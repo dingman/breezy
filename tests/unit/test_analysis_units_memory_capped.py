@@ -28,6 +28,11 @@ _DEPLOY_DIR = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
 # actually present on disk.
 _CANDIDATE_UNITS = [
     "breezy-k1-daily.service",
+    # AUD-15 (2026-09-22): RETIRED, ruling
+    # `RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md` RULING 1.
+    # Left in this list deliberately -- `_EXISTING_UNITS` below filters on
+    # `is_file()`, so a retired name here narrows the parametrisation rather
+    # than failing it (no edit required by AUD-15 §7 step 7d-bis).
     "breezy-mb-daily.service",
     "breezy-offer-gate-daily.service",
     # WP-11b (active-family registry, cardinality-1): the retired
@@ -38,6 +43,9 @@ _CANDIDATE_UNITS = [
     "breezy-live-tally.service",
     "breezy-score-live-trials.service",
     "breezy-quote-tape-ingest.service",
+    # AUD-15 re-home (2026-09-22): a light unit, but it declares its own
+    # MemoryHigh=512M/MemoryMax=1G and nothing else pinned them until now.
+    "breezy-asos-refresh.service",
 ]
 
 _EXISTING_UNITS = [

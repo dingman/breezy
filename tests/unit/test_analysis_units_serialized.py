@@ -356,40 +356,34 @@ _LOCK_FILENAME: Final[str] = "breezy-studies.lock"
 #: one of these asserts it equals the hardcoded expectation FIRST, so a
 #: missing file fails loudly on set membership rather than silently
 #: iterating over zero items.
+#: AUD-15: `breezy-mb-daily`/`breezy-offer-gate-daily` RETIRED 2026-09-22
+#: (`docs/evidence/RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md`
+#: RULING 1). `breezy-k1-daily` is now the only unit in the "heavy study"
+#: band; the re-homed `breezy-asos-refresh` is a LIGHT unit (§6 of the AUD-15
+#: plan) and deliberately does NOT join these sets -- it takes the shared
+#: flock (tested separately, `tests/unit/test_asos_refresh_wrapper_
+#: contention.py`) but is not a 12-16G heavy study.
 _HEAVY_TIMERS: Final[frozenset[str]] = frozenset(
     {
         "breezy-k1-daily.timer",
-        "breezy-mb-daily.timer",
-        "breezy-offer-gate-daily.timer",
     }
 )
 _HEAVY_SERVICES: Final[frozenset[str]] = frozenset(
     {
         "breezy-k1-daily.service",
-        "breezy-mb-daily.service",
-        "breezy-offer-gate-daily.service",
     }
 )
 _WRAPPERS: Final[frozenset[str]] = frozenset(
     {
         "k1-daily-run.sh",
-        "mb-daily-run.sh",
-        "offer-gate-daily-run.sh",
     }
 )
 
-#: Every wrapper writes its own `$OUT`/log via a distinct env var, except
-#: `offer-gate-daily-run.sh`, which takes `$OUT` as `argv[1]` (A-8) -- `None`
-#: marks that case.
 _WRAPPER_OUTPUT_ENV_VAR: Final[dict[str, str | None]] = {
     "k1-daily-run.sh": "BREEZY_K1_OUTPUT_DIR",
-    "mb-daily-run.sh": "BREEZY_MB_OUTPUT_DIR",
-    "offer-gate-daily-run.sh": None,
 }
 _WRAPPER_LOG_FILENAME: Final[dict[str, str]] = {
     "k1-daily-run.sh": "k1_daily.log",
-    "mb-daily-run.sh": "mb_daily.log",
-    "offer-gate-daily-run.sh": "offer_gate_daily.log",
 }
 
 _SIZE_MULTIPLIERS: Final[dict[str, int]] = {
@@ -566,8 +560,6 @@ def test_the_protected_window_is_derived_from_the_declared_std_offsets() -> None
 def test_no_heavy_unit_timer_fires_inside_the_lst_derived_protected_window(timer_name: str) -> None:
     assert _HEAVY_TIMERS == {
         "breezy-k1-daily.timer",
-        "breezy-mb-daily.timer",
-        "breezy-offer-gate-daily.timer",
     }
     timer_path = _DEPLOY_DIR / timer_name
     assert timer_path.is_file(), f"{timer_name} does not exist"
@@ -622,8 +614,6 @@ def test_the_v3_strategy_imports_the_v1_decision_window_and_redeclares_neither()
 def test_every_heavy_study_unit_declares_the_shared_studies_slice(service_name: str) -> None:
     assert _HEAVY_SERVICES == {
         "breezy-k1-daily.service",
-        "breezy-mb-daily.service",
-        "breezy-offer-gate-daily.service",
     }
     service_path = _DEPLOY_DIR / service_name
     assert service_path.is_file(), f"{service_name} does not exist"
@@ -656,17 +646,6 @@ def test_the_ingest_unit_comment_matches_the_cli_exit_contract() -> None:
     assert "EXIT_CONVERSION_FAILED" in text
 
 
-def test_the_offer_gate_unit_still_passes_the_systemd_home_specifier() -> None:
-    text = (_DEPLOY_DIR / "breezy-offer-gate-daily.service").read_text()
-    exec_start = _directive_value(text, "ExecStart")
-    assert exec_start is not None
-    assert "offer-gate-daily-run.sh" in exec_start
-    assert "%h/.local/share/breezy/offer_gate" in exec_start
-    for path in _DEPLOY_DIR.iterdir():
-        if path.is_file():
-            assert "BREEZY_OFFER_GATE_OUTPUT_DIR" not in path.read_text()
-
-
 ##############################################################################
 # I2a/A-20 -- retimed doc claims, scoped grep + positive control + residual
 ##############################################################################
@@ -674,7 +653,11 @@ def test_the_offer_gate_unit_still_passes_the_systemd_home_specifier() -> None:
 _A20_SCOPE: Final[frozenset[str]] = frozenset(
     {
         "deploy/systemd/breezy-k1-daily.timer",
-        "deploy/systemd/breezy-offer-gate-daily.timer",
+        # AUD-15: breezy-offer-gate-daily.timer RETIRED 2026-09-22 (ruling
+        # `RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md`
+        # RULING 1) -- its retimed "02:05" tick is preserved as a historical
+        # mention in README.md instead, so the assertion below still holds
+        # without needing the deleted file.
         "deploy/systemd/README.md",
     }
 )
@@ -687,7 +670,9 @@ _A20_RESIDUAL: Final[frozenset[str]] = frozenset(
         # SAME "occupied elsewhere" residual-tick comment.
         "breezy-family-tally@.timer",
         "breezy-live-tally.timer",
-        "breezy-mb-daily.timer",
+        # AUD-15: breezy-mb-daily.timer RETIRED 2026-09-22 (same ruling as
+        # above) -- removed from this residual set since the file no longer
+        # exists; the remaining four members still carry the tick text.
         "breezy-score-live-trials.timer",
         "breezy-quote-tape-ingest.timer",
     }
@@ -753,7 +738,7 @@ def _spawn_wrapper(
 def test_every_heavy_study_wrapper_takes_the_studies_flock_and_skips_when_held(
     wrapper_filename: str, tmp_path: Path
 ) -> None:
-    assert _WRAPPERS == {"k1-daily-run.sh", "mb-daily-run.sh", "offer-gate-daily-run.sh"}
+    assert _WRAPPERS == {"k1-daily-run.sh"}
     token = new_run_token()
     xdg_runtime_dir = tmp_path / f"{token}-xdg-runtime"
     xdg_runtime_dir.mkdir(parents=True)
@@ -810,14 +795,6 @@ def test_the_wrapper_skips_when_the_lock_directory_is_missing_or_unwritable(
         restricted_runtime_dir.chmod(0o700)
 
 
-def test_the_offer_gate_wrapper_requires_its_output_dir_as_an_argument(tmp_path: Path) -> None:
-    result, _out_dir, _log_path = _spawn_wrapper(
-        "offer-gate-daily-run.sh", tmp_path, provide_output_arg=False
-    )
-    assert result.returncode != 0
-    assert "offer-gate output directory is required" in result.stderr
-
-
 @pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
 def test_every_study_wrapper_is_executable(wrapper_filename: str) -> None:
     path = _DEPLOY_DIR / wrapper_filename
@@ -825,9 +802,12 @@ def test_every_study_wrapper_is_executable(wrapper_filename: str) -> None:
     assert os.access(path, os.X_OK), f"{wrapper_filename} is not executable"
 
 
-def test_all_three_wrappers_name_the_same_lock_path() -> None:
+def test_every_flock_taking_wrapper_names_the_same_lock_path() -> None:
+    """AUD-15: broadened beyond `_WRAPPERS` (the HEAVY-study set) to also
+    cover `asos-refresh-run.sh` -- a light unit, but one that takes the same
+    shared studies flock and must resolve the identical path."""
     expected_line = f'LOCK="$LOCK_DIR/{_LOCK_FILENAME}"'
-    for wrapper_filename in sorted(_WRAPPERS):
+    for wrapper_filename in sorted(_WRAPPERS | {"asos-refresh-run.sh"}):
         text = (_DEPLOY_DIR / wrapper_filename).read_text()
         assert expected_line in text.splitlines(), (
             f"{wrapper_filename} does not name the shared lock path identically"

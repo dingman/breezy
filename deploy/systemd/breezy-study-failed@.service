@@ -1,0 +1,49 @@
+[Unit]
+# AUD-15a: the OnFailure= notifier for every Breezy study unit. Templated so
+# ONE unit covers every current and future study -- the failing unit's own
+# name arrives via `%i` (systemd's own instance-name expansion), never a
+# per-study copy of this file. See
+# `docs/plans/backlog/AUDIT_2026-09-21/AUD-15-failing-study-units-fix-or-retire-and-alert.md`
+# §6 for the full specification this unit implements.
+Description=Breezy study-unit failure notifier for %i
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/study_failure_notifier.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Same shared aggregate ceiling as the studies it reports on, so a
+# pathological notifier cannot contend with the live trading node (which
+# lives outside this slice entirely -- breezy-trade-supervisor.service:64).
+Slice=breezy-studies.slice
+UMask=0077
+
+# AUD-15 amendment (2026-09-22): BREEZY_ALERT_WEBHOOK_URL lives ONLY in
+# ~/.config/breezy/breezy-trade.env on this host, loaded only by the
+# supervisor -- so under NO EnvironmentFile= this unit always resolved a
+# LOG-ONLY sink (detection without delivery, the exact defect `f97c26f` was
+# raised to close). `alerts.env` is a DEDICATED, single-key file -- never
+# `breezy-trade.env` or `polymarket.env`, which also carry
+# POLYMARKET_US_ACCOUNT_NUMBER / POLYMARKET_US_EXEC_STATE_DB, a venue
+# credential this study-adjacent unit must never hold. The leading `-` keeps
+# this unit startable even if the file is absent (fails closed to
+# LOG-only, never to a hard start failure). See
+# `deploy/systemd/migrate-alerts-env.sh` for how the file is populated and
+# README.md's "AUD-15 alert env file" note for the full rationale.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=%h/breezy/.venv/bin/breezy-study-failed --unit %i
+
+# No Restart=, and -- the load-bearing line -- deliberately NO OnFailure= of
+# its own: an alerting loop is worse than a missed alert. If this instance
+# itself fails, it lands in `failed` (visible in `systemctl --user list-units
+# --all 'breezy-*'`) but nothing pages on it -- a named, accepted residual
+# (see the notifier module's own docstring and the plan's §9).
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-study-failed
+
+# NOTE: no [Install] section. This unit is never enabled or started
+# directly -- it is invoked ONLY via a sibling study unit's
+# `OnFailure=breezy-study-failed@%n.service` line.

@@ -232,6 +232,30 @@ after fixing the env, then `start` again. A runtime / market-data fault
 with backoff, and `StartLimitIntervalSec=0` is what makes 09-09's
 "Start request repeated too quickly" abandon-permanently outcome impossible.
 
+### Retiring a unit (general pattern, folded in by the AUD-15 amendment)
+
+Any unit's retirement (a timer + service + wrapper triple, same shape as
+`breezy-mb-daily`/`breezy-offer-gate-daily` below) follows this order,
+never fewer steps:
+
+```bash
+systemctl --user disable --now <unit>.timer
+# If the service ever reached `failed` (it will have, on its last run before
+# retirement, if that run was a timeout/OOM/non-zero exit):
+systemctl --user reset-failed <unit>.service
+rm ~/.config/systemd/user/<unit>.timer ~/.config/systemd/user/<unit>.service
+systemctl --user daemon-reload
+```
+
+**Never leave a disabled timer with an orphan unit.** The
+`breezy-pm-crh-{cont,v2}-tally` orphans are the named anti-pattern (G-04):
+both symlinks were left in place after their timers were disabled, so they
+sit in `not-found`/`failed` forever, indistinguishable at a glance from a
+unit that is merely quiet. `systemctl --user list-units --all 'breezy-*'`
+after any retirement must show **neither** `not-found` **nor** `failed` for
+the retired name -- confirming the symlinks and the failed-state latch are
+BOTH gone, not just the timer disabled.
+
 ## 6. Design notes (why these values)
 
 - **`KillSignal=SIGTERM`, `TimeoutStopSec=120`.** SIGTERM is what the clean path
@@ -385,76 +409,255 @@ when the timer will fire, never which version of the service it will fire.
 
 ---
 
-## `breezy-mb-daily` — M_A + M_B tape-side studies (2026-09-02, PREPARED, NOT ACTIVATED)
+## `breezy-mb-daily` / `breezy-offer-gate-daily` — RETIRED 2026-09-22
 
-`breezy-mb-daily.service` + `.timer` run `ma_prelock_winner_ask_study.py`
-(M_A) and `mb_current_rung_edge_study.py` (M_B) daily at **13:30 UTC** via a
-wrapper script, `deploy/systemd/mb-daily-run.sh`, in the same style as
-`k1-daily-run.sh`: the timer owns cadence, the script owns the work. M_A runs
-first; M_B runs **unconditionally** afterward — a failed or cache-starved M_A
-never skips M_B's own daily sample. The schedule sits after the 12:15 UTC
-quote-tape-catalog ingest tick, after every dense station's previous climate
-day has closed (latest, SFO/LAX at UTC-8, closes at 08:00 UTC) and its CLI
-final has normally posted. It was originally staggered a full hour off
-`breezy-k1-daily`/`breezy-offer-gate-daily`.
+**Both units are RETIRED**, per
+`docs/evidence/RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md`
+RULING 1 (ENDORSED, review trail
+`docs/evidence/reviews/RULING_study_ceiling_exit_review_2026-09-21.md`):
+`breezy-offer-gate-daily` on decision-table rows 1+2 (no consumer of
+`offer_gate_latest.md`; the lock-family programme it measures is dead by
+standing verdict); `breezy-mb-daily`'s M_A on rows 1+2 (same lock programme)
+and M_B on row 2 (it measures the archive-vs-tape edge closed TERMINAL
+2026-09-20). Their timers, units and wrapper scripts (`mb-daily-run.sh`,
+`offer-gate-daily-run.sh`) are deleted. `ma_prelock_winner_ask_study.py`,
+`mb_current_rung_edge_study.py` and `cli_basis_offer_gate_scan.py` are **NOT**
+deleted or edited (ruling §1.4 item 3): the offer-gate module is imported as
+a library elsewhere (AUD-09), and M_B's module is a registered PREREG v1/v2
+analysis definition, pinned byte-unmodified while those specs are live.
+`ma_prelock_winner_ask_study.py:169-177`'s docstring, which names
+`breezy-mb-daily.timer` as the window advancer, is now stale by this
+retirement and is left that way by the same zero-diff rule (a documented,
+accepted doc-drift, not an oversight).
 
-MOVED 2026-09-12: those two moved from (22:30 UTC) / (22:45 UTC) to `01:35
-UTC` / `02:05 UTC` (see "Protected window and serialization" below);
-`breezy-mb-daily` stayed at `13:30 UTC` -- see the timer file's own comment
-for the full reasoning.
+**Historical, retained so this file's own A-20 pin still holds:**
+- `breezy-k1-daily` moved `22:30 UTC` to `01:35 UTC` (MOVED 2026-09-12).
+- `breezy-offer-gate-daily` (now retired) moved `22:45 UTC` to `02:05 UTC` (MOVED 2026-09-12).
+- `breezy-mb-daily` (now retired) stayed at `13:30 UTC`.
 
-Both studies previously hard-coded `ASOS_FETCH_END` to a literal date with a
-comment instructing a human to hand-edit it forward each day
-(`ma_prelock_winner_ask_study.py`, imported by `mb_current_rung_edge_study.py`)
-— exactly what an unattended daily timer cannot do. `default_asos_fetch_end()`
-replaces it with a through-**today** default (not yesterday: a station-day
-without a posted CLI final already scores PENDING rather than a false
-"zero-qualifying" result, so including today's still-open climate day is
-safe). `ASOS_FETCH_START` stays a fixed anchor, so the window only ever
-widens — this is the mechanism by which "the tape-side sample accrues" across
-runs, not merely "the same report gets rewritten daily."
+**What replaced them.** Retiring both wrappers would have deleted the ONLY
+nightly invocation of `asos_recent_refresh.py --since <ASOS_FETCH_START
+anchor>` (`mb-daily-run.sh:86-87`'s form) -- the fixed-window fetch a
+**live-path** consumer reads without fetching itself
+(`current_rung_hold_monitor_hypothetical_hold.py:158-168`,
+`current_rung_hold_exit_window_study.py:16-24`). Ruling §1.4 item 4 / the
+Revision 2 addendum §A1 makes re-homing that ONE invocation (never the
+offer-gate rolling 3-day form, §A1(ii)) a BINDING same-commit condition. See
+the `breezy-asos-refresh` section immediately below.
 
-Both studies are **cache-only** for ASOS: `load_asos_series_for_day` raises
-`SystemExit` on a cache miss rather than fetching, keyed on the exact IEM
-ASOS URL for `(ASOS_FETCH_START, ASOS_FETCH_END)`
-(`settlement_alignment_study.py:cache_path_for_url` hashes the whole URL, so
-no partial or nearby-range cache file satisfies it). `asos_recent_refresh.py`
-(Item 4's fetcher) previously only supported a `--lookback-days` window
-relative to *today*, which can **never** produce that exact URL against a
-*fixed* `ASOS_FETCH_START` — its window's start drifts a day further from the
-anchor every day the timer fires. `mb-daily-run.sh` therefore calls it with
-the new `--since <ASOS_FETCH_START literal>` flag instead
-(`lookback_days_since`), which pins the fetch's start to the exact same
-anchor and its end to `today` — matching `default_asos_fetch_end()` exactly,
-so the refreshed cache entry is the one the studies actually read. The
-`--since` literal in `mb-daily-run.sh` duplicates
-`ma_prelock_winner_ask_study.ASOS_FETCH_START`; there is no shared import
-across the shell/Python boundary, so both must be updated together if that
-anchor ever moves — the wrapper script's header says so at the point of use.
+---
 
-Artefacts land under `~/.local/share/breezy/derived/`, dated
-(`ma_prelock_winner_ask_<date>.md`, `mb_current_rung_edge_<date>.md`), one
-snapshot per day — the unit never writes into `docs/evidence/`; promoting a
-snapshot there is a deliberate, reviewed step, same convention as
-`breezy-k1-daily` and `breezy-offer-gate-daily`.
+## `breezy-asos-refresh` — re-homed ASOS fixed-window refresh (2026-09-22)
 
-Validation performed (no unit activated):
+`breezy-asos-refresh.service` + `.timer` + `deploy/systemd/asos-refresh-
+run.sh` are the re-home target: exactly the invocation `asos_recent_
+refresh.py --since "$ASOS_FETCH_START_ANCHOR"` moved verbatim from the
+retired `mb-daily-run.sh`, at the **same 13:30 UTC** slot that unit
+vacated. The anchor is not forked (ruling §A1(iii)): it exists in exactly
+two places after this commit, the module constant `ma_prelock_winner_ask_
+study.ASOS_FETCH_START` and the wrapper's own `ASOS_FETCH_START_ANCHOR`,
+both carrying the "update both together" comment, and a RED-first pin
+(`tests/unit/test_asos_refresh_re_home.py::
+test_an_enabled_timer_invokes_the_since_anchored_asos_refresh_and_the_consumer_cache_key_is_fresh`)
+imports the module constant so a fork fails the suite.
+
+**Light unit, not a heavy study.** `MemoryHigh=512M`/`MemoryMax=1G` (the
+`breezy-position-monitor-report.service` band) -- this is one HTTP GET per
+site plus a cache-mtime read, never a tape scan. It still cites the
+2026-09-11 K1 incident, joins `breezy-studies.slice`, and takes the shared
+studies flock, so it never contends with a heavy study or the live node.
+
+**`$OUT/asos_refresh.log` is append-only, with no rotation** -- an
+accepted residual, same pre-existing pattern as every other study
+wrapper's own log file (`k1_daily.log`, the retired `mb_daily.log`/
+`offer_gate_daily.log`): one light run per day keeps this small enough
+that rotation has never been worth building.
+
+**Control flow differs from the retired heavy wrappers on purpose** (a
+round-6 review defect, fixed before this shipped): the retired wrappers
+`exit 0` IMMEDIATELY on lock contention, so nothing after the lock line ever
+ran on a contention night. `asos-refresh-run.sh` CAPTURES the lock result
+instead (`if flock -n 9; then <refresh>; else <SKIPPED-LOCK>; fi`) so the
+freshness check below always runs. `SKIPPED-INFRA`/`exit 75` on a genuine
+lock-infrastructure failure is unchanged.
+
+**The freshness alert this re-home ships (`scripts/analysis/asos_cache_
+freshness_check.py`).** 15a's `OnFailure=` only fires on `failed`, and the
+refresh's own shortfall path exits 0 by design -- so a refresh that fetches
+nothing would otherwise leave the unit looking healthy while the consumer's
+cache key goes unwritten. The wrapper therefore runs an UNCONDITIONAL
+check, on every invocation regardless of the lock outcome: it resolves the
+SAME cache path the live consumer resolves (`asos_url` + `cache_path_
+for_url`, never re-derived by hand) and compares its **epoch mtime** against
+00:00:00Z of the current UTC day -- missing, or older than that boundary,
+fires exactly one `asos_cache_stale` WARN through the existing alert sink
+(`breezy.runtime.health`) and the unit still exits 0. There is no hour
+threshold: the cache key hashes a URL carrying both window dates, so it
+rotates every UTC day and a present file under today's key can only ever
+have been written today -- "missing" is therefore the dominant signal, and
+the mtime leg is what keeps the rule correct if the key ever stops rotating.
+Fires 90 minutes ahead of the first consumer (15:00 UTC).
+
+Validation performed:
 
 ```
-$ systemd-analyze --user verify deploy/systemd/breezy-mb-daily.service \
-    deploy/systemd/breezy-mb-daily.timer
+$ systemd-analyze --user verify deploy/systemd/breezy-asos-refresh.service \
+    deploy/systemd/breezy-asos-refresh.timer
 (no output)
 EXIT=0
 
-$ bash -n deploy/systemd/mb-daily-run.sh
+$ bash -n deploy/systemd/asos-refresh-run.sh
 OK
 ```
 
 To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
 pattern), `daemon-reload`, then
-`systemctl --user enable --now breezy-mb-daily.timer` — deliberately not run
-here; see the TRAP section above for the post-edit `daemon-reload` discipline
-that applies to any future edit of this unit too.
+`systemctl --user enable --now breezy-asos-refresh.timer` — deliberately not
+run here; see the TRAP section above for the post-edit `daemon-reload`
+discipline that applies to any future edit of this unit too.
+
+---
+
+## `breezy-study-failed@` — OnFailure= notifier for every study unit (AUD-15a, 2026-09-22)
+
+`breezy-study-failed@.service` is a templated `Type=oneshot` unit that ONE
+line on every other study unit invokes:
+`OnFailure=breezy-study-failed@%n.service` -- `%n` carries the failing
+unit's own full name as the instance. Cause-agnostic: it fires identically
+whether the unit hit `TimeoutStartSec`, was OOM-killed by its own
+`MemoryMax`, or exited non-zero for any other reason. `ExecStart` runs a
+console entry point, `breezy-study-failed --unit %i`, over a small module
+(`src/breezy/runtime/study_failure_notifier.py`) that reuses the existing
+alert sink (`breezy.runtime.health.emit_alert`/`resolve_alert_sink`)
+unmodified -- no new `src/` alerting mechanism, only the entry point.
+
+The alert is a fixed-shape WARN: `event="study_unit_failed"`,
+`site="global"`, and a closed-enum `detail` that never carries the failing
+unit's name, exception text, or journal text -- the unit name travels on the
+plain log line instead. The template unit itself declares **no**
+`OnFailure=` and **no** `Restart=`: if the notifier instance itself fails, it
+lands in `failed` (visible in `systemctl --user list-units --all
+'breezy-*'`) but nothing pages on it, a named and accepted residual rather
+than a second-order watchdog that would reintroduce an alert loop.
+
+Covers, as of this revision: `breezy-k1-daily`, `breezy-exit-window-study`,
+`breezy-family-tally@`, `breezy-live-tally`, `breezy-position-monitor-report`,
+`breezy-quote-tape-ingest`, `breezy-quote-tape-rotate`,
+`breezy-score-live-trials`, and the new `breezy-asos-refresh` -- every unit
+with a sibling timer, enumerated by `tests/unit/test_study_failure_alert.py`
+by scanning the tree (never a frozen list), so a future study unit added
+without `OnFailure=` fails that suite. It incidentally also covers
+`breezy-family-tally@pm_us_crh_cont.service` (G-04, a different gap, out of
+scope here).
+
+To activate: symlink the template unit into `~/.config/systemd/user/` (§2's
+pattern) alongside every unit that references it, `daemon-reload`. There is
+no `[Install]` section to enable -- this unit is invoked only via a sibling's
+`OnFailure=` line.
+
+---
+
+## AUD-15 alert env file (`~/.config/breezy/alerts.env`) (amendment, 2026-09-22)
+
+**The contradiction this closes.** AUD-15's own plan text said "No
+`EnvironmentFile=`, no credential" for `breezy-study-failed@.service` and
+`breezy-asos-refresh.service`, and separately assumed
+`BREEZY_ALERT_WEBHOOK_URL` "is configured" for them. On this host that
+variable lives ONLY in `~/.config/breezy/breezy-trade.env`, loaded only by
+`breezy-trade-supervisor.service`. Under an empty declared environment,
+both new units' `resolve_alert_sink()` always returned a LOG-ONLY sink --
+detection without delivery, the exact defect `f97c26f` was raised to close,
+reproduced by AUD-15 itself. Independent review (silent-failure-hunter,
+security-reviewer) blocked the build on this before it shipped.
+
+**The fix.** A DEDICATED, single-key file, `~/.config/breezy/alerts.env`,
+mode `0600`, holding exactly one line: `BREEZY_ALERT_WEBHOOK_URL=<value>`.
+Three units load it via `EnvironmentFile=-%h/.config/breezy/alerts.env`
+(the `-` keeps each startable if the file is absent): the two new AUD-15
+units, and `breezy-trade-supervisor.service` (added BEFORE its existing
+`breezy-trade.env` line, so this is the single source of truth going
+forward). Rejected: pointing the new units at `breezy-trade.env` itself
+(it also carries `POLYMARKET_US_ACCOUNT_NUMBER` /
+`POLYMARKET_US_EXEC_STATE_DB` -- a venue credential a study-adjacent unit
+must never hold); `systemctl --user set-environment` (transient, lost on
+user-manager restart, invisible to unit-text pinning tests); an inline
+`Environment=` literal (a bearer-capability URL mirrored into tracked
+`deploy/systemd/`).
+
+**Least privilege inside `asos-refresh-run.sh`.** The ASOS fetch subprocess
+never sees the variable (`env -u BREEZY_ALERT_WEBHOOK_URL` wraps only that
+call) -- it is an outbound HTTP GET to a public endpoint with no use for a
+credential-shaped value. Only the freshness-check step needs it.
+
+**Runtime visibility, not just a hermetic unit test.** Both
+`study_failure_notifier.notify_study_failed` and
+`asos_cache_freshness_check.main` call
+`breezy.runtime.health.log_alert_egress_status(env, component=...)` BEFORE
+resolving the sink, on every invocation -- so a missing/empty `alerts.env`
+leaves a distinct, loud journal line every run, not a silently-downgraded
+`LoggingAlertSink`. The hermetic `resolve_alert_sink` test in each unit's
+test module proves the function reads the right key NAME; it does not by
+itself prove the deployed file exists, which is what this call and the
+deploy-time check below are for.
+
+**Migration (host-only, never committed).** `deploy/systemd/
+migrate-alerts-env.sh` -- ONE idempotent script, `set -euo pipefail`,
+`umask 077`, never prints/logs/echoes the URL's value (names, counts, and
+file modes only):
+
+```bash
+# Step 1 (base migration; safe to re-run; leaves breezy-trade.env untouched):
+deploy/systemd/migrate-alerts-env.sh
+# -> creates ~/.config/breezy/alerts.env (mode 600) from the ONE
+#    BREEZY_ALERT_WEBHOOK_URL= line in breezy-trade.env. Aborts loudly if
+#    that file has zero or more than one such line.
+
+# Step 2: land the unit-file commit (this repo's changes), symlink, then:
+systemctl --user daemon-reload
+
+# Step 3: confirm delivery (see below) -- must exit 0 before step 4.
+
+# Step 4 (only after steps 2-3 both succeed):
+deploy/systemd/migrate-alerts-env.sh --finalize --delivery-confirmed
+# -> removes BREEZY_ALERT_WEBHOOK_URL= from breezy-trade.env. REFUSES
+#    unless `systemctl --user cat breezy-trade-supervisor.service` already
+#    shows the alerts.env EnvironmentFile= line (proving step 2 landed) AND
+#    --delivery-confirmed is passed (proving step 3 passed). Does NOT
+#    restart, stop, start, enable, or disable any unit -- the supervisor's
+#    added EnvironmentFile= line and the key's removal from
+#    breezy-trade.env both take effect only at ITS NEXT NATURAL RESTART,
+#    never forced by this script (the running process keeps its
+#    already-loaded URL until then).
+```
+
+**Duplication during the transition is deliberate and harmless.** Between
+step 1 and step 4, the SAME value may exist in both files; whichever
+`EnvironmentFile=` line systemd loads last wins, and both hold the
+identical value, so this is never a two-sources-of-truth risk -- only
+step 4's removal makes `alerts.env` the sole copy.
+
+**Deploy-time delivery check (§4d).** `%h` is a systemd-native specifier,
+NOT expanded by `systemd-run -p` on the command line, so the real `$HOME`
+must be substituted by the shell instead:
+
+```bash
+systemd-run --user --wait --pipe -p EnvironmentFile=-"$HOME"/.config/breezy/alerts.env \
+  /home/jon/breezy/.venv/bin/breezy-check-alerts --severity INFO
+```
+
+Expected: exit `0` and a `delivered -- event=BREEZY_ALERT_EGRESS_CHECK
+severity=INFO detail=operator_channel_test` line (`breezy-check-alerts`'s
+own contract, `check_alerts_cli.py`: `0` delivered, `2` NOT CONFIGURED,
+`3` configured but NOT DELIVERED). One run covers both new units, since
+both declare the identical `EnvironmentFile=`. Exit `2` -> `alerts.env`
+missing or empty, stop and fix before continuing. Exit `3` -> endpoint
+unreachable, report and stop.
+
+**Rollback.** Re-add the removed line to `breezy-trade.env` from
+`alerts.env` (the two are still byte-identical at that key until finalize
+ran), `git revert` the unit/test commit, `daemon-reload`. Leave
+`alerts.env` in place (harmless) or `rm -f` it. No supervisor restart at
+rollback either -- same "next natural restart" rule as the forward path.
 
 ---
 
@@ -474,7 +677,8 @@ most-recently-started instance and `breezy-quote-tape.service` reports
 active. A new instance directory is opened only on process start, so a
 recorder left running for days leaves days of marker-closed, ingest-eligible
 data sitting behind that one still-open instance, invisible to the parquet
-catalog `breezy-mb-daily` reads. Measured 2026-09-02: instance `dbb0354a…`
+catalog the (now-retired, AUD-15) `breezy-mb-daily` used to read. Measured
+2026-09-02: instance `dbb0354a…`
 had been live since 10:56Z with no calendar-driven path to close it.
 
 `breezy-quote-tape-rotate.service` + `.timer` run
@@ -487,12 +691,16 @@ nothing. `try-restart`, not `restart`: if an operator has deliberately
 stopped the recorder, this timer must never be what silently brings it back
 up — `try-restart` is a no-op against an inactive unit, `restart` would start
 it unconditionally. Full daily sequence and why each stagger exists:
-**rotate 09:00 UTC → ingest 12:15 UTC → mb-daily 13:30 UTC**. The
+**rotate 09:00 UTC → ingest 12:15 UTC → 13:30 UTC tick**. The
 09:00→12:15 gap is deliberate, not incidental: it clears the ingest CLI's
 30-minute live-write grace window (`DEFAULT_LIVE_GRACE_MINUTES`) by over two
 hours, so 12:15's pass is guaranteed to see the rotated-off instance as
-genuinely quiet and convert it, landing it in the catalog before
-`breezy-mb-daily` reads at 13:30.
+genuinely quiet and convert it, landing it in the catalog before the 13:30
+tick. AUD-15 (2026-09-22): the 13:30 tick's occupant is now `breezy-asos-
+refresh` (retired `breezy-mb-daily`'s successor at that slot), which does
+not read this catalog at all -- it fetches ASOS, not quote-tape data -- so
+this stagger has no live reader left downstream of it; retained because it
+remains harmless and documents the tick's history.
 
 A daily `try-restart` does not interact badly with the recorder's own
 `Restart=always` / `RestartPreventExitStatus=2` / `StartLimitIntervalSec=0`:
@@ -523,7 +731,7 @@ discipline that applies to any future edit of this unit too.
 
 `breezy-live-tally.service` + `.timer` run `scripts/analysis/
 live_family_tally.py` daily at **14:30 UTC** via a wrapper script,
-`deploy/systemd/live-tally-run.sh`, in the same style as `mb-daily-run.sh`:
+`deploy/systemd/live-tally-run.sh`, in the same style as `k1-daily-run.sh`:
 the timer owns cadence, the script owns the work. The script reads the 6c
 scored-trial parquet store (`~/.local/share/breezy/derived/scored_trials`,
 written by `scripts/analysis/score_live_trials.py`), builds realized-hold-rate
@@ -538,11 +746,12 @@ stratum table header is byte-identical to the M_B live section
 `breezy.settlement.roi_bound.format_roi_bound`. This unit never prints the
 naive normal-approximation interval EXEC_SPINE R-9 refuses by name.
 
-Scheduled a full hour AFTER `breezy-mb-daily` (13:30 UTC) so the tally's read
-of the (unrelated) parquet store never races that unit's work, and a
-distinct hour from every other Breezy timer (`breezy-quote-tape-rotate`
+Scheduled a full hour AFTER the 13:30 UTC tick (occupied by the now-retired
+`breezy-mb-daily`, AUD-15's `breezy-asos-refresh` since 2026-09-22) so the
+tally's read of the (unrelated) parquet store never races that unit's work,
+and a distinct hour from every other Breezy timer (`breezy-quote-tape-rotate`
 09:00, `breezy-quote-tape-ingest` 00,06,12,18:15, `breezy-k1-daily` 01:35,
-`breezy-offer-gate-daily` 02:05 (MOVED 2026-09-12, was 22:30/22:45)) —
+the now-retired `breezy-offer-gate-daily` 02:05 (MOVED 2026-09-12, was 22:45)) —
 pinned by
 `tests/unit/test_deploy_timer_hours.py`, which parses every
 `deploy/systemd/*.timer`'s `OnCalendar=` line as text (no `systemd-analyze`
@@ -551,7 +760,7 @@ network: the store is local, and the unit carries no `EnvironmentFile`.
 
 Artefacts land under `~/.local/share/breezy/derived/`, dated
 (`live_family_tally_<date>.md`), one snapshot per day — same convention as
-`breezy-mb-daily`; the unit never writes into `docs/evidence/`.
+`breezy-k1-daily`; the unit never writes into `docs/evidence/`.
 
 Validation performed (no unit activated):
 
@@ -919,8 +1128,16 @@ prevent.
 
 ## Protected window and serialization
 
+**AUD-15 (2026-09-22): `breezy-mb-daily` and `breezy-offer-gate-daily` are
+RETIRED** (see their own section above). This section is retained as the
+historical design record for the protected window and the flock, which both
+still apply to the surviving `breezy-k1-daily` and to the new light
+`breezy-asos-refresh` unit (its own section documents its use of the same
+lock).
+
 SP-1 (2026-09-12): `breezy-k1-daily`, `breezy-mb-daily` and
-`breezy-offer-gate-daily` are the three nightly analysis studies. Two
+`breezy-offer-gate-daily` were the three nightly analysis studies at the
+time this section was written. Two
 independent `systemd --user` timers had no shared lock, so they could (and,
 per the 2026-09-11 incident, did) run concurrently -- each already capped at
 its own `MemoryHigh=12G`/`MemoryMax=16G`
@@ -958,8 +1175,9 @@ added to the slice before it is wrapped. It only binds once **installed**:
 symlink; without it systemd instantiates an implicit, unbounded slice while
 `show <service> -p Slice` still reports the configured name (false green).
 The real observable is `systemctl --user show breezy-studies.slice -p
-MemoryHigh -p MemoryMax`. Each of the three wrappers (`k1-daily-run.sh`,
-`mb-daily-run.sh`, and the new `offer-gate-daily-run.sh`) now takes a
+MemoryHigh -p MemoryMax`. `k1-daily-run.sh` (the sole surviving heavy
+wrapper after AUD-15's retirement) and the new light `asos-refresh-run.sh`
+both take a
 host-wide, non-blocking `flock` on `breezy-studies.lock` (resolved under
 `$XDG_RUNTIME_DIR`, falling back to `$HOME/.local/share/breezy`) before
 doing any work: contention exits 0 (skip-not-kill -- `Persistent=true`
@@ -976,12 +1194,22 @@ each is <=1 GB / <=60 s, well under the exemption threshold, and none is
 retimed or wrapped by this item.
 
 **Worst-case-runtime rule.** No heavy study starts within its own worst-case
-observed runtime before `16:35Z`: `breezy-offer-gate-daily` 11.5 min,
-`breezy-mb-daily` 36 min (13:30Z + 36 min = ~14:06Z, clear).
+observed runtime before `16:35Z`: `breezy-k1-daily` at `01:35Z` clears by a
+wide margin. (Historical, pre-retirement figures: `breezy-offer-gate-daily`
+11.5 min, `breezy-mb-daily` 36 min (13:30Z + 36 min = ~14:06Z, clear) --
+both units are now retired.) `breezy-asos-refresh` is a light unit, not
+subject to this rule.
 
 **Reboot-catch-up residual.** `daemon-reload` can trigger an immediate
 `Persistent=true` catch-up run; a reboot can still fire a relocated heavy
 timer inside `P`. Accepted: the flock and slice still apply even then.
+AUD-15 amendment (2026-09-22), naming the unit this applies to explicitly:
+`breezy-asos-refresh.timer` sets `Persistent=true` (confirmed in the
+working tree, `breezy-asos-refresh.timer:25`), so it inherits this same
+residual -- a missed 13:30Z tick can fire immediately on the next boot
+rather than waiting a full day, which is fine (the flock still serializes
+it, and it is a light unit, not subject to the worst-case-runtime rule
+above).
 
 **G2 is NOT met by this item.** `breezy-quote-tape-ingest.service` (`*:0/15`)
 still runs INSIDE `P` every 15 minutes and still peaks approximately 4.0 GB
@@ -997,16 +1225,17 @@ with no copy in this repo -- a pre-existing, out-of-scope residual, named
 here rather than silently inherited.
 
 **Declared stale cross-references (A-20).** MOVED 2026-09-12 retimed
-exactly `breezy-k1-daily.timer` (was `22:30`, MOVED 2026-09-12) and
-`breezy-offer-gate-daily.timer` (was `22:45`, MOVED 2026-09-12) (plus this
-file), correcting the old values above. Five OTHER files still carry a
-stale comment cross-reference to that same pre-move schedule, and are
-deliberately left unedited because each is protected as an R-5/R-4-gated
-zero-diff file:
+exactly `breezy-k1-daily.timer` (was `22:30`, MOVED 2026-09-12) and the
+now-retired `breezy-offer-gate-daily.timer` (was `22:45`, MOVED 2026-09-12)
+(plus this file), correcting the old values above. Four OTHER files still
+carry a stale comment cross-reference to that same pre-move schedule, and
+are deliberately left unedited because each is protected as an R-5/R-4-gated
+zero-diff file (AUD-15, 2026-09-22: `breezy-mb-daily.timer` dropped from
+this list -- the file is retired, not merely left stale):
 `breezy-pm-crh-v2-tally.timer:13`, `breezy-live-tally.timer:12`,
-`breezy-mb-daily.timer:24-25`, `breezy-score-live-trials.timer:10`, and
+`breezy-score-live-trials.timer:10`, and
 `breezy-quote-tape-ingest.timer:11-12`. Follow-up owner: whoever unblocks
-R-5 (the `breezy-live-tally` narrowing ruling) should sweep these five
+R-5 (the `breezy-live-tally` narrowing ruling) should sweep these four
 comments in the same pass.
 
 **v3 tally now scheduled (L-38 closed 2026-09-16).** `pm_us_crh_cont` (the

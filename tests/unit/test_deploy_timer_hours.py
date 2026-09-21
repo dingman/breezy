@@ -113,7 +113,10 @@ def test_every_timer_file_is_parsed_by_this_test() -> None:
     timer_files = _all_timer_files()
     names = {path.name for path in timer_files}
     assert "breezy-live-tally.timer" in names
-    assert "breezy-mb-daily.timer" in names
+    # AUD-15 (2026-09-22): breezy-mb-daily.timer RETIRED, replaced at its
+    # own 13:30Z slot by breezy-asos-refresh.timer (ruling
+    # `RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md` RULING 1).
+    assert "breezy-asos-refresh.timer" in names
     assert "breezy-score-live-trials.timer" in names
 
 

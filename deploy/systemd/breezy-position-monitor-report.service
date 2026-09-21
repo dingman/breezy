@@ -16,6 +16,10 @@ Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Documentation=file:///home/jon/breezy/scripts/analysis/position_monitor_nightly_report.py
 Documentation=file:///home/jon/breezy/docs/plans/INTRADAY_POSITION_MONITOR_2026-09-15.md
 
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy

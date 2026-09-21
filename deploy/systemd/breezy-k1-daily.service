@@ -9,6 +9,10 @@ Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 # network for nothing at all -- it is a pure local read.
 After=network-online.target
 
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy

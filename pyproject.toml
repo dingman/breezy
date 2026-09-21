@@ -300,6 +300,12 @@ breezy-trade-supervisor = "breezy.runtime.trade_supervisor:main"
 # `breezy.runtime.check_alerts_cli` for the exit contract (2 = NO EGRESS
 # CONFIGURED, 3 = configured but NOT DELIVERED).
 breezy-check-alerts = "breezy.runtime.check_alerts_cli:main"
+# AUD-15a: the `OnFailure=` notifier for every study unit in
+# `deploy/systemd/` (`breezy-study-failed@.service`). Deliberately its own
+# process, mirroring `breezy-check-alerts`'s shape: no credential, no state
+# store, one alert, exits 0 unconditionally. See
+# `breezy.runtime.study_failure_notifier`.
+breezy-study-failed = "breezy.runtime.study_failure_notifier:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

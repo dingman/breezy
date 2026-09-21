@@ -1,0 +1,74 @@
+[Unit]
+# AUD-15 re-home (ruling A1, 2026-09-21/22): the ONLY surviving nightly
+# invocation of `asos_recent_refresh.py --since <ASOS_FETCH_START anchor>`,
+# moved here when `breezy-mb-daily` and `breezy-offer-gate-daily` were
+# RETIRED (docs/evidence/RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md
+# RULING 1, Revision 2 addendum §A1). This unit's ONLY job is to keep the
+# fixed-window ASOS cache the live-path hypothetical-hold monitor and the
+# exit-window study read (`scripts/analysis/current_rung_hold_monitor_
+# hypothetical_hold.py:158-168`, `current_rung_hold_exit_window_study.py:
+# 16-24`) advancing one UTC day at a time, and to alert if it does not
+# (`asos-refresh-run.sh`, `scripts/analysis/asos_cache_freshness_check.py`).
+Description=Breezy nightly ASOS refresh for the fixed-window (--since) cache key
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/asos_recent_refresh.py
+Documentation=file:///home/jon/breezy/scripts/analysis/asos_cache_freshness_check.py
+After=network-online.target
+Wants=network-online.target
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Light-unit band, NOT the heavy-study band: this is one HTTP GET per site
+# plus a cache-mtime read, never a tape scan -- matches
+# breezy-position-monitor-report.service's own ceiling (:33-34), not the
+# retired studies' MemoryHigh=12G/MemoryMax=16G. Still cites the 2026-09-11
+# K1 incident (breezy-k1-daily.service hit a 17.6 GB peak in under 2 minutes
+# with no ceiling at all, pushing the 31 GB host into swap while
+# breezy-trade-supervisor.service -- the live trading node, deliberately
+# left UNcapped, see its own :64 comment -- ran at ~625 MB) because every
+# unit on this host now carries an explicit ceiling for that reason, however
+# small its own working set.
+MemoryHigh=512M
+MemoryMax=1G
+
+# Shared aggregate ceiling across the nightly studies -- this unit takes the
+# same shared flock below, so it participates in the same serialization even
+# though it is not itself a heavy study.
+Slice=breezy-studies.slice
+UMask=0077
+
+# AUD-15 amendment (2026-09-22): the ONLY EnvironmentFile= this unit loads
+# -- a dedicated, single-key file (`alerts.env`, mode 0600, holding just
+# BREEZY_ALERT_WEBHOOK_URL), never `breezy-trade.env`/`polymarket.env`
+# (which also carry POLYMARKET_US_ACCOUNT_NUMBER /
+# POLYMARKET_US_EXEC_STATE_DB, a venue credential this unit must never
+# hold). Without it, this unit's freshness-check step always resolved a
+# LOG-ONLY alert sink -- detection without delivery. The `-` prefix keeps
+# the unit startable if the file is absent. The refresh subprocess itself
+# never sees this variable (asos-refresh-run.sh's `env -u`, least
+# privilege) -- only the freshness check needs it. See
+# `deploy/systemd/migrate-alerts-env.sh` and README.md's "AUD-15 alert env
+# file" note.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/deploy/systemd/asos-refresh-run.sh
+
+# A single HTTP GET per site (five sites) plus a cache-mtime read -- well
+# under even breezy-k1-daily's budget, but Type=oneshot still needs a bound.
+TimeoutStartSec=600
+
+# No Restart=. A missed refresh is caught same-day by the unconditional
+# freshness check inside the wrapper (asos_cache_stale WARN), 90 minutes
+# ahead of the first consumer -- see asos-refresh-run.sh's own header.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-asos-refresh
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-asos-refresh.timer` is
+# the only thing to enable.

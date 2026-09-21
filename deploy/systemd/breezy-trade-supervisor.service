@@ -75,6 +75,19 @@ UMask=0077
 # ---- Environment. Operator-reserved caps: REFERENCES ONLY. Build-side
 # session constants: assigned below per operator ruling 2026-09-10. ----
 #
+# AUD-15 amendment (2026-09-22): the dedicated, single-key alert file --
+# ONLY BREEZY_ALERT_WEBHOOK_URL, mode 0600, never a venue credential. Loaded
+# BEFORE breezy-trade.env so this is the single source of truth for the
+# webhook URL, shared with `breezy-study-failed@.service` and
+# `breezy-asos-refresh.service` (neither of which may load breezy-trade.env
+# itself -- it also carries POLYMARKET_US_ACCOUNT_NUMBER /
+# POLYMARKET_US_EXEC_STATE_DB). During the migration window
+# (`deploy/systemd/migrate-alerts-env.sh`) the same key may transiently
+# exist in BOTH files -- deliberate and harmless (identical value,
+# last-loaded-wins), never a two-sources-of-truth risk once `--finalize`
+# removes it from breezy-trade.env.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+#
 # Node/exec identity and paths. Value-free with respect to every reserved
 # control; supplies BREEZY_TRADE_CATALOG_ROOT, BREEZY_TRADE_TRADER_ID,
 # BREEZY_USER_AGENT, POLYMARKET_US_ACCOUNT_NUMBER and

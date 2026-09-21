@@ -14,6 +14,10 @@ Documentation=file:///home/jon/breezy/scripts/analysis/family_tally_v2.py
 Documentation=file:///home/jon/breezy/docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-09-04.md
 Documentation=file:///home/jon/breezy/docs/plans/FORECAST_TO_LEARNING_WORK_BREAKDOWN_2026-09-18.md
 
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy
