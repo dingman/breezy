@@ -70,9 +70,12 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Protocol, TextIO
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Final, Protocol, TextIO
 
 from nautilus_trader.common.actor import Actor
+from nautilus_trader.common.enums import ComponentState
+from nautilus_trader.common.messages import ComponentStateChanged
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
@@ -98,9 +101,11 @@ from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.account_presence_halt import install_account_presence_halt
 from breezy.runtime.backtest_order_guard import install_live_order_guard
 from breezy.runtime.component_health_watch import (
+    COMPONENT_STATE_TOPIC,
     install_component_degraded_alert,
     install_stale_intent_alert,
 )
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
@@ -121,6 +126,213 @@ logger = logging.getLogger(__name__)
 EXIT_OK = 0
 EXIT_RUNTIME_ERROR = 1
 EXIT_CONFIG_ERROR = 2
+
+#: One event for every boot that returns from ``node.run()`` without the
+#: trader ever having published ``RUNNING``. Fixed, so an operator can filter
+#: on it. ``detail`` is the cause enum below, never a value.
+BOOT_HALT_EVENT: Final[str] = "BOOT_HALT"
+BOOT_HALT_SEVERITY: Final[str] = "CRITICAL"
+BOOT_HALT_SITE: Final[str] = "global"
+
+#: ``OrderEmulator.start()`` sits between the reconciliation early-return and
+#: the portfolio early-return, and publishes this component type on
+#: ``events.system.OrderEmulator``. Never having seen it is what separates a
+#: failed reconciliation from a portfolio that never initialised: both leave
+#: ``portfolio.initialized`` false.
+_ORDER_EMULATOR_COMPONENT_TYPE: Final[str] = "OrderEmulator"
+
+def _boot_halt_sample_interval_s(node: Node) -> float:
+    """How often to re-read the kernel probes while the trader has not started.
+
+    Half the node's own ``timeout_connection`` (else one second). No new
+    numeric policy: shutdown disconnects clients before ``node.run()``
+    returns, so the post-run check needs a sample taken while the run was
+    still up, and the node's connection timeout is already that scale.
+    """
+    config = getattr(node, "_config", None)
+    if config is None:
+        config = getattr(getattr(node, "kernel", None), "_config", None)
+    if config is None:
+        config = getattr(node, "config", None)
+    timeout = getattr(config, "timeout_connection", None)
+    if isinstance(timeout, int | float) and not isinstance(timeout, bool) and timeout > 0:
+        return float(timeout) / 2
+    return 1
+
+
+class BootHaltDetail(StrEnum):
+    """Closed ``detail`` values for :data:`BOOT_HALT_EVENT`.
+
+    Fixed strings. Never exception text, never a count, never a path.
+    """
+
+    ENGINES_NOT_CONNECTED = "BOOT_HALT_ENGINES_NOT_CONNECTED"
+    RECONCILIATION_FAILED = "BOOT_HALT_RECONCILIATION_FAILED"
+    PORTFOLIO_NOT_INITIALISED = "BOOT_HALT_PORTFOLIO_NOT_INITIALISED"
+    TRADER_NEVER_STARTED = "BOOT_HALT_TRADER_NEVER_STARTED"
+
+
+class _BootHaltWatch:
+    """Latches what startup published, and the probes sampled while it ran.
+
+    The post-run check reads only this object. It does not re-read live
+    engine connectivity: by then ``stop`` has disconnected the clients.
+    """
+
+    def __init__(self, trader_component_id: str, node: Node, loop: Any) -> None:
+        self._trader_component_id = trader_component_id
+        self._node = node
+        self._loop = loop
+        self._cancelled = False
+        self._ticking = False
+        self._handle: Any = None
+        self._interval_s = _boot_halt_sample_interval_s(node)
+        self.trader_running = False
+        self.emulator_running = False
+        self.engines_connected = False
+        self.engines_disconnected = False
+        self.portfolio_observed = False
+        self.portfolio_initialized = False
+
+    def observe(self, event: object) -> None:
+        if not isinstance(event, ComponentStateChanged):
+            return
+        if event.state != ComponentState.RUNNING:
+            return
+        if event.component_type == _ORDER_EMULATOR_COMPONENT_TYPE:
+            self.emulator_running = True
+        if str(event.component_id) == self._trader_component_id:
+            self.trader_running = True
+
+    def sample(self, node: Node) -> None:
+        """Sticky: a later disconnect must not erase a connection we saw.
+
+        Missing probes (a test double with no engine) are "not observed",
+        not a guessed cause. ``getattr`` rather than ``except``: a probe
+        that is absent must not look like a probe that failed.
+        """
+        kernel = getattr(node, "kernel", None)
+        if kernel is None:
+            return
+        data_check = getattr(getattr(kernel, "data_engine", None), "check_connected", None)
+        exec_check = getattr(getattr(kernel, "exec_engine", None), "check_connected", None)
+        if callable(data_check) and callable(exec_check):
+            if data_check() and exec_check():
+                self.engines_connected = True
+            else:
+                self.engines_disconnected = True
+        portfolio = getattr(kernel, "portfolio", None)
+        if portfolio is not None and hasattr(portfolio, "initialized"):
+            self.portfolio_observed = True
+            if portfolio.initialized:
+                self.portfolio_initialized = True
+
+    def detail(self) -> str | None:
+        """The boot-halt ``detail``, or ``None`` when the trader did start."""
+        if self.trader_running:
+            return None
+        if self.engines_connected:
+            if not self.emulator_running:
+                return BootHaltDetail.RECONCILIATION_FAILED.value
+            if self.portfolio_observed and not self.portfolio_initialized:
+                return BootHaltDetail.PORTFOLIO_NOT_INITIALISED.value
+            return BootHaltDetail.TRADER_NEVER_STARTED.value
+        if self.engines_disconnected:
+            return BootHaltDetail.ENGINES_NOT_CONNECTED.value
+        return BootHaltDetail.TRADER_NEVER_STARTED.value
+
+    def ensure_ticking(self) -> None:
+        if self._ticking or self._cancelled or self.trader_running or self._loop is None:
+            return
+        self._ticking = True
+
+        def _tick() -> None:
+            if self._cancelled or self.trader_running:
+                return
+            self.sample(self._node)
+            if self._cancelled or self.trader_running:
+                return
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            try:
+                self._handle = loop.call_later(self._interval_s, _tick)
+            except RuntimeError:
+                return
+
+        try:
+            self._handle = self._loop.call_soon(_tick)
+        except RuntimeError:
+            self._ticking = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            handle.cancel()
+
+
+def _install_boot_halt_watch(node: Node) -> _BootHaltWatch:
+    """Latch trader and ``OrderEmulator`` ``RUNNING`` on the component bus.
+
+    Installed beside the other post-``build()`` watches. The handler only
+    records; it never asks the node to stop, start, or trade.
+    """
+    # A test double may not carry ``trader.id``. Falling back, and never
+    # raising, is load-bearing: this watch must not turn a boot into an
+    # exit-1. The real node sets ``Trader.id`` to its ``TraderId``.
+    trader = getattr(node, "trader", None)
+    component_id = getattr(trader, "id", None)
+    if component_id is None:
+        config = getattr(node, "config", None)
+        if config is None:
+            config = getattr(node, "_config", None)
+        component_id = getattr(config, "trader_id", "")
+    watch = _BootHaltWatch(
+        trader_component_id=str(component_id or ""),
+        node=node,
+        loop=getattr(getattr(node, "kernel", None), "loop", None),
+    )
+
+    def _on_component_state(event: object) -> None:
+        # A broken watch must not unwind the component that published the
+        # event. That would change whether the node boots.
+        try:
+            watch.observe(event)
+            watch.sample(node)
+            watch.ensure_ticking()
+        except Exception as exc:  # noqa: BLE001 - a watch must not unwind the publisher
+            logger.error("boot-halt watch failed exception_type=%s", type(exc).__name__)
+
+    node.kernel.msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
+    return watch
+
+
+def _emit_boot_halt_alert(watch: _BootHaltWatch) -> None:
+    """One CRITICAL when ``node.run()`` returned with the trader never started.
+
+    ``emit_alert`` contains sink failures. Construction of the sink is
+    contained here too: a bad webhook URL must not change the exit code.
+    """
+    try:
+        detail = watch.detail()
+        if detail is None:
+            return
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=BOOT_HALT_SEVERITY,
+                event=BOOT_HALT_EVENT,
+                site=BOOT_HALT_SITE,
+                detail=detail,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert must not change the exit code
+        logger.error(
+            "boot-halt alert could not be emitted exception_type=%s",
+            type(exc).__name__,
+        )
 
 #: Failures that mean "this deployment is misconfigured", not "the run broke".
 #: ``OSError`` is included because the credential key file this process opens
@@ -397,6 +609,7 @@ def _run_node(
     check at venue egress.
     """
     node: Node | None = None
+    boot_halt_watch: _BootHaltWatch | None = None
     try:
         node = node_factory(config)
         node.add_data_client_factory(
@@ -433,9 +646,16 @@ def _run_node(
             node.kernel.risk_engine,
             on_halt=_account_halt_reporter(stderr),
         )
+        # AUD-13d. Records whether the trader (and the order emulator) ever
+        # reached RUNNING. It does not start, stop, or alter the node.
+        boot_halt_watch = _install_boot_halt_watch(node)
         if after_build is not None:
             after_build(node)
         node.run()
+        # A reconciliation failure does not raise and does not by itself
+        # stop the node; when ``run()`` does return with the trader never
+        # started, say so. The exit code below is unchanged either way.
+        _emit_boot_halt_alert(boot_halt_watch)
         return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
         # A deliberate stop is NOT a failure. `TradingNode.run` catches only
@@ -451,6 +671,8 @@ def _run_node(
         _report(stderr, "trading node failed", exc, expected=False)
         return EXIT_RUNTIME_ERROR
     finally:
+        if boot_halt_watch is not None:
+            boot_halt_watch.cancel()
         if node is not None:
             try:
                 node.dispose()
