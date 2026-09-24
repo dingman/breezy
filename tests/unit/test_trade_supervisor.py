@@ -33,6 +33,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_intent_marker_path
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
+    BUILD_REVISION_ENV_VAR,
     EXIT_CONFIG_ERROR,
     EXIT_OK,
     NODE_CONSOLE_SCRIPT,
@@ -44,6 +45,8 @@ from breezy.runtime.trade_supervisor import (
     _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
+    _read_git_head_sha,
+    _resolve_build_revision,
     _run_forever,
     _SELF_CHECK_PASS_RESULTS,
     _SupervisorFileHandler,
@@ -3636,6 +3639,132 @@ class TestSupervisorLoggingConfiguration:
         # UTC-formatted timestamp prefix, per line -- e.g. "2026-09-05T...Z".
         assert "Z INFO breezy.runtime.trade_supervisor supervisor_started" in content
 
+    def test_supervisor_started_logs_a_revision_field(self, monkeypatch, tmp_path):
+        """AUD-14a: the supervisor records the build revision it is running
+        so a restart's motive (deploy vs not) is inferable after the fact by
+        diffing consecutive `revision=` values -- see
+        docs/plans/backlog/AUDIT_2026-09-21/AUD-14-...md, §6/§7 14a."""
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv(BUILD_REVISION_ENV_VAR, "deadbeef123")
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+
+        log_path = supervisor_log_path(home / ".local" / "share" / "breezy" / "logs")
+        content = log_path.read_text()
+        assert "supervisor_started" in content
+        assert "revision=deadbeef123" in content
+
+    def test_an_absent_revision_logs_unknown_rather_than_omitting_the_field(
+        self, monkeypatch, tmp_path
+    ):
+        """When the env var, the git-file lookup, AND package metadata all
+        come up empty, the field is still present -- `revision=unknown`,
+        never omitted (an absent field is indistinguishable from an old
+        binary)."""
+        import importlib.metadata
+
+        import breezy.runtime.trade_supervisor as ts_module
+
+        def _raise_not_found(_name: str) -> str:
+            raise importlib.metadata.PackageNotFoundError
+
+        monkeypatch.delenv(BUILD_REVISION_ENV_VAR, raising=False)
+        monkeypatch.setattr(ts_module, "_read_source_tree_head_sha", lambda: None)
+        monkeypatch.setattr(importlib.metadata, "version", _raise_not_found)
+
+        home = tmp_path / "home"
+        home.mkdir()
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+
+        log_path = supervisor_log_path(home / ".local" / "share" / "breezy" / "logs")
+        content = log_path.read_text()
+        assert "revision=unknown" in content
+
+    def test_the_revision_field_is_never_read_from_an_operator_reserved_variable(self):
+        """The resolver's ENV lookup consults only `BUILD_REVISION_ENV_VAR`
+        -- never one of the two operator-reserved caps -- regardless of
+        what the git-file/metadata fallbacks resolve to."""
+        from breezy.adapters.polymarket_us.operator_controls import (
+            OPERATOR_RESERVED_CONTROL_ENV_VARS,
+        )
+
+        class _RecordingEnv(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.accessed_keys: list[str] = []
+
+            def get(self, key, default=None):
+                self.accessed_keys.append(key)
+                return super().get(key, default)
+
+        env = _RecordingEnv(
+            {var: "sentinel-operator-value" for var in OPERATOR_RESERVED_CONTROL_ENV_VARS}
+        )
+
+        revision = _resolve_build_revision(env)
+
+        assert revision != "sentinel-operator-value"
+        for reserved_var in OPERATOR_RESERVED_CONTROL_ENV_VARS:
+            assert reserved_var not in env.accessed_keys
+
+    def test_resolve_build_revision_falls_through_to_metadata_when_the_git_head_sha_is_unavailable(
+        self, monkeypatch
+    ):
+        """`_read_source_tree_head_sha` returning `None` (an ordinary,
+        anticipated "this isn't resolvable from .git" outcome, e.g. a
+        non-editable install) is NOT an exception -- it is a clean
+        fall-through to `importlib.metadata.version`, never straight to
+        "unknown"."""
+        import importlib.metadata
+
+        import breezy.runtime.trade_supervisor as ts_module
+
+        monkeypatch.setattr(ts_module, "_read_source_tree_head_sha", lambda: None)
+        expected = importlib.metadata.version("breezy")
+
+        revision = _resolve_build_revision({})
+
+        assert revision == expected
+        assert revision != "unknown"
+
+    def test_resolve_build_revision_truncates_a_resolved_sha_to_twelve_characters(
+        self, monkeypatch
+    ):
+        """No `-dirty` suffix, no full 40-char sha -- exactly the first 12
+        hex characters, per the coordinator's explicit ruling."""
+        import breezy.runtime.trade_supervisor as ts_module
+
+        full_sha = "abcdef0123456789abcdef0123456789abcdef01"
+        monkeypatch.setattr(ts_module, "_read_source_tree_head_sha", lambda: full_sha)
+
+        revision = _resolve_build_revision({})
+
+        assert revision == full_sha[:12]
+        assert len(revision) == 12
+
+    def test_resolve_build_revision_returns_unknown_and_logs_a_warning_on_any_unexpected_exception(
+        self, monkeypatch, caplog
+    ):
+        """The WHOLE resolution is wrapped in `except Exception`: a genuine,
+        unanticipated failure (as opposed to the ordinary `None`
+        fall-through above) never crashes supervisor startup -- it logs one
+        WARNING and returns "unknown"."""
+        import breezy.runtime.trade_supervisor as ts_module
+
+        def _boom() -> str | None:
+            raise RuntimeError("simulated unexpected failure reading .git")
+
+        monkeypatch.setattr(ts_module, "_read_source_tree_head_sha", _boom)
+
+        with caplog.at_level("WARNING"):
+            revision = _resolve_build_revision({})
+
+        assert revision == "unknown"
+        assert any(
+            record.levelname == "WARNING" and "build revision" in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_sentinel_env_value_never_appears_in_the_log_file(self, monkeypatch, tmp_path):
         home = tmp_path / "home"
         home.mkdir()
@@ -3706,6 +3835,91 @@ class TestSupervisorLoggingConfiguration:
         assert exit_code == EXIT_OK
         assert supervisor_log_path(override_log_dir).exists()
         assert not decoy_home_log_dir.exists()
+
+
+# ===========================================================================
+# AUD-14a (coordinator REQUEST_CHANGES): `_read_git_head_sha` reads `.git`
+# files directly -- no `git` subprocess, no GitPython -- to resolve the
+# commit of the source tree actually imported. Each shape it must handle is
+# pinned independently: an ordinary symbolic HEAD, a detached HEAD, the
+# packed-refs fallback, and a linked worktree's `.git` FILE + `commondir`
+# indirection (this repo's own backlog worktrees have exactly this shape).
+# ===========================================================================
+
+
+_FAKE_SHA = "abcdef0123456789abcdef0123456789abcdef01"
+
+
+class TestReadGitHeadSha:
+    def test_resolves_a_symbolic_head_via_a_loose_ref(self, tmp_path):
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        refs_dir = git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        (refs_dir / "main").write_text(f"{_FAKE_SHA}\n")
+
+        assert _read_git_head_sha(git_dir) == _FAKE_SHA
+
+    def test_resolves_a_detached_head(self, tmp_path):
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text(f"{_FAKE_SHA}\n")
+
+        assert _read_git_head_sha(git_dir) == _FAKE_SHA
+
+    def test_falls_back_to_packed_refs_when_the_loose_ref_is_missing(self, tmp_path):
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        # No refs/heads/main loose ref file -- only packed-refs carries it,
+        # exactly as happens once a branch has been packed.
+        (git_dir / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted \n"
+            f"{_FAKE_SHA} refs/heads/main\n"
+        )
+
+        assert _read_git_head_sha(git_dir) == _FAKE_SHA
+
+    def test_follows_a_linked_worktree_gitdir_file_and_its_commondir(self, tmp_path):
+        # Mirrors this repo's own real layout: <worktree>/.git is a FILE
+        # pointing at <main>/.git/worktrees/<name>, which carries its own
+        # HEAD but a `commondir` back to the shared refs.
+        main_git_dir = tmp_path / "main" / ".git"
+        worktree_git_dir = main_git_dir / "worktrees" / "linked"
+        worktree_git_dir.mkdir(parents=True)
+        (worktree_git_dir / "commondir").write_text("../..\n")
+        (worktree_git_dir / "HEAD").write_text("ref: refs/heads/feature\n")
+        refs_dir = main_git_dir / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        (refs_dir / "feature").write_text(f"{_FAKE_SHA}\n")
+
+        linked_git_file = tmp_path / "linked" / ".git"
+        linked_git_file.parent.mkdir(parents=True)
+        linked_git_file.write_text(f"gitdir: {worktree_git_dir}\n")
+
+        assert _read_git_head_sha(linked_git_file) == _FAKE_SHA
+
+    def test_returns_none_for_a_missing_git_directory(self, tmp_path):
+        assert _read_git_head_sha(tmp_path / "nonexistent" / ".git") is None
+
+    def test_returns_none_when_head_is_missing(self, tmp_path):
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        # No HEAD file at all.
+        assert _read_git_head_sha(git_dir) is None
+
+    def test_returns_none_when_the_ref_is_unresolvable(self, tmp_path):
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text("ref: refs/heads/ghost\n")
+        # Neither a loose ref file nor packed-refs names "ghost".
+        assert _read_git_head_sha(git_dir) is None
+
+    def test_returns_none_for_a_git_file_with_unrecognised_content(self, tmp_path):
+        git_file = tmp_path / ".git"
+        git_file.write_text("not-a-gitdir-line\n")
+        assert _read_git_head_sha(git_file) is None
 
 
 # ===========================================================================
