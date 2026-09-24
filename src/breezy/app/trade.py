@@ -214,6 +214,11 @@ def run(
         return EXIT_CONFIG_ERROR
 
     if settings.sending_family_id is None:
+        # AUD-16b: the explicit sentinel line -- a missing line here would be
+        # indistinguishable from an old binary that never carried this field.
+        _boot_logger.info(
+            "boot_family id=none composition_kind=none status=none manifest_sha256=none"
+        )
         return trade_cli.run(
             env=env,
             node_factory=node_factory,
@@ -241,6 +246,24 @@ def run(
 
     try:
         manifest = load_family_manifest(_FAMILIES_DIR / f"{settings.sending_family_id}.json")
+        # AUD-16b: attribute this boot to the family + the manifest bytes it
+        # actually loaded (sha256 over the raw on-disk file, computed in
+        # load_family_manifest before the dataclass is built). Values only
+        # from the loaded manifest and settings.sending_family_id -- never an
+        # environ mapping, an operator-reserved cap, or exception text.
+        # Observability only: nothing may key on this line, and it changes no
+        # decision. KNOWN GAP (not silently assumed -- see AUD-16 return):
+        # this line cannot precede the permit lines app/trade.py::main logs
+        # before it calls run() (the sole production caller); achieving that
+        # would require moving manifest resolution into main(), ahead of
+        # permit issuance, which is out of this item's scope.
+        _boot_logger.info(
+            "boot_family id=%s composition_kind=%s status=%s manifest_sha256=%s",
+            settings.sending_family_id,
+            manifest.composition_kind,
+            manifest.status,
+            manifest.manifest_sha256,
+        )
         # Manifest stations, not SUPPORTED_STATIONS. The call has to follow
         # the load: the composable set is a property of this manifest.
         today_by_station = _today_by_station(_composable_stations(manifest))
