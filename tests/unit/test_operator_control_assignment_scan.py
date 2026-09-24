@@ -118,6 +118,21 @@ WHITELISTED_TEST_HELPER: Final[str] = "tests/unit/operator_control_env.py"
 #: inventory, so it necessarily references the constant that carries them.
 SCAN_MODULE: Final[str] = "tests/unit/test_operator_control_assignment_scan.py"
 
+#: Documentary mentions reviewed when the 2026-09-21 audit plans were committed.
+#: Each path names a control in prose and is not Python, so it cannot assign one.
+#: One set, widened by a reviewed path — never a directory exclusion, never a
+#: relaxation of the layer-B equality below.
+REVIEWED_PROSE_MENTIONS: Final[frozenset[str]] = frozenset(
+    {
+        (
+            "docs/plans/backlog/AUDIT_2026-09-21/"
+            "AUD-17-operator-caps-proven-through-the-v4-live-composition.md"
+        ),
+        "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r3-silent-failure-hunter.md",
+        "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r4-silent-failure-hunter.md",
+    }
+)
+
 #: A6: the ONLY callables that may be handed a control's NAME as an argument
 #: outside the definition module. Everything here either removes a value
 #: (fail-closed), tabulates cases, or IS the whitelisted seam. Anything else --
@@ -614,8 +629,51 @@ def test_only_the_definition_module_names_an_operator_reserved_control() -> None
     ``.env.example``, a systemd unit under ``deploy/``, a CI YAML, a shell
     script, a JSON fixture, or a docstring code sample. Any of them naming a
     control lands here as a failing diff a reviewer has to look at.
+
+    ``REVIEWED_PROSE_MENTIONS`` is the one reviewed allowlist of documentary
+    paths. A new mention is a new row in that set, not a prefix exclusion.
     """
-    assert files_naming_a_control() == {DEFINITION_MODULE, "operator.env.example"}
+    assert files_naming_a_control() == {
+        DEFINITION_MODULE,
+        "operator.env.example",
+    } | REVIEWED_PROSE_MENTIONS
+
+
+def test_reviewed_prose_mentions_are_one_exact_non_assigning_allowlist() -> None:
+    """Import-set and AST pin for the one documentary allowlist.
+
+    The row is not a blanket ``docs/`` exclusion: the set is exact, every
+    member is a markdown file whose bytes name a control, ``ast.parse``
+    rejects each file (it is not a module that could assign), and no Python
+    file under the layer-A roots imports one of those paths.
+    """
+    assert REVIEWED_PROSE_MENTIONS == frozenset(
+        {
+            (
+                "docs/plans/backlog/AUDIT_2026-09-21/"
+                "AUD-17-operator-caps-proven-through-the-v4-live-composition.md"
+            ),
+            "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r3-silent-failure-hunter.md",
+            "docs/plans/backlog/AUDIT_2026-09-21/reviews/AUD-17-r4-silent-failure-hunter.md",
+        }
+    )
+    imported_from: list[str] = []
+    for root in SCAN_ROOTS:
+        for path in (REPO_ROOT / root).rglob("*.py"):
+            if "__pycache__" in path.parts or path.name == Path(SCAN_MODULE).name:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for relative in REVIEWED_PROSE_MENTIONS:
+                if Path(relative).name in text:
+                    imported_from.append(path.relative_to(REPO_ROOT).as_posix())
+    assert imported_from == []
+    for relative in sorted(REVIEWED_PROSE_MENTIONS):
+        document = REPO_ROOT / relative
+        source = document.read_text(encoding="utf-8")
+        assert document.suffix == ".md"
+        assert any(name in source for name in CONTROL_ENV_VAR_NAMES)
+        with pytest.raises(SyntaxError):
+            ast.parse(source)
 
 
 def test_the_census_fires_on_a_control_name_planted_in_a_config_file(
