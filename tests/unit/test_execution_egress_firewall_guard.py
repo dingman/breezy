@@ -2175,6 +2175,18 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # which stays absent from this set.
         "self._resolver_instrument_loader",
         "self._cache.add_instrument",
+        # HIGH review fix (2026-09-24, post-ac691dc): the loader above is a
+        # synchronous full-catalog scan measured at 1.06-1.36s wall time
+        # against the production catalog -- run directly on the event loop
+        # it would stall order sends and quote processing for over a
+        # second on every miss. `self._loop` is the SAME
+        # `asyncio.AbstractEventLoop` this coroutine already runs on
+        # (`LiveExecutionClient.__init__` stores the injected `loop` as
+        # `self._loop`, `live/execution_client.py:132`) -- `run_in_executor`
+        # hands the call to the default `ThreadPoolExecutor` and merely
+        # awaits the result; it opens no socket, sends no order, and
+        # creates no market-data subscription.
+        "self._loop.run_in_executor",
     }
 )
 
