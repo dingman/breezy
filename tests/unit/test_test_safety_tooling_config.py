@@ -69,6 +69,8 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
         # `app` is the composition-root layer above `strategy`: it constructs
         # strategies and hands already-built objects down to `runtime`.
         "app",
+        # Offline analysis cores reach DOWN; nothing below reaches up, and `app` never loads them.
+        "analysis",
         # `strategy` reaches DOWN into `runtime` (the backtest feed's shared
         # `ClientId`) and `ingest` (the shared weather `DataType` factories),
         # and nothing below `app` reaches back up. The harness in `runtime`
@@ -116,6 +118,33 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
     # importing the `.com` adapter and asserts the real `lint-imports`
     # rejects it.
     assert forbidden.get("ignore_imports", []) == []
+
+    live_path = contracts["The live trading path never imports the offline analysis layer"]
+    assert live_path["type"] == "forbidden"
+    assert live_path["source_modules"] == [
+        "breezy.app",
+        "breezy.strategy",
+        "breezy.runtime",
+        "breezy.adapters",
+        "breezy.ingest",
+        "breezy.persistence",
+        "breezy.registry",
+        "breezy.normalize",
+        "breezy.features",
+        "breezy.settlement",
+        "breezy.domain",
+    ]
+    assert live_path["forbidden_modules"] == ["breezy.analysis"]
+    # Written without the key. Import-linter's default is false, so an
+    # indirect import of the offline analysis layer is forbidden too.
+    assert "allow_indirect_imports" not in live_path
+    assert live_path.get("allow_indirect_imports", False) is False
+
+    analysis_nautilus = contracts["The offline analysis layer never DIRECTLY imports Nautilus"]
+    assert analysis_nautilus["type"] == "forbidden"
+    assert analysis_nautilus["source_modules"] == ["breezy.analysis"]
+    assert analysis_nautilus["forbidden_modules"] == ["nautilus_trader"]
+    assert analysis_nautilus["allow_indirect_imports"] is True
 
 
 def test_polymarket_com_adapter_imports_are_banned_repo_wide() -> None:
