@@ -456,7 +456,9 @@ def _trial_rows(
 def _write_mechanism_trials(output_dir: Path, rows: Sequence[dict[str, str]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "LOOKAHEAD_CAVEAT.txt").write_text(LOOK_AHEAD_CAVEAT + "\n", encoding="utf-8")
-    stamped = [dict(row, mechanism_test_only="true") for row in rows]
+    # `rows` (always built by `_trial_rows`, the one caller) already carries
+    # `mechanism_test_only="true"` per row; no second stamp needed here.
+    stamped = list(rows)
     fieldnames = [
         "station",
         "climate_day",

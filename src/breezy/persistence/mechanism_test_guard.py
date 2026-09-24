@@ -63,9 +63,12 @@ def _parquet_declares(path: Path) -> bool:
     text = raw.decode("utf-8", errors="replace").strip().lower()
     if text in _TRUE:
         return True
+    # Fail-closed on PRESENCE, not value: the column being set at all --
+    # including to an explicit "false" -- still refuses. Only its absence
+    # (`raw is None`, above) leaves the directory eligible.
     raise MechanismTestIneligibleError(
-        f"{path} carries mechanism_test_only={raw!r}, which is not an explicit "
-        "false; refusing it as a PREREG or tally input"
+        f"{path} carries a mechanism_test_only marker ({raw!r}); any explicit "
+        "value, true or false, refuses it as a PREREG or tally input"
     )
 
 
