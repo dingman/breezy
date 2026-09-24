@@ -232,6 +232,12 @@ if "$PY" "$REPO/scripts/analysis/family_tally_v2.py" \
 else
   say "FAMILY TALLY V2 ($FAMILY) RUN FAILED (see stderr above in $LOG)"
   STATUS=1
+  # AUD-05 D-F: one CRITICAL per (family, UTC day). A repeat the same day
+  # is latched. Alert failure must not change the tally's own exit status.
+  LATCH="$OUT/family_tally/.alert_latch.json"
+  "$PY" -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from family_tally_v2 import emit_family_tally_failure_alert; log_path = Path(sys.argv[3]); emit_family_tally_failure_alert(family_id=sys.argv[2], log_text=log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else "", latch_path=Path(sys.argv[4]), today_utc=sys.argv[5])' \
+    "$REPO/scripts/analysis" "$FAMILY" "$LOG" "$LATCH" "$STAMP" \
+    || say "FAMILY TALLY V2 ($FAMILY) alert emit failed (non-fatal)"
 fi
 
 exit "$STATUS"

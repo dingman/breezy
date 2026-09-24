@@ -407,20 +407,15 @@ def build_stratum_v2(
 ) -> StratumV2 | None:
     """`None` for an empty stratum -- a rate over nothing is undefined.
 
-    Raises `ValueError` if any row's `side != "yes"` (fix-first review of
-    87278dd, item 3) -- `k = sum(row.held ...)`/`pi = mean(BE_i)` is
-    side-blind, same refusal `score()` applies, until this is made
-    side-aware.
+    Side-aware at ``pi = mean(BE_i)``: under H0 ``E[held_i] = BE_i`` on both
+    YES and NO (NO-side amendment 2026-09-14; ``StratumRow`` keeps the leg's
+    own ask, fee, and held). A side outside ``{yes, no}`` still raises in
+    ``StratumRow.__post_init__``. The arithmetic below is unchanged.
+    ``score()`` stays side-blind; this tally does not call it.
     """
     rows = tuple(rows)
     if not rows:
         return None
-    if any(row.side != "yes" for row in rows):
-        raise ValueError(
-            "build_stratum_v2() is side-blind and refuses any row with "
-            "side != 'yes' until it is made side-aware (fix-first review "
-            "of 87278dd, item 3)"
-        )
     n = len(rows)
     k = sum(1 for row in rows if row.held)
     mean_ask = sum((row.entry_ask for row in rows), start=Decimal(0)) / n

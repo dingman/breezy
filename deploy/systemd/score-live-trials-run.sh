@@ -37,14 +37,12 @@ set -uo pipefail
 
 REPO=/home/jon/breezy
 PY="${BREEZY_SCORE_LIVE_TRIALS_PYTHON:-$REPO/.venv/bin/python}"
-# BLOCK-1: byte-identical to live-tally-run.sh's own assignment -- one
-# manifest literal, two wrappers, one test. Reaches two consumers now (L-38
-# widened the scorer loop below off a separate, generically-enumerated
-# list): the covered-listed-station-days counter's --family-manifest, and
-# (unchanged since before L-38) the structural-dead-stop pin stays
-# v2-scoped only, tracked separately (R-4, SP-1 I5) -- never every scorer
-# invocation any more, that is FAMILY_MANIFESTS below.
-FAMILY_MANIFEST="$REPO/deploy/families/pm_us_crh_v2.json"
+# INC-SP1I5 (AUD-05; RULING_live_family_tally_scope_2026-09-21.md): the
+# covered-listed counter follows the deployed sending family, read from
+# breezy-trade-supervisor.service's BREEZY_SENDING_FAMILY_ID. No second
+# family-manifest literal. BREEZY_SYSTEMCTL is a test seam; production
+# leaves it unset. RULING_A1 stops sending only -- this counter does not
+# branch on that disposition.
 # L-38: every REGISTERED, venue=polymarket_us family manifest under
 # deploy/families -- one scorer invocation per (city, manifest) pair below.
 # Overridable so tests can point at a worktree's own deploy/families
@@ -113,6 +111,47 @@ if [ "$CHECK_TOKEN" = "NO_NODE" ]; then
 fi
 
 CJSON="$OUT/covered_listed_station_days_$STAMP.json"
+# INC-SP1I5: resolve the champion BEFORE the counter. A missing or
+# unregistered id removes any stale counter JSON and exits 1, so yesterday's
+# file is not consumed and no new file is written.
+SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
+resolve_sending_family_manifest() {
+  local show id path status
+  show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG") || true
+  # `systemctl show --property=Environment` prints `Environment=K=V K=V`
+  # (one or more lines). Strip the property name, then split assignments.
+  id=$(printf '%s\n' "$show" | sed -n 's/^Environment=//p' | tr ' ' '\n' | sed -n 's/^BREEZY_SENDING_FAMILY_ID=//p' | head -n1)
+  id=${id%\"}
+  id=${id#\"}
+  if [ -z "$id" ]; then
+    say "SCORE LIVE TRIALS SKIPPED -- BREEZY_SENDING_FAMILY_ID absent on breezy-trade-supervisor.service"
+    return 1
+  fi
+  case "$id" in
+    *[!A-Za-z0-9_-]*)
+      say "SCORE LIVE TRIALS SKIPPED -- BREEZY_SENDING_FAMILY_ID is not a family id"
+      return 1
+      ;;
+  esac
+  path="$FAMILIES_DIR/$id.json"
+  if [ ! -f "$path" ]; then
+    say "SCORE LIVE TRIALS SKIPPED -- no manifest for sending family $id"
+    return 1
+  fi
+  status=$(manifest_field "$path" status)
+  if [ "$status" != "REGISTERED" ]; then
+    say "SCORE LIVE TRIALS SKIPPED -- sending family $id status=${status:-absent} is not REGISTERED"
+    return 1
+  fi
+  CHAMPION_MANIFEST=$path
+  CHAMPION_FAMILY_ID=$id
+  say "covered-listed counter family=$id manifest=$path"
+  return 0
+}
+if ! resolve_sending_family_manifest; then
+  rm -f "$CJSON"
+  exit 1
+fi
 # Trust-boundary residual (Codex re-check, MEDIUM): remove any existing
 # counter JSON IMMEDIATELY before invoking the counter -- never leave a
 # stale/foreign well-shaped file in place for the station loop below or the
@@ -122,7 +161,7 @@ CJSON="$OUT/covered_listed_station_days_$STAMP.json"
 rm -f "$CJSON"
 if ! "$PY" "$REPO/scripts/analysis/structural_dead_stop.py" \
      --catalog-root "$CATALOG_ROOT" \
-     --family-manifest "$FAMILY_MANIFEST" \
+     --family-manifest "$CHAMPION_MANIFEST" \
      --output "$CJSON" >>"$LOG" 2>&1; then
   say "SCORE LIVE TRIALS SKIPPED -- covered-listed station-days counter FAILED"
   exit 1

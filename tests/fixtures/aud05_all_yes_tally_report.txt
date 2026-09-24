@@ -1,0 +1,33 @@
+# PREREG v2 family tally
+
+family_id: pm_us_crh_v2_test
+manifest_sha256: 85b464bc2afb9fb74df074a03925df216fda85aead7dc0bc4adf44a6445f9de9
+boundary_inputs_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+status: REGISTERED
+as_of: 2026-09-24
+row count: 4 (excluded: 0)
+source parquet: /tmp/scored.parquet
+
+provenance barrier (obligation e): the 17-column ScoredTrial schema carries no separate provenance column -- family/version scope is enforced by three barriers, ANY of which refuses the whole tally: trial_id prefix match AND climate_day >= the registered d0_climate_day AND station in the registered station census (breezy.settlement.family_barrier.assert_family_only). In addition, --store-dir must carry a provenance.json sidecar declaring provenance=='live' (written by score_live_trials.py, ruling Q4) -- refused if missing or mismatched, except on an empty store with no sidecar yet (n=0, not a refusal, R2) -- and every scored fill's sequential-look position is read from the store's fill_order.jsonl sidecar (B3).
+qty guard (partial_or_multi_fill, obligation b): DORMANT against this store -- ScoredTrial carries no qty column (dropped upstream by trial_scorer.score_trial); see family_tally_v2.py module docstring.
+
+| stratum | n | k | mean ask | mean BE (pi) | Wilson-lower | Wilson-upper | |
+|---|---:|---:|---:|---:|---:|---:|---|
+| pooled | 4 | 4 | 0.1000 | 0.1054 | 0.5101 | 1.0000 |  |
+| station:LAX | 1 | 1 | 0.1000 | 0.1054 | 0.2065 | 1.0000 |  |
+| station:MDW | 1 | 1 | 0.1000 | 0.1054 | 0.2065 | 1.0000 |  |
+| station:MIA | 1 | 1 | 0.1000 | 0.1054 | 0.2065 | 1.0000 |  |
+| station:SFO | 1 | 1 | 0.1000 | 0.1054 | 0.2065 | 1.0000 |  |
+| ask:(0.05,0.15] | 4 | 4 | 0.1000 | 0.1054 | 0.5101 | 1.0000 |  |
+
+**CONTINUE** -- fewer than one completed look so far (n < look_step)
+
+| look | n | t | S | I | b_eff | b_fut | verdict |
+|---:|---:|---:|---:|---:|---:|---:|---|
+
+total pnl (non-excluded): 3.578400
+BCa: not computed (terminal-only; no completed terminal look yet)
+
+Coverage -- admission exclusions (reporting only; dn = dk = dI = dS = 0)
+
+no exclusions recorded (artefact absent)

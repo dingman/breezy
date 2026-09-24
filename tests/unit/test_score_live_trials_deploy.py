@@ -143,6 +143,7 @@ def _run_wrapper(
     stub_python: Path | None,
     set_state_db: bool = True,
     families_dir: Path | None = None,
+    systemctl_stub: Path | None = None,
 ) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     home = tmp_path / "home"
@@ -164,6 +165,11 @@ def _run_wrapper(
         env.pop("POLYMARKET_US_EXEC_STATE_DB", None)
     if stub_python is not None:
         env["BREEZY_SCORE_LIVE_TRIALS_PYTHON"] = str(stub_python)
+    if systemctl_stub is None:
+        systemctl_stub = _systemctl_stub(
+            tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4"
+        )
+    env["BREEZY_SYSTEMCTL"] = str(systemctl_stub)
     return subprocess.run(
         ["bash", str(_WRAPPER)],
         cwd=_REPO_ROOT,
@@ -517,15 +523,16 @@ def test_neither_i3_unit_carries_an_environment_file_directive() -> None:
 
 
 def test_family_manifest_assignment_byte_identical_across_wrappers() -> None:
-    scorer_lines = [
-        line for line in _WRAPPER.read_text().splitlines() if line.startswith("FAMILY_MANIFEST=")
-    ]
+    """v1's live tally keeps its pinned manifest. INC-SP1I5 moved the 14:15
+    counter off that literal onto BREEZY_SENDING_FAMILY_ID."""
     v1_lines = [
         line for line in _V1_WRAPPER.read_text().splitlines() if line.startswith("FAMILY_MANIFEST=")
     ]
-    assert len(scorer_lines) == 1
-    assert len(v1_lines) == 1
-    assert scorer_lines[0] == v1_lines[0]
+    assert v1_lines == ['FAMILY_MANIFEST="$REPO/deploy/families/pm_us_crh_v2.json"']
+    scorer_lines = [
+        line for line in _WRAPPER.read_text().splitlines() if line.startswith("FAMILY_MANIFEST=")
+    ]
+    assert scorer_lines == []
 
 
 def test_v1_d0_literal_assignment_byte_identical_across_wrappers() -> None:
@@ -566,3 +573,111 @@ def test_score_live_trials_unit_pair_exists_and_wires_to_wrapper() -> None:
     assert "Unit=breezy-score-live-trials.service" in timer_text
     assert "OnCalendar=*-*-* 14:15:00 UTC" in timer_text
     assert "Persistent=true" in timer_text
+
+
+def _systemctl_stub(tmp_path: Path, environment_line: str) -> Path:
+    stub = tmp_path / "systemctl-stub.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' " + shlex.quote(environment_line) + "\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _counter_lines(argv_log: Path) -> list[str]:
+    if not argv_log.exists():
+        return []
+    return [line for line in argv_log.read_text().splitlines() if line.startswith("COUNTER")]
+
+
+def test_the_counter_resolves_the_manifest_from_the_deployed_sending_family_id(
+    tmp_path: Path,
+) -> None:
+    stub, argv_log = _make_stub(tmp_path)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4 OTHER=1"
+    )
+    result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
+    assert result.returncode == 0, result.stderr
+    counters = _counter_lines(argv_log)
+    assert len(counters) == 1
+    assert counters[0].rstrip().endswith("deploy/families/pm_us_crh_v4.json") or (
+        "pm_us_crh_v4.json" in counters[0] and "pm_us_crh_v2.json" not in counters[0]
+    )
+    log_text = (tmp_path / "derived" / "score_live_trials.log").read_text(encoding="utf-8")
+    assert "pm_us_crh_v4" in log_text
+
+
+def test_the_counter_json_carries_the_champion_manifest_sha256(tmp_path: Path) -> None:
+    import hashlib
+
+    stub, argv_log = _make_stub(tmp_path)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4"
+    )
+    result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
+    assert result.returncode == 0, result.stderr
+    counters = _counter_lines(argv_log)
+    assert counters and "pm_us_crh_v4.json" in counters[0]
+    manifest = _FAMILIES_DIR / "pm_us_crh_v4.json"
+    catalog = tmp_path / "empty-catalog"
+    catalog.mkdir()
+    output = tmp_path / "counter.json"
+    proc = subprocess.run(
+        [
+            "/home/jon/breezy/.venv/bin/python",
+            str(_REPO_ROOT / "scripts" / "analysis" / "structural_dead_stop.py"),
+            "--catalog-root",
+            str(catalog),
+            "--family-manifest",
+            str(manifest),
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    body = json.loads(output.read_text(encoding="utf-8"))
+    assert body["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+
+def test_the_counter_refuses_when_the_sending_family_id_is_absent_or_unregistered(
+    tmp_path: Path,
+) -> None:
+    for environment in (
+        "Environment=OTHER=1",
+        "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_exit_v4",
+        "Environment=BREEZY_SENDING_FAMILY_ID=missing_family",
+    ):
+        run_dir = tmp_path / environment.split("=")[-1]
+        run_dir.mkdir()
+        stub, argv_log = _make_stub(run_dir)
+        systemctl = _systemctl_stub(run_dir, environment)
+        stale = _seed_stale_cjson(run_dir)
+        result = _run_wrapper(run_dir, stub_python=stub, systemctl_stub=systemctl)
+        assert result.returncode != 0, environment
+        assert not stale.exists(), environment
+        assert _counter_lines(argv_log) == [], environment
+
+
+def test_the_counter_still_runs_for_a_halted_family(tmp_path: Path) -> None:
+    """RULING_A1 halts sending only. pm_us_crh_v4 stays REGISTERED, so the
+    clock still counts. The wrapper must not special-case the halt."""
+    text = _WRAPPER.read_text(encoding="utf-8")
+    assert "halt" not in text.lower()
+    stub, argv_log = _make_stub(tmp_path)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4"
+    )
+    result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
+    assert result.returncode == 0, result.stderr
+    counters = _counter_lines(argv_log)
+    assert counters and "pm_us_crh_v4.json" in counters[0]
+
+
+def test_score_live_trials_run_has_no_second_family_manifest_literal() -> None:
+    text = _WRAPPER.read_text(encoding="utf-8")
+    assert re.search(r"deploy/families/[A-Za-z0-9_]+\.json", text) is None

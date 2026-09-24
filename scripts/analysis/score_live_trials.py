@@ -561,6 +561,7 @@ def read_filled_trials_state_db(
     cli_location: str,
     since_climate_day: str,
     stations: Sequence[str],
+    until_climate_day: str | None = None,
 ) -> tuple[
     tuple[FilledTrial, ...],
     tuple[FillExclusion, ...],
@@ -720,6 +721,11 @@ def read_filled_trials_state_db(
         else:
             continue
         if climate_day < since_climate_day:
+            continue
+        # Inclusive upper bound, the mirror of `assert_family_only`: a closed
+        # family's terminal day is kept; the next day is not scored here.
+        # `None` is still open (AUD-05 D-G). No new CLI flag.
+        if until_climate_day is not None and climate_day > until_climate_day:
             continue
         try:
             record = TrialDayRecord.from_bytes(value)
@@ -1316,6 +1322,7 @@ def score_live_trials(
     fill_source_path: Path | None = None,
     family_prefix: str | None = None,
     since_climate_day: str | None = None,
+    until_climate_day: str | None = None,
     stations: Sequence[str] | None = None,
     catalog_base: Path,
     venue: str,
@@ -1397,6 +1404,7 @@ def score_live_trials(
             city=city,
             cli_location=cli_location,
             since_climate_day=since_climate_day,
+            until_climate_day=until_climate_day,
             stations=stations,
         )
         filled_trials = tuple(
@@ -1771,6 +1779,7 @@ def main(argv: Sequence[str] | None = None, *, proc_root: Path = Path("/proc")) 
     fill_source_path: Path | None = None
     family_prefix: str | None = None
     since_climate_day: str | None = None
+    until_climate_day: str | None = None
     stations: tuple[str, ...] | None = None
     if args.fills is None:
         if args.fill_source is not None:
@@ -1787,6 +1796,7 @@ def main(argv: Sequence[str] | None = None, *, proc_root: Path = Path("/proc")) 
         log.info("resolved fill-source path: %s", fill_source_path)
         family_prefix = manifest.trial_id_prefix
         since_climate_day = manifest.d0_climate_day
+        until_climate_day = manifest.terminal_climate_day
         stations = manifest.stations
 
     now_ns = time.time_ns()
@@ -1796,6 +1806,7 @@ def main(argv: Sequence[str] | None = None, *, proc_root: Path = Path("/proc")) 
             fill_source_path=fill_source_path,
             family_prefix=family_prefix,
             since_climate_day=since_climate_day,
+            until_climate_day=until_climate_day,
             stations=stations,
             catalog_base=args.catalog_base,
             venue=args.venue,
