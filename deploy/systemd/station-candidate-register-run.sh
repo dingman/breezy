@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# AUD-08b: one run of scripts/analysis/station_candidate_register.py, the
-# second ExecStart= of breezy-quote-tape-rotate.service (after the recorder
-# rotation). The timer owns cadence. This script owns the studies flock and
+# AUD-08b: one run of scripts/analysis/station_candidate_register.py, as
+# breezy-station-candidate-register.service (started by the rotate unit's
+# OnSuccess=). The rotate timer owns cadence. This script owns the studies flock and
 # the catalog-root resolution, nothing else.
 #
 # ADVISORY ONLY: the register it maintains never makes a city tradeable.
@@ -10,7 +10,10 @@
 #
 # Lock discipline matches decision-funnel-digest-run.sh: contention skips
 # (exit 0 -- the last_folded_day watermark re-folds every missed day on the
-# next run); a lock-infrastructure failure exits 75 so OnFailure= can fire.
+# next run) but first runs the cheap --check-staleness mode, which alerts if
+# the watermark is more than 2 days old, so a lock held every night cannot
+# starve the register silently; a lock-infrastructure failure exits 75 so
+# OnFailure= can fire.
 set -uo pipefail
 
 REPO=/home/jon/breezy
@@ -41,7 +44,7 @@ fi
 LOCK="$LOCK_DIR/breezy-studies.lock"
 mkdir -p "$LOCK_DIR" 2>>"$LOG" || { say "SKIPPED-INFRA -- no studies lock directory"; exit 75; }
 exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studies lock"; exit 75; }
-flock -n 9                     || { say "SKIPPED -- another study holds the studies lock"; exit 0; }
+flock -n 9                     || { say "SKIPPED -- another study holds the studies lock"; "$PY" "$REPO/scripts/analysis/station_candidate_register.py" --check-staleness --state-dir "$OUT"; exit 0; }
 
 if "$PY" "$REPO/scripts/analysis/station_candidate_register.py" \
      --catalog-root "$CATALOG_ROOT" \

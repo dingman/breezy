@@ -33,9 +33,9 @@ under the ``instruments`` quota key.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, overload
+from typing import Any, Final, Literal, overload
 
 from nautilus_trader.common.component import Clock
 from nautilus_trader.common.providers import InstrumentProvider
@@ -71,6 +71,7 @@ __all__ = [
     "MARKET_BY_SLUG_PATH",
     "MARKET_LIST_PATH",
     "SIGHTING_SCHEMA_VERSION",
+    "SIGHTING_SINK_FAILURE_ALERT_CYCLES",
     "DiscoveredMarket",
     "PolymarketUSInstrumentProvider",
     "SightingSinkAlreadyAttachedError",
@@ -119,6 +120,13 @@ class DiscoveredMarket:
     slug: str
     resolved_reason: str | None
     payload: Mapping[str, Any]
+
+
+#: Consecutive discovery cycles whose sidecar append failed before the ONE
+#: sidecar-broken alert fires (AUD-08b review). A cycle with no sightings is
+#: no evidence either way and neither counts nor resets. Three reload cycles
+#: rules out a single transient fault without leaving a broken disk silent.
+SIGHTING_SINK_FAILURE_ALERT_CYCLES: Final[int] = 3
 
 
 class SightingSinkAlreadyAttachedError(RuntimeError):
@@ -373,6 +381,8 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         self._resolved_market_reasons: dict[str, str] = {}
         self._unregistered_city_sightings: tuple[UnregisteredCitySighting, ...] = ()
         self._sighting_sink: SightingSink | None = None
+        self._sighting_failure_alert: Callable[[str], None] | None = None
+        self._sighting_sink_consecutive_failures: int = 0
         self._last_successful_non_empty_discovery: tuple[str, ...] = ()
 
     @property
@@ -409,35 +419,68 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         """The attached sidecar sink, or ``None`` (every non-recorder process)."""
         return self._sighting_sink
 
-    def attach_sighting_sink(self, sink: SightingSink) -> None:
+    @property
+    def sighting_sink_consecutive_failures(self) -> int:
+        """Consecutive cycles whose sidecar append failed. 0 after any good cycle."""
+        return self._sighting_sink_consecutive_failures
+
+    def attach_sighting_sink(
+        self,
+        sink: SightingSink,
+        *,
+        failure_alert: Callable[[str], None] | None = None,
+    ) -> None:
         """Attach the ONE sidecar writer (AUD-08 §6b.1). Idempotent by identity.
 
         Attached after construction, never a constructor or ``lru_cache`` key
         parameter, so the process keeps exactly one shared provider.
+        ``failure_alert`` is the runtime-injected callable raised once per
+        streak of :data:`SIGHTING_SINK_FAILURE_ALERT_CYCLES` failed cycles.
         """
-        if self._sighting_sink is sink:
-            return
-        if self._sighting_sink is not None:
+        if self._sighting_sink is not None and self._sighting_sink is not sink:
             raise SightingSinkAlreadyAttachedError(
                 "a different sighting sink is already attached; the sidecar has exactly one writer"
             )
         self._sighting_sink = sink
+        if failure_alert is not None:
+            self._sighting_failure_alert = failure_alert
 
     def _append_sightings(self) -> None:
         """One append per sighting of this cycle. Advisory: a fault never aborts discovery."""
         sink = self._sighting_sink
-        if sink is None:
+        if sink is None or not self._unregistered_city_sightings:
             return
         for sighting in self._unregistered_city_sightings:
             try:
                 sink.append(sighting)
             except (OSError, ValueError) as exc:
-                self._discovery_log.error(
-                    "Polymarket.us sighting sidecar append failed "
-                    f"({type(exc).__name__}: {exc}); this cycle's remaining sightings "
-                    "are not persisted and discovery continues"
-                )
+                self._record_sighting_sink_failure(type(exc).__name__)
                 return
+        self._sighting_sink_consecutive_failures = 0
+
+    def _record_sighting_sink_failure(self, error_type: str) -> None:
+        # Exception TYPE only: an OSError's text carries an absolute path,
+        # which an alert detail must never contain.
+        self._sighting_sink_consecutive_failures += 1
+        failures = self._sighting_sink_consecutive_failures
+        self._discovery_log.error(
+            f"Polymarket.us sighting sidecar append failed ({error_type}); "
+            f"{failures} consecutive cycle(s); this cycle's remaining sightings are "
+            "not persisted and discovery continues"
+        )
+        if failures != SIGHTING_SINK_FAILURE_ALERT_CYCLES or self._sighting_failure_alert is None:
+            return
+        detail = (
+            f"sighting sidecar append failed for {failures} consecutive discovery "
+            f"cycles ({error_type}); unregistered-city sightings are not being "
+            "recorded - check the recorder's derived/station_candidates dir"
+        )
+        try:
+            self._sighting_failure_alert(detail)
+        except Exception as exc:  # noqa: BLE001 - an alert fault must never abort discovery
+            self._discovery_log.error(
+                f"Polymarket.us sighting sidecar alert could not be raised ({type(exc).__name__})"
+            )
 
     async def load_all_async(self, filters: dict[Any, Any] | None = None) -> None:
         """Discover weather markets through ``GET /v1/markets`` and load active ones."""

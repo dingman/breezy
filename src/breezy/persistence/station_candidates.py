@@ -142,11 +142,24 @@ class UnregisteredCitySighting:
 class StationCandidate:
     """One ``(venue, city_token)`` row of the register.
 
-    ``first_seen_day`` is the UTC day the register FIRST recorded the city
-    (the fold day) and never moves. ``last_seen_day`` is the latest UTC day
-    the venue was observed listing it (a seed: the latest fold that still
-    found it in the settlement registry); monotone non-decreasing.
-    ``distinct_*`` are monotone and exact over the sidecar retention window.
+    Two day domains, deliberately (AUD-09a H1 readers: do not compare them):
+
+    * ``first_seen_day`` is the UTC day the register FIRST recorded the city
+      -- the FOLD day -- and never moves. It is the durable once-per-candidate
+      alert key (A16).
+    * ``last_seen_day`` is the latest UTC day the venue was OBSERVED listing
+      it (a seed: the latest fold that still found it in the settlement
+      registry); monotone non-decreasing.
+
+    Because the nightly fold runs the day after the observation, a NEW
+    sighting-origin record normally has ``first_seen_day`` one day AFTER
+    ``last_seen_day``. That is expected, not corruption.
+
+    ``distinct_slugs`` / ``distinct_climate_days`` are a LOWER BOUND: each
+    fold computes the distinct count over the retained sidecar window
+    (35 days) and merges by ``max``, so a city listed for longer than the
+    window under-counts rather than double-counts. Always 0 for a
+    ``REGISTRY_SEED`` row, which never counts slugs.
     """
 
     schema_version: int
@@ -263,38 +276,63 @@ def _sighting_from_record(record: Any, *, path: Path, line_number: int) -> Unreg
         raise SightingSidecarCorruptError(
             f"{path}: line {line_number} does not carry exactly the sighting fields"
         )
+    if record["observed_ts_ns"] <= 0:
+        raise SightingSidecarCorruptError(f"{path}: line {line_number} has no observed_ts_ns stamp")
     return UnregisteredCitySighting(**record)
 
 
 def read_sightings_file(path: Path) -> SightingRead:
-    """Read one sidecar file.
+    """Read one sidecar file, streaming, de-duplicated.
 
-    A trailing partial line (the LAST line, with no ``\\n``) is a recorder
+    A trailing partial line (the LAST line, with no ``\n``) is a recorder
     killed mid-write: skipped with a WARN and counted. Any other malformed
     line is interleaving -- the two-writer defect -- and refuses.
+
+    Identical sightings (same ``venue``, ``city_token``, ``slug`` and UTC day)
+    are kept once, first occurrence wins: the recorder's empty-listing retry
+    loop can re-append the same sighting many times a day, and memory must be
+    bounded by distinct markets, not by retries.
     """
-    raw = path.read_text(encoding="utf-8")
-    lines = raw.split("\n")
-    trailing = lines.pop()  # "" when the file ends with "\n"
+    sightings: dict[tuple[str, str, str, str], UnregisteredCitySighting] = {}
     partial = 0
-    if trailing:
-        partial = 1
-        _LOG.warning(
-            "%s: skipping a trailing partial line (%d bytes) -- a recorder killed mid-write",
-            path,
-            len(trailing),
-        )
-    sightings = []
-    for index, line in enumerate(lines, start=1):
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise SightingSidecarCorruptError(
-                f"{path}: line {index} is not valid JSON and is not the final line; "
-                "two writers interleaved"
-            ) from exc
-        sightings.append(_sighting_from_record(record, path=path, line_number=index))
-    return SightingRead(sightings=tuple(sightings), partial_lines_skipped=partial)
+    with open(path, encoding="utf-8") as handle:
+        pending: tuple[int, str] | None = None
+        for index, line in enumerate(handle, start=1):
+            if pending is not None:
+                _accept_sighting_line(sightings, *pending, path=path)
+            pending = (index, line)
+        if pending is not None:
+            index, line = pending
+            if line.endswith("\n"):
+                _accept_sighting_line(sightings, index, line, path=path)
+            else:
+                partial = 1
+                _LOG.warning(
+                    "%s: skipping a trailing partial line (%d bytes) -- a recorder "
+                    "killed mid-write",
+                    path,
+                    len(line),
+                )
+    return SightingRead(sightings=tuple(sightings.values()), partial_lines_skipped=partial)
+
+
+def _accept_sighting_line(
+    sightings: dict[tuple[str, str, str, str], UnregisteredCitySighting],
+    index: int,
+    line: str,
+    *,
+    path: Path,
+) -> None:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SightingSidecarCorruptError(
+            f"{path}: line {index} is not valid JSON and is not the final line; "
+            "two writers interleaved"
+        ) from exc
+    sighting = _sighting_from_record(record, path=path, line_number=index)
+    key = (sighting.venue, sighting.city_token, sighting.slug, sighting_day(sighting))
+    sightings.setdefault(key, sighting)
 
 
 def read_sightings(path: Path) -> tuple[UnregisteredCitySighting, ...]:
@@ -384,13 +422,18 @@ def merge_sightings(
                 sufficiency=_required_sufficiency(key, sufficiency_by_city),
             )
             continue
+        if prior.origin == "REGISTRY_SEED":
+            # A seed is not a sighting and never counts slugs (§6b.3); its
+            # sufficiency is the seed path's. Only last_seen_day moves.
+            by_key[key] = replace(prior, last_seen_day=max(prior.last_seen_day, last_seen))
+            continue
         updated = replace(
             prior,
             last_seen_day=max(prior.last_seen_day, last_seen),
             distinct_slugs=max(prior.distinct_slugs, slugs),
             distinct_climate_days=max(prior.distinct_climate_days, climate_days),
         )
-        if prior.origin == "SIGHTING" and key in sufficiency_by_city:
+        if key in sufficiency_by_city:
             updated = replace(updated, sufficiency=sufficiency_by_city[key])
         by_key[key] = updated
 

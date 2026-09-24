@@ -1,4 +1,4 @@
-"""AUD-08b §7 step 13: the nightly emitter rides ``breezy-quote-tape-rotate.service``.
+"""AUD-08b §7 step 13: the nightly emitter is its own unit, started by the rotation.
 
 Parses unit text and runs the wrapper against a stub interpreter inside
 ``tmp_path`` only. Never reads an INSTALLED unit, never runs ``systemctl``,
@@ -15,6 +15,7 @@ from typing import Final
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DEPLOY_DIR: Final[Path] = _REPO_ROOT / "deploy" / "systemd"
 _ROTATE_UNIT: Final[Path] = _DEPLOY_DIR / "breezy-quote-tape-rotate.service"
+_REGISTER_UNIT: Final[Path] = _DEPLOY_DIR / "breezy-station-candidate-register.service"
 _WRAPPER: Final[Path] = _DEPLOY_DIR / "station-candidate-register-run.sh"
 _SCORE_WRAPPER: Final[Path] = _DEPLOY_DIR / "score-live-trials-run.sh"
 
@@ -33,22 +34,63 @@ def _directives(text: str, name: str) -> list[str]:
     ]
 
 
-def test_the_rotate_unit_runs_the_emitter_after_the_recorder_rotation() -> None:
-    exec_starts = _directives(_ROTATE_UNIT.read_text(), "ExecStart")
+def test_the_rotate_unit_is_its_pre_08b_self_plus_one_non_blocking_start() -> None:
+    """Decoupled (review HIGH): the register can never fail, slow or re-slice the rotation.
 
-    assert exec_starts == [
-        "/usr/bin/systemctl --user try-restart breezy-quote-tape.service",
-        f"/home/jon/breezy/deploy/systemd/{_WRAPPER.name}",
-    ]
-
-
-def test_the_rotate_unit_carries_the_studies_slice_memory_ceiling_and_alert_egress() -> None:
+    ``OnSuccess=`` enqueues the register unit as a SEPARATE job only after the
+    rotation finished successfully; the register's own outcome can never
+    reach back into this unit's result.
+    """
     text = _ROTATE_UNIT.read_text()
 
+    assert _directives(text, "ExecStart") == [
+        "/usr/bin/systemctl --user try-restart breezy-quote-tape.service"
+    ]
+    assert _directives(text, "OnSuccess") == [_REGISTER_UNIT.name]
+    assert _directives(text, "ExecStartPost") == []
+    for directive in ("Slice", "MemoryHigh", "MemoryMax", "EnvironmentFile"):
+        assert _directives(text, directive) == [], directive
+    assert _directives(text, "TimeoutStartSec") == ["180"]
+    starts = [
+        line
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#") and _REGISTER_UNIT.name in line
+    ]
+    assert starts == [f"OnSuccess={_REGISTER_UNIT.name}"]
+
+
+def test_the_rotate_unit_differs_from_its_pre_08b_content_by_directive_only_in_onsuccess() -> None:
+    """Every non-comment line of the base unit survives byte-identical."""
+    base = subprocess.run(
+        ["git", "show", "c527439:deploy/systemd/breezy-quote-tape-rotate.service"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+    def directive_lines(text: str) -> list[str]:
+        return [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+    current = directive_lines(_ROTATE_UNIT.read_text())
+    added = [line for line in current if line not in directive_lines(base)]
+    assert added == [f"OnSuccess={_REGISTER_UNIT.name}"]
+    assert [line for line in current if not line.startswith("OnSuccess=")] == directive_lines(base)
+
+
+def test_the_register_unit_carries_its_own_slice_ceiling_alerting_and_wrapper() -> None:
+    text = _REGISTER_UNIT.read_text()
+
+    assert _directives(text, "Type") == ["oneshot"]
+    assert _directives(text, "ExecStart") == [f"/home/jon/breezy/deploy/systemd/{_WRAPPER.name}"]
     assert _directives(text, "Slice") == ["breezy-studies.slice"]
     assert _directives(text, "MemoryHigh") and _directives(text, "MemoryMax")
     assert _directives(text, "EnvironmentFile") == ["-%h/.config/breezy/alerts.env"]
     assert _directives(text, "OnFailure") == ["breezy-study-failed@%n.service"]
+    assert _directives(text, "TimeoutStartSec")
+    # Started only by the rotate unit's OnSuccess=: no timer, no [Install].
+    assert not (_DEPLOY_DIR / "breezy-station-candidate-register.timer").exists()
+    assert "[Install]" not in text.splitlines()
 
 
 def test_the_wrapper_resolves_the_catalog_byte_identically_to_the_scorer() -> None:
@@ -107,3 +149,18 @@ def test_the_wrapper_defaults_the_catalog_root_under_home(tmp_path: Path) -> Non
     assert argv[argv.index("--catalog-root") + 1] == str(
         tmp_path / "home" / ".local/share/breezy/catalog/quote_tape/polymarket_us"
     )
+
+
+def test_the_wrapper_checks_staleness_when_it_skips_on_the_lock() -> None:
+    """A study that holds the lock every night must not silently starve the register."""
+    lines = _WRAPPER.read_text().splitlines()
+    (skip,) = [line for line in lines if line.startswith("flock -n 9")]
+    assert "--check-staleness" in skip
+
+
+def test_the_recorder_unit_loads_the_alert_webhook_so_a_broken_sidecar_can_page() -> None:
+    """The sidecar-broken alert is raised INSIDE the recorder; without alerts.env it
+    would degrade to a journal line nobody reads."""
+    text = (_DEPLOY_DIR / "breezy-quote-tape.service").read_text()
+
+    assert "-%h/.config/breezy/alerts.env" in _directives(text, "EnvironmentFile")

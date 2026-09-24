@@ -57,6 +57,7 @@ from typing import Any
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, Logger, MessageBus
+from nautilus_trader.common.config import resolve_path
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
@@ -553,6 +554,26 @@ def _shared_polymarket_us_instrument_provider(
     )
 
 
+def _resolve_sighting_failure_alert(path: str | None) -> Callable[[str], None] | None:
+    """Resolve the runtime-named alert callable; refuse a bad path at build time.
+
+    Nautilus's own ``resolve_path`` (the ``Importable*Config`` mechanism), so
+    the adapter never imports ``breezy.runtime`` itself.
+    """
+    if path is None:
+        return None
+    try:
+        target: Any = resolve_path(path)
+    except (ImportError, AttributeError, ValueError) as exc:
+        raise SettingsError(
+            f"sighting_failure_alert_path {path!r} does not resolve: {exc!r}"
+        ) from exc
+    if not callable(target):
+        raise SettingsError(f"sighting_failure_alert_path {path!r} is not callable")
+    alert: Callable[[str], None] = target
+    return alert
+
+
 @lru_cache(maxsize=1)
 def _shared_sighting_sink(directory: str) -> FileSightingSink:
     """The ONE sidecar sink for the process (AUD-08 §6b.1), keyed on a hashable ``str``.
@@ -626,7 +647,10 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
         # only this data factory; the trade node keeps the default False and
         # attaches nothing. Advisory: the sidecar never makes a city tradeable.
         if config.subscribe_trades:
-            instrument_provider.attach_sighting_sink(_shared_sighting_sink(str(SIGHTINGS_DIR)))
+            instrument_provider.attach_sighting_sink(
+                _shared_sighting_sink(str(SIGHTINGS_DIR)),
+                failure_alert=_resolve_sighting_failure_alert(config.sighting_failure_alert_path),
+            )
 
         ws_signer = signer if WS_MARKETS_REQUIRES_AUTH else None
         ws_logger = Logger(f"{name}-ws")

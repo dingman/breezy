@@ -29,7 +29,9 @@ from breezy.persistence.station_candidates import (
     compact_station_candidates,
     merge_sightings,
     read_last_folded_day,
+    read_sightings_file,
     read_station_candidates,
+    write_last_folded_day,
     write_station_candidates,
 )
 from breezy.runtime.health import AlertPayload
@@ -219,6 +221,9 @@ def test_a_seed_and_a_later_sighting_of_the_same_token_collapse_into_one_seed_re
     assert len(later) == 1
     assert later[0].origin == "REGISTRY_SEED"
     assert later[0].first_seen_day == "2026-09-21"
+    # A seed is not a sighting and never counts slugs (§6b.3 key rule).
+    assert (later[0].distinct_slugs, later[0].distinct_climate_days) == (0, 0)
+    assert later[0].sufficiency == "REGISTRY_ONLY_NO_CAPTURE"
 
 
 def test_origin_never_changes_once_set() -> None:
@@ -648,7 +653,9 @@ def test_a_recovered_emitter_folds_every_missed_day_and_advances_the_watermark(
     assert {r.city_token for r in records} == {"bos", "phx", "sea", "den", "nyc"}
     assert read_last_folded_day(state_dir / "last_folded_day.json") == "2026-09-20"
     # A delayed fold delays the one-shot alert; it never skips it.
-    assert sorted(p.site for p in sink.payloads) == [
+    # Three missed nights is also stale: one BREEZY_STATION_CANDIDATE_STALE.
+    assert [p.event for p in sink.payloads].count("BREEZY_STATION_CANDIDATE_STALE") == 1
+    assert sorted(p.site for p in sink.payloads if p.event == "BREEZY_STATION_CANDIDATE_NEW") == [
         "polymarket_us/den",
         "polymarket_us/phx",
         "polymarket_us/sea",
@@ -688,7 +695,10 @@ def test_todays_still_growing_sidecar_is_never_folded(
     assert [
         r.city_token for r in read_station_candidates(state_dir / "station_candidates.jsonl")
     ] == ["nyc"]
-    assert read_last_folded_day(state_dir / "last_folded_day.json") is None
+    # Every day before today has been considered: the watermark is yesterday,
+    # and today's file (still growing) is folded on the next run.
+    assert read_last_folded_day(state_dir / "last_folded_day.json") == "2026-09-20"
+    assert (state_dir / "sightings" / "sightings-2026-09-21.jsonl").exists()
 
 
 def test_an_absent_watermark_folds_every_unpruned_file_and_old_files_are_pruned_and_counted(
@@ -771,3 +781,129 @@ def test_a_flood_of_new_cities_refuses_with_the_register_untouched(
 def test_the_emitter_parses_catalog_root_with_the_shared_default() -> None:
     args = register_script.parse_args([])
     assert args.catalog_root == str(register_script.DEFAULT_QUOTE_TAPE_CATALOG)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: staleness alert, read-side dedupe
+# ---------------------------------------------------------------------------
+
+
+def test_a_quiet_venue_still_advances_the_watermark_to_yesterday(
+    catalog_root: Path, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No sidecar files at all is the normal case; it must not look stale."""
+    assert (
+        _run(
+            catalog_root=catalog_root,
+            state_dir=state_dir,
+            today="2026-09-21",
+            counter=_Counter(0),
+            monkeypatch=monkeypatch,
+        )
+        == 0
+    )
+    assert read_last_folded_day(state_dir / "last_folded_day.json") == "2026-09-20"
+
+
+def _stale_payloads(sink: RecordingAlertSink) -> list[AlertPayload]:
+    return [p for p in sink.payloads if p.event == "BREEZY_STATION_CANDIDATE_STALE"]
+
+
+@pytest.mark.parametrize(("today", "stale"), [("2026-09-17", False), ("2026-09-18", True)])
+def test_a_run_alerts_once_when_the_watermark_is_more_than_two_days_old(
+    catalog_root: Path,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    today: str,
+    stale: bool,
+) -> None:
+    write_last_folded_day(state_dir / "last_folded_day.json", "2026-09-15")
+    sink = RecordingAlertSink()
+
+    assert (
+        _run(
+            catalog_root=catalog_root,
+            state_dir=state_dir,
+            today=today,
+            counter=_Counter(0),
+            monkeypatch=monkeypatch,
+            alert_sink=sink,
+        )
+        == 0
+    )
+
+    assert len(_stale_payloads(sink)) == (1 if stale else 0)
+
+
+def test_the_lock_skip_path_checks_staleness_without_touching_the_catalog(
+    tmp_path: Path, state_dir: Path
+) -> None:
+    """Skip-forever (studies lock always held) must still reach a human."""
+    write_last_folded_day(state_dir / "last_folded_day.json", "2026-09-15")
+    sink = RecordingAlertSink()
+
+    code = register_script.check_staleness(
+        state_dir=state_dir, today=dt.date(2026, 9, 21), alert_sink=sink
+    )
+
+    assert code == 0
+    (payload,) = _stale_payloads(sink)
+    assert "2026-09-15" in payload.detail
+    assert str(state_dir) not in payload.detail
+    assert (
+        register_script.check_staleness(
+            state_dir=state_dir, today=dt.date(2026, 9, 17), alert_sink=RecordingAlertSink()
+        )
+        == 0
+    )
+    fresh = RecordingAlertSink()
+    register_script.check_staleness(
+        state_dir=state_dir, today=dt.date(2026, 9, 17), alert_sink=fresh
+    )
+    assert fresh.payloads == []
+
+
+def test_an_absent_watermark_is_not_reported_stale(state_dir: Path) -> None:
+    sink = RecordingAlertSink()
+    register_script.check_staleness(
+        state_dir=state_dir, today=dt.date(2026, 9, 21), alert_sink=sink
+    )
+    assert sink.payloads == []
+
+
+def test_the_check_staleness_flag_skips_the_fold(
+    tmp_path: Path, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_last_folded_day(state_dir / "last_folded_day.json", "2026-09-15")
+    seen: list[str] = []
+
+    def fake_check(*, state_dir: Path, today: dt.date, alert_sink: object) -> int:
+        seen.append(today.isoformat())
+        return 0
+
+    def no_run(**_kwargs: object) -> int:
+        raise AssertionError("the staleness-only mode must never fold")
+
+    monkeypatch.setattr(register_script, "check_staleness", fake_check)
+    monkeypatch.setattr(register_script, "run", no_run)
+
+    code = register_script.main(
+        ["--check-staleness", "--state-dir", str(state_dir), "--today", "2026-09-21"], env={}
+    )
+
+    assert code == 0
+    assert seen == ["2026-09-21"]
+
+
+def test_repeated_identical_sightings_are_deduplicated_on_read(tmp_path: Path) -> None:
+    """An empty-listing retry loop re-appends the same sighting; memory must not grow."""
+    directory = tmp_path / "sightings"
+    sighting = _sighting(day="2026-09-20")
+    for _ in range(50):
+        append_sighting(directory, sighting)
+    append_sighting(directory, _sighting(day="2026-09-20", bounds="gte80f"))
+
+    read = read_sightings_file(directory / "sightings-2026-09-20.jsonl")
+
+    assert len(read.sightings) == 2
+    assert read.sightings[0] == sighting

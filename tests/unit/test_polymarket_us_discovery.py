@@ -30,6 +30,7 @@ from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.provider import (
     MARKET_LIST_PATH,
     MAX_DISCOVERY_PAGES,
+    SIGHTING_SINK_FAILURE_ALERT_CYCLES,
     PolymarketUSInstrumentProvider,
     _weather_market_payloads,
     discovery_candidate_slugs,
@@ -830,3 +831,82 @@ async def test_no_sink_means_no_append_and_no_error() -> None:
 
     assert provider.sighting_sink is None
     assert [m for level, m in logger.messages if level == "error"] == []
+
+
+class _TogglingSightingSink:
+    def __init__(self) -> None:
+        self.failing = True
+
+    def append(self, sighting: Any) -> None:
+        if self.failing:
+            raise PermissionError(13, "Permission denied", "/home/someone/sidecar.jsonl")
+
+
+async def _cycles(provider: PolymarketUSInstrumentProvider, count: int) -> None:
+    for _ in range(count):
+        await provider.load_all_async()
+
+
+@pytest.mark.asyncio
+async def test_a_persistently_failing_sink_alerts_once_after_n_consecutive_cycles() -> None:
+    registered, boston = _four_registered_and_boston()
+    provider, _transport, _logger = provider_for_pages(
+        [page_with(*registered, boston)], discovery=_cohort_discovery()
+    )
+    alerts: list[str] = []
+    provider.attach_sighting_sink(_TogglingSightingSink(), failure_alert=alerts.append)
+
+    await _cycles(provider, SIGHTING_SINK_FAILURE_ALERT_CYCLES - 1)
+    assert alerts == []
+    await _cycles(provider, 1)
+    assert len(alerts) == 1
+    assert f"{SIGHTING_SINK_FAILURE_ALERT_CYCLES} consecutive" in alerts[0]
+    assert "PermissionError" in alerts[0]
+    assert "/home" not in alerts[0]
+    await _cycles(provider, 3)
+    assert len(alerts) == 1
+    assert provider.sighting_sink_consecutive_failures == SIGHTING_SINK_FAILURE_ALERT_CYCLES + 3
+
+
+@pytest.mark.asyncio
+async def test_a_successful_append_resets_the_failure_streak_and_rearms_the_alert() -> None:
+    registered, boston = _four_registered_and_boston()
+    provider, _transport, _logger = provider_for_pages(
+        [page_with(*registered, boston)], discovery=_cohort_discovery()
+    )
+    sink = _TogglingSightingSink()
+    alerts: list[str] = []
+    provider.attach_sighting_sink(sink, failure_alert=alerts.append)
+
+    await _cycles(provider, SIGHTING_SINK_FAILURE_ALERT_CYCLES - 1)
+    sink.failing = False
+    await _cycles(provider, 1)
+    assert provider.sighting_sink_consecutive_failures == 0
+    sink.failing = True
+    await _cycles(provider, SIGHTING_SINK_FAILURE_ALERT_CYCLES - 1)
+    assert alerts == []
+    await _cycles(provider, 1)
+    assert len(alerts) == 1
+
+    sink.failing = False
+    await _cycles(provider, 1)
+    sink.failing = True
+    await _cycles(provider, SIGHTING_SINK_FAILURE_ALERT_CYCLES)
+    assert len(alerts) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_raising_failure_alert_never_aborts_discovery() -> None:
+    registered, boston = _four_registered_and_boston()
+    provider, _transport, _logger = provider_for_pages(
+        [page_with(*registered, boston)], discovery=_cohort_discovery()
+    )
+
+    def broken_alert(detail: str) -> None:
+        raise RuntimeError("webhook down")
+
+    provider.attach_sighting_sink(_TogglingSightingSink(), failure_alert=broken_alert)
+
+    await _cycles(provider, SIGHTING_SINK_FAILURE_ALERT_CYCLES + 1)
+
+    _assert_registered_cohort_loaded(provider, registered, boston)

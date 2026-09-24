@@ -24,6 +24,23 @@ One nightly run, riding ``breezy-quote-tape-rotate.service``:
 
 No venue call. Sufficiency reuses the KILL clock's own counter and floor
 (``structural_dead_stop``), never a second threshold.
+
+The ``last_folded_day`` watermark is NOT an input filter -- every retained
+sidecar day is re-read each run, which is what keeps ``distinct_*`` exact
+over the window and the fold idempotent. Its roles are: (a) naming which days
+are newly folded (summary), (b) counting expired days pruned before any
+successful run could fold them (``sidecar_days_lost``), and (c) the
+staleness alarm -- after every successful run it is YESTERDAY, so an age of
+more than two days means the fold has been skipped or refused, and the run
+(or the wrapper's lock-skip path, ``--check-staleness``) raises
+``BREEZY_STATION_CANDIDATE_STALE``.
+
+Clearing a persistent flood refusal (operator): the refusal repeats every
+night while the offending ``sightings/sightings-<day>.jsonl`` files remain
+inside the 35-day window. Review them (a venue-shape event, not a batch of
+candidates), then move them OUT of ``sightings/`` (e.g. to a dated
+``quarantine/`` directory beside it); the next run folds the rest. Never raise
+the cap: it is derived from the settlement registry on purpose.
 """
 
 from __future__ import annotations
@@ -73,6 +90,7 @@ __all__ = [
     "MIN_STRUCTURAL_DEAD_STATION_DAYS",
     "SIDECAR_RETENTION_DAYS",
     "QuoteTapeGapDataUnavailable",
+    "check_staleness",
     "count_covered_listed_station_days_from_catalog",
     "flood_cap",
     "main",
@@ -85,6 +103,10 @@ __all__ = [
 VENUE: Final[str] = "polymarket_us"
 SIDECAR_RETENTION_DAYS: Final[int] = 35
 ALERT_EVENT: Final[str] = "BREEZY_STATION_CANDIDATE_NEW"
+STALE_ALERT_EVENT: Final[str] = "BREEZY_STATION_CANDIDATE_STALE"
+#: A healthy watermark is yesterday (age 1). Older than this means the fold has
+#: been skipped (studies lock) or refused for more than two nights.
+STALE_WATERMARK_DAYS: Final[int] = 2
 _PREFIX: Final[str] = "station-candidate-register"
 
 _READ_ERRORS: Final[tuple[type[Exception], ...]] = (
@@ -205,6 +227,7 @@ def _run(
 
     _require_catalog(catalog_root)
     watermark = read_last_folded_day(watermark_path)
+    _alert_if_stale(watermark, today=today, alert_sink=alert_sink)
     all_days = sighting_file_days(sightings_dir)
     retained = [day for day in all_days if horizon <= day < today_iso]
     expired = [day for day in all_days if day < horizon]
@@ -252,8 +275,10 @@ def _run(
     except OSError as exc:
         raise _Refused(f"register write failed: {exc}") from exc
     alerts = _emit_new_candidate_alerts(records, today=today_iso, alert_sink=alert_sink)
-    if newly_folded:
-        write_last_folded_day(watermark_path, max(newly_folded))
+    # Every day before today has now been considered, whether or not it had a
+    # sidecar file: a quiet venue (no unregistered city, the normal case) must
+    # not read as a stale emitter.
+    write_last_folded_day(watermark_path, (today - dt.timedelta(days=1)).isoformat())
     for day in expired:
         sighting_path(sightings_dir, day).unlink(missing_ok=True)
 
@@ -264,6 +289,41 @@ def _run(
         f"records_compacted={stale_record_count(records, today=today_iso)} "
         f"sidecars_pruned={len(expired)} alerts={alerts}"
     )
+    return 0
+
+
+def _alert_if_stale(watermark: str | None, *, today: dt.date, alert_sink: AlertSink) -> bool:
+    """One alert per call when the last successful fold is > 2 days old.
+
+    Absent watermark (fresh install) is not stale. Called once per nightly
+    run -- both the full run and the lock-skip path -- so at most once a day.
+    """
+    if watermark is None:
+        return False
+    age_days = (today - dt.date.fromisoformat(watermark)).days
+    if age_days <= STALE_WATERMARK_DAYS:
+        return False
+    emit_alert(
+        alert_sink,
+        AlertPayload(
+            severity="WARN",
+            event=STALE_ALERT_EVENT,
+            site=f"{VENUE}/register",
+            detail=(
+                f"station-candidate register last folded {watermark} ({age_days} days "
+                "ago); the nightly fold is being skipped or refused - check "
+                "breezy-station-candidate-register.service"
+            ),
+        ),
+    )
+    return True
+
+
+def check_staleness(*, state_dir: Path, today: dt.date, alert_sink: AlertSink) -> int:
+    """The cheap lock-skip mode: no catalog read, no fold, no write."""
+    watermark = read_last_folded_day(state_dir / "last_folded_day.json")
+    stale = _alert_if_stale(watermark, today=today, alert_sink=alert_sink)
+    print(f"{_PREFIX}: staleness check last_folded_day={watermark} stale={stale}")
     return 0
 
 
@@ -301,6 +361,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="directory holding station_candidates.jsonl, last_folded_day.json, sightings/",
     )
     parser.add_argument("--today", default=None, help="UTC fold day (YYYY-MM-DD); default now")
+    parser.add_argument(
+        "--check-staleness",
+        action="store_true",
+        help="only alert if last_folded_day is stale; no catalog read, no fold (lock-skip path)",
+    )
     return parser.parse_args(argv)
 
 
@@ -311,9 +376,12 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         if args.today is not None
         else dt.datetime.now(dt.UTC).date()
     )
+    state_dir = Path(args.state_dir).expanduser()
+    if args.check_staleness:
+        return check_staleness(state_dir=state_dir, today=today, alert_sink=resolve_alert_sink(env))
     return run(
         catalog_root=Path(args.catalog_root).expanduser(),
-        state_dir=Path(args.state_dir).expanduser(),
+        state_dir=state_dir,
         today=today,
         alert_sink=resolve_alert_sink(env),
     )

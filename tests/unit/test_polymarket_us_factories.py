@@ -1007,3 +1007,28 @@ def test_the_shared_provider_getter_signature_is_unchanged() -> None:
         factories_module._shared_polymarket_us_instrument_provider.__wrapped__
     )
     assert tuple(signature.parameters) == ("client", "provider_config", "discovery", "clock")
+
+
+def test_the_recorder_composition_wires_the_config_supplied_failure_alert(
+    wired: dict[str, Any],
+) -> None:
+    """The alert callable is NAMED by the runtime (a path, resolved with Nautilus's
+    ``resolve_path``) so the adapter never imports ``breezy.runtime``."""
+    config = make_config(subscribe_trades=True, sighting_failure_alert_path="builtins:print")
+    provider = _provider_of(build_client(config))
+
+    assert provider._sighting_failure_alert is print
+
+
+def test_the_trade_node_composition_resolves_no_failure_alert(wired: dict[str, Any]) -> None:
+    provider = _provider_of(build_client(make_config()))
+
+    assert provider._sighting_failure_alert is None
+
+
+@pytest.mark.parametrize("path", ["builtins:no_such_function", "builtins:__doc__"])
+def test_an_unresolvable_or_non_callable_failure_alert_path_refuses_at_build(
+    wired: dict[str, Any], path: str
+) -> None:
+    with pytest.raises(SettingsError, match="sighting_failure_alert_path"):
+        build_client(make_config(subscribe_trades=True, sighting_failure_alert_path=path))
