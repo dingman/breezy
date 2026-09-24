@@ -1,10 +1,14 @@
 """AUD-13d: a real kernel's startup early-return is a CRITICAL boot-halt alert.
 
 The lifecycle contract beside this file is the positive control: the same
-``build_trade_node_config`` wiring reaches ``trader.is_running``. Each test
+``build_trade_node_config`` wiring reaches ``trader.is_running``. Each halt
 here perturbs that wiring by exactly one fact (a client that never connects,
-a reconciliation that returns false, a portfolio that never initialises) and
-asserts the boot-halt ``detail`` the post-``run()`` ladder resolves.
+a reconciliation that returns false, a portfolio that never initialises).
+The post-``run()`` read cannot tell those causes apart -- stop disconnects
+the engines, and ``portfolio.initialized`` stays false for every early
+return -- so every halt carries the one honest detail,
+``BOOT_HALT_TRADER_NEVER_STARTED``. A boot that reaches RUNNING and is then
+stopped, including by the node's SIGTERM callback, carries none.
 
 Nothing in ``nautilus_trader`` is monkeypatched. Levers are a
 ``TradingNodeConfig`` timeout or a Breezy-owned client subclass registered
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import signal
 import threading
 import time
 from enum import Enum
@@ -55,9 +60,7 @@ _DRIVE_DEADLINE_S = 20.0
 OPERATOR_ORDER_CEILING_USD = "25"
 
 _BOOT_HALT_EVENT = "BOOT_HALT"
-_DETAIL_ENGINES = "BOOT_HALT_ENGINES_NOT_CONNECTED"
-_DETAIL_RECONCILIATION = "BOOT_HALT_RECONCILIATION_FAILED"
-_DETAIL_PORTFOLIO = "BOOT_HALT_PORTFOLIO_NOT_INITIALISED"
+_DETAIL_NEVER_STARTED = "BOOT_HALT_TRADER_NEVER_STARTED"
 
 
 class _Mode(Enum):
@@ -239,10 +242,21 @@ class _HarnessNode(TradingNode):
             super().add_exec_client_factory(name, _MassStatusNoneExecClientFactory)
 
 
-def _request_stop(node: TradingNode) -> None:
+def _request_stop(node: TradingNode, *, sigterm: bool = False) -> None:
+    """Stop the node from the driving thread.
+
+    ``sigterm`` fires the node's own signal callback -- the body the kernel
+    installs for SIGTERM -- instead of calling ``stop_async`` directly.
+    """
     loop = node.kernel.loop
 
     def _schedule() -> None:
+        if sigterm:
+            callback = node.kernel.loop_sig_callback
+            if callback is None:
+                raise RuntimeError("kernel exposed no SIGTERM callback")
+            callback(signal.SIGTERM)
+            return
         loop.create_task(node.stop_async())
 
     loop.call_soon_threadsafe(_schedule)
@@ -327,7 +341,7 @@ def _drive(
             observed["trader_running"] = bool(node.trader.is_running)
         except Exception as exc:  # noqa: BLE001 - recorded, asserted by the caller
             observed["trader_running_error"] = type(exc).__name__
-        _request_stop(node)
+        _request_stop(node, sigterm=until_running)
 
     thread = threading.Thread(target=stopper, name="boot-halt-stopper", daemon=True)
     thread.start()
@@ -340,14 +354,15 @@ def _boot_halt_details(sink: _RecordingAlertSink) -> list[str]:
     return [payload.detail for payload in sink.payloads if payload.event == _BOOT_HALT_EVENT]
 
 
-def test_a_real_node_that_reaches_running_emits_no_boot_halt_alert(
+def test_a_real_node_that_reaches_running_then_sigterm_emits_no_boot_halt_alert(
     alert_sink: _RecordingAlertSink,
 ) -> None:
-    """Positive control for the false-positive guard, on a real node.
+    """Positive control: RUNNING, then the node's SIGTERM callback, stays silent.
 
     Same client wiring as ``test_the_trade_node_reaches_running_and_stops_cleanly``:
     a connecting data client and zero execution clients. The trader reaches
-    RUNNING, so the post-run check must stay silent.
+    RUNNING and the stop is the SIGTERM callback, so the post-run check must
+    stay silent. An ordinary stop and a SIGTERM stop are this same callback.
     """
     code, stderr, trader_running = _drive(_Mode.REACHES_RUNNING, until_running=True)
 
@@ -356,18 +371,20 @@ def test_a_real_node_that_reaches_running_emits_no_boot_halt_alert(
     assert _boot_halt_details(alert_sink) == []
 
 
-def test_engines_that_never_connect_halt_the_boot_with_the_engines_not_connected_detail(
+def test_engines_that_never_connect_halt_the_boot_with_one_critical_alert(
     alert_sink: _RecordingAlertSink,
 ) -> None:
     code, stderr, trader_running = _drive(_Mode.ENGINES_NEVER_CONNECT, until_running=False)
 
     assert code == EXIT_OK, stderr
     # The halt is the kernel's: the trader never started. The alert does not
-    # change that, and it does not change the process exit code.
+    # change that, and it does not change the process exit code. Stop has
+    # disconnected the clients, so the cause is not attributed.
     assert trader_running is False
     details = _boot_halt_details(alert_sink)
-    assert details == [_DETAIL_ENGINES]
+    assert details == [_DETAIL_NEVER_STARTED]
     assert alert_sink.payloads[0].severity == "CRITICAL"
+    assert len(alert_sink.payloads) == 1
 
 
 def test_a_false_reconciliation_halts_the_boot_and_emits_a_critical_alert(
@@ -378,13 +395,13 @@ def test_a_false_reconciliation_halts_the_boot_and_emits_a_critical_alert(
     assert code == EXIT_OK, stderr
     assert trader_running is False
     details = _boot_halt_details(alert_sink)
-    assert details == [_DETAIL_RECONCILIATION]
+    assert details == [_DETAIL_NEVER_STARTED]
     assert alert_sink.payloads[0].severity == "CRITICAL"
     assert alert_sink.payloads[0].site == "global"
     assert len(alert_sink.payloads) == 1
 
 
-def test_a_portfolio_that_never_initialises_halts_the_boot_with_the_portfolio_detail(
+def test_a_portfolio_that_never_initialises_halts_the_boot_with_one_critical_alert(
     alert_sink: _RecordingAlertSink,
 ) -> None:
     code, stderr, trader_running = _drive(
@@ -396,5 +413,5 @@ def test_a_portfolio_that_never_initialises_halts_the_boot_with_the_portfolio_de
     assert code == EXIT_OK, stderr
     assert trader_running is False
     details = _boot_halt_details(alert_sink)
-    assert details == [_DETAIL_PORTFOLIO]
-    assert _DETAIL_RECONCILIATION not in details
+    assert details == [_DETAIL_NEVER_STARTED]
+    assert len(alert_sink.payloads) == 1

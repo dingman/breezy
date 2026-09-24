@@ -180,12 +180,7 @@ class _FakeRiskEngine:
 
 
 class _SilentExecEngine:
-    """Enough of the exec engine for the stale-intent reader to find no client.
-
-    ``check_connected`` is deliberately absent: a fake run that never publishes
-    component state has not observed engine connectivity, and the boot-halt
-    ladder must not invent it.
-    """
+    """Enough of the exec engine for the stale-intent reader to find no client."""
 
     def __init__(self) -> None:
         self._clients: dict[object, object] = {}
@@ -376,10 +371,10 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
     """2026-09-11 incident addendum, item 3: `install_stale_intent_alert`
     rides the SAME `COMPONENT_STATE_TOPIC` heartbeat
     `install_component_degraded_alert` already subscribes -- one wiring
-    idiom, not a second timer. AUD-13d adds a third subscriber on that
-    topic, the boot-halt watch. Nothing else in `_run_node` uses it (the
-    order guard and the account presence halt both subscribe
-    `ORDER_EVENT_TOPIC` instead)."""
+    idiom, not a second timer. The boot-halt check is not a third
+    subscriber and not a timer: it reads the trader once after ``run()``.
+    Nothing else in `_run_node` uses this topic (the order guard and the
+    account presence halt both subscribe `ORDER_EVENT_TOPIC` instead)."""
     run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
     node = RecordingNode.instances[0]
 
@@ -388,7 +383,7 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
         for topic, handler in node.kernel.msgbus.subscriptions
         if topic == COMPONENT_STATE_TOPIC
     ]
-    assert len(component_state_subscribers) == 3, node.kernel.msgbus.subscriptions
+    assert len(component_state_subscribers) == 2, node.kernel.msgbus.subscriptions
 
 
 def test_the_entrypoint_source_registers_no_strategy_or_exec_algorithm_or_raw_submit() -> None:
@@ -934,12 +929,15 @@ def test_the_tape_recorder_and_the_ingest_node_are_untouched() -> None:
 # ---------------------------------------------------------------------------
 
 _BOOT_HALT_EVENT = "BOOT_HALT"
-_BOOT_HALT_DETAILS = frozenset(
+#: The only detail a post-run read can state honestly. Engine connectivity
+#: does not survive stop, and ``portfolio.initialized`` is false for every
+#: early return, not only a portfolio-init failure.
+_BOOT_HALT_DETAILS = frozenset({"BOOT_HALT_TRADER_NEVER_STARTED"})
+_DROPPED_BOOT_HALT_DETAILS = frozenset(
     {
         "BOOT_HALT_ENGINES_NOT_CONNECTED",
         "BOOT_HALT_RECONCILIATION_FAILED",
         "BOOT_HALT_PORTFOLIO_NOT_INITIALISED",
-        "BOOT_HALT_TRADER_NEVER_STARTED",
     }
 )
 
@@ -979,37 +977,38 @@ class _AlwaysConnectedEngine:
 
 
 class _TraderReachedRunningNode(RecordingNode):
-    """A clean stop that did publish trader RUNNING, the way a real boot does."""
+    """A clean stop leaves the public ``Trader.is_stopped`` flag set.
+
+    That is the one-shot signal read after ``run()``. Publishing a component
+    state is not that signal: the check does not subscribe to the bus.
+    """
 
     def run(self) -> None:
         self.calls.append("run")
-        _publish_component_state(
-            self,
-            component_id=self.trader.id,
-            component_type="Trader",
-            state=ComponentState.RUNNING,
-        )
+        self.trader.is_stopped = True
 
 
 class _UnattributedBootHaltNode(RecordingNode):
-    """Engines connected, emulator ran, portfolio initialised, trader did not.
+    """Connected engines, portfolio not initialised, trader never started.
 
-    None of the three named early-return probes fire, so the ladder must
-    fall through to the generic detail rather than borrow one.
+    A bus sample of that shape used to be labelled a failed reconciliation
+    (engines connected, order emulator never seen). Those probes do not
+    survive as a cause after ``run()`` returns, so the alert stays generic.
+    The published event gives a subscriber the same chance to mislabel it.
     """
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
         self.kernel.data_engine = _AlwaysConnectedEngine()
         self.kernel.exec_engine = _AlwaysConnectedEngine()
-        self.kernel.portfolio.initialized = True
+        self.kernel.portfolio.initialized = False
 
     def run(self) -> None:
         self.calls.append("run")
         _publish_component_state(
             self,
-            component_id=ComponentId("OrderEmulator"),
-            component_type="OrderEmulator",
+            component_id=ComponentId("DataEngine"),
+            component_type="DataEngine",
             state=ComponentState.RUNNING,
         )
 
@@ -1044,13 +1043,9 @@ def test_a_normal_run_that_reaches_trader_running_emits_no_boot_halt_alert(
     assert err.getvalue() == ""
     assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
     node = RecordingNode.instances[0]
-    component_state_subscribers = [
-        handler
-        for topic, handler in node.kernel.msgbus.subscriptions
-        if topic == COMPONENT_STATE_TOPIC
-    ]
-    # Without the watch, "no alert" is true of every run and proves nothing.
-    assert len(component_state_subscribers) == 3, node.kernel.msgbus.subscriptions
+    # The one-shot signal, not a bus subscription. A node that never sets
+    # it alerts (the test above); this one did, so silence is the branch.
+    assert node.trader.is_stopped is True
     assert _boot_halt_payloads(_no_send_alert_sink) == []
 
 
@@ -1107,8 +1102,4 @@ def test_a_boot_halt_with_no_attributable_cause_alerts_with_the_generic_detail(
     assert payloads[0].severity == "CRITICAL"
     detail = payloads[0].detail
     assert detail == "BOOT_HALT_TRADER_NEVER_STARTED"
-    assert detail not in {
-        "BOOT_HALT_ENGINES_NOT_CONNECTED",
-        "BOOT_HALT_RECONCILIATION_FAILED",
-        "BOOT_HALT_PORTFOLIO_NOT_INITIALISED",
-    }
+    assert detail not in _DROPPED_BOOT_HALT_DETAILS
