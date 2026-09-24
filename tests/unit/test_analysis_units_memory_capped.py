@@ -51,6 +51,9 @@ _CANDIDATE_UNITS = [
     # breezy-position-monitor-report.service and breezy-asos-refresh.service
     # -- checked here so its own cgroup ceiling never goes uncovered.
     "breezy-portfolio-roi.service",
+    # AUD-03: one day's offer-tape JSONL. Sized under the 512M/1G light
+    # band (see the unit file) and listed here so the ceiling cannot drift.
+    "breezy-decision-funnel-digest.service",
 ]
 
 _EXISTING_UNITS = [

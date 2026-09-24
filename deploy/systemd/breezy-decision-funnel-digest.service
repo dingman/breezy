@@ -1,0 +1,47 @@
+[Unit]
+# AUD-03 daily decision-funnel digest
+# (docs/plans/backlog/AUDIT_2026-09-21/AUD-03-daily-decision-funnel-digest.md).
+# Read-only over one day's offer-tape JSONL. Holds no venue credential.
+# Does not touch the node, the order path, or the tally.
+Description=Breezy AUD-03 daily decision-funnel digest
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/decision_funnel_daily_digest.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-03-daily-decision-funnel-digest.md
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit). A missing
+# tape is exit 0 with an INFO diagnostic inside the script, so it does not
+# trip this. An unknown offer-tape source returns 1 and does.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Sized under breezy-position-monitor-report's MemoryHigh=512M/MemoryMax=1G:
+# this unit reads one day's JSONL, not a parquet join. Still cites the
+# 2026-09-11 K1 incident — breezy-k1-daily.service hit a 17.6 GB peak in
+# under 2 minutes with no ceiling, pushing the 31 GB host into swap while
+# breezy-trade-supervisor.service (deliberately uncapped) ran beside it.
+MemoryHigh=256M
+MemoryMax=512M
+
+# Same shared slice and flock as the other analysis units
+# (decision-funnel-digest-run.sh). Light, but serialized rather than exempt.
+Slice=breezy-studies.slice
+UMask=0077
+
+# The ONLY EnvironmentFile=: alerts.env (mode 0600, BREEZY_ALERT_WEBHOOK_URL
+# only). Never breezy-trade.env, polymarket.env, or operator.env. The `-`
+# prefix keeps the unit startable when the file is absent (log-only sink).
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/deploy/systemd/decision-funnel-digest-run.sh
+
+TimeoutStartSec=180
+
+# No Restart=. A bad run must not retry-storm. Persistent=true on the timer
+# catches a reboot-missed run.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-decision-funnel-digest
+
+# NOTE: no [Install] section. Enable the timer, never this unit.
