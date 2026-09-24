@@ -433,4 +433,363 @@ Rules for every merge:
 
 Lesson numbers cited (headers checked in `docs/core/LESSONS.md`): L-16 (:772), L-32 (:1268), L-34 (:1296), L-43 (:1424), L-48 (:1515).
 
-Status: Rev 2 — pending delta peer review.
+
+---
+
+# Rev 3 — BINDING section replacements (each supersedes the same-named Rev 2 section above) for `docs/plans/STALL_FOLLOWUPS_F1_F4_2026-09-24.md`
+
+These are surgical replacements for R1–R9. Each block below replaces the named section in full; everything not listed stays as in Rev 2.
+
+I checked the new citations against the tree before using them:
+
+| Citation | What I found |
+|---|---|
+| L-36 | Real header at `LESSONS.md:1324`: "Strict ZERO_FILL is unreachable; a no-fill IOC is AMBIGUOUS until a GET says otherwise" |
+| `PRE_DECISION_WAIT_DIAGNOSTICS` | `halt_detector.py:175-181` = {`in_window_not_executable`, `in_window_no_running_max_yet`, `in_window_rung_not_current`} |
+| `measured_slippage_from_fills.py:487` | Globs `offer_tape_*.jsonl` |
+| AUD-14a `.git`-reading helper | Not on this branch. A grep of `*.py` for `.git/HEAD` / `packed-refs` / `AUD-14a` found nothing. R8 is written as a dependency. |
+
+---
+
+### Replace section: `## F-1a: NO-only branch when the YES ask is outside the band` → `### Acceptance criteria`
+
+### Acceptance criteria
+
+1. YES ask outside the band, NO leg executable, running max present, rung current: `_evaluate_no_side_shadow` runs exactly once.
+2. On every tick where the YES ask is outside the band, the changes to `diagnostics.counts` match the baseline exactly (`in_window_not_executable` +1 and nothing else). `refusals.counts`, `takes`, `_eligible_snap_counts` and the YES tape rows do not change.
+3. YES and NO both outside the band: byte-identical to today, and no tape row.
+4. Gate closed: a NO-only tick appends one NO row with `reason=no_side_calibration_unsafe`. It produces zero `submit_order` calls, zero `set_inflight`/`record_attempt` calls on `no_iid`, zero writes of `NO_SIDE_FIRST_LIVE_ORDER_KEY`, and `no_takes == 0`.
+5. Gate cleared, in a test config only: a NO-only tick with edge reaches the arm tail at `:1946-1960`. This proves the tail is reachable; it does not enable it.
+6. Crossed book on a NO-only tick: NO is refused `not_executable`.
+7. Any tick with the YES ask in band is byte-identical to the baseline: golden rows, counters and order calls.
+8. **(D2, R8) Sampling-regime boundary.**
+   - Record the F-1a, F-1b and F-1c merge SHAs in `docs/core/PROGRESS.md` and cross-reference them from the AUD-01 plan as NO-population regime boundaries. This follows the precedent in amendment §1:16 (`STUDY_GIT_SHA`).
+   - Any NO-calibration study, including the one that would clear the AUD-01a gate, must record those SHAs and must not pool `no_side_shadow` rows across them. The default scope is post-F-1c.
+   - Attribution comes from the **node**. Every F-2 row carries `build_sha`, resolved once at boot by reading the imported tree's `.git` files (no subprocess; see F-2 Design). The digest copies the distinct `build_sha` values for the day into its artefact as `no_regime_sha`. The digest never resolves a SHA itself.
+
+---
+
+### Replace section: `## F-1b: a bid-only Depth10 book reaches NO evaluation (separate commit)`
+
+## F-1b: a bid-only Depth10 book reaches NO evaluation (separate commit)
+
+The domain reviewer CONFIRMED the trigger reading: a bid-only Depth10 update is an update to the NO leg's ask (amendment §2:32).
+
+**Mechanism.** `on_order_book_depth:1155-1157` returns when `best_order(depth.asks) is None`. So the cheapest NO, which comes from a YES book that has only a bid, is never evaluated.
+
+**Change (optional ask).**
+- `_AskSnapshot.ask` becomes `Decimal | None`. `size` is 0 when there is no ask.
+  - The type is private to `continuous_strategy.py`. The only sites are `:268`, `:290`, `:1159`, `:1209` and `:1322`.
+  - `_snapshot_from_quote` always sets an ask.
+- `on_order_book_depth` returns only when **both** the ask and the bid are None. Forwarding to the monitor (`:1169`) is unchanged.
+- The dedupe key at `:1209` is `(ts_event, ask, size)` when an ask exists, otherwise `(ts_event, None, bid, bid_size)`. Keys with an ask are unchanged.
+- **Window check, silent for bid-only frames (R1).** At `:1306`, when `snapshot.ask is None` and the hour is outside the window, return **before** `self.refusals.record(_OUTSIDE_DECISION_WINDOW)`, before the refusal alerter, and before `_observe_halt(trading_expected=False)`. `refusals` stays byte-identical.
+- **At `:1322`, when `snapshot.ask is None`:**
+  - Record no YES diagnostic.
+  - If `no_leg_executable(...)`, call `_hunt_no_only`; then return.
+  - Put `assert ask is not None` on the YES path after this branch.
+- **Replay fixtures first (R2).** Before writing code, the implementer counts Depth10 frames with no ask and a bid present in every fixture that `tests/unit/test_current_rung_hold_paper_replay.py` loads, and states the count.
+  - If the count is non-zero, re-baseline that test **by name in the F-1b commit**, giving the reason ("bid-only Depth10 frames now reach NO evaluation per the F-1b trigger reading") and the before/after row and counter deltas.
+  - If the count is zero, the test stays unedited.
+
+**Remaining upstream deltas for in-window bid-only frames.** Each is accepted explicitly. Before F-1b these frames returned at `:1157`.
+
+| Gate (line) | Delta now possible | Accepted because |
+|---|---|---|
+| `family_halt` (`:1181`) | `diagnostics["family_halt"]` +1; alerter report | The family is already halted, so the count only raises the detail number. It is not in `PRE_DECISION_WAIT_DIAGNOSTICS`. |
+| Fee halt (`:1191`) | none | Silent return |
+| `day_budget_exhausted` (`:1220`) | `diagnostics["day_budget_exhausted"]` +1; `budget_stop:` notice at most once per `(station, utc_day)` (already deduped by `_budget_stop_notice`) | A true WAIT, accurately observed; bounded |
+| `is_consumed` (`:1241`) | none (see F-1c) | — |
+| `_release_stale_inflight` (`:1251`) | Latch `clear_inflight` write; `inflight_released` +1; `rearm:` line | The release conditions (intent CLOSED plus the delay floor) do not depend on the trigger, and any quote tick would release at the same point. Pinned by a test. |
+| `rearm_wait` (`:1278`) | `diagnostics["rearm_wait"]` +1; `_record_rearm_denial_once` (deduped per station-day) | Bounded, and an accurate WAIT |
+| `open_intent_wait` (`:1296`) | `diagnostics["open_intent_wait"]` +1; alerter | Accurate; F-2 and F-4 carry it |
+| Window (`:1306`) | none (silent return, R1) | `refusals` byte-identical |
+| `_observe_halt(True)` (`:1320`) | One extra observation per in-window bid-only frame | **Halt semantics verified safe.** None of the keys above are in `PRE_DECISION_WAIT_DIAGNOSTICS` (`halt_detector.py:175-181`). Bid-only frames never record `in_window_not_executable`, `in_window_no_running_max_yet` or `in_window_rung_not_current`. The detector's baseline resets when `trading_expected` is False, and bid-only frames outside the window never call it. |
+| `_last_ask_seen[iid]` | One dict entry per iid | Bounded by the instrument count |
+
+**Acceptance criteria**
+1. A bid-only book with an executable NO leg evaluates NO exactly once.
+2. A bid-only book whose NO leg is outside the band writes no row and causes no `not_executable` or `refusals` delta.
+3. A book with neither an ask nor a bid returns early, unchanged.
+4. Gate closed: no order, no inflight, no first-order key.
+5. The QuoteTick path is byte-identical.
+6. Bid-only frames outside the window leave `refusals` byte-identical and never call `_observe_halt(False)`.
+7. The only upstream deltas are the ones enumerated in the table above.
+
+**Tests** (in `tests/unit/test_continuous_rung_hold_no_only_hunt_2026_09_24.py`):
+- `test_bid_only_depth_evaluates_no_side`
+- `test_bid_only_depth_no_leg_out_of_band_is_silent`
+- `test_empty_depth_returns_early`
+- `test_bid_only_dedupe_distinguishes_bids_at_same_ts`
+- `test_bid_only_gate_closed_never_submits`
+- `test_quote_tick_path_unchanged`
+- `test_bid_only_frame_counter_deltas_per_upstream_state`: parametrised over {`family_halt`, `day_budget_exhausted`, `rearm_wait`, `intent_open`, `outside_window`}. Each case asserts the exact `diagnostics`/`refusals` delta from the table, and that `refusals` is empty for `outside_window`.
+- `test_release_stale_inflight_is_trigger_independent`: same latch state and same `ts_event`, fired once by a quote tick, once by a Depth10 frame with an ask, and once by a bid-only Depth10 frame. All three produce the same `clear_inflight` write, the same diagnostic and the same `rearm:` line.
+
+---
+
+### Replace section: `## F-1c: YES latch states that return before NO (separate commit)`
+
+## F-1c: YES latch states that return before NO (separate commit)
+
+| YES state (`:1241-1284`) | Evaluate NO? | Rationale |
+|---|---|---|
+| `is_consumed(YES iid)`, record reason in `_FILLED_REASONS` | **No.** Skip silently. The positive result is cached (R4). | Amendment §4:114; avoids a `sibling_leg_traded` tape row on every tick |
+| `is_consumed(YES iid)`, record not a fill | **Yes**, through the quiet NO-only entry | §4 excludes NO only on a YES *fill* (`_FILLED_REASONS`, `trial_day_latch.py:164`) |
+| YES IN_FLIGHT, not released | **No.** Fail closed. | The YES outcome is unresolved, so the §4 exclusion cannot be proven |
+| YES `rearm_wait` | **No.** Fail closed. | The prior YES attempt lacks venue evidence of a non-fill (PREREG v3 §5 attempts 2–3) |
+
+**Fail-closed argument (R3).**
+- A YES order that reached `submit_order` without a confirmed fill is AMBIGUOUS by default (L-36). The account-wide submit intent stays OPEN until the resolver retires it with venue evidence (R-7; PREREG v3 §4; L-48 names the clearing path).
+- While that intent is OPEN, the quiet consumed entry returns at step 2 (`is_intent_open()`). `_evaluate_no_side_shadow` checks it again at `(a)`.
+- So NO can be evaluated next to a non-fill YES record only after the intent is retired, which means venue evidence has already said "not filled". That is exactly the case §4 permits.
+
+**Change.** At `:1241`, when the YES instrument is consumed:
+1. If `(station_day, yes_iid)` is in `self._yes_fill_blocks_no`, return. Otherwise run `refuse_if_sibling_leg_traded(store, prefix, station, day, no_iid)`. If it refuses, add the key to the set and return.
+   - The set is bounded by the process's instruments, like `_illegal_cell_station_days`.
+   - Only the positive result is cached. It is safe to cache because a fill record is durable and never reverts.
+   - A negative result is never cached (R4).
+2. Compute `hour_lst`. If outside the window, return silently: no refusal, no `_observe_halt`.
+3. If `is_intent_open()`, return silently.
+4. If `no_leg_executable(...)`, call `_hunt_no_only`.
+
+`_evaluate_no_side_shadow` still applies its own `is_consumed(no_iid)`, Σq admission and day-budget gates. The IN_FLIGHT and `rearm_wait` returns are kept, each with a one-line comment citing this table.
+
+**Acceptance criteria**
+1. YES consumed with a filled reason: no NO evaluation and no row. The second and later ticks do no store read (they hit the cache).
+2. YES consumed with a non-fill reason and the intent CLOSED: NO is evaluated. With the gate closed that yields `no_side_calibration_unsafe` and no order.
+3. YES IN_FLIGHT, or YES in `rearm_wait`: NO is not evaluated.
+4. On the consumed path, an OPEN intent or an outside-window hour is silent, and counters are byte-identical.
+5. **(R3) Writer proof.**
+   - The implementer lists every `consume(` and `consume_if_absent(` caller (codegraph `_callers`, `projectPath=/home/jon/breezy`) together with the reason each one writes.
+   - For each non-fill reason, prove one of two things: the record is written before `submit_order` is reached, or it is written only after the intent was retired with venue non-fill evidence.
+   - Any path that cannot be proven is added to the "treat as filled" skip set in the F-1c commit, so it fails closed. The proof goes in the PR.
+
+**Tests** (same file):
+- `test_yes_consumed_filled_skips_no`
+- `test_yes_consumed_filled_result_is_cached`: asserts one store read across N ticks
+- `test_yes_consumed_unfilled_evaluates_no`: parametrised over non-fill `_REASONS`
+- `test_consumed_unfilled_with_open_ambiguous_intent_is_silent`
+- `test_yes_inflight_skips_no`
+- `test_yes_rearm_wait_skips_no`
+- `test_consumed_path_outside_window_records_nothing`
+
+---
+
+### Replace section: `## F-2: pre-tape counts visible intraday` → `### Design`
+
+### Design
+
+- **Event-time rollover** at the top of `_hunt_tick`: `bucket = ts_event // 3.6e12`, and it only moves forward.
+- **What each rollover emits:** deltas since the last emission for `diagnostics`, `refusals`, `takes` (YES), `no_takes` (NO; incremented at `:1951`, mirroring `takes` at `:1619`) and `offer_tape.sidecar_capped`. A final row is emitted in `on_stop` before `:1050`.
+- **Memory:** bounded by the counters' key sets.
+- **Station field:** `station = ",".join(self._config.stations)`.
+- **Log line:** `diagnostics_hourly: station=… hour_utc=… diag={…} refusals={…} takes=+n no_takes=+n tape_capped=+n build_sha=…`
+- **JSONL row** (`crh_diag_hourly_v1`) fields: `station`, `pid`, `boot_ns`, `build_sha`, `hour_utc_start_ns`, `emitted_at_ns`, `diagnostics`, `refusals`, `takes`, `no_takes`, `offer_tape_capped`, `final`.
+- **Sidecar path:** `_decisions_dir(catalog_root) / f"diagnostics_summary_{day}.jsonl"`, using the offer tape's boot-day name.
+- **`build_sha` (R8):**
+  - Resolved **once at composition time** by reading the imported package tree's `.git` files, with no subprocess. That means following a worktree `.git` file's `gitdir:` pointer, reading `HEAD`, then the loose ref or `packed-refs`.
+  - On any failure it is `"unknown"`, and it never raises.
+  - Reuse AUD-14a's supervisor helper if it has merged by the time F-2 starts. It is not on this branch today, so this is a stated dependency. Otherwise, add a minimal `src/breezy/runtime/build_sha.py`, stdlib only, and move AUD-14a onto it when that lands. This is decided in the F-2 brief.
+- **Halt detector:** `HaltDetector.observe(takes=self.takes)` is unchanged, because no cited rule requires it to see NO takes.
+
+---
+
+### Replace section: `## F-2: pre-tape counts visible intraday` → `### File-by-file`
+
+### File-by-file
+
+- **New `src/breezy/strategy/current_rung_hold/diagnostics_summary.py`** (stdlib only): `DiagnosticsSummarySink(path | None, max_bytes=4 MiB)` with the same best-effort, byte-capped, resume-from-stat behaviour as `OfferTape.append:395-430`, plus a pure `delta(prev, cur)`.
+- **`src/breezy/runtime/build_sha.py`** (if AUD-14a's helper is not merged): `resolve_build_sha(package_file: Path) -> str`.
+- **`composition.py`:**
+  - Add `_decisions_dir(catalog_root)`, shared by `_default_offer_tape_path` and a new `_default_diagnostics_summary_path`.
+  - Resolve `build_sha` once.
+  - Build one shared sink beside `tape` (`:559`) and pass the sink and `build_sha` to each strategy.
+- **`continuous_strategy.py`:**
+  - `__init__` gains kwargs `diagnostics_summary=None` and `build_sha="unknown"`, the `no_takes` counter, and bucket state.
+  - New `_maybe_roll_diagnostics`.
+  - Flush in `on_stop`.
+- **`continuous_backtest_only.py`:** its constructor forwards kwargs explicitly (`:114`, `:130`). **Add** `diagnostics_summary` and `build_sha` to its signature and to its forwarding call (R9).
+- **Digest:** streaming `_read_summary`, a `--summary` flag, `FunnelReport.pre_tape_by_station`, and artefact `no_regime_sha` = sorted distinct `build_sha` values.
+
+---
+
+### Replace section: `## F-2: pre-tape counts visible intraday` → `### Tests`
+
+### Tests
+
+- **`tests/unit/test_continuous_rung_hold_diagnostics_hourly.py`:**
+  - `test_rollover_one_row_per_hour`
+  - `test_per_process_deltas_sum_to_on_stop_snapshot`
+  - `test_older_on_data_ts_never_rolls_back`
+  - `test_sidecar_oserror_never_raises`
+  - `test_no_new_counter_keys`
+  - `test_memory_bounded_by_key_set` (10^5 ticks)
+  - `test_no_takes_counted_at_no_inflight_and_halt_detector_takes_unchanged`
+  - `test_station_field_is_joined_config_stations`
+  - `test_rows_carry_build_sha`
+- **`tests/unit/test_diagnostics_summary_sink.py`:**
+  - `test_two_sink_instances_one_file_rows_intact_and_attributable`
+  - `test_cap_and_resume`
+  - `test_unwritable_dir_in_memory_only`
+- **`tests/unit/test_build_sha.py`** (if the module is added):
+  - `test_reads_loose_ref`
+  - `test_reads_packed_refs`
+  - `test_follows_worktree_gitdir_pointer`
+  - `test_detached_head`
+  - `test_missing_git_returns_unknown_never_raises`
+  - `test_no_subprocess_used`
+- **Digest:**
+  - `test_stalled_station_annotated_from_summary`
+  - `test_missing_summary_byte_identical`
+  - `test_pre_token_dropped_first`
+  - `test_no_regime_sha_copied_from_rows`
+- **Composition:**
+  - `test_diagnostics_summary_path_uses_decisions_dir_boot_day`
+  - `test_backtest_only_forwards_diagnostics_summary_and_build_sha` (R9)
+- **Tripwire:** `test_execution_egress_firewall_guard.py` scans the new modules. They use no egress names and no `subprocess`. If a scanned-file set is enumerated (near `:1601`), add the files to it; weaken nothing.
+
+---
+
+### Replace section: `## F-3: tape cap, streaming digest, retention` → `### Acceptance criteria`
+
+### Acceptance criteria
+
+1. `DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES` is set to the measured value (at most 2× the projected peak day including F-1 growth), and its comment cites the measurement.
+2. One WARN when a sidecar crosses 50% of its cap.
+3. `sidecar_capped` appears in F-2 rows, and the digest prints `truncated=1` when it is above 0.
+4. The digest streams line by line. Peak `tracemalloc` on a 10^5-row tape stays under 50 MB.
+5. A truncated or malformed last line makes the digest exit 1 with `decision tape unreadable`.
+6. **Retention, gzip only (R6, R7).** New `scripts/ops/decisions_retention.py`, run by `deploy/systemd/breezy-decisions-retention.{service,timer}` under the studies flock (same discipline as `decision-funnel-digest-run.sh:37-40`).
+   - **Scope:** only files directly inside `decisions/` whose name fully matches `^(offer_tape|diagnostics_summary)_\d{4}-\d{2}-\d{2}\.jsonl$`. No recursion, and never `observations/`.
+   - **Age is judged by activity, not by name:** skip any file whose mtime is within 36 h. Gzip files older than N days, with N ≥ 2 chosen from the disk measurement.
+   - **Atomic gzip:**
+     1. Write `<name>.jsonl.gz.tmp`.
+     2. fsync the file.
+     3. `os.replace` it to `<name>.jsonl.gz`, then fsync the directory.
+     4. Verify by fully decompressing it and comparing byte count and line count with the original.
+     5. Only then unlink the original.
+   - **On any failure** at any step, remove the `.tmp`, keep the original, log, and continue.
+   - **Pruning ships disabled.** It exists only behind an explicit `--prune-older-than DAYS` flag, which is off by default, and the timer's `ExecStart` never passes it. Enabling it is a separate future change with a one-line heads-up.
+7. **Readers (R5).** Every reader of these files handles both `.jsonl` and `.jsonl.gz`:
+   - the AUD-03 digest;
+   - `scripts/analysis/measured_slippage_from_fills.py:487`, which globs `offer_tape_*.jsonl` and must also glob `offer_tape_*.jsonl.gz`, de-duplicating by date and preferring `.jsonl` when both exist;
+   - `scripts/analysis/band_decider_stage0b_screen.py:37`, which gets a `.gz` fallback for its pinned 09-16 path.
+   
+   The implementer re-greps `scripts/` and `src/` for `offer_tape_`, `diagnostics_summary_` and `decisions` and lists every reader in the PR.
+
+---
+
+### Replace section: `## F-3: tape cap, streaming digest, retention` → `### File-by-file`
+
+### File-by-file
+
+- `src/breezy/strategy/current_rung_hold/offer_tape.py`: the constant, plus a `_half_cap_logged` flag and its WARN.
+- `scripts/analysis/decision_funnel_daily_digest.py`: generator `_iter_jsonl` with `.gz` support through `gzip.open`, preserving the exit-1 "unreadable" path.
+- `scripts/analysis/measured_slippage_from_fills.py`: `.jsonl.gz` glob and open.
+- `scripts/analysis/band_decider_stage0b_screen.py`: `.gz` fallback.
+- New `scripts/ops/decisions_retention.py`, `deploy/systemd/breezy-decisions-retention.service`, `deploy/systemd/breezy-decisions-retention.timer`, plus a wrapper `deploy/systemd/decisions-retention-run.sh` that takes the flock. `ExecStart` has no prune flag.
+
+---
+
+### Replace section: `## F-3: tape cap, streaming digest, retention` → `### Tests`
+
+### Tests
+
+- **`test_current_rung_hold_offer_tape.py`:** re-pin `test_default_sidecar_max_bytes_is_pinned_at_64_mib` under a new name carrying the measured value. It is a provisional value pin, not a safety test, and the commit says so. Add `test_half_cap_warn_once`.
+- **Digest:**
+  - `test_digest_streams_bounded_memory`
+  - `test_truncated_last_line_exits_1_unreadable`
+  - `test_reads_gz_tape`
+  - `test_truncated_flag_from_summary`
+- **`tests/unit/test_measured_slippage_reads_gz.py`:** `test_offer_tape_counts_equal_before_and_after_retention` runs the slippage reader over a fixture `decisions/` directory, then runs retention (N forced past mtime), then runs the reader again, and asserts identical per-date row counts and outputs.
+- **`tests/unit/test_decisions_retention.py`:**
+  - `test_gzips_older_than_n`
+  - `test_recent_mtime_file_untouched_even_if_named_old`
+  - `test_failed_gzip_keeps_original`: injected failure at each of write, fsync, rename and verify
+  - `test_verify_mismatch_keeps_original`
+  - `test_exact_name_match_only_no_recursion`
+  - `test_never_touches_observations`
+  - `test_prune_absent_by_default`
+  - `test_prune_only_with_explicit_flag`
+  - `test_timer_execstart_has_no_prune_flag`: parses the unit file
+  - `test_skips_on_lock_contention`
+
+---
+
+### Replace section: `## F-3: tape cap, streaming digest, retention` → `### Risks`
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Disk runs out | The cap is set from measurement; gzip bounds long-term size. Prune can be enabled later as a named change. |
+| Retention loses data | Gzip only; atomic; verified before unlink; the original is never unlinked on any failure |
+| A file still being written gets compressed | The 36 h mtime rule, independent of the file name |
+| A reader misses `.gz` files | All three readers are updated; the before/after count-equality test |
+| A retention bug deletes files | No delete path runs unless the explicit flag is passed, and the timer never passes it |
+
+---
+
+### Replace section: `## Sequencing (A8, L-43)`
+
+## Sequencing (A8, L-43)
+
+1. **F-3**: merge, then run the full `scripts/ci/run_tests_no_egress.sh` gate. Deploy it first.
+2. **F-1a**: merge, full gate.
+3. **F-1b**: check the replay fixtures first (R2). Merge, full gate.
+4. **F-1c**: produce the writer proof first (R3). Merge, full gate.
+5. **F-2 + F-4**: one slice, because they share `_hunt_tick`'s head, `on_stop`, `__init__`, `composition.py`, `continuous_backtest_only.py` and the digest. Merge, full gate.
+
+Rules for every merge:
+- Run the full no-egress gate plus `lint-imports` after every merge, before the next one.
+- Nothing is parallel on the integration branch.
+- Deploy only through `breezy-trade-supervisor`'s daily boot.
+- Record the D2 regime SHAs at each F-1 merge.
+
+**Must stay green, unedited:**
+- `test_continuous_rung_hold_strategy.py`
+- `test_continuous_rung_hold_no_side_shadow_2026_09_14.py`
+- `test_no_side_first_order_pending_2026_09_14.py`
+- `test_no_side_calibration_gate_manifest.py`
+- `test_current_rung_hold_tick_eval_no_side_2026_09_14.py`
+- `test_halt_detector.py`
+- `test_submit_intent_latch.py`
+- `test_execution_egress_firewall_guard.py` (additions to an enumerated set only)
+- `test_test_safety_tooling_config.py`
+
+**Must stay green; edited only under a condition:**
+- `tests/unit/test_current_rung_hold_paper_replay.py`: unedited, **unless** the R2 fixture check finds bid-only Depth10 frames. In that case it gets a named re-baseline in the F-1b commit with the stated reason and deltas, and it must be green after that re-baseline.
+
+---
+
+### Replace section: `## Unknowns`
+
+## Unknowns
+
+- **F-1b:** whether the replay fixtures contain bid-only Depth10 frames. Resolved by the R2 check before code.
+- **F-1c:** whether any `consume(` or `consume_if_absent(` caller writes a non-fill YES record while the intent could already be retired. This is now an acceptance criterion (F-1c AC5): prove it, or that path fails closed.
+- **F-2:** whether AUD-14a's `.git` helper has merged. If not, F-2 adds `runtime/build_sha.py`.
+- **F-3:** disk headroom, the peak-day volume, and N. Measured before the cap is chosen.
+
+---
+
+## Rev 3 dispositions
+
+| Item | Severity | Where it landed |
+|---|---|---|
+| R1: bid-only frames' upstream side effects | HIGH | F-1b: silent return at the window check; delta table naming every gate with an accept rationale; halt-safety statement citing `halt_detector.py:175-181` and the baseline reset; AC2 reworded; AC6/AC7; `test_bid_only_frame_counter_deltas_per_upstream_state`, `test_release_stale_inflight_is_trigger_independent` |
+| R2: replay fixtures and paper_replay re-baseline | MED | F-1b "Replay fixtures first"; Sequencing step 3; must-stay-green list split into unedited and conditional |
+| R3: F-1c fail-closed argument; writer proof as an AC | MED | F-1c "Fail-closed argument" (L-36 `:1324`, R-7, PREREG v3 §4, L-48); AC5; `test_consumed_unfilled_with_open_ambiguous_intent_is_silent`; Unknowns updated |
+| R4: cache positive filled results | LOW | F-1c Change step 1 (`_yes_fill_blocks_no`, bounded, positive only); AC1; `test_yes_consumed_filled_result_is_cached` |
+| R5: `measured_slippage_from_fills.py:487` reader | HIGH | F-3 AC7; File-by-file; `test_offer_tape_counts_equal_before_and_after_retention` |
+| R6: gzip only; prune behind a flag that is off | HIGH | F-3 AC6; Risks; `test_prune_absent_by_default`, `test_prune_only_with_explicit_flag`, `test_timer_execstart_has_no_prune_flag` |
+| R7: mtime 36 h, N ≥ 2, atomic gzip, exact names | MED | F-3 AC6; `test_recent_mtime_file_untouched_even_if_named_old`, `test_failed_gzip_keeps_original`, `test_exact_name_match_only_no_recursion` |
+| R8: `no_regime_sha` comes from the node | LOW | F-1a AC8; F-2 Design (`build_sha` at boot, `.git` read with no subprocess, AUD-14a dependency stated); F-2 File-by-file and Tests |
+| R9: `continuous_backtest_only.py` kwarg | — | F-2 File-by-file (must add, `:114`/`:130`); `test_backtest_only_forwards_diagnostics_summary_and_build_sha` |
+
+Rev 2 items that are unchanged: D1, D2 (extended by R8) and A1–A8, with the edits above to A3/F-1b/F-1c, A6/F-3 and A8/Sequencing.
+
+**Coordinator note (Rev 3):** AUD-14a merged (`_read_git_head_sha` in `src/breezy/runtime/trade_supervisor.py`). F-2 extracts it into `src/breezy/runtime/build_sha.py` and both callers use that module (DRY); the supervisor import stays behaviour-identical.
+
+Status: Rev 3 — domain reviewer APPROVED Rev 2; architect delta pending.
