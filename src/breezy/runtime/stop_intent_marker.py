@@ -83,7 +83,41 @@ _MARKER_SUFFIX: str = ".stop_intent"
 #: SIGTERM -> Nautilus's own stop_async -> run() returning sequence in well
 #: under a minute, so five minutes is a generous multiple of that -- it
 #: bounds the window a marker can ever apply without being reachable in
-#: normal operation.
+#: normal operation. Cross-checked against Nautilus's OWN shutdown timeout
+#: budget (installed ``nautilus_trader/system/config.py:127-129``,
+#: ``NautilusKernelConfig``): ``timeout_connection=60.0``,
+#: ``timeout_reconciliation=30.0``, ``timeout_portfolio=10.0`` seconds --
+#: 100s total, before ``timeout_disconnection``/``timeout_post_stop``/
+#: ``timeout_shutdown`` even start. 300s is a 3x multiple of that whole
+#: connection+reconciliation+portfolio budget, not just of the "well under a
+#: minute" happy path, so a slow-but-legitimate stop_async that eats its full
+#: Nautilus-side timeout allowance still leaves headroom before this bound
+#: fires.
+#:
+#: [2026-09-24 review, why this stays ``time.time()`` and not
+#: ``time.monotonic()``] ``time.monotonic()`` on Linux is backed by
+#: ``CLOCK_MONOTONIC``, which the Python docs (``time.monotonic``) and
+#: ``clock_gettime(2)`` both describe as a single *system-wide* clock -- so
+#: two DIFFERENT processes reading it on the SAME boot get directly
+#: comparable values, unlike e.g. per-process CPU-time clocks. That property
+#: alone would make it a fine fit for an age check written by one process and
+#: read by another. It is rejected here anyway for one reason
+#: ``CLOCK_MONOTONIC``-across-processes does not fix: it resets to (near) 0
+#: at every boot. The claim "a reboot between write and consume can't
+#: silently validate because start_ticks already differ across boots" does
+#: NOT hold -- ``/proc/<pid>/stat`` field 22 is ALSO ticks-since-boot (see
+#: :func:`_process_start_ticks`), so early in a fresh boot, PIDs are
+#: routinely reused at LOW numbers with correspondingly small, collision-prone
+#: start_ticks; a genuine host reboot in the write-to-consume window is the
+#: one scenario the pid+start_ticks pair is least reliable against. Wall-clock
+#: ``time.time()`` is what actually closes that gap: real time keeps
+#: advancing across a reboot (a reboot takes far longer than an in-process
+#: restart), so ``now() - written_at`` stays large and this check still fails
+#: closed exactly when the identity check is at its weakest. A monotonic
+#: ``now() - written_at`` computed across a reboot would instead be
+#: small or even negative (the post-reboot clock starts back near 0), which
+#: would WRONGLY read as "fresh" -- the opposite of fail-closed. Keep
+#: ``time.time()``.
 _MAX_MARKER_AGE_SECONDS: float = 300.0
 
 #: 1-based ``/proc/<pid>/stat`` field 22 (``starttime``, clock ticks since
