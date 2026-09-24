@@ -456,9 +456,13 @@ def _trial_rows(
 def _write_mechanism_trials(output_dir: Path, rows: Sequence[dict[str, str]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "LOOKAHEAD_CAVEAT.txt").write_text(LOOK_AHEAD_CAVEAT + "\n", encoding="utf-8")
-    # `rows` (always built by `_trial_rows`, the one caller) already carries
-    # `mechanism_test_only="true"` per row; no second stamp needed here.
-    stamped = list(rows)
+    # NOT redundant with `_trial_rows`'s own stamp: `_write_mechanism_trials`
+    # is itself the marker's write-path contract (see
+    # tests/contract/test_mechanism_test_ineligibility.py, which calls this
+    # function directly with rows that do NOT pre-carry the marker) --
+    # dropping this stamp would silently rely on every future caller
+    # replicating `_trial_rows`'s stamp itself.
+    stamped = [dict(row, mechanism_test_only="true") for row in rows]
     fieldnames = [
         "station",
         "climate_day",
