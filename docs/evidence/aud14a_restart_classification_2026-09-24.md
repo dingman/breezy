@@ -93,3 +93,22 @@ earlier, consistent with `7938032` landing 2026-09-12T01:24.
   restart, without a manual `git log` correlation. §8 item 5's demonstration
   (a real deploy restart showing a changed `revision=` value) is left for
   the next deploy, per the plan.
+
+## Correction — first implementation was inert in production (caught by review)
+
+The first cut of `_resolve_build_revision` fell back to
+`importlib.metadata.version("breezy")` when `BREEZY_BUILD_REVISION` was
+unset. `pyproject.toml`'s version is a hand-edited literal (`0.1.0`), frozen
+across ordinary commits, and nothing in this deployment sets
+`BREEZY_BUILD_REVISION` — so every `supervisor_started` line would have read
+`revision=0.1.0` regardless of which commit was actually running, making the
+field unable to answer the one question it exists for (§8 item 5's
+"the value differs from the previous restart's"). Independent review
+(REQUEST_CHANGES) caught this before merge. The corrected resolver reads the
+git commit of the source tree actually imported directly from `.git` files
+(`HEAD`, loose/packed refs, and the linked-worktree `commondir` indirection —
+no `git` subprocess, no GitPython), truncated to 12 hex characters, and falls
+back to the package version only when no `.git` is resolvable at all (e.g. a
+non-editable install). The value reflects the checked-out tree at supervisor
+*start*; the node is spawned later from that same tree, so it is also the
+node's revision.
