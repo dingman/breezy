@@ -34,6 +34,7 @@ from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import backtest
 from breezy.runtime.paper_replay import (
+    UNSCOPED_FAMILY_ID,
     ReplayEntryContext,
     build_paper_replay_config,
     filled_trials_from_engine,
@@ -53,6 +54,7 @@ from breezy.strategy.current_rung_hold.monitor_store import (
     read_monitor_summaries,
 )
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
+from breezy.strategy.current_rung_hold.trial_day_latch import CONTINUOUS_TRIAL_KEY_PREFIX
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
     _cont_latch_factory,
@@ -589,7 +591,12 @@ def test_a_fill_is_delivered_before_the_next_depth_frame_is_handled(
             entry_ask=Decimal("0.40"),
             scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
         )
-        trials = filled_trials_from_engine(engine, {str(interior_instrument.id): ctx})
+        trials = filled_trials_from_engine(
+            engine,
+            {str(interior_instrument.id): ctx},
+            family_id=UNSCOPED_FAMILY_ID,
+            trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        )
 
     assert len(trials) == 1
     assert call_order == [
@@ -783,7 +790,12 @@ def _run_fill_then_monitor(
             entry_ask=Decimal("0.40"),
             scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
         )
-        trials = filled_trials_from_engine(engine, {str(interior_instrument.id): ctx})
+        trials = filled_trials_from_engine(
+            engine,
+            {str(interior_instrument.id): ctx},
+            family_id=UNSCOPED_FAMILY_ID,
+            trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        )
     assert len(trials) == 1
     return strategy, trials, final_ts
 

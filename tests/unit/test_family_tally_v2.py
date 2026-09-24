@@ -1973,9 +1973,17 @@ def test_the_v1_tally_is_untouched() -> None:
     hardcoded sha256 of the file's current bytes (computed once at S4a
     HEAD, cac3f63), not a `git show` of a commit that a future history
     squash could make unresolvable. v1 tally byte-frozen; PREREG v1 closed;
-    update only with a ruling."""
+    update only with a ruling.
+
+    AUD-19a (peer-**ENDORSED** ruling
+    `RULING_replay_evidence_citability_and_promotion_criteria_2026-09-21.md`
+    Q1 RULING items 1-8) is exactly such a ruling: it moves the restated
+    paper-namespace check and its `assert_paper_only`/`build_live_family_
+    tally` provenance leg in `live_family_tally.py`, so the pin is ADVANCED
+    to the ruling-authorized post-AUD-19a bytes -- never relaxed into a
+    non-pin; any FUTURE undocumented drift still fails this test."""
     import hashlib
 
     path = _SCRIPTS_ANALYSIS_DIR / "live_family_tally.py"
     current = hashlib.sha256(path.read_bytes()).hexdigest()
-    assert current == "801f3106e3a32f6032942b85feaf23b30cb2a0159705d471ab956f9cb86610e0"
+    assert current == "e5567a87c08d716310e1f5114c07a7758d1cda990e7e753d79a2fe599cef9120"

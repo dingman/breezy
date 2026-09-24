@@ -47,7 +47,9 @@ from breezy.domain.weather_bucket_facts import (
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import SettlementInvariantError, backtest
 from breezy.runtime.paper_replay import (
+    PAPER_TRIAL_ID_NAMESPACE,
     PRECISION_ARMS,
+    UNSCOPED_FAMILY_ID,
     ForeignReplayDataError,
     ImpossibleFillPriceError,
     PaperReplayInputs,
@@ -70,6 +72,8 @@ from breezy.strategy.current_rung_hold.config import (
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.monitor_store import read_monitor_summaries
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    DEFAULT_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
 )
@@ -223,7 +227,14 @@ def test_a_quote_only_instrument_is_refused() -> None:
 # ---------------------------------------------------------------------------
 # RED tests 3-4 -- IOC fill mechanics, over a REAL BacktestEngine
 # ---------------------------------------------------------------------------
-def _run_engine(store_path: Path, *, ask: str, size: int) -> tuple[FilledTrial, ...]:
+def _run_engine(
+    store_path: Path,
+    *,
+    ask: str,
+    size: int,
+    family_id: str = UNSCOPED_FAMILY_ID,
+    trial_id_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+) -> tuple[FilledTrial, ...]:
     instrument = _instrument()
     # Depth strictly precedes the quote's own ts_init: under L2_MBP,
     # `process_quote_tick` never mutates the book (engine.pyx:4509,4551), so
@@ -271,7 +282,12 @@ def _run_engine(store_path: Path, *, ask: str, size: int) -> tuple[FilledTrial, 
             entry_ask=Decimal(ask),
             scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
         )
-        trials = filled_trials_from_engine(engine, {str(instrument.id): ctx})
+        trials = filled_trials_from_engine(
+            engine,
+            {str(instrument.id): ctx},
+            family_id=family_id,
+            trial_id_prefix=trial_id_prefix,
+        )
     return trials
 
 
@@ -332,7 +348,12 @@ def test_a_fill_below_its_decision_instant_entry_ask_is_refused(tmp_path: Path) 
             scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
         )
         with pytest.raises(ImpossibleFillPriceError, match="0.40.*0.50|entry_ask=0.50"):
-            filled_trials_from_engine(engine, {str(instrument.id): ctx})
+            filled_trials_from_engine(
+                engine,
+                {str(instrument.id): ctx},
+                family_id=UNSCOPED_FAMILY_ID,
+                trial_id_prefix=DEFAULT_TRIAL_KEY_PREFIX,
+            )
 
 
 def test_an_ioc_at_displayed_size_one_fills_exactly_one_contract_at_the_displayed_ask(
@@ -344,8 +365,61 @@ def test_an_ioc_at_displayed_size_one_fills_exactly_one_contract_at_the_displaye
     assert trial.fill_px == Decimal("0.40")
     assert trial.entry_ask == Decimal("0.40")
     assert trial.qty == Decimal(1)
-    expected_id = f"paper_replay/current_rung_hold/trial/{STATION}/{CLIMATE_DAY.isoformat()}"
+    # AUD-19a: the id now carries the caller's `family_id` segment
+    # (`UNSCOPED_FAMILY_ID` here -- no manifest is in play at this call
+    # site) immediately after the `PAPER_TRIAL_ID_NAMESPACE` literal.
+    expected_id = (
+        f"{PAPER_TRIAL_ID_NAMESPACE}/{UNSCOPED_FAMILY_ID}/"
+        f"{DEFAULT_TRIAL_KEY_PREFIX}{STATION}/{CLIMATE_DAY.isoformat()}"
+    )
     assert trial.trial_id == expected_id
+
+
+# ---------------------------------------------------------------------------
+# AUD-19a -- family-scoped replay id (ruling
+# `RULING_replay_evidence_citability_and_promotion_criteria_2026-09-21.md`
+# Q1). Step 1: the ruled shape, over the REAL on-disk collision --
+# `pm_us_crh_cont` and `pm_us_crh_v4` share `trial_id_prefix`
+# "continuous_rung_hold/trial/" (`deploy/families/*.json`) yet must produce
+# distinct ids.
+# ---------------------------------------------------------------------------
+def test_two_manifests_sharing_a_trial_id_prefix_yield_distinct_replay_ids(
+    tmp_path: Path,
+) -> None:
+    cont_id = _run_engine(
+        tmp_path / "cont.db",
+        ask="0.40",
+        size=10,
+        family_id="pm_us_crh_cont",
+        trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+    )[0].trial_id
+    v4_id = _run_engine(
+        tmp_path / "v4.db",
+        ask="0.40",
+        size=10,
+        family_id="pm_us_crh_v4",
+        trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+    )[0].trial_id
+    assert cont_id != v4_id
+    assert cont_id == (
+        f"{PAPER_TRIAL_ID_NAMESPACE}/pm_us_crh_cont/"
+        f"{CONTINUOUS_TRIAL_KEY_PREFIX}{STATION}/{CLIMATE_DAY.isoformat()}"
+    )
+    assert v4_id == (
+        f"{PAPER_TRIAL_ID_NAMESPACE}/pm_us_crh_v4/"
+        f"{CONTINUOUS_TRIAL_KEY_PREFIX}{STATION}/{CLIMATE_DAY.isoformat()}"
+    )
+
+
+def test_the_builder_refuses_a_missing_family_id() -> None:
+    """D1, fail-closed: a caller supplying no `family_id` (or no
+    `trial_id_prefix`) does not compile/typecheck and raises `TypeError` at
+    runtime -- checked before the function body ever touches its other
+    arguments, so no real engine is needed here."""
+    with pytest.raises(TypeError):
+        filled_trials_from_engine(None, {}, trial_id_prefix=DEFAULT_TRIAL_KEY_PREFIX)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        filled_trials_from_engine(None, {}, family_id=UNSCOPED_FAMILY_ID)  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +557,12 @@ def test_a_capture_with_a_real_close_builds_and_runs_the_engine(tmp_path: Path) 
             entry_ask=Decimal("0.40"),
             scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
         )
-        trials = filled_trials_from_engine(engine, {str(instrument.id): ctx})
+        trials = filled_trials_from_engine(
+            engine,
+            {str(instrument.id): ctx},
+            family_id=UNSCOPED_FAMILY_ID,
+            trial_id_prefix=DEFAULT_TRIAL_KEY_PREFIX,
+        )
     assert len(trials) == 1
     assert trials[0].fill_px == Decimal("0.40")
 
