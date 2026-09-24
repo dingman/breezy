@@ -46,7 +46,6 @@ order; B = build, O = operator, S = strategy-lead ruling.
 
 | ID | Own | Sev | Item | Plan | Size |
 |---|---|---|---|---|---|
-| REG-1 | B | HIGH | `manifest.stations` / `trial_id_prefix` are validated but NOT consumed by composition (station iteration reads module-level `SUPPORTED_STATIONS`), so a promoted revision changing stations silently does nothing. Blocks promotion varying the station set | WP-11b merge `fbc5eea` | M |
 | ADM-1 | B | LOW | Σq admission counts FILLED legs only (concurrent-arm race) | diagnosis §4 | S |
 | HUNT-1 | B/S | **CRIT** | **Continuous hunting is REQUIRED and NOT met.** The `[12:00,17:00)` LST gate is a consequence of `P_HOLD_LOWER` covering `hour_lst` ∈ {12..16} only — removing it yields `None`, not hunting. Supersedes WIN-1 (wrongly deleted 09-20) | `CONTINUOUS_HUNTING_GAP_2026-09-20.md` | L |
 | EXIT-1 | B/O | CRIT | **Exit seam BUILT, UNARMED** (c96c7f4; ruling 09-16). Decider→native IOC LIMIT SELL→exec exit seam; `pm_us_crh_exit_v4` DRAFT, no `exit_rule` → live family never sells. Study N=5: R-DEAD 0/5 fillable, R-THREAT 1/5 → gates FAIL. Before arming: PREREG v4 registration, 1-lot positive control, nightly study (15:20Z). `POSITION_EXIT_EXECUTION_2026-09-16.md` | plan §4 | L |
@@ -70,7 +69,6 @@ diagnostic is inert until the v3 tally receives the count (R-4).
 | R-1 | Fee unit on the reconciled `FillReport`: O1 recorded / O4 hybrid + `feeSource` admissible without amendment (reviewer: recommend O4); O2 bare modelled fee needs an amendment; O3 raw-else-refuse likely yields no report on today's record | SP-3 B1 | P3 §8 |
 | R-2 | May a reconciled `OrderFilled` reach `on_order_filled` (`external_order_claims`)? | SP-3 B2 | P3 §8 |
 | R-3 | §9 coverage tolerance: (i) keep any-overlap, (ii) duration X≈60 s, (iii) span-with-max-gap, (iv) never-resolved rows from dead processes; does a safety-stop calibration trigger v1 §7 re-registration? | SP-5 rule change | P5 §8 |
-| R-4 | v3 §9 is "unchanged from v2" with no carve-out, so the v3 tally MUST receive a v3-scoped count (own `--family-manifest pm_us_crh_cont.json`, d0 09-12, never v2's JSON); today no unit runs the v3 tally at all | SP-1 I5 | P1 §8, R-F |
 | R-5 | Is PREREG v1's 60/150 tally still evidence (may `breezy-live-tally` stop)? | SP-1 I1 | P1 §8 |
 | R-12 | The permit's session ORDER-COUNT ceiling (`floor(daily budget / per-position cap)`, min 1; `safety.py _derived_session_order_count`) can exhaust BEFORE the dollar budget under the 09-14 per-order ruling (many orders below the cap). The day stop marks only the two dollar ceilings; the count ceiling still refuses on its own. Operator: keep it (derive from daily / venue lot minimum) or drop it so the dollar budget is the only day stop | operator | day-stop plan D3 |
 | R-11 | LD-OBF boundary validity at qty>1: H0 crossing 0.059 at mixed qty vs α 0.025 (qty≡1: 0.012). Re-validate at the real Increment-B qty distribution; re-solve the artefact only if it still fails | MP-B | validation slice |
@@ -95,7 +93,7 @@ ruff 24 incl. `persistence/family_manifest.py:42`), CF-13, CF-14b, PF-1, BL-10, 
 
 ## Pointers
 
-Audit backlog 09-21 (AUD-01..19; 19 READY, AUD-06b not): `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
+Audit backlog 09-21 (AUD-01..19; 19 READY, AUD-06b not; 09-24 merged: AUD-03, 05, 08a, 10a, 13d (13d amendment endorsed)): `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
 (binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
