@@ -211,7 +211,12 @@ FAMILY_VENUE=$(manifest_field "$FAMILY_MANIFEST_PATH" venue)
 FAMILY_D0=$(manifest_field "$FAMILY_MANIFEST_PATH" d0_climate_day)
 
 if [ "$FAMILY_STATUS" = "REGISTERED" ] && [ "$FAMILY_VENUE" = "polymarket_us" ]; then
-  CJSON="$OUT/covered_listed_station_days_$STAMP.json"
+  # AUD-05 fix-2 (SPLIT THE ARTEFACT, 2026-09-24): this reads the
+  # CHAMPION-scoped counter score-live-trials-run.sh writes at its OWN,
+  # separate path -- never the pre-existing `covered_listed_station_days_
+  # $STAMP.json` path, which is v1-scoped (pm_us_crh_v2, fetch_start
+  # 2026-09-05) and is live-tally-run.sh's own artefact.
+  CJSON="$OUT/covered_listed_station_days_champion_$STAMP.json"
   if [ ! -f "$CJSON" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no covered-listed station-days JSON for $STAMP"
     exit 1

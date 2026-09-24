@@ -72,3 +72,17 @@ systemctl --user list-timers --all | grep breezy-pm-crh || true
 
 No manifest under `deploy/families/` was edited. `pm_us_crh_cont` stays
 `REGISTERED`. The v4 sending halt is untouched.
+
+## Fix-2 (2026-09-24): SPLIT THE ARTEFACT — deviation from §6 D-H
+
+The single champion-scoped counter above made `breezy-live-tally` (ENABLED
+v1 daily stop; R-5 OPEN) refuse every day: fetch_start 2026-09-20 vs its
+v1 literal 2026-09-05. §6 D-H specified ONE resolved-champion counter at
+the pre-existing path — **deviation**: `structural_dead_stop.py` now runs
+TWICE per 14:15 run: the pre-existing path (`pm_us_crh_v2.json`, fetch_start
+2026-09-05, byte-identical to base 161cba8) for `live-tally-run.sh` and this
+wrapper's scorer loop; a NEW `covered_listed_station_days_champion_<date>
+.json` (champion-resolved, sha-guarded) for `family-tally-v2-run.sh`'s v4
+instance and the KILL clock. Cost: ~0.65s/~300MB RSS per invocation
+(empty catalog) — the extra daily run is cheap next to a guaranteed page.
+No manifest/ruling/enablement state changed.

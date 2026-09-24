@@ -612,6 +612,11 @@ def _write_counter_json(
 ) -> Path:
     """Champion-shaped counter JSON (v4 d0 + that manifest's sha).
 
+    AUD-05 fix-2 (SPLIT THE ARTEFACT, 2026-09-24): this writes to the
+    CHAMPION-scoped path (`covered_listed_station_days_champion_<stamp>
+    .json`), which is what `family-tally-v2-run.sh` reads post-split. The
+    pre-existing `covered_listed_station_days_<stamp>.json` path is now
+    v1-scoped (`live-tally-run.sh`'s own artefact) and is never read here.
     A default of the retired v2 literal 2026-09-05 made this consumer's
     drift guard look green while a real champion counter was skipped.
     """
@@ -629,7 +634,7 @@ def _write_counter_json(
         ),
         "stations": ["LAX", "MDW", "MIA", "SFO"],
     }
-    path = out / f"covered_listed_station_days_{stamp}.json"
+    path = out / f"covered_listed_station_days_champion_{stamp}.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return path
 
@@ -1045,6 +1050,69 @@ esac
 def test_the_consumer_does_not_pin_the_retired_v2_d0_literal() -> None:
     text = _WRAPPER.read_text(encoding="utf-8")
     assert "V2_D0_LITERAL" not in text
+
+
+def _write_base_path_counter_json(tmp_path: Path, *, fetch_start: str = "2026-09-05") -> Path:
+    """Writes v1-shaped content to the PRE-EXISTING path (never the
+    champion path `_write_counter_json` above targets). Used to prove
+    `family-tally-v2-run.sh` ignores this file entirely post-split."""
+    out = tmp_path / "derived"
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+    payload = {
+        "count": 1,
+        "depth_root_present": True,
+        "fetch_end": fetch_start,
+        "fetch_start": fetch_start,
+        "manifest_sha256": "c" * 64,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+    }
+    path = out / f"covered_listed_station_days_{stamp}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return path
+
+
+def test_v4_tally_consumes_the_champion_artefact_not_the_base_counter(
+    tmp_path: Path,
+) -> None:
+    """AUD-05 fix-2 (SPLIT THE ARTEFACT): a valid v1-scoped counter on the
+    pre-existing path must not satisfy this tally, and the covered-day
+    count consumed must be the CHAMPION file's, never the base file's."""
+    assert _champion_d0() == "2026-09-20"
+    capture = tmp_path / "argv_capture.txt"
+    stub = _tally_stub(tmp_path, capture)
+    _write_base_path_counter_json(tmp_path)
+    _write_counter_json(tmp_path, count=42)
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=stub,
+        write_counter_json=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_lines = capture.read_text(encoding="utf-8").splitlines()
+    assert argv_lines[argv_lines.index("--fill-since-climate-day") + 1] == "2026-09-20"
+    assert argv_lines[argv_lines.index("--covered-listed-station-days") + 1] == "42"
+
+
+def test_v4_tally_still_refuses_on_drift_when_only_the_base_artefact_is_valid(
+    tmp_path: Path,
+) -> None:
+    """A well-formed v1-scoped counter on the base path is not a substitute
+    for the champion artefact: with only the base path present (v1's own
+    2026-09-05 fetch_start, unrelated sha), the champion-path guard still
+    fails closed."""
+    _write_base_path_counter_json(tmp_path)
+    capture = tmp_path / "argv_capture.txt"
+    stub = _tally_stub(tmp_path, capture)
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=stub,
+        write_counter_json=False,
+    )
+    assert result.returncode == 1
+    assert not capture.exists()
 
 
 def test_v4_tally_accepts_a_champion_scoped_counter_and_uses_its_own_d0(

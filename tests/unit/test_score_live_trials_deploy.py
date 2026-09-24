@@ -85,6 +85,11 @@ def _default_counter_json(
     was given. The deployed clock is ``pm_us_crh_v4`` (``d0_climate_day``
     2026-09-20), not the retired v1 literal 2026-09-05. Defaulting to that
     literal made the drift guard look green while rejecting the real counter.
+
+    AUD-05 fix-2 (SPLIT THE ARTEFACT, 2026-09-24): this shapes the
+    CHAMPION-scoped counter -- the wrapper's SECOND invocation, written to
+    the NEW `covered_listed_station_days_champion_$STAMP.json` path. See
+    `_default_base_counter_json` for the pre-existing path's own shape.
     """
     start = _champion_d0() if fetch_start is None else fetch_start
     payload = {
@@ -102,6 +107,32 @@ def _default_counter_json(
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def _default_base_counter_json(
+    *,
+    count: int = 20,
+    fetch_start: str = "2026-09-05",
+    manifest_sha256: str | None = None,
+) -> str:
+    """v1-shaped counter JSON for the PRE-EXISTING path.
+
+    AUD-05 fix-2 (SPLIT THE ARTEFACT): byte-for-byte the same semantics the
+    wrapper had on base commit 161cba8 -- `pm_us_crh_v2.json`, fetch_start
+    2026-09-05. The consumer of this path (`live-tally-run.sh`, and this
+    wrapper's own STATIONS/scorer loop) never checks `manifest_sha256`, so
+    its exact value is immaterial; a fixed placeholder is used unless a
+    test overrides it.
+    """
+    payload = {
+        "count": count,
+        "depth_root_present": True,
+        "fetch_end": fetch_start,
+        "fetch_start": fetch_start,
+        "manifest_sha256": manifest_sha256 if manifest_sha256 is not None else "a" * 64,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def _make_stub(
     tmp_path: Path,
     *,
@@ -109,15 +140,28 @@ def _make_stub(
     check_token: str = "MATCH",
     counter_exit: int = 0,
     counter_json: str | None = None,
+    champion_counter_json: str | None = None,
     scorer_fail_city: str = "",
     scorer_exit: int = 0,
 ) -> tuple[Path, Path]:
-    """A dispatching stub `$PY`: recognises the three invocation shapes the
-    wrapper makes (the `--check` module call, the counter, one scorer call
-    per city), logs each to `argv_log` tagged by shape, and behaves per the
-    keyword arguments. Returns (stub_path, argv_log_path)."""
+    """A dispatching stub `$PY`: recognises the invocation shapes the
+    wrapper makes (the `--check` module call, the counter -- called TWICE,
+    once per manifest -- and one scorer call per city), logs each to
+    `argv_log` tagged by shape, and behaves per the keyword arguments.
+
+    AUD-05 fix-2 (SPLIT THE ARTEFACT): the counter now runs twice, against
+    two different `--family-manifest` values, each with its own `--output`
+    path. `counter_json` shapes the call whose manifest ends in
+    `pm_us_crh_v2.json` (the pre-existing, base/v1-scoped path);
+    `champion_counter_json` shapes every OTHER manifest (the champion
+    path) -- dispatch is on the manifest argument actually passed, never
+    on call order, so this remains correct regardless of which counter the
+    wrapper invokes first. Returns (stub_path, argv_log_path)."""
     argv_log = tmp_path / "argv_log.txt"
-    json_text = counter_json if counter_json is not None else _default_counter_json()
+    base_json_text = counter_json if counter_json is not None else _default_base_counter_json()
+    champion_json_text = (
+        champion_counter_json if champion_counter_json is not None else _default_counter_json()
+    )
     script = f"""#!/usr/bin/env bash
 ARGV_LOG={shlex.quote(str(argv_log))}
 case "$*" in
@@ -129,15 +173,30 @@ case "$*" in
   *"structural_dead_stop.py"*)
     echo "COUNTER $*" >> "$ARGV_LOG"
     if [ {counter_exit} -eq 0 ]; then
+      manifest_arg=""
+      out_arg=""
       prev=""
       for arg in "$@"; do
+        if [ "$prev" = "--family-manifest" ]; then
+          manifest_arg="$arg"
+        fi
         if [ "$prev" = "--output" ]; then
-          cat > "$arg" <<'BREEZY_STUB_JSON'
-{json_text}
-BREEZY_STUB_JSON
+          out_arg="$arg"
         fi
         prev="$arg"
       done
+      case "$manifest_arg" in
+        */pm_us_crh_v2.json)
+          cat > "$out_arg" <<'BREEZY_STUB_JSON_BASE'
+{base_json_text}
+BREEZY_STUB_JSON_BASE
+          ;;
+        *)
+          cat > "$out_arg" <<'BREEZY_STUB_JSON_CHAMPION'
+{champion_json_text}
+BREEZY_STUB_JSON_CHAMPION
+          ;;
+      esac
     fi
     exit {counter_exit}
     ;;
@@ -315,7 +374,10 @@ def test_no_node_token_warns_but_marker_still_written(tmp_path: Path) -> None:
 
 
 def test_fetch_start_mismatch_leaves_no_marker(tmp_path: Path) -> None:
-    bad_json = _default_counter_json(fetch_start="2026-09-06")
+    """The BASE/v1-scoped counter's own drift guard (against the registered
+    v1 D0, 2026-09-05) -- unaffected by the champion-scoped counter, which
+    always defaults to a valid call in this test."""
+    bad_json = _default_base_counter_json(fetch_start="2026-09-06")
     stub, argv_log = _make_stub(tmp_path, counter_json=bad_json)
     result = _run_wrapper(tmp_path, stub_python=stub)
     assert result.returncode != 0
@@ -461,7 +523,7 @@ def test_stale_marker_removed_then_rewritten_on_a_later_successful_run(
 def test_truncated_counter_json_missing_closing_brace_leaves_no_marker(
     tmp_path: Path,
 ) -> None:
-    lines = _default_counter_json().splitlines()
+    lines = _default_base_counter_json().splitlines()
     truncated = "\n".join(lines[:-1])  # drop the closing "}"
     stub, argv_log = _make_stub(tmp_path, counter_json=truncated)
 
@@ -473,7 +535,7 @@ def test_truncated_counter_json_missing_closing_brace_leaves_no_marker(
 
 
 def test_counter_json_with_duplicate_count_line_leaves_no_marker(tmp_path: Path) -> None:
-    lines = _default_counter_json().splitlines()
+    lines = _default_base_counter_json().splitlines()
     count_idx = next(i for i, line in enumerate(lines) if line.strip().startswith('"count"'))
     duplicated = lines[: count_idx + 1] + [lines[count_idx]] + lines[count_idx + 1 :]
     bad_json = "\n".join(duplicated)
@@ -554,28 +616,39 @@ def test_neither_i3_unit_carries_an_environment_file_directive() -> None:
 
 
 def test_family_manifest_assignment_byte_identical_across_wrappers() -> None:
-    """v1's live tally keeps its pinned manifest. INC-SP1I5 moved the 14:15
-    counter off that literal onto BREEZY_SENDING_FAMILY_ID."""
+    """AUD-05 fix-2 (SPLIT THE ARTEFACT, 2026-09-24): score-live-trials-run.sh
+    restores its own v1-scoped `FAMILY_MANIFEST=` line, byte-identical to
+    `live-tally-run.sh`'s -- this is the literal the BASE-path counter run
+    (the pre-existing artefact) is invoked against. The CHAMPION-scoped
+    counter's manifest is resolved separately, from
+    BREEZY_SENDING_FAMILY_ID, never a second hardcoded literal."""
     v1_lines = [
         line for line in _V1_WRAPPER.read_text().splitlines() if line.startswith("FAMILY_MANIFEST=")
     ]
-    assert v1_lines == ['FAMILY_MANIFEST="$REPO/deploy/families/pm_us_crh_v2.json"']
     scorer_lines = [
         line for line in _WRAPPER.read_text().splitlines() if line.startswith("FAMILY_MANIFEST=")
     ]
-    assert scorer_lines == []
+    assert len(v1_lines) == 1
+    assert len(scorer_lines) == 1
+    assert v1_lines[0] == scorer_lines[0]
+    assert v1_lines[0] == 'FAMILY_MANIFEST="$REPO/deploy/families/pm_us_crh_v2.json"'
 
 
-def test_v1_d0_literal_stays_on_the_v1_wrapper_only() -> None:
-    """The v1 live tally keeps its prose D0 pin. The 14:15 KILL clock does
-    not share it: ``score-live-trials-run.sh`` compares ``fetch_start`` to
-    the resolved champion manifest, never a second date literal."""
+def test_v1_d0_literal_assignment_byte_identical_across_wrappers() -> None:
+    """AUD-05 fix-2: score-live-trials-run.sh restores its own
+    `V1_D0_LITERAL=` line, byte-identical to live-tally-run.sh's -- it
+    drift-checks the BASE-path (pre-existing artefact) counter only. The
+    champion-scoped counter (the 14:15 KILL clock's own artefact) compares
+    against the resolved champion manifest's own d0, never this literal."""
     v1_lines = [
         line for line in _V1_WRAPPER.read_text().splitlines() if line.startswith("V1_D0_LITERAL=")
     ]
-    assert v1_lines == ['V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130']
-    scorer_text = _WRAPPER.read_text()
-    assert "V1_D0_LITERAL" not in scorer_text
+    scorer_lines = [
+        line for line in _WRAPPER.read_text().splitlines() if line.startswith("V1_D0_LITERAL=")
+    ]
+    assert len(v1_lines) == 1
+    assert len(scorer_lines) == 1
+    assert v1_lines[0] == scorer_lines[0] == 'V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130'
 
 
 def test_only_the_scorer_wrapper_writes_the_success_marker() -> None:
@@ -622,6 +695,13 @@ def _counter_lines(argv_log: Path) -> list[str]:
     return [line for line in argv_log.read_text().splitlines() if line.startswith("COUNTER")]
 
 
+def _champion_counter_calls(counters: list[str]) -> list[str]:
+    """AUD-05 fix-2: the counter now runs twice per invocation (base +
+    champion). Isolate the champion-manifest call by its own argv shape,
+    never by list position -- call order is an implementation detail."""
+    return [c for c in counters if "pm_us_crh_v2.json" not in c]
+
+
 def test_the_counter_resolves_the_manifest_from_the_deployed_sending_family_id(
     tmp_path: Path,
 ) -> None:
@@ -632,10 +712,14 @@ def test_the_counter_resolves_the_manifest_from_the_deployed_sending_family_id(
     result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
     assert result.returncode == 0, result.stderr
     counters = _counter_lines(argv_log)
-    assert len(counters) == 1
-    assert counters[0].rstrip().endswith("deploy/families/pm_us_crh_v4.json") or (
-        "pm_us_crh_v4.json" in counters[0] and "pm_us_crh_v2.json" not in counters[0]
+    assert len(counters) == 2
+    champion_calls = _champion_counter_calls(counters)
+    assert len(champion_calls) == 1
+    assert champion_calls[0].rstrip().endswith("deploy/families/pm_us_crh_v4.json") or (
+        "pm_us_crh_v4.json" in champion_calls[0]
     )
+    v1_calls = [c for c in counters if "pm_us_crh_v2.json" in c]
+    assert len(v1_calls) == 1
     log_text = (tmp_path / "derived" / "score_live_trials.log").read_text(encoding="utf-8")
     assert "pm_us_crh_v4" in log_text
 
@@ -650,7 +734,8 @@ def test_the_counter_json_carries_the_champion_manifest_sha256(tmp_path: Path) -
     result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
     assert result.returncode == 0, result.stderr
     counters = _counter_lines(argv_log)
-    assert counters and "pm_us_crh_v4.json" in counters[0]
+    champion_calls = _champion_counter_calls(counters)
+    assert champion_calls and "pm_us_crh_v4.json" in champion_calls[0]
     manifest = _FAMILIES_DIR / "pm_us_crh_v4.json"
     catalog = tmp_path / "empty-catalog"
     catalog.mkdir()
@@ -706,19 +791,28 @@ def test_the_counter_still_runs_for_a_halted_family(tmp_path: Path) -> None:
     result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
     assert result.returncode == 0, result.stderr
     counters = _counter_lines(argv_log)
-    assert counters and "pm_us_crh_v4.json" in counters[0]
+    champion_calls = _champion_counter_calls(counters)
+    assert champion_calls and "pm_us_crh_v4.json" in champion_calls[0]
 
 
 def test_score_live_trials_run_has_no_second_family_manifest_literal() -> None:
+    """AUD-05 fix-2 (SPLIT THE ARTEFACT): the ONLY hardcoded family-manifest
+    literal this wrapper may carry is the v1-compat one (byte-identical to
+    live-tally-run.sh's own, pinned by
+    ``test_family_manifest_assignment_byte_identical_across_wrappers``).
+    The champion-scoped counter's manifest must still be resolved
+    dynamically from BREEZY_SENDING_FAMILY_ID -- never a second, different
+    hardcoded family literal."""
     text = _WRAPPER.read_text(encoding="utf-8")
-    assert re.search(r"deploy/families/[A-Za-z0-9_]+\.json", text) is None
+    literals = set(re.findall(r"deploy/families/[A-Za-z0-9_]+\.json", text))
+    assert literals == {"deploy/families/pm_us_crh_v2.json"}
 
 
 def test_a_champion_scoped_counter_json_is_accepted(tmp_path: Path) -> None:
     """D-H: fetch_start is the champion manifest's d0 and manifest_sha256
     is that file's sha. The wrapper must accept it."""
     assert _champion_d0() == "2026-09-20"
-    stub, argv_log = _make_stub(tmp_path, counter_json=_default_counter_json())
+    stub, argv_log = _make_stub(tmp_path, champion_counter_json=_default_counter_json())
     result = _run_wrapper(tmp_path, stub_python=stub)
     assert result.returncode == 0, result.stderr
     assert _marker_path(tmp_path).exists()
@@ -727,7 +821,7 @@ def test_a_champion_scoped_counter_json_is_accepted(tmp_path: Path) -> None:
 
 def test_a_drifted_fetch_start_is_rejected(tmp_path: Path) -> None:
     drifted = _default_counter_json(fetch_start="2026-09-21")
-    stub, argv_log = _make_stub(tmp_path, counter_json=drifted)
+    stub, argv_log = _make_stub(tmp_path, champion_counter_json=drifted)
     result = _run_wrapper(tmp_path, stub_python=stub)
     assert result.returncode == 1
     assert not _marker_path(tmp_path).exists()
@@ -736,7 +830,7 @@ def test_a_drifted_fetch_start_is_rejected(tmp_path: Path) -> None:
 
 def test_a_mismatched_manifest_sha256_is_rejected(tmp_path: Path) -> None:
     mismatched = _default_counter_json(manifest_sha256="b" * 64)
-    stub, argv_log = _make_stub(tmp_path, counter_json=mismatched)
+    stub, argv_log = _make_stub(tmp_path, champion_counter_json=mismatched)
     result = _run_wrapper(tmp_path, stub_python=stub)
     assert result.returncode == 1
     assert not _marker_path(tmp_path).exists()
@@ -756,7 +850,7 @@ def test_an_unreadable_champion_d0_fails_closed(tmp_path: Path) -> None:
     # and must still refuse once the guard reads this manifest's own d0.
     stub, argv_log = _make_stub(
         tmp_path,
-        counter_json=_default_counter_json(
+        champion_counter_json=_default_counter_json(
             fetch_start="2026-09-05",
             manifest_sha256=_manifest_sha256(manifest),
         ),
@@ -765,3 +859,58 @@ def test_an_unreadable_champion_d0_fails_closed(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert not _marker_path(tmp_path).exists()
     assert not _scorer_calls(argv_log)
+
+
+def _cjson_champion_path(tmp_path: Path) -> Path:
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+    return tmp_path / "derived" / f"covered_listed_station_days_champion_{stamp}.json"
+
+
+def test_base_path_counter_keeps_v1_semantics_and_champion_path_is_separate(
+    tmp_path: Path,
+) -> None:
+    """AUD-05 fix-2 test (d): the pre-existing path is the v1-registered
+    manifest's counter (fetch_start 2026-09-05, `pm_us_crh_v2.json`),
+    byte-for-byte the same semantics as base commit 161cba8. The champion
+    path is a SEPARATE file, carrying v4's own d0 and sha -- the two are
+    never the same content and never the same call."""
+    stub, argv_log = _make_stub(tmp_path)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4"
+    )
+    result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
+    assert result.returncode == 0, result.stderr
+
+    base = json.loads(_cjson_path(tmp_path).read_text(encoding="utf-8"))
+    assert base["fetch_start"] == "2026-09-05"
+
+    champion = json.loads(_cjson_champion_path(tmp_path).read_text(encoding="utf-8"))
+    assert champion["fetch_start"] == "2026-09-20"
+    assert champion["manifest_sha256"] == _manifest_sha256(_champion_manifest_path())
+    assert champion["fetch_start"] != base["fetch_start"]
+
+    counters = _counter_lines(argv_log)
+    assert len(counters) == 2
+    v1_calls = [c for c in counters if "pm_us_crh_v2.json" in c]
+    champion_calls = _champion_counter_calls(counters)
+    assert len(v1_calls) == 1
+    assert len(champion_calls) == 1
+    assert "covered_listed_station_days_champion_" in champion_calls[0]
+    assert "covered_listed_station_days_champion_" not in v1_calls[0]
+
+
+def test_regression_v1_wrapper_accepts_its_counter_when_champion_is_v4(
+    tmp_path: Path,
+) -> None:
+    """AUD-05 fix-2 test (a): with both artefacts produced for a day where
+    the deployed champion is v4, this wrapper's own end-to-end run still
+    exits 0 and STILL writes a v1-scoped base counter -- proving the split
+    is produced correctly by ONE real run, not just assembled by two
+    independently-seeded test fixtures (that half lives in
+    test_live_tally_deploy.py, which drives the v1 wrapper directly)."""
+    stub, _argv_log = _make_stub(tmp_path)
+    result = _run_wrapper(tmp_path, stub_python=stub)
+    assert result.returncode == 0, result.stderr
+    base = json.loads(_cjson_path(tmp_path).read_text(encoding="utf-8"))
+    assert base["fetch_start"] == "2026-09-05"
+    assert _marker_path(tmp_path).exists()
