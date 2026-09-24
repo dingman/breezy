@@ -161,3 +161,35 @@ def test_trade_supervisor_unit_still_has_neither_memory_directive() -> None:
     assert _directive_value(text, "MemoryMax") is None
     # The comment documenting the deliberate absence must still be present.
     assert "NO MemoryHigh=/MemoryMax=" in text
+
+
+_SCORE_LIVE_TRIALS_UNIT = _DEPLOY_DIR / "breezy-score-live-trials.service"
+
+
+def test_score_live_trials_unit_memory_ceiling_covers_its_measured_working_set() -> None:
+    """2026-09-24 timeout incident: the unit's original MemoryHigh=1G/
+    MemoryMax=2G was sized on a stale "local parquet/sqlite read" comment.
+    Since 2026-09-19 every run sat at the 1G MemoryHigh with 1.5-1.9G swap
+    and took ~2.5 min; on 2026-09-24 it hit TimeoutStartSec=1200 ('Failed
+    with result timeout', 1.1G peak, 1.7G swap), so no success marker was
+    written and all three downstream tallies (breezy-live-tally,
+    breezy-pm-crh-v2-tally, breezy-family-tally@) skipped. A scratch
+    rehearsal of the current wrapper (which since AUD-05 runs the
+    structural_dead_stop counter TWICE, sequentially -- v1-scoped then
+    champion-scoped) at the production caps was OOM-killed after 544s; at
+    MemoryMax=4G it completed in 96s with a 3.1G cgroup peak (3.38G RSS).
+    MemoryHigh must therefore cover that measured working set (>=4G), with
+    MemoryMax strictly above it."""
+    assert _SCORE_LIVE_TRIALS_UNIT.is_file()
+    text = _SCORE_LIVE_TRIALS_UNIT.read_text()
+    memory_high = _directive_value(text, "MemoryHigh")
+    memory_max = _directive_value(text, "MemoryMax")
+    assert memory_high is not None, "breezy-score-live-trials.service is missing MemoryHigh="
+    assert memory_max is not None, "breezy-score-live-trials.service is missing MemoryMax="
+    assert _parse_systemd_size(memory_high) >= _parse_systemd_size("4G"), (
+        f"MemoryHigh={memory_high} is below the measured 3.1G cgroup peak "
+        "(3.38G RSS) that caused the 2026-09-24 TimeoutStartSec failure"
+    )
+    assert _parse_systemd_size(memory_max) > _parse_systemd_size(memory_high), (
+        f"MemoryMax={memory_max} must be strictly above MemoryHigh={memory_high}"
+    )
