@@ -713,7 +713,20 @@ def _pin_no_probability(
 
 
 def _no_inputs(bid: Decimal, **overrides: object) -> DecisionInputs:
-    return _causal_inputs(side="no", bid=bid, bid_size=Decimal(5), **overrides)
+    """NO snapshot on the ARMED calibration path.
+
+    These tests pin the break-even boundary of ``P_HOLD_UPPER``, which is
+    reachable only once ``no_side_calibration_gate_cleared`` is explicit.
+    The shipped default (closed) is pinned in the NO-side decision module.
+    """
+    config = overrides.pop("config", CurrentRungHoldConfig(no_side_calibration_gate_cleared=True))
+    return _causal_inputs(
+        side="no",
+        bid=bid,
+        bid_size=Decimal(5),
+        config=config,
+        **overrides,
+    )
 
 
 def test_the_no_leg_flips_refuse_to_take_exactly_at_its_own_break_even(

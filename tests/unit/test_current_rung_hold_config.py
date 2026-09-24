@@ -137,6 +137,12 @@ def test_orders_enabled_defaults_false() -> None:
     assert config.orders_enabled is False
 
 
+def test_no_side_calibration_gate_defaults_closed() -> None:
+    """AUD-01a: the shipped default refuses NO-side pricing. Clearing it is
+    a later code change at composition, never a constructor default."""
+    assert CurrentRungHoldConfig().no_side_calibration_gate_cleared is False
+
+
 def test_orders_enabled_true_is_refused_via_msgspec_decode() -> None:
     """T3 (WIDEN only): ``__post_init__`` runs on ``msgspec.json.decode`` too,
     so a persisted or replayed config cannot smuggle ``orders_enabled=True``

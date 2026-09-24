@@ -48,6 +48,12 @@ build order step 5, refined by this increment's dispatch brief):
 9. ``p_hold_lower`` does not clear the break-even price (``ask`` plus the
    venue fee on that ask) -> ``edge_below_break_even``; otherwise ``Take``.
 
+NO side only: after the shared gates above and the NO book's own
+executability check, and before ``P_HOLD_UPPER`` is read, a closed
+``config.no_side_calibration_gate_cleared`` (the default) refuses
+``no_side_calibration_unsafe``. The YES side does not read that flag.
+A thin NO book still refuses ``not_executable`` first.
+
 Receipt gating (blueprint amendment, "Receipt gating is Seam A-2's
 contract") is NOT re-derived here: ``RunningMax.value_at(now_ns)`` already
 excludes any row with ``received_at_ns > now_ns``
@@ -144,6 +150,11 @@ REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         # trial-day latch's closed reason set stays ONE set with the shared
         # refusal vocabulary.
         "instrument_unresolved",
+        # AUD-01a: emitted by ``_evaluate_no_side`` while
+        # ``no_side_calibration_gate_cleared`` is false, before
+        # ``P_HOLD_UPPER`` is read. Not a structural halt -- a closed gate
+        # is the intended state, not a page.
+        "no_side_calibration_unsafe",
     }
 )
 
@@ -372,6 +383,18 @@ def evaluate_decision(inputs: DecisionInputs) -> Decision:
         raise ValueError(f"unreachable: side={inputs.side!r}")
 
 
+def _is_executable(price: Decimal, size: Decimal | int, config: CurrentRungHoldConfig) -> bool:
+    """The shared executable-band+size predicate, used by BOTH sides.
+
+    Strictly between ``executable_ask_lower``/``executable_ask_upper``
+    (exclusive) and at least ``minimum_displayed_size`` (inclusive).
+    """
+    return (
+        config.executable_ask_lower < price < config.executable_ask_upper
+        and size >= config.minimum_displayed_size
+    )
+
+
 def _finalize_take(
     inputs: DecisionInputs,
     *,
@@ -389,11 +412,7 @@ def _finalize_take(
     ``1 - P_HOLD_UPPER`` for NO) -- this function only runs the shared rule
     order (executable, then defined, then break-even), never any inversion.
     """
-    executable = (
-        inputs.config.executable_ask_lower < price < inputs.config.executable_ask_upper
-        and size >= inputs.config.minimum_displayed_size
-    )
-    if not executable:
+    if not _is_executable(price, size, inputs.config):
         return Refuse("not_executable")
 
     if p_bound is None:
@@ -432,11 +451,26 @@ def _evaluate_no_side(
     size in the SAME contracts unit as ``config.minimum_displayed_size`` --
     never dollar notional (N2-11): a 0.1-contract bid against a 1-contract
     ``order_quantity`` correctly refuses.
+
+    After that executability check, a closed
+    ``config.no_side_calibration_gate_cleared`` refuses
+    ``no_side_calibration_unsafe`` and returns before ``P_HOLD_UPPER`` is
+    read. The YES path never reaches this function.
     """
     if inputs.bid is None or inputs.bid_size is None:
         return Refuse("not_executable")
 
     no_ask = _ONE - inputs.bid
+    # Same executable predicate as ``_finalize_take`` (``_is_executable``),
+    # run HERE so a thin book keeps ``not_executable`` and the unsafe table
+    # is never read while the calibration gate is closed. ``_finalize_take``
+    # calls the same helper again on the armed path.
+    if not _is_executable(no_ask, inputs.bid_size, inputs.config):
+        return Refuse("not_executable")
+
+    if not inputs.config.no_side_calibration_gate_cleared:
+        return Refuse("no_side_calibration_unsafe")
+
     p_hold_upper = P_HOLD_UPPER.get(key)
     p_miss_lower = None if p_hold_upper is None else _ONE - p_hold_upper
     return _finalize_take(

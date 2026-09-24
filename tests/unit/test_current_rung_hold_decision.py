@@ -100,6 +100,9 @@ def test_refusal_reasons_is_the_closed_set_from_the_brief() -> None:
             # sibling instruments -- widened here for the same reason
             # `outside_decision_window` was.
             "instrument_unresolved",
+            # AUD-01a: NO side refuses before `P_HOLD_UPPER` is read while
+            # the calibration gate is closed (the shipped default).
+            "no_side_calibration_unsafe",
         }
     )
 

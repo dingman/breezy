@@ -56,7 +56,9 @@ def _both_sides(
         bid_size=bid_size,
         running_max=_running_max(),
         staleness_ns=0,
-        config=CurrentRungHoldConfig(),
+        # Armed so this file still measures the NO break-even. The closed
+        # default is pinned on ``evaluate_decision`` itself.
+        config=CurrentRungHoldConfig(no_side_calibration_gate_cleared=True),
         hour_lst=_HOUR_LST,
         width_code=_INTERIOR_WIDTH_CODE,
         m_code=_M_ZERO,

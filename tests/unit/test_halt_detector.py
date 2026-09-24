@@ -123,6 +123,16 @@ def test_structural_reasons_are_a_subset_of_the_existing_refusal_vocabulary() ->
     assert STRUCTURAL_HALT_REASONS <= known
 
 
+def test_no_side_calibration_unsafe_is_not_a_structural_halt() -> None:
+    """AUD-01a: a window refused only for the closed calibration gate is the
+    intended state, not a page. The reason is in the decision vocabulary and
+    stays out of ``STRUCTURAL_HALT_REASONS``."""
+    assert "no_side_calibration_unsafe" in REFUSAL_REASONS
+    assert "no_side_calibration_unsafe" not in STRUCTURAL_HALT_REASONS
+    tally = DecisionWindowTally(refusals={"no_side_calibration_unsafe": 40}, takes=0)
+    assert all_refused_halt_reason(tally) is None
+
+
 def test_an_unknown_reason_never_pages() -> None:
     tally = DecisionWindowTally(refusals={"some_future_reason": 99}, takes=0)
     assert all_refused_halt_reason(tally) is None

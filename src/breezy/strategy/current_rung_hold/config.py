@@ -211,6 +211,13 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
         Fixed ``True``. The settlement halt applies only to NEW entries
         (never a flatten/close path -- this strategy holds to settlement by
         design, see the blueprint's "Hold-to-settlement" row).
+    no_side_calibration_gate_cleared : bool
+        Default ``False``. While false, an executable NO snapshot is refused
+        ``no_side_calibration_unsafe`` before ``P_HOLD_UPPER`` is read. A
+        family manifest cannot set this field. Clearing it is a later
+        explicit argument at ``composition.py::_station_config``,
+        accompanying a reviewed calibration ruling. The YES side does not
+        read it.
 
     Not present: the two operator-reserved dollar controls (maximum daily
     trading budget; maximum notional per position). See the module
@@ -235,6 +242,9 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
     #: Must stay ``False`` in this increment; constructing ``True`` raises
     #: :class:`OrdersEnabledNotPermittedError`. See that error's docstring.
     orders_enabled: bool = False
+    #: AUD-01a. Default closed. Not read from a family manifest; only an
+    #: explicit ``composition.py::_station_config`` argument can clear it.
+    no_side_calibration_gate_cleared: bool = False
 
     def __post_init__(self) -> None:
         if self.stale_observation_minutes <= 0:
