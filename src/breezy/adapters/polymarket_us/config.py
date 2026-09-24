@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import msgspec
@@ -617,6 +618,21 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
         and ``PolymarketUSExecutionClient`` denies every exit-tagged order
         with ``_EXIT_MANIFEST_ABSENT_REASON`` exactly as it did before this
         field existed.
+    resolver_instrument_loader : Callable[[str], Any] | None
+        2026-09-24 stuck-prior-day-instrument fix: injected the SAME way
+        ``submit_veto`` is -- a plain callable, typed loosely (``Any``
+        return) so this ``adapters`` module needs no import of the real
+        ``Instrument`` type or of ``breezy.runtime`` to carry it. Given a
+        venue instrument id string, returns the native instrument
+        definition if the resolver's own AMBIGUOUS-intent GET path can
+        obtain one WITHOUT subscribing to market data, or ``None`` if it
+        cannot. ``build_trade_node_config`` fills this in with a closure
+        over the SAME ``ParquetDataCatalog`` the composition root already
+        reads (``resolve_station_instrument_ids``) -- never the venue-backed
+        ``InstrumentProvider``, which refuses anything outside the latest
+        discovery cycle for an expired market. ``None`` by default -- every
+        composition root that predates this parameter is unaffected, and
+        the resolver escalates instead of loading, exactly as it always has.
     """
 
     venue: PolymarketUSDataClientConfig | None = None
@@ -630,6 +646,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     retirement_reasons: object | None = None
     submit_veto: Callable[[], str | None] | None = None
     exit_manifest: FamilyManifest | None = None
+    resolver_instrument_loader: Callable[[str], Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PolymarketUSDataClientConfig):

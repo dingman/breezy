@@ -2163,6 +2163,18 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # counted, never left to kill the polling task. Inert -- increments
         # a process-local counter and logs; reaches no network.
         "self._note_resolver_error",
+        # 2026-09-24 stuck-prior-day-instrument fix: the injected loader is
+        # a plain callable this module never imports the type of (mirrors
+        # `self._private_read`'s own shape) -- its egress, if any, lives in
+        # the closure `node_config.py` builds (a durable ParquetDataCatalog
+        # read, never a venue call), OUTSIDE this scanned file entirely.
+        # `self._cache.add_instrument` is a local Cache write only -- the
+        # native `Cache.add_instrument` (`cache/adapter.py:158`) transforms
+        # and stores; it never touches a data client or creates a
+        # subscription. Neither reaches `self._order_sender.post_order`,
+        # which stays absent from this set.
+        "self._resolver_instrument_loader",
+        "self._cache.add_instrument",
     }
 )
 
