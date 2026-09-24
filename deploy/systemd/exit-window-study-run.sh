@@ -22,10 +22,9 @@
 #
 # STATIONS / SINCE_CLIMATE_DAY below are the pm_us_crh_v2 family's own
 # `stations` / `d0_climate_day` (deploy/families/pm_us_crh_v2.json),
-# hardcoded with a citation comment -- the SAME convention
-# family-tally-v2-run.sh uses for its own `V2_D0_LITERAL`, never a second,
-# independently-derived JSON parse for values already pinned by that
-# manifest and its own tests.
+# hardcoded with a citation comment. This study is v2-scoped offline
+# analysis, not the KILL clock: family-tally-v2-run.sh reads the deployed
+# champion manifest for that guard and does not share this date literal.
 #
 # Exit status: 0 on a completed run (including zero positions -- the study
 # script itself reports missing inputs rather than fabricating them, never

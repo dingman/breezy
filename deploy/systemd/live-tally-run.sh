@@ -5,9 +5,19 @@
 #
 # I3 (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md section 7): this
 # wrapper no longer runs the covered-listed-station-days counter itself --
-# score-live-trials-run.sh (14:15 UTC) runs it exactly once and writes BOTH
-# the dated success marker and the counter's --output JSON; this wrapper
-# only asserts the marker and READS that JSON for the v1 stop's two flags.
+# score-live-trials-run.sh (14:15 UTC) writes the dated success marker and
+# the counter's --output JSON; this wrapper only asserts the marker and
+# READS that JSON for the v1 stop's two flags.
+#
+# AUD-05 fix-2 (SPLIT THE ARTEFACT, 2026-09-24): score-live-trials-run.sh
+# now runs the counter TWICE, to two distinct paths -- this wrapper's own
+# pre-existing path (`covered_listed_station_days_$STAMP.json`, v1-scoped:
+# `pm_us_crh_v2.json`, fetch_start 2026-09-05, byte-for-byte unchanged from
+# base commit 161cba8) and a NEW, separate champion-scoped path
+# (`covered_listed_station_days_champion_$STAMP.json`) that
+# family-tally-v2-run.sh's v4 instance and the 14:15 KILL clock read
+# instead. This wrapper reads ONLY its own pre-existing path, below --
+# never the champion-scoped one, regardless of which family is deployed.
 #
 # Exit status: 0 on a completed report; 1 if the analysis script failed, the
 # 14:15 success marker is missing, the counter JSON is missing/unreadable,
@@ -62,10 +72,13 @@ STORE_DIR=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_t
 OUT=${BREEZY_LIVE_TALLY_OUTPUT_DIR:-$HOME/.local/share/breezy/derived}
 LOG=$OUT/live_tally.log
 # Drift guard: v1's own D0 (PREREG v1 section 6:130) is prose, never read
-# from the manifest by the v1 python -- if a later v2 amendment ever moves
-# the manifest's d0_climate_day, this wrapper must refuse rather than
-# silently re-window the v1 stop. Byte-identical to
-# score-live-trials-run.sh's own assignment.
+# from the manifest by the v1 python. If this wrapper's own (v1-scoped)
+# counter JSON's fetch_start is not this date, refuse rather than silently
+# re-window the v1 stop. The 14:15 KILL clock does not share this literal
+# or this file: score-live-trials-run.sh writes it a SEPARATE,
+# champion-scoped counter JSON (AUD-05 fix-2) and checks THAT file against
+# the deployed champion manifest's own d0_climate_day and sha -- this
+# wrapper never reads that second file.
 V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130
 
 mkdir -p "$OUT"

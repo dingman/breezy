@@ -17,7 +17,7 @@ import pytest
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
 from breezy.runtime.sqlite_store import SqliteStateStore
-from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
+from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord, trial_id_for
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
@@ -215,4 +215,48 @@ def test_a_duplicate_fill_on_one_instrument_does_not_double_count_the_trial(
         },
     )
     result = ftc_mod.count_filled_takes(db_path, family_prefix=_CONT_PREFIX)
+    assert result == 1
+
+
+def test_two_rung_fills_on_one_station_day_count_as_two(
+    ftc_mod: ModuleType, tmp_path: Path
+) -> None:
+    """AUD-05 D-B cause (i), measured on the live exec store: v3 latches are
+    ``station/climate_day/instrument_id``. Two rung fills on MDW/2026-09-15
+    are two keys. The 2-part-only counter skipped both."""
+    prefix = "continuous_rung_hold/trial/"
+    rung_a = "tc-temp-mdwhigh-2026-09-15-gte80lt81f.POLYMARKET_US"
+    rung_b = "tc-temp-mdwhigh-2026-09-15-gte82lt83f.POLYMARKET_US"
+    db_path = tmp_path / "exec_state.sqlite"
+    _make_state_db(
+        db_path,
+        {
+            trial_id_for(prefix, "MDW", "2026-09-15", rung_a): _trial_row(rung_a),
+            trial_id_for(prefix, "MDW", "2026-09-15", rung_b): _trial_row(rung_b),
+            "exec/polymarket_us/fill/order-a": _fill_row("order-a", rung_a),
+            "exec/polymarket_us/fill/order-b": _fill_row("order-b", rung_b),
+        },
+    )
+    result = ftc_mod.count_filled_takes(db_path, family_prefix=prefix)
+    assert result == 2
+
+
+def test_a_no_leg_fill_is_counted_under_its_composite_instrument_id(
+    ftc_mod: ModuleType, tmp_path: Path
+) -> None:
+    """The live NO latch and its fill share one composite id
+    (``...^no.POLYMARKET_US``). Cause (ii) -- a YES-vs-NO form mismatch --
+    was measured and is not operative. The NO fill is still uncounted today
+    because that key is 3-part."""
+    prefix = "continuous_rung_hold/trial/"
+    no_id = "tc-temp-miahigh-2026-09-15-gte92lt93f^no.POLYMARKET_US"
+    db_path = tmp_path / "exec_state.sqlite"
+    _make_state_db(
+        db_path,
+        {
+            trial_id_for(prefix, "MIA", "2026-09-15", no_id): _trial_row(no_id),
+            "exec/polymarket_us/fill/order-no": _fill_row("order-no", no_id),
+        },
+    )
+    result = ftc_mod.count_filled_takes(db_path, family_prefix=prefix)
     assert result == 1

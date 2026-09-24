@@ -106,6 +106,7 @@ from breezy.persistence.residual_fills import (
 from breezy.persistence.residual_fills import read_excluded_fills as _read_excluded_fills
 from breezy.persistence.residual_fills import residual_trial_ids as _residual_trial_ids
 from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA, read_scored_trials
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.settlement.current_rung_hold_v2 import (
     CombinedDraw,
     ScoreState,
@@ -292,6 +293,12 @@ class FamilyTallyV2:
     #: R2: the `trial_id`s that are BOTH a scored parquet row AND a residual
     #: sidecar entry -- a reconciliation contradiction, never silent.
     residual_scored_contradictions: tuple[str, ...] = ()
+    #: AUD-05 D-A(ii): label for the pooled mean-ask cell. ``""`` on an
+    #: all-YES corpus, so the rendered report stays byte-identical. Not a
+    #: statistic: `cell_dead` and the sequential score never read it.
+    pooled_side_mix: str = ""
+    #: One label per rendered `(*station_strata, *ask_band_strata)` element.
+    strata_side_mix: tuple[str, ...] = ()
 
 
 def _assert_held_matches_pnl_sign(rows: Sequence[ScoredTrial]) -> None:
@@ -643,6 +650,7 @@ def build_family_tally_v2(
     ordered = _ordered_for_looks(non_excluded, store_dir=store_dir)
     pooled_rows = tuple(_stratum_row(t) for t in ordered)
     pooled = build_stratum_v2("pooled", pooled_rows) if pooled_rows else None
+    pooled_side_mix = _side_mix_label(pooled_rows) if pooled_rows else ""
     # S4a (R3-2/R3-3): the registered statistic scores one COMBINED draw per
     # station-day, never per raw fill -- `pooled`/`station_strata`/
     # `ask_band_strata` above stay per-fill (Wilson cell_dead diagnostics are
@@ -652,6 +660,10 @@ def build_family_tally_v2(
     combined_draws = _combined_draws_for_looks(ordered)
     station_strata = _station_strata(non_excluded)
     ask_band_strata = _ask_band_strata(non_excluded)
+    strata_side_mix = (
+        *_station_side_mixes(non_excluded),
+        *_ask_band_side_mixes(non_excluded),
+    )
     any_cell_dead = any(s.cell_dead for s in (*station_strata, *ask_band_strata))
 
     total_pnl = sum((row.pnl for row in non_excluded), start=Decimal(0))
@@ -816,8 +828,10 @@ def build_family_tally_v2(
         n_residual_excluded=len(contradictions),
         residual_scored_contradictions=contradictions,
         pooled=pooled,
+        pooled_side_mix=pooled_side_mix,
         station_strata=station_strata,
         ask_band_strata=ask_band_strata,
+        strata_side_mix=strata_side_mix,
         looks=tuple(looks),
         verdict=verdict,
         total_pnl=total_pnl,
@@ -827,12 +841,131 @@ def build_family_tally_v2(
     )
 
 
-def _fmt_stratum_row(stratum: StratumV2) -> str:
+def _side_mix_label(rows: Sequence[StratumRow]) -> str:
+    """Disclosure for a mixed-domain mean ask. Empty on an all-YES group."""
+    if not rows:
+        return ""
+    n_yes = sum(1 for row in rows if row.side == "yes")
+    n_no = len(rows) - n_yes
+    if n_no == 0:
+        return ""
+    if n_yes == 0:
+        return " (NO-only)"
+    return f" (mixed-side: Y{n_yes}/N{n_no})"
+
+
+def _station_side_mixes(rows: Sequence[ScoredTrial]) -> tuple[str, ...]:
+    by_station: dict[str, list[ScoredTrial]] = defaultdict(list)
+    for row in rows:
+        by_station[row.station].append(row)
+    return tuple(
+        _side_mix_label(tuple(_stratum_row(trial) for trial in by_station[station]))
+        for station in sorted(by_station)
+    )
+
+
+def _ask_band_side_mixes(rows: Sequence[ScoredTrial]) -> tuple[str, ...]:
+    by_band: dict[tuple[float, float], list[ScoredTrial]] = defaultdict(list)
+    for row in rows:
+        by_band[classify_ask_band(float(row.entry_ask))].append(row)
+    mixes: list[str] = []
+    for lo, hi in ASK_BANDS:
+        group = by_band.get((lo, hi), [])
+        if not group:
+            continue
+        mixes.append(_side_mix_label(tuple(_stratum_row(trial) for trial in group)))
+    return tuple(mixes)
+
+
+_SIDE_MIX_FOOTNOTE = (
+    "mean ask is a per-leg average in each leg's OWN price domain; a NO leg's "
+    "ask is not comparable with a YES leg's. Annotated cells mix domains and "
+    "must not be read as one price. pi = mean(BE_i) is unaffected: "
+    "E[held_i] = BE_i on both sides (see the family manifest and PREREG v3 "
+    "amendment NO_SIDE 2026-09-14 §3)."
+)
+
+
+def _fmt_stratum_row(stratum: StratumV2, *, side_mix: str = "") -> str:
     dead = "CELL-DEAD" if stratum.cell_dead else ""
     return (
-        f"| {stratum.label} | {stratum.n} | {stratum.k} | {stratum.mean_ask:.4f} | "
+        f"| {stratum.label} | {stratum.n} | {stratum.k} | "
+        f"{stratum.mean_ask:.4f}{side_mix} | "
         f"{stratum.pi:.4f} | {stratum.wilson_lower:.4f} | {stratum.wilson_upper:.4f} | {dead} |"
     )
+
+
+def failure_detail_from_log(log_text: str) -> str:
+    """Exception class and ``file:line`` only.
+
+    The exception message is dropped: it can carry a currency figure, and
+    the alert detail must not.
+    """
+    file_line = "family_tally_v2.py:0"
+    exc_name = "FamilyTallyFailed"
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("File ") and ", line " in stripped:
+            try:
+                path_part = stripped.split('"', 2)[1]
+                line_no = stripped.split(", line ", 1)[1].split(",", 1)[0].strip()
+            except IndexError:
+                continue
+            if line_no.isdigit():
+                file_line = f"{Path(path_part).name}:{line_no}"
+            continue
+        if ":" not in stripped or stripped.startswith("Traceback"):
+            continue
+        head = stripped.split(":", 1)[0].strip()
+        if head.isidentifier():
+            exc_name = head
+    return f"{exc_name} at {file_line}"
+
+
+def _latch_keys(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, list):
+        return set()
+    return {item for item in payload if isinstance(item, str)}
+
+
+def _write_latch(path: Path, keys: set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(keys)), encoding="utf-8")
+
+
+def emit_family_tally_failure_alert(
+    *,
+    family_id: str,
+    log_text: str,
+    latch_path: Path,
+    today_utc: str,
+    sink: object | None = None,
+) -> bool:
+    """One CRITICAL ``FAMILY_TALLY_FAILED`` per ``(family_id, UTC day)``.
+
+    Returns True when an alert was emitted. A repeat the same day returns
+    False and does not page again.
+    """
+    key = f"{family_id}|{today_utc}"
+    keys = _latch_keys(latch_path)
+    if key in keys:
+        return False
+    payload = AlertPayload(
+        severity="CRITICAL",
+        event="FAMILY_TALLY_FAILED",
+        site=f"breezy-family-tally@{family_id}",
+        detail=failure_detail_from_log(log_text),
+    )
+    emit_alert(resolve_alert_sink() if sink is None else sink, payload)  # type: ignore[arg-type]
+    keys.add(key)
+    _write_latch(latch_path, keys)
+    return True
 
 
 def read_excluded_fills(store_dir: Path) -> tuple[ExcludedFill, ...]:
@@ -1072,9 +1205,13 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     add(STRATUM_TABLE_HEADER)
     add(STRATUM_TABLE_DIVIDER)
     if tally.pooled is not None:
-        add(_fmt_stratum_row(tally.pooled))
-    for stratum in (*tally.station_strata, *tally.ask_band_strata):
-        add(_fmt_stratum_row(stratum))
+        add(_fmt_stratum_row(tally.pooled, side_mix=tally.pooled_side_mix))
+    rendered_strata = (*tally.station_strata, *tally.ask_band_strata)
+    for index, stratum in enumerate(rendered_strata):
+        side_mix = tally.strata_side_mix[index] if index < len(tally.strata_side_mix) else ""
+        add(_fmt_stratum_row(stratum, side_mix=side_mix))
+    if tally.pooled_side_mix or any(tally.strata_side_mix):
+        add(_SIDE_MIX_FOOTNOTE)
     add("")
 
     is_shadow = tally.status != "REGISTERED"

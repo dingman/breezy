@@ -159,6 +159,65 @@ def test_d0_mismatch_is_nonzero(tmp_path: Path) -> None:
     assert not _tally_calls(argv_log)
 
 
+def _write_champion_counter_json(
+    tmp_path: Path, *, fetch_start: str = "2026-09-20", count: int = 7
+) -> Path:
+    """AUD-05 fix-2 (SPLIT THE ARTEFACT, 2026-09-24): the CHAMPION-scoped
+    artefact, written by score-live-trials-run.sh to its OWN, separate
+    path. This wrapper (the v1 stop) must never read this file."""
+    out = _out_dir(tmp_path)
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "count": count,
+        "depth_root_present": True,
+        "fetch_end": fetch_start,
+        "fetch_start": fetch_start,
+        "manifest_sha256": "a" * 64,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+    }
+    path = out / f"covered_listed_station_days_champion_{_stamp()}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return path
+
+
+def test_v1_tally_accepts_its_counter_when_the_champion_artefact_is_also_present(
+    tmp_path: Path,
+) -> None:
+    """AUD-05 fix-2 test (a) -- regression: both artefacts exist for a day
+    where the deployed champion is v4 (fetch_start 2026-09-20 on the
+    champion path). The v1 wrapper reads only its own pre-existing path
+    and exits 0 -- this is the false page the split exists to stop (before
+    the fix, both consumers shared the champion-scoped file and this
+    wrapper refused every day)."""
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path, fetch_start="2026-09-05", count=20)
+    _write_champion_counter_json(tmp_path, fetch_start="2026-09-20", count=7)
+    stub, argv_log = _make_stub(tmp_path)
+    result = _run_wrapper(tmp_path, stub_python=stub)
+    assert result.returncode == 0, result.stderr
+    calls = _tally_calls(argv_log)
+    assert len(calls) == 1
+    parts = calls[0].split()
+    assert parts[parts.index("--fill-since-climate-day") + 1] == "2026-09-05"
+    assert parts[parts.index("--covered-listed-station-days") + 1] == "20"
+
+
+def test_v1_wrapper_rejects_the_champion_artefact_when_mispointed(tmp_path: Path) -> None:
+    """AUD-05 fix-2 test (b) -- fail closed: a champion-shaped JSON (v4's
+    d0) placed on the v1 wrapper's OWN path is not a valid v1 counter and
+    must still be refused, regardless of what (if anything) also exists at
+    the separate champion path."""
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path, fetch_start="2026-09-20", count=7)
+    _write_champion_counter_json(tmp_path, fetch_start="2026-09-20", count=7)
+    stub, argv_log = _make_stub(tmp_path)
+    result = _run_wrapper(tmp_path, stub_python=stub)
+    assert result.returncode == 1
+    assert not _tally_calls(argv_log)
+    log_text = (tmp_path / "derived" / "live_tally.log").read_text(encoding="utf-8")
+    assert "drifted from the registered v1 D0" in log_text
+
+
 def test_tally_argv_pinned_to_the_literal_invocation_count_and_fetch_start_extracted(
     tmp_path: Path,
 ) -> None:

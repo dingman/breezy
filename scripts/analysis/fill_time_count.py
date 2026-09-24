@@ -142,9 +142,17 @@ def count_filled_takes(
             continue
         remainder = key[len(family_prefix) :]
         parts = remainder.split("/")
-        if len(parts) != 2:
+        # v2 keys are station/climate_day. v3 keys append the instrument id,
+        # one key per fill (AUD-05 D-B): skipping those collapsed every
+        # instrument-keyed take, including a same-station second rung and a
+        # composite `^no` id, out of the count. The fill match below stays
+        # exact -- the ledger writes the same instrument id on both records.
+        if len(parts) == 2:
+            _station, climate_day = parts
+        elif len(parts) == 3:
+            _station, climate_day, _key_instrument = parts
+        else:
             continue
-        _station, climate_day = parts
         if since_climate_day is not None and climate_day < since_climate_day:
             continue
         try:
