@@ -42,7 +42,7 @@ from breezy.runtime.health import AlertPayload, AlertState, emit_alert, resolve_
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
-from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS, CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
     Phase0PermitForbiddenError,
@@ -316,7 +316,7 @@ def resolve_station_instrument_ids(
     instruments = list(raw) if raw is not None else []
 
     buckets: dict[str, dict[InstrumentId, None]] = {
-        station: {} for station in SUPPORTED_STATIONS
+        station: {} for station in today_by_station
     }
     for instrument in instruments:
         parsed = _facts_from_instrument(instrument)
@@ -325,7 +325,7 @@ def resolve_station_instrument_ids(
         station, climate_day, measure = parsed
         if measure is not Measure.HIGH:
             continue
-        if station not in SUPPORTED_STATIONS:
+        if station not in today_by_station:
             continue
         if climate_day != today_by_station.get(station):
             continue
@@ -378,7 +378,7 @@ def _zero_instruments_message(
 ) -> str:
     dates = sorted({day.isoformat() for day in today_by_station.values()})
     date_part = dates[0] if len(dates) == 1 else ",".join(dates)
-    counts = " ".join(f"{station}={len(resolved[station])}" for station in SUPPORTED_STATIONS)
+    counts = " ".join(f"{station}={len(resolved[station])}" for station in resolved)
     return (
         f"current_rung_hold: resolved 0 instruments for {date_part} ({counts}); refusing to start"
     )
@@ -445,7 +445,7 @@ def build_current_rung_hold_strategies(
         raise NoTradableInstrumentsError(_zero_instruments_message(resolved, today_by_station))
 
     strategies: list[CurrentRungHoldStrategy] = []
-    for station in SUPPORTED_STATIONS:
+    for station in today_by_station:
         instrument_ids = resolved[station]
         if not instrument_ids:
             logger.warning(
@@ -562,7 +562,7 @@ def build_continuous_rung_hold_strategies(
     #: -tape root, so `monitor_root` is a directory beside it, one level up.
     monitor_root = catalog_root.parent / _MONITOR_CATALOG_DIRNAME
     strategies: list[ContinuousRungHoldStrategy] = []
-    for station in SUPPORTED_STATIONS:
+    for station in today_by_station:
         instrument_ids = resolved[station]
         if not instrument_ids:
             logger.warning(

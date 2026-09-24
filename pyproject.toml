@@ -77,6 +77,11 @@ layers = [
     # strategies and hands already-built objects down to `runtime`. Runtime
     # never imports strategy.
     "app",
+    # Offline analysis cores (census, promotion criteria). Reach DOWN into
+    # strategy/persistence/settlement for constants and loaders; nothing below
+    # may reach up into them, and `app` is barred by the forbidden contract
+    # below so the live node process never loads offline analysis code.
+    "analysis",
     # `strategy` reaches down into `runtime` for the backtest feed's shared
     # `ClientId` and into `ingest` for the shared weather `DataType`
     # factories. Nothing below `app` may reach back up into it -- the
@@ -139,6 +144,30 @@ forbidden_modules = [
 ]
 allow_indirect_imports = false
 
+[[tool.importlinter.contracts]]
+name = "The live trading path never imports the offline analysis layer"
+type = "forbidden"
+source_modules = [
+    "breezy.app", "breezy.strategy", "breezy.runtime", "breezy.adapters",
+    "breezy.ingest", "breezy.persistence", "breezy.registry", "breezy.normalize",
+    "breezy.features", "breezy.settlement", "breezy.domain",
+]
+forbidden_modules = ["breezy.analysis"]
+
+[[tool.importlinter.contracts]]
+name = "The offline analysis layer never DIRECTLY imports Nautilus"
+type = "forbidden"
+source_modules = ["breezy.analysis"]
+forbidden_modules = ["nautilus_trader"]
+# The property wanted is NO DIRECT ADOPTION: an analysis module must never
+# write `import nautilus_trader`. Indirect chains are unavoidable and are NOT
+# adoption -- `analysis` is permitted to import `breezy.strategy`, and
+# `breezy.strategy.current_rung_hold.config` imports
+# `nautilus_trader.model.identifiers` / `nautilus_trader.trading.config` at
+# config.py:59-60, which is also where SUPPORTED_STATIONS (:76) lives. Same
+# reasoning, and the same flag, as the `.com` adapter contract above.
+allow_indirect_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
@@ -166,6 +195,7 @@ files = [
     "src/breezy/persistence",
     "src/breezy/runtime",
     "src/breezy/strategy",
+    "src/breezy/analysis",
 
     # The venue slice. The operator EXECUTES the smoke script against
     # PRODUCTION credentials, so it must be typechecked, and so must the test

@@ -8,6 +8,7 @@ stays unreachable from env; ``build_trade_node_config`` keeps ``strategies=[]``.
 from __future__ import annotations
 
 import io
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -461,6 +462,83 @@ def test_two_stations_never_share_a_component_id(tmp_path: Path) -> None:
     tags = [strategy.order_id_tag for strategy in strategies]
     assert len(ids) == len(set(ids))
     assert len(tags) == len(set(tags))
+
+
+def _install_family(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    family_id: str,
+    stations: list[str],
+    template: str = "pm_us_crh_v2",
+) -> None:
+    payload = json.loads((Path("deploy/families") / f"{template}.json").read_text())
+    payload["family_id"] = family_id
+    payload["stations"] = stations
+    families = tmp_path / "families"
+    families.mkdir()
+    (families / f"{family_id}.json").write_text(json.dumps(payload))
+    monkeypatch.setattr("breezy.runtime.settings._FAMILIES_DIR", families)
+    monkeypatch.setattr("breezy.app.trade._FAMILIES_DIR", families)
+
+
+def test_a_manifest_naming_an_unsupported_station_refuses_the_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NYC is outside the allow-list. The boot names it and does not drop it."""
+    family_id = "pm_us_crh_nyc"
+    _install_family(monkeypatch, tmp_path, family_id=family_id, stations=["LAX", "NYC"])
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    _write_today_catalog(catalog_root)
+    err = io.StringIO()
+    env = _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: family_id,
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+
+    code = run(env=env, node_factory=RecordingNode, stderr=err)
+
+    message = err.getvalue()
+    assert code == EXIT_CONFIG_ERROR
+    assert "NYC" in message
+    assert "SUPPORTED_STATIONS" in message
+    assert RecordingNode.instances == []
+
+
+def test_an_empty_intersection_refuses_the_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every declared station is outside the allow-list. Do not fall back."""
+    family_id = "pm_us_crh_empty"
+    _install_family(monkeypatch, tmp_path, family_id=family_id, stations=["NYC"])
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    _write_today_catalog(catalog_root)
+    err = io.StringIO()
+    env = _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: family_id,
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+
+    code = run(env=env, node_factory=RecordingNode, stderr=err)
+
+    message = err.getvalue()
+    assert code == EXIT_CONFIG_ERROR
+    assert "empty" in message
+    assert "NYC" in message
+    assert "SUPPORTED_STATIONS" in message
+    assert RecordingNode.instances == []
 
 
 def test_tape_recorder_settings_never_read_the_sending_family_id_var(
