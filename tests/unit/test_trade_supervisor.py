@@ -30,6 +30,7 @@ import pytest
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
 from breezy.runtime.health import AlertPayload
 from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_intent_marker_path
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
     EXIT_CONFIG_ERROR,
@@ -2171,6 +2172,119 @@ class TestTerminateAfterToctouRecheck:
         finally:
             os.waitpid(pid, 0)
 
+    # -- AUD-13d HIGH-1: the stop-intent marker is written BEFORE the signal --
+
+    def test_a_store_path_writes_the_stop_intent_marker_before_signalling(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        order: list[str] = []
+        sent: list[int] = []
+        # A REAL, live pid: the default `write_stop_intent_marker` binds the
+        # marker to `/proc/<pid>/stat`'s own start time (2026-09-24 review,
+        # pid-reuse hardening), so a synthetic pid like 777 would read as
+        # "already gone" and nothing would be written. This process's own
+        # pid is alive for the whole test.
+        target_pid = os.getpid()
+
+        def _terminate_fn(pid: int) -> None:
+            order.append("terminate")
+            sent.append(pid)
+
+        terminate_after_toctou_recheck(
+            target_pid,
+            intent_lock_path_=Path("/does/not/matter"),
+            resolve_holder=lambda _p: target_pid,
+            terminate_fn=_terminate_fn,
+            is_alive=lambda _pid: True,
+            store_path=store_path,
+        )
+
+        assert sent == [target_pid]
+        # The marker was written for THIS pid before the signal was sent --
+        # asserted by consuming it now: a marker that was never written (or
+        # written for the wrong pid/incarnation) reports False.
+        assert consume_stop_intent_marker(store_path, target_pid) is True
+
+    def test_a_terminate_fn_that_raises_still_removes_the_marker_and_propagates(
+        self, tmp_path
+    ):
+        """[2026-09-24 review, HIGH] ``os.kill`` racing a target that died
+        right after the TOCTOU recheck must never leave an orphaned marker
+        for a LATER, unrelated process to (mis)match -- and the original
+        failure must still reach the caller exactly as before."""
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        target_pid = os.getpid()
+
+        def _raising_terminate_fn(pid: int) -> None:
+            raise ProcessLookupError(f"no such process: {pid}")
+
+        with pytest.raises(ProcessLookupError):
+            terminate_after_toctou_recheck(
+                target_pid,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: target_pid,
+                terminate_fn=_raising_terminate_fn,
+                is_alive=lambda _pid: True,
+                store_path=store_path,
+            )
+
+        assert not stop_intent_marker_path(store_path).exists()
+
+    def test_a_terminate_fn_exception_without_a_store_path_still_propagates(self, tmp_path):
+        """Regression guard: wrapping ``terminate_fn`` in a try/except must
+        not swallow the failure for callers that pass no ``store_path``."""
+
+        def _raising_terminate_fn(pid: int) -> None:
+            raise ProcessLookupError(f"no such process: {pid}")
+
+        with pytest.raises(ProcessLookupError):
+            terminate_after_toctou_recheck(
+                777,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: 777,
+                terminate_fn=_raising_terminate_fn,
+                is_alive=lambda _pid: True,
+            )
+
+    def test_no_store_path_writes_no_marker_backward_compatible_default(self, tmp_path):
+        """Every EXISTING caller omits ``store_path`` -- confirms the new
+        parameter is opt-in and changes nothing for them."""
+        store_path = tmp_path / "state" / "store.sqlite3"  # never passed in below
+        sent: list[int] = []
+
+        terminate_after_toctou_recheck(
+            777,
+            intent_lock_path_=Path("/does/not/matter"),
+            resolve_holder=lambda _p: 777,
+            terminate_fn=sent.append,
+            is_alive=lambda _pid: True,
+        )
+
+        assert sent == [777]
+        assert not stop_intent_marker_path(store_path).exists()
+
+    def test_a_refused_recheck_never_writes_the_marker(self, tmp_path):
+        """[L3] The marker is corroborating evidence for a signal that WAS
+        sent -- a race-refused terminate must leave no marker behind to
+        wrongly suppress a later, unrelated boot-halt."""
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        sent: list[int] = []
+
+        with pytest.raises(StopPriorRaceRefused):
+            terminate_after_toctou_recheck(
+                777,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: 999,
+                terminate_fn=sent.append,
+                is_alive=lambda _pid: True,
+                store_path=store_path,
+            )
+
+        assert sent == []
+        assert not stop_intent_marker_path(store_path).exists()
+
 
 # ---------------------------------------------------------------------------
 # process_is_alive -- a zombie must never read as alive (os.kill(pid, 0)
@@ -2540,6 +2654,28 @@ class TestPhaseHandlersDirect:
         result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=1001)
         assert result is None
         assert terminated == [1001]
+
+    def test_stop_prior_passes_its_own_store_path_to_the_terminate_port(self, tmp_path):
+        """AUD-13d HIGH-1: ``_do_stop_prior`` never resolves a marker path of
+        its own -- it hands its ``store_path`` straight to the port, which
+        owns writing the marker."""
+        store_path = tmp_path / "state" / "store.sqlite3"
+        received: dict[str, object] = {}
+
+        def _terminate_after_recheck(pid: int, **kwargs: object) -> None:
+            received["pid"] = pid
+            received.update(kwargs)
+
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: 1001,
+            terminate_after_recheck=_terminate_after_recheck,
+        )
+        result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=1001)
+
+        assert result is None
+        assert received["pid"] == 1001
+        assert received["store_path"] == store_path
 
     def test_do_launch_refuses_when_lock_held(self, tmp_path):
         store_path = tmp_path / "state" / "store.sqlite3"

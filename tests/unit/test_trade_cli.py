@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import io
+import os
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
@@ -30,11 +31,14 @@ from typing import Any, ClassVar
 
 import pytest
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.common.enums import ComponentState
+from nautilus_trader.common.messages import ComponentStateChanged
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce, TradingState
 from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
+    ComponentId,
     InstrumentId,
     StrategyId,
     Symbol,
@@ -57,7 +61,9 @@ from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
 from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRefusedError
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
+from breezy.runtime.health import AlertPayload
 from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, TRADE_TRADER_ID_VAR
+from breezy.runtime.stop_intent_marker import stop_intent_marker_path, write_stop_intent_marker
 from breezy.runtime.trade_cli import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -175,6 +181,13 @@ class _FakeRiskEngine:
         self.states.append(state)
 
 
+class _SilentExecEngine:
+    """Enough of the exec engine for the stale-intent reader to find no client."""
+
+    def __init__(self) -> None:
+        self._clients: dict[object, object] = {}
+
+
 class _FakeKernel:
     """Stands in for the slice of ``NautilusKernel`` R-6a's/R-7-PRE's guards read."""
 
@@ -185,6 +198,7 @@ class _FakeKernel:
         self.cache = self.cache_type()
         self.msgbus = _FakeMsgBus()
         self.risk_engine = _FakeRiskEngine()
+        self.exec_engine = _SilentExecEngine()
         # WP-B2 widens the slice the guards read by one attribute: the
         # kernel's own clock, which `_run_node` hands the order guard so a
         # lapsed `OrderSubmissionPermit` is refused at submit. A REAL
@@ -203,7 +217,8 @@ class _FakeAccountlessKernel(_FakeKernel):
 class _RecordingTrader:
     """Stands in for ``Trader``; records the Actors registered natively on it."""
 
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(self, calls: list[str], trader_id: TraderId) -> None:
+        self.id = trader_id
         self.actors: list[Any] = []
         self.strategies: list[Any] = []
         self._calls = calls
@@ -228,7 +243,7 @@ class RecordingNode:
         self.exec_client_factories: list[tuple[str, type]] = []
         self.calls: list[str] = []
         self.kernel = _FakeKernel()
-        self.trader = _RecordingTrader(self.calls)
+        self.trader = _RecordingTrader(self.calls, config.trader_id)
         RecordingNode.instances.append(self)
 
     def add_data_client_factory(self, name: str, factory: type) -> None:
@@ -272,6 +287,29 @@ class FeedLostNode(RecordingNode):
         feed_fault.record_fatal_feed_fault(
             "POLYMARKET_US", "markets feed lost and not recoverable"
         )
+
+
+class _RecordingAlertSink:
+    """Captures alert payloads. Never opens a socket."""
+
+    def __init__(self) -> None:
+        self.payloads: list[AlertPayload] = []
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.payloads.append(payload)
+
+
+@pytest.fixture(autouse=True)
+def _no_send_alert_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[_RecordingAlertSink]:
+    """Every ``run()`` in this module resolves the alert sink through here.
+
+    A boot that never publishes trader ``RUNNING`` emits after the feature
+    lands. The real ``resolve_alert_sink`` would build a webhook client when
+    ``BREEZY_ALERT_WEBHOOK_URL`` is set. This module must not do that.
+    """
+    sink = _RecordingAlertSink()
+    monkeypatch.setattr(trade_cli, "resolve_alert_sink", lambda: sink, raising=False)
+    yield sink
 
 
 @pytest.fixture(autouse=True)
@@ -335,9 +373,10 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
     """2026-09-11 incident addendum, item 3: `install_stale_intent_alert`
     rides the SAME `COMPONENT_STATE_TOPIC` heartbeat
     `install_component_degraded_alert` already subscribes -- one wiring
-    idiom, not a second timer. Exactly two subscribers on that topic:
-    nothing else in `_run_node` uses it (the order guard and the account
-    presence halt both subscribe `ORDER_EVENT_TOPIC` instead)."""
+    idiom, not a second timer. The boot-halt check is not a third
+    subscriber and not a timer: it reads the trader once after ``run()``.
+    Nothing else in `_run_node` uses this topic (the order guard and the
+    account presence halt both subscribe `ORDER_EVENT_TOPIC` instead)."""
     run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
     node = RecordingNode.instances[0]
 
@@ -883,3 +922,274 @@ def test_the_tape_recorder_and_the_ingest_node_are_untouched() -> None:
         assert "NwsObservationActor" not in source, module.__name__
         assert "live_observations" not in source, module.__name__
         assert "observation_composition" not in source, module.__name__
+
+
+# ---------------------------------------------------------------------------
+# AUD-13d: a trader that never reaches RUNNING is a CRITICAL boot-halt.
+# The node lifecycle (build / run / dispose, exit code) stays the one the
+# kernel already decided. This block only observes it.
+# ---------------------------------------------------------------------------
+
+_BOOT_HALT_EVENT = "BOOT_HALT"
+#: The only detail a post-run read can state honestly. Engine connectivity
+#: does not survive stop, and ``portfolio.initialized`` is false for every
+#: early return, not only a portfolio-init failure.
+_BOOT_HALT_DETAILS = frozenset({"BOOT_HALT_TRADER_NEVER_STARTED"})
+_DROPPED_BOOT_HALT_DETAILS = frozenset(
+    {
+        "BOOT_HALT_ENGINES_NOT_CONNECTED",
+        "BOOT_HALT_RECONCILIATION_FAILED",
+        "BOOT_HALT_PORTFOLIO_NOT_INITIALISED",
+    }
+)
+
+
+def _boot_halt_payloads(sink: _RecordingAlertSink) -> list[AlertPayload]:
+    return [payload for payload in sink.payloads if payload.event == _BOOT_HALT_EVENT]
+
+
+def _publish_component_state(
+    node: RecordingNode,
+    *,
+    component_id: Any,
+    component_type: str,
+    state: ComponentState,
+) -> None:
+    event = ComponentStateChanged(
+        trader_id=node.trader.id,
+        component_id=component_id,
+        component_type=component_type,
+        state=state,
+        config={},
+        event_id=UUID4(),
+        ts_event=0,
+        ts_init=0,
+    )
+    for topic, handler in node.kernel.msgbus.subscriptions:
+        if topic == COMPONENT_STATE_TOPIC:
+            handler(event)
+
+
+class _AlwaysConnectedEngine:
+    def __init__(self) -> None:
+        self._clients: dict[object, object] = {}
+
+    def check_connected(self) -> bool:
+        return True
+
+
+class _TraderReachedRunningNode(RecordingNode):
+    """A clean stop leaves the public ``Trader.is_stopped`` flag set.
+
+    That is the one-shot signal read after ``run()``. Publishing a component
+    state is not that signal: the check does not subscribe to the bus.
+    """
+
+    def run(self) -> None:
+        self.calls.append("run")
+        self.trader.is_stopped = True
+
+
+class _UnattributedBootHaltNode(RecordingNode):
+    """Connected engines, portfolio not initialised, trader never started.
+
+    A bus sample of that shape used to be labelled a failed reconciliation
+    (engines connected, order emulator never seen). Those probes do not
+    survive as a cause after ``run()`` returns, so the alert stays generic.
+    The published event gives a subscriber the same chance to mislabel it.
+    """
+
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+        self.kernel.data_engine = _AlwaysConnectedEngine()
+        self.kernel.exec_engine = _AlwaysConnectedEngine()
+        self.kernel.portfolio.initialized = False
+
+    def run(self) -> None:
+        self.calls.append("run")
+        _publish_component_state(
+            self,
+            component_id=ComponentId("DataEngine"),
+            component_type="DataEngine",
+            state=ComponentState.RUNNING,
+        )
+
+
+def test_a_run_that_ends_without_the_trader_ever_running_alerts_at_critical(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    # The boot/halt decision is unchanged: the fake run still completes and
+    # still exits 0. Only the alert is new.
+    assert code == EXIT_OK
+    assert err.getvalue() == ""
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].severity == "CRITICAL"
+    assert payloads[0].site == "global"
+    assert payloads[0].event == _BOOT_HALT_EVENT
+
+
+def test_a_normal_run_that_reaches_trader_running_emits_no_boot_halt_alert(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=_TraderReachedRunningNode, stderr=err)
+
+    assert code == EXIT_OK
+    assert err.getvalue() == ""
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+    node = RecordingNode.instances[0]
+    # The one-shot signal, not a bus subscription. A node that never sets
+    # it alerts (the test above); this one did, so silence is the branch.
+    assert node.trader.is_stopped is True
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
+
+
+def test_the_boot_halt_alert_detail_is_a_fixed_enum_and_carries_no_value(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    detail = payloads[0].detail
+    assert detail in _BOOT_HALT_DETAILS
+    assert detail == "BOOT_HALT_TRADER_NEVER_STARTED"
+    assert not any(character.isdigit() for character in detail)
+    assert " " not in detail
+    assert "/" not in detail
+    assert set(payloads[0].to_dict()) == {"severity", "event", "site", "detail"}
+
+
+def test_a_failing_alert_sink_does_not_change_the_process_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RaisingSink:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def emit(self, payload: AlertPayload) -> None:
+            del payload
+            self.calls += 1
+            raise RuntimeError("sink down")
+
+    sink = _RaisingSink()
+    monkeypatch.setattr(trade_cli, "resolve_alert_sink", lambda: sink, raising=False)
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    assert sink.calls == 1
+    assert code == EXIT_OK
+    assert err.getvalue() == ""
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+
+
+def test_a_boot_halt_with_no_attributable_cause_alerts_with_the_generic_detail(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    code = run(env=TRADE_ENV, node_factory=_UnattributedBootHaltNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].severity == "CRITICAL"
+    detail = payloads[0].detail
+    assert detail == "BOOT_HALT_TRADER_NEVER_STARTED"
+    assert detail not in _DROPPED_BOOT_HALT_DETAILS
+
+
+# ---------------------------------------------------------------------------
+# AUD-13d HIGH-1: an intentional supervisor stop must never page CRITICAL.
+# The marker lives beside `POLYMARKET_US_EXEC_STATE_DB`
+# (`TRADE_ENV[EXEC_STATE_DB_ENV_VAR]`) -- the SAME store path
+# `breezy.runtime.trade_supervisor`'s `stop_prior` phase resolves from the
+# identical env var, since `spawn_node` forwards `env=os.environ` as-is.
+# ---------------------------------------------------------------------------
+
+_STOP_INTENT_STORE_PATH = Path(TRADE_ENV["POLYMARKET_US_EXEC_STATE_DB"])
+
+
+@pytest.fixture(autouse=True)
+def _clean_stop_intent_marker() -> Iterator[None]:
+    marker_path = stop_intent_marker_path(_STOP_INTENT_STORE_PATH)
+    marker_path.unlink(missing_ok=True)
+    yield
+    marker_path.unlink(missing_ok=True)
+
+
+def test_a_stop_intent_marker_naming_this_process_suppresses_the_boot_halt_alert(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid())
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
+
+
+def test_the_stop_intent_marker_is_single_use(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """A marker consumed by one boot-halt check must not silence the next."""
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid())
+
+    first_code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+    assert first_code == EXIT_OK
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
+
+    second_code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+    assert second_code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].detail == "BOOT_HALT_TRADER_NEVER_STARTED"
+
+
+def test_a_stop_intent_marker_for_a_different_pid_does_not_suppress_the_alert(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid() + 1)
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].detail == "BOOT_HALT_TRADER_NEVER_STARTED"
+
+
+def test_no_stop_intent_marker_still_alerts_as_before(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """Regression guard: the default (no marker) path is unchanged."""
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].severity == "CRITICAL"
+
+
+def test_a_stop_intent_marker_does_not_suppress_a_run_that_reaches_running(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """The marker is read only when the trader never reached RUNNING -- a
+    healthy run that happens to race a stale marker still stays silent for
+    the SAME reason it always did (``_trader_reached_running`` is True),
+    and the marker must still be consumed so it cannot outlive this boot."""
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid())
+
+    code = run(env=TRADE_ENV, node_factory=_TraderReachedRunningNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
