@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
+import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,7 +27,11 @@ from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
 )
-from breezy.adapters.polymarket_us.safety import issue_live_trading_permit
+from breezy.adapters.polymarket_us.safety import (
+    MAX_ORDER_NOTIONAL_USD_ENV_VAR,
+    issue_live_trading_permit,
+)
+from breezy.app.trade import run
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
     MEASURE_KEY,
@@ -35,11 +42,17 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KNOWN,
     WEATHER_FACTS_STATUS_UNKNOWN,
 )
-from breezy.persistence.family_manifest import FamilyManifest
+from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.runtime.order_enablement import OrderSubmissionPermit
-from breezy.runtime.settings import SettingsError
+from breezy.runtime.settings import (
+    LIVE_OBSERVATIONS_VAR,
+    SENDING_FAMILY_ID_VAR,
+    TRADE_CATALOG_ROOT_VAR,
+    SettingsError,
+)
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_OK
 from breezy.strategy.current_rung_hold.composition import (
     NoTradableInstrumentsError,
     build_continuous_rung_hold_strategies,
@@ -63,6 +76,13 @@ from tests.unit.test_polymarket_us_permit_issuance import clock_at, enable_opera
 from tests.unit.test_polymarket_us_submit_order_chain import (
     write_canonical_verified,  # noqa: F401 -- reused fixture, see test below
 )
+from tests.unit.test_trade_cli_current_rung_hold import (
+    RecordingNode,
+    _instrument,
+    _trade_env,
+    _write_today_catalog,
+)
+from tests.unit.test_trade_cli_current_rung_hold import _today_by_station as _live_today
 
 _POLYMARKET_VENUE = Venue("POLYMARKET_US")
 _DAY = dt.date(2026, 9, 4)
@@ -930,3 +950,175 @@ def test_family_halt_submit_veto_reads_a_family_wide_key_not_a_station_scoped_on
         )
 
         assert veto_for_lax() == "family_halt"
+
+
+def test_composition_uses_only_the_stations_the_manifest_declares(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A two-station mapping composes those two stations, not every allow-list station.
+
+    The catalog holds instruments for all four supported stations. Iteration
+    must follow the mapping (manifest order, already the allow-list order),
+    and stations the mapping does not name must not be bucketed or warned.
+    """
+    declared = ("LAX", "MDW")
+    today = {station: _DAY for station in declared}
+    _write(
+        tmp_path,
+        [
+            _binary(
+                f"tc-temp-{station.lower()}high-2026-09-04-gte80lt81f",
+                info=_known(station=station, day=_DAY),
+            )
+            for station in (*declared, "MIA", "SFO")
+        ],
+    )
+    offer_tape = tmp_path / "offers.jsonl"
+    with caplog.at_level(logging.WARNING, logger="breezy.strategy.current_rung_hold.composition"):
+        current = build_current_rung_hold_strategies(
+            catalog_root=tmp_path,
+            today_by_station=today,
+            trial_day_latch_factory=_unused_latch_factory,
+        )
+        continuous = build_continuous_rung_hold_strategies(
+            catalog_root=tmp_path,
+            today_by_station=today,
+            trial_day_latch_factory=_unused_latch_factory,
+            offer_tape_path=offer_tape,
+            enable_position_monitor=False,
+        )
+
+    assert tuple(strategy.order_id_tag for strategy in current) == declared
+    assert tuple(strategy.order_id_tag for strategy in continuous) == declared
+    resolved = resolve_station_instrument_ids(tmp_path, today)
+    assert tuple(resolved) == declared
+    assert "skipping MIA" not in caplog.text
+    assert "skipping SFO" not in caplog.text
+
+
+@pytest.mark.parametrize("template", ["pm_us_crh_v2", "pm_us_crh_v4"])
+def test_a_narrowed_manifest_whose_declared_stations_all_resolve_zero_refuses_the_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    template: str,
+) -> None:
+    """Declared stations all resolve zero; an undeclared station has instruments.
+
+    The boot must raise ``NoTradableInstrumentsError`` (exit 2) for both
+    builders. The refusal names only the declared stations.
+    """
+    family_id = f"{template}_narrow"
+    payload = json.loads((Path("deploy/families") / f"{template}.json").read_text())
+    payload["family_id"] = family_id
+    payload["stations"] = ["LAX", "MDW"]
+    families = tmp_path / "families"
+    families.mkdir()
+    (families / f"{family_id}.json").write_text(json.dumps(payload))
+    monkeypatch.setattr("breezy.runtime.settings._FAMILIES_DIR", families)
+    monkeypatch.setattr("breezy.app.trade._FAMILIES_DIR", families)
+    monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, "25")
+
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    live_today = _live_today()
+    ParquetDataCatalog(str(catalog_root)).write_data(
+        [_instrument(station="SFO", climate_day=live_today["SFO"])]
+    )
+    env = _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: family_id,
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+            MAX_ORDER_NOTIONAL_USD_ENV_VAR: "25",
+        },
+    )
+    err = io.StringIO()
+    RecordingNode.instances.clear()
+
+    code = run(env=env, node_factory=RecordingNode, stderr=err)
+
+    message = err.getvalue()
+    assert code == EXIT_CONFIG_ERROR
+    assert "LAX=0" in message
+    assert "MDW=0" in message
+    assert "SFO=" not in message
+    assert "MIA=" not in message
+    assert "refusing to start" in message
+    assert RecordingNode.instances == []
+
+
+def test_the_live_v4_manifest_composes_the_same_four_stations_as_before(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L-2 pin: the deployed v4 station list composes the same four strategies.
+
+    Also pins the boot log (C18): the line names that station set and the
+    manifest's ``family_id``.
+    """
+    manifest = load_family_manifest(Path("deploy/families/pm_us_crh_v4.json"))
+    assert tuple(manifest.stations) == SUPPORTED_STATIONS
+
+    _write(
+        tmp_path,
+        [
+            _binary(
+                f"tc-temp-{station.lower()}high-2026-09-04-gte80lt81f",
+                info=_known(station=station, day=_DAY),
+            )
+            for station in SUPPORTED_STATIONS
+        ],
+    )
+    offer_tape = tmp_path / "offers.jsonl"
+    common = {
+        "catalog_root": tmp_path,
+        "trial_day_latch_factory": _unused_latch_factory,
+        "offer_tape_path": offer_tape,
+        "enable_position_monitor": False,
+    }
+    from_manifest = build_continuous_rung_hold_strategies(
+        today_by_station={station: _DAY for station in manifest.stations},
+        **common,
+    )
+    from_constant = build_continuous_rung_hold_strategies(
+        today_by_station={station: _DAY for station in SUPPORTED_STATIONS},
+        **common,
+    )
+
+    def _identity(
+        strategies: tuple[ContinuousRungHoldStrategy, ...],
+    ) -> list[tuple[str, str, tuple[str, ...]]]:
+        return [
+            (
+                str(strategy.id),
+                strategy.order_id_tag,
+                tuple(str(instrument_id) for instrument_id in strategy._config.instrument_ids),
+            )
+            for strategy in strategies
+        ]
+
+    assert _identity(from_manifest) == _identity(from_constant)
+    assert [strategy.order_id_tag for strategy in from_manifest] == list(SUPPORTED_STATIONS)
+
+    catalog_root = tmp_path / "live-catalog"
+    catalog_root.mkdir()
+    _write_today_catalog(catalog_root)
+    monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, "25")
+    env = _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v4",
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+            MAX_ORDER_NOTIONAL_USD_ENV_VAR: "25",
+        },
+    )
+    RecordingNode.instances.clear()
+    with caplog.at_level(logging.INFO, logger="breezy.app.trade.boot"):
+        code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert "composed stations LAX,MDW,MIA,SFO from family_id=pm_us_crh_v4" in caplog.text

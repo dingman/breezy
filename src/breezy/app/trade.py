@@ -17,7 +17,7 @@ import datetime as dt
 import logging
 import os
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Final, TextIO
@@ -145,14 +145,46 @@ def _ensure_boot_logging_visible() -> None:
     _boot_logger.setLevel(logging.INFO)
 
 
-def _today_by_station() -> dict[str, dt.date]:
+def _composable_stations(manifest: FamilyManifest) -> tuple[str, ...]:
+    """Stations this boot may compose, in ``SUPPORTED_STATIONS`` order.
+
+    The manifest is the only source. Anything outside the allow-list refuses
+    the boot by name -- it is never dropped. An empty intersection refuses
+    too, rather than falling back to the allow-list.
+    """
+    declared = tuple(manifest.stations)
+    declared_set = set(declared)
+    unsupported = [station for station in declared if station not in SUPPORTED_STATIONS]
+    allowed = tuple(station for station in SUPPORTED_STATIONS if station in declared_set)
+    if not allowed:
+        message = (
+            f"{manifest.family_id}: refusing boot; intersection of stations "
+            f"{list(declared)!r} with SUPPORTED_STATIONS {list(SUPPORTED_STATIONS)!r} "
+            "is empty"
+        )
+        if unsupported:
+            message += f"; unsupported: {unsupported!r}"
+        _boot_logger.error(message)
+        raise SettingsError(message)
+    if unsupported:
+        message = (
+            f"{manifest.family_id}: refusing boot; stations {list(declared)!r} "
+            f"include values outside SUPPORTED_STATIONS {list(SUPPORTED_STATIONS)!r}; "
+            f"unsupported: {unsupported!r}"
+        )
+        _boot_logger.error(message)
+        raise SettingsError(message)
+    return allowed
+
+
+def _today_by_station(stations: Sequence[str]) -> dict[str, dt.date]:
     registry = default_registry()
     now = dt.datetime.now(tz=dt.UTC)
     return {
         station: climate_day_for_instant(
             now, registry.climate_day_window(_VENUE, station).std_utc_offset_hours
         )
-        for station in SUPPORTED_STATIONS
+        for station in stations
     }
 
 
@@ -207,9 +239,11 @@ def run(
         )
         return EXIT_CONFIG_ERROR
 
-    today_by_station = _today_by_station()
     try:
         manifest = load_family_manifest(_FAMILIES_DIR / f"{settings.sending_family_id}.json")
+        # Manifest stations, not SUPPORTED_STATIONS. The call has to follow
+        # the load: the composable set is a property of this manifest.
+        today_by_station = _today_by_station(_composable_stations(manifest))
         with ExitStack() as stack:
             store = stack.enter_context(SqliteStateStore(store_path))
             latch = stack.enter_context(open_submit_intent_latch(store, store_path))
@@ -303,6 +337,11 @@ def run(
                 )
 
             composed = tuple(strategies)
+            _boot_logger.info(
+                "composed stations %s from family_id=%s",
+                ",".join(strategy.order_id_tag for strategy in composed),
+                manifest.family_id,
+            )
             return trade_cli.run(
                 env=env,
                 node_factory=node_factory,
