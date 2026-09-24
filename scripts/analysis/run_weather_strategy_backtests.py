@@ -57,18 +57,15 @@ does not carry it):
     timestamped strictly after that instrument's last real market-data record.
     Its `close_price` is cosmetic: the engine reads settlement price ONLY from
     `settlement_prices` (`docs/specs/BACKTEST_VENUE_CONFIG.md` Sec.0).
-  * The weather record's timestamps. The real preliminary observations were
-    retrieved at ~20:32-20:50 UTC on 2026-08-30 -- AFTER the tape window ends
-    (~16:11:53 UTC) -- so feeding them at their real timestamp would place
-    them after every instrument's synthesized close, deep in the record
-    stream. They are RESTAMPED to just before the tape window starts so they
-    are available context throughout the run; `tmax_f`, `is_final`,
-    `revision_seq` and every other field are untouched. Because both
-    strategies gate flatten-on-observation on `is_final` (`False` here) and
-    that flag defaults off in every strategy config used here, this
-    restamping has no effect on trading behaviour -- it exists only so the
-    weather record's *arrival* is honestly inside the observed window rather
-    than centered on a timestamp that never occurred in the tape.
+  * Nothing about the weather record's timestamps. The real climate-day
+    observations for this tape were retrieved AFTER the tape window ends
+    (~16:11:53 UTC; preliminaries ~20:32-20:50 UTC the same day, later
+    revisions even later). There is no honest `ts_init` at which they could
+    be fed into the engine and still precede every decision. The default
+    branch therefore does not restamp them and does not pass them as
+    `weather_data`. `assert_available_before_decision` records that fact.
+    The selected `tmax_f` values are used only for the post-hoc
+    settlement-scenario sweep.
 
 NEVER PRESENT AS MEASURED PERFORMANCE
 ---------------------------------------
@@ -239,6 +236,10 @@ from breezy.runtime.backtest_harness import (
     run_backtest,
 )
 from breezy.runtime.backtest_order_guard import NakedShortRefusedError, PostOnlyRefusedError
+from breezy.runtime.point_in_time_guard import (
+    LookAheadRecordError,
+    assert_available_before_decision,
+)
 from breezy.runtime.quote_tape_ingest_cli import default_convert
 from breezy.strategy.calibration_mean_reversion import (
     CalibrationMeanReversionConfig,
@@ -739,77 +740,105 @@ def _synthesize_close(tape_instrument: TapeInstrument) -> InstrumentClose:
     )
 
 
+def _climate_day_for_message(records: Sequence[NwsClimateDay]) -> dt.date:
+    days = {record.climate_day for record in records}
+    if len(days) == 1:
+        return next(iter(days))
+    return CLIMATE_DAY
+
+
+def _select_highest_revision_readings(
+    records: Sequence[NwsClimateDay],
+    *,
+    stations: Sequence[str],
+    require_final: bool,
+    raise_on_missing: bool,
+    filter_superseded: bool,
+    missing_context: str | None = None,
+) -> tuple[dict[str, int], dict[str, NwsClimateDay]]:
+    """Highest-`revision_seq` reading per station.
+
+    ``require_final`` chooses the candidate set. ``raise_on_missing`` chooses
+    what a station with an empty candidate set does. ``filter_superseded``
+    chooses whether ``is_superseded`` is consulted at all. The three are
+    independent.
+
+    * ``require_final=False, raise_on_missing=True, filter_superseded=True``
+      is :func:`_load_real_observations`: every fixed station must have a
+      non-superseded candidate, final or not.
+    * ``require_final=True, raise_on_missing=False, filter_superseded=False``
+      is :func:`_settled_readings`: a station with no final print is omitted.
+      :func:`_run_live_capture` turns that omission into its REFUSAL exit.
+      ``is_superseded`` is deliberately NOT consulted here -- see
+      ``breezy.domain.nws_climate_day.NwsClimateDay`` (``is_superseded``) and
+      ``breezy.domain.selection`` (module docstring): the flag only records
+      what was known when a record was written and can never be set
+      retroactively on the record it supersedes, so selecting on it would
+      silently disagree with settlement truth.
+
+    A selected candidate whose ``tmax_f`` is ``None`` always raises
+    ``LookupError``. ``missing_context``, when given, is appended so the
+    real-observation wrapper keeps the historical ``under <catalog>`` text.
+    """
+    observed: dict[str, int] = {}
+    chosen: dict[str, NwsClimateDay] = {}
+    day = _climate_day_for_message(records)
+    location = f" under {missing_context}" if missing_context else ""
+    for station in stations:
+        candidates = [
+            record
+            for record in records
+            if record.station == station
+            and (not filter_superseded or not record.is_superseded)
+            and (record.is_final or not require_final)
+        ]
+        if not candidates:
+            if not raise_on_missing:
+                continue
+            kind = "final " if require_final else ""
+            prefix = "non-superseded " if filter_superseded else ""
+            raise LookupError(
+                f"no {prefix}{kind}NwsClimateDay for station={station!r} "
+                f"climate_day={day.isoformat()}{location}",
+            )
+        best = max(candidates, key=lambda record: record.revision_seq)
+        if best.tmax_f is None:
+            if require_final:
+                raise LookupError(
+                    f"{station} {best.climate_day.isoformat()} final print carries no "
+                    "tmax_f (flagged missing/trace); refusing to fabricate a settlement",
+                )
+            raise LookupError(
+                f"selected NwsClimateDay for {station} {best.climate_day.isoformat()} "
+                "carries no tmax_f (flagged missing/trace)",
+            )
+        observed[station] = best.tmax_f
+        chosen[station] = best
+    return observed, chosen
+
+
 def _load_real_observations(
     weather_catalog_root: Path,
 ) -> tuple[dict[str, int], dict[str, NwsClimateDay]]:
-    """The REAL preliminary NYC/MIA observations for `CLIMATE_DAY`.
+    """The REAL highest-revision NYC/MIA observations for `CLIMATE_DAY`.
 
-    Selects, per station, the non-superseded record with the highest
-    `revision_seq` for `CLIMATE_DAY` -- there happens to be exactly one
-    (`revision_seq=1`, `is_final=False`) for each station at the time this was
-    written, but the selection rule does not assume that.
-
-    Raises
-    ------
-    LookupError
-        If a station has no non-superseded record for `CLIMATE_DAY` -- this
-        script must not silently fall back to a fabricated reading.
-
+    Thin wrapper: real ``ts_init`` records from :func:`_load_climate_day_records`,
+    then :func:`_select_highest_revision_readings` with ``require_final=False``
+    and ``raise_on_missing=True``. A fixed station with no non-superseded
+    candidate still raises ``LookupError``. Nothing is restamped.
     """
-    observed: dict[str, int] = {}
-    records: dict[str, NwsClimateDay] = {}
-    for station in ("NYC", "MIA"):
-        station_catalog = open_station_catalog(weather_catalog_root, WEATHER_VENUE, station)
-        candidates = [
-            record
-            for record in read_climate_days(station_catalog)
-            if record.climate_day == CLIMATE_DAY and not record.is_superseded
-        ]
-        if not candidates:
-            raise LookupError(
-                f"no non-superseded NwsClimateDay for station={station!r} "
-                f"climate_day={CLIMATE_DAY.isoformat()} under {weather_catalog_root}",
-            )
-        best = max(candidates, key=lambda r: r.revision_seq)
-        if best.tmax_f is None:
-            raise LookupError(
-                f"selected NwsClimateDay for {station} {CLIMATE_DAY.isoformat()} "
-                f"carries no tmax_f (flagged missing/trace)",
-            )
-        observed[station] = best.tmax_f
-        records[station] = best
-    return observed, records
-
-
-def _restamp_climate_day(record: NwsClimateDay, retrieved_at_ns: int) -> NwsClimateDay:
-    """A copy of `record` with `retrieved_at_ns`/`ts_event` moved inside the tape window.
-
-    See the module docstring: the real retrieval timestamp is AFTER the tape
-    window ends. Every other field, including `tmax_f`, `is_final` and
-    `revision_seq`, is copied verbatim.
-    """
-    return NwsClimateDay(
-        station=record.station,
-        climate_day=record.climate_day,
-        tmax_f=record.tmax_f,
-        tmin_f=record.tmin_f,
-        tavg_f=record.tavg_f,
-        tmax_flag=record.tmax_flag,
-        tmin_flag=record.tmin_flag,
-        tavg_flag=record.tavg_flag,
-        is_final=record.is_final,
-        correction_flag=record.correction_flag,
-        revision_seq=record.revision_seq,
-        is_superseded=record.is_superseded,
-        issuing_office=record.issuing_office,
-        issuance_time_ns=record.issuance_time_ns,
-        retrieved_at_ns=retrieved_at_ns,
-        parser_version=record.parser_version,
-        registry_version=record.registry_version,
-        raw_sha256=record.raw_sha256,
-        source_channel=record.source_channel,
-        schema_version=record.schema_version,
-        ts_event=retrieved_at_ns,
+    records = _load_climate_day_records(
+        weather_catalog_root,
+        stations=("NYC", "MIA"),
+        climate_day=CLIMATE_DAY,
+    )
+    return _select_highest_revision_readings(
+        records,
+        stations=("NYC", "MIA"),
+        require_final=False,
+        raise_on_missing=True,
+        filter_superseded=True,
+        missing_context=str(weather_catalog_root),
     )
 
 
@@ -1354,13 +1383,13 @@ def _load_climate_day_records(
 ) -> list[NwsClimateDay]:
     """Every non-superseded `NwsClimateDay` for `climate_day`, at its REAL ts_init.
 
-    NOT restamped. The legacy path restamps because its real retrieval
-    timestamps fall OUTSIDE the tape window; on a live capture that spans the
-    morning final prints they fall INSIDE it, so the honest wiring is to feed
-    them exactly where they landed. Sorted by `ts_init` for readability only
-    -- `BacktestEngine.add_data` sorts by `ts_init` itself
-    (`backtest/engine.pyx:903`), and `ts_event` is never read on the replay
-    path.
+    NOT restamped. The default branch does not feed these records to the
+    engine at all: their real retrieval timestamps fall outside that tape's
+    decision window. A live capture that spans the morning final prints feeds
+    this same list, at these timestamps, because those prints land inside its
+    window. Sorted by `ts_init` for readability only -- `BacktestEngine.add_data`
+    sorts by `ts_init` itself (`backtest/engine.pyx:903`), and `ts_event` is
+    never read on the replay path.
     """
     records: list[NwsClimateDay] = []
     for station in stations:
@@ -1378,24 +1407,24 @@ def _settled_readings(records: Sequence[NwsClimateDay]) -> dict[str, int]:
 
     This is the SETTLEMENT truth for the run: the venue settles weather
     contracts on the NWS Daily Climate Report, and only the final issuance is
-    settlement-grade (`nws-cli-settlement`). Raises rather than guessing.
+    settlement-grade (`nws-cli-settlement`). A station with no final print is
+    omitted, not an exception -- :func:`_run_live_capture` turns that gap into
+    its ``REFUSAL: no FINAL print`` exit. A selected final whose ``tmax_f`` is
+    ``None`` still raises ``LookupError``.
+
+    ``is_superseded`` is deliberately NOT consulted (``filter_superseded=
+    False``): see the ``filter_superseded`` note on
+    :func:`_select_highest_revision_readings` and
+    ``breezy.domain.nws_climate_day.NwsClimateDay`` (``is_superseded``).
     """
-    best: dict[str, NwsClimateDay] = {}
-    for record in records:
-        if not record.is_final:
-            continue
-        current = best.get(record.station)
-        if current is None or record.revision_seq > current.revision_seq:
-            best[record.station] = record
-    readings: dict[str, int] = {}
-    for station, record in best.items():
-        if record.tmax_f is None:
-            raise LookupError(
-                f"{station} {record.climate_day.isoformat()} final print carries no "
-                f"tmax_f (flagged missing/trace); refusing to fabricate a settlement",
-            )
-        readings[station] = record.tmax_f
-    return readings
+    observed, _chosen = _select_highest_revision_readings(
+        records,
+        stations=sorted({record.station for record in records}),
+        require_final=True,
+        raise_on_missing=False,
+        filter_superseded=False,
+    )
+    return observed
 
 
 def _print_lock_gate_records(
@@ -1760,7 +1789,44 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(ti.quotes)} quote rows, station={ti.facts.settlement_station}",
         )
 
-    real_observed, real_records = _load_real_observations(args.weather_catalog_root)
+    records = _load_climate_day_records(
+        args.weather_catalog_root,
+        stations=("NYC", "MIA"),
+        climate_day=CLIMATE_DAY,
+    )
+    decision_ts_init_ns = (
+        max(ti.last_market_data_ts_init for ti in tape_instruments) + _ONE_SECOND_NS
+    )
+    try:
+        assert_available_before_decision(
+            records,
+            decision_ts_init_ns=decision_ts_init_ns,
+            context="run_weather_strategy_backtests.main default branch",
+        )
+        print(
+            "FINDING: assert_available_before_decision did not raise for "
+            f"{len(records)} climate-day record(s). They are still withheld "
+            "from the engine feed.",
+        )
+    except LookAheadRecordError as exc:
+        excluded = len(exc.offending_records)
+        print(
+            f"CONFIRMED: {excluded} climate-day record(s) excluded from the engine "
+            "feed — real ts_init is after the last decision instant",
+        )
+        if excluded != len(records):
+            print(
+                f"FINDING: {excluded} of {len(records)} climate-day record(s) "
+                "are after the last decision instant; the rest are withheld too.",
+            )
+    real_observed, _real_records = _select_highest_revision_readings(
+        records,
+        stations=("NYC", "MIA"),
+        require_final=False,
+        raise_on_missing=True,
+        filter_superseded=True,
+        missing_context=str(args.weather_catalog_root),
+    )
     print(f"REAL preliminary observations for {CLIMATE_DAY.isoformat()}: {real_observed}")
 
     tape_start_ns = min(ti.last_market_data_ts_init for ti in tape_instruments)
@@ -1769,16 +1835,7 @@ def main(argv: list[str] | None = None) -> int:
         min(d.ts_init for ti in tape_instruments for d in ti.depths),
     )
     tape_start_dt = dt.datetime.fromtimestamp(tape_start_ns / 1_000_000_000, tz=dt.UTC)
-    restamped_ns = tape_start_ns - _ONE_SECOND_NS
-    for station, record in real_records.items():
-        print(
-            f"CONSTRUCTED: restamping {station} NwsClimateDay retrieved_at_ns "
-            f"{record.retrieved_at_ns} -> {restamped_ns} (real value fell outside "
-            f"the tape window; tmax_f/is_final/revision_seq unchanged)",
-        )
-    weather_data = as_backtest_data(
-        [_restamp_climate_day(record, restamped_ns) for record in real_records.values()],
-    )
+    weather_data: list[Any] = []
 
     closes = [_synthesize_close(ti) for ti in tape_instruments]
     print(f"CONSTRUCTED: synthesized {len(closes)} CONTRACT_EXPIRED closes (one per instrument).")
