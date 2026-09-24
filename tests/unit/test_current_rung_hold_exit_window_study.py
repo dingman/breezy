@@ -16,10 +16,14 @@ instead of a capture.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sys
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
+from typing import Self
 
+import httpx
 import pytest
 from nautilus_trader.model.data import BookOrder, OrderBookDepth10
 from nautilus_trader.model.enums import OrderSide
@@ -27,6 +31,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
+from breezy.settlement.trial_scorer import FilledTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator, RunningMax
 
@@ -38,6 +43,8 @@ if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
 import current_rung_hold_exit_window_study as study_mod
 import exit_window_core as ewc
 import exit_window_report as ewr
+import ma_prelock_winner_ask_study as prelock
+import settlement_alignment_study as settlement
 
 _STD_UTC_OFFSET_HOURS = -8.0  # Pacific standard time, matches SFO
 _STATION = "SFO"
@@ -460,3 +467,214 @@ def test_run_exit_window_study_reads_scored_trials_via_the_pooled_reader(
     assert calls == [scored_dir]
     assert rows == ()
     assert missing == ()
+
+
+# ---------------------------------------------------------------------------
+# Fetch failures are per-station missing inputs, not a crashed run.
+# A total outage (every attempted station) still exits non-zero.
+# ---------------------------------------------------------------------------
+
+_CACHED_CITY = "LAX"
+_FAILED_CITY = "SFO"
+_FETCH_CLIMATE_DAY = "2026-01-15"
+
+
+class _StatusClient:
+    """Stand-in for ``httpx.Client``. ``get`` never touches the network."""
+
+    def __init__(self, status_code: int) -> None:
+        self._status_code = status_code
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def get(self, url: str, *, timeout: float) -> httpx.Response:
+        request = httpx.Request("GET", url)
+        return httpx.Response(self._status_code, request=request)
+
+
+class _TransportErrorClient:
+    """Stand-in whose ``get`` raises ``httpx.TransportError`` (no status)."""
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def get(self, url: str, *, timeout: float) -> httpx.Response:
+        raise httpx.ConnectError("synthetic connection reset")
+
+
+def _synthetic_trial(city: str) -> FilledTrial:
+    instrument_id = f"{city.lower()}-86-87.POLYMARKET_US"
+    return FilledTrial(
+        trial_id=f"synthetic:{city}:{_FETCH_CLIMATE_DAY}:{instrument_id}",
+        station=city,
+        climate_day=_FETCH_CLIMATE_DAY,
+        instrument_id=instrument_id,
+        bucket=WeatherBucketFacts(
+            settlement_station=city,
+            climate_day=_CLIMATE_DAY,
+            measure=Measure.HIGH,
+            lower_f=86,
+            upper_f=87,
+        ),
+        fill_px=Decimal("0.40"),
+        fee=Decimal("0.02"),
+        qty=Decimal(1),
+        filled_at_ns=_ns_at(14, 0),
+        entry_ask=Decimal("0.40"),
+        scheduled_release_at_ns=_ns_at(18, 0),
+    )
+
+
+def _depths(
+    *, catalog_root: Path, instrument_ids: Sequence[str],
+) -> dict[str, tuple[OrderBookDepth10, ...]]:
+    del catalog_root
+    return {
+        instrument_id: (
+            _depth(
+                bids=(("0.05", "5"),),
+                asks=(),
+                ts_ns=_ns_at(15, 0),
+                instrument_id=instrument_id,
+            ),
+        )
+        for instrument_id in instrument_ids
+    }
+
+
+def _install_offline_study_fakes(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
+    """No sqlite, no catalog, no network. The client is the only fetch seam."""
+
+    def _trials(
+        state_db: Path,
+        *,
+        family_prefix: str,
+        city: str,
+        cli_location: str,
+        since_climate_day: str,
+        stations: Sequence[str],
+    ) -> tuple[tuple[FilledTrial, ...], tuple[object, ...], dict[str, object], dict[str, object]]:
+        del state_db, family_prefix, cli_location, since_climate_day, stations
+        return (_synthetic_trial(city),), (), {}, {}
+
+    # httpx is imported by the study module and is not part of its public surface.
+    httpx_in_study = study_mod.httpx  # type: ignore[attr-defined]
+    monkeypatch.setattr(httpx_in_study, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(study_mod, "read_filled_trials_state_db", _trials)
+    monkeypatch.setattr(
+        study_mod, "_read_bucket_facts_by_instrument_id", lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        study_mod, "load_settled_tmax_for_day", lambda **kwargs: (None, 0, "synthetic"),
+    )
+    monkeypatch.setattr(study_mod, "_load_depth_frames", _depths)
+
+
+def _seed_cached_asos(cache_dir: Path, city: str) -> None:
+    spec = next(spec for spec in settlement.load_sites() if spec.city == city)
+    url = settlement.asos_url(
+        spec.iem_asos_id, prelock.ASOS_FETCH_START, prelock.ASOS_FETCH_END,
+    )
+    path = settlement.cache_path_for_url(cache_dir, url, ".txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Header only: a cache hit with no METAR rows. The row still builds from
+    # the stubbed depth tape; nothing here is a live observation.
+    path.write_text("station,valid,metar\n", encoding="utf-8")
+
+
+def _study_argv(tmp_path: Path, *, cache_dir: Path) -> list[str]:
+    catalog = tmp_path / "catalog"
+    catalog.mkdir(exist_ok=True)
+    return [
+        "--state-db", str(tmp_path / "state.sqlite"),
+        "--stations", _FAILED_CITY, _CACHED_CITY,
+        "--since-climate-day", _FETCH_CLIMATE_DAY,
+        "--catalog-root", str(catalog),
+        "--scored-trials-dir", str(tmp_path / "scored"),
+        "--asos-cache-dir", str(cache_dir),
+        "--obs-source", "fetch",
+        "--depth-source", "catalog",
+        "--live-catalog-root", str(tmp_path / "live"),
+        "--run-stamp", "synthetic-fetch",
+        "--out-root", str(tmp_path / "out"),
+    ]
+
+
+def test_one_station_429_is_missing_and_the_cached_station_still_produces_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+    )
+
+    assert [row.position.station for row in rows] == [_CACHED_CITY]
+    failed = [item for item in missing if _FAILED_CITY in item]
+    assert failed
+    assert all("429" in item for item in failed)
+    assert study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir)) == 0
+
+
+def test_a_transport_error_on_one_station_is_missing_and_the_cached_station_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _TransportErrorClient())
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+    )
+
+    assert [row.position.station for row in rows] == [_CACHED_CITY]
+    failed = [item for item in missing if _FAILED_CITY in item]
+    assert failed
+    assert all("ConnectError" in item for item in failed)
+
+
+def test_every_station_429_exits_non_zero_and_names_each_station(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    cache_dir.mkdir()
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir))
+
+    assert code != 0
+    report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    missing = payload["missing_inputs"]
+    for city in (_FAILED_CITY, _CACHED_CITY):
+        named = [item for item in missing if city in item and "429" in item]
+        assert named, missing

@@ -23,7 +23,12 @@ Reads:
   write-shaped HTTP verb, so this module stays clear of the write-egress
   firewall scan) and writes the result into the cache so the next run is
   offline. A cache miss under ``cache`` is reported as a missing input,
-  never fabricated.
+  never fabricated. An HTTP or transport failure on one station's fetch is
+  likewise a missing input (the station and status are named) and the other
+  stations still run. ``fetch_text_cached`` itself still raises, so other
+  callers are unchanged. The process exits non-zero only when every station
+  that attempted a fetch failed and no station loaded ASOS text, so a total
+  outage still trips the unit's OnFailure alert. A partial outage exits 0.
 * Each instrument's captured Depth10 frames, ``--depth-source
   {catalog,staged}`` (default: auto-select per position). ``catalog``: the
   committed quote-tape ``ParquetDataCatalog`` (``current_rung_hold_monitor_
@@ -391,6 +396,32 @@ def _resolve_settlement(
     )
 
 
+class _TotalAsosFetchOutage(Exception):
+    """Every station this run tried to fetch failed, and none loaded from cache.
+
+    Carries the rows and missing-input list already collected so ``main`` can
+    still write the report, then exit non-zero. A partial outage does not
+    raise: the failed stations are ordinary ``missing`` entries.
+    """
+
+    def __init__(
+        self, rows: tuple[PositionExitRow, ...], missing: tuple[str, ...],
+    ) -> None:
+        super().__init__("every attempted ASOS station fetch failed")
+        self.rows = rows
+        self.missing = missing
+
+
+def _asos_fetch_failure(city: str, iem_asos_id: str, exc: httpx.HTTPError) -> str:
+    """One station's fetch failure, named for the report's missing section."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{city}: ASOS fetch failed for {iem_asos_id} (HTTP {exc.response.status_code})"
+    return (
+        f"{city}: ASOS fetch failed for {iem_asos_id} "
+        f"(transport error: {type(exc).__name__})"
+    )
+
+
 def run_exit_window_study(
     *,
     state_db: Path,
@@ -406,7 +437,11 @@ def run_exit_window_study(
     """Build one exit-window row per filled position across ``stations``.
 
     Returns ``(rows, missing)`` -- ``missing`` names inputs that could not be
-    resolved, reported rather than fabricated.
+    resolved, reported rather than fabricated. A per-station HTTP or transport
+    failure is one of those missing inputs. When every attempted fetch failed
+    and no station loaded ASOS text, raises :class:`_TotalAsosFetchOutage`
+    instead of returning (``main`` turns that into a non-zero exit after
+    writing the report).
     """
     config = CurrentRungHoldConfig(stations=tuple(stations))
     fee_coefficient = config.required_fee_coefficient
@@ -425,6 +460,12 @@ def run_exit_window_study(
 
     rows: list[PositionExitRow] = []
     missing: list[str] = []
+    #: Stations whose ASOS text loaded (cache hit or a successful fetch) versus
+    #: stations whose fetch raised. A total outage is "at least one fetch failed
+    #: and nothing loaded" -- a cache hit is not a failed attempt, so one cached
+    #: station plus one HTTP 429 is a partial outage and does not raise.
+    loaded_stations = 0
+    failed_fetches = 0
     #: `no_taken_latch`/`ambiguous_latch` exclusions carry an empty
     #: `station` by design and are emitted IDENTICALLY by every city's
     #: invocation (`read_filled_trials_state_db`'s own docstring) -- keyed
@@ -479,9 +520,14 @@ def run_exit_window_study(
                 **settlement_catalog_bucket_by_instrument,
             }
 
-            station_text = _station_asos_text(
-                cache_dir=asos_cache_dir, spec=spec, obs_source=obs_source, client=client,
-            )
+            try:
+                station_text = _station_asos_text(
+                    cache_dir=asos_cache_dir, spec=spec, obs_source=obs_source, client=client,
+                )
+            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+                failed_fetches += 1
+                missing.append(_asos_fetch_failure(city, spec.iem_asos_id, exc))
+                continue
             if station_text is None:
                 missing.append(
                     f"{city}: ASOS cache miss for {spec.iem_asos_id} (window "
@@ -489,6 +535,7 @@ def run_exit_window_study(
                     "to populate it",
                 )
                 continue
+            loaded_stations += 1
             station_observations = _station_observations(spec=spec, text=station_text)
 
             accumulator_by_day: dict[dt.date, RunningExtremeAccumulator] = {}
@@ -574,7 +621,10 @@ def run_exit_window_study(
                     ),
                 )
 
-    return tuple(rows), tuple(missing)
+    result = (tuple(rows), tuple(missing))
+    if failed_fetches > 0 and loaded_stations == 0:
+        raise _TotalAsosFetchOutage(result[0], result[1])
+    return result
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -608,13 +658,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir: Path = args.out_root / args.run_stamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows, missing = run_exit_window_study(
-        state_db=args.state_db, stations=tuple(args.stations),
-        since_climate_day=args.since_climate_day, catalog_root=args.catalog_root,
-        scored_trials_dir=args.scored_trials_dir, asos_cache_dir=args.asos_cache_dir,
-        obs_source=args.obs_source, depth_source=args.depth_source,
-        live_catalog_root=args.live_catalog_root,
-    )
+    total_fetch_outage = False
+    try:
+        rows, missing = run_exit_window_study(
+            state_db=args.state_db, stations=tuple(args.stations),
+            since_climate_day=args.since_climate_day, catalog_root=args.catalog_root,
+            scored_trials_dir=args.scored_trials_dir, asos_cache_dir=args.asos_cache_dir,
+            obs_source=args.obs_source, depth_source=args.depth_source,
+            live_catalog_root=args.live_catalog_root,
+        )
+    except _TotalAsosFetchOutage as exc:
+        rows, missing = exc.rows, exc.missing
+        total_fetch_outage = True
     summary = build_summary(rows)
     markdown = render_markdown(rows, summary)
     if missing:
@@ -637,6 +692,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[exit-window-study] {len(rows)} position(s); wrote {out_dir}", file=sys.stderr)
     for item in missing:
         print(f"[exit-window-study] MISSING: {item}", file=sys.stderr)
+    if total_fetch_outage:
+        print(
+            "[exit-window-study] every attempted ASOS fetch failed; no station loaded",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
