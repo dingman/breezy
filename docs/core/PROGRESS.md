@@ -29,7 +29,7 @@ Everything else is build-side.
 - **G-01 prelim→final revision POWERED FAIL** on MDW/NYC/SFO; interior-bucket strategies dead. `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 - **Lock strategies DEAD (L-9); K1 DEAD at ask ≥2c.** Forecast-family KILL **SUPERSEDED 09-18 by ruling** `docs/evidence/RULING_forecast_edge_family_2026-09-18.md`: `pm_us_crh_fc_v1` Stage 0 per `docs/plans/FORECAST_EDGE_FAMILY_Rev5_2026-09-18.md` (§0.3 binding); arming displaces `pm_us_crh_cont`.
 - **Price history is forward-only; a forecast archive is a CALIBRATION set.** Venue surface = 5 cities × daily HIGH. BL-6 (no NO-side instrument) is SUPERSEDED by the 09-14 operator ruling: NO-side hunting is a requirement (NO-1).
-- **NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT** (`pm_us_crh_cont`, PREREG v3 BINDING, d0 2026-09-12; `pm_us_crh_v2` still REGISTERED). Demonstrated edge NONE; admissible n = 0 after 10 live days; log archive: 10 `OrderSubmitted` / 11 `OrderFilled` as of 09-24 (order 1, 09-05, has no `OrderSubmitted` line in any of its 20 sessions — open escalation, AUD-13). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
+- **NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT** (`pm_us_crh_cont`, PREREG v3 BINDING, d0 2026-09-12; `pm_us_crh_v2` still REGISTERED). Demonstrated edge NONE; admissible n = 0 after 10 live days; 10 orders, 9 fills as of 09-24 (9 durable exec-fill-store records, exact match against real-event log lines net of inferred/relaunch noise; order 1, 09-05, has no `OrderSubmitted` line in any of its 20 sessions — open escalation, AUD-13). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
 - **Readiness audit 2026-09-12** (`docs/evidence/READINESS_AUDIT_2026-09-12.md`): the KILL-clock counter read 0/15 for 09-05..09-11 BY MECHANISM (any-overlap rule + feed-wide gap fan-out; L-38), not by outage; the create-path accept-fill branch has never fired live; v3 has never been fill-replayed; alerts reach nobody.
 
 ---
@@ -77,7 +77,7 @@ diagnostic is inert until the v3 tally receives the count (R-4).
 **KILL clock (truth as of 09-13 14:15Z):** counter 0/15 for 09-05..09-13. Shard-local gap
 accounting works (09-12 in-window overlaps = 0 on all four stations); the day is uncovered because
 ingest stranded its Depth10 (ING-1). Zero-fill / retired-AMBIGUOUS takes are not trials; resolver
-fills are residual. **Live n (09-24):** log archive 10 `OrderSubmitted` / 11 `OrderFilled` (order 1, 09-05, unmatched — AUD-13 escalation), admissible 0.
+fills are residual. **Live n (09-24):** 10 orders, 9 fills (durable exec fill store, exact match against real-event log lines; order 1, 09-05, unmatched — AUD-13 escalation), admissible 0.
 
 **Closed 2026-09-20:** forecast-edge hunt TERMINAL (`RULING_forecast_edge_programme_closes_2026-09-20.md`); `pm_us_crh_rest_v5` folded CLOSED_NOT_REGISTERED; alert delivery shipped (`f97c26f`). Next phase: `docs/plans/POST_FORECAST_PHASE_2026-09-20.md`.
 
