@@ -10,11 +10,16 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import sqlite3
 import sys
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+
+from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import hold_submit_intent_process_lock
+from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_HALT_KEY
 
 _SCRIPT = (
     Path(__file__).resolve().parents[2]
@@ -323,3 +328,239 @@ def test_empty_tape_is_a_real_zero_funnel_distinct_from_a_missing_file(
     assert "e=0" in sink.payloads[0].detail
     assert "no decision tape found" not in sink.payloads[0].detail
     assert "stall=MDW" in sink.payloads[0].detail
+
+
+# ---------------------------------------------------------------------------
+# AUD-03 follow-up: `halt_enforced` (yes/no/unknown), read via the digest's
+# OWN read-only sqlite connection -- never the node's exclusive submit-intent
+# flock (docs/plans/backlog/AUDIT_2026-09-21/AUD-03-FOLLOWUP-a1-digest-line.md,
+# coordinator build decision 2026-09-24).
+# ---------------------------------------------------------------------------
+
+
+def _store_with_halt_value(tmp_path: Path, raw: bytes | None) -> Path:
+    store_path = tmp_path / "exec-state.db"
+    store = SqliteStateStore(store_path)
+    try:
+        if raw is not None:
+            store.set(FAMILY_HALT_KEY, raw)
+    finally:
+        store.close()
+    return store_path
+
+
+def test_read_family_halt_status_is_no_when_the_key_is_absent(tmp_path: Path) -> None:
+    store_path = _store_with_halt_value(tmp_path, None)
+
+    status = _DIGEST.read_family_halt_status(store_path)
+
+    assert status.value == "no"
+    assert status.reason is None
+
+
+def test_read_family_halt_status_is_yes_when_a_halt_is_recorded(tmp_path: Path) -> None:
+    store_path = _store_with_halt_value(
+        tmp_path, b'{"v":1,"reason":"policy_halt","tsNs":1,"detail":"x","evidenceSha256":"a"}'
+    )
+
+    status = _DIGEST.read_family_halt_status(store_path)
+
+    assert status.value == "yes"
+    assert status.reason is None
+
+
+def test_read_family_halt_status_is_no_when_the_halt_was_cleared(tmp_path: Path) -> None:
+    store_path = _store_with_halt_value(tmp_path, b'{"v":1,"state":"cleared"}')
+
+    status = _DIGEST.read_family_halt_status(store_path)
+
+    assert status.value == "no"
+    assert status.reason is None
+
+
+def test_read_family_halt_status_is_unknown_when_the_store_file_is_missing(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist.db"
+
+    status = _DIGEST.read_family_halt_status(missing)
+
+    assert status.value == "unknown"
+    assert status.reason
+    assert "OperationalError" in status.reason
+
+
+def test_read_family_halt_status_is_unknown_when_the_stored_value_is_malformed(
+    tmp_path: Path,
+) -> None:
+    """A real corruption/schema-drift shape: the `state` table's `value`
+    column is declared BLOB, but SQLite's dynamic typing lets a raw writer
+    insert TEXT -- `sqlite3` then returns a `str`, not `bytes`, and
+    `decode_family_halt` must never be handed that silently."""
+    store_path = tmp_path / "exec-state.db"
+    conn = sqlite3.connect(store_path)
+    conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+    conn.execute("INSERT INTO state (key, value) VALUES (?, ?)", (FAMILY_HALT_KEY, "not-bytes"))
+    conn.commit()
+    conn.close()
+
+    status = _DIGEST.read_family_halt_status(store_path)
+
+    assert status.value == "unknown"
+    assert status.reason
+    assert "malformed" in status.reason.lower()
+
+
+def test_read_family_halt_status_is_unknown_when_locked_beyond_the_busy_timeout(
+    tmp_path: Path,
+) -> None:
+    store_path = _store_with_halt_value(tmp_path, None)
+
+    def _always_locked(*args: object, **kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("database is locked")
+
+    status = _DIGEST.read_family_halt_status(store_path, connect=_always_locked)
+
+    assert status.value == "unknown"
+    assert status.reason
+    assert "locked" in status.reason.lower()
+
+
+def test_read_family_halt_status_never_fails_open_to_no_or_closed_to_yes_on_error(
+    tmp_path: Path,
+) -> None:
+    """Never guess a direction on failure -- every error path lands on
+    `unknown`, distinct from both `yes` and `no`."""
+    missing = tmp_path / "does-not-exist.db"
+
+    status = _DIGEST.read_family_halt_status(missing)
+
+    assert status.value not in ("yes", "no")
+
+
+def test_read_family_halt_status_succeeds_while_the_node_holds_the_submit_intent_flock(
+    tmp_path: Path,
+) -> None:
+    """The digest's own read-only sqlite connection must never contend with
+    `breezy.runtime.submit_intent`'s exclusive, node-lifetime-held flock --
+    that flock lives beside the store (`<store>.intent.lock`), a different
+    file from the sqlite store itself."""
+    store_path = _store_with_halt_value(
+        tmp_path, b'{"v":1,"reason":"policy_halt","tsNs":1,"detail":"x","evidenceSha256":"a"}'
+    )
+
+    with hold_submit_intent_process_lock(store_path):
+        status = _DIGEST.read_family_halt_status(store_path)
+
+    assert status.value == "yes"
+    assert status.reason is None
+
+
+# ---------------------------------------------------------------------------
+# `halt_enforced` threaded into the digest's alert detail and artefact.
+# ---------------------------------------------------------------------------
+
+
+def test_digest_detail_reports_halt_enforced_yes() -> None:
+    report = _DIGEST.funnel_for_day([_row(source="quote")])
+    halt = _DIGEST.FamilyHaltStatus(value="yes", reason=None)
+
+    detail = _DIGEST.format_digest_detail(report, climate_day="2026-09-20", halt=halt)
+
+    assert "halt=yes" in detail
+    assert len(detail) <= 200
+
+
+def test_digest_detail_reports_halt_enforced_unknown_with_reason(tmp_path: Path) -> None:
+    report = _DIGEST.funnel_for_day([_row(source="quote")])
+    halt = _DIGEST.FamilyHaltStatus(value="unknown", reason="OperationalError: unable to open")
+
+    detail = _DIGEST.format_digest_detail(report, climate_day="2026-09-20", halt=halt)
+
+    assert "halt=unknown" in detail
+    assert "unable to open" in detail
+    assert len(detail) <= 200
+
+
+def test_digest_detail_drops_the_halt_reason_before_anything_else_when_over_budget() -> None:
+    """The halt reason is free text and the LOWEST-priority field: it is
+    dropped first, ahead of even the existing `why=` reason tally, once the
+    line would exceed MAX_ALERT_DETAIL_CHARS. `halt=<value>` itself is never
+    dropped."""
+    many_reasons = [
+        _row(source="quote", reason=f"reason_number_{i}", illegal_cell=True) for i in range(30)
+    ]
+    report = _DIGEST.funnel_for_day(many_reasons)
+    long_reason = "OperationalError: " + ("x" * 300)
+    halt = _DIGEST.FamilyHaltStatus(value="unknown", reason=long_reason)
+
+    detail = _DIGEST.format_digest_detail(report, climate_day="2026-09-20", halt=halt)
+
+    assert len(detail) <= 200
+    assert "halt=unknown" in detail
+    assert long_reason not in detail
+
+
+def test_digest_detail_omits_halt_entirely_when_none_is_passed() -> None:
+    """Back-compat: existing callers that never pass `halt` see no field."""
+    report = _DIGEST.funnel_for_day([_row(source="quote")])
+
+    detail = _DIGEST.format_digest_detail(report, climate_day="2026-09-20")
+
+    assert "halt=" not in detail
+
+
+def test_main_reports_halt_enforced_unknown_when_the_store_path_does_not_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(json.dumps(_row(source="quote", observed_at_ns=7)) + "\n", encoding="utf-8")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+    missing_store = tmp_path / "does-not-exist.db"
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(out),
+            "--store-path", str(missing_store),
+        ]
+    )
+
+    assert code == 0
+    payload = sink.payloads[0]
+    assert "halt=unknown" in payload.detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["halt_enforced"] == "unknown"
+    assert artefact["halt_reason"]
+
+
+def test_main_reports_halt_enforced_yes_from_a_real_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(json.dumps(_row(source="quote", observed_at_ns=7)) + "\n", encoding="utf-8")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+    store_path = _store_with_halt_value(
+        tmp_path, b'{"v":1,"reason":"policy_halt","tsNs":1,"detail":"x","evidenceSha256":"a"}'
+    )
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(out),
+            "--store-path", str(store_path),
+        ]
+    )
+
+    assert code == 0
+    payload = sink.payloads[0]
+    assert "halt=yes" in payload.detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["halt_enforced"] == "yes"
+    assert artefact["halt_reason"] is None

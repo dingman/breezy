@@ -102,6 +102,7 @@ __all__ = [
     "TrialDayLatchError",
     "TrialDayRecord",
     "TrialDayRecordCorrupt",
+    "decode_family_halt",
     "open_trial_day_latch",
     "refuse_if_sibling_leg_traded",
     "startup_evidence_confirms_absent_flat",
@@ -299,6 +300,22 @@ HALT_CLEARED_KEY_PREFIX: Final[str] = "continuous_rung_hold/halt_cleared/"
 #: distinguishable value rather than an absent key, mirroring
 #: `_INFLIGHT_CLEARED` above.
 _HALT_CLEARED_MARKER: Final[bytes] = b'{"v":1,"state":"cleared"}'
+
+
+def decode_family_halt(raw: bytes | None) -> bool:
+    """Pure decode of a ``FAMILY_HALT_KEY`` store value: ``True`` iff present
+    and not the ``_HALT_CLEARED_MARKER`` sentinel.
+
+    No I/O, no lock, no ``TrialDayLatch`` instance required -- this is the
+    SINGLE SOURCE OF TRUTH :meth:`TrialDayLatch.is_family_halted` itself
+    calls after its own ``_require_held()`` check. A caller that does not
+    (and must not) hold this family's exclusive submit-intent latch --
+    ``scripts/analysis/decision_funnel_daily_digest.py``'s ``halt_enforced``
+    field, reading the SAME key through its own separate, read-only sqlite
+    connection -- calls this function directly instead of duplicating the
+    two-line comparison.
+    """
+    return raw is not None and raw != _HALT_CLEARED_MARKER
 
 
 def _decode_halt_payload(raw: bytes) -> dict[str, object]:
@@ -1050,15 +1067,16 @@ class TrialDayLatch:
         identically here; this method cannot and does not distinguish which
         one fired.
 
-        Checks against ``_HALT_CLEARED_MARKER`` rather than mere key
-        presence: the store has no delete, so :meth:`clear_family_halt`
-        leaves a distinguishable "cleared" value in place rather than an
-        absent key (see that method and ``_INFLIGHT_CLEARED`` above for the
-        same pattern).
+        The decode itself is :func:`decode_family_halt` -- see that
+        function for the ``_HALT_CLEARED_MARKER`` rationale. This method
+        only adds the ``_require_held()`` discipline every other method on
+        this class carries; a caller with no legitimate held latch (AUD-03's
+        daily digest, reading through its OWN read-only sqlite connection,
+        never this latch's exclusive flock) calls :func:`decode_family_halt`
+        directly instead.
         """
         self._require_held()
-        raw = self._store.get(FAMILY_HALT_KEY)
-        return raw is not None and raw != _HALT_CLEARED_MARKER
+        return decode_family_halt(self._store.get(FAMILY_HALT_KEY))
 
     def is_day_budget_exhausted(self, utc_day: str) -> bool:
         """``True`` once the exec client has marked ``utc_day`` (a

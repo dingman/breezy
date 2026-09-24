@@ -35,9 +35,11 @@ from score_live_trials import (
 
 from breezy.persistence.realized_draws import (
     RealizedDrawsSchemaDrift,
+    admissible_scored_trials,
     load_realized_draws,
 )
-from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA
+from breezy.persistence.residual_fills import residual_trial_ids
+from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA, read_scored_trials
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.settlement.current_rung_hold_v2 import combine_station_day
 from tests.unit.test_score_live_trials_state_db_source import (
@@ -53,6 +55,16 @@ from tests.unit.test_score_live_trials_state_db_source import (
 )
 
 _LIVE_STORE = Path.home() / ".local/share/breezy/derived/scored_trials/pm_us_crh_cont"
+
+#: A frozen, read-only snapshot of `_LIVE_STORE` as it stood on 2026-09-17
+#: (the two 2026-09-16 scoring runs plus the 2026-09-17T14:15 run, before the
+#: store grew further) -- copied verbatim (parquet + `excluded_fills.jsonl` +
+#: `fill_order.jsonl`, real files written by the real scorer, never
+#: hand-built) so the count-pinned assertions below stay hermetic instead of
+#: drifting as the live store keeps accumulating new scoring runs.
+_FROZEN_LIVE_SNAPSHOT = (
+    Path(__file__).resolve().parents[1] / "fixtures/scored_trials/pm_us_crh_cont_2026-09-17"
+)
 
 
 def _run_real_scorer(tmp_path: Path, store_path: Path, **overrides: Any) -> Path:
@@ -247,18 +259,48 @@ def test_a_file_missing_only_the_back_compat_optional_bucket_source_still_loads(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _LIVE_STORE.exists(), reason="no live scored-trial store on this host")
-def test_the_real_live_store_loads_three_admissible_fills_in_two_station_day_draws() -> None:
-    """The 2026-09-16 live `pm_us_crh_cont` store: FOUR scored parquet rows,
-    one of which (the MIA `^no` trial) carries a `no_side_first_order_residual`
-    exclusion in the sidecar. PREREG §5 admits THREE."""
-    loaded = load_realized_draws(_LIVE_STORE)
+def test_the_frozen_2026_09_17_snapshot_loads_three_admissible_fills_in_two_station_day_draws() -> (
+    None
+):
+    """Hermetic pin of the 2026-09-16/17 live `pm_us_crh_cont` store: FOUR
+    scored parquet rows, one of which (the MIA `^no` trial) carries a
+    `no_side_first_order_residual` exclusion in the sidecar. PREREG §5 admits
+    THREE. This is `_FROZEN_LIVE_SNAPSHOT` -- a byte-for-byte copy of the real
+    store as of 2026-09-17T14:15Z -- rather than `_LIVE_STORE` itself, because
+    the live store is append-only and keeps growing (it held 7 scored rows by
+    2026-09-24); pinning counts against a live, growing store is not
+    hermetic. See `test_the_real_live_store_never_admits_a_residual_trial_id`
+    below for the structural (non-count) invariant checked against the
+    CURRENT live store."""
+    loaded = load_realized_draws(_FROZEN_LIVE_SNAPSHOT)
 
     assert loaded.n_admissible_fills == 3
     assert loaded.n_dropped_residual == 1
     assert loaded.station_days == (("MDW", "2026-09-15"), ("SFO", "2026-09-15"))
     assert tuple(d.n_constituents for d in loaded.draws) == (2, 1)
     assert all(row.side == "yes" for row in loaded.stratum_rows)
+
+
+@pytest.mark.skipif(not _LIVE_STORE.exists(), reason="no live scored-trial store on this host")
+def test_the_real_live_store_never_admits_a_residual_trial_id() -> None:
+    """Structural invariant (PREREG v3 §5), not a count: no matter how many
+    rows the live store accumulates, (1) a trial_id the sidecar names
+    residual must never appear in the admissible set, and (2) every scored
+    row is accounted for exactly once across admissible / dropped-residual /
+    dropped-excluded-reason. Runs against the REAL, growing store and pins
+    no count -- the frozen, count-pinned snapshot of this same store as of
+    2026-09-17 is
+    `test_the_frozen_2026_09_17_snapshot_loads_three_admissible_fills_in_two_station_day_draws`
+    above."""
+    loaded = load_realized_draws(_LIVE_STORE)
+    rows = read_scored_trials(_LIVE_STORE)
+    residual = residual_trial_ids(_LIVE_STORE)
+    admissible = admissible_scored_trials(rows, residual_trial_ids=residual)
+
+    assert not ({trial.trial_id for trial in admissible} & residual)
+    assert loaded.n_scored_rows == (
+        loaded.n_admissible_fills + loaded.n_dropped_residual + loaded.n_dropped_excluded_reason
+    )
 
 
 # ---------------------------------------------------------------------------
