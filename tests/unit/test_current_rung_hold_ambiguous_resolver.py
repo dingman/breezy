@@ -94,6 +94,17 @@ def _ambiguous_create_body(order_id: str) -> bytes:
     return json.dumps({"id": order_id, "executions": []}).encode("utf-8")
 
 
+#: The venue's REAL terminal-order shape (2026-09-24 production evidence,
+#: venue order CP05MNWMAWP6): ``leavesQuantity=0`` regardless of how much of
+#: ``quantity`` filled -- mirrors
+#: ``reports._TERMINAL_ORDER_STATUSES``/``ORDER_STATE_TO_ORDER_STATUS``, kept
+#: as raw venue strings here since this module never imports the mapped
+#: enum. Used only to pick ``_order_get_body``'s DEFAULT ``leavesQuantity``.
+_TERMINAL_STATES_FOR_LEAVES_DEFAULT = frozenset(
+    {"ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED", "ORDER_STATE_EXPIRED"}
+)
+
+
 def _order_get_body(
     order_id: str,
     *,
@@ -101,7 +112,15 @@ def _order_get_body(
     state: str,
     cum_quantity: float,
     avg_px: str | None = None,
+    leaves_quantity: float | None = None,
 ) -> dict[str, Any]:
+    """``leaves_quantity`` defaults to the venue's real shape: 0 for a
+    terminal ``state`` (regardless of how ``cum_quantity`` split against
+    ``quantity``), or the ``quantity - cumQuantity`` identity for a live
+    state. Override explicitly only to construct a deliberately
+    inconsistent body."""
+    if leaves_quantity is None:
+        leaves_quantity = 0 if state in _TERMINAL_STATES_FOR_LEAVES_DEFAULT else 1 - cum_quantity
     order: dict[str, Any] = {
         "id": order_id,
         "marketSlug": slug,
@@ -111,7 +130,7 @@ def _order_get_body(
         "price": {"value": "0.40", "currency": "USD"},
         "quantity": 1,
         "cumQuantity": cum_quantity,
-        "leavesQuantity": 1 - cum_quantity,
+        "leavesQuantity": leaves_quantity,
         "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
         "state": state,
         "createTime": TS_EVENT_TEXT,
@@ -438,6 +457,55 @@ async def test_a_get_confirmed_terminal_zero_with_no_long_retires_and_trues_up_t
         remaining_notional, remaining_count = live_trading_budget_remaining(client._permit)
         assert remaining_count == 2
         assert remaining_notional == Decimal("1000.00")
+        assert current.intent_id not in client._ambiguous_bookings
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_get_confirmed_expired_zero_fill_with_real_venue_leaves_retires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """2026-09-24 production evidence (venue order CP05MNWMAWP6): a
+    read-only GET of the stuck order returned
+    ``state=ORDER_STATE_EXPIRED, quantity=1, cumQuantity=0,
+    leavesQuantity=0`` -- the venue's REAL terminal-order shape, not the
+    ``leaves == quantity - cumQuantity`` identity every other test in this
+    module builds via ``_order_get_body``'s default formula. Before the fix,
+    ``parse_order_status_report`` refused this body (1 - 0 = 1 != 0), the
+    resolver logged ``mapping_error`` and stayed AMBIGUOUS forever, and the
+    submit intent never retired -- the exact shape that blocked the
+    supervisor from launching the node. This proves the resolver now
+    RETIRES it as a terminal zero-fill (Resolution D) instead."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        # eof-complete, no LONG anywhere.
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, (
+            "must retire, not stay AMBIGUOUS, on the venue's real terminal "
+            "leavesQuantity=0 shape"
+        )
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
         assert current.intent_id not in client._ambiguous_bookings
         await client._disconnect()
 
