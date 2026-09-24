@@ -56,13 +56,19 @@ at ask 0.99, which BL-19 s8.2 computes as **-0.003698** after one tick of
 slippage. Keeping the terms separate, named, and pure means the total cost is
 never writable, only derivable.
 
-``slippage_prob`` is UNMEASURED. See
-``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`` s2 and s8.2, and
-the instrumentation obligation in s8.5 that is expected to replace the 0.01
-placeholder with a figure derived from realised fills. Callers put
-``fee_coefficient``, ``fee_prob`` and ``slippage_prob`` on the emitted
-decision's metadata precisely so that replacement is possible offline, without
-re-running a capture.
+``slippage_prob`` was UNMEASURED as of 2026-09-01. See
+``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`` s2 and s8.2 for
+the original placeholder's derivation, and AUD-12a's
+``docs/evidence/MEASURED_SLIPPAGE_2026-09-24.md`` for the first
+fills-derived measurement (the narrower sub-question this module's own
+docstring names, joining realised fill price to decision-time ask): n=8
+included fills, mean/median/range 0.0000, honestly too small to support a
+confidence interval that excludes this ``0.01`` placeholder -- the constant
+below is UNCHANGED, since a measured mean of 0.0000 gives no reason to
+believe ``0.01`` is unsafe-low. Callers put ``fee_coefficient``, ``fee_prob``
+and ``slippage_prob`` on the emitted decision's metadata precisely so that a
+future, better-powered replacement is possible offline, without re-running a
+capture.
 
 VENUE NEUTRALITY
 ----------------
@@ -187,10 +193,12 @@ def trade_cost_prob(
 
     The two terms are kept SEPARATE and separately named because they behave
     oppositely as ``p -> 1``: the fee vanishes (0.000594 at 0.99), the
-    execution term does not. ``slippage_prob`` is UNMEASURED -- see
-    ``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`` s2 and s8.2,
-    and the instrumentation in s8.5 that is expected to replace the 0.01
-    placeholder with a figure derived from realised fills.
+    execution term does not. ``slippage_prob`` was UNMEASURED as of
+    2026-09-01 -- see ``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md``
+    s2 and s8.2 for the placeholder's derivation, and AUD-12a's
+    ``docs/evidence/MEASURED_SLIPPAGE_2026-09-24.md`` for the first
+    fills-derived measurement (n=8, mean 0.0000, honestly underpowered; the
+    ``0.01`` placeholder is unchanged).
 
     Raises
     ------
