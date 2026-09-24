@@ -36,7 +36,12 @@ from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
-from breezy.runtime.settings import ORDERS_ENABLED_VAR, SettingsError, load_trade_settings
+from breezy.runtime.settings import (
+    ORDERS_ENABLED_VAR,
+    SENDING_FAMILY_ID_VAR,
+    SettingsError,
+    load_trade_settings,
+)
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     SubmitIntentLockError,
@@ -452,6 +457,19 @@ def main() -> int:
     )
 
     _ensure_boot_logging_visible()
+
+    # AUD-16b (coordinator ruling): the FIRST boot log line, before either
+    # permit is minted, so a boot that dies at permit mint still carries its
+    # family identity. Deliberately minimal -- the raw declared value only,
+    # via the same env var settings.py resolves BREEZY_SENDING_FAMILY_ID
+    # from (SENDING_FAMILY_ID_VAR); no manifest load, no sha, no validation
+    # side effects, never an operator-reserved variable. The validated
+    # boot_family line (family_id + manifest_sha256) still logs from run(),
+    # once the manifest is actually loaded.
+    _boot_logger.info(
+        "boot_family_declared id=%s",
+        os.environ.get(SENDING_FAMILY_ID_VAR, "none") or "none",
+    )
 
     permit = None
     try:

@@ -5,17 +5,18 @@ Reuses the ``run()`` harness from ``test_trade_cli_current_rung_hold.py``
 (``RecordingNode``, ``_trade_env``, ``_operator_order_ceiling``,
 ``_write_today_catalog``, ``_install_family``) rather than redefining it.
 
-Not implemented here: ``test_the_family_line_precedes_the_permit_lines``.
-``app/trade.py::main`` (the sole production caller of ``run()``, per
-``pyproject.toml``'s ``breezy-trade`` entry point) mints both permits and
-logs every permit-related line BEFORE it calls ``run()`` -- the function
-this manifest load and its new log line live in. A boot that exits during
-permit minting never reaches ``run()`` at all, so no placement inside
-``run()`` can precede those lines; writing this test would either fabricate
-a false-green assertion or pin a RED that can never go GREEN without moving
-manifest resolution into ``main()`` ahead of permit issuance, which is out
-of this item's scope. See the AUD-16 return report for the coordinator
-decision.
+Coordinator ruling (2026-09-24): the ordering invariant ("a boot that dies
+at permit mint still carries its family identity") is satisfied WITHOUT
+touching permit minting, by a second, separate line -- ``boot_family_declared``
+-- logged as the FIRST thing ``app/trade.py::main`` does, before either
+permit is minted. It carries only the raw declared
+``BREEZY_SENDING_FAMILY_ID`` value (no manifest load, no sha, no validation
+side effects); the validated ``boot_family`` line (with ``manifest_sha256``)
+still logs from ``run()`` once the manifest actually loads. The two tests
+below (``test_the_family_line_precedes_the_permit_lines`` and
+``test_a_permit_mint_failure_still_leaves_the_declared_line_in_the_log``)
+exercise ``main()`` end-to-end, reusing the harness from
+``test_app_trade_main_permit_logging.py``.
 """
 
 from __future__ import annotations
@@ -28,15 +29,27 @@ from pathlib import Path
 
 import pytest
 
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
+from breezy.adapters.polymarket_us.safety import TRADING_ENABLED_ENV_VAR
 from breezy.app import trade as trade_module
 from breezy.app.trade import run
 from breezy.runtime.settings import (
     LIVE_OBSERVATIONS_VAR,
+    ORDERS_ENABLED_VAR,
     SENDING_FAMILY_ID_VAR,
     TRADE_CATALOG_ROOT_VAR,
+    SettingsError,
 )
-from breezy.runtime.trade_cli import EXIT_OK
+from breezy.runtime.trade_cli import EXIT_OK, EXIT_RUNTIME_ERROR
 from breezy.runtime.trade_supervisor_core import COMPOSITION_KIND_SUBSCRIBED_MARKERS
+from tests.unit.operator_control_env import operator_control_env
+from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_verified,  # noqa: F401 -- reused fixture
+)
 from tests.unit.test_trade_cli_current_rung_hold import (  # noqa: F401 -- reused harness
     RecordingNode,
     _clean_nodes,
@@ -208,3 +221,88 @@ def test_the_family_line_is_not_a_supervisor_readiness_marker() -> None:
     }
     for marker in COMPOSITION_KIND_SUBSCRIBED_MARKERS.values():
         assert "boot_family" not in marker
+
+
+# ---------------------------------------------------------------------------
+# Coordinator ruling 2026-09-24: ``boot_family_declared`` is main()'s FIRST
+# log line, logged before either permit is minted, so a boot that dies at
+# permit mint still carries its declared family identity.
+# ---------------------------------------------------------------------------
+
+
+def test_the_family_line_precedes_the_permit_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    enable_operator_gate(monkeypatch)
+    monkeypatch.setenv(SENDING_FAMILY_ID_VAR, "pm_us_crh_v2")
+    monkeypatch.setattr(trade_module, "run", lambda **kwargs: 0)
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        caplog.at_level(logging.INFO),
+    ):
+        trade_module.main()
+
+    declared = [
+        r for r in caplog.records if r.getMessage() == "boot_family_declared id=pm_us_crh_v2"
+    ]
+    permit_related = [
+        r
+        for r in caplog.records
+        if r is not None and "permit" in r.getMessage() and r not in declared
+    ]
+    assert len(declared) == 1, caplog.text
+    assert permit_related, "no permit-related line was logged; the test setup is wrong"
+    assert caplog.records.index(declared[0]) < min(
+        caplog.records.index(r) for r in permit_related
+    ), caplog.text
+
+
+def test_a_boot_with_no_declared_family_logs_the_none_sentinel_first(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv(SENDING_FAMILY_ID_VAR, raising=False)
+    monkeypatch.delenv(TRADING_ENABLED_ENV_VAR, raising=False)
+    monkeypatch.setattr(trade_module, "run", lambda **kwargs: 0)
+
+    with caplog.at_level(logging.INFO):
+        trade_module.main()
+
+    assert caplog.records[0].getMessage() == "boot_family_declared id=none"
+
+
+def _raising_load_trade_settings() -> object:
+    raise SettingsError("fake settings load failure")
+
+
+def test_a_permit_mint_failure_still_leaves_the_declared_line_in_the_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A boot that dies fatally while minting permits (settings load fails
+    while orders were requested -- ``run()`` is never reached, see
+    ``test_app_trade_main_permit_logging.py``) still carries the declared
+    family id, because that line is logged before permit minting begins."""
+    monkeypatch.delenv(TRADING_ENABLED_ENV_VAR, raising=False)
+    monkeypatch.setenv(ORDERS_ENABLED_VAR, "1")
+    monkeypatch.setenv(SENDING_FAMILY_ID_VAR, "pm_us_crh_v2")
+    monkeypatch.setattr(trade_module, "load_trade_settings", _raising_load_trade_settings)
+
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        trade_module, "run", lambda **kwargs: (captured.append(kwargs), 0)[1]
+    )
+
+    with caplog.at_level(logging.INFO):
+        exit_code = trade_module.main()
+
+    assert exit_code == EXIT_RUNTIME_ERROR
+    assert captured == []  # run() never reached -- the boot died at permit mint
+    declared = [
+        r for r in caplog.records if r.getMessage() == "boot_family_declared id=pm_us_crh_v2"
+    ]
+    assert len(declared) == 1, caplog.text
