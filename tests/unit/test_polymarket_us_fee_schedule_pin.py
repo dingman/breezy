@@ -276,3 +276,41 @@ def test_both_guard_copies_return_none_on_unknown_and_maker_fee_on_known() -> No
         method: Any = owner.__dict__["_guarded_fee_coefficient"]
         assert method(None, unknown) is None
         assert method(None, known) == known.maker_fee
+
+
+# AUD-13b (plan §7 13b step 1d, §8 item 18): the dated reconciliation fee
+# schedule is declared ONLY in `fees.py`. `STUDY_THETA_BY_VENUE` and
+# `test_every_in_scope_theta_site_agrees_with_its_venue_constant` above are
+# untouched: this is a SEPARATE, src-scoped expected set over the same
+# scanner, never a widening of the study-script census.
+SRC_FEES_PATH = REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "fees.py"
+SRC_EXEC_CLIENT_PATH = (
+    REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "exec" / "client.py"
+)
+SRC_FEE_SCHEDULE_THETA_SITES: frozenset[tuple[str, str, str, Decimal]] = frozenset(
+    {
+        ("polymarket_us", "fees", "DOCUMENTED_TAKER_FEE_COEFFICIENT", Decimal("0.06")),
+        # Enumerated, dated exception: the post-drift taker theta the venue has
+        # charged since 2026-09-17T17:00:00Z, evidenced by
+        # docs/evidence/venue/polymarket_us/FEE_SCHEDULE_PIN_2026-09-18.md
+        # (first drift alert 17:00:00.610319588Z; all six 2026-09-17 offer-tape
+        # rows `fee_coefficient="0.0695"`). Used ONLY by reconciliation's
+        # as-of-fill-time resolver; `DOCUMENTED_TAKER_FEE_COEFFICIENT` stays 0.06.
+        ("polymarket_us", "fees", "_POST_DRIFT_TAKER_FEE_COEFFICIENT", Decimal("0.0695")),
+    }
+)
+
+
+def test_the_dated_fee_schedule_is_declared_only_in_fees_py() -> None:
+    fees_sites = study_theta_sites_from_source(
+        SRC_FEES_PATH.read_text(encoding="utf-8"), module_stem="fees"
+    )
+    added = fees_sites - SRC_FEE_SCHEDULE_THETA_SITES
+    missing = SRC_FEE_SCHEDULE_THETA_SITES - fees_sites
+    assert fees_sites == SRC_FEE_SCHEDULE_THETA_SITES, (
+        f"fees.py theta census drifted; added={sorted(added)!r} missing={sorted(missing)!r}"
+    )
+    client_sites = study_theta_sites_from_source(
+        SRC_EXEC_CLIENT_PATH.read_text(encoding="utf-8"), module_stem="client"
+    )
+    assert client_sites == frozenset(), client_sites

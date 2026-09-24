@@ -229,6 +229,7 @@ FIVE INVARIANTS, EACH WITH ITS OWN VERIFIED CITATION
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -294,7 +295,10 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_position_status_report,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
-from breezy.adapters.polymarket_us.fees import polymarket_us_fee
+from breezy.adapters.polymarket_us.fees import (
+    polymarket_us_fee,
+    taker_fee_coefficient_of,
+)
 from breezy.adapters.polymarket_us.operator_controls import (
     DailyBudgetExhausted,
     SpendBooking,
@@ -655,6 +659,54 @@ def _optional_order_qty(raw: object) -> Decimal | None:
     return _to_decimal(raw, field="orderQty", error=ExecutionReportMappingError)
 
 
+#: AUD-13b (ruling R-1 = O4): the two values a record's ``feeSource`` may
+#: take. ``RECORDED`` is the venue's own attested fee; anything else is a
+#: model output FOR THAT FILL'S ERA (theta as of ``ts_event``).
+FEE_SOURCE_RECORDED: Final[str] = "RECORDED"
+FEE_SOURCE_MODELLED_AT_FILL_TIME: Final[str] = "MODELLED_AT_FILL_TIME"
+_FEE_SOURCES: Final[frozenset[str]] = frozenset(
+    {FEE_SOURCE_RECORDED, FEE_SOURCE_MODELLED_AT_FILL_TIME}
+)
+
+
+def fee_source_for(*, fee_reconciled: bool, venue_fee_raw: str | None) -> str:
+    """The O4 rule, in one place: ``RECORDED`` iff the fee reconciled AND the
+    venue's raw fee is present -- ``fee_reconciled`` alone is not an
+    attestation. Both write sites stamp this, and reconciliation re-derives
+    it rather than trusting a stored value."""
+    if fee_reconciled and venue_fee_raw is not None:
+        return FEE_SOURCE_RECORDED
+    return FEE_SOURCE_MODELLED_AT_FILL_TIME
+
+
+def _optional_fee_coefficient_at_fill(raw: object) -> Decimal | None:
+    """``feeCoefficientAtFill`` is optional-on-read (``None`` on every record
+    written before AUD-13b); a present value must be a finite theta in
+    ``[0, 1]``, exactly the range ``fees._fee_coefficient`` accepts."""
+    if raw is None:
+        return None
+    theta = _to_decimal(raw, field="feeCoefficientAtFill", error=ExecutionReportMappingError)
+    if theta < 0 or theta > 1:
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: feeCoefficientAtFill {theta} "
+            "is outside [0, 1]"
+        )
+    return theta
+
+
+def _optional_fee_source(raw: object) -> str | None:
+    """``feeSource`` is optional-on-read; a present value must be one of the
+    two ruled members, never a near-miss spelling."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or raw not in _FEE_SOURCES:
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: feeSource must be one of "
+            f"{sorted(_FEE_SOURCES)} or null, got {raw!r}"
+        )
+    return raw
+
+
 @dataclass(frozen=True, kw_only=True)
 class DurableFillRecord:
     """What Breezy actually paid, on disk, CUMULATIVE per venue order.
@@ -701,6 +753,15 @@ class DurableFillRecord:
     #: ``None`` on a legacy record; never inferred from ``cumulative_qty``,
     #: never defaulted to ``Decimal(1)`` (S-M1).
     order_qty: Decimal | None = None
+    #: AUD-13b / ruling R-1 = O4 mechanism (a): the taker theta of the
+    #: ``Instrument`` in hand when the record was written. ``None`` on a legacy
+    #: record (priced from the dated schedule instead) or when that
+    #: instrument's schedule was unusable. On a RESOLVER record it is the theta
+    #: at DISCOVERY time, the same upper-bound caveat as its ``ts_event``.
+    fee_coefficient_at_fill: Decimal | None = None
+    #: AUD-13b: :func:`fee_source_for` as stamped at write time. Diagnostic
+    #: provenance only -- reconciliation re-derives it, never trusts it.
+    fee_source: str | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -717,6 +778,12 @@ class DurableFillRecord:
                 "venueFeeRaw": self.venue_fee_raw,
                 "tradeId": self.trade_id,
                 "orderQty": None if self.order_qty is None else str(self.order_qty),
+                "feeCoefficientAtFill": (
+                    None
+                    if self.fee_coefficient_at_fill is None
+                    else str(self.fee_coefficient_at_fill)
+                ),
+                "feeSource": self.fee_source,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -725,9 +792,10 @@ class DurableFillRecord:
     def from_bytes(cls, raw: bytes) -> Self:
         """Decode a record, refusing anything that is not exactly one.
 
-        Every field is required except ``venueFeeRaw``, ``tradeId`` and
-        ``orderQty``, which are optional-on-read so pre-GL-2/pre-B0 records
-        still decode (``None``). A present non-string ``venueFeeRaw``/
+        Every field is required except ``venueFeeRaw``, ``tradeId``,
+        ``orderQty``, ``feeCoefficientAtFill`` and ``feeSource``, which are
+        optional-on-read so pre-GL-2/pre-B0/pre-AUD-13b records still decode
+        (``None``). A present non-string ``venueFeeRaw``/
         ``tradeId``, or a present non-finite ``orderQty``, is refused. A
         partially-decodable record is refused rather than defaulted: a fill
         record missing its price is not a fill record with a zero price.
@@ -775,6 +843,10 @@ class DurableFillRecord:
                 venue_fee_raw=_optional_venue_fee_raw(payload.get("venueFeeRaw")),
                 trade_id=_optional_trade_id(payload.get("tradeId")),
                 order_qty=_optional_order_qty(payload.get("orderQty")),
+                fee_coefficient_at_fill=_optional_fee_coefficient_at_fill(
+                    payload.get("feeCoefficientAtFill")
+                ),
+                fee_source=_optional_fee_source(payload.get("feeSource")),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -2247,7 +2319,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             order_qty=report.quantity.as_decimal(),
         )
         try:
-            self.record_fill(record)
+            # AUD-13b (ruling R-1 = O4 (a)): stamp the theta of the instrument
+            # in hand NOW -- i.e. at DISCOVERY, like `ts_event` above; the
+            # true fill lies in [intent created, now] (evidence pack F3).
+            self.record_fill(record, fill_time_instrument=instrument)
         except Exception as exc:  # noqa: BLE001 - see the CREATE path's identical guard
             fill_record_bytes = record.to_bytes()
             detail = fill_record_bytes.decode()
@@ -2993,8 +3068,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return None
         return ClientOrderId(raw.decode("utf-8"))
 
-    def record_fill(self, record: DurableFillRecord) -> None:
+    def record_fill(
+        self,
+        record: DurableFillRecord,
+        *,
+        fill_time_instrument: Instrument | None = None,
+    ) -> None:
         """Persist one venue order's cumulative totals and index it.
+
+        AUD-13b (ruling R-1 = O4 mechanism (a)): the two fill write sites pass
+        ``fill_time_instrument`` -- the ``Instrument`` in hand when the fill
+        is recorded -- and the record is stamped with that instrument's taker
+        theta (:func:`~breezy.adapters.polymarket_us.fees.taker_fee_coefficient_of`,
+        ``None`` if its schedule is unusable) and the O4 ``feeSource``
+        (:func:`fee_source_for`). Done HERE, in the already-permitted inert
+        store write, so neither guarded write site gains a callee. Without it
+        (every direct caller) the record is persisted exactly as given.
 
         Written before the ``OrderFilled`` is published (R-7), so a crash
         between the venue's answer and the event still leaves the evidence on
@@ -3007,6 +3096,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         prefix scan, so an id absent from the index is an id that no longer
         exists as far as pricing is concerned.
         """
+        if fill_time_instrument is not None:
+            record = dataclasses.replace(
+                record,
+                fee_coefficient_at_fill=taker_fee_coefficient_of(fill_time_instrument),
+                fee_source=fee_source_for(
+                    fee_reconciled=record.fee_reconciled,
+                    venue_fee_raw=record.venue_fee_raw,
+                ),
+            )
         index_key = f"{FILL_INDEX_KEY_PREFIX}{record.instrument_id}"
         indexed = self._read_fill_index(index_key)
         if indexed is None:
@@ -3776,7 +3874,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     trade_id=fill.trade_id.value,
                     order_qty=submit_chain.order_quantity_decimal(order),
                 )
-                self.record_fill(record)
+                # AUD-13b (ruling R-1 = O4 (a)): stamp the theta of the
+                # instrument this order was priced and sent against.
+                self.record_fill(record, fill_time_instrument=instrument)
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this
                 # guards ONE evidence write and ANY failure of it must halt
                 # trading rather than lose the event. Narrowing to the known
