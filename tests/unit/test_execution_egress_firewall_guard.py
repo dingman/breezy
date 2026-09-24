@@ -3432,10 +3432,22 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # (L-6/L-12): the comparison is still `==`; the module carries NO pytest
     # mark at all -- none of `SOCKET_RESTORING_MARKERS` appears in it --
     # constructs no client and opens no socket.
+    #
+    # Old -> new (this row, AUD-13b 2026-09-24, native reconciliation reports
+    # from durable records): added
+    # `tests/contract/test_reconciliation_durable_reports_contract.py`, which
+    # imports `PolymarketUSExecutionClient`/`DurableFillRecord` from
+    # `exec.client` and drives the real client through a REAL
+    # `LiveExecutionEngine` reconciliation -- the SAME shape as its
+    # `test_exec_client_reconciliation_contract.py` sibling above. WIDENED,
+    # not relaxed (L-6/L-12): the comparison is still `==`; its only mark is
+    # `contract` -- none of `SOCKET_RESTORING_MARKERS` appears in it -- and the
+    # venue read is an injected coroutine, so it opens no socket.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
+        "tests/contract/test_reconciliation_durable_reports_contract.py",
         "tests/unit/test_continuous_rung_hold_backtest_only.py",
         "tests/unit/test_continuous_rung_hold_fill_wiring.py",
         "tests/unit/test_continuous_rung_hold_never_arm_no_leg_2026_09_14.py",
