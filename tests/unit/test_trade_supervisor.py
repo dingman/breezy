@@ -3680,10 +3680,25 @@ class TestSupervisorLoggingConfiguration:
         content = log_path.read_text()
         assert "revision=unknown" in content
 
-    def test_the_revision_field_is_never_read_from_an_operator_reserved_variable(self):
+    def test_the_revision_field_is_never_read_from_an_operator_reserved_variable(
+        self, monkeypatch
+    ):
         """The resolver's ENV lookup consults only `BUILD_REVISION_ENV_VAR`
         -- never one of the two operator-reserved caps -- regardless of
-        what the git-file/metadata fallbacks resolve to."""
+        what the git-file/metadata fallbacks resolve to.
+
+        R-6e / rule A6: a repo file may never ASSIGN a value to an
+        operator-reserved control, including inside a test fixture (a
+        `{var: "sentinel-value" for var in OPERATOR_RESERVED_CONTROL_ENV_VARS}`
+        dict literal is itself such an assignment, per
+        `tests/unit/test_operator_control_assignment_scan.py`). This test
+        proves the same non-consultation property WITHOUT ever assigning
+        either control a value: the recording mapping starts EMPTY, so
+        there is nothing for the resolver to read even if it tried, and the
+        assertion is on the SET OF KEYS the resolver queried, checked for
+        disjointness against the reserved names -- not on a planted value.
+        """
+        import breezy.runtime.trade_supervisor as ts_module
         from breezy.adapters.polymarket_us.operator_controls import (
             OPERATOR_RESERVED_CONTROL_ENV_VARS,
         )
@@ -3697,15 +3712,18 @@ class TestSupervisorLoggingConfiguration:
                 self.accessed_keys.append(key)
                 return super().get(key, default)
 
-        env = _RecordingEnv(
-            {var: "sentinel-operator-value" for var in OPERATOR_RESERVED_CONTROL_ENV_VARS}
-        )
+        # Git-less tree: forces the resolver past its git-file lookup
+        # (which reads no env at all) so only the env-lookup step's key
+        # accesses are exercised, deterministically, on this empty mapping.
+        monkeypatch.setattr(ts_module, "_read_source_tree_head_sha", lambda: None)
+        env = _RecordingEnv()
 
-        revision = _resolve_build_revision(env)
+        _resolve_build_revision(env)
 
-        assert revision != "sentinel-operator-value"
+        accessed = set(env.accessed_keys)
+        assert accessed <= {BUILD_REVISION_ENV_VAR}
         for reserved_var in OPERATOR_RESERVED_CONTROL_ENV_VARS:
-            assert reserved_var not in env.accessed_keys
+            assert reserved_var not in accessed
 
     def test_resolve_build_revision_falls_through_to_metadata_when_the_git_head_sha_is_unavailable(
         self, monkeypatch
