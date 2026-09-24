@@ -40,6 +40,7 @@ from tests.unit.test_family_tally_v2 import (
     _manifest,
 )
 from tests.unit.test_realized_draws_loader import (
+    _FROZEN_LIVE_SNAPSHOT,
     _LIVE_STORE,
     _reseed_fill,
     _run_real_scorer,
@@ -242,21 +243,57 @@ def test_a_non_residual_exclusion_whose_trial_id_is_scored_is_still_dropped(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _LIVE_STORE.exists(), reason="no live scored-trial store on this host")
-def test_the_real_live_store_tally_admits_three_not_four(
+def test_the_frozen_2026_09_17_snapshot_tally_admits_three_not_four(
     tally_mod: ModuleType, real_artefact: BoundaryArtefact
 ) -> None:
+    """Hermetic pin of the registered `pm_us_crh_cont` tally over
+    `_FROZEN_LIVE_SNAPSHOT` (see `test_realized_draws_loader.py`) rather than
+    `_LIVE_STORE` directly: the live store is append-only and keeps growing
+    past `pm_us_crh_cont`'s own `terminal_climate_day` (2026-09-19), so
+    `build_family_tally_v2` over the CURRENT live store now correctly raises
+    `FamilyBarrierRefusal` instead of returning a tally at all -- see
+    `test_the_real_live_store_past_its_terminal_day_refuses_the_family_barrier`
+    below for that structural (non-count) invariant."""
     from breezy.persistence.family_manifest import load_family_manifest
 
     manifest = load_family_manifest(_CONT_MANIFEST_PATH, allow_draft=True)
     tally = tally_mod.build_family_tally_v2(
-        read_scored_trials(_LIVE_STORE),
+        read_scored_trials(_FROZEN_LIVE_SNAPSHOT),
         manifest=manifest,
         artefact=real_artefact,
-        store_dir=_LIVE_STORE,
+        store_dir=_FROZEN_LIVE_SNAPSHOT,
     )
 
     assert tally.n_scored == 4
     assert _admitted(tally) == 3
     assert tally.n_residual_excluded == 1
-    assert _admitted(tally) == load_realized_draws(_LIVE_STORE).n_admissible_fills
+    assert _admitted(tally) == load_realized_draws(_FROZEN_LIVE_SNAPSHOT).n_admissible_fills
+
+
+@pytest.mark.skipif(not _LIVE_STORE.exists(), reason="no live scored-trial store on this host")
+def test_the_real_live_store_past_its_terminal_day_refuses_the_family_barrier(
+    tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    """Structural invariant (R4, fail-closed), not a count: `pm_us_crh_cont`
+    closed on `terminal_climate_day` 2026-09-19 (ruling 2026-09-20), but the
+    live store directory keeps accumulating scored rows past that day.
+    Building the registered tally straight off the raw, growing live store
+    must ALWAYS refuse via `FamilyBarrierRefusal` once any row postdates the
+    terminal day -- never silently pool a successor row into the closed
+    family's in-flight alpha-spending sequence. This runs against the REAL
+    store and pins no count; the frozen, count-pinned snapshot from BEFORE
+    the family closed is `test_the_frozen_2026_09_17_snapshot_tally_admits_three_not_four`
+    above."""
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    manifest = load_family_manifest(_CONT_MANIFEST_PATH, allow_draft=True)
+    rows = read_scored_trials(_LIVE_STORE)
+    assert any(row.climate_day > manifest.terminal_climate_day for row in rows), (
+        "premise stale: the live store no longer holds a row past "
+        f"{manifest.terminal_climate_day!r} -- update or retire this test"
+    )
+
+    with pytest.raises(tally_mod.FamilyBarrierRefusal):
+        tally_mod.build_family_tally_v2(
+            rows, manifest=manifest, artefact=real_artefact, store_dir=_LIVE_STORE
+        )
