@@ -1137,7 +1137,13 @@ recorder, a daily relaunch — is started in its own session (`setsid` /
 `ps -o pid,sid,pgid`, and supervised by something whose lifetime is the host's,
 never the coordinator's (a systemd unit where the runbook allows one; the
 detached in-memory supervisor of `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md`
-where it does not). A session-bound cron or `/loop` may *check* the process; it
+where it does not). **Sharpened 2026-09-24:** a new session is NOT enough on this
+host. The coordinator runs inside a `tmux-spawn-*.scope` cgroup, and closing the SSH
+connection kills the whole cgroup regardless of SID: a hand-relaunched node
+(`setsid` + `start_new_session=True`) and nine external CLI workers died together
+with no SIGTERM line. Launch anything that must outlive the session through
+`systemd-run --user` (`--scope` when a launcher forks the real process and exits), and
+verify with `cat /proc/<pid>/cgroup` that it sits under `app.slice`, not the tmux scope. A session-bound cron or `/loop` may *check* the process; it
 must never be the only thing that *starts* it. Five of the seven enablement
 values stay memory/shell-only; the two caps may live in the operator's
 gitignored `operator.env` at the repo root (never committed, never written by
@@ -1505,3 +1511,31 @@ A decision record outlives the run that produced it and is read as settled groun
 
 ### How to apply
 Reviewer brief line: "for each claim about installed behaviour, state CONFIRMED or REFUTED with installed file:line — do not accept the document's own assurance that it checked." Author/coordinator audit before accepting an evidence note: for every "X is flat / absent / unsupported / no-ops", grep the repo for a prior measured statement about X, and confirm the diff's actual call path reaches the cited trap. Related: L-1 (null hypothesis against the installed surface), L-12 (widen, never relax), L-46 (the contract outranks the plan).
+
+## L-48 — A latch whose only clearing path it blocks is a deadlock, not a safety stop (2026-09-24)
+
+### What happened
+An AMBIGUOUS IOC (CP05MNWMAWP6, 09-23) left the account-wide submit intent OPEN. The supervisor refuses to launch any node while an intent is OPEN, yet only a running node's resolver can retire one. The resolver could not have retired it anyway: a state-blind `leaves == qty − cum` check rejected the venue's terminal EXPIRED body (leaves 0) 285 times, and the next day's node cached only today's instruments, so yesterday's order looped on "not in the cache". The node stayed down for a day with no path out that did not require a human.
+
+### Why this is binding
+A fail-closed latch is only safe if something can open it while it is closed. Otherwise "fail closed" silently becomes "never trade again", which looks like a quiet market.
+
+### The rule
+For every blocking latch (open intent, family halt, permit), name the clearing path and prove it can run WHILE the latch is closed and across a day boundary. Test that path end to end with the real stuck shape (the venue body verbatim, a past-day instrument, a node that boots after the latch was set).
+
+### How to apply
+Plans that add or touch a latch carry a "clearing path" row: who clears it, in which process, with which inputs, and a test that drives it. Mapping guards must be state-aware (terminal vs live), and must log the offending field values, not only the field names. Related: L-36 (AMBIGUOUS is the default), L-38 (a stop that cannot fire).
+
+## L-49 — Low CPU over wall time on a failing unit means a memory ceiling, not a slow job (2026-09-24)
+
+### What happened
+`breezy-quote-tape-ingest.service` had `MemoryHigh=4G`, sized to historical peaks. A growing 90G `live/` backlog pushed its working set past the ceiling, and every run from 10:15Z did about 5 minutes of CPU, then sat in `__mem_cgroup_handle_over_high` until the 30-minute timeout killed it. Seventeen runs made zero progress. The converted catalog stopped at 09-23, so the trade node resolved 0 instruments and refused to start. With `MemoryHigh=10G` a single run drained the whole backlog in 16 minutes.
+
+### Why this is binding
+Raising the timeout would only have lengthened the thrash. A unit killed by timeout looks like "slow", and the real limiter is invisible unless you compare CPU time with wall time.
+
+### The rule
+When a unit fails with CPU/wall < 0.3, check `memory.high` throttling (`wchan`, major faults, swap peak) before touching timeouts. Size a memory ceiling against the current backlog's working set, not past peaks, and keep a downstream consumer's input (the catalog) from depending on one unbounded run.
+
+### How to apply
+Triage line for any repeatedly failing unit: `systemctl --user show -p MemoryHigh,MemoryMax,TimeoutStartSec`, plus the journal's "Consumed X CPU over Y wall". Durable fix owed for ingest: bounded per-run memory and instruments-before-depths ordering. Related: L-29 (unbounded buffers), L-20 (the catalog you query is not the tape you capture).
