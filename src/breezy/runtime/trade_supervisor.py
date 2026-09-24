@@ -50,6 +50,7 @@ from breezy.runtime.health import (
 )
 from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.stop_intent_marker import write_stop_intent_marker
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
     SubmitIntent,
@@ -489,6 +490,8 @@ def terminate_after_toctou_recheck(
     resolve_holder: Callable[[Path], int | None] = resolve_lock_holder_pid,
     terminate_fn: Callable[[int], None] = terminate,
     is_alive: Callable[[int], bool] | None = None,
+    store_path: Path | None = None,
+    mark_stop_intent: Callable[[Path, int], None] = write_stop_intent_marker,
 ) -> None:
     """[L3] TOCTOU-safe SIGTERM: the stop-prior DECISION
     (:func:`decide_stop_prior_action`) and the actual signal are two
@@ -497,12 +500,22 @@ def terminate_after_toctou_recheck(
     ``intent_lock_path_``'s inode. Either check failing raises
     ``StopPriorRaceRefused`` -- the caller refuses and alerts rather than
     signalling a PID that may since have been reused by an unrelated
-    process."""
+    process.
+
+    [AUD-13d HIGH-1] When ``store_path`` is given, the ONE-SHOT stop-intent
+    marker is written for ``pid`` immediately before ``terminate_fn`` sends
+    the signal -- never before the recheck above passes, so a race-refused
+    terminate (no signal sent) leaves no marker behind. ``store_path``
+    defaults to ``None`` (no marker, unchanged behaviour) so every existing
+    caller of this function is untouched.
+    """
     alive_check = is_alive if is_alive is not None else process_is_alive
     if not alive_check(pid):
         raise StopPriorRaceRefused("pid no longer exists")
     if resolve_holder(intent_lock_path_) != pid:
         raise StopPriorRaceRefused("pid no longer holds the intent flock")
+    if store_path is not None:
+        mark_stop_intent(store_path, pid)
     terminate_fn(pid)
 
 
@@ -897,7 +910,9 @@ def _do_stop_prior(
     # SIGTERM_TRACKED.
     assert discovered is not None
     try:
-        ports.terminate_after_recheck(discovered, intent_lock_path_=lock_path)
+        ports.terminate_after_recheck(
+            discovered, intent_lock_path_=lock_path, store_path=store_path
+        )
     except StopPriorRaceRefused:
         log_decision("stop_prior_race_refused", pid=discovered)
         alert(

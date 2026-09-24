@@ -68,9 +68,11 @@ one bit survives, and this module is where it becomes the answer to
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Protocol, TextIO
 
 from nautilus_trader.common.actor import Actor
@@ -112,6 +114,7 @@ from breezy.runtime.settings import (
     load_trade_settings,
     proxy_env_check_enabled,
 )
+from breezy.runtime.stop_intent_marker import consume_stop_intent_marker
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.adapters.polymarket_us.config import PolymarketUSExecClientConfig
@@ -164,14 +167,34 @@ def _trader_reached_running(node: Node) -> bool:
     return getattr(trader, "is_stopped", False) is True
 
 
-def _emit_boot_halt_alert(node: Node) -> None:
+def _emit_boot_halt_alert(node: Node, stop_intent_store_path: Path | None) -> None:
     """One CRITICAL when ``node.run()`` returned with the trader never started.
 
     ``emit_alert`` contains sink failures. Construction of the sink is
     contained here too: a bad webhook URL must not change the exit code.
+
+    [AUD-13d HIGH-1] The stop-intent marker (``breezy.runtime.
+    stop_intent_marker``) is consumed FIRST and unconditionally -- before the
+    ``_trader_reached_running`` read -- so a marker written for an ordinary
+    stop of an already-RUNNING trader is still cleared here rather than left
+    to outlive this boot. Suppression itself only applies on the branch that
+    would otherwise alert: a Breezy-owned SIGTERM (``trade_supervisor``'s
+    ``stop_prior``) that arrived before RUNNING wrote this marker
+    immediately before signalling; a match means the halt was requested, not
+    a crash. ``stop_intent_store_path`` is ``None`` whenever the exec
+    state-DB path could not be resolved, in which case this is a no-op and
+    the alert fires exactly as it always has.
     """
     try:
+        stop_was_requested = stop_intent_store_path is not None and consume_stop_intent_marker(
+            stop_intent_store_path, os.getpid()
+        )
         if _trader_reached_running(node):
+            return
+        if stop_was_requested:
+            logger.info(
+                "boot-halt alert suppressed: an intentional Breezy stop was requested"
+            )
             return
         emit_alert(
             resolve_alert_sink(),
@@ -397,6 +420,7 @@ def _run_node(
     strategies: Sequence[Strategy] = (),
     after_build: Callable[[Node], None] | None = None,
     order_submission_permit: OrderSubmissionPermit | None = None,
+    stop_intent_store_path: Path | None = None,
 ) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -506,7 +530,7 @@ def _run_node(
         # A reconciliation failure does not raise. When ``run()`` returns
         # with the trader never started, say so. The exit code below is
         # unchanged either way. One read of public trader state; no timer.
-        _emit_boot_halt_alert(node)
+        _emit_boot_halt_alert(node, stop_intent_store_path)
         return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
         # A deliberate stop is NOT a failure. `TradingNode.run` catches only
@@ -590,6 +614,18 @@ def run(
             _report(out, "configuration error", exc, expected=True)
             return EXIT_CONFIG_ERROR
 
+        # AUD-13d HIGH-1: the SAME exec state-DB path
+        # `trade_supervisor`'s `stop_prior` phase resolves (`spawn_node`
+        # forwards `env=os.environ` as-is, so both processes read the
+        # identical `POLYMARKET_US_EXEC_STATE_DB`) -- already validated
+        # non-``None`` by `exec_config_from_env`/`PolymarketUSExecClientConfig`
+        # by the time `exec_client_config` exists.
+        stop_intent_store_path = (
+            Path(exec_client_config.state_store_path)
+            if exec_client_config.state_store_path is not None
+            else None
+        )
+
         actors: Sequence[Actor] = ()
         if settings.live_observations:
             # 2026-09-16 GAP fix: `catalog_root` is the config seam for the
@@ -608,6 +644,7 @@ def run(
             strategies=strategies,
             after_build=after_build,
             order_submission_permit=order_submission_permit,
+            stop_intent_store_path=stop_intent_store_path,
         )
     finally:
         uninstall_logging_bridge()

@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -48,6 +51,7 @@ from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.runtime import trade_cli
 from breezy.runtime.health import AlertPayload
+from breezy.runtime.stop_intent_marker import stop_intent_marker_path, write_stop_intent_marker
 from breezy.runtime.trade_cli import EXIT_OK, run
 from tests.unit.test_trade_cli import TRADE_ENV
 
@@ -302,6 +306,8 @@ def _drive(
     *,
     until_running: bool,
     after_build: Any = None,
+    pre_stop_hook: Callable[[], None] | None = None,
+    force_sigterm: bool = False,
 ) -> tuple[int, str, bool | None]:
     observed: dict[str, Any] = {}
     holder: list[TradingNode] = []
@@ -341,7 +347,9 @@ def _drive(
             observed["trader_running"] = bool(node.trader.is_running)
         except Exception as exc:  # noqa: BLE001 - recorded, asserted by the caller
             observed["trader_running_error"] = type(exc).__name__
-        _request_stop(node, sigterm=until_running)
+        if pre_stop_hook is not None:
+            pre_stop_hook()
+        _request_stop(node, sigterm=until_running or force_sigterm)
 
     thread = threading.Thread(target=stopper, name="boot-halt-stopper", daemon=True)
     thread.start()
@@ -415,3 +423,43 @@ def test_a_portfolio_that_never_initialises_halts_the_boot_with_one_critical_ale
     details = _boot_halt_details(alert_sink)
     assert details == [_DETAIL_NEVER_STARTED]
     assert len(alert_sink.payloads) == 1
+
+
+# ---------------------------------------------------------------------------
+# AUD-13d HIGH-1: an intentional Breezy stop before RUNNING must page nobody.
+# ---------------------------------------------------------------------------
+
+_STOP_INTENT_STORE_PATH = Path(TRADE_ENV["POLYMARKET_US_EXEC_STATE_DB"])
+
+
+def test_a_real_sigterm_before_running_with_a_stop_intent_marker_emits_no_boot_halt_alert(
+    alert_sink: _RecordingAlertSink,
+) -> None:
+    """The exact shape HIGH-1 fixes: the daily ``stop_prior`` phase's SIGTERM
+    reaching a still-booting node (engines never connect here; any early
+    return is equally silenced -- the marker check runs before cause
+    attribution). Writing the marker for THIS process's pid, immediately
+    before a REAL SIGTERM through the kernel's own signal callback, must
+    suppress the alert entirely -- contrasted with
+    ``test_engines_that_never_connect_halt_the_boot_with_one_critical_alert``
+    above, which is the SAME halt with no marker and pages exactly once.
+    """
+    marker_path = stop_intent_marker_path(_STOP_INTENT_STORE_PATH)
+    marker_path.unlink(missing_ok=True)
+    try:
+        code, stderr, trader_running = _drive(
+            _Mode.ENGINES_NEVER_CONNECT,
+            until_running=False,
+            force_sigterm=True,
+            pre_stop_hook=lambda: write_stop_intent_marker(
+                _STOP_INTENT_STORE_PATH, os.getpid()
+            ),
+        )
+
+        assert code == EXIT_OK, stderr
+        assert trader_running is False
+        assert _boot_halt_details(alert_sink) == []
+        # Single-use: consumed by the boot-halt check that just ran.
+        assert not marker_path.exists()
+    finally:
+        marker_path.unlink(missing_ok=True)

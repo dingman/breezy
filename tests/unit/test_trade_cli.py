@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import io
+import os
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
@@ -62,6 +63,7 @@ from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRef
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
 from breezy.runtime.health import AlertPayload
 from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, TRADE_TRADER_ID_VAR
+from breezy.runtime.stop_intent_marker import stop_intent_marker_path, write_stop_intent_marker
 from breezy.runtime.trade_cli import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -1103,3 +1105,91 @@ def test_a_boot_halt_with_no_attributable_cause_alerts_with_the_generic_detail(
     detail = payloads[0].detail
     assert detail == "BOOT_HALT_TRADER_NEVER_STARTED"
     assert detail not in _DROPPED_BOOT_HALT_DETAILS
+
+
+# ---------------------------------------------------------------------------
+# AUD-13d HIGH-1: an intentional supervisor stop must never page CRITICAL.
+# The marker lives beside `POLYMARKET_US_EXEC_STATE_DB`
+# (`TRADE_ENV[EXEC_STATE_DB_ENV_VAR]`) -- the SAME store path
+# `breezy.runtime.trade_supervisor`'s `stop_prior` phase resolves from the
+# identical env var, since `spawn_node` forwards `env=os.environ` as-is.
+# ---------------------------------------------------------------------------
+
+_STOP_INTENT_STORE_PATH = Path(TRADE_ENV["POLYMARKET_US_EXEC_STATE_DB"])
+
+
+@pytest.fixture(autouse=True)
+def _clean_stop_intent_marker() -> Iterator[None]:
+    marker_path = stop_intent_marker_path(_STOP_INTENT_STORE_PATH)
+    marker_path.unlink(missing_ok=True)
+    yield
+    marker_path.unlink(missing_ok=True)
+
+
+def test_a_stop_intent_marker_naming_this_process_suppresses_the_boot_halt_alert(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid())
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
+
+
+def test_the_stop_intent_marker_is_single_use(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """A marker consumed by one boot-halt check must not silence the next."""
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid())
+
+    first_code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+    assert first_code == EXIT_OK
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
+
+    second_code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+    assert second_code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].detail == "BOOT_HALT_TRADER_NEVER_STARTED"
+
+
+def test_a_stop_intent_marker_for_a_different_pid_does_not_suppress_the_alert(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid() + 1)
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].detail == "BOOT_HALT_TRADER_NEVER_STARTED"
+
+
+def test_no_stop_intent_marker_still_alerts_as_before(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """Regression guard: the default (no marker) path is unchanged."""
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].severity == "CRITICAL"
+
+
+def test_a_stop_intent_marker_does_not_suppress_a_run_that_reaches_running(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """The marker is read only when the trader never reached RUNNING -- a
+    healthy run that happens to race a stale marker still stays silent for
+    the SAME reason it always did (``_trader_reached_running`` is True),
+    and the marker must still be consumed so it cannot outlive this boot."""
+    write_stop_intent_marker(_STOP_INTENT_STORE_PATH, os.getpid())
+
+    code = run(env=TRADE_ENV, node_factory=_TraderReachedRunningNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert _boot_halt_payloads(_no_send_alert_sink) == []
