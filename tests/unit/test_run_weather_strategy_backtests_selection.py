@@ -1,9 +1,12 @@
 """Selection-helper equivalence for the two climate-day reading contracts.
 
 ``_select_highest_revision_readings`` does not exist until AUD-11 wires it.
-``require_final`` and ``raise_on_missing`` are independent: the real-observation
-wrapper raises when a fixed station is absent; the settlement wrapper omits a
-station that has no final print.
+``require_final``, ``raise_on_missing`` and ``filter_superseded`` are
+independent: the real-observation wrapper raises when a fixed station is
+absent and filters ``is_superseded``; the settlement wrapper omits a station
+that has no final print and does NOT consult ``is_superseded`` -- see
+``breezy.domain.nws_climate_day.NwsClimateDay`` (``is_superseded``) and
+``breezy.domain.selection`` (module docstring).
 """
 
 from __future__ import annotations
@@ -82,6 +85,7 @@ def test_non_final_selection_matches_the_real_observation_rule() -> None:
         stations=("NYC", "MIA"),
         require_final=False,
         raise_on_missing=True,
+        filter_superseded=True,
     )
     assert observed == {"NYC": 71, "MIA": 80}
     assert chosen["NYC"] is nyc_high
@@ -98,6 +102,7 @@ def test_missing_fixed_station_raises_the_real_observation_lookup_error() -> Non
             stations=("NYC", "MIA"),
             require_final=False,
             raise_on_missing=True,
+            filter_superseded=True,
             missing_context="/tmp/aud11-synthetic-catalog",
         )
 
@@ -112,6 +117,7 @@ def test_final_selection_omits_a_station_that_has_only_a_preliminary() -> None:
         stations=("MIA", "NYC"),
         require_final=True,
         raise_on_missing=False,
+        filter_superseded=False,
     )
     assert observed == {"MIA": 91}
     assert "NYC" not in observed
@@ -126,6 +132,7 @@ def test_settled_readings_omits_a_preliminary_only_station_without_raising() -> 
         stations=("NYC",),
         require_final=True,
         raise_on_missing=False,
+        filter_superseded=False,
     )
     assert observed == {}
     assert module._settled_readings([preliminary]) == observed
@@ -147,8 +154,17 @@ def test_load_real_observations_wrapper_still_raises_when_a_fixed_station_is_abs
         module._load_real_observations(Path("/tmp/aud11-synthetic-catalog"))
 
 
-def test_settled_readings_ignores_a_superseded_final() -> None:
-    """A superseded final is not a candidate, even at a higher revision."""
+def test_settled_readings_selects_a_superseded_higher_revision_final() -> None:
+    """Settlement truth does NOT consult ``is_superseded``.
+
+    ``breezy.domain.nws_climate_day.NwsClimateDay`` (``is_superseded``) and
+    ``breezy.domain.selection`` (module docstring) both state the flag can
+    only record what was known when a record was written -- it is never set
+    retroactively on the record it supersedes -- so selecting on it would
+    silently disagree with the write path. The settlement wrapper therefore
+    ranks on ``revision_seq`` alone among FINAL prints: a higher-revision
+    FINAL is selected even though it carries ``is_superseded=True``.
+    """
     module = _load()
     superseded = _day(
         station="NYC",
@@ -166,7 +182,7 @@ def test_settled_readings_ignores_a_superseded_final() -> None:
         is_superseded=False,
         retrieved_at_ns=40,
     )
-    assert module._settled_readings([superseded, current]) == {"NYC": 77}
+    assert module._settled_readings([superseded, current]) == {"NYC": 80}
 
 
 def test_the_default_branch_does_not_restamp_climate_days() -> None:
@@ -187,4 +203,5 @@ def test_a_selected_record_with_no_tmax_still_raises() -> None:
             stations=("NYC",),
             require_final=True,
             raise_on_missing=False,
+            filter_superseded=False,
         )

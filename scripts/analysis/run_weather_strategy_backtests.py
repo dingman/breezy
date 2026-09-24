@@ -753,19 +753,28 @@ def _select_highest_revision_readings(
     stations: Sequence[str],
     require_final: bool,
     raise_on_missing: bool,
+    filter_superseded: bool,
     missing_context: str | None = None,
 ) -> tuple[dict[str, int], dict[str, NwsClimateDay]]:
-    """Highest-`revision_seq` non-superseded reading per station.
+    """Highest-`revision_seq` reading per station.
 
     ``require_final`` chooses the candidate set. ``raise_on_missing`` chooses
-    what a station with an empty candidate set does. The two are independent.
+    what a station with an empty candidate set does. ``filter_superseded``
+    chooses whether ``is_superseded`` is consulted at all. The three are
+    independent.
 
-    * ``require_final=False, raise_on_missing=True`` is
-      :func:`_load_real_observations`: every fixed station must have a
+    * ``require_final=False, raise_on_missing=True, filter_superseded=True``
+      is :func:`_load_real_observations`: every fixed station must have a
       non-superseded candidate, final or not.
-    * ``require_final=True, raise_on_missing=False`` is
-      :func:`_settled_readings`: a station with no final print is omitted.
+    * ``require_final=True, raise_on_missing=False, filter_superseded=False``
+      is :func:`_settled_readings`: a station with no final print is omitted.
       :func:`_run_live_capture` turns that omission into its REFUSAL exit.
+      ``is_superseded`` is deliberately NOT consulted here -- see
+      ``breezy.domain.nws_climate_day.NwsClimateDay`` (``is_superseded``) and
+      ``breezy.domain.selection`` (module docstring): the flag only records
+      what was known when a record was written and can never be set
+      retroactively on the record it supersedes, so selecting on it would
+      silently disagree with settlement truth.
 
     A selected candidate whose ``tmax_f`` is ``None`` always raises
     ``LookupError``. ``missing_context``, when given, is appended so the
@@ -780,15 +789,16 @@ def _select_highest_revision_readings(
             record
             for record in records
             if record.station == station
-            and not record.is_superseded
+            and (not filter_superseded or not record.is_superseded)
             and (record.is_final or not require_final)
         ]
         if not candidates:
             if not raise_on_missing:
                 continue
             kind = "final " if require_final else ""
+            prefix = "non-superseded " if filter_superseded else ""
             raise LookupError(
-                f"no non-superseded {kind}NwsClimateDay for station={station!r} "
+                f"no {prefix}{kind}NwsClimateDay for station={station!r} "
                 f"climate_day={day.isoformat()}{location}",
             )
         best = max(candidates, key=lambda record: record.revision_seq)
@@ -827,6 +837,7 @@ def _load_real_observations(
         stations=("NYC", "MIA"),
         require_final=False,
         raise_on_missing=True,
+        filter_superseded=True,
         missing_context=str(weather_catalog_root),
     )
 
@@ -1400,12 +1411,18 @@ def _settled_readings(records: Sequence[NwsClimateDay]) -> dict[str, int]:
     omitted, not an exception -- :func:`_run_live_capture` turns that gap into
     its ``REFUSAL: no FINAL print`` exit. A selected final whose ``tmax_f`` is
     ``None`` still raises ``LookupError``.
+
+    ``is_superseded`` is deliberately NOT consulted (``filter_superseded=
+    False``): see the ``filter_superseded`` note on
+    :func:`_select_highest_revision_readings` and
+    ``breezy.domain.nws_climate_day.NwsClimateDay`` (``is_superseded``).
     """
     observed, _chosen = _select_highest_revision_readings(
         records,
         stations=sorted({record.station for record in records}),
         require_final=True,
         raise_on_missing=False,
+        filter_superseded=False,
     )
     return observed
 
@@ -1807,6 +1824,7 @@ def main(argv: list[str] | None = None) -> int:
         stations=("NYC", "MIA"),
         require_final=False,
         raise_on_missing=True,
+        filter_superseded=True,
         missing_context=str(args.weather_catalog_root),
     )
     print(f"REAL preliminary observations for {CLIMATE_DAY.isoformat()}: {real_observed}")
