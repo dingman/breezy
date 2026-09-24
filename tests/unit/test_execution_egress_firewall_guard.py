@@ -3422,6 +3422,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the module
     # carries NO pytest mark at all -- none of `SOCKET_RESTORING_MARKERS`
     # appears in it -- constructs no client and opens no socket.
+    #
+    # Old -> new (this row, AUD-05 2026-09-24, terminal-day scorer bound):
+    # added `tests/unit/test_aud05_scorer_terminal_bound.py`, which imports
+    # `FILL_KEY_PREFIX`/`DurableFillRecord` from `exec.client` to seed durable
+    # fill fixtures for the scorer's family-terminal-day bound -- the SAME
+    # plain-data-record idiom as its `test_fill_time_count.py`/
+    # `test_portfolio_roi_report.py` siblings above. WIDENED, not relaxed
+    # (L-6/L-12): the comparison is still `==`; the module carries NO pytest
+    # mark at all -- none of `SOCKET_RESTORING_MARKERS` appears in it --
+    # constructs no client and opens no socket.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3483,6 +3493,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # `_RecordingSender` double, the same injected-sender shape as the
         # exec-client suite, so this row never opens a socket either.
         "tests/unit/test_operator_caps_through_the_live_composition.py",
+        "tests/unit/test_aud05_scorer_terminal_bound.py",
     }
 
 

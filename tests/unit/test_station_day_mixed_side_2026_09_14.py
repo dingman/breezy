@@ -25,6 +25,7 @@ from breezy.settlement.current_rung_hold_v2 import (
     CombinedDraw,
     StationDayAdmissionRefusal,
     StratumRow,
+    break_even_row,
     build_stratum_v2,
     combine_station_day,
     score,
@@ -514,13 +515,31 @@ def test_score_is_unchanged_for_all_yes_rows() -> None:
     assert state.n == 3
 
 
-def test_build_stratum_v2_refuses_any_no_side_row_until_side_aware() -> None:
-    rows = (
-        _row("0.10", True),
-        _row("0.20", True, side="no", rung="R1"),
-    )
+# AUD-05 D-A (2026-09-21) made `build_stratum_v2` side-aware, sunsetting the
+# refusal this pinned -- converted to its positive successor.
+def test_build_stratum_v2_accepts_a_no_side_row_and_still_refuses_an_unknown_side() -> None:
+    """A NO row is now ACCEPTED and scored against its OWN break-even (no
+    reflection to `1 - BE`), reusing the oracle already proven in
+    `test_aud05_side_aware_stratum.py::test_a_no_leg_row_is_scored_not_refused`
+    /`test_a_mixed_side_pooled_stratum_scores_each_leg_against_its_own_break_even`.
+    An unknown (non `{yes, no}`) side is unaffected by the sunset and still
+    raises."""
+    yes_row = _row("0.10", True, fee=Decimal(0))
+    no_row = _row("0.20", True, side="no", fee=Decimal(0), rung="R1")
+
+    stratum = build_stratum_v2("station:MIA", (yes_row, no_row))
+
+    assert stratum is not None
+    assert stratum.n == 2
+    assert stratum.k == 2
+    assert stratum.pi == (
+        break_even_row(yes_row.entry_ask, yes_row.fee)
+        + break_even_row(no_row.entry_ask, no_row.fee)
+    ) / 2
+    assert stratum.pi == Decimal("0.15")  # the NO leg's OWN ask, not its 0.80 reflection
+
     with pytest.raises(ValueError):
-        build_stratum_v2("station:MIA", rows)
+        build_stratum_v2("station:MIA", (_row("0.20", True, side="maybe", rung="R1"),))
 
 
 def test_build_stratum_v2_is_unchanged_for_all_yes_rows() -> None:
