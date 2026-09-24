@@ -458,15 +458,27 @@ ORDER_STATE_TO_ORDER_STATUS: Final[Mapping[str, OrderStatus]] = {
 
 #: The native statuses at which an order will never receive another fill.
 #: This is this parser's OWN terminal set -- keyed to the mapped
-#: ``OrderStatus``, not the raw venue string, and including ``FILLED``
-#: (unlike ``client._RESOLVER_TERMINAL_STATUSES``, which tracks a completed
-#: fill separately for resolver classification). Used only by
-#: :func:`_assert_fill_progress_consistent`: a terminal order's
-#: ``leavesQuantity`` is 0 regardless of how ``cumQuantity`` split against
-#: ``quantity`` -- an IOC partially filled then CANCELED/EXPIRED reports
-#: exactly this shape (``exec/client.py``'s TERMINAL-FILL resolution).
-_TERMINAL_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+#: ``OrderStatus``, not the raw venue string. PUBLIC: ``exec/client.py``
+#: imports this directly (it already imports from this module) rather than
+#: maintaining its own hand-written copy -- see ``NON_FILL_TERMINAL_STATUSES``
+#: below, and ``client._RESOLVER_TERMINAL_STATUSES``, which is that constant
+#: under a resolver-local name.
+TERMINAL_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
     {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED}
+)
+
+#: ``TERMINAL_ORDER_STATUSES`` minus ``FILLED``. Used by
+#: :func:`_assert_fill_progress_consistent`: CANCELED/REJECTED/EXPIRED never
+#: receive another fill, so ``leavesQuantity=0`` is legitimate even with
+#: ``cumQuantity < quantity`` -- an IOC partially filled then
+#: CANCELED/EXPIRED reports exactly this shape (``exec/client.py``'s
+#: TERMINAL-FILL resolution). ``FILLED`` is deliberately EXCLUDED: for that
+#: status, ``leavesQuantity=0`` is only truthful when ``cumQuantity ==
+#: quantity`` too -- a body claiming FILLED with a short ``cumQuantity`` and
+#: zero leaves is a genuine contradiction, not a legitimate terminal shape,
+#: so it keeps the strict ``leaves == quantity - cumQuantity`` identity.
+NON_FILL_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = (
+    TERMINAL_ORDER_STATUSES - frozenset({OrderStatus.FILLED})
 )
 
 #: The two ``ExecutionType`` members that describe a trade
@@ -841,16 +853,17 @@ def _assert_fill_progress_consistent(
 
     The identity checked against a PRESENT ``leavesQuantity`` is
     STATE-DEPENDENT (``order_status`` is resolved by the caller BEFORE this
-    check, precisely so it can be state-aware). A live order -- anything not
-    in ``_TERMINAL_ORDER_STATUSES`` -- must satisfy the venue's own
-    arithmetic exactly: ``leaves == quantity - cumQuantity``. A TERMINAL
-    order will never receive another fill, so nothing is left resting no
-    matter how ``cumQuantity`` split against ``quantity``: an IOC partially
-    filled then CANCELED/EXPIRED legitimately reports ``leavesQuantity=0``
-    with ``0 < cumQuantity < quantity``, and the strict identity would wrongly
-    refuse it. Every raise below names ``state``, ``quantity``,
-    ``cumQuantity`` and ``leavesQuantity`` so the resolver's WARN log carries
-    the values, not just the exception class.
+    check, precisely so it can be state-aware). Only CANCELED/REJECTED/
+    EXPIRED (``NON_FILL_TERMINAL_STATUSES``) relax to ``leaves == 0``
+    regardless of ``cumQuantity``: an IOC partially filled then
+    CANCELED/EXPIRED legitimately reports ``leavesQuantity=0`` with
+    ``0 < cumQuantity < quantity``. Every other status -- every live state,
+    AND ``FILLED`` -- keeps the venue's own arithmetic exactly: ``leaves ==
+    quantity - cumQuantity``. FILLED is deliberately NOT relaxed: a body
+    claiming FILLED with a short ``cumQuantity`` and zero leaves is not the
+    IOC shape above, it is a genuine contradiction. Every raise below names
+    ``state``, ``quantity``, ``cumQuantity`` and ``leavesQuantity`` so the
+    resolver's WARN log carries the values, not just the exception class.
     """
     leaves_raw = payload.get("leavesQuantity")
     if filled_qty > quantity:
@@ -867,7 +880,7 @@ def _assert_fill_progress_consistent(
     leaves = _quantity_field(
         payload, "leavesQuantity", instrument=instrument, context=context, allow_zero=True
     )
-    if order_status in _TERMINAL_ORDER_STATUSES:
+    if order_status in NON_FILL_TERMINAL_STATUSES:
         if leaves.as_decimal() != 0:
             raise ExecutionReportMappingError(
                 f"{context} field 'leavesQuantity' is not zero for a terminal "

@@ -4846,3 +4846,18 @@ def test_open_order_ids_are_redacted_to_a_prefix_in_the_error_line() -> None:
 
     assert _redact_order_id("CEBPX0EVTTMX") == "CEBP…"
     assert _redact_order_id("AB") == "AB…"
+
+
+def test_resolver_terminal_statuses_is_derived_not_hand_copied() -> None:
+    """Two independently hand-maintained copies of the same three statuses
+    can drift silently. `_RESOLVER_TERMINAL_STATUSES` must be the SAME
+    object (or at minimum equal) as `reports.NON_FILL_TERMINAL_STATUSES`,
+    not a second frozenset that happens to match today."""
+    from breezy.adapters.polymarket_us.exec.client import _RESOLVER_TERMINAL_STATUSES
+    from breezy.adapters.polymarket_us.exec.reports import NON_FILL_TERMINAL_STATUSES
+
+    assert _RESOLVER_TERMINAL_STATUSES is NON_FILL_TERMINAL_STATUSES
+    assert _RESOLVER_TERMINAL_STATUSES == {
+        OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED,
+    }
+    assert OrderStatus.FILLED not in _RESOLVER_TERMINAL_STATUSES

@@ -284,6 +284,7 @@ from breezy.adapters.polymarket_us.exec.refusals import (
     refusals_after_successful_reconcile,
 )
 from breezy.adapters.polymarket_us.exec.reports import (
+    NON_FILL_TERMINAL_STATUSES,
     OpenOrderRecord,
     build_execution_mass_status,
     derive_position_cost_basis,
@@ -1036,9 +1037,15 @@ class StartupPositionEvidence:
 #: ``minimumTradeQty`` dropped to 0.01 (a CANCELED/EXPIRED order can still
 #: carry real filled shares) -- resolved by ``_resolve_accept_fill`` exactly
 #: like a full FILLED.
-_RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
-    {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED}
-)
+#:
+#: Derived from ``reports.NON_FILL_TERMINAL_STATUSES`` (this module already
+#: imports from ``reports`` above) rather than hand-copied: ``reports.py`` is
+#: the lower layer here -- it does not, and must not, import FROM
+#: ``client.py`` -- so this module is the one that reuses the other's
+#: constant, never the reverse. A second hand-written copy of the same three
+#: statuses previously drifted from ``reports._assert_fill_progress_consistent``'s
+#: own terminal check; this alias makes that impossible.
+_RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = NON_FILL_TERMINAL_STATUSES
 #: A GET-resolved report carrying a COMPLETE fill. ``PARTIALLY_FILLED`` is
 #: deliberately EXCLUDED: it is a LIVE state -- the order can still receive
 #: more fills or reach a terminal status later -- and must NEVER resolve the

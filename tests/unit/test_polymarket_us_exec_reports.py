@@ -194,18 +194,28 @@ def test_order_status_report_maps_every_snapshot_state(
     }
     assert set(ORDER_STATE_TO_ORDER_STATUS) == snapshot_states
 
-    # Terminal states require `leavesQuantity == 0` (a terminal order rests
-    # nothing); every other state keeps the fixture's own
+    # CANCELED/REJECTED/EXPIRED relax to `leavesQuantity == 0` regardless of
+    # `cumQuantity` (a terminal order rests nothing, fully filled or not).
+    # FILLED is NOT relaxed -- leaves==0 is only truthful there when
+    # cumQuantity == quantity too, so its body is made genuinely consistent
+    # (cum == quantity) rather than laundering a short fill through a zero
+    # leaves. Every other state keeps the fixture's own
     # `leaves == quantity - cumQuantity` identity (10 - 4 = 6). This is
     # fixture setup for a totality test, not a copy of the guard's own list.
-    terminal_states = {
-        "ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED",
-        "ORDER_STATE_EXPIRED",
+    relaxed_terminal_states = {
+        "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED", "ORDER_STATE_EXPIRED",
     }
     for state in sorted(snapshot_states):
-        leaves = 0 if state in terminal_states else 6
+        body = {**order, "state": state}
+        if state == "ORDER_STATE_FILLED":
+            body["cumQuantity"] = order["quantity"]
+            body["leavesQuantity"] = 0
+        elif state in relaxed_terminal_states:
+            body["leavesQuantity"] = 0
+        else:
+            body["leavesQuantity"] = 6
         report = parse_order_status_report(
-            {**order, "state": state, "leavesQuantity": leaves},
+            body,
             instrument=instrument,
             account_id=ACCOUNT_ID,
             report_id=REPORT_ID,
@@ -1233,6 +1243,32 @@ def test_a_terminal_filled_order_still_requires_the_exact_identity(
 
     assert report.order_status == OrderStatus.FILLED
     assert report.filled_qty == Quantity.from_str("10.00")
+
+
+def test_a_filled_order_short_of_quantity_is_still_refused(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """FILLED is NOT in the relaxed-leaves set: only CANCELED/REJECTED/
+    EXPIRED may report ``leavesQuantity=0`` with ``cumQuantity < quantity``.
+    A FILLED order claiming a short fill with zero leaves is a genuine
+    contradiction -- 'filled' but not actually filled -- and must be
+    refused exactly like the pre-existing non-terminal guard, not silently
+    accepted as a partial fill."""
+    with pytest.raises(ExecutionReportMappingError, match="leavesQuantity") as excinfo:
+        parse_order_status_report(
+            {**order, "state": "ORDER_STATE_FILLED", "quantity": 10, "cumQuantity": 4,
+             "leavesQuantity": 0},
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+    message = str(excinfo.value)
+    assert "ORDER_STATE_FILLED" in message
+    assert "quantity=10" in message
+    assert "cumQuantity=4" in message
+    assert "leavesQuantity=0" in message
 
 
 def test_a_terminal_order_with_resting_leaves_is_still_refused(
