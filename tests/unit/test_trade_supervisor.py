@@ -33,6 +33,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_intent_marker_path
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
+    BUILD_REVISION_ENV_VAR,
     EXIT_CONFIG_ERROR,
     EXIT_OK,
     NODE_CONSOLE_SCRIPT,
@@ -44,6 +45,7 @@ from breezy.runtime.trade_supervisor import (
     _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
+    _resolve_build_revision,
     _run_forever,
     _SELF_CHECK_PASS_RESULTS,
     _SupervisorFileHandler,
@@ -3635,6 +3637,70 @@ class TestSupervisorLoggingConfiguration:
         assert "supervisor_started" in content
         # UTC-formatted timestamp prefix, per line -- e.g. "2026-09-05T...Z".
         assert "Z INFO breezy.runtime.trade_supervisor supervisor_started" in content
+
+    def test_supervisor_started_logs_a_revision_field(self, monkeypatch, tmp_path):
+        """AUD-14a: the supervisor records the build revision it is running
+        so a restart's motive (deploy vs not) is inferable after the fact by
+        diffing consecutive `revision=` values -- see
+        docs/plans/backlog/AUDIT_2026-09-21/AUD-14-...md, §6/§7 14a."""
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv(BUILD_REVISION_ENV_VAR, "deadbeef123")
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+
+        log_path = supervisor_log_path(home / ".local" / "share" / "breezy" / "logs")
+        content = log_path.read_text()
+        assert "supervisor_started" in content
+        assert "revision=deadbeef123" in content
+
+    def test_an_absent_revision_logs_unknown_rather_than_omitting_the_field(
+        self, monkeypatch, tmp_path
+    ):
+        """When neither the env var nor package metadata carries a revision,
+        the field is still present -- `revision=unknown`, never omitted (an
+        absent field is indistinguishable from an old binary)."""
+        import importlib.metadata
+
+        def _raise_not_found(_name: str) -> str:
+            raise importlib.metadata.PackageNotFoundError
+
+        monkeypatch.delenv(BUILD_REVISION_ENV_VAR, raising=False)
+        monkeypatch.setattr(importlib.metadata, "version", _raise_not_found)
+
+        home = tmp_path / "home"
+        home.mkdir()
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+
+        log_path = supervisor_log_path(home / ".local" / "share" / "breezy" / "logs")
+        content = log_path.read_text()
+        assert "revision=unknown" in content
+
+    def test_the_revision_field_is_never_read_from_an_operator_reserved_variable(self):
+        """The resolver consults only three sources: the `BUILD_REVISION_ENV_VAR`
+        env var, `importlib.metadata.version`, and the literal "unknown" --
+        never one of the two operator-reserved caps."""
+        from breezy.adapters.polymarket_us.operator_controls import (
+            OPERATOR_RESERVED_CONTROL_ENV_VARS,
+        )
+
+        class _RecordingEnv(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.accessed_keys: list[str] = []
+
+            def get(self, key, default=None):
+                self.accessed_keys.append(key)
+                return super().get(key, default)
+
+        env = _RecordingEnv(
+            {var: "sentinel-operator-value" for var in OPERATOR_RESERVED_CONTROL_ENV_VARS}
+        )
+
+        revision = _resolve_build_revision(env)
+
+        assert revision != "sentinel-operator-value"
+        for reserved_var in OPERATOR_RESERVED_CONTROL_ENV_VARS:
+            assert reserved_var not in env.accessed_keys
 
     def test_sentinel_env_value_never_appears_in_the_log_file(self, monkeypatch, tmp_path):
         home = tmp_path / "home"

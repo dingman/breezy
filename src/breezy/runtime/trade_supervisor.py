@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as dt
 import errno
 import fcntl
+import importlib.metadata
 import json
 import logging
 import os
@@ -716,6 +717,38 @@ def spawn_node(
 # ---------------------------------------------------------------------------
 # Value-free logging and alerting.
 # ---------------------------------------------------------------------------
+
+
+#: AUD-14a: the sole env var this module reads for build identity. Never
+#: one of the operator-reserved caps
+#: (``operator_controls.OPERATOR_RESERVED_CONTROL_ENV_VARS``) -- a build
+#: revision is a static identifier, not an operator value.
+BUILD_REVISION_ENV_VAR: Final = "BREEZY_BUILD_REVISION"
+
+
+def _resolve_build_revision(env: Mapping[str, str]) -> str:
+    """The running build's static identity, for the ``supervisor_started``
+    ``revision`` field (AUD-14a).
+
+    Consults, in this order, ONLY:
+      1. ``BUILD_REVISION_ENV_VAR`` in ``env``, if set and non-blank;
+      2. ``importlib.metadata.version("breezy")``, if the installed
+         package carries one;
+      3. the literal ``"unknown"``.
+
+    Never shells out to ``git``: this supervisor is long-lived and
+    unattended, and ``subprocess`` against a repo it does not own is a new
+    failure surface for zero benefit. Absence resolves to ``"unknown"``,
+    never an omitted field -- an absent field is indistinguishable from an
+    old binary that never wrote one.
+    """
+    from_env = env.get(BUILD_REVISION_ENV_VAR, "").strip()
+    if from_env:
+        return from_env
+    try:
+        return importlib.metadata.version("breezy")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def log_decision(event: str, **fields: int | str) -> None:
@@ -1504,6 +1537,7 @@ def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
                 self_check_utc=str(SELF_CHECK_UTC),
                 lock_path=str(lock_path),
                 log_dir=str(log_dir),
+                revision=_resolve_build_revision(os.environ),
             )
             _run_forever(
                 store_path=store_path,
