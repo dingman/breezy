@@ -50,6 +50,15 @@ WorkingDirectory=/home/jon/breezy
 # MemoryMax=5G covers that measured working set with headroom while staying
 # well below the host: a runaway run's OOM still lands on the study, never
 # the node.
+#
+# Overlap ruling (pre-existing, bounded): breezy-quote-tape-ingest-frequent.timer
+# (OnCalendar=*:0/15) fires breezy-quote-tape-ingest.service
+# (MemoryHigh=4G/MemoryMax=6G) at the same 14:15:00 tick as this unit. Worst
+# case both ceilings sum to 5G + 6G = 11G, plus the ~1G uncapped live node,
+# against 30G RAM with ~23G available (`free -g`, 2026-09-24 ~23:00Z) -- well
+# within bounds, so no flock/slice/timer change. This unit is deliberately
+# NOT a member of breezy-studies.lock: it must not be delayed behind a heavy
+# nightly study past its own 14:30Z/17:20Z downstream tally consumers.
 MemoryHigh=4G
 MemoryMax=5G
 UMask=0077
