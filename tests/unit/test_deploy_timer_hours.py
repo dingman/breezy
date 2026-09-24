@@ -169,6 +169,25 @@ def test_1715_and_1725_utc_are_unowned_after_the_wp11b_template_merge() -> None:
         assert owners == [], f"{hour}:{minute} UTC unexpectedly owned by {owners}"
 
 
+def test_0920_utc_is_owned_by_the_decision_funnel_digest() -> None:
+    """AUD-03: 09:20 UTC is after quote-tape rotate (09:00) and is not
+    shared with any other timer. Outside the protected window
+    ``[16:45Z, 01:15Z)``.
+    """
+    owners = [
+        timer_path.name
+        for timer_path in _all_timer_files()
+        if ("09", "20") in _clock_ticks(timer_path)
+    ]
+    assert owners == ["breezy-decision-funnel-digest.timer"]
+    rotate = [
+        timer_path.name
+        for timer_path in _all_timer_files()
+        if ("09", "00") in _clock_ticks(timer_path)
+    ]
+    assert rotate == ["breezy-quote-tape-rotate.timer"]
+
+
 def test_1720_utc_is_owned_by_exactly_one_timer() -> None:
     # WP-11b: 17:20 UTC is the ONE shared breezy-family-tally@.timer tick --
     # after 16:50 launch / 17:10 window end, and strictly between the two
