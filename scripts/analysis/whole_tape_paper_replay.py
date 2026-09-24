@@ -447,6 +447,7 @@ def _trial_rows(
                 "fill_minus_entry_ask": str(fill_px - entry_ask),
                 "fill_minus_l2_ask": "" if l2_ask is None else str(fill_px - l2_ask),
                 "lookahead_caveat": LOOK_AHEAD_CAVEAT,
+                "mechanism_test_only": "true",
             }
         )
     return rows
@@ -455,6 +456,7 @@ def _trial_rows(
 def _write_mechanism_trials(output_dir: Path, rows: Sequence[dict[str, str]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "LOOKAHEAD_CAVEAT.txt").write_text(LOOK_AHEAD_CAVEAT + "\n", encoding="utf-8")
+    stamped = [dict(row, mechanism_test_only="true") for row in rows]
     fieldnames = [
         "station",
         "climate_day",
@@ -467,16 +469,18 @@ def _write_mechanism_trials(output_dir: Path, rows: Sequence[dict[str, str]]) ->
         "fill_minus_entry_ask",
         "fill_minus_l2_ask",
         "lookahead_caveat",
+        "mechanism_test_only",
     ]
     with (output_dir / "mechanism_trials.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(stamped)
     table = pa.Table.from_pylist(
-        list(rows), schema=pa.schema([(name, pa.string()) for name in fieldnames])
+        list(stamped), schema=pa.schema([(name, pa.string()) for name in fieldnames])
     )
     metadata = dict(table.schema.metadata or {})
     metadata[b"lookahead_caveat"] = LOOK_AHEAD_CAVEAT.encode()
+    metadata[b"mechanism_test_only"] = b"true"
     pq.write_table(table.replace_schema_metadata(metadata), output_dir / "mechanism_trials.parquet")
 
 

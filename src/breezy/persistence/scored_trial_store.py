@@ -45,6 +45,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from breezy.persistence.mechanism_test_guard import assert_prereg_directory_eligible
 from breezy.settlement.trial_scorer import BucketSource, ScoredTrial, SettlementBasis
 
 __all__ = [
@@ -123,6 +124,7 @@ def read_scored_trials(directory: Path) -> tuple[ScoredTrial, ...]:
     """
     if not directory.exists():
         return ()
+    assert_prereg_directory_eligible(directory)
     latest: dict[str, ScoredTrial] = {}
     for path in sorted(directory.glob(f"{_FILE_PREFIX}*{_FILE_SUFFIX}")):
         table = pq.read_table(path, schema=SCORED_TRIAL_SCHEMA)

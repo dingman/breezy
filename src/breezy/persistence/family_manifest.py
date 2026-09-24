@@ -69,6 +69,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
 
+from breezy.persistence.mechanism_test_guard import assert_prereg_directory_eligible
+
 __all__ = [
     "CompositionKind",
     "FamilyManifest",
@@ -216,6 +218,8 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
     that combined set is refused. `status="DRAFT_NOT_REGISTERED"` and an unpinned (all-zero)
     `boundary_inputs_sha256` are each refused unless `allow_draft=True`.
     """
+    if path.parent.exists():
+        assert_prereg_directory_eligible(path.parent)
     raw = path.read_bytes()
     manifest_sha256 = hashlib.sha256(raw).hexdigest()
     try:
