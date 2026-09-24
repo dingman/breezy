@@ -422,6 +422,51 @@ def test_the_builder_refuses_a_missing_family_id() -> None:
         filled_trials_from_engine(None, {}, family_id=UNSCOPED_FAMILY_ID)  # type: ignore[call-arg]
 
 
+class _FakeOrderCache:
+    """The minimal `engine.cache` shape `filled_trials_from_engine` reads
+    -- an empty order sequence -- so the character-class RED/GREEN below
+    needs no real `BacktestEngine`: the pattern check fires before the
+    order loop ever runs, and `pm_us_crh_v4` (the accepted case) must reach
+    that loop without raising."""
+
+    def orders(self) -> list[object]:
+        return []
+
+
+class _FakeEngineForFamilyIdCheck:
+    cache = _FakeOrderCache()
+
+
+@pytest.mark.parametrize("invalid_family_id", ["Not/Valid", "UPPER", "has space", ""])
+def test_the_builder_refuses_a_family_id_outside_the_registry_key_character_class(
+    invalid_family_id: str,
+) -> None:
+    """`_FAMILY_ID_PATTERN` (`[a-z0-9_]+`) pin -- a manifest's `family_id`
+    is its registry primary key shape, never a path-shaped, uppercase, or
+    whitespace-bearing string. `Not/Valid` in particular carries a `/` NOT
+    at the leading position, so `_assert_valid_trial_id_component`'s own
+    leading-`/`/`..`-segment checks pass it through -- only the character
+    class catches it; deleting `_FAMILY_ID_PATTERN`'s check would make this
+    case (and `UPPER`/`has space`) silently accepted."""
+    with pytest.raises(ValueError, match=r"family_id"):
+        filled_trials_from_engine(
+            _FakeEngineForFamilyIdCheck(),
+            {},
+            family_id=invalid_family_id,
+            trial_id_prefix=DEFAULT_TRIAL_KEY_PREFIX,
+        )
+
+
+def test_the_builder_accepts_a_registry_key_shaped_family_id() -> None:
+    trials = filled_trials_from_engine(
+        _FakeEngineForFamilyIdCheck(),
+        {},
+        family_id="pm_us_crh_v4",
+        trial_id_prefix=DEFAULT_TRIAL_KEY_PREFIX,
+    )
+    assert trials == ()
+
+
 # ---------------------------------------------------------------------------
 # Phase 0b: a replayed one-sided window reaches `on_order_book_depth` through
 # a REAL BacktestEngine (`backtest_harness.py` feeds `OrderBookDepth10` the
