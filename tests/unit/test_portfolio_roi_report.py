@@ -2294,3 +2294,149 @@ class TestG4NoFabricatedPlanQuotations:
         assert quoted in plan_text
         module_source = Path(_prr.__file__).read_text()
         assert quoted in module_source
+
+
+def _ns_at(day: str, hour: int, minute: int = 0) -> int:
+    """UTC instant on ``day`` at ``hour:minute``, in epoch nanoseconds."""
+    return _ns_of(day, hour) + minute * 60 * 1_000_000_000
+
+
+class TestSnapshotIntervalReconciliation:
+    """Cash identity over (previous AccountState ts, this AccountState ts].
+
+    A day-keyed balance with no timestamp still means end of that UTC day,
+    which is what the pre-existing calendar-day fixtures encode. An explicit
+    ``balance_timestamps_ns`` is the snapshot clock.
+    """
+
+    def test_a_fill_after_the_snapshot_lands_in_the_later_interval(self) -> None:
+        """Fill at 18:00Z, snapshots at 16:50Z today and 16:50Z tomorrow.
+
+        The 16:50Z print is before the fill, so today's interval must not
+        book the capital. Both intervals reconcile to 0; capital is on the
+        interval that closes tomorrow. The day-before 16:50Z print is only
+        the prior anchor that gives today's interval a delta.
+        """
+        anchor = "2026-06-01"
+        today = "2026-06-02"
+        tomorrow = "2026-06-03"
+        deployed = Decimal("0.43")
+        fill = _fill(
+            venue_order_id="vo-after-snapshot",
+            ts_event=_ns_at(today, 18, 0),
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal("0.03"),
+        )
+        daily_balances = {
+            anchor: Decimal("10.00"),
+            today: Decimal("10.00"),
+            tomorrow: Decimal("9.57"),
+        }
+        timestamps = {
+            anchor: _ns_at(anchor, 16, 50),
+            today: _ns_at(today, 16, 50),
+            tomorrow: _ns_at(tomorrow, 16, 50),
+        }
+
+        rows = reconcile_daily(
+            fills=[fill],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            balance_timestamps_ns=timestamps,
+        )
+        rows_by_day = {row.day: row for row in rows}
+
+        assert rows_by_day[today].unexplained == Decimal("0.00")
+        assert rows_by_day[tomorrow].unexplained == Decimal("0.00")
+        assert rows_by_day[today].capital_deployed == Decimal("0.00")
+        assert rows_by_day[tomorrow].capital_deployed == deployed
+        assert rows_by_day[today].classification == UNEXPLAINED_OK_LABEL
+        assert rows_by_day[tomorrow].classification == UNEXPLAINED_OK_LABEL
+
+    def test_an_empty_interval_cash_jump_stays_unexplained_capital_flow(self) -> None:
+        """A +40.00 balance jump with no fill and no settlement is still
+        UNEXPLAINED_CAPITAL_FLOW for the full magnitude. Interval assignment
+        must not swallow a real deposit."""
+        opening = "2026-06-10"
+        closing = "2026-06-11"
+        daily_balances = {
+            opening: Decimal("100.00"),
+            closing: Decimal("140.00"),
+        }
+        timestamps = {
+            opening: _ns_at(opening, 16, 50),
+            closing: _ns_at(closing, 16, 50),
+        }
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            balance_timestamps_ns=timestamps,
+        )
+        row = next(r for r in rows if r.day == closing)
+
+        assert row.capital_deployed == Decimal("0.00")
+        assert row.proceeds == Decimal("0.00")
+        assert row.unexplained == Decimal("40.00")
+        assert row.breaches_tolerance is True
+        assert row.classification == UNEXPLAINED_CAPITAL_FLOW_LABEL
+
+
+class TestScoredTrialDedup:
+    def test_two_rows_one_trial_id_book_payout_once(self) -> None:
+        """One trial_id in two family stores must not double-count payout."""
+        day = "2026-06-20"
+        earlier = _scored_trial(
+            trial_id="trial-shared",
+            pnl=Decimal(1),
+            fill_px=Decimal(0),
+            fee=Decimal(0),
+            climate_day="2026-06-18",
+            scored_at_ns=_ns_at(day, 17, 0),
+        )
+        later = _scored_trial(
+            trial_id="trial-shared",
+            pnl=Decimal(1),
+            fill_px=Decimal(0),
+            fee=Decimal(0),
+            climate_day="2026-06-18",
+            scored_at_ns=_ns_at(day, 18, 0),
+        )
+
+        proceeds = _prr.proceeds_by_day((earlier, later))
+
+        assert proceeds == {day: Decimal(1)}
+        assert settlement_payout(later) == Decimal(1)
+
+    def test_duplicate_count_keeps_the_latest_scored_at_ns(self) -> None:
+        day = "2026-06-20"
+        earlier = _scored_trial(
+            trial_id="trial-shared",
+            pnl=Decimal(1),
+            fill_px=Decimal(0),
+            fee=Decimal(0),
+            scored_at_ns=_ns_at(day, 17, 0),
+        )
+        later = _scored_trial(
+            trial_id="trial-shared",
+            pnl=Decimal(5),
+            fill_px=Decimal(0),
+            fee=Decimal(0),
+            scored_at_ns=_ns_at(day, 18, 0),
+        )
+
+        kept, n_dup = _prr.dedupe_scored_trials((earlier, later))
+
+        assert n_dup == 1
+        assert len(kept) == 1
+        assert kept[0].scored_at_ns == later.scored_at_ns
+        assert settlement_payout(kept[0]) == Decimal(5)
+
+    def test_the_summary_line_names_n_duplicate_scored_trials(self) -> None:
+        data = dataclasses.replace(_report_data(), n_duplicate_scored_trials=1)
+        line = journal_line(data)
+
+        assert "n_duplicate_scored_trials=1" in line
+        assert "$" not in line
+        assert not re.search(r"\d+\.\d+", line)

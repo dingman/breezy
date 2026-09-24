@@ -737,6 +737,83 @@ def _shift_iso_day(day: str, delta_days: int) -> str:
     return (date.fromisoformat(day) + timedelta(days=delta_days)).isoformat()
 
 
+def _utc_midnight_ns(day: str) -> int:
+    """Epoch nanoseconds of 00:00:00.000000000Z on ``day``. Integer arithmetic
+    only -- ``datetime.timestamp()`` is a float and is not used here."""
+    midnight = datetime.combine(date.fromisoformat(day), datetime.min.time(), tzinfo=UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    delta = midnight - epoch
+    return delta.days * _NS_PER_DAY + delta.seconds * 1_000_000_000
+
+
+def _end_of_utc_day_ns(day: str) -> int:
+    """Last nanosecond of ``day`` UTC.
+
+    A day-keyed balance with no snapshot clock is stamped here, so an event
+    anywhere on that calendar day falls in the interval that closes on that
+    day. That is the pre-existing calendar-day fixture behaviour. A real
+    ``AccountState`` timestamp overrides it.
+    """
+    return _utc_midnight_ns(_shift_iso_day(day, 1)) - 1
+
+
+def balance_point_ts_ns(ts_iso: str) -> int:
+    """Epoch nanoseconds of one ``BalancePoint.ts_iso`` (``...Z``)."""
+    if not ts_iso.endswith("Z"):
+        raise ValueError(f"balance timestamp {ts_iso!r} is not a Zulu instant")
+    body = ts_iso[:-1]
+    if "." in body:
+        head, frac = body.split(".", 1)
+        digits = "".join(ch for ch in frac if ch.isdigit())
+        frac_ns = int((digits + "000000000")[:9])
+    else:
+        head = body
+        frac_ns = 0
+    day, hms = head.split("T", 1)
+    hour_s, minute_s, second_s = hms.split(":")
+    return (
+        _utc_midnight_ns(day)
+        + int(hour_s) * 3_600 * 1_000_000_000
+        + int(minute_s) * 60 * 1_000_000_000
+        + int(second_s) * 1_000_000_000
+        + frac_ns
+    )
+
+
+def _snapshot_ts_ns(day: str, balance_timestamps_ns: Mapping[str, int] | None) -> int:
+    if balance_timestamps_ns is not None and day in balance_timestamps_ns:
+        return balance_timestamps_ns[day]
+    return _end_of_utc_day_ns(day)
+
+
+def _cash_between(
+    *,
+    buy_fills: Sequence[DurableFillRecord],
+    scored_trials: Sequence[ScoredTrial],
+    after_ts: int | None,
+    through_ts: int,
+) -> tuple[Decimal, Decimal, int]:
+    """Capital, proceeds, and BUY-fill count for one snapshot interval.
+
+    ``after_ts is None`` selects events at or before ``through_ts`` (the
+    opening snapshot, which has no previous print). Otherwise the interval
+    is ``(after_ts, through_ts]``.
+    """
+    if after_ts is None:
+        chosen_fills = tuple(fill for fill in buy_fills if fill.ts_event <= through_ts)
+        chosen_trials = tuple(trial for trial in scored_trials if trial.scored_at_ns <= through_ts)
+    else:
+        chosen_fills = tuple(
+            fill for fill in buy_fills if after_ts < fill.ts_event <= through_ts
+        )
+        chosen_trials = tuple(
+            trial for trial in scored_trials if after_ts < trial.scored_at_ns <= through_ts
+        )
+    capital = sum((capital_deployed_for_fill(fill) for fill in chosen_fills), start=Decimal(0))
+    proceeds = sum((settlement_payout(trial) for trial in chosen_trials), start=Decimal(0))
+    return capital, proceeds, len(chosen_fills)
+
+
 # --------------------------------------------------------------------------
 # C1b -- the cash identity's two ledger-scoped terms (§6 D4)
 # --------------------------------------------------------------------------
@@ -801,12 +878,45 @@ def settlement_lag_days(trial: ScoredTrial) -> int:
     return (scored_day - climate_day).days
 
 
-def proceeds_by_day(scored_trials: Iterable[ScoredTrial]) -> dict[str, Decimal]:
-    """Sum of :func:`settlement_payout` grouped by :func:`proceeds_date`
-    (§6 D4: 'proceeds(D) = Sum over positions whose settlement is dated D,
-    of payout (cash IN)')."""
-    totals: dict[str, Decimal] = {}
+def dedupe_scored_trials(
+    scored_trials: Sequence[ScoredTrial],
+) -> tuple[tuple[ScoredTrial, ...], int]:
+    """One row per ``trial_id``, keeping the latest ``scored_at_ns``.
+
+    The pooled store does not dedupe across family directories
+    (``read_scored_trials_pooled``). Two families can share a
+    ``trial_id_prefix``, so the same settled trial is readable twice.
+    Proceeds, realised P&L and the lag sample must see it once.
+
+    The returned count is the number of rows dropped. Two rows of one
+    ``trial_id`` count as 1. On an equal ``scored_at_ns`` the later row
+    wins.
+    """
+    best: dict[str, ScoredTrial] = {}
+    order: list[str] = []
+    n_duplicate = 0
     for trial in scored_trials:
+        current = best.get(trial.trial_id)
+        if current is None:
+            best[trial.trial_id] = trial
+            order.append(trial.trial_id)
+            continue
+        n_duplicate += 1
+        if trial.scored_at_ns >= current.scored_at_ns:
+            best[trial.trial_id] = trial
+    return tuple(best[trial_id] for trial_id in order), n_duplicate
+
+
+def proceeds_by_day(scored_trials: Iterable[ScoredTrial]) -> dict[str, Decimal]:
+    """Sum of :func:`settlement_payout` grouped by :func:`proceeds_date`.
+
+    Deduped by ``trial_id`` first (:func:`dedupe_scored_trials`), so one
+    trial stored under two families contributes its payout once. Dating is
+    still the UTC day of the kept row's ``scored_at_ns`` (§6 D4 R3).
+    """
+    kept, _n_duplicate = dedupe_scored_trials(tuple(scored_trials))
+    totals: dict[str, Decimal] = {}
+    for trial in kept:
         day = proceeds_date(trial)
         totals[day] = totals.get(day, Decimal(0)) + settlement_payout(trial)
     return totals
@@ -901,12 +1011,14 @@ class DailyUnexplained:
       cumulative sum.
     - A day that RESOLVES a balance delta spanning one or more hole days
       (``window_start_day != day``, ``spans_hole is True``): the row is
-      never silently attributed to just that one day -- ``capital_deployed``
-      and ``proceeds`` are the SUM over the whole
-      ``window_start_day..day`` span (inclusive), compared against the one
-      known delta that actually spans it, and named as such via
-      ``spans_hole``/``window_start_day`` rather than absorbed into an
-      ordinary single-day row.
+      never silently attributed to just that one day. ``capital_deployed``
+      and ``proceeds`` are the events in
+      ``(previous AccountState ts, this AccountState ts]`` -- the previous
+      print is the known balance on the day before ``window_start_day`` --
+      compared against the one known delta that spans the hole, and named
+      via ``spans_hole``/``window_start_day``. With no snapshot clock each
+      print is the last nanosecond of its UTC day, so the interval is that
+      calendar span.
     """
 
     day: str
@@ -975,21 +1087,33 @@ def reconcile_daily(
     fills: Sequence[DurableFillRecord],
     scored_trials: Sequence[ScoredTrial],
     daily_balances: Mapping[str, Decimal | None],
+    balance_timestamps_ns: Mapping[str, int] | None = None,
 ) -> tuple[DailyUnexplained, ...]:
-    """The cash identity (§6 D4), windowed over known-balance-to-known-balance
-    intervals (F3) so a hole in the balance series is never coerced into a
-    known-zero delta.
+    """The cash identity (§6 D4), one row per balance interval.
+
+    An interval is ``(previous AccountState ts, this AccountState ts]``.
+    Capital is the BUY fills whose ``ts_event`` falls in that interval;
+    proceeds are the deduped scored trials whose ``scored_at_ns`` falls in
+    it. The row's ``day`` is the closing snapshot's UTC day. A day-keyed
+    balance with no entry in ``balance_timestamps_ns`` is stamped at the
+    last nanosecond of that UTC day, which keeps a calendar-day fixture
+    (event at midnight, balance already moved on that same day) on the
+    day the fixture names.
 
     Quotes the identity verbatim: 'unexplained(D) = Delta_balance(D) -
     proceeds(D) + capital_deployed(D)'. Never nets a breach into ROI or into
     another day's figure -- each row is independent; only a caller's
     explicit cumulative sum (see :func:`cumulative_reconciliation`) combines
     them, and :class:`BALANCE_UNKNOWN_LABEL` rows never enter that sum.
+    A balance jump with no fill and no settlement in the interval stays
+    :data:`UNEXPLAINED_CAPITAL_FLOW_LABEL` at its full magnitude.
     """
+    scored_trials, _n_duplicate = dedupe_scored_trials(tuple(scored_trials))
     capital_by_day = capital_deployed_by_day(fills)
     fills_opened_count = _fills_opened_count_by_day(fills)
     proceeds_totals = proceeds_by_day(scored_trials)
     proxy_lag_days = _days_potentially_explained_by_proxy_lag(scored_trials)
+    buy_fills = tuple(fill for fill in fills if fill_side_label(fill) == ORDER_SIDE_BUY)
 
     rows: list[DailyUnexplained] = []
     resolved_days: set[str] = set()
@@ -997,13 +1121,15 @@ def reconcile_daily(
     windows = _balance_windows(daily_balances)
     for window in windows:
         span_days = _days_between_inclusive(window.window_start_day, window.end_day)
-        capital_deployed = sum(
-            (capital_by_day.get(day, Decimal(0)) for day in span_days), start=Decimal(0)
+        previous_day = _shift_iso_day(window.window_start_day, -1)
+        prev_ts = _snapshot_ts_ns(previous_day, balance_timestamps_ns)
+        this_ts = _snapshot_ts_ns(window.end_day, balance_timestamps_ns)
+        capital_deployed, proceeds, n_fills_in_span = _cash_between(
+            buy_fills=buy_fills,
+            scored_trials=scored_trials,
+            after_ts=prev_ts,
+            through_ts=this_ts,
         )
-        proceeds = sum(
-            (proceeds_totals.get(day, Decimal(0)) for day in span_days), start=Decimal(0)
-        )
-        n_fills_in_span = sum(fills_opened_count.get(day, 0) for day in span_days)
         unexplained = window.delta - proceeds + capital_deployed
         tolerance = per_day_tolerance(n_fills_in_span)
         breaches = abs(unexplained) > tolerance
@@ -1040,8 +1166,9 @@ def reconcile_daily(
     # against) and its own balance IS known, so it is never picked up by
     # the BALANCE_UNKNOWN sweep below either -- without this row it is
     # silently dropped: its capital/proceeds are computed but land in no
-    # row at all. Emitted with a distinct label, its own day's
-    # capital/proceeds for transparency, and `unexplained=None` so it is
+    # row at all. Emitted with a distinct label, the capital/proceeds at
+    # or before that opening snapshot for transparency, and
+    # `unexplained=None` so it is
     # excluded from every cumulative sum exactly like a `BALANCE_UNKNOWN`
     # row (see `cumulative_reconciliation`'s `row.unexplained is not None`
     # filter).
@@ -1050,8 +1177,13 @@ def reconcile_daily(
         earliest_known_day = known_days[0]
         resolved_end_days = {window.end_day for window in windows}
         if earliest_known_day not in resolved_end_days:
-            capital_deployed = capital_by_day.get(earliest_known_day, Decimal(0))
-            proceeds = proceeds_totals.get(earliest_known_day, Decimal(0))
+            first_ts = _snapshot_ts_ns(earliest_known_day, balance_timestamps_ns)
+            capital_deployed, proceeds, n_opening_fills = _cash_between(
+                buy_fills=buy_fills,
+                scored_trials=scored_trials,
+                after_ts=None,
+                through_ts=first_ts,
+            )
             rows.append(
                 DailyUnexplained(
                     day=earliest_known_day,
@@ -1061,7 +1193,7 @@ def reconcile_daily(
                     proceeds=proceeds,
                     delta_balance=None,
                     unexplained=None,
-                    tolerance=per_day_tolerance(fills_opened_count.get(earliest_known_day, 0)),
+                    tolerance=per_day_tolerance(n_opening_fills),
                     breaches_tolerance=False,
                     settlement_lag_days=proxy_lag_days.get(earliest_known_day),
                     proceeds_date_proxy=(
@@ -1587,6 +1719,9 @@ class PortfolioRoiReportData:
     # -- F5: SELL exits, excluded from capital_deployed/ROI (see
     # `exit_label_for_fill`), visible only as this dimensionless count.
     n_exit_fills: int = 0
+    # Rows dropped before proceeds: same trial_id in more than one family
+    # store. Latest scored_at_ns is kept. Dimensionless.
+    n_duplicate_scored_trials: int = 0
 
 
 def power_caveat(*, n_ledger_fills: int, n_scored: int, days: int) -> str:
@@ -1619,6 +1754,7 @@ def build_portfolio_roi_report_data(
     n_ledger_rows: int = 0,
     n_undecodable_ledger_rows: int = 0,
     n_exit_fills: int = 0,
+    n_duplicate_scored_trials: int = 0,
 ) -> PortfolioRoiReportData:
     """Assemble the one :class:`PortfolioRoiReportData` this run produces.
 
@@ -1677,6 +1813,7 @@ def build_portfolio_roi_report_data(
         n_ledger_rows=n_ledger_rows,
         n_undecodable_ledger_rows=n_undecodable_ledger_rows,
         n_exit_fills=n_exit_fills,
+        n_duplicate_scored_trials=n_duplicate_scored_trials,
     )
 
 
@@ -1726,6 +1863,7 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "n_ledger_rows": data.n_ledger_rows,
         "n_undecodable_ledger_rows": data.n_undecodable_ledger_rows,
         "n_exit_fills": data.n_exit_fills,
+        "n_duplicate_scored_trials": data.n_duplicate_scored_trials,
     }
 
 
@@ -1778,6 +1916,7 @@ class PortfolioRoiReportView:
     n_ledger_rows: int
     n_undecodable_ledger_rows: int
     n_exit_fills: int
+    n_duplicate_scored_trials: int
     #: G2: the per-day table, typed/validated the same way as every other
     #: field (never a raw list of dicts) -- absent on an old JSON sibling
     #: (schema_version=1 predates this field) reads as `()`, the only
@@ -1906,6 +2045,11 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
             else 0
         ),
         n_exit_fills=_require_int(raw, "n_exit_fills") if "n_exit_fills" in raw else 0,
+        n_duplicate_scored_trials=(
+            _require_int(raw, "n_duplicate_scored_trials")
+            if "n_duplicate_scored_trials" in raw
+            else 0
+        ),
         _roi=_require_decimal_str(raw, "roi"),
         _roi_minus_b0=_require_decimal_str(raw, "roi_minus_b0"),
         _roi_minus_b1=_require_decimal_str(raw, "roi_minus_b1"),
@@ -1981,6 +2125,7 @@ def render_markdown_report(data: PortfolioRoiReportData) -> str:
         f"- unsettled_capital_positions: {data.unsettled_capital_positions}",
         f"- max_days_past_horizon: {data.max_days_past_horizon}",
         f"- n_family_station_refusals: {data.n_family_station_refusals}",
+        f"- n_duplicate_scored_trials: {data.n_duplicate_scored_trials}",
         "",
         "## Settled-window cash-identity verdict (F1, §6 D4)",
         f"- settled_cumulative_unexplained: {data.settled_cumulative_unexplained}",
@@ -2027,6 +2172,7 @@ def journal_line(data: PortfolioRoiReportData) -> str:
     return (
         f"PORTFOLIO_ROI period={data.period_start}..{data.period_end} "
         f"n_fills={data.n_fills} n_scored={data.n_scored} "
+        f"n_duplicate_scored_trials={data.n_duplicate_scored_trials} "
         f"n_residual={data.n_residual} n_unreconciled={data.n_unreconciled} "
         f"n_ledger_rows={data.n_ledger_rows} "
         f"n_undecodable_ledger_rows={data.n_undecodable_ledger_rows} "
@@ -2460,7 +2606,9 @@ def _run(
     # `read_scored_trials`/`residual_trial_ids` on the family-agnostic
     # parent directory (as this module previously did) always returns
     # nothing, because neither reader recurses.
-    scored_trials = read_scored_trials_pooled(scored_trials_dir).rows
+    scored_trials, n_duplicate_scored_trials = dedupe_scored_trials(
+        read_scored_trials_pooled(scored_trials_dir).rows
+    )
     residual_ids = residual_trial_ids_pooled(scored_trials_dir)
     scored_ids = scored_trial_ids_of(scored_trials)
 
@@ -2524,6 +2672,11 @@ def _run(
             day: (point.total_usd if point is not None else None)
             for day, point in balance_series.items()
         }
+        balance_timestamps_ns: dict[str, int] = {
+            day: balance_point_ts_ns(point.ts_iso)
+            for day, point in balance_series.items()
+            if point is not None
+        }
 
         # G1: the earliest known-balance day in `daily_balances` has no
         # PRIOR balance within the report period to diff against. Look
@@ -2542,13 +2695,18 @@ def _run(
                 max_lookback_days=OPENING_BALANCE_LOOKBACK_DAYS,
             )
             if lookback_point is not None:
+                lookback_day = lookback_point.ts_iso[:10]
                 daily_balances = {
                     **daily_balances,
-                    lookback_point.ts_iso[:10]: lookback_point.total_usd,
+                    lookback_day: lookback_point.total_usd,
                 }
+                balance_timestamps_ns[lookback_day] = balance_point_ts_ns(lookback_point.ts_iso)
 
         daily_rows = reconcile_daily(
-            fills=fills, scored_trials=scored_trials, daily_balances=daily_balances
+            fills=fills,
+            scored_trials=scored_trials,
+            daily_balances=daily_balances,
+            balance_timestamps_ns=balance_timestamps_ns,
         )
         # G1: a successful look-back above adds a day BEFORE `period_start`
         # into `daily_balances` purely as a window anchor -- it is never
@@ -2598,6 +2756,7 @@ def _run(
         n_ledger_rows=ledger_result.n_ledger_rows,
         n_undecodable_ledger_rows=ledger_result.n_undecodable_ledger_rows,
         n_exit_fills=n_exit_fills,
+        n_duplicate_scored_trials=n_duplicate_scored_trials,
     )
 
     # F7/F9: atomic writes -- the directory is created by
