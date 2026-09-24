@@ -16,7 +16,10 @@
 
 `ask`/`break_even` are populated by `_finalize_take` only at the
 `edge_below_break_even` refusal or a `Take`. They are `None` on **every row of
-every day recorded**. No decision has ever reached the pricing gate.
+every day recorded**. On the two days measured here (2026-09-20 and
+2026-09-16 -- both after the last fill, 2026-09-15T20:12:06Z), no decision
+reached the pricing gate. That is this table's measurement, not a claim about
+any other day (AUD-16a).
 
 ## Gate 1 — `observation_ambiguous` (35,980 rows; MIA, LAX)
 
