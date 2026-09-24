@@ -95,7 +95,7 @@ ruff 24 incl. `persistence/family_manifest.py:42`), CF-13, CF-14b, PF-1, BL-10, 
 
 ## Pointers
 
-Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
+Audit backlog 09-21 (AUD-01..19; 19 READY, AUD-06b not): `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
 (binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
