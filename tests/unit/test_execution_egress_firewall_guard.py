@@ -3401,6 +3401,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # plain frozen dataclasses, no client, no socket; see the comment
         # block above this assert for the full justification.
         "tests/unit/test_startup_evidence_parsers_agree_2026_09_16.py",
+        # Old -> new (this row, AUD-17): added
+        # `tests/unit/test_operator_caps_through_the_live_composition.py`,
+        # which drives the shipped pm_us_crh_v4 manifest through the real
+        # `PolymarketUSExecutionClient._submit_order`. WIDENED, not relaxed
+        # (L-6/L-12): the comparison is still `==`; the module carries no
+        # `SOCKET_RESTORING_MARKERS`. Its `post_order` is a local
+        # `_RecordingSender` double, the same injected-sender shape as the
+        # exec-client suite, so this row never opens a socket either.
+        "tests/unit/test_operator_caps_through_the_live_composition.py",
     }
 
 
