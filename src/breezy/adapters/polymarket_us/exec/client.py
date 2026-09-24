@@ -455,6 +455,23 @@ _EVIDENCE_REFRESH_AFTER_NS: Final[int] = 60 * 1_000_000_000
 #: still AMBIGUOUS raises the one-shot stale-intent alert below.
 _STALE_INTENT_ALERT_AFTER_NS: Final[int] = 15 * 60 * 1_000_000_000
 
+#: HIGH review fix (2026-09-24, post-ac691dc): the floor between
+#: ``self._resolver_instrument_loader`` re-attempts for the SAME instrument
+#: id, whether the last attempt hit or missed. ``ParquetDataCatalog.
+#: instruments()`` is a synchronous full-catalog scan -- measured at
+#: 1.06-1.36s wall time against the production catalog (13,132 instruments,
+#: ``/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us``,
+#: 2026-09-24, ``systemd-run --user --scope -p MemoryMax=4G``), so a MISS
+#: must not re-trigger it every ``_RESOLVER_POLL_INTERVAL_SECS`` forever.
+#: 15 minutes matches ``_STALE_INTENT_ALERT_AFTER_NS``'s own magnitude: the
+#: catalog only grows once per quote-tape recorder rotation cycle (hours),
+#: so this is a conservative floor that still catches a catch-up well inside
+#: an operator's incident-response window. The consecutive-failure backoff
+#: below independently throttles the PASS rate while a miss persists (it
+#: saturates at ``_RESOLVER_BACKOFF_CAP_SECS`` well under 15 minutes), so
+#: this constant is what actually bounds the scan's own frequency.
+_RESOLVER_INSTRUMENT_LOAD_RETRY_NS: Final[int] = 15 * 60 * 1_000_000_000
+
 #: The only order side Breezy OPENS with. ``allow_short=False`` is permanent
 #: (``strategy/weather_common/risk.py:139``).
 LONG_ONLY_SIDE: Final[str] = "BUY"
@@ -1123,6 +1140,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         retirement_reasons: Any = None,
         submit_veto: Callable[[], str | None] | None = None,
         exit_manifest: FamilyManifest | None = None,
+        resolver_instrument_loader: Callable[[str], Any] | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
 
@@ -1216,6 +1234,28 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # `_EXIT_MANIFEST_ABSENT_REASON` rather than dereferencing `None`
         # inside `submit_chain.unmappable_exit_order_reason`.
         self._exit_manifest = exit_manifest
+        # 2026-09-24 stuck-prior-day-instrument fix: injected exactly like
+        # `submit_veto`/`exit_manifest` above -- a plain callable this
+        # adapters-layer module needs no `runtime` import to type. Given a
+        # venue instrument id string, returns the native `Instrument`
+        # definition if one can be obtained WITHOUT subscribing to market
+        # data (composition's `ParquetDataCatalog.instruments()` historical
+        # read is the intended source -- see `node_config.py`), or `None`
+        # if it cannot. `None` (the default) matches every composition root
+        # that predates this parameter: the resolver then escalates instead
+        # of loading, exactly as it always has.
+        self._resolver_instrument_loader = resolver_instrument_loader
+        # Same field, dedup set: an instrument the loader could not produce
+        # is escalated at ERROR exactly ONCE per instrument id, never every
+        # ~5s poll for the process lifetime -- the same one-shot shape
+        # `_resolver_stale_alerted_intent_ids` already uses below.
+        self._resolver_missing_instrument_logged: set[str] = set()
+        # HIGH review fix (2026-09-24, post-ac691dc): the LAST timestamp the
+        # loader was attempted for an instrument id, whether it hit or
+        # missed. Gates re-attempts to `_RESOLVER_INSTRUMENT_LOAD_RETRY_NS`
+        # apart -- see that constant's docstring for the measured cost this
+        # guards against.
+        self._resolver_instrument_load_attempted_ns: dict[str, int] = {}
         self._intent_reconciled: bool = False
         # Resolution A/E (plan rev 6.1): the live `SpendBooking` for a
         # with-id AMBIGUOUS intent, held ONLY for same-process true-up.
@@ -1813,11 +1853,70 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     },
                 }
             instrument = self._cache.instrument(InstrumentId.from_str(context.instrument_id))
+            if instrument is None and self._resolver_instrument_loader is not None:
+                # 2026-09-24 fix: the OPEN intent's instrument may belong to
+                # a PRIOR day's node boot (the node boots for TODAY's
+                # instruments only) and be absent from THIS run's cache. A
+                # loader that can read it from durable history (never the
+                # venue-backed InstrumentProvider, which refuses anything
+                # outside the latest discovery cycle for an expired market,
+                # and never subscribes to market data) is consulted here --
+                # gated to `_RESOLVER_INSTRUMENT_LOAD_RETRY_NS` apart (HIGH
+                # review fix, post-ac691dc): the loader is a synchronous
+                # full-catalog scan, measured at 1.06-1.36s against the
+                # production catalog -- see that constant's docstring.
+                # Deliberately NOT `.get(...)`: a dict-method call here is a
+                # new, unpermitted callee under E0-NOSEND-RESOLVER (see the
+                # backoff comment above).
+                # Deliberately NOT `.get(...)`: a dict-method call here is a
+                # new, unpermitted callee under E0-NOSEND-RESOLVER (see the
+                # backoff comment above).
+                last_attempted_ns = self._resolver_instrument_load_attempted_ns[context.instrument_id] if context.instrument_id in self._resolver_instrument_load_attempted_ns else None  # noqa: E501, SIM401
+                load_now_ns = self._clock.timestamp_ns()
+                if (
+                    last_attempted_ns is None
+                    or load_now_ns - last_attempted_ns >= _RESOLVER_INSTRUMENT_LOAD_RETRY_NS
+                ):
+                    self._resolver_instrument_load_attempted_ns = {
+                        **self._resolver_instrument_load_attempted_ns,
+                        context.instrument_id: load_now_ns,
+                    }
+                    # Off the event loop: the scan is blocking local I/O, not
+                    # a network call -- `self._loop` is the SAME loop this
+                    # coroutine already runs on (`LiveExecutionClient.
+                    # __init__`), and `run_in_executor` hands the call to the
+                    # default thread pool so the rest of the node (order
+                    # sends, quote processing) keeps running while it
+                    # completes, instead of stalling behind it.
+                    instrument = await self._loop.run_in_executor(
+                        None, self._resolver_instrument_loader, context.instrument_id,
+                    )
+                    if instrument is not None:
+                        self._cache.add_instrument(instrument)
             if instrument is None:
-                self._log.warning(
-                    f"resolver: instrument {context.instrument_id} not in the "
-                    "cache; retrying next pass"
-                )
+                # A miss counts toward the SAME consecutive-failure backoff
+                # the GET path below uses -- every pass this intent fails to
+                # progress on, for whatever reason, slows the next attempt.
+                self._resolver_consecutive_failures += 1
+                self._resolver_last_failure_kind[context.intent_id] = "instrument_unavailable"
+                if context.instrument_id not in self._resolver_missing_instrument_logged:
+                    self._resolver_missing_instrument_logged = (
+                        self._resolver_missing_instrument_logged | {context.instrument_id}
+                    )
+                    self._log.error(
+                        f"resolver: instrument {context.instrument_id} is not in "
+                        "the cache and could not be loaded; this intent stays "
+                        "AMBIGUOUS until a definition becomes available "
+                        f"(backoff: {self._resolver_consecutive_failures} consecutive "
+                        "failure(s))"
+                    )
+                else:
+                    self._log.debug(
+                        f"resolver: instrument {context.instrument_id} still "
+                        "unavailable; retrying next pass "
+                        f"(backoff: {self._resolver_consecutive_failures} consecutive "
+                        "failure(s))"
+                    )
                 continue
             try:
                 order_payload = await self._private_read(

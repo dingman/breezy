@@ -2163,6 +2163,30 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # counted, never left to kill the polling task. Inert -- increments
         # a process-local counter and logs; reaches no network.
         "self._note_resolver_error",
+        # 2026-09-24 stuck-prior-day-instrument fix: the injected loader is
+        # a plain callable this module never imports the type of (mirrors
+        # `self._private_read`'s own shape) -- its egress, if any, lives in
+        # the closure `node_config.py` builds (a durable ParquetDataCatalog
+        # read, never a venue call), OUTSIDE this scanned file entirely.
+        # `self._cache.add_instrument` is a local Cache write only -- the
+        # native `Cache.add_instrument` (`cache/adapter.py:158`) transforms
+        # and stores; it never touches a data client or creates a
+        # subscription. Neither reaches `self._order_sender.post_order`,
+        # which stays absent from this set.
+        "self._resolver_instrument_loader",
+        "self._cache.add_instrument",
+        # HIGH review fix (2026-09-24, post-ac691dc): the loader above is a
+        # synchronous full-catalog scan measured at 1.06-1.36s wall time
+        # against the production catalog -- run directly on the event loop
+        # it would stall order sends and quote processing for over a
+        # second on every miss. `self._loop` is the SAME
+        # `asyncio.AbstractEventLoop` this coroutine already runs on
+        # (`LiveExecutionClient.__init__` stores the injected `loop` as
+        # `self._loop`, `live/execution_client.py:132`) -- `run_in_executor`
+        # hands the call to the default `ThreadPoolExecutor` and merely
+        # awaits the result; it opens no socket, sends no order, and
+        # creates no market-data subscription.
+        "self._loop.run_in_executor",
     }
 )
 
@@ -2295,6 +2319,29 @@ def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
     return violations
 
 
+def _is_permitted_resolver_executor_call(call: ast.Call) -> bool:
+    """The ONE ``self._loop.run_in_executor`` shape
+    E0-NOSEND-RESOLVER-EXECUTOR permits (security review, 2b4c4b6 follow-up):
+    a literal ``None`` executor, and ``self._resolver_instrument_loader``
+    passed as a plain POSITIONAL callable in the second argument slot --
+    never a lambda, a bare ``Name``, a different attribute
+    (``self._order_sender.post_order`` included), or a keyword-passed
+    callable. ``_dotted_callee`` returning ``None`` for anything that is not
+    a plain dotted name (a lambda, a call result, a subscript) already makes
+    those shapes fail the equality check by construction.
+
+    ``call.args[2:]`` (the loader's own positional arguments, e.g.
+    ``context.instrument_id``) are UNCONSTRAINED -- the loader itself is the
+    vetted callee here, not what gets passed to it.
+    """
+    if len(call.args) < 2:
+        return False
+    executor_arg = call.args[0]
+    if not (isinstance(executor_arg, ast.Constant) and executor_arg.value is None):
+        return False
+    return _dotted_callee(call.args[1]) == "self._resolver_instrument_loader"
+
+
 def find_exec_resolver_violations(path: str, source: str) -> list[Violation]:
     """Resolution A (plan rev 6.1), SAFETY M3 pin 2: the resolver's own
     E0-NOSEND-shaped rule.
@@ -2305,6 +2352,18 @@ def find_exec_resolver_violations(path: str, source: str) -> list[Violation]:
     :data:`EXEC_RESOLVER_PERMITTED_CALLEES`, which excludes
     ``self._order_sender.post_order`` BY CONSTRUCTION. A resolver that could
     reach it would defeat the entire point of resolving AMBIGUOUS by GET.
+
+    ``self._loop.run_in_executor`` gets an EXTRA, narrower check
+    (security review, 2b4c4b6 follow-up): :func:`_dotted_callee` matches
+    ``Call.func`` names only, so membership in
+    :data:`EXEC_RESOLVER_PERMITTED_CALLEES` alone would let
+    ``self._loop.run_in_executor(None, self._order_sender.post_order,
+    order)`` pass -- the callee name is identical, only the ARGUMENTS
+    differ. :func:`_is_permitted_resolver_executor_call` inspects those
+    arguments and is checked for every ``run_in_executor`` call regardless
+    of the generic allowlist, via a distinct violation code so a caller can
+    tell "wrong callee" (E0-NOSEND-RESOLVER) apart from "right callee, wrong
+    executor shape" (E0-NOSEND-RESOLVER-EXECUTOR).
     """
     if not path.startswith(EXEC_PACKAGE_PATH_PREFIX):
         return []
@@ -2319,6 +2378,20 @@ def find_exec_resolver_violations(path: str, source: str) -> list[Violation]:
             if not isinstance(inner, ast.Call):
                 continue
             callee = _dotted_callee(inner.func)
+            if callee == "self._loop.run_in_executor":
+                if not _is_permitted_resolver_executor_call(inner):
+                    violations.append(
+                        Violation(
+                            path,
+                            inner.lineno,
+                            "E0-NOSEND-RESOLVER-EXECUTOR",
+                            f"{node.name}() calls self._loop.run_in_executor "
+                            "with a shape other than "
+                            "(None, self._resolver_instrument_loader, ...) -- "
+                            "the only shape this allowlist permits",
+                        )
+                    )
+                continue
             if callee not in EXEC_RESOLVER_PERMITTED_CALLEES:
                 violations.append(
                     Violation(
@@ -3566,6 +3639,95 @@ def test_resolver_scan_detects_a_planted_post_order_call() -> None:
     )
     assert [v.rule for v in violations] == ["E0-NOSEND-RESOLVER"]
     assert "post_order" in violations[0].detail
+
+
+def test_resolver_scan_flags_run_in_executor_smuggling_post_order() -> None:
+    """Security review follow-up (2b4c4b6): ``_dotted_callee`` matches
+    ``Call.func`` names only, so bare membership of
+    ``self._loop.run_in_executor`` in the allowlist would let
+    ``self._loop.run_in_executor(None, self._order_sender.post_order,
+    order)`` pass -- same callee name, different (dangerous) argument. This
+    is the exact shape the review's brief names; it must be caught, with
+    the executor-specific code, distinct from a plain unlisted-callee miss."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _resolve_ambiguous_intents(self):\n"
+        "    await self._loop.run_in_executor(\n"
+        "        None, self._order_sender.post_order, order,\n"
+        "    )\n"
+    )
+    violations = find_exec_resolver_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0-NOSEND-RESOLVER-EXECUTOR"]
+    assert "run_in_executor" in violations[0].detail
+
+
+def test_resolver_scan_flags_run_in_executor_with_a_lambda() -> None:
+    """A lambda has no dotted name -- ``_dotted_callee`` returns ``None`` for
+    it -- so it can never equal ``self._resolver_instrument_loader`` and must
+    be flagged, never silently waved through as "not a plain Attribute so
+    skip it"."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _resolve_ambiguous_intents(self):\n"
+        "    await self._loop.run_in_executor(\n"
+        "        None, lambda: self._order_sender.post_order, context.instrument_id,\n"
+        "    )\n"
+    )
+    violations = find_exec_resolver_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0-NOSEND-RESOLVER-EXECUTOR"]
+
+
+def test_resolver_scan_flags_run_in_executor_with_a_bare_name() -> None:
+    """A bare local ``Name`` (e.g. a callable smuggled in through a
+    closure/alias) must be flagged too -- only the EXACT dotted name
+    ``self._resolver_instrument_loader`` is permitted, never a look-alike
+    local binding."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _resolve_ambiguous_intents(self):\n"
+        "    loader = self._resolver_instrument_loader\n"
+        "    await self._loop.run_in_executor(None, loader, context.instrument_id)\n"
+    )
+    violations = find_exec_resolver_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0-NOSEND-RESOLVER-EXECUTOR"]
+
+
+def test_resolver_scan_permits_the_exact_run_in_executor_shape() -> None:
+    """Control: the ONE shape the resolver actually ships -- a literal
+    ``None`` executor and ``self._resolver_instrument_loader`` passed
+    positionally -- must clear the scan, or the narrowing would forbid the
+    very call it exists to permit."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _resolve_ambiguous_intents(self):\n"
+        "    await self._loop.run_in_executor(\n"
+        "        None, self._resolver_instrument_loader, context.instrument_id,\n"
+        "    )\n"
+    )
+    assert (
+        find_exec_resolver_violations(
+            "src/breezy/adapters/polymarket_us/exec/client.py",
+            source,
+        )
+        == []
+    )
 
 
 def test_resolver_scan_permits_a_bounded_get_and_nothing_else() -> None:

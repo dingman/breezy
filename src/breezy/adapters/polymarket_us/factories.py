@@ -804,5 +804,6 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             retirement_reasons=config.retirement_reasons,
             submit_veto=config.submit_veto,
             exit_manifest=config.exit_manifest,
+            resolver_instrument_loader=config.resolver_instrument_loader,
         )
         return client

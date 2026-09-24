@@ -38,6 +38,7 @@ from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
 from breezy.adapters.polymarket_us.exec.client import (
+    _RESOLVER_INSTRUMENT_LOAD_RETRY_NS,
     _VENUE_ID_MAP_WRITE_FAILED,
     RESOLVER_CONTEXT_KEY_PREFIX,
     AmbiguousResolverContext,
@@ -67,7 +68,11 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     open_trial_day_latch,
 )
 from tests.unit.operator_control_env import operator_control_env
-from tests.unit.polymarket_us_exec_shapes import TS_EVENT_TEXT, build_instrument
+from tests.unit.polymarket_us_exec_shapes import (
+    TS_EVENT_TEXT,
+    build_instrument,
+    build_second_instrument,
+)
 from tests.unit.test_current_rung_hold_pre_arm_race import (
     STRATEGY_ID,
     TRADER_ID,
@@ -507,6 +512,337 @@ async def test_a_get_confirmed_expired_zero_fill_with_real_venue_leaves_retires(
         assert current.retirement_reason is not None
         assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
         assert current.intent_id not in client._ambiguous_bookings
+        await client._disconnect()
+
+
+def _rewrite_resolver_context_instrument(
+    client: PolymarketUSExecutionClient, intent_id: str, instrument_id: str,
+) -> None:
+    """Rewrite the durable resolver context's ``instrument_id`` in place --
+    simulates the production shape (2026-09-24, node NODE-A boot log): a
+    with-id AMBIGUOUS intent whose instrument belongs to a PRIOR day's node
+    boot and is absent from THIS run's cache/instrument-provider universe
+    (the node boots for TODAY's instruments only, per
+    ``resolve_station_instrument_ids``)."""
+    raw = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+    assert raw is not None
+    context = AmbiguousResolverContext.from_bytes(raw)
+    rewritten = replace(context, instrument_id=instrument_id)
+    client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", rewritten.to_bytes())
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_prior_day_instrument_absent_from_cache_is_loaded_and_retires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """2026-09-24 production deadlock: an OPEN intent's instrument belongs
+    to YESTERDAY's node boot and is absent from THIS run's cache. Before the
+    fix the resolver logged a WARN every pass forever and never retired,
+    deadlocking the supervisor's launch gate across days. A loader that CAN
+    produce the definition (mirrors the ParquetDataCatalog historical read
+    ``resolve_station_instrument_ids`` already uses) must be consulted and
+    the result added to the cache -- never fetched through the venue-backed
+    ``InstrumentProvider`` (which refuses anything outside the latest
+    discovery cycle for an expired market -- ``load_ids_async``,
+    ``provider.py:437-453``) and never subscribed to market data."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        assert client._cache.instrument(stale_instrument.id) is None, (
+            "fixture invariant: the stale instrument must start absent from the cache"
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        loader_calls: list[str] = []
+
+        def _loader(instrument_id: str) -> Any:
+            loader_calls.append(instrument_id)
+            return stale_instrument if instrument_id == str(stale_instrument.id) else None
+
+        client._resolver_instrument_loader = _loader  # type: ignore[method-assign]
+
+        def _forbidden(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError(
+                "the resolver must never reach the venue-backed InstrumentProvider "
+                "(a subscription/network path) to resolve a past-day instrument"
+            )
+
+        monkeypatch.setattr(client._instrument_provider, "load", _forbidden)
+        monkeypatch.setattr(client._instrument_provider, "load_async", _forbidden)
+        monkeypatch.setattr(client._instrument_provider, "load_ids_async", _forbidden)
+
+        await _run_resolver_passes(client, count=1)
+
+        assert loader_calls == [str(stale_instrument.id)]
+        assert client._cache.instrument(stale_instrument.id) is stale_instrument
+        # (c) No market-data subscription: the venue-backed provider never
+        # learns about the loaded instrument -- a pure Cache write, nothing else.
+        assert client._instrument_provider.find(stale_instrument.id) is None
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.RETIRED
+        assert refreshed.retirement_reason is not None
+        assert refreshed.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_prior_day_instrument_unobtainable_stays_open_and_escalates_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """When the loader cannot produce the definition (catalog miss, or no
+    loader injected at all) the intent must stay AMBIGUOUS and OPEN forever
+    -- retiring without venue evidence is forbidden -- but the operator must
+    see ONE ERROR naming the instrument, not a WARN every poll interval for
+    the process lifetime.
+
+    ``self._log`` is Nautilus's own Cython logger (not stdlib ``logging``);
+    ``caplog``/``monkeypatch.setattr`` cannot observe or replace it -- see
+    ``test_connect_immediate_pass_exception_handler_logs_type_only_never_the_value``
+    above and ``test_ambiguous_exception_path_source_logs_the_exception_type_never_its_str``
+    in ``test_polymarket_us_submit_order_chain.py`` for the same,
+    already-established limitation. The dedup set the resolver must guard
+    the ERROR with is asserted directly (the exact idiom
+    ``_resolver_stale_alerted_intent_ids`` already uses above), plus a
+    static source-shape check that the ``self._log.error`` call site is
+    gated by membership in that set."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        client._resolver_instrument_loader = lambda _instrument_id: None  # type: ignore[method-assign]
+
+        await _run_resolver_passes(client, count=3)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN, (
+            "never retire an intent without venue evidence for its own instrument"
+        )
+        # Escalated exactly once -- the dedup set carries exactly this one
+        # instrument id despite 3 passes each re-observing the cache miss.
+        assert client._resolver_missing_instrument_logged == {str(stale_instrument.id)}
+        await client._disconnect()
+
+
+def test_the_missing_instrument_escalation_is_gated_by_the_dedup_set() -> None:
+    """Static pin (see the docstring above): the source must guard
+    ``self._log.error`` for the missing-instrument case with the SAME
+    ``not in ... / | {...}`` dedup shape ``_resolver_stale_alerted_intent_ids``
+    already uses, never an unconditional per-pass call."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._resolve_ambiguous_intents)
+    marker = "_resolver_missing_instrument_logged"
+    assert marker in source, "the resolver must carry a missing-instrument dedup set"
+    idx = source.index(marker)
+    guard_block = source[max(0, idx - 200) : idx + 400]
+    assert "self._log.error" in guard_block
+    assert "not in" in guard_block
+
+
+def _backdate_load_attempt(
+    client: PolymarketUSExecutionClient, instrument_id: str, *, ago_ns: int,
+) -> None:
+    """Rewrite the resolver's recorded last-attempt timestamp for
+    ``instrument_id`` to ``ago_ns`` nanoseconds before the REAL clock's
+    current reading -- the SAME backdating idiom
+    ``test_a_stale_open_intent_alerts_once_and_resets_on_retirement`` above
+    uses for ``context.created_ns``. ``self._clock`` on this Nautilus
+    ``Component`` is a read-only Cython attribute (``AttributeError:
+    attribute '_clock' ... is not writable``) and cannot be swapped for a
+    fake, so the elapsed-time seam this module controls instead is the
+    resolver's OWN plain-dict bookkeeping."""
+    client._resolver_instrument_load_attempted_ns = {
+        **client._resolver_instrument_load_attempted_ns,
+        instrument_id: client._clock.timestamp_ns() - ago_ns,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_load_miss_does_not_rescan_the_catalog_within_the_retry_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """HIGH review fix (2026-09-24, post-ac691dc): the loader is a
+    synchronous full-catalog scan measured at 1.06-1.36s against the
+    production catalog -- a MISS must not re-invoke it on every ~5s poll
+    forever. Only the FIRST pass (no prior attempt recorded) may call it;
+    every later pass within ``_RESOLVER_INSTRUMENT_LOAD_RETRY_NS`` must
+    skip the call entirely."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+
+        loader_calls: list[str] = []
+
+        def _loader(instrument_id: str) -> Any:
+            loader_calls.append(instrument_id)
+            return None
+
+        client._resolver_instrument_loader = _loader  # type: ignore[method-assign]
+
+        await _run_resolver_passes(client, count=1)
+        assert loader_calls == [str(stale_instrument.id)], "the first pass must attempt the scan"
+
+        # Well within the retry interval -- real elapsed test-runtime is
+        # microseconds; several more passes must not re-invoke the scan.
+        await _run_resolver_passes(client, count=3)
+        assert loader_calls == [str(stale_instrument.id)], (
+            "a miss must not re-invoke the loader again before the retry interval elapses"
+        )
+
+        # Explicitly close to, but still short of, the retry interval -- 5s
+        # margin (not 1ns) so the assertion is not flaky against the real
+        # wall-clock jitter between the backdate call and the resolver's
+        # OWN later `self._clock.timestamp_ns()` read inside the pass.
+        _backdate_load_attempt(
+            client,
+            str(stale_instrument.id),
+            ago_ns=_RESOLVER_INSTRUMENT_LOAD_RETRY_NS - 5_000_000_000,
+        )
+        await _run_resolver_passes(client, count=1)
+        assert loader_calls == [str(stale_instrument.id)], (
+            "well short of the retry interval must still skip the scan"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_load_miss_engages_the_same_consecutive_failure_backoff_as_a_get_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """HIGH review fix: a miss must count toward the SAME
+    ``_resolver_consecutive_failures`` backoff the GET-exception and
+    mapping-error branches already use -- not a separate, unthrottled
+    failure mode."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        client._resolver_instrument_loader = lambda _id: None  # type: ignore[method-assign]
+
+        assert client._resolver_consecutive_failures == 0
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._resolver_consecutive_failures >= 1
+        assert client._resolver_last_failure_kind[current.intent_id] == "instrument_unavailable"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_load_hit_after_the_retry_interval_retires_the_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """HIGH review fix: a catalog catch-up must still resolve the intent --
+    once ``_RESOLVER_INSTRUMENT_LOAD_RETRY_NS`` has elapsed since the last
+    (missed) attempt, a later pass whose loader now returns the definition
+    must retire the intent exactly as the happy path does."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+
+        miss_calls = {"n": 0}
+
+        def _missing_loader(_id: str) -> Any:
+            miss_calls["n"] += 1
+            return None
+
+        client._resolver_instrument_loader = _missing_loader  # type: ignore[method-assign]
+        await _run_resolver_passes(client, count=1)
+        assert miss_calls["n"] == 1
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN
+
+        # The catalog "catches up" and the retry interval elapses.
+        _backdate_load_attempt(
+            client, str(stale_instrument.id), ago_ns=_RESOLVER_INSTRUMENT_LOAD_RETRY_NS,
+        )
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+        client._resolver_instrument_loader = (  # type: ignore[method-assign]
+            lambda instrument_id: stale_instrument
+            if instrument_id == str(stale_instrument.id)
+            else None
+        )
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._cache.instrument(stale_instrument.id) is stale_instrument
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.RETIRED
+        assert refreshed.retirement_reason is not None
+        assert refreshed.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
         await client._disconnect()
 
 

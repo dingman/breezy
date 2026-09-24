@@ -79,6 +79,7 @@ from nautilus_trader.model.data import (
 )
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.config import StreamingConfig
 from nautilus_trader.persistence.writer import RotationMode
 
@@ -670,6 +671,49 @@ def build_trade_risk_engine_config(
     )
 
 
+def _resolver_instrument_loader_from_catalog(catalog_root: Path) -> Callable[[str], Any]:
+    """Return a ``PolymarketUSExecClientConfig.resolver_instrument_loader``
+    closure over ``catalog_root``'s durable history.
+
+    2026-09-24 stuck-prior-day-instrument fix: the AMBIGUOUS-intent resolver
+    (``exec/client.py``'s ``_resolve_ambiguous_intents``) may need an
+    instrument definition for a PRIOR day's node boot that is absent from
+    THIS run's cache -- the node boots for TODAY's instruments only
+    (``breezy.strategy.current_rung_hold.composition.
+    resolve_station_instrument_ids``). This reads the SAME
+    ``ParquetDataCatalog`` root that function already reads, never the
+    venue-backed ``PolymarketUSInstrumentProvider`` -- that provider's
+    ``load_ids_async`` (``adapters/polymarket_us/provider.py:437-453``)
+    raises ``VenuePayloadError`` for any id outside the LATEST discovery
+    cycle, which a resolved/expired prior-day market always is, and even a
+    hypothetical bypass would be a live venue call and a new market-data
+    subscription path -- neither of which the resolver may reach.
+
+    ``catalog.instruments(instrument_ids=[...])`` silently omits every
+    flat-written row -- the SAME gotcha ``resolve_station_instrument_ids``'s
+    own docstring documents -- so this always calls ``instruments()``
+    unfiltered and matches by id string locally, never by the identifier
+    filter.
+
+    This module (``runtime``) may not import ``breezy.strategy`` (the layer
+    contract: ``strategy`` sits ABOVE ``runtime``), so the read is
+    reimplemented here rather than reused from
+    ``resolve_station_instrument_ids`` -- both read the one native call,
+    :meth:`ParquetDataCatalog.instruments`.
+    """
+
+    def _load(instrument_id: str) -> Any:
+        catalog = ParquetDataCatalog(str(catalog_root))
+        raw = catalog.instruments()
+        instruments = list(raw) if raw is not None else []
+        for instrument in instruments:
+            if str(getattr(instrument, "id", None)) == instrument_id:
+                return instrument
+        return None
+
+    return _load
+
+
 def build_trade_node_config(
     settings: BreezyTradeSettings,
     data_client_config: PolymarketUSDataClientConfig,
@@ -855,6 +899,15 @@ def build_trade_node_config(
             f"FamilyManifest (or None); got {type(exit_manifest).__name__!r}"
         )
 
+    # 2026-09-24 fix: `None` when no catalog root is configured (a host with
+    # no sending family, `settings.catalog_root`'s own default) -- the
+    # resolver then has no loader and escalates instead of loading, exactly
+    # as it did before this parameter existed.
+    resolver_instrument_loader = (
+        _resolver_instrument_loader_from_catalog(settings.catalog_root)
+        if settings.catalog_root is not None
+        else None
+    )
     exec_client_config = msgspec_replace(
         exec_client_config,
         state_store_opener=lambda: SqliteStateStore(state_store_path),
@@ -863,6 +916,7 @@ def build_trade_node_config(
         retirement_reasons=RetirementReason,
         submit_veto=submit_veto,
         exit_manifest=exit_manifest,
+        resolver_instrument_loader=resolver_instrument_loader,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
