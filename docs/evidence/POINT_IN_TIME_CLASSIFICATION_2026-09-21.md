@@ -131,4 +131,67 @@ construct a `BacktestEngine` or score a replay. Class **(c)**. Provenance
 
 ## Tape evidence
 
-Pending the captured-tape run recorded below this paragraph.
+**BLOCKED, 2026-09-24 -- memory envelope, not missing data.** The script's
+default branch (`uv run python scripts/analysis/run_weather_strategy_backtests.py`,
+i.e. `run_weather_strategy_backtests.main()` with no CLI arguments beyond
+`--output-dir`, reading the default `DEFAULT_QUOTE_CATALOG_PATH`
+(`/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us`) and
+`DEFAULT_WEATHER_CATALOG_ROOT` against the captured 2026-08-30 NYC/MIA tape,
+per plan §7 step 5) was run twice under the mandated memory cap
+(`systemd-run --user --scope -p MemoryMax=6G --`), once against a
+`git archive 1780ccb` (pre-refactor) export and once against this worktree
+(post-refactor, commit `5e10107`). **Both runs were killed by the kernel OOM
+killer inside the cgroup before producing any stdout** -- neither reached the
+`_select_tape_instruments` print lines, let alone `main`'s documenting
+`assert_available_before_decision` call. Data is present and was not the
+blocker: the quote-tape catalog carries 2026-08-30 `binary_option`,
+`order_book_depths`, `custom_venue_settlement_snapshot` etc. partitions, and
+the weather catalog carries the NYC/MIA `NwsClimateDay` records for that day.
+
+Pre-refactor run (`1780ccb` export), `journalctl --user` for
+`run-p668812-i42569400.scope`:
+```
+Sep 24 19:56:37 ... Started run-p668812-i42569400.scope - [systemd-run] ... run_weather_strategy_backtests.py --output-dir <scratch>/pre_output.
+Sep 24 20:03:00 ... run-p668812-i42569400.scope: The kernel OOM killer killed some processes in this unit.
+Sep 24 20:03:00 ... run-p668812-i42569400.scope: Failed with result 'oom-kill'.
+Sep 24 20:03:00 ... run-p668812-i42569400.scope: Consumed 6min 1.993s CPU time over 6min 23.684s wall clock time, 6G memory peak, 1.5G memory swap peak.
+```
+stdout: empty. stderr: only the `systemd-run` "Running as unit" banner line.
+
+Post-refactor run (this worktree, commit `5e10107`), `journalctl --user` for
+`run-p690465-i42609296.scope`:
+```
+Sep 24 20:03:37 ... Started run-p690465-i42609296.scope - [systemd-run] ... run_weather_strategy_backtests.py --output-dir <scratch>/post_output.
+Sep 24 20:09:43 ... run-p690465-i42609296.scope: The kernel OOM killer killed some processes in this unit.
+Sep 24 20:09:43 ... run-p690465-i42609296.scope: Failed with result 'oom-kill'.
+Sep 24 20:09:43 ... run-p690465-i42609296.scope: Consumed 5min 47.131s CPU time over 6min 6.482s wall clock time, 6G memory peak, 1.6G memory swap peak.
+```
+stdout: empty. stderr: only the `systemd-run` "Running as unit" banner line.
+
+Both runs behave identically under the cap (~6 minutes wall clock, ~6G RSS
+peak, ~1.5-1.6G swap peak, killed at the same point in the same phase --
+the quote-tape catalog read/`_select_tape_instruments` step, before any of
+the script's own `print` statements fire), so this is the script's
+structural memory footprint against the full 2026-08-30 tape (consistent
+with the MEMORY.md lesson that nightly studies of this shape run
+10-24GB), not a regression introduced by this item's refactor. The host
+had only ~1.6GB of free swap and ~8.3GB free RAM at the time (other
+processes, including the live node, were resident), which likely tightened
+the effective ceiling below a clean 6G.
+
+**Consequence for this item's acceptance criteria (plan §8):** the
+`real_observed`/scenario byte-identical-output comparison, the
+`naive`/`realistic` per-strategy trading-result comparison, and the
+documenting `assert_available_before_decision` raise/no-raise outcome for
+this tape are **not captured** -- the run never reaches that code. This is
+reported as a blocker, not fabricated. The refactor's correctness for the
+selection-helper and the guard is instead evidenced by: (1) the RED->GREEN
+unit tests in `tests/unit/test_run_weather_strategy_backtests_selection.py`
+and `tests/unit/test_point_in_time_guard.py`, which exercise the same code
+paths against small synthetic fixtures without loading the full tape, and
+(2) the AUD-11 finding-1 fix (`5e10107`), which is verified the same way
+(RED against `HEAD`, GREEN in this worktree; see that commit message). A
+follow-up either needs a higher memory allowance explicitly authorized
+above this task's 6G cap, or a quiet window with more free system memory
+(this task's brief does not authorize either change; both are coordinator
+decisions).
