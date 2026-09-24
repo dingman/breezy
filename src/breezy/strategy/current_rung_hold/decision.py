@@ -383,6 +383,18 @@ def evaluate_decision(inputs: DecisionInputs) -> Decision:
         raise ValueError(f"unreachable: side={inputs.side!r}")
 
 
+def _is_executable(price: Decimal, size: Decimal | int, config: CurrentRungHoldConfig) -> bool:
+    """The shared executable-band+size predicate, used by BOTH sides.
+
+    Strictly between ``executable_ask_lower``/``executable_ask_upper``
+    (exclusive) and at least ``minimum_displayed_size`` (inclusive).
+    """
+    return (
+        config.executable_ask_lower < price < config.executable_ask_upper
+        and size >= config.minimum_displayed_size
+    )
+
+
 def _finalize_take(
     inputs: DecisionInputs,
     *,
@@ -400,11 +412,7 @@ def _finalize_take(
     ``1 - P_HOLD_UPPER`` for NO) -- this function only runs the shared rule
     order (executable, then defined, then break-even), never any inversion.
     """
-    executable = (
-        inputs.config.executable_ask_lower < price < inputs.config.executable_ask_upper
-        and size >= inputs.config.minimum_displayed_size
-    )
-    if not executable:
+    if not _is_executable(price, size, inputs.config):
         return Refuse("not_executable")
 
     if p_bound is None:
@@ -453,14 +461,11 @@ def _evaluate_no_side(
         return Refuse("not_executable")
 
     no_ask = _ONE - inputs.bid
-    # Same executable predicate as ``_finalize_take``, run HERE so a thin
-    # book keeps ``not_executable`` and the unsafe table is never read
-    # while the calibration gate is closed. ``_finalize_take`` repeats it
-    # on the armed path; the two copies must stay identical.
-    if not (
-        inputs.config.executable_ask_lower < no_ask < inputs.config.executable_ask_upper
-        and inputs.bid_size >= inputs.config.minimum_displayed_size
-    ):
+    # Same executable predicate as ``_finalize_take`` (``_is_executable``),
+    # run HERE so a thin book keeps ``not_executable`` and the unsafe table
+    # is never read while the calibration gate is closed. ``_finalize_take``
+    # calls the same helper again on the armed path.
+    if not _is_executable(no_ask, inputs.bid_size, inputs.config):
         return Refuse("not_executable")
 
     if not inputs.config.no_side_calibration_gate_cleared:
