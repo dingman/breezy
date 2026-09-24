@@ -31,6 +31,7 @@ from breezy.adapters.polymarket_us.provider import (
     MARKET_LIST_PATH,
     MAX_DISCOVERY_PAGES,
     PolymarketUSInstrumentProvider,
+    _weather_market_payloads,
     discovery_candidate_slugs,
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
@@ -561,3 +562,190 @@ async def test_resolved_markets_are_excluded_from_active_slugs_but_retained_for_
     assert provider.active_market_slugs == (OPEN_SLUG,)
     assert EXPIRED_SLUG in provider.resolved_market_reasons
     assert provider.find(InstrumentId(Symbol(EXPIRED_SLUG), POLYMARKET_US_VENUE)) is None
+
+
+_REGISTERED_CITIES: tuple[tuple[str, str], ...] = (
+    ("nyc", "New York"),
+    ("mia", "Miami"),
+    ("mdw", "Chicago"),
+    ("lax", "Los Angeles"),
+)
+_REGISTERED_CITY_CODES: tuple[str, ...] = tuple(token for token, _name in _REGISTERED_CITIES)
+_UNREGISTERED_CITY_ERROR = (
+    "Boston.*tc-temp-boshigh-2026-08-25-lt79f.*slug city 'bos'.*no polymarket_us "
+    "entry in the settlement registry"
+)
+
+
+def _weather_market(
+    city_token: str,
+    city_name: str,
+    *,
+    climate_date: str = "2026-08-25",
+    bounds: str = "lt79f",
+) -> dict[str, Any]:
+    """Captured open-market shape, re-keyed onto ``city_token``.
+
+    ``lt79f`` keeps the fixture's prose corroboration, so a registered city
+    still parses into an instrument. An unregistered city is never parsed.
+    """
+    slug = f"tc-temp-{city_token}high-{climate_date}-{bounds}"
+    market = market_with_slug(slug)
+    market["question"] = f"Highest temperature in {city_name} on {climate_date}?"
+    return market
+
+
+def _four_registered_and_boston(
+    *,
+    climate_date: str = "2026-08-25",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    registered = [
+        _weather_market(token, name, climate_date=climate_date)
+        for token, name in _REGISTERED_CITIES
+    ]
+    return registered, _weather_market("bos", "Boston", climate_date=climate_date)
+
+
+def _cohort_discovery() -> PolymarketUSMarketDiscoveryConfig:
+    return PolymarketUSMarketDiscoveryConfig(limit=10, city_codes=_REGISTERED_CITY_CODES)
+
+
+def test_an_unregistered_city_still_raises_when_collect_unregistered_is_false() -> None:
+    """Default discovery still fail-stops. AUD-08a must not widen what is traded.
+
+    Characterisation pin (L-33): the no-flag call and ``collect_unregistered=False``
+    both raise the pre-change refusal, and ``discovery_candidate_slugs`` does too.
+    """
+    _registered, boston = _four_registered_and_boston()
+    payload = page_with(boston)
+
+    with pytest.raises(VenuePayloadError, match=_UNREGISTERED_CITY_ERROR):
+        _weather_market_payloads(payload, _REGISTERED_CITY_CODES)
+    with pytest.raises(VenuePayloadError, match=_UNREGISTERED_CITY_ERROR):
+        _weather_market_payloads(
+            payload,
+            _REGISTERED_CITY_CODES,
+            collect_unregistered=False,
+        )
+    with pytest.raises(VenuePayloadError, match=_UNREGISTERED_CITY_ERROR):
+        discovery_candidate_slugs(payload, city_codes=_REGISTERED_CITY_CODES)
+
+
+def test_an_unregistered_city_is_collected_and_the_registered_cities_still_load() -> None:
+    """Four registered markets stay accepted; the unknown city is one sighting."""
+    registered, boston = _four_registered_and_boston()
+    accepted, sightings = _weather_market_payloads(
+        page_with(*registered, boston),
+        _REGISTERED_CITY_CODES,
+        collect_unregistered=True,
+    )
+
+    assert [market["slug"] for market in accepted] == [market["slug"] for market in registered]
+    assert len(sightings) == 1
+    sighting = sightings[0]
+    assert sighting.venue == "polymarket_us"
+    assert sighting.city_token == "bos"
+    assert sighting.slug == boston["slug"]
+    assert sighting.climate_date == "2026-08-25"
+    assert sighting.schema_version == 1
+
+    # A weather question whose slug is not the weather grammar is still a
+    # venue-shape event, not a candidate (plan §9).
+    unparseable = {
+        "slug": "climate-policy-index-2026",
+        "question": "Highest temperature in Boston on 2026-08-25?",
+    }
+    with pytest.raises(VenuePayloadError, match="does not match the observed weather grammar"):
+        _weather_market_payloads(
+            page_with(unparseable),
+            ("nyc",),
+            collect_unregistered=True,
+        )
+
+
+def _assert_registered_cohort_loaded(
+    provider: PolymarketUSInstrumentProvider,
+    registered: Sequence[Mapping[str, Any]],
+    boston: Mapping[str, Any],
+) -> None:
+    registered_slugs = tuple(str(market["slug"]) for market in registered)
+    boston_slug = str(boston["slug"])
+    assert provider.market_slugs == registered_slugs
+    assert provider.active_market_slugs == registered_slugs
+    assert boston_slug not in provider.market_slugs
+    assert boston_slug not in provider.active_market_slugs
+    assert provider.find(InstrumentId(Symbol(boston_slug), POLYMARKET_US_VENUE)) is None
+    for slug in registered_slugs:
+        assert provider.find(InstrumentId(Symbol(slug), POLYMARKET_US_VENUE)) is not None
+    sightings = provider.unregistered_city_sightings
+    assert tuple(sighting.city_token for sighting in sightings) == ("bos",)
+    assert tuple(sighting.slug for sighting in sightings) == (boston_slug,)
+
+
+@pytest.mark.asyncio
+async def test_a_reload_cycle_with_an_unregistered_city_still_loads_tomorrows_cohort() -> None:
+    """One unknown city must not livelock the next registered cohort."""
+    today, today_boston = _four_registered_and_boston(climate_date="2026-08-25")
+    tomorrow, tomorrow_boston = _four_registered_and_boston(climate_date="2026-08-26")
+    provider, transport, _logger = provider_for_pages(
+        [page_with(*today, today_boston)],
+        discovery=_cohort_discovery(),
+    )
+
+    await provider.load_all_async()
+    _assert_registered_cohort_loaded(provider, today, today_boston)
+    assert len(transport.calls) == 1
+
+    transport.set_pages([page_with(*tomorrow, tomorrow_boston)])
+    await provider.load_all_async()
+    _assert_registered_cohort_loaded(provider, tomorrow, tomorrow_boston)
+    assert len(transport.calls) == 2
+    for market in tomorrow:
+        assert (
+            provider.find(InstrumentId(Symbol(str(market["slug"])), POLYMARKET_US_VENUE))
+            is not None
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_provider_exposes_one_warn_naming_every_unregistered_city() -> None:
+    """Exactly one WARN per cycle, naming each distinct city and its slug count."""
+    registered, boston = _four_registered_and_boston()
+    second_boston = _weather_market("bos", "Boston", bounds="gte64f")
+    phoenix = _weather_market("phx", "Phoenix")
+    provider, transport, logger = provider_for_pages(
+        [page_with(*registered, boston, second_boston, phoenix)],
+        discovery=_cohort_discovery(),
+    )
+
+    await provider.load_all_async()
+
+    warnings = [message for level, message in logger.messages if level == "warning"]
+    assert warnings == [
+        (
+            "Polymarket.us discovery cycle observed unregistered weather cities with no "
+            "polymarket_us entry in the settlement registry; refusing to trade or subscribe: "
+            "bos (2 slugs), phx (1 slug)"
+        )
+    ]
+    assert len(transport.calls) == 1
+    tokens = tuple(sighting.city_token for sighting in provider.unregistered_city_sightings)
+    assert tokens == ("bos", "bos", "phx")
+
+
+@pytest.mark.asyncio
+async def test_an_unregistered_city_never_becomes_an_instrument() -> None:
+    """A sighted city is absent from the instrument cache and the subscription set."""
+    registered, boston = _four_registered_and_boston()
+    provider, transport, _logger = provider_for_pages(
+        [page_with(*registered, boston)],
+        discovery=_cohort_discovery(),
+    )
+
+    await provider.load_all_async()
+
+    _assert_registered_cohort_loaded(provider, registered, boston)
+    assert len(transport.calls) == 1
+    assert all(
+        sighting.observed_ts_ns == TS_INIT for sighting in provider.unregistered_city_sightings
+    )

@@ -34,8 +34,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Final, Literal, overload
 
 from nautilus_trader.common.component import Clock
 from nautilus_trader.common.providers import InstrumentProvider
@@ -65,8 +65,10 @@ from breezy.registry.sites import SiteRegistry, default_registry
 __all__ = [
     "MARKET_BY_SLUG_PATH",
     "MARKET_LIST_PATH",
+    "SIGHTING_SCHEMA_VERSION",
     "DiscoveredMarket",
     "PolymarketUSInstrumentProvider",
+    "UnregisteredCitySighting",
     "discovery_candidate_slugs",
 ]
 
@@ -111,6 +113,26 @@ class DiscoveredMarket:
     slug: str
     resolved_reason: str | None
     payload: Mapping[str, Any]
+
+
+#: In-memory sighting schema. AUD-08a writes no file; durability is a later item.
+SIGHTING_SCHEMA_VERSION: Final[int] = 1
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UnregisteredCitySighting:
+    """One unregistered venue city on a discovery payload.
+
+    In-process only: lost on restart, never written to disk. ``observed_ts_ns``
+    is 0 until the provider stamps it from its clock.
+    """
+
+    schema_version: int
+    venue: str
+    city_token: str
+    slug: str
+    climate_date: str
+    observed_ts_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +209,36 @@ def discovery_candidate_slugs(
     return tuple(market["slug"] for market in _weather_market_payloads(payload, city_codes))
 
 
+@overload
 def _weather_market_payloads(
     payload: Mapping[str, Any],
     city_codes: tuple[str, ...],
-) -> tuple[Mapping[str, Any], ...]:
+    *,
+    collect_unregistered: Literal[False] = False,
+) -> tuple[Mapping[str, Any], ...]: ...
+
+
+@overload
+def _weather_market_payloads(
+    payload: Mapping[str, Any],
+    city_codes: tuple[str, ...],
+    *,
+    collect_unregistered: Literal[True],
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[UnregisteredCitySighting, ...]]: ...
+
+
+def _weather_market_payloads(
+    payload: Mapping[str, Any],
+    city_codes: tuple[str, ...],
+    *,
+    collect_unregistered: bool = False,
+) -> (
+    tuple[Mapping[str, Any], ...]
+    | tuple[tuple[Mapping[str, Any], ...], tuple[UnregisteredCitySighting, ...]]
+):
     markets = _markets_from_payload(payload)
     accepted: list[Mapping[str, Any]] = []
+    sightings: list[UnregisteredCitySighting] = []
     city_set = set(city_codes)
     for index, market in enumerate(markets):
         if not isinstance(market, Mapping):
@@ -219,14 +265,46 @@ def _weather_market_payloads(
                 "refusing to fall back to slug parsing"
             )
         if parsed.city not in city_set:
-            raise VenuePayloadError(
-                f"{MARKET_LIST_PATH} returned weather market naming {city_name!r} "
-                f"({slug!r}, slug city {parsed.city!r}), which has no polymarket_us "
-                "entry in the settlement registry; refusing to trade or to skip a "
-                "city Breezy holds no settlement truth for"
+            if not collect_unregistered:
+                raise VenuePayloadError(
+                    f"{MARKET_LIST_PATH} returned weather market naming {city_name!r} "
+                    f"({slug!r}, slug city {parsed.city!r}), which has no polymarket_us "
+                    "entry in the settlement registry; refusing to trade or to skip a "
+                    "city Breezy holds no settlement truth for"
+                )
+            # Recorded, not traded: one unknown city must not abort the cohort.
+            sightings.append(
+                UnregisteredCitySighting(
+                    schema_version=SIGHTING_SCHEMA_VERSION,
+                    venue=REGISTRY_VENUE_KEY,
+                    city_token=parsed.city,
+                    slug=slug,
+                    climate_date=parsed.climate_date,
+                    observed_ts_ns=0,
+                )
             )
+            continue
         accepted.append(market)
+    if collect_unregistered:
+        return tuple(accepted), tuple(sightings)
     return tuple(accepted)
+
+
+def _unregistered_cities_warning(sightings: Sequence[UnregisteredCitySighting]) -> str:
+    """One line naming every distinct unregistered city and its slug count."""
+    counts: dict[str, int] = {}
+    for sighting in sightings:
+        counts[sighting.city_token] = counts.get(sighting.city_token, 0) + 1
+    rendered = ", ".join(
+        f"{city_token} ({count} slug{'' if count == 1 else 's'})"
+        for city_token, count in sorted(counts.items())
+    )
+    kind = "city" if len(counts) == 1 else "cities"
+    return (
+        "Polymarket.us discovery cycle observed unregistered weather "
+        f"{kind} with no polymarket_us entry in the settlement registry; "
+        f"refusing to trade or subscribe: {rendered}"
+    )
 
 
 def _weather_city_name_from_payload(market: Mapping[str, Any]) -> str | None:
@@ -299,6 +377,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         self._market_slugs: tuple[str, ...] = ()
         self._active_market_slugs: tuple[str, ...] = ()
         self._resolved_market_reasons: dict[str, str] = {}
+        self._unregistered_city_sightings: tuple[UnregisteredCitySighting, ...] = ()
         self._last_successful_non_empty_discovery: tuple[str, ...] = ()
 
     @property
@@ -321,9 +400,27 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         """Return latest venue-owned resolution reasons keyed by slug."""
         return dict(self._resolved_market_reasons)
 
+    @property
+    def unregistered_city_sightings(self) -> tuple[UnregisteredCitySighting, ...]:
+        """Sightings from the latest discovery cycle. Empty when that cycle saw none.
+
+        In-process only. Lost on restart. Not a subscription set and not a
+        trading allow-list.
+        """
+        return self._unregistered_city_sightings
+
     async def load_all_async(self, filters: dict[Any, Any] | None = None) -> None:
         """Discover weather markets through ``GET /v1/markets`` and load active ones."""
-        discovered = await self._discover_markets()
+        discovered, sightings = await self._discover_markets()
+        observed_ts_ns = self._clock.timestamp_ns()
+        self._unregistered_city_sightings = tuple(
+            replace(sighting, observed_ts_ns=observed_ts_ns) for sighting in sightings
+        )
+        if self._unregistered_city_sightings:
+            # One WARN per cycle, not one line per market.
+            self._discovery_log.warning(
+                _unregistered_cities_warning(self._unregistered_city_sightings)
+            )
         if not discovered:
             message = (
                 "Polymarket.us market discovery returned zero configured-city weather "
@@ -494,8 +591,11 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
             if no_instrument is not None:
                 assert self.find(no_instrument.id) is not None
 
-    async def _discover_markets(self) -> tuple[DiscoveredMarket, ...]:
+    async def _discover_markets(
+        self,
+    ) -> tuple[tuple[DiscoveredMarket, ...], tuple[UnregisteredCitySighting, ...]]:
         discovered: list[DiscoveredMarket] = []
+        sightings: list[UnregisteredCitySighting] = []
         offset = 0
         limit = self._discovery.limit
         for page in range(MAX_DISCOVERY_PAGES + 1):
@@ -513,7 +613,12 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 quota_key=QUOTA_KEY_DISCOVERY,
             )
             page_markets = _markets_from_payload(payload)
-            for market in _weather_market_payloads(payload, self._discovery.city_codes):
+            accepted, page_sightings = _weather_market_payloads(
+                payload,
+                self._discovery.city_codes,
+                collect_unregistered=True,
+            )
+            for market in accepted:
                 slug = market["slug"]
                 assert isinstance(slug, str)
                 discovered.append(
@@ -523,10 +628,11 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                         payload=market,
                     )
                 )
+            sightings.extend(page_sightings)
             if len(page_markets) < limit:
                 break
             offset += limit
-        return tuple(discovered)
+        return tuple(discovered), tuple(sightings)
 
     def _query(self, *, offset: int) -> dict[str, object]:
         query: dict[str, object] = {
