@@ -792,4 +792,18 @@ Rev 2 items that are unchanged: D1, D2 (extended by R8) and A1–A8, with the ed
 
 **Coordinator note (Rev 3):** AUD-14a merged (`_read_git_head_sha` in `src/breezy/runtime/trade_supervisor.py`). F-2 extracts it into `src/breezy/runtime/build_sha.py` and both callers use that module (DRY); the supervisor import stays behaviour-identical.
 
-Status: Rev 3 — domain reviewer APPROVED Rev 2; architect delta pending.
+
+---
+
+# Rev 3.1 — BINDING amendments from the architect's Rev 3 delta (supersede any conflicting Rev 2/Rev 3 text)
+
+**R8 (replaces F-2 build_sha text and the Rev 3 citation row "AUD-14a helper not on this branch", which is now false).**
+1. Move `_looks_like_git_sha`, `_read_ref_sha`, `_read_git_head_sha` (`trade_supervisor.py:735-819`) unchanged into `src/breezy/runtime/build_sha.py`, return type `str | None`; `trade_supervisor` re-imports them under the same private names (`tests/unit/test_trade_supervisor.py:48` imports `_read_git_head_sha` from it). `_read_source_tree_head_sha` STAYS in `trade_supervisor` (tests monkeypatch it via `ts_module`, `:3672-3757`). `test_trade_supervisor.py` stays green and unedited; `test_build_sha.py` keeps only a re-export test.
+2. Also extract `_resolve_build_revision` (`:835`) publicly as `resolve_build_revision(environ)` in `build_sha.py` (env override, 12-char form, bare-except → "unknown"); `trade_supervisor` keeps a thin private alias. The NODE's F-2 `build_sha` is taken from `resolve_build_revision(os.environ)` at composition time — never from `_read_git_head_sha` directly (it can raise OSError) — so F-2 rows and `supervisor_started.revision` are the same identity and D2 attribution joins.
+3. Sequence F-2 after any in-flight `trade_supervisor.py` work merges; rebase before extracting.
+
+**F-3 AC6 atomic gzip (replaces the step order).** Write `.gz.tmp` → fsync → VERIFY the `.tmp` (decompressed byte and line counts equal the original) → `os.replace` to `.gz` → fsync the directory → `os.utime` the `.gz` to the original's mtime → unlink the original. Any failure before the rename removes the `.tmp` and keeps the original. A crash between rename and unlink leaves both files: all three readers dedupe by date preferring `.jsonl`, and retention treats "both exist" idempotently (re-verify, then unlink the original). Tests: `test_verify_runs_before_rename`, `test_both_present_all_readers_count_once`.
+
+**Sequencing guard for the conditional paper-replay re-baseline.** The F-1b commit must show YES rows, YES counters and order calls byte-identical before/after; only `no_side_shadow` rows and the R1-table deltas may change. Any other diff halts F-1b.
+
+Status: Rev 3.1 — APPROVED. Domain reviewer (prediction-market-reviewer) APPROVED Rev 2 (F-1b trigger CONFIRMS); architect APPROVED R1–R7, R9 and specified the exact R8/F-3/guard fixes applied verbatim above. Ready for implementation per Sequencing.
