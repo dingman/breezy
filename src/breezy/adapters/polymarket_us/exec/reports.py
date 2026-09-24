@@ -456,6 +456,31 @@ ORDER_STATE_TO_ORDER_STATUS: Final[Mapping[str, OrderStatus]] = {
     "ORDER_STATE_EXPIRED": OrderStatus.EXPIRED,
 }
 
+#: The native statuses at which an order will never receive another fill.
+#: This is this parser's OWN terminal set -- keyed to the mapped
+#: ``OrderStatus``, not the raw venue string. PUBLIC: ``exec/client.py``
+#: imports this directly (it already imports from this module) rather than
+#: maintaining its own hand-written copy -- see ``NON_FILL_TERMINAL_STATUSES``
+#: below, and ``client._RESOLVER_TERMINAL_STATUSES``, which is that constant
+#: under a resolver-local name.
+TERMINAL_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED}
+)
+
+#: ``TERMINAL_ORDER_STATUSES`` minus ``FILLED``. Used by
+#: :func:`_assert_fill_progress_consistent`: CANCELED/REJECTED/EXPIRED never
+#: receive another fill, so ``leavesQuantity=0`` is legitimate even with
+#: ``cumQuantity < quantity`` -- an IOC partially filled then
+#: CANCELED/EXPIRED reports exactly this shape (``exec/client.py``'s
+#: TERMINAL-FILL resolution). ``FILLED`` is deliberately EXCLUDED: for that
+#: status, ``leavesQuantity=0`` is only truthful when ``cumQuantity ==
+#: quantity`` too -- a body claiming FILLED with a short ``cumQuantity`` and
+#: zero leaves is a genuine contradiction, not a legitimate terminal shape,
+#: so it keeps the strict ``leaves == quantity - cumQuantity`` identity.
+NON_FILL_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = (
+    TERMINAL_ORDER_STATUSES - frozenset({OrderStatus.FILLED})
+)
+
 #: The two ``ExecutionType`` members that describe a trade
 #: (``types/orders.py:34-43``). Every other declared member is a lifecycle
 #: acknowledgement, and turning one into a ``FillReport`` would invent a trade.
@@ -809,6 +834,7 @@ def _assert_fill_progress_consistent(
     *,
     quantity: Quantity,
     filled_qty: Quantity,
+    order_status: OrderStatus,
     instrument: Instrument,
     context: str,
 ) -> None:
@@ -824,23 +850,52 @@ def _assert_fill_progress_consistent(
     ``total=False`` in the snapshot, so an ABSENT leaves is not a
     contradiction and is not treated as one; a PRESENT leaves that disagrees
     is.
+
+    The identity checked against a PRESENT ``leavesQuantity`` is
+    STATE-DEPENDENT (``order_status`` is resolved by the caller BEFORE this
+    check, precisely so it can be state-aware). Only CANCELED/REJECTED/
+    EXPIRED (``NON_FILL_TERMINAL_STATUSES``) relax to ``leaves == 0``
+    regardless of ``cumQuantity``: an IOC partially filled then
+    CANCELED/EXPIRED legitimately reports ``leavesQuantity=0`` with
+    ``0 < cumQuantity < quantity``. Every other status -- every live state,
+    AND ``FILLED`` -- keeps the venue's own arithmetic exactly: ``leaves ==
+    quantity - cumQuantity``. FILLED is deliberately NOT relaxed: a body
+    claiming FILLED with a short ``cumQuantity`` and zero leaves is not the
+    IOC shape above, it is a genuine contradiction. Every raise below names
+    ``state``, ``quantity``, ``cumQuantity`` and ``leavesQuantity`` so the
+    resolver's WARN log carries the values, not just the exception class.
     """
+    leaves_raw = payload.get("leavesQuantity")
     if filled_qty > quantity:
         raise ExecutionReportMappingError(
-            f"{context} reports a 'cumQuantity' greater than its 'quantity'; a "
-            "filled size larger than the order is a contradiction, and the native "
+            f"{context} reports a 'cumQuantity' greater than its 'quantity' "
+            f"(state={payload.get('state')!r}, quantity={quantity}, "
+            f"cumQuantity={filled_qty}, leavesQuantity="
+            f"{leaves_raw if leaves_raw is not None else 'absent'}); a filled "
+            "size larger than the order is a contradiction, and the native "
             "report would silently clamp it rather than refuse it"
         )
-    if payload.get("leavesQuantity") is None:
+    if leaves_raw is None:
         return
     leaves = _quantity_field(
         payload, "leavesQuantity", instrument=instrument, context=context, allow_zero=True
     )
+    if order_status in NON_FILL_TERMINAL_STATUSES:
+        if leaves.as_decimal() != 0:
+            raise ExecutionReportMappingError(
+                f"{context} field 'leavesQuantity' is not zero for a terminal "
+                f"order (state={payload.get('state')!r}, quantity={quantity}, "
+                f"cumQuantity={filled_qty}, leavesQuantity={leaves}); a "
+                "terminal order cannot have resting quantity"
+            )
+        return
     if leaves.as_decimal() != quantity.as_decimal() - filled_qty.as_decimal():
         raise ExecutionReportMappingError(
             f"{context} field 'leavesQuantity' does not equal 'quantity' minus "
-            "'cumQuantity'; refusing a self-contradictory order payload rather "
-            "than choosing which two of the three fields to believe"
+            f"'cumQuantity' (state={payload.get('state')!r}, quantity={quantity}, "
+            f"cumQuantity={filled_qty}, leavesQuantity={leaves}); refusing a "
+            "self-contradictory order payload rather than choosing which two "
+            "of the three fields to believe"
         )
 
 
@@ -1123,10 +1178,15 @@ def parse_order_status_report(
     filled_qty = _quantity_field(
         order, "cumQuantity", instrument=instrument, context=context, allow_zero=True
     )
+    # Resolved BEFORE the fill-progress check so that check can be
+    # state-aware (a terminal order's leaves is 0, not quantity - cum) and
+    # reused below rather than looked up twice.
+    order_status = _lookup(ORDER_STATE_TO_ORDER_STATUS, order, "state", context=context)
     _assert_fill_progress_consistent(
         order,
         quantity=quantity,
         filled_qty=filled_qty,
+        order_status=order_status,
         instrument=instrument,
         context=context,
     )
@@ -1138,7 +1198,7 @@ def parse_order_status_report(
         order_side=order_side,
         order_type=_lookup(_ORDER_TYPES, order, "type", context=context),
         time_in_force=_lookup(_TIME_IN_FORCE, order, "tif", context=context),
-        order_status=_lookup(ORDER_STATE_TO_ORDER_STATUS, order, "state", context=context),
+        order_status=order_status,
         quantity=quantity,
         filled_qty=filled_qty,
         report_id=report_id,
