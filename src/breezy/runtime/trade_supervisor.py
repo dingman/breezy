@@ -721,9 +721,8 @@ def spawn_node(
 
 
 #: AUD-14a: the sole env var this module reads for build identity. Never
-#: one of the operator-reserved caps
-#: (``operator_controls.OPERATOR_RESERVED_CONTROL_ENV_VARS``) -- a build
-#: revision is a static identifier, not an operator value.
+#: an operator-reserved control variable (the two seven-value caps) -- a
+#: build revision is a static identifier, not an operator value.
 BUILD_REVISION_ENV_VAR: Final = "BREEZY_BUILD_REVISION"
 
 #: A loose sanity check on a value THIS MODULE read out of a `.git` file
