@@ -506,6 +506,11 @@ The supervisor does not automatically relaunch a killed node (only crashes trigg
 A manual restart is needed: `systemctl --user restart breezy-trade-supervisor.service` at the next
 desired window, or before 17:00Z if you want to keep the day's permit active.
 
+**AUD-13d note:** this manual kill switch bypasses the stop-intent marker the supervisor's own
+`stop_prior` phase writes before its SIGTERM (`breezy.runtime.stop_intent_marker`) — if it lands on a
+node that has not yet reached RUNNING, the CRITICAL `BOOT_HALT` alert **will** fire. Expected, not a bug:
+treat it the same as any other unattributed halt.
+
 #### (v-bis) First-boot verification (v3)
 
 Run these checks against the newest `~/.local/share/breezy/logs/breezy-trade-[0-9]*T*Z.log` and the node's `/proc/<pid>/environ`:
@@ -552,6 +557,9 @@ When a node must be restarted outside the 16:50Z window or after an unclean shut
 
 1. **Copy environment verbatim:** `env=$(cat /proc/<OLD_PID>/environ); echo "$env" | tr '\0' '\n'` (verify, never print).
 2. **Stop the old process:** `kill -TERM <OLD_PID>` and wait for `TradingNode: DISPOSED` in the log (~11 s).
+   **AUD-13d note:** this hand SIGTERM also bypasses the stop-intent marker (only `trade_supervisor`'s
+   own `stop_prior` phase writes it) — a still-booting `<OLD_PID>` will page CRITICAL `BOOT_HALT` exactly
+   as an unattributed crash would.
 3. **Spawn the new node:** Mirror `trade_supervisor.spawn_node()`:
    ```
    subprocess.Popen(

@@ -2179,25 +2179,73 @@ class TestTerminateAfterToctouRecheck:
         store_path.parent.mkdir(parents=True)
         order: list[str] = []
         sent: list[int] = []
+        # A REAL, live pid: the default `write_stop_intent_marker` binds the
+        # marker to `/proc/<pid>/stat`'s own start time (2026-09-24 review,
+        # pid-reuse hardening), so a synthetic pid like 777 would read as
+        # "already gone" and nothing would be written. This process's own
+        # pid is alive for the whole test.
+        target_pid = os.getpid()
 
         def _terminate_fn(pid: int) -> None:
             order.append("terminate")
             sent.append(pid)
 
         terminate_after_toctou_recheck(
-            777,
+            target_pid,
             intent_lock_path_=Path("/does/not/matter"),
-            resolve_holder=lambda _p: 777,
+            resolve_holder=lambda _p: target_pid,
             terminate_fn=_terminate_fn,
             is_alive=lambda _pid: True,
             store_path=store_path,
         )
 
-        assert sent == [777]
+        assert sent == [target_pid]
         # The marker was written for THIS pid before the signal was sent --
         # asserted by consuming it now: a marker that was never written (or
-        # written for the wrong pid) reports False.
-        assert consume_stop_intent_marker(store_path, 777) is True
+        # written for the wrong pid/incarnation) reports False.
+        assert consume_stop_intent_marker(store_path, target_pid) is True
+
+    def test_a_terminate_fn_that_raises_still_removes_the_marker_and_propagates(
+        self, tmp_path
+    ):
+        """[2026-09-24 review, HIGH] ``os.kill`` racing a target that died
+        right after the TOCTOU recheck must never leave an orphaned marker
+        for a LATER, unrelated process to (mis)match -- and the original
+        failure must still reach the caller exactly as before."""
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        target_pid = os.getpid()
+
+        def _raising_terminate_fn(pid: int) -> None:
+            raise ProcessLookupError(f"no such process: {pid}")
+
+        with pytest.raises(ProcessLookupError):
+            terminate_after_toctou_recheck(
+                target_pid,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: target_pid,
+                terminate_fn=_raising_terminate_fn,
+                is_alive=lambda _pid: True,
+                store_path=store_path,
+            )
+
+        assert not stop_intent_marker_path(store_path).exists()
+
+    def test_a_terminate_fn_exception_without_a_store_path_still_propagates(self, tmp_path):
+        """Regression guard: wrapping ``terminate_fn`` in a try/except must
+        not swallow the failure for callers that pass no ``store_path``."""
+
+        def _raising_terminate_fn(pid: int) -> None:
+            raise ProcessLookupError(f"no such process: {pid}")
+
+        with pytest.raises(ProcessLookupError):
+            terminate_after_toctou_recheck(
+                777,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: 777,
+                terminate_fn=_raising_terminate_fn,
+                is_alive=lambda _pid: True,
+            )
 
     def test_no_store_path_writes_no_marker_backward_compatible_default(self, tmp_path):
         """Every EXISTING caller omits ``store_path`` -- confirms the new

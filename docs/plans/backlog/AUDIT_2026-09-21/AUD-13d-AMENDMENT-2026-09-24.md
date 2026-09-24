@@ -1,6 +1,6 @@
 # AUD-13d amendment — no ladder detail is reachable; the generic detail stands
 
-Status: PROPOSED — requires independent review.
+Status: ENDORSED 2026-09-24 by independent trading-bot-architect review (one text fix applied).
 
 ## Superseded
 
@@ -74,8 +74,17 @@ honest, uniform "unattributed."
    log lines, which this item does not need to duplicate into the alert:
    `"Timed out ... waiting for engines to connect"` (`system/kernel.py:1310`),
    `"Execution state could not be reconciled"` (`:1345`), `"Timed out ...
-   waiting for portfolio to initialize"` (`:1358-1362`) — all three already
-   reach the node's own log stream via `logging_bridge.py`, so
-   `grep -E "Timed out.*waiting for (engines|portfolio to initialize)|
-   Execution state could not be reconciled" <node log>` recovers the cause a
-   structured alert field cannot safely carry.
+   waiting for portfolio to initialize"` (`:1358-1362`) — all three are
+   emitted by the kernel's own native `Logger` directly into the node's log
+   stream; no bridge is required, since these are already Nautilus-native
+   log calls. `grep -E "Timed out.*waiting for (engines|portfolio to
+   initialize)|Execution state could not be reconciled" <node log>` recovers
+   the cause a structured alert field cannot safely carry.
+
+## Supporting evidence (reviewer-added)
+
+`Portfolio.initialize_positions()` (`portfolio/portfolio.pyx:295-384`)
+unconditionally overwrites `initialized` on every call — it is not a
+monotonic latch even within a single boot — so portfolio-init semantics are
+too fragile a foundation for a ladder detail even setting the stop-survival
+problem above aside.

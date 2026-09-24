@@ -50,7 +50,7 @@ from breezy.runtime.health import (
 )
 from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
-from breezy.runtime.stop_intent_marker import write_stop_intent_marker
+from breezy.runtime.stop_intent_marker import discard_stop_intent_marker, write_stop_intent_marker
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
     SubmitIntent,
@@ -508,6 +508,15 @@ def terminate_after_toctou_recheck(
     terminate (no signal sent) leaves no marker behind. ``store_path``
     defaults to ``None`` (no marker, unchanged behaviour) so every existing
     caller of this function is untouched.
+
+    [2026-09-24 review, HIGH] If ``terminate_fn`` itself raises -- the
+    target died in the tiny window between the recheck above and the signal
+    (``ProcessLookupError``) -- the marker just written would otherwise be
+    orphaned for a LATER, unrelated process to be assigned that pid and have
+    a genuine boot halt wrongly suppressed. The marker is discarded here,
+    then the original exception is re-raised unchanged: this function's
+    exception behaviour for every OTHER caller (``store_path=None``) is
+    untouched.
     """
     alive_check = is_alive if is_alive is not None else process_is_alive
     if not alive_check(pid):
@@ -516,7 +525,12 @@ def terminate_after_toctou_recheck(
         raise StopPriorRaceRefused("pid no longer holds the intent flock")
     if store_path is not None:
         mark_stop_intent(store_path, pid)
-    terminate_fn(pid)
+    try:
+        terminate_fn(pid)
+    except Exception:
+        if store_path is not None:
+            discard_stop_intent_marker(store_path)
+        raise
 
 
 def _proc_state_char(pid: int) -> str | None:
