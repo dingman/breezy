@@ -710,6 +710,20 @@ per day cannot park capture the way the old 20-per-hour ceiling did on
 09-09. No further adjustment to `breezy-quote-tape.service` is needed for
 the rotate unit.
 
+**AUD-08b (2026-09-24): second `ExecStart=`, the station-candidate register.**
+After the rotation succeeds, the unit runs `station-candidate-register-run.sh`
+(shared studies flock; `--catalog-root` resolved byte-identically to
+`score-live-trials-run.sh`), which folds the recorder's unregistered-city
+sighting sidecar (`~/.local/share/breezy/derived/station_candidates/sightings/`)
+into the ADVISORY register `station_candidates.jsonl` — never a trading input,
+never a subscription — and raises one `BREEZY_STATION_CANDIDATE_NEW` alert per
+new venue city. The unit therefore now reads `alerts.env`, sits in
+`breezy-studies.slice` and carries `MemoryHigh=3G`/`MemoryMax=4G` (the NYC
+covered-station-day count measured 1.76 GB RSS, 12 s). An unreadable catalog
+makes the emitter exit 1 having written nothing. The sidecar only grows once
+the recorder restarts on this code (`config.subscribe_trades` attaches the
+sink; the trade node attaches none).
+
 Validation performed (no unit activated):
 
 ```

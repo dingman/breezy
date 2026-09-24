@@ -30,10 +30,12 @@ Type=oneshot
 WorkingDirectory=/home/jon/breezy
 UMask=0077
 
-# No EnvironmentFile: this process holds no venue credential and opens no
-# socket, same posture as breezy-quote-tape-ingest.service. It sends exactly
-# one signal -- a restart request to the user manager for the recorder unit
-# -- and nothing else.
+# No venue EnvironmentFile: this process holds no venue credential and opens
+# no venue socket, same posture as breezy-quote-tape-ingest.service. Its
+# first ExecStart= sends exactly one signal -- a restart request to the user
+# manager for the recorder unit. AUD-08b adds ONLY the alerts webhook file
+# (the repo's alert-egress convention), read by the second ExecStart= below.
+EnvironmentFile=-%h/.config/breezy/alerts.env
 #
 # try-restart (not restart): if an operator has deliberately stopped
 # breezy-quote-tape.service (maintenance, incident response), this daily
@@ -45,10 +47,28 @@ UMask=0077
 # never decides on its own that the recorder should be running.
 ExecStart=/usr/bin/systemctl --user try-restart breezy-quote-tape.service
 
-# A single systemctl call against a local unit; the recorder's own
-# TimeoutStopSec=120 clean-shutdown budget is the only slow step in this
-# chain, so bound generously over that rather than mirror it exactly.
-TimeoutStartSec=180
+# AUD-08b: fold the recorder's unregistered-city sighting sidecar into the
+# ADVISORY station-candidate register (never a trading input) and raise the
+# one-shot BREEZY_STATION_CANDIDATE_NEW alert -- one more invocation on an
+# already-scheduled unit rather than a fifth timer. Runs only after the
+# rotation succeeded (sequential ExecStart=); a failure here fails the unit
+# and fires OnFailure=, and the last_folded_day watermark re-folds every
+# missed day on the next success. The wrapper takes the shared studies flock.
+ExecStart=/home/jon/breezy/deploy/systemd/station-candidate-register-run.sh
+
+# The recorder's own TimeoutStopSec=120 clean-shutdown budget plus the
+# emitter's NYC covered-station-day count (measured 12 s on 2026-09-24),
+# bounded generously rather than mirrored exactly.
+TimeoutStartSec=600
+
+# The emitter's covered-station-day counter loads quote-tape depth (measured
+# 1.76 GB RSS for NYC on 2026-09-24), so this unit carries its own ceiling
+# like every other unit that loads catalog data -- the 2026-09-11 K1 incident
+# (breezy-k1-daily.service, 17.6 GB peak with no cap) is why. The systemctl
+# call above is negligible inside it.
+MemoryHigh=3G
+MemoryMax=4G
+Slice=breezy-studies.slice
 
 # No Restart=. A missed rotation is not an incident: the live instance
 # simply keeps accumulating for one more day, exactly as it does today, and

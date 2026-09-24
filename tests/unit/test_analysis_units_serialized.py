@@ -808,7 +808,8 @@ def test_every_flock_taking_wrapper_names_the_same_lock_path() -> None:
     shared studies flock and must resolve the identical path. AUD-04
     (2026-09-21/22) extends this the same way for `portfolio-roi-run.sh`,
     another light unit that takes the same shared flock per section 6 D1.
-    AUD-03 extends it again for `decision-funnel-digest-run.sh`."""
+    AUD-03 extends it again for `decision-funnel-digest-run.sh`; AUD-08b for
+    `station-candidate-register-run.sh`."""
     expected_line = f'LOCK="$LOCK_DIR/{_LOCK_FILENAME}"'
     for wrapper_filename in sorted(
         _WRAPPERS
@@ -816,6 +817,10 @@ def test_every_flock_taking_wrapper_names_the_same_lock_path() -> None:
             "asos-refresh-run.sh",
             "portfolio-roi-run.sh",
             "decision-funnel-digest-run.sh",
+            # AUD-08b: WIDENED, not relaxed -- the station-candidate
+            # register emitter reads the quote-tape catalog under the same
+            # shared flock.
+            "station-candidate-register-run.sh",
         }
     ):
         text = (_DEPLOY_DIR / wrapper_filename).read_text()

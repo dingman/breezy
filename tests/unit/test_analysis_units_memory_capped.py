@@ -54,6 +54,11 @@ _CANDIDATE_UNITS = [
     # AUD-03: one day's offer-tape JSONL. Sized under the 512M/1G light
     # band (see the unit file) and listed here so the ceiling cannot drift.
     "breezy-decision-funnel-digest.service",
+    # AUD-08b (2026-09-24): WIDENED, not relaxed. The rotate unit now also runs
+    # the station-candidate register emitter, whose NYC covered-station-day
+    # count loads quote-tape depth (measured 1.76 GB RSS, 12 s). A unit that
+    # loads catalog data joins this list and carries its own ceiling.
+    "breezy-quote-tape-rotate.service",
 ]
 
 _EXISTING_UNITS = [

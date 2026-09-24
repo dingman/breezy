@@ -103,6 +103,7 @@ from breezy.adapters.polymarket_us.write_transport import (
     Ed25519WriteRequestSigner,
     PolymarketUSWriteTransport,
 )
+from breezy.persistence.station_candidates import SIGHTINGS_DIR, FileSightingSink
 from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
 
 __all__ = [
@@ -552,6 +553,18 @@ def _shared_polymarket_us_instrument_provider(
     )
 
 
+@lru_cache(maxsize=1)
+def _shared_sighting_sink(directory: str) -> FileSightingSink:
+    """The ONE sidecar sink for the process (AUD-08 §6b.1), keyed on a hashable ``str``.
+
+    Deliberately NOT a parameter of ``_shared_polymarket_us_instrument_provider``:
+    widening that cache key would make the data and exec factories' keys
+    unequal, evict at ``maxsize=1`` and build a second provider -- a second
+    appender on the same sidecar. The sink is attached after construction.
+    """
+    return FileSightingSink(Path(directory))
+
+
 class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
     """Construct the read-only Polymarket.us data client for a ``TradingNode``.
 
@@ -607,6 +620,13 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
             config.market_discovery,
             clock,
         )
+        # AUD-08b: `subscribe_trades` already means "this process is the
+        # quote-tape RECORDER" and nothing else, so it is the discriminator
+        # for the ONE sidecar writer -- no second flag. The recorder registers
+        # only this data factory; the trade node keeps the default False and
+        # attaches nothing. Advisory: the sidecar never makes a city tradeable.
+        if config.subscribe_trades:
+            instrument_provider.attach_sighting_sink(_shared_sighting_sink(str(SIGHTINGS_DIR)))
 
         ws_signer = signer if WS_MARKETS_REQUIRES_AUTH else None
         ws_logger = Logger(f"{name}-ws")

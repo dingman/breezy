@@ -749,3 +749,84 @@ async def test_an_unregistered_city_never_becomes_an_instrument() -> None:
     assert all(
         sighting.observed_ts_ns == TS_INIT for sighting in provider.unregistered_city_sightings
     )
+
+
+# ---------------------------------------------------------------------------
+# AUD-08b §6b.1: the attached sighting sink (the sidecar's only write path)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSightingSink:
+    def __init__(self, logger: NullLogger) -> None:
+        self._logger = logger
+        self.appended: list[Any] = []
+        self.warnings_seen_at_append: list[int] = []
+
+    def append(self, sighting: Any) -> None:
+        self.warnings_seen_at_append.append(
+            sum(1 for level, _ in self._logger.messages if level == "warning")
+        )
+        self.appended.append(sighting)
+
+
+class _FailingSightingSink:
+    def append(self, sighting: Any) -> None:
+        raise OSError("disk full")
+
+
+@pytest.mark.asyncio
+async def test_an_attached_sink_receives_every_stamped_sighting_once_per_cycle_after_the_warn() -> (
+    None
+):
+    """Call-site (round-4 a1): in ``load_all_async``, after the WARN, once per sighting."""
+    registered, boston = _four_registered_and_boston()
+    phoenix = _weather_market("phx", "Phoenix")
+    provider, transport, logger = provider_for_pages(
+        [page_with(*registered, boston, phoenix)],
+        discovery=_cohort_discovery(),
+    )
+    sink = _RecordingSightingSink(logger)
+    provider.attach_sighting_sink(sink)
+
+    await provider.load_all_async()
+
+    assert tuple(sink.appended) == provider.unregistered_city_sightings
+    assert [s.city_token for s in sink.appended] == ["bos", "phx"]
+    assert all(s.observed_ts_ns == TS_INIT for s in sink.appended)
+    assert sink.warnings_seen_at_append == [1, 1]
+    # A10: zero new venue requests -- the sink rides the existing payload.
+    assert len(transport.calls) == 1
+
+    await provider.load_all_async()
+    assert len(sink.appended) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_failing_sink_never_aborts_the_registered_cohort() -> None:
+    """The sidecar is advisory: a disk fault must not reinstate the AUD-08a livelock."""
+    registered, boston = _four_registered_and_boston()
+    provider, _transport, logger = provider_for_pages(
+        [page_with(*registered, boston)],
+        discovery=_cohort_discovery(),
+    )
+    provider.attach_sighting_sink(_FailingSightingSink())
+
+    await provider.load_all_async()
+
+    _assert_registered_cohort_loaded(provider, registered, boston)
+    errors = [message for level, message in logger.messages if level == "error"]
+    assert any("sighting sidecar" in message and "OSError" in message for message in errors)
+
+
+@pytest.mark.asyncio
+async def test_no_sink_means_no_append_and_no_error() -> None:
+    registered, boston = _four_registered_and_boston()
+    provider, _transport, logger = provider_for_pages(
+        [page_with(*registered, boston)],
+        discovery=_cohort_discovery(),
+    )
+
+    await provider.load_all_async()
+
+    assert provider.sighting_sink is None
+    assert [m for level, m in logger.messages if level == "error"] == []

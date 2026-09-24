@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Final, Literal, overload
+from typing import Any, Literal, overload
 
 from nautilus_trader.common.component import Clock
 from nautilus_trader.common.providers import InstrumentProvider
@@ -60,6 +60,11 @@ from breezy.adapters.polymarket_us.transport import (
     QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_INSTRUMENTS,
 )
+from breezy.persistence.station_candidates import (
+    SIGHTING_SCHEMA_VERSION,
+    SightingSink,
+    UnregisteredCitySighting,
+)
 from breezy.registry.sites import SiteRegistry, default_registry
 
 __all__ = [
@@ -68,6 +73,7 @@ __all__ = [
     "SIGHTING_SCHEMA_VERSION",
     "DiscoveredMarket",
     "PolymarketUSInstrumentProvider",
+    "SightingSinkAlreadyAttachedError",
     "UnregisteredCitySighting",
     "discovery_candidate_slugs",
 ]
@@ -115,24 +121,12 @@ class DiscoveredMarket:
     payload: Mapping[str, Any]
 
 
-#: In-memory sighting schema. AUD-08a writes no file; durability is a later item.
-SIGHTING_SCHEMA_VERSION: Final[int] = 1
+class SightingSinkAlreadyAttachedError(RuntimeError):
+    """A DIFFERENT sighting sink was attached to a provider that already has one.
 
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class UnregisteredCitySighting:
-    """One unregistered venue city on a discovery payload.
-
-    In-process only: lost on restart, never written to disk. ``observed_ts_ns``
-    is 0 until the provider stamps it from its clock.
+    The sidecar has exactly one writer by construction (AUD-08 §6b.1); a
+    second sink would be a second appender on the same file.
     """
-
-    schema_version: int
-    venue: str
-    city_token: str
-    slug: str
-    climate_date: str
-    observed_ts_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +372,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         self._active_market_slugs: tuple[str, ...] = ()
         self._resolved_market_reasons: dict[str, str] = {}
         self._unregistered_city_sightings: tuple[UnregisteredCitySighting, ...] = ()
+        self._sighting_sink: SightingSink | None = None
         self._last_successful_non_empty_discovery: tuple[str, ...] = ()
 
     @property
@@ -409,6 +404,41 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         """
         return self._unregistered_city_sightings
 
+    @property
+    def sighting_sink(self) -> SightingSink | None:
+        """The attached sidecar sink, or ``None`` (every non-recorder process)."""
+        return self._sighting_sink
+
+    def attach_sighting_sink(self, sink: SightingSink) -> None:
+        """Attach the ONE sidecar writer (AUD-08 §6b.1). Idempotent by identity.
+
+        Attached after construction, never a constructor or ``lru_cache`` key
+        parameter, so the process keeps exactly one shared provider.
+        """
+        if self._sighting_sink is sink:
+            return
+        if self._sighting_sink is not None:
+            raise SightingSinkAlreadyAttachedError(
+                "a different sighting sink is already attached; the sidecar has exactly one writer"
+            )
+        self._sighting_sink = sink
+
+    def _append_sightings(self) -> None:
+        """One append per sighting of this cycle. Advisory: a fault never aborts discovery."""
+        sink = self._sighting_sink
+        if sink is None:
+            return
+        for sighting in self._unregistered_city_sightings:
+            try:
+                sink.append(sighting)
+            except (OSError, ValueError) as exc:
+                self._discovery_log.error(
+                    "Polymarket.us sighting sidecar append failed "
+                    f"({type(exc).__name__}: {exc}); this cycle's remaining sightings "
+                    "are not persisted and discovery continues"
+                )
+                return
+
     async def load_all_async(self, filters: dict[Any, Any] | None = None) -> None:
         """Discover weather markets through ``GET /v1/markets`` and load active ones."""
         discovered, sightings = await self._discover_markets()
@@ -421,6 +451,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
             self._discovery_log.warning(
                 _unregistered_cities_warning(self._unregistered_city_sightings)
             )
+            self._append_sightings()
         if not discovered:
             message = (
                 "Polymarket.us market discovery returned zero configured-city weather "
