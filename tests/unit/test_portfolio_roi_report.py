@@ -125,6 +125,7 @@ LedgerReadResult = _prr.LedgerReadResult
 read_ledger_fills_with_counts = _prr.read_ledger_fills_with_counts
 assert_ledger_partition = _prr.assert_ledger_partition
 LedgerPartitionViolationError = _prr.LedgerPartitionViolationError
+DuplicateScoredTrialEconomicsMismatchError = _prr.DuplicateScoredTrialEconomicsMismatchError
 BALANCE_UNKNOWN_LABEL = _prr.BALANCE_UNKNOWN_LABEL
 fill_side_label = _prr.fill_side_label
 UnknownOrderSideError = _prr.UnknownOrderSideError
@@ -2353,6 +2354,41 @@ class TestSnapshotIntervalReconciliation:
         assert rows_by_day[today].classification == UNEXPLAINED_OK_LABEL
         assert rows_by_day[tomorrow].classification == UNEXPLAINED_OK_LABEL
 
+    def test_a_fill_exactly_at_the_closing_snapshot_ts_lands_in_that_interval(self) -> None:
+        """(c) boundary: `(prev, this]` is inclusive at `this` -- a fill
+        whose ts_event is EXACTLY the closing AccountState snapshot's ts is
+        assigned to the interval that closes there, not the next one."""
+        anchor = "2026-06-01"
+        closing = "2026-06-02"
+        closing_ts = _ns_at(closing, 16, 50)
+        deployed = Decimal("0.43")
+        fill = _fill(
+            venue_order_id="vo-at-snapshot",
+            ts_event=closing_ts,
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal("0.03"),
+        )
+        daily_balances = {
+            anchor: Decimal("10.00"),
+            closing: Decimal("9.57"),
+        }
+        timestamps = {
+            anchor: _ns_at(anchor, 16, 50),
+            closing: closing_ts,
+        }
+
+        rows = reconcile_daily(
+            fills=[fill],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            balance_timestamps_ns=timestamps,
+        )
+        row = next(r for r in rows if r.day == closing)
+
+        assert row.capital_deployed == deployed
+        assert row.unexplained == Decimal("0.00")
+        assert row.classification == UNEXPLAINED_OK_LABEL
+
     def test_an_empty_interval_cash_jump_stays_unexplained_capital_flow(self) -> None:
         """A +40.00 balance jump with no fill and no settlement is still
         UNEXPLAINED_CAPITAL_FLOW for the full magnitude. Interval assignment
@@ -2410,10 +2446,16 @@ class TestScoredTrialDedup:
         assert settlement_payout(later) == Decimal(1)
 
     def test_duplicate_count_keeps_the_latest_scored_at_ns(self) -> None:
+        """Two rows sharing a trial_id that are the SAME trade (identical on
+        every economic field) differ only in scored_at_ns -- the later row
+        is kept. This must NOT be conflated with two rows that merely share
+        a trial_id but disagree economically (see
+        TestScoredTrialDedupRefusesEconomicMismatch below): that case is a
+        refusal, never a pick."""
         day = "2026-06-20"
         earlier = _scored_trial(
             trial_id="trial-shared",
-            pnl=Decimal(1),
+            pnl=Decimal(5),
             fill_px=Decimal(0),
             fee=Decimal(0),
             scored_at_ns=_ns_at(day, 17, 0),
@@ -2432,6 +2474,51 @@ class TestScoredTrialDedup:
         assert len(kept) == 1
         assert kept[0].scored_at_ns == later.scored_at_ns
         assert settlement_payout(kept[0]) == Decimal(5)
+
+    def test_identical_economics_are_collapsed_and_counted_once(self) -> None:
+        """(b) Same trial_id, identical economics (differ only in
+        scored_at_ns/provenance) -- collapsed, n_duplicate_scored_trials=1,
+        proceeds counted once."""
+        day = "2026-06-20"
+        earlier = _scored_trial(
+            trial_id="trial-shared",
+            pnl=Decimal(1),
+            fill_px=Decimal(0),
+            fee=Decimal(0),
+            climate_day="2026-06-18",
+            scored_at_ns=_ns_at(day, 17, 0),
+        )
+        later = _scored_trial(
+            trial_id="trial-shared",
+            pnl=Decimal(1),
+            fill_px=Decimal(0),
+            fee=Decimal(0),
+            climate_day="2026-06-18",
+            scored_at_ns=_ns_at(day, 18, 0),
+        )
+
+        kept, n_dup = _prr.dedupe_scored_trials((earlier, later))
+        proceeds = _prr.proceeds_by_day((earlier, later))
+
+        assert n_dup == 1
+        assert len(kept) == 1
+        assert proceeds == {day: Decimal(1)}
+
+
+class TestScoredTrialDedupRefusesEconomicMismatch:
+    """(a) trial_id alone does not encode family (family_barrier.py:15-18):
+    two DIFFERENT trades from two families can collide on trial_id. Rows
+    that share a trial_id but disagree on an economic field must never be
+    silently picked -- dedupe_scored_trials fails closed."""
+
+    def test_different_pnl_under_the_same_trial_id_refuses(self) -> None:
+        row_a = _scored_trial(trial_id="trial-shared", pnl=Decimal(1))
+        row_b = _scored_trial(trial_id="trial-shared", pnl=Decimal(5))
+
+        with pytest.raises(DuplicateScoredTrialEconomicsMismatchError) as exc_info:
+            _prr.dedupe_scored_trials((row_a, row_b))
+
+        assert "trial-shared" in str(exc_info.value)
 
     def test_the_summary_line_names_n_duplicate_scored_trials(self) -> None:
         data = dataclasses.replace(_report_data(), n_duplicate_scored_trials=1)

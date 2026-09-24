@@ -123,6 +123,7 @@ __all__ = [
     "CumulativeReconciliation",
     "DailyUnexplained",
     "DailyUnexplainedSummaryRow",
+    "DuplicateScoredTrialEconomicsMismatchError",
     "FamilyManifestAttribution",
     "FamilyStationResult",
     "FillBucket",
@@ -798,6 +799,10 @@ def _cash_between(
     ``after_ts is None`` selects events at or before ``through_ts`` (the
     opening snapshot, which has no previous print). Otherwise the interval
     is ``(after_ts, through_ts]``.
+
+    Inclusive at ``through_ts``: an event stamped exactly at the closing
+    snapshot's own ts happened no later than the balance it is being
+    reconciled against, so it belongs to the interval that closes there.
     """
     if after_ts is None:
         chosen_fills = tuple(fill for fill in buy_fills if fill.ts_event <= through_ts)
@@ -878,10 +883,67 @@ def settlement_lag_days(trial: ScoredTrial) -> int:
     return (scored_day - climate_day).days
 
 
+class DuplicateScoredTrialEconomicsMismatchError(Exception):
+    """Two scored-trial rows share a ``trial_id`` but disagree on an
+    economic field.
+
+    ``trial_id`` (``trial_id_prefix + station/climate_day/instrument_id``,
+    ``family_barrier.py:15-18``) does not encode which FAMILY minted it, and
+    two families can share a ``trial_id_prefix`` (e.g. ``pm_us_crh_cont`` and
+    ``pm_us_crh_v4`` both mint ``continuous_rung_hold/trial/...``). Most such
+    collisions are the SAME settled trade read twice out of two family
+    stores -- safe to collapse. But nothing rules out two DIFFERENT trades
+    from two families landing on the same ``trial_id``; picking either row
+    would silently drop the other's real P&L from ROI and the cash identity.
+    This is the fail-closed guard: raised instead, naming the ``trial_id``,
+    the same idiom this module already uses for
+    :class:`LedgerPartitionViolationError` and :class:`UnknownOrderSideError`
+    (a structural-invariant violation, not a routine daily reconciliation
+    event) -- ``_run`` handles it identically: one clear stderr line naming
+    the error type and the offending ``trial_id`` (never an amount),
+    non-zero exit, no report written for that run.
+    """
+
+
+#: Fields that determine a scored trial's contribution to proceeds/P&L --
+#: i.e. what makes two rows sharing a ``trial_id`` the SAME trade.
+#: Deliberately excludes ``trial_id`` (the group key, identical by
+#: construction) and every provenance/store field that can legitimately
+#: differ between two readings of the same settled trade: ``scored_at_ns``
+#: (which scoring pass produced this row -- the field this function already
+#: uses to pick the latest), ``revision_seq``/``raw_sha256`` (which
+#: settlement-data revision/raw input backed the row), ``score_seq`` (which
+#: scoring run), and ``bucket_source`` (which store it was read from).
+_SCORED_TRIAL_ECONOMIC_FIELDS: Final[tuple[str, ...]] = (
+    "station",
+    "climate_day",
+    "instrument_id",
+    "settlement_tmax_f",
+    "held",
+    "pnl",
+    "settlement_basis",
+    "excluded_reason",
+    "slippage",
+    "entry_ask",
+    "fill_px",
+    "fee",
+)
+
+
+def _scored_trial_economic_fingerprint(trial: ScoredTrial) -> tuple[object, ...]:
+    """``trial``'s economic identity -- see :data:`_SCORED_TRIAL_ECONOMIC_FIELDS`."""
+    return tuple(getattr(trial, field) for field in _SCORED_TRIAL_ECONOMIC_FIELDS)
+
+
 def dedupe_scored_trials(
     scored_trials: Sequence[ScoredTrial],
 ) -> tuple[tuple[ScoredTrial, ...], int]:
-    """One row per ``trial_id``, keeping the latest ``scored_at_ns``.
+    """One row per ``trial_id``, keeping the latest ``scored_at_ns`` --
+    ONLY when every row sharing that ``trial_id`` is economically the SAME
+    trade (:func:`_scored_trial_economic_fingerprint`). Raises
+    :class:`DuplicateScoredTrialEconomicsMismatchError` if two rows share a
+    ``trial_id`` but disagree on an economic field -- see that error's
+    docstring for why a silent pick is never safe.
 
     The pooled store does not dedupe across family directories
     (``read_scored_trials_pooled``). Two families can share a
@@ -901,6 +963,15 @@ def dedupe_scored_trials(
             best[trial.trial_id] = trial
             order.append(trial.trial_id)
             continue
+        if _scored_trial_economic_fingerprint(
+            trial
+        ) != _scored_trial_economic_fingerprint(current):
+            raise DuplicateScoredTrialEconomicsMismatchError(
+                f"trial_id={trial.trial_id!r} has two scored rows that disagree "
+                "on an economic field -- refusing to collapse or pick one "
+                "(they may be two different trades from two families that "
+                "share a trial_id prefix, family_barrier.py:15-18)"
+            )
         n_duplicate += 1
         if trial.scored_at_ns >= current.scored_at_ns:
             best[trial.trial_id] = trial
@@ -2606,9 +2677,21 @@ def _run(
     # `read_scored_trials`/`residual_trial_ids` on the family-agnostic
     # parent directory (as this module previously did) always returns
     # nothing, because neither reader recurses.
-    scored_trials, n_duplicate_scored_trials = dedupe_scored_trials(
-        read_scored_trials_pooled(scored_trials_dir).rows
-    )
+    # A trial_id shared by two economically-different rows is a data-
+    # integrity violation, not a routine event: fail-loud exactly like the
+    # ledger-partition and unknown-order-side checks below -- one clear
+    # stderr line naming the error type and the offending trial_id (never
+    # an amount), non-zero exit, no report written for this run.
+    try:
+        scored_trials, n_duplicate_scored_trials = dedupe_scored_trials(
+            read_scored_trials_pooled(scored_trials_dir).rows
+        )
+    except DuplicateScoredTrialEconomicsMismatchError as exc:
+        print(
+            f"portfolio_roi_report: DUPLICATE_SCORED_TRIAL_ECONOMICS_MISMATCH: {exc}",
+            file=sys.stderr,
+        )
+        return 1
     residual_ids = residual_trial_ids_pooled(scored_trials_dir)
     scored_ids = scored_trial_ids_of(scored_trials)
 
