@@ -161,6 +161,37 @@ def test_a_stale_observation_only_refusal_alerts() -> None:
     assert payload.severity == "WARN"
 
 
+def test_no_side_calibration_unsafe_surfaces_as_its_own_alert_condition() -> None:
+    """AUD-01a: the new reason is its own ``AlertCondition``, keyed apart
+    from any existing reason. ``RefusalAlerter`` iterates recorded counts,
+    so no dedicated reason list is required."""
+    from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
+
+    assert "no_side_calibration_unsafe" in REFUSAL_REASONS
+
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+    counter.record("no_side_calibration_unsafe")
+    counter.record("edge_below_break_even")
+    emitted = alerter.report(now_ns=1_000)
+
+    assert emitted == 2
+    by_event = {payload.event: payload for payload in sink.payloads}
+    assert set(by_event) == {
+        "NO_SIDE_CALIBRATION_UNSAFE_REFUSALS",
+        "EDGE_BELOW_BREAK_EVEN_REFUSALS",
+    }
+    assert by_event["NO_SIDE_CALIBRATION_UNSAFE_REFUSALS"].detail == (
+        "1 order(s) refused as no_side_calibration_unsafe"
+    )
+    assert "edge_below_break_even" not in (
+        by_event["NO_SIDE_CALIBRATION_UNSAFE_REFUSALS"].detail
+    )
+    assert by_event["NO_SIDE_CALIBRATION_UNSAFE_REFUSALS"].site == SITE
+    assert by_event["EDGE_BELOW_BREAK_EVEN_REFUSALS"].site == SITE
+
+
 def test_two_refusal_reasons_alert_naming_both() -> None:
     """A run refused for two distinct reasons alerts once per reason, each named."""
     counter = RefusalCounter()

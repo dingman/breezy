@@ -20,6 +20,7 @@ from decimal import Decimal
 
 import pytest
 
+from breezy.strategy.current_rung_hold import decision as decision_module
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
     DecisionInputs,
@@ -74,6 +75,11 @@ def _take_case_inputs(**overrides: object) -> DecisionInputs:
         latch_consumed=False,
     )
     return dataclasses.replace(base, **overrides)  # type: ignore[arg-type]
+
+
+def _gate_cleared_config() -> CurrentRungHoldConfig:
+    """The armed NO path. Production composition never passes this."""
+    return CurrentRungHoldConfig(no_side_calibration_gate_cleared=True)
 
 
 def _no_case_inputs(**overrides: object) -> DecisionInputs:
@@ -133,8 +139,79 @@ def test_yes_illegal_cell_is_still_refused() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_clean_no_take_inverts_the_bid_and_reads_p_hold_upper() -> None:
+class _SpyHoldUpper:
+    """Records ``.get`` so a test can prove the unsafe table was not read."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.gets: list[object] = []
+
+    def get(self, key: object, default: object = None) -> object:
+        self.gets.append(key)
+        return self._inner.get(key, default)  # type: ignore[attr-defined]
+
+
+def test_yes_worked_example_is_unaffected_by_the_no_side_calibration_gate() -> None:
+    """YES pricing does not read the NO-side calibration flag."""
+    decision = evaluate_decision(_take_case_inputs())
+    assert decision == Take(
+        quantity=1,
+        limit_price=Decimal("0.40"),
+        p_hold_lower=Decimal("0.6585"),
+        break_even=Decimal("0.41"),
+        rung=(70, 71),
+    )
+
+
+def test_closed_calibration_gate_refuses_a_profitable_no_side_without_reading_the_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default-closed gate: the 2026-09-14 clean NO Take is now a refusal,
+    and ``P_HOLD_UPPER.get`` is never called (the unsafe estimand is not
+    computed, not merely discarded)."""
+    spy = _SpyHoldUpper(decision_module.P_HOLD_UPPER)
+    monkeypatch.setattr(decision_module, "P_HOLD_UPPER", spy)
+
     decision = evaluate_decision(_no_case_inputs())
+
+    assert not isinstance(decision, Take)
+    assert decision == Refuse("no_side_calibration_unsafe")
+    assert spy.gets == []
+
+
+def test_a_thin_no_book_refuses_not_executable_before_the_calibration_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thin NO book keeps the more specific ``not_executable`` reason, and
+    still does not consult ``P_HOLD_UPPER``."""
+    spy = _SpyHoldUpper(decision_module.P_HOLD_UPPER)
+    monkeypatch.setattr(decision_module, "P_HOLD_UPPER", spy)
+
+    decision = evaluate_decision(_no_case_inputs(bid_size=Decimal("0.1")))
+
+    assert decision == Refuse("not_executable")
+    assert spy.gets == []
+
+
+def test_clearing_the_calibration_gate_restores_the_no_side_take() -> None:
+    """Arming is an explicit config argument, not the default. When it is
+    set, the clean NO snapshot still prices off ``P_HOLD_UPPER``."""
+    config = CurrentRungHoldConfig(no_side_calibration_gate_cleared=True)
+    decision = evaluate_decision(_no_case_inputs(config=config))
+    assert decision == Take(
+        quantity=1,
+        limit_price=Decimal("0.22"),
+        p_hold_lower=_P_MISS_LOWER,
+        break_even=Decimal("0.23"),
+        rung=(70, 71),
+        side="no",
+        p_bound=_P_MISS_LOWER,
+    )
+
+
+def test_a_clean_no_take_inverts_the_bid_and_reads_p_hold_upper() -> None:
+    """Pricing math, reached only once the calibration gate is explicitly cleared."""
+    decision = evaluate_decision(_no_case_inputs(config=_gate_cleared_config()))
     assert decision == Take(
         quantity=1,
         limit_price=Decimal("0.22"),
@@ -148,7 +225,9 @@ def test_a_clean_no_take_inverts_the_bid_and_reads_p_hold_upper() -> None:
 
 def test_no_edge_below_break_even_is_refused() -> None:
     # bid=0.10 -> NO_ask=0.90, break_even~0.91, far above p_miss_lower=0.2570.
-    decision = evaluate_decision(_no_case_inputs(bid=Decimal("0.10")))
+    decision = evaluate_decision(
+        _no_case_inputs(bid=Decimal("0.10"), config=_gate_cleared_config())
+    )
     # GAP fix 2026-09-15: `Refuse` now carries the numeric p_bound/break_even
     # that produced this refusal (offer-tape postmortem observability).
     assert decision == Refuse(
@@ -165,7 +244,9 @@ def test_no_cell_below_n_min_is_p_hold_undefined() -> None:
     # (LAX, DJF, 12, 1, 0) is a legal open-upper-tail cell absent from
     # P_HOLD_UPPER's DJF/12 rows in this test's key space -- reuse an
     # out-of-corpus hour instead, which both maps define as undefined.
-    decision = evaluate_decision(_no_case_inputs(hour_lst=99))
+    decision = evaluate_decision(
+        _no_case_inputs(hour_lst=99, config=_gate_cleared_config())
+    )
     assert decision == Refuse("p_hold_undefined")
 
 
@@ -208,7 +289,9 @@ def test_n2_11_a_point_one_contract_bid_against_a_one_contract_order_is_not_exec
 
 
 def test_n2_11_a_bid_size_exactly_at_the_minimum_displayed_size_is_executable() -> None:
-    decision = evaluate_decision(_no_case_inputs(bid_size=Decimal(1)))
+    decision = evaluate_decision(
+        _no_case_inputs(bid_size=Decimal(1), config=_gate_cleared_config())
+    )
     assert isinstance(decision, Take)
 
 
@@ -220,7 +303,9 @@ def test_n2_11_a_bid_size_exactly_at_the_minimum_displayed_size_is_executable() 
 def test_no_ask_inversion_is_exact_decimal_arithmetic_at_every_cent_tick() -> None:
     for cent in range(1, 100):
         bid = Decimal(cent) / Decimal(100)
-        decision = evaluate_decision(_no_case_inputs(bid=bid))
+        decision = evaluate_decision(
+            _no_case_inputs(bid=bid, config=_gate_cleared_config())
+        )
         if isinstance(decision, Take):
             assert decision.limit_price == Decimal(1) - bid
             assert decision.limit_price.as_tuple().exponent >= -2

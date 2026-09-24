@@ -104,6 +104,10 @@ def _register(
 ) -> ContinuousRungHoldStrategy:
     cfg = CurrentRungHoldConfig(
         instrument_ids=tuple(instrument.id for instrument in instruments),
+        # Post-decision NO gates (admission, shadow, submit) are only
+        # reachable once the calibration gate is explicit. Production
+        # composition leaves it false; these tests are not that path.
+        no_side_calibration_gate_cleared=True,
     )
     strategy = ContinuousRungHoldStrategy(
         cfg,
@@ -993,6 +997,9 @@ def _register_armed(
     A1 is characterisation-only -- this helper never touches source."""
     cfg = CurrentRungHoldConfig(
         instrument_ids=tuple(instrument.id for instrument in instruments),
+        # Same as ``_register``: arm the calibration gate so submit stays
+        # reachable. Production composition leaves the flag false.
+        no_side_calibration_gate_cleared=True,
     )
     strategy = ContinuousRungHoldStrategy(
         cfg,
@@ -1225,6 +1232,9 @@ def _register_phase1_and_start(
     """
     cfg = CurrentRungHoldConfig(
         instrument_ids=tuple(instrument.id for instrument in instruments),
+        # Same as ``_register``: arm the calibration gate so a NO decision
+        # can still reach this gate. Production composition leaves it false.
+        no_side_calibration_gate_cleared=True,
     )
     strategy = ContinuousRungHoldStrategy(
         cfg,
