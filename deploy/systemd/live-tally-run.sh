@@ -62,10 +62,10 @@ STORE_DIR=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_t
 OUT=${BREEZY_LIVE_TALLY_OUTPUT_DIR:-$HOME/.local/share/breezy/derived}
 LOG=$OUT/live_tally.log
 # Drift guard: v1's own D0 (PREREG v1 section 6:130) is prose, never read
-# from the manifest by the v1 python -- if a later v2 amendment ever moves
-# the manifest's d0_climate_day, this wrapper must refuse rather than
-# silently re-window the v1 stop. Byte-identical to
-# score-live-trials-run.sh's own assignment.
+# from the manifest by the v1 python. If the shared counter's fetch_start
+# is not this date, refuse rather than silently re-window the v1 stop.
+# The 14:15 KILL clock does not share this literal; score-live-trials-run.sh
+# checks the deployed champion manifest's own d0_climate_day and sha.
 V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130
 
 mkdir -p "$OUT"

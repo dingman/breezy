@@ -28,10 +28,10 @@
 #
 # Exit status: 0 only when the marker was written; 1 if the state-DB env
 # var is unset, the node-env pre-flight refuses (MISMATCH/DISCOVERY_FAILED),
-# the counter fails, its JSON is malformed/unreadable, its fetch_start
-# drifts from the registered v1 D0, or any city/family scorer invocation
-# fails -- remaining (city, family) pairs are still attempted so the
-# journal shows every failure.
+# the counter fails, its JSON is malformed/unreadable, its fetch_start or
+# manifest_sha256 drifts from the resolved champion manifest, or any
+# city/family scorer invocation fails -- remaining (city, family) pairs
+# are still attempted so the journal shows every failure.
 # Reported to `systemctl --user status breezy-score-live-trials.service`.
 set -uo pipefail
 
@@ -56,8 +56,6 @@ LOG=$OUT/score_live_trials.log
 # quote-tape catalog root breezy-quote-tape(-ingest).service already write
 # under this exact env var name.
 CATALOG_ROOT=${BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG:-$HOME/.local/share/breezy/catalog/quote_tape/polymarket_us}
-# Drift guard: byte-identical to live-tally-run.sh's own assignment.
-V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130
 
 mkdir -p "$OUT"
 
@@ -193,8 +191,35 @@ if [ -z "$FETCH_START" ]; then
   say "SCORE LIVE TRIALS SKIPPED -- counter output missing fetch_start"
   exit 1
 fi
-if [ "$FETCH_START" != "$V1_D0_LITERAL" ]; then
-  say "SCORE LIVE TRIALS SKIPPED -- counter fetch_start drifted from the registered v1 D0"
+# D-H: the drift guard compares to the SAME manifest the counter was
+# resolved from. A v1/v2 date literal rejects the champion (v4 d0 is
+# 2026-09-20). Fail closed if that file's d0 or sha cannot be read.
+if [ ! -r "$CHAMPION_MANIFEST" ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- champion manifest unreadable"
+  exit 1
+fi
+CHAMPION_D0=$(manifest_field "$CHAMPION_MANIFEST" d0_climate_day)
+if [ -z "$CHAMPION_D0" ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- champion manifest d0_climate_day unreadable"
+  exit 1
+fi
+CHAMPION_SHA=$(sha256sum "$CHAMPION_MANIFEST" 2>>"$LOG" | awk 'NR==1 { print $1 }')
+if [ -z "$CHAMPION_SHA" ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- champion manifest sha256 unreadable"
+  exit 1
+fi
+if [ "$FETCH_START" != "$CHAMPION_D0" ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- counter fetch_start drifted from the resolved champion manifest d0"
+  exit 1
+fi
+CJSON_SHA_LINES=$(grep -cE '^  "manifest_sha256": "[0-9a-f]{64}",?$' "$CJSON" || true)
+if [ "$CJSON_SHA_LINES" -ne 1 ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- counter JSON manifest_sha256 not exactly one line"
+  exit 1
+fi
+CJSON_SHA=$(sed -nE 's/^  "manifest_sha256": "([0-9a-f]{64})",?$/\1/p' "$CJSON")
+if [ -z "$CJSON_SHA" ] || [ "$CJSON_SHA" != "$CHAMPION_SHA" ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- counter manifest_sha256 drifted from the resolved champion manifest"
   exit 1
 fi
 

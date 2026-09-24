@@ -14,6 +14,7 @@ idiom).
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -59,13 +60,43 @@ _MARKER_WRITE_PATTERN = re.compile(
 )
 
 
-def _default_counter_json(*, count: int = 20, fetch_start: str = "2026-09-05") -> str:
+def _champion_manifest_path() -> Path:
+    return _FAMILIES_DIR / "pm_us_crh_v4.json"
+
+
+def _champion_d0() -> str:
+    payload = json.loads(_champion_manifest_path().read_text(encoding="utf-8"))
+    return str(payload["d0_climate_day"])
+
+
+def _manifest_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _default_counter_json(
+    *,
+    count: int = 20,
+    fetch_start: str | None = None,
+    manifest_sha256: str | None = None,
+) -> str:
+    """Champion-shaped counter JSON.
+
+    ``structural_dead_stop.py`` writes ``fetch_start`` from the manifest it
+    was given. The deployed clock is ``pm_us_crh_v4`` (``d0_climate_day``
+    2026-09-20), not the retired v1 literal 2026-09-05. Defaulting to that
+    literal made the drift guard look green while rejecting the real counter.
+    """
+    start = _champion_d0() if fetch_start is None else fetch_start
     payload = {
         "count": count,
         "depth_root_present": True,
-        "fetch_end": "2026-09-05",
-        "fetch_start": fetch_start,
-        "manifest_sha256": "a" * 64,
+        "fetch_end": start,
+        "fetch_start": start,
+        "manifest_sha256": (
+            _manifest_sha256(_champion_manifest_path())
+            if manifest_sha256 is None
+            else manifest_sha256
+        ),
         "stations": ["LAX", "MDW", "MIA", "SFO"],
     }
     return json.dumps(payload, indent=2, sort_keys=True)
@@ -535,16 +566,16 @@ def test_family_manifest_assignment_byte_identical_across_wrappers() -> None:
     assert scorer_lines == []
 
 
-def test_v1_d0_literal_assignment_byte_identical_across_wrappers() -> None:
-    scorer_lines = [
-        line for line in _WRAPPER.read_text().splitlines() if line.startswith("V1_D0_LITERAL=")
-    ]
+def test_v1_d0_literal_stays_on_the_v1_wrapper_only() -> None:
+    """The v1 live tally keeps its prose D0 pin. The 14:15 KILL clock does
+    not share it: ``score-live-trials-run.sh`` compares ``fetch_start`` to
+    the resolved champion manifest, never a second date literal."""
     v1_lines = [
         line for line in _V1_WRAPPER.read_text().splitlines() if line.startswith("V1_D0_LITERAL=")
     ]
-    assert len(scorer_lines) == 1
-    assert len(v1_lines) == 1
-    assert scorer_lines[0] == v1_lines[0]
+    assert v1_lines == ['V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130']
+    scorer_text = _WRAPPER.read_text()
+    assert "V1_D0_LITERAL" not in scorer_text
 
 
 def test_only_the_scorer_wrapper_writes_the_success_marker() -> None:
@@ -681,3 +712,56 @@ def test_the_counter_still_runs_for_a_halted_family(tmp_path: Path) -> None:
 def test_score_live_trials_run_has_no_second_family_manifest_literal() -> None:
     text = _WRAPPER.read_text(encoding="utf-8")
     assert re.search(r"deploy/families/[A-Za-z0-9_]+\.json", text) is None
+
+
+def test_a_champion_scoped_counter_json_is_accepted(tmp_path: Path) -> None:
+    """D-H: fetch_start is the champion manifest's d0 and manifest_sha256
+    is that file's sha. The wrapper must accept it."""
+    assert _champion_d0() == "2026-09-20"
+    stub, argv_log = _make_stub(tmp_path, counter_json=_default_counter_json())
+    result = _run_wrapper(tmp_path, stub_python=stub)
+    assert result.returncode == 0, result.stderr
+    assert _marker_path(tmp_path).exists()
+    assert _scorer_calls(argv_log)
+
+
+def test_a_drifted_fetch_start_is_rejected(tmp_path: Path) -> None:
+    drifted = _default_counter_json(fetch_start="2026-09-21")
+    stub, argv_log = _make_stub(tmp_path, counter_json=drifted)
+    result = _run_wrapper(tmp_path, stub_python=stub)
+    assert result.returncode == 1
+    assert not _marker_path(tmp_path).exists()
+    assert not _scorer_calls(argv_log)
+
+
+def test_a_mismatched_manifest_sha256_is_rejected(tmp_path: Path) -> None:
+    mismatched = _default_counter_json(manifest_sha256="b" * 64)
+    stub, argv_log = _make_stub(tmp_path, counter_json=mismatched)
+    result = _run_wrapper(tmp_path, stub_python=stub)
+    assert result.returncode == 1
+    assert not _marker_path(tmp_path).exists()
+    assert not _scorer_calls(argv_log)
+
+
+def test_an_unreadable_champion_d0_fails_closed(tmp_path: Path) -> None:
+    families = tmp_path / "families"
+    families.mkdir()
+    source = _champion_manifest_path().read_text(encoding="utf-8")
+    (families / "pm_us_crh_v4.json").write_text(
+        source.replace('  "d0_climate_day": "2026-09-20",\n', ""),
+        encoding="utf-8",
+    )
+    manifest = families / "pm_us_crh_v4.json"
+    # fetch_start is the retired v1 literal, which the wrapper accepts today
+    # and must still refuse once the guard reads this manifest's own d0.
+    stub, argv_log = _make_stub(
+        tmp_path,
+        counter_json=_default_counter_json(
+            fetch_start="2026-09-05",
+            manifest_sha256=_manifest_sha256(manifest),
+        ),
+    )
+    result = _run_wrapper(tmp_path, stub_python=stub, families_dir=families)
+    assert result.returncode == 1
+    assert not _marker_path(tmp_path).exists()
+    assert not _scorer_calls(argv_log)

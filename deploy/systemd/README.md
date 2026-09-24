@@ -1006,9 +1006,9 @@ style as `position-monitor-report-run.sh`. Each run invokes
 `scripts/analysis/current_rung_hold_exit_window_study.py` for the
 `pm_us_crh_v2` family's four stations (`LAX`, `MDW`, `MIA`, `SFO`) since that
 family's own `d0_climate_day` (both hardcoded in the wrapper with a citation
-comment, the same convention `family-tally-v2-run.sh` uses for its own
-`V2_D0_LITERAL` — never a second, independently-derived parse of
-`deploy/families/pm_us_crh_v2.json` at run time), with `--obs-source fetch`
+comment — this study is v2-scoped offline analysis, not the KILL clock;
+`family-tally-v2-run.sh` reads the deployed champion manifest for that
+guard and does not share this date literal), with `--obs-source fetch`
 (network fetch allowed only on a cache miss) and the CLI's own default
 depth-source (auto-select per position), writing one dated JSON + Markdown
 report under `~/.local/share/breezy/derived/exit_window_study/<run-stamp>/`

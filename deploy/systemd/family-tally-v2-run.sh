@@ -61,6 +61,40 @@ manifest_field() {
     | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
 }
 
+# INC-SP1I5: the shared counter's manifest is the deployed sending family,
+# read the same way score-live-trials-run.sh reads it. No second family
+# literal. BREEZY_SYSTEMCTL is a test seam; production leaves it unset.
+SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
+resolve_champion_manifest() {
+  local show id path status
+  show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG") || true
+  id=$(printf '%s\n' "$show" | sed -n 's/^Environment=//p' | tr ' ' '\n' | sed -n 's/^BREEZY_SENDING_FAMILY_ID=//p' | head -n1)
+  id=${id%\"}
+  id=${id#\"}
+  if [ -z "$id" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- BREEZY_SENDING_FAMILY_ID absent on breezy-trade-supervisor.service"
+    return 1
+  fi
+  case "$id" in
+    *[!A-Za-z0-9_-]*)
+      say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- BREEZY_SENDING_FAMILY_ID is not a family id"
+      return 1
+      ;;
+  esac
+  path="$FAMILIES_DIR/$id.json"
+  if [ ! -f "$path" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no manifest for sending family $id"
+    return 1
+  fi
+  status=$(manifest_field "$path" status)
+  if [ "$status" != "REGISTERED" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- sending family $id status=${status:-absent} is not REGISTERED"
+    return 1
+  fi
+  CHAMPION_MANIFEST=$path
+  return 0
+}
+
 valid_family_ids() {
   local manifest stem field
   for manifest in "$FAMILIES_DIR"/*.json; do
@@ -97,8 +131,9 @@ say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
 # Structural-dead pin is pm_us_crh_v2 only -- never attached to kalshi_crh_v1.
+# v2 is not the KILL clock. Its retired unit files are orphans (plan D-E);
+# this id only selects the v2 launch-window gate below.
 PM_FAMILY="pm_us_crh_v2"
-V2_D0_LITERAL="2026-09-05"  # pm_us_crh_v2.json d0_climate_day
 
 # I3 (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): assert the
 # 14:15 score-live-trials-run.sh success marker before tallying -- never
@@ -151,10 +186,15 @@ fi
 # covered-listed-station-days is FAMILY-AGNOSTIC PER STATION (a property of
 # which afternoon windows were actually captured, not of who is trading
 # them) and comes from the ONE shared counter JSON
-# score-live-trials-run.sh already writes once per day, pinned to
-# pm_us_crh_v2's own d0_climate_day -- so the freshness check below is
-# always against $V2_D0_LITERAL, for every family, never this family's own
-# D0 (a drift here means the SHARED counter drifted, not this one family).
+# score-live-trials-run.sh writes once per day for the deployed champion
+# (BREEZY_SENDING_FAMILY_ID). The freshness check below is against THAT
+# manifest's d0_climate_day and sha256, for every family -- never a v2
+# date literal, and never this family's own D0. A drift means the shared
+# counter is not the champion's.
+#
+# Per family (plan §6 D-H, §7 step 11, §8 AC #2/#15; ruling R-4): v4 is
+# tallied on its own d0; cont stays invocable for its one terminal run and
+# keeps cont's own fill-since; v2 is not the clock (pin gate only).
 #
 # fill-source/fill-since-climate-day ARE per-family: filled_takes and the
 # v3 residual are read under THIS family's own `trial_id_prefix`
@@ -162,8 +202,8 @@ fi
 # by `manifest.trial_id_prefix` -- e.g. v3's `continuous_rung_hold/trial/`
 # vs v2's `current_rung_hold/trial/` -- so no prefix argument needs adding
 # here), scoped `--fill-since-climate-day` to THIS family's own
-# `d0_climate_day` (read straight off its manifest, never
-# $V2_D0_LITERAL) so a family registered after v2 never inherits v2's D0.
+# `d0_climate_day` (read straight off its manifest) so a family registered
+# after v2 never inherits v2's D0 or the champion's.
 EXTRA_ARGS=()
 FAMILY_MANIFEST_PATH="$FAMILIES_DIR/$FAMILY.json"
 FAMILY_STATUS=$(manifest_field "$FAMILY_MANIFEST_PATH" status)
@@ -200,8 +240,37 @@ if [ "$FAMILY_STATUS" = "REGISTERED" ] && [ "$FAMILY_VENUE" = "polymarket_us" ];
     exit 1
   fi
 
-  if [ "$CJSON_FETCH_START" != "$V2_D0_LITERAL" ]; then
-    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter fetch_start drifted from the registered d0"
+  # Same manifest the counter was resolved from. Fail closed if its d0
+  # or sha cannot be read. Do not delete $CJSON -- the producer owns it.
+  if ! resolve_champion_manifest; then
+    exit 1
+  fi
+  if [ ! -r "$CHAMPION_MANIFEST" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- champion manifest unreadable"
+    exit 1
+  fi
+  CHAMPION_D0=$(manifest_field "$CHAMPION_MANIFEST" d0_climate_day)
+  if [ -z "$CHAMPION_D0" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- champion manifest d0_climate_day unreadable"
+    exit 1
+  fi
+  CHAMPION_SHA=$(sha256sum "$CHAMPION_MANIFEST" 2>>"$LOG" | awk 'NR==1 { print $1 }')
+  if [ -z "$CHAMPION_SHA" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- champion manifest sha256 unreadable"
+    exit 1
+  fi
+  if [ "$CJSON_FETCH_START" != "$CHAMPION_D0" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter fetch_start drifted from the resolved champion manifest d0"
+    exit 1
+  fi
+  CJSON_SHA_LINES=$(grep -cE '^  "manifest_sha256": "[0-9a-f]{64}",?$' "$CJSON" || true)
+  if [ "$CJSON_SHA_LINES" -ne 1 ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter JSON manifest_sha256 not exactly one line"
+    exit 1
+  fi
+  CJSON_SHA=$(sed -nE 's/^  "manifest_sha256": "([0-9a-f]{64})",?$/\1/p' "$CJSON")
+  if [ -z "$CJSON_SHA" ] || [ "$CJSON_SHA" != "$CHAMPION_SHA" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter manifest_sha256 drifted from the resolved champion manifest"
     exit 1
   fi
 
@@ -222,22 +291,41 @@ else
   say "family tally v2 ($FAMILY) structural-dead-stop inputs SKIPPED -- status=$FAMILY_STATUS venue=$FAMILY_VENUE (not a REGISTERED polymarket_us family)"
 fi
 
+# This run's stderr only. The append-only family_tally_v2.log is not an
+# alert input -- reading it loads every previous run. 64KiB bounds the
+# traceback the alert process is allowed to hold.
+TALLY_ERR_BOUND_BYTES=65536
+TALLY_ERR=$(mktemp "${TMPDIR:-/tmp}/breezy-family-tally-err.XXXXXX" 2>>"$LOG") || {
+  say "FAMILY TALLY V2 ($FAMILY) RUN FAILED -- could not capture stderr"
+  exit 1
+}
 if "$PY" "$REPO/scripts/analysis/family_tally_v2.py" \
      --family "$FAMILY" \
      --store-dir "$STORE_DIR" \
      --as-of "$STAMP" \
      --output "$OUT/family_tally_v2_${FAMILY}_$STAMP.md" \
-     "${EXTRA_ARGS[@]}" >/dev/null 2>>"$LOG"; then
+     "${EXTRA_ARGS[@]}" >/dev/null 2>"$TALLY_ERR"; then
+  cat "$TALLY_ERR" >> "$LOG"
+  rm -f "$TALLY_ERR"
   say "family tally v2 ($FAMILY) ok"
 else
+  TALLY_ERR_BOUND=$(mktemp "${TMPDIR:-/tmp}/breezy-family-tally-err.XXXXXX" 2>>"$LOG") || {
+    rm -f "$TALLY_ERR"
+    say "FAMILY TALLY V2 ($FAMILY) RUN FAILED -- could not bound stderr"
+    exit 1
+  }
+  tail -c "$TALLY_ERR_BOUND_BYTES" "$TALLY_ERR" > "$TALLY_ERR_BOUND"
+  cat "$TALLY_ERR_BOUND" >> "$LOG"
+  rm -f "$TALLY_ERR"
   say "FAMILY TALLY V2 ($FAMILY) RUN FAILED (see stderr above in $LOG)"
   STATUS=1
   # AUD-05 D-F: one CRITICAL per (family, UTC day). A repeat the same day
   # is latched. Alert failure must not change the tally's own exit status.
   LATCH="$OUT/family_tally/.alert_latch.json"
-  "$PY" -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from family_tally_v2 import emit_family_tally_failure_alert; log_path = Path(sys.argv[3]); emit_family_tally_failure_alert(family_id=sys.argv[2], log_text=log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else "", latch_path=Path(sys.argv[4]), today_utc=sys.argv[5])' \
-    "$REPO/scripts/analysis" "$FAMILY" "$LOG" "$LATCH" "$STAMP" \
+  "$PY" -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from family_tally_v2 import emit_family_tally_failure_alert; err_path = Path(sys.argv[3]); emit_family_tally_failure_alert(family_id=sys.argv[2], log_text=err_path.read_text(encoding="utf-8", errors="replace") if err_path.is_file() else "", latch_path=Path(sys.argv[4]), today_utc=sys.argv[5])' \
+    "$REPO/scripts/analysis" "$FAMILY" "$TALLY_ERR_BOUND" "$LATCH" "$STAMP" \
     || say "FAMILY TALLY V2 ($FAMILY) alert emit failed (non-fatal)"
+  rm -f "$TALLY_ERR_BOUND"
 fi
 
 exit "$STATUS"

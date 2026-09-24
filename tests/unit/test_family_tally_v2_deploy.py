@@ -9,6 +9,7 @@ verified without it.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,34 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SYSTEMD_DIR = _REPO_ROOT / "deploy" / "systemd"
 _WRAPPER = _SYSTEMD_DIR / "family-tally-v2-run.sh"
 _FAMILIES_DIR = _REPO_ROOT / "deploy" / "families"
+_CHAMPION_FAMILY = "pm_us_crh_v4"
+_TALLY_ERR_BOUND_BYTES = 65536
+
+
+def _champion_manifest_path() -> Path:
+    return _FAMILIES_DIR / f"{_CHAMPION_FAMILY}.json"
+
+
+def _champion_d0() -> str:
+    payload = json.loads(_champion_manifest_path().read_text(encoding="utf-8"))
+    return str(payload["d0_climate_day"])
+
+
+def _champion_manifest_sha() -> str:
+    return hashlib.sha256(_champion_manifest_path().read_bytes()).hexdigest()
+
+
+def _systemctl_stub(
+    tmp_path: Path,
+    environment_line: str = "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+) -> Path:
+    stub = tmp_path / "systemctl-stub.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' " + repr(environment_line) + "\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
 
 
 def _valid_family_ids() -> set[str]:
@@ -52,6 +81,7 @@ def _run_wrapper(
     state_db: Path | None = None,
     families_dir: Path | None = None,
     unset_extra: frozenset[str] = frozenset(),
+    systemctl_stub: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): the wrapper now
     # asserts the 14:15 score-live-trials-run.sh success marker before
@@ -86,6 +116,9 @@ def _run_wrapper(
     # dedicated `set_*` parameter per variable.
     for var in unset_extra:
         env.pop(var, None)
+    if systemctl_stub is None:
+        systemctl_stub = _systemctl_stub(tmp_path)
+    env["BREEZY_SYSTEMCTL"] = str(systemctl_stub)
     if create_marker:
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
@@ -489,6 +522,7 @@ esac
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(out_dir)
     env["BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR"] = str(_FAMILIES_DIR)
     env["BREEZY_FAMILY_TALLY_V2_PYTHON"] = str(stub)
+    env["BREEZY_SYSTEMCTL"] = str(_systemctl_stub(probe_dir))
     env.pop(var_name, None)
 
     result = subprocess.run(
@@ -570,17 +604,29 @@ def test_every_tally_unit_carries_every_env_var_its_family_requires(
 
 
 def _write_counter_json(
-    tmp_path: Path, *, fetch_start: str = "2026-09-05", count: int = 20
+    tmp_path: Path,
+    *,
+    fetch_start: str | None = None,
+    count: int = 20,
+    manifest_sha256: str | None = None,
 ) -> Path:
+    """Champion-shaped counter JSON (v4 d0 + that manifest's sha).
+
+    A default of the retired v2 literal 2026-09-05 made this consumer's
+    drift guard look green while a real champion counter was skipped.
+    """
+    start = _champion_d0() if fetch_start is None else fetch_start
     out = tmp_path / "derived"
     out.mkdir(parents=True, exist_ok=True)
     stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
     payload = {
         "count": count,
         "depth_root_present": True,
-        "fetch_end": fetch_start,
-        "fetch_start": fetch_start,
-        "manifest_sha256": "b" * 64,
+        "fetch_end": start,
+        "fetch_start": start,
+        "manifest_sha256": (
+            _champion_manifest_sha() if manifest_sha256 is None else manifest_sha256
+        ),
         "stations": ["LAX", "MDW", "MIA", "SFO"],
     }
     path = out / f"covered_listed_station_days_{stamp}.json"
@@ -610,7 +656,7 @@ esac
 """
     )
     stub.chmod(0o755)
-    _write_counter_json(tmp_path, count=42, fetch_start="2026-09-05")
+    _write_counter_json(tmp_path, count=42)
     result = _run_wrapper(
         ["pm_us_crh_v2"],
         tmp_path,
@@ -855,14 +901,15 @@ def test_wrapper_passes_covered_listed_and_fill_source_for_cont_family_with_its_
     wrapper called either for a non-pm_us_crh_v2 family this test's stub
     would fall through to the default capture branch and corrupt the
     tally's own argv capture). `--fill-since-climate-day` must be the
-    family's OWN `d0_climate_day` (2026-09-12), never the v2 literal
-    (2026-09-05) baked into the shared counter JSON's `fetch_start`.
+    family's OWN `d0_climate_day` (2026-09-12). The shared counter's
+    `fetch_start` is the deployed champion's d0 (pm_us_crh_v4,
+    2026-09-20), not cont's and not the retired v2 literal.
     """
     capture = tmp_path / "argv_capture.txt"
     stub = tmp_path / "stub_python.sh"
     stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
     stub.chmod(0o755)
-    _write_counter_json(tmp_path, count=17, fetch_start="2026-09-05")
+    _write_counter_json(tmp_path, count=17)
     result = _run_wrapper(
         ["pm_us_crh_cont"],
         tmp_path,
@@ -943,7 +990,7 @@ def test_wrapper_logs_which_structural_dead_stop_inputs_were_supplied_per_family
     stub.write_text('#!/usr/bin/env bash\nexit 0\n')
     stub.chmod(0o755)
     out_dir = tmp_path / "derived"
-    _write_counter_json(tmp_path, count=17, fetch_start="2026-09-05")
+    _write_counter_json(tmp_path, count=17)
 
     cont_result = _run_wrapper(
         ["pm_us_crh_cont"], tmp_path, stub_python=stub, write_counter_json=False
@@ -970,3 +1017,134 @@ def test_kalshi_crh_unit_pair_is_parked_off_main(tmp_path: Path) -> None:
     assert not (_SYSTEMD_DIR / "breezy-kalshi-crh-tally.service").exists()
     assert not (_SYSTEMD_DIR / "breezy-kalshi-crh-tally.timer").exists()
     assert "kalshi_crh_v1" in _valid_family_ids()
+
+
+def _tally_stub(tmp_path: Path, capture: Path) -> Path:
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MATCH"
+    exit 0
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    exit 0
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def test_the_consumer_does_not_pin_the_retired_v2_d0_literal() -> None:
+    text = _WRAPPER.read_text(encoding="utf-8")
+    assert "V2_D0_LITERAL" not in text
+
+
+def test_v4_tally_accepts_a_champion_scoped_counter_and_uses_its_own_d0(
+    tmp_path: Path,
+) -> None:
+    """v4 is the tallied champion. fill-since is v4's own d0, and the
+    shared counter's fetch_start is that same d0."""
+    assert _champion_d0() == "2026-09-20"
+    capture = tmp_path / "argv_capture.txt"
+    stub = _tally_stub(tmp_path, capture)
+    _write_counter_json(tmp_path)
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=stub,
+        write_counter_json=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_lines = capture.read_text(encoding="utf-8").splitlines()
+    assert argv_lines[argv_lines.index("--fill-since-climate-day") + 1] == "2026-09-20"
+    assert "--covered-listed-station-days" in argv_lines
+
+
+def test_a_drifted_fetch_start_is_rejected(tmp_path: Path) -> None:
+    capture = tmp_path / "argv_capture.txt"
+    stub = _tally_stub(tmp_path, capture)
+    _write_counter_json(tmp_path, fetch_start="2026-09-21")
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=stub,
+        write_counter_json=False,
+    )
+    assert result.returncode == 1
+    assert not capture.exists()
+
+
+def test_a_mismatched_manifest_sha256_is_rejected(tmp_path: Path) -> None:
+    capture = tmp_path / "argv_capture.txt"
+    stub = _tally_stub(tmp_path, capture)
+    _write_counter_json(tmp_path, manifest_sha256="b" * 64)
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=stub,
+        write_counter_json=False,
+    )
+    assert result.returncode == 1
+    assert not capture.exists()
+
+
+def test_failure_alert_reads_this_runs_bounded_stderr_not_the_log(
+    tmp_path: Path,
+) -> None:
+    """The append-only family_tally_v2.log must not be loaded for the alert."""
+    log_path = tmp_path / "derived" / "family_tally_v2.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(b"OLD-LOG-MARKER\n" + b"Y" * 200_000)
+    capture = tmp_path / "alert_argv.txt"
+    copied = tmp_path / "alert_err.bin"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *family_tally_v2.py*)
+    printf 'HEAD-MARKER\\n' >&2
+    head -c 80000 /dev/zero | tr '\\0' 'A' >&2
+    printf '\\nTHIS-RUN-TRACEBACK\\n' >&2
+    exit 1
+    ;;
+  *emit_family_tally_failure_alert*)
+    printf '%s\\n' "$@" > "{capture}"
+    for arg in "$@"; do
+      case "$arg" in
+        *breezy-family-tally-err*)
+          cp "$arg" "{copied}"
+          ;;
+      esac
+    done
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_v4"],
+        tmp_path,
+        stub_python=stub,
+    )
+    assert result.returncode == 1
+    assert capture.exists(), result.stderr
+    args = capture.read_text(encoding="utf-8").splitlines()
+    assert not any(arg.endswith("family_tally_v2.log") for arg in args)
+    assert copied.is_file()
+    payload = copied.read_bytes()
+    assert b"OLD-LOG-MARKER" not in payload
+    assert b"THIS-RUN-TRACEBACK" in payload
+    assert b"HEAD-MARKER" not in payload
+    assert len(payload) <= _TALLY_ERR_BOUND_BYTES
