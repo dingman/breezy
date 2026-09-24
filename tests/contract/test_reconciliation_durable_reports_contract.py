@@ -897,3 +897,59 @@ async def test_a_partially_filled_ioc_reconciles_as_canceled_with_its_fill(
     (position,) = rig.cache.positions_open(instrument_id=yes.id)
     assert position.quantity == yes.make_qty(1)
     await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_latched_refusal_reaches_the_alert_sink_once_after_a_real_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """AUD-13b delivery, end to end: the REAL client's latched refusal, read
+    by the runtime watch on the SAME bus after a real engine reconciliation,
+    reaches the sink exactly once with the fixed-enum detail and no id."""
+    from nautilus_trader.common.enums import ComponentState
+    from nautilus_trader.common.messages import ComponentStateChanged
+    from nautilus_trader.core.uuid import UUID4
+
+    from breezy.runtime.component_health_watch import install_reconciliation_refusal_alert
+    from breezy.runtime.health import AlertPayload
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.payloads: list[AlertPayload] = []
+
+        def emit(self, payload: AlertPayload) -> None:
+            self.payloads.append(payload)
+
+    yes, _ = _pair()
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(yes,))
+    sink = _Sink()
+    install_reconciliation_refusal_alert(
+        rig.msgbus, refusals=lambda: rig.client.reconciliation_refusals, sink=sink,
+    )
+    await rig.client._connect()
+    rig.client.record_fill(
+        _record(yes, venue_order_id="V-ALERT-1", client_order_id="O-ALERT-1",
+                ts_event=AMBIGUOUS_NS),
+    )
+    rig.hold(_slug(yes), 1)
+    assert await rig.reconcile() is True
+    for _ in range(2):  # what the kernel's OrderEmulator/trader starts publish
+        rig.msgbus.publish(
+            topic="events.system.OrderEmulator",
+            msg=ComponentStateChanged(
+                trader_id=TRADER_ID,
+                component_id=ClientId("OrderEmulator"),
+                component_type="OrderEmulator",
+                state=ComponentState.RUNNING,
+                config={},
+                event_id=UUID4(),
+                ts_event=0,
+                ts_init=0,
+            ),
+        )
+
+    (payload,) = [p for p in sink.payloads if p.event == "reconciliation_refusal"]
+    assert payload.detail == "FEE_COEFFICIENT_AMBIGUOUS"
+    assert payload.severity == "WARN"
+    assert "V-AL" not in payload.detail
+    await rig.client._disconnect()

@@ -230,6 +230,86 @@ def install_stale_intent_alert(
     return _on_component_state
 
 
+#: AUD-13b: the event every latched durable-reconciliation refusal of an
+#: execution client is delivered under (plan §6, "emit a WARN alert"). The
+#: client only RECORDS the refusal on ``reconciliation_refusals`` -- it may not
+#: import this layer (barrier E0-TRANSPORT) -- so this is where it is sent.
+RECONCILIATION_REFUSAL_ALERT_EVENT: Final[str] = "reconciliation_refusal"
+
+#: WARN, as the plan names it: every such refusal falls CLOSED to the engine's
+#: existing inference and the node still boots and hunts; the one
+#: reconciliation outcome that halts the boot is AUD-13d's CRITICAL.
+RECONCILIATION_REFUSAL_ALERT_SEVERITY: Final[str] = "WARN"
+
+#: Process-wide, like the other two watches.
+RECONCILIATION_REFUSAL_ALERT_SITE: Final[str] = "global"
+
+#: The ruled ``detail`` members (plan §6/§8 item 17). Anything else on the
+#: surface is sent as the generic member -- the surface's own free text never
+#: travels, so no id, date or exception text can reach the sink.
+_RECONCILIATION_REFUSAL_DETAILS: Final[frozenset[str]] = frozenset(
+    {"POSITIONS_READ_FAILED", "RECORD_VENUE_DISAGREEMENT", "FEE_COEFFICIENT_AMBIGUOUS"}
+)
+_RECONCILIATION_REFUSAL_UNKNOWN_DETAIL: Final[str] = "RECONCILIATION_REFUSAL_UNKNOWN"
+
+
+def install_reconciliation_refusal_alert(
+    msgbus: MessageBus,
+    *,
+    refusals: Callable[[], Sequence[Mapping[str, str]]],
+    sink: AlertSink | None = None,
+) -> Callable[[object], None]:
+    """Emit one WARN alert per NEW latched durable-reconciliation refusal.
+
+    Rides the SAME ``COMPONENT_STATE_TOPIC`` heartbeat as
+    :func:`install_stale_intent_alert` -- no timer. The poll is guaranteed to
+    run after the startup reconciliation: ``NautilusKernel.start_async``
+    awaits the reconciliation (``system/kernel.py:1027-1029``) and only then
+    starts the ``OrderEmulator`` (``:1033``) and the trader (``:1039``), each
+    of which publishes a ``ComponentStateChanged`` on ``events.system.*``.
+    The shipped ``LiveExecEngineConfig`` enables no periodic reconciliation
+    (``open_check_interval_secs``/``position_check_interval_secs`` stay
+    ``None``), and any later state change re-polls regardless.
+
+    Dedupe is by ``(latch, subject)`` -- the client latches each once per
+    process -- but only the fixed-enum ``detail`` is sent.
+    """
+    active_sink = resolve_alert_sink() if sink is None else sink
+    alerted: set[tuple[str, str]] = set()
+
+    def _on_component_state(event: object) -> None:
+        del event
+        try:
+            current = tuple(refusals())
+        # Broad, deliberately: a broken reader must not crash the component
+        # publishing the triggering event (CONTAINMENT, module docstring).
+        except Exception:
+            logger.exception("failed to read reconciliation_refusals")
+            return
+        for refusal in current:
+            key = (refusal.get("latch", ""), refusal.get("subject", ""))
+            if key in alerted:
+                continue
+            alerted.add(key)
+            detail = refusal.get("detail", "")
+            emit_alert(
+                active_sink,
+                AlertPayload(
+                    severity=RECONCILIATION_REFUSAL_ALERT_SEVERITY,
+                    event=RECONCILIATION_REFUSAL_ALERT_EVENT,
+                    site=RECONCILIATION_REFUSAL_ALERT_SITE,
+                    detail=(
+                        detail
+                        if detail in _RECONCILIATION_REFUSAL_DETAILS
+                        else _RECONCILIATION_REFUSAL_UNKNOWN_DETAIL
+                    ),
+                ),
+            )
+
+    msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
+    return _on_component_state
+
+
 def install_component_degraded_alert(
     msgbus: MessageBus,
     *,
