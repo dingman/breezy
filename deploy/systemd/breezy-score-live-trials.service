@@ -33,12 +33,34 @@ WorkingDirectory=/home/jon/breezy
 # minutes with NO MemoryHigh=/MemoryMax= configured at all, pushing the 31 GB
 # host into swap while breezy-trade-supervisor.service (the live trading
 # node, deliberately left UNcapped on purpose -- see its own :64 comment)
-# was running at ~625 MB. This unit's own footprint is a local parquet/
-# sqlite read, not a tape scan, so MemoryHigh=1G/MemoryMax=2G is deliberately
-# far below the host: a runaway run's OOM lands on the study, never the
-# node.
-MemoryHigh=1G
-MemoryMax=2G
+# was running at ~625 MB.
+#
+# 2026-09-24 timeout incident (this unit): the original MemoryHigh=1G/
+# MemoryMax=2G was sized on a stale "local parquet/sqlite read" claim.
+# structural_dead_stop.py actually walks the quote-tape Parquet catalog
+# (load_depth per station-day), and since AUD-05 the wrapper runs that
+# counter TWICE, sequentially -- v1-scoped then champion-scoped. Since
+# 2026-09-19 every run sat at the 1G MemoryHigh with 1.5-1.9G swap and took
+# ~2.5 min; on 2026-09-24 it hit TimeoutStartSec=1200 ('Failed with result
+# timeout', 1.1G peak, 1.7G swap), so no success marker was written and all
+# three downstream tallies (breezy-live-tally, breezy-pm-crh-v2-tally,
+# breezy-family-tally@) skipped. A scratch rehearsal of the current wrapper
+# at the production caps was OOM-killed after 544s; at MemoryMax=4G it
+# completed in 96s with a 3.1G cgroup peak (3.38G RSS). MemoryHigh=4G/
+# MemoryMax=5G covers that measured working set with headroom while staying
+# well below the host: a runaway run's OOM still lands on the study, never
+# the node.
+#
+# Overlap ruling (pre-existing, bounded): breezy-quote-tape-ingest-frequent.timer
+# (OnCalendar=*:0/15) fires breezy-quote-tape-ingest.service
+# (MemoryHigh=4G/MemoryMax=6G) at the same 14:15:00 tick as this unit. Worst
+# case both ceilings sum to 5G + 6G = 11G, plus the ~1G uncapped live node,
+# against 30G RAM with ~23G available (`free -g`, 2026-09-24 ~23:00Z) -- well
+# within bounds, so no flock/slice/timer change. This unit is deliberately
+# NOT a member of breezy-studies.lock: it must not be delayed behind a heavy
+# nightly study past its own 14:30Z/17:20Z downstream tally consumers.
+MemoryHigh=4G
+MemoryMax=5G
 UMask=0077
 
 # No EnvironmentFile: this is a single non-secret filesystem path literal
