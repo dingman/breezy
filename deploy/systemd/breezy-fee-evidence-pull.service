@@ -1,0 +1,67 @@
+[Unit]
+# AUD-02 A0 (docs/plans/backlog/AUDIT_2026-09-21/AUD-02-COMPLETION-PLAN-2026-09-25.md
+# Section 2 "A0"). Unattended, unauthenticated public-GET evidence pull of
+# Polymarket.us's fee schedule: pages the venue weather-market list to eof,
+# then GETs every listed slug and records taker/maker fields off the raw
+# wire JSON, never from a parsed Instrument. Read-only; never touches the
+# node, the order path, or a venue credential -- see
+# scripts/venue/fee_drift_evidence_pull.py's own module docstring.
+Description=Breezy AUD-02 A0 unattended fee-drift evidence pull (unauthenticated, read-only)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/venue/fee_drift_evidence_pull.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-02-COMPLETION-PLAN-2026-09-25.md
+Documentation=file:///home/jon/breezy/docs/evidence/venue/polymarket_us/FEE_DRIFT_EVIDENCE_2026-09-25.md
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+# A run inside the protected window is NOT a failure: the script exits 0 and
+# marks the day INCOMPLETE in its own output.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Light-unit band: this unit pages one list endpoint plus one GET per listed
+# weather slug, all JSON, no catalog/tape read. Sized between
+# breezy-decisions-retention.service (256M/512M, streamed JSONL) and
+# breezy-position-monitor-report.service (512M/1G, a parquet join) -- see
+# the plan's Section 2 "A0" for the exact figures.
+MemoryHigh=384M
+MemoryMax=512M
+
+# Shared aggregate ceiling across the nightly studies. The plan's own
+# trade-off (Section "A0 gets its own timer") notes this job does NOT take
+# breezy-studies.lock: it is light enough, and its own venue-side pacing
+# (native per-key rate limiting, see the script's module docstring) already
+# bounds its cost independent of what else is running.
+Slice=breezy-studies.slice
+UMask=0077
+
+# The ONLY EnvironmentFile=: the dedicated, single-key alerts.env (mode
+# 0600, BREEZY_ALERT_WEBHOOK_URL only) -- same discipline as
+# breezy-decision-funnel-digest.service and breezy-portfolio-roi.service.
+# Never breezy-trade.env / polymarket.env / operator.env: this unit holds no
+# venue credential and no operator-reserved value. The `-` prefix keeps the
+# unit startable when the file is absent (falls back to a log-only sink).
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/venue/fee_drift_evidence_pull.py --user-agent "breezy-fee-drift-evidence-pull/1 (contact jon@gopoint.com)"
+
+# One list page plus a handful of per-slug GETs, natively paced under the
+# shared instrument/discovery quotas (6/min each) -- generous headroom over
+# the expected wall-clock cost of a single day's weather-market universe.
+TimeoutStartSec=900
+
+# No Restart=. A missed run is not an incident on its own -- tomorrow's run
+# is a fresh day's evidence regardless. The timer's Persistent=true recovers
+# a run missed across a reboot (and the script itself marks any run started
+# inside the protected window INCOMPLETE rather than pulling stale-window
+# data).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-fee-evidence-pull
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-fee-evidence-pull.timer`
+# is the only thing to enable. NOT enabled by this change -- the coordinator
+# installs it.

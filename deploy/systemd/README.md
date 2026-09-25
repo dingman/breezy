@@ -1352,3 +1352,94 @@ structural-dead-stop's v3-scoped count wiring (its own
 args, currently `pm_us_crh_v2`-only in the wrapper) remains I5, blocked on
 R-4; this item schedules the LD-OBF sequential look and per-stratum
 `cell_dead` diagnostics only, not the structural-dead stop itself.
+
+---
+
+## `breezy-fee-evidence-pull` — AUD-02 A0 unattended fee-drift evidence pull (2026-09-25, PREPARED, NOT ACTIVATED)
+
+`breezy-fee-evidence-pull.service` + `.timer` run the daily, unattended,
+unauthenticated public-GET evidence pull of
+`docs/plans/backlog/AUDIT_2026-09-21/AUD-02-COMPLETION-PLAN-2026-09-25.md`
+Section 2 "A0". Each run invokes `scripts/venue/fee_drift_evidence_pull.py`
+directly (no wrapper shell script, no `breezy-studies.lock` -- see below),
+which:
+
+1. pages `GET /v1/markets` (category `climate`) to eof and stores every raw
+   page as the day's denominator;
+2. `GET`s every listed weather slug's `/v1/market/slug/{slug}`, paced under
+   the SAME native, client-side rate limiter every other `get_public` caller
+   already pays into (`QUOTA_KEY_INSTRUMENTS`, 6 requests/minute -- no manual
+   sleep; see the script's own module docstring for the exact citation);
+3. records the taker (`feeCoefficient`) and a candidate maker
+   (`makerCommissionsBasisPoints`) field **off the raw wire JSON**, never from
+   a parsed `Instrument` (B-7: `parsing.py` writes theta onto both of
+   `Instrument`'s flat fee fields, so reading either back would just echo
+   theta at itself) -- a missing or unparseable field is recorded with a
+   reason, never dropped and never fabricated;
+4. writes `data/evidence/fee_drift/<UTC date>/{slugs,summary,manifest.sha256}.json`
+   (outside git; see `.gitignore`) or, if the run started inside the
+   protected window (below), a bare `incomplete.json` and nothing else.
+
+**Unauthenticated only; no credential of any kind.** The script's
+`build_default_client` passes `signer=None` to `PolymarketUSHttpClient`:
+`get_public`'s dispatch is unconditionally `authenticated=False`
+(`http.py:137-152`), and the `if authenticated:` guard
+(`http.py:200-202`) is the only place the signer is ever read -- provably
+unreachable here, not merely unused. Verified holding no execution-egress
+surface: it imports nothing under `breezy.adapters.polymarket_us.exec`, so
+`tests/unit/test_execution_egress_firewall_guard.py`'s X1 scan needs no
+widening for this unit.
+
+**Point-in-time guard (AUD-11): not applicable.** The guard polices records
+fed into a backtest/replay/study DECISION stream that could look ahead of a
+decision instant. This script computes no decision and replays nothing -- it
+is a live, wall-clock capture of the venue's current wire state. A future
+C2 readout that treats this evidence as a backtest input is the case the
+guard actually covers, and must call it there.
+
+**Protected window, enforced by the script itself, not just the timer's
+placement.** A run started inside `[16:35Z, 01:15Z)` -- the supervisor's
+LAUNCH/mid-day-watch/self-check span -- pulls nothing and marks that day
+INCOMPLETE (Rev 2.1 item 2 of the completion plan). This means a
+`Persistent=true` catch-up firing late from a reboot degrades to an honestly
+INCOMPLETE day instead of an uncontrolled pull, so the timer's own placement
+only has to avoid contention, not correctness.
+
+**Light unit; deliberately does NOT take `breezy-studies.lock`.** Unlike
+every other study unit in this file, `ExecStart=` invokes the venv Python
+directly against the script (`breezy-study-failed@.service`'s own pattern) —
+there is no wrapper shell script and no shared-lock acquisition. The plan's
+own trade-off: this job is light enough, and bounded independently by its
+own native per-key venue rate limits, that serializing it behind the shared
+studies lock buys nothing. `MemoryHigh=384M`/`MemoryMax=512M`, between
+`breezy-decisions-retention.service` (256M/512M) and
+`breezy-position-monitor-report.service` (512M/1G).
+
+**Alert env file.** The unit's only `EnvironmentFile=` is
+`-%h/.config/breezy/alerts.env` (the AUD-15 amendment single-key file), same
+discipline as `breezy-decision-funnel-digest.service` — never
+`breezy-trade.env`/`polymarket.env`/`operator.env`.
+
+**`OnFailure=`.** `OnFailure=breezy-study-failed@%n.service`, same notifier
+every other study-adjacent unit declares.
+
+Scheduled at **11:10 UTC** — clear of every occupied `OnCalendar=` on this
+host and of the 15-minute quote-tape ingest ticks, and outside the protected
+window, pinned by `tests/unit/test_deploy_timer_hours.py`.
+
+**Retention.** `data/evidence/fee_drift/` is outside git
+(`.gitignore`); the evidence doc
+(`docs/evidence/venue/polymarket_us/FEE_DRIFT_EVIDENCE_2026-09-25.md`)
+records each day's raw-directory sha256 manifest instead, and no retention
+job may prune this directory.
+
+To activate: symlink both files (`breezy-fee-evidence-pull.service`,
+`breezy-fee-evidence-pull.timer`) into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-fee-evidence-pull.timer` — never
+`start` the service directly. **Not activated by this change** — the
+coordinator installs and enables it.
+
+**Rollback:** `systemctl --user disable --now breezy-fee-evidence-pull.timer`
+and revert the commit. Nothing reads `data/evidence/fee_drift/` except the
+evidence doc's own dated notes, so rollback is total.

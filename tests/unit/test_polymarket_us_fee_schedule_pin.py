@@ -314,3 +314,40 @@ def test_the_dated_fee_schedule_is_declared_only_in_fees_py() -> None:
         SRC_EXEC_CLIENT_PATH.read_text(encoding="utf-8"), module_stem="client"
     )
     assert client_sites == frozenset(), client_sites
+
+
+# ---------------------------------------------------------------------------
+# AUD-02 A0: fee-drift evidence-pack evidence-record test
+# (docs/plans/backlog/AUDIT_2026-09-21/AUD-02-COMPLETION-PLAN-2026-09-25.md
+# Section 2 "A0"). The evidence doc's Observations table stays empty/PENDING
+# until >=5 consecutive complete days accumulate from the unattended pull
+# (scripts/venue/fee_drift_evidence_pull.py); this module's OWN recorded
+# observed set below is widened only in the SAME commit that adds a real
+# row to the doc -- never independently, and never by moving
+# DOCUMENTED_TAKER_FEE_COEFFICIENT itself.
+# ---------------------------------------------------------------------------
+FEE_DRIFT_EVIDENCE_DOC = EVIDENCE / "FEE_DRIFT_EVIDENCE_2026-09-25.md"
+
+FEE_DRIFT_EVIDENCE_OBSERVED_TAKER_SET: frozenset[Decimal] = frozenset()
+
+
+def test_fee_drift_evidence_pack_is_pending_and_the_pin_is_unmoved() -> None:
+    """AUD-02 A0 evidence-record test -- two assertions:
+
+    (1) :data:`DOCUMENTED_TAKER_FEE_COEFFICIENT` is still the pinned
+    ``Decimal("0.06")`` (A-3) -- a future drift can only ever be recorded as
+    OBSERVED wire data in the evidence doc, never by moving this pin; a
+    mutation of ``fees.py``'s constant must turn this test RED (see the A0
+    work-package's captured mutation-evidence run).
+    (2) this module's recorded observed set for the evidence doc matches
+    what the doc itself declares: PENDING, with an empty Observations table,
+    because no real pull has run yet.
+    """
+    assert DOCUMENTED_TAKER_FEE_COEFFICIENT == Decimal("0.06")
+
+    doc_text = FEE_DRIFT_EVIDENCE_DOC.read_text(encoding="utf-8")
+    assert "**Status: PENDING.**" in doc_text
+    assert "_(none yet)_" in doc_text
+    assert "**PENDING**" in doc_text
+
+    assert FEE_DRIFT_EVIDENCE_OBSERVED_TAKER_SET == frozenset()
