@@ -54,8 +54,10 @@ No network. No repo writes except `--out`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -63,9 +65,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import numpy as np
+import scipy
 from numpy.typing import NDArray
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,18 +106,31 @@ from breezy.settlement.current_rung_hold_v2 import (
 
 __all__ = [
     "ALL_YES_K1_CONTROL",
+    "AUDIT_TARGET",
+    "COARSE_NPTS",
     "LOOK_STEP",
     "M1C_GRID",
     "N_MAX",
+    "N_SUBSTREAMS_80K",
     "REDUCED_NPTS",
     "SEED_BASE",
+    "SEED_CAL_BASE",
+    "SEED_RERUN_BASE",
+    "AuditPremiseViolation",
+    "EpsPin",
+    "EpsPinValidationError",
+    "ForeignStageRowError",
     "M1cCellResult",
+    "ResumeKeyConflictError",
     "StreamingBoundary",
     "clopper_pearson_lower",
     "clopper_pearson_upper",
+    "load_eps_pin",
     "m1c_grid",
     "run_cell",
+    "run_chunk",
     "run_sequential_looks",
+    "seed_for",
     "seed_for_cell_index",
 ]
 
@@ -168,6 +184,17 @@ LOOK_STEP: Final[int] = 10
 REDUCED_NPTS: Final[int] = 601
 
 SEED_BASE: Final[int] = 20260925_000
+
+#: Rev 2 M1c/M2 execution amendment (2026-09-25) constants -- §7.
+COARSE_NPTS: Final[int] = REDUCED_NPTS
+SEED_CAL_BASE: Final[int] = 20260925_900
+SEED_RERUN_BASE: Final[int] = 20260925_500
+N_SUBSTREAMS_80K: Final[int] = 4
+AUDIT_TARGET: Final[int] = 400
+
+#: EPS floor (amendment §1 "EPS and DT_MIN"): `EPS = max(0.02, 3 x census
+#: max)`, never below this regardless of the census.
+EPS_FLOOR: Final[float] = 0.02
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +344,22 @@ def seed_for_cell_index(cell_index: int) -> int:
     return SEED_BASE + cell_index
 
 
+def seed_for(stage: str, cell_index: int, substream: int = 0) -> int:
+    """The Rev 2 seed-base table (§3.1): the 20k, 80k and CAL seed ranges
+    are pairwise disjoint by construction (test 27). CAL-a/CAL-b/CAL-c
+    intentionally share ONE formula (`SEED_CAL_BASE + cell_index`): CAL-c is
+    required to reuse CAL-a's exact seeds for the byte-equality check
+    (amendment §5, "CAL-c: refined `run_cell` on the CAL-a cells and
+    seeds")."""
+    if stage == "20k":
+        return SEED_BASE + cell_index
+    if stage == "80k":
+        return SEED_RERUN_BASE + 100 * substream + cell_index
+    if stage in ("cal_a", "cal_b", "cal_c", "smoke"):
+        return SEED_CAL_BASE + cell_index
+    raise ValueError(f"unknown stage {stage!r}")
+
+
 # ---------------------------------------------------------------------------
 # One cell's Monte-Carlo, replaying the live rule
 # ---------------------------------------------------------------------------
@@ -341,6 +384,29 @@ class M1cCellResult:
     loss_stop_count: int
     skipped: bool = False
     skip_reason: str | None = None
+    # --- Rev 2 M1c/M2 execution amendment fields (§7), all defaulted so the
+    # dataclass stays valid and every existing pure-mode call site/test is
+    # byte-unchanged. ---
+    stage: str | None = None
+    code_sha: str | None = None
+    substream: int | None = None
+    boundary_mode: str = "pure"
+    coarse_npts: int | None = None
+    eps: float | None = None
+    dt_min: float | None = None
+    eps_pin_sha256: str | None = None
+    audit_every: int | None = None
+    refined_count: int = 0
+    #: sorted pairs: frozen/slots-safe, no mutable default.
+    refine_reasons: tuple[tuple[str, int], ...] = ()
+    audit_reps: int = 0
+    audit_max_abs_delta_b: float | None = None
+    audit_disagreements: int = 0
+    sum_s_terminal: float = 0.0
+    sum_s2_terminal: float = 0.0
+    sum_look_count: int = 0
+    numpy_version: str | None = None
+    scipy_version: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -363,7 +429,304 @@ class M1cCellResult:
             "loss_stop_count": self.loss_stop_count,
             "skipped": self.skipped,
             "skip_reason": self.skip_reason,
+            "stage": self.stage,
+            "code_sha": self.code_sha,
+            "substream": self.substream,
+            "boundary_mode": self.boundary_mode,
+            "coarse_npts": self.coarse_npts,
+            "eps": self.eps,
+            "dt_min": self.dt_min,
+            "eps_pin_sha256": self.eps_pin_sha256,
+            "audit_every": self.audit_every,
+            "refined_count": self.refined_count,
+            "refine_reasons": [list(pair) for pair in self.refine_reasons],
+            "audit_reps": self.audit_reps,
+            "audit_max_abs_delta_b": self.audit_max_abs_delta_b,
+            "audit_disagreements": self.audit_disagreements,
+            "sum_s_terminal": self.sum_s_terminal,
+            "sum_s2_terminal": self.sum_s2_terminal,
+            "sum_look_count": self.sum_look_count,
+            "numpy_version": self.numpy_version,
+            "scipy_version": self.scipy_version,
         }
+
+
+# ---------------------------------------------------------------------------
+# Rev 2 refine-on-proximity machinery (amendment §1, §2, §3.2)
+# ---------------------------------------------------------------------------
+class EpsPinValidationError(ValueError):
+    """`load_eps_pin` refuses an EPS below the floor, below 3x the census
+    max, or stamped with a foreign `code_sha` (amendment §5 "Pin")."""
+
+
+class AuditPremiseViolation(RuntimeError):
+    """Raised when an in-run audit finds a decision disagreement or an
+    |delta b| >= EPS between the coarse and fine grids (amendment §2.1).
+    The cell that raises this writes NO row and the caller must exit
+    non-zero (test 22)."""
+
+    def __init__(
+        self, *, cell_index: int, rep_index: int, max_abs_delta_b: float, disagreement: bool
+    ) -> None:
+        self.cell_index = cell_index
+        self.rep_index = rep_index
+        self.max_abs_delta_b = max_abs_delta_b
+        self.disagreement = disagreement
+        super().__init__(
+            f"cell {cell_index} rep {rep_index}: audit premise violation "
+            f"(disagreement={disagreement}, max_abs_delta_b={max_abs_delta_b!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EpsPin:
+    """The data-file EPS/DT_MIN pin (amendment §1 "EPS and DT_MIN", §5
+    "Pin") -- never a code constant, so CAL and the gated runs share one
+    `code_sha` and one snapshot."""
+
+    eps: float
+    dt_min: float
+    census_sha256: str
+    census_max: float
+    code_sha: str
+    #: sha256 of the pin FILE's own canonical bytes, stamped on every row.
+    sha256: str
+
+
+def load_eps_pin(path: Path, *, code_sha: str) -> EpsPin:
+    """Load and validate `eps_pin.json` (amendment §5 "Pin"): `EPS >=
+    0.02`, `EPS >= 3 x census max`, and the pin's own `code_sha` must match
+    the running code -- each violation is a refusal, never a silent clamp
+    (test 28)."""
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    eps = float(payload["eps"])
+    dt_min = float(payload["dt_min"])
+    census_max = float(payload["census_max"])
+    census_sha256 = str(payload["census_sha256"])
+    pin_code_sha = str(payload["code_sha"])
+
+    if pin_code_sha != code_sha:
+        raise EpsPinValidationError(
+            f"eps_pin code_sha {pin_code_sha!r} does not match the running "
+            f"code_sha {code_sha!r} (foreign pin)"
+        )
+    if eps < EPS_FLOOR:
+        raise EpsPinValidationError(f"eps {eps!r} is below the floor {EPS_FLOOR!r}")
+    if eps < 3.0 * census_max:
+        raise EpsPinValidationError(
+            f"eps {eps!r} is below 3x the census max {census_max!r} "
+            f"({3.0 * census_max!r})"
+        )
+    if dt_min <= 0.0:
+        raise EpsPinValidationError(f"dt_min {dt_min!r} must be > 0")
+
+    return EpsPin(
+        eps=eps,
+        dt_min=dt_min,
+        census_sha256=census_sha256,
+        census_max=census_max,
+        code_sha=pin_code_sha,
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def _resolve_audit_every(n_reps: int, audit_every: int | None) -> int:
+    """Review item 6b: `audit_every = n_reps // AUDIT_TARGET` when omitted
+    (never zero -- `max(1, ...)` so a small `n_reps` still audits every
+    rep), matching amendment §1 ("50 at 20k and 200 at 80k"). An EXPLICIT
+    `audit_every` that would yield fewer than `AUDIT_TARGET` audits is
+    refused rather than silently under-auditing."""
+    if audit_every is None:
+        return max(1, n_reps // AUDIT_TARGET)
+    n_audits = n_reps // audit_every
+    if n_audits < AUDIT_TARGET:
+        raise ValueError(
+            f"--audit-every {audit_every} yields only {n_audits} audit(s) for "
+            f"n_reps={n_reps}, below AUDIT_TARGET={AUDIT_TARGET}"
+        )
+    return audit_every
+
+
+def _needs_refine(looks: Sequence[Any], *, eps: float, dt_min: float) -> str | None:
+    """`None` only if ALL of eff/fut/dt/nonfinite hold over the reached
+    coarse looks (amendment §2.1). Returns the FIRST failing category's
+    short name otherwise."""
+    if not looks:
+        return None
+
+    confident_crossing = any((look.state.s - look.b_eff) >= eps for look in looks)
+    confident_non_crossing = all((look.state.s - look.b_eff) <= -eps for look in looks)
+    if not (confident_crossing or confident_non_crossing):
+        return "eff"
+
+    for look in looks:
+        if look.b_fut == float("-inf"):
+            continue  # tie pair: infinite margin, always passes.
+        if abs(look.state.s - look.b_fut) < eps:
+            return "fut"
+
+    prev_t = 0.0
+    for look in looks:
+        dt = look.t - prev_t
+        prev_t = look.t
+        if dt == 0.0:
+            continue  # a tie: the degenerate (+inf, -inf) pair.
+        if dt < dt_min:
+            return "dt"
+
+    for look in looks:
+        is_tie_pair = look.b_eff == float("inf") and look.b_fut == float("-inf")
+        if is_tie_pair:
+            continue
+        if not (math.isfinite(look.b_eff) and math.isfinite(look.b_fut)):
+            return "nonfinite"
+
+    return None
+
+
+def _decisions(looks: Sequence[Any]) -> tuple[bool, int, int | None]:
+    """`(crossing indicator, number of looks, futility-stop index)`
+    (amendment §2.1 `decisions(looks)`)."""
+    crossed = any(look.state.s >= look.b_eff for look in looks)
+    futility_index = next(
+        (i for i, look in enumerate(looks) if look.state.s <= look.b_fut), None
+    )
+    return (crossed, len(looks), futility_index)
+
+
+def _max_abs_delta_b(looks_a: Sequence[Any], looks_b: Sequence[Any]) -> float:
+    """Max absolute |delta b| over the two chains' matching looks. The
+    exact `(+inf, -inf)` tie pair counts as zero delta when both sides
+    agree; any other pairing where one side is non-finite and the other is
+    not is reported as an infinite (maximal) delta."""
+    max_delta = 0.0
+    for look_a, look_b in zip(looks_a, looks_b, strict=False):
+        for xa, xb in ((look_a.b_eff, look_b.b_eff), (look_a.b_fut, look_b.b_fut)):
+            if xa == xb:
+                continue
+            if not (math.isfinite(xa) and math.isfinite(xb)):
+                return float("inf")
+            max_delta = max(max_delta, abs(xa - xb))
+    return max_delta
+
+
+def _run_replicate(
+    draws: list[CombinedDraw],
+    *,
+    artefact: BoundaryArtefact,
+    pin: EpsPin,
+    coarse_npts: int,
+    fine_npts: int,
+    alpha: float,
+    audit: bool,
+    rep_index: int,
+    cell_index: int,
+) -> tuple[tuple[Any, ...], str | None, dict[str, Any]]:
+    """One refined-mode replicate (amendment §2.1's pseudocode). Raises
+    `AuditPremiseViolation` (never caught here) on an audited disagreement
+    or |delta b| >= EPS -- the caller must let the cell abort with no row
+    written (test 22)."""
+    try:
+        streaming_c = StreamingBoundary(alpha=alpha, npts=coarse_npts)
+        looks_c, _verdict_c, _decided_c = run_sequential_looks(
+            draws,
+            artefact=artefact,
+            boundary_fn=streaming_c,
+            total_pnl=Decimal(0),
+            residual=Decimal(0),
+            cell_dead=False,
+            structural_fired=False,
+            registered=True,
+            truncation=None,
+        )
+    except ValueError:
+        reason: str | None = "solver"
+        looks_c = ()
+    else:
+        reason = _needs_refine(looks_c, eps=pin.eps, dt_min=pin.dt_min)
+
+    audit_stats: dict[str, Any] = {
+        "audited": False,
+        "max_abs_delta_b": None,
+        "disagreement": False,
+    }
+
+    if reason is not None or audit:
+        streaming_f = StreamingBoundary(alpha=alpha, npts=fine_npts)
+        looks_f, _verdict_f, _decided_f = run_sequential_looks(
+            draws,
+            artefact=artefact,
+            boundary_fn=streaming_f,
+            total_pnl=Decimal(0),
+            residual=Decimal(0),
+            cell_dead=False,
+            structural_fired=False,
+            registered=True,
+            truncation=None,
+        )
+        if audit and reason is None:
+            max_delta = _max_abs_delta_b(looks_c, looks_f)
+            disagreement = _decisions(looks_c) != _decisions(looks_f)
+            audit_stats = {
+                "audited": True,
+                "max_abs_delta_b": max_delta,
+                "disagreement": disagreement,
+            }
+            if disagreement or max_delta >= pin.eps:
+                raise AuditPremiseViolation(
+                    cell_index=cell_index,
+                    rep_index=rep_index,
+                    max_abs_delta_b=max_delta,
+                    disagreement=disagreement,
+                )
+        looks = looks_f
+        used_fine_grid = True
+    else:
+        looks = looks_c
+        used_fine_grid = False
+
+    # `needed_refine` (reason-triggered) is DISTINCT from `used_fine_grid`
+    # (also true for an audit-only rep that never needed refining) -- the
+    # cost-model refine fraction f (§2.4) counts only the former.
+    return looks, reason, {
+        "used_fine_grid": used_fine_grid,
+        "needed_refine": reason is not None,
+        **audit_stats,
+    }
+
+
+def _assert_snapshot_imports(root: Path) -> None:
+    """Startup assertion (amendment §3.2): `breezy` and
+    `aud06a_qty_envelope_sweep` must both resolve UNDER `root` -- catches an
+    editable install in `.venv`, or a stray `PYTHONPATH`, pointing at a
+    different tree than the pinned snapshot (test 26)."""
+    root = root.resolve()
+
+    import breezy
+
+    breezy_path = Path(breezy.__file__).resolve()
+    if root not in breezy_path.parents:
+        raise AssertionError(
+            f"breezy resolves to {breezy_path}, outside the snapshot root "
+            f"{root} (editable install or stray PYTHONPATH?)"
+        )
+
+    import aud06a_qty_envelope_sweep
+
+    sweep_path = Path(aud06a_qty_envelope_sweep.__file__).resolve()
+    if root not in sweep_path.parents:
+        raise AssertionError(
+            f"aud06a_qty_envelope_sweep resolves to {sweep_path}, outside "
+            f"the snapshot root {root}"
+        )
+
+    family_tally_v2_path = (_SCRIPTS_ANALYSIS_DIR / "family_tally_v2.py").resolve()
+    if root not in family_tally_v2_path.parents:
+        raise AssertionError(
+            f"the family_tally_v2 spec path {family_tally_v2_path} is "
+            f"outside the snapshot root {root}"
+        )
 
 
 def _feasibility_check(cell: CellSpec, *, seed: int) -> str | None:
@@ -415,6 +778,13 @@ def run_cell(
     i_max: float = I_MAX,
     n_max: int = N_MAX,
     look_step: int = LOOK_STEP,
+    boundary_mode: Literal["pure", "refined"] = "pure",
+    eps_pin: EpsPin | None = None,
+    coarse_npts: int = COARSE_NPTS,
+    audit_every: int | None = None,
+    stage: str | None = None,
+    code_sha: str | None = None,
+    substream: int | None = None,
 ) -> M1cCellResult:
     """One cell's Monte-Carlo, replaying the LIVE look loop verbatim
     (`run_sequential_looks` + a fresh `StreamingBoundary` per replicate).
@@ -426,12 +796,24 @@ def run_cell(
     tally's own `verdict` string, which this neutral wiring makes
     permanently unable to report `SURVIVE` (`total_pnl > 0` never holds at
     `total_pnl == 0`).
+
+    `boundary_mode="pure"` (the default) is byte-unchanged from the M1b
+    behaviour: a single `StreamingBoundary(npts=npts)` chain per replicate.
+    `boundary_mode="refined"` (Rev 2 amendment §1/§2) requires `eps_pin`: it
+    runs the coarse chain at `coarse_npts`, refining onto a fresh
+    `npts`-grid chain on proximity, forced guard, or in-run audit
+    (`audit_every`). `npts` is then the DECISION grid recorded on the row.
+    An `AuditPremiseViolation` propagates uncaught -- the cell aborts with
+    no row written (test 22).
     """
     skip_reason = _feasibility_check(cell, seed=seed)
     if skip_reason is not None:
         return _skipped_result(
             cell, cell_index=cell_index, seed=seed, n_reps=n_reps, npts=npts, reason=skip_reason
         )
+
+    if boundary_mode == "refined" and eps_pin is None:
+        raise ValueError("boundary_mode='refined' requires an eps_pin")
 
     artefact = _synthetic_artefact(alpha=alpha, i_max=i_max, n_max=n_max, look_step=look_step)
     rng = random.Random(seed)
@@ -440,24 +822,62 @@ def run_cell(
     sum_s_terminal = 0.0
     sum_s2_terminal = 0.0
     sum_look_count = 0
+    refined_count = 0
+    refine_reason_counts: dict[str, int] = {}
+    audit_reps = 0
+    audit_max_abs_delta_b: float | None = None
+    audit_disagreements = 0
+    audit_every_effective = (
+        _resolve_audit_every(n_reps, audit_every) if boundary_mode == "refined" else None
+    )
 
     try:
-        for _rep in range(n_reps):
+        for rep_index in range(n_reps):
             draws: list[CombinedDraw] = [
                 combine_station_day(sample_station_day(rng, cell)) for _ in range(n_max)
             ]
-            streaming = StreamingBoundary(alpha=alpha, npts=npts)
-            looks, _verdict, decided = run_sequential_looks(
-                draws,
-                artefact=artefact,
-                boundary_fn=streaming,
-                total_pnl=Decimal(0),
-                residual=Decimal(0),
-                cell_dead=False,
-                structural_fired=False,
-                registered=True,
-                truncation=None,
-            )
+
+            if boundary_mode == "refined":
+                assert eps_pin is not None
+                audit = audit_every_effective is not None and rep_index % audit_every_effective == 0
+                looks, reason, stats = _run_replicate(
+                    draws,
+                    artefact=artefact,
+                    pin=eps_pin,
+                    coarse_npts=coarse_npts,
+                    fine_npts=npts,
+                    alpha=alpha,
+                    audit=audit,
+                    rep_index=rep_index,
+                    cell_index=cell_index,
+                )
+                decided = True
+                if stats["needed_refine"]:
+                    refined_count += 1
+                    refine_reason_counts[reason] = refine_reason_counts.get(reason, 0) + 1
+                if stats["audited"]:
+                    audit_reps += 1
+                    delta = stats["max_abs_delta_b"]
+                    if delta is not None and (
+                        audit_max_abs_delta_b is None or delta > audit_max_abs_delta_b
+                    ):
+                        audit_max_abs_delta_b = delta
+                    if stats["disagreement"]:
+                        audit_disagreements += 1
+            else:
+                streaming = StreamingBoundary(alpha=alpha, npts=npts)
+                looks, _verdict, decided = run_sequential_looks(
+                    draws,
+                    artefact=artefact,
+                    boundary_fn=streaming,
+                    total_pnl=Decimal(0),
+                    residual=Decimal(0),
+                    cell_dead=False,
+                    structural_fired=False,
+                    registered=True,
+                    truncation=None,
+                )
+
             if not decided:
                 raise AssertionError(
                     "the real n_max/look_step schedule always reaches a "
@@ -499,32 +919,178 @@ def run_cell(
         var_s_terminal=var_s_terminal,
         mean_look_count=sum_look_count / n_reps,
         loss_stop_count=loss_stop_count,
+        stage=stage,
+        code_sha=code_sha,
+        substream=substream,
+        boundary_mode=boundary_mode,
+        coarse_npts=coarse_npts if boundary_mode == "refined" else None,
+        eps=eps_pin.eps if eps_pin is not None else None,
+        dt_min=eps_pin.dt_min if eps_pin is not None else None,
+        eps_pin_sha256=eps_pin.sha256 if eps_pin is not None else None,
+        audit_every=audit_every_effective,
+        refined_count=refined_count,
+        refine_reasons=tuple(sorted(refine_reason_counts.items())),
+        audit_reps=audit_reps,
+        audit_max_abs_delta_b=audit_max_abs_delta_b,
+        audit_disagreements=audit_disagreements,
+        sum_s_terminal=sum_s_terminal,
+        sum_s2_terminal=sum_s2_terminal,
+        sum_look_count=sum_look_count,
+        numpy_version=np.__version__,
+        scipy_version=scipy.__version__,
     )
 
 
+class ForeignStageRowError(RuntimeError):
+    """A row's own `stage` field does not match the `--stage`/`stage=`
+    this `run_chunk` invocation was given (amendment §3.3, test 24)."""
+
+
+class ResumeKeyConflictError(RuntimeError):
+    """The same `(stage, cell_index, substream)` already has a row on disk
+    with a DIFFERENT resume key (e.g. a different `code_sha`) -- refused
+    rather than silently overwritten or duplicated (amendment §3.3, test
+    23)."""
+
+
+#: The resume key (amendment §3.3, step 3): an exact match on all of these
+#: means the cell is done and is skipped; any other difference on the same
+#: `(stage, cell_index, substream)` raises.
+_RESUME_KEY_FIELDS: Final[tuple[str, ...]] = (
+    "stage",
+    "cell_index",
+    "substream",
+    "seed",
+    "n_reps",
+    "boundary_mode",
+    "coarse_npts",
+    "eps_pin_sha256",
+    "code_sha",
+    "numpy_version",
+    "scipy_version",
+)
+
+
+def _resume_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(row.get(field) for field in _RESUME_KEY_FIELDS)
+
+
+def _read_and_repair(out_path: Path) -> list[str]:
+    """Read complete lines from `out_path`, repairing a killed write
+    (amendment §3.3 step 1: non-empty, no trailing `\\n` -> truncate to the
+    last complete line, or to empty). Returns the complete raw lines
+    (without their trailing newline); a complete line that fails to parse
+    is left for the caller to raise on (step 2)."""
+    if not out_path.exists():
+        return []
+    raw = out_path.read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        last_nl = raw.rfind(b"\n")
+        repaired = raw[: last_nl + 1] if last_nl >= 0 else b""
+        out_path.write_bytes(repaired)
+        print(
+            f"[aud07-m1c] repaired a killed write in {out_path}: truncated to "
+            "the last complete line",
+            file=sys.stderr,
+        )
+        raw = repaired
+    text = raw.decode("utf-8")
+    return [line for line in text.split("\n") if line]
+
+
+def _load_done_cells(out_path: Path, *, stage: str) -> dict[int, tuple[Any, ...]]:
+    """`{cell_index: resume_key}` for rows already complete in `out_path`,
+    after repairing a killed write. Raises `ForeignStageRowError` on a row
+    whose `stage` differs from the expected stage; a malformed complete
+    line raises via `json.loads` itself (amendment §3.3 step 2)."""
+    done: dict[int, tuple[Any, ...]] = {}
+    for line in _read_and_repair(out_path):
+        row = json.loads(line)
+        if row.get("stage") != stage:
+            raise ForeignStageRowError(
+                f"row stage {row.get('stage')!r} in {out_path} does not match "
+                f"the expected stage {stage!r}"
+            )
+        done[row["cell_index"]] = _resume_key(row)
+    return done
+
+
 def run_chunk(
-    from_idx: int, to_idx: int, *, out_path: Path, n_reps: int, npts: int = GRID_NPTS
+    from_idx: int,
+    to_idx: int,
+    *,
+    out_path: Path,
+    n_reps: int,
+    npts: int = GRID_NPTS,
+    stage: str = "20k",
+    code_sha: str | None = None,
+    boundary_mode: Literal["pure", "refined"] = "pure",
+    eps_pin: EpsPin | None = None,
+    coarse_npts: int = COARSE_NPTS,
+    audit_every: int | None = None,
+    substream: int | None = None,
 ) -> None:
     """Append one JSONL row per completed cell in `M1C_GRID[from_idx:to_idx]`
     (mirrors `aud06a_qty_envelope_sweep.run_chunk`'s chunked/resumable
     protocol -- per-cell seed, so chunk boundaries cannot change the
-    result)."""
+    result), stage-aware and idempotent (amendment §3.3).
+
+    `--out`'s parent directory name must equal `stage` (amendment §3.3
+    "The CLI takes `--stage` and refuses an `--out` whose parent directory
+    name is not that stage", test 24) -- enforced by the CLI, not here, so
+    a direct `run_chunk` call (as the tests use) stays a plain library
+    call.
+    """
+    done = _load_done_cells(out_path, stage=stage)
+
     with out_path.open("a", encoding="utf-8") as f:
         for cell_index in range(from_idx, to_idx):
             cell = M1C_GRID[cell_index]
+            seed = seed_for(stage, cell_index, substream or 0)
+            this_key = (
+                stage,
+                cell_index,
+                substream,
+                seed,
+                n_reps,
+                boundary_mode,
+                coarse_npts if boundary_mode == "refined" else None,
+                eps_pin.sha256 if eps_pin is not None else None,
+                code_sha,
+                np.__version__,
+                scipy.__version__,
+            )
+            existing_key = done.get(cell_index)
+            if existing_key is not None:
+                if existing_key == this_key:
+                    continue  # exact match: already done, skip.
+                raise ResumeKeyConflictError(
+                    f"cell {cell_index} in {out_path} already has a row with a "
+                    f"DIFFERENT resume key: existing={existing_key!r} "
+                    f"new={this_key!r}"
+                )
+
             t0 = time.monotonic()
             result = run_cell(
                 cell,
                 cell_index=cell_index,
-                seed=seed_for_cell_index(cell_index),
+                seed=seed,
                 n_reps=n_reps,
                 npts=npts,
+                boundary_mode=boundary_mode,
+                eps_pin=eps_pin,
+                coarse_npts=coarse_npts,
+                audit_every=audit_every,
+                stage=stage,
+                code_sha=code_sha,
+                substream=substream,
             )
             wall_s = time.monotonic() - t0
             row = result.to_json()
             row["wall_s"] = wall_s
             f.write(json.dumps(row) + "\n")
             f.flush()
+            os.fsync(f.fileno())
             print(
                 f"[aud07-m1c] cell {cell_index} ({cell.label}): "
                 f"crossing_rate={result.crossing_rate!r} cp_upper={result.cp_upper!r} "
@@ -549,20 +1115,68 @@ def _parse_cells_arg(value: str) -> tuple[int, int]:
     return int(from_str), int(to_str)
 
 
+class StageDirMismatchError(RuntimeError):
+    """`--out`'s parent directory name is not `--stage` (amendment §3.3,
+    test 24)."""
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cells", type=_parse_cells_arg, required=True, help="FROM:TO, e.g. 0:49")
     parser.add_argument("--n-reps", type=int, required=True)
     parser.add_argument("--npts", type=int, default=GRID_NPTS)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--stage", default="20k")
+    parser.add_argument("--code-sha", default=None)
+    parser.add_argument("--eps-pin", type=Path, default=None)
+    parser.add_argument("--substream", type=int, default=None)
+    parser.add_argument(
+        "--boundary-mode", choices=("pure", "refined"), default="pure"
+    )
+    parser.add_argument("--coarse-npts", type=int, default=COARSE_NPTS)
+    parser.add_argument("--audit-every", type=int, default=None)
     return parser.parse_args(argv)
+
+
+#: Stages that MUST run from the pinned code snapshot (amendment §3.2):
+#: `smoke` is exempt (decided, review item 3) -- it is a cheap plumbing
+#: check, run directly against the working tree during development, never
+#: cited as evidence.
+_SNAPSHOT_GATED_STAGES: Final[frozenset[str]] = frozenset({"cal_a", "cal_b", "cal_c", "20k", "80k"})
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     from_idx, to_idx = args.cells
+    if args.out.parent.name != args.stage:
+        raise StageDirMismatchError(
+            f"--out {args.out} has parent directory {args.out.parent.name!r}, "
+            f"which does not match --stage {args.stage!r}"
+        )
+    if args.stage in _SNAPSHOT_GATED_STAGES:
+        _assert_snapshot_imports(_REPO_ROOT)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    run_chunk(from_idx, to_idx, out_path=args.out, n_reps=args.n_reps, npts=args.npts)
+
+    eps_pin = None
+    if args.boundary_mode == "refined":
+        if args.eps_pin is None:
+            raise ValueError("--boundary-mode=refined requires --eps-pin")
+        eps_pin = load_eps_pin(args.eps_pin, code_sha=args.code_sha)
+
+    run_chunk(
+        from_idx,
+        to_idx,
+        out_path=args.out,
+        n_reps=args.n_reps,
+        npts=args.npts,
+        stage=args.stage,
+        code_sha=args.code_sha,
+        boundary_mode=args.boundary_mode,
+        eps_pin=eps_pin,
+        coarse_npts=args.coarse_npts,
+        audit_every=args.audit_every,
+        substream=args.substream,
+    )
     return 0
 
 
