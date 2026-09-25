@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from breezy.persistence import family_manifest as family_manifest_module
 from breezy.persistence.family_manifest import (
     FamilyManifest,
     FamilyManifestValidationError,
@@ -223,3 +226,45 @@ def test_an_empty_string_exit_rule_is_refused(tmp_path: Path) -> None:
     payload = dict(_VALID, exit_rule="")
     with pytest.raises(FamilyManifestValidationError):
         load_family_manifest(_write(tmp_path, payload))
+
+
+def test_a_manifest_round_trips_through_the_serialiser(tmp_path: Path) -> None:
+    """AUD-10b step 8: load(write(m), allow_draft=True) == m.
+
+    `manifest_sha256` is the hash of the file bytes, not a JSON field, so
+    the object under test is the one whose sha is the hash of what the
+    serialiser itself writes.
+    """
+    from breezy.persistence.family_manifest import write_family_manifest
+
+    draft = dict(_VALID, status="DRAFT_NOT_REGISTERED", exit_rule="hold_to_settlement")
+    draft["terminal_climate_day"] = "2026-09-30"
+    skeleton = load_family_manifest(_write(tmp_path, draft), allow_draft=True)
+    once = write_family_manifest(tmp_path / "once.json", skeleton)
+    pinned = replace(
+        skeleton,
+        manifest_sha256=hashlib.sha256(once.read_bytes()).hexdigest(),
+    )
+    twice = write_family_manifest(tmp_path / "twice.json", pinned)
+    assert load_family_manifest(twice, allow_draft=True) == pinned
+    assert twice.read_bytes() == once.read_bytes()
+
+
+def test_a_required_key_absent_from_the_serialiser_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A future `_REQUIRED_KEYS` member with no serialiser mapping raises,
+    naming the key -- the serialiser is built from the key sets."""
+    from breezy.persistence.family_manifest import dump_family_manifest
+
+    skeleton = load_family_manifest(
+        _write(tmp_path, dict(_VALID, status="DRAFT_NOT_REGISTERED")),
+        allow_draft=True,
+    )
+    monkeypatch.setattr(
+        family_manifest_module,
+        "_REQUIRED_KEYS",
+        family_manifest_module._REQUIRED_KEYS | frozenset({"brand_new_required_key"}),
+    )
+    with pytest.raises(FamilyManifestValidationError, match="brand_new_required_key"):
+        dump_family_manifest(skeleton)

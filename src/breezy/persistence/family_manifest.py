@@ -63,6 +63,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -356,3 +357,63 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         exit_rule=exit_rule,
         terminal_climate_day=terminal_climate_day,
     )
+
+
+def _field_getters() -> dict[str, Callable[[FamilyManifest], object]]:
+    """One getter per key the loader accepts. A key that appears in
+    `_REQUIRED_KEYS | _OPTIONAL_KEYS` but not here fails `dump_family_manifest`
+    loudly -- the serialiser is not a hand-maintained second key list.
+    """
+
+    def _path(value: Path) -> str:
+        return value.as_posix()
+
+    return {
+        "family_id": lambda manifest: manifest.family_id,
+        "venue": lambda manifest: manifest.venue,
+        "trial_id_prefix": lambda manifest: manifest.trial_id_prefix,
+        "d0_climate_day": lambda manifest: manifest.d0_climate_day,
+        "boundary_artefact_path": lambda manifest: _path(manifest.boundary_artefact_path),
+        "boundary_inputs_sha256": lambda manifest: manifest.boundary_inputs_sha256,
+        "stations": lambda manifest: list(manifest.stations),
+        "status": lambda manifest: manifest.status,
+        "composition_kind": lambda manifest: manifest.composition_kind,
+        "density_artefact_path": lambda manifest: _path(manifest.density_artefact_path),
+        "density_artefact_sha256": lambda manifest: manifest.density_artefact_sha256,
+        "taker_fee_coefficient": lambda manifest: str(manifest.taker_fee_coefficient),
+        "exit_rule": lambda manifest: manifest.exit_rule,
+        "terminal_climate_day": lambda manifest: manifest.terminal_climate_day,
+    }
+
+
+def dump_family_manifest(manifest: FamilyManifest) -> dict[str, object]:
+    """JSON object for `manifest`, covering `_REQUIRED_KEYS | _OPTIONAL_KEYS`.
+
+    `manifest_sha256` is not a JSON field -- it is the hash of the file
+    bytes `write_family_manifest` emits. Optional keys whose value is
+    ``None`` are omitted, matching `load_family_manifest`'s absence rule.
+    """
+    getters = _field_getters()
+    keys = _REQUIRED_KEYS | _OPTIONAL_KEYS
+    missing = sorted(keys - getters.keys())
+    if missing:
+        raise FamilyManifestValidationError(
+            f"serialiser has no mapping for key(s): {missing}"
+        )
+    payload: dict[str, object] = {}
+    for key in sorted(keys):
+        value = getters[key](manifest)
+        if key in _OPTIONAL_KEYS and value is None:
+            continue
+        payload[key] = value
+    return payload
+
+
+def write_family_manifest(path: Path, manifest: FamilyManifest) -> Path:
+    """Write `manifest` as canonical JSON. Returns `path`."""
+    raw = (json.dumps(dump_family_manifest(manifest), indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    return path
