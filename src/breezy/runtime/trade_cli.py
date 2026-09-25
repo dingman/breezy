@@ -438,6 +438,7 @@ def _run_node(
     stderr: TextIO,
     *,
     actors: Sequence[Actor] = (),
+    extra_actors: Sequence[Actor] = (),
     strategies: Sequence[Strategy] = (),
     after_build: Callable[[Node], None] | None = None,
     order_submission_permit: OrderSubmissionPermit | None = None,
@@ -451,6 +452,15 @@ def _run_node(
     ``composition.build_ingest_node`` registers the ingest Actors.
     ``build_trade_node_config`` keeps ``actors=[]``; these are not an order
     path (an Actor is not a Strategy and cannot ``submit_order``).
+
+    ``extra_actors`` (AUD-12b): a SECOND, independent seam for the SAME
+    native registration below -- kept apart from ``actors`` only so each
+    caller's intent stays legible (``actors`` is BL-24's ingest-observation
+    set; ``extra_actors`` is composition-kind-specific, today only the
+    fee-drift probe ``breezy.app.trade`` builds for ``continuous_rung_hold``).
+    Both are registered through the exact SAME ``node.trader.add_actor`` loop,
+    before ``build()``. Defaults to ``()`` so every existing caller is
+    unchanged.
 
     Shadow-mode ``current_rung_hold`` strategies -- constructed ABOVE this
     module by ``breezy.app.trade`` -- are registered the same way, through
@@ -517,7 +527,7 @@ def _run_node(
         node.add_exec_client_factory(
             POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory
         )
-        for actor in actors:
+        for actor in (*actors, *extra_actors):
             node.trader.add_actor(actor)
         for strategy in strategies:
             node.trader.add_strategy(strategy)
@@ -584,6 +594,7 @@ def run(
     node_factory: NodeFactory = TradingNode,
     stderr: TextIO | None = None,
     strategies: Sequence[Strategy] = (),
+    extra_actors: Sequence[Actor] = (),
     submit_intent_latch: object | None = None,
     after_build: Callable[[Node], None] | None = None,
     live_trading_permit: object | None = None,
@@ -612,6 +623,11 @@ def run(
     function. Re-reading either here would be a second, competing read of the
     same environment variables at the same instant; when the caller already
     has a value, it is passed straight through and neither loader runs again.
+
+    ``extra_actors`` (AUD-12b) is a plain passthrough to :func:`_run_node`,
+    default ``()``: ``breezy.app.trade.run`` builds the fee-drift probe
+    Actor (``continuous_rung_hold`` only) and passes it here, already fully
+    constructed -- this function opens no new registration mechanism.
     """
     out = sys.stderr if stderr is None else stderr
     install_logging_bridge()
@@ -666,6 +682,7 @@ def run(
             node_factory,
             out,
             actors=actors,
+            extra_actors=extra_actors,
             strategies=strategies,
             after_build=after_build,
             order_submission_permit=order_submission_permit,
