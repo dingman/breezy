@@ -522,6 +522,26 @@ def test_c_n_live_empty_store_is_underpowered(tmp_path: Path) -> None:
     assert row.value["n"] == 0
 
 
+def test_edge_ci_lower_uses_the_shared_one_sided_confidence_level() -> None:
+    """`_edge`'s analytic CI-lower and `block_bootstrap_ci_lower`'s BCa bound
+    must be reported at the SAME one-sided level -- both derived from
+    `roi_bound._CONFIDENCE_LEVEL` (0.95), not a locally hardcoded 0.975."""
+    from scipy.stats import norm
+
+    from breezy.analysis.promotion_criteria import _CONFIDENCE_LEVEL, _edge
+
+    draws = (
+        CombinedDraw(x=10.0, variance=4.0, n_constituents=5),
+        CombinedDraw(x=5.0, variance=1.0, n_constituents=5),
+    )
+    edge_hat, se, lower = _edge(draws)
+    z = norm.ppf(_CONFIDENCE_LEVEL)
+    assert lower == pytest.approx(edge_hat - z * se)
+    # The bug this pins: 0.975 (two-sided companion of a 95% CI) is a
+    # DIFFERENT level than roi_bound's one-sided 0.95.
+    assert norm.ppf(_CONFIDENCE_LEVEL) != pytest.approx(norm.ppf(0.975))
+
+
 def test_c_estimator_absent_cites_c_n_and_emits_no_edge(tmp_path: Path) -> None:
     row = evaluate_c_estimator(
         store_dir=tmp_path / "missing",

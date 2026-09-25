@@ -246,6 +246,99 @@ def test_a_second_unchanged_run_is_idempotent_and_a_tamper_is_a_hard_error(
     assert "hard error" in out3.lower() or "byte" in out3.lower()
 
 
+def _store(tmp_path: Path, name: str) -> Path:
+    store = tmp_path / name
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    return store
+
+
+def test_new_scored_trial_file_between_runs_yields_a_new_proposal_directory(
+    tmp_path: Path,
+) -> None:
+    """C12 fix: the content hash must cover the scored-trials STORE's actual
+    contents (parquet/sidecar files), not just its provenance.json sidecar --
+    a new fill/scored-trial landing between two same-day runs must produce a
+    NEW proposal directory and exit 0, never a false 'tamper' hard error."""
+    clock = _counter(tmp_path, _V4, "clock")
+    store = _store(tmp_path, "store")
+    run_root = tmp_path / "a"
+    code1, out1 = _run(run_root, clock, extra=["--scored-trials-dir", str(store)])
+    assert code1 == 0, out1
+    dirs1 = {p.name for p in (run_root / "derived" / "promotion" / "proposals").iterdir()}
+    assert len(dirs1) == 1
+
+    # A new scored fill lands in the store between runs.
+    (store / "fill_order.jsonl").write_text(
+        json.dumps({"trial_id": "t1", "score_seq": 0, "filled_at_ns": 1}) + "\n"
+    )
+
+    code2, out2 = _run(run_root, clock, extra=["--scored-trials-dir", str(store)])
+    assert code2 == 0, out2
+    assert "hard error" not in out2.lower()
+    dirs2 = {p.name for p in (run_root / "derived" / "promotion" / "proposals").iterdir()}
+    assert len(dirs2) == 2
+    assert dirs1 < dirs2
+
+
+def test_new_exec_state_db_row_between_runs_yields_a_new_proposal_directory(
+    tmp_path: Path,
+) -> None:
+    """C12 fix: the exec-state DB is a content input too -- a new fill
+    written between two same-day runs must produce a NEW proposal directory
+    and exit 0, never a false 'tamper' hard error."""
+    clock = _counter(tmp_path, _V4, "clock")
+    exec_db = _exec_db(tmp_path)
+    run_root = tmp_path / "b"
+    code1, out1 = _run(run_root, clock, extra=["--exec-state-db", str(exec_db)])
+    assert code1 == 0, out1
+    dirs1 = {p.name for p in (run_root / "derived" / "promotion" / "proposals").iterdir()}
+    assert len(dirs1) == 1
+
+    conn = sqlite3.connect(exec_db)
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES (?, ?)",
+        ("some/new/key", b"a new fill landed"),
+    )
+    conn.commit()
+    conn.close()
+
+    code2, out2 = _run(run_root, clock, extra=["--exec-state-db", str(exec_db)])
+    assert code2 == 0, out2
+    assert "hard error" not in out2.lower()
+    dirs2 = {p.name for p in (run_root / "derived" / "promotion" / "proposals").iterdir()}
+    assert len(dirs2) == 2
+    assert dirs1 < dirs2
+
+
+def test_unchanged_scored_trials_store_and_exec_db_reuse_the_same_directory(
+    tmp_path: Path,
+) -> None:
+    """Unchanged store + exec-db content (even under a different exec-db
+    file path) yields the SAME content-hashed directory and exit 0."""
+    clock = _counter(tmp_path, _V4, "clock")
+    store = _store(tmp_path, "store")
+    run_root = tmp_path / "c"
+    code1, out1 = _run(
+        run_root,
+        clock,
+        extra=["--scored-trials-dir", str(store), "--exec-state-db", str(_exec_db(tmp_path))],
+    )
+    assert code1 == 0, out1
+    dirs1 = {p.name for p in (run_root / "derived" / "promotion" / "proposals").iterdir()}
+    assert len(dirs1) == 1
+
+    # A fresh exec-db file with byte-identical (empty) content, same store.
+    code2, out2 = _run(
+        run_root,
+        clock,
+        extra=["--scored-trials-dir", str(store), "--exec-state-db", str(_exec_db(tmp_path))],
+    )
+    assert code2 == 0, out2
+    dirs2 = {p.name for p in (run_root / "derived" / "promotion" / "proposals").iterdir()}
+    assert dirs1 == dirs2
+
+
 def test_unknown_replay_schema_refuses(tmp_path: Path) -> None:
     clock = _counter(tmp_path, _V4, "clock")
     results = tmp_path / "bad.jsonl"
