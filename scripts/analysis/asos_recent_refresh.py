@@ -56,8 +56,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
-from collections.abc import Sequence
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal
 
@@ -70,6 +71,7 @@ from settlement_alignment_study import (
     HistoricalDataClient,
     SiteSpec,
     asos_url,
+    cache_path_for_url,
     fetch_text_cached,
     load_sites,
     parse_asos_rows,
@@ -91,6 +93,131 @@ __all__ = [
 DEFAULT_LOOKBACK_DAYS: Final[int] = 3
 
 RefreshOutcome = Literal["FETCHED", "EMPTY_RESPONSE", "FETCH_FAILED"]
+
+# ---------------------------------------------------------------------------
+# 429/5xx pacing and bounded retry (production evidence 2026-09-22..09-24:
+# NYC fetched, then SFO/MIA/MDW/LAX each got HTTPStatusError 429 back-to-back
+# with ZERO spacing -- `fetch_text_cached`'s own `time.sleep(delay_s)` runs
+# only AFTER a successful `response.raise_for_status()`, so a 429 skips it
+# entirely and the very next station's request fires immediately).
+#
+# Mirrors two already-reviewed patterns rather than inventing a third:
+# `current_rung_hold_exit_window_study.py`'s `_RetryWaitBudget` (a run-wide
+# ceiling on the SUM of every retry wait, never per-station alone) and
+# `iem_mos_backfill.py`'s `_make_fetch`/`_retry_wait` (Retry-After honoured
+# in its integer-seconds form, capped, else exponential backoff, 429/5xx
+# only). `fetch_text_cached` itself is NEVER modified here -- every other
+# caller (`settlement_alignment_study.main`, `current_rung_hold_resting_bid_
+# study.py`, the exit-window study's own wrapper) keeps its existing,
+# single-attempt behaviour.
+# ---------------------------------------------------------------------------
+
+#: IEM's expected minimum spacing between requests -- the same 1 s floor
+#: `iem_mos_probe_transport.IemPacer`/`IEM_MIN_INTERVAL_NS` charge for the
+#: MOS/1-minute-ASOS transports. `--delay-seconds` (default below) drives
+#: this pacer's `min_interval_s` directly, so the CLI default keeps the
+#: existing 1.0 s politeness floor.
+_DEFAULT_MIN_INTERVAL_S: Final[float] = 1.0
+_RETRY_BACKOFFS_S: Final[tuple[float, ...]] = (5.0, 15.0, 45.0)
+_MAX_RETRY_WAIT_S: Final[float] = 60.0
+_MAX_FETCH_RETRIES: Final[int] = 3
+#: A run-wide ceiling on the SUM of every retry wait across every site in
+#: one run -- matches `iem_mos_backfill._MAX_RETRY_WALL_S` exactly, and sits
+#: well under `_ASOS_ASSUMED_BUDGET_S` (600 s, `test_asos_refresh_alert_env
+#: .py`) with headroom left for the GET calls and pacing themselves.
+_TOTAL_RETRY_WAIT_BUDGET_S: Final[float] = 300.0
+
+
+@dataclass(slots=True)
+class _RetryWaitBudget:
+    """A per-RUN ceiling on the TOTAL retry wait summed across every site --
+    one shared instance for the whole `refresh_recent_asos` loop. Once
+    exhausted, retrying stops immediately for every remaining site too."""
+
+    remaining_s: float
+
+    def consume(self, seconds: float) -> bool:
+        """`True` (and decrements `remaining_s`) iff the FULL `seconds` fits
+        in what remains; `False` (unchanged) otherwise."""
+        if seconds > self.remaining_s:
+            return False
+        self.remaining_s -= seconds
+        return True
+
+
+@dataclass(slots=True)
+class _InterRequestPacer:
+    """>= `min_interval_s` between actual network ATTEMPTS, charged BEFORE
+    every attempt -- success or failure alike. Unlike `fetch_text_cached`'s
+    own post-SUCCESS-only `time.sleep`, this pacer cannot be skipped by a
+    429: it is what closes the production gap above."""
+
+    min_interval_s: float
+    monotonic: Callable[[], float]
+    sleep: Callable[[float], None]
+    _last_attempt: float | None = field(default=None, init=False)
+
+    def wait(self) -> None:
+        now = self.monotonic()
+        if self._last_attempt is not None:
+            residual = self.min_interval_s - (now - self._last_attempt)
+            if residual > 0:
+                self.sleep(residual)
+        self._last_attempt = self.monotonic()
+
+
+def _retry_wait_seconds(exc: httpx.HTTPStatusError, attempt: int) -> float:
+    """Seconds to wait before retrying `exc`'s station (`attempt` is
+    0-indexed: 0 is the wait before the FIRST retry). Honours `Retry-After`
+    in its seconds form only -- an HTTP-date `Retry-After`, or one that
+    fails to parse as a float, falls back to `_RETRY_BACKOFFS_S`. Always
+    capped at `_MAX_RETRY_WAIT_S`.
+    """
+    seconds = _RETRY_BACKOFFS_S[attempt]
+    retry_after = exc.response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            parsed = float(retry_after)
+        except ValueError:
+            pass
+        else:
+            if parsed >= 0:
+                seconds = parsed
+    return min(seconds, _MAX_RETRY_WAIT_S)
+
+
+def _fetch_text_paced_with_retry(
+    client: HistoricalDataClient,
+    cache_dir: Path,
+    url: str,
+    *,
+    pacer: _InterRequestPacer,
+    sleep: Callable[[float], None],
+    budget: _RetryWaitBudget,
+) -> str:
+    """Bounded retry (429/5xx only) around `fetch_text_cached`, paced at
+    least `pacer.min_interval_s` apart before every attempt. A cache hit
+    never touches the network, so it is never paced or retried. Any other
+    `httpx.HTTPStatusError` (e.g. 404) or a connection-level error is raised
+    on the very first attempt, exactly like the pre-retry behaviour.
+    """
+    path = cache_path_for_url(cache_dir, url)
+    if path.exists():
+        return path.read_text(encoding="utf-8", errors="replace")
+    for attempt in range(_MAX_FETCH_RETRIES + 1):
+        pacer.wait()
+        try:
+            return fetch_text_cached(client, cache_dir, url, 0.0)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            retryable = status == 429 or 500 <= status < 600
+            if not retryable or attempt == _MAX_FETCH_RETRIES:
+                raise
+            wait_s = _retry_wait_seconds(exc, attempt)
+            if not budget.consume(wait_s):
+                raise
+            sleep(wait_s)
+    raise AssertionError("unreachable: the loop above always returns or raises")
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,19 +270,32 @@ def refresh_recent_asos(
     today: dt.date,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     delay_s: float = 0.0,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    retry_wait_budget_s: float = _TOTAL_RETRY_WAIT_BUDGET_S,
 ) -> RefreshReport:
     """Fetch each site's recent ASOS window into `cache_dir`, failing SOFT.
 
     One `SiteRefreshResult` per site, always -- a network error or an empty
     response for one station is recorded and the loop continues; nothing
-    here ever raises past this function.
+    here ever raises past this function. `delay_s` sets the pacer's minimum
+    interval between network attempts (charged before every attempt, not
+    just after a success -- see the pacing/retry block above); `sleep` and
+    `monotonic` are test seams so a test never really sleeps;
+    `retry_wait_budget_s` is a run-wide ceiling on the SUM of every retry
+    wait across every site (production default `_TOTAL_RETRY_WAIT_BUDGET_S`,
+    injectable small for a test).
     """
     start, end = refresh_window(today=today, lookback_days=lookback_days)
+    pacer = _InterRequestPacer(min_interval_s=delay_s, monotonic=monotonic, sleep=sleep)
+    budget = _RetryWaitBudget(remaining_s=retry_wait_budget_s)
     results: list[SiteRefreshResult] = []
     for spec in sites:
         url = asos_url(spec.iem_asos_id, start, end)
         try:
-            text = fetch_text_cached(client, cache_dir, url, delay_s)
+            text = _fetch_text_paced_with_retry(
+                client, cache_dir, url, pacer=pacer, sleep=sleep, budget=budget
+            )
         except Exception as exc:  # noqa: BLE001 -- fail soft; every exception is reportable
             results.append(
                 SiteRefreshResult(
@@ -208,7 +348,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Absolute start date (YYYY-MM-DD), overriding --lookback-days with a "
         "window that does not drift a day further from this anchor every run.",
     )
-    parser.add_argument("--delay-seconds", type=float, default=1.0)
+    parser.add_argument("--delay-seconds", type=float, default=_DEFAULT_MIN_INTERVAL_S)
     return parser.parse_args(argv)
 
 

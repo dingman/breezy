@@ -30,11 +30,16 @@ from asos_cache_freshness_check import (
     ASOS_CACHE_STALE_ALERT_SEVERITY,
     AsosCacheStaleDetail,
     check_and_alert,
+    resolve_consumer_cache_paths,
+    stale_paths,
 )
 from settlement_alignment_study import SiteSpec
 
 _SITE: Final[SiteSpec] = SiteSpec(
     city="Testville", site=object(), std_utc_offset_hours=-6.0, iem_asos_id="TST"  # type: ignore[arg-type]
+)
+_OTHER_SITE: Final[SiteSpec] = SiteSpec(
+    city="Otherville", site=object(), std_utc_offset_hours=-5.0, iem_asos_id="OTR"  # type: ignore[arg-type]
 )
 _FETCH_START: Final[dt.date] = dt.date(2026, 8, 30)
 _FETCH_END: Final[dt.date] = dt.date(2026, 9, 22)
@@ -111,6 +116,39 @@ def test_an_empty_site_list_is_treated_as_stale_not_a_vacuous_pass(tmp_path: Pat
     assert payload.severity == ASOS_CACHE_STALE_ALERT_SEVERITY
     assert payload.event == ASOS_CACHE_STALE_ALERT_EVENT
     assert payload.detail == AsosCacheStaleDetail.CONSUMER_CACHE_KEY_MISSING_OR_STALE_TODAY.value
+
+
+def test_the_check_flags_one_stale_station_while_another_is_fresh(tmp_path: Path) -> None:
+    """AUD-25 asos-429 fix (2026-09-25, production evidence: NYC fetched
+    while SFO/MIA/MDW/LAX all 429'd): `resolve_consumer_cache_paths`
+    already resolves ONE path per site in `sites`, and `check_and_alert`
+    already alerts if ANY of them is stale -- this pins that the check is
+    genuinely per-station, not a single aggregate key that could mask a
+    4-of-5 shortfall as a pass, by giving one site a fresh cache and the
+    other none at all.
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    paths = resolve_consumer_cache_paths(
+        cache_dir=cache_dir, sites=(_SITE, _OTHER_SITE), fetch_start=_FETCH_START,
+        fetch_end=_FETCH_END,
+    )
+    fresh_path, stale_path = paths
+    fresh_path.write_bytes(b"fetched today")
+    fresh_today = _NOW.replace(hour=6, minute=0, second=0, microsecond=0).timestamp()
+    os.utime(fresh_path, (fresh_today, fresh_today))
+    # `stale_path` (the second site's) is never written -- the exact shape
+    # of a station that 429'd every attempt.
+
+    assert stale_paths(paths, now=_NOW) == (stale_path,)
+
+    sink = _RecordingSink()
+    stale = check_and_alert(
+        cache_dir=cache_dir, sites=(_SITE, _OTHER_SITE), fetch_start=_FETCH_START,
+        fetch_end=_FETCH_END, now=_NOW, sink=sink,
+    )
+    assert stale is True
+    assert len(sink.emitted) == 1
 
 
 def test_main_logs_alert_egress_status_before_resolving_the_sink(
