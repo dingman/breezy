@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import inspect
 import json
 import os
 import sys
@@ -69,6 +70,7 @@ from argv_digest import argv_sha256
 from run_weather_strategy_backtests import (
     WEATHER_VENUE,
     TapeInstrument,
+    _capture_instruments_by_id,
     _convert_live_capture,
     _load_climate_day_records,
     _select_capture_instruments,
@@ -77,6 +79,7 @@ from run_weather_strategy_backtests import (
 from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
 from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_of
+from breezy.analysis.replay_sufficiency import decision_window_ns
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
@@ -297,6 +300,105 @@ def assert_requested_days_are_listed(
             f"{[d.isoformat() for d in unlisted]!r}; listed days: "
             f"{sorted(d.isoformat() for d in listed)!r}",
         )
+
+
+def _select_replay_capture_instruments(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str,
+    start: int,
+    end: int | None,
+) -> list[TapeInstrument]:
+    """Call the shared selector with replay-only narrowing when the callable
+    exposes those keywords.
+
+    Several driver tests monkeypatch `_select_capture_instruments` with the
+    historical `(catalog, *, climate_day)` shape to isolate unrelated dispatch
+    behavior. Signature-aware dispatch keeps those tests about their original
+    seam while the real selector receives the station and window bounds.
+    """
+    selector = _select_capture_instruments
+    parameters = inspect.signature(selector).parameters
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    kwargs: dict[str, object] = {"climate_day": climate_day}
+    for name, value in (("station", station), ("start", start), ("end", end)):
+        if accepts_kwargs or name in parameters:
+            kwargs[name] = value
+    return selector(catalog, **kwargs)
+
+
+def _replay_station_day_instrument_ids(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str,
+) -> tuple[str, ...]:
+    """Instrument ids for the warm-up peek below.
+
+    Discovery (dedup + station/day filtering) is `_capture_instruments_by_id`
+    -- the SAME seam `_select_capture_instruments` uses for its own
+    discovery -- never a second, ad hoc `catalog.instruments()` loop (review
+    fix: this function used to duplicate that loop and touch the catalog
+    directly, bypassing every test that patches `_select_capture_
+    instruments`).
+    """
+    return tuple(
+        sorted(
+            _capture_instruments_by_id(catalog, climate_day=climate_day, station=station),
+        ),
+    )
+
+
+def _latest_ts_init_at_or_before(records: Sequence[object], bound_ns: int) -> int | None:
+    candidates = [
+        record.ts_init
+        for record in records
+        if getattr(record, "ts_init", bound_ns + 1) <= bound_ns
+    ]
+    return max(candidates, default=None)
+
+
+def _warmup_start_ns_for_replay(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str,
+    window_start_ns: int,
+) -> int:
+    """Earliest latest pre-window book/quote timestamp needed for warm state.
+
+    The replay must start before the decision window when a book or quote
+    already existed at the boundary. For each selected instrument and each
+    relevant market-data type, query the catalog up to the window start and
+    keep only that type's latest pre-window timestamp. The replay read starts
+    at the earliest of those latest timestamps so every instrument/type with
+    prior state is present without replaying older history.
+    """
+    warmup_points: list[int] = []
+    for instrument_id in _replay_station_day_instrument_ids(
+        catalog,
+        climate_day=climate_day,
+        station=station,
+    ):
+        depths = catalog.order_book_depth10(  # type: ignore[attr-defined]
+            instrument_ids=[instrument_id],
+            end=window_start_ns,
+        )
+        quotes = catalog.quote_ticks(  # type: ignore[attr-defined]
+            instrument_ids=[instrument_id],
+            end=window_start_ns,
+        )
+        depth_start = _latest_ts_init_at_or_before(depths, window_start_ns)
+        quote_start = _latest_ts_init_at_or_before(quotes, window_start_ns)
+        if depth_start is not None:
+            warmup_points.append(depth_start)
+        if quote_start is not None:
+            warmup_points.append(quote_start)
+    return min(warmup_points, default=window_start_ns)
 
 
 class FeeScheduleMismatchError(ValueError):
@@ -1479,7 +1581,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         subdirectory=args.tape_subdirectory,
         work_catalog=args.work_catalog,
     )
-    tape_instruments = _select_capture_instruments(catalog, climate_day=climate_day)
+    std_utc_offset_hours = default_registry().climate_day_window(
+        WEATHER_VENUE, args.station,
+    ).std_utc_offset_hours
+    market_start_ns, _market_end_ns = decision_window_ns(
+        climate_day=climate_day,
+        std_utc_offset_hours=std_utc_offset_hours,
+    )
+    market_read_start_ns = _warmup_start_ns_for_replay(
+        catalog,
+        climate_day=climate_day,
+        station=args.station,
+        window_start_ns=market_start_ns,
+    )
+    tape_instruments = _select_replay_capture_instruments(
+        catalog,
+        climate_day=climate_day,
+        station=args.station,
+        start=market_read_start_ns,
+        end=None,
+    )
     listed_days = sorted({ti.facts.climate_day for ti in tape_instruments})
     assert_requested_days_are_listed([climate_day], listed_days)
 
@@ -1496,9 +1617,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"current_rung_hold_paper_replay: refused: {exc}", file=sys.stderr)
             return EXIT_FEE_SCHEDULE_MISMATCH
 
-    std_utc_offset_hours = default_registry().climate_day_window(
-        WEATHER_VENUE, args.station,
-    ).std_utc_offset_hours
     # (3) Printed BEFORE the coverage precondition below, unconditionally --
     # an uncovered tape's own counts/span must be visible even (especially)
     # when this run goes on to refuse it.
