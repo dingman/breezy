@@ -118,6 +118,7 @@ Target: `docs/plans/backlog/AUDIT_2026-09-21/AUD-09-scheduled-per-station-replay
 - **R1 selection:**
   - Build `dict[(station, climate_day)] → row` from `read_replay_sufficiency`.
   - Eligible: SUFFICIENT, `live_instance_count == 0`, `station in SUPPORTED_STATIONS` (drift: the census emits NYC rows; base §5 excludes them from the queue), and no result row under the full key.
+  - **Tracking (2026-09-25, B27):** eligibility now also requires `is_replayable_whole_day(row)` (`breezy.analysis.replay_sufficiency`) rather than `verdict == "SUFFICIENT"` alone -- a Stage B `FRAGMENT` winner or a `window_complete=False` winner is real but partial, and replaying either as a full day is the selection-bias hazard §5 names. `is_replayable_whole_day` cannot see the drift set itself, so R4's drift check below still runs separately and independently excludes a drifted key.
   - Order by an explicit sort on `(climate_day, SUPPORTED_STATIONS.index(station))`, never file order.
 - **R2 row fields:** add `window_complete`, `replayed_first_ns`, `replayed_last_ns`, `census_schema_version`. `REPLAY_RESULTS_SCHEMA_VERSION` stays 1 because nothing has shipped.
 - **R3 summary line:** "replayed [hh:mm, hh:mm] LST of [12:00, 17:00); window_complete=…". A replay is never described as full-day unless `window_complete` is true.

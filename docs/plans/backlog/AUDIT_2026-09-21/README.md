@@ -92,7 +92,9 @@ Artefacts are in `docs/evidence/`; review trails in `docs/evidence/reviews/`.
 
 Edges (A → B means B needs A): AUD-02b → enforcement of A1 · AUD-05 → AUD-10 (`C-KILL`) ·
 AUD-19a → AUD-19b → AUD-19c · AUD-09 runner → AUD-19c · AUD-19 → AUD-10 (`C-PAIRED`) ·
-AUD-09 → AUD-10 (shared wrapper contract) · AUD-08 → AUD-09 (site registry constraint) ·
+AUD-09 → AUD-10 (shared wrapper contract; AUD-09b amendment §5/§7 B27 — `C-VALIDITY` must refuse
+`window_complete=false`, `coverage_kind≠WHOLE`, and drifted keys via `is_replayable_whole_day`) ·
+AUD-08 → AUD-09 (site registry constraint) ·
 AUD-09 + AUD-11 + AUD-12 → AUD-18 (replay runner, point-in-time guard, slippage) · AUD-18 CONFIRMED → AUD-06b ·
 AUD-06a → AUD-06b · AUD-06a → AUD-07 · AUD-04 → AUD-07 (AUD-04 owns `alert_ladder.py`). No cycle.
 
