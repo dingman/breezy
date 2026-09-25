@@ -748,3 +748,133 @@ def test_corrupt_summary_warns_before_returning_zero(
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert str(summary) in warnings[0].message
+
+
+def test_stalled_station_annotated_from_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-2 AC6: a stalled window-open station gets a `stall=STATION(reason:
+    count)` token and a `pre_tape_by_station` artefact entry, sourced from
+    the diagnostics-summary sidecar."""
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(
+        json.dumps(_row(station="LAX", source="quote", observed_at_ns=1)) + "\n",
+        encoding="utf-8",
+    )
+    summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+    summary.write_text(
+        json.dumps({"station": "MDW", "diagnostics": {"not_executable": 826}}) + "\n",
+        encoding="utf-8",
+    )
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "LAX,MDW",
+            "--output-dir", str(out),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 0
+    assert "stall=MDW(not_executable:826)" in sink.payloads[0].detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["pre_tape_by_station"] == {"MDW": {"not_executable": 826}}
+
+
+def test_missing_summary_byte_identical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing diagnostics-summary sidecar produces the SAME output as
+    before F-2's `pre_tape_by_station` field existed: plain `stall=`
+    station names, no `pre_tape_by_station` artefact key."""
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(
+        json.dumps(_row(station="LAX", source="quote", observed_at_ns=1)) + "\n",
+        encoding="utf-8",
+    )
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "LAX,MDW",
+            "--output-dir", str(out),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 0
+    assert "stall=MDW" in sink.payloads[0].detail
+    assert "(" not in sink.payloads[0].detail.split("stall=")[1].split(" ")[0]
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert "pre_tape_by_station" not in artefact
+
+
+def test_pre_token_dropped_first() -> None:
+    """F-2 AC6: the enriched stall token is dropped BEFORE anything else
+    (halt_reason, why, ...) when it alone pushes the line over budget."""
+    report = _DIGEST.FunnelReport(
+        totals=_DIGEST.StageCounts(),
+        shadow_count=0,
+        shadow_by_reason=(),
+        exit_fired=0,
+        exit_refused=0,
+        stalled_stations=("LAX", "MDW", "MIA", "SFO"),
+        coverage_min_observed_at_ns=None,
+        coverage_max_observed_at_ns=None,
+        entry_reasons=(),
+        pre_tape_by_station={
+            "LAX": {"a_very_long_pre_tape_diagnostic_reason_name_one": 111_111},
+            "MDW": {"a_very_long_pre_tape_diagnostic_reason_name_two": 222_222},
+            "MIA": {"a_very_long_pre_tape_diagnostic_reason_name_three": 333_333},
+            "SFO": {"a_very_long_pre_tape_diagnostic_reason_name_four": 444_444},
+        },
+    )
+
+    detail = _DIGEST.format_digest_detail(report, climate_day="2026-09-20")
+
+    assert len(detail) <= 200
+    assert "stall=LAX,MDW,MIA,SFO" in detail
+    assert "a_very_long_pre_tape_diagnostic_reason_name" not in detail
+
+
+class TestReadDiagnosticsSummaryTotalsSinglePass:
+    def test_reads_the_summary_file_exactly_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guards against the double-read regression: a single call site in
+        `main` must produce exactly ONE warning on a corrupt sidecar (see
+        `test_corrupt_summary_warns_before_returning_zero`), and exactly one
+        `_iter_jsonl` pass over the file."""
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8"
+        )
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text(
+            json.dumps(
+                {"station": "MDW", "offer_tape_capped": 2, "diagnostics": {"x": 5}}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        calls: list[Path] = []
+        original = _DIGEST._iter_jsonl
+
+        def _spy(path: Path):  # type: ignore[no-untyped-def]
+            calls.append(path)
+            return original(path)
+
+        monkeypatch.setattr(_DIGEST, "_iter_jsonl", _spy)
+
+        totals = _DIGEST._read_diagnostics_summary_totals(tape, "2026-09-20")
+
+        assert totals.capped_total == 2
+        assert totals.pre_tape_by_station == {"MDW": {"x": 5}}
+        assert len(calls) == 1

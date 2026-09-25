@@ -44,7 +44,7 @@ import os
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
@@ -194,6 +194,14 @@ class FunnelReport:
     coverage_min_observed_at_ns: int | None
     coverage_max_observed_at_ns: int | None
     entry_reasons: tuple[tuple[str, int], ...]
+    #: F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): per-station SUMS of the
+    #: day's hourly `diagnostics` deltas, read from the diagnostics-summary
+    #: sidecar (F-2's own artefact) -- `{}` when that sidecar is absent or
+    #: unreadable, in which case the digest's output is byte-identical to
+    #: before this field existed (AC6). Populated by `main` via `replace`,
+    #: never by `funnel_for_day` itself (that function reads only the
+    #: offer-tape rows).
+    pre_tape_by_station: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def default_climate_day(now: dt.datetime) -> dt.date:
@@ -302,6 +310,18 @@ def funnel_for_day(
     )
 
 
+def _stall_token(station: str, pre_tape_by_station: Mapping[str, Mapping[str, int]]) -> str:
+    """F-2 AC6: ``STATION(top_reason:count)`` when the diagnostics-summary
+    sidecar has pre-tape counts for ``station``, else the plain station
+    name (byte-identical to before this field existed -- the missing/empty
+    case)."""
+    counts = pre_tape_by_station.get(station)
+    if not counts:
+        return station
+    top_reason, top_count = max(counts.items(), key=lambda item: item[1])
+    return f"{station}({top_reason}:{top_count})"
+
+
 def format_digest_detail(
     report: FunnelReport,
     *,
@@ -312,7 +332,8 @@ def format_digest_detail(
     """One alert line. Shadow is labelled as outside the orders funnel.
 
     Stays within ``MAX_ALERT_DETAIL_CHARS`` by dropping fields in priority
-    order, most-expendable first: the halt-unknown free-text ``reason``
+    order, most-expendable first: the F-2 pre-tape ``stall=STATION(reason:
+    count)`` enrichment, then the halt-unknown free-text ``reason``
     (unbounded length, diagnostic only), then the ``why=`` reason tally,
     then finally falling back to the short form. ``halt=<value>`` itself
     (when ``halt`` is given at all) is never dropped -- it is one of three
@@ -321,36 +342,50 @@ def format_digest_detail(
     relies on ``AlertPayload`` truncation, which would cut a token in half.
     """
     totals = report.totals
-    stall = ",".join(report.stalled_stations) if report.stalled_stations else "-"
     if report.coverage_min_observed_at_ns is None or report.coverage_max_observed_at_ns is None:
         coverage = "absent"
     else:
         coverage = f"{report.coverage_min_observed_at_ns}-{report.coverage_max_observed_at_ns}"
-    base = (
-        f"day={climate_day} e={totals.decisions_emitted} r={totals.rung_resolved} "
-        f"c={totals.cell_legal} p={totals.reached_price} m={totals.margin_positive} "
-        f"o={totals.orders} shadow={report.shadow_count}(not-orders) "
-        f"xf={report.exit_fired} xr={report.exit_refused} stall={stall} cov={coverage}"
-    )
-    if halt is not None:
-        base = f"{base} halt={halt.value}"
-    if capped_total > 0:
-        base = f"{base} truncated=1"
     halt_reason = f"halt_reason={halt.reason}" if halt is not None and halt.reason else None
     why = ",".join(f"{name}:{count}" for name, count in report.entry_reasons)
 
-    # Richest to leanest: base+halt, +halt_reason, +why -- drop halt_reason
-    # first, then why, landing on `base` (which always carries halt=<value>
-    # once `halt` is given), then the short fallback below.
-    with_reason = f"{base} {halt_reason}" if halt_reason else base
-    candidate = f"{with_reason} why={why}" if why else with_reason
-    if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
-        return candidate
-    candidate = f"{base} why={why}" if why else base
-    if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
-        return candidate
-    if len(base) <= MAX_ALERT_DETAIL_CHARS:
-        return base
+    def _base(stall: str) -> str:
+        rendered = (
+            f"day={climate_day} e={totals.decisions_emitted} r={totals.rung_resolved} "
+            f"c={totals.cell_legal} p={totals.reached_price} m={totals.margin_positive} "
+            f"o={totals.orders} shadow={report.shadow_count}(not-orders) "
+            f"xf={report.exit_fired} xr={report.exit_refused} stall={stall} cov={coverage}"
+        )
+        if halt is not None:
+            rendered = f"{rendered} halt={halt.value}"
+        if capped_total > 0:
+            rendered = f"{rendered} truncated=1"
+        return rendered
+
+    if report.stalled_stations:
+        enriched_stall = ",".join(
+            _stall_token(station, report.pre_tape_by_station) for station in report.stalled_stations
+        )
+        plain_stall = ",".join(report.stalled_stations)
+    else:
+        enriched_stall = plain_stall = "-"
+
+    # F-2 AC6: the enriched stall token is the FIRST thing dropped -- tried
+    # richest to leanest at EVERY tier (halt_reason+why, why-only, base
+    # alone) before falling back to the plain station-name stall field and
+    # repeating the SAME cascade.
+    for stall in (enriched_stall, plain_stall):
+        base = _base(stall)
+        with_reason = f"{base} {halt_reason}" if halt_reason else base
+        candidate = f"{with_reason} why={why}" if why else with_reason
+        if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
+            return candidate
+        candidate = f"{base} why={why}" if why else base
+        if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
+            return candidate
+        if len(base) <= MAX_ALERT_DETAIL_CHARS:
+            return base
+
     short = (
         f"day={climate_day} e={totals.decisions_emitted} r={totals.rung_resolved} "
         f"c={totals.cell_legal} p={totals.reached_price} m={totals.margin_positive} "
@@ -402,37 +437,58 @@ def _resolve_readable_path(path: Path) -> Path:
     return path
 
 
-def _capped_total_from_summary(tape_path: Path, climate_day: str) -> int:
-    """F-3 AC3: sum `offer_tape_capped` across the day's diagnostics-summary
-    sidecar (F-2's own artefact, `diagnostics_summary_<day>.jsonl[.gz]`,
-    Design line 588) -- read-only and best-effort, exactly like
-    :func:`read_family_halt_status`: F-2 has not landed on this branch yet
-    (Sequencing places F-3 first), so the summary file is commonly absent,
-    and any read/decode failure here must never fail the main offer-tape
-    funnel. Returns 0 when absent, unreadable, or every row's `offer_tape_
-    capped` is 0/absent -- never raises.
+@dataclass(frozen=True, slots=True)
+class _DiagnosticsSummaryTotals:
+    capped_total: int
+    pre_tape_by_station: dict[str, dict[str, int]]
+
+
+def _read_diagnostics_summary_totals(
+    tape_path: Path, climate_day: str
+) -> _DiagnosticsSummaryTotals:
+    """F-3 AC3 + F-2 AC6, ONE pass: sums `offer_tape_capped` AND, per
+    station, the day's `diagnostics` deltas -- across the SAME diagnostics-
+    summary sidecar (F-2's own artefact, `diagnostics_summary_<day>.jsonl
+    [.gz]`). Read-only and best-effort, exactly like
+    :func:`read_family_halt_status`: any read/decode failure here must
+    never fail the main offer-tape funnel, and reading the file only ONCE
+    (rather than once per field) means a corrupt sidecar logs exactly one
+    WARNING, not one per caller. Returns all-empty when the sidecar is
+    absent, unreadable, or carries no usable rows -- never raises.
     """
     candidate = tape_path.parent / f"diagnostics_summary_{climate_day}.jsonl"
     summary_path = _resolve_readable_path(candidate)
     if not summary_path.is_file():
-        return 0
-    total = 0
+        return _DiagnosticsSummaryTotals(capped_total=0, pre_tape_by_station={})
+    capped_total = 0
+    per_station: dict[str, Counter[str]] = {}
     try:
         for row in _iter_jsonl(summary_path):
             value = row.get("offer_tape_capped")
             if isinstance(value, int) and not isinstance(value, bool):
-                total += value
+                capped_total += value
+            station = row.get("station")
+            diagnostics = row.get("diagnostics")
+            if isinstance(station, str) and isinstance(diagnostics, dict):
+                bucket = per_station.setdefault(station, Counter())
+                for key, count in diagnostics.items():
+                    if isinstance(count, int) and not isinstance(count, bool):
+                        bucket[key] += count
     except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
         logger.warning(
             "decision_funnel_daily_digest: diagnostics-summary sidecar %s is "
-            "corrupt or unreadable (%s: %s); truncated stays unreported for %s",
+            "corrupt or unreadable (%s: %s); truncated/pre_tape_by_station stay "
+            "unreported for %s",
             summary_path,
             type(exc).__name__,
             exc,
             climate_day,
         )
-        return 0
-    return total
+        return _DiagnosticsSummaryTotals(capped_total=0, pre_tape_by_station={})
+    return _DiagnosticsSummaryTotals(
+        capped_total=capped_total,
+        pre_tape_by_station={station: dict(counter) for station, counter in per_station.items()},
+    )
 
 
 def _artefact(
@@ -468,6 +524,18 @@ def _artefact(
         artefact["halt_reason"] = halt.reason
     if capped_total > 0:
         artefact["truncated"] = 1
+    # F-2 AC6: stalled stations get their pre-tape counts in the artefact --
+    # never for a station that is NOT stalled, and never at all when the
+    # sidecar is absent (an empty `pre_tape_by_station` produces an empty
+    # dict here too, so the key is simply omitted, byte-identical to before
+    # this field existed).
+    stalled_pre_tape = {
+        station: counts
+        for station, counts in report.pre_tape_by_station.items()
+        if station in report.stalled_stations
+    }
+    if stalled_pre_tape:
+        artefact["pre_tape_by_station"] = stalled_pre_tape
     return artefact
 
 
@@ -564,7 +632,10 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         _emit(sink, detail=f"decision tape unreadable for {climate_day}")
         return 1
     halt = _resolve_halt_status(args, source_env)
-    capped_total = _capped_total_from_summary(tape, climate_day)
+    summary_totals = _read_diagnostics_summary_totals(tape, climate_day)
+    capped_total = summary_totals.capped_total
+    if summary_totals.pre_tape_by_station:
+        report = replace(report, pre_tape_by_station=summary_totals.pre_tape_by_station)
     _emit(
         sink,
         detail=format_digest_detail(
