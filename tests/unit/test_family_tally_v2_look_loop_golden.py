@@ -3,12 +3,15 @@
 `build_family_tally_v2`'s pooled sequential look loop, captured BEFORE
 `run_sequential_looks` is extracted.
 
-Six scenarios (plan §4 M1b bullet 1): I_max terminal on a mixed-side row,
-LOSS_STOP, forced truncation on-grid, the off-grid truncation tail
-(`family_tally_v2.py:784-819`), structural KILL
-(`family_tally_v2.py:706-708`), and a plain CONTINUE run. Comparison is on
-the returned dataclass OBJECTS (`LookRecord.state`, `.b_eff`, `.b_fut`,
-`.verdict`, `.terminal`, `.reason`), never on rendered report bytes.
+Seven scenarios (plan §4 M1b bullet 1, plus a coordinator follow-up):
+I_max terminal on a mixed-side row, LOSS_STOP, forced truncation on-grid,
+the off-grid truncation tail (`family_tally_v2.py:784-819`), structural
+KILL (`family_tally_v2.py:706-708`), a plain CONTINUE run, and n_max
+reached with information below i_max (the `range(look_step, min(n,
+n_max) + 1, look_step)` boundary, B7's "n_max reached, I < i_max" report
+case). Comparison is on the returned dataclass OBJECTS (`LookRecord.state`,
+`.b_eff`, `.b_fut`, `.verdict`, `.terminal`, `.reason`), never on rendered
+report bytes.
 
 Rows are passed directly to `build_family_tally_v2` as synthetic
 `ScoredTrial` tuples with no `store_dir` -- the same fixture shape every
@@ -23,7 +26,9 @@ After the extraction lands, this file is re-run unchanged (byte-identical
 assertions) as the regression net; mutation evidence (removing
 `reached_i_max` / removing the off-grid tail from
 `run_sequential_looks`) is recorded verbatim in the refactor commit
-message, not in this file.
+message, not in this file. The n_max-reached-below-i_max scenario's own
+mutation evidence (dropping the `+1` in `min(n, n_max) + 1`) is likewise
+recorded in that follow-up commit message, not here.
 """
 
 from __future__ import annotations
@@ -342,3 +347,39 @@ def test_plain_continue_below_look_step_produces_no_looks(
     assert tally.verdict == "CONTINUE"
     assert tally.bca_line is None
     assert tally.total_pnl == Decimal("2.062200")
+
+
+def test_n_max_reached_with_information_below_i_max(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """`scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)`:
+    with `n_max=10`, `look_step=10`, the only scheduled look is `look_n=10`
+    (`min(10, 10) + 1 == 11`, so `range(10, 11, 10) == [10]`). At that look
+    `reached_n_max=True` (`look_n >= n_max`) but `reached_i_max=False`
+    (a real, `i_max=40` pin the low-ask rows never approach) -- B7's "n_max
+    reached, I < i_max" case: `reason` stays `TruncationReason.I_MAX` (no
+    dedicated enum member, per the documented decision) but
+    `n_max_reached_below_i_max` is `True`."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=40.0, n_max=10, look_step=10)
+    rows = tuple(_row(i, ask="0.10", held=(i % 5 == 0)) for i in range(10))
+
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+
+    assert len(tally.looks) == 1
+    look = tally.looks[0]
+    assert look.look_n == 10
+    assert look.terminal is True
+    assert look.reason is tally_mod.TruncationReason.I_MAX
+    assert look.n_max_reached_below_i_max is True
+    assert look.state.n == 10
+    assert look.state.s == pytest.approx(0.9742185261591195, rel=1e-9)
+    assert look.state.information == pytest.approx(0.9429084, rel=1e-9)
+    assert look.state.information < artefact.i_max
+    assert look.b_eff == pytest.approx(1.9604170760650852, rel=1e-9)
+    assert look.b_fut == pytest.approx(-1.960417076065091, rel=1e-9)
+    # Interior score (b_fut < S < b_eff) at truncation is fail-closed to KILL.
+    assert look.verdict == "KILL"
+    assert tally.verdict == "KILL"
+    assert tally.total_pnl == Decimal("0.946000")
+    assert tally.bca_line is not None
