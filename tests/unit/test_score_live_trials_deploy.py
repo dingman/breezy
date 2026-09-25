@@ -606,13 +606,31 @@ def test_neither_i3_unit_carries_an_environment_file_directive() -> None:
     # Repo-wide: breezy-quote-tape.service legitimately carries an
     # EnvironmentFile= for venue credentials -- out of scope here. This
     # increment's invariant is narrower: neither of the units that carry
-    # the pinned sqlite Environment= line may carry an EnvironmentFile=.
+    # the pinned sqlite Environment= line may carry an EnvironmentFile= for
+    # a VENUE credential.
+    #
+    # 2026-09-25 units-alerts-env audit (tests/unit/test_alerts_env_deploy.py):
+    # breezy-family-tally@.service alerts in-process
+    # (emit_family_tally_failure_alert -> resolve_alert_sink/emit_alert,
+    # family_tally_v2.py:1002-1024) and now legitimately carries the
+    # allowlisted alerts.env EnvironmentFile= -- excluded from the "carries
+    # no EnvironmentFile= at all" invariant below, asserted instead against
+    # the audit's own allowlist. score-live-trials and live-tally do not
+    # alert in-process (same audit) and keep the stricter "none at all"
+    # invariant.
     for name in (
         "breezy-score-live-trials.service",
         "breezy-live-tally.service",
-        "breezy-family-tally@.service",
     ):
         assert "EnvironmentFile=" not in (_SYSTEMD_DIR / name).read_text(), name
+
+    family_tally_text = (_SYSTEMD_DIR / "breezy-family-tally@.service").read_text()
+    env_file_lines = [
+        line.strip()
+        for line in family_tally_text.splitlines()
+        if line.strip().startswith("EnvironmentFile=")
+    ]
+    assert env_file_lines == ["EnvironmentFile=-%h/.config/breezy/alerts.env"]
 
 
 def test_family_manifest_assignment_byte_identical_across_wrappers() -> None:

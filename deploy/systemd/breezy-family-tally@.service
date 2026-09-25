@@ -31,9 +31,21 @@ MemoryHigh=1G
 MemoryMax=2G
 UMask=0077
 
-# No env FILE directive here: this unit holds no venue credential -- it
-# reads a local parquet directory, a local sqlite exec-state DB, and writes
-# a local Markdown report.
+# This unit holds no venue credential -- it reads a local parquet directory,
+# a local sqlite exec-state DB, and writes a local Markdown report. It DOES
+# alert in-process on a same-day repeat failure
+# (emit_family_tally_failure_alert -> resolve_alert_sink/emit_alert,
+# scripts/analysis/family_tally_v2.py:1002-1024, wired from
+# family-tally-v2-run.sh:330), which is a run that otherwise still exits
+# non-zero -- OnFailure=breezy-study-failed@%n.service above also fires --
+# but without BREEZY_ALERT_WEBHOOK_URL the in-process alert itself silently
+# degrades to journal-only, log-hidden delivery (2026-09-25 units-alerts-env
+# audit; tests/unit/test_alerts_env_deploy.py). Same allowlist discipline as
+# breezy-portfolio-roi.service: the dedicated, single-key alerts.env file
+# (mode 0600, holding just BREEZY_ALERT_WEBHOOK_URL), never breezy-trade.env/
+# polymarket.env/operator.env. The `-` prefix keeps the unit startable if the
+# file is absent.
+EnvironmentFile=-%h/.config/breezy/alerts.env
 #
 # POLYMARKET_US_EXEC_STATE_DB lives HERE, in the shared TEMPLATE, not on a
 # per-instance override: the wrapper unconditionally requires it
