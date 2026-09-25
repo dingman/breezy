@@ -1,3 +1,16 @@
+# RETIRED 2026-09-24 per docs/evidence/RULING_R5_prereg_v1_tally_2026-09-24.md
+# (section 4, ENDORSED). Reason: n=0 for this unit's whole life; the family has
+# not been the node's sending family since pm_us_crh_cont's D0
+# (2026-09-12); the pooled 60/150 Wilson statistic this tally exists to
+# serve is superseded, for pm_us_crh_v2 itself, by PREREG v2 rev b; the
+# same structural-dead check is already, and more completely, duplicated
+# daily by breezy-family-tally@pm_us_crh_v2. Disabled (never deleted),
+# 2026-09-25T02:54:23Z: `systemctl --user disable --now
+# breezy-live-tally.timer`. This file, its sibling .service,
+# live-tally-run.sh, and live_family_tally.py all stay in the repo,
+# unedited in logic. Re-enable only via a NEW ruling, and only if
+# pm_us_crh_v2 is ever re-armed as a sending family.
+
 [Unit]
 Description=Daily trigger for the Breezy 6d live-family tally
 Documentation=file:///home/jon/breezy/deploy/systemd/README.md
