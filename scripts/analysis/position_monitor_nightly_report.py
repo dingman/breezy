@@ -130,25 +130,45 @@ _AMBIGUOUS_FAMILY_LABEL: Final[str] = "AMBIGUOUS_FAMILY"
 
 
 def resolve_trial_family(
-    trial_id: str, registered_manifests: Sequence[FamilyManifest]
+    trial_id: str, climate_day: str, registered_manifests: Sequence[FamilyManifest]
 ) -> str | None:
-    """`trial_id`'s owning REGISTERED family, resolved by `trial_id_prefix`.
+    """`trial_id`'s owning REGISTERED family, resolved by `trial_id_prefix`
+    and then narrowed by each candidate's declared
+    `d0_climate_day..terminal_climate_day` window (domain review item 4).
 
-    Returns the single matching `family_id` when exactly one registered
-    manifest's prefix matches, `_AMBIGUOUS_FAMILY_LABEL` when more than one
-    matches, or `None` when none match (the trial belongs to no family this
-    report was told about).
+    Two REGISTERED families can share a `trial_id_prefix` (e.g. a
+    superseding family reusing the predecessor's trial namespace) -- prefix
+    alone is not sufficient to bind a trial to a family. Among the
+    prefix-matching manifests, only those whose window contains
+    `climate_day` are considered (the window is
+    `[d0_climate_day, terminal_climate_day]` inclusive, open-ended above
+    when `terminal_climate_day` is `None`).
+
+    Returns the single matching `family_id` when exactly one prefix-matching
+    manifest's window also contains `climate_day`. Returns
+    `_AMBIGUOUS_FAMILY_LABEL` when more than one prefix-matching manifest's
+    window contains it, or when a trial matches a prefix but falls in ZERO
+    of the candidate windows (the prefix binding exists but which family
+    owns this specific day is not determinable from what this report was
+    told). Returns `None` only when no manifest's prefix matches at all --
+    the trial belongs to no family this report was told about.
     """
-    matches = {
-        manifest.family_id
+    prefix_matches = [
+        manifest
         for manifest in registered_manifests
         if trial_id.startswith(manifest.trial_id_prefix)
+    ]
+    if not prefix_matches:
+        return None
+    window_matches = {
+        manifest.family_id
+        for manifest in prefix_matches
+        if manifest.d0_climate_day <= climate_day
+        and (manifest.terminal_climate_day is None or climate_day <= manifest.terminal_climate_day)
     }
-    if len(matches) > 1:
-        return _AMBIGUOUS_FAMILY_LABEL
-    if len(matches) == 1:
-        return next(iter(matches))
-    return None
+    if len(window_matches) == 1:
+        return next(iter(window_matches))
+    return _AMBIGUOUS_FAMILY_LABEL
 
 
 def _open_readonly_state_db(path: Path) -> sqlite3.Connection | None:
@@ -867,7 +887,7 @@ def build_monitor_report(
     ambiguous_family_trial_ids = tuple(
         summary.trial_id
         for summary in summaries
-        if resolve_trial_family(summary.trial_id, registered_manifests)
+        if resolve_trial_family(summary.trial_id, summary.climate_day, registered_manifests)
         == _AMBIGUOUS_FAMILY_LABEL
     )
     settled_from_scored_trials = sum(

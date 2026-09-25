@@ -1051,16 +1051,25 @@ def _manifest(**overrides: object) -> FamilyManifest:
 
 class TestResolveTrialFamily:
     """AUD-07 C1(i): a trial matching more than one REGISTERED family's
-    `trial_id_prefix` is AMBIGUOUS_FAMILY, never silently picked."""
+    `trial_id_prefix` is AMBIGUOUS_FAMILY, never silently picked.
+
+    Domain review item 4: prefix-colliding manifests are further
+    partitioned by their declared `d0_climate_day..terminal_climate_day`
+    window against the trial's `climate_day` -- AMBIGUOUS only when the
+    trial falls in zero or in multiple windows, never merely because more
+    than one manifest happens to share a prefix."""
 
     def test_a_trial_matching_exactly_one_registered_prefix_resolves_to_it(
         self, report_mod: ModuleType
     ) -> None:
         manifests = (
-            _manifest(family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/"),
+            _manifest(
+                family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/",
+                d0_climate_day="2026-09-01", terminal_climate_day=None,
+            ),
         )
         result = report_mod.resolve_trial_family(
-            "current_rung_hold/trial/SFO/2026-09-01/x.POLYMARKET_US", manifests
+            "current_rung_hold/trial/SFO/2026-09-01/x.POLYMARKET_US", "2026-09-05", manifests
         )
         assert result == "pm_us_crh_v2"
 
@@ -1071,7 +1080,7 @@ class TestResolveTrialFamily:
             _manifest(family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/"),
         )
         result = report_mod.resolve_trial_family(
-            "paper_replay/current_rung_hold/trial/x", manifests
+            "paper_replay/current_rung_hold/trial/x", "2026-09-05", manifests
         )
         assert result is None
 
@@ -1079,13 +1088,65 @@ class TestResolveTrialFamily:
         self, report_mod: ModuleType
     ) -> None:
         """AUD-05 D-D: `pm_us_crh_v4` and `pm_us_crh_cont` both use
-        `"continuous_rung_hold/trial/"`."""
+        `"continuous_rung_hold/trial/"`. Both windows are open and overlap
+        the trial's climate_day, so it falls in BOTH -- ambiguous."""
         manifests = (
-            _manifest(family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/"),
-            _manifest(family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/"),
+            _manifest(
+                family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-09-01", terminal_climate_day=None,
+            ),
+            _manifest(
+                family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-09-01", terminal_climate_day=None,
+            ),
         )
         result = report_mod.resolve_trial_family(
-            "continuous_rung_hold/trial/SFO/2026-09-01/x.POLYMARKET_US", manifests
+            "continuous_rung_hold/trial/SFO/2026-09-15/x.POLYMARKET_US", "2026-09-15", manifests
+        )
+        assert result == "AMBIGUOUS_FAMILY"
+
+
+class TestResolveTrialFamilyByDateWindow:
+    """Domain review item 4: a cont-window day maps to cont; a v4-window day
+    maps to v4; a day in both or neither maps to AMBIGUOUS."""
+
+    @staticmethod
+    def _manifests() -> tuple[FamilyManifest, ...]:
+        # pm_us_crh_cont closed 2026-09-19 (real deployment history); the
+        # overlap day 2026-09-20 is deliberately shared with both windows to
+        # exercise the boundary case, not just a gap.
+        return (
+            _manifest(
+                family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-09-01", terminal_climate_day="2026-09-20",
+            ),
+            _manifest(
+                family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-09-20", terminal_climate_day=None,
+            ),
+        )
+
+    def test_a_cont_window_day_maps_to_cont(self, report_mod: ModuleType) -> None:
+        result = report_mod.resolve_trial_family(
+            "continuous_rung_hold/trial/SFO/2026-09-10/x", "2026-09-10", self._manifests()
+        )
+        assert result == "pm_us_crh_cont"
+
+    def test_a_v4_window_day_maps_to_v4(self, report_mod: ModuleType) -> None:
+        result = report_mod.resolve_trial_family(
+            "continuous_rung_hold/trial/SFO/2026-09-25/x", "2026-09-25", self._manifests()
+        )
+        assert result == "pm_us_crh_v4"
+
+    def test_a_day_in_both_windows_is_ambiguous(self, report_mod: ModuleType) -> None:
+        result = report_mod.resolve_trial_family(
+            "continuous_rung_hold/trial/SFO/2026-09-20/x", "2026-09-20", self._manifests()
+        )
+        assert result == "AMBIGUOUS_FAMILY"
+
+    def test_a_day_in_neither_window_is_ambiguous(self, report_mod: ModuleType) -> None:
+        result = report_mod.resolve_trial_family(
+            "continuous_rung_hold/trial/SFO/2026-08-01/x", "2026-08-01", self._manifests()
         )
         assert result == "AMBIGUOUS_FAMILY"
 
@@ -1094,10 +1155,22 @@ class TestAmbiguousFamilyReporting:
     def test_a_summary_matching_two_registered_families_is_reported_ambiguous(
         self, report_mod: ModuleType
     ) -> None:
-        summaries = (_summary(trial_id="continuous_rung_hold/trial/SFO/2026-09-01/x"),)
+        # 2026-09-01 falls in BOTH open windows -- a real overlap, not merely
+        # a zero-window default mismatch (domain review item 4).
+        summaries = (
+            _summary(
+                trial_id="continuous_rung_hold/trial/SFO/2026-09-01/x", climate_day="2026-09-01"
+            ),
+        )
         manifests = (
-            _manifest(family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/"),
-            _manifest(family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/"),
+            _manifest(
+                family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-08-01", terminal_climate_day=None,
+            ),
+            _manifest(
+                family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-08-01", terminal_climate_day=None,
+            ),
         )
         report = report_mod.build_monitor_report(summaries, (), registered_manifests=manifests)
         assert report.ambiguous_family_trial_ids == (
@@ -1109,12 +1182,22 @@ class TestAmbiguousFamilyReporting:
     def test_two_registered_families_are_each_reported_separately(
         self, report_mod: ModuleType
     ) -> None:
-        """A trial owned by exactly one of two REGISTERED families is never
-        marked ambiguous."""
-        summaries = (_summary(trial_id="current_rung_hold/trial/SFO/2026-09-01/x"),)
+        """A trial owned by exactly one of two REGISTERED families' windows
+        is never marked ambiguous."""
+        summaries = (
+            _summary(
+                trial_id="current_rung_hold/trial/SFO/2026-09-01/x", climate_day="2026-09-01"
+            ),
+        )
         manifests = (
-            _manifest(family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/"),
-            _manifest(family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/"),
+            _manifest(
+                family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/",
+                d0_climate_day="2026-08-01", terminal_climate_day=None,
+            ),
+            _manifest(
+                family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/",
+                d0_climate_day="2026-08-01", terminal_climate_day=None,
+            ),
         )
         report = report_mod.build_monitor_report(summaries, (), registered_manifests=manifests)
         assert report.ambiguous_family_trial_ids == ()
