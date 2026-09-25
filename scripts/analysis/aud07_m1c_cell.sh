@@ -106,9 +106,18 @@ _default_est_wall_s() {
 }
 
 _median_wall_s() {
+  # 2026-09-25 re-verification fix: malformed completed rows (non-int
+  # `cell_index`, non-finite/non-positive `wall_s`) are SKIPPED with a
+  # counted stderr WARN, never a crash -- an empty/all-skipped result
+  # falls back to the class default (the caller's `[ -z "$est_wall" ]`
+  # check). Any OTHER unexpected error (e.g. a stage-dir row file this
+  # process cannot read) is caught, reported to stderr, and exits non-zero
+  # -- never a bare traceback -- so the caller routes it through the same
+  # FAILED path as a cell-command failure.
   local stage_dir="$1" class="$2"
   "${BREEZY_PYTHON:-python3}" - "$stage_dir" "$class" <<'PYEOF'
 import json
+import math
 import pathlib
 import sys
 
@@ -119,31 +128,78 @@ def cell_class(idx: int) -> str:
     return "mixed" if 0 <= idx <= 15 else "other"
 
 
-values = []
-for path in pathlib.Path(stage_dir).glob("*.jsonl"):
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if "wall_s" not in row or "cell_index" not in row:
-            continue
-        if cell_class(row["cell_index"]) == want_class:
-            values.append(row["wall_s"])
+def _type_valid(row: dict) -> bool:
+    """Type/value validation ONLY (never class membership): `cell_index`
+    must be a (non-bool) int, `wall_s` a (non-bool) finite number > 0. A
+    row failing this is MALFORMED and counted in the skip total. A
+    well-formed row that simply belongs to a different class is NOT
+    malformed -- it is filtered separately, below, uncounted."""
+    cell_index = row.get("cell_index")
+    if not isinstance(cell_index, int) or isinstance(cell_index, bool):
+        return False
+    wall_s = row.get("wall_s")
+    if not isinstance(wall_s, (int, float)) or isinstance(wall_s, bool):
+        return False
+    return math.isfinite(float(wall_s)) and float(wall_s) > 0
 
-if values:
-    values.sort()
-    n = len(values)
-    median = values[n // 2] if n % 2 == 1 else (values[n // 2 - 1] + values[n // 2]) / 2
-    print(median)
+
+def main() -> int:
+    values: list[float] = []
+    skipped = 0
+    for path in pathlib.Path(stage_dir).glob("*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if not isinstance(row, dict) or "cell_index" not in row or "wall_s" not in row:
+                # Not a completed-row candidate at all (e.g. a row from an
+                # unrelated stage/format) -- silently ignored, never
+                # counted as malformed.
+                continue
+            if not _type_valid(row):
+                skipped += 1
+                continue
+            if cell_class(row["cell_index"]) != want_class:
+                continue  # well-formed, just a different class -- not malformed.
+            values.append(float(row["wall_s"]))
+
+    if skipped:
+        print(
+            f"[aud07-m1c-cell] WARN: skipped {skipped} malformed completed "
+            f"row(s) in {stage_dir}",
+            file=sys.stderr,
+        )
+
+    if values:
+        values.sort()
+        n = len(values)
+        median = values[n // 2] if n % 2 == 1 else (values[n // 2 - 1] + values[n // 2]) / 2
+        print(median)
+    return 0
+
+
+try:
+    sys.exit(main())
+except Exception as exc:  # never a bare traceback: caller routes this to FAILED.
+    print(f"[aud07-m1c-cell] est_wall estimator error: {exc!r}", file=sys.stderr)
+    sys.exit(3)
 PYEOF
 }
 
 class="$(_cell_class "$cell_index")"
+set +e
 est_wall="$(_median_wall_s "$stage_dir" "$class")"
+median_rc=$?
+set -e
+if [ "$median_rc" -ne 0 ]; then
+  printf '%s rc=%s %s (est_wall estimator error)\n' "$cell_arg" "$median_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$failed_file"
+  exit 255
+fi
 if [ -z "$est_wall" ]; then
   est_wall="$(_default_est_wall_s "$stage" "$class")"
 fi

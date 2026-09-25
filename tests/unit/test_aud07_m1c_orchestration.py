@@ -574,3 +574,93 @@ def test_sweep_sh_exports_thread_env_vars_itself(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert env_report.read_text(encoding="utf-8").strip() == "OPENBLAS=1 OMP=1 MKL=1"
+
+
+def test_malformed_completed_row_degrades_to_the_default_and_the_cell_still_runs(
+    tmp_path: Path,
+) -> None:
+    """Re-verification fix: a malformed completed row (non-int
+    `cell_index`, non-numeric/non-positive `wall_s`) must be SKIPPED with a
+    counted stderr WARN, never crash the estimator -- the cell then falls
+    back to the class default and still runs (or defers) correctly."""
+    run_dir = tmp_path / "runs"
+    stage_dir = run_dir / "20k"
+    stage_dir.mkdir(parents=True)
+    calls_file = tmp_path / "calls.txt"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(
+        f'#!/usr/bin/env bash\necho "ran $1" >> "{calls_file}"\nexit 0\n', encoding="utf-8"
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    # Malformed rows: non-int cell_index, non-numeric wall_s, negative
+    # wall_s, non-finite wall_s -- all in the "mixed" class (0-15).
+    malformed_rows = [
+        {"cell_index": "0", "wall_s": 5.0},
+        {"cell_index": 1, "wall_s": "not-a-number"},
+        {"cell_index": 2, "wall_s": -5.0},
+        {"cell_index": 3, "wall_s": float("nan")},
+    ]
+    (stage_dir / "cell_00.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in malformed_rows) + "\n", encoding="utf-8"
+    )
+
+    env = {
+        **os.environ,
+        "RUN_DIR": str(run_dir),
+        "STAGE": "20k",
+        # Far enough to fit the class default (4928s for "mixed") but the
+        # malformed rows above must never be allowed to produce a bogus
+        # median that would change this outcome.
+        "CUTOFF": (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "AUD07_CELL_CMD": str(stub),
+    }
+    result = subprocess.run(
+        ["bash", str(_CELL_SH), "4"], env=env, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ran 4" in calls_file.read_text(encoding="utf-8")
+    assert "WARN" in result.stderr
+    assert "4" in result.stderr  # 4 malformed rows skipped
+
+
+def test_estimator_crash_lands_in_failed_not_a_bare_traceback(tmp_path: Path) -> None:
+    """Re-verification fix: an unexpected error in the estimator (never a
+    type-validation skip) must append to FAILED and exit 255, never a bare
+    traceback."""
+    run_dir = tmp_path / "runs"
+    stage_dir = run_dir / "20k"
+    stage_dir.mkdir(parents=True)
+    calls_file = tmp_path / "calls.txt"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(
+        f'#!/usr/bin/env bash\necho "ran $1" >> "{calls_file}"\nexit 0\n', encoding="utf-8"
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    # An unreadable row file: a genuine unexpected error (PermissionError),
+    # never a type-validation case.
+    unreadable = stage_dir / "cell_00.jsonl"
+    unreadable.write_text(json.dumps({"cell_index": 0, "wall_s": 5.0}) + "\n", encoding="utf-8")
+    unreadable.chmod(0o000)
+    try:
+        env = {
+            **os.environ,
+            "RUN_DIR": str(run_dir),
+            "STAGE": "20k",
+            "CUTOFF": (datetime.now(UTC) + timedelta(days=1)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "AUD07_CELL_CMD": str(stub),
+        }
+        result = subprocess.run(
+            ["bash", str(_CELL_SH), "1"], env=env, capture_output=True, text=True, check=False
+        )
+    finally:
+        unreadable.chmod(0o644)
+
+    assert result.returncode == 255, (result.returncode, result.stderr)
+    assert not calls_file.exists()
+    failed_text = (stage_dir / "FAILED").read_text(encoding="utf-8")
+    assert "1" in failed_text
+    assert "Traceback" not in result.stderr
