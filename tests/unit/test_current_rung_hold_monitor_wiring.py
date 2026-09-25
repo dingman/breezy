@@ -24,9 +24,12 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId, Venue
 
-from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
+from breezy.adapters.polymarket_us.symbology import (
+    no_leg_instrument_id,
+    sibling_instrument_id,
+)
 from breezy.strategy.current_rung_hold.monitor_wiring import (
     MonitorCallables,
     build_monitor_callables,
@@ -192,6 +195,78 @@ def test_station_and_climate_day_for_read_the_strategys_own_facts() -> None:
 
     assert callables.station_for(_IID) == STATION
     assert callables.climate_day_for(_IID) == CLIMATE_DAY.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# FU-1: a `^no` id falls back to its YES sibling's facts
+# ---------------------------------------------------------------------------
+
+
+def test_station_and_climate_day_for_fall_back_to_the_yes_sibling_for_a_no_leg_id() -> None:
+    facts = {_IID: _FakeFacts(settlement_station=STATION, climate_day=CLIMATE_DAY)}
+    callables = build_monitor_callables(_strategy(_facts=facts))  # type: ignore[arg-type]
+
+    assert callables.station_for(_NO_IID) == STATION
+    assert callables.climate_day_for(_NO_IID) == CLIMATE_DAY.isoformat()
+
+
+def test_rung_geometry_falls_back_to_the_yes_sibling_for_a_no_leg_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts = {_IID: _FakeFacts(settlement_station=STATION, climate_day=CLIMATE_DAY)}
+    callables = build_monitor_callables(_strategy(_facts=facts))  # type: ignore[arg-type]
+
+    assert callables.rung_geometry(_NO_IID) is facts[_IID]
+
+    def _raise(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(
+            "sibling_instrument_id must never be called for a YES-id miss"
+        )
+
+    # A YES-id miss (e.g. an unregistered instrument) must never even
+    # attempt the sibling probe -- reviewer finding: prove it by making the
+    # probe itself raise.
+    monkeypatch.setattr(
+        "breezy.strategy.current_rung_hold.monitor_wiring.sibling_instrument_id", _raise,
+    )
+    assert callables.rung_geometry("unregistered-id") is None
+
+
+def test_station_and_climate_day_for_raise_keyerror_when_neither_leg_is_in_facts() -> None:
+    callables = build_monitor_callables(_strategy(_facts={}))  # type: ignore[arg-type]
+
+    assert callables.rung_geometry(_NO_IID) is None
+    with pytest.raises(KeyError):
+        callables.station_for(_NO_IID)
+    with pytest.raises(KeyError):
+        callables.climate_day_for(_NO_IID)
+
+
+def test_rung_geometry_for_a_no_leg_id_never_mutates_the_facts_mapping() -> None:
+    facts = {_IID: _FakeFacts(settlement_station=STATION, climate_day=CLIMATE_DAY)}
+    callables = build_monitor_callables(_strategy(_facts=facts))  # type: ignore[arg-type]
+
+    callables.rung_geometry(_NO_IID)
+
+    assert facts == {_IID: _FakeFacts(settlement_station=STATION, climate_day=CLIMATE_DAY)}
+    assert list(facts) == [_IID]
+
+
+def test_a_foreign_venue_or_malformed_no_leg_id_resolves_to_none() -> None:
+    facts = {_IID: _FakeFacts(settlement_station=STATION, climate_day=CLIMATE_DAY)}
+    callables = build_monitor_callables(_strategy(_facts=facts))  # type: ignore[arg-type]
+
+    # Malformed (unparseable by `InstrumentId.from_str`): `ValueError` -> `None`.
+    assert callables.rung_geometry("not-a-valid-instrument-id") is None
+    with pytest.raises(KeyError):
+        callables.station_for("not-a-valid-instrument-id")
+
+    # A NO-leg id for a foreign venue: `sibling_instrument_id`'s own venue
+    # check raises `VenuePayloadError` -> `None`, never a guessed slug.
+    foreign_no_id = str(no_leg_instrument_id("lax-86-87", venue=Venue("KALSHI")))
+    assert callables.rung_geometry(foreign_no_id) is None
+    with pytest.raises(KeyError):
+        callables.station_for(foreign_no_id)
 
 
 def test_hour_lst_for_matches_the_shared_local_hour_derivation() -> None:

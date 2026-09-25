@@ -24,18 +24,46 @@ Call sites still own ``buffer``, ``catalog_root``, ``summaries_dir``,
 node's bare ``MarkBuffer()`` vs a replay run's JSONL sidecar; the live alert
 sink vs a test's no-op reporter) and are deliberately NOT part of this
 factory.
+
+FU-1 (``docs/plans`` backlog item "Position monitor KeyError on `^no` ids"):
+``strategy._facts`` (``continuous_strategy.py:842``) is populated YES-only --
+depth is subscribed only for YES instrument ids, so a NO-leg composite id is
+NEVER a key in that mapping. Before this fix, ``_rung_geometry``/
+``_station_for``/``_climate_day_for`` read ``strategy._facts`` directly and a
+NO-leg fill's ``PositionMonitor._register`` (``position_monitor.py``) raised
+``KeyError`` on every one of them, caught only by ``_guarded`` (D8) as a
+``monitor_error`` -- the NO position was never actually monitored. Below,
+:func:`_facts_for_either_leg` resolves a NO-leg id to its YES sibling's
+already-registered facts (the two legs of one market share ONE rung/station/
+climate-day geometry) with NO change to a YES id's own resolution -- a
+YES-id miss still resolves to ``None`` exactly as before, and the sibling
+probe never runs for one (a YES id can never satisfy ``leg_of(iid) ==
+"no"``, so it is never even attempted).
+
+Live behaviour table (this fix, both legs' facts source only -- everything
+downstream, e.g. ``leg_for``/``monitor_decision``/``monitor_evidence``'s
+DEAD/LOCKED swap and mark-price complement, is unchanged, already leg-aware,
+and out of this module's scope):
+
+============  =========================================  ==================
+Leg           facts source                                Miss (neither leg)
+============  =========================================  ==================
+YES           ``strategy._facts[iid]`` directly            ``None``/``KeyError``
+NO            YES sibling's ``strategy._facts[sibling]``   ``None``/``KeyError``
+============  =========================================  ==================
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from nautilus_trader.model.identifiers import InstrumentId
 
-from breezy.adapters.polymarket_us.symbology import leg_of
+from breezy.adapters.polymarket_us.errors import VenuePayloadError
+from breezy.adapters.polymarket_us.symbology import leg_of, sibling_instrument_id
 from breezy.strategy.current_rung_hold.monitor_evidence import Leg
 from breezy.strategy.current_rung_hold.strategy import _local_hour
 
@@ -49,6 +77,38 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
 
 __all__ = ["MonitorCallables", "build_monitor_callables"]
+
+
+def _facts_for_either_leg(
+    facts: Mapping[str, WeatherBucketFacts], iid: str,
+) -> WeatherBucketFacts | None:
+    """FU-1: resolve ``iid``'s rung geometry, falling back to its YES
+    sibling's facts when ``iid`` is a NO-leg id absent from ``facts``.
+
+    A direct hit always wins -- the sibling probe runs ONLY on a genuine
+    miss, and only when ``iid`` actually parses as a NO-leg id; a YES-id
+    miss (e.g. an unregistered instrument) never reaches
+    :func:`sibling_instrument_id` and resolves to ``None``, byte-identical
+    to the pre-fix behaviour. Never mutates ``facts`` (M7 D3). An
+    unparseable ``iid`` (:class:`ValueError` from
+    :meth:`InstrumentId.from_str`) or a foreign-venue NO-leg id
+    (:class:`VenuePayloadError` from :func:`sibling_instrument_id`) also
+    resolves to ``None`` -- never a raised error, never a guessed slug.
+    """
+    direct = facts.get(iid)
+    if direct is not None:
+        return direct
+    try:
+        instrument_id = InstrumentId.from_str(iid)
+    except ValueError:
+        return None
+    if leg_of(instrument_id) != "no":
+        return None
+    try:
+        sibling_id = sibling_instrument_id(instrument_id)
+    except VenuePayloadError:
+        return None
+    return facts.get(str(sibling_id))
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +157,7 @@ def build_monitor_callables(strategy: ContinuousRungHoldStrategy) -> MonitorCall
         )
 
     def _rung_geometry(iid: str) -> WeatherBucketFacts | None:
-        return strategy._facts.get(iid)
+        return _facts_for_either_leg(strategy._facts, iid)
 
     def _fee_coefficient_for(iid: str) -> Decimal:
         instrument = strategy.cache.instrument(InstrumentId.from_str(iid))
@@ -110,10 +170,16 @@ def build_monitor_callables(strategy: ContinuousRungHoldStrategy) -> MonitorCall
         return "NO" if leg_of(InstrumentId.from_str(iid)) == "no" else "YES"
 
     def _station_for(iid: str) -> str:
-        return strategy._facts[iid].settlement_station
+        facts = _facts_for_either_leg(strategy._facts, iid)
+        if facts is None:
+            raise KeyError(iid)
+        return facts.settlement_station
 
     def _climate_day_for(iid: str) -> str:
-        return strategy._facts[iid].climate_day.isoformat()
+        facts = _facts_for_either_leg(strategy._facts, iid)
+        if facts is None:
+            raise KeyError(iid)
+        return facts.climate_day.isoformat()
 
     def _hour_lst_for(station: str, now_ns: int) -> int:
         offset = strategy._std_utc_offset_hours_by_station[station]

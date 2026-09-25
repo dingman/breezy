@@ -14,7 +14,8 @@ integration tests wiring a real ``PositionMonitor`` onto a real
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,6 +27,7 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
+from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
 from breezy.strategy.current_rung_hold.monitor_decision import (
     MonitorHistory,
     ThesisState,
@@ -37,6 +39,7 @@ from breezy.strategy.current_rung_hold.monitor_store import (
     MarkBuffer,
     read_monitor_summaries,
 )
+from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
@@ -453,53 +456,24 @@ def _wire_monitor(
     submit_exit: Callable[..., None] | None = None,
     record_exit_offer: Callable[..., None] | None = None,
 ) -> PositionMonitor:
-    from breezy.adapters.polymarket_us.symbology import leg_of
-    from breezy.strategy.current_rung_hold.strategy import _local_hour
-
-    def _positions_open(iid: str):
-        return strategy.cache.positions_open(instrument_id=InstrumentId.from_str(iid))
-
-    def _latch_record(station: str, climate_day: str, *, key_instrument_id: str | None = None):
-        if strategy._latch is None:
-            return None
-        return strategy._latch.record_with_legacy_fallback(
-            station, climate_day, key_instrument_id=key_instrument_id,
-        )
-
-    def _rung_geometry(iid: str):
-        return strategy._facts.get(iid)
-
-    def _fee_coefficient_for(iid: str) -> Decimal:
-        instrument = strategy.cache.instrument(InstrumentId.from_str(iid))
-        fee = strategy._guarded_fee_coefficient(instrument)
-        if fee is None:
-            raise ValueError(f"unknown fee schedule for {iid}")
-        return fee
-
-    def _leg_for(iid: str) -> str:
-        return "NO" if leg_of(InstrumentId.from_str(iid)) == "no" else "YES"
-
-    def _station_for(iid: str) -> str:
-        return strategy._facts[iid].settlement_station
-
-    def _climate_day_for(iid: str) -> str:
-        return strategy._facts[iid].climate_day.isoformat()
-
-    def _hour_lst_for(station: str, now_ns: int) -> int:
-        offset = strategy._std_utc_offset_hours_by_station[station]
-        return _local_hour(now_ns, offset)
+    """Test-only DRY (file-by-file item 2, F1): builds the eight closures
+    from the PRODUCTION `build_monitor_callables` factory instead of hand-
+    copying them a fourth time -- byte-identical behaviour to the three
+    call sites it already unifies (`monitor_wiring.py`'s own docstring), so
+    every existing assertion below is unchanged."""
+    callables = build_monitor_callables(strategy)
 
     return PositionMonitor(
         clock_ns=strategy.clock.timestamp_ns,
-        positions_open=_positions_open,  # type: ignore[arg-type]
+        positions_open=callables.positions_open,
         accumulators=strategy._accumulators,
-        latch_record=_latch_record,  # type: ignore[arg-type]
-        rung_geometry=_rung_geometry,  # type: ignore[arg-type]
-        fee_coefficient_for=_fee_coefficient_for,
-        leg_for=_leg_for,  # type: ignore[arg-type]
-        station_for=_station_for,
-        climate_day_for=_climate_day_for,
-        hour_lst_for=_hour_lst_for,
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
         stale_observation_bound_ns=strategy._config.stale_observation_minutes * _MINUTE_NS,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
         buffer=MarkBuffer(),
@@ -832,4 +806,440 @@ def test_an_armed_family_fires_and_calls_submit_exit_with_a_proposal(
     assert "submit_exit" in call_order
     assert call_order.index("record_exit_offer") < call_order.index("submit_exit"), (
         "the decision must be persisted BEFORE submit_exit is called (hard invariant)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FU-1: `PositionMonitor` resolves a `^no` position's facts via the YES
+# sibling (`monitor_wiring.build_monitor_callables`'s FU-1 fix), driven
+# through the REAL `build_monitor_callables` factory over a duck-typed,
+# YES-only fake strategy -- never the isolated `_build_monitor` stub harness
+# above, so these tests actually exercise the production wiring seam the fix
+# lives in, not a bespoke test double that would paper over the bug.
+# ---------------------------------------------------------------------------
+
+_NO_IID = str(sibling_instrument_id(INTERIOR_ID))
+
+
+@dataclass
+class _NoLegFakeFacts:
+    settlement_station: str
+    climate_day: date
+    lower_f: int | None
+    upper_f: int | None
+
+
+class _FakeCacheForCallables:
+    """Exposes only `positions_open`/`instrument`, mirroring
+    `test_current_rung_hold_monitor_wiring.py`'s `_StrictCache` shape."""
+
+    def __init__(
+        self, *, positions_by_iid: dict[str, list[_FakePosition]], instrument: object = None,
+    ) -> None:
+        self._positions_by_iid = positions_by_iid
+        self._instrument = instrument
+
+    def positions_open(self, *, instrument_id: object) -> Sequence[_FakePosition]:
+        return self._positions_by_iid.get(str(instrument_id), [])
+
+    def instrument(self, instrument_id: object) -> object:
+        return self._instrument
+
+
+@dataclass
+class _FakeLatchForCallables:
+    record: object | None = None
+
+    def record_with_legacy_fallback(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> object | None:
+        return self.record
+
+
+@dataclass
+class _FakeStrategyForCallables:
+    """Minimal duck-typed stand-in for `ContinuousRungHoldStrategy` --
+    `_facts` is YES-only, exactly as `continuous_strategy.py:842` leaves it
+    in production (depth is subscribed only for YES instrument ids)."""
+
+    cache: object
+    _latch: object
+    _facts: dict[str, _NoLegFakeFacts] = field(default_factory=dict)
+    _std_utc_offset_hours_by_station: dict[str, float] = field(default_factory=dict)
+    _fee: Decimal | None = Decimal("0.06")
+
+    def _guarded_fee_coefficient(self, instrument: object) -> Decimal | None:
+        return self._fee
+
+
+def _build_position_monitor_via_callables(
+    strategy: _FakeStrategyForCallables,
+    *,
+    tmp_path: Path,
+    accumulators: Mapping[str, object],
+    report: Callable[[str, Mapping[str, object]], None] | None = None,
+    exit_decider: Callable[..., object] | None = None,
+    exit_manifest: object | None = None,
+    exit_family_id: str | None = None,
+    exit_client_order_id_factory: Callable[[], str] | None = None,
+    submit_exit: Callable[..., None] | None = None,
+    record_exit_offer: Callable[..., None] | None = None,
+) -> PositionMonitor:
+    """The production `build_monitor_callables` factory, wired into a real
+    `PositionMonitor` -- the FU-1-relevant twin of `_wire_monitor` above,
+    over a duck-typed fake rather than a real `ContinuousRungHoldStrategy`."""
+    callables = build_monitor_callables(strategy)  # type: ignore[arg-type]
+    return PositionMonitor(
+        clock_ns=lambda: WINDOW_OPEN_NS,
+        positions_open=callables.positions_open,
+        accumulators=accumulators,  # type: ignore[arg-type]
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
+        stale_observation_bound_ns=_STALE_BOUND_NS,
+        trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        buffer=MarkBuffer(),
+        catalog_root=tmp_path / "monitor",
+        summaries_dir=tmp_path / "monitor" / "summaries",
+        report=report if report is not None else (lambda event, detail: None),
+        exit_decider=exit_decider,  # type: ignore[arg-type]
+        exit_manifest=exit_manifest,  # type: ignore[arg-type]
+        exit_family_id=exit_family_id,
+        exit_client_order_id_factory=exit_client_order_id_factory,
+        submit_exit=submit_exit,
+        record_exit_offer=record_exit_offer,
+    )
+
+
+def _no_leg_facts(*, station: str = STATION, climate_day: date = CLIMATE_DAY) -> dict:
+    return {_IID: _NoLegFakeFacts(
+        settlement_station=station, climate_day=climate_day, lower_f=86, upper_f=87,
+    )}
+
+
+def test_no_leg_position_opened_registers_with_sibling_station_day_and_no_monitor_error(
+    tmp_path: Path,
+) -> None:
+    strategy = _FakeStrategyForCallables(
+        cache=_FakeCacheForCallables(
+            positions_by_iid={
+                _NO_IID: [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)],
+            },
+        ),
+        _latch=_FakeLatchForCallables(record=None),
+        _facts=_no_leg_facts(),
+        _std_utc_offset_hours_by_station={STATION: -8.0},
+    )
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor = _build_position_monitor_via_callables(
+        strategy, tmp_path=tmp_path, accumulators={STATION: accumulator},
+    )
+
+    fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
+    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert _NO_IID in monitor._positions
+    registered = monitor._positions[_NO_IID]
+    assert registered.leg == "NO"
+    assert registered.station == STATION
+    assert registered.climate_day == CLIMATE_DAY.isoformat()
+
+
+def test_no_leg_position_is_evaluated_on_observation_with_mark_source_missing(
+    tmp_path: Path,
+) -> None:
+    strategy = _FakeStrategyForCallables(
+        cache=_FakeCacheForCallables(
+            positions_by_iid={
+                _NO_IID: [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)],
+            },
+        ),
+        _latch=_FakeLatchForCallables(record=None),
+        _facts=_no_leg_facts(),
+        _std_utc_offset_hours_by_station={STATION: -8.0},
+    )
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor = _build_position_monitor_via_callables(
+        strategy, tmp_path=tmp_path, accumulators={STATION: accumulator},
+    )
+    fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
+    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    monitor.on_observation(STATION, WINDOW_OPEN_NS + _MINUTE_NS)
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert monitor.counters["evaluations"] == 1
+
+    monitor.on_stop(WINDOW_OPEN_NS + 2 * _MINUTE_NS)
+    summaries = read_monitor_summaries(tmp_path / "monitor" / "summaries")
+    assert len(summaries) == 1
+    assert summaries[0].mark_missing_frames == 1
+
+
+def test_no_leg_recovered_p_hold_at_entry_is_one_minus_p_hold_upper(tmp_path: Path) -> None:
+    from breezy.strategy.current_rung_hold.archive_table import P_HOLD_UPPER
+
+    #: A real, populated cell (`tests/unit/test_current_rung_hold_monitor_evidence.py`'s
+    #: own `_KEY`) -- never a fabricated golden value.
+    station = "SFO"
+    season_climate_day = date(2026, 1, 15)  # January -> DJF
+    hour_lst = 14
+    key = (station, "DJF", hour_lst, 0, 0)
+    expected_p_hold = Decimal(1) - P_HOLD_UPPER[key]
+
+    yes_iid_obj = InstrumentId.from_str("sfo-86-87.POLYMARKET_US")
+    yes_iid = str(yes_iid_obj)
+    no_iid = str(sibling_instrument_id(yes_iid_obj))
+
+    hour_ns = 3_600_000_000_000
+    latched_at_ns = WINDOW_OPEN_NS + 2 * hour_ns  # 12:00 LST + 2h == 14:00 LST
+
+    @dataclass
+    class _FakeTrialDayRecord:
+        latched_at_ns: int
+
+    strategy = _FakeStrategyForCallables(
+        cache=_FakeCacheForCallables(
+            positions_by_iid={
+                no_iid: [_FakePosition(instrument_id=no_iid, avg_px_open=0.40, quantity=1)],
+            },
+        ),
+        _latch=_FakeLatchForCallables(record=_FakeTrialDayRecord(latched_at_ns=latched_at_ns)),
+        _facts={yes_iid: _NoLegFakeFacts(
+            settlement_station=station, climate_day=season_climate_day, lower_f=86, upper_f=87,
+        )},
+        _std_utc_offset_hours_by_station={station: -8.0},
+    )
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=86, upper_f=87, source_observed_at_ns=latched_at_ns),
+    )
+    monitor = _build_position_monitor_via_callables(
+        strategy, tmp_path=tmp_path, accumulators={station: accumulator},
+    )
+
+    fake_position = _FakePosition(instrument_id=no_iid, avg_px_open=0.40, quantity=1)
+    monitor.on_position_opened(fake_position, latched_at_ns)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert monitor._positions[no_iid].p_hold_at_entry == expected_p_hold
+
+
+# ---------------------------------------------------------------------------
+# FU-1: the NO leg's DEAD/LOCKED swap at the pure `evaluate_monitor` layer
+# (`monitor_decision._evaluate_no`) -- neither test needs a `PositionMonitor`
+# at all; both drive the SAME "inside the rung, past the peak hour" geometry
+# through the real classifier, mirroring
+# `test_two_distinct_observed_at_ns_spanning_the_bound_confirm_dead` above.
+# ---------------------------------------------------------------------------
+
+
+def _locked_geometry_evidence(
+    *, leg: str, ts_ns: int, observed_at_ns: int | None,
+) -> MonitorEvidence:
+    return MonitorEvidence(
+        ts_ns=ts_ns,
+        instrument_id=_IID if leg == "YES" else _NO_IID,
+        station=STATION,
+        climate_day=CLIMATE_DAY.isoformat(),
+        leg=leg,  # type: ignore[arg-type]
+        cell_key=(STATION, "SON", 18, 0, 0),
+        p_hold_at_entry=Decimal("0.70") if leg == "YES" else None,
+        p_hold_at_t=Decimal("0.70") if leg == "YES" else None,
+        fill_px=Decimal("0.40"),
+        held_qty=1,
+        mark_vwap=None,
+        mark_source="missing",
+        spread=None,
+        depth_sufficient=False,
+        staleness_ns=0,
+        book_staleness_ns=0,
+        running_max_lower=86,
+        running_max_upper=87,
+        rung_low=86,
+        rung_high=87,
+        exit_fee_at_mark=None,
+        unrealized_pnl=None,
+        recoverable_value=None,
+        hour_lst=18,  # >= monitor_decision._LOCKED_HOUR_LST
+        entry_context="live",
+        observed_at_ns=observed_at_ns,
+    )
+
+
+def test_no_leg_inside_rung_after_peak_reaches_dead_by_observation() -> None:
+    history = MonitorHistory.EMPTY
+    first = _locked_geometry_evidence(leg="NO", ts_ns=0, observed_at_ns=0)
+    decision, history = evaluate_monitor(
+        first, history, stale_observation_bound_ns=_STALE_BOUND_NS,
+    )
+    assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+
+    second = _locked_geometry_evidence(
+        leg="NO", ts_ns=6 * _MINUTE_NS, observed_at_ns=6 * _MINUTE_NS,
+    )
+    decision, history = evaluate_monitor(
+        second, history, stale_observation_bound_ns=_STALE_BOUND_NS,
+    )
+    assert decision.state is ThesisState.DEAD_BY_OBSERVATION
+    assert decision.reason_codes == ("no_leg_inside_rung_after_peak",)
+
+
+def test_the_same_evidence_on_the_yes_leg_is_locked_never_dead() -> None:
+    from breezy.strategy.current_rung_hold.monitor_decision import (
+        _DEAD_MIN_CONFIRM_SPAN_NS,
+        _LOCKED_HOUR_LST,
+    )
+
+    assert 18 >= _LOCKED_HOUR_LST
+    assert 6 * _MINUTE_NS >= _DEAD_MIN_CONFIRM_SPAN_NS
+
+    history = MonitorHistory.EMPTY
+    first = _locked_geometry_evidence(leg="YES", ts_ns=0, observed_at_ns=0)
+    decision, history = evaluate_monitor(
+        first, history, stale_observation_bound_ns=_STALE_BOUND_NS,
+    )
+    assert decision.state is not ThesisState.LOCKED_BY_OBSERVATION
+
+    second = _locked_geometry_evidence(
+        leg="YES", ts_ns=6 * _MINUTE_NS, observed_at_ns=6 * _MINUTE_NS,
+    )
+    decision, history = evaluate_monitor(
+        second, history, stale_observation_bound_ns=_STALE_BOUND_NS,
+    )
+    assert decision.state is ThesisState.LOCKED_BY_OBSERVATION
+    assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+
+
+# ---------------------------------------------------------------------------
+# FU-1: a DEAD/THREATENED NO leg reaches the (shadow) exit decider exactly
+# like a YES leg does -- INC-E3's `_maybe_decide_exit` is leg-agnostic, but
+# before FU-1 a NO leg never registered at all, so it never reached here.
+# ---------------------------------------------------------------------------
+
+_HOUR_NS = 3_600_000_000_000
+
+
+def _drive_no_leg_to_dead(monitor: PositionMonitor, *, station: str, start_ns: int) -> None:
+    """Two observations spanning >= `_DEAD_MIN_CONFIRM_SPAN_NS` (5 min), both
+    at/after `_LOCKED_HOUR_LST` (18:00 LST) with the running max fixed inside
+    the rung -- the NO leg's `_evaluate_no` "inside rung after peak" DEAD
+    path (mirrors `_drive_to_dead`'s YES-leg geometry above)."""
+    monitor.on_observation(station, start_ns)
+    monitor.on_observation(station, start_ns + 6 * _MINUTE_NS)
+
+
+def _drive_no_leg_to_threatened(monitor: PositionMonitor, *, station: str, start_ns: int) -> None:
+    """Three observations spanning >= `_THREATENED_MIN_SPAN_NS` (10 min),
+    all BEFORE `_LOCKED_HOUR_LST` with the running max fixed inside the rung
+    -- the NO leg's pre-peak "inside rung" THREATENED hysteresis path."""
+    monitor.on_observation(station, start_ns)
+    monitor.on_observation(station, start_ns + 5 * _MINUTE_NS)
+    monitor.on_observation(station, start_ns + 10 * _MINUTE_NS)
+
+
+def test_no_leg_dead_with_gated_false_manifest_writes_only_refusal_rows_and_never_submits(
+    tmp_path: Path,
+) -> None:
+    from breezy.strategy.current_rung_hold.exit_decider import decide_exit
+
+    submit_calls: list[object] = []
+    offer_calls: list[object] = []
+    start_ns = WINDOW_OPEN_NS + 6 * _HOUR_NS  # 18:00 LST -- at `_LOCKED_HOUR_LST`
+
+    strategy = _FakeStrategyForCallables(
+        cache=_FakeCacheForCallables(
+            positions_by_iid={
+                _NO_IID: [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)],
+            },
+        ),
+        _latch=_FakeLatchForCallables(record=None),
+        _facts=_no_leg_facts(),
+        _std_utc_offset_hours_by_station={STATION: -8.0},
+    )
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=86, upper_f=87, source_observed_at_ns=start_ns),
+    )
+    monitor = _build_position_monitor_via_callables(
+        strategy,
+        tmp_path=tmp_path,
+        accumulators={STATION: accumulator},
+        exit_decider=decide_exit,
+        exit_manifest=_manifest_for_exit_test(exit_rule=None),
+        exit_family_id="pm_us_crh_cont",
+        exit_client_order_id_factory=lambda: "exit-coid-no-leg-shadow",
+        submit_exit=submit_calls.append,
+        record_exit_offer=offer_calls.append,
+    )
+    fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
+    monitor.on_position_opened(fake_position, start_ns)  # type: ignore[arg-type]
+
+    _drive_no_leg_to_dead(monitor, station=STATION, start_ns=start_ns)
+
+    assert submit_calls == []
+    assert offer_calls, "at least one refusal row must still be persisted"
+    assert all(
+        getattr(call, "exit_reason_code", None) == "family_not_exit_registered"
+        for call in offer_calls
+    )
+    assert all(getattr(call, "side", None) == "NO" for call in offer_calls)
+
+
+def test_no_leg_dead_with_an_armed_family_refuses_book_not_executable_while_no_marks_exist(
+    tmp_path: Path,
+) -> None:
+    """Reviewer finding: an ARMED family (`exit_rule` set, family registered)
+    still refuses -- the NO leg's exit-side book was never walked (no depth
+    ever pushed here), so `decide_exit`'s own `_book_is_executable` check
+    refuses every evaluation with `book_not_executable`, and `submit_exit`
+    is never called."""
+    from breezy.strategy.current_rung_hold.exit_decider import decide_exit
+
+    submit_calls: list[object] = []
+    offer_calls: list[object] = []
+    start_ns = WINDOW_OPEN_NS + 2 * _HOUR_NS  # 14:00 LST -- before `_LOCKED_HOUR_LST`
+
+    strategy = _FakeStrategyForCallables(
+        cache=_FakeCacheForCallables(
+            positions_by_iid={
+                _NO_IID: [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)],
+            },
+        ),
+        _latch=_FakeLatchForCallables(record=None),
+        _facts=_no_leg_facts(),
+        _std_utc_offset_hours_by_station={STATION: -8.0},
+    )
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=86, upper_f=87, source_observed_at_ns=start_ns),
+    )
+    monitor = _build_position_monitor_via_callables(
+        strategy,
+        tmp_path=tmp_path,
+        accumulators={STATION: accumulator},
+        exit_decider=decide_exit,
+        exit_manifest=_manifest_for_exit_test(
+            exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+        ),
+        exit_family_id="pm_us_crh_exit_v4",
+        exit_client_order_id_factory=lambda: "exit-coid-no-leg-armed",
+        submit_exit=submit_calls.append,
+        record_exit_offer=offer_calls.append,
+    )
+    fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
+    monitor.on_position_opened(fake_position, start_ns)  # type: ignore[arg-type]
+
+    _drive_no_leg_to_threatened(monitor, station=STATION, start_ns=start_ns)
+
+    assert submit_calls == []
+    assert offer_calls, "at least one refusal row must still be persisted"
+    assert all(
+        getattr(call, "exit_reason_code", None) == "book_not_executable" for call in offer_calls
     )
