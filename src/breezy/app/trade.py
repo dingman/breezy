@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -103,6 +104,33 @@ _FAMILIES_DIR: Final[Path] = Path("deploy/families")
 LIVE_TRADING_PERMIT_REFUSED_EVENT: Final[str] = "LIVE_TRADING_PERMIT_REFUSED"
 LIVE_TRADING_PERMIT_REFUSED_SEVERITY: Final[str] = "WARN"
 LIVE_TRADING_PERMIT_REFUSED_SITE: Final[str] = "global"
+
+#: [A-1, 2026-09-25] A plain, non-negative integer only -- same ASCII/
+#: anchoring discipline as ``safety.py``'s own ``_MONEY_RE``/``_COUNT_RE``.
+_PERMIT_EXPIRY_CEILING_NS_RE: Final = re.compile(r"^[0-9]+\Z")
+
+
+def _resolve_permit_expiry_ceiling_ns() -> int | None:
+    """Read ``PERMIT_EXPIRY_CEILING_NS_ENV_VAR`` (A-1): supervisor-injected
+    only, for a mid-day-relaunched child -- never set for the 16:50Z daily
+    boot. Absent -> ``None`` (unchanged, unbounded-by-this-mechanism
+    behaviour). Present but not a plain non-negative integer -> raises
+    ``LiveTradingPermissionError``, refusing the permit through the SAME
+    fail-closed path ``main()`` already uses for every other mint
+    precondition -- never silently falling back to an unbounded permit.
+    """
+    from breezy.adapters.polymarket_us.safety import LiveTradingPermissionError
+    from breezy.runtime.trade_supervisor_core import PERMIT_EXPIRY_CEILING_NS_ENV_VAR
+
+    raw = os.environ.get(PERMIT_EXPIRY_CEILING_NS_ENV_VAR)
+    if raw is None:
+        return None
+    if not _PERMIT_EXPIRY_CEILING_NS_RE.match(raw):
+        raise LiveTradingPermissionError(
+            f"{PERMIT_EXPIRY_CEILING_NS_ENV_VAR} is set but is not a plain "
+            f"non-negative integer; refusing rather than minting an unbounded permit"
+        )
+    return int(raw)
 
 #: ``AlertPayload.detail`` is a small closed set of static reasons -- never
 #: exception text, never a permit/config value (L-22 shape). ``main()`` has
@@ -648,7 +676,9 @@ def main() -> int:
 
     permit = None
     try:
-        permit = issue_live_trading_permit(clock=LiveClock())
+        permit = issue_live_trading_permit(
+            clock=LiveClock(), max_expires_at_ns=_resolve_permit_expiry_ceiling_ns()
+        )
     except LiveTradingPermissionError as exc:
         _boot_logger.info("live-trading permit not issued: %s", exc)
         emit_alert(

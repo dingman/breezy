@@ -576,3 +576,7 @@ When a node must be restarted outside the 16:50Z window or after an unclean shut
    ```
    This detaches the node from the terminal and ensures clean shutdown on session end. The supervisor's
    16:40Z STOP_PRIOR finds running nodes by pgrep; a node that outlives its supervisor is an anticipated state.
+   **A-1 note (docs/evidence/RULING_permit_daily_coverage_2026-09-25.md):** a hand-relaunched node mints a
+   fresh, full-TTL permit with no daily coverage ceiling — this is outside A-1's automated-relaunch threat
+   model since a human is deciding, but repeated hand relaunches in one trading day reproduce the same
+   cumulative-coverage gap A-1 closes for `_do_midday_watch`, and are the operator's own call to make.

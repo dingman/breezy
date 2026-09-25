@@ -82,6 +82,14 @@ PERMIT_ISSUED_MARKER: Final[str] = "live-trading permit issued issued_at_ns="
 PERMIT_NOT_ISSUED_MARKER: Final[str] = "order submission permit not issued"
 TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
 
+#: [A-1, 2026-09-25] Injected by ``_do_midday_watch`` into a mid-day-relaunched
+#: child's environment, read by ``app/trade.py::main`` and passed to
+#: ``issue_live_trading_permit`` as ``max_expires_at_ns`` -- caps that
+#: child's permit at the day's FIRST boot's expiry so cumulative daily
+#: coverage stays <= ``PERMIT_TTL_NS`` + spawn grace instead of one fresh
+#: 10 h window per relaunch. Never set for the 16:50Z daily boot spawn.
+PERMIT_EXPIRY_CEILING_NS_ENV_VAR: Final[str] = "BREEZY_PERMIT_EXPIRY_CEILING_NS"
+
 #: WP-11b (active-family registry, cardinality-1): the WP-0a two-prefix
 #: stopgap is replaced by a ``composition_kind`` -> subscribe-marker
 #: mapping, pinned against each strategy class's own name the same way the
@@ -223,6 +231,12 @@ class AlertDetail(str, Enum):
     #: the bounded post-relaunch readiness re-check.
     MIDDAY_RELAUNCH_EXHAUSTED = "midday_relaunch_exhausted"
     MIDDAY_RELAUNCHED_CHILD_NOT_READY = "midday_relaunched_child_not_ready"
+    #: [A-1, 2026-09-25] The day's first-boot permit expiry was never
+    #: observed (e.g. the first child died between writing its permit line
+    #: and the next poll) -- fires once per day and DECLINES every mid-day
+    #: relaunch for the rest of the day rather than mint a relaunched
+    #: child's permit with no ceiling.
+    MIDDAY_RELAUNCH_CEILING_UNKNOWN = "midday_relaunch_ceiling_unknown"
     #: [AUD-14b] The self-check repeat-failure escalation machinery's own
     #: fault paths -- see ``SelfCheckEscalationState``/``EscalationLoadOutcome``
     #: below. Each fails TOWARD alerting, never toward silence.
@@ -832,6 +846,24 @@ class DaySchedulerState:
     #: for the rest of the day. Reset by :func:`record_child_adopted` for
     #: a new child, same as ``midday_not_ready_alert_sent``.
     midday_readiness_recheck_done: bool = False
+    #: [A-1, 2026-09-25] The day's FIRST-observed permit-issued expiry --
+    #: DISTINCT from ``permit_issued_seen_expires_at_ns`` above, which is
+    #: per-child and cleared by :func:`record_child_adopted` on every
+    #: relaunch. This field is first-seen-wins for the whole TRADING DAY
+    #: (set once, via :func:`record_first_boot_permit_seen`) and is
+    #: deliberately absent from every ``replace(...)`` in
+    #: :func:`record_child_adopted` and the relaunch recorders that reuse
+    #: it, so it survives every mid-day relaunch unchanged. Reset only by
+    #: :func:`_for_day` at the trading-day boundary, same as every other
+    #: field here. ``None`` means no permit-issued line has been observed
+    #: yet today -- the fail-closed anchor :func:`_do_midday_watch` requires
+    #: before it will ever relaunch a sending node (A-1).
+    first_boot_permit_expires_at_ns: int | None = None
+    #: [A-1, 2026-09-25] Gates ``AlertDetail.MIDDAY_RELAUNCH_CEILING_UNKNOWN``
+    #: to exactly once per trading day -- same idempotent-latch shape as
+    #: ``midday_alert_sent``. A day-level gate, not per-child: NOT cleared
+    #: by :func:`record_child_adopted`.
+    midday_ceiling_unknown_alert_sent: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -1019,6 +1051,23 @@ def record_permit_issued_seen(
     return replace(effective, permit_issued_seen_expires_at_ns=expires_at_ns)
 
 
+def record_first_boot_permit_seen(
+    state: DaySchedulerState, now_utc: dt.datetime, expires_at_ns: int
+) -> DaySchedulerState:
+    """[A-1, 2026-09-25] Latch ``first_boot_permit_expires_at_ns`` -- the
+    day's FIRST-observed permit-issued expiry, DISTINCT from the per-child
+    :func:`record_permit_issued_seen` latch. First-seen-wins for the whole
+    trading day, same ``_for_day`` shape as :func:`record_permit_issued_seen`
+    (idempotent: a caller that has already latched today's anchor gets the
+    same state back unchanged). Callers latch this ALONGSIDE
+    :func:`record_permit_issued_seen`, every time a permit-issued log line
+    is observed, at every phase (boot, relaunch, mid-day)."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.first_boot_permit_expires_at_ns is not None:
+        return effective
+    return replace(effective, first_boot_permit_expires_at_ns=expires_at_ns)
+
+
 def record_midday_cause_seen(
     state: DaySchedulerState, now_utc: dt.datetime, cause: RelaunchCause
 ) -> DaySchedulerState:
@@ -1057,6 +1106,22 @@ def record_midday_alert_sent(state: DaySchedulerState, now_utc: dt.datetime) -> 
     if effective.midday_alert_sent:
         return effective
     return replace(effective, midday_alert_sent=True)
+
+
+def record_midday_ceiling_unknown_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[A-1, 2026-09-25] Latch that
+    ``AlertDetail.MIDDAY_RELAUNCH_CEILING_UNKNOWN`` has already fired today --
+    gates it to exactly once, same idempotent shape as
+    :func:`record_midday_alert_sent`. A day-level gate: unlike
+    ``midday_not_ready_alert_sent``, this is NOT cleared by
+    :func:`record_child_adopted` -- an unknown first-boot anchor is a
+    property of the DAY, not of any one child."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_ceiling_unknown_alert_sent:
+        return effective
+    return replace(effective, midday_ceiling_unknown_alert_sent=True)
 
 
 def record_midday_not_ready_alert_sent(

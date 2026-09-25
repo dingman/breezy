@@ -104,6 +104,7 @@ from breezy.runtime.trade_supervisor_core import (
     next_due,
     parse_permit_expiry_ns,
     readiness_observed,
+    record_first_boot_permit_seen,
     record_midday_cause_seen,
     record_permit_issued_seen,
     record_readiness_observed,
@@ -3968,6 +3969,10 @@ class TestDoMiddayWatch:
             read_log_new=lambda p: p.read_text(),
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
 
         new_pid, new_log, state = _do_midday_watch(
             ports=ports,
@@ -3996,6 +4001,10 @@ class TestDoMiddayWatch:
             read_log_new=lambda p: p.read_text(),
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
         for i in range(MIDDAY_MAX_RELAUNCH_ATTEMPTS):
             state = record_midday_relaunch_attempt(state, _utc(19, 40 + i * 6))
         assert state.midday_relaunch_attempts == MIDDAY_MAX_RELAUNCH_ATTEMPTS
@@ -4032,6 +4041,10 @@ class TestDoMiddayWatch:
         node_log.write_text(_TRADING_NODE_FAILED_LINE)
         ports = _make_ports(process_alive=lambda _pid: False)
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
         for i in range(MIDDAY_MAX_RELAUNCH_ATTEMPTS):
             state = record_midday_relaunch_attempt(state, _utc(19, 40 + i * 6))
 
@@ -4058,6 +4071,10 @@ class TestDoMiddayWatch:
             resolve_intent_lock_holder=lambda p: (holder_calls.append(p), None)[1],
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
 
         result = _do_midday_watch(
             ports=ports,
@@ -4085,6 +4102,10 @@ class TestDoMiddayWatch:
             alert_sink=sink,
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
         relaunch_at = _utc(20, 0)
         state = record_midday_relaunch_attempt(state, relaunch_at)
 
@@ -4129,6 +4150,10 @@ class TestDoMiddayWatch:
             read_log_new=lambda p: p.read_text(),
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
         relaunch_at = _utc(20, 0)
         state = record_midday_relaunch_attempt(state, relaunch_at)
 
@@ -4168,6 +4193,10 @@ class TestDoMiddayWatch:
             spawn=FakeSpawner(),
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
 
         new_pid, new_log, state = _do_midday_watch(
             ports=ports,
@@ -4209,6 +4238,10 @@ class TestDoMiddayWatch:
             spawn=spawner,
         )
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        # [A-1] MIDDAY_WATCH is only reachable after boot's own permit-issued
+        # line was already observed (readiness requires it) -- seed the
+        # day-level anchor these fixtures' realistic precondition implies.
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
 
         # Poll N: the fatal marker is present in THIS poll's delta, but the
         # process is still alive -- the death-detecting poll may be a
@@ -4257,6 +4290,170 @@ class TestDoMiddayWatch:
 
         assert len(spawner.calls) == 1
         assert new_pid != tracked_pid
+
+
+# ===========================================================================
+# [A-1, 2026-09-25] `first_boot_permit_expires_at_ns` -- the cumulative daily
+# permit-coverage ceiling anchor. Ruling:
+# docs/evidence/RULING_permit_daily_coverage_2026-09-25.md
+# ===========================================================================
+
+
+class TestFirstBootPermitAnchor:
+    def test_survives_three_mid_day_relaunches_unchanged(self, tmp_path):
+        """The anchor is set once from the FIRST child's permit line and
+        must not move even though each relaunched child mints (and logs)
+        its own, later, clamped expiry."""
+        from breezy.runtime.trade_supervisor_core import record_child_adopted
+
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
+        anchor = state.first_boot_permit_expires_at_ns
+        assert anchor == _FAR_FUTURE_EXPIRES_AT_NS
+
+        for i in range(3):
+            node_log = tmp_path / f"child{i}.log"
+            # Each relaunched child logs a DIFFERENT (later) permit expiry --
+            # if the anchor were re-latched from this, it would move.
+            child_expiry = _FAR_FUTURE_EXPIRES_AT_NS + (i + 1) * 1_000_000_000
+            node_log.write_text(
+                "trading node failed\n"
+                f"live-trading permit issued issued_at_ns=1 expires_at_ns={child_expiry} "
+                "ttl_s=1\n"
+            )
+            ports = _make_ports(
+                process_alive=lambda _pid: False,
+                spawn=FakeSpawner(),
+                read_log_new=lambda p: p.read_text(),
+            )
+            _new_pid, _new_log, state = _do_midday_watch(
+                ports=ports,
+                state=state,
+                now=_utc(20 + i, 0),
+                tracked_pid=1001 + i,
+                node_log=node_log,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+            assert state.first_boot_permit_expires_at_ns == anchor
+            state = record_child_adopted(state, _utc(20 + i, 1))
+            assert state.first_boot_permit_expires_at_ns == anchor
+
+        assert state.first_boot_permit_expires_at_ns == anchor
+
+    def test_unknown_anchor_declines_every_relaunch_and_alerts_exactly_once(self, tmp_path):
+        """No permit-issued line has ever been observed today (e.g. the
+        first child died between writing its permit line and the next
+        poll) -- every mid-day relaunch must fail CLOSED, never fall
+        through to `decide_midday_relaunch`/`ports.spawn`, regardless of
+        budget/window state."""
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        assert state.first_boot_permit_expires_at_ns is None
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            spawn=spawner,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 0
+        assert tracked_pid == 1001  # never None, same contract as every other decline
+        assert state.midday_relaunch_attempts == 0
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.MIDDAY_RELAUNCH_CEILING_UNKNOWN.value
+        ]
+
+        # A second poll must not re-alert.
+        tracked_pid_2, _, _state_2 = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert len(sink.payloads) == 1
+        assert tracked_pid_2 == tracked_pid
+
+    def test_relaunch_at_0030z_anchors_to_the_previous_trading_day(self):
+        """00:00-16:40Z belongs to the trading day that opened yesterday's
+        16:40Z (`_trading_day`) -- a permit line observed at 00:30Z must
+        latch onto THAT day's state, never roll it to the new calendar
+        date."""
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        after_midnight = _utc(0, 30, day=_DAY + dt.timedelta(days=1))
+
+        state = record_first_boot_permit_seen(
+            state, after_midnight, _FAR_FUTURE_EXPIRES_AT_NS
+        )
+
+        assert state.day == _DAY
+        assert state.first_boot_permit_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+
+    def test_midday_relaunch_spawn_env_carries_the_first_boot_ceiling(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import PERMIT_EXPIRY_CEILING_NS_ENV_VAR
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            spawn=spawner,
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
+
+        _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        env = spawner.calls[0]["env"]
+        assert env[PERMIT_EXPIRY_CEILING_NS_ENV_VAR] == str(_FAR_FUTURE_EXPIRES_AT_NS)
+        # A copy, never a mutation of the real process environment.
+        assert PERMIT_EXPIRY_CEILING_NS_ENV_VAR not in os.environ
+
+    def test_daily_boot_launch_spawn_env_carries_no_ceiling(self, tmp_path):
+        """The 16:50Z daily boot path (`_do_launch`) must never inject
+        `PERMIT_EXPIRY_CEILING_NS_ENV_VAR` -- it forwards `os.environ`
+        as-is, exactly as before A-1."""
+        from breezy.runtime.trade_supervisor_core import PERMIT_EXPIRY_CEILING_NS_ENV_VAR
+
+        spawner = FakeSpawner()
+        ports = _make_ports(spawn=spawner, intent_lock_free=lambda _p: True)
+
+        _do_launch(
+            ports=ports,
+            state=initial_scheduler_state(_DAY),
+            now=_utc(16, 50),
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+
+        assert len(spawner.calls) == 1
+        env = spawner.calls[0]["env"]
+        assert env is os.environ  # forwarded as-is, never copied or augmented
+        assert PERMIT_EXPIRY_CEILING_NS_ENV_VAR not in env
 
 
 # ===========================================================================
@@ -4445,6 +4642,7 @@ class TestWp0aLiveFamilyMiddayWatchAndReap:
                 read_log_new=lambda p: p.read_text(),
             )
             state = record_readiness_observed(state, _utc(16, 55))
+            state = record_first_boot_permit_seen(state, _utc(16, 55), _FAR_FUTURE_EXPIRES_AT_NS)
             new_pid, _new_log, state = _do_midday_watch(
                 ports=watch_ports,
                 state=state,
