@@ -936,6 +936,55 @@ class TestAud04PerTrialReconciliation:
 
         assert result.matched is True
 
+    def test_a_duplicate_trial_id_whose_rows_sum_to_the_other_sides_value_is_divergent(
+        self,
+    ) -> None:
+        """MEDIUM review finding: the dict comprehensions used to collapse a
+        duplicate `trial_id` on either side to last-write-wins. Here each
+        duplicate's SECOND row alone already equals the other side's single
+        value (rows sum to 0.00 + 0.40 == 0.40) -- under last-write-wins this
+        reconciled as a false MATCH, hiding that one side reported the trial
+        more than once. A duplicate on either side must now be divergent
+        regardless of value equality."""
+        rows = (
+            _synthetic_row(
+                trial_id="dup-on-aud04-side", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.40"),
+                r_dead_pnl=Decimal("0.40"), r_threat_pnl=Decimal("0.40"),
+                r_best_pnl=Decimal("0.40"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="dup-on-exit-side", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.00"),
+                r_dead_pnl=Decimal("0.00"), r_threat_pnl=Decimal("0.00"),
+                r_best_pnl=Decimal("0.00"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="dup-on-exit-side", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.35"),
+                r_dead_pnl=Decimal("0.35"), r_threat_pnl=Decimal("0.35"),
+                r_best_pnl=Decimal("0.35"),
+                climate_day="2026-01-05",
+            ),
+        )
+        aud04_trial_rows = (
+            _trial_row(trial_id="dup-on-aud04-side", climate_day="2026-01-05", pnl=Decimal("0.00")),
+            _trial_row(trial_id="dup-on-aud04-side", climate_day="2026-01-05", pnl=Decimal("0.40")),
+            _trial_row(trial_id="dup-on-exit-side", climate_day="2026-01-05", pnl=Decimal("0.35")),
+        )
+
+        result = study_mod.reconcile_with_aud04_per_trial(
+            rows=rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+
+        assert result.matched is False
+        assert result.n_matched == 0
+        assert result.n_duplicate_exit == 1
+        assert result.n_duplicate_aud04 == 1
+        assert set(result.divergent_trial_ids) == {"dup-on-aud04-side", "dup-on-exit-side"}
+
 
 class TestAud04PerTrialReconciliationLadder:
     def test_a_persistent_per_trial_mismatch_names_divergent_trial_ids_without_the_caveat(
@@ -979,6 +1028,45 @@ class TestAud04PerTrialReconciliationLadder:
         assert clear_payload is not None
         assert clear_payload.event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT
         assert latch.streak == 0
+
+    def test_the_mismatch_alert_names_a_capped_sample_of_unjoined_trial_ids(self) -> None:
+        """LOW review finding: `exit_only_trial_ids`/`aud04_only_trial_ids`
+        must be visible in the alert detail, not only their counts."""
+        result = study_mod.Aud04PerTrialReconciliationResult(
+            matched=False, cutoff="2026-01-10", n_matched=0, n_exit_only=1, n_aud04_only=1,
+            n_divergent=0, n_duplicate_exit=0, n_duplicate_aud04=0,
+            divergent_trial_ids=(), exit_only_trial_ids=("exit-only-trial",),
+            aud04_only_trial_ids=("aud04-only-trial",),
+        )
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder_per_trial(
+                result=result, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert "exit-only-trial" in payload.detail
+        assert "aud04-only-trial" in payload.detail
+
+    def test_the_unjoined_trial_id_sample_in_the_alert_detail_is_capped(self) -> None:
+        many_ids = tuple(
+            f"trial-{i}" for i in range(study_mod._MAX_NAMED_DIVERGENT_TRIAL_IDS + 5)
+        )
+        result = study_mod.Aud04PerTrialReconciliationResult(
+            matched=False, cutoff="2026-01-10", n_matched=0, n_exit_only=len(many_ids),
+            n_aud04_only=0, n_divergent=0, n_duplicate_exit=0, n_duplicate_aud04=0,
+            divergent_trial_ids=(), exit_only_trial_ids=many_ids, aud04_only_trial_ids=(),
+        )
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder_per_trial(
+                result=result, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert "trial-0" in payload.detail
+        last_id = f"trial-{study_mod._MAX_NAMED_DIVERGENT_TRIAL_IDS + 4}"
+        assert last_id not in payload.detail
 
 
 def _write_minimal_aud04_report_v1(path: Path, *, realised_pnl_after_fees_total: Decimal) -> None:

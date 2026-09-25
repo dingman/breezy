@@ -68,6 +68,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -371,6 +372,13 @@ class Aud04PerTrialReconciliationResult:
     is compared individually at the same zero tolerance
     (`_RECONCILIATION_TOLERANCE`) the total-level check uses, and a
     `trial_id` present on only one side is reported, never silently dropped.
+
+    A `trial_id` occurring MORE THAN ONCE on either side (`n_duplicate_exit`/
+    `n_duplicate_aud04`) is always divergent when joined, regardless of
+    whether its values happen to compare equal -- a naive dict keyed on
+    `trial_id` silently collapses duplicates to last-write-wins, which can
+    reconcile as a false MATCH exactly when the duplicated rows' values
+    happen to sum to the other side's single value (review finding, 2026-09-25).
     """
 
     matched: bool
@@ -379,6 +387,10 @@ class Aud04PerTrialReconciliationResult:
     n_exit_only: int
     n_aud04_only: int
     n_divergent: int
+    #: Count of DISTINCT trial_ids occurring more than once among the
+    #: cutoff-restricted rows on that side (review finding, 2026-09-25).
+    n_duplicate_exit: int = 0
+    n_duplicate_aud04: int = 0
     #: First `_MAX_NAMED_DIVERGENT_TRIAL_IDS` divergent trial ids, sorted --
     #: for the alert detail. `n_divergent` is the true (unbounded) count.
     divergent_trial_ids: tuple[str, ...]
@@ -397,12 +409,26 @@ def reconcile_with_aud04_per_trial(
     An exit-side row whose `hold_pnl` is `None` (settlement truth not yet
     known for that trial) cannot be compared and is counted as divergent
     rather than silently treated as a match.
+
+    Duplicate `trial_id`s on either side are counted with a `Counter`
+    BEFORE either side is collapsed into a `{trial_id: pnl}` dict -- a plain
+    dict comprehension silently keeps only the LAST row for a repeated key,
+    which can reconcile as a false match (review finding, 2026-09-25). A
+    joined `trial_id` duplicated on either side is always divergent here,
+    regardless of whether the (arbitrary, last-write) value it collapsed to
+    happens to compare equal.
     """
     cutoff_exit_rows = tuple(row for row in rows if row.position.climate_day <= cutoff)
+    cutoff_aud04_rows = tuple(row for row in aud04_trial_rows if row.climate_day <= cutoff)
+
+    exit_trial_id_counts = Counter(row.position.trial_id for row in cutoff_exit_rows)
+    aud04_trial_id_counts = Counter(row.trial_id for row in cutoff_aud04_rows)
+    duplicate_exit_trial_ids = {tid for tid, count in exit_trial_id_counts.items() if count > 1}
+    duplicate_aud04_trial_ids = {tid for tid, count in aud04_trial_id_counts.items() if count > 1}
+
     exit_pnl_by_trial: dict[str, Decimal | None] = {
         row.position.trial_id: row.hold_pnl for row in cutoff_exit_rows
     }
-    cutoff_aud04_rows = tuple(row for row in aud04_trial_rows if row.climate_day <= cutoff)
     aud04_pnl_by_trial: dict[str, Decimal] = {row.trial_id: row.pnl for row in cutoff_aud04_rows}
 
     exit_only = tuple(sorted(set(exit_pnl_by_trial) - set(aud04_pnl_by_trial)))
@@ -412,6 +438,9 @@ def reconcile_with_aud04_per_trial(
     divergent: list[str] = []
     n_matched = 0
     for trial_id in joined_trial_ids:
+        if trial_id in duplicate_exit_trial_ids or trial_id in duplicate_aud04_trial_ids:
+            divergent.append(trial_id)
+            continue
         exit_pnl = exit_pnl_by_trial[trial_id]
         aud04_pnl = aud04_pnl_by_trial[trial_id]
         if exit_pnl is not None and abs(exit_pnl - aud04_pnl) <= _RECONCILIATION_TOLERANCE:
@@ -423,6 +452,8 @@ def reconcile_with_aud04_per_trial(
     return Aud04PerTrialReconciliationResult(
         matched=matched, cutoff=cutoff, n_matched=n_matched,
         n_exit_only=len(exit_only), n_aud04_only=len(aud04_only), n_divergent=len(divergent),
+        n_duplicate_exit=len(duplicate_exit_trial_ids),
+        n_duplicate_aud04=len(duplicate_aud04_trial_ids),
         divergent_trial_ids=tuple(divergent[:_MAX_NAMED_DIVERGENT_TRIAL_IDS]),
         exit_only_trial_ids=exit_only, aud04_only_trial_ids=aud04_only,
     )
@@ -436,13 +467,21 @@ def apply_pnl_reconciliation_ladder_per_trial(
     -- this is the per-row upgrade of the SAME control, not a second one).
     The report-level-total caveat is DROPPED here (it no longer applies once
     AUD-04 publishes `trial_rows`); the detail instead names the first
-    `_MAX_NAMED_DIVERGENT_TRIAL_IDS` divergent `trial_id`s plus the
-    unjoined-row counts on each side."""
+    `_MAX_NAMED_DIVERGENT_TRIAL_IDS` divergent `trial_id`s, the duplicate
+    counts on each side, and a same-capped sample of the unjoined
+    `trial_id`s on each side (review finding, 2026-09-25 -- previously only
+    their counts were visible)."""
     previous_streak = latch.streak
     stale_detail = (
         f"streak={previous_streak + 1} n_divergent={result.n_divergent} "
         f"n_exit_only={result.n_exit_only} n_aud04_only={result.n_aud04_only} "
-        f"divergent_trial_ids={list(result.divergent_trial_ids)}"
+        f"n_duplicate_exit={result.n_duplicate_exit} "
+        f"n_duplicate_aud04={result.n_duplicate_aud04} "
+        f"divergent_trial_ids={list(result.divergent_trial_ids)} "
+        f"exit_only_trial_ids="
+        f"{list(result.exit_only_trial_ids[:_MAX_NAMED_DIVERGENT_TRIAL_IDS])} "
+        f"aud04_only_trial_ids="
+        f"{list(result.aud04_only_trial_ids[:_MAX_NAMED_DIVERGENT_TRIAL_IDS])}"
     )
     return _apply_ladder(
         is_fresh=result.matched, latch=latch, now_ns=now_ns,
@@ -1285,13 +1324,20 @@ def main(
                     per_trial_result = reconcile_with_aud04_per_trial(
                         rows=rows, cutoff=cutoff, aud04_trial_rows=aud04_view.trial_rows,
                     )
+                    cap = _MAX_NAMED_DIVERGENT_TRIAL_IDS
                     print(
                         f"[exit-window-study] AUD-04 per-trial reconciliation: "
                         f"matched={per_trial_result.matched} cutoff={cutoff} "
                         f"n_divergent={per_trial_result.n_divergent} "
                         f"n_exit_only={per_trial_result.n_exit_only} "
                         f"n_aud04_only={per_trial_result.n_aud04_only} "
-                        f"divergent_trial_ids={list(per_trial_result.divergent_trial_ids)}",
+                        f"n_duplicate_exit={per_trial_result.n_duplicate_exit} "
+                        f"n_duplicate_aud04={per_trial_result.n_duplicate_aud04} "
+                        f"divergent_trial_ids={list(per_trial_result.divergent_trial_ids)} "
+                        f"exit_only_trial_ids="
+                        f"{list(per_trial_result.exit_only_trial_ids[:cap])} "
+                        f"aud04_only_trial_ids="
+                        f"{list(per_trial_result.aud04_only_trial_ids[:cap])}",
                         file=sys.stderr,
                     )
                     new_reconciliation_latch, reconciliation_payload = (
