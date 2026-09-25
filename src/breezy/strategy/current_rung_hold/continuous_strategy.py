@@ -14,13 +14,14 @@ tick with guards, else skips.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected, PositionOpened
@@ -61,6 +62,12 @@ from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.strategy.current_rung_hold import exit_wiring
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take, no_leg_executable
+from breezy.strategy.current_rung_hold.diagnostics_summary import (
+    DiagnosticsSummarySink,
+)
+from breezy.strategy.current_rung_hold.diagnostics_summary import (
+    delta as _diagnostics_delta,
+)
 from breezy.strategy.current_rung_hold.exit_decider import ExitProposal
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
@@ -132,6 +139,9 @@ __all__ = [
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 #: GAP fix 2026-09-15: for the `take:` log line's `staleness_s=` field only.
 _NS_PER_SECOND: Final[int] = 1_000_000_000
+#: F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): the `open_intent_wait:` log
+#: line's own re-log cadence while the SAME intent_id persists.
+_NS_PER_HOUR: Final[int] = 60 * _NS_PER_MINUTE
 #: GAP fix 2026-09-15: `NO_ask = 1 - bid`, for the NO-side offer-tape row's
 #: `ask` field ONLY when `no_decision` is a `Refuse` that never reached a
 #: `Take.limit_price` -- mirrors `decision.py`'s own inversion exactly,
@@ -417,6 +427,8 @@ class ContinuousRungHoldStrategy(Strategy):
         phase0_permit_guard: bool = True,
         position_monitor: PositionMonitor | None = None,
         shadow_rest_summary_dir: Path | None = None,
+        diagnostics_summary: DiagnosticsSummarySink | None = None,
+        build_sha: str = "unknown",
     ) -> None:
         """``phase0_permit_guard=True`` (default) keeps Phase 0's seal: a
         non-None ``order_submission_permit`` raises
@@ -568,6 +580,52 @@ class ContinuousRungHoldStrategy(Strategy):
         #: genuine leak (evictions climbing every day) is distinguishable
         #: from ordinary multi-day overlap.
         self._shadow_rest_summary_evictions = 0
+        #: F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): dedupes the store
+        #: read `current_open_submit_intent()` to at most once per event-
+        #: time MINUTE bucket (`snapshot.ts_event // 60e9`) -- `None` until
+        #: the first `is_intent_open()` WAIT tick this process ever sees.
+        self._open_intent_wait_last_minute_bucket: int | None = None
+        #: F-4: `(intent_id, last_logged_ns)` for the LOG line's OWN dedupe
+        #: -- once per NEW `intent_id`, then at most once per hour while the
+        #: SAME id persists. `None` until a line is actually logged.
+        self._open_intent_wait_log_state: tuple[str, int] | None = None
+        #: Mirrors `last_rearm_decision`/`last_no_take_shadow` (L-27:
+        #: asserted by presence, never via log capture) -- the MOST RECENT
+        #: `open_intent_wait:` line actually logged (never set on a
+        #: deduped repeat).
+        self.last_open_intent_wait: str | None = None
+        #: F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A4): mirrors `self.
+        #: takes` -- the NO leg's own FINALIZED-take count, incremented at
+        #: the same point the latch goes IN_FLIGHT for `no_iid`.
+        #: `HaltDetector.observe(takes=self.takes)` stays YES-only: no cited
+        #: rule requires it to see this.
+        self.no_takes = 0
+        #: F-2 (coordinator carry-forward): distinct from `diagnostics`/
+        #: `refusals` (no new alerter condition, AC4) -- counts an
+        #: in-window bid-only Depth10 frame (F-1b), and, of those, the ones
+        #: whose NO leg is ALSO outside the executable band. Both were
+        #: invisible to every counter before this pair existed.
+        self._bid_only_in_window_frames = 0
+        self._no_out_of_band_frames = 0
+        #: F-2: the optional shared hourly-diagnostics sidecar and this
+        #: process's build identity -- `None`/`"unknown"` by default so a
+        #: harness/test that never wires composition is byte-identical to
+        #: before this pair of kwargs existed.
+        self._diagnostics_summary = diagnostics_summary
+        self._build_sha = build_sha
+        #: Per-process attribution (A5) for every `crh_diag_hourly_v1` row.
+        #: `_diag_boot_ns` is resolved once in `on_start` (the clock is not
+        #: bound until `register()` runs); `0` here is never emitted since
+        #: no row exists before `on_start`.
+        self._diag_pid = os.getpid()
+        self._diag_boot_ns = 0
+        #: The event-time hour bucket (`ts_event // _NS_PER_HOUR`) of the
+        #: MOST RECENT `_maybe_roll_diagnostics` call, and the counter
+        #: snapshot taken at that call -- `None` until the first tick this
+        #: process ever hunts. Bounded: exactly one bucket int and one
+        #: bounded dict-of-dicts, never a growing collection.
+        self._diag_hourly_bucket: int | None = None
+        self._diag_hourly_baseline: dict[str, object] | None = None
 
     def _record_shadow_rest_tick(
         self,
@@ -738,6 +796,9 @@ class ContinuousRungHoldStrategy(Strategy):
                 "ContinuousRungHoldStrategy was constructed with no "
                 "trial_day_latch_factory; see the module docstring."
             )
+        # F-2: the clock is only bound once `register()` has run, so this is
+        # the earliest point `self.clock.timestamp_ns()` is meaningful.
+        self._diag_boot_ns = self.clock.timestamp_ns()
         exit_stack = ExitStack()
         self._latch = exit_stack.enter_context(self._latch_factory())
         self._exit_stack = exit_stack
@@ -1101,6 +1162,7 @@ class ContinuousRungHoldStrategy(Strategy):
     def on_stop(self) -> None:
         self.log.info(self._diagnostics_snapshot_message())
         self.log.info(self._illegal_cell_snapshot_message())
+        self._flush_diagnostics_summary_final()
         for iid in self._facts:
             self.unsubscribe_order_book_depth(InstrumentId.from_str(iid))
         if self._position_monitor is not None:
@@ -1158,6 +1220,155 @@ class ContinuousRungHoldStrategy(Strategy):
     def _illegal_cell_snapshot_message(self) -> str:
         n = len(self._illegal_cell_station_days)
         return f"continuous_rung_hold illegal_cell once-count: {n}"
+
+    def _diagnostics_baseline_snapshot(self) -> dict[str, object]:
+        """F-2: the full set of counters the hourly row's deltas are
+        computed against. A plain dict-of-copies -- `diagnostics`/
+        `refusals` are copied (mutable dicts, snapshotted by value) so a
+        later in-place mutation of `self.diagnostics.counts` can never
+        retroactively change an ALREADY-COMPUTED baseline.
+        """
+        sink = self._diagnostics_summary
+        return {
+            "diagnostics": dict(self.diagnostics.counts),
+            "refusals": dict(self.refusals.counts),
+            "takes": self.takes,
+            "no_takes": self.no_takes,
+            "offer_tape_capped": self.offer_tape.sidecar_capped,
+            "bid_only_in_window": self._bid_only_in_window_frames,
+            "no_out_of_band": self._no_out_of_band_frames,
+            #: Silent-failure review (2026-09-25): the sidecar's OWN health
+            #: mirrored into the NEXT row it (or, if it is itself the thing
+            #: failing, the log line alone) can still deliver -- `0`/`0`
+            #: when there is no sink at all, exactly like every other
+            #: counter here defaults to "nothing happened".
+            "diagnostics_summary_errors": 0 if sink is None else sink.errors,
+            "diagnostics_summary_capped": 0 if sink is None else sink.capped,
+        }
+
+    def _maybe_roll_diagnostics(self, *, now_ns: int) -> None:
+        """F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): event-time hourly
+        rollover. On the FIRST call this process ever makes, only the
+        baseline is captured (no emission -- there is no prior hour to
+        close). On every later call whose bucket has moved FORWARD, the
+        just-closed hour's deltas are emitted and the baseline resets to
+        NOW. A bucket that has not advanced -- including one that appears
+        to move BACKWARD (an out-of-order `on_data` retry re-evaluating an
+        older cached quote) -- is a no-op: the bucket and baseline are
+        never rolled back.
+        """
+        bucket = now_ns // _NS_PER_HOUR
+        if self._diag_hourly_bucket is None:
+            self._diag_hourly_bucket = bucket
+            self._diag_hourly_baseline = self._diagnostics_baseline_snapshot()
+            return
+        if bucket <= self._diag_hourly_bucket:
+            return
+        closed_hour_start_ns = self._diag_hourly_bucket * _NS_PER_HOUR
+        emitted = self._run_observability(
+            "continuous_rung_hold diagnostics-summary rollover failed",
+            lambda: self._emit_diagnostics_row(
+                hour_utc_start_ns=closed_hour_start_ns, final=False,
+            ),
+        )
+        # Silent-failure review (2026-09-25): the bucket (and therefore the
+        # baseline `_emit_diagnostics_row` itself updates) advances ONLY on
+        # a successful emission. A failure leaves both untouched, so the
+        # NEXT tick -- in the SAME new hour -- retries emitting the SAME
+        # closed hour's deltas rather than silently losing that hour's data
+        # the moment a transient fault clears.
+        if emitted:
+            self._diag_hourly_bucket = bucket
+
+    def _emit_diagnostics_row(self, *, hour_utc_start_ns: int, final: bool) -> bool:
+        """F-2 Design: one INFO log line (Output 1) plus one JSONL row
+        (Output 2, schema ``crh_diag_hourly_v1``) per emission -- deltas
+        since the LAST emission for `diagnostics`, `refusals`, `takes`,
+        `no_takes` and `offer_tape.sidecar_capped`, plus the two F-2
+        coordinator counters. Never raises: called only from inside
+        `_run_observability` (the rollover path) or `_flush_diagnostics_
+        summary_final` (also wrapped there). Returns `True` on completion --
+        `_maybe_roll_diagnostics` only advances its bucket once this
+        returns (silent-failure review 2026-09-25): `_run_observability`
+        itself returns `None` on a caught exception, so the caller can tell
+        "emitted" from "raised" without a second flag.
+        """
+        baseline = self._diag_hourly_baseline
+        if baseline is None:
+            baseline = self._diagnostics_baseline_snapshot()
+        current = self._diagnostics_baseline_snapshot()
+        diag_delta = _diagnostics_delta(
+            cast("Mapping[str, int]", baseline["diagnostics"]),
+            cast("Mapping[str, int]", current["diagnostics"]),
+        )
+        refusals_delta = _diagnostics_delta(
+            cast("Mapping[str, int]", baseline["refusals"]),
+            cast("Mapping[str, int]", current["refusals"]),
+        )
+        takes_delta = cast(int, current["takes"]) - cast(int, baseline["takes"])
+        no_takes_delta = cast(int, current["no_takes"]) - cast(int, baseline["no_takes"])
+        tape_capped_delta = cast(int, current["offer_tape_capped"]) - cast(
+            int, baseline["offer_tape_capped"]
+        )
+        bid_only_delta = cast(int, current["bid_only_in_window"]) - cast(
+            int, baseline["bid_only_in_window"]
+        )
+        no_oob_delta = cast(int, current["no_out_of_band"]) - cast(
+            int, baseline["no_out_of_band"]
+        )
+        summary_errors_delta = cast(int, current["diagnostics_summary_errors"]) - cast(
+            int, baseline["diagnostics_summary_errors"]
+        )
+        summary_capped_delta = cast(int, current["diagnostics_summary_capped"]) - cast(
+            int, baseline["diagnostics_summary_capped"]
+        )
+        station = ",".join(self._config.stations)
+        emitted_at_ns = self.clock.timestamp_ns()
+        self.log.info(
+            f"diagnostics_hourly: station={station} hour_utc={hour_utc_start_ns} "
+            f"diag={diag_delta} refusals={refusals_delta} takes=+{takes_delta} "
+            f"no_takes=+{no_takes_delta} tape_capped=+{tape_capped_delta} "
+            f"summary_errors=+{summary_errors_delta} summary_capped=+{summary_capped_delta} "
+            f"build_sha={self._build_sha}"
+        )
+        row: dict[str, object] = {
+            "schema": "crh_diag_hourly_v1",
+            "station": station,
+            "pid": self._diag_pid,
+            "boot_ns": self._diag_boot_ns,
+            "build_sha": self._build_sha,
+            "hour_utc_start_ns": hour_utc_start_ns,
+            "emitted_at_ns": emitted_at_ns,
+            "diagnostics": diag_delta,
+            "refusals": refusals_delta,
+            "takes": takes_delta,
+            "no_takes": no_takes_delta,
+            "offer_tape_capped": tape_capped_delta,
+            "bid_only_in_window": bid_only_delta,
+            "no_out_of_band": no_oob_delta,
+            "diagnostics_summary_errors": summary_errors_delta,
+            "diagnostics_summary_capped": summary_capped_delta,
+            "final": final,
+        }
+        if self._diagnostics_summary is not None:
+            self._diagnostics_summary.append(row)
+        self._diag_hourly_baseline = current
+        return True
+
+    def _flush_diagnostics_summary_final(self) -> None:
+        """F-2 Design: "Emit a `final` row in `on_stop`". No-op if this
+        process never hunted a single tick (no baseline was ever taken) --
+        there is no hour to close. Wrapped in `_run_observability` so a
+        sidecar/log failure at shutdown can never prevent the REST of
+        `on_stop`'s own cleanup (latch/exit-stack) from running.
+        """
+        if self._diag_hourly_bucket is None:
+            return
+        hour_utc_start_ns = self._diag_hourly_bucket * _NS_PER_HOUR
+        self._run_observability(
+            "continuous_rung_hold diagnostics-summary final flush failed",
+            lambda: self._emit_diagnostics_row(hour_utc_start_ns=hour_utc_start_ns, final=True),
+        )
 
     def on_data(self, data: Data) -> None:
         if type(data) is not StationObservation:
@@ -1520,6 +1731,14 @@ class ContinuousRungHoldStrategy(Strategy):
             if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
                 return
             if self._latch.is_intent_open():
+                # Silent-failure review (2026-09-25): this WAIT is silent on
+                # `diagnostics`/`refusals` by design (AC4 above), but it is
+                # still a genuine `open_intent_wait` -- routed through the
+                # SAME F-4 observation `_hunt_tick`'s own check uses, so it
+                # is not invisible to `last_open_intent_wait`/the log line.
+                # Deduped by the SAME per-process state (minute bucket,
+                # intent_id) either check already shares.
+                self._maybe_observe_open_intent_wait(now_ns=now_ns)
                 return
             if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
                 self._hunt_no_only(
@@ -1547,6 +1766,11 @@ class ContinuousRungHoldStrategy(Strategy):
         trigger: Trigger,
         quote_age_ns: int | None,
     ) -> None:
+        # F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): checked FIRST, ahead of
+        # every gate -- pre-decision WAIT diagnostics record BEFORE reaching
+        # a Take/Refuse, so the hourly rollover must see EVERY tick, not
+        # only the ones that reach a decision.
+        self._maybe_roll_diagnostics(now_ns=snapshot.ts_event)
         assert self._latch is not None
         if self._latch.is_family_halted():
             # Slice 4 item B1 (plan rev 6.1): checked FIRST, before any
@@ -1699,6 +1923,10 @@ class ContinuousRungHoldStrategy(Strategy):
                 self.diagnostics_alerter,
                 "continuous_rung_hold diagnostics report failed",
             )
+            # F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): observability ONLY
+            # -- the WAIT outcome above is already decided; this can never
+            # change it, add a refusal/diagnostic key, or affect the gate.
+            self._maybe_observe_open_intent_wait(now_ns=snapshot.ts_event)
             return
 
         now_ns = snapshot.ts_event
@@ -1735,6 +1963,15 @@ class ContinuousRungHoldStrategy(Strategy):
             # so the YES-side counters stay byte-identical. Only the NO
             # leg's own executability (never the YES ask, which does not
             # exist on this frame) gates the NO-only hunt.
+            #
+            # F-2 (coordinator carry-forward, STALL_FOLLOWUPS_F1_F4_2026-09-
+            # 24.md): these two counts are DISTINCT from `diagnostics`/
+            # `refusals` (AC4: no new keys there, no new alerter condition)
+            # -- they exist ONLY in the hourly diagnostics-summary row, so
+            # the halt detector's input is unaffected. Since F-1b landed,
+            # both were invisible: an in-window bid-only frame recorded
+            # nothing at all before this increment.
+            self._bid_only_in_window_frames += 1
             if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
                 self._hunt_no_only(
                     snapshot,
@@ -1746,6 +1983,14 @@ class ContinuousRungHoldStrategy(Strategy):
                     now_ns=now_ns,
                     hour_lst=hour_lst,
                 )
+            else:
+                # The NO leg (`1 - bid`) is ALSO outside the executable
+                # band -- an in-window frame with neither leg executable,
+                # silent and row-less exactly as F-1b AC2 pins, but now
+                # counted here so it stops being invisible to the F-2
+                # digest (never to `diagnostics`/`refusals`/the halt
+                # detector).
+                self._no_out_of_band_frames += 1
             return
         raw_executable = (
             self._config.executable_ask_lower < ask < self._config.executable_ask_upper
@@ -2398,6 +2643,13 @@ class ContinuousRungHoldStrategy(Strategy):
             first_live_order_payload(no_iid, now_ns),
         )
         self._decision_ask_by_station_day[(station, climate_day_key)] = no_decision.limit_price
+        # F-2 (A4): mirrors `self.takes += 1` at the YES tail (:2069) --
+        # counted here, at the SAME point the latch goes IN_FLIGHT for the
+        # NO leg, unconditionally (even under Phase 0/gate-closed, exactly
+        # like `takes`). `HaltDetector.observe(takes=self.takes)` stays
+        # UNCHANGED (no cited rule makes it NO-aware) -- see the dedicated
+        # test.
+        self.no_takes += 1
         self._latch.set_inflight(station, climate_day_key, key_instrument_id=no_iid)
         self._latch.record_attempt(
             station, climate_day_key, ts_ns=now_ns, key_instrument_id=no_iid,
@@ -2681,6 +2933,68 @@ class ContinuousRungHoldStrategy(Strategy):
         """Mirrors ``_emit_startup_evidence_summary`` (:490-501): production
         body is exactly one ``self.log.info`` call -- overridable so a test
         can record calls instead of asserting on captured log output (L-27).
+        """
+        self.log.info(summary)
+
+    def _maybe_observe_open_intent_wait(self, *, now_ns: int) -> None:
+        """F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): reads
+        ``current_open_submit_intent()`` at most once per event-time MINUTE
+        bucket -- contained under :meth:`_run_observability` exactly like
+        every other observability call in this class (``_observe_halt``,
+        ``_report_alerter``), so a store-read failure can never affect the
+        WAIT outcome ``is_intent_open()`` already decided, nor raise into
+        ``_hunt_tick``.
+        """
+        minute_bucket = now_ns // _NS_PER_MINUTE
+        if minute_bucket == self._open_intent_wait_last_minute_bucket:
+            return
+        self._open_intent_wait_last_minute_bucket = minute_bucket
+        self._run_observability(
+            "continuous_rung_hold open-intent-wait observation failed",
+            lambda: self._log_open_intent_wait_if_due(now_ns=now_ns),
+        )
+
+    def _log_open_intent_wait_if_due(self, *, now_ns: int) -> None:
+        """F-4: logs once per NEW ``intent_id``, then at most once per hour
+        while the SAME id persists (``_open_intent_wait_log_state``). Never
+        reads or logs ``SubmitIntent.fingerprint`` (``repr=False`` on that
+        dataclass) -- only ``intent_id`` and the age derived from
+        ``created_ns``.
+        """
+        assert self._latch is not None
+        intent = self._latch.current_open_submit_intent()
+        if intent is None:
+            # The singleton cleared between `is_intent_open()`'s read and
+            # this one (a genuine, if narrow, race) -- nothing to log.
+            return
+        state = self._open_intent_wait_log_state
+        if (
+            state is not None
+            and state[0] == intent.intent_id
+            and now_ns - state[1] < _NS_PER_HOUR
+        ):
+            return
+        self._open_intent_wait_log_state = (intent.intent_id, now_ns)
+        station = ",".join(self._config.stations)
+        age_s = (now_ns - intent.created_ns) / _NS_PER_SECOND
+        self._record_open_intent_wait(
+            f"open_intent_wait: station={station} intent_id={intent.intent_id} "
+            f"age_s={age_s}"
+        )
+
+    def _record_open_intent_wait(self, summary: str) -> None:
+        """Mirrors ``_record_rearm_decision`` -- stores the ONE summary line
+        on ``self.last_open_intent_wait`` (asserted by presence, L-27) and
+        emits it via the overridable seam below. Stable grep token
+        ``open_intent_wait:``.
+        """
+        self.last_open_intent_wait = summary
+        self._emit_open_intent_wait(summary)
+
+    def _emit_open_intent_wait(self, summary: str) -> None:
+        """Mirrors ``_emit_rearm_decision``: production body is exactly one
+        ``self.log.info`` call -- overridable so a test can record calls
+        instead of asserting on captured log output (L-27).
         """
         self.log.info(summary)
 

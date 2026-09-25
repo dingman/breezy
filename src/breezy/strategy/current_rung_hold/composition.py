@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -38,6 +39,7 @@ from breezy.domain.weather_bucket_facts import (
     WeatherFactsUnavailableError,
     read_weather_bucket_facts,
 )
+from breezy.runtime.build_sha import resolve_build_revision
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
 from breezy.runtime.health import AlertPayload, AlertState, emit_alert, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit
@@ -48,6 +50,7 @@ from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
     Phase0PermitForbiddenError,
 )
+from breezy.strategy.current_rung_hold.diagnostics_summary import DiagnosticsSummarySink
 from breezy.strategy.current_rung_hold.exit_decider import decide_exit
 from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer
 from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
@@ -544,6 +547,16 @@ def build_current_rung_hold_strategies(
     return tuple(strategies)
 
 
+def _decisions_dir(catalog_root: Path) -> Path:
+    """F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): the ONE `decisions/`
+    directory `_default_offer_tape_path` and `_default_diagnostics_summary_
+    path` both resolve under -- a sibling of the quote-tape catalog root,
+    never nested under it, exactly as `_default_offer_tape_path` already
+    resolved it inline before this extraction (pure DRY, no path change).
+    """
+    return catalog_root.parent / _DECISIONS_DIRNAME
+
+
 def _default_offer_tape_path(catalog_root: Path, today_by_station: Mapping[str, dt.date]) -> Path:
     """GAP fix 2026-09-15: the live default JSONL sidecar for the shared
     `OfferTape` -- a sibling of the quote-tape catalog root (never nested
@@ -556,7 +569,19 @@ def _default_offer_tape_path(catalog_root: Path, today_by_station: Mapping[str, 
     hold_strategies` already requires at least one resolved station above.
     """
     day = min(today_by_station.values())
-    return catalog_root.parent / _DECISIONS_DIRNAME / f"offer_tape_{day.isoformat()}.jsonl"
+    return _decisions_dir(catalog_root) / f"offer_tape_{day.isoformat()}.jsonl"
+
+
+def _default_diagnostics_summary_path(
+    catalog_root: Path, today_by_station: Mapping[str, dt.date]
+) -> Path:
+    """F-2: the live default JSONL sidecar for the shared
+    `DiagnosticsSummarySink` -- same `decisions/` directory and the SAME
+    boot-day naming convention as `_default_offer_tape_path`, so both
+    sidecars rotate together at the next daily boot.
+    """
+    day = min(today_by_station.values())
+    return _decisions_dir(catalog_root) / f"diagnostics_summary_{day.isoformat()}.jsonl"
 
 
 def build_continuous_rung_hold_strategies(
@@ -566,6 +591,7 @@ def build_continuous_rung_hold_strategies(
     trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]],
     order_submission_permit: OrderSubmissionPermit | None = None,
     offer_tape_path: Path | None = None,
+    diagnostics_summary_path: Path | None = None,
     phase0_permit_guard: bool = True,
     enable_position_monitor: bool = True,
     exit_manifest: FamilyManifest | None = None,
@@ -636,6 +662,19 @@ def build_continuous_rung_hold_strategies(
         else _default_offer_tape_path(catalog_root, today_by_station)
     )
     tape = OfferTape(resolved_offer_tape_path)
+    # F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): ONE shared
+    # `DiagnosticsSummarySink`, mirroring the shared `OfferTape` above --
+    # same `decisions/` directory, same boot-day rotation. `build_sha` is
+    # resolved ONCE here (never per-station) via `resolve_build_revision`
+    # (Rev 3.1 R8) -- the SAME identity `trade_supervisor`'s own
+    # `supervisor_started.revision` resolves for this process tree.
+    resolved_diagnostics_summary_path = (
+        diagnostics_summary_path
+        if diagnostics_summary_path is not None
+        else _default_diagnostics_summary_path(catalog_root, today_by_station)
+    )
+    diagnostics_summary = DiagnosticsSummarySink(resolved_diagnostics_summary_path)
+    build_sha = resolve_build_revision(os.environ)
     #: Sibling of the quote-tape catalog root (NEVER nested under it) --
     #: `catalog_root` here is `resolve_station_instrument_ids`'s own quote
     #: -tape root, so `monitor_root` is a directory beside it, one level up.
@@ -670,6 +709,8 @@ def build_continuous_rung_hold_strategies(
             order_submission_permit=order_submission_permit,
             offer_tape=tape,
             phase0_permit_guard=phase0_permit_guard,
+            diagnostics_summary=diagnostics_summary,
+            build_sha=build_sha,
         )
         if enable_position_monitor:
             # Attribute assignment, not a constructor kwarg: the monitor's

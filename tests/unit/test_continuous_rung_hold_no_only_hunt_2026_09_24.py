@@ -1001,6 +1001,34 @@ def test_consumed_unfilled_with_open_ambiguous_intent_is_silent(
     assert strategy.offer_tape.records() == ()
 
 
+def test_consumed_unfilled_with_open_intent_observes_open_intent_wait(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Silent-failure review (2026-09-25): the consumed-YES/non-fill/OPEN-
+    intent path above is silent on `diagnostics`/`refusals` BY DESIGN (AC4),
+    but it must not be silent on F-4's own observation -- routed through
+    the SAME `_maybe_observe_open_intent_wait` `_hunt_tick`'s own
+    `is_intent_open()` check uses, so `last_open_intent_wait` is set here
+    too, never only on the direct-hunt path."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="not_executable")
+    assert strategy._latch is not None
+    intent_latch = strategy._latch._intent_latch
+    assert intent_latch is not None
+    intent_latch.arm("a" * 64, now_ns=WINDOW_OPEN_NS)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+    assert strategy.last_open_intent_wait is not None
+    assert "intent_id=" in strategy.last_open_intent_wait
+    assert "fingerprint" not in strategy.last_open_intent_wait
+
+
 def test_yes_inflight_skips_no(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:

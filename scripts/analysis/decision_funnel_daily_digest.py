@@ -44,10 +44,10 @@ import os
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import (
@@ -85,6 +85,17 @@ _DEFAULT_OUTPUT_DIR = Path.home() / ".local/share/breezy/derived/decision_funnel
 _HALT_BUSY_TIMEOUT_SECONDS: float = 2.0
 
 _SELECT_HALT_SQL = "SELECT value FROM state WHERE key = ?"
+
+#: Silent-failure review (2026-09-25): the plan does not name a number for
+#: THIS specific staleness check (distinct from F-2's own hourly rollover
+#: cadence) -- 2h is a stated, reviewable default: long enough to tolerate
+#: one missed rollover (a data stall shorter than a full hour bucket)
+#: without a false positive, short enough that a genuinely silent sidecar
+#: is flagged well before a human would otherwise notice. `_maybe_roll_
+#: diagnostics` keeps the node's hot path untouched -- this is a delivery-
+#: side check, computed here, never on the strategy's own tick.
+_PRE_TAPE_STALE_HOURS: Final[int] = 2
+_NS_PER_HOUR: Final[int] = 3_600_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +205,37 @@ class FunnelReport:
     coverage_min_observed_at_ns: int | None
     coverage_max_observed_at_ns: int | None
     entry_reasons: tuple[tuple[str, int], ...]
+    #: F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): per-station SUMS of the
+    #: day's hourly `diagnostics` deltas, read from the diagnostics-summary
+    #: sidecar (F-2's own artefact) -- `{}` when that sidecar is absent or
+    #: unreadable. Populated by `main` via `replace`, never by `funnel_for_
+    #: day` itself (that function reads only the offer-tape rows).
+    pre_tape_by_station: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: Coordinator carry-forward (2026-09-25 code review, R-c): per-station
+    #: SUMS of the day's `bid_only_in_window`/`no_out_of_band` deltas --
+    #: distinct fields, never folded into `pre_tape_by_station`'s reason
+    #: breakdown (that dict mirrors `diagnostics`, which these two counters
+    #: are deliberately NOT part of -- AC4).
+    bid_only_in_window_by_station: dict[str, int] = field(default_factory=dict)
+    no_out_of_band_by_station: dict[str, int] = field(default_factory=dict)
+    #: Rev 3.1 R8: the day's DISTINCT `build_sha` values, copied verbatim
+    #: from the diagnostics-summary rows -- sorted, and never dropping an
+    #: "absent" (row predates this field) or `"unknown"` (the node could not
+    #: resolve one) entry silently.
+    no_regime_sha: tuple[str, ...] = field(default_factory=tuple)
+    #: Silent-failure review (2026-09-25): tri-state read outcome for the
+    #: diagnostics-summary sidecar itself -- "ok" (read, however sparse),
+    #: "missing" (no file), "corrupt" (present but unreadable/malformed).
+    #: Every OTHER pre-tape field above is trustworthy only when this is
+    #: "ok". Defaults to "ok" for `funnel_for_day`'s own construction (which
+    #: never reads the sidecar at all) and for any pre-existing direct
+    #: `FunnelReport(...)` construction in tests.
+    pre_tape_status: Literal["ok", "missing", "corrupt"] = "ok"
+    #: True when at least one station's newest diagnostics-summary row is
+    #: older than `_PRE_TAPE_STALE_HOURS` relative to the digest's own run
+    #: time -- a live sidecar that has gone silent (a real data stall, not
+    #: a missing/corrupt file, which `pre_tape_status` already covers).
+    pre_tape_stale: bool = False
 
 
 def default_climate_day(now: dt.datetime) -> dt.date:
@@ -206,6 +248,14 @@ def default_climate_day(now: dt.datetime) -> dt.date:
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     return now.astimezone(dt.UTC).date() - dt.timedelta(days=1)
+
+
+def _now_ns() -> int:
+    """The digest's own run time, in ns -- used only for the pre-tape
+    staleness check (`_pre_tape_is_stale`). A thin, monkeypatchable seam
+    (mirrors how `main` itself is exercised in tests) rather than a bare
+    inline `dt.datetime.now` call."""
+    return int(dt.datetime.now(dt.UTC).timestamp() * 1_000_000_000)
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -302,6 +352,40 @@ def funnel_for_day(
     )
 
 
+def _stall_token(station: str, pre_tape_by_station: Mapping[str, Mapping[str, int]]) -> str:
+    """F-2 AC6: ``STATION(top_reason:count)`` when the diagnostics-summary
+    sidecar has pre-tape counts for ``station``, else the plain station
+    name (byte-identical to before this field existed -- the missing/empty
+    case)."""
+    counts = pre_tape_by_station.get(station)
+    if not counts:
+        return station
+    top_reason, top_count = max(counts.items(), key=lambda item: item[1])
+    return f"{station}({top_reason}:{top_count})"
+
+
+def _stationed_counts_token(label: str, counts_by_station: Mapping[str, int]) -> str | None:
+    """R-c: a single ``label=STATION:count,STATION:count`` token, sorted by
+    station name for determinism. ``None`` when there is nothing to report
+    -- the caller omits the token entirely rather than rendering
+    ``label=``."""
+    if not counts_by_station:
+        return None
+    pairs = ",".join(f"{station}:{count}" for station, count in sorted(counts_by_station.items()))
+    return f"{label}={pairs}"
+
+
+def _pre_tape_status_token(report: FunnelReport) -> str | None:
+    """Silent-failure review: a MISSING or CORRUPT diagnostics-summary
+    sidecar is surfaced explicitly -- ``None`` (nothing rendered) only for
+    the "ok" status, so the common case stays lean."""
+    if report.pre_tape_status == "missing":
+        return "pre_tape=missing"
+    if report.pre_tape_status == "corrupt":
+        return "pre_tape=unreadable"
+    return None
+
+
 def format_digest_detail(
     report: FunnelReport,
     *,
@@ -312,45 +396,77 @@ def format_digest_detail(
     """One alert line. Shadow is labelled as outside the orders funnel.
 
     Stays within ``MAX_ALERT_DETAIL_CHARS`` by dropping fields in priority
-    order, most-expendable first: the halt-unknown free-text ``reason``
-    (unbounded length, diagnostic only), then the ``why=`` reason tally,
-    then finally falling back to the short form. ``halt=<value>`` itself
-    (when ``halt`` is given at all) is never dropped -- it is one of three
-    fixed short tokens. ``halt`` is ``None`` only for callers that predate
-    AUD-03's follow-up and omit the field entirely (back-compat). Never
-    relies on ``AlertPayload`` truncation, which would cut a token in half.
+    order, most-expendable first: the F-2/R-c/silent-failure-review
+    enrichments (the ``stall=STATION(reason:count)`` form, the ``bid_only=``/
+    ``no_oob=`` per-station tallies, and the ``pre_tape=``/``pre_tape_
+    stale=1`` sidecar-health tokens), then the halt-unknown free-text
+    ``reason`` (unbounded length, diagnostic only), then the ``why=`` reason
+    tally, then finally falling back to the short form. ``halt=<value>``
+    itself (when ``halt`` is given at all) is never dropped -- it is one of
+    three fixed short tokens. ``halt`` is ``None`` only for callers that
+    predate AUD-03's follow-up and omit the field entirely (back-compat).
+    Never relies on ``AlertPayload`` truncation, which would cut a token in
+    half.
     """
     totals = report.totals
-    stall = ",".join(report.stalled_stations) if report.stalled_stations else "-"
     if report.coverage_min_observed_at_ns is None or report.coverage_max_observed_at_ns is None:
         coverage = "absent"
     else:
         coverage = f"{report.coverage_min_observed_at_ns}-{report.coverage_max_observed_at_ns}"
-    base = (
-        f"day={climate_day} e={totals.decisions_emitted} r={totals.rung_resolved} "
-        f"c={totals.cell_legal} p={totals.reached_price} m={totals.margin_positive} "
-        f"o={totals.orders} shadow={report.shadow_count}(not-orders) "
-        f"xf={report.exit_fired} xr={report.exit_refused} stall={stall} cov={coverage}"
-    )
-    if halt is not None:
-        base = f"{base} halt={halt.value}"
-    if capped_total > 0:
-        base = f"{base} truncated=1"
     halt_reason = f"halt_reason={halt.reason}" if halt is not None and halt.reason else None
     why = ",".join(f"{name}:{count}" for name, count in report.entry_reasons)
 
-    # Richest to leanest: base+halt, +halt_reason, +why -- drop halt_reason
-    # first, then why, landing on `base` (which always carries halt=<value>
-    # once `halt` is given), then the short fallback below.
-    with_reason = f"{base} {halt_reason}" if halt_reason else base
-    candidate = f"{with_reason} why={why}" if why else with_reason
-    if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
-        return candidate
-    candidate = f"{base} why={why}" if why else base
-    if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
-        return candidate
-    if len(base) <= MAX_ALERT_DETAIL_CHARS:
-        return base
+    def _base(stall: str, *, include_extra: bool) -> str:
+        rendered = (
+            f"day={climate_day} e={totals.decisions_emitted} r={totals.rung_resolved} "
+            f"c={totals.cell_legal} p={totals.reached_price} m={totals.margin_positive} "
+            f"o={totals.orders} shadow={report.shadow_count}(not-orders) "
+            f"xf={report.exit_fired} xr={report.exit_refused} stall={stall} cov={coverage}"
+        )
+        if halt is not None:
+            rendered = f"{rendered} halt={halt.value}"
+        if capped_total > 0:
+            rendered = f"{rendered} truncated=1"
+        if include_extra:
+            for token in (
+                _stationed_counts_token("bid_only", report.bid_only_in_window_by_station),
+                _stationed_counts_token("no_oob", report.no_out_of_band_by_station),
+                _pre_tape_status_token(report),
+                "pre_tape_stale=1" if report.pre_tape_stale else None,
+            ):
+                if token:
+                    rendered = f"{rendered} {token}"
+        return rendered
+
+    if report.stalled_stations:
+        enriched_stall = ",".join(
+            _stall_token(station, report.pre_tape_by_station) for station in report.stalled_stations
+        )
+        plain_stall = ",".join(report.stalled_stations)
+    else:
+        enriched_stall = plain_stall = "-"
+
+    # The enrichments are the FIRST thing dropped, in this order: extra
+    # tokens (bid_only/no_oob/pre_tape*) go before the enriched stall form,
+    # each tried richest to leanest at EVERY tier (halt_reason+why, why-
+    # only, base alone) before the next, leanest tier is tried.
+    for stall, include_extra in (
+        (enriched_stall, True),
+        (enriched_stall, False),
+        (plain_stall, True),
+        (plain_stall, False),
+    ):
+        base = _base(stall, include_extra=include_extra)
+        with_reason = f"{base} {halt_reason}" if halt_reason else base
+        candidate = f"{with_reason} why={why}" if why else with_reason
+        if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
+            return candidate
+        candidate = f"{base} why={why}" if why else base
+        if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
+            return candidate
+        if len(base) <= MAX_ALERT_DETAIL_CHARS:
+            return base
+
     short = (
         f"day={climate_day} e={totals.decisions_emitted} r={totals.rung_resolved} "
         f"c={totals.cell_legal} p={totals.reached_price} m={totals.margin_positive} "
@@ -402,37 +518,135 @@ def _resolve_readable_path(path: Path) -> Path:
     return path
 
 
-def _capped_total_from_summary(tape_path: Path, climate_day: str) -> int:
-    """F-3 AC3: sum `offer_tape_capped` across the day's diagnostics-summary
-    sidecar (F-2's own artefact, `diagnostics_summary_<day>.jsonl[.gz]`,
-    Design line 588) -- read-only and best-effort, exactly like
-    :func:`read_family_halt_status`: F-2 has not landed on this branch yet
-    (Sequencing places F-3 first), so the summary file is commonly absent,
-    and any read/decode failure here must never fail the main offer-tape
-    funnel. Returns 0 when absent, unreadable, or every row's `offer_tape_
-    capped` is 0/absent -- never raises.
+@dataclass(frozen=True, slots=True)
+class _DiagnosticsSummaryTotals:
+    #: Silent-failure review (2026-09-25): tri-state -- "missing" (no file
+    #: at all), "corrupt" (present but the read raised), "ok" (read to
+    #: completion, however sparse). Every field below is meaningful only
+    #: when this is "ok".
+    status: Literal["ok", "missing", "corrupt"]
+    capped_total: int
+    pre_tape_by_station: dict[str, dict[str, int]]
+    #: R-c (2026-09-25 code review): per-station sums, distinct fields.
+    bid_only_in_window_by_station: dict[str, int]
+    no_out_of_band_by_station: dict[str, int]
+    #: Rev 3.1 R8: sorted distinct `build_sha` values seen across the day's
+    #: rows. `"absent"` stands in for a row with no `build_sha` field at all
+    #: (a pre-R8 schema) -- never silently dropped.
+    no_regime_sha: tuple[str, ...]
+    #: Silent-failure review: the newest `emitted_at_ns` seen per station,
+    #: for the staleness check below. Only populated when `status == "ok"`.
+    newest_row_ns_by_station: dict[str, int]
+
+
+_EMPTY_DIAGNOSTICS_SUMMARY_TOTALS_KWARGS: Mapping[str, object] = {
+    "capped_total": 0,
+    "pre_tape_by_station": {},
+    "bid_only_in_window_by_station": {},
+    "no_out_of_band_by_station": {},
+    "no_regime_sha": (),
+    "newest_row_ns_by_station": {},
+}
+
+
+def _read_diagnostics_summary_totals(
+    tape_path: Path, climate_day: str
+) -> _DiagnosticsSummaryTotals:
+    """F-3 AC3 + F-2 AC6 + R-c + R8 + silent-failure review, ONE pass over
+    the diagnostics-summary sidecar (F-2's own artefact, `diagnostics_
+    summary_<day>.jsonl[.gz]`) -- `offer_tape_capped`, per-station
+    `diagnostics`/`bid_only_in_window`/`no_out_of_band` sums, the day's
+    distinct `build_sha` values, and the newest row timestamp per station.
+    Read-only and best-effort, exactly like :func:`read_family_halt_status`:
+    any read/decode failure here must never fail the main offer-tape funnel,
+    and reading the file only ONCE (rather than once per field) means a
+    corrupt sidecar logs exactly one WARNING, not one per caller. Returns a
+    tri-state `status` -- never silently collapses "missing" and "corrupt"
+    into the same all-empty shape the way the pre-review version did.
     """
     candidate = tape_path.parent / f"diagnostics_summary_{climate_day}.jsonl"
     summary_path = _resolve_readable_path(candidate)
     if not summary_path.is_file():
-        return 0
-    total = 0
+        return _DiagnosticsSummaryTotals(
+            status="missing", **_EMPTY_DIAGNOSTICS_SUMMARY_TOTALS_KWARGS,  # type: ignore[arg-type]
+        )
+    capped_total = 0
+    per_station: dict[str, Counter[str]] = {}
+    bid_only_by_station: dict[str, int] = {}
+    no_oob_by_station: dict[str, int] = {}
+    build_shas: set[str] = set()
+    newest_by_station: dict[str, int] = {}
     try:
         for row in _iter_jsonl(summary_path):
             value = row.get("offer_tape_capped")
             if isinstance(value, int) and not isinstance(value, bool):
-                total += value
+                capped_total += value
+            station = row.get("station")
+            diagnostics = row.get("diagnostics")
+            if isinstance(station, str) and isinstance(diagnostics, dict):
+                bucket = per_station.setdefault(station, Counter())
+                for key, count in diagnostics.items():
+                    if isinstance(count, int) and not isinstance(count, bool):
+                        bucket[key] += count
+            if isinstance(station, str):
+                bid_only_value = row.get("bid_only_in_window")
+                if isinstance(bid_only_value, int) and not isinstance(bid_only_value, bool):
+                    bid_only_by_station[station] = (
+                        bid_only_by_station.get(station, 0) + bid_only_value
+                    )
+                no_oob_value = row.get("no_out_of_band")
+                if isinstance(no_oob_value, int) and not isinstance(no_oob_value, bool):
+                    no_oob_by_station[station] = no_oob_by_station.get(station, 0) + no_oob_value
+                emitted_at = row.get("emitted_at_ns")
+                if isinstance(emitted_at, int) and not isinstance(emitted_at, bool):
+                    newest_by_station[station] = max(
+                        newest_by_station.get(station, emitted_at), emitted_at
+                    )
+            build_sha_value = row.get("build_sha")
+            build_shas.add(
+                build_sha_value if isinstance(build_sha_value, str) and build_sha_value
+                else "absent"
+            )
     except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
         logger.warning(
             "decision_funnel_daily_digest: diagnostics-summary sidecar %s is "
-            "corrupt or unreadable (%s: %s); truncated stays unreported for %s",
+            "corrupt or unreadable (%s: %s); pre-tape fields stay unreported for %s",
             summary_path,
             type(exc).__name__,
             exc,
             climate_day,
         )
-        return 0
-    return total
+        return _DiagnosticsSummaryTotals(
+            status="corrupt", **_EMPTY_DIAGNOSTICS_SUMMARY_TOTALS_KWARGS,  # type: ignore[arg-type]
+        )
+    return _DiagnosticsSummaryTotals(
+        status="ok",
+        capped_total=capped_total,
+        pre_tape_by_station={station: dict(counter) for station, counter in per_station.items()},
+        bid_only_in_window_by_station=bid_only_by_station,
+        no_out_of_band_by_station=no_oob_by_station,
+        no_regime_sha=tuple(sorted(build_shas)),
+        newest_row_ns_by_station=newest_by_station,
+    )
+
+
+def _pre_tape_is_stale(
+    newest_row_ns_by_station: Mapping[str, int],
+    *,
+    now_ns: int,
+    stale_after_hours: int = _PRE_TAPE_STALE_HOURS,
+) -> bool:
+    """Silent-failure review: `True` when at least one station's newest
+    diagnostics-summary row is older than `stale_after_hours` relative to
+    `now_ns` (the digest's own run time) -- a live sidecar that has gone
+    silent, distinct from a missing/corrupt file (`_DiagnosticsSummaryTotals
+    .status` already covers those). A station with no row at all is not
+    judged here -- callers only call this when `status == "ok"`.
+    """
+    threshold_ns = stale_after_hours * _NS_PER_HOUR
+    return any(
+        now_ns - newest > threshold_ns for newest in newest_row_ns_by_station.values()
+    )
 
 
 def _artefact(
@@ -468,6 +682,35 @@ def _artefact(
         artefact["halt_reason"] = halt.reason
     if capped_total > 0:
         artefact["truncated"] = 1
+    # F-2 AC6: stalled stations get their pre-tape counts in the artefact --
+    # never for a station that is NOT stalled, and never at all when the
+    # sidecar is absent (an empty `pre_tape_by_station` produces an empty
+    # dict here too, so the key is simply omitted, byte-identical to before
+    # this field existed).
+    stalled_pre_tape = {
+        station: counts
+        for station, counts in report.pre_tape_by_station.items()
+        if station in report.stalled_stations
+    }
+    if stalled_pre_tape:
+        artefact["pre_tape_by_station"] = stalled_pre_tape
+    # R-c (2026-09-25 code review): distinct per-station fields, UNGATED by
+    # stall status (a station can be fully active AND still show bid-only/
+    # NO-out-of-band frames) -- never folded into `pre_tape_by_station`.
+    if report.bid_only_in_window_by_station:
+        artefact["bid_only_in_window_by_station"] = dict(report.bid_only_in_window_by_station)
+    if report.no_out_of_band_by_station:
+        artefact["no_out_of_band_by_station"] = dict(report.no_out_of_band_by_station)
+    # Rev 3.1 R8: always present when there is at least one row to report a
+    # SHA for -- never dropped for "absent"/"unknown" entries.
+    if report.no_regime_sha:
+        artefact["no_regime_sha"] = list(report.no_regime_sha)
+    # Silent-failure review: the tri-state sidecar-read outcome is ALWAYS
+    # present -- "ok" is itself meaningful (never a silently-collapsed
+    # "missing"/"corrupt").
+    artefact["pre_tape_status"] = report.pre_tape_status
+    if report.pre_tape_stale:
+        artefact["pre_tape_stale"] = 1
     return artefact
 
 
@@ -564,7 +807,20 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         _emit(sink, detail=f"decision tape unreadable for {climate_day}")
         return 1
     halt = _resolve_halt_status(args, source_env)
-    capped_total = _capped_total_from_summary(tape, climate_day)
+    summary_totals = _read_diagnostics_summary_totals(tape, climate_day)
+    capped_total = summary_totals.capped_total
+    is_stale = summary_totals.status == "ok" and _pre_tape_is_stale(
+        summary_totals.newest_row_ns_by_station, now_ns=_now_ns()
+    )
+    report = replace(
+        report,
+        pre_tape_by_station=summary_totals.pre_tape_by_station,
+        bid_only_in_window_by_station=summary_totals.bid_only_in_window_by_station,
+        no_out_of_band_by_station=summary_totals.no_out_of_band_by_station,
+        no_regime_sha=summary_totals.no_regime_sha,
+        pre_tape_status=summary_totals.status,
+        pre_tape_stale=is_stale,
+    )
     _emit(
         sink,
         detail=format_digest_detail(

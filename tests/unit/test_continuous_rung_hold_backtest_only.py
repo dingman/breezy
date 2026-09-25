@@ -173,6 +173,28 @@ def _register_backtest_and_start(
     return strategy
 
 
+def test_backtest_only_forwards_diagnostics_summary_and_build_sha(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R9 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, F-2): both new kwargs reach
+    the parent's own fields unchanged -- this subclass adds no new
+    behaviour of its own around them, only forwards."""
+    from breezy.strategy.current_rung_hold.diagnostics_summary import DiagnosticsSummarySink
+
+    sink = DiagnosticsSummarySink(None)
+    cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,))
+
+    strategy = ContinuousRungHoldBacktestStrategy(
+        cfg,
+        trial_day_latch_factory=_cont_latch_factory(store_path),
+        diagnostics_summary=sink,
+        build_sha="deadbeef0001",
+    )
+
+    assert strategy._diagnostics_summary is sink
+    assert strategy._build_sha == "deadbeef0001"
+
+
 # ---------------------------------------------------------------------------
 # B-1: the AST exact-set method pin (L-12 widen-never-relax)
 # ---------------------------------------------------------------------------
