@@ -352,6 +352,12 @@ class FeeDriftProbeActor(Actor):
             self.counters["unknown"] += 1
             return "UNKNOWN"
         if wire_fee == self._documented:
+            # A flap is news: an AGREE means the drift this dedupe state was
+            # tracking is OVER, so a LATER mismatch -- even the SAME wire
+            # value -- is a new event, not a continuation, and must re-alert
+            # immediately rather than being swallowed by the old window.
+            self._last_mismatch_wire_fee = None
+            self._last_mismatch_alert_ts_ns = None
             self.counters["agree"] += 1
             return "AGREE"
         self._dedupe_and_alert_mismatch(wire_fee)

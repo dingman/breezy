@@ -274,6 +274,49 @@ async def test_the_same_wire_value_after_24h_emits_one_persisting_reminder_then_
     assert len(mismatches) == 1, "only the first sighting of this wire value is a mismatch event"
 
 
+@pytest.mark.asyncio
+async def test_an_agree_resets_the_mismatch_dedupe_so_a_flap_realerts() -> None:
+    """A flap is news (coordinator ruling on the 1907e68 review): an AGREE
+    between two DISAGREEs for the SAME wire value means the drift ended and
+    came back -- a new event, not a continuation -- so it must re-alert
+    immediately, never stay suppressed by the pre-flap window."""
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    first = await actor.probe_once()
+    actor._wire_fee_fetcher = _agreeing_fetcher()
+    middle = await actor.probe_once()
+    actor._wire_fee_fetcher = _disagreeing_fetcher("0.0695")
+    last = await actor.probe_once()
+
+    assert (first, middle, last) == ("DISAGREE", "AGREE", "DISAGREE")
+    assert setter.calls == 2, "the halt-set stays unconditional on every DISAGREE"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 2, "the AGREE must reset the dedupe so the flap re-alerts"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_never_resets_the_mismatch_dedupe() -> None:
+    """UNKNOWN is a read failure, not a resolution -- it must leave the
+    dedupe state untouched, so a DISAGREE either side of it for the SAME
+    wire value stays suppressed."""
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    first = await actor.probe_once()
+    actor._wire_fee_fetcher = _raising_fetcher(WireFeeCoefficientError("no feeCoefficient field"))
+    middle = await actor.probe_once()
+    actor._wire_fee_fetcher = _disagreeing_fetcher("0.0695")
+    last = await actor.probe_once()
+
+    assert (first, middle, last) == ("DISAGREE", "UNKNOWN", "DISAGREE")
+    assert setter.calls == 2, "the halt-set stays unconditional on every DISAGREE"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 1, "an UNKNOWN must never reset the mismatch dedupe"
+
+
 # ---------------------------------------------------------------------------
 # fetch_wire_fee_coefficient: the unauthenticated gateway path, and failure shapes
 # ---------------------------------------------------------------------------

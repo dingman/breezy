@@ -40,6 +40,11 @@ Deduped per distinct wire value, per process:
 - A new distinct wire value always alerts immediately regardless of any
   prior value's suppression window.
 - `UNKNOWN` outcomes are unchanged: still alerted, still never halt.
+- A flap is news (coordinator ruling, review of `1907e68`): an `AGREE` resets
+  the mismatch dedupe state, so a LATER `DISAGREE` for the SAME wire value
+  is treated as a new event and re-alerts immediately, never suppressed by
+  the pre-flap window; an `UNKNOWN` is a read failure, not a resolution, and
+  leaves the dedupe state untouched.
 
 ## Halt
 
