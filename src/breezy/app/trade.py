@@ -14,18 +14,29 @@ opens its own latch.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from decimal import Decimal
 from pathlib import Path
-from typing import Final, TextIO
+from typing import Any, Final, TextIO
 
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.trading.strategy import Strategy
 
-from breezy.adapters.polymarket_us.factories import exec_config_from_env
+from breezy.adapters.polymarket_us.factories import (
+    POLYMARKET_US_CLIENT_NAME,
+    exec_config_from_env,
+    shared_polymarket_us_http_client,
+)
+from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
+from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
+from breezy.adapters.polymarket_us.transport import QUOTA_KEY_DISCOVERY
 from breezy.domain.climate_day import climate_day_for_instant
 from breezy.persistence.family_manifest import (
     FamilyManifest,
@@ -59,8 +70,14 @@ from breezy.strategy.current_rung_hold.composition import (
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 from breezy.strategy.current_rung_hold.continuous_strategy import Phase0PermitForbiddenError
+from breezy.strategy.current_rung_hold.fee_drift_probe import (
+    FeeDriftProbeActor,
+    WireFeeCoefficientError,
+    fetch_wire_fee_coefficient,
+)
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
+    TrialDayLatch,
     open_trial_day_latch,
 )
 
@@ -193,6 +210,143 @@ def _today_by_station(stations: Sequence[str]) -> dict[str, dt.date]:
     }
 
 
+#: AUD-12b: the family-halt reason ``FeeDriftProbeActor`` records via
+#: ``TrialDayLatch.record_policy_halt`` on a confirmed DISAGREE. A closed,
+#: fixed string -- never a value derived from the observed drift, which
+#: goes in ``evidence_sha256`` instead (hashed, per ``AlertPayload``'s own
+#: "never a raw upstream value" convention).
+_FEE_DRIFT_HALT_REASON: Final[str] = "fee_schedule_drift"
+
+
+def _representative_fee_drift_slug(strategies: Sequence[Strategy]) -> str | None:
+    """The one representative slug AUD-12b's probe checks (§6 item 3: a
+    single-slug design, evidence-justified in ``fee_drift_probe.py``'s own
+    module docstring).
+
+    Derived from the SAME ``today_by_station``-driven instrument resolution
+    ``build_continuous_rung_hold_strategies`` already performed for
+    ``strategies`` -- ``strategy.config.instrument_ids`` (the SAME public
+    accessor ``strike_ladder.py`` already uses), never a second catalog
+    read. The first composed strategy that resolved at least one instrument
+    wins; ``None`` only when every station resolved zero, which
+    ``build_continuous_rung_hold_strategies`` already refuses earlier for
+    the all-zero case -- this is a defensive fallback, not the expected path.
+    """
+    for strategy in strategies:
+        instrument_ids = getattr(strategy.config, "instrument_ids", ())
+        if instrument_ids:
+            return instrument_id_to_slug(instrument_ids[0])
+    return None
+
+
+def _build_fee_drift_probe(
+    *,
+    strategies: Sequence[Strategy],
+    family_halt_latch: TrialDayLatch,
+) -> tuple[FeeDriftProbeActor, Callable[[Any], None]] | None:
+    """Build AUD-12b's fee-drift probe for ``continuous_rung_hold`` only.
+
+    Returns ``None`` (no probe registered) when no composed strategy
+    resolved any tradable instrument -- logged, never a crashed boot.
+
+    Every collaborator is the SAME object another already-wired seam uses:
+
+    * ``set_family_halted`` calls ``family_halt_latch.record_policy_halt`` --
+      the EXACT ``TrialDayLatch`` handle this branch already opened for
+      ``family_halt_submit_veto``'s READ side (``open_trial_day_latch(latch,
+      key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)``), never a second open. It can
+      only SET the halt (``record_policy_halt``'s own idempotent, additive
+      write -- see its docstring); nothing here can clear one.
+    * ``wire_fee_fetcher`` reads a ``PolymarketUSHttpClient`` resolved lazily,
+      post-``build()``, via the returned ``resolve_client`` callback (bound
+      into ``after_build`` by the caller) -- ``shared_polymarket_us_http_client``
+      (``factories.py:516``) on the SAME ``PolymarketUSDataClientConfig`` and
+      the SAME ``node.kernel.clock`` the live data client itself was built
+      with (``live/node_builder.py:184``, ``clock=self._clock``), so this
+      reuses the ONE cached transport/rate-limiter rather than opening a
+      second one. Before ``resolve_client`` has run (or if no data client is
+      found), the fetcher raises :class:`WireFeeCoefficientError` --
+      ``probe_once()`` already turns that into a plain ``"UNKNOWN"`` alert,
+      never a boot-time crash and never a halt. Resolution is RETRIED on
+      every fetch until it first succeeds (never cached as a permanent
+      failure): a data client that connects moments after ``build()``
+      (reconnect, slow handshake) must not leave the probe UNKNOWN for the
+      rest of the process's life.
+    """
+    slug = _representative_fee_drift_slug(strategies)
+    if slug is None:
+        _boot_logger.warning(
+            "fee_drift_probe: no instrument resolved for any composed station; "
+            "probe not registered"
+        )
+        return None
+
+    node_holder: dict[str, Any] = {}
+    client_holder: dict[str, PolymarketUSHttpClient] = {}
+
+    def _try_resolve_client() -> PolymarketUSHttpClient | None:
+        """Best-effort resolve against whatever `node` the last `after_build`
+        call handed us. Read-only; never raises -- a missing/renamed
+        attribute fails closed to `None` (caller turns that into UNKNOWN),
+        never a boot-time or probe-time crash.
+
+        Reaches into `data_engine._clients` -- the SAME private-attribute
+        idiom already established at `trade_cli.py`'s own
+        `_exec_client_refusal_reader`/`_exec_client_stale_intent_reader`
+        (`trade_cli.py:383,406`), guarded here the same way: `getattr` at
+        every hop, never a bare attribute chain, so a future Nautilus rename
+        degrades to UNKNOWN instead of an unhandled `AttributeError`.
+        """
+        node = node_holder.get("node")
+        if node is None:
+            return None
+        data_engine = getattr(node.kernel, "data_engine", None)
+        clients = getattr(data_engine, "_clients", None)
+        client = None if clients is None else clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        venue_config = getattr(client, "_venue_config", None)
+        if venue_config is None:
+            return None
+        resolved = shared_polymarket_us_http_client(venue_config, node.kernel.clock)
+        client_holder["client"] = resolved
+        return resolved
+
+    async def _wire_fee_fetcher() -> Decimal:
+        client = client_holder.get("client")
+        if client is None:
+            client = _try_resolve_client()
+        if client is None:
+            raise WireFeeCoefficientError(
+                "fee_drift_probe: no live read-only http client resolved yet"
+            )
+        return await fetch_wire_fee_coefficient(client, slug, quota_key=QUOTA_KEY_DISCOVERY)
+
+    def _set_family_halted(wire_fee: Decimal) -> None:
+        evidence_sha256 = hashlib.sha256(
+            f"fee_drift_probe:slug={slug}:wire={wire_fee}".encode()
+        ).hexdigest()
+        family_halt_latch.record_policy_halt(
+            reason=_FEE_DRIFT_HALT_REASON,
+            evidence_sha256=evidence_sha256,
+            ts_ns=time.time_ns(),
+        )
+
+    actor = FeeDriftProbeActor(
+        wire_fee_fetcher=_wire_fee_fetcher,
+        set_family_halted=_set_family_halted,
+        alert_sink=resolve_alert_sink(),
+    )
+
+    def _resolve_client(node: Any) -> None:
+        node_holder["node"] = node
+        if _try_resolve_client() is None:
+            _boot_logger.warning(
+                "fee_drift_probe: no live data client found post-build; "
+                "probe stays UNKNOWN until one resolves"
+            )
+
+    return actor, _resolve_client
+
+
 def run(
     *,
     env: Mapping[str, str] | None = None,
@@ -283,6 +437,8 @@ def run(
             strategies: list[Strategy] = []
             submit_veto: Callable[[], str | None] | None = None
             exit_manifest: FamilyManifest | None = None
+            fee_drift_actor: FeeDriftProbeActor | None = None
+            fee_drift_resolve_client: Callable[[Any], None] | None = None
 
             if manifest.composition_kind == "current_rung_hold":
                 factory = make_trial_day_latch_factory(latch)
@@ -347,6 +503,14 @@ def run(
                         required_fee_coefficient=manifest.taker_fee_coefficient,
                     )
                 )
+                # AUD-12b: unattended fee-schedule drift probe, this
+                # composition_kind only (§9: "runs alongside the existing
+                # strategy Actors", never folded into their own on_start).
+                built_probe = _build_fee_drift_probe(
+                    strategies=strategies, family_halt_latch=family_halt_latch
+                )
+                if built_probe is not None:
+                    fee_drift_actor, fee_drift_resolve_client = built_probe
             elif manifest.composition_kind == "forecast_ladder":
                 # WP-14 has not landed: the strategy this composition_kind
                 # names does not exist yet. Refuse to boot rather than
@@ -370,13 +534,24 @@ def run(
                 ",".join(strategy.order_id_tag for strategy in composed),
                 manifest.family_id,
             )
+
+            def _after_build(node: Any) -> None:
+                install_current_rung_hold_refusal_watch(node, composed)
+                # AUD-12b: resolved lazily, post-`build()`, because only
+                # then does `node.kernel`'s registered data client (and its
+                # `PolymarketUSDataClientConfig`) exist to share a transport
+                # with -- see `_build_fee_drift_probe`'s own docstring.
+                if fee_drift_resolve_client is not None:
+                    fee_drift_resolve_client(node)
+
             return trade_cli.run(
                 env=env,
                 node_factory=node_factory,
                 stderr=out,
                 strategies=composed,
+                extra_actors=() if fee_drift_actor is None else (fee_drift_actor,),
                 submit_intent_latch=latch,
-                after_build=lambda node: install_current_rung_hold_refusal_watch(node, composed),
+                after_build=_after_build,
                 live_trading_permit=live_trading_permit,
                 settings=settings,
                 exec_client_config=exec_client_config,

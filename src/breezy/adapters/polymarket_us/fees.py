@@ -35,6 +35,7 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 
 from nautilus_trader.backtest.models import FeeModel
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
@@ -56,7 +57,10 @@ __all__ = [
     "MAKER_FEE_COEFFICIENT",
     "PolymarketUSFeeModel",
     "expected_fee_for",
+    "fee_schedule_bucket",
     "polymarket_us_fee",
+    "taker_fee_at_fill",
+    "taker_fee_coefficient_of",
 ]
 
 _ZERO = Decimal(0)
@@ -78,12 +82,40 @@ MAKER_FEE_COEFFICIENT: Decimal = Decimal("-0.0125")
 
 #: The DOCUMENTED taker theta (fees_2026-08-25.md:27, "Taker Fee | 0.06 |
 #: $1.50"), used ONLY by :func:`expected_fee_for`, which has no `Instrument`
-#: and therefore no per-market coefficient to read. Every per-fill fee this
+#: and therefore no per-market coefficient to read, and by
+#: :func:`_fee_coefficient_as_of` as the PRE-drift member of the dated
+#: reconciliation schedule (AUD-13b). Every per-fill fee this
 #: module actually charges comes from :func:`polymarket_us_fee`, which reads
 #: `theta` from `instrument.info[FEE_COEFFICIENT_KEY]` and never from this
 #: constant. Public because the schedule-pin capture test is the only legal
 #: cross-package reader -- nothing in `src/` may import it.
 DOCUMENTED_TAKER_FEE_COEFFICIENT = Decimal("0.06")
+
+#: AUD-13b (ruling ``RULING_venue_reconciliation_R1_R2_2026-09-21.md`` R-1 =
+#: O4, Revision 3): the DATED taker-theta schedule reconciliation prices a
+#: legacy fill record from, keyed on the fill's ``ts_event``. Encoded as
+#: individually-named SCALARS, never a table, so the theta census in
+#: ``tests/unit/test_polymarket_us_fee_schedule_pin.py`` can see each one.
+#: Evidence for every value: ``docs/evidence/venue/polymarket_us/
+#: FEE_SCHEDULE_PIN_2026-09-18.md`` (2026-09-16: 53624/53624 offer-tape rows
+#: at 0.06; 2026-09-17: first drift alert 17:00:00.610319588Z, all six tape
+#: rows at 0.0695). The PRE-drift coefficient is
+#: :data:`DOCUMENTED_TAKER_FEE_COEFFICIENT` itself -- deliberately NOT a second
+#: ``0.06`` literal under another name. Used ONLY by :func:`taker_fee_at_fill`;
+#: :func:`polymarket_us_fee` (the live pricing path) is untouched and keeps
+#: reading theta from the ``Instrument`` at call time.
+_POST_DRIFT_TAKER_FEE_COEFFICIENT: Decimal = Decimal("0.0695")
+
+#: 2026-08-25T00:00:00Z -- the earliest pinned date (the docs snapshot the
+#: 0.06 pin is transcribed from, ``fees_2026-08-25.md``). A ``ts_event`` before
+#: it is UNPINNED and refuses rather than defaulting.
+_FEE_SCHEDULE_EARLIEST_PINNED_NS: int = 1_787_616_000_000_000_000
+
+#: ``[2026-09-17T00:00:00Z, 2026-09-17T17:00:00Z)`` -- the named AMBIGUOUS
+#: window. The pin document calls this gap "open, out of scope": no evidence
+#: fixes which coefficient billed inside it, so it is refused, never guessed.
+_FEE_DRIFT_AMBIGUOUS_START_NS: int = 1_789_603_200_000_000_000
+_FEE_DRIFT_AMBIGUOUS_END_NS: int = 1_789_664_400_000_000_000
 
 #: ``instrument.info`` key this module cross-checks :data:`MAKER_FEE_COEFFICIENT`
 #: against, named for the venue's OWN wire field:
@@ -462,6 +494,88 @@ def _fee_coefficient(instrument: Instrument) -> Decimal:
             f"{FEE_COEFFICIENT_KEY!r} {theta!s} is outside [0, 1]"
         )
     return theta
+
+
+def fee_schedule_bucket(ts_event_ns: int) -> str:
+    """Which interval of the dated taker-theta schedule ``ts_event_ns`` is in.
+
+    ``"UNPINNED"`` (before the earliest pinned date), ``"PRE_DRIFT"``,
+    ``"AMBIGUOUS"`` (the named 2026-09-17 window) or ``"POST_DRIFT"``. The
+    post-drift interval is open-ended: a THIRD, unpinned drift would land
+    inside it undetected -- a known limit of the ruling (plan §12), not a
+    defect of this function.
+    """
+    if ts_event_ns < _FEE_SCHEDULE_EARLIEST_PINNED_NS:
+        return "UNPINNED"
+    if ts_event_ns < _FEE_DRIFT_AMBIGUOUS_START_NS:
+        return "PRE_DRIFT"
+    if ts_event_ns < _FEE_DRIFT_AMBIGUOUS_END_NS:
+        return "AMBIGUOUS"
+    return "POST_DRIFT"
+
+
+def _fee_coefficient_as_of(ts_event_ns: int) -> Decimal | None:
+    """The taker theta in force at ``ts_event_ns``, or ``None`` when no
+    evidence pins one (the AMBIGUOUS window, or before the earliest pinned
+    date). Never a default: ``None`` is a refusal the caller must surface."""
+    bucket = fee_schedule_bucket(ts_event_ns)
+    if bucket == "PRE_DRIFT":
+        return DOCUMENTED_TAKER_FEE_COEFFICIENT
+    if bucket == "POST_DRIFT":
+        return _POST_DRIFT_TAKER_FEE_COEFFICIENT
+    return None
+
+
+def taker_fee_coefficient_of(instrument: Instrument) -> Decimal | None:
+    """This market's taker theta as :func:`polymarket_us_fee` would read it
+    NOW, or ``None`` when its schedule is unknown or unusable.
+
+    For the fill-record write sites (AUD-13b B0): they record the theta in
+    hand AT FILL TIME, and a fill that has already happened must never fail
+    to be recorded because its instrument's schedule is unusable -- ``None``
+    there falls back to the dated schedule at reconciliation instead.
+    """
+    try:
+        return _fee_coefficient(instrument)
+    except FeeScheduleUnknownError:
+        return None
+
+
+def taker_fee_at_fill(
+    *,
+    quantity: Decimal,
+    price: Decimal,
+    ts_event_ns: int,
+    fee_coefficient_at_fill: Decimal | None,
+) -> Money | None:
+    """The modelled TAKER fee for a fill, with theta AS OF the fill.
+
+    ``theta`` is ``fee_coefficient_at_fill`` when the record carries it, else
+    :func:`_fee_coefficient_as_of` ``(ts_event_ns)`` -- never the
+    reconciliation-time ``Instrument``, which is the defect ruling R-1
+    Revision 2 fixed. ``None`` when neither pins a theta: the caller refuses.
+    Same arithmetic and rounding as :func:`polymarket_us_fee`
+    (``theta * C * p * (1 - p)``, banker's-rounded per fill), in USD.
+
+    Raises
+    ------
+    ValueError
+        If ``price`` is outside ``[0, 1]``.
+    """
+    theta = (
+        fee_coefficient_at_fill
+        if fee_coefficient_at_fill is not None
+        else _fee_coefficient_as_of(ts_event_ns)
+    )
+    if theta is None:
+        return None
+    if price < _ZERO or price > _ONE:
+        raise ValueError(
+            f"Fill price {price} is outside the binary-option range [0, 1]; "
+            "refusing to model a Polymarket.us fee for it"
+        )
+    exact = theta * quantity * price * (_ONE - price)
+    return Money(_round_bankers(exact, USD), USD)
 
 
 def _round_bankers(value: Decimal, currency: Currency) -> Decimal:
