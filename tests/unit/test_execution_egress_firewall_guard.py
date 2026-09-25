@@ -3466,6 +3466,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # relaxed (L-6/L-12): the comparison is still `==`; the module carries NO
     # pytest mark at all -- none of `SOCKET_RESTORING_MARKERS` appears in it
     # -- constructs no `PolymarketUSExecutionClient` and opens no socket.
+    # Old -> new (this row, F-1a 2026-09-25, NO-only hunt when the YES ask is
+    # outside the band): added
+    # `tests/unit/test_continuous_rung_hold_no_only_hunt_2026_09_24.py`, which
+    # imports `is_no_side_pending` from `exec.no_side_keys` to assert the
+    # gate-closed NO-only path never sets the bounded first-order pending
+    # flag. WIDENED, not relaxed (L-6/L-12): the comparison is still `==`;
+    # the module carries no `SOCKET_RESTORING_MARKERS`, constructs no client,
+    # and opens no socket -- `is_no_side_pending` is a pure read over an
+    # injected `SqliteStateStore`, the same idiom as this set's other
+    # plain-data/pure-helper rows.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3531,6 +3541,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_aud05_scorer_terminal_bound.py",
         "tests/unit/test_measured_slippage_from_fills.py",
         "tests/unit/test_position_monitor_nightly_report.py",
+        "tests/unit/test_continuous_rung_hold_no_only_hunt_2026_09_24.py",
     }
 
 

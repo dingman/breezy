@@ -75,7 +75,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Protocol, cast
 
 import pyarrow.parquet as pq
 
@@ -571,6 +571,178 @@ def filter_rows_to_manifest_prefix(
     return tuple(kept)
 
 
+class _BoundaryFn(Protocol):
+    """The exact call shape `run_sequential_looks` needs off `boundary_fn`
+    -- structurally satisfied by `BoundaryArtefact.boundary_for` (a bound
+    method, `t_history: Sequence[float], *, is_terminal: bool = False`)
+    without importing it as a nominal type. Every call site here passes
+    `is_terminal` explicitly (never relies on a default), so it is
+    declared required, matching actual usage exactly rather than merely
+    matching `boundary_for`'s own (wider) signature."""
+
+    def __call__(
+        self, t_history: tuple[float, ...], *, is_terminal: bool
+    ) -> tuple[float, float]: ...
+
+
+def run_sequential_looks(
+    combined_draws: Sequence[CombinedDraw],
+    *,
+    artefact: BoundaryArtefact,
+    boundary_fn: _BoundaryFn,
+    total_pnl: Decimal,
+    residual: Decimal,
+    cell_dead: bool,
+    structural_fired: bool,
+    registered: bool,
+    truncation: TruncationReason | None,
+) -> tuple[tuple[LookRecord, ...], str, bool]:
+    """Replay the pooled sequential look loop (rev b Sec 3/4), including the
+    off-grid truncation tail -- extracted verbatim from
+    `build_family_tally_v2` (AUD-07 amendment Stage M1b, L-33
+    characterisation: `tests/unit/test_family_tally_v2_look_loop_golden.py`
+    pins this function's behaviour unchanged by the extraction).
+
+    Returns `(looks, verdict, decided)`. `decided` is `True` exactly when a
+    terminal or non-CONTINUE interim verdict was reached (main loop `break`,
+    or the off-grid tail ran) -- the caller computes `bca_line` (via
+    `_roi_bound_line_v2`, which needs `roi_rows`, a caller-only concern)
+    only when `decided` is `True`, byte-identical to the pre-extraction
+    `bca_line is None` cases (structural KILL with zero looks; a plain
+    CONTINUE below `look_step` with no truncation).
+
+    `boundary_fn` is a separate parameter from `artefact` (whose
+    `i_max`/`spending.look_step`/`spending.n_max` are still read here) so a
+    future streaming solver (plan §4 M1c) can pass its own `(t_history,
+    is_terminal) -> (b_eff, b_fut)` callable without touching this loop --
+    production always passes `artefact.boundary_for`.
+    """
+    n = len(combined_draws)
+    look_step = artefact.spending.look_step
+    n_max = artefact.spending.n_max
+
+    looks: list[LookRecord] = []
+    t_history: list[float] = []
+    verdict = "CONTINUE"
+
+    # Structural-dead is a separate KILL authority: never overwritten by a
+    # later look_verdict/terminal_look assignment. Skip the look loop
+    # entirely -- no look, no BCa line.
+    if structural_fired and registered:
+        return (), "KILL", False
+
+    scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)
+    for look_n in scheduled_ns:
+        state = score_combined(combined_draws[:look_n])
+        t = information_fraction(state.information, i_max=artefact.i_max)
+        t_history.append(t)
+
+        reached_loss_stop = (total_pnl + residual) <= LOSS_STOP_PNL
+        reached_i_max = state.information >= artefact.i_max
+        reached_n_max = (
+            look_n >= n_max
+        )  # B5: >= not == (see load_boundary_artefact's n_max%look_step==0 invariant)
+        forced = truncation is not None and look_n == n
+        is_terminal = reached_loss_stop or reached_i_max or reached_n_max or forced
+
+        if is_terminal:
+            reason = (
+                TruncationReason.LOSS_STOP
+                if reached_loss_stop
+                else (truncation if forced and truncation is not None else TruncationReason.I_MAX)
+            )
+            n_max_reached_below_i_max = (
+                reason is TruncationReason.I_MAX and reached_n_max and not reached_i_max
+            )
+            b_eff, b_fut = boundary_fn(tuple(t_history), is_terminal=True)
+            verdict = terminal_look(
+                state,
+                reason=reason,
+                b_eff=b_eff,
+                b_fut=b_fut,
+                total_pnl=total_pnl,
+                cell_dead=cell_dead,
+                structural_fired=structural_fired,
+            )
+            looks.append(
+                LookRecord(
+                    look_n=look_n,
+                    t=t,
+                    state=state,
+                    b_eff=b_eff,
+                    b_fut=b_fut,
+                    verdict=verdict,
+                    terminal=True,
+                    reason=reason,
+                    n_max_reached_below_i_max=n_max_reached_below_i_max,
+                )
+            )
+            return tuple(looks), verdict, True
+
+        b_eff, b_fut = boundary_fn(tuple(t_history), is_terminal=False)
+        verdict = look_verdict(
+            state,
+            b_eff=b_eff,
+            b_fut=b_fut,
+            total_pnl=total_pnl,
+            cell_dead=cell_dead,
+            structural_fired=structural_fired,
+        )
+        looks.append(
+            LookRecord(
+                look_n=look_n,
+                t=t,
+                state=state,
+                b_eff=b_eff,
+                b_fut=b_fut,
+                verdict=verdict,
+                terminal=False,
+                reason=None,
+            )
+        )
+        if verdict != "CONTINUE":
+            return tuple(looks), verdict, True
+
+    already_terminal = bool(looks) and looks[-1].terminal
+    if (
+        not (structural_fired and registered)
+        and truncation is not None
+        and not already_terminal
+        and combined_draws
+    ):
+        # An off-grid explicit truncation (n does not land on a look_step
+        # boundary): treated as a look too, never a skipped None (rev b
+        # SS4).
+        state = score_combined(combined_draws)
+        t = information_fraction(state.information, i_max=artefact.i_max)
+        t_history.append(t)
+        b_eff, b_fut = boundary_fn(tuple(t_history), is_terminal=True)
+        verdict = terminal_look(
+            state,
+            reason=truncation,
+            b_eff=b_eff,
+            b_fut=b_fut,
+            total_pnl=total_pnl,
+            cell_dead=cell_dead,
+            structural_fired=structural_fired,
+        )
+        looks.append(
+            LookRecord(
+                look_n=n,
+                t=t,
+                state=state,
+                b_eff=b_eff,
+                b_fut=b_fut,
+                verdict=verdict,
+                terminal=True,
+                reason=truncation,
+            )
+        )
+        return tuple(looks), verdict, True
+
+    return tuple(looks), verdict, False
+
+
 def build_family_tally_v2(
     rows: Sequence[ScoredTrial],
     *,
@@ -691,132 +863,20 @@ def build_family_tally_v2(
     )
     structural_fired = structural is not None and structural.structural_dead
 
-    n = len(combined_draws)
-    look_step = artefact.spending.look_step
-    n_max = artefact.spending.n_max
-
-    looks: list[LookRecord] = []
-    t_history: list[float] = []
-    verdict = "CONTINUE"
-    bca_line: str | None = None
     registered = manifest.status == "REGISTERED"
 
-    # Structural-dead is a separate KILL authority: never overwritten by a
-    # later look_verdict/terminal_look assignment. Skip the look loop.
-    if structural_fired and registered:
-        verdict = "KILL"
-        scheduled_ns = range(0)
-    else:
-        scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)
-    for look_n in scheduled_ns:
-        state = score_combined(combined_draws[:look_n])
-        t = information_fraction(state.information, i_max=artefact.i_max)
-        t_history.append(t)
-
-        reached_loss_stop = (total_pnl + residual) <= LOSS_STOP_PNL
-        reached_i_max = state.information >= artefact.i_max
-        reached_n_max = (
-            look_n >= n_max
-        )  # B5: >= not == (see load_boundary_artefact's n_max%look_step==0 invariant)
-        forced = truncation is not None and look_n == n
-        is_terminal = reached_loss_stop or reached_i_max or reached_n_max or forced
-
-        if is_terminal:
-            reason = (
-                TruncationReason.LOSS_STOP
-                if reached_loss_stop
-                else (truncation if forced and truncation is not None else TruncationReason.I_MAX)
-            )
-            n_max_reached_below_i_max = (
-                reason is TruncationReason.I_MAX and reached_n_max and not reached_i_max
-            )
-            b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=True)
-            verdict = terminal_look(
-                state,
-                reason=reason,
-                b_eff=b_eff,
-                b_fut=b_fut,
-                total_pnl=total_pnl,
-                cell_dead=any_cell_dead,
-                structural_fired=structural_fired,
-            )
-            looks.append(
-                LookRecord(
-                    look_n=look_n,
-                    t=t,
-                    state=state,
-                    b_eff=b_eff,
-                    b_fut=b_fut,
-                    verdict=verdict,
-                    terminal=True,
-                    reason=reason,
-                    n_max_reached_below_i_max=n_max_reached_below_i_max,
-                )
-            )
-            bca_line = _roi_bound_line_v2(roi_rows)
-            break
-
-        b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=False)
-        verdict = look_verdict(
-            state,
-            b_eff=b_eff,
-            b_fut=b_fut,
-            total_pnl=total_pnl,
-            cell_dead=any_cell_dead,
-            structural_fired=structural_fired,
-        )
-        looks.append(
-            LookRecord(
-                look_n=look_n,
-                t=t,
-                state=state,
-                b_eff=b_eff,
-                b_fut=b_fut,
-                verdict=verdict,
-                terminal=False,
-                reason=None,
-            )
-        )
-        if verdict != "CONTINUE":
-            bca_line = _roi_bound_line_v2(roi_rows)
-            break
-
-    already_terminal = bool(looks) and looks[-1].terminal
-    if (
-        not (structural_fired and registered)
-        and truncation is not None
-        and not already_terminal
-        and combined_draws
-    ):
-        # An off-grid explicit truncation (n does not land on a look_step
-        # boundary): treated as a look too, never a skipped None (rev b
-        # SS4).
-        state = score_combined(combined_draws)
-        t = information_fraction(state.information, i_max=artefact.i_max)
-        t_history.append(t)
-        b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=True)
-        verdict = terminal_look(
-            state,
-            reason=truncation,
-            b_eff=b_eff,
-            b_fut=b_fut,
-            total_pnl=total_pnl,
-            cell_dead=any_cell_dead,
-            structural_fired=structural_fired,
-        )
-        looks.append(
-            LookRecord(
-                look_n=n,
-                t=t,
-                state=state,
-                b_eff=b_eff,
-                b_fut=b_fut,
-                verdict=verdict,
-                terminal=True,
-                reason=truncation,
-            )
-        )
-        bca_line = _roi_bound_line_v2(roi_rows)
+    looks, verdict, decided = run_sequential_looks(
+        combined_draws,
+        artefact=artefact,
+        boundary_fn=artefact.boundary_for,
+        total_pnl=total_pnl,
+        residual=residual,
+        cell_dead=any_cell_dead,
+        structural_fired=structural_fired,
+        registered=registered,
+        truncation=truncation,
+    )
+    bca_line = _roi_bound_line_v2(roi_rows) if decided else None
 
     return FamilyTallyV2(
         family_id=manifest.family_id,

@@ -248,12 +248,16 @@ def test_the_frozen_2026_09_17_snapshot_tally_admits_three_not_four(
 ) -> None:
     """Hermetic pin of the registered `pm_us_crh_cont` tally over
     `_FROZEN_LIVE_SNAPSHOT` (see `test_realized_draws_loader.py`) rather than
-    `_LIVE_STORE` directly: the live store is append-only and keeps growing
-    past `pm_us_crh_cont`'s own `terminal_climate_day` (2026-09-19), so
-    `build_family_tally_v2` over the CURRENT live store now correctly raises
-    `FamilyBarrierRefusal` instead of returning a tally at all -- see
-    `test_the_real_live_store_past_its_terminal_day_refuses_the_family_barrier`
-    below for that structural (non-count) invariant."""
+    `_LIVE_STORE` directly: at the time this snapshot was frozen the live
+    store was still append-only past `pm_us_crh_cont`'s own
+    `terminal_climate_day` (2026-09-19). Commit a693f54 later bounded the
+    scorer's write path to that terminal day and the leaked successor rows
+    were quarantined (`docs/evidence/CONT_TALLY_LEAKED_SUCCESSOR_ROWS_2026-09-25.md`),
+    so the CURRENT live store no longer reproduces the pre-fix shape this
+    snapshot pins -- see `test_the_real_live_store_stays_clean_past_its_terminal_day`
+    below for the post-fix real-store pin, and
+    `test_a_synthetic_row_after_the_manifests_terminal_day_refuses_the_family_barrier`
+    for the structural (non-count) `FamilyBarrierRefusal` invariant itself."""
     from breezy.persistence.family_manifest import load_family_manifest
 
     manifest = load_family_manifest(_CONT_MANIFEST_PATH, allow_draft=True)
@@ -270,30 +274,75 @@ def test_the_frozen_2026_09_17_snapshot_tally_admits_three_not_four(
     assert _admitted(tally) == load_realized_draws(_FROZEN_LIVE_SNAPSHOT).n_admissible_fills
 
 
+def test_a_synthetic_row_after_the_manifests_terminal_day_refuses_the_family_barrier(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    """Hermetic pin of the terminal-day half of `assert_family_only`
+    (`breezy.settlement.family_barrier`), at the `build_family_tally_v2`
+    call site the rows actually flow through.
+
+    `tests/unit/test_aud05_family_barrier_pin.py::
+    test_the_barrier_separates_cont_from_v4_under_their_shared_prefix`
+    already pins the identical check one layer down, directly against
+    `assert_family_only`, using the real `pm_us_crh_cont`/`pm_us_crh_v4`
+    manifests. This test is the `build_family_tally_v2`-level companion:
+    a purely synthetic successor row (built by mutating one real scored
+    row's `climate_day`/`trial_id`), so it needs no real store past its
+    terminal day to stay green -- unlike the real-store test this one
+    replaces below, which went stale the moment the real store was
+    cleaned up (a693f54 + the 2026-09-25 quarantine)."""
+    derived = _clean_store(tmp_path)
+    (row,) = read_scored_trials(derived)
+    successor_day = "2026-09-30"
+    assert successor_day > row.climate_day
+    successor_row = dataclasses.replace(
+        row,
+        climate_day=successor_day,
+        trial_id=row.trial_id.replace(row.climate_day, successor_day),
+    )
+    manifest = _v3_manifest(tmp_path, terminal_climate_day=row.climate_day)
+
+    # store_dir=None: the driver-level synthetic-row mode `build_family_tally_v2`
+    # already documents (no real fill_order.jsonl sidecar exists for a
+    # fabricated trial_id) -- isolates the assertion to the barrier check
+    # itself, with nothing else in the pipeline able to raise first.
+    with pytest.raises(tally_mod.FamilyBarrierRefusal):
+        tally_mod.build_family_tally_v2(
+            (successor_row,), manifest=manifest, artefact=real_artefact, store_dir=None
+        )
+
+
 @pytest.mark.skipif(not _LIVE_STORE.exists(), reason="no live scored-trial store on this host")
-def test_the_real_live_store_past_its_terminal_day_refuses_the_family_barrier(
+def test_the_real_live_store_stays_clean_past_its_terminal_day(
     tally_mod: ModuleType, real_artefact: BoundaryArtefact
 ) -> None:
-    """Structural invariant (R4, fail-closed), not a count: `pm_us_crh_cont`
-    closed on `terminal_climate_day` 2026-09-19 (ruling 2026-09-20), but the
-    live store directory keeps accumulating scored rows past that day.
-    Building the registered tally straight off the raw, growing live store
-    must ALWAYS refuse via `FamilyBarrierRefusal` once any row postdates the
-    terminal day -- never silently pool a successor row into the closed
-    family's in-flight alpha-spending sequence. This runs against the REAL
-    store and pins no count; the frozen, count-pinned snapshot from BEFORE
-    the family closed is `test_the_frozen_2026_09_17_snapshot_tally_admits_three_not_four`
-    above."""
+    """Positive real-store pin, history in three lines: before a693f54
+    bounded `score_live_trials.py`'s write path to
+    `until_climate_day=manifest.terminal_climate_day`, the live store kept
+    accumulating scored rows past `pm_us_crh_cont`'s 2026-09-19 terminal
+    day; those leaked successor rows were quarantined in
+    `docs/evidence/CONT_TALLY_LEAKED_SUCCESSOR_ROWS_2026-09-25.md`. This
+    pins the POST-fix, POST-quarantine state -- the real store holds
+    nothing past the terminal day, and the registered tally builds clean
+    off it. The structural, fail-closed refusal itself is pinned
+    hermetically above (`test_a_synthetic_row_after_the_manifests_terminal_day_refuses_the_family_barrier`)
+    and does not depend on this store's current contents."""
     from breezy.persistence.family_manifest import load_family_manifest
 
     manifest = load_family_manifest(_CONT_MANIFEST_PATH, allow_draft=True)
     rows = read_scored_trials(_LIVE_STORE)
-    assert any(row.climate_day > manifest.terminal_climate_day for row in rows), (
-        "premise stale: the live store no longer holds a row past "
-        f"{manifest.terminal_climate_day!r} -- update or retire this test"
+
+    assert not any(row.climate_day > manifest.terminal_climate_day for row in rows), (
+        "regression: a row past pm_us_crh_cont's terminal_climate_day "
+        f"({manifest.terminal_climate_day!r}) reappeared in the real store -- "
+        "this is the write-path bound commit a693f54 fixed "
+        "(score_live_trials.py until_climate_day=manifest.terminal_climate_day); "
+        "see docs/evidence/CONT_TALLY_LEAKED_SUCCESSOR_ROWS_2026-09-25.md for "
+        "the prior leak and its quarantine"
     )
 
-    with pytest.raises(tally_mod.FamilyBarrierRefusal):
-        tally_mod.build_family_tally_v2(
-            rows, manifest=manifest, artefact=real_artefact, store_dir=_LIVE_STORE
-        )
+    tally = tally_mod.build_family_tally_v2(
+        rows, manifest=manifest, artefact=real_artefact, store_dir=_LIVE_STORE
+    )
+
+    assert tally is not None

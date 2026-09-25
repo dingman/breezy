@@ -115,6 +115,15 @@ def _build_actor(
     return actor, sink, setter
 
 
+def _register(actor: FeeDriftProbeActor, clock: TestClock) -> None:
+    actor.register_base(
+        portfolio=TestComponentStubs.portfolio(),
+        msgbus=TestComponentStubs.msgbus(),
+        cache=TestComponentStubs.cache(),
+        clock=clock,
+    )
+
+
 # ---------------------------------------------------------------------------
 # probe_once: the three outcomes
 # ---------------------------------------------------------------------------
@@ -135,6 +144,7 @@ async def test_probe_once_agrees_and_never_alerts_or_halts() -> None:
 @pytest.mark.asyncio
 async def test_probe_once_disagrees_alerts_critical_and_halts() -> None:
     actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    _register(actor, TestClock())
 
     outcome = await actor.probe_once()
 
@@ -166,6 +176,7 @@ async def test_probe_once_never_raises_when_the_halt_set_write_itself_fails() ->
         set_family_halted=_raising_setter,
         alert_sink=sink,
     )
+    _register(actor, TestClock())
 
     outcome = await actor.probe_once()
 
@@ -190,6 +201,120 @@ async def test_probe_once_fails_closed_to_unknown_and_never_defaults_to_agree() 
     (payload,) = sink.emitted
     assert payload.severity == "CRITICAL"
     assert actor.counters["unknown"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Mismatch alert dedupe (fee-drift-probe-target ruling, 2026-09-25): CRITICAL
+# once per distinct wire value, suppressed for 24h on the Actor's OWN clock,
+# then one "persisting" reminder that re-arms its own window. The halt-set
+# stays unconditional on every DISAGREE throughout -- dedupe shapes only the
+# alert stream, never the halt.
+# ---------------------------------------------------------------------------
+
+_TWENTY_FOUR_HOURS_NS = 24 * 60 * 60 * 1_000_000_000
+
+
+def _events_named(sink: _RecordingAlertSink, event: str) -> list[AlertPayload]:
+    return [payload for payload in sink.emitted if payload.event == event]
+
+
+@pytest.mark.asyncio
+async def test_two_disagrees_with_the_same_wire_value_within_24h_alert_once() -> None:
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    first = await actor.probe_once()
+    clock.set_time(_TWENTY_FOUR_HOURS_NS - 1)
+    second = await actor.probe_once()
+
+    assert first == "DISAGREE"
+    assert second == "DISAGREE"
+    assert setter.calls == 2, "the halt-set stays unconditional on every DISAGREE"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 1, "the second DISAGREE for the SAME wire value must be suppressed"
+    assert all(payload.severity == "CRITICAL" for payload in mismatches)
+
+
+@pytest.mark.asyncio
+async def test_a_new_distinct_wire_value_alerts_immediately_inside_the_suppression_window() -> None:
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    await actor.probe_once()
+    actor._wire_fee_fetcher = _disagreeing_fetcher("0.07")
+    outcome = await actor.probe_once()
+
+    assert outcome == "DISAGREE"
+    assert setter.calls == 2, "the halt-set stays unconditional on every DISAGREE"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 2, "a distinct wire value is never suppressed by a prior window"
+
+
+@pytest.mark.asyncio
+async def test_the_same_wire_value_after_24h_emits_one_persisting_reminder_then_rearms() -> None:
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    await actor.probe_once()
+    clock.set_time(_TWENTY_FOUR_HOURS_NS)
+    second = await actor.probe_once()
+    clock.set_time(_TWENTY_FOUR_HOURS_NS + 1)  # inside the reminder's own freshly re-armed window
+    third = await actor.probe_once()
+
+    assert second == "DISAGREE"
+    assert third == "DISAGREE"
+    assert setter.calls == 3, "the halt-set stays unconditional on every DISAGREE"
+    persisting = _events_named(sink, "fee_drift_probe_mismatch_persisting")
+    assert len(persisting) == 1, "the reminder fires once at >=24h, then re-arms its own window"
+    assert persisting[0].severity == "CRITICAL"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 1, "only the first sighting of this wire value is a mismatch event"
+
+
+@pytest.mark.asyncio
+async def test_an_agree_resets_the_mismatch_dedupe_so_a_flap_realerts() -> None:
+    """A flap is news (coordinator ruling on the 1907e68 review): an AGREE
+    between two DISAGREEs for the SAME wire value means the drift ended and
+    came back -- a new event, not a continuation -- so it must re-alert
+    immediately, never stay suppressed by the pre-flap window."""
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    first = await actor.probe_once()
+    actor._wire_fee_fetcher = _agreeing_fetcher()
+    middle = await actor.probe_once()
+    actor._wire_fee_fetcher = _disagreeing_fetcher("0.0695")
+    last = await actor.probe_once()
+
+    assert (first, middle, last) == ("DISAGREE", "AGREE", "DISAGREE")
+    assert setter.calls == 2, "the halt-set stays unconditional on every DISAGREE"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 2, "the AGREE must reset the dedupe so the flap re-alerts"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_never_resets_the_mismatch_dedupe() -> None:
+    """UNKNOWN is a read failure, not a resolution -- it must leave the
+    dedupe state untouched, so a DISAGREE either side of it for the SAME
+    wire value stays suppressed."""
+    actor, sink, setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+
+    first = await actor.probe_once()
+    actor._wire_fee_fetcher = _raising_fetcher(WireFeeCoefficientError("no feeCoefficient field"))
+    middle = await actor.probe_once()
+    actor._wire_fee_fetcher = _disagreeing_fetcher("0.0695")
+    last = await actor.probe_once()
+
+    assert (first, middle, last) == ("DISAGREE", "UNKNOWN", "DISAGREE")
+    assert setter.calls == 2, "the halt-set stays unconditional on every DISAGREE"
+    mismatches = _events_named(sink, "fee_drift_probe_mismatch")
+    assert len(mismatches) == 1, "an UNKNOWN must never reset the mismatch dedupe"
 
 
 # ---------------------------------------------------------------------------
@@ -250,15 +375,6 @@ async def test_fetch_wire_fee_coefficient_raises_on_a_malformed_field() -> None:
 # ---------------------------------------------------------------------------
 # Timer wiring: no coarser than 2 hours, native `Clock.set_timer`
 # ---------------------------------------------------------------------------
-
-
-def _register(actor: FeeDriftProbeActor, clock: TestClock) -> None:
-    actor.register_base(
-        portfolio=TestComponentStubs.portfolio(),
-        msgbus=TestComponentStubs.msgbus(),
-        cache=TestComponentStubs.cache(),
-        clock=clock,
-    )
 
 
 @pytest.mark.asyncio
@@ -334,6 +450,7 @@ async def test_disagree_persists_the_halt_through_a_real_trial_day_latch_and_the
             ),
             alert_sink=sink,
         )
+        _register(actor, TestClock())
 
         outcome = await actor.probe_once()
 
