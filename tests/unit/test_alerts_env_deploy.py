@@ -19,7 +19,7 @@ resolve_alert_sink/emit_alert/alert_ladder calls):
         (emit_family_tally_failure_alert; wired from
         deploy/systemd/family-tally-v2-run.sh:330)
     breezy-hypothesis-triage.service
-        YES -- scripts/analysis/hypothesis_triage.py:47,409,416
+        YES -- scripts/analysis/hypothesis_triage.py:61,433,446
         (resolve_alert_sink/emit_alert via deploy/systemd/
         hypothesis-triage-run.sh)
     breezy-decisions-retention.service

@@ -81,7 +81,14 @@ EVALUATION_SCHEMA_VERSION: int = HYPOTHESIS_LEDGER_SCHEMA_VERSION
 _BOOTSTRAP_ITERATIONS: int = 400
 _BOOTSTRAP_SEED: int = 20260925
 _DEFAULT_HORIZON_DAYS: int = 21
-_HORIZON_ALERT_STATE_SCHEMA_VERSION: int = 1
+#: Shared schema for every per-hypothesis one-shot alert state file (see
+#: `_alert_state_path`/`_read_alert_state`/`_write_alert_state`). Each alert
+#: KIND (`_HORIZON_ALERT_KIND`, `_MISSING_STRATUM_BINDING_ALERT_KIND`) gets
+#: its own file, so the two kinds can never suppress each other -- only the
+#: on-disk shape is shared.
+_ALERT_STATE_SCHEMA_VERSION: int = 1
+_HORIZON_ALERT_KIND: str = "horizon"
+_MISSING_STRATUM_BINDING_ALERT_KIND: str = "missing_stratum_binding"
 _MISSING_STRATUM_BINDING: str = "MISSING_STRATUM_BINDING"
 _ACTIVE_STATUSES = frozenset(
     {"REGISTERED", "PARKED_INSUFFICIENT_DATA", "EVALUATING"}
@@ -138,8 +145,8 @@ def evaluations_path(derived_root: Path) -> Path:
     return derived_root / "hypothesis" / "hypothesis_evaluations.jsonl"
 
 
-def _horizon_alert_state_path(derived_root: Path) -> Path:
-    return derived_root / "hypothesis" / "horizon_alerts.json"
+def _alert_state_path(derived_root: Path, *, kind: str) -> Path:
+    return derived_root / "hypothesis" / f"{kind}_alerts.json"
 
 
 def _sufficiency_path(derived_root: Path) -> Path:
@@ -222,40 +229,45 @@ def _atomic_write_lines(path: Path, lines: Sequence[str]) -> None:
         raise
 
 
-def _read_horizon_alert_state(path: Path) -> frozenset[str]:
-    """Read durable one-shot state for PARKED horizon advisories.
+def _read_alert_state(path: Path, *, label: str) -> frozenset[str]:
+    """Read durable one-shot state for a per-hypothesis advisory alert.
 
-    Missing state means no alert has been recorded yet. Corrupt state fails
-    loud so the unit does not oscillate between silent suppression and an
-    uncontrolled re-alert storm.
+    Missing state means no alert has been recorded yet for this KIND.
+    Corrupt state fails loud so the unit does not oscillate between silent
+    suppression and an uncontrolled re-alert storm.
+
+    Shared by every alert kind that pages at most once per hypothesis
+    (PARKED horizon stall, MISSING_STRATUM_BINDING) -- `label` only affects
+    the failure message; each kind's `path` (see `_alert_state_path`) is
+    distinct, so the two kinds can never suppress each other.
     """
     if not path.exists():
         return frozenset()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise _TriageFailure(f"corrupt horizon alert state: {_public_detail(exc)}") from exc
+        raise _TriageFailure(f"corrupt {label} alert state: {_public_detail(exc)}") from exc
     except OSError as exc:
-        raise _TriageFailure(f"unreadable horizon alert state: {_public_detail(exc)}") from exc
+        raise _TriageFailure(f"unreadable {label} alert state: {_public_detail(exc)}") from exc
     if not isinstance(payload, Mapping):
-        raise _TriageFailure("corrupt horizon alert state: expected JSON object")
+        raise _TriageFailure(f"corrupt {label} alert state: expected JSON object")
     version = payload.get("schema_version")
-    if version != _HORIZON_ALERT_STATE_SCHEMA_VERSION:
+    if version != _ALERT_STATE_SCHEMA_VERSION:
         raise _TriageFailure(
-            "unknown horizon alert state schema_version "
-            f"{version!r} (expected {_HORIZON_ALERT_STATE_SCHEMA_VERSION})"
+            f"unknown {label} alert state schema_version "
+            f"{version!r} (expected {_ALERT_STATE_SCHEMA_VERSION})"
         )
     ids = payload.get("alerted_hypothesis_ids")
     if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
         raise _TriageFailure(
-            "corrupt horizon alert state: alerted_hypothesis_ids must be a list of strings"
+            f"corrupt {label} alert state: alerted_hypothesis_ids must be a list of strings"
         )
     return frozenset(ids)
 
 
-def _write_horizon_alert_state(path: Path, alerted: frozenset[str]) -> None:
+def _write_alert_state(path: Path, alerted: frozenset[str]) -> None:
     payload = {
-        "schema_version": _HORIZON_ALERT_STATE_SCHEMA_VERSION,
+        "schema_version": _ALERT_STATE_SCHEMA_VERSION,
         "alerted_hypothesis_ids": sorted(alerted),
     }
     _atomic_write_lines(path, [json.dumps(payload, sort_keys=True)])
@@ -678,8 +690,12 @@ def run(args: _Args) -> int:
     active = [record for record in look_taking if record.status in _ACTIVE_STATUSES]
     _sufficiency, results = _load_aud09(args.derived_root)
     completed = _completed_on_whole_days(_sufficiency, results)  # type: ignore[arg-type]
-    horizon_state_path = _horizon_alert_state_path(args.derived_root)
-    horizon_alerted = _read_horizon_alert_state(horizon_state_path)
+    horizon_state_path = _alert_state_path(args.derived_root, kind=_HORIZON_ALERT_KIND)
+    horizon_alerted = _read_alert_state(horizon_state_path, label="horizon")
+    binding_state_path = _alert_state_path(
+        args.derived_root, kind=_MISSING_STRATUM_BINDING_ALERT_KIND
+    )
+    binding_alerted = _read_alert_state(binding_state_path, label="missing stratum binding")
     updated_records = records
     for record in active:
         updated, new_look, event = _triage_record(
@@ -709,18 +725,21 @@ def run(args: _Args) -> int:
                     ),
                 )
                 horizon_alerted = frozenset((*horizon_alerted, record.hypothesis_id))
-                _write_horizon_alert_state(horizon_state_path, horizon_alerted)
+                _write_alert_state(horizon_state_path, horizon_alerted)
         elif event == "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING":
-            _emit(
-                alert_log=args.alert_log,
-                severity="WARN",
-                event=event,
-                detail=(
-                    f"hypothesis {record.hypothesis_id} skipped: "
-                    f"{_MISSING_STRATUM_BINDING}; registered schema has no "
-                    "hypothesis/variant stratum draw-population binding"
-                ),
-            )
+            if record.hypothesis_id not in binding_alerted:
+                _emit(
+                    alert_log=args.alert_log,
+                    severity="WARN",
+                    event=event,
+                    detail=(
+                        f"hypothesis {record.hypothesis_id} skipped: "
+                        f"{_MISSING_STRATUM_BINDING}; registered schema has no "
+                        "hypothesis/variant stratum draw-population binding"
+                    ),
+                )
+                binding_alerted = frozenset((*binding_alerted, record.hypothesis_id))
+                _write_alert_state(binding_state_path, binding_alerted)
         elif event == "HYPOTHESIS_ABANDONED_CAP_EXHAUSTED":
             _emit(
                 alert_log=args.alert_log,
