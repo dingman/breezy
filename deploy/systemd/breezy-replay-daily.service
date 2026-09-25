@@ -39,6 +39,16 @@ MemoryMax=4G
 Slice=breezy-studies.slice
 UMask=0077
 
+# AUD-15 amendment (2026-09-22) alert-env convention: without this, every
+# BREEZY_REPLAY_STALLED / BREEZY_REPLAY_PROVENANCE_DRIFT alert this unit's
+# own subprocess emits would resolve a LOG-ONLY sink on this host
+# (BREEZY_ALERT_WEBHOOK_URL lives only here) -- detection without
+# delivery. The leading `-` keeps the unit startable even before
+# migrate-alerts-env.sh has run. Never breezy-trade.env/polymarket.env/
+# operator.env -- this unit holds no venue credential and no
+# operator-reserved value.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
 ExecStart=/home/jon/breezy/deploy/systemd/replay-daily-run.sh
 
 TimeoutStartSec=1800
