@@ -1,5 +1,10 @@
 # Replay-sufficiency census — real run, 2026-09-24/25 (AUD-09a)
 
+**Updated 2026-09-25 after python-reviewer's HIGH fix** (every station-day
+gets a row; real `breezy.persistence.station_candidates` reader). Numbers
+below are from the RE-RUN unless marked "first run"; see "Re-run" below for
+the diff.
+
 **MECHANISM TEST — NO VERDICT.** This artefact classifies which
 `(station, climate_day)` pairs CAN be replayed at all. It makes no claim
 about edge, ROI, or trading performance, and it is not itself a promotion
@@ -11,7 +16,7 @@ Q2): no replay-derived artefact of any validity tag may feed PREREG v3 §9's
 Scope: AUD-09a (the census) only. AUD-09b (the scheduled runner) is out of
 scope for this change and was not built or run.
 
-## Run
+## Run (first run, 2026-09-24/25, pre-fix)
 
 - Command: `systemd-run --user --scope -q -p MemoryMax=4G --
   /home/jon/breezy/.venv/bin/python scripts/analysis/replay_sufficiency_census.py
@@ -41,10 +46,41 @@ scope for this change and was not built or run.
   treating as an empty candidate set (AUD-08b not yet merged or not yet run)
   ```
 
+## Re-run (2026-09-25) — the completeness fix
+
+python-reviewer found a HIGH: `run_census` only seeded `InstanceSpan`s from
+CLEAN/CORRUPT instance ids, so a station-day whose only instances were LIVE
+or EMPTY got **no row at all** rather than a wrong-but-present reason,
+leaving B1 ("every `(station, climate_day)` in the tape gets a row")
+unproven. Fixed by applying the SAME identity-only read
+`_corrupt_instance_station_days` already performs for CORRUPT instances
+(binary_option registrations only, never the depth/quote streams) to the
+LIVE/EMPTY instance ids, and by adding `_assert_census_is_complete` — a loud
+`CensusCompletenessError` if the set of station-days discovered from raw
+instance metadata ever diverges from the set actually written.
+
+- Command, catalog, memory cap and read-only posture: **unchanged** from the
+  first run (below).
+- Wall clock: ~52 minutes (pid 2610260). Peak RSS observed: ~3.3 GB, stayed
+  under the 4 GB cap throughout (checked at 6 points; no OOM; exit code 0).
+- **127 rows** (up from 122 in the first run) — **exactly +5**, matching the
+  fix: five new `NO_CLEAN_INSTANCE` rows, one per station
+  (`LAX/MDW/MIA/NYC/SFO`), all for **2026-09-25** — today's still-in-progress
+  boot, previously invisible, now correctly reported as insufficient rather
+  than silently absent.
+- The completeness assertion passed silently on this run (no
+  `CensusCompletenessError`, exit 0): the discovered and written station-day
+  sets matched exactly.
+- Station-candidate register: still absent (AUD-08b's own register-writer,
+  `scripts/analysis/station_candidate_register.py`, has not been run in
+  production yet), so the WARN still fired, now through the real
+  `breezy.persistence.station_candidates.read_station_candidates` rather
+  than the local stand-in.
+
 ## B1 — every `(station, climate_day)` in the tape gets a row from the closed alphabet
 
-**122 rows**, one per `(station, climate_day)`, spanning **25 distinct
-climate days** (2026-08-30 .. 2026-09-24) across **5 stations**
+**127 rows**, one per `(station, climate_day)`, spanning **26 distinct
+climate days** (2026-08-30 .. 2026-09-25) across **5 stations**
 (`LAX, MDW, MIA, NYC, SFO`). Reason histogram:
 
 | Verdict | Reason | Count |
@@ -53,11 +89,13 @@ climate days** (2026-08-30 .. 2026-09-24) across **5 stations**
 | INSUFFICIENT | `AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN` | 72 |
 | INSUFFICIENT | `NO_IN_WINDOW_DEPTH` | 10 |
 | INSUFFICIENT | `DEPTH_WINDOW_UNDER_30MIN` | 4 |
+| INSUFFICIENT | `NO_CLEAN_INSTANCE` | 5 |
 
-`NO_CLEAN_INSTANCE`, `CORRUPT_ONLY`, `VENUE_NEVER_LISTED_UNCONFIRMED`,
-`INGEST_INSTANCE_REFUSED` and `CANDIDATE_UNSUPPORTED_STATION` did not occur
-in this run (no corrupt-only day, no candidate register, no LIVE/EMPTY-only
-day was found in the live tape as of this run).
+`CORRUPT_ONLY`, `VENUE_NEVER_LISTED_UNCONFIRMED`, `INGEST_INSTANCE_REFUSED`
+and `CANDIDATE_UNSUPPORTED_STATION` did not occur in this run (no
+corrupt-only day and no candidate register was found in the live tape as of
+this run). `NO_CLEAN_INSTANCE`'s five rows are exactly today's
+(2026-09-25) LIVE-only day for every station — see "Re-run" above.
 
 **Scope note — `NYC` (round-1, not a plan deviation).** `NYC` is one of the
 five cities Polymarket.us lists (memory `polymarket-us-surface-is-5-cities-high-only`)
@@ -101,9 +139,11 @@ multiple times inside one climate day, more than one CLEAN instance
 routinely covers >=30 min of that day, and the plan's own de-dup rule
 ("no first-list, no stitch, no union" — `WHOLE_TAPE_PAPER_REPLAY_2026-09-05.md`)
 correctly refuses to pick one. **This means AUD-09b's queue, as specified,
-would currently starve on every day from 09-09 onward except today's**
-in-progress one — a finding this census exists to surface, not a defect in
-the census itself. Resolving it (e.g. a different winner tie-break, or
+would currently starve on every day from 09-09 onward except 2026-09-24** —
+a finding this census exists to surface, not a defect in the census itself.
+(The re-run's still-forming 2026-09-25 now correctly reports
+`NO_CLEAN_INSTANCE` rather than being invisible — see "Re-run" below.)
+Resolving the AMBIGUOUS starvation (e.g. a different winner tie-break, or
 suppressing intra-day relaunch duplicates upstream) is outside AUD-09a's
 scope and is not proposed here.
 
@@ -131,19 +171,21 @@ scope and is not proposed here.
 `lint-imports`: **5 contracts kept, 0 broken** (including "The live trading
 path never imports the offline analysis layer" and "The offline analysis
 layer never DIRECTLY imports Nautilus" — both already merged by AUD-10a,
-reused unmodified). `mypy` (full configured file set): baseline pre-existing
-error count is 1039 (unrelated to this change, confirmed by running mypy
-with and without the four new files); the four new files add **zero** new
-errors.
+reused unmodified). `mypy` (full configured file set, after merging AUD-08b
+via `git merge --no-ff 40bb796`): baseline pre-existing error count is 1049
+(unrelated to this change); this item's files add **zero** new errors.
 
-## B13 — H1 exercised
+## B13 — H1 exercised (now against the real AUD-08b register)
 
-- Missing register: WARN + empty candidate set (confirmed live above, and by
-  `test_read_station_candidates_missing_file_warns_and_yields_empty_set`).
+- Missing register: WARN (printed by this script) + empty candidate set,
+  from the real `read_station_candidates` returning `()` for an absent
+  file — confirmed live in both real runs above, and by
+  `test_read_station_candidates_missing_file_warns_and_yields_empty_set`.
 - One candidate -> one `CANDIDATE_UNSUPPORTED_STATION` row, zero queue
   entries: `test_candidate_rows_never_enter_the_replay_queue`,
   `test_build_census_includes_candidate_rows_alongside_tape_rows`.
-- Unknown `schema_version` -> `UnknownStationCandidateSchemaError`:
+- Unknown `schema_version` -> `UnknownStationCandidateSchemaError`, raised by
+  AUD-08b's own reader and propagated unchanged:
   `test_read_station_candidates_refuses_an_unknown_schema_version`.
 
 ## B14 — H0 is a real contract
@@ -163,12 +205,16 @@ compares `typing.get_args` of both literals; both are exactly
 ## Artefact
 
 `~/.local/share/breezy/derived/replay/replay_sufficiency.jsonl` —
-`schema_version: 1`, 122 lines, one per `(station, climate_day)`, sorted.
-`computed_day: "2026-09-24"` on every row (the UTC date the run started).
+`schema_version: 1`, **127 lines** (re-run), one per `(station,
+climate_day)`, sorted. `computed_day: "2026-09-24"` on every row of the
+first run and `"2026-09-25"` on every row of the re-run (the UTC date each
+run started).
 
 ## Not in scope for this change
 
 - AUD-09b (the scheduled runner, the `--asos-cache-csv` producer, the systemd
   unit/timer, the result-record schema) — untouched.
 - Resolving the 09-09-onward `AMBIGUOUS_WINNER` structural finding above.
-- AUD-08b's real station-candidate register (not yet merged).
+- Running AUD-08b's `scripts/analysis/station_candidate_register.py` in
+  production (its module is merged and reused; the register file itself has
+  not yet been generated).
