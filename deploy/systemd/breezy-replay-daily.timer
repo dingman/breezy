@@ -1,0 +1,25 @@
+[Unit]
+Description=15:50 UTC trigger for the Breezy scheduled replay runner
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/replay_daily_runner.py
+
+[Timer]
+Unit=breezy-replay-daily.service
+
+# 15:50 UTC -- free on the existing schedule (occupied: 01:35, 02:05, 09:00,
+# 09:20, 13:30, 14:15, 14:30, 15:00, 15:20, 17:20, 00/06/12/18:15) and
+# outside the protected LST-union no-start window [16:35Z, 01:15Z)
+# (deploy/systemd/README.md). No two Breezy timers ever fire in the same
+# hour:minute tick (tests/unit/test_deploy_timer_hours.py).
+#
+# base plan §6b.3: this unit is INSTALLED here but is enabled only after a
+# real, non-BLOCKED result row (AUD-09b amendment R5) -- see the plan's
+# step 13/14 and the operator runbook note in README.md.
+OnCalendar=*-*-* 15:50:00 UTC
+
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

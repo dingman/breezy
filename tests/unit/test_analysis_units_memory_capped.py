@@ -59,6 +59,13 @@ _CANDIDATE_UNITS = [
     # (measured up to 1.95 GB RSS). A unit that loads catalog data joins this
     # list and carries its own ceiling.
     "breezy-station-candidate-register.service",
+    # AUD-09b (2026-09-25): the scheduled per-station replay runner invokes
+    # the single-day paper-replay driver as a subprocess -- deliberately an
+    # order of magnitude below the three heavy nightly studies' own
+    # MemoryHigh=12G/MemoryMax=16G floor (measured single-day envelope
+    # ~80s/~674MB); listed here so its own cgroup ceiling never goes
+    # uncovered.
+    "breezy-replay-daily.service",
 ]
 
 _EXISTING_UNITS = [

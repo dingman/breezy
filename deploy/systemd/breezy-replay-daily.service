@@ -1,0 +1,53 @@
+[Unit]
+# AUD-09b scheduled replay runner (docs/plans/backlog/AUDIT_2026-09-21/
+# AUD-09-scheduled-per-station-replay.md;
+# AUD-09b-AMENDMENT-2026-09-25.md), triggered by
+# breezy-replay-daily.timer. Sibling of breezy-exit-window-study.service:
+# same oneshot/no-Install shape, same wrapper-script driver style
+# (deploy/systemd/replay-daily-run.sh) -- the timer owns cadence, the
+# script owns the work.
+#
+# One invocation replays AT MOST one (station, climate_day) for the ARMED
+# family only, via scripts/analysis/replay_daily_runner.py, and writes one
+# ~/.local/share/breezy/derived/replay/replay_results.jsonl row. Every row
+# is written validity="MECHANISM_ONLY" until AUD-11/AUD-12 land -- this
+# unit's output may never feed a live trading decision.
+Description=Breezy scheduled per-station replay (offline, MECHANISM_ONLY)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/replay_daily_runner.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-09-scheduled-per-station-replay.md
+
+# AUD-15a pattern: alert on failure (timeout, OOM-kill, or non-zero exit).
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Deliberately an order of magnitude below the three heavy nightly
+# studies' own MemoryHigh=12G/MemoryMax=16G floor
+# (tests/unit/test_analysis_units_memory_capped.py, following the
+# 2026-09-11 K1 incident's 17.6 GB peak with no per-unit ceiling) -- the
+# measured single-day envelope is n=1 ~80s / ~674MB (V3 plan §4 increment
+# F, re-measured at this item's own step 13). A single-day replay reaching
+# 4GB is a regression of L-31 (whole_tape_paper_replay's own unbounded-
+# memory incident); being OOM-killed in its own cgroup is the intended,
+# loud outcome, never the trading node's.
+MemoryHigh=3G
+MemoryMax=4G
+
+Slice=breezy-studies.slice
+UMask=0077
+
+ExecStart=/home/jon/breezy/deploy/systemd/replay-daily-run.sh
+
+TimeoutStartSec=1800
+
+# No Restart=. A missed day is not an incident -- the census-driven queue
+# drains monotonically and tomorrow's run picks up where today's left off.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-replay-daily
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly.
