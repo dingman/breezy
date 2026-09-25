@@ -45,6 +45,7 @@ from breezy.runtime import trade_cli
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import ORDERS_ENABLED_VAR, SettingsError
 from breezy.runtime.trade_cli import EXIT_RUNTIME_ERROR
+from tests.unit.log_leak_assertions import assert_no_values_leaked
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
 from tests.unit.test_polymarket_us_submit_order_chain import (
@@ -54,6 +55,11 @@ from tests.unit.test_polymarket_us_submit_order_chain import (
 #: Values `enable_operator_gate`'s defaults plant in the environment for the
 #: live-trading permit -- asserted ABSENT from every captured log line, the
 #: same shape as the R2 test in `test_polymarket_us_permit_issuance.py`.
+#: Checked via `log_leak_assertions.assert_no_values_leaked`, a number-
+#: boundary match rather than a bare substring check: the permit log line
+#: legitimately contains nanosecond timestamps, and a plain `"100" not in
+#: text` check false-fails whenever that digit run happens to appear inside
+#: one by coincidence of the wall clock.
 _SENSITIVE_VALUES = ("operator@example.com", "5.00", "1000.00", "100")
 
 
@@ -110,8 +116,7 @@ def test_main_logs_live_trading_permit_issued_when_both_permits_are_minted(
     assert expires_at_ns - issued_at_ns == PERMIT_TTL_NS
     assert ttl_s == PERMIT_TTL_NS // 1_000_000_000
 
-    for value in _SENSITIVE_VALUES:
-        assert value not in caplog.text, f"{value!r} leaked into a log record"
+    assert_no_values_leaked(caplog.text, _SENSITIVE_VALUES)
 
 
 def test_main_emits_warn_alert_when_live_trading_permit_refused_and_continues_in_shadow_mode(
