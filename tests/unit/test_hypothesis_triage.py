@@ -121,6 +121,10 @@ def _horizon_alert_state(derived: Path) -> Path:
     return derived / "hypothesis" / "horizon_alerts.json"
 
 
+def _binding_alert_state(derived: Path) -> Path:
+    return derived / "hypothesis" / "missing_stratum_binding_alerts.json"
+
+
 def _assert_missing_stratum_binding(
     proc: subprocess.CompletedProcess[str],
     alerts: list[dict[str, str]],
@@ -623,7 +627,13 @@ def test_corrupt_horizon_state_fails_loud_without_realerting(tmp_path: Path) -> 
     }
 
 
-def test_second_run_records_already_looked_and_appends_nothing(tmp_path: Path) -> None:
+def test_second_run_emits_missing_stratum_binding_alert_exactly_once(tmp_path: Path) -> None:
+    """AUD-18 triage review HIGH fix: every registered look-taking hypothesis
+    fails the fail-closed stratum-binding check (`_has_registered_draw_binding`
+    is always `False` today), so without a one-shot state -- mirroring the
+    sibling HORIZON_STALL dedupe -- this would page on every single run.
+    Two consecutive runs must emit exactly one alert and write no look rows.
+    """
     hypothesis_id = "H-ONCE"
     _register(tmp_path, hypothesis_id=hypothesis_id, min_station_days=5)
     rows = [("SFO", _day(index), 1) for index in range(5)]
@@ -639,16 +649,82 @@ def test_second_run_records_already_looked_and_appends_nothing(tmp_path: Path) -
     written = [path for path in (tmp_path / "hypothesis").rglob("*") if path.is_file()]
     assert written
     assert all(path.is_relative_to(tmp_path / "hypothesis") for path in written)
+    assert _binding_alert_state(tmp_path).is_file()
 
     second, second_alerts = _run(tmp_path)
     assert second.returncode == 0, second.stderr
-    assert len(second_alerts) == 2
+    assert len(second_alerts) == 1
     assert [alert["event"] for alert in second_alerts] == [
-        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING",
-        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING",
+        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING"
     ]
     assert len(_looks(tmp_path)) == 0
     assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
+
+
+def test_missing_binding_and_horizon_stall_alerts_do_not_suppress_each_other(
+    tmp_path: Path,
+) -> None:
+    """The two alert kinds share the one-shot state MECHANISM but must never
+    share its KEY SPACE: a hypothesis alerted for MISSING_STRATUM_BINDING
+    must still page once for HORIZON_STALL once the horizon is crossed."""
+    hypothesis_id = "H-BOTH"
+    _register(
+        tmp_path,
+        hypothesis_id=hypothesis_id,
+        min_station_days=1,
+        registered_at="2026-09-01",
+    )
+    climate_day = _day(0)
+    _write_replay(tmp_path, [("SFO", climate_day, 1)])
+    _write_store(tmp_path, [_winner("SFO", climate_day, trial_id="w0")])
+
+    # Before the horizon: eligible + data present, but no stratum binding.
+    first, first_alerts = _run(tmp_path, as_of="2026-09-05")
+    assert first.returncode == 0, first.stderr
+    assert [alert["event"] for alert in first_alerts] == [
+        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING"
+    ]
+
+    # Still before the horizon: the binding alert must not re-fire.
+    second, second_alerts = _run(tmp_path, as_of="2026-09-06")
+    assert second.returncode == 0, second.stderr
+    assert [alert["event"] for alert in second_alerts] == [
+        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING"
+    ]
+
+    # Past the horizon: HORIZON_STALL fires too -- the binding alert's own
+    # one-shot state must not suppress it, and vice versa.
+    third, third_alerts = _run(tmp_path, as_of="2026-10-10")
+    assert third.returncode == 0, third.stderr
+    assert [alert["event"] for alert in third_alerts] == [
+        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING",
+        "HYPOTHESIS_TRIAGE_HORIZON_STALL",
+    ]
+    assert _binding_alert_state(tmp_path).is_file()
+    assert _horizon_alert_state(tmp_path).is_file()
+
+
+def test_corrupt_missing_stratum_binding_state_fails_loud_without_realerting(
+    tmp_path: Path,
+) -> None:
+    hypothesis_id = "H-BINDING-CORRUPT"
+    _register(tmp_path, hypothesis_id=hypothesis_id, min_station_days=1)
+    climate_day = _day(0)
+    _write_replay(tmp_path, [("SFO", climate_day, 1)])
+    _write_store(tmp_path, [_winner("SFO", climate_day, trial_id="w0")])
+    state = _binding_alert_state(tmp_path)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text("{not-json\n", encoding="utf-8")
+
+    proc, alerts = _run(tmp_path)
+    assert proc.returncode != 0
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "CRITICAL"
+    assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_FAILED"
+    assert "missing stratum binding alert state" in alerts[0]["detail"]
+    assert "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING" not in {
+        alert["event"] for alert in alerts
+    }
 
 
 def test_duplicate_look_key_is_a_hard_error(tmp_path: Path) -> None:
