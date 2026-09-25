@@ -59,6 +59,7 @@ from breezy.persistence.scored_trial_store import read_scored_trials
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import SubmitIntentState
 from breezy.settlement.trial_scorer import ScoreRefusal
+from tests.support.real_tree_write_guard import install_real_tree_write_guard
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
@@ -104,62 +105,44 @@ pytestmark = pytest.mark.contract
 # point at (`DEFAULT_DERIVED_DIR`/`DEFAULT_NWS_CATALOG_BASE` in
 # `scripts/analysis/score_live_trials.py`) -- every test in this module
 # passes an explicit `--catalog-base`/`derived_dir` under `tmp_path`, so
-# neither tree should ever change; this is the module's own proof of that,
-# not a test of behaviour. `Path.home()` is resolved once, at import time.
+# neither tree should ever be WRITTEN BY THIS TEST PROCESS; this is the
+# module's own proof of that, not a test of behaviour. `Path.home()` is
+# resolved once, at import time.
+#
+# This used to be a before/after `(relpath, size, mtime_ns)` tree-stat diff,
+# which flakes for real on this host: the NWS ingest daemon writes
+# `polymarket_us/<CITY>/data/custom_nws_climate_day` under the catalog root,
+# the trade node writes `state/breezy-state.sqlite3` WAL/SHM files, and the
+# scorer's own timers write `derived/scored_trials` -- all concurrently,
+# independent of this module. A stat diff cannot distinguish "this test
+# wrote here" from "some other live process wrote here at the same instant";
+# excluding more subtrees to dodge that would WEAKEN the guard.
+#
+# `install_real_tree_write_guard` (`tests/support/real_tree_write_guard.py`)
+# uses a `sys.addaudithook` instead: it only ever sees operations THIS
+# interpreter performs, so a concurrent write from another OS process never
+# raises an event here. That also means it needs no `quote_tape/` carve-out
+# -- the old exclusion existed solely to tolerate the live recorder's
+# unrelated writes there, and a write-attribution hook is structurally
+# immune to that race, so it now covers strictly MORE of the catalog tree
+# than the snapshot version did.
 # ---------------------------------------------------------------------------
 
 _REAL_HOME = Path.home()
 _REAL_SCORED_TRIALS_DIR = _REAL_HOME / ".local/share/breezy/derived/scored_trials"
 _REAL_CATALOG_DIR = _REAL_HOME / ".local/share/breezy/catalog"
 
-#: `quote_tape/` is the LIVE recorder's own continuous capture namespace
-#: (`src/breezy/persistence/catalog.py` never writes there -- confirmed by
-#: grep; `open_station_catalog`/`write_records`, the only catalog writers
-#: this driver or `trial_scorer.py` ever call, land under a wholly separate
-#: `<venue>/<city>/...` layout). On this host the recorder runs continuously
-#: under systemd (`g14-capture-is-systemd-now`) and appends to it every few
-#: seconds regardless of anything this test module does -- confirmed
-#: empirically (11/11 runs) by a byte-for-byte diff always isolated to one
-#: actively-growing `quote_tape/.../instrument_status_*.feather` file, never
-#: to a path this suite could write. Excluded here so the guard still catches
-#: this suite's own mutations to the parts of the catalog it CAN reach,
-#: without flaking on a concurrent, unrelated writer (`one-tree-many-agents-
-#: fakes-test-failures`).
-_LIVE_RECORDER_SUBTREE = "quote_tape"
-
-
-def _tree_snapshot(
-    root: Path, *, exclude_top_level: str | None = None
-) -> tuple[tuple[str, int, int], ...] | None:
-    """A recursive `(relpath, st_size, st_mtime_ns)` snapshot of every path
-    under `root`, or `None` when `root` does not exist at all. Paths whose
-    top-level component under `root` equals `exclude_top_level` are skipped."""
-    if not root.exists():
-        return None
-    rows = []
-    for p in root.rglob("*"):
-        relpath = p.relative_to(root)
-        if exclude_top_level is not None and relpath.parts[:1] == (exclude_top_level,):
-            continue
-        rows.append((relpath.as_posix(), p.stat().st_size, p.stat().st_mtime_ns))
-    return tuple(sorted(rows))
-
 
 @pytest.fixture(scope="module", autouse=True)
 def _guard_real_derived_and_catalog_trees_untouched() -> Iterator[None]:
-    before_scored = _tree_snapshot(_REAL_SCORED_TRIALS_DIR)
-    before_catalog = _tree_snapshot(_REAL_CATALOG_DIR, exclude_top_level=_LIVE_RECORDER_SUBTREE)
+    guard = install_real_tree_write_guard(_REAL_SCORED_TRIALS_DIR, _REAL_CATALOG_DIR)
+    guard.active = True
     yield
-    assert _tree_snapshot(_REAL_SCORED_TRIALS_DIR) == before_scored, (
-        "a test in test_live_fill_scoring_chain_contract.py modified the REAL "
-        f"derived tree at {_REAL_SCORED_TRIALS_DIR}"
-    )
-    assert (
-        _tree_snapshot(_REAL_CATALOG_DIR, exclude_top_level=_LIVE_RECORDER_SUBTREE)
-        == before_catalog
-    ), (
-        "a test in test_live_fill_scoring_chain_contract.py modified the REAL "
-        f"catalog tree at {_REAL_CATALOG_DIR} (outside quote_tape/)"
+    guard.active = False
+    assert not guard.offenses, (
+        "a test in test_live_fill_scoring_chain_contract.py wrote to the REAL "
+        f"derived tree at {_REAL_SCORED_TRIALS_DIR} or catalog tree at "
+        f"{_REAL_CATALOG_DIR}:\n" + "\n".join(guard.offenses)
     )
 
 #: The fake /proc node this suite's REVISE-1 pre-flight matches against --
