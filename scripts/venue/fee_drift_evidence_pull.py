@@ -59,6 +59,34 @@ the case the guard covers, and must call it there, not here.
 Every write under it is followed by a ``manifest.sha256`` covering that day's
 raw files, so a later retention pass can prove nothing was silently altered
 without needing git history over a directory git never tracked.
+
+**Same-day re-run discipline (code review fix).** A day directory's evidence
+artifact set (``slugs.json``/``summary.json``, OR ``incomplete.json``) is
+always fully REPLACED by a run, never merged into: every file is written to a
+temp path and renamed into place, any of the three names NOT part of this
+run's write-set is deleted, and ``manifest.sha256.json`` -- covering exactly
+the files left on disk -- is written last, after every data file already has
+its final name. This is what keeps the manifest a byte-exact description of
+the directory at every point in time, including mid-crash: a reader never
+sees a manifest naming a file that is not yet (or no longer) there.
+
+**Downgrade policy: a protected-window run never erases an existing REAL
+pull record for the same UTC date.** If ``slugs.json`` and ``summary.json``
+already exist for a date (a real attempt, whatever its own ``complete``
+value), a run that starts inside the protected window records its own
+skipped attempt in a separate sidecar (``skipped_downgrade.json``, never
+covered by the manifest, never counted as an evidence artifact) and leaves
+the existing three files and the manifest untouched. The reverse direction
+(a real pull following an earlier protected-window ``incomplete.json``) is an
+upgrade, not a downgrade, and proceeds normally -- ``incomplete.json`` is
+removed and replaced by the real record. Rationale: an evidence pack is used
+to answer "what did we actually observe", and a scheduler artifact (a
+catch-up run landing inside the protected window, e.g. after
+``Persistent=true`` fires late) carries strictly less information than an
+already-recorded real attempt; silently downgrading the record to
+"incomplete" would make the pack LIE about what is actually known for that
+date. Recording the later attempt separately, rather than dropping it
+silently, keeps the operator able to see that a downgrade was avoided.
 """
 
 from __future__ import annotations
@@ -67,6 +95,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -86,6 +115,8 @@ from breezy.strategy.current_rung_hold.fee_drift_probe import (
     FEE_COEFFICIENT_WIRE_KEY,
     MARKET_BY_SLUG_PATH,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "COMPLETE_DAY_THRESHOLD",
@@ -324,22 +355,115 @@ def _sha256_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _write_json(path: Path, payload: object) -> str:
+#: The COMPLETE set of names a day directory's evidence record may hold,
+#: exclusive of `MANIFEST_FILENAME` itself and the downgrade sidecar. Exactly
+#: one of {"slugs.json", "summary.json"} (together) OR {"incomplete.json"} is
+#: ever the FULL evidence set for a given day -- `_replace_day_artifacts`
+#: enforces that no member outside this run's write-set survives it.
+_DAY_ARTIFACT_NAMES: frozenset[str] = frozenset(
+    {"slugs.json", "summary.json", "incomplete.json"}
+)
+
+MANIFEST_FILENAME: str = "manifest.sha256.json"
+
+#: Records a protected-window run that was REFUSED rather than downgrading an
+#: existing real pull record for the same date (see module docstring "Downgrade
+#: policy"). Deliberately outside `_DAY_ARTIFACT_NAMES` and never covered by
+#: the manifest: it is an audit note about a skipped attempt, not evidence.
+_SKIPPED_DOWNGRADE_SIDECAR: str = "skipped_downgrade.json"
+
+_DOWNGRADE_REFUSED_REASON_PREFIX: str = (
+    "downgrade refused: a real pull record already exists for "
+)
+
+
+def _atomic_write_json(path: Path, payload: object) -> str:
+    """Write ``path`` atomically (temp file, then rename) and return its sha256.
+
+    The temp file lives in the SAME directory as ``path`` so the rename is
+    guaranteed to be on one filesystem (an atomic `os.rename`, never a
+    cross-filesystem copy). A reader can therefore never observe a partially
+    written file at ``path``'s final name.
+    """
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    path.write_text(text, encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
     return _sha256_of(text)
 
 
-def _write_artifacts(result: EvidencePullResult, day_dir: Path) -> EvidencePullResult:
+def _has_real_pull_record(day_dir: Path) -> bool:
+    """True when ``day_dir`` already holds a REAL pull's record (both
+    ``slugs.json`` and ``summary.json``), as opposed to only a
+    protected-window ``incomplete.json`` or nothing at all.
+    """
+    return (day_dir / "slugs.json").exists() and (day_dir / "summary.json").exists()
+
+
+def _replace_day_artifacts(
+    day_dir: Path, files: Mapping[str, object]
+) -> Mapping[str, str]:
+    """Write EXACTLY ``files`` as the day's evidence record, atomically, and
+    delete any OTHER member of `_DAY_ARTIFACT_NAMES` left over from a prior
+    run for the same day -- a run's write-set fully REPLACES the day
+    directory's evidence set, never merges into it. The manifest is written
+    LAST, after every data file already has its final on-disk name, so the
+    manifest is always an exact description of what is on disk, even if this
+    process is killed mid-run (the worst case is a manifest one run behind,
+    never a manifest naming a file that does not exist).
+    """
     day_dir.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, str] = {}
+    for name, payload in files.items():
+        manifest[name] = _atomic_write_json(day_dir / name, payload)
+    for stale_name in _DAY_ARTIFACT_NAMES - set(files):
+        stale_path = day_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
+    _atomic_write_json(day_dir / MANIFEST_FILENAME, manifest)
+    return manifest
 
-    if not result.complete and result.reason == _PROTECTED_WINDOW_REASON:
-        manifest["incomplete.json"] = _write_json(
-            day_dir / "incomplete.json",
-            {"date": result.date, "reason": result.reason},
+
+def _refuse_downgrade(result: EvidencePullResult, day_dir: Path) -> EvidencePullResult:
+    """Record a refused protected-window downgrade attempt and return the
+    EXISTING on-disk record's own facts -- never this run's protected-window
+    facts, and never touching `slugs.json`/`summary.json`/the manifest.
+    """
+    day_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(
+        day_dir / _SKIPPED_DOWNGRADE_SIDECAR,
+        {"date": result.date, "attempted_reason": result.reason},
+    )
+    logger.warning(
+        "fee_drift_evidence_pull: refusing to downgrade date=%s -- a real pull "
+        "record already exists; recorded the skipped attempt in %s",
+        result.date,
+        _SKIPPED_DOWNGRADE_SIDECAR,
+    )
+    existing_summary = json.loads((day_dir / "summary.json").read_text(encoding="utf-8"))
+    existing_manifest = json.loads((day_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    return EvidencePullResult(
+        date=result.date,
+        complete=bool(existing_summary["complete"]),
+        reason=f"{_DOWNGRADE_REFUSED_REASON_PREFIX}{result.date}",
+        markets_listed=int(existing_summary["markets_listed"]),
+        slugs=(),
+        output_dir=day_dir,
+        manifest=existing_manifest,
+    )
+
+
+def _write_artifacts(result: EvidencePullResult, day_dir: Path) -> EvidencePullResult:
+    is_protected_skip = not result.complete and result.reason == _PROTECTED_WINDOW_REASON
+
+    if is_protected_skip and _has_real_pull_record(day_dir):
+        return _refuse_downgrade(result, day_dir)
+
+    if is_protected_skip:
+        manifest = _replace_day_artifacts(
+            day_dir,
+            {"incomplete.json": {"date": result.date, "reason": result.reason}},
         )
-        _write_json(day_dir / "manifest.sha256.json", manifest)
         return EvidencePullResult(
             date=result.date,
             complete=False,
@@ -350,36 +474,34 @@ def _write_artifacts(result: EvidencePullResult, day_dir: Path) -> EvidencePullR
             manifest=manifest,
         )
 
-    manifest["slugs.json"] = _write_json(
-        day_dir / "slugs.json",
-        [
-            {
-                "slug": s.slug,
-                "ok": s.ok,
-                "taker_fee_coefficient": s.taker_fee_coefficient,
-                "maker_fee_wire": s.maker_fee_wire,
-                "reason": s.reason,
-                "raw": s.raw,
-            }
-            for s in result.slugs
-        ],
-    )
-    manifest["summary.json"] = _write_json(
-        day_dir / "summary.json",
+    manifest = _replace_day_artifacts(
+        day_dir,
         {
-            "date": result.date,
-            "complete": result.complete,
-            "markets_listed": result.markets_listed,
-            "ok_count": result.ok_count,
-            "failed_count": len(result.slugs) - result.ok_count,
-            "taker_values_observed": sorted(result.taker_values_observed),
-            "maker_values_observed": sorted(result.maker_values_observed),
-            "failed_slugs": [
-                {"slug": s.slug, "reason": s.reason} for s in result.slugs if not s.ok
+            "slugs.json": [
+                {
+                    "slug": s.slug,
+                    "ok": s.ok,
+                    "taker_fee_coefficient": s.taker_fee_coefficient,
+                    "maker_fee_wire": s.maker_fee_wire,
+                    "reason": s.reason,
+                    "raw": s.raw,
+                }
+                for s in result.slugs
             ],
+            "summary.json": {
+                "date": result.date,
+                "complete": result.complete,
+                "markets_listed": result.markets_listed,
+                "ok_count": result.ok_count,
+                "failed_count": len(result.slugs) - result.ok_count,
+                "taker_values_observed": sorted(result.taker_values_observed),
+                "maker_values_observed": sorted(result.maker_values_observed),
+                "failed_slugs": [
+                    {"slug": s.slug, "reason": s.reason} for s in result.slugs if not s.ok
+                ],
+            },
         },
     )
-    _write_json(day_dir / "manifest.sha256.json", manifest)
     return EvidencePullResult(
         date=result.date,
         complete=result.complete,

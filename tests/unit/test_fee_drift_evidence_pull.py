@@ -306,3 +306,86 @@ async def test_a_complete_day_meets_the_95_percent_threshold_exactly(tmp_path: P
     assert result.markets_listed == 20
     assert COMPLETE_DAY_THRESHOLD == Decimal("0.95")
     assert result.complete is True
+
+
+# ---------------------------------------------------------------------------
+# same-day re-run (code review fix): manifest must always match disk exactly,
+# and a protected-window run must never downgrade an existing real record.
+# ---------------------------------------------------------------------------
+
+_SAME_DAY_SLUG = "tc-temp-nychigh-2026-09-25-gte72f"
+
+
+def _one_slug_complete_client() -> _FakePublicClient:
+    return _FakePublicClient(
+        list_pages=[{"markets": [_weather_market(_SAME_DAY_SLUG)]}],
+        slug_responses={_SAME_DAY_SLUG: _market_payload(taker="0.06", maker="-125")},
+    )
+
+
+def _assert_manifest_matches_disk(day_dir: Path) -> None:
+    manifest = json.loads((day_dir / "manifest.sha256.json").read_text(encoding="utf-8"))
+    on_disk = {
+        p.name
+        for p in day_dir.iterdir()
+        if p.name not in {"manifest.sha256.json", "skipped_downgrade.json"}
+        and not p.name.startswith(".")
+    }
+    assert set(manifest) == on_disk, (manifest, on_disk)
+    for filename, digest in manifest.items():
+        contents = (day_dir / filename).read_text(encoding="utf-8")
+        assert hashlib.sha256(contents.encode("utf-8")).hexdigest() == digest
+
+
+@pytest.mark.asyncio
+async def test_complete_then_protected_same_day_never_downgrades_the_record(
+    tmp_path: Path,
+) -> None:
+    complete_now = dt.datetime(2026, 9, 25, 10, 0, tzinfo=dt.UTC)
+    first = await run_once(
+        client=_one_slug_complete_client(), output_root=tmp_path, now=complete_now
+    )
+    day_dir = tmp_path / "2026-09-25"
+    assert first.complete is True
+    _assert_manifest_matches_disk(day_dir)
+
+    protected_client = _FakePublicClient()
+    # Same UTC date (2026-09-25), inside [16:35Z, 24:00) -- the protected window.
+    protected_now = dt.datetime(2026, 9, 25, 20, 0, tzinfo=dt.UTC)
+    second = await run_once(client=protected_client, output_root=tmp_path, now=protected_now)
+
+    # The protected-window run must never issue any GET.
+    assert protected_client.list_calls == []
+    assert protected_client.slug_calls == []
+    # Downgrade policy: the returned facts are the EXISTING complete record's,
+    # not a fresh "incomplete" verdict.
+    assert second.complete is True
+    assert "downgrade refused" in second.reason
+    assert (day_dir / "slugs.json").exists()
+    assert (day_dir / "summary.json").exists()
+    assert not (day_dir / "incomplete.json").exists()
+    _assert_manifest_matches_disk(day_dir)
+
+    sidecar = json.loads((day_dir / "skipped_downgrade.json").read_text(encoding="utf-8"))
+    assert sidecar["date"] == "2026-09-25"
+
+
+@pytest.mark.asyncio
+async def test_protected_then_complete_same_day_upgrades_cleanly(tmp_path: Path) -> None:
+    protected_now = dt.datetime(2026, 9, 25, 20, 0, tzinfo=dt.UTC)
+    first = await run_once(client=_FakePublicClient(), output_root=tmp_path, now=protected_now)
+    day_dir = tmp_path / "2026-09-25"
+    assert first.complete is False
+    assert (day_dir / "incomplete.json").exists()
+    _assert_manifest_matches_disk(day_dir)
+
+    complete_now = dt.datetime(2026, 9, 25, 10, 0, tzinfo=dt.UTC)
+    second = await run_once(
+        client=_one_slug_complete_client(), output_root=tmp_path, now=complete_now
+    )
+
+    assert second.complete is True
+    assert not (day_dir / "incomplete.json").exists()
+    assert (day_dir / "slugs.json").exists()
+    assert (day_dir / "summary.json").exists()
+    _assert_manifest_matches_disk(day_dir)
