@@ -69,6 +69,7 @@ import os
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
 
@@ -95,6 +96,10 @@ from monitor_hypothetical_core import ObservationRow
 from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+from portfolio_roi_report import (
+    UnknownPortfolioRoiSchemaError,
+    read_portfolio_roi_report,
+)
 from score_live_trials import (
     DEFAULT_DERIVED_DIR,
     _read_bucket_facts_by_instrument_id,
@@ -186,20 +191,15 @@ def _write_previous_trial_ids(path: Path, trial_ids: frozenset[str]) -> None:
     )
 
 
-def apply_corpus_frozen_ladder(
-    *, n_positions_new_since_previous_run: int | None,
-    latch: alert_ladder.LatchState, now_ns: int,
+def _apply_ladder(
+    *, is_fresh: bool, latch: alert_ladder.LatchState, now_ns: int,
+    stale_event: str, cleared_event: str, stale_detail: str, cleared_detail: str,
 ) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
-    """Drives `breezy.runtime.alert_ladder`'s shared state machine over this
-    control's own local predicate: fresh (no alert, streak clears) iff no
-    previous run exists to compare against, or this run added at least one
-    NEW position; stale (streak increments) iff a previous run exists and
-    `n_positions_new_since_previous_run == 0`.
-
-    Returns the next latch state to persist and an `AlertPayload` to emit
-    through the caller's sink, or `None` when this run stays silent.
-    """
-    is_fresh = n_positions_new_since_previous_run is None or n_positions_new_since_previous_run > 0
+    """Shared plumbing behind :func:`apply_corpus_frozen_ladder` and
+    :func:`apply_pnl_reconciliation_ladder` -- mirrors
+    `portfolio_roi_report._apply_ladder` byte-for-byte in shape (one shared
+    `alert_ladder` state machine, two LOCAL consumers, each with its own
+    latch file and event names -- D8's ownership rule)."""
     previous_streak = latch.streak
     streak = alert_ladder.next_streak(is_fresh=is_fresh, previous_streak=previous_streak)
 
@@ -210,9 +210,8 @@ def apply_corpus_frozen_ladder(
         )
         if previous_streak >= alert_ladder.WARN_STREAK_THRESHOLD:
             return new_latch, AlertPayload(
-                severity="INFO", event=EXIT_CORPUS_FROZEN_CLEARED_EVENT,
-                site="current_rung_hold_exit_window_study",
-                detail=f"streak_len={previous_streak}",
+                severity="INFO", event=cleared_event,
+                site="current_rung_hold_exit_window_study", detail=cleared_detail,
             )
         return new_latch, None
 
@@ -234,9 +233,105 @@ def apply_corpus_frozen_ladder(
         return new_latch, None
     assert decision.severity is not None
     return new_latch, AlertPayload(
-        severity=decision.severity, event=EXIT_CORPUS_FROZEN_EVENT,
-        site="current_rung_hold_exit_window_study",
-        detail=f"streak={streak} n_positions_new_since_previous_run=0",
+        severity=decision.severity, event=stale_event,
+        site="current_rung_hold_exit_window_study", detail=stale_detail,
+    )
+
+
+EXIT_PNL_RECONCILIATION_MISMATCH_EVENT: Final[str] = "EXIT_PNL_RECONCILIATION_MISMATCH"
+EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT: Final[str] = (
+    "EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED"
+)
+#: Own latch (D8's per-consumer file rule); restart-surviving, same ladder
+#: cadence as `_FROZEN_STREAK_LATCH_FILENAME`.
+_PNL_RECONCILIATION_LATCH_FILENAME: Final[str] = ".pnl_reconciliation_mismatch.json"
+#: The reconciliation matches to the cent while no exit has ever fired
+#: (`exit_gate.py:55`'s `pm_us_crh_exit_v4` stays `DRAFT_NOT_REGISTERED`) --
+#: any non-zero divergence is therefore an alarm, not expected slack.
+_RECONCILIATION_TOLERANCE: Final[Decimal] = Decimal(0)
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Aud04ReconciliationResult:
+    """One reconciliation read against AUD-04's published report.
+
+    **Residual limitation, stated honestly rather than silently narrowed:**
+    AUD-04's `schema_version` reader (`portfolio_roi_report
+    .read_portfolio_roi_report`) exposes only a REPORT-LEVEL
+    `realised_pnl_after_fees_total` today -- it carries no per-`trial_id`
+    breakdown to join against. The plan's literal spec ("inner join on
+    trial_id ... matches to the cent on every joined row") therefore cannot
+    be implemented against AUD-04's CURRENT published schema without AUD-04
+    adding that breakdown (its own stated mirror obligation, AUD-04 plan
+    §8 AC#4) -- this is a genuine cross-item dependency gap, not something
+    this item can close unilaterally by editing another item's file. Until
+    that field exists, this compares `sum_hold_pnl` over EVERY row this
+    study has ever produced against AUD-04's report-level total for the
+    same period -- a real, standing, alerting check (not a no-op), but
+    coarser than the per-row form the plan specifies.
+    """
+
+    matched: bool
+    sum_hold_pnl: Decimal | None
+    aud04_realised_pnl_after_fees_total: Decimal
+    divergence: Decimal | None
+
+
+def reconcile_with_aud04(
+    *, sum_hold_pnl: Decimal | None, aud04_realised_pnl_after_fees_total: Decimal,
+) -> Aud04ReconciliationResult:
+    """Pure comparison -- no I/O. `sum_hold_pnl is None` (an empty corpus)
+    reconciles trivially against a zero AUD-04 total only; any non-zero
+    AUD-04 total against an empty study is an unjoined-row mismatch."""
+    if sum_hold_pnl is None:
+        divergence = aud04_realised_pnl_after_fees_total
+    else:
+        divergence = sum_hold_pnl - aud04_realised_pnl_after_fees_total
+    matched = abs(divergence) <= _RECONCILIATION_TOLERANCE
+    return Aud04ReconciliationResult(
+        matched=matched, sum_hold_pnl=sum_hold_pnl,
+        aud04_realised_pnl_after_fees_total=aud04_realised_pnl_after_fees_total,
+        divergence=divergence,
+    )
+
+
+def apply_pnl_reconciliation_ladder(
+    *, matched: bool, latch: alert_ladder.LatchState, now_ns: int,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Same ladder cadence as `apply_corpus_frozen_ladder`: `matched=True` is
+    fresh (silent, or one `INFO` `..._CLEARED` recovering from a streak);
+    `matched=False` increments the streak toward a weekly `WARN`, daily
+    `CRITICAL` at `streak >= 14`."""
+    previous_streak = latch.streak
+    return _apply_ladder(
+        is_fresh=matched, latch=latch, now_ns=now_ns,
+        stale_event=EXIT_PNL_RECONCILIATION_MISMATCH_EVENT,
+        cleared_event=EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT,
+        stale_detail=f"streak={previous_streak + 1}",
+        cleared_detail=f"streak_len={previous_streak}",
+    )
+
+
+def apply_corpus_frozen_ladder(
+    *, n_positions_new_since_previous_run: int | None,
+    latch: alert_ladder.LatchState, now_ns: int,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Drives `breezy.runtime.alert_ladder`'s shared state machine over this
+    control's own local predicate: fresh (no alert, streak clears) iff no
+    previous run exists to compare against, or this run added at least one
+    NEW position; stale (streak increments) iff a previous run exists and
+    `n_positions_new_since_previous_run == 0`.
+
+    Returns the next latch state to persist and an `AlertPayload` to emit
+    through the caller's sink, or `None` when this run stays silent.
+    """
+    is_fresh = n_positions_new_since_previous_run is None or n_positions_new_since_previous_run > 0
+    previous_streak = latch.streak
+    return _apply_ladder(
+        is_fresh=is_fresh, latch=latch, now_ns=now_ns,
+        stale_event=EXIT_CORPUS_FROZEN_EVENT, cleared_event=EXIT_CORPUS_FROZEN_CLEARED_EVENT,
+        stale_detail=f"streak={previous_streak + 1} n_positions_new_since_previous_run=0",
+        cleared_detail=f"streak_len={previous_streak}",
     )
 
 
@@ -750,6 +845,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--live-catalog-root", type=Path, default=_DEFAULT_LIVE_CATALOG_ROOT)
     parser.add_argument("--run-stamp", required=True, type=str)
     parser.add_argument("--out-root", type=Path, default=_DEFAULT_OUT_ROOT)
+    parser.add_argument(
+        "--aud04-report", type=Path, default=None,
+        help=(
+            "AUD-07 standing reconciliation: optional path to AUD-04's "
+            "PRIVATE_portfolio_roi_<stamp>.json for the SAME period. Read "
+            "through AUD-04's own schema_version reader, never re-parsed "
+            "Markdown. Omitted on any date AUD-04's artefact does not yet "
+            "exist -- the reconciliation is then skipped, never faked."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -824,6 +929,37 @@ def main(
     alert_ladder.write_latch_state(frozen_streak_latch_path, new_frozen_streak_latch)
     if alert_payload is not None:
         emit_alert(resolved_sink, alert_payload)
+
+    # AUD-07 standing reconciliation with AUD-04 (§6, "on any date both
+    # artefacts exist"). Skipped entirely -- never faked as matched -- when
+    # AUD-04's artefact for this date was not supplied.
+    if args.aud04_report is not None:
+        try:
+            aud04_view = read_portfolio_roi_report(args.aud04_report)
+        except (OSError, UnknownPortfolioRoiSchemaError) as exc:
+            print(
+                f"[exit-window-study] AUD-04 reconciliation SKIPPED: could not read "
+                f"{args.aud04_report}: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+        else:
+            reconciliation = reconcile_with_aud04(
+                sum_hold_pnl=summary.sum_hold_pnl,
+                aud04_realised_pnl_after_fees_total=aud04_view.realised_pnl_after_fees_total,
+            )
+            print(
+                f"[exit-window-study] AUD-04 reconciliation: matched={reconciliation.matched} "
+                f"divergence={reconciliation.divergence}",
+                file=sys.stderr,
+            )
+            reconciliation_latch_path = args.out_root / _PNL_RECONCILIATION_LATCH_FILENAME
+            reconciliation_latch = alert_ladder.read_latch_state(reconciliation_latch_path)
+            new_reconciliation_latch, reconciliation_payload = apply_pnl_reconciliation_ladder(
+                matched=reconciliation.matched, latch=reconciliation_latch, now_ns=resolved_now_ns,
+            )
+            alert_ladder.write_latch_state(reconciliation_latch_path, new_reconciliation_latch)
+            if reconciliation_payload is not None:
+                emit_alert(resolved_sink, reconciliation_payload)
 
     if total_fetch_outage:
         print(

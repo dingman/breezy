@@ -45,6 +45,7 @@ import current_rung_hold_exit_window_study as study_mod
 import exit_window_core as ewc
 import exit_window_report as ewr
 import ma_prelock_winner_ask_study as prelock
+import portfolio_roi_report as prr
 import settlement_alignment_study as settlement
 
 _STD_UTC_OFFSET_HOURS = -8.0  # Pacific standard time, matches SFO
@@ -616,6 +617,118 @@ class TestExitCorpusFrozenLadder:
         import re as _re
 
         assert not _re.search(r"\d+\.\d\d\b", payload.detail)
+
+
+# ---------------------------------------------------------------------------
+# 5c. AUD-07 standing reconciliation with AUD-04, read through AUD-04's own
+# schema_version reader (never re-parsed Markdown). See
+# Aud04ReconciliationResult's docstring for the stated residual limitation:
+# AUD-04's published schema carries a REPORT-LEVEL total only, not yet a
+# per-trial_id breakdown to inner-join against (AUD-04's own mirror
+# obligation, AUD-04 plan §8 AC#4) -- this compares totals over the same
+# period until that field exists.
+# ---------------------------------------------------------------------------
+
+
+def _write_minimal_aud04_report(
+    path: Path, *, realised_pnl_after_fees_total: Decimal,
+) -> None:
+    payload = {
+        "schema_version": prr.PORTFOLIO_ROI_SCHEMA_VERSION,
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-10",
+        "n_fills": 1,
+        "n_scored": 1,
+        "n_residual": 0,
+        "n_unreconciled": 0,
+        "power_caveat": "n=1; not statistically powered.",
+        "realised_pnl_after_fees_total": str(realised_pnl_after_fees_total),
+        "capital_deployed_total": "1.00",
+        "unexplained_flow_days": 0,
+        "settled_through": "2026-01-08",
+        "settled_through_statistic": "max",
+        "lag_sample_n": 1,
+        "roi_status": prr.ROI_STATUS_OK,
+        "unsettled_capital_positions": 0,
+        "max_days_past_horizon": 0,
+        "roi": "0.10",
+        "roi_minus_b0": "0.10",
+        "roi_minus_b1": "0.10",
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+class TestAud04Reconciliation:
+    def test_a_matching_total_reconciles(self) -> None:
+        result = study_mod.reconcile_with_aud04(
+            sum_hold_pnl=Decimal("0.61"), aud04_realised_pnl_after_fees_total=Decimal("0.61"),
+        )
+        assert result.matched is True
+        assert result.divergence == Decimal(0)
+
+    def test_a_mismatched_total_does_not_reconcile_and_names_the_divergence(self) -> None:
+        result = study_mod.reconcile_with_aud04(
+            sum_hold_pnl=Decimal("0.61"), aud04_realised_pnl_after_fees_total=Decimal("0.50"),
+        )
+        assert result.matched is False
+        assert result.divergence == Decimal("0.11")
+
+    def test_an_empty_study_against_a_nonzero_aud04_total_is_a_mismatch_never_dropped(
+        self,
+    ) -> None:
+        result = study_mod.reconcile_with_aud04(
+            sum_hold_pnl=None, aud04_realised_pnl_after_fees_total=Decimal("0.50"),
+        )
+        assert result.matched is False
+        assert result.divergence == Decimal("0.50")
+
+    def test_the_reconciliation_reads_aud04_through_its_schema_version_reader(
+        self, tmp_path: Path,
+    ) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_2026-01-10.json"
+        _write_minimal_aud04_report(report_path, realised_pnl_after_fees_total=Decimal("0.61"))
+
+        view = prr.read_portfolio_roi_report(report_path)
+        result = study_mod.reconcile_with_aud04(
+            sum_hold_pnl=Decimal("0.61"),
+            aud04_realised_pnl_after_fees_total=view.realised_pnl_after_fees_total,
+        )
+        assert result.matched is True
+
+
+class TestPnlReconciliationLadder:
+    def test_a_persistent_mismatch_emits_on_the_same_ladder_as_corpus_frozen(self) -> None:
+        latch = _FRESH_LATCH
+        payloads = []
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert [p is not None for p in payloads] == [False, False, True]
+        assert payloads[-1].severity == "WARN"
+        assert payloads[-1].event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_EVENT
+
+    def test_a_matching_run_clears_the_streak_and_emits_one_info(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+        assert latch.streak == 3
+        latch, clear_payload = study_mod.apply_pnl_reconciliation_ladder(
+            matched=True, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert clear_payload.severity == "INFO"
+        assert clear_payload.event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT
+        assert latch.streak == 0
+
+    def test_own_latch_file_is_distinct_from_the_frozen_corpus_latch(self) -> None:
+        assert (
+            study_mod._PNL_RECONCILIATION_LATCH_FILENAME
+            != study_mod._FROZEN_STREAK_LATCH_FILENAME
+        )
 
 
 # ---------------------------------------------------------------------------
