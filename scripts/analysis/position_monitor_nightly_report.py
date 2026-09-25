@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -74,6 +75,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from archive_correction_probe import wilson_interval
 
+from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
 from breezy.persistence.exit_gate import family_declares_exit_rule
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.scored_trial_store import read_scored_trials_pooled
@@ -111,12 +114,91 @@ CALIBRATION_FLOOR_STATION_DAYS: Final[int] = 30
 #: every joined row a decider never fired an exit for.
 _EXIT_RULES: Final[tuple[str, ...]] = ("R_THREAT", "R_DEAD")
 _SETTLED_GROUP: Final[str] = "SETTLED"
-#: The one family this report has ever covered to date; used only as the
-#: `RuleSeries.family` label when no explicit `FamilyManifest` is supplied
-#: (`main`'s `--family-manifest` is optional). Never influences `armed`,
-#: which is `False` whenever no manifest is supplied, regardless of this
-#: label.
-_DEFAULT_MONITORED_FAMILY_ID: Final[str] = "pm_us_crh_cont"
+#: AUD-07 C1(ii): explicit sentinel for "no `--family-manifest` supplied" --
+#: replaces the old `_DEFAULT_MONITORED_FAMILY_ID = "pm_us_crh_cont"` default
+#: literal, which read like a real binding when the wrapper simply never
+#: passed the (optional) flag (the report was UNBOUND, not mis-bound to
+#: `pm_us_crh_cont`). Never influences `armed`, which is `False` whenever no
+#: manifest is supplied, regardless of this label.
+_UNBOUND_FAMILY_LABEL: Final[str] = "UNBOUND"
+
+#: AUD-07 C1(i): two REGISTERED families can share a `trial_id_prefix`
+#: (AUD-05 D-D: `pm_us_crh_v4` and `pm_us_crh_cont` both use
+#: `"continuous_rung_hold/trial/"`) -- a trial matching more than one
+#: registered prefix is reported as ambiguous rather than silently picked.
+_AMBIGUOUS_FAMILY_LABEL: Final[str] = "AMBIGUOUS_FAMILY"
+
+
+def resolve_trial_family(
+    trial_id: str, registered_manifests: Sequence[FamilyManifest]
+) -> str | None:
+    """`trial_id`'s owning REGISTERED family, resolved by `trial_id_prefix`.
+
+    Returns the single matching `family_id` when exactly one registered
+    manifest's prefix matches, `_AMBIGUOUS_FAMILY_LABEL` when more than one
+    matches, or `None` when none match (the trial belongs to no family this
+    report was told about).
+    """
+    matches = {
+        manifest.family_id
+        for manifest in registered_manifests
+        if trial_id.startswith(manifest.trial_id_prefix)
+    }
+    if len(matches) > 1:
+        return _AMBIGUOUS_FAMILY_LABEL
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
+def _open_readonly_state_db(path: Path) -> sqlite3.Connection | None:
+    """Independent `mode=ro` open, mirroring `fill_time_count.py`'s own idiom
+    (`:84-98`) -- a separate implementation on purpose (AUD-07 §7 step 1 R2):
+    this report's ledger count must be a structurally different read from
+    whatever the exit-window study or the scorer already computed, never a
+    shared helper two independently-wrong callers could both misuse
+    identically."""
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn.execute("SELECT 1 FROM state LIMIT 1")
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def count_ledger_fill_records(
+    source_path: Path, *, since_ts_ns: int | None = None
+) -> int | None:
+    """Independent, structurally different count of `DurableFillRecord` rows
+    under `FILL_KEY_PREFIX` in the exec-state store -- the same ledger AUD-04
+    reads (`client.py:641`, `:384`). `None` (fail-closed, never zero) when the
+    store cannot be opened or read as this schema. `since_ts_ns`, when given,
+    drops any record whose `ts_event` precedes it.
+    """
+    conn = _open_readonly_state_db(source_path)
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute("SELECT key, value FROM state").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    count = 0
+    for key, value in rows:
+        if not isinstance(key, str) or not key.startswith(FILL_KEY_PREFIX):
+            continue
+        try:
+            record = DurableFillRecord.from_bytes(value)
+        except ExecutionReportMappingError:
+            continue
+        if since_ts_ns is not None and record.ts_event < since_ts_ns:
+            continue
+        count += 1
+    return count
 #: Same per-contract fee coefficient `decision.py`/`monitor_evidence.py`
 #: already require (`CurrentRungHoldConfig.required_fee_coefficient`) --
 #: read from that ONE source rather than re-declaring `Decimal("0.06")`
@@ -352,6 +434,17 @@ class MonitorReport:
     #: INC-E5: keyed by `"R_THREAT"`, `"R_DEAD"`, `"SETTLED"` -- see
     #: `RuleSeries` and the module docstring's INC-E5 paragraph.
     exit_rule_series: Mapping[str, RuleSeries]
+    #: AUD-07 C1(i): trial ids whose `trial_id_prefix` matches more than one
+    #: REGISTERED family passed via `--registered-family-manifest` -- never
+    #: silently attributed to one of them.
+    ambiguous_family_trial_ids: tuple[str, ...]
+    #: AUD-07 C2/C3: an INDEPENDENT, structurally different count of
+    #: `DurableFillRecord` rows in the exec-state ledger over the same
+    #: period as `total_positions` (`--exec-state-db`), or `None` when that
+    #: flag was not supplied. The monitor-summaries universe
+    #: (`total_positions`) and the ledger universe are DIFFERENT stores --
+    #: see `_render_markdown`'s "position universe" line.
+    ledger_fill_count: int | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -382,6 +475,8 @@ class MonitorReport:
             "exit_rule_series": {
                 rule: series.to_dict() for rule, series in self.exit_rule_series.items()
             },
+            "ambiguous_family_trial_ids": list(self.ambiguous_family_trial_ids),
+            "ledger_fill_count": self.ledger_fill_count,
         }
 
 
@@ -591,7 +686,7 @@ def _exit_rule_series(
     absence of an exit, not a rule that could fire).
     """
     family = (
-        family_manifest.family_id if family_manifest is not None else _DEFAULT_MONITORED_FAMILY_ID
+        family_manifest.family_id if family_manifest is not None else _UNBOUND_FAMILY_LABEL
     )
     gate_open = family_manifest is not None and family_declares_exit_rule(family_manifest)
 
@@ -751,6 +846,8 @@ def build_monitor_report(
     n_min: int = DEFAULT_N_MIN,
     usable_station_days: int | None = None,
     family_manifest: FamilyManifest | None = None,
+    registered_manifests: Sequence[FamilyManifest] = (),
+    ledger_fill_count: int | None = None,
 ) -> MonitorReport:
     """Build the nightly report purely from already-read `summaries`/`scored_trials`.
 
@@ -761,8 +858,18 @@ def build_monitor_report(
     INC-8 hypothetical-hold corpus, which never has a `ScoredTrial` by
     construction), else unsettled -- see `_join`. A summary settled neither
     way is counted as unsettled, never dropped and never treated as settled.
+
+    `registered_manifests` (AUD-07 C1(i)) and `ledger_fill_count` (C2/C3) are
+    both already-read, pure inputs -- this function performs no I/O of its
+    own; `main` reads the manifests and the ledger and passes the results in.
     """
     joined, unsettled = _join(summaries, scored_trials)
+    ambiguous_family_trial_ids = tuple(
+        summary.trial_id
+        for summary in summaries
+        if resolve_trial_family(summary.trial_id, registered_manifests)
+        == _AMBIGUOUS_FAMILY_LABEL
+    )
     settled_from_scored_trials = sum(
         1 for row in joined if row.settlement_source == _SOURCE_SCORED_TRIAL
     )
@@ -793,6 +900,30 @@ def build_monitor_report(
         exit_rule_series=MappingProxyType(
             _exit_rule_series(joined, family_manifest=family_manifest)
         ),
+        ambiguous_family_trial_ids=ambiguous_family_trial_ids,
+        ledger_fill_count=ledger_fill_count,
+    )
+
+
+def _position_universe_line(report: MonitorReport) -> str:
+    """AUD-07 C2/C3: state the report's position universe explicitly against
+    the independent ledger count, rather than printing a bare `positions: N`
+    that reads as "there are none" when the two stores disagree (the
+    silent 0-vs-5 disagreement this line exists to close)."""
+    if report.ledger_fill_count is None:
+        return (
+            f"position universe: monitor summaries (N={report.total_positions}); "
+            "ledger fills: UNAVAILABLE (--exec-state-db not supplied)"
+        )
+    if report.ledger_fill_count == report.total_positions:
+        return (
+            f"position universe: monitor summaries (N={report.total_positions}); "
+            f"ledger fills over the same period: {report.ledger_fill_count} -- RECONCILED"
+        )
+    return (
+        f"position universe: monitor summaries (N={report.total_positions}); "
+        f"ledger fills over the same period: {report.ledger_fill_count} -- "
+        "DIFFERENT UNIVERSES"
     )
 
 
@@ -809,6 +940,16 @@ def _render_markdown(report: MonitorReport) -> str:
             f"settled by source: scored_trials={report.settled_from_scored_trials} "
             f"summary={report.settled_from_summary}"
         ),
+        _position_universe_line(report),
+    ]
+    if report.ambiguous_family_trial_ids:
+        lines.append(
+            "AMBIGUOUS_FAMILY: "
+            f"{len(report.ambiguous_family_trial_ids)} trial(s) match more than one "
+            "REGISTERED family's trial_id_prefix and are not attributed to either: "
+            + ", ".join(report.ambiguous_family_trial_ids)
+        )
+    lines += [
         (
             f"premature-exit rate: point={report.premature_exit_rate.point} "
             f"[{report.premature_exit_rate.lower:.4f}, {report.premature_exit_rate.upper:.4f}] "
@@ -830,8 +971,11 @@ def _render_markdown(report: MonitorReport) -> str:
     ]
     for group in (*_EXIT_RULES, _SETTLED_GROUP):
         rule_series = report.exit_rule_series[group]
+        family_label = rule_series.family
+        if family_label == _UNBOUND_FAMILY_LABEL:
+            family_label = f"{_UNBOUND_FAMILY_LABEL} (no manifest supplied)"
         lines.append(
-            f"{group}: ARMED: {rule_series.armed} family: {rule_series.family} "
+            f"{group}: ARMED: {rule_series.armed} family: {family_label} "
             f"n={rule_series.n} realized_pnl_total={rule_series.realized_pnl_total} "
             f"avoided_loss_total={rule_series.avoided_loss_total} "
             f"premature_exit_rate point={rule_series.premature_exit_rate.point} "
@@ -868,6 +1012,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "of the default"
         ),
     )
+    parser.add_argument(
+        "--registered-family-manifest", type=Path, action="append", default=[],
+        help=(
+            "AUD-07 C1(i): every REGISTERED deploy/families/<family>.json path "
+            "the wrapper enumerated this run (repeatable) -- used only to detect "
+            "a trial_id matching more than one REGISTERED family's "
+            "trial_id_prefix (AMBIGUOUS_FAMILY), never to pick one."
+        ),
+    )
+    parser.add_argument(
+        "--exec-state-db", type=Path, default=None,
+        help=(
+            "AUD-07 C2/C3: optional read-only path to the exec-state "
+            "SqliteStateStore, for an INDEPENDENT ledger fill count stated "
+            "against the monitor-summaries position universe."
+        ),
+    )
     args = parser.parse_args(argv)
 
     summaries = read_monitor_summaries(args.summaries_dir)
@@ -889,12 +1050,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         # state can be reported, never refused just for being unregistered.
         family_manifest = load_family_manifest(args.family_manifest, allow_draft=True)
 
+    #: REGISTERED-only (no `allow_draft`): a family that cannot yet arm
+    #: anything cannot be ambiguous with a live one either.
+    registered_manifests = tuple(
+        load_family_manifest(path) for path in args.registered_family_manifest
+    )
+
+    ledger_fill_count: int | None = None
+    if args.exec_state_db is not None:
+        ledger_fill_count = count_ledger_fill_records(args.exec_state_db)
+
     report = build_monitor_report(
         summaries,
         scored_trials,
         n_min=args.n_min,
         usable_station_days=usable_station_days,
         family_manifest=family_manifest,
+        registered_manifests=registered_manifests,
+        ledger_fill_count=ledger_fill_count,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -744,25 +744,30 @@ class TestExitRuleSeries:
         assert report.exit_rule_series["R_THREAT"].n == 0
         assert report.exit_rule_series["R_DEAD"].n == 0
 
-    def test_default_manifest_reports_armed_false_for_pm_us_crh_cont(
+    def test_an_unbound_run_renders_UNBOUND_not_a_default_family(
         self, report_mod: ModuleType
     ) -> None:
+        """AUD-07 C1(ii): no `--family-manifest` supplied means the report is
+        UNBOUND, not silently bound to `pm_us_crh_cont` (the old default
+        literal that read like a real binding)."""
         report = report_mod.build_monitor_report((), ())
 
         for rule in ("R_THREAT", "R_DEAD", "SETTLED"):
             rule_series = report.exit_rule_series[rule]
             assert rule_series.armed is False
-            assert rule_series.family == "pm_us_crh_cont"
+            assert rule_series.family == "UNBOUND"
+            assert rule_series.family != "pm_us_crh_cont"
 
-    def test_markdown_renders_the_armed_line_false_for_pm_us_crh_cont(
+    def test_markdown_renders_the_unbound_family_line_with_a_note(
         self, report_mod: ModuleType
     ) -> None:
         report = report_mod.build_monitor_report((), ())
         markdown = report_mod._render_markdown(report)
 
-        assert "R_THREAT: ARMED: False family: pm_us_crh_cont" in markdown
-        assert "R_DEAD: ARMED: False family: pm_us_crh_cont" in markdown
-        assert "SETTLED: ARMED: False family: pm_us_crh_cont" in markdown
+        assert "R_THREAT: ARMED: False family: UNBOUND (no manifest supplied)" in markdown
+        assert "R_DEAD: ARMED: False family: UNBOUND (no manifest supplied)" in markdown
+        assert "SETTLED: ARMED: False family: UNBOUND (no manifest supplied)" in markdown
+        assert "pm_us_crh_cont" not in markdown
 
     def test_a_code_registered_manifest_declaring_exit_rule_arms_the_exit_rules_only(
         self, report_mod: ModuleType
@@ -839,7 +844,7 @@ class TestExitRuleSeries:
         assert isinstance(r_threat_payload["realized_pnl_total"], str)
         assert isinstance(r_threat_payload["avoided_loss_total"], str)
         assert r_threat_payload["armed"] is False
-        assert r_threat_payload["family"] == "pm_us_crh_cont"
+        assert r_threat_payload["family"] == "UNBOUND"
 
     def test_missing_entry_fee_join_excludes_the_row_from_pricing_but_counts_it(
         self, report_mod: ModuleType
@@ -1020,3 +1025,209 @@ class TestCli:
         payload = json.loads(out_path.read_text())
         assert payload["total_positions"] == 1
         assert payload["settled_from_scored_trials"] == 1
+
+
+def _manifest(**overrides: object) -> FamilyManifest:
+    base: dict[str, object] = {
+        "family_id": "pm_us_crh_v4",
+        "venue": "polymarket_us",
+        "taker_fee_coefficient": Decimal("0.0695"),
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "d0_climate_day": "2026-09-12",
+        "boundary_artefact_path": Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+        "boundary_inputs_sha256": "a" * 64,
+        "composition_kind": "continuous_rung_hold",
+        "density_artefact_path": Path("deploy/families/artefacts/not_applicable_density.json"),
+        "density_artefact_sha256": (
+            "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65"
+        ),
+        "stations": ("SFO",),
+        "status": "REGISTERED",
+        "manifest_sha256": "e" * 64,
+    }
+    base.update(overrides)
+    return FamilyManifest(**base)  # type: ignore[arg-type]
+
+
+class TestResolveTrialFamily:
+    """AUD-07 C1(i): a trial matching more than one REGISTERED family's
+    `trial_id_prefix` is AMBIGUOUS_FAMILY, never silently picked."""
+
+    def test_a_trial_matching_exactly_one_registered_prefix_resolves_to_it(
+        self, report_mod: ModuleType
+    ) -> None:
+        manifests = (
+            _manifest(family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/"),
+        )
+        result = report_mod.resolve_trial_family(
+            "current_rung_hold/trial/SFO/2026-09-01/x.POLYMARKET_US", manifests
+        )
+        assert result == "pm_us_crh_v2"
+
+    def test_a_trial_matching_no_registered_prefix_resolves_to_none(
+        self, report_mod: ModuleType
+    ) -> None:
+        manifests = (
+            _manifest(family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/"),
+        )
+        result = report_mod.resolve_trial_family(
+            "paper_replay/current_rung_hold/trial/x", manifests
+        )
+        assert result is None
+
+    def test_two_registered_families_sharing_a_prefix_yield_ambiguous_family(
+        self, report_mod: ModuleType
+    ) -> None:
+        """AUD-05 D-D: `pm_us_crh_v4` and `pm_us_crh_cont` both use
+        `"continuous_rung_hold/trial/"`."""
+        manifests = (
+            _manifest(family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/"),
+            _manifest(family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/"),
+        )
+        result = report_mod.resolve_trial_family(
+            "continuous_rung_hold/trial/SFO/2026-09-01/x.POLYMARKET_US", manifests
+        )
+        assert result == "AMBIGUOUS_FAMILY"
+
+
+class TestAmbiguousFamilyReporting:
+    def test_a_summary_matching_two_registered_families_is_reported_ambiguous(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (_summary(trial_id="continuous_rung_hold/trial/SFO/2026-09-01/x"),)
+        manifests = (
+            _manifest(family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/"),
+            _manifest(family_id="pm_us_crh_cont", trial_id_prefix="continuous_rung_hold/trial/"),
+        )
+        report = report_mod.build_monitor_report(summaries, (), registered_manifests=manifests)
+        assert report.ambiguous_family_trial_ids == (
+            "continuous_rung_hold/trial/SFO/2026-09-01/x",
+        )
+        markdown = report_mod._render_markdown(report)
+        assert "AMBIGUOUS_FAMILY: 1 trial(s)" in markdown
+
+    def test_two_registered_families_are_each_reported_separately(
+        self, report_mod: ModuleType
+    ) -> None:
+        """A trial owned by exactly one of two REGISTERED families is never
+        marked ambiguous."""
+        summaries = (_summary(trial_id="current_rung_hold/trial/SFO/2026-09-01/x"),)
+        manifests = (
+            _manifest(family_id="pm_us_crh_v2", trial_id_prefix="current_rung_hold/trial/"),
+            _manifest(family_id="pm_us_crh_v4", trial_id_prefix="continuous_rung_hold/trial/"),
+        )
+        report = report_mod.build_monitor_report(summaries, (), registered_manifests=manifests)
+        assert report.ambiguous_family_trial_ids == ()
+
+
+class TestPositionUniverse:
+    """AUD-07 C2/C3: the report must state its position universe against an
+    INDEPENDENT ledger count, never a bare `positions: N` that reads as
+    "there are none" when the two stores disagree."""
+
+    def test_no_exec_state_db_supplied_renders_ledger_unavailable(
+        self, report_mod: ModuleType
+    ) -> None:
+        report = report_mod.build_monitor_report((), ())
+        markdown = report_mod._render_markdown(report)
+        assert (
+            "position universe: monitor summaries (N=0); "
+            "ledger fills: UNAVAILABLE (--exec-state-db not supplied)" in markdown
+        )
+
+    def test_a_reconcilable_ledger_count_renders_reconciled(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (_summary(trial_id="A"),)
+        report = report_mod.build_monitor_report(summaries, (), ledger_fill_count=1)
+        markdown = report_mod._render_markdown(report)
+        assert (
+            "position universe: monitor summaries (N=1); "
+            "ledger fills over the same period: 1 -- RECONCILED" in markdown
+        )
+
+    def test_a_mismatched_ledger_count_renders_different_universes_not_a_bare_zero(
+        self, report_mod: ModuleType
+    ) -> None:
+        report = report_mod.build_monitor_report((), (), ledger_fill_count=5)
+        markdown = report_mod._render_markdown(report)
+        assert (
+            "position universe: monitor summaries (N=0); "
+            "ledger fills over the same period: 5 -- DIFFERENT UNIVERSES" in markdown
+        )
+        # The silent 0-vs-5 disagreement this line exists to close: a bare
+        # "positions: 0" must never be the only signal.
+        assert "DIFFERENT UNIVERSES" in markdown
+
+
+class TestIndependentLedgerFillCount:
+    """AUD-07 §7 step 1 (R2): a SECOND, structurally different read of the
+    exec-state ledger -- never a wrapper over the same code path the study
+    already uses -- so two independently-wrong reads that happen to agree
+    can no longer satisfy the criterion silently."""
+
+    def test_an_absent_store_returns_none_not_zero(
+        self, tmp_path: Path, report_mod: ModuleType
+    ) -> None:
+        result = report_mod.count_ledger_fill_records(tmp_path / "does_not_exist.sqlite")
+        assert result is None
+
+    def test_a_store_with_two_fill_records_counts_both(
+        self, tmp_path: Path, report_mod: ModuleType
+    ) -> None:
+        from decimal import Decimal as D
+
+        from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+        from breezy.runtime.sqlite_store import SqliteStateStore
+
+        store_path = tmp_path / "exec_state.sqlite"
+        store = SqliteStateStore(store_path)
+        try:
+            for i in range(2):
+                record = DurableFillRecord(
+                    venue_order_id=f"order-{i}",
+                    client_order_id=f"client-{i}",
+                    instrument_id="sfo-86-87.POLYMARKET_US",
+                    order_side="BUY",
+                    cumulative_qty=D(1),
+                    cumulative_cost=D("0.55"),
+                    cumulative_fee=D("0.02"),
+                    fee_reconciled=True,
+                    ts_event=1_757_000_000_000_000_000 + i,
+                )
+                store.set(f"exec/polymarket_us/fill/order-{i}", record.to_bytes())
+        finally:
+            store.close()
+
+        result = report_mod.count_ledger_fill_records(store_path)
+        assert result == 2
+
+    def test_since_ts_ns_drops_earlier_fill_records(
+        self, tmp_path: Path, report_mod: ModuleType
+    ) -> None:
+        from decimal import Decimal as D
+
+        from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+        from breezy.runtime.sqlite_store import SqliteStateStore
+
+        store_path = tmp_path / "exec_state.sqlite"
+        store = SqliteStateStore(store_path)
+        try:
+            for i, ts in enumerate((1_000, 2_000_000_000_000)):
+                record = DurableFillRecord(
+                    venue_order_id=f"order-{i}",
+                    client_order_id=f"client-{i}",
+                    instrument_id="sfo-86-87.POLYMARKET_US",
+                    order_side="BUY",
+                    cumulative_qty=D(1),
+                    cumulative_cost=D("0.55"),
+                    cumulative_fee=D("0.02"),
+                    fee_reconciled=True,
+                    ts_event=ts,
+                )
+                store.set(f"exec/polymarket_us/fill/order-{i}", record.to_bytes())
+        finally:
+            store.close()
+
+        result = report_mod.count_ledger_fill_records(store_path, since_ts_ns=1_000_000_000)
+        assert result == 1
