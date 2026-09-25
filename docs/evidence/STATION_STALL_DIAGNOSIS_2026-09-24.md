@@ -151,3 +151,70 @@ Every Python run used `systemd-run --user --scope -q -p MemoryMax=4G /home/jon/b
 - `lax_trace.py`: logs each crossing of LAX 78-79 / 80-81 into and out of the band between 20:00Z and 22:00Z (E3).
 - `nogap.py <day>`: counts in-window ticks where the YES ask is out of band but `1 - bid` is in band (F-1).
 - Observation max: iterate `observations_2026-09-20.jsonl`, dedupe on `(observed_at, is_metar)`, and track the running max with its first `fetched_at_ns` (E5).
+
+## F-4 disposition (STALL_FOLLOWUPS_F1_F4_2026-09-24.md §F-4; added by the F-2/F-4 implementer, 2026-09-25)
+
+**The gate is intended.** `is_intent_open()` (`trial_day_latch.py:643-662`) is the
+account-wide R-7 singleton: "one order in flight at a time across the whole
+account" (`MULTI_POSITION_PER_STATION_2026-09-14.md:100,113`). The 09-14
+ruling lifted only one-position-per-station; the account-wide singleton
+stands. The 09-23 row above (LAX 100,284 / MDW 27,611 / SFO 115,468
+`open_intent_wait`) is this gate working as designed while a DIFFERENT
+defect (an AMBIGUOUS order the resolver could not retire) kept the
+singleton OPEN far longer than intended. That defect, not the gate, is
+what this addendum measures.
+
+**Measurement (read-only, `breezy-trade-20260923T165046Z.log` /
+`breezy-trade-20260924T183812Z.log`, journalctl for `breezy-trade-supervisor`).**
+
+- Intent opened 2026-09-23T17:22:07.912Z: `POLYMARKET_US` create-order for
+  venue order `CP05MNWMAWP6` came back AMBIGUOUS ("create-order outcome is
+  AMBIGUOUS; latch stays open and the booking is held").
+- Every ~5 min from then on, the resolver's GET for `CP05MNWMAWP6` refused
+  to map: `ExecutionReportMappingError: order status report field
+  'leavesQuantity' does not equal 'quantity' minus 'cumQuantity'`, backoff
+  climbing 1 → 285 consecutive failures.
+- 2026-09-24T16:40:01.836Z: `open_intent_stale` CRITICAL fires (intent OPEN
+  and AMBIGUOUS for >15 min — a per-check threshold, not the total age).
+- 2026-09-24T16:40:12Z: the node is stopped (matches
+  `node-refused-on-terminal-leaves-2026-09-24.md`: the next boot refused to
+  launch on this same unresolved intent; A1 halt set 16:42Z).
+- **Retired interval: ~23h18m** (17:22:07Z 09-23 → 16:40:12Z 09-24) — the
+  intent was never retired by the resolver's own logic during that window;
+  it was cleared out of band once the fix below landed (per
+  `audit-backlog-execution-2026-09-24.md`: "intent retired, node
+  hand-launched 20:15Z" on 09-24).
+
+**Counterfactual, with mechanism (verified `git show --stat`, both SHAs
+exist and merged on 09-24, AFTER the incident):**
+
+- `df66327` ("a terminal non-fill order's leaves is zero") — its own commit
+  message names root cause "the state-blind leaves check kept the intent
+  OPEN (285 failures)", the SAME count measured above for `CP05MNWMAWP6`.
+  The venue's GET for this order reports `ORDER_STATE_EXPIRED qty=1 cum=0
+  leaves=0`; the pre-fix mapper treated `leaves != quantity - cumQuantity`
+  (`0 != 1-0`) as an unresolvable contradiction rather than reading the
+  terminal `EXPIRED` state's own `leaves=0` as authoritative. **Mechanism:**
+  had `df66327` been live before 17:22:07Z, the very FIRST resolver GET
+  (within the ~5 min poll interval) would have classified this order as a
+  terminal non-fill and retired the intent — shortening the ~23h18m
+  interval to roughly one poll cycle (single-digit minutes).
+- `c3398bb` ("the AMBIGUOUS resolver loads a past-day instrument from the
+  local catalog") fixes a SEPARATE failure mode: a node that only caches
+  today's instruments loops forever on "instrument not in cache" when a
+  leftover intent references YESTERDAY's instrument, blocking every
+  subsequent launch. **Mechanism:** this is orthogonal to the 285
+  mapping-error failures measured above (those failed on the leaves check,
+  never reached an instrument-cache lookup); it would matter only if
+  resolution had NOT completed same-day under `df66327` and the node had
+  restarted into a new catalog day. Given `df66327` alone would have
+  resolved this specific intent within the same UTC day, `c3398bb` was not
+  the interval's binding constraint for this incident, but closes the
+  otherwise-open next-day launch-deadlock path (L-48's "clearing path").
+
+**L-48's clearing-path row for the intent latch:** OPEN → (resolver GET
+maps a terminal state OR a confirmed fill) → `retire()` clears the
+singleton. On 09-23/09-24 the GET never mapped (the state-blind leaves
+check), so the latch had no clearing path available until `df66327`
+shipped — exactly the "clearing path was blocked" reading the plan's F-4
+disposition already names.
