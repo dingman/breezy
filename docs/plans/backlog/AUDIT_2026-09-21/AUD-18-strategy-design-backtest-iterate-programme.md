@@ -752,7 +752,9 @@ sufficiency, rather than leaving that judgement scattered across memories.
 | **`pm_us_crh_v4` archive-table recalibration** (fix the train/serve skew so the family can price at all) | **BLOCKED on data, not closed** | `DECISION_FUNNEL_2026-09-20.md`: "the family is currently UNSALVAGEABLE, not merely miscalibrated" **absent real historical venue ladders, which do not exist**; the corpus is 2021-2025 CLI-derived, the live decision path needs interval-aware venue-priced ladders that only exist from tape start (2026-08-30) forward | Registered `PARKED_INSUFFICIENT_DATA`; re-triaged automatically (§6.4) as AUD-09a's census accumulates SUFFICIENT station-days; **not** evaluated until `min_station_days` is met per-cluster (station × season × hour × width × m — the corpus's own strata) |
 | **Maker/resting-bid redesign** (`pm_us_crh_rest_v5` folded `CLOSED_NOT_REGISTERED` as originally drafted) | **CLOSED as drafted; a genuinely different redesign is a NEW registration** | `POST_FORECAST_PHASE §0.2`: "resting −2.550 vs IOC −2.09... loses more than the baseline it must beat" | A future redesign is a fresh `hypothesis_id` with its own `K_variants`; this item does not propose one, per §5's exclusion |
 | **NO-side hunting** | **BLOCKED on capture, not closed** — standing requirement (memory `no-side-hunting-is-a-requirement`) | `POST_FORECAST_PHASE §0.3`/work packages C0-C2: NO leg has **never been priced** (zero `^no` dirs in `order_book_depths`/`quote_tick`/`trade_tick`); C1/C2's own n≥30 gate, owned by AUD-02, is upstream of this item | Registered `PARKED_INSUFFICIENT_DATA`; triage (§6.4) reads C1/C2's own capture progress once it exists — this item adds no new capture path, per §5 |
-| **Hours 10-11 repricing window (HUNT-1/WIN-1)** | **BLOCKED, structurally, not closed** | `DECISION_FUNNEL_2026-09-20.md`: 100% of decisions die upstream of pricing (`observation_ambiguous` then `illegal_cell`); HUNT-1 is "moot" until Gate 1/Gate 2 are fixed — and the funnel's own follow-on measurement REJECTED all three candidate fixes to Gate 1 ("no live sub-degree high-cadence observation source has been found to exist") | Registered `PARKED_INSUFFICIENT_DATA` with reason `OBSERVATION_GATE_UNRESOLVED`; owned upstream by AUD-01/the Gate-1 design track, cited by id, never re-decided here |
+| **Hours 10-11 repricing window (HUNT-1/WIN-1)** | **BLOCKED, structurally, not closed** | `DECISION_FUNNEL_2026-09-20.md`: 100% of decisions die upstream of pricing (`observation_ambiguous` then `illegal_cell`); HUNT-1 is "moot" until Gate 1/Gate 2 are fixed — and the funnel's own follow-on measurement REJECTED all three candidate fixes to Gate 1 ("no live sub-degree high-cadence observation source has been found to exist") | Registered `PARKED_INSUFFICIENT_DATA` with reason `OBSERVATION_GATE_UNRESOLVED`[^footnote-gate-unresolved]; owned upstream by AUD-01/the Gate-1 design track, cited by id, never re-decided here |
+
+[^footnote-gate-unresolved]: Distinction: `OBSERVATION_GATE_UNRESOLVED` means the hypothesis is blocked **pre-registration**, upstream of any power check (the input to `register_hypothesis` is undefined — no station-day sample exists). `UNDERPOWERED_NOT_REGISTERED` means a hypothesis **reached** `register_hypothesis`, its power check ran, but MDE exceeds bound — two different gates at two different pipeline stages.
 | **Kalshi surface** (24 cities, 5-min cadence) | **Out of programme scope** | memory `polymarket-us-first-kalshi-secondary`, `kalshi-lists-24-cities-all-5min` | Not registered; named for completeness only, per §5's exclusion |
 
 **Reading this table honestly:** four of six classes are BLOCKED on data or on
@@ -870,6 +872,8 @@ It:
    stall, without changing status — data insufficiency is not a failed test,
    and must not be scored as one.
 
+**Amendment 2026-09-25 (step 8).** Manual wp7b re-run cadence for NO-side capture status: the `wp7b_market_as_forecaster.py --since <last freeze>` script is re-run by hand whenever a coordinator has reason to believe accrual since the last run may have crossed the C1/C2 capture bar of `0.25 station-days` (at minimum, once every 21 days, mirroring this section's step 7 horizon). A crossing is recorded as a dated addendum to the most recent C1/C2 disposition ruling, never as an automated `hypothesis_ledger.py` input, and never silently — the addendum itself is the record, mirroring `RULING_aud02_step5_dispositions_2026-09-25.md`'s own issuance pattern.
+
 ### 6.4b Scheduling — AUD-18's own unit, ordered after AUD-09, never inside its wrapper
 
 Because AUD-09 **B18**/AUD-10 **C19** close `deploy/systemd/replay-daily-run.sh`
@@ -960,6 +964,32 @@ stated plainly, exactly as `POST_FORECAST_PHASE §2` already states it for the
 flagship family — is **"nothing arms," and PM.us daily-high rungs close as a
 programme.** This is the acceptance test's non-trading branch (§8); it is not
 a failure of this plan, it is the plan doing its job.
+
+**On reaching the KILL state above, the programme's conclusion is scoped to
+PM.us daily-high rungs specifically, not to weather-prediction trading as a
+venue-agnostic objective.** The KILL escalates to a peer ruling (per the
+2026-09-25 step-8 amendment) with an explicit recommendation to redirect
+engineering investment toward the next-highest-leverage lever this repo has
+already identified and partially scaffolded, rather than an open-ended "look
+for something else":
+
+- **Primary candidate: Kalshi.** Parked on `wip/kalshi-s4-registry` (memory
+  `polymarket-us-first-kalshi-secondary`, binding — Kalshi was never in scope
+  for AUD-18 itself and remains so; this is a pointer for the POST-KILL
+  successor work). Kalshi's surface materially changes the sample-size constraint
+  that drove this programme's own worked expectation of a KILL (§9, §11):
+  **24 cities at 5-minute cadence** (memory `kalshi-lists-24-cities-all-5min`)
+  versus PM.us's **5 cities, daily-HIGH only** (memory
+  `polymarket-us-surface-is-5-cities-high-only`) — roughly a 24x city count
+  and a ~288x-finer settlement cadence, which is the single lever this
+  programme's own §9 identifies as the way to clear a power-check bar
+  ("raising `n`... more stations, or a longer pre-registered horizon"). A
+  Kalshi successor would need its OWN AUD-18-shaped programme (its own ledger,
+  its own alpha budget, its own §6.3-equivalent triage).
+- **Named caveat, not a reason to prefer PM.us's failure mode:** Kalshi settles
+  on **The Weather Company** data, not NWS (memory `both-venues-settle-on-nws`,
+  CORRECTED — per-station reconciliation is mandatory before any Kalshi
+  hypothesis could reuse this programme's settlement primitives unmodified).
 
 ## 7. Ordered implementation or verification steps
 
@@ -1314,11 +1344,12 @@ saying whether that is data or abandonment). **On the honest expectation:**
 given PM.us's 5-city daily-HIGH sample and the cost of this correction (§9),
 the more likely terminus of this programme is an evidenced KILL — PM.us
 daily-high rungs close, and continued engineering investment is redirected —
-not a CONFIRMED hypothesis. §9's worked power check makes that expectation
-numerical rather than rhetorical: at the floor allocation the detectable edge
-is `0.1032` at `n = 300` station-days and `0.0730` at `n = 600` — 7 to 10
-points net of a `0.0695`-coefficient fee and AUD-12's slippage allowance —
-against a venue where this repo has never evidenced an edge of that size.
+not a CONFIRMED hypothesis (see §6.6 for the KILL-state successor naming).
+§9's worked power check makes that expectation numerical rather than rhetorical:
+at the floor allocation the detectable edge is `0.1032` at `n = 300` station-days
+and `0.0730` at `n = 600` — 7 to 10 points net of a `0.0695`-coefficient fee
+and AUD-12's slippage allowance — against a venue where this repo has never
+evidenced an edge of that size.
 **Those figures are PRIMARY-TEST power only (see §6.1 POWER-PRIMARY-ONLY),
 which binds every downstream citation of them — a ruling author, AUD-02/A1 or
 AUD-10b.** What that changes for THIS section's expectation: it makes the
