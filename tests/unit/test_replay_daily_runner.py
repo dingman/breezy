@@ -8,12 +8,15 @@ dependency injection) and a recording fake `AlertSink` (B19/R-e).
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
@@ -119,6 +122,33 @@ def _terminal_row(
     )
 
 
+def _write_manifest(
+    path: Path, *, composition_kind: str = "continuous_rung_hold", family_id: str = "pm_us_crh_v4"
+) -> Path:
+    """A minimal REGISTERED, pinned manifest fixture -- shape mirrors
+    `deploy/families/*.json`, real enough for `load_family_manifest` to
+    accept it. Review fix 2: composition_kind is the axis under test."""
+    path.write_text(
+        json.dumps(
+            {
+                "family_id": family_id,
+                "venue": "polymarket_us",
+                "trial_id_prefix": "trial/",
+                "d0_climate_day": "2026-09-01",
+                "boundary_artefact_path": "deploy/families/artefacts/boundary.json",
+                "boundary_inputs_sha256": "b" * 64,
+                "stations": [STATION],
+                "status": "REGISTERED",
+                "composition_kind": composition_kind,
+                "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+                "density_artefact_sha256": "c" * 64,
+                "taker_fee_coefficient": "0.0695",
+            }
+        )
+    )
+    return path
+
+
 class _RecordingSink:
     def __init__(self) -> None:
         self.payloads: list[object] = []
@@ -218,6 +248,66 @@ def test_select_target_never_picks_a_drifted_key() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Review fix 3 (HIGH): durable wrapper-skip record + escalation
+# ---------------------------------------------------------------------------
+
+
+def test_read_skip_state_of_a_missing_file_is_zero_and_no_reason(tmp_path: Path) -> None:
+    assert runner.read_skip_state(tmp_path / "absent") == (0, None)
+
+
+def test_record_skip_increments_the_same_reason_and_resets_on_a_new_one(tmp_path: Path) -> None:
+    path = tmp_path / "wrapper_skip_state"
+    sink = _RecordingSink()
+    runner.record_skip(skip_state_path=path, reason="LOCK_CONTENTION", sink=sink)
+    assert runner.read_skip_state(path) == (1, "LOCK_CONTENTION")
+    runner.record_skip(skip_state_path=path, reason="LOCK_CONTENTION", sink=sink)
+    assert runner.read_skip_state(path) == (2, "LOCK_CONTENTION")
+    runner.record_skip(skip_state_path=path, reason="NO_ARMED_FAMILY", sink=sink)
+    assert runner.read_skip_state(path) == (1, "NO_ARMED_FAMILY")
+    assert not sink.payloads
+
+
+def test_record_skip_escalates_on_every_run_once_the_run_reaches_three(tmp_path: Path) -> None:
+    path = tmp_path / "wrapper_skip_state"
+    sink = _RecordingSink()
+    for _ in range(5):
+        runner.record_skip(skip_state_path=path, reason="NO_ARMED_FAMILY", sink=sink)
+    assert len(sink.payloads) == 3
+    for payload in sink.payloads:
+        assert payload.event == "BREEZY_REPLAY_SKIPPED_STALLED"  # type: ignore[attr-defined]
+        assert payload.severity == "warning"  # type: ignore[attr-defined]
+
+
+def test_record_skip_never_propagates_a_raising_sink(tmp_path: Path) -> None:
+    path = tmp_path / "wrapper_skip_state"
+    for _ in range(3):
+        runner.record_skip(skip_state_path=path, reason="LOCK_CONTENTION", sink=_RaisingSink())
+    assert runner.read_skip_state(path) == (3, "LOCK_CONTENTION")
+
+
+def test_reset_skip_state_clears_the_counter(tmp_path: Path) -> None:
+    path = tmp_path / "wrapper_skip_state"
+    runner.record_skip(skip_state_path=path, reason="LOCK_CONTENTION", sink=_RecordingSink())
+    runner.reset_skip_state(path)
+    assert runner.read_skip_state(path) == (0, None)
+
+
+def test_run_once_resets_skip_state_on_a_real_attempt(tmp_path: Path) -> None:
+    """A run that gets far enough to call `run_once` at all is, by
+    definition, no longer a wrapper-level skip -- the streak must not keep
+    counting a day whose queue merely happened to be empty."""
+    config = _config(tmp_path)
+    runner.record_skip(
+        skip_state_path=config.skip_state_path, reason="LOCK_CONTENTION", sink=_RecordingSink(),
+    )
+    assert runner.read_skip_state(config.skip_state_path) == (1, "LOCK_CONTENTION")
+    write_replay_sufficiency(config.replay_sufficiency_path, [])
+    runner.run_once(config, sink=_RecordingSink())
+    assert runner.read_skip_state(config.skip_state_path) == (0, None)
+
+
+# ---------------------------------------------------------------------------
 # record_blocked + B19 stall escalation
 # ---------------------------------------------------------------------------
 
@@ -236,23 +326,35 @@ def test_record_blocked_appends_a_row_and_leaves_the_day_queued(tmp_path: Path) 
     assert not sink.payloads
 
 
-def test_stall_alert_fires_exactly_once_at_the_third_consecutive_blocked_row(
+def test_stall_alert_fires_on_every_run_once_the_run_reaches_three(
     tmp_path: Path,
 ) -> None:
+    """Review fix 5 (MEDIUM): firing only at `n == 3` loses the alert
+    forever if that one send fails (fix for the sink-failure case is
+    covered separately by `test_a_raising_sink_never_propagates`, but a
+    TRANSIENT delivery failure at exactly n==3 must not silence every
+    later run too). Firing on every run while the trailing BLOCKED run is
+    `>= 3` is self-healing: the very next daily run tries again. The timer
+    is daily, so this is at most one alert per day."""
     path = tmp_path / "replay_results.jsonl"
     sink = _RecordingSink()
-    for _ in range(4):
+    for _ in range(5):
         runner.record_blocked(
             results_path=path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
             lag_minutes=LAG_MINUTES, blocked_reason="ASOS_CACHE_EMPTY", sink=sink,
         )
-    assert len(sink.payloads) == 1
-    payload = sink.payloads[0]
-    assert payload.event == "BREEZY_REPLAY_STALLED"  # type: ignore[attr-defined]
-    assert "/" not in payload.detail  # type: ignore[attr-defined]
+    # Runs 1-2: no alert. Runs 3, 4, 5 (run length 3, 4, 5): one alert each.
+    assert len(sink.payloads) == 3
+    for payload in sink.payloads:
+        assert payload.event == "BREEZY_REPLAY_STALLED"  # type: ignore[attr-defined]
+        assert "/" not in payload.detail  # type: ignore[attr-defined]
 
 
-def test_stall_run_resets_on_a_different_blocked_reason(tmp_path: Path) -> None:
+def test_stall_run_does_not_reset_on_a_different_blocked_reason(tmp_path: Path) -> None:
+    """Review fix 4 (MEDIUM-HIGH): the stall is "the schedule has stopped
+    replaying", not "the schedule keeps hitting the SAME reason" -- two
+    BLOCKED rows for reason A followed by one for reason B is still three
+    consecutive BLOCKED rows and must count toward the run."""
     path = tmp_path / "replay_results.jsonl"
     sink = _RecordingSink()
     for _ in range(2):
@@ -264,12 +366,26 @@ def test_stall_run_resets_on_a_different_blocked_reason(tmp_path: Path) -> None:
         results_path=path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
         lag_minutes=LAG_MINUTES, blocked_reason="ASOS_PRODUCER_FAILED", sink=sink,
     )
-    for _ in range(2):
-        runner.record_blocked(
-            results_path=path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
-            lag_minutes=LAG_MINUTES, blocked_reason="ASOS_CACHE_EMPTY", sink=sink,
+    assert len(sink.payloads) == 1
+
+
+def test_stall_run_length_counts_blocked_rows_regardless_of_reason() -> None:
+    path_rows = [
+        ReplayResult(
+            schema_version=REPLAY_RESULTS_SCHEMA_VERSION, run_ts="t", station=STATION,
+            climate_day=CLIMATE_DAY, strategy=STRATEGY, lag_minutes=LAG_MINUTES,
+            outcome="BLOCKED", validity=REPLAY_VALIDITY, blocked_reason=reason,
+            exception_type=None, family_id=None, manifest_sha256=None,
+            manifest_taker_fee_coefficient=None, engine_required_fee_coefficient=None,
+            engine_params_source=None, params_match=None, composition_kind=None,
+            tape_instance_id=None, sufficiency_reason="", trials=0, fills=0,
+            fill_price_vs_decision_ask=(), refusal_counts={}, wall_s=None, peak_rss_bytes=None,
+            parquet_sha256=None, window_complete=None, replayed_first_ns=None,
+            replayed_last_ns=None, census_schema_version=None,
         )
-    assert not sink.payloads
+        for reason in ("ASOS_CACHE_EMPTY", "ASOS_PRODUCER_FAILED", "FAMILY_MANIFEST_REFUSED")
+    ]
+    assert runner.stall_run_length(path_rows) == 3
 
 
 def test_stall_run_resets_on_a_completed_row(tmp_path: Path) -> None:
@@ -282,6 +398,32 @@ def test_stall_run_resets_on_a_completed_row(tmp_path: Path) -> None:
             lag_minutes=LAG_MINUTES, blocked_reason="ASOS_CACHE_EMPTY", sink=sink,
         )
     assert len(sink.payloads) == 1
+
+
+def test_record_blocked_remediation_text_branches_on_the_reason(tmp_path: Path) -> None:
+    """Review fix 7 (MEDIUM): the alert detail must not hardcode ASOS
+    remediation for a non-ASOS reason (e.g. a family-manifest refusal)."""
+    asos_path = tmp_path / "asos.jsonl"
+    asos_sink = _RecordingSink()
+    for _ in range(3):
+        runner.record_blocked(
+            results_path=asos_path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
+            lag_minutes=LAG_MINUTES, blocked_reason="ASOS_CACHE_EMPTY", sink=asos_sink,
+        )
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_sink = _RecordingSink()
+    for _ in range(3):
+        runner.record_blocked(
+            results_path=manifest_path, station=STATION, climate_day=CLIMATE_DAY,
+            strategy=STRATEGY, lag_minutes=LAG_MINUTES,
+            blocked_reason="FAMILY_MANIFEST_REFUSED", sink=manifest_sink,
+        )
+    asos_detail = asos_sink.payloads[0].detail  # type: ignore[attr-defined]
+    manifest_detail = manifest_sink.payloads[0].detail  # type: ignore[attr-defined]
+    assert asos_detail != manifest_detail
+    assert "asos" in asos_detail.lower()
+    assert "asos" not in manifest_detail.lower()
+    assert "manifest" in manifest_detail.lower()
 
 
 def test_a_raising_sink_never_propagates(tmp_path: Path) -> None:
@@ -405,6 +547,65 @@ def test_asos_argv_invokes_the_producer_script() -> None:
     assert "--station" in argv and STATION in argv
 
 
+def test_driver_argv_never_passes_strategy_explicitly() -> None:
+    """Review fix 2 (HIGH): the driver's own contract
+    (`current_rung_hold_paper_replay.py` ~:1376-1383, `resolve_family_
+    parameters` ~:461) derives the strategy from `--family-manifest`'s
+    `composition_kind`; an explicit `--strategy` that disagrees is REFUSED
+    (`FamilyManifestArgumentError` -> exit 2). Passing it hardcoded as
+    `continuous_rung_hold` permanently refuses any `current_rung_hold`
+    -composition family (e.g. `pm_us_crh_v2`). The runner must never pass
+    it at all."""
+    argv = runner.build_driver_argv(
+        python_executable="python3", station=STATION, climate_day=CLIMATE_DAY,
+        tape_instance_id="w1", quote_catalog=Path("/q"), work_catalog=Path("/w"),
+        asos_cache_csv=Path("/a.csv"), weather_catalog_root=Path("/wcr"),
+        output_dir=Path("/out"), family_manifest_path=Path("/fm.json"),
+    )
+    assert "--strategy" not in argv
+
+
+# ---------------------------------------------------------------------------
+# Review fix 2: strategy is derived from the manifest's composition_kind
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_strategy_from_manifest_reads_composition_kind(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path / "family.json", composition_kind="current_rung_hold")
+    assert runner.resolve_strategy_from_manifest(manifest) == "current_rung_hold"
+
+
+def test_resolve_strategy_from_manifest_refuses_forecast_ladder(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path / "family.json", composition_kind="forecast_ladder")
+    with pytest.raises(runner.UnsupportedCompositionKindError):
+        runner.resolve_strategy_from_manifest(manifest)
+
+
+# ---------------------------------------------------------------------------
+# Review fix 2: classify_driver_failure for both FAMILY_MANIFEST_* codes
+# ---------------------------------------------------------------------------
+
+
+def test_classify_driver_failure_family_manifest_refused() -> None:
+    assert runner.classify_driver_failure(returncode=2, stderr="") == (
+        "BLOCKED", "FAMILY_MANIFEST_REFUSED",
+    )
+
+
+def test_classify_driver_failure_family_manifest_unusable() -> None:
+    assert runner.classify_driver_failure(returncode=3, stderr="") == (
+        "BLOCKED", "FAMILY_MANIFEST_UNUSABLE",
+    )
+
+
+def test_classify_driver_failure_falls_back_to_failed_for_other_codes() -> None:
+    outcome, reason = runner.classify_driver_failure(
+        returncode=1, stderr="ValueError: boom",
+    )
+    assert outcome == "FAILED"
+    assert reason == "ValueError"
+
+
 # ---------------------------------------------------------------------------
 # run_once integration (fake subprocesses)
 # ---------------------------------------------------------------------------
@@ -417,15 +618,19 @@ def _completed_process(
 
 
 def _config(tmp_path: Path, *, family_manifest_path: Path | None = None) -> runner.RunConfig:
+    manifest_path = family_manifest_path
+    if manifest_path is None:
+        manifest_path = _write_manifest(tmp_path / "family.json")
     return runner.RunConfig(
         replay_sufficiency_path=tmp_path / "replay_sufficiency.jsonl",
         replay_results_path=tmp_path / "replay_results.jsonl",
         replay_drift_path=tmp_path / "replay_drift.jsonl",
         quote_catalog=tmp_path / "quote_catalog",
         weather_catalog_root=tmp_path / "weather_catalog",
-        family_manifest_path=family_manifest_path or (tmp_path / "family.json"),
+        family_manifest_path=manifest_path,
         output_root=tmp_path / "out",
         python_executable=sys.executable,
+        skip_state_path=tmp_path / "wrapper_skip_state",
     )
 
 
@@ -542,8 +747,9 @@ def test_run_once_writes_a_completed_row_from_the_sidecar_and_parquet(tmp_path: 
             0, stdout="strategy refusals: {'no_decision_window_coverage': 2}\n",
         )
 
+    sink = _RecordingSink()
     exit_code = runner.run_once(
-        config, run_subprocess=fake_subprocess, sink=_RecordingSink(),
+        config, run_subprocess=fake_subprocess, sink=sink,
         work_dir_factory=lambda: tmp_path / "work",
     )
     assert exit_code == 0
@@ -560,6 +766,74 @@ def test_run_once_writes_a_completed_row_from_the_sidecar_and_parquet(tmp_path: 
     assert row.refusal_counts == {"no_decision_window_coverage": 2}
     assert row.window_complete is True
     assert row.validity == "MECHANISM_ONLY"
+    # Review fix 6: real activity (a trial, or a non-empty refusal
+    # histogram) is never flagged suspect.
+    assert not any(
+        getattr(p, "event", None) == "BREEZY_REPLAY_SUSPECT_ZERO_ACTIVITY" for p in sink.payloads
+    )
+
+
+def test_run_once_replays_a_current_rung_hold_composition_family_without_a_strategy_flag(
+    tmp_path: Path,
+) -> None:
+    """Review fix 2 (HIGH): a `current_rung_hold`-composition family (e.g.
+    `pm_us_crh_v2`) must be replayable -- the pre-fix hardcoded
+    `--strategy continuous_rung_hold` would have this refused by the
+    driver's own `resolve_family_parameters` conflict check."""
+    manifest = _write_manifest(
+        tmp_path / "family.json", composition_kind="current_rung_hold", family_id="pm_us_crh_v2",
+    )
+    config = _config(tmp_path, family_manifest_path=manifest)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    captured_driver_argv: list[str] = []
+
+    def fake_subprocess(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        script = argv[1]
+        if "asos_cache_csv.py" in script:
+            return _completed_process(0)
+        captured_driver_argv.extend(argv)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "family_params.json").write_text(
+            json.dumps(
+                {
+                    "family_id": "pm_us_crh_v2",
+                    "manifest_sha256": "d" * 64,
+                    "manifest_taker_fee_coefficient": "0.06",
+                    "engine_required_fee_coefficient": "0.06",
+                    "engine_params_source": "FAMILY_MANIFEST",
+                    "params_match": True,
+                    "composition_kind": "current_rung_hold",
+                }
+            )
+        )
+        return _completed_process(0)
+
+    sink = _RecordingSink()
+    exit_code = runner.run_once(
+        config, run_subprocess=fake_subprocess, sink=sink,
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    assert "--strategy" not in captured_driver_argv
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    assert rows[0].strategy == "current_rung_hold"
+    assert rows[0].composition_kind == "current_rung_hold"
+    # Review fix 6 (MEDIUM): trials=0 AND an empty refusal_counts is
+    # indistinguishable from a broken engine -- still COMPLETED (a real
+    # mechanism outcome), but flagged with a WARN alert.
+    assert rows[0].trials == 0
+    assert rows[0].refusal_counts == {}
+    suspect_alerts = [
+        p for p in sink.payloads
+        if getattr(p, "event", None) == "BREEZY_REPLAY_SUSPECT_ZERO_ACTIVITY"
+    ]
+    assert len(suspect_alerts) == 1
+    assert suspect_alerts[0].severity == "warning"  # type: ignore[attr-defined]
 
 
 def test_run_once_marks_a_driver_crash_as_failed_with_the_exception_type(tmp_path: Path) -> None:
@@ -586,3 +860,23 @@ def test_run_once_marks_a_driver_crash_as_failed_with_the_exception_type(tmp_pat
     rows = read_replay_results(config.replay_results_path)
     assert rows[0].outcome == "FAILED"
     assert rows[0].exception_type == "NoDecisionWindowCoverageError"
+
+
+# ---------------------------------------------------------------------------
+# Review fix 3: `main` dispatches `--report-skip` without run_once's own
+# required flags
+# ---------------------------------------------------------------------------
+
+
+def test_main_report_skip_dispatches_without_the_run_once_flags(tmp_path: Path) -> None:
+    state_path = tmp_path / "wrapper_skip_state"
+    exit_code = runner.main(
+        ["--report-skip", "LOCK_CONTENTION", "--skip-state-path", str(state_path)]
+    )
+    assert exit_code == 0
+    assert runner.read_skip_state(state_path) == (1, "LOCK_CONTENTION")
+
+
+def test_main_requires_the_usual_flags_when_report_skip_is_absent() -> None:
+    with pytest.raises(SystemExit):
+        runner.main([])

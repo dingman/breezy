@@ -198,3 +198,16 @@ def test_1720_utc_is_owned_by_exactly_one_timer() -> None:
         if ("17", "20") in _clock_ticks(timer_path)
     ]
     assert owners == ["breezy-family-tally@.timer"]
+
+
+def test_1550_utc_is_owned_by_exactly_one_timer() -> None:
+    # AUD-09b: 15:50 UTC is the ONE breezy-replay-daily.timer tick -- free
+    # on the pre-existing schedule (occupied: 01:35, 02:05, 09:00, 09:20,
+    # 13:30, 14:15, 14:30, 15:00, 15:20, 17:20, 00/06/12/18:15) and outside
+    # the protected LST-union no-start window [16:35Z, 01:15Z).
+    owners = [
+        timer_path.name
+        for timer_path in _all_timer_files()
+        if ("15", "50") in _clock_ticks(timer_path)
+    ]
+    assert owners == ["breezy-replay-daily.timer"]

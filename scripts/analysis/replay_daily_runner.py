@@ -67,6 +67,7 @@ from breezy.analysis.replay_sufficiency import (
     read_replay_sufficiency,
 )
 from breezy.domain.climate_day import standard_time_zone
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import read_scored_trials
 from breezy.runtime.health import (
     AlertPayload,
@@ -81,13 +82,16 @@ __all__ = [
     "DEFAULT_REPLAY_DRIFT_PATH",
     "DEFAULT_REPLAY_RESULTS_PATH",
     "DEFAULT_REPLAY_SUFFICIENCY_PATH",
+    "DEFAULT_SKIP_STATE_PATH",
     "DEFAULT_STRATEGY",
     "REPLAY_DRIFT_SCHEMA_VERSION",
     "STALL_ALERT_RUN_LENGTH",
     "WEATHER_VENUE",
     "DriftRecord",
     "RunConfig",
+    "SkipReason",
     "SubprocessRunner",
+    "UnsupportedCompositionKindError",
     "build_asos_argv",
     "build_driver_argv",
     "classify_asos_failure",
@@ -95,7 +99,11 @@ __all__ = [
     "compute_drift",
     "main",
     "read_replay_drift",
+    "read_skip_state",
     "record_blocked",
+    "record_skip",
+    "reset_skip_state",
+    "resolve_strategy_from_manifest",
     "run_once",
     "select_target",
     "stall_run_length",
@@ -116,6 +124,16 @@ DEFAULT_REPLAY_SUFFICIENCY_PATH: Final[Path] = (
 )
 DEFAULT_REPLAY_RESULTS_PATH: Final[Path] = _DERIVED_ROOT / "replay" / "replay_results.jsonl"
 DEFAULT_REPLAY_DRIFT_PATH: Final[Path] = _DERIVED_ROOT / "replay" / "replay_drift.jsonl"
+#: Review fix 3 (HIGH): a small, non-JSONL state file the WRAPPER's own
+#: skip paths (lock contention, no armed family) report through -- never
+#: parsed by the wrapper itself (B18: no JSONL parsing in the wrapper), so
+#: this is deliberately plain text, not a `replay_results.jsonl` row.
+DEFAULT_SKIP_STATE_PATH: Final[Path] = _DERIVED_ROOT / "replay" / "wrapper_skip_state"
+
+#: The wrapper's two benign-skip reasons (review fix 3). Distinct from
+#: `blocked_reason` (a REPLAY attempt that started and was refused) --
+#: these mean the wrapper never even reached `run_once`.
+SkipReason = Literal["LOCK_CONTENTION", "NO_ARMED_FAMILY"]
 
 #: AUD-08 §9's own three-consecutive-failure tolerance (base plan §6b.3,
 #: "N = 3 is not a new number").
@@ -388,8 +406,14 @@ def record_blocked(
     )
     append_replay_result(results_path, row)
     results = read_replay_results(results_path)
-    run_length = stall_run_length(results, blocked_reason=blocked_reason)
-    if run_length == STALL_ALERT_RUN_LENGTH:
+    run_length = stall_run_length(results)
+    # Review fix 5 (MEDIUM): fire on EVERY run once the trailing BLOCKED run
+    # reaches 3, not only at the instant it first equals 3 -- a send that
+    # fails (or a webhook outage) at n==3 must not silence the schedule's
+    # ONLY escalation forever. The timer is daily, so this is at most one
+    # alert per day; a resolved day (COMPLETED/RECOVERED/FAILED) resets the
+    # run back to 0 and re-arms the next three.
+    if run_length >= STALL_ALERT_RUN_LENGTH:
         active_sink = sink if sink is not None else resolve_alert_sink(os.environ)
         emit_alert(
             active_sink,
@@ -399,22 +423,121 @@ def record_blocked(
                 site=station,
                 detail=(
                     f"{run_length} consecutive BLOCKED replays reason={blocked_reason}; "
-                    "widen asos_recent_refresh.py --since or target a recent climate day"
+                    f"{_remediation_for(blocked_reason)}"
                 ),
             ),
         )
 
 
-def stall_run_length(results: Sequence[ReplayResult], *, blocked_reason: str) -> int:
-    """Length of the trailing run of `BLOCKED` rows sharing `blocked_reason`
-    (B19). Any other outcome, or a different `blocked_reason`, ends the run."""
+#: Review fix 7 (MEDIUM): the remediation act implied by each closed
+#: `blocked_reason`, never one hardcoded ASOS-only sentence for every
+#: reason. `AlertPayload` truncates `detail` to `MAX_ALERT_DETAIL_CHARS`
+#: (health.py), so each entry stays short.
+_BLOCKED_REMEDIATION: Final[dict[str, str]] = {
+    "ASOS_CACHE_EMPTY": (
+        "widen asos_recent_refresh.py --since or target a recent climate day"
+    ),
+    "ASOS_CACHE_UNPARSEABLE_ROWS": "inspect the settlement-alignment ASOS cache for the station",
+    "ASOS_PRODUCER_FAILED": "check asos_cache_csv.py's own stderr in the wrapper log",
+    "FAMILY_MANIFEST_REFUSED": (
+        "the armed manifest's composition_kind/station conflicts; re-check it"
+    ),
+    "FAMILY_MANIFEST_UNUSABLE": "the armed manifest is malformed or unpinned; re-check it",
+}
+_DEFAULT_BLOCKED_REMEDIATION: Final[str] = "investigate the wrapper log for this reason"
+
+
+def _remediation_for(blocked_reason: str) -> str:
+    return _BLOCKED_REMEDIATION.get(blocked_reason, _DEFAULT_BLOCKED_REMEDIATION)
+
+
+def stall_run_length(results: Sequence[ReplayResult]) -> int:
+    """Length of the trailing run of `BLOCKED` rows, of ANY
+    `blocked_reason` (review fix 4 -- the stall being escalated is "the
+    schedule has stopped replaying", not "the schedule keeps hitting the
+    identical reason"; two different reasons in a row are still two
+    replays that did not happen). Any non-`BLOCKED` outcome ends the run."""
     run = 0
     for row in reversed(results):
-        if row.outcome == "BLOCKED" and row.blocked_reason == blocked_reason:
+        if row.outcome == "BLOCKED":
             run += 1
         else:
             break
     return run
+
+
+# ---------------------------------------------------------------------------
+# Review fix 3 (HIGH): durable wrapper-skip record + escalation (mirrors
+# B19's shape, one level up -- BEFORE any replay attempt starts).
+# ---------------------------------------------------------------------------
+
+
+def read_skip_state(path: Path) -> tuple[int, str | None]:
+    """`(count, reason)` of the current consecutive-skip run, or `(0,
+    None)` for a missing/empty/malformed file -- never raises: a corrupt
+    state file degrades to "no streak yet", not a wrapper failure."""
+    if not path.exists():
+        return 0, None
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return 0, None
+    count_text, _, reason_text = text.partition(" ")
+    try:
+        count = int(count_text)
+    except ValueError:
+        return 0, None
+    return count, (reason_text or None)
+
+
+def _write_skip_state(path: Path, *, count: int, reason: str | None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{count} {reason or ''}\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def reset_skip_state(path: Path) -> None:
+    """Called at the top of `run_once` -- reaching it at all means the
+    wrapper got past both skip gates and a real attempt is happening now,
+    so any prior skip streak is over."""
+    _write_skip_state(path, count=0, reason=None)
+
+
+def record_skip(
+    *,
+    skip_state_path: Path,
+    reason: SkipReason,
+    site: str = "breezy-replay-daily",
+    sink: AlertSink | None = None,
+) -> None:
+    """The wrapper's own skip paths (lock contention, no armed family) call
+    into this -- never `record_blocked` (a skip means `run_once` never
+    even started). Escalates on every run once the trailing run reaches
+    `STALL_ALERT_RUN_LENGTH`, same self-healing cadence as B19 (fix 5): a
+    failed send is retried the very next scheduled tick, never lost for
+    good."""
+    previous_count, previous_reason = read_skip_state(skip_state_path)
+    count = previous_count + 1 if previous_reason == reason else 1
+    _write_skip_state(skip_state_path, count=count, reason=reason)
+    if count >= STALL_ALERT_RUN_LENGTH:
+        active_sink = sink if sink is not None else resolve_alert_sink(os.environ)
+        emit_alert(
+            active_sink,
+            AlertPayload(
+                severity="warning",
+                event="BREEZY_REPLAY_SKIPPED_STALLED",
+                site=site,
+                detail=(
+                    f"{count} consecutive wrapper skips reason={reason}; the schedule "
+                    "never even attempted a replay"
+                ),
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -454,18 +577,25 @@ def build_driver_argv(
     weather_catalog_root: Path,
     output_dir: Path,
     family_manifest_path: Path,
-    strategy: str = DEFAULT_STRATEGY,
     lag_minutes: int = DEFAULT_LAG_MINUTES,
 ) -> list[str]:
     """The complete argument vector for
     `current_rung_hold_paper_replay.py` -- every `required=True` argument
     of that parser is present (B17; `test_replay_daily_runner.py` asserts
-    this set against the driver's own source)."""
+    this set against the driver's own source).
+
+    **Never passes `--strategy` (review fix 2, HIGH).** With
+    `--family-manifest` set, the driver's own contract
+    (`resolve_family_parameters`, `current_rung_hold_paper_replay.py`
+    ~:461) derives the strategy from the manifest's `composition_kind` and
+    REFUSES (`FamilyManifestArgumentError` -> exit
+    `EXIT_FAMILY_MANIFEST_REFUSED`) an explicit `--strategy` that
+    disagrees. A hardcoded `--strategy continuous_rung_hold` here would
+    permanently refuse every `current_rung_hold`-composition family (e.g.
+    `pm_us_crh_v2`)."""
     return [
         python_executable,
         str(_SCRIPTS_DIR / "current_rung_hold_paper_replay.py"),
-        "--strategy",
-        strategy,
         "--station",
         station,
         "--climate-day",
@@ -507,6 +637,35 @@ def classify_driver_failure(
     matches = _EXCEPTION_NAME_RE.findall(stderr)
     exception_type = matches[-1] if matches else "UnknownDriverFailure"
     return "FAILED", exception_type
+
+
+class UnsupportedCompositionKindError(Exception):
+    """The armed family manifest declares `composition_kind="forecast_ladder"`
+    -- `current_rung_hold_paper_replay.py` has no such strategy class
+    (`resolve_family_parameters`'s own refusal); the runner refuses at
+    the top of `run_once`, before any selection."""
+
+
+#: `FamilyManifest.composition_kind`'s three values (`persistence/
+#: family_manifest.py`); the driver supports exactly the first two.
+_SUPPORTED_COMPOSITION_KINDS: Final[frozenset[str]] = frozenset(
+    {"current_rung_hold", "continuous_rung_hold"}
+)
+
+
+def resolve_strategy_from_manifest(family_manifest_path: Path) -> str:
+    """Review fix 2 (HIGH): the strategy is ALWAYS derived from the armed
+    family's own `composition_kind` -- never a runner-side literal. A
+    manifest declaring `composition_kind="forecast_ladder"` is refused
+    (`UnsupportedCompositionKindError`); the driver itself has no such
+    strategy class (`resolve_family_parameters`'s own check)."""
+    manifest = load_family_manifest(family_manifest_path)
+    if manifest.composition_kind not in _SUPPORTED_COMPOSITION_KINDS:
+        raise UnsupportedCompositionKindError(
+            f"{family_manifest_path}: composition_kind "
+            f"{manifest.composition_kind!r} has no replay strategy class"
+        )
+    return manifest.composition_kind
 
 
 def classify_asos_failure(*, returncode: int) -> str:
@@ -575,8 +734,11 @@ class RunConfig:
     family_manifest_path: Path
     output_root: Path
     python_executable: str
-    strategy: str = DEFAULT_STRATEGY
+    #: NOT a caller-chosen dimension (review fix 2): the real strategy is
+    #: always DERIVED from `family_manifest_path`'s own `composition_kind`
+    #: via `resolve_strategy_from_manifest`, at the top of `run_once`.
     lag_minutes: int = DEFAULT_LAG_MINUTES
+    skip_state_path: Path = DEFAULT_SKIP_STATE_PATH
 
 
 def _output_dir_for(config: RunConfig, *, station: str, climate_day: str) -> Path:
@@ -591,6 +753,7 @@ def _append_terminal(
     config: RunConfig,
     target: ReplaySufficiency,
     *,
+    strategy: str,
     now_ts: Callable[[], str],
     outcome: Literal["COMPLETED", "RECOVERED", "FAILED"],
     exception_type: str | None = None,
@@ -614,7 +777,7 @@ def _append_terminal(
         run_ts=now_ts(),
         station=target.station,
         climate_day=target.climate_day,
-        strategy=config.strategy,
+        strategy=strategy,
         lag_minutes=config.lag_minutes,
         outcome=outcome,
         validity=REPLAY_VALIDITY,
@@ -658,6 +821,16 @@ def run_once(
     all ordinary returns; H0/H3 corruption is the one thing that
     propagates as a loud non-zero exit, never a silent empty queue)."""
     active_sink = sink if sink is not None else resolve_alert_sink(os.environ)
+    # Review fix 3: reaching this function at all means the wrapper got
+    # past both its own skip gates (the lock, the armed-family check) --
+    # any prior wrapper-skip streak is over.
+    reset_skip_state(config.skip_state_path)
+
+    try:
+        strategy = resolve_strategy_from_manifest(config.family_manifest_path)
+    except (OSError, FamilyManifestError, UnsupportedCompositionKindError) as exc:
+        print(f"replay_daily_runner: family manifest unusable: {exc}", file=sys.stderr)
+        return 1
 
     try:
         rows = read_replay_sufficiency(config.replay_sufficiency_path)
@@ -689,7 +862,7 @@ def run_once(
         rows=rows,
         replayed=existing_results,
         drift=current_drift,
-        strategy=config.strategy,
+        strategy=strategy,
         lag_minutes=config.lag_minutes,
     )
     if target is None:
@@ -717,7 +890,7 @@ def run_once(
                 digest = hashlib.sha256(latest.read_bytes()).hexdigest()
             except OSError as exc:
                 _append_terminal(
-                    config, target, now_ts=now_ts, outcome="FAILED",
+                    config, target, strategy=strategy, now_ts=now_ts, outcome="FAILED",
                     exception_type=type(exc).__name__,
                 )
                 print(
@@ -726,7 +899,8 @@ def run_once(
                 )
                 return 1
             _append_terminal(
-                config, target, now_ts=now_ts, outcome="RECOVERED", parquet_sha256=digest,
+                config, target, strategy=strategy, now_ts=now_ts, outcome="RECOVERED",
+                parquet_sha256=digest,
             )
             print(f"RECOVERED {station} {climate_day} -- {latest.name}")
             return 0
@@ -743,7 +917,7 @@ def run_once(
         reason = classify_asos_failure(returncode=asos_result.returncode)
         record_blocked(
             results_path=config.replay_results_path, station=station, climate_day=climate_day,
-            strategy=config.strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
+            strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
             sufficiency_reason=target.reason, census_schema_version=target.schema_version,
             sink=active_sink, now_ts=now_ts,
         )
@@ -761,7 +935,7 @@ def run_once(
             quote_catalog=config.quote_catalog, work_catalog=work_catalog,
             asos_cache_csv=asos_csv, weather_catalog_root=config.weather_catalog_root,
             output_dir=output_dir, family_manifest_path=config.family_manifest_path,
-            strategy=config.strategy, lag_minutes=config.lag_minutes,
+            lag_minutes=config.lag_minutes,
         )
     )
     wall_s = time.monotonic() - started
@@ -775,15 +949,15 @@ def run_once(
         if outcome == "BLOCKED":
             record_blocked(
                 results_path=config.replay_results_path, station=station, climate_day=climate_day,
-                strategy=config.strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
+                strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
                 sufficiency_reason=target.reason, census_schema_version=target.schema_version,
                 sink=active_sink, now_ts=now_ts,
             )
             print(f"BLOCKED {station} {climate_day} -- {reason}")
             return 0
         _append_terminal(
-            config, target, now_ts=now_ts, outcome="FAILED", exception_type=reason,
-            wall_s=wall_s, peak_rss_bytes=peak_rss_bytes,
+            config, target, strategy=strategy, now_ts=now_ts, outcome="FAILED",
+            exception_type=reason, wall_s=wall_s, peak_rss_bytes=peak_rss_bytes,
         )
         print(f"FAILED {station} {climate_day} -- {reason}", file=sys.stderr)
         return 1
@@ -803,7 +977,7 @@ def run_once(
     manifest_taker_fee_coefficient = sidecar.get("manifest_taker_fee_coefficient")
     engine_required_fee_coefficient = sidecar.get("engine_required_fee_coefficient")
     _append_terminal(
-        config, target, now_ts=now_ts, outcome="COMPLETED",
+        config, target, strategy=strategy, now_ts=now_ts, outcome="COMPLETED",
         family_id=sidecar.get("family_id"),  # type: ignore[arg-type]
         manifest_sha256=sidecar.get("manifest_sha256"),  # type: ignore[arg-type]
         manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,  # type: ignore[arg-type]
@@ -819,6 +993,25 @@ def run_once(
         peak_rss_bytes=peak_rss_bytes,
         parquet_sha256=parquet_sha256,
     )
+    # Review fix 6 (MEDIUM): trials=0 AND an empty refusal_counts is
+    # indistinguishable from a broken engine -- a real quiet day still logs
+    # at least one strategy refusal (e.g. outside_decision_window) for
+    # every candidate it considered. Still COMPLETED (a genuine mechanism
+    # outcome), but escalated once as a WARN so it is never silently
+    # absorbed into the ordinary zero-trade case.
+    if len(scored) == 0 and not refusal_counts:
+        emit_alert(
+            active_sink,
+            AlertPayload(
+                severity="warning",
+                event="BREEZY_REPLAY_SUSPECT_ZERO_ACTIVITY",
+                site=station,
+                detail=(
+                    f"{climate_day}: COMPLETED with 0 trials and an empty refusal "
+                    "histogram -- check the engine actually evaluated this day"
+                ),
+            ),
+        )
     if std_utc_offset_hours_for is not None:
         offset = std_utc_offset_hours_for(station)
         interval = (
@@ -846,18 +1039,51 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--replay-sufficiency", type=Path, default=DEFAULT_REPLAY_SUFFICIENCY_PATH)
     parser.add_argument("--replay-results", type=Path, default=DEFAULT_REPLAY_RESULTS_PATH)
     parser.add_argument("--replay-drift", type=Path, default=DEFAULT_REPLAY_DRIFT_PATH)
-    parser.add_argument("--quote-catalog", type=Path, required=True)
-    parser.add_argument("--weather-catalog-root", type=Path, required=True)
-    parser.add_argument("--family-manifest", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
+    # Not `required=True`: a `--report-skip` invocation (review fix 3) never
+    # touches these -- the wrapper never reached `run_once` at all. `main`
+    # enforces requiredness itself when `--report-skip` is absent, below.
+    parser.add_argument("--quote-catalog", type=Path, default=None)
+    parser.add_argument("--weather-catalog-root", type=Path, default=None)
+    parser.add_argument("--family-manifest", type=Path, default=None)
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument(
         "--python", dest="python_executable", type=str, default=sys.executable,
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--report-skip",
+        choices=("LOCK_CONTENTION", "NO_ARMED_FAMILY"),
+        default=None,
+        help=(
+            "Review fix 3: the wrapper's OWN skip paths (lock contention, "
+            "no armed family) call this instead of running the census/"
+            "driver at all. Records a durable skip and escalates once the "
+            "consecutive-skip run reaches 3, then exits -- run_once never "
+            "starts."
+        ),
+    )
+    parser.add_argument("--skip-state-path", type=Path, default=DEFAULT_SKIP_STATE_PATH)
+    args = parser.parse_args(argv)
+    if args.report_skip is None:
+        missing = [
+            flag
+            for flag, value in (
+                ("--quote-catalog", args.quote_catalog),
+                ("--weather-catalog-root", args.weather_catalog_root),
+                ("--family-manifest", args.family_manifest),
+                ("--output-root", args.output_root),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(f"the following arguments are required: {', '.join(missing)}")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.report_skip is not None:
+        record_skip(skip_state_path=args.skip_state_path, reason=args.report_skip)
+        return 0
     config = RunConfig(
         replay_sufficiency_path=args.replay_sufficiency,
         replay_results_path=args.replay_results,
@@ -867,6 +1093,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         family_manifest_path=args.family_manifest,
         output_root=args.output_root,
         python_executable=args.python_executable,
+        skip_state_path=args.skip_state_path,
     )
     return run_once(config, std_utc_offset_hours_for=_resolve_std_utc_offset_hours)
 

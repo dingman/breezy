@@ -19,10 +19,14 @@
 #
 # Exit status: 0 on a completed run (COMPLETED/RECOVERED/BLOCKED/empty
 # queue -- base plan §9: a BLOCKED day or an all-INSUFFICIENT census is a
-# data verdict, never a job failure) and 0 on lock contention
-# (skip-not-kill); non-zero only when the runner itself exits non-zero
-# (H0/H3 corruption, or a FAILED replay -- base plan §9). Reported to
-# `systemctl --user status breezy-replay-daily.service`.
+# data verdict, never a job failure) and 0 on a BENIGN skip (lock
+# contention, or no armed/REGISTERED family -- skip-not-kill; each records
+# a durable skip via `replay_daily_runner.py --report-skip`, review fix 3);
+# non-zero when the runner itself exits non-zero (H0/H3 corruption, or a
+# FAILED replay -- base plan §9), OR when `systemctl show` itself fails
+# (review fix 3: an INFRA failure resolving the armed family is never
+# silently treated as "no family armed"). Reported to `systemctl --user
+# status breezy-replay-daily.service`.
 set -uo pipefail
 
 REPO=/home/jon/breezy
@@ -34,10 +38,23 @@ QUOTE_CATALOG=${BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG:-$HOME/.local/share/bree
 WEATHER_CATALOG_ROOT=${BREEZY_WEATHER_CATALOG_ROOT:-$HOME/.local/share/breezy/catalog}
 OUT_ROOT=${BREEZY_REPLAY_DAILY_OUTPUT_ROOT:-$HOME/.local/share/breezy/derived}
 REPLAY_DIR=$OUT/replay
+SKIP_STATE_PATH="${BREEZY_REPLAY_DAILY_SKIP_STATE:-$REPLAY_DIR/wrapper_skip_state}"
 
 mkdir -p "$OUT" "$REPLAY_DIR"
 
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
+
+# Review fix 3: a benign skip (lock contention, no armed family) is
+# recorded durably via the SAME module the real run uses -- never a second
+# JSONL-writing/record_blocked mechanism here (B18 stays intact: this is
+# one more invocation of the ALREADY-named `replay_daily_runner.py`, using
+# a mode that never reads replay_sufficiency.jsonl or replay_results.jsonl
+# at all). Best-effort: a failure of THIS call never turns a benign skip
+# into a hard failure (skip-not-kill stays skip-not-kill).
+report_skip() {
+  "$PY" "$REPO/scripts/analysis/replay_daily_runner.py" \
+    --report-skip "$1" --skip-state-path "$SKIP_STATE_PATH" >>"$LOG" 2>&1 || true
+}
 
 # Host-wide mutual exclusion, same convention as every sibling study
 # wrapper (SP-1.rev4.md). Skip-not-kill.
@@ -52,7 +69,11 @@ fi
 LOCK="$LOCK_DIR/breezy-studies.lock"
 mkdir -p "$LOCK_DIR" 2>>"$LOG" || { say "SKIPPED-INFRA -- no studies lock directory"; exit 75; }
 exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studies lock"; exit 75; }
-flock -n 9                     || { say "SKIPPED -- another study holds the studies lock"; exit 0; }
+if ! flock -n 9; then
+  say "SKIPPED -- another study holds the studies lock"
+  report_skip LOCK_CONTENTION
+  exit 0
+fi
 
 manifest_field() {
   grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -n1 \
@@ -60,11 +81,19 @@ manifest_field() {
 }
 
 # Resolve the ARMED family only (base plan §6b.2) -- byte-identical idiom to
-# score-live-trials-run.sh's own resolve_sending_family_manifest().
+# score-live-trials-run.sh's own resolve_sending_family_manifest(), EXCEPT
+# (review fix 3) the `systemctl show` call's own exit status is checked
+# BEFORE `|| true` ever discarded it: a `systemctl` FAILURE (not installed,
+# permission denied, unit unknown) is an INFRA problem, distinct from a
+# benign "no family armed yet", and must exit non-zero so `OnFailure=`
+# fires -- never silently folded into the ordinary skip path.
 SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
 resolve_family_manifest() {
   local show id path status
-  show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG") || true
+  if ! show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG"); then
+    say "REPLAY DAILY FAILED -- systemctl show failed, see $LOG"
+    return 2
+  fi
   id=$(printf '%s\n' "$show" | sed -n 's/^Environment=//p' | tr ' ' '\n' | sed -n 's/^BREEZY_SENDING_FAMILY_ID=//p' | head -n1)
   id=${id%\"}
   id=${id#\"}
@@ -91,7 +120,14 @@ resolve_family_manifest() {
   FAMILY_MANIFEST=$path
 }
 
-if ! resolve_family_manifest; then
+resolve_family_manifest
+resolve_rc=$?
+if [ "$resolve_rc" -eq 2 ]; then
+  # INFRA failure (systemctl itself) -- loud, non-zero, no skip record: a
+  # skip means "we know nothing is armed"; this means we DON'T know.
+  exit 1
+elif [ "$resolve_rc" -ne 0 ]; then
+  report_skip NO_ARMED_FAMILY
   exit 0
 fi
 
