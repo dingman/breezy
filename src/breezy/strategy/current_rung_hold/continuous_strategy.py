@@ -533,6 +533,17 @@ class ContinuousRungHoldStrategy(Strategy):
         #: on a deduped repeat, so its presence proves the guard fired
         #: without needing to capture the logger).
         self.last_no_only_hunt_error: str | None = None
+        #: F-1c (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): caches
+        #: a POSITIVE `refuse_if_sibling_leg_traded` result keyed by
+        #: `(station_day, yes_iid)` -- a fill record is durable and never
+        #: reverts, so caching "this YES instrument-day is a confirmed
+        #: fill" can never go stale. A NEGATIVE result (the YES record is
+        #: consumed but not filled) is deliberately never cached (R4), so a
+        #: later genuine fill on this same key is observed the very next
+        #: tick. Bounded by the process's instruments, exactly like
+        #: `_illegal_cell_station_days` -- see
+        #: `_hunt_no_only_after_yes_consumed`.
+        self._yes_fill_blocks_no: set[tuple[tuple[str, str], str]] = set()
         #: INC-5 (intra-day position monitor, SHADOW-ONLY): `None` (default)
         #: means every monitor hook below is a no-op -- byte-identical
         #: behaviour to before this field existed. A composition root wires
@@ -1418,6 +1429,101 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             self.log.exception(cleanup_message, cleanup_exc)  # noqa: TRY401
 
+    def _hunt_no_only_after_yes_consumed(
+        self,
+        snapshot: _AskSnapshot,
+        facts: WeatherBucketFacts,
+        *,
+        station: str,
+        climate_day: date,
+        climate_day_key: str,
+        station_day: tuple[str, str],
+        iid: str,
+    ) -> None:
+        """F-1c (plan ``STALL_FOLLOWUPS_F1_F4_2026-09-24.md``, Rev 3.1):
+        reached ONLY from `_hunt_tick`'s ``is_consumed(YES iid)`` branch,
+        which today returns unconditionally. Amendment §4:114 excludes a NO
+        take only when the sibling YES leg already has a *fill* on record
+        (``_FILLED_REASONS``) -- a YES instrument-day that was merely
+        EVALUATED and refused (never filled) must still reach NO.
+
+        Fail-closed argument (R3). A YES order that reached ``submit_order``
+        without a confirmed fill is AMBIGUOUS by default (L-36); the
+        account-wide submit intent stays OPEN until the resolver retires it
+        with venue evidence (R-7; PREREG v3 §4; L-48 names the clearing
+        path). While that intent is OPEN, step 2 below returns silently, and
+        `_evaluate_no_side_shadow` re-checks ``is_intent_open()`` again at
+        its own gate -- so NO is evaluated next to a non-fill YES record
+        only after the intent is retired, which means venue evidence has
+        already said "not filled". That is exactly the case §4 permits.
+
+        Step 1 reuses `refuse_if_sibling_leg_traded` on the NO id -- the
+        SAME sibling-fill check the YES admission gate and
+        `_evaluate_no_side_shadow`'s own admission gate already run -- so
+        "is the consumed YES record actually a fill" is never a second,
+        independently-drifting reason check. A POSITIVE result is cached in
+        `self._yes_fill_blocks_no`, bounded by the process's instruments
+        exactly like `self._illegal_cell_station_days` (R4): a fill record
+        is durable and never reverts, so caching it can never go stale. A
+        NEGATIVE result (a non-fill reason) is never cached, so a later
+        genuine fill durably written to this SAME key is observed the very
+        next tick.
+
+        Steps 2-3 are QUIET: no diagnostic, no refusal, no `_observe_halt`
+        call -- this branch runs BEFORE `_hunt_tick` reaches its own
+        window/intent checks for the YES path, so the counters those checks
+        own must stay byte-identical to a world where this method never ran
+        (AC4).
+
+        CONTAINED (silent-failure-hunter discipline, matching
+        `_hunt_no_only`): `refuse_if_sibling_leg_traded` reads and decodes a
+        durable record and can raise `TrialDayRecordCorrupt`; a fault here
+        fails CLOSED (no cache write, no NO evaluation) rather than risk a
+        NO take next to an unprovable YES outcome. Shares
+        `_contain_no_only_hunt_error`'s counter/notice/log-once discipline
+        with `_hunt_no_only` -- this is the same "quiet NO-only hunt"
+        surface, reached through a second entry point.
+        """
+        cache_key = (station_day, iid)
+        if cache_key in self._yes_fill_blocks_no:
+            return
+        try:
+            assert self._latch is not None
+            store = self._latch._store
+            prefix = self._latch._key_prefix
+            no_iid = str(sibling_instrument_id(InstrumentId.from_str(iid)))
+            if refuse_if_sibling_leg_traded(
+                store, prefix, station, climate_day_key, no_iid,
+            ) is not None:
+                self._yes_fill_blocks_no.add(cache_key)
+                return
+
+            now_ns = snapshot.ts_event
+            offset = self._std_utc_offset_hours_by_station[station]
+            hour_lst = _local_hour(now_ns, offset)
+            if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
+                return
+            if self._latch.is_intent_open():
+                return
+            if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
+                self._hunt_no_only(
+                    snapshot,
+                    facts,
+                    station=station,
+                    climate_day=climate_day,
+                    climate_day_key=climate_day_key,
+                    station_day=station_day,
+                    now_ns=now_ns,
+                    hour_lst=hour_lst,
+                )
+        except Exception as exc:  # noqa: BLE001 - must never affect _hunt_tick (fail closed)
+            self._contain_no_only_hunt_error(
+                exc,
+                yes_instrument_id=snapshot.instrument_id,
+                station=station,
+                climate_day_key=climate_day_key,
+            )
+
     def _hunt_tick(
         self,
         snapshot: _AskSnapshot,
@@ -1497,6 +1603,19 @@ class ContinuousRungHoldStrategy(Strategy):
 
         assert self._latch is not None
         if self._latch.is_consumed(station, climate_day_key, key_instrument_id=iid):
+            # F-1c (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): a
+            # consumed YES instrument-day no longer implies "never evaluate
+            # NO" -- see `_hunt_no_only_after_yes_consumed`'s own table and
+            # fail-closed argument.
+            self._hunt_no_only_after_yes_consumed(
+                snapshot,
+                facts,
+                station=station,
+                climate_day=climate_day,
+                climate_day_key=climate_day_key,
+                station_day=station_day,
+                iid=iid,
+            )
             return
         # AM-4 (HF-4 rev2.1): hoisted once per tick, BEFORE the IN_FLIGHT
         # check below, so the stale-IN_FLIGHT release and the re-arm gate a
@@ -1506,6 +1625,10 @@ class ContinuousRungHoldStrategy(Strategy):
         # accepted cost (Decision 1, HF-4.rev2.md): Phase 0 already self-
         # clears IN_FLIGHT at the end of this method regardless.
         attempt_state = self._latch.attempt_state(station, climate_day_key, key_instrument_id=iid)
+        # F-1c table: an unreleased IN_FLIGHT YES marker fails closed here --
+        # the sibling exclusion (amendment sec4:114) cannot be proven safe
+        # while this leg's fill outcome is unresolved, so NO is not
+        # evaluated on this branch.
         if self._latch.is_inflight(
             station, climate_day_key, key_instrument_id=iid,
         ) and not self._release_stale_inflight(
@@ -1525,6 +1648,10 @@ class ContinuousRungHoldStrategy(Strategy):
         # eligible_depth_frames.
         if self._submission_armed():
             attempts, last_attempt_ns = attempt_state
+            # F-1c table: a YES re-arm wait fails closed for the same reason
+            # as IN_FLIGHT above -- the prior YES attempt lacks venue
+            # evidence of a non-fill, so the sibling exclusion cannot yet be
+            # proven safe and NO is not evaluated on this branch.
             if attempts > 0 and not self._rearm_permitted(
                 station,
                 climate_day_key,
