@@ -71,11 +71,11 @@ import json
 import logging
 import sys
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Protocol, cast
 
 import pyarrow.parquet as pq
 
@@ -571,11 +571,25 @@ def filter_rows_to_manifest_prefix(
     return tuple(kept)
 
 
+class _BoundaryFn(Protocol):
+    """The exact call shape `run_sequential_looks` needs off `boundary_fn`
+    -- structurally satisfied by `BoundaryArtefact.boundary_for` (a bound
+    method, `t_history: Sequence[float], *, is_terminal: bool = False`)
+    without importing it as a nominal type. Every call site here passes
+    `is_terminal` explicitly (never relies on a default), so it is
+    declared required, matching actual usage exactly rather than merely
+    matching `boundary_for`'s own (wider) signature."""
+
+    def __call__(
+        self, t_history: tuple[float, ...], *, is_terminal: bool
+    ) -> tuple[float, float]: ...
+
+
 def run_sequential_looks(
     combined_draws: Sequence[CombinedDraw],
     *,
     artefact: BoundaryArtefact,
-    boundary_fn: Callable[..., tuple[float, float]],
+    boundary_fn: _BoundaryFn,
     total_pnl: Decimal,
     residual: Decimal,
     cell_dead: bool,
