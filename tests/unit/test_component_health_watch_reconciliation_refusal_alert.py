@@ -135,6 +135,23 @@ def test_an_unknown_detail_is_never_forwarded_verbatim() -> None:
     assert payload.detail == "RECONCILIATION_REFUSAL_UNKNOWN"
 
 
+def test_a_durable_reports_build_failed_refusal_alerts_under_its_own_name() -> None:
+    """AUD-13b review fix: the fourth latch (``durable_reports_build_failed``,
+    added when the per-position build loop got its own catch) must reach the
+    sink with ITS detail, never collapsed to the generic UNKNOWN member."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    surface = (
+        _refusal(
+            "durable_reports_build_failed", "DURABLE_REPORTS_BUILD_FAILED", "a.POLYMARKET_US"
+        ),
+    )
+    install_reconciliation_refusal_alert(msgbus, refusals=lambda: surface, sink=sink)
+    _tick(msgbus)
+    (payload,) = sink.payloads
+    assert payload.detail == "DURABLE_REPORTS_BUILD_FAILED"
+
+
 def test_a_broken_surface_reader_does_not_crash_the_handler() -> None:
     msgbus = _new_bus()
     sink = _RecordingSink()

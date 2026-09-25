@@ -3011,7 +3011,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         DURABLE_REPORTS_BUILD_FAILED, str(position.instrument_id)
                     )
                     counts[f"refusals_{DURABLE_REPORTS_BUILD_FAILED}"] += 1
-                    self._log.warning(
+                    # Review fix (LOW): `_latch_reconciliation_refusal` already
+                    # emits the deduped WARNING every alerting caller sees; a
+                    # second WARNING here would double-log on EVERY pass this
+                    # position keeps failing on (the latch WARNs once ever, this
+                    # loop runs every pass). The exception detail the latch's
+                    # fixed-enum log does not carry stays reachable at DEBUG.
+                    self._log.debug(
                         "durable reconciliation: building reports for "
                         f"{position.instrument_id} raised ({type(exc).__name__}: {exc}); "
                         "nothing is reported for it; other positions are unaffected"

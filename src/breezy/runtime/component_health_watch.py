@@ -248,7 +248,12 @@ RECONCILIATION_REFUSAL_ALERT_SITE: Final[str] = "global"
 #: surface is sent as the generic member -- the surface's own free text never
 #: travels, so no id, date or exception text can reach the sink.
 _RECONCILIATION_REFUSAL_DETAILS: Final[frozenset[str]] = frozenset(
-    {"POSITIONS_READ_FAILED", "RECORD_VENUE_DISAGREEMENT", "FEE_COEFFICIENT_AMBIGUOUS"}
+    {
+        "POSITIONS_READ_FAILED",
+        "RECORD_VENUE_DISAGREEMENT",
+        "FEE_COEFFICIENT_AMBIGUOUS",
+        "DURABLE_REPORTS_BUILD_FAILED",
+    }
 )
 _RECONCILIATION_REFUSAL_UNKNOWN_DETAIL: Final[str] = "RECONCILIATION_REFUSAL_UNKNOWN"
 
