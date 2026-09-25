@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
@@ -59,7 +60,7 @@ from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.strategy.current_rung_hold import exit_wiring
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
-from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take
+from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take, no_leg_executable
 from breezy.strategy.current_rung_hold.exit_decider import ExitProposal
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
@@ -284,6 +285,20 @@ class _AskSnapshot:
     #: as a missing bid (NO refuses `not_executable`).
     bid: Decimal | None = None
     bid_size: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _EligibleSetup:
+    """The three per-tick facts the YES path and the NO-only hunt (F-1a)
+    both need, derived identically from the same snapshot -- extracted (A1,
+    plan ``STALL_FOLLOWUPS_F1_F4_2026-09-24.md``) so `_hunt_no_only` can
+    share them with `_hunt_tick`'s YES path without duplicating the calls.
+    """
+
+    width_code: int
+    m_code: int
+    fee_coefficient: Decimal | None
+    staleness_ns: int | None
 
 
 def _snapshot_from_quote(tick: QuoteTick) -> _AskSnapshot:
@@ -1170,6 +1185,111 @@ class ContinuousRungHoldStrategy(Strategy):
             monitor = self._position_monitor
             self._forward_to_monitor(lambda: monitor.on_depth(depth, depth.ts_event))
 
+    def _eligible_setup(
+        self,
+        instrument_id: InstrumentId,
+        facts: WeatherBucketFacts,
+        running_max: RunningMax,
+        accumulator: RunningExtremeAccumulator,
+        now_ns: int,
+    ) -> _EligibleSetup:
+        """Pure extraction (A1, F-1a) of the YES path's three per-tick
+        lookups -- `width_and_m`, `_guarded_fee_coefficient`,
+        `accumulator.staleness_ns` -- same calls, same order, no behaviour
+        change. Shared by `_hunt_tick`'s YES path and `_hunt_no_only`.
+        """
+        width_code, m_code = width_and_m(facts, running_max)
+        instrument = self.cache.instrument(instrument_id)
+        fee_coefficient = self._guarded_fee_coefficient(instrument)
+        staleness_ns = accumulator.staleness_ns(now_ns)
+        return _EligibleSetup(
+            width_code=width_code,
+            m_code=m_code,
+            fee_coefficient=fee_coefficient,
+            staleness_ns=staleness_ns,
+        )
+
+    def _hunt_no_only(
+        self,
+        snapshot: _AskSnapshot,
+        facts: WeatherBucketFacts,
+        *,
+        station: str,
+        climate_day: date,
+        climate_day_key: str,
+        station_day: tuple[str, str],
+        now_ns: int,
+        hour_lst: int,
+    ) -> None:
+        """F-1a (plan ``STALL_FOLLOWUPS_F1_F4_2026-09-24.md``): a quiet
+        NO-only evaluation, reached ONLY from `_hunt_tick`'s
+        ``not raw_executable`` branch, and only when the caller has already
+        proven ``no_leg_executable`` for this snapshot. The YES path
+        (`_hunt_tick`'s ``:1336`` onward) is untouched: this method always
+        returns before it, and this method itself never touches
+        ``self.diagnostics``/``self.refusals``/``self._eligible_snap_counts``
+        or the YES offer-tape row -- restoring the registered NO population
+        (PREREG v3 amendment §1:13/§2:32; the F-1 diagnosis's finding: the
+        YES-ask-in-band requirement at the caller was the code's deviation,
+        not this branch) must never add a second count to a tick the caller
+        already counted once.
+
+        Steps 1-2 are QUIET (no diagnostic, no tape row): an unresolved
+        running max or an off-rung instrument is upstream state the YES
+        path already has its own (counted) gates for on the SAME tick --
+        this NO-only path must not double-count it. Step 3 shares the exact
+        per-tick lookups the YES path uses (`_eligible_setup`). Step 4
+        reuses `evaluate_both_sides` so the crossed-book check
+        (``tick_eval.py``'s own ``bid >= ask`` guard) is single-sourced --
+        never re-implemented here. Step 5, `_evaluate_no_side_shadow`, is
+        completely unchanged: it runs its own admission/budget/consumed
+        gates independently, exactly as it already does on the YES-in-band
+        path.
+        """
+        accumulator = self._accumulators.get(station)
+        running_max = None if accumulator is None else accumulator.value_at(now_ns)
+        if running_max is None or accumulator is None:
+            return
+        if not instrument_rung_is_current(facts, running_max):
+            return
+
+        setup = self._eligible_setup(
+            snapshot.instrument_id, facts, running_max, accumulator, now_ns,
+        )
+        both_sides = evaluate_both_sides(
+            station=station,
+            climate_day=climate_day,
+            now_ns=now_ns,
+            ladder=self._ladders[(station, climate_day_key)],
+            fee_coefficient=setup.fee_coefficient,
+            ask=snapshot.ask,
+            ask_size=snapshot.size,
+            bid=snapshot.bid,
+            bid_size=snapshot.bid_size,
+            running_max=running_max,
+            staleness_ns=setup.staleness_ns,
+            config=self._config,
+            hour_lst=hour_lst,
+            width_code=setup.width_code,
+            m_code=setup.m_code,
+        )
+        self._evaluate_no_side_shadow(
+            station=station,
+            climate_day_key=climate_day_key,
+            station_day=station_day,
+            yes_instrument_id=snapshot.instrument_id,
+            no_decision=both_sides.no,
+            now_ns=now_ns,
+            bid_size=snapshot.bid_size,
+            bid=snapshot.bid,
+            hour_lst=hour_lst,
+            width_code=setup.width_code,
+            m_code=setup.m_code,
+            fee_coefficient=setup.fee_coefficient,
+            staleness_ns=setup.staleness_ns,
+            running_max=running_max,
+        )
+
     def _hunt_tick(
         self,
         snapshot: _AskSnapshot,
@@ -1331,6 +1451,24 @@ class ContinuousRungHoldStrategy(Strategy):
                 self.diagnostics_alerter,
                 "continuous_rung_hold diagnostics report failed",
             )
+            # F-1a (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md): the YES ask
+            # being outside the executable band (or too thin) never implies
+            # the NO leg (1 - bid) is -- PREREG v3 amendment §1:13/§2:32
+            # registers the NO population on the NO leg's OWN executability,
+            # never gated on the YES ask. This restores that population; the
+            # counted diagnostic above and this `return` are unchanged, so
+            # every existing YES-side count and tape row stays byte-identical.
+            if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
+                self._hunt_no_only(
+                    snapshot,
+                    facts,
+                    station=station,
+                    climate_day=climate_day,
+                    climate_day_key=climate_day_key,
+                    station_day=station_day,
+                    now_ns=now_ns,
+                    hour_lst=hour_lst,
+                )
             return
 
         accumulator = self._accumulators.get(station)
@@ -1350,15 +1488,20 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             return
 
-        width_code, m_code = width_and_m(facts, running_max)
-        instrument = self.cache.instrument(snapshot.instrument_id)
-        fee_coefficient = self._guarded_fee_coefficient(instrument)
+        # A1 (F-1a): extracted into `_eligible_setup` so the NO-only hunt
+        # can share these exact three lookups -- same calls, same order, no
+        # behaviour change on this (YES) path.
+        setup = self._eligible_setup(
+            snapshot.instrument_id, facts, running_max, accumulator, now_ns,
+        )
+        width_code, m_code = setup.width_code, setup.m_code
+        fee_coefficient = setup.fee_coefficient
         # GAP fix 2026-09-15 (offer-tape postmortem observability): named
         # once so the offer-tape row below and the NO-side shadow evaluation
         # log the SAME staleness the decision was actually evaluated
         # against, rather than two independent (if numerically identical)
         # calls -- pure extraction, no behaviour change.
-        staleness_ns = accumulator.staleness_ns(now_ns)
+        staleness_ns = setup.staleness_ns
         # S3b (plan NO_SIDE_EDGE_2026-09-14 S3/S4): both sides are evaluated
         # from the SAME frame every tick. `decision` (YES) continues through
         # the existing arm/submit path below, byte-identical to before this
