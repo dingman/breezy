@@ -44,6 +44,7 @@ from breezy.runtime.order_enablement import (
     SettingsNotSettingsLikeError,
     WriteCanonicalStringUnverifiedError,
 )
+from tests.unit.log_leak_assertions import assert_no_values_leaked
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.test_polymarket_us_permit_issuance import (
     clock_at,
@@ -244,9 +245,11 @@ _FORBIDDEN_VALUES = ("the-operator-value", "1000.00", "10.00")
 
 
 def _assert_message_names_no_value(exc: BaseException) -> None:
+    # Number-boundary match, not a bare substring check -- see
+    # `log_leak_assertions.py` for why a plain substring check on a numeric
+    # sensitive value is a false-positive risk against any nearby digit run.
     message = str(exc)
-    for value in _FORBIDDEN_VALUES:
-        assert value not in message, f"{value!r} leaked into: {message!r}"
+    assert_no_values_leaked(message, _FORBIDDEN_VALUES, context=repr(message))
 
 
 def test_orders_not_requested_message_names_no_value(
