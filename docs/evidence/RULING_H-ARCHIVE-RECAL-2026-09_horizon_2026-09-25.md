@@ -135,3 +135,27 @@ No live-trading enablement is proposed or implied. This ruling arms nothing.
 - `PREREG_WP7_MULTIPLICITY_RULE §1.v` application: corpus-scoped, not statistic-scoped. ENDORSED.
 
 This amended ruling, with §0 and table §1 updates applied, receives ENDORSED status subject to peer confirmation of the corpus rationale.
+
+## Peer confirmation of the corpus rationale (2026-09-25, appended; closes the :137 condition)
+
+An independent pass by `mle-reviewer` returned **CONFIRMED-WITH-NOTES**.
+
+- **Recomputed MDE.** The recompute matches the ruling exactly at every sample size:
+
+  | n | MDE |
+  |---|---|
+  | 300 | 0.08900 |
+  | 600 | 0.06293 |
+  | 1200 | 0.04450 |
+
+  BE is 0.324595. The required hold probability is 0.3875.
+- **Comparator sources.** Both comparators behind the 0.03 bound predate `freeze_commit` 49261a5, and neither is drawn from this hypothesis's SEARCH window (2026-09-21..09-25):
+  - The WP-7b ask CI `[-0.02147,+0.02079]`, clusters=84, matches `AUD02_step5_wp7b_since_2026-09-21_run.md:16` byte for byte. It comes from a pinned `--corpus-json` corpus dated 2026-09-20. The windowed step-5 addendum in the same file uses a separate, non-overlapping code path.
+  - The forecast-taker CI `[-0.03229,-0.00373]`, n=64, matches `RULING_forecast_edge_programme_closes_2026-09-20.md:45`.
+- **Leakage.** None found.
+- **Train/serve skew.** The archive table was calibrated without the tenths-METAR ambiguity gate, and that skew is real. It does not matter here, because an UNDERPOWERED disposition refuses intake before any archive-table data is opened.
+- **Notes.**
+  - "The corpus rationale" could mean either §0 (SEARCH scoping) or §3 (bound justification). Both were verified.
+  - That the comparator corpora do not overlap the SEARCH window was established by script and commit forensics. The ruling body does not state it.
+
+**The :137 condition is closed.** Registration of H-ARCHIVE-RECAL-2026-09 is unblocked, as a follow-up slice.

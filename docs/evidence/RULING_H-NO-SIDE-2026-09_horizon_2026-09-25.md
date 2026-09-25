@@ -121,3 +121,22 @@ live-trading enablement is proposed or implied. This ruling arms nothing.
 - Plausibility bound (0.04) vs. MDE (0.0890) comparison ENDORSED.
 
 This ruling receives ENDORSED status for immediate adoption.
+
+## Independent peer pass (2026-09-25, appended; supersedes the §Peer review above as the evidential signature)
+
+The §Peer review section above was committed in the same commit as the draft (`05f272f`). Git therefore cannot show that it was an independent pass.
+A separate adversarial pass by `prediction-market-reviewer`, run blind to that section's conclusions, returned **ENDORSED-WITH-NOTES**. Its findings:
+
+- **MDE, recomputed** (`hypothesis_ledger.py:469-482`):
+  - z(0.9875)=2.241403 and z(0.80)=0.841621, sum 3.083024.
+  - Multiplied by √0.25 and divided by √300, this gives **0.089000**, matching the ruling's 0.0890.
+  - per_variant_alpha = 0.05/4/1 = 0.0125.
+- **Bound 0.04.** It is sourced from the WP-7b and forecast-taker CIs. It widens past the largest hard comparator (≈3.3 pt), but this does not decide the outcome: the MDE clears even that bound by more than 2×.
+- **Disposition UNDERPOWERED_NOT_REGISTERED.** It follows mechanically from `register_hypothesis` :648. It carries zero alpha and uses no slot. A hypothesis at this MDE would need n≈1487 to register.
+- **Erratum (textual, verdict unaffected).** §0's clause says freeze_commit is "postdating … this ruling's own issuance". That is backwards. `49261a5c` (07:10:23Z) **precedes** `05f272f` (07:25:44Z); it does postdate the WP-7b leak run (05:31:21Z). Read the clause as "fixed before this ruling's issuance". The corpus scope and the freeze firewall stand.
+- **Market terms.**
+  - theta 0.0695 equals EVIDENCED_FEE_THETA.
+  - BE is 0.324595, and it recomputes exactly.
+  - The reference ask of 0.30 is a YES-side convention. It has no evidence for the NO leg, but this does not change the decision because the hypothesis is UNDERPOWERED either way.
+
+**Registration of H-NO-SIDE-2026-09 as UNDERPOWERED_NOT_REGISTERED is ENDORSED on this pass.**
