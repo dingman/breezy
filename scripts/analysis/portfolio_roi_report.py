@@ -30,6 +30,20 @@ via ``score_live_trials.read_filled_trials_state_db`` (one call per
 (REGISTERED ``polymarket_us`` family manifest, station) pair, the same loop
 ``score-live-trials-run.sh`` already drives); and the CLI ``main``.
 
+**Stage C3 adds (this addition):** the per-trial P&L breakdown
+(``trial_rows``, one :class:`PortfolioRoiTrialRow` per settled trial --
+``trial_id``, ``family_id``, ``climate_day``, ``side``, ``pnl`` and
+``settlement_basis``) an AUD-07-style consumer can join on ``trial_id`` to
+catch an equal-and-opposite per-trial error a report-level total alone
+cannot reveal. This is the field that bumps ``PORTFOLIO_ROI_SCHEMA_VERSION``
+to 2 (every prior C2 addition stayed additive-within-version-1; this one
+does not, precisely so the reader can tell "no rows because this report
+predates the field" (``schema_version=1`` -> ``trial_rows is None``) apart
+from "no rows because zero trials settled this run" (``schema_version=2``
+-> ``trial_rows == ()``) -- a distinction a bare additive key can't carry
+for a *list*-shaped field the way a dimensionless count's ``0`` default
+safely can). The reader still accepts ``schema_version=1`` unmodified.
+
 **Known gap, deliberately deferred, not a contradiction with the plan text
 naming only four loaders:** the plan's four named loaders do not, on their
 own, give a `DurableFillRecord` (keyed by `venue_order_id`) a `trial_id` --
@@ -117,6 +131,7 @@ __all__ = [
     "UNEXPLAINED_CAPITAL_FLOW_LABEL",
     "UNEXPLAINED_OK_LABEL",
     "UNEXPLAINED_PROXY_LAG_LABEL",
+    "UNKNOWN_TRIAL_FAMILY_LABEL",
     "UNRECONCILED_EXIT_LABEL",
     "AttributedFill",
     "BalancePoint",
@@ -134,6 +149,7 @@ __all__ = [
     "PortfolioRoiReportData",
     "PortfolioRoiReportMalformedFieldError",
     "PortfolioRoiReportView",
+    "PortfolioRoiTrialRow",
     "RoiAgainstBaselines",
     "UnknownOrderSideError",
     "UnknownPortfolioRoiSchemaError",
@@ -162,6 +178,7 @@ __all__ = [
     "is_input_fresh",
     "journal_line",
     "leg_of_fill",
+    "leg_of_scored_trial",
     "main",
     "max_settlement_horizon_ns",
     "parse_account_state_line",
@@ -181,12 +198,14 @@ __all__ = [
     "residual_trial_ids_pooled",
     "roi",
     "roi_against_baselines",
+    "scored_trial_family_ids",
     "settled_through_statistic_label",
     "settlement_lag_days",
     "settlement_payout",
     "total_capital_deployed",
     "total_realised_pnl_admissible",
     "total_realised_pnl_all_settled",
+    "trial_rows_of",
     "write_portfolio_roi_json",
 ]
 
@@ -325,6 +344,15 @@ def leg_of_fill(fill: DurableFillRecord) -> Literal["yes", "no"]:
     ``"yes"`` -- the same rule ``realized_draws.stratum_row_from_scored_trial``
     applies, restated here over a ledger fill instead of a ``ScoredTrial``."""
     return leg_of_symbol(symbol_of_instrument_id(fill.instrument_id))
+
+
+def leg_of_scored_trial(trial: ScoredTrial) -> Literal["yes", "no"]:
+    """The mirror of :func:`leg_of_fill`, over a ``ScoredTrial`` instead of a
+    ``DurableFillRecord`` -- same rule (a composite ``^no`` instrument id is
+    the NO leg), restated over the settlement-side record so the per-trial
+    P&L breakdown (:func:`trial_rows_of`) never has to reach for a ledger
+    fill just to label a trial's side."""
+    return leg_of_symbol(symbol_of_instrument_id(trial.instrument_id))
 
 
 #: F5: `DurableFillRecord.order_side` on this ledger is already NORMALISED
@@ -552,6 +580,46 @@ def scored_trial_ids_of(scored_trials: Iterable[ScoredTrial]) -> frozenset[str]:
     caller never inlines ``{t.trial_id for t in ...}`` independently at each
     call site."""
     return frozenset(trial.trial_id for trial in scored_trials)
+
+
+#: A `trial_id` scored under the pre-L-38 legacy top-level layout (no
+#: per-family subdirectory) -- `scored_trial_family_ids`'s label for it.
+_LEGACY_SCORED_TRIAL_FAMILY_LABEL: Final[str] = "(top-level)"
+
+#: `trial_rows_of`'s fallback when a `trial_id` has no entry in the
+#: `family_ids_by_trial_id` mapping it was given (can only happen if the
+#: scored-trial store changed between the two reads) -- a diagnostic label,
+#: never a value any reported P&L or the sum invariant depends on.
+UNKNOWN_TRIAL_FAMILY_LABEL: Final[str] = "UNKNOWN"
+
+
+def scored_trial_family_ids(base_dir: Path) -> dict[str, str]:
+    """Best-effort ``trial_id`` -> originating family map, mirroring
+    :func:`breezy.persistence.scored_trial_store.read_scored_trials_pooled`'s
+    own iteration (L-38: the store subdirectory name IS the family id).
+    Legacy top-level rows (the pre-L-38 layout that reader also still
+    unions) map to :data:`_LEGACY_SCORED_TRIAL_FAMILY_LABEL`.
+
+    When the SAME ``trial_id`` is present under more than one source, the
+    LAST one iterated (sorted subdirectory order, after any legacy rows)
+    wins. This can only happen when both rows carry byte-identical
+    economics -- any genuine mismatch already fails the whole run loud via
+    :class:`DuplicateScoredTrialEconomicsMismatchError` before this map is
+    ever consulted -- so which label wins never changes any reported P&L,
+    only this diagnostic breakdown's ``family_id`` column.
+
+    Absent/empty ``base_dir`` returns ``{}``, the same "never an error"
+    contract every loader in this module carries.
+    """
+    family_ids: dict[str, str] = {}
+    if not base_dir.exists():
+        return family_ids
+    for trial in read_scored_trials(base_dir):
+        family_ids[trial.trial_id] = _LEGACY_SCORED_TRIAL_FAMILY_LABEL
+    for child in sorted(p for p in base_dir.iterdir() if p.is_dir()):
+        for trial in read_scored_trials(child):
+            family_ids[trial.trial_id] = child.name
+    return family_ids
 
 
 # --------------------------------------------------------------------------
@@ -1583,7 +1651,19 @@ def roi_against_baselines(
 
 #: §6 D7: '"schema_version": 1" as a top-level integer ... additive-only
 #: within a major version; any removal or semantic change increments it.'
-PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 1
+#: Stage C3 bumps this to 2 for `trial_rows` (see the module docstring's
+#: "Stage C3 adds" paragraph for why THIS field bumps the version rather
+#: than landing as another additive-within-1 key).
+PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 2
+
+#: The Stage C3 version's own value, named so `read_portfolio_roi_report`'s
+#: gate on it (rather than on bare key-presence) is self-documenting.
+_MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS: Final[int] = 2
+
+#: Every `schema_version` this reader accepts -- `PORTFOLIO_ROI_SCHEMA_VERSION`
+#: (the current, writer-stamped version) plus every prior version this
+#: module still reads. Anything else raises `UnknownPortfolioRoiSchemaError`.
+_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2})
 
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
@@ -1699,6 +1779,47 @@ def _require_daily_reconciliation_rows(
     return tuple(parsed)
 
 
+def _require_trial_rows(raw: Mapping[str, object]) -> tuple[PortfolioRoiTrialRow, ...]:
+    """Strict extraction of ``trial_rows`` (Stage C3, schema_version=2).
+
+    Unlike :func:`_require_daily_reconciliation_rows`, this key is
+    REQUIRED here: a document already claiming ``schema_version >=
+    _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS`` but missing the very field that
+    version introduced is malformed, not merely old -- a genuinely old
+    (``schema_version=1``) document never reaches this function at all
+    (:func:`read_portfolio_roi_report` surfaces ``trial_rows=None`` for it
+    directly, from the version check alone).
+    """
+    if "trial_rows" not in raw:
+        raise PortfolioRoiReportMalformedFieldError(
+            "portfolio ROI report is missing required field 'trial_rows' at "
+            f"schema_version={raw.get('schema_version')!r}"
+        )
+    rows = raw["trial_rows"]
+    if not isinstance(rows, list):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field 'trial_rows' must be a list, got {type(rows).__name__}"
+        )
+    parsed: list[PortfolioRoiTrialRow] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise PortfolioRoiReportMalformedFieldError(
+                f"portfolio ROI report field 'trial_rows[{index}]' must be an object, got "
+                f"{type(row).__name__}"
+            )
+        parsed.append(
+            PortfolioRoiTrialRow(
+                trial_id=_require_str(row, "trial_id"),
+                family_id=_require_str(row, "family_id"),
+                climate_day=_require_str(row, "climate_day"),
+                side=_require_str(row, "side"),
+                pnl=_require_decimal_str(row, "pnl"),
+                settlement_basis=_require_str(row, "settlement_basis"),
+            )
+        )
+    return tuple(parsed)
+
+
 def _require_decimal_str(raw: Mapping[str, object], field: str) -> Decimal:
     value = raw.get(field)
     if not isinstance(value, str):
@@ -1738,6 +1859,55 @@ def _summary_row_of(row: DailyUnexplained) -> DailyUnexplainedSummaryRow:
         magnitude_cents=magnitude_cents,
         provisional=row.provisional,
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PortfolioRoiTrialRow:
+    """One settled trial's own P&L (Stage C3, schema_version=2) -- the
+    per-trial breakdown a caller (e.g. an AUD-07-style exit-side
+    reconciliation) can join on ``trial_id`` to catch an equal-and-opposite
+    per-trial error a report-level total alone cannot reveal."""
+
+    trial_id: str
+    family_id: str
+    climate_day: str
+    side: str
+    pnl: Decimal
+    settlement_basis: str
+
+
+def trial_rows_of(
+    scored_trials: Iterable[ScoredTrial],
+    *,
+    family_ids_by_trial_id: Mapping[str, str],
+) -> tuple[PortfolioRoiTrialRow, ...]:
+    """One :class:`PortfolioRoiTrialRow` per given ``scored_trials`` row --
+    never a re-aggregation, so ``sum(row.pnl for row in
+    trial_rows_of(scored_trials, ...)) ==
+    total_realised_pnl_all_settled(scored_trials)`` holds by construction
+    (same input, same ``.pnl`` field, no filtering, no dedup performed
+    here -- callers pass the already-deduped rows). Sorted by ``trial_id``
+    (unique post-``dedupe_scored_trials``) for a deterministic,
+    diff-friendly JSON encoding.
+
+    ``family_id`` is looked up from ``family_ids_by_trial_id`` (see
+    :func:`scored_trial_family_ids`); a ``trial_id`` missing from that
+    mapping reports :data:`UNKNOWN_TRIAL_FAMILY_LABEL` rather than raising,
+    since this is a diagnostic breakdown column, never a value the sum
+    invariant depends on.
+    """
+    rows = tuple(
+        PortfolioRoiTrialRow(
+            trial_id=trial.trial_id,
+            family_id=family_ids_by_trial_id.get(trial.trial_id, UNKNOWN_TRIAL_FAMILY_LABEL),
+            climate_day=trial.climate_day,
+            side=leg_of_scored_trial(trial),
+            pnl=trial.pnl,
+            settlement_basis=trial.settlement_basis,
+        )
+        for trial in scored_trials
+    )
+    return tuple(sorted(rows, key=lambda row: row.trial_id))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1793,6 +1963,11 @@ class PortfolioRoiReportData:
     # Rows dropped before proceeds: same trial_id in more than one family
     # store. Latest scored_at_ns is kept. Dimensionless.
     n_duplicate_scored_trials: int = 0
+    # -- Stage C3: the per-trial P&L breakdown (schema_version=2). Empty by
+    # default only for a caller (e.g. a test) that never supplies scored
+    # trials -- `build_portfolio_roi_report_data` always populates this from
+    # its own `scored_trials` argument.
+    trial_rows: tuple[PortfolioRoiTrialRow, ...] = ()
 
 
 def power_caveat(*, n_ledger_fills: int, n_scored: int, days: int) -> str:
@@ -1826,6 +2001,8 @@ def build_portfolio_roi_report_data(
     n_undecodable_ledger_rows: int = 0,
     n_exit_fills: int = 0,
     n_duplicate_scored_trials: int = 0,
+    scored_trials: Iterable[ScoredTrial] = (),
+    family_ids_by_trial_id: Mapping[str, str] | None = None,
 ) -> PortfolioRoiReportData:
     """Assemble the one :class:`PortfolioRoiReportData` this run produces.
 
@@ -1885,6 +2062,9 @@ def build_portfolio_roi_report_data(
         n_undecodable_ledger_rows=n_undecodable_ledger_rows,
         n_exit_fills=n_exit_fills,
         n_duplicate_scored_trials=n_duplicate_scored_trials,
+        trial_rows=trial_rows_of(
+            scored_trials, family_ids_by_trial_id=family_ids_by_trial_id or {}
+        ),
     )
 
 
@@ -1935,6 +2115,17 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "n_undecodable_ledger_rows": data.n_undecodable_ledger_rows,
         "n_exit_fills": data.n_exit_fills,
         "n_duplicate_scored_trials": data.n_duplicate_scored_trials,
+        "trial_rows": [
+            {
+                "trial_id": row.trial_id,
+                "family_id": row.family_id,
+                "climate_day": row.climate_day,
+                "side": row.side,
+                "pnl": str(row.pnl),
+                "settlement_basis": row.settlement_basis,
+            }
+            for row in data.trial_rows
+        ],
     }
 
 
@@ -1993,6 +2184,12 @@ class PortfolioRoiReportView:
     #: (schema_version=1 predates this field) reads as `()`, the only
     #: tolerated absence (D7's additive-only rule).
     daily_reconciliation: tuple[DailyUnexplainedSummaryRow, ...]
+    #: Stage C3, schema_version=2: one row per settled trial. `None` means
+    #: "this report predates the field" (`schema_version=1`) -- NEVER
+    #: confused with `()`, which means "this report knows the field and
+    #: genuinely settled zero trials this run" (see the module docstring's
+    #: "Stage C3 adds" paragraph).
+    trial_rows: tuple[PortfolioRoiTrialRow, ...] | None
     _roi: Decimal
     _roi_minus_b0: Decimal
     _roi_minus_b1: Decimal
@@ -2035,13 +2232,20 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
     never a bare `KeyError`/`TypeError` from a raw dict access. Fields added
     after `schema_version=1` shipped stay optional-on-read with a default
     (D7's additive-only rule) and are NOT type-checked when absent.
+
+    Accepts every version in :data:`_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS`
+    (currently 1 and 2), refusing anything else exactly as before. `trial_id`
+    is `None` at `schema_version=1` (the field did not exist yet) and a
+    strictly-typed tuple (possibly empty) at `schema_version=2` (see
+    `PortfolioRoiReportView.trial_rows`'s own docstring).
     """
     raw = json.loads(path.read_text())
     version = raw.get("schema_version")
-    if version != PORTFOLIO_ROI_SCHEMA_VERSION:
+    if version not in _KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS:
         raise UnknownPortfolioRoiSchemaError(
             f"unknown portfolio ROI schema_version={version!r}; this reader "
-            f"only knows schema_version={PORTFOLIO_ROI_SCHEMA_VERSION!r}"
+            f"only knows schema_version in "
+            f"{sorted(_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS)!r}"
         )
     return PortfolioRoiReportView(
         schema_version=version,
@@ -2120,6 +2324,11 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
             _require_int(raw, "n_duplicate_scored_trials")
             if "n_duplicate_scored_trials" in raw
             else 0
+        ),
+        trial_rows=(
+            _require_trial_rows(raw)
+            if version >= _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS
+            else None
         ),
         _roi=_require_decimal_str(raw, "roi"),
         _roi_minus_b0=_require_decimal_str(raw, "roi_minus_b0"),
@@ -2692,6 +2901,10 @@ def _run(
             file=sys.stderr,
         )
         return 1
+    # Stage C3: `trial_id` -> originating family, for the per-trial P&L
+    # breakdown's `family_id` column (`PooledScoredTrials.rows` itself does
+    # not carry this -- see `scored_trial_family_ids`'s own docstring).
+    family_ids_by_trial_id = scored_trial_family_ids(scored_trials_dir)
     residual_ids = residual_trial_ids_pooled(scored_trials_dir)
     scored_ids = scored_trial_ids_of(scored_trials)
 
@@ -2840,6 +3053,8 @@ def _run(
         n_undecodable_ledger_rows=ledger_result.n_undecodable_ledger_rows,
         n_exit_fills=n_exit_fills,
         n_duplicate_scored_trials=n_duplicate_scored_trials,
+        scored_trials=scored_trials,
+        family_ids_by_trial_id=family_ids_by_trial_id,
     )
 
     # F7/F9: atomic writes -- the directory is created by

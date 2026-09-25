@@ -140,6 +140,13 @@ OPENING_BALANCE_LOOKBACK_DAYS = _prr.OPENING_BALANCE_LOOKBACK_DAYS
 _latest_balance_before = _prr._latest_balance_before
 DailyUnexplainedSummaryRow = _prr.DailyUnexplainedSummaryRow
 
+# -- Stage C3 additions (per-trial P&L breakdown) --
+PortfolioRoiTrialRow = _prr.PortfolioRoiTrialRow
+trial_rows_of = _prr.trial_rows_of
+scored_trial_family_ids = _prr.scored_trial_family_ids
+leg_of_scored_trial = _prr.leg_of_scored_trial
+UNKNOWN_TRIAL_FAMILY_LABEL = _prr.UNKNOWN_TRIAL_FAMILY_LABEL
+
 from breezy.runtime import alert_ladder as _ladder
 
 alert_ladder = _ladder
@@ -211,7 +218,8 @@ class TestJsonSchemaVersion:
         write_portfolio_roi_json(path, data)
 
         raw = json.loads(path.read_text())
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 1
+        # Stage C3 bumps this to 2 (the per-trial `trial_rows` breakdown).
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 2
         # D6: the JSON is PRIVATE, mode 0600.
         assert (path.stat().st_mode & 0o777) == 0o600
 
@@ -260,6 +268,175 @@ class TestJsonSchemaVersion:
         ok_view = read_portfolio_roi_report(ok_path)
         assert ok_view.roi_status == ROI_STATUS_OK
         assert ok_view.roi == ok_data.roi
+
+
+class TestPerTrialPnlBreakdown:
+    """Stage C3: the per-trial P&L breakdown (`trial_rows`) an AUD-07-style
+    consumer joins on `trial_id`, so an equal-and-opposite per-trial error
+    can never cancel invisibly inside a report-level total."""
+
+    def test_trial_rows_of_sums_exactly_to_the_total_and_is_sorted_by_trial_id(
+        self,
+    ) -> None:
+        trial_b = _scored_trial(
+            trial_id="fam_b/trial/LAX/2026-01-02", pnl=Decimal("0.30"), climate_day="2026-01-02"
+        )
+        trial_a = _scored_trial(
+            trial_id="fam_a/trial/LAX/2026-01-01", pnl=Decimal("0.27"), climate_day="2026-01-01"
+        )
+        family_ids = {
+            "fam_a/trial/LAX/2026-01-01": "fam_a",
+            "fam_b/trial/LAX/2026-01-02": "fam_b",
+        }
+
+        # Given out of order -- the output must still be sorted.
+        rows = trial_rows_of((trial_b, trial_a), family_ids_by_trial_id=family_ids)
+
+        assert [row.trial_id for row in rows] == [
+            "fam_a/trial/LAX/2026-01-01",
+            "fam_b/trial/LAX/2026-01-02",
+        ]
+        assert sum((row.pnl for row in rows), start=Decimal(0)) == total_realised_pnl_all_settled(
+            (trial_a, trial_b)
+        )
+        assert rows[0].family_id == "fam_a"
+        assert rows[0].climate_day == "2026-01-01"
+        assert rows[0].side == "yes"
+        assert rows[0].settlement_basis == "nws_final"
+
+    def test_trial_rows_of_uses_the_unknown_label_when_the_family_map_has_no_entry(
+        self,
+    ) -> None:
+        trial = _scored_trial(trial_id="fam_x/trial/LAX/2026-01-03", pnl=Decimal("0.05"))
+
+        rows = trial_rows_of((trial,), family_ids_by_trial_id={})
+
+        assert rows[0].family_id == UNKNOWN_TRIAL_FAMILY_LABEL
+
+    def test_leg_of_scored_trial_identifies_the_no_leg_via_the_composite_symbol(
+        self,
+    ) -> None:
+        yes_trial = _scored_trial(trial_id="t-yes", pnl=Decimal("0.01"))
+        no_trial = dataclasses.replace(
+            _scored_trial(trial_id="t-no", pnl=Decimal("0.01")),
+            instrument_id="LAX-92-94^no.POLYMARKET_US",
+        )
+
+        assert leg_of_scored_trial(yes_trial) == "yes"
+        assert leg_of_scored_trial(no_trial) == "no"
+
+    def test_scored_trial_family_ids_maps_trial_id_to_its_store_subdirectory(
+        self, tmp_path: Path
+    ) -> None:
+        scored_trials_dir = tmp_path / "scored_trials"
+        trial_a = _scored_trial(trial_id="fam_a/trial/LAX/2026-01-01", pnl=Decimal("0.10"))
+        trial_b = _scored_trial(trial_id="fam_b/trial/LAX/2026-01-02", pnl=Decimal("0.20"))
+        write_scored_trials(scored_trials_dir / "fam_a", [trial_a], now_ns=1)
+        write_scored_trials(scored_trials_dir / "fam_b", [trial_b], now_ns=2)
+
+        family_ids = scored_trial_family_ids(scored_trials_dir)
+
+        assert family_ids == {
+            "fam_a/trial/LAX/2026-01-01": "fam_a",
+            "fam_b/trial/LAX/2026-01-02": "fam_b",
+        }
+
+    def test_scored_trial_family_ids_returns_empty_for_an_absent_directory(
+        self, tmp_path: Path
+    ) -> None:
+        assert scored_trial_family_ids(tmp_path / "does_not_exist") == {}
+
+    def test_the_json_sibling_carries_trial_rows_summing_to_the_total(
+        self, tmp_path: Path
+    ) -> None:
+        row_a = PortfolioRoiTrialRow(
+            trial_id="fam_a/trial/1",
+            family_id="fam_a",
+            climate_day="2026-01-01",
+            side="no",
+            pnl=Decimal("0.27"),
+            settlement_basis="venue_last_fair_price_fallback",
+        )
+        row_b = PortfolioRoiTrialRow(
+            trial_id="fam_b/trial/1",
+            family_id="fam_b",
+            climate_day="2026-01-02",
+            side="yes",
+            pnl=Decimal("0.30"),
+            settlement_basis="nws_final",
+        )
+        data = dataclasses.replace(_report_data(), trial_rows=(row_a, row_b))
+        # Sanity: `_report_data()`'s default total is exactly 0.27 + 0.30.
+        assert (
+            sum((row.pnl for row in data.trial_rows), start=Decimal(0))
+            == data.realised_pnl_after_fees_total
+        )
+
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, data)
+        raw = json.loads(path.read_text())
+
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 2
+        assert raw["trial_rows"] == [
+            {
+                "trial_id": "fam_a/trial/1",
+                "family_id": "fam_a",
+                "climate_day": "2026-01-01",
+                "side": "no",
+                "pnl": "0.27",
+                "settlement_basis": "venue_last_fair_price_fallback",
+            },
+            {
+                "trial_id": "fam_b/trial/1",
+                "family_id": "fam_b",
+                "climate_day": "2026-01-02",
+                "side": "yes",
+                "pnl": "0.30",
+                "settlement_basis": "nws_final",
+            },
+        ]
+
+        view = read_portfolio_roi_report(path)
+        assert view.trial_rows == (row_a, row_b)
+        assert (
+            sum((row.pnl for row in view.trial_rows), start=Decimal(0))
+            == view.realised_pnl_after_fees_total
+        )
+
+    def test_an_old_schema_version_one_report_surfaces_trial_rows_as_none(
+        self, tmp_path: Path
+    ) -> None:
+        """A pre-existing report predates this field entirely (it predates
+        schema_version=2 itself) -- `None` (unknown), never `()` (which
+        would misreport a genuinely empty, but KNOWN, trial set)."""
+        data = _report_data()
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, data)
+        raw = json.loads(path.read_text())
+        raw["schema_version"] = 1
+        del raw["trial_rows"]
+        path.write_text(json.dumps(raw))
+
+        view = read_portfolio_roi_report(path)
+
+        assert view.schema_version == 1
+        assert view.trial_rows is None
+        # Every other field is still fully readable at the old version.
+        assert view.n_fills == data.n_fills
+        assert view.roi == data.roi
+
+    def test_a_schema_version_two_report_missing_trial_rows_is_malformed(
+        self, tmp_path: Path
+    ) -> None:
+        data = _report_data()
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, data)
+        raw = json.loads(path.read_text())
+        del raw["trial_rows"]
+        path.write_text(json.dumps(raw))
+
+        with pytest.raises(PortfolioRoiReportMalformedFieldError):
+            read_portfolio_roi_report(path)
 
 
 class TestReportHeader:
@@ -1396,6 +1573,97 @@ class TestRunDefect1FamilyAgnosticJoinIsPerFamily:
         assert report["n_fills"] == 2
 
 
+class TestRunEmitsPerTrialBreakdown:
+    """Stage C3, end to end: `_run()` wires the per-family scored-trial
+    store into `trial_rows` with the correct `family_id` attribution -- not
+    just `build_portfolio_roi_report_data` in isolation."""
+
+    def test_the_written_report_carries_trial_rows_attributed_to_their_own_family(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_family_manifest(families_dir, family_id="fam_a", trial_id_prefix="fam_a/trial/")
+        _write_family_manifest(families_dir, family_id="fam_b", trial_id_prefix="fam_b/trial/")
+
+        scored_trials_dir = tmp_path / "scored_trials"
+        trial_a = _scored_trial(
+            trial_id="fam_a/trial/LAX/2026-09-01", pnl=Decimal("0.10"), climate_day="2026-09-01"
+        )
+        trial_b = _scored_trial(
+            trial_id="fam_b/trial/LAX/2026-09-02", pnl=Decimal("0.20"), climate_day="2026-09-02"
+        )
+        write_scored_trials(scored_trials_dir / "fam_a", [trial_a], now_ns=1)
+        write_scored_trials(scored_trials_dir / "fam_b", [trial_b], now_ns=2)
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill_scored_a = _fill(venue_order_id="vo-a", ts_event=_ns_of_day("2026-09-01"))
+            fill_scored_b = _fill(venue_order_id="vo-b", ts_event=_ns_of_day("2026-09-02"))
+            store.set(f"{_FILL_KEY_PREFIX}vo-a", fill_scored_a.to_bytes())
+            store.set(f"{_FILL_KEY_PREFIX}vo-b", fill_scored_b.to_bytes())
+        finally:
+            store.close()
+
+        reader = _stub_reader(
+            {
+                ("fam_a/trial/", "LAX"): (
+                    (),
+                    {"fam_a/trial/LAX/2026-09-01": (True, "vo-a", False)},
+                ),
+                ("fam_b/trial/", "LAX"): (
+                    (),
+                    {"fam_b/trial/LAX/2026-09-02": (True, "vo-b", False)},
+                ),
+            }
+        )
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=tmp_path / "logs",
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=_ns_of_day("2026-09-05"),
+            sink=_prr.resolve_alert_sink({}),
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-05.json").read_text()
+        )
+        assert report["trial_rows"] == [
+            {
+                "trial_id": "fam_a/trial/LAX/2026-09-01",
+                "family_id": "fam_a",
+                "climate_day": "2026-09-01",
+                "side": "yes",
+                "pnl": "0.10",
+                "settlement_basis": "nws_final",
+            },
+            {
+                "trial_id": "fam_b/trial/LAX/2026-09-02",
+                "family_id": "fam_b",
+                "climate_day": "2026-09-02",
+                "side": "yes",
+                "pnl": "0.20",
+                "settlement_basis": "nws_final",
+            },
+        ]
+        pnl_sum = sum((Decimal(row["pnl"]) for row in report["trial_rows"]), start=Decimal(0))
+        assert str(pnl_sum) == report["realised_pnl_after_fees_total"]
+
+        view = read_portfolio_roi_report(
+            tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-05.json"
+        )
+        assert view.trial_rows is not None
+        assert {row.trial_id for row in view.trial_rows} == {
+            "fam_a/trial/LAX/2026-09-01",
+            "fam_b/trial/LAX/2026-09-02",
+        }
+
+
 class TestRunDefect2ScheduledReleaseIsApplied:
     def test_a_recently_filled_trial_inside_its_real_horizon_is_not_flagged_unsettled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1522,7 +1790,10 @@ class TestAdditiveSchemaFieldBackwardCompat:
     ) -> None:
         """§6 D7: 'additive-only within a major version' -- a JSON sibling
         written before `n_family_station_refusals` existed has no such key
-        and must still read under schema_version=1, defaulting to 0."""
+        and must still read under the current schema_version, defaulting to
+        0. (Stage C3 bumps `PORTFOLIO_ROI_SCHEMA_VERSION` to 2 for the
+        UNRELATED `trial_rows` field -- this field's own additive-within-
+        version contract is otherwise unchanged.)"""
         data = _report_data()
         path = tmp_path / "report.json"
         write_portfolio_roi_json(path, data)
@@ -1531,7 +1802,7 @@ class TestAdditiveSchemaFieldBackwardCompat:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 1
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 2
         assert view.n_family_station_refusals == 0
 
     def test_the_journal_line_carries_the_new_dimensionless_count(self) -> None:
@@ -1590,8 +1861,9 @@ class TestF1CumulativeReconciliationReachesTheArtefact:
                 "provisional": False,
             }
         ]
-        # schema_version stays 1 -- these are additive fields (D7).
-        assert raw["schema_version"] == 1
+        # These fields are additive-within-version (D7); the schema_version
+        # bump to 2 is unrelated (Stage C3's `trial_rows` field).
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 2
 
         view = read_portfolio_roi_report(path)
         assert view.settled_cumulative_passes is False
