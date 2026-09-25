@@ -878,3 +878,266 @@ class TestReadDiagnosticsSummaryTotalsSinglePass:
         assert totals.capped_total == 2
         assert totals.pre_tape_by_station == {"MDW": {"x": 5}}
         assert len(calls) == 1
+
+
+class TestBidOnlyAndNoOutOfBandSurfaceThroughTheDigest:
+    """R-c (2026-09-25 code review): the writer emits `bid_only_in_window`/
+    `no_out_of_band` as distinct row keys; the digest must aggregate and
+    surface both, distinctly, in the artefact AND the rendered detail."""
+
+    def test_bid_only_and_no_out_of_band_appear_in_the_artefact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(station="LAX", source="quote", observed_at_ns=1)) + "\n",
+            encoding="utf-8",
+        )
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text(
+            json.dumps(
+                {"station": "LAX", "bid_only_in_window": 12, "no_out_of_band": 3}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "LAX",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        assert "bid_only=LAX:12" in sink.payloads[0].detail
+        assert "no_oob=LAX:3" in sink.payloads[0].detail
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert artefact["bid_only_in_window_by_station"] == {"LAX": 12}
+        assert artefact["no_out_of_band_by_station"] == {"LAX": 3}
+
+    def test_absent_when_the_summary_has_no_such_keys(self) -> None:
+        report = _DIGEST.funnel_for_day([_row(station="LAX", source="quote")])
+        artefact = _DIGEST._artefact(report, climate_day="2026-09-20")
+        assert "bid_only_in_window_by_station" not in artefact
+        assert "no_out_of_band_by_station" not in artefact
+
+
+class TestNoRegimeShaCopiedFromRows:
+    """Rev 3.1 R8 + HIGH review item: the digest copies the day's distinct
+    `build_sha` values into `no_regime_sha`; an absent or "unknown" value
+    appears explicitly, never dropped."""
+
+    def test_no_regime_sha_copied_from_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(station="LAX", source="quote", observed_at_ns=1)) + "\n",
+            encoding="utf-8",
+        )
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in (
+                    {"station": "LAX", "build_sha": "cafefeed1234"},
+                    {"station": "MDW", "build_sha": "cafefeed1234"},
+                    {"station": "MIA", "build_sha": "deadbeef0001"},
+                    {"station": "SFO", "build_sha": "unknown"},
+                    {"station": "LAX"},  # pre-R8 row -- no build_sha field at all
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "LAX",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert artefact["no_regime_sha"] == [
+            "absent", "cafefeed1234", "deadbeef0001", "unknown",
+        ]
+
+    def test_absent_when_the_summary_has_no_rows_at_all(self) -> None:
+        report = _DIGEST.funnel_for_day([_row(station="LAX", source="quote")])
+        artefact = _DIGEST._artefact(report, climate_day="2026-09-20")
+        assert "no_regime_sha" not in artefact
+
+
+class TestPreTapeTriStateStatus:
+    """Silent-failure review (2026-09-25): a missing sidecar, a corrupt
+    sidecar and a genuinely readable-but-sparse sidecar must be
+    distinguishable -- never collapsed to the same all-empty shape."""
+
+    def test_missing_sidecar_reports_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8"
+        )
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "MIA",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        assert "pre_tape=missing" in sink.payloads[0].detail
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert artefact["pre_tape_status"] == "missing"
+
+    def test_corrupt_sidecar_reports_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8"
+        )
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text("not valid json at all\n", encoding="utf-8")
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "MIA",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        assert "pre_tape=unreadable" in sink.payloads[0].detail
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert artefact["pre_tape_status"] == "corrupt"
+
+    def test_ok_sidecar_reports_ok_and_renders_no_pre_tape_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8"
+        )
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text(json.dumps({"station": "MIA"}) + "\n", encoding="utf-8")
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "MIA",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        assert "pre_tape=" not in sink.payloads[0].detail
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert artefact["pre_tape_status"] == "ok"
+
+
+class TestPreTapeStaleness:
+    def test_an_old_last_row_flags_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(station="MIA", source="quote", observed_at_ns=1)) + "\n",
+            encoding="utf-8",
+        )
+        old_row_ns = 1_000_000_000_000
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text(
+            json.dumps({"station": "MIA", "emitted_at_ns": old_row_ns}) + "\n",
+            encoding="utf-8",
+        )
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        # "Now" is 3 hours after the row -- over the 2h default threshold.
+        monkeypatch.setattr(_DIGEST, "_now_ns", lambda: old_row_ns + 3 * 3_600_000_000_000)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "MIA",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        assert "pre_tape_stale=1" in sink.payloads[0].detail
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert artefact["pre_tape_stale"] == 1
+
+    def test_a_recent_last_row_is_not_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+        tape.write_text(
+            json.dumps(_row(station="MIA", source="quote", observed_at_ns=1)) + "\n",
+            encoding="utf-8",
+        )
+        recent_row_ns = 1_000_000_000_000
+        summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+        summary.write_text(
+            json.dumps({"station": "MIA", "emitted_at_ns": recent_row_ns}) + "\n",
+            encoding="utf-8",
+        )
+        sink = _Sink()
+        monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+        # "Now" is 30 minutes after the row -- well under the 2h threshold.
+        monkeypatch.setattr(_DIGEST, "_now_ns", lambda: recent_row_ns + 1_800_000_000_000)
+        out = tmp_path / "out"
+
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "MIA",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+
+        assert code == 0
+        assert "pre_tape_stale" not in sink.payloads[0].detail
+        artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+        assert "pre_tape_stale" not in artefact

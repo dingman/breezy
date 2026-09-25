@@ -34,6 +34,10 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
 )
+from tests.unit.test_continuous_rung_hold_no_only_hunt_2026_09_24 import (
+    _BAND_CLEARING_BID,
+    _bid_only_depth,
+)
 from tests.unit.test_current_rung_hold_strategy import (
     INTERIOR_ID,
     STATION,
@@ -140,6 +144,22 @@ def test_offer_tape_cap_surfaces_as_truncated_through_the_digest(
     # refused by the byte cap.
     strategy.offer_tape.append(_make_record(ts_event=WINDOW_OPEN_NS + 1))
     strategy.offer_tape.append(_make_record(ts_event=WINDOW_OPEN_NS + 2))
+
+    # WRITER (R-c, 2026-09-25 code review): a bid-only in-window Depth10
+    # frame with an executable NO leg (bid_only_in_window), and a second
+    # one whose NO leg is ALSO out of band (no_out_of_band) -- both are the
+    # coordinator's own distinct counters, driven through the REAL
+    # `on_order_book_depth` path, never hand-set.
+    strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS + 3)
+    )
+    strategy.on_order_book_depth(_bid_only_depth(bid="0.02", ts_event=WINDOW_OPEN_NS + 4))
+    assert strategy._bid_only_in_window_frames == 2
+    assert strategy._no_out_of_band_frames == 1
+
+    # Captured AFTER every writer action above -- the executable-NO-leg
+    # depth frame reaches `_hunt_no_only`, which can itself append a NO row
+    # to the (still 1-row-capacity) offer tape.
     capped_by_writer = strategy.offer_tape.sidecar_capped
     assert capped_by_writer >= 2
 
@@ -155,6 +175,8 @@ def test_offer_tape_cap_surfaces_as_truncated_through_the_digest(
     ]
     assert len(summary_rows) == 1
     assert summary_rows[0]["offer_tape_capped"] == capped_by_writer
+    assert summary_rows[0]["bid_only_in_window"] == 2
+    assert summary_rows[0]["no_out_of_band"] == 1
     assert summary_rows[0]["final"] is True
 
     # READER: the digest, run read-only against both real sidecars.
@@ -177,8 +199,13 @@ def test_offer_tape_cap_surfaces_as_truncated_through_the_digest(
 
     assert code == 0
     assert len(sink_calls) == 1
-    assert "truncated=1" in sink_calls[0].detail  # type: ignore[attr-defined]
+    detail = sink_calls[0].detail  # type: ignore[attr-defined]
+    assert "truncated=1" in detail
+    assert f"bid_only={STATION}:2" in detail
+    assert f"no_oob={STATION}:1" in detail
     artefact = json.loads(
         (tmp_path / "out" / "decision_funnel_2026-09-04.json").read_text(encoding="utf-8")
     )
     assert artefact["truncated"] == 1
+    assert artefact["bid_only_in_window_by_station"] == {STATION: 2}
+    assert artefact["no_out_of_band_by_station"] == {STATION: 1}
