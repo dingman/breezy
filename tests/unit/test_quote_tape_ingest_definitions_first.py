@@ -22,6 +22,7 @@ import io
 import os
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from breezy.runtime.quote_tape_ingest_cli import (
     run,
 )
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
+from breezy.strategy.current_rung_hold.composition import resolve_station_instrument_ids
 from tests.unit.test_quote_tape_ingest_cli import (
     INSTANCE,
     OTHER_INSTANCE,
@@ -50,6 +52,11 @@ from tests.unit.test_quote_tape_ingest_cli import (
     _touch,
     _write_instrument_feather,
 )
+from tests.unit.test_trade_cli_current_rung_hold import _instrument
+
+_STATION_A = "LAX"
+_STATION_B = "SFO"
+_TODAY = date(2026, 9, 25)
 
 _OLD = DEFAULT_LIVE_GRACE_MINUTES + 5
 
@@ -294,12 +301,22 @@ class TestDeadInstanceAKillDoesNotHideInstanceBDefinitions:
     def test_dead_instance_a_kill_does_not_hide_instance_b_definitions(
         self, tmp_path: Path
     ) -> None:
+        """AC4: real weather-slug instruments, resolved through the actual
+        downstream consumer (``resolve_station_instrument_ids``), not merely
+        ``catalog.instruments()``. Instance A dies mid-Depth10 (a tick type,
+        stood in here by ``QuoteTick``); station A's own definitions -- landed
+        by pass 1 before A died -- and station B's (an entirely untouched
+        instance) must both resolve.
+        """
+        instrument_a = _instrument(station=_STATION_A, climate_day=_TODAY)
+        instrument_b = _instrument(station=_STATION_B, climate_day=_TODAY)
+
         _write_instrument_feather(
-            tmp_path, INSTANCE, "binary_option_0.feather", [_binary_option("MKT-A", T0)]
+            tmp_path, INSTANCE, "binary_option_0.feather", [instrument_a]
         )
         _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=_OLD)
         _write_instrument_feather(
-            tmp_path, OTHER_INSTANCE, "binary_option_0.feather", [_binary_option("MKT-B", T0)]
+            tmp_path, OTHER_INSTANCE, "binary_option_0.feather", [instrument_b]
         )
         _touch(tmp_path, OTHER_INSTANCE, "quote_tick_0.feather", age_minutes=_OLD)
 
@@ -307,7 +324,7 @@ class TestDeadInstanceAKillDoesNotHideInstanceBDefinitions:
             catalog: ParquetDataCatalog, instance_id: str, data_cls: type, subdirectory: str
         ) -> str | None:
             if instance_id == INSTANCE and data_cls is QuoteTick:
-                raise _FatalDuringConversion("instance A dies mid tick conversion")
+                raise _FatalDuringConversion("instance A dies mid Depth10 (tick) conversion")
             return default_convert(catalog, instance_id, data_cls, subdirectory)
 
         with pytest.raises(_FatalDuringConversion):
@@ -318,10 +335,11 @@ class TestDeadInstanceAKillDoesNotHideInstanceBDefinitions:
                 convert_fn=convert_fn,
             )
 
-        catalog = ParquetDataCatalog(str(tmp_path))
-        instrument_values = {inst.id.value for inst in catalog.instruments()}
-        assert "MKT-A.POLYUS" in instrument_values, "A's own defs landed before it died"
-        assert "MKT-B.POLYUS" in instrument_values, "B's defs are untouched by A's death"
+        resolved = resolve_station_instrument_ids(
+            tmp_path, {_STATION_A: _TODAY, _STATION_B: _TODAY}
+        )
+        assert resolved[_STATION_A] != (), "A's own defs landed before it died"
+        assert resolved[_STATION_B] != (), "B's defs are untouched by A's death"
 
 
 # ---------------------------------------------------------------------------
