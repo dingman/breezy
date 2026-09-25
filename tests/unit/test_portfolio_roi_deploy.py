@@ -24,6 +24,18 @@ _SERVICE = _SYSTEMD_DIR / "breezy-portfolio-roi.service"
 _TIMER = _SYSTEMD_DIR / "breezy-portfolio-roi.timer"
 _WRAPPER = _SYSTEMD_DIR / "portfolio-roi-run.sh"
 
+# The wrapper hardcodes `REPO=/home/jon/breezy` (deploy/systemd/portfolio-roi-run.sh:49)
+# -- the real, installed checkout path the systemd unit runs from in
+# production, same as test_service_exec_start_invokes_the_wrapper's own
+# hardcoded ExecStart= assertion above. It has no env override (unlike
+# BREEZY_PORTFOLIO_ROI_PYTHON), and must not gain one just to make this
+# test worktree-portable: that would change production wrapper behaviour.
+# So the invoked-argv assertion below is pinned to THIS constant, never to
+# `_REPO_ROOT` (which is the checkout under test -- a worktree when this
+# module runs from one, and would silently diverge from what the wrapper
+# actually resolves).
+_WRAPPER_PRODUCTION_REPO_ROOT = Path("/home/jon/breezy")
+
 _PERMITTED_ENV_FILES = frozenset({"%h/.config/breezy/alerts.env"})
 _FORBIDDEN_ENV_SUBSTRINGS = ("breezy-trade.env", "polymarket.env", "operator.env")
 
@@ -189,8 +201,20 @@ def _run_wrapper(
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(out_dir)
     if stub_python is not None:
         env["BREEZY_PORTFOLIO_ROI_PYTHON"] = str(stub_python)
-    if xdg_runtime_dir is not None:
-        env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
+    # Hermetic by default: the wrapper's lock preamble resolves
+    # `LOCK_DIR="${XDG_RUNTIME_DIR:-}"` FIRST, so an unset override here
+    # silently inherits the HOST's real XDG_RUNTIME_DIR (this pytest
+    # process's own env) and takes the real, shared
+    # $XDG_RUNTIME_DIR/breezy-studies.lock -- every real study on the box
+    # contends for that same lock, so a concurrent study makes every test
+    # below fail with "SKIPPED -- another study holds the studies lock"
+    # for a reason that has nothing to do with this module. Default to a
+    # fresh per-test directory unless a test explicitly wants to drive lock
+    # contention itself (the two tests that pass `xdg_runtime_dir`).
+    if xdg_runtime_dir is None:
+        xdg_runtime_dir = tmp_path / "run"
+        xdg_runtime_dir.mkdir(parents=True, exist_ok=True)
+    env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
     if create_marker:
         stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
         (out_dir / f"score_live_trials_ok_{stamp}").touch()
@@ -232,7 +256,7 @@ def test_wrapper_invokes_the_report_when_marker_present(tmp_path: Path) -> None:
     # The stub receives exactly ONE argv token -- the report script's own
     # path -- proving the wrapper passes no CLI flags of its own.
     assert capture.read_text().splitlines() == [
-        str(_REPO_ROOT / "scripts" / "analysis" / "portfolio_roi_report.py")
+        str(_WRAPPER_PRODUCTION_REPO_ROOT / "scripts" / "analysis" / "portfolio_roi_report.py")
     ]
 
 

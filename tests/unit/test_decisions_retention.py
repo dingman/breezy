@@ -372,8 +372,14 @@ def _run_wrapper(
     env = dict(os.environ)
     env["BREEZY_DECISIONS_RETENTION_DECISIONS_DIR"] = str(decisions_dir)
     env["BREEZY_DECISIONS_RETENTION_OUTPUT_DIR"] = str(tmp_path / "derived")
-    if xdg_runtime_dir is not None:
-        env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
+    # Hermetic by default (same defect class as test_portfolio_roi_deploy.py's
+    # _run_wrapper): the wrapper takes the shared breezy-studies.lock via
+    # `LOCK_DIR="${XDG_RUNTIME_DIR:-}"`, so leaving this unset would silently
+    # inherit the host's real XDG_RUNTIME_DIR and contend with a real study.
+    if xdg_runtime_dir is None:
+        xdg_runtime_dir = tmp_path / "run"
+        xdg_runtime_dir.mkdir(parents=True, exist_ok=True)
+    env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
     return subprocess.run(
         ["bash", str(_WRAPPER)],
         cwd=REPO_ROOT,
