@@ -212,4 +212,58 @@ empty CONFIRMED-mechanism envelope, which did not occur; `boundary_inputs_sha256
 (`test_under_h0_the_ld_obf_boundary_crossing_rate_is_at_most_alpha`) is unchanged and stays strict, its
 reason extended with a citation to this evidence.
 
+## Amendment C2 (2026-09-25, AUD-06a continuation) — POST-HOC: the control anchor made baseline-relative
+
+**Stated plainly: this is a post-hoc amendment, made AFTER seeing the first 33 cells of the sweep.**
+Amendment C's original condition (3) (`max_k|Δt_k| ≤ 0.01` for the qty≡1 control cell) was found
+unsatisfiable in the first 33-cell run: the control (`q_max=1,k=1,side_mix=all_yes`) measured
+`max_k|Δt_k|=0.365`, thirty-six times the tolerance, while its crossing rate (0.0089) stayed safely
+under α. An independent domain review (`prediction-market-reviewer`) APPROVED the sampler and the
+NO-side `held` fix, and ruled the ABSOLUTE anchor mis-specified: it implicitly assumes a `BE≈0.5` prior
+(the artefact's own generation assumption), while the observed, real venue ask prior
+(`median=0.22, p75=0.35`, `docs/evidence/AUD13A_RECONCILIATION_EVIDENCE_2026-09-24.md` §1) makes even a
+`qty≡1` station-day's realised information accrue slower than the artefact's assumed `n_k/n_max`
+schedule — a STRUCTURAL, qty-INDEPENDENT effect the original anchor could never satisfy regardless of
+qty.
+
+**New condition (3), BASELINE-RELATIVE:** for each cell, pair it against the `q_max=1` cell in the SAME
+`(k, side_mix, dispersion, R)` stratum, and require
+`max_k |Δt_k(cell) − Δt_k(baseline)| ≤ tolerance` — differencing out the structural, BE-prior-driven
+component (present already at `qty=1`) and isolating the qty-INDUCED increment. A `q_max=1` cell pairs
+with itself, giving 0 departure by construction, so the anchor is now satisfiable in principle (unlike
+the absolute version).
+
+**Tolerance, justified:** `tolerance = 0.01` — the SAME numeric value as the original anchor, but
+RE-JUSTIFIED for the differenced quantity: 0.01 is small relative to the observed `q_max=2`
+baseline-relative departures (typically 0.2–0.9 in the full-grid run below, i.e. 20–90× this
+tolerance), so it remains a meaningful near-zero threshold once the structural component is removed.
+No new number is invented; the same constant is re-derived to apply to a different (differenced)
+quantity.
+
+**Both anchors are reported, always — never only the favourable one.** Every mechanism-verdict
+computation in this item's evidence artefact states the verdict under the ORIGINAL (absolute) anchor
+AND under Amendment C2's baseline-relative anchor side by side.
+
+**Stratum-controlled paired trend (point 3 of the continuation brief).** Alongside the pooled Spearman
+correlation, the sweep driver (`scripts/analysis/aud06a_qty_envelope_sweep.py::paired_trend_table`)
+reports, per `(k, side_mix, dispersion, R)` stratum, the `q_max=1` crossing rate against every
+`q_max>1` crossing rate run in that SAME stratum, and the fold increase between them — confirming or
+refuting, on the full grid, the reviewer's observation from the first 33 cells that "`q_max` 1→2 raised
+crossing 4–6× to well above α in every sampled stratum". See the RULING artefact for the full-grid
+table and verdict.
+
+**Result, full grid (2026-09-25):** all 320 cells run. **Both anchors return INDETERMINATE**
+(original: `ρ=0.8704, p=0.0001`; C2: `ρ=0.7006, p=0.0001`; `n=280` contributing cells either way).
+Monotonicity is strongly satisfied under BOTH, but `control_ok` fails under BOTH — C2 correctly fixed
+the qty=1-vs-BE-prior confound it targeted, but exposed a SEPARATE, qty-independent finding: 16 of 56
+`q_max=1` cells already exceed `α`, and every one is a `mixed` (YES+NO) side_mix cell — mixed-side
+station-days over-cross the boundary even at `qty≡1`. **The stratum-controlled paired trend confirms
+the reviewer's 33-cell observation on the full grid: 56/56 strata show `q_max=2` over `α`** (fold
+increase 1.27×–17.95×), and 224/224 cells at `q_max∈{2,3,4,5}` over `α` with zero exceptions. **No
+envelope is formally published** (mechanism INDETERMINATE under both anchors, per this amendment's own
+gate), but the raw, unanimous full-grid pattern is reported as an operational finding for AUD-06b
+(do not proceed with qty>1 sizing) and AUD-07 (the mixed-side-at-qty≡1 over-crossing is a NEW,
+qty-independent boundary-validity question, higher priority than the qty envelope this item was
+scoped to answer). Full table: `docs/evidence/RULING_r11_qty_envelope_2026-09-25.md` §0.
+
 **Increment A (final):** S0 (R3-1) → S1 (+A1 sites, inflight clear) → S3 → S4a (R3-2, R3-3 formula at qty≡1) → validation slice (i)-(iii) → ruling artefact + LESSONS entry. **Increment B:** S2 (depth-capped, cent-safe, log-redacted sizing) → S4b (qty through scorer/store) → re-run (ii) with qty>1.

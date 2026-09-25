@@ -17,6 +17,93 @@ bound, and the **`Var(S) ∈ [0.95,1.05]`** per-look tolerance **ARE** anchored 
 `docs/evidence/PREREG_v3_AMENDMENT_NO_SIDE_2026-09-14.md` §6's registered qty≡1 mixed-side study
 (20000 reps, Monte-Carlo SE 0.001104).
 
+## 0. FULL-GRID ADDENDUM (2026-09-25, continuation) — supersedes §3-§6 below where they conflict
+
+**All 320 cells now run and merged** (`docs/evidence/aud06a_sweep_cells.jsonl`, sorted by cell index,
+verified index/seed/label against the canonical ordering, zero conflicts, zero gaps): the 33 cells
+committed earlier in this item, 287 cells run by the coordinator (cells 33-319, `docs/evidence/
+aud06a_sweep_cells.jsonl` sha unchanged in substance for the 25 overlapping indices — byte-verified
+identical), and 25 cells (indices 8-32, the missing `two_point`/`cap_shaped R∈{2,3}` q_max=1 baselines)
+run by this implementer to close a genuine gap left by the numeric-range assumption in the hand-off
+(the committed 33 were a scattered strategic subset — indices 0-7, 64-87, 140 — not the contiguous
+range 0-32 the hand-off assumed). 40/320 cells are `skipped` (all `all_no,k=3`, structurally
+near-infeasible under the observed ask sample — §4). **280 contributing cells.**
+
+**Amendment C2 (baseline-relative anchor, POST-HOC — see the plan doc's Amendment C2 for the full
+justification):** the domain review correctly found the ORIGINAL absolute control anchor
+(`max_k|Δt_k|≤0.01`) unsatisfiable because it assumes `BE≈0.5`. C2 pairs each cell against its own
+`q_max=1` baseline in the same `(k, side_mix, dispersion, R)` stratum, differencing out that structural
+component.
+
+### Verdict under BOTH anchors (never only the favourable one)
+
+| Anchor | ρ | p | n_cells | control_ok | Verdict |
+|---|---|---|---|---|---|
+| **Original (absolute)** | 0.8704 | 0.0001 | 280 | **False** | **INDETERMINATE** |
+| **Amendment C2 (baseline-relative)** | 0.7006 | 0.0001 | 280 | **False** | **INDETERMINATE** |
+
+Monotonicity is strongly satisfied under BOTH anchors (`ρ ≥ 0.70`, `p < 0.01`). Both verdicts are
+INDETERMINATE anyway, because **`control_ok` fails under C2 too — for a NEW, distinct, and more
+important reason than the one C2 was written to fix.**
+
+### A more important finding than the one this item set out to test
+
+**16 of the 56 `q_max=1` cells already have Clopper-Pearson upper bound > α=0.025 — and EVERY ONE of
+those 16 is a `mixed` (YES+NO) side_mix cell** (every `dispersion×k∈{2,3}` combination; e.g.
+`q_max=1,all_equal,k=2,mixed`: rate 0.0534, CP-upper 0.0561 — more than double `α`). **Every
+non-`mixed` `q_max=1` cell (40/56) passes comfortably** (CP-upper ≤ 0.025, most ≤ 0.02).
+
+**This means the boundary over-crossing is not purely a qty effect. Mixing YES and NO legs on the same
+station-day inflates the crossing rate above α even at `qty≡1`** — the crossing-term sign argument
+already in Amendment C (`combine_station_day:344`, a YES/NO pair's cross term is positive, raising
+variance) is now demonstrated to be severe enough, on its own, to break the boundary's nominal type-I
+rate with NO qty involvement at all. Because `control_ok` requires ALL `q_max=1` cells (baselines) to
+individually pass, and the `mixed` ones do not, `control_ok=False` under BOTH anchors — the C2 fix
+correctly repaired the qty-1-vs-BE-prior confound it was written for, but exposed this qty-independent
+one underneath it. **This is reported honestly as INDETERMINATE, not forced to CONFIRMED.**
+
+### Stratum-controlled paired trend (56 strata, full grid) — confirms the reviewer's 33-cell observation
+
+**Every one of the 56 strata shows `q_max=2` crossing well above `α`: 56/56 (100%).** Fold increase
+from `q_max=1` to `q_max=2`: min 1.27×, median 4.38×, max 17.95× (largest fold increases are in
+`all_no` strata, where the `q_max=1` baseline itself is very low, ~0.003-0.004). At `q_max=3/4/5` the
+picture is unanimous too: **56/56 strata over `α` at every `q_max∈{2,3,4,5}` sampled**, CP-upper ranges
+`[0.048,0.087]` (q=2), `[0.062,0.099]` (q=3), `[0.070,0.101]` (q=4), `[0.072,0.101]` (q=5). **The
+reviewer's 33-cell observation ("q_max 1→2 raised crossing 4-6× to well above α in every sampled
+stratum") is CONFIRMED on the full grid**, with a wider fold-increase range than the 33-cell sample
+suggested (1.27×-17.95×, not just 4-6×) — `all_no` strata inflate far more sharply than `all_yes` or
+`mixed` strata.
+
+### Envelope — raw empirical result, reported plainly, still NOT formally "published"
+
+Per Amendment C, an envelope may not be formally PUBLISHED on an unestablished (non-CONFIRMED)
+mechanism premise, and neither anchor reaches CONFIRMED here. **No envelope is formally published.**
+
+**The raw data is nonetheless unambiguous and is reported as an operational finding, not a ruling:**
+`q_max_validated` computed directly from the full grid returns `{all_yes: 1, all_no: 1, mixed: 1}` —
+**every side_mix caps at `q_max=1`**, with zero exceptions across all 224 cells run at `q_max≥2`. This
+is not a borderline result requiring a formal envelope-publication gate to trust operationally: **no
+plausible reading of this data supports qty>1 today**, mechanism-verdict formality notwithstanding.
+
+### Operational consequence for AUD-06b / AUD-07 (finding only — no live code, no operator value touched)
+
+1. **AUD-06b (qty>1 sizing): do not proceed.** The full grid shows 100% of sampled `q_max≥2` cells
+   over-crossing `α`, in every stratum, with no dispersion class or `k` value found to be an exception.
+   Remedy (A) (an envelope) is empty in substance; remedy (B) (re-solve the boundary) would need to
+   account for BOTH the qty effect AND the independent mixed-side effect below.
+2. **AUD-07 (boundary package) — NEW finding, higher priority than qty:** mixed-side (YES+NO)
+   station-days over-cross `α` at `qty≡1` — i.e. **this affects Increment A's already-shipped
+   qty≡1 configuration**, not just the qty>1 capability AUD-06b would add. Since AUD-05 (merged,
+   `013d654`) made the live tally side-aware, mixed-side station-days can occur in the live system
+   TODAY. Whether the live LD-OBF boundary needs recalibration for mixed-side days (independent of
+   qty) is a question this item surfaces but does not resolve — it is exactly the "boundary validity
+   beyond qty" case Amendment C's §4 dependency line anticipated ("inherited by AUD-07's boundary
+   package ... if this item concludes anything about boundary validity beyond qty"). **Recommendation,
+   stated as a finding: AUD-07 should treat mixed-side LD-OBF validity as a standalone, qty-independent
+   question**, not a sub-case of AUD-06b's qty envelope.
+3. **The strict `xfail` stays exactly as it is** (§9) — no envelope was published, so the plan's own
+   flip condition never fires.
+
 ## 1. Step 1 — reproduction (§7 step 1)
 
 The xfail reason's two figures (`tests/unit/test_multi_position_validation_2026_09_14.py:161-199`)

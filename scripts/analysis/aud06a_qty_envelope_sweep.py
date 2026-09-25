@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import numpy as np
 from scipy import stats
@@ -602,6 +602,178 @@ def compute_mechanism_verdict(
             f"control_ok={control_ok}"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Amendment C2 (post-hoc, made AFTER seeing the first 33 cells --
+# prediction-market-reviewer ruling): the ABSOLUTE control anchor
+# (`max_k|Δt_k| <= 0.01`) implicitly assumes a `BE~0.5` prior. The observed,
+# realistically-cheap ask prior (median 0.22, p75 0.35) makes even the
+# `qty=1` control depart from the artefact's assumed `n_k/n_max` schedule
+# for reasons structural to the BE prior, not to qty. Condition (3) is
+# therefore made BASELINE-RELATIVE: each cell's departure is measured
+# against its OWN `q_max=1` cell in the same `(k, side_mix, dispersion, R)`
+# stratum, differencing out the qty-independent structural component and
+# isolating the qty-induced INCREMENT. Reported under BOTH anchors --
+# never only the favourable one.
+# ---------------------------------------------------------------------------
+
+#: Reuses the original anchor's numeric value, RE-JUSTIFIED for the
+#: baseline-DIFFERENCED quantity (Amendment C2): a `q_max=1` cell is paired
+#: with itself and so has baseline-relative departure exactly 0 by
+#: construction -- unlike the absolute anchor, this tolerance is
+#: satisfiable, and 0.01 remains a meaningful near-zero threshold relative
+#: to the observed q_max=2 baseline-relative departures (typically
+#: 0.2-0.9, i.e. 20-90x this tolerance -- see the RULING artefact).
+BASELINE_RELATIVE_TOLERANCE: Final[float] = 0.01
+
+
+def stratum_key(cell: CellResult) -> tuple[int, str, str, int | None]:
+    """`(k, side_mix, dispersion, R)` -- the stratum a cell is paired within."""
+    return (cell.k, cell.side_mix, cell.dispersion, cell.r)
+
+
+def baseline_relative_max_delta_t(cell: CellResult, baseline: CellResult) -> float:
+    """`max_k |Δt_k(cell) - Δt_k(baseline)|` -- the qty-induced INCREMENT
+    over the same-stratum `q_max=1` baseline's own departure."""
+    return max(abs(a - b) for a, b in zip(cell.delta_t, baseline.delta_t, strict=True))
+
+
+def _q1_baselines_by_stratum(cell_results: list[CellResult]) -> dict[tuple, CellResult]:
+    return {
+        stratum_key(c): c
+        for c in cell_results
+        if c.q_max == 1 and not c.skipped
+    }
+
+
+def compute_mechanism_verdict_c2(
+    cell_results: list[CellResult],
+    *,
+    seed: int = SWEEP_SEED_BASE,
+    n_permutations: int = PERMUTATION_COUNT,
+    tolerance: float = BASELINE_RELATIVE_TOLERANCE,
+) -> MechanismVerdict:
+    """Amendment C2's baseline-relative mechanism verdict. Condition (2)
+    (monotonicity) is re-run against the baseline-relative departure instead
+    of the raw (BE-prior-confounded) `max_abs_delta_t`. Condition (3) (the
+    control anchor) becomes: every PAIRABLE `q_max=1` baseline cell has
+    (trivially, by construction) 0 departure from itself, AND its own
+    CP-upper stays <= alpha -- the qty-independent structural departure
+    found by the domain review no longer defeats the anchor."""
+    non_skipped = [c for c in cell_results if not c.skipped]
+    baselines = _q1_baselines_by_stratum(non_skipped)
+
+    pairable: list[tuple[CellResult, float]] = []
+    for c in non_skipped:
+        baseline = baselines.get(stratum_key(c))
+        if baseline is None:
+            continue
+        pairable.append((c, baseline_relative_max_delta_t(c, baseline)))
+
+    n_cells = len(pairable)
+    if n_cells < MIN_CONTRIBUTING_CELLS:
+        return MechanismVerdict(
+            verdict="INDETERMINATE",
+            rho=None,
+            p_value=None,
+            n_cells=n_cells,
+            reason=f"only {n_cells} pairable cells, minimum is {MIN_CONTRIBUTING_CELLS}",
+        )
+
+    q1_cells = [c for c in baselines.values()]
+    control_ok = bool(q1_cells) and all(c.cp_upper <= CONTROL_MAX_CP_UPPER for c in q1_cells)
+
+    x = np.array([rel_dt for _c, rel_dt in pairable])
+    y = np.array([c.crossing_rate for c, _rel_dt in pairable])
+    rho, _ = stats.spearmanr(x, y)
+    rng = np.random.default_rng(seed)
+    p_value = _permutation_p_value(x, y, rho, n_perm=n_permutations, rng=rng)
+    monotonic_ok = rho >= RHO_THRESHOLD and p_value < PERMUTATION_P_THRESHOLD
+
+    if control_ok:
+        control_cp_upper = max(c.cp_upper for c in q1_cells)
+        for c, rel_dt in pairable:
+            if rel_dt <= tolerance and c.cp_lower > control_cp_upper:
+                return MechanismVerdict(
+                    verdict="REFUTED",
+                    rho=float(rho),
+                    p_value=float(p_value),
+                    n_cells=n_cells,
+                    reason=(
+                        f"cell {c.label} shows no baseline-relative departure "
+                        f"(rel_dt={rel_dt:.4f}) but over-crosses (CP lower "
+                        f"{c.cp_lower:.4f} > q_max=1 CP upper {control_cp_upper:.4f})"
+                    ),
+                )
+
+    if monotonic_ok and control_ok:
+        return MechanismVerdict(
+            verdict="CONFIRMED",
+            rho=float(rho),
+            p_value=float(p_value),
+            n_cells=n_cells,
+            reason=(
+                f"[Amendment C2, baseline-relative] rho={rho:.4f} >= {RHO_THRESHOLD}, "
+                f"p={p_value:.5f} < {PERMUTATION_P_THRESHOLD}, control anchor holds "
+                f"({len(q1_cells)} q_max=1 baseline cells, all CP-upper <= "
+                f"{CONTROL_MAX_CP_UPPER})"
+            ),
+        )
+
+    return MechanismVerdict(
+        verdict="INDETERMINATE",
+        rho=float(rho),
+        p_value=float(p_value),
+        n_cells=n_cells,
+        reason=(
+            f"[Amendment C2] neither CONFIRMED nor REFUTED: rho={rho:.4f}, "
+            f"p={p_value:.5f}, control_ok={control_ok}"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PairedTrendRow:
+    stratum: tuple[int, str, str, int | None]
+    q1_crossing_rate: float
+    q1_cp_upper: float
+    by_q_max: dict[int, float]  # q_max -> crossing_rate, for q_max > 1 in this stratum
+    fold_increase: dict[int, float]  # q_max -> crossing_rate / q1_crossing_rate
+
+
+def paired_trend_table(cell_results: list[CellResult]) -> list[PairedTrendRow]:
+    """Stratum-controlled paired trend (Amendment C2 point 3): for each
+    `(k, side_mix, dispersion, R)` stratum, the crossing rate at `q_max=1`
+    versus every `q_max>1` cell run in the SAME stratum, and the fold
+    increase -- confirms or refutes the reviewer's observation ("q_max 1->2
+    raised crossing 4-6x... in every sampled stratum") on the full grid."""
+    non_skipped = [c for c in cell_results if not c.skipped]
+    baselines = _q1_baselines_by_stratum(non_skipped)
+    rows: dict[tuple, PairedTrendRow] = {}
+    for c in non_skipped:
+        if c.q_max == 1:
+            continue
+        # stratum key without q_max, but WITH k/side_mix/dispersion/r
+        key = stratum_key(c)
+        baseline = baselines.get(key)
+        if baseline is None:
+            continue
+        row = rows.get(key)
+        if row is None:
+            row = PairedTrendRow(
+                stratum=key,
+                q1_crossing_rate=baseline.crossing_rate,
+                q1_cp_upper=baseline.cp_upper,
+                by_q_max={},
+                fold_increase={},
+            )
+            rows[key] = row
+        row.by_q_max[c.q_max] = c.crossing_rate
+        row.fold_increase[c.q_max] = (
+            c.crossing_rate / baseline.crossing_rate if baseline.crossing_rate > 0 else float("inf")
+        )
+    return list(rows.values())
 
 
 # ---------------------------------------------------------------------------

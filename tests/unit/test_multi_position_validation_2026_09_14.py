@@ -187,7 +187,16 @@ def test_under_h0_the_combined_statistic_has_unit_variance() -> None:
         "realistic (non-uniform, cheap) BE prior -- a confound unrelated to "
         "qty. No envelope was published; this xfail is unchanged and stays "
         "strict pending a completed grid or a reconsidered control-anchor "
-        "tolerance."
+        "tolerance. FULL-GRID UPDATE (2026-09-25): all 320 cells run; a "
+        "domain-reviewed baseline-relative anchor (Amendment C2) was added "
+        "and BOTH anchors still return INDETERMINATE (rho=0.87/0.70, "
+        "p=0.0001, n=280) -- C2 fixed the qty=1-vs-BE-prior confound but "
+        "exposed a SEPARATE, qty-independent finding: 16/56 q_max=1 cells "
+        "already exceed alpha, and every one is a MIXED (YES+NO) side_mix "
+        "cell, so boundary over-crossing is not purely a qty effect. Raw "
+        "data (not a formal envelope) shows 100% of q_max>=2 cells (224/224) "
+        "over alpha in every stratum, fold increase 1.27x-17.95x at q_max=2 "
+        "-- see the RULING artefact's full-grid addendum."
     ),
 )
 def test_under_h0_the_ld_obf_boundary_crossing_rate_is_at_most_alpha() -> None:
@@ -512,6 +521,88 @@ def test_a_mixed_side_cell_at_k_equals_one_is_skipped_not_sampled_as_all_yes() -
     for cell in sweep.ALL_CELLS:
         assert not (cell.k == 1 and cell.side_mix == "mixed")
     assert len(sweep.ALL_CELLS) == 320
+
+
+def test_baseline_relative_departure_is_zero_for_a_cell_paired_with_itself() -> None:
+    """Amendment C2: a `q_max=1` cell paired against itself (the trivial
+    baseline case) has baseline-relative departure exactly 0."""
+    cell = sweep.CellResult(
+        cell_index=0, label="c0", q_max=1, dispersion="all_equal", r=None, k=1,
+        side_mix="all_yes", seed=1, n_reps=100, crossing_count=1, crossing_rate=0.01,
+        cp_upper=0.02, cp_lower=0.0001, look_ns=(10, 20), delta_t=(0.1, 0.2), var_s=(1.0, 1.0),
+        max_abs_delta_t=0.2,
+    )
+    assert sweep.baseline_relative_max_delta_t(cell, cell) == 0.0
+
+
+def test_paired_trend_table_reports_fold_increase_per_stratum() -> None:
+    """Amendment C2 point 3: the stratum-controlled paired trend reports
+    each stratum's q_max=1 crossing rate, its q_max>1 crossing rate(s), and
+    the fold increase between them."""
+    q1 = sweep.CellResult(
+        cell_index=0, label="q1", q_max=1, dispersion="all_equal", r=None, k=1,
+        side_mix="all_yes", seed=1, n_reps=20000, crossing_count=100, crossing_rate=0.01,
+        cp_upper=0.012, cp_lower=0.008, look_ns=(10,), delta_t=(0.1,), var_s=(1.0,),
+        max_abs_delta_t=0.1,
+    )
+    q2 = sweep.CellResult(
+        cell_index=64, label="q2", q_max=2, dispersion="all_equal", r=None, k=1,
+        side_mix="all_yes", seed=2, n_reps=20000, crossing_count=1000, crossing_rate=0.05,
+        cp_upper=0.053, cp_lower=0.047, look_ns=(10,), delta_t=(0.5,), var_s=(1.0,),
+        max_abs_delta_t=0.5,
+    )
+    table = sweep.paired_trend_table([q1, q2])
+    assert len(table) == 1
+    row = table[0]
+    assert row.q1_crossing_rate == pytest.approx(0.01)
+    assert row.by_q_max[2] == pytest.approx(0.05)
+    assert row.fold_increase[2] == pytest.approx(5.0)
+
+
+def test_the_c2_mechanism_verdict_uses_baseline_relative_departure() -> None:
+    """The C2 verdict correlates the BASELINE-RELATIVE departure (not the
+    raw, BE-prior-confounded departure) with crossing rate, and its control
+    anchor is satisfiable by construction (q_max=1 cells pair with
+    themselves, giving 0 departure) -- unlike the original absolute anchor."""
+    rng_seed = 7
+    synthetic: list[sweep.CellResult] = []
+    strata = [(k, sm) for k in (1, 2, 3) for sm in ("all_yes", "all_no")]
+    cell_idx = 0
+    for k, sm in strata:
+        # q_max=1 baseline: large RAW delta_t (structural, BE-prior driven),
+        # low crossing rate -- exactly what the domain review found.
+        synthetic.append(
+            sweep.CellResult(
+                cell_index=cell_idx, label=f"q1-{k}-{sm}", q_max=1, dispersion="all_equal",
+                r=None, k=k, side_mix=sm, seed=cell_idx, n_reps=20000, crossing_count=100,
+                crossing_rate=0.01, cp_upper=0.012, cp_lower=0.008, look_ns=(10, 20),
+                delta_t=(0.3, 0.35), var_s=(1.0, 1.0), max_abs_delta_t=0.35,
+            )
+        )
+        cell_idx += 1
+        for q_max, bump in ((2, 0.1), (3, 0.2)):
+            synthetic.append(
+                sweep.CellResult(
+                    cell_index=cell_idx, label=f"q{q_max}-{k}-{sm}", q_max=q_max,
+                    dispersion="all_equal", r=None, k=k, side_mix=sm, seed=cell_idx,
+                    n_reps=20000, crossing_count=int((0.02 + bump) * 20000),
+                    crossing_rate=0.02 + bump, cp_upper=0.02 + bump + 0.003,
+                    cp_lower=max(0.0, 0.02 + bump - 0.003), look_ns=(10, 20),
+                    delta_t=(0.3 + bump, 0.35 + bump), var_s=(1.0, 1.0),
+                    max_abs_delta_t=0.35 + bump,
+                )
+            )
+            cell_idx += 1
+
+    verdict = sweep.compute_mechanism_verdict_c2(synthetic, seed=rng_seed)
+    # 6 strata x 3 cells each (the q_max=1 baseline pairs with itself too)
+    assert verdict.n_cells == 18
+    assert verdict.verdict == "INDETERMINATE"  # below MIN_CONTRIBUTING_CELLS by construction
+    assert "pairable cells" in verdict.reason
+    # Reproducibility: same input, same verdict.
+    verdict_2 = sweep.compute_mechanism_verdict_c2(synthetic, seed=rng_seed)
+    assert verdict.verdict == verdict_2.verdict
+    assert verdict.rho == verdict_2.rho
 
 
 def test_the_mechanism_verdict_is_computed_not_eyeballed() -> None:
