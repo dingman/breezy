@@ -1376,7 +1376,7 @@ R-4; this item schedules the LD-OBF sequential look and per-stratum
 
 ---
 
-## `breezy-fee-evidence-pull` — AUD-02 A0 unattended fee-drift evidence pull (2026-09-25, PREPARED, NOT ACTIVATED)
+## `breezy-fee-evidence-pull` — AUD-02 A0 unattended fee-drift evidence pull (2026-09-25, runtime-fixed after a live TIMEOUT)
 
 `breezy-fee-evidence-pull.service` + `.timer` run the daily, unattended,
 unauthenticated public-GET evidence pull of
@@ -1385,12 +1385,24 @@ Section 2 "A0". Each run invokes `scripts/venue/fee_drift_evidence_pull.py`
 directly (no wrapper shell script, no `breezy-studies.lock` -- see below),
 which:
 
-1. pages `GET /v1/markets` (category `climate`) to eof and stores every raw
-   page as the day's denominator;
-2. `GET`s every listed weather slug's `/v1/market/slug/{slug}`, paced under
-   the SAME native, client-side rate limiter every other `get_public` caller
-   already pays into (`QUOTA_KEY_INSTRUMENTS`, 6 requests/minute -- no manual
-   sleep; see the script's own module docstring for the exact citation);
+1. pages `GET /v1/markets` (category `climate`, `active=true&closed=false&
+   archived=false` -- the CURRENTLY tradable universe, not the full
+   historical archive) to eof and stores every raw page as the day's
+   denominator;
+2. reads `feeCoefficient` (and a candidate maker field) straight off each
+   listed market's own list entry -- **no per-slug GET in the normal case**.
+   A bounded fallback (`MAX_FALLBACK_PER_SLUG_CALLS`, default 20) GETs
+   `/v1/market/slug/{slug}` only for a listed entry that itself lacks a
+   parseable fee, paced under the SAME native, client-side rate limiter
+   every other `get_public` caller already pays into (`QUOTA_KEY_INSTRUMENTS`,
+   6 requests/minute). **Runtime-fix note:** the first live run (05:43Z)
+   timed out at `TimeoutStartSec=900` because the original design GETed
+   every listed slug unconditionally -- measured that day at 4353 total
+   climate-category markets, a ~12-hour pull at that pace. Every listed
+   market already carries `feeCoefficient` on the list response (0 missing
+   observed across all 4353), so the fix removes the per-slug GET from the
+   normal path entirely; `worst_case_runtime_secs()` bounds the pathological
+   case at 580s, tested against `TimeoutStartSec` with margin;
 3. records the taker (`feeCoefficient`) and a candidate maker
    (`makerCommissionsBasisPoints`) field **off the raw wire JSON**, never from
    a parsed `Instrument` (B-7: `parsing.py` writes theta onto both of
