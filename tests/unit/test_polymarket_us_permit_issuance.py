@@ -356,17 +356,24 @@ def test_the_issued_permit_carries_exactly_the_operator_supplied_ceiling(
     assert permit.expires_at_ns == NOW_NS + PERMIT_TTL_NS
 
 
-def test_no_issuer_parameter_can_supply_a_ceiling_or_an_environment() -> None:
-    """The ceiling must be unreachable from the call site.
+def test_no_issuer_parameter_can_supply_a_widening_ceiling_or_an_environment() -> None:
+    """No parameter may WIDEN the issuer's authority from the call site.
 
     An ``env=`` or ``max_notional=`` parameter would reintroduce exactly the
     defect one level up: a caller handing the issuer its own authority.
+
+    ``max_expires_at_ns`` (A-1, 2026-09-25 security review) is the one
+    narrowly-scoped, explicitly-authorized exception: it can only CLAMP the
+    natural expiry earlier (see the ``test_a_ceiling_*``/``test_no_ceiling_*``
+    tests above), defaults to ``None`` (byte-identical prior behaviour), and
+    a value at or before issuance REFUSES rather than mints -- so this
+    signature pin is updated to name it explicitly rather than dropped.
     """
     import inspect
 
     parameters = set(inspect.signature(issue_live_trading_permit).parameters)
 
-    assert parameters == {"clock"}
+    assert parameters == {"clock", "max_expires_at_ns"}
 
 
 # ==========================================================================
@@ -1457,6 +1464,57 @@ def test_the_docstring_does_not_claim_the_spend_down_is_absent() -> None:
 
     assert "budget_notional_usd" in source
     assert "budget_order_count" in source
+
+
+# ==========================================================================
+# A-1 (docs/plans/POST_FORECAST_PHASE_2026-09-20.md Amendment A) -- a
+# relaunch's permit is capped at the day's first-boot expiry, never a fresh
+# +PERMIT_TTL_NS window. ``max_expires_at_ns`` is supervisor-injected only
+# (never env-derived inside this module -- see the docstring) and can only
+# CLAMP an expiry, never extend one.
+# ==========================================================================
+
+
+def test_no_ceiling_is_byte_identical_to_prior_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_operator_gate(monkeypatch)
+    permit = issue_live_trading_permit(clock=clock_at(), max_expires_at_ns=None)
+    assert permit.expires_at_ns == NOW_NS + PERMIT_TTL_NS
+
+
+def test_a_ceiling_before_the_natural_expiry_clamps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_operator_gate(monkeypatch)
+    ceiling = NOW_NS + 1_000
+    permit = issue_live_trading_permit(clock=clock_at(), max_expires_at_ns=ceiling)
+    assert permit.expires_at_ns == ceiling
+
+
+def test_a_ceiling_after_the_natural_expiry_never_extends_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_operator_gate(monkeypatch)
+    ceiling = NOW_NS + PERMIT_TTL_NS + 10_000_000_000
+    permit = issue_live_trading_permit(clock=clock_at(), max_expires_at_ns=ceiling)
+    assert permit.expires_at_ns == NOW_NS + PERMIT_TTL_NS
+
+
+def test_a_ceiling_at_or_before_issuance_is_refused_not_minted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ceiling that is already lapsed relative to issuance must REFUSE,
+    never mint a permit with a past or zero-length expiry -- the same
+    fail-closed shape as every other mint precondition, so self-check's
+    shadow-mode-no-permit detector fires rather than seeing a technically
+    "issued" permit that is already dead."""
+    enable_operator_gate(monkeypatch)
+    with pytest.raises(LiveTradingPermissionError, match="max_expires_at_ns"):
+        issue_live_trading_permit(clock=clock_at(), max_expires_at_ns=NOW_NS)
+
+    with pytest.raises(LiveTradingPermissionError, match="max_expires_at_ns"):
+        issue_live_trading_permit(clock=clock_at(), max_expires_at_ns=NOW_NS - 1)
 
 
 # ==========================================================================

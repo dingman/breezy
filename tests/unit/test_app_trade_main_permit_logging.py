@@ -45,6 +45,7 @@ from breezy.runtime import trade_cli
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import ORDERS_ENABLED_VAR, SettingsError
 from breezy.runtime.trade_cli import EXIT_RUNTIME_ERROR
+from breezy.runtime.trade_supervisor_core import PERMIT_EXPIRY_CEILING_NS_ENV_VAR
 from tests.unit.log_leak_assertions import assert_no_values_leaked
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
@@ -117,6 +118,101 @@ def test_main_logs_live_trading_permit_issued_when_both_permits_are_minted(
     assert ttl_s == PERMIT_TTL_NS // 1_000_000_000
 
     assert_no_values_leaked(caplog.text, _SENSITIVE_VALUES)
+
+
+# ---------------------------------------------------------------------------
+# A-1 (docs/plans/POST_FORECAST_PHASE_2026-09-20.md Amendment A,
+# docs/evidence/RULING_permit_daily_coverage_2026-09-25.md): a supervisor-
+# injected BREEZY_PERMIT_EXPIRY_CEILING_NS clamps the minted permit; a
+# malformed value refuses the permit through the SAME shadow-mode path as
+# every other mint precondition, never a raw exception out of ``main()``.
+# ---------------------------------------------------------------------------
+
+
+def test_main_clamps_the_permit_to_a_valid_expiry_ceiling_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    import time
+
+    enable_operator_gate(monkeypatch)
+    monkeypatch.setattr(trade_module, "load_trade_settings", lambda: _FakeSettings())
+    ceiling_ns = time.time_ns() + 5_000_000_000  # 5s out -- far short of the 10h TTL
+    monkeypatch.setenv(PERMIT_EXPIRY_CEILING_NS_ENV_VAR, str(ceiling_ns))
+
+    captured: list[dict[str, object]] = []
+
+    def _fake_run(**kwargs: object) -> int:
+        captured.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(trade_module, "run", _fake_run)
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+        caplog.at_level(logging.INFO),
+    ):
+        exit_code = trade_module.main()
+
+    assert exit_code == 0
+    permit = captured[0]["live_trading_permit"]
+    assert permit is not None
+    assert permit.expires_at_ns == ceiling_ns  # clamped, not the natural +PERMIT_TTL_NS expiry
+
+    issued_records = [
+        r for r in caplog.records if r.getMessage().startswith("live-trading permit issued")
+    ]
+    assert len(issued_records) == 1
+    match = re.fullmatch(
+        r"live-trading permit issued issued_at_ns=(\d+) expires_at_ns=(\d+) ttl_s=(\d+)",
+        issued_records[0].getMessage(),
+    )
+    assert match is not None
+    assert int(match.group(2)) == ceiling_ns
+
+
+def test_main_refuses_the_permit_when_the_expiry_ceiling_env_var_is_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ceiling must fail CLOSED -- refuse the permit through the
+    existing shadow-mode path -- never mint an unbounded permit and never
+    raise an unhandled exception out of ``main()``."""
+    enable_operator_gate(monkeypatch)
+    monkeypatch.setenv(PERMIT_EXPIRY_CEILING_NS_ENV_VAR, "not-a-number")
+    monkeypatch.setattr(
+        trade_module,
+        "load_trade_settings",
+        lambda: _FakeSettings(orders_enabled_requested=False),
+    )
+
+    captured: list[dict[str, object]] = []
+
+    def _fake_run(**kwargs: object) -> int:
+        captured.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(trade_module, "run", _fake_run)
+
+    with caplog.at_level(logging.INFO):
+        exit_code = trade_module.main()
+
+    assert exit_code == 0
+    assert captured[0]["live_trading_permit"] is None  # refused -> shadow mode, not fatal
+
+    warn_records = [
+        r
+        for r in caplog.records
+        if r.name == "breezy.runtime.health" and r.levelno == logging.WARNING
+    ]
+    assert len(warn_records) == 1
+    assert warn_records[0].getMessage() == (
+        "breezy alert event=LIVE_TRADING_PERMIT_REFUSED site=global "
+        "severity=WARN detail=permit_missing"
+    )
+    assert "not-a-number" not in warn_records[0].getMessage()
 
 
 def test_main_emits_warn_alert_when_live_trading_permit_refused_and_continues_in_shadow_mode(

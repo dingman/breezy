@@ -65,6 +65,7 @@ from breezy.runtime.trade_supervisor_core import (
     MIDDAY_READINESS_RECHECK_TIMEOUT,
     MIN_RELAUNCH_GAP,
     NODE_ARGV_ANCHOR,
+    PERMIT_EXPIRY_CEILING_NS_ENV_VAR,
     PERMIT_ISSUED_MARKER,
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ALERT_DETAIL,
@@ -106,8 +107,10 @@ from breezy.runtime.trade_supervisor_core import (
     permit_expiry_valid,
     readiness_observed,
     record_child_adopted,
+    record_first_boot_permit_seen,
     record_midday_alert_sent,
     record_midday_cause_seen,
+    record_midday_ceiling_unknown_alert_sent,
     record_midday_not_ready_alert_sent,
     record_midday_readiness_recheck_done,
     record_midday_relaunch_attempt,
@@ -1235,6 +1238,10 @@ def _do_relaunch_check(
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
     if permit_expiry_ns is not None:
         state = record_permit_issued_seen(state, now, permit_expiry_ns)
+        # [A-1] Distinct, day-level anchor -- see DaySchedulerState's own
+        # docstring for why this is never merged with the per-child latch
+        # just above.
+        state = record_first_boot_permit_seen(state, now, permit_expiry_ns)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),
@@ -1320,6 +1327,10 @@ def _do_midday_watch(
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
     if permit_expiry_ns is not None:
         state = record_permit_issued_seen(state, now, permit_expiry_ns)
+        # [A-1] Distinct, day-level anchor -- see DaySchedulerState's own
+        # docstring for why this is never merged with the per-child latch
+        # just above.
+        state = record_first_boot_permit_seen(state, now, permit_expiry_ns)
     live_cause = classify_exit1_cause(log_text)
     if live_cause is not RelaunchCause.UNKNOWN:
         state = record_midday_cause_seen(state, now, live_cause)
@@ -1350,6 +1361,34 @@ def _do_midday_watch(
         return tracked_pid, node_log, state
 
     cause = state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
+
+    # [A-1, 2026-09-25] Fail-closed gate, checked FIRST and unconditionally --
+    # independent of the budget/window decision below. A mid-day relaunch
+    # without a known first-boot anchor would mint a fresh, unbounded
+    # +PERMIT_TTL_NS permit (the exact defect A-1 closes), so this never
+    # reaches `decide_midday_relaunch`/`ports.spawn` at all. Accepted failure
+    # surface (ruling doc): if the FIRST child dies between writing its
+    # permit line and the next poll, this anchor stays `None` and every
+    # mid-day relaunch for the rest of the day is declined here.
+    if state.first_boot_permit_expires_at_ns is None:
+        log_decision(
+            "midday_relaunch_declined",
+            phase="midday_watch",
+            reason="first-boot permit expiry unknown",
+        )
+        if not state.midday_ceiling_unknown_alert_sent:
+            log_decision(
+                "midday_relaunch_ceiling_unknown", phase="midday_watch", pid=tracked_pid
+            )
+            alert(
+                ports.alert_sink,
+                event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+                severity="CRITICAL",
+                detail=AlertDetail.MIDDAY_RELAUNCH_CEILING_UNKNOWN,
+            )
+            state = record_midday_ceiling_unknown_alert_sent(state, now)
+        return tracked_pid, node_log, state
+
     decision = decide_midday_relaunch(
         now=now,
         window_end=midday_watch_window_end(state.day),
@@ -1374,7 +1413,13 @@ def _do_midday_watch(
         "midday_relaunching", phase="midday_watch", attempt=state.midday_relaunch_attempts + 1
     )
     new_log = node_log_path(log_dir, now)
-    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    # [A-1] Cap the relaunched child's permit at the day's first-boot expiry
+    # -- a copy of the environment, never a mutation of `os.environ` itself
+    # (which `_do_launch`'s own 16:50Z daily-boot spawn still forwards
+    # as-is, with no ceiling).
+    child_env = dict(os.environ)
+    child_env[PERMIT_EXPIRY_CEILING_NS_ENV_VAR] = str(state.first_boot_permit_expires_at_ns)
+    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=child_env, log_path=new_log)
     _retain_spawned_child(proc)
     return proc.pid, new_log, record_midday_relaunch_attempt(state, now)
 
@@ -1470,16 +1515,41 @@ def _do_self_check(
         strategy_subscribed = state.strategy_subscribed_seen
         if live_permit_expiry_ns is not None and state.permit_issued_seen_expires_at_ns is None:
             state = record_permit_issued_seen(state, now, live_permit_expiry_ns)
+        if live_permit_expiry_ns is not None:
+            # [A-1] Distinct, day-level anchor -- idempotent, so calling it
+            # unconditionally (whenever a permit-issued line is observed)
+            # is safe even when the per-child latch above was skipped.
+            state = record_first_boot_permit_seen(state, now, live_permit_expiry_ns)
         latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
         permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
         if latched_permit_expiry_ns is not None:
             expiry_valid = latched_permit_expiry_ns > now_ns
         else:
             expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
+        # [A-1 follow-up, 2026-09-25] Distinguish a permit whose expiry
+        # equals the day's first-boot ceiling anchor -- A-1's clamp working
+        # as designed, never a genuine refusal. ``relaunch_attempts > 0`` is
+        # the only observable signal separating "this child's own permit IS
+        # the anchor's source" (the never-relaunched original boot, where
+        # the values trivially match) from "this child's permit was CLAMPED
+        # to a pre-existing anchor" -- a clamped permit's log line is
+        # byte-identical in shape to a fresh one (ruling doc §2/§4).
+        observed_expiry_ns = (
+            latched_permit_expiry_ns
+            if latched_permit_expiry_ns is not None
+            else live_permit_expiry_ns
+        )
+        permit_expiry_at_daily_ceiling = (
+            observed_expiry_ns is not None
+            and state.first_boot_permit_expires_at_ns is not None
+            and observed_expiry_ns == state.first_boot_permit_expires_at_ns
+            and state.relaunch_attempts > 0
+        )
     else:
         strategy_subscribed = strategy_subscribed_live
         permit_issued = permit_issued_live
         expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
+        permit_expiry_at_daily_ceiling = False
 
     continuous_check: ContinuousFamilyCheck | None = None
     if ports.continuous_family_active():
@@ -1502,6 +1572,7 @@ def _do_self_check(
         strategy_subscribed=strategy_subscribed,
         log_available=node_log is not None,
         continuous_check=continuous_check,
+        permit_expiry_at_daily_ceiling=permit_expiry_at_daily_ceiling,
     )
     # [AUD-14b] Repeat-failure escalation -- a separate, store-backed
     # record, re-read fresh at every self-check (see
