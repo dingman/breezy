@@ -12,9 +12,10 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import importlib.util
+import json
 import re
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -43,6 +44,12 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KEY,
     WEATHER_FACTS_STATUS_KNOWN,
     read_weather_bucket_facts,
+)
+from breezy.persistence.family_manifest import (
+    UnpinnedBoundaryArtefactError,
+    UnpinnedDensityArtefactError,
+    UnregisteredFamilyManifestError,
+    load_family_manifest,
 )
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import SettlementInvariantError, backtest
@@ -1579,17 +1586,27 @@ def _run_main_with_stubbed_capture(
     *,
     strategy: str | None,
     monkeypatch: pytest.MonkeyPatch,
+    extra_argv: Sequence[str] = (),
+    expect_rc: int = 0,
 ) -> dict[str, object]:
     """Stub the driver's OWN capture/settlement seams (never Nautilus, never
     the strategy under test) so `main` reaches `run_one_precision_arm`
     without a real recorded catalog on disk -- the dispatch logic under
-    test lives entirely between argument parsing and that call."""
+    test lives entirely between argument parsing and that call.
+
+    AUD-19b: `extra_argv` appends CLI arguments (e.g. `--family-manifest`)
+    after `_minimal_argv`'s fixed set; the spy also captures
+    `required_fee_coefficient`/`family_id`/`trial_id_prefix` so a caller can
+    assert on what `main` resolved and threaded through."""
     captured: dict[str, object] = {}
     tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
 
     def _spy_run_one_precision_arm(**kwargs: object) -> object:
         captured["strategy_cls"] = kwargs["strategy_cls"]
         captured["latch_key_prefix"] = kwargs["latch_key_prefix"]
+        captured["required_fee_coefficient"] = kwargs.get("required_fee_coefficient")
+        captured["family_id"] = kwargs.get("family_id")
+        captured["trial_id_prefix"] = kwargs.get("trial_id_prefix")
         return driver.PrecisionArmResult(trials=())
 
     monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
@@ -1602,9 +1619,42 @@ def _run_main_with_stubbed_capture(
     monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
     monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
 
-    rc = driver.main(_minimal_argv(tmp_path, strategy=strategy))
-    assert rc == 0
+    argv = [*_minimal_argv(tmp_path, strategy=strategy), *extra_argv]
+    rc = driver.main(argv)
+    assert rc == expect_rc
+    captured["rc"] = rc
     return captured
+
+
+#: A real (non-zero) sha of the committed sentinel density artefact, lifted
+#: verbatim from `tests/unit/test_family_manifest.py` -- shared by every
+#: non-forecast family manifest on this tree.
+_SENTINEL_DENSITY_SHA = "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65"
+
+
+def _family_manifest_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "family_id": "pm_us_crh_v4",
+        "venue": "polymarket_us",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "d0_climate_day": "2026-08-31",
+        "taker_fee_coefficient": "0.0695",
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v4.json",
+        "boundary_inputs_sha256": "a" * 64,
+        "composition_kind": "continuous_rung_hold",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": _SENTINEL_DENSITY_SHA,
+        "stations": [STATION],
+        "status": "REGISTERED",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _write_family_manifest(tmp_path: Path, **overrides: object) -> Path:
+    path = tmp_path / "family_manifest.json"
+    path.write_text(json.dumps(_family_manifest_payload(**overrides)))
+    return path
 
 
 def test_the_strategy_flag_selects_the_continuous_backtest_subclass(
@@ -1637,6 +1687,316 @@ def test_the_default_strategy_is_still_the_v2_backtest_subclass(
     assert captured["latch_key_prefix"] == driver.DEFAULT_TRIAL_KEY_PREFIX
     out = capsys.readouterr().out
     assert "strategy position events" not in out
+
+
+# ---------------------------------------------------------------------------
+# AUD-19b: `--family-manifest` on the driver (plan §7 steps 8-13, 17-20).
+# ---------------------------------------------------------------------------
+def test_omitting_family_manifest_leaves_the_argument_vector_and_config_unchanged(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A2: the byte-identity pin on C2 -- no `--family-manifest` resolves the
+    same strategy default, threads no `required_fee_coefficient` override,
+    uses `UNSCOPED_FAMILY_ID`, and writes no sidecar."""
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+    )
+    assert captured["strategy_cls"] is driver.CurrentRungHoldBacktestStrategy
+    assert captured["latch_key_prefix"] == driver.DEFAULT_TRIAL_KEY_PREFIX
+    assert captured["required_fee_coefficient"] is None
+    assert captured["family_id"] == driver.UNSCOPED_FAMILY_ID
+    assert not (tmp_path / "out" / "family_params.json").exists()
+
+
+def test_family_manifest_threads_the_registered_taker_fee_coefficient(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A3: `--family-manifest` replaces the class-default fee coefficient
+    with the manifest's registered `taker_fee_coefficient`, and the family
+    segment threaded downstream is the manifest's own `family_id`."""
+    manifest_path = _write_family_manifest(
+        tmp_path, family_id="pm_us_crh_v4", taker_fee_coefficient="0.0695",
+    )
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+        extra_argv=["--family-manifest", str(manifest_path)],
+    )
+    assert captured["required_fee_coefficient"] == Decimal("0.0695")
+    assert captured["family_id"] == "pm_us_crh_v4"
+    assert captured["trial_id_prefix"] == "continuous_rung_hold/trial/"
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_error"),
+    [
+        ({"status": "DRAFT_NOT_REGISTERED"}, UnregisteredFamilyManifestError),
+        ({"boundary_inputs_sha256": "0" * 64}, UnpinnedBoundaryArtefactError),
+        ({"density_artefact_sha256": "0" * 64}, UnpinnedDensityArtefactError),
+    ],
+)
+def test_a_draft_or_unpinned_family_manifest_is_refused(
+    driver: ModuleType,
+    tmp_path: Path,
+    override: dict[str, object],
+    expected_error: type[Exception],
+) -> None:
+    """A4: every existing `family_manifest` refusal fires through this path
+    INHERITED, never re-implemented -- `allow_draft` never appears here."""
+    manifest_path = _write_family_manifest(tmp_path, **override)
+    with pytest.raises(expected_error):
+        driver.resolve_family_parameters(manifest_path, station=STATION, strategy_arg=None)
+
+
+def test_a_station_outside_the_manifest_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """A5: refuses naming both sides, never silently preferring either."""
+    manifest_path = _write_family_manifest(tmp_path, stations=["MDW"])
+    with pytest.raises(driver.FamilyManifestArgumentError, match="LAX"):
+        driver.resolve_family_parameters(manifest_path, station=STATION, strategy_arg=None)
+
+
+def test_an_explicit_strategy_conflicting_with_composition_kind_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """A5: an explicit `--strategy` that disagrees with the manifest's
+    `composition_kind` is refused, naming both sides."""
+    manifest_path = _write_family_manifest(tmp_path)  # composition_kind=continuous_rung_hold
+    with pytest.raises(driver.FamilyManifestArgumentError, match="current_rung_hold"):
+        driver.resolve_family_parameters(
+            manifest_path, station=STATION, strategy_arg="current_rung_hold",
+        )
+
+
+def test_a_forecast_ladder_manifest_is_refused(driver: ModuleType, tmp_path: Path) -> None:
+    """C4: this driver has no `forecast_ladder` strategy class."""
+    manifest_path = _write_family_manifest(tmp_path, composition_kind="forecast_ladder")
+    with pytest.raises(driver.FamilyManifestArgumentError, match="forecast_ladder"):
+        driver.resolve_family_parameters(manifest_path, station=STATION, strategy_arg=None)
+
+
+def test_each_new_refusal_path_exits_with_its_pinned_code(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """A17/C7: the three C4 argument refusals exit `EXIT_FAMILY_MANIFEST_
+    REFUSED`; the loader-side refusals (plus a missing manifest path) exit
+    `EXIT_FAMILY_MANIFEST_UNUSABLE`. Refusal happens before any capture I/O,
+    so `_minimal_argv`'s placeholder paths never need to exist."""
+    station_conflict = _write_family_manifest(tmp_path, stations=["MDW"])
+    rc = driver.main(
+        [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(station_conflict)],
+    )
+    assert rc == driver.EXIT_FAMILY_MANIFEST_REFUSED
+
+    strategy_conflict = _write_family_manifest(tmp_path)
+    rc = driver.main(
+        [
+            *_minimal_argv(tmp_path, strategy="current_rung_hold"),
+            "--family-manifest", str(strategy_conflict),
+        ],
+    )
+    assert rc == driver.EXIT_FAMILY_MANIFEST_REFUSED
+
+    forecast_ladder = _write_family_manifest(tmp_path, composition_kind="forecast_ladder")
+    rc = driver.main(
+        [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(forecast_ladder)],
+    )
+    assert rc == driver.EXIT_FAMILY_MANIFEST_REFUSED
+
+    draft = _write_family_manifest(tmp_path, status="DRAFT_NOT_REGISTERED")
+    rc = driver.main([*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(draft)])
+    assert rc == driver.EXIT_FAMILY_MANIFEST_UNUSABLE
+
+    unpinned_boundary = _write_family_manifest(tmp_path, boundary_inputs_sha256="0" * 64)
+    rc = driver.main(
+        [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(unpinned_boundary)],
+    )
+    assert rc == driver.EXIT_FAMILY_MANIFEST_UNUSABLE
+
+    unpinned_density = _write_family_manifest(tmp_path, density_artefact_sha256="0" * 64)
+    rc = driver.main(
+        [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(unpinned_density)],
+    )
+    assert rc == driver.EXIT_FAMILY_MANIFEST_UNUSABLE
+
+    missing_manifest = tmp_path / "does_not_exist.json"
+    rc = driver.main(
+        [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(missing_manifest)],
+    )
+    assert rc == driver.EXIT_FAMILY_MANIFEST_UNUSABLE
+
+
+def test_no_pre_existing_failure_path_changed_its_exit_code(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A17: a pre-existing failure path still propagates uncaught (exit `1`
+    at the process boundary), with the flag absent AND present."""
+
+    def _raise(*a: object, **kw: object) -> None:
+        raise driver.NoDecisionWindowCoverageError("boom")
+
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    monkeypatch.setattr(driver, "assert_decision_window_has_coverage", _raise)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+
+    with pytest.raises(driver.NoDecisionWindowCoverageError):
+        driver.main(_minimal_argv(tmp_path, strategy=None))
+
+    manifest_path = _write_family_manifest(tmp_path, composition_kind="current_rung_hold")
+    with pytest.raises(driver.NoDecisionWindowCoverageError):
+        driver.main(
+            [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(manifest_path)],
+        )
+
+
+def test_composition_kind_selects_the_strategy_when_strategy_is_not_passed(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4: with `--family-manifest` and no explicit `--strategy`, the
+    manifest's `composition_kind` selects the strategy."""
+    manifest_path = _write_family_manifest(tmp_path, composition_kind="continuous_rung_hold")
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+        extra_argv=["--family-manifest", str(manifest_path)],
+    )
+    assert captured["strategy_cls"] is driver.ContinuousRungHoldBacktestStrategy
+    assert captured["latch_key_prefix"] == driver.CONTINUOUS_TRIAL_KEY_PREFIX
+
+
+def test_family_params_sidecar_records_the_resolved_parameters(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A6: the sidecar carries exactly the C6 key set, with
+    `params_match=True`, `engine_params_source="FAMILY_MANIFEST"`, and a
+    `manifest_sha256` equal to the loader's own."""
+    manifest_path = _write_family_manifest(
+        tmp_path, family_id="pm_us_crh_v4", taker_fee_coefficient="0.0695",
+        composition_kind="continuous_rung_hold",
+    )
+    _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+        extra_argv=["--family-manifest", str(manifest_path)],
+    )
+    sidecar_path = tmp_path / "out" / "family_params.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text())
+    assert set(payload) == {
+        "family_id",
+        "manifest_sha256",
+        "manifest_taker_fee_coefficient",
+        "engine_required_fee_coefficient",
+        "engine_params_source",
+        "params_match",
+        "composition_kind",
+        "strategy",
+        "station",
+        "climate_day",
+        "exit_rule",
+        "argv_sha256",
+        "run_ts",
+    }
+    assert payload["params_match"] is True
+    assert payload["engine_params_source"] == "FAMILY_MANIFEST"
+    assert payload["family_id"] == "pm_us_crh_v4"
+    assert payload["manifest_taker_fee_coefficient"] == "0.0695"
+    assert payload["engine_required_fee_coefficient"] == "0.0695"
+    assert payload["manifest_sha256"] == load_family_manifest(manifest_path).manifest_sha256
+
+
+def test_a_pre_existing_sidecar_is_removed_before_the_run_starts(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A9/C6 step 1: with the flag ABSENT, a seeded predecessor sidecar is
+    unconditionally removed before the engine starts and none is written."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True)
+    seeded = out_dir / "family_params.json"
+    seeded.write_text("{}")
+
+    _run_main_with_stubbed_capture(driver, tmp_path, strategy=None, monkeypatch=monkeypatch)
+    assert not seeded.exists()
+
+
+def test_a_crashing_run_leaves_no_sidecar(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A9/C6 step 1: a run that crashes AFTER the pre-run clear (flag
+    present) leaves neither the seeded predecessor nor a `.tmp`."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True)
+    seeded = out_dir / "family_params.json"
+    seeded.write_text("{}")
+    manifest_path = _write_family_manifest(tmp_path)
+
+    def _boom(**kwargs: object) -> object:
+        raise RuntimeError("forced crash")
+
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    monkeypatch.setattr(driver, "run_one_precision_arm", _boom)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+
+    with pytest.raises(RuntimeError):
+        driver.main(
+            [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(manifest_path)],
+        )
+    assert not seeded.exists()
+    assert not (out_dir / "family_params.json.tmp").exists()
+
+
+def test_the_sidecar_carries_a_verifiable_argv_sha256(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A10/A15/C6 step 2: the sidecar's `argv_sha256` is produced by calling
+    `argv_digest.argv_sha256` (spied here), never computed inline, and does
+    not match a differently-ordered vector."""
+    manifest_path = _write_family_manifest(tmp_path)
+    real_argv_sha256 = driver.argv_sha256
+    spy_calls: list[list[str]] = []
+
+    def _spy(vector: list[str]) -> str:
+        spy_calls.append(list(vector))
+        return real_argv_sha256(vector)
+
+    monkeypatch.setattr(driver, "argv_sha256", _spy)
+    extra_argv = ["--family-manifest", str(manifest_path)]
+    _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch, extra_argv=extra_argv,
+    )
+    full_argv = [*_minimal_argv(tmp_path, strategy=None), *extra_argv]
+    sidecar = json.loads((tmp_path / "out" / "family_params.json").read_text())
+    assert spy_calls, "the driver must call argv_digest.argv_sha256, never compute it inline"
+    assert sidecar["argv_sha256"] == real_argv_sha256(full_argv)
+    assert sidecar["argv_sha256"] != real_argv_sha256(list(reversed(full_argv)))
+
+
+def test_the_sidecar_is_written_atomically(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A10/C6 step 3: after a successful run no `.tmp` survives, and the
+    final file parses as complete JSON."""
+    manifest_path = _write_family_manifest(tmp_path)
+    _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+        extra_argv=["--family-manifest", str(manifest_path)],
+    )
+    out_dir = tmp_path / "out"
+    assert not (out_dir / "family_params.json.tmp").exists()
+    payload = json.loads((out_dir / "family_params.json").read_text())
+    assert isinstance(payload, dict)
 
 
 def test_the_continuous_arm_injects_flat_position_evidence_for_every_candidate_slug(
