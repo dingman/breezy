@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -124,6 +125,50 @@ def _sha(path: Path | None) -> str:
 
 def _content_hash(parts: list[tuple[str, str]]) -> str:
     body = "\n".join(f"{label}={value}" for label, value in parts)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _directory_content_hash(directory: Path) -> str:
+    """sha256 over the sorted (filename, sha256) pairs of every regular file
+    directly under `directory` -- covers every artefact `load_realized_draws`
+    (and `_admissible_n`'s `provenance.json` read) can see: the scored-trial
+    `scored_trials_*.parquet` run files, the `fill_order.jsonl` sidecar, the
+    `excluded_fills.jsonl` residual sidecar, and `provenance.json` itself.
+
+    A new fill/scored-trial landing between two runs -- a new parquet run
+    file, or an appended sidecar line -- changes either the file list or an
+    existing file's bytes, so this changes deterministically with it (C12);
+    an absent directory hashes as `"ABSENT"`, distinct from a real empty one.
+    """
+    if not directory.is_dir():
+        return "ABSENT"
+    names = sorted(p.name for p in directory.iterdir() if p.is_file())
+    body = "\n".join(f"{name}={_sha(directory / name)}" for name in names)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _exec_state_db_content_hash(path: Path | None) -> str:
+    """sha256 over every `(key, value)` row `count_filled_takes` reads from
+    the exec-state `SqliteStateStore` -- opened read-only (the exec DB is
+    read-only evidence here, never written), matching
+    `fill_time_count._open_readonly`'s own read-only URI connection.
+
+    A new fill written between two runs changes a row (or adds one), so this
+    changes deterministically with it (C12). `"ABSENT"`/`"UNREADABLE"` for a
+    missing or unreadable file -- never a crash, matching `count_filled_takes`
+    itself failing closed rather than inferring zero.
+    """
+    if path is None or not path.is_file():
+        return "ABSENT"
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            rows = conn.execute("SELECT key, value FROM state ORDER BY key").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return "UNREADABLE"
+    body = "\n".join(f"{key}={hashlib.sha256(value).hexdigest()}" for key, value in rows)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
@@ -310,7 +355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("replay_sufficiency", _sha(args.replay_sufficiency)),
         ("replay_drift", _sha(args.replay_drift)),
         ("kill_clock", _sha(clock)),
-        ("scored_trials_provenance", _sha(store / "provenance.json")),
+        ("exec_state_db", _exec_state_db_content_hash(exec_db)),
+        ("scored_trials_store", _directory_content_hash(store)),
     ]
     digest = _content_hash(parts)
     dest = args.output_root / "proposals" / digest

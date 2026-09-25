@@ -291,7 +291,11 @@ def _edge(draws: Sequence[CombinedDraw]) -> tuple[float, float, float]:
         raise ValueError("edge estimator is undefined at Σqty <= 0")
     edge_hat = total_x / qty
     se = float(np.sqrt(information) / qty) if information > 0.0 else 0.0
-    z = float(norm.ppf(0.975))
+    #: Same one-sided level `block_bootstrap_ci_lower`'s BCa bound reports
+    #: (`roi_bound._CONFIDENCE_LEVEL = 0.95`, `alternative="greater"`) --
+    #: the two CI-lower numbers are shown side by side and must be at the
+    #: same level, not this estimator's own hardcoded two-sided 0.975.
+    z = float(norm.ppf(_CONFIDENCE_LEVEL))
     return edge_hat, se, edge_hat - z * se
 
 
