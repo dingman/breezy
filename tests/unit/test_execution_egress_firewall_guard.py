@@ -3443,6 +3443,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # not relaxed (L-6/L-12): the comparison is still `==`; its only mark is
     # `contract` -- none of `SOCKET_RESTORING_MARKERS` appears in it -- and the
     # venue read is an injected coroutine, so it opens no socket.
+    #
+    # Old -> new (this row, AUD-12a 2026-09-24, measured slippage from live
+    # fills): added `tests/unit/test_measured_slippage_from_fills.py`, which
+    # imports `DurableFillRecord` from `exec.client` to build fill fixtures
+    # for the fills-derived slippage join -- the SAME plain-data-record idiom
+    # as its `test_fill_time_count.py`/`test_portfolio_roi_report.py`/
+    # `test_aud05_scorer_terminal_bound.py` siblings above. WIDENED, not
+    # relaxed (L-6/L-12): the comparison is still `==`; the module carries NO
+    # pytest mark at all -- none of `SOCKET_RESTORING_MARKERS` appears in it
+    # -- constructs no client and opens no socket.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3506,6 +3516,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # exec-client suite, so this row never opens a socket either.
         "tests/unit/test_operator_caps_through_the_live_composition.py",
         "tests/unit/test_aud05_scorer_terminal_bound.py",
+        "tests/unit/test_measured_slippage_from_fills.py",
     }
 
 

@@ -82,13 +82,17 @@ __all__ = [
 #: {climate_day}`) -- the ONLY provenance signal the 6c store carries.
 _LIVE_TRIAL_ID_PREFIX = "current_rung_hold/trial/"
 
-#: The paper-replay latch's own key prefix (6b, `paper_replay.
-#: PAPER_TRIAL_ID_PREFIX`) -- restated verbatim here, not imported, because
-#: `breezy.runtime.paper_replay` sits above this script in the layer graph
-#: the same way `breezy.persistence.scored_trial_store` does; the two
-#: prefixes are pinned never to collide by
-#: `tests/unit/test_live_family_tally_provenance.py`.
-_PAPER_TRIAL_ID_PREFIX = "paper_replay/current_rung_hold/trial/"
+#: The paper-replay namespace literal (6b, `paper_replay.
+#: PAPER_TRIAL_ID_NAMESPACE`) -- restated verbatim here, not imported,
+#: because `breezy.runtime.paper_replay` sits above this script in the
+#: layer graph the same way `breezy.persistence.scored_trial_store` does;
+#: the two literals are pinned equal by
+#: `tests/unit/test_live_family_tally_provenance.py` (AUD-19a A1c). This is
+#: the OUTER literal only -- unlike the old `_PAPER_TRIAL_ID_PREFIX`, it no
+#: longer names `current_rung_hold`, so the live/paper barrier
+#: (`assert_paper_only` below) keys on this literal alone, unaffected by
+#: which family or composition produced the row.
+_PAPER_TRIAL_ID_NAMESPACE = "paper_replay/"
 
 #: Pinned column-for-column identical to the M_B live section's stratum
 #: table (`mb_current_rung_edge_study.py`'s `render_markdown`), per the
@@ -165,19 +169,36 @@ def assert_live_only(rows: Sequence[ScoredTrial]) -> None:
         )
 
 
-def assert_paper_only(rows: Sequence[ScoredTrial]) -> None:
+def assert_paper_only(rows: Sequence[ScoredTrial], *, family_id: str | None = None) -> None:
     """Symmetric to `assert_live_only`: refuse the paper tally if any row is
-    not a `paper_replay/current_rung_hold/trial/...` row (6b, L-22
-    provenance -- a live row must never pool into a mechanism-test tally
-    either)."""
+    not a `paper_replay/...` row (6b, L-22 provenance -- a live row must
+    never pool into a mechanism-test tally either).
+
+    `family_id`, when given (AUD-19a A4), additionally requires
+    `row.trial_id.split("/")[1] == family_id` for every row -- EXACT
+    equality on the segment, never a prefix or substring test, and never a
+    `trial_id_prefix` comparison (the ruling's collision was exactly two
+    REGISTERED families sharing one `trial_id_prefix`). An old-shape row
+    (segment 1 == `"current_rung_hold"`, D3) equals no registered
+    `family_id` and is refused by this leg, never attributed to a family it
+    was never scoped to."""
     offenders = tuple(
-        row.trial_id for row in rows if not row.trial_id.startswith(_PAPER_TRIAL_ID_PREFIX)
+        row.trial_id for row in rows if not row.trial_id.startswith(_PAPER_TRIAL_ID_NAMESPACE)
     )
     if offenders:
         raise ValueError(
             "refusing to tally: non-paper trial_id(s) found "
             f"(live trials are never pooled into a paper_replay tally): {offenders!r}"
         )
+    if family_id is not None:
+        mismatched = tuple(
+            row.trial_id for row in rows if row.trial_id.split("/")[1] != family_id
+        )
+        if mismatched:
+            raise ValueError(
+                f"refusing to tally: trial_id(s) not scoped to family {family_id!r}: "
+                f"{mismatched!r}"
+            )
 
 
 def _rows_from_scored(scored: Sequence[ScoredTrial]) -> Sequence[CurrentRungTrial]:
@@ -241,6 +262,7 @@ def build_live_family_tally(
     provenance: str = "live",
     covered_listed_station_days: int | None = None,
     filled_takes: int | None = None,
+    family_id: str | None = None,
 ) -> LiveFamilyTally:
     """Build the pooled/station/ask-band strata, verdict, and BCa line.
 
@@ -269,13 +291,14 @@ def build_live_family_tally(
 
     `provenance` selects which unforgeable barrier runs: `"live"` (default)
     dispatches to `assert_live_only`, UNMODIFIED; `"paper_replay"` dispatches
-    to `assert_paper_only`. Excludes any row with a non-`None`
+    to `assert_paper_only`, forwarding `family_id` (AUD-19a A4; ignored when
+    `provenance="live"`). Excludes any row with a non-`None`
     `excluded_reason` from every stratum (review item 2) -- such rows are
     still counted by the BCa exclusion fraction below, via `_roi_bound_line`,
     which sees the full input.
     """
     if provenance == "paper_replay":
-        assert_paper_only(rows)
+        assert_paper_only(rows, family_id=family_id)
     else:
         assert_live_only(rows)
     if filled_takes is not None and filled_takes < len(rows):

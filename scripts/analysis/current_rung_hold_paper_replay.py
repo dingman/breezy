@@ -68,8 +68,9 @@ from breezy.runtime.exec_state_db_path import (
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.paper_replay import (
     EXPIRATION_LEG_PREFIX,
-    PAPER_TRIAL_ID_PREFIX,
+    PAPER_TRIAL_ID_NAMESPACE,
     PRECISION_ARMS,
+    UNSCOPED_FAMILY_ID,
     PaperReplayInputs,
     PrecisionMode,
     ReplayEntryContext,
@@ -838,6 +839,11 @@ def run_one_precision_arm(
     alongside `CurrentRungHoldBacktestStrategy` is a silent no-op, since the
     v2 strategy carries no `_position_monitor` hook at all.
 
+    AUD-19a: internally passes `family_id=UNSCOPED_FAMILY_ID` and
+    `trial_id_prefix=latch_key_prefix` to `filled_trials_from_engine` --
+    this function's own signature is unchanged (no manifest exists to
+    thread yet; that is AUD-19b's `--family-manifest` flag).
+
     Review finding F2: `main` calls this function once per entry in
     `PRECISION_ARMS`, all sharing the ONE `monitor_out_dir` an operator
     passes on the CLI. Neither `PositionMarkRecord` nor
@@ -983,7 +989,12 @@ def run_one_precision_arm(
             scheduled_release_at_ns=max(ts_values) + SEVEN_DAYS_NS,
             latch_key_prefix=latch_key_prefix,
         )
-        trials = filled_trials_from_engine(engine, entry_contexts)
+        trials = filled_trials_from_engine(
+            engine,
+            entry_contexts,
+            family_id=UNSCOPED_FAMILY_ID,
+            trial_id_prefix=latch_key_prefix,
+        )
     if evidence is not None and evidence.called:
         # AM-20/NB-6 (driver-side half): the evidence reader's own record of
         # what it last emitted must equal the strategy's own `_facts` slug
@@ -1229,7 +1240,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if scored:
         write_scored_trials(args.output_dir, scored, now_ns=now_ns)
-    print(f"trial_id prefix used: {PAPER_TRIAL_ID_PREFIX}")
+    print(
+        "trial_id prefix used: "
+        f"{PAPER_TRIAL_ID_NAMESPACE}/{UNSCOPED_FAMILY_ID}/{latch_key_prefix}",
+    )
     print(f"trader_id: {DEFAULT_BACKTEST_TRADER_ID}")
     return 0
 

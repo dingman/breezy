@@ -80,6 +80,13 @@ UMask=0077
 # (src/breezy/runtime/settings.py:12-16).
 EnvironmentFile=/home/jon/.config/breezy/polymarket.env
 
+# AUD-08b: ONLY the alert webhook (the repo's alert-egress convention), so the
+# recorder's BREEZY_SIGHTING_SIDECAR_BROKEN alert (raised after
+# SIGHTING_SINK_FAILURE_ALERT_CYCLES consecutive failed sidecar appends)
+# reaches a human rather than the journal. Optional ("-"): absent means the
+# alert degrades to a log line and never fails the recorder.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
 # The one variable the supervisors export on top of that env file
 # (tape_supervisor.sh:18; tape_supervisor_k1.sh:9+28). Required with NO
 # default and must be absolute -- src/breezy/runtime/settings.py:557-576.

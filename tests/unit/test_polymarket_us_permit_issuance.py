@@ -85,6 +85,7 @@ from breezy.adapters.polymarket_us.safety import (
     seed_permit_budget_from_prior_spend,
 )
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
+from tests.unit.log_leak_assertions import assert_no_values_leaked
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1868,15 +1869,19 @@ def test_a_logged_permit_never_publishes_operator_id_or_a_ceiling_value(
     text = caplog.text
     rendered = repr(permit)
 
+    # Number-boundary match, not a bare substring check: this fixture's
+    # `clock_at()` is deterministic (`NOW_NS`), but `issued_at_ns`/
+    # `expires_at_ns` are still large digit runs a plain `"100" not in text`
+    # check could spuriously match inside -- see
+    # `test_app_trade_main_permit_logging.py` and `log_leak_assertions.py`.
     sensitive_values = (
         "operator@example.com",
         "5.00",
         "1000.00",
         "100",
     )
-    for value in sensitive_values:
-        assert value not in text, f"{value!r} leaked into a log record"
-        assert value not in rendered, f"{value!r} leaked into repr(permit)"
+    assert_no_values_leaked(text, sensitive_values, context="a log record")
+    assert_no_values_leaked(rendered, sensitive_values, context="repr(permit)")
 
 
 # ---------------------------------------------------------------------------

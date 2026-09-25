@@ -7,10 +7,11 @@ registered symbols in `scripts/analysis/mb_current_rung_edge_study.py`
 (`FEE_THETA`, `break_even`, `RealizedStratum`, `build_realized_stratum`) plus
 the three `build_realized_stratum` call sites in
 `scripts/analysis/live_family_tally.py` (line-anchored after b08166c's
-structural-dead-stop shift: `:193` station, `:206` ask-band, `:290` pooled),
-sha256-pins each to its CURRENT text, and proves each pin can fail in BOTH
-directions with a widened and a narrowed neighbour mutant -- the same
-equality-pin discipline as `test_cage_rule_constants_are_pinned.py`.
+structural-dead-stop shift, RE-ANCHORED after AUD-19a's family-scoping
+addition earlier in the file: `:214` station, `:227` ask-band, `:313`
+pooled), sha256-pins each to its CURRENT text, and proves each pin can fail
+in BOTH directions with a widened and a narrowed neighbour mutant -- the
+same equality-pin discipline as `test_cage_rule_constants_are_pinned.py`.
 
 No import of either module (source-text extraction only): a drift in the
 STATISTIC is what this guards, not merely importability.
@@ -90,12 +91,19 @@ PINNED_SYMBOL_HASHES: dict[str, str] = {
 
 #: Sha256 of the CURRENT text of each `build_realized_stratum` call site in
 #: `live_family_tally.py`, line-anchored after b08166c's shift (blueprint
-#: Sec "Tests"): `:193` station stratum, `:206` ask-band stratum, `:290`
-#: pooled stratum.
+#: Sec "Tests"), RE-ANCHORED after AUD-19a (peer-**ENDORSED** ruling
+#: `RULING_replay_evidence_citability_and_promotion_criteria_2026-09-21.md`
+#: Q1) added lines earlier in the file to `assert_paper_only`/
+#: `build_live_family_tally`'s paper-namespace family scoping: `:214`
+#: station stratum, `:227` ask-band stratum, `:313` pooled stratum. The
+#: HASHES are byte-identical to the pre-AUD-19a pins -- verified by sha256
+#: of the pre-move line text -- so this is a line-number re-anchor only,
+#: never a content change; the statistic these call sites feed remains
+#: byte-unmodified.
 PINNED_CALL_SITE_HASHES: dict[int, str] = {
-    193: "10afd2cb4abcefd10527b55dc4dd5c20c90c5af381256812608b347a7d69e517",
-    206: "5d75c71e94c8de385603ec2b9bac36c89734e666696600bf039aa70ddf1003fd",
-    290: "9e7cb7e9fb91daab14aab35e09887a16d95a8378b6dbef44fb765af04a72c9fa",
+    214: "10afd2cb4abcefd10527b55dc4dd5c20c90c5af381256812608b347a7d69e517",
+    227: "5d75c71e94c8de385603ec2b9bac36c89734e666696600bf039aa70ddf1003fd",
+    313: "9e7cb7e9fb91daab14aab35e09887a16d95a8378b6dbef44fb765af04a72c9fa",
 }
 
 
@@ -183,4 +191,7 @@ def test_symbol_pin_table_covers_exactly_the_four_ruling_3_symbols() -> None:
 
 
 def test_call_site_pin_table_covers_exactly_the_three_ruling_3_line_numbers() -> None:
-    assert set(PINNED_CALL_SITE_HASHES) == {193, 206, 290}
+    # WIDENED, not relaxed: re-anchored to AUD-19a's post-edit line numbers
+    # (see `PINNED_CALL_SITE_HASHES`'s docstring) -- same three call sites,
+    # same hashes, verified byte-identical to the pre-AUD-19a pins.
+    assert set(PINNED_CALL_SITE_HASHES) == {214, 227, 313}
