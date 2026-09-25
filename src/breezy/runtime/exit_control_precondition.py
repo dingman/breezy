@@ -56,14 +56,31 @@ def read_exit_control_halt_precondition(
     """Read-only sender-global halt-state check. Never writes, never
     raises: any ``reader`` exception fails closed as
     :data:`BLOCKED_HALT_STATE_UNREADABLE` rather than propagating.
+
+    ``reader``'s connection (the default ``read_continuous_family_store_
+    state`` -> ``SqliteStateStore``) is opened read-write in MODE -- but
+    performs no write on an EXISTING store, since it only ever ``get``\\ s.
+    On a non-existent ``store_path`` it would instead ``mkdir(parents=True)``
+    and ``CREATE TABLE IF NOT EXISTS`` a fresh, empty database and read no
+    halt from it -- silently returning :data:`HALT_CLEAR_NEXT_PRECONDITION`
+    for a path that names nothing (fail-open). This function therefore
+    checks ``store_path.is_file()`` FIRST and returns
+    :data:`BLOCKED_HALT_STATE_UNREADABLE` without ever calling ``reader``,
+    and without creating the file or its parent directory, when the store
+    does not already exist.
     """
     halt_key = continuous_family_halt_key(sending_family_id)
-    try:
-        state = reader(store_path, sending_family_id)
-    except Exception:  # noqa: BLE001 - any reader failure fails closed, never propagates
+    if not store_path.is_file():
         verdict = BLOCKED_HALT_STATE_UNREADABLE
     else:
-        verdict = BLOCKED_FAMILY_HALT_SET if state.family_halted else HALT_CLEAR_NEXT_PRECONDITION
+        try:
+            state = reader(store_path, sending_family_id)
+        except Exception:  # noqa: BLE001 - any reader failure fails closed, never propagates
+            verdict = BLOCKED_HALT_STATE_UNREADABLE
+        else:
+            verdict = (
+                BLOCKED_FAMILY_HALT_SET if state.family_halted else HALT_CLEAR_NEXT_PRECONDITION
+            )
     return HaltPreconditionReading(
         verdict=verdict,
         halt_key=halt_key,

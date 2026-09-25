@@ -194,6 +194,7 @@ def test_the_module_imports_no_order_or_strategy_surface() -> None:
 
 def test_BLOCKED_HALT_STATE_UNREADABLE_fires_when_the_reader_raises(tmp_path: Path) -> None:
     store_path = tmp_path / "unreadable.db"
+    store_path.touch()  # exists, so the missing-path guard does not short-circuit the reader
 
     def _raising_reader(path: Path, sending_family_id: str) -> object:
         raise RuntimeError("simulated unreadable store")
@@ -203,3 +204,24 @@ def test_BLOCKED_HALT_STATE_UNREADABLE_fires_when_the_reader_raises(tmp_path: Pa
     )
 
     assert reading.verdict == BLOCKED_HALT_STATE_UNREADABLE
+
+
+def test_a_nonexistent_store_path_is_BLOCKED_HALT_STATE_UNREADABLE_and_creates_nothing(
+    tmp_path: Path,
+) -> None:
+    """The reused `read_continuous_family_store_state` opens
+    `SqliteStateStore`, which `mkdir(parents=True)`s and `CREATE TABLE IF
+    NOT EXISTS`s -- so a wrong/non-existent path would otherwise be
+    silently treated as a fresh, unhalted store (fail-open: "clear" for a
+    path that names nothing). The precondition must refuse to call the
+    reader at all in that case, and must create neither the parent
+    directory nor the file.
+    """
+    missing_parent = tmp_path / "does-not-exist-yet"
+    store_path = missing_parent / "state.db"
+
+    reading = read_exit_control_halt_precondition(store_path, "pm_us_crh_v4", now_ns=8)
+
+    assert reading.verdict == BLOCKED_HALT_STATE_UNREADABLE
+    assert not store_path.exists()
+    assert not missing_parent.exists()
