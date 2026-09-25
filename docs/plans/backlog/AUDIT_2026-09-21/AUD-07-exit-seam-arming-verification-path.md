@@ -347,6 +347,22 @@ one wrapper, and one JSON manifest.
      `THREATENED_AFTER_EXIT_SIDE_EMPTIED` **do not count toward** the R-THREAT "≥3 of N firing before
      the exit side empties" gate, whatever the median says. The median is a summary; the gate is
      per-row. If closing the anomaly reduces the qualifying count, that is the honest reading.
+
+> **ERRATUM (2026-09-25, domain review of steps 0-6 implementation).** The polarity stated above is
+> **inverted**. The implemented and coordinator-ENDORSED rule (CORRECT_DEVIATION) is:
+> `delta_i < 0` → `THREATENED_BEFORE_EXIT_SIDE_EMPTIED` (the gate-relevant case);
+> `delta_i > 0` (or `= 0`) → `THREATENED_AFTER_EXIT_SIDE_EMPTIED`.
+> Derivation: `delta_i = threatened_confirmed_ts_i − last_executable_exit_ts_i`. "Threatened confirmed
+> **before** the exit side empties" means the threatened timestamp is the *earlier* of the two, i.e.
+> `threatened_confirmed_ts_i < last_executable_exit_ts_i`, i.e. `delta_i < 0` — the opposite sign of
+> what this section originally wrote. The real-writer-path fixture for the MIA 09-15 firing confirms
+> this empirically: it has `delta = −74.12 min` and was already published (Rev 3, Finding B2) as
+> `THREATENED_BEFORE_EXIT_SIDE_EMPTIED`, which is only consistent with `delta_i < 0 → BEFORE`. See
+> `docs/evidence/EXIT_SEAM_VERIFICATION_STATE_2026-09-25.md` for the reconciled table and the
+> `classify_threatened_delta` implementation this erratum describes. This erratum corrects the prose
+> only; it does not reopen §6 B2's gate-reading consequence (item 3 above), which is stated correctly
+> in terms of the class labels, not the raw sign.
+
 - **A — complete the registration package, still DRAFT.** Mint real artefacts and fill the manifest:
   re-run `scripts/analysis/crh_group_sequential_boundaries.py` and pin the resulting `inputs_sha256`
   (Rev 2 §2's own instruction), set a real `density_artefact_sha256`, correct

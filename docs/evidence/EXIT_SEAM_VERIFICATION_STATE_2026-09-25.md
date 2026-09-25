@@ -178,7 +178,10 @@ only row with both timestamps defined, so the "median" of a one-element
 sample is that element), and a negative value is the CORRECT, gate-relevant
 sign under the polarity this item verifies from the evidence (see the
 commit message on `classify_threatened_delta` for the full derivation and
-the note that the plan's own prose stated the opposite polarity).
+the note that the plan's own prose stated the opposite polarity — see the
+dated erratum in
+`docs/plans/backlog/AUDIT_2026-09-21/AUD-07-exit-seam-arming-verification-path.md`
+§6 B2, added 2026-09-25).
 
 **Gate reading, per row (Rev 2's unchanged gates, restated here since Rev 3
 itself is out of this item's scope):** R-THREAT: 1 of 5 qualifying rows
@@ -208,3 +211,15 @@ drift from Rev 2 Appendix A.3, as stated above under Finding B.
   plan's own §9 "Autonomous operation" discipline, not solved here.
 - `exit_gate.py`: unchanged. No order placed, no family registered, no
   gate opened, no positive control run, no live-trading enablement touched.
+
+## Residuals (named, not required to close in this pass)
+
+- **`EXIT_CORPUS_FROZEN` WARN=3 threshold in quiet periods (domain review,
+  follow-up only).** The ladder's WARN-at-streak-3 threshold counts
+  consecutive runs with zero new positions. A genuinely quiet weather
+  window (no qualifying signal for several days, not a stuck job) can reach
+  streak 3 on legitimate inactivity and WARN even though nothing is
+  actually frozen. This item did not change the threshold or add an
+  activity-aware suppression; it is left as a residual for a later pass to
+  size against real quiet-period base rates before tightening or widening
+  the threshold.
