@@ -32,22 +32,38 @@ from typing import Any
 
 import pytest
 from nautilus_trader.common.component import TestClock
-from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId, TraderId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.exec.client import BUDGET_EXHAUSTED_KEY_PREFIX
 from breezy.adapters.polymarket_us.exec.no_side_keys import is_no_side_pending
+from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
-from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
+from breezy.strategy.current_rung_hold.continuous_strategy import (
+    _DIAG_DAY_BUDGET_EXHAUSTED,
+    _DIAG_FAMILY_HALT,
+    _DIAG_OPEN_INTENT_WAIT,
+    _DIAG_REARM_WAIT,
+    _OUTSIDE_DECISION_WINDOW,
+    ContinuousRungHoldStrategy,
+)
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
+)
+from tests.unit.test_continuous_rung_hold_strategy import (
+    _PERMISSIVE_EVIDENCE,
+    _register_phase1_and_start,
 )
 from tests.unit.test_current_rung_hold_strategy import (
     CLIMATE_DAY,
@@ -59,6 +75,49 @@ from tests.unit.test_current_rung_hold_strategy import (
     _observation,
     _quote,
 )
+
+_NS_PER_HOUR = 3_600_000_000_000
+_DEPTH10_LEVELS = 10
+
+
+def _pad_depth_side(
+    side: OrderSide, levels: tuple[tuple[str, int], ...],
+) -> list[BookOrder]:
+    """Ten-level Depth10 side, padded with the size-0 Arrow filler -- mirrors
+    ``test_continuous_rung_hold_strategy.py``'s own ``_pad`` verbatim."""
+    filler = BookOrder(side, Price(0, 2), Quantity(0, 0), 0)
+    orders = [BookOrder(side, Price.from_str(px), Quantity(size, 0), 0) for px, size in levels]
+    while len(orders) < _DEPTH10_LEVELS:
+        orders.append(filler)
+    return orders
+
+
+def _depth(
+    instrument_id: InstrumentId,
+    *,
+    bids: tuple[tuple[str, int], ...] = (),
+    asks: tuple[tuple[str, int], ...] = (),
+    ts_event: int,
+) -> OrderBookDepth10:
+    bid_orders = _pad_depth_side(OrderSide.BUY, bids)
+    ask_orders = _pad_depth_side(OrderSide.SELL, asks)
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bid_orders,
+        asks=ask_orders,
+        bid_counts=[1 if o.size.as_double() > 0 else 0 for o in bid_orders],
+        ask_counts=[1 if o.size.as_double() > 0 else 0 for o in ask_orders],
+        flags=0,
+        sequence=0,
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+def _bid_only_depth(
+    *, bid: str, bid_size: int = 10, ts_event: int,
+) -> OrderBookDepth10:
+    return _depth(INTERIOR_ID, bids=((bid, bid_size),), asks=(), ts_event=ts_event)
 
 _NO_INTERIOR_ID = sibling_instrument_id(INTERIOR_ID)
 _BAND_CLEARING_BID = "0.85"
@@ -512,3 +571,296 @@ def test_a_second_raise_in_the_same_station_day_does_not_log_again(
     # But the notice set (and therefore the ERROR log it guards) never grows
     # past the first entry for this station-day.
     assert len(strategy._no_only_hunt_error_notice) == 1
+
+
+# ---------------------------------------------------------------------------
+# F-1b (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): a bid-only
+# Depth10 book (a YES book with a real bid but no real ask -- the venue's
+# own book, not derivable from any QuoteTick) reaches NO evaluation.
+# ---------------------------------------------------------------------------
+
+
+def test_bid_only_depth_evaluates_no_side(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC1: a bid-only book with an executable NO leg evaluates NO exactly
+    once, and records no YES diagnostic (the frame carries no ask)."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert len(calls) == 1
+    assert strategy.diagnostics.counts == {}
+    assert not any(rec.side == "YES" for rec in strategy.offer_tape.records())
+
+
+def test_bid_only_depth_no_leg_out_of_band_is_silent(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC2: a bid-only book whose NO leg is outside the band writes no row
+    and causes no ``not_executable``/``refusals`` delta."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    calls = _spy_no_side_shadow(strategy)
+
+    # bid=0.99 -> NO_ask = 0.01, outside (0.05, 0.95).
+    strategy.on_order_book_depth(_bid_only_depth(bid="0.99", ts_event=WINDOW_OPEN_NS))
+
+    assert calls == []
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+    assert strategy.offer_tape.records() == ()
+
+
+def test_empty_depth_returns_early(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC3: a book with neither an ask nor a bid returns early, unchanged."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_order_book_depth(_depth(INTERIOR_ID, bids=(), asks=(), ts_event=WINDOW_OPEN_NS))
+
+    assert calls == []
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+    assert strategy.offer_tape.records() == ()
+
+
+def test_bid_only_dedupe_distinguishes_bids_at_same_ts(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """The dedupe key for an ask-less frame is ``(ts_event, None, bid,
+    bid_size)`` -- a DIFFERENT bid at the identical ``ts_event`` is not
+    swallowed, but the identical bid at the identical ``ts_event`` is."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+    strategy.on_order_book_depth(_bid_only_depth(bid="0.90", ts_event=WINDOW_OPEN_NS))
+    assert len(calls) == 2
+
+    strategy.on_order_book_depth(_bid_only_depth(bid="0.90", ts_event=WINDOW_OPEN_NS))
+    assert len(calls) == 2
+
+
+def test_bid_only_gate_closed_never_submits(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC4: gate closed -- no order, no inflight, no first-order key."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+
+    strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert submitted == []
+    assert strategy._latch is not None
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(_NO_INTERIOR_ID)
+        )
+        is False
+    )
+    assert is_no_side_pending(strategy._latch._store) is False
+    rows = [rec for rec in strategy.offer_tape.records() if rec.side == "NO"]
+    assert len(rows) == 1
+    assert rows[0].reason == "no_side_calibration_unsafe"
+
+
+def test_quote_tick_path_unchanged(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC5: the QuoteTick path (`_snapshot_from_quote` always sets an ask)
+    is byte-identical to the pre-F-1b baseline."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    rows = strategy.offer_tape.records()
+    yes_rows = [rec for rec in rows if rec.side == "YES"]
+    assert len(yes_rows) == 1
+    assert yes_rows[0].reason == "taken"
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+
+
+# ---------------------------------------------------------------------------
+# R1: every upstream gate above the ask/bid branch runs identically for a
+# bid-only frame as for any other trigger -- named per the F-1b delta table.
+# ---------------------------------------------------------------------------
+
+
+def _family_halt_strategy(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    assert strategy._latch is not None
+    strategy._latch.record_policy_halt(
+        reason="test halt", evidence_sha256="a" * 64, ts_ns=WINDOW_OPEN_NS,
+    )
+    return strategy
+
+
+def _day_budget_exhausted_strategy(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    assert strategy._latch is not None
+    utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
+    strategy._latch._store.set(f"{BUDGET_EXHAUSTED_KEY_PREFIX}{utc_day}", b"1")
+    return strategy
+
+
+def _intent_open_strategy(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    assert strategy._latch is not None
+    intent_latch = strategy._latch._intent_latch
+    assert intent_latch is not None
+    intent_latch.arm("a" * 64, now_ns=WINDOW_OPEN_NS)
+    return strategy
+
+
+def _rearm_wait_strategy(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    assert strategy._latch is not None
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS, key_instrument_id=str(INTERIOR_ID),
+    )
+    return strategy
+
+
+@pytest.mark.parametrize(
+    ("build_strategy", "expected_diag_key"),
+    [
+        (_family_halt_strategy, _DIAG_FAMILY_HALT),
+        (_day_budget_exhausted_strategy, _DIAG_DAY_BUDGET_EXHAUSTED),
+        (_intent_open_strategy, _DIAG_OPEN_INTENT_WAIT),
+        (_rearm_wait_strategy, _DIAG_REARM_WAIT),
+    ],
+    ids=["family_halt", "day_budget_exhausted", "intent_open", "rearm_wait"],
+)
+def test_bid_only_frame_counter_deltas_per_upstream_state(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    build_strategy: Callable[[Path, BinaryOption], ContinuousRungHoldStrategy],
+    expected_diag_key: str,
+) -> None:
+    """R1: each pre-decision gate above the ask/bid branch runs identically
+    for a bid-only Depth10 frame as for any other trigger -- the F-1b delta
+    table names each one explicitly as an accepted delta, and `refusals`
+    stays empty for every one of these (none of them is a refusal)."""
+    strategy = build_strategy(store_path, interior_instrument)
+
+    strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert strategy.diagnostics.counts == {expected_diag_key: 1}
+    assert strategy.refusals.counts == {}
+
+
+def test_bid_only_frame_outside_window_is_silent(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R1: a bid-only frame outside the decision window returns BEFORE
+    `refusals.record(_OUTSIDE_DECISION_WINDOW)` and before
+    `_observe_halt(trading_expected=False)` -- `refusals` stays
+    byte-identical, unlike an ask-bearing out-of-window frame."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS - 30 * NS_PER_MIN)
+    )
+
+    assert strategy.refusals.counts == {}
+    assert strategy.diagnostics.counts == {}
+    assert strategy.offer_tape.records() == ()
+    assert _OUTSIDE_DECISION_WINDOW not in strategy.refusals.counts
+
+
+def test_release_stale_inflight_is_trigger_independent(
+    interior_instrument: BinaryOption, tmp_path: Path,
+) -> None:
+    """R1: `_release_stale_inflight`'s conditions (intent CLOSED, the
+    same-burst delay floor elapsed) do not depend on the trigger -- a quote
+    tick, an ask-bearing Depth10 frame and a bid-only Depth10 frame release
+    the SAME stale IN_FLIGHT marker identically (same `clear_inflight`
+    outcome, same `inflight_released` count, same `rearm:` summary)."""
+    release_ts = WINDOW_OPEN_NS + 121_000_000_000  # past `_REARM_MIN_DELAY_NS` (120s)
+
+    def _prime(store_path: Path) -> ContinuousRungHoldStrategy:
+        strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+        assert strategy._latch is not None
+        strategy._latch.record_attempt(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            ts_ns=WINDOW_OPEN_NS,
+            key_instrument_id=str(INTERIOR_ID),
+        )
+        strategy._latch.set_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        return strategy
+
+    def _outcome(strategy: ContinuousRungHoldStrategy) -> tuple[bool, int, str | None]:
+        assert strategy._latch is not None
+        return (
+            strategy._latch.is_inflight(
+                STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+            ),
+            strategy.diagnostics.count("inflight_released"),
+            strategy.last_rearm_decision,
+        )
+
+    quote_strategy = _prime(tmp_path / "quote.db")
+    quote_strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.97", ts_event=release_ts))
+    quote_outcome = _outcome(quote_strategy)
+
+    ask_depth_strategy = _prime(tmp_path / "ask_depth.db")
+    ask_depth_strategy.on_order_book_depth(
+        _depth(
+            INTERIOR_ID,
+            bids=((_BAND_CLEARING_BID, 10),),
+            asks=(("0.97", 10),),
+            ts_event=release_ts,
+        )
+    )
+    ask_depth_outcome = _outcome(ask_depth_strategy)
+
+    bid_only_strategy = _prime(tmp_path / "bid_only.db")
+    bid_only_strategy.on_order_book_depth(
+        _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=release_ts)
+    )
+    bid_only_outcome = _outcome(bid_only_strategy)
+
+    assert quote_outcome == (False, 1, quote_outcome[2])
+    assert quote_outcome == ask_depth_outcome == bid_only_outcome
