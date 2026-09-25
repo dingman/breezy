@@ -751,7 +751,7 @@ sufficiency, rather than leaving that judgement scattered across memories.
 | **Forecast taker** (rung-level, any window/side/screen variant already covered by `PREREG_WP7_MULTIPLICITY_RULE`'s 12) | **CLOSED, TERMINAL** | `RULING_forecast_edge_programme_closes_2026-09-20.md`: market resolution 1.98x the forecast's, CI95 `[-0.03229,-0.00373]` | Registered here as `status=REJECTED`, cap exhausted, so a future registration attempt under this class is a hard refusal, not a silent no-op — see §7 step 7 |
 | **`pm_us_crh_v4` archive-table recalibration** (fix the train/serve skew so the family can price at all) | **BLOCKED on data, not closed** | `DECISION_FUNNEL_2026-09-20.md`: "the family is currently UNSALVAGEABLE, not merely miscalibrated" **absent real historical venue ladders, which do not exist**; the corpus is 2021-2025 CLI-derived, the live decision path needs interval-aware venue-priced ladders that only exist from tape start (2026-08-30) forward | Registered `PARKED_INSUFFICIENT_DATA`; re-triaged automatically (§6.4) as AUD-09a's census accumulates SUFFICIENT station-days; **not** evaluated until `min_station_days` is met per-cluster (station × season × hour × width × m — the corpus's own strata) |
 | **Maker/resting-bid redesign** (`pm_us_crh_rest_v5` folded `CLOSED_NOT_REGISTERED` as originally drafted) | **CLOSED as drafted; a genuinely different redesign is a NEW registration** | `POST_FORECAST_PHASE §0.2`: "resting −2.550 vs IOC −2.09... loses more than the baseline it must beat" | A future redesign is a fresh `hypothesis_id` with its own `K_variants`; this item does not propose one, per §5's exclusion |
-| **NO-side hunting** | **BLOCKED on capture, not closed** — standing requirement (memory `no-side-hunting-is-a-requirement`) | `POST_FORECAST_PHASE §0.3`/work packages C0-C2: NO leg has **never been priced** (zero `^no` dirs in `order_book_depths`/`quote_tick`/`trade_tick`); C1/C2's own n≥30 gate, owned by AUD-02, is upstream of this item | Registered `PARKED_INSUFFICIENT_DATA`; triage (§6.4) reads C1/C2's own capture progress once it exists — this item adds no new capture path, per §5 |
+| **NO-side hunting** | **BLOCKED on capture, not closed** — standing requirement (memory `no-side-hunting-is-a-requirement`) | `POST_FORECAST_PHASE §0.3`/work packages C0-C2: NO leg has **never been priced** (zero `^no` dirs in `order_book_depths`/`quote_tick`/`trade_tick`); C1/C2's own n≥30 gate, owned by AUD-02, is upstream of this item | Registered `PARKED_INSUFFICIENT_DATA`; triage (§6.4) reads C1/C2's own capture progress once it exists — this item adds no new capture path, per §5. **Superseded 2026-09-25 for the specific `H-NO-SIDE-2026-09` design** — see the dated amendment after step 9 below: this row's disposition predates the §7 step 8 horizon ruling and its independent peer pass. |
 | **Hours 10-11 repricing window (HUNT-1/WIN-1)** | **BLOCKED, structurally, not closed** | `DECISION_FUNNEL_2026-09-20.md`: 100% of decisions die upstream of pricing (`observation_ambiguous` then `illegal_cell`); HUNT-1 is "moot" until Gate 1/Gate 2 are fixed — and the funnel's own follow-on measurement REJECTED all three candidate fixes to Gate 1 ("no live sub-degree high-cadence observation source has been found to exist") | Registered `PARKED_INSUFFICIENT_DATA` with reason `OBSERVATION_GATE_UNRESOLVED`[^footnote-gate-unresolved]; owned upstream by AUD-01/the Gate-1 design track, cited by id, never re-decided here |
 
 [^footnote-gate-unresolved]: Distinction: `OBSERVATION_GATE_UNRESOLVED` means the hypothesis is blocked **pre-registration**, upstream of any power check (the input to `register_hypothesis` is undefined — no station-day sample exists). `UNDERPOWERED_NOT_REGISTERED` means a hypothesis **reached** `register_hypothesis`, its power check ran, but MDE exceeds bound — two different gates at two different pipeline stages.
@@ -776,7 +776,14 @@ It:
 2. Reads `replay_sufficiency.jsonl` (AUD-09a, H0) and `replay_results.jsonl`
    (AUD-09b, H3) — **read-only, no new fields requested of either artefact**.
 3. For each `REGISTERED`/`PARKED_INSUFFICIENT_DATA`/`EVALUATING` hypothesis,
-   recomputes whether `min_station_days` is now met **per stratum**, using
+   recomputes whether `min_station_days` is now met **per stratum** [Note,
+   2026-09-25: this repo's DoD (D1-D13) never actually requires per-stratum
+   accrual for a look-taking registration — `min_station_days` is checked as a
+   single pooled count in the implemented triage runner and in both step-8
+   horizon rulings (`H-ARCHIVE-RECAL-2026-09`, `H-NO-SIDE-2026-09`); this
+   sentence is aspirational plan text, not the shipped behavior, and is left
+   uncorrected in place rather than silently rewritten — see the dated
+   amendment after step 9], using
    the census's own `(station, climate_day)` sufficiency verdicts joined to
    `replay_results.jsonl`'s completed rows -- **counting only completed rows
    carrying `fills >= 1`**, per SS6.1's zero-take rule, so a run of `fills = 0`
@@ -1208,6 +1215,55 @@ for something else":
    registered hypotheses report `PARKED_INSUFFICIENT_DATA` with a reason that
    matches §6.3's stated evidence, and that the run adds no new decisions,
    orders, or state to the live path.
+
+### Dated amendment, 2026-09-25 — step 8/9 outcome and remainder scope
+
+Both step-8 rulings issued this date (`docs/evidence/RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md`,
+`docs/evidence/RULING_H-NO-SIDE-2026-09_horizon_2026-09-25.md`), each drafted
+and its own §Peer review section committed together in `05f272f` — which git
+cannot show as an independent pass, since same-commit authorship and review
+are indistinguishable from the history alone. Both rulings have since received
+a genuinely separate, independently-committed peer pass appended in `329380f`
+(`docs(aud-18): independent peer passes on both step-8 horizon rulings`):
+
+- `H-NO-SIDE-2026-09` — independent pass by `prediction-market-reviewer`:
+  **ENDORSED-WITH-NOTES** (recomputed MDE 0.089000 matches; disposition
+  `UNDERPOWERED_NOT_REGISTERED` follows mechanically from
+  `register_hypothesis` §6.1's pinned formula; one textual erratum on the
+  freeze-clause direction, verdict unaffected — `freeze_commit` `49261a5`
+  precedes the ruling commit `05f272f`, not the reverse as the ruling's §0
+  prose states; read §0 as "fixed before this ruling's issuance"). The
+  appended independent pass, not the same-commit §Peer review section, is this
+  ruling's evidential signature of record. Host registration of
+  `H-NO-SIDE-2026-09` as `UNDERPOWERED_NOT_REGISTERED` — via
+  `scripts/analysis/hypothesis_register.py --register-underpowered
+  H-NO-SIDE-2026-09` — proceeds on this basis.
+- `H-ARCHIVE-RECAL-2026-09` — independent pass by `mle-reviewer`:
+  **CONFIRMED-WITH-NOTES**, closing the ruling's own §137 condition ("ENDORSED
+  status subject to peer confirmation of the corpus rationale"). MDE recomputes
+  exactly at n=300/600/1200; both plausibility-bound comparators predate
+  `freeze_commit` and fall outside this hypothesis's SEARCH window; no leakage
+  found. Registration of `H-ARCHIVE-RECAL-2026-09` is therefore **unblocked**,
+  but — per this same-dated remainder slice's own scope decision — it is
+  **registered in a follow-up slice, not this one**: this change's CLI
+  (`hypothesis_register.py --register-underpowered`) deliberately offers no
+  choice for `H-ARCHIVE-RECAL-2026-09` (`ARCHIVE_RECAL_HYPOTHESIS_ID` is named
+  only to be refused, per `test_archive_recal_is_not_a_registrable_choice`) —
+  a narrower host action than what the ruling now permits, not a disagreement
+  with it.
+
+**Re-issue path, documented only (not built this slice):** a hypothesis this
+programme later wants to re-attempt under different design inputs (e.g. an
+AUD-12 measured-slippage update, per each ruling's §5/§6 provisional-flag
+clause) is a NEW `hypothesis_id` (e.g. `H-NO-SIDE-2026-09-R2`) with its own
+ruling and its own peer section, registered through the same check-before-write
+path (`register_and_persist`); the superseded id's ledger line stays as
+zero-look history (append-only ledger, §6.2; `PREREG_v2 §1.v`).
+`DuplicateHypothesisIdError` is the mechanical guard against silently reusing
+an id instead. If a re-issued design would resolve `REGISTERED` rather than
+`UNDERPOWERED_NOT_REGISTERED`/`CLOSED`, the CLI in its current form refuses it
+(no zero-look CLI path exists for a look-taking outcome) — extending that is
+out of scope here (a Phase B item).
 
 ## 8. Measurable acceptance criteria and required evidence
 

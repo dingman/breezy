@@ -59,6 +59,7 @@ from breezy.settlement.current_rung_hold_v2 import (  # noqa: E402
 )
 from breezy.settlement.trial_scorer import ScoredTrial  # noqa: E402
 from hypothesis_register import (  # noqa: E402
+    main as register_main,
     register_forecast_taker_closed_disposition,
 )
 
@@ -821,3 +822,81 @@ def test_unknown_ledger_schema_emits_one_critical_and_exits_nonzero(tmp_path: Pa
     assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_FAILED"
     assert "99" in alerts[0]["detail"]
     assert _looks(tmp_path) == []
+
+
+def test_triage_clean_on_cli_written_closed_plus_no_side_ledger(tmp_path: Path) -> None:
+    """T10 -- characterisation. A ledger written entirely through the
+    `hypothesis_register` CLI (CLOSED forecast-taker + NO-SIDE
+    UNDERPOWERED_NOT_REGISTERED, both zero-look) triages CLEAN and never
+    touches an AUD-09 replay artefact, because `run`'s `look_taking` filter
+    (`hypothesis_triage.py`: `[record for record in records if not
+    record.is_zero_look]`) excludes both. This fixture deliberately writes no
+    replay_sufficiency.jsonl/replay_results.jsonl -- CLEAN never needs them.
+
+    Mutation evidence: flipping the NO-SIDE record's `is_zero_look` to
+    `False` on disk (simulating a bug that miscounts it as look-taking) makes
+    triage treat it as an active look-taking hypothesis, which then requires
+    AUD-09 artefacts this fixture never wrote -- `_load_aud09` raises
+    `_TriageFailure("absent AUD-09 artefact")`, `main()` emits exactly one
+    CRITICAL `HYPOTHESIS_TRIAGE_FAILED` alert, and the process exits 1. This
+    proves CLEAN is not a no-op default the runner falls into unconditionally.
+    """
+    path = _ledger(tmp_path)
+    assert (
+        register_main(
+            [
+                "--derived-root",
+                str(tmp_path),
+                "--registered-at",
+                "2026-09-20",
+                "--freeze-commit",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "--register-forecast-taker-closed",
+            ]
+        )
+        == 0
+    )
+    assert (
+        register_main(
+            [
+                "--derived-root",
+                str(tmp_path),
+                "--registered-at",
+                "2026-09-25",
+                "--register-underpowered",
+                "H-NO-SIDE-2026-09",
+            ]
+        )
+        == 0
+    )
+    before_bytes = path.read_bytes()
+
+    proc, alerts = _run(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "CLEAN" in proc.stdout
+    assert alerts == []
+    assert _looks(tmp_path) == []
+    assert not _evaluations(tmp_path).exists()
+    assert not (tmp_path / "alert-log.jsonl").exists()
+    assert path.read_bytes() == before_bytes
+
+    # Mutation: corrupt the NO-SIDE record's is_zero_look on disk.
+    records = [
+        json.loads(line) for line in before_bytes.decode("utf-8").splitlines() if line.strip()
+    ]
+    mutated = [
+        {**record, "is_zero_look": False}
+        if record["hypothesis_id"] == "H-NO-SIDE-2026-09"
+        else record
+        for record in records
+    ]
+    path.write_text(
+        "\n".join(json.dumps(record, sort_keys=True) for record in mutated) + "\n",
+        encoding="utf-8",
+    )
+
+    proc2, alerts2 = _run(tmp_path)
+    assert proc2.returncode == 1
+    assert len(alerts2) == 1
+    assert alerts2[0]["severity"] == "CRITICAL"
+    assert alerts2[0]["event"] == "HYPOTHESIS_TRIAGE_FAILED"
