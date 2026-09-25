@@ -66,6 +66,7 @@ import argparse
 import datetime as dt
 import itertools
 import math
+import re
 import statistics
 import sys
 from collections.abc import Mapping, Sequence
@@ -106,10 +107,13 @@ __all__ = [
     "FAMILY",
     "MARKET_ASK",
     "MARKET_MID",
+    "QUALIFYING_ASK_MIN",
+    "QUALIFYING_SUM_ASK_MAX",
     "STATION_TIME_ZONES",
     "ClusterCI",
     "IncompleteLadderError",
     "LookAheadError",
+    "QualifyingRateReport",
     "RungEvent",
     "RungInstant",
     "SumAskRow",
@@ -118,14 +122,18 @@ __all__ = [
     "assert_complete_partition",
     "bootstrap_brier_difference_ci",
     "brier",
+    "build_artefact",
     "build_rung_probabilities",
     "build_station_day_events",
+    "compute_qualifying_rate",
     "decision_instant_ns",
     "first_liftable_at_or_after",
     "hurdle",
     "mu_sigma_at_instant",
     "paired_brier",
     "paired_brier_ci",
+    "parse_forecast_archive_gaps",
+    "render_qualifying_rate_report",
     "sum_ask_row",
     "to_trials",
 ]
@@ -614,6 +622,207 @@ def select_reading(
 
 
 # ---------------------------------------------------------------------------
+# Step-5 qualifying-rate window (AUD-02 completion plan §3)
+#
+# Definition, from ``docs/evidence/WP7b_MARKET_AS_FORECASTER_2026-09-20.md``
+# (frozen confirmatory region, lines 203-208): an event qualifies when its OWN
+# ``yes_ask >= 0.70`` AND its station-day's ``sum(ask)`` over the complete
+# partition is ``<= 1.20``, at the pre-declared 09:00 LST instant. NO new
+# predicate is introduced: ``ask_events`` (built from the L0 YES ask, no bid
+# required -- the NO leg is not captured) and ``sum_ask_rows`` are the
+# existing values §4/§2 already compute; this section only filters and counts
+# them over a climate-day window. The frozen region opened 2026-09-21.
+# ---------------------------------------------------------------------------
+
+#: §3's qualifying threshold on a single rung's YES ask.
+QUALIFYING_ASK_MIN: Final[float] = 0.70
+
+#: §3's qualifying ceiling on the station-day's Σask over the complete partition.
+QUALIFYING_SUM_ASK_MAX: Final[float] = 1.20
+
+_ARCHIVE_GAP_RE: Final[re.Pattern[str]] = re.compile(
+    r"FORECAST ARCHIVE GAP for (\S+):.*\((\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})\)"
+)
+
+
+def parse_forecast_archive_gaps(notes: Sequence[str]) -> tuple[tuple[str, dt.date, dt.date], ...]:
+    """Extract ``(icao, start, end)`` gap ranges from the corpus load's own notes.
+
+    The notes are produced by ``wp7_realised_pnl_falsification._load_corpus``
+    (``FORECAST ARCHIVE GAP for <icao>: ... (<start>..<end>)``); this is a
+    read of that existing, already-computed fact, not a new detector.
+    """
+    gaps: list[tuple[str, dt.date, dt.date]] = []
+    for note in notes:
+        match = _ARCHIVE_GAP_RE.search(note)
+        if match is None:
+            continue
+        icao, start, end = match.groups()
+        gaps.append((icao, dt.date.fromisoformat(start), dt.date.fromisoformat(end)))
+    return tuple(gaps)
+
+
+def _in_window(day: dt.date, *, since: dt.date, until: dt.date | None) -> bool:
+    """Inclusive on both ends: ``since <= day`` and, if given, ``day <= until``."""
+    return since <= day and (until is None or day <= until)
+
+
+def _window_overlaps_gap(
+    *, since: dt.date, until: dt.date | None, gap_start: dt.date, gap_end: dt.date
+) -> bool:
+    if until is None:
+        return gap_end >= since
+    return gap_start <= until and gap_end >= since
+
+
+@dataclass(frozen=True, slots=True)
+class QualifyingRateReport:
+    """The step-5 qualifying-rate measurement over a climate-day window.
+
+    ``station_days_in_window`` is the "n admitted" the report line names --
+    the count of station-days whose complete-partition Σask is known in the
+    window, whether or not they qualify. It is the denominator; it is never
+    left implicit or reconstructed by a reader from the qualifying count.
+    """
+
+    since: dt.date
+    until: dt.date | None
+    gap_ranges: tuple[tuple[str, dt.date, dt.date], ...]
+    station_days_in_window: int
+    qualifying_events: int
+    qualifying_station_days: int
+
+    @property
+    def gap_intersects_window(self) -> bool:
+        return any(
+            _window_overlaps_gap(since=self.since, until=self.until, gap_start=start, gap_end=end)
+            for _icao, start, end in self.gap_ranges
+        )
+
+    @property
+    def no_data(self) -> bool:
+        return self.station_days_in_window == 0
+
+
+def compute_qualifying_rate(
+    *,
+    ask_events: Sequence[RungEvent],
+    sum_ask_rows: Sequence[SumAskRow],
+    notes: Sequence[str],
+    since: dt.date,
+    until: dt.date | None = None,
+) -> QualifyingRateReport:
+    """Count qualifying events and station-days in ``[since, until]`` (both inclusive).
+
+    A rung-event qualifies iff its own ask meets ``QUALIFYING_ASK_MIN`` AND its
+    station-day's Σask (from ``sum_ask_rows``, already verified over a
+    complete partition -- §4) is at or under ``QUALIFYING_SUM_ASK_MAX``. A
+    rung-event whose station-day carries no ``sum_ask_rows`` entry in the
+    window is not counted: sum(ask) is undefined for it, so the predicate is
+    undefined too, not vacuously true.
+    """
+    sum_ask_by_day = {
+        (row.station, row.climate_day): row.sum_ask
+        for row in sum_ask_rows
+        if _in_window(row.climate_day, since=since, until=until)
+    }
+    qualifying_station_days: set[tuple[str, dt.date]] = set()
+    qualifying_events = 0
+    for event in ask_events:
+        if not _in_window(event.climate_day, since=since, until=until):
+            continue
+        key = (event.station, event.climate_day)
+        sum_ask = sum_ask_by_day.get(key)
+        if sum_ask is None:
+            continue
+        if event.ask >= QUALIFYING_ASK_MIN and sum_ask <= QUALIFYING_SUM_ASK_MAX:
+            qualifying_events += 1
+            qualifying_station_days.add(key)
+    return QualifyingRateReport(
+        since=since,
+        until=until,
+        gap_ranges=parse_forecast_archive_gaps(notes),
+        station_days_in_window=len(sum_ask_by_day),
+        qualifying_events=qualifying_events,
+        qualifying_station_days=len(qualifying_station_days),
+    )
+
+
+def render_qualifying_rate_report(report: QualifyingRateReport) -> str:
+    """Render the step-5 window report. Never a bare 0/0 rate or NaN on no data."""
+    until_text = "open" if report.until is None else report.until.isoformat()
+    lines = [
+        "## Step-5 qualifying rate (AUD-02 completion plan §3)",
+        "",
+        (
+            "`yes_ask >= 0.70` AND `sum(ask) <= 1.20` over the complete partition, at the "
+            "09:00 LST instant; YES side only (the NO leg is not captured)."
+        ),
+        "",
+        (
+            f"Window (climate-day, inclusive both ends): since={report.since.isoformat()} "
+            f"until={until_text}. Station-days admitted in window (n): "
+            f"**{report.station_days_in_window}**."
+        ),
+    ]
+    if report.gap_ranges:
+        gap_text = "; ".join(
+            f"{icao} {start.isoformat()}..{end.isoformat()}"
+            for icao, start, end in report.gap_ranges
+        )
+        if report.gap_intersects_window:
+            lines.append(f"- FORECAST ARCHIVE GAP intersects this window: {gap_text}")
+        else:
+            lines.append(f"- FORECAST ARCHIVE GAP(s) recorded, outside this window: {gap_text}")
+    else:
+        lines.append("- no FORECAST ARCHIVE GAP recorded for this corpus load")
+
+    if report.no_data:
+        if report.gap_intersects_window:
+            lines.append("- qualifying rate: **NO DATA (archive gap)** -- n=0 station-days")
+        else:
+            lines.append("- qualifying rate: **NO DATA** -- n=0 station-days in window")
+    else:
+        rate = report.qualifying_station_days / report.station_days_in_window
+        lines.append(
+            f"- qualifying events: {report.qualifying_events}; qualifying station-days: "
+            f"{report.qualifying_station_days} of {report.station_days_in_window} "
+            f"({rate:.4f})"
+        )
+    return "\n".join(lines)
+
+
+def build_artefact(
+    collected: Collected, *, since: dt.date | None, until: dt.date | None
+) -> str:
+    """The full rendered artefact: ``render()``, plus the step-5 section iff ``since`` is set.
+
+    With ``since=None`` this is byte-identical to ``render(collected)`` -- the
+    default CLI path (no ``--since``/``--until``) never appends anything.
+    """
+    artefact = render(collected)
+    if since is None:
+        return artefact
+    report = compute_qualifying_rate(
+        ask_events=collected.ask_events,
+        sum_ask_rows=collected.sum_ask_rows,
+        notes=collected.notes,
+        since=since,
+        until=until,
+    )
+    return artefact + "\n" + render_qualifying_rate_report(report) + "\n"
+
+
+def _parse_climate_day(value: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid climate-day {value!r}; expected YYYY-MM-DD"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1080,10 +1289,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--tape", type=Path, default=DEFAULT_QUOTE_TAPE_CATALOG)
     parser.add_argument("--corpus-json", type=Path, default=DEFAULT_CORPUS_JSON)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--since",
+        type=_parse_climate_day,
+        default=None,
+        help=(
+            "step-5 qualifying-rate window: climate-day lower bound (YYYY-MM-DD), "
+            "inclusive. Adds a report section; the default output is unchanged "
+            "when this is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--until",
+        type=_parse_climate_day,
+        default=None,
+        help=(
+            "step-5 qualifying-rate window: climate-day upper bound (YYYY-MM-DD), "
+            "inclusive. Requires --since."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.until is not None and args.since is None:
+        parser.error("--until requires --since")
+    if args.since is not None and args.until is not None and args.since > args.until:
+        parser.error(f"--since {args.since.isoformat()} is after --until {args.until.isoformat()}")
+
     collected = collect(tape_root=args.tape, corpus_json=args.corpus_json)
-    artefact = render(collected)
+    artefact = build_artefact(collected, since=args.since, until=args.until)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(artefact, encoding="utf-8")
     print(artefact)
