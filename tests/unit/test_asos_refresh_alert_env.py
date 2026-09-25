@@ -128,8 +128,6 @@ def test_main_logs_alert_egress_status_before_resolving_the_sink_env_variant(
     end for the refresh unit specifically, mirroring the notifier's own
     test file 1:1 so the two units' alert-delivery contracts are reviewable
     side by side."""
-    import sys
-
     scripts_analysis_dir = _REPO_ROOT / "scripts" / "analysis"
     if str(scripts_analysis_dir) not in sys.path:
         sys.path.insert(0, str(scripts_analysis_dir))
