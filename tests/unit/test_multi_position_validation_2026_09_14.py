@@ -43,6 +43,7 @@ _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
+import aud06a_qty_envelope_sweep as sweep
 import crh_group_sequential_boundaries as gs
 
 _ARTEFACT_PATH = _REPO_ROOT / "deploy" / "families" / "gs_boundary_pm_us_crh_v2.json"
@@ -175,7 +176,18 @@ def test_under_h0_the_combined_statistic_has_unit_variance() -> None:
         "correctly calibrated; Increment B (qty>1) needs the boundary "
         "re-validated (plan Rev3 S3 'Increment B: re-run (ii) with qty>1') "
         "before it can rely on this artefact. Per R3-3 disposition, this "
-        "does NOT block Increment A and the artefact is NOT re-solved here."
+        "does NOT block Increment A and the artefact is NOT re-solved here. "
+        "AUD-06a (2026-09-25, docs/evidence/RULING_r11_qty_envelope_2026-09-25.md): "
+        "re-validation at a dimensionless qty-envelope sweep (Amendment C, "
+        "MULTI_POSITION_PER_STATION_2026-09-14.md) reproduced both figures, "
+        "found the recorded mechanism's monotonicity STRONGLY supported "
+        "(Spearman rho=0.83, p=0.0001 across 29 cells) but returned an "
+        "INDETERMINATE mechanism verdict because the qty=1 control anchor "
+        "itself departs from the artefact's assumed schedule under a "
+        "realistic (non-uniform, cheap) BE prior -- a confound unrelated to "
+        "qty. No envelope was published; this xfail is unchanged and stays "
+        "strict pending a completed grid or a reconsidered control-anchor "
+        "tolerance."
     ),
 )
 def test_under_h0_the_ld_obf_boundary_crossing_rate_is_at_most_alpha() -> None:
@@ -251,3 +263,292 @@ def test_observed_information_cannot_exceed_i_max_within_n_max() -> None:
 
     assert max_variance <= 0.25 + 1e-9
     assert i_max == pytest.approx(0.25 * n_max)
+
+
+# ---------------------------------------------------------------------------
+# AUD-06a — R-11 qty envelope sweep (Amendment C to
+# MULTI_POSITION_PER_STATION_2026-09-14.md, replacing validation-slice item
+# (ii)). See scripts/analysis/aud06a_qty_envelope_sweep.py.
+# ---------------------------------------------------------------------------
+
+
+def test_the_crossing_rate_is_reported_per_qty_envelope() -> None:
+    """`run_cell` reports a `CellResult` carrying `q_max` and its realised
+    one-sided crossing rate, so the sweep table is a function of the qty
+    envelope rather than one point estimate."""
+    cell_small = sweep.CellSpec(
+        q_max=1, dispersion=sweep.DispersionSpec("all_equal"), k=1, side_mix="all_yes"
+    )
+    cell_large = sweep.CellSpec(
+        q_max=3, dispersion=sweep.DispersionSpec("all_equal"), k=2, side_mix="mixed"
+    )
+    result_small = sweep.run_cell(cell_small, cell_index=0, seed=1, n_reps=500)
+    result_large = sweep.run_cell(cell_large, cell_index=1, seed=2, n_reps=500)
+    assert result_small.q_max == 1
+    assert result_large.q_max == 3
+    assert 0.0 <= result_small.crossing_rate <= 1.0
+    assert 0.0 <= result_large.crossing_rate <= 1.0
+
+
+def test_the_simulated_null_reproduces_the_registered_h0_variance_exactly() -> None:
+    """Closed-form check of `Var_H0(X_sd)` against §6/Amendment §3 at k=1
+    qty=1, and at k=2 mixed qty including a YES/NO pair whose cross term is
+    POSITIVE (the L-41 guard: a mis-specified null must be caught here)."""
+    # k=1, qty=1: Var = BE(1-BE)
+    be = 0.3
+    row = StratumRow(entry_ask=Decimal(str(be)), fee=Decimal(0), held=False, station="MIA")
+    draw = combine_station_day((row,))
+    assert draw.variance == pytest.approx(be * (1 - be))
+
+    # k=2 mixed qty, YES/NO pair: cross term is POSITIVE (s_i*s_j = -1)
+    be_yes, be_no = 0.2, 0.3
+    qty_yes, qty_no = 2.0, 3.0
+    row_yes = StratumRow(
+        entry_ask=Decimal(str(be_yes)), fee=Decimal(0), held=False, station="MIA",
+        qty=Decimal(str(qty_yes)), side="yes", rung="r0",
+    )
+    row_no = StratumRow(
+        entry_ask=Decimal(str(be_no)), fee=Decimal(0), held=False, station="MIA",
+        qty=Decimal(str(qty_no)), side="no", rung="r1",
+    )
+    draw_mixed = combine_station_day((row_yes, row_no))
+    q_yes = be_yes
+    q_no = 1.0 - be_no
+    expected_variance = (
+        qty_yes**2 * q_yes * (1 - q_yes)
+        + qty_no**2 * q_no * (1 - q_no)
+        - 2.0 * qty_yes * qty_no * (1.0) * (-1.0) * q_yes * q_no
+    )
+    assert draw_mixed.variance == pytest.approx(expected_variance)
+    # The cross term itself (before the "-2*..." sign) is POSITIVE:
+    cross_term = -2.0 * qty_yes * qty_no * (1.0) * (-1.0) * q_yes * q_no
+    assert cross_term > 0
+
+
+def test_an_inadmissible_station_day_is_refused_at_draw_construction() -> None:
+    """A station-day whose cell probabilities sum above 1 is refused by
+    `combine_station_day` itself -- the sampler's rejection loop exists so
+    such a draw never reaches `score_combined`."""
+    rows = tuple(
+        StratumRow(entry_ask=Decimal("0.6"), fee=Decimal(0), held=False, station="MIA")
+        for _ in range(2)
+    )
+    from breezy.settlement.current_rung_hold_v2 import StationDayAdmissionRefusal
+
+    with pytest.raises(StationDayAdmissionRefusal):
+        combine_station_day(rows)
+
+
+def test_the_realised_information_trajectory_is_reported_per_look() -> None:
+    """Each `CellResult` reports `delta_t`/`var_s` at every look
+    `n_k in {10,...,160}` -- the mechanism instrument (Amendment C)."""
+    cell = sweep.CellSpec(
+        q_max=2, dispersion=sweep.DispersionSpec("two_point"), k=2, side_mix="all_yes"
+    )
+    result = sweep.run_cell(cell, cell_index=0, seed=42, n_reps=300)
+    assert result.look_ns == tuple(range(10, 161, 10))
+    assert len(result.delta_t) == len(result.look_ns)
+    assert len(result.var_s) == len(result.look_ns)
+    assert result.max_abs_delta_t == max(abs(d) for d in result.delta_t)
+
+
+def test_the_envelope_records_the_be_prior_support_and_its_staleness_predicate() -> None:
+    """The artefact records the `BE`-prior's sampled support (min/p25/median
+    /p75/max/IQR) and ships a staleness predicate function."""
+    support = sweep.observed_ask_support()
+    for key in ("n", "min", "p25", "median", "p75", "max", "iqr"):
+        assert key in support
+    assert support["min"] <= support["p25"] <= support["median"] <= support["p75"] <= support["max"]
+    assert callable(sweep.envelope_is_stale)
+
+
+def test_a_be_prior_outside_the_recorded_support_marks_the_envelope_stale() -> None:
+    """Both staleness conditions fire: live median outside `[p25,p75]`, and
+    live IQR drifted more than the recorded thresholds."""
+    support = sweep.observed_ask_support()
+    # Condition 1: live median far outside [p25, p75]
+    assert sweep.envelope_is_stale((0.99, 0.99, 0.99, 0.99), recorded_support=support)
+    # Condition 2: live IQR blown out relative to the recorded IQR
+    wide_asks = tuple(i / 100 for i in range(1, 100))
+    assert sweep.envelope_is_stale(wide_asks, recorded_support=support)
+    # Not stale: the observed sample itself, replayed as "live"
+    assert not sweep.envelope_is_stale(sweep.OBSERVED_ASKS, recorded_support=support)
+
+
+def test_the_sampler_sets_side_and_the_mixed_cell_contains_both_legs() -> None:
+    """The sampler sets `side` explicitly (never defaulting every row to
+    `"yes"`), and a `mixed` cell's draw contains at least one YES and one
+    NO leg."""
+    rng = random.Random(7)
+    cell = sweep.CellSpec(
+        q_max=2, dispersion=sweep.DispersionSpec("all_equal"), k=2, side_mix="mixed"
+    )
+    rows = sweep.sample_station_day(rng, cell)
+    sides = {row.side for row in rows}
+    assert sides == {"yes", "no"}
+
+
+def test_a_mixed_side_pair_raises_station_day_variance_relative_to_an_all_yes_pair() -> None:
+    """At equal `q`/`qty`, a YES/NO pair has HIGHER station-day variance
+    than a YES/YES pair (`combine_station_day:344`'s sign argument)."""
+    be = 0.3
+    qty = Decimal(2)
+    row_yes_a = StratumRow(
+        entry_ask=Decimal(str(be)), fee=Decimal(0), held=False, station="MIA",
+        qty=qty, side="yes", rung="r0",
+    )
+    row_yes_b = StratumRow(
+        entry_ask=Decimal(str(be)), fee=Decimal(0), held=False, station="MIA",
+        qty=qty, side="yes", rung="r1",
+    )
+    row_no_b = StratumRow(
+        entry_ask=Decimal(str(be)), fee=Decimal(0), held=False, station="MIA",
+        qty=qty, side="no", rung="r1",
+    )
+    variance_all_yes = combine_station_day((row_yes_a, row_yes_b)).variance
+    variance_mixed = combine_station_day((row_yes_a, row_no_b)).variance
+    assert variance_mixed > variance_all_yes
+
+
+def test_the_no_side_sampler_produces_unbiased_held_under_h0() -> None:
+    """A k=1 `all_no` cell's `held` rate must match `E[held_i] = BE_i` under
+    H0 (`build_stratum_v2` docstring: "under H0 E[held_i] = BE_i on both YES
+    and NO") -- `held` is the PER-SIDE truth (`StratumRow` docstring), not
+    the same `i == holder` test for both sides (that instead gives
+    `E[held_i] = q_i = 1 - BE_i`, biased). Checked via a single fixed ask
+    (never bootstrapped) so the true `BE_i` is known exactly, over 20000
+    draws at `q_max=1` (dispersion is inert at q_max=1)."""
+    cell = sweep.CellSpec(
+        q_max=1, dispersion=sweep.DispersionSpec("all_equal"), k=1, side_mix="all_no"
+    )
+    rng = random.Random(2026)
+    fixed_ask = 0.3  # BE_i = ask = 0.3; E[held_i] = BE_i for a NO leg too
+    n_draws = 20000
+    original_asks = sweep.OBSERVED_ASKS
+    sweep.OBSERVED_ASKS = (fixed_ask,)
+    try:
+        rows_sample = [sweep.sample_station_day(rng, cell) for _ in range(n_draws)]
+    finally:
+        sweep.OBSERVED_ASKS = original_asks
+    assert all(rows[0].side == "no" for rows in rows_sample)
+    held_count = sum(1 for rows in rows_sample if rows[0].held)
+    empirical_rate = held_count / n_draws
+    expected_rate = fixed_ask
+    assert empirical_rate == pytest.approx(expected_rate, abs=0.02), (
+        f"empirical held-rate {empirical_rate!r} != expected BE_i={expected_rate!r} "
+        "-- the NO-side sampler is biased"
+    )
+
+
+def test_the_mixed_cell_never_samples_an_inadmissible_station_day() -> None:
+    """1000 sampled `mixed` station-days at k=2 and k=3 never raise a
+    `StationDayAdmissionRefusal` when re-fed through `combine_station_day` --
+    the sampler's rejection loop keeps its own output admissible."""
+    from breezy.settlement.current_rung_hold_v2 import StationDayAdmissionRefusal
+
+    rng = random.Random(99)
+    for k in (2, 3):
+        cell = sweep.CellSpec(
+            q_max=3, dispersion=sweep.DispersionSpec("cap_shaped", r=5), k=k, side_mix="mixed"
+        )
+        for _ in range(1000):
+            rows = sweep.sample_station_day(rng, cell)
+            try:
+                combine_station_day(rows)
+            except StationDayAdmissionRefusal:
+                pytest.fail("sampler produced an inadmissible mixed station-day")
+
+
+def test_the_cap_shaped_dispersion_reads_no_operator_reserved_value() -> None:
+    """The `R` grid is a literal dimensionless sequence; the sweep module's
+    source contains no cap read, no currency figure and no cap-derived
+    quotient."""
+    source = Path(sweep.__file__).read_text(encoding="utf-8")
+    forbidden = (
+        "operator_controls", "per_position", "daily_budget", "PERMIT_BUDGETS", "os.environ",
+    )
+    for token in forbidden:
+        assert token not in source, f"sweep module reads or references {token!r}"
+    assert sweep.CAP_SHAPED_R_GRID == (2, 3, 5, 8, 13, 21)
+
+
+def test_the_sweep_retains_no_per_replication_state() -> None:
+    """`run_cell` holds no growing container across reps -- only scalar
+    accumulators and a length-`n_max/look_step` per-look history survive a
+    replication (the `replay_driver_memory_grows_unbounded` failure mode)."""
+    import inspect
+
+    source = inspect.getsource(sweep.run_cell)
+    rep_loop_start = source.index("for _rep in range(n_reps):")
+    rep_loop_end = source.index("\n    delta_t = []")
+    rep_loop_body = source[rep_loop_start:rep_loop_end]
+    assert ".append(" not in rep_loop_body, (
+        "run_cell's per-replication loop retains state via .append(...) -- "
+        "only fixed-size scalar accumulators (sum_i/sum_s/sum_s2, length "
+        "n_max/look_step) may survive a replication"
+    )
+
+
+def test_a_chunked_run_produces_a_byte_identical_table_to_a_single_run(tmp_path: Path) -> None:
+    """Cells `0:6` in two chunks (`0:3` then `3:6`) assemble to a table
+    byte-identical to a single `0:6` run -- chunk boundaries cannot change
+    the result because the seed is per-cell."""
+    chunked_path = tmp_path / "chunked.jsonl"
+    sweep.run_chunk(0, 3, out_path=chunked_path, n_reps=50)
+    sweep.run_chunk(3, 6, out_path=chunked_path, n_reps=50)
+
+    single_path = tmp_path / "single.jsonl"
+    sweep.run_chunk(0, 6, out_path=single_path, n_reps=50)
+
+    chunked_results = [r.to_json() for r in sweep.load_results(chunked_path)]
+    single_results = [r.to_json() for r in sweep.load_results(single_path)]
+    assert chunked_results == single_results
+
+
+def test_a_mixed_side_cell_at_k_equals_one_is_skipped_not_sampled_as_all_yes() -> None:
+    """`(k=1, mixed)` is undefined and absent from the canonical cell grid
+    entirely -- never silently degraded to `all_yes`."""
+    assert (1, "mixed") not in sweep.ADMISSIBLE_K_SIDE_MIX
+    for cell in sweep.ALL_CELLS:
+        assert not (cell.k == 1 and cell.side_mix == "mixed")
+    assert len(sweep.ALL_CELLS) == 320
+
+
+def test_the_mechanism_verdict_is_computed_not_eyeballed() -> None:
+    """The driver emits `CONFIRMED`/`REFUTED`/`INDETERMINATE` with `rho`,
+    its permutation p-value and the contributing cell count; the same table
+    always yields the same verdict."""
+    too_few = [
+        sweep.CellResult(
+            cell_index=i, label=f"c{i}", q_max=1, dispersion="all_equal", r=None, k=1,
+            side_mix="all_yes", seed=i, n_reps=100, crossing_count=2, crossing_rate=0.02,
+            cp_upper=0.05, cp_lower=0.001, look_ns=(10, 20), delta_t=(0.0, 0.0), var_s=(1.0, 1.0),
+            max_abs_delta_t=0.0,
+        )
+        for i in range(5)
+    ]
+    verdict_few = sweep.compute_mechanism_verdict(too_few)
+    assert verdict_few.verdict == "INDETERMINATE"
+    assert verdict_few.n_cells == 5
+
+    synthetic = []
+    for i in range(30):
+        max_dt = i * 0.01
+        rate = min(0.5, 0.01 + max_dt * 2.0)
+        side_mix = "all_yes"
+        synthetic.append(
+            sweep.CellResult(
+                cell_index=i, label=f"c{i}", q_max=(i % 5) + 1, dispersion="all_equal", r=None,
+                k=1 if i == 0 else 2, side_mix=side_mix, seed=i, n_reps=20000,
+                crossing_count=int(rate * 20000), crossing_rate=rate,
+                cp_upper=min(1.0, rate + 0.005), cp_lower=max(0.0, rate - 0.005),
+                look_ns=(10, 20), delta_t=(max_dt, max_dt), var_s=(1.0, 1.0),
+                max_abs_delta_t=max_dt,
+            )
+        )
+    verdict_1 = sweep.compute_mechanism_verdict(synthetic)
+    verdict_2 = sweep.compute_mechanism_verdict(synthetic)
+    assert verdict_1.verdict == verdict_2.verdict
+    assert verdict_1.rho == verdict_2.rho
+    assert verdict_1.p_value == verdict_2.p_value
+    assert verdict_1.verdict in ("CONFIRMED", "REFUTED", "INDETERMINATE")

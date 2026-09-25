@@ -130,6 +130,86 @@ CODEGRAPH_USED: 9 calls
 `X_sd = Σ_i qty_i·(held_i − BE_i)`;
 `Var_H0(X_sd) = Σ_i qty_i²·BE_i(1−BE_i) − 2·Σ_{i<j} qty_i·qty_j·BE_i·BE_j`;
 `I = Σ_sd Var_H0(X_sd)`; `S = Σ_sd X_sd / √I`; `Var_H0(S) = 1` exactly (station-days independent). Reductions: k=1, qty=1 → byte-identical to `current_rung_hold_v2.score`; k=1, qty>1 → `qty²·BE(1−BE)`, matching PnL's dollar-variance scaling. **Admission gate, enforced at draw construction, never post-hoc:** `Σ_i BE_i ≤ 1` for the station-day, else the whole station-day is refused as `malformed_input` before I/S are touched.
-**S5 is replaced by the validation slice:** (i) closed-form unit tests of the reductions; (ii) a seeded Monte-Carlo under H0 with k∈{1,2,3} mutually exclusive rungs and mixed qty asserting sample Var(S) within tolerance of 1 AND the LD-OBF boundary's realised one-sided crossing rate ≤ α at n_max=160 (load-bearing: the boundary is asymptotically valid, finite-sample accrual shape changes with multi-rung days); (iii) `inputs_sha256` unchanged + the static I_max bound check. Re-validation suffices; a re-solve is required only if (ii) fails. Increment A ships only after (i)-(iii) are green.
+**S5 is replaced by the validation slice:** (i) closed-form unit tests of the reductions; (ii) [SUPERSEDED by Amendment C below, 2026-09-24 — AUD-06a] a seeded Monte-Carlo under H0 with k∈{1,2,3} mutually exclusive rungs and mixed qty asserting sample Var(S) within tolerance of 1 AND the LD-OBF boundary's realised one-sided crossing rate ≤ α at n_max=160 (load-bearing: the boundary is asymptotically valid, finite-sample accrual shape changes with multi-rung days); (iii) `inputs_sha256` unchanged + the static I_max bound check. Re-validation suffices; a re-solve is required only if (ii) fails. Increment A ships only after (i)-(iii) are green.
+
+## Amendment C (2026-09-24, AUD-06a) — item (ii) replaced: qty-envelope sweep, not a single re-run
+
+**Source:** `docs/plans/backlog/AUDIT_2026-09-21/AUD-06a-r11-boundary-revalidation.md` (peer-reviewed to
+100/100, READY). Clears R-11 (`PROGRESS.md`): item (ii)'s single mixed-qty point estimate measured a
+~0.059 one-sided crossing rate against α=0.025 at k∈{1,2,3}, mixed qty∈{1,2,3}
+(`tests/unit/test_multi_position_validation_2026_09_14.py:161-199`, strict `xfail`). This amendment
+replaces item (ii) with a qty-envelope sweep so re-validation is a function of the qty distribution,
+never a single unnamed point (the real Increment-B qty is `floor(cap/ask/lot)*lot`, a function of the
+operator-reserved per-position cap this repo may never read — §5 there).
+
+**New item (ii):** sweep the qty distribution over a dimensionless grid — never the cap itself — and
+report, per cell, the realised one-sided crossing rate, its Clopper-Pearson upper bound, and the
+realised information-accrual trajectory `t_k = I(n_k)/I_max` against the artefact's ASSUMED schedule
+`t_k = n_k/n_max` (the mechanism the strict `xfail` already records: higher qty inflates a
+station-day's variance, so `I` saturates faster than the artefact's schedule assumes, and the
+realised-`t` boundary interpolation undershoots). Increment B's merge gate becomes "the sizing formula
+provably cannot emit a qty outside the validated envelope, and the envelope is not stale" — not "the
+boundary was re-validated once".
+
+**Formulas reused verbatim** (unchanged from R3-3 above, generalised to mixed sides by
+`docs/evidence/PREREG_v3_AMENDMENT_NO_SIDE_2026-09-14.md` §3): `X_sd = Σ_i qty_i·(held_i − BE_i)`;
+`Var_H0(X_sd) = Σ_i qty_i²·q_i(1−q_i) − 2·Σ_{i<j} qty_i·qty_j·s_i·s_j·q_i·q_j` (`s_i=+1` YES, `s_i=-1`
+NO, `q_i=BE_i` YES / `1-BE_i` NO); `I = Σ_sd Var_H0(X_sd)`; `S = Σ_sd X_sd/√I`. The station-day
+admission gate `Σ_i q_i ≤ 1` is enforced at draw construction (rejection sampling), never post-hoc.
+Implemented in `src/breezy/settlement/current_rung_hold_v2.py` (`StratumRow`, `combine_station_day`,
+`score_combined`) — imported, never reimplemented, by
+`scripts/analysis/aud06a_qty_envelope_sweep.py`.
+
+**Sweep axes (dimensionless, seeded):** `q_max ∈ {1,2,3,4,5}`; qty dispersion — `all-equal` (every leg
+at `qty=q_max`), `two-point` (half legs at `qty=1`, half at `qty=q_max`), `cap-shaped`
+(`qty_i = clip(floor(R/ask_i), 1, q_max)`, `R ∈ {2,3,5,8,13,21}`, a dimensionless budget-to-ask ratio,
+never a cap value); rungs per station-day `k ∈ {1,2,3}`; leg side composition
+`side_mix ∈ {all-YES, all-NO, mixed}` (`mixed` undefined and SKIPPED at `k=1`). `ask_i`/`BE_i` are
+drawn from the **observed live/tape ask distribution** — the 9 durable PM.us fills' posted price,
+`docs/evidence/AUD13A_RECONCILIATION_EVIDENCE_2026-09-24.md` §1 (the same read-only source that
+already confirms every real fill today is `qty=1` — no empirical qty>1 data exists, `config.py:255`).
+Total grid: `5 q_max × 8 dispersion sub-cells × 8 admissible (k, side_mix) pairs = 320 cells`
+(`(k=1, mixed)` excluded as inadmissible, not silently sampled as all-YES), at the REGISTERED 20000
+replications/cell (`docs/evidence/PREREG_v3_AMENDMENT_NO_SIDE_2026-09-14.md` §6).
+
+**Methodology, pinned:** 20000 reps/cell (registered figure, comparable to the qty≡1 mixed-side
+study); Clopper-Pearson exact one-sided 95% upper bound (never normal-approximation, which
+under-covers exactly where the safety decision is made); seeds `20260914` for reproduction cells,
+`20260921_000 + cell_index` (disjoint) for the sweep; `Var(S) ∈ [0.95,1.05]` per look at 20000 reps.
+
+**Mechanism verdict, machine-checkable, not eyeballed:** CONFIRMED requires (1) ≥24 contributing
+cells, (2) Spearman `ρ ≥ 0.70` between `max_k|Δt_k|` and the realised crossing rate with a one-sided
+permutation `p < 0.01` (10000 permutations), and (3) the qty≡1 control cell shows `max_k|Δt_k| ≤ 0.01`
+and CP-upper ≤ 0.025. REFUTED if any cell with `max_k|Δt_k| ≤ 0.01` has a crossing-rate CP-lower bound
+above the control's CP-upper bound. Anything else is INDETERMINATE. `ρ ≥ 0.70` / `p < 0.01` are
+REASONED BUILD-SIDE DEFAULTS fixed before the sweep ran, NOT inherited from a registered study —
+unlike the 20000 reps, the CP construction and the `Var(S)` tolerance, which ARE anchored to the
+registered qty≡1 study.
+
+**Output:** the largest `q_max` per `side_mix` whose every swept cell has CP-upper ≤ α=0.025,
+published as `Q_MAX_VALIDATED` plus the artefact's `boundary_inputs_sha256` (unchanged) — `q_max=1`
+(no qty above 1 validates) is an explicitly legitimate result. **Staleness trigger:** the artefact
+records the `BE`-prior's sampled support (`min`/`p25`/`median`/`p75`/`max`/IQR); the envelope is STALE
+— and `Q_MAX_VALIDATED` must not be relied on — when the live 14-day trailing median ask falls outside
+the recorded `[p25,p75]`, or the live IQR drifts by more than +50%/−33% from the recorded IQR. The
+check is fail-closed at the consumer (AUD-06b sizing refuses, never warns) and is evaluated at the
+consumer's gate, never on a timer.
+
+**Result, this run** (`docs/evidence/RULING_r11_qty_envelope_2026-09-25.md`, authoritative table):
+**compute-budget-bounded — 33 of 320 cells run** (calibration `τ_cell=59.50s`, projected full-grid
+5.29 wall-hours, over this session's 2-hour compute allowance; resumable via `--cells FROM:TO` against
+the committed `docs/evidence/aud06a_sweep_cells.jsonl`). Mechanism verdict: **INDETERMINATE** — the
+monotonicity condition is strongly satisfied (Spearman `ρ=0.8331`, permutation `p=0.0001` over 29
+contributing cells) but the qty≡1 control anchor fails (`max_k|Δt_k|=0.365 > 0.01`) for a reason
+unrelated to qty: the observed, realistically-cheap ask distribution (`median=0.22`) makes even the
+`qty=1` control's per-draw variance depart substantially from the artefact's assumed 0.25-per-draw
+schedule. **No envelope is published** (Amendment C: envelope publication is gated on a CONFIRMED
+verdict); the raw partial table shows every run `q_max≥2` cell over `α=0.025` and every run `q_max=1`
+cell (bar the structurally-infeasible `all_no,k=3`) under it, but that is reported as information, not
+a ruling. **No re-solve of the boundary artefact** — R-11's remedy-B fallback triggers only on an
+empty CONFIRMED-mechanism envelope, which did not occur; `boundary_inputs_sha256` is unchanged
+(asserted by `test_the_boundary_inputs_sha256_is_unchanged`). The strict `xfail`
+(`test_under_h0_the_ld_obf_boundary_crossing_rate_is_at_most_alpha`) is unchanged and stays strict, its
+reason extended with a citation to this evidence.
 
 **Increment A (final):** S0 (R3-1) → S1 (+A1 sites, inflight clear) → S3 → S4a (R3-2, R3-3 formula at qty≡1) → validation slice (i)-(iii) → ruling artefact + LESSONS entry. **Increment B:** S2 (depth-capped, cent-safe, log-redacted sizing) → S4b (qty through scorer/store) → re-run (ii) with qty>1.
