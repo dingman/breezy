@@ -889,6 +889,97 @@ def test_build_continuous_rung_hold_strategies_survives_an_unwritable_offer_tape
     assert v3[0].offer_tape.sidecar_errors == 1
 
 
+def test_continuous_builder_defaults_the_diagnostics_summary_to_a_sibling_decisions_dir(
+    tmp_path: Path,
+) -> None:
+    """F-2 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): mirrors the offer-tape
+    default test above -- `diagnostics_summary_path=None` (the live
+    default) resolves under the SAME sibling `decisions/` dir and the SAME
+    boot-day naming convention as the offer tape, and every station shares
+    ONE sink instance."""
+    _write(
+        tmp_path,
+        [
+            _binary(
+                "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                info=_known(station="SFO", day=_DAY),
+            ),
+        ],
+    )
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        order_submission_permit=None,
+    )
+    assert len(v3) == 1
+    sink = v3[0]._diagnostics_summary  # type: ignore[attr-defined]
+    assert sink is not None
+    assert sink._path is not None  # type: ignore[attr-defined]
+    assert sink._path.parent.name == "decisions"  # type: ignore[attr-defined]
+    assert sink._path.parent.parent == tmp_path.parent  # type: ignore[attr-defined]
+    assert sink._path.name == f"diagnostics_summary_{_DAY.isoformat()}.jsonl"  # type: ignore[attr-defined]
+
+
+def test_continuous_builder_honors_an_explicit_diagnostics_summary_path(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        [
+            _binary(
+                "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                info=_known(station="SFO", day=_DAY),
+            ),
+        ],
+    )
+    explicit_path = tmp_path / "explicit_diagnostics.jsonl"
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        order_submission_permit=None,
+        diagnostics_summary_path=explicit_path,
+    )
+    sink = v3[0]._diagnostics_summary  # type: ignore[attr-defined]
+    assert sink is not None
+    assert sink._path == explicit_path  # type: ignore[attr-defined]
+
+
+def test_continuous_builder_resolves_a_real_build_sha_for_every_station(
+    tmp_path: Path,
+) -> None:
+    """R8/D2: every station strategy carries the SAME `build_sha`, resolved
+    ONCE (never per-station) -- proven here by checking it is a real
+    resolved value (this checkout is a git repo), never the `"unknown"`
+    default a harness that skips composition would leave in place."""
+    _write(
+        tmp_path,
+        [
+            _binary(
+                "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                info=_known(station="SFO", day=_DAY),
+            ),
+            _binary(
+                "tc-temp-laxhigh-2026-09-04-gte70lt71f",
+                info=_known(station="LAX", day=_DAY),
+            ),
+        ],
+    )
+    two_stations = {"SFO": _DAY, "LAX": _DAY}
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=two_stations,
+        trial_day_latch_factory=_unused_latch_factory,
+        order_submission_permit=None,
+    )
+    assert len(v3) == 2
+    shas = {strategy._build_sha for strategy in v3}  # type: ignore[attr-defined]
+    assert len(shas) == 1
+    (sha,) = shas
+    assert sha != "unknown"
+
+
 def test_continuous_builder_refuses_a_non_none_permit(tmp_path: Path) -> None:
     """Phase 0 seal: `build_continuous_rung_hold_strategies` refuses a
     non-None `order_submission_permit`, naming Phase 0 in the error."""

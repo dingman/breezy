@@ -65,6 +65,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from pathlib import Path
 
     from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+    from breezy.strategy.current_rung_hold.diagnostics_summary import DiagnosticsSummarySink
     from breezy.strategy.current_rung_hold.offer_tape import OfferTape
     from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
 
@@ -113,6 +114,8 @@ class ContinuousRungHoldBacktestStrategy(ContinuousRungHoldStrategy):
         offer_tape: OfferTape | None = None,
         offer_tape_path: Path | None = None,
         position_evidence_reader: Callable[[], dict[str, object] | None] | None = None,
+        diagnostics_summary: DiagnosticsSummarySink | None = None,
+        build_sha: str = "unknown",
     ) -> None:
         # No `order_submission_permit` parameter exists on this
         # constructor -- PERMIT ISOLATION: this subclass can never be
@@ -130,6 +133,8 @@ class ContinuousRungHoldBacktestStrategy(ContinuousRungHoldStrategy):
             offer_tape_path=offer_tape_path,
             position_evidence_reader=position_evidence_reader,
             phase0_permit_guard=True,
+            diagnostics_summary=diagnostics_summary,
+            build_sha=build_sha,
         )
         #: Internal, backtest-only submit gate. NEVER derived from a real
         #: `OrderSubmissionPermit` -- this subclass never holds one.
