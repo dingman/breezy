@@ -156,12 +156,30 @@ def _read_station_candidates(path: Path) -> tuple[StationCandidate, ...]:
 
 
 def _candidate_rows_to_replay_sufficiency(
-    candidates: Sequence[StationCandidate], *, computed_day: str,
+    candidates: Sequence[StationCandidate],
+    *,
+    computed_day: str,
+    exclude_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[ReplaySufficiency, ...]:
-    """H1: one row per candidate, `CANDIDATE_UNSUPPORTED_STATION`, never queued.
+    """H1: one row per candidate NOT already discovered on the tape,
+    `CANDIDATE_UNSUPPORTED_STATION`, never queued.
 
-    `winner_instance_id` is always `None`: no station outside
-    `SUPPORTED_STATIONS` can ever be selected for replay (plan §6a).
+    `exclude_keys` (AUD-09b dup fix, 2026-09-25) is the set of resolved
+    `(station, climate_day)` keys the tape-derived census already classified
+    via `classify_station_day` in this same run. A candidate register is
+    folded on its own schedule and can still list a station (typically a
+    `REGISTRY_SEED` row) for the SAME still-open UTC day a live instance is
+    already capturing real quotes under -- that collision produced a real
+    duplicate `(station, climate_day)` key in production
+    (`('NYC', '2026-09-25')`, both `CANDIDATE_UNSUPPORTED_STATION` and a
+    real tape-derived row) that `read_replay_sufficiency` correctly refused
+    to silently accept. A key the tape already has a real, data-backed
+    verdict for is skipped here rather than duplicated with this placeholder
+    -- the reader's duplicate-key refusal stays a safety check, not a
+    routine trip.
+
+    `winner_instance_id` is always `None` on every emitted row: no station
+    outside `SUPPORTED_STATIONS` can ever be selected for replay (plan §6a).
     """
     registry = default_registry()
     rows: list[ReplaySufficiency] = []
@@ -176,6 +194,8 @@ def _candidate_rows_to_replay_sufficiency(
                 "token as a best-effort station label",
                 file=sys.stderr,
             )
+        if (station, candidate.last_seen_day) in exclude_keys:
+            continue
         rows.append(
             ReplaySufficiency(
                 schema_version=REPLAY_SUFFICIENCY_SCHEMA_VERSION,
@@ -600,7 +620,11 @@ def run_census(
     )
 
     candidates = _read_station_candidates(station_candidates_path)
-    candidate_rows = _candidate_rows_to_replay_sufficiency(candidates, computed_day=computed_day)
+    candidate_rows = _candidate_rows_to_replay_sufficiency(
+        candidates,
+        computed_day=computed_day,
+        exclude_keys=frozenset(discovered_station_days),
+    )
 
     return build_census(
         station_day_spans=spans,
