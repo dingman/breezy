@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -17,8 +16,6 @@ import pytest
 from breezy.analysis.promotion_criteria import (
     ADAPTED_R5_IDS,
     KILL_CLOCK_MAX_AGE_SECONDS,
-    LIFTING_RULING_RELATIVE,
-    LIFTING_RULING_SHA256,
     PROVISIONAL_TAG,
     AdmissionReport,
     CriterionRow,
@@ -37,7 +34,6 @@ from breezy.analysis.promotion_criteria import (
     evaluate_c_validity,
     paired_ci_comparison,
     render_rationale,
-    resolve_criteria_status,
 )
 from breezy.analysis.replay_results import (
     REPLAY_RESULTS_SCHEMA_VERSION,
@@ -768,9 +764,14 @@ def test_inert_bars_proposal_even_when_every_other_predicate_passes() -> None:
     assert "C-PAIRED" in assembled.inert
 
 
-def test_first_fully_evaluable_run_stays_provisional_without_a_lifting_ruling(
-    tmp_path: Path,
-) -> None:
+def test_a_fully_evaluable_run_with_provisional_status_still_tags_the_output() -> None:
+    """The PROVISIONAL/LIFTED decision is made by the caller (the lifting-ruling
+    path + sha256 check lives in ``scripts/analysis/promotion_proposal.py``,
+    never here -- see ``test_probe_containment.py::
+    test_no_module_under_src_reads_docs_evidence``); this module only ever
+    receives an already-resolved ``criteria_status`` string and must render it
+    faithfully even when every predicate is evaluable.
+    """
     rows = tuple(
         CriterionRow(
             id=name,
@@ -794,36 +795,13 @@ def test_first_fully_evaluable_run_stays_provisional_without_a_lifting_ruling(
             "C-STATIONS",
         )
     )
-    status = resolve_criteria_status(tmp_path)
-    assembled = assemble_outcome(rows, criteria_status=status)
-    assert status == "PROVISIONAL"
+    assembled = assemble_outcome(rows, criteria_status="PROVISIONAL")
     assert assembled.outcome == "PROPOSAL"
     assert assembled.criteria_status == "PROVISIONAL"
     for outcome in ("PROPOSAL", "NO_PROPOSAL"):
         text = render_rationale(replace(assembled, outcome=outcome))
         assert "PROVISIONAL" in text
         assert "never arms" in text.lower()
-
-
-def test_criteria_status_lifts_only_on_an_exact_sha_match(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import breezy.analysis.promotion_criteria as criteria
-
-    target = tmp_path / LIFTING_RULING_RELATIVE
-    target.parent.mkdir(parents=True)
-    body = b"lifting ruling body\n"
-    target.write_bytes(body)
-    assert resolve_criteria_status(tmp_path) == "PROVISIONAL"
-    monkeypatch.setattr(criteria, "LIFTING_RULING_SHA256", hashlib.sha256(body).hexdigest())
-    assert resolve_criteria_status(tmp_path) == "LIFTED"
-    target.write_bytes(b"tampered\n")
-    assert resolve_criteria_status(tmp_path) == "PROVISIONAL"
-    target.unlink()
-    assert resolve_criteria_status(tmp_path) == "PROVISIONAL"
-    target.mkdir()
-    assert resolve_criteria_status(tmp_path) == "PROVISIONAL"
-    assert LIFTING_RULING_SHA256 != hashlib.sha256(body).hexdigest()
 
 
 def test_failed_criteria_assemble_as_no_proposal() -> None:

@@ -14,7 +14,6 @@ fallback onto that other file.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import importlib.util
 import json
 import sys
@@ -53,14 +52,12 @@ PROVISIONAL_TAG: Final[str] = (
 ADAPTED_R5_IDS: Final[frozenset[str]] = frozenset(
     {"C-KILL", "C-PAIRED", "C-ESTIMATOR", "C-REVISION", "C-PIN"}
 )
-LIFTING_RULING_RELATIVE: Final[Path] = Path(
-    "docs/evidence/RULING_promotion_criteria_provisional_lift.md"
-)
-#: sha256 of the unissued-ruling sentence. Not the hash of any file in the
-#: tree; a lift requires this constant to change with the ruling artefact.
-LIFTING_RULING_SHA256: Final[str] = (
-    "db14b89647c744ce1ac5b7e6f890caa172d61e9119ba133a22d51da00eda114b"
-)
+#: The lifting-ruling path + sha256 check lives in
+#: ``scripts/analysis/promotion_proposal.py::resolve_criteria_status``, never
+#: here: `src/breezy` is the EVIDENCE ONLY -- NEVER INGEST boundary
+#: (`tests/unit/test_probe_containment.py::test_no_module_under_src_reads_docs_evidence`)
+#: and must carry no `docs/evidence` path as a runtime value. This module
+#: only ever receives an already-resolved `criteria_status` string.
 _KILL_CLOCK_KEYS: Final[frozenset[str]] = frozenset(
     {
         "count",
@@ -611,19 +608,6 @@ def evaluate_c_pin(proposal: FamilyManifest) -> CriterionRow:
         source="R5-8 adapted, PROVISIONAL",
         detail="PROPOSAL_INCOMPLETE" if unpinned else None,
     )
-
-
-def resolve_criteria_status(repo_root: Path) -> str:
-    """LIFTED only when the pinned ruling file's sha256 matches. Never raises."""
-    path = repo_root / LIFTING_RULING_RELATIVE
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return "PROVISIONAL"
-    digest = hashlib.sha256(raw).hexdigest()
-    if digest != LIFTING_RULING_SHA256:
-        return "PROVISIONAL"
-    return "LIFTED"
 
 
 def assemble_outcome(
