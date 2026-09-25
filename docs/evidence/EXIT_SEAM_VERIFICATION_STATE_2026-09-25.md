@@ -155,6 +155,30 @@ legitimately produces zero new positions.
 | `breezy-family-tally@pm_us_crh_v4.timer` | 2026-09-25 17:20 UTC | never fired yet |
 | `breezy-portfolio-roi.timer` | 2026-09-25 17:40 UTC | 2026-09-24 17:40 UTC |
 
+## Standing AUD-04 reconciliation — per-trial upgrade (2026-09-25 addendum, AUD-07 §7 step 5)
+
+The standing reconciliation with AUD-04 (§6, "on any date both artefacts
+exist") no longer stops at a report-level total. AUD-04
+(`portfolio_roi_report.py`, commit `49261a5`) now publishes `trial_rows`
+(`schema_version=2`) — its own §8 AC#4 mirror obligation — so
+`current_rung_hold_exit_window_study.py` joins on `trial_id` directly via the
+new `reconcile_with_aud04_per_trial`, at the same cutoff and the same zero
+tolerance the total-level check used. Every `trial_id` present on both sides
+is compared individually; a `trial_id` present on only one side is reported
+(`n_exit_only`/`n_aud04_only`), never dropped; the mismatch alert fires on
+ANY per-row divergence and names the first `trial_id`s in its detail. **The
+"report-level total, not per-trial; offsetting per-trial errors are
+invisible" caveat previously carried by this check is DROPPED on this
+path** — it no longer applies, because the join it warned was unavailable
+now exists.
+
+The report-level comparison (`reconcile_with_aud04`, the caveat intact) is
+retained ONLY as the fallback for an AUD-04 artefact that predates
+`trial_rows` (`schema_version=1`, `trial_rows is None`) — `main()` selects
+between the two paths on that field, never on a flag. This is a
+per-row upgrade of the same standing control (same event names, same latch
+file, same re-alert ladder), not a new check.
+
 ## Finding B — reconciled table (step 6, closed)
 
 The reconciled table over the last successful nightly run

@@ -68,6 +68,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -98,6 +99,7 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from portfolio_roi_report import (
     PortfolioRoiReportMalformedFieldError,
+    PortfolioRoiTrialRow,
     UnknownPortfolioRoiSchemaError,
     read_portfolio_roi_report,
 )
@@ -309,20 +311,17 @@ class Aud04ReconciliationResult:
     like", never today's cumulative exit-side sum against yesterday's
     AUD-04 total).
 
-    **Residual limitation, stated honestly rather than silently narrowed
-    (domain review item 3 -- also carried into the stderr line and the alert
-    detail, not only here):** AUD-04's `schema_version` reader
-    (`portfolio_roi_report.read_portfolio_roi_report`) exposes only a
-    REPORT-LEVEL `realised_pnl_after_fees_total` today -- it carries no
-    per-`trial_id` breakdown to join against, so offsetting per-trial errors
-    on either side are invisible to this check. The plan's literal spec
-    ("inner join on trial_id ... matches to the cent on every joined row")
-    therefore cannot be implemented against AUD-04's CURRENT published
-    schema without AUD-04 adding that breakdown (its own stated mirror
-    obligation, AUD-04 plan §8 AC#4) -- a genuine cross-item dependency gap,
-    not something this item can close unilaterally by editing another
-    item's file. This is a real, standing, alerting check today (not a
-    no-op), but coarser than the per-row form the plan specifies.
+    **Scope, narrowed 2026-09-25 (per-row upgrade): this is now the
+    `schema_version=1` FALLBACK path only.** AUD-04 has since shipped
+    `trial_rows` (Stage C3, `schema_version=2`) -- its own mirror obligation
+    from AUD-04 plan §8 AC#4 -- so a per-`trial_id` join is possible and is
+    the PREFERRED comparison; see `reconcile_with_aud04_per_trial`. This
+    report-level total comparison stays in force only when AUD-04's artefact
+    predates that field (`PortfolioRoiReportView.trial_rows is None`), where
+    it still carries the same residual limitation as before: offsetting
+    per-trial errors on either side are invisible to a bare total, which is
+    why the caller must call the per-row form whenever `trial_rows` is
+    available rather than falling back to this one.
     """
 
     matched: bool
@@ -354,6 +353,141 @@ def reconcile_with_aud04(
         matched=matched, cutoff=cutoff, sum_hold_pnl=sum_hold_pnl,
         aud04_realised_pnl_after_fees_total=aud04_realised_pnl_after_fees_total,
         divergence=divergence,
+    )
+
+
+#: §7 step 5 (per-row upgrade, 2026-09-25): the alert detail names at most
+#: this many divergent `trial_id`s, so a large mismatch still produces a
+#: bounded, readable line rather than an unbounded one.
+_MAX_NAMED_DIVERGENT_TRIAL_IDS: Final[int] = 10
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Aud04PerTrialReconciliationResult:
+    """Per-`trial_id` join between this study's exit-side rows and AUD-04's
+    `trial_rows` (`schema_version>=2`) -- the per-row form
+    `Aud04ReconciliationResult`'s own docstring points to. Unlike the
+    report-level total, this catches an EQUAL-AND-OPPOSITE per-trial error
+    pair whose sum happens to match: every `trial_id` present on both sides
+    is compared individually at the same zero tolerance
+    (`_RECONCILIATION_TOLERANCE`) the total-level check uses, and a
+    `trial_id` present on only one side is reported, never silently dropped.
+
+    A `trial_id` occurring MORE THAN ONCE on either side (`n_duplicate_exit`/
+    `n_duplicate_aud04`) is always divergent when joined, regardless of
+    whether its values happen to compare equal -- a naive dict keyed on
+    `trial_id` silently collapses duplicates to last-write-wins, which can
+    reconcile as a false MATCH exactly when the duplicated rows' values
+    happen to sum to the other side's single value (review finding, 2026-09-25).
+    """
+
+    matched: bool
+    cutoff: str
+    n_matched: int
+    n_exit_only: int
+    n_aud04_only: int
+    n_divergent: int
+    #: Count of DISTINCT trial_ids occurring more than once among the
+    #: cutoff-restricted rows on that side (review finding, 2026-09-25).
+    n_duplicate_exit: int = 0
+    n_duplicate_aud04: int = 0
+    #: First `_MAX_NAMED_DIVERGENT_TRIAL_IDS` divergent trial ids, sorted --
+    #: for the alert detail. `n_divergent` is the true (unbounded) count.
+    divergent_trial_ids: tuple[str, ...]
+    exit_only_trial_ids: tuple[str, ...]
+    aud04_only_trial_ids: tuple[str, ...]
+
+
+def reconcile_with_aud04_per_trial(
+    *,
+    rows: Sequence[PositionExitRow],
+    cutoff: str,
+    aud04_trial_rows: Sequence[PortfolioRoiTrialRow],
+) -> Aud04PerTrialReconciliationResult:
+    """Pure comparison -- no I/O. Both sides are restricted to `climate_day
+    <= cutoff` (the same universe/cutoff rule `reconcile_with_aud04` uses).
+    An exit-side row whose `hold_pnl` is `None` (settlement truth not yet
+    known for that trial) cannot be compared and is counted as divergent
+    rather than silently treated as a match.
+
+    Duplicate `trial_id`s on either side are counted with a `Counter`
+    BEFORE either side is collapsed into a `{trial_id: pnl}` dict -- a plain
+    dict comprehension silently keeps only the LAST row for a repeated key,
+    which can reconcile as a false match (review finding, 2026-09-25). A
+    joined `trial_id` duplicated on either side is always divergent here,
+    regardless of whether the (arbitrary, last-write) value it collapsed to
+    happens to compare equal.
+    """
+    cutoff_exit_rows = tuple(row for row in rows if row.position.climate_day <= cutoff)
+    cutoff_aud04_rows = tuple(row for row in aud04_trial_rows if row.climate_day <= cutoff)
+
+    exit_trial_id_counts = Counter(row.position.trial_id for row in cutoff_exit_rows)
+    aud04_trial_id_counts = Counter(row.trial_id for row in cutoff_aud04_rows)
+    duplicate_exit_trial_ids = {tid for tid, count in exit_trial_id_counts.items() if count > 1}
+    duplicate_aud04_trial_ids = {tid for tid, count in aud04_trial_id_counts.items() if count > 1}
+
+    exit_pnl_by_trial: dict[str, Decimal | None] = {
+        row.position.trial_id: row.hold_pnl for row in cutoff_exit_rows
+    }
+    aud04_pnl_by_trial: dict[str, Decimal] = {row.trial_id: row.pnl for row in cutoff_aud04_rows}
+
+    exit_only = tuple(sorted(set(exit_pnl_by_trial) - set(aud04_pnl_by_trial)))
+    aud04_only = tuple(sorted(set(aud04_pnl_by_trial) - set(exit_pnl_by_trial)))
+    joined_trial_ids = sorted(set(exit_pnl_by_trial) & set(aud04_pnl_by_trial))
+
+    divergent: list[str] = []
+    n_matched = 0
+    for trial_id in joined_trial_ids:
+        if trial_id in duplicate_exit_trial_ids or trial_id in duplicate_aud04_trial_ids:
+            divergent.append(trial_id)
+            continue
+        exit_pnl = exit_pnl_by_trial[trial_id]
+        aud04_pnl = aud04_pnl_by_trial[trial_id]
+        if exit_pnl is not None and abs(exit_pnl - aud04_pnl) <= _RECONCILIATION_TOLERANCE:
+            n_matched += 1
+        else:
+            divergent.append(trial_id)
+
+    matched = not divergent and not exit_only and not aud04_only
+    return Aud04PerTrialReconciliationResult(
+        matched=matched, cutoff=cutoff, n_matched=n_matched,
+        n_exit_only=len(exit_only), n_aud04_only=len(aud04_only), n_divergent=len(divergent),
+        n_duplicate_exit=len(duplicate_exit_trial_ids),
+        n_duplicate_aud04=len(duplicate_aud04_trial_ids),
+        divergent_trial_ids=tuple(divergent[:_MAX_NAMED_DIVERGENT_TRIAL_IDS]),
+        exit_only_trial_ids=exit_only, aud04_only_trial_ids=aud04_only,
+    )
+
+
+def apply_pnl_reconciliation_ladder_per_trial(
+    *, result: Aud04PerTrialReconciliationResult, latch: alert_ladder.LatchState, now_ns: int,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Same ladder cadence, event names, and latch file as
+    `apply_pnl_reconciliation_ladder` (D8's per-consumer-file ownership rule
+    -- this is the per-row upgrade of the SAME control, not a second one).
+    The report-level-total caveat is DROPPED here (it no longer applies once
+    AUD-04 publishes `trial_rows`); the detail instead names the first
+    `_MAX_NAMED_DIVERGENT_TRIAL_IDS` divergent `trial_id`s, the duplicate
+    counts on each side, and a same-capped sample of the unjoined
+    `trial_id`s on each side (review finding, 2026-09-25 -- previously only
+    their counts were visible)."""
+    previous_streak = latch.streak
+    stale_detail = (
+        f"streak={previous_streak + 1} n_divergent={result.n_divergent} "
+        f"n_exit_only={result.n_exit_only} n_aud04_only={result.n_aud04_only} "
+        f"n_duplicate_exit={result.n_duplicate_exit} "
+        f"n_duplicate_aud04={result.n_duplicate_aud04} "
+        f"divergent_trial_ids={list(result.divergent_trial_ids)} "
+        f"exit_only_trial_ids="
+        f"{list(result.exit_only_trial_ids[:_MAX_NAMED_DIVERGENT_TRIAL_IDS])} "
+        f"aud04_only_trial_ids="
+        f"{list(result.aud04_only_trial_ids[:_MAX_NAMED_DIVERGENT_TRIAL_IDS])}"
+    )
+    return _apply_ladder(
+        is_fresh=result.matched, latch=latch, now_ns=now_ns,
+        stale_event=EXIT_PNL_RECONCILIATION_MISMATCH_EVENT,
+        cleared_event=EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT,
+        stale_detail=stale_detail, cleared_detail=f"streak_len={previous_streak}",
     )
 
 
@@ -1179,22 +1313,60 @@ def main(
                 )
             else:
                 assert cutoff is not None
-                reconciliation = reconcile_with_aud04(
-                    rows=rows, cutoff=cutoff,
-                    aud04_realised_pnl_after_fees_total=aud04_view.realised_pnl_after_fees_total,
-                )
-                print(
-                    f"[exit-window-study] AUD-04 reconciliation: matched={reconciliation.matched} "
-                    f"cutoff={cutoff} divergence={reconciliation.divergence} "
-                    f"caveat={_AUD04_RECONCILIATION_CAVEAT}",
-                    file=sys.stderr,
-                )
                 reconciliation_latch_path = args.out_root / _PNL_RECONCILIATION_LATCH_FILENAME
                 reconciliation_latch = alert_ladder.read_latch_state(reconciliation_latch_path)
-                new_reconciliation_latch, reconciliation_payload = apply_pnl_reconciliation_ladder(
-                    matched=reconciliation.matched, latch=reconciliation_latch,
-                    now_ns=resolved_now_ns,
-                )
+                if aud04_view.trial_rows is not None:
+                    # AUD-04 schema_version>=2: a per-trial_id breakdown
+                    # exists, so join on it instead of comparing bare totals
+                    # (§6 "standing P&L reconciliation with AUD-04", the
+                    # per-row upgrade -- catches an equal-and-opposite
+                    # per-trial error pair a total alone would miss).
+                    per_trial_result = reconcile_with_aud04_per_trial(
+                        rows=rows, cutoff=cutoff, aud04_trial_rows=aud04_view.trial_rows,
+                    )
+                    cap = _MAX_NAMED_DIVERGENT_TRIAL_IDS
+                    print(
+                        f"[exit-window-study] AUD-04 per-trial reconciliation: "
+                        f"matched={per_trial_result.matched} cutoff={cutoff} "
+                        f"n_divergent={per_trial_result.n_divergent} "
+                        f"n_exit_only={per_trial_result.n_exit_only} "
+                        f"n_aud04_only={per_trial_result.n_aud04_only} "
+                        f"n_duplicate_exit={per_trial_result.n_duplicate_exit} "
+                        f"n_duplicate_aud04={per_trial_result.n_duplicate_aud04} "
+                        f"divergent_trial_ids={list(per_trial_result.divergent_trial_ids)} "
+                        f"exit_only_trial_ids="
+                        f"{list(per_trial_result.exit_only_trial_ids[:cap])} "
+                        f"aud04_only_trial_ids="
+                        f"{list(per_trial_result.aud04_only_trial_ids[:cap])}",
+                        file=sys.stderr,
+                    )
+                    new_reconciliation_latch, reconciliation_payload = (
+                        apply_pnl_reconciliation_ladder_per_trial(
+                            result=per_trial_result, latch=reconciliation_latch,
+                            now_ns=resolved_now_ns,
+                        )
+                    )
+                else:
+                    # AUD-04 schema_version=1: no per-trial breakdown exists
+                    # yet -- fall back to the report-level total, caveat
+                    # intact (Aud04ReconciliationResult's docstring).
+                    reconciliation = reconcile_with_aud04(
+                        rows=rows, cutoff=cutoff,
+                        aud04_realised_pnl_after_fees_total=aud04_view.realised_pnl_after_fees_total,
+                    )
+                    print(
+                        f"[exit-window-study] AUD-04 reconciliation: "
+                        f"matched={reconciliation.matched} "
+                        f"cutoff={cutoff} divergence={reconciliation.divergence} "
+                        f"caveat={_AUD04_RECONCILIATION_CAVEAT}",
+                        file=sys.stderr,
+                    )
+                    new_reconciliation_latch, reconciliation_payload = (
+                        apply_pnl_reconciliation_ladder(
+                            matched=reconciliation.matched, latch=reconciliation_latch,
+                            now_ns=resolved_now_ns,
+                        )
+                    )
                 alert_ladder.write_latch_state(reconciliation_latch_path, new_reconciliation_latch)
                 if reconciliation_payload is not None:
                     emit_alert(resolved_sink, reconciliation_payload)
