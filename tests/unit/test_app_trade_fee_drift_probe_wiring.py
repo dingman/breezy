@@ -38,7 +38,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 from breezy.app.trade import run
@@ -73,6 +75,21 @@ def _fee_drift_actors(node: RecordingNode) -> list[FeeDriftProbeActor]:
     return [actor for actor in node.trader.actors if isinstance(actor, FeeDriftProbeActor)]
 
 
+def _register_clock(actor: FeeDriftProbeActor, clock: TestClock) -> None:
+    """`RecordingNode`'s fake `Trader.add_actor` never calls the native
+    `register_base` (no real Nautilus registration in this harness -- see
+    its own docstring), so `actor.clock` stays `None` unless a test that
+    drives a DISAGREE (which reads `self.clock.timestamp_ns()` for the
+    mismatch-alert dedupe window) registers one itself, exactly as
+    `test_fee_drift_probe.py`'s own `_register` does."""
+    actor.register_base(
+        portfolio=TestComponentStubs.portfolio(),
+        msgbus=TestComponentStubs.msgbus(),
+        cache=TestComponentStubs.cache(),
+        clock=clock,
+    )
+
+
 def _continuous_env(tmp_path: Path) -> dict[str, str]:
     catalog_root = tmp_path / "catalog"
     catalog_root.mkdir()
@@ -87,12 +104,73 @@ def _continuous_env(tmp_path: Path) -> dict[str, str]:
     )
 
 
+def _v4_env(tmp_path: Path) -> dict[str, str]:
+    """`pm_us_crh_v4` -- the LIVE family, registered at theta 0.0695, never
+    0.06 (fee-drift-probe-target ruling, 2026-09-25)."""
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    _write_today_catalog(catalog_root)
+    return _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v4",
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+
+
 def test_continuous_run_registers_exactly_one_fee_drift_probe_actor(tmp_path: Path) -> None:
     code = run(env=_continuous_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
 
     assert code == EXIT_OK
     node = RecordingNode.instances[-1]
     assert len(_fee_drift_actors(node)) == 1
+
+
+def test_the_probes_reference_theta_is_the_sending_familys_registered_one(tmp_path: Path) -> None:
+    """Wiring RED test (fee-drift-probe-target ruling, 2026-09-25): the
+    constructed Actor's reference must be `pm_us_crh_v4`'s OWN registered
+    theta (0.0695), never the module-level `DOCUMENTED_TAKER_FEE_COEFFICIENT`
+    (0.06) -- comparing against the wrong constant made the probe DISAGREE
+    forever for this family."""
+    code = run(env=_v4_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    node = RecordingNode.instances[-1]
+    (actor,) = _fee_drift_actors(node)
+    assert actor._documented == Decimal("0.0695")
+
+
+def test_wire_equal_to_the_registered_family_theta_agrees_with_no_alert_and_no_halt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect this ruling fixes, proven end to end: `pm_us_crh_v4` is
+    registered at 0.0695, so a wire read of 0.0695 must AGREE -- before the
+    fix this compared against the stale 0.06 pin and DISAGREED forever."""
+    sink = _RecordingAlertSink()
+    monkeypatch.setattr("breezy.app.trade.resolve_alert_sink", lambda: sink)
+    results: dict[str, Any] = {}
+
+    class _Capture(RecordingNode):
+        def run(self) -> None:
+            (actor,) = _fee_drift_actors(self)
+            submit_veto = self.config.exec_clients[POLYMARKET_US_CLIENT_NAME].submit_veto
+
+            async def _agreeing() -> Decimal:
+                return Decimal("0.0695")
+
+            actor._wire_fee_fetcher = _agreeing
+            results["outcome"] = asyncio.run(actor.probe_once())
+            results["veto_after"] = submit_veto()
+            super().run()
+
+    code = run(env=_v4_env(tmp_path), node_factory=_Capture, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert results["outcome"] == "AGREE"
+    assert sink.emitted == []
+    assert results["veto_after"] is None
 
 
 def test_current_rung_hold_run_never_registers_the_fee_drift_probe_actor(tmp_path: Path) -> None:
@@ -145,6 +223,7 @@ def test_disagree_reaches_the_same_latch_the_submit_veto_reads_and_alerts_once(
     class _Capture(RecordingNode):
         def run(self) -> None:
             (actor,) = _fee_drift_actors(self)
+            _register_clock(actor, TestClock())
             submit_veto = self.config.exec_clients[POLYMARKET_US_CLIENT_NAME].submit_veto
             results["veto_before"] = submit_veto()
 

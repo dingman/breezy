@@ -243,11 +243,25 @@ def _build_fee_drift_probe(
     *,
     strategies: Sequence[Strategy],
     family_halt_latch: TrialDayLatch,
+    registered_fee_coefficient: Decimal,
 ) -> tuple[FeeDriftProbeActor, Callable[[Any], None]] | None:
     """Build AUD-12b's fee-drift probe for ``continuous_rung_hold`` only.
 
     Returns ``None`` (no probe registered) when no composed strategy
     resolved any tradable instrument -- logged, never a crashed boot.
+
+    ``registered_fee_coefficient`` is the SENDING family's own
+    ``FamilyManifest.taker_fee_coefficient`` (the caller's already-loaded
+    ``manifest``, read once, above) -- the EXACT source the composed
+    strategies' own ``required_fee_coefficient`` already comes from (see the
+    ``continuous_rung_hold`` branch above) and the same one
+    ``current_rung_hold/decision.py:342``'s per-order check compares against.
+    Passed straight through to :class:`FeeDriftProbeActor` as
+    ``documented_fee_coefficient`` -- fee-drift-probe-target ruling,
+    2026-09-25: comparing the wire read against the module-level
+    ``DOCUMENTED_TAKER_FEE_COEFFICIENT`` instead of the running family's own
+    registered theta made the probe DISAGREE forever for any family (e.g.
+    ``pm_us_crh_v4``) registered at a different, committed value.
 
     Every collaborator is the SAME object another already-wired seam uses:
 
@@ -334,6 +348,7 @@ def _build_fee_drift_probe(
         wire_fee_fetcher=_wire_fee_fetcher,
         set_family_halted=_set_family_halted,
         alert_sink=resolve_alert_sink(),
+        documented_fee_coefficient=registered_fee_coefficient,
     )
 
     def _resolve_client(node: Any) -> None:
@@ -507,7 +522,12 @@ def run(
                 # composition_kind only (§9: "runs alongside the existing
                 # strategy Actors", never folded into their own on_start).
                 built_probe = _build_fee_drift_probe(
-                    strategies=strategies, family_halt_latch=family_halt_latch
+                    strategies=strategies,
+                    family_halt_latch=family_halt_latch,
+                    # The sending family's own registered theta -- see the
+                    # v2 branch's `required_fee_coefficient` comment above;
+                    # never a constant, never an environment variable.
+                    registered_fee_coefficient=manifest.taker_fee_coefficient,
                 )
                 if built_probe is not None:
                     fee_drift_actor, fee_drift_resolve_client = built_probe
