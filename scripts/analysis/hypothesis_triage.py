@@ -81,6 +81,8 @@ EVALUATION_SCHEMA_VERSION: int = HYPOTHESIS_LEDGER_SCHEMA_VERSION
 _BOOTSTRAP_ITERATIONS: int = 400
 _BOOTSTRAP_SEED: int = 20260925
 _DEFAULT_HORIZON_DAYS: int = 21
+_HORIZON_ALERT_STATE_SCHEMA_VERSION: int = 1
+_MISSING_STRATUM_BINDING: str = "MISSING_STRATUM_BINDING"
 _ACTIVE_STATUSES = frozenset(
     {"REGISTERED", "PARKED_INSUFFICIENT_DATA", "EVALUATING"}
 )
@@ -134,6 +136,10 @@ def ledger_path(derived_root: Path) -> Path:
 
 def evaluations_path(derived_root: Path) -> Path:
     return derived_root / "hypothesis" / "hypothesis_evaluations.jsonl"
+
+
+def _horizon_alert_state_path(derived_root: Path) -> Path:
+    return derived_root / "hypothesis" / "horizon_alerts.json"
 
 
 def _sufficiency_path(derived_root: Path) -> Path:
@@ -214,6 +220,45 @@ def _atomic_write_lines(path: Path, lines: Sequence[str]) -> None:
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+
+
+def _read_horizon_alert_state(path: Path) -> frozenset[str]:
+    """Read durable one-shot state for PARKED horizon advisories.
+
+    Missing state means no alert has been recorded yet. Corrupt state fails
+    loud so the unit does not oscillate between silent suppression and an
+    uncontrolled re-alert storm.
+    """
+    if not path.exists():
+        return frozenset()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise _TriageFailure(f"corrupt horizon alert state: {_public_detail(exc)}") from exc
+    except OSError as exc:
+        raise _TriageFailure(f"unreadable horizon alert state: {_public_detail(exc)}") from exc
+    if not isinstance(payload, Mapping):
+        raise _TriageFailure("corrupt horizon alert state: expected JSON object")
+    version = payload.get("schema_version")
+    if version != _HORIZON_ALERT_STATE_SCHEMA_VERSION:
+        raise _TriageFailure(
+            "unknown horizon alert state schema_version "
+            f"{version!r} (expected {_HORIZON_ALERT_STATE_SCHEMA_VERSION})"
+        )
+    ids = payload.get("alerted_hypothesis_ids")
+    if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+        raise _TriageFailure(
+            "corrupt horizon alert state: alerted_hypothesis_ids must be a list of strings"
+        )
+    return frozenset(ids)
+
+
+def _write_horizon_alert_state(path: Path, alerted: frozenset[str]) -> None:
+    payload = {
+        "schema_version": _HORIZON_ALERT_STATE_SCHEMA_VERSION,
+        "alerted_hypothesis_ids": sorted(alerted),
+    }
+    _atomic_write_lines(path, [json.dumps(payload, sort_keys=True)])
 
 
 def read_hypothesis_evaluations(path: Path) -> tuple[HypothesisLook, ...]:
@@ -424,6 +469,18 @@ def _horizon_reached(record: HypothesisRecord, *, as_of: str, horizon_days: int)
     return parked_for > horizon_days
 
 
+def _has_registered_draw_binding(record: HypothesisRecord, variant_id: str) -> bool:
+    """Current schema has no hypothesis/variant -> stratum/draw-population key.
+
+    The strict ledger reader accepts exactly the fields on `HypothesisRecord`;
+    none names a stratum, station set, replay strategy/lag, or variant-specific
+    draw population. Until a future schema adds that field, every look-taking
+    record fails closed instead of consuming the global replay corpus.
+    """
+    _ = (record, variant_id)
+    return False
+
+
 def _skip(record: HypothesisRecord, variant_id: str, reason: str) -> None:
     print(
         f"SKIP hypothesis_id={record.hypothesis_id} variant_id={variant_id} "
@@ -463,6 +520,19 @@ def _triage_record(
             )
         return record, None, None
 
+    if _horizon_reached(record, as_of=as_of, horizon_days=horizon_days):
+        return record, None, "HYPOTHESIS_TRIAGE_HORIZON_STALL"
+
+    missing_binding = [
+        variant_id
+        for variant_id in eligible
+        if not _has_registered_draw_binding(record, variant_id)
+    ]
+    if missing_binding:
+        for variant_id in missing_binding:
+            _skip(record, variant_id, _MISSING_STRATUM_BINDING)
+        return record, None, "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING"
+
     if completed and any(not _passes_c_validity(row) for row in completed):
         for variant_id in variants:
             _skip(record, variant_id, "C_VALIDITY")
@@ -489,7 +559,6 @@ def _triage_record(
 
     variant_id = eligible[0]
     assert_look_permitted(record, looks, variant_id)
-    lag = max(row.lag_minutes for row in by_day[with_takes[0]])
     draws = tuple(
         _draw_for_station_day(
             derived_root,
@@ -499,7 +568,6 @@ def _triage_record(
         )
         for station, climate_day in with_takes
     )
-    del lag
     score_combined(draws)
     means = tuple(station_day_mean_x(draw) for draw in draws)
     ci_lower, ci_upper = cluster_bootstrap_ci(means, alpha=record.per_variant_alpha)
@@ -610,6 +678,8 @@ def run(args: _Args) -> int:
     active = [record for record in look_taking if record.status in _ACTIVE_STATUSES]
     _sufficiency, results = _load_aud09(args.derived_root)
     completed = _completed_on_whole_days(_sufficiency, results)  # type: ignore[arg-type]
+    horizon_state_path = _horizon_alert_state_path(args.derived_root)
+    horizon_alerted = _read_horizon_alert_state(horizon_state_path)
     updated_records = records
     for record in active:
         updated, new_look, event = _triage_record(
@@ -628,13 +698,27 @@ def run(args: _Args) -> int:
         if updated != record:
             updated_records = _replace_status(updated_records, updated)
         if event == "HYPOTHESIS_TRIAGE_HORIZON_STALL":
+            if record.hypothesis_id not in horizon_alerted:
+                _emit(
+                    alert_log=args.alert_log,
+                    severity="WARN",
+                    event=event,
+                    detail=(
+                        f"hypothesis {record.hypothesis_id} stayed PARKED_INSUFFICIENT_DATA "
+                        f"past the {args.horizon_days}-day horizon"
+                    ),
+                )
+                horizon_alerted = frozenset((*horizon_alerted, record.hypothesis_id))
+                _write_horizon_alert_state(horizon_state_path, horizon_alerted)
+        elif event == "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING":
             _emit(
                 alert_log=args.alert_log,
                 severity="WARN",
                 event=event,
                 detail=(
-                    f"hypothesis {record.hypothesis_id} stayed PARKED_INSUFFICIENT_DATA "
-                    f"past the {args.horizon_days}-day horizon"
+                    f"hypothesis {record.hypothesis_id} skipped: "
+                    f"{_MISSING_STRATUM_BINDING}; registered schema has no "
+                    "hypothesis/variant stratum draw-population binding"
                 ),
             )
         elif event == "HYPOTHESIS_ABANDONED_CAP_EXHAUSTED":
