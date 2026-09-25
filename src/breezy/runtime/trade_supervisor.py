@@ -73,6 +73,7 @@ from breezy.runtime.trade_supervisor_core import (
     NODE_ARGV_ANCHOR,
     PERMIT_EXPIRY_CEILING_NS_ENV_VAR,
     PERMIT_ISSUED_MARKER,
+    PERMIT_NOT_REQUESTED_MARKER,
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ALERT_DETAIL,
     SELF_CHECK_ESCALATION_STORE_KEY,
@@ -127,6 +128,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_midday_not_ready_alert_sent,
     record_midday_readiness_recheck_done,
     record_midday_relaunch_attempt,
+    record_orders_not_requested_seen,
     record_permit_alert_sent,
     record_permit_deferred_since,
     record_permit_gap_info_logged,
@@ -1165,6 +1167,20 @@ def _do_relaunch_check(
         # docstring for why this is never merged with the per-child latch
         # just above.
         state = record_first_boot_permit_seen(state, now, permit_expiry_ns)
+    # [FU-1, 2026-09-25] Classified -- and latched into `midday_cause_seen`
+    # -- from THIS read, unconditionally (alive or dead), same drain-safe
+    # placement as the two latches just above. Without this, a transient
+    # marker line drained here while the child is still starting (or on an
+    # earlier dead-poll before B1 next runs) is gone by the time
+    # `_do_midday_watch` later needs it for `decide_midday_relaunch`: B1's
+    # own `_do_permit_watch` skips its `latch_log_facts` call whenever this
+    # handler is the one dispatched (`handler_read_log`), and by the time it
+    # does run, the shared `IncrementalLogReader`'s next delta no longer
+    # holds this line. `cause` is reused, unchanged, by the boot-relaunch
+    # decision below.
+    cause = classify_exit1_cause(log_text)
+    if cause is not RelaunchCause.UNKNOWN:
+        state = record_midday_cause_seen(state, now, cause)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),
@@ -1177,7 +1193,6 @@ def _do_relaunch_check(
     if ports.process_alive(tracked_pid):
         return tracked_pid, node_log, state
 
-    cause = classify_exit1_cause(log_text)
     decision = decide_relaunch(
         now=now,
         attempts_so_far=state.relaunch_attempts,
@@ -1257,6 +1272,15 @@ def _do_midday_watch(
     live_cause = classify_exit1_cause(log_text)
     if live_cause is not RelaunchCause.UNKNOWN:
         state = record_midday_cause_seen(state, now, live_cause)
+    # [FU-1, 2026-09-25] Same drain-safe placement as the three latches just
+    # above: B1's own `_do_permit_watch` skips its `latch_log_facts` call on
+    # every poll where THIS handler was the one dispatched
+    # (`handler_read_log`), so a `PERMIT_NOT_REQUESTED_MARKER` line in this
+    # delta is otherwise gone before B1 next gets a chance at it --
+    # misclassifying a pure-shadow-mode child as `ABSENT`/`LAPSED` instead
+    # of `NOT_REQUIRED`.
+    if PERMIT_NOT_REQUESTED_MARKER in log_text:
+        state = record_orders_not_requested_seen(state, now)
 
     if ports.process_alive(tracked_pid):
         relaunched_at = state.last_midday_relaunch_attempt_at
@@ -1628,6 +1652,18 @@ def _do_self_check(
             # unconditionally (whenever a permit-issued line is observed)
             # is safe even when the per-child latch above was skipped.
             state = record_first_boot_permit_seen(state, now, live_permit_expiry_ns)
+        # [FU-1, 2026-09-25] `_do_self_check` has no `handler_read_log` flag
+        # of its own, but reads through the identical shared, offset-
+        # draining `IncrementalLogReader` as `_do_relaunch_check` and
+        # `_do_midday_watch` -- so a delta it drains can lose these two
+        # facts the exact same way, and neither was previously latched
+        # here. Both are idempotent first-seen-wins latches, same as the
+        # strategy/permit latches just above.
+        live_cause = classify_exit1_cause(log_text)
+        if live_cause is not RelaunchCause.UNKNOWN:
+            state = record_midday_cause_seen(state, now, live_cause)
+        if PERMIT_NOT_REQUESTED_MARKER in log_text:
+            state = record_orders_not_requested_seen(state, now)
         latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
         permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
         if latched_permit_expiry_ns is not None:

@@ -611,23 +611,34 @@ class TestPermitAlertLatchLifecycle:
 
 class TestLatchLogFactsParity:
     def test_latch_log_facts_parity_with_midday_watch_inline_latching(self):
+        """[FU-1, 2026-09-25] Before this change, `_do_midday_watch`'s own
+        inline sequence never latched `orders_not_requested_seen`, so this
+        test could only assert parity on the OTHER four fields --
+        `latch_log_facts` strictly EXCEEDED `_do_midday_watch` on that one.
+        `_do_midday_watch` now latches it too (same discipline as its other
+        four inline latches), so this asserts the now-EQUAL coverage: every
+        field `latch_log_facts` sets from this text, `_do_midday_watch`'s
+        own inline sequence sets identically, field for field."""
+        from breezy.runtime.trade_supervisor_core import PERMIT_NOT_REQUESTED_MARKER
+
         log_text = (
             "trading node failed\n"
             f"live-trading permit issued issued_at_ns=1 expires_at_ns={_FAR_FUTURE_NS} "
             "ttl_s=1\n"
             "CurrentRungHoldStrategy subscribed X\n"
-        )
+        ) + PERMIT_NOT_REQUESTED_MARKER + "\n"
         state = initial_scheduler_state(_DAY)
 
         drained = latch_log_facts(state, _utc(20, 0), log_text)
 
-        # Mirrors _do_midday_watch's own inline sequence exactly.
+        # Mirrors _do_midday_watch's own inline sequence exactly (post FU-1).
         from breezy.runtime.trade_supervisor_core import (
             RelaunchCause,
             classify_exit1_cause,
             parse_permit_expiry_ns,
             record_first_boot_permit_seen,
             record_midday_cause_seen,
+            record_orders_not_requested_seen,
             record_permit_issued_seen,
             strategy_subscribed_in,
         )
@@ -642,6 +653,8 @@ class TestLatchLogFactsParity:
         cause = classify_exit1_cause(log_text)
         if cause is not RelaunchCause.UNKNOWN:
             inline = record_midday_cause_seen(inline, _utc(20, 0), cause)
+        if PERMIT_NOT_REQUESTED_MARKER in log_text:
+            inline = record_orders_not_requested_seen(inline, _utc(20, 0))
 
         assert drained.strategy_subscribed_seen == inline.strategy_subscribed_seen
         assert (
@@ -651,6 +664,9 @@ class TestLatchLogFactsParity:
             drained.first_boot_permit_expires_at_ns == inline.first_boot_permit_expires_at_ns
         )
         assert drained.midday_cause_seen == inline.midday_cause_seen
+        # The now-equal field -- previously exceeded, never asserted here.
+        assert drained.orders_not_requested_seen == inline.orders_not_requested_seen
+        assert drained == inline
 
     def test_latch_log_facts_also_latches_the_not_requested_marker(self):
         from breezy.runtime.trade_supervisor_core import PERMIT_NOT_REQUESTED_MARKER

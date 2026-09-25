@@ -1485,17 +1485,23 @@ def latch_log_facts(
 
     [FU-1, 2026-09-25] Investigated migrating ``_do_relaunch_check``,
     ``_do_midday_watch``, and ``_do_self_check`` onto this helper; declined
-    for all three, byte-identical-behaviour constraint. Each handler's own
-    inline sequence is a real subset (or, for self-check, a structurally
-    different shape) of what this helper latches on the SAME text, and the
-    gap is observable, not cosmetic: ``_do_relaunch_check`` never records
-    ``midday_cause_seen``, ``_do_midday_watch`` never records
-    ``orders_not_requested_seen`` (both consumed by
-    :func:`permit_capability_valid` and by ``decide_midday_relaunch``'s
-    cause), and ``_do_self_check`` guards its latching on live-vs-latched
-    values this helper does not expose. Calling this helper from any of the
-    three would change alerting/relaunch behaviour, not just tidy the code,
-    so their inline latching stays untouched."""
+    for all three, byte-identical-behaviour constraint (each handler's own
+    inline sequence is gated on live-vs-latched values, or an early return,
+    this helper does not expose, so calling it directly would change
+    alerting/relaunch behaviour, not just tidy the code).
+
+    That investigation found the three handlers' own inline sequences were
+    NOT actually at parity with what this helper latches from the same
+    drained text: ``_do_relaunch_check`` never recorded ``midday_cause_seen``,
+    and both ``_do_midday_watch`` and ``_do_self_check`` never recorded
+    ``orders_not_requested_seen`` -- each a real gap (fixed inline, same
+    2026-09-25 change, not by migrating onto this helper), since B1's own
+    call to this helper is skipped whenever the dispatched handler is the
+    one that read the log (``handler_read_log``), and by the time B1 next
+    runs, the shared, offset-draining ``IncrementalLogReader``'s next delta
+    no longer holds the line. All four handlers (this helper plus the three
+    inline callers) now latch the same superset of facts from a delta they
+    each drain -- parity restored without merging their control flow."""
     if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now_utc)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
