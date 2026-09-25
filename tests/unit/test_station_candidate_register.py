@@ -281,6 +281,32 @@ def test_the_register_round_trips_with_stable_key_order(tmp_path: Path) -> None:
     assert list(json.loads(line)) == sorted(json.loads(line))
 
 
+def test_write_station_candidates_serializes_the_exact_expected_json_line(
+    tmp_path: Path,
+) -> None:
+    """Pins the register line's exact keys/values (AUD-08b credential-serialization
+    guard fix: ``asdict`` replaced by explicit field-by-field serialization).
+    Must keep passing unchanged across that refactor.
+    """
+    path = tmp_path / "station_candidates.jsonl"
+    (record,) = _fold((), (_sighting(),), today="2026-09-21")
+
+    write_station_candidates(path, (record,))
+
+    (line,) = path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(line) == {
+        "schema_version": STATION_CANDIDATES_SCHEMA_VERSION,
+        "venue": record.venue,
+        "city_token": record.city_token,
+        "origin": record.origin,
+        "first_seen_day": record.first_seen_day,
+        "last_seen_day": record.last_seen_day,
+        "distinct_slugs": record.distinct_slugs,
+        "distinct_climate_days": record.distinct_climate_days,
+        "sufficiency": record.sufficiency,
+    }
+
+
 def test_the_writer_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed replace leaves the previous register intact and no temp file behind."""
     import breezy.persistence.station_candidates as module

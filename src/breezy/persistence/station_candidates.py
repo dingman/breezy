@@ -36,7 +36,7 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, get_args
 
@@ -137,6 +137,23 @@ class UnregisteredCitySighting:
     climate_date: str
     observed_ts_ns: int
 
+    def to_row(self) -> dict[str, Any]:
+        """Explicit field-by-field row -- never ``dataclasses.asdict`` (AUD-08b
+        credential-serialization guard, ``test_polymarket_us_credential_serialization``):
+        that guard bans every ``asdict(...)`` call site outside a closed
+        allowlist this module is not on. Named fields keep the sidecar
+        contract legible at the call site instead of behind a generic
+        reflection call.
+        """
+        return {
+            "schema_version": self.schema_version,
+            "venue": self.venue,
+            "city_token": self.city_token,
+            "slug": self.slug,
+            "climate_date": self.climate_date,
+            "observed_ts_ns": self.observed_ts_ns,
+        }
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class StationCandidate:
@@ -175,6 +192,23 @@ class StationCandidate:
     @property
     def key(self) -> tuple[str, str]:
         return (self.venue, self.city_token)
+
+    def to_row(self) -> dict[str, Any]:
+        """Explicit field-by-field row -- never ``dataclasses.asdict`` (AUD-08b
+        credential-serialization guard; see ``UnregisteredCitySighting.to_row``
+        for the rationale).
+        """
+        return {
+            "schema_version": self.schema_version,
+            "venue": self.venue,
+            "city_token": self.city_token,
+            "origin": self.origin,
+            "first_seen_day": self.first_seen_day,
+            "last_seen_day": self.last_seen_day,
+            "distinct_slugs": self.distinct_slugs,
+            "distinct_climate_days": self.distinct_climate_days,
+            "sufficiency": self.sufficiency,
+        }
 
 
 class SightingSink(Protocol):
@@ -232,7 +266,7 @@ def append_sighting(directory: Path, sighting: UnregisteredCitySighting) -> Path
     before return.
     """
     path = sighting_path(directory, sighting_day(sighting))
-    line = json.dumps(asdict(sighting), sort_keys=True) + "\n"
+    line = json.dumps(sighting.to_row(), sort_keys=True) + "\n"
     directory.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(line)
@@ -487,7 +521,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 def write_station_candidates(path: Path, candidates: Sequence[StationCandidate]) -> None:
     """One line per candidate, stable key order, atomic temp + ``os.replace``."""
-    text = "".join(json.dumps(asdict(record), sort_keys=True) + "\n" for record in candidates)
+    text = "".join(json.dumps(record.to_row(), sort_keys=True) + "\n" for record in candidates)
     _atomic_write_text(path, text)
 
 

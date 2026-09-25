@@ -94,6 +94,27 @@ def test_append_sighting_writes_one_line_per_call_and_round_trips(tmp_path: Path
     assert read_sightings(path_one) == (first, second)
 
 
+def test_append_sighting_serializes_the_exact_expected_json_line(tmp_path: Path) -> None:
+    """Pins the sidecar line's exact keys/values (AUD-08b credential-serialization
+    guard fix: ``asdict`` replaced by explicit field-by-field serialization).
+    Must keep passing unchanged across that refactor.
+    """
+    sighting = _sighting()
+
+    path = append_sighting(tmp_path, sighting)
+
+    (line,) = path.read_text(encoding="utf-8").splitlines()
+    assert line == _line()
+    assert json.loads(line) == {
+        "schema_version": SIGHTING_SCHEMA_VERSION,
+        "venue": "polymarket_us",
+        "city_token": "bos",
+        "slug": "tc-temp-boshigh-2026-09-25-lt79f",
+        "climate_date": "2026-09-25",
+        "observed_ts_ns": _BEFORE_MIDNIGHT_NS,
+    }
+
+
 def test_two_appends_straddling_utc_midnight_land_in_two_day_named_files(
     tmp_path: Path,
 ) -> None:
