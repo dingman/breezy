@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Final, Literal
 
 __all__ = [
+    "FEE_SCHEDULE_MISMATCH_REFUSAL",
     "REPLAY_RESULTS_SCHEMA_VERSION",
     "REPLAY_VALIDITY",
     "DuplicateReplayResultError",
@@ -40,6 +41,7 @@ __all__ = [
     "ResultKey",
     "UnknownReplayResultSchemaError",
     "append_replay_result",
+    "is_fee_schedule_void",
     "read_replay_results",
     "result_key",
 ]
@@ -64,6 +66,14 @@ ResultKey = tuple[str, str, str, int]
 #: Terminal outcomes retire a `ResultKey`; `BLOCKED` never does (module
 #: docstring).
 _TERMINAL_OUTCOMES: Final[frozenset[str]] = frozenset({"COMPLETED", "RECOVERED", "FAILED"})
+
+#: AUD-09b amendment (fee-regime plan, Phase 1): the exact `Refuse` reason
+#: literal `evaluate_decision` returns (`current_rung_hold/decision.py:344`,
+#: `Refuse("fee_schedule_mismatch")`) when a tape instrument's own theta
+#: disagrees with `CurrentRungHoldConfig.required_fee_coefficient`. Named
+#: here, once, so `is_fee_schedule_void` and the runner's own net never
+#: duplicate the string.
+FEE_SCHEDULE_MISMATCH_REFUSAL: Final[str] = "fee_schedule_mismatch"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -385,3 +395,13 @@ def terminal_keys(results: Sequence[ReplayResult]) -> frozenset[ResultKey]:
     """Every queue key that already has a TERMINAL row -- what target
     selection must never reselect (R1)."""
     return frozenset(result_key(r) for r in results if r.outcome in _TERMINAL_OUTCOMES)
+
+
+def is_fee_schedule_void(result: ReplayResult) -> bool:
+    """`True` iff `result.refusal_counts` records at least one
+    `fee_schedule_mismatch` refusal (AUD-09b amendment fee-regime plan,
+    Phase 1). Checked for ANY `outcome` -- including a legacy `COMPLETED`
+    row written before this net existed (e.g. MDW 2026-09-01): the day was
+    void the moment the engine ever refused on a fee-schedule mismatch,
+    regardless of how the row's own `outcome` was originally classified."""
+    return result.refusal_counts.get(FEE_SCHEDULE_MISMATCH_REFUSAL, 0) >= 1

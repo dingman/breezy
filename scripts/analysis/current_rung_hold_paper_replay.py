@@ -22,6 +22,17 @@ every emitted `trial_id` carries the manifest's `family_id` (AUD-19a), and a
 `family_params.json` provenance sidecar records the resolved parameters
 under `--output-dir`. Omitting the flag (the default) leaves every existing
 invocation byte-identical to before this flag existed.
+
+AUD-09b fee-regime plan, Phase 3: with `--family-manifest` present, an
+EXACT preflight (`assert_fee_schedule_matches_family`) runs before the
+engine starts -- every tape instrument's OWN pinned taker theta (read
+through `fees.taker_fee_coefficient_of`, the SAME reader
+`polymarket_us_fee` uses) must equal the manifest's registered
+`taker_fee_coefficient`. A mismatch exits `EXIT_FEE_SCHEDULE_MISMATCH`
+(never runs the engine); the replay runner's own `classify_driver_failure`
+maps that code to `BLOCKED FEE_SCHEDULE_MISMATCH` with the same durable
+exclusion Phase 1/2 give the post-hoc net. This makes the refusal exact and
+independent of parsing the driver's own stdout.
 """
 
 from __future__ import annotations
@@ -65,6 +76,7 @@ from run_weather_strategy_backtests import (
 )
 from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
+from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_of
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
@@ -119,17 +131,20 @@ from breezy.strategy.depth10 import best_order
 __all__ = [
     "EXIT_FAMILY_MANIFEST_REFUSED",
     "EXIT_FAMILY_MANIFEST_UNUSABLE",
+    "EXIT_FEE_SCHEDULE_MISMATCH",
     "EXIT_OK",
     "PROVENANCE_HEADER_TEMPLATE",
     "SEVEN_DAYS_NS",
     "STARTING_BALANCE_USD",
     "FamilyManifestArgumentError",
     "FamilyParameters",
+    "FeeScheduleMismatchError",
     "NoDecisionWindowCoverageError",
     "PiecemealFamilyParametersError",
     "UnlistedStationDayError",
     "VenueOutsideLiveDirError",
     "assert_decision_window_has_coverage",
+    "assert_fee_schedule_matches_family",
     "build_provenance_header",
     "climate_day_records_to_settlement",
     "close_source_label",
@@ -167,6 +182,13 @@ EXIT_FAMILY_MANIFEST_REFUSED: Final[int] = 2
 #: `FamilyManifestError` (and its subclasses) or an `OSError` on the
 #: manifest path. Reachable ONLY through `--family-manifest`.
 EXIT_FAMILY_MANIFEST_UNUSABLE: Final[int] = 3
+#: AUD-09b fee-regime plan, Phase 3: `assert_fee_schedule_matches_family`'s
+#: `FeeScheduleMismatchError` -- at least one tape instrument's OWN pinned
+#: taker theta disagrees with the manifest's registered
+#: `taker_fee_coefficient`. Reachable ONLY through `--family-manifest`. Must
+#: equal `replay_daily_runner._EXIT_FEE_SCHEDULE_MISMATCH` (pinned by
+#: `test_fee_schedule_mismatch_exit_code_matches_the_drivers_own_constant`).
+EXIT_FEE_SCHEDULE_MISMATCH: Final[int] = 4
 
 #: AUD-19b C6: the provenance sidecar's filename, written under
 #: `--output-dir` only when `--family-manifest` is passed.
@@ -274,6 +296,43 @@ def assert_requested_days_are_listed(
             f"requested day(s) not listed by the tape: "
             f"{[d.isoformat() for d in unlisted]!r}; listed days: "
             f"{sorted(d.isoformat() for d in listed)!r}",
+        )
+
+
+class FeeScheduleMismatchError(ValueError):
+    """AUD-09b fee-regime plan, Phase 3: a tape instrument's OWN pinned
+    taker theta disagrees with the armed family's registered
+    `taker_fee_coefficient`. Raised BEFORE the engine starts -- exact, and
+    independent of parsing the driver's own stdout, unlike the replay
+    runner's post-hoc `fee_schedule_mismatch` refusal-count net
+    (`replay_daily_runner.py`, Phase 1)."""
+
+
+def assert_fee_schedule_matches_family(
+    tape_instruments: Sequence[TapeInstrument], *, required_fee_coefficient: Decimal,
+) -> None:
+    """Exact preflight: every tape instrument's own taker theta, read
+    through :func:`taker_fee_coefficient_of` (the SAME reader
+    `polymarket_us_fee` -- the live pricing path -- uses), must equal
+    ``required_fee_coefficient``. An unknown/unusable schedule (`None`) is
+    ALSO a mismatch: it fails closed rather than silently running the
+    engine against an unpriced fee.
+
+    Raises
+    ------
+    FeeScheduleMismatchError
+        Naming every mismatched instrument id and both thetas.
+    """
+    mismatched = sorted(
+        str(ti.instrument.id)
+        for ti in tape_instruments
+        if taker_fee_coefficient_of(ti.instrument) != required_fee_coefficient
+    )
+    if mismatched:
+        raise FeeScheduleMismatchError(
+            f"tape instrument(s) {mismatched!r} carry a taker theta different from "
+            f"the armed family's required theta {required_fee_coefficient}; refusing "
+            "rather than running the engine against a mismatched fee regime"
         )
 
 
@@ -1423,6 +1482,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     tape_instruments = _select_capture_instruments(catalog, climate_day=climate_day)
     listed_days = sorted({ti.facts.climate_day for ti in tape_instruments})
     assert_requested_days_are_listed([climate_day], listed_days)
+
+    # AUD-09b fee-regime plan, Phase 3: reachable ONLY through
+    # --family-manifest, and only then does a required theta exist to check
+    # the tape against. Runs BEFORE any engine arm, so a mismatch never
+    # burns a real run.
+    if family_params is not None:
+        try:
+            assert_fee_schedule_matches_family(
+                tape_instruments, required_fee_coefficient=family_params.taker_fee_coefficient,
+            )
+        except FeeScheduleMismatchError as exc:
+            print(f"current_rung_hold_paper_replay: refused: {exc}", file=sys.stderr)
+            return EXIT_FEE_SCHEDULE_MISMATCH
 
     std_utc_offset_hours = default_registry().climate_day_window(
         WEATHER_VENUE, args.station,

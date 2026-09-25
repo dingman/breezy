@@ -26,6 +26,24 @@ With the flag available, every row's `engine_params_source` is
 provenance sidecar -- never `"DRIVER_DEFAULTS"` (that source only applied
 when the flag did not exist). B16/B20 are satisfied more strongly this way:
 `params_match` reflects the ENGINE's own readback, not an inference.
+
+**AUD-09b fee-regime plan, Phase 1.** A day the engine ever refuses on
+`fee_schedule_mismatch` is recorded `BLOCKED`, never `COMPLETED`, its output
+directory quarantined (never deleted), and the key durably excluded from
+re-selection under the SAME armed family's theta (`fee_void_keys`) --
+closing the gap where a pre-drift day looped as a meaningless
+`COMPLETED trials=0` forever.
+
+**AUD-09b fee-regime plan, Phase 2.** `select_target` also takes an
+optional `fee_coefficient_as_of` callable so a real run can PRE-select only
+station-days the dated schedule
+(`breezy.adapters.polymarket_us.fees.taker_fee_coefficient_as_of`) pins to
+the armed family's own theta -- the vast majority of the fix, since net
+(1) alone would still waste a full engine run on every pre-drift day
+before ever reaching one Phase 1 could catch. `main` imports that function
+lazily (inside itself, not at module level) so a caller that never runs a
+real replay -- every test in this suite -- never pays for pulling in
+`nautilus_trader`'s Cython `FeeModel` at import time.
 """
 
 from __future__ import annotations
@@ -44,19 +62,24 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from breezy.analysis.replay_results import (
+    FEE_SCHEDULE_MISMATCH_REFUSAL,
     REPLAY_RESULTS_SCHEMA_VERSION,
     REPLAY_VALIDITY,
     DuplicateReplayResultError,
     ReplayResult,
+    ResultKey,
     UnknownReplayResultSchemaError,
     append_replay_result,
+    is_fee_schedule_void,
     read_replay_results,
+    result_key,
     terminal_keys,
 )
 from breezy.analysis.replay_sufficiency import (
@@ -88,6 +111,7 @@ __all__ = [
     "STALL_ALERT_RUN_LENGTH",
     "WEATHER_VENUE",
     "DriftRecord",
+    "LegacyFeeVoidQuarantineResult",
     "RunConfig",
     "SkipReason",
     "SubprocessRunner",
@@ -97,7 +121,10 @@ __all__ = [
     "classify_asos_failure",
     "classify_driver_failure",
     "compute_drift",
+    "fee_regime_excluded_count",
+    "fee_void_keys",
     "main",
+    "quarantine_legacy_fee_void",
     "read_replay_drift",
     "read_skip_state",
     "record_blocked",
@@ -146,6 +173,12 @@ STALL_ALERT_RUN_LENGTH: Final[int] = 3
 #: constants if that module's exit-code table ever changes.
 _EXIT_FAMILY_MANIFEST_REFUSED: Final[int] = 2
 _EXIT_FAMILY_MANIFEST_UNUSABLE: Final[int] = 3
+#: AUD-09b fee-regime plan, Phase 3: the driver's own exact preflight
+#: refusal -- a tape instrument's theta disagrees with the armed family's.
+#: Must equal `current_rung_hold_paper_replay.EXIT_FEE_SCHEDULE_MISMATCH`
+#: (pinned by `test_fee_schedule_mismatch_exit_code_matches_the_drivers_
+#: own_constant`).
+_EXIT_FEE_SCHEDULE_MISMATCH: Final[int] = 4
 
 _EXCEPTION_NAME_RE: Final[re.Pattern[str]] = re.compile(r"\b([A-Z][A-Za-z0-9_]*Error)\b")
 
@@ -311,6 +344,83 @@ def emit_new_drift_alerts(
 # ---------------------------------------------------------------------------
 
 
+def fee_void_keys(
+    replayed: Sequence[ReplayResult], required_fee_coefficient: Decimal | None,
+) -> frozenset[ResultKey]:
+    """AC2: every queue key carrying a row `is_fee_schedule_void` whose OWN
+    `manifest_taker_fee_coefficient` equals `required_fee_coefficient` --
+    compared as `Decimal`, never as raw strings, so `"0.0700"` and
+    `Decimal("0.07")` are the SAME theta. A key voided under a DIFFERENT
+    family's theta is not excluded here: re-arming a different family must
+    be free to re-replay a day another family's fee regime poisoned.
+
+    `required_fee_coefficient is None` (no armed family resolved theta)
+    excludes nothing -- every pre-existing caller that never passes this
+    kwarg keeps yesterday's behaviour byte-for-byte."""
+    if required_fee_coefficient is None:
+        return frozenset()
+    excluded: set[ResultKey] = set()
+    for row in replayed:
+        if not is_fee_schedule_void(row):
+            continue
+        if row.manifest_taker_fee_coefficient is None:
+            continue
+        if Decimal(row.manifest_taker_fee_coefficient) != required_fee_coefficient:
+            continue
+        excluded.add(result_key(row))
+    return frozenset(excluded)
+
+
+def _pre_fee_eligible_rows(
+    *,
+    rows: Sequence[ReplaySufficiency],
+    replayed: Sequence[ReplayResult],
+    drift: Sequence[DriftRecord],
+    strategy: str,
+    lag_minutes: int,
+    required_fee_coefficient: Decimal | None,
+) -> list[ReplaySufficiency]:
+    """Every AUD-09b amendment R1 predicate, PLUS AC2's durable fee-void
+    exclusion. Factored out so a future consumer of "otherwise eligible"
+    (e.g. a fee-regime exclusion count) shares this exact definition rather
+    than re-deriving it."""
+    done = terminal_keys(replayed)
+    drifted_keys = {d.key for d in drift}
+    fee_blocked_keys = fee_void_keys(replayed, required_fee_coefficient)
+    return [
+        row
+        for row in rows
+        if is_replayable_whole_day(row)
+        and row.live_instance_count == 0
+        and row.station in SUPPORTED_STATIONS
+        and (row.station, row.climate_day, strategy, lag_minutes) not in done
+        and (row.station, row.climate_day, strategy, lag_minutes) not in drifted_keys
+        and (row.station, row.climate_day, strategy, lag_minutes) not in fee_blocked_keys
+    ]
+
+
+def _fee_regime_eligible(
+    row: ReplaySufficiency,
+    *,
+    required_fee_coefficient: Decimal | None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None,
+) -> bool:
+    """AC3: `row` is eligible only when the DATED schedule
+    (`fee_coefficient_as_of`) pins the SAME theta at BOTH the row's own
+    `window_start_ns` and `window_end_ns` -- `None` at either edge (the
+    AMBIGUOUS window, or before the earliest pinned date) fails closed.
+
+    `fee_coefficient_as_of is None` or `required_fee_coefficient is None`
+    admits every row: Phase 2 is opt-in via these two kwargs, so a caller
+    that never passes them (every pre-existing test) keeps the date-blind
+    behaviour byte-for-byte."""
+    if fee_coefficient_as_of is None or required_fee_coefficient is None:
+        return True
+    start = fee_coefficient_as_of(row.window_start_ns)
+    end = fee_coefficient_as_of(row.window_end_ns)
+    return start == required_fee_coefficient and end == required_fee_coefficient
+
+
 def select_target(
     *,
     rows: Sequence[ReplaySufficiency],
@@ -318,6 +428,8 @@ def select_target(
     drift: Sequence[DriftRecord],
     strategy: str = DEFAULT_STRATEGY,
     lag_minutes: int = DEFAULT_LAG_MINUTES,
+    required_fee_coefficient: Decimal | None = None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None = None,
 ) -> ReplaySufficiency | None:
     """The oldest eligible `(station, climate_day)`, tie-broken by
     `SUPPORTED_STATIONS` order (base plan §6b.3; AUD-09b amendment R1).
@@ -328,24 +440,59 @@ def select_target(
     `live_instance_count == 0`, AND `station in SUPPORTED_STATIONS` (the
     census also emits candidate/NYC rows the queue must never take, H1),
     AND no TERMINAL result row under the full key, AND the key is not in
-    the drift set (a drifted key is never re-replayed, R4).
+    the drift set (a drifted key is never re-replayed, R4), AND the key
+    carries no durable `FEE_SCHEDULE_MISMATCH` void under THIS theta (AC2),
+    AND (Phase 2, opt-in) the dated fee schedule pins THIS theta across the
+    row's own decision window (AC3).
     """
-    done = terminal_keys(replayed)
-    drifted_keys = {d.key for d in drift}
+    pre_fee_eligible = _pre_fee_eligible_rows(
+        rows=rows, replayed=replayed, drift=drift, strategy=strategy, lag_minutes=lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+    )
     eligible = [
         row
-        for row in rows
-        if is_replayable_whole_day(row)
-        and row.live_instance_count == 0
-        and row.station in SUPPORTED_STATIONS
-        and (row.station, row.climate_day, strategy, lag_minutes) not in done
-        and (row.station, row.climate_day, strategy, lag_minutes) not in drifted_keys
+        for row in pre_fee_eligible
+        if _fee_regime_eligible(
+            row,
+            required_fee_coefficient=required_fee_coefficient,
+            fee_coefficient_as_of=fee_coefficient_as_of,
+        )
     ]
     if not eligible:
         return None
     station_rank = {station: index for index, station in enumerate(SUPPORTED_STATIONS)}
     eligible.sort(key=lambda row: (row.climate_day, station_rank[row.station]))
     return eligible[0]
+
+
+def fee_regime_excluded_count(
+    *,
+    rows: Sequence[ReplaySufficiency],
+    replayed: Sequence[ReplayResult],
+    drift: Sequence[DriftRecord],
+    strategy: str = DEFAULT_STRATEGY,
+    lag_minutes: int = DEFAULT_LAG_MINUTES,
+    required_fee_coefficient: Decimal | None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None,
+) -> int:
+    """AC4: how many rows that pass every OTHER `select_target` predicate
+    the AC3 dated-schedule check alone excludes -- the count the daily
+    `FEE_REGIME_EXCLUDED n ...` line names. Zero whenever
+    `fee_coefficient_as_of` is `None` (Phase 2 not wired) or
+    `required_fee_coefficient` is `None` (no armed family theta)."""
+    pre_fee_eligible = _pre_fee_eligible_rows(
+        rows=rows, replayed=replayed, drift=drift, strategy=strategy, lag_minutes=lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+    )
+    return sum(
+        1
+        for row in pre_fee_eligible
+        if not _fee_regime_eligible(
+            row,
+            required_fee_coefficient=required_fee_coefficient,
+            fee_coefficient_as_of=fee_coefficient_as_of,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,11 +514,25 @@ def record_blocked(
     blocked_reason: str,
     sufficiency_reason: str = "",
     census_schema_version: int | None = None,
+    family_id: str | None = None,
+    manifest_taker_fee_coefficient: str | None = None,
+    engine_required_fee_coefficient: str | None = None,
+    tape_instance_id: str | None = None,
+    refusal_counts: Mapping[str, int] | None = None,
     sink: AlertSink | None = None,
     now_ts: Callable[[], str] = _now_ts,
 ) -> None:
     """Append one `outcome="BLOCKED"` row (day stays queued, exit 0 at the
-    call site) and escalate via B19's stall rule."""
+    call site) and escalate via B19's stall rule.
+
+    `family_id`/`manifest_taker_fee_coefficient`/`engine_required_fee_
+    coefficient`/`tape_instance_id`/`refusal_counts` are AUD-09b amendment
+    fee-regime plan additions (Phase 1) -- keyword-only, all defaulting to
+    the pre-existing hardcoded `None`/`{}` so every pre-existing call site
+    writes a byte-identical row. A `FEE_SCHEDULE_MISMATCH` block needs them
+    so `fee_void_keys` can compare the row's OWN theta against an armed
+    family's (AC2); every other `blocked_reason` still writes them `None`.
+    """
     row = ReplayResult(
         schema_version=REPLAY_RESULTS_SCHEMA_VERSION,
         run_ts=now_ts(),
@@ -383,19 +544,19 @@ def record_blocked(
         validity=REPLAY_VALIDITY,
         blocked_reason=blocked_reason,
         exception_type=None,
-        family_id=None,
+        family_id=family_id,
         manifest_sha256=None,
-        manifest_taker_fee_coefficient=None,
-        engine_required_fee_coefficient=None,
+        manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,
+        engine_required_fee_coefficient=engine_required_fee_coefficient,
         engine_params_source=None,
         params_match=None,
         composition_kind=None,
-        tape_instance_id=None,
+        tape_instance_id=tape_instance_id,
         sufficiency_reason=sufficiency_reason,
         trials=0,
         fills=0,
         fill_price_vs_decision_ask=(),
-        refusal_counts={},
+        refusal_counts=dict(refusal_counts or {}),
         wall_s=None,
         peak_rss_bytes=None,
         parquet_sha256=None,
@@ -443,6 +604,9 @@ _BLOCKED_REMEDIATION: Final[dict[str, str]] = {
         "the armed manifest's composition_kind/station conflicts; re-check it"
     ),
     "FAMILY_MANIFEST_UNUSABLE": "the armed manifest is malformed or unpinned; re-check it",
+    "FEE_SCHEDULE_MISMATCH": (
+        "tape instrument theta != family theta; recheck FEE_SCHEDULE_PIN table vs tape"
+    ),
 }
 _DEFAULT_BLOCKED_REMEDIATION: Final[str] = "investigate the wrapper log for this reason"
 
@@ -622,18 +786,21 @@ def build_driver_argv(
 def classify_driver_failure(
     *, returncode: int, stderr: str
 ) -> tuple[Literal["BLOCKED", "FAILED"], str]:
-    """A non-zero driver exit is `BLOCKED` only for the two well-known
-    family-manifest refusal codes (should not occur in practice -- the
-    runner resolves and validates the manifest before invoking the driver
-    -- but classified rather than silently mis-filed as a crash);
-    everything else is `FAILED`, with the exception type parsed from the
-    LAST `...Error` name in stderr (a driver crash prints an uncaught
-    Python traceback -- base plan §9's `NoDecisionWindowCoverageError` /
-    `EntryAskFromLatchMissingError` / `ImpossibleFillPriceError` cases)."""
+    """A non-zero driver exit is `BLOCKED` only for the well-known
+    family-manifest refusal codes and the Phase 3 fee-schedule preflight
+    (should not occur in practice -- the runner's own Phase 2 pre-selection
+    already excludes a mismatched day -- but classified rather than
+    silently mis-filed as a crash); everything else is `FAILED`, with the
+    exception type parsed from the LAST `...Error` name in stderr (a driver
+    crash prints an uncaught Python traceback -- base plan §9's
+    `NoDecisionWindowCoverageError` / `EntryAskFromLatchMissingError` /
+    `ImpossibleFillPriceError` cases)."""
     if returncode == _EXIT_FAMILY_MANIFEST_REFUSED:
         return "BLOCKED", "FAMILY_MANIFEST_REFUSED"
     if returncode == _EXIT_FAMILY_MANIFEST_UNUSABLE:
         return "BLOCKED", "FAMILY_MANIFEST_UNUSABLE"
+    if returncode == _EXIT_FEE_SCHEDULE_MISMATCH:
+        return "BLOCKED", "FEE_SCHEDULE_MISMATCH"
     matches = _EXCEPTION_NAME_RE.findall(stderr)
     exception_type = matches[-1] if matches else "UnknownDriverFailure"
     return "FAILED", exception_type
@@ -741,12 +908,96 @@ class RunConfig:
     skip_state_path: Path = DEFAULT_SKIP_STATE_PATH
 
 
-def _output_dir_for(config: RunConfig, *, station: str, climate_day: str) -> Path:
+def _output_dir_for_lag(
+    output_root: Path, *, station: str, climate_day: str, lag_minutes: int,
+) -> Path:
     return (
-        config.output_root
+        output_root
         / "paper_replay" / "scored_trials" / "v3" / station / climate_day
-        / f"lag_{config.lag_minutes}"
+        / f"lag_{lag_minutes}"
     )
+
+
+def _output_dir_for(config: RunConfig, *, station: str, climate_day: str) -> Path:
+    return _output_dir_for_lag(
+        config.output_root, station=station, climate_day=climate_day,
+        lag_minutes=config.lag_minutes,
+    )
+
+
+def _quarantine_fee_void_output_dir(
+    output_dir: Path, *, now_ts: Callable[[], str] = _now_ts,
+) -> bool:
+    """AC5: rename (never delete) a fee-void output directory to
+    `lag_<n>.fee_void.<utc-stamp>` via `os.replace`, so the `RECOVERED`
+    branch can never adopt its parquet and a `paper_replay` tally globbing
+    `scored_trials/v3` never pools it.
+
+    Idempotent: returns `False` on an absent directory -- already
+    quarantined under a stamped name, or nothing was ever written -- rather
+    than raising. The caller's own `record_blocked` row is what matters,
+    never this rename succeeding a second time."""
+    if not output_dir.exists():
+        return False
+    stamp = now_ts().replace(":", "").replace("-", "").replace("+00:00", "Z")
+    quarantined = output_dir.parent / f"{output_dir.name}.fee_void.{stamp}"
+    os.replace(output_dir, quarantined)
+    return True
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LegacyFeeVoidQuarantineResult:
+    """One key `quarantine_legacy_fee_void` inspected, and what it did."""
+
+    key: ResultKey
+    output_dir: Path
+    action: Literal["QUARANTINED", "DRY_RUN", "ALREADY_QUARANTINED_OR_ABSENT"]
+
+
+def quarantine_legacy_fee_void(
+    *,
+    replay_results_path: Path,
+    output_root: Path,
+    dry_run: bool = False,
+    now_ts: Callable[[], str] = _now_ts,
+) -> tuple[LegacyFeeVoidQuarantineResult, ...]:
+    """AC5 backstop for rows written BEFORE this net existed (Phase 1 review
+    requirement 2; e.g. the legacy MDW 2026-09-01 terminal `COMPLETED` row,
+    module docstring "LOW: Legacy residue"). Scans EVERY `COMPLETED`/
+    `RECOVERED` row in `replay_results.jsonl` for `is_fee_schedule_void` --
+    never assumes only one row, or only one station, is affected -- and
+    quarantine-renames each one's own `_output_dir_for_lag(...)` directory.
+
+    Idempotent: a directory already renamed (or never written) reports
+    `ALREADY_QUARANTINED_OR_ABSENT` rather than raising. `dry_run=True`
+    reports every affected key as `DRY_RUN` without touching the
+    filesystem. Never rewrites `replay_results.jsonl`, which is
+    append-only."""
+    results = read_replay_results(replay_results_path)
+    affected_keys = sorted(
+        {
+            result_key(row)
+            for row in results
+            if row.outcome in ("COMPLETED", "RECOVERED") and is_fee_schedule_void(row)
+        }
+    )
+    reports: list[LegacyFeeVoidQuarantineResult] = []
+    for key in affected_keys:
+        station, climate_day, _strategy, lag_minutes = key
+        output_dir = _output_dir_for_lag(
+            output_root, station=station, climate_day=climate_day, lag_minutes=lag_minutes,
+        )
+        action: Literal["QUARANTINED", "DRY_RUN", "ALREADY_QUARANTINED_OR_ABSENT"]
+        if dry_run:
+            action = "DRY_RUN"
+        elif _quarantine_fee_void_output_dir(output_dir, now_ts=now_ts):
+            action = "QUARANTINED"
+        else:
+            action = "ALREADY_QUARANTINED_OR_ABSENT"
+        reports.append(
+            LegacyFeeVoidQuarantineResult(key=key, output_dir=output_dir, action=action)
+        )
+    return tuple(reports)
 
 
 def _append_terminal(
@@ -815,11 +1066,21 @@ def run_once(
     now_ts: Callable[[], str] = _now_ts,
     work_dir_factory: Callable[[], Path] = _default_work_dir,
     std_utc_offset_hours_for: Callable[[str], float] | None = None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None = None,
 ) -> int:
     """The whole nightly decision, end to end. Returns the process exit
     code (never raises for an expected outcome -- BLOCKED/FAILED/EMPTY are
     all ordinary returns; H0/H3 corruption is the one thing that
-    propagates as a loud non-zero exit, never a silent empty queue)."""
+    propagates as a loud non-zero exit, never a silent empty queue).
+
+    `fee_coefficient_as_of` (AUD-09b amendment fee-regime plan, Phase 2) is
+    the SAME kind of optional production seam as `std_utc_offset_hours_for`
+    above: `None` here (every pre-existing test's default) keeps
+    `select_target` date-blind, exactly as before this plan; `main` wires
+    the real `breezy.adapters.polymarket_us.fees.taker_fee_coefficient_as_
+    of` in production. AC2's durable fee-void exclusion (`fee_void_keys`)
+    is NOT gated behind this kwarg -- it always runs once the armed
+    family's theta is known, independent of Phase 2's date table."""
     active_sink = sink if sink is not None else resolve_alert_sink(os.environ)
     # Review fix 3: reaching this function at all means the wrapper got
     # past both its own skip gates (the lock, the armed-family check) --
@@ -828,6 +1089,9 @@ def run_once(
 
     try:
         strategy = resolve_strategy_from_manifest(config.family_manifest_path)
+        required_fee_coefficient = load_family_manifest(
+            config.family_manifest_path,
+        ).taker_fee_coefficient
     except (OSError, FamilyManifestError, UnsupportedCompositionKindError) as exc:
         print(f"replay_daily_runner: family manifest unusable: {exc}", file=sys.stderr)
         return 1
@@ -864,6 +1128,23 @@ def run_once(
         drift=current_drift,
         strategy=strategy,
         lag_minutes=config.lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+        fee_coefficient_as_of=fee_coefficient_as_of,
+    )
+    # AC4: nothing about the fee-regime exclusion is silent, whether or not
+    # it is what emptied the queue.
+    excluded_count = fee_regime_excluded_count(
+        rows=rows,
+        replayed=existing_results,
+        drift=current_drift,
+        strategy=strategy,
+        lag_minutes=config.lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+        fee_coefficient_as_of=fee_coefficient_as_of,
+    )
+    print(
+        f"FEE_REGIME_EXCLUDED {excluded_count} station-day(s) "
+        f"(required theta={required_fee_coefficient}; table=FEE_SCHEDULE_PIN_2026-09-18)"
     )
     if target is None:
         sufficient_count = sum(1 for row in rows if row.verdict == "SUFFICIENT")
@@ -872,6 +1153,11 @@ def run_once(
                 sorted(Counter(row.reason for row in rows if row.verdict == "INSUFFICIENT").items())
             )
             print(f"EVERY DAY INSUFFICIENT -- {histogram}")
+        elif excluded_count > 0:
+            print(
+                f"QUEUE EMPTY (FEE REGIME) -- {excluded_count} station-day(s) excluded by the "
+                "dated fee schedule; table=FEE_SCHEDULE_PIN_2026-09-18"
+            )
         else:
             print(
                 f"QUEUE EMPTY -- {sufficient_count} SUFFICIENT day(s), all replayed under "
@@ -966,16 +1252,40 @@ def run_once(
     sidecar: dict[str, object] = {}
     if sidecar_path.exists():
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    manifest_taker_fee_coefficient = sidecar.get("manifest_taker_fee_coefficient")
+    engine_required_fee_coefficient = sidecar.get("engine_required_fee_coefficient")
     scored = read_scored_trials(output_dir)
     fill_price_vs_decision_ask = tuple(str(trial.slippage) for trial in scored)
     refusal_counts = _parse_strategy_refusals(driver_result.stdout or "")
+
+    # AUD-09b fee-regime plan, Phase 1: net (1), the exact post-hoc safety
+    # backstop. A day the engine ever refused on `fee_schedule_mismatch` is
+    # VOID regardless of `trials` -- a partial day under a latched halt is
+    # contaminated (AC1) -- so it is quarantined and recorded `BLOCKED`,
+    # never `COMPLETED`, and stays queued for re-selection under a
+    # DIFFERENT family's theta only (`fee_void_keys`, AC2).
+    if refusal_counts.get(FEE_SCHEDULE_MISMATCH_REFUSAL, 0) >= 1:
+        _quarantine_fee_void_output_dir(output_dir, now_ts=now_ts)
+        record_blocked(
+            results_path=config.replay_results_path, station=station, climate_day=climate_day,
+            strategy=strategy, lag_minutes=config.lag_minutes,
+            blocked_reason="FEE_SCHEDULE_MISMATCH",
+            sufficiency_reason=target.reason, census_schema_version=target.schema_version,
+            family_id=sidecar.get("family_id"),  # type: ignore[arg-type]
+            manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,  # type: ignore[arg-type]
+            engine_required_fee_coefficient=engine_required_fee_coefficient,  # type: ignore[arg-type]
+            tape_instance_id=target.winner_instance_id,
+            refusal_counts=refusal_counts,
+            sink=active_sink, now_ts=now_ts,
+        )
+        print(f"BLOCKED {station} {climate_day} -- FEE_SCHEDULE_MISMATCH")
+        return 0
+
     parquet_files = sorted(output_dir.glob("scored_trials_*.parquet"))
     parquet_sha256 = (
         hashlib.sha256(parquet_files[-1].read_bytes()).hexdigest() if parquet_files else None
     )
 
-    manifest_taker_fee_coefficient = sidecar.get("manifest_taker_fee_coefficient")
-    engine_required_fee_coefficient = sidecar.get("engine_required_fee_coefficient")
     _append_terminal(
         config, target, strategy=strategy, now_ts=now_ts, outcome="COMPLETED",
         family_id=sidecar.get("family_id"),  # type: ignore[arg-type]
@@ -1062,8 +1372,27 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--skip-state-path", type=Path, default=DEFAULT_SKIP_STATE_PATH)
+    parser.add_argument(
+        "--quarantine-legacy-fee-void",
+        action="store_true",
+        help=(
+            "AUD-09b fee-regime plan, Phase 1 review requirement 2: a "
+            "coordinator-run, one-shot migration. Scans replay_results.jsonl "
+            "for every COMPLETED/RECOVERED row whose refusal_counts records "
+            "a fee_schedule_mismatch (e.g. the pre-net MDW 2026-09-01 row) "
+            "and quarantine-renames its own output directory. Never "
+            "rewrites the append-only results file, and never invokes "
+            "run_once. Requires --replay-results and --output-root; every "
+            "other run_once-only flag is ignored."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --quarantine-legacy-fee-void, list affected keys without renaming.",
+    )
     args = parser.parse_args(argv)
-    if args.report_skip is None:
+    if args.report_skip is None and not args.quarantine_legacy_fee_void:
         missing = [
             flag
             for flag, value in (
@@ -1076,6 +1405,8 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ]
         if missing:
             parser.error(f"the following arguments are required: {', '.join(missing)}")
+    elif args.quarantine_legacy_fee_void and args.output_root is None:
+        parser.error("--quarantine-legacy-fee-void requires --output-root")
     return args
 
 
@@ -1083,6 +1414,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.report_skip is not None:
         record_skip(skip_state_path=args.skip_state_path, reason=args.report_skip)
+        return 0
+    if args.quarantine_legacy_fee_void:
+        reports = quarantine_legacy_fee_void(
+            replay_results_path=args.replay_results,
+            output_root=args.output_root,
+            dry_run=args.dry_run,
+        )
+        for report in reports:
+            station, climate_day, _strategy, lag_minutes = report.key
+            print(
+                f"{report.action} {station} {climate_day} lag_{lag_minutes} -- "
+                f"{report.output_dir}"
+            )
+        print(
+            f"quarantine-legacy-fee-void: {len(reports)} key(s) affected "
+            f"(dry_run={args.dry_run})"
+        )
         return 0
     config = RunConfig(
         replay_sufficiency_path=args.replay_sufficiency,
@@ -1095,7 +1443,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         python_executable=args.python_executable,
         skip_state_path=args.skip_state_path,
     )
-    return run_once(config, std_utc_offset_hours_for=_resolve_std_utc_offset_hours)
+    from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_as_of
+
+    return run_once(
+        config,
+        std_utc_offset_hours_for=_resolve_std_utc_offset_hours,
+        fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
 
 
 if __name__ == "__main__":

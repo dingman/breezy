@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from breezy.analysis.replay_results import (
+    FEE_SCHEDULE_MISMATCH_REFUSAL,
     REPLAY_RESULTS_SCHEMA_VERSION,
     REPLAY_VALIDITY,
     DuplicateReplayResultError,
@@ -26,6 +27,7 @@ from breezy.analysis.replay_results import (
     ReplayResultRecordError,
     UnknownReplayResultSchemaError,
     append_replay_result,
+    is_fee_schedule_void,
     read_replay_results,
     result_key,
 )
@@ -196,3 +198,36 @@ def test_module_does_not_use_dataclasses_asdict() -> None:
         __file__,
     ).resolve().parents[2] / "src" / "breezy" / "analysis" / "replay_results.py"
     assert "asdict(" not in source.read_text()
+
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 1: `is_fee_schedule_void`
+# ---------------------------------------------------------------------------
+
+
+def test_is_fee_schedule_void_true_for_completed_row_with_fee_mismatch_refusal() -> None:
+    """The shape of the legacy MDW 2026-09-01 row: `outcome="COMPLETED"`
+    but `refusal_counts` already recorded a `fee_schedule_mismatch` refusal
+    -- void regardless of how it was originally classified."""
+    row = _row(
+        outcome="COMPLETED",
+        refusal_counts={"fee_schedule_mismatch": 1, "outside_decision_window": 26_215},
+    )
+    assert is_fee_schedule_void(row)
+
+
+def test_is_fee_schedule_void_false_when_refusal_absent_or_zero() -> None:
+    absent = _row(refusal_counts={"outside_decision_window": 26_215})
+    zero = _row(refusal_counts={"fee_schedule_mismatch": 0})
+    assert not is_fee_schedule_void(absent)
+    assert not is_fee_schedule_void(zero)
+
+
+def test_fee_schedule_mismatch_refusal_constant_matches_decision_literal() -> None:
+    """Cross-checked against `evaluate_decision`'s own `Refuse` literal
+    (`current_rung_hold/decision.py:344`) -- never a second hand-copied
+    string that can drift from it."""
+    from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
+
+    assert FEE_SCHEDULE_MISMATCH_REFUSAL == "fee_schedule_mismatch"
+    assert FEE_SCHEDULE_MISMATCH_REFUSAL in REFUSAL_REASONS
