@@ -425,14 +425,20 @@ def _redact_order_id(venue_order_id: str) -> str:
 
 
 #: AUD-13b (plan §6 "Fail-closed semantics"): the event name every durable-
-#: reconciliation refusal is surfaced under, and its three NAMED latches.
-#: Each refusal returns empty reports for its scope AND latches one of these
-#: -- emptiness is never indistinguishable from "nothing to report", and no
+#: reconciliation refusal is surfaced under, and its NAMED latches. Each
+#: refusal returns empty reports for its scope AND latches one of these --
+#: emptiness is never indistinguishable from "nothing to report", and no
 #: refusal borrows another's name.
 RECONCILIATION_REFUSAL_EVENT: Final[str] = "reconciliation_refusal"
 POSITIONS_READ_FAILED: Final[str] = "positions_read_failed"
 RECORD_VENUE_DISAGREEMENT: Final[str] = "record_venue_disagreement"
 FEE_COEFFICIENT_AMBIGUOUS: Final[str] = "fee_coefficient_ambiguous"
+#: AUD-13b silent-failure review finding 1: an UNEXPECTED defect building one
+#: position's reports (never a foreign payload shape -- that is
+#: ``positions_read_failed`` -- and never a corrupt fee input -- that is
+#: ``fee_coefficient_ambiguous``). Scoped to the ONE position it hit so a
+#: defect in one position's build never drops every other position's reports.
+DURABLE_REPORTS_BUILD_FAILED: Final[str] = "durable_reports_build_failed"
 
 #: What `_map_position` did with one venue position (AUD-13b). Anything that
 #: is not one of the first three -- a mapping error, a non-long side -- is
@@ -447,10 +453,11 @@ _RECONCILIATION_REFUSAL_DETAILS: Final[Mapping[str, str]] = {
     POSITIONS_READ_FAILED: "POSITIONS_READ_FAILED",
     RECORD_VENUE_DISAGREEMENT: "RECORD_VENUE_DISAGREEMENT",
     FEE_COEFFICIENT_AMBIGUOUS: "FEE_COEFFICIENT_AMBIGUOUS",
+    DURABLE_REPORTS_BUILD_FAILED: "DURABLE_REPORTS_BUILD_FAILED",
 }
 
 #: The counts line's fields, in their fixed order (plan §6 "Regression
-#: detector"). ``refusals`` is the sum of the three per-cause fields.
+#: detector"). ``refusals`` is the sum of the per-cause fields.
 _RECONCILIATION_COUNT_FIELDS: Final[tuple[str, ...]] = (
     "order_reports",
     "fill_reports",
@@ -461,6 +468,7 @@ _RECONCILIATION_COUNT_FIELDS: Final[tuple[str, ...]] = (
     f"refusals_{POSITIONS_READ_FAILED}",
     f"refusals_{RECORD_VENUE_DISAGREEMENT}",
     f"refusals_{FEE_COEFFICIENT_AMBIGUOUS}",
+    f"refusals_{DURABLE_REPORTS_BUILD_FAILED}",
 )
 
 
@@ -2971,20 +2979,43 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if error is None:
             try:
                 positions = self._declared_positions(payload)
-            except Exception as exc:  # noqa: BLE001 - a foreign shape is a failed read
-                error = exc
-            else:
                 position_reports, outcomes = self._map_positions(positions)
+            except Exception as exc:  # noqa: BLE001 - a foreign shape OR a mapping
+                # defect is a failed read either way (silent-failure review
+                # finding 1): `_map_positions` must run INSIDE this try, not
+                # in an `else:` -- an `else:` clause is not covered by the
+                # `try:` block's own `except`, so a mapping defect used to
+                # escape uncaught.
+                error = exc
         counts["gated_out"] = outcomes.count(_MAP_GATED_OUT)
+        # Finding 4 (accepted as-is, LOW): `instrument_absent` is counted for
+        # visibility only and deliberately never latched -- the engine
+        # already no-ops on an uncached instrument natively
+        # (``execution_engine.py:3056-3062``), so this is not a Breezy
+        # refusal, and `_durable_reports_for_position` already logs a
+        # WARNING for each occurrence.
         counts["instrument_absent"] = outcomes.count(_MAP_INSTRUMENT_ABSENT)
         if error is not None or _MAP_UNPARSEABLE in outcomes:
             self._latch_reconciliation_refusal(POSITIONS_READ_FAILED, "")
             counts[f"refusals_{POSITIONS_READ_FAILED}"] = 1
         else:
             for position in position_reports:
-                self._durable_reports_for_position(
-                    position, counts, order_reports, fill_reports, fee_sources
-                )
+                try:
+                    self._durable_reports_for_position(
+                        position, counts, order_reports, fill_reports, fee_sources
+                    )
+                except Exception as exc:  # noqa: BLE001 - finding 1: NOTHING from a
+                    # per-position build may reach the native handler, and one
+                    # bad position must not drop every other position's reports.
+                    self._latch_reconciliation_refusal(
+                        DURABLE_REPORTS_BUILD_FAILED, str(position.instrument_id)
+                    )
+                    counts[f"refusals_{DURABLE_REPORTS_BUILD_FAILED}"] += 1
+                    self._log.warning(
+                        "durable reconciliation: building reports for "
+                        f"{position.instrument_id} raised ({type(exc).__name__}: {exc}); "
+                        "nothing is reported for it; other positions are unaffected"
+                    )
         counts["order_reports"] = len(order_reports)
         counts["fill_reports"] = len(fill_reports)
         counts["refusals"] = sum(
@@ -3037,7 +3068,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         built: list[tuple[OrderStatusReport, FillReport, str]] = []
         for record in records:
-            commission, fee_source = self._reconciled_commission(record)
+            try:
+                commission, fee_source = self._reconciled_commission(record)
+            except (ArithmeticError, ValueError) as exc:
+                # Finding 2: a corrupt record (a price outside [0, 1] from bad
+                # cumulative_cost/cumulative_qty, or a division by a zero
+                # quantity) reaches `taker_fee_at_fill`'s own validation.
+                # `taker_fee_at_fill` is left unchanged; fold the raise into
+                # the SAME fee_coefficient_ambiguous handling below rather
+                # than let it escape.
+                self._log.warning(
+                    "durable reconciliation: fee computation for "
+                    f"{_redact_order_id(record.venue_order_id)} raised "
+                    f"({type(exc).__name__}: {exc}); treated as fee_coefficient_ambiguous"
+                )
+                commission, fee_source = None, ""
             if commission is None:
                 self._latch_reconciliation_refusal(
                     FEE_COEFFICIENT_AMBIGUOUS,

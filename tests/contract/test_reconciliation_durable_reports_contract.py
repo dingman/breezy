@@ -48,6 +48,7 @@ from nautilus_trader.model.objects import Money
 from nautilus_trader.portfolio.portfolio import Portfolio
 
 from breezy.adapters.polymarket_us.exec.client import (
+    DURABLE_REPORTS_BUILD_FAILED,
     FEE_COEFFICIENT_AMBIGUOUS,
     FEE_SOURCE_MODELLED_AT_FILL_TIME,
     FEE_SOURCE_RECORDED,
@@ -705,13 +706,15 @@ def test_the_reconciliation_counts_line_distinguishes_zero_records_from_zero_rep
         "refusals_positions_read_failed": 0,
         "refusals_record_venue_disagreement": 0,
         "refusals_fee_coefficient_ambiguous": 0,
+        "refusals_durable_reports_build_failed": 0,
     }
     nothing = format_reconciliation_counts_line(base)
     regressed = format_reconciliation_counts_line({**base, "records_considered": 3})
     assert nothing == (
         "durable reconciliation: order_reports=0 fill_reports=0 records_considered=0 "
         "gated_out=0 instrument_absent=0 refusals=0 refusals_positions_read_failed=0 "
-        "refusals_record_venue_disagreement=0 refusals_fee_coefficient_ambiguous=0"
+        "refusals_record_venue_disagreement=0 refusals_fee_coefficient_ambiguous=0 "
+        "refusals_durable_reports_build_failed=0"
     )
     assert "order_reports=0" in regressed
     assert "records_considered=3" in regressed
@@ -952,4 +955,115 @@ async def test_a_latched_refusal_reaches_the_alert_sink_once_after_a_real_reconc
     assert payload.detail == "FEE_COEFFICIENT_AMBIGUOUS"
     assert payload.severity == "WARN"
     assert "V-AL" not in payload.detail
+    await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# AUD-13b review fixes: `_durable_reconciliation_pass` must never raise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_mapping_defect_folds_into_positions_read_failed_never_escapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A defect in `_map_positions` used to run in the `else:` of a
+    try/except -- NOT covered by that except's `try:`. Called directly (not
+    through `generate_mass_status`, which has its own unrelated safety net),
+    the generator itself must not raise, and the defect must fold into the
+    SAME positions_read_failed refusal a foreign payload shape gets."""
+    yes, _ = _pair()
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(yes,))
+    await rig.client._connect()
+    rig.client.record_fill(_record(yes, venue_order_id="V-MAPBUG-1", client_order_id="O-MAPBUG-1"))
+    rig.hold(_slug(yes), 1)
+
+    def _boom(positions: Any) -> Any:
+        raise RuntimeError("mapping defect")
+
+    monkeypatch.setattr(rig.client, "_map_positions", _boom)
+
+    order_reports = await rig.client.generate_order_status_reports(None)
+
+    assert order_reports == []
+    assert list(_refusals_by_latch(rig.client)) == [POSITIONS_READ_FAILED]
+    assert rig.client.reconciliation_counts["refusals_positions_read_failed"] == 1
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_per_position_build_defect_is_isolated_other_positions_still_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-position loop in `_durable_reconciliation_pass` used to run
+    outside any try. A defect building ONE position's reports must not drop
+    every other position's reports, and must never escape to the native
+    handler -- it latches its OWN named refusal instead."""
+    yes, _ = _pair()
+    second = build_second_instrument()
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(yes, second))
+    await rig.client._connect()
+    rig.client.record_fill(_record(yes, venue_order_id="V-GOOD-1", client_order_id="O-GOOD-1"))
+    rig.client.record_fill(
+        _record(second, venue_order_id="V-BAD-1", client_order_id="O-BAD-1", cost="0.09"),
+    )
+    rig.hold(_slug(yes), 1)
+    rig.hold(_slug(second), 1)
+
+    original = type(rig.client)._durable_reports_for_position
+
+    def _patched(
+        self: PolymarketUSExecutionClient,
+        position: Any,
+        counts: dict[str, int],
+        order_reports: list[Any],
+        fill_reports: list[Any],
+        fee_sources: dict[str, str],
+    ) -> None:
+        if position.instrument_id == second.id:
+            raise RuntimeError("build defect")
+        return original(self, position, counts, order_reports, fill_reports, fee_sources)
+
+    monkeypatch.setattr(type(rig.client), "_durable_reports_for_position", _patched)
+
+    order_reports = await rig.client.generate_order_status_reports(None)
+    fill_reports = await rig.client.generate_fill_reports(None)
+
+    assert [r.instrument_id for r in order_reports] == [yes.id]
+    assert [r.instrument_id for r in fill_reports] == [yes.id]
+    (entry,) = _refusals_by_latch(rig.client)[DURABLE_REPORTS_BUILD_FAILED]
+    assert entry["subject"] == str(second.id)
+    assert rig.client.reconciliation_counts["refusals_durable_reports_build_failed"] == 1
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_fee_input_folds_into_fee_coefficient_ambiguous_never_escapes(
+    tmp_path: Path,
+) -> None:
+    """``taker_fee_at_fill`` correctly raises ``ValueError`` for a price
+    outside ``[0, 1]`` -- reachable from a corrupt
+    ``cumulative_cost``/``cumulative_qty`` pair that survives
+    ``_records_explain_position``'s own (qty > 0, cost > 0) check. That
+    validation is left alone; the CALL SITE must fold the raise into the
+    existing fee-ambiguous refusal rather than let it escape."""
+    yes, _ = _pair()
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(yes,))
+    await rig.client._connect()
+    rig.client.record_fill(
+        _record(yes, venue_order_id="V-CORRUPT-1", client_order_id="O-CORRUPT-1",
+                qty="1", cost="2.00", ts_event=PRE_DRIFT_NS),
+    )
+    rig.hold(_slug(yes), 1)
+
+    order_reports = await rig.client.generate_order_status_reports(None)
+    fill_reports = await rig.client.generate_fill_reports(None)
+
+    assert order_reports == []
+    assert fill_reports == []
+    (entry,) = _refusals_by_latch(rig.client)[FEE_COEFFICIENT_AMBIGUOUS]
+    assert entry["subject"] == "V-CO…"
+    assert rig.client.reconciliation_counts["refusals_fee_coefficient_ambiguous"] == 1
     await rig.client._disconnect()
