@@ -237,3 +237,40 @@ def test_an_old_shape_row_is_still_classified_as_paper_but_never_attributed_to_a
     tally_mod.assert_paper_only([row])  # still paper, unscoped
     with pytest.raises(ValueError, match="not scoped to family 'pm_us_crh_v4'"):
         tally_mod.assert_paper_only([row], family_id="pm_us_crh_v4")
+
+
+# ---------------------------------------------------------------------------
+# AUD-19b step 20/A11: the 19a-to-19b window shape
+# (`paper_replay/unscoped/{prefix}{station}/{day}`, D1) is symmetric with the
+# old-shape and colliding-family cases above -- it satisfies the live/paper
+# barrier unscoped, and is refused by every family-scoped read and every
+# live-side selector, exactly as an unattributable row must be.
+# ---------------------------------------------------------------------------
+def test_an_unscoped_replay_id_is_never_attributable_to_a_family(
+    tally_mod: ModuleType,
+    family_tally_v2_mod: ModuleType,
+    fill_time_count_mod: ModuleType,
+    tmp_path: Path,
+) -> None:
+    row = _trial(_PAPER_ID)
+    with pytest.raises(ValueError, match="non-live"):
+        tally_mod.assert_live_only([row])
+    tally_mod.assert_paper_only([row])  # accepts -- unscoped read
+    with pytest.raises(ValueError, match="not scoped to family 'pm_us_crh_v4'"):
+        tally_mod.assert_paper_only([row], family_id="pm_us_crh_v4")
+
+    for family_id in ("pm_us_crh_cont", "pm_us_crh_v4"):
+        manifest = _manifest(family_id=family_id, trial_id_prefix=_CONT_PREFIX)
+        kept = family_tally_v2_mod.filter_rows_to_manifest_prefix(
+            [row], manifest, store_declared_single_family=False,
+        )
+        assert kept == ()
+
+    empty_state_db = tmp_path / "unscoped_exec_state.sqlite"
+    SqliteStateStore(empty_state_db).close()
+    assert (
+        fill_time_count_mod.count_filled_takes(
+            empty_state_db, family_prefix="continuous_rung_hold/trial/",
+        )
+        == 0
+    )

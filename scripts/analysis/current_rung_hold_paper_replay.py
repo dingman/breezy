@@ -14,6 +14,14 @@ No hand computation: every number this module prints comes from
 `breezy.runtime.paper_replay.format_roi_bound_for_paper_replay`, or
 `archive_correction_probe.wilson_interval` (the study's own Wilson helper) --
 never an inline Wilson or bootstrap formula (RED "no hand computation" test).
+
+AUD-19b: `--family-manifest <path>` optionally binds a run to one REGISTERED
+family manifest -- its `composition_kind` selects the strategy and its
+`taker_fee_coefficient` replaces `CurrentRungHoldConfig`'s class default,
+every emitted `trial_id` carries the manifest's `family_id` (AUD-19a), and a
+`family_params.json` provenance sidecar records the resolved parameters
+under `--output-dir`. Omitting the flag (the default) leaves every existing
+invocation byte-identical to before this flag existed.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import os
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -45,6 +54,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from archive_correction_probe import wilson_interval
+from argv_digest import argv_sha256
 from run_weather_strategy_backtests import (
     WEATHER_VENUE,
     TapeInstrument,
@@ -55,6 +65,7 @@ from run_weather_strategy_backtests import (
 )
 from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import as_backtest_data
@@ -106,10 +117,16 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 from breezy.strategy.depth10 import best_order
 
 __all__ = [
+    "EXIT_FAMILY_MANIFEST_REFUSED",
+    "EXIT_FAMILY_MANIFEST_UNUSABLE",
+    "EXIT_OK",
     "PROVENANCE_HEADER_TEMPLATE",
     "SEVEN_DAYS_NS",
     "STARTING_BALANCE_USD",
+    "FamilyManifestArgumentError",
+    "FamilyParameters",
     "NoDecisionWindowCoverageError",
+    "PiecemealFamilyParametersError",
     "UnlistedStationDayError",
     "VenueOutsideLiveDirError",
     "assert_decision_window_has_coverage",
@@ -117,6 +134,7 @@ __all__ = [
     "climate_day_records_to_settlement",
     "close_source_label",
     "print_tape_instrument_header",
+    "resolve_family_parameters",
     "run_one_precision_arm",
 ]
 
@@ -132,6 +150,27 @@ _WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
 STARTING_BALANCE_USD: Final[int] = 10_000
 SEVEN_DAYS_NS: Final[int] = 7 * 24 * 60 * 60 * 1_000_000_000
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
+
+#: AUD-19b C7: exit-code vocabulary for the NEW `--family-manifest` refusal
+#: paths ONLY, following the repo's existing module-level `EXIT_*`
+#: convention (`clear_family_halt_cli.py:46-48`), never the wrapper-level
+#: `75`/`SKIPPED-INFRA` shell convention. No pre-existing failure path's
+#: code changes: every one of them keeps CPython's uncaught-exception exit
+#: `1`, with the flag absent OR present.
+EXIT_OK: Final[int] = 0
+#: C4's `FamilyManifestArgumentError` -- station outside `manifest.stations`,
+#: `--strategy` conflicting with `composition_kind`, or
+#: `composition_kind == "forecast_ladder"`. Reachable ONLY through
+#: `--family-manifest`.
+EXIT_FAMILY_MANIFEST_REFUSED: Final[int] = 2
+#: The manifest cannot be loaded or is not registered/pinned --
+#: `FamilyManifestError` (and its subclasses) or an `OSError` on the
+#: manifest path. Reachable ONLY through `--family-manifest`.
+EXIT_FAMILY_MANIFEST_UNUSABLE: Final[int] = 3
+
+#: AUD-19b C6: the provenance sidecar's filename, written under
+#: `--output-dir` only when `--family-manifest` is passed.
+_FAMILY_PARAMS_SIDECAR_FILENAME: Final[str] = "family_params.json"
 
 #: INC-7 (plan §6, Rev 2.1 addendum M3): a SIBLING pair under `--monitor-
 #: out-dir`, deliberately NOT nested the way the live composition root
@@ -338,6 +377,135 @@ def assert_paper_write_path_is_not_live(output_dir: Path) -> None:
             f"--output-dir {output_dir} resolves under the live scored_trials "
             "directory; the paper writer refuses to write there (L-22).",
         )
+
+
+class FamilyManifestArgumentError(ValueError):
+    """AUD-19b C4: `--family-manifest` conflicts with `--station`/`--strategy`,
+    or names a composition this driver cannot run.
+
+    Raised, never caught internally except by `main`'s own dispatch into
+    :data:`EXIT_FAMILY_MANIFEST_REFUSED` -- neither side of a conflict is
+    ever silently preferred (the exact failure mode of memory
+    `bss-headline-is-the-wrong-family`)."""
+
+
+class PiecemealFamilyParametersError(ValueError):
+    """AUD-19b LOW fix (silent-failure-hunter review): `run_one_precision_arm`'s
+    `required_fee_coefficient`/`family_id`/`trial_id_prefix` are an
+    all-or-nothing bundle -- a caller supplies every one of them (a resolved
+    `FamilyParameters`) or none of them (the unscoped default), never some.
+
+    Refusing a partial bundle is what makes a fee-scoped-but-unscoped trial
+    (a fee coefficient threaded against a family manifest never validated
+    it against) structurally UNREACHABLE, rather than merely undocumented.
+    """
+
+
+def _assert_family_parameters_are_not_piecemeal(
+    *,
+    required_fee_coefficient: Decimal | None,
+    family_id: str,
+    trial_id_prefix: str | None,
+) -> None:
+    bundle = (
+        required_fee_coefficient is not None,
+        family_id != UNSCOPED_FAMILY_ID,
+        trial_id_prefix is not None,
+    )
+    if any(bundle) and not all(bundle):
+        raise PiecemealFamilyParametersError(
+            "required_fee_coefficient/family_id/trial_id_prefix must be supplied "
+            "together (a resolved FamilyParameters) or not at all -- got "
+            f"required_fee_coefficient={required_fee_coefficient!r}, "
+            f"family_id={family_id!r}, trial_id_prefix={trial_id_prefix!r}"
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FamilyParameters:
+    """AUD-19b C3: one `--family-manifest` run's fully-resolved parameters --
+    what `main` threads into `CurrentRungHoldConfig`, the replay id, and the
+    provenance sidecar (C6). Never constructed directly outside
+    :func:`resolve_family_parameters`."""
+
+    family_id: str
+    manifest_sha256: str
+    taker_fee_coefficient: Decimal
+    composition_kind: str
+    strategy_name: str
+    trial_id_prefix: str
+    exit_rule: str | None
+
+
+def resolve_family_parameters(
+    manifest_path: Path, *, station: str, strategy_arg: str | None,
+) -> FamilyParameters:
+    """Load `manifest_path` (no `allow_draft` -- every existing
+    `family_manifest` refusal fires through this path unmodified) and
+    validate it against this run's `--station`/`--strategy`.
+
+    `composition_kind` selects the strategy when `--strategy` is not passed
+    explicitly (C4); when it IS passed, it must equal `composition_kind` or
+    the run is refused, naming both. A manifest declaring `exit_rule` is not
+    refused -- the replay harness simulates no exit path, so one loud
+    `UNMODELLED:` line is printed and the value rides along in the sidecar
+    (D5) -- but `composition_kind == "forecast_ladder"` IS refused: this
+    driver has no such strategy class.
+    """
+    manifest = load_family_manifest(manifest_path)
+    if station not in manifest.stations:
+        raise FamilyManifestArgumentError(
+            f"--station {station!r} is not among manifest {manifest_path}'s "
+            f"stations {manifest.stations!r}"
+        )
+    if strategy_arg is not None and strategy_arg != manifest.composition_kind:
+        raise FamilyManifestArgumentError(
+            f"--strategy {strategy_arg!r} conflicts with manifest "
+            f"{manifest_path}'s composition_kind {manifest.composition_kind!r}"
+        )
+    if manifest.composition_kind == "forecast_ladder":
+        raise FamilyManifestArgumentError(
+            f"manifest {manifest_path}'s composition_kind is 'forecast_ladder'; "
+            "this driver has no forecast_ladder strategy class"
+        )
+    if manifest.exit_rule is not None:
+        print(
+            f"UNMODELLED: manifest {manifest_path}'s exit_rule="
+            f"{manifest.exit_rule!r} is not simulated by this replay harness"
+        )
+    return FamilyParameters(
+        family_id=manifest.family_id,
+        manifest_sha256=manifest.manifest_sha256,
+        taker_fee_coefficient=manifest.taker_fee_coefficient,
+        composition_kind=manifest.composition_kind,
+        strategy_name=manifest.composition_kind,
+        trial_id_prefix=manifest.trial_id_prefix,
+        exit_rule=manifest.exit_rule,
+    )
+
+
+def _clear_family_params_sidecar(output_dir: Path) -> None:
+    """C6 step 1: unconditionally remove any predecessor sidecar (and its
+    `.tmp`) BEFORE the engine starts -- whether or not `--family-manifest`
+    was passed this run. A crash, a refusal, or a flagless re-run into a
+    directory a prior run wrote therefore leaves NO sidecar rather than a
+    stale one."""
+    (output_dir / _FAMILY_PARAMS_SIDECAR_FILENAME).unlink(missing_ok=True)
+    (output_dir / f"{_FAMILY_PARAMS_SIDECAR_FILENAME}.tmp").unlink(missing_ok=True)
+
+
+def _write_family_params_sidecar(output_dir: Path, payload: Mapping[str, object]) -> None:
+    """C6 step 3: atomic write -- serialize to a `.tmp` sibling, `fsync`,
+    then `os.replace` onto the final name, so a reader never observes a
+    partial or half-written file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final_path = output_dir / _FAMILY_PARAMS_SIDECAR_FILENAME
+    tmp_path = output_dir / f"{_FAMILY_PARAMS_SIDECAR_FILENAME}.tmp"
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(dict(payload), fh, sort_keys=True, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, final_path)
 
 
 class ReplayLatchStoreIsLiveError(ValueError):
@@ -671,6 +839,16 @@ class PrecisionArmResult:
     strategy_refusals: Mapping[str, int] = field(default_factory=dict)
     strategy_diagnostics: Mapping[str, int] = field(default_factory=dict)
     strategy_position_events: Mapping[str, int] = field(default_factory=dict)
+    #: AUD-19b MEDIUM fix (silent-failure-hunter review): the
+    #: `required_fee_coefficient` this arm's `CurrentRungHoldConfig` ACTUALLY
+    #: carried -- a READBACK off the built config, never an echo of the
+    #: caller's own input. `main`'s `params_match` compares THIS value
+    #: against the manifest's registered `taker_fee_coefficient`, so a bug
+    #: that silently drops or mistransforms the kwarg on its way into
+    #: `CurrentRungHoldConfig` is caught rather than compared to itself.
+    #: `None` when no config was built this arm (the early-return
+    #: empty-market-data path) -- there is nothing to read back.
+    engine_required_fee_coefficient: Decimal | None = None
 
 
 class ReplayEvidenceUnboundError(RuntimeError):
@@ -825,6 +1003,9 @@ def run_one_precision_arm(
     ] = CurrentRungHoldBacktestStrategy,
     latch_key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
     monitor_out_dir: Path | None = None,
+    required_fee_coefficient: Decimal | None = None,
+    family_id: str = UNSCOPED_FAMILY_ID,
+    trial_id_prefix: str | None = None,
 ) -> PrecisionArmResult:
     """Run one (lag, precision) arm of the replay; return its `FilledTrial`s
     AND the strategy's own refusal counts (`PrecisionArmResult`).
@@ -838,6 +1019,17 @@ def run_one_precision_arm(
     (`strategy_cls is ContinuousRungHoldBacktestStrategy`); passing it
     alongside `CurrentRungHoldBacktestStrategy` is a silent no-op, since the
     v2 strategy carries no `_position_monitor` hook at all.
+
+    AUD-19b C5: `required_fee_coefficient` -- `None` (default) omits the
+    kwarg from `CurrentRungHoldConfig` entirely, so the config's own class
+    default (`Decimal("0.06")`) applies, byte-identical to every call site
+    that predates this flag. `family_id` defaults to `UNSCOPED_FAMILY_ID`
+    and `trial_id_prefix` defaults to `latch_key_prefix` (AUD-19a's
+    previously-hardcoded pair) -- a caller with no family manifest in play
+    (e.g. `whole_tape_paper_replay.py`) needs no call-site change at all.
+    `main` sources all three from a resolved `FamilyParameters` when
+    `--family-manifest` is passed, and leaves them at these defaults when it
+    is not.
 
     AUD-19a: internally passes `family_id=UNSCOPED_FAMILY_ID` and
     `trial_id_prefix=latch_key_prefix` to `filled_trials_from_engine` --
@@ -854,7 +1046,16 @@ def run_one_precision_arm(
     then silently keep only one arm's row. `install_position_monitor` is
     therefore called against `monitor_out_dir / precision_mode`, giving
     each arm its own `<mode>/monitor` + `<mode>/monitor_summaries` pair.
+
+    LOW fix (silent-failure-hunter review): `required_fee_coefficient`,
+    `family_id` and `trial_id_prefix` are refused as a PARTIAL bundle before
+    any other work runs -- see :func:`_assert_family_parameters_are_not_piecemeal`.
     """
+    _assert_family_parameters_are_not_piecemeal(
+        required_fee_coefficient=required_fee_coefficient,
+        family_id=family_id,
+        trial_id_prefix=trial_id_prefix,
+    )
     inputs = PaperReplayInputs(lag_minutes=lag_minutes, precision_mode=precision_mode)
     # `StationObservation.station` must carry the IEM ASOS/ICAO id
     # (`CurrentRungHoldStrategy.on_data` maps it back via `_STATION_BY_ICAO`,
@@ -891,6 +1092,7 @@ def run_one_precision_arm(
             strategy_refusals={},
             strategy_diagnostics={},
             strategy_position_events={},
+            engine_required_fee_coefficient=None,
         )
     ts_values = [record.ts_init for record in market_data]
     capture_window_ns = (min(ts_values), max(ts_values))
@@ -935,9 +1137,17 @@ def run_one_precision_arm(
         capture_window_ns=capture_window_ns,
     )
 
-    cfg = CurrentRungHoldConfig(
-        instrument_ids=tuple(i.id for i in instruments), stations=(station,),
-    )
+    # AUD-19b C5: threaded ONLY when a registered family manifest supplied
+    # one -- omitted entirely otherwise, so `CurrentRungHoldConfig`'s own
+    # class default (`Decimal("0.06")`) applies exactly as before this
+    # parameter existed (A2).
+    config_kwargs: dict[str, object] = {
+        "instrument_ids": tuple(i.id for i in instruments),
+        "stations": (station,),
+    }
+    if required_fee_coefficient is not None:
+        config_kwargs["required_fee_coefficient"] = required_fee_coefficient
+    cfg = CurrentRungHoldConfig(**config_kwargs)
 
     evidence: _FlatStartupEvidence | None = None
     strategy: CurrentRungHoldBacktestStrategy | ContinuousRungHoldBacktestStrategy
@@ -992,8 +1202,8 @@ def run_one_precision_arm(
         trials = filled_trials_from_engine(
             engine,
             entry_contexts,
-            family_id=UNSCOPED_FAMILY_ID,
-            trial_id_prefix=latch_key_prefix,
+            family_id=family_id,
+            trial_id_prefix=trial_id_prefix if trial_id_prefix is not None else latch_key_prefix,
         )
     if evidence is not None and evidence.called:
         # AM-20/NB-6 (driver-side half): the evidence reader's own record of
@@ -1015,6 +1225,9 @@ def run_one_precision_arm(
         strategy_refusals=dict(strategy.refusals.counts),
         strategy_diagnostics=dict(strategy.diagnostics.counts),
         strategy_position_events=dict(strategy.position_events.counts),
+        # MEDIUM fix: read back off the CONSTRUCTED config, never echo the
+        # caller's own `required_fee_coefficient` argument.
+        engine_required_fee_coefficient=cfg.required_fee_coefficient,
     )
 
 
@@ -1100,13 +1313,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--strategy",
         choices=("current_rung_hold", "continuous_rung_hold"),
-        default="current_rung_hold",
+        default=None,
         type=str,
         help=(
-            "Which BACKTEST-ONLY strategy subclass to replay. Default "
-            "'current_rung_hold' keeps the v2 golden transcript byte-"
-            "identical; 'continuous_rung_hold' selects "
-            "ContinuousRungHoldBacktestStrategy (SP-4)."
+            "Which BACKTEST-ONLY strategy subclass to replay. Default (no "
+            "flag, and no --family-manifest) resolves 'current_rung_hold', "
+            "keeping the v2 golden transcript byte-identical; "
+            "'continuous_rung_hold' selects ContinuousRungHoldBacktestStrategy "
+            "(SP-4). With --family-manifest, this must either be omitted "
+            "(the manifest's composition_kind selects the strategy) or equal "
+            "composition_kind exactly -- any other value is refused (AUD-19b)."
         ),
     )
     parser.add_argument(
@@ -1122,11 +1338,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             "one, so every existing replay artefact stays byte-identical."
         ),
     )
+    parser.add_argument(
+        "--family-manifest",
+        default=None,
+        type=Path,
+        help=(
+            "AUD-19b: a REGISTERED family manifest (deploy/families/<id>.json). "
+            "Its composition_kind selects the strategy (or must equal an "
+            "explicit --strategy) and its taker_fee_coefficient replaces "
+            "CurrentRungHoldConfig's class default. Every replay row's "
+            "trial_id then carries the manifest's own family_id, and a "
+            "family_params.json provenance sidecar is written under "
+            "--output-dir. Default None leaves every existing invocation "
+            "byte-identical to before this flag existed."
+        ),
+    )
     args = parser.parse_args(argv)
+    # C6 step 2: the run identifier is the SHA-256 of the resolved argument
+    # vector actually parsed -- everything after the script path, in the
+    # order passed -- computed by the ONE shared implementation
+    # (`argv_digest.argv_sha256`), never inline here (A15).
+    resolved_argv = list(argv) if argv is not None else list(sys.argv[1:])
+
+    family_params: FamilyParameters | None = None
+    if args.family_manifest is not None:
+        try:
+            family_params = resolve_family_parameters(
+                args.family_manifest, station=args.station, strategy_arg=args.strategy,
+            )
+        except FamilyManifestArgumentError as exc:
+            print(f"current_rung_hold_paper_replay: refused: {exc}", file=sys.stderr)
+            return EXIT_FAMILY_MANIFEST_REFUSED
+        except (FamilyManifestError, OSError) as exc:
+            print(f"current_rung_hold_paper_replay: manifest unusable: {exc}", file=sys.stderr)
+            return EXIT_FAMILY_MANIFEST_UNUSABLE
+
+    # C2: the resolved LOCAL `strategy_name` is what every downstream branch
+    # consults -- `args.strategy` survives solely as the was-it-explicit
+    # sentinel `resolve_family_parameters` already used above. With the flag
+    # absent this resolves identically to the old `default="current_rung_hold"`.
+    strategy_name = (
+        family_params.strategy_name if family_params is not None
+        else (args.strategy or "current_rung_hold")
+    )
 
     # Explicit `if`, never `getattr`/dynamic-import duck-typing (L-12/AM-5;
     # test_the_dynamic_import_call_site_count_is_unchanged pins the count).
-    if args.strategy == "continuous_rung_hold":
+    if strategy_name == "continuous_rung_hold":
         strategy_cls: type[
             CurrentRungHoldBacktestStrategy | ContinuousRungHoldBacktestStrategy
         ] = ContinuousRungHoldBacktestStrategy
@@ -1136,6 +1394,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         latch_key_prefix = DEFAULT_TRIAL_KEY_PREFIX
 
     assert_paper_write_path_is_not_live(args.output_dir)
+    # C6 step 1: unconditional pre-run clear -- BEFORE the engine ever
+    # starts, whether or not --family-manifest was passed this run.
+    _clear_family_params_sidecar(args.output_dir)
     climate_day = dt.date.fromisoformat(args.climate_day)
 
     # SP-4 increment E (CX-B3): runs immediately after the check above and
@@ -1189,6 +1450,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(close_source_label(tape_instruments))
 
     all_trials: list[FilledTrial] = []
+    # MEDIUM fix: the readback off whichever arm actually built a
+    # `CurrentRungHoldConfig` -- every arm shares one `tape_instruments`
+    # (market-data emptiness does not vary by precision_mode), so either all
+    # arms build one and agree, or none do; `None` means none did.
+    engine_fee_readback: Decimal | None = None
     now_ns = max(
         (record.ts_init for ti in tape_instruments for record in (*ti.quotes, *ti.depths)),
         default=0,
@@ -1215,8 +1481,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             strategy_cls=strategy_cls,
             latch_key_prefix=latch_key_prefix,
             monitor_out_dir=args.monitor_out_dir,
+            required_fee_coefficient=(
+                family_params.taker_fee_coefficient if family_params is not None else None
+            ),
+            family_id=family_params.family_id if family_params is not None else UNSCOPED_FAMILY_ID,
+            trial_id_prefix=family_params.trial_id_prefix if family_params is not None else None,
         )
         all_trials.extend(result.trials)
+        if result.engine_required_fee_coefficient is not None:
+            engine_fee_readback = result.engine_required_fee_coefficient
         # (a) reporting gap: the strategy's own refusal counts, sorted for a
         # deterministic line -- never conflated with `scoring_refused` above.
         print(f"strategy refusals: {dict(sorted(result.strategy_refusals.items()))}")
@@ -1240,12 +1513,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if scored:
         write_scored_trials(args.output_dir, scored, now_ns=now_ns)
+    resolved_family_id = (
+        family_params.family_id if family_params is not None else UNSCOPED_FAMILY_ID
+    )
+    resolved_trial_id_prefix = (
+        family_params.trial_id_prefix if family_params is not None else latch_key_prefix
+    )
     print(
         "trial_id prefix used: "
-        f"{PAPER_TRIAL_ID_NAMESPACE}/{UNSCOPED_FAMILY_ID}/{latch_key_prefix}",
+        f"{PAPER_TRIAL_ID_NAMESPACE}/{resolved_family_id}/{resolved_trial_id_prefix}",
     )
     print(f"trader_id: {DEFAULT_BACKTEST_TRADER_ID}")
-    return 0
+    # AUD-19b C6 step 3: the sidecar is written ONLY when --family-manifest
+    # was passed -- with it absent, AUD-09's runner supplies DRIVER_DEFAULTS/
+    # params_match=False itself, exactly as its own spec already does (A2).
+    if family_params is not None:
+        run_argv_sha256 = argv_sha256(resolved_argv)
+        # MEDIUM fix (silent-failure-hunter review): compare the ENGINE'S
+        # OWN readback to the manifest's registered value -- never echo the
+        # manifest's value as both sides of the comparison. `engine_fee_
+        # readback is None` (no arm ever built a config -- every arm's
+        # market data was empty) is NOT a match: nothing was constructed to
+        # prove the parameterisation, so this reports the manifest's
+        # intended value with `params_match=False` rather than an unproven
+        # `True`.
+        if engine_fee_readback is not None:
+            engine_required_fee_coefficient = engine_fee_readback
+            params_match = engine_fee_readback == family_params.taker_fee_coefficient
+        else:
+            engine_required_fee_coefficient = family_params.taker_fee_coefficient
+            params_match = False
+        sidecar_payload = {
+            "family_id": family_params.family_id,
+            "manifest_sha256": family_params.manifest_sha256,
+            "manifest_taker_fee_coefficient": str(family_params.taker_fee_coefficient),
+            "engine_required_fee_coefficient": str(engine_required_fee_coefficient),
+            "engine_params_source": "FAMILY_MANIFEST",
+            "params_match": params_match,
+            "composition_kind": family_params.composition_kind,
+            "strategy": strategy_name,
+            "station": args.station,
+            "climate_day": args.climate_day,
+            "exit_rule": family_params.exit_rule,
+            "argv_sha256": run_argv_sha256,
+            "run_ts": dt.datetime.now(dt.UTC).isoformat(),
+        }
+        _write_family_params_sidecar(args.output_dir, sidecar_payload)
+        print(f"family_params sidecar written: {args.output_dir / _FAMILY_PARAMS_SIDECAR_FILENAME}")
+    return EXIT_OK
 
 
 if __name__ == "__main__":
