@@ -17,6 +17,26 @@ bound, and the **`Var(S) ∈ [0.95,1.05]`** per-look tolerance **ARE** anchored 
 `docs/evidence/PREREG_v3_AMENDMENT_NO_SIDE_2026-09-14.md` §6's registered qty≡1 mixed-side study
 (20000 reps, Monte-Carlo SE 0.001104).
 
+> **CAVEAT (2026-09-25, added after review; binding on every reader of this document).**
+> The simulation harness behind every crossing rate in this ruling — the AUD-06a sweep
+> (`scripts/analysis/aud06a_qty_envelope_sweep.py` ~429-454) AND the pre-existing strict-xfail
+> harness it inherits from (`tests/unit/test_multi_position_validation_2026_09_14.py`
+> `_run_h0_monte_carlo`, ~104-140) — does NOT execute the production stopping rule:
+> (1) it interpolates the regression-only 16-row `reference_table`
+> (`src/breezy/persistence/gs_boundary_artefact.py:143-146,171-175`) where the live tally re-solves
+> `artefact.boundary_for(t_history)` at every look (`scripts/analysis/family_tally_v2.py:733,759`);
+> (2) it keeps testing after information saturates (`t` clamped at 1) where the live tally makes
+> one terminal look at `I >= I_max` and stops (`family_tally_v2.py:716-722,757`). Mixed-side and
+> qty>1 days saturate information early, so these cells receive several extra terminal tests the
+> live rule never makes. Confirmed against the code by the prediction-market-reviewer that approved
+> this ruling. **Consequence:** every reported crossing rate, CP bound and fold change here —
+> including the mixed-side qty=1 excess, the 224/224 qty>=2 result, and the strict xfail's
+> ~0.059 figure — is PROVISIONAL. The qualitative direction may hold; the magnitudes are not
+> calibrated against production. They are being re-measured under a harness that executes the
+> live look loop (AUD-07 amendment, Stage M). Until then: AUD-06b must not proceed on these
+> numbers in either direction, and no one may cite them as a measured property of the live
+> sequential test.
+
 ## 0. FULL-GRID ADDENDUM (2026-09-25, continuation) — supersedes §3-§6 below where they conflict
 
 **All 320 cells now run and merged** (`docs/evidence/aud06a_sweep_cells.jsonl`, sorted by cell index,
@@ -86,6 +106,8 @@ is not a borderline result requiring a formal envelope-publication gate to trust
 plausible reading of this data supports qty>1 today**, mechanism-verdict formality notwithstanding.
 
 ### Operational consequence for AUD-06b / AUD-07 (finding only — no live code, no operator value touched)
+
+*(Provisional — see the CAVEAT above §0: the magnitudes below come from a harness whose stopping rule diverges from production.)*
 
 1. **AUD-06b (qty>1 sizing): do not proceed.** The full grid shows 100% of sampled `q_max≥2` cells
    over-crossing `α`, in every stratum, with no dispersion class or `k` value found to be an exception.
