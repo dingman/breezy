@@ -13,6 +13,7 @@ written).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,26 @@ def test_from_dict_raises_on_a_wrong_type() -> None:
     payload["trials"] = "3"
     with pytest.raises(ReplayResultRecordError):
         ReplayResult.from_dict(payload)
+
+
+def test_a_write_failure_surfaces_its_own_exception_not_a_double_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review fix 8 (MEDIUM): `os.fdopen(fd, ...)` takes ownership of `fd`.
+    If a failure happens INSIDE the `with` block (after `fdopen` already
+    succeeded), the `with` statement's own `__exit__` already closes `fd`
+    while unwinding -- a second `os.close(fd)` in the `except` handler then
+    raises its OWN `OSError: Bad file descriptor`, masking the real error.
+    Injecting the failure at `os.fsync` (after `fdopen` succeeded) proves
+    the ORIGINAL exception surfaces, not the masking one."""
+    path = tmp_path / "replay_results.jsonl"
+
+    def _raise_fsync(_fd: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(os, "fsync", _raise_fsync)
+    with pytest.raises(OSError, match="injected fsync failure"):
+        append_replay_result(path, _row())
 
 
 def test_append_then_read_round_trips(tmp_path: Path) -> None:

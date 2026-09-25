@@ -322,19 +322,29 @@ def append_replay_result(path: Path, result: ReplayResult) -> None:
     """Append one line to `replay_results.jsonl`. Never rewrites, never
     checks for a duplicate itself -- `read_replay_results` is the single
     place that enforces H3's duplicate-terminal-key contract, exactly as
-    `read_replay_sufficiency` enforces H0's own duplicate rule on read."""
+    `read_replay_sufficiency` enforces H0's own duplicate rule on read.
+
+    Review fix 8: `os.fdopen(fd, ...)` takes ownership of `fd` the instant
+    it succeeds, so `fd` must be closed by hand ONLY when `fdopen` itself
+    fails -- once it succeeds, the `with` statement's own `__exit__`
+    already closes it while unwinding on any later failure (a write, a
+    flush, an `fsync`), and a second `os.close(fd)` there would raise its
+    OWN `OSError: Bad file descriptor`, masking the real error (mirrors
+    `scripts/venue/polymarket_us_auth_smoke.py::_write_private_text`'s own
+    fix for the identical shape)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(result.to_dict(), sort_keys=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        handle = os.fdopen(fd, "a", encoding="utf-8")
     except BaseException:
         os.close(fd)
         raise
+    with handle:
+        handle.write(line)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def read_replay_results(path: Path) -> tuple[ReplayResult, ...]:
