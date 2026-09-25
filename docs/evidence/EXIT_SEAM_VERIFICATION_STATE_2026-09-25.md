@@ -149,6 +149,51 @@ legitimately produces zero new positions.
 | `breezy-family-tally@pm_us_crh_v4.timer` | 2026-09-25 17:20 UTC | never fired yet |
 | `breezy-portfolio-roi.timer` | 2026-09-25 17:40 UTC | 2026-09-24 17:40 UTC |
 
+## Finding B — reconciled table (step 6, closed)
+
+The reconciled table over the last successful nightly run
+(`2026-09-20_nightly`, N=5, same five `trial_id`s as Rev 2 Appendix A.3),
+with the per-row `delta_i` classification (`classify_threatened_delta`,
+commit `6bd52ef`) added as the required closing check before this table may
+be trusted (§6 B2):
+
+| position | leg | fill | first THREATENED | last executable exit | `delta_i` classification | hold pnl | R-BEST |
+|---|---|---|---|---|---|---|---|
+| MDW [80,81] 09-15 | YES | 0.11 | — | 18:07Z | no signal (THREATENED never confirmed) | −0.12 | exit @0.11 → −0.02 |
+| MDW [82,83] 09-15 | YES | 0.24 | — | none after fill (catalog) | no signal | −0.25 | exited@0.41 → +0.15 |
+| MIA 09-13 | YES | 0.70 | — | 15:35Z | no signal | +0.30 | exit @0.99 → +0.29 |
+| MIA [92,93] 09-15 | NO | 0.09 | 18:22Z | 19:36Z | **THREATENED_BEFORE_EXIT_SIDE_EMPTIED** (`delta_i` = 18:22 − 19:36 = −74.12 min) | −0.09 | exit @0.06 → −0.03 |
+| SFO [71,72] 09-15 | YES | 0.44 | — | 20:12Z | no signal | −0.45 | exit @0.02 → −0.43 |
+
+**Every row's classification is individually explained** (AC#4's
+requirement): four rows never confirmed THREATENED at all ("no signal" is
+not a delta of zero and is not counted either way); the one row that did
+(MIA NO leg) classifies `BEFORE_EXIT_SIDE_EMPTIED` — this is the single
+documented R-THREAT firing, already characterised in Rev 2 Appendix A.3 as
+"THREATENED before the exit side emptied 1/5, correct in sign (+0.02 vs
+hold)" (its R-THREAT outcome: `exited@0.02 pnl=-0.0700`, still better than
+the `-0.09` hold loss). **The "negative-median anomaly" was never an
+anomaly**: `−74.12` is exactly this one row's `delta_i` in minutes (the
+only row with both timestamps defined, so the "median" of a one-element
+sample is that element), and a negative value is the CORRECT, gate-relevant
+sign under the polarity this item verifies from the evidence (see the
+commit message on `classify_threatened_delta` for the full derivation and
+the note that the plan's own prose stated the opposite polarity).
+
+**Gate reading, per row (Rev 2's unchanged gates, restated here since Rev 3
+itself is out of this item's scope):** R-THREAT: 1 of 5 qualifying rows
+(gate ≥ 3) — **does not arm**. R-DEAD: 0 of 5 rows ever confirm DEAD before
+the exit side empties (`dead_before_exit_side_emptied=0/5`, unchanged from
+Rev 2) — **does not arm**. Both gate readings are unchanged from Rev 2's
+own conclusion; reconciling the drift (finding B) did not change which
+gates pass.
+
+**Provenance of this table:** `2026-09-20_nightly/exit_window_study.{json,md}`
+(the last artefact the timer wrote before the 09-22–09-24 crashes in
+Finding D); `depth_source=catalog` for all 5 rows confirms candidate (i)
+(the ING-1 staged→catalog substitution) as the cause of the Σ figures'
+drift from Rev 2 Appendix A.3, as stated above under Finding B.
+
 ## Summary of what this pass changes vs. what it leaves alone
 
 - **Changed:** C1 (family binding, wrapper enumeration), C2/C3 (stated
