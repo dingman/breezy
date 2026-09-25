@@ -33,6 +33,17 @@ directory quarantined (never deleted), and the key durably excluded from
 re-selection under the SAME armed family's theta (`fee_void_keys`) --
 closing the gap where a pre-drift day looped as a meaningless
 `COMPLETED trials=0` forever.
+
+**AUD-09b fee-regime plan, Phase 2.** `select_target` also takes an
+optional `fee_coefficient_as_of` callable so a real run can PRE-select only
+station-days the dated schedule
+(`breezy.adapters.polymarket_us.fees.taker_fee_coefficient_as_of`) pins to
+the armed family's own theta -- the vast majority of the fix, since net
+(1) alone would still waste a full engine run on every pre-drift day
+before ever reaching one Phase 1 could catch. `main` imports that function
+lazily (inside itself, not at module level) so a caller that never runs a
+real replay -- every test in this suite -- never pays for pulling in
+`nautilus_trader`'s Cython `FeeModel` at import time.
 """
 
 from __future__ import annotations
@@ -110,6 +121,7 @@ __all__ = [
     "classify_asos_failure",
     "classify_driver_failure",
     "compute_drift",
+    "fee_regime_excluded_count",
     "fee_void_keys",
     "main",
     "quarantine_legacy_fee_void",
@@ -381,6 +393,28 @@ def _pre_fee_eligible_rows(
     ]
 
 
+def _fee_regime_eligible(
+    row: ReplaySufficiency,
+    *,
+    required_fee_coefficient: Decimal | None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None,
+) -> bool:
+    """AC3: `row` is eligible only when the DATED schedule
+    (`fee_coefficient_as_of`) pins the SAME theta at BOTH the row's own
+    `window_start_ns` and `window_end_ns` -- `None` at either edge (the
+    AMBIGUOUS window, or before the earliest pinned date) fails closed.
+
+    `fee_coefficient_as_of is None` or `required_fee_coefficient is None`
+    admits every row: Phase 2 is opt-in via these two kwargs, so a caller
+    that never passes them (every pre-existing test) keeps the date-blind
+    behaviour byte-for-byte."""
+    if fee_coefficient_as_of is None or required_fee_coefficient is None:
+        return True
+    start = fee_coefficient_as_of(row.window_start_ns)
+    end = fee_coefficient_as_of(row.window_end_ns)
+    return start == required_fee_coefficient and end == required_fee_coefficient
+
+
 def select_target(
     *,
     rows: Sequence[ReplaySufficiency],
@@ -389,6 +423,7 @@ def select_target(
     strategy: str = DEFAULT_STRATEGY,
     lag_minutes: int = DEFAULT_LAG_MINUTES,
     required_fee_coefficient: Decimal | None = None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None = None,
 ) -> ReplaySufficiency | None:
     """The oldest eligible `(station, climate_day)`, tie-broken by
     `SUPPORTED_STATIONS` order (base plan §6b.3; AUD-09b amendment R1).
@@ -400,17 +435,58 @@ def select_target(
     census also emits candidate/NYC rows the queue must never take, H1),
     AND no TERMINAL result row under the full key, AND the key is not in
     the drift set (a drifted key is never re-replayed, R4), AND the key
-    carries no durable `FEE_SCHEDULE_MISMATCH` void under THIS theta (AC2).
+    carries no durable `FEE_SCHEDULE_MISMATCH` void under THIS theta (AC2),
+    AND (Phase 2, opt-in) the dated fee schedule pins THIS theta across the
+    row's own decision window (AC3).
     """
-    eligible = _pre_fee_eligible_rows(
+    pre_fee_eligible = _pre_fee_eligible_rows(
         rows=rows, replayed=replayed, drift=drift, strategy=strategy, lag_minutes=lag_minutes,
         required_fee_coefficient=required_fee_coefficient,
     )
+    eligible = [
+        row
+        for row in pre_fee_eligible
+        if _fee_regime_eligible(
+            row,
+            required_fee_coefficient=required_fee_coefficient,
+            fee_coefficient_as_of=fee_coefficient_as_of,
+        )
+    ]
     if not eligible:
         return None
     station_rank = {station: index for index, station in enumerate(SUPPORTED_STATIONS)}
     eligible.sort(key=lambda row: (row.climate_day, station_rank[row.station]))
     return eligible[0]
+
+
+def fee_regime_excluded_count(
+    *,
+    rows: Sequence[ReplaySufficiency],
+    replayed: Sequence[ReplayResult],
+    drift: Sequence[DriftRecord],
+    strategy: str = DEFAULT_STRATEGY,
+    lag_minutes: int = DEFAULT_LAG_MINUTES,
+    required_fee_coefficient: Decimal | None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None,
+) -> int:
+    """AC4: how many rows that pass every OTHER `select_target` predicate
+    the AC3 dated-schedule check alone excludes -- the count the daily
+    `FEE_REGIME_EXCLUDED n ...` line names. Zero whenever
+    `fee_coefficient_as_of` is `None` (Phase 2 not wired) or
+    `required_fee_coefficient` is `None` (no armed family theta)."""
+    pre_fee_eligible = _pre_fee_eligible_rows(
+        rows=rows, replayed=replayed, drift=drift, strategy=strategy, lag_minutes=lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+    )
+    return sum(
+        1
+        for row in pre_fee_eligible
+        if not _fee_regime_eligible(
+            row,
+            required_fee_coefficient=required_fee_coefficient,
+            fee_coefficient_as_of=fee_coefficient_as_of,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -981,11 +1057,21 @@ def run_once(
     now_ts: Callable[[], str] = _now_ts,
     work_dir_factory: Callable[[], Path] = _default_work_dir,
     std_utc_offset_hours_for: Callable[[str], float] | None = None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None = None,
 ) -> int:
     """The whole nightly decision, end to end. Returns the process exit
     code (never raises for an expected outcome -- BLOCKED/FAILED/EMPTY are
     all ordinary returns; H0/H3 corruption is the one thing that
-    propagates as a loud non-zero exit, never a silent empty queue)."""
+    propagates as a loud non-zero exit, never a silent empty queue).
+
+    `fee_coefficient_as_of` (AUD-09b amendment fee-regime plan, Phase 2) is
+    the SAME kind of optional production seam as `std_utc_offset_hours_for`
+    above: `None` here (every pre-existing test's default) keeps
+    `select_target` date-blind, exactly as before this plan; `main` wires
+    the real `breezy.adapters.polymarket_us.fees.taker_fee_coefficient_as_
+    of` in production. AC2's durable fee-void exclusion (`fee_void_keys`)
+    is NOT gated behind this kwarg -- it always runs once the armed
+    family's theta is known, independent of Phase 2's date table."""
     active_sink = sink if sink is not None else resolve_alert_sink(os.environ)
     # Review fix 3: reaching this function at all means the wrapper got
     # past both its own skip gates (the lock, the armed-family check) --
@@ -1034,6 +1120,22 @@ def run_once(
         strategy=strategy,
         lag_minutes=config.lag_minutes,
         required_fee_coefficient=required_fee_coefficient,
+        fee_coefficient_as_of=fee_coefficient_as_of,
+    )
+    # AC4: nothing about the fee-regime exclusion is silent, whether or not
+    # it is what emptied the queue.
+    excluded_count = fee_regime_excluded_count(
+        rows=rows,
+        replayed=existing_results,
+        drift=current_drift,
+        strategy=strategy,
+        lag_minutes=config.lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+        fee_coefficient_as_of=fee_coefficient_as_of,
+    )
+    print(
+        f"FEE_REGIME_EXCLUDED {excluded_count} station-day(s) "
+        f"(required theta={required_fee_coefficient}; table=FEE_SCHEDULE_PIN_2026-09-18)"
     )
     if target is None:
         sufficient_count = sum(1 for row in rows if row.verdict == "SUFFICIENT")
@@ -1042,6 +1144,11 @@ def run_once(
                 sorted(Counter(row.reason for row in rows if row.verdict == "INSUFFICIENT").items())
             )
             print(f"EVERY DAY INSUFFICIENT -- {histogram}")
+        elif excluded_count > 0:
+            print(
+                f"QUEUE EMPTY (FEE REGIME) -- {excluded_count} station-day(s) excluded by the "
+                "dated fee schedule; table=FEE_SCHEDULE_PIN_2026-09-18"
+            )
         else:
             print(
                 f"QUEUE EMPTY -- {sufficient_count} SUFFICIENT day(s), all replayed under "
@@ -1327,7 +1434,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         python_executable=args.python_executable,
         skip_state_path=args.skip_state_path,
     )
-    return run_once(config, std_utc_offset_hours_for=_resolve_std_utc_offset_hours)
+    from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_as_of
+
+    return run_once(
+        config,
+        std_utc_offset_hours_for=_resolve_std_utc_offset_hours,
+        fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
 
 
 if __name__ == "__main__":

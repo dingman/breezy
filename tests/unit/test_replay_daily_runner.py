@@ -23,6 +23,7 @@ sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 import replay_daily_runner as runner
 
+from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_as_of
 from breezy.analysis.replay_results import (
     REPLAY_RESULTS_SCHEMA_VERSION,
     REPLAY_VALIDITY,
@@ -1136,3 +1137,188 @@ def test_three_consecutive_fee_mismatch_blocked_rows_fire_stall_alert(tmp_path: 
     assert sink.payloads[0].event == "BREEZY_REPLAY_STALLED"  # type: ignore[attr-defined]
 
 
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 1 review requirement 2: legacy
+# quarantine migration
+# ---------------------------------------------------------------------------
+
+
+def _write_legacy_fee_void_row(path: Path) -> None:
+    base = _terminal_row(outcome="COMPLETED")
+    row = ReplayResult(
+        schema_version=base.schema_version, run_ts=base.run_ts, station=base.station,
+        climate_day=base.climate_day, strategy=base.strategy, lag_minutes=base.lag_minutes,
+        outcome=base.outcome, validity=base.validity, blocked_reason=base.blocked_reason,
+        exception_type=base.exception_type, family_id=base.family_id,
+        manifest_sha256=base.manifest_sha256,
+        manifest_taker_fee_coefficient=base.manifest_taker_fee_coefficient,
+        engine_required_fee_coefficient=base.engine_required_fee_coefficient,
+        engine_params_source=base.engine_params_source, params_match=base.params_match,
+        composition_kind=base.composition_kind, tape_instance_id=base.tape_instance_id,
+        sufficiency_reason=base.sufficiency_reason, trials=0, fills=0,
+        fill_price_vs_decision_ask=(),
+        refusal_counts={"fee_schedule_mismatch": 1, "outside_decision_window": 26_215},
+        wall_s=base.wall_s, peak_rss_bytes=base.peak_rss_bytes, parquet_sha256=base.parquet_sha256,
+        window_complete=base.window_complete, replayed_first_ns=base.replayed_first_ns,
+        replayed_last_ns=base.replayed_last_ns, census_schema_version=base.census_schema_version,
+    )
+    append_replay_result(path, row)
+
+
+def test_quarantine_legacy_fee_void_dry_run_lists_without_renaming(tmp_path: Path) -> None:
+    results_path = tmp_path / "replay_results.jsonl"
+    _write_legacy_fee_void_row(results_path)
+    output_dir = (
+        tmp_path / "out" / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    output_dir.mkdir(parents=True)
+    (output_dir / "scored_trials_1.parquet").write_bytes(b"x")
+
+    reports = runner.quarantine_legacy_fee_void(
+        replay_results_path=results_path, output_root=tmp_path / "out", dry_run=True,
+    )
+    assert len(reports) == 1
+    assert reports[0].action == "DRY_RUN"
+    assert output_dir.exists()
+
+
+def test_quarantine_legacy_fee_void_renames_the_output_dir(tmp_path: Path) -> None:
+    results_path = tmp_path / "replay_results.jsonl"
+    _write_legacy_fee_void_row(results_path)
+    output_dir = (
+        tmp_path / "out" / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    output_dir.mkdir(parents=True)
+    (output_dir / "scored_trials_1.parquet").write_bytes(b"x")
+
+    reports = runner.quarantine_legacy_fee_void(
+        replay_results_path=results_path, output_root=tmp_path / "out",
+    )
+    assert len(reports) == 1
+    assert reports[0].action == "QUARANTINED"
+    assert not output_dir.exists()
+    quarantined = sorted(output_dir.parent.glob(f"{output_dir.name}.fee_void.*"))
+    assert len(quarantined) == 1
+
+
+def test_quarantine_legacy_fee_void_is_idempotent_on_a_second_run(tmp_path: Path) -> None:
+    results_path = tmp_path / "replay_results.jsonl"
+    _write_legacy_fee_void_row(results_path)
+    output_dir = (
+        tmp_path / "out" / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    output_dir.mkdir(parents=True)
+    (output_dir / "scored_trials_1.parquet").write_bytes(b"x")
+
+    runner.quarantine_legacy_fee_void(
+        replay_results_path=results_path, output_root=tmp_path / "out",
+    )
+    reports = runner.quarantine_legacy_fee_void(
+        replay_results_path=results_path, output_root=tmp_path / "out",
+    )
+    assert len(reports) == 1
+    assert reports[0].action == "ALREADY_QUARANTINED_OR_ABSENT"
+
+
+def test_quarantine_legacy_fee_void_reports_a_missing_directory(tmp_path: Path) -> None:
+    results_path = tmp_path / "replay_results.jsonl"
+    _write_legacy_fee_void_row(results_path)
+    reports = runner.quarantine_legacy_fee_void(
+        replay_results_path=results_path, output_root=tmp_path / "out",
+    )
+    assert len(reports) == 1
+    assert reports[0].action == "ALREADY_QUARANTINED_OR_ABSENT"
+
+
+def test_quarantine_legacy_fee_void_never_rewrites_the_results_file(tmp_path: Path) -> None:
+    results_path = tmp_path / "replay_results.jsonl"
+    _write_legacy_fee_void_row(results_path)
+    before = results_path.read_text()
+    runner.quarantine_legacy_fee_void(
+        replay_results_path=results_path, output_root=tmp_path / "out",
+    )
+    assert results_path.read_text() == before
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 2: dated-schedule pre-selection
+# ---------------------------------------------------------------------------
+
+_EARLIEST_NS = 1_787_616_000_000_000_000  # 2026-08-25T00:00:00Z
+_AMBIGUOUS_START_NS = 1_789_603_200_000_000_000  # 2026-09-17T00:00:00Z
+_AMBIGUOUS_END_NS = 1_789_664_400_000_000_000  # 2026-09-17T17:00:00Z
+_POST_DRIFT_THETA = Decimal("0.0695")
+_PRE_DRIFT_THETA = Decimal("0.06")
+
+
+def test_select_target_excludes_pre_drift_day_under_post_drift_theta() -> None:
+    row = _row(window_start_ns=_EARLIEST_NS, window_end_ns=_EARLIEST_NS + 1_000)
+    target = runner.select_target(
+        rows=[row], replayed=(), drift=(), required_fee_coefficient=_POST_DRIFT_THETA,
+        fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
+    assert target is None
+
+
+def test_select_target_excludes_day_whose_window_touches_ambiguous_interval() -> None:
+    row = _row(window_start_ns=_AMBIGUOUS_START_NS, window_end_ns=_AMBIGUOUS_END_NS)
+    target = runner.select_target(
+        rows=[row], replayed=(), drift=(), required_fee_coefficient=_POST_DRIFT_THETA,
+        fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
+    assert target is None
+
+
+def test_select_target_excludes_unpinned_day_fail_closed() -> None:
+    row = _row(window_start_ns=0, window_end_ns=_EARLIEST_NS - 1)
+    target = runner.select_target(
+        rows=[row], replayed=(), drift=(), required_fee_coefficient=_PRE_DRIFT_THETA,
+        fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
+    assert target is None
+
+
+def test_select_target_admits_post_drift_day_under_post_drift_theta() -> None:
+    row = _row(window_start_ns=_AMBIGUOUS_END_NS, window_end_ns=_AMBIGUOUS_END_NS + 1_000)
+    target = runner.select_target(
+        rows=[row], replayed=(), drift=(), required_fee_coefficient=_POST_DRIFT_THETA,
+        fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
+    assert target is not None
+
+
+def test_run_once_prints_fee_regime_excluded_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(
+        config.replay_sufficiency_path,
+        [_row(window_start_ns=_EARLIEST_NS, window_end_ns=_EARLIEST_NS + 1_000)],
+    )
+    capsys.readouterr()
+    exit_code = runner.run_once(
+        config, sink=_RecordingSink(), fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "FEE_REGIME_EXCLUDED 1" in out
+
+
+def test_queue_empty_message_distinguishes_fee_regime_exclusion(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(
+        config.replay_sufficiency_path,
+        [_row(window_start_ns=_EARLIEST_NS, window_end_ns=_EARLIEST_NS + 1_000)],
+    )
+    capsys.readouterr()
+    runner.run_once(
+        config, sink=_RecordingSink(), fee_coefficient_as_of=taker_fee_coefficient_as_of,
+    )
+    out = capsys.readouterr().out
+    assert "QUEUE EMPTY (FEE REGIME)" in out
+    assert "all replayed under key" not in out

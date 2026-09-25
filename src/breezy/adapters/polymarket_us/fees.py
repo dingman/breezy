@@ -60,6 +60,7 @@ __all__ = [
     "fee_schedule_bucket",
     "polymarket_us_fee",
     "taker_fee_at_fill",
+    "taker_fee_coefficient_as_of",
     "taker_fee_coefficient_of",
 ]
 
@@ -101,9 +102,12 @@ DOCUMENTED_TAKER_FEE_COEFFICIENT = Decimal("0.06")
 #: at 0.06; 2026-09-17: first drift alert 17:00:00.610319588Z, all six tape
 #: rows at 0.0695). The PRE-drift coefficient is
 #: :data:`DOCUMENTED_TAKER_FEE_COEFFICIENT` itself -- deliberately NOT a second
-#: ``0.06`` literal under another name. Used ONLY by :func:`taker_fee_at_fill`;
-#: :func:`polymarket_us_fee` (the live pricing path) is untouched and keeps
-#: reading theta from the ``Instrument`` at call time.
+#: ``0.06`` literal under another name. Used by :func:`taker_fee_at_fill` and,
+#: via :func:`_fee_coefficient_as_of`/:func:`taker_fee_coefficient_as_of`, by
+#: the AUD-09b amendment replay runner's fee-regime REPLAY-ELIGIBILITY
+#: reader (`scripts/analysis/replay_daily_runner.py`); :func:`polymarket_us_
+#: fee` (the live pricing path) is untouched and keeps reading theta from the
+#: ``Instrument`` at call time.
 _POST_DRIFT_TAKER_FEE_COEFFICIENT: Decimal = Decimal("0.0695")
 
 #: 2026-08-25T00:00:00Z -- the earliest pinned date (the docs snapshot the
@@ -524,6 +528,18 @@ def _fee_coefficient_as_of(ts_event_ns: int) -> Decimal | None:
     if bucket == "POST_DRIFT":
         return _POST_DRIFT_TAKER_FEE_COEFFICIENT
     return None
+
+
+def taker_fee_coefficient_as_of(ts_event_ns: int) -> Decimal | None:
+    """Public wrapper over :func:`_fee_coefficient_as_of` (AUD-09b amendment
+    fee-regime plan, Phase 2): the dated schedule's taker theta at
+    ``ts_event_ns``, or ``None`` when the AMBIGUOUS window or an unpinned
+    date refuses to name one. The ONE legal cross-package reader for replay
+    ELIGIBILITY selection (`replay_daily_runner.select_target`'s optional
+    `fee_coefficient_as_of` kwarg) -- never a per-day theta SUBSTITUTION:
+    the engine still reads theta from the tape instrument at run time, this
+    function only decides which station-days are worth attempting."""
+    return _fee_coefficient_as_of(ts_event_ns)
 
 
 def taker_fee_coefficient_of(instrument: Instrument) -> Decimal | None:

@@ -20,6 +20,7 @@ from breezy.adapters.polymarket_us.fees import (
     DOCUMENTED_TAKER_FEE_COEFFICIENT,
     fee_schedule_bucket,
     taker_fee_at_fill,
+    taker_fee_coefficient_as_of,
 )
 
 EARLIEST_NS = 1_787_616_000_000_000_000  # 2026-08-25T00:00:00Z
@@ -49,6 +50,26 @@ def test_the_coefficient_as_of_each_boundary(
 ) -> None:
     assert fees._fee_coefficient_as_of(ts_event) == expected
     assert fee_schedule_bucket(ts_event) == bucket
+
+
+@pytest.mark.parametrize(
+    "ts_event",
+    [
+        EARLIEST_NS - 1,
+        EARLIEST_NS,
+        AMBIGUOUS_START_NS - 1,
+        AMBIGUOUS_START_NS,
+        AMBIGUOUS_END_NS - 1,
+        AMBIGUOUS_END_NS,
+    ],
+)
+def test_taker_fee_coefficient_as_of_matches_private_schedule_at_each_bucket_edge(
+    ts_event: int,
+) -> None:
+    """AUD-09b amendment fee-regime plan, Phase 2: the public wrapper is
+    exactly `_fee_coefficient_as_of`, at every named boundary including
+    both AMBIGUOUS edges +/-1 ns."""
+    assert taker_fee_coefficient_as_of(ts_event) == fees._fee_coefficient_as_of(ts_event)
 
 
 def test_a_record_carrying_its_own_coefficient_wins_over_the_schedule() -> None:
