@@ -44,6 +44,7 @@ sibling, lands separately).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -69,8 +70,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "EXPIRATION_LEG_PREFIX",
-    "PAPER_TRIAL_ID_PREFIX",
+    "PAPER_TRIAL_ID_NAMESPACE",
     "PRECISION_ARMS",
+    "UNSCOPED_FAMILY_ID",
     "ForeignReplayDataError",
     "ImpossibleFillPriceError",
     "PaperReplayInputs",
@@ -83,13 +85,37 @@ __all__ = [
     "load_replay_observations",
 ]
 
-#: Every paper-replay trial id starts with this. Two independent barriers
-#: keep it out of the live tally (module docstring's "L-22 unforgeable
-#: provenance"): (i) `assert_live_only` refuses any non-`current_rung_hold/
-#: trial/` prefix, unmodified; (ii) `assert_paper_only` (`live_family_tally.py`)
-#: refuses anything ELSE. This prefix is never a caller-supplied argument --
-#: see `filled_trials_from_engine`, which derives it internally.
-PAPER_TRIAL_ID_PREFIX: Final[str] = "paper_replay/current_rung_hold/trial"
+#: Every paper-replay trial id starts with this literal, unconditionally.
+#: Two independent barriers keep it out of the live tally (module
+#: docstring's "L-22 unforgeable provenance"): (i) `assert_live_only`
+#: refuses any non-`current_rung_hold/trial/` prefix, unmodified; (ii)
+#: `assert_paper_only` (`live_family_tally.py`) refuses anything ELSE. This
+#: namespace is never a caller-supplied argument -- see
+#: `filled_trials_from_engine`, which derives it internally.
+#:
+#: AUD-19a (ruling `RULING_replay_evidence_citability_and_promotion_
+#: criteria_2026-09-21.md` Q1): the id used to be a fixed literal naming
+#: `current_rung_hold` regardless of which family or strategy composition
+#: was actually replayed, so two REGISTERED families sharing one
+#: `trial_id_prefix` produced indistinguishable ids. The shape is now
+#: `{PAPER_TRIAL_ID_NAMESPACE}/{family_id}/{trial_id_prefix}{station}/
+#: {climate_day}` -- `family_id` is the discriminator (a manifest's registry
+#: primary key), never `trial_id_prefix`, which is proven non-unique on this
+#: tree. This constant keeps its old meaning as the outer literal only.
+PAPER_TRIAL_ID_NAMESPACE: Final[str] = "paper_replay"
+
+#: The `family_id` `filled_trials_from_engine` callers pass when no family
+#: manifest is in play (AUD-19a design decision D1, pending AUD-19b's
+#: `--family-manifest` flag). `"unscoped"` is not, and may never become, a
+#: registered `family_id` -- no `deploy/families/unscoped.json` exists, and
+#: a manifest's `family_id` is its filename -- so a row carrying it is
+#: self-describing and can never be mistaken for a registered family's row.
+UNSCOPED_FAMILY_ID: Final[str] = "unscoped"
+
+#: `family_id` must be a bare registry-key-shaped token -- no path
+#: separators, no traversal segments -- so it can never widen or escape the
+#: `PAPER_TRIAL_ID_NAMESPACE` it is spliced into.
+_FAMILY_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9_]+$")
 
 #: Both precision arms this harness prints, unconditionally, every run
 #: (converged peer review item 5). `nws_integer_c` is the default -- see
@@ -161,7 +187,7 @@ class PaperReplayInputs:
 class ReplayEntryContext:
     """Per-instrument context `filled_trials_from_engine` needs to build a
     `FilledTrial` for a fill on that instrument -- never a `trial_id`
-    (derived internally, see `PAPER_TRIAL_ID_PREFIX`)."""
+    (derived internally, see `PAPER_TRIAL_ID_NAMESPACE`)."""
 
     station: str
     climate_day: str
@@ -297,19 +323,49 @@ def build_paper_replay_config(
     )
 
 
+def _assert_valid_trial_id_component(value: str, *, name: str) -> None:
+    """Refuse an empty, `/`-leading, or `..`-segmented `trial_id` component.
+
+    Shared by `family_id` and `trial_id_prefix` (AUD-19a A2): a malformed
+    segment is refused at the builder before any id is formed, so a
+    path-shaped segment can never widen or escape
+    `PAPER_TRIAL_ID_NAMESPACE`.
+    """
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    if value.startswith("/"):
+        raise ValueError(f"{name}={value!r} must not start with '/'")
+    if ".." in value.split("/"):
+        raise ValueError(f"{name}={value!r} must not contain a '..' segment")
+
+
 def filled_trials_from_engine(
     engine: BacktestEngine,
     entry_contexts: Mapping[str, ReplayEntryContext],
+    *,
+    family_id: str,
+    trial_id_prefix: str,
 ) -> tuple[FilledTrial, ...]:
     """Every FILLED entry order in `engine.cache`, turned into a `FilledTrial`.
 
-    `trial_id` is derived internally (`paper_replay/current_rung_hold/
-    trial/{station}/{climate_day}`) -- never a caller-supplied argument
-    (L-22, converged peer review item 6). An order on an instrument with no
-    entry context (i.e. not part of this replay's candidate set) is
-    skipped, never fabricated a trial. `CurrentRungHoldConfig.order_quantity`
-    is pinned to 1, so the venue's per-order commission IS the per-contract
+    `trial_id` is derived internally (`{PAPER_TRIAL_ID_NAMESPACE}/{family_id}/
+    {trial_id_prefix}{station}/{climate_day}`) -- the two components are
+    caller-supplied, but the assembled `trial_id` itself never is (L-22,
+    converged peer review item 6). An order on an instrument with no entry
+    context (i.e. not part of this replay's candidate set) is skipped,
+    never fabricated a trial. `CurrentRungHoldConfig.order_quantity` is
+    pinned to 1, so the venue's per-order commission IS the per-contract
     fee -- no division.
+
+    `family_id` and `trial_id_prefix` are both REQUIRED, keyword-only, with
+    no default (AUD-19a design decision D1, fail-closed at the library
+    boundary): a caller that supplies neither does not compile/typecheck
+    and raises `TypeError` at runtime, so no row can ever silently regain
+    the old, family-ambiguous shape. A caller replaying no manifest passes
+    `family_id=UNSCOPED_FAMILY_ID` explicitly. Both are validated non-empty
+    and free of a leading `/` or a `..` segment; `family_id` must also match
+    `_FAMILY_ID_PATTERN` (`[a-z0-9_]+`) -- a manifest's registry primary key
+    shape, never a path-shaped or traversal-capable string.
 
     A real `InstrumentClose` in `market_data` makes
     `SimulatedExchange.check_instrument_expiration` flatten any still-open
@@ -324,6 +380,14 @@ def filled_trials_from_engine(
     rather than ever built into a `FilledTrial` -- see that error's
     docstring.
     """
+    _assert_valid_trial_id_component(family_id, name="family_id")
+    if not _FAMILY_ID_PATTERN.match(family_id):
+        raise ValueError(
+            f"family_id={family_id!r} must match {_FAMILY_ID_PATTERN.pattern!r} "
+            "-- a manifest's registry primary key shape, never a path or "
+            "arbitrary string",
+        )
+    _assert_valid_trial_id_component(trial_id_prefix, name="trial_id_prefix")
     trials: list[FilledTrial] = []
     for order in engine.cache.orders():
         if order.status != OrderStatus.FILLED:
@@ -344,7 +408,10 @@ def filled_trials_from_engine(
                 f"(order {order.client_order_id}) -- a BUY IOC at limit=ask cannot "
                 "improve inside the same book snapshot the decision saw.",
             )
-        trial_id = f"{PAPER_TRIAL_ID_PREFIX}/{ctx.station}/{ctx.climate_day}"
+        trial_id = (
+            f"{PAPER_TRIAL_ID_NAMESPACE}/{family_id}/"
+            f"{trial_id_prefix}{ctx.station}/{ctx.climate_day}"
+        )
         trials.append(
             FilledTrial(
                 trial_id=trial_id,
