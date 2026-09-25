@@ -780,6 +780,319 @@ class TestAud04Reconciliation:
         assert result.divergence == Decimal("0.51")
 
 
+def _trial_row(
+    *, trial_id: str, climate_day: str, pnl: Decimal,
+) -> prr.PortfolioRoiTrialRow:
+    return prr.PortfolioRoiTrialRow(
+        trial_id=trial_id, family_id="UNKNOWN", climate_day=climate_day, side="yes", pnl=pnl,
+        settlement_basis="nws_final",
+    )
+
+
+class TestAud04PerTrialReconciliation:
+    """AUD-07 §6 "standing P&L reconciliation with AUD-04" upgraded from a
+    report-level total (`reconcile_with_aud04`) to a per-`trial_id` join once
+    AUD-04 publishes `trial_rows` (schema_version>=2) -- AUD-04 plan §8 AC#4's
+    mirror obligation."""
+
+    def test_equal_and_opposite_per_trial_errors_whose_totals_match_are_detected(self) -> None:
+        """THE KEY TEST: the two sides' totals agree (0.80 == 0.80) but every
+        individual trial diverges -- a report-level total alone cannot see
+        this; the per-row join must."""
+        rows = (
+            _synthetic_row(
+                trial_id="trial-a", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.50"),
+                r_dead_pnl=Decimal("0.50"), r_threat_pnl=Decimal("0.50"),
+                r_best_pnl=Decimal("0.50"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="trial-b", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.30"),
+                r_dead_pnl=Decimal("0.30"), r_threat_pnl=Decimal("0.30"),
+                r_best_pnl=Decimal("0.30"),
+                climate_day="2026-01-05",
+            ),
+        )
+        aud04_trial_rows = (
+            _trial_row(trial_id="trial-a", climate_day="2026-01-05", pnl=Decimal("0.55")),
+            _trial_row(trial_id="trial-b", climate_day="2026-01-05", pnl=Decimal("0.25")),
+        )
+
+        # The report-level total check this per-row join replaces would have
+        # reported a match -- the equal-and-opposite errors cancel in the sum.
+        total_level = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.80"),
+        )
+        assert total_level.matched is True
+
+        result = study_mod.reconcile_with_aud04_per_trial(
+            rows=rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+
+        assert result.matched is False
+        assert result.n_divergent == 2
+        assert set(result.divergent_trial_ids) == {"trial-a", "trial-b"}
+        assert result.n_exit_only == 0
+        assert result.n_aud04_only == 0
+
+    def test_a_trial_present_on_only_one_side_is_reported_never_dropped(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="both-sides", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="exit-only", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.10"),
+                r_dead_pnl=Decimal("0.10"), r_threat_pnl=Decimal("0.10"),
+                r_best_pnl=Decimal("0.10"),
+                climate_day="2026-01-05",
+            ),
+        )
+        aud04_trial_rows = (
+            _trial_row(trial_id="both-sides", climate_day="2026-01-05", pnl=Decimal("0.61")),
+            _trial_row(trial_id="aud04-only", climate_day="2026-01-05", pnl=Decimal("0.20")),
+        )
+
+        result = study_mod.reconcile_with_aud04_per_trial(
+            rows=rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+
+        assert result.matched is False
+        assert result.n_matched == 1
+        assert result.n_divergent == 0
+        assert result.exit_only_trial_ids == ("exit-only",)
+        assert result.aud04_only_trial_ids == ("aud04-only",)
+
+    def test_all_matching_per_trial_rows_reconcile_with_no_alert(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="trial-a", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.50"),
+                r_dead_pnl=Decimal("0.50"), r_threat_pnl=Decimal("0.50"),
+                r_best_pnl=Decimal("0.50"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="trial-b", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.30"),
+                r_dead_pnl=Decimal("0.30"), r_threat_pnl=Decimal("0.30"),
+                r_best_pnl=Decimal("0.30"),
+                climate_day="2026-01-05",
+            ),
+        )
+        aud04_trial_rows = (
+            _trial_row(trial_id="trial-a", climate_day="2026-01-05", pnl=Decimal("0.50")),
+            _trial_row(trial_id="trial-b", climate_day="2026-01-05", pnl=Decimal("0.30")),
+        )
+
+        result = study_mod.reconcile_with_aud04_per_trial(
+            rows=rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+
+        assert result.matched is True
+        assert result.n_matched == 2
+        assert result.n_divergent == 0
+        assert result.exit_only_trial_ids == ()
+        assert result.aud04_only_trial_ids == ()
+
+        _latch, payload = study_mod.apply_pnl_reconciliation_ladder_per_trial(
+            result=result, latch=_FRESH_LATCH, now_ns=_day_ns(0),
+        )
+        assert payload is None
+
+    def test_a_row_after_the_cutoff_is_excluded_from_both_sides(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="in-window", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="after-cutoff", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("9.99"),
+                r_dead_pnl=Decimal("9.99"), r_threat_pnl=Decimal("9.99"),
+                r_best_pnl=Decimal("9.99"),
+                climate_day="2026-01-11",
+            ),
+        )
+        aud04_trial_rows = (
+            _trial_row(trial_id="in-window", climate_day="2026-01-05", pnl=Decimal("0.61")),
+            _trial_row(
+                trial_id="after-cutoff-aud04", climate_day="2026-01-11", pnl=Decimal("5.00"),
+            ),
+        )
+
+        result = study_mod.reconcile_with_aud04_per_trial(
+            rows=rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+
+        assert result.matched is True
+
+
+class TestAud04PerTrialReconciliationLadder:
+    def test_a_persistent_per_trial_mismatch_names_divergent_trial_ids_without_the_caveat(
+        self,
+    ) -> None:
+        mismatched = study_mod.Aud04PerTrialReconciliationResult(
+            matched=False, cutoff="2026-01-10", n_matched=0, n_exit_only=0, n_aud04_only=0,
+            n_divergent=2, divergent_trial_ids=("trial-a", "trial-b"),
+            exit_only_trial_ids=(), aud04_only_trial_ids=(),
+        )
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder_per_trial(
+                result=mismatched, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert payload.event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_EVENT
+        assert "trial-a" in payload.detail
+        assert "trial-b" in payload.detail
+        assert study_mod._AUD04_RECONCILIATION_CAVEAT not in payload.detail
+
+    def test_uses_the_same_latch_file_as_the_total_level_path(self) -> None:
+        matched = study_mod.Aud04PerTrialReconciliationResult(
+            matched=True, cutoff="2026-01-10", n_matched=1, n_exit_only=0, n_aud04_only=0,
+            n_divergent=0, divergent_trial_ids=(), exit_only_trial_ids=(), aud04_only_trial_ids=(),
+        )
+        mismatched = study_mod.Aud04PerTrialReconciliationResult(
+            matched=False, cutoff="2026-01-10", n_matched=0, n_exit_only=1, n_aud04_only=0,
+            n_divergent=0, divergent_trial_ids=(), exit_only_trial_ids=("x",),
+            aud04_only_trial_ids=(),
+        )
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_pnl_reconciliation_ladder_per_trial(
+                result=mismatched, latch=latch, now_ns=_day_ns(i),
+            )
+        latch, clear_payload = study_mod.apply_pnl_reconciliation_ladder_per_trial(
+            result=matched, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert clear_payload.event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT
+        assert latch.streak == 0
+
+
+def _write_minimal_aud04_report_v1(path: Path, *, realised_pnl_after_fees_total: Decimal) -> None:
+    """A pre-Stage-C3 (`schema_version=1`) report -- predates `trial_rows`
+    entirely, never an empty list of them."""
+    payload = {
+        "schema_version": 1,
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-10",
+        "n_fills": 1,
+        "n_scored": 1,
+        "n_residual": 0,
+        "n_unreconciled": 0,
+        "power_caveat": "n=1; not statistically powered.",
+        "realised_pnl_after_fees_total": str(realised_pnl_after_fees_total),
+        "capital_deployed_total": "1.00",
+        "unexplained_flow_days": 0,
+        "settled_through": "2026-01-08",
+        "settled_through_statistic": "max",
+        "lag_sample_n": 1,
+        "roi_status": prr.ROI_STATUS_OK,
+        "unsettled_capital_positions": 0,
+        "max_days_past_horizon": 0,
+        "roi": "0.10",
+        "roi_minus_b0": "0.10",
+        "roi_minus_b1": "0.10",
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+class TestAud04V1FallsBackToTotalLevel:
+    """AUD-07 §6: when AUD-04 publishes a `schema_version=1` report (predates
+    `trial_rows`), the per-row join has nothing to join against -- the study
+    must fall back to `reconcile_with_aud04`'s total-level check, caveat
+    intact, rather than silently skipping the reconciliation."""
+
+    def test_a_v1_report_has_no_trial_rows(self, tmp_path: Path) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_v1.json"
+        _write_minimal_aud04_report_v1(report_path, realised_pnl_after_fees_total=Decimal("0.61"))
+
+        view = prr.read_portfolio_roi_report(report_path)
+
+        assert view.schema_version == 1
+        assert view.trial_rows is None
+
+    def test_main_dispatches_to_the_per_trial_path_when_trial_rows_is_present(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache_dir = tmp_path / "asos"
+        _seed_cached_asos(cache_dir, _CACHED_CITY)
+        _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+        aud04_report = tmp_path / "PRIVATE_portfolio_roi_v2.json"
+        _write_minimal_aud04_report(aud04_report, realised_pnl_after_fees_total=Decimal("0.61"))
+        # settled_through in this fixture is "2026-01-08"; run_date must be
+        # within the staleness bound for the reconciliation to actually run.
+        now_ns = int(dt.datetime(2026, 1, 9, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
+
+        calls: list[str] = []
+        original_per_trial = study_mod.reconcile_with_aud04_per_trial
+        original_total = study_mod.reconcile_with_aud04
+
+        def _spy_per_trial(**kwargs: object) -> object:
+            calls.append("per_trial")
+            return original_per_trial(**kwargs)
+
+        def _spy_total(**kwargs: object) -> object:
+            calls.append("total")
+            return original_total(**kwargs)
+
+        monkeypatch.setattr(study_mod, "reconcile_with_aud04_per_trial", _spy_per_trial)
+        monkeypatch.setattr(study_mod, "reconcile_with_aud04", _spy_total)
+
+        code = study_mod.main(
+            _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report), now_ns=now_ns,
+        )
+
+        assert code == 0
+        assert calls == ["per_trial"]
+
+    def test_main_dispatches_to_the_total_level_path_when_trial_rows_is_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache_dir = tmp_path / "asos"
+        _seed_cached_asos(cache_dir, _CACHED_CITY)
+        _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+        aud04_report = tmp_path / "PRIVATE_portfolio_roi_v1.json"
+        _write_minimal_aud04_report_v1(aud04_report, realised_pnl_after_fees_total=Decimal("0.61"))
+        now_ns = int(dt.datetime(2026, 1, 9, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
+
+        calls: list[str] = []
+        original_per_trial = study_mod.reconcile_with_aud04_per_trial
+        original_total = study_mod.reconcile_with_aud04
+
+        def _spy_per_trial(**kwargs: object) -> object:
+            calls.append("per_trial")
+            return original_per_trial(**kwargs)
+
+        def _spy_total(**kwargs: object) -> object:
+            calls.append("total")
+            return original_total(**kwargs)
+
+        monkeypatch.setattr(study_mod, "reconcile_with_aud04_per_trial", _spy_per_trial)
+        monkeypatch.setattr(study_mod, "reconcile_with_aud04", _spy_total)
+
+        code = study_mod.main(
+            _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report), now_ns=now_ns,
+        )
+
+        assert code == 0
+        assert calls == ["total"]
+
+
 class TestAud04ReconciliationReadiness:
     """Domain review item 2: reconcile like with like -- restrict both sides
     to AUD-04's own `settled_through` cutoff; skip (never compare mismatched
