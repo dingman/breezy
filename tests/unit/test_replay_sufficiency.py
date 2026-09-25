@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -24,17 +25,20 @@ sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 from cli_basis_offer_gate_scan import InstanceVerdict as ScriptInstanceVerdict
 from ma_prelock_winner_ask_study import in_afternoon_window
 
+from breezy.analysis import replay_sufficiency
 from breezy.analysis.replay_sufficiency import (
-    AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN,
+    AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN,
     CORRUPT_ONLY,
     DEPTH_WINDOW_UNDER_30MIN,
     NO_CLEAN_INSTANCE,
     NO_IN_WINDOW_DEPTH,
+    OVERLAP_TOLERANCE_NS,
     REPLAY_SUFFICIENCY_REASONS,
     REPLAY_SUFFICIENCY_SCHEMA_VERSION,
     VENUE_NEVER_LISTED_UNCONFIRMED,
     WINDOW_EDGE_TOLERANCE_NS,
     DuplicateReplaySufficiencyRecordError,
+    FragmentSpan,
     InstanceSpan,
     InstanceVerdict,
     ReplaySufficiency,
@@ -96,6 +100,8 @@ def _full_payload(**overrides: object) -> dict[str, object]:
         "winner_last_in_window_ns": 1_900,
         "window_complete": True,
         "live_instance_count": 0,
+        "coverage_kind": "WHOLE",
+        "excluded_fragments": [],
     }
     payload.update(overrides)
     return payload
@@ -367,9 +373,23 @@ def test_a9_replay_sufficiency_module_never_calls_asdict() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_two_clean_instances_each_ge_30min_are_ambiguous_not_first_listed() -> None:
-    first = _span(instance_id="zzz-listed-first", depth_window_minutes=45.0)
-    second = _span(instance_id="aaa-listed-second", depth_window_minutes=60.0)
+def test_two_clean_instances_each_ge_30min_overlapping_are_ambiguous_not_first_listed() -> None:
+    """AUD-09b amendment Stage B: two eligible CLEAN instances only stay
+    AMBIGUOUS when they genuinely OVERLAP (> OVERLAP_TOLERANCE_NS) -- the old
+    `AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN` token (which fired for ANY two
+    eligible instances, overlapping or not) is retired (B-f)."""
+    first = _span(
+        instance_id="zzz-listed-first",
+        depth_window_minutes=45.0,
+        first_in_window_ns=0,
+        last_in_window_ns=45 * _NS_PER_MIN,
+    )
+    second = _span(
+        instance_id="aaa-listed-second",
+        depth_window_minutes=60.0,
+        first_in_window_ns=10 * _NS_PER_MIN,
+        last_in_window_ns=70 * _NS_PER_MIN,
+    )
 
     result = classify_station_day(
         station=STATION,
@@ -379,7 +399,7 @@ def test_two_clean_instances_each_ge_30min_are_ambiguous_not_first_listed() -> N
     )
 
     assert result.verdict == "INSUFFICIENT"
-    assert result.reason == AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN
+    assert result.reason == AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN
     assert result.winner_instance_id is None
 
 
@@ -507,3 +527,212 @@ def test_write_replay_sufficiency_is_byte_idempotent_regardless_of_input_order(
     write_replay_sufficiency(path_reverse, [row_b, row_a])
 
     assert path_forward.read_bytes() == path_reverse.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Stage B (AUD-09b amendment §3): the overlap winner rule and FRAGMENT
+# reporting. `_STAGE_B_DAY`/`_STAGE_B_START_NS` mirror the real MDW/MIA/NYC
+# 2026-09-14 sequential-restart rows Stage 0 found (e0839202.../44d3220f...).
+# ---------------------------------------------------------------------------
+
+_STAGE_B_DAY = dt.date(2026, 9, 14)
+_STAGE_B_OFFSET = -6.0
+_STAGE_B_START_NS, _STAGE_B_END_NS = decision_window_ns(
+    climate_day=_STAGE_B_DAY, std_utc_offset_hours=_STAGE_B_OFFSET,
+)
+
+
+def _at(instance_id: str, first_min: float, last_min: float) -> InstanceSpan:
+    """A CLEAN span at `[start + first_min, start + last_min)` LST minutes
+    into the Stage B fixture day's decision window."""
+    first_ns = _STAGE_B_START_NS + int(first_min * _NS_PER_MIN)
+    last_ns = _STAGE_B_START_NS + int(last_min * _NS_PER_MIN)
+    return _span(
+        instance_id=instance_id,
+        depth_window_minutes=(last_ns - first_ns) / 1_000_000_000 / 60,
+        first_in_window_ns=first_ns,
+        last_in_window_ns=last_ns,
+    )
+
+
+def _classify_stage_b(instances: list[InstanceSpan]) -> ReplaySufficiency:
+    return classify_station_day(
+        station=STATION,
+        climate_day=_STAGE_B_DAY.isoformat(),
+        instances=instances,
+        computed_day=COMPUTED_DAY,
+        window_start_ns=_STAGE_B_START_NS,
+        window_end_ns=_STAGE_B_END_NS,
+    )
+
+
+def test_ba_overlap_beyond_tolerance_is_ambiguous_60s_and_touching_are_disjoint() -> None:
+    a = _at("instance-a", 0, 40)  # 40 min span, eligible
+
+    # 61 s overlap: exceeds OVERLAP_TOLERANCE_NS -> AMBIGUOUS.
+    b_overlap = _span(
+        instance_id="instance-b",
+        depth_window_minutes=40.0,
+        first_in_window_ns=a.last_in_window_ns - (OVERLAP_TOLERANCE_NS + 1),
+        last_in_window_ns=a.last_in_window_ns - (OVERLAP_TOLERANCE_NS + 1) + 40 * _NS_PER_MIN,
+    )
+    overlapping_result = _classify_stage_b([a, b_overlap])
+    assert overlapping_result.verdict == "INSUFFICIENT"
+    assert overlapping_result.reason == AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN
+
+    # Exactly 60s: NOT exceeding the tolerance -> disjoint -> SUFFICIENT.
+    b_exact = _span(
+        instance_id="instance-b",
+        depth_window_minutes=40.0,
+        first_in_window_ns=a.last_in_window_ns - OVERLAP_TOLERANCE_NS,
+        last_in_window_ns=a.last_in_window_ns - OVERLAP_TOLERANCE_NS + 40 * _NS_PER_MIN,
+    )
+    exact_result = _classify_stage_b([a, b_exact])
+    assert exact_result.verdict == "SUFFICIENT"
+
+    # Touching (zero gap): disjoint -> SUFFICIENT.
+    b_touching = _span(
+        instance_id="instance-b",
+        depth_window_minutes=40.0,
+        first_in_window_ns=a.last_in_window_ns,
+        last_in_window_ns=a.last_in_window_ns + 40 * _NS_PER_MIN,
+    )
+    touching_result = _classify_stage_b([a, b_touching])
+    assert touching_result.verdict == "SUFFICIENT"
+
+
+def test_bb_disjoint_fragments_the_longer_wins_fragment_and_excluded_fragments_shape() -> None:
+    # 12:00-14:00 (120 min) and 14:05-17:00 (175 min): a 5-minute gap, disjoint.
+    shorter = _at("instance-shorter", 0, 120)
+    longer = _at("instance-longer", 125, 300)
+
+    result = _classify_stage_b([shorter, longer])
+
+    assert result.verdict == "SUFFICIENT"
+    assert result.reason == ""
+    assert result.winner_instance_id == "instance-longer"
+    assert result.coverage_kind == "FRAGMENT"
+    assert result.excluded_fragments == (
+        FragmentSpan(
+            instance_id="instance-shorter",
+            first_in_window_ns=shorter.first_in_window_ns,
+            last_in_window_ns=shorter.last_in_window_ns,
+        ),
+    )
+
+
+def test_bc_a_single_eligible_instance_plus_a_disjoint_10min_fragment_gives_fragment() -> None:
+    winner = _at("instance-winner", 0, 45)  # 45 min, eligible
+    small_fragment = _at("instance-small", 50, 60)  # 10 min, NOT eligible on its own
+
+    result = _classify_stage_b([winner, small_fragment])
+
+    assert result.verdict == "SUFFICIENT"
+    assert result.winner_instance_id == "instance-winner"
+    assert result.coverage_kind == "FRAGMENT"
+    assert {fragment.instance_id for fragment in result.excluded_fragments} == {"instance-small"}
+
+
+def test_bd_tie_break_order_span_then_first_ns_then_instance_id() -> None:
+    # Two disjoint fragments tied at the longest span (90 min): the earlier
+    # one (by first_ns) wins over the later one, even though a third,
+    # shorter fragment (60 min) sits chronologically between them.
+    earliest_tied = _at("instance-c", 0, 90)
+    later_tied = _at("instance-b", 100, 190)
+    shorter = _at("instance-a", 200, 260)
+
+    result = _classify_stage_b([earliest_tied, later_tied, shorter])
+
+    assert result.verdict == "SUFFICIENT"
+    assert result.winner_instance_id == "instance-c"
+
+    # Direct pin of the (-span_ns, first_ns, instance_id) tie-break's THIRD
+    # key: two spans identical in both span and first_ns differ only by
+    # instance_id (an input shape `classify_station_day` cannot construct
+    # from genuinely disjoint real data, but the sort rule itself is pinned
+    # here directly).
+    same_first_and_span_a = _span(
+        instance_id="bbb", depth_window_minutes=40.0, first_in_window_ns=1_000,
+        last_in_window_ns=1_000 + 40 * _NS_PER_MIN,
+    )
+    same_first_and_span_b = _span(
+        instance_id="aaa", depth_window_minutes=40.0, first_in_window_ns=1_000,
+        last_in_window_ns=1_000 + 40 * _NS_PER_MIN,
+    )
+    winner = replay_sufficiency._pick_winner([same_first_and_span_a, same_first_and_span_b])
+    assert winner.instance_id == "aaa"
+
+
+def test_be_every_permutation_of_four_spans_gives_an_identical_row() -> None:
+    spans = [
+        _at("s-40", 0, 40),
+        _at("s-90", 50, 140),
+        _at("s-60", 150, 210),
+        _at("s-15", 220, 235),
+    ]
+
+    expected = _classify_stage_b(spans)
+    assert expected.winner_instance_id == "s-90"
+    assert expected.coverage_kind == "FRAGMENT"
+    assert {fragment.instance_id for fragment in expected.excluded_fragments} == {
+        "s-40", "s-60", "s-15",
+    }
+
+    for permutation in itertools.permutations(spans):
+        assert _classify_stage_b(list(permutation)) == expected
+
+
+def test_bf_the_old_ambiguous_token_is_absent() -> None:
+    assert "AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN" not in REPLAY_SUFFICIENCY_REASONS
+    assert not hasattr(replay_sufficiency, "AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN")
+    assert AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN in REPLAY_SUFFICIENCY_REASONS
+
+    source = Path(replay_sufficiency.__file__).read_text(encoding="utf-8")
+    assert "AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN" not in source
+
+
+def test_b23_a_whole_day_sufficient_row_carries_coverage_kind_whole() -> None:
+    span = _at("instance-1", 2, 298)  # a single CLEAN instance, no fragments
+
+    result = _classify_stage_b([span])
+
+    assert result.verdict == "SUFFICIENT"
+    assert result.coverage_kind == "WHOLE"
+    assert result.excluded_fragments == ()
+
+
+def test_stage_b_schema_version_is_3() -> None:
+    assert REPLAY_SUFFICIENCY_SCHEMA_VERSION == 3
+
+
+def test_stage_b_excluded_fragments_round_trip_through_to_dict_from_dict() -> None:
+    payload = _full_payload(
+        coverage_kind="FRAGMENT",
+        excluded_fragments=[
+            {"instance_id": "z", "first_in_window_ns": 500, "last_in_window_ns": 600},
+            {"instance_id": "a", "first_in_window_ns": 100, "last_in_window_ns": 200},
+        ],
+    )
+
+    row = ReplaySufficiency.from_dict(payload)
+    restored = ReplaySufficiency.from_dict(row.to_dict())
+
+    assert restored == row
+    assert row.excluded_fragments == (
+        FragmentSpan(instance_id="z", first_in_window_ns=500, last_in_window_ns=600),
+        FragmentSpan(instance_id="a", first_in_window_ns=100, last_in_window_ns=200),
+    )
+
+
+def test_stage_b_from_dict_raises_on_a_malformed_excluded_fragments_entry() -> None:
+    payload = _full_payload(excluded_fragments=[{"instance_id": "z"}])
+
+    with pytest.raises(ReplaySufficiencyRecordError, match="excluded_fragments"):
+        ReplaySufficiency.from_dict(payload)
+
+
+def test_stage_b_from_dict_raises_when_excluded_fragments_is_not_a_list() -> None:
+    payload = _full_payload(excluded_fragments="not-a-list")
+
+    with pytest.raises(ReplaySufficiencyRecordError, match="excluded_fragments"):
+        ReplaySufficiency.from_dict(payload)

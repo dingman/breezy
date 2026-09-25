@@ -13,8 +13,22 @@ cores.
 "De-dup BEFORE replay"; memory ``paper-replay-instance-selection`` records the
 zero-fill trap a first-listed instance caused): key ``(station, climate_day)``
 only; the winner is the ``CLEAN`` instance with the longest in-window Depth10
-span; two ``CLEAN`` instances each >= :data:`MIN_DEPTH_WINDOW_MINUTES` REFUSE
-the pair -- no first-list, no stitch, no union.
+span.
+
+**Overlap winner rule (AUD-09b amendment Stage B, §3)**: two or more
+eligible (``span_ns >= `` :data:`MIN_DEPTH_WINDOW_NS`) ``CLEAN`` instances no
+longer always refuse the pair. A genuine overlap -- pairwise
+``min(last_i, last_j) - max(first_i, first_j)`` exceeding
+:data:`OVERLAP_TOLERANCE_NS` -- still refuses
+(``AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN``: two writers plausibly
+touched the same instant). Otherwise every eligible pair is DISJOINT (a
+sequential recorder restart split one afternoon into fragments), and the
+longest fragment wins by ``(-span_ns, first_ns, instance_id)`` -- still no
+first-list, no stitch, no union: the losing fragment's hours are never
+replayed. That loss is recorded, never hidden: ``coverage_kind`` is
+``"FRAGMENT"`` whenever any other ``CLEAN`` instance has a date-scoped event
+outside the winner's own ``[first, last]``, and ``excluded_fragments`` names
+each such instance's own extent.
 
 **Coverage basis is DEPTH, not quotes**: v3 hunts Depth10 (L-35), and at
 ``L2_MBP`` the QuoteTick tape is inert for execution
@@ -52,7 +66,7 @@ from typing import Final, Literal
 from breezy.domain.climate_day import standard_time_zone
 
 __all__ = [
-    "AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN",
+    "AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN",
     "CANDIDATE_UNSUPPORTED_STATION",
     "CORRUPT_ONLY",
     "DECISION_WINDOW_END_LST",
@@ -60,13 +74,16 @@ __all__ = [
     "DEPTH_WINDOW_UNDER_30MIN",
     "INGEST_INSTANCE_REFUSED",
     "MIN_DEPTH_WINDOW_MINUTES",
+    "MIN_DEPTH_WINDOW_NS",
     "NO_CLEAN_INSTANCE",
     "NO_IN_WINDOW_DEPTH",
+    "OVERLAP_TOLERANCE_NS",
     "REPLAY_SUFFICIENCY_REASONS",
     "REPLAY_SUFFICIENCY_SCHEMA_VERSION",
     "VENUE_NEVER_LISTED_UNCONFIRMED",
     "WINDOW_EDGE_TOLERANCE_NS",
     "DuplicateReplaySufficiencyRecordError",
+    "FragmentSpan",
     "InstanceSpan",
     "InstanceVerdict",
     "ReplaySufficiency",
@@ -83,10 +100,12 @@ __all__ = [
 ]
 
 #: Hand-off H0 (AUD-09 plan §6a): every writer/reader agrees on this version.
-#: Bumped to 2 by the AUD-09b amendment Stage A (C2a): the MEANING of the
-#: spans changed (date-scoped, ns-precision, plus the new window/live-count
-#: fields), so a v1 line is refused rather than silently misread.
-REPLAY_SUFFICIENCY_SCHEMA_VERSION: Final[int] = 2
+#: Bumped to 3 by the AUD-09b amendment Stage B (§3): the MEANING of the
+#: rows changed again (the overlap winner rule replaces the old
+#: two-CLEAN-instances-always-refuse rule, and every row now carries
+#: ``coverage_kind``/``excluded_fragments``), so a v1 or v2 line is refused
+#: rather than silently misread.
+REPLAY_SUFFICIENCY_SCHEMA_VERSION: Final[int] = 3
 
 #: Matches ``structural_dead_stop.py``'s own >=30 min afternoon-coverage rule
 #: (``scripts/analysis/ma_prelock_winner_ask_study.MIN_AFTERNOON_COVERAGE_MINUTES``,
@@ -96,6 +115,22 @@ REPLAY_SUFFICIENCY_SCHEMA_VERSION: Final[int] = 2
 #: imported: that module lives in ``scripts/``, unimportable from
 #: ``src/breezy/**`` -- the same reasoning :data:`InstanceVerdict` documents.
 MIN_DEPTH_WINDOW_MINUTES: Final[float] = 30.0
+
+#: AUD-09b amendment Stage B (§3): the SAME 30-minute eligibility floor as
+#: :data:`MIN_DEPTH_WINDOW_MINUTES`, expressed in integer nanoseconds and
+#: computed directly from an instance's ``first_in_window_ns``/
+#: ``last_in_window_ns`` (C1's date-scoped extents), never from the derived
+#: float ``depth_window_minutes``. Used only by the Stage B overlap rule.
+MIN_DEPTH_WINDOW_NS: Final[int] = 30 * 60 * 1_000_000_000
+
+#: AUD-09b amendment Stage B (§3): two eligible CLEAN instances whose
+#: in-window depth overlaps by MORE than this many nanoseconds are a genuine
+#: duplicate and stay ``AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN``.
+#: Touching intervals and an overlap of EXACTLY this value count as disjoint.
+#: 60 s is far below the 30-minute floor (so a real duplicate can hide at
+#: most 60 s) and above zero (to absorb a boot-snapshot ``ts_event`` at a
+#: recorder handoff).
+OVERLAP_TOLERANCE_NS: Final[int] = 60 * 1_000_000_000
 
 #: The decision window is local-STANDARD-time ``[12:00, 17:00)`` -- the same
 #: bounds ``ma_prelock_winner_ask_study.AFTERNOON_WINDOW_START/END`` and
@@ -118,7 +153,13 @@ _NS_PER_US: Final[int] = 1_000
 #: venue; a bare ``VENUE_NEVER_LISTED`` would claim a fact only a by-slug
 #: probe can establish (memory ``venue-skips-station-days``).
 NO_CLEAN_INSTANCE: Final[str] = "NO_CLEAN_INSTANCE"
-AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN: Final[str] = "AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN"
+#: AUD-09b amendment Stage B (§3): replaces the pre-Stage-B "two eligible
+#: CLEAN instances always refuse the pair" token, which is now false text --
+#: only a genuine overlap (> :data:`OVERLAP_TOLERANCE_NS`) refuses the pair.
+#: The old token is never emitted and no longer exists in this module (B-f).
+AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN: Final[str] = (
+    "AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN"
+)
 DEPTH_WINDOW_UNDER_30MIN: Final[str] = "DEPTH_WINDOW_UNDER_30MIN"
 NO_IN_WINDOW_DEPTH: Final[str] = "NO_IN_WINDOW_DEPTH"
 VENUE_NEVER_LISTED_UNCONFIRMED: Final[str] = "VENUE_NEVER_LISTED_UNCONFIRMED"
@@ -129,7 +170,7 @@ CANDIDATE_UNSUPPORTED_STATION: Final[str] = "CANDIDATE_UNSUPPORTED_STATION"
 REPLAY_SUFFICIENCY_REASONS: Final[frozenset[str]] = frozenset(
     {
         NO_CLEAN_INSTANCE,
-        AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN,
+        AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN,
         DEPTH_WINDOW_UNDER_30MIN,
         NO_IN_WINDOW_DEPTH,
         VENUE_NEVER_LISTED_UNCONFIRMED,
@@ -219,6 +260,22 @@ def count_live_instances_in_window(
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class FragmentSpan:
+    """One losing CLEAN instance's own extent, excluded from a FRAGMENT winner
+    (AUD-09b amendment Stage B, C4's pinned shape).
+
+    Exactly these three fields -- the closed JSON shape ``{"instance_id":
+    str, "first_in_window_ns": int, "last_in_window_ns": int}`` -- so a
+    :class:`ReplaySufficiency` row records WHICH hours were never replayed,
+    never a stitch or union of them.
+    """
+
+    instance_id: str
+    first_in_window_ns: int
+    last_in_window_ns: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InstanceSpan:
     """One instance's contribution to one ``(station, climate_day)``.
 
@@ -261,6 +318,16 @@ class ReplaySufficiency:
     the window's own edges. ``live_instance_count`` is the count from
     :func:`count_live_instances_in_window` for this ``(station,
     climate_day)``.
+
+    AUD-09b amendment Stage B (§3) fields: ``coverage_kind`` is ``"WHOLE"``
+    unless some OTHER ``CLEAN`` instance has a date-scoped event outside the
+    winner's own ``[winner_first_in_window_ns, winner_last_in_window_ns]``,
+    in which case it is ``"FRAGMENT"`` -- the winner's hours are real but
+    incomplete for the day. ``excluded_fragments`` names each such losing
+    instance's own extent (C4's pinned shape), sorted by
+    ``(first_in_window_ns, instance_id)``. Both default to the degenerate
+    ``"WHOLE"``/``()`` for every ``INSUFFICIENT`` row (no winner, nothing
+    excluded).
     """
 
     schema_version: int
@@ -279,6 +346,8 @@ class ReplaySufficiency:
     winner_last_in_window_ns: int | None
     window_complete: bool
     live_instance_count: int
+    coverage_kind: str
+    excluded_fragments: tuple[FragmentSpan, ...]
 
     def to_dict(self) -> dict[str, object]:
         """Explicit field-by-field row -- never ``dataclasses.asdict`` (AUD-09b
@@ -302,6 +371,15 @@ class ReplaySufficiency:
             "winner_last_in_window_ns": self.winner_last_in_window_ns,
             "window_complete": self.window_complete,
             "live_instance_count": self.live_instance_count,
+            "coverage_kind": self.coverage_kind,
+            "excluded_fragments": [
+                {
+                    "instance_id": fragment.instance_id,
+                    "first_in_window_ns": fragment.first_in_window_ns,
+                    "last_in_window_ns": fragment.last_in_window_ns,
+                }
+                for fragment in self.excluded_fragments
+            ],
         }
 
     @classmethod
@@ -314,16 +392,18 @@ class ReplaySufficiency:
         a positional slot instead of a JSON key.
         """
         keys = set(payload)
-        missing = _RECORD_FIELD_TYPES.keys() - keys
+        known_keys = _RECORD_FIELD_TYPES.keys() | _LIST_RECORD_FIELDS
+        missing = known_keys - keys
         if missing:
             raise ReplaySufficiencyRecordError(
                 f"replay_sufficiency record missing key(s): {sorted(missing)}"
             )
-        extra = keys - _RECORD_FIELD_TYPES.keys()
+        extra = keys - known_keys
         if extra:
             raise ReplaySufficiencyRecordError(
                 f"replay_sufficiency record has unexpected key(s): {sorted(extra)}"
             )
+        excluded_fragments = _parse_excluded_fragments(payload["excluded_fragments"])
         for name, expected_type in _RECORD_FIELD_TYPES.items():
             value = payload[name]
             if value is None:
@@ -367,6 +447,8 @@ class ReplaySufficiency:
             winner_last_in_window_ns=payload["winner_last_in_window_ns"],  # type: ignore[arg-type]
             window_complete=payload["window_complete"],  # type: ignore[arg-type]
             live_instance_count=payload["live_instance_count"],  # type: ignore[arg-type]
+            coverage_kind=payload["coverage_kind"],  # type: ignore[arg-type]
+            excluded_fragments=excluded_fragments,
         )
 
 
@@ -390,12 +472,74 @@ _RECORD_FIELD_TYPES: Final[dict[str, type]] = {
     "winner_last_in_window_ns": int,
     "window_complete": bool,
     "live_instance_count": int,
+    "coverage_kind": str,
+}
+
+#: `excluded_fragments` is a list, not a scalar -- validated separately by
+#: :func:`_parse_excluded_fragments`, but still a required top-level key
+#: (AUD-09b amendment Stage B, C4).
+_LIST_RECORD_FIELDS: Final[frozenset[str]] = frozenset({"excluded_fragments"})
+
+#: `FragmentSpan`'s own closed JSON shape (C4), nested inside each
+#: `excluded_fragments` entry.
+_FRAGMENT_FIELD_TYPES: Final[dict[str, type]] = {
+    "instance_id": str,
+    "first_in_window_ns": int,
+    "last_in_window_ns": int,
 }
 
 #: Fields legitimately `None` -- an `INSUFFICIENT` row has no winner.
 _NULLABLE_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
     {"winner_instance_id", "winner_first_in_window_ns", "winner_last_in_window_ns"}
 )
+
+
+def _parse_excluded_fragments(payload: object) -> tuple[FragmentSpan, ...]:
+    """Validate and reconstruct C4's pinned `excluded_fragments` shape.
+
+    Raises :class:`ReplaySufficiencyRecordError` on anything but a list of
+    objects carrying exactly `_FRAGMENT_FIELD_TYPES`'s keys with the right
+    types -- never a bare `TypeError`/`KeyError`.
+    """
+    if not isinstance(payload, list):
+        raise ReplaySufficiencyRecordError(
+            f"'excluded_fragments' must be a list, got {type(payload).__name__}"
+        )
+    fragments: list[FragmentSpan] = []
+    for entry in payload:
+        if not isinstance(entry, Mapping):
+            raise ReplaySufficiencyRecordError(
+                f"'excluded_fragments' entry must be an object, got {type(entry).__name__}"
+            )
+        entry_keys = set(entry)
+        expected_keys = _FRAGMENT_FIELD_TYPES.keys()
+        if entry_keys != expected_keys:
+            raise ReplaySufficiencyRecordError(
+                "'excluded_fragments' entry has the wrong key(s): "
+                f"missing {sorted(expected_keys - entry_keys)}, "
+                f"extra {sorted(entry_keys - expected_keys)}"
+            )
+        for name, expected_type in _FRAGMENT_FIELD_TYPES.items():
+            value = entry[name]
+            is_bool_value = isinstance(value, bool)
+            if expected_type is int and (not isinstance(value, int) or is_bool_value):
+                raise ReplaySufficiencyRecordError(
+                    f"'excluded_fragments' entry {name!r} must be an int, "
+                    f"got {type(value).__name__}"
+                )
+            if expected_type is str and not isinstance(value, str):
+                raise ReplaySufficiencyRecordError(
+                    f"'excluded_fragments' entry {name!r} must be a str, "
+                    f"got {type(value).__name__}"
+                )
+        fragments.append(
+            FragmentSpan(
+                instance_id=entry["instance_id"],  # type: ignore[arg-type]
+                first_in_window_ns=entry["first_in_window_ns"],  # type: ignore[arg-type]
+                last_in_window_ns=entry["last_in_window_ns"],  # type: ignore[arg-type]
+            )
+        )
+    return tuple(fragments)
 
 
 class ReplaySufficiencyRecordError(Exception):
@@ -457,6 +601,16 @@ def classify_station_day(
     the real census script (``run_census``) always supplies the true values
     computed via :func:`decision_window_ns` and
     :func:`count_live_instances_in_window`.
+
+    AUD-09b amendment Stage B (§3): eligibility for the overlap rule below is
+    ``span_ns >= `` :data:`MIN_DEPTH_WINDOW_NS`, computed from
+    ``first_in_window_ns``/``last_in_window_ns`` when both are set (the real,
+    production shape) -- see :func:`_span_ns` for the minutes-based fallback
+    that keeps a synthetic caller lacking ns fields at Stage A's unchanged
+    behaviour (A3). Two eligible instances that overlap by more than
+    :data:`OVERLAP_TOLERANCE_NS`, OR either of which lacks a real ns extent
+    to check, stay ``AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN`` --
+    disjointness is only ever claimed with ns evidence.
     """
     clean = [instance for instance in instances if instance.verdict == "CLEAN"]
 
@@ -475,47 +629,50 @@ def classify_station_day(
             live_instance_count=live_instance_count,
         )
 
-    eligible = [
-        instance for instance in clean if instance.depth_window_minutes >= MIN_DEPTH_WINDOW_MINUTES
-    ]
+    eligible = [instance for instance in clean if _span_ns(instance) >= MIN_DEPTH_WINDOW_NS]
+
     if len(eligible) >= 2:
-        best = _longest_depth(eligible)
-        return _insufficient(
+        overlapping = any(
+            _pair_overlaps(a, b) for i, a in enumerate(eligible) for b in eligible[i + 1 :]
+        )
+        if overlapping:
+            best = _longest_depth(eligible)
+            return _insufficient(
+                station=station,
+                climate_day=climate_day,
+                reason=AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN,
+                computed_day=computed_day,
+                depth_window_minutes=best.depth_window_minutes,
+                quote_window_minutes=best.quote_window_minutes,
+                distinct_instruments=best.distinct_instruments,
+                window_start_ns=window_start_ns,
+                window_end_ns=window_end_ns,
+                live_instance_count=live_instance_count,
+            )
+        return _sufficient(
             station=station,
             climate_day=climate_day,
-            reason=AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN,
+            winner=_pick_winner(eligible),
+            clean=clean,
             computed_day=computed_day,
-            depth_window_minutes=best.depth_window_minutes,
-            quote_window_minutes=best.quote_window_minutes,
-            distinct_instruments=best.distinct_instruments,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+            live_instance_count=live_instance_count,
+        )
+
+    if eligible:
+        return _sufficient(
+            station=station,
+            climate_day=climate_day,
+            winner=eligible[0],
+            clean=clean,
+            computed_day=computed_day,
             window_start_ns=window_start_ns,
             window_end_ns=window_end_ns,
             live_instance_count=live_instance_count,
         )
 
     best = _longest_depth(clean)
-    if best.depth_window_minutes >= MIN_DEPTH_WINDOW_MINUTES:
-        return ReplaySufficiency(
-            schema_version=REPLAY_SUFFICIENCY_SCHEMA_VERSION,
-            station=station,
-            climate_day=climate_day,
-            verdict="SUFFICIENT",
-            reason="",
-            winner_instance_id=best.instance_id,
-            depth_window_minutes=best.depth_window_minutes,
-            quote_window_minutes=best.quote_window_minutes,
-            distinct_instruments=best.distinct_instruments,
-            computed_day=computed_day,
-            window_start_ns=window_start_ns,
-            window_end_ns=window_end_ns,
-            winner_first_in_window_ns=best.first_in_window_ns,
-            winner_last_in_window_ns=best.last_in_window_ns,
-            window_complete=_window_complete(
-                winner=best, window_start_ns=window_start_ns, window_end_ns=window_end_ns,
-            ),
-            live_instance_count=live_instance_count,
-        )
-
     reason = DEPTH_WINDOW_UNDER_30MIN if best.depth_window_minutes > 0.0 else NO_IN_WINDOW_DEPTH
     return _insufficient(
         station=station,
@@ -535,6 +692,146 @@ def _longest_depth(instances: Sequence[InstanceSpan]) -> InstanceSpan:
     """The instance with the longest depth span, ties broken by id for determinism."""
     return max(
         instances, key=lambda instance: (instance.depth_window_minutes, instance.instance_id)
+    )
+
+
+_NS_PER_MINUTE: Final[int] = 60_000_000_000
+
+
+def _span_ns(instance: InstanceSpan) -> int:
+    """AUD-09b amendment Stage B (§3): the ns-precision span `window_extent`
+    would report for this instance's own in-window instants.
+
+    When both edges are set (the real, production shape -- every
+    `InstanceSpan` the census script builds), this IS that span. When either
+    edge is unset -- a synthetic/legacy caller that only populated
+    `depth_window_minutes` -- falls back to that derived value converted to
+    ns, so a caller that never populates the ns fields keeps exactly Stage
+    A's `depth_window_minutes`-based eligibility (unchanged, A3) rather than
+    becoming spuriously ineligible.
+    """
+    if instance.first_in_window_ns is not None and instance.last_in_window_ns is not None:
+        return instance.last_in_window_ns - instance.first_in_window_ns
+    return int(instance.depth_window_minutes * _NS_PER_MINUTE)
+
+
+def _first_ns_sort_key(instance: InstanceSpan) -> int:
+    """`first_in_window_ns`, or `0` for a synthetic instance that never set
+    it -- only reached when `_span_ns`'s minutes fallback already made it
+    eligible; never raises comparing `None` against a real `int`."""
+    return instance.first_in_window_ns if instance.first_in_window_ns is not None else 0
+
+
+def _overlap_ns(a: InstanceSpan, b: InstanceSpan) -> int | None:
+    """AUD-09b amendment Stage B (§3): `min(last, last) - max(first, first)`.
+
+    `None` when either side lacks a REAL ns extent -- treated conservatively
+    as an overlap (AMBIGUOUS) by the caller, exactly matching Stage A's
+    original behaviour for any two eligible CLEAN instances (never a
+    disjoint-fragment claim without the ns precision to back it).
+    """
+    if a.first_in_window_ns is None or a.last_in_window_ns is None:
+        return None
+    if b.first_in_window_ns is None or b.last_in_window_ns is None:
+        return None
+    return min(a.last_in_window_ns, b.last_in_window_ns) - max(
+        a.first_in_window_ns, b.first_in_window_ns,
+    )
+
+
+def _pair_overlaps(a: InstanceSpan, b: InstanceSpan) -> bool:
+    """`True` on a genuine overlap (> `OVERLAP_TOLERANCE_NS`) OR when either
+    side lacks the ns evidence to prove disjointness (fail toward AMBIGUOUS)."""
+    overlap = _overlap_ns(a, b)
+    return overlap is None or overlap > OVERLAP_TOLERANCE_NS
+
+
+def _pick_winner(eligible: Sequence[InstanceSpan]) -> InstanceSpan:
+    """AUD-09b amendment Stage B (§3): `(-span_ns, first_ns, instance_id)`.
+
+    The longest fragment wins; a tie goes to the earlier one; a tie on both
+    goes to the lexicographically smaller `instance_id` -- identical for
+    every permutation of the input (B22/B-e).
+    """
+    return min(
+        eligible,
+        key=lambda instance: (
+            -_span_ns(instance),
+            _first_ns_sort_key(instance),
+            instance.instance_id,
+        ),
+    )
+
+
+def _fragment_analysis(
+    *, winner: InstanceSpan, clean: Sequence[InstanceSpan],
+) -> tuple[str, tuple[FragmentSpan, ...]]:
+    """AUD-09b amendment Stage B (§3): `coverage_kind` plus `excluded_fragments`.
+
+    `"FRAGMENT"` iff some OTHER `CLEAN` instance has a date-scoped in-window
+    event outside the winner's own `[first, last]` -- approximated from that
+    instance's own extent (`first`/`last` are the only in-window instants
+    this module tracks): its first is before the winner's first, or its last
+    is after the winner's last. An instance with no in-window depth at all
+    (`first_in_window_ns is None`) contributes nothing.
+    """
+    fragments = [
+        FragmentSpan(
+            instance_id=other.instance_id,
+            first_in_window_ns=other.first_in_window_ns,
+            last_in_window_ns=other.last_in_window_ns,
+        )
+        for other in clean
+        if other.instance_id != winner.instance_id
+        and other.first_in_window_ns is not None
+        and other.last_in_window_ns is not None
+        and winner.first_in_window_ns is not None
+        and winner.last_in_window_ns is not None
+        and (
+            other.first_in_window_ns < winner.first_in_window_ns
+            or other.last_in_window_ns > winner.last_in_window_ns
+        )
+    ]
+    ordered = tuple(
+        sorted(fragments, key=lambda fragment: (fragment.first_in_window_ns, fragment.instance_id))
+    )
+    coverage_kind = "FRAGMENT" if ordered else "WHOLE"
+    return coverage_kind, ordered
+
+
+def _sufficient(
+    *,
+    station: str,
+    climate_day: str,
+    winner: InstanceSpan,
+    clean: Sequence[InstanceSpan],
+    computed_day: str,
+    window_start_ns: int,
+    window_end_ns: int,
+    live_instance_count: int,
+) -> ReplaySufficiency:
+    coverage_kind, excluded_fragments = _fragment_analysis(winner=winner, clean=clean)
+    return ReplaySufficiency(
+        schema_version=REPLAY_SUFFICIENCY_SCHEMA_VERSION,
+        station=station,
+        climate_day=climate_day,
+        verdict="SUFFICIENT",
+        reason="",
+        winner_instance_id=winner.instance_id,
+        depth_window_minutes=winner.depth_window_minutes,
+        quote_window_minutes=winner.quote_window_minutes,
+        distinct_instruments=winner.distinct_instruments,
+        computed_day=computed_day,
+        window_start_ns=window_start_ns,
+        window_end_ns=window_end_ns,
+        winner_first_in_window_ns=winner.first_in_window_ns,
+        winner_last_in_window_ns=winner.last_in_window_ns,
+        window_complete=_window_complete(
+            winner=winner, window_start_ns=window_start_ns, window_end_ns=window_end_ns,
+        ),
+        live_instance_count=live_instance_count,
+        coverage_kind=coverage_kind,
+        excluded_fragments=excluded_fragments,
     )
 
 
@@ -568,6 +865,8 @@ def _insufficient(
         winner_last_in_window_ns=None,
         window_complete=False,
         live_instance_count=live_instance_count,
+        coverage_kind="WHOLE",
+        excluded_fragments=(),
     )
 
 

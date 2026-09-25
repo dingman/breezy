@@ -238,3 +238,53 @@ Three same-date, disjoint fragments with 4-min handover gaps (sequential restart
 **Stage A (date scoping + cache) fixes 96% of the problem; Stage B needed for the remaining 3 rows.** The v1 problem (69 AMBIGUOUS rows) is eliminated by date scoping (H-A dominates). The three H-C rows (same-date disjoint fragments from sequential restart) require Stage B's overlap rule to classify as SUFFICIENT. The 18 SUFFICIENT→INSUFFICIENT rows are correct reclassifications (v1 was wrong). The remaining 34 INSUFFICIENT rows are structural.
 
 **Recommendation:** Merge Stage A into the primary branch with the drift test (R-e). Build and test Stage B immediately after Stage A. Deploy Stage A's census nightly under B26's cost gate. Do not release H-C rows for replay pending Stage B build.
+
+**Correction (2026-09-25, Stage B build):** the three H-C rows above are Stage 0's classification of the OLD (pre-Stage-B) rule -- they are same-date DISJOINT fragments (4-min handover gap; overlap_ns ≈ -237 s to -242 s, i.e. a GAP, never an overlap), not an actual overlap. Any earlier wording in this document describing them as "overlapping" or as H-B is imprecise and is superseded by this note: they are H-C, and only H-C (a real H-B row, had one existed, would carry a POSITIVE `overlap_ns` exceeding `OVERLAP_TOLERANCE_NS`). The H-B row count in the table above is correctly 0.
+
+## Stage B build and re-run (2026-09-25)
+
+**Decision: BUILD** (unchanged from the Stage B decision section above; this section records the completed build and the measured re-run delta).
+
+Implemented in `src/breezy/analysis/replay_sufficiency.py` (`classify_station_day`'s overlap winner rule, `FragmentSpan`, `coverage_kind`/`excluded_fragments`, schema bumped 2 -> 3) and `scripts/analysis/replay_sufficiency_census.py` (the Stage-0-only `--dump-instance-extents`/`_dump_instance_extents` diagnostic (D1) deleted per the C6 note, since Stage B has now landed). RED-first TDD: `tests/unit/test_replay_sufficiency.py` (B-a through B-f, B23, schema-version and round-trip tests) and `tests/unit/test_replay_sufficiency_census.py` (D1 test removed). Full focused suite green; `ruff` and `lint-imports` (5 kept) clean.
+
+### Re-run command
+
+Same cache (`instance_spans.jsonl`, copied verbatim from the Stage 0 run -- CLEAN instance spans are unaffected by the winner-rule change) reused to isolate the classification delta from any capture-freshness delta:
+
+```
+systemd-run --user --slice=breezy-studies.slice -p MemoryMax=6G \
+  -p WorkingDirectory=/home/jon/breezy-a09a -E PYTHONPATH=/home/jon/breezy-a09a/src \
+  --wait --collect -q /usr/bin/flock -w 1800 "$XDG_RUNTIME_DIR/breezy-studies.lock" \
+  /usr/bin/time -v -o time_stageB.txt /home/jon/breezy/.venv/bin/python \
+  scripts/analysis/replay_sufficiency_census.py \
+  --output replay_sufficiency_stageB.jsonl \
+  --instance-spans-cache instance_spans.jsonl
+```
+
+(`--dump-instance-extents` omitted: D1 no longer exists.)
+
+**Cost:** wall 7:13, user+sys CPU 7:10 (342.4 + 87.3 s), max RSS 400 MB -- consistent with the Stage 0 warm-run cost class (B26 unaffected).
+
+### Verdict delta (Stage 0 v2-cold -> Stage B), by `(station, climate_day)` key
+
+| Key | Before (Stage 0, schema v2) | After (Stage B, schema v3) |
+|---|---|---|
+| (MDW, 2026-09-14) | INSUFFICIENT / `AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN` | SUFFICIENT, winner `44d3220f-fe48...` |
+| (MIA, 2026-09-14) | INSUFFICIENT / `AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN` | SUFFICIENT, winner `e0839202-d4aa...` |
+| (NYC, 2026-09-14) | INSUFFICIENT / `AMBIGUOUS_WINNER_TWO_CLEAN_GE_30MIN` | SUFFICIENT, winner `e0839202-d4aa...` |
+
+All 124 other keys are byte-for-byte identical (verdict, reason, winner) between the two runs. **Delta is exactly the 3 predicted H-C rows -- no other row moved.** `SUFFICIENT` count: 87 -> 90; the `AMBIGUOUS_WINNER_*` reason no longer appears anywhere in the output (count 0), matching B-f (the old token is retired).
+
+Both new SUFFICIENT rows carry `coverage_kind=FRAGMENT` and a one-entry `excluded_fragments` (the losing fragment's own extent), per the C4 shape:
+
+| Station | Winner (longer fragment) | Excluded fragment | Winner span | Excluded span |
+|---|---|---|---|---|
+| MDW | `44d3220f-fe48...` (14:00-16:59 CDT) | `e0839202-d4aa...` (12:00-13:56 CDT) | ~179 min | ~116 min |
+| MIA | `e0839202-d4aa...` (12:00-14:56 EDT) | `44d3220f-fe48...` (15:00-16:59 EDT) | ~176 min | ~119 min |
+| NYC | `e0839202-d4aa...` (12:00-14:56 EDT) | `44d3220f-fe48...` (15:00-16:59 EDT) | ~176 min | ~119 min |
+
+This matches Stage 0's own extent dump exactly (`overlap_ns` -236.7 s / -241.9 s / -240.5 s for MDW/MIA/NYC -- a gap, never an overlap -- well clear of `OVERLAP_TOLERANCE_NS` on the disjoint side), so this is expected drift, not a regression: **expected drift = exactly these 3 keys, flipping INSUFFICIENT -> SUFFICIENT, and only these 3.** `3e096362-2240...` (the third MDW/MIA/NYC instance with no in-window depth) plays no role in either winner and is absent from `excluded_fragments`, matching F1's "a third instance has no in-window depth" note.
+
+### Citability
+
+Every new SUFFICIENT row is `MECHANISM_ONLY` per §5, same as every other row. Both are also `coverage_kind=FRAGMENT`, so per §5's decision they are additionally barred from any edge criterion (`coverage_kind == "WHOLE"` required) even after `params_match` flips -- they may feed mechanism-only replay evidence (take-rate, fill vs book) for their own winning interval only, never a full-day claim.

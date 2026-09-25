@@ -33,6 +33,13 @@ instant across rungs of the merged tape catalog and subtracts resolved
 `QuoteTapeGap`s, while this census counts PER INSTANCE, executable asks only.
 They can still disagree about "covered" -- the shared piece is the window.
 
+**Overlap winner rule (AUD-09b amendment Stage B, §3)**: the winner rule and
+FRAGMENT/`excluded_fragments` reporting live entirely in
+`breezy.analysis.replay_sufficiency.classify_station_day`; this script
+supplies only the real, ns-precision `InstanceSpan` values the pure core
+classifies. Stage 0's `--dump-instance-extents` diagnostic (D1) was
+Stage-0-only and is deleted now that Stage B has landed.
+
 **H1 (AUD-08b -> AUD-09a)** is read via AUD-08b's own
 `breezy.persistence.station_candidates.read_station_candidates` (merged).
 `_read_station_candidates` below is a thin wrapper: it prints the plan's
@@ -48,7 +55,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import json
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -94,7 +100,6 @@ from breezy.analysis.replay_sufficiency import (
     window_extent,
     write_replay_sufficiency,
 )
-from breezy.domain.climate_day import standard_time_zone
 from breezy.domain.weather_bucket_facts import (
     WeatherFactsUnavailableError,
     read_weather_bucket_facts,
@@ -192,6 +197,8 @@ def _candidate_rows_to_replay_sufficiency(
                 winner_last_in_window_ns=None,
                 window_complete=False,
                 live_instance_count=0,
+                coverage_kind="WHOLE",
+                excluded_fragments=(),
             )
         )
     return tuple(rows)
@@ -440,72 +447,6 @@ def _live_instance_registrations(
     return result
 
 
-def _pairwise_overlap_ns(a: InstanceSpan, b: InstanceSpan) -> int | None:
-    """`None` when either side has no in-window depth at all."""
-    if a.first_in_window_ns is None or a.last_in_window_ns is None:
-        return None
-    if b.first_in_window_ns is None or b.last_in_window_ns is None:
-        return None
-    return min(a.last_in_window_ns, b.last_in_window_ns) - max(
-        a.first_in_window_ns, b.first_in_window_ns,
-    )
-
-
-def _dump_instance_extents(
-    path: Path,
-    *,
-    station_day_spans: Mapping[tuple[str, str], Sequence[InstanceSpan]],
-    live_capture_start_by_instance: Mapping[str, int],
-    std_offset_by_station: Mapping[str, float],
-) -> None:
-    """D1: one JSON line per ``(station, climate_day, instance_id)``.
-
-    Diagnostic only (AUD-09b amendment §2 D1): feeds Stage 0 by hand, never
-    versioned, never read back by this script, and deleted with Stage B or
-    after Stage 0.
-    """
-    lines: list[dict[str, object]] = []
-    for (station, climate_day), instances in sorted(station_day_spans.items()):
-        offset = std_offset_by_station.get(station)
-        clean_instances = [instance for instance in instances if instance.verdict == "CLEAN"]
-        for instance in sorted(instances, key=lambda instance: instance.instance_id):
-            overlaps: dict[str, int | None] = {}
-            if instance.verdict == "CLEAN":
-                overlaps = {
-                    other.instance_id: _pairwise_overlap_ns(instance, other)
-                    for other in clean_instances
-                    if other.instance_id != instance.instance_id
-                }
-            lines.append(
-                {
-                    "station": station,
-                    "climate_day": climate_day,
-                    "instance_id": instance.instance_id,
-                    "verdict": instance.verdict,
-                    "first_in_window_lst": _format_lst(instance.first_in_window_ns, offset),
-                    "last_in_window_lst": _format_lst(instance.last_in_window_ns, offset),
-                    "capture_start_ns": live_capture_start_by_instance.get(instance.instance_id),
-                    "overlap_ns": overlaps,
-                }
-            )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for line in lines:
-            handle.write(json.dumps(line, sort_keys=True))
-            handle.write("\n")
-
-
-def _format_lst(ts_ns: int | None, std_utc_offset_hours: float | None) -> str | None:
-    if ts_ns is None or std_utc_offset_hours is None:
-        return None
-
-    seconds, nanos = divmod(ts_ns, 1_000_000_000)
-    instant = dt.datetime.fromtimestamp(seconds, tz=dt.UTC) + dt.timedelta(
-        microseconds=nanos // 1_000,
-    )
-    return instant.astimezone(standard_time_zone(std_utc_offset_hours)).isoformat()
-
-
 def run_census(
     *,
     catalog_root: Path,
@@ -515,14 +456,13 @@ def run_census(
     computed_day: str,
     now_ns: int,
     instance_spans_cache_path: Path | None = None,
-    dump_instance_extents_path: Path | None = None,
 ) -> tuple[ReplaySufficiency, ...]:
     """The real, end-to-end census over one feather capture root.
 
     `instance_spans_cache_path` (AUD-09b amendment C6) is `None` by default:
     caching is opt-in, so a test (or any caller) that omits it never reads or
     writes the shared on-disk cache. Only `main` passes the real default
-    path. `dump_instance_extents_path` (D1) is likewise opt-in.
+    path.
     """
     try:
         instance_ids = list_instance_ids(catalog_root, subdirectory)
@@ -609,11 +549,9 @@ def run_census(
     )
     live_or_empty_station_days_native: set[tuple[str, dt.date]] = set()
     live_capture_starts_by_station_day: dict[tuple[str, str], list[int]] = defaultdict(list)
-    live_capture_start_by_instance: dict[str, int] = {}
-    for instance_id, (station_days, capture_start) in live_registrations.items():
+    for station_days, capture_start in live_registrations.values():
         live_or_empty_station_days_native |= station_days
         if capture_start is not None:
-            live_capture_start_by_instance[instance_id] = capture_start
             for station, native_day in station_days:
                 live_capture_starts_by_station_day[(station, native_day.isoformat())].append(
                     capture_start
@@ -655,19 +593,6 @@ def run_census(
         written={(row.station, row.climate_day) for row in tape_rows},
     )
 
-    if dump_instance_extents_path is not None:
-        std_offset_by_station = {
-            city: registry.climate_day_window(WEATHER_VENUE, city).std_utc_offset_hours
-            for venue, city in registry.pairs()
-            if venue == WEATHER_VENUE
-        }
-        _dump_instance_extents(
-            dump_instance_extents_path,
-            station_day_spans=spans,
-            live_capture_start_by_instance=live_capture_start_by_instance,
-            std_offset_by_station=std_offset_by_station,
-        )
-
     candidates = _read_station_candidates(station_candidates_path)
     candidate_rows = _candidate_rows_to_replay_sufficiency(candidates, computed_day=computed_day)
 
@@ -696,11 +621,6 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Disable the C6 on-disk span cache for this run.",
     )
-    parser.add_argument(
-        "--dump-instance-extents",
-        default=None,
-        help="AUD-09b amendment D1: write a diagnostic per-instance extent dump here.",
-    )
     return parser.parse_args(argv)
 
 
@@ -713,9 +633,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     instance_spans_cache_path = (
         None if args.no_instance_spans_cache else Path(args.instance_spans_cache).expanduser()
     )
-    dump_instance_extents_path = (
-        Path(args.dump_instance_extents).expanduser() if args.dump_instance_extents else None
-    )
 
     with tempfile.TemporaryDirectory(prefix="replay-sufficiency-census-") as tmp:
         rows = run_census(
@@ -726,7 +643,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             computed_day=computed_day,
             now_ns=now_ns,
             instance_spans_cache_path=instance_spans_cache_path,
-            dump_instance_extents_path=dump_instance_extents_path,
         )
 
     write_replay_sufficiency(Path(args.output).expanduser(), rows)

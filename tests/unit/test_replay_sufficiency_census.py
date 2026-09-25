@@ -511,38 +511,3 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
     assert span.last_in_window_ns == ts_event
     assert (station, climate_day.isoformat()) in window_bounds
 
-
-# ---------------------------------------------------------------------------
-# D1: --dump-instance-extents writes a diagnostic line per
-# (station, climate_day, instance_id); never versioned, never read back.
-# ---------------------------------------------------------------------------
-
-
-def test_d1_dump_instance_extents_writes_one_line_per_instance(tmp_path: Path) -> None:
-    span = InstanceSpan(
-        instance_id="instance-1",
-        verdict="CLEAN",
-        depth_window_minutes=45.0,
-        quote_window_minutes=10.0,
-        distinct_instruments=1,
-        first_in_window_ns=1_700_000_000_000_000_000,
-        last_in_window_ns=1_700_000_002_700_000_000,
-    )
-    dump_path = tmp_path / "extents.jsonl"
-
-    census_module._dump_instance_extents(
-        dump_path,
-        station_day_spans={("SFO", "2026-09-01"): [span]},
-        live_capture_start_by_instance={},
-        std_offset_by_station={"SFO": -8.0},
-    )
-
-    lines = dump_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
-    row = json.loads(lines[0])
-    assert row["station"] == "SFO"
-    assert row["climate_day"] == "2026-09-01"
-    assert row["instance_id"] == "instance-1"
-    assert row["verdict"] == "CLEAN"
-    assert row["first_in_window_lst"] is not None
-    assert row["overlap_ns"] == {}
