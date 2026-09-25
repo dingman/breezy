@@ -412,15 +412,18 @@ class TestPerTrialPnlBreakdown:
         assert view.n_fills == data.n_fills
         assert view.roi == data.roi
 
-    def test_a_schema_version_two_report_missing_trial_rows_reads_as_none(
+    def test_a_schema_version_two_report_missing_trial_rows_is_malformed(
         self, tmp_path: Path
     ) -> None:
-        """A document that stamps the CURRENT `schema_version` (2) without
-        also knowing about `trial_rows` -- e.g. a fixture that reads
-        `PORTFOLIO_ROI_SCHEMA_VERSION` dynamically but predates this field
-        -- must not hard-fail for that alone (the additive-tolerant-on-read
-        contract every other field in this report already gets, D7):
-        gated on key-presence, not on the declared version number."""
+        """Every real `schema_version=2` writer (`write_portfolio_roi_json`)
+        always emits `trial_rows`, so its absence at that version is
+        corruption (a hand-edited or truncated document), never merely
+        "predates the field" the way a genuinely old `schema_version=1`
+        report's absence is (see the sibling `TestPerTrialPnlBreakdown`
+        test for that case). A caller that hand-constructs a
+        `schema_version=2` payload -- e.g. a test fixture -- must include
+        this key; see `_write_minimal_aud04_report` in
+        `tests/unit/test_current_rung_hold_exit_window_study.py`."""
         data = _report_data()
         path = tmp_path / "report.json"
         write_portfolio_roi_json(path, data)
@@ -428,10 +431,8 @@ class TestPerTrialPnlBreakdown:
         del raw["trial_rows"]
         path.write_text(json.dumps(raw))
 
-        view = read_portfolio_roi_report(path)
-
-        assert view.schema_version == 2
-        assert view.trial_rows is None
+        with pytest.raises(PortfolioRoiReportMalformedFieldError):
+            read_portfolio_roi_report(path)
 
     def test_a_present_but_malformed_trial_rows_still_raises(self, tmp_path: Path) -> None:
         data = _report_data()

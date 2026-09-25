@@ -1689,6 +1689,11 @@ def roi_against_baselines(
 #: than landing as another additive-within-1 key).
 PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 2
 
+#: The version `trial_rows` was introduced at -- every `schema_version` at
+#: or above this REQUIRES the key (see `_require_trial_rows`); below it,
+#: the field's total absence is simply "predates it" (`None`).
+_MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS: Final[int] = 2
+
 #: Every `schema_version` this reader accepts -- `PORTFOLIO_ROI_SCHEMA_VERSION`
 #: (the current, writer-stamped version) plus every prior version this
 #: module still reads. Anything else raises `UnknownPortfolioRoiSchemaError`.
@@ -1809,21 +1814,28 @@ def _require_daily_reconciliation_rows(
 
 
 def _require_trial_rows(raw: Mapping[str, object]) -> tuple[PortfolioRoiTrialRow, ...]:
-    """Strict extraction of ``trial_rows`` (Stage C3) when the key IS
-    present. Callers gate on key-presence themselves
-    (:func:`read_portfolio_roi_report`: present -> this function; absent ->
-    ``None``, regardless of the document's own ``schema_version``) rather
-    than this function raising on absence the way it raises on a
-    present-but-malformed value -- an early revision hard-required the key
-    at ``schema_version=2``, but a document that dynamically stamps
-    ``PORTFOLIO_ROI_SCHEMA_VERSION`` (as this module's own writer, and at
-    least one downstream fixture, both do) without also knowing about a
-    field added in the SAME version bump must not hard-fail for that alone;
-    the additive-tolerant-on-read contract every other field in this
-    report already gets (D7) is more valuable here than the extra strictness.
-    A PRESENT-but-malformed value still raises, exactly like every other
-    strict field reader in this module.
+    """Strict extraction of ``trial_rows`` (Stage C3, schema_version=2).
+
+    Unlike :func:`_require_daily_reconciliation_rows`, this key is
+    REQUIRED here: a document already claiming ``schema_version >=
+    _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS`` but missing the very field that
+    version introduced is corruption, not merely old -- every real
+    ``schema_version=2`` writer (:func:`write_portfolio_roi_json`) always
+    emits it, so its absence at that version means the document was hand-
+    edited or truncated. A genuinely old (``schema_version=1``) document
+    never reaches this function at all (:func:`read_portfolio_roi_report`
+    surfaces ``trial_rows=None`` for it directly, from the version check
+    alone). Any caller that constructs a ``schema_version=2`` payload by
+    hand (e.g. a test fixture) must include this key -- see
+    ``_write_minimal_aud04_report`` in
+    ``tests/unit/test_current_rung_hold_exit_window_study.py`` for the
+    precedent.
     """
+    if "trial_rows" not in raw:
+        raise PortfolioRoiReportMalformedFieldError(
+            "portfolio ROI report is missing required field 'trial_rows' at "
+            f"schema_version={raw.get('schema_version')!r}"
+        )
     rows = raw["trial_rows"]
     if not isinstance(rows, list):
         raise PortfolioRoiReportMalformedFieldError(
@@ -2356,11 +2368,11 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
             if "n_duplicate_scored_trials" in raw
             else 0
         ),
-        # Key-presence, not version comparison (see `_require_trial_rows`'s
-        # own docstring for why): absent -> None (unknown -- a genuinely
-        # old report, or a v2-labelled one from a writer that predates this
-        # field), present -> strictly parsed.
-        trial_rows=(_require_trial_rows(raw) if "trial_rows" in raw else None),
+        trial_rows=(
+            _require_trial_rows(raw)
+            if version >= _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS
+            else None
+        ),
         _roi=_require_decimal_str(raw, "roi"),
         _roi_minus_b0=_require_decimal_str(raw, "roi_minus_b0"),
         _roi_minus_b1=_require_decimal_str(raw, "roi_minus_b1"),
