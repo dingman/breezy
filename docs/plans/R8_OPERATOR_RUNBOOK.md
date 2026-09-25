@@ -602,6 +602,51 @@ Both gaps fall entirely outside the union of the four station decision
 windows (17:00Z→01:00Z, §6 above), so no live entry decision is denied by the
 gap today.
 
-**The gap is accepted and NOT alerted until B1 exists.** Moving LAUNCH is not
-claimed to shift the capture or KILL-clock schedules — that Rev 1 claim was
-unverified and has been dropped.
+The gap itself is accepted, and moving LAUNCH is not claimed to shift the
+capture or KILL-clock schedules — that Rev 1 claim was unverified and has been
+dropped.
+
+**B1 (2026-09-25) now watches the whole decision window.** B1 is the
+supervisor-side permit-lapse detector (`trade_supervisor.py::_do_permit_watch`,
+pure core in `trade_supervisor_core.py`). Its own window `W` is
+`[17:10Z, 01:00Z next day)` — opens the instant the 17:05Z self-check's own
+catch-up window closes, closes at the same instant MIDDAY_WATCH's window does.
+It never mints, spawns, terminates, or moves any schedule; it only classifies
+and alerts.
+
+Every poll inside `W`, B1 classifies one of: `VALID` (latched permit expiry
+`> now`, silent); `LAPSED` / `EXPIRED_AT_CEILING` (latched expiry `<= now` —
+the latter when the expiry equals the day's first-boot ceiling anchor and a
+relaunch already happened, i.e. A-1's clamp working as designed, not a genuine
+refusal) — both CRITICAL; `NOT_REQUIRED` (the orders-not-requested marker
+latched) — WARN, once per trading day, no heartbeat; `DEFERRED` (no live child
+with the mid-day relaunch budget still live, or a fresh mid-day child within
+its 2-minute boot grace) — silent, but bounded to 20 minutes
+(`PERMIT_DEFERRED_MAX`) from the FIRST such observation before promoting to
+`NO_NODE`, so neither a stalled relaunch budget nor a `decide_midday_relaunch`
+decline-with-no-alert can defer forever; `ABSENT` (alive, log readable, no
+permit latch, no marker, past the boot grace) — CRITICAL, and takes
+precedence over `UNKNOWN` whenever the log is actually readable; `UNKNOWN`
+(child alive, log missing) — CRITICAL `PERMIT_UNVERIFIABLE`; `NO_NODE` (no
+live/adoptable child, budget not live) — CRITICAL.
+
+**On the first poll at or after `W`'s close**, B1 evaluates capability once
+more AS OF the close instant (catching a lapse whose onset fell between two
+polls), then writes exactly one INFO `permit_accepted_gap` log line for the
+day and evaluates nothing further until tomorrow's `W`.
+
+**Alerting is heartbeat-gated**, at most one CRITICAL per bad capability per
+60 minutes (`PERMIT_ALERT_HEARTBEAT`) — a change to a DIFFERENT bad capability
+still pages immediately. A self-check permit FAIL or a mid-day-watch CRITICAL
+seeds B1's own heartbeat timer, so B1's first page for the SAME underlying
+fault waits for the heartbeat rather than double-paging within the same
+minute. A contained B1 fault (an exception inside its own evaluation) is fed
+into the same heartbeat as a distinct `WATCH_FAILED` capability
+(`PERMIT_WATCH_EXCEPTION_CONTAINED`), logged as `permit_watch_exception_
+contained` (never `phase_exception_contained`) — never silent, never a page
+storm, and never able to stop the supervisor loop or skip the next scheduled
+phase.
+
+The gap window's residual exposure — LAUNCH not moved, per the ruling above —
+is unchanged by B1: B1 does not shrink the gap, it makes every lapse INSIDE
+`W` observable within the hour.
