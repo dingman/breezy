@@ -149,6 +149,11 @@ class BootHaltDetail(StrEnum):
     """
 
     TRADER_NEVER_STARTED = "BOOT_HALT_TRADER_NEVER_STARTED"
+    #: AUD-13c review: the node raised while being ASSEMBLED -- factory,
+    #: ``add_actor``/``add_strategy`` (e.g. Nautilus's double external-order
+    #: claim, ``execution/engine.pyx:552-557``) or ``build`` -- so ``run()``
+    #: was never reached. Attributable: the raise happened in this process.
+    NODE_ASSEMBLY_FAILED = "BOOT_HALT_NODE_ASSEMBLY_FAILED"
 
 
 def _trader_reached_running(node: Node) -> bool:
@@ -166,6 +171,27 @@ def _trader_reached_running(node: Node) -> bool:
     if getattr(trader, "is_running", False) is True:
         return True
     return getattr(trader, "is_stopped", False) is True
+
+
+def _emit_node_assembly_failed_alert() -> None:
+    """One CRITICAL for a node that raised before ``run()``. Called only
+    AFTER the original error has been reported; a sink that fails, or cannot
+    be constructed, is contained here and never masks that error."""
+    try:
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=BOOT_HALT_SEVERITY,
+                event=BOOT_HALT_EVENT,
+                site=BOOT_HALT_SITE,
+                detail=BootHaltDetail.NODE_ASSEMBLY_FAILED.value,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert must not change the exit code
+        logger.error(
+            "node-assembly boot-halt alert could not be emitted exception_type=%s",
+            type(exc).__name__,
+        )
 
 
 def _emit_boot_halt_alert(node: Node, stop_intent_store_path: Path | None) -> None:
@@ -519,6 +545,7 @@ def _run_node(
     check at venue egress.
     """
     node: Node | None = None
+    assembled = False
     try:
         node = node_factory(config)
         node.add_data_client_factory(
@@ -532,6 +559,7 @@ def _run_node(
         for strategy in strategies:
             node.trader.add_strategy(strategy)
         node.build()
+        assembled = True
         install_live_order_guard(
             node.kernel.portfolio,
             node.kernel.cache,
@@ -579,6 +607,8 @@ def _run_node(
         return _exit_code_for_completed_run(stderr)
     except BaseException as exc:  # noqa: BLE001 - the process exit contract lives here
         _report(stderr, "trading node failed", exc, expected=False)
+        if not assembled:
+            _emit_node_assembly_failed_alert()
         return EXIT_RUNTIME_ERROR
     finally:
         if node is not None:

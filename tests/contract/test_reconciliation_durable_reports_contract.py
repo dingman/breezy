@@ -1067,3 +1067,244 @@ async def test_a_corrupt_fee_input_folds_into_fee_coefficient_ambiguous_never_es
     assert entry["subject"] == "V-CO…"
     assert rig.client.reconciliation_counts["refusals_fee_coefficient_ambiguous"] == 1
     await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Increment C (09-12 plan §4 row C; ruling R-2 condition 1) -- engine-driven
+# characterisation of replay idempotence for a CLAIMED instrument. No
+# production change: the claim is registered here exactly as
+# ``Trader.add_strategy`` does (``trading/trader.py:435`` ->
+# ``execution/engine.pyx:532-560``), so this pins Nautilus + strategy
+# behaviour independently of how Breezy's composition sets the claim.
+# ---------------------------------------------------------------------------
+
+
+def _claiming_continuous_strategy(
+    rig: _Rig,
+    *,
+    store_path: Path,
+    instrument: BinaryOption,
+) -> Any:
+    """A RUNNING ``ContinuousRungHoldStrategy`` on the rig's own bus/cache,
+    claiming ``instrument``. It is started BEFORE the reconciliation -- the
+    worst case for R-2: a real boot starts strategies only after
+    ``reconcile_execution_state`` (``system/kernel.py:1027-1039``) and
+    ``Strategy.handle_event`` drops every event while not ``RUNNING``
+    (``trading/strategy.pyx:1917``), so a boot-time reconciled fill never
+    reaches ``on_order_filled`` at all. Here it does."""
+    from nautilus_trader.common.component import TestClock
+
+    from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+    from breezy.strategy.current_rung_hold.continuous_strategy import (
+        ContinuousRungHoldStrategy,
+    )
+    from tests.unit.test_continuous_rung_hold_strategy import (
+        _PERMISSIVE_EVIDENCE,
+        _cont_latch_factory,
+    )
+    from tests.unit.test_current_rung_hold_strategy import STATION, WINDOW_OPEN_NS
+
+    config = CurrentRungHoldConfig(
+        instrument_ids=(instrument.id,),
+        stations=(STATION,),
+        strategy_id="ContinuousRungHoldStrategy",
+        order_id_tag=STATION,
+        external_order_claims=[instrument.id],
+    )
+    strategy = ContinuousRungHoldStrategy(
+        config,
+        trial_day_latch_factory=_cont_latch_factory(store_path),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    clock = TestClock()
+    clock.set_time(WINDOW_OPEN_NS)
+    strategy.register(
+        trader_id=TRADER_ID,
+        portfolio=rig.portfolio,
+        msgbus=rig.msgbus,
+        cache=rig.cache,
+        clock=clock,
+    )
+    rig.engine.register_external_order_claims(strategy)
+    strategy.start()
+    return strategy
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_reconciliations_leave_the_halt_key_absent(
+    tmp_path: Path,
+) -> None:
+    """Three boots (fresh engine, cache and bus each; the SAME durable exec
+    store and the SAME strategy store) each reconcile the one durable fill
+    into a CLAIMED book and deliver its ``OrderFilled`` to a running
+    strategy. Boot 1 consumes the TRIAL; boots 2 and 3 are replays keyed on
+    ``venue_order_id`` (``trial_day_latch.py::consume_if_absent``) and must
+    write no ``duplicate_fill`` bucket and never set
+    ``continuous_rung_hold/halt``."""
+    from breezy.strategy.current_rung_hold.trial_day_latch import (
+        DUPLICATE_FILL_KEY_PREFIX,
+        FAMILY_HALT_KEY,
+    )
+    from tests.unit.test_current_rung_hold_strategy import (
+        CLIMATE_DAY,
+        INTERIOR_ID,
+        STATION,
+        _instrument,
+    )
+
+    interior = _instrument(INTERIOR_ID, lower_f=86, upper_f=87)
+    strategy_store = tmp_path / "strategy.db"
+    for boot in (1, 2, 3):
+        rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(interior,))
+        await rig.client._connect()
+        if boot == 1:
+            rig.client.record_fill(
+                _record(interior, venue_order_id="V-REPLAY-1", client_order_id="O-REPLAY-1",
+                        cost="0.40", trade_id="trd-replay-1", fee_coefficient_at_fill="0.06"),
+            )
+        rig.hold(_slug(interior), 1)
+        strategy = _claiming_continuous_strategy(
+            rig, store_path=strategy_store, instrument=interior,
+        )
+
+        assert await rig.reconcile() is True, f"boot {boot}"
+
+        (order,) = rig.cache.orders()
+        assert order.strategy_id == strategy.id, f"boot {boot}: claimed, never EXTERNAL"
+        (fill,) = _fills(rig.cache)
+        assert str(fill.venue_order_id) == "V-REPLAY-1"
+        latch = strategy._latch
+        assert latch is not None
+        record = latch.record(STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID))
+        assert record is not None, f"boot {boot}: the reconciled fill reached on_order_filled"
+        assert record.venue_order_id == "V-REPLAY-1"
+        assert latch.is_family_halted() is False, f"boot {boot}"
+        assert latch._store.get(FAMILY_HALT_KEY) is None, f"boot {boot}"
+        assert latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}V-REPLAY-1") is None, f"boot {boot}"
+        strategy.stop()
+        await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# AUD-13c (increment B2; ruling R-2 = R2-B conditional) -- the composed
+# continuous strategy claims its station's instruments, so a reconciled fill
+# books under the Breezy strategy id, never ``StrategyId("EXTERNAL")``
+# (``live/execution_engine.py:3551-3572``).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_instrument_reconciles_under_the_breezy_strategy_id(
+    tmp_path: Path,
+) -> None:
+    from nautilus_trader.model.identifiers import InstrumentId, StrategyId, Symbol
+    from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+    from breezy.strategy.current_rung_hold.composition import (
+        build_continuous_rung_hold_strategies,
+    )
+    from tests.unit.test_continuous_rung_hold_strategy import _cont_latch_factory
+    from tests.unit.test_current_rung_hold_strategy import CLIMATE_DAY, _instrument
+
+    rung = _instrument(
+        InstrumentId(Symbol("tc-temp-laxhigh-2026-09-04-gte86lt87f"), POLYMARKET_US_VENUE),
+        lower_f=86,
+        upper_f=87,
+    )
+    catalog_root = tmp_path / "catalog"
+    ParquetDataCatalog(str(catalog_root)).write_data([rung])
+    (strategy,) = build_continuous_rung_hold_strategies(
+        catalog_root=catalog_root,
+        today_by_station={"LAX": CLIMATE_DAY},
+        trial_day_latch_factory=_cont_latch_factory(tmp_path / "strategy.db"),
+        enable_position_monitor=False,
+    )
+
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(rung,))
+    # Exactly what `Trader.add_strategy` does with a composed strategy
+    # (`trading/trader.py:435`).
+    rig.engine.register_external_order_claims(strategy)
+    await rig.client._connect()
+    rig.client.record_fill(
+        _record(rung, venue_order_id="V-CLAIM-1", client_order_id="O-CLAIM-1",
+                cost="0.40", trade_id="trd-claim-1", fee_coefficient_at_fill="0.06"),
+    )
+    rig.hold(_slug(rung), 1)
+
+    assert await rig.reconcile() is True
+
+    (order,) = rig.cache.orders()
+    assert str(strategy.id) == "ContinuousRungHoldStrategy-LAX"
+    assert order.strategy_id == strategy.id
+    assert order.strategy_id != StrategyId("EXTERNAL")
+    assert order.tags is None, "a claimed order carries no VENUE/RECONCILIATION tag"
+    (position,) = rig.cache.positions(instrument_id=rung.id)
+    assert str(position.id).endswith("-ContinuousRungHoldStrategy-LAX"), position.id
+    assert position.strategy_id == strategy.id
+    assert rig.cache.positions(strategy_id=StrategyId("EXTERNAL")) == []
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_yesterdays_no_leg_fill_reconciles_under_the_breezy_strategy_id(
+    tmp_path: Path,
+) -> None:
+    """The claim covers the NO leg (``^no`` composite id) of YESTERDAY's
+    market too: the daily boot reconciles a fill whose market has not yet
+    settled, and a NO buy fills on the NO-leg id."""
+    import datetime as dt
+
+    from nautilus_trader.model.identifiers import InstrumentId, Symbol
+    from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+    from breezy.adapters.polymarket_us.symbology import no_leg_instrument_id
+    from breezy.domain.weather_bucket_facts import CLIMATE_DAY_KEY
+    from breezy.strategy.current_rung_hold.composition import (
+        build_continuous_rung_hold_strategies,
+    )
+    from tests.unit.test_continuous_rung_hold_strategy import _cont_latch_factory
+    from tests.unit.test_current_rung_hold_strategy import CLIMATE_DAY, _instrument
+
+    today_slug = "tc-temp-laxhigh-2026-09-04-gte86lt87f"
+    yesterday_slug = "tc-temp-laxhigh-2026-09-03-gte86lt87f"
+    today = _instrument(
+        InstrumentId(Symbol(today_slug), POLYMARKET_US_VENUE), lower_f=86, upper_f=87,
+    )
+    yesterday_info = dict(today.info)
+    yesterday_info[CLIMATE_DAY_KEY] = (CLIMATE_DAY - dt.timedelta(days=1)).isoformat()
+    yesterday_yes = BinaryOption.from_dict(
+        {
+            **BinaryOption.to_dict(today),
+            "id": f"{yesterday_slug}.POLYMARKET_US",
+            "raw_symbol": yesterday_slug,
+            "info": yesterday_info,
+        },
+    )
+    yesterday_no = _instrument(no_leg_instrument_id(yesterday_slug), lower_f=86, upper_f=87)
+    catalog_root = tmp_path / "catalog"
+    ParquetDataCatalog(str(catalog_root)).write_data([today, yesterday_yes])
+    (strategy,) = build_continuous_rung_hold_strategies(
+        catalog_root=catalog_root,
+        today_by_station={"LAX": CLIMATE_DAY},
+        trial_day_latch_factory=_cont_latch_factory(tmp_path / "strategy.db"),
+        enable_position_monitor=False,
+    )
+    assert yesterday_no.id in strategy.external_order_claims
+
+    rig = _Rig(asyncio.get_running_loop(), tmp_path, cached=(yesterday_yes, yesterday_no))
+    rig.engine.register_external_order_claims(strategy)
+    await rig.client._connect()
+    rig.client.record_fill(
+        _record(yesterday_no, venue_order_id="V-NOCLAIM-1", client_order_id="O-NOCLAIM-1",
+                cost="0.09", trade_id="trd-noclaim-1", fee_coefficient_at_fill="0.06"),
+    )
+    rig.hold(yesterday_slug, 1, no_leg=True)
+
+    assert await rig.reconcile() is True
+
+    (order,) = rig.cache.orders()
+    assert order.instrument_id == yesterday_no.id
+    assert order.strategy_id == strategy.id
+    (position,) = rig.cache.positions(instrument_id=yesterday_no.id)
+    assert position.strategy_id == strategy.id
+    await rig.client._disconnect()
