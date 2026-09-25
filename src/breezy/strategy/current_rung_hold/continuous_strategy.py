@@ -132,6 +132,9 @@ __all__ = [
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 #: GAP fix 2026-09-15: for the `take:` log line's `staleness_s=` field only.
 _NS_PER_SECOND: Final[int] = 1_000_000_000
+#: F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): the `open_intent_wait:` log
+#: line's own re-log cadence while the SAME intent_id persists.
+_NS_PER_HOUR: Final[int] = 60 * _NS_PER_MINUTE
 #: GAP fix 2026-09-15: `NO_ask = 1 - bid`, for the NO-side offer-tape row's
 #: `ask` field ONLY when `no_decision` is a `Refuse` that never reached a
 #: `Take.limit_price` -- mirrors `decision.py`'s own inversion exactly,
@@ -568,6 +571,20 @@ class ContinuousRungHoldStrategy(Strategy):
         #: genuine leak (evictions climbing every day) is distinguishable
         #: from ordinary multi-day overlap.
         self._shadow_rest_summary_evictions = 0
+        #: F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): dedupes the store
+        #: read `current_open_submit_intent()` to at most once per event-
+        #: time MINUTE bucket (`snapshot.ts_event // 60e9`) -- `None` until
+        #: the first `is_intent_open()` WAIT tick this process ever sees.
+        self._open_intent_wait_last_minute_bucket: int | None = None
+        #: F-4: `(intent_id, last_logged_ns)` for the LOG line's OWN dedupe
+        #: -- once per NEW `intent_id`, then at most once per hour while the
+        #: SAME id persists. `None` until a line is actually logged.
+        self._open_intent_wait_log_state: tuple[str, int] | None = None
+        #: Mirrors `last_rearm_decision`/`last_no_take_shadow` (L-27:
+        #: asserted by presence, never via log capture) -- the MOST RECENT
+        #: `open_intent_wait:` line actually logged (never set on a
+        #: deduped repeat).
+        self.last_open_intent_wait: str | None = None
 
     def _record_shadow_rest_tick(
         self,
@@ -1699,6 +1716,10 @@ class ContinuousRungHoldStrategy(Strategy):
                 self.diagnostics_alerter,
                 "continuous_rung_hold diagnostics report failed",
             )
+            # F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): observability ONLY
+            # -- the WAIT outcome above is already decided; this can never
+            # change it, add a refusal/diagnostic key, or affect the gate.
+            self._maybe_observe_open_intent_wait(now_ns=snapshot.ts_event)
             return
 
         now_ns = snapshot.ts_event
@@ -2681,6 +2702,68 @@ class ContinuousRungHoldStrategy(Strategy):
         """Mirrors ``_emit_startup_evidence_summary`` (:490-501): production
         body is exactly one ``self.log.info`` call -- overridable so a test
         can record calls instead of asserting on captured log output (L-27).
+        """
+        self.log.info(summary)
+
+    def _maybe_observe_open_intent_wait(self, *, now_ns: int) -> None:
+        """F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md, A7): reads
+        ``current_open_submit_intent()`` at most once per event-time MINUTE
+        bucket -- contained under :meth:`_run_observability` exactly like
+        every other observability call in this class (``_observe_halt``,
+        ``_report_alerter``), so a store-read failure can never affect the
+        WAIT outcome ``is_intent_open()`` already decided, nor raise into
+        ``_hunt_tick``.
+        """
+        minute_bucket = now_ns // _NS_PER_MINUTE
+        if minute_bucket == self._open_intent_wait_last_minute_bucket:
+            return
+        self._open_intent_wait_last_minute_bucket = minute_bucket
+        self._run_observability(
+            "continuous_rung_hold open-intent-wait observation failed",
+            lambda: self._log_open_intent_wait_if_due(now_ns=now_ns),
+        )
+
+    def _log_open_intent_wait_if_due(self, *, now_ns: int) -> None:
+        """F-4: logs once per NEW ``intent_id``, then at most once per hour
+        while the SAME id persists (``_open_intent_wait_log_state``). Never
+        reads or logs ``SubmitIntent.fingerprint`` (``repr=False`` on that
+        dataclass) -- only ``intent_id`` and the age derived from
+        ``created_ns``.
+        """
+        assert self._latch is not None
+        intent = self._latch.current_open_submit_intent()
+        if intent is None:
+            # The singleton cleared between `is_intent_open()`'s read and
+            # this one (a genuine, if narrow, race) -- nothing to log.
+            return
+        state = self._open_intent_wait_log_state
+        if (
+            state is not None
+            and state[0] == intent.intent_id
+            and now_ns - state[1] < _NS_PER_HOUR
+        ):
+            return
+        self._open_intent_wait_log_state = (intent.intent_id, now_ns)
+        station = ",".join(self._config.stations)
+        age_s = (now_ns - intent.created_ns) / _NS_PER_SECOND
+        self._record_open_intent_wait(
+            f"open_intent_wait: station={station} intent_id={intent.intent_id} "
+            f"age_s={age_s}"
+        )
+
+    def _record_open_intent_wait(self, summary: str) -> None:
+        """Mirrors ``_record_rearm_decision`` -- stores the ONE summary line
+        on ``self.last_open_intent_wait`` (asserted by presence, L-27) and
+        emits it via the overridable seam below. Stable grep token
+        ``open_intent_wait:``.
+        """
+        self.last_open_intent_wait = summary
+        self._emit_open_intent_wait(summary)
+
+    def _emit_open_intent_wait(self, summary: str) -> None:
+        """Mirrors ``_emit_rearm_decision``: production body is exactly one
+        ``self.log.info`` call -- overridable so a test can record calls
+        instead of asserting on captured log output (L-27).
         """
         self.log.info(summary)
 

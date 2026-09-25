@@ -1941,3 +1941,120 @@ def test_the_first_budget_denied_orders_inflight_record_is_orphaned_and_inert(
     assert strategy._latch.attempt_state(
         STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
     )[0] == 1
+
+
+def _spy(obj: object, name: str) -> list[tuple[tuple[object, ...], dict[str, object]]]:
+    """Wrap ``obj``'s bound method ``name`` to record every call while still
+    delegating to the original -- mirrors the inline spies used above
+    (``test_hunt_tick_waits_while_the_account_wide_intent_is_open``)."""
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    orig = getattr(obj, name)
+
+    def _wrapped(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return orig(*args, **kwargs)
+
+    setattr(obj, name, _wrapped)
+    return calls
+
+
+class TestOpenIntentWaitObservability:
+    """F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): observability ONLY over
+    the pre-existing account-wide ``open_intent_wait`` WAIT gate -- never
+    changes the gate outcome, never adds a diagnostic/refusal key.
+    """
+
+    def test_open_intent_read_once_per_event_minute(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        _arm_and_release_stale_intent(store_path)
+        strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        assert strategy._latch is not None
+        read_calls = _spy(strategy._latch, "current_open_submit_intent")
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+        strategy.on_quote_tick(
+            _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 1_000_000_000),
+        )
+
+        assert len(read_calls) == 1
+        assert strategy.diagnostics.count("open_intent_wait") == 2
+
+    def test_open_intent_logged_once_per_intent_id_then_hourly(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        _arm_and_release_stale_intent(store_path)
+        strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+        first_line = strategy.last_open_intent_wait
+        assert first_line is not None
+        assert "intent_id=" in first_line
+
+        # A later minute, well under an hour since the last log: no re-log.
+        strategy.on_quote_tick(
+            _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN),
+        )
+        assert strategy.last_open_intent_wait == first_line
+
+        # An hour later: re-logs, same intent_id, a fresh age.
+        strategy.on_quote_tick(
+            _quote(
+                INTERIOR_ID,
+                ask="0.40",
+                ts_event=WINDOW_OPEN_NS + 3600 * 1_000_000_000 + NS_PER_MIN,
+            ),
+        )
+        second_line = strategy.last_open_intent_wait
+        assert second_line is not None
+        assert second_line != first_line
+        assert "intent_id=" in second_line
+
+    def test_open_intent_log_omits_fingerprint(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        _arm_and_release_stale_intent(store_path)
+        strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+        assert strategy.last_open_intent_wait is not None
+        assert "fingerprint" not in strategy.last_open_intent_wait
+        assert "a" * 64 not in strategy.last_open_intent_wait
+
+    def test_open_intent_age_from_ts_event(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        _arm_and_release_stale_intent(store_path)  # created_ns=1
+        strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+        expected_age_s = (WINDOW_OPEN_NS - 1) / 1_000_000_000
+        assert strategy.last_open_intent_wait is not None
+        assert f"age_s={expected_age_s}" in strategy.last_open_intent_wait
+
+    def test_intent_read_failure_contained(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        _arm_and_release_stale_intent(store_path)
+        strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        assert strategy._latch is not None
+
+        def _boom() -> None:
+            raise RuntimeError("simulated store fault")
+
+        strategy._latch.current_open_submit_intent = _boom  # type: ignore[method-assign]
+        submitted: list[object] = []
+        strategy.submit_order = submitted.append  # type: ignore[method-assign]
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+        assert submitted == []
+        assert strategy.diagnostics.count("open_intent_wait") == 1
+        assert strategy.last_open_intent_wait is None
