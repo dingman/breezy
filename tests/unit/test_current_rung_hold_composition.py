@@ -565,6 +565,74 @@ def test_continuous_builder_uses_distinct_strategy_id(tmp_path: Path) -> None:
     assert v3[0]._order_submission_permit is None
 
 
+def test_continuous_strategies_claim_today_and_yesterday_on_both_legs_for_their_own_station(
+    tmp_path: Path,
+) -> None:
+    """AUD-13c (ruling R-2 = R2-B): each continuous strategy claims
+    (``StrategyConfig.external_order_claims``, ``trading/config.py:91``) its
+    OWN station's today and yesterday HIGH markets, YES and NO leg, so a
+    reconciled fill books under its id instead of ``EXTERNAL``
+    (``live/execution_engine.py:3551-3556``). Older days stay unclaimed
+    (reconcile EXTERNAL, as before); ``instrument_ids`` is unchanged; claim
+    sets never overlap across stations -- ``register_external_order_claims``
+    raises on a double claim (``execution/engine.pyx:552-557``)."""
+    yesterday = _DAY - dt.timedelta(days=1)
+    _write(
+        tmp_path,
+        [
+            _binary("tc-temp-laxhigh-2026-09-04-gte80lt81f", info=_known(station="LAX", day=_DAY)),
+            _binary(
+                "tc-temp-laxhigh-2026-09-03-gte80lt81f", info=_known(station="LAX", day=yesterday),
+            ),
+            _binary(
+                "tc-temp-laxhigh-2026-09-02-gte80lt81f",
+                info=_known(station="LAX", day=dt.date(2026, 9, 2)),
+            ),
+            _binary("tc-temp-mdwhigh-2026-09-04-gte90lt91f", info=_known(station="MDW", day=_DAY)),
+        ],
+    )
+
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        enable_position_monitor=False,
+    )
+
+    by_station = {strategy.config.stations[0]: strategy for strategy in v3}
+    assert set(by_station) == {"LAX", "MDW"}
+    lax_claims = [str(iid) for iid in by_station["LAX"].external_order_claims]
+    assert len(lax_claims) == len(set(lax_claims))
+    assert set(lax_claims) == {
+        "tc-temp-laxhigh-2026-09-04-gte80lt81f.POLYMARKET_US",
+        "tc-temp-laxhigh-2026-09-04-gte80lt81f^no.POLYMARKET_US",
+        "tc-temp-laxhigh-2026-09-03-gte80lt81f.POLYMARKET_US",
+        "tc-temp-laxhigh-2026-09-03-gte80lt81f^no.POLYMARKET_US",
+    }
+    assert {str(iid) for iid in by_station["MDW"].external_order_claims} == {
+        "tc-temp-mdwhigh-2026-09-04-gte90lt91f.POLYMARKET_US",
+        "tc-temp-mdwhigh-2026-09-04-gte90lt91f^no.POLYMARKET_US",
+    }
+    assert [str(iid) for iid in by_station["LAX"].config.instrument_ids] == [
+        "tc-temp-laxhigh-2026-09-04-gte80lt81f.POLYMARKET_US"
+    ], "claims never widen what the strategy trades"
+
+
+def test_the_v2_builder_claims_nothing(tmp_path: Path) -> None:
+    """R2-B's evidence (replay idempotence keyed on ``venue_order_id``) is
+    ``ContinuousRungHoldStrategy``'s; v2 is not claimed for."""
+    _write(
+        tmp_path,
+        [_binary("tc-temp-laxhigh-2026-09-04-gte80lt81f", info=_known(station="LAX", day=_DAY))],
+    )
+    (v2,) = build_current_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+    )
+    assert v2.external_order_claims == []
+
+
 def _placeholder_manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
     """A manifest built directly (never ``load_family_manifest``, which
     reads a real file): only ``family_id``/``exit_rule`` vary here; every

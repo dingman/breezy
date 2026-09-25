@@ -176,6 +176,71 @@ def test_a_replayed_fill_with_the_same_venue_order_id_is_idempotent(
     assert strategy._latch._store.get(FAMILY_HALT_KEY) is None
 
 
+def test_a_replayed_reconciled_fill_writes_no_duplicate_bucket_and_no_halt(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """(Increment C, 09-12 plan §4 row C; ruling R-2 condition 1.) The
+    reconciliation shape of a replay: the live fill is consumed by one
+    process, then a RESTARTED strategy (a new instance over the SAME store)
+    receives the reconciled ``OrderFilled`` for the same order -- a different
+    ``trade_id`` (the ``GET-<venue order id>`` a legacy durable record
+    reconciles with) and a different ``event_id``, the same
+    ``venue_order_id``. Idempotence is keyed on ``venue_order_id``, so no
+    ``duplicate_fill`` bucket is written and the family halt stays unset.
+    The engine-driven, claimed-instrument counterpart is
+    ``tests/contract/test_reconciliation_durable_reports_contract.py::
+    test_three_consecutive_reconciliations_leave_the_halt_key_absent``."""
+    live = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    live.on_order_filled(
+        _fill(live, instrument_id=INTERIOR_ID, venue_order_id="ord-1", client_order_id="O-1"),
+    )
+    live.stop()
+
+    restarted = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    reconciled = _fill(
+        restarted, instrument_id=INTERIOR_ID, venue_order_id="ord-1", client_order_id="O-1",
+    )
+    reconciled = OrderFilled(
+        trader_id=reconciled.trader_id,
+        strategy_id=reconciled.strategy_id,
+        instrument_id=reconciled.instrument_id,
+        client_order_id=reconciled.client_order_id,
+        venue_order_id=reconciled.venue_order_id,
+        account_id=reconciled.account_id,
+        trade_id=TradeId("GET-ord-1"),
+        position_id=reconciled.position_id,
+        order_side=reconciled.order_side,
+        order_type=reconciled.order_type,
+        last_qty=reconciled.last_qty,
+        last_px=reconciled.last_px,
+        currency=reconciled.currency,
+        commission=Money(Decimal("0.01"), USD),
+        liquidity_side=reconciled.liquidity_side,
+        event_id=UUID4(),
+        ts_event=reconciled.ts_event,
+        ts_init=reconciled.ts_init,
+        reconciliation=True,
+    )
+    restarted.on_order_filled(reconciled)
+
+    latch = restarted._latch
+    assert latch is not None
+    assert latch.is_family_halted() is False
+    assert latch._store.get(FAMILY_HALT_KEY) is None
+    assert latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}ord-1") is None
+    record = latch.record(STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID))
+    assert record is not None and record.venue_order_id == "ord-1"
+
+
 def test_a_second_genuine_fill_with_a_different_id_halts_the_family(
     store_path: Path,
     interior_instrument: BinaryOption,
