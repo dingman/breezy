@@ -34,7 +34,8 @@ mirroring ``weather_common.costs.FeeCoefficientSource``:
   :func:`fetch_wire_fee_coefficient` bound (via ``functools.partial``) to a
   concrete ``PolymarketUSHttpClient`` and slug at the wiring site
   (``breezy.app.trade``); this module holds no transport of its own.
-* ``set_family_halted`` -- a no-argument callable driving the SAME
+* ``set_family_halted`` -- a callable, taking the observed wire fee,
+  driving the SAME
   ``family_halted`` state the existing order-path refusal already uses
   (``TrialDayLatch.record_policy_halt``, reused as-is -- no new key, no new
   veto). This module never imports ``TrialDayLatch`` directly: the wiring
@@ -68,8 +69,8 @@ strengthening left to a future item, not built here.
 
 **Three outcomes per fire, never two -- and UNKNOWN never halts.** AGREE is
 silent (no alert, no state change). DISAGREE alerts CRITICAL and calls
-``set_family_halted()``. UNKNOWN (the wire read raised or returned an
-unusable payload) alerts CRITICAL but does NOT call ``set_family_halted()``
+``set_family_halted(wire_fee)``. UNKNOWN (the wire read raised or returned
+an unusable payload) alerts CRITICAL but does NOT call ``set_family_halted``
 -- a DELIBERATE choice, stated here rather than left to inference: the plan
 requires UNKNOWN to "fail closed" by never defaulting to "agrees" (i.e. by
 never staying silent), which alerting satisfies; it does not require this
@@ -172,7 +173,7 @@ class FeeDriftProbeActor(Actor):
         self,
         *,
         wire_fee_fetcher: Callable[[], Awaitable[Decimal]],
-        set_family_halted: Callable[[], None],
+        set_family_halted: Callable[[Decimal], None],
         alert_sink: AlertSink,
         documented_fee_coefficient: Decimal = DOCUMENTED_TAKER_FEE_COEFFICIENT,
         interval_seconds: int = DEFAULT_FEE_DRIFT_PROBE_INTERVAL_SECONDS,
@@ -298,7 +299,7 @@ class FeeDriftProbeActor(Actor):
             self.counters["agree"] += 1
             return "AGREE"
         self._alert_mismatch(wire_fee)
-        self._set_family_halted()
+        self._set_family_halted(wire_fee)
         self.counters["disagree"] += 1
         return "DISAGREE"
 

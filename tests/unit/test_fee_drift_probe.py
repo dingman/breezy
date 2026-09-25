@@ -61,9 +61,11 @@ class _RecordingHaltSetter:
     """Stands in for the wiring site's `TrialDayLatch.record_policy_halt` binding."""
 
     calls: int = field(default=0)
+    last_wire_fee: Decimal | None = field(default=None)
 
-    def __call__(self) -> None:
+    def __call__(self, wire_fee: Decimal) -> None:
         self.calls += 1
+        self.last_wire_fee = wire_fee
 
 
 def _agreeing_fetcher() -> Any:
@@ -130,6 +132,7 @@ async def test_probe_once_disagrees_alerts_critical_and_halts() -> None:
 
     assert outcome == "DISAGREE"
     assert setter.calls == 1
+    assert setter.last_wire_fee == Decimal("0.0695")
     (payload,) = sink.emitted
     assert payload.severity == "CRITICAL"
     assert "0.0695" in payload.detail
