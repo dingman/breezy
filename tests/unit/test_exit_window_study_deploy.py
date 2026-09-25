@@ -215,6 +215,37 @@ def test_study_argv_pinned_stations_since_day_obs_source_and_run_stamp(tmp_path:
     assert "--obs-source fetch" in call
     assert re.search(r"--run-stamp \d{4}-\d{2}-\d{2}_nightly", call) is not None
     assert "--depth-source" not in call  # default depth-source: let the CLI auto-select
+    assert "--aud04-report" not in call  # no AUD-04 artefact exists yet in this run
+
+
+def test_aud04_report_flag_included_as_the_newest_when_present(tmp_path: Path) -> None:
+    """AUD-07 standing reconciliation: the MOST RECENT
+    PRIVATE_portfolio_roi_<stamp>.json under the shared derived-output root,
+    never assumed same-day (this wrapper runs before AUD-04's own timer)."""
+    state_db = _make_state_db(tmp_path / "state" / "exec_polymarket_us.sqlite")
+    stub, argv_log = _make_stub(tmp_path)
+    derived_dir = tmp_path / "derived"
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    older = derived_dir / "PRIVATE_portfolio_roi_2026-01-08.json"
+    newer = derived_dir / "PRIVATE_portfolio_roi_2026-01-09.json"
+    older.write_text("{}")
+    newer.write_text("{}")
+
+    result = _run_wrapper(tmp_path, stub_python=stub, state_db=state_db)
+    assert result.returncode == 0, result.stderr
+
+    call = _calls(argv_log, "STUDY")[0]
+    assert f"--aud04-report {newer}" in call
+    assert str(older) not in call
+
+
+def test_aud04_report_flag_omitted_when_no_artefact_exists(tmp_path: Path) -> None:
+    state_db = _make_state_db(tmp_path / "state" / "exec_polymarket_us.sqlite")
+    stub, argv_log = _make_stub(tmp_path)
+    result = _run_wrapper(tmp_path, stub_python=stub, state_db=state_db)
+    assert result.returncode == 0, result.stderr
+    call = _calls(argv_log, "STUDY")[0]
+    assert "--aud04-report" not in call
 
 
 def test_state_db_copy_is_used_never_the_live_path(tmp_path: Path) -> None:

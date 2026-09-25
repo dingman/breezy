@@ -348,3 +348,174 @@ def test_the_hurdle_is_the_venue_fee_plus_the_half_spread(wp7b):
 
     hurdle = wp7b.hurdle(ask=0.50, bid=0.40)
     assert hurdle == pytest.approx(venue_fee(ask_probability=0.50) + 0.05)
+
+
+# ---------------------------------------------------------------------------
+# 8. Step-5 qualifying-rate window flags (AUD-02 completion plan §3)
+#
+# Definition, from WP7b_MARKET_AS_FORECASTER_2026-09-20.md:203-208: an event
+# qualifies when its OWN yes_ask >= 0.70 AND its station-day's Σask over the
+# complete partition <= 1.20, at the pre-declared 09:00 LST instant. Only the
+# YES side needs to be priced at L0 -- ``ask_events``/``sum_ask_rows`` already
+# carry exactly that (no bid required), so this reuses the existing values and
+# adds no new predicate. The frozen region opens on climate day 2026-09-21.
+# ---------------------------------------------------------------------------
+
+SINCE = dt.date(2026, 9, 21)
+
+
+def _sum_ask_row(wp7b, *, station: str = "SFO", climate_day: dt.date, sum_ask: float):
+    return wp7b.SumAskRow(
+        station=station,
+        climate_day=climate_day,
+        n_rungs=6,
+        sum_ask=sum_ask,
+        sum_fee=0.0,
+        min_ask_size=25.0,
+        total_ask_size=150.0,
+    )
+
+
+def _rung_event(
+    wp7b, *, station: str = "SFO", climate_day: dt.date, ask: float, rung_id: str = "r1"
+):
+    return wp7b.RungEvent(
+        station=station,
+        climate_day=climate_day,
+        rung_id=rung_id,
+        ts_ns=0,
+        p_fc=0.5,
+        ask=ask,
+        ask_size=25.0,
+        bid=None,
+        bid_size=0.0,
+        settled=False,
+    )
+
+
+def test_window_filter_includes_the_since_boundary_day(wp7b):
+    events = [_rung_event(wp7b, climate_day=SINCE, ask=0.80)]
+    rows = [_sum_ask_row(wp7b, climate_day=SINCE, sum_ask=1.00)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE
+    )
+    assert report.station_days_in_window == 1
+    assert report.qualifying_events == 1
+
+
+def test_window_filter_excludes_the_day_before_since(wp7b):
+    day_before = SINCE - dt.timedelta(days=1)
+    events = [_rung_event(wp7b, climate_day=day_before, ask=0.80)]
+    rows = [_sum_ask_row(wp7b, climate_day=day_before, sum_ask=1.00)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE
+    )
+    assert report.station_days_in_window == 0
+    assert report.qualifying_events == 0
+
+
+def test_window_filter_includes_the_until_boundary_day_inclusive(wp7b):
+    until = SINCE + dt.timedelta(days=2)
+    events = [_rung_event(wp7b, climate_day=until, ask=0.80)]
+    rows = [_sum_ask_row(wp7b, climate_day=until, sum_ask=1.00)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE, until=until
+    )
+    assert report.station_days_in_window == 1
+
+
+def test_window_filter_excludes_the_day_after_until(wp7b):
+    until = SINCE + dt.timedelta(days=2)
+    after = until + dt.timedelta(days=1)
+    events = [_rung_event(wp7b, climate_day=after, ask=0.80)]
+    rows = [_sum_ask_row(wp7b, climate_day=after, sum_ask=1.00)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE, until=until
+    )
+    assert report.station_days_in_window == 0
+
+
+def test_predicate_admits_high_ask_with_tight_partition(wp7b):
+    rows = [_sum_ask_row(wp7b, climate_day=SINCE, sum_ask=1.10)]
+    events = [_rung_event(wp7b, climate_day=SINCE, ask=0.75)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE
+    )
+    assert report.qualifying_events == 1
+    assert report.qualifying_station_days == 1
+
+
+def test_predicate_rejects_ask_below_threshold(wp7b):
+    rows = [_sum_ask_row(wp7b, climate_day=SINCE, sum_ask=1.10)]
+    events = [_rung_event(wp7b, climate_day=SINCE, ask=0.69)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE
+    )
+    assert report.qualifying_events == 0
+
+
+def test_predicate_rejects_partition_over_the_sum_ask_cap(wp7b):
+    rows = [_sum_ask_row(wp7b, climate_day=SINCE, sum_ask=1.21)]
+    events = [_rung_event(wp7b, climate_day=SINCE, ask=0.90)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=[], since=SINCE
+    )
+    assert report.qualifying_events == 0
+
+
+def test_bad_since_date_format_is_refused(wp7b):
+    with pytest.raises(SystemExit):
+        wp7b.main(["--since", "2026/09/21"])
+
+
+def test_since_after_until_is_refused(wp7b):
+    with pytest.raises(SystemExit):
+        wp7b.main(["--since", "2026-09-25", "--until", "2026-09-20"])
+
+
+def test_a_gap_intersecting_window_reports_no_data_not_a_rate_or_nan(wp7b):
+    notes = [
+        (
+            "FORECAST ARCHIVE GAP for KSFO: 1 runtime day(s) covered by no entry "
+            "(2026-09-21..2026-09-21)"
+        )
+    ]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=[], sum_ask_rows=[], notes=notes, since=SINCE
+    )
+    assert report.gap_intersects_window is True
+    assert report.station_days_in_window == 0
+    rendered = wp7b.render_qualifying_rate_report(report)
+    assert "NO DATA (archive gap)" in rendered
+    assert "0/0" not in rendered
+    assert "nan" not in rendered.lower()
+
+
+def test_a_gap_outside_the_window_does_not_trigger_no_data_language(wp7b):
+    notes = [
+        (
+            "FORECAST ARCHIVE GAP for KSFO: 1 runtime day(s) covered by no entry "
+            "(2026-08-01..2026-08-01)"
+        )
+    ]
+    rows = [_sum_ask_row(wp7b, climate_day=SINCE, sum_ask=1.00)]
+    events = [_rung_event(wp7b, climate_day=SINCE, ask=0.80)]
+    report = wp7b.compute_qualifying_rate(
+        ask_events=events, sum_ask_rows=rows, notes=notes, since=SINCE
+    )
+    assert report.gap_intersects_window is False
+    rendered = wp7b.render_qualifying_rate_report(report)
+    assert "NO DATA" not in rendered
+
+
+def test_default_behaviour_with_no_window_flags_is_byte_identical(wp7b):
+    """Pins that adding --since/--until changes nothing when neither is passed."""
+    collected = wp7b.Collected(
+        ask_events=[],
+        mid_events=[],
+        sum_ask_rows=[],
+        single_instant_takes=[],
+        census=wp7b.Census(),
+        notes=[],
+    )
+    assert wp7b.build_artefact(collected, since=None, until=None) == wp7b.render(collected)

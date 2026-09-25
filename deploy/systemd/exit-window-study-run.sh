@@ -85,6 +85,17 @@ STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is required
 STATIONS=(LAX MDW MIA SFO)
 SINCE_CLIMATE_DAY="2026-09-05"  # pm_us_crh_v2.json d0_climate_day
 
+# AUD-07 standing reconciliation (§6): the MOST RECENT AUD-04
+# PRIVATE_portfolio_roi_<stamp>.json under the shared $OUT root, read ONLY
+# when it exists -- this wrapper runs at 15:20 UTC, before AUD-04's own
+# 17:40 UTC timer, so "today's" AUD-04 artefact never exists yet at this
+# instant; the most recent one that DOES exist (typically yesterday's) is
+# the correct "any date both artefacts exist" reading, never assumed same-day.
+AUD04_REPORT=""
+if [ -d "$OUT" ]; then
+  AUD04_REPORT=$(find "$OUT" -maxdepth 1 -name 'PRIVATE_portfolio_roi_*.json' -print 2>/dev/null | sort | tail -n1)
+fi
+
 STAMP=$(date -u +%Y-%m-%d)
 RUN_STAMP="${STAMP}_nightly"
 
@@ -116,12 +127,19 @@ if ! "$PY" -c "$BACKUP_PY" "$STATE_DB" "$STATE_DB_COPY" >>"$LOG" 2>&1; then
   exit 1
 fi
 
+STUDY_ARGS=(
+  --state-db "$STATE_DB_COPY"
+  --stations "${STATIONS[@]}"
+  --since-climate-day "$SINCE_CLIMATE_DAY"
+  --obs-source fetch
+  --run-stamp "$RUN_STAMP"
+)
+if [ -n "$AUD04_REPORT" ]; then
+  STUDY_ARGS+=(--aud04-report "$AUD04_REPORT")
+fi
+
 if "$PY" "$REPO/scripts/analysis/current_rung_hold_exit_window_study.py" \
-     --state-db "$STATE_DB_COPY" \
-     --stations "${STATIONS[@]}" \
-     --since-climate-day "$SINCE_CLIMATE_DAY" \
-     --obs-source fetch \
-     --run-stamp "$RUN_STAMP" >>"$LOG" 2>&1; then
+     "${STUDY_ARGS[@]}" >>"$LOG" 2>&1; then
   say "exit window study ok -- run-stamp $RUN_STAMP"
   exit 0
 fi

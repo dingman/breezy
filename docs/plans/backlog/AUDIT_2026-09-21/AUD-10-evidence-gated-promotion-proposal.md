@@ -368,6 +368,18 @@ from**; the fourth column states what the predicate does when that input is abse
 | `C-VALIDITY` | every replay-derived input row carries `validity != REPLAY_VALIDITY` (`"MECHANISM_ONLY"`) **and `params_match == true`**, else no edge statistic may be cited | `replay_results.jsonl` (H3) | vacuously true over zero rows, but `C-N` then fails — no edge statistic can be cited either way | AUD-11 / AUD-12; AUD-09 §6b.2 |
 | `C-STATIONS` | **pure subset predicate:** the proposal's `stations` are a subset of `SUPPORTED_STATIONS`. No other artefact is read. Reason `EXPANSION_REQUIRES_RULING` is recorded when it fails | the proposal's own draft manifest only | n/a — the input is always present, it is the thing being proposed | this plan, §6b.2 H2 |
 
+**Amendment (2026-09-25, AUD-09b amendment §5 B27 — tracking, not yet built here).** `C-VALIDITY`
+must additionally refuse a replay-derived row whose census provenance is `window_complete=false`,
+whose `coverage_kind != "WHOLE"` (when that field is present — AUD-09b amendment Stage B), or whose
+`(station, climate_day)` key appears in the runner's `replay_drift.jsonl` provenance-drift set (R4).
+The decision is made via `breezy.analysis.replay_sufficiency.is_replayable_whole_day` (the ONE
+sanctioned replayability check — a row's bare `verdict == "SUFFICIENT"` is never sufficient, because
+it also admits a partial `FRAGMENT` winner or a `window_complete=false` winner); `is_replayable_whole_day`
+cannot itself see the drift set, so `C-VALIDITY`'s implementation must ALSO check the key against
+`replay_drift.jsonl` directly. Owner: AUD-10 (this plan), by id, per the AUD-09b amendment §5/§7 B27
+disposition. Not yet implemented against this plan's own criteria code — tracked here so the
+dependency is visible before AUD-10 build work starts.
+
 **R5-7 / R5-8 as adapted for `continuous_rung_hold` — RULED, pinned here (round 8).**
 Rounds 1-6 tagged these criteria `SOURCE=FORECAST_FAMILY_R5` and stated they were *transcribed, not
 adapted*, because the transfer was an open strategy-lead blocker. That blocker is **RULED and

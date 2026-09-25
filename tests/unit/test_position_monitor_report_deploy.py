@@ -68,10 +68,36 @@ esac
     return stub, argv_log
 
 
+def _write_family_manifest(
+    path: Path, *, family_id: str, venue: str = "polymarket_us", status: str = "REGISTERED"
+) -> Path:
+    """A minimal, shell-grep-parseable manifest -- `$PY` is always stubbed in
+    this file, so the wrapper's own `manifest_field()` extraction is the only
+    thing that ever reads this JSON; it need not pass `load_family_manifest`'s
+    full schema validation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"family_id": family_id, "venue": venue, "status": status}, indent=2)
+    )
+    return path
+
+
+def _default_families_dir(tmp_path: Path) -> Path:
+    """AUD-07 C1(i): every pre-existing test in this file defaults to
+    exactly ONE REGISTERED polymarket_us manifest, so the "exactly one
+    report invocation" assertions predating the multi-family enumeration fix
+    stay meaningful -- the dedicated enumeration tests below pass their own
+    `families_dir` with more than one manifest."""
+    families_dir = tmp_path / "families"
+    _write_family_manifest(families_dir / "pm_us_crh_test.json", family_id="pm_us_crh_test")
+    return families_dir
+
+
 def _run_wrapper(
     tmp_path: Path,
     *,
     stub_python: Path | None,
+    families_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     home = tmp_path / "home"
@@ -88,6 +114,9 @@ def _run_wrapper(
     )
     env["BREEZY_SCORED_TRIALS_DIR"] = str(tmp_path / "scored_trials")
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(tmp_path / "derived")
+    env["BREEZY_POSITION_MONITOR_REPORT_FAMILIES_DIR"] = str(
+        families_dir if families_dir is not None else _default_families_dir(tmp_path)
+    )
     if stub_python is not None:
         env["BREEZY_POSITION_MONITOR_REPORT_PYTHON"] = str(stub_python)
     return subprocess.run(
@@ -180,6 +209,7 @@ def test_corpus_summary_flag_included_as_the_newest_report_when_corpus_dir_prese
     )
     env["BREEZY_SCORED_TRIALS_DIR"] = str(tmp_path / "scored_trials")
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(tmp_path / "derived")
+    env["BREEZY_POSITION_MONITOR_REPORT_FAMILIES_DIR"] = str(_default_families_dir(tmp_path))
     env["BREEZY_POSITION_MONITOR_REPORT_PYTHON"] = str(stub)
 
     result = subprocess.run(
@@ -342,3 +372,89 @@ def test_readme_documents_the_new_unit() -> None:
     text = _README.read_text()
     assert "breezy-position-monitor-report" in text
     assert "position-monitor-report-run.sh" in text
+
+
+class TestFamilyEnumeration:
+    """AUD-07 C1(i): the wrapper enumerates every REGISTERED,
+    venue=polymarket_us family manifest and runs the report once per family
+    -- never a single unbound run that renders a stale default literal."""
+
+    def test_the_wrapper_passes_a_family_manifest_for_every_registered_polymarket_us_family(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_family_manifest(families_dir / "a.json", family_id="pm_us_crh_v2")
+        _write_family_manifest(families_dir / "b.json", family_id="pm_us_crh_v4")
+        _write_family_manifest(
+            families_dir / "draft.json",
+            family_id="pm_us_crh_exit_v4",
+            status="DRAFT_NOT_REGISTERED",
+        )
+        _write_family_manifest(
+            families_dir / "kalshi.json", family_id="kalshi_crh_v1", venue="kalshi"
+        )
+
+        stub, argv_log = _make_stub(tmp_path)
+        result = _run_wrapper(tmp_path, stub_python=stub, families_dir=families_dir)
+        assert result.returncode == 0, result.stderr
+
+        calls = _report_calls(argv_log)
+        assert len(calls) == 2
+        joined = "\n".join(calls)
+        assert f"--family-manifest {families_dir / 'a.json'}" in joined
+        assert f"--family-manifest {families_dir / 'b.json'}" in joined
+        assert "draft.json" not in joined
+        assert "kalshi.json" not in joined
+
+    def test_two_registered_families_are_each_reported_separately(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_family_manifest(families_dir / "a.json", family_id="pm_us_crh_v2")
+        _write_family_manifest(families_dir / "b.json", family_id="pm_us_crh_v4")
+
+        stub, argv_log = _make_stub(tmp_path)
+        result = _run_wrapper(tmp_path, stub_python=stub, families_dir=families_dir)
+        assert result.returncode == 0, result.stderr
+
+        calls = _report_calls(argv_log)
+        assert len(calls) == 2
+        outs = set()
+        for call in calls:
+            match = re.search(r"--out (\S+)", call)
+            assert match is not None
+            outs.add(match.group(1))
+        assert len(outs) == 2, "each family must write its own output file, never a shared one"
+
+    def test_every_invocation_carries_every_registered_manifest_for_ambiguity_detection(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_family_manifest(families_dir / "a.json", family_id="pm_us_crh_v2")
+        _write_family_manifest(families_dir / "b.json", family_id="pm_us_crh_v4")
+
+        stub, argv_log = _make_stub(tmp_path)
+        result = _run_wrapper(tmp_path, stub_python=stub, families_dir=families_dir)
+        assert result.returncode == 0, result.stderr
+
+        for call in _report_calls(argv_log):
+            assert f"--registered-family-manifest {families_dir / 'a.json'}" in call
+            assert f"--registered-family-manifest {families_dir / 'b.json'}" in call
+
+    def test_zero_registered_families_falls_back_to_one_unbound_run(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir / "draft.json",
+            family_id="pm_us_crh_exit_v4",
+            status="DRAFT_NOT_REGISTERED",
+        )
+
+        stub, argv_log = _make_stub(tmp_path)
+        result = _run_wrapper(tmp_path, stub_python=stub, families_dir=families_dir)
+        assert result.returncode == 0, result.stderr
+
+        calls = _report_calls(argv_log)
+        assert len(calls) == 1
+        assert "--family-manifest" not in calls[0]

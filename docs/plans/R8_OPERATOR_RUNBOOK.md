@@ -580,3 +580,28 @@ When a node must be restarted outside the 16:50Z window or after an unclean shut
    fresh, full-TTL permit with no daily coverage ceiling — this is outside A-1's automated-relaunch threat
    model since a human is deciding, but repeated hand relaunches in one trading day reproduce the same
    cumulative-coverage gap A-1 closes for `_do_midday_watch`, and are the operator's own call to make.
+
+## Permit window posture (2026-09-25)
+
+Ruled: `docs/evidence/RULING_B3_permit_window_posture_2026-09-25.md`
+(trading-bot-architect + security-reviewer). Option (a) — accept the gap —
+chosen over (a′) — move LAUNCH later.
+
+**Nominal (single-mint):** permit runs 16:50Z→02:50Z (10h, `PERMIT_TTL_NS`).
+Gap to the next STOP_PRIOR (16:40Z): ~13h50m.
+
+**Worst case (multi-mint, WITHOUT the permit-cumulative-coverage cap):** a
+mid-day relaunch as late as 00:59Z mints a fresh 10h permit expiring ~10:59Z.
+Union of coverage: 16:50Z→~10:59Z (~18h09m). Gap to STOP_PRIOR: ~5h41m.
+
+**With the cap** (`docs/evidence/RULING_permit_daily_coverage_2026-09-25.md`,
+merged 13e4849): any mid-day-relaunch permit is capped at the day's
+first-boot expiry, so worst-case coverage collapses back to the nominal case.
+
+Both gaps fall entirely outside the union of the four station decision
+windows (17:00Z→01:00Z, §6 above), so no live entry decision is denied by the
+gap today.
+
+**The gap is accepted and NOT alerted until B1 exists.** Moving LAUNCH is not
+claimed to shift the capture or KILL-clock schedules — that Rev 1 claim was
+unverified and has been dropped.
