@@ -277,3 +277,38 @@ def test_both_python_steps_route_stdout_to_the_log_not_devnull() -> None:
             '"$PY"' in line or "$PY" in line
         ):
             assert '>>"$LOG" 2>>"$LOG"' in line, f"stdout not routed to $LOG: {line!r}"
+
+
+def test_webhook_url_stripped_from_refresh_env() -> None:
+    """AUD-18: the MOS fetch step is an outbound HTTP GET to a public IEM
+    endpoint, same least-privilege posture (A-5) as the ASOS fetch step --
+    the webhook URL never reaches it."""
+    text = _ASOS_REFRESH_WRAPPER.read_text()
+    for line in _logical_lines(text):
+        if "iem_mos_backfill.py" in line and ('"$PY"' in line or "$PY" in line):
+            assert 'env -u BREEZY_ALERT_WEBHOOK_URL "$PY"' in line, (
+                f"iem_mos_backfill.py invocation does not strip the webhook "
+                f"env var: {line!r}"
+            )
+            break
+    else:
+        raise AssertionError("no iem_mos_backfill.py invocation found in the wrapper")
+
+
+def test_mos_steps_route_stdout_to_the_log() -> None:
+    """AUD-18: both new MOS steps must not discard their own outcome text,
+    same posture as the two pre-existing ASOS steps."""
+    text = _ASOS_REFRESH_WRAPPER.read_text()
+    assert ">/dev/null" not in text, "a python step still discards its own stdout"
+    invocation_count = sum(
+        1
+        for line in _logical_lines(text)
+        if ("iem_mos_backfill.py" in line or "iem_mos_freshness_check.py" in line)
+        and ('"$PY"' in line or "$PY" in line)
+    )
+    assert invocation_count == 2
+    for line in _logical_lines(text):
+        if ("iem_mos_backfill.py" in line or "iem_mos_freshness_check.py" in line) and (
+            '"$PY"' in line or "$PY" in line
+        ):
+            assert '>>"$LOG" 2>>"$LOG"' in line, f"stdout not routed to $LOG: {line!r}"

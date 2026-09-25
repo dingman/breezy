@@ -518,6 +518,74 @@ discipline that applies to any future edit of this unit too.
 
 ---
 
+## AUD-18 addendum — nightly IEM MOS closed-day refresh (2026-09-25)
+
+Two extra steps were added to the SAME `asos-refresh-run.sh` at the SAME
+13:30 UTC slot, rather than a new unit/timer (coordinator decision): the
+lock, the freshness-alert pattern, and the "run regardless of the others'
+outcome" contract were already correct here and did not need forking.
+
+**The steps, in order.** (1) ASOS refresh, (2) ASOS freshness check
+(unchanged from the section above), (3) IEM MOS closed-day refresh
+(`scripts/archive/iem_mos_backfill.py --closed-days-lookback 7 --model NBS
+--apply`, one 1-day entry per (station, settled UTC day) for
+KLAX/KMDW/KMIA/KSFO, self-healing over the 7-night lookback), (4) IEM MOS
+freshness check (`scripts/archive/iem_mos_freshness_check.py`). Steps (1)
+and (3) share ONE captured lock result (`LOCKED`, from a single `flock -n 9`
+call) — a lock-contention night skips BOTH fetch steps, never just one.
+Steps (2) and (4) are unconditional, exactly like (2) already was.
+
+**New exit contract.** The wrapper used to exit ALWAYS 0. It now exits 1 if
+ANY of the four steps exits non-zero, 75 on the pre-existing
+lock-infrastructure failure paths (unchanged), 0 otherwise. `asos_recent_
+refresh.main` and both freshness checks are still fail-soft by design (they
+return 0 on a data-freshness signal, never a crash) — the new non-zero paths
+come only from the MOS refresh step failing (upstream refused, a retry
+budget exhausted, the completeness guard tripping) or an unexpected
+internal exception in any step, which is intended: those are exactly the
+conditions `OnFailure=` should page on.
+
+**`TimeoutStartSec=1800`** (up from 600): budgeted as ASOS (600, unchanged)
++ the MOS step's own `900`-second timeout (`timeout --kill-after=30`) + its
+30s kill grace + both freshness checks (~60s combined, generous), with
+margin. Pinned by `tests/unit/test_asos_refresh_alert_env.py::
+test_unit_timeout_exceeds_step_bounds`.
+
+**`breezy.env` joins the EnvironmentFile allowlist**, dash-prefixed
+(`EnvironmentFile=-%h/.config/breezy/breezy.env`) for the SAME independence
+reason as the rest of this unit: the MOS step needs `BREEZY_USER_AGENT`
+(`iem_mos_backfill.py` refuses without one), but a missing `breezy.env` must
+never stop the independent ASOS steps from starting. Per this file's own
+"AUD-15 alert env file" section below, `breezy.env` is non-credential. The
+forbidden-substring list (`breezy-trade.env`, `polymarket.env`,
+`operator.env`) is unchanged.
+
+**Freshness alert.** `iem_mos_archive_stale` (WARN) fires per station,
+`site=<station>`, `detail=latest_closed_day_missing`, when that station's
+EXACT 1-day manifest key for the latest SETTLED closed UTC day (`L = (now -
+12h).date() - 1`) is missing — one missed night is enough. A wider entry
+that merely spans `L` (see the AUD-18 note below) does NOT satisfy this
+check: `resolve_mos_coverage`'s narrowest-wins rule means the 1-day entry,
+once it exists, is what a read actually resolves to, so its continued
+absence is the real gap. A missing or unreadable manifest emits one
+`site=global` alert instead (`detail=manifest_missing` /
+`manifest_unreadable`).
+
+**AUD-18 note — the acknowledged wide 2026-09-25 entry, and FU-1 (KNYC).**
+A one-off `--start 2026-09-20 --end 2026-09-27 --apply` run on 2026-09-25
+(before this refresh existed) left one wide 6-day manifest entry per
+station. It is NOT rewritten or deleted (the cache is write-once); the
+nightly closed-day refresh's 1-day entries for 2026-09-25/26 onward take it
+over through the narrowest-wins rule as they land. **Such a one-off would
+now be REFUSED**: the window-mode CLI gained a settled-bound guard
+(`--end` may not claim a day after `(now - 12h).date()`), so `--end
+2026-09-27` at the time that run happened would be refused with exit 2.
+KNYC stays out of MOS scope, pinned by `tests/unit/test_iem_mos_probe_
+transport.py::test_mos_url_rejects_knyc`, tracked as follow-up FU-1 under
+AUD-18.
+
+---
+
 ## `breezy-study-failed@` — OnFailure= notifier for every study unit (AUD-15a, 2026-09-22)
 
 `breezy-study-failed@.service` is a templated `Type=oneshot` unit that ONE

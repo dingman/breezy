@@ -13,6 +13,8 @@ Description=Breezy nightly ASOS refresh for the fixed-window (--since) cache key
 Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Documentation=file:///home/jon/breezy/scripts/analysis/asos_recent_refresh.py
 Documentation=file:///home/jon/breezy/scripts/analysis/asos_cache_freshness_check.py
+Documentation=file:///home/jon/breezy/scripts/archive/iem_mos_backfill.py
+Documentation=file:///home/jon/breezy/scripts/archive/iem_mos_freshness_check.py
 After=network-online.target
 Wants=network-online.target
 
@@ -56,11 +58,25 @@ UMask=0077
 # `deploy/systemd/migrate-alerts-env.sh` and README.md's "AUD-15 alert env
 # file" note.
 EnvironmentFile=-%h/.config/breezy/alerts.env
+# AUD-18 (2026-09-25): the MOS closed-day refresh needs BREEZY_USER_AGENT
+# (iem_mos_backfill.py refuses without one), which lives in the operator's
+# non-credential `breezy.env`. The `-` prefix is DELIBERATE and differs from
+# breezy-fee-evidence-pull.service's own (non-dashed) EnvironmentFile=: a
+# missing breezy.env must not stop the independent ASOS steps from starting
+# (AC #9's independence requirement). The MOS step still fails LOUDLY on a
+# missing/empty BREEZY_USER_AGENT -- `main` refuses with exit 2
+# (iem_mos_backfill.py:881-882 at the pre-AUD-18 line numbers), which makes
+# the wrapper exit 1 and fires OnFailure=. Per deploy/systemd/README.md,
+# breezy.env is non-credential.
+EnvironmentFile=-%h/.config/breezy/breezy.env
 ExecStart=/home/jon/breezy/deploy/systemd/asos-refresh-run.sh
 
-# A single HTTP GET per site (five sites) plus a cache-mtime read -- well
-# under even breezy-k1-daily's budget, but Type=oneshot still needs a bound.
-TimeoutStartSec=600
+# AUD-18: was 600 (ASOS-only budget: one HTTP GET per site plus a
+# cache-mtime read). Now sized for ASOS (600) + the MOS step's own timeout
+# (900) + its --kill-after grace (30) + both freshness checks (~60,
+# generous), with margin -- and still well ahead of the 14:15Z
+# score-live-trials tick and the 15:00Z consumer even in the worst case.
+TimeoutStartSec=1800
 
 # No Restart=. A missed refresh is caught same-day by the unconditional
 # freshness check inside the wrapper (asos_cache_stale WARN), 90 minutes

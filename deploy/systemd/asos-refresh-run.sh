@@ -16,10 +16,14 @@
 # from the shared idiom -- a lock-INFRASTRUCTURE failure is a real failure
 # and must still reach `failed` so 15a's OnFailure= fires.
 #
-# Exit status: ALWAYS 0. Neither a lock skip nor a stale cache is a unit
-# failure (module docstrings of asos_recent_refresh.py and
-# asos_cache_freshness_check.py); only a lock-infrastructure failure exits
-# non-zero (75).
+# Exit status (AUD-18, 2026-09-25): 1 if ANY of the four steps below exits
+# non-zero, 75 on a lock-INFRASTRUCTURE failure, 0 otherwise. Neither a lock
+# SKIP nor a stale-cache WARN is a step failure (module docstrings of
+# asos_recent_refresh.py, asos_cache_freshness_check.py and
+# iem_mos_freshness_check.py all return 0 on staleness) -- only a step that
+# itself exits non-zero counts. Each step runs regardless of the others'
+# outcome (AC #9): a MOS-step failure never skips the ASOS steps and vice
+# versa.
 set -uo pipefail
 
 REPO=/home/jon/breezy
@@ -30,6 +34,12 @@ LOG=$OUT/asos_refresh.log
 # together if it ever changes (mirrors the retired mb-daily-run.sh's own
 # comment; the anchor is not forked, ruling §A1(iii)).
 ASOS_FETCH_START_ANCHOR=2026-08-30
+# AUD-18: the wrapper hard-codes 7 (the deploy first run uses 14 by hand,
+# outside the unit -- see the plan's Deploy step 4).
+MOS_CLOSED_DAYS_LOOKBACK=7
+MOS_STEP_TIMEOUT_S=900
+
+FAILED=0
 
 mkdir -p "$OUT"
 
@@ -57,20 +67,29 @@ LOCK="$LOCK_DIR/breezy-studies.lock"
 mkdir -p "$LOCK_DIR" 2>>"$LOG" || { say "SKIPPED-INFRA -- no studies lock directory"; exit 75; }
 exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studies lock"; exit 75; }
 
+# Captured ONCE: both fetch steps below (ASOS and MOS) gate on the SAME
+# lock outcome from this ONE flock(2) call, never a second call on fd 9 --
+# both freshness checks stay unconditional regardless of LOCKED.
 if flock -n 9; then
+  LOCKED=1
+else
+  LOCKED=0
+  say "SKIPPED-LOCK -- another study holds the studies lock; asos refresh not attempted this invocation"
+fi
+
+if [ "$LOCKED" -eq 1 ]; then
   # AUD-15 amendment, least privilege (A-5): the fetch talks only to the
   # public IEM ASOS endpoint and has no use for the alert webhook URL --
   # `env -u` strips it from THIS subprocess only, so a credential-shaped
   # value never reaches a process whose job is an outbound HTTP GET to a
-  # third party. Only the freshness check below (never this one) needs it.
+  # third party. Only the freshness checks (never a fetch step) need it.
   if env -u BREEZY_ALERT_WEBHOOK_URL "$PY" "$REPO/scripts/analysis/asos_recent_refresh.py" \
        --since "$ASOS_FETCH_START_ANCHOR" >>"$LOG" 2>>"$LOG"; then
     say "asos refresh ok"
   else
     say "asos refresh reported a shortfall (see log above) -- continuing on whatever is cached"
+    FAILED=1
   fi
-else
-  say "SKIPPED-LOCK -- another study holds the studies lock; asos refresh not attempted this invocation"
 fi
 
 # UNCONDITIONAL: runs whether the lock was acquired or not, and whether the
@@ -84,6 +103,38 @@ if "$PY" "$REPO/scripts/analysis/asos_cache_freshness_check.py" >>"$LOG" 2>>"$LO
   say "asos cache freshness check ok"
 else
   say "asos cache freshness check reported an internal error (see log above)"
+  FAILED=1
 fi
 
-exit 0
+# AUD-18: the nightly IEM MOS closed-day refresh, added to this unit rather
+# than a new timer (coordinator decision). Gates on the SAME captured
+# LOCKED result as the ASOS refresh above -- one flock(2) call, two fetch
+# steps under it -- and is otherwise independent: a MOS-step failure never
+# skips the ASOS steps, and vice versa (AC #9).
+if [ "$LOCKED" -eq 1 ]; then
+  if BREEZY_LIVE=1 timeout --kill-after=30 "$MOS_STEP_TIMEOUT_S" \
+       env -u BREEZY_ALERT_WEBHOOK_URL "$PY" "$REPO/scripts/archive/iem_mos_backfill.py" \
+       --closed-days-lookback "$MOS_CLOSED_DAYS_LOOKBACK" --model NBS --apply \
+       --report-json "$OUT/mos_refresh.json" >>"$LOG" 2>>"$LOG"; then
+    say "iem-mos refresh ok"
+  else
+    say "iem-mos refresh reported a failure (see log above)"
+    FAILED=1
+  fi
+fi
+# No second SKIPPED-LOCK line here on purpose: LOCKED is captured from ONE
+# flock(2) call above, and that capture already logged the single
+# SKIPPED-LOCK line for this invocation.
+
+# UNCONDITIONAL, same reasoning as the ASOS freshness check above: runs
+# whether the MOS refresh step ran, succeeded, failed, or was skipped on
+# lock contention. Keeps BREEZY_ALERT_WEBHOOK_URL (from this unit's
+# EnvironmentFile) to deliver off-box.
+if "$PY" "$REPO/scripts/archive/iem_mos_freshness_check.py" >>"$LOG" 2>>"$LOG"; then
+  say "iem-mos freshness check ok"
+else
+  say "iem-mos freshness check reported an internal error (see log above)"
+  FAILED=1
+fi
+
+exit $(( FAILED ? 1 : 0 ))
