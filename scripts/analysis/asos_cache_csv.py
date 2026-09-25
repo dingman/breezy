@@ -33,6 +33,16 @@ cached rows fall inside the target climate day's window: a zero-row CSV
 would let the replay run and silently report a clean zero-trial day, the
 "0 rows is not a quiet market" failure L-8 names.
 
+Refuses (`ASOS_CACHE_UNPARSEABLE_ROWS`, a DIFFERENT non-zero exit, **no file
+written**) when any cached row for the station has a `valid` field that does
+not parse. Such a row cannot be placed inside or outside the target window at
+all, so it is data the replay would silently lack rather than data correctly
+excluded -- this module fails CLOSED rather than dropping it silently, and
+counts it the same way `settlement_alignment_study.metar_temperatures` counts
+its own `archive_parse_error` drops. Measured against the real archive
+(2026-09-25): the whole-history SFO cache (574,679 rows) has zero
+unparseable `valid` fields, so fail-closed costs nothing against real data.
+
 The write itself is atomic: the CSV is built in a temp file next to `--out`
 and moved into place with `os.replace`, so a reader of `--out` never
 observes a partially-written file and a crash mid-write leaves nothing at
@@ -47,7 +57,9 @@ import datetime as dt
 import os
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -61,8 +73,10 @@ from breezy.normalize.climate_day import standard_time_zone
 
 __all__ = [
     "ASOS_CACHE_EMPTY",
+    "ASOS_CACHE_UNPARSEABLE_ROWS",
     "CSV_FIELDNAMES",
     "AsosCacheCsvError",
+    "WindowedAsosRows",
     "climate_day_utc_bounds",
     "main",
     "site_for_station",
@@ -75,6 +89,15 @@ __all__ = [
 #: scope) hardcodes this same literal when it sees this module exit non-zero
 #: -- it does not parse this module's stderr.
 ASOS_CACHE_EMPTY: Final[str] = "ASOS_CACHE_EMPTY"
+
+#: Exit reason for "at least one cached row for the station has a `valid`
+#: field that does not parse". Distinct from `ASOS_CACHE_EMPTY`: this is a
+#: data-quality refusal, not a "nothing in the window" verdict.
+ASOS_CACHE_UNPARSEABLE_ROWS: Final[str] = "ASOS_CACHE_UNPARSEABLE_ROWS"
+
+#: The `Counter` key `windowed_asos_rows` uses for an unparseable `valid`
+#: field, mirroring `metar_temperatures`'s `archive_parse_error` drop key.
+_UNPARSEABLE_VALID_DROP: Final[str] = "unparseable_valid"
 
 #: The exact, and only, columns the replay driver's `read_asos_rows` expects.
 CSV_FIELDNAMES: Final[tuple[str, str, str]] = ("station", "valid", "metar")
@@ -97,6 +120,17 @@ def site_for_station(station: str) -> SiteSpec:
     raise AsosCacheCsvError(f"unsupported station: {station!r}")
 
 
+def _bounds_for_offset(std_utc_offset_hours: float, climate_day: dt.date) -> tuple[int, int]:
+    """The pure half-open `[start_ns, end_ns)` bound, given an already-resolved offset."""
+    tz = standard_time_zone(std_utc_offset_hours)
+    start = dt.datetime.combine(climate_day, dt.time.min, tzinfo=tz)
+    end = start + dt.timedelta(days=1)
+    return (
+        int(start.timestamp() * 1_000_000_000),
+        int(end.timestamp() * 1_000_000_000),
+    )
+
+
 def climate_day_utc_bounds(*, station: str, climate_day: dt.date) -> tuple[int, int]:
     """Half-open `[start_ns, end_ns)` of `climate_day`, local standard time, in UTC ns.
 
@@ -105,13 +139,7 @@ def climate_day_utc_bounds(*, station: str, climate_day: dt.date) -> tuple[int, 
     `ClimateDayWindow`'s own docstring.
     """
     spec = site_for_station(station)
-    tz = standard_time_zone(spec.std_utc_offset_hours)
-    start = dt.datetime.combine(climate_day, dt.time.min, tzinfo=tz)
-    end = start + dt.timedelta(days=1)
-    return (
-        int(start.timestamp() * 1_000_000_000),
-        int(end.timestamp() * 1_000_000_000),
-    )
+    return _bounds_for_offset(spec.std_utc_offset_hours, climate_day)
 
 
 def _row_ns(row: Mapping[str, str]) -> int | None:
@@ -125,23 +153,46 @@ def _row_ns(row: Mapping[str, str]) -> int | None:
     return int(parsed.timestamp() * 1_000_000_000)
 
 
+@dataclass(frozen=True, slots=True)
+class WindowedAsosRows:
+    """The in-window rows for a station-day, plus every drop counted by reason.
+
+    Mirrors `settlement_alignment_study.metar_temperatures`'s `(values, Counter)`
+    shape: a drop is never silent, even when the caller only reads `.rows`.
+    """
+
+    rows: tuple[Mapping[str, str], ...]
+    drops: Counter[str]
+
+
 def windowed_asos_rows(
     *, station: str, climate_day: dt.date, cache_dir: Path
-) -> tuple[Mapping[str, str], ...]:
+) -> WindowedAsosRows:
     """Every cached ASOS row for `station` inside `climate_day`'s window.
 
     ZERO NETWORK: composed entirely from `load_recent_asos_rows`'s local-cache
     scan (`iem_asos_id`-filtered, so another station's rows never reach this
-    function at all) and `climate_day_utc_bounds`'s pure window.
+    function at all) and `_bounds_for_offset`'s pure window. `site_for_station`
+    is resolved exactly once here (previously resolved a second time inside
+    `climate_day_utc_bounds`).
+
+    A row whose `valid` field will not parse is never silently folded into
+    "outside the window": it is counted under `_UNPARSEABLE_VALID_DROP`, so a
+    caller that only reads `.rows` still has the count available in `.drops`.
     """
     spec = site_for_station(station)
-    start_ns, end_ns = climate_day_utc_bounds(station=station, climate_day=climate_day)
+    start_ns, end_ns = _bounds_for_offset(spec.std_utc_offset_hours, climate_day)
     rows = load_recent_asos_rows(cache_dir, spec.iem_asos_id)
-    return tuple(
-        row
-        for row in rows
-        if (row_ns := _row_ns(row)) is not None and start_ns <= row_ns < end_ns
-    )
+    kept: list[Mapping[str, str]] = []
+    drops: Counter[str] = Counter()
+    for row in rows:
+        row_ns = _row_ns(row)
+        if row_ns is None:
+            drops[_UNPARSEABLE_VALID_DROP] += 1
+            continue
+        if start_ns <= row_ns < end_ns:
+            kept.append(row)
+    return WindowedAsosRows(rows=tuple(kept), drops=drops)
 
 
 def write_asos_cache_csv(rows: Sequence[Mapping[str, str]], out: Path) -> None:
@@ -174,14 +225,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     try:
-        rows = windowed_asos_rows(
+        result = windowed_asos_rows(
             station=args.station, climate_day=args.climate_day, cache_dir=args.cache_dir
         )
     except AsosCacheCsvError as exc:
         print(f"[asos-cache-csv] {exc}", file=sys.stderr)
         return 2
 
-    if not rows:
+    unparseable = result.drops[_UNPARSEABLE_VALID_DROP]
+    if unparseable:
+        print(
+            f"[asos-cache-csv] {ASOS_CACHE_UNPARSEABLE_ROWS}: {unparseable} cached row(s) "
+            f"for {args.station} have an unparseable 'valid' field; such a row cannot be "
+            "placed inside or outside the target window, so it is refused rather than "
+            "silently dropped; writing no file",
+            file=sys.stderr,
+        )
+        return 3
+
+    if not result.rows:
         print(
             f"[asos-cache-csv] {ASOS_CACHE_EMPTY}: no cached ASOS rows for "
             f"{args.station} inside climate day {args.climate_day}; writing no file",
@@ -189,8 +251,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    write_asos_cache_csv(rows, args.out)
-    print(f"[asos-cache-csv] wrote {len(rows)} row(s) to {args.out}")
+    write_asos_cache_csv(result.rows, args.out)
+    print(f"[asos-cache-csv] wrote {len(result.rows)} row(s) to {args.out}")
     return 0
 
 
