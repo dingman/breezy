@@ -79,6 +79,8 @@ from breezy.runtime.trade_supervisor_core import (
     DaySchedulerState,
     EscalationLoadOutcome,
     LaunchAction,
+    PermitAlertAction,
+    PermitCapability,
     Phase,
     RelaunchCause,
     SelfCheckEscalationState,
@@ -93,18 +95,23 @@ from breezy.runtime.trade_supervisor_core import (
     continuous_family_startup_evidence_key,
     decide_launch_action,
     decide_midday_relaunch,
+    decide_permit_alert,
     decide_relaunch,
     decide_stop_prior_action,
     decode_self_check_escalation_state,
     encode_self_check_escalation_state,
     escalated_self_check_severity,
     initial_scheduler_state,
+    latch_log_facts,
     launch_time_ns,
     mark_phase_fired,
+    midday_budget_live,
     midday_watch_window_end,
     next_due,
     parse_permit_expiry_ns,
+    permit_capability_valid,
     permit_expiry_valid,
+    permit_watch_window,
     readiness_observed,
     record_child_adopted,
     record_first_boot_permit_seen,
@@ -114,11 +121,16 @@ from breezy.runtime.trade_supervisor_core import (
     record_midday_not_ready_alert_sent,
     record_midday_readiness_recheck_done,
     record_midday_relaunch_attempt,
+    record_permit_alert_sent,
+    record_permit_deferred_since,
+    record_permit_gap_info_logged,
     record_permit_issued_seen,
+    record_permit_not_required_warned,
     record_readiness_observed,
     record_relaunch_attempt,
     record_self_check_result,
     record_strategy_subscribed_seen,
+    seed_permit_alert,
     self_check,
     self_check_gap_hours,
     strategy_subscribed_in,
@@ -900,6 +912,25 @@ def alert(
     )
 
 
+def _send_permit_alert(
+    sink: AlertSink, *, event: str, severity: str, detail: AlertDetail, site: str = "trade_node"
+) -> bool:
+    """[B1, silent-failure-review A2] Like :func:`alert`, but the send's
+    success/failure is OBSERVABLE to the caller -- ``emit_alert`` deliberately
+    never reports that back (see its own docstring), which is right for
+    every other fire-and-forget call site in this module but wrong for B1:
+    a failed send here must be retried on the very next poll, never latched
+    as sent. Same containment discipline as ``emit_alert`` (``BaseException``,
+    exception TYPE only, never the message)."""
+    payload = AlertPayload(severity=severity, event=event, site=site, detail=detail.value)
+    try:
+        sink.emit(payload)
+    except BaseException as exc:  # noqa: BLE001 -- deliberate; see docstring.
+        log_decision("permit_watch_alert_send_failed", error_type=type(exc).__name__)
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Logging configuration -- attaching real handlers so `log_decision`'s and
 # `alert`'s log lines actually reach a file and stderr at INFO, instead of
@@ -1387,6 +1418,7 @@ def _do_midday_watch(
                 detail=AlertDetail.MIDDAY_RELAUNCH_CEILING_UNKNOWN,
             )
             state = record_midday_ceiling_unknown_alert_sent(state, now)
+            state = seed_permit_alert(state, now)  # [B1/D5]
         return tracked_pid, node_log, state
 
     decision = decide_midday_relaunch(
@@ -1407,6 +1439,7 @@ def _do_midday_watch(
                 detail=AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED,
             )
             state = record_midday_alert_sent(state, now)
+            state = seed_permit_alert(state, now)  # [B1/D5]
         return tracked_pid, node_log, state
 
     log_decision(
@@ -1424,9 +1457,192 @@ def _do_midday_watch(
     return proc.pid, new_log, record_midday_relaunch_attempt(state, now)
 
 
+# ---------------------------------------------------------------------------
+# [B1, 2026-09-25] Supervisor-side permit-lapse detector -- the I/O shell.
+# Read-only with respect to the node and the store: never spawns, never
+# terminates, never writes ``SqliteStateStore`` (AC8). Runs on EVERY
+# ``_run_forever`` iteration (both the ``Phase.NONE`` branch and after the
+# dispatched phase, per the plan's Architecture section) and is a cheap
+# no-op outside its own window (:func:`permit_watch_window`).
+# ---------------------------------------------------------------------------
+
+
+def _permit_watch_adopt_and_evaluate(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    now_ns: int,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    log_dir: Path,
+    handler_read_log: bool,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[D7] Adopt a live, unverified child if needed, then [D6] drain the
+    log only when the dispatched phase did not, then [D2] classify and
+    [D5] alert. Never adopts over an already-alive ``tracked_pid`` -- that
+    includes a pid the mid-day watch just spawned earlier in this same
+    iteration (the caller passes the POST-dispatch values)."""
+    if tracked_pid is None or not ports.process_alive(tracked_pid):
+        lock_path = intent_lock_path(store_path)
+        adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
+        if adoption is not None:
+            tracked_pid, node_log = adoption
+            log_decision("permit_watch_adopted_live_node", pid=tracked_pid)
+            state = record_child_adopted(state, now)
+
+    child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
+    log_available = node_log is not None
+    if child_alive and node_log is not None and not handler_read_log:
+        log_text = ports.read_log_new(node_log)
+        state = latch_log_facts(state, now, log_text)
+
+    budget_live = midday_budget_live(
+        launch_done=state.launch_done,
+        readiness_observed=state.readiness_observed,
+        midday_watch_window_open=True,
+        midday_alert_sent=state.midday_alert_sent,
+        midday_ceiling_unknown_alert_sent=state.midday_ceiling_unknown_alert_sent,
+        midday_relaunch_attempts=state.midday_relaunch_attempts,
+    )
+    capability = permit_capability_valid(
+        state,
+        now_ns,
+        child_alive=child_alive,
+        log_available=log_available,
+        midday_budget_live=budget_live,
+    )
+    state = record_permit_deferred_since(state, now, capability=capability)
+
+    decision = decide_permit_alert(
+        capability=capability,
+        now=now,
+        last_sent_at=state.permit_alert_last_sent_at,
+        last_capability=state.permit_alert_last_capability,
+        not_required_warned=state.permit_not_required_warned,
+    )
+    if decision.action is PermitAlertAction.ALERT:
+        sent = _send_permit_alert(
+            ports.alert_sink,
+            event=decision.event,
+            severity=decision.severity,
+            detail=decision.detail,
+        )
+        if not sent:  # [A2] retried on the next poll, never latched as sent.
+            return tracked_pid, node_log, state
+        log_decision("permit_watch", phase="permit_watch", capability=capability.value)
+        if capability is PermitCapability.NOT_REQUIRED:
+            state = record_permit_not_required_warned(state, now)
+        else:
+            state = record_permit_alert_sent(state, now, capability=capability)
+    elif decision.action is PermitAlertAction.RESTORED:
+        log_decision("permit_restored", phase="permit_watch")
+        state = record_permit_alert_sent(state, now, capability=PermitCapability.VALID)
+    return tracked_pid, node_log, state
+
+
+def _do_permit_watch(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    log_dir: Path,
+    handler_read_log: bool,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[B1] The permit-lapse watch, called on every ``_run_forever``
+    iteration. [D8] Has its own ``try``, separate from the dispatched
+    phase's own -- a fault here must never end the supervisor or skip the
+    next phase dispatch.
+
+    [D2] A no-op outside :func:`permit_watch_window`. [Rev 2 #4] On the
+    first poll at or after the window's close, evaluates capability once
+    AS OF the close instant (catching a lapse that fell between polls),
+    then writes exactly one INFO ``permit_accepted_gap`` line and never
+    evaluates again until the next window (a fresh trading day)."""
+    try:
+        window_open, window_close = permit_watch_window(state.day)
+
+        if now >= window_close:
+            if state.permit_gap_info_logged:
+                return tracked_pid, node_log, state
+            close_ns = int(window_close.timestamp() * 1e9)
+            tracked_pid, node_log, state = _permit_watch_adopt_and_evaluate(
+                ports=ports,
+                state=state,
+                now=now,
+                now_ns=close_ns,
+                tracked_pid=tracked_pid,
+                node_log=node_log,
+                store_path=store_path,
+                log_dir=log_dir,
+                handler_read_log=handler_read_log,
+            )
+            log_decision(
+                "permit_accepted_gap",
+                expires_at_ns=state.permit_issued_seen_expires_at_ns or 0,
+                ruling="B3",
+            )
+            state = record_permit_gap_info_logged(state, now)
+            return tracked_pid, node_log, state
+
+        if now < window_open:
+            return tracked_pid, node_log, state
+
+        now_ns = int(now.timestamp() * 1e9)
+        return _permit_watch_adopt_and_evaluate(
+            ports=ports,
+            state=state,
+            now=now,
+            now_ns=now_ns,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+            log_dir=log_dir,
+            handler_read_log=handler_read_log,
+        )
+    except Exception as exc:  # noqa: BLE001 -- [D8] B1's own containment.
+        log_decision(
+            "permit_watch_exception_contained",
+            phase="permit_watch",
+            error_type=type(exc).__name__,
+        )
+        decision = decide_permit_alert(
+            capability=PermitCapability.WATCH_FAILED,
+            now=now,
+            last_sent_at=state.permit_alert_last_sent_at,
+            last_capability=state.permit_alert_last_capability,
+            not_required_warned=state.permit_not_required_warned,
+        )
+        if decision.action is PermitAlertAction.ALERT:
+            sent = _send_permit_alert(
+                ports.alert_sink,
+                event=decision.event,
+                severity=decision.severity,
+                detail=decision.detail,
+            )
+            if not sent:  # [A2] retried on the next poll, never latched.
+                return tracked_pid, node_log, state
+            state = record_permit_alert_sent(state, now, capability=PermitCapability.WATCH_FAILED)
+        return tracked_pid, node_log, state
+
+
 #: Self-check results that are a PASS of some kind -- never alerted on.
 _SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
     {SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN}
+)
+
+#: [B1/D5] The self-check FAIL results that are specifically about the
+#: permit -- these seed B1's own heartbeat (see ``_do_self_check``'s call to
+#: ``seed_permit_alert``), distinct from a not-ready/multi-holder FAIL.
+_PERMIT_FAIL_SELF_CHECK_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
+    {
+        SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT,
+        SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING,
+    }
 )
 
 
@@ -1574,6 +1790,11 @@ def _do_self_check(
         continuous_check=continuous_check,
         permit_expiry_at_daily_ceiling=permit_expiry_at_daily_ceiling,
     )
+    # [B1/D5] A permit-specific FAIL seeds B1's own heartbeat timer so its
+    # first CRITICAL for the SAME underlying fault waits for the heartbeat
+    # rather than double-paging within the same minute (AC5).
+    if state is not None and result in _PERMIT_FAIL_SELF_CHECK_RESULTS:
+        state = seed_permit_alert(state, now)
     # [AUD-14b] Repeat-failure escalation -- a separate, store-backed
     # record, re-read fresh at every self-check (see
     # `_load_self_check_escalation`'s docstring). Bracket ordering is
@@ -1754,6 +1975,43 @@ def _default_clock() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
+def _dispatch_permit_watch(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    log_dir: Path,
+    handler_read_log: bool,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[silent-failure-review A2] A SECOND, outer containment layer around
+    :func:`_do_permit_watch`'s own ``try`` (D8) -- a fault escaping B1
+    ENTIRELY (including one raised from within its own exception handling)
+    must never stop the loop or skip the next phase dispatch. Returns the
+    PRIOR triple unchanged on that (expected-to-be-rare) path; ``_do_permit_
+    watch`` itself is the layer that actually classifies and alerts."""
+    try:
+        return _do_permit_watch(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+            log_dir=log_dir,
+            handler_read_log=handler_read_log,
+        )
+    except Exception as exc:  # noqa: BLE001 -- deliberate: see docstring.
+        log_decision(
+            "permit_watch_exception_contained",
+            phase="permit_watch_outer",
+            error_type=type(exc).__name__,
+        )
+        return tracked_pid, node_log, state
+
+
 def _run_forever(
     *,
     store_path: Path,
@@ -1809,9 +2067,20 @@ def _run_forever(
                 # Reaping here bounds the window to one poll interval
                 # (`_SCHEDULE_POLL_INTERVAL_S`, currently 60 s) instead.
                 _reap_spawned_children()
+                tracked_pid, node_log, state = _dispatch_permit_watch(
+                    ports=active_ports,
+                    state=state,
+                    now=now,
+                    tracked_pid=tracked_pid,
+                    node_log=node_log,
+                    store_path=store_path,
+                    log_dir=log_dir,
+                    handler_read_log=False,
+                )
                 sleep(_SCHEDULE_POLL_INTERVAL_S)
                 continue
 
+            permit_watch_handler_read_log = False
             try:
                 if phase is Phase.STOP_PRIOR:
                     tracked_pid = _do_stop_prior(
@@ -1856,6 +2125,13 @@ def _run_forever(
                         state = new_state
                     state = mark_phase_fired(state, phase, now)
                 elif phase is Phase.MIDDAY_WATCH:
+                    # [B1/D6] Captured BEFORE the call: mirrors
+                    # `_do_midday_watch`'s own early-return guard exactly, so
+                    # B1 drains the log itself only when this dispatch did
+                    # not (an early return means no read happened).
+                    permit_watch_handler_read_log = not (
+                        state.midday_alert_sent or tracked_pid is None or node_log is None
+                    )
                     tracked_pid, node_log, state = _do_midday_watch(
                         ports=active_ports,
                         state=state,
@@ -1890,6 +2166,21 @@ def _run_forever(
                 )
                 if phase is not Phase.RELAUNCH_CHECK:
                     state = mark_phase_fired(state, phase, now)
+
+            # [B1] Runs after EVERY dispatched phase (Architecture step 3) --
+            # a cheap no-op outside its own window. Threaded back into the
+            # SAME locals every other handler uses, so a child B1 adopts is
+            # SIGTERM'd by the next STOP_PRIOR (AC11).
+            tracked_pid, node_log, state = _dispatch_permit_watch(
+                ports=active_ports,
+                state=state,
+                now=now,
+                tracked_pid=tracked_pid,
+                node_log=node_log,
+                store_path=store_path,
+                log_dir=log_dir,
+                handler_read_log=permit_watch_handler_read_log,
+            )
 
             # [D1] EVERY dispatch is followed by a bounded sleep -- without
             # this, a LAUNCH that leaves RELAUNCH_CHECK due every pass (not

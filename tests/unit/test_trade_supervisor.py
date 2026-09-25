@@ -33,6 +33,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_intent_marker_path
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
+    _SELF_CHECK_PASS_RESULTS,
     BUILD_REVISION_ENV_VAR,
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -42,13 +43,13 @@ from breezy.runtime.trade_supervisor import (
     SupervisorPorts,
     _do_launch,
     _do_midday_watch,
+    _do_permit_watch,
     _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
     _read_git_head_sha,
     _resolve_build_revision,
     _run_forever,
-    _SELF_CHECK_PASS_RESULTS,
     _SupervisorFileHandler,
     _SupervisorStreamHandler,
     configure_supervisor_logging,
@@ -70,16 +71,19 @@ from breezy.runtime.trade_supervisor import (
     terminate_after_toctou_recheck,
 )
 from breezy.runtime.trade_supervisor_core import (
+    _PASS_RESULT_VALUES,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_MIN_RELAUNCH_GAP,
     MIDDAY_READINESS_RECHECK_TIMEOUT,
     MIN_RELAUNCH_GAP,
+    PERMIT_DEFERRED_MAX,
+    PERMIT_NOT_REQUESTED_MARKER,
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ESCALATION_STORE_KEY,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
-    EscalationLoadOutcome,
+    DaySchedulerState,
     ExitConfigErrorCause,
     LaunchAction,
     Phase,
@@ -88,7 +92,6 @@ from breezy.runtime.trade_supervisor_core import (
     SelfCheckEscalationState,
     SelfCheckResult,
     StopPriorAction,
-    _PASS_RESULT_VALUES,
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
     decide_launch_action,
@@ -104,6 +107,7 @@ from breezy.runtime.trade_supervisor_core import (
     next_due,
     parse_permit_expiry_ns,
     readiness_observed,
+    record_child_adopted,
     record_first_boot_permit_seen,
     record_midday_cause_seen,
     record_permit_issued_seen,
@@ -4402,7 +4406,6 @@ class TestFirstBootPermitAnchor:
         """The anchor is set once from the FIRST child's permit line and
         must not move even though each relaunched child mints (and logs)
         its own, later, clamped expiry."""
-        from breezy.runtime.trade_supervisor_core import record_child_adopted
 
         state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
         state = record_first_boot_permit_seen(state, _utc(17, 10), _FAR_FUTURE_EXPIRES_AT_NS)
@@ -4837,3 +4840,571 @@ class TestWp0aLiveFamilyMiddayWatchAndReap:
         assert "FAIL_NODE_NOT_READY" not in self_check_lines[0]
         assert "PASS" in self_check_lines[0]
         assert len(spawn_calls) == 2
+
+
+# ===========================================================================
+# B1 -- the supervisor-side permit-lapse detector.
+# ===========================================================================
+
+
+def _b1_common_kwargs(tmp_path) -> dict:
+    return {
+        "store_path": tmp_path / "state" / "store.sqlite3",
+        "log_dir": tmp_path / "logs",
+    }
+
+
+def _b1_ready_state(**overrides) -> DaySchedulerState:
+
+    base = replace(
+        initial_scheduler_state(_DAY),
+        launch_done=True,
+        readiness_observed=True,
+    )
+    return replace(base, **overrides) if overrides else base
+
+
+class TestB1PermitWatch:
+    # -- AC1 -----------------------------------------------------------
+    def test_nominal_1650z_to_0300z_never_pages_and_logs_one_accepted_gap_info(
+        self, tmp_path, caplog
+    ):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_READY_LOG_LINES)
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+        state = _b1_ready_state(
+            permit_issued_seen_expires_at_ns=_FAR_FUTURE_EXPIRES_AT_NS,
+            first_boot_permit_expires_at_ns=_FAR_FUTURE_EXPIRES_AT_NS,
+        )
+        common = _b1_common_kwargs(tmp_path)
+
+        with caplog.at_level("INFO"):
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=_utc(17, 10), tracked_pid=1001,
+                node_log=node_log, handler_read_log=False, **common,
+            )
+            close = _utc(1, 0, day=_DAY + dt.timedelta(days=1))
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=close, tracked_pid=1001,
+                node_log=node_log, handler_read_log=False, **common,
+            )
+            # A poll after close is a no-op -- nothing further logged.
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=close + dt.timedelta(minutes=1), tracked_pid=1001,
+                node_log=node_log, handler_read_log=False, **common,
+            )
+
+        assert sink.payloads == []
+        gap_lines = [r for r in caplog.records if "permit_accepted_gap" in r.getMessage()]
+        assert len(gap_lines) == 1
+        assert state.permit_gap_info_logged is True
+
+    # -- AC2 -----------------------------------------------------------
+    def test_in_window_lapse_pages_critical_then_heartbeats_until_close(self, tmp_path, caplog):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        lapse_ns = int(_utc(22, 0).timestamp() * 1e9)
+        state = _b1_ready_state(
+            permit_issued_seen_expires_at_ns=lapse_ns, first_boot_permit_expires_at_ns=lapse_ns
+        )
+        common = _b1_common_kwargs(tmp_path)
+
+        with caplog.at_level("INFO"):
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=_utc(22, 0), tracked_pid=1001, node_log=node_log,
+                handler_read_log=True, **common,
+            )
+            assert [p.detail for p in sink.payloads] == [
+                AlertDetail.PERMIT_LAPSED_IN_DECISION_WINDOW.value
+            ]
+
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=_utc(22, 30), tracked_pid=1001, node_log=node_log,
+                handler_read_log=True, **common,
+            )
+            assert len(sink.payloads) == 1  # too soon for the heartbeat
+
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=_utc(23, 0), tracked_pid=1001, node_log=node_log,
+                handler_read_log=True, **common,
+            )
+            assert len(sink.payloads) == 2
+
+            close = _utc(1, 0, day=_DAY + dt.timedelta(days=1))
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=close, tracked_pid=1001, node_log=node_log,
+                handler_read_log=True, **common,
+            )
+
+        assert len(sink.payloads) == 3
+        assert state.permit_gap_info_logged is True
+        gap_lines = [r for r in caplog.records if "permit_accepted_gap" in r.getMessage()]
+        assert len(gap_lines) == 1
+
+    # -- AC3 -----------------------------------------------------------
+    def test_lapse_pages_with_midday_alert_sent_latched(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        lapse_ns = int(_utc(22, 0).timestamp() * 1e9)
+        state = _b1_ready_state(
+            permit_issued_seen_expires_at_ns=lapse_ns,
+            first_boot_permit_expires_at_ns=lapse_ns,
+            midday_alert_sent=True,
+        )
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(22, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **_b1_common_kwargs(tmp_path),
+        )
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_LAPSED_IN_DECISION_WINDOW.value
+        ]
+
+    def test_lapse_pages_with_ceiling_unknown_latched(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        lapse_ns = int(_utc(22, 0).timestamp() * 1e9)
+        state = _b1_ready_state(
+            permit_issued_seen_expires_at_ns=lapse_ns,
+            first_boot_permit_expires_at_ns=lapse_ns,
+            midday_ceiling_unknown_alert_sent=True,
+        )
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(22, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **_b1_common_kwargs(tmp_path),
+        )
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_LAPSED_IN_DECISION_WINDOW.value
+        ]
+
+    # -- AC7 -----------------------------------------------------------
+    def test_ceiling_unknown_dead_child_promotes_deferred_to_no_node(self, tmp_path):
+        sink = _RecordingAlertSink()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            find_node_pid=lambda: None,
+            resolve_intent_lock_holder=lambda _p: None,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        state = _b1_ready_state(midday_ceiling_unknown_alert_sent=True)
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(20, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **_b1_common_kwargs(tmp_path),
+        )
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_NO_NODE_IN_DECISION_WINDOW.value
+        ]
+
+    def test_deterministic_decline_without_alert_is_bounded_to_no_node(self, tmp_path):
+        sink = _RecordingAlertSink()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            find_node_pid=lambda: None,
+            resolve_intent_lock_holder=lambda _p: None,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        state = _b1_ready_state()  # budget nominally live -- no latches set
+        common = _b1_common_kwargs(tmp_path)
+        t0 = _utc(20, 0)
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=t0, tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **common,
+        )
+        assert sink.payloads == []
+        assert state.permit_deferred_since == t0
+
+        t1 = t0 + PERMIT_DEFERRED_MAX + dt.timedelta(minutes=1)
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=t1, tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **common,
+        )
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_NO_NODE_IN_DECISION_WINDOW.value
+        ]
+
+    # -- AC4 -----------------------------------------------------------
+    def test_adopted_child_without_log_pages_unverifiable(self, tmp_path):
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            find_node_pid=lambda: 777,
+            resolve_intent_lock_holder=lambda _p: 777,
+            process_alive=lambda pid: pid == 777,
+            find_adopted_log=lambda _log_dir, _pid: None,
+            alert_sink=sink,
+        )
+        state = _b1_ready_state()
+        _, node_log_out, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(20, 0), tracked_pid=None, node_log=None,
+            handler_read_log=False, **_b1_common_kwargs(tmp_path),
+        )
+        assert node_log_out is None
+        assert [p.detail for p in sink.payloads] == [AlertDetail.PERMIT_UNVERIFIABLE.value]
+
+    # -- AC5 -----------------------------------------------------------
+    def test_self_check_permit_fail_suppresses_b1_first_page_until_heartbeat(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("CurrentRungHoldStrategy subscribed X\n")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: 1001,
+            count_intent_lock_holders=lambda _p: 1,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+        common = _b1_common_kwargs(tmp_path)
+        state = initial_scheduler_state(_DAY)
+        tracked_pid, node_log_out, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            tracked_pid=1001,
+            node_log=node_log,
+            state=state,
+            **common,
+        )
+        assert state.permit_alert_last_sent_at == _utc(17, 5)
+        baseline = len(sink.payloads)
+        assert baseline >= 1
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 0), tracked_pid=tracked_pid,
+            node_log=node_log_out, handler_read_log=False, **common,
+        )
+        assert len(sink.payloads) == baseline  # still suppressed
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 5, 1), tracked_pid=tracked_pid,
+            node_log=node_log_out, handler_read_log=False, **common,
+        )
+        assert len(sink.payloads) == baseline + 1
+
+    # -- AC6 -----------------------------------------------------------
+    def test_shadow_by_design_node_warns_once_per_day(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(PERMIT_NOT_REQUESTED_MARKER + "\n")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+        state = _b1_ready_state()
+        common = _b1_common_kwargs(tmp_path)
+
+        _, node_log_out, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(17, 10), tracked_pid=1001, node_log=node_log,
+            handler_read_log=False, **common,
+        )
+        assert [p.detail for p in sink.payloads] == [AlertDetail.PERMIT_NOT_REQUIRED_SHADOW.value]
+        assert [p.severity for p in sink.payloads] == ["WARN"]
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(20, 0), tracked_pid=1001, node_log=node_log_out,
+            handler_read_log=False, **common,
+        )
+        assert len(sink.payloads) == 1
+
+    # -- AC8 -----------------------------------------------------------
+    def test_permit_watch_never_spawns_terminates_or_writes_store(self, tmp_path):
+        spawner = FakeSpawner()
+        terminate_calls: list[int] = []
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        ports = _make_ports(
+            spawn=spawner,
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+            process_alive=lambda _pid: False,
+            find_node_pid=lambda: None,
+            resolve_intent_lock_holder=lambda _p: None,
+            read_log_new=lambda _p: "",
+        )
+        state = _b1_ready_state()
+        common = _b1_common_kwargs(tmp_path)
+        for hour in (17, 18, 20, 23):
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=_utc(hour, 30), tracked_pid=1001, node_log=node_log,
+                handler_read_log=True, **common,
+            )
+        assert spawner.calls == []
+        assert terminate_calls == []
+        assert not (tmp_path / "state" / "store.sqlite3").exists()
+
+    # -- AC11 (loop-level) ----------------------------------------------
+    def test_b1_adopted_child_is_sigtermed_by_next_stop_prior(self, tmp_path):
+        clock = FakeClock(_utc(20, 0))
+        terminate_calls: list[int] = []
+        ports = _make_ports(
+            find_node_pid=lambda: 555,
+            resolve_intent_lock_holder=lambda _p: 555,
+            process_alive=lambda pid: pid == 555,
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+            read_log_new=lambda _p: "",
+        )
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=1300,
+        )
+        assert terminate_calls == [555]
+
+    def test_restart_mid_window_b1_adopts_once_and_midday_spawn_same_poll_is_not_readopted(
+        self, tmp_path
+    ):
+        find_calls: list[int] = []
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        ports = _make_ports(
+            find_node_pid=lambda: (find_calls.append(1), 9999)[1],
+            resolve_intent_lock_holder=lambda _p: 9999,
+            process_alive=lambda pid: pid == 5001,
+            read_log_new=lambda _p: "",
+        )
+        state = _b1_ready_state()
+        tracked_pid, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(20, 0), tracked_pid=5001, node_log=node_log,
+            handler_read_log=True, **_b1_common_kwargs(tmp_path),
+        )
+        assert tracked_pid == 5001
+        assert find_calls == []  # never attempted -- 5001 was already alive
+
+    # -- AC12 ------------------------------------------------------------
+    def test_lapse_between_last_poll_and_close_pages_once_before_gap_info(self, tmp_path, caplog):
+        close = _utc(1, 0, day=_DAY + dt.timedelta(days=1))
+        lapse_at_ns = int((close - dt.timedelta(seconds=30)).timestamp() * 1e9)
+        sink = _RecordingAlertSink()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        state = _b1_ready_state(
+            permit_issued_seen_expires_at_ns=lapse_at_ns,
+            first_boot_permit_expires_at_ns=lapse_at_ns,
+        )
+        common = _b1_common_kwargs(tmp_path)
+
+        poll1 = close - dt.timedelta(minutes=1)
+        tracked_pid, node_log_out, state = _do_permit_watch(
+            ports=ports, state=state, now=poll1, tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **common,
+        )
+        assert sink.payloads == []
+
+        poll2 = close + dt.timedelta(seconds=5)
+        with caplog.at_level("INFO"):
+            _, _, state = _do_permit_watch(
+                ports=ports, state=state, now=poll2, tracked_pid=tracked_pid, node_log=node_log_out,
+                handler_read_log=True, **common,
+            )
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_LAPSED_IN_DECISION_WINDOW.value
+        ]
+        gap_lines = [r for r in caplog.records if "permit_accepted_gap" in r.getMessage()]
+        assert len(gap_lines) == 1
+
+    # -- AC13 --------------------------------------------------------
+    def test_persistent_permit_watch_exception_alerts_once_then_heartbeats(self, tmp_path):
+        sink = _RecordingAlertSink()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+
+        def _boom(_p):
+            raise RuntimeError("synthetic read failure")
+
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=_boom, alert_sink=sink)
+        state = _b1_ready_state()
+        common = _b1_common_kwargs(tmp_path)
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=False, **common,
+        )
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_WATCH_EXCEPTION_CONTAINED.value
+        ]
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 30), tracked_pid=1001, node_log=node_log,
+            handler_read_log=False, **common,
+        )
+        assert len(sink.payloads) == 1
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(19, 0, 1), tracked_pid=1001, node_log=node_log,
+            handler_read_log=False, **common,
+        )
+        assert len(sink.payloads) == 2
+
+    def test_permit_watch_exception_log_line_is_distinct_from_phase_exception(
+        self, tmp_path, caplog
+    ):
+        def _boom(_p):
+            raise RuntimeError("boom")
+
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=_boom)
+        state = _b1_ready_state()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        with caplog.at_level("INFO"):
+            _do_permit_watch(
+                ports=ports, state=state, now=_utc(18, 0), tracked_pid=1001, node_log=node_log,
+                handler_read_log=False, **_b1_common_kwargs(tmp_path),
+            )
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("permit_watch_exception_contained" in m for m in messages)
+        assert not any(m.startswith("phase_exception_contained") for m in messages)
+
+    def test_permit_watch_does_not_drain_log_when_midday_watch_read_it(self, tmp_path):
+        read_calls: list[Path] = []
+
+        def _track(p: Path) -> str:
+            read_calls.append(p)
+            return ""
+
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=_track)
+        state = _b1_ready_state()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **_b1_common_kwargs(tmp_path),
+        )
+        assert read_calls == []
+
+    def test_fatal_marker_drained_by_permit_watch_still_classifies_midday_cause(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("trading node failed\n")
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=lambda p: p.read_text())
+        state = _b1_ready_state()
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=False, **_b1_common_kwargs(tmp_path),
+        )
+        assert state.midday_cause_seen == RelaunchCause.TRANSIENT
+
+    def test_permit_not_requested_marker_is_a_substring_of_the_real_emitter(self):
+        source = (REPO_ROOT / "src" / "breezy" / "app" / "trade.py").read_text()
+        assert PERMIT_NOT_REQUESTED_MARKER in source
+
+    def test_supervisor_modules_never_reference_the_permit_issuer_or_ttl(self):
+        # [AC9] Comment lines are excluded -- a PRE-EXISTING (A-1) prose
+        # comment mentions "+PERMIT_TTL_NS" descriptively; the invariant this
+        # test pins is that B1's own CODE never imports or names the mint
+        # site/its TTL constant, not that the word never appears in prose.
+        for name in ("trade_supervisor.py", "trade_supervisor_core.py"):
+            source = (REPO_ROOT / "src" / "breezy" / "runtime" / name).read_text()
+            code_text = "\n".join(
+                line for line in source.splitlines() if not line.strip().startswith("#")
+            )
+            assert "issue_live_trading_permit" not in code_text
+            assert "PERMIT_TTL_NS" not in code_text
+
+    # -- silent-failure-review A2 -------------------------------------
+    def test_a_failed_alert_send_is_retried_next_poll_and_the_latch_is_not_set(self, tmp_path):
+        class _FailOnceThenRecordSink:
+            def __init__(self) -> None:
+                self.payloads: list = []
+                self._fail_next = True
+
+            def emit(self, payload) -> None:
+                if self._fail_next:
+                    self._fail_next = False
+                    raise RuntimeError("synthetic webhook failure")
+                self.payloads.append(payload)
+
+        sink = _FailOnceThenRecordSink()
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: "",
+            alert_sink=sink,
+        )
+        state = _b1_ready_state()
+        common = _b1_common_kwargs(tmp_path)
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 0), tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **common,
+        )
+        assert state.permit_alert_last_sent_at is None
+        assert sink.payloads == []
+
+        _, _, state = _do_permit_watch(
+            ports=ports, state=state, now=_utc(18, 0, 30), tracked_pid=1001, node_log=node_log,
+            handler_read_log=True, **common,
+        )
+        assert len(sink.payloads) == 1
+        assert state.permit_alert_last_sent_at == _utc(18, 0, 30)
+
+    def test_an_exception_escaping_do_permit_watch_does_not_stop_the_loop(
+        self, tmp_path, monkeypatch
+    ):
+        import breezy.runtime.trade_supervisor as ts_module
+
+        def _always_raise(**_kw):
+            raise RuntimeError("synthetic B1 failure escaping its own containment")
+
+        monkeypatch.setattr(ts_module, "_do_permit_watch", _always_raise)
+
+        clock = FakeClock(_utc(16, 39, 0))
+        terminate_calls: list[int] = []
+        ports = _make_ports(
+            find_node_pid=lambda: 42,
+            resolve_intent_lock_holder=lambda _p: 42,
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+        )
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=30,
+        )
+        assert terminate_calls == [42]

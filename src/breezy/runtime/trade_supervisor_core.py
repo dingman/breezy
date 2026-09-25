@@ -90,6 +90,30 @@ TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
 #: 10 h window per relaunch. Never set for the 16:50Z daily boot spawn.
 PERMIT_EXPIRY_CEILING_NS_ENV_VAR: Final[str] = "BREEZY_PERMIT_EXPIRY_CEILING_NS"
 
+#: [B1, 2026-09-25] The supervisor-side permit-lapse watch's own window --
+#: opens the instant SELF_CHECK's catch-up window closes (17:10 UTC), so the
+#: two windows never overlap, and closes at the same 01:00 UTC instant
+#: MIDDAY_WATCH's own window does (see :func:`midday_watch_window_end`).
+#: Both endpoints are shared with existing constants deliberately -- B1 is
+#: never the owner of a THIRD independent schedule boundary.
+B1_WINDOW_OPEN_UTC: Final[dt.time] = SELF_CHECK_WINDOW_END_UTC
+
+#: [B1] At most one CRITICAL page per bad capability per hour -- a change to
+#: a DIFFERENT bad capability still emits immediately (D5).
+PERMIT_ALERT_HEARTBEAT: Final[dt.timedelta] = dt.timedelta(minutes=60)
+
+#: [B1] DEFERRED (no live child with the mid-day budget still live, or a
+#: fresh mid-day child within its boot grace) that persists longer than this
+#: is promoted to NO_NODE -- 3 mid-day relaunch attempts x 5 min gap + 2 min
+#: recheck, rounded up (D3).
+PERMIT_DEFERRED_MAX: Final[dt.timedelta] = dt.timedelta(minutes=20)
+
+#: [B1/D9] Verified emitter: ``app/trade.py``'s ``settings is not None and
+#: not orders_enabled_requested`` branch. Never collides with
+#: ``PERMIT_NOT_ISSUED_MARKER`` ("...not issued") -- this one says "not
+#: minted: orders not requested".
+PERMIT_NOT_REQUESTED_MARKER: Final[str] = "order submission permit not minted: orders not requested"
+
 #: WP-11b (active-family registry, cardinality-1): the WP-0a two-prefix
 #: stopgap is replaced by a ``composition_kind`` -> subscribe-marker
 #: mapping, pinned against each strategy class's own name the same way the
@@ -252,6 +276,18 @@ class AlertDetail(str, Enum):
     SELF_CHECK_ESCALATION_STATE_CORRUPT = "self_check_escalation_state_corrupt"
     SELF_CHECK_ESCALATION_STORE_UNAVAILABLE = "self_check_escalation_store_unavailable"
     SELF_CHECK_ESCALATION_STATE_WRITE_FAILED = "self_check_escalation_state_write_failed"
+    #: [B1, 2026-09-25] The supervisor-side permit-lapse watch's own alert
+    #: details -- each names exactly one :class:`PermitCapability` (or, for
+    #: ``PERMIT_WATCH_EXCEPTION_CONTAINED``, B1's own contained fault).
+    PERMIT_LAPSED_IN_DECISION_WINDOW = "permit_lapsed_in_decision_window"
+    PERMIT_EXPIRED_AT_DAILY_CEILING_IN_DECISION_WINDOW = (
+        "permit_expired_at_daily_ceiling_in_decision_window"
+    )
+    PERMIT_ABSENT_IN_DECISION_WINDOW = "permit_absent_in_decision_window"
+    PERMIT_NO_NODE_IN_DECISION_WINDOW = "permit_no_node_in_decision_window"
+    PERMIT_UNVERIFIABLE = "permit_unverifiable"
+    PERMIT_WATCH_EXCEPTION_CONTAINED = "permit_watch_exception_contained"
+    PERMIT_NOT_REQUIRED_SHADOW = "permit_not_required_shadow"
 
 
 class StopPriorAction(str, Enum):
@@ -894,6 +930,27 @@ class DaySchedulerState:
     #: ``midday_alert_sent``. A day-level gate, not per-child: NOT cleared
     #: by :func:`record_child_adopted`.
     midday_ceiling_unknown_alert_sent: bool = False
+    #: [B1, 2026-09-25] Day-level heartbeat latches for the permit-lapse
+    #: watch's own alerting (D5) -- reset only by :func:`_for_day`, never by
+    #: :func:`record_child_adopted`, never gated by ``midday_alert_sent``.
+    permit_alert_last_sent_at: dt.datetime | None = None
+    #: The :class:`PermitCapability` value (a string) B1 last alerted on --
+    #: ``None`` means B1 has never alerted today.
+    permit_alert_last_capability: str | None = None
+    #: [B1] Set on first entering DEFERRED, cleared only by a VALID or
+    #: NOT_REQUIRED observation (or the day rollover) -- an interstitial
+    #: UNKNOWN/other bad capability does NOT reset it (silent-failure-review
+    #: amendment A1).
+    permit_deferred_since: dt.datetime | None = None
+    #: [B1] Gates the one ``permit_accepted_gap`` INFO line to once per
+    #: trading day.
+    permit_gap_info_logged: bool = False
+    #: [B1] Gates the ``PERMIT_NOT_REQUIRED_SHADOW`` WARN to once per day.
+    permit_not_required_warned: bool = False
+    #: [B1] Per-child latch for :data:`PERMIT_NOT_REQUESTED_MARKER` -- reset
+    #: by :func:`record_child_adopted` for a new child, same as every other
+    #: per-child evidence latch above.
+    orders_not_requested_seen: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -1030,6 +1087,7 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
         midday_cause_seen=None,
         midday_not_ready_alert_sent=False,
         midday_readiness_recheck_done=False,
+        orders_not_requested_seen=False,
     )
 
 
@@ -1206,3 +1264,316 @@ def decide_midday_relaunch(
     if last_attempt_at is not None and (now - last_attempt_at) < MIDDAY_MIN_RELAUNCH_GAP:
         return RelaunchDecision(False, "minimum inter-attempt gap not elapsed")
     return RelaunchDecision(True, "transient failure, within budget and window")
+
+
+# ---------------------------------------------------------------------------
+# [B1, 2026-09-25] Supervisor-side permit-lapse detector -- pure decision
+# rules. See ``docs/plans`` B1 Rev 2 plan for the full design (D1-D9). The
+# I/O shell (``_do_permit_watch`` in ``trade_supervisor.py``) resolves real
+# inputs (process liveness, log deltas, adoption) and calls into these.
+# ---------------------------------------------------------------------------
+
+
+class PermitCapability(str, Enum):
+    """[B1/D2] The permit-lapse watch's own closed-set classification of
+    "can this trading day still submit orders right now", evaluated once per
+    poll inside :data:`B1_WINDOW_OPEN_UTC`--``midday_watch_window_end``."""
+
+    UNKNOWN = "unknown"
+    VALID = "valid"
+    LAPSED = "lapsed"
+    EXPIRED_AT_CEILING = "expired_at_ceiling"
+    NOT_REQUIRED = "not_required"
+    DEFERRED = "deferred"
+    ABSENT = "absent"
+    NO_NODE = "no_node"
+    #: [D8] Fed into :func:`decide_permit_alert` when B1's own evaluation
+    #: raised -- never returned by :func:`permit_capability_valid` itself.
+    WATCH_FAILED = "watch_failed"
+
+
+def permit_watch_window(trading_day: dt.date) -> tuple[dt.datetime, dt.datetime]:
+    """[B1/D2] The watch's own window: ``[B1_WINDOW_OPEN_UTC`` on
+    ``trading_day``, ``midday_watch_window_end(trading_day))`` -- identical
+    bounds to MIDDAY_WATCH's own window, by design (D1: never a third
+    independent schedule boundary)."""
+    return _at(trading_day, B1_WINDOW_OPEN_UTC), midday_watch_window_end(trading_day)
+
+
+def midday_budget_live(
+    *,
+    launch_done: bool,
+    readiness_observed: bool,
+    midday_watch_window_open: bool,
+    midday_alert_sent: bool,
+    midday_ceiling_unknown_alert_sent: bool,
+    midday_relaunch_attempts: int,
+) -> bool:
+    """[B1/D3] True only when a mid-day relaunch remains a live possibility
+    for the CURRENT dead child -- every one of MIDDAY_WATCH's own
+    preconditions plus neither of its two day-level exhaustion latches plus
+    budget remaining. Used ONLY to decide DEFERRED-vs-NO_NODE (D2 row 5a);
+    never consulted for B1's own alerting, which reacts to a genuine
+    permit-expiry latch regardless of this value (AC3)."""
+    return (
+        launch_done
+        and readiness_observed
+        and midday_watch_window_open
+        and not midday_alert_sent
+        and not midday_ceiling_unknown_alert_sent
+        and midday_relaunch_attempts < MIDDAY_MAX_RELAUNCH_ATTEMPTS
+    )
+
+
+def permit_capability_valid(
+    state: DaySchedulerState,
+    now_ns: int,
+    *,
+    child_alive: bool,
+    log_available: bool,
+    midday_budget_live: bool,
+) -> PermitCapability:
+    """[B1/D2/D2a/D3] The capability table, evaluated in the documented
+    order. Never returns :attr:`PermitCapability.WATCH_FAILED` -- that value
+    is fed directly into :func:`decide_permit_alert` by the I/O shell's own
+    exception containment (D8), never derived here."""
+    if child_alive and not log_available:
+        return PermitCapability.UNKNOWN
+
+    latched_expiry_ns = state.permit_issued_seen_expires_at_ns
+    if latched_expiry_ns is not None:
+        if latched_expiry_ns > now_ns:
+            return PermitCapability.VALID
+        if (
+            latched_expiry_ns == state.first_boot_permit_expires_at_ns
+            and (state.relaunch_attempts + state.midday_relaunch_attempts) > 0
+        ):
+            return PermitCapability.EXPIRED_AT_CEILING
+        return PermitCapability.LAPSED
+
+    if state.orders_not_requested_seen:
+        return PermitCapability.NOT_REQUIRED
+
+    if not child_alive:
+        deferred_candidate = midday_budget_live
+    else:
+        # [silent-failure-review A1] The boot grace applies ONLY to a
+        # midday-relaunched child -- a never-relaunched (16:50Z) first boot
+        # with no permit line has no ``last_midday_relaunch_attempt_at`` at
+        # all and must resolve to ABSENT, never a silent, unbounded DEFERRED.
+        last_midday_attempt = state.last_midday_relaunch_attempt_at
+        if last_midday_attempt is None:
+            deferred_candidate = False
+        else:
+            grace_ns = int(MIDDAY_READINESS_RECHECK_TIMEOUT.total_seconds() * 1e9)
+            attempt_ns = int(last_midday_attempt.timestamp() * 1e9)
+            deferred_candidate = (now_ns - attempt_ns) < grace_ns
+
+    if deferred_candidate:
+        if state.permit_deferred_since is not None:
+            since_ns = int(state.permit_deferred_since.timestamp() * 1e9)
+            deferred_max_ns = int(PERMIT_DEFERRED_MAX.total_seconds() * 1e9)
+            if now_ns - since_ns > deferred_max_ns:
+                return PermitCapability.NO_NODE
+        return PermitCapability.DEFERRED
+
+    if not child_alive:
+        return PermitCapability.NO_NODE
+    # [D2a] Alive, log readable (checked at the top), no permit latch, no
+    # not-required marker, past the boot grace -- ABSENT, never UNKNOWN.
+    return PermitCapability.ABSENT
+
+
+class PermitAlertAction(str, Enum):
+    """[B1] What :func:`decide_permit_alert` wants the I/O shell to do."""
+
+    NONE = "none"
+    ALERT = "alert"
+    #: Bad -> VALID transition -- one INFO log line, never an ``alert()``
+    #: call (there is no operator-facing severity for "it recovered").
+    RESTORED = "restored"
+
+
+@dataclass(frozen=True, slots=True)
+class PermitAlertDecision:
+    action: PermitAlertAction
+    severity: str | None = None
+    event: str | None = None
+    detail: AlertDetail | None = None
+
+
+#: Every :class:`PermitCapability` that is a genuine fault, mapped to its
+#: fixed :class:`AlertDetail`. ``VALID``, ``NOT_REQUIRED`` and ``DEFERRED``
+#: are deliberately absent -- each has its own bespoke handling below.
+_PERMIT_ALERT_DETAIL: Final[dict[PermitCapability, AlertDetail]] = {
+    PermitCapability.LAPSED: AlertDetail.PERMIT_LAPSED_IN_DECISION_WINDOW,
+    PermitCapability.EXPIRED_AT_CEILING: (
+        AlertDetail.PERMIT_EXPIRED_AT_DAILY_CEILING_IN_DECISION_WINDOW
+    ),
+    PermitCapability.ABSENT: AlertDetail.PERMIT_ABSENT_IN_DECISION_WINDOW,
+    PermitCapability.NO_NODE: AlertDetail.PERMIT_NO_NODE_IN_DECISION_WINDOW,
+    PermitCapability.UNKNOWN: AlertDetail.PERMIT_UNVERIFIABLE,
+    PermitCapability.WATCH_FAILED: AlertDetail.PERMIT_WATCH_EXCEPTION_CONTAINED,
+}
+_BAD_CAPABILITY_VALUES: Final[frozenset[str]] = frozenset(
+    capability.value for capability in _PERMIT_ALERT_DETAIL
+)
+
+
+def decide_permit_alert(
+    *,
+    capability: PermitCapability,
+    now: dt.datetime,
+    last_sent_at: dt.datetime | None,
+    last_capability: str | None,
+    not_required_warned: bool,
+) -> PermitAlertDecision:
+    """[B1/D5] The heartbeat/change/once-per-day decision, pure. ``changed``
+    is deliberately ``False`` on a true first observation (``last_capability
+    is None``) -- that case alerts because ``heartbeat_elapsed`` is True
+    when nothing has ever been sent, not because it "changed". This is what
+    lets :func:`seed_permit_alert` (which sets only ``last_sent_at``, never
+    ``last_capability``) suppress B1's own first page for the SAME
+    underlying fault another handler already alerted on, while a genuine
+    capability CHANGE still bypasses the heartbeat (AC5 vs "a change to a
+    different bad capability emits immediately")."""
+    if capability is PermitCapability.NOT_REQUIRED:
+        if not_required_warned:
+            return PermitAlertDecision(action=PermitAlertAction.NONE)
+        return PermitAlertDecision(
+            action=PermitAlertAction.ALERT,
+            severity="WARN",
+            event="TRADE_SUPERVISOR_PERMIT_NOT_REQUIRED",
+            detail=AlertDetail.PERMIT_NOT_REQUIRED_SHADOW,
+        )
+    if capability is PermitCapability.DEFERRED:
+        return PermitAlertDecision(action=PermitAlertAction.NONE)
+    if capability is PermitCapability.VALID:
+        if last_capability is not None and last_capability in _BAD_CAPABILITY_VALUES:
+            return PermitAlertDecision(action=PermitAlertAction.RESTORED)
+        return PermitAlertDecision(action=PermitAlertAction.NONE)
+    if capability.value in _BAD_CAPABILITY_VALUES:
+        changed = last_capability is not None and last_capability != capability.value
+        heartbeat_elapsed = last_sent_at is None or (now - last_sent_at) >= PERMIT_ALERT_HEARTBEAT
+        if changed or heartbeat_elapsed:
+            return PermitAlertDecision(
+                action=PermitAlertAction.ALERT,
+                severity="CRITICAL",
+                event="TRADE_SUPERVISOR_PERMIT_WATCH",
+                detail=_PERMIT_ALERT_DETAIL[capability],
+            )
+        return PermitAlertDecision(action=PermitAlertAction.NONE)
+    # [silent-failure-hunter/python-reviewer review] An unmapped capability
+    # must fail loudly, never silently resolve to NONE -- a future
+    # PermitCapability member added without a matching `_PERMIT_ALERT_DETAIL`
+    # entry (or `VALID`/`DEFERRED`/`NOT_REQUIRED` handling above) would
+    # otherwise be swallowed here forever. D8's own containment
+    # (`_do_permit_watch`) turns this into a CRITICAL `WATCH_FAILED` page,
+    # never silence.
+    raise AssertionError(f"unmapped PermitCapability {capability!r}")
+
+
+def latch_log_facts(
+    state: DaySchedulerState, now_utc: dt.datetime, log_text: str
+) -> DaySchedulerState:
+    """[B1/D6] Pure projection of an already-read log-reader delta onto
+    every latch the three existing handlers' own inline logic would set
+    from the same text: strategy-subscribed, permit-issued (+ the
+    first-boot anchor), the first non-``UNKNOWN`` exit-1 cause, and the
+    orders-not-requested marker. Used ONLY by B1, and ONLY on a drain the
+    dispatched handler itself did not perform (D6) -- the handlers' own
+    inline latching is untouched (FU-1 migrates them onto this helper
+    later)."""
+    if strategy_subscribed_in(log_text):
+        state = record_strategy_subscribed_seen(state, now_utc)
+    permit_expiry_ns = parse_permit_expiry_ns(log_text)
+    if permit_expiry_ns is not None:
+        state = record_permit_issued_seen(state, now_utc, permit_expiry_ns)
+        state = record_first_boot_permit_seen(state, now_utc, permit_expiry_ns)
+    cause = classify_exit1_cause(log_text)
+    if cause is not RelaunchCause.UNKNOWN:
+        state = record_midday_cause_seen(state, now_utc, cause)
+    if PERMIT_NOT_REQUESTED_MARKER in log_text:
+        state = record_orders_not_requested_seen(state, now_utc)
+    return state
+
+
+def record_orders_not_requested_seen(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[B1/D9] First-seen-wins per-child latch for
+    :data:`PERMIT_NOT_REQUESTED_MARKER`. Cleared by
+    :func:`record_child_adopted` for the next child."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.orders_not_requested_seen:
+        return effective
+    return replace(effective, orders_not_requested_seen=True)
+
+
+def record_permit_deferred_since(
+    state: DaySchedulerState, now_utc: dt.datetime, *, capability: PermitCapability
+) -> DaySchedulerState:
+    """[B1/D3, silent-failure-review A1] Set on first entering DEFERRED;
+    cleared ONLY by a VALID or NOT_REQUIRED observation, never by an
+    interstitial UNKNOWN/LAPSED/ABSENT/NO_NODE -- so a DEFERRED -> UNKNOWN
+    -> DEFERRED flicker still promotes to NO_NODE 20 minutes from the FIRST
+    observation, never resets."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if capability is PermitCapability.DEFERRED:
+        if effective.permit_deferred_since is not None:
+            return effective
+        return replace(effective, permit_deferred_since=now_utc)
+    if capability in (PermitCapability.VALID, PermitCapability.NOT_REQUIRED):
+        if effective.permit_deferred_since is None:
+            return effective
+        return replace(effective, permit_deferred_since=None)
+    return effective
+
+
+def record_permit_not_required_warned(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[B1/D9] Gates the once-per-day WARN. Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.permit_not_required_warned:
+        return effective
+    return replace(effective, permit_not_required_warned=True)
+
+
+def record_permit_gap_info_logged(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[B1/D2] Gates the one ``permit_accepted_gap`` INFO line to once per
+    trading day. Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.permit_gap_info_logged:
+        return effective
+    return replace(effective, permit_gap_info_logged=True)
+
+
+def record_permit_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime, *, capability: PermitCapability
+) -> DaySchedulerState:
+    """[B1/D5] Latch the heartbeat timer and the last-alerted capability --
+    called by the shell only AFTER ``alert()`` returns successfully
+    (silent-failure-review A2), so a failed send is retried on the next
+    poll rather than silenced for a heartbeat. Also used, with
+    ``capability=PermitCapability.VALID``, to clear ``last_capability`` on a
+    RESTORED transition."""
+    effective = _for_day(state, _trading_day(now_utc))
+    return replace(
+        effective,
+        permit_alert_last_sent_at=now_utc,
+        permit_alert_last_capability=capability.value,
+    )
+
+
+def seed_permit_alert(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    """[B1/D5] Seed ONLY the heartbeat timer (never ``last_capability``) from
+    a FAIL/CRITICAL another handler (self-check, mid-day watch) already
+    alerted on this poll -- so B1's own first page for the SAME underlying
+    fault is suppressed until the heartbeat elapses (AC5), while a later
+    capability CHANGE observed by B1 itself still bypasses the heartbeat
+    (see :func:`decide_permit_alert`'s docstring)."""
+    effective = _for_day(state, _trading_day(now_utc))
+    return replace(effective, permit_alert_last_sent_at=now_utc)
