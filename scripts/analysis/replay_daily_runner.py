@@ -24,8 +24,13 @@ AUD-19b landed `--family-manifest` on
 With the flag available, every row's `engine_params_source` is
 `"FAMILY_MANIFEST"`, read back from the driver's own `family_params.json`
 provenance sidecar -- never `"DRIVER_DEFAULTS"` (that source only applied
-when the flag did not exist). B16/B20 are satisfied more strongly this way:
-`params_match` reflects the ENGINE's own readback, not an inference.
+when the flag did not exist). The sidecar is accepted only when its
+`argv_sha256` equals `argv_digest.argv_sha256` over the argument vector
+this runner actually passed (arguments after the script path, the same
+slice the driver hashes). A missing file or a mismatched digest is
+`BLOCKED` and the day stays queued. B16/B20 are satisfied more strongly
+this way: `params_match` reflects the ENGINE's own readback, not an
+inference.
 
 **AUD-09b fee-regime plan, Phase 1.** A day the engine ever refuses on
 `fee_schedule_mismatch` is recorded `BLOCKED`, never `COMPLETED`, its output
@@ -67,6 +72,8 @@ from pathlib import Path
 from typing import Final, Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from argv_digest import argv_sha256
 
 from breezy.analysis.replay_results import (
     FEE_SCHEDULE_MISMATCH_REFUSAL,
@@ -607,6 +614,12 @@ _BLOCKED_REMEDIATION: Final[dict[str, str]] = {
     "FEE_SCHEDULE_MISMATCH": (
         "tape instrument theta != family theta; recheck FEE_SCHEDULE_PIN table vs tape"
     ),
+    "FAMILY_PARAMS_SIDECAR_MISSING": (
+        "driver exited 0 with no family_params.json; re-run, do not default provenance"
+    ),
+    "FAMILY_PARAMS_ARGV_MISMATCH": (
+        "family_params.json argv_sha256 != the vector this runner passed"
+    ),
 }
 _DEFAULT_BLOCKED_REMEDIATION: Final[str] = "investigate the wrapper log for this reason"
 
@@ -786,24 +799,68 @@ def build_driver_argv(
 def classify_driver_failure(
     *, returncode: int, stderr: str
 ) -> tuple[Literal["BLOCKED", "FAILED"], str]:
-    """A non-zero driver exit is `BLOCKED` only for the well-known
-    family-manifest refusal codes and the Phase 3 fee-schedule preflight
-    (should not occur in practice -- the runner's own Phase 2 pre-selection
-    already excludes a mismatched day -- but classified rather than
-    silently mis-filed as a crash); everything else is `FAILED`, with the
-    exception type parsed from the LAST `...Error` name in stderr (a driver
-    crash prints an uncaught Python traceback -- base plan §9's
+    """Dispatch on the driver's exit code, never on its message (AUD-19 §6 E3).
+
+    `BLOCKED` only for the mapped refusal codes: family-manifest `2`/`3`
+    and the Phase 3 fee-schedule preflight `4` (should not occur in
+    practice -- the runner's own Phase 2 pre-selection already excludes a
+    mismatched day -- but classified rather than mis-filed as a crash).
+    Exit `1` is an uncaught driver exception: the exception type is the
+    LAST `...Error` name in stderr (base plan §9's
     `NoDecisionWindowCoverageError` / `EntryAskFromLatchMissingError` /
-    `ImpossibleFillPriceError` cases)."""
+    `ImpossibleFillPriceError`), or `UnknownDriverFailure` when stderr
+    names none. Every other code -- a signal (`-9`), `137`, or any future
+    code -- is `FAILED` with the literal `UNCLASSIFIED_DRIVER_EXIT_<returncode>`
+    and does not consult stderr. Exit `4` stays the fee-regime mapping;
+    AUD-19's table predates that code and does not reclassify it.
+    """
     if returncode == _EXIT_FAMILY_MANIFEST_REFUSED:
         return "BLOCKED", "FAMILY_MANIFEST_REFUSED"
     if returncode == _EXIT_FAMILY_MANIFEST_UNUSABLE:
         return "BLOCKED", "FAMILY_MANIFEST_UNUSABLE"
     if returncode == _EXIT_FEE_SCHEDULE_MISMATCH:
         return "BLOCKED", "FEE_SCHEDULE_MISMATCH"
+    if returncode != 1:
+        return "FAILED", f"UNCLASSIFIED_DRIVER_EXIT_{returncode}"
     matches = _EXCEPTION_NAME_RE.findall(stderr)
     exception_type = matches[-1] if matches else "UnknownDriverFailure"
     return "FAILED", exception_type
+
+
+def _resolved_driver_argv(argv: Sequence[str]) -> list[str]:
+    """Arguments after the driver script path.
+
+    That is the vector `current_rung_hold_paper_replay.main` hashes
+    (`resolved_argv` = `sys.argv[1:]`). `build_driver_argv` is
+    `[python, script, *flags]`, so this is `flags`, never the interpreter
+    or the script path -- hashing either would refuse every real sidecar.
+    """
+    for index, token in enumerate(argv):
+        if token.endswith("current_rung_hold_paper_replay.py"):
+            return list(argv[index + 1 :])
+    return list(argv)
+
+
+def _verified_family_params(
+    sidecar_path: Path, expected_argv_sha256: str,
+) -> tuple[dict[str, object] | None, str | None]:
+    """`(payload, None)` when the sidecar's `argv_sha256` matches, else
+    `(None, blocked_reason)`. A missing file and a digest that does not
+    match are different reasons; both are re-runnable provenance refusals.
+    An unreadable or non-object file cannot be verified, so it mismatches.
+    """
+    if not sidecar_path.is_file():
+        return None, "FAMILY_PARAMS_SIDECAR_MISSING"
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, "FAMILY_PARAMS_ARGV_MISMATCH"
+    if not isinstance(payload, dict):
+        return None, "FAMILY_PARAMS_ARGV_MISMATCH"
+    actual = payload.get("argv_sha256")
+    if not isinstance(actual, str) or actual != expected_argv_sha256:
+        return None, "FAMILY_PARAMS_ARGV_MISMATCH"
+    return payload, None
 
 
 class UnsupportedCompositionKindError(Exception):
@@ -1213,17 +1270,17 @@ def run_once(
     work_catalog = work_dir / "work_catalog"
     started = time.monotonic()
     rss_before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    driver_result = run_subprocess(
-        build_driver_argv(
-            python_executable=config.python_executable,
-            station=station, climate_day=climate_day,
-            tape_instance_id=target.winner_instance_id or "",
-            quote_catalog=config.quote_catalog, work_catalog=work_catalog,
-            asos_cache_csv=asos_csv, weather_catalog_root=config.weather_catalog_root,
-            output_dir=output_dir, family_manifest_path=config.family_manifest_path,
-            lag_minutes=config.lag_minutes,
-        )
+    driver_argv = build_driver_argv(
+        python_executable=config.python_executable,
+        station=station, climate_day=climate_day,
+        tape_instance_id=target.winner_instance_id or "",
+        quote_catalog=config.quote_catalog, work_catalog=work_catalog,
+        asos_cache_csv=asos_csv, weather_catalog_root=config.weather_catalog_root,
+        output_dir=output_dir, family_manifest_path=config.family_manifest_path,
+        lag_minutes=config.lag_minutes,
     )
+    expected_argv_sha256 = argv_sha256(_resolved_driver_argv(driver_argv))
+    driver_result = run_subprocess(driver_argv)
     wall_s = time.monotonic() - started
     rss_after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     peak_rss_bytes = max(0, (rss_after - rss_before)) * 1024
@@ -1249,9 +1306,17 @@ def run_once(
         return 1
 
     sidecar_path = output_dir / "family_params.json"
-    sidecar: dict[str, object] = {}
-    if sidecar_path.exists():
-        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar, sidecar_refusal = _verified_family_params(sidecar_path, expected_argv_sha256)
+    if sidecar is None:
+        reason = sidecar_refusal or "FAMILY_PARAMS_SIDECAR_MISSING"
+        record_blocked(
+            results_path=config.replay_results_path, station=station, climate_day=climate_day,
+            strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
+            sufficiency_reason=target.reason, census_schema_version=target.schema_version,
+            sink=active_sink, now_ts=now_ts,
+        )
+        print(f"BLOCKED {station} {climate_day} -- {reason}")
+        return 0
     manifest_taker_fee_coefficient = sidecar.get("manifest_taker_fee_coefficient")
     engine_required_fee_coefficient = sidecar.get("engine_required_fee_coefficient")
     scored = read_scored_trials(output_dir)
