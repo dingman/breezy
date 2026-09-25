@@ -39,6 +39,7 @@ import argparse
 import datetime as dt
 import gzip
 import json
+import logging
 import os
 import sqlite3
 from collections import Counter
@@ -57,6 +58,8 @@ from breezy.runtime.health import (
     resolve_alert_sink,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_HALT_KEY, decode_family_halt
+
+logger = logging.getLogger(__name__)
 
 _ENTRY_SOURCES: frozenset[str] = frozenset({"quote", "depth"})
 _SHADOW_SOURCES: frozenset[str] = frozenset({"no_side_shadow"})
@@ -419,7 +422,15 @@ def _capped_total_from_summary(tape_path: Path, climate_day: str) -> int:
             value = row.get("offer_tape_capped")
             if isinstance(value, int) and not isinstance(value, bool):
                 total += value
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        logger.warning(
+            "decision_funnel_daily_digest: diagnostics-summary sidecar %s is "
+            "corrupt or unreadable (%s: %s); truncated stays unreported for %s",
+            summary_path,
+            type(exc).__name__,
+            exc,
+            climate_day,
+        )
         return 0
     return total
 

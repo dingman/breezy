@@ -716,3 +716,35 @@ def test_truncated_flag_absent_when_no_summary_or_zero_capped(
 
     assert code == 0
     assert "truncated=1" not in sink.payloads[0].detail
+
+
+def test_corrupt_summary_warns_before_returning_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review fix 3: a corrupt/unreadable diagnostics-summary sidecar must
+    log a WARNING naming the file -- never fail the main funnel silently."""
+    import logging
+
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8")
+    summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+    summary.write_text('{"offer_tape_capped": not valid json\n', encoding="utf-8")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+
+    caplog.set_level(logging.WARNING, logger="decision_funnel_daily_digest")
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(tmp_path / "out"),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 0
+    assert "truncated=1" not in sink.payloads[0].detail
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(summary) in warnings[0].message

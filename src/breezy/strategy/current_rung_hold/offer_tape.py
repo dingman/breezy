@@ -52,11 +52,18 @@ DEFAULT_OFFER_TAPE_MAXLEN: Final[int] = 16384
 #: Sequencing) is expected to add further NO-side row volume that cannot yet
 #: be measured directly (no `nogap.py`-style count is possible before F-1a
 #: lands). Rather than pick an unmeasured multiplier, this pin uses the plan's
-#: own stated ceiling directly: 512 MiB, ~3.6x the current uncapped
-#: projection, comfortably covering F-1a's expected growth without exceeding
-#: the Rev-1-approved ceiling. Applies PER sidecar file (one per climate
-#: day), never across files. Revisit once a live day is measured with F-1a
-#: merged.
+#: own stated ceiling directly: 512 MiB.
+#:
+#: ACCEPTED DEVIATION FROM AC1: AC1 caps the pin at "at most 2x the projected
+#: peak day" (~141 MiB uncapped here, so at most ~282 MiB) unless the
+#: measurement itself justifies more. 512 MiB is ~3.6x that projection, not
+#: 2x -- accepted deliberately, specifically to cover F-1a's unmeasured
+#: NO-side growth, rather than ship a tighter figure known in advance to be
+#: too small. This is a stated, reviewed exception, not an oversight: it
+#: MUST be re-baselined to a real measured multiple once F-1a lands and a
+#: live day is measured with it running.
+#:
+#: Applies PER sidecar file (one per climate day), never across files.
 DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES: Final[int] = 512 * 1024 * 1024
 
 #: AC2 (F-3): the sidecar logs one WARN when a file crosses HALF its cap, in

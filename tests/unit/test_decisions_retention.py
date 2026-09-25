@@ -183,21 +183,26 @@ class TestBothPresentIdempotent:
     def test_both_present_all_readers_count_once(self, tmp_path: Path) -> None:
         """A crash between rename and unlink leaves BOTH files. The next
         retention run re-verifies the existing `.gz` and unlinks the
-        original -- it never re-writes a `.gz` that already verifies."""
+        original -- it never re-writes a `.gz` that already verifies (its
+        compressed CONTENT is untouched), and (review fix 2) its mtime ends
+        up matching the original's, never its own earlier write-time mtime."""
         old = tmp_path / "offer_tape_2026-09-01.jsonl"
         _touch_with_mtime(old, age_hours=24 * 10, content="a\nb\nc\n")
-        with gzip.open(tmp_path / "offer_tape_2026-09-01.jsonl.gz", "wt", encoding="utf-8") as h:
+        orig_mtime = old.stat().st_mtime
+        gz = tmp_path / "offer_tape_2026-09-01.jsonl.gz"
+        with gzip.open(gz, "wt", encoding="utf-8") as h:
             h.write("a\nb\nc\n")
-        gz_mtime_before = (tmp_path / "offer_tape_2026-09-01.jsonl.gz").stat().st_mtime
+        gz_bytes_before = gz.read_bytes()
 
         outcome = gzip_eligible_files(tmp_path, older_than_days=7, now=_NOW)
 
         assert outcome.gzipped == ("offer_tape_2026-09-01.jsonl",)
         assert not old.exists()
-        gz = tmp_path / "offer_tape_2026-09-01.jsonl.gz"
         assert gz.is_file()
         # The pre-existing .gz was re-verified, not re-written from scratch.
-        assert gz.stat().st_mtime == gz_mtime_before
+        assert gz.read_bytes() == gz_bytes_before
+        # ...but its mtime is now aligned to the original's (review fix 2).
+        assert gz.stat().st_mtime == orig_mtime
 
     def test_both_present_but_gz_does_not_verify_keeps_both(self, tmp_path: Path) -> None:
         old = tmp_path / "offer_tape_2026-09-01.jsonl"
@@ -210,6 +215,71 @@ class TestBothPresentIdempotent:
         assert outcome.failed == ("offer_tape_2026-09-01.jsonl",)
         assert old.is_file()
         assert (tmp_path / "offer_tape_2026-09-01.jsonl.gz").is_file()
+
+    def test_same_size_and_line_count_but_different_content_fails_verification(
+        self, tmp_path: Path
+    ) -> None:
+        """Review fix 1: byte-count/line-count equality alone cannot catch
+        bit-flip-shaped corruption -- a streamed sha256 does."""
+        old = tmp_path / "offer_tape_2026-09-01.jsonl"
+        _touch_with_mtime(old, age_hours=24 * 10, content="a\nb\nc\n")
+        # Same byte count (6) and same line count (3) as the original, but
+        # NOT the same bytes.
+        with gzip.open(tmp_path / "offer_tape_2026-09-01.jsonl.gz", "wt", encoding="utf-8") as h:
+            h.write("x\ny\nz\n")
+
+        outcome = gzip_eligible_files(tmp_path, older_than_days=7, now=_NOW)
+
+        assert outcome.failed == ("offer_tape_2026-09-01.jsonl",)
+        assert old.is_file()
+        assert old.read_text(encoding="utf-8") == "a\nb\nc\n"
+        assert (tmp_path / "offer_tape_2026-09-01.jsonl.gz").is_file()
+
+    def test_recovery_applies_original_mtime_before_unlinking(self, tmp_path: Path) -> None:
+        """Review fix 2: the idempotent recovery branch must apply the
+        ORIGINAL's mtime onto the pre-existing `.gz` -- a crash between
+        `os.replace` and `os.utime` in a prior run leaves the `.gz` with its
+        own write-time mtime, never the original's."""
+        old = tmp_path / "offer_tape_2026-09-01.jsonl"
+        _touch_with_mtime(old, age_hours=24 * 10, content="a\nb\nc\n")
+        orig_mtime = old.stat().st_mtime
+        gz = tmp_path / "offer_tape_2026-09-01.jsonl.gz"
+        with gzip.open(gz, "wt", encoding="utf-8") as h:
+            h.write("a\nb\nc\n")
+        write_time_mtime = (_NOW - dt.timedelta(hours=1)).timestamp()
+        os.utime(gz, (write_time_mtime, write_time_mtime))
+        assert gz.stat().st_mtime != orig_mtime
+
+        outcome = gzip_eligible_files(tmp_path, older_than_days=7, now=_NOW)
+
+        assert outcome.gzipped == ("offer_tape_2026-09-01.jsonl",)
+        assert not old.exists()
+        assert gz.stat().st_mtime == orig_mtime
+
+    def test_utime_failure_in_recovery_keeps_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review fix 2: if applying the original's mtime fails, the
+        original must NOT be unlinked -- utime happens strictly before
+        unlink in the recovery branch too."""
+        import decisions_retention as mod
+
+        old = tmp_path / "offer_tape_2026-09-01.jsonl"
+        _touch_with_mtime(old, age_hours=24 * 10, content="a\nb\nc\n")
+        gz = tmp_path / "offer_tape_2026-09-01.jsonl.gz"
+        with gzip.open(gz, "wt", encoding="utf-8") as h:
+            h.write("a\nb\nc\n")
+
+        def _boom_utime(target: object, times: object) -> None:
+            raise OSError("simulated utime failure")
+
+        monkeypatch.setattr(mod.os, "utime", _boom_utime)
+
+        outcome = gzip_eligible_files(tmp_path, older_than_days=7, now=_NOW)
+
+        assert outcome.failed == ("offer_tape_2026-09-01.jsonl",)
+        assert old.is_file()
+        assert gz.is_file()
 
 
 class TestExactNameMatchOnlyNoRecursion:

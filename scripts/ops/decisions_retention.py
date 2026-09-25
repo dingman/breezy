@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import gzip
+import hashlib
 import logging
 import os
 import re
@@ -120,13 +121,22 @@ def _candidate_jsonl_files(decisions_dir: Path) -> list[Path]:
     )
 
 
-def _line_and_byte_counts(
+def _content_fingerprint(
     opener: Callable[..., object], path: Path
-) -> tuple[int, int]:
-    """Streamed (bounded memory) byte and newline counts -- never loads the
-    whole file, so verification stays cheap even on a 512 MiB sidecar."""
+) -> tuple[int, int, str]:
+    """Streamed (bounded memory) byte count, newline count, and sha256 hex
+    digest -- never loads the whole file, so verification stays cheap even
+    on a 512 MiB sidecar.
+
+    Review fix 1: byte-count/line-count equality alone cannot catch
+    same-size, same-line-count content corruption (e.g. a bit flip, or a
+    gzip stream that decompresses to different bytes at the same shape) --
+    the sha256 digest is the actual content-equality check; the counts are
+    kept only as a cheap, human-readable diagnostic alongside it.
+    """
     lines = 0
     total_bytes = 0
+    hasher = hashlib.sha256()
     with opener(path, "rb") as handle:  # type: ignore[call-arg]
         while True:
             chunk = handle.read(_READ_CHUNK_BYTES)
@@ -134,19 +144,25 @@ def _line_and_byte_counts(
                 break
             total_bytes += len(chunk)
             lines += chunk.count(b"\n")
-    return lines, total_bytes
+            hasher.update(chunk)
+    return lines, total_bytes, hasher.hexdigest()
 
 
 def _verify_gzip_matches(original: Path, gz_path: Path) -> bool:
-    """Step 3: the decompressed `.gz` must have IDENTICAL byte and line
-    counts to the original -- the whole point of gzip-only retention (never
-    a lossy transform)."""
-    orig_lines, orig_bytes = _line_and_byte_counts(open, original)
+    """Step 3: the decompressed `.gz` must be BYTE-IDENTICAL to the original
+    -- verified by a streamed sha256 digest (review fix 1), not merely by
+    matching byte/line counts -- the whole point of gzip-only retention
+    (never a lossy transform)."""
+    orig_lines, orig_bytes, orig_sha256 = _content_fingerprint(open, original)
     try:
-        gz_lines, gz_bytes = _line_and_byte_counts(gzip.open, gz_path)
+        gz_lines, gz_bytes, gz_sha256 = _content_fingerprint(gzip.open, gz_path)
     except OSError:
         return False
-    return orig_lines == gz_lines and orig_bytes == gz_bytes
+    return (
+        orig_sha256 == gz_sha256
+        and orig_lines == gz_lines
+        and orig_bytes == gz_bytes
+    )
 
 
 def _fsync_path(path: Path) -> None:
@@ -168,6 +184,24 @@ def _atomic_gzip_one(path: Path) -> bool:
         # A prior run crashed between rename and unlink. Idempotent: only
         # re-verify the EXISTING .gz, never re-write it.
         if _verify_gzip_matches(path, gz_path):
+            # Review fix 2: the prior crash may have happened BEFORE that
+            # run's own `os.utime`, leaving `gz_path` with its own
+            # write-time mtime instead of the original's. Apply the
+            # original's mtime here too, and strictly BEFORE unlinking the
+            # original -- if this fails, the original must stay (both files
+            # left in place for the next run), never unlinked with the
+            # `.gz`'s mtime left wrong.
+            try:
+                stat = path.stat()
+                os.utime(gz_path, (stat.st_atime, stat.st_mtime))
+            except OSError:
+                logger.exception(
+                    "decisions_retention: failed to apply %s's mtime onto "
+                    "existing %s; keeping both untouched",
+                    path,
+                    gz_path,
+                )
+                return False
             path.unlink()
             return True
         logger.error(
