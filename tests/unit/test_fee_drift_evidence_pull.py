@@ -96,6 +96,39 @@ def _market_payload(*, taker: str | None = None, maker: str | None = None) -> di
 
 
 # ---------------------------------------------------------------------------
+# --user-agent validation (2026-09-25 follow-up): the systemd unit now
+# substitutes this value from ``${BREEZY_USER_AGENT}`` via EnvironmentFile,
+# so an unset variable reaches argparse as an EMPTY string, not a missing
+# argument -- argparse's own ``required=True`` never catches that case. This
+# guards the empty/whitespace-only case explicitly, with a clear message,
+# per the script's own help text ("never a generic placeholder").
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_rejects_an_empty_user_agent(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        pull._parse_args(["--user-agent", ""])
+    assert exc_info.value.code != 0
+    assert "user-agent" in capsys.readouterr().err.lower()
+
+
+def test_parse_args_rejects_a_whitespace_only_user_agent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        pull._parse_args(["--user-agent", "   "])
+    assert exc_info.value.code != 0
+    assert "user-agent" in capsys.readouterr().err.lower()
+
+
+def test_parse_args_accepts_a_real_contactable_user_agent() -> None:
+    args = pull._parse_args(
+        ["--user-agent", "breezy-fee-drift-evidence-pull/1 (contact ops@example.com)"]
+    )
+    assert args.user_agent == "breezy-fee-drift-evidence-pull/1 (contact ops@example.com)"
+
+
+# ---------------------------------------------------------------------------
 # pagination to eof
 # ---------------------------------------------------------------------------
 

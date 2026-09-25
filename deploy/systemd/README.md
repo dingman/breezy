@@ -1436,10 +1436,17 @@ studies lock buys nothing. `MemoryHigh=384M`/`MemoryMax=512M`, between
 `breezy-decisions-retention.service` (256M/512M) and
 `breezy-position-monitor-report.service` (512M/1G).
 
-**Alert env file.** The unit's only `EnvironmentFile=` is
-`-%h/.config/breezy/alerts.env` (the AUD-15 amendment single-key file), same
-discipline as `breezy-decision-funnel-digest.service` — never
-`breezy-trade.env`/`polymarket.env`/`operator.env`.
+**Env files (2026-09-25 follow-up).** Two `EnvironmentFile=` lines, both
+non-credential. `%h/.config/breezy/breezy.env` (no `-` prefix — a missing
+file fails the unit loudly) supplies `BREEZY_USER_AGENT`, the operator's own
+configured contact string, substituted into `ExecStart=` as
+`--user-agent "${BREEZY_USER_AGENT}"` rather than hardcoded in the unit; the
+script itself refuses an empty/whitespace-only value
+(`fee_drift_evidence_pull.py`'s `_parse_args`), so an unset variable fails
+the run rather than sending the venue a blank contact header.
+`-%h/.config/breezy/alerts.env` (the AUD-15 amendment single-key file) keeps
+its `-` prefix, same discipline as `breezy-decision-funnel-digest.service` —
+never `breezy-trade.env`/`polymarket.env`/`operator.env`.
 
 **`OnFailure=`.** `OnFailure=breezy-study-failed@%n.service`, same notifier
 every other study-adjacent unit declares.
