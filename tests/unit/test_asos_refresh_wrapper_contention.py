@@ -70,8 +70,13 @@ def _wrapper_for_repo_under_test(tmp_path: Path, repo_root: Path = _REPO_ROOT) -
     code) is exercised byte-for-byte; only WHICH tree the python steps
     resolve under changes."""
     original = _WRAPPER.read_text()
+    # Assert the line exists, not that the text changed: when the suite runs
+    # in the primary tree, repo_root IS /home/jon/breezy and the rewrite is a
+    # no-op by design.
+    assert original.count(_ORIGINAL_REPO_LINE) == 1, (
+        "REPO= line not found exactly once in the wrapper to rewrite"
+    )
     rewritten = original.replace(_ORIGINAL_REPO_LINE, f"REPO={repo_root}\n", 1)
-    assert rewritten != original, "REPO= line not found in the wrapper to rewrite"
     target = tmp_path / "asos-refresh-run.sh"
     target.write_text(rewritten)
     target.chmod(0o755)
