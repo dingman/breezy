@@ -1322,3 +1322,20 @@ def test_queue_empty_message_distinguishes_fee_regime_exclusion(
     out = capsys.readouterr().out
     assert "QUEUE EMPTY (FEE REGIME)" in out
     assert "all replayed under key" not in out
+
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 3: exit-code parity with the driver
+# ---------------------------------------------------------------------------
+
+
+def test_fee_schedule_mismatch_exit_code_matches_the_drivers_own_constant() -> None:
+    import current_rung_hold_paper_replay as driver
+
+    assert runner._EXIT_FEE_SCHEDULE_MISMATCH == driver.EXIT_FEE_SCHEDULE_MISMATCH == 4
+
+
+def test_classify_driver_failure_fee_schedule_mismatch() -> None:
+    assert runner.classify_driver_failure(returncode=4, stderr="") == (
+        "BLOCKED", "FEE_SCHEDULE_MISMATCH",
+    )

@@ -100,7 +100,9 @@ THETA = Decimal("0.06")
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
-def _facts_info(*, lower_f: int | None, upper_f: int | None) -> dict[str, object]:
+def _facts_info(
+    *, lower_f: int | None, upper_f: int | None, fee_coefficient: Decimal = THETA,
+) -> dict[str, object]:
     return {
         WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
         SETTLEMENT_STATION_KEY: STATION,
@@ -109,11 +111,11 @@ def _facts_info(*, lower_f: int | None, upper_f: int | None) -> dict[str, object
         STRIKE_LOWER_F_KEY: lower_f,
         STRIKE_UPPER_F_KEY: upper_f,
         FEE_SCHEDULE_STATUS_KEY: FEE_SCHEDULE_STATUS_KNOWN,
-        FEE_COEFFICIENT_KEY: str(THETA),
+        FEE_COEFFICIENT_KEY: str(fee_coefficient),
     }
 
 
-def _instrument() -> BinaryOption:
+def _instrument(*, fee_coefficient: Decimal = THETA) -> BinaryOption:
     increment = Price.from_str("0.01")
     size_increment = Quantity.from_str("1")
     return BinaryOption(
@@ -131,11 +133,11 @@ def _instrument() -> BinaryOption:
         expiration_ns=200 * 3_600_000_000_000,
         max_quantity=None,
         min_quantity=Quantity.from_int(1),
-        maker_fee=THETA,
-        taker_fee=THETA,
+        maker_fee=fee_coefficient,
+        taker_fee=fee_coefficient,
         ts_event=0,
         ts_init=0,
-        info=_facts_info(lower_f=86, upper_f=87),
+        info=_facts_info(lower_f=86, upper_f=87, fee_coefficient=fee_coefficient),
     )
 
 
@@ -685,15 +687,22 @@ def _tape_instrument_no_close(driver: ModuleType, *, ask: str, size: int) -> obj
 
 
 def _tape_instrument_depth_and_quote_in_window(
-    driver: ModuleType, *, ask: str, size: int,
+    driver: ModuleType, *, ask: str, size: int, fee_coefficient: Decimal = THETA,
 ) -> object:
     """SP-4 increment D: BOTH the QuoteTick and the OrderBookDepth10 land
     IN the decision window -- for dispatch-level tests that stub `run_one_
     precision_arm` (never a real engine), where `_tape_instrument_no_
     close`'s depth-1000ns-before-the-quote tie-break (needed only for a
     REAL engine's depth-before-quote fill ordering) would otherwise trip
-    the NEW depth-basis coverage gate the continuous arm now runs under."""
-    instrument = _instrument()
+    the NEW depth-basis coverage gate the continuous arm now runs under.
+
+    `fee_coefficient` (AUD-09b fee-regime plan, Phase 3) defaults to the
+    module's own `THETA` -- every pre-existing caller stays byte-identical;
+    a caller exercising `--family-manifest` with a DIFFERENT registered
+    theta passes this so the new preflight (`assert_fee_schedule_matches_
+    family`) sees a tape that genuinely agrees with the manifest under
+    test, rather than tripping on an incidental fixture mismatch."""
+    instrument = _instrument(fee_coefficient=fee_coefficient)
     facts = read_weather_bucket_facts(instrument.info)
     quote = _quote(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
     depth = _depth(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
@@ -1588,6 +1597,7 @@ def _run_main_with_stubbed_capture(
     monkeypatch: pytest.MonkeyPatch,
     extra_argv: Sequence[str] = (),
     expect_rc: int = 0,
+    tape_fee_coefficient: Decimal = THETA,
 ) -> dict[str, object]:
     """Stub the driver's OWN capture/settlement seams (never Nautilus, never
     the strategy under test) so `main` reaches `run_one_precision_arm`
@@ -1597,9 +1607,18 @@ def _run_main_with_stubbed_capture(
     AUD-19b: `extra_argv` appends CLI arguments (e.g. `--family-manifest`)
     after `_minimal_argv`'s fixed set; the spy also captures
     `required_fee_coefficient`/`family_id`/`trial_id_prefix` so a caller can
-    assert on what `main` resolved and threaded through."""
+    assert on what `main` resolved and threaded through.
+
+    `tape_fee_coefficient` (AUD-09b fee-regime plan, Phase 3) defaults to
+    `THETA`, matching `_family_manifest_payload`'s own default
+    `taker_fee_coefficient` -- a caller registering a manifest theta that
+    DIFFERS from `THETA` must pass the same value here, or the new
+    `assert_fee_schedule_matches_family` preflight refuses before
+    `run_one_precision_arm` is ever reached."""
     captured: dict[str, object] = {}
-    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(
+        driver, ask="0.40", size=10, fee_coefficient=tape_fee_coefficient,
+    )
 
     def _spy_run_one_precision_arm(**kwargs: object) -> object:
         captured["strategy_cls"] = kwargs["strategy_cls"]
@@ -1643,7 +1662,12 @@ def _family_manifest_payload(**overrides: object) -> dict[str, object]:
         "venue": "polymarket_us",
         "trial_id_prefix": "continuous_rung_hold/trial/",
         "d0_climate_day": "2026-08-31",
-        "taker_fee_coefficient": "0.0695",
+        # AUD-09b fee-regime plan, Phase 3: matches `THETA`, the fixture tape
+        # instrument's own fee coefficient (`_instrument`'s default) -- a
+        # test that registers a DIFFERENT theta must also pass a matching
+        # `tape_fee_coefficient`/`fee_coefficient` override, or the new
+        # `assert_fee_schedule_matches_family` preflight refuses it.
+        "taker_fee_coefficient": str(THETA),
         "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v4.json",
         "boundary_inputs_sha256": "a" * 64,
         "composition_kind": "continuous_rung_hold",
@@ -1725,10 +1749,50 @@ def test_family_manifest_threads_the_registered_taker_fee_coefficient(
     captured = _run_main_with_stubbed_capture(
         driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
         extra_argv=["--family-manifest", str(manifest_path)],
+        tape_fee_coefficient=Decimal("0.0695"),
     )
     assert captured["required_fee_coefficient"] == Decimal("0.0695")
     assert captured["family_id"] == "pm_us_crh_v4"
     assert captured["trial_id_prefix"] == "continuous_rung_hold/trial/"
+
+
+# ---------------------------------------------------------------------------
+# AUD-09b fee-regime plan, Phase 3: the exact tape-vs-manifest preflight
+# ---------------------------------------------------------------------------
+def test_assert_fee_schedule_matches_family_admits_an_agreeing_tape(
+    driver: ModuleType,
+) -> None:
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    driver.assert_fee_schedule_matches_family(
+        [tape_instrument], required_fee_coefficient=THETA,
+    )
+
+
+def test_assert_fee_schedule_matches_family_refuses_a_disagreeing_tape(
+    driver: ModuleType,
+) -> None:
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    with pytest.raises(driver.FeeScheduleMismatchError, match=str(INSTRUMENT_ID)):
+        driver.assert_fee_schedule_matches_family(
+            [tape_instrument], required_fee_coefficient=Decimal("0.10"),
+        )
+
+
+def test_main_exits_fee_schedule_mismatch_before_the_engine_runs(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real preflight, wired through `main`: a manifest registering a
+    theta the tape's OWN instrument disagrees with never reaches
+    `run_one_precision_arm` at all -- proven by never installing a
+    `family_params.json`-writing spy and still getting no sidecar."""
+    manifest_path = _write_family_manifest(tmp_path, taker_fee_coefficient="0.10")
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+        extra_argv=["--family-manifest", str(manifest_path)],
+        expect_rc=driver.EXIT_FEE_SCHEDULE_MISMATCH,
+    )
+    assert captured["rc"] == driver.EXIT_FEE_SCHEDULE_MISMATCH
+    assert not (tmp_path / "out" / "family_params.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1888,6 +1952,7 @@ def test_family_params_sidecar_records_the_resolved_parameters(
     _run_main_with_stubbed_capture(
         driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
         extra_argv=["--family-manifest", str(manifest_path)],
+        tape_fee_coefficient=Decimal("0.0695"),
     )
     sidecar_path = tmp_path / "out" / "family_params.json"
     assert sidecar_path.exists()
@@ -2047,7 +2112,9 @@ def test_params_match_is_computed_from_the_engines_actual_readback_not_echoed(
     manifest_path = _write_family_manifest(
         tmp_path, family_id="pm_us_crh_v4", taker_fee_coefficient="0.0695",
     )
-    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(
+        driver, ask="0.40", size=10, fee_coefficient=Decimal("0.0695"),
+    )
 
     def _spy_run_one_precision_arm(**kwargs: object) -> object:
         return driver.PrecisionArmResult(

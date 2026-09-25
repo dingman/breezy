@@ -173,6 +173,12 @@ STALL_ALERT_RUN_LENGTH: Final[int] = 3
 #: constants if that module's exit-code table ever changes.
 _EXIT_FAMILY_MANIFEST_REFUSED: Final[int] = 2
 _EXIT_FAMILY_MANIFEST_UNUSABLE: Final[int] = 3
+#: AUD-09b fee-regime plan, Phase 3: the driver's own exact preflight
+#: refusal -- a tape instrument's theta disagrees with the armed family's.
+#: Must equal `current_rung_hold_paper_replay.EXIT_FEE_SCHEDULE_MISMATCH`
+#: (pinned by `test_fee_schedule_mismatch_exit_code_matches_the_drivers_
+#: own_constant`).
+_EXIT_FEE_SCHEDULE_MISMATCH: Final[int] = 4
 
 _EXCEPTION_NAME_RE: Final[re.Pattern[str]] = re.compile(r"\b([A-Z][A-Za-z0-9_]*Error)\b")
 
@@ -780,18 +786,21 @@ def build_driver_argv(
 def classify_driver_failure(
     *, returncode: int, stderr: str
 ) -> tuple[Literal["BLOCKED", "FAILED"], str]:
-    """A non-zero driver exit is `BLOCKED` only for the two well-known
-    family-manifest refusal codes (should not occur in practice -- the
-    runner resolves and validates the manifest before invoking the driver
-    -- but classified rather than silently mis-filed as a crash);
-    everything else is `FAILED`, with the exception type parsed from the
-    LAST `...Error` name in stderr (a driver crash prints an uncaught
-    Python traceback -- base plan §9's `NoDecisionWindowCoverageError` /
-    `EntryAskFromLatchMissingError` / `ImpossibleFillPriceError` cases)."""
+    """A non-zero driver exit is `BLOCKED` only for the well-known
+    family-manifest refusal codes and the Phase 3 fee-schedule preflight
+    (should not occur in practice -- the runner's own Phase 2 pre-selection
+    already excludes a mismatched day -- but classified rather than
+    silently mis-filed as a crash); everything else is `FAILED`, with the
+    exception type parsed from the LAST `...Error` name in stderr (a driver
+    crash prints an uncaught Python traceback -- base plan §9's
+    `NoDecisionWindowCoverageError` / `EntryAskFromLatchMissingError` /
+    `ImpossibleFillPriceError` cases)."""
     if returncode == _EXIT_FAMILY_MANIFEST_REFUSED:
         return "BLOCKED", "FAMILY_MANIFEST_REFUSED"
     if returncode == _EXIT_FAMILY_MANIFEST_UNUSABLE:
         return "BLOCKED", "FAMILY_MANIFEST_UNUSABLE"
+    if returncode == _EXIT_FEE_SCHEDULE_MISMATCH:
+        return "BLOCKED", "FEE_SCHEDULE_MISMATCH"
     matches = _EXCEPTION_NAME_RE.findall(stderr)
     exception_type = matches[-1] if matches else "UnknownDriverFailure"
     return "FAILED", exception_type
