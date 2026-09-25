@@ -126,6 +126,27 @@ already-recorded real attempt; silently downgrading the record to
 "incomplete" would make the pack LIE about what is actually known for that
 date. Recording the later attempt separately, rather than dropping it
 silently, keeps the operator able to see that a downgrade was avoided.
+
+**Fail loudly (2026-09-25 production incident, fixed same day).** The first
+real 11:10Z run listed ZERO markets and still printed
+``complete=False ... reason=None`` and exited **0** -- a silent failure that
+never triggered ``OnFailure=``. Root cause, reproduced live (read-only,
+unauthenticated, against the real gateway): the list query's own three
+filters (:data:`LIST_QUERY_ACTIVE`/:data:`LIST_QUERY_CLOSED`/
+:data:`LIST_QUERY_ARCHIVED`) matched zero markets when sent WITHOUT ordering,
+even though ``active=true&categories=climate`` alone, queried at the same
+moment, returned 100 -- reproducible, not a one-off. ``PolymarketUSMarket
+DiscoveryConfig``'s own defaults (``config.py:191-192``) always pair those
+same three filters with :data:`LIST_QUERY_ORDER_BY`/
+:data:`LIST_QUERY_ORDER_DIRECTION`, and
+``PolymarketUSInstrumentProvider._discover_markets`` -- the query shape the
+live trading node already discovers and trades markets with -- always sends
+them together. This script now does too. Independently of that fix, `main`
+never again exits 0 on a silent incomplete day: `run_once` names a
+non-``None`` reason on every non-complete outcome (empty listing, or
+below-threshold parse rate), and `main` treats every incomplete day as a
+failure UNLESS the reason is the one documented, evidence-justified
+legitimate case -- the protected window (:data:`_PROTECTED_WINDOW_REASON`).
 """
 
 from __future__ import annotations
@@ -164,6 +185,8 @@ __all__ = [
     "LIST_QUERY_ACTIVE",
     "LIST_QUERY_ARCHIVED",
     "LIST_QUERY_CLOSED",
+    "LIST_QUERY_ORDER_BY",
+    "LIST_QUERY_ORDER_DIRECTION",
     "MAKER_FEE_WIRE_KEY",
     "MARKET_LIST_QUOTA_KEY",
     "MAX_FALLBACK_PER_SLUG_CALLS",
@@ -220,6 +243,22 @@ WEATHER_CATEGORY: str = "climate"
 LIST_QUERY_ACTIVE: bool = True
 LIST_QUERY_CLOSED: bool = False
 LIST_QUERY_ARCHIVED: bool = False
+
+#: **Empty-listing fix (2026-09-25 production incident).** The 11:10Z live
+#: run listed ZERO markets with `LIST_QUERY_ACTIVE`/`_CLOSED`/`_ARCHIVED`
+#: alone (no ordering). Re-measured live, read-only, unauthenticated,
+#: against the real gateway the same day: `active=true&categories=climate`
+#: ALONE returned 100 markets at that moment, but adding `closed=false` and
+#: `archived=false` with NO `orderBy`/`orderDirection` zeroed the result set
+#: -- reproducibly, not a one-off. `PolymarketUSMarketDiscoveryConfig`'s own
+#: defaults (`config.py:191-192`) pair those same three filters with
+#: `orderBy=("endDate",)`/`orderDirection="asc"`, and
+#: `PolymarketUSInstrumentProvider._discover_markets` -- the query shape the
+#: live trading node already discovers and trades markets with -- always
+#: sends them together. This script must send the SAME proven shape, not a
+#: subset of it.
+LIST_QUERY_ORDER_BY: tuple[str, ...] = ("endDate",)
+LIST_QUERY_ORDER_DIRECTION: str = "asc"
 
 #: Bound on option-(b) fallback per-slug GETs (a listed market whose OWN
 #: entry lacks a parseable fee -- never observed as of 2026-09-25, across
@@ -334,6 +373,8 @@ async def list_weather_markets(
             query={
                 "limit": limit,
                 "offset": offset,
+                "orderBy": LIST_QUERY_ORDER_BY,
+                "orderDirection": LIST_QUERY_ORDER_DIRECTION,
                 "categories": [WEATHER_CATEGORY],
                 "active": LIST_QUERY_ACTIVE,
                 "closed": LIST_QUERY_CLOSED,
@@ -696,14 +737,35 @@ async def run_once(
     results = tuple(primary_results + fallback_results)
     listed_count = len(primary_results) + len(fallback_slugs)
     complete = _is_complete(listed_count, results)
+    reason = None if complete else _incomplete_reason(listed_count=listed_count, results=results)
     result = EvidencePullResult(
         date=date,
         complete=complete,
-        reason=None,
+        reason=reason,
         markets_listed=listed_count,
         slugs=results,
     )
     return _write_artifacts(result, day_dir)
+
+
+def _incomplete_reason(*, listed_count: int, results: Sequence[SlugPullResult]) -> str:
+    """Name WHY a day is incomplete -- never leave ``reason=None`` on a real
+    (non-protected-window) run. A silent ``complete=False, reason=None`` is
+    exactly the 2026-09-25 production incident this function closes: a run
+    that lists zero markets exits looking indistinguishable from success.
+    """
+    if listed_count == 0:
+        return (
+            "empty listing: the "
+            f"{MARKET_LIST_PATH} query (categories={[WEATHER_CATEGORY]!r}, "
+            f"active={LIST_QUERY_ACTIVE}, closed={LIST_QUERY_CLOSED}, "
+            f"archived={LIST_QUERY_ARCHIVED}) matched zero weather markets"
+        )
+    ok = sum(1 for r in results if r.ok)
+    return (
+        f"only {ok}/{listed_count} listed slugs returned a parseable "
+        f"{TAKER_FEE_WIRE_KEY!r} (< {COMPLETE_DAY_THRESHOLD:.0%} threshold)"
+    )
 
 
 def build_default_client(*, user_agent: str) -> PublicReadClient:
@@ -772,15 +834,26 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+#: The ONLY reasons under which an incomplete/empty day is a legitimate,
+#: evidence-justified outcome rather than a failure -- see module docstring
+#: "Fail loudly" and the 2026-09-25 production incident this closes. Every
+#: other incomplete day (empty listing, below-threshold parse rate, a
+#: refused same-day downgrade over a still-incomplete existing record) must
+#: make `main` exit non-zero so `OnFailure=` actually fires.
+_LOUD_FAILURE_EXEMPT_REASONS: frozenset[str] = frozenset({_PROTECTED_WINDOW_REASON})
+
+
+def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> int:
     args = _parse_args(argv)
     client = build_default_client(user_agent=args.user_agent)
-    result = asyncio.run(run_once(client=client, output_root=args.output_root))
+    result = asyncio.run(run_once(client=client, output_root=args.output_root, now=now))
     print(
         f"fee_drift_evidence_pull: date={result.date} complete={result.complete} "
         f"markets_listed={result.markets_listed} ok={result.ok_count} "
         f"reason={result.reason}"
     )
+    if not result.complete and result.reason not in _LOUD_FAILURE_EXEMPT_REASONS:
+        return 1
     return 0
 
 
