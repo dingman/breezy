@@ -163,6 +163,27 @@ still has an open file -- never partially, never ahead of its definition.
 A tick row can therefore never land in the catalog before the instrument
 definition it references.
 
+Definitions-first across the WHOLE run (ING-2 S1)
+---------------------------------------------------
+The guarantee above is per-instance only: :func:`ingest_instance` and
+:func:`_ingest_instance_per_file` each convert one instance's own
+definitions before that SAME instance's tick types, but say nothing about
+instance B's tick types relative to instance A's definitions. A run killed
+(SIGKILL/OOM/``os._exit``) partway through instance A's tick conversion used
+to leave the catalog with NO instrument definitions landed at all if A
+happened to be enumerated first -- the 2026-09-25 16:50Z forensics: only a
+``.converted-quote_tick`` marker existed on disk, and the node resolved zero
+instruments. :func:`run_ingest_definitions_first` closes that gap: it takes
+ONE :class:`LivenessSnapshot` (:func:`take_liveness_snapshot`) up front,
+runs a first pass converting ONLY instrument-definition types for every
+instance :func:`_needs_definition_pass` selects, then runs the ordinary
+:func:`run_ingest` as a second pass over every instance and every requested
+type (already-landed definitions are skipped by their existing per-type
+marker). A kill during the second pass therefore can never erase what the
+first pass already committed -- every instance definitions pass 1 reached is
+resolvable in the catalog regardless of what happens next. ``run()`` calls
+this wrapper, not :func:`run_ingest` directly.
+
 A ``None`` table from the native feather reader (ArrowInvalid/OSError,
 already-truncated bytes that slipped past preflight, or a post-transform
 table that comes back empty despite a nonzero preflight row count) is a
@@ -208,7 +229,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -293,6 +314,25 @@ _STREAM_SUBDIRECTORIES = ("live", "backtest")
 #: mean the plain :data:`CONVERTED` outcome.
 ConvertFn = Callable[[ParquetDataCatalog, str, type, str], str | None]
 ServiceActiveProbe = Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class LivenessSnapshot:
+    """One frozen liveness/inventory read, shared by both defs-first passes.
+
+    See :func:`take_liveness_snapshot`. Sharing one instance across pass 1
+    (a narrowed ``instance_ids``) and pass 2 (every instance) is what makes
+    ``newest_instance_id`` correct for both: it is fixed here, computed over
+    the FULL instance list, before pass 1's subset ever exists -- a pass
+    that recomputed it over a narrowed subset could wrongly crown a merely
+    small selection's own member as "the current instance".
+    """
+
+    now_ns: int
+    grace_ns: int
+    instance_ids: tuple[str, ...]
+    newest_instance_id: str | None
+    service_active: bool
 
 
 def _instance_dir(catalog_root: Path, instance_id: str, subdirectory: str) -> Path:
@@ -382,6 +422,22 @@ def _is_instrument_definition(data_cls: type) -> bool:
     and is therefore monotonic by construction.
     """
     return issubclass(data_cls, Instrument)
+
+
+def _definitions_first(data_types: Sequence[type]) -> tuple[type, ...]:
+    """Stable partition: instrument-definition types first, in their given
+    order, then every other type, in its given order.
+
+    Mirrors the split :func:`_ingest_instance_per_file` already performs
+    (``definition_types``/``tick_types`` above) so a single instance's own
+    conversion ATTEMPT order is always defs-first, regardless of the order
+    ``data_types`` was requested in. The caller's requested order is never
+    lost -- it is restored in the returned ``type_results`` by iterating
+    ``data_types`` again, not this function's output.
+    """
+    definitions = [data_cls for data_cls in data_types if _is_instrument_definition(data_cls)]
+    ticks = [data_cls for data_cls in data_types if not _is_instrument_definition(data_cls)]
+    return tuple(definitions + ticks)
 
 
 def _read_streamed(
@@ -849,13 +905,19 @@ def ingest_instance(
     aborts other instances. The INSTANCE-level outcome is ``"failed"`` if
     any type failed, matching :func:`_ingest_instance_per_file`'s existing
     precedent (SP-1/I3).
+
+    Conversion is ATTEMPTED defs-first (:func:`_definitions_first`), even
+    when ``data_types`` requests a tick type before a definition type -- a
+    kill partway through this call therefore always leaves this instance's
+    own definitions landed first. ``type_results`` is still returned in the
+    REQUESTED ``data_types`` order; only the attempt order changes.
     """
     instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
-    type_results: list[TypeConversionResult] = []
-    for data_cls in data_types:
+    results_by_cls: dict[type, TypeConversionResult] = {}
+    for data_cls in _definitions_first(data_types):
         if _is_marked_converted(instance_dir, data_cls):
-            type_results.append(
-                TypeConversionResult(data_cls, "skipped-already-converted")
+            results_by_cls[data_cls] = TypeConversionResult(
+                data_cls, "skipped-already-converted"
             )
             continue
         try:
@@ -867,10 +929,11 @@ def ingest_instance(
                 data_cls.__name__,
                 exc,
             )
-            type_results.append(TypeConversionResult(data_cls, "failed", str(exc)))
+            results_by_cls[data_cls] = TypeConversionResult(data_cls, "failed", str(exc))
             continue
         _mark_converted(instance_dir, data_cls)
-        type_results.append(TypeConversionResult(data_cls, outcome or CONVERTED))
+        results_by_cls[data_cls] = TypeConversionResult(data_cls, outcome or CONVERTED)
+    type_results = tuple(results_by_cls[data_cls] for data_cls in data_types)
     any_failure = any(_outcome_has_failure(result.outcome) for result in type_results)
     return InstanceIngestResult(
         instance_id=instance_id,
@@ -878,7 +941,7 @@ def ingest_instance(
         reason="at least one type failed conversion; see type_results for detail"
         if any_failure
         else "",
-        type_results=tuple(type_results),
+        type_results=type_results,
     )
 
 
@@ -921,6 +984,54 @@ def _cls_open_and_closed_files(
     cls_open = [path for path in cls_files if path in open_files]
     cls_closed = [path for path in cls_files if path not in open_files]
     return cls_open, cls_closed
+
+
+def _needs_definition_pass(
+    catalog_root: Path,
+    subdirectory: str,
+    instance_id: str,
+    data_types: Sequence[type],
+    snap: LivenessSnapshot,
+) -> bool:
+    """True when this instance genuinely needs pass 1: at least one
+    instrument-definition type is unmarked, has zero open files, and has at
+    least one closed file to convert.
+
+    Mirrors the selection :func:`_convert_one_definition_type` already
+    applies per-type: an open file defers the type entirely
+    (``skipped-open``, never selected here either -- a still-writing
+    definitions file is exactly what pass 1 must never touch), and zero
+    closed files means there is nothing to convert
+    (``skipped-already-converted``, vacuously -- also not selected). Stat
+    only: this never calls :func:`~breezy.persistence.feather_preflight.
+    scan_instance`, so an instance that does not need pass 1 is never
+    rescanned merely to find that out.
+    """
+    definition_types = [
+        data_cls for data_cls in data_types if _is_instrument_definition(data_cls)
+    ]
+    if not definition_types:
+        return False
+    instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
+    open_files = _open_files_for_instance(
+        catalog_root,
+        instance_id,
+        subdirectory,
+        data_types,
+        now_ns=snap.now_ns,
+        grace_ns=snap.grace_ns,
+        newest_instance_id=snap.newest_instance_id,
+        service_active=snap.service_active,
+    )
+    for data_cls in definition_types:
+        if _is_marked_converted(instance_dir, data_cls):
+            continue
+        cls_open, cls_closed = _cls_open_and_closed_files(instance_dir, data_cls, open_files)
+        if cls_open:
+            continue
+        if cls_closed:
+            return True
+    return False
 
 
 def _convert_one_definition_type(
@@ -1229,6 +1340,40 @@ def _ingest_instance_per_file(
     )
 
 
+def take_liveness_snapshot(
+    catalog_root: Path,
+    subdirectory: str,
+    *,
+    now_ns: int | None = None,
+    grace_minutes: float = DEFAULT_LIVE_GRACE_MINUTES,
+    service_active_probe: ServiceActiveProbe = default_service_active_probe,
+) -> LivenessSnapshot:
+    """Freeze one liveness/inventory read: instance ids, the newest-started
+    instance (over the FULL list), and the recorder's active state.
+
+    A verbatim lift of the read :func:`run_ingest` has always performed --
+    list, then newest-over-the-full-list, then probe, in that exact order --
+    so a caller that takes ONE snapshot and shares it across two passes
+    (:func:`run_ingest_definitions_first`) sees the identical liveness
+    picture a single :func:`run_ingest` call would have. A
+    :class:`~breezy.persistence.feather_preflight.PreflightError` from
+    ``list_instance_ids`` propagates before the probe is ever called -- an
+    unreadable catalog root must never send an unnecessary systemctl query.
+    """
+    now = time.time_ns() if now_ns is None else now_ns
+    grace_ns = int(grace_minutes * 60 * 1_000_000_000)
+    instance_ids = list_instance_ids(catalog_root, subdirectory)
+    newest_instance_id = _newest_started_instance_id(catalog_root, instance_ids, subdirectory)
+    service_active = service_active_probe()
+    return LivenessSnapshot(
+        now_ns=now,
+        grace_ns=grace_ns,
+        instance_ids=instance_ids,
+        newest_instance_id=newest_instance_id,
+        service_active=service_active,
+    )
+
+
 def run_ingest(
     catalog_root: Path,
     *,
@@ -1239,14 +1384,37 @@ def run_ingest(
     service_active_probe: ServiceActiveProbe = default_service_active_probe,
     convert_fn: ConvertFn = default_convert,
     dry_run: bool = False,
+    snapshot: LivenessSnapshot | None = None,
 ) -> tuple[InstanceIngestResult, ...]:
-    """Enumerate instances and convert every one that is safe to convert."""
-    now = time.time_ns() if now_ns is None else now_ns
-    grace_ns = int(grace_minutes * 60 * 1_000_000_000)
+    """Enumerate instances and convert every one that is safe to convert.
 
-    instance_ids = list_instance_ids(catalog_root, subdirectory)
-    newest_instance_id = _newest_started_instance_id(catalog_root, instance_ids, subdirectory)
-    service_active = service_active_probe()
+    ``snapshot``, when given, OVERRIDES the liveness/inventory read
+    entirely: ``now_ns``/``grace_minutes``/``service_active_probe`` are
+    never consulted and the read is not repeated -- this call's instance
+    list, newest-instance id, and service-active state are exactly the
+    snapshot's. Passing both ``snapshot`` and ``now_ns`` is a caller error
+    (:func:`take_liveness_snapshot` already folds ``now_ns`` into the
+    snapshot) and raises ``ValueError``.
+    """
+    if snapshot is not None and now_ns is not None:
+        raise ValueError("snapshot and now_ns are mutually exclusive")
+    snap = (
+        take_liveness_snapshot(
+            catalog_root,
+            subdirectory,
+            now_ns=now_ns,
+            grace_minutes=grace_minutes,
+            service_active_probe=service_active_probe,
+        )
+        if snapshot is None
+        else snapshot
+    )
+
+    now = snap.now_ns
+    grace_ns = snap.grace_ns
+    instance_ids = snap.instance_ids
+    newest_instance_id = snap.newest_instance_id
+    service_active = snap.service_active
 
     catalog = ParquetDataCatalog(str(catalog_root))
     results: list[InstanceIngestResult] = []
@@ -1341,6 +1509,111 @@ def run_ingest(
     return tuple(results)
 
 
+def _merge_pass_results(
+    pass_one: tuple[InstanceIngestResult, ...],
+    pass_two: tuple[InstanceIngestResult, ...],
+) -> tuple[InstanceIngestResult, ...]:
+    """Combine both passes' results, one row per instance in pass 2's order.
+
+    Pass 2 already covers every instance in the run (the whole
+    ``instance_ids`` list), so its results are the base. An instance whose
+    definitions pass FAILED (its instrument-definition conversion raised a
+    caught ``ValueError``) is reported as ``"failed"`` regardless of what
+    pass 2 did with it -- even if pass 2's own retry of that same type
+    happened to succeed -- with the reason prefixed to say so. This only
+    ever matters for an ordinary caught ``ValueError``: a ``BaseException``
+    mid pass 1 propagates before pass 2 is ever called, so this function is
+    never reached in that case. ``type_results`` are pass 2's; pass 1's are
+    used only as a fallback when pass 2 produced none for that instance.
+    """
+    pass_one_by_id = {result.instance_id: result for result in pass_one}
+    merged: list[InstanceIngestResult] = []
+    for result in pass_two:
+        p1 = pass_one_by_id.get(result.instance_id)
+        if p1 is not None and p1.outcome == "failed":
+            merged.append(
+                replace(
+                    result,
+                    outcome="failed",
+                    reason=f"definitions pass failed; {p1.reason}",
+                    type_results=result.type_results or p1.type_results,
+                )
+            )
+        else:
+            merged.append(result)
+    return tuple(merged)
+
+
+def run_ingest_definitions_first(
+    catalog_root: Path,
+    *,
+    subdirectory: str = DEFAULT_SUBDIRECTORY,
+    data_types: Sequence[type] = DEFAULT_DATA_TYPES,
+    now_ns: int | None = None,
+    grace_minutes: float = DEFAULT_LIVE_GRACE_MINUTES,
+    service_active_probe: ServiceActiveProbe = default_service_active_probe,
+    convert_fn: ConvertFn = default_convert,
+    dry_run: bool = False,
+) -> tuple[InstanceIngestResult, ...]:
+    """Convert every instance's instrument definitions before any tick
+    type, across the WHOLE run -- not merely within one instance (see the
+    module docstring's "Definitions-first across the whole run" section).
+
+    One :class:`LivenessSnapshot` is taken up front and shared by both
+    passes, so neither pass re-probes the recorder or recomputes the
+    newest-started instance over a narrowed subset. Pass 1 converts ONLY
+    the instrument-definition types, for the instances
+    :func:`_needs_definition_pass` selects; pass 2 runs the ordinary
+    :func:`run_ingest` over every instance and every requested type --
+    already-converted definitions are skipped by the existing per-type
+    marker, so pass 2 never re-converts what pass 1 just landed.
+
+    No definition types requested, or ``dry_run=True``, or nothing selected:
+    pass 1 is skipped entirely and the output is identical to a single
+    :func:`run_ingest` call (dry-run must never touch disk, including via a
+    preview-only pass 1).
+    """
+    snap = take_liveness_snapshot(
+        catalog_root,
+        subdirectory,
+        now_ns=now_ns,
+        grace_minutes=grace_minutes,
+        service_active_probe=service_active_probe,
+    )
+    definition_types = tuple(
+        data_cls for data_cls in data_types if _is_instrument_definition(data_cls)
+    )
+    selected: tuple[str, ...] = ()
+    if definition_types and not dry_run:
+        selected = tuple(
+            instance_id
+            for instance_id in snap.instance_ids
+            if _needs_definition_pass(catalog_root, subdirectory, instance_id, data_types, snap)
+        )
+
+    pass_one: tuple[InstanceIngestResult, ...] = ()
+    if selected:
+        pass_one = run_ingest(
+            catalog_root,
+            subdirectory=subdirectory,
+            data_types=definition_types,
+            snapshot=replace(snap, instance_ids=selected),
+            convert_fn=convert_fn,
+            dry_run=dry_run,
+        )
+
+    pass_two = run_ingest(
+        catalog_root,
+        subdirectory=subdirectory,
+        data_types=data_types,
+        snapshot=snap,
+        convert_fn=convert_fn,
+        dry_run=dry_run,
+    )
+
+    return _merge_pass_results(pass_one, pass_two)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
@@ -1418,7 +1691,7 @@ def run(
 
     try:
         root = _resolve_catalog(namespace, active_env)
-        results = run_ingest(
+        results = run_ingest_definitions_first(
             root,
             subdirectory=namespace.subdirectory,
             grace_minutes=namespace.live_grace_minutes,
