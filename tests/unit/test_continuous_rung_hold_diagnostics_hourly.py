@@ -376,3 +376,106 @@ class TestSidecarFailureContained:
         # Never raises, even though the sidecar's directory is unwritable.
         strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=hour1_start))
         strategy.stop()
+
+
+class TestSinkHealthSurfacedInNextRow:
+    def test_sink_errors_surfaced_in_the_next_row(
+        self,
+        store_path: Path,
+        interior_instrument: BinaryOption,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """LOW (silent-failure review, 2026-09-25): `DiagnosticsSummarySink.
+        errors` -- its OWN health -- is mirrored into the NEXT row as a
+        delta, mirroring `offer_tape_capped`."""
+        path = tmp_path / "diagnostics_summary.jsonl"
+        sink = DiagnosticsSummarySink(path)
+        strategy = _register_and_start(
+            store_path=store_path, instruments=(interior_instrument,), diagnostics_summary=sink,
+        )
+        hour0_bucket = WINDOW_OPEN_NS // _NS_PER_HOUR
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+        # One write failure BEFORE the first rollover -- `sink.errors`
+        # becomes 1, which the rollover's own row must carry as a delta.
+        def _boom(self: Path, *args: object, **kwargs: object) -> None:
+            raise OSError("simulated fault")
+
+        monkeypatch.setattr(Path, "open", _boom)
+        sink.append({"pid": 999})
+        monkeypatch.undo()
+        assert sink.errors == 1
+
+        hour1_start = (hour0_bucket + 1) * _NS_PER_HOUR
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=hour1_start))
+
+        rows = _rows(path)
+        assert len(rows) == 1
+        assert rows[0]["diagnostics_summary_errors"] == 1
+        assert rows[0]["diagnostics_summary_capped"] == 0
+
+    def test_sink_capped_surfaced_in_the_next_row(
+        self, store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "diagnostics_summary.jsonl"
+        sink = DiagnosticsSummarySink(path)
+        strategy = _register_and_start(
+            store_path=store_path, instruments=(interior_instrument,), diagnostics_summary=sink,
+        )
+        hour0_bucket = WINDOW_OPEN_NS // _NS_PER_HOUR
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+        # `sink._max_bytes` is private but this is the same sink instance
+        # the strategy holds -- shrink its cap so a manual append is capped
+        # before the rollover's own row is written.
+        sink._max_bytes = 1  # type: ignore[attr-defined]
+        sink.append({"pid": 999})
+        assert sink.capped == 1
+        sink._max_bytes = 4 * 1024 * 1024  # type: ignore[attr-defined]
+
+        hour1_start = (hour0_bucket + 1) * _NS_PER_HOUR
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=hour1_start))
+
+        rows = _rows(path)
+        assert len(rows) == 1
+        assert rows[0]["diagnostics_summary_capped"] == 1
+
+
+class TestBucketAdvancesOnlyOnSuccessfulEmission:
+    def test_a_failed_emission_retries_on_the_next_tick(
+        self, store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "diagnostics_summary.jsonl"
+        sink = DiagnosticsSummarySink(path)
+        strategy = _register_and_start(
+            store_path=store_path, instruments=(interior_instrument,), diagnostics_summary=sink,
+        )
+        hour0_bucket = WINDOW_OPEN_NS // _NS_PER_HOUR
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+        hour1_start = (hour0_bucket + 1) * _NS_PER_HOUR
+
+        # The FIRST rollover attempt fails.
+        original = strategy._emit_diagnostics_row
+        calls: list[int] = []
+
+        def _flaky(*, hour_utc_start_ns: int, final: bool) -> bool:
+            calls.append(hour_utc_start_ns)
+            if len(calls) == 1:
+                raise RuntimeError("simulated emission fault")
+            return original(hour_utc_start_ns=hour_utc_start_ns, final=final)
+
+        strategy._emit_diagnostics_row = _flaky  # type: ignore[method-assign]
+
+        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=hour1_start))
+        assert _rows(path) == []  # the first attempt failed -- nothing written
+        assert strategy._diag_hourly_bucket == hour0_bucket  # bucket did NOT advance
+
+        # The SAME closed hour is retried on the next in-hour-1 tick.
+        strategy.on_quote_tick(
+            _quote(INTERIOR_ID, ask="0.41", ts_event=hour1_start + NS_PER_MIN)
+        )
+        rows = _rows(path)
+        assert len(rows) == 1
+        assert rows[0]["hour_utc_start_ns"] == hour0_bucket * _NS_PER_HOUR
+        assert strategy._diag_hourly_bucket == hour0_bucket + 1

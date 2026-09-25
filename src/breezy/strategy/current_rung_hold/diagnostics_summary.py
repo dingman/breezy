@@ -73,6 +73,9 @@ class DiagnosticsSummarySink:
         self._errors = 0
         self._capped = 0
         self._cap_logged = False
+        #: Silent-failure review (2026-09-25): one-shot latch for the
+        #: write-failure WARNING below, mirroring `_cap_logged`.
+        self._error_logged = False
         self._path: Path | None = None
         self._bytes_written = 0
         if path is not None:
@@ -131,6 +134,14 @@ class DiagnosticsSummarySink:
                 handle.write("\n")
         except OSError:
             self._errors += 1
-            logger.exception("DiagnosticsSummarySink: failed to append to %s", self._path)
+            # Silent-failure review (2026-09-25): a persistent write fault
+            # (a since-removed directory, a full disk) would otherwise log
+            # a full traceback on EVERY hourly emission for the rest of the
+            # process's life -- deduped to once per process, mirroring
+            # `_cap_logged` above. `self._errors` itself is never capped, so
+            # a caller can still tell "many failures" from "one".
+            if not self._error_logged:
+                self._error_logged = True
+                logger.exception("DiagnosticsSummarySink: failed to append to %s", self._path)
             return
         self._bytes_written += len(encoded)

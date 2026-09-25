@@ -1228,6 +1228,7 @@ class ContinuousRungHoldStrategy(Strategy):
         later in-place mutation of `self.diagnostics.counts` can never
         retroactively change an ALREADY-COMPUTED baseline.
         """
+        sink = self._diagnostics_summary
         return {
             "diagnostics": dict(self.diagnostics.counts),
             "refusals": dict(self.refusals.counts),
@@ -1236,6 +1237,13 @@ class ContinuousRungHoldStrategy(Strategy):
             "offer_tape_capped": self.offer_tape.sidecar_capped,
             "bid_only_in_window": self._bid_only_in_window_frames,
             "no_out_of_band": self._no_out_of_band_frames,
+            #: Silent-failure review (2026-09-25): the sidecar's OWN health
+            #: mirrored into the NEXT row it (or, if it is itself the thing
+            #: failing, the log line alone) can still deliver -- `0`/`0`
+            #: when there is no sink at all, exactly like every other
+            #: counter here defaults to "nothing happened".
+            "diagnostics_summary_errors": 0 if sink is None else sink.errors,
+            "diagnostics_summary_capped": 0 if sink is None else sink.capped,
         }
 
     def _maybe_roll_diagnostics(self, *, now_ns: int) -> None:
@@ -1257,22 +1265,33 @@ class ContinuousRungHoldStrategy(Strategy):
         if bucket <= self._diag_hourly_bucket:
             return
         closed_hour_start_ns = self._diag_hourly_bucket * _NS_PER_HOUR
-        self._diag_hourly_bucket = bucket
-        self._run_observability(
+        emitted = self._run_observability(
             "continuous_rung_hold diagnostics-summary rollover failed",
             lambda: self._emit_diagnostics_row(
                 hour_utc_start_ns=closed_hour_start_ns, final=False,
             ),
         )
+        # Silent-failure review (2026-09-25): the bucket (and therefore the
+        # baseline `_emit_diagnostics_row` itself updates) advances ONLY on
+        # a successful emission. A failure leaves both untouched, so the
+        # NEXT tick -- in the SAME new hour -- retries emitting the SAME
+        # closed hour's deltas rather than silently losing that hour's data
+        # the moment a transient fault clears.
+        if emitted:
+            self._diag_hourly_bucket = bucket
 
-    def _emit_diagnostics_row(self, *, hour_utc_start_ns: int, final: bool) -> None:
+    def _emit_diagnostics_row(self, *, hour_utc_start_ns: int, final: bool) -> bool:
         """F-2 Design: one INFO log line (Output 1) plus one JSONL row
         (Output 2, schema ``crh_diag_hourly_v1``) per emission -- deltas
         since the LAST emission for `diagnostics`, `refusals`, `takes`,
         `no_takes` and `offer_tape.sidecar_capped`, plus the two F-2
         coordinator counters. Never raises: called only from inside
         `_run_observability` (the rollover path) or `_flush_diagnostics_
-        summary_final` (also wrapped there).
+        summary_final` (also wrapped there). Returns `True` on completion --
+        `_maybe_roll_diagnostics` only advances its bucket once this
+        returns (silent-failure review 2026-09-25): `_run_observability`
+        itself returns `None` on a caught exception, so the caller can tell
+        "emitted" from "raised" without a second flag.
         """
         baseline = self._diag_hourly_baseline
         if baseline is None:
@@ -1297,12 +1316,19 @@ class ContinuousRungHoldStrategy(Strategy):
         no_oob_delta = cast(int, current["no_out_of_band"]) - cast(
             int, baseline["no_out_of_band"]
         )
+        summary_errors_delta = cast(int, current["diagnostics_summary_errors"]) - cast(
+            int, baseline["diagnostics_summary_errors"]
+        )
+        summary_capped_delta = cast(int, current["diagnostics_summary_capped"]) - cast(
+            int, baseline["diagnostics_summary_capped"]
+        )
         station = ",".join(self._config.stations)
         emitted_at_ns = self.clock.timestamp_ns()
         self.log.info(
             f"diagnostics_hourly: station={station} hour_utc={hour_utc_start_ns} "
             f"diag={diag_delta} refusals={refusals_delta} takes=+{takes_delta} "
             f"no_takes=+{no_takes_delta} tape_capped=+{tape_capped_delta} "
+            f"summary_errors=+{summary_errors_delta} summary_capped=+{summary_capped_delta} "
             f"build_sha={self._build_sha}"
         )
         row: dict[str, object] = {
@@ -1320,11 +1346,14 @@ class ContinuousRungHoldStrategy(Strategy):
             "offer_tape_capped": tape_capped_delta,
             "bid_only_in_window": bid_only_delta,
             "no_out_of_band": no_oob_delta,
+            "diagnostics_summary_errors": summary_errors_delta,
+            "diagnostics_summary_capped": summary_capped_delta,
             "final": final,
         }
         if self._diagnostics_summary is not None:
             self._diagnostics_summary.append(row)
         self._diag_hourly_baseline = current
+        return True
 
     def _flush_diagnostics_summary_final(self) -> None:
         """F-2 Design: "Emit a `final` row in `on_stop`". No-op if this
@@ -1702,6 +1731,14 @@ class ContinuousRungHoldStrategy(Strategy):
             if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
                 return
             if self._latch.is_intent_open():
+                # Silent-failure review (2026-09-25): this WAIT is silent on
+                # `diagnostics`/`refusals` by design (AC4 above), but it is
+                # still a genuine `open_intent_wait` -- routed through the
+                # SAME F-4 observation `_hunt_tick`'s own check uses, so it
+                # is not invisible to `last_open_intent_wait`/the log line.
+                # Deduped by the SAME per-process state (minute bucket,
+                # intent_id) either check already shares.
+                self._maybe_observe_open_intent_wait(now_ns=now_ns)
                 return
             if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
                 self._hunt_no_only(

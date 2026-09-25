@@ -87,3 +87,31 @@ class TestDiagnosticsSummarySinkAppend:
     def test_negative_max_bytes_rejected(self) -> None:
         with pytest.raises(ValueError):
             DiagnosticsSummarySink(None, max_bytes=0)
+
+
+class TestErrorLoggingIsDeduped:
+    def test_repeated_write_failures_log_exactly_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Silent-failure review (2026-09-25): a persistent write fault must
+        not log a full traceback on every single append -- deduped to once
+        per process, mirroring the half-cap/cap WARNs. `errors` itself still
+        counts every failure."""
+        import logging
+
+        path = tmp_path / "diagnostics_summary_2026-09-25.jsonl"
+        sink = DiagnosticsSummarySink(path)
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated disk fault")
+
+        monkeypatch.setattr(Path, "open", _boom)
+
+        caplog.set_level(logging.ERROR)
+        sink.append({"pid": 1})
+        sink.append({"pid": 2})
+        sink.append({"pid": 3})
+
+        assert sink.errors == 3
+        exception_records = [r for r in caplog.records if r.exc_info is not None]
+        assert len(exception_records) == 1
