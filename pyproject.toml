@@ -168,6 +168,41 @@ forbidden_modules = ["nautilus_trader"]
 # reasoning, and the same flag, as the `.com` adapter contract above.
 allow_indirect_imports = true
 
+[[tool.importlinter.contracts]]
+name = "AUD-18 D6(i): the hypothesis ledger stays outside the live import graph, both ways"
+type = "forbidden"
+# `breezy.analysis.hypothesis_ledger` is a PURE core -- registration and alpha
+# bookkeeping only -- so it never needs, and must never gain, a path into the
+# live node's own graph. The broader "live path never imports breezy.analysis"
+# contract above already covers this module transitively; this contract is
+# narrower and DELIBERATELY redundant with it: it names the module itself (not
+# the whole layer) so a future `analysis` module that DOES need `strategy`
+# (e.g. a triage script reusing settlement config) never has to touch this
+# rule, while `hypothesis_ledger` staying analysis-layer-only per AUD-18 SS5 is
+# pinned independently of how the rest of `analysis` evolves.
+# `breezy.execution` is not a top-level package in this repo (execution-egress
+# code lives under `breezy.adapters.polymarket_us.exec`, already covered by
+# banning `breezy.adapters` wholesale); import-linter's `forbidden` contract
+# requires every named module to exist, so it is not listed by that name here.
+source_modules = ["breezy.analysis.hypothesis_ledger"]
+forbidden_modules = [
+    "breezy.runtime",
+    "breezy.adapters",
+    "breezy.strategy",
+]
+allow_indirect_imports = false
+
+[[tool.importlinter.contracts]]
+name = "AUD-18 D6(i): the live import graph never reaches into the hypothesis ledger"
+type = "forbidden"
+source_modules = [
+    "breezy.runtime",
+    "breezy.adapters",
+    "breezy.strategy",
+]
+forbidden_modules = ["breezy.analysis.hypothesis_ledger"]
+allow_indirect_imports = false
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
