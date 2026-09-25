@@ -18,6 +18,7 @@ from typing import Self
 import pytest
 
 from breezy.runtime.trade_supervisor_core import LAUNCH_WINDOW_END_UTC
+from tests.support.real_tree_write_guard import install_real_tree_write_guard
 
 _REAL_HOME = Path.home()
 _REAL_TALLY_LOG = _REAL_HOME / ".local" / "share" / "breezy" / "derived" / "family_tally_v2.log"
@@ -28,24 +29,25 @@ _POST_LAUNCH = dt.time(17, 15)
 _PRE_LAUNCH = dt.time(15, 30)
 
 
-def _stat_or_none(path: Path) -> tuple[int, float] | None:
-    try:
-        stat_result = path.stat()
-    except FileNotFoundError:
-        return None
-    return (stat_result.st_size, stat_result.st_mtime)
-
-
 @pytest.fixture(scope="module", autouse=True)
 def _guard_real_tally_log_untouched() -> Iterator[None]:
-    """L-27: this suite must not write the operator's real tally log."""
-    before = _stat_or_none(_REAL_TALLY_LOG)
+    """L-27: this suite must not write the operator's real tally log.
+
+    A `(size, mtime)` before/after stat diff flakes here for the same
+    reason `test_live_fill_scoring_chain_contract.py`'s tree-snapshot guard
+    did (see that module's guard comment): the scorer's own timers append
+    to this exact log concurrently, independent of this suite. A
+    `sys.addaudithook`-based guard only ever sees writes THIS interpreter
+    performs, so it attributes writes to this test process instead of
+    racing a live writer.
+    """
+    guard = install_real_tree_write_guard(_REAL_TALLY_LOG)
+    guard.active = True
     yield
-    after = _stat_or_none(_REAL_TALLY_LOG)
-    assert after == before, (
-        "a test in tests/unit/test_structural_pin_guard.py modified the REAL "
-        f"tally log at {_REAL_TALLY_LOG} -- (size, mtime) changed from "
-        f"{before} to {after}"
+    guard.active = False
+    assert not guard.offenses, (
+        "a test in tests/unit/test_structural_pin_guard.py wrote to the REAL "
+        f"tally log at {_REAL_TALLY_LOG}:\n" + "\n".join(guard.offenses)
     )
 
 

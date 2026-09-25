@@ -111,6 +111,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_strategy_subscribed_seen,
     self_check,
 )
+from tests.support.real_tree_write_guard import install_real_tree_write_guard
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -131,14 +132,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _REAL_HOME = Path.home()
 _REAL_SUPERVISOR_LOG_DIR = _REAL_HOME / ".local" / "share" / "breezy" / "logs"
-
-
-def _stat_or_none(path: Path) -> tuple[int, float] | None:
-    try:
-        stat_result = path.stat()
-    except FileNotFoundError:
-        return None
-    return (stat_result.st_size, stat_result.st_mtime)
 
 
 @pytest.fixture(autouse=True)
@@ -170,19 +163,26 @@ def _isolate_home_and_reset_supervisor_logger(monkeypatch, tmp_path):
 
 @pytest.fixture(scope="module", autouse=True)
 def _guard_real_supervisor_log_untouched():
-    """Module-scoped finalizer: snapshot the REAL supervisor log's
-    size/mtime (via the never-monkeypatched ``_REAL_HOME`` above) before
-    the first test in this module runs, and assert it is byte-for-byte
-    unchanged after the last one. Read-only ``stat`` calls only -- this
-    never opens, truncates, or edits that file.
+    """Module-scoped finalizer: this module must never WRITE the operator's
+    real supervisor log.
+
+    A `(size, mtime)` before/after stat diff (the previous form of this
+    guard) is racy: a live supervisor process can append to this exact log
+    concurrently, independent of this suite, and a stat diff cannot tell
+    that apart from a write by a leaked handler in this process (see
+    `test_live_fill_scoring_chain_contract.py`'s guard comment for the same
+    race in the catalog/derived trees). A `sys.addaudithook`-based guard
+    only ever sees writes THIS interpreter performs, so it attributes a
+    write to this test process instead of racing a live writer.
     """
-    before = _stat_or_none(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
+    guard = install_real_tree_write_guard(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
+    guard.active = True
     yield
-    after = _stat_or_none(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
-    assert after == before, (
-        "a test in tests/unit/test_trade_supervisor.py modified the REAL "
-        f"supervisor log at {supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR)} "
-        f"-- (size, mtime) changed from {before} to {after}"
+    guard.active = False
+    assert not guard.offenses, (
+        "a test in tests/unit/test_trade_supervisor.py wrote to the REAL "
+        f"supervisor log at {supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR)}:\n"
+        + "\n".join(guard.offenses)
     )
 
 
