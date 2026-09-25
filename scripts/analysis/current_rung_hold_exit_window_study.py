@@ -97,6 +97,7 @@ from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from portfolio_roi_report import (
+    PortfolioRoiReportMalformedFieldError,
     UnknownPortfolioRoiSchemaError,
     read_portfolio_roi_report,
 )
@@ -249,47 +250,108 @@ _PNL_RECONCILIATION_LATCH_FILENAME: Final[str] = ".pnl_reconciliation_mismatch.j
 #: (`exit_gate.py:55`'s `pm_us_crh_exit_v4` stays `DRAFT_NOT_REGISTERED`) --
 #: any non-zero divergence is therefore an alarm, not expected slack.
 _RECONCILIATION_TOLERANCE: Final[Decimal] = Decimal(0)
+#: Coordinator ruling (2026-09-25, domain review items 2/3): the exit-window
+#: study runs at 15:20Z; AUD-04 (`breezy-portfolio-roi.timer`) runs at
+#: 17:40Z. Comparing today's cumulative sum_hold_pnl against YESTERDAY's
+#: AUD-04 total at zero tolerance produced spurious mismatches. A report
+#: older than this many days past the run date is stale and SKIPPED rather
+#: than compared.
+_MAX_AUD04_STALENESS_DAYS: Final[int] = 2
+#: Domain review item 3: this caveat must appear in the stderr line AND the
+#: alert detail text, not only in a docstring.
+_AUD04_RECONCILIATION_CAVEAT: Final[str] = (
+    "report-level total, not per-trial; offsetting per-trial errors are invisible"
+)
+
+
+def _utc_date_from_ns(now_ns: int) -> str:
+    return dt.datetime.fromtimestamp(now_ns / 1_000_000_000, tz=dt.UTC).date().isoformat()
+
+
+def aud04_reconciliation_readiness(
+    *, settled_through: str, run_date: str, max_staleness_days: int = _MAX_AUD04_STALENESS_DAYS,
+) -> tuple[str | None, str | None]:
+    """Decide whether AUD-04's report can be reconciled against today's run,
+    and if so, the CUTOFF to restrict both sides to (domain review item 2).
+
+    Returns ``(cutoff, skip_reason)`` -- exactly one is ``None``.
+    ``settled_through`` (`PortfolioRoiReportView.settled_through`) is
+    AUD-04's own climate-day bound past which its daily rows are provisional
+    (`apply_settled_through`'s docstring) -- the best available "as-of"
+    field the published schema carries; used here as the join cutoff for
+    BOTH sides, never assumed same-day. Skips (never compares mismatched
+    periods) when ``settled_through`` does not parse as an ISO-8601 date, or
+    when it is more than ``max_staleness_days`` before ``run_date``.
+    """
+    try:
+        settled_through_date = dt.date.fromisoformat(settled_through)
+    except ValueError:
+        return None, (
+            f"AUD-04 settled_through={settled_through!r} is not a usable ISO-8601 date"
+        )
+    try:
+        run_date_parsed = dt.date.fromisoformat(run_date)
+    except ValueError:
+        return None, f"run_date={run_date!r} is not a usable ISO-8601 date"
+    age_days = (run_date_parsed - settled_through_date).days
+    if age_days > max_staleness_days:
+        return None, (
+            f"WARN: AUD-04 report is stale -- settled_through={settled_through} is "
+            f"{age_days} day(s) before run_date={run_date} (max {max_staleness_days})"
+        )
+    return settled_through, None
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class Aud04ReconciliationResult:
-    """One reconciliation read against AUD-04's published report.
+    """One reconciliation read against AUD-04's published report, restricted
+    on BOTH sides to `cutoff` (domain review item 2 -- "reconcile like with
+    like", never today's cumulative exit-side sum against yesterday's
+    AUD-04 total).
 
-    **Residual limitation, stated honestly rather than silently narrowed:**
-    AUD-04's `schema_version` reader (`portfolio_roi_report
-    .read_portfolio_roi_report`) exposes only a REPORT-LEVEL
-    `realised_pnl_after_fees_total` today -- it carries no per-`trial_id`
-    breakdown to join against. The plan's literal spec ("inner join on
-    trial_id ... matches to the cent on every joined row") therefore cannot
-    be implemented against AUD-04's CURRENT published schema without AUD-04
-    adding that breakdown (its own stated mirror obligation, AUD-04 plan
-    §8 AC#4) -- this is a genuine cross-item dependency gap, not something
-    this item can close unilaterally by editing another item's file. Until
-    that field exists, this compares `sum_hold_pnl` over EVERY row this
-    study has ever produced against AUD-04's report-level total for the
-    same period -- a real, standing, alerting check (not a no-op), but
-    coarser than the per-row form the plan specifies.
+    **Residual limitation, stated honestly rather than silently narrowed
+    (domain review item 3 -- also carried into the stderr line and the alert
+    detail, not only here):** AUD-04's `schema_version` reader
+    (`portfolio_roi_report.read_portfolio_roi_report`) exposes only a
+    REPORT-LEVEL `realised_pnl_after_fees_total` today -- it carries no
+    per-`trial_id` breakdown to join against, so offsetting per-trial errors
+    on either side are invisible to this check. The plan's literal spec
+    ("inner join on trial_id ... matches to the cent on every joined row")
+    therefore cannot be implemented against AUD-04's CURRENT published
+    schema without AUD-04 adding that breakdown (its own stated mirror
+    obligation, AUD-04 plan §8 AC#4) -- a genuine cross-item dependency gap,
+    not something this item can close unilaterally by editing another
+    item's file. This is a real, standing, alerting check today (not a
+    no-op), but coarser than the per-row form the plan specifies.
     """
 
     matched: bool
+    cutoff: str
     sum_hold_pnl: Decimal | None
     aud04_realised_pnl_after_fees_total: Decimal
     divergence: Decimal | None
 
 
 def reconcile_with_aud04(
-    *, sum_hold_pnl: Decimal | None, aud04_realised_pnl_after_fees_total: Decimal,
+    *, rows: Sequence[PositionExitRow], cutoff: str, aud04_realised_pnl_after_fees_total: Decimal,
 ) -> Aud04ReconciliationResult:
-    """Pure comparison -- no I/O. `sum_hold_pnl is None` (an empty corpus)
-    reconciles trivially against a zero AUD-04 total only; any non-zero
-    AUD-04 total against an empty study is an unjoined-row mismatch."""
+    """Pure comparison -- no I/O. Restricts the exit-side sum to positions
+    with `climate_day <= cutoff` (the same universe/cutoff AUD-04's own
+    `settled_through` bounds), never the study's full cumulative history.
+    An empty cutoff-restricted set reconciles trivially against a zero
+    AUD-04 total only; any non-zero AUD-04 total against an empty
+    cutoff-restricted study is an unjoined-row mismatch.
+    """
+    cutoff_rows = tuple(row for row in rows if row.position.climate_day <= cutoff)
+    known_hold_pnl = [row.hold_pnl for row in cutoff_rows if row.hold_pnl is not None]
+    sum_hold_pnl = sum(known_hold_pnl, Decimal(0)) if known_hold_pnl else None
     if sum_hold_pnl is None:
         divergence = aud04_realised_pnl_after_fees_total
     else:
         divergence = sum_hold_pnl - aud04_realised_pnl_after_fees_total
     matched = abs(divergence) <= _RECONCILIATION_TOLERANCE
     return Aud04ReconciliationResult(
-        matched=matched, sum_hold_pnl=sum_hold_pnl,
+        matched=matched, cutoff=cutoff, sum_hold_pnl=sum_hold_pnl,
         aud04_realised_pnl_after_fees_total=aud04_realised_pnl_after_fees_total,
         divergence=divergence,
     )
@@ -301,14 +363,15 @@ def apply_pnl_reconciliation_ladder(
     """Same ladder cadence as `apply_corpus_frozen_ladder`: `matched=True` is
     fresh (silent, or one `INFO` `..._CLEARED` recovering from a streak);
     `matched=False` increments the streak toward a weekly `WARN`, daily
-    `CRITICAL` at `streak >= 14`."""
+    `CRITICAL` at `streak >= 14`. The detail text always carries the
+    report-level-total caveat (domain review item 3)."""
     previous_streak = latch.streak
     return _apply_ladder(
         is_fresh=matched, latch=latch, now_ns=now_ns,
         stale_event=EXIT_PNL_RECONCILIATION_MISMATCH_EVENT,
         cleared_event=EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT,
-        stale_detail=f"streak={previous_streak + 1}",
-        cleared_detail=f"streak_len={previous_streak}",
+        stale_detail=f"streak={previous_streak + 1} caveat={_AUD04_RECONCILIATION_CAVEAT}",
+        cleared_detail=f"streak_len={previous_streak} caveat={_AUD04_RECONCILIATION_CAVEAT}",
     )
 
 
@@ -931,35 +994,54 @@ def main(
         emit_alert(resolved_sink, alert_payload)
 
     # AUD-07 standing reconciliation with AUD-04 (§6, "on any date both
-    # artefacts exist"). Skipped entirely -- never faked as matched -- when
-    # AUD-04's artefact for this date was not supplied.
+    # artefacts exist"). Skipped entirely -- never faked as matched, and
+    # never compared across mismatched periods -- when AUD-04's artefact for
+    # this date was not supplied, is unreadable/malformed, or is stale.
     if args.aud04_report is not None:
         try:
             aud04_view = read_portfolio_roi_report(args.aud04_report)
-        except (OSError, UnknownPortfolioRoiSchemaError) as exc:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            UnknownPortfolioRoiSchemaError,
+            PortfolioRoiReportMalformedFieldError,
+        ) as exc:
             print(
                 f"[exit-window-study] AUD-04 reconciliation SKIPPED: could not read "
                 f"{args.aud04_report}: {type(exc).__name__}",
                 file=sys.stderr,
             )
         else:
-            reconciliation = reconcile_with_aud04(
-                sum_hold_pnl=summary.sum_hold_pnl,
-                aud04_realised_pnl_after_fees_total=aud04_view.realised_pnl_after_fees_total,
+            run_date = _utc_date_from_ns(resolved_now_ns)
+            cutoff, skip_reason = aud04_reconciliation_readiness(
+                settled_through=aud04_view.settled_through, run_date=run_date,
             )
-            print(
-                f"[exit-window-study] AUD-04 reconciliation: matched={reconciliation.matched} "
-                f"divergence={reconciliation.divergence}",
-                file=sys.stderr,
-            )
-            reconciliation_latch_path = args.out_root / _PNL_RECONCILIATION_LATCH_FILENAME
-            reconciliation_latch = alert_ladder.read_latch_state(reconciliation_latch_path)
-            new_reconciliation_latch, reconciliation_payload = apply_pnl_reconciliation_ladder(
-                matched=reconciliation.matched, latch=reconciliation_latch, now_ns=resolved_now_ns,
-            )
-            alert_ladder.write_latch_state(reconciliation_latch_path, new_reconciliation_latch)
-            if reconciliation_payload is not None:
-                emit_alert(resolved_sink, reconciliation_payload)
+            if skip_reason is not None:
+                print(
+                    f"[exit-window-study] AUD-04 reconciliation SKIPPED: {skip_reason}",
+                    file=sys.stderr,
+                )
+            else:
+                assert cutoff is not None
+                reconciliation = reconcile_with_aud04(
+                    rows=rows, cutoff=cutoff,
+                    aud04_realised_pnl_after_fees_total=aud04_view.realised_pnl_after_fees_total,
+                )
+                print(
+                    f"[exit-window-study] AUD-04 reconciliation: matched={reconciliation.matched} "
+                    f"cutoff={cutoff} divergence={reconciliation.divergence} "
+                    f"caveat={_AUD04_RECONCILIATION_CAVEAT}",
+                    file=sys.stderr,
+                )
+                reconciliation_latch_path = args.out_root / _PNL_RECONCILIATION_LATCH_FILENAME
+                reconciliation_latch = alert_ladder.read_latch_state(reconciliation_latch_path)
+                new_reconciliation_latch, reconciliation_payload = apply_pnl_reconciliation_ladder(
+                    matched=reconciliation.matched, latch=reconciliation_latch,
+                    now_ns=resolved_now_ns,
+                )
+                alert_ladder.write_latch_state(reconciliation_latch_path, new_reconciliation_latch)
+                if reconciliation_payload is not None:
+                    emit_alert(resolved_sink, reconciliation_payload)
 
     if total_fetch_outage:
         print(

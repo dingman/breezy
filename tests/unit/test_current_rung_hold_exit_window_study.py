@@ -347,11 +347,12 @@ def test_a_threatened_confirmation_after_the_exit_side_empties_yields_a_positive
 def _synthetic_row(
     *, trial_id: str, first_threatened_ts_ns: int | None, first_dead_ts_ns: int | None,
     last_executable_ts_ns: int | None, hold_pnl_value: Decimal, r_dead_pnl: Decimal,
-    r_threat_pnl: Decimal, r_best_pnl: Decimal,
+    r_threat_pnl: Decimal, r_best_pnl: Decimal, climate_day: str | None = None,
 ) -> ewr.PositionExitRow:
     position = _position(filled_at_ns=_ns_at(14, 5))
     position = ewc.FilledPosition(
-        trial_id=trial_id, station=position.station, climate_day=position.climate_day,
+        trial_id=trial_id, station=position.station,
+        climate_day=climate_day if climate_day is not None else position.climate_day,
         season=position.season, instrument_id=position.instrument_id, leg=position.leg,
         rung=position.rung, fill_px=position.fill_px, fee=position.fee,
         held_qty=position.held_qty, filled_at_ns=position.filled_at_ns,
@@ -660,15 +661,34 @@ def _write_minimal_aud04_report(
 
 class TestAud04Reconciliation:
     def test_a_matching_total_reconciles(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
         result = study_mod.reconcile_with_aud04(
-            sum_hold_pnl=Decimal("0.61"), aud04_realised_pnl_after_fees_total=Decimal("0.61"),
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.61"),
         )
         assert result.matched is True
         assert result.divergence == Decimal(0)
+        assert result.cutoff == "2026-01-10"
 
     def test_a_mismatched_total_does_not_reconcile_and_names_the_divergence(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
         result = study_mod.reconcile_with_aud04(
-            sum_hold_pnl=Decimal("0.61"), aud04_realised_pnl_after_fees_total=Decimal("0.50"),
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.50"),
         )
         assert result.matched is False
         assert result.divergence == Decimal("0.11")
@@ -677,7 +697,7 @@ class TestAud04Reconciliation:
         self,
     ) -> None:
         result = study_mod.reconcile_with_aud04(
-            sum_hold_pnl=None, aud04_realised_pnl_after_fees_total=Decimal("0.50"),
+            rows=(), cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.50"),
         )
         assert result.matched is False
         assert result.divergence == Decimal("0.50")
@@ -689,11 +709,100 @@ class TestAud04Reconciliation:
         _write_minimal_aud04_report(report_path, realised_pnl_after_fees_total=Decimal("0.61"))
 
         view = prr.read_portfolio_roi_report(report_path)
+        rows = (
+            _synthetic_row(
+                trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
         result = study_mod.reconcile_with_aud04(
-            sum_hold_pnl=Decimal("0.61"),
+            rows=rows, cutoff=view.settled_through,
             aud04_realised_pnl_after_fees_total=view.realised_pnl_after_fees_total,
         )
         assert result.matched is True
+
+    def test_a_row_after_the_cutoff_is_excluded_from_the_exit_side_sum(self) -> None:
+        """Domain review item 2: "reconcile like with like" -- a settlement
+        landing AFTER AUD-04's cutoff must not itself produce a mismatch."""
+        rows = (
+            _synthetic_row(
+                trial_id="in-window", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="after-cutoff", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("9.99"),
+                r_dead_pnl=Decimal("9.99"), r_threat_pnl=Decimal("9.99"),
+                r_best_pnl=Decimal("9.99"),
+                climate_day="2026-01-11",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.61"),
+        )
+        assert result.matched is True
+        assert result.sum_hold_pnl == Decimal("0.61")
+
+    def test_a_genuine_divergence_within_the_same_cutoff_is_a_mismatch(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="in-window", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.10"),
+        )
+        assert result.matched is False
+        assert result.divergence == Decimal("0.51")
+
+
+class TestAud04ReconciliationReadiness:
+    """Domain review item 2: reconcile like with like -- restrict both sides
+    to AUD-04's own `settled_through` cutoff; skip (never compare mismatched
+    periods) on an unusable or stale cutoff."""
+
+    def test_a_fresh_report_yields_the_settled_through_cutoff(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="2026-01-08", run_date="2026-01-09",
+        )
+        assert cutoff == "2026-01-08"
+        assert skip_reason is None
+
+    def test_a_report_exactly_at_the_staleness_bound_is_not_skipped(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="2026-01-01", run_date="2026-01-03",
+        )
+        assert cutoff == "2026-01-01"
+        assert skip_reason is None
+
+    def test_a_report_older_than_two_days_is_skipped_with_a_warn_line_naming_its_age(
+        self,
+    ) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="2026-01-01", run_date="2026-01-05",
+        )
+        assert cutoff is None
+        assert skip_reason is not None
+        assert "WARN" in skip_reason
+        assert "4 day(s)" in skip_reason
+
+    def test_an_unparseable_settled_through_is_skipped_with_a_stated_reason(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="not-a-date", run_date="2026-01-05",
+        )
+        assert cutoff is None
+        assert skip_reason is not None
+        assert "not-a-date" in skip_reason
 
 
 class TestPnlReconciliationLadder:
@@ -729,6 +838,78 @@ class TestPnlReconciliationLadder:
             study_mod._PNL_RECONCILIATION_LATCH_FILENAME
             != study_mod._FROZEN_STREAK_LATCH_FILENAME
         )
+
+    def test_the_mismatch_alert_carries_the_report_level_total_caveat(self) -> None:
+        """Domain review item 3: the caveat must be in the alert detail text,
+        not only in a docstring."""
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert study_mod._AUD04_RECONCILIATION_CAVEAT in payload.detail
+
+    def test_the_cleared_alert_also_carries_the_caveat(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+        latch, clear_payload = study_mod.apply_pnl_reconciliation_ladder(
+            matched=True, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert study_mod._AUD04_RECONCILIATION_CAVEAT in clear_payload.detail
+
+
+class TestAud04MalformedArtifactHandling:
+    """Domain review item 1: a malformed AUD-04 artefact must degrade to the
+    SKIPPED path -- never crash the run -- and the study must still write
+    its own summary."""
+
+    def test_corrupt_json_skips_and_still_writes_the_summary(
+        self, tmp_path: Path,
+    ) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_corrupt.json"
+        report_path.write_text("{ not valid json")
+
+        with pytest.raises(json.JSONDecodeError):
+            prr.read_portfolio_roi_report(report_path)
+
+        # The exact exception main() must catch and degrade from:
+        try:
+            prr.read_portfolio_roi_report(report_path)
+        except (
+            OSError,
+            json.JSONDecodeError,
+            prr.UnknownPortfolioRoiSchemaError,
+            prr.PortfolioRoiReportMalformedFieldError,
+        ) as exc:
+            caught: Exception | None = exc
+        else:
+            caught = None
+        assert caught is not None
+
+    def test_a_malformed_field_skips_and_still_writes_the_summary(
+        self, tmp_path: Path,
+    ) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_malformed.json"
+        _write_minimal_aud04_report(report_path, realised_pnl_after_fees_total=Decimal("0.61"))
+        payload = json.loads(report_path.read_text())
+        payload["realised_pnl_after_fees_total"] = 0.61  # must be a decimal-shaped STR
+        report_path.write_text(json.dumps(payload))
+
+        with pytest.raises(prr.PortfolioRoiReportMalformedFieldError):
+            prr.read_portfolio_roi_report(report_path)
+
+    # The full main()-level integration tests (a real offline run, via the
+    # SAME fakes as test_one_station_429_is_missing_..., with a corrupt and
+    # a malformed --aud04-report) live below, after _study_argv/
+    # _install_offline_study_fakes are defined:
+    # test_main_degrades_to_skipped_on_a_corrupt_aud04_artefact_and_still_writes_output
+    # test_main_degrades_to_skipped_on_a_malformed_aud04_artefact_and_still_writes_output
 
 
 # ---------------------------------------------------------------------------
@@ -976,10 +1157,12 @@ def _seed_cached_asos(cache_dir: Path, city: str) -> None:
     path.write_text("station,valid,metar\n", encoding="utf-8")
 
 
-def _study_argv(tmp_path: Path, *, cache_dir: Path) -> list[str]:
+def _study_argv(
+    tmp_path: Path, *, cache_dir: Path, aud04_report: Path | None = None,
+) -> list[str]:
     catalog = tmp_path / "catalog"
     catalog.mkdir(exist_ok=True)
-    return [
+    argv = [
         "--state-db", str(tmp_path / "state.sqlite"),
         "--stations", _FAILED_CITY, _CACHED_CITY,
         "--since-climate-day", _FETCH_CLIMATE_DAY,
@@ -992,6 +1175,9 @@ def _study_argv(tmp_path: Path, *, cache_dir: Path) -> list[str]:
         "--run-stamp", "synthetic-fetch",
         "--out-root", str(tmp_path / "out"),
     ]
+    if aud04_report is not None:
+        argv += ["--aud04-report", str(aud04_report)]
+    return argv
 
 
 def test_one_station_429_is_missing_and_the_cached_station_still_produces_rows(
@@ -1065,3 +1251,53 @@ def test_every_station_429_exits_non_zero_and_names_each_station(
     for city in (_FAILED_CITY, _CACHED_CITY):
         named = [item for item in missing if city in item and "429" in item]
         assert named, missing
+
+
+# ---------------------------------------------------------------------------
+# Domain review item 1: a malformed AUD-04 artefact degrades to the SKIPPED
+# path rather than crashing the run -- the study's own summary is still
+# written. Full main()-level runs, via the SAME offline fakes as the
+# fetch-failure tests above (real state-db/catalog/network paths never
+# touched).
+# ---------------------------------------------------------------------------
+
+
+def test_main_degrades_to_skipped_on_a_corrupt_aud04_artefact_and_still_writes_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+    aud04_report = tmp_path / "PRIVATE_portfolio_roi_corrupt.json"
+    aud04_report.write_text("{ not valid json")
+
+    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report))
+
+    assert code == 0  # the failed station is a missing input, never a crash
+    report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
+    assert report.exists()
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["summary"]["n_positions"] == 1  # the cached station still produced its row
+
+
+def test_main_degrades_to_skipped_on_a_malformed_aud04_artefact_and_still_writes_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+    aud04_report = tmp_path / "PRIVATE_portfolio_roi_malformed.json"
+    _write_minimal_aud04_report(aud04_report, realised_pnl_after_fees_total=Decimal("0.61"))
+    payload = json.loads(aud04_report.read_text())
+    payload["realised_pnl_after_fees_total"] = 0.61  # must be a decimal-shaped STR
+    aud04_report.write_text(json.dumps(payload))
+
+    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report))
+
+    assert code == 0
+    report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
+    assert report.exists()
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert written["summary"]["n_positions"] == 1
