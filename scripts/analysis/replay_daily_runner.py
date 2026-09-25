@@ -620,6 +620,9 @@ _BLOCKED_REMEDIATION: Final[dict[str, str]] = {
     "FAMILY_PARAMS_ARGV_MISMATCH": (
         "family_params.json argv_sha256 != the vector this runner passed"
     ),
+    "FAMILY_PARAMS_SIDECAR_MALFORMED": (
+        "family_params.json is not valid provenance; re-run, do not default provenance"
+    ),
 }
 _DEFAULT_BLOCKED_REMEDIATION: Final[str] = "investigate the wrapper log for this reason"
 
@@ -841,25 +844,50 @@ def _resolved_driver_argv(argv: Sequence[str]) -> list[str]:
     return list(argv)
 
 
+_REQUIRED_FAMILY_PARAMS_STR_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "family_id",
+        "manifest_sha256",
+        "manifest_taker_fee_coefficient",
+        "engine_required_fee_coefficient",
+        "engine_params_source",
+        "composition_kind",
+    },
+)
+_REQUIRED_FAMILY_PARAMS_BOOL_KEYS: Final[frozenset[str]] = frozenset({"params_match"})
+
+
+def _family_params_sidecar_is_well_formed(payload: Mapping[str, object]) -> bool:
+    for key in _REQUIRED_FAMILY_PARAMS_STR_KEYS:
+        if not isinstance(payload.get(key), str):
+            return False
+    for key in _REQUIRED_FAMILY_PARAMS_BOOL_KEYS:
+        if not isinstance(payload.get(key), bool):
+            return False
+    return True
+
+
 def _verified_family_params(
     sidecar_path: Path, expected_argv_sha256: str,
 ) -> tuple[dict[str, object] | None, str | None]:
     """`(payload, None)` when the sidecar's `argv_sha256` matches, else
     `(None, blocked_reason)`. A missing file and a digest that does not
     match are different reasons; both are re-runnable provenance refusals.
-    An unreadable or non-object file cannot be verified, so it mismatches.
+    An unreadable, non-object, or schema-invalid file is malformed.
     """
     if not sidecar_path.is_file():
         return None, "FAMILY_PARAMS_SIDECAR_MISSING"
     try:
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return None, "FAMILY_PARAMS_ARGV_MISMATCH"
+        return None, "FAMILY_PARAMS_SIDECAR_MALFORMED"
     if not isinstance(payload, dict):
-        return None, "FAMILY_PARAMS_ARGV_MISMATCH"
+        return None, "FAMILY_PARAMS_SIDECAR_MALFORMED"
     actual = payload.get("argv_sha256")
     if not isinstance(actual, str) or actual != expected_argv_sha256:
         return None, "FAMILY_PARAMS_ARGV_MISMATCH"
+    if not _family_params_sidecar_is_well_formed(payload):
+        return None, "FAMILY_PARAMS_SIDECAR_MALFORMED"
     return payload, None
 
 
