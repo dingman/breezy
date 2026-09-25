@@ -187,6 +187,36 @@ def test_read_station_candidates_refuses_an_unknown_schema_version(tmp_path: Pat
     assert str(path) in str(excinfo.value)
 
 
+def test_candidate_rows_excludes_a_key_the_tape_already_discovered() -> None:
+    """AUD-09b dup fix (2026-09-25): a candidate colliding with a key the
+    tape-derived census already classified must not also emit a
+    `CANDIDATE_UNSUPPORTED_STATION` placeholder for that same key -- that
+    collision is exactly what produced the production duplicate
+    `('NYC', '2026-09-25')`."""
+    candidate = _fake_candidate(venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-25")
+
+    rows = _candidate_rows_to_replay_sufficiency(
+        [candidate],
+        computed_day="2026-09-25",
+        exclude_keys=frozenset({("NYC", "2026-09-25")}),
+    )
+
+    assert rows == ()
+
+
+def test_candidate_rows_keeps_a_key_the_tape_never_discovered() -> None:
+    candidate = _fake_candidate(venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-20")
+
+    rows = _candidate_rows_to_replay_sufficiency(
+        [candidate],
+        computed_day="2026-09-24",
+        exclude_keys=frozenset({("NYC", "2026-09-25")}),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].reason == CANDIDATE_UNSUPPORTED_STATION
+
+
 def test_candidate_rows_never_enter_the_replay_queue() -> None:
     """H1: a candidate is recorded, never queued -- it always carries the
     closed CANDIDATE_UNSUPPORTED_STATION reason and no winner instance."""
@@ -343,6 +373,47 @@ class TestLiveAndEmptyInstancesGetARow:
         )
 
         assert rows == ()
+
+    def test_a_registry_seed_candidate_never_duplicates_a_live_tape_key(
+        self, tmp_path: Path,
+    ) -> None:
+        """Reproduces the 2026-09-25 production incident byte-for-byte: NYC
+        seeded as a candidate for the SAME still-open day a live instance is
+        already capturing real NYC quotes under. `run_census` must emit
+        exactly one row for `(NYC, climate_day)`, carrying the real
+        tape-derived verdict -- never the two-row
+        `NO_CLEAN_INSTANCE`/`CANDIDATE_UNSUPPORTED_STATION` duplicate
+        `read_replay_sufficiency` correctly refused."""
+        instance_dir = tmp_path / "live" / "instance-live-1"
+        _write_binary_option_feather(
+            instance_dir / "binary_option_0.feather",
+            [_weather_binary_option(station="NYC", climate_day="2026-09-25", ts_init=1)],
+        )
+        _write_truncated_open_stream(
+            instance_dir / "quote_tick_0.feather", [_quote_tick(0), _quote_tick(1)]
+        )
+
+        register_path = tmp_path / "station_candidates.jsonl"
+        candidate = _fake_candidate(
+            venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-25",
+        )
+        register_path.write_text(json.dumps(asdict(candidate)) + "\n", encoding="utf-8")
+
+        now_ns = int(dt.datetime.now(dt.UTC).timestamp() * 1_000_000_000)
+
+        rows = run_census(
+            catalog_root=tmp_path,
+            subdirectory="live",
+            work_root=tmp_path / "work",
+            station_candidates_path=register_path,
+            computed_day=COMPUTED_DAY,
+            now_ns=now_ns,
+        )
+
+        keys = [(row.station, row.climate_day) for row in rows]
+        assert keys.count(("NYC", "2026-09-25")) == 1
+        row = next(r for r in rows if (r.station, r.climate_day) == ("NYC", "2026-09-25"))
+        assert row.reason == NO_CLEAN_INSTANCE
 
 
 # ---------------------------------------------------------------------------
