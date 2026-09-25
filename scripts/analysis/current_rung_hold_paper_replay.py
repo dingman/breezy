@@ -79,6 +79,7 @@ from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
 from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_of
 from breezy.analysis.replay_sufficiency import decision_window_ns
+from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
@@ -307,7 +308,7 @@ def _select_replay_capture_instruments(
     climate_day: dt.date,
     station: str,
     start: int,
-    end: int,
+    end: int | None,
 ) -> list[TapeInstrument]:
     """Call the shared selector with replay-only narrowing when the callable
     exposes those keywords.
@@ -328,6 +329,73 @@ def _select_replay_capture_instruments(
         if accepts_kwargs or name in parameters:
             kwargs[name] = value
     return selector(catalog, **kwargs)
+
+
+def _replay_station_day_instrument_ids(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str,
+) -> tuple[str, ...]:
+    by_id: dict[str, object] = {}
+    for instrument in catalog.instruments():  # type: ignore[attr-defined]
+        by_id.setdefault(instrument.id.value, instrument)
+
+    return tuple(
+        sorted(
+            instrument_id
+            for instrument_id, instrument in by_id.items()
+            if read_weather_bucket_facts(instrument.info).applies_to(station, climate_day)
+        ),
+    )
+
+
+def _latest_ts_init_at_or_before(records: Sequence[object], bound_ns: int) -> int | None:
+    candidates = [
+        record.ts_init
+        for record in records
+        if getattr(record, "ts_init", bound_ns + 1) <= bound_ns
+    ]
+    return max(candidates, default=None)
+
+
+def _warmup_start_ns_for_replay(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str,
+    window_start_ns: int,
+) -> int:
+    """Earliest latest pre-window book/quote timestamp needed for warm state.
+
+    The replay must start before the decision window when a book or quote
+    already existed at the boundary. For each selected instrument and each
+    relevant market-data type, query the catalog up to the window start and
+    keep only that type's latest pre-window timestamp. The replay read starts
+    at the earliest of those latest timestamps so every instrument/type with
+    prior state is present without replaying older history.
+    """
+    warmup_points: list[int] = []
+    for instrument_id in _replay_station_day_instrument_ids(
+        catalog,
+        climate_day=climate_day,
+        station=station,
+    ):
+        depths = catalog.order_book_depth10(  # type: ignore[attr-defined]
+            instrument_ids=[instrument_id],
+            end=window_start_ns,
+        )
+        quotes = catalog.quote_ticks(  # type: ignore[attr-defined]
+            instrument_ids=[instrument_id],
+            end=window_start_ns,
+        )
+        depth_start = _latest_ts_init_at_or_before(depths, window_start_ns)
+        quote_start = _latest_ts_init_at_or_before(quotes, window_start_ns)
+        if depth_start is not None:
+            warmup_points.append(depth_start)
+        if quote_start is not None:
+            warmup_points.append(quote_start)
+    return min(warmup_points, default=window_start_ns)
 
 
 class FeeScheduleMismatchError(ValueError):
@@ -1513,16 +1581,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     std_utc_offset_hours = default_registry().climate_day_window(
         WEATHER_VENUE, args.station,
     ).std_utc_offset_hours
-    market_start_ns, market_end_ns = decision_window_ns(
+    market_start_ns, _market_end_ns = decision_window_ns(
         climate_day=climate_day,
         std_utc_offset_hours=std_utc_offset_hours,
+    )
+    market_read_start_ns = _warmup_start_ns_for_replay(
+        catalog,
+        climate_day=climate_day,
+        station=args.station,
+        window_start_ns=market_start_ns,
     )
     tape_instruments = _select_replay_capture_instruments(
         catalog,
         climate_day=climate_day,
         station=args.station,
-        start=market_start_ns,
-        end=market_end_ns,
+        start=market_read_start_ns,
+        end=None,
     )
     listed_days = sorted({ti.facts.climate_day for ti in tape_instruments})
     assert_requested_days_are_listed([climate_day], listed_days)
