@@ -57,6 +57,22 @@ _validate() {
 }
 
 _PATH_RE='^[A-Za-z0-9_./-]+$'
+
+# Interpreter: BREEZY_PYTHON if set (validated), else the repo/snapshot's own
+# .venv python next to this script. NEVER a bare system `python3` -- it lacks
+# numpy/scipy, and a wrong interpreter must fail loudly, not late.
+_resolve_python() {
+  if [ -n "${BREEZY_PYTHON:-}" ]; then
+    _validate "$BREEZY_PYTHON" "$_PATH_RE" "BREEZY_PYTHON"
+    printf '%s\n' "$BREEZY_PYTHON"
+    return 0
+  fi
+  local cand
+  cand="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/.venv/bin/python"
+  [ -x "$cand" ] || _die "BREEZY_PYTHON unset and no executable .venv python at $cand"
+  printf '%s\n' "$cand"
+}
+PY="$(_resolve_python)"
 _INT_RE='^[0-9]+$'
 _ISO_UTC_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 
@@ -115,7 +131,7 @@ _median_wall_s() {
   # -- never a bare traceback -- so the caller routes it through the same
   # FAILED path as a cell-command failure.
   local stage_dir="$1" class="$2"
-  "${BREEZY_PYTHON:-python3}" - "$stage_dir" "$class" <<'PYEOF'
+  "$PY" - "$stage_dir" "$class" <<'PYEOF'
 import json
 import math
 import pathlib
@@ -240,7 +256,7 @@ else
     n_reps="${N_REPS:?N_REPS is required}"
     _validate "$n_reps" "$_INT_RE" "N_REPS"
     argv=(
-      "${BREEZY_PYTHON:-python3}" "$script_dir/aud07_m1c_census.py"
+      "$PY" "$script_dir/aud07_m1c_census.py"
       --stage "$stage" --code-sha "$code_sha"
       --cells "$cell_index:$((cell_index + 1))"
       --reps-per-cell "$n_reps"
@@ -257,7 +273,7 @@ else
     _validate "$boundary_mode" '^(pure|refined)$' "BOUNDARY_MODE"
 
     argv=(
-      "${BREEZY_PYTHON:-python3}" "$script_dir/aud07_live_rule_crossing_sim.py"
+      "$PY" "$script_dir/aud07_live_rule_crossing_sim.py"
       --stage "$stage" --code-sha "$code_sha"
       --cells "$cell_index:$((cell_index + 1))"
       --n-reps "$n_reps" --npts "$npts"
