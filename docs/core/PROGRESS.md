@@ -45,36 +45,37 @@ merge. AUD plans: `docs/plans/backlog/AUDIT_2026-09-21/` (authoritative per item
 
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| ING-2 | **CRIT** | Quote-tape ingest fails EVERY run since 09-24 20:00Z (20×, unit failed now): `MemoryHigh=4G` < backlog working set → thrash + 30-min kill (L-49); the node resolves instruments from the converted catalog, so the next 16:50Z launch finds 0. Now: one-off drain (`systemd-run`, MemoryHigh 10G, pause+restore both ingest timers) before 16:50Z. Durable: bounded per-run memory / instruments-before-depths (`quote_tape_ingest_cli.py`) + unit sizing | L-49; 09-24 drain |
-| AUD-09b | HIGH | Merge `backlog/aud-09b-b26-memory-2026-09-25` + `backlog/aud-09b-replay-bound-2026-09-25` (worktrees exist); B26 ruling (cgroup peak 11 GiB FAIL vs RSS 2.49 GB PASS); `enable breezy-replay-daily.timer` (failed "unit to trigger vanished"); ratchet B5 at 2× | AUD-09 amendment §7, §10.9 |
+| ING-2 | HIGH | S1 definitions-first merged c5d1e24 (+T3b fix c7d2b85), live 21:00Z; 09-25 backlog drained (10G one-off). Owed: S2 per-run deadline, S3 bounded memory (Stage-0 measure first) — post-09:00Z rotation conversion still exceeds 4G; watch 09-26 09:45Z runs | L-49; c5d1e24 |
+| AUD-09b | HIGH | Both branches merged (3147576); B26 PASS-CONDITIONAL (`RULING_aud09b_B26_2026-09-25.md`). Next: C2 warm capped manual `breezy-replay-daily.service` run in a quiet window (≈10:30–14:00Z, no study) → wall <900s, anon <3G, MemAvailable → `reset-failed` + `enable --now` timer → B5 at 2×C2 (cap 4G) in AUD-09 §8 | B26 ruling |
 | AUD-07 | HIGH | M1c CAL-a/b/c (transient `breezy-aud07-m1c-seg-0926a` 09-26 02:10Z) → census/eps_pin/cal_check → 20k sweep (49 cells) → 80k → `--final` → `RULING_aud07_mixed_side_ldobf_<date>.md` (AC7); then base §7 steps 7, 7b, 8; branch-I tests 10–16 only if M2 = I | AUD-07 Exec-Rev2 §4-6 |
-| AUD-18 | HIGH | Link+enable `breezy-hypothesis-triage.{service,timer}` (absent on host); §7 step 9 first watched run; ledger has no stratum/draw binding → every record MISSING_STRATUM_BINDING (`hypothesis_ledger.py:234`, triage `:484`) — new schema_version + binding | AUD-18; ae56ab8 |
+| AUD-18 | MED | Deployed 09-25 21:17Z: triage timer enabled (01:20Z), ledger = CLOSED + H-NO-SIDE UNDERPOWERED (merge 9a8a8fe). Open: §7 step 9 first tick 09-26 01:20Z (AC5 vs snapshot); H-ARCHIVE-RECAL registration slice (unblocked 329380f); schema-v2 binding BLOCKED until a look-taking registration or REPLAY_VALIDITY flip (+ replay timer healthy) | AUD-18 plan amendment |
 | AUD-02 | MED | WP-D1 `discovery_set_equality.py` + note; A0 needs ≥5 consecutive fee-evidence days (1 so far); coordinator block / Amendment C pointer (DoD 10) | completion plan §2, §5 |
 | AUD-05 | MED | §7 step 8: observe three consecutive 17:20Z v4 tally runs (1 so far) | AUD-05 §7 |
 | AUD-10b | MED | Evidence doc `PROMOTION_PROPOSAL_MECHANISM_<date>.md` (C1–C20); unattended runs need the replay timer | AUD-10 §8 |
-| TALLY-V2 | MED | `breezy-family-tally@pm_us_crh_v2` fails (structural-pin-guard `NO_NODE`, 09-25 17:20Z): fix or retire per the tally-scope ruling | host |
+| TALLY-V2 | LOW | Not a tally defect: v2 pin guard fails closed on NO_NODE because no node ran 09-24/09-25 (R-5 keeps v2 tally). Re-verify 09-26 17:20Z after a normal node launch; code fix only with new evidence | R-5 ruling §3(2) |
 | HUNT-1 | CRIT/S | Strategy-lead ruling: close as moot (daf81a1: no hour clears zero) or name the all-hours build. NOT covered by AUD-01 (its §5/§12 exclude it) | `CONTINUOUS_HUNTING_GAP_2026-09-20.md` |
 | SP-5/R-3 | S | Coverage diagnostic (blips vs outages vs dead-recorder rows) + §9 tolerance ruling (options i–iv, v1 §7 re-registration); unowned by any AUD item | `COVERAGE_KILL_CLOCK_2026-09-12.md` |
 | R-7 | S | `PositionReportingLag`: keep+wire on the create path or delete (`position_reporting_lag.py:8`, zero producers) | P7 §8 |
 | SP-3r | LOW | `_has_durable_fill_record` still a stub (`exec/client.py:1672`); order-1 (09-05) no-`OrderSubmitted` escalation | AUD-13 plan :146 |
 | SP-7r | LOW | Doc truths H-2..H-6 (`deploy/systemd/README.md:3` "PREPARED, NOT ACTIVATED", `native_reuse_audit` :118/:131, GO_LIVE_BLOCKERS → gl1_gl4) | `HYGIENE_FREE_FIXES_2026-09-12.md` |
 | ADM-1 | LOW | Σq admission skips IN_FLIGHT legs (`trial_day_latch.py:1546`): count them, or RED-prove the intent latch serializes | diagnosis §4 |
-| FU-1 | MED | Position monitor `KeyError` on `^no` ids (`monitor_wiring.py:113,116`; `_facts` is YES-only) — fall back to the YES sibling (as `continuous_strategy.py:1142`) | 09-22 MDW fill log |
+| FU-1b | MED | NO positions now monitored (FU-1 merged 7e3462d, live at next node spawn) but unmarked: no `^no` depth subscribed; decide together with any exit-family arming (missing marks currently force book_not_executable). FU-1c short-YES netting deferred (reconcile refuses non-LONG) | FU-1 plan r2 |
 | FU-2 | MED | NO-side `no_take_shadow`/take lines omit the observation reading behind `p_miss_lower` (`continuous_strategy.py:2605`) — log value + ts | 09-22 audit |
 | FU-3 | MED | ROI: attribute $40.00 + $0.99 UNEXPLAINED_CAPITAL_FLOW (09-13/09-14; `PRIVATE_portfolio_roi_2026-09-25.md:38`); add `_run`-level test for `DuplicateScoredTrialEconomicsMismatchError` | AUD-04 |
 | FU-4 | LOW | Exit-window study: catch `OSError` on cached-file read per station; add N/M-stations-loaded line | 09-24 review |
 | FU-5 | LOW | Resolver: overlapping connect passes (`client.py:1605`/`:1632`) log a false "could not be loaded" — serialize or say "load in flight" | node log 09-24 20:15Z |
 | FU-6 | LOW | `halt_enforced: yes/no` digest field from the halt store | `AUD-03-FOLLOWUP-a1-digest-line.md` |
 | AUD-11 | BLOCKED | §7 step 5 captured-tape proof: backtest OOM at 6G on base and branch — rerun with a higher cap in a quiet window | `POINT_IN_TIME_CLASSIFICATION_2026-09-21.md:134` |
+| FU-7 | LOW | Follow-ups 09-25: registrar `--registered-at` raw-string date compare (validate ISO); ingest `results_by_cls` collapses duplicate data_types; salvage `NotImplementedError` retried every run (instance 7f353f94 mark_price 09-05); T7 test name says DEAD but drives THREATENED; no test drives a NO leg to a real `submit_exit`; ingest R4 (03–09Z boot never sees day-D defs) | 09-25 reviews |
 | AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family (both step-8 horizons UNDERPOWERED) | AUD-06b |
 
-**Order:** ING-2 (before 16:50Z) → AUD-09b → TALLY-V2 → AUD-18 deploy → AUD-07 (on its M1c clock) →
-AUD-02/05/10b → FU-1..FU-3 → rulings HUNT-1, SP-5/R-3, R-7 (coordinator + peer loop) → LOW items.
+**Order:** AUD-09b C2 → ING-2 S2/S3 → AUD-07 (on its M1c clock) → AUD-18 step 9 + ARCHIVE-RECAL →
+AUD-02/05/10b → FU-1b..FU-3 → rulings HUNT-1, SP-5/R-3, R-7 (coordinator + peer loop) → LOW items.
 
 **KILL clock / live n (09-25):** champion (v4) counter 10 covered-listed station-days (09-20..09-25);
 v4 tally n=3 (1 win), under one completed look. Exec store 9 fills (newest 09-22). A1 halt SET 09-24.
 
-**Closed since 09-21 (commit = record):** AUD-01a/b, 02b, 03, 04, 06a (R-11 INDETERMINATE), 08a/b,
+**Closed since 09-21 (commit = record):** FU-1 7e3462d, AUD-09b merges 3147576, AUD-18 steps 3-6 + registration 9a8a8fe, ING-2 S1 c5d1e24; AUD-01a/b, 02b, 03, 04, 06a (R-11 INDETERMINATE), 08a/b,
 09a, 10a, 12a/b, 13a-d (R-1, R-2), 14a/b, 15, 16, 17, 19a-c; R-5, R-12 rulings; WP-R1 fix e83fc5c;
 live-store pins 7a39577; stuck intent CP05MNWMAWP6 retired 09-24. EXIT-1→AUD-07, MP-B→AUD-06b, SP-4→AUD-09.
 

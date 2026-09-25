@@ -1551,3 +1551,35 @@ coordinator installs and enables it.
 **Rollback:** `systemctl --user disable --now breezy-fee-evidence-pull.timer`
 and revert the commit. Nothing reads `data/evidence/fee_drift/` except the
 evidence doc's own dated notes, so rollback is total.
+
+## `breezy-hypothesis-triage` — AUD-18 nightly hypothesis triage (DEPLOYED 2026-09-25 21:17Z)
+
+The timer fires at 01:20 UTC (`Persistent=true`). The service has no `[Install]` section and is started only by the timer. It is ordered `After=breezy-replay-daily.service`, but does not require it.
+
+```bash
+# 1. Confirm alerts.env exists (mode 600). Without it the unit's sink is log-only.
+ls -l ~/.config/breezy/alerts.env
+
+# 2. Link both units, following this repo's symlink convention (§2).
+ln -s /home/jon/breezy/deploy/systemd/breezy-hypothesis-triage.service ~/.config/systemd/user/
+ln -s /home/jon/breezy/deploy/systemd/breezy-hypothesis-triage.timer   ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# Any output from verify is a FAIL (verify exits 0 even on parse errors).
+systemd-analyze --user verify ~/.config/systemd/user/breezy-hypothesis-triage.{service,timer}
+
+# 3. Ledger records go through the registrar. Run each writer SEQUENTIALLY (L-50).
+.venv/bin/python scripts/analysis/hypothesis_register.py --registered-at 2026-09-20 \
+    --freeze-commit <40-hex> --register-forecast-taker-closed
+.venv/bin/python scripts/analysis/hypothesis_register.py --registered-at <YYYY-MM-DD> \
+    --register-underpowered H-NO-SIDE-2026-09
+
+# 4. Enable the timer. This starts nothing; no stamp file exists yet, so there is no catch-up run.
+systemctl --user enable --now breezy-hypothesis-triage.timer
+```
+
+Rules and checks:
+
+- **Never start the service by hand inside [16:35Z, 01:15Z).** Linking and enabling start nothing, so both may run at any time.
+- **Ledger path:** `~/.local/share/breezy/derived/hypothesis/hypothesis_ledger.jsonl`. The registrar and triage share this default, and neither the unit nor the wrapper sets `BREEZY_DERIVED_ROOT`.
+- **"CLEAN no look-taking hypothesis" appears in two cases:** when the ledger is absent, and when every record is zero-look. So check the ledger contents directly with `read_hypothesis_ledger` (L-30).

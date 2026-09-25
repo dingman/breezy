@@ -1444,6 +1444,11 @@ Run the full no-egress gate on the integration branch immediately after every sl
 ### How to apply
 After `git merge` on the base branch: gate → only then merge the next branch. When a merged evidence artefact's test fails on the base, the artefact is withdrawn until re-run on the base commit. Related: L-41, [[one-tree-many-agents-fakes-test-failures]].
 
+**Amendment (2026-09-25, ING-2 S1):** the environment can differ, not only the code. A new subprocess test asserted that `PYTHONPATH` was set, which is true only under the worktree convention. Its worktree full gate passed. The primary-tree gate after merge (c5d1e24) failed deterministically. Rules:
+- A test that spawns a Python child derives the child's `src` from the parent's own `breezy.__file__`, never from an env var.
+- The child asserts that it imports the same module path as the parent.
+- A worktree gate is not evidence that the integration branch is green.
+
 ## L-44 — Logic written for one leg silently mislabels the other; test each leg's terminal state (2026-09-15)
 
 ### What happened
@@ -1547,4 +1552,29 @@ Raising the timeout would only have lengthened the thrash. A unit killed by time
 When a unit fails with CPU/wall < 0.3, check `memory.high` throttling (`wchan`, major faults, swap peak) before touching timeouts. Size a memory ceiling against the current backlog's working set, not past peaks, and keep a downstream consumer's input (the catalog) from depending on one unbounded run.
 
 ### How to apply
-Triage line for any repeatedly failing unit: `systemctl --user show -p MemoryHigh,MemoryMax,TimeoutStartSec`, plus the journal's "Consumed X CPU over Y wall". Durable fix owed for ingest: bounded per-run memory and instruments-before-depths ordering. Related: L-29 (unbounded buffers), L-20 (the catalog you query is not the tape you capture).
+Triage line for any repeatedly failing unit: `systemctl --user show -p MemoryHigh,MemoryMax,TimeoutStartSec`, plus the journal's "Consumed X CPU over Y wall". Status of the ingest durable fix (2026-09-25):
+- Instruments-before-depths ordering is DELIVERED by ING-2 S1 (merge c5d1e24): a definitions-only pass over a frozen liveness snapshot runs before any tick type. A killed run still leaves resolvable instruments.
+- Still owed: S2 (a per-run deadline) and S3 (bounded per-run memory; measure first).
+- Until S3 lands, the conversion of a whole instance after rotation can still exceed 4G.
+
+Related: L-29 (unbounded buffers), L-20 (the catalog you query is not the tape you capture).
+
+## L-50 — Two writers of one rewrite-in-place file race even when both "append" (2026-09-25)
+
+### What happened
+A deploy agent ran two ledger registrar invocations (`hypothesis_register.py --register-forecast-taker-closed` and `--register-underpowered H-NO-SIDE-2026-09`) at the same time. Each one reads the whole ledger, adds its record and atomically replaces the file. Both records survived only because the runs did not overlap: the design did not rule out the loss, timing just happened to avoid it. An atomic `os.replace` makes each write whole, but it does not stop one write from overwriting the other.
+
+### Why this is binding
+The ledger, the exec-state DB, the halt store and the catalog markers are all read-modify-write state. With a lost-update race, both writers exit 0 and nothing looks wrong. The record is simply missing. For a hypothesis ledger that means an alpha slot or a zero-look disposition disappears silently.
+
+### The rule
+- Never run two writers of the same read-modify-write file or store concurrently.
+- Serialize them in the brief ("run step N only after step N−1 exits 0").
+- Or the writer holds a lock for its whole read-modify-write cycle.
+
+### How to apply
+- Deploy and ops briefs name each write step as sequential.
+- After any batch of writes, add a positive control that reads the store back and asserts the exact record set, as L-30 requires.
+- A writer CLI that lacks a lock is a backlog item, not a license to parallelize.
+
+Related: L-22 (an instance mutex serializes the read-modify-write), [[give-each-agent-its-own-scratchpad]].
