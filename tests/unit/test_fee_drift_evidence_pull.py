@@ -45,12 +45,18 @@ pull = _load_pull_module()
 COMPLETE_DAY_THRESHOLD: Decimal = pull.COMPLETE_DAY_THRESHOLD
 MARKET_LIST_QUOTA_KEY: str = pull.MARKET_LIST_QUOTA_KEY
 PER_SLUG_QUOTA_KEY: str = pull.PER_SLUG_QUOTA_KEY
+MAX_FALLBACK_PER_SLUG_CALLS: int = pull.MAX_FALLBACK_PER_SLUG_CALLS
+MAX_LIST_PAGES: int = pull.MAX_LIST_PAGES
+LIST_QUERY_ACTIVE: bool = pull.LIST_QUERY_ACTIVE
+LIST_QUERY_CLOSED: bool = pull.LIST_QUERY_CLOSED
+LIST_QUERY_ARCHIVED: bool = pull.LIST_QUERY_ARCHIVED
 PROTECTED_WINDOW_END_UTC = pull.PROTECTED_WINDOW_END_UTC
 PROTECTED_WINDOW_START_UTC = pull.PROTECTED_WINDOW_START_UTC
 is_protected_window = pull.is_protected_window
 list_weather_markets = pull.list_weather_markets
 pull_slug = pull.pull_slug
 run_once = pull.run_once
+worst_case_runtime_secs = pull.worst_case_runtime_secs
 
 
 class _FakePublicClient:
@@ -82,8 +88,15 @@ class _FakePublicClient:
         return response
 
 
-def _weather_market(slug: str) -> dict[str, Any]:
-    return {"slug": slug, "id": 1}
+def _weather_market(
+    slug: str, *, taker: str | None = None, maker: str | None = None
+) -> dict[str, Any]:
+    market: dict[str, Any] = {"slug": slug, "id": 1}
+    if taker is not None:
+        market["feeCoefficient"] = taker
+    if maker is not None:
+        market["makerCommissionsBasisPoints"] = maker
+    return market
 
 
 def _market_payload(*, taker: str | None = None, maker: str | None = None) -> dict[str, Any]:
@@ -422,3 +435,137 @@ async def test_protected_then_complete_same_day_upgrades_cleanly(tmp_path: Path)
     assert (day_dir / "slugs.json").exists()
     assert (day_dir / "summary.json").exists()
     _assert_manifest_matches_disk(day_dir)
+
+
+# ---------------------------------------------------------------------------
+# runtime fix (2026-09-25 live TimeoutStartSec failure): fee fields come off
+# the list response directly; per-slug GETs are a bounded fallback only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_query_is_scoped_to_the_currently_tradable_universe() -> None:
+    client = _FakePublicClient(list_pages=[{"markets": []}])
+    await list_weather_markets(client, limit=10)
+
+    query, _quota_key = client.list_calls[0]
+    assert query["active"] is LIST_QUERY_ACTIVE
+    assert query["closed"] is LIST_QUERY_CLOSED
+    assert query["archived"] is LIST_QUERY_ARCHIVED
+
+
+@pytest.mark.asyncio
+async def test_a_listed_fee_coefficient_needs_no_per_slug_get_at_all(tmp_path: Path) -> None:
+    """The actual fix: when every list entry already carries `feeCoefficient`,
+    `run_once` issues ZERO per-slug GETs. This is exactly the shape of the
+    real gateway response measured 2026-09-25 (0 missing across 4353
+    markets) -- the prior design's unconditional per-slug GET is what timed
+    out the first live run."""
+    cities = ["nyc", "lax", "chi", "hou", "phx"]
+    slugs = [
+        f"tc-temp-{city}high-2026-09-{day:02d}-gte72f"
+        for city in cities
+        for day in range(1, 11)
+    ]
+    client = _FakePublicClient(
+        list_pages=[
+            {"markets": [_weather_market(slug, taker="0.0695") for slug in slugs]}
+        ],
+    )
+    now = dt.datetime(2026, 9, 25, 10, 0, tzinfo=dt.UTC)
+
+    result = await run_once(client=client, output_root=tmp_path, now=now, list_limit=100)
+
+    assert client.slug_calls == []  # the fix: no per-slug GET issued
+    assert result.markets_listed == 50
+    assert result.ok_count == 50
+    assert result.complete is True
+    assert result.taker_values_observed == frozenset({"0.0695"})
+
+
+@pytest.mark.asyncio
+async def test_a_listed_entry_missing_fee_falls_back_to_one_per_slug_get(
+    tmp_path: Path,
+) -> None:
+    slug = "tc-temp-nychigh-2026-09-21-gte72f"
+    client = _FakePublicClient(
+        list_pages=[{"markets": [_weather_market(slug)]}],  # no feeCoefficient on the list entry
+        slug_responses={slug: _market_payload(taker="0.06")},
+    )
+    now = dt.datetime(2026, 9, 25, 10, 0, tzinfo=dt.UTC)
+
+    result = await run_once(client=client, output_root=tmp_path, now=now, list_limit=10)
+
+    assert client.slug_calls == [
+        (MARKET_BY_SLUG_PATH.format(slug=slug), PER_SLUG_QUOTA_KEY)
+    ]
+    assert result.ok_count == 1
+    assert result.taker_values_observed == frozenset({"0.06"})
+
+
+@pytest.mark.asyncio
+async def test_fallback_per_slug_gets_are_capped_and_overflow_is_recorded(
+    tmp_path: Path,
+) -> None:
+    n = MAX_FALLBACK_PER_SLUG_CALLS + 5
+    slugs = [f"tc-temp-nychigh-2026-09-{i:02d}-gte72f" for i in range(1, n + 1)]
+    # None of these list entries carry a fee -> every slug needs the fallback.
+    client = _FakePublicClient(
+        list_pages=[{"markets": [_weather_market(slug) for slug in slugs]}],
+        slug_responses={slug: _market_payload(taker="0.0695") for slug in slugs},
+    )
+    now = dt.datetime(2026, 9, 25, 10, 0, tzinfo=dt.UTC)
+
+    result = await run_once(client=client, output_root=tmp_path, now=now, list_limit=100)
+
+    assert len(client.slug_calls) == MAX_FALLBACK_PER_SLUG_CALLS
+    assert result.markets_listed == n
+    assert result.ok_count == MAX_FALLBACK_PER_SLUG_CALLS
+    overflow_reasons = {
+        s.reason for s in result.slugs if s.reason and "cap" in s.reason
+    }
+    assert len(overflow_reasons) == 1
+    assert str(MAX_FALLBACK_PER_SLUG_CALLS) in next(iter(overflow_reasons))
+
+
+def test_worst_case_runtime_secs_matches_the_documented_580_seconds() -> None:
+    # MAX_LIST_PAGES=50, DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE=6:
+    #   (50-6) * (60/6) = 440s
+    # MAX_FALLBACK_PER_SLUG_CALLS=20, DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE=6:
+    #   (20-6) * (60/6) = 140s
+    # total = 580s
+    assert worst_case_runtime_secs() == pytest.approx(580.0)
+    assert MAX_LIST_PAGES == 50
+    assert MAX_FALLBACK_PER_SLUG_CALLS == 20
+
+
+def test_worst_case_runtime_secs_is_zero_within_the_burst_allowance() -> None:
+    assert worst_case_runtime_secs(max_list_pages=6, max_fallback_calls=6) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# deploy: the shipped unit's TimeoutStartSec must exceed the worst-case bound
+# ---------------------------------------------------------------------------
+
+_SERVICE_PATH = REPO_ROOT / "deploy" / "systemd" / "breezy-fee-evidence-pull.service"
+
+#: Comfortable slack beyond the documented worst-case bound (process startup,
+#: DNS, TLS handshake, GC pauses -- none of which the pacing formula models).
+_TIMEOUT_MARGIN_SECS = 120
+
+
+def _service_timeout_start_sec() -> int:
+    for line in _SERVICE_PATH.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("TimeoutStartSec="):
+            return int(line.strip().split("=", 1)[1])
+    raise AssertionError(f"{_SERVICE_PATH} has no TimeoutStartSec= line")
+
+
+def test_service_timeout_exceeds_the_worst_case_bound_with_margin() -> None:
+    bound = worst_case_runtime_secs()
+    timeout = _service_timeout_start_sec()
+    assert timeout >= bound + _TIMEOUT_MARGIN_SECS, (
+        f"TimeoutStartSec={timeout} does not clear the worst-case bound "
+        f"{bound}s plus a {_TIMEOUT_MARGIN_SECS}s margin -- the exact failure "
+        "mode of the first live run"
+    )

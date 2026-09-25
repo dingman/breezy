@@ -13,6 +13,35 @@ never imports anything under ``breezy.adapters.polymarket_us.exec`` --
 verified by :func:`tests.unit.test_execution_egress_firewall_guard.find_execution_egress_modules`,
 which this module's own test asserts stays silent about it.
 
+**Runtime-fix redesign (2026-09-25, first live run TIMED OUT).** The original
+design GETed every listed weather slug individually. Measured against the
+real, unauthenticated, public gateway the same day: the ``categories=climate``
+list carries **4353** markets total since inception (paged to eof at
+``limit=500``, 9 pages) but only **58** are ``active=true&closed=false&
+archived=false`` (48 of which parse as a weather slug) -- and, decisively,
+**every single listed market object already carries its own
+``feeCoefficient``** (0 missing across all 4353). A per-slug GET for each was
+therefore both unnecessary (the field is already on the list response) and
+the actual cause of the timeout: paced at ``QUOTA_KEY_INSTRUMENTS``'s 6/min,
+4343 weather slugs would take roughly 12 hours, far past
+``TimeoutStartSec=900``. The fixed design (option (a), coordinator's
+preference order) reads ``feeCoefficient`` (and the candidate maker field)
+directly off each list entry; a per-slug GET (option (b)) is now only a
+BOUNDED fallback (:data:`MAX_FALLBACK_PER_SLUG_CALLS`) for the rare listed
+market whose entry itself lacks a parseable fee -- never the whole universe.
+
+**Denominator change, documented (coordinator's explicit ask).** "The day's
+listed weather slugs" now means the CURRENTLY tradable universe --
+``active=true, closed=false, archived=false`` -- not the full historical
+archive of every weather market ever listed. This matches
+``PolymarketUSMarketDiscoveryConfig``'s own defaults (``config.py:194-196``),
+so A0's denominator stays consistent with WP-D1's comparison against the
+live node's own discovered-slug snapshot, which uses the same filters. The
+95% completeness threshold is unchanged and, against this denominator, is
+still meaningful: 48 real weather markets, not thousands of already-settled
+historical ones whose fee is a frozen fact, not a daily observation.
+:data:`FEE_DRIFT_EVIDENCE_2026-09-25.md` records this change.
+
 **Pacing -- no new transport, no manual sleep.** Every ``get_public`` call
 below is budgeted under a ``quota_key`` that ``transport.py`` already enforces
 NATIVELY, client-side, via the Nautilus rate limiter
@@ -22,13 +51,23 @@ NATIVELY, client-side, via the Nautilus rate limiter
 pace their own reads under (``provider.py:639-641,684-687``). This script
 reuses those two keys rather than inventing pacing of its own:
 
-* ``PER_SLUG_QUOTA_KEY = QUOTA_KEY_INSTRUMENTS`` --
-  ``DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE = 6`` requests/minute
-  (``transport.py:126``), i.e. one per-slug ``GET /v1/market/slug/{slug}``
-  roughly every 10 seconds.
 * ``MARKET_LIST_QUOTA_KEY = QUOTA_KEY_DISCOVERY`` --
   ``DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE = 6`` requests/minute
   (``transport.py:125``) for each ``GET /v1/markets`` list page.
+* ``PER_SLUG_QUOTA_KEY = QUOTA_KEY_INSTRUMENTS`` --
+  ``DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE = 6`` requests/minute
+  (``transport.py:126``), now used ONLY for the bounded fallback
+  (:data:`MAX_FALLBACK_PER_SLUG_CALLS` calls, worst case).
+
+**Worst-case runtime bound, tested.** :func:`worst_case_runtime_secs` computes
+the documented upper bound from :data:`MAX_LIST_PAGES` and
+:data:`MAX_FALLBACK_PER_SLUG_CALLS` against a token-bucket quota
+(burst == requests/minute, then paced at ``60 / requests_per_minute``
+seconds/request -- the exact shape ``build_keyed_quotas`` constructs). At the
+current constants this is 580s; ``tests/unit/test_fee_drift_evidence_pull.py``
+asserts the shipped unit's ``TimeoutStartSec`` exceeds this bound plus a
+margin, so a future constant change that would blow the timeout fails CI
+instead of failing in production again.
 
 ``scripts/venue/polymarket_us_shape_capture.py`` itself performs no I/O (it is
 a pure value-free describe/write module), so there is no pacing constant to
@@ -108,6 +147,8 @@ from typing import Any, Protocol
 from breezy.adapters.polymarket_us.provider import MARKET_LIST_PATH
 from breezy.adapters.polymarket_us.symbology import parse_weather_slug
 from breezy.adapters.polymarket_us.transport import (
+    DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE,
+    DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE,
     QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_INSTRUMENTS,
 )
@@ -120,8 +161,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "COMPLETE_DAY_THRESHOLD",
+    "LIST_QUERY_ACTIVE",
+    "LIST_QUERY_ARCHIVED",
+    "LIST_QUERY_CLOSED",
     "MAKER_FEE_WIRE_KEY",
     "MARKET_LIST_QUOTA_KEY",
+    "MAX_FALLBACK_PER_SLUG_CALLS",
     "MAX_LIST_PAGES",
     "PER_SLUG_QUOTA_KEY",
     "PROTECTED_WINDOW_END_UTC",
@@ -136,6 +181,7 @@ __all__ = [
     "main",
     "pull_slug",
     "run_once",
+    "worst_case_runtime_secs",
 ]
 
 #: The venue's own wire field for taker theta -- read verbatim, never renamed
@@ -165,6 +211,23 @@ DEFAULT_LIST_PAGE_LIMIT: int = 100
 #: The venue's own weather/climate category, server-side filter
 #: (`PolymarketUSMarketDiscoveryConfig.categories` default, `config.py:193`).
 WEATHER_CATEGORY: str = "climate"
+
+#: Server-side filters matching `PolymarketUSMarketDiscoveryConfig`'s own
+#: defaults (`config.py:194-196`): only the CURRENTLY tradable universe.
+#: Measured 2026-09-25 against the real, unauthenticated gateway: 4353
+#: markets total under `categories=climate` since inception vs. 58 with
+#: these three filters applied (see module docstring, "Denominator change").
+LIST_QUERY_ACTIVE: bool = True
+LIST_QUERY_CLOSED: bool = False
+LIST_QUERY_ARCHIVED: bool = False
+
+#: Bound on option-(b) fallback per-slug GETs (a listed market whose OWN
+#: entry lacks a parseable fee -- never observed as of 2026-09-25, across
+#: 4353 markets, but a documented, tested safety net rather than an
+#: assumption). Combined with :data:`MAX_LIST_PAGES` this bounds
+#: :func:`worst_case_runtime_secs` well under the shipped unit's
+#: `TimeoutStartSec` -- see the timeout-bound test.
+MAX_FALLBACK_PER_SLUG_CALLS: int = 20
 
 #: [16:35Z, 01:15Z) -- the supervisor's LAUNCH/mid-day-watch/self-check span
 #: (`deploy/systemd/breezy-exit-window-study.timer`'s own comment; Rev 2.1
@@ -244,13 +307,17 @@ async def list_weather_markets(
     limit: int = DEFAULT_LIST_PAGE_LIMIT,
     max_pages: int = MAX_LIST_PAGES,
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
-    """Page ``MARKET_LIST_PATH`` to eof.
+    """Page ``MARKET_LIST_PATH`` to eof, scoped to the CURRENTLY tradable
+    universe (:data:`LIST_QUERY_ACTIVE`/:data:`LIST_QUERY_CLOSED`/
+    :data:`LIST_QUERY_ARCHIVED` -- see module docstring "Denominator change").
 
     Returns ``(raw_pages, weather_markets)``: every raw page payload (the
     day's denominator, stored verbatim) and the subset of listed markets that
     parse as a weather slug (client-side confirmation of the server-side
     ``categories=[climate]`` filter, mirroring `provider.py`'s own
-    belt-and-braces double-check).
+    belt-and-braces double-check). Each returned market dict carries its own
+    ``feeCoefficient`` -- the primary source `run_once` reads fees from,
+    never a per-slug GET.
     """
     raw_pages: list[Mapping[str, Any]] = []
     weather_markets: list[Mapping[str, Any]] = []
@@ -268,6 +335,9 @@ async def list_weather_markets(
                 "limit": limit,
                 "offset": offset,
                 "categories": [WEATHER_CATEGORY],
+                "active": LIST_QUERY_ACTIVE,
+                "closed": LIST_QUERY_CLOSED,
+                "archived": LIST_QUERY_ARCHIVED,
             },
             quota_key=MARKET_LIST_QUOTA_KEY,
         )
@@ -293,8 +363,42 @@ def _parse_decimal(raw: object) -> str | None:
         return None
 
 
+def _slug_result_from_market(slug: str, market: Mapping[str, Any]) -> SlugPullResult:
+    """Build a `SlugPullResult` straight from a market's own wire fields.
+
+    Shared by the PRIMARY path (a listed market's own entry, from
+    `list_weather_markets`) and the bounded FALLBACK path (`pull_slug`'s
+    decoded per-slug GET) -- one taker/maker extraction rule, never two.
+    """
+    taker_raw = market.get(TAKER_FEE_WIRE_KEY)
+    reason: str | None = None
+    taker: str | None = None
+    if taker_raw is None:
+        reason = f"missing {TAKER_FEE_WIRE_KEY!r}"
+    else:
+        taker = _parse_decimal(taker_raw)
+        if taker is None:
+            reason = f"unparseable {TAKER_FEE_WIRE_KEY!r}={taker_raw!r}"
+
+    maker_raw = market.get(MAKER_FEE_WIRE_KEY)
+    maker = None if maker_raw is None else (_parse_decimal(maker_raw) or str(maker_raw))
+
+    return SlugPullResult(
+        slug=slug,
+        ok=reason is None,
+        taker_fee_coefficient=taker,
+        maker_fee_wire=maker,
+        reason=reason,
+        raw=market,
+    )
+
+
 async def pull_slug(client: PublicReadClient, slug: str) -> SlugPullResult:
-    """One slug's raw-wire GET. Never raises -- a failure is recorded, not dropped."""
+    """FALLBACK per-slug raw-wire GET (option (b)) -- used ONLY for a listed
+    market whose own list entry lacked a parseable fee, bounded by
+    :data:`MAX_FALLBACK_PER_SLUG_CALLS` in `run_once`. Never raises -- a
+    failure is recorded, not dropped.
+    """
     try:
         payload = await client.get_public(
             MARKET_BY_SLUG_PATH.format(slug=slug),
@@ -321,26 +425,37 @@ async def pull_slug(client: PublicReadClient, slug: str) -> SlugPullResult:
             raw=None,
         )
 
-    taker_raw = market.get(TAKER_FEE_WIRE_KEY)
-    reason: str | None = None
-    taker: str | None = None
-    if taker_raw is None:
-        reason = f"missing {TAKER_FEE_WIRE_KEY!r}"
-    else:
-        taker = _parse_decimal(taker_raw)
-        if taker is None:
-            reason = f"unparseable {TAKER_FEE_WIRE_KEY!r}={taker_raw!r}"
+    return _slug_result_from_market(slug, market)
 
-    maker_raw = market.get(MAKER_FEE_WIRE_KEY)
-    maker = None if maker_raw is None else (_parse_decimal(maker_raw) or str(maker_raw))
 
-    return SlugPullResult(
-        slug=slug,
-        ok=reason is None,
-        taker_fee_coefficient=taker,
-        maker_fee_wire=maker,
-        reason=reason,
-        raw=market,
+def _worst_case_paced_seconds(request_count: int, *, requests_per_minute: int) -> float:
+    """Upper-bound wall-clock seconds for `request_count` requests under a
+    token-bucket quota of `requests_per_minute` with burst ==
+    `requests_per_minute` (the exact shape `build_keyed_quotas` constructs):
+    the first `requests_per_minute` requests are free (burst), then each
+    further request is paced at ``60 / requests_per_minute`` seconds.
+    """
+    if request_count <= requests_per_minute:
+        return 0.0
+    return (request_count - requests_per_minute) * (60.0 / requests_per_minute)
+
+
+def worst_case_runtime_secs(
+    *,
+    max_list_pages: int = MAX_LIST_PAGES,
+    max_fallback_calls: int = MAX_FALLBACK_PER_SLUG_CALLS,
+    list_requests_per_minute: int = DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE,
+    slug_requests_per_minute: int = DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE,
+) -> float:
+    """The documented worst-case wall-clock bound this script's design
+    guarantees: the list pagination cap plus the bounded per-slug fallback,
+    each paced under its own native quota. A deploy test asserts the shipped
+    unit's ``TimeoutStartSec`` exceeds this, plus a margin.
+    """
+    return _worst_case_paced_seconds(
+        max_list_pages, requests_per_minute=list_requests_per_minute
+    ) + _worst_case_paced_seconds(
+        max_fallback_calls, requests_per_minute=slug_requests_per_minute
     )
 
 
@@ -520,8 +635,15 @@ async def run_once(
     now: datetime | None = None,
     list_limit: int = DEFAULT_LIST_PAGE_LIMIT,
 ) -> EvidencePullResult:
-    """One day's evidence pull. Never raises on a venue-side failure of an
-    individual slug; only a malformed/hostile list response can raise
+    """One day's evidence pull.
+
+    PRIMARY path: fee fields come straight off each listed market's own list
+    entry (no per-slug GET). FALLBACK path: any listed market whose entry
+    lacked a parseable fee gets a per-slug GET, bounded by
+    :data:`MAX_FALLBACK_PER_SLUG_CALLS` -- an overflow beyond that cap is
+    recorded with a reason, never attempted, so the worst case stays bounded
+    (:func:`worst_case_runtime_secs`). Never raises on a venue-side failure of
+    an individual slug; only a malformed/hostile list response can raise
     (`list_weather_markets`'s page cap).
     """
     moment = now if now is not None else datetime.now(tz=UTC)
@@ -539,16 +661,46 @@ async def run_once(
         return _write_artifacts(result, day_dir)
 
     _raw_pages, weather_markets = await list_weather_markets(client, limit=list_limit)
-    slugs = [
-        m["slug"] for m in weather_markets if isinstance(m.get("slug"), str)
-    ]
-    results = tuple([await pull_slug(client, slug) for slug in slugs])
-    complete = _is_complete(len(slugs), results)
+
+    primary_results: list[SlugPullResult] = []
+    fallback_slugs: list[str] = []
+    for market in weather_markets:
+        slug = market.get("slug")
+        if not isinstance(slug, str):
+            continue
+        result = _slug_result_from_market(slug, market)
+        if result.ok:
+            primary_results.append(result)
+        else:
+            fallback_slugs.append(slug)
+
+    fallback_slugs.sort()  # deterministic which slugs get the bounded fallback
+    attempted = fallback_slugs[:MAX_FALLBACK_PER_SLUG_CALLS]
+    overflow = fallback_slugs[MAX_FALLBACK_PER_SLUG_CALLS:]
+    fallback_results = [await pull_slug(client, slug) for slug in attempted]
+    fallback_results.extend(
+        SlugPullResult(
+            slug=slug,
+            ok=False,
+            taker_fee_coefficient=None,
+            maker_fee_wire=None,
+            reason=(
+                f"fallback per-slug GET cap ({MAX_FALLBACK_PER_SLUG_CALLS}) "
+                "exceeded; not attempted"
+            ),
+            raw=None,
+        )
+        for slug in overflow
+    )
+
+    results = tuple(primary_results + fallback_results)
+    listed_count = len(primary_results) + len(fallback_slugs)
+    complete = _is_complete(listed_count, results)
     result = EvidencePullResult(
         date=date,
         complete=complete,
         reason=None,
-        markets_listed=len(slugs),
+        markets_listed=listed_count,
         slugs=results,
     )
     return _write_artifacts(result, day_dir)

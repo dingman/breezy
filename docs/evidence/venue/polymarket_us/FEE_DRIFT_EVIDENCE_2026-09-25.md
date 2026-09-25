@@ -10,6 +10,24 @@ Section 2 "A0" and its Rev 2.1 addendum. Producer:
 `scripts/venue/fee_drift_evidence_pull.py`, driven by
 `deploy/systemd/breezy-fee-evidence-pull.{service,timer}` (11:10 UTC daily).
 
+**Runtime-fix amendment (2026-09-25, before any observation was recorded).**
+The first live run (05:43Z) timed out at `TimeoutStartSec=900` with zero
+artifacts written: the original design GETed every listed weather slug
+individually, and the real universe under `categories=climate` is 4353
+markets since inception (paged to eof, `limit=500`) -- an unauthenticated,
+public per-slug GET for each, paced at 6/min, would take roughly 12 hours.
+Measured the same day: **every** listed market object already carries its
+own `feeCoefficient` (0 missing across all 4353), so the fixed design reads
+the fee straight off the list response and narrows the denominator to the
+**currently tradable universe** (`active=true, closed=false, archived=false`
+-- 58 markets that day, 48 of which parse as a weather slug), matching
+`PolymarketUSMarketDiscoveryConfig`'s own defaults and keeping this
+denominator consistent with WP-D1's. This amendment happens BEFORE the
+"Observations" table below has a single row, so it changes the
+pre-registered rule rather than loosening it after data arrived. See
+`scripts/venue/fee_drift_evidence_pull.py`'s module docstring for the full
+measurement and the fix.
+
 ## Pre-registered closing rule
 
 1. **Evidence set.** Only observations produced by this script's own daily
@@ -22,8 +40,10 @@ Section 2 "A0" and its Rev 2.1 addendum. Producer:
 
 2. **Complete day.** A UTC day counts as COMPLETE only if at least **95%**
    of that day's venue-listed weather slugs (the day's denominator: the
-   `GET /v1/markets?categories=climate` response, paged to eof and stored
-   verbatim by the pull script) returned a parseable `feeCoefficient`. A day
+   `GET /v1/markets?categories=climate&active=true&closed=false&archived=false`
+   response, paged to eof and stored verbatim by the pull script -- the
+   CURRENTLY tradable universe, per the runtime-fix amendment above, not the
+   full historical archive) returned a parseable `feeCoefficient`. A day
    below that threshold is recorded in the raw directory and in the table
    below, but does **not** count toward the required length.
 
