@@ -41,7 +41,9 @@ mirroring ``weather_common.costs.FeeCoefficientSource``:
   veto). This module never imports ``TrialDayLatch`` directly: the wiring
   site already holds the strategy's shared latch handle for the READ side of
   this state (``composition.family_halt_submit_veto``), and this is that
-  same idiom for the WRITE side.
+  same idiom for the WRITE side. May raise (e.g. the durable store's own
+  write failing) -- ``probe_once`` contains that separately from the
+  fetch/compare above; see its docstring.
 * ``alert_sink`` -- ``runtime.health.AlertSink``, resolved once at the
   wiring site via ``resolve_alert_sink()`` (already landed, ``f97c26f``);
   this module only calls ``emit_alert``.
@@ -78,7 +80,12 @@ probe to halt the family on every transient network hiccup, which would
 convert a probe interval's worth of ordinary read flakiness into a
 family-wide trading stop the existing per-order check does not itself
 impose. A confirmed DISAGREE is the only condition this probe treats as
-drift.
+drift. If the halt-set write itself then fails (the durable store, not the
+wire read), ``probe_once`` still returns ``"DISAGREE"`` -- the drift WAS
+found -- but emits a SEPARATE ``fee_drift_probe_halt_set_failed`` CRITICAL
+alert, distinct from the mismatch alert, so "halted" and "found drift but
+could not halt" never look the same in the alert stream. See
+``probe_once``'s own docstring.
 """
 
 from __future__ import annotations
@@ -288,7 +295,24 @@ class FeeDriftProbeActor(Actor):
     # -- the probe itself ---------------------------------------------------
 
     async def probe_once(self) -> str:
-        """Fetch, compare, alert/halt. Returns "AGREE" | "DISAGREE" | "UNKNOWN". Never raises."""
+        """Fetch, compare, alert/halt. Returns "AGREE" | "DISAGREE" | "UNKNOWN". Never raises.
+
+        A DISAGREE's halt-set is wrapped separately from the fetch/compare
+        above: ``set_family_halted`` is an injected write against a REAL
+        durable store (``TrialDayLatch.record_policy_halt`` at the wiring
+        site, which requires the submit-intent flock to still be held --
+        see that call site's own docstring for why it always is, for the
+        process's whole life, while the probe runs). A write can still fail
+        for reasons a read cannot (a corrupt store, a released lock this
+        probe does not itself control), and the DISAGREE finding -- the
+        confirmed drift itself -- must never be swallowed by that failure:
+        it is still alerted via ``_alert_mismatch`` and still counted and
+        returned as ``"DISAGREE"``. The halt-set failure gets its OWN,
+        distinct CRITICAL alert (``fee_drift_probe_halt_set_failed``) so an
+        operator can tell "drift detected, family halted" apart from
+        "drift detected, halt did NOT take" -- the second is materially
+        worse and must not look identical to the first in the alert stream.
+        """
         try:
             wire_fee = await self._wire_fee_fetcher()
         except Exception as exc:  # noqa: BLE001 - any read failure is UNKNOWN, never "agrees"
@@ -299,7 +323,11 @@ class FeeDriftProbeActor(Actor):
             self.counters["agree"] += 1
             return "AGREE"
         self._alert_mismatch(wire_fee)
-        self._set_family_halted(wire_fee)
+        try:
+            self._set_family_halted(wire_fee)
+        except Exception as exc:  # noqa: BLE001 - a halt-set failure must never crash the probe
+            self._alert_halt_set_failed(exc, wire_fee)
+            self.counters["halt_set_failed"] += 1
         self.counters["disagree"] += 1
         return "DISAGREE"
 
@@ -322,5 +350,24 @@ class FeeDriftProbeActor(Actor):
                 event="fee_drift_probe_mismatch",
                 site=self._site,
                 detail=f"documented={self._documented} wire={wire_fee}",
+            ),
+        )
+
+    def _alert_halt_set_failed(self, exc: BaseException, wire_fee: Decimal) -> None:
+        """A DISAGREE was found but the durable halt-set write itself failed.
+
+        Distinct event name, distinct alert, from ``_alert_mismatch`` above
+        -- this must never be silently folded into "drift detected" (the
+        mismatch alert already covers that); an operator who only ever sees
+        ``fee_drift_probe_mismatch`` on a run where the write actually
+        failed would believe the family is halted when it is not.
+        """
+        emit_alert(
+            self._alert_sink,
+            AlertPayload(
+                severity="CRITICAL",
+                event="fee_drift_probe_halt_set_failed",
+                site=self._site,
+                detail=f"halt-set failed after DISAGREE (wire={wire_fee}): {type(exc).__name__}",
             ),
         )

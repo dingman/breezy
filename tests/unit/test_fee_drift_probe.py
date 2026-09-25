@@ -25,6 +25,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,12 +36,19 @@ from breezy.adapters.polymarket_us.fees import DOCUMENTED_TAKER_FEE_COEFFICIENT
 from breezy.adapters.polymarket_us.provider import MARKET_BY_SLUG_PATH
 from breezy.adapters.polymarket_us.transport import QUOTA_KEY_DISCOVERY
 from breezy.runtime.health import AlertPayload
+from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.strategy.current_rung_hold.composition import family_halt_submit_veto
 from breezy.strategy.current_rung_hold.fee_drift_probe import (
     DEFAULT_FEE_DRIFT_PROBE_INTERVAL_SECONDS,
     FEE_COEFFICIENT_WIRE_KEY,
     FeeDriftProbeActor,
     WireFeeCoefficientError,
     fetch_wire_fee_coefficient,
+)
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    open_trial_day_latch,
 )
 
 _SLUG = "tc-temp-sfohigh-2026-09-21-gte70f"
@@ -138,6 +146,35 @@ async def test_probe_once_disagrees_alerts_critical_and_halts() -> None:
     assert "0.0695" in payload.detail
     assert str(DOCUMENTED_TAKER_FEE_COEFFICIENT) in payload.detail
     assert actor.counters["disagree"] == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_once_never_raises_when_the_halt_set_write_itself_fails() -> None:
+    """The DISAGREE finding must survive a failing durable write: still
+    alerted (via the mismatch alert), still returned as "DISAGREE", still
+    counted -- plus a SEPARATE, distinctly-named alert for the failed write
+    itself, so an operator can tell "halted" apart from "found drift but the
+    halt did not take"."""
+    sink = _RecordingAlertSink()
+
+    def _raising_setter(wire_fee: Decimal) -> None:
+        del wire_fee
+        raise RuntimeError("submit intent process lock is not held")
+
+    actor = FeeDriftProbeActor(
+        wire_fee_fetcher=_disagreeing_fetcher("0.0695"),
+        set_family_halted=_raising_setter,
+        alert_sink=sink,
+    )
+
+    outcome = await actor.probe_once()
+
+    assert outcome == "DISAGREE"
+    assert actor.counters["disagree"] == 1
+    assert actor.counters["halt_set_failed"] == 1
+    events = {payload.event for payload in sink.emitted}
+    assert events == {"fee_drift_probe_mismatch", "fee_drift_probe_halt_set_failed"}
+    assert all(payload.severity == "CRITICAL" for payload in sink.emitted)
 
 
 @pytest.mark.asyncio
@@ -258,3 +295,51 @@ def test_documented_fee_coefficient_default_is_byte_identical_to_the_pin() -> No
     assert DOCUMENTED_TAKER_FEE_COEFFICIENT == Decimal("0.06")
     actor, _sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
     assert actor._documented == DOCUMENTED_TAKER_FEE_COEFFICIENT
+
+
+# ---------------------------------------------------------------------------
+# Integration: a REAL TrialDayLatch, acquired through its existing public API
+# (silent-failure-hunter review, 2026-09-25) -- proves DISAGREE persists the
+# family halt through the SAME mechanism the submit path itself uses, rather
+# than only through a fake/stub in the unit tests above. The lock is
+# acquired the same way `breezy.app.trade.run` acquires it: open the store,
+# open the submit-intent latch (holds an exclusive flock for as long as this
+# `with` block is entered -- exactly as long as a live process holds it for
+# its whole life), then bind a `TrialDayLatch` to it via `open_trial_day_latch`
+# -- never bypassing `_require_held()`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_disagree_persists_the_halt_through_a_real_trial_day_latch_and_the_veto_then_refuses(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "exec_state.sqlite"
+    sink = _RecordingAlertSink()
+
+    with (
+        SqliteStateStore(store_path) as store,
+        open_submit_intent_latch(store, store_path) as latch,
+    ):
+        family_halt_latch = open_trial_day_latch(latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        submit_veto = family_halt_submit_veto(family_halt_latch)
+        assert submit_veto() is None, "must start un-halted"
+
+        actor = FeeDriftProbeActor(
+            wire_fee_fetcher=_disagreeing_fetcher("0.0695"),
+            set_family_halted=lambda wire_fee: family_halt_latch.record_policy_halt(
+                reason="fee_schedule_drift",
+                evidence_sha256="0" * 64,
+                ts_ns=1,
+            ),
+            alert_sink=sink,
+        )
+
+        outcome = await actor.probe_once()
+
+        assert outcome == "DISAGREE"
+        assert actor.counters["halt_set_failed"] == 0, "the real write must succeed here"
+        assert submit_veto() == "family_halt", (
+            "a DISAGREE must durably set the SAME halt the submit veto reads, "
+            "through the latch's real, held lock -- never bypassing _require_held()"
+        )

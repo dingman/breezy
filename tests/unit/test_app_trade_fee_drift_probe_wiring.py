@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 from breezy.app.trade import run
@@ -48,7 +49,10 @@ from breezy.runtime.settings import (
     TRADE_CATALOG_ROOT_VAR,
 )
 from breezy.runtime.trade_cli import EXIT_OK
-from breezy.strategy.current_rung_hold.fee_drift_probe import FeeDriftProbeActor
+from breezy.strategy.current_rung_hold.fee_drift_probe import (
+    FEE_COEFFICIENT_WIRE_KEY,
+    FeeDriftProbeActor,
+)
 from tests.unit.test_trade_cli_current_rung_hold import (  # noqa: F401 -- reused harness
     RecordingNode,
     _operator_order_ceiling,
@@ -183,3 +187,75 @@ def test_unknown_never_halts_but_still_alerts(
     assert results["outcome"] == "UNKNOWN"
     assert len(sink.emitted) == 1
     assert results["veto_after"] is None
+
+
+class _NoClientsAttrDataEngine:
+    """Simulates a future Nautilus rename that drops `_clients` -- item 2
+    (silent-failure-hunter review, 2026-09-25): the guarded `getattr` chain
+    must fail closed to UNKNOWN, never raise `AttributeError` and crash the
+    probe or the node."""
+
+
+def test_a_data_engine_missing_the_private_clients_attr_fails_closed_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    results: dict[str, Any] = {}
+
+    class _Capture(RecordingNode):
+        def run(self) -> None:
+            self.kernel.data_engine = _NoClientsAttrDataEngine()
+            (actor,) = _fee_drift_actors(self)
+            results["outcome"] = asyncio.run(actor.probe_once())
+            super().run()
+
+    code = run(env=_continuous_env(tmp_path), node_factory=_Capture, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert results["outcome"] == "UNKNOWN"
+
+
+class _FakeVenueHttpClient:
+    def __init__(self, payload: dict[str, str]) -> None:
+        self._payload = payload
+
+    async def get_public(self, path: str, *, query: Any = None, quota_key: str) -> dict[str, str]:
+        del path, query, quota_key
+        return self._payload
+
+
+def test_client_resolution_is_retried_each_probe_until_it_first_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 3 (silent-failure-hunter review, 2026-09-25): a first-resolve
+    failure must not be cached forever -- a data client that only becomes
+    available after the first probe fire must be picked up by the NEXT one."""
+    fake_client = _FakeVenueHttpClient({FEE_COEFFICIENT_WIRE_KEY: "0.06"})
+    monkeypatch.setattr(
+        "breezy.app.trade.shared_polymarket_us_http_client",
+        lambda venue_config, clock: fake_client,
+    )
+    results: dict[str, Any] = {}
+
+    class _FakeExecClient:
+        _venue_config = object()
+
+    class _FakeDataEngine:
+        def __init__(self) -> None:
+            self._clients = {ClientId(POLYMARKET_US_CLIENT_NAME): _FakeExecClient()}
+
+    class _Capture(RecordingNode):
+        def run(self) -> None:
+            (actor,) = _fee_drift_actors(self)
+            # No `data_engine` on this fake kernel yet -- the first fire
+            # must fail closed to UNKNOWN, not raise.
+            results["first"] = asyncio.run(actor.probe_once())
+            # The data client "connects" between fires.
+            self.kernel.data_engine = _FakeDataEngine()
+            results["second"] = asyncio.run(actor.probe_once())
+            super().run()
+
+    code = run(env=_continuous_env(tmp_path), node_factory=_Capture, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert results["first"] == "UNKNOWN"
+    assert results["second"] == "AGREE", "resolution must be retried, not cached as a failure"

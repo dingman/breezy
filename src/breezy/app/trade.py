@@ -262,7 +262,11 @@ def _build_fee_drift_probe(
       second one. Before ``resolve_client`` has run (or if no data client is
       found), the fetcher raises :class:`WireFeeCoefficientError` --
       ``probe_once()`` already turns that into a plain ``"UNKNOWN"`` alert,
-      never a boot-time crash and never a halt.
+      never a boot-time crash and never a halt. Resolution is RETRIED on
+      every fetch until it first succeeds (never cached as a permanent
+      failure): a data client that connects moments after ``build()``
+      (reconnect, slow handshake) must not leave the probe UNKNOWN for the
+      rest of the process's life.
     """
     slug = _representative_fee_drift_slug(strategies)
     if slug is None:
@@ -272,10 +276,39 @@ def _build_fee_drift_probe(
         )
         return None
 
+    node_holder: dict[str, Any] = {}
     client_holder: dict[str, PolymarketUSHttpClient] = {}
+
+    def _try_resolve_client() -> PolymarketUSHttpClient | None:
+        """Best-effort resolve against whatever `node` the last `after_build`
+        call handed us. Read-only; never raises -- a missing/renamed
+        attribute fails closed to `None` (caller turns that into UNKNOWN),
+        never a boot-time or probe-time crash.
+
+        Reaches into `data_engine._clients` -- the SAME private-attribute
+        idiom already established at `trade_cli.py`'s own
+        `_exec_client_refusal_reader`/`_exec_client_stale_intent_reader`
+        (`trade_cli.py:383,406`), guarded here the same way: `getattr` at
+        every hop, never a bare attribute chain, so a future Nautilus rename
+        degrades to UNKNOWN instead of an unhandled `AttributeError`.
+        """
+        node = node_holder.get("node")
+        if node is None:
+            return None
+        data_engine = getattr(node.kernel, "data_engine", None)
+        clients = getattr(data_engine, "_clients", None)
+        client = None if clients is None else clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        venue_config = getattr(client, "_venue_config", None)
+        if venue_config is None:
+            return None
+        resolved = shared_polymarket_us_http_client(venue_config, node.kernel.clock)
+        client_holder["client"] = resolved
+        return resolved
 
     async def _wire_fee_fetcher() -> Decimal:
         client = client_holder.get("client")
+        if client is None:
+            client = _try_resolve_client()
         if client is None:
             raise WireFeeCoefficientError(
                 "fee_drift_probe: no live read-only http client resolved yet"
@@ -299,20 +332,12 @@ def _build_fee_drift_probe(
     )
 
     def _resolve_client(node: Any) -> None:
-        data_engine = getattr(node.kernel, "data_engine", None)
-        client = (
-            None
-            if data_engine is None
-            else data_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
-        )
-        venue_config = getattr(client, "_venue_config", None)
-        if venue_config is None:
+        node_holder["node"] = node
+        if _try_resolve_client() is None:
             _boot_logger.warning(
                 "fee_drift_probe: no live data client found post-build; "
-                "probe stays UNKNOWN until one is"
+                "probe stays UNKNOWN until one resolves"
             )
-            return
-        client_holder["client"] = shared_polymarket_us_http_client(venue_config, node.kernel.clock)
 
     return actor, _resolve_client
 
