@@ -189,7 +189,7 @@ def test_driver_derives_selector_bounds_from_strategy_decision_window(
     monkeypatch.setattr(
         driver,
         "_warmup_start_ns_for_replay",
-        lambda **_kwargs: decision_window_ns(
+        lambda *_args, **_kwargs: decision_window_ns(
             climate_day=_DAY,
             std_utc_offset_hours=driver.default_registry()
             .climate_day_window(driver.WEATHER_VENUE, _STATION)
