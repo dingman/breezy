@@ -265,3 +265,109 @@ def test_replay_warmup_start_uses_latest_pre_window_quote_and_depth_records(
             "end": window_start,
         },
     ]
+
+
+def test_replay_warmup_falls_back_to_window_start_with_no_pre_window_record(
+    driver: ModuleType,
+) -> None:
+    """No book/quote record exists at-or-before the window: there is no
+    prior state to warm from, so the read starts exactly at the window
+    open -- never earlier (which would replay history nothing needs) and
+    never later (which would truncate the window itself)."""
+    catalog = _SpyCatalog()
+    window_start = 1_000
+    catalog.depth_records = [_Record(1_100), _Record(1_200)]
+    catalog.quote_records = [_Record(1_050)]
+
+    start = driver._warmup_start_ns_for_replay(
+        catalog,
+        climate_day=_DAY,
+        station=_STATION,
+        window_start_ns=window_start,
+    )
+
+    assert start == window_start
+
+
+class _MultiInstrumentSpyCatalog:
+    """`_SpyCatalog` variant carrying more than one station/day-matching
+    instrument -- needed to pin `_warmup_start_ns_for_replay`'s min-across-
+    instruments reduction; `_SpyCatalog` above always resolves to exactly
+    one match."""
+
+    def __init__(self, targets: list[BinaryOption]) -> None:
+        self._targets = targets
+        self.depth_calls: list[dict[str, Any]] = []
+        self.quote_calls: list[dict[str, Any]] = []
+        self.depth_records_by_id: dict[str, list[object]] = {}
+        self.quote_records_by_id: dict[str, list[object]] = {}
+
+    def instruments(self) -> list[BinaryOption]:
+        return list(self._targets)
+
+    def order_book_depth10(self, *, instrument_ids: list[str], **kwargs: Any) -> list[object]:
+        self.depth_calls.append({"instrument_ids": instrument_ids, **kwargs})
+        [instrument_id] = instrument_ids
+        return self.depth_records_by_id.get(instrument_id, [])
+
+    def quote_ticks(self, *, instrument_ids: list[str], **kwargs: Any) -> list[object]:
+        self.quote_calls.append({"instrument_ids": instrument_ids, **kwargs})
+        [instrument_id] = instrument_ids
+        return self.quote_records_by_id.get(instrument_id, [])
+
+    def instrument_closes(self, *, instrument_ids: list[str], **kwargs: Any) -> list[object]:
+        return []
+
+
+def test_replay_warmup_start_is_the_minimum_across_instruments(driver: ModuleType) -> None:
+    """Two station/day instruments with DIFFERENT last pre-window records:
+    the replay must start early enough to warm BOTH, i.e. at the earlier
+    (minimum) of the two -- not just the first instrument discovered."""
+    window_start = 1_000
+    instrument_a = _instrument("tc-temp-laxhigh-2026-09-17-a", station=_STATION, day=_DAY)
+    instrument_b = _instrument("tc-temp-laxhigh-2026-09-17-b", station=_STATION, day=_DAY)
+    catalog = _MultiInstrumentSpyCatalog([instrument_a, instrument_b])
+    id_a, id_b = str(instrument_a.id), str(instrument_b.id)
+    catalog.depth_records_by_id = {id_a: [_Record(900)], id_b: [_Record(700)]}
+    catalog.quote_records_by_id = {id_a: [], id_b: []}
+
+    start = driver._warmup_start_ns_for_replay(
+        catalog,
+        climate_day=_DAY,
+        station=_STATION,
+        window_start_ns=window_start,
+    )
+
+    assert start == 700
+
+
+def test_late_listed_rung_is_selected_and_kept_unbounded_at_the_end(
+    driver: ModuleType,
+) -> None:
+    """A rung with no records before the (warmed-up) start bound but real
+    records after it is a LATE LISTING, not a gap -- `_select_capture_
+    instruments` must still select it as trade-eligible, and `end=None`
+    must reach the catalog unbounded so nothing after it is truncated."""
+    catalog = _SpyCatalog()
+    start_ns = 1_000
+    catalog.depth_records = [_Record(1_500), _Record(2_000)]  # both AFTER start_ns
+    catalog.quote_records = [_Record(1_600)]
+
+    selected = driver._select_capture_instruments(
+        catalog,
+        climate_day=_DAY,
+        station=_STATION,
+        start=start_ns,
+        end=None,
+    )
+
+    assert [str(ti.instrument.id) for ti in selected] == [
+        "tc-temp-laxhigh-2026-09-17-gte76lt77.POLYMARKET_US",
+    ]
+    assert catalog.depth_calls == [
+        {
+            "instrument_ids": ["tc-temp-laxhigh-2026-09-17-gte76lt77.POLYMARKET_US"],
+            "start": start_ns,
+            "end": None,
+        },
+    ]

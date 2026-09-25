@@ -711,6 +711,33 @@ def _tape_instrument_depth_and_quote_in_window(
     )
 
 
+class _StubReplayCatalog:
+    """`_convert_live_capture`'s dispatch-test stand-in (AUD-09b review fix).
+
+    Before the warm-up peek existed, a bare `object()` sufficed here because
+    `main` never touched the catalog outside the separately-stubbed
+    `_select_capture_instruments`. `_warmup_start_ns_for_replay` now reads
+    `catalog.instruments()` / `catalog.order_book_depth10()` / `catalog.
+    quote_ticks()` directly (see `test_paper_replay_catalog_bounds.py` for
+    the real-catalog-shaped coverage of that call), so these dispatch-level
+    tests need a minimal fake exposing exactly that surface -- built from
+    the SAME canned `TapeInstrument` already returned by the stubbed
+    `_select_capture_instruments`, never a second, diverging fixture.
+    """
+
+    def __init__(self, tape_instrument: object) -> None:
+        self._tape_instrument = tape_instrument
+
+    def instruments(self) -> list[object]:
+        return [self._tape_instrument.instrument]
+
+    def order_book_depth10(self, *, instrument_ids: list[str], end: int) -> list[object]:
+        return self._tape_instrument.depths
+
+    def quote_ticks(self, *, instrument_ids: list[str], end: int) -> list[object]:
+        return self._tape_instrument.quotes
+
+
 _OBSERVATION_ROWS = [{"station": ICAO, "valid": "2026-09-04 19:55", "metar": "KLAX T03000167"}]
 
 #: WINDOW_OPEN_NS is exactly 12:00 LST (see the module comment above); shift
@@ -1634,7 +1661,9 @@ def _run_main_with_stubbed_capture(
         )
 
     monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
-    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
@@ -1913,7 +1942,9 @@ def test_no_pre_existing_failure_path_changed_its_exit_code(
 
     tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
     monkeypatch.setattr(driver, "assert_decision_window_has_coverage", _raise)
-    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
@@ -2017,7 +2048,9 @@ def test_a_crashing_run_leaves_no_sidecar(
 
     tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
     monkeypatch.setattr(driver, "run_one_precision_arm", _boom)
-    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
@@ -2129,7 +2162,9 @@ def test_params_match_is_computed_from_the_engines_actual_readback_not_echoed(
         )
 
     monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
-    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
@@ -2456,7 +2491,9 @@ def test_the_continuous_arm_selects_capture_instruments_exactly_once(
         return [tape_instrument]
 
     monkeypatch.setattr(driver, "_select_capture_instruments", _counting_select)
-    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
     monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
     monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
     monkeypatch.setattr(
