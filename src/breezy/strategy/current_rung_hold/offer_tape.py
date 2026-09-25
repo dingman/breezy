@@ -42,15 +42,34 @@ logger = logging.getLogger(__name__)
 #: sharing this tape.
 DEFAULT_OFFER_TAPE_MAXLEN: Final[int] = 16384
 
-#: PROVISIONAL (2026-09-16 GAP fix, first live-day offer-tape postmortem):
-#: the first live day wrote 7.9 MB / 9612 rows in ONE hour for ONE station
-#: (one row per eligible snapshot per leg, by design -- the in-memory
-#: deque is already bounded by :data:`DEFAULT_OFFER_TAPE_MAXLEN`, but the
-#: JSONL sidecar was an unbounded plain append). 64 MiB is a round, generous
-#: multiple of that measured rate (~8x the single busiest hour observed so
-#: far) -- revisit once more live days are measured. Applies PER sidecar
-#: file (one per climate day), never across files.
-DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES: Final[int] = 64 * 1024 * 1024
+#: PROVISIONAL (2026-09-25 F-3 re-measurement, stall follow-ups
+#: STALL_FOLLOWUPS_F1_F4_2026-09-24.md): the prior 64 MiB pin (2026-09-16
+#: postmortem) was hit mid-day on 09-22 -- that file wrote its full 64 MiB in
+#: 3.6h (17:00Z-20:37Z, ~18.5 MB/h, the busiest window measured so far).
+#: Projecting that rate through the trading day's 17:00Z-01:00Z close (8h
+#: total) gives an UNCAPPED peak-day size of ~141 MiB. F-1a (registered NO
+#: population restoration, not yet implemented on this branch -- see
+#: Sequencing) is expected to add further NO-side row volume that cannot yet
+#: be measured directly (no `nogap.py`-style count is possible before F-1a
+#: lands). Rather than pick an unmeasured multiplier, this pin uses the plan's
+#: own stated ceiling directly: 512 MiB.
+#:
+#: ACCEPTED DEVIATION FROM AC1: AC1 caps the pin at "at most 2x the projected
+#: peak day" (~141 MiB uncapped here, so at most ~282 MiB) unless the
+#: measurement itself justifies more. 512 MiB is ~3.6x that projection, not
+#: 2x -- accepted deliberately, specifically to cover F-1a's unmeasured
+#: NO-side growth, rather than ship a tighter figure known in advance to be
+#: too small. This is a stated, reviewed exception, not an oversight: it
+#: MUST be re-baselined to a real measured multiple once F-1a lands and a
+#: live day is measured with it running.
+#:
+#: Applies PER sidecar file (one per climate day), never across files.
+DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES: Final[int] = 512 * 1024 * 1024
+
+#: AC2 (F-3): the sidecar logs one WARN when a file crosses HALF its cap, in
+#: addition to the existing at-cap WARN -- an earlier, less urgent signal an
+#: operator can act on before the cap itself is reached.
+_HALF_CAP_WARN_FRACTION: Final[float] = 0.5
 
 #: L1 review finding (commit 309dab6): the 16 keys every pre-GAP-fix JSONL
 #: line carries -- :meth:`OfferTapeRecord.from_dict` requires all of them
@@ -337,6 +356,10 @@ class OfferTape:
         #: this counter is unbounded so it never itself needs a cap.
         self._sidecar_capped = 0
         self._sidecar_cap_logged = False
+        #: AC2 (F-3, 2026-09-25): the half-cap WARN's own one-shot latch,
+        #: independent of `_sidecar_cap_logged` -- both can fire in the same
+        #: file's lifetime, half-cap always first.
+        self._sidecar_half_cap_logged = False
         #: H1 review finding (commit 309dab6): sidecar setup is best-effort.
         #: `composition.py` now resolves a default sidecar path
         #: unconditionally, so an unwritable/read-only/full
@@ -408,7 +431,18 @@ class OfferTape:
             return
         line = json.dumps(record.to_dict(), sort_keys=True)
         encoded = line.encode("utf-8") + b"\n"
-        if self._bytes_written + len(encoded) > self._sidecar_max_bytes:
+        prospective_bytes = self._bytes_written + len(encoded)
+        if (
+            not self._sidecar_half_cap_logged
+            and prospective_bytes > self._sidecar_max_bytes * _HALF_CAP_WARN_FRACTION
+        ):
+            self._sidecar_half_cap_logged = True
+            logger.warning(
+                "OfferTape: sidecar %s crossed 50%% of its %d-byte cap",
+                self._path,
+                self._sidecar_max_bytes,
+            )
+        if prospective_bytes > self._sidecar_max_bytes:
             self._sidecar_capped += 1
             if not self._sidecar_cap_logged:
                 self._sidecar_cap_logged = True

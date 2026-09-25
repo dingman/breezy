@@ -249,6 +249,46 @@ class TestCountRefusedPricedOfferTapeRecords:
 
         assert counts == {"offer_tape_2026-09-01.jsonl": 1}
 
+    def test_reads_a_gzipped_tape_transparently(self, tmp_path: Path) -> None:
+        """F-3 R5: `measured_slippage_from_fills.py:487`'s reader must handle
+        `.jsonl.gz` produced by retention -- same decode path, same counts."""
+        import gzip
+
+        refuse_priced = OfferTapeRecord(
+            station="LAX", climate_day="2026-09-01", instrument_id="i1", ask="0.40",
+            size=10, reason="not_executable", ts_event=1, hour_lst=10, width_code=1,
+            m_code=1, trigger="tick", quote_age_ns=1, minutes_since_window_open=1,
+            prior_eligible_snaps=0, illegal_cell=False, source="quote_tick",
+            decision="refuse",
+        )
+        path = tmp_path / "offer_tape_2026-09-01.jsonl.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            handle.write(json.dumps(refuse_priced.to_dict()) + "\n")
+
+        counts = count_refused_priced_offer_tape_records([path])
+
+        assert counts == {"offer_tape_2026-09-01.jsonl.gz": 1}
+
+
+class TestGlobOfferTapePathsDedup:
+    def test_dedupes_by_date_preferring_jsonl_over_gz(self, tmp_path: Path) -> None:
+        """F-3 R5/AC7: `main`'s glob must cover both `offer_tape_*.jsonl` and
+        `offer_tape_*.jsonl.gz`, and when the SAME date has both (the crash
+        window between retention's rename and unlink), the plain `.jsonl` is
+        the one counted -- never both, never the `.gz`."""
+        from measured_slippage_from_fills import glob_offer_tape_paths
+
+        (tmp_path / "offer_tape_2026-09-01.jsonl").write_text("", encoding="utf-8")
+        (tmp_path / "offer_tape_2026-09-01.jsonl.gz").write_text("", encoding="utf-8")
+        (tmp_path / "offer_tape_2026-09-02.jsonl.gz").write_text("", encoding="utf-8")
+
+        paths = glob_offer_tape_paths(tmp_path)
+
+        assert [p.name for p in paths] == [
+            "offer_tape_2026-09-01.jsonl",
+            "offer_tape_2026-09-02.jsonl.gz",
+        ]
+
 
 class TestRenderEvidenceDoc:
     def test_includes_the_required_honesty_and_scope_statements(self) -> None:
