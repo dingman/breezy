@@ -30,15 +30,22 @@ from exit_window_core import (
 )
 
 __all__ = [
+    "THREATENED_AFTER_EXIT_SIDE_EMPTIED",
+    "THREATENED_BEFORE_EXIT_SIDE_EMPTIED",
     "ExitWindowSummary",
     "PositionExitRow",
     "build_position_exit_row",
     "build_summary",
+    "classify_threatened_delta",
     "render_markdown",
 ]
 
 _ZERO: Final[Decimal] = Decimal(0)
 _MINUTE_NS: Final[int] = 60_000_000_000
+
+#: AUD-07 B2 per-row classification labels.
+THREATENED_BEFORE_EXIT_SIDE_EMPTIED: Final[str] = "THREATENED_BEFORE_EXIT_SIDE_EMPTIED"
+THREATENED_AFTER_EXIT_SIDE_EMPTIED: Final[str] = "THREATENED_AFTER_EXIT_SIDE_EMPTIED"
 
 
 def _decimal_or_none(value: Decimal | None) -> str | None:
@@ -129,6 +136,22 @@ class ExitWindowSummary:
     sum_r_dead_pnl: Decimal | None
     sum_r_threat_pnl: Decimal | None
     sum_r_best_pnl: Decimal | None
+    #: AUD-07 B2: count of rows classified `THREATENED_AFTER_EXIT_SIDE_
+    #: EMPTIED` -- these do NOT count toward `threatened_before_emptied`
+    #: (the R-THREAT gate's "before the exit side empties" reading), whatever
+    #: the median says. `threatened_before_emptied + threatened_after_emptied
+    #: <= n_positions` (a row with no THREATENED confirmation at all
+    #: classifies as neither).
+    threatened_after_emptied: int
+    #: AUD-07 D: earliest/latest `climate_day` across `rows`, or `None` for
+    #: an empty corpus -- makes a frozen corpus legible rather than a bare
+    #: unchanging `n_positions`.
+    corpus_first_fill_date: str | None
+    corpus_last_fill_date: str | None
+    #: AUD-07 D: `None` when no PREVIOUS run's trial-id set was supplied
+    #: (nothing to compare against yet -- never treated as "frozen"); else
+    #: the count of `rows` whose `trial_id` was NOT in the previous run.
+    n_positions_new_since_previous_run: int | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -145,7 +168,36 @@ class ExitWindowSummary:
             "sum_r_dead_pnl": _decimal_or_none(self.sum_r_dead_pnl),
             "sum_r_threat_pnl": _decimal_or_none(self.sum_r_threat_pnl),
             "sum_r_best_pnl": _decimal_or_none(self.sum_r_best_pnl),
+            "threatened_after_emptied": self.threatened_after_emptied,
+            "corpus_first_fill_date": self.corpus_first_fill_date,
+            "corpus_last_fill_date": self.corpus_last_fill_date,
+            "n_positions_new_since_previous_run": self.n_positions_new_since_previous_run,
         }
+
+
+def classify_threatened_delta(row: PositionExitRow) -> str | None:
+    """AUD-07 B2: per-row THREATENED-vs-exit-side-emptied ordering.
+
+    ``delta_i = first_threatened_ts_ns - last_executable_ts_ns`` (the plan's
+    own formula). **Classification polarity, verified against the
+    already-published Rev 2 Appendix A.3 narrative** (the only real
+    R-THREAT firing on record: MIA NO leg 09-15, ``first_threatened_ts_ns``
+    18:22Z, ``last_executable_ts_ns`` 19:36Z -- i.e. ``delta_i < 0`` -- and
+    Rev 2 A.3 counts that row toward "THREATENED before the exit side
+    emptied 1/5", the gate-relevant case): ``delta_i <= 0`` classifies
+    :data:`THREATENED_BEFORE_EXIT_SIDE_EMPTIED`; ``delta_i > 0`` classifies
+    :data:`THREATENED_AFTER_EXIT_SIDE_EMPTIED`. Returns ``None`` when either
+    timestamp is absent -- THREATENED never confirmed for this row ("no
+    signal"), not a delta of zero.
+    """
+    threatened_ts_ns = row.timeline.first_threatened_ts_ns
+    last_executable_ts_ns = row.timeline.last_executable_ts_ns
+    if threatened_ts_ns is None or last_executable_ts_ns is None:
+        return None
+    delta_i = threatened_ts_ns - last_executable_ts_ns
+    if delta_i <= 0:
+        return THREATENED_BEFORE_EXIT_SIDE_EMPTIED
+    return THREATENED_AFTER_EXIT_SIDE_EMPTIED
 
 
 def _minutes(delta_ns: int) -> Decimal:
@@ -178,13 +230,17 @@ def _sum_pnl(rows: Sequence[PositionExitRow], *, outcome_attr: str) -> Decimal |
     return sum(known, _ZERO)
 
 
-def build_summary(rows: Sequence[PositionExitRow]) -> ExitWindowSummary:
+def build_summary(
+    rows: Sequence[PositionExitRow], *, previous_trial_ids: frozenset[str] | None = None
+) -> ExitWindowSummary:
+    """``previous_trial_ids`` (AUD-07 D) is an already-read, pure input --
+    the caller (the I/O shell) reads the prior run's trial-id set and passes
+    it in; this function performs no I/O of its own."""
     threatened_before_emptied = sum(
-        1
-        for row in rows
-        if row.timeline.first_threatened_ts_ns is not None
-        and row.timeline.last_executable_ts_ns is not None
-        and row.timeline.first_threatened_ts_ns <= row.timeline.last_executable_ts_ns
+        1 for row in rows if classify_threatened_delta(row) == THREATENED_BEFORE_EXIT_SIDE_EMPTIED
+    )
+    threatened_after_emptied = sum(
+        1 for row in rows if classify_threatened_delta(row) == THREATENED_AFTER_EXIT_SIDE_EMPTIED
     )
     dead_before_emptied = sum(
         1
@@ -193,6 +249,10 @@ def build_summary(rows: Sequence[PositionExitRow]) -> ExitWindowSummary:
         and row.timeline.last_executable_ts_ns is not None
         and row.timeline.first_dead_ts_ns <= row.timeline.last_executable_ts_ns
     )
+    climate_days = sorted({row.position.climate_day for row in rows})
+    n_new: int | None = None
+    if previous_trial_ids is not None:
+        n_new = sum(1 for row in rows if row.position.trial_id not in previous_trial_ids)
     return ExitWindowSummary(
         n_positions=len(rows),
         threatened_before_emptied=threatened_before_emptied,
@@ -207,6 +267,10 @@ def build_summary(rows: Sequence[PositionExitRow]) -> ExitWindowSummary:
         sum_r_dead_pnl=_sum_pnl(rows, outcome_attr="r_dead"),
         sum_r_threat_pnl=_sum_pnl(rows, outcome_attr="r_threat"),
         sum_r_best_pnl=_sum_pnl(rows, outcome_attr="r_best"),
+        threatened_after_emptied=threatened_after_emptied,
+        corpus_first_fill_date=climate_days[0] if climate_days else None,
+        corpus_last_fill_date=climate_days[-1] if climate_days else None,
+        n_positions_new_since_previous_run=n_new,
     )
 
 
@@ -224,10 +288,10 @@ def render_markdown(rows: Sequence[PositionExitRow], summary: ExitWindowSummary)
     """One Markdown table row per position plus the aggregate summary block."""
     header = (
         "| trial_id | leg | fill_px | depth_source | first_threatened_ts_ns | "
-        "first_dead_ts_ns | last_executable_ts_ns | settled_held | preliminary | hold_pnl | "
-        "R-DEAD | R-THREAT | R-BEST |"
+        "first_dead_ts_ns | last_executable_ts_ns | threatened_delta_class | "
+        "settled_held | preliminary | hold_pnl | R-DEAD | R-THREAT | R-BEST |"
     )
-    sep = "|---" * 13 + "|"
+    sep = "|---" * 14 + "|"
     lines = [header, sep]
     for row in rows:
         lines.append(
@@ -241,6 +305,7 @@ def render_markdown(rows: Sequence[PositionExitRow], summary: ExitWindowSummary)
                     _fmt(row.timeline.first_threatened_ts_ns),
                     _fmt(row.timeline.first_dead_ts_ns),
                     _fmt(row.timeline.last_executable_ts_ns),
+                    _fmt(classify_threatened_delta(row)),
                     _fmt(row.settled_held),
                     "YES" if row.settlement_preliminary else "no",
                     _fmt(row.hold_pnl),
@@ -258,6 +323,10 @@ def render_markdown(rows: Sequence[PositionExitRow], summary: ExitWindowSummary)
         f"{summary.n_positions}",
     )
     lines.append(
+        f"threatened_after_exit_side_emptied={summary.threatened_after_emptied}/"
+        f"{summary.n_positions}",
+    )
+    lines.append(
         f"dead_before_exit_side_emptied={summary.dead_before_emptied}/{summary.n_positions}",
     )
     lines.append(
@@ -272,4 +341,10 @@ def render_markdown(rows: Sequence[PositionExitRow], summary: ExitWindowSummary)
     lines.append(f"sum_r_dead_pnl={_fmt(summary.sum_r_dead_pnl)}")
     lines.append(f"sum_r_threat_pnl={_fmt(summary.sum_r_threat_pnl)}")
     lines.append(f"sum_r_best_pnl={_fmt(summary.sum_r_best_pnl)}")
+    lines.append(f"corpus_first_fill_date={_fmt(summary.corpus_first_fill_date)}")
+    lines.append(f"corpus_last_fill_date={_fmt(summary.corpus_last_fill_date)}")
+    lines.append(
+        "n_positions_new_since_previous_run="
+        f"{_fmt(summary.n_positions_new_since_previous_run)}",
+    )
     return "\n".join(lines) + "\n"

@@ -65,7 +65,9 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import os
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final, Literal
@@ -118,6 +120,8 @@ from breezy.domain.weather_bucket_facts import WeatherBucketFacts, read_weather_
 from breezy.ingest.iem_observations import iem_asos_rows_to_station_observations
 from breezy.persistence.scored_trial_store import read_scored_trials_pooled
 from breezy.registry.sites import default_registry
+from breezy.runtime import alert_ladder
+from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
 from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.monitor_evidence import Leg
@@ -138,6 +142,102 @@ _DEFAULT_LIVE_CATALOG_ROOT: Final[Path] = (
 #: note, mirroring every sibling analysis reader's convention) -- this only
 #: needs to be a real, always-visible-in-the-future instant.
 _PLACEHOLDER_RECEIVED_AT_NS: Final[int] = 2**62
+
+# --------------------------------------------------------------------------
+# AUD-07 D -- EXIT_CORPUS_FROZEN, on AUD-04's shared alert_ladder
+# (breezy.runtime.alert_ladder). This control owns its own latch file, its
+# own state file (the previous run's trial_id set), and its own event
+# names -- the streak/period-key state machine is imported, never
+# re-implemented (round 3 of the AUD-04/AUD-07 plan review).
+# --------------------------------------------------------------------------
+
+EXIT_CORPUS_FROZEN_EVENT: Final[str] = "EXIT_CORPUS_FROZEN"
+EXIT_CORPUS_FROZEN_CLEARED_EVENT: Final[str] = "EXIT_CORPUS_FROZEN_CLEARED"
+#: Path is literal per the plan (`docs/plans/backlog/AUDIT_2026-09-21/
+#: AUD-07-exit-seam-arming-verification-path.md` §6 D), under `out_root`
+#: (never per-run-stamp -- it must persist ACROSS runs).
+_FROZEN_STREAK_LATCH_FILENAME: Final[str] = ".frozen_streak.json"
+#: This item's own previous-run state: the trial_id set the LAST run saw,
+#: so "N grew" vs "N is frozen" is derived from an actual prior observation,
+#: never assumed. Absent on the very first run ever (streak stays 0, no
+#: alert -- nothing to compare against yet).
+_PREVIOUS_TRIAL_IDS_FILENAME: Final[str] = ".previous_trial_ids.json"
+
+
+def _read_previous_trial_ids(path: Path) -> frozenset[str] | None:
+    """`None` (never observed before) on a missing or unparseable file --
+    fail-closed toward "nothing to compare", never toward "frozen"."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    trial_ids = payload.get("trial_ids")
+    if not isinstance(trial_ids, list) or not all(isinstance(t, str) for t in trial_ids):
+        return None
+    return frozenset(trial_ids)
+
+
+def _write_previous_trial_ids(path: Path, trial_ids: frozenset[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"trial_ids": sorted(trial_ids)}, sort_keys=True), encoding="utf-8"
+    )
+
+
+def apply_corpus_frozen_ladder(
+    *, n_positions_new_since_previous_run: int | None,
+    latch: alert_ladder.LatchState, now_ns: int,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Drives `breezy.runtime.alert_ladder`'s shared state machine over this
+    control's own local predicate: fresh (no alert, streak clears) iff no
+    previous run exists to compare against, or this run added at least one
+    NEW position; stale (streak increments) iff a previous run exists and
+    `n_positions_new_since_previous_run == 0`.
+
+    Returns the next latch state to persist and an `AlertPayload` to emit
+    through the caller's sink, or `None` when this run stays silent.
+    """
+    is_fresh = n_positions_new_since_previous_run is None or n_positions_new_since_previous_run > 0
+    previous_streak = latch.streak
+    streak = alert_ladder.next_streak(is_fresh=is_fresh, previous_streak=previous_streak)
+
+    if is_fresh:
+        new_latch = alert_ladder.LatchState(
+            schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+            streak=0, last_alert_severity=None, last_alert_period_key=None,
+        )
+        if previous_streak >= alert_ladder.WARN_STREAK_THRESHOLD:
+            return new_latch, AlertPayload(
+                severity="INFO", event=EXIT_CORPUS_FROZEN_CLEARED_EVENT,
+                site="current_rung_hold_exit_window_study",
+                detail=f"streak_len={previous_streak}",
+            )
+        return new_latch, None
+
+    decision = alert_ladder.evaluate_streak(
+        streak=streak, last_alert_severity=latch.last_alert_severity,
+        last_alert_period_key=latch.last_alert_period_key, now_ns=now_ns,
+    )
+    new_latch = alert_ladder.LatchState(
+        schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+        streak=streak,
+        last_alert_severity=(
+            decision.severity if decision.should_alert else latch.last_alert_severity
+        ),
+        last_alert_period_key=(
+            decision.period_key if decision.should_alert else latch.last_alert_period_key
+        ),
+    )
+    if not decision.should_alert:
+        return new_latch, None
+    assert decision.severity is not None
+    return new_latch, AlertPayload(
+        severity=decision.severity, event=EXIT_CORPUS_FROZEN_EVENT,
+        site="current_rung_hold_exit_window_study",
+        detail=f"streak={streak} n_positions_new_since_previous_run=0",
+    )
 
 
 def _station_asos_text(
@@ -653,10 +753,21 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    sink: AlertSink | None = None,
+    now_ns: int | None = None,
+) -> int:
+    """`sink`/`now_ns` are keyword-only test seams (never CLI flags, mirroring
+    `score_live_trials.main`'s own `proc_root` convention): production
+    resolves both from the real environment/clock.
+    """
     args = _parse_args(argv)
     out_dir: Path = args.out_root / args.run_stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    resolved_sink = resolve_alert_sink(os.environ) if sink is None else sink
+    resolved_now_ns = time.time_ns() if now_ns is None else now_ns
 
     total_fetch_outage = False
     try:
@@ -670,7 +781,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _TotalAsosFetchOutage as exc:
         rows, missing = exc.rows, exc.missing
         total_fetch_outage = True
-    summary = build_summary(rows)
+
+    # AUD-07 D: read the PREVIOUS run's trial-id set (persisted under
+    # out_root, never per-run-stamp) before building this run's summary, so
+    # "N grew" vs "N is frozen" is derived from an actual prior observation.
+    previous_trial_ids_path = args.out_root / _PREVIOUS_TRIAL_IDS_FILENAME
+    previous_trial_ids = _read_previous_trial_ids(previous_trial_ids_path)
+    summary = build_summary(rows, previous_trial_ids=previous_trial_ids)
+    _write_previous_trial_ids(
+        previous_trial_ids_path, frozenset(row.position.trial_id for row in rows)
+    )
+
     markdown = render_markdown(rows, summary)
     if missing:
         markdown += "\nMISSING INPUTS (reported, not fabricated):\n" + "\n".join(
@@ -692,6 +813,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[exit-window-study] {len(rows)} position(s); wrote {out_dir}", file=sys.stderr)
     for item in missing:
         print(f"[exit-window-study] MISSING: {item}", file=sys.stderr)
+
+    # AUD-07 D: EXIT_CORPUS_FROZEN, on AUD-04's shared re-alert ladder.
+    frozen_streak_latch_path = args.out_root / _FROZEN_STREAK_LATCH_FILENAME
+    frozen_streak_latch = alert_ladder.read_latch_state(frozen_streak_latch_path)
+    new_frozen_streak_latch, alert_payload = apply_corpus_frozen_ladder(
+        n_positions_new_since_previous_run=summary.n_positions_new_since_previous_run,
+        latch=frozen_streak_latch, now_ns=resolved_now_ns,
+    )
+    alert_ladder.write_latch_state(frozen_streak_latch_path, new_frozen_streak_latch)
+    if alert_payload is not None:
+        emit_alert(resolved_sink, alert_payload)
+
     if total_fetch_outage:
         print(
             "[exit-window-study] every attempted ASOS fetch failed; no station loaded",

@@ -31,6 +31,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
+from breezy.runtime import alert_ladder
 from breezy.settlement.trial_scorer import FilledTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator, RunningMax
@@ -263,6 +264,81 @@ def test_winning_position_r_threat_premature_exit_costs_money_vs_hold() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 4b. AUD-07 B2: the negative-median closing check, through the REAL writer
+# path (build_exit_timeline replay, never a hand-set ExitTimeline) -- a
+# synthetic timeline would hide exactly the class of defect the 0-vs-5
+# disagreement already demonstrated (L-42).
+# ---------------------------------------------------------------------------
+
+
+def test_a_threatened_confirmation_before_the_exit_side_empties_yields_a_negative_delta() -> None:
+    """Mirrors the one real R-THREAT firing on record (MIA NO leg, 09-15):
+    THREATENED confirms, and the exit side STILL has liquidity afterward --
+    delta_i = threatened - last_executable < 0, classified BEFORE."""
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_STD_UTC_OFFSET_HOURS)
+    _push_metar(accumulator, _ns_at(12, 30), 86)  # entry reading, m_code=0
+    position = _position(filled_at_ns=_ns_at(13, 5))
+    _push_metar(accumulator, _ns_at(13, 10), 87)  # m 0 -> 1 drop begins
+    # Same THREATENED-confirming frame as
+    # test_winning_position_r_threat_premature_exit_costs_money_vs_hold
+    # (depth is required for the monitor to assess THREATENED at all), plus
+    # a SECOND, LATER fillable frame -- the exit side still has liquidity
+    # well after THREATENED confirms at 13:30.
+    threatened_frame = _depth(bids=(("0.30", "5"),), asks=(), ts_ns=_ns_at(13, 20))
+    later_fillable_frame = _depth(bids=(("0.20", "5"),), asks=(), ts_ns=_ns_at(13, 40))
+
+    timeline = _timeline(
+        position=position, accumulator=accumulator,
+        depth_frames=(threatened_frame, later_fillable_frame),
+        observation_ts_ns=(_ns_at(13, 10), _ns_at(13, 30)),
+    )
+
+    assert timeline.first_threatened_ts_ns == _ns_at(13, 30)
+    assert timeline.last_executable_ts_ns == _ns_at(13, 40)
+    assert timeline.first_threatened_ts_ns < timeline.last_executable_ts_ns
+
+    row = ewr.build_position_exit_row(
+        timeline=timeline, settled_held=True, settlement_preliminary=False, depth_source="catalog",
+    )
+    assert ewr.classify_threatened_delta(row) == ewr.THREATENED_BEFORE_EXIT_SIDE_EMPTIED
+
+
+def test_a_threatened_confirmation_after_the_exit_side_empties_yields_a_positive_delta() -> None:
+    """The exit side empties FIRST, and THREATENED only confirms afterward --
+    delta_i = threatened - last_executable > 0, classified AFTER, and must
+    NOT count toward the R-THREAT "before the exit side empties" gate."""
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_STD_UTC_OFFSET_HOURS)
+    _push_metar(accumulator, _ns_at(12, 30), 86)  # entry reading, m_code=0
+    position = _position(filled_at_ns=_ns_at(13, 5))
+    _push_metar(accumulator, _ns_at(13, 10), 87)  # m 0 -> 1 drop begins
+    # Fillable only at the FIRST evaluation instant; gone by the second.
+    early_fillable_frame = _depth(bids=(("0.20", "5"),), asks=(), ts_ns=_ns_at(13, 9))
+    empties_for_good = _depth(bids=(), asks=(), ts_ns=_ns_at(13, 20))
+
+    timeline = _timeline(
+        position=position, accumulator=accumulator,
+        depth_frames=(early_fillable_frame, empties_for_good),
+        observation_ts_ns=(_ns_at(13, 10), _ns_at(13, 30)),
+    )
+
+    assert timeline.first_threatened_ts_ns == _ns_at(13, 30)
+    assert timeline.last_executable_ts_ns == _ns_at(13, 10)
+    assert timeline.last_executable_ts_ns < timeline.first_threatened_ts_ns
+
+    row = ewr.build_position_exit_row(
+        timeline=timeline, settled_held=True, settlement_preliminary=False, depth_source="catalog",
+    )
+    assert ewr.classify_threatened_delta(row) == ewr.THREATENED_AFTER_EXIT_SIDE_EMPTIED
+
+    summary = ewr.build_summary((row,))
+    # The gate-reading consequence (§6 B2.3): an AFTER row counts toward
+    # neither the R-THREAT "before" gate nor its complement pool silently --
+    # it is excluded from threatened_before_emptied.
+    assert summary.threatened_before_emptied == 0
+    assert summary.threatened_after_emptied == 1
+
+
+# ---------------------------------------------------------------------------
 # 5. Summary counters and Markdown rendering over a 3-row fixture
 # ---------------------------------------------------------------------------
 
@@ -328,12 +404,20 @@ def test_build_summary_counts_and_medians_over_a_three_row_fixture() -> None:
 
     assert summary.n_positions == 3
     assert summary.threatened_before_emptied == 1  # only row-1
+    assert summary.threatened_after_emptied == 1  # only row-2 (AUD-07 B2)
     assert summary.dead_before_emptied == 1  # only row-1
     assert summary.median_minutes_last_executable_to_dead == Decimal(-10)
     assert summary.sum_hold_pnl == Decimal("0.80")
     assert summary.sum_r_dead_pnl == Decimal("1.10")
     assert summary.sum_r_threat_pnl == Decimal("0.85")
     assert summary.sum_r_best_pnl == Decimal("1.25")
+    assert summary.corpus_first_fill_date == rows[0].position.climate_day
+    assert summary.corpus_last_fill_date == rows[0].position.climate_day
+    assert summary.n_positions_new_since_previous_run is None  # no previous run supplied
+
+    assert ewr.classify_threatened_delta(rows[0]) == ewr.THREATENED_BEFORE_EXIT_SIDE_EMPTIED
+    assert ewr.classify_threatened_delta(rows[1]) == ewr.THREATENED_AFTER_EXIT_SIDE_EMPTIED
+    assert ewr.classify_threatened_delta(rows[2]) is None  # no THREATENED confirmation at all
 
     markdown = ewr.render_markdown(rows, summary)
     assert "row-1" in markdown
@@ -341,7 +425,197 @@ def test_build_summary_counts_and_medians_over_a_three_row_fixture() -> None:
     assert "row-3" in markdown
     assert "n_positions=3" in markdown
     assert "threatened_before_exit_side_emptied=1/3" in markdown
+    assert "threatened_after_exit_side_emptied=1/3" in markdown
     assert "dead_before_exit_side_emptied=1/3" in markdown
+    assert "THREATENED_BEFORE_EXIT_SIDE_EMPTIED" in markdown
+    assert "THREATENED_AFTER_EXIT_SIDE_EMPTIED" in markdown
+
+
+def test_build_summary_with_a_previous_run_counts_only_new_trial_ids() -> None:
+    rows = (
+        _synthetic_row(
+            trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+            last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.10"),
+            r_dead_pnl=Decimal("0.10"), r_threat_pnl=Decimal("0.10"), r_best_pnl=Decimal("0.10"),
+        ),
+        _synthetic_row(
+            trial_id="row-2", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+            last_executable_ts_ns=_ns_at(14, 30), hold_pnl_value=Decimal("0.10"),
+            r_dead_pnl=Decimal("0.10"), r_threat_pnl=Decimal("0.10"), r_best_pnl=Decimal("0.10"),
+        ),
+    )
+
+    frozen = ewr.build_summary(rows, previous_trial_ids=frozenset({"row-1", "row-2"}))
+    assert frozen.n_positions_new_since_previous_run == 0
+
+    grown = ewr.build_summary(rows, previous_trial_ids=frozenset({"row-1"}))
+    assert grown.n_positions_new_since_previous_run == 1  # only row-2 is new
+
+    first_ever = ewr.build_summary(rows, previous_trial_ids=frozenset())
+    assert first_ever.n_positions_new_since_previous_run == 2  # both new vs an empty prior set
+
+
+# ---------------------------------------------------------------------------
+# 5b. AUD-07 D: EXIT_CORPUS_FROZEN, on AUD-04's shared alert_ladder --
+# this control's own LOCAL wiring (event names, latch file, its
+# n_positions_new_since_previous_run == 0 predicate). The shared streak /
+# period-key state machine itself is asserted once, in
+# tests/unit/test_alert_ladder.py -- not re-asserted here.
+# ---------------------------------------------------------------------------
+
+_NS_PER_DAY = 86_400_000_000_000
+_FRESH_LATCH = alert_ladder.LatchState(
+    schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+    streak=0, last_alert_severity=None, last_alert_period_key=None,
+)
+
+
+def _day_ns(day_offset: int) -> int:
+    epoch_ns = int(dt.datetime(2026, 1, 1, tzinfo=dt.UTC).timestamp()) * 1_000_000_000
+    return epoch_ns + day_offset * _NS_PER_DAY
+
+
+class TestExitCorpusFrozenLadder:
+    def test_a_run_that_adds_no_positions_reports_zero_new(self) -> None:
+        latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=_FRESH_LATCH, now_ns=_day_ns(0),
+        )
+        assert latch.streak == 1
+        assert payload is None  # below WARN_STREAK_THRESHOLD
+
+    def test_three_consecutive_zero_new_runs_emit_one_frozen_corpus_warn(self) -> None:
+        latch = _FRESH_LATCH
+        payloads = []
+        for i in range(3):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert [p is not None for p in payloads] == [False, False, True]
+        assert payloads[-1].severity == "WARN"
+        assert payloads[-1].event == study_mod.EXIT_CORPUS_FROZEN_EVENT
+
+    def test_a_thirty_night_freeze_re_alerts_weekly_then_escalates_to_daily_critical(self) -> None:
+        latch = _FRESH_LATCH
+        emitted: list[tuple[int, str]] = []
+        for day_offset in range(30):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(day_offset),
+            )
+            if payload is not None:
+                emitted.append((day_offset + 1, payload.severity))
+        warns = [day for day, severity in emitted if severity == "WARN"]
+        criticals = [day for day, severity in emitted if severity == "CRITICAL"]
+        assert warns[0] == 3
+        assert all(severity != "CRITICAL" for day, severity in emitted if day < 14)
+        assert 14 in criticals
+        assert criticals == list(range(14, 31))
+
+    def test_a_same_period_rerun_does_not_re_alert(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(2),
+        )
+        assert payload is None
+
+    def test_the_frozen_streak_latch_survives_a_restart_without_re_alerting(
+        self, tmp_path: Path,
+    ) -> None:
+        latch_path = tmp_path / ".frozen_streak.json"
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        alert_ladder.write_latch_state(latch_path, latch)
+
+        reloaded = alert_ladder.read_latch_state(latch_path)
+        _new_latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=reloaded, now_ns=_day_ns(2),
+        )
+        assert payload is None
+
+    def test_a_missing_or_corrupt_frozen_streak_latch_re_alerts_rather_than_failing_silent(
+        self, tmp_path: Path,
+    ) -> None:
+        latch_path = tmp_path / ".frozen_streak.json"
+        latch_path.write_text("{ not json")
+        reloaded = alert_ladder.read_latch_state(latch_path)
+        assert reloaded.streak == 0
+
+        latch = reloaded
+        payloads = []
+        for i in range(3):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert payloads[-1] is not None
+
+    def test_a_new_position_clears_the_streak_emits_one_info_and_fully_re_arms(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        assert latch.streak == 3
+
+        latch, clear_payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=1, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert clear_payload.severity == "INFO"
+        assert clear_payload.event == study_mod.EXIT_CORPUS_FROZEN_CLEARED_EVENT
+        assert latch.streak == 0
+
+        payloads = []
+        for i in range(4, 7):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert payloads[-1] is not None
+        assert payloads[-1].severity == "WARN"
+
+    def test_the_first_ever_run_never_alerts_frozen(self) -> None:
+        """`n_positions_new_since_previous_run is None` (nothing to compare
+        against) must never be treated as frozen."""
+        latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=None, latch=_FRESH_LATCH, now_ns=_day_ns(0),
+        )
+        assert payload is None
+        assert latch.streak == 0
+
+    def test_severity_never_de_escalates_within_one_streak(self) -> None:
+        latch = _FRESH_LATCH
+        payload = None
+        for day_offset in range(14):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(day_offset),
+            )
+        assert payload.severity == "CRITICAL"
+        latch, payload2 = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=latch,
+            now_ns=_day_ns(13) + 3_600_000_000_000,
+        )
+        assert payload2 is None or payload2.severity == "CRITICAL"
+
+    def test_the_warning_carries_no_currency_denominated_field(self) -> None:
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert "$" not in payload.detail
+        import re as _re
+
+        assert not _re.search(r"\d+\.\d\d\b", payload.detail)
 
 
 # ---------------------------------------------------------------------------
