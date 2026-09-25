@@ -1742,14 +1742,21 @@ def test_family_manifest_threads_the_registered_taker_fee_coefficient(
 ) -> None:
     """A3: `--family-manifest` replaces the class-default fee coefficient
     with the manifest's registered `taker_fee_coefficient`, and the family
-    segment threaded downstream is the manifest's own `family_id`."""
+    segment threaded downstream is the manifest's own `family_id`.
+
+    Audit fix: the tape keeps its ORIGINAL, DISTINCT default (`THETA` =
+    0.06) while the manifest registers 0.0695 -- the Phase 3 preflight is
+    stubbed to a no-op here ONLY, so this test still discriminates "reads
+    the manifest's theta" from a regression that reads the tape's theta
+    instead (which the Phase 3 preflight would otherwise legitimately
+    refuse before `required_fee_coefficient` is ever captured)."""
+    monkeypatch.setattr(driver, "assert_fee_schedule_matches_family", lambda *a, **kw: None)
     manifest_path = _write_family_manifest(
         tmp_path, family_id="pm_us_crh_v4", taker_fee_coefficient="0.0695",
     )
     captured = _run_main_with_stubbed_capture(
         driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
         extra_argv=["--family-manifest", str(manifest_path)],
-        tape_fee_coefficient=Decimal("0.0695"),
     )
     assert captured["required_fee_coefficient"] == Decimal("0.0695")
     assert captured["family_id"] == "pm_us_crh_v4"
