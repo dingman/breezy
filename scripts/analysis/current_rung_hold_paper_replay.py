@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import inspect
 import json
 import os
 import sys
@@ -77,6 +78,7 @@ from run_weather_strategy_backtests import (
 from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
 from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_of
+from breezy.analysis.replay_sufficiency import decision_window_ns
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
@@ -297,6 +299,35 @@ def assert_requested_days_are_listed(
             f"{[d.isoformat() for d in unlisted]!r}; listed days: "
             f"{sorted(d.isoformat() for d in listed)!r}",
         )
+
+
+def _select_replay_capture_instruments(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str,
+    start: int,
+    end: int,
+) -> list[TapeInstrument]:
+    """Call the shared selector with replay-only narrowing when the callable
+    exposes those keywords.
+
+    Several driver tests monkeypatch `_select_capture_instruments` with the
+    historical `(catalog, *, climate_day)` shape to isolate unrelated dispatch
+    behavior. Signature-aware dispatch keeps those tests about their original
+    seam while the real selector receives the station and window bounds.
+    """
+    selector = _select_capture_instruments
+    parameters = inspect.signature(selector).parameters
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    kwargs: dict[str, object] = {"climate_day": climate_day}
+    for name, value in (("station", station), ("start", start), ("end", end)):
+        if accepts_kwargs or name in parameters:
+            kwargs[name] = value
+    return selector(catalog, **kwargs)
 
 
 class FeeScheduleMismatchError(ValueError):
@@ -1479,7 +1510,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         subdirectory=args.tape_subdirectory,
         work_catalog=args.work_catalog,
     )
-    tape_instruments = _select_capture_instruments(catalog, climate_day=climate_day)
+    std_utc_offset_hours = default_registry().climate_day_window(
+        WEATHER_VENUE, args.station,
+    ).std_utc_offset_hours
+    market_start_ns, market_end_ns = decision_window_ns(
+        climate_day=climate_day,
+        std_utc_offset_hours=std_utc_offset_hours,
+    )
+    tape_instruments = _select_replay_capture_instruments(
+        catalog,
+        climate_day=climate_day,
+        station=args.station,
+        start=market_start_ns,
+        end=market_end_ns,
+    )
     listed_days = sorted({ti.facts.climate_day for ti in tape_instruments})
     assert_requested_days_are_listed([climate_day], listed_days)
 
@@ -1496,9 +1540,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"current_rung_hold_paper_replay: refused: {exc}", file=sys.stderr)
             return EXIT_FEE_SCHEDULE_MISMATCH
 
-    std_utc_offset_hours = default_registry().climate_day_window(
-        WEATHER_VENUE, args.station,
-    ).std_utc_offset_hours
     # (3) Printed BEFORE the coverage precondition below, unconditionally --
     # an uncovered tape's own counts/span must be visible even (especially)
     # when this run goes on to refuse it.

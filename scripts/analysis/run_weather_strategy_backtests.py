@@ -1317,6 +1317,9 @@ def _select_capture_instruments(
     catalog: ParquetDataCatalog,
     *,
     climate_day: dt.date,
+    station: str | None = None,
+    start: int | None = None,
+    end: int | None = None,
 ) -> list[TapeInstrument]:
     """Every captured instrument for `climate_day` that carries ORDER-BOOK depth.
 
@@ -1337,7 +1340,11 @@ def _select_capture_instruments(
     facts_by_id: dict[str, WeatherBucketFacts] = {}
     for instrument_id, instrument in by_id.items():
         facts = read_weather_bucket_facts(instrument.info)
-        if facts.climate_day == climate_day:
+        if (
+            facts.applies_to(station, climate_day)
+            if station is not None
+            else facts.climate_day == climate_day
+        ):
             facts_by_id[instrument_id] = facts
 
     depth_counts: dict[str, int] = {}
@@ -1345,10 +1352,18 @@ def _select_capture_instruments(
     quotes_by_id: dict[str, list[QuoteTick]] = {}
     closes_by_id: dict[str, list[InstrumentClose]] = {}
     for instrument_id in facts_by_id:
-        depths = catalog.order_book_depth10(instrument_ids=[instrument_id])
+        depths = catalog.order_book_depth10(
+            instrument_ids=[instrument_id],
+            start=start,
+            end=end,
+        )
         depths_by_id[instrument_id] = depths
         depth_counts[instrument_id] = len(depths)
-        quotes_by_id[instrument_id] = catalog.quote_ticks(instrument_ids=[instrument_id])
+        quotes_by_id[instrument_id] = catalog.quote_ticks(
+            instrument_ids=[instrument_id],
+            start=start,
+            end=end,
+        )
         # The capture's OWN recorded closes for this instrument, converted by
         # `_convert_live_capture` alongside the quotes/depths above -- never
         # synthesized here (unlike `_select_tape_instruments`).
