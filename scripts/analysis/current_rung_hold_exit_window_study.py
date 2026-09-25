@@ -65,8 +65,11 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import os
 import sys
+import time
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
 
@@ -93,6 +96,11 @@ from monitor_hypothetical_core import ObservationRow
 from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+from portfolio_roi_report import (
+    PortfolioRoiReportMalformedFieldError,
+    UnknownPortfolioRoiSchemaError,
+    read_portfolio_roi_report,
+)
 from score_live_trials import (
     DEFAULT_DERIVED_DIR,
     _read_bucket_facts_by_instrument_id,
@@ -118,6 +126,8 @@ from breezy.domain.weather_bucket_facts import WeatherBucketFacts, read_weather_
 from breezy.ingest.iem_observations import iem_asos_rows_to_station_observations
 from breezy.persistence.scored_trial_store import read_scored_trials_pooled
 from breezy.registry.sites import default_registry
+from breezy.runtime import alert_ladder
+from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
 from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.monitor_evidence import Leg
@@ -138,6 +148,254 @@ _DEFAULT_LIVE_CATALOG_ROOT: Final[Path] = (
 #: note, mirroring every sibling analysis reader's convention) -- this only
 #: needs to be a real, always-visible-in-the-future instant.
 _PLACEHOLDER_RECEIVED_AT_NS: Final[int] = 2**62
+
+# --------------------------------------------------------------------------
+# AUD-07 D -- EXIT_CORPUS_FROZEN, on AUD-04's shared alert_ladder
+# (breezy.runtime.alert_ladder). This control owns its own latch file, its
+# own state file (the previous run's trial_id set), and its own event
+# names -- the streak/period-key state machine is imported, never
+# re-implemented (round 3 of the AUD-04/AUD-07 plan review).
+# --------------------------------------------------------------------------
+
+EXIT_CORPUS_FROZEN_EVENT: Final[str] = "EXIT_CORPUS_FROZEN"
+EXIT_CORPUS_FROZEN_CLEARED_EVENT: Final[str] = "EXIT_CORPUS_FROZEN_CLEARED"
+#: Path is literal per the plan (`docs/plans/backlog/AUDIT_2026-09-21/
+#: AUD-07-exit-seam-arming-verification-path.md` §6 D), under `out_root`
+#: (never per-run-stamp -- it must persist ACROSS runs).
+_FROZEN_STREAK_LATCH_FILENAME: Final[str] = ".frozen_streak.json"
+#: This item's own previous-run state: the trial_id set the LAST run saw,
+#: so "N grew" vs "N is frozen" is derived from an actual prior observation,
+#: never assumed. Absent on the very first run ever (streak stays 0, no
+#: alert -- nothing to compare against yet).
+_PREVIOUS_TRIAL_IDS_FILENAME: Final[str] = ".previous_trial_ids.json"
+
+
+def _read_previous_trial_ids(path: Path) -> frozenset[str] | None:
+    """`None` (never observed before) on a missing or unparseable file --
+    fail-closed toward "nothing to compare", never toward "frozen"."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    trial_ids = payload.get("trial_ids")
+    if not isinstance(trial_ids, list) or not all(isinstance(t, str) for t in trial_ids):
+        return None
+    return frozenset(trial_ids)
+
+
+def _write_previous_trial_ids(path: Path, trial_ids: frozenset[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"trial_ids": sorted(trial_ids)}, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _apply_ladder(
+    *, is_fresh: bool, latch: alert_ladder.LatchState, now_ns: int,
+    stale_event: str, cleared_event: str, stale_detail: str, cleared_detail: str,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Shared plumbing behind :func:`apply_corpus_frozen_ladder` and
+    :func:`apply_pnl_reconciliation_ladder` -- mirrors
+    `portfolio_roi_report._apply_ladder` byte-for-byte in shape (one shared
+    `alert_ladder` state machine, two LOCAL consumers, each with its own
+    latch file and event names -- D8's ownership rule)."""
+    previous_streak = latch.streak
+    streak = alert_ladder.next_streak(is_fresh=is_fresh, previous_streak=previous_streak)
+
+    if is_fresh:
+        new_latch = alert_ladder.LatchState(
+            schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+            streak=0, last_alert_severity=None, last_alert_period_key=None,
+        )
+        if previous_streak >= alert_ladder.WARN_STREAK_THRESHOLD:
+            return new_latch, AlertPayload(
+                severity="INFO", event=cleared_event,
+                site="current_rung_hold_exit_window_study", detail=cleared_detail,
+            )
+        return new_latch, None
+
+    decision = alert_ladder.evaluate_streak(
+        streak=streak, last_alert_severity=latch.last_alert_severity,
+        last_alert_period_key=latch.last_alert_period_key, now_ns=now_ns,
+    )
+    new_latch = alert_ladder.LatchState(
+        schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+        streak=streak,
+        last_alert_severity=(
+            decision.severity if decision.should_alert else latch.last_alert_severity
+        ),
+        last_alert_period_key=(
+            decision.period_key if decision.should_alert else latch.last_alert_period_key
+        ),
+    )
+    if not decision.should_alert:
+        return new_latch, None
+    assert decision.severity is not None
+    return new_latch, AlertPayload(
+        severity=decision.severity, event=stale_event,
+        site="current_rung_hold_exit_window_study", detail=stale_detail,
+    )
+
+
+EXIT_PNL_RECONCILIATION_MISMATCH_EVENT: Final[str] = "EXIT_PNL_RECONCILIATION_MISMATCH"
+EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT: Final[str] = (
+    "EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED"
+)
+#: Own latch (D8's per-consumer file rule); restart-surviving, same ladder
+#: cadence as `_FROZEN_STREAK_LATCH_FILENAME`.
+_PNL_RECONCILIATION_LATCH_FILENAME: Final[str] = ".pnl_reconciliation_mismatch.json"
+#: The reconciliation matches to the cent while no exit has ever fired
+#: (`exit_gate.py:55`'s `pm_us_crh_exit_v4` stays `DRAFT_NOT_REGISTERED`) --
+#: any non-zero divergence is therefore an alarm, not expected slack.
+_RECONCILIATION_TOLERANCE: Final[Decimal] = Decimal(0)
+#: Coordinator ruling (2026-09-25, domain review items 2/3): the exit-window
+#: study runs at 15:20Z; AUD-04 (`breezy-portfolio-roi.timer`) runs at
+#: 17:40Z. Comparing today's cumulative sum_hold_pnl against YESTERDAY's
+#: AUD-04 total at zero tolerance produced spurious mismatches. A report
+#: older than this many days past the run date is stale and SKIPPED rather
+#: than compared.
+_MAX_AUD04_STALENESS_DAYS: Final[int] = 2
+#: Domain review item 3: this caveat must appear in the stderr line AND the
+#: alert detail text, not only in a docstring.
+_AUD04_RECONCILIATION_CAVEAT: Final[str] = (
+    "report-level total, not per-trial; offsetting per-trial errors are invisible"
+)
+
+
+def _utc_date_from_ns(now_ns: int) -> str:
+    return dt.datetime.fromtimestamp(now_ns / 1_000_000_000, tz=dt.UTC).date().isoformat()
+
+
+def aud04_reconciliation_readiness(
+    *, settled_through: str, run_date: str, max_staleness_days: int = _MAX_AUD04_STALENESS_DAYS,
+) -> tuple[str | None, str | None]:
+    """Decide whether AUD-04's report can be reconciled against today's run,
+    and if so, the CUTOFF to restrict both sides to (domain review item 2).
+
+    Returns ``(cutoff, skip_reason)`` -- exactly one is ``None``.
+    ``settled_through`` (`PortfolioRoiReportView.settled_through`) is
+    AUD-04's own climate-day bound past which its daily rows are provisional
+    (`apply_settled_through`'s docstring) -- the best available "as-of"
+    field the published schema carries; used here as the join cutoff for
+    BOTH sides, never assumed same-day. Skips (never compares mismatched
+    periods) when ``settled_through`` does not parse as an ISO-8601 date, or
+    when it is more than ``max_staleness_days`` before ``run_date``.
+    """
+    try:
+        settled_through_date = dt.date.fromisoformat(settled_through)
+    except ValueError:
+        return None, (
+            f"AUD-04 settled_through={settled_through!r} is not a usable ISO-8601 date"
+        )
+    try:
+        run_date_parsed = dt.date.fromisoformat(run_date)
+    except ValueError:
+        return None, f"run_date={run_date!r} is not a usable ISO-8601 date"
+    age_days = (run_date_parsed - settled_through_date).days
+    if age_days > max_staleness_days:
+        return None, (
+            f"WARN: AUD-04 report is stale -- settled_through={settled_through} is "
+            f"{age_days} day(s) before run_date={run_date} (max {max_staleness_days})"
+        )
+    return settled_through, None
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Aud04ReconciliationResult:
+    """One reconciliation read against AUD-04's published report, restricted
+    on BOTH sides to `cutoff` (domain review item 2 -- "reconcile like with
+    like", never today's cumulative exit-side sum against yesterday's
+    AUD-04 total).
+
+    **Residual limitation, stated honestly rather than silently narrowed
+    (domain review item 3 -- also carried into the stderr line and the alert
+    detail, not only here):** AUD-04's `schema_version` reader
+    (`portfolio_roi_report.read_portfolio_roi_report`) exposes only a
+    REPORT-LEVEL `realised_pnl_after_fees_total` today -- it carries no
+    per-`trial_id` breakdown to join against, so offsetting per-trial errors
+    on either side are invisible to this check. The plan's literal spec
+    ("inner join on trial_id ... matches to the cent on every joined row")
+    therefore cannot be implemented against AUD-04's CURRENT published
+    schema without AUD-04 adding that breakdown (its own stated mirror
+    obligation, AUD-04 plan §8 AC#4) -- a genuine cross-item dependency gap,
+    not something this item can close unilaterally by editing another
+    item's file. This is a real, standing, alerting check today (not a
+    no-op), but coarser than the per-row form the plan specifies.
+    """
+
+    matched: bool
+    cutoff: str
+    sum_hold_pnl: Decimal | None
+    aud04_realised_pnl_after_fees_total: Decimal
+    divergence: Decimal | None
+
+
+def reconcile_with_aud04(
+    *, rows: Sequence[PositionExitRow], cutoff: str, aud04_realised_pnl_after_fees_total: Decimal,
+) -> Aud04ReconciliationResult:
+    """Pure comparison -- no I/O. Restricts the exit-side sum to positions
+    with `climate_day <= cutoff` (the same universe/cutoff AUD-04's own
+    `settled_through` bounds), never the study's full cumulative history.
+    An empty cutoff-restricted set reconciles trivially against a zero
+    AUD-04 total only; any non-zero AUD-04 total against an empty
+    cutoff-restricted study is an unjoined-row mismatch.
+    """
+    cutoff_rows = tuple(row for row in rows if row.position.climate_day <= cutoff)
+    known_hold_pnl = [row.hold_pnl for row in cutoff_rows if row.hold_pnl is not None]
+    sum_hold_pnl = sum(known_hold_pnl, Decimal(0)) if known_hold_pnl else None
+    if sum_hold_pnl is None:
+        divergence = aud04_realised_pnl_after_fees_total
+    else:
+        divergence = sum_hold_pnl - aud04_realised_pnl_after_fees_total
+    matched = abs(divergence) <= _RECONCILIATION_TOLERANCE
+    return Aud04ReconciliationResult(
+        matched=matched, cutoff=cutoff, sum_hold_pnl=sum_hold_pnl,
+        aud04_realised_pnl_after_fees_total=aud04_realised_pnl_after_fees_total,
+        divergence=divergence,
+    )
+
+
+def apply_pnl_reconciliation_ladder(
+    *, matched: bool, latch: alert_ladder.LatchState, now_ns: int,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Same ladder cadence as `apply_corpus_frozen_ladder`: `matched=True` is
+    fresh (silent, or one `INFO` `..._CLEARED` recovering from a streak);
+    `matched=False` increments the streak toward a weekly `WARN`, daily
+    `CRITICAL` at `streak >= 14`. The detail text always carries the
+    report-level-total caveat (domain review item 3)."""
+    previous_streak = latch.streak
+    return _apply_ladder(
+        is_fresh=matched, latch=latch, now_ns=now_ns,
+        stale_event=EXIT_PNL_RECONCILIATION_MISMATCH_EVENT,
+        cleared_event=EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT,
+        stale_detail=f"streak={previous_streak + 1} caveat={_AUD04_RECONCILIATION_CAVEAT}",
+        cleared_detail=f"streak_len={previous_streak} caveat={_AUD04_RECONCILIATION_CAVEAT}",
+    )
+
+
+def apply_corpus_frozen_ladder(
+    *, n_positions_new_since_previous_run: int | None,
+    latch: alert_ladder.LatchState, now_ns: int,
+) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
+    """Drives `breezy.runtime.alert_ladder`'s shared state machine over this
+    control's own local predicate: fresh (no alert, streak clears) iff no
+    previous run exists to compare against, or this run added at least one
+    NEW position; stale (streak increments) iff a previous run exists and
+    `n_positions_new_since_previous_run == 0`.
+
+    Returns the next latch state to persist and an `AlertPayload` to emit
+    through the caller's sink, or `None` when this run stays silent.
+    """
+    is_fresh = n_positions_new_since_previous_run is None or n_positions_new_since_previous_run > 0
+    previous_streak = latch.streak
+    return _apply_ladder(
+        is_fresh=is_fresh, latch=latch, now_ns=now_ns,
+        stale_event=EXIT_CORPUS_FROZEN_EVENT, cleared_event=EXIT_CORPUS_FROZEN_CLEARED_EVENT,
+        stale_detail=f"streak={previous_streak + 1} n_positions_new_since_previous_run=0",
+        cleared_detail=f"streak_len={previous_streak}",
+    )
 
 
 def _station_asos_text(
@@ -650,13 +908,34 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--live-catalog-root", type=Path, default=_DEFAULT_LIVE_CATALOG_ROOT)
     parser.add_argument("--run-stamp", required=True, type=str)
     parser.add_argument("--out-root", type=Path, default=_DEFAULT_OUT_ROOT)
+    parser.add_argument(
+        "--aud04-report", type=Path, default=None,
+        help=(
+            "AUD-07 standing reconciliation: optional path to AUD-04's "
+            "PRIVATE_portfolio_roi_<stamp>.json for the SAME period. Read "
+            "through AUD-04's own schema_version reader, never re-parsed "
+            "Markdown. Omitted on any date AUD-04's artefact does not yet "
+            "exist -- the reconciliation is then skipped, never faked."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    sink: AlertSink | None = None,
+    now_ns: int | None = None,
+) -> int:
+    """`sink`/`now_ns` are keyword-only test seams (never CLI flags, mirroring
+    `score_live_trials.main`'s own `proc_root` convention): production
+    resolves both from the real environment/clock.
+    """
     args = _parse_args(argv)
     out_dir: Path = args.out_root / args.run_stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    resolved_sink = resolve_alert_sink(os.environ) if sink is None else sink
+    resolved_now_ns = time.time_ns() if now_ns is None else now_ns
 
     total_fetch_outage = False
     try:
@@ -670,7 +949,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _TotalAsosFetchOutage as exc:
         rows, missing = exc.rows, exc.missing
         total_fetch_outage = True
-    summary = build_summary(rows)
+
+    # AUD-07 D: read the PREVIOUS run's trial-id set (persisted under
+    # out_root, never per-run-stamp) before building this run's summary, so
+    # "N grew" vs "N is frozen" is derived from an actual prior observation.
+    previous_trial_ids_path = args.out_root / _PREVIOUS_TRIAL_IDS_FILENAME
+    previous_trial_ids = _read_previous_trial_ids(previous_trial_ids_path)
+    summary = build_summary(rows, previous_trial_ids=previous_trial_ids)
+    _write_previous_trial_ids(
+        previous_trial_ids_path, frozenset(row.position.trial_id for row in rows)
+    )
+
     markdown = render_markdown(rows, summary)
     if missing:
         markdown += "\nMISSING INPUTS (reported, not fabricated):\n" + "\n".join(
@@ -692,6 +981,68 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[exit-window-study] {len(rows)} position(s); wrote {out_dir}", file=sys.stderr)
     for item in missing:
         print(f"[exit-window-study] MISSING: {item}", file=sys.stderr)
+
+    # AUD-07 D: EXIT_CORPUS_FROZEN, on AUD-04's shared re-alert ladder.
+    frozen_streak_latch_path = args.out_root / _FROZEN_STREAK_LATCH_FILENAME
+    frozen_streak_latch = alert_ladder.read_latch_state(frozen_streak_latch_path)
+    new_frozen_streak_latch, alert_payload = apply_corpus_frozen_ladder(
+        n_positions_new_since_previous_run=summary.n_positions_new_since_previous_run,
+        latch=frozen_streak_latch, now_ns=resolved_now_ns,
+    )
+    alert_ladder.write_latch_state(frozen_streak_latch_path, new_frozen_streak_latch)
+    if alert_payload is not None:
+        emit_alert(resolved_sink, alert_payload)
+
+    # AUD-07 standing reconciliation with AUD-04 (§6, "on any date both
+    # artefacts exist"). Skipped entirely -- never faked as matched, and
+    # never compared across mismatched periods -- when AUD-04's artefact for
+    # this date was not supplied, is unreadable/malformed, or is stale.
+    if args.aud04_report is not None:
+        try:
+            aud04_view = read_portfolio_roi_report(args.aud04_report)
+        except (
+            OSError,
+            json.JSONDecodeError,
+            UnknownPortfolioRoiSchemaError,
+            PortfolioRoiReportMalformedFieldError,
+        ) as exc:
+            print(
+                f"[exit-window-study] AUD-04 reconciliation SKIPPED: could not read "
+                f"{args.aud04_report}: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+        else:
+            run_date = _utc_date_from_ns(resolved_now_ns)
+            cutoff, skip_reason = aud04_reconciliation_readiness(
+                settled_through=aud04_view.settled_through, run_date=run_date,
+            )
+            if skip_reason is not None:
+                print(
+                    f"[exit-window-study] AUD-04 reconciliation SKIPPED: {skip_reason}",
+                    file=sys.stderr,
+                )
+            else:
+                assert cutoff is not None
+                reconciliation = reconcile_with_aud04(
+                    rows=rows, cutoff=cutoff,
+                    aud04_realised_pnl_after_fees_total=aud04_view.realised_pnl_after_fees_total,
+                )
+                print(
+                    f"[exit-window-study] AUD-04 reconciliation: matched={reconciliation.matched} "
+                    f"cutoff={cutoff} divergence={reconciliation.divergence} "
+                    f"caveat={_AUD04_RECONCILIATION_CAVEAT}",
+                    file=sys.stderr,
+                )
+                reconciliation_latch_path = args.out_root / _PNL_RECONCILIATION_LATCH_FILENAME
+                reconciliation_latch = alert_ladder.read_latch_state(reconciliation_latch_path)
+                new_reconciliation_latch, reconciliation_payload = apply_pnl_reconciliation_ladder(
+                    matched=reconciliation.matched, latch=reconciliation_latch,
+                    now_ns=resolved_now_ns,
+                )
+                alert_ladder.write_latch_state(reconciliation_latch_path, new_reconciliation_latch)
+                if reconciliation_payload is not None:
+                    emit_alert(resolved_sink, reconciliation_payload)
+
     if total_fetch_outage:
         print(
             "[exit-window-study] every attempted ASOS fetch failed; no station loaded",

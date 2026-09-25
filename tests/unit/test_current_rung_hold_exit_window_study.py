@@ -31,6 +31,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
+from breezy.runtime import alert_ladder
 from breezy.settlement.trial_scorer import FilledTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator, RunningMax
@@ -44,6 +45,7 @@ import current_rung_hold_exit_window_study as study_mod
 import exit_window_core as ewc
 import exit_window_report as ewr
 import ma_prelock_winner_ask_study as prelock
+import portfolio_roi_report as prr
 import settlement_alignment_study as settlement
 
 _STD_UTC_OFFSET_HOURS = -8.0  # Pacific standard time, matches SFO
@@ -263,6 +265,81 @@ def test_winning_position_r_threat_premature_exit_costs_money_vs_hold() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 4b. AUD-07 B2: the negative-median closing check, through the REAL writer
+# path (build_exit_timeline replay, never a hand-set ExitTimeline) -- a
+# synthetic timeline would hide exactly the class of defect the 0-vs-5
+# disagreement already demonstrated (L-42).
+# ---------------------------------------------------------------------------
+
+
+def test_a_threatened_confirmation_before_the_exit_side_empties_yields_a_negative_delta() -> None:
+    """Mirrors the one real R-THREAT firing on record (MIA NO leg, 09-15):
+    THREATENED confirms, and the exit side STILL has liquidity afterward --
+    delta_i = threatened - last_executable < 0, classified BEFORE."""
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_STD_UTC_OFFSET_HOURS)
+    _push_metar(accumulator, _ns_at(12, 30), 86)  # entry reading, m_code=0
+    position = _position(filled_at_ns=_ns_at(13, 5))
+    _push_metar(accumulator, _ns_at(13, 10), 87)  # m 0 -> 1 drop begins
+    # Same THREATENED-confirming frame as
+    # test_winning_position_r_threat_premature_exit_costs_money_vs_hold
+    # (depth is required for the monitor to assess THREATENED at all), plus
+    # a SECOND, LATER fillable frame -- the exit side still has liquidity
+    # well after THREATENED confirms at 13:30.
+    threatened_frame = _depth(bids=(("0.30", "5"),), asks=(), ts_ns=_ns_at(13, 20))
+    later_fillable_frame = _depth(bids=(("0.20", "5"),), asks=(), ts_ns=_ns_at(13, 40))
+
+    timeline = _timeline(
+        position=position, accumulator=accumulator,
+        depth_frames=(threatened_frame, later_fillable_frame),
+        observation_ts_ns=(_ns_at(13, 10), _ns_at(13, 30)),
+    )
+
+    assert timeline.first_threatened_ts_ns == _ns_at(13, 30)
+    assert timeline.last_executable_ts_ns == _ns_at(13, 40)
+    assert timeline.first_threatened_ts_ns < timeline.last_executable_ts_ns
+
+    row = ewr.build_position_exit_row(
+        timeline=timeline, settled_held=True, settlement_preliminary=False, depth_source="catalog",
+    )
+    assert ewr.classify_threatened_delta(row) == ewr.THREATENED_BEFORE_EXIT_SIDE_EMPTIED
+
+
+def test_a_threatened_confirmation_after_the_exit_side_empties_yields_a_positive_delta() -> None:
+    """The exit side empties FIRST, and THREATENED only confirms afterward --
+    delta_i = threatened - last_executable > 0, classified AFTER, and must
+    NOT count toward the R-THREAT "before the exit side empties" gate."""
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_STD_UTC_OFFSET_HOURS)
+    _push_metar(accumulator, _ns_at(12, 30), 86)  # entry reading, m_code=0
+    position = _position(filled_at_ns=_ns_at(13, 5))
+    _push_metar(accumulator, _ns_at(13, 10), 87)  # m 0 -> 1 drop begins
+    # Fillable only at the FIRST evaluation instant; gone by the second.
+    early_fillable_frame = _depth(bids=(("0.20", "5"),), asks=(), ts_ns=_ns_at(13, 9))
+    empties_for_good = _depth(bids=(), asks=(), ts_ns=_ns_at(13, 20))
+
+    timeline = _timeline(
+        position=position, accumulator=accumulator,
+        depth_frames=(early_fillable_frame, empties_for_good),
+        observation_ts_ns=(_ns_at(13, 10), _ns_at(13, 30)),
+    )
+
+    assert timeline.first_threatened_ts_ns == _ns_at(13, 30)
+    assert timeline.last_executable_ts_ns == _ns_at(13, 10)
+    assert timeline.last_executable_ts_ns < timeline.first_threatened_ts_ns
+
+    row = ewr.build_position_exit_row(
+        timeline=timeline, settled_held=True, settlement_preliminary=False, depth_source="catalog",
+    )
+    assert ewr.classify_threatened_delta(row) == ewr.THREATENED_AFTER_EXIT_SIDE_EMPTIED
+
+    summary = ewr.build_summary((row,))
+    # The gate-reading consequence (§6 B2.3): an AFTER row counts toward
+    # neither the R-THREAT "before" gate nor its complement pool silently --
+    # it is excluded from threatened_before_emptied.
+    assert summary.threatened_before_emptied == 0
+    assert summary.threatened_after_emptied == 1
+
+
+# ---------------------------------------------------------------------------
 # 5. Summary counters and Markdown rendering over a 3-row fixture
 # ---------------------------------------------------------------------------
 
@@ -270,11 +347,12 @@ def test_winning_position_r_threat_premature_exit_costs_money_vs_hold() -> None:
 def _synthetic_row(
     *, trial_id: str, first_threatened_ts_ns: int | None, first_dead_ts_ns: int | None,
     last_executable_ts_ns: int | None, hold_pnl_value: Decimal, r_dead_pnl: Decimal,
-    r_threat_pnl: Decimal, r_best_pnl: Decimal,
+    r_threat_pnl: Decimal, r_best_pnl: Decimal, climate_day: str | None = None,
 ) -> ewr.PositionExitRow:
     position = _position(filled_at_ns=_ns_at(14, 5))
     position = ewc.FilledPosition(
-        trial_id=trial_id, station=position.station, climate_day=position.climate_day,
+        trial_id=trial_id, station=position.station,
+        climate_day=climate_day if climate_day is not None else position.climate_day,
         season=position.season, instrument_id=position.instrument_id, leg=position.leg,
         rung=position.rung, fill_px=position.fill_px, fee=position.fee,
         held_qty=position.held_qty, filled_at_ns=position.filled_at_ns,
@@ -328,12 +406,20 @@ def test_build_summary_counts_and_medians_over_a_three_row_fixture() -> None:
 
     assert summary.n_positions == 3
     assert summary.threatened_before_emptied == 1  # only row-1
+    assert summary.threatened_after_emptied == 1  # only row-2 (AUD-07 B2)
     assert summary.dead_before_emptied == 1  # only row-1
     assert summary.median_minutes_last_executable_to_dead == Decimal(-10)
     assert summary.sum_hold_pnl == Decimal("0.80")
     assert summary.sum_r_dead_pnl == Decimal("1.10")
     assert summary.sum_r_threat_pnl == Decimal("0.85")
     assert summary.sum_r_best_pnl == Decimal("1.25")
+    assert summary.corpus_first_fill_date == rows[0].position.climate_day
+    assert summary.corpus_last_fill_date == rows[0].position.climate_day
+    assert summary.n_positions_new_since_previous_run is None  # no previous run supplied
+
+    assert ewr.classify_threatened_delta(rows[0]) == ewr.THREATENED_BEFORE_EXIT_SIDE_EMPTIED
+    assert ewr.classify_threatened_delta(rows[1]) == ewr.THREATENED_AFTER_EXIT_SIDE_EMPTIED
+    assert ewr.classify_threatened_delta(rows[2]) is None  # no THREATENED confirmation at all
 
     markdown = ewr.render_markdown(rows, summary)
     assert "row-1" in markdown
@@ -341,7 +427,489 @@ def test_build_summary_counts_and_medians_over_a_three_row_fixture() -> None:
     assert "row-3" in markdown
     assert "n_positions=3" in markdown
     assert "threatened_before_exit_side_emptied=1/3" in markdown
+    assert "threatened_after_exit_side_emptied=1/3" in markdown
     assert "dead_before_exit_side_emptied=1/3" in markdown
+    assert "THREATENED_BEFORE_EXIT_SIDE_EMPTIED" in markdown
+    assert "THREATENED_AFTER_EXIT_SIDE_EMPTIED" in markdown
+
+
+def test_build_summary_with_a_previous_run_counts_only_new_trial_ids() -> None:
+    rows = (
+        _synthetic_row(
+            trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+            last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.10"),
+            r_dead_pnl=Decimal("0.10"), r_threat_pnl=Decimal("0.10"), r_best_pnl=Decimal("0.10"),
+        ),
+        _synthetic_row(
+            trial_id="row-2", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+            last_executable_ts_ns=_ns_at(14, 30), hold_pnl_value=Decimal("0.10"),
+            r_dead_pnl=Decimal("0.10"), r_threat_pnl=Decimal("0.10"), r_best_pnl=Decimal("0.10"),
+        ),
+    )
+
+    frozen = ewr.build_summary(rows, previous_trial_ids=frozenset({"row-1", "row-2"}))
+    assert frozen.n_positions_new_since_previous_run == 0
+
+    grown = ewr.build_summary(rows, previous_trial_ids=frozenset({"row-1"}))
+    assert grown.n_positions_new_since_previous_run == 1  # only row-2 is new
+
+    first_ever = ewr.build_summary(rows, previous_trial_ids=frozenset())
+    assert first_ever.n_positions_new_since_previous_run == 2  # both new vs an empty prior set
+
+
+# ---------------------------------------------------------------------------
+# 5b. AUD-07 D: EXIT_CORPUS_FROZEN, on AUD-04's shared alert_ladder --
+# this control's own LOCAL wiring (event names, latch file, its
+# n_positions_new_since_previous_run == 0 predicate). The shared streak /
+# period-key state machine itself is asserted once, in
+# tests/unit/test_alert_ladder.py -- not re-asserted here.
+# ---------------------------------------------------------------------------
+
+_NS_PER_DAY = 86_400_000_000_000
+_FRESH_LATCH = alert_ladder.LatchState(
+    schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+    streak=0, last_alert_severity=None, last_alert_period_key=None,
+)
+
+
+def _day_ns(day_offset: int) -> int:
+    epoch_ns = int(dt.datetime(2026, 1, 1, tzinfo=dt.UTC).timestamp()) * 1_000_000_000
+    return epoch_ns + day_offset * _NS_PER_DAY
+
+
+class TestExitCorpusFrozenLadder:
+    def test_a_run_that_adds_no_positions_reports_zero_new(self) -> None:
+        latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=_FRESH_LATCH, now_ns=_day_ns(0),
+        )
+        assert latch.streak == 1
+        assert payload is None  # below WARN_STREAK_THRESHOLD
+
+    def test_three_consecutive_zero_new_runs_emit_one_frozen_corpus_warn(self) -> None:
+        latch = _FRESH_LATCH
+        payloads = []
+        for i in range(3):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert [p is not None for p in payloads] == [False, False, True]
+        assert payloads[-1].severity == "WARN"
+        assert payloads[-1].event == study_mod.EXIT_CORPUS_FROZEN_EVENT
+
+    def test_a_thirty_night_freeze_re_alerts_weekly_then_escalates_to_daily_critical(self) -> None:
+        latch = _FRESH_LATCH
+        emitted: list[tuple[int, str]] = []
+        for day_offset in range(30):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(day_offset),
+            )
+            if payload is not None:
+                emitted.append((day_offset + 1, payload.severity))
+        warns = [day for day, severity in emitted if severity == "WARN"]
+        criticals = [day for day, severity in emitted if severity == "CRITICAL"]
+        assert warns[0] == 3
+        assert all(severity != "CRITICAL" for day, severity in emitted if day < 14)
+        assert 14 in criticals
+        assert criticals == list(range(14, 31))
+
+    def test_a_same_period_rerun_does_not_re_alert(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(2),
+        )
+        assert payload is None
+
+    def test_the_frozen_streak_latch_survives_a_restart_without_re_alerting(
+        self, tmp_path: Path,
+    ) -> None:
+        latch_path = tmp_path / ".frozen_streak.json"
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        alert_ladder.write_latch_state(latch_path, latch)
+
+        reloaded = alert_ladder.read_latch_state(latch_path)
+        _new_latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=reloaded, now_ns=_day_ns(2),
+        )
+        assert payload is None
+
+    def test_a_missing_or_corrupt_frozen_streak_latch_re_alerts_rather_than_failing_silent(
+        self, tmp_path: Path,
+    ) -> None:
+        latch_path = tmp_path / ".frozen_streak.json"
+        latch_path.write_text("{ not json")
+        reloaded = alert_ladder.read_latch_state(latch_path)
+        assert reloaded.streak == 0
+
+        latch = reloaded
+        payloads = []
+        for i in range(3):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert payloads[-1] is not None
+
+    def test_a_new_position_clears_the_streak_emits_one_info_and_fully_re_arms(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        assert latch.streak == 3
+
+        latch, clear_payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=1, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert clear_payload.severity == "INFO"
+        assert clear_payload.event == study_mod.EXIT_CORPUS_FROZEN_CLEARED_EVENT
+        assert latch.streak == 0
+
+        payloads = []
+        for i in range(4, 7):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert payloads[-1] is not None
+        assert payloads[-1].severity == "WARN"
+
+    def test_the_first_ever_run_never_alerts_frozen(self) -> None:
+        """`n_positions_new_since_previous_run is None` (nothing to compare
+        against) must never be treated as frozen."""
+        latch, payload = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=None, latch=_FRESH_LATCH, now_ns=_day_ns(0),
+        )
+        assert payload is None
+        assert latch.streak == 0
+
+    def test_severity_never_de_escalates_within_one_streak(self) -> None:
+        latch = _FRESH_LATCH
+        payload = None
+        for day_offset in range(14):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(day_offset),
+            )
+        assert payload.severity == "CRITICAL"
+        latch, payload2 = study_mod.apply_corpus_frozen_ladder(
+            n_positions_new_since_previous_run=0, latch=latch,
+            now_ns=_day_ns(13) + 3_600_000_000_000,
+        )
+        assert payload2 is None or payload2.severity == "CRITICAL"
+
+    def test_the_warning_carries_no_currency_denominated_field(self) -> None:
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_corpus_frozen_ladder(
+                n_positions_new_since_previous_run=0, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert "$" not in payload.detail
+        import re as _re
+
+        assert not _re.search(r"\d+\.\d\d\b", payload.detail)
+
+
+# ---------------------------------------------------------------------------
+# 5c. AUD-07 standing reconciliation with AUD-04, read through AUD-04's own
+# schema_version reader (never re-parsed Markdown). See
+# Aud04ReconciliationResult's docstring for the stated residual limitation:
+# AUD-04's published schema carries a REPORT-LEVEL total only, not yet a
+# per-trial_id breakdown to inner-join against (AUD-04's own mirror
+# obligation, AUD-04 plan §8 AC#4) -- this compares totals over the same
+# period until that field exists.
+# ---------------------------------------------------------------------------
+
+
+def _write_minimal_aud04_report(
+    path: Path, *, realised_pnl_after_fees_total: Decimal,
+) -> None:
+    payload = {
+        "schema_version": prr.PORTFOLIO_ROI_SCHEMA_VERSION,
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-10",
+        "n_fills": 1,
+        "n_scored": 1,
+        "n_residual": 0,
+        "n_unreconciled": 0,
+        "power_caveat": "n=1; not statistically powered.",
+        "realised_pnl_after_fees_total": str(realised_pnl_after_fees_total),
+        "capital_deployed_total": "1.00",
+        "unexplained_flow_days": 0,
+        "settled_through": "2026-01-08",
+        "settled_through_statistic": "max",
+        "lag_sample_n": 1,
+        "roi_status": prr.ROI_STATUS_OK,
+        "unsettled_capital_positions": 0,
+        "max_days_past_horizon": 0,
+        "roi": "0.10",
+        "roi_minus_b0": "0.10",
+        "roi_minus_b1": "0.10",
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+class TestAud04Reconciliation:
+    def test_a_matching_total_reconciles(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.61"),
+        )
+        assert result.matched is True
+        assert result.divergence == Decimal(0)
+        assert result.cutoff == "2026-01-10"
+
+    def test_a_mismatched_total_does_not_reconcile_and_names_the_divergence(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.50"),
+        )
+        assert result.matched is False
+        assert result.divergence == Decimal("0.11")
+
+    def test_an_empty_study_against_a_nonzero_aud04_total_is_a_mismatch_never_dropped(
+        self,
+    ) -> None:
+        result = study_mod.reconcile_with_aud04(
+            rows=(), cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.50"),
+        )
+        assert result.matched is False
+        assert result.divergence == Decimal("0.50")
+
+    def test_the_reconciliation_reads_aud04_through_its_schema_version_reader(
+        self, tmp_path: Path,
+    ) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_2026-01-10.json"
+        _write_minimal_aud04_report(report_path, realised_pnl_after_fees_total=Decimal("0.61"))
+
+        view = prr.read_portfolio_roi_report(report_path)
+        rows = (
+            _synthetic_row(
+                trial_id="row-1", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff=view.settled_through,
+            aud04_realised_pnl_after_fees_total=view.realised_pnl_after_fees_total,
+        )
+        assert result.matched is True
+
+    def test_a_row_after_the_cutoff_is_excluded_from_the_exit_side_sum(self) -> None:
+        """Domain review item 2: "reconcile like with like" -- a settlement
+        landing AFTER AUD-04's cutoff must not itself produce a mismatch."""
+        rows = (
+            _synthetic_row(
+                trial_id="in-window", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="after-cutoff", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("9.99"),
+                r_dead_pnl=Decimal("9.99"), r_threat_pnl=Decimal("9.99"),
+                r_best_pnl=Decimal("9.99"),
+                climate_day="2026-01-11",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.61"),
+        )
+        assert result.matched is True
+        assert result.sum_hold_pnl == Decimal("0.61")
+
+    def test_a_genuine_divergence_within_the_same_cutoff_is_a_mismatch(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="in-window", first_threatened_ts_ns=None, first_dead_ts_ns=None,
+                last_executable_ts_ns=_ns_at(14, 20), hold_pnl_value=Decimal("0.61"),
+                r_dead_pnl=Decimal("0.61"), r_threat_pnl=Decimal("0.61"),
+                r_best_pnl=Decimal("0.61"),
+                climate_day="2026-01-05",
+            ),
+        )
+        result = study_mod.reconcile_with_aud04(
+            rows=rows, cutoff="2026-01-10", aud04_realised_pnl_after_fees_total=Decimal("0.10"),
+        )
+        assert result.matched is False
+        assert result.divergence == Decimal("0.51")
+
+
+class TestAud04ReconciliationReadiness:
+    """Domain review item 2: reconcile like with like -- restrict both sides
+    to AUD-04's own `settled_through` cutoff; skip (never compare mismatched
+    periods) on an unusable or stale cutoff."""
+
+    def test_a_fresh_report_yields_the_settled_through_cutoff(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="2026-01-08", run_date="2026-01-09",
+        )
+        assert cutoff == "2026-01-08"
+        assert skip_reason is None
+
+    def test_a_report_exactly_at_the_staleness_bound_is_not_skipped(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="2026-01-01", run_date="2026-01-03",
+        )
+        assert cutoff == "2026-01-01"
+        assert skip_reason is None
+
+    def test_a_report_older_than_two_days_is_skipped_with_a_warn_line_naming_its_age(
+        self,
+    ) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="2026-01-01", run_date="2026-01-05",
+        )
+        assert cutoff is None
+        assert skip_reason is not None
+        assert "WARN" in skip_reason
+        assert "4 day(s)" in skip_reason
+
+    def test_an_unparseable_settled_through_is_skipped_with_a_stated_reason(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            settled_through="not-a-date", run_date="2026-01-05",
+        )
+        assert cutoff is None
+        assert skip_reason is not None
+        assert "not-a-date" in skip_reason
+
+
+class TestPnlReconciliationLadder:
+    def test_a_persistent_mismatch_emits_on_the_same_ladder_as_corpus_frozen(self) -> None:
+        latch = _FRESH_LATCH
+        payloads = []
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+            payloads.append(payload)
+        assert [p is not None for p in payloads] == [False, False, True]
+        assert payloads[-1].severity == "WARN"
+        assert payloads[-1].event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_EVENT
+
+    def test_a_matching_run_clears_the_streak_and_emits_one_info(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+        assert latch.streak == 3
+        latch, clear_payload = study_mod.apply_pnl_reconciliation_ladder(
+            matched=True, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert clear_payload.severity == "INFO"
+        assert clear_payload.event == study_mod.EXIT_PNL_RECONCILIATION_MISMATCH_CLEARED_EVENT
+        assert latch.streak == 0
+
+    def test_own_latch_file_is_distinct_from_the_frozen_corpus_latch(self) -> None:
+        assert (
+            study_mod._PNL_RECONCILIATION_LATCH_FILENAME
+            != study_mod._FROZEN_STREAK_LATCH_FILENAME
+        )
+
+    def test_the_mismatch_alert_carries_the_report_level_total_caveat(self) -> None:
+        """Domain review item 3: the caveat must be in the alert detail text,
+        not only in a docstring."""
+        latch = _FRESH_LATCH
+        payload = None
+        for i in range(3):
+            latch, payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+        assert payload is not None
+        assert study_mod._AUD04_RECONCILIATION_CAVEAT in payload.detail
+
+    def test_the_cleared_alert_also_carries_the_caveat(self) -> None:
+        latch = _FRESH_LATCH
+        for i in range(3):
+            latch, _payload = study_mod.apply_pnl_reconciliation_ladder(
+                matched=False, latch=latch, now_ns=_day_ns(i),
+            )
+        latch, clear_payload = study_mod.apply_pnl_reconciliation_ladder(
+            matched=True, latch=latch, now_ns=_day_ns(3),
+        )
+        assert clear_payload is not None
+        assert study_mod._AUD04_RECONCILIATION_CAVEAT in clear_payload.detail
+
+
+class TestAud04MalformedArtifactHandling:
+    """Domain review item 1: a malformed AUD-04 artefact must degrade to the
+    SKIPPED path -- never crash the run -- and the study must still write
+    its own summary."""
+
+    def test_corrupt_json_skips_and_still_writes_the_summary(
+        self, tmp_path: Path,
+    ) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_corrupt.json"
+        report_path.write_text("{ not valid json")
+
+        with pytest.raises(json.JSONDecodeError):
+            prr.read_portfolio_roi_report(report_path)
+
+        # The exact exception main() must catch and degrade from:
+        try:
+            prr.read_portfolio_roi_report(report_path)
+        except (
+            OSError,
+            json.JSONDecodeError,
+            prr.UnknownPortfolioRoiSchemaError,
+            prr.PortfolioRoiReportMalformedFieldError,
+        ) as exc:
+            caught: Exception | None = exc
+        else:
+            caught = None
+        assert caught is not None
+
+    def test_a_malformed_field_skips_and_still_writes_the_summary(
+        self, tmp_path: Path,
+    ) -> None:
+        report_path = tmp_path / "PRIVATE_portfolio_roi_malformed.json"
+        _write_minimal_aud04_report(report_path, realised_pnl_after_fees_total=Decimal("0.61"))
+        payload = json.loads(report_path.read_text())
+        payload["realised_pnl_after_fees_total"] = 0.61  # must be a decimal-shaped STR
+        report_path.write_text(json.dumps(payload))
+
+        with pytest.raises(prr.PortfolioRoiReportMalformedFieldError):
+            prr.read_portfolio_roi_report(report_path)
+
+    # The full main()-level integration tests (a real offline run, via the
+    # SAME fakes as test_one_station_429_is_missing_..., with a corrupt and
+    # a malformed --aud04-report) live below, after _study_argv/
+    # _install_offline_study_fakes are defined:
+    # test_main_degrades_to_skipped_on_a_corrupt_aud04_artefact_and_still_writes_output
+    # test_main_degrades_to_skipped_on_a_malformed_aud04_artefact_and_still_writes_output
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +1157,12 @@ def _seed_cached_asos(cache_dir: Path, city: str) -> None:
     path.write_text("station,valid,metar\n", encoding="utf-8")
 
 
-def _study_argv(tmp_path: Path, *, cache_dir: Path) -> list[str]:
+def _study_argv(
+    tmp_path: Path, *, cache_dir: Path, aud04_report: Path | None = None,
+) -> list[str]:
     catalog = tmp_path / "catalog"
     catalog.mkdir(exist_ok=True)
-    return [
+    argv = [
         "--state-db", str(tmp_path / "state.sqlite"),
         "--stations", _FAILED_CITY, _CACHED_CITY,
         "--since-climate-day", _FETCH_CLIMATE_DAY,
@@ -605,6 +1175,9 @@ def _study_argv(tmp_path: Path, *, cache_dir: Path) -> list[str]:
         "--run-stamp", "synthetic-fetch",
         "--out-root", str(tmp_path / "out"),
     ]
+    if aud04_report is not None:
+        argv += ["--aud04-report", str(aud04_report)]
+    return argv
 
 
 def test_one_station_429_is_missing_and_the_cached_station_still_produces_rows(
@@ -678,3 +1251,53 @@ def test_every_station_429_exits_non_zero_and_names_each_station(
     for city in (_FAILED_CITY, _CACHED_CITY):
         named = [item for item in missing if city in item and "429" in item]
         assert named, missing
+
+
+# ---------------------------------------------------------------------------
+# Domain review item 1: a malformed AUD-04 artefact degrades to the SKIPPED
+# path rather than crashing the run -- the study's own summary is still
+# written. Full main()-level runs, via the SAME offline fakes as the
+# fetch-failure tests above (real state-db/catalog/network paths never
+# touched).
+# ---------------------------------------------------------------------------
+
+
+def test_main_degrades_to_skipped_on_a_corrupt_aud04_artefact_and_still_writes_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+    aud04_report = tmp_path / "PRIVATE_portfolio_roi_corrupt.json"
+    aud04_report.write_text("{ not valid json")
+
+    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report))
+
+    assert code == 0  # the failed station is a missing input, never a crash
+    report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
+    assert report.exists()
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["summary"]["n_positions"] == 1  # the cached station still produced its row
+
+
+def test_main_degrades_to_skipped_on_a_malformed_aud04_artefact_and_still_writes_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+    aud04_report = tmp_path / "PRIVATE_portfolio_roi_malformed.json"
+    _write_minimal_aud04_report(aud04_report, realised_pnl_after_fees_total=Decimal("0.61"))
+    payload = json.loads(aud04_report.read_text())
+    payload["realised_pnl_after_fees_total"] = 0.61  # must be a decimal-shaped STR
+    aud04_report.write_text(json.dumps(payload))
+
+    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report))
+
+    assert code == 0
+    report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
+    assert report.exists()
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert written["summary"]["n_positions"] == 1

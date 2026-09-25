@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 # INC-6 (docs/plans/INTRADAY_POSITION_MONITOR_2026-09-15.md Sec 4 "Nightly
 # report" / Sec 6 INC-6). ONE run of the position-monitor nightly report
-# (scripts/analysis/position_monitor_nightly_report.py), mirroring
+# (scripts/analysis/position_monitor_nightly_report.py) PER REGISTERED
+# polymarket_us family (AUD-07 C1, 2026-09-25 fix), mirroring
 # score-live-trials-run.sh / family-tally-v2-run.sh: systemd's timer owns
 # the cadence, this script owns only the work.
+#
+# AUD-07 C1: before this fix, `--family-manifest` was never passed at all,
+# so the report silently rendered the stale default literal `pm_us_crh_cont`
+# -- UNBOUND, not mis-bound. This wrapper now enumerates every REGISTERED,
+# venue=polymarket_us family manifest under FAMILIES_DIR (L-38's own
+# `manifest_field` idiom, byte-identical to score-live-trials-run.sh) and
+# runs the report once per family, each writing its own family-suffixed
+# output pair. Every registered manifest (not just the one being reported
+# on) is also passed via repeated `--registered-family-manifest`, so the
+# report can flag a trial matching more than one family's `trial_id_prefix`
+# as AMBIGUOUS_FAMILY (AUD-05 D-D) rather than silently picking one. A
+# FAMILIES_DIR with no REGISTERED polymarket_us manifest falls back to
+# exactly ONE UNBOUND run (no `--family-manifest`), preserving this report's
+# pre-AUD-07 continuity: it is shadow-only and never gates on a family
+# existing.
 #
 # Scheduled AFTER breezy-score-live-trials.timer (14:15 UTC), which is the
 # thing that populates the scored-trials store this report joins against --
@@ -49,6 +65,18 @@ STORE_DIR=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_t
 OUT=${BREEZY_LIVE_TALLY_OUTPUT_DIR:-$HOME/.local/share/breezy/derived}
 LOG=$OUT/position_monitor_report.log
 
+# AUD-07 C1(i): overridable so tests can point at a worktree's own
+# deploy/families instead of the deployed tree's (mirrors
+# score-live-trials-run.sh's own BREEZY_SCORE_LIVE_TRIALS_FAMILIES_DIR
+# override).
+FAMILIES_DIR="${BREEZY_POSITION_MONITOR_REPORT_FAMILIES_DIR:-$REPO/deploy/families}"
+
+# AUD-07 C2/C3: optional, read-only -- an INDEPENDENT ledger fill count
+# stated against the monitor-summaries universe. Never required: this
+# report is shadow-only (D2/D3) and must still run with no exec-state store
+# configured.
+EXEC_STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:-}"
+
 # INC-8 corpus summary (scripts/analysis/current_rung_hold_monitor_hypothetical_hold.py
 # -> monitor_hypothetical_report.py's `build_corpus_report`), read ONLY when
 # present -- optional, so the report's calibration flag reflects the corpus
@@ -60,6 +88,30 @@ CORPUS_DIR="$HOME/.local/share/breezy/derived/hypothetical_hold_corpus"
 mkdir -p "$OUT"
 
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
+
+# L-38: byte-identical field-extraction idiom to score-live-trials-run.sh's
+# own manifest_field() -- never a second JSON parser for a shell script.
+manifest_field() {
+  grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -n1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
+}
+
+# AUD-07 C1(i): every REGISTERED, venue=polymarket_us family manifest under
+# FAMILIES_DIR -- never assumed, never a hardcoded literal.
+REGISTERED_FAMILY_MANIFESTS=()
+if [ -d "$FAMILIES_DIR" ]; then
+  for manifest in "$FAMILIES_DIR"/*.json; do
+    [ -e "$manifest" ] || continue
+    family_id=$(manifest_field "$manifest" family_id)
+    [ -n "$family_id" ] || continue  # not a family manifest
+    venue=$(manifest_field "$manifest" venue)
+    status=$(manifest_field "$manifest" status)
+    if [ "$venue" != "polymarket_us" ] || [ "$status" != "REGISTERED" ]; then
+      continue
+    fi
+    REGISTERED_FAMILY_MANIFESTS+=("$manifest:$family_id")
+  done
+fi
 
 # Host-wide mutual exclusion, same convention as k1-daily-run.sh /
 # mb-daily-run.sh / offer-gate-daily-run.sh (SP-1.rev4.md). Skip-not-kill:
@@ -96,28 +148,66 @@ exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studie
 flock -n 9                     || { say "SKIPPED -- another study holds the studies lock"; exit 0; }
 
 STAMP=$(date -u +%Y-%m-%d)
-JSON_OUT="$OUT/position_monitor_report_$STAMP.json"
-MD_OUT="$OUT/position_monitor_report_$STAMP.md"
-
-ARGS=(
-  --summaries-dir "$SUMMARIES_DIR"
-  --scored-trials-dir "$STORE_DIR"
-  --out "$JSON_OUT"
-  --markdown "$MD_OUT"
-)
 
 CORPUS_SUMMARY=""
 if [ -d "$CORPUS_DIR" ]; then
   CORPUS_SUMMARY=$(find "$CORPUS_DIR" -maxdepth 1 -name 'hypothetical_hold_corpus_report_*.json' -print 2>/dev/null | sort | tail -n1)
 fi
-if [ -n "$CORPUS_SUMMARY" ]; then
-  ARGS+=(--corpus-summary "$CORPUS_SUMMARY")
+
+# AUD-07 C1(i): every registered manifest is passed to every invocation via
+# repeated --registered-family-manifest, so the report can detect a trial
+# matching more than one family's trial_id_prefix (AUD-05 D-D) regardless of
+# which family is currently being reported on.
+REGISTERED_ARGS=()
+for entry in "${REGISTERED_FAMILY_MANIFESTS[@]}"; do
+  REGISTERED_ARGS+=(--registered-family-manifest "${entry%%:*}")
+done
+
+run_one_report() {
+  # $1: --family-manifest path, or "" for an UNBOUND run. $2: output suffix
+  # ("" for the pre-AUD-07 unsuffixed filename).
+  local manifest_path=$1
+  local suffix=$2
+  local json_out="$OUT/position_monitor_report_$STAMP${suffix}.json"
+  local md_out="$OUT/position_monitor_report_$STAMP${suffix}.md"
+
+  local args=(
+    --summaries-dir "$SUMMARIES_DIR"
+    --scored-trials-dir "$STORE_DIR"
+    --out "$json_out"
+    --markdown "$md_out"
+  )
+  if [ -n "$CORPUS_SUMMARY" ]; then
+    args+=(--corpus-summary "$CORPUS_SUMMARY")
+  fi
+  if [ -n "$manifest_path" ]; then
+    args+=(--family-manifest "$manifest_path")
+  fi
+  if [ "${#REGISTERED_ARGS[@]}" -gt 0 ]; then
+    args+=("${REGISTERED_ARGS[@]}")
+  fi
+  if [ -n "$EXEC_STATE_DB" ] && [ -f "$EXEC_STATE_DB" ]; then
+    args+=(--exec-state-db "$EXEC_STATE_DB")
+  fi
+
+  if "$PY" "$REPO/scripts/analysis/position_monitor_nightly_report.py" "${args[@]}" >>"$LOG" 2>&1; then
+    say "position monitor report ok -- $json_out"
+    return 0
+  fi
+  say "POSITION MONITOR REPORT FAILED for ${manifest_path:-UNBOUND} (see stderr above in $LOG)"
+  return 1
+}
+
+STATUS=0
+if [ "${#REGISTERED_FAMILY_MANIFESTS[@]}" -eq 0 ]; then
+  say "no REGISTERED polymarket_us family manifest found in $FAMILIES_DIR -- running one UNBOUND report"
+  run_one_report "" "" || STATUS=1
+else
+  for entry in "${REGISTERED_FAMILY_MANIFESTS[@]}"; do
+    manifest_path="${entry%%:*}"
+    family_id="${entry##*:}"
+    run_one_report "$manifest_path" "_$family_id" || STATUS=1
+  done
 fi
 
-if "$PY" "$REPO/scripts/analysis/position_monitor_nightly_report.py" "${ARGS[@]}" >>"$LOG" 2>&1; then
-  say "position monitor report ok -- $JSON_OUT"
-  exit 0
-fi
-
-say "POSITION MONITOR REPORT FAILED (see stderr above in $LOG)"
-exit 1
+exit "$STATUS"
