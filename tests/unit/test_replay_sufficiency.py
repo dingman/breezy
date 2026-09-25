@@ -47,6 +47,7 @@ from breezy.analysis.replay_sufficiency import (
     classify_station_day,
     count_live_instances_in_window,
     decision_window_ns,
+    is_replayable_whole_day,
     read_replay_sufficiency,
     window_extent,
     write_replay_sufficiency,
@@ -736,3 +737,52 @@ def test_stage_b_from_dict_raises_when_excluded_fragments_is_not_a_list() -> Non
 
     with pytest.raises(ReplaySufficiencyRecordError, match="excluded_fragments"):
         ReplaySufficiency.from_dict(payload)
+
+
+def test_bg_one_overlapping_pair_plus_a_disjoint_third_is_ambiguous() -> None:
+    """LOW (replay-validity review): the pairwise rule refuses on ANY
+    overlapping pair, regardless of how many other eligible instances are
+    disjoint from both."""
+    overlapping_a = _at("instance-a", 0, 40)
+    overlapping_b = _at("instance-b", 10, 50)  # overlaps instance-a by 30 min
+    disjoint_c = _at("instance-c", 100, 140)  # disjoint from both
+
+    result = _classify_stage_b([overlapping_a, overlapping_b, disjoint_c])
+
+    assert result.verdict == "INSUFFICIENT"
+    assert result.reason == AMBIGUOUS_WINNER_OVERLAPPING_CLEAN_GE_30MIN
+
+
+# ---------------------------------------------------------------------------
+# is_replayable_whole_day (replay-validity review MEDIUM): the ONE sanctioned
+# replayability check -- a FRAGMENT row and a window_complete=False row must
+# both be refused even though `verdict == "SUFFICIENT"`.
+# ---------------------------------------------------------------------------
+
+
+def test_is_replayable_whole_day_refuses_a_fragment_row() -> None:
+    fragment_row = _classify_stage_b(
+        [_at("instance-shorter", 0, 120), _at("instance-longer", 125, 300)]
+    )
+
+    assert fragment_row.verdict == "SUFFICIENT"
+    assert fragment_row.coverage_kind == "FRAGMENT"
+    assert is_replayable_whole_day(fragment_row) is False
+
+
+def test_is_replayable_whole_day_refuses_a_window_incomplete_row() -> None:
+    incomplete_row = _classify_stage_b([_at("instance-lone", 60, 100)])
+
+    assert incomplete_row.verdict == "SUFFICIENT"
+    assert incomplete_row.window_complete is False
+    assert incomplete_row.coverage_kind == "WHOLE"
+    assert is_replayable_whole_day(incomplete_row) is False
+
+
+def test_is_replayable_whole_day_admits_a_whole_complete_sufficient_row() -> None:
+    whole_day_row = _classify_stage_b([_at("instance-whole", 2, 298)])
+
+    assert whole_day_row.verdict == "SUFFICIENT"
+    assert whole_day_row.window_complete is True
+    assert whole_day_row.coverage_kind == "WHOLE"
+    assert is_replayable_whole_day(whole_day_row) is True

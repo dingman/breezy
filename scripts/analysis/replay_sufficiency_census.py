@@ -294,6 +294,29 @@ def _instance_fingerprint(instance_dir: Path, *, offset_table_fingerprint: str) 
     return hashlib.sha256(f"{file_fingerprint}:{offset_table_fingerprint}".encode()).hexdigest()
 
 
+def _window_bounds_for(
+    station: str,
+    day: str,
+    *,
+    registry: object,
+    window_bounds: MutableMapping[tuple[str, str], tuple[int, int]],
+) -> tuple[int, int]:
+    """Memoised `decision_window_ns` lookup, shared by `_discover_clean_spans`
+    and `run_census` (code review MEDIUM: previously duplicated as an
+    identical local closure in each)."""
+    bounds = window_bounds.get((station, day))
+    if bounds is not None:
+        return bounds
+    std_offset = registry.climate_day_window(  # type: ignore[attr-defined]
+        WEATHER_VENUE, station,
+    ).std_utc_offset_hours
+    bounds = decision_window_ns(
+        climate_day=dt.date.fromisoformat(day), std_utc_offset_hours=std_offset,
+    )
+    window_bounds[(station, day)] = bounds
+    return bounds
+
+
 def _discover_clean_spans(
     *,
     catalog_root: Path,
@@ -325,17 +348,6 @@ def _discover_clean_spans(
     clean_station_days: set[tuple[str, str]] = set()
     window_bounds: dict[tuple[str, str], tuple[int, int]] = {}
 
-    def _window_bounds_for(station: str, day: str) -> tuple[int, int]:
-        bounds = window_bounds.get((station, day))
-        if bounds is not None:
-            return bounds
-        std_offset = registry.climate_day_window(WEATHER_VENUE, station).std_utc_offset_hours
-        bounds = decision_window_ns(
-            climate_day=dt.date.fromisoformat(day), std_utc_offset_hours=std_offset,
-        )
-        window_bounds[(station, day)] = bounds
-        return bounds
-
     for instance_id in clean_ids:
         instance_dir = catalog_root / subdirectory / instance_id
         fingerprint = _instance_fingerprint(
@@ -350,7 +362,7 @@ def _discover_clean_spans(
             for (station, day), span in cached.items():
                 spans[(station, day)].append(span)
                 clean_station_days.add((station, day))
-                _window_bounds_for(station, day)
+                _window_bounds_for(station, day, registry=registry, window_bounds=window_bounds)
             continue
 
         work_catalog = work_root / f"{instance_id}"
@@ -376,7 +388,9 @@ def _discover_clean_spans(
 
         instance_spans: dict[tuple[str, str], InstanceSpan] = {}
         for (station, day), tape_instruments in by_station_day.items():
-            start_ns, end_ns = _window_bounds_for(station, day)
+            start_ns, end_ns = _window_bounds_for(
+                station, day, registry=registry, window_bounds=window_bounds,
+            )
             depth_ts = [
                 depth.ts_event
                 for tape_instrument in tape_instruments
@@ -513,20 +527,9 @@ def run_census(
     )
     registry = default_registry()
 
-    def _window_bounds_for(station: str, day: str) -> tuple[int, int]:
-        bounds = window_bounds.get((station, day))
-        if bounds is not None:
-            return bounds
-        std_offset = registry.climate_day_window(WEATHER_VENUE, station).std_utc_offset_hours
-        bounds = decision_window_ns(
-            climate_day=dt.date.fromisoformat(day), std_utc_offset_hours=std_offset,
-        )
-        window_bounds[(station, day)] = bounds
-        return bounds
-
     for station, corrupt_day in corrupt_only:
         day = corrupt_day.isoformat()
-        _window_bounds_for(station, day)
+        _window_bounds_for(station, day, registry=registry, window_bounds=window_bounds)
         spans.setdefault((station, day), []).append(
             InstanceSpan(
                 instance_id="<corrupt-only>",
@@ -559,7 +562,7 @@ def run_census(
 
     for station, live_day in live_or_empty_station_days_native:
         day = live_day.isoformat()
-        _window_bounds_for(station, day)
+        _window_bounds_for(station, day, registry=registry, window_bounds=window_bounds)
         spans.setdefault((station, day), []).append(
             InstanceSpan(
                 instance_id="<live-or-empty>",
@@ -572,7 +575,10 @@ def run_census(
 
     live_instance_counts = {
         key: count_live_instances_in_window(
-            capture_starts, window_end_ns=_window_bounds_for(*key)[1],
+            capture_starts,
+            window_end_ns=_window_bounds_for(
+                *key, registry=registry, window_bounds=window_bounds,
+            )[1],
         )
         for key, capture_starts in live_capture_starts_by_station_day.items()
     }

@@ -127,6 +127,44 @@ def test_a6_reader_refuses_an_unknown_schema_version(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Code review MEDIUM: a malformed line must raise InstanceSpanCacheCorruptError
+# naming the bad key -- never a bare KeyError/TypeError -- for a non-object
+# line, a missing top-level key, and a wrong-type top-level key.
+# ---------------------------------------------------------------------------
+
+
+def test_read_refuses_a_non_object_line(tmp_path: Path) -> None:
+    path = tmp_path / "instance_spans.jsonl"
+    path.write_text("[1, 2, 3]\n", encoding="utf-8")
+
+    with pytest.raises(InstanceSpanCacheCorruptError, match=str(path)):
+        read_instance_span_cache(path)
+
+
+def test_read_refuses_a_line_missing_a_required_top_level_key(tmp_path: Path) -> None:
+    path = tmp_path / "instance_spans.jsonl"
+    path.write_text(
+        '{"schema_version": 1, "fingerprint": "y", "algo_version": 1, "spans": []}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InstanceSpanCacheCorruptError, match="instance_id"):
+        read_instance_span_cache(path)
+
+
+def test_read_refuses_a_top_level_key_with_the_wrong_type(tmp_path: Path) -> None:
+    path = tmp_path / "instance_spans.jsonl"
+    path.write_text(
+        '{"schema_version": 1, "instance_id": "x", "fingerprint": "y", '
+        '"algo_version": "not-an-int", "spans": []}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InstanceSpanCacheCorruptError, match="algo_version"):
+        read_instance_span_cache(path)
+
+
+# ---------------------------------------------------------------------------
 # A7 (residual pin, DOMAIN 3): an edit that preserves both size and mtime is
 # NOT detected -- a known, accepted gap, not an oversight.
 # ---------------------------------------------------------------------------

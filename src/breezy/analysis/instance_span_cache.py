@@ -191,8 +191,40 @@ def write_instance_span_cache(path: Path, entries: Mapping[CacheKey, StationDayS
         raise
 
 
+def _require_top_level_key(
+    payload: Mapping[str, object],
+    key: str,
+    expected_type: type,
+    *,
+    path: Path,
+    line_number: int,
+) -> object:
+    """One top-level key, validated and typed -- raises
+    :class:`InstanceSpanCacheCorruptError` naming the bad key, never a bare
+    `KeyError`/`TypeError` (code review MEDIUM: `_row_to_span` already
+    validates its own nested rows this way; the top-level keys did not)."""
+    if key not in payload:
+        raise InstanceSpanCacheCorruptError(
+            f"{path}:{line_number}: instance_spans cache line missing key {key!r}"
+        )
+    value = payload[key]
+    is_bool_value = isinstance(value, bool)
+    if expected_type is int and (not isinstance(value, int) or is_bool_value):
+        raise InstanceSpanCacheCorruptError(
+            f"{path}:{line_number}: {key!r} must be an int, got {type(value).__name__}"
+        )
+    if expected_type is str and not isinstance(value, str):
+        raise InstanceSpanCacheCorruptError(
+            f"{path}:{line_number}: {key!r} must be a str, got {type(value).__name__}"
+        )
+    return value
+
+
 def read_instance_span_cache(path: Path) -> dict[CacheKey, dict[tuple[str, str], InstanceSpan]]:
-    """Absent file = empty cache. Refuses an unrecognised ``schema_version``."""
+    """Absent file = empty cache. Refuses an unrecognised ``schema_version``,
+    a non-object line, a missing top-level key, or a top-level key of the
+    wrong type -- always :class:`InstanceSpanCacheCorruptError` naming the
+    bad key, never a bare `KeyError`/`TypeError`/`AttributeError`."""
     if not path.exists():
         return {}
     cache: dict[CacheKey, dict[tuple[str, str], InstanceSpan]] = {}
@@ -202,20 +234,41 @@ def read_instance_span_cache(path: Path) -> dict[CacheKey, dict[tuple[str, str],
             if not line:
                 continue
             payload = json.loads(line)
+            if not isinstance(payload, Mapping):
+                raise InstanceSpanCacheCorruptError(
+                    f"{path}:{line_number}: instance_spans cache line is not a JSON "
+                    f"object, got {type(payload).__name__}"
+                )
             version = payload.get("schema_version")
             if version != INSTANCE_SPANS_SCHEMA_VERSION:
                 raise UnknownInstanceSpanCacheSchemaError(
                     f"{path}:{line_number}: unknown instance_span_cache schema_version "
                     f"{version!r} (expected {INSTANCE_SPANS_SCHEMA_VERSION})"
                 )
-            instance_id = payload["instance_id"]
-            fingerprint = payload["fingerprint"]
-            algo_version = payload["algo_version"]
+            instance_id = _require_top_level_key(
+                payload, "instance_id", str, path=path, line_number=line_number,
+            )
+            fingerprint = _require_top_level_key(
+                payload, "fingerprint", str, path=path, line_number=line_number,
+            )
+            algo_version = _require_top_level_key(
+                payload, "algo_version", int, path=path, line_number=line_number,
+            )
+            if "spans" not in payload:
+                raise InstanceSpanCacheCorruptError(
+                    f"{path}:{line_number}: instance_spans cache line missing key 'spans'"
+                )
+            spans_payload = payload["spans"]
+            if not isinstance(spans_payload, list):
+                raise InstanceSpanCacheCorruptError(
+                    f"{path}:{line_number}: 'spans' must be a list, "
+                    f"got {type(spans_payload).__name__}"
+                )
             spans: dict[tuple[str, str], InstanceSpan] = {}
-            for row in payload["spans"]:
-                key, span = _row_to_span(row, instance_id=instance_id)
+            for row in spans_payload:
+                key, span = _row_to_span(row, instance_id=instance_id)  # type: ignore[arg-type]
                 spans[key] = span
-            cache[(instance_id, fingerprint, algo_version)] = spans
+            cache[(instance_id, fingerprint, algo_version)] = spans  # type: ignore[index]
     return cache
 
 

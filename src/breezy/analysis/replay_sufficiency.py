@@ -43,6 +43,16 @@ across rungs of the MERGED tape catalog and subtracts resolved
 asks only (``best_order``), with no gap handling. "Cannot disagree about
 covered" was an overclaim; the shared piece is the window, nothing more.
 
+**The sanctioned replayability check (AUD-09b amendment §5, replay-validity
+review MEDIUM)**: a consumer MUST call :func:`is_replayable_whole_day` on a
+row before treating it as a full-day replay candidate -- NEVER read
+``row.verdict == "SUFFICIENT"`` alone. ``SUFFICIENT`` also covers a Stage B
+``FRAGMENT`` winner and a ``window_complete=False`` winner, both real but
+PARTIAL; replaying either as if it were the whole day is selection bias
+against ``trial_day_consumed``'s one-trial-per-station-day rule. See
+:func:`is_replayable_whole_day` for the exact predicate and the one check it
+cannot make (the runner's own provenance-drift set).
+
 **Date scoping (AUD-09b amendment Rev 2.1, F3)**: the daily 09:00Z recorder
 rotation (``breezy-quote-tape-rotate.service``) opens a fresh instance every
 day, so a market listed the day before gives the earlier instance ``D-1``'s
@@ -94,6 +104,7 @@ __all__ = [
     "classify_station_day",
     "count_live_instances_in_window",
     "decision_window_ns",
+    "is_replayable_whole_day",
     "read_replay_sufficiency",
     "window_extent",
     "write_replay_sufficiency",
@@ -304,6 +315,16 @@ class InstanceSpan:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ReplaySufficiency:
     """One census row: whether ``(station, climate_day)`` can be replayed.
+
+    **Consumers MUST call** :func:`is_replayable_whole_day` **to decide
+    replayability -- never read** ``verdict == "SUFFICIENT"`` **alone**
+    (AUD-09b amendment §5, replay-validity review MEDIUM): ``SUFFICIENT``
+    also covers a Stage B ``FRAGMENT`` winner and a ``window_complete=False``
+    winner, both real but PARTIAL days. Treating a partial row as a full-day
+    replay is selection bias against ``trial_day_consumed``'s
+    one-trial-per-station-day rule -- a replay starting late (or covering
+    only a fragment) can take or refuse where the full day would have
+    decided differently.
 
     ``reason`` is the empty string for a ``SUFFICIENT`` verdict; for
     ``INSUFFICIENT`` it is one member of :data:`REPLAY_SUFFICIENCY_REASONS`.
@@ -565,6 +586,35 @@ class DuplicateReplaySufficiencyRecordError(Exception):
     """Two lines in ``replay_sufficiency.jsonl`` share one ``(station,
     climate_day)`` key -- a hard error, never last-wins: a duplicate means two
     writers raced and the file cannot be trusted."""
+
+
+def is_replayable_whole_day(row: ReplaySufficiency) -> bool:
+    """The ONE sanctioned replayability check (AUD-09b amendment §5, replay-
+    validity review MEDIUM). Every consumer MUST call this -- never read
+    ``row.verdict`` alone -- because ``SUFFICIENT`` also covers a real but
+    PARTIAL row: a Stage B ``FRAGMENT`` winner (a disjoint recorder-restart
+    fragment covering only part of the day) and a ``window_complete=False``
+    winner (edges more than :data:`WINDOW_EDGE_TOLERANCE_NS` from the window
+    bounds). Treating either as a full-day replay is selection bias:
+    ``trial_day_consumed`` allows exactly ONE trial per station-day, so a
+    partial replay can take or refuse where the full day would have decided
+    differently.
+
+    Returns ``True`` only when all of:
+
+    - ``row.verdict == "SUFFICIENT"``;
+    - ``row.window_complete`` is ``True``;
+    - ``row.coverage_kind == "WHOLE"``.
+
+    **Not determinable from a row alone**: whether ``(row.station,
+    row.climate_day)`` is in the runner's provenance-drift set
+    (``replay_drift.jsonl``, R4) -- a :class:`ReplaySufficiency` row carries
+    no drift information. The RUNNER must additionally refuse any key
+    present in that drift set before selecting a row this function admits;
+    this function's ``True`` is necessary, never sufficient, for that final
+    selection.
+    """
+    return row.verdict == "SUFFICIENT" and row.window_complete and row.coverage_kind == "WHOLE"
 
 
 def _window_complete(
