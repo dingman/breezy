@@ -17,6 +17,8 @@ import datetime as dt
 import inspect
 from dataclasses import replace
 
+import pytest
+
 from breezy.runtime.trade_supervisor_core import (
     MIDDAY_MAX_RELAUNCH_ATTEMPTS,
     PERMIT_ALERT_HEARTBEAT,
@@ -472,7 +474,31 @@ class TestPermitDeferredSinceMonotonic:
         assert cap2 is PermitCapability.NO_NODE
 
 
+class _UnmappedCapability:
+    """[silent-failure-hunter/python-reviewer review] A stand-in for a
+    future ``PermitCapability`` member that reaches ``decide_permit_alert``
+    with no ``_PERMIT_ALERT_DETAIL`` entry and no explicit branch (not
+    ``NOT_REQUIRED``/``DEFERRED``/``VALID``, and its ``.value`` is not in
+    ``_BAD_CAPABILITY_VALUES``). A real enum member can't exercise this --
+    every current one is mapped -- so this mimics one structurally instead."""
+
+    value = "totally_unmapped_capability"
+
+
 class TestDecidePermitAlert:
+    def test_decide_permit_alert_raises_on_an_unmapped_capability(self):
+        """The fallback must fail loudly, never silently resolve to NONE --
+        D8's own containment (``_do_permit_watch``) is what turns this into
+        a CRITICAL ``WATCH_FAILED`` page, never this function itself."""
+        with pytest.raises(AssertionError):
+            decide_permit_alert(
+                capability=_UnmappedCapability(),
+                now=_utc(20, 0),
+                last_sent_at=None,
+                last_capability=None,
+                not_required_warned=False,
+            )
+
     def test_decide_permit_alert_heartbeat_repeats_after_sixty_minutes(self):
         first = decide_permit_alert(
             capability=PermitCapability.ABSENT,

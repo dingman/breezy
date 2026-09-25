@@ -1463,7 +1463,14 @@ def decide_permit_alert(
                 detail=_PERMIT_ALERT_DETAIL[capability],
             )
         return PermitAlertDecision(action=PermitAlertAction.NONE)
-    return PermitAlertDecision(action=PermitAlertAction.NONE)  # pragma: no cover -- exhaustive
+    # [silent-failure-hunter/python-reviewer review] An unmapped capability
+    # must fail loudly, never silently resolve to NONE -- a future
+    # PermitCapability member added without a matching `_PERMIT_ALERT_DETAIL`
+    # entry (or `VALID`/`DEFERRED`/`NOT_REQUIRED` handling above) would
+    # otherwise be swallowed here forever. D8's own containment
+    # (`_do_permit_watch`) turns this into a CRITICAL `WATCH_FAILED` page,
+    # never silence.
+    raise AssertionError(f"unmapped PermitCapability {capability!r}")
 
 
 def latch_log_facts(
