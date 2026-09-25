@@ -655,6 +655,20 @@ def _write_minimal_aud04_report(
         "roi": "0.10",
         "roi_minus_b0": "0.10",
         "roi_minus_b1": "0.10",
+        # AUD-04 schema_version=2 requires this key (Stage C3's per-trial
+        # P&L breakdown); one row, summing exactly to
+        # `realised_pnl_after_fees_total` (the sum invariant), matching this
+        # fixture's own `n_scored=1`.
+        "trial_rows": [
+            {
+                "trial_id": "aud04-minimal/trial/LAX/2026-01-05",
+                "family_id": "UNKNOWN",
+                "climate_day": "2026-01-05",
+                "side": "yes",
+                "pnl": str(realised_pnl_after_fees_total),
+                "settlement_basis": "nws_final",
+            }
+        ],
     }
     path.write_text(json.dumps(payload, indent=2))
 
