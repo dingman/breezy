@@ -38,6 +38,11 @@ _DAY = dt.date(2026, 9, 17)
 _STATION = "LAX"
 
 
+class _Record:
+    def __init__(self, ts_init: int) -> None:
+        self.ts_init = ts_init
+
+
 def _load_driver() -> ModuleType:
     if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
         sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
@@ -107,17 +112,19 @@ class _SpyCatalog:
         self.depth_calls: list[dict[str, Any]] = []
         self.quote_calls: list[dict[str, Any]] = []
         self.close_calls: list[dict[str, Any]] = []
+        self.depth_records: list[object] = [object()]
+        self.quote_records: list[object] = [object()]
 
     def instruments(self) -> list[BinaryOption]:
         return [self._target, self._other_station, self._other_day]
 
     def order_book_depth10(self, *, instrument_ids: list[str], **kwargs: Any) -> list[object]:
         self.depth_calls.append({"instrument_ids": instrument_ids, **kwargs})
-        return [object()]
+        return self.depth_records
 
     def quote_ticks(self, *, instrument_ids: list[str], **kwargs: Any) -> list[object]:
         self.quote_calls.append({"instrument_ids": instrument_ids, **kwargs})
-        return [object()]
+        return self.quote_records
 
     def instrument_closes(self, *, instrument_ids: list[str], **kwargs: Any) -> list[object]:
         self.close_calls.append({"instrument_ids": instrument_ids, **kwargs})
@@ -179,6 +186,17 @@ def test_driver_derives_selector_bounds_from_strategy_decision_window(
         captured.update(kwargs)
         return [tape_instrument]
 
+    monkeypatch.setattr(
+        driver,
+        "_warmup_start_ns_for_replay",
+        lambda **_kwargs: decision_window_ns(
+            climate_day=_DAY,
+            std_utc_offset_hours=driver.default_registry()
+            .climate_day_window(driver.WEATHER_VENUE, _STATION)
+            .std_utc_offset_hours,
+        )[0]
+        - 123,
+    )
     monkeypatch.setattr(driver, "_convert_live_capture", lambda **_kwargs: object())
     monkeypatch.setattr(driver, "_select_capture_instruments", _select)
     monkeypatch.setattr(driver, "assert_requested_days_are_listed", lambda *_args, **_kwargs: None)
@@ -209,9 +227,41 @@ def test_driver_derives_selector_bounds_from_strategy_decision_window(
         driver.WEATHER_VENUE,
         _STATION,
     ).std_utc_offset_hours
+    window_start = decision_window_ns(climate_day=_DAY, std_utc_offset_hours=offset)[0]
     assert captured == {
         "climate_day": _DAY,
         "station": _STATION,
-        "start": decision_window_ns(climate_day=_DAY, std_utc_offset_hours=offset)[0],
-        "end": decision_window_ns(climate_day=_DAY, std_utc_offset_hours=offset)[1],
+        "start": window_start - 123,
+        "end": None,
     }
+
+
+def test_replay_warmup_start_uses_latest_pre_window_quote_and_depth_records(
+    driver: ModuleType,
+) -> None:
+    catalog = _SpyCatalog()
+    window_start = 1_000
+    catalog.depth_records = [_Record(200), _Record(900), _Record(1_100)]
+    catalog.quote_records = [_Record(400), _Record(850), _Record(1_050)]
+
+    start = driver._warmup_start_ns_for_replay(
+        catalog,
+        climate_day=_DAY,
+        station=_STATION,
+        window_start_ns=window_start,
+    )
+
+    assert start == 850
+    assert start < window_start
+    assert catalog.depth_calls == [
+        {
+            "instrument_ids": ["tc-temp-laxhigh-2026-09-17-gte76lt77.POLYMARKET_US"],
+            "end": window_start,
+        },
+    ]
+    assert catalog.quote_calls == [
+        {
+            "instrument_ids": ["tc-temp-laxhigh-2026-09-17-gte76lt77.POLYMARKET_US"],
+            "end": window_start,
+        },
+    ]
