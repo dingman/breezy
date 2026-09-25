@@ -12,7 +12,7 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -739,12 +739,7 @@ def test_run_once_writes_a_completed_row_from_the_sidecar_and_parquet(tmp_path: 
         )
         write_scored_trials(output_dir, [scored], now_ns=2)
         (output_dir / "family_params.json").write_text(
-            '{"family_id": "pm_us_crh_v4", "manifest_sha256": "'
-            + ("a" * 64)
-            + '", "manifest_taker_fee_coefficient": "0.0695", '
-            '"engine_required_fee_coefficient": "0.0695", '
-            '"engine_params_source": "FAMILY_MANIFEST", "params_match": true, '
-            '"composition_kind": "continuous_rung_hold"}'
+            json.dumps(_matching_sidecar(argv)), encoding="utf-8",
         )
         return _completed_process(
             0, stdout="strategy refusals: {'no_decision_window_coverage': 2}\n",
@@ -802,16 +797,16 @@ def test_run_once_replays_a_current_rung_hold_composition_family_without_a_strat
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "family_params.json").write_text(
             json.dumps(
-                {
-                    "family_id": "pm_us_crh_v2",
-                    "manifest_sha256": "d" * 64,
-                    "manifest_taker_fee_coefficient": "0.06",
-                    "engine_required_fee_coefficient": "0.06",
-                    "engine_params_source": "FAMILY_MANIFEST",
-                    "params_match": True,
-                    "composition_kind": "current_rung_hold",
-                }
-            )
+                _matching_sidecar(
+                    argv,
+                    family_id="pm_us_crh_v2",
+                    manifest_sha256="d" * 64,
+                    manifest_taker_fee_coefficient="0.06",
+                    engine_required_fee_coefficient="0.06",
+                    composition_kind="current_rung_hold",
+                )
+            ),
+            encoding="utf-8",
         )
         return _completed_process(0)
 
@@ -991,16 +986,13 @@ def _fake_subprocess_fee_mismatch(
             write_scored_trials(output_dir, scored, now_ns=2)
         (output_dir / "family_params.json").write_text(
             json.dumps(
-                {
-                    "family_id": "pm_us_crh_v4",
-                    "manifest_sha256": "a" * 64,
-                    "manifest_taker_fee_coefficient": "0.0695",
-                    "engine_required_fee_coefficient": "0.06",
-                    "engine_params_source": "FAMILY_MANIFEST",
-                    "params_match": False,
-                    "composition_kind": "continuous_rung_hold",
-                }
-            )
+                _matching_sidecar(
+                    argv,
+                    engine_required_fee_coefficient="0.06",
+                    params_match=False,
+                )
+            ),
+            encoding="utf-8",
         )
         return _completed_process(
             0,
@@ -1339,3 +1331,497 @@ def test_classify_driver_failure_fee_schedule_mismatch() -> None:
     assert runner.classify_driver_failure(returncode=4, stderr="") == (
         "BLOCKED", "FEE_SCHEDULE_MISMATCH",
     )
+
+
+# ---------------------------------------------------------------------------
+# AUD-19c: sidecar argv integrity, unclassified driver exits, AUD-09 anchors
+# ---------------------------------------------------------------------------
+
+#: Exit-0 provenance refusals (AUD-19 §6 E3). Missing file and a digest that
+#: does not match the vector the runner passed are different operator acts,
+#: so they are different closed-set reasons — both BLOCKED, both re-queued.
+SIDECAR_MISSING_REASON = "FAMILY_PARAMS_SIDECAR_MISSING"
+SIDECAR_MISMATCH_REASON = "FAMILY_PARAMS_ARGV_MISMATCH"
+SIDECAR_MALFORMED_REASON = "FAMILY_PARAMS_SIDECAR_MALFORMED"
+
+_COMPLETED_ROW_SIDECAR_KEYS = (
+    "family_id",
+    "manifest_sha256",
+    "manifest_taker_fee_coefficient",
+    "engine_required_fee_coefficient",
+    "engine_params_source",
+    "params_match",
+    "composition_kind",
+)
+
+_FAILED_CLASS_EXCEPTIONS = (
+    "NoDecisionWindowCoverageError",
+    "EntryAskFromLatchMissingError",
+    "ImpossibleFillPriceError",
+)
+
+#: AUD-19 A17's sweep, minus `4`. Exit 4 is the later AUD-09b fee-regime
+#: preflight (`EXIT_FEE_SCHEDULE_MISMATCH`), already mapped to BLOCKED —
+#: reclassifying it as unclassified would retire a fee-void day.
+_UNCLASSIFIED_DRIVER_EXITS = (-9, -15, 75, 137, 255)
+
+
+def _output_dir_for(config: runner.RunConfig, climate_day: str = CLIMATE_DAY) -> Path:
+    return (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / climate_day
+        / f"lag_{config.lag_minutes}"
+    )
+
+
+def _matching_sidecar(argv: Sequence[str], **overrides: object) -> dict[str, object]:
+    """Sidecar whose `argv_sha256` is the driver's own digest of the vector
+    after the script path — the slice `main` hashes (`resolved_argv`)."""
+    import argv_digest
+
+    payload: dict[str, object] = {
+        "family_id": "pm_us_crh_v4",
+        "manifest_sha256": "a" * 64,
+        "manifest_taker_fee_coefficient": "0.0695",
+        "engine_required_fee_coefficient": "0.0695",
+        "engine_params_source": "FAMILY_MANIFEST",
+        "params_match": True,
+        "composition_kind": "continuous_rung_hold",
+        "argv_sha256": argv_digest.argv_sha256(list(argv[2:])),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _driver_then(
+    on_driver: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> Callable[[Sequence[str]], subprocess.CompletedProcess[str]]:
+    def fake(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if "asos_cache_csv.py" in argv[1]:
+            return _completed_process(0)
+        assert "current_rung_hold_paper_replay.py" in argv[1]
+        return on_driver(argv)
+
+    return fake
+
+
+def test_the_cited_aud09_anchors_still_exist() -> None:
+    """AUD-19c step 22-pre / A16: the anchors 19c cites are still in the
+    current AUD-09 plan, and the built runner exposes the symbols 19c calls."""
+    plan = REPO_ROOT / "docs/plans/backlog/AUDIT_2026-09-21/AUD-09-scheduled-per-station-replay.md"
+    text = plan.read_text(encoding="utf-8")
+    anchors = (
+        "## 6",
+        "## 7",
+        "## 8",
+        "## 9",
+        "§6b.2",
+        "§6b.3",
+        "engine_params_source",
+        "engine_required_fee_coefficient",
+        "params_match",
+        "COMPLETED",
+        "RECOVERED",
+        "BLOCKED",
+        "FAILED",
+        "ASOS_CACHE_EMPTY",
+        "B16",
+        "B17",
+        "B18",
+        *_FAILED_CLASS_EXCEPTIONS,
+    )
+    for anchor in anchors:
+        assert anchor in text, f"missing anchor {anchor!r} in {plan}"
+
+    runner_path = REPO_ROOT / "scripts/analysis/replay_daily_runner.py"
+    source = runner_path.read_text(encoding="utf-8")
+    for symbol in (
+        "def record_blocked",
+        "def build_driver_argv",
+        "from argv_digest import argv_sha256",
+    ):
+        assert symbol in source, f"missing symbol {symbol!r} in {runner_path}"
+
+    import argv_digest
+
+    assert runner.argv_sha256 is argv_digest.argv_sha256, (
+        f"replay_daily_runner.argv_sha256 is not argv_digest.argv_sha256 ({runner_path})"
+    )
+
+
+@pytest.mark.parametrize("case", ["missing", "mismatched"])
+def test_a_missing_or_mismatched_sidecar_yields_a_BLOCKED_row(
+    tmp_path: Path, case: str,
+) -> None:
+    """AUD-19 §6 E3 / A14: exit 0 with no sidecar, or a sidecar whose
+    `argv_sha256` is not the digest of the vector the runner passed, is
+    `BLOCKED` (day stays queued, exit 0) — never a COMPLETED row and never
+    `engine_params_source="DRIVER_DEFAULTS"`."""
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = _output_dir_for(config)
+
+    def on_driver(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if case == "mismatched":
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "family_params.json").write_text(
+                json.dumps(_matching_sidecar(argv, argv_sha256="0" * 64)),
+                encoding="utf-8",
+            )
+        return _completed_process(0)
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    before = config.replay_results_path.read_text(encoding="utf-8")
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    assert before.count("\n") == 1
+    row = rows[0]
+    assert row.outcome == "BLOCKED"
+    expected_reason = SIDECAR_MISSING_REASON if case == "missing" else SIDECAR_MISMATCH_REASON
+    assert row.blocked_reason == expected_reason
+    assert row.engine_params_source != "DRIVER_DEFAULTS"
+    assert row.params_match is not True
+
+    still_queued = runner.select_target(
+        rows=[_row()],
+        replayed=rows,
+        drift=runner.read_replay_drift(config.replay_drift_path),
+        strategy=STRATEGY,
+        lag_minutes=LAG_MINUTES,
+    )
+    assert still_queued is not None
+    assert still_queued.climate_day == CLIMATE_DAY
+
+    def on_driver_again(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if case == "mismatched":
+            (output_dir / "family_params.json").write_text(
+                json.dumps(_matching_sidecar(argv, argv_sha256="f" * 64)),
+                encoding="utf-8",
+            )
+        return _completed_process(0)
+
+    second = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver_again), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert second == 0
+    again = read_replay_results(config.replay_results_path)
+    assert len(again) == 2
+    assert all(item.outcome == "BLOCKED" for item in again)
+    assert all(item.engine_params_source != "DRIVER_DEFAULTS" for item in again)
+
+
+def _assert_still_queued(config: runner.RunConfig, rows: Sequence[ReplayResult]) -> None:
+    still_queued = runner.select_target(
+        rows=[_row()],
+        replayed=rows,
+        drift=runner.read_replay_drift(config.replay_drift_path),
+        strategy=STRATEGY,
+        lag_minutes=LAG_MINUTES,
+    )
+    assert still_queued is not None
+    assert still_queued.climate_day == CLIMATE_DAY
+
+
+@pytest.mark.parametrize("missing_key", _COMPLETED_ROW_SIDECAR_KEYS)
+def test_a_matching_sidecar_missing_any_completed_row_key_is_BLOCKED_and_still_queued(
+    tmp_path: Path, missing_key: str,
+) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = _output_dir_for(config)
+
+    def on_driver(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload = _matching_sidecar(argv)
+        payload.pop(missing_key)
+        (output_dir / "family_params.json").write_text(json.dumps(payload), encoding="utf-8")
+        return _completed_process(0)
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.outcome == "BLOCKED"
+    assert row.blocked_reason == SIDECAR_MALFORMED_REASON
+    assert row.engine_params_source != "DRIVER_DEFAULTS"
+    assert row.params_match is not True
+    _assert_still_queued(config, rows)
+
+
+def test_a_matching_sidecar_with_the_wrong_completed_row_key_type_is_BLOCKED(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = _output_dir_for(config)
+
+    def on_driver(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "family_params.json").write_text(
+            json.dumps(_matching_sidecar(argv, params_match="true")),
+            encoding="utf-8",
+        )
+        return _completed_process(0)
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.outcome == "BLOCKED"
+    assert row.blocked_reason == SIDECAR_MALFORMED_REASON
+    assert row.params_match is not True
+    _assert_still_queued(config, rows)
+
+
+def test_an_unparseable_sidecar_is_BLOCKED_and_still_queued(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = _output_dir_for(config)
+
+    def on_driver(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        del argv
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "family_params.json").write_text("{not json", encoding="utf-8")
+        return _completed_process(0)
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.outcome == "BLOCKED"
+    assert row.blocked_reason == SIDECAR_MALFORMED_REASON
+    assert row.engine_params_source != "DRIVER_DEFAULTS"
+    assert row.params_match is not True
+    _assert_still_queued(config, rows)
+
+
+def test_the_runner_and_driver_agree_on_argv_sha256(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A15: the runner verifies the sidecar with `argv_digest.argv_sha256`
+    over the arguments after the script path (the driver's `resolved_argv`),
+    not a second digest. A reordered vector does not match."""
+    import argv_digest
+
+    seen: list[tuple[str, ...]] = []
+    real = argv_digest.argv_sha256
+
+    def spy(argv: Sequence[str]) -> str:
+        seen.append(tuple(argv))
+        return real(argv)
+
+    monkeypatch.setattr(runner, "argv_sha256", spy)
+
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = _output_dir_for(config)
+    captured: list[str] = []
+
+    def on_driver(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        captured.extend(argv)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "family_params.json").write_text(
+            json.dumps(_matching_sidecar(argv)), encoding="utf-8",
+        )
+        return _completed_process(0, stdout="strategy refusals: {'outside_decision_window': 1}\n")
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    assert seen, "runner never called argv_sha256"
+    assert seen[0] == tuple(captured[2:])
+    assert real(captured[2:]) == real(list(seen[0]))
+    reordered = list(captured[2:])
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    assert real(reordered) != real(captured[2:])
+    row = read_replay_results(config.replay_results_path)[0]
+    assert row.outcome == "COMPLETED"
+    assert row.engine_params_source == "FAMILY_MANIFEST"
+    assert row.params_match is True
+
+
+@pytest.mark.parametrize("returncode", _UNCLASSIFIED_DRIVER_EXITS)
+def test_an_unclassified_driver_exit_appends_one_FAILED_row_and_leaves_the_queue(
+    tmp_path: Path, returncode: int,
+) -> None:
+    """AUD-19 §6 E3 D6 / A14 / A17: a driver exit outside the mapped set
+    appends exactly one FAILED row whose exception field is
+    `UNCLASSIFIED_DRIVER_EXIT_<returncode>`, exits non-zero, and the day
+    leaves the queue. Stderr that looks like a refusal or a FAILED-class
+    exception does not change that. Three such crashes do not advance B19."""
+    config = _config(tmp_path)
+    days = ("2026-09-01", "2026-09-02", "2026-09-03")
+    write_replay_sufficiency(
+        config.replay_sufficiency_path, [_row(climate_day=day) for day in days],
+    )
+    sink = _RecordingSink()
+    literal = f"UNCLASSIFIED_DRIVER_EXIT_{returncode}"
+    refusal_looking_stderr = (
+        "FAMILY_MANIFEST_REFUSED\n"
+        "Traceback (most recent call last):\n"
+        "NoDecisionWindowCoverageError: no coverage\n"
+    )
+
+    for index, day in enumerate(days):
+        before = (
+            config.replay_results_path.read_text(encoding="utf-8")
+            if config.replay_results_path.exists()
+            else ""
+        )
+
+        def on_driver(
+            argv: Sequence[str], *, _day: str = day,
+        ) -> subprocess.CompletedProcess[str]:
+            assert "--climate-day" in argv and _day in argv
+            return _completed_process(returncode, stderr=refusal_looking_stderr)
+
+        exit_code = runner.run_once(
+            config, run_subprocess=_driver_then(on_driver), sink=sink,
+            work_dir_factory=lambda i=index: tmp_path / f"work-{i}",
+        )
+        assert exit_code != 0
+        after = config.replay_results_path.read_text(encoding="utf-8")
+        assert after.count("\n") == before.count("\n") + 1
+
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 3
+    assert [row.outcome for row in rows] == ["FAILED", "FAILED", "FAILED"]
+    assert [row.exception_type for row in rows] == [literal, literal, literal]
+    assert all(row.blocked_reason is None for row in rows)
+    assert not any(
+        getattr(payload, "event", None) == "BREEZY_REPLAY_STALLED" for payload in sink.payloads
+    )
+
+    def fail_if_called(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"day still queued; subprocess invoked: {argv}")
+
+    drained = runner.run_once(
+        config, run_subprocess=fail_if_called, sink=sink,
+        work_dir_factory=lambda: tmp_path / "work-drained",
+    )
+    assert drained == 0
+    assert len(read_replay_results(config.replay_results_path)) == 3
+    assert runner.select_target(
+        rows=[_row(climate_day=day) for day in days],
+        replayed=read_replay_results(config.replay_results_path),
+        drift=runner.read_replay_drift(config.replay_drift_path),
+        strategy=STRATEGY,
+        lag_minutes=LAG_MINUTES,
+    ) is None
+
+
+@pytest.mark.parametrize("exception_name", _FAILED_CLASS_EXCEPTIONS)
+def test_a_failed_class_driver_crash_is_never_classified_as_BLOCKED(
+    tmp_path: Path, exception_name: str,
+) -> None:
+    """AUD-19 §6 E3 / A14: exit 1 carrying one of AUD-09 §9's three
+    FAILED-class exceptions is FAILED with that type, and the day leaves
+    the queue. Never BLOCKED, never re-queued."""
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+
+    def on_driver(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return _completed_process(
+            1,
+            stderr=(
+                "Traceback (most recent call last):\n"
+                f"breezy.runtime.paper_replay.{exception_name}: defect\n"
+            ),
+        )
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code != 0
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    assert rows[0].outcome == "FAILED"
+    assert rows[0].exception_type == exception_name
+    assert rows[0].blocked_reason is None
+
+    def fail_if_called(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("FAILED-class day was re-queued")
+
+    drained = runner.run_once(
+        config, run_subprocess=fail_if_called, sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work-2",
+    )
+    assert drained == 0
+    assert len(read_replay_results(config.replay_results_path)) == 1
+
+
+def test_the_runner_dispatches_on_exit_code_and_never_on_message(tmp_path: Path) -> None:
+    """C7/E3: blank stderr, or stderr that names the other class, does not
+    move a code. Exit 1 stays FAILED; exit 2/3 stay BLOCKED and queued;
+    an unmapped code stays the unclassified literal."""
+    cases = (
+        (1, "", "FAILED", "UnknownDriverFailure", False),
+        (1, "BLOCKED FAMILY_MANIFEST_REFUSED\n", "FAILED", "UnknownDriverFailure", False),
+        (
+            2,
+            "NoDecisionWindowCoverageError: no coverage\n",
+            "BLOCKED",
+            "FAMILY_MANIFEST_REFUSED",
+            True,
+        ),
+        (3, "", "BLOCKED", "FAMILY_MANIFEST_UNUSABLE", True),
+        (
+            -9,
+            "ImpossibleFillPriceError: too good\n",
+            "FAILED",
+            "UNCLASSIFIED_DRIVER_EXIT_-9",
+            False,
+        ),
+    )
+    for index, (returncode, stderr, outcome, detail, stays_queued) in enumerate(cases):
+        day_root = tmp_path / f"case-{index}"
+        day_root.mkdir()
+        config = _config(day_root)
+        write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+
+        def on_driver(
+            argv: Sequence[str], *, _stderr: str = stderr, _rc: int = returncode,
+        ) -> subprocess.CompletedProcess[str]:
+            return _completed_process(_rc, stderr=_stderr)
+
+        exit_code = runner.run_once(
+            config, run_subprocess=_driver_then(on_driver), sink=_RecordingSink(),
+            work_dir_factory=lambda root=day_root: root / "work",
+        )
+        rows = read_replay_results(config.replay_results_path)
+        assert len(rows) == 1
+        assert rows[0].outcome == outcome
+        if outcome == "BLOCKED":
+            assert exit_code == 0
+            assert rows[0].blocked_reason == detail
+        else:
+            assert exit_code != 0
+            assert rows[0].exception_type == detail
+            assert rows[0].blocked_reason is None
+        queued = runner.select_target(
+            rows=[_row()],
+            replayed=rows,
+            drift=runner.read_replay_drift(config.replay_drift_path),
+            strategy=STRATEGY,
+            lag_minutes=LAG_MINUTES,
+        )
+        assert (queued is not None) is stays_queued
