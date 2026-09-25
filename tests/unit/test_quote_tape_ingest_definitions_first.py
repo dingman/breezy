@@ -31,6 +31,7 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
+import breezy
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
 from breezy.runtime.quote_tape_ingest_cli import (
     DEFAULT_LIVE_GRACE_MINUTES,
@@ -217,18 +218,26 @@ class TestAKillDuringTickConversionLeavesInstrumentsResolvable:
         )
         _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=_OLD)
 
-        worktree_src = os.environ.get("PYTHONPATH", "")
-        assert worktree_src, "PYTHONPATH must be set to the worktree's src/ for this test"
+        # Derive the src dir from the PARENT's own running import -- never an
+        # unconditional PYTHONPATH requirement. Under a worktree, that's the
+        # worktree's src/; under the primary tree's gate (no PYTHONPATH set
+        # at all), it's wherever `breezy` is actually installed from. Either
+        # way the child must resolve `breezy` to that SAME file.
+        parent_breezy_file = str(Path(breezy.__file__).resolve())
+        src_dir = str(Path(breezy.__file__).resolve().parents[1])
         breezy_python = os.environ.get("BREEZY_PYTHON", sys.executable)
 
         child = tmp_path / "child_t3b.py"
         child.write_text(_T3B_CHILD)
 
         child_env = dict(os.environ)
-        child_env["PYTHONPATH"] = worktree_src
+        existing_pythonpath = child_env.get("PYTHONPATH", "")
+        child_env["PYTHONPATH"] = (
+            src_dir if not existing_pythonpath else f"{src_dir}{os.pathsep}{existing_pythonpath}"
+        )
 
         completed = subprocess.run(
-            [breezy_python, str(child), str(tmp_path), "live", worktree_src],
+            [breezy_python, str(child), str(tmp_path), "live", parent_breezy_file],
             capture_output=True,
             text=True,
             timeout=120,
@@ -259,10 +268,11 @@ from pathlib import Path
 
 import breezy
 
-expected_prefix = sys.argv[3]
-assert breezy.__file__.startswith(expected_prefix), (
-    f"positive control failed: breezy loaded from {breezy.__file__!r}, "
-    f"expected worktree prefix {expected_prefix!r}"
+expected_breezy_file = sys.argv[3]
+actual_breezy_file = str(Path(breezy.__file__).resolve())
+assert actual_breezy_file == expected_breezy_file, (
+    f"positive control failed: child resolved breezy to {actual_breezy_file!r}, "
+    f"parent resolved it to {expected_breezy_file!r}"
 )
 print("POSITIVE CONTROL OK", breezy.__file__)
 sys.stdout.flush()  # os._exit() below skips the normal atexit flush
