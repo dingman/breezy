@@ -1526,10 +1526,30 @@ def _do_self_check(
             expiry_valid = latched_permit_expiry_ns > now_ns
         else:
             expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
+        # [A-1 follow-up, 2026-09-25] Distinguish a permit whose expiry
+        # equals the day's first-boot ceiling anchor -- A-1's clamp working
+        # as designed, never a genuine refusal. ``relaunch_attempts > 0`` is
+        # the only observable signal separating "this child's own permit IS
+        # the anchor's source" (the never-relaunched original boot, where
+        # the values trivially match) from "this child's permit was CLAMPED
+        # to a pre-existing anchor" -- a clamped permit's log line is
+        # byte-identical in shape to a fresh one (ruling doc §2/§4).
+        observed_expiry_ns = (
+            latched_permit_expiry_ns
+            if latched_permit_expiry_ns is not None
+            else live_permit_expiry_ns
+        )
+        permit_expiry_at_daily_ceiling = (
+            observed_expiry_ns is not None
+            and state.first_boot_permit_expires_at_ns is not None
+            and observed_expiry_ns == state.first_boot_permit_expires_at_ns
+            and state.relaunch_attempts > 0
+        )
     else:
         strategy_subscribed = strategy_subscribed_live
         permit_issued = permit_issued_live
         expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
+        permit_expiry_at_daily_ceiling = False
 
     continuous_check: ContinuousFamilyCheck | None = None
     if ports.continuous_family_active():
@@ -1552,6 +1572,7 @@ def _do_self_check(
         strategy_subscribed=strategy_subscribed,
         log_available=node_log is not None,
         continuous_check=continuous_check,
+        permit_expiry_at_daily_ceiling=permit_expiry_at_daily_ceiling,
     )
     # [AUD-14b] Repeat-failure escalation -- a separate, store-backed
     # record, re-read fresh at every self-check (see

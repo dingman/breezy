@@ -833,6 +833,44 @@ class TestSelfCheck:
         )
         assert result is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
 
+    def test_shadow_mode_at_daily_ceiling_is_a_distinct_fail_state(self):
+        """[A-1 follow-up, 2026-09-25] A permit whose expiry equals the
+        day's first-boot ceiling anchor is a benign consequence of A-1's
+        clamp, never a genuine refusal -- it must be distinguishable, not
+        folded into the generic ``FAIL_SHADOW_MODE_NO_PERMIT``, and it must
+        still alert (never silenced)."""
+        result = self_check(
+            child_alive=True,
+            flock_holder_count=1,
+            flock_held_by_tracked_pid=True,
+            permit_issued=True,
+            permit_expiry_valid=False,
+            strategy_subscribed=True,
+            permit_expiry_at_daily_ceiling=True,
+        )
+        assert result is SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING
+
+    def test_shadow_mode_without_a_ceiling_match_stays_the_generic_result(self):
+        """No permit at all -- ``permit_expiry_at_daily_ceiling`` defaults
+        False, so every existing caller sees byte-identical behaviour."""
+        result = self_check(
+            child_alive=True,
+            flock_holder_count=1,
+            flock_held_by_tracked_pid=True,
+            permit_issued=False,
+            permit_expiry_valid=False,
+            strategy_subscribed=True,
+        )
+        assert result is SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+
+    def test_daily_ceiling_result_maps_to_its_own_distinct_alert_detail(self):
+        from breezy.runtime.trade_supervisor_core import SELF_CHECK_ALERT_DETAIL
+
+        result = SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING
+        detail = SELF_CHECK_ALERT_DETAIL[result]
+        assert detail is AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING
+        assert detail is not AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT
+
     def test_shadow_mode_result_maps_to_a_fixed_alert_detail_never_relaunched(self):
         from breezy.runtime.trade_supervisor_core import SELF_CHECK_ALERT_DETAIL
 
@@ -2970,6 +3008,66 @@ class TestStickyPermitIssuedAcrossSharedReader:
 
         assert sink.payloads[-1].detail == (AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT.value)
         assert state.permit_issued_seen_expires_at_ns == expired_ns
+
+    def test_self_check_distinguishes_a_relaunched_childs_daily_ceiling_expiry(
+        self, tmp_path
+    ):
+        """[A-1 follow-up, 2026-09-25] Unlike the test above (a genuinely
+        unbounded permit that happened to expire, on the ORIGINAL, never-
+        relaunched child), a RELAUNCHED child whose permit expiry matches
+        the day's first-boot ceiling anchor must alert with the distinct
+        daily-ceiling detail, not the generic shadow-mode-no-permit one."""
+        from breezy.runtime.trade_supervisor_core import (
+            record_first_boot_permit_seen,
+            record_permit_issued_seen,
+            record_relaunch_attempt,
+        )
+
+        anchor_ns = 1  # already lapsed by self-check time -- ceiling exhausted
+        tracked_pid = 9001
+        node_log = tmp_path / "node.log"
+        node_log.write_text(
+            _STRATEGY_SUBSCRIBED_LINE
+            + (
+                f"live-trading permit issued issued_at_ns=1 expires_at_ns={anchor_ns} "
+                "ttl_s=1\n"
+            )
+        )
+        # The FIRST child of the day set the anchor; a boot-window relaunch
+        # then occurred (``relaunch_attempts > 0``) -- the only observable
+        # signal distinguishing "this child's log IS the anchor's own
+        # source" from "this child's permit was CLAMPED to a pre-existing
+        # anchor", since a clamped permit's log line is byte-identical in
+        # shape to a fresh one (§2 of the ruling doc).
+        state = initial_scheduler_state(_DAY)
+        state = record_permit_issued_seen(state, _utc(16, 50), anchor_ns)
+        state = record_first_boot_permit_seen(state, _utc(16, 50), anchor_ns)
+        state = record_relaunch_attempt(state, _utc(16, 51))
+        assert state.first_boot_permit_expires_at_ns == anchor_ns
+        assert state.permit_issued_seen_expires_at_ns is None  # cleared for the new child
+
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: tracked_pid,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            state=state,
+        )
+
+        assert sink.payloads[-1].detail == (
+            AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING.value
+        )
 
     def test_permit_latch_resets_on_next_days_launch_so_stale_permit_cannot_pass(self, tmp_path):
         yesterday = _DAY - dt.timedelta(days=1)

@@ -237,6 +237,15 @@ class AlertDetail(str, Enum):
     #: relaunch for the rest of the day rather than mint a relaunched
     #: child's permit with no ceiling.
     MIDDAY_RELAUNCH_CEILING_UNKNOWN = "midday_relaunch_ceiling_unknown"
+    #: [A-1 follow-up, 2026-09-25] A relaunched child's permit line shows an
+    #: expiry equal to the day's first-boot ceiling anchor -- A-1's clamp
+    #: working as designed, never a genuine "no permit was issued" refusal.
+    #: Distinct from ``SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT`` so an
+    #: operator is not misled into treating expected daily-coverage-limit
+    #: shadow time as a broken permit path. Still alerts -- never silenced.
+    SELF_CHECK_FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING = (
+        "self_check_fail_shadow_mode_permit_expired_at_daily_ceiling"
+    )
     #: [AUD-14b] The self-check repeat-failure escalation machinery's own
     #: fault paths -- see ``SelfCheckEscalationState``/``EscalationLoadOutcome``
     #: below. Each fails TOWARD alerting, never toward silence.
@@ -287,6 +296,11 @@ class SelfCheckResult(str, Enum):
     PASS_ADOPTED_LOG_UNKNOWN = "PASS_ADOPTED_LOG_UNKNOWN"
     FAIL_NODE_NOT_READY = "FAIL_NODE_NOT_READY"
     FAIL_SHADOW_MODE_NO_PERMIT = "FAIL_SHADOW_MODE_NO_PERMIT"
+    #: [A-1 follow-up, 2026-09-25] See ``AlertDetail.SELF_CHECK_FAIL_
+    #: SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING``'s own docstring.
+    FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING = (
+        "FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING"
+    )
     FAIL_MULTIPLE_FLOCK_HOLDERS = "FAIL_MULTIPLE_FLOCK_HOLDERS"
     FAIL_CHILD_EXITED = "FAIL_CHILD_EXITED"
     #: [2026-09-12] Continuous-family-only -- see ``ContinuousFamilyCheck``.
@@ -301,6 +315,9 @@ class SelfCheckResult(str, Enum):
 SELF_CHECK_ALERT_DETAIL: Final[dict[SelfCheckResult, AlertDetail]] = {
     SelfCheckResult.FAIL_NODE_NOT_READY: AlertDetail.SELF_CHECK_FAIL_NOT_READY,
     SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT: (AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT),
+    SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING: (
+        AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING
+    ),
     SelfCheckResult.FAIL_MULTIPLE_FLOCK_HOLDERS: (
         AlertDetail.SELF_CHECK_FAIL_MULTIPLE_FLOCK_HOLDERS
     ),
@@ -527,6 +544,7 @@ def self_check(
     strategy_subscribed: bool,
     log_available: bool = True,
     continuous_check: ContinuousFamilyCheck | None = None,
+    permit_expiry_at_daily_ceiling: bool = False,
 ) -> SelfCheckResult:
     """[B4/E3/D2] The 17:05 UTC self-check. Exactly one PASS/FAIL result.
 
@@ -551,6 +569,16 @@ def self_check(
     continuous-family failure is reported on top of a healthy node, never
     instead of a genuine ``FAIL_CHILD_EXITED``/``FAIL_NODE_NOT_READY``/
     ``FAIL_SHADOW_MODE_NO_PERMIT``.
+
+    [A-1 follow-up, 2026-09-25] ``permit_expiry_at_daily_ceiling`` defaults
+    ``False`` -- every existing caller that never sets it sees byte-
+    identical behaviour. When the caller has determined the observed
+    permit's expiry equals the day's first-boot ceiling anchor (A-1), the
+    would-be ``FAIL_SHADOW_MODE_NO_PERMIT`` is reported as the distinct
+    ``FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING`` instead -- a
+    permit WAS issued and A-1's clamp is working as designed, not a
+    genuine refusal. Still alerts (see ``SELF_CHECK_ALERT_DETAIL``), never
+    silenced.
     """
     if not child_alive:
         return SelfCheckResult.FAIL_CHILD_EXITED
@@ -563,6 +591,8 @@ def self_check(
     if not strategy_subscribed:
         return SelfCheckResult.FAIL_NODE_NOT_READY
     if not (permit_issued and permit_expiry_valid):
+        if permit_issued and permit_expiry_at_daily_ceiling:
+            return SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING
         return SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
     if continuous_check is not None:
         if not continuous_check.phase0_clean:

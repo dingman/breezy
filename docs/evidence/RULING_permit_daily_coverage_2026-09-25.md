@@ -105,6 +105,60 @@ the safety-layer refusal actually fires downstream.
   detection reads a child's OWN latched `permit_issued_seen_expires_at_ns`
   (the pre-existing per-child field), never the new day-level anchor — no
   change to that logic was needed or made.
+- **`_do_relaunch_check` (boot-window relaunch, before readiness) spawns
+  without a ceiling.** Only `_do_midday_watch` injects
+  `BREEZY_PERMIT_EXPIRY_CEILING_NS`; a bounded boot-window relaunch
+  (<=`MAX_RELAUNCH_ATTEMPTS`=2, >=`MIN_RELAUNCH_GAP`=3 min apart, never
+  at/after `RELAUNCH_CUTOFF_UTC`=17:00Z) still mints a fresh, unclamped,
+  full-`PERMIT_TTL_NS` permit, and can be the child whose permit line
+  latches `first_boot_permit_expires_at_ns` for the day if it is the
+  first to log one. **Accepted:** every boot-window relaunch attempt
+  occurs within minutes of the original 16:50Z boot and before
+  17:00Z — so any two candidate anchors from this window are, at most,
+  ~10 minutes apart. Cumulative daily coverage from this window therefore
+  *clusters* around one ~10 h expiry rather than *stacking* additional
+  ~10 h windows the way an unbounded mid-day relaunch would (the actual
+  defect A-1 closes) — a few minutes of anchor jitter is not a material
+  widening of daily coverage. Closing this fully would mean threading a
+  ceiling through `_do_relaunch_check` too; deferred as out of scope for
+  this change, and named here so a future reviewer does not mistake the
+  omission for an oversight.
+
+## 5. Follow-up (2026-09-25): daily-ceiling expiry is distinguishable from a refusal
+
+silent-failure-hunter review: a relaunched child whose CLAMPED permit
+expires shortly after boot (little headroom left under the ceiling)
+produced the same `SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT` /
+`AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT` as a genuine refusal —
+an operator paged on either would misdiagnose A-1's clamp working exactly
+as designed as a broken permit path.
+
+**Remedy (smallest change consistent with the existing closed
+`SelfCheckResult`/`AlertDetail` vocabulary):** one new member on each enum,
+`FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING` /
+`SELF_CHECK_FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING`, mapped in
+`SELF_CHECK_ALERT_DETAIL` — it still alerts on every path the generic
+member did, never silenced. `self_check()` gains one keyword-only
+`permit_expiry_at_daily_ceiling: bool = False` (default preserves
+byte-identical behaviour for every existing caller); when a would-be
+`FAIL_SHADOW_MODE_NO_PERMIT` also has `permit_issued=True` and the caller
+has determined the flag is set, the distinct result is returned instead.
+
+`_do_self_check` computes the flag as: the observed (latched-or-live)
+permit expiry equals `state.first_boot_permit_expires_at_ns` **and**
+`state.relaunch_attempts > 0`. The `relaunch_attempts > 0` guard is
+necessary, not cosmetic: for the ORIGINAL, never-relaunched boot child its
+own permit expiry always equals the anchor too (the anchor is latched FROM
+that very permit), so equality alone cannot distinguish "this permit IS
+the anchor's source, and genuinely expired" (a real bug, still reported as
+`FAIL_SHADOW_MODE_NO_PERMIT`) from "this permit was CLAMPED to a
+pre-existing anchor" (A-1 working as designed) — a clamped permit's log
+line is byte-identical in shape to a fresh one, so `relaunch_attempts` is
+the only available signal. Tested at both the pure-`self_check()` level
+(ceiling-match true/false) and the `_do_self_check` wiring level (a
+never-relaunched child's genuinely expired permit still alerts the
+generic detail; a relaunched child's ceiling-matched expiry alerts the
+distinct one).
 
 ## 5. Tests (RED before GREEN, all passing after implementation)
 
