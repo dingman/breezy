@@ -68,7 +68,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
@@ -398,9 +398,120 @@ def apply_corpus_frozen_ladder(
     )
 
 
+#: Bounded retry for a 429/5xx ASOS fetch (module docstring's fetch-failure
+#: note) -- the exit-window study's OWN wrapper around
+#: ``settlement_alignment_study.fetch_text_cached``, which itself stays
+#: UNCHANGED for its other callers (``asos_recent_refresh.py``,
+#: ``current_rung_hold_resting_bid_study.py``, and
+#: ``settlement_alignment_study.main`` itself all still get exactly one
+#: attempt -- see ``_fetch_text_with_retry``'s own docstring). Exponential
+#: backoff is used when the origin sends no usable ``Retry-After``; at most
+#: ``_MAX_FETCH_RETRIES`` retries per station, and every wait -- backoff or
+#: ``Retry-After`` -- is capped at ``_MAX_RETRY_WAIT_S``.
+#:
+#: Per-station worst case (``_MAX_FETCH_RETRIES`` retries, each capped at
+#: ``_MAX_RETRY_WAIT_S``) is 360s; across the whole four-station family that
+#: is 1440s -- uncomfortably close to the unit's own ``TimeoutStartSec``.
+#: ``_TOTAL_RETRY_WAIT_BUDGET_S`` (see ``_RetryWaitBudget``) is the hard
+#: backstop for that: a single ceiling on the SUM of every wait across
+#: every station in one run, never per-station alone.
+_RETRY_BACKOFFS_S: Final[tuple[float, ...]] = (5.0, 15.0, 45.0)
+_MAX_RETRY_WAIT_S: Final[float] = 120.0
+_MAX_FETCH_RETRIES: Final[int] = 3
+_TOTAL_RETRY_WAIT_BUDGET_S: Final[float] = 600.0
+#: Shared between `_asos_fetch_failure` (below) and `main`'s own
+#: partial-run WARN filter -- one literal, not two independently
+#: maintained ones.
+_ASOS_FETCH_FAILURE_MARKER: Final[str] = "ASOS fetch failed for"
+#: A detector without delivery is not a control (AUD-15's own lesson):
+#: fired once per run when any station is still missing after
+#: `_fetch_text_with_retry` exhausts its retries. Never fired on a TOTAL
+#: outage -- that path already exits 1 and trips the unit's own
+#: `OnFailure=` alert (`main`'s own guard).
+EXIT_WINDOW_ASOS_FETCH_PARTIAL_OUTAGE_EVENT: Final[str] = (
+    "EXIT_WINDOW_ASOS_FETCH_PARTIAL_OUTAGE"
+)
+
+
+def _retry_wait_seconds(exc: httpx.HTTPStatusError, attempt: int) -> float:
+    """Seconds to wait before retrying `exc`'s station (`attempt` is
+    0-indexed: 0 is the wait before the FIRST retry). Honours `Retry-After`
+    in its seconds form only -- an HTTP-date `Retry-After`, or one that
+    fails to parse as a float, falls back to `_RETRY_BACKOFFS_S`, exactly
+    like a station that sent no header at all. Always capped at
+    `_MAX_RETRY_WAIT_S`.
+    """
+    seconds = _RETRY_BACKOFFS_S[attempt]
+    retry_after = exc.response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            parsed = float(retry_after)
+        except ValueError:
+            pass
+        else:
+            if parsed >= 0:
+                seconds = parsed
+    return min(seconds, _MAX_RETRY_WAIT_S)
+
+
+@dataclasses.dataclass(slots=True)
+class _RetryWaitBudget:
+    """A per-RUN ceiling on the TOTAL retry wait summed across EVERY
+    station -- shared (one instance) across the whole `run_exit_window_study`
+    loop, never per-station. Once exhausted, `_fetch_text_with_retry` stops
+    retrying immediately: the failing station becomes an ordinary missing
+    input, exactly like exhausting its own `_MAX_FETCH_RETRIES`, and later
+    stations get no further retries either once the shared budget is gone.
+    """
+
+    remaining_s: float
+
+    def consume(self, seconds: float) -> bool:
+        """`True` (and decrements `remaining_s`) iff the FULL `seconds` fits
+        in what remains; `False` (unchanged) otherwise. Never a partial
+        wait -- the sum of every wait this budget ever approves can never
+        exceed the value it was constructed with.
+        """
+        if seconds > self.remaining_s:
+            return False
+        self.remaining_s -= seconds
+        return True
+
+
+def _fetch_text_with_retry(
+    client: HistoricalDataClient, cache_dir: Path, url: str, delay_s: float,
+    *, sleep: Callable[[float], None], budget: _RetryWaitBudget,
+) -> str:
+    """Bounded retry around `fetch_text_cached`, for THIS study's own
+    per-station fetch path only -- `fetch_text_cached` itself is never
+    modified, so every other caller keeps its original single-attempt
+    behaviour. Retries ONLY HTTP 429 and 5xx, at most `_MAX_FETCH_RETRIES`
+    times (`_MAX_FETCH_RETRIES + 1` attempts total) AND only while `budget`
+    (shared across every station in this run) can still cover the next
+    wait; any other `httpx.HTTPStatusError` (e.g. 404) or a
+    `httpx.TransportError` (a connection failure, never a rate limit) is
+    raised on the very first attempt, exactly like this study's own
+    pre-retry behaviour.
+    """
+    for attempt in range(_MAX_FETCH_RETRIES + 1):
+        try:
+            return fetch_text_cached(client, cache_dir, url, delay_s)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            retryable = status == 429 or 500 <= status < 600
+            if not retryable or attempt == _MAX_FETCH_RETRIES:
+                raise
+            wait_s = _retry_wait_seconds(exc, attempt)
+            if not budget.consume(wait_s):
+                raise
+            sleep(wait_s)
+    raise AssertionError("unreachable: the loop above always returns or raises")
+
+
 def _station_asos_text(
     *, cache_dir: Path, spec: SiteSpec, obs_source: Literal["cache", "fetch"],
-    client: HistoricalDataClient | None,
+    client: HistoricalDataClient | None, sleep: Callable[[float], None] = time.sleep,
+    budget: _RetryWaitBudget,
 ) -> str | None:
     """The FIXED-window ASOS text for ``spec``'s whole station (never a
     per-day fetch -- one fetch covers every climate day this run needs,
@@ -409,18 +520,24 @@ def _station_asos_text(
 
     ``obs_source="cache"``: read-only, ``None`` on a miss (the caller reports
     it, never fabricates). ``obs_source="fetch"``: fetch-on-miss via
+    :func:`_fetch_text_with_retry` (a bounded-retry wrapper around
     ``settlement_alignment_study.fetch_text_cached`` -- the SAME helper
     ``asos_recent_refresh.py`` uses, calling only ``client.get(...)`` (never
     ``.post``/``.put``/``.patch``/``.delete``/``.request``, so this module
-    stays clear of the write-egress firewall scan) -- and WRITES the result
-    into ``cache_dir`` so the next run is offline."""
+    stays clear of the write-egress firewall scan)) -- and WRITES the result
+    into ``cache_dir`` so the next run is offline. ``sleep`` is a test seam
+    (defaults to the real ``time.sleep``): production retries really wait;
+    tests inject a no-op/recording fake so they never really sleep.
+    ``budget`` is the run-wide :class:`_RetryWaitBudget`, shared across
+    every station -- always passed explicitly by the caller, never
+    defaulted (a fresh per-call budget would defeat the whole-run cap)."""
     url = asos_url(spec.iem_asos_id, ASOS_FETCH_START, ASOS_FETCH_END)
     path = cache_path_for_url(cache_dir, url, ".txt")
     if path.exists():
         return path.read_text(encoding="utf-8", errors="replace")
     if obs_source != "fetch" or client is None:
         return None
-    return fetch_text_cached(client, cache_dir, url, 1.0)
+    return _fetch_text_with_retry(client, cache_dir, url, 1.0, sleep=sleep, budget=budget)
 
 
 def _station_observations(*, spec: SiteSpec, text: str) -> tuple[ObservationRow, ...]:
@@ -671,11 +788,16 @@ class _TotalAsosFetchOutage(Exception):
 
 
 def _asos_fetch_failure(city: str, iem_asos_id: str, exc: httpx.HTTPError) -> str:
-    """One station's fetch failure, named for the report's missing section."""
+    """One station's fetch failure, named for the report's missing section
+    (after `_fetch_text_with_retry` already exhausted its retries for a
+    429/5xx, or immediately for anything else)."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"{city}: ASOS fetch failed for {iem_asos_id} (HTTP {exc.response.status_code})"
+        return (
+            f"{city}: {_ASOS_FETCH_FAILURE_MARKER} {iem_asos_id} "
+            f"(HTTP {exc.response.status_code})"
+        )
     return (
-        f"{city}: ASOS fetch failed for {iem_asos_id} "
+        f"{city}: {_ASOS_FETCH_FAILURE_MARKER} {iem_asos_id} "
         f"(transport error: {type(exc).__name__})"
     )
 
@@ -691,21 +813,32 @@ def run_exit_window_study(
     obs_source: Literal["cache", "fetch"] = "cache",
     depth_source: Literal["catalog", "staged"] | None = None,
     live_catalog_root: Path = _DEFAULT_LIVE_CATALOG_ROOT,
+    sleep: Callable[[float], None] = time.sleep,
+    retry_wait_budget_s: float = _TOTAL_RETRY_WAIT_BUDGET_S,
 ) -> tuple[tuple[PositionExitRow, ...], tuple[str, ...]]:
     """Build one exit-window row per filled position across ``stations``.
 
     Returns ``(rows, missing)`` -- ``missing`` names inputs that could not be
-    resolved, reported rather than fabricated. A per-station HTTP or transport
-    failure is one of those missing inputs. When every attempted fetch failed
-    and no station loaded ASOS text, raises :class:`_TotalAsosFetchOutage`
-    instead of returning (``main`` turns that into a non-zero exit after
-    writing the report).
+    resolved, reported rather than fabricated. A per-station HTTP 429/5xx is
+    retried (bounded per station AND by a run-wide `retry_wait_budget_s`
+    shared across every station, see `_fetch_text_with_retry`/
+    `_RetryWaitBudget`) before becoming one of those missing inputs; any
+    other HTTP or transport failure is missing on the first attempt. When
+    every attempted fetch failed and no station loaded ASOS text, raises
+    :class:`_TotalAsosFetchOutage` instead of returning (``main`` turns
+    that into a non-zero exit after writing the report). ``sleep`` and
+    ``retry_wait_budget_s`` are test seams (default to the real
+    ``time.sleep`` and ``_TOTAL_RETRY_WAIT_BUDGET_S``).
     """
     config = CurrentRungHoldConfig(stations=tuple(stations))
     fee_coefficient = config.required_fee_coefficient
     stale_observation_bound_ns = config.stale_observation_minutes * 60_000_000_000
     registry = default_registry()
     specs_by_city = {spec.city: spec for spec in load_sites() if spec.city in stations}
+    #: ONE budget, shared across every station this run -- see
+    #: `_RetryWaitBudget`'s own docstring for why a fresh per-station budget
+    #: would defeat the whole-run cap.
+    retry_budget = _RetryWaitBudget(remaining_s=retry_wait_budget_s)
     #: L-38 (`cbd5fec`): each REGISTERED family's rows now live under their
     #: own `<scored_trials_dir>/<family_id>/` subdirectory -- pooled here
     #: across every family plus any legacy top-level rows (see
@@ -781,6 +914,7 @@ def run_exit_window_study(
             try:
                 station_text = _station_asos_text(
                     cache_dir=asos_cache_dir, spec=spec, obs_source=obs_source, client=client,
+                    sleep=sleep, budget=retry_budget,
                 )
             except (httpx.HTTPStatusError, httpx.TransportError) as exc:
                 failed_fetches += 1
@@ -926,16 +1060,19 @@ def main(
     *,
     sink: AlertSink | None = None,
     now_ns: int | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> int:
-    """`sink`/`now_ns` are keyword-only test seams (never CLI flags, mirroring
-    `score_live_trials.main`'s own `proc_root` convention): production
-    resolves both from the real environment/clock.
+    """`sink`/`now_ns`/`sleep` are keyword-only test seams (never CLI flags,
+    mirroring `score_live_trials.main`'s own `proc_root` convention):
+    production resolves all three from the real environment/clock/
+    `time.sleep`.
     """
     args = _parse_args(argv)
     out_dir: Path = args.out_root / args.run_stamp
     out_dir.mkdir(parents=True, exist_ok=True)
     resolved_sink = resolve_alert_sink(os.environ) if sink is None else sink
     resolved_now_ns = time.time_ns() if now_ns is None else now_ns
+    resolved_sleep = time.sleep if sleep is None else sleep
 
     total_fetch_outage = False
     try:
@@ -944,7 +1081,7 @@ def main(
             since_climate_day=args.since_climate_day, catalog_root=args.catalog_root,
             scored_trials_dir=args.scored_trials_dir, asos_cache_dir=args.asos_cache_dir,
             obs_source=args.obs_source, depth_source=args.depth_source,
-            live_catalog_root=args.live_catalog_root,
+            live_catalog_root=args.live_catalog_root, sleep=resolved_sleep,
         )
     except _TotalAsosFetchOutage as exc:
         rows, missing = exc.rows, exc.missing
@@ -981,6 +1118,25 @@ def main(
     print(f"[exit-window-study] {len(rows)} position(s); wrote {out_dir}", file=sys.stderr)
     for item in missing:
         print(f"[exit-window-study] MISSING: {item}", file=sys.stderr)
+
+    # Partial-run WARN: a detector without delivery is not a control
+    # (AUD-15's own lesson). Fired exactly once per run (never once per
+    # missing station), naming every station+status still missing after
+    # `_fetch_text_with_retry` exhausted its retries. Never fired on a
+    # TOTAL outage -- that path already exits 1 below and trips the unit's
+    # own `OnFailure=` alert; this WARN would be a duplicate signal for the
+    # identical condition.
+    asos_partial_failures = tuple(item for item in missing if _ASOS_FETCH_FAILURE_MARKER in item)
+    if asos_partial_failures and not total_fetch_outage:
+        emit_alert(
+            resolved_sink,
+            AlertPayload(
+                severity="WARN",
+                event=EXIT_WINDOW_ASOS_FETCH_PARTIAL_OUTAGE_EVENT,
+                site="current_rung_hold_exit_window_study",
+                detail="; ".join(asos_partial_failures),
+            ),
+        )
 
     # AUD-07 D: EXIT_CORPUS_FROZEN, on AUD-04's shared re-alert ladder.
     frozen_streak_latch_path = args.out_root / _FROZEN_STREAK_LATCH_FILENAME

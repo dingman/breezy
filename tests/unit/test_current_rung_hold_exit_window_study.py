@@ -1052,6 +1052,7 @@ class _StatusClient:
 
     def __init__(self, status_code: int) -> None:
         self._status_code = status_code
+        self.calls = 0
 
     def __enter__(self) -> Self:
         return self
@@ -1060,8 +1061,40 @@ class _StatusClient:
         return None
 
     def get(self, url: str, *, timeout: float) -> httpx.Response:
+        self.calls += 1
         request = httpx.Request("GET", url)
         return httpx.Response(self._status_code, request=request)
+
+
+class _SequencedStatusClient:
+    """Stand-in whose successive ``get`` calls replay ``responses`` in
+    order: ``(status_code, retry_after)``. ``retry_after`` (or ``None``) is
+    sent as the ``Retry-After`` header only for a non-2xx response. A 200
+    entry returns ``body`` as the response text (mirrors a real ASOS
+    success). Raises ``IndexError`` if called more times than provided --
+    that is a test-setup bug, never a silently-extended fake."""
+
+    def __init__(
+        self, responses: Sequence[tuple[int, str | None]], *, body: str = "station,valid,metar\n",
+    ) -> None:
+        self._responses = list(responses)
+        self._body = body
+        self.calls = 0
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def get(self, url: str, *, timeout: float) -> httpx.Response:
+        status_code, retry_after = self._responses[self.calls]
+        self.calls += 1
+        request = httpx.Request("GET", url)
+        if status_code == 200:
+            return httpx.Response(200, request=request, text=self._body)
+        headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        return httpx.Response(status_code, request=request, headers=headers)
 
 
 class _TransportErrorClient:
@@ -1199,13 +1232,16 @@ def test_one_station_429_is_missing_and_the_cached_station_still_produces_rows(
         obs_source="fetch",
         depth_source="catalog",
         live_catalog_root=tmp_path / "live",
+        sleep=lambda seconds: None,
     )
 
     assert [row.position.station for row in rows] == [_CACHED_CITY]
     failed = [item for item in missing if _FAILED_CITY in item]
     assert failed
     assert all("429" in item for item in failed)
-    assert study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir)) == 0
+    assert study_mod.main(
+        _study_argv(tmp_path, cache_dir=cache_dir), sleep=lambda seconds: None,
+    ) == 0
 
 
 def test_a_transport_error_on_one_station_is_missing_and_the_cached_station_continues(
@@ -1242,7 +1278,17 @@ def test_every_station_429_exits_non_zero_and_names_each_station(
     cache_dir.mkdir()
     _install_offline_study_fakes(monkeypatch, _StatusClient(429))
 
-    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir))
+    class _CapturingSink:
+        def __init__(self) -> None:
+            self.payloads: list[object] = []
+
+        def emit(self, payload: object) -> None:
+            self.payloads.append(payload)
+
+    sink = _CapturingSink()
+    code = study_mod.main(
+        _study_argv(tmp_path, cache_dir=cache_dir), sink=sink, sleep=lambda seconds: None,
+    )
 
     assert code != 0
     report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
@@ -1251,6 +1297,198 @@ def test_every_station_429_exits_non_zero_and_names_each_station(
     for city in (_FAILED_CITY, _CACHED_CITY):
         named = [item for item in missing if city in item and "429" in item]
         assert named, missing
+    # A TOTAL outage exits 1 and trips the unit's own OnFailure= alert
+    # already -- the partial-run WARN must never ALSO fire here.
+    warn_payloads = [
+        p for p in sink.payloads
+        if p.event == study_mod.EXIT_WINDOW_ASOS_FETCH_PARTIAL_OUTAGE_EVENT
+    ]
+    assert warn_payloads == []
+
+
+# ---------------------------------------------------------------------------
+# 429/5xx retry (this backlog item): bounded, Retry-After-aware, injectable
+# sleep so no test here ever really waits.
+# ---------------------------------------------------------------------------
+
+
+def _status_error(status_code: int, *, retry_after: str | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://example.invalid/asos.txt")
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    response = httpx.Response(status_code, request=request, headers=headers)
+    return httpx.HTTPStatusError(str(status_code), request=request, response=response)
+
+
+def test_retry_wait_seconds_honours_retry_after_seconds_form_capped_at_120() -> None:
+    exc = _status_error(429, retry_after="500")
+
+    assert study_mod._retry_wait_seconds(exc, attempt=0) == 120.0
+
+
+def test_retry_wait_seconds_honours_a_small_retry_after_uncapped() -> None:
+    exc = _status_error(429, retry_after="30")
+
+    assert study_mod._retry_wait_seconds(exc, attempt=0) == 30.0
+
+
+def test_retry_wait_seconds_falls_back_to_exponential_backoff_without_retry_after() -> None:
+    exc = _status_error(503)
+
+    assert [study_mod._retry_wait_seconds(exc, attempt=n) for n in range(3)] == [5.0, 15.0, 45.0]
+
+
+def test_retry_wait_seconds_falls_back_on_an_http_date_retry_after() -> None:
+    """An HTTP-date ``Retry-After`` (not the seconds form) is treated as
+    absent -- this study parses ONLY the seconds form, per the backlog
+    item's own scope."""
+    exc = _status_error(429, retry_after="Wed, 21 Oct 2026 07:28:00 GMT")
+
+    assert study_mod._retry_wait_seconds(exc, attempt=1) == 15.0
+
+
+def test_429_then_200_recovers_the_station_honouring_retry_after_and_capping_the_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    client = _SequencedStatusClient([(429, "500"), (200, None)])
+    _install_offline_study_fakes(monkeypatch, client)
+    # `fetch_text_cached`'s own success path (unmodified, per this backlog
+    # item's own constraint) always calls `time.sleep(delay_s=1.0)` after a
+    # successful GET -- real, not this study's injected retry `sleep`. This
+    # is the ONLY test in the file that ever reaches that success path, so
+    # it is the only one that needs this: patch the stdlib `time.sleep`
+    # `settlement_alignment_study` calls, in THIS test only (monkeypatch
+    # auto-restores), never `fetch_text_cached` itself.
+    monkeypatch.setattr(settlement.time, "sleep", lambda seconds: None)
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    sleeps: list[float] = []
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY,),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=sleeps.append,
+    )
+
+    assert client.calls == 2
+    # Retry-After=500 is capped at the 120s ceiling, never used raw.
+    assert sleeps == [120.0]
+    assert [row.position.station for row in rows] == [_FAILED_CITY]
+    assert not any(study_mod._ASOS_FETCH_FAILURE_MARKER in item for item in missing)
+
+
+def test_429_exhausts_retries_missing_and_a_deduped_warn_names_the_station(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    client = _StatusClient(429)
+    _install_offline_study_fakes(monkeypatch, client)
+    sleeps: list[float] = []
+
+    class _CapturingSink:
+        def __init__(self) -> None:
+            self.payloads: list[object] = []
+
+        def emit(self, payload: object) -> None:
+            self.payloads.append(payload)
+
+    sink = _CapturingSink()
+    code = study_mod.main(
+        _study_argv(tmp_path, cache_dir=cache_dir), sink=sink, sleep=sleeps.append,
+    )
+
+    assert code == 0
+    # 1 initial attempt + 3 retries = 4 calls; 3 waits (5, 15, 45).
+    assert client.calls == 4
+    assert sleeps == [5.0, 15.0, 45.0]
+    report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    missing = payload["missing_inputs"]
+    failed = [item for item in missing if _FAILED_CITY in item and "429" in item]
+    assert failed
+    warn_payloads = [
+        p for p in sink.payloads
+        if p.event == study_mod.EXIT_WINDOW_ASOS_FETCH_PARTIAL_OUTAGE_EVENT
+    ]
+    assert len(warn_payloads) == 1
+    assert warn_payloads[0].severity == "WARN"
+    assert _FAILED_CITY in warn_payloads[0].detail
+    assert "429" in warn_payloads[0].detail
+
+
+_THIRD_FAILED_CITY = "MDW"
+
+
+def test_total_retry_wait_budget_exhaustion_stops_retrying_remaining_stations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run-wide `retry_wait_budget_s` (production default 600s; injected
+    small here) is a hard ceiling on the SUM of every wait across every
+    station, not just each station's own `_MAX_FETCH_RETRIES`. SFO consumes
+    its full 5+15+45=65s before exhausting its own retry count; MDW then
+    gets only 2 waits (5+15=20s) before the shared budget (100s total)
+    cannot cover its third (45s) -- it stops retrying immediately rather
+    than waiting a truncated amount, and becomes missing one attempt early.
+    LAX is a cache hit throughout, so this run stays a PARTIAL (not total)
+    outage.
+    """
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    client = _StatusClient(429)
+    _install_offline_study_fakes(monkeypatch, client)
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    sleeps: list[float] = []
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _THIRD_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=sleeps.append,
+        retry_wait_budget_s=100.0,
+    )
+
+    # SFO: 4 calls (1 + 3 retries), all within budget. MDW: 3 calls (1 + 2
+    # retries) -- its 3rd retry is refused by the exhausted budget before a
+    # 4th call is ever made. LAX: 0 calls (cache hit).
+    assert client.calls == 7
+    assert sleeps == [5.0, 15.0, 45.0, 5.0, 15.0]
+    assert sum(sleeps) <= 100.0
+    assert [row.position.station for row in rows] == [_CACHED_CITY]
+    for city in (_FAILED_CITY, _THIRD_FAILED_CITY):
+        failed = [item for item in missing if city in item and "429" in item]
+        assert failed, missing
+
+
+def test_fetch_text_cached_other_callers_still_get_exactly_one_attempt_on_429(
+    tmp_path: Path,
+) -> None:
+    """Pins ``settlement_alignment_study.fetch_text_cached``'s own,
+    unretried behaviour: the retry added by this backlog item lives ONLY in
+    the exit-window study's own wrapper, never in the shared helper every
+    other caller (``asos_recent_refresh.py``,
+    ``current_rung_hold_resting_bid_study.py``, and
+    ``settlement_alignment_study.main`` itself) still uses."""
+    client = _StatusClient(429)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        settlement.fetch_text_cached(client, tmp_path, "https://example.invalid/asos.txt", 0.0)
+
+    assert client.calls == 1
 
 
 # ---------------------------------------------------------------------------
