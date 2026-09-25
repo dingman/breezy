@@ -710,6 +710,24 @@ per day cannot park capture the way the old 20-per-hour ceiling did on
 09-09. No further adjustment to `breezy-quote-tape.service` is needed for
 the rotate unit.
 
+**AUD-08b (2026-09-24): `OnSuccess=breezy-station-candidate-register.service`.**
+The rotate unit is otherwise byte-identical to its pre-08b self (no slice, no
+memory cap, no extra env). After a successful rotation it enqueues
+`breezy-station-candidate-register.service`, a separate oneshot (no timer, no
+`[Install]`) that runs `station-candidate-register-run.sh` under the shared
+studies flock and `breezy-studies.slice`, with `MemoryHigh=4G`/`MemoryMax=6G`
+(growth measurements in the unit comment), `alerts.env` and `OnFailure=`. It
+folds the recorder's unregistered-city sighting sidecar
+(`~/.local/share/breezy/derived/station_candidates/sightings/`) into the
+ADVISORY register `station_candidates.jsonl` -- never a trading input, never a
+subscription -- and raises `BREEZY_STATION_CANDIDATE_NEW` once per new venue
+city and `BREEZY_STATION_CANDIDATE_STALE` when the fold has not succeeded for
+more than two nights (also checked on the lock-skip path). An unreadable catalog
+makes it exit 1 having written nothing; the register's failure can never fail
+the rotation. The recorder unit now also reads `alerts.env`, for the
+`BREEZY_SIGHTING_SIDECAR_BROKEN` alert (three consecutive failed sidecar
+appends). The sidecar only grows once the recorder restarts on this code.
+
 Validation performed (no unit activated):
 
 ```

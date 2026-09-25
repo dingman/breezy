@@ -680,3 +680,52 @@ class TestTradePrintsReachDiskAndReadBack:
         assert [t.ts_event for t in trades] == [1_000_000_000, 2_000_000_000]
         assert [t.ts_init for t in trades] == [1_000_000_500, 2_000_000_500]
         assert {t.instrument_id for t in trades} == {instrument.id}
+
+
+# ---------------------------------------------------------------------------
+# AUD-08b review MEDIUM: a persistently broken sighting sidecar reaches a human.
+# ---------------------------------------------------------------------------
+
+
+def test_the_recorder_role_injects_the_sidecar_failure_alert(tmp_path: Path) -> None:
+    """The runtime owns the alert sink; the adapter only receives a callable."""
+    from nautilus_trader.common.config import resolve_path
+
+    from breezy.runtime import node_config
+
+    base = make_data_client_config()
+    assert base.sighting_failure_alert_path is None
+
+    config = build_quote_tape_node_config(make_tape_settings(tmp_path), base)
+
+    wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
+    assert isinstance(wired, PolymarketUSDataClientConfig)
+    assert wired.sighting_failure_alert_path is not None
+    assert resolve_path(wired.sighting_failure_alert_path) is (
+        node_config.emit_sighting_sidecar_broken_alert
+    )
+    # Still a hashable config: it is the shared lru_cache key.
+    hash(wired)
+
+
+def test_the_sidecar_failure_alert_emits_one_warn_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from breezy.runtime import node_config
+    from breezy.runtime.health import AlertPayload
+
+    emitted: list[AlertPayload] = []
+
+    class _Sink:
+        def emit(self, payload: AlertPayload) -> None:
+            emitted.append(payload)
+
+    monkeypatch.setattr(node_config, "resolve_alert_sink", lambda env=None: _Sink())
+
+    node_config.emit_sighting_sidecar_broken_alert("3 consecutive cycles failed (OSError)")
+
+    (payload,) = emitted
+    assert payload.event == "BREEZY_SIGHTING_SIDECAR_BROKEN"
+    assert payload.severity == "WARN"
+    assert payload.site == "polymarket_us/recorder"
+    assert "3 consecutive cycles failed (OSError)" in payload.detail

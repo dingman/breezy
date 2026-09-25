@@ -91,6 +91,7 @@ from breezy.adapters.polymarket_us.tape_records import (
 )
 from breezy.persistence.catalog import CatalogPathError
 from breezy.persistence.family_manifest import FamilyManifest
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.settings import (
     BreezyRuntimeSettings,
     BreezyTradeSettings,
@@ -451,6 +452,30 @@ def prepare_quote_tape_root(root: Path) -> Path:
     return root
 
 
+#: The one alert the recorder raises for a persistently broken sighting sidecar.
+SIGHTING_SIDECAR_BROKEN_EVENT: Final[str] = "BREEZY_SIGHTING_SIDECAR_BROKEN"
+#: Resolved by the adapter's data factory (``resolve_path``), never imported by it.
+SIGHTING_SIDECAR_BROKEN_ALERT_PATH: Final[str] = f"{__name__}:emit_sighting_sidecar_broken_alert"
+
+
+def emit_sighting_sidecar_broken_alert(detail: str) -> None:
+    """Deliver the provider's sidecar-broken detail through the shipped alert path.
+
+    Resolved per call (it fires at most once per failure streak), so the
+    process environment at alert time -- ``alerts.env`` via the recorder unit --
+    is what counts. ``emit_alert`` contains every sink failure.
+    """
+    emit_alert(
+        resolve_alert_sink(),
+        AlertPayload(
+            severity="WARN",
+            event=SIGHTING_SIDECAR_BROKEN_EVENT,
+            site="polymarket_us/recorder",
+            detail=detail,
+        ),
+    )
+
+
 def build_quote_tape_node_config(
     settings: PolymarketUSQuoteTapeSettings,
     data_client_config: PolymarketUSDataClientConfig,
@@ -543,6 +568,11 @@ def build_quote_tape_node_config(
         # `subscribe_trades`, so halving would be a no-op for it, and this
         # keeps its shard count byte-identical regardless.
         trade_shard_halving=True,
+        # AUD-08b, quote-tape ONLY: the recorder is the one process that
+        # writes the sighting sidecar, so it is the one that can report the
+        # sidecar persistently broken. Injected here because the adapter may
+        # not import the runtime alert path.
+        sighting_failure_alert_path=SIGHTING_SIDECAR_BROKEN_ALERT_PATH,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

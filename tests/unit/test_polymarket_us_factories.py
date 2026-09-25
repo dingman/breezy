@@ -79,7 +79,10 @@ from breezy.adapters.polymarket_us.factories import (
     exec_config_from_env,
 )
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
-from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
+from breezy.adapters.polymarket_us.provider import (
+    PolymarketUSInstrumentProvider,
+    SightingSinkAlreadyAttachedError,
+)
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
 from breezy.adapters.polymarket_us.signing import (
     SigningVariant,
@@ -93,6 +96,7 @@ from breezy.adapters.polymarket_us.websocket import (
 )
 from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
 from breezy.persistence.family_manifest import FamilyManifest
+from breezy.persistence.station_candidates import SIGHTINGS_DIR, FileSightingSink
 from breezy.runtime.settings import SettingsError
 
 CLIENT_NAME = "POLYMARKET_US"
@@ -178,12 +182,14 @@ def _clear_shared_polymarket_us_caches() -> Iterator[None]:
     factories_module._shared_polymarket_us_transport.cache_clear()
     factories_module._shared_polymarket_us_http_client.cache_clear()
     factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    factories_module._shared_sighting_sink.cache_clear()
     transport_module.build_shared_http_client._reset_for_tests()
     yield
     factories_module._shared_polymarket_us_signer.cache_clear()
     factories_module._shared_polymarket_us_transport.cache_clear()
     factories_module._shared_polymarket_us_http_client.cache_clear()
     factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    factories_module._shared_sighting_sink.cache_clear()
     transport_module.build_shared_http_client._reset_for_tests()
 
 
@@ -905,3 +911,124 @@ def test_the_public_http_client_wrapper_returns_the_same_cached_instance(
     via_public = factories_module.shared_polymarket_us_http_client(config, clock)
     via_private = factories_module._shared_polymarket_us_http_client(config, clock)
     assert via_public is via_private
+
+
+# ---------------------------------------------------------------------------
+# AUD-08b A14: exactly one process can write the sighting sidecar, and
+# exactly one provider exists in it that could.
+# ---------------------------------------------------------------------------
+
+
+def _provider_of(
+    client: PolymarketUSDataClient | PolymarketUSExecutionClient,
+) -> PolymarketUSInstrumentProvider:
+    provider = client._instrument_provider
+    assert isinstance(provider, PolymarketUSInstrumentProvider)
+    return provider
+
+
+def _build_both_with_one_clock(
+    tmp_path: Path, config: PolymarketUSDataClientConfig
+) -> tuple[PolymarketUSDataClient, PolymarketUSExecutionClient]:
+    """Drive BOTH ``create()``s in one process, sharing the node's one clock."""
+    clock = LiveClock()
+    trader_id = TraderId("SMOKE-001")
+    loop = asyncio.new_event_loop()
+    try:
+        data_client = PolymarketUSLiveDataClientFactory.create(
+            loop=loop,
+            name=CLIENT_NAME,
+            config=config,
+            msgbus=MessageBus(trader_id=trader_id, clock=clock),
+            cache=TestComponentStubs.cache(),
+            clock=clock,
+        )
+        exec_client = PolymarketUSLiveExecClientFactory.create(
+            loop=loop,
+            name=CLIENT_NAME,
+            config=make_exec_config(tmp_path, venue=config),
+            msgbus=MessageBus(trader_id=trader_id, clock=clock),
+            cache=TestComponentStubs.cache(),
+            clock=clock,
+        )
+    finally:
+        loop.close()
+    return data_client, exec_client
+
+
+def test_the_trade_node_composition_attaches_no_sighting_sink(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    """A14 (i): the trade node keeps ``subscribe_trades=False`` and writes no sidecar."""
+    data_client, exec_client = _build_both_with_one_clock(tmp_path, make_config())
+
+    assert _provider_of(data_client).sighting_sink is None
+    assert _provider_of(exec_client).sighting_sink is None
+    assert factories_module._shared_sighting_sink.cache_info().currsize == 0
+
+
+def test_the_recorder_composition_attaches_one_file_backed_sink(
+    wired: dict[str, Any],
+) -> None:
+    """A14 (ii): ``subscribe_trades=True`` is the recorder; it gets the one file sink."""
+    config = make_config(subscribe_trades=True)
+    client = build_client(config)
+    provider = _provider_of(client)
+    sink = provider.sighting_sink
+
+    assert isinstance(sink, FileSightingSink)
+    assert sink.directory == SIGHTINGS_DIR
+    # Attaching performs no I/O: nothing is created until a sighting exists.
+    # Re-running the recorder's create() is a no-op on the same cached sink.
+    build_client(config)
+    assert provider.sighting_sink is sink
+    with pytest.raises(SightingSinkAlreadyAttachedError):
+        provider.attach_sighting_sink(FileSightingSink(directory=SIGHTINGS_DIR))
+
+
+def test_both_factories_construct_exactly_one_instrument_provider(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    """A14 (iii): the sink is NOT an lru_cache key, so the provider stays singular."""
+    data_client, exec_client = _build_both_with_one_clock(
+        tmp_path, make_config(subscribe_trades=True)
+    )
+
+    assert _provider_of(data_client) is _provider_of(exec_client)
+    info = factories_module._shared_polymarket_us_instrument_provider.cache_info()
+    assert info.misses == 1
+    assert info.hits == 1
+    assert isinstance(_provider_of(exec_client).sighting_sink, FileSightingSink)
+
+
+def test_the_shared_provider_getter_signature_is_unchanged() -> None:
+    """Plan §7 step 9: the cache key stays exactly (client, provider_config, discovery, clock)."""
+    signature = inspect.signature(
+        factories_module._shared_polymarket_us_instrument_provider.__wrapped__
+    )
+    assert tuple(signature.parameters) == ("client", "provider_config", "discovery", "clock")
+
+
+def test_the_recorder_composition_wires_the_config_supplied_failure_alert(
+    wired: dict[str, Any],
+) -> None:
+    """The alert callable is NAMED by the runtime (a path, resolved with Nautilus's
+    ``resolve_path``) so the adapter never imports ``breezy.runtime``."""
+    config = make_config(subscribe_trades=True, sighting_failure_alert_path="builtins:print")
+    provider = _provider_of(build_client(config))
+
+    assert provider._sighting_failure_alert is print
+
+
+def test_the_trade_node_composition_resolves_no_failure_alert(wired: dict[str, Any]) -> None:
+    provider = _provider_of(build_client(make_config()))
+
+    assert provider._sighting_failure_alert is None
+
+
+@pytest.mark.parametrize("path", ["builtins:no_such_function", "builtins:__doc__"])
+def test_an_unresolvable_or_non_callable_failure_alert_path_refuses_at_build(
+    wired: dict[str, Any], path: str
+) -> None:
+    with pytest.raises(SettingsError, match="sighting_failure_alert_path"):
+        build_client(make_config(subscribe_trades=True, sighting_failure_alert_path=path))
