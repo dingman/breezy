@@ -89,6 +89,7 @@ from breezy.strategy.current_rung_hold.strategy import (
 from breezy.strategy.current_rung_hold.tick_eval import (
     BothSides,
     evaluate_both_sides,
+    evaluate_eligible_snapshot_no_side,
     instrument_rung_is_current,
     width_and_m,
 )
@@ -280,7 +281,12 @@ class _AskSnapshot:
     """
 
     instrument_id: InstrumentId
-    ask: Decimal
+    #: F-1b (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): optional --
+    #: `None` when a Depth10 frame carries a real bid but no real ask (the
+    #: cheapest NO population, `on_order_book_depth`). `size` is `0` in that
+    #: case. `_snapshot_from_quote` always sets a real `ask` (a `QuoteTick`
+    #: cannot exist without both sides), so the QuoteTick path is unaffected.
+    ask: Decimal | None
     size: int
     ts_event: int
     source: Source
@@ -486,7 +492,9 @@ class ContinuousRungHoldStrategy(Strategy):
         # not a growing set: `on_data` retries deliberately re-evaluate the
         # SAME cached quote on a later weather update, so only the two live
         # push triggers ("quote_tick", "depth") ever consult or update this.
-        self._last_ask_seen: dict[str, tuple[int, Decimal, int]] = {}
+        self._last_ask_seen: dict[
+            str, tuple[int, Decimal, int] | tuple[int, None, Decimal | None, Decimal | None]
+        ] = {}
         #: Review item 3 (three-seam Slice 4 review): the ask a Take
         #: decision was actually made against, keyed by the station-day it
         #: will (eventually) consume -- `on_order_filled` reads (and pops)
@@ -1179,20 +1187,26 @@ class ContinuousRungHoldStrategy(Strategy):
         self._hunt_tick(_snapshot_from_quote(tick), trigger="quote_tick", quote_age_ns=None)
 
     def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
-        """Hunt on the venue's own Depth10 ask when quotes go dark (L-35).
+        """Hunt on the venue's own Depth10 book when quotes go dark (L-35).
 
         A one-sided book (no bid) never produces a `QuoteTick`
         (`parse_quote_tick` requires both sides) but still carries a real,
         executable ask -- `best_order` skips the size-0 Arrow pad.
+
+        F-1b (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): the
+        REVERSE one-sided book -- a real bid, no real ask -- is the cheapest
+        NO population (amendment sec2:32 reads a bid-only Depth10 update as
+        an update to the NO leg's own ask) and must reach `_hunt_tick` too,
+        never return here. Only a book with NEITHER side returns early.
         """
         ask = best_order(depth.asks)
-        if ask is None:
-            return
         bid = best_order(depth.bids)
+        if ask is None and bid is None:
+            return
         snapshot = _AskSnapshot(
             instrument_id=depth.instrument_id,
-            ask=ask.price.as_decimal(),
-            size=int(ask.size),
+            ask=ask.price.as_decimal() if ask is not None else None,
+            size=int(ask.size) if ask is not None else 0,
             ts_event=depth.ts_event,
             source="depth",
             bid=bid.price.as_decimal() if bid is not None else None,
@@ -1256,11 +1270,17 @@ class ContinuousRungHoldStrategy(Strategy):
         running max or an off-rung instrument is upstream state the YES
         path already has its own (counted) gates for on the SAME tick --
         this NO-only path must not double-count it. Step 3 shares the exact
-        per-tick lookups the YES path uses (`_eligible_setup`). Step 4
-        reuses `evaluate_both_sides` so the crossed-book check
-        (``tick_eval.py``'s own ``bid >= ask`` guard) is single-sourced --
-        never re-implemented here. Step 5, `_evaluate_no_side_shadow`, is
-        completely unchanged: it runs its own admission/budget/consumed
+        per-tick lookups the YES path uses (`_eligible_setup`). Step 4, when
+        ``snapshot.ask`` is present, reuses `evaluate_both_sides` so the
+        crossed-book check (``tick_eval.py``'s own ``bid >= ask`` guard) is
+        single-sourced -- never re-implemented here. F-1b (Rev 3.1): when
+        ``snapshot.ask`` is ``None`` (a bid-only Depth10 frame -- there is
+        no ask to cross against), it calls
+        `evaluate_eligible_snapshot_no_side` directly -- the same NO-side
+        evaluate path `evaluate_both_sides` itself calls for its own
+        ``.no`` -- so both branches run the identical NO-side rule order,
+        never a second implementation. Step 5, `_evaluate_no_side_shadow`,
+        is completely unchanged: it runs its own admission/budget/consumed
         gates independently, exactly as it already does on the YES-in-band
         path.
 
@@ -1285,29 +1305,51 @@ class ContinuousRungHoldStrategy(Strategy):
             setup = self._eligible_setup(
                 snapshot.instrument_id, facts, running_max, accumulator, now_ns,
             )
-            both_sides = evaluate_both_sides(
-                station=station,
-                climate_day=climate_day,
-                now_ns=now_ns,
-                ladder=self._ladders[(station, climate_day_key)],
-                fee_coefficient=setup.fee_coefficient,
-                ask=snapshot.ask,
-                ask_size=snapshot.size,
-                bid=snapshot.bid,
-                bid_size=snapshot.bid_size,
-                running_max=running_max,
-                staleness_ns=setup.staleness_ns,
-                config=self._config,
-                hour_lst=hour_lst,
-                width_code=setup.width_code,
-                m_code=setup.m_code,
-            )
+            no_decision: Decision
+            if snapshot.ask is not None:
+                both_sides = evaluate_both_sides(
+                    station=station,
+                    climate_day=climate_day,
+                    now_ns=now_ns,
+                    ladder=self._ladders[(station, climate_day_key)],
+                    fee_coefficient=setup.fee_coefficient,
+                    ask=snapshot.ask,
+                    ask_size=snapshot.size,
+                    bid=snapshot.bid,
+                    bid_size=snapshot.bid_size,
+                    running_max=running_max,
+                    staleness_ns=setup.staleness_ns,
+                    config=self._config,
+                    hour_lst=hour_lst,
+                    width_code=setup.width_code,
+                    m_code=setup.m_code,
+                )
+                no_decision = both_sides.no
+            else:
+                # F-1b: no ask on this frame, so `evaluate_both_sides`'s own
+                # crossed-book check (which needs both sides) does not
+                # apply -- there is nothing to be crossed against.
+                no_decision = evaluate_eligible_snapshot_no_side(
+                    station=station,
+                    climate_day=climate_day,
+                    now_ns=now_ns,
+                    ladder=self._ladders[(station, climate_day_key)],
+                    fee_coefficient=setup.fee_coefficient,
+                    bid=snapshot.bid,
+                    bid_size=snapshot.bid_size,
+                    running_max=running_max,
+                    staleness_ns=setup.staleness_ns,
+                    config=self._config,
+                    hour_lst=hour_lst,
+                    width_code=setup.width_code,
+                    m_code=setup.m_code,
+                )
             self._evaluate_no_side_shadow(
                 station=station,
                 climate_day_key=climate_day_key,
                 station_day=station_day,
                 yes_instrument_id=snapshot.instrument_id,
-                no_decision=both_sides.no,
+                no_decision=no_decision,
                 now_ns=now_ns,
                 bid_size=snapshot.bid_size,
                 bid=snapshot.bid,
@@ -1412,7 +1454,17 @@ class ContinuousRungHoldStrategy(Strategy):
         # re-evaluates the SAME cached quote on a later weather update and
         # must never be short-circuited by this.
         if trigger in ("quote_tick", "depth"):
-            dedupe_key = (snapshot.ts_event, snapshot.ask, snapshot.size)
+            # F-1b: a bid-only frame (no ask) is deduped on the NO leg's own
+            # inputs -- `size` is always `0` for an ask-less snapshot and
+            # would collapse two DIFFERENT bids at the same `ts_event` into
+            # one dedupe key.
+            dedupe_key: (
+                tuple[int, Decimal, int] | tuple[int, None, Decimal | None, Decimal | None]
+            )
+            if snapshot.ask is not None:
+                dedupe_key = (snapshot.ts_event, snapshot.ask, snapshot.size)
+            else:
+                dedupe_key = (snapshot.ts_event, None, snapshot.bid, snapshot.bid_size)
             if self._last_ask_seen.get(iid) == dedupe_key:
                 return
             self._last_ask_seen[iid] = dedupe_key
@@ -1510,6 +1562,12 @@ class ContinuousRungHoldStrategy(Strategy):
         offset = self._std_utc_offset_hours_by_station[station]
         hour_lst = _local_hour(now_ns, offset)
         if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
+            if snapshot.ask is None:
+                # F-1b (R1): a bid-only frame outside the window returns
+                # BEFORE the refusal/alerter/halt-observation below, so
+                # `refusals` and the halt detector's baseline stay
+                # byte-identical to a world where this frame never arrived.
+                return
             self.refusals.record(_OUTSIDE_DECISION_WINDOW)
             self._report_alerter(
                 self.refusal_alerter,
@@ -1527,6 +1585,25 @@ class ContinuousRungHoldStrategy(Strategy):
 
         ask = snapshot.ask
         size = snapshot.size
+        if ask is None:
+            # F-1b (R1): a bid-only Depth10 frame -- no YES diagnostic is
+            # recorded (today these frames record nothing at all, since
+            # `on_order_book_depth` returned before `_hunt_tick` ever ran),
+            # so the YES-side counters stay byte-identical. Only the NO
+            # leg's own executability (never the YES ask, which does not
+            # exist on this frame) gates the NO-only hunt.
+            if no_leg_executable(snapshot.bid, snapshot.bid_size, self._config):
+                self._hunt_no_only(
+                    snapshot,
+                    facts,
+                    station=station,
+                    climate_day=climate_day,
+                    climate_day_key=climate_day_key,
+                    station_day=station_day,
+                    now_ns=now_ns,
+                    hour_lst=hour_lst,
+                )
+            return
         raw_executable = (
             self._config.executable_ask_lower < ask < self._config.executable_ask_upper
             and size >= self._config.minimum_displayed_size
@@ -1556,6 +1633,7 @@ class ContinuousRungHoldStrategy(Strategy):
                     hour_lst=hour_lst,
                 )
             return
+        assert ask is not None  # mypy narrowing for the YES path below
 
         accumulator = self._accumulators.get(station)
         running_max = None if accumulator is None else accumulator.value_at(now_ns)
