@@ -187,9 +187,9 @@ def _look_from_payload(payload: Mapping[str, object]) -> HypothesisLook:
         hypothesis_id=str(payload["hypothesis_id"]),
         variant_id=str(payload["variant_id"]),
         looked_at=str(payload["looked_at"]),
-        n_station_days=int(payload["n_station_days"]),  # type: ignore[arg-type]
-        n_station_days_observed=int(payload["n_station_days_observed"]),  # type: ignore[arg-type]
-        n_station_days_with_takes=int(payload["n_station_days_with_takes"]),  # type: ignore[arg-type]
+        n_station_days=int(payload["n_station_days"]),  # type: ignore[call-overload]
+        n_station_days_observed=int(payload["n_station_days_observed"]),  # type: ignore[call-overload]
+        n_station_days_with_takes=int(payload["n_station_days_with_takes"]),  # type: ignore[call-overload]
         take_rate=float(payload["take_rate"]),  # type: ignore[arg-type]
         ci_lower=float(payload["ci_lower"]),  # type: ignore[arg-type]
         ci_upper=float(payload["ci_upper"]),  # type: ignore[arg-type]

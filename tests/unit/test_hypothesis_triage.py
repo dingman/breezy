@@ -521,8 +521,8 @@ def test_pooled_pnl_veto_counterexample_is_not_confirmed(tmp_path: Path) -> None
     looks = _looks(tmp_path)
     assert len(looks) == 1
     look = looks[0]
-    assert look["ci_lower"] > 0
-    assert look["pooled_net_pnl_per_contract"] < 0
+    assert float(look["ci_lower"]) > 0  # type: ignore[arg-type]
+    assert float(look["pooled_net_pnl_per_contract"]) < 0  # type: ignore[arg-type]
     assert look["veto_reason"] == "POOLED_PNL_NON_POSITIVE"
     assert look["alpha_spent_cumulative"] == pytest.approx(PROGRAMME_ALPHA / MAX_HYPOTHESES)
     assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PRIMARY_PASSED_PNL_VETO"
