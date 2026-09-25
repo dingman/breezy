@@ -46,19 +46,23 @@ from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.strategy.current_rung_hold import continuous_strategy as continuous_strategy_module
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     _DIAG_DAY_BUDGET_EXHAUSTED,
     _DIAG_FAMILY_HALT,
+    _DIAG_NO_ONLY_HUNT_ERROR,
     _DIAG_OPEN_INTENT_WAIT,
     _DIAG_REARM_WAIT,
     _OUTSIDE_DECISION_WINDOW,
     ContinuousRungHoldStrategy,
 )
-from breezy.strategy.current_rung_hold.decision import Decision, Refuse
+from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS, Decision, Refuse
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     TrialDayLatch,
+    TrialDayRecord,
+    TrialDayRecordCorrupt,
     open_trial_day_latch,
 )
 from tests.unit.test_continuous_rung_hold_strategy import (
@@ -864,3 +868,282 @@ def test_release_stale_inflight_is_trigger_independent(
 
     assert quote_outcome == (False, 1, quote_outcome[2])
     assert quote_outcome == ask_depth_outcome == bid_only_outcome
+
+
+# ---------------------------------------------------------------------------
+# F-1c (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): a YES instrument-
+# day that is consumed but not FILLED still evaluates NO. YES IN_FLIGHT and
+# rearm_wait stay fail-closed (unmodified, existing behaviour -- documented
+# here as this slice's own acceptance criteria). A positive (filled) cache
+# result fails closed on a miss/eviction: it always re-derives from the
+# durable store, never assumes "not filled".
+#
+# Writer proof (R3 AC5, codegraph `_callers` on `consume`/`consume_if_absent`
+# in `trial_day_latch.py`, `projectPath=/home/jon/breezy`): the ONLY two
+# production writers of a YES `TrialDayRecord` anywhere in
+# `continuous_strategy.py` are `_consume_trial_from_fill_record`
+# (`reason=TAKEN_FROM_FILL_WALK_REASON`) and `_consume_or_flag_duplicate`
+# (`reason="taken"`) -- both members of `_FILLED_REASONS`. No live path in
+# this module ever writes a non-fill YES record today, so AC2 below is
+# dormant in production; it is exercised here via a DIRECT latch write, the
+# same harness idiom every IN_FLIGHT/rearm/intent-open test in this file
+# already uses. No "treat as filled" skip-set entry is needed: the new
+# branch already fails closed on anything it cannot positively prove filled.
+# ---------------------------------------------------------------------------
+
+
+def _consume_yes(
+    strategy: ContinuousRungHoldStrategy, *, reason: str, ts_ns: int = WINDOW_OPEN_NS,
+) -> None:
+    assert strategy._latch is not None
+    wrote = strategy._latch.consume_if_absent(
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        TrialDayRecord(
+            latched_at_ns=ts_ns,
+            instrument_id=str(INTERIOR_ID),
+            ask=Decimal("0.40"),
+            reason=reason,
+        ),
+        key_instrument_id=str(INTERIOR_ID),
+    )
+    assert wrote is True
+
+
+def test_yes_consumed_filled_skips_no(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="taken")
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+    assert strategy.offer_tape.records() == ()
+
+
+def test_yes_consumed_filled_result_is_cached(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1: the second and later ticks do no store read (they hit the
+    cache) -- proxied by counting calls to `refuse_if_sibling_leg_traded`,
+    the ONLY store read this branch's cache shields."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="taken")
+
+    calls: list[Any] = []
+    original = continuous_strategy_module.refuse_if_sibling_leg_traded
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(continuous_strategy_module, "refuse_if_sibling_leg_traded", _spy)
+
+    for i in range(5):
+        strategy.on_quote_tick(
+            _quote(
+                INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID,
+                ts_event=WINDOW_OPEN_NS + i * NS_PER_MIN,
+            )
+        )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("reason", sorted(REFUSAL_REASONS))
+def test_yes_consumed_unfilled_evaluates_no(
+    store_path: Path, interior_instrument: BinaryOption, reason: str,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason=reason)
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert len(calls) == 1
+    rows = [rec for rec in strategy.offer_tape.records() if rec.side == "NO"]
+    assert len(rows) == 1
+    assert rows[0].reason == "no_side_calibration_unsafe"
+
+
+def test_consumed_unfilled_with_open_ambiguous_intent_is_silent(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="not_executable")
+    assert strategy._latch is not None
+    intent_latch = strategy._latch._intent_latch
+    assert intent_latch is not None
+    intent_latch.arm("a" * 64, now_ns=WINDOW_OPEN_NS)
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+    assert strategy.offer_tape.records() == ()
+
+
+def test_yes_inflight_skips_no(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC3: an unreleased IN_FLIGHT YES marker -- distinct from consumed --
+    still skips NO. Existing, unmodified behaviour; pinned here as an F-1c
+    acceptance criterion (the risk register's fail-closed row)."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    assert strategy._latch is not None
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    )
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert calls == []
+
+
+def test_yes_rearm_wait_skips_no(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC3: a YES re-arm wait -- distinct from consumed -- still skips NO.
+    Existing, unmodified behaviour; pinned here as an F-1c acceptance
+    criterion."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    assert strategy._latch is not None
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS, key_instrument_id=str(INTERIOR_ID),
+    )
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.count(_DIAG_REARM_WAIT) == 1
+
+
+def test_consumed_path_outside_window_records_nothing(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="not_executable")
+    calls = _spy_no_side_shadow(strategy)
+
+    outside_ts = WINDOW_OPEN_NS - 30 * NS_PER_MIN
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=outside_ts)
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.counts == {}
+    assert strategy.refusals.counts == {}
+    assert strategy.offer_tape.records() == ()
+    assert _OUTSIDE_DECISION_WINDOW not in strategy.refusals.counts
+
+
+def test_cache_eviction_or_miss_reconsults_the_durable_store_never_assumes_not_filled(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Fail-closed proof (coordinator brief): clearing the cache (the same
+    empty shape a real eviction, or a fresh process, would leave) never
+    flips the outcome -- the very next tick re-derives "filled" from the
+    DURABLE store and re-populates the cache; an absent cache entry is
+    never treated as "not filled"."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="taken")
+    calls = _spy_no_side_shadow(strategy)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+    station_day = (STATION, CLIMATE_DAY.isoformat())
+    cache_key = (station_day, str(INTERIOR_ID))
+    assert cache_key in strategy._yes_fill_blocks_no
+
+    strategy._yes_fill_blocks_no.clear()
+
+    strategy.on_quote_tick(
+        _quote(
+            INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID,
+            ts_event=WINDOW_OPEN_NS + NS_PER_MIN,
+        )
+    )
+
+    assert calls == []
+    assert strategy.offer_tape.records() == ()
+    assert cache_key in strategy._yes_fill_blocks_no
+
+
+def test_sibling_check_fault_is_contained_and_does_not_cache(
+    store_path: Path, interior_instrument: BinaryOption, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM (coordinator review of 10d46cf): a raising
+    `refuse_if_sibling_leg_traded` -- e.g. a corrupt durable sibling record
+    -- inside `_hunt_no_only_after_yes_consumed`'s own gate must be
+    CONTAINED exactly like `_hunt_no_only`'s own store dependency: no NO
+    evaluation, no cache write (fail closed -- a later, healthy tick must
+    still re-derive the true answer), counted every time (a persistent
+    fault is never silently invisible), and logged at most once per
+    station-day."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="taken")
+    calls = _spy_no_side_shadow(strategy)
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise TrialDayRecordCorrupt()
+
+    monkeypatch.setattr(continuous_strategy_module, "refuse_if_sibling_leg_traded", _raise)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.count(_DIAG_NO_ONLY_HUNT_ERROR) == 1
+    station_day = (STATION, CLIMATE_DAY.isoformat())
+    cache_key = (station_day, str(INTERIOR_ID))
+    assert cache_key not in strategy._yes_fill_blocks_no
+
+    # A second tick in the same station-day: the fault is counted again
+    # (persistent faults stay visible) but the ERROR log's dedupe notice
+    # does not grow past its first entry.
+    strategy.on_quote_tick(
+        _quote(
+            INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID,
+            ts_event=WINDOW_OPEN_NS + NS_PER_MIN,
+        )
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.count(_DIAG_NO_ONLY_HUNT_ERROR) == 2
+    assert cache_key not in strategy._yes_fill_blocks_no
+    assert len(strategy._no_only_hunt_error_notice) == 1
