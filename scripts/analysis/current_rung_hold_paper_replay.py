@@ -70,6 +70,7 @@ from argv_digest import argv_sha256
 from run_weather_strategy_backtests import (
     WEATHER_VENUE,
     TapeInstrument,
+    _capture_instruments_by_id,
     _convert_live_capture,
     _load_climate_day_records,
     _select_capture_instruments,
@@ -79,7 +80,6 @@ from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
 from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_of
 from breezy.analysis.replay_sufficiency import decision_window_ns
-from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
@@ -337,15 +337,18 @@ def _replay_station_day_instrument_ids(
     climate_day: dt.date,
     station: str,
 ) -> tuple[str, ...]:
-    by_id: dict[str, object] = {}
-    for instrument in catalog.instruments():  # type: ignore[attr-defined]
-        by_id.setdefault(instrument.id.value, instrument)
+    """Instrument ids for the warm-up peek below.
 
+    Discovery (dedup + station/day filtering) is `_capture_instruments_by_id`
+    -- the SAME seam `_select_capture_instruments` uses for its own
+    discovery -- never a second, ad hoc `catalog.instruments()` loop (review
+    fix: this function used to duplicate that loop and touch the catalog
+    directly, bypassing every test that patches `_select_capture_
+    instruments`).
+    """
     return tuple(
         sorted(
-            instrument_id
-            for instrument_id, instrument in by_id.items()
-            if read_weather_bucket_facts(instrument.info).applies_to(station, climate_day)
+            _capture_instruments_by_id(catalog, climate_day=climate_day, station=station),
         ),
     )
 

@@ -1313,6 +1313,45 @@ def _convert_live_capture(
     return work
 
 
+def _capture_instruments_by_id(
+    catalog: object,
+    *,
+    climate_day: dt.date,
+    station: str | None = None,
+) -> dict[str, Instrument]:
+    """Every RECORDED instrument for `climate_day` (and `station`, when
+    given), de-duplicated on `id`.
+
+    `catalog.instruments()` returns one row per RECORDED definition, and the
+    recorder re-publishes definitions on every discovery cycle, so the same
+    `InstrumentId` appears many times. De-duplicated on `id`, keeping the
+    first, so an instrument is counted once.
+
+    THE single instrument-discovery seam: `_select_capture_instruments`
+    below and the paper-replay driver's warm-up discovery
+    (`_replay_station_day_instrument_ids`, `current_rung_hold_paper_
+    replay.py`) both call this -- never their own `catalog.instruments()`
+    loop -- so there is exactly one id-discovery-and-filter implementation,
+    and exactly one place that touches `catalog.instruments()` for this
+    purpose (AUD-09b review fix: the driver used to duplicate this loop and
+    touch the catalog directly, bypassing every test that patches `_select_
+    capture_instruments`).
+    """
+    by_id: dict[str, Instrument] = {}
+    for instrument in catalog.instruments():  # type: ignore[attr-defined]
+        by_id.setdefault(instrument.id.value, instrument)
+
+    return {
+        instrument_id: instrument
+        for instrument_id, instrument in by_id.items()
+        if (
+            read_weather_bucket_facts(instrument.info).applies_to(station, climate_day)
+            if station is not None
+            else read_weather_bucket_facts(instrument.info).climate_day == climate_day
+        )
+    }
+
+
 def _select_capture_instruments(
     catalog: ParquetDataCatalog,
     *,
@@ -1328,24 +1367,14 @@ def _select_capture_instruments(
     and why relaxing it here is not a relaxation of anything the forecast
     strategies rely on.
 
-    `catalog.instruments()` returns one row per RECORDED definition, and the
-    recorder re-publishes definitions on every discovery cycle, so the same
-    `InstrumentId` appears many times. De-duplicated on `id`, keeping the
-    first, so an instrument is counted once.
+    Instrument discovery (dedup + `climate_day`/`station` filtering) is
+    `_capture_instruments_by_id` -- see that function for why.
     """
-    by_id: dict[str, Instrument] = {}
-    for instrument in catalog.instruments():
-        by_id.setdefault(instrument.id.value, instrument)
-
-    facts_by_id: dict[str, WeatherBucketFacts] = {}
-    for instrument_id, instrument in by_id.items():
-        facts = read_weather_bucket_facts(instrument.info)
-        if (
-            facts.applies_to(station, climate_day)
-            if station is not None
-            else facts.climate_day == climate_day
-        ):
-            facts_by_id[instrument_id] = facts
+    by_id = _capture_instruments_by_id(catalog, climate_day=climate_day, station=station)
+    facts_by_id: dict[str, WeatherBucketFacts] = {
+        instrument_id: read_weather_bucket_facts(instrument.info)
+        for instrument_id, instrument in by_id.items()
+    }
 
     depth_counts: dict[str, int] = {}
     depths_by_id: dict[str, list[OrderBookDepth10]] = {}
