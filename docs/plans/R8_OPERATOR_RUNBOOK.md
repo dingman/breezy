@@ -576,6 +576,10 @@ When a node must be restarted outside the 16:50Z window or after an unclean shut
    ```
    This detaches the node from the terminal and ensures clean shutdown on session end. The supervisor's
    16:40Z STOP_PRIOR finds running nodes by pgrep; a node that outlives its supervisor is an anticipated state.
+   **A-1 note (docs/evidence/RULING_permit_daily_coverage_2026-09-25.md):** a hand-relaunched node mints a
+   fresh, full-TTL permit with no daily coverage ceiling — this is outside A-1's automated-relaunch threat
+   model since a human is deciding, but repeated hand relaunches in one trading day reproduce the same
+   cumulative-coverage gap A-1 closes for `_do_midday_watch`, and are the operator's own call to make.
 
 ## Permit window posture (2026-09-25)
 
@@ -591,7 +595,7 @@ mid-day relaunch as late as 00:59Z mints a fresh 10h permit expiring ~10:59Z.
 Union of coverage: 16:50Z→~10:59Z (~18h09m). Gap to STOP_PRIOR: ~5h41m.
 
 **With the cap** (`docs/evidence/RULING_permit_daily_coverage_2026-09-25.md`,
-being implemented): any mid-day-relaunch permit is capped at the day's
+merged 13e4849): any mid-day-relaunch permit is capped at the day's
 first-boot expiry, so worst-case coverage collapses back to the nominal case.
 
 Both gaps fall entirely outside the union of the four station decision

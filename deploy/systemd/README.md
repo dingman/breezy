@@ -745,7 +745,28 @@ discipline that applies to any future edit of this unit too.
 
 ---
 
-## `breezy-live-tally` — 6d nightly live-family tally (2026-09-04, PREPARED, NOT ACTIVATED)
+## `breezy-live-tally` — 6d nightly live-family tally — RETIRED 2026-09-24
+
+**RETIRED 2026-09-24 per `docs/evidence/RULING_R5_prereg_v1_tally_2026-09-24.md`
+(§2-§4, ENDORSED).** Disabled (never deleted), 2026-09-25T02:54:23Z:
+`systemctl --user disable --now breezy-live-tally.timer`. Reason: this
+unit's tally produced zero evidence for its entire life (`row count: 0`
+every dated report); it has been structurally incapable of evidencing
+either family actually trading (`pm_us_crh_cont`/`pm_us_crh_v4`, disjoint
+`trial_id_prefix`) since `pm_us_crh_cont`'s D0 (2026-09-12); the pooled
+60/150 Wilson statistic it exists to serve is superseded, for
+`pm_us_crh_v2` itself, by PREREG v2 rev b's LD-OBF sequential design; and
+its own structural-dead check is already, and more completely, duplicated
+daily by `breezy-family-tally@pm_us_crh_v2` (own alert edge, reading the
+champion-scoped counter per the R-4 ruling). Re-enable only via a NEW
+ruling, and only if `pm_us_crh_v2` is ever re-armed as a sending family.
+
+The unit files, `live-tally-run.sh`, and `scripts/analysis/
+live_family_tally.py` all stay in the repo, unedited in logic
+(`tests/unit/test_prereg_v1_is_byte_unmodified.py` byte-pins the analysis
+module); every past `live_family_tally_*.md` report and `live_tally.log`
+line is retained as citable history. The description below is kept as
+historical/architecture record of what the unit did while active.
 
 `breezy-live-tally.service` + `.timer` run `scripts/analysis/
 live_family_tally.py` daily at **14:30 UTC** via a wrapper script,
@@ -797,11 +818,11 @@ directory" purely because the wrapper script does not yet exist at that
 absolute host path, the same caveat that applies to any unit authored in a
 worktree before it lands on the main checkout.
 
-To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
-pattern), `daemon-reload`, then
-`systemctl --user enable --now breezy-live-tally.timer` — deliberately not
-run here; see the TRAP section above for the post-edit `daemon-reload`
-discipline that applies to any future edit of this unit too.
+**Retired — not to be activated.** The activation steps this unit
+previously documented here (symlink, `daemon-reload`, then the systemd
+command that starts and arms this timer) no longer apply: the unit is
+disabled per the RETIRED note above, and re-arming it is gated on a NEW
+ruling, not a deploy step.
 
 ---
 

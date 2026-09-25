@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -103,6 +104,33 @@ _FAMILIES_DIR: Final[Path] = Path("deploy/families")
 LIVE_TRADING_PERMIT_REFUSED_EVENT: Final[str] = "LIVE_TRADING_PERMIT_REFUSED"
 LIVE_TRADING_PERMIT_REFUSED_SEVERITY: Final[str] = "WARN"
 LIVE_TRADING_PERMIT_REFUSED_SITE: Final[str] = "global"
+
+#: [A-1, 2026-09-25] A plain, non-negative integer only -- same ASCII/
+#: anchoring discipline as ``safety.py``'s own ``_MONEY_RE``/``_COUNT_RE``.
+_PERMIT_EXPIRY_CEILING_NS_RE: Final = re.compile(r"^[0-9]+\Z")
+
+
+def _resolve_permit_expiry_ceiling_ns() -> int | None:
+    """Read ``PERMIT_EXPIRY_CEILING_NS_ENV_VAR`` (A-1): supervisor-injected
+    only, for a mid-day-relaunched child -- never set for the 16:50Z daily
+    boot. Absent -> ``None`` (unchanged, unbounded-by-this-mechanism
+    behaviour). Present but not a plain non-negative integer -> raises
+    ``LiveTradingPermissionError``, refusing the permit through the SAME
+    fail-closed path ``main()`` already uses for every other mint
+    precondition -- never silently falling back to an unbounded permit.
+    """
+    from breezy.adapters.polymarket_us.safety import LiveTradingPermissionError
+    from breezy.runtime.trade_supervisor_core import PERMIT_EXPIRY_CEILING_NS_ENV_VAR
+
+    raw = os.environ.get(PERMIT_EXPIRY_CEILING_NS_ENV_VAR)
+    if raw is None:
+        return None
+    if not _PERMIT_EXPIRY_CEILING_NS_RE.match(raw):
+        raise LiveTradingPermissionError(
+            f"{PERMIT_EXPIRY_CEILING_NS_ENV_VAR} is set but is not a plain "
+            f"non-negative integer; refusing rather than minting an unbounded permit"
+        )
+    return int(raw)
 
 #: ``AlertPayload.detail`` is a small closed set of static reasons -- never
 #: exception text, never a permit/config value (L-22 shape). ``main()`` has
@@ -243,11 +271,25 @@ def _build_fee_drift_probe(
     *,
     strategies: Sequence[Strategy],
     family_halt_latch: TrialDayLatch,
+    registered_fee_coefficient: Decimal,
 ) -> tuple[FeeDriftProbeActor, Callable[[Any], None]] | None:
     """Build AUD-12b's fee-drift probe for ``continuous_rung_hold`` only.
 
     Returns ``None`` (no probe registered) when no composed strategy
     resolved any tradable instrument -- logged, never a crashed boot.
+
+    ``registered_fee_coefficient`` is the SENDING family's own
+    ``FamilyManifest.taker_fee_coefficient`` (the caller's already-loaded
+    ``manifest``, read once, above) -- the EXACT source the composed
+    strategies' own ``required_fee_coefficient`` already comes from (see the
+    ``continuous_rung_hold`` branch above) and the same one
+    ``current_rung_hold/decision.py:342``'s per-order check compares against.
+    Passed straight through to :class:`FeeDriftProbeActor` as
+    ``documented_fee_coefficient`` -- fee-drift-probe-target ruling,
+    2026-09-25: comparing the wire read against the module-level
+    ``DOCUMENTED_TAKER_FEE_COEFFICIENT`` instead of the running family's own
+    registered theta made the probe DISAGREE forever for any family (e.g.
+    ``pm_us_crh_v4``) registered at a different, committed value.
 
     Every collaborator is the SAME object another already-wired seam uses:
 
@@ -334,6 +376,7 @@ def _build_fee_drift_probe(
         wire_fee_fetcher=_wire_fee_fetcher,
         set_family_halted=_set_family_halted,
         alert_sink=resolve_alert_sink(),
+        documented_fee_coefficient=registered_fee_coefficient,
     )
 
     def _resolve_client(node: Any) -> None:
@@ -507,7 +550,12 @@ def run(
                 # composition_kind only (§9: "runs alongside the existing
                 # strategy Actors", never folded into their own on_start).
                 built_probe = _build_fee_drift_probe(
-                    strategies=strategies, family_halt_latch=family_halt_latch
+                    strategies=strategies,
+                    family_halt_latch=family_halt_latch,
+                    # The sending family's own registered theta -- see the
+                    # v2 branch's `required_fee_coefficient` comment above;
+                    # never a constant, never an environment variable.
+                    registered_fee_coefficient=manifest.taker_fee_coefficient,
                 )
                 if built_probe is not None:
                     fee_drift_actor, fee_drift_resolve_client = built_probe
@@ -648,7 +696,9 @@ def main() -> int:
 
     permit = None
     try:
-        permit = issue_live_trading_permit(clock=LiveClock())
+        permit = issue_live_trading_permit(
+            clock=LiveClock(), max_expires_at_ns=_resolve_permit_expiry_ceiling_ns()
+        )
     except LiveTradingPermissionError as exc:
         _boot_logger.info("live-trading permit not issued: %s", exc)
         emit_alert(

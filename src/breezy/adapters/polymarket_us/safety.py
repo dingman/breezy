@@ -672,12 +672,26 @@ def operator_max_order_notional_whole_usd() -> int:
     return whole
 
 
-def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermit:
+def issue_live_trading_permit(
+    *, clock: SupportsTimestampNs, max_expires_at_ns: int | None = None
+) -> LiveTradingPermit:
     """Mint the ONE kind of authority the chokepoint accepts.
 
-    There is deliberately no ``env`` parameter and no ceiling parameter:
-    either would reintroduce the original defect one level up, letting a
-    caller hand the issuer its own authority.
+    There is deliberately no ``env`` parameter and no WIDENING ceiling
+    parameter: either would reintroduce the original defect one level up,
+    letting a caller hand the issuer its own authority.
+
+    ``max_expires_at_ns`` is the single, narrowly-scoped exception (A-1,
+    docs/plans/POST_FORECAST_PHASE_2026-09-20.md Amendment A, security
+    review 2026-09-25): it can only CLAMP the natural ``issued_at_ns +
+    PERMIT_TTL_NS`` expiry earlier, never move it later, and it is resolved
+    by the caller (``app/trade.py``, from a supervisor-injected env var)
+    rather than read from the environment here -- this function still never
+    reads or writes an environment variable to determine its OWN
+    authority. Its purpose is bounding a mid-day-relaunched process's
+    permit to the day's FIRST boot's expiry, so cumulative daily coverage
+    stays <= ``PERMIT_TTL_NS`` + spawn grace instead of one fresh 10 h
+    window per relaunch.
 
     Operator ruling 2026-09-10: the two reserved caps are the only
     operator-controlled values. The three session ceilings, when absent
@@ -690,7 +704,10 @@ def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermi
         LiveTradingPermissionError: if the enablement gate is not exactly
             ``"1"``, if a present session ceiling is malformed, if the caps
             needed for a derivation are absent, if no operator identity is
-            recorded, or if the injected clock is unusable.
+            recorded, if the injected clock is unusable, or if
+            ``max_expires_at_ns`` is at or before the sampled issuance
+            instant (a lapsed ceiling REFUSES; it never mints a permit with
+            a past or zero-length expiry).
     """
     if os.environ.get(TRADING_ENABLED_ENV_VAR) != "1":
         raise LiveTradingPermissionError(
@@ -710,8 +727,17 @@ def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermi
     operator_id = _require_operator_value(OPERATOR_ID_ENV_VAR).strip()
     issued_at_ns = _read_clock(clock)
 
+    if max_expires_at_ns is not None and max_expires_at_ns <= issued_at_ns:
+        raise LiveTradingPermissionError(
+            "max_expires_at_ns leaves no positive coverage window at this "
+            "issuance instant; refusing rather than minting a permit with a "
+            "past or zero-length expiry (A-1)"
+        )
+
     permit_id = secrets.token_bytes(16)
     expires_at_ns = issued_at_ns + PERMIT_TTL_NS
+    if max_expires_at_ns is not None:
+        expires_at_ns = min(expires_at_ns, max_expires_at_ns)
     payload = _permit_payload(
         operator_id=operator_id,
         max_order_notional_usd=ceiling,

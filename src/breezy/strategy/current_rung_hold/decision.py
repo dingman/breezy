@@ -117,6 +117,7 @@ __all__ = [
     "Take",
     "evaluate_decision",
     "is_legal_cell",
+    "no_leg_executable",
 ]
 
 #: The closed set of refusal reasons this module can emit. Widening this set
@@ -441,6 +442,24 @@ def _finalize_take(
     )
 
 
+def no_leg_executable(
+    bid: Decimal | None, bid_size: Decimal | int | None, config: CurrentRungHoldConfig
+) -> bool:
+    """Whether the NO leg (``1 - bid``) is independently executable.
+
+    F-1a (plan ``STALL_FOLLOWUPS_F1_F4_2026-09-24.md``): single-sources the
+    SAME predicate ``_evaluate_no_side`` below runs, so the caller's
+    NO-only hunt gate and the armed NO evaluation can never diverge --
+    exactly the executable-band-plus-size test ``_is_executable`` already
+    runs, on the NO leg's own complement price, with no independent copy.
+    """
+    return (
+        bid is not None
+        and bid_size is not None
+        and _is_executable(_ONE - bid, bid_size, config)
+    )
+
+
 def _evaluate_no_side(
     inputs: DecisionInputs, *, key: tuple[str, str, int, int, int], rung: RungBounds
 ) -> Decision:
@@ -464,8 +483,10 @@ def _evaluate_no_side(
     # Same executable predicate as ``_finalize_take`` (``_is_executable``),
     # run HERE so a thin book keeps ``not_executable`` and the unsafe table
     # is never read while the calibration gate is closed. ``_finalize_take``
-    # calls the same helper again on the armed path.
-    if not _is_executable(no_ask, inputs.bid_size, inputs.config):
+    # calls the same helper again on the armed path. Routed through the
+    # public ``no_leg_executable`` (F-1a) so this stays the ONE predicate a
+    # caller's NO-only hunt gate also uses -- no behaviour change.
+    if not no_leg_executable(inputs.bid, inputs.bid_size, inputs.config):
         return Refuse("not_executable")
 
     if not inputs.config.no_side_calibration_gate_cleared:

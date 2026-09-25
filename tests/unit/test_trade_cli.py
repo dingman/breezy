@@ -959,7 +959,9 @@ _BOOT_HALT_EVENT = "BOOT_HALT"
 #: The only detail a post-run read can state honestly. Engine connectivity
 #: does not survive stop, and ``portfolio.initialized`` is false for every
 #: early return, not only a portfolio-init failure.
-_BOOT_HALT_DETAILS = frozenset({"BOOT_HALT_TRADER_NEVER_STARTED"})
+_BOOT_HALT_DETAILS = frozenset(
+    {"BOOT_HALT_TRADER_NEVER_STARTED", "BOOT_HALT_NODE_ASSEMBLY_FAILED"}
+)
 _DROPPED_BOOT_HALT_DETAILS = frozenset(
     {
         "BOOT_HALT_ENGINES_NOT_CONNECTED",
@@ -1130,6 +1132,81 @@ def test_a_boot_halt_with_no_attributable_cause_alerts_with_the_generic_detail(
     detail = payloads[0].detail
     assert detail == "BOOT_HALT_TRADER_NEVER_STARTED"
     assert detail not in _DROPPED_BOOT_HALT_DETAILS
+
+
+class _DoubleClaimNode(RecordingNode):
+    """``Trader.add_strategy`` raising, as Nautilus's double external-order
+    claim does (``execution/engine.pyx:552-557``)."""
+
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+
+        def _raise(strategy: Any) -> None:
+            del strategy
+            self.calls.append("add_strategy")
+            raise ValueError("External order claim for X already exists for Y")
+
+        self.trader.add_strategy = _raise  # type: ignore[method-assign]
+
+
+class _BuildRaisingNode(RecordingNode):
+    def build(self) -> None:
+        self.calls.append("build")
+        raise RuntimeError("the builder refused")
+
+
+@pytest.mark.parametrize("node_factory", [_DoubleClaimNode, _BuildRaisingNode])
+def test_a_node_assembly_failure_pages_one_critical_boot_halt(
+    node_factory: type[RecordingNode],
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    """AUD-13c review HIGH: an exception while the node is ASSEMBLED
+    (``add_actor``/``add_strategy``/``build``) reaches the same CRITICAL
+    sink as a boot that never starts. Exit code and stderr report unchanged."""
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=node_factory, stderr=err, strategies=(object(),))
+
+    assert code == EXIT_RUNTIME_ERROR
+    assert "trading node failed" in err.getvalue()
+    assert "run" not in RecordingNode.instances[0].calls
+    payloads = _boot_halt_payloads(_no_send_alert_sink)
+    assert len(payloads) == 1
+    assert payloads[0].severity == "CRITICAL"
+    assert payloads[0].site == "global"
+    assert payloads[0].detail == "BOOT_HALT_NODE_ASSEMBLY_FAILED"
+    assert payloads[0].detail in _BOOT_HALT_DETAILS
+
+
+def test_a_raising_sink_never_masks_a_node_assembly_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RaisingSink:
+        calls = 0
+
+        def emit(self, payload: AlertPayload) -> None:
+            del payload
+            _RaisingSink.calls += 1
+            raise RuntimeError("sink down")
+
+    monkeypatch.setattr(trade_cli, "resolve_alert_sink", _RaisingSink, raising=False)
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=_BuildRaisingNode, stderr=err)
+
+    assert _RaisingSink.calls == 1
+    assert code == EXIT_RUNTIME_ERROR
+    assert "the builder refused" in err.getvalue()
+
+
+def test_a_failure_after_assembly_is_not_labelled_an_assembly_failure(
+    _no_send_alert_sink: _RecordingAlertSink,
+) -> None:
+    code = run(env=TRADE_ENV, node_factory=RaisingNode, stderr=io.StringIO())
+
+    assert code == EXIT_RUNTIME_ERROR
+    details = [payload.detail for payload in _boot_halt_payloads(_no_send_alert_sink)]
+    assert "BOOT_HALT_NODE_ASSEMBLY_FAILED" not in details
 
 
 # ---------------------------------------------------------------------------

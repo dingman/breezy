@@ -31,6 +31,7 @@ from breezy.adapters.polymarket_us.symbology import (
     instrument_id_to_slug,
     leg_of,
     parse_weather_slug,
+    sibling_instrument_id,
 )
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -66,7 +67,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.persistence.family_manifest import FamilyManifest
 
 __all__ = [
+    "InstrumentStationMismatchError",
     "NoTradableInstrumentsError",
+    "OverlappingExternalOrderClaimsError",
     "build_continuous_rung_hold_strategies",
     "build_current_rung_hold_strategies",
     "family_halt_submit_veto",
@@ -163,6 +166,20 @@ class NoTradableInstrumentsError(SettingsError):
     A ``SettingsError`` subclass so the trading process exits 2 via the
     existing configuration-error path.
     """
+
+
+class OverlappingExternalOrderClaimsError(SettingsError):
+    """AUD-13c: two composed strategies claim the same instrument.
+
+    Checked BEFORE ``Trader.add_strategy``, where Nautilus would otherwise
+    raise ``InvalidConfiguration`` mid-assembly (``execution/engine.pyx:552-557``).
+    A ``SettingsError`` so the process exits 2 via the configuration path.
+    """
+
+
+class InstrumentStationMismatchError(RuntimeError):
+    """An id bucketed under one station re-parses to another -- the station
+    pairing guard in :func:`resolve_station_instrument_ids`."""
 
 
 def strategy_component_id(station: str) -> str:
@@ -311,10 +328,20 @@ def resolve_station_instrument_ids(
     already applies to the paper-replay driver -- so each id is subscribed to
     exactly once downstream in ``CurrentRungHoldStrategy.on_start``.
     """
-    catalog = ParquetDataCatalog(str(catalog_root))
-    raw = catalog.instruments()
-    instruments = list(raw) if raw is not None else []
+    return _bucket_station_instrument_ids(_read_catalog_instruments(catalog_root), today_by_station)
 
+
+def _read_catalog_instruments(catalog_root: Path) -> list[object]:
+    raw = ParquetDataCatalog(str(catalog_root)).instruments()
+    return list(raw) if raw is not None else []
+
+
+def _bucket_station_instrument_ids(
+    instruments: Sequence[object],
+    today_by_station: Mapping[str, dt.date],
+) -> dict[str, tuple[InstrumentId, ...]]:
+    """``resolve_station_instrument_ids``'s bucketing over an already-read
+    catalog, so one boot can bucket more than one day off ONE read."""
     buckets: dict[str, dict[InstrumentId, None]] = {
         station: {} for station in today_by_station
     }
@@ -365,10 +392,11 @@ def resolve_station_instrument_ids(
         # subscribe one station's strategy to another station's market.
         for instrument_id in ids:
             reparsed_station = station_by_id.get(instrument_id)
-            assert reparsed_station == station, (
-                f"resolve_station_instrument_ids: {instrument_id} bucketed under "
-                f"{station!r} re-parses to {reparsed_station!r}"
-            )
+            if reparsed_station != station:
+                raise InstrumentStationMismatchError(
+                    f"resolve_station_instrument_ids: {instrument_id} bucketed under "
+                    f"{station!r} re-parses to {reparsed_station!r}"
+                )
     return resolved
 
 
@@ -384,12 +412,52 @@ def _zero_instruments_message(
     )
 
 
+def _station_claims(
+    today: tuple[InstrumentId, ...],
+    yesterday: tuple[InstrumentId, ...],
+) -> tuple[InstrumentId, ...]:
+    """AUD-13c (ruling R-2 = R2-B): the ids one continuous station strategy
+    claims via the native ``StrategyConfig.external_order_claims``
+    (``trading/config.py:91``, registered by ``Trader.add_strategy`` at
+    ``trading/trader.py:435``). Without a claim, reconciliation books every
+    report under ``StrategyId("EXTERNAL")``
+    (``live/execution_engine.py:3551-3556``).
+
+    Today and yesterday (a fill is reconciled at the next daily boot, before
+    its market settles), YES and NO leg (a NO buy fills on the NO-leg id).
+    Station-scoped by construction -- both inputs come from the same
+    per-station bucketing -- so no two strategies claim one id (a double
+    claim raises, ``execution/engine.pyx:552-557``). Older positions still
+    reconcile EXTERNAL, exactly as before this item.
+    """
+    claims: dict[InstrumentId, None] = {}
+    for instrument_id in (*today, *yesterday):
+        claims.setdefault(instrument_id, None)
+        claims.setdefault(sibling_instrument_id(instrument_id), None)
+    return tuple(claims)
+
+
+def _assert_disjoint_claims(strategies: Sequence[ContinuousRungHoldStrategy]) -> None:
+    """Refuse two composed strategies claiming one instrument, BEFORE
+    ``Trader.add_strategy`` -- naming the instrument and both strategies."""
+    owner: dict[InstrumentId, str] = {}
+    for strategy in strategies:
+        for instrument_id in strategy.external_order_claims:
+            first = owner.setdefault(instrument_id, str(strategy.id))
+            if first != str(strategy.id):
+                raise OverlappingExternalOrderClaimsError(
+                    f"external_order_claims: {instrument_id} is claimed by both "
+                    f"{first} and {strategy.id}; refusing to compose"
+                )
+
+
 def _station_config(
     *,
     instrument_ids: tuple[InstrumentId, ...],
     station: str,
     strategy_id: str,
     required_fee_coefficient: Decimal | None,
+    external_order_claims: tuple[InstrumentId, ...] | None = None,
 ) -> CurrentRungHoldConfig:
     """One station's config, priced at the sending family's REGISTERED theta.
 
@@ -404,13 +472,18 @@ def _station_config(
     (``trading/strategy.pyx:148-149``). The prefix is the class name; the
     tag is the station, so both uniqueness checks at ``trader.py:400,416``
     pass.
+
+    ``external_order_claims`` ``None`` (v2's builder) leaves the native
+    default -- no claim.
     """
+    claims = None if external_order_claims is None else list(external_order_claims)
     if required_fee_coefficient is None:
         return CurrentRungHoldConfig(
             instrument_ids=instrument_ids,
             stations=(station,),
             strategy_id=strategy_id,
             order_id_tag=station,
+            external_order_claims=claims,
         )
     return CurrentRungHoldConfig(
         instrument_ids=instrument_ids,
@@ -418,6 +491,7 @@ def _station_config(
         strategy_id=strategy_id,
         order_id_tag=station,
         required_fee_coefficient=required_fee_coefficient,
+        external_order_claims=claims,
     )
 
 
@@ -540,9 +614,14 @@ def build_continuous_rung_hold_strategies(
             "build_continuous_rung_hold_strategies: Phase 0 forbids a non-None "
             "order_submission_permit"
         )
-    resolved = resolve_station_instrument_ids(catalog_root, today_by_station)
+    catalog_instruments = _read_catalog_instruments(catalog_root)
+    resolved = _bucket_station_instrument_ids(catalog_instruments, today_by_station)
     if all(len(ids) == 0 for ids in resolved.values()):
         raise NoTradableInstrumentsError(_zero_instruments_message(resolved, today_by_station))
+    resolved_yesterday = _bucket_station_instrument_ids(
+        catalog_instruments,
+        {station: day - dt.timedelta(days=1) for station, day in today_by_station.items()},
+    )
 
     # ONE OfferTape instance (its bounded deque, DEFAULT_OFFER_TAPE_MAXLEN=16384
     # slots) is shared by every per-station strategy below -- not one tape per
@@ -571,11 +650,19 @@ def build_continuous_rung_hold_strategies(
                 today_by_station[station].isoformat(),
             )
             continue
+        if not resolved_yesterday[station]:
+            logger.warning(
+                "continuous_rung_hold: %s resolved 0 instruments for yesterday %s; "
+                "external order claim covers today only",
+                station,
+                (today_by_station[station] - dt.timedelta(days=1)).isoformat(),
+            )
         config = _station_config(
             instrument_ids=instrument_ids,
             station=station,
             strategy_id=_CONTINUOUS_COMPONENT_ID_PREFIX,
             required_fee_coefficient=required_fee_coefficient,
+            external_order_claims=_station_claims(instrument_ids, resolved_yesterday[station]),
         )
         strategy = ContinuousRungHoldStrategy(
             config,
@@ -593,6 +680,7 @@ def build_continuous_rung_hold_strategies(
                 strategy, monitor_root=monitor_root, exit_manifest=exit_manifest,
             )
         strategies.append(strategy)
+    _assert_disjoint_claims(strategies)
     return tuple(strategies)
 
 

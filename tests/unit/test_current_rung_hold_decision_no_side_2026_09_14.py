@@ -27,6 +27,7 @@ from breezy.strategy.current_rung_hold.decision import (
     Refuse,
     Take,
     evaluate_decision,
+    no_leg_executable,
 )
 from breezy.strategy.weather_common.running_extreme import RunningMax
 
@@ -337,3 +338,47 @@ def test_take_rejects_an_invalid_side(bad_side: object) -> None:
             rung=(70, 71),
             side=bad_side,  # type: ignore[arg-type]
         )
+
+
+# ---------------------------------------------------------------------------
+# F-1a (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md): `no_leg_executable` is the
+# SAME predicate `_evaluate_no_side` runs internally -- a caller's NO-only
+# hunt gate and the armed evaluation must never diverge.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bid", [Decimal("0.05"), Decimal("0.95")])
+@pytest.mark.parametrize("bid_size", [Decimal(0), Decimal("0.5"), Decimal(1)])
+def test_no_leg_executable_parity_with_evaluate_no_side(
+    bid: Decimal, bid_size: Decimal,
+) -> None:
+    """At both band edges (``NO_ask = 1 - bid`` lands exactly on
+    ``executable_ask_lower``/``executable_ask_upper``, both EXCLUSIVE) and
+    every size straddling ``minimum_displayed_size == 1``,
+    ``no_leg_executable`` agrees exactly with whether ``evaluate_decision``
+    refuses ``not_executable`` -- the two can never disagree because the
+    NO-side gate now calls this same function."""
+    config = _gate_cleared_config()
+    executable = no_leg_executable(bid, bid_size, config)
+    decision = evaluate_decision(_no_case_inputs(bid=bid, bid_size=bid_size, config=config))
+    refused_not_executable = decision == Refuse("not_executable")
+    assert executable == (not refused_not_executable)
+
+
+def test_no_leg_executable_matches_a_clearing_mid_band_bid() -> None:
+    """A mid-band, adequately sized bid is executable by both the standalone
+    predicate and the full decision path (contrast case for the edges
+    above)."""
+    config = _gate_cleared_config()
+    bid = Decimal("0.78")
+    bid_size = Decimal(5)
+    assert no_leg_executable(bid, bid_size, config) is True
+    decision = evaluate_decision(_no_case_inputs(bid=bid, bid_size=bid_size, config=config))
+    assert decision != Refuse("not_executable")
+
+
+def test_no_leg_executable_is_false_for_a_missing_bid_or_size() -> None:
+    config = _gate_cleared_config()
+    assert no_leg_executable(None, Decimal(5), config) is False
+    assert no_leg_executable(Decimal("0.50"), None, config) is False
+    assert no_leg_executable(None, None, config) is False
