@@ -3,8 +3,14 @@
 AUD-07 §7 step 0 (read-only evidence). Nothing armed, started, stopped or
 modified in the collection of this evidence. Scope: original plan steps
 0–6 only (B/B2, C1–C3, D, the standing AUD-04 reconciliation). Steps 7,
-7b, 7c, 8, 9 are out of scope for this pass (7/7b gated on the Stage M
+7b, 8, 9 are out of scope for this pass (7/7b gated on the Stage M
 ruling per the 2026-09-25 amendment).
+
+**Addendum (2026-09-25, AUD-07 step 7c):** step 7c (the positive control's
+halt-state precondition) is now IN scope and covered below — see "§7c
+halt-state precondition". It required no code from steps 0–6 above and no
+Stage M ruling; it is read-only against the live store, addressed
+separately.
 
 ## Finding A — the gate is closed; both L-22 halves visible (re-verified, unchanged)
 
@@ -223,3 +229,54 @@ drift from Rev 2 Appendix A.3, as stated above under Finding B.
   activity-aware suppression; it is left as a residual for a later pass to
   size against real quiet-period base rates before tightening or widening
   the threshold.
+
+## §7c halt-state precondition (AUD-07 step 7c, PRECONDITION-2, AC 8c)
+
+Read-only. Nothing armed, started, stopped or modified in the collection of
+this evidence — no order built or sent, no CLI run against the live state.
+`read_exit_control_halt_precondition`
+(`src/breezy/runtime/exit_control_precondition.py`) reuses
+`read_continuous_family_store_state` (`trade_supervisor.py:403`) and reads
+the SAME `FAMILY_HALT_KEY`/`CONTINUOUS_FAMILY_HALT_KEY`
+(`trial_day_latch.py:292`; `trade_supervisor_core.py:148`, both
+`"continuous_rung_hold/halt"`) the exit veto (`exit_wiring.py:246,269-275` →
+`TrialDayLatch.is_family_halted`) already reads — no new mechanism, no new
+key, no new veto (§7 step 7c tests pin `CONTINUOUS_FAMILY_HALT_KEY ==
+FAMILY_HALT_KEY` and the identical-refusal behaviour end to end).
+
+**Live read, one-time, via a fresh independent connection (never touching
+the node):**
+
+- **Key:** `continuous_rung_hold/halt`
+- **Store path:** `/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite`
+  (`POLYMARKET_US_EXEC_STATE_DB`, confirmed from
+  `breezy.adapters.polymarket_us.factories.EXEC_STATE_DB_ENV_VAR` and
+  `~/.config/breezy/breezy-trade.env:5`)
+- **UTC read time:** `2026-09-25T06:01:31Z`
+- **Raw payload, quoted exactly:**
+  `{"detail": "Ruling A1 2026-09-21: pm_us_crh_v4 may not SEND orders; node, capture and KILL clock keep running", "evidenceSha256": "754e5cbef13e2896854dc99391e6c64923fe7813ccd03909b7a8fef898b87353", "reason": "policy_halt", "tsNs": 1790268150964821245, "v": 1}`
+  (sha256 of these exact payload bytes: `5a82b40140618de8d35338c0c9463afb256de37b73729ebbe32ffd8d75b19f28`)
+- **Verdict:** `BLOCKED_FAMILY_HALT_SET` — expected, since the A1 halt
+  (`RULING_A1_pm_us_crh_v4_disposition_2026-09-21.md`, enforced via
+  AUD-02b's `record_policy_halt`) is set for `pm_us_crh_v4`, and the key is
+  sender-global (F6, cardinality-1), so the same reading holds for
+  `pm_us_crh_exit_v4` (§7 step 7c test 1).
+- **No-write check:** sha256 of the store file, byte for byte, is identical
+  before and after the read.
+
+**AUD-02 clear → act → re-set route, cited by ID (re-checked against
+current line numbers — the plan review table's original citation,
+`AUD-02-edge-discovery-programme-status-and-fold-in.md:668,742`, has
+drifted with subsequent AUD-02 merges and no longer points at this text):**
+the route is documented as the **clear → exit → re-set sequence** at
+`docs/plans/backlog/AUDIT_2026-09-21/AUD-02-edge-discovery-programme-status-and-fold-in.md:899-900`
+(also restated at `:818`, `:998`, `:1308`) — clearing alone never re-arms
+anything (`:741-745`, `clear_family_halt_cli.py:70-135`); a re-arm needs a
+new A1-class ruling. This item never runs any leg of that route: the real
+halt is neither cleared nor set here.
+
+**`C-AUD07-MIXED-SIDE` (DoD (vi), `AUD-07-AMENDMENT-2026-09-25.md:241`) is
+PENDING M2.** That named clear-condition — required on the A1 ruling's
+halt-clear evidence checklist before a halt is cleared for a family that
+can open both sides — is not satisfied by this item and is not evidenced
+here; it depends on the M2 ruling this pass does not reach.

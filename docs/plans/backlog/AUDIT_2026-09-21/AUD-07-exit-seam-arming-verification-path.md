@@ -363,6 +363,15 @@ one wrapper, and one JSON manifest.
 > only; it does not reopen §6 B2's gate-reading consequence (item 3 above), which is stated correctly
 > in terms of the class labels, not the raw sign.
 
+> **ERRATUM-TO-ERRATUM (2026-09-25, AUD-07 step 7c).** The erratum immediately above states the MIA
+> 09-15 row "was already published (Rev 3, Finding B2)". **There is no Rev 3 of this plan** — no
+> document by that name exists in this repo. The row is published in
+> `docs/evidence/EXIT_SEAM_VERIFICATION_STATE_2026-09-25.md:152-192` ("Finding B — reconciled table
+> (step 6, closed)"), which is where `THREATENED_BEFORE_EXIT_SIDE_EMPTIED` for the MIA `[92,93]` NO
+> leg (`delta_i = -74.12 min`) actually appears. This correction is additive and prose-only: it does
+> not change the polarity derivation, the cited `delta_i` value, or §6 B2's gate-reading consequence,
+> all of which stand as the immediately preceding erratum states them.
+
 - **A — complete the registration package, still DRAFT.** Mint real artefacts and fill the manifest:
   re-run `scripts/analysis/crh_group_sequential_boundaries.py` and pin the resulting `inputs_sha256`
   (Rev 2 §2's own instruction), set a real `density_artefact_sha256`, correct
