@@ -45,6 +45,16 @@ _REPO_ASSIGNMENT_RE = re.compile(r"^REPO=(\S+)\s*$", re.MULTILINE)
 
 _LIVE_STATE_DB_ENV_LITERAL = "/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite"
 
+#: AUD-15 amendment discipline (2026-09-22): the only alert env file any
+#: study-adjacent unit may load -- see README.md's "AUD-15 alert env file"
+#: section and test_portfolio_roi_deploy.py's identically-named check.
+_PERMITTED_ENV_FILES = frozenset({"%h/.config/breezy/alerts.env"})
+_FORBIDDEN_ENV_SUBSTRINGS = ("breezy-trade.env", "polymarket.env", "operator.env")
+
+
+def _directive_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if not line.strip().startswith("#")]
+
 _READ_MARKER_PY = """\
 import sqlite3
 import sys
@@ -376,7 +386,7 @@ def test_exit_window_study_unit_pair_exists_and_wires_to_wrapper() -> None:
     assert len(exec_lines) == 1
     assert exec_lines[0].strip().endswith("exit-window-study-run.sh")
     assert "TimeoutStartSec=" in service_text
-    assert "EnvironmentFile=" not in service_text
+    assert "EnvironmentFile=-%h/.config/breezy/alerts.env" in service_text
     assert f"Environment=POLYMARKET_US_EXEC_STATE_DB={_LIVE_STATE_DB_ENV_LITERAL}" in service_text
     assert "Slice=breezy-studies.slice" in service_text
     assert "Type=oneshot" in service_text
@@ -391,6 +401,23 @@ def test_exit_window_study_unit_pair_exists_and_wires_to_wrapper() -> None:
     assert "Persistent=true" in timer_text
     assert "[Install]" in timer_text
     assert "WantedBy=timers.target" in timer_text
+
+
+def test_service_declares_only_the_allowlisted_alert_env_file() -> None:
+    """Without this line, `resolve_alert_sink` always degrades to a
+    LOG-ONLY sink under systemd -- the new partial-run WARN (and the
+    existing EXIT_CORPUS_FROZEN/EXIT_PNL_RECONCILIATION_MISMATCH alerts)
+    would reach only the journal, never the operator channel."""
+    lines = _directive_lines(_SERVICE.read_text())
+    env_files = [
+        line.removeprefix("EnvironmentFile=").lstrip("-")
+        for line in lines
+        if line.startswith("EnvironmentFile=")
+    ]
+    assert set(env_files) == _PERMITTED_ENV_FILES
+    assert not any(
+        forbidden in env_file for env_file in env_files for forbidden in _FORBIDDEN_ENV_SUBSTRINGS
+    )
 
 
 def test_state_db_env_literal_is_byte_identical_to_sibling_services() -> None:

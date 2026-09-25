@@ -1352,6 +1352,14 @@ def test_429_then_200_recovers_the_station_honouring_retry_after_and_capping_the
     cache_dir = tmp_path / "asos"
     client = _SequencedStatusClient([(429, "500"), (200, None)])
     _install_offline_study_fakes(monkeypatch, client)
+    # `fetch_text_cached`'s own success path (unmodified, per this backlog
+    # item's own constraint) always calls `time.sleep(delay_s=1.0)` after a
+    # successful GET -- real, not this study's injected retry `sleep`. This
+    # is the ONLY test in the file that ever reaches that success path, so
+    # it is the only one that needs this: patch the stdlib `time.sleep`
+    # `settlement_alignment_study` calls, in THIS test only (monkeypatch
+    # auto-restores), never `fetch_text_cached` itself.
+    monkeypatch.setattr(settlement.time, "sleep", lambda seconds: None)
     catalog = tmp_path / "catalog"
     catalog.mkdir()
     sleeps: list[float] = []
@@ -1414,6 +1422,56 @@ def test_429_exhausts_retries_missing_and_a_deduped_warn_names_the_station(
     assert warn_payloads[0].severity == "WARN"
     assert _FAILED_CITY in warn_payloads[0].detail
     assert "429" in warn_payloads[0].detail
+
+
+_THIRD_FAILED_CITY = "MDW"
+
+
+def test_total_retry_wait_budget_exhaustion_stops_retrying_remaining_stations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run-wide `retry_wait_budget_s` (production default 600s; injected
+    small here) is a hard ceiling on the SUM of every wait across every
+    station, not just each station's own `_MAX_FETCH_RETRIES`. SFO consumes
+    its full 5+15+45=65s before exhausting its own retry count; MDW then
+    gets only 2 waits (5+15=20s) before the shared budget (100s total)
+    cannot cover its third (45s) -- it stops retrying immediately rather
+    than waiting a truncated amount, and becomes missing one attempt early.
+    LAX is a cache hit throughout, so this run stays a PARTIAL (not total)
+    outage.
+    """
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    client = _StatusClient(429)
+    _install_offline_study_fakes(monkeypatch, client)
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    sleeps: list[float] = []
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _THIRD_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=sleeps.append,
+        retry_wait_budget_s=100.0,
+    )
+
+    # SFO: 4 calls (1 + 3 retries), all within budget. MDW: 3 calls (1 + 2
+    # retries) -- its 3rd retry is refused by the exhausted budget before a
+    # 4th call is ever made. LAX: 0 calls (cache hit).
+    assert client.calls == 7
+    assert sleeps == [5.0, 15.0, 45.0, 5.0, 15.0]
+    assert sum(sleeps) <= 100.0
+    assert [row.position.station for row in rows] == [_CACHED_CITY]
+    for city in (_FAILED_CITY, _THIRD_FAILED_CITY):
+        failed = [item for item in missing if city in item and "429" in item]
+        assert failed, missing
 
 
 def test_fetch_text_cached_other_callers_still_get_exactly_one_attempt_on_429(

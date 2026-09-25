@@ -46,7 +46,22 @@ MemoryMax=2G
 Slice=breezy-studies.slice
 UMask=0077
 
-# No EnvironmentFile: this is a single non-secret filesystem path literal,
+# AUD-15 amendment discipline (2026-09-22), added HERE 2026-09-25 (review
+# of the 429-retry backlog item's new partial-run WARN caught this unit
+# missing it -- exactly the "detection without delivery" defect f97c26f was
+# raised to close): the ONLY EnvironmentFile= this unit loads -- the
+# dedicated, single-key alerts.env file (mode 0600, holding just
+# BREEZY_ALERT_WEBHOOK_URL), never breezy-trade.env/polymarket.env/
+# operator.env (which carry a venue credential or an operator-reserved
+# value this unit must never hold). Without it, this unit's alert emission
+# (the new EXIT_WINDOW_ASOS_FETCH_PARTIAL_OUTAGE WARN, and the existing
+# EXIT_CORPUS_FROZEN/EXIT_PNL_RECONCILIATION_MISMATCH alerts) always
+# resolves a LOG-ONLY sink. The `-` prefix keeps the unit startable if the
+# file is absent, matching breezy-portfolio-roi.service /
+# breezy-asos-refresh.service.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+# This state-db path is a single non-secret filesystem path literal,
 # byte-identical to the same line in breezy-score-live-trials.service /
 # breezy-live-tally.service / breezy-pm-crh-v2-tally.service (I3
 # BLOCK-1.1/BLOCK-1.3) -- never a venue credential. The wrapper opens this

@@ -406,16 +406,19 @@ def apply_corpus_frozen_ladder(
 #: ``settlement_alignment_study.main`` itself all still get exactly one
 #: attempt -- see ``_fetch_text_with_retry``'s own docstring). Exponential
 #: backoff is used when the origin sends no usable ``Retry-After``; at most
-#: ``_MAX_FETCH_RETRIES`` retries, and every wait -- backoff or
-#: ``Retry-After`` -- is capped at ``_MAX_RETRY_WAIT_S`` so one station's
-#: retry loop cannot threaten the unit's ``TimeoutStartSec``. The three
-#: backoff values sum to 65s; across the whole four-station family that
-#: keeps the realistic total added wait (one or two stations rate-limited,
-#: never an absurd multi-hundred-second ``Retry-After`` on every station)
-#: comfortably under ~5 minutes.
+#: ``_MAX_FETCH_RETRIES`` retries per station, and every wait -- backoff or
+#: ``Retry-After`` -- is capped at ``_MAX_RETRY_WAIT_S``.
+#:
+#: Per-station worst case (``_MAX_FETCH_RETRIES`` retries, each capped at
+#: ``_MAX_RETRY_WAIT_S``) is 360s; across the whole four-station family that
+#: is 1440s -- uncomfortably close to the unit's own ``TimeoutStartSec``.
+#: ``_TOTAL_RETRY_WAIT_BUDGET_S`` (see ``_RetryWaitBudget``) is the hard
+#: backstop for that: a single ceiling on the SUM of every wait across
+#: every station in one run, never per-station alone.
 _RETRY_BACKOFFS_S: Final[tuple[float, ...]] = (5.0, 15.0, 45.0)
 _MAX_RETRY_WAIT_S: Final[float] = 120.0
 _MAX_FETCH_RETRIES: Final[int] = 3
+_TOTAL_RETRY_WAIT_BUDGET_S: Final[float] = 600.0
 #: Shared between `_asos_fetch_failure` (below) and `main`'s own
 #: partial-run WARN filter -- one literal, not two independently
 #: maintained ones.
@@ -451,18 +454,44 @@ def _retry_wait_seconds(exc: httpx.HTTPStatusError, attempt: int) -> float:
     return min(seconds, _MAX_RETRY_WAIT_S)
 
 
+@dataclasses.dataclass(slots=True)
+class _RetryWaitBudget:
+    """A per-RUN ceiling on the TOTAL retry wait summed across EVERY
+    station -- shared (one instance) across the whole `run_exit_window_study`
+    loop, never per-station. Once exhausted, `_fetch_text_with_retry` stops
+    retrying immediately: the failing station becomes an ordinary missing
+    input, exactly like exhausting its own `_MAX_FETCH_RETRIES`, and later
+    stations get no further retries either once the shared budget is gone.
+    """
+
+    remaining_s: float
+
+    def consume(self, seconds: float) -> bool:
+        """`True` (and decrements `remaining_s`) iff the FULL `seconds` fits
+        in what remains; `False` (unchanged) otherwise. Never a partial
+        wait -- the sum of every wait this budget ever approves can never
+        exceed the value it was constructed with.
+        """
+        if seconds > self.remaining_s:
+            return False
+        self.remaining_s -= seconds
+        return True
+
+
 def _fetch_text_with_retry(
     client: HistoricalDataClient, cache_dir: Path, url: str, delay_s: float,
-    *, sleep: Callable[[float], None],
+    *, sleep: Callable[[float], None], budget: _RetryWaitBudget,
 ) -> str:
     """Bounded retry around `fetch_text_cached`, for THIS study's own
     per-station fetch path only -- `fetch_text_cached` itself is never
     modified, so every other caller keeps its original single-attempt
     behaviour. Retries ONLY HTTP 429 and 5xx, at most `_MAX_FETCH_RETRIES`
-    times (`_MAX_FETCH_RETRIES + 1` attempts total); any other
-    `httpx.HTTPStatusError` (e.g. 404) or a `httpx.TransportError` (a
-    connection failure, never a rate limit) is raised on the very first
-    attempt, exactly like this study's own pre-retry behaviour.
+    times (`_MAX_FETCH_RETRIES + 1` attempts total) AND only while `budget`
+    (shared across every station in this run) can still cover the next
+    wait; any other `httpx.HTTPStatusError` (e.g. 404) or a
+    `httpx.TransportError` (a connection failure, never a rate limit) is
+    raised on the very first attempt, exactly like this study's own
+    pre-retry behaviour.
     """
     for attempt in range(_MAX_FETCH_RETRIES + 1):
         try:
@@ -472,13 +501,17 @@ def _fetch_text_with_retry(
             retryable = status == 429 or 500 <= status < 600
             if not retryable or attempt == _MAX_FETCH_RETRIES:
                 raise
-            sleep(_retry_wait_seconds(exc, attempt))
+            wait_s = _retry_wait_seconds(exc, attempt)
+            if not budget.consume(wait_s):
+                raise
+            sleep(wait_s)
     raise AssertionError("unreachable: the loop above always returns or raises")
 
 
 def _station_asos_text(
     *, cache_dir: Path, spec: SiteSpec, obs_source: Literal["cache", "fetch"],
     client: HistoricalDataClient | None, sleep: Callable[[float], None] = time.sleep,
+    budget: _RetryWaitBudget,
 ) -> str | None:
     """The FIXED-window ASOS text for ``spec``'s whole station (never a
     per-day fetch -- one fetch covers every climate day this run needs,
@@ -494,14 +527,17 @@ def _station_asos_text(
     stays clear of the write-egress firewall scan)) -- and WRITES the result
     into ``cache_dir`` so the next run is offline. ``sleep`` is a test seam
     (defaults to the real ``time.sleep``): production retries really wait;
-    tests inject a no-op/recording fake so they never really sleep."""
+    tests inject a no-op/recording fake so they never really sleep.
+    ``budget`` is the run-wide :class:`_RetryWaitBudget`, shared across
+    every station -- always passed explicitly by the caller, never
+    defaulted (a fresh per-call budget would defeat the whole-run cap)."""
     url = asos_url(spec.iem_asos_id, ASOS_FETCH_START, ASOS_FETCH_END)
     path = cache_path_for_url(cache_dir, url, ".txt")
     if path.exists():
         return path.read_text(encoding="utf-8", errors="replace")
     if obs_source != "fetch" or client is None:
         return None
-    return _fetch_text_with_retry(client, cache_dir, url, 1.0, sleep=sleep)
+    return _fetch_text_with_retry(client, cache_dir, url, 1.0, sleep=sleep, budget=budget)
 
 
 def _station_observations(*, spec: SiteSpec, text: str) -> tuple[ObservationRow, ...]:
@@ -778,23 +814,31 @@ def run_exit_window_study(
     depth_source: Literal["catalog", "staged"] | None = None,
     live_catalog_root: Path = _DEFAULT_LIVE_CATALOG_ROOT,
     sleep: Callable[[float], None] = time.sleep,
+    retry_wait_budget_s: float = _TOTAL_RETRY_WAIT_BUDGET_S,
 ) -> tuple[tuple[PositionExitRow, ...], tuple[str, ...]]:
     """Build one exit-window row per filled position across ``stations``.
 
     Returns ``(rows, missing)`` -- ``missing`` names inputs that could not be
     resolved, reported rather than fabricated. A per-station HTTP 429/5xx is
-    retried (bounded, see `_fetch_text_with_retry`) before becoming one of
-    those missing inputs; any other HTTP or transport failure is missing on
-    the first attempt. When every attempted fetch failed and no station
-    loaded ASOS text, raises :class:`_TotalAsosFetchOutage` instead of
-    returning (``main`` turns that into a non-zero exit after writing the
-    report). ``sleep`` is a test seam (defaults to the real ``time.sleep``).
+    retried (bounded per station AND by a run-wide `retry_wait_budget_s`
+    shared across every station, see `_fetch_text_with_retry`/
+    `_RetryWaitBudget`) before becoming one of those missing inputs; any
+    other HTTP or transport failure is missing on the first attempt. When
+    every attempted fetch failed and no station loaded ASOS text, raises
+    :class:`_TotalAsosFetchOutage` instead of returning (``main`` turns
+    that into a non-zero exit after writing the report). ``sleep`` and
+    ``retry_wait_budget_s`` are test seams (default to the real
+    ``time.sleep`` and ``_TOTAL_RETRY_WAIT_BUDGET_S``).
     """
     config = CurrentRungHoldConfig(stations=tuple(stations))
     fee_coefficient = config.required_fee_coefficient
     stale_observation_bound_ns = config.stale_observation_minutes * 60_000_000_000
     registry = default_registry()
     specs_by_city = {spec.city: spec for spec in load_sites() if spec.city in stations}
+    #: ONE budget, shared across every station this run -- see
+    #: `_RetryWaitBudget`'s own docstring for why a fresh per-station budget
+    #: would defeat the whole-run cap.
+    retry_budget = _RetryWaitBudget(remaining_s=retry_wait_budget_s)
     #: L-38 (`cbd5fec`): each REGISTERED family's rows now live under their
     #: own `<scored_trials_dir>/<family_id>/` subdirectory -- pooled here
     #: across every family plus any legacy top-level rows (see
@@ -870,7 +914,7 @@ def run_exit_window_study(
             try:
                 station_text = _station_asos_text(
                     cache_dir=asos_cache_dir, spec=spec, obs_source=obs_source, client=client,
-                    sleep=sleep,
+                    sleep=sleep, budget=retry_budget,
                 )
             except (httpx.HTTPStatusError, httpx.TransportError) as exc:
                 failed_fetches += 1
