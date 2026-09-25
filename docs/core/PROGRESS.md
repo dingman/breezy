@@ -34,50 +34,49 @@ Everything else is build-side.
 
 ---
 
-## BACKLOG — SHORTEST PATH TO A TESTABLE, RISK-CONTROLLED LIVE STATE (opened 2026-09-12)
+## BACKLOG — verified open set (re-synced 2026-09-25 19:40Z against merges, evidence and host)
 
-**Binding constraints on EVERY item.** No item may: set `allow_short=True`; weaken
-`BacktestOrderGuard` or any safety, settlement, or contract test; touch live-trading
-enablement or the NO-SEND egress firewall; invent an operator-reserved value; or change
-PREREG v3 §3/§5/§9 semantics except through a ruling artefact under `docs/evidence/`.
-Every increment carries an L-1 null-hypothesis verdict citing installed Nautilus source.
-Each plan below is peer-reviewed (Rev 2 dispositions inside the plan). Execute in plan
-order; B = build, O = operator, S = strategy-lead ruling.
+**Binding on EVERY item.** Never set `allow_short=True`; never weaken `BacktestOrderGuard` or any
+safety, settlement, contract or NO-SEND firewall test (widen exact sets by one reviewed row, L-12);
+never touch live-trading enablement; never invent an operator-reserved value; PREREG semantics change
+only via a ruling under `docs/evidence/`. L-1 null-hypothesis verdict per increment. Durable processes
+via `systemd-run --user` (L-26); worktree commands need `PYTHONPATH=<wt>/src`. Full gate after EVERY
+merge. AUD plans: `docs/plans/backlog/AUDIT_2026-09-21/` (authoritative per item).
 
-| ID | Own | Sev | Item | Plan | Size |
-|---|---|---|---|---|---|
-| ADM-1 | B | LOW | Σq admission counts FILLED legs only (concurrent-arm race) | diagnosis §4 | S |
-| HUNT-1 | B/S | **CRIT** | **Continuous hunting is REQUIRED and NOT met.** The `[12:00,17:00)` LST gate is a consequence of `P_HOLD_LOWER` covering `hour_lst` ∈ {12..16} only — removing it yields `None`, not hunting. Supersedes WIN-1 (wrongly deleted 09-20) | `CONTINUOUS_HUNTING_GAP_2026-09-20.md` | L |
-| EXIT-1 | B/O | CRIT | **Exit seam BUILT, UNARMED** (c96c7f4; ruling 09-16). Decider→native IOC LIMIT SELL→exec exit seam; `pm_us_crh_exit_v4` DRAFT, no `exit_rule` → live family never sells. Study N=5: R-DEAD 0/5 fillable, R-THREAT 1/5 → gates FAIL. Before arming: PREREG v4 registration, 1-lot positive control, nightly study (15:20Z). `POSITION_EXIT_EXECUTION_2026-09-16.md` | plan §4 | L |
-| MP-B | B/O | HIGH | Increment B: depth-capped, cent-safe, log-redacted sizing from the per-position cap (S2) + qty through scorer/store (S4b). **BLOCKED on R-11**: at mixed qty∈{1,2,3} the pre-solved LD-OBF boundary over-crosses (0.059 vs α 0.025; strict xfail `test_multi_position_validation_2026_09_14.py`) — re-validate at the real qty distribution, re-solve only then. Operator rulings 09-14 (per-order cap; daily budget = single-day stop) recorded in memory + day-stop plan | plan §3 Increment B | M |
-| SP-3 | B | A/C DONE 09-13; B1/B2 open | Venue-id map live (proven on CFJ485874TMM); `generate_order_status_reports`/`generate_fill_reports` still return `[]` pending R-1/R-2; `_has_durable_fill_record` still a stub | `RECONCILIATION_NATIVE_REPORTS_2026-09-12.md` | S |
-| SP-4 | B | subclass DONE 09-13; replay **NOT RUN** | v3 backtest subclass, `--strategy continuous_rung_hold`, depth-basis gate landed; the one capped SFO 2026-09-01 replay has no artefact — run it (command in plan :80-91) in a quiet window, record filled trials or BLOCKED reason | `V3_BACKTEST_REPLAY_SUBCLASS_2026-09-12.md` | S |
-| SP-5 | B/S | CRIT | Coverage / KILL clock: read-only diagnostic (blips vs outages vs never-resolved rows from dead recorders); dry-run of tonight's afternoon under the shard-local recorder; ruling package on §9 tolerance; truncation as a named reason | `COVERAGE_KILL_CLOCK_2026-09-12.md` | S+ruling |
-| SP-7 | B | LOW | Free hygiene: permit-log leak scan (1.98%/run flake; `test_app_trade_main_permit_logging.py:115`), five doc truth insertions, three docstrings, `PositionReportingLag` disposition; no bulk reformat | `HYGIENE_FREE_FIXES_2026-09-12.md` | S |
-
-**Execution order (from the 2026-09-12 peer reviews, Rev 1 dispositions land as Rev 2 in each plan):**
-SP-1 I1/I2/I3 (window per R-B: `[17:00Z, 01:00Z)`; drop the 4G→2G ingest change; I5 needs a v3 SCORER pass and a v3-scoped count, not only a tally unit) → SP-2 → SP-3 (after SP-2; both edit
-`_submit_order`; SP-3's venue-id call must sit right after `classify_create_order_outcome`, before
-the kind dispatch, and widens the firewall callee allowlist explicitly) → SP-4 ‖ SP-6 ‖ SP-7 (the
-permit-log leak-scan fix is owned by SP-6 A3; SP-7 H-1 defers to it) → SP-1 I5 after R-4 → SP-5
-diagnostic is inert until the v3 tally receives the count (R-4).
-
-**Rulings queue (strategy lead, artefacts under `docs/evidence/`; block only the increment named):**
-
-| R | Question | Blocks | Source |
+| ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| R-1 | Fee unit on the reconciled `FillReport`: O1 recorded / O4 hybrid + `feeSource` admissible without amendment (reviewer: recommend O4); O2 bare modelled fee needs an amendment; O3 raw-else-refuse likely yields no report on today's record | SP-3 B1 | P3 §8 |
-| R-2 | May a reconciled `OrderFilled` reach `on_order_filled` (`external_order_claims`)? | SP-3 B2 | P3 §8 |
-| R-3 | §9 coverage tolerance: (i) keep any-overlap, (ii) duration X≈60 s, (iii) span-with-max-gap, (iv) never-resolved rows from dead processes; does a safety-stop calibration trigger v1 §7 re-registration? | SP-5 rule change | P5 §8 |
-| R-5 | Is PREREG v1's 60/150 tally still evidence (may `breezy-live-tally` stop)? | SP-1 I1 | P1 §8 |
-| R-12 | The permit's session ORDER-COUNT ceiling (`floor(daily budget / per-position cap)`, min 1; `safety.py _derived_session_order_count`) can exhaust BEFORE the dollar budget under the 09-14 per-order ruling (many orders below the cap). The day stop marks only the two dollar ceilings; the count ceiling still refuses on its own. Operator: keep it (derive from daily / venue lot minimum) or drop it so the dollar budget is the only day stop | operator | day-stop plan D3 |
-| R-11 | LD-OBF boundary validity at qty>1: H0 crossing 0.059 at mixed qty vs α 0.025 (qty≡1: 0.012). Re-validate at the real Increment-B qty distribution; re-solve the artefact only if it still fails | MP-B | validation slice |
-| R-7 | `PositionReportingLag`: keep and wire on the create path later (recommended), never on the resolver path (`ts_event` is poll cadence) | SP-7 H-8 | P7 §8 |
+| ING-2 | **CRIT** | Quote-tape ingest fails EVERY run since 09-24 20:00Z (20×, unit failed now): `MemoryHigh=4G` < backlog working set → thrash + 30-min kill (L-49); the node resolves instruments from the converted catalog, so the next 16:50Z launch finds 0. Now: one-off drain (`systemd-run`, MemoryHigh 10G, pause+restore both ingest timers) before 16:50Z. Durable: bounded per-run memory / instruments-before-depths (`quote_tape_ingest_cli.py`) + unit sizing | L-49; 09-24 drain |
+| AUD-09b | HIGH | Merge `backlog/aud-09b-b26-memory-2026-09-25` + `backlog/aud-09b-replay-bound-2026-09-25` (worktrees exist); B26 ruling (cgroup peak 11 GiB FAIL vs RSS 2.49 GB PASS); `enable breezy-replay-daily.timer` (failed "unit to trigger vanished"); ratchet B5 at 2× | AUD-09 amendment §7, §10.9 |
+| AUD-07 | HIGH | M1c CAL-a/b/c (transient `breezy-aud07-m1c-seg-0926a` 09-26 02:10Z) → census/eps_pin/cal_check → 20k sweep (49 cells) → 80k → `--final` → `RULING_aud07_mixed_side_ldobf_<date>.md` (AC7); then base §7 steps 7, 7b, 8; branch-I tests 10–16 only if M2 = I | AUD-07 Exec-Rev2 §4-6 |
+| AUD-18 | HIGH | Link+enable `breezy-hypothesis-triage.{service,timer}` (absent on host); §7 step 9 first watched run; ledger has no stratum/draw binding → every record MISSING_STRATUM_BINDING (`hypothesis_ledger.py:234`, triage `:484`) — new schema_version + binding | AUD-18; ae56ab8 |
+| AUD-02 | MED | WP-D1 `discovery_set_equality.py` + note; A0 needs ≥5 consecutive fee-evidence days (1 so far); coordinator block / Amendment C pointer (DoD 10) | completion plan §2, §5 |
+| AUD-05 | MED | §7 step 8: observe three consecutive 17:20Z v4 tally runs (1 so far) | AUD-05 §7 |
+| AUD-10b | MED | Evidence doc `PROMOTION_PROPOSAL_MECHANISM_<date>.md` (C1–C20); unattended runs need the replay timer | AUD-10 §8 |
+| TALLY-V2 | MED | `breezy-family-tally@pm_us_crh_v2` fails (structural-pin-guard `NO_NODE`, 09-25 17:20Z): fix or retire per the tally-scope ruling | host |
+| HUNT-1 | CRIT/S | Strategy-lead ruling: close as moot (daf81a1: no hour clears zero) or name the all-hours build. NOT covered by AUD-01 (its §5/§12 exclude it) | `CONTINUOUS_HUNTING_GAP_2026-09-20.md` |
+| SP-5/R-3 | S | Coverage diagnostic (blips vs outages vs dead-recorder rows) + §9 tolerance ruling (options i–iv, v1 §7 re-registration); unowned by any AUD item | `COVERAGE_KILL_CLOCK_2026-09-12.md` |
+| R-7 | S | `PositionReportingLag`: keep+wire on the create path or delete (`position_reporting_lag.py:8`, zero producers) | P7 §8 |
+| SP-3r | LOW | `_has_durable_fill_record` still a stub (`exec/client.py:1672`); order-1 (09-05) no-`OrderSubmitted` escalation | AUD-13 plan :146 |
+| SP-7r | LOW | Doc truths H-2..H-6 (`deploy/systemd/README.md:3` "PREPARED, NOT ACTIVATED", `native_reuse_audit` :118/:131, GO_LIVE_BLOCKERS → gl1_gl4) | `HYGIENE_FREE_FIXES_2026-09-12.md` |
+| ADM-1 | LOW | Σq admission skips IN_FLIGHT legs (`trial_day_latch.py:1546`): count them, or RED-prove the intent latch serializes | diagnosis §4 |
+| FU-1 | MED | Position monitor `KeyError` on `^no` ids (`monitor_wiring.py:113,116`; `_facts` is YES-only) — fall back to the YES sibling (as `continuous_strategy.py:1142`) | 09-22 MDW fill log |
+| FU-2 | MED | NO-side `no_take_shadow`/take lines omit the observation reading behind `p_miss_lower` (`continuous_strategy.py:2605`) — log value + ts | 09-22 audit |
+| FU-3 | MED | ROI: attribute $40.00 + $0.99 UNEXPLAINED_CAPITAL_FLOW (09-13/09-14; `PRIVATE_portfolio_roi_2026-09-25.md:38`); add `_run`-level test for `DuplicateScoredTrialEconomicsMismatchError` | AUD-04 |
+| FU-4 | LOW | Exit-window study: catch `OSError` on cached-file read per station; add N/M-stations-loaded line | 09-24 review |
+| FU-5 | LOW | Resolver: overlapping connect passes (`client.py:1605`/`:1632`) log a false "could not be loaded" — serialize or say "load in flight" | node log 09-24 20:15Z |
+| FU-6 | LOW | `halt_enforced: yes/no` digest field from the halt store | `AUD-03-FOLLOWUP-a1-digest-line.md` |
+| AUD-11 | BLOCKED | §7 step 5 captured-tape proof: backtest OOM at 6G on base and branch — rerun with a higher cap in a quiet window | `POINT_IN_TIME_CLASSIFICATION_2026-09-21.md:134` |
+| AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family (both step-8 horizons UNDERPOWERED) | AUD-06b |
 
-**KILL clock (truth as of 09-13 14:15Z):** counter 0/15 for 09-05..09-13. Shard-local gap
-accounting works (09-12 in-window overlaps = 0 on all four stations); the day is uncovered because
-ingest stranded its Depth10 (ING-1). Zero-fill / retired-AMBIGUOUS takes are not trials; resolver
-fills are residual. **Live n (09-24):** 10 orders, 9 fills (durable exec fill store, exact match against real-event log lines; order 1, 09-05, unmatched — AUD-13 escalation), admissible 0.
+**Order:** ING-2 (before 16:50Z) → AUD-09b → TALLY-V2 → AUD-18 deploy → AUD-07 (on its M1c clock) →
+AUD-02/05/10b → FU-1..FU-3 → rulings HUNT-1, SP-5/R-3, R-7 (coordinator + peer loop) → LOW items.
+
+**KILL clock / live n (09-25):** champion (v4) counter 10 covered-listed station-days (09-20..09-25);
+v4 tally n=3 (1 win), under one completed look. Exec store 9 fills (newest 09-22). A1 halt SET 09-24.
+
+**Closed since 09-21 (commit = record):** AUD-01a/b, 02b, 03, 04, 06a (R-11 INDETERMINATE), 08a/b,
+09a, 10a, 12a/b, 13a-d (R-1, R-2), 14a/b, 15, 16, 17, 19a-c; R-5, R-12 rulings; WP-R1 fix e83fc5c;
+live-store pins 7a39577; stuck intent CP05MNWMAWP6 retired 09-24. EXIT-1→AUD-07, MP-B→AUD-06b, SP-4→AUD-09.
 
 **Closed 2026-09-20:** forecast-edge hunt TERMINAL (`RULING_forecast_edge_programme_closes_2026-09-20.md`); `pm_us_crh_rest_v5` folded CLOSED_NOT_REGISTERED; alert delivery shipped (`f97c26f`). Next phase: `docs/plans/POST_FORECAST_PHASE_2026-09-20.md`.
 
@@ -93,34 +92,7 @@ ruff 24 incl. `persistence/family_manifest.py:42`), CF-13, CF-14b, PF-1, BL-10, 
 
 ## Pointers
 
-Audit backlog 09-21 (AUD-01..19; 19 READY, AUD-06b not; 09-24 merged: AUD-03, 05, 08a, 10a, 13d (13d amendment endorsed)): `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
+Audit backlog 09-21 (AUD-01..19; open/partial items listed in BACKLOG above): `docs/plans/backlog/AUDIT_2026-09-21/README.md` · Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
 (binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
-
-## 2026-09-20 — WP-R1 calibration defect found in production (open)
-
-`ZERO_CANDIDATES_EVALUATED_HALT` fired for MDW at 18:58Z on the first day the
-detector ran live, while MDW demonstrably evaluated at 18:48Z and 19:03Z
-(`IN_WINDOW_NOT_EXECUTABLE_WAIT`, same station, same window).
-
-**Cause.** A pre-decision WAIT is not a "candidate evaluated". When every tick
-in an observation window fails executability — an ordinary illiquid stretch —
-the window closes with a candidate count of zero and the detector reads that as
-a structural block.
-
-**Why it matters.** This is exactly the false page WP-R1 was designed to avoid:
-"the cost of a false page is an operator who stops reading alerts." The
-all-refused arm is correctly guarded (homogeneous reason ∈
-`STRUCTURAL_HALT_REASONS`); the zero-evaluation arm is not.
-
-**Fix (not yet applied).** ZERO-EVALUATION must distinguish *no ticks observed*
-(genuine: no eligible instrument, discovery collapse, subscription starvation)
-from *ticks observed but none reached a decision* (ordinary market condition).
-Gate it on observed tick count, not candidate count. Add a RED test built from
-this exact MDW 18:58Z shape.
-
-**Not a trading blocker** — observability only; the node was hunting normally
-throughout. Verified same-window: WS subscriptions healthy (30 instruments
-across LAX/MDW/MIA/SFO/NYC), no cap message (the apparent one was a GET URL
-containing `limit` as a query parameter).
