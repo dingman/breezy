@@ -1607,7 +1607,12 @@ def _run_main_with_stubbed_capture(
         captured["required_fee_coefficient"] = kwargs.get("required_fee_coefficient")
         captured["family_id"] = kwargs.get("family_id")
         captured["trial_id_prefix"] = kwargs.get("trial_id_prefix")
-        return driver.PrecisionArmResult(trials=())
+        # Simulates a CurrentRungHoldConfig that faithfully carried whatever
+        # was passed in -- the dedicated mismatch test below overrides this
+        # spy directly to prove the OTHER (non-echoing) branch.
+        return driver.PrecisionArmResult(
+            trials=(), engine_required_fee_coefficient=kwargs.get("required_fee_coefficient"),
+        )
 
     monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
     monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
@@ -1997,6 +2002,128 @@ def test_the_sidecar_is_written_atomically(
     assert not (out_dir / "family_params.json.tmp").exists()
     payload = json.loads((out_dir / "family_params.json").read_text())
     assert isinstance(payload, dict)
+
+
+# ---------------------------------------------------------------------------
+# AUD-19b fix review (silent-failure-hunter): params_match must compare the
+# engine's own readback, never echo the manifest's value as both sides.
+# ---------------------------------------------------------------------------
+def test_the_engine_readback_matches_a_correctly_threaded_fee_coefficient(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """MEDIUM fix, non-stubbed: a REAL `run_one_precision_arm` call (real
+    tape instrument, real engine, real `CurrentRungHoldConfig`) with a
+    consistent family-scoped bundle reports the value the CONSTRUCTED config
+    actually carried on `PrecisionArmResult.engine_required_fee_coefficient`
+    -- never merely the caller's own input echoed back."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+        required_fee_coefficient=Decimal("0.0695"),
+        family_id="pm_us_crh_v4",
+        trial_id_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert result.engine_required_fee_coefficient == Decimal("0.0695")
+
+
+def test_params_match_is_computed_from_the_engines_actual_readback_not_echoed(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM fix: a driver whose engine readback DISAGREES with the
+    manifest's registered value must yield `params_match=False` and report
+    the READBACK (not the manifest's value) as
+    `engine_required_fee_coefficient` -- proving the sidecar's comparison is
+    genuine, not tautological."""
+    manifest_path = _write_family_manifest(
+        tmp_path, family_id="pm_us_crh_v4", taker_fee_coefficient="0.0695",
+    )
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+
+    def _spy_run_one_precision_arm(**kwargs: object) -> object:
+        return driver.PrecisionArmResult(
+            trials=(), engine_required_fee_coefficient=Decimal("0.9999"),
+        )
+
+    monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+
+    rc = driver.main(
+        [*_minimal_argv(tmp_path, strategy=None), "--family-manifest", str(manifest_path)],
+    )
+    assert rc == 0
+    sidecar = json.loads((tmp_path / "out" / "family_params.json").read_text())
+    assert sidecar["params_match"] is False
+    assert sidecar["engine_required_fee_coefficient"] == "0.9999"
+    assert sidecar["manifest_taker_fee_coefficient"] == "0.0695"
+
+
+@pytest.mark.parametrize(
+    ("required_fee_coefficient", "family_id", "trial_id_prefix"),
+    [
+        (Decimal("0.0695"), UNSCOPED_FAMILY_ID, None),  # fee threaded but family unscoped
+        (None, "pm_us_crh_v4", "continuous_rung_hold/trial/"),  # scoped, no fee
+        (Decimal("0.0695"), "pm_us_crh_v4", None),  # scoped + fee, no trial_id_prefix
+    ],
+)
+def test_a_piecemeal_family_parameter_bundle_is_refused(
+    driver: ModuleType,
+    tmp_path: Path,
+    required_fee_coefficient: Decimal | None,
+    family_id: str,
+    trial_id_prefix: str | None,
+) -> None:
+    """LOW fix: `required_fee_coefficient`/`family_id`/`trial_id_prefix` are
+    all-or-nothing -- a caller cannot produce a fee-scoped-but-unscoped (or
+    otherwise partial) trial piecemeal."""
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    with pytest.raises(driver.PiecemealFamilyParametersError):
+        driver.run_one_precision_arm(
+            tape_instruments=[tape_instrument],
+            observation_rows=_OBSERVATION_ROWS,
+            station=STATION,
+            lag_minutes=1,
+            precision_mode="nws_integer_c",
+            latch_store_path=tmp_path / "state.db",
+            settlement_by_key={},
+            required_fee_coefficient=required_fee_coefficient,
+            family_id=family_id,
+            trial_id_prefix=trial_id_prefix,
+        )
+
+
+def test_whole_tape_paper_replays_default_call_is_unaffected_by_the_piecemeal_guard(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """LOW fix: the fully-defaulted bundle (no fee, `UNSCOPED_FAMILY_ID`, no
+    `trial_id_prefix` -- exactly what `whole_tape_paper_replay.py`'s
+    unmodified call site passes) must remain byte-identical, never refused."""
+    result = driver.run_one_precision_arm(
+        tape_instruments=[],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=30,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key={},
+    )
+    assert result.trials == ()
 
 
 def test_the_continuous_arm_injects_flat_position_evidence_for_every_candidate_slug(

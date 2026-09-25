@@ -126,6 +126,7 @@ __all__ = [
     "FamilyManifestArgumentError",
     "FamilyParameters",
     "NoDecisionWindowCoverageError",
+    "PiecemealFamilyParametersError",
     "UnlistedStationDayError",
     "VenueOutsideLiveDirError",
     "assert_decision_window_has_coverage",
@@ -386,6 +387,38 @@ class FamilyManifestArgumentError(ValueError):
     :data:`EXIT_FAMILY_MANIFEST_REFUSED` -- neither side of a conflict is
     ever silently preferred (the exact failure mode of memory
     `bss-headline-is-the-wrong-family`)."""
+
+
+class PiecemealFamilyParametersError(ValueError):
+    """AUD-19b LOW fix (silent-failure-hunter review): `run_one_precision_arm`'s
+    `required_fee_coefficient`/`family_id`/`trial_id_prefix` are an
+    all-or-nothing bundle -- a caller supplies every one of them (a resolved
+    `FamilyParameters`) or none of them (the unscoped default), never some.
+
+    Refusing a partial bundle is what makes a fee-scoped-but-unscoped trial
+    (a fee coefficient threaded against a family manifest never validated
+    it against) structurally UNREACHABLE, rather than merely undocumented.
+    """
+
+
+def _assert_family_parameters_are_not_piecemeal(
+    *,
+    required_fee_coefficient: Decimal | None,
+    family_id: str,
+    trial_id_prefix: str | None,
+) -> None:
+    bundle = (
+        required_fee_coefficient is not None,
+        family_id != UNSCOPED_FAMILY_ID,
+        trial_id_prefix is not None,
+    )
+    if any(bundle) and not all(bundle):
+        raise PiecemealFamilyParametersError(
+            "required_fee_coefficient/family_id/trial_id_prefix must be supplied "
+            "together (a resolved FamilyParameters) or not at all -- got "
+            f"required_fee_coefficient={required_fee_coefficient!r}, "
+            f"family_id={family_id!r}, trial_id_prefix={trial_id_prefix!r}"
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -806,6 +839,16 @@ class PrecisionArmResult:
     strategy_refusals: Mapping[str, int] = field(default_factory=dict)
     strategy_diagnostics: Mapping[str, int] = field(default_factory=dict)
     strategy_position_events: Mapping[str, int] = field(default_factory=dict)
+    #: AUD-19b MEDIUM fix (silent-failure-hunter review): the
+    #: `required_fee_coefficient` this arm's `CurrentRungHoldConfig` ACTUALLY
+    #: carried -- a READBACK off the built config, never an echo of the
+    #: caller's own input. `main`'s `params_match` compares THIS value
+    #: against the manifest's registered `taker_fee_coefficient`, so a bug
+    #: that silently drops or mistransforms the kwarg on its way into
+    #: `CurrentRungHoldConfig` is caught rather than compared to itself.
+    #: `None` when no config was built this arm (the early-return
+    #: empty-market-data path) -- there is nothing to read back.
+    engine_required_fee_coefficient: Decimal | None = None
 
 
 class ReplayEvidenceUnboundError(RuntimeError):
@@ -1003,7 +1046,16 @@ def run_one_precision_arm(
     then silently keep only one arm's row. `install_position_monitor` is
     therefore called against `monitor_out_dir / precision_mode`, giving
     each arm its own `<mode>/monitor` + `<mode>/monitor_summaries` pair.
+
+    LOW fix (silent-failure-hunter review): `required_fee_coefficient`,
+    `family_id` and `trial_id_prefix` are refused as a PARTIAL bundle before
+    any other work runs -- see :func:`_assert_family_parameters_are_not_piecemeal`.
     """
+    _assert_family_parameters_are_not_piecemeal(
+        required_fee_coefficient=required_fee_coefficient,
+        family_id=family_id,
+        trial_id_prefix=trial_id_prefix,
+    )
     inputs = PaperReplayInputs(lag_minutes=lag_minutes, precision_mode=precision_mode)
     # `StationObservation.station` must carry the IEM ASOS/ICAO id
     # (`CurrentRungHoldStrategy.on_data` maps it back via `_STATION_BY_ICAO`,
@@ -1040,6 +1092,7 @@ def run_one_precision_arm(
             strategy_refusals={},
             strategy_diagnostics={},
             strategy_position_events={},
+            engine_required_fee_coefficient=None,
         )
     ts_values = [record.ts_init for record in market_data]
     capture_window_ns = (min(ts_values), max(ts_values))
@@ -1172,6 +1225,9 @@ def run_one_precision_arm(
         strategy_refusals=dict(strategy.refusals.counts),
         strategy_diagnostics=dict(strategy.diagnostics.counts),
         strategy_position_events=dict(strategy.position_events.counts),
+        # MEDIUM fix: read back off the CONSTRUCTED config, never echo the
+        # caller's own `required_fee_coefficient` argument.
+        engine_required_fee_coefficient=cfg.required_fee_coefficient,
     )
 
 
@@ -1394,6 +1450,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(close_source_label(tape_instruments))
 
     all_trials: list[FilledTrial] = []
+    # MEDIUM fix: the readback off whichever arm actually built a
+    # `CurrentRungHoldConfig` -- every arm shares one `tape_instruments`
+    # (market-data emptiness does not vary by precision_mode), so either all
+    # arms build one and agree, or none do; `None` means none did.
+    engine_fee_readback: Decimal | None = None
     now_ns = max(
         (record.ts_init for ti in tape_instruments for record in (*ti.quotes, *ti.depths)),
         default=0,
@@ -1427,6 +1488,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             trial_id_prefix=family_params.trial_id_prefix if family_params is not None else None,
         )
         all_trials.extend(result.trials)
+        if result.engine_required_fee_coefficient is not None:
+            engine_fee_readback = result.engine_required_fee_coefficient
         # (a) reporting gap: the strategy's own refusal counts, sorted for a
         # deterministic line -- never conflated with `scoring_refused` above.
         print(f"strategy refusals: {dict(sorted(result.strategy_refusals.items()))}")
@@ -1466,13 +1529,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     # params_match=False itself, exactly as its own spec already does (A2).
     if family_params is not None:
         run_argv_sha256 = argv_sha256(resolved_argv)
+        # MEDIUM fix (silent-failure-hunter review): compare the ENGINE'S
+        # OWN readback to the manifest's registered value -- never echo the
+        # manifest's value as both sides of the comparison. `engine_fee_
+        # readback is None` (no arm ever built a config -- every arm's
+        # market data was empty) is NOT a match: nothing was constructed to
+        # prove the parameterisation, so this reports the manifest's
+        # intended value with `params_match=False` rather than an unproven
+        # `True`.
+        if engine_fee_readback is not None:
+            engine_required_fee_coefficient = engine_fee_readback
+            params_match = engine_fee_readback == family_params.taker_fee_coefficient
+        else:
+            engine_required_fee_coefficient = family_params.taker_fee_coefficient
+            params_match = False
         sidecar_payload = {
             "family_id": family_params.family_id,
             "manifest_sha256": family_params.manifest_sha256,
             "manifest_taker_fee_coefficient": str(family_params.taker_fee_coefficient),
-            "engine_required_fee_coefficient": str(family_params.taker_fee_coefficient),
+            "engine_required_fee_coefficient": str(engine_required_fee_coefficient),
             "engine_params_source": "FAMILY_MANIFEST",
-            "params_match": True,
+            "params_match": params_match,
             "composition_kind": family_params.composition_kind,
             "strategy": strategy_name,
             "station": args.station,
