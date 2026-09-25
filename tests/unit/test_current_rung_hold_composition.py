@@ -54,7 +54,9 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_OK
 from breezy.strategy.current_rung_hold.composition import (
+    InstrumentStationMismatchError,
     NoTradableInstrumentsError,
+    OverlappingExternalOrderClaimsError,
     build_continuous_rung_hold_strategies,
     build_current_rung_hold_strategies,
     family_halt_submit_veto,
@@ -616,6 +618,84 @@ def test_continuous_strategies_claim_today_and_yesterday_on_both_legs_for_their_
     assert [str(iid) for iid in by_station["LAX"].config.instrument_ids] == [
         "tc-temp-laxhigh-2026-09-04-gte80lt81f.POLYMARKET_US"
     ], "claims never widen what the strategy trades"
+
+
+def test_overlapping_claims_across_built_strategies_raise_a_named_error_before_add_strategy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AUD-13c review HIGH: Nautilus raises ``InvalidConfiguration`` on a
+    double claim only inside ``Trader.add_strategy``
+    (``execution/engine.pyx:552-557``). The builder checks disjointness
+    first and names the instrument and BOTH strategies."""
+    from breezy.strategy.current_rung_hold import composition
+
+    _write(
+        tmp_path,
+        [
+            _binary("tc-temp-laxhigh-2026-09-04-gte80lt81f", info=_known(station="LAX", day=_DAY)),
+            _binary("tc-temp-mdwhigh-2026-09-04-gte90lt91f", info=_known(station="MDW", day=_DAY)),
+        ],
+    )
+    shared = InstrumentId(Symbol("tc-temp-laxhigh-2026-09-04-gte80lt81f"), _POLYMARKET_VENUE)
+    monkeypatch.setattr(composition, "_station_claims", lambda today, yesterday: (shared,))
+
+    with pytest.raises(OverlappingExternalOrderClaimsError) as raised:
+        build_continuous_rung_hold_strategies(
+            catalog_root=tmp_path,
+            today_by_station=_TODAY,
+            trial_day_latch_factory=_unused_latch_factory,
+            enable_position_monitor=False,
+        )
+
+    message = str(raised.value)
+    assert str(shared) in message
+    assert "ContinuousRungHoldStrategy-LAX" in message
+    assert "ContinuousRungHoldStrategy-MDW" in message
+    assert isinstance(raised.value, SettingsError)
+
+
+def test_an_empty_yesterday_warns_that_the_claim_covers_today_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _write(
+        tmp_path,
+        [_binary("tc-temp-laxhigh-2026-09-04-gte80lt81f", info=_known(station="LAX", day=_DAY))],
+    )
+
+    with caplog.at_level("WARNING"):
+        build_continuous_rung_hold_strategies(
+            catalog_root=tmp_path,
+            today_by_station=_TODAY,
+            trial_day_latch_factory=_unused_latch_factory,
+            enable_position_monitor=False,
+        )
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING" and "claim" in record.getMessage()
+    ]
+    assert len(warnings) == 1, warnings
+    assert "LAX" in warnings[0]
+    assert "2026-09-03" in warnings[0]
+    assert "today only" in warnings[0]
+
+
+def test_a_station_bucketing_mismatch_raises_a_named_error_not_an_assert(
+    tmp_path: Path,
+) -> None:
+    """The pairing guard is a real check, not an ``assert`` that ``-O``
+    strips: an id whose first-recorded definition names ANOTHER station
+    than the one it was bucketed under is refused by name."""
+    slug = "tc-temp-laxhigh-2026-09-04-gte80lt81f"
+    _write(tmp_path, [_binary(slug, info=_known(station="MDW", day=dt.date(2026, 9, 1)), ts=0)])
+    _write(tmp_path, [_binary(slug, info=_known(station="LAX", day=_DAY), ts=1)])
+
+    with pytest.raises(InstrumentStationMismatchError) as raised:
+        resolve_station_instrument_ids(tmp_path, _TODAY)
+
+    assert slug in str(raised.value)
+    assert not isinstance(raised.value, AssertionError)
 
 
 def test_the_v2_builder_claims_nothing(tmp_path: Path) -> None:

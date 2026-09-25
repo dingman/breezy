@@ -67,7 +67,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.persistence.family_manifest import FamilyManifest
 
 __all__ = [
+    "InstrumentStationMismatchError",
     "NoTradableInstrumentsError",
+    "OverlappingExternalOrderClaimsError",
     "build_continuous_rung_hold_strategies",
     "build_current_rung_hold_strategies",
     "family_halt_submit_veto",
@@ -164,6 +166,20 @@ class NoTradableInstrumentsError(SettingsError):
     A ``SettingsError`` subclass so the trading process exits 2 via the
     existing configuration-error path.
     """
+
+
+class OverlappingExternalOrderClaimsError(SettingsError):
+    """AUD-13c: two composed strategies claim the same instrument.
+
+    Checked BEFORE ``Trader.add_strategy``, where Nautilus would otherwise
+    raise ``InvalidConfiguration`` mid-assembly (``execution/engine.pyx:552-557``).
+    A ``SettingsError`` so the process exits 2 via the configuration path.
+    """
+
+
+class InstrumentStationMismatchError(RuntimeError):
+    """An id bucketed under one station re-parses to another -- the station
+    pairing guard in :func:`resolve_station_instrument_ids`."""
 
 
 def strategy_component_id(station: str) -> str:
@@ -376,10 +392,11 @@ def _bucket_station_instrument_ids(
         # subscribe one station's strategy to another station's market.
         for instrument_id in ids:
             reparsed_station = station_by_id.get(instrument_id)
-            assert reparsed_station == station, (
-                f"resolve_station_instrument_ids: {instrument_id} bucketed under "
-                f"{station!r} re-parses to {reparsed_station!r}"
-            )
+            if reparsed_station != station:
+                raise InstrumentStationMismatchError(
+                    f"resolve_station_instrument_ids: {instrument_id} bucketed under "
+                    f"{station!r} re-parses to {reparsed_station!r}"
+                )
     return resolved
 
 
@@ -418,6 +435,20 @@ def _station_claims(
         claims.setdefault(instrument_id, None)
         claims.setdefault(sibling_instrument_id(instrument_id), None)
     return tuple(claims)
+
+
+def _assert_disjoint_claims(strategies: Sequence[ContinuousRungHoldStrategy]) -> None:
+    """Refuse two composed strategies claiming one instrument, BEFORE
+    ``Trader.add_strategy`` -- naming the instrument and both strategies."""
+    owner: dict[InstrumentId, str] = {}
+    for strategy in strategies:
+        for instrument_id in strategy.external_order_claims:
+            first = owner.setdefault(instrument_id, str(strategy.id))
+            if first != str(strategy.id):
+                raise OverlappingExternalOrderClaimsError(
+                    f"external_order_claims: {instrument_id} is claimed by both "
+                    f"{first} and {strategy.id}; refusing to compose"
+                )
 
 
 def _station_config(
@@ -619,6 +650,13 @@ def build_continuous_rung_hold_strategies(
                 today_by_station[station].isoformat(),
             )
             continue
+        if not resolved_yesterday[station]:
+            logger.warning(
+                "continuous_rung_hold: %s resolved 0 instruments for yesterday %s; "
+                "external order claim covers today only",
+                station,
+                (today_by_station[station] - dt.timedelta(days=1)).isoformat(),
+            )
         config = _station_config(
             instrument_ids=instrument_ids,
             station=station,
@@ -642,6 +680,7 @@ def build_continuous_rung_hold_strategies(
                 strategy, monitor_root=monitor_root, exit_manifest=exit_manifest,
             )
         strategies.append(strategy)
+    _assert_disjoint_claims(strategies)
     return tuple(strategies)
 
 
