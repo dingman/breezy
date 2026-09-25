@@ -299,6 +299,26 @@ class FamilyTallyV2:
     pooled_side_mix: str = ""
     #: One label per rendered `(*station_strata, *ask_band_strata)` element.
     strata_side_mix: tuple[str, ...] = ()
+    #: AUD-07 amendment Stage M1b DoD (iv): count of admitted station-days
+    #: (grouped exactly as `_combined_draws_for_looks` groups them) whose
+    #: constituent legs are not all one side -- the population L-40's
+    #: amendment (2026-09-25) says the same-side qty=1 ceiling
+    #: (`Var_H0 <= 1/4`) does NOT cover (`Var_H0` up to 1.0 on a mixed day).
+    #: Reporting only: never read by `run_sequential_looks` or any verdict.
+    mixed_day_count: int = 0
+    #: AUD-07 amendment Stage M1b DoD (iv): `True` exactly when the FINAL
+    #: look terminated because the information ceiling was reached
+    #: (`state.information >= artefact.i_max`) while `n_max` draws had NOT
+    #: yet been used (`look_n < n_max`) -- the circumstance under which a
+    #: mixed-side day's up-to-4x variance is most likely to have driven an
+    #: early stop against a boundary sized for the same-side ceiling.
+    #: Mirrors `LookRecord.n_max_reached_below_i_max`'s own "reason stays
+    #: `TruncationReason.I_MAX` either way" convention (B7): a report-only
+    #: fact, derived here rather than added to `LookRecord`/
+    #: `run_sequential_looks` so the M1b characterisation golden
+    #: (`tests/unit/test_family_tally_v2_look_loop_golden.py`) stays
+    #: byte-unchanged by this later commit.
+    i_max_terminal_below_n_max: bool = False
 
 
 def _assert_held_matches_pnl_sign(rows: Sequence[ScoredTrial]) -> None:
@@ -495,6 +515,23 @@ def _combined_draws_for_looks(
                 f"refusing to tally station-day {key!r}: {exc} (malformed_input)"
             ) from exc
     return tuple(draws)
+
+
+def _mixed_side_station_day_count(rows: Sequence[ScoredTrial]) -> int:
+    """AUD-07 amendment Stage M1b DoD (iv): count admitted station-days
+    (grouped by `(station, climate_day)`, the SAME grouping
+    `_combined_draws_for_looks` folds into one `CombinedDraw`) whose
+    constituent legs are not all one side.
+
+    This is the population L-40's 2026-09-25 amendment says the same-side
+    qty=1 ceiling (`Var_H0 <= 1/4`) does not cover -- a mixed day's
+    `Var_H0 = S - (q_y-q_n)^2` can reach 1.0. Reporting only: never read by
+    `run_sequential_looks`, `combine_station_day`, or any verdict.
+    """
+    sides_by_day: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in rows:
+        sides_by_day[(row.station, row.climate_day)].add(_stratum_row(row).side)
+    return sum(1 for sides in sides_by_day.values() if len(sides) > 1)
 
 
 def _station_strata(rows: Sequence[ScoredTrial]) -> tuple[StratumV2, ...]:
@@ -878,6 +915,23 @@ def build_family_tally_v2(
     )
     bca_line = _roi_bound_line_v2(roi_rows) if decided else None
 
+    mixed_day_count = _mixed_side_station_day_count(non_excluded)
+    last_look = looks[-1] if looks else None
+    # AUD-07 amendment Stage M1b DoD (iv): the SAME `reached_i_max`/
+    # `reached_n_max` predicates `run_sequential_looks` computes internally
+    # (`state.information >= artefact.i_max`, `look_n >= artefact.spending
+    # .n_max`), recomputed here from the returned `LookRecord` rather than
+    # threaded out of that function, so the M1b extraction's own golden
+    # (`tests/unit/test_family_tally_v2_look_loop_golden.py`) stays
+    # byte-unchanged by this later commit.
+    i_max_terminal_below_n_max = (
+        last_look is not None
+        and last_look.terminal
+        and last_look.reason is TruncationReason.I_MAX
+        and last_look.state.information >= artefact.i_max
+        and last_look.look_n < artefact.spending.n_max
+    )
+
     return FamilyTallyV2(
         family_id=manifest.family_id,
         manifest_sha256=manifest.manifest_sha256,
@@ -898,6 +952,8 @@ def build_family_tally_v2(
         bca_line=bca_line,
         structural_dead=structural,
         store_empty_no_sidecar=store_empty_no_sidecar,
+        mixed_day_count=mixed_day_count,
+        i_max_terminal_below_n_max=i_max_terminal_below_n_max,
     )
 
 
@@ -944,6 +1000,34 @@ _SIDE_MIX_FOOTNOTE = (
     "E[held_i] = BE_i on both sides (see the family manifest and PREREG v3 "
     "amendment NO_SIDE 2026-09-14 §3)."
 )
+
+
+def _mixed_side_disclosure_line(tally: FamilyTallyV2) -> str:
+    """AUD-07 amendment Stage M1b DoD (iv) (plan §4 M1b bullet 4 / §5 test
+    9): the L-40-amended mixed-side validity caveat, rendered ONLY when the
+    admitted population carries at least one mixed-side station-day
+    (`tally.mixed_day_count > 0`) -- the same-side qty=1 ceiling this
+    family's boundary artefact is sized for does not apply to those days,
+    and this family's live LD-OBF boundary has not been re-validated
+    against the mixed-side look loop pending the M2 ruling.
+
+    Both facts plan §5 test 9 names are always reported together:
+    `mixed_day_count` and `i_max_terminal_below_n_max` -- the latter flags
+    the circumstance (an early stop via the information ceiling, short of
+    `n_max`) under which a mixed day's up-to-4x variance is most likely to
+    have driven the verdict against an under-sized boundary.
+    """
+    return (
+        f"mixed-side disclosure (AUD-07 M1a, L-40 amended 2026-09-25): "
+        f"mixed_day_count={tally.mixed_day_count}; "
+        f"i_max_terminal_below_n_max={tally.i_max_terminal_below_n_max}; "
+        "the qty=1 variance ceiling Var_H0 <= 1/4 holds for SAME-SIDE "
+        "station-days only -- a mixed YES+NO station-day's "
+        "Var_H0 = S - (q_y-q_n)^2 can reach 1.0. LD-OBF boundary validity on "
+        "mixed-side station-days is UNCONFIRMED pending the M2 ruling "
+        "(docs/plans/backlog/AUDIT_2026-09-21/AUD-07-AMENDMENT-2026-09-25.md, "
+        "docs/core/LESSONS.md L-40)."
+    )
 
 
 def _fmt_stratum_row(stratum: StratumV2, *, side_mix: str = "") -> str:
@@ -1273,6 +1357,9 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     if tally.pooled_side_mix or any(tally.strata_side_mix):
         add(_SIDE_MIX_FOOTNOTE)
     add("")
+    if tally.mixed_day_count:
+        add(_mixed_side_disclosure_line(tally))
+        add("")
 
     is_shadow = tally.status != "REGISTERED"
     if is_shadow:
