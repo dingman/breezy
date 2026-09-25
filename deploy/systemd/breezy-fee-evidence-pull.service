@@ -38,14 +38,21 @@ MemoryMax=512M
 Slice=breezy-studies.slice
 UMask=0077
 
-# The ONLY EnvironmentFile=: the dedicated, single-key alerts.env (mode
-# 0600, BREEZY_ALERT_WEBHOOK_URL only) -- same discipline as
+# Two EnvironmentFile= lines, both non-credential. breezy.env (mode 0600)
+# holds only non-credential operator settings -- here, BREEZY_USER_AGENT,
+# the operator's own configured contact string, substituted into ExecStart
+# below rather than hardcoded, so the unit carries no personal contact
+# literal in version control. It has NO `-` prefix: a missing file fails
+# the unit loudly instead of silently substituting an empty user agent (the
+# script itself also refuses an empty/whitespace-only --user-agent -- see
+# fee_drift_evidence_pull.py's _parse_args). alerts.env (mode 0600,
+# BREEZY_ALERT_WEBHOOK_URL only) keeps its `-` prefix -- same discipline as
 # breezy-decision-funnel-digest.service and breezy-portfolio-roi.service.
 # Never breezy-trade.env / polymarket.env / operator.env: this unit holds no
-# venue credential and no operator-reserved value. The `-` prefix keeps the
-# unit startable when the file is absent (falls back to a log-only sink).
+# venue credential and no operator-reserved value.
+EnvironmentFile=%h/.config/breezy/breezy.env
 EnvironmentFile=-%h/.config/breezy/alerts.env
-ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/venue/fee_drift_evidence_pull.py --user-agent "breezy-fee-drift-evidence-pull/1 (contact jon@gopoint.com)"
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/venue/fee_drift_evidence_pull.py --user-agent "${BREEZY_USER_AGENT}"
 
 # One list page plus a handful of per-slug GETs, natively paced under the
 # shared instrument/discovery quotas (6/min each) -- generous headroom over

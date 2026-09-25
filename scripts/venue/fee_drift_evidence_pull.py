@@ -608,7 +608,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         required=True,
         help="A specific, contactable User-Agent -- never a generic placeholder",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # The systemd unit substitutes this value from ${BREEZY_USER_AGENT} via
+    # EnvironmentFile= (deploy/systemd/breezy-fee-evidence-pull.service): an
+    # unset variable reaches argparse as an EMPTY string, not a missing
+    # argument, so `required=True` alone never catches it. Refuse loudly
+    # rather than sending the venue a blank or whitespace-only contact
+    # header.
+    if not args.user_agent.strip():
+        parser.error("--user-agent must be a specific, contactable value -- never empty/blank")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
