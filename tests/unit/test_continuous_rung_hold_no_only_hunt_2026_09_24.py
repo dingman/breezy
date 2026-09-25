@@ -51,6 +51,7 @@ from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     _DIAG_DAY_BUDGET_EXHAUSTED,
     _DIAG_FAMILY_HALT,
+    _DIAG_NO_ONLY_HUNT_ERROR,
     _DIAG_OPEN_INTENT_WAIT,
     _DIAG_REARM_WAIT,
     _OUTSIDE_DECISION_WINDOW,
@@ -61,6 +62,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     TrialDayRecord,
+    TrialDayRecordCorrupt,
     open_trial_day_latch,
 )
 from tests.unit.test_continuous_rung_hold_strategy import (
@@ -1098,3 +1100,50 @@ def test_cache_eviction_or_miss_reconsults_the_durable_store_never_assumes_not_f
     assert calls == []
     assert strategy.offer_tape.records() == ()
     assert cache_key in strategy._yes_fill_blocks_no
+
+
+def test_sibling_check_fault_is_contained_and_does_not_cache(
+    store_path: Path, interior_instrument: BinaryOption, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM (coordinator review of 10d46cf): a raising
+    `refuse_if_sibling_leg_traded` -- e.g. a corrupt durable sibling record
+    -- inside `_hunt_no_only_after_yes_consumed`'s own gate must be
+    CONTAINED exactly like `_hunt_no_only`'s own store dependency: no NO
+    evaluation, no cache write (fail closed -- a later, healthy tick must
+    still re-derive the true answer), counted every time (a persistent
+    fault is never silently invisible), and logged at most once per
+    station-day."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    _consume_yes(strategy, reason="taken")
+    calls = _spy_no_side_shadow(strategy)
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise TrialDayRecordCorrupt()
+
+    monkeypatch.setattr(continuous_strategy_module, "refuse_if_sibling_leg_traded", _raise)
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.count(_DIAG_NO_ONLY_HUNT_ERROR) == 1
+    station_day = (STATION, CLIMATE_DAY.isoformat())
+    cache_key = (station_day, str(INTERIOR_ID))
+    assert cache_key not in strategy._yes_fill_blocks_no
+
+    # A second tick in the same station-day: the fault is counted again
+    # (persistent faults stay visible) but the ERROR log's dedupe notice
+    # does not grow past its first entry.
+    strategy.on_quote_tick(
+        _quote(
+            INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID,
+            ts_event=WINDOW_OPEN_NS + NS_PER_MIN,
+        )
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.count(_DIAG_NO_ONLY_HUNT_ERROR) == 2
+    assert cache_key not in strategy._yes_fill_blocks_no
+    assert len(strategy._no_only_hunt_error_notice) == 1

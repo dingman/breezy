@@ -1469,6 +1469,22 @@ class ContinuousRungHoldStrategy(Strategy):
         genuine fill durably written to this SAME key is observed the very
         next tick.
 
+        Writer-proof scope note (coordinator review of 10d46cf): the "no
+        live path writes a non-fill YES record" dormancy claim (module
+        docstring / commit message) covers ONLY this module, the v3
+        continuous family. The v2 ``CurrentRungHoldStrategy``
+        (``strategy.py``) CAN write a non-fill Refuse reason through its own
+        ``consume`` call. That stays segregated from this module's writes by
+        trial-key PREFIX -- ``DEFAULT_TRIAL_KEY_PREFIX`` (v2) vs
+        ``CONTINUOUS_TRIAL_KEY_PREFIX`` (this module, injected into the
+        latch factory this ``on_start`` enters via ``composition.py``) --
+        and the two strategies are mutually exclusive ``composition_kind``
+        branches (``"current_rung_hold"`` vs ``"continuous_rung_hold"``) in
+        ``app/trade.py``, never composed against the same store.
+        Composing both against one store, or unifying the prefix, would
+        reactivate this method's non-fill branch in production; either
+        change must re-run this writer proof before it ships.
+
         Steps 2-3 are QUIET: no diagnostic, no refusal, no `_observe_halt`
         call -- this branch runs BEFORE `_hunt_tick` reaches its own
         window/intent checks for the YES path, so the counters those checks
