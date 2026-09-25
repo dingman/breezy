@@ -23,28 +23,24 @@ This module is the impure I/O wrapper around the pure core in
   (`current_rung_hold_paper_replay.py:257`) uses, so the census's coverage
   decision cannot silently diverge from the strategy's own.
 
-**H1 (AUD-08b -> AUD-09a) is read locally, not by importing AUD-08b's
-module.** AUD-08b (`breezy.persistence.station_candidates`) is in flight and
-not yet merged; the AUD-09 plan explicitly allows AUD-09a to ship before it
-(§6a: "a missing register is a WARN and an empty candidate set, never a
-census failure"). `_read_station_candidates` below is therefore a minimal,
-self-contained mirror of AUD-08b's own stated H1 contract (schema_version=1,
-`UnknownStationCandidateSchemaError` on a mismatch, WARN-and-empty on a
-missing file) -- not an import of a module that does not exist in this tree.
-When AUD-08b lands, its own `breezy.persistence.station_candidates.read_station_candidates`
-should replace this local reader.
+**H1 (AUD-08b -> AUD-09a)** is read via AUD-08b's own
+`breezy.persistence.station_candidates.read_station_candidates` (merged).
+`_read_station_candidates` below is a thin wrapper: it prints the plan's
+mandated WARN when the register file is absent (§6a: "a missing register is
+a WARN and an empty candidate set, never a census failure"), then delegates
+to the real reader, which itself returns `()` for a missing file and raises
+`UnknownStationCandidateSchemaError`/`StationCandidateRegisterCorruptError`
+on a corrupt or unversioned register -- never swallowed here.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import sys
 import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -79,14 +75,14 @@ from breezy.persistence.feather_preflight import (
     list_instance_ids,
     scan_instance,
 )
+from breezy.persistence.station_candidates import StationCandidate, read_station_candidates
 from breezy.registry import SiteNotFoundError, default_registry
 from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.depth10 import best_order
 
 __all__ = [
-    "STATION_CANDIDATES_SCHEMA_VERSION",
-    "UnknownStationCandidateSchemaError",
-    "_StationCandidateRow",
+    "CensusCompletenessError",
+    "_assert_census_is_complete",
     "_candidate_rows_to_replay_sufficiency",
     "_read_station_candidates",
     "build_census",
@@ -102,11 +98,6 @@ __all__ = [
 _WINDOW_START_HOUR_LST: Final[int] = 12
 _WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
 
-#: AUD-08b's own constant
-#: (`breezy.persistence.station_candidates.STATION_CANDIDATES_SCHEMA_VERSION`),
-#: mirrored here -- see the module docstring for why this is not an import.
-STATION_CANDIDATES_SCHEMA_VERSION: Final[int] = 1
-
 DEFAULT_QUOTE_TAPE_CATALOG: Final[Path] = (
     Path.home() / ".local/share/breezy/catalog/quote_tape/polymarket_us"
 )
@@ -118,29 +109,14 @@ DEFAULT_STATION_CANDIDATES_PATH: Final[Path] = (
 )
 
 
-class UnknownStationCandidateSchemaError(Exception):
-    """`station_candidates.jsonl` names a `schema_version` this reader refuses.
-
-    Mirrors AUD-08b's own H1 contract (see module docstring): the census
-    fails loudly rather than degrading silently on a version it does not
-    understand.
-    """
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _StationCandidateRow:
-    """The subset of AUD-08b's `StationCandidate` this census needs."""
-
-    schema_version: int
-    venue: str
-    city_token: str
-    last_seen_day: str
-
-
-def _read_station_candidates(path: Path) -> tuple[_StationCandidateRow, ...]:
+def _read_station_candidates(path: Path) -> tuple[StationCandidate, ...]:
     """H1: a missing register WARNs and yields an empty candidate set.
 
-    Never a census failure -- AUD-09a ships before AUD-08b (plan §6a).
+    Never a census failure. The WARN is printed here (the plan's own H1
+    text); the actual read -- including the missing-file empty return and
+    the unknown-schema / corrupt-register refusals -- is AUD-08b's real
+    `breezy.persistence.station_candidates.read_station_candidates`, never
+    swallowed.
     """
     if not path.is_file():
         print(
@@ -148,33 +124,11 @@ def _read_station_candidates(path: Path) -> tuple[_StationCandidateRow, ...]:
             "treating as an empty candidate set (AUD-08b not yet merged or not yet run)",
             file=sys.stderr,
         )
-        return ()
-    rows: list[_StationCandidateRow] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            payload = json.loads(line)
-            version = payload.get("schema_version")
-            if version != STATION_CANDIDATES_SCHEMA_VERSION:
-                raise UnknownStationCandidateSchemaError(
-                    f"{path}:{line_number}: unknown station_candidates schema_version "
-                    f"{version!r} (expected {STATION_CANDIDATES_SCHEMA_VERSION})"
-                )
-            rows.append(
-                _StationCandidateRow(
-                    schema_version=version,
-                    venue=payload["venue"],
-                    city_token=payload["city_token"],
-                    last_seen_day=payload["last_seen_day"],
-                )
-            )
-    return tuple(rows)
+    return read_station_candidates(path)
 
 
 def _candidate_rows_to_replay_sufficiency(
-    candidates: Sequence[_StationCandidateRow], *, computed_day: str,
+    candidates: Sequence[StationCandidate], *, computed_day: str,
 ) -> tuple[ReplaySufficiency, ...]:
     """H1: one row per candidate, `CANDIDATE_UNSUPPORTED_STATION`, never queued.
 
@@ -230,6 +184,29 @@ def build_census(
     ]
     rows.extend(candidate_rows)
     return tuple(sorted(rows, key=lambda row: (row.station, row.climate_day)))
+
+
+class CensusCompletenessError(Exception):
+    """The written tape rows do not cover every station-day discovered in the
+    raw instance metadata.
+
+    B1 requires a row for every `(station, climate_day)` the tape contains;
+    a silently-missing row is worse than a wrong reason, so a mismatch here
+    is a loud failure, never a partial write.
+    """
+
+
+def _assert_census_is_complete(
+    *, discovered: set[tuple[str, str]], written: set[tuple[str, str]],
+) -> None:
+    missing = discovered - written
+    extra = written - discovered
+    if missing or extra:
+        raise CensusCompletenessError(
+            f"census completeness check failed: {len(missing)} station-day(s) discovered in "
+            f"raw instance metadata but not written ({sorted(missing)}); {len(extra)} written "
+            f"but not discovered ({sorted(extra)})"
+        )
 
 
 def _in_decision_window(ts_event_ns: int, std_utc_offset_hours: float) -> bool:
@@ -328,6 +305,7 @@ def run_census(
 
     clean_ids: list[str] = []
     corrupt_ids: list[str] = []
+    live_or_empty_ids: list[str] = []
     for instance_id in instance_ids:
         report = scan_instance(catalog_root, instance_id, subdirectory)
         verdict = classify_instance(report, now_ns=now_ns)
@@ -335,13 +313,12 @@ def run_census(
             clean_ids.append(instance_id)
         elif verdict == "CORRUPT":
             corrupt_ids.append(instance_id)
-        # EMPTY / LIVE instances carry no usable station-day identity for
-        # this census: EMPTY captured zero rows anywhere (no registration to
-        # read), and LIVE means the writer may still be appending -- neither
-        # is a candidate winner, and both resolve to CLEAN or CORRUPT on a
-        # later run once the grace period elapses. A day covered ONLY by a
-        # LIVE instance today is invisible to this run; the next daily
-        # recompute (`computed_day` advances) picks it up once it settles.
+        else:
+            # LIVE (writer may still be appending) or EMPTY (zero rows
+            # anywhere). Neither is ever a winner, but B1 requires a row for
+            # every (station, climate_day) the tape contains -- silently
+            # dropping a LIVE-only day's identity was the completeness bug.
+            live_or_empty_ids.append(instance_id)
 
     spans, clean_station_days = _discover_clean_spans(
         catalog_root=catalog_root,
@@ -370,6 +347,40 @@ def run_census(
                 distinct_instruments=0,
             )
         )
+
+    # Identity-only read for LIVE/EMPTY instances -- the SAME mechanism
+    # `_corrupt_instance_station_days` performs for CORRUPT instances (it
+    # reads only the `binary_option` registration rows, never the
+    # depth/quote streams a still-appending or empty tape cannot be trusted
+    # for). EMPTY structurally contributes nothing here: `captured_nothing`
+    # means zero rows in EVERY file, including `binary_option`, so it can
+    # never yield a registration; every entry below is therefore from a
+    # LIVE instance.
+    live_or_empty_station_days_native = _corrupt_instance_station_days(
+        quote_catalog=catalog_root, subdirectory=subdirectory, corrupt_ids=live_or_empty_ids,
+    )
+    for station, live_day in live_or_empty_station_days_native:
+        day = live_day.isoformat()
+        spans.setdefault((station, day), []).append(
+            InstanceSpan(
+                instance_id="<live-or-empty>",
+                verdict="LIVE",
+                depth_window_minutes=0.0,
+                quote_window_minutes=0.0,
+                distinct_instruments=0,
+            )
+        )
+
+    discovered_station_days = {
+        (station, day.isoformat()) for station, day in corrupt_station_days_native
+    } | clean_station_days | {
+        (station, day.isoformat()) for station, day in live_or_empty_station_days_native
+    }
+    tape_rows = build_census(station_day_spans=spans, computed_day=computed_day)
+    _assert_census_is_complete(
+        discovered=discovered_station_days,
+        written={(row.station, row.climate_day) for row in tape_rows},
+    )
 
     candidates = _read_station_candidates(station_candidates_path)
     candidate_rows = _candidate_rows_to_replay_sufficiency(candidates, computed_day=computed_day)

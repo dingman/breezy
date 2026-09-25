@@ -1,46 +1,64 @@
 """Unit tests for `scripts/analysis/replay_sufficiency_census.py` (RED first, AUD-09a).
 
-The script's own I/O wiring against a real feather/catalog capture is
-exercised by the plan's "one real run" (AUD-09 §7 step 3-equivalent for the
-census), not by these tests: replicating a real Nautilus `BinaryOption` +
-`OrderBookDepth10`/`QuoteTick` capture here would duplicate the fixtures
-`test_cli_basis_offer_gate_scan.py` already owns for that purpose without
-adding coverage `classify_station_day`'s own pure tests (`test_replay_sufficiency.py`)
-do not already provide. What IS unit-tested here is everything this script
-owns beyond that classification: the aggregation into one row per
-`(station, climate_day)`, the H1 candidate-register contract (missing file,
-schema mismatch, one row per candidate, never queued), and that the write
-path stays byte-idempotent -- all pure or local-file I/O, all network-free by
-the repo-wide socket block (`tests/conftest.py`).
+Most of the script's real I/O wiring against a full feather/catalog capture
+is exercised by the plan's "one real run", not by these tests. Two real,
+minimal feather fixtures ARE built here (`TestLiveAndEmptyInstancesGetARow`)
+because the completeness bug they cover -- a station-day whose only
+instances are LIVE or EMPTY silently getting no row at all -- can only be
+proven through the real `list_instance_ids`/`scan_instance`/`classify_instance`
+wiring, not through the pure `build_census`/`classify_station_day` cores
+alone. Everything else stays at the aggregation/contract level: one row per
+`(station, climate_day)`, the H1 candidate-register contract (now backed by
+the real `breezy.persistence.station_candidates`, merged via AUD-08b), and
+byte-idempotent writes -- all pure or local-file I/O, all network-free by the
+repo-wide socket block (`tests/conftest.py`).
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sys
+from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 from replay_sufficiency_census import (
-    STATION_CANDIDATES_SCHEMA_VERSION,
-    UnknownStationCandidateSchemaError,
+    CensusCompletenessError,
+    _assert_census_is_complete,
     _candidate_rows_to_replay_sufficiency,
     _read_station_candidates,
-    _StationCandidateRow,
     build_census,
+    run_census,
 )
 
 from breezy.analysis.replay_sufficiency import (
     CANDIDATE_UNSUPPORTED_STATION,
     CORRUPT_ONLY,
+    NO_CLEAN_INSTANCE,
     InstanceSpan,
+)
+from breezy.persistence.station_candidates import (
+    STATION_CANDIDATES_SCHEMA_VERSION,
+    StationCandidate,
+    UnknownStationCandidateSchemaError,
 )
 
 COMPUTED_DAY = "2026-09-24"
+_VENUE = Venue("BREEZY_TEST")
 
 
 def _span(verdict: str, depth: float = 0.0, instance_id: str = "instance-1") -> InstanceSpan:
@@ -80,9 +98,7 @@ def test_build_census_marks_a_corrupt_only_day_corrupt_only_and_never_selected()
 def test_build_census_includes_candidate_rows_alongside_tape_rows() -> None:
     spans = {("SFO", "2026-09-01"): [_span("CLEAN", depth=45.0)]}
     candidate_rows = _candidate_rows_to_replay_sufficiency(
-        [
-            _fake_candidate(venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-20"),
-        ],
+        [_fake_candidate(venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-20")],
         computed_day=COMPUTED_DAY,
     )
 
@@ -97,12 +113,17 @@ def test_build_census_includes_candidate_rows_alongside_tape_rows() -> None:
     assert candidate_row.climate_day == "2026-09-20"
 
 
-def _fake_candidate(*, venue: str, city_token: str, last_seen_day: str) -> _StationCandidateRow:
-    return _StationCandidateRow(
+def _fake_candidate(*, venue: str, city_token: str, last_seen_day: str) -> StationCandidate:
+    return StationCandidate(
         schema_version=STATION_CANDIDATES_SCHEMA_VERSION,
         venue=venue,
         city_token=city_token,
+        origin="SIGHTING",
+        first_seen_day=last_seen_day,
         last_seen_day=last_seen_day,
+        distinct_slugs=1,
+        distinct_climate_days=1,
+        sufficiency="NO_SETTLEMENT_TRUTH",
     )
 
 
@@ -121,18 +142,9 @@ def test_read_station_candidates_missing_file_warns_and_yields_empty_set(
 
 def test_read_station_candidates_parses_one_line_per_candidate(tmp_path: Path) -> None:
     path = tmp_path / "station_candidates.jsonl"
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": STATION_CANDIDATES_SCHEMA_VERSION,
-                "venue": "polymarket_us",
-                "city_token": "nyc",
-                "last_seen_day": "2026-09-20",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+
+    candidate = _fake_candidate(venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-20")
+    path.write_text(json.dumps(asdict(candidate)) + "\n", encoding="utf-8")
 
     result = _read_station_candidates(path)
 
@@ -149,7 +161,12 @@ def test_read_station_candidates_refuses_an_unknown_schema_version(tmp_path: Pat
                 "schema_version": 2,
                 "venue": "polymarket_us",
                 "city_token": "nyc",
+                "origin": "SIGHTING",
+                "first_seen_day": "2026-09-20",
                 "last_seen_day": "2026-09-20",
+                "distinct_slugs": 1,
+                "distinct_climate_days": 1,
+                "sufficiency": "NO_SETTLEMENT_TRUTH",
             }
         )
         + "\n",
@@ -173,3 +190,148 @@ def test_candidate_rows_never_enter_the_replay_queue() -> None:
     assert rows[0].reason == CANDIDATE_UNSUPPORTED_STATION
     assert rows[0].verdict == "INSUFFICIENT"
     assert rows[0].winner_instance_id is None
+
+
+class TestCensusCompletenessAssertion:
+    def test_matching_sets_is_a_no_op(self) -> None:
+        _assert_census_is_complete(
+            discovered={("SFO", "2026-09-01")}, written={("SFO", "2026-09-01")}
+        )
+
+    def test_a_missing_row_raises_loudly(self) -> None:
+        with pytest.raises(CensusCompletenessError) as excinfo:
+            _assert_census_is_complete(discovered={("SFO", "2026-09-01")}, written=set())
+
+        assert "SFO" in str(excinfo.value)
+        assert "2026-09-01" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Real, minimal feather fixtures: the LIVE/EMPTY completeness fix (HIGH)
+# ---------------------------------------------------------------------------
+
+
+def _weather_binary_option(*, station: str, climate_day: str, ts_init: int) -> BinaryOption:
+    symbol = Symbol(f"TC-TEMP-{station}HIGH-{climate_day}-70")
+    info = {
+        "weather_facts_status": "KNOWN",
+        "settlement_station": station,
+        "climate_date": climate_day,
+        "measure": "high",
+        "strike_lower_f": 70,
+        "strike_upper_f": None,
+    }
+    return BinaryOption(
+        instrument_id=InstrumentId(symbol=symbol, venue=_VENUE),
+        raw_symbol=symbol,
+        outcome="Yes",
+        description="AUD-09a census fixture",
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        size_precision=0,
+        size_increment=Quantity.from_int(1),
+        activation_ns=0,
+        expiration_ns=1_800_000_000_000_000_000,
+        max_quantity=None,
+        min_quantity=Quantity.from_int(1),
+        maker_fee=Decimal(0),
+        taker_fee=Decimal(0),
+        ts_event=ts_init,
+        ts_init=ts_init,
+        info=info,
+    )
+
+
+def _write_binary_option_feather(path: Path, instruments: list[BinaryOption]) -> None:
+    batch = ArrowSerializer.serialize_batch(instruments, data_cls=BinaryOption)
+    table = pa.Table.from_batches([batch]) if isinstance(batch, pa.RecordBatch) else batch
+    table = table.replace_schema_metadata({"class": BinaryOption.__name__})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        writer = pa.ipc.new_stream(handle, table.schema)
+        writer.write_table(table)
+        writer.close()
+
+
+def _quote_tick(index: int) -> QuoteTick:
+    return QuoteTick(
+        instrument_id=InstrumentId(symbol=Symbol("EUR/USD"), venue=_VENUE),
+        bid_price=Price.from_str("1.00000"),
+        ask_price=Price.from_str("1.00010"),
+        bid_size=Quantity.from_int(1),
+        ask_size=Quantity.from_int(1),
+        ts_event=1_000_000_000 + index,
+        ts_init=1_000_000_000 + index,
+    )
+
+
+def _write_truncated_open_stream(path: Path, objects: list[QuoteTick]) -> None:
+    """An OPEN (never-closed) IPC stream, then drop its tail -- classified
+    truncated (not a clean EOS) by `inspect_feather_file`, and recently
+    modified so `classify_instance` reads it as LIVE, not CORRUPT."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    first = ArrowSerializer.serialize_batch([objects[0]], data_cls=QuoteTick)
+    with path.open("wb") as handle:
+        writer = pa.ipc.new_stream(handle, first.schema)
+        for obj in objects:
+            piece = ArrowSerializer.serialize_batch([obj], data_cls=QuoteTick)
+            if isinstance(piece, pa.RecordBatch):
+                writer.write_batch(piece)
+            else:
+                writer.write_table(piece)
+        # Deliberately never closed/`.close()`-d: no end-of-stream marker.
+    with path.open("r+b") as handle:
+        handle.truncate(max(path.stat().st_size - 8, 0))
+
+
+class TestLiveAndEmptyInstancesGetARow:
+    def test_a_live_only_day_gets_a_no_clean_instance_row_not_no_row_at_all(
+        self, tmp_path: Path,
+    ) -> None:
+        instance_dir = tmp_path / "live" / "instance-live-1"
+        _write_binary_option_feather(
+            instance_dir / "binary_option_0.feather",
+            [_weather_binary_option(station="SFO", climate_day="2026-09-05", ts_init=1)],
+        )
+        _write_truncated_open_stream(
+            instance_dir / "quote_tick_0.feather", [_quote_tick(0), _quote_tick(1)]
+        )
+
+        now_ns = int(dt.datetime.now(dt.UTC).timestamp() * 1_000_000_000)
+
+        rows = run_census(
+            catalog_root=tmp_path,
+            subdirectory="live",
+            work_root=tmp_path / "work",
+            station_candidates_path=tmp_path / "no-such-register.jsonl",
+            computed_day=COMPUTED_DAY,
+            now_ns=now_ns,
+        )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row.station, row.climate_day) == ("SFO", "2026-09-05")
+        assert row.verdict == "INSUFFICIENT"
+        assert row.reason == NO_CLEAN_INSTANCE
+
+    def test_an_empty_only_instance_yields_zero_rows_and_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        instance_dir = tmp_path / "live" / "instance-empty-1"
+        instance_dir.mkdir(parents=True)
+        (instance_dir / "binary_option_0.feather").touch()  # 0 bytes: EMPTY_FILE
+
+        now_ns = int(dt.datetime.now(dt.UTC).timestamp() * 1_000_000_000)
+
+        rows = run_census(
+            catalog_root=tmp_path,
+            subdirectory="live",
+            work_root=tmp_path / "work",
+            station_candidates_path=tmp_path / "no-such-register.jsonl",
+            computed_day=COMPUTED_DAY,
+            now_ns=now_ns,
+        )
+
+        assert rows == ()
