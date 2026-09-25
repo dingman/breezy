@@ -4,24 +4,34 @@
 Disk-only, per `(station, climate_day)`, machine-readable, versioned census
 of which station-days can be replayed at all -- see
 `docs/plans/backlog/AUDIT_2026-09-21/AUD-09-scheduled-per-station-replay.md`
-§6a. Cheap: it never runs an engine, never fetches over the network, and
-never touches the live path.
+§6a and the Rev 2.1 amendment
+(`docs/plans/backlog/AUDIT_2026-09-21/AUD-09b-AMENDMENT-2026-09-25.md`). Cheap:
+it never runs an engine, never fetches over the network, and never touches
+the live path.
 
 This module is the impure I/O wrapper around the pure core in
 `breezy.analysis.replay_sufficiency`. It reuses, without modification:
 
-- `breezy.persistence.feather_preflight.list_instance_ids` / `scan_instance`;
-- `cli_basis_offer_gate_scan.classify_instance` and
+- `breezy.persistence.feather_preflight.list_instance_ids` / `scan_instance` /
+  `iter_feather_files`;
+- `cli_basis_offer_gate_scan.classify_instance`, `_load_stream` and
   `station_days_only_on_corrupt_tape`;
 - `current_rung_hold_paper_replay._convert_live_capture` /
   `_select_capture_instruments` and `whole_tape_paper_replay._corrupt_instance_station_days`
   for the same feather-to-work-catalog conversion and corrupt-tape identity
   read the whole-tape driver already performs, so this script derives no new
-  reading of the raw capture format;
-- `breezy.strategy.current_rung_hold.strategy._local_hour` for the same LST
-  decision-window hour derivation `assert_decision_window_has_coverage`
-  (`current_rung_hold_paper_replay.py:257`) uses, so the census's coverage
-  decision cannot silently diverge from the strategy's own.
+  reading of the raw capture format.
+
+**Window definition (AUD-09b amendment C1, B21)**: the decision window is
+computed via `breezy.analysis.replay_sufficiency.decision_window_ns`, which
+scopes by BOTH date and local-standard-time hour -- unlike the pre-amendment
+`_in_decision_window` this module used to define locally (hour only), which
+let a market listed the day before draw depth from the WRONG day's
+afternoon (F3). The census and the KILL clock (`structural_dead_stop.py`)
+therefore share the WINDOW DEFINITION ONLY: the KILL clock counts every depth
+instant across rungs of the merged tape catalog and subtracts resolved
+`QuoteTapeGap`s, while this census counts PER INSTANCE, executable asks only.
+They can still disagree about "covered" -- the shared piece is the window.
 
 **H1 (AUD-08b -> AUD-09a)** is read via AUD-08b's own
 `breezy.persistence.station_candidates.read_station_candidates` (merged).
@@ -37,16 +47,19 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import json
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import Final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cli_basis_offer_gate_scan import (
+    _load_stream,
     classify_instance,
     station_days_only_on_corrupt_tape,
 )
@@ -54,17 +67,34 @@ from current_rung_hold_paper_replay import (  # type: ignore[attr-defined]
     _convert_live_capture,
     _select_capture_instruments,
 )
+from nautilus_trader.model.instruments import BinaryOption
 from run_weather_strategy_backtests import WEATHER_VENUE, TapeInstrument
 from whole_tape_paper_replay import _corrupt_instance_station_days
 
+from breezy.analysis.instance_span_cache import (
+    DEFAULT_INSTANCE_SPANS_PATH,
+    SPAN_ALGO_VERSION,
+    CacheKey,
+    InstanceFileFingerprint,
+    StationDaySpans,
+    fingerprint_instance_files,
+    lookup,
+    read_instance_span_cache,
+    write_instance_span_cache,
+)
 from breezy.analysis.replay_sufficiency import (
     CANDIDATE_UNSUPPORTED_STATION,
     REPLAY_SUFFICIENCY_SCHEMA_VERSION,
     InstanceSpan,
     ReplaySufficiency,
+    WindowExtent,
     classify_station_day,
+    count_live_instances_in_window,
+    decision_window_ns,
+    window_extent,
     write_replay_sufficiency,
 )
+from breezy.domain.climate_day import standard_time_zone
 from breezy.domain.weather_bucket_facts import (
     WeatherFactsUnavailableError,
     read_weather_bucket_facts,
@@ -72,31 +102,24 @@ from breezy.domain.weather_bucket_facts import (
 from breezy.persistence.feather_preflight import (
     DEFAULT_SUBDIRECTORY,
     PreflightError,
+    iter_feather_files,
     list_instance_ids,
     scan_instance,
 )
 from breezy.persistence.station_candidates import StationCandidate, read_station_candidates
 from breezy.registry import SiteNotFoundError, default_registry
-from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.depth10 import best_order
 
 __all__ = [
     "CensusCompletenessError",
     "_assert_census_is_complete",
     "_candidate_rows_to_replay_sufficiency",
+    "_live_instance_registrations",
     "_read_station_candidates",
     "build_census",
     "main",
     "run_census",
 ]
-
-#: The same LST decision window `assert_decision_window_has_coverage`'s
-#: `source="depth"` branch checks (`current_rung_hold_paper_replay.py:128-129`),
-#: imported nowhere as a constant (that module keeps it private) but
-#: numerically identical and re-derived here via the SAME `_local_hour`
-#: function, never a re-implementation of the hour arithmetic.
-_WINDOW_START_HOUR_LST: Final[int] = 12
-_WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
 
 DEFAULT_QUOTE_TAPE_CATALOG: Final[Path] = (
     Path.home() / ".local/share/breezy/catalog/quote_tape/polymarket_us"
@@ -160,6 +183,15 @@ def _candidate_rows_to_replay_sufficiency(
                 quote_window_minutes=0.0,
                 distinct_instruments=0,
                 computed_day=computed_day,
+                # No registry offset exists for an unsupported station -- there
+                # is no decision window to report, so every window/live-count
+                # field below is the degenerate sentinel (AUD-09b amendment C2a).
+                window_start_ns=0,
+                window_end_ns=0,
+                winner_first_in_window_ns=None,
+                winner_last_in_window_ns=None,
+                window_complete=False,
+                live_instance_count=0,
             )
         )
     return tuple(rows)
@@ -170,15 +202,28 @@ def build_census(
     station_day_spans: Mapping[tuple[str, str], Sequence[InstanceSpan]],
     candidate_rows: Sequence[ReplaySufficiency] = (),
     computed_day: str,
+    window_bounds: Mapping[tuple[str, str], tuple[int, int]] | None = None,
+    live_instance_counts: Mapping[tuple[str, str], int] | None = None,
 ) -> tuple[ReplaySufficiency, ...]:
     """Pure aggregation: one `classify_station_day` call per tape-derived key,
-    plus every H1 candidate row, sorted for determinism."""
+    plus every H1 candidate row, sorted for determinism.
+
+    `window_bounds`/`live_instance_counts` (AUD-09b amendment C2a/C3) default
+    to empty, so a caller that does not yet compute them (e.g. an older test)
+    gets the pre-amendment degenerate `(0, 0)`/`0` values `classify_station_day`
+    itself defaults to -- never a `KeyError`.
+    """
+    resolved_window_bounds = window_bounds or {}
+    resolved_live_counts = live_instance_counts or {}
     rows = [
         classify_station_day(
             station=station,
             climate_day=climate_day,
             instances=instances,
             computed_day=computed_day,
+            window_start_ns=resolved_window_bounds.get((station, climate_day), (0, 0))[0],
+            window_end_ns=resolved_window_bounds.get((station, climate_day), (0, 0))[1],
+            live_instance_count=resolved_live_counts.get((station, climate_day), 0),
         )
         for (station, climate_day), instances in station_day_spans.items()
     ]
@@ -209,36 +254,98 @@ def _assert_census_is_complete(
         )
 
 
-def _in_decision_window(ts_event_ns: int, std_utc_offset_hours: float) -> bool:
-    hour = _local_hour(ts_event_ns, std_utc_offset_hours)
-    return _WINDOW_START_HOUR_LST <= hour < _WINDOW_END_HOUR_LST
+def _registry_offset_table_fingerprint(registry: object) -> str:
+    """sha256 over every `(station, std_utc_offset_hours)` pair the registry
+    knows for this venue (AUD-09b amendment Rev 2.1 #5).
 
-
-def _window_span_minutes(ts_event_ns_values: Sequence[int]) -> float:
-    """Span between the first and last in-window instant, in minutes.
-
-    Zero for 0 or 1 instants -- a single snapshot covers no SPAN, the same
-    rule `ma_prelock_winner_ask_study.afternoon_coverage_minutes` applies.
+    Folded into every instance's cache fingerprint: a registry offset edit
+    must invalidate cached spans even though the instance's OWN files never
+    changed. Whole-table rather than per-instance-station, because the cache
+    lookup happens BEFORE the instance's own stations are known (that is
+    discovered only by the conversion the cache is trying to skip).
     """
-    if len(ts_event_ns_values) < 2:
-        return 0.0
-    return (max(ts_event_ns_values) - min(ts_event_ns_values)) / 1_000_000_000.0 / 60.0
+    pairs = sorted(
+        (city, registry.climate_day_window(WEATHER_VENUE, city).std_utc_offset_hours)  # type: ignore[attr-defined]
+        for venue, city in registry.pairs()  # type: ignore[attr-defined]
+        if venue == WEATHER_VENUE
+    )
+    canonical = "|".join(f"{city}:{offset}" for city, offset in pairs)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _instance_fingerprint(instance_dir: Path, *, offset_table_fingerprint: str) -> str:
+    """C6: sha256 over the instance's own files, folded with the registry's
+    offset table (Rev 2.1 #5)."""
+    file_fingerprint = fingerprint_instance_files(
+        InstanceFileFingerprint(
+            relpath=str(path.relative_to(instance_dir)),
+            size=path.stat().st_size,
+            mtime_ns=path.stat().st_mtime_ns,
+        )
+        for path in iter_feather_files(instance_dir)
+    )
+    return hashlib.sha256(f"{file_fingerprint}:{offset_table_fingerprint}".encode()).hexdigest()
 
 
 def _discover_clean_spans(
-    *, catalog_root: Path, subdirectory: str, clean_ids: Sequence[str], work_root: Path,
-) -> tuple[dict[tuple[str, str], list[InstanceSpan]], set[tuple[str, str]]]:
+    *,
+    catalog_root: Path,
+    subdirectory: str,
+    clean_ids: Sequence[str],
+    work_root: Path,
+    span_cache: MutableMapping[CacheKey, StationDaySpans] | None = None,
+) -> tuple[
+    dict[tuple[str, str], list[InstanceSpan]],
+    set[tuple[str, str]],
+    dict[tuple[str, str], tuple[int, int]],
+]:
     """Real catalog conversion + per-station-day depth/quote span computation.
 
     Not directly unit-tested (see the test module's docstring): this is the
     same conversion `whole_tape_paper_replay._load_clean_instance` performs,
     reused rather than re-derived, and validated by the plan's real run
     against production data.
+
+    `span_cache` (AUD-09b amendment C6), when given, is checked per CLEAN
+    instance BEFORE the expensive `_convert_live_capture` conversion: a hit
+    (same instance_id, fingerprint, and `SPAN_ALGO_VERSION`) reuses the
+    cached spans and skips the conversion entirely. A fresh instance's spans
+    are added to `span_cache` in place for the caller to persist.
     """
     registry = default_registry()
+    offset_table_fingerprint = _registry_offset_table_fingerprint(registry)
     spans: dict[tuple[str, str], list[InstanceSpan]] = defaultdict(list)
     clean_station_days: set[tuple[str, str]] = set()
+    window_bounds: dict[tuple[str, str], tuple[int, int]] = {}
+
+    def _window_bounds_for(station: str, day: str) -> tuple[int, int]:
+        bounds = window_bounds.get((station, day))
+        if bounds is not None:
+            return bounds
+        std_offset = registry.climate_day_window(WEATHER_VENUE, station).std_utc_offset_hours
+        bounds = decision_window_ns(
+            climate_day=dt.date.fromisoformat(day), std_utc_offset_hours=std_offset,
+        )
+        window_bounds[(station, day)] = bounds
+        return bounds
+
     for instance_id in clean_ids:
+        instance_dir = catalog_root / subdirectory / instance_id
+        fingerprint = _instance_fingerprint(
+            instance_dir, offset_table_fingerprint=offset_table_fingerprint,
+        )
+        cached = (
+            lookup(span_cache, instance_id=instance_id, fingerprint=fingerprint)
+            if span_cache is not None
+            else None
+        )
+        if cached is not None:
+            for (station, day), span in cached.items():
+                spans[(station, day)].append(span)
+                clean_station_days.add((station, day))
+                _window_bounds_for(station, day)
+            continue
+
         work_catalog = work_root / f"{instance_id}"
         catalog = _convert_live_capture(
             quote_catalog=catalog_root,
@@ -260,32 +367,143 @@ def _discover_clean_spans(
                 key = (tape_instrument.facts.settlement_station, climate_day.isoformat())
                 by_station_day[key].append(tape_instrument)
 
+        instance_spans: dict[tuple[str, str], InstanceSpan] = {}
         for (station, day), tape_instruments in by_station_day.items():
-            std_offset = registry.climate_day_window(WEATHER_VENUE, station).std_utc_offset_hours
+            start_ns, end_ns = _window_bounds_for(station, day)
             depth_ts = [
                 depth.ts_event
                 for tape_instrument in tape_instruments
                 for depth in tape_instrument.depths
-                if _in_decision_window(depth.ts_event, std_offset)
-                and best_order(depth.asks) is not None
+                if best_order(depth.asks) is not None
             ]
             quote_ts = [
                 quote.ts_event
                 for tape_instrument in tape_instruments
                 for quote in tape_instrument.quotes
-                if _in_decision_window(quote.ts_event, std_offset)
             ]
-            spans[(station, day)].append(
-                InstanceSpan(
-                    instance_id=instance_id,
-                    verdict="CLEAN",
-                    depth_window_minutes=_window_span_minutes(depth_ts),
-                    quote_window_minutes=_window_span_minutes(quote_ts),
-                    distinct_instruments=len(tape_instruments),
-                )
+            depth_extent: WindowExtent = window_extent(depth_ts, start_ns=start_ns, end_ns=end_ns)
+            quote_extent: WindowExtent = window_extent(quote_ts, start_ns=start_ns, end_ns=end_ns)
+            span = InstanceSpan(
+                instance_id=instance_id,
+                verdict="CLEAN",
+                depth_window_minutes=depth_extent.span_ns / 1_000_000_000 / 60,
+                quote_window_minutes=quote_extent.span_ns / 1_000_000_000 / 60,
+                distinct_instruments=len(tape_instruments),
+                first_in_window_ns=depth_extent.first_ns,
+                last_in_window_ns=depth_extent.last_ns,
             )
+            spans[(station, day)].append(span)
             clean_station_days.add((station, day))
-    return dict(spans), clean_station_days
+            instance_spans[(station, day)] = span
+
+        if span_cache is not None:
+            span_cache[(instance_id, fingerprint, SPAN_ALGO_VERSION)] = instance_spans
+
+    return dict(spans), clean_station_days, window_bounds
+
+
+def _live_instance_registrations(
+    *, quote_catalog: Path, subdirectory: str, live_ids: Sequence[str],
+) -> dict[str, tuple[set[tuple[str, dt.date]], int | None]]:
+    """AUD-09b amendment C3 / Rev 2.1 #2: per-LIVE-instance identity read.
+
+    Returns, per LIVE instance, the ``(station, climate_day)`` set its own
+    ``binary_option`` registrations named, plus its CAPTURE START (the
+    minimum ``ts_init`` over those same rows), or ``None`` when the instance
+    yields no usable registration at all.
+
+    Census-local -- deliberately NOT an extension of the shared
+    `_corrupt_instance_station_days` (Rev 2.1 #2): that helper merges every
+    instance into ONE set and is shared with the whole-tape driver and the
+    CORRUPT path, so extending it to also return a minimum would attribute
+    ONE global minimum across every instance, not each instance's own start.
+    Reading one instance directory at a time here keeps the attribution
+    correct. Registration `ts_init` may be listing time rather than true
+    capture time; that errs toward OVER-counting a LIVE instance (fail
+    closed), and the amendment's Stage 0 journal correlation is the guard.
+    """
+    result: dict[str, tuple[set[tuple[str, dt.date]], int | None]] = {}
+    for instance_id in live_ids:
+        instance_dir = quote_catalog / subdirectory / instance_id
+        station_days: set[tuple[str, dt.date]] = set()
+        min_ts_init: int | None = None
+        for instrument in _load_stream([instance_dir], "binary_option", BinaryOption):
+            try:
+                facts = read_weather_bucket_facts(instrument.info)
+            except WeatherFactsUnavailableError:
+                continue
+            station_days.add((facts.settlement_station, facts.climate_day))
+            ts_init = int(instrument.ts_init)
+            if min_ts_init is None or ts_init < min_ts_init:
+                min_ts_init = ts_init
+        result[instance_id] = (station_days, min_ts_init)
+    return result
+
+
+def _pairwise_overlap_ns(a: InstanceSpan, b: InstanceSpan) -> int | None:
+    """`None` when either side has no in-window depth at all."""
+    if a.first_in_window_ns is None or a.last_in_window_ns is None:
+        return None
+    if b.first_in_window_ns is None or b.last_in_window_ns is None:
+        return None
+    return min(a.last_in_window_ns, b.last_in_window_ns) - max(
+        a.first_in_window_ns, b.first_in_window_ns,
+    )
+
+
+def _dump_instance_extents(
+    path: Path,
+    *,
+    station_day_spans: Mapping[tuple[str, str], Sequence[InstanceSpan]],
+    live_capture_start_by_instance: Mapping[str, int],
+    std_offset_by_station: Mapping[str, float],
+) -> None:
+    """D1: one JSON line per ``(station, climate_day, instance_id)``.
+
+    Diagnostic only (AUD-09b amendment §2 D1): feeds Stage 0 by hand, never
+    versioned, never read back by this script, and deleted with Stage B or
+    after Stage 0.
+    """
+    lines: list[dict[str, object]] = []
+    for (station, climate_day), instances in sorted(station_day_spans.items()):
+        offset = std_offset_by_station.get(station)
+        clean_instances = [instance for instance in instances if instance.verdict == "CLEAN"]
+        for instance in sorted(instances, key=lambda instance: instance.instance_id):
+            overlaps: dict[str, int | None] = {}
+            if instance.verdict == "CLEAN":
+                overlaps = {
+                    other.instance_id: _pairwise_overlap_ns(instance, other)
+                    for other in clean_instances
+                    if other.instance_id != instance.instance_id
+                }
+            lines.append(
+                {
+                    "station": station,
+                    "climate_day": climate_day,
+                    "instance_id": instance.instance_id,
+                    "verdict": instance.verdict,
+                    "first_in_window_lst": _format_lst(instance.first_in_window_ns, offset),
+                    "last_in_window_lst": _format_lst(instance.last_in_window_ns, offset),
+                    "capture_start_ns": live_capture_start_by_instance.get(instance.instance_id),
+                    "overlap_ns": overlaps,
+                }
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(json.dumps(line, sort_keys=True))
+            handle.write("\n")
+
+
+def _format_lst(ts_ns: int | None, std_utc_offset_hours: float | None) -> str | None:
+    if ts_ns is None or std_utc_offset_hours is None:
+        return None
+
+    seconds, nanos = divmod(ts_ns, 1_000_000_000)
+    instant = dt.datetime.fromtimestamp(seconds, tz=dt.UTC) + dt.timedelta(
+        microseconds=nanos // 1_000,
+    )
+    return instant.astimezone(standard_time_zone(std_utc_offset_hours)).isoformat()
 
 
 def run_census(
@@ -296,8 +514,16 @@ def run_census(
     station_candidates_path: Path,
     computed_day: str,
     now_ns: int,
+    instance_spans_cache_path: Path | None = None,
+    dump_instance_extents_path: Path | None = None,
 ) -> tuple[ReplaySufficiency, ...]:
-    """The real, end-to-end census over one feather capture root."""
+    """The real, end-to-end census over one feather capture root.
+
+    `instance_spans_cache_path` (AUD-09b amendment C6) is `None` by default:
+    caching is opt-in, so a test (or any caller) that omits it never reads or
+    writes the shared on-disk cache. Only `main` passes the real default
+    path. `dump_instance_extents_path` (D1) is likewise opt-in.
+    """
     try:
         instance_ids = list_instance_ids(catalog_root, subdirectory)
     except PreflightError:
@@ -320,12 +546,21 @@ def run_census(
             # dropping a LIVE-only day's identity was the completeness bug.
             live_or_empty_ids.append(instance_id)
 
-    spans, clean_station_days = _discover_clean_spans(
+    span_cache: dict[CacheKey, StationDaySpans] | None = None
+    if instance_spans_cache_path is not None:
+        span_cache = dict(read_instance_span_cache(instance_spans_cache_path))
+
+    spans, clean_station_days, window_bounds = _discover_clean_spans(
         catalog_root=catalog_root,
         subdirectory=subdirectory,
         clean_ids=clean_ids,
         work_root=work_root,
+        span_cache=span_cache,
     )
+
+    if instance_spans_cache_path is not None and span_cache is not None:
+        write_instance_span_cache(instance_spans_cache_path, span_cache)
+
     corrupt_station_days_native = _corrupt_instance_station_days(
         quote_catalog=catalog_root, subdirectory=subdirectory, corrupt_ids=corrupt_ids,
     )
@@ -336,8 +571,22 @@ def run_census(
         corrupt_station_days=corrupt_station_days_native,
         clean_station_days=clean_station_days_native,
     )
+    registry = default_registry()
+
+    def _window_bounds_for(station: str, day: str) -> tuple[int, int]:
+        bounds = window_bounds.get((station, day))
+        if bounds is not None:
+            return bounds
+        std_offset = registry.climate_day_window(WEATHER_VENUE, station).std_utc_offset_hours
+        bounds = decision_window_ns(
+            climate_day=dt.date.fromisoformat(day), std_utc_offset_hours=std_offset,
+        )
+        window_bounds[(station, day)] = bounds
+        return bounds
+
     for station, corrupt_day in corrupt_only:
         day = corrupt_day.isoformat()
+        _window_bounds_for(station, day)
         spans.setdefault((station, day), []).append(
             InstanceSpan(
                 instance_id="<corrupt-only>",
@@ -348,19 +597,31 @@ def run_census(
             )
         )
 
-    # Identity-only read for LIVE/EMPTY instances -- the SAME mechanism
-    # `_corrupt_instance_station_days` performs for CORRUPT instances (it
-    # reads only the `binary_option` registration rows, never the
-    # depth/quote streams a still-appending or empty tape cannot be trusted
-    # for). EMPTY structurally contributes nothing here: `captured_nothing`
-    # means zero rows in EVERY file, including `binary_option`, so it can
-    # never yield a registration; every entry below is therefore from a
-    # LIVE instance.
-    live_or_empty_station_days_native = _corrupt_instance_station_days(
-        quote_catalog=catalog_root, subdirectory=subdirectory, corrupt_ids=live_or_empty_ids,
+    # C3/Rev 2.1 #2: census-local, per-LIVE-instance identity read -- never
+    # an extension of the shared `_corrupt_instance_station_days` (that
+    # helper merges every instance into one set; C3 needs each instance's
+    # OWN capture start attributed to only the days IT registered).
+    # EMPTY instances structurally contribute nothing here (`captured_nothing`
+    # means zero rows in every file, so they can never yield a registration);
+    # every entry below is therefore from a genuinely LIVE instance.
+    live_registrations = _live_instance_registrations(
+        quote_catalog=catalog_root, subdirectory=subdirectory, live_ids=live_or_empty_ids,
     )
+    live_or_empty_station_days_native: set[tuple[str, dt.date]] = set()
+    live_capture_starts_by_station_day: dict[tuple[str, str], list[int]] = defaultdict(list)
+    live_capture_start_by_instance: dict[str, int] = {}
+    for instance_id, (station_days, capture_start) in live_registrations.items():
+        live_or_empty_station_days_native |= station_days
+        if capture_start is not None:
+            live_capture_start_by_instance[instance_id] = capture_start
+            for station, native_day in station_days:
+                live_capture_starts_by_station_day[(station, native_day.isoformat())].append(
+                    capture_start
+                )
+
     for station, live_day in live_or_empty_station_days_native:
         day = live_day.isoformat()
+        _window_bounds_for(station, day)
         spans.setdefault((station, day), []).append(
             InstanceSpan(
                 instance_id="<live-or-empty>",
@@ -371,22 +632,51 @@ def run_census(
             )
         )
 
+    live_instance_counts = {
+        key: count_live_instances_in_window(
+            capture_starts, window_end_ns=_window_bounds_for(*key)[1],
+        )
+        for key, capture_starts in live_capture_starts_by_station_day.items()
+    }
+
     discovered_station_days = {
         (station, day.isoformat()) for station, day in corrupt_station_days_native
     } | clean_station_days | {
         (station, day.isoformat()) for station, day in live_or_empty_station_days_native
     }
-    tape_rows = build_census(station_day_spans=spans, computed_day=computed_day)
+    tape_rows = build_census(
+        station_day_spans=spans,
+        computed_day=computed_day,
+        window_bounds=window_bounds,
+        live_instance_counts=live_instance_counts,
+    )
     _assert_census_is_complete(
         discovered=discovered_station_days,
         written={(row.station, row.climate_day) for row in tape_rows},
     )
 
+    if dump_instance_extents_path is not None:
+        std_offset_by_station = {
+            city: registry.climate_day_window(WEATHER_VENUE, city).std_utc_offset_hours
+            for venue, city in registry.pairs()
+            if venue == WEATHER_VENUE
+        }
+        _dump_instance_extents(
+            dump_instance_extents_path,
+            station_day_spans=spans,
+            live_capture_start_by_instance=live_capture_start_by_instance,
+            std_offset_by_station=std_offset_by_station,
+        )
+
     candidates = _read_station_candidates(station_candidates_path)
     candidate_rows = _candidate_rows_to_replay_sufficiency(candidates, computed_day=computed_day)
 
     return build_census(
-        station_day_spans=spans, candidate_rows=candidate_rows, computed_day=computed_day
+        station_day_spans=spans,
+        candidate_rows=candidate_rows,
+        computed_day=computed_day,
+        window_bounds=window_bounds,
+        live_instance_counts=live_instance_counts,
     )
 
 
@@ -396,6 +686,21 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--subdirectory", default=DEFAULT_SUBDIRECTORY)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH))
     parser.add_argument("--station-candidates", default=str(DEFAULT_STATION_CANDIDATES_PATH))
+    parser.add_argument(
+        "--instance-spans-cache",
+        default=str(DEFAULT_INSTANCE_SPANS_PATH),
+        help="AUD-09b amendment C6: on-disk per-instance span cache path.",
+    )
+    parser.add_argument(
+        "--no-instance-spans-cache",
+        action="store_true",
+        help="Disable the C6 on-disk span cache for this run.",
+    )
+    parser.add_argument(
+        "--dump-instance-extents",
+        default=None,
+        help="AUD-09b amendment D1: write a diagnostic per-instance extent dump here.",
+    )
     return parser.parse_args(argv)
 
 
@@ -405,6 +710,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     now_ns = int(now.timestamp() * 1_000_000_000)
     computed_day = now.date().isoformat()
 
+    instance_spans_cache_path = (
+        None if args.no_instance_spans_cache else Path(args.instance_spans_cache).expanduser()
+    )
+    dump_instance_extents_path = (
+        Path(args.dump_instance_extents).expanduser() if args.dump_instance_extents else None
+    )
+
     with tempfile.TemporaryDirectory(prefix="replay-sufficiency-census-") as tmp:
         rows = run_census(
             catalog_root=Path(args.catalog_root).expanduser(),
@@ -413,6 +725,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             station_candidates_path=Path(args.station_candidates).expanduser(),
             computed_day=computed_day,
             now_ns=now_ns,
+            instance_spans_cache_path=instance_spans_cache_path,
+            dump_instance_extents_path=dump_instance_extents_path,
         )
 
     write_replay_sufficiency(Path(args.output).expanduser(), rows)

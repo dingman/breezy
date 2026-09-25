@@ -19,15 +19,17 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sys
+from collections.abc import Iterable
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10, QuoteTick
+from nautilus_trader.model.enums import AssetClass, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
@@ -36,10 +38,12 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
+import replay_sufficiency_census as census_module
 from replay_sufficiency_census import (
     CensusCompletenessError,
     _assert_census_is_complete,
     _candidate_rows_to_replay_sufficiency,
+    _live_instance_registrations,
     _read_station_candidates,
     build_census,
     run_census,
@@ -50,7 +54,11 @@ from breezy.analysis.replay_sufficiency import (
     CORRUPT_ONLY,
     NO_CLEAN_INSTANCE,
     InstanceSpan,
+    WindowExtent,
+    decision_window_ns,
+    window_extent,
 )
+from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
 from breezy.persistence.station_candidates import (
     STATION_CANDIDATES_SCHEMA_VERSION,
     StationCandidate,
@@ -335,3 +343,206 @@ class TestLiveAndEmptyInstancesGetARow:
         )
 
         assert rows == ()
+
+
+# ---------------------------------------------------------------------------
+# A8 (census-local coverage): _live_instance_registrations attributes each
+# LIVE instance's OWN capture start (min ts_init over its own registrations),
+# never a merged/global minimum.
+# ---------------------------------------------------------------------------
+
+
+class TestLiveInstanceRegistrations:
+    def test_returns_the_stations_days_and_the_instances_own_min_ts_init(
+        self, tmp_path: Path,
+    ) -> None:
+        instance_dir = tmp_path / "live" / "instance-live-1"
+        _write_binary_option_feather(
+            instance_dir / "binary_option_0.feather",
+            [
+                _weather_binary_option(station="SFO", climate_day="2026-09-05", ts_init=5_000),
+                _weather_binary_option(station="SFO", climate_day="2026-09-05", ts_init=1_000),
+            ],
+        )
+
+        result = _live_instance_registrations(
+            quote_catalog=tmp_path, subdirectory="live", live_ids=["instance-live-1"],
+        )
+
+        station_days, capture_start = result["instance-live-1"]
+        assert station_days == {("SFO", dt.date(2026, 9, 5))}
+        assert capture_start == 1_000  # the MIN over this instance's own rows
+
+    def test_two_instances_each_keep_their_own_capture_start(self, tmp_path: Path) -> None:
+        early = tmp_path / "live" / "instance-early"
+        late = tmp_path / "live" / "instance-late"
+        _write_binary_option_feather(
+            early / "binary_option_0.feather",
+            [_weather_binary_option(station="LAX", climate_day="2026-09-05", ts_init=100)],
+        )
+        _write_binary_option_feather(
+            late / "binary_option_0.feather",
+            [_weather_binary_option(station="LAX", climate_day="2026-09-05", ts_init=999_999)],
+        )
+
+        result = _live_instance_registrations(
+            quote_catalog=tmp_path,
+            subdirectory="live",
+            live_ids=["instance-early", "instance-late"],
+        )
+
+        assert result["instance-early"][1] == 100
+        assert result["instance-late"][1] == 999_999  # NOT merged into instance-early's start
+
+    def test_an_instance_with_no_usable_registration_yields_none(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / "instance-empty"
+        instance_dir.mkdir(parents=True)
+        (instance_dir / "binary_option_0.feather").touch()
+
+        result = _live_instance_registrations(
+            quote_catalog=tmp_path, subdirectory="live", live_ids=["instance-empty"],
+        )
+
+        station_days, capture_start = result["instance-empty"]
+        assert station_days == set()
+        assert capture_start is None
+
+
+# ---------------------------------------------------------------------------
+# A10: _discover_clean_spans calls window_extent through the module-level
+# seam, rather than re-implementing the window filter inline. The catalog
+# conversion itself is stubbed (not directly unit-tested per this module's
+# own docstring); only `window_extent` is a real recording stub.
+# ---------------------------------------------------------------------------
+
+
+def _pad(
+    side: OrderSide, levels: tuple[tuple[str, int], ...],
+) -> tuple[list[BookOrder], list[int]]:
+    filler = BookOrder(side, Price(0, 2), Quantity(0, 0), 0)
+    orders = [BookOrder(side, Price.from_str(px), Quantity(size, 0), 0) for px, size in levels]
+    counts = [1] * len(orders)
+    while len(orders) < 10:
+        orders.append(filler)
+        counts.append(0)
+    return orders, counts
+
+
+def _fake_depth(*, instrument_id: InstrumentId, ask: str, ts_event: int) -> OrderBookDepth10:
+    bid_orders, bid_counts = _pad(OrderSide.BUY, (("0.01", 10),))
+    ask_orders, ask_counts = _pad(OrderSide.SELL, ((ask, 5),))
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bid_orders,
+        asks=ask_orders,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=0,
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+def _fake_quote(*, instrument_id: InstrumentId, ts_event: int) -> QuoteTick:
+    return QuoteTick(
+        instrument_id=instrument_id,
+        bid_price=Price.from_str("0.49"),
+        ask_price=Price.from_str("0.51"),
+        bid_size=Quantity.from_int(5),
+        ask_size=Quantity.from_int(5),
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    station = "SFO"
+    climate_day = dt.date(2026, 9, 1)
+    offset = -8.0
+    start_ns, _end_ns = decision_window_ns(climate_day=climate_day, std_utc_offset_hours=offset)
+    ts_event = start_ns + 10 * 60_000_000_000  # 10 minutes into the window
+
+    instrument = _weather_binary_option(
+        station=station, climate_day=climate_day.isoformat(), ts_init=0,
+    )
+    depth = _fake_depth(instrument_id=instrument.id, ask="0.50", ts_event=ts_event)
+    quote = _fake_quote(instrument_id=instrument.id, ts_event=ts_event)
+    tape_instrument = SimpleNamespace(
+        instrument=instrument,
+        facts=read_weather_bucket_facts(instrument.info),
+        depths=[depth],
+        quotes=[quote],
+        closes=[],
+    )
+
+    calls: list[tuple[tuple[int, ...], int, int]] = []
+
+    def _recording_window_extent(
+        ts_event_ns: Iterable[int], *, start_ns: int, end_ns: int,
+    ) -> WindowExtent:
+        values = tuple(ts_event_ns)
+        calls.append((values, start_ns, end_ns))
+        return window_extent(values, start_ns=start_ns, end_ns=end_ns)
+
+    monkeypatch.setattr(census_module, "window_extent", _recording_window_extent)
+    monkeypatch.setattr(
+        census_module, "_convert_live_capture",
+        lambda **kwargs: SimpleNamespace(instruments=lambda: [instrument]),
+    )
+    monkeypatch.setattr(
+        census_module, "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+
+    spans, clean_station_days, window_bounds = census_module._discover_clean_spans(
+        catalog_root=tmp_path,
+        subdirectory="live",
+        clean_ids=["instance-1"],
+        work_root=tmp_path / "work",
+    )
+
+    assert calls, "window_extent must be called, not re-implemented inline"
+    assert (station, climate_day.isoformat()) in clean_station_days
+    span = spans[(station, climate_day.isoformat())][0]
+    assert span.first_in_window_ns == ts_event
+    assert span.last_in_window_ns == ts_event
+    assert (station, climate_day.isoformat()) in window_bounds
+
+
+# ---------------------------------------------------------------------------
+# D1: --dump-instance-extents writes a diagnostic line per
+# (station, climate_day, instance_id); never versioned, never read back.
+# ---------------------------------------------------------------------------
+
+
+def test_d1_dump_instance_extents_writes_one_line_per_instance(tmp_path: Path) -> None:
+    span = InstanceSpan(
+        instance_id="instance-1",
+        verdict="CLEAN",
+        depth_window_minutes=45.0,
+        quote_window_minutes=10.0,
+        distinct_instruments=1,
+        first_in_window_ns=1_700_000_000_000_000_000,
+        last_in_window_ns=1_700_000_002_700_000_000,
+    )
+    dump_path = tmp_path / "extents.jsonl"
+
+    census_module._dump_instance_extents(
+        dump_path,
+        station_day_spans={("SFO", "2026-09-01"): [span]},
+        live_capture_start_by_instance={},
+        std_offset_by_station={"SFO": -8.0},
+    )
+
+    lines = dump_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["station"] == "SFO"
+    assert row["climate_day"] == "2026-09-01"
+    assert row["instance_id"] == "instance-1"
+    assert row["verdict"] == "CLEAN"
+    assert row["first_in_window_lst"] is not None
+    assert row["overlap_ns"] == {}
