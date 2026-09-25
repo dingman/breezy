@@ -664,3 +664,43 @@ def test_estimator_crash_lands_in_failed_not_a_bare_traceback(tmp_path: Path) ->
     failed_text = (stage_dir / "FAILED").read_text(encoding="utf-8")
     assert "1" in failed_text
     assert "Traceback" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-25 census-chunking fix: cell.sh --stage cal_b dispatch
+# ---------------------------------------------------------------------------
+def test_cell_sh_cal_b_dispatches_to_the_census_per_cell_cli_and_validates_its_args(
+    tmp_path: Path,
+) -> None:
+    """cal_b is a DIFFERENT computation from cal_a/cal_c (the boundary-delta
+    census, not a crossing-rate Monte-Carlo) -- cell.sh must dispatch it to
+    `aud07_m1c_census.py`, never to `aud07_live_rule_crossing_sim.py`, with
+    the same validated-args, no-eval discipline."""
+    run_dir = tmp_path / "runs"
+    env_ok = {
+        **os.environ,
+        "RUN_DIR": str(run_dir),
+        "STAGE": "cal_b",
+        "CODE_SHA": "deadbeef",
+        "N_REPS": "1",
+        "CUTOFF": (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    result = subprocess.run(
+        ["bash", str(_CELL_SH), "0"], env=env_ok, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    out_path = run_dir / "cal_b" / "cell_00.jsonl"
+    row = json.loads(out_path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["stage"] == "cal_b"
+    assert row["cell_index"] == 0
+    assert row["boundary_mode"] == "census"
+
+    # Missing N_REPS is refused (cal_b still needs it, for --reps-per-cell)
+    # before anything runs.
+    env_missing_n_reps = {k: v for k, v in env_ok.items() if k != "N_REPS"}
+    result2 = subprocess.run(
+        ["bash", str(_CELL_SH), "1"],
+        env=env_missing_n_reps, capture_output=True, text=True, check=False,
+    )
+    assert result2.returncode != 0
+    assert not (run_dir / "cal_b" / "cell_01.jsonl").exists()

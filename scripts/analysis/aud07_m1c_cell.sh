@@ -229,39 +229,57 @@ else
   code_sha="${CODE_SHA:?CODE_SHA is required}"
   _validate "$code_sha" '^[0-9a-f]{7,40}$' "CODE_SHA"
 
-  n_reps="${N_REPS:?N_REPS is required}"
-  _validate "$n_reps" "$_INT_RE" "N_REPS"
-
-  npts="${NPTS:?NPTS is required}"
-  _validate "$npts" "$_INT_RE" "NPTS"
-
-  boundary_mode="${BOUNDARY_MODE:-pure}"
-  _validate "$boundary_mode" '^(pure|refined)$' "BOUNDARY_MODE"
-
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-  argv=(
-    "${BREEZY_PYTHON:-python3}" "$script_dir/aud07_live_rule_crossing_sim.py"
-    --stage "$stage" --code-sha "$code_sha"
-    --cells "$cell_index:$((cell_index + 1))"
-    --n-reps "$n_reps" --npts "$npts"
-    --out "$out_path"
-  )
 
-  if [ "$boundary_mode" = "refined" ]; then
-    eps_pin="${EPS_PIN:?EPS_PIN is required when BOUNDARY_MODE=refined}"
-    _validate "$eps_pin" "$_PATH_RE" "EPS_PIN"
-    coarse_npts="${COARSE_NPTS:?COARSE_NPTS is required when BOUNDARY_MODE=refined}"
-    _validate "$coarse_npts" "$_INT_RE" "COARSE_NPTS"
-    argv+=(--boundary-mode refined --eps-pin "$eps_pin" --coarse-npts "$coarse_npts")
-    if [ -n "${AUDIT_EVERY:-}" ]; then
-      _validate "$AUDIT_EVERY" "$_INT_RE" "AUDIT_EVERY"
-      argv+=(--audit-every "$AUDIT_EVERY")
+  if [ "$stage" = "cal_b" ]; then
+    # cal_b dispatches to the CHUNKABLE census per-cell mode (2026-09-25
+    # fix), never to aud07_live_rule_crossing_sim.py -- cal_a/cal_c ARE
+    # crossing-rate Monte-Carlo runs the sim CLI already handles natively;
+    # cal_b is the coarse-vs-fine BOUNDARY-DELTA census, a different
+    # computation entirely.
+    n_reps="${N_REPS:?N_REPS is required}"
+    _validate "$n_reps" "$_INT_RE" "N_REPS"
+    argv=(
+      "${BREEZY_PYTHON:-python3}" "$script_dir/aud07_m1c_census.py"
+      --stage "$stage" --code-sha "$code_sha"
+      --cells "$cell_index:$((cell_index + 1))"
+      --reps-per-cell "$n_reps"
+      --out "$out_path"
+    )
+  else
+    n_reps="${N_REPS:?N_REPS is required}"
+    _validate "$n_reps" "$_INT_RE" "N_REPS"
+
+    npts="${NPTS:?NPTS is required}"
+    _validate "$npts" "$_INT_RE" "NPTS"
+
+    boundary_mode="${BOUNDARY_MODE:-pure}"
+    _validate "$boundary_mode" '^(pure|refined)$' "BOUNDARY_MODE"
+
+    argv=(
+      "${BREEZY_PYTHON:-python3}" "$script_dir/aud07_live_rule_crossing_sim.py"
+      --stage "$stage" --code-sha "$code_sha"
+      --cells "$cell_index:$((cell_index + 1))"
+      --n-reps "$n_reps" --npts "$npts"
+      --out "$out_path"
+    )
+
+    if [ "$boundary_mode" = "refined" ]; then
+      eps_pin="${EPS_PIN:?EPS_PIN is required when BOUNDARY_MODE=refined}"
+      _validate "$eps_pin" "$_PATH_RE" "EPS_PIN"
+      coarse_npts="${COARSE_NPTS:?COARSE_NPTS is required when BOUNDARY_MODE=refined}"
+      _validate "$coarse_npts" "$_INT_RE" "COARSE_NPTS"
+      argv+=(--boundary-mode refined --eps-pin "$eps_pin" --coarse-npts "$coarse_npts")
+      if [ -n "${AUDIT_EVERY:-}" ]; then
+        _validate "$AUDIT_EVERY" "$_INT_RE" "AUDIT_EVERY"
+        argv+=(--audit-every "$AUDIT_EVERY")
+      fi
     fi
-  fi
 
-  if [ -n "$arg_substream" ]; then
-    _validate "$arg_substream" "$_INT_RE" "substream"
-    argv+=(--substream "$arg_substream")
+    if [ -n "$arg_substream" ]; then
+      _validate "$arg_substream" "$_INT_RE" "substream"
+      argv+=(--substream "$arg_substream")
+    fi
   fi
 fi
 
