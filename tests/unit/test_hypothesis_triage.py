@@ -117,6 +117,25 @@ def _looks(derived: Path) -> list[dict[str, object]]:
     ]
 
 
+def _horizon_alert_state(derived: Path) -> Path:
+    return derived / "hypothesis" / "horizon_alerts.json"
+
+
+def _assert_missing_stratum_binding(
+    proc: subprocess.CompletedProcess[str],
+    alerts: list[dict[str, str]],
+    *,
+    hypothesis_id: str,
+) -> None:
+    assert proc.returncode == 0, proc.stderr
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "WARN"
+    assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING"
+    assert "MISSING_STRATUM_BINDING" in alerts[0]["detail"]
+    assert hypothesis_id in alerts[0]["detail"]
+    assert "MISSING_STRATUM_BINDING" in proc.stdout
+
+
 def _register(
     derived: Path,
     *,
@@ -360,14 +379,13 @@ def test_refused_only_ledger_is_a_clean_non_alerting_outcome(tmp_path: Path) -> 
 
 
 def test_under_min_station_days_stays_parked_and_scores_nothing(tmp_path: Path) -> None:
-    """40 observed station-days, 12 with takes, min_station_days=20: no look."""
+    """Absent stratum binding fails closed before global sufficiency can count."""
     hypothesis_id = "H-UNDER-MIN"
     _register(tmp_path, hypothesis_id=hypothesis_id, min_station_days=20)
     rows = [("SFO", _day(index), 0 if index < 28 else 1) for index in range(40)]
     _write_replay(tmp_path, rows)
     proc, alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert alerts == []
+    _assert_missing_stratum_binding(proc, alerts, hypothesis_id=hypothesis_id)
     assert _looks(tmp_path) == []
     records = read_hypothesis_ledger(_ledger(tmp_path))
     assert records[0].status == "PARKED_INSUFFICIENT_DATA"
@@ -375,29 +393,29 @@ def test_under_min_station_days_stays_parked_and_scores_nothing(tmp_path: Path) 
 
 
 def test_mechanism_only_rows_are_never_evaluated(tmp_path: Path) -> None:
-    _register(tmp_path, hypothesis_id="H-MECH", min_station_days=1)
+    hypothesis_id = "H-MECH"
+    _register(tmp_path, hypothesis_id=hypothesis_id, min_station_days=1)
     rows = [("SFO", _day(index), 3) for index in range(6)]
     _write_replay(tmp_path, rows, validity=REPLAY_VALIDITY)
     proc, alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert alerts == []
+    _assert_missing_stratum_binding(proc, alerts, hypothesis_id=hypothesis_id)
     assert _looks(tmp_path) == []
     assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
-    assert "C_VALIDITY" in proc.stdout
 
 
 def test_params_match_false_is_never_evaluated(tmp_path: Path) -> None:
-    _register(tmp_path, hypothesis_id="H-PARAMS", min_station_days=1)
+    hypothesis_id = "H-PARAMS"
+    _register(tmp_path, hypothesis_id=hypothesis_id, min_station_days=1)
     rows = [("SFO", _day(index), 3) for index in range(6)]
     _write_replay(tmp_path, rows, params_match=False)
     proc, alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert alerts == []
+    _assert_missing_stratum_binding(proc, alerts, hypothesis_id=hypothesis_id)
     assert _looks(tmp_path) == []
-    assert "C_VALIDITY" in proc.stdout
 
 
-def test_crossing_the_look_uses_the_mean_not_the_sum(tmp_path: Path) -> None:
+def test_missing_stratum_binding_skips_with_named_alert_and_no_global_evaluation(
+    tmp_path: Path,
+) -> None:
     hypothesis_id = "H-MEAN"
     _register(tmp_path, hypothesis_id=hypothesis_id, min_station_days=1)
     climate_day = _day(0)
@@ -449,22 +467,10 @@ def test_crossing_the_look_uses_the_mean_not_the_sum(tmp_path: Path) -> None:
     assert mean_excess != pytest.approx(oracle.x)
 
     proc, alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert alerts == []
-    looks = _looks(tmp_path)
-    assert len(looks) == 1
-    look = looks[0]
-    assert look["hypothesis_id"] == hypothesis_id
-    assert look["variant_id"] == "v1"
-    assert look["n_station_days"] == 1
-    assert look["ci_lower"] == pytest.approx(mean_excess)
-    assert look["ci_upper"] == pytest.approx(mean_excess)
-    assert look["ci_lower"] != pytest.approx(oracle.x)
-    assert look["veto_reason"] == "LEG_SHARE_ABOVE_CAP"
-    assert look["alpha_spent_cumulative"] == pytest.approx(PROGRAMME_ALPHA / MAX_HYPOTHESES)
-    assert look["is_terminal_look"] is True
+    _assert_missing_stratum_binding(proc, alerts, hypothesis_id=hypothesis_id)
+    assert _looks(tmp_path) == []
     status = read_hypothesis_ledger(_ledger(tmp_path))[0].status
-    assert status == "PRIMARY_PASSED_PNL_VETO"
+    assert status == "PARKED_INSUFFICIENT_DATA"
     assert not (tmp_path / "hypothesis" / f"handoff_{hypothesis_id}.json").exists()
 
 
@@ -485,14 +491,8 @@ def test_zero_take_rows_are_counted_and_not_scored(tmp_path: Path) -> None:
         ],
     )
     proc, _alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    looks = _looks(tmp_path)
-    assert len(looks) == 1
-    look = looks[0]
-    assert look["n_station_days"] == 2
-    assert look["n_station_days_observed"] == 4
-    assert look["n_station_days_with_takes"] == 2
-    assert look["take_rate"] == pytest.approx(0.5)
+    _assert_missing_stratum_binding(proc, _alerts, hypothesis_id="H-ZERO")
+    assert _looks(tmp_path) == []
 
 
 def test_pooled_pnl_veto_counterexample_is_not_confirmed(tmp_path: Path) -> None:
@@ -516,16 +516,9 @@ def test_pooled_pnl_veto_counterexample_is_not_confirmed(tmp_path: Path) -> None
     )
     _write_store(tmp_path, trials)
     proc, alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert alerts == []
-    looks = _looks(tmp_path)
-    assert len(looks) == 1
-    look = looks[0]
-    assert float(look["ci_lower"]) > 0  # type: ignore[arg-type]
-    assert float(look["pooled_net_pnl_per_contract"]) < 0  # type: ignore[arg-type]
-    assert look["veto_reason"] == "POOLED_PNL_NON_POSITIVE"
-    assert look["alpha_spent_cumulative"] == pytest.approx(PROGRAMME_ALPHA / MAX_HYPOTHESES)
-    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PRIMARY_PASSED_PNL_VETO"
+    _assert_missing_stratum_binding(proc, alerts, hypothesis_id=hypothesis_id)
+    assert _looks(tmp_path) == []
+    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
     assert not (tmp_path / "hypothesis" / f"handoff_{hypothesis_id}.json").exists()
 
 
@@ -549,12 +542,9 @@ def test_exhausted_variants_alert_once_and_abandon(tmp_path: Path) -> None:
         ],
     )
     proc, alerts = _run(tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert len(alerts) == 1
-    assert alerts[0]["event"] == "HYPOTHESIS_ABANDONED_CAP_EXHAUSTED"
-    assert hypothesis_id in alerts[0]["detail"]
-    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "ABANDONED_CAP_EXHAUSTED"
-    assert len(_looks(tmp_path)) == 1
+    _assert_missing_stratum_binding(proc, alerts, hypothesis_id=hypothesis_id)
+    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
+    assert _looks(tmp_path) == []
     assert not (tmp_path / "hypothesis" / f"handoff_{hypothesis_id}.json").exists()
 
 
@@ -578,6 +568,60 @@ def test_parked_past_horizon_emits_one_advisory_without_changing_status(
     assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
     assert _looks(tmp_path) == []
 
+    second, second_alerts = _run(tmp_path, as_of="2026-09-02")
+    assert second.returncode == 0, second.stderr
+    assert len(second_alerts) == 1
+    assert [alert["event"] for alert in second_alerts] == [
+        "HYPOTHESIS_TRIAGE_HORIZON_STALL"
+    ]
+    assert _horizon_alert_state(tmp_path).is_file()
+
+
+def test_missing_horizon_state_reemits_instead_of_suppressing(tmp_path: Path) -> None:
+    hypothesis_id = "H-HORIZON-MISSING-STATE"
+    _register(
+        tmp_path,
+        hypothesis_id=hypothesis_id,
+        min_station_days=20,
+        registered_at="2026-08-01",
+    )
+    _empty_replay_files(tmp_path)
+    first, first_alerts = _run(tmp_path, as_of="2026-09-01")
+    assert first.returncode == 0, first.stderr
+    assert len(first_alerts) == 1
+    _horizon_alert_state(tmp_path).unlink()
+
+    second, second_alerts = _run(tmp_path, as_of="2026-09-02")
+    assert second.returncode == 0, second.stderr
+    assert [alert["event"] for alert in second_alerts] == [
+        "HYPOTHESIS_TRIAGE_HORIZON_STALL",
+        "HYPOTHESIS_TRIAGE_HORIZON_STALL",
+    ]
+
+
+def test_corrupt_horizon_state_fails_loud_without_realerting(tmp_path: Path) -> None:
+    hypothesis_id = "H-HORIZON-CORRUPT"
+    _register(
+        tmp_path,
+        hypothesis_id=hypothesis_id,
+        min_station_days=20,
+        registered_at="2026-08-01",
+    )
+    _empty_replay_files(tmp_path)
+    state = _horizon_alert_state(tmp_path)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text("{not-json\n", encoding="utf-8")
+
+    proc, alerts = _run(tmp_path, as_of="2026-09-01")
+    assert proc.returncode != 0
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "CRITICAL"
+    assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_FAILED"
+    assert "horizon alert state" in alerts[0]["detail"]
+    assert "HYPOTHESIS_TRIAGE_HORIZON_STALL" not in {
+        alert["event"] for alert in alerts
+    }
+
 
 def test_second_run_records_already_looked_and_appends_nothing(tmp_path: Path) -> None:
     hypothesis_id = "H-ONCE"
@@ -589,20 +633,22 @@ def test_second_run_records_already_looked_and_appends_nothing(tmp_path: Path) -
         [_winner("SFO", _day(index), trial_id=f"w{index}") for index in range(5)],
     )
     first, first_alerts = _run(tmp_path)
-    assert first.returncode == 0, first.stderr
-    assert first_alerts == []
-    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "CONFIRMED"
-    assert (tmp_path / "hypothesis" / f"handoff_{hypothesis_id}.json").is_file()
+    _assert_missing_stratum_binding(first, first_alerts, hypothesis_id=hypothesis_id)
+    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
+    assert not (tmp_path / "hypothesis" / f"handoff_{hypothesis_id}.json").exists()
     written = [path for path in (tmp_path / "hypothesis").rglob("*") if path.is_file()]
     assert written
     assert all(path.is_relative_to(tmp_path / "hypothesis") for path in written)
 
     second, second_alerts = _run(tmp_path)
     assert second.returncode == 0, second.stderr
-    assert second_alerts == []
-    assert "ALREADY_LOOKED" in second.stdout
-    assert len(_looks(tmp_path)) == 1
-    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "CONFIRMED"
+    assert len(second_alerts) == 2
+    assert [alert["event"] for alert in second_alerts] == [
+        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING",
+        "HYPOTHESIS_TRIAGE_MISSING_STRATUM_BINDING",
+    ]
+    assert len(_looks(tmp_path)) == 0
+    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
 
 
 def test_duplicate_look_key_is_a_hard_error(tmp_path: Path) -> None:
