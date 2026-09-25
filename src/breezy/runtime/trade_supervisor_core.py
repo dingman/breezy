@@ -1481,9 +1481,21 @@ def latch_log_facts(
     from the same text: strategy-subscribed, permit-issued (+ the
     first-boot anchor), the first non-``UNKNOWN`` exit-1 cause, and the
     orders-not-requested marker. Used ONLY by B1, and ONLY on a drain the
-    dispatched handler itself did not perform (D6) -- the handlers' own
-    inline latching is untouched (FU-1 migrates them onto this helper
-    later)."""
+    dispatched handler itself did not perform (D6).
+
+    [FU-1, 2026-09-25] Investigated migrating ``_do_relaunch_check``,
+    ``_do_midday_watch``, and ``_do_self_check`` onto this helper; declined
+    for all three, byte-identical-behaviour constraint. Each handler's own
+    inline sequence is a real subset (or, for self-check, a structurally
+    different shape) of what this helper latches on the SAME text, and the
+    gap is observable, not cosmetic: ``_do_relaunch_check`` never records
+    ``midday_cause_seen``, ``_do_midday_watch`` never records
+    ``orders_not_requested_seen`` (both consumed by
+    :func:`permit_capability_valid` and by ``decide_midday_relaunch``'s
+    cause), and ``_do_self_check`` guards its latching on live-vs-latched
+    values this helper does not expose. Calling this helper from any of the
+    three would change alerting/relaunch behaviour, not just tidy the code,
+    so their inline latching stays untouched."""
     if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now_utc)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
