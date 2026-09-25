@@ -422,7 +422,7 @@ _ALLOWED_ASDICT_CALL_SITES: tuple[_AllowedAsdictCallSite, ...] = (
     ),
     _AllowedAsdictCallSite(
         path="scripts/analysis/promotion_proposal.py",
-        lineno=329,
+        lineno=375,
         arg_name="row",
         justification=(
             "`row` is a `CriterionRow` (breezy.analysis.promotion_criteria) -- "
