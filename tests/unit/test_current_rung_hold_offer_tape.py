@@ -314,8 +314,40 @@ def _line_bytes(record: OfferTapeRecord) -> int:
     return len(json.dumps(record.to_dict(), sort_keys=True).encode("utf-8")) + 1
 
 
-def test_default_sidecar_max_bytes_is_pinned_at_64_mib() -> None:
-    assert DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES == 64 * 1024 * 1024
+def test_default_sidecar_max_bytes_is_pinned_at_the_measured_2026_09_25_value() -> None:
+    """F-3 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md) re-pin: the 09-16 postmortem's
+    64 MiB pin is superseded by the 2026-09-25 disk measurement (09-22's
+    capped 64 MiB day projected to ~141 MiB uncapped through 01:00Z, plus an
+    unmeasured F-1a NO-side growth margin -- F-1a is not implemented on this
+    branch yet per Sequencing). This is a PROVISIONAL value pin, not a safety
+    test: it may move again once a live day is measured with F-1a merged."""
+    assert DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES == 512 * 1024 * 1024
+
+
+def test_half_cap_warn_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """AC2: one WARN when a sidecar crosses 50% of its cap -- distinct from,
+    and logged before, the existing at-cap WARN."""
+    path = tmp_path / "offer.jsonl"
+    one_line = _line_bytes(_RECORD)
+    # 4 lines fits comfortably under half of an 8-line cap; the 5th crosses it.
+    cap = one_line * 8
+    tape = OfferTape(path, sidecar_max_bytes=cap)
+
+    caplog.set_level(logging.WARNING, logger="breezy.strategy.current_rung_hold.offer_tape")
+    for _ in range(4):
+        tape.append(_RECORD)
+    assert not caplog.records
+
+    tape.append(_RECORD)  # 5th line crosses the 50% threshold
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "50%" in warnings[0].message or "half" in warnings[0].message.lower()
+
+    # Further rows below the cap never log a second half-cap WARN.
+    for _ in range(2):
+        tape.append(_RECORD)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
 
 
 def test_below_the_cap_every_row_is_written_unchanged(tmp_path: Path) -> None:
@@ -364,6 +396,10 @@ def test_at_the_cap_further_rows_stop_appending_to_disk_but_not_to_the_deque(
 def test_the_cap_warning_is_logged_exactly_once(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """F-3 (AC2) note: a cap this small (one line == the whole cap) crosses
+    BOTH the 50% half-cap threshold and the full cap on the very first
+    append, so exactly one HALF-CAP warning and one AT-CAP warning are
+    expected -- never more than one of either kind."""
     path = tmp_path / "offer.jsonl"
     one_line = _line_bytes(_RECORD)
     tape = OfferTape(path, sidecar_max_bytes=one_line)
@@ -374,7 +410,11 @@ def test_the_cap_warning_is_logged_exactly_once(
         tape.append(_RECORD)  # every one of these is refused
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
+    at_cap = [r for r in warnings if "reached its" in r.message]
+    half_cap = [r for r in warnings if "crossed 50%" in r.message]
+    assert len(at_cap) == 1
+    assert len(half_cap) == 1
+    assert len(warnings) == 2
     assert tape.sidecar_capped == 3
 
 

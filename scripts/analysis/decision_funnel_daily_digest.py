@@ -37,11 +37,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import json
 import os
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -299,7 +300,11 @@ def funnel_for_day(
 
 
 def format_digest_detail(
-    report: FunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None
+    report: FunnelReport,
+    *,
+    climate_day: str,
+    halt: FamilyHaltStatus | None = None,
+    capped_total: int = 0,
 ) -> str:
     """One alert line. Shadow is labelled as outside the orders funnel.
 
@@ -326,6 +331,8 @@ def format_digest_detail(
     )
     if halt is not None:
         base = f"{base} halt={halt.value}"
+    if capped_total > 0:
+        base = f"{base} truncated=1"
     halt_reason = f"halt_reason={halt.reason}" if halt is not None and halt.reason else None
     why = ",".join(f"{name}:{count}" for name, count in report.entry_reasons)
 
@@ -349,12 +356,22 @@ def format_digest_detail(
     )
     if halt is not None:
         short = f"{short} halt={halt.value}"
+    if capped_total > 0:
+        short = f"{short} truncated=1"
     return short[:MAX_ALERT_DETAIL_CHARS]
 
 
-def _read_jsonl(path: Path) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    with path.open(encoding="utf-8") as handle:
+def _iter_jsonl(path: Path) -> Iterator[dict[str, object]]:
+    """Stream one JSONL file line by line -- bounded memory regardless of
+    file size (F-3 AC4). Transparent `.gz` support (F-3 AC7): a `.gz` suffix
+    opens through :func:`gzip.open` in text mode, byte-identical decoding to
+    the plain path otherwise. A truncated or malformed final line raises
+    exactly as it would mid-stream (F-3 AC5) -- the caller's own
+    ``except (json.JSONDecodeError, ValueError, TypeError)`` around
+    consuming this generator is unchanged.
+    """
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, mode="rt", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
             if not stripped:
@@ -362,12 +379,57 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
             payload = json.loads(stripped)
             if not isinstance(payload, dict):
                 raise TypeError("offer-tape line is not a JSON object")
-            rows.append(payload)
-    return rows
+            yield payload
+
+
+def _resolve_readable_path(path: Path) -> Path:
+    """F-3 AC7: `.jsonl` or its `.jsonl.gz` sibling, whichever exists.
+
+    `path` itself is returned unchanged when it exists (including when the
+    caller already passed a `.gz` path directly), or when NEITHER form
+    exists -- the caller's own missing-file diagnostic is unchanged either
+    way; this function only redirects to a `.gz` sibling that is actually on
+    disk.
+    """
+    if path.is_file():
+        return path
+    gz_sibling = path.with_name(path.name + ".gz")
+    if gz_sibling.is_file():
+        return gz_sibling
+    return path
+
+
+def _capped_total_from_summary(tape_path: Path, climate_day: str) -> int:
+    """F-3 AC3: sum `offer_tape_capped` across the day's diagnostics-summary
+    sidecar (F-2's own artefact, `diagnostics_summary_<day>.jsonl[.gz]`,
+    Design line 588) -- read-only and best-effort, exactly like
+    :func:`read_family_halt_status`: F-2 has not landed on this branch yet
+    (Sequencing places F-3 first), so the summary file is commonly absent,
+    and any read/decode failure here must never fail the main offer-tape
+    funnel. Returns 0 when absent, unreadable, or every row's `offer_tape_
+    capped` is 0/absent -- never raises.
+    """
+    candidate = tape_path.parent / f"diagnostics_summary_{climate_day}.jsonl"
+    summary_path = _resolve_readable_path(candidate)
+    if not summary_path.is_file():
+        return 0
+    total = 0
+    try:
+        for row in _iter_jsonl(summary_path):
+            value = row.get("offer_tape_capped")
+            if isinstance(value, int) and not isinstance(value, bool):
+                total += value
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return 0
+    return total
 
 
 def _artefact(
-    report: FunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None
+    report: FunnelReport,
+    *,
+    climate_day: str,
+    halt: FamilyHaltStatus | None = None,
+    capped_total: int = 0,
 ) -> dict[str, object]:
     totals = report.totals
     artefact: dict[str, object] = {
@@ -393,17 +455,24 @@ def _artefact(
     if halt is not None:
         artefact["halt_enforced"] = halt.value
         artefact["halt_reason"] = halt.reason
+    if capped_total > 0:
+        artefact["truncated"] = 1
     return artefact
 
 
 def _write_artefact(
-    directory: Path, report: FunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None
+    directory: Path,
+    report: FunnelReport,
+    *,
+    climate_day: str,
+    halt: FamilyHaltStatus | None = None,
+    capped_total: int = 0,
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"decision_funnel_{climate_day}.json"
+    artefact = _artefact(report, climate_day=climate_day, halt=halt, capped_total=capped_total)
     path.write_text(
-        json.dumps(_artefact(report, climate_day=climate_day, halt=halt), indent=2, sort_keys=True)
-        + "\n",
+        json.dumps(artefact, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     path.chmod(0o600)
@@ -460,7 +529,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         climate_day = args.climate_day
     else:
         climate_day = default_climate_day(dt.datetime.now(dt.UTC)).isoformat()
-    tape = (
+    tape = _resolve_readable_path(
         Path(args.tape)
         if args.tape
         else _DEFAULT_TAPE_DIR / f"offer_tape_{climate_day}.jsonl"
@@ -476,8 +545,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         _emit(sink, detail=str(missing))
         return 0
     try:
-        rows = _read_jsonl(tape)
-        report = funnel_for_day(rows, window_open_stations=stations)
+        report = funnel_for_day(_iter_jsonl(tape), window_open_stations=stations)
     except UnknownOfferTapeSourceError as exc:
         _emit(sink, detail=f"unrecognised offer-tape source {exc.source!r} for {climate_day}")
         return 1
@@ -485,8 +553,16 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         _emit(sink, detail=f"decision tape unreadable for {climate_day}")
         return 1
     halt = _resolve_halt_status(args, source_env)
-    _emit(sink, detail=format_digest_detail(report, climate_day=climate_day, halt=halt))
-    _write_artefact(output_dir, report, climate_day=climate_day, halt=halt)
+    capped_total = _capped_total_from_summary(tape, climate_day)
+    _emit(
+        sink,
+        detail=format_digest_detail(
+            report, climate_day=climate_day, halt=halt, capped_total=capped_total
+        ),
+    )
+    _write_artefact(
+        output_dir, report, climate_day=climate_day, halt=halt, capped_total=capped_total
+    )
     return 0
 
 

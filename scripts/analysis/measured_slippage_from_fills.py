@@ -49,7 +49,9 @@ This script makes NO change to `DOCUMENTED_TAKER_FEE_COEFFICIENT` or the
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import re
 import sqlite3
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -244,14 +246,29 @@ def summarize_slippage(
     )
 
 
+#: F-3 R5: the exact `offer_tape_<date>.jsonl[.gz]` name shape retention
+#: produces -- used both to open a path transparently and to dedupe the glob
+#: below by date.
+_OFFER_TAPE_NAME_RE: Final[re.Pattern[str]] = re.compile(
+    r"^offer_tape_(\d{4}-\d{2}-\d{2})\.jsonl(\.gz)?$"
+)
+
+
 def count_refused_priced_offer_tape_records(paths: Iterable[Path]) -> dict[str, int]:
     """§7 step 0: per-file count of `decision="refuse"` records with a
     non-null `ask` -- a triggered evaluation that priced the market but did
-    not result in a Take. Decoded via `OfferTapeRecord.from_dict`."""
+    not result in a Take. Decoded via `OfferTapeRecord.from_dict`.
+
+    F-3 R5: transparently reads a gzipped sidecar (retention's atomic-gzip
+    output) exactly like the plain `.jsonl` -- same decode path, same
+    counts, so a retention-compressed file changes nothing this script
+    reports.
+    """
     counts: dict[str, int] = {}
     for path in paths:
         count = 0
-        with path.open("r", encoding="utf-8") as fh:
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, mode="rt", encoding="utf-8") as fh:
             for line in fh:
                 stripped = line.strip()
                 if not stripped:
@@ -261,6 +278,31 @@ def count_refused_priced_offer_tape_records(paths: Iterable[Path]) -> dict[str, 
                     count += 1
         counts[path.name] = count
     return counts
+
+
+def glob_offer_tape_paths(decisions_dir: Path) -> list[Path]:
+    """F-3 R5/AC7: every `offer_tape_<date>.jsonl` OR `.jsonl.gz` under
+    `decisions_dir`, one entry per date, sorted by date. When retention's
+    atomic-gzip crash window (Rev 3.1) leaves BOTH forms on disk for the same
+    date, the plain `.jsonl` is preferred -- it is unambiguously the
+    original, never partially written, and matches what every other reader
+    (the digest, `band_decider_stage0b_screen.py`) also prefers.
+    """
+    by_date: dict[str, Path] = {}
+    for path in decisions_dir.iterdir():
+        match = _OFFER_TAPE_NAME_RE.match(path.name)
+        if match is None or not path.is_file():
+            continue
+        date = match.group(1)
+        is_gz = match.group(2) is not None
+        existing = by_date.get(date)
+        if existing is None:
+            by_date[date] = path
+        elif existing.suffix == ".gz" and not is_gz:
+            # A later .jsonl replaces an earlier .gz for the same date --
+            # never the reverse (.jsonl always wins).
+            by_date[date] = path
+    return [by_date[date] for date in sorted(by_date)]
 
 
 #: §6 item 2 (round 4 corrected): the field-by-field comparison of
@@ -484,7 +526,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     measurements, unresolved = join_fills_to_decision_ask(fills, trial_records)
     summary = summarize_slippage(measurements, unresolved_venue_order_ids=unresolved)
 
-    offer_tape_paths = sorted(args.decisions_dir.glob("offer_tape_*.jsonl"))
+    offer_tape_paths = glob_offer_tape_paths(args.decisions_dir)
     offer_tape_counts = count_refused_priced_offer_tape_records(offer_tape_paths)
 
     doc = render_evidence_doc(

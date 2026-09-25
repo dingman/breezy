@@ -564,3 +564,155 @@ def test_main_reports_halt_enforced_yes_from_a_real_store(
     artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
     assert artefact["halt_enforced"] == "yes"
     assert artefact["halt_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# F-3 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): tape cap, streaming digest,
+# retention. The digest streams line by line (bounded memory), reads a
+# gzipped tape transparently, exits 1 on a truncated/malformed last line, and
+# reports `truncated=1` when the day's diagnostics-summary sidecar (F-2's
+# artefact -- not implemented on this branch yet per Sequencing; this reader
+# is built against F-2's own pinned `offer_tape_capped` schema, Design line
+# 588, so it is forward-compatible once F-2's writer lands) recorded any
+# sidecar-cap refusals.
+# ---------------------------------------------------------------------------
+
+import gzip
+
+
+def _write_bulk_tape(path: Path, n: int) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for i in range(n):
+            handle.write(json.dumps(_row(source="quote", observed_at_ns=i)) + "\n")
+
+
+def test_digest_streams_bounded_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import tracemalloc
+
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    _write_bulk_tape(tape, 100_000)
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    tracemalloc.start()
+    try:
+        code = _DIGEST.main(
+            [
+                "--tape", str(tape),
+                "--climate-day", "2026-09-20",
+                "--stations", "MIA",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "absent.sqlite"),
+            ]
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert code == 0
+    assert peak < 50 * 1024 * 1024, f"peak traced memory {peak} bytes exceeds the 50 MB bound"
+
+
+def test_truncated_last_line_exits_1_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    good = json.dumps(_row(source="quote", observed_at_ns=1))
+    # A truncated final line -- no closing brace, no trailing newline, exactly
+    # what a process killed mid-write would leave behind.
+    tape.write_text(good + "\n" + '{"station": "MIA", "sourc', encoding="utf-8")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--output-dir", str(tmp_path / "out"),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 1
+    assert len(sink.payloads) == 1
+    assert "unreadable" in sink.payloads[0].detail
+
+
+def test_reads_gz_tape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No `--tape` given: the default `<dir>/offer_tape_<day>.jsonl` path is
+    absent, but its `.jsonl.gz` sibling exists and is read transparently."""
+    tape_dir = tmp_path / "decisions"
+    tape_dir.mkdir()
+    gz_path = tape_dir / "offer_tape_2026-09-20.jsonl.gz"
+    with gzip.open(gz_path, "wt", encoding="utf-8") as handle:
+        handle.write(json.dumps(_row(source="quote", observed_at_ns=7)) + "\n")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    monkeypatch.setattr(_DIGEST, "_DEFAULT_TAPE_DIR", tape_dir)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(out),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 0
+    assert len(sink.payloads) == 1
+    assert "e=1" in sink.payloads[0].detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["totals"]["decisions_emitted"] == 1
+
+
+def test_truncated_flag_from_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8")
+    summary = tmp_path / "diagnostics_summary_2026-09-20.jsonl"
+    summary.write_text(
+        json.dumps({"offer_tape_capped": 0}) + "\n" + json.dumps({"offer_tape_capped": 3}) + "\n",
+        encoding="utf-8",
+    )
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(out),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 0
+    assert "truncated=1" in sink.payloads[0].detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["truncated"] == 1
+
+
+def test_truncated_flag_absent_when_no_summary_or_zero_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(json.dumps(_row(source="quote", observed_at_ns=1)) + "\n", encoding="utf-8")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(tmp_path / "out"),
+            "--store-path", str(tmp_path / "absent.sqlite"),
+        ]
+    )
+
+    assert code == 0
+    assert "truncated=1" not in sink.payloads[0].detail

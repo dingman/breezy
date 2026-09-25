@@ -8,6 +8,7 @@ station-month and discards each station-day after aggregation.
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import math
 import os
@@ -575,7 +576,15 @@ def score_tape(
         "stations": defaultdict(int),
         "reasons_first90": defaultdict(int),
     }
-    with TAPE_PATH.open() as handle:
+    # F-3 AC7: retention gzips a tape older than N days -- fall back to the
+    # `.gz` sibling when the plain pinned path is gone, never the reverse.
+    tape_path = TAPE_PATH
+    if not tape_path.is_file():
+        gz_sibling = tape_path.with_name(tape_path.name + ".gz")
+        if gz_sibling.is_file():
+            tape_path = gz_sibling
+    opener = gzip.open if tape_path.suffix == ".gz" else open
+    with opener(tape_path, mode="rt") as handle:
         for line in handle:
             diag["n_jsonl"] += 1
             rec = json.loads(line)
