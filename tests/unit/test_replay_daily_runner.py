@@ -56,6 +56,8 @@ def _row(
     live_instance_count: int = 0,
     winner_first_in_window_ns: int | None = 1_000,
     winner_last_in_window_ns: int | None = 2_000,
+    window_start_ns: int = 0,
+    window_end_ns: int = 18_000_000_000_000,
 ) -> ReplaySufficiency:
     return ReplaySufficiency(
         schema_version=REPLAY_SUFFICIENCY_SCHEMA_VERSION,
@@ -68,8 +70,8 @@ def _row(
         quote_window_minutes=300.0,
         distinct_instruments=4,
         computed_day="2026-09-25",
-        window_start_ns=0,
-        window_end_ns=18_000_000_000_000,
+        window_start_ns=window_start_ns,
+        window_end_ns=window_end_ns,
         winner_first_in_window_ns=winner_first_in_window_ns,
         winner_last_in_window_ns=winner_last_in_window_ns,
         window_complete=window_complete,
@@ -880,3 +882,257 @@ def test_main_report_skip_dispatches_without_the_run_once_flags(tmp_path: Path) 
 def test_main_requires_the_usual_flags_when_report_skip_is_absent() -> None:
     with pytest.raises(SystemExit):
         runner.main([])
+
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 1: record_blocked provenance kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_record_blocked_default_kwargs_row_unchanged(tmp_path: Path) -> None:
+    """Regression pin: every pre-existing call site (none of which passes
+    the new kwargs) still writes a byte-identical row."""
+    path = tmp_path / "replay_results.jsonl"
+    runner.record_blocked(
+        results_path=path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
+        lag_minutes=LAG_MINUTES, blocked_reason="ASOS_CACHE_EMPTY", sink=_RecordingSink(),
+    )
+    row = read_replay_results(path)[0]
+    assert row.family_id is None
+    assert row.manifest_taker_fee_coefficient is None
+    assert row.engine_required_fee_coefficient is None
+    assert row.tape_instance_id is None
+    assert row.refusal_counts == {}
+
+
+def test_fee_schedule_mismatch_gets_a_blocked_remediation_entry(tmp_path: Path) -> None:
+    path = tmp_path / "replay_results.jsonl"
+    sink = _RecordingSink()
+    for _ in range(3):
+        runner.record_blocked(
+            results_path=path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
+            lag_minutes=LAG_MINUTES, blocked_reason="FEE_SCHEDULE_MISMATCH", sink=sink,
+        )
+    assert len(sink.payloads) == 1
+    detail = sink.payloads[0].detail  # type: ignore[attr-defined]
+    assert "theta" in detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 1: `fee_void_keys` / AC2
+# ---------------------------------------------------------------------------
+
+
+def _fee_mismatch_blocked_row(
+    *, manifest_taker_fee_coefficient: str, station: str = STATION, climate_day: str = CLIMATE_DAY,
+) -> ReplayResult:
+    return ReplayResult(
+        schema_version=REPLAY_RESULTS_SCHEMA_VERSION, run_ts="2026-09-25T15:50:00+00:00",
+        station=station, climate_day=climate_day, strategy=STRATEGY, lag_minutes=LAG_MINUTES,
+        outcome="BLOCKED", validity=REPLAY_VALIDITY, blocked_reason="FEE_SCHEDULE_MISMATCH",
+        exception_type=None, family_id="pm_us_crh_v2", manifest_sha256=None,
+        manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,
+        engine_required_fee_coefficient=manifest_taker_fee_coefficient,
+        engine_params_source=None, params_match=None, composition_kind=None,
+        tape_instance_id="5a111bca-0000-0000-0000-000000000000", sufficiency_reason="", trials=0,
+        fills=0, fill_price_vs_decision_ask=(),
+        refusal_counts={"fee_schedule_mismatch": 1, "outside_decision_window": 26_215},
+        wall_s=None, peak_rss_bytes=None, parquet_sha256=None, window_complete=None,
+        replayed_first_ns=None, replayed_last_ns=None, census_schema_version=None,
+    )
+
+
+def test_select_target_skips_key_with_fee_mismatch_blocked_row_for_same_theta() -> None:
+    """Review requirement 1: theta is compared as `Decimal`, never as raw
+    strings -- `"0.0700"` and `Decimal("0.07")` are the SAME theta."""
+    rows = [_row()]
+    blocked = [_fee_mismatch_blocked_row(manifest_taker_fee_coefficient="0.0700")]
+    target = runner.select_target(
+        rows=rows, replayed=blocked, drift=(), required_fee_coefficient=Decimal("0.07"),
+    )
+    assert target is None
+
+
+def test_select_target_reselects_fee_mismatch_key_for_a_different_theta() -> None:
+    """A day voided under one family's theta is NOT excluded for another."""
+    rows = [_row()]
+    blocked = [_fee_mismatch_blocked_row(manifest_taker_fee_coefficient="0.07")]
+    target = runner.select_target(
+        rows=rows, replayed=blocked, drift=(), required_fee_coefficient=Decimal("0.06"),
+    )
+    assert target is not None
+
+
+# ---------------------------------------------------------------------------
+# AUD-09b amendment fee-regime plan, Phase 1: `run_once` net (1) + AC5
+# ---------------------------------------------------------------------------
+
+
+def _fake_subprocess_fee_mismatch(
+    output_dir: Path, *, trials: int = 0,
+) -> Sequence[str]:
+    def fake_subprocess(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        script = argv[1]
+        if "asos_cache_csv.py" in script:
+            return _completed_process(0)
+        assert "current_rung_hold_paper_replay.py" in script
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if trials:
+            scored = [
+                ScoredTrial(
+                    trial_id="t1", station=STATION, climate_day=CLIMATE_DAY, instrument_id="i1",
+                    settlement_tmax_f=70, held=True, pnl=Decimal("0.5"), revision_seq=1,
+                    raw_sha256="x", scored_at_ns=1, score_seq=0, settlement_basis="nws_final",
+                    excluded_reason=None, slippage=Decimal("0.01"), entry_ask=Decimal("0.4"),
+                    fill_px=Decimal("0.41"), fee=Decimal("0.02"),
+                )
+            ]
+            write_scored_trials(output_dir, scored, now_ns=2)
+        (output_dir / "family_params.json").write_text(
+            json.dumps(
+                {
+                    "family_id": "pm_us_crh_v4",
+                    "manifest_sha256": "a" * 64,
+                    "manifest_taker_fee_coefficient": "0.0695",
+                    "engine_required_fee_coefficient": "0.06",
+                    "engine_params_source": "FAMILY_MANIFEST",
+                    "params_match": False,
+                    "composition_kind": "continuous_rung_hold",
+                }
+            )
+        )
+        return _completed_process(
+            0,
+            stdout=(
+                "strategy refusals: {'fee_schedule_mismatch': 1, "
+                "'outside_decision_window': 26215}\n"
+            ),
+        )
+
+    return fake_subprocess  # type: ignore[return-value]
+
+
+def test_run_once_records_blocked_fee_schedule_mismatch_not_completed(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    exit_code = runner.run_once(
+        config, run_subprocess=_fake_subprocess_fee_mismatch(output_dir), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    assert rows[0].outcome == "BLOCKED"
+    assert rows[0].blocked_reason == "FEE_SCHEDULE_MISMATCH"
+
+
+def test_fee_mismatch_blocked_row_carries_family_and_theta_provenance(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    runner.run_once(
+        config, run_subprocess=_fake_subprocess_fee_mismatch(output_dir), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    row = read_replay_results(config.replay_results_path)[0]
+    assert row.family_id == "pm_us_crh_v4"
+    assert row.manifest_taker_fee_coefficient == "0.0695"
+    assert row.engine_required_fee_coefficient == "0.06"
+    assert row.tape_instance_id == "5a111bca-0000-0000-0000-000000000000"
+    assert row.refusal_counts == {"fee_schedule_mismatch": 1, "outside_decision_window": 26_215}
+
+
+def test_fee_mismatch_with_nonzero_trials_still_blocked_and_zeroed(tmp_path: Path) -> None:
+    """AC1: a partial day under a latched halt is contaminated -- fails
+    closed even when the engine produced trials."""
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    runner.run_once(
+        config, run_subprocess=_fake_subprocess_fee_mismatch(output_dir, trials=1),
+        sink=_RecordingSink(), work_dir_factory=lambda: tmp_path / "work",
+    )
+    row = read_replay_results(config.replay_results_path)[0]
+    assert row.outcome == "BLOCKED"
+    assert row.trials == 0
+    assert row.fills == 0
+
+
+def test_fee_mismatch_quarantines_output_dir_and_recovered_never_adopts_it(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    runner.run_once(
+        config, run_subprocess=_fake_subprocess_fee_mismatch(output_dir, trials=1),
+        sink=_RecordingSink(), work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert not output_dir.exists()
+    quarantined = sorted(output_dir.parent.glob(f"{output_dir.name}.fee_void.*"))
+    assert len(quarantined) == 1
+    assert sorted(quarantined[0].glob("scored_trials_*.parquet"))
+
+    # A second run never sees a RECOVERED parquet under the original path --
+    # the day is durably excluded for this SAME family theta instead.
+    def _fail_if_called(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("no subprocess should run: the day is fee-void-excluded")
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_fail_if_called, sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    assert len(read_replay_results(config.replay_results_path)) == 1
+
+
+def test_fee_mismatch_does_not_reselect_same_day_next_run(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row()])
+    output_dir = (
+        config.output_root / "paper_replay/scored_trials/v3" / STATION / CLIMATE_DAY
+        / f"lag_{LAG_MINUTES}"
+    )
+    runner.run_once(
+        config, run_subprocess=_fake_subprocess_fee_mismatch(output_dir), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    first_rows = read_replay_results(config.replay_results_path)
+    assert len(first_rows) == 1
+
+    def _fail_if_called(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("no subprocess should run on the second call")
+
+    exit_code = runner.run_once(
+        config, run_subprocess=_fail_if_called, sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    assert read_replay_results(config.replay_results_path) == first_rows
+
+
+def test_three_consecutive_fee_mismatch_blocked_rows_fire_stall_alert(tmp_path: Path) -> None:
+    path = tmp_path / "replay_results.jsonl"
+    sink = _RecordingSink()
+    for _ in range(3):
+        runner.record_blocked(
+            results_path=path, station=STATION, climate_day=CLIMATE_DAY, strategy=STRATEGY,
+            lag_minutes=LAG_MINUTES, blocked_reason="FEE_SCHEDULE_MISMATCH", sink=sink,
+        )
+    assert len(sink.payloads) == 1
+    assert sink.payloads[0].event == "BREEZY_REPLAY_STALLED"  # type: ignore[attr-defined]
+
+
