@@ -1481,9 +1481,27 @@ def latch_log_facts(
     from the same text: strategy-subscribed, permit-issued (+ the
     first-boot anchor), the first non-``UNKNOWN`` exit-1 cause, and the
     orders-not-requested marker. Used ONLY by B1, and ONLY on a drain the
-    dispatched handler itself did not perform (D6) -- the handlers' own
-    inline latching is untouched (FU-1 migrates them onto this helper
-    later)."""
+    dispatched handler itself did not perform (D6).
+
+    [FU-1, 2026-09-25] Investigated migrating ``_do_relaunch_check``,
+    ``_do_midday_watch``, and ``_do_self_check`` onto this helper; declined
+    for all three, byte-identical-behaviour constraint (each handler's own
+    inline sequence is gated on live-vs-latched values, or an early return,
+    this helper does not expose, so calling it directly would change
+    alerting/relaunch behaviour, not just tidy the code).
+
+    That investigation found the three handlers' own inline sequences were
+    NOT actually at parity with what this helper latches from the same
+    drained text: ``_do_relaunch_check`` never recorded ``midday_cause_seen``,
+    and both ``_do_midday_watch`` and ``_do_self_check`` never recorded
+    ``orders_not_requested_seen`` -- each a real gap (fixed inline, same
+    2026-09-25 change, not by migrating onto this helper), since B1's own
+    call to this helper is skipped whenever the dispatched handler is the
+    one that read the log (``handler_read_log``), and by the time B1 next
+    runs, the shared, offset-draining ``IncrementalLogReader``'s next delta
+    no longer holds the line. All four handlers (this helper plus the three
+    inline callers) now latch the same superset of facts from a delta they
+    each drain -- parity restored without merging their control flow."""
     if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now_utc)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)

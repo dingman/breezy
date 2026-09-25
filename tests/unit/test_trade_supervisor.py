@@ -4558,6 +4558,135 @@ class TestFirstBootPermitAnchor:
 
 
 # ===========================================================================
+# [FU-1, 2026-09-25] `_do_midday_watch`, `_do_relaunch_check`, and
+# `_do_self_check` each drain the SAME shared, offset-consuming
+# `IncrementalLogReader` as B1's own `_do_permit_watch` -- and B1 skips its
+# OWN `latch_log_facts` call for a delta the dispatched handler already
+# read (`handler_read_log`). Every fact `latch_log_facts` would have
+# latched from that delta must therefore be latched by the handler that
+# actually consumed it, or it is gone forever. Two gaps were found (the
+# not-requested marker in `_do_midday_watch`, the exit-1 cause in
+# `_do_relaunch_check`), plus a third in `_do_self_check` -- structurally
+# different (no B1-style `handler_read_log` flag exists for it), but it
+# reads through the exact same shared reader and never latched either fact
+# either, so the same drain can silently lose them there too.
+# ===========================================================================
+
+
+class TestGapHandlersLatchEveryLogFact:
+    def test_midday_watch_latches_the_not_requested_marker_from_its_own_read(self, tmp_path):
+        """A pure-shadow-mode child (orders never requested) must resolve to
+        `NOT_REQUIRED`, not a false `ABSENT`/`LAPSED` CRITICAL -- but only if
+        the marker `_do_midday_watch` itself just drained is latched."""
+        from breezy.runtime.trade_supervisor_core import (
+            PermitCapability,
+            permit_capability_valid,
+        )
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(PERMIT_NOT_REQUESTED_MARKER + "\n")
+        reader = IncrementalLogReader()
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+        state = initial_scheduler_state(_DAY)
+        now = _utc(20, 0)
+
+        _tracked_pid, _node_log_out, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert state.orders_not_requested_seen is True
+        now_ns = int(now.timestamp() * 1e9)
+        capability = permit_capability_valid(
+            state, now_ns, child_alive=True, log_available=True, midday_budget_live=True
+        )
+        assert capability is PermitCapability.NOT_REQUIRED
+
+    def test_relaunch_check_latches_the_midday_cause_from_its_own_read(self, tmp_path):
+        """A transient-fault line may print well before the process is
+        actually observed dead -- this poll (process still alive) may be
+        the LAST one whose delta holds it (see the analogous
+        `_do_midday_watch` race). `state.midday_cause_seen` must survive to
+        `decide_midday_relaunch` later in the day, but
+        `_do_relaunch_check` never called `record_midday_cause_seen`."""
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        reader = IncrementalLogReader()
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+        state = initial_scheduler_state(_DAY)
+
+        _tracked_pid, _node_log_out, state = _do_relaunch_check(
+            ports=ports,
+            state=state,
+            now=_utc(16, 55),
+            tracked_pid=1001,
+            node_log=node_log,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+
+        assert state.midday_cause_seen == RelaunchCause.TRANSIENT
+        decision = decide_midday_relaunch(
+            now=_utc(20, 0),
+            window_end=midday_watch_window_end(_DAY),
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=state.midday_cause_seen,
+        )
+        assert decision.should_relaunch is True
+
+    def test_self_check_also_latches_both_facts_from_its_own_read(self, tmp_path):
+        """`_do_self_check` has no `handler_read_log` flag of its own, but it
+        reads through the identical shared reader and never latched either
+        fact -- the same drain-loss FU-1 fixes in the other two handlers."""
+        from breezy.runtime.trade_supervisor_core import (
+            PermitCapability,
+            latch_log_facts,
+            permit_capability_valid,
+        )
+
+        # Sanity: `latch_log_facts` itself latches both facts from this text
+        # -- the handler must match it, never fall behind it.
+        reference = latch_log_facts(
+            initial_scheduler_state(_DAY),
+            _utc(17, 5),
+            _TRADING_NODE_FAILED_LINE + PERMIT_NOT_REQUESTED_MARKER + "\n",
+        )
+        assert reference.midday_cause_seen == RelaunchCause.TRANSIENT
+        assert reference.orders_not_requested_seen is True
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE + PERMIT_NOT_REQUESTED_MARKER + "\n")
+        reader = IncrementalLogReader()
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=reader.read_new)
+        state = initial_scheduler_state(_DAY)
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=1001,
+            node_log=node_log,
+            state=state,
+        )
+
+        assert state.midday_cause_seen == RelaunchCause.TRANSIENT
+        assert state.orders_not_requested_seen is True
+        now_ns = int(_utc(17, 5).timestamp() * 1e9)
+        capability = permit_capability_valid(
+            state, now_ns, child_alive=True, log_available=True, midday_budget_live=True
+        )
+        assert capability is PermitCapability.NOT_REQUIRED
+
+
+# ===========================================================================
 # [2026-09-15] Plan §4 step 7: `_run_forever`'s dispatch must route
 # `Phase.MIDDAY_WATCH` into `_do_midday_watch`, never fall through the bare
 # `else` into `_do_self_check`.
