@@ -21,4 +21,10 @@ secrets/
 # from an authenticated private endpoint must carry the PRIVATE_ prefix so it
 # can never be added by a bare `git add docs/`.
 docs/evidence/venue/**/PRIVATE_*
+
+# AUD-02 A0: fee-drift evidence pull's raw wire-JSON captures. Outside git
+# deliberately -- the evidence doc (docs/evidence/venue/polymarket_us/
+# FEE_DRIFT_EVIDENCE_2026-09-25.md) records each day's sha256 manifest
+# instead, and no retention job may prune this directory (Rev 2.1 item 4).
+data/evidence/fee_drift/
 .venv

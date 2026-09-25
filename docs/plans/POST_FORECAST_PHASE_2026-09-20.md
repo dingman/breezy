@@ -391,3 +391,65 @@ WP-Q1 (tape gaps) -> C0 -> C1   <- C only as an S rider, and only if the
 
 **The single most important change in this amendment:** WP-B0 comes first.
 Every detector in this plan is worthless until an alert can reach a human.
+
+---
+
+# AMENDMENT C — AUD-02 status fold-in (2026-09-25)
+
+Authority: `docs/plans/backlog/AUDIT_2026-09-21/AUD-02-edge-discovery-programme-status-and-fold-in.md`
+§6.1–6.2, §7 step 1. Amendments A and B remain binding; nothing here re-litigates them.
+
+## C-1 — Work packages DONE (verified against git history)
+- **WP-B0 (alert egress): DONE** — `f97c26f feat(wp-b0)`; tee to log AND webhook `bcb82d6`.
+- **WP-R1 (zero-orders / all-refused detector): DONE** — `6aa9d92 feat(wp-r1)`,
+  calibration fix `e83fc5c fix(wp-r1)`.
+- **B2 (kernel guard): DONE** — `a49c7b4 feat(wp-b2)`, 2026-09-20, as ONE kernel guard per B-5
+  (`PermitExpiredRefusedError`, `runtime/backtest_order_guard.py`). AUD-02 §3's "no matching
+  commit" for B2 is CORRECTED here. Verification: `docs/evidence/WP-B2_verification_2026-09-25.md`.
+
+## C-2 — A1 is RULED (ii); enforcement record
+A1: **(ii) STOP TRADING THIS SURFACE**, peer-ENDORSED —
+`docs/evidence/RULING_A1_pm_us_crh_v4_disposition_2026-09-21.md` (Rev 3; review
+`docs/evidence/reviews/RULING_A1_review_2026-09-21.md`). Enforcement: `breezy-set-family-halt`
+(`e837511`, AUD-02b); deployment and verification record
+`docs/evidence/AUD-02b_halt_deployment_2026-09-25.md` (the halt state as read from the node-resolved
+store on that date, with decoded payload). `e3e8ac6` opened `pm_us_crh_v4` at θ=0.0695 before the
+ruling; the ruling is the disposition of record. The node, capture, shadow valuation and the KILL
+clock keep running; order submission (entry AND exit) is vetoed.
+
+## C-3 — A1's precondition is WIDENED (applies to any FUTURE A1-class ruling)
+Amendment B-1 required "a post-θ edge estimate for `pm_us_crh` itself." Add: "...and that edge
+estimate must be computed WITHOUT relying on `P_HOLD_LOWER`/`P_HOLD_UPPER` cells whose gate-pass
+conditioning the domain reviewer has ruled a collider (`DECISION_FUNNEL_2026-09-20.md`, 'Why
+"recalibrate on the gate-pass subsample" is NOT the remedy') — i.e., A0's fee-drift evidence pack
+alone cannot satisfy A1; a genuinely independent edge estimate is required, and if none can be
+produced without real (non-synthetic) historical venue ladders, **(ii) STOP TRADING THIS SURFACE is
+not merely the default, it is very likely the only defensible ruling.**" The independent estimate
+is owned by AUD-18 (hand-off H5). A re-arm additionally needs HUNT-1 met and a NEW registration per
+A-9 item 2 (A1's row cites "per L-34"; A-9 item 2 is the correct source).
+
+## C-4 — Revised order (supersedes B's order for the remaining items)
+    B3 (window posture — ruling)       ||  B2 (DONE — verification note only)
+    WP-D1 (discovery attrition — study) ||  A0 (fee-drift evidence — unattended study + evidence test)
+      A0's evidence set is closed only after WP-D1 confirms the day-list source (see A0).
+    Step-5 re-evaluation of B1, WP-T1, WP-Q1, C0, C1, C2 (C-6)  || runs alongside A0
+A0 is a precondition of any FUTURE A1-class ruling, no longer of A1 itself. AUD-12b's
+`FeeDriftProbeActor` (`30dd034`) is a single-slug DETECTOR; A0 is the all-slug raw-wire EVIDENCE
+pack; probe samples are excluded from A0's evidence set. Probe comparison target:
+`docs/evidence/RULING_fee_drift_probe_target_2026-09-25.md`.
+Permit cumulative coverage (mid-day relaunch re-mint) is a separate safety item, not B3.
+
+## C-5 — Verification artefacts
+B2, WP-D1 and A0 close on dated notes under `docs/evidence/`, never on a commit subject alone.
+
+## C-6 — Re-evaluation under (ii)
+Every WP in {B1, WP-T1, WP-Q1, C0, C1, C2} receives exactly one disposition in
+`docs/evidence/RULING_post_forecast_wp_reevaluation_<date>.md`, a two-peer ruling meeting the
+six acceptance criteria stated in the AUD-02 completion plan.
+
+## C-7 — Goal state (no bare STOP)
+(ii) is interim. The route back to forecast trading and learning: AUD-18 nightly triage (learning)
+-> a CONFIRMED hypothesis (H5/H6) -> a NEW A1-class ruling -> a NEW registration -> operator-only
+enablement. The programme's terminal non-trading state is AUD-18 §6.6's evidenced KILL: "nothing
+arms," and PM.us daily-high rungs close as a programme. Choosing any successor venue is out of
+scope of this plan and of AUD-18.
