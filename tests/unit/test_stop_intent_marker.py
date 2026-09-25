@@ -7,12 +7,15 @@ real ``/proc`` state for an arbitrary test pid.
 
 from __future__ import annotations
 
+import inspect
 import logging
+import time
 from pathlib import Path
 
 import pytest
 
 from breezy.runtime.stop_intent_marker import (
+    _process_start_ticks,
     consume_stop_intent_marker,
     discard_stop_intent_marker,
     stop_intent_marker_path,
@@ -199,6 +202,77 @@ def test_a_marker_within_the_max_age_is_still_a_match(tmp_path: Path) -> None:
     )
 
     assert result is True
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-24 review, nit (a)] `time.monotonic()` is `CLOCK_MONOTONIC`-backed
+# on Linux -- a single system-wide clock, so two DIFFERENT processes reading
+# it on the SAME boot get comparable values (Python docs for
+# `time.monotonic`; `clock_gettime(2)`). That does NOT make it safe here: it
+# resets to (near) 0 at every boot, and so does `/proc/<pid>/stat`'s
+# starttime field (`_process_start_ticks`) -- a genuine host reboot landing
+# in the write-to-consume window is exactly the case where BOTH clocks reset
+# together, so a monotonic age check could read a stale marker as fresh
+# (small/negative `now() - written_at`) instead of failing closed. Wall-clock
+# `time.time()` keeps advancing across a reboot, so it is kept. This test
+# pins that decision in code so a future refactor can't silently swap it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_clock_is_wall_clock_time_not_monotonic() -> None:
+    write_sig = inspect.signature(write_stop_intent_marker)
+    consume_sig = inspect.signature(consume_stop_intent_marker)
+
+    assert write_sig.parameters["now"].default is time.time
+    assert consume_sig.parameters["now"].default is time.time
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-24 review, nit (c)] `_process_start_ticks` splits `/proc/<pid>/stat`
+# after the LAST `)` because `comm` (field 2) is parenthesized and may itself
+# contain spaces or parentheses.
+# ---------------------------------------------------------------------------
+
+
+def test_process_start_ticks_parses_a_comm_containing_spaces_and_parens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 987654
+    stat_path = Path(f"/proc/{pid}/stat")
+    # Fields 3 (state) .. 22 (starttime) verbatim, matching the real kernel
+    # layout -- only `comm` (field 2) is synthetic/adversarial.
+    trailing_fields = [
+        "S", "1", "12345", "12345", "0", "-1", "4194304", "100", "0", "0",
+        "0", "10", "5", "0", "0", "20", "0", "4", "0", "987654321",
+    ]
+    synthetic_line = f"{pid} (my (weird) proc name) " + " ".join(trailing_fields)
+    real_read_text = Path.read_text
+
+    def _fake_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == stat_path:
+            return synthetic_line
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _fake_read_text)
+
+    assert _process_start_ticks(pid) == 987654321
+
+
+def test_process_start_ticks_returns_none_when_proc_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 987655
+    stat_path = Path(f"/proc/{pid}/stat")
+    real_read_text = Path.read_text
+
+    def _fake_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == stat_path:
+            raise OSError("synthetic: no such process")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _fake_read_text)
+
+    assert _process_start_ticks(pid) is None
 
 
 # ---------------------------------------------------------------------------

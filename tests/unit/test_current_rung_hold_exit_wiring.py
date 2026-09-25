@@ -38,6 +38,7 @@ from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import BreezyBacktestConfig, backtest
 from breezy.runtime.paper_replay import (
+    UNSCOPED_FAMILY_ID,
     ReplayEntryContext,
     build_paper_replay_config,
     filled_trials_from_engine,
@@ -55,7 +56,10 @@ from breezy.strategy.current_rung_hold.exit_wiring import (
 from breezy.strategy.current_rung_hold.exit_wiring import (
     EXIT_RULE_TAG_PREFIX as _EXIT_RULE_TAG_PREFIX,
 )
-from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatchError
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    TrialDayLatchError,
+)
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
     _cont_latch_factory,
@@ -272,7 +276,12 @@ def test_a_gate_refused_family_manifest_submits_no_order_on_the_same_dead_scenar
             entry_ask=Decimal("0.40"),
             scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
         )
-        trials = filled_trials_from_engine(engine, {str(interior_instrument.id): ctx})
+        trials = filled_trials_from_engine(
+            engine,
+            {str(interior_instrument.id): ctx},
+            family_id=UNSCOPED_FAMILY_ID,
+            trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        )
         assert len(trials) == 1
 
         # Queried INSIDE the `with` block -- `engine.dispose()` (on exit)

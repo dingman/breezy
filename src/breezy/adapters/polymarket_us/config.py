@@ -353,6 +353,20 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     #: and only pins the shard-count-stays-safe behaviour.
     trade_shard_halving: bool = False
 
+    #: AUD-08b: ``"module:attr"`` path of the RUNTIME-layer callable
+    #: (``detail: str -> None``) the recorder's instrument provider calls ONCE
+    #: when the unregistered-city sighting sidecar has failed to append for
+    #: ``provider.SIGHTING_SINK_FAILURE_ALERT_CYCLES`` consecutive discovery
+    #: cycles. A path, not a callable: this config is an ``lru_cache`` key and
+    #: Nautilus hashes a config through its JSON encoding, which refuses a
+    #: function. Resolved by the data factory with Nautilus's own
+    #: ``nautilus_trader.common.config.resolve_path`` -- the same mechanism
+    #: ``Importable*Config`` uses -- so this ``adapters`` package never imports
+    #: ``breezy.runtime``. Set only by
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config``; the trade
+    #: node keeps ``None`` (it attaches no sidecar sink at all).
+    sighting_failure_alert_path: str | None = None
+
     def __post_init__(self) -> None:
         unset = [
             name

@@ -14,9 +14,23 @@ No strategy module is imported. Reasons are reported verbatim — there is
 no fault/wait/edge taxonomy. ``no_side_calibration_unsafe`` (AUD-01a) is
 classified only by those predicates plus the verbatim reason tally.
 
-The A1-open-age line is not implemented here. AUD-02's Amendment C is not
-in ``POST_FORECAST_PHASE_2026-09-20.md``, so AUD-03 §8's fallback applies.
-See ``docs/plans/backlog/AUDIT_2026-09-21/AUD-03-FOLLOWUP-a1-digest-line.md``.
+The A1-open-age line is not implemented here; AUD-02's Amendment C is not in
+``POST_FORECAST_PHASE_2026-09-20.md``, so AUD-03 §8's fallback applied (see
+``docs/plans/backlog/AUDIT_2026-09-21/AUD-03-FOLLOWUP-a1-digest-line.md``).
+Its replacement -- a ``halt_enforced: yes|no|unknown`` field read from the
+SAME ``FAMILY_HALT_KEY`` the submit veto reads -- IS implemented here
+(coordinator build decision, 2026-09-24): :func:`read_family_halt_status`
+opens its OWN read-only sqlite connection (``file:<path>?mode=ro``) directly
+against the exec-state store, never the node's exclusive submit-intent flock
+(``breezy.runtime.submit_intent.hold_submit_intent_process_lock``, held for
+the node's full process lifetime and therefore unusable by a periodic
+read-only digest -- see that test file for the two-connection proof). The
+decode itself is the single shared
+``breezy.strategy.current_rung_hold.trial_day_latch.decode_family_halt``
+pure helper, never re-implemented here. Every read failure -- missing
+store, a lock that outlives ``_HALT_BUSY_TIMEOUT_SECONDS``, a malformed
+stored value, any exception -- reports ``unknown`` with a reason; this field
+NEVER fails open to ``no`` or closed to ``yes``.
 """
 
 from __future__ import annotations
@@ -24,12 +38,16 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
+import sqlite3
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Literal
 
+from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import (
     MAX_ALERT_DETAIL_CHARS,
     AlertPayload,
@@ -37,6 +55,7 @@ from breezy.runtime.health import (
     emit_alert,
     resolve_alert_sink,
 )
+from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_HALT_KEY, decode_family_halt
 
 _ENTRY_SOURCES: frozenset[str] = frozenset({"quote", "depth"})
 _SHADOW_SOURCES: frozenset[str] = frozenset({"no_side_shadow"})
@@ -53,6 +72,85 @@ _MISSING_DETAIL = "no decision tape found for {climate_day}"
 
 _DEFAULT_TAPE_DIR = Path.home() / ".local/share/breezy/catalog/quote_tape/decisions"
 _DEFAULT_OUTPUT_DIR = Path.home() / ".local/share/breezy/derived/decision_funnel"
+
+#: Belt-and-suspenders bound on the digest's OWN read-only connection --
+#: independent of, and much shorter than, `stop_intent_marker`'s 300s
+#: (that one bounds a marker's validity; this one bounds how long a
+#: best-effort diagnostic read may block before reporting `unknown` rather
+#: than stalling the whole digest run).
+_HALT_BUSY_TIMEOUT_SECONDS: float = 2.0
+
+_SELECT_HALT_SQL = "SELECT value FROM state WHERE key = ?"
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyHaltStatus:
+    """AUD-03 follow-up: the A1 family-halt read for the daily digest.
+
+    Three states, never two: `unknown` is a distinct outcome from both
+    `yes` and `no` for every failure mode below -- this field must never
+    fail open to "not halted" nor fail closed to "halted" on a read it could
+    not actually perform. `reason` is set only when `value == "unknown"`.
+    """
+
+    value: Literal["yes", "no", "unknown"]
+    reason: str | None
+
+
+def read_family_halt_status(
+    store_path: Path,
+    *,
+    busy_timeout_s: float = _HALT_BUSY_TIMEOUT_SECONDS,
+    connect: Callable[..., sqlite3.Connection] = sqlite3.connect,
+) -> FamilyHaltStatus:
+    """Read `FAMILY_HALT_KEY` through the digest's OWN read-only sqlite
+    connection -- `file:<path>?mode=ro`, never a write, never the node's
+    exclusive submit-intent flock (`breezy.runtime.submit_intent.
+    hold_submit_intent_process_lock`, a SEPARATE sidecar file
+    `<store_path>.intent.lock` the node holds for its whole process
+    lifetime; a digest that acquired or waited on THAT lock could never
+    report anything but "held" while the node is live -- exactly when this
+    field matters most).
+
+    `busy_timeout_s` bounds how long sqlite's own locking layer may block
+    this connection (WAL readers are not normally blocked by a writer, but
+    this is a belt-and-suspenders cap regardless) before this function gives
+    up and reports `unknown` rather than stalling the digest.
+
+    Every failure -- the store file does not exist, the read stays locked
+    past `busy_timeout_s`, the stored value is not `bytes` (schema drift/
+    corruption), or any other `sqlite3.Error`/`OSError` -- reports `unknown`
+    with a `reason` naming what went wrong. Never fails open to `no` or
+    closed to `yes`: an
+    operator reading a stale "no" here would wrongly believe entry is
+    enabled when it might not be; a stale "yes" would wrongly believe the
+    family is protected when it might not be. `unknown` names the read
+    itself as untrustworthy in either direction.
+    """
+    try:
+        conn = connect(f"file:{store_path}?mode=ro", uri=True, timeout=busy_timeout_s)
+    except (sqlite3.Error, OSError) as exc:
+        return FamilyHaltStatus(value="unknown", reason=f"{type(exc).__name__}: {exc}")
+    try:
+        try:
+            row = conn.execute(_SELECT_HALT_SQL, (FAMILY_HALT_KEY,)).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        return FamilyHaltStatus(value="unknown", reason=f"{type(exc).__name__}: {exc}")
+
+    raw = row[0] if row is not None else None
+    if raw is not None and not isinstance(raw, bytes | bytearray):
+        return FamilyHaltStatus(
+            value="unknown",
+            reason=f"malformed FAMILY_HALT_KEY value: expected bytes, got {type(raw).__name__}",
+        )
+    # `decode_family_halt` is a pure `bytes | None -> bool` comparison (see
+    # its docstring) -- it cannot raise on the `bytes | None` this function
+    # already guarantees above, so no further try/except is warranted here
+    # (YAGNI: an unreachable defensive branch is dead code, not safety).
+    halted = decode_family_halt(bytes(raw) if raw is not None else None)
+    return FamilyHaltStatus(value="yes" if halted else "no", reason=None)
 
 
 class UnknownOfferTapeSourceError(ValueError):
@@ -200,12 +298,19 @@ def funnel_for_day(
     )
 
 
-def format_digest_detail(report: FunnelReport, *, climate_day: str) -> str:
+def format_digest_detail(
+    report: FunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None
+) -> str:
     """One alert line. Shadow is labelled as outside the orders funnel.
 
-    Stays within ``MAX_ALERT_DETAIL_CHARS`` by dropping the reason tally
-    first, then shortening the stall list. Never relies on ``AlertPayload``
-    truncation, which would cut a token in half.
+    Stays within ``MAX_ALERT_DETAIL_CHARS`` by dropping fields in priority
+    order, most-expendable first: the halt-unknown free-text ``reason``
+    (unbounded length, diagnostic only), then the ``why=`` reason tally,
+    then finally falling back to the short form. ``halt=<value>`` itself
+    (when ``halt`` is given at all) is never dropped -- it is one of three
+    fixed short tokens. ``halt`` is ``None`` only for callers that predate
+    AUD-03's follow-up and omit the field entirely (back-compat). Never
+    relies on ``AlertPayload`` truncation, which would cut a token in half.
     """
     totals = report.totals
     stall = ",".join(report.stalled_stations) if report.stalled_stations else "-"
@@ -219,11 +324,21 @@ def format_digest_detail(report: FunnelReport, *, climate_day: str) -> str:
         f"o={totals.orders} shadow={report.shadow_count}(not-orders) "
         f"xf={report.exit_fired} xr={report.exit_refused} stall={stall} cov={coverage}"
     )
+    if halt is not None:
+        base = f"{base} halt={halt.value}"
+    halt_reason = f"halt_reason={halt.reason}" if halt is not None and halt.reason else None
     why = ",".join(f"{name}:{count}" for name, count in report.entry_reasons)
-    if why:
-        detailed = f"{base} why={why}"
-        if len(detailed) <= MAX_ALERT_DETAIL_CHARS:
-            return detailed
+
+    # Richest to leanest: base+halt, +halt_reason, +why -- drop halt_reason
+    # first, then why, landing on `base` (which always carries halt=<value>
+    # once `halt` is given), then the short fallback below.
+    with_reason = f"{base} {halt_reason}" if halt_reason else base
+    candidate = f"{with_reason} why={why}" if why else with_reason
+    if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
+        return candidate
+    candidate = f"{base} why={why}" if why else base
+    if len(candidate) <= MAX_ALERT_DETAIL_CHARS:
+        return candidate
     if len(base) <= MAX_ALERT_DETAIL_CHARS:
         return base
     short = (
@@ -232,6 +347,8 @@ def format_digest_detail(report: FunnelReport, *, climate_day: str) -> str:
         f"o={totals.orders} shadow={report.shadow_count}(not-orders) "
         f"stall={len(report.stalled_stations)}"
     )
+    if halt is not None:
+        short = f"{short} halt={halt.value}"
     return short[:MAX_ALERT_DETAIL_CHARS]
 
 
@@ -249,9 +366,11 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def _artefact(report: FunnelReport, *, climate_day: str) -> dict[str, object]:
+def _artefact(
+    report: FunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None
+) -> dict[str, object]:
     totals = report.totals
-    return {
+    artefact: dict[str, object] = {
         "climate_day": climate_day,
         "totals": {
             "decisions_emitted": totals.decisions_emitted,
@@ -271,13 +390,20 @@ def _artefact(report: FunnelReport, *, climate_day: str) -> dict[str, object]:
         "coverage_min_observed_at_ns": report.coverage_min_observed_at_ns,
         "coverage_max_observed_at_ns": report.coverage_max_observed_at_ns,
     }
+    if halt is not None:
+        artefact["halt_enforced"] = halt.value
+        artefact["halt_reason"] = halt.reason
+    return artefact
 
 
-def _write_artefact(directory: Path, report: FunnelReport, *, climate_day: str) -> None:
+def _write_artefact(
+    directory: Path, report: FunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"decision_funnel_{climate_day}.json"
     path.write_text(
-        json.dumps(_artefact(report, climate_day=climate_day), indent=2, sort_keys=True) + "\n",
+        json.dumps(_artefact(report, climate_day=climate_day, halt=halt), indent=2, sort_keys=True)
+        + "\n",
         encoding="utf-8",
     )
     path.chmod(0o600)
@@ -293,7 +419,30 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--tape", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--stations", default=None, help="Comma-separated window-open stations")
+    parser.add_argument(
+        "--store-path",
+        default=None,
+        help=(
+            "exec state-DB path for the halt_enforced read-only read; falls back to "
+            "EXEC_STATE_DB_ENV_VAR"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _resolve_halt_status(
+    args: argparse.Namespace, source_env: Mapping[str, str]
+) -> FamilyHaltStatus:
+    """Never raises: a misconfigured/absent store is `unknown`, not a digest
+    failure -- `halt_enforced` is supplementary to the offer-tape funnel,
+    which is this digest's binding read-only contract (module docstring)."""
+    if args.store_path:
+        return read_family_halt_status(Path(args.store_path))
+    try:
+        store_path = resolve_store_path(source_env)
+    except ExecStateDbNotConfiguredError as exc:
+        return FamilyHaltStatus(value="unknown", reason=str(exc))
+    return read_family_halt_status(store_path)
 
 
 def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None) -> int:
@@ -305,6 +454,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     ordinary no-trade day.
     """
     args = _parse_args(argv)
+    source_env = os.environ if env is None else env
     sink = resolve_alert_sink(env)
     if args.climate_day:
         climate_day = args.climate_day
@@ -334,8 +484,9 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     except (json.JSONDecodeError, ValueError, TypeError):
         _emit(sink, detail=f"decision tape unreadable for {climate_day}")
         return 1
-    _emit(sink, detail=format_digest_detail(report, climate_day=climate_day))
-    _write_artefact(output_dir, report, climate_day=climate_day)
+    halt = _resolve_halt_status(args, source_env)
+    _emit(sink, detail=format_digest_detail(report, climate_day=climate_day, halt=halt))
+    _write_artefact(output_dir, report, climate_day=climate_day, halt=halt)
     return 0
 
 

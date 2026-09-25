@@ -25,6 +25,15 @@ After=network-online.target
 # deploy/systemd/breezy-study-failed@.service and its own module docstring.
 OnFailure=breezy-study-failed@%n.service
 
+# AUD-08b: after a SUCCESSFUL rotation, enqueue the advisory
+# station-candidate register as its OWN oneshot unit. OnSuccess= (systemd
+# >= 249) rather than ExecStartPost=systemctl --no-block: it is declarative,
+# adds no process to this unit, and nothing the register does (its memory
+# ceiling, its slice, its failure) can ever reach back into this unit's
+# result -- the rotation stays exactly what it was before 08b. A skipped day
+# (rotation failed) is caught up by the register's last_folded_day watermark.
+OnSuccess=breezy-station-candidate-register.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy
