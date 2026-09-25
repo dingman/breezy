@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.persistence.residual_fills import EXCLUDED_FILLS_FILENAME
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -143,9 +144,12 @@ DailyUnexplainedSummaryRow = _prr.DailyUnexplainedSummaryRow
 # -- Stage C3 additions (per-trial P&L breakdown) --
 PortfolioRoiTrialRow = _prr.PortfolioRoiTrialRow
 trial_rows_of = _prr.trial_rows_of
-scored_trial_family_ids = _prr.scored_trial_family_ids
 leg_of_scored_trial = _prr.leg_of_scored_trial
 UNKNOWN_TRIAL_FAMILY_LABEL = _prr.UNKNOWN_TRIAL_FAMILY_LABEL
+
+# -- Review fix: family_id resolved by REGISTERED-manifest date window --
+_load_registered_family_manifests = _prr._load_registered_family_manifests
+_family_id_of_trial = _prr._family_id_of_trial
 
 from breezy.runtime import alert_ladder as _ladder
 
@@ -284,13 +288,17 @@ class TestPerTrialPnlBreakdown:
         trial_a = _scored_trial(
             trial_id="fam_a/trial/LAX/2026-01-01", pnl=Decimal("0.27"), climate_day="2026-01-01"
         )
-        family_ids = {
-            "fam_a/trial/LAX/2026-01-01": "fam_a",
-            "fam_b/trial/LAX/2026-01-02": "fam_b",
-        }
+        manifests = (
+            _family_manifest(
+                family_id="fam_a", trial_id_prefix="fam_a/trial/", d0_climate_day="2026-01-01"
+            ),
+            _family_manifest(
+                family_id="fam_b", trial_id_prefix="fam_b/trial/", d0_climate_day="2026-01-01"
+            ),
+        )
 
         # Given out of order -- the output must still be sorted.
-        rows = trial_rows_of((trial_b, trial_a), family_ids_by_trial_id=family_ids)
+        rows = trial_rows_of((trial_b, trial_a), registered_manifests=manifests)
 
         assert [row.trial_id for row in rows] == [
             "fam_a/trial/LAX/2026-01-01",
@@ -304,12 +312,12 @@ class TestPerTrialPnlBreakdown:
         assert rows[0].side == "yes"
         assert rows[0].settlement_basis == "nws_final"
 
-    def test_trial_rows_of_uses_the_unknown_label_when_the_family_map_has_no_entry(
+    def test_trial_rows_of_uses_the_unknown_label_when_no_manifest_prefix_matches(
         self,
     ) -> None:
         trial = _scored_trial(trial_id="fam_x/trial/LAX/2026-01-03", pnl=Decimal("0.05"))
 
-        rows = trial_rows_of((trial,), family_ids_by_trial_id={})
+        rows = trial_rows_of((trial,), registered_manifests=())
 
         assert rows[0].family_id == UNKNOWN_TRIAL_FAMILY_LABEL
 
@@ -324,27 +332,6 @@ class TestPerTrialPnlBreakdown:
 
         assert leg_of_scored_trial(yes_trial) == "yes"
         assert leg_of_scored_trial(no_trial) == "no"
-
-    def test_scored_trial_family_ids_maps_trial_id_to_its_store_subdirectory(
-        self, tmp_path: Path
-    ) -> None:
-        scored_trials_dir = tmp_path / "scored_trials"
-        trial_a = _scored_trial(trial_id="fam_a/trial/LAX/2026-01-01", pnl=Decimal("0.10"))
-        trial_b = _scored_trial(trial_id="fam_b/trial/LAX/2026-01-02", pnl=Decimal("0.20"))
-        write_scored_trials(scored_trials_dir / "fam_a", [trial_a], now_ns=1)
-        write_scored_trials(scored_trials_dir / "fam_b", [trial_b], now_ns=2)
-
-        family_ids = scored_trial_family_ids(scored_trials_dir)
-
-        assert family_ids == {
-            "fam_a/trial/LAX/2026-01-01": "fam_a",
-            "fam_b/trial/LAX/2026-01-02": "fam_b",
-        }
-
-    def test_scored_trial_family_ids_returns_empty_for_an_absent_directory(
-        self, tmp_path: Path
-    ) -> None:
-        assert scored_trial_family_ids(tmp_path / "does_not_exist") == {}
 
     def test_the_json_sibling_carries_trial_rows_summing_to_the_total(
         self, tmp_path: Path
@@ -425,9 +412,15 @@ class TestPerTrialPnlBreakdown:
         assert view.n_fills == data.n_fills
         assert view.roi == data.roi
 
-    def test_a_schema_version_two_report_missing_trial_rows_is_malformed(
+    def test_a_schema_version_two_report_missing_trial_rows_reads_as_none(
         self, tmp_path: Path
     ) -> None:
+        """A document that stamps the CURRENT `schema_version` (2) without
+        also knowing about `trial_rows` -- e.g. a fixture that reads
+        `PORTFOLIO_ROI_SCHEMA_VERSION` dynamically but predates this field
+        -- must not hard-fail for that alone (the additive-tolerant-on-read
+        contract every other field in this report already gets, D7):
+        gated on key-presence, not on the declared version number."""
         data = _report_data()
         path = tmp_path / "report.json"
         write_portfolio_roi_json(path, data)
@@ -435,8 +428,108 @@ class TestPerTrialPnlBreakdown:
         del raw["trial_rows"]
         path.write_text(json.dumps(raw))
 
+        view = read_portfolio_roi_report(path)
+
+        assert view.schema_version == 2
+        assert view.trial_rows is None
+
+    def test_a_present_but_malformed_trial_rows_still_raises(self, tmp_path: Path) -> None:
+        data = _report_data()
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, data)
+        raw = json.loads(path.read_text())
+        raw["trial_rows"] = "not-a-list"
+        path.write_text(json.dumps(raw))
+
         with pytest.raises(PortfolioRoiReportMalformedFieldError):
             read_portfolio_roi_report(path)
+
+
+class TestPerTrialFamilyAttributionByDateWindow:
+    """Review fix (MEDIUM): `family_id` is resolved by each REGISTERED
+    family's declared `d0_climate_day..terminal_climate_day` window
+    (`_family_id_of_trial` / `position_monitor_nightly_report.
+    resolve_trial_family`, reused for parity), never by which scored-trial-
+    store subdirectory happened to be read last. A shared `trial_id_prefix`
+    collision (e.g. a superseding family reusing its predecessor's
+    namespace) must resolve to whichever family's window actually contains
+    the trial's `climate_day` -- never to whichever family sorts last."""
+
+    def test_a_shared_prefix_collision_in_the_predecessor_s_window_resolves_to_it(
+        self,
+    ) -> None:
+        cont = _family_manifest(
+            family_id="fam_cont",
+            trial_id_prefix="shared/trial/",
+            d0_climate_day="2026-01-01",
+            terminal_climate_day="2026-01-15",
+        )
+        v4 = _family_manifest(
+            family_id="fam_v4", trial_id_prefix="shared/trial/", d0_climate_day="2026-01-16"
+        )
+        trial = _scored_trial(
+            trial_id="shared/trial/LAX/2026-01-10", pnl=Decimal("0.10"), climate_day="2026-01-10"
+        )
+
+        rows = trial_rows_of((trial,), registered_manifests=(cont, v4))
+
+        assert rows[0].family_id == "fam_cont"
+
+    def test_the_same_collision_in_the_successor_s_window_resolves_to_it(self) -> None:
+        cont = _family_manifest(
+            family_id="fam_cont",
+            trial_id_prefix="shared/trial/",
+            d0_climate_day="2026-01-01",
+            terminal_climate_day="2026-01-15",
+        )
+        v4 = _family_manifest(
+            family_id="fam_v4", trial_id_prefix="shared/trial/", d0_climate_day="2026-01-16"
+        )
+        trial = _scored_trial(
+            trial_id="shared/trial/LAX/2026-01-20", pnl=Decimal("0.20"), climate_day="2026-01-20"
+        )
+
+        rows = trial_rows_of((trial,), registered_manifests=(cont, v4))
+
+        assert rows[0].family_id == "fam_v4"
+
+    def test_a_day_outside_every_candidate_window_is_unknown_never_a_guess(self) -> None:
+        cont = _family_manifest(
+            family_id="fam_cont",
+            trial_id_prefix="shared/trial/",
+            d0_climate_day="2026-01-01",
+            terminal_climate_day="2026-01-15",
+        )
+        v4 = _family_manifest(
+            family_id="fam_v4", trial_id_prefix="shared/trial/", d0_climate_day="2026-01-16"
+        )
+        trial = _scored_trial(
+            trial_id="shared/trial/LAX/2025-12-31", pnl=Decimal("0.05"), climate_day="2025-12-31"
+        )
+
+        rows = trial_rows_of((trial,), registered_manifests=(cont, v4))
+
+        assert rows[0].family_id == UNKNOWN_TRIAL_FAMILY_LABEL
+
+    def test_load_registered_family_manifests_skips_draft_and_non_polymarket_us_manifests(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_registered_family_manifest(
+            families_dir, family_id="fam_reg", trial_id_prefix="fam_reg/trial/"
+        )
+        _write_family_manifest(  # DRAFT_NOT_REGISTERED -- must be skipped
+            families_dir, family_id="fam_draft", trial_id_prefix="fam_draft/trial/"
+        )
+
+        manifests = _load_registered_family_manifests(families_dir)
+
+        assert {m.family_id for m in manifests} == {"fam_reg"}
+
+    def test_load_registered_family_manifests_returns_empty_for_an_absent_directory(
+        self, tmp_path: Path
+    ) -> None:
+        assert _load_registered_family_manifests(tmp_path / "does_not_exist") == ()
 
 
 class TestReportHeader:
@@ -715,6 +808,35 @@ def _scored_trial(
         entry_ask=Decimal("0.40"),
         fill_px=fill_px,
         fee=fee,
+    )
+
+
+def _family_manifest(
+    *,
+    family_id: str,
+    trial_id_prefix: str,
+    d0_climate_day: str,
+    terminal_climate_day: str | None = None,
+) -> FamilyManifest:
+    """A REGISTERED `FamilyManifest`, built in memory (no file I/O) for pure
+    `trial_rows_of`/`_family_id_of_trial` unit tests -- the same shape
+    `_write_registered_family_manifest` writes to disk for `_run`-level
+    tests."""
+    return FamilyManifest(
+        family_id=family_id,
+        venue="polymarket_us",
+        trial_id_prefix=trial_id_prefix,
+        d0_climate_day=d0_climate_day,
+        boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+        boundary_inputs_sha256="1" * 64,
+        stations=("LAX",),
+        status="REGISTERED",
+        manifest_sha256="1" * 64,
+        composition_kind="current_rung_hold",
+        density_artefact_path=Path("deploy/families/artefacts/not_applicable_density.json"),
+        density_artefact_sha256="1" * 64,
+        taker_fee_coefficient=Decimal("0.06"),
+        terminal_climate_day=terminal_climate_day,
     )
 
 
@@ -1400,6 +1522,40 @@ def _write_family_manifest(
     (families_dir / f"{family_id}.json").write_text(json.dumps(manifest))
 
 
+def _write_registered_family_manifest(
+    families_dir: Path,
+    *,
+    family_id: str,
+    trial_id_prefix: str,
+    d0_climate_day: str = "2026-01-01",
+    terminal_climate_day: str | None = None,
+    stations: tuple[str, ...] = ("LAX",),
+) -> None:
+    """A REGISTERED (`allow_draft=False`-loadable) manifest -- the shape
+    `_load_registered_family_manifests`/`resolve_trial_family`'s own
+    `registered_manifests` requires: a real (non-placeholder) sha256 and
+    `status="REGISTERED"`, optionally closed at `terminal_climate_day`
+    (open-ended -- unbounded above -- when omitted)."""
+    manifest: dict[str, object] = {
+        "family_id": family_id,
+        "venue": "polymarket_us",
+        "trial_id_prefix": trial_id_prefix,
+        "d0_climate_day": d0_climate_day,
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "1" * 64,
+        "composition_kind": "current_rung_hold",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "1" * 64,
+        "stations": list(stations),
+        "taker_fee_coefficient": "0.06",
+        "status": "REGISTERED",
+    }
+    if terminal_climate_day is not None:
+        manifest["terminal_climate_day"] = terminal_climate_day
+    families_dir.mkdir(parents=True, exist_ok=True)
+    (families_dir / f"{family_id}.json").write_text(json.dumps(manifest))
+
+
 def _write_excluded_fills_line(
     store_dir: Path, *, trial_id: str, venue_order_id: str, reason: str = "duplicate_fill"
 ) -> None:
@@ -1582,8 +1738,18 @@ class TestRunEmitsPerTrialBreakdown:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         families_dir = tmp_path / "families"
-        _write_family_manifest(families_dir, family_id="fam_a", trial_id_prefix="fam_a/trial/")
-        _write_family_manifest(families_dir, family_id="fam_b", trial_id_prefix="fam_b/trial/")
+        _write_registered_family_manifest(
+            families_dir,
+            family_id="fam_a",
+            trial_id_prefix="fam_a/trial/",
+            d0_climate_day="2026-01-01",
+        )
+        _write_registered_family_manifest(
+            families_dir,
+            family_id="fam_b",
+            trial_id_prefix="fam_b/trial/",
+            d0_climate_day="2026-01-01",
+        )
 
         scored_trials_dir = tmp_path / "scored_trials"
         trial_a = _scored_trial(
