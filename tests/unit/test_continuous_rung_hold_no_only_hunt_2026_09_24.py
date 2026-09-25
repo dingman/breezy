@@ -52,6 +52,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 from tests.unit.test_current_rung_hold_strategy import (
     CLIMATE_DAY,
     INTERIOR_ID,
+    NS_PER_MIN,
     STATION,
     WINDOW_OPEN_NS,
     _instrument,
@@ -430,3 +431,84 @@ def test_yes_in_band_tick_is_byte_identical(
     # since raw_executable is True and this branch never runs at all), and
     # it is called exactly once, exactly as before this slice.
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Silent-failure-hunter finding (2026-09-25): `_hunt_no_only` must contain a
+# raising store dependency the same way `_evaluate_shadow_rest` contains its
+# decider -- never raise into `_hunt_tick`, count every fault, log at ERROR
+# at most once per station-day, and never leave `is_inflight`/the bounded
+# first-order key half-written without a submit.
+# ---------------------------------------------------------------------------
+
+
+def test_a_raising_store_dependency_is_contained_and_clears_half_written_inflight(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Exercises the REAL arm tail up through `set_inflight`/`record_attempt`
+    /the durable ``NO_SIDE_FIRST_LIVE_ORDER_KEY`` write, then injects the
+    fault at `_maybe_submit` -- exactly the "state could be half-written"
+    ordering the finding names. `is_inflight` (read by no other gate) is
+    defensively cleared; the bounded first-order key (which DOES gate future
+    arms) is left set, fail-closed, matching `_evaluate_no_side_shadow`'s
+    own documented stance."""
+    config = _gate_cleared_config(instruments=(interior_instrument,))
+    strategy = _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,), config=config,
+    )
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    def _raise(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("simulated submit-path fault")
+
+    strategy._maybe_submit = _raise  # type: ignore[method-assign]
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+
+    assert strategy.is_running
+    assert strategy.diagnostics.count("no_only_hunt_error") == 1
+    assert strategy.last_no_only_hunt_error is not None
+    assert strategy._latch is not None
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(_NO_INTERIOR_ID)
+        )
+        is False
+    )
+    # Fail-closed, deliberately: the pending flag was durably written before
+    # the injected fault and is never cleared by the containment handler.
+    assert is_no_side_pending(strategy._latch._store) is True
+
+
+def test_a_second_raise_in_the_same_station_day_does_not_log_again(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    def _raise(**kwargs: Any) -> None:
+        raise RuntimeError("simulated store fault")
+
+    strategy._evaluate_no_side_shadow = _raise  # type: ignore[method-assign]
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
+    )
+    assert len(strategy._no_only_hunt_error_notice) == 1
+    assert strategy.diagnostics.count("no_only_hunt_error") == 1
+
+    strategy.on_quote_tick(
+        _quote(
+            INTERIOR_ID, ask="0.97", bid=_BAND_CLEARING_BID,
+            ts_event=WINDOW_OPEN_NS + NS_PER_MIN,
+        )
+    )
+
+    assert strategy.is_running
+    # Counted both times -- a persistent fault is never silently invisible.
+    assert strategy.diagnostics.count("no_only_hunt_error") == 2
+    # But the notice set (and therefore the ERROR log it guards) never grows
+    # past the first entry for this station-day.
+    assert len(strategy._no_only_hunt_error_notice) == 1

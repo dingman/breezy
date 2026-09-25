@@ -136,6 +136,12 @@ _NS_PER_SECOND: Final[int] = 1_000_000_000
 #: `Take.limit_price` -- mirrors `decision.py`'s own inversion exactly,
 #: recomputed here purely for logging (never for a decision).
 _ONE: Final[Decimal] = Decimal(1)
+#: F-1a hardening (silent-failure-hunter finding, 2026-09-25): the
+#: diagnostic reason `_hunt_no_only`'s containment handler records on every
+#: exception it catches -- a NEW key (not a `REFUSAL_REASONS` member; there
+#: is no closed-set validation on `self.diagnostics`), so a persistent store
+#: fault is counted every tick even while its ERROR log is deduped.
+_DIAG_NO_ONLY_HUNT_ERROR: Final[str] = "no_only_hunt_error"
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
 #: Domain review of 87446c2, finding 1: `_evaluate_shadow_rest`'s
 #: containment fallback when the shadow decider raises -- a synthetic
@@ -507,6 +513,18 @@ class ContinuousRungHoldStrategy(Strategy):
         #: line -- once per (station, climate_day, YES instrument id), for
         #: the life of the process, mirroring `_no_refuse_notice` above.
         self._take_log_notice: set[tuple[str, str, str]] = set()
+        #: F-1a hardening (silent-failure-hunter finding, 2026-09-25):
+        #: dedupes `_hunt_no_only`'s containment ERROR log to once per
+        #: (station, climate_day) for the life of the process -- mirrors
+        #: `_illegal_cell_station_days`'s bounded shape, so a PERSISTENT
+        #: store fault logs once, never once per tick.
+        self._no_only_hunt_error_notice: set[tuple[str, str]] = set()
+        #: Mirrors `last_rearm_decision`/`last_no_take_shadow` (L-27:
+        #: asserted by presence, never via log capture) -- the MOST RECENT
+        #: `_hunt_no_only` containment message actually LOGGED (never set
+        #: on a deduped repeat, so its presence proves the guard fired
+        #: without needing to capture the logger).
+        self.last_no_only_hunt_error: str | None = None
         #: INC-5 (intra-day position monitor, SHADOW-ONLY): `None` (default)
         #: means every monitor hook below is a no-op -- byte-identical
         #: behaviour to before this field existed. A composition root wires
@@ -1245,50 +1263,118 @@ class ContinuousRungHoldStrategy(Strategy):
         completely unchanged: it runs its own admission/budget/consumed
         gates independently, exactly as it already does on the YES-in-band
         path.
-        """
-        accumulator = self._accumulators.get(station)
-        running_max = None if accumulator is None else accumulator.value_at(now_ns)
-        if running_max is None or accumulator is None:
-            return
-        if not instrument_rung_is_current(facts, running_max):
-            return
 
-        setup = self._eligible_setup(
-            snapshot.instrument_id, facts, running_max, accumulator, now_ns,
-        )
-        both_sides = evaluate_both_sides(
-            station=station,
-            climate_day=climate_day,
-            now_ns=now_ns,
-            ladder=self._ladders[(station, climate_day_key)],
-            fee_coefficient=setup.fee_coefficient,
-            ask=snapshot.ask,
-            ask_size=snapshot.size,
-            bid=snapshot.bid,
-            bid_size=snapshot.bid_size,
-            running_max=running_max,
-            staleness_ns=setup.staleness_ns,
-            config=self._config,
-            hour_lst=hour_lst,
-            width_code=setup.width_code,
-            m_code=setup.m_code,
-        )
-        self._evaluate_no_side_shadow(
-            station=station,
-            climate_day_key=climate_day_key,
-            station_day=station_day,
-            yes_instrument_id=snapshot.instrument_id,
-            no_decision=both_sides.no,
-            now_ns=now_ns,
-            bid_size=snapshot.bid_size,
-            bid=snapshot.bid,
-            hour_lst=hour_lst,
-            width_code=setup.width_code,
-            m_code=setup.m_code,
-            fee_coefficient=setup.fee_coefficient,
-            staleness_ns=setup.staleness_ns,
-            running_max=running_max,
-        )
+        CONTAINED (silent-failure-hunter finding, 2026-09-25): unlike the
+        YES path's own store reads, which only happen on the rarer in-band
+        Take, `_evaluate_no_side_shadow`'s store-backed gates run on every
+        COMMON out-of-band-YES tick that reaches this method -- mirrors
+        `_evaluate_shadow_rest`'s containment of its decider, so a raising
+        store dependency here can never escape into `_hunt_tick`/
+        `on_quote_tick`/`on_data`/`on_order_book_depth`. See
+        `_contain_no_only_hunt_error` for the exact ordering-safety
+        argument on `NO_SIDE_FIRST_LIVE_ORDER_KEY` vs. `is_inflight`.
+        """
+        try:
+            accumulator = self._accumulators.get(station)
+            running_max = None if accumulator is None else accumulator.value_at(now_ns)
+            if running_max is None or accumulator is None:
+                return
+            if not instrument_rung_is_current(facts, running_max):
+                return
+
+            setup = self._eligible_setup(
+                snapshot.instrument_id, facts, running_max, accumulator, now_ns,
+            )
+            both_sides = evaluate_both_sides(
+                station=station,
+                climate_day=climate_day,
+                now_ns=now_ns,
+                ladder=self._ladders[(station, climate_day_key)],
+                fee_coefficient=setup.fee_coefficient,
+                ask=snapshot.ask,
+                ask_size=snapshot.size,
+                bid=snapshot.bid,
+                bid_size=snapshot.bid_size,
+                running_max=running_max,
+                staleness_ns=setup.staleness_ns,
+                config=self._config,
+                hour_lst=hour_lst,
+                width_code=setup.width_code,
+                m_code=setup.m_code,
+            )
+            self._evaluate_no_side_shadow(
+                station=station,
+                climate_day_key=climate_day_key,
+                station_day=station_day,
+                yes_instrument_id=snapshot.instrument_id,
+                no_decision=both_sides.no,
+                now_ns=now_ns,
+                bid_size=snapshot.bid_size,
+                bid=snapshot.bid,
+                hour_lst=hour_lst,
+                width_code=setup.width_code,
+                m_code=setup.m_code,
+                fee_coefficient=setup.fee_coefficient,
+                staleness_ns=setup.staleness_ns,
+                running_max=running_max,
+            )
+        except Exception as exc:  # noqa: BLE001 - a NO-only hunt fault must never affect _hunt_tick
+            self._contain_no_only_hunt_error(
+                exc,
+                yes_instrument_id=snapshot.instrument_id,
+                station=station,
+                climate_day_key=climate_day_key,
+            )
+
+    def _contain_no_only_hunt_error(
+        self,
+        exc: Exception,
+        *,
+        yes_instrument_id: InstrumentId,
+        station: str,
+        climate_day_key: str,
+    ) -> None:
+        """Containment tail for `_hunt_no_only` (silent-failure-hunter
+        finding, 2026-09-25). Never raises.
+
+        Counts every fault (uncapped -- a persistent fault is never
+        silently invisible after the first tick), but logs at ERROR at
+        most once per (station, climate_day) for the life of the process
+        (`_no_only_hunt_error_notice`), so a persistent store fault cannot
+        flood the log.
+
+        Ordering safety: `NO_SIDE_FIRST_LIVE_ORDER_KEY` is NEVER touched
+        here, matching `_evaluate_no_side_shadow`'s own documented
+        fail-closed stance on that key -- if the fault struck AFTER it was
+        durably written, clearing it would be the UNSAFE direction: it
+        would grant a second NO arm attempt while the first's outcome is
+        still unknown. `is_inflight(no_iid)` IS defensively cleared,
+        itself contained -- no gate in this module ever reads NO's
+        `is_inflight` (only the YES `iid`'s is, in `_hunt_tick`'s own
+        re-arm gate), so clearing it can never grant an arm that would
+        otherwise be denied; it only prevents a stale marker from
+        outliving the tick that half-wrote it.
+        """
+        self.diagnostics.record(_DIAG_NO_ONLY_HUNT_ERROR)
+        notice_key = (station, climate_day_key)
+        if notice_key not in self._no_only_hunt_error_notice:
+            self._no_only_hunt_error_notice.add(notice_key)
+            message = (
+                f"continuous_rung_hold: NO-only hunt failed station={station} "
+                f"climate_day={climate_day_key}"
+            )
+            self.last_no_only_hunt_error = message
+            self.log.exception(message, exc)
+        if self._latch is None:
+            return
+        no_iid = str(sibling_instrument_id(yes_instrument_id))
+        try:
+            self._latch.clear_inflight(station, climate_day_key, key_instrument_id=no_iid)
+        except Exception as cleanup_exc:  # cleanup must never itself raise
+            cleanup_message = (
+                "continuous_rung_hold: NO-only hunt error cleanup (clear_inflight) failed"
+            )
+            self.log.exception(cleanup_message, cleanup_exc)  # noqa: TRY401
 
     def _hunt_tick(
         self,
