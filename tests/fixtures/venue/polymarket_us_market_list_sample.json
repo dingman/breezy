@@ -1,0 +1,39 @@
+{
+  "markets": [
+    {
+      "id": "1000000001",
+      "question": "Will the high temperature in New York City be greater than or equal to 72°F on 2026-09-25?",
+      "slug": "tc-temp-nychigh-2026-09-25-gte72f",
+      "endDate": "2026-09-26T04:00:00Z",
+      "category": "climate",
+      "startDate": "2026-09-24T04:00:00Z",
+      "description": "Fabricated fixture value -- structure only, not a captured real payload.",
+      "active": true,
+      "marketType": "binary",
+      "closed": false,
+      "createdAt": "2026-09-24T04:00:05Z",
+      "updatedAt": "2026-09-25T10:00:00Z",
+      "archived": false,
+      "orderPriceMinTickSize": 0.01,
+      "gameStartTime": "",
+      "manualActivation": false,
+      "sportsMarketType": "",
+      "marketSides": ["YES", "NO"],
+      "outcomes": "[\"Yes\", \"No\"]",
+      "outcomePrices": "[\"0.5\", \"0.5\"]",
+      "ep3Status": "",
+      "status": "",
+      "assetPriceTerms": null,
+      "sportsMarketTypeV2": "",
+      "hidden": false,
+      "tags": ["weather", "climate"],
+      "title": "NYC high >= 72F on 2026-09-25",
+      "feeCoefficient": 0.06,
+      "sortOrder": 0,
+      "titleShort": "NYC >= 72F",
+      "ep3SyncedAt": "",
+      "minimumTradeQty": 1,
+      "comboEnabled": false
+    }
+  ]
+}

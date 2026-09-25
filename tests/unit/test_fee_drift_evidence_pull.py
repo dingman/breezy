@@ -544,6 +544,149 @@ def test_worst_case_runtime_secs_is_zero_within_the_burst_allowance() -> None:
 
 
 # ---------------------------------------------------------------------------
+# empty-listing silent-success bug (2026-09-25 production incident): the
+# live 11:10Z run listed ZERO markets, wrote complete=False, and exited 0
+# with reason=None -- a silent failure. `run_once` must record a distinct,
+# named reason, and `main` must exit non-zero, so OnFailure= actually fires.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_records_a_named_reason_when_the_list_returns_zero_markets(
+    tmp_path: Path,
+) -> None:
+    client = _FakePublicClient(list_pages=[{"markets": []}])
+    now = dt.datetime(2026, 9, 25, 11, 10, tzinfo=dt.UTC)
+
+    result = await run_once(client=client, output_root=tmp_path, now=now)
+
+    assert result.markets_listed == 0
+    assert result.complete is False
+    assert result.reason is not None
+    assert "empty listing" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_run_once_records_a_named_reason_when_below_the_completeness_threshold(
+    tmp_path: Path,
+) -> None:
+    slugs = [f"tc-temp-nychigh-2026-09-{i:02d}-gte72f" for i in range(1, 5)]
+    client = _FakePublicClient(
+        list_pages=[{"markets": [_weather_market(slug, taker="0.06") for slug in slugs[:1]]
+                     + [_weather_market(slug) for slug in slugs[1:]]}],
+    )
+    now = dt.datetime(2026, 9, 25, 11, 10, tzinfo=dt.UTC)
+
+    result = await run_once(client=client, output_root=tmp_path, now=now, list_limit=10)
+
+    assert result.complete is False
+    assert result.markets_listed == 4
+    assert result.reason is not None
+    assert "empty listing" not in result.reason
+
+
+def test_main_exits_non_zero_on_empty_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_client = _FakePublicClient(list_pages=[{"markets": []}])
+    monkeypatch.setattr(pull, "build_default_client", lambda *, user_agent: fake_client)
+    now = dt.datetime(2026, 9, 25, 11, 10, tzinfo=dt.UTC)
+
+    exit_code = pull.main(
+        ["--user-agent", "test-agent/1", "--output-root", str(tmp_path)], now=now
+    )
+
+    assert exit_code != 0
+    out = capsys.readouterr().out
+    assert "markets_listed=0" in out
+    assert "reason=None" not in out
+
+
+def test_main_exits_zero_on_a_complete_day(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    slug = "tc-temp-nychigh-2026-09-25-gte72f"
+    fake_client = _FakePublicClient(list_pages=[{"markets": [_weather_market(slug, taker="0.06")]}])
+    monkeypatch.setattr(pull, "build_default_client", lambda *, user_agent: fake_client)
+    now = dt.datetime(2026, 9, 25, 11, 10, tzinfo=dt.UTC)
+
+    exit_code = pull.main(
+        ["--user-agent", "test-agent/1", "--output-root", str(tmp_path)], now=now
+    )
+
+    assert exit_code == 0
+
+
+def test_main_exits_zero_inside_the_protected_window_even_though_incomplete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The protected window is the one documented, evidence-justified
+    "no markets expected right now" case -- everything else must be loud."""
+    fake_client = _FakePublicClient()
+    monkeypatch.setattr(pull, "build_default_client", lambda *, user_agent: fake_client)
+    now = dt.datetime(2026, 9, 25, 18, 0, tzinfo=dt.UTC)
+
+    exit_code = pull.main(
+        ["--user-agent", "test-agent/1", "--output-root", str(tmp_path)], now=now
+    )
+
+    assert exit_code == 0
+    assert fake_client.list_calls == []
+
+
+# ---------------------------------------------------------------------------
+# listing query fix: the shipped script's own three-filter query
+# (active=true&closed=false&archived=false&categories=climate, no orderBy)
+# was measured LIVE (2026-09-25, read-only, unauthenticated) against
+# https://gateway.polymarket.us/v1/markets: it returned ZERO markets, while
+# active=true&categories=climate ALONE (same endpoint, same moment) returned
+# 100. `PolymarketUSInstrumentProvider._query` -- the query shape the
+# production node already discovers markets with -- sends the identical four
+# filters PLUS `orderBy=("endDate",)` / `orderDirection="asc"`
+# (`PolymarketUSMarketDiscoveryConfig`'s own defaults). This script must send
+# the same proven shape rather than a subset of it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_query_matches_the_proven_provider_discovery_order() -> None:
+    client = _FakePublicClient(list_pages=[{"markets": []}])
+    await list_weather_markets(client, limit=10)
+
+    query, _quota_key = client.list_calls[0]
+    assert query["orderBy"] == pull.LIST_QUERY_ORDER_BY
+    assert query["orderDirection"] == pull.LIST_QUERY_ORDER_DIRECTION
+    assert tuple(pull.LIST_QUERY_ORDER_BY) == ("endDate",)
+    assert pull.LIST_QUERY_ORDER_DIRECTION == "asc"
+
+
+# ---------------------------------------------------------------------------
+# recorded-fixture test: the real gateway response shape (field names only,
+# fabricated values -- captured 2026-09-25 via a read-only, unauthenticated
+# probe against https://gateway.polymarket.us/v1/markets). Confirms parsing
+# survives every extra field the real payload carries beyond the two this
+# script actually reads.
+# ---------------------------------------------------------------------------
+
+_MARKET_LIST_FIXTURE = (
+    REPO_ROOT / "tests" / "fixtures" / "venue" / "polymarket_us_market_list_sample.json"
+)
+
+
+@pytest.mark.asyncio
+async def test_recorded_real_shape_fixture_parses_despite_unmodelled_fields() -> None:
+    payload = json.loads(_MARKET_LIST_FIXTURE.read_text(encoding="utf-8"))
+    client = _FakePublicClient(list_pages=[payload])
+
+    _raw_pages, weather_markets = await list_weather_markets(client, limit=10)
+
+    assert len(weather_markets) == 1
+    result = pull._slug_result_from_market(weather_markets[0]["slug"], weather_markets[0])
+    assert result.ok is True
+    assert result.taker_fee_coefficient == "0.06"
+
+
+# ---------------------------------------------------------------------------
 # deploy: the shipped unit's TimeoutStartSec must exceed the worst-case bound
 # ---------------------------------------------------------------------------
 
