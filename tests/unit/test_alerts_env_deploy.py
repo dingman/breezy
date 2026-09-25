@@ -18,6 +18,10 @@ resolve_alert_sink/emit_alert/alert_ladder calls):
         YES -- scripts/analysis/family_tally_v2.py:109,1025
         (emit_family_tally_failure_alert; wired from
         deploy/systemd/family-tally-v2-run.sh:330)
+    breezy-hypothesis-triage.service
+        YES -- scripts/analysis/hypothesis_triage.py:61,433,446
+        (resolve_alert_sink/emit_alert via deploy/systemd/
+        hypothesis-triage-run.sh)
     breezy-decisions-retention.service
         NO -- scripts/ops/decisions_retention.py: no alert import
     breezy-k1-daily.service
@@ -64,6 +68,7 @@ _ALERTS_ENV_DIRECTIVE = "EnvironmentFile=-%h/.config/breezy/alerts.env"
 _ALERTS_IN_PROCESS = frozenset(
     {
         "breezy-family-tally@.service",
+        "breezy-hypothesis-triage.service",
     }
 )
 
@@ -71,6 +76,7 @@ _ALL_AUDITED_UNITS = frozenset(
     {
         "breezy-decisions-retention.service",
         "breezy-family-tally@.service",
+        "breezy-hypothesis-triage.service",
         "breezy-k1-daily.service",
         "breezy-live-tally.service",
         "breezy-position-monitor-report.service",

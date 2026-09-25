@@ -1,0 +1,21 @@
+[Unit]
+Description=01:20 UTC trigger for the Breezy hypothesis triage
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/hypothesis_triage.py
+
+[Timer]
+Unit=breezy-hypothesis-triage.service
+
+# 01:20 UTC. First free minute after the protected LST-union no-start
+# window [16:35Z, 01:15Z) closes, 15 minutes clear of breezy-k1-daily at
+# 01:35, and colliding with no other HH:MM tick. The 15:50 UTC replay this
+# job reads finished hours earlier, so this cheap join is the least likely
+# admissible slot to skip behind breezy-studies.lock.
+OnCalendar=*-*-* 01:20:00 UTC
+
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

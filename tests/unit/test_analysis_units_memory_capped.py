@@ -66,6 +66,9 @@ _CANDIDATE_UNITS = [
     # ~80s/~674MB); listed here so its own cgroup ceiling never goes
     # uncovered.
     "breezy-replay-daily.service",
+    # AUD-18: hypothesis triage. JSONL joins only, so it sits an order of
+    # magnitude under the tape studies: MemoryHigh=1G / MemoryMax=2G.
+    "breezy-hypothesis-triage.service",
 ]
 
 _EXISTING_UNITS = [
@@ -205,3 +208,19 @@ def test_score_live_trials_unit_memory_ceiling_covers_its_measured_working_set()
     assert _parse_systemd_size(memory_max) > _parse_systemd_size(memory_high), (
         f"MemoryMax={memory_max} must be strictly above MemoryHigh={memory_high}"
     )
+
+
+_HYPOTHESIS_TRIAGE_UNIT = _DEPLOY_DIR / "breezy-hypothesis-triage.service"
+
+
+def test_hypothesis_triage_service_is_capped_ordered_after_replay_and_on_the_studies_slice() -> (
+    None
+):
+    """AUD-18 §6.4b / §7 step 5. Text-only: never systemctl, never an
+    installed unit path."""
+    text = _HYPOTHESIS_TRIAGE_UNIT.read_text()
+    assert _directive_value(text, "MemoryHigh") == "1G"
+    assert _directive_value(text, "MemoryMax") == "2G"
+    assert _directive_value(text, "Slice") == "breezy-studies.slice"
+    assert _directive_value(text, "After") == "breezy-replay-daily.service"
+    assert _directive_value(text, "Type") == "oneshot"

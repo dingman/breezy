@@ -1092,6 +1092,93 @@ def test_every_subprocess_call_takes_env_from_the_wrapper_env_fixture() -> None:
         )
 
 
+def _code_lines(text: str) -> list[str]:
+    return [
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_replay_daily_wrapper_does_not_invoke_hypothesis_triage() -> None:
+    """AUD-18 §7 step 5 / D5. AUD-09's wrapper stays closed: it does not
+    invoke hypothesis_triage.py, and every `"$PY"` script it does invoke is
+    inside the named set. The count is not pinned -- AUD-10b may add
+    promotion_proposal.py beside the two scripts already present."""
+    text = (_DEPLOY_DIR / "replay-daily-run.sh").read_text()
+    code = "\n".join(_code_lines(text))
+    assert "hypothesis_triage.py" not in code
+    invoked = set(
+        re.findall(r'"\$PY"\s+"\$REPO/scripts/analysis/([A-Za-z0-9_]+\.py)"', text)
+    )
+    allowed = {
+        "replay_sufficiency_census.py",
+        "replay_daily_runner.py",
+        "promotion_proposal.py",
+    }
+    assert invoked, "expected at least one \"$PY\" invocation"
+    assert invoked <= allowed, f"unsanctioned invocation(s): {invoked - allowed}"
+
+
+def test_hypothesis_triage_wrapper_locks_skips_and_invokes_one_script() -> None:
+    """AUD-18 §6.4b. Text contract: host-wide studies lock, flock -n
+    skip-not-kill, exactly one `"$PY"` script, no JSONL parsing in shell."""
+    text = (_DEPLOY_DIR / "hypothesis-triage-run.sh").read_text()
+    code = "\n".join(_code_lines(text))
+    assert "breezy-studies.lock" in code
+    assert re.search(r"flock -n 9", code)
+    assert "SKIPPED -- another study holds the studies lock" in code
+    assert re.search(r"flock -n 9.*exit 0", code, re.DOTALL)
+    invoked = re.findall(
+        r'"\$PY"\s+"\$REPO/scripts/analysis/([A-Za-z0-9_]+\.py)"', text
+    )
+    assert invoked == ["hypothesis_triage.py"]
+    assert ".jsonl" not in code
+    assert "json.load" not in code
+    assert "unset POSIXLY_CORRECT" in code
+
+
+def test_hypothesis_triage_wrapper_skips_when_the_studies_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    token = new_run_token()
+    xdg_runtime_dir = tmp_path / f"{token}-xdg-runtime"
+    xdg_runtime_dir.mkdir(parents=True)
+    lock_path = xdg_runtime_dir / _LOCK_FILENAME
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        out_dir = tmp_path / f"{token}-out"
+        env = build_wrapper_env(
+            tmp_path,
+            token,
+            output_dirs={"BREEZY_LIVE_TALLY_OUTPUT_DIR": out_dir},
+            xdg_runtime_dir=xdg_runtime_dir,
+            extra={"BREEZY_DERIVED_ROOT": str(tmp_path / f"{token}-derived")},
+        )
+        result = subprocess.run(
+            ["bash", str(_DEPLOY_DIR / "hypothesis-triage-run.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert "SKIPPED -- another study holds the studies lock" in result.stdout
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def test_hypothesis_triage_timer_is_0120_utc_persistent() -> None:
+    text = (_DEPLOY_DIR / "breezy-hypothesis-triage.timer").read_text()
+    assert "OnCalendar=*-*-* 01:20:00 UTC" in text
+    assert "Persistent=true" in text
+    assert "AccuracySec=1min" in text
+    assert "Unit=breezy-hypothesis-triage.service" in text
+
+
 def test_no_wrapper_test_wrote_into_the_real_breezy_state_directory() -> None:
     """A-19, the real guard (X-L27): scans ONLY the bytes appended (or, for
     the three `$OUT` directories, the names added) to the enumerated
