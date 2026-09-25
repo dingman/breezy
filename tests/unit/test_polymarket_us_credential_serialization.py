@@ -420,6 +420,18 @@ _ALLOWED_ASDICT_CALL_SITES: tuple[_AllowedAsdictCallSite, ...] = (
             "type."
         ),
     ),
+    _AllowedAsdictCallSite(
+        path="scripts/analysis/promotion_proposal.py",
+        lineno=375,
+        arg_name="row",
+        justification=(
+            "`row` is a `CriterionRow` (breezy.analysis.promotion_criteria) -- "
+            "a frozen dataclass of promotion-predicate metadata: id, verdict, "
+            "value, threshold, input_artefact, source, tag, inert_reason, "
+            "detail. It carries no credential-bearing field; nothing here is "
+            "loaded from, or authenticates to, a venue."
+        ),
+    ),
 )
 
 _ALLOWED_ASDICT_CALL_KEYS = frozenset(

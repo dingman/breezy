@@ -8,8 +8,9 @@
 # selection decision, parses NO JSONL artefact, and contains NO
 # `record_blocked` -- every `"$PY"` invocation below is one of the two
 # named scripts (`replay_sufficiency_census.py`,
-# `replay_daily_runner.py`); a third, `promotion_proposal.py`, is the
-# SANCTIONED future addition owned by AUD-10b (not built here).
+# `replay_daily_runner.py`, `promotion_proposal.py`). The proposal
+# invocation is the sanctioned third `"$PY"` script (AUD-09 B18 / AUD-10
+# C19). It is disk-only and arms nothing.
 #
 # The armed family manifest is resolved via the SAME
 # `systemctl --user show breezy-trade-supervisor.service --property=
@@ -160,15 +161,24 @@ fi
 # producer + driver subprocess invocations, RECOVERED/FAILED,
 # record_blocked, the row append, the summary line) lives in
 # replay_daily_runner.py, never here.
-if "$PY" "$REPO/scripts/analysis/replay_daily_runner.py" \
+if ! "$PY" "$REPO/scripts/analysis/replay_daily_runner.py" \
      --quote-catalog "$QUOTE_CATALOG" \
      --weather-catalog-root "$WEATHER_CATALOG_ROOT" \
      --family-manifest "$FAMILY_MANIFEST" \
      --output-root "$OUT_ROOT" \
      --python "$PY" >>"$LOG" 2>&1; then
-  say "replay daily ok"
-  exit 0
+  say "REPLAY DAILY FAILED (see $LOG)"
+  exit 1
 fi
 
-say "REPLAY DAILY FAILED (see $LOG)"
-exit 1
+# AUD-10b: sanctioned third invocation, still inside breezy-studies.lock,
+# after the replay. Disk-only proposal. No JSONL parsing in this wrapper.
+if ! "$PY" "$REPO/scripts/analysis/promotion_proposal.py" \
+     --family-manifest "$FAMILY_MANIFEST" \
+     --output-root "$OUT/promotion" \
+     --tally-output-dir "$OUT" >>"$LOG" 2>&1; then
+  say "REPLAY DAILY FAILED -- promotion proposal (see $LOG)"
+  exit 1
+fi
+say "replay daily ok"
+exit 0
