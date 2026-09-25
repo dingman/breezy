@@ -65,7 +65,7 @@ def _look(*, t: float, s: float, b_eff: float, b_fut: float) -> SimpleNamespace:
 #: coarse=151, fine=401"), `dt_min` pinned tiny so the dt guard never
 #: confounds the eff/fut/nonfinite-focused tests.
 _FAST_PIN = EpsPin(
-    eps=0.03,
+    eps=0.2,
     dt_min=1e-6,
     census_sha256="0" * 64,
     census_max=0.0,
@@ -264,9 +264,13 @@ def test_refined_run_equals_the_fine_grid_run_field_for_field_and_exercises_both
     """Test 17. One mixed and one 16-look cell, ~200 reps: the refined
     result must equal a pure fine-grid run field for field (excluding
     metadata) AND `0 < refined_count < n_reps` -- exercising both the
-    refine and the no-refine path (`_FAST_PIN.eps=0.03` is calibrated, by
-    direct measurement, to split at the gate-fast coarse=151/fine=401
-    pair)."""
+    refine and the no-refine path. `_FAST_PIN.eps=0.2` is calibrated, by
+    direct measurement, to split at the gate-fast coarse=151/fine=401 pair
+    AND to survive full per-rep auditing (review item 6b made
+    `audit_every` default to auditing every rep at this small `n_reps`,
+    which is a materially stricter bar than the refine-trigger heuristic
+    alone -- a smaller eps that only satisfied the split passed the split
+    but tripped `AuditPremiseViolation`)."""
     control_index = M1C_GRID.index(ALL_YES_K1_CONTROL)
     mixed_index = M1C_GRID.index(_ONE_MIXED_CELL)
     cells_and_indices = ((_ONE_MIXED_CELL, mixed_index), (ALL_YES_K1_CONTROL, control_index))
@@ -409,7 +413,7 @@ def test_small_dt_nonfinite_and_solver_error_force_the_fine_grid(
         cell_index=0,
     )
     assert reason == "solver"
-    assert stats["refined"] is True
+    assert stats["used_fine_grid"] is True
     assert len(looks) > 0
 
 

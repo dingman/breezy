@@ -10,13 +10,32 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from scipy.stats import beta as scipy_beta
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
-from aud06a_qty_envelope_sweep import clopper_pearson_lower, clopper_pearson_upper
 from aud07_m2_gate import ALPHA, I_CONF, V_CONF, V_THRESHOLD, branch, classify_cell, final_class
+
+
+def _indep_cp_upper(count: int, n: int, confidence: float) -> float:
+    """One-sided exact Clopper-Pearson upper bound, computed INDEPENDENTLY
+    of `aud06a_qty_envelope_sweep.clopper_pearson_upper` -- review item 5:
+    test 31 must not share its ground truth with the function it verifies.
+    `beta.ppf(conf, c+1, n-c)`, 1.0 at c=n."""
+    if count >= n:
+        return 1.0
+    return float(scipy_beta.ppf(confidence, count + 1, n - count))
+
+
+def _indep_cp_lower(count: int, n: int, confidence: float) -> float:
+    """One-sided exact Clopper-Pearson lower bound, independently derived.
+    `beta.ppf(1-conf, c, n-c+1)`, 0.0 at c=0."""
+    if count <= 0:
+        return 0.0
+    return float(scipy_beta.ppf(1.0 - confidence, count, n - count + 1))
 
 
 def test_gate_literals_are_the_amendment_values() -> None:
@@ -28,10 +47,11 @@ def test_gate_literals_are_the_amendment_values() -> None:
 
 
 def _count_for_cp_upper_at_most(n: int, threshold: float, *, confidence: float) -> int:
-    """The largest `count` with `clopper_pearson_upper(count, n, confidence) <= threshold`."""
+    """The largest `count` with `_indep_cp_upper(count, n, confidence) <= threshold`,
+    computed from the INDEPENDENT `scipy.stats.beta.ppf` derivation above."""
     best = 0
     for count in range(n + 1):
-        if clopper_pearson_upper(count, n, confidence=confidence) <= threshold:
+        if _indep_cp_upper(count, n, confidence) <= threshold:
             best = count
         else:
             break
@@ -39,27 +59,33 @@ def _count_for_cp_upper_at_most(n: int, threshold: float, *, confidence: float) 
 
 
 def test_classify_cell_at_v_and_i_boundaries_at_20k_and_80k() -> None:
-    """Test 31: the V boundary count (from the gate's own CP-upper
-    function, never hand-typed) classifies V one side and not-V the other,
-    at both the 20k and 80k rep counts. The I side is exercised at a count
-    comfortably past the V/I crossover (V is checked FIRST in
-    `classify_cell`, so a count can satisfy the `I` significance bound
-    while still also clearing the tight `V_THRESHOLD` -- ALPHA + delta
-    margin -- at large n; that band classifies V by design, never I)."""
+    """Test 31 (review item 5: independently derived via `scipy.stats.beta.ppf`
+    directly, never via the module's own `clopper_pearson_upper`/`_lower` --
+    a shared implementation would make this test a tautology). Asserts
+    `classify_cell` at count-1/count/count+1 around each independently
+    computed boundary, at both the 20k and 80k rep counts."""
     for n in (20000, 80000):
         v_count = _count_for_cp_upper_at_most(n, V_THRESHOLD, confidence=V_CONF)
+        assert classify_cell(v_count - 1, n) == "V"
         assert classify_cell(v_count, n) == "V"
         assert classify_cell(v_count + 1, n) != "V"
 
         # Walk upward from the V boundary until BOTH the V criterion fails
-        # and the I criterion fires -- the unambiguous I region.
+        # and the I criterion fires -- the unambiguous I region (V is
+        # checked FIRST in `classify_cell`, so a count can independently
+        # satisfy the I significance bound while still also clearing the
+        # tight V_THRESHOLD -- ALPHA + delta margin -- at large n; that
+        # band classifies V by design, never I, which is why both
+        # independent conditions are required here, not just the I bound).
         i_count = v_count + 1
         while not (
-            clopper_pearson_upper(i_count, n, confidence=V_CONF) > V_THRESHOLD
-            and clopper_pearson_lower(i_count, n, confidence=I_CONF) > ALPHA
+            _indep_cp_upper(i_count, n, V_CONF) > V_THRESHOLD
+            and _indep_cp_lower(i_count, n, I_CONF) > ALPHA
         ):
             i_count += 1
+        assert classify_cell(i_count - 1, n) != "I"
         assert classify_cell(i_count, n) == "I"
+        assert classify_cell(i_count + 1, n) == "I"
 
 
 def test_80k_replaces_never_pools_with_20k_and_indeterminate_after_rerun_is_i() -> None:

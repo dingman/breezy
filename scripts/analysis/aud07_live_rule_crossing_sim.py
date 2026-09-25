@@ -355,7 +355,7 @@ def seed_for(stage: str, cell_index: int, substream: int = 0) -> int:
         return SEED_BASE + cell_index
     if stage == "80k":
         return SEED_RERUN_BASE + 100 * substream + cell_index
-    if stage in ("cal_a", "cal_b", "cal_c"):
+    if stage in ("cal_a", "cal_b", "cal_c", "smoke"):
         return SEED_CAL_BASE + cell_index
     raise ValueError(f"unknown stage {stage!r}")
 
@@ -518,6 +518,8 @@ def load_eps_pin(path: Path, *, code_sha: str) -> EpsPin:
             f"eps {eps!r} is below 3x the census max {census_max!r} "
             f"({3.0 * census_max!r})"
         )
+    if dt_min <= 0.0:
+        raise EpsPinValidationError(f"dt_min {dt_min!r} must be > 0")
 
     return EpsPin(
         eps=eps,
@@ -527,6 +529,23 @@ def load_eps_pin(path: Path, *, code_sha: str) -> EpsPin:
         code_sha=pin_code_sha,
         sha256=hashlib.sha256(raw).hexdigest(),
     )
+
+
+def _resolve_audit_every(n_reps: int, audit_every: int | None) -> int:
+    """Review item 6b: `audit_every = n_reps // AUDIT_TARGET` when omitted
+    (never zero -- `max(1, ...)` so a small `n_reps` still audits every
+    rep), matching amendment §1 ("50 at 20k and 200 at 80k"). An EXPLICIT
+    `audit_every` that would yield fewer than `AUDIT_TARGET` audits is
+    refused rather than silently under-auditing."""
+    if audit_every is None:
+        return max(1, n_reps // AUDIT_TARGET)
+    n_audits = n_reps // audit_every
+    if n_audits < AUDIT_TARGET:
+        raise ValueError(
+            f"--audit-every {audit_every} yields only {n_audits} audit(s) for "
+            f"n_reps={n_reps}, below AUDIT_TARGET={AUDIT_TARGET}"
+        )
+    return audit_every
 
 
 def _needs_refine(looks: Sequence[Any], *, eps: float, dt_min: float) -> str | None:
@@ -662,12 +681,19 @@ def _run_replicate(
                     disagreement=disagreement,
                 )
         looks = looks_f
-        refined = True
+        used_fine_grid = True
     else:
         looks = looks_c
-        refined = False
+        used_fine_grid = False
 
-    return looks, reason, {"refined": refined, **audit_stats}
+    # `needed_refine` (reason-triggered) is DISTINCT from `used_fine_grid`
+    # (also true for an audit-only rep that never needed refining) -- the
+    # cost-model refine fraction f (§2.4) counts only the former.
+    return looks, reason, {
+        "used_fine_grid": used_fine_grid,
+        "needed_refine": reason is not None,
+        **audit_stats,
+    }
 
 
 def _assert_snapshot_imports(root: Path) -> None:
@@ -801,7 +827,9 @@ def run_cell(
     audit_reps = 0
     audit_max_abs_delta_b: float | None = None
     audit_disagreements = 0
-    audit_every_effective = audit_every if audit_every and audit_every > 0 else None
+    audit_every_effective = (
+        _resolve_audit_every(n_reps, audit_every) if boundary_mode == "refined" else None
+    )
 
     try:
         for rep_index in range(n_reps):
@@ -824,10 +852,9 @@ def run_cell(
                     cell_index=cell_index,
                 )
                 decided = True
-                if stats["refined"]:
+                if stats["needed_refine"]:
                     refined_count += 1
-                    if reason is not None:
-                        refine_reason_counts[reason] = refine_reason_counts.get(reason, 0) + 1
+                    refine_reason_counts[reason] = refine_reason_counts.get(reason, 0) + 1
                 if stats["audited"]:
                     audit_reps += 1
                     delta = stats["max_abs_delta_b"]
@@ -1111,6 +1138,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+#: Stages that MUST run from the pinned code snapshot (amendment §3.2):
+#: `smoke` is exempt (decided, review item 3) -- it is a cheap plumbing
+#: check, run directly against the working tree during development, never
+#: cited as evidence.
+_SNAPSHOT_GATED_STAGES: Final[frozenset[str]] = frozenset({"cal_a", "cal_b", "cal_c", "20k", "80k"})
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     from_idx, to_idx = args.cells
@@ -1119,6 +1153,8 @@ def main(argv: list[str] | None = None) -> int:
             f"--out {args.out} has parent directory {args.out.parent.name!r}, "
             f"which does not match --stage {args.stage!r}"
         )
+    if args.stage in _SNAPSHOT_GATED_STAGES:
+        _assert_snapshot_imports(_REPO_ROOT)
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     eps_pin = None

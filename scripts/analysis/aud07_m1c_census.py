@@ -53,9 +53,16 @@ from breezy.settlement.current_rung_hold_v2 import (
     score_combined,
 )
 
-__all__ = ["CensusCellStats", "derive_eps_pin", "run_census_cell"]
+__all__ = ["CensusCellStats", "derive_eps_pin", "run_census_cell", "run_stress_set"]
 
 DEFAULT_REPS_PER_CELL: Final[int] = 400
+
+#: Stress-set grid sizes (amendment §5 "Stress set"): t_1 in
+#: [0.5 x min observed, 0.15], dt on a log grid down to 1e-4.
+_STRESS_T1_POINTS: Final[int] = 6
+_STRESS_DT_POINTS: Final[int] = 8
+_STRESS_DT_MIN: Final[float] = 1e-4
+_STRESS_DT_MAX: Final[float] = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,17 +147,90 @@ def run_census_cell(
     )
 
 
+def _lin_grid(lo: float, hi: float, n: int) -> list[float]:
+    if n <= 1:
+        return [lo]
+    return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+
+
+def _log_grid(lo: float, hi: float, n: int) -> list[float]:
+    if lo <= 0 or hi <= 0:
+        raise ValueError(f"_log_grid requires lo, hi > 0: lo={lo!r} hi={hi!r}")
+    if n <= 1:
+        return [lo]
+    log_lo, log_hi = math.log10(lo), math.log10(hi)
+    return [10 ** (log_lo + (log_hi - log_lo) * i / (n - 1)) for i in range(n)]
+
+
+def run_stress_set(*, eps: float, min_observed_t1: float) -> dict[str, Any]:
+    """Synthetic low-t/low-dt stress set (amendment §5 "Stress set"):
+    `t_1` in `[0.5 x min_observed_t1, 0.15]`, `dt` on a log grid down to
+    `1e-4`. Needs NO real station-day draws: the coarse/fine boundary
+    comparison depends only on the synthetic `t_history` fed to
+    `StreamingBoundary`, never on `S` (`score_combined`/
+    `information_fraction` are grid-independent) -- so this is cheap,
+    unlike the CAL-b census's real Monte-Carlo replicates.
+
+    Records the per-`(t1, dt)` max `|delta b|`, and the LOWEST stress `dt`
+    that showed `max_abs_delta_b <= eps/3` (a `DT_MIN` LOWERING candidate
+    only -- amendment §5: "The stress set can only lower DT_MIN, and only
+    where it shows Δb ≤ EPS/3")."""
+    t1_lo = 0.5 * min_observed_t1
+    t1_grid = _lin_grid(min(t1_lo, 0.15), 0.15, _STRESS_T1_POINTS)
+    dt_grid = _log_grid(_STRESS_DT_MIN, _STRESS_DT_MAX, _STRESS_DT_POINTS)
+
+    results: list[dict[str, float]] = []
+    safe_dts: list[float] = []
+
+    for t1 in t1_grid:
+        for dt in dt_grid:
+            t2 = t1 + dt
+            if t2 > 1.0:
+                continue
+            coarse = StreamingBoundary(alpha=ALPHA_ONE_SIDED, npts=COARSE_NPTS)
+            fine = StreamingBoundary(alpha=ALPHA_ONE_SIDED, npts=GRID_NPTS)
+            max_delta = 0.0
+            t_history: list[float] = []
+            for i, t in enumerate((t1, t2)):
+                t_history.append(t)
+                is_terminal = i == 1
+                b_eff_c, b_fut_c = coarse(tuple(t_history), is_terminal=is_terminal)
+                b_eff_f, b_fut_f = fine(tuple(t_history), is_terminal=is_terminal)
+                for xc, xf in ((b_eff_c, b_eff_f), (b_fut_c, b_fut_f)):
+                    if xc == xf:
+                        continue
+                    if math.isfinite(xc) and math.isfinite(xf):
+                        max_delta = max(max_delta, abs(xc - xf))
+            results.append({"t1": t1, "dt": dt, "max_abs_delta_b": max_delta})
+            if max_delta <= eps / 3.0:
+                safe_dts.append(dt)
+
+    return {
+        "results": results,
+        "lowest_safe_stress_dt": min(safe_dts) if safe_dts else None,
+    }
+
+
 def derive_eps_pin(
-    cell_stats: list[CensusCellStats], *, code_sha: str, census_json_path: Path
+    cell_stats: list[CensusCellStats],
+    *,
+    code_sha: str,
+    census_json_path: Path,
+    stress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """`EPS = max(0.02, 3 x census max)`; `DT_MIN` = the realised minimum
-    dt across cells (the stress set can only LOWER this further -- not
-    implemented in the CAL-b runner above; the coordinator applies it as a
-    documented manual step per amendment §5 until a dedicated stress-set
-    runner lands)."""
+    """`EPS = max(0.02, 3 x census max)`. `DT_MIN` = the realised minimum
+    dt across cells, further lowered by `stress["lowest_safe_stress_dt"]`
+    when the stress set found one -- the stress set can only LOWER
+    `DT_MIN`, never raise it (amendment §5)."""
     census_max = max((s.max_abs_delta_b for s in cell_stats), default=0.0)
     dt_min = min((s.min_dt for s in cell_stats if s.min_dt > 0), default=0.0)
     eps = max(EPS_FLOOR, 3.0 * census_max)
+
+    if stress is not None:
+        stress_dt = stress.get("lowest_safe_stress_dt")
+        if stress_dt is not None:
+            dt_min = min(dt_min, stress_dt) if dt_min > 0 else stress_dt
+
     census_sha256 = hashlib.sha256(census_json_path.read_bytes()).hexdigest()
     return {
         "eps": eps,
@@ -175,11 +255,20 @@ def main(argv: list[str] | None = None) -> int:
     stats = [
         run_census_cell(i, n_reps=args.reps_per_cell) for i in range(len(M1C_GRID))
     ]
+
+    census_max = max((s.max_abs_delta_b for s in stats), default=0.0)
+    tentative_eps = max(EPS_FLOOR, 3.0 * census_max)
+    min_observed_t1 = min((s.min_t1 for s in stats if s.min_t1 > 0), default=0.15)
+    stress = run_stress_set(eps=tentative_eps, min_observed_t1=min_observed_t1)
+
     args.out_census.parent.mkdir(parents=True, exist_ok=True)
     args.out_census.write_text(
-        json.dumps({"cells": [s.to_json() for s in stats]}, indent=2) + "\n", encoding="utf-8"
+        json.dumps({"cells": [s.to_json() for s in stats], "stress": stress}, indent=2) + "\n",
+        encoding="utf-8",
     )
-    pin = derive_eps_pin(stats, code_sha=args.code_sha, census_json_path=args.out_census)
+    pin = derive_eps_pin(
+        stats, code_sha=args.code_sha, census_json_path=args.out_census, stress=stress
+    )
     args.out_pin.parent.mkdir(parents=True, exist_ok=True)
     args.out_pin.write_text(json.dumps(pin, indent=2) + "\n", encoding="utf-8")
     print(f"[aud07-m1c-census] EPS={pin['eps']!r} DT_MIN={pin['dt_min']!r}", file=sys.stderr)

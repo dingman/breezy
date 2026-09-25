@@ -14,6 +14,7 @@ import os
 import stat
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -23,11 +24,19 @@ _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
+import aud07_live_rule_crossing_sim as sim_mod
 from aud07_live_rule_crossing_sim import (
+    AUDIT_TARGET,
+    M1C_GRID,
+    EpsPin,
+    EpsPinValidationError,
     ForeignStageRowError,
     ResumeKeyConflictError,
     StageDirMismatchError,
     _assert_snapshot_imports,
+    _resolve_audit_every,
+    load_eps_pin,
+    run_cell,
     run_chunk,
 )
 from aud07_live_rule_crossing_sim import (
@@ -335,3 +344,233 @@ def test_80k_substream_pooling_equals_direct_accumulation() -> None:
     # Relative tolerance ~1e-12 on the float sums.
     assert pooled["sum_s_terminal"] == pytest.approx(direct_sum_s, rel=1e-12)
     assert pooled["sum_s2_terminal"] == pytest.approx(direct_sum_s2, rel=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-25 review fixes (python REQUEST_CHANGES, test audit)
+# ---------------------------------------------------------------------------
+
+
+def test_main_asserts_snapshot_imports_for_gated_stages_but_not_smoke(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review item 3: `main()` calls `_assert_snapshot_imports` for
+    cal_a/cal_b/cal_c/20k/80k; `smoke` is exempt (decided and tested)."""
+    monkeypatch.setattr(sim_mod, "_REPO_ROOT", tmp_path)
+
+    gated_dir = tmp_path / "20k"
+    gated_dir.mkdir()
+    with pytest.raises(AssertionError):
+        sim_main(
+            [
+                "--cells", "0:1", "--n-reps", "1", "--npts", "41",
+                "--out", str(gated_dir / "cell_00.jsonl"),
+                "--stage", "20k", "--code-sha", "deadbeef",
+            ]
+        )
+
+    smoke_dir = tmp_path / "smoke"
+    smoke_dir.mkdir()
+    # smoke is exempt from the snapshot assertion, so this must NOT raise
+    # AssertionError even though `_REPO_ROOT` is patched to a dir with no
+    # breezy package -- it runs the (cheap) cell for real instead.
+    rc = sim_main(
+        [
+            "--cells", "0:1", "--n-reps", "1", "--npts", "41",
+            "--out", str(smoke_dir / "cell_00.jsonl"),
+            "--stage", "smoke", "--code-sha", "deadbeef",
+        ]
+    )
+    assert rc == 0
+
+
+def test_eps_pin_validation_rejects_dt_min_leq_zero(tmp_path: Path) -> None:
+    """Review item 6a."""
+    payload = {
+        "eps": 0.03,
+        "dt_min": 0.0,
+        "census_max": 0.005,
+        "census_sha256": "d" * 64,
+        "code_sha": "sha-a",
+    }
+    path = tmp_path / "eps_pin_zero_dt.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(EpsPinValidationError, match="dt_min"):
+        load_eps_pin(path, code_sha="sha-a")
+
+    path2 = tmp_path / "eps_pin_negative_dt.json"
+    path2.write_text(json.dumps({**payload, "dt_min": -1e-6}), encoding="utf-8")
+    with pytest.raises(EpsPinValidationError, match="dt_min"):
+        load_eps_pin(path2, code_sha="sha-a")
+
+
+def test_audit_every_defaults_from_n_reps_and_audit_target_and_rejects_too_few_audits() -> None:
+    """Review item 6b: `audit_every` is computed from `n_reps`/`AUDIT_TARGET`
+    when omitted, and an explicit value yielding fewer than `AUDIT_TARGET`
+    audits is REJECTED."""
+    assert _resolve_audit_every(20000, None) == 20000 // AUDIT_TARGET == 50
+    assert _resolve_audit_every(80000, None) == 80000 // AUDIT_TARGET == 200
+    # Too few reps for even one full AUDIT_TARGET batch: never divide by zero.
+    assert _resolve_audit_every(200, None) == 1
+
+    # An explicit value that clears the bar is accepted verbatim.
+    assert _resolve_audit_every(1000, 2) == 2  # 1000 // 2 = 500 >= 400
+
+    with pytest.raises(ValueError, match="audit"):
+        _resolve_audit_every(1000, 10)  # 1000 // 10 = 100 < 400
+
+    # Wired through run_cell: the resolved value is stamped on the row. eps
+    # is deliberately generous (this is a wiring check, not a proximity
+    # calibration) so every-rep auditing at audit_every=1 never trips
+    # AuditPremiseViolation on this small rep count.
+    pin = EpsPin(
+        eps=1.0, dt_min=1e-6, census_sha256="0" * 64, census_max=0.0, code_sha="s", sha256="0" * 64
+    )
+    mixed_index = next(i for i, c in enumerate(M1C_GRID) if c.side_mix == "mixed" and c.k == 2)
+    result = run_cell(
+        M1C_GRID[mixed_index],
+        cell_index=mixed_index,
+        seed=20260925_950001,
+        n_reps=40,
+        npts=401,
+        boundary_mode="refined",
+        eps_pin=pin,
+        coarse_npts=151,
+        audit_every=None,
+    )
+    assert result.audit_every == max(1, 40 // AUDIT_TARGET) == 1
+
+
+def test_cell_sh_rejects_shell_metacharacters_in_cell_arg_stage_and_cmd_without_executing(
+    tmp_path: Path,
+) -> None:
+    """Review item 1 (CRITICAL): no value cell.sh reads is ever `eval`'d --
+    a metacharacter-carrying cell arg, `STAGE`, or `AUD07_CELL_CMD` is
+    rejected before anything runs."""
+    run_dir = tmp_path / "runs"
+    calls_file = tmp_path / "calls.txt"
+    marker = tmp_path / "PWNED"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(
+        f'#!/usr/bin/env bash\necho "$1 $2" >> "{calls_file}"\nexit 0\n', encoding="utf-8"
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    base_env = {
+        **os.environ,
+        "RUN_DIR": str(run_dir),
+        "STAGE": "20k",
+        "CUTOFF": "2026-09-26T00:00:00Z",
+        "AUD07_CELL_CMD": str(stub),
+    }
+
+    r_arg = subprocess.run(
+        ["bash", str(_CELL_SH), f"0; touch {marker}"],
+        env=base_env, capture_output=True, text=True, check=False,
+    )
+    assert r_arg.returncode != 0
+    assert not marker.exists()
+    assert not calls_file.exists()
+
+    r_stage = subprocess.run(
+        ["bash", str(_CELL_SH), "0"],
+        env={**base_env, "STAGE": f"20k; touch {marker}"},
+        capture_output=True, text=True, check=False,
+    )
+    assert r_stage.returncode != 0
+    assert not marker.exists()
+    assert not calls_file.exists()
+
+    r_cmd = subprocess.run(
+        ["bash", str(_CELL_SH), "0"],
+        env={**base_env, "AUD07_CELL_CMD": f"{stub} ; touch {marker}"},
+        capture_output=True, text=True, check=False,
+    )
+    assert r_cmd.returncode != 0
+    assert not marker.exists()
+    assert not calls_file.exists()
+
+
+def test_cell_sh_defers_near_cutoff_runs_far_cutoff_and_uses_the_class_median(
+    tmp_path: Path,
+) -> None:
+    """Review item 2: the §3.4 est_wall/cutoff deferral."""
+    run_dir = tmp_path / "runs"
+    stage_dir = run_dir / "20k"
+    stage_dir.mkdir(parents=True)
+    calls_file = tmp_path / "calls.txt"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(
+        f'#!/usr/bin/env bash\necho "ran $1" >> "{calls_file}"\nexit 0\n', encoding="utf-8"
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    def _run(cell_arg: str, cutoff_iso: str) -> subprocess.CompletedProcess:
+        env = {
+            **os.environ,
+            "RUN_DIR": str(run_dir),
+            "STAGE": "20k",
+            "CUTOFF": cutoff_iso,
+            "AUD07_CELL_CMD": str(stub),
+        }
+        return subprocess.run(
+            ["bash", str(_CELL_SH), cell_arg], env=env, capture_output=True, text=True, check=False
+        )
+
+    far = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r_far = _run("48", far)
+    assert r_far.returncode == 0, r_far.stderr
+    assert "ran 48" in calls_file.read_text(encoding="utf-8")
+
+    near = (datetime.now(UTC) + timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r_near = _run("47", near)
+    assert r_near.returncode == 0, r_near.stderr
+    deferred_text = (stage_dir / "DEFERRED").read_text(encoding="utf-8")
+    assert "47" in deferred_text
+    assert "ran 47" not in calls_file.read_text(encoding="utf-8")
+
+    # Seed completed "mixed"-class (cell_index 0-15) rows with a small
+    # median wall_s, then use a cutoff that fits the MEDIAN (12s) but NOT
+    # the class default (4928s) -- proving the median, not the default,
+    # drove the decision.
+    (stage_dir / "cell_00.jsonl").write_text(
+        json.dumps({"cell_index": 0, "wall_s": 5.0}) + "\n"
+        + json.dumps({"cell_index": 1, "wall_s": 15.0}) + "\n",
+        encoding="utf-8",
+    )
+    fits_median_only = (datetime.now(UTC) + timedelta(seconds=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r_median = _run("2", fits_median_only)
+    assert r_median.returncode == 0, r_median.stderr
+    assert "ran 2" in calls_file.read_text(encoding="utf-8")
+
+
+def test_sweep_sh_exports_thread_env_vars_itself(tmp_path: Path) -> None:
+    """Review item 4."""
+    run_dir = tmp_path / "runs"
+    queue = tmp_path / "queue.txt"
+    queue.write_text("0\n", encoding="utf-8")
+    env_report = tmp_path / "env_report.txt"
+    stub = tmp_path / "stub.sh"
+    report_line = (
+        'echo "OPENBLAS=$OPENBLAS_NUM_THREADS OMP=$OMP_NUM_THREADS '
+        f'MKL=$MKL_NUM_THREADS" >> "{env_report}"\n'
+    )
+    stub.write_text(
+        "#!/usr/bin/env bash\n" + report_line + "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    env = {k: v for k, v in os.environ.items() if not k.endswith("_NUM_THREADS")}
+    env.update({"RUN_DIR": str(run_dir), "AUD07_CELL_CMD": str(stub)})
+
+    result = subprocess.run(
+        [
+            "bash", str(_SWEEP_SH),
+            "--code-sha", "deadbeef", "--stage", "20k",
+            "--queue", str(queue), "--cutoff", "2026-09-26T00:00:00Z", "-P", "1",
+        ],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert env_report.read_text(encoding="utf-8").strip() == "OPENBLAS=1 OMP=1 MKL=1"

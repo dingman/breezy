@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # AUD-07 M1c/M2 Rev 2 execution amendment -- sweep driver (amendment §3.4
 # "aud07_m1c_sweep.sh --code-sha --stage --queue <file> --cutoff <ISO-UTC>
-# -P 8"). The est_wall/cutoff-deferral scheduling this drives in production
-# is the coordinator's job (task brief: "Do NOT run CAL, the sweep or any
-# heavy job"); this script implements ONLY the fail-closed FAILED-file gate
-# and the xargs exit-code surfacing that the orchestration tests (test 22)
-# exercise directly, via the `AUD07_CELL_CMD` stub.
+# -P 8"), 2026-09-25 review fixes:
+#
+#   item 2: forwards CODE_SHA/STAGE/RUN_DIR/CUTOFF to `aud07_m1c_cell.sh` as
+#   env, so `cell.sh` can implement the est_wall/cutoff deferral itself.
+#   Every other cell input (N_REPS, NPTS, BOUNDARY_MODE, EPS_PIN,
+#   COARSE_NPTS, AUDIT_EVERY) is inherited from THIS script's own
+#   environment -- set by the coordinator (e.g. `systemd-run --setenv=...`)
+#   before invoking this script -- and validated by `cell.sh` itself.
+#
+#   item 4: exports the thread-oversubscription guards itself, rather than
+#   relying on the caller to have set them.
 set -euo pipefail
+
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
 code_sha=""
 stage=""
@@ -46,8 +56,11 @@ stage_dir="$run_dir/$stage"
 mkdir -p "$stage_dir"
 
 cell_script="$(dirname "$0")/aud07_m1c_cell.sh"
-STAGE="$stage" RUN_DIR="$run_dir" xargs -a "$queue" -P "$parallel" -n 1 "$cell_script"
+export STAGE="$stage" RUN_DIR="$run_dir" CODE_SHA="$code_sha" CUTOFF="$cutoff"
+set +e
+xargs -a "$queue" -P "$parallel" -n 1 "$cell_script"
 rc=$?
+set -e
 
 if [ "$rc" -eq 123 ] || [ "$rc" -eq 124 ] || [ "$rc" -eq 125 ]; then
   echo "[aud07-m1c-sweep] one or more cells failed:" >&2
