@@ -12,6 +12,23 @@ with an independent, periodic, read-only probe. It never edits
 ``DOCUMENTED_TAKER_FEE_COEFFICIENT``, never auto-adopts a wire value, and
 never places an order.
 
+**Reference value defect fix (``RULING_fee_drift_probe_target_2026-09-25.md``,
+2026-09-25).** The probe's ``documented_fee_coefficient`` is a plain
+constructor parameter, defaulted to ``DOCUMENTED_TAKER_FEE_COEFFICIENT`` for
+tests only -- the wiring site (``breezy.app.trade``) ALWAYS passes the
+composed family's own REGISTERED theta (``FamilyManifest.taker_fee_coefficient``,
+the exact source ``decision.py:342``'s own per-order check already uses),
+never the module-level constant. A family registered at a different,
+committed theta (e.g. ``pm_us_crh_v4`` at ``0.0695``) is compared against
+ITS OWN registered value, not the stale documentation pin -- comparing
+against the wrong constant previously produced a permanent, unresolvable
+DISAGREE for that family. Repeated DISAGREEs against the SAME wire value are
+deduplicated (CRITICAL once, then a single ``fee_drift_probe_mismatch_persisting``
+reminder per :data:`_MISMATCH_SUPPRESSION_WINDOW_NS`); a NEW distinct wire
+value always alerts immediately. The halt-set (``set_family_halted``) still
+fires on EVERY DISAGREE, deduped or not -- dedup only shapes the alert
+stream, never the halt.
+
 **Native extension point, not a new mechanism.** A plain ``Actor`` with a
 native ``Clock.set_timer`` (``common/component.pyx:419``), the exact shape
 ``breezy.ingest.nbm_forecast_actor.NbmForecastActor`` and
@@ -125,6 +142,13 @@ FEE_COEFFICIENT_WIRE_KEY: Final[str] = "feeCoefficient"
 #: No coarser than 2 hours (plan §6 item 3 / §7 step 3a).
 DEFAULT_FEE_DRIFT_PROBE_INTERVAL_SECONDS: Final[int] = 2 * 60 * 60
 
+#: Dedupe/re-arm window for a repeated DISAGREE against the SAME wire value
+#: (``RULING_fee_drift_probe_target_2026-09-25.md``). Measured on this
+#: Actor's OWN clock (``self.clock.timestamp_ns()``), never wall time, so a
+#: backtest or a fast-forwarded ``TestClock`` reasons about it identically to
+#: a live process.
+_MISMATCH_SUPPRESSION_WINDOW_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
+
 #: Reused, not reinvented: the same read-quota bucket
 #: ``provider.py``'s own single-slug-per-session discovery reads already
 #: spend against.
@@ -201,6 +225,12 @@ class FeeDriftProbeActor(Actor):
         self._inflight = 0
         self._inflight_lock = threading.Lock()
         self.counters: Counter[str] = Counter()
+
+        #: Dedupe state for the mismatch alert stream (never for the halt,
+        #: which stays unconditional on every DISAGREE). ``None`` until the
+        #: first DISAGREE this process has seen.
+        self._last_mismatch_wire_fee: Decimal | None = None
+        self._last_mismatch_alert_ts_ns: int | None = None
 
     # -- observability --------------------------------------------------
 
@@ -306,7 +336,9 @@ class FeeDriftProbeActor(Actor):
         for reasons a read cannot (a corrupt store, a released lock this
         probe does not itself control), and the DISAGREE finding -- the
         confirmed drift itself -- must never be swallowed by that failure:
-        it is still alerted via ``_alert_mismatch`` and still counted and
+        it is still alerted (via :meth:`_dedupe_and_alert_mismatch`, which may
+        be the first-sighting ``_alert_mismatch`` or the >=24h
+        ``_alert_mismatch_persisting`` reminder) and still counted and
         returned as ``"DISAGREE"``. The halt-set failure gets its OWN,
         distinct CRITICAL alert (``fee_drift_probe_halt_set_failed``) so an
         operator can tell "drift detected, family halted" apart from
@@ -322,7 +354,7 @@ class FeeDriftProbeActor(Actor):
         if wire_fee == self._documented:
             self.counters["agree"] += 1
             return "AGREE"
-        self._alert_mismatch(wire_fee)
+        self._dedupe_and_alert_mismatch(wire_fee)
         try:
             self._set_family_halted(wire_fee)
         except Exception as exc:  # noqa: BLE001 - a halt-set failure must never crash the probe
@@ -342,6 +374,32 @@ class FeeDriftProbeActor(Actor):
             ),
         )
 
+    def _dedupe_and_alert_mismatch(self, wire_fee: Decimal) -> None:
+        """CRITICAL once per distinct wire value; the SAME value is
+        suppressed for :data:`_MISMATCH_SUPPRESSION_WINDOW_NS`, then gets
+        exactly one ``fee_drift_probe_mismatch_persisting`` reminder, which
+        re-arms its own window. A NEW distinct wire value always alerts
+        immediately, regardless of any prior value's window.
+
+        Timed on ``self.clock.timestamp_ns()`` -- this Actor's own, native
+        clock (a live process's real clock or a test's ``TestClock``), never
+        wall time, so a fast-forwarded backtest/test reasons about the
+        window identically to a live process. Never shapes the halt: the
+        caller (:meth:`probe_once`) still calls ``set_family_halted`` on
+        every DISAGREE this method is invoked for, deduped or not.
+        """
+        now_ns = self.clock.timestamp_ns()
+        if wire_fee != self._last_mismatch_wire_fee:
+            self._alert_mismatch(wire_fee)
+            self._last_mismatch_wire_fee = wire_fee
+            self._last_mismatch_alert_ts_ns = now_ns
+            return
+        assert self._last_mismatch_alert_ts_ns is not None  # set alongside the wire fee, above
+        elapsed_ns = now_ns - self._last_mismatch_alert_ts_ns
+        if elapsed_ns >= _MISMATCH_SUPPRESSION_WINDOW_NS:
+            self._alert_mismatch_persisting(wire_fee, elapsed_ns)
+            self._last_mismatch_alert_ts_ns = now_ns
+
     def _alert_mismatch(self, wire_fee: Decimal) -> None:
         emit_alert(
             self._alert_sink,
@@ -350,6 +408,25 @@ class FeeDriftProbeActor(Actor):
                 event="fee_drift_probe_mismatch",
                 site=self._site,
                 detail=f"documented={self._documented} wire={wire_fee}",
+            ),
+        )
+
+    def _alert_mismatch_persisting(self, wire_fee: Decimal, elapsed_ns: int) -> None:
+        """The SAME drifted wire value is still live >= the suppression
+        window after it was first alerted. Distinct event name from
+        ``_alert_mismatch`` so an operator scanning the alert stream can tell
+        "still drifted, unresolved" apart from "a fresh drift just
+        appeared"."""
+        emit_alert(
+            self._alert_sink,
+            AlertPayload(
+                severity="CRITICAL",
+                event="fee_drift_probe_mismatch_persisting",
+                site=self._site,
+                detail=(
+                    f"documented={self._documented} wire={wire_fee} "
+                    f"persisting_ns={elapsed_ns}"
+                ),
             ),
         )
 
