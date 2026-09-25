@@ -3013,9 +3013,10 @@ async def test_record_fill_is_written_before_true_up_booking_retire_and_order_fi
     # the only live instance for the duration of this test.
     original_true_up = DailySpendLedger.true_up_booking
 
-    def _spy_record_fill(record: DurableFillRecord) -> None:
+    def _spy_record_fill(record: DurableFillRecord, **kwargs: Any) -> None:
+        # AUD-13b: the write sites now pass `fill_time_instrument=` through.
         rig.trace.append("record_fill")
-        original_record_fill(record)
+        original_record_fill(record, **kwargs)
 
     def _spy_true_up(ledger_self: Any, *args: Any, **kwargs: Any) -> Any:
         rig.trace.append("true_up_booking")
@@ -3737,7 +3738,7 @@ async def test_a_raising_record_fill_refuses_but_still_publishes_both_events(
         body=_accept_fill_body(slug, order_id="ord-i1b-boom"),
     )
 
-    def _boom(record: DurableFillRecord) -> None:
+    def _boom(record: DurableFillRecord, **kwargs: Any) -> None:
         raise RuntimeError("simulated durable write failure")
 
     monkeypatch.setattr(rig.client, "record_fill", _boom)
@@ -4028,6 +4029,10 @@ def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
         "venueFeeRaw",
         "tradeId",
         "orderQty",
+        # AUD-13b (ruling R-1 = O4): two more optional-on-read keys, same
+        # pattern as `tradeId`/`orderQty`. WIDENED, not relaxed: still `==`.
+        "feeCoefficientAtFill",
+        "feeSource",
     }
 
     assert DurableFillRecord.from_bytes(raw) == record
@@ -4086,6 +4091,80 @@ def test_a_non_finite_order_qty_is_refused(bad_order_qty: str) -> None:
 def test_a_non_string_trade_id_is_refused() -> None:
     with pytest.raises(ExecutionReportMappingError, match="tradeId"):
         DurableFillRecord.from_bytes(_raw_record(tradeId=123))
+
+
+# (f4) AUD-13b / ruling R-1 = O4: `fee_coefficient_at_fill` and `fee_source`
+# round-trip, and are optional-on-read for every record written before them.
+def test_a_durable_record_round_trips_the_fee_coefficient_at_fill_and_fee_source() -> None:
+    record = DurableFillRecord(
+        venue_order_id="V-ROUNDTRIP-3",
+        client_order_id="O-19700101-000000-001-001-3",
+        instrument_id="some-instrument",
+        order_side="BUY",
+        cumulative_qty=Decimal(1),
+        cumulative_cost=Decimal("0.44"),
+        cumulative_fee=Decimal(0),
+        fee_reconciled=False,
+        ts_event=TS_INIT,
+        fee_coefficient_at_fill=Decimal("0.0695"),
+        fee_source="MODELLED_AT_FILL_TIME",
+    )
+    raw = record.to_bytes()
+    decoded = json.loads(raw)
+    assert decoded["feeCoefficientAtFill"] == "0.0695"
+    assert decoded["feeSource"] == "MODELLED_AT_FILL_TIME"
+    assert DurableFillRecord.from_bytes(raw) == record
+
+
+def test_a_legacy_record_decodes_with_no_fee_coefficient_at_fill_and_no_fee_source() -> None:
+    legacy = DurableFillRecord.from_bytes(_raw_record())
+    assert legacy.fee_coefficient_at_fill is None
+    assert legacy.fee_source is None
+
+
+@pytest.mark.parametrize("bad", ["NaN", "-0.01", "1.5"])
+def test_an_unusable_fee_coefficient_at_fill_is_refused(bad: str) -> None:
+    with pytest.raises(ExecutionReportMappingError, match="feeCoefficientAtFill"):
+        DurableFillRecord.from_bytes(_raw_record(feeCoefficientAtFill=bad))
+
+
+@pytest.mark.parametrize("bad", ["recorded", "MODELLED", 1])
+def test_a_fee_source_outside_the_two_ruled_values_is_refused(bad: Any) -> None:
+    with pytest.raises(ExecutionReportMappingError, match="feeSource"):
+        DurableFillRecord.from_bytes(_raw_record(feeSource=bad))
+
+
+@pytest.mark.asyncio
+async def test_an_accept_fill_stamps_the_fill_time_coefficient_and_fee_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """B0 (ruling R-1 mechanism (a)): the CREATE-path write site records the
+    theta of the `Instrument` in hand AT FILL TIME, and the `feeSource` the O4
+    rule derives from the record itself."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id="ord-b0-theta"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        (record,) = rig.client.fill_records_for(rig.instrument.id)
+        await rig.client._disconnect()
+
+    assert record.fee_coefficient_at_fill == Decimal(
+        str(rig.instrument.info[FEE_COEFFICIENT_KEY])
+    )
+    expected = (
+        "RECORDED"
+        if record.fee_reconciled and record.venue_fee_raw is not None
+        else "MODELLED_AT_FILL_TIME"
+    )
+    assert record.fee_source == expected
 
 
 # (g) `None` totals on an accept-fill outcome -- the same failure path as (c).

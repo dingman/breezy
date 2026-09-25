@@ -950,6 +950,11 @@ async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fi
         # DIFFERENT field from `cumulative_qty`/`filled_qty` above).
         assert record.trade_id == f"GET-{order_id}"
         assert record.order_qty == Decimal(1)
+        # AUD-13b (ruling R-1 = O4 mechanism (a)): the RESOLVER write site
+        # stamps the theta of the Instrument in hand (the fixture's 0.06) and
+        # the ruled fee source -- no venue fee on an Order-only GET, so MODELLED.
+        assert record.fee_coefficient_at_fill == Decimal("0.06")
+        assert record.fee_source == "MODELLED_AT_FILL_TIME"
 
         filled = _order_filled_events(order_events)
         assert len(filled) == 1, "exactly one native OrderFilled"

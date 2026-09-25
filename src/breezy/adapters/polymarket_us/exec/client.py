@@ -229,6 +229,7 @@ FIVE INVARIANTS, EACH WITH ITS OWN VERIFIED CITATION
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import threading
 from collections.abc import Callable, Iterable, Mapping
@@ -237,7 +238,11 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Protocol, Self
 
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.reports import PositionStatusReport
+from nautilus_trader.execution.reports import (
+    FillReport,
+    OrderStatusReport,
+    PositionStatusReport,
+)
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
@@ -248,6 +253,7 @@ from nautilus_trader.model.enums import (
     OrderStatus,
     OrderType,
     PositionSide,
+    TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -294,7 +300,12 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_position_status_report,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
-from breezy.adapters.polymarket_us.fees import polymarket_us_fee
+from breezy.adapters.polymarket_us.fees import (
+    fee_schedule_bucket,
+    polymarket_us_fee,
+    taker_fee_at_fill,
+    taker_fee_coefficient_of,
+)
 from breezy.adapters.polymarket_us.operator_controls import (
     DailyBudgetExhausted,
     SpendBooking,
@@ -340,11 +351,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         SubmitOrder,
         SubmitOrderList,
     )
-    from nautilus_trader.execution.reports import (
-        ExecutionMassStatus,
-        FillReport,
-        OrderStatusReport,
-    )
+    from nautilus_trader.execution.reports import ExecutionMassStatus
     from nautilus_trader.model.identifiers import ClientId, Venue
     from nautilus_trader.model.instruments import Instrument
     from nautilus_trader.model.objects import Price, Quantity
@@ -415,6 +422,64 @@ _ORDER_ID_REDACT_PREFIX: Final[int] = 4
 def _redact_order_id(venue_order_id: str) -> str:
     """A venue order id reduced to a short prefix for a log line."""
     return f"{venue_order_id[:_ORDER_ID_REDACT_PREFIX]}\u2026"
+
+
+#: AUD-13b (plan §6 "Fail-closed semantics"): the event name every durable-
+#: reconciliation refusal is surfaced under, and its NAMED latches. Each
+#: refusal returns empty reports for its scope AND latches one of these --
+#: emptiness is never indistinguishable from "nothing to report", and no
+#: refusal borrows another's name.
+RECONCILIATION_REFUSAL_EVENT: Final[str] = "reconciliation_refusal"
+POSITIONS_READ_FAILED: Final[str] = "positions_read_failed"
+RECORD_VENUE_DISAGREEMENT: Final[str] = "record_venue_disagreement"
+FEE_COEFFICIENT_AMBIGUOUS: Final[str] = "fee_coefficient_ambiguous"
+#: AUD-13b silent-failure review finding 1: an UNEXPECTED defect building one
+#: position's reports (never a foreign payload shape -- that is
+#: ``positions_read_failed`` -- and never a corrupt fee input -- that is
+#: ``fee_coefficient_ambiguous``). Scoped to the ONE position it hit so a
+#: defect in one position's build never drops every other position's reports.
+DURABLE_REPORTS_BUILD_FAILED: Final[str] = "durable_reports_build_failed"
+
+#: What `_map_position` did with one venue position (AUD-13b). Anything that
+#: is not one of the first three -- a mapping error, a non-long side -- is
+#: `_MAP_UNPARSEABLE`, which fails the WHOLE read for the durable reports.
+_MAP_OPEN: Final[str] = "open"
+_MAP_GATED_OUT: Final[str] = "gated_out"
+_MAP_INSTRUMENT_ABSENT: Final[str] = "instrument_absent"
+_MAP_UNPARSEABLE: Final[str] = "unparseable"
+
+#: The FIXED enum ``detail`` per latch (never an id, a date or exception text).
+_RECONCILIATION_REFUSAL_DETAILS: Final[Mapping[str, str]] = {
+    POSITIONS_READ_FAILED: "POSITIONS_READ_FAILED",
+    RECORD_VENUE_DISAGREEMENT: "RECORD_VENUE_DISAGREEMENT",
+    FEE_COEFFICIENT_AMBIGUOUS: "FEE_COEFFICIENT_AMBIGUOUS",
+    DURABLE_REPORTS_BUILD_FAILED: "DURABLE_REPORTS_BUILD_FAILED",
+}
+
+#: The counts line's fields, in their fixed order (plan §6 "Regression
+#: detector"). ``refusals`` is the sum of the per-cause fields.
+_RECONCILIATION_COUNT_FIELDS: Final[tuple[str, ...]] = (
+    "order_reports",
+    "fill_reports",
+    "records_considered",
+    "gated_out",
+    "instrument_absent",
+    "refusals",
+    f"refusals_{POSITIONS_READ_FAILED}",
+    f"refusals_{RECORD_VENUE_DISAGREEMENT}",
+    f"refusals_{FEE_COEFFICIENT_AMBIGUOUS}",
+    f"refusals_{DURABLE_REPORTS_BUILD_FAILED}",
+)
+
+
+def format_reconciliation_counts_line(counts: Mapping[str, int]) -> str:
+    """The one fixed-shape INFO line per durable reconciliation pass.
+
+    A silent regression to ``[]`` reads ``order_reports=0 records_considered=N``,
+    a different and greppable shape from a legitimate ``records_considered=0``.
+    """
+    fields = " ".join(f"{name}={counts[name]}" for name in _RECONCILIATION_COUNT_FIELDS)
+    return f"durable reconciliation: {fields}"
 
 #: D1/D2 (plan rev 6.1): durable, per-venue-order-id marker that a permit
 #: slot was restored for it -- written by the CALLER (this client), never by
@@ -655,6 +720,54 @@ def _optional_order_qty(raw: object) -> Decimal | None:
     return _to_decimal(raw, field="orderQty", error=ExecutionReportMappingError)
 
 
+#: AUD-13b (ruling R-1 = O4): the two values a record's ``feeSource`` may
+#: take. ``RECORDED`` is the venue's own attested fee; anything else is a
+#: model output FOR THAT FILL'S ERA (theta as of ``ts_event``).
+FEE_SOURCE_RECORDED: Final[str] = "RECORDED"
+FEE_SOURCE_MODELLED_AT_FILL_TIME: Final[str] = "MODELLED_AT_FILL_TIME"
+_FEE_SOURCES: Final[frozenset[str]] = frozenset(
+    {FEE_SOURCE_RECORDED, FEE_SOURCE_MODELLED_AT_FILL_TIME}
+)
+
+
+def fee_source_for(*, fee_reconciled: bool, venue_fee_raw: str | None) -> str:
+    """The O4 rule, in one place: ``RECORDED`` iff the fee reconciled AND the
+    venue's raw fee is present -- ``fee_reconciled`` alone is not an
+    attestation. Both write sites stamp this, and reconciliation re-derives
+    it rather than trusting a stored value."""
+    if fee_reconciled and venue_fee_raw is not None:
+        return FEE_SOURCE_RECORDED
+    return FEE_SOURCE_MODELLED_AT_FILL_TIME
+
+
+def _optional_fee_coefficient_at_fill(raw: object) -> Decimal | None:
+    """``feeCoefficientAtFill`` is optional-on-read (``None`` on every record
+    written before AUD-13b); a present value must be a finite theta in
+    ``[0, 1]``, exactly the range ``fees._fee_coefficient`` accepts."""
+    if raw is None:
+        return None
+    theta = _to_decimal(raw, field="feeCoefficientAtFill", error=ExecutionReportMappingError)
+    if theta < 0 or theta > 1:
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: feeCoefficientAtFill {theta} "
+            "is outside [0, 1]"
+        )
+    return theta
+
+
+def _optional_fee_source(raw: object) -> str | None:
+    """``feeSource`` is optional-on-read; a present value must be one of the
+    two ruled members, never a near-miss spelling."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or raw not in _FEE_SOURCES:
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: feeSource must be one of "
+            f"{sorted(_FEE_SOURCES)} or null, got {raw!r}"
+        )
+    return raw
+
+
 @dataclass(frozen=True, kw_only=True)
 class DurableFillRecord:
     """What Breezy actually paid, on disk, CUMULATIVE per venue order.
@@ -701,6 +814,15 @@ class DurableFillRecord:
     #: ``None`` on a legacy record; never inferred from ``cumulative_qty``,
     #: never defaulted to ``Decimal(1)`` (S-M1).
     order_qty: Decimal | None = None
+    #: AUD-13b / ruling R-1 = O4 mechanism (a): the taker theta of the
+    #: ``Instrument`` in hand when the record was written. ``None`` on a legacy
+    #: record (priced from the dated schedule instead) or when that
+    #: instrument's schedule was unusable. On a RESOLVER record it is the theta
+    #: at DISCOVERY time, the same upper-bound caveat as its ``ts_event``.
+    fee_coefficient_at_fill: Decimal | None = None
+    #: AUD-13b: :func:`fee_source_for` as stamped at write time. Diagnostic
+    #: provenance only -- reconciliation re-derives it, never trusts it.
+    fee_source: str | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -717,6 +839,12 @@ class DurableFillRecord:
                 "venueFeeRaw": self.venue_fee_raw,
                 "tradeId": self.trade_id,
                 "orderQty": None if self.order_qty is None else str(self.order_qty),
+                "feeCoefficientAtFill": (
+                    None
+                    if self.fee_coefficient_at_fill is None
+                    else str(self.fee_coefficient_at_fill)
+                ),
+                "feeSource": self.fee_source,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -725,9 +853,10 @@ class DurableFillRecord:
     def from_bytes(cls, raw: bytes) -> Self:
         """Decode a record, refusing anything that is not exactly one.
 
-        Every field is required except ``venueFeeRaw``, ``tradeId`` and
-        ``orderQty``, which are optional-on-read so pre-GL-2/pre-B0 records
-        still decode (``None``). A present non-string ``venueFeeRaw``/
+        Every field is required except ``venueFeeRaw``, ``tradeId``,
+        ``orderQty``, ``feeCoefficientAtFill`` and ``feeSource``, which are
+        optional-on-read so pre-GL-2/pre-B0/pre-AUD-13b records still decode
+        (``None``). A present non-string ``venueFeeRaw``/
         ``tradeId``, or a present non-finite ``orderQty``, is refused. A
         partially-decodable record is refused rather than defaulted: a fill
         record missing its price is not a fill record with a zero price.
@@ -775,11 +904,31 @@ class DurableFillRecord:
                 venue_fee_raw=_optional_venue_fee_raw(payload.get("venueFeeRaw")),
                 trade_id=_optional_trade_id(payload.get("tradeId")),
                 order_qty=_optional_order_qty(payload.get("orderQty")),
+                fee_coefficient_at_fill=_optional_fee_coefficient_at_fill(
+                    payload.get("feeCoefficientAtFill")
+                ),
+                fee_source=_optional_fee_source(payload.get("feeSource")),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
                 f"a durable fill record is malformed: {type(exc).__name__}: {exc}"
             ) from None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationPass:
+    """AUD-13b: one ``generate_mass_status`` pass's memoised positions read.
+
+    ``error`` is the read's exception (re-raised into
+    ``generate_position_status_reports``' own unchanged refusal path);
+    otherwise ``position_reports`` is the mapped book, computed ONCE, and the
+    two report lists are the durable reports gated on it.
+    """
+
+    error: Exception | None
+    position_reports: tuple[PositionStatusReport, ...]
+    order_reports: tuple[OrderStatusReport, ...]
+    fill_reports: tuple[FillReport, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1317,8 +1466,48 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # cannot GET. REFUSED until the first read succeeds: fail closed.
         self._open_orders_read_refused: bool = True
         self._open_orders: tuple[OpenOrderRecord, ...] = ()
+        # AUD-13b: the durable-record reconciliation's observable state.
+        # Latched refusals persist for the process (deduped by latch+subject);
+        # counts and fee sources describe the LAST pass only.
+        self._reconciliation_refusal_latches: dict[tuple[str, str], Mapping[str, str]] = {}
+        self._reconciliation_counts: Mapping[str, int] = dict.fromkeys(
+            _RECONCILIATION_COUNT_FIELDS, 0
+        )
+        self._reconciled_fee_sources: Mapping[str, str] = {}
+        # One memoised positions read (and its durable reports) per
+        # `generate_mass_status` pass; `None` outside a pass.
+        self._reconciliation_pass: _ReconciliationPass | None = None
+        # Set by `_map_position` at each return, read by the durable pass to
+        # tell an unparseable row (fails the whole read) from a settled one.
+        self._position_map_outcome: str = ""
 
     # -- observable state ---------------------------------------------------
+
+    @property
+    def reconciliation_refusals(self) -> tuple[Mapping[str, str], ...]:
+        """AUD-13b: every latched durable-reconciliation refusal.
+
+        **Read-only surface, deliberately -- not an emitted alert**, exactly
+        like :attr:`stale_ambiguous_intent_alerts`: this module may not import
+        ``breezy.runtime.health`` (barrier E0-TRANSPORT). Each entry is the
+        WARN payload the runtime layer delivers: ``event`` is
+        :data:`RECONCILIATION_REFUSAL_EVENT`, ``detail`` a fixed enum member
+        per latch, ``latch`` the reason code, ``subject`` the instrument id
+        (disagreement), the REDACTED venue order id (fee ambiguity) or ``""``
+        (read failure).
+        """
+        return tuple(self._reconciliation_refusal_latches.values())
+
+    @property
+    def reconciliation_counts(self) -> Mapping[str, int]:
+        """AUD-13b: the last durable pass's counts line, as numbers."""
+        return dict(self._reconciliation_counts)
+
+    @property
+    def reconciled_fee_sources(self) -> Mapping[str, str]:
+        """AUD-13b: ``venue_order_id -> feeSource`` for every fill report the
+        last durable pass emitted (ruling R-1 = O4 provenance)."""
+        return dict(self._reconciled_fee_sources)
 
     @property
     def trading_refusals(self) -> tuple[str, ...]:
@@ -2247,7 +2436,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             order_qty=report.quantity.as_decimal(),
         )
         try:
-            self.record_fill(record)
+            # AUD-13b (ruling R-1 = O4 (a)): stamp the theta of the instrument
+            # in hand NOW -- i.e. at DISCOVERY, like `ts_event` above; the
+            # true fill lies in [intent created, now] (evidence pack F3).
+            self.record_fill(record, fill_time_instrument=instrument)
         except Exception as exc:  # noqa: BLE001 - see the CREATE path's identical guard
             fill_record_bytes = record.to_bytes()
             detail = fill_record_bytes.decode()
@@ -2512,6 +2704,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         saying so.
         """
         self.reconciliation_active = True
+        # AUD-13b: one memoised positions read per pass, shared by all three
+        # generators so the durable gating and the position report can never
+        # see two different books. Cleared again in the `finally` below.
+        self._reconciliation_pass = None
         try:
             try:
                 order_reports = await self.generate_order_status_reports(None)
@@ -2536,6 +2732,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 return self._assemble([], [], [])
         finally:
+            self._reconciliation_pass = None
             self.reconciliation_active = False
 
     def _assemble(
@@ -2607,51 +2804,70 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReports | None = None,
     ) -> list[OrderStatusReport]:
-        """Empty, and empty for a stated reason.
+        """One terminal order report per durable fill record the VENUE gates in.
 
-        Returns ``[]`` today. This generator and :meth:`generate_fill_reports`
-        below MUST land together: native reconciliation iterates
-        ``mass_status.order_reports`` and looks its matching fills up BY the
-        venue order id each order report names
-        (``live/execution_engine.py:1880-1881``) -- shipping one without the
-        other reconciles nothing. Gated on ruling **R-1**:
-        :class:`~nautilus_trader.execution.reports.FillReport`'s
-        ``commission`` is a required ``Money`` (``execution/reports.py:667-684``),
-        and the intended source, once R-1 rules, is the ONE durable fill
-        record this session's B0 already writes to disk and the store.
+        AUD-13b (plan §6; field map: evidence pack §5). The venue ``Order``
+        carries no client-order-id field (``reports.py`` module docstring item
+        2), so an order enumerated from the venue alone can only reconcile as
+        ``EXTERNAL``. Breezy's durable fill record is the only place the
+        client-order-id <-> venue-id binding exists -- but it is NOT the
+        authority on whether the position is still open: a record is reported
+        **iff a fresh venue positions read currently shows an open position
+        for its (leg-resolved) instrument**. The venue decides *whether*; the
+        record supplies *which order, which side, at what price*.
 
-        RESTING_BID_HUNT Rev 2 section 4.3 DECIDED to keep this empty even
-        though the open-order read (:meth:`_read_open_orders`) now exists:
-        the venue ``Order`` carries no client-order-id field (``reports.py``
-        module docstring item 2), so no enumerated order is
-        Breezy-ATTRIBUTABLE from the read alone, and a report carrying
-        ``client_order_id=None`` would make native reconciliation adopt the
-        order as ``EXTERNAL`` -- the opposite of the fail-closed stance the
-        never-arm gate takes on the same enumeration. Attribution arrives
-        with the section 4.4 durable resting-intent store (venue id -> intent);
-        this generator is wired then, together with fill reports.
+        Lands TOGETHER with :meth:`generate_fill_reports`: native
+        reconciliation looks a fill up BY the venue order id an order report
+        names (``live/execution_engine.py:1880-1881``); there is no fill-only
+        loop. Every refusal is named and latched
+        (:attr:`reconciliation_refusals`), never a bare ``[]``. A resting
+        order has no durable fill record and so is never reported here
+        (RESTING_BID_HUNT Rev 2 section 4.3 stands); ``open_only`` asks for
+        open orders, and every durable report is terminal, so it gets none.
+
+        Never raises: a failed read is captured and latched.
         """
-        return []
+        if getattr(command, "open_only", False):
+            return []
+        durable = self._reconciliation_pass
+        if durable is None:
+            payload: Any = None
+            error: Exception | None = None
+            try:
+                payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+            except Exception as exc:  # noqa: BLE001 - latched as positions_read_failed
+                error = exc
+            durable = self._durable_reconciliation_pass(payload, error)
+        return self._reports_for_command(durable.order_reports, command)
 
     async def generate_fill_reports(
         self,
         command: GenerateFillReports | None = None,
     ) -> list[FillReport]:
-        """Empty, and empty for a stated reason.
+        """One ``FillReport`` per order report above, from the same pass.
 
-        Returns ``[]`` today. Must land TOGETHER with
-        :meth:`generate_order_status_reports` above: reconciliation looks a
-        fill up BY the venue order id an order report names
-        (``live/execution_engine.py:1880-1881``), so shipping this one alone
-        reconciles nothing. Gated on ruling **R-1**:
-        :class:`~nautilus_trader.execution.reports.FillReport`'s
-        ``commission`` is a required ``Money`` (``execution/reports.py:667-684``);
-        the intended source, once R-1 rules, is the durable fill record this
-        session's B0 already writes to disk and the store, never a fresh
-        venue read. This docstring makes no promise that B1 will be
-        implemented.
+        ``commission`` is ruling R-1 = O4: the venue-attested fee when the
+        record carries one (``feeSource=RECORDED``), else the taker fee
+        modelled with theta AS OF the fill (``MODELLED_AT_FILL_TIME``), else
+        -- the AMBIGUOUS 2026-09-17 window or an unpinned date -- the whole
+        instrument is REFUSED (``fee_coefficient_ambiguous``), never defaulted.
+        ``trade_id`` is the record's, else the resolver's ``GET-<venue order
+        id>`` form, byte-equal to what a same-process resolver fill used (F5).
         """
-        return []
+        durable = self._reconciliation_pass
+        if durable is None:
+            payload: Any = None
+            error: Exception | None = None
+            try:
+                payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+            except Exception as exc:  # noqa: BLE001 - latched as positions_read_failed
+                error = exc
+            durable = self._durable_reconciliation_pass(payload, error)
+        reports = self._reports_for_command(durable.fill_reports, command)
+        venue_order_id = getattr(command, "venue_order_id", None)
+        if venue_order_id is not None:
+            reports = [r for r in reports if r.venue_order_id == venue_order_id]
+        return reports
 
     async def generate_position_status_reports(
         self,
@@ -2664,9 +2880,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         override above must not have to rely on that not happening.
         """
         instrument_filter = getattr(command, "instrument_id", None)
+        durable = self._reconciliation_pass
+        mapped: tuple[PositionStatusReport, ...] | None = None
         try:
-            payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
-            positions = self._declared_positions(payload)
+            if durable is not None:
+                # AUD-13b: this pass's memoised read. A failed one re-enters
+                # the SAME refusal below, byte-for-byte as before.
+                if durable.error is not None:
+                    raise durable.error
+                mapped = durable.position_reports
+            else:
+                payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+                positions = self._declared_positions(payload)
         except Exception as exc:  # noqa: BLE001 - see the docstring: NOTHING may reach the native handler
             # R-6.5a: a status-carrying refusal is classified TRANSIENT/
             # DURABLE on its actual HTTP status and gRPC code; anything else
@@ -2685,15 +2910,340 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             return []
 
+        if mapped is None:
+            mapped, _ = self._map_positions(positions)
+        return [
+            report
+            for report in mapped
+            if instrument_filter is None or report.instrument_id == instrument_filter
+        ]
+
+    def _map_positions(
+        self,
+        positions: Mapping[str, Any],
+    ) -> tuple[tuple[PositionStatusReport, ...], tuple[str, ...]]:
+        """Map every venue position, in slug order, ONCE.
+
+        Returns the forwarded reports and, per slug, the outcome
+        :meth:`_map_position` recorded (``open`` / ``gated_out`` /
+        ``instrument_absent`` / ``unparseable``).
+        """
         reports: list[PositionStatusReport] = []
+        outcomes: list[str] = []
         for slug in sorted(positions):
+            self._position_map_outcome = _MAP_UNPARSEABLE
             report = self._map_position(slug, positions[slug])
-            if report is None:
-                continue
-            if instrument_filter is not None and report.instrument_id != instrument_filter:
-                continue
-            reports.append(report)
-        return reports
+            outcomes.append(self._position_map_outcome)
+            if report is not None:
+                reports.append(report)
+        return tuple(reports), tuple(outcomes)
+
+    # -- AUD-13b: durable-record reconciliation ------------------------------
+
+    def _reports_for_command(self, reports: tuple[Any, ...], command: Any) -> list[Any]:
+        instrument_id = getattr(command, "instrument_id", None)
+        return [r for r in reports if instrument_id is None or r.instrument_id == instrument_id]
+
+    def _durable_reconciliation_pass(
+        self,
+        payload: Any,
+        error: Exception | None,
+    ) -> _ReconciliationPass:
+        """Map the positions read once, gate the durable records on it, and
+        build both report lists. Memoised for the rest of a mass-status pass.
+
+        Fail-closed walks (plan §6), each NAMED and latched:
+
+        * the read failed, or the payload is unparseable in whole OR IN PART
+          -> no durable report at all, ``positions_read_failed``. Partial
+          gating is forbidden: a dropped row would turn "the venue says we
+          hold this" into "it does not", the fail-OPEN direction;
+        * the venue holds an instrument its records do not explain (no record,
+          a net-quantity mismatch, an unknown side, a venue-id map row naming
+          a DIFFERENT client order id) -> nothing for THAT instrument,
+          ``record_venue_disagreement``. A MISSING map row is not a
+          disagreement (evidence F7: pre-A1 records have none);
+        * a record whose fee cannot be pinned to its fill time -> nothing for
+          that instrument, ``fee_coefficient_ambiguous``.
+
+        An instrument absent from the Nautilus cache is skipped by the engine
+        anyway (``live/execution_engine.py:3056-3062``); it is COUNTED as its
+        own field, never folded into ``gated_out`` (evidence F8).
+        """
+        counts: dict[str, int] = dict.fromkeys(_RECONCILIATION_COUNT_FIELDS, 0)
+        position_reports: tuple[PositionStatusReport, ...] = ()
+        order_reports: list[OrderStatusReport] = []
+        fill_reports: list[FillReport] = []
+        fee_sources: dict[str, str] = {}
+        outcomes: tuple[str, ...] = ()
+        if error is None:
+            try:
+                positions = self._declared_positions(payload)
+                position_reports, outcomes = self._map_positions(positions)
+            except Exception as exc:  # noqa: BLE001 - a foreign shape OR a mapping
+                # defect is a failed read either way (silent-failure review
+                # finding 1): `_map_positions` must run INSIDE this try, not
+                # in an `else:` -- an `else:` clause is not covered by the
+                # `try:` block's own `except`, so a mapping defect used to
+                # escape uncaught.
+                error = exc
+        counts["gated_out"] = outcomes.count(_MAP_GATED_OUT)
+        # Finding 4 (accepted as-is, LOW): `instrument_absent` is counted for
+        # visibility only and deliberately never latched -- the engine
+        # already no-ops on an uncached instrument natively
+        # (``execution_engine.py:3056-3062``), so this is not a Breezy
+        # refusal, and `_durable_reports_for_position` already logs a
+        # WARNING for each occurrence.
+        counts["instrument_absent"] = outcomes.count(_MAP_INSTRUMENT_ABSENT)
+        if error is not None or _MAP_UNPARSEABLE in outcomes:
+            self._latch_reconciliation_refusal(POSITIONS_READ_FAILED, "")
+            counts[f"refusals_{POSITIONS_READ_FAILED}"] = 1
+        else:
+            for position in position_reports:
+                try:
+                    self._durable_reports_for_position(
+                        position, counts, order_reports, fill_reports, fee_sources
+                    )
+                except Exception as exc:  # noqa: BLE001 - finding 1: NOTHING from a
+                    # per-position build may reach the native handler, and one
+                    # bad position must not drop every other position's reports.
+                    self._latch_reconciliation_refusal(
+                        DURABLE_REPORTS_BUILD_FAILED, str(position.instrument_id)
+                    )
+                    counts[f"refusals_{DURABLE_REPORTS_BUILD_FAILED}"] += 1
+                    # Review fix (LOW): `_latch_reconciliation_refusal` already
+                    # emits the deduped WARNING every alerting caller sees; a
+                    # second WARNING here would double-log on EVERY pass this
+                    # position keeps failing on (the latch WARNs once ever, this
+                    # loop runs every pass). The exception detail the latch's
+                    # fixed-enum log does not carry stays reachable at DEBUG.
+                    self._log.debug(
+                        "durable reconciliation: building reports for "
+                        f"{position.instrument_id} raised ({type(exc).__name__}: {exc}); "
+                        "nothing is reported for it; other positions are unaffected"
+                    )
+        counts["order_reports"] = len(order_reports)
+        counts["fill_reports"] = len(fill_reports)
+        counts["refusals"] = sum(
+            counts[f"refusals_{latch}"] for latch in _RECONCILIATION_REFUSAL_DETAILS
+        )
+        self._reconciliation_counts = counts
+        self._reconciled_fee_sources = fee_sources
+        self._log.info(format_reconciliation_counts_line(counts))
+        durable = _ReconciliationPass(
+            error=error,
+            position_reports=position_reports,
+            order_reports=tuple(order_reports),
+            fill_reports=tuple(fill_reports),
+        )
+        if self.reconciliation_active:
+            self._reconciliation_pass = durable
+        return durable
+
+    def _durable_reports_for_position(
+        self,
+        position: PositionStatusReport,
+        counts: dict[str, int],
+        order_reports: list[OrderStatusReport],
+        fill_reports: list[FillReport],
+        fee_sources: dict[str, str],
+    ) -> None:
+        """Append the reports for ONE venue-open instrument, or latch why not.
+
+        ``position.instrument_id`` is ``_map_position``'s LEG-RESOLVED id, so a
+        NO-leg holding gates its ``^no`` records -- never a YES-leg re-lookup
+        of the slug (coordinator decision 1; evidence F5).
+        """
+        instrument_id = position.instrument_id
+        instrument = self._cache.instrument(instrument_id)
+        if instrument is None:
+            counts["instrument_absent"] += 1
+            self._log.warning(
+                f"durable reconciliation: {instrument_id} is held at the venue but "
+                "not in the cache; the engine would skip its reports, so none are built"
+            )
+            return
+        records = sorted(
+            self.fill_records_for(instrument_id),
+            key=lambda record: (record.ts_event, record.order_side != LONG_ONLY_SIDE),
+        )
+        counts["records_considered"] += len(records)
+        if not self._records_explain_position(records, position):
+            self._latch_reconciliation_refusal(RECORD_VENUE_DISAGREEMENT, str(instrument_id))
+            counts[f"refusals_{RECORD_VENUE_DISAGREEMENT}"] += 1
+            return
+        built: list[tuple[OrderStatusReport, FillReport, str]] = []
+        for record in records:
+            try:
+                commission, fee_source = self._reconciled_commission(record)
+            except (ArithmeticError, ValueError) as exc:
+                # Finding 2: a corrupt record (a price outside [0, 1] from bad
+                # cumulative_cost/cumulative_qty, or a division by a zero
+                # quantity) reaches `taker_fee_at_fill`'s own validation.
+                # `taker_fee_at_fill` is left unchanged; fold the raise into
+                # the SAME fee_coefficient_ambiguous handling below rather
+                # than let it escape.
+                self._log.warning(
+                    "durable reconciliation: fee computation for "
+                    f"{_redact_order_id(record.venue_order_id)} raised "
+                    f"({type(exc).__name__}: {exc}); treated as fee_coefficient_ambiguous"
+                )
+                commission, fee_source = None, ""
+            if commission is None:
+                self._latch_reconciliation_refusal(
+                    FEE_COEFFICIENT_AMBIGUOUS,
+                    _redact_order_id(record.venue_order_id),
+                    ts_event_bucket=fee_schedule_bucket(record.ts_event),
+                )
+                counts[f"refusals_{FEE_COEFFICIENT_AMBIGUOUS}"] += 1
+                return
+            built.append((*self._reports_for_record(record, instrument, commission), fee_source))
+        for order_report, fill_report, fee_source in built:
+            order_reports.append(order_report)
+            fill_reports.append(fill_report)
+            fee_sources[str(order_report.venue_order_id)] = fee_source
+
+    def _records_explain_position(
+        self,
+        records: list[DurableFillRecord],
+        position: PositionStatusReport,
+    ) -> bool:
+        """``True`` iff these records are exactly Breezy's account of the
+        venue's position: at least one, every side known, the signed net
+        quantity equal to the venue's, and no venue-id map row naming a
+        different client order id."""
+        if not records:
+            return False
+        if any(record.order_side not in _RECORD_SIGNS for record in records):
+            return False
+        net_qty = sum(
+            (_RECORD_SIGNS[record.order_side] * record.cumulative_qty for record in records),
+            Decimal(0),
+        )
+        if net_qty != position.quantity.as_decimal():
+            return False
+        for record in records:
+            if record.cumulative_qty <= 0 or record.cumulative_cost <= 0:
+                return False
+            mapped = self.client_order_id_for(VenueOrderId(record.venue_order_id))
+            if mapped is not None and mapped.value != record.client_order_id:
+                self._log.warning(
+                    "durable reconciliation: venue order "
+                    f"{_redact_order_id(record.venue_order_id)} maps to "
+                    f"{mapped.value} but its fill record names "
+                    f"{record.client_order_id}; neither is picked"
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _reconciled_commission(record: DurableFillRecord) -> tuple[Money | None, str]:
+        """Ruling R-1 = O4, re-derived from the record (never its stored
+        ``feeSource``): the venue-attested fee, else the taker fee modelled
+        with theta as of the fill, else ``None`` (refuse)."""
+        fee_source = fee_source_for(
+            fee_reconciled=record.fee_reconciled, venue_fee_raw=record.venue_fee_raw
+        )
+        if fee_source == FEE_SOURCE_RECORDED:
+            return Money(record.cumulative_fee, USD), fee_source
+        # G5 / evidence F3: a RESOLVER-path record's `ts_event` is its
+        # DISCOVERY time, not the venue's fill time (which is unknown; it lies
+        # in [intent created, ts_event]). It is used as the plan says, as an
+        # upper bound -- exact only for create-path records. A resolver record
+        # whose true interval straddled a schedule boundary cannot be bucketed
+        # from `ts_event` alone; no fill time is invented here.
+        commission = taker_fee_at_fill(
+            quantity=record.cumulative_qty,
+            price=record.cumulative_cost / record.cumulative_qty,
+            ts_event_ns=record.ts_event,
+            fee_coefficient_at_fill=record.fee_coefficient_at_fill,
+        )
+        return commission, fee_source
+
+    def _reports_for_record(
+        self,
+        record: DurableFillRecord,
+        instrument: Instrument,
+        commission: Money,
+    ) -> tuple[OrderStatusReport, FillReport]:
+        """The native report pair for one record (evidence pack §5 field map).
+
+        ``order_side`` is the RECORD's (ruling finding 8), never a hardcoded
+        BUY: a SELL exit record must reconcile to a SELL. ``quantity`` is the
+        original order size, else -- a legacy record -- the terminal filled
+        portion (L-2). An IOC whose remainder the venue cancelled is reported
+        ``CANCELED`` with its fill, never ``FILLED`` with ``filled < quantity``.
+        """
+        ts_init = self._clock.timestamp_ns()
+        filled = record.cumulative_qty
+        ordered = record.order_qty if record.order_qty is not None else filled
+        avg_px = record.cumulative_cost / filled
+        last_px = instrument.make_price(avg_px)
+        order_side = OrderSide[record.order_side]
+        venue_order_id = VenueOrderId(record.venue_order_id)
+        client_order_id = ClientOrderId(record.client_order_id)
+        trade_id = (
+            TradeId(record.trade_id)
+            if record.trade_id is not None
+            else _synthetic_get_fill_trade_id(record.venue_order_id)
+        )
+        order_report = OrderStatusReport(
+            account_id=self._issued_account_id,
+            instrument_id=instrument.id,
+            venue_order_id=venue_order_id,
+            order_side=order_side,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.IOC,
+            order_status=OrderStatus.FILLED if ordered == filled else OrderStatus.CANCELED,
+            quantity=instrument.make_qty(ordered),
+            filled_qty=instrument.make_qty(filled),
+            report_id=UUID4(),
+            ts_accepted=record.ts_event,
+            ts_last=record.ts_event,
+            ts_init=ts_init,
+            client_order_id=client_order_id,
+            price=last_px,
+            avg_px=avg_px,
+        )
+        fill_report = FillReport(
+            account_id=self._issued_account_id,
+            instrument_id=instrument.id,
+            venue_order_id=venue_order_id,
+            trade_id=trade_id,
+            order_side=order_side,
+            last_qty=instrument.make_qty(filled),
+            last_px=last_px,
+            commission=commission,
+            liquidity_side=LiquiditySide.TAKER,
+            report_id=UUID4(),
+            ts_event=record.ts_event,
+            ts_init=ts_init,
+            avg_px=avg_px,
+            client_order_id=client_order_id,
+        )
+        return order_report, fill_report
+
+    def _latch_reconciliation_refusal(self, latch: str, subject: str, **extra: str) -> None:
+        """Latch one NAMED durable-reconciliation refusal (deduped by latch and
+        subject) and log it at WARNING. The ``detail`` is a fixed enum."""
+        key = (latch, subject)
+        if key in self._reconciliation_refusal_latches:
+            return
+        payload = {
+            "event": RECONCILIATION_REFUSAL_EVENT,
+            "detail": _RECONCILIATION_REFUSAL_DETAILS[latch],
+            "latch": latch,
+            "subject": subject,
+            **extra,
+        }
+        self._reconciliation_refusal_latches = {
+            **self._reconciliation_refusal_latches,
+            key: payload,
+        }
+        self._log.warning(
+            f"durable reconciliation refused: {latch} subject={subject or '-'}; "
+            "nothing is reported for it and the engine falls back to inference"
+        )
 
     @staticmethod
     def _declared_positions(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -2748,6 +3298,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         """
         instrument = self._find_instrument(slug)
         if instrument is None:
+            self._position_map_outcome = _MAP_INSTRUMENT_ABSENT
             self._refuse(
                 f"the venue reports a position in market {slug!r}, for which no "
                 "instrument is loaded; it cannot be mapped, priced or netted"
@@ -2778,6 +3329,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if mapped.leg == "no":
             no_instrument = self._find_instrument(slug, leg="no")
             if no_instrument is None:
+                self._position_map_outcome = _MAP_INSTRUMENT_ABSENT
                 self._refuse(
                     f"the venue reports a NO-leg position in market {slug!r}, for "
                     "which no NO-leg instrument is loaded; it cannot be mapped, "
@@ -2811,12 +3363,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"({report.quantity}); excluded from reconciliation as settled, "
                 "not live risk",
             )
+            self._position_map_outcome = _MAP_GATED_OUT
             return None
 
         if report.position_side == PositionSide.FLAT:
             # Deliberately not forwarded: see the module docstring's landmine
             # note. A FLAT report on a held binary books the close at the OPEN
             # price and realizes exactly zero.
+            self._position_map_outcome = _MAP_GATED_OUT
             return None
 
         if report.position_side != PositionSide.LONG:
@@ -2827,6 +3381,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return None
 
         avg_px_open = self._entry_price(resolved_instrument_id, report.quantity, payload)
+        self._position_map_outcome = _MAP_OPEN
 
         return PositionStatusReport(
             account_id=report.account_id,
@@ -2993,8 +3548,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return None
         return ClientOrderId(raw.decode("utf-8"))
 
-    def record_fill(self, record: DurableFillRecord) -> None:
+    def record_fill(
+        self,
+        record: DurableFillRecord,
+        *,
+        fill_time_instrument: Instrument | None = None,
+    ) -> None:
         """Persist one venue order's cumulative totals and index it.
+
+        AUD-13b (ruling R-1 = O4 mechanism (a)): the two fill write sites pass
+        ``fill_time_instrument`` -- the ``Instrument`` in hand when the fill
+        is recorded -- and the record is stamped with that instrument's taker
+        theta (:func:`~breezy.adapters.polymarket_us.fees.taker_fee_coefficient_of`,
+        ``None`` if its schedule is unusable) and the O4 ``feeSource``
+        (:func:`fee_source_for`). Done HERE, in the already-permitted inert
+        store write, so neither guarded write site gains a callee. Without it
+        (every direct caller) the record is persisted exactly as given.
 
         Written before the ``OrderFilled`` is published (R-7), so a crash
         between the venue's answer and the event still leaves the evidence on
@@ -3007,6 +3576,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         prefix scan, so an id absent from the index is an id that no longer
         exists as far as pricing is concerned.
         """
+        if fill_time_instrument is not None:
+            record = dataclasses.replace(
+                record,
+                fee_coefficient_at_fill=taker_fee_coefficient_of(fill_time_instrument),
+                fee_source=fee_source_for(
+                    fee_reconciled=record.fee_reconciled,
+                    venue_fee_raw=record.venue_fee_raw,
+                ),
+            )
         index_key = f"{FILL_INDEX_KEY_PREFIX}{record.instrument_id}"
         indexed = self._read_fill_index(index_key)
         if indexed is None:
@@ -3776,7 +4354,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     trade_id=fill.trade_id.value,
                     order_qty=submit_chain.order_quantity_decimal(order),
                 )
-                self.record_fill(record)
+                # AUD-13b (ruling R-1 = O4 (a)): stamp the theta of the
+                # instrument this order was priced and sent against.
+                self.record_fill(record, fill_time_instrument=instrument)
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this
                 # guards ONE evidence write and ANY failure of it must halt
                 # trading rather than lose the event. Narrowing to the known

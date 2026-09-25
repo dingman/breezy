@@ -102,6 +102,7 @@ from breezy.runtime.account_presence_halt import install_account_presence_halt
 from breezy.runtime.backtest_order_guard import install_live_order_guard
 from breezy.runtime.component_health_watch import (
     install_component_degraded_alert,
+    install_reconciliation_refusal_alert,
     install_stale_intent_alert,
 )
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
@@ -411,6 +412,26 @@ def _exec_client_stale_intent_reader(node: Node) -> Callable[[], tuple[Mapping[s
     return _read
 
 
+def _exec_client_reconciliation_refusal_reader(
+    node: Node,
+) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the reader the AUD-13b reconciliation-refusal watch requires.
+
+    Same lookup and lazy resolution as
+    :func:`_exec_client_stale_intent_reader`: the client is looked up at poll
+    time, and a missing client or one without ``reconciliation_refusals``
+    yields ``()`` rather than raising inside a message-bus handler.
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(getattr(client, "reconciliation_refusals", ()))
+
+    return _read
+
+
 def _run_node(
     config: TradingNodeConfig,
     node_factory: NodeFactory,
@@ -517,6 +538,10 @@ def _run_node(
         install_stale_intent_alert(
             node.kernel.msgbus,
             stale_alerts=_exec_client_stale_intent_reader(node),
+        )
+        install_reconciliation_refusal_alert(
+            node.kernel.msgbus,
+            refusals=_exec_client_reconciliation_refusal_reader(node),
         )
         install_account_presence_halt(
             node.kernel.msgbus,
