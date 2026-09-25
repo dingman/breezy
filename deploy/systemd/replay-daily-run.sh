@@ -49,11 +49,26 @@ say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 # JSONL-writing/record_blocked mechanism here (B18 stays intact: this is
 # one more invocation of the ALREADY-named `replay_daily_runner.py`, using
 # a mode that never reads replay_sufficiency.jsonl or replay_results.jsonl
-# at all). Best-effort: a failure of THIS call never turns a benign skip
-# into a hard failure (skip-not-kill stays skip-not-kill).
+# at all).
+#
+# Coordinator follow-up (2026-09-25): NOT best-effort. `|| true` here used
+# to mean a crashing recorder (e.g. an OSError writing the state file)
+# left the skip unrecorded AND the wrapper still exiting 0 -- a skip that
+# is silently never recorded can never reach the B19-style >=3 escalation,
+# so the ONE thing this fix exists to guarantee (a persistent skip
+# eventually pages someone) would quietly stop holding. The recorder's OWN
+# exit code is now the caller's problem: propagated via `return`, and the
+# call site exits non-zero when it is non-zero, so
+# `OnFailure=breezy-study-failed@%n.service` fires on a broken recorder
+# exactly like any other wrapper failure.
 report_skip() {
   "$PY" "$REPO/scripts/analysis/replay_daily_runner.py" \
-    --report-skip "$1" --skip-state-path "$SKIP_STATE_PATH" >>"$LOG" 2>&1 || true
+    --report-skip "$1" --skip-state-path "$SKIP_STATE_PATH" >>"$LOG" 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    say "skip recorder FAILED (exit $rc)"
+  fi
+  return "$rc"
 }
 
 # Host-wide mutual exclusion, same convention as every sibling study
@@ -71,8 +86,10 @@ mkdir -p "$LOCK_DIR" 2>>"$LOG" || { say "SKIPPED-INFRA -- no studies lock direct
 exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studies lock"; exit 75; }
 if ! flock -n 9; then
   say "SKIPPED -- another study holds the studies lock"
-  report_skip LOCK_CONTENTION
-  exit 0
+  if report_skip LOCK_CONTENTION; then
+    exit 0
+  fi
+  exit 1
 fi
 
 manifest_field() {
@@ -127,8 +144,10 @@ if [ "$resolve_rc" -eq 2 ]; then
   # skip means "we know nothing is armed"; this means we DON'T know.
   exit 1
 elif [ "$resolve_rc" -ne 0 ]; then
-  report_skip NO_ARMED_FAMILY
-  exit 0
+  if report_skip NO_ARMED_FAMILY; then
+    exit 0
+  fi
+  exit 1
 fi
 
 # Step 1: the census (base plan §6b.3 step 1).

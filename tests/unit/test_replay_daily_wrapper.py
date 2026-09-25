@@ -30,10 +30,11 @@ def _systemctl_stub(tmp_path: Path, *, environment_line: str = "", exit_code: in
     return stub
 
 
-def _python_stub(tmp_path: Path) -> tuple[Path, Path]:
-    """A `$PY` stub that logs every invocation shape and always succeeds --
-    the census, the runner's real path, and `--report-skip` are all
-    dispatched here, never a real script."""
+def _python_stub(tmp_path: Path, *, report_skip_exit_code: int = 0) -> tuple[Path, Path]:
+    """A `$PY` stub that logs every invocation shape -- the census, the
+    runner's real path, and `--report-skip` are all dispatched here, never
+    a real script. `report_skip_exit_code` models the skip recorder
+    itself crashing (review follow-up fix)."""
     argv_log = tmp_path / "argv_log.txt"
     stub = tmp_path / "python-stub.sh"
     stub.write_text(
@@ -42,7 +43,7 @@ ARGV_LOG={shlex.quote(str(argv_log))}
 case "$*" in
   *"--report-skip"*)
     echo "REPORT_SKIP $*" >> "$ARGV_LOG"
-    exit 0
+    exit {report_skip_exit_code}
     ;;
   *"replay_sufficiency_census.py"*)
     echo "CENSUS $*" >> "$ARGV_LOG"
@@ -157,6 +158,34 @@ def test_lock_contention_exits_zero_and_records_a_skip(tmp_path: Path) -> None:
     assert "REPORT_SKIP" in log_text
     assert "LOCK_CONTENTION" in log_text
     assert "CENSUS" not in log_text
+
+
+def test_a_crashing_skip_recorder_exits_nonzero_on_lock_contention(tmp_path: Path) -> None:
+    """Coordinator follow-up: `report_skip()` used to end in `|| true`, so
+    a crashing recorder (e.g. an OSError on the state file) left the skip
+    unrecorded AND the wrapper exiting 0 -- nothing ever escalates. The
+    recorder failing must itself be loud."""
+    python_stub, argv_log = _python_stub(tmp_path, report_skip_exit_code=1)
+    systemctl_stub = _systemctl_stub(
+        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+    )
+    result = _run_wrapper(
+        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub, hold_lock=True,
+    )
+    assert result.returncode != 0
+    log_text = (tmp_path / "derived" / "replay_daily.log").read_text()
+    assert "skip recorder FAILED" in log_text
+    assert "REPORT_SKIP" in argv_log.read_text()
+
+
+def test_a_crashing_skip_recorder_exits_nonzero_on_no_armed_family(tmp_path: Path) -> None:
+    python_stub, argv_log = _python_stub(tmp_path, report_skip_exit_code=1)
+    systemctl_stub = _systemctl_stub(tmp_path, environment_line="")
+    result = _run_wrapper(tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub)
+    assert result.returncode != 0
+    log_text = (tmp_path / "derived" / "replay_daily.log").read_text()
+    assert "skip recorder FAILED" in log_text
+    assert "REPORT_SKIP" in argv_log.read_text()
 
 
 def test_a_normal_run_invokes_the_census_then_the_runner_and_no_skip(tmp_path: Path) -> None:
