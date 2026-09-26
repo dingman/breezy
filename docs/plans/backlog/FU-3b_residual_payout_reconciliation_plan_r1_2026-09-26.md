@@ -70,3 +70,13 @@
 - **[LOW] Importing private names script-to-script** from `score_live_trials`.
 
 **Confidence.** HIGH that option (a) is correct and PREREG-safe. MEDIUM on the exact fixture values until premises (i) and (ii) are checked.
+
+## r1.1 (peer review converged: prediction-market-reviewer APPROVE; python-reviewer MEDIUM → blockers applied)
+- **Premises verified.**
+  - (i) MIA 09-13 `scheduled_release_at_ns` = 2026-09-14T12:00:00Z. It falls between the snapshots at 09-13 16:50:13Z and 09-14 16:50:24Z.
+  - (ii) Ledger for CFJ485874TMM: `cumulativeCost=0.70`, `cumulativeFee=0`, `feeReconciled=false`. The venue cost was 0.71.
+- **Regression fixture.** Capital 0.70, payout 1.00, Δbalance +0.29, so unexplained = −0.01, which classifies as OK because it is within the one-fill tolerance.
+- **Blocker (a).** The resolution shell catches a CLOSED, named exception tuple, modelled on `station_candidate_register._READ_ERRORS`. It never uses a broad `except Exception`.
+- **Blocker (b).** Log `trial_id`, `type(exc).__name__` and the message, matching `_run`'s existing handlers. Amounts never appear in the log.
+- **Wiring.** `_resolve_residual_settlements` runs after `filled_trials` is materialized (≈:3070-3072), not at :2823. It takes the RESIDUAL-bucket trials from that list, and its results feed `reconcile_daily`.
+- **Context.** The latest report's `roi_status` = `GATED_UNSETTLED_CAPITAL`. This is FU-3c, out of scope here.
