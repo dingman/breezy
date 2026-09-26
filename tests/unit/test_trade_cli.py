@@ -62,7 +62,11 @@ from breezy.adapters.polymarket_us.operator_controls import (
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
 from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRefusedError
-from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
+from breezy.runtime.component_health_watch import (
+    COMPONENT_STATE_TOPIC,
+    REFUSAL_REPOLL_INTERVAL,
+    REFUSAL_REPOLL_TIMER_NAME,
+)
 from breezy.runtime.health import AlertPayload
 from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, TRADE_TRADER_ID_VAR
 from breezy.runtime.stop_intent_marker import stop_intent_marker_path, write_stop_intent_marker
@@ -190,6 +194,25 @@ class _SilentExecEngine:
         self._clients: dict[object, object] = {}
 
 
+class _InlineLoop:
+    """FU-8b: fakes the loop-hop surface `_run_node` reads off `node.kernel.loop`
+    -- `is_closed()` and `call_soon_threadsafe`. Calls the callback INLINE,
+    on the same thread, since every fake `TestClock` in this module fires
+    inline too (`TestClock.advance_time`); the genuine cross-thread hop is
+    proven separately under a real `LiveClock` and a real asyncio loop in
+    `tests/contract/test_refusal_repoll_live_clock_contract.py`.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def call_soon_threadsafe(self, callback: Any, *args: Any) -> None:
+        callback(*args)
+
+
 class _FakeKernel:
     """Stands in for the slice of ``NautilusKernel`` R-6a's/R-7-PRE's guards read."""
 
@@ -208,6 +231,11 @@ class _FakeKernel:
         # a `Clock` (`system/kernel.py`), and the point of this fake is to
         # stand in for that slice faithfully.
         self.clock = TestClock()
+        # FU-8b: `_run_node` now also reads `node.kernel.loop` to arm the
+        # refusal re-poll timer's loop-thread hop. Without this, every test
+        # in this module would take the `NOT armed` path once that read
+        # lands (`AttributeError` on a bare fake).
+        self.loop = _InlineLoop()
 
 
 class _FakeAccountlessKernel(_FakeKernel):
@@ -1295,3 +1323,196 @@ def test_a_stop_intent_marker_does_not_suppress_a_run_that_reaches_running(
 
     assert code == EXIT_OK
     assert _boot_halt_payloads(_no_send_alert_sink) == []
+
+
+# ---------------------------------------------------------------------------
+# FU-8b: a native LiveClock timer re-polls the reconciliation-refusal and
+# stale-intent surfaces so a runtime latch is alerted within one interval
+# with no ComponentStateChanged in between.
+# ---------------------------------------------------------------------------
+
+_REPOLL_INTERVAL_NS = int(REFUSAL_REPOLL_INTERVAL.total_seconds() * 1_000_000_000)
+
+
+def _fire_repoll(node: RecordingNode) -> None:
+    """Advance the fake kernel's real `TestClock` by exactly one repoll
+    interval and hand every returned `TimeEventHandler` to `.handle()` --
+    `TestClock` fires inline, on the caller's thread, and `_InlineLoop`
+    (`node.kernel.loop`) forwards that call inline too, so the whole chain
+    -- `_on_timer` -> `call_soon_threadsafe` -> `_poll` -> both alert
+    handlers -- runs synchronously inside this call.
+    """
+    clock = node.kernel.clock
+    handlers = clock.advance_time(clock.timestamp_ns() + _REPOLL_INTERVAL_NS)
+    for handler in handlers:
+        handler.handle()
+
+
+class TimerObservingNode(RecordingNode):
+    """Snapshots the kernel clock's armed timer names at the instant `run()`
+    is called -- BEFORE any fire -- so test 13 observes arming alone."""
+
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+        self.timer_names_at_run: tuple[str, ...] = ()
+
+    def run(self) -> None:
+        self.calls.append("run")
+        self.timer_names_at_run = tuple(self.kernel.clock.timer_names)
+
+
+def test_run_node_arms_the_repoll_timer_on_the_kernel_clock_during_run() -> None:
+    run(env=TRADE_ENV, node_factory=TimerObservingNode, stderr=io.StringIO())
+
+    node = RecordingNode.instances[0]
+    assert REFUSAL_REPOLL_TIMER_NAME in node.timer_names_at_run  # type: ignore[attr-defined]
+
+
+class RepollTickNode(RecordingNode):
+    """Registers one reconciliation refusal and one stale intent on the
+    exec-client surfaces the readers poll, then fires exactly one repoll
+    tick from inside `run()`."""
+
+    def run(self) -> None:
+        self.calls.append("run")
+        client = SimpleNamespace(
+            reconciliation_refusals=(
+                {
+                    "latch": "resolver_fill_not_booked",
+                    "subject": "",
+                    "detail": "RESOLVER_FILL_NOT_BOOKED",
+                },
+            ),
+            stale_ambiguous_intent_alerts=(
+                {
+                    "intent_id": "intent-1",
+                    "venue_order_id": "vo-1",
+                    "age_minutes": "16",
+                    "last_failure_kind": "TIMEOUT",
+                },
+            ),
+        )
+        self.kernel.exec_engine._clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = client
+        _fire_repoll(self)
+
+
+def test_run_node_repoll_polls_reconciliation_and_stale_surfaces_on_a_tick(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The two watches resolve their OWN default alert sink -- a real
+    `LoggingAlertSink` -- at install time, independent of this module's
+    `_no_send_alert_sink` fixture (which only patches `trade_cli`'s own
+    reference, used for boot-halt/assembly alerts). So the signal a repoll
+    tick produced is read from the log stream, exactly as an operator would.
+    """
+    with caplog.at_level("INFO"):
+        code = run(env=TRADE_ENV, node_factory=RepollTickNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    messages = [record.message for record in caplog.records]
+    assert any("event=reconciliation_refusal" in message for message in messages)
+    assert any("event=open_intent_stale" in message for message in messages)
+
+
+class _DisposeSnapshotMixin:
+    """Snapshots the kernel clock's armed timer names at the instant
+    `dispose()` runs, before delegating to the real fake's own bookkeeping."""
+
+    def dispose(self) -> None:
+        self.timer_names_at_dispose: tuple[str, ...] = tuple(  # type: ignore[attr-defined]
+            self.kernel.clock.timer_names  # type: ignore[attr-defined]
+        )
+        super().dispose()  # type: ignore[misc]
+
+
+class CancelObservingNormalNode(_DisposeSnapshotMixin, RecordingNode):
+    pass
+
+
+class CancelObservingRaisingNode(_DisposeSnapshotMixin, RaisingNode):
+    pass
+
+
+class CancelObservingInterruptedNode(_DisposeSnapshotMixin, InterruptedNode):
+    pass
+
+
+@pytest.mark.parametrize(
+    "node_factory",
+    [CancelObservingNormalNode, CancelObservingRaisingNode, CancelObservingInterruptedNode],
+)
+def test_run_node_cancels_the_timer_on_every_exit(
+    node_factory: type[RecordingNode],
+) -> None:
+    run(env=TRADE_ENV, node_factory=node_factory, stderr=io.StringIO())
+
+    node = RecordingNode.instances[0]
+    assert node.timer_names_at_dispose == ()  # type: ignore[attr-defined]
+
+
+class RunSwallowsErrorNode(RecordingNode):
+    """Models `TradingNode.run` catching a `RuntimeError` and returning with
+    the kernel never stopped (`live/node.py:293-300`): from `_run_node`'s own
+    vantage this `run()` simply returns, exactly like a normal stop, and
+    nothing here calls the kernel's own `_cancel_timers`."""
+
+    def run(self) -> None:
+        self.calls.append("run")
+
+
+class CancelObservingSwallowedNode(_DisposeSnapshotMixin, RunSwallowsErrorNode):
+    pass
+
+
+def test_run_node_cancels_the_timer_when_run_swallows_an_error_and_the_kernel_never_stops() -> (
+    None
+):
+    run(env=TRADE_ENV, node_factory=CancelObservingSwallowedNode, stderr=io.StringIO())
+
+    node = RecordingNode.instances[0]
+    assert node.timer_names_at_dispose == ()  # type: ignore[attr-defined]
+
+
+def test_run_node_arms_nothing_and_writes_no_not_armed_line_when_build_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reuses `_BuildRaisingNode` (defined above for the assembly-failure
+    tests): the arm is pinned AFTER `build()`, so a build that raises never
+    reaches the arm call at all -- no armed INFO line, no `NOT armed` line,
+    and no timer left on the clock."""
+    err = io.StringIO()
+
+    with caplog.at_level("INFO"):
+        code = run(env=TRADE_ENV, node_factory=_BuildRaisingNode, stderr=err)
+
+    assert code == EXIT_RUNTIME_ERROR
+    assert "NOT armed" not in err.getvalue()
+    # The positive arm signal must be ABSENT too: a timer armed and then
+    # cleaned up in `finally` would satisfy the final-state check below by
+    # accident even if the arm ran too early (before `build()`).
+    assert not any("refusal re-poll timer armed" in record.message for record in caplog.records)
+    node = RecordingNode.instances[0]
+    assert tuple(node.kernel.clock.timer_names) == ()
+
+
+def test_run_node_boots_when_arming_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def _raise_on_arm(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("arming exploded")
+
+    monkeypatch.setattr(trade_cli, "install_refusal_repoll_timer", _raise_on_arm)
+    err = io.StringIO()
+
+    with caplog.at_level("ERROR"):
+        code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    assert code == EXIT_OK
+    assert err.getvalue().count("NOT armed") == 1
+    not_armed_errors = [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "NOT armed" in record.message
+    ]
+    assert len(not_armed_errors) == 1
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]

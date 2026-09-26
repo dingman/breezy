@@ -178,6 +178,21 @@ class _FakeRiskEngine:
         self.states.append(state)
 
 
+class _InlineLoop:
+    """FU-8b: fakes `node.kernel.loop`'s `is_closed`/`call_soon_threadsafe`
+    surface, called inline on the same thread -- see the identical fake in
+    `test_trade_cli.py` for the full rationale."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def call_soon_threadsafe(self, callback: Any, *args: Any) -> None:
+        callback(*args)
+
+
 class _FakeKernel:
     def __init__(self) -> None:
         self.portfolio = _FakeGuardPortfolio()
@@ -187,6 +202,10 @@ class _FakeKernel:
         # WP-B2: `_run_node` reads `node.kernel.clock` and hands it to the
         # order guard (see the same addition in `test_trade_cli.py`).
         self.clock = TestClock()
+        # FU-8b: `_run_node` now also reads `node.kernel.loop` to arm the
+        # refusal re-poll timer. Without this, every test in this file would
+        # take the `NOT armed` path once that read lands.
+        self.loop = _InlineLoop()
 
 
 class _RecordingTrader:
@@ -316,9 +335,14 @@ def test_both_flags_on_populated_catalog_registers_one_strategy_per_station_befo
         },
     )
 
-    code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+    err = io.StringIO()
+    code = run(env=env, node_factory=RecordingNode, stderr=err)
 
     assert code == EXIT_OK
+    # FU-8b: a normal run arms the refusal re-poll timer cleanly; this
+    # harness's `_FakeKernel` gained `loop` for exactly that, and a
+    # regression there would surface as a silent `NOT armed` line.
+    assert "NOT armed" not in err.getvalue()
     node = RecordingNode.instances[0]
     strategies = node.trader.strategies
     assert len(strategies) == len(SUPPORTED_STATIONS)
