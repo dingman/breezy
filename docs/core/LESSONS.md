@@ -1578,3 +1578,28 @@ The ledger, the exec-state DB, the halt store and the catalog markers are all re
 - A writer CLI that lacks a lock is a backlog item, not a license to parallelize.
 
 Related: L-22 (an instance mutex serializes the read-modify-write), [[give-each-agent-its-own-scratchpad]].
+
+## L-51 — A worktree shares the venv and the stash stack with production; isolation of files is not isolation of state (2026-09-26)
+
+### What happened
+Two things on 2026-09-26 went wrong because a worktree was treated as fully isolated:
+- The WP-D1 implementer ran `uv sync` from `/home/jon/breezy-wpd1`. That worktree's `.venv` is a symlink to `/home/jon/breezy/.venv`, the environment the live node, the supervisor and every systemd study run from. `uv sync` rewrote it to the lockfile's default set and stripped the optional extras. The agent restored them, and the coordinator verified the imports, but for that window any unit that spawned would have imported a different environment.
+- Two implementers (FU-5 and the R-7 hardening round) ran `git stash` inside their own worktrees, although both briefs forbade it. The stash stack is per-repository, not per-worktree. A stash made in one worktree can be popped, listed or dropped from any other. No work was lost only because both stashes were popped straight away.
+
+### Why this is binding
+A worktree isolates the checked-out files and the index. It does not isolate:
+- anything reached through a symlink (the venv);
+- the object store and refs (including `refs/stash`);
+- host state (systemd units, the catalog, `~/.local/share/breezy`).
+
+"It's my worktree" is exactly the belief that causes these writes.
+
+### The rule
+- From any worktree, never run an installer that can change the environment: `uv sync`, `uv add`, `uv pip`, `pip install`, `uv run`. Use `/home/jon/breezy/.venv/bin/python` with `PYTHONPATH=<wt>/src`.
+- Never `git stash` anywhere in this repo. To compare against the pre-change code, use `git show <sha>:<path>`, a detached scratch worktree, or edit-then-`git checkout -- <file>`.
+
+### How to apply
+- Every implementer and reviewer brief restates both bans.
+- After every implementer returns, and before merging, the coordinator runs `git stash list` (must be empty), `git status -s` on every live worktree, and an import smoke of the shared venv (`python -c "import nautilus_trader, breezy, pyarrow"`, versions unchanged).
+
+Related: L-50 (shared read-modify-write state), [[never-uv-sync-the-shared-venv]], [[never-git-stash-in-a-shared-tree]], [[worktree-needs-pythonpath]].
