@@ -8,6 +8,8 @@ excludes INITIALIZED and SUBMITTED). This audit asked how many more exist.
 Every claim below was verified at source by the coordinator before being
 recorded. Line numbers are as of `ff21d94`.
 
+**Superseding note (2026-09-12, verified 2026-09-26):** Lines 151 "all three live node configs pass `strategies=[]`" and 155-157 "permit system entirely unwired" and "zero callers in `src/`" — status is partially corrected at HEAD. The strategies claim (line 151) is factually accurate: `node_config.py:231,544,819` literally still read `strategies=[]`. However, strategies ARE added *after* `node_config` at `trade_cli.py:396-397` (`node.trader.add_strategy`), so the code was never immobilized. Permit claim (lines 155-157) is now false: `assert_live_order_submission_permitted` is called at `exec/client.py:2693`. The nuance (line 162-167) is correct: the notional gate is implemented inside the unwired chokepoint, so R-7 needs the chokepoint wired plus a consumer, not a new gate built.
+
 ## T-2 [HIGH, FIXING] `_flatten` returns early on a settled-only quantity
 
 `forecast_mispricing/strategy.py`, `calibration_mean_reversion/strategy.py`,

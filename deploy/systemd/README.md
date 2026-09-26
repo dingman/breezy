@@ -1,7 +1,6 @@
 # G-14 — reboot-durable supervision for the quote tape and the K1 study
 
-**Status: PREPARED, NOT ACTIVATED.** Nothing in this directory is installed,
-enabled, or running. The cutover in §3 is run by the coordinator, with eyes on
+**Status: ACTIVATED** (the 09-12 header "PREPARED, NOT ACTIVATED" is superseded; measured 2026-09-26: 36 `breezy-*` symlinks into this directory plus 2 host-local regular files, `breezy-nws-ingest.service` (no source here) and `breezy-trade-supervisor.service` (a regular file that shadows the repo copy, with .bak copies from 09-20/09-21); 17 active timers; 4 services running). The cutover in §3 is run by the coordinator, with eyes on
 it, because it briefly stops the one data stream Breezy cannot re-acquire.
 
 ## 1. What this replaces, and why it is urgent

@@ -23,6 +23,8 @@ local midnight); (4) execute the EXEC SPINE
 R-6c/d/e local; R-5R + R-6.5P VENUE-GATED (private backend 500/503, auth
 proven); R-4P-2 (cursor pagination) open. Plan
 `docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`; (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
+
+**Superseding note (2026-09-12, verified 2026-09-26):** EXEC SPINE R-1..R-4 + W + R-6a landed and live. See `docs/evidence/EXECUTION_CLIENT_NATIVE_AUDIT_2026-08-31.md` and live node integration (`exec/client.py:2647-2716` chokepoint, permit mint, intent latch, resolver). R-5R + R-6.5P status remains VENUE-GATED as stated.
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
 Backtest stays REFUTATION + plumbing only: offer survival is a counterfactual
 about the venue's reaction to OUR order, recorded nowhere.

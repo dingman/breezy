@@ -114,6 +114,8 @@ discarded outright.
 native risk engine is currently both **inert and unset**. `instrument.max_quantity` is likewise
 left unset at `parsing.py:1244` while `min_quantity` is set.
 
+**Resolved (2026-09-12, verified 2026-09-26):** Native risk caps are now configured. `LiveRiskEngineConfig` at `node_config.py:67,567,615`; `max_notional_per_order` at `:619` wires `set_max_notional_per_order` at runtime as instruments are discovered. See commit `6e6e623`.
+
 This is free protection sitting on the floor, and it is the opposite of the failure the operator
 suspected: not rebuilding a native, but ignoring one. **Being remediated.**
 
@@ -129,6 +131,8 @@ native therefore costs a `pyproject.toml` edit, which biases the codebase toward
 The friction is already documented in the repo: the `breezy.strategy.**` entry carries a comment
 that a per-module rule *"made 'write a strategy' a pyproject edit that nothing in pytest
 catches"*. **Being narrowed** to `nautilus_trader.adapters.polymarket`, preserving the real ban.
+
+**Resolved (2026-09-12, verified 2026-09-26):** Import contract is now narrowed. `pyproject.toml:121` now forbids only `["nautilus_trader.adapters.polymarket"]` with an empty allow-list (was `["nautilus_trader"]` with ~30-entry allow-list). See commit `f36d1c4`.
 
 ---
 

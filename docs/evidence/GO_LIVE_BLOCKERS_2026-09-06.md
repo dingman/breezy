@@ -11,6 +11,8 @@ verification of the two highest-impact claims directly against the code, the
 registered spec and the live process cgroup and environment (names only).
 HEAD `6285fb7`. Owner tags: **B** build, **O** operator.
 
+**Superseding note (2026-09-12, verified 2026-09-26):** GL-1 and GL-4 are **RULED HOLD** (2026-09-10, `docs/evidence/gl1_gl4_order_state_ruling_2026-09-10.md`). GL-3 CONFORMANCE fix approved; GL-7/GL-10 deprioritised per operator decision (line 80–88). GL-9 observable met synthetically by audit S7 (`tests/contract/test_live_fill_scoring_chain_contract.py`).
+
 ## Ranked blockers
 
 | ID | Owner | Sev | Blocker | Evidence | Unlock and observable | Size |
