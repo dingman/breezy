@@ -1692,8 +1692,12 @@ class TestRunDefect1FamilyAgnosticJoinIsPerFamily:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         families_dir = tmp_path / "families"
-        _write_family_manifest(families_dir, family_id="fam_a", trial_id_prefix="fam_a/trial/")
-        _write_family_manifest(families_dir, family_id="fam_b", trial_id_prefix="fam_b/trial/")
+        _write_registered_family_manifest(
+            families_dir, family_id="fam_a", trial_id_prefix="fam_a/trial/"
+        )
+        _write_registered_family_manifest(
+            families_dir, family_id="fam_b", trial_id_prefix="fam_b/trial/"
+        )
 
         scored_trials_dir = tmp_path / "scored_trials"
         trial_a = _scored_trial(trial_id="fam_a/trial/LAX/2026-09-01", pnl=Decimal("0.10"))
@@ -1928,7 +1932,7 @@ class TestRunDefect3RefusalIsLoggedAndCounted:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        _write_registered_family_manifest(
             families_dir, family_id="fam_broken", trial_id_prefix="fam_broken/trial/"
         )
 
@@ -2346,7 +2350,7 @@ class TestF8SharedFamilyStationEnumeration:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        _write_registered_family_manifest(
             families_dir, family_id="fam_broken", trial_id_prefix="fam_broken/trial/"
         )
         store_path = tmp_path / "state.db"
@@ -2371,6 +2375,80 @@ class TestF8SharedFamilyStationEnumeration:
         )
         # Post-F8-fix: ONE enumeration pass -> exactly one refusal, not two.
         assert report["n_family_station_refusals"] == 1
+
+
+class TestFu9DraftFamiliesAreNeverScanned:
+    """FU-9: :func:`enumerate_family_station_pairs`'s own docstring already
+    claimed it enumerates REGISTERED ``polymarket_us`` family manifests, but
+    pre-fix it globbed with ``allow_draft=True`` and never checked
+    ``status``, so the never-traded DRAFT_NOT_REGISTERED family
+    ``pm_us_crh_exit_v4`` was scanned on every production run and its
+    permanently-empty store's ``StorePositiveControlFailedError`` inflated
+    ``n_family_station_refusals`` into a permanent, misleading baseline.
+    """
+
+    def test_a_draft_not_registered_manifest_yields_zero_pairs_and_zero_refusals(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_family_manifest(  # DRAFT_NOT_REGISTERED
+            families_dir, family_id="fam_draft", trial_id_prefix="fam_draft/trial/"
+        )
+        store_path = tmp_path / "state.db"
+        SqliteStateStore(store_path).close()  # empty but openable
+
+        results, n_refusals = _prr.enumerate_family_station_pairs(
+            families_dir=families_dir, exec_state_db_path=store_path
+        )
+
+        assert results == ()
+        assert n_refusals == 0
+
+    def test_a_registered_manifest_with_an_empty_store_still_counts_a_refusal(
+        self, tmp_path: Path
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_registered_family_manifest(
+            families_dir, family_id="fam_reg", trial_id_prefix="fam_reg/trial/"
+        )
+        store_path = tmp_path / "state.db"
+        SqliteStateStore(store_path).close()  # empty but openable
+
+        results, n_refusals = _prr.enumerate_family_station_pairs(
+            families_dir=families_dir, exec_state_db_path=store_path
+        )
+
+        # Guard strength preserved: a REGISTERED family still fails the
+        # positive control on a genuinely empty store, exactly as before.
+        assert results == ()
+        assert n_refusals == 1
+
+    def test_a_manifest_with_any_other_status_is_still_scanned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        families_dir = tmp_path / "families"
+        _write_registered_family_manifest(
+            families_dir, family_id="fam_retired", trial_id_prefix="fam_retired/trial/"
+        )
+        manifest_path = families_dir / "fam_retired.json"
+        retired = dataclasses.replace(
+            _prr.load_family_manifest(manifest_path, allow_draft=True),
+            status="RETIRED",  # synthetic future status, never DRAFT_NOT_REGISTERED
+        )
+        monkeypatch.setattr(_prr, "load_family_manifest", lambda *_a, **_kw: retired)
+
+        store_path = tmp_path / "state.db"
+        SqliteStateStore(store_path).close()  # empty but openable
+
+        results, n_refusals = _prr.enumerate_family_station_pairs(
+            families_dir=families_dir, exec_state_db_path=store_path
+        )
+
+        # A future RETIRED/superseded family that actually traded must still
+        # be scanned -- the skip is keyed on the literal DRAFT_NOT_REGISTERED
+        # value, never `!= "REGISTERED"`.
+        assert results == ()
+        assert n_refusals == 1
 
 
 class TestF9ReaderTypeValidation:
@@ -3297,7 +3375,7 @@ class TestResidualSettlementCash:
         `_run`'s own fixtures -- never a hand-built `ResidualSettlement`.
         """
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        _write_registered_family_manifest(
             families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
         )
 
@@ -3457,7 +3535,7 @@ class TestFu3bResidualCountsSurfaced:
         VISIBLE in the persisted report -- never a silent gap in the cash
         identity."""
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        _write_registered_family_manifest(
             families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
         )
 
@@ -3738,7 +3816,7 @@ class TestResidualPnlAndD9:
         must still be flagged once its horizon passes -- ungating everything
         would fail this test too."""
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        _write_registered_family_manifest(
             families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
         )
 
@@ -3878,7 +3956,7 @@ class TestResidualPnlAndD9:
         residual) and the +0.30 residual P&L reaches the numerator
         (AC1/AC2)."""
         families_dir = tmp_path / "families"
-        _write_family_manifest(
+        _write_registered_family_manifest(
             families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
         )
 

@@ -3026,6 +3026,20 @@ def enumerate_family_station_pairs(
             continue
         if manifest.venue != "polymarket_us":
             continue
+        if manifest.status == "DRAFT_NOT_REGISTERED":
+            # FU-9: a family that never armed anything cannot refuse a
+            # (family, station) scan either -- pre-fix, every draft was
+            # scanned via `allow_draft=True` and its permanently-empty
+            # store's `StorePositiveControlFailedError` was folded into
+            # `n_family_station_refusals` as a permanent, misleading
+            # baseline. `!= "REGISTERED"` is deliberately NOT used here: a
+            # future RETIRED/superseded family that actually traded must
+            # still be scanned so its fills count.
+            logger.info(
+                "portfolio_roi_report: skipping DRAFT_NOT_REGISTERED family manifest family=%s",
+                manifest.family_id,
+            )
+            continue
         for station in manifest.stations:
             try:
                 site = default_registry().settlement_site(manifest.venue, station)
