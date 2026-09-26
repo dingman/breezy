@@ -43,6 +43,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
+from breezy.runtime import quote_tape_ingest_cli
 from breezy.runtime.quote_tape_ingest_cli import (
     DEFAULT_LIVE_GRACE_MINUTES,
     EXIT_CONVERSION_FAILED,
@@ -102,7 +103,12 @@ def _quote_tick_at(ts_ns: int) -> QuoteTick:
 
 
 def _raise_non_disjoint(
-    self: ParquetDataCatalog, instance_id: str, data_cls: type, **kwargs: object
+    catalog: ParquetDataCatalog,
+    instance_id: str,
+    data_cls: type,
+    subdirectory: str,
+    *,
+    target: ParquetDataCatalog | None = None,
 ) -> None:
     raise ValueError("would create non-disjoint intervals")
 
@@ -114,7 +120,7 @@ def test_a_whole_instance_run_with_one_failed_type_reports_outcome_failed(
     instance-level outcome was unconditionally "converted" regardless of a
     per-type failure logged one line above it."""
     _touch_feather(tmp_path, _INSTANCE, "quote_tick_1.feather")
-    monkeypatch.setattr(ParquetDataCatalog, "convert_stream_to_data", _raise_non_disjoint)
+    monkeypatch.setattr(quote_tape_ingest_cli, "_convert_stream_natively", _raise_non_disjoint)
 
     results = run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
 
@@ -155,7 +161,7 @@ def test_run_returns_exit_conversion_failed_when_a_whole_instance_type_failed(
     never depend on that.
     """
     _touch_feather(tmp_path, _INSTANCE, "quote_tick_1.feather")
-    monkeypatch.setattr(ParquetDataCatalog, "convert_stream_to_data", _raise_non_disjoint)
+    monkeypatch.setattr(quote_tape_ingest_cli, "_convert_stream_natively", _raise_non_disjoint)
 
     out, err = io.StringIO(), io.StringIO()
     code = run(

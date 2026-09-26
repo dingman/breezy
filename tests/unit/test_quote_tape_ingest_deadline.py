@@ -623,10 +623,10 @@ class TestCLIDeadlineLine:
     ) -> None:
         _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
 
-        def boom(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
             raise ValueError("boom -- not the non-disjoint refusal text")
 
-        monkeypatch.setattr(ParquetDataCatalog, "convert_stream_to_data", boom)
+        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", boom)
         import io
 
         out_buf, err_buf = io.StringIO(), io.StringIO()
@@ -909,17 +909,17 @@ class TestPerFileBreadcrumbSurvivesAKillThenTheNextRunConverts:
 
         attempt = instance_dir / f"{ATTEMPT_PREFIX}quote_tick"
         raised = {"count": 0}
-        real_read = ParquetDataCatalog._read_feather_file
+        real_read = ingest_cli_module.read_feather_coalesced  # type: ignore[attr-defined]
 
-        def flaky_read(self, path, *a, **kw):  # type: ignore[no-untyped-def]
+        def flaky_read(fs, path, *a, **kw):  # type: ignore[no-untyped-def]
             if raised["count"] == 0:
                 raised["count"] += 1
                 raise KeyboardInterrupt("simulated hard kill on the first read")
-            return real_read(self, path, *a, **kw)
+            return real_read(fs, path, *a, **kw)
 
         # Run 1: a hard kill mid-conversion leaves the breadcrumb, no marker.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(ParquetDataCatalog, "_read_feather_file", flaky_read)
+            mp.setattr(ingest_cli_module, "read_feather_coalesced", flaky_read)
             deadline = RunDeadline(budget_ns=1_000_000_000_000)
             with pytest.raises(KeyboardInterrupt):
                 run_ingest(
@@ -1143,14 +1143,14 @@ class TestPerFileLazyGateTiming:
         assert deadline.admitted == 1
 
         read_calls: list[Path] = []
-        real_read = ParquetDataCatalog._read_feather_file
+        real_read = ingest_cli_module.read_feather_coalesced  # type: ignore[attr-defined]
 
-        def counting_read(self, path, *a, **kw):  # type: ignore[no-untyped-def]
+        def counting_read(fs, path, *a, **kw):  # type: ignore[no-untyped-def]
             read_calls.append(Path(path))
-            return real_read(self, path, *a, **kw)
+            return real_read(fs, path, *a, **kw)
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(ParquetDataCatalog, "_read_feather_file", counting_read)
+            mp.setattr(ingest_cli_module, "read_feather_coalesced", counting_read)
             result, converted, _is_open = ingest_cli_module._convert_one_tick_type_per_file(
                 catalog, instance_dir, INSTANCE, QuoteTick, frozenset(), reports_by_path,
                 instance_is_dead=False, dry_run=False, deadline=deadline,

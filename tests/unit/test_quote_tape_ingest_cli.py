@@ -667,7 +667,7 @@ class TestReEmittedInstrumentDefinitionsStillLand:
 
 
 class TestNonInstrumentTypesKeepTheSingleNativeCall:
-    def test_a_quote_tick_still_goes_through_convert_stream_to_data(
+    def test_a_quote_tick_still_goes_through_the_native_bulk_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The row-wise path is for instrument definitions ONLY.
@@ -675,6 +675,15 @@ class TestNonInstrumentTypesKeepTheSingleNativeCall:
         Quote/depth/trade rows are capture-timed and monotonic, so they never
         hit the overlap; re-routing them through a deserialise-and-rewrite
         path would trade a working native bulk copy for a slower one.
+
+        ING-2 S3a: the fast path now calls a Breezy mirror,
+        ``_convert_stream_natively``, instead of the native
+        ``ParquetDataCatalog.convert_stream_to_data`` directly (it still
+        calls native ``_convert_feather_table_to_parquet`` per file inside
+        that mirror) -- so the spy is retargeted to the seam this module
+        actually calls. Mutation M1 (``default_convert`` bypasses the seam
+        and calls ``catalog.convert_stream_to_data`` directly) must turn this
+        RED: the spy would then stay empty.
         """
         _touch(
             tmp_path,
@@ -688,11 +697,16 @@ class TestNonInstrumentTypesKeepTheSingleNativeCall:
         native_calls: list[type] = []
 
         def spy(
-            self: ParquetDataCatalog, instance_id: str, data_cls: type, **kwargs: Any
+            catalog: ParquetDataCatalog,
+            instance_id: str,
+            data_cls: type,
+            subdirectory: str,
+            *,
+            target: ParquetDataCatalog | None = None,
         ) -> None:
             native_calls.append(data_cls)
 
-        monkeypatch.setattr(ParquetDataCatalog, "convert_stream_to_data", spy)
+        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", spy)
 
         run_ingest(
             tmp_path,
@@ -713,11 +727,16 @@ class TestNonInstrumentTypesKeepTheSingleNativeCall:
         )
 
         def boom(
-            self: ParquetDataCatalog, instance_id: str, data_cls: type, **kwargs: Any
+            catalog: ParquetDataCatalog,
+            instance_id: str,
+            data_cls: type,
+            subdirectory: str,
+            *,
+            target: ParquetDataCatalog | None = None,
         ) -> None:
             raise ValueError("would create non-disjoint intervals")
 
-        monkeypatch.setattr(ParquetDataCatalog, "convert_stream_to_data", boom)
+        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", boom)
 
         results = run_ingest(
             tmp_path,
@@ -1288,7 +1307,9 @@ class TestANoneOrEmptyPostTransformTableIsAHardFailure:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         instance_dir, quote_path = self._mixed_instance(tmp_path)
-        monkeypatch.setattr(ParquetDataCatalog, "_read_feather_file", lambda self, path: None)
+        monkeypatch.setattr(
+            ingest_cli_module, "read_feather_coalesced", lambda fs, path, **kw: None
+        )
 
         results = run_ingest(
             tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active
@@ -1597,7 +1618,9 @@ class TestExitCodeReflectsAHardConversionFailure:
         )
         stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
         os.utime(quote_path, (stamp, stamp))
-        monkeypatch.setattr(ParquetDataCatalog, "_read_feather_file", lambda self, path: None)
+        monkeypatch.setattr(
+            ingest_cli_module, "read_feather_coalesced", lambda fs, path, **kw: None
+        )
 
         out, err = io.StringIO(), io.StringIO()
         code = run(

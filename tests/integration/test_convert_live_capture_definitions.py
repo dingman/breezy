@@ -17,7 +17,8 @@ streams, no mocked catalog), reproduce the failure through
 ``_convert_live_capture`` (RED), and then pin the fix: instrument
 definitions route through ``breezy.runtime.quote_tape_ingest_cli``'s
 row-wise, de-duplicated conversion instead, while quote ticks keep the
-single native ``convert_stream_to_data`` call, unchanged.
+native per-file writer via the Breezy mirror (ING-2 S3a,
+``_convert_stream_natively``).
 """
 
 from __future__ import annotations

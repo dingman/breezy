@@ -54,7 +54,9 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 from nautilus_trader.model.data import CustomData
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.funcs import class_to_filename
 
@@ -158,6 +160,104 @@ def _drop_already_landed_unfiltered(
     return [obj for obj in objects if _object_key(obj) not in known]
 
 
+class ExtendWriteMismatch(ValueError):
+    """An EXTEND write's row count on disk did not match what was fresh (A8).
+
+    ``write_data``'s ``_write_chunk`` silently skips a write when its target
+    filename already exists (a bare ``print``, ``parquet.py:378-380``) --
+    indistinguishable on its own from a successful write. This detector
+    turns that silent skip into a loud, reason-coded failure for the EXTEND
+    path (ING-2 S3a, Arch §7 r3), where ``write_data``'s per-instrument
+    filename usually differs from native's flat one, so a collision is a
+    real, actionable anomaly rather than routine idempotent overlap. It
+    covers EXTEND only: a same-directory, same-filename collision on the
+    native fast/per-file path is RS-4, a named residual, and is not raised
+    here. The message never contains "non-disjoint", so it is never
+    misrouted into the non-disjoint-refusal handling in
+    ``quote_tape_ingest_cli``, and it never names an instrument id or a
+    value -- only counts.
+    """
+
+
+def _write_data_group(obj: Any) -> tuple[type, str | None]:
+    """Mirror ``ParquetDataCatalog.write_data``'s grouping rule (``parquet.py:320-339``).
+
+    Returns the ``(class, identifier)`` pair ``write_data`` will use to pick
+    ``obj``'s directory: unwraps ``CustomData``, then applies native's
+    four-branch rule -- an ``Instrument``'s ``id.value``, an object with
+    ``bar_type``'s ``str(bar_type)``, an object with ``instrument_id``'s
+    ``instrument_id.value``, or ``None`` otherwise. The identifier returned
+    here is the RAW form; ``_make_path`` applies ``urisafe_identifier``
+    itself, so it must never be pre-encoded.
+    """
+    if isinstance(obj, CustomData):
+        obj = obj.data
+    cls = type(obj)
+    if isinstance(obj, Instrument):
+        return cls, obj.id.value
+    if hasattr(obj, "bar_type"):
+        return cls, str(obj.bar_type)
+    if hasattr(obj, "instrument_id"):
+        return cls, obj.instrument_id.value
+    return cls, None
+
+
+def _parquet_set(write_target: ParquetDataCatalog, directory: str) -> set[str]:
+    """The depth-1 ``*.parquet`` files directly under ``directory``.
+
+    Depth-1 only, via ``fs.ls`` rather than ``fs.glob`` (r3.1: avoids
+    glob-metacharacter interpretation in an instrument id or bar_type
+    string). For a flat type root (identifier ``None``) this correctly
+    excludes identifier subdirectories; for a per-instrument directory it is
+    exactly the directory ``_write_chunk`` writes into
+    (``parquet.py:370-380``).
+    """
+    if not write_target.fs.exists(directory):
+        return set()
+    return {
+        entry for entry in write_target.fs.ls(directory, detail=False) if entry.endswith(".parquet")
+    }
+
+
+def _write_data_with_mismatch_detection(
+    write_target: ParquetDataCatalog,
+    data_cls: type,
+    fresh: list[Any],
+) -> None:
+    """``write_data(fresh, skip_disjoint_check=True)``, guarded by A8.
+
+    Scoped to the exact directories ``write_data`` will touch for ``fresh``
+    (Arch §7 r3). Diffs each directory's depth-1 parquet set before and
+    after the write, and sums the row counts of the new files from their
+    footers (cheap: footer-only reads, never a full table read). If the sum
+    does not equal ``len(fresh)``, raises :class:`ExtendWriteMismatch` --
+    the file stays unmarked by the caller, and the run is retried.
+    """
+    dirs = {
+        write_target._make_path(data_cls=cls, identifier=ident)
+        for cls, ident in {_write_data_group(obj) for obj in fresh}
+    }
+    before: set[str] = set()
+    for directory in dirs:
+        before |= _parquet_set(write_target, directory)
+
+    write_target.write_data(fresh, skip_disjoint_check=True)
+
+    after: set[str] = set()
+    for directory in dirs:
+        after |= _parquet_set(write_target, directory)
+
+    new_files = after - before
+    written = sum(
+        pq.read_metadata(new_file, filesystem=write_target.fs).num_rows for new_file in new_files
+    )
+    if written != len(fresh):
+        raise ExtendWriteMismatch(
+            f"extend write mismatch for {class_to_filename(data_cls)}: "
+            f"expected {len(fresh)} row(s), landed {written} across {len(dirs)} dir(s)"
+        )
+
+
 def write_fresh_capture_rows(
     write_target: ParquetDataCatalog,
     data_cls: type,
@@ -168,7 +268,10 @@ def write_fresh_capture_rows(
     EXTEND for ING-1: new parquet records only, never a rewrite or a
     ``delete_data_range``. ``skip_disjoint_check=True`` is earned by the
     de-dupe, same contract as :func:`salvage_truncated_instance` and
-    ``convert_instrument_definitions``.
+    ``convert_instrument_definitions``. The write is guarded by the A8
+    write-mismatch detector (:func:`_write_data_with_mismatch_detection`),
+    which raises :class:`ExtendWriteMismatch` instead of silently losing
+    rows to ``write_data``'s exists-skip.
     """
     fresh = _drop_already_landed_unfiltered(write_target, data_cls, objects)
     dropped = len(objects) - len(fresh)
@@ -182,7 +285,7 @@ def write_fresh_capture_rows(
         )
     if not fresh:
         return 0
-    write_target.write_data(fresh, skip_disjoint_check=True)
+    _write_data_with_mismatch_detection(write_target, data_cls, fresh)
     return len(fresh)
 
 
