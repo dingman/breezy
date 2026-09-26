@@ -200,14 +200,31 @@ def test_no_leg_exit_still_refuses_at_family_gate_today() -> None:
     assert outcome.rule is None
 
 
-def test_no_leg_refuses_at_no_leg_gate_when_family_armed_but_undeclared() -> None:
+@pytest.mark.parametrize(
+    ("state", "verdict"),
+    [
+        (ThesisState.DEAD_BY_OBSERVATION, Verdict.EXIT_RECOMMENDED),
+        (ThesisState.THREATENED, Verdict.REDUCE_RECOMMENDED),
+    ],
+)
+def test_no_leg_refuses_at_no_leg_gate_when_family_armed_but_undeclared(
+    state: ThesisState, verdict: Verdict,
+) -> None:
     """(d): the family IS armed (`exit_rule` set, code-registered) but its
     manifest does NOT declare `no_leg_exit` -- a NO-leg evaluation refuses
     at the new gate with `rule=None`, EVEN THOUGH a `depth_walk` mark is
-    present and the state is DEAD (a rule would otherwise have selected)."""
+    present and the state WOULD otherwise have selected a rule: DEAD (as
+    today), or THREATENED with the same `p_hold_at_t`/`mark_vwap` pair that
+    fires R_THREAT for a NO leg once declared
+    (``test_r_threat_fires_on_threatened_no_leg``)."""
     outcome = _decide(
-        _decision(ThesisState.DEAD_BY_OBSERVATION, Verdict.EXIT_RECOMMENDED),
-        _evidence(leg="NO", mark_vwap=Decimal("0.85"), mark_source="depth_walk"),
+        _decision(state, verdict),
+        _evidence(
+            leg="NO",
+            p_hold_at_t=Decimal("0.30"),
+            mark_vwap=Decimal("0.85"),
+            mark_source="depth_walk",
+        ),
         manifest=_manifest(no_leg_exit=False),
     )
     assert isinstance(outcome, ExitRefusal)

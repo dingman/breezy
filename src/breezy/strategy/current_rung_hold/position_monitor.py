@@ -339,8 +339,8 @@ class PositionMonitor:
         """FU-1d (RULING_FU-1b_no_leg_marks_2026-09-26.md): re-route THIS
         SAME YES depth frame to its registered NO-leg sibling, evaluated
         independently of `_on_depth` above -- its own `_guarded` site
-        (`on_depth`) means an error here can never suppress or alter the
-        YES evaluation, and vice versa.
+        (`on_depth_sibling`) means an error here can never suppress or alter
+        the YES evaluation, and vice versa.
 
         A no-op whenever `sibling_for` is `None` (the default: byte-
         identical shadow behaviour for every caller that predates FU-1d).
