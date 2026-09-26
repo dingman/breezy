@@ -481,6 +481,25 @@ def test_fires_one_below_the_per_station_day_cap() -> None:
     assert isinstance(outcome, ExitProposal)
 
 
+def test_no_leg_evidence_honours_the_station_day_cap_when_no_leg_exit_is_declared() -> None:
+    """S1 (FU-1d-reopen, characterisation, L-33): the per-station-day cap is
+    SHARED across legs (it is fed `PositionMonitor._station_day_exit_counts`,
+    keyed by `(station, climate_day)` only), so a NO-leg evaluation at the
+    cap refuses `station_day_exit_cap` -- never `no_leg_exit_not_declared`
+    -- once the family has armed `no_leg_exit`. No RED: mutation evidence
+    (skipping the cap check for a NO leg) is attached in the commit body and
+    makes this test fail.
+    """
+    outcome = _decide(
+        _decision(ThesisState.THREATENED, Verdict.REDUCE_RECOMMENDED),
+        _evidence(leg="NO", p_hold_at_t=Decimal("0.30"), mark_vwap=Decimal("0.85")),
+        manifest=_manifest(no_leg_exit=True),
+        station_day_exit_count=MAX_STATION_DAY_EXIT_ORDERS,
+    )
+    assert isinstance(outcome, ExitRefusal)
+    assert outcome.reason == "station_day_exit_cap"
+
+
 # ---------------------------------------------------------------------------
 # ExitAuthorization construction / client_order_id economy
 # ---------------------------------------------------------------------------

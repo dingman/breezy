@@ -31,6 +31,7 @@ from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
 from breezy.strategy.current_rung_hold.monitor_decision import (
+    MonitorDecision,
     MonitorHistory,
     ThesisState,
     Verdict,
@@ -869,6 +870,143 @@ def test_an_armed_family_fires_and_calls_submit_exit_with_a_proposal(
     assert call_order.index("record_exit_offer") < call_order.index("submit_exit"), (
         "the decision must be persisted BEFORE submit_exit is called (hard invariant)"
     )
+
+
+# ---------------------------------------------------------------------------
+# FU-1d S1 (RULING_FU-1b_no_leg_marks_2026-09-26.md re-open item 1,
+# FU-1d-reopen plan r1): the per-station-day exit-fire counter
+# (`PositionMonitor._station_day_exit_counts`) is keyed by `(station,
+# climate_day)` ONLY -- deliberately SHARED across a station-day's YES and
+# NO legs, matching PREREG v4 section3b's per-station-day cap (the trial
+# unit is the station-day, L-40). Characterisation test (L-33): no RED,
+# since this is the pre-existing keying; mutation evidence (keying by
+# `(station, climate_day, monitored.leg)` instead) is attached in the
+# commit body and makes this test fail.
+# ---------------------------------------------------------------------------
+
+
+def _s1_shared_cap_evidence(*, iid: str, leg: str) -> MonitorEvidence:
+    return MonitorEvidence(
+        ts_ns=WINDOW_OPEN_NS,
+        instrument_id=iid,
+        station=STATION,
+        climate_day=CLIMATE_DAY.isoformat(),
+        leg=leg,  # type: ignore[arg-type]
+        cell_key=(STATION, "DJF", 14, 0, 0),
+        p_hold_at_entry=Decimal("0.70"),
+        p_hold_at_t=Decimal("0.05"),
+        fill_px=Decimal("0.40"),
+        held_qty=1,
+        mark_vwap=Decimal("0.05"),
+        mark_source="depth_walk",
+        spread=Decimal("0.01"),
+        depth_sufficient=True,
+        staleness_ns=0,
+        book_staleness_ns=0,
+        running_max_lower=90,
+        running_max_upper=90,
+        rung_low=84,
+        rung_high=87,
+        exit_fee_at_mark=Decimal("0.01"),
+        unrealized_pnl=Decimal(0),
+        recoverable_value=Decimal("0.04"),
+        hour_lst=14,
+        entry_context="live",
+    )
+
+
+def test_station_day_exit_count_is_shared_across_yes_and_no_legs_of_one_station_day(
+    tmp_path: Path,
+) -> None:
+    """Drive a YES DEAD-confirmed evaluation, then a NO one, for the SAME
+    station-day, through a stub `exit_decider` that records
+    `(evidence.leg, station_day_exit_count)` and always fires (returns a
+    real `ExitProposal`). The NO leg must see the YES leg's fired exit
+    already reflected as `station_day_exit_count == 1`."""
+    from breezy.strategy.current_rung_hold.exit_authorization import (
+        ExitAuthorization,
+        ExitRule,
+    )
+    from breezy.strategy.current_rung_hold.exit_decider import ExitProposal
+
+    calls: list[tuple[str, int]] = []
+
+    def _stub_decider(
+        decision, evidence, *,
+        manifest, family_id, position_id, client_order_id_factory,
+        last_exit_decided_at_ns_for_position, station_day_exit_count,
+        fee_coefficient, now_ns,
+    ):
+        calls.append((evidence.leg, station_day_exit_count))
+        return ExitProposal(
+            instrument_id=evidence.instrument_id,
+            authorization=ExitAuthorization(
+                family_id=family_id,
+                position_id=position_id,
+                client_order_id=client_order_id_factory(),
+                leg="yes" if evidence.leg == "YES" else "no",
+                attributed_net_long=1,
+                working_sell_qty=0,
+                quantity=1,
+                limit_price=Decimal("0.05"),
+                rule=ExitRule.R_DEAD,
+                expected_settlement_value=Decimal(0),
+                fee_coefficient=Decimal(0),
+                decided_at_ns=now_ns,
+                book_staleness_ns=0,
+            ),
+            decided_at_ns=now_ns,
+        )
+
+    submit_calls: list[object] = []
+    strategy = _FakeStrategyForCallables(
+        cache=_FakeCacheForCallables(positions_by_iid={}),
+        _latch=_FakeLatchForCallables(record=None),
+        _facts=_no_leg_facts(),
+        _std_utc_offset_hours_by_station={STATION: -8.0},
+    )
+    monitor = _build_position_monitor_via_callables(
+        strategy,
+        tmp_path=tmp_path,
+        accumulators={},
+        exit_decider=_stub_decider,
+        exit_manifest=_manifest_for_exit_test(
+            exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+        ),
+        exit_family_id="pm_us_crh_exit_v4",
+        exit_client_order_id_factory=lambda: "exit-coid-s1",
+        submit_exit=submit_calls.append,
+    )
+    monitor.on_position_opened(  # type: ignore[arg-type]
+        _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1, id="P-YES"),
+        WINDOW_OPEN_NS,
+    )
+    monitor.on_position_opened(  # type: ignore[arg-type]
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1, id="P-NO"),
+        WINDOW_OPEN_NS,
+    )
+    monitored_yes = monitor._positions[_IID]
+    monitored_no = monitor._positions[_NO_IID]
+    assert (monitored_yes.station, monitored_yes.climate_day) == (
+        monitored_no.station, monitored_no.climate_day,
+    ), "both legs of one market must share one station-day"
+
+    decision = MonitorDecision(
+        state=ThesisState.DEAD_BY_OBSERVATION,
+        verdict=Verdict.EXIT_RECOMMENDED,
+        reason_codes=(),
+        confirmations=3,
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor._maybe_decide_exit(
+        monitored_yes, _s1_shared_cap_evidence(iid=_IID, leg="YES"), decision, WINDOW_OPEN_NS,
+    )
+    monitor._maybe_decide_exit(
+        monitored_no, _s1_shared_cap_evidence(iid=_NO_IID, leg="NO"), decision, WINDOW_OPEN_NS + 1,
+    )
+
+    assert calls == [("YES", 0), ("NO", 1)]
+    assert len(submit_calls) == 2
 
 
 # ---------------------------------------------------------------------------
