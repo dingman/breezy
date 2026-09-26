@@ -703,6 +703,34 @@ def test_c_pin_unpinned_sha_is_proposal_incomplete() -> None:
     assert row.verdict == "PROPOSAL_INCOMPLETE"
 
 
+def test_c_pin_real_pinned_shas_pass() -> None:
+    champion = _champion()
+    row = evaluate_c_pin(champion)
+    assert row.verdict == "true"
+    assert row.value["boundary_inputs_sha256"] == champion.boundary_inputs_sha256
+    assert row.value["density_artefact_sha256"] == champion.density_artefact_sha256
+    assert row.detail is None
+
+
+def test_c_pin_absent_density_sha_is_proposal_incomplete() -> None:
+    """Only ONE of the two shas C-PIN reads is the unpinned placeholder --
+    the other is a real, champion-pinned value. The `or` in `evaluate_c_pin`
+    must still fail closed: any absent input is PROPOSAL_INCOMPLETE, not
+    just both-absent."""
+    champion = _champion()
+    draft = _draft_from(
+        champion,
+        family_id="other",
+        trial_id_prefix="other/trial/",
+        d0_climate_day="2026-09-26",
+        status="DRAFT_NOT_REGISTERED",
+        density_artefact_sha256="0" * 64,
+    )
+    assert draft.boundary_inputs_sha256 == champion.boundary_inputs_sha256
+    row = evaluate_c_pin(draft)
+    assert row.verdict == "PROPOSAL_INCOMPLETE"
+
+
 def test_adapted_r5_rows_carry_the_provisional_tag_and_name_an_artefact() -> None:
     champion = _champion()
     rows = (
