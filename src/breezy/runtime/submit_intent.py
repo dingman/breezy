@@ -157,8 +157,11 @@ class SubmitIntentLockNotHeld(SubmitIntentError):
 class SubmitIntentLockError(SubmitIntentError):
     """Raised when the process lock cannot be opened for a non-contention reason."""
 
-    def __init__(self) -> None:
-        super().__init__("submit intent process lock could not be acquired")
+    def __init__(self, detail: str | None = None) -> None:
+        message = "submit intent process lock could not be acquired"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
 
 
 def _require_str(payload: dict[str, object], name: str) -> str:
@@ -536,6 +539,19 @@ class SubmitIntentLatch:
         raise SubmitIntentCorrupt()
 
 
+def _lock_unavailable_detail(exc: OSError) -> str:
+    """Render an OSError's errno for diagnosis without implying contention.
+
+    A non-contention OSError (e.g. EMFILE: too many open files) is fail-closed
+    identically to genuine lock contention, but must be distinguishable from
+    it after the fact -- "lock unavailable" names the errno instead of
+    implying another holder.
+    """
+    code = exc.errno
+    name = errno.errorcode.get(code, str(code)) if code is not None else "unknown"
+    return f"lock unavailable: {name} ({exc.strerror})"
+
+
 @contextmanager
 def hold_submit_intent_process_lock(store_path: Path) -> Iterator[_HeldSubmitIntentLock]:
     """Hold an exclusive non-blocking flock beside the store, or fail closed."""
@@ -545,8 +561,8 @@ def hold_submit_intent_process_lock(store_path: Path) -> Iterator[_HeldSubmitInt
     flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         fd = os.open(lock_path, flags, 0o644)
-    except OSError:
-        raise SubmitIntentLockError() from None
+    except OSError as exc:
+        raise SubmitIntentLockError(_lock_unavailable_detail(exc)) from exc
     lock: _HeldSubmitIntentLock | None = None
     try:
         try:
@@ -554,7 +570,7 @@ def hold_submit_intent_process_lock(store_path: Path) -> Iterator[_HeldSubmitInt
         except OSError as exc:
             if exc.errno in {errno.EWOULDBLOCK, errno.EAGAIN}:
                 raise SubmitIntentLockHeld() from None
-            raise SubmitIntentLockError() from None
+            raise SubmitIntentLockError(_lock_unavailable_detail(exc)) from exc
         lock = _HeldSubmitIntentLock(fd)
         yield lock
     finally:
