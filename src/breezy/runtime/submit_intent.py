@@ -438,7 +438,7 @@ class SubmitIntentLatch:
     def reconcile_at_startup(
         self,
         *,
-        has_durable_fill_record: Callable[[str], object],
+        has_durable_fill_record: Callable[[str, int], object],
         now_ns: int,
     ) -> SubmitIntent | None:
         """Repair a crash between history write and singleton write.
@@ -449,6 +449,12 @@ class SubmitIntentLatch:
         A corrupt singleton raises ``SubmitIntentCorrupt`` (never repaired).
         A damaged or mismatched history record leaves the singleton OPEN
         and does not consult the fill probe: a damaged ledger stays closed.
+
+        SP-3r: the probe is called with the OPEN singleton's OWN
+        ``fingerprint`` AND ``created_ns`` -- never the boot wall-clock time
+        -- so an injected probe can derive the exact day-scoped index key a
+        crashed process would have written, even when boot happens after a
+        UTC-midnight rollover.
         """
         self._require_held()
         with self._mutex:
@@ -465,7 +471,7 @@ class SubmitIntentLatch:
                 record, raw = history
                 self._store.set(CURRENT_INTENT_KEY, raw)
                 return record
-            if has_durable_fill_record(current.fingerprint) is True:
+            if has_durable_fill_record(current.fingerprint, current.created_ns) is True:
                 return self._retire_unlocked(
                     current.intent_id,
                     RetirementReason.STARTUP_FILL_RECORD_MATCH,

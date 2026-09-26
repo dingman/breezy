@@ -395,6 +395,24 @@ FILL_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill/"
 #: because the store has no prefix scan; see the module docstring.
 FILL_INDEX_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_index/"
 
+#: SP-3r: ``<UTC day>:<intent_fingerprint>`` -> the venue order id whose
+#: fill record it names. Written INLINE inside :meth:`record_fill` (never as
+#: a separate coroutine-level call -- E0-NOSEND's per-coroutine callee
+#: allowlist has no ``self._store_set`` entry, and this module's own hard
+#: invariant is to never widen it), always AFTER the fill record and its
+#: `FILL_INDEX_KEY_PREFIX` entry, so a crash before this write still leaves
+#: `_has_durable_fill_record` free to answer False (fail closed) rather than
+#: finding a durable fill index it never wrote for.
+#:
+#: Scoped by UTC day (security review, r1.1) as defence in depth against
+#: `client_order_id` reuse: Nautilus's native `ClientOrderIdGenerator`
+#: (`common/generators.pyx`) embeds a minute-resolution UTC datetime tag in
+#: every generated id, so `intent_fingerprint` (which hashes `client_order_id`
+#: among other order fields) already differs across real UTC days under
+#: normal operation -- the day scope guards a generator reset / clock
+#: anomaly / `use_uuids=False` counter collision, not a reachable path today.
+FILL_BY_FINGERPRINT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_by_fingerprint/"
+
 #: Resolution A/E (plan rev 6.1): intent_id -> the durable resolver context
 #: for one with-id AMBIGUOUS create-order outcome. Written by
 #: `_note_ambiguous_open` BEFORE `_resolve_ambiguous_intents` can ever
@@ -1695,10 +1713,68 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self.shutdown_system(reason)
             raise
 
-    def _has_durable_fill_record(self, fingerprint: str) -> bool:
-        """Nothing supplies a fill probe today; absence is False, never synthesised."""
-        del fingerprint
-        return False
+    def _has_durable_fill_record(self, fingerprint: str, created_ns: int) -> bool:
+        """SP-3r: the real boot probe for a crash between ``record_fill`` and
+        ``_retire``.
+
+        Returns the literal ``True`` (the only value :meth:`~breezy.runtime.
+        submit_intent.SubmitIntentLatch.reconcile_at_startup` treats as a
+        match) iff the day-scoped ``FILL_BY_FINGERPRINT_KEY_PREFIX`` entry
+        for ``(day, fingerprint)`` exists AND the fill record it names still
+        decodes. ``day`` is derived from ``created_ns`` -- the OPEN intent's
+        OWN creation time, never this boot's wall clock -- so a crash just
+        before a UTC-midnight rollover still probes the day the intent was
+        actually armed on, matching exactly the day :meth:`record_fill`
+        wrote under.
+
+        Every failure mode (a bad timestamp, an unreadable index, an
+        undecodable index value, a missing or undecodable fill record)
+        returns ``False``: absence is never synthesised into a match, and no
+        exception ever escapes to crash boot over a probe that is read-only
+        by construction.
+        """
+        try:
+            day = utc_day_for_ns(created_ns).isoformat()
+        except Exception as exc:  # noqa: BLE001 - an unusable timestamp must refuse, not crash boot
+            self._log.warning(
+                "durable fill probe: could not derive a UTC day from "
+                f"created_ns ({type(exc).__name__}); refusing"
+            )
+            return False
+        index_key = f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{fingerprint}"
+        try:
+            venue_order_id_raw = self._store_get(index_key)
+        except Exception as exc:  # noqa: BLE001 - a store error must refuse, not crash boot
+            self._log.warning(
+                f"durable fill probe: index read failed ({type(exc).__name__}); refusing"
+            )
+            return False
+        if venue_order_id_raw is None:
+            return False
+        try:
+            venue_order_id = venue_order_id_raw.decode("utf-8")
+        except Exception as exc:  # noqa: BLE001 - an undecodable index value must refuse
+            self._log.warning(
+                f"durable fill probe: index value undecodable ({type(exc).__name__}); refusing"
+            )
+            return False
+        try:
+            fill_raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+        except Exception as exc:  # noqa: BLE001 - a store error must refuse, not crash boot
+            self._log.warning(
+                f"durable fill probe: fill record read failed ({type(exc).__name__}); refusing"
+            )
+            return False
+        if fill_raw is None:
+            return False
+        try:
+            DurableFillRecord.from_bytes(fill_raw)
+        except Exception as exc:  # noqa: BLE001 - an undecodable fill record must refuse
+            self._log.warning(
+                f"durable fill probe: fill record undecodable ({type(exc).__name__}); refusing"
+            )
+            return False
+        return True
 
     def _reconcile_submit_intent(self) -> None:
         """Reconcile the INJECTED (composition-root-opened) latch before any
@@ -2465,7 +2541,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # AUD-13b (ruling R-1 = O4 (a)): stamp the theta of the instrument
             # in hand NOW -- i.e. at DISCOVERY, like `ts_event` above; the
             # true fill lies in [intent created, now] (evidence pack F3).
-            self.record_fill(record, fill_time_instrument=instrument)
+            self.record_fill(
+                record,
+                fill_time_instrument=instrument,
+                intent_fingerprint=current.fingerprint,
+                intent_created_ns=current.created_ns,
+            )
         except Exception as exc:  # noqa: BLE001 - see the CREATE path's identical guard
             fill_record_bytes = record.to_bytes()
             detail = fill_record_bytes.decode()
@@ -3579,6 +3660,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         record: DurableFillRecord,
         *,
         fill_time_instrument: Instrument | None = None,
+        intent_fingerprint: str | None = None,
+        intent_created_ns: int | None = None,
     ) -> None:
         """Persist one venue order's cumulative totals and index it.
 
@@ -3601,6 +3684,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         destroying every surviving record's reachability -- the store has no
         prefix scan, so an id absent from the index is an id that no longer
         exists as far as pricing is concerned.
+
+        SP-3r: when both ``intent_fingerprint`` and ``intent_created_ns`` are
+        given (both call sites pass the armed/open ``SubmitIntent``'s own
+        fields), a day-scoped ``FILL_BY_FINGERPRINT_KEY_PREFIX`` entry is
+        ALSO written here -- the last write in this method, i.e. strictly
+        after the fill record and its instrument index above, and therefore
+        still strictly before either caller's own ``_retire``. Done HERE
+        (this method's body is not one of E0-NOSEND's scanned coroutines)
+        rather than as a separate call from the scanned create/resolver
+        coroutines, which may call only their own fixed allowlists. Any
+        failure here (like any failure above) propagates to the caller's
+        identical ``_FILL_WRITE_FAILED`` refusal path -- an index write
+        failure never leaves the fill record written without it silently.
         """
         if fill_time_instrument is not None:
             record = dataclasses.replace(
@@ -3623,6 +3719,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if record.venue_order_id not in indexed:
             indexed.append(record.venue_order_id)
             self._store_set(index_key, json.dumps(indexed).encode("utf-8"))
+        if intent_fingerprint is not None and intent_created_ns is not None:
+            day = utc_day_for_ns(intent_created_ns).isoformat()
+            self._store_set(
+                f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{intent_fingerprint}",
+                record.venue_order_id.encode("utf-8"),
+            )
 
     def fill_records_for(
         self,
@@ -4382,7 +4484,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 # AUD-13b (ruling R-1 = O4 (a)): stamp the theta of the
                 # instrument this order was priced and sent against.
-                self.record_fill(record, fill_time_instrument=instrument)
+                self.record_fill(
+                    record,
+                    fill_time_instrument=instrument,
+                    intent_fingerprint=intent.fingerprint,
+                    intent_created_ns=intent.created_ns,
+                )
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this
                 # guards ONE evidence write and ANY failure of it must halt
                 # trading rather than lose the event. Narrowing to the known

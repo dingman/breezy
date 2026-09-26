@@ -96,6 +96,7 @@ from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, Po
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     BUDGET_EXHAUSTED_KEY_PREFIX,
+    FILL_BY_FINGERPRINT_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
     RESOLVER_CONTEXT_KEY_PREFIX,
@@ -4940,3 +4941,164 @@ def test_resolver_terminal_statuses_is_derived_not_hand_copied() -> None:
         OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED,
     }
     assert OrderStatus.FILLED not in _RESOLVER_TERMINAL_STATUSES
+
+
+# ---------------------------------------------------------------------------
+# SP-3r: the real `_has_durable_fill_record` boot probe (plan r1 + r1.1)
+# ---------------------------------------------------------------------------
+
+
+def _sp3r_fill_record(
+    *, venue_order_id: str, instrument_id: str, ts_event: int,
+) -> DurableFillRecord:
+    return DurableFillRecord(
+        venue_order_id=venue_order_id,
+        client_order_id=f"O-{venue_order_id}",
+        instrument_id=instrument_id,
+        order_side="BUY",
+        cumulative_qty=Decimal(1),
+        cumulative_cost=Decimal("0.37"),
+        cumulative_fee=Decimal("0.02"),
+        fee_reconciled=True,
+        ts_event=ts_event,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_committed_fill_with_an_open_intent_is_retired_at_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """SP-3r AC1. Crash injection: `_retire` is monkeypatched to raise
+    exactly where the real create-path accept-fill branch calls it -- AFTER
+    `record_fill` (and, inside it, the day-scoped fingerprint index write)
+    has already committed. The OPEN singleton and the real fill/fingerprint
+    evidence both survive on disk; a brand-new client instance over the SAME
+    store (standing in for a process restart, the same idiom
+    `test_an_ambiguous_exit_send_leaves_the_durable_intent_open_across_a_restart`
+    uses) must retire it at `_connect` via the REAL probe -- not the old
+    always-``False`` stub -- with `STARTUP_FILL_RECORD_MATCH`."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id="ord-sp3r-crash"),
+    )
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated crash between record_fill and _retire")
+
+    monkeypatch.setattr(rig.client, "_retire", _boom)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await rig.client._submit_order(rig.limit_buy())
+        crashed = rig.submit_intent_latch.current()
+        assert crashed is not None
+        assert crashed.state is SubmitIntentState.OPEN, (
+            "the crash must leave the singleton OPEN, exactly like a real "
+            "process death between record_fill and _retire"
+        )
+        await rig.client._disconnect()
+    # Standing in for the process exiting: release the flock this rig's
+    # `open_submit_intent_latch` call holds, so a second client can open the
+    # SAME store, exactly like a restarted process would.
+    rig._latch_cm.__exit__(None, None, None)
+
+    fill_record = _reopened_fill_record(rig.store_path, "ord-sp3r-crash")
+    assert fill_record is not None, "record_fill's own write must have survived the crash"
+    with SqliteStateStore(rig.store_path) as reopened:
+        day = utc_day_for_ns(crashed.created_ns).isoformat()
+        index_raw = reopened.get(f"{FILL_BY_FINGERPRINT_KEY_PREFIX}{day}:{crashed.fingerprint}")
+    assert index_raw == b"ord-sp3r-crash"
+
+    restarted = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=_FakeOrderSender(),
+    )
+    await restarted.client._connect()
+    await restarted.client._disconnect()
+
+    result = restarted.submit_intent_latch.current()
+    assert result is not None
+    assert result.intent_id == crashed.intent_id
+    assert result.state is SubmitIntentState.RETIRED
+    assert result.retirement_reason is RetirementReason.STARTUP_FILL_RECORD_MATCH
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_false_with_no_fingerprint_index_entry(tmp_path: Path) -> None:
+    """SP-3r AC2. Nothing was ever written for this fingerprint -- absence,
+    never a synthesised match."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    assert rig.client._has_durable_fill_record("a" * 64, TS_INIT) is False
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_false_on_a_fingerprint_mismatch(tmp_path: Path) -> None:
+    """SP-3r AC2. An index entry exists for a DIFFERENT fingerprint on the
+    SAME day -- the probe must not match on the day alone. The genuine
+    fingerprint, probed identically, DOES match: proves the negative case
+    above is a real mismatch check, not a probe that always refuses."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    record = _sp3r_fill_record(
+        venue_order_id="V-SP3R-MISMATCH", instrument_id=str(rig.instrument.id), ts_event=TS_INIT,
+    )
+    rig.client.record_fill(record, intent_fingerprint="b" * 64, intent_created_ns=TS_INIT)
+
+    assert rig.client._has_durable_fill_record("c" * 64, TS_INIT) is False
+    assert rig.client._has_durable_fill_record("b" * 64, TS_INIT) is True
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_false_on_a_store_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SP-3r AC2. A store read failure must refuse, never raise out of the
+    probe and never be treated as a match."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    record = _sp3r_fill_record(
+        venue_order_id="V-SP3R-STOREERR", instrument_id=str(rig.instrument.id), ts_event=TS_INIT,
+    )
+    rig.client.record_fill(record, intent_fingerprint="d" * 64, intent_created_ns=TS_INIT)
+
+    def _boom(key: str) -> bytes | None:
+        raise OSError("simulated store read failure")
+
+    monkeypatch.setattr(rig.client, "_store_get", _boom)
+    assert rig.client._has_durable_fill_record("d" * 64, TS_INIT) is False
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_prior_day_fingerprint_index_does_not_match_a_new_days_probe(
+    tmp_path: Path,
+) -> None:
+    """Security review r1.1: day-scoping is defence in depth against
+    `client_order_id`/fingerprint reuse across UTC days. A fingerprint index
+    entry written under one UTC day must never satisfy a probe for the SAME
+    fingerprint carrying a NEW open intent's later `created_ns`."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    fingerprint = "e" * 64
+    stale_day_ns = TS_INIT
+    a_month_of_ns = 86_400 * 1_000_000_000 * 30
+    new_day_ns = TS_INIT + a_month_of_ns
+    record = _sp3r_fill_record(
+        venue_order_id="V-SP3R-STALEDAY",
+        instrument_id=str(rig.instrument.id),
+        ts_event=stale_day_ns,
+    )
+    rig.client.record_fill(record, intent_fingerprint=fingerprint, intent_created_ns=stale_day_ns)
+
+    assert rig.client._has_durable_fill_record(fingerprint, new_day_ns) is False
+    # Sanity: the stale day's own probe still matches its own entry -- the
+    # negative above is the day scope, not a fingerprint typo.
+    assert rig.client._has_durable_fill_record(fingerprint, stale_day_ns) is True
+    await rig.client._disconnect()
