@@ -82,7 +82,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -102,6 +102,15 @@ from breezy.persistence.catalog import (
     CatalogPathError,
     open_station_catalog,
     read_climate_day_including_corrections,
+)
+from breezy.persistence.external_capital_flows import (
+    STATUS_NOT_CONFIGURED,
+    ExternalFlowEvidence,
+    WindowFlows,
+    default_capital_flows_dir,
+    default_output_dir,
+    load_evidence,
+    window_flows,
 )
 from breezy.persistence.family_manifest import (
     FamilyManifest,
@@ -1410,6 +1419,13 @@ BALANCE_UNKNOWN_LABEL: Final[str] = "BALANCE_UNKNOWN"
 #: `n_no_prior_balance_days` (mirrors `n_balance_unknown_days`).
 NO_PRIOR_BALANCE_LABEL: Final[str] = "NO_PRIOR_BALANCE"
 
+#: FU-13b AC6: the net-of-external-flow classification labels. Distinct from
+#: the raw labels above -- a row's raw `classification` never changes; these
+#: are assigned separately to `net_classification` by :func:`_classify_net`.
+EXPLAINED_EXTERNAL_FLOW_LABEL: Final[str] = "EXPLAINED_EXTERNAL_FLOW"
+EXTERNAL_FLOW_MISMATCH_LABEL: Final[str] = "EXTERNAL_FLOW_MISMATCH"
+EXTERNAL_FLOW_UNVERIFIABLE_LABEL: Final[str] = "EXTERNAL_FLOW_UNVERIFIABLE"
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DailyUnexplained:
@@ -1456,6 +1472,15 @@ class DailyUnexplained:
     proceeds_date_proxy: str | None
     classification: str
     provisional: bool = False
+    #: FU-13b: net-of-external-flow fields, additive-only over the raw
+    #: identity above (AC3: the raw fields are never touched by these).
+    #: All three default to `None`/`False` -- BALANCE_UNKNOWN/NO_PRIOR_BALANCE
+    #: rows and any row with no external-flow evidence keep these defaults
+    #: (AC6 "pass through unchanged").
+    external_flow_window_covered: bool = False
+    external_flow_cents: int | None = None
+    unexplained_net: Decimal | None = None
+    net_classification: str | None = None
 
 
 def _days_between_inclusive(start_day: str, end_day: str) -> tuple[str, ...]:
@@ -1554,6 +1579,42 @@ def _proxy_lag_capacity_for_window(
     return capacity
 
 
+def _classify_net(
+    *,
+    raw_classification: str,
+    unexplained: Decimal | None,
+    tolerance: Decimal,
+    settlement_lag_days: int | None,
+    window: WindowFlows,
+    capacity_provider: Callable[[], Decimal | None],
+) -> tuple[str, Decimal | None, Decimal | None]:
+    """FU-13b AC6: the net-of-external-flow ladder, defined for EVERY raw
+    label. Returns ``(net_classification, unexplained_net,
+    external_flow_amount)`` -- ``external_flow_amount`` (dollars, signed) is
+    the window's own counted flow sum, or `None` when there is nothing to
+    report (BALANCE_UNKNOWN/NO_PRIOR_BALANCE, an uncovered window, or a
+    covered window with zero counted flows and no unverifiable record --
+    AC2/AC6: never EXPLAINED by inference).
+    """
+    if raw_classification in (BALANCE_UNKNOWN_LABEL, NO_PRIOR_BALANCE_LABEL):
+        return raw_classification, None, None
+    if not window.covered:
+        return raw_classification, None, None
+    if window.n_counted == 0 and not window.has_unverifiable:
+        return raw_classification, None, None
+    if window.has_unverifiable:
+        return EXTERNAL_FLOW_UNVERIFIABLE_LABEL, None, window.counted_sum
+    assert unexplained is not None  # narrowed: not BALANCE_UNKNOWN/NO_PRIOR_BALANCE above
+    unexplained_net = unexplained - window.counted_sum
+    if abs(unexplained_net) <= tolerance:
+        return EXPLAINED_EXTERNAL_FLOW_LABEL, unexplained_net, window.counted_sum
+    if settlement_lag_days is not None:
+        capacity = capacity_provider()
+        if capacity is None or capacity >= abs(unexplained_net) - tolerance:
+            return UNEXPLAINED_PROXY_LAG_LABEL, unexplained_net, window.counted_sum
+    return EXTERNAL_FLOW_MISMATCH_LABEL, unexplained_net, window.counted_sum
+
+
 def reconcile_daily(
     *,
     fills: Sequence[DurableFillRecord],
@@ -1562,8 +1623,15 @@ def reconcile_daily(
     balance_timestamps_ns: Mapping[str, int] | None = None,
     residual_settlements: Sequence[ResidualSettlement] = (),
     residual_pending: Sequence[ResidualPending] = (),
+    external_flows: ExternalFlowEvidence | None = None,
 ) -> tuple[DailyUnexplained, ...]:
     """The cash identity (§6 D4), one row per balance interval.
+
+    FU-13b: ``external_flows`` (default `None`, meaning "never configured" --
+    the same as passing a `NOT_CONFIGURED` evidence view) supplies AC5/AC6's
+    net-of-external-flow ladder for every window row via :func:`_classify_net`
+    -- never for a `BALANCE_UNKNOWN`/`NO_PRIOR_BALANCE` row, which passes
+    through unchanged (AC6).
 
     An interval is ``(previous AccountState ts, this AccountState ts]``.
     Capital is the BUY fills whose ``ts_event`` falls in that interval;
@@ -1613,6 +1681,19 @@ def reconcile_daily(
             for day in _days_between_inclusive(pending.release_day, end_day):
                 proxy_lag_days[day] = max(proxy_lag_days.get(day, 0), _RESIDUAL_PROXY_LAG_DAYS)
     buy_fills = tuple(fill for fill in fills if fill_side_label(fill) == ORDER_SIDE_BUY)
+    # FU-13b AC2: "never configured" reads identically to a `NOT_CONFIGURED`
+    # evidence view -- `window_flows` already treats that status as uncovered.
+    evidence = (
+        external_flows
+        if external_flows is not None
+        else ExternalFlowEvidence(
+            status=STATUS_NOT_CONFIGURED,
+            flows=(),
+            pulled_at_ns=None,
+            covered_from_ns=None,
+            newest_rejected_status=None,
+        )
+    )
 
     rows: list[DailyUnexplained] = []
     resolved_days: set[str] = set()
@@ -1656,6 +1737,32 @@ def reconcile_daily(
         else:
             classification = UNEXPLAINED_CAPITAL_FLOW_LABEL
         proceeds_date_proxy = PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
+        window_evidence_flows = window_flows(evidence, prev_ts, this_ts)
+
+        def _capacity_provider(
+            span_days: tuple[str, ...] = span_days,
+        ) -> Decimal | None:
+            return _proxy_lag_capacity_for_window(
+                span_days=frozenset(span_days),
+                scored_trials=scored_trials,
+                residual_settlements=residual_settlements,
+                residual_pending=residual_pending,
+                report_bound_day=report_bound_day,
+            )
+
+        net_classification, unexplained_net, external_flow_amount = _classify_net(
+            raw_classification=classification,
+            unexplained=unexplained,
+            tolerance=tolerance,
+            settlement_lag_days=lag,
+            window=window_evidence_flows,
+            capacity_provider=_capacity_provider,
+        )
+        external_flow_cents = (
+            None
+            if external_flow_amount is None
+            else int((external_flow_amount * 100).to_integral_value())
+        )
         rows.append(
             DailyUnexplained(
                 day=window.end_day,
@@ -1670,6 +1777,10 @@ def reconcile_daily(
                 settlement_lag_days=lag,
                 proceeds_date_proxy=proceeds_date_proxy,
                 classification=classification,
+                external_flow_window_covered=window_evidence_flows.covered,
+                external_flow_cents=external_flow_cents,
+                unexplained_net=unexplained_net,
+                net_classification=net_classification,
             )
         )
         resolved_days.update(span_days)
@@ -1714,6 +1825,7 @@ def reconcile_daily(
                         PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
                     ),
                     classification=NO_PRIOR_BALANCE_LABEL,
+                    net_classification=NO_PRIOR_BALANCE_LABEL,
                 )
             )
 
@@ -1746,6 +1858,7 @@ def reconcile_daily(
                     PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
                 ),
                 classification=BALANCE_UNKNOWN_LABEL,
+                net_classification=BALANCE_UNKNOWN_LABEL,
             )
         )
 
@@ -1848,6 +1961,26 @@ class CumulativeReconciliation:
     #: G1: count of `NO_PRIOR_BALANCE_LABEL` rows -- excluded from both
     #: cumulative sums above, dimensionless, never a gating figure.
     n_no_prior_balance_days: int
+    #: FU-13b: the net-of-external-flow settled/provisional sums and verdict.
+    #: A row with `unexplained_net is None` (never covered by evidence)
+    #: contributes its own raw `unexplained` instead -- fail-safe, never
+    #: silently zeroed. BALANCE_UNKNOWN/NO_PRIOR_BALANCE rows are excluded
+    #: from these sums exactly as they are from the raw ones above (both
+    #: draw from the same `settled_rows`/`provisional_rows` filter).
+    settled_cumulative_unexplained_net: Decimal
+    provisional_cumulative_unexplained_net: Decimal
+    settled_cumulative_passes_net: bool
+
+
+def _unexplained_net_or_raw(row: DailyUnexplained) -> Decimal:
+    """FU-13b: a row never covered by external-flow evidence contributes its
+    own raw `unexplained` to the net sum -- fail-safe, never silently
+    zeroed. Only called over `settled_rows`/`provisional_rows`, which are
+    already filtered to `row.unexplained is not None`."""
+    if row.unexplained_net is not None:
+        return row.unexplained_net
+    assert row.unexplained is not None
+    return row.unexplained
 
 
 def cumulative_reconciliation(
@@ -1878,6 +2011,12 @@ def cumulative_reconciliation(
         start=Decimal(0),
     )
     settled_tolerance = sum((row.tolerance for row in settled_rows), start=Decimal(0))
+    settled_cumulative_net = sum(
+        (_unexplained_net_or_raw(row) for row in settled_rows), start=Decimal(0)
+    )
+    provisional_cumulative_net = sum(
+        (_unexplained_net_or_raw(row) for row in provisional_rows), start=Decimal(0)
+    )
     n_balance_unknown_days = sum(
         1 for row in all_rows if row.classification == BALANCE_UNKNOWN_LABEL
     )
@@ -1894,6 +2033,9 @@ def cumulative_reconciliation(
         settled_cumulative_passes=abs(settled_cumulative) <= settled_tolerance,
         n_balance_unknown_days=n_balance_unknown_days,
         n_no_prior_balance_days=n_no_prior_balance_days,
+        settled_cumulative_unexplained_net=settled_cumulative_net,
+        provisional_cumulative_unexplained_net=provisional_cumulative_net,
+        settled_cumulative_passes_net=abs(settled_cumulative_net) <= settled_tolerance,
     )
 
 
@@ -2124,6 +2266,30 @@ def _require_bool(raw: Mapping[str, object], field: str) -> bool:
     return value
 
 
+def _optional_str(row: Mapping[str, object], field: str) -> str | None:
+    """FU-13b AC4: `field` absent -> `None` (D7 additive-only); present but
+    not a str raises, mirroring `_require_str`'s strictness."""
+    value = row.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} must be a str, got {type(value).__name__}"
+        )
+    return value
+
+
+def _optional_int(row: Mapping[str, object], field: str) -> int | None:
+    value = row.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} must be an int, got {type(value).__name__}"
+        )
+    return value
+
+
 def _require_daily_reconciliation_rows(
     raw: Mapping[str, object],
 ) -> tuple[DailyUnexplainedSummaryRow, ...]:
@@ -2153,6 +2319,49 @@ def _require_daily_reconciliation_rows(
                 classification=_require_str(row, "classification"),
                 magnitude_cents=_require_int(row, "magnitude_cents"),
                 provisional=_require_bool(row, "provisional"),
+            )
+        )
+    return tuple(parsed)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NetReconciliationRow:
+    """FU-13b: one day's net-of-external-flow verdict, keyed by `day` --
+    kept as a SIBLING of `daily_reconciliation` (never widening that
+    pre-existing, golden-tested row shape) so the raw D4 identity's own JSON
+    representation is untouched (AC3)."""
+
+    day: str
+    net_classification: str | None
+    external_flow_cents: int | None
+
+
+def _require_net_reconciliation_rows(
+    raw: Mapping[str, object],
+) -> tuple[NetReconciliationRow, ...]:
+    """FU-13b, additive/optional (AC4): absent on a report predating this
+    field reads as `()`; present-but-wrong-typed raises, mirroring
+    :func:`_require_daily_reconciliation_rows`."""
+    if "net_reconciliation" not in raw:
+        return ()
+    rows = raw.get("net_reconciliation")
+    if not isinstance(rows, list):
+        raise PortfolioRoiReportMalformedFieldError(
+            "portfolio ROI report field 'net_reconciliation' must be a list, got "
+            f"{type(rows).__name__}"
+        )
+    parsed: list[NetReconciliationRow] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise PortfolioRoiReportMalformedFieldError(
+                f"portfolio ROI report field 'net_reconciliation[{index}]' must be an "
+                f"object, got {type(row).__name__}"
+            )
+        parsed.append(
+            NetReconciliationRow(
+                day=_require_str(row, "day"),
+                net_classification=_optional_str(row, "net_classification"),
+                external_flow_cents=_optional_int(row, "external_flow_cents"),
             )
         )
     return tuple(parsed)
@@ -2244,6 +2453,17 @@ def _summary_row_of(row: DailyUnexplained) -> DailyUnexplainedSummaryRow:
         classification=row.classification,
         magnitude_cents=magnitude_cents,
         provisional=row.provisional,
+    )
+
+
+def _net_reconciliation_row_of(row: DailyUnexplained) -> NetReconciliationRow:
+    """FU-13b: the SIBLING per-day net verdict (see
+    :class:`NetReconciliationRow`'s own docstring for why this is not folded
+    into :func:`_summary_row_of`'s pre-existing, golden-tested shape)."""
+    return NetReconciliationRow(
+        day=row.day,
+        net_classification=row.net_classification,
+        external_flow_cents=row.external_flow_cents,
     )
 
 
@@ -2375,6 +2595,24 @@ class PortfolioRoiReportData:
     # trials -- `build_portfolio_roi_report_data` always populates this from
     # its own `scored_trials` argument.
     trial_rows: tuple[PortfolioRoiTrialRow, ...] = ()
+    # -- FU-13b: net-of-external-flow reconciliation (v3-additive, no schema
+    # bump -- see the module's D7 versioning note above). Always emitted
+    # (AC2): `NOT_CONFIGURED` is the honest default for a report predating
+    # this feature or run with no puller configured.
+    external_flow_evidence_status: str = STATUS_NOT_CONFIGURED
+    external_flow_pulled_at_ns: int | None = None
+    external_flow_newest_rejected_status: str | None = None
+    n_external_flow_records: int = 0
+    n_windows_not_covered: int = 0
+    n_explained_external_flow_days: int = 0
+    n_external_flow_mismatch_days: int = 0
+    n_external_flow_unverifiable_days: int = 0
+    settled_cumulative_unexplained_net: Decimal = Decimal(0)
+    provisional_cumulative_unexplained_net: Decimal = Decimal(0)
+    settled_cumulative_passes_net: bool = True
+    #: The per-day net verdict, keyed by `day` -- a SIBLING of
+    #: `daily_reconciliation` (see `NetReconciliationRow`'s docstring).
+    net_reconciliation: tuple[NetReconciliationRow, ...] = ()
 
 
 def power_caveat(*, n_ledger_fills: int, n_scored: int, days: int) -> str:
@@ -2414,6 +2652,10 @@ def build_portfolio_roi_report_data(
     realised_pnl_residual_total: Decimal = Decimal(0),
     scored_trials: Iterable[ScoredTrial] = (),
     registered_manifests: Sequence[FamilyManifest] = (),
+    external_flow_evidence_status: str = STATUS_NOT_CONFIGURED,
+    external_flow_pulled_at_ns: int | None = None,
+    external_flow_newest_rejected_status: str | None = None,
+    n_external_flow_records: int = 0,
 ) -> PortfolioRoiReportData:
     """Assemble the one :class:`PortfolioRoiReportData` this run produces.
 
@@ -2435,6 +2677,27 @@ def build_portfolio_roi_report_data(
     )
     n_unexplained_proxy_lag_days = sum(
         1 for row in non_provisional_rows if row.classification == UNEXPLAINED_PROXY_LAG_LABEL
+    )
+    # -- FU-13b: aggregated over the SAME `non_provisional_rows` the two
+    # counts above already use; BALANCE_UNKNOWN/NO_PRIOR_BALANCE rows are
+    # never "windows" for this purpose (their `external_flow_window_covered`
+    # default of `False` would otherwise wrongly count them as uncovered).
+    n_windows_not_covered = sum(
+        1
+        for row in non_provisional_rows
+        if row.classification not in (BALANCE_UNKNOWN_LABEL, NO_PRIOR_BALANCE_LABEL)
+        and not row.external_flow_window_covered
+    )
+    n_explained_external_flow_days = sum(
+        1 for row in non_provisional_rows if row.net_classification == EXPLAINED_EXTERNAL_FLOW_LABEL
+    )
+    n_external_flow_mismatch_days = sum(
+        1 for row in non_provisional_rows if row.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+    )
+    n_external_flow_unverifiable_days = sum(
+        1
+        for row in non_provisional_rows
+        if row.net_classification == EXTERNAL_FLOW_UNVERIFIABLE_LABEL
     )
     return PortfolioRoiReportData(
         period_start=period_start,
@@ -2465,6 +2728,9 @@ def build_portfolio_roi_report_data(
         provisional_cumulative_unexplained=cumulative.provisional_cumulative_unexplained,
         settled_cumulative_passes=cumulative.settled_cumulative_passes,
         daily_reconciliation=tuple(_summary_row_of(row) for row in cumulative.all_rows),
+        net_reconciliation=tuple(
+            _net_reconciliation_row_of(row) for row in cumulative.all_rows
+        ),
         n_unexplained_capital_flow_days=n_unexplained_capital_flow_days,
         n_unexplained_proxy_lag_days=n_unexplained_proxy_lag_days,
         n_balance_unknown_days=cumulative.n_balance_unknown_days,
@@ -2479,6 +2745,17 @@ def build_portfolio_roi_report_data(
         realised_pnl_residual_total=realised_pnl_residual_total,
         realised_pnl_portfolio_total=total_realised_pnl + realised_pnl_residual_total,
         trial_rows=trial_rows_of(scored_trials, registered_manifests=registered_manifests),
+        external_flow_evidence_status=external_flow_evidence_status,
+        external_flow_pulled_at_ns=external_flow_pulled_at_ns,
+        external_flow_newest_rejected_status=external_flow_newest_rejected_status,
+        n_external_flow_records=n_external_flow_records,
+        n_windows_not_covered=n_windows_not_covered,
+        n_explained_external_flow_days=n_explained_external_flow_days,
+        n_external_flow_mismatch_days=n_external_flow_mismatch_days,
+        n_external_flow_unverifiable_days=n_external_flow_unverifiable_days,
+        settled_cumulative_unexplained_net=cumulative.settled_cumulative_unexplained_net,
+        provisional_cumulative_unexplained_net=cumulative.provisional_cumulative_unexplained_net,
+        settled_cumulative_passes_net=cumulative.settled_cumulative_passes_net,
     )
 
 
@@ -2514,6 +2791,10 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "settled_cumulative_unexplained": str(data.settled_cumulative_unexplained),
         "provisional_cumulative_unexplained": str(data.provisional_cumulative_unexplained),
         "settled_cumulative_passes": data.settled_cumulative_passes,
+        # AC3 (golden): the pre-existing `daily_reconciliation` row shape is
+        # NEVER widened -- an existing exact-equality golden test pins it to
+        # exactly these four keys. FU-13b's per-row net fields live in the
+        # SIBLING `net_reconciliation` array below instead.
         "daily_reconciliation": [
             {
                 "day": row.day,
@@ -2522,6 +2803,14 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
                 "provisional": row.provisional,
             }
             for row in data.daily_reconciliation
+        ],
+        "net_reconciliation": [
+            {
+                "day": row.day,
+                "net_classification": row.net_classification,
+                "external_flow_cents": row.external_flow_cents,
+            }
+            for row in data.net_reconciliation
         ],
         "n_unexplained_capital_flow_days": data.n_unexplained_capital_flow_days,
         "n_unexplained_proxy_lag_days": data.n_unexplained_proxy_lag_days,
@@ -2545,6 +2834,19 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
             }
             for row in data.trial_rows
         ],
+        "external_flow_evidence_status": data.external_flow_evidence_status,
+        "external_flow_pulled_at_ns": data.external_flow_pulled_at_ns,
+        "external_flow_newest_rejected_status": data.external_flow_newest_rejected_status,
+        "n_external_flow_records": data.n_external_flow_records,
+        "n_windows_not_covered": data.n_windows_not_covered,
+        "n_explained_external_flow_days": data.n_explained_external_flow_days,
+        "n_external_flow_mismatch_days": data.n_external_flow_mismatch_days,
+        "n_external_flow_unverifiable_days": data.n_external_flow_unverifiable_days,
+        "settled_cumulative_unexplained_net": str(data.settled_cumulative_unexplained_net),
+        "provisional_cumulative_unexplained_net": str(
+            data.provisional_cumulative_unexplained_net
+        ),
+        "settled_cumulative_passes_net": data.settled_cumulative_passes_net,
     }
 
 
@@ -2617,6 +2919,20 @@ class PortfolioRoiReportView:
     #: genuinely settled zero trials this run" (see the module docstring's
     #: "Stage C3 adds" paragraph).
     trial_rows: tuple[PortfolioRoiTrialRow, ...] | None
+    #: FU-13b: always present on a report written by this module (default
+    #: `NOT_CONFIGURED` for a report predating the field -- honestly true).
+    external_flow_evidence_status: str
+    external_flow_pulled_at_ns: int | None
+    external_flow_newest_rejected_status: str | None
+    n_external_flow_records: int
+    n_windows_not_covered: int
+    n_explained_external_flow_days: int
+    n_external_flow_mismatch_days: int
+    n_external_flow_unverifiable_days: int
+    settled_cumulative_unexplained_net: Decimal
+    provisional_cumulative_unexplained_net: Decimal
+    settled_cumulative_passes_net: bool
+    net_reconciliation: tuple[NetReconciliationRow, ...]
     _roi: Decimal
     _roi_minus_b0: Decimal
     _roi_minus_b1: Decimal
@@ -2780,6 +3096,57 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
             if version >= _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS
             else None
         ),
+        # -- FU-13b: additive-only; absent means "predates the field",
+        # honestly reported as NOT_CONFIGURED (an old report ran with no
+        # puller either).
+        external_flow_evidence_status=(
+            _require_str(raw, "external_flow_evidence_status")
+            if "external_flow_evidence_status" in raw
+            else STATUS_NOT_CONFIGURED
+        ),
+        external_flow_pulled_at_ns=_optional_int(raw, "external_flow_pulled_at_ns"),
+        external_flow_newest_rejected_status=_optional_str(
+            raw, "external_flow_newest_rejected_status"
+        ),
+        n_external_flow_records=(
+            _require_int(raw, "n_external_flow_records")
+            if "n_external_flow_records" in raw
+            else 0
+        ),
+        n_windows_not_covered=(
+            _require_int(raw, "n_windows_not_covered") if "n_windows_not_covered" in raw else 0
+        ),
+        n_explained_external_flow_days=(
+            _require_int(raw, "n_explained_external_flow_days")
+            if "n_explained_external_flow_days" in raw
+            else 0
+        ),
+        n_external_flow_mismatch_days=(
+            _require_int(raw, "n_external_flow_mismatch_days")
+            if "n_external_flow_mismatch_days" in raw
+            else 0
+        ),
+        n_external_flow_unverifiable_days=(
+            _require_int(raw, "n_external_flow_unverifiable_days")
+            if "n_external_flow_unverifiable_days" in raw
+            else 0
+        ),
+        settled_cumulative_unexplained_net=(
+            _require_decimal_str(raw, "settled_cumulative_unexplained_net")
+            if "settled_cumulative_unexplained_net" in raw
+            else Decimal(0)
+        ),
+        provisional_cumulative_unexplained_net=(
+            _require_decimal_str(raw, "provisional_cumulative_unexplained_net")
+            if "provisional_cumulative_unexplained_net" in raw
+            else Decimal(0)
+        ),
+        settled_cumulative_passes_net=(
+            _require_bool(raw, "settled_cumulative_passes_net")
+            if "settled_cumulative_passes_net" in raw
+            else True
+        ),
+        net_reconciliation=_require_net_reconciliation_rows(raw),
         _roi=_require_decimal_str(raw, "roi"),
         _roi_minus_b0=_require_decimal_str(raw, "roi_minus_b0"),
         _roi_minus_b1=_require_decimal_str(raw, "roi_minus_b1"),
@@ -2909,6 +3276,34 @@ def render_markdown_report(
             "gated for every downstream consumer via `read_portfolio_roi_report()`. "
             "Its capital stays in capital_deployed_total (never dropped)."
         )
+    # -- FU-13b: APPENDED at the end, after every pre-existing line above --
+    # never inserted earlier and never altering an existing line (AC12).
+    lines.extend(
+        [
+            "",
+            "## External capital flows (FU-13b, net-of-flow reconciliation)",
+            f"- external_flow_evidence_status: {data.external_flow_evidence_status}",
+            (
+                "- external_flow_newest_rejected_status: "
+                f"{data.external_flow_newest_rejected_status}"
+            ),
+            f"- n_external_flow_records: {data.n_external_flow_records}",
+            f"- n_windows_not_covered: {data.n_windows_not_covered}",
+            f"- n_explained_external_flow_days: {data.n_explained_external_flow_days}",
+            f"- n_external_flow_mismatch_days: {data.n_external_flow_mismatch_days}",
+            f"- n_external_flow_unverifiable_days: {data.n_external_flow_unverifiable_days}",
+            f"- settled_cumulative_unexplained_net: {data.settled_cumulative_unexplained_net}",
+            f"- settled_cumulative_passes_net: {data.settled_cumulative_passes_net}",
+            "",
+            "### Per-day net classification",
+            *(
+                f"{row.net_classification} day={row.day} "
+                f"external_flow_cents={row.external_flow_cents}"
+                for row in data.net_reconciliation
+                if row.net_classification is not None
+            ),
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -2949,7 +3344,15 @@ def journal_line(data: PortfolioRoiReportData) -> str:
         f"n_family_station_refusals={data.n_family_station_refusals} "
         f"n_residual_settlements={data.n_residual_settlements} "
         f"n_residual_pending={data.n_residual_pending} "
-        f"n_residual_unresolved={data.n_residual_unresolved}"
+        f"n_residual_unresolved={data.n_residual_unresolved} "
+        # -- FU-13b: appended tokens, dimensionless only (AC9: never trips
+        # the currency-withhold regex at deploy/systemd/portfolio-roi-run.sh:114).
+        f"external_flow_evidence_status={data.external_flow_evidence_status} "
+        f"n_windows_not_covered={data.n_windows_not_covered} "
+        f"n_explained_external_flow_days={data.n_explained_external_flow_days} "
+        f"n_external_flow_mismatch_days={data.n_external_flow_mismatch_days} "
+        f"n_external_flow_unverifiable_days={data.n_external_flow_unverifiable_days} "
+        f"settled_reconciliation_passes_net={data.settled_cumulative_passes_net}"
     )
 
 
@@ -3142,10 +3545,11 @@ def _default_logs_dir() -> Path:
 
 
 def _default_output_dir() -> Path:
-    override = os.environ.get("BREEZY_LIVE_TALLY_OUTPUT_DIR", "").strip()
-    if override:
-        return Path(override)
-    return Path.home() / ".local" / "share" / "breezy" / "derived"
+    """Delegates to the single persistence rule -- see
+    ``breezy.persistence.external_capital_flows.default_output_dir`` (FU-13b
+    review HIGH finding: this used to be a byte-identical copy of that
+    function's env-or-default rule)."""
+    return default_output_dir()
 
 
 def _default_families_dir() -> Path:
@@ -3477,6 +3881,7 @@ def _run(
     now_ns: int,
     sink: AlertSink,
     catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
+    capital_flows_dir: Path | None = None,
 ) -> int:
     """The I/O shell's actual work, factored out of `main()` as an explicit
     test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
@@ -3686,6 +4091,10 @@ def _run(
             fills=fills,
         )
 
+        # FU-13b: read-only, evidenced net-of-external-flow input. `None`
+        # dir (the pre-FU-13b/no-puller-configured case) reads as
+        # NOT_CONFIGURED (AC2) -- never inferred, never venue-called here.
+        external_flow_evidence = load_evidence(capital_flows_dir)
         daily_rows = reconcile_daily(
             fills=fills,
             scored_trials=scored_trials,
@@ -3693,6 +4102,7 @@ def _run(
             balance_timestamps_ns=balance_timestamps_ns,
             residual_settlements=residual_settlements,
             residual_pending=residual_pending,
+            external_flows=external_flow_evidence,
         )
         # G1: a successful look-back above adds a day BEFORE `period_start`
         # into `daily_balances` purely as a window anchor -- it is never
@@ -3753,6 +4163,10 @@ def _run(
         realised_pnl_residual_total=residual_pnl,
         scored_trials=scored_trials,
         registered_manifests=registered_manifests,
+        external_flow_evidence_status=external_flow_evidence.status,
+        external_flow_pulled_at_ns=external_flow_evidence.pulled_at_ns,
+        external_flow_newest_rejected_status=external_flow_evidence.newest_rejected_status,
+        n_external_flow_records=len(external_flow_evidence.flows),
     )
 
     # F7/F9: atomic writes -- the directory is created by
@@ -3821,6 +4235,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         now_ns=time.time_ns(),
         sink=resolve_alert_sink(os.environ),
         catalog_base=_default_catalog_base(),
+        # FU-13b: same `default_output_dir()` root the wrapper argv never
+        # changes -- the puller (stage S2) writes snapshots to this same
+        # subdirectory.
+        capital_flows_dir=default_capital_flows_dir(),
     )
 
 

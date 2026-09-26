@@ -168,6 +168,20 @@ _fee_unverified_fills_deduped = _prr._fee_unverified_fills_deduped
 _portfolio_roi_json_dict = _prr._portfolio_roi_json_dict
 _AMBIGUOUS_FEE_WINDOW_NS = 1_789_620_000_000_000_000  # inside [START, END) -- fees.py:121-122
 
+# -- FU-13b additions (net-of-external-flow reconciliation) --
+from breezy.persistence.external_capital_flows import (
+    STATUS_NOT_CONFIGURED,
+    STATUS_OK,
+    ExternalCapitalFlow,
+    ExternalFlowEvidence,
+    load_evidence,
+    write_snapshot,
+)
+
+EXPLAINED_EXTERNAL_FLOW_LABEL = _prr.EXPLAINED_EXTERNAL_FLOW_LABEL
+EXTERNAL_FLOW_MISMATCH_LABEL = _prr.EXTERNAL_FLOW_MISMATCH_LABEL
+EXTERNAL_FLOW_UNVERIFIABLE_LABEL = _prr.EXTERNAL_FLOW_UNVERIFIABLE_LABEL
+
 from breezy.runtime import alert_ladder as _ladder
 
 alert_ladder = _ladder
@@ -883,6 +897,75 @@ def _ns_of_day(day: str) -> int:
     """Midnight UTC of an ISO calendar-day string, in epoch nanoseconds."""
     dt = datetime.combine(date.fromisoformat(day), datetime.min.time(), tzinfo=UTC)
     return int(dt.timestamp() * 1_000_000_000)
+
+
+# -- FU-13b test helpers --
+
+
+def _flow(
+    *,
+    kind: str = "ACCOUNT_ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    signed_amount: Decimal | None = Decimal(10),
+    currency: str | None = "USD",
+    status: str | None = "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+    create_ts_ns: int | None = None,
+    parse_status: str = "OK",
+    failed: bool = False,
+    sha256: str = "a" * 64,
+) -> ExternalCapitalFlow:
+    return ExternalCapitalFlow(
+        kind=kind,
+        signed_amount=signed_amount,
+        currency=currency,
+        status=status,
+        create_ts_ns=create_ts_ns,
+        update_ts_ns=None,
+        transaction_id_sha256=sha256,
+        sign_basis="literal",
+        parse_status=parse_status,
+        failed=failed,
+    )
+
+
+def _evidence(
+    flows: tuple[ExternalCapitalFlow, ...],
+    *,
+    status: str = STATUS_OK,
+    pulled_at_ns: int,
+    covered_from_ns: int,
+    newest_rejected_status: str | None = None,
+) -> ExternalFlowEvidence:
+    return ExternalFlowEvidence(
+        status=status,
+        flows=flows,
+        pulled_at_ns=pulled_at_ns,
+        covered_from_ns=covered_from_ns,
+        newest_rejected_status=newest_rejected_status,
+    )
+
+
+def _fu13b_0913_fixture() -> tuple[dict[str, Decimal], tuple[ResidualSettlement, ...]]:
+    """The 09-13-shaped PROXY_LAG raw row (AC1, FU-3/FU-13b): a $45 residual
+    settlement dated 2026-09-12 gives 2026-09-13 a `settlement_lag_days`
+    overlap and a $45 proxy-lag payout capacity (via the SAME
+    `_shift_iso_day(release_day, 1)` mechanism `_proxy_lag_capacity_for_window`
+    already uses for a residual), while the balance series shows a cleanly
+    reconciled 2026-09-12 and a genuinely unexplained +$40.00 on 2026-09-13
+    with zero fills that day (tolerance $0.00)."""
+    settlement = ResidualSettlement(
+        trial_id="fam/trial/LAX/2026-09-12",
+        climate_day="2026-09-12",
+        payout=Decimal("45.00"),
+        dated_at_ns=_ns_of_day("2026-09-12"),
+        settlement_basis="nws_final",
+        realised_pnl=Decimal("30.00"),
+    )
+    daily_balances = {
+        "2026-09-11": Decimal("100.00"),
+        "2026-09-12": Decimal("145.00"),  # the $45 residual payout, cleanly explained
+        "2026-09-13": Decimal("185.00"),  # +$40.00 genuinely unexplained on top
+    }
+    return daily_balances, (settlement,)
 
 
 def _filled_trial(
@@ -4552,3 +4635,747 @@ class TestResidualPnlAndD9:
         assert Decimal(report["roi"]) == roi(
             total_realised_pnl=Decimal("0.57"), total_capital_deployed=Decimal("0.43")
         )
+
+
+# --------------------------------------------------------------------------
+# FU-13b: net-of-external-flow reconciliation (v3-additive)
+# --------------------------------------------------------------------------
+
+
+class TestFu13bNetOfExternalFlowReconciliation:
+    def test_fu13b_0913_proxy_lag_row_explained_with_evidence(self) -> None:
+        """AC1: a covered snapshot with REFERRAL_BONUS +25, TRANSFER +5 and
+        ACCOUNT_DEPOSIT +10 (summing to exactly the $40.00 breach) explains
+        the 09-13 window at zero tolerance, while the raw label/verdict is
+        untouched."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        flows = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                signed_amount=Decimal(25),
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+                sha256="a" * 64,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                signed_amount=Decimal(5),
+                create_ts_ns=_ns_of_day("2026-09-13") + 2,
+                sha256="b" * 64,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+                signed_amount=Decimal(10),
+                create_ts_ns=_ns_of_day("2026-09-13") + 3,
+                sha256="c" * 64,
+            ),
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-14"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        row = next(r for r in rows if r.day == "2026-09-13")
+
+        assert row.classification == UNEXPLAINED_PROXY_LAG_LABEL  # raw label untouched
+        assert row.unexplained == Decimal("40.00")
+        assert row.tolerance == Decimal("0.00")
+        assert row.net_classification == EXPLAINED_EXTERNAL_FLOW_LABEL
+        assert row.unexplained_net == Decimal("0.00")
+        assert row.external_flow_cents == 4000
+
+        cumulative = cumulative_reconciliation(daily_rows=rows, settled_through="2026-09-13")
+        assert cumulative.settled_cumulative_passes_net is True
+
+    def test_fu13b_0913_keeps_raw_label_without_snapshot(self) -> None:
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=None,
+        )
+        row = next(r for r in rows if r.day == "2026-09-13")
+
+        assert row.net_classification == UNEXPLAINED_PROXY_LAG_LABEL
+        assert row.unexplained_net is None
+        assert row.external_flow_cents is None
+
+    def test_fu13b_0913_keeps_raw_label_not_configured(self) -> None:
+        """AC2, via the SAME public `load_evidence` a real run calls -- `None`
+        directory reads as NOT_CONFIGURED, never inferred."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        evidence = load_evidence(None)
+        assert evidence.status == STATUS_NOT_CONFIGURED
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        row = next(r for r in rows if r.day == "2026-09-13")
+
+        assert row.net_classification == UNEXPLAINED_PROXY_LAG_LABEL
+        assert row.unexplained_net is None
+
+    def test_fu13b_0913_stale_snapshot_not_covered(self) -> None:
+        """AC2: a snapshot pulled BEFORE the window closes never explains
+        it, however many matching flows it holds."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        flows = (
+            _flow(signed_amount=Decimal(40), create_ts_ns=_ns_of_day("2026-09-13") + 1),
+        )
+        # `pulled_at_ns` is BEFORE the 09-13 window closes -- stale.
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-12"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        row = next(r for r in rows if r.day == "2026-09-13")
+
+        assert row.external_flow_window_covered is False
+        assert row.net_classification == UNEXPLAINED_PROXY_LAG_LABEL
+        assert row.unexplained_net is None
+        assert row.external_flow_cents is None
+
+    def test_fu13b_0913_missing_one_flow_mismatch(self) -> None:
+        """AC2/AC6: a raw `UNEXPLAINED_CAPITAL_FLOW` (no proxy-lag capacity
+        available) with only a PARTIAL flow set covering the breach is
+        never EXPLAINED, and -- with no lag to fall back on -- becomes
+        EXTERNAL_FLOW_MISMATCH rather than silently keeping the raw label."""
+        daily_balances = {
+            "2026-09-11": Decimal("100.00"),
+            "2026-09-12": Decimal("100.00"),
+            "2026-09-13": Decimal("140.00"),  # +$40, no lag-eligible event anywhere
+        }
+        flows = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                signed_amount=Decimal(25),
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                signed_amount=Decimal(5),
+                create_ts_ns=_ns_of_day("2026-09-13") + 2,
+            ),
+            # The $10 ACCOUNT_DEPOSIT is simply missing from this snapshot.
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-14"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[], scored_trials=[], daily_balances=daily_balances, external_flows=evidence
+        )
+        row = next(r for r in rows if r.day == "2026-09-13")
+
+        assert row.classification == UNEXPLAINED_CAPITAL_FLOW_LABEL
+        assert row.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+        assert row.unexplained_net == Decimal("10.00")
+        assert row.external_flow_cents == 3000
+
+    def test_fu13b_0913_unknown_status_unverifiable(self) -> None:
+        """AC5/AC6: a record whose status is outside {COMPLETED, PENDING}
+        makes its window EXTERNAL_FLOW_UNVERIFIABLE -- never silently
+        excluded and never EXPLAINED by the remaining flows alone."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        flows = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                signed_amount=Decimal(25),
+                status="ACCOUNT_BALANCE_CHANGE_STATUS_CANCELLED",
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                signed_amount=Decimal(5),
+                create_ts_ns=_ns_of_day("2026-09-13") + 2,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+                signed_amount=Decimal(10),
+                create_ts_ns=_ns_of_day("2026-09-13") + 3,
+            ),
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-14"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        row = next(r for r in rows if r.day == "2026-09-13")
+
+        assert row.net_classification == EXTERNAL_FLOW_UNVERIFIABLE_LABEL
+        assert row.unexplained_net is None
+
+    def test_fu13b_proxy_lag_window_with_flow_reruns_ladder_on_net(self) -> None:
+        """AC6: the ladder re-runs on `unexplained_net`, not the raw
+        `unexplained` -- a counted flow that makes the NET breach worse
+        (here, a withdrawal with the opposite sign) can push it past the
+        SAME $45 proxy-lag capacity that covered the raw $40 breach,
+        flipping PROXY_LAG to MISMATCH."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+
+        # Sub-case A: net stays within the $45 capacity -> still PROXY_LAG.
+        flows_within = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_WITHDRAWAL",
+                signed_amount=Decimal(-3),
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+        )
+        evidence_within = _evidence(
+            flows_within,
+            pulled_at_ns=_ns_of_day("2026-09-14"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+        rows_within = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence_within,
+        )
+        row_within = next(r for r in rows_within if r.day == "2026-09-13")
+        assert row_within.unexplained_net == Decimal("43.00")  # 40 - (-3)
+        assert row_within.net_classification == UNEXPLAINED_PROXY_LAG_LABEL
+
+        # Sub-case B: net exceeds the $45 capacity -> MISMATCH.
+        flows_beyond = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_WITHDRAWAL",
+                signed_amount=Decimal(-10),
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+        )
+        evidence_beyond = _evidence(
+            flows_beyond,
+            pulled_at_ns=_ns_of_day("2026-09-14"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+        rows_beyond = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence_beyond,
+        )
+        row_beyond = next(r for r in rows_beyond if r.day == "2026-09-13")
+        assert row_beyond.unexplained_net == Decimal("50.00")  # 40 - (-10)
+        assert row_beyond.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+
+    def test_fu13b_ok_window_with_flow_is_mismatch(self) -> None:
+        """AC6: 'A raw-OK window that contains a counted flow and has
+        |net| > tol is MISMATCH, never OK.'"""
+        daily_balances = {
+            "2026-01-01": Decimal("100.00"),
+            "2026-01-02": Decimal("100.00"),  # no genuine movement -- raw OK
+        }
+        flows = (
+            _flow(signed_amount=Decimal(5), create_ts_ns=_ns_of_day("2026-01-02") + 1),
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-01-03"), covered_from_ns=_ns_of_day("2025-12-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[], scored_trials=[], daily_balances=daily_balances, external_flows=evidence
+        )
+        row = next(r for r in rows if r.day == "2026-01-02")
+
+        assert row.classification == UNEXPLAINED_OK_LABEL
+        assert row.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+        assert row.unexplained_net == Decimal("-5.00")
+
+    def test_advanced_deposit_reversal_unexplains_the_earlier_window(self) -> None:
+        """AC7: every window is recomputed from the NEWEST valid snapshot on
+        each run -- a later failure marker on one of the 09-13 flows flips
+        the verdict from EXPLAINED to MISMATCH, exactly the
+        `|40 - 30| > 0` arithmetic AC7 names. Uses a raw
+        `UNEXPLAINED_CAPITAL_FLOW` (no lag-eligible event, hence no
+        proxy-lag capacity to fall back on) so the post-reversal net breach
+        cannot be relabelled PROXY_LAG."""
+        daily_balances = {
+            "2026-09-11": Decimal("100.00"),
+            "2026-09-12": Decimal("100.00"),
+            "2026-09-13": Decimal("140.00"),
+        }
+
+        def _flows(*, deposit_failed: bool) -> tuple[ExternalCapitalFlow, ...]:
+            return (
+                _flow(
+                    kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                    signed_amount=Decimal(25),
+                    create_ts_ns=_ns_of_day("2026-09-13") + 1,
+                ),
+                _flow(
+                    kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                    signed_amount=Decimal(5),
+                    create_ts_ns=_ns_of_day("2026-09-13") + 2,
+                ),
+                _flow(
+                    kind="ACCOUNT_ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+                    signed_amount=Decimal(10),
+                    create_ts_ns=_ns_of_day("2026-09-13") + 3,
+                    failed=deposit_failed,
+                ),
+            )
+
+        evidence_before = _evidence(
+            _flows(deposit_failed=False),
+            pulled_at_ns=_ns_of_day("2026-09-14"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+        rows_before = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            external_flows=evidence_before,
+        )
+        row_before = next(r for r in rows_before if r.day == "2026-09-13")
+        assert row_before.net_classification == EXPLAINED_EXTERNAL_FLOW_LABEL
+
+        # A later run's newest snapshot now carries a failure marker on the
+        # SAME deposit -- every window is recomputed from scratch.
+        evidence_after = _evidence(
+            _flows(deposit_failed=True),
+            pulled_at_ns=_ns_of_day("2026-09-15"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+        rows_after = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            external_flows=evidence_after,
+        )
+        row_after = next(r for r in rows_after if r.day == "2026-09-13")
+        assert row_after.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+        assert row_after.unexplained_net == Decimal("10.00")
+
+    def test_reversal_window_is_unverifiable_not_dropped(self) -> None:
+        """AC7: an unrecognised reversal activity type makes its OWN window
+        UNVERIFIABLE, and the row is never dropped from the output."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        flows = (
+            _flow(
+                kind="UNRECOGNISED",
+                signed_amount=None,
+                currency=None,
+                status=None,
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-14"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        days = [r.day for r in rows]
+        assert "2026-09-13" in days  # never dropped
+        row = next(r for r in rows if r.day == "2026-09-13")
+        assert row.net_classification == EXTERNAL_FLOW_UNVERIFIABLE_LABEL
+
+    def test_fu13b_raw_fields_byte_identical_with_and_without_evidence(self) -> None:
+        """AC3 golden: every pre-existing field this identity/report already
+        carried is untouched by evidence being present or absent."""
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        evidence = _evidence(
+            (
+                _flow(signed_amount=Decimal(40), create_ts_ns=_ns_of_day("2026-09-13") + 1),
+            ),
+            pulled_at_ns=_ns_of_day("2026-09-14"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+
+        rows_without = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=None,
+        )
+        rows_with = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        by_day_without = {r.day: r for r in rows_without}
+        by_day_with = {r.day: r for r in rows_with}
+        assert set(by_day_without) == set(by_day_with)
+        for day, raw_row in by_day_without.items():
+            evidenced_row = by_day_with[day]
+            assert evidenced_row.unexplained == raw_row.unexplained
+            assert evidenced_row.classification == raw_row.classification
+            assert evidenced_row.capital_deployed == raw_row.capital_deployed
+            assert evidenced_row.proceeds == raw_row.proceeds
+            assert evidenced_row.breaches_tolerance == raw_row.breaches_tolerance
+            assert evidenced_row.tolerance == raw_row.tolerance
+
+        cumulative_without = cumulative_reconciliation(
+            daily_rows=rows_without, settled_through="2026-09-13"
+        )
+        cumulative_with = cumulative_reconciliation(
+            daily_rows=rows_with, settled_through="2026-09-13"
+        )
+        assert (
+            cumulative_without.settled_cumulative_unexplained
+            == cumulative_with.settled_cumulative_unexplained
+        )
+        assert (
+            cumulative_without.settled_cumulative_passes
+            == cumulative_with.settled_cumulative_passes
+        )
+
+        baselines = roi_against_baselines(
+            total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), fills=[]
+        )
+        data_without = build_portfolio_roi_report_data(
+            period_start="2026-09-11", period_end="2026-09-13", fill_buckets={},
+            total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), baselines=baselines,
+            cumulative=cumulative_without, settled_through_statistic="max", lag_sample_n=0,
+            permanently_unsettled=(),
+        )
+        data_with = build_portfolio_roi_report_data(
+            period_start="2026-09-11", period_end="2026-09-13", fill_buckets={},
+            total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), baselines=baselines,
+            cumulative=cumulative_with, settled_through_statistic="max", lag_sample_n=0,
+            permanently_unsettled=(),
+            external_flow_evidence_status=evidence.status,
+            external_flow_pulled_at_ns=evidence.pulled_at_ns,
+            n_external_flow_records=len(evidence.flows),
+        )
+        json_without = _portfolio_roi_json_dict(data_without)
+        json_with = _portfolio_roi_json_dict(data_with)
+        fu13b_keys = {
+            "external_flow_evidence_status",
+            "external_flow_pulled_at_ns",
+            "external_flow_newest_rejected_status",
+            "n_external_flow_records",
+            "n_windows_not_covered",
+            "n_explained_external_flow_days",
+            "n_external_flow_mismatch_days",
+            "n_external_flow_unverifiable_days",
+            "settled_cumulative_unexplained_net",
+            "provisional_cumulative_unexplained_net",
+            "settled_cumulative_passes_net",
+            "net_reconciliation",
+        }
+        for key in json_without:
+            if key in fu13b_keys or key == "daily_reconciliation":
+                continue
+            assert json_without[key] == json_with[key], key
+        rows_by_day_without = {r["day"]: r for r in json_without["daily_reconciliation"]}
+        rows_by_day_with = {r["day"]: r for r in json_with["daily_reconciliation"]}
+        for day, raw_json_row in rows_by_day_without.items():
+            evidenced_json_row = rows_by_day_with[day]
+            for pre_existing_key in ("day", "classification", "magnitude_cents", "provisional"):
+                assert raw_json_row[pre_existing_key] == evidenced_json_row[pre_existing_key]
+
+    def test_fu13b_settled_cumulative_passes_net_true_raw_false(self) -> None:
+        daily_balances, residual_settlements = _fu13b_0913_fixture()
+        evidence = _evidence(
+            (
+                _flow(
+                    kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                    signed_amount=Decimal(25),
+                    create_ts_ns=_ns_of_day("2026-09-13") + 1,
+                ),
+                _flow(
+                    kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                    signed_amount=Decimal(5),
+                    create_ts_ns=_ns_of_day("2026-09-13") + 2,
+                ),
+                _flow(
+                    kind="ACCOUNT_ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+                    signed_amount=Decimal(10),
+                    create_ts_ns=_ns_of_day("2026-09-13") + 3,
+                ),
+            ),
+            pulled_at_ns=_ns_of_day("2026-09-14"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=residual_settlements,
+            external_flows=evidence,
+        )
+        cumulative = cumulative_reconciliation(daily_rows=rows, settled_through="2026-09-13")
+
+        assert cumulative.settled_cumulative_passes is False  # raw $40 unresolved
+        assert cumulative.settled_cumulative_passes_net is True  # net $0
+
+    def test_fu13b_evidence_status_always_emitted(self) -> None:
+        data = _report_data()
+        assert data.external_flow_evidence_status == STATUS_NOT_CONFIGURED
+        raw = _portfolio_roi_json_dict(data)
+        assert raw["external_flow_evidence_status"] == STATUS_NOT_CONFIGURED
+
+    def test_fu13b_schema_version_stays_3_and_reader_accepts_old_v3(
+        self, tmp_path: Path
+    ) -> None:
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, _report_data())
+        raw = json.loads(path.read_text())
+        for key in (
+            "external_flow_evidence_status",
+            "external_flow_pulled_at_ns",
+            "external_flow_newest_rejected_status",
+            "n_external_flow_records",
+            "n_windows_not_covered",
+            "n_explained_external_flow_days",
+            "n_external_flow_mismatch_days",
+            "n_external_flow_unverifiable_days",
+            "settled_cumulative_unexplained_net",
+            "provisional_cumulative_unexplained_net",
+            "settled_cumulative_passes_net",
+            "net_reconciliation",
+        ):
+            raw.pop(key, None)
+        path.write_text(json.dumps(raw))
+
+        view = read_portfolio_roi_report(path)
+        assert view.schema_version == 3
+        assert view.external_flow_evidence_status == STATUS_NOT_CONFIGURED
+        assert view.n_windows_not_covered == 0
+        assert view.settled_cumulative_passes_net is True
+        assert view.net_reconciliation == ()
+
+    def test_fu13b_reader_rejects_wrong_typed_net_classification(
+        self, tmp_path: Path
+    ) -> None:
+        """AC4: `net_classification` lives in the `net_reconciliation`
+        sibling array (never widening the pre-existing, golden-tested
+        `daily_reconciliation` row shape -- see `NetReconciliationRow`'s
+        docstring); a present-but-wrong-typed value there still raises."""
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, _report_data())
+        raw = json.loads(path.read_text())
+        raw["net_reconciliation"] = [
+            {
+                "day": "2026-01-02",
+                "net_classification": 123,  # wrong type
+                "external_flow_cents": None,
+            }
+        ]
+        path.write_text(json.dumps(raw))
+
+        with pytest.raises(PortfolioRoiReportMalformedFieldError):
+            read_portfolio_roi_report(path)
+
+    def test_fu13b_journal_line_prefix_byte_identical_and_tokens_appended(self) -> None:
+        """AC12: the pre-FU-13b journal line is a byte-identical PREFIX of
+        the new one -- replicated independently here as a golden format, a
+        characterization guard that is green both before and after this
+        change."""
+        data = _report_data()
+        pre_fu13b_prefix = (
+            f"PORTFOLIO_ROI period={data.period_start}..{data.period_end} "
+            f"n_fills={data.n_fills} n_scored={data.n_scored} "
+            f"n_duplicate_scored_trials={data.n_duplicate_scored_trials} "
+            f"n_residual={data.n_residual} n_unreconciled={data.n_unreconciled} "
+            f"n_ledger_rows={data.n_ledger_rows} "
+            f"n_undecodable_ledger_rows={data.n_undecodable_ledger_rows} "
+            f"n_exit_fills={data.n_exit_fills} "
+            f"roi_status={data.roi_status} "
+            f"settled_reconciliation_passes={data.settled_cumulative_passes} "
+            f"unexplained_flow_days={data.unexplained_flow_days} "
+            f"n_unexplained_capital_flow_days={data.n_unexplained_capital_flow_days} "
+            f"n_unexplained_proxy_lag_days={data.n_unexplained_proxy_lag_days} "
+            f"n_balance_unknown_days={data.n_balance_unknown_days} "
+            f"n_no_prior_balance_days={data.n_no_prior_balance_days} "
+            f"unsettled_capital_positions={data.unsettled_capital_positions} "
+            f"settled_through_statistic={data.settled_through_statistic} "
+            f"lag_sample_n={data.lag_sample_n} "
+            f"n_family_station_refusals={data.n_family_station_refusals} "
+            f"n_residual_settlements={data.n_residual_settlements} "
+            f"n_residual_pending={data.n_residual_pending} "
+            f"n_residual_unresolved={data.n_residual_unresolved}"
+        )
+        line = journal_line(data)
+        assert line.startswith(pre_fu13b_prefix)
+        assert "external_flow_evidence_status=NOT_CONFIGURED" in line
+        assert "n_windows_not_covered=0" in line
+        assert "settled_reconciliation_passes_net=True" in line
+
+    def test_fu13b_journal_line_has_no_currency_token(self) -> None:
+        data = _report_data()
+        line = journal_line(data)
+        assert not re.search(r"\d+\.\d+", line)
+        assert "$" not in line
+
+    def test_fu13b_markdown_existing_lines_unchanged_section_appended(self) -> None:
+        data = dataclasses.replace(
+            _report_data(),
+            daily_reconciliation=(
+                DailyUnexplainedSummaryRow(
+                    day="2026-01-02",
+                    classification=UNEXPLAINED_CAPITAL_FLOW_LABEL,
+                    magnitude_cents=2,
+                    provisional=False,
+                ),
+            ),
+            net_reconciliation=(
+                _prr.NetReconciliationRow(
+                    day="2026-01-02",
+                    net_classification=EXPLAINED_EXTERNAL_FLOW_LABEL,
+                    external_flow_cents=4000,
+                ),
+            ),
+        )
+        report = render_markdown_report(data)
+        lines = report.splitlines()
+
+        assert lines[0] == (
+            "# Portfolio ROI Report (AUD-04, PRIVATE -- do not share outside the operator)"
+        )
+        assert "UNEXPLAINED_CAPITAL_FLOW day=2026-01-02 magnitude_cents=2" in report
+        per_day_idx = lines.index("### Per-day reconciliation")
+        section_idx = next(
+            i for i, ln in enumerate(lines) if ln.startswith("## External capital flows (FU-13b")
+        )
+        assert section_idx > per_day_idx
+        assert "EXPLAINED_EXTERNAL_FLOW day=2026-01-02 external_flow_cents=4000" in report
+
+    def test_fu13b_run_seam_reads_capital_flows_dir(self, tmp_path: Path) -> None:
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(venue_order_id="vo-a", ts_event=_ns_of_day("2026-09-14"))
+            store.set(f"{_FILL_KEY_PREFIX}vo-a", fill.to_bytes())
+        finally:
+            store.close()
+
+        capital_flows_dir = tmp_path / "capital_flows"
+        write_snapshot(
+            capital_flows_dir,
+            flows=[_flow(create_ts_ns=_ns_of_day("2026-09-14") + 1)],
+            pulled_at_ns=_ns_of_day("2026-09-15"),
+            covered_from_ns=_ns_of_day("2026-09-01"),
+        )
+
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=tmp_path / "scored_trials",
+            logs_dir=tmp_path / "logs",
+            output_dir=tmp_path / "derived",
+            families_dir=tmp_path / "families",
+            now_ns=_ns_of_day("2026-09-14"),
+            sink=_prr.resolve_alert_sink({}),
+            capital_flows_dir=capital_flows_dir,
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-14.json").read_text()
+        )
+        assert report["external_flow_evidence_status"] == "OK"
+        assert report["n_external_flow_records"] == 1
+
+    def test_fu13b_balance_unknown_rows_excluded_from_net_cumulative(self) -> None:
+        """Binding amendment 5 (round-2 domain review): a `BALANCE_UNKNOWN`
+        row must be excluded from `settled_cumulative_unexplained_net`
+        exactly as the raw filter already excludes it from
+        `settled_cumulative_unexplained` -- both sums are drawn from the
+        SAME `unexplained is not None`-filtered `settled_rows`
+        (`cumulative_reconciliation`/`_unexplained_net_or_raw`), so a
+        BALANCE_UNKNOWN row (whose `unexplained` is always `None`) never
+        contributes to either, even when it carries its own `net_classification
+        == BALANCE_UNKNOWN_LABEL`."""
+        hole_day = "2026-09-09"  # a fill with no balance entry at all -> BALANCE_UNKNOWN
+        daily_balances = {
+            "2026-09-11": Decimal("100.00"),
+            "2026-09-12": Decimal("100.00"),
+            "2026-09-13": Decimal("140.00"),  # +$40, no lag-eligible event anywhere
+        }
+        fill_on_hole = _fill(
+            ts_event=_ns_of_day(hole_day),
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal("0.03"),
+        )
+        flows = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                signed_amount=Decimal(25),
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                signed_amount=Decimal(5),
+                create_ts_ns=_ns_of_day("2026-09-13") + 2,
+            ),
+            # The $10 ACCOUNT_DEPOSIT is missing -- leaves a $10 net breach.
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-14"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[fill_on_hole],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            external_flows=evidence,
+        )
+        rows_by_day = {r.day: r for r in rows}
+
+        unknown_row = rows_by_day[hole_day]
+        assert unknown_row.classification == BALANCE_UNKNOWN_LABEL
+        assert unknown_row.net_classification == BALANCE_UNKNOWN_LABEL
+        assert unknown_row.unexplained is None
+        assert unknown_row.unexplained_net is None
+
+        settled_row = rows_by_day["2026-09-13"]
+        assert settled_row.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+        assert settled_row.unexplained_net == Decimal("10.00")
+
+        cumulative = cumulative_reconciliation(daily_rows=rows, settled_through="2026-09-13")
+        assert cumulative.n_balance_unknown_days == 1
+        # The BALANCE_UNKNOWN row's indeterminate contribution enters neither
+        # sum -- the NET cumulative equals the normal settled row's own net
+        # contribution only, exactly like the raw cumulative already does.
+        assert cumulative.settled_cumulative_unexplained_net == Decimal("10.00")
+
+    def test_default_output_dir_delegates_to_persistence_rule(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Review HIGH finding (FU-13b): the report's `_default_output_dir`
+        used to be a byte-identical copy of
+        `breezy.persistence.external_capital_flows.default_output_dir`'s
+        env-or-default rule. Guard against re-duplicating it: patch the
+        persistence function and observe the report's own function returns
+        the patched value, proving delegation rather than a parallel
+        re-implementation."""
+        sentinel = tmp_path / "sentinel-output-dir"
+        monkeypatch.setattr(_prr, "default_output_dir", lambda: sentinel)
+
+        assert _prr._default_output_dir() == sentinel
