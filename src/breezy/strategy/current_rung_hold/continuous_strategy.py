@@ -2601,11 +2601,22 @@ class ContinuousRungHoldStrategy(Strategy):
         # branch below decides whether it actually arms.
         if self._no_shadow_notice.get(notice_key) != minute_bucket:
             self._no_shadow_notice[notice_key] = minute_bucket
+            # FU-2: mirrors the YES `take:` line's own `R=[...]`/staleness
+            # fields (`:2298-2304`) -- rendered `None` when `running_max`/
+            # `staleness_ns` are absent (the two direct-call-site unit tests
+            # never supply them), never a `NoneType` crash on `.lower_f`.
+            no_r_bounds = (
+                "None" if running_max is None
+                else f"[{running_max.lower_f},{running_max.upper_f}]"
+            )
+            no_obs_ts_ns = None if running_max is None else running_max.source_observed_at_ns
+            no_staleness_s = None if staleness_ns is None else staleness_ns / _NS_PER_SECOND
             self._record_no_take_shadow(
                 f"no_take_shadow: station={station} instrument={no_iid} "
                 f"no_ask={no_decision.limit_price} p_miss_lower={no_decision.p_bound} "
                 f"be={no_decision.break_even} bid_size={bid_size} "
-                f"pending={1 if pending else 0}"
+                f"pending={1 if pending else 0} "
+                f"R={no_r_bounds} obs_ts_ns={no_obs_ts_ns} staleness_s={no_staleness_s}"
             )
 
         if NO_SIDE_SHADOW_ONLY:

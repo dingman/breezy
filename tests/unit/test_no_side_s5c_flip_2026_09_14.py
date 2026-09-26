@@ -206,7 +206,10 @@ def test_a_second_no_take_is_refused_while_the_first_order_is_pending(
     assert submitted == []
     assert strategy.last_no_refuse is None
     assert strategy.last_no_take_shadow is not None
-    assert strategy.last_no_take_shadow.endswith("pending=1")
+    # FU-2: `pending=` is no longer the line's last token -- the running-max
+    # bounds/obs-ts/staleness fields now follow it -- so this asserts the
+    # field's VALUE, not the line's ending.
+    assert "pending=1 " in strategy.last_no_take_shadow
     assert strategy._latch.is_inflight(
         STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(_NO_INTERIOR_ID),
     ) is False
@@ -341,7 +344,10 @@ def test_a_two_call_synchronous_burst_leaves_exactly_one_no_take_submitted(
     )
     assert len(submitted) == 1
     assert strategy.last_no_take_shadow is not None
-    assert strategy.last_no_take_shadow.endswith("pending=1")
+    # FU-2: `pending=` is no longer the line's last token -- the running-max
+    # bounds/obs-ts/staleness fields now follow it -- so this asserts the
+    # field's VALUE, not the line's ending.
+    assert "pending=1 " in strategy.last_no_take_shadow
     assert strategy.last_no_refuse is None
 
 
@@ -430,7 +436,9 @@ def test_the_key_persists_across_a_simulated_relaunch_and_blocks_further_arming(
     )
     assert submitted == []
     assert relaunched.last_no_take_shadow is not None
-    assert relaunched.last_no_take_shadow.endswith("pending=1")
+    # FU-2: see the earlier `pending=1 ` comment in this file -- same
+    # reasoning.
+    assert "pending=1 " in relaunched.last_no_take_shadow
 
 
 def test_the_yes_path_is_untouched_by_the_strategy_side_key_write(
