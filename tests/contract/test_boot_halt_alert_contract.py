@@ -19,12 +19,13 @@ sink is an in-process recorder; ``resolve_alert_sink`` is never the webhook.
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import os
 import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,79 @@ class _RecordingAlertSink:
 @pytest.fixture(autouse=True)
 def _operator_order_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, OPERATOR_ORDER_CEILING_USD)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _warm_up_trading_node_runtime() -> None:
+    """Absorb the first ``TradingNode``'s one-time process-wide allocation.
+
+    The very first ``TradingNode`` built in this process opens Nautilus's
+    own runtime reactor fds once, process-wide (observed here: two epoll
+    instances, one eventfd, three sockets). Left unabsorbed, that one-time
+    cost lands on whichever test in this file happens to run first -- under
+    ``pytest-randomly`` a different test each run -- and is indistinguishable
+    there from the per-drive leak ``_assert_drive_closes_its_event_loop``
+    exists to catch. Driving one throwaway, alert-free boot here, before any
+    per-test measurement begins, keeps that guard aimed at each test's own
+    ``_drive()`` call.
+
+    ``REACHES_RUNNING`` never reaches ``_emit_boot_halt_alert``'s
+    ``resolve_alert_sink()`` call (``_trader_reached_running`` short-circuits
+    it), so this warm-up needs no sink stub.
+    """
+    previous = os.environ.get(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
+    os.environ[MAX_ORDER_NOTIONAL_USD_ENV_VAR] = OPERATOR_ORDER_CEILING_USD
+    try:
+        _drive(_Mode.REACHES_RUNNING, until_running=True)
+    finally:
+        if previous is None:
+            os.environ.pop(MAX_ORDER_NOTIONAL_USD_ENV_VAR, None)
+        else:
+            os.environ[MAX_ORDER_NOTIONAL_USD_ENV_VAR] = previous
+
+
+def _open_fd_count() -> int:
+    return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+
+@pytest.fixture(autouse=True)
+def _assert_drive_closes_its_event_loop() -> Iterator[None]:
+    """Each test below drives exactly one ``_HarnessNode`` through ``_drive()``.
+
+    ``_drive()``'s factory creates a fresh ``asyncio.new_event_loop()`` per
+    call. Nautilus's own ``TradingNode.dispose()`` only closes that loop when
+    it is no longer running at dispose time; when it is still running,
+    ``dispose()`` only calls ``loop.stop()`` and leaves the loop (and its
+    epoll/eventfd/self-pipe fds) open, exactly like every sibling contract
+    file's ``node`` fixture guards against with ``try/finally: loop.close()``.
+    This asserts each drive in this file leaves no more than one fd behind,
+    so a future drive that stops relying on `_drive()`'s own explicit close
+    is caught here rather than by fd exhaustion in a long-running process.
+
+    ``BaseEventLoop.__del__`` closes an unclosed loop as a last resort, which
+    would otherwise hide a real leak behind Python's cyclic garbage collector
+    -- whichever test happens to run when a generational collection fires
+    "pays" for every loop leaked since the suite started, and every other
+    test reads clean. ``gc`` is disabled for the duration of the drive so the
+    assertion reflects THIS test's own cleanup, never an incidental
+    collection borrowed from a neighbour. The session-scoped
+    ``_warm_up_trading_node_runtime`` fixture absorbs the first-ever
+    ``TradingNode``'s one-time process-wide fd cost so it isn't mistaken for
+    a per-test leak here.
+    """
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    before = _open_fd_count()
+    try:
+        yield
+        after = _open_fd_count()
+        assert after - before <= 1, (
+            f"fd leak across this test's _drive() call: {before} -> {after} open fds"
+        )
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @pytest.fixture
@@ -311,6 +385,7 @@ def _drive(
 ) -> tuple[int, str, bool | None]:
     observed: dict[str, Any] = {}
     holder: list[TradingNode] = []
+    loops: list[asyncio.AbstractEventLoop] = []
     err = io.StringIO()
 
     def factory(config: Any) -> TradingNode:
@@ -320,6 +395,7 @@ def _drive(
             timeout_portfolio=_STARTUP_TIMEOUT_S,
         )
         loop = asyncio.new_event_loop()
+        loops.append(loop)
         node = _HarnessNode(tuned, mode, loop)
         holder.append(node)
         return node
@@ -353,8 +429,20 @@ def _drive(
 
     thread = threading.Thread(target=stopper, name="boot-halt-stopper", daemon=True)
     thread.start()
-    code = run(env=TRADE_ENV, node_factory=factory, stderr=err, after_build=after_build)
-    thread.join(timeout=5)
+    try:
+        code = run(env=TRADE_ENV, node_factory=factory, stderr=err, after_build=after_build)
+    finally:
+        thread.join(timeout=5)
+        # ``TradingNode.dispose()`` (live/node.py) only closes the loop when
+        # it is no longer running at dispose time; when it is still running
+        # it only calls ``loop.stop()``. Every sibling contract file's
+        # ``node`` fixture closes its own loop explicitly for exactly this
+        # reason (``try/finally: loop.close()``); `_drive()` owns the loop it
+        # creates in `factory()` above, so it closes it here too, whether or
+        # not Nautilus already did.
+        for loop in loops:
+            if not loop.is_closed():
+                loop.close()
     return code, err.getvalue(), observed.get("trader_running")
 
 
