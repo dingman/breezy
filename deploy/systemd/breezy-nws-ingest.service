@@ -1,0 +1,22 @@
+[Unit]
+Description=Breezy NWS Weather Data Ingest (user scope)
+Documentation=file:///home/jon/breezy/docs/core/RUNBOOK_NWS_COLLECTION.md
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+EnvironmentFile=/home/jon/.config/breezy/breezy.env
+ExecStart=/home/jon/breezy/.venv/bin/breezy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-nws
+
+[Install]
+WantedBy=default.target
