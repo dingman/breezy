@@ -18,16 +18,20 @@ Two safety properties, both load-bearing:
   or `write_data` failure on one truncated file must never abort the
   remaining files, types, or instances -- exactly the isolation
   ``ingest_instance`` already gives an ordinary ``ValueError`` from
-  ``convert_stream_to_data``. Caught narrowly: ``ValueError`` (deserialisation
-  or non-disjoint-interval refusal), ``pyarrow.ArrowInvalid`` (a salvaged
-  table that still fails a later Arrow operation), ``OSError`` (the
-  file vanishing or becoming unreadable between preflight and salvage), and
-  ``NotImplementedError`` (``ArrowSerializer._deserialize_rust`` when the
-  type's Rust wrangler is ``None`` -- measured for ``MarkPriceUpdate``,
-  also ``InstrumentClose`` / ``IndexPriceUpdate``). A
-  ``MemoryError``/``RecursionError`` is deliberately NOT caught here, for the
-  same reason ``_read_streamed`` does not catch it: it says nothing about
-  this file and everything about the process.
+  ``convert_stream_to_data``. Two kinds of isolation, in two branches:
+  a RETRYABLE one -- ``ValueError`` (deserialisation or non-disjoint-interval
+  refusal), ``pyarrow.ArrowInvalid`` (a salvaged table that still fails a
+  later Arrow operation), ``OSError`` (the file vanishing or becoming
+  unreadable between preflight and salvage) -- left unmarked so a later run
+  may retry; and a TERMINAL one -- ``NotImplementedError``
+  (``ArrowSerializer._deserialize_rust`` when the type's Rust wrangler is
+  ``None`` -- measured for ``MarkPriceUpdate``, also ``InstrumentClose`` /
+  ``IndexPriceUpdate``) -- deterministic and permanent for the installed
+  Nautilus version, so it earns its own marker
+  (:data:`SALVAGE_UNSUPPORTED_PREFIX`) instead of being retried forever
+  (FU-7 item 4). A ``MemoryError``/``RecursionError`` is deliberately NOT
+  caught here, for the same reason ``_read_streamed`` does not catch it: it
+  says nothing about this file and everything about the process.
 
 De-duplication before writing salvaged rows
 --------------------------------------------
@@ -53,6 +57,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import nautilus_trader
 import pyarrow as pa
 import pyarrow.parquet as pq
 from nautilus_trader.model.data import CustomData
@@ -73,17 +78,28 @@ logger = logging.getLogger(__name__)
 #: again -- nothing re-truncates it further.
 SALVAGE_MARKER_PREFIX = ".salvaged-"
 
+#: Prefix for the TERMINAL per-truncated-file marker written when the type's
+#: Arrow wrangler is ``None`` (``NotImplementedError``, FU-7 item 4). Unlike
+#: ``SALVAGE_MARKER_PREFIX``, this never claims rows were landed -- reusing
+#: ``_mark_salvaged`` here would mislead forensics and flip the ``:1144``
+#: pin in ``test_quote_tape_ingest_cli.py`` (the "no Arrow wrangler"
+#: isolation test). The failure is deterministic for the installed Nautilus
+#: version (verified against ``serializer.py:328-347``), so there is no
+#: retry -- delete the marker to retry after a Nautilus upgrade that might
+#: add the missing wrangler.
+SALVAGE_UNSUPPORTED_PREFIX = ".salvage-unsupported-"
+
 #: Exceptions isolated to the ONE truncated file that raised them. Mirrors
 #: ``ingest_instance``'s own ``except ValueError`` isolation, widened to the
 #: failure modes salvage can hit that a plain conversion cannot: a salvaged
-#: table that still fails a later Arrow operation, the file vanishing
-#: between preflight and salvage, or a type whose Arrow wrangler is ``None``
-#: (``ArrowSerializer._deserialize_rust`` raises ``NotImplementedError``).
+#: table that still fails a later Arrow operation, or the file vanishing
+#: between preflight and salvage. ``NotImplementedError`` (a type whose
+#: Arrow wrangler is ``None``) is handled separately, in its own terminal
+#: branch below -- see :data:`SALVAGE_UNSUPPORTED_PREFIX`.
 _ISOLATED_ERRORS: tuple[type[BaseException], ...] = (
     ValueError,
     pa.ArrowInvalid,
     OSError,
-    NotImplementedError,
 )
 
 
@@ -91,12 +107,40 @@ def _salvage_marker_path(instance_dir: Path, file_path: Path) -> Path:
     return instance_dir / f"{SALVAGE_MARKER_PREFIX}{file_path.name}"
 
 
+def _salvage_unsupported_marker_path(instance_dir: Path, file_path: Path) -> Path:
+    return instance_dir / f"{SALVAGE_UNSUPPORTED_PREFIX}{file_path.name}"
+
+
 def _is_salvage_marked(instance_dir: Path, file_path: Path) -> bool:
-    return _salvage_marker_path(instance_dir, file_path).is_file()
+    return (
+        _salvage_marker_path(instance_dir, file_path).is_file()
+        or _salvage_unsupported_marker_path(instance_dir, file_path).is_file()
+    )
 
 
 def _mark_salvaged(instance_dir: Path, file_path: Path) -> None:
     _salvage_marker_path(instance_dir, file_path).touch()
+
+
+def _mark_salvage_unsupported(instance_dir: Path, file_path: Path) -> None:
+    """Terminal marker: this file's type has no Arrow wrangler to salvage it.
+
+    Written empty (``touch``), like every sibling marker in this module and
+    in ``quote_tape_ingest_cli`` (``SALVAGE_MARKER_PREFIX``,
+    ``FILE_MARKER_PREFIX``, ``MARKER_PREFIX``): the marker's own filename
+    ends in ``.feather``, so a non-empty, non-Arrow body would make the
+    preflight scanner's own byte-level walk (``iter_feather_files`` globs
+    ``*.feather``) misclassify the MARKER ITSELF as a truncated Arrow
+    stream, poisoning ``needs_salvage_work`` in
+    ``quote_tape_ingest_cli._ingest_instance_per_file`` with a phantom
+    truncated file (measured: a text body flips this marker to
+    ``FeatherStatus.TRUNCATED``, defeating AC4). An empty file classifies as
+    ``EMPTY_FILE`` instead, exactly like the existing markers. The installed
+    Nautilus version is recorded in the ERROR log line instead (AC3), and
+    that log line names this marker's path for the delete-to-retry
+    instruction.
+    """
+    _salvage_unsupported_marker_path(instance_dir, file_path).touch()
 
 
 def _file_belongs_to_data_cls(instance_dir: Path, file_path: Path, data_cls: type) -> bool:
@@ -324,6 +368,22 @@ def salvage_truncated_instance(
                 _salvage_one_file(
                     catalog, write_target, instance_dir, instance_id, cls_name, data_cls, report
                 )
+            except NotImplementedError as exc:
+                marker_path = _salvage_unsupported_marker_path(instance_dir, report.path)
+                logger.error(
+                    "instance %s: salvage of %s truncated file %s skipped %s "
+                    "[reason=unsupported_type] no Arrow wrangler in nautilus %s: %s; "
+                    "rows NOT landed; marked terminal; delete %s to retry",
+                    instance_id,
+                    cls_name,
+                    report.path,
+                    type(exc).__name__,
+                    nautilus_trader.__version__,
+                    exc,
+                    marker_path,
+                )
+                _mark_salvage_unsupported(instance_dir, report.path)
+                continue
             except _ISOLATED_ERRORS as exc:
                 logger.error(
                     "instance %s: salvage of %s truncated file %s failed -- %s: %s -- "
