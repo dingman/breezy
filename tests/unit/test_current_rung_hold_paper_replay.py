@@ -1673,7 +1673,7 @@ def _run_main_with_stubbed_capture(
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
+        lambda catalog, *, climate_day, **_kw: [tape_instrument],
     )
     monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
     monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
@@ -1839,7 +1839,7 @@ def test_a_multi_contract_backtest_fill_is_refused_before_the_scored_store_write
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
+        lambda catalog, *, climate_day, **_kw: [tape_instrument],
     )
     monkeypatch.setattr(
         driver,
@@ -2002,6 +2002,33 @@ def test_each_new_refusal_path_exits_with_its_pinned_code(
     assert rc == driver.EXIT_FAMILY_MANIFEST_UNUSABLE
 
 
+def test_old_signature_selector_fake_fails_loudly_instead_of_dropping_narrowing(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FU-7c: `main` calls `_select_capture_instruments` directly with the
+    station/window keywords -- no `inspect.signature` shim smooths over a
+    fake stuck on the historical `(catalog, *, climate_day)` shape. A
+    keyword-arity mismatch must raise loudly instead of silently dropping
+    the replay-only narrowing."""
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+    monkeypatch.setattr(
+        driver, "run_one_precision_arm", lambda **kw: driver.PrecisionArmResult(trials=()),
+    )
+
+    with pytest.raises(TypeError):
+        driver.main(_minimal_argv(tmp_path, strategy=None))
+
+
 def test_no_pre_existing_failure_path_changed_its_exit_code(
     driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2019,7 +2046,7 @@ def test_no_pre_existing_failure_path_changed_its_exit_code(
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
+        lambda catalog, *, climate_day, **_kw: [tape_instrument],
     )
     monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
     monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
@@ -2125,7 +2152,7 @@ def test_a_crashing_run_leaves_no_sidecar(
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
+        lambda catalog, *, climate_day, **_kw: [tape_instrument],
     )
     monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
     monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
@@ -2239,7 +2266,7 @@ def test_params_match_is_computed_from_the_engines_actual_readback_not_echoed(
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
+        lambda catalog, *, climate_day, **_kw: [tape_instrument],
     )
     monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
     monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
@@ -2557,7 +2584,7 @@ def test_the_continuous_arm_selects_capture_instruments_exactly_once(
     calls: list[int] = []
     tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
 
-    def _counting_select(catalog: object, *, climate_day: dt.date) -> list[object]:
+    def _counting_select(catalog: object, *, climate_day: dt.date, **_kw: object) -> list[object]:
         calls.append(1)
         return [tape_instrument]
 
@@ -2747,7 +2774,7 @@ def test_the_guard_runs_before_convert_live_capture_writes_the_work_catalog(
     monkeypatch.setattr(
         driver,
         "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
+        lambda catalog, *, climate_day, **_kw: [tape_instrument],
     )
     monkeypatch.setattr(
         driver,

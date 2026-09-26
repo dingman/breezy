@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
-import inspect
 import json
 import os
 import sys
@@ -304,35 +303,6 @@ def assert_requested_days_are_listed(
             f"{[d.isoformat() for d in unlisted]!r}; listed days: "
             f"{sorted(d.isoformat() for d in listed)!r}",
         )
-
-
-def _select_replay_capture_instruments(
-    catalog: object,
-    *,
-    climate_day: dt.date,
-    station: str,
-    start: int,
-    end: int | None,
-) -> list[TapeInstrument]:
-    """Call the shared selector with replay-only narrowing when the callable
-    exposes those keywords.
-
-    Several driver tests monkeypatch `_select_capture_instruments` with the
-    historical `(catalog, *, climate_day)` shape to isolate unrelated dispatch
-    behavior. Signature-aware dispatch keeps those tests about their original
-    seam while the real selector receives the station and window bounds.
-    """
-    selector = _select_capture_instruments
-    parameters = inspect.signature(selector).parameters
-    accepts_kwargs = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-    kwargs: dict[str, object] = {"climate_day": climate_day}
-    for name, value in (("station", station), ("start", start), ("end", end)):
-        if accepts_kwargs or name in parameters:
-            kwargs[name] = value
-    return selector(catalog, **kwargs)
 
 
 def _replay_station_day_instrument_ids(
@@ -1613,7 +1583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         station=args.station,
         window_start_ns=market_start_ns,
     )
-    tape_instruments = _select_replay_capture_instruments(
+    tape_instruments = _select_capture_instruments(
         catalog,
         climate_day=climate_day,
         station=args.station,
