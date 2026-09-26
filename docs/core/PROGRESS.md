@@ -34,7 +34,7 @@ Everything else is build-side.
 
 ---
 
-## BACKLOG — verified open set (re-synced 2026-09-26 11:10Z against merges, evidence and host)
+## BACKLOG — verified open set (re-synced 2026-09-26 16:35Z against merges, evidence and host)
 
 **Binding on EVERY item.** Never set `allow_short=True`; never weaken `BacktestOrderGuard` or any
 safety, settlement, contract or NO-SEND firewall test (widen exact sets by one reviewed row, L-12);
@@ -45,29 +45,29 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| ING-2 | HIGH | S1 + S2 live (S2: `--deadline-seconds 600`, deferred counts, OOMScoreAdjust=500). **S3** plan converged (`ING-2_S3_plan_r2_2026-09-26.md` + r3/r3.1): next Phase 0 capped arms (quiet window, 2G, never uncapped) → S3a TDD (coalesced read, mirror, A8 detector, T-META) → S3b chunked EXTEND only if T-a/T-b fires. Residual: deferred units have no alert | `docs/plans/backlog/ING-2_2026-09-25/` stage-0 findings (F3 dominant) |
-| AUD-09b | HIGH | C2 run 09-26 10:30Z: LAX 09-17 COMPLETED (row RSS 1.13G, 138 s) but unit exit 1 = KILL_CLOCK_ABSENT (hand-start before the 14:15Z score-live-trials producer; by design) and B26 unproven (cgroup peak 3.245G incl. cache). Architect ruling: rerun under `time -v` armed 14:25Z (`aud09b-c2-rerun.timer` + TEMPORARY drop-in `zz-c2-time-v-TEMPORARY.conf` — remove after). Pass = exit 0 + maxRSS <3G + wall <900 s → `enable --now breezy-replay-daily.timer`; B5 = row RSS ≤2.25G, row wall ≤275 s, unit wall ≤1517 s (AUD-09 §8 :841) | AUD-09b amendment :132/:187/:219 |
-| AUD-07 | HIGH | Global-pin CAL passed but f≈0.2 → pre-registered counterfactual (`AUD07_M1c_eps_k_counterfactual_2026-09-26.md`) → BUILD-EPS_K. Code S′ a40d433 merged (ec96501), snapshot made, `runs/0369e1218a85` SUPERSEDED (never rename). `breezy-aud07-m1c-seg-0927a` armed 09-27 02:10–08:40Z: CAL rerun → cal_check → 20k (F_GATE_MAX=1.0, PR-3) → 80k → `--final` → AC7 ruling; then base §7 steps 7, 7b, 8 | `RULING_aud07_m1c_eps_k_decision_rule_2026-09-26.md` |
-| AUD-02 | MED | WP-D1 merged + `breezy-discovery-pull.timer` live (16:52Z; day 1 = 09-26); A0 fee-evidence day 1 = 09-26 (earliest close 09-30); DoD 10 coordinator block / Amendment C pointer | completion plan §2, §5 |
+| ING-2 | HIGH | S3a merged 2d36198 (live). AC-S3-5: (a) fast path ΔRSS 0.171 GiB PASS; (b) forced EXTEND 1.0215 GiB FAIL → T-b (T-a already fired). **S3b** chunked EXTEND in TDD (`breezy-ing2-s3b`), incl. arm 3b + AC-S3-5(b) rerun ≤1 GiB. Then: T5′ EXTEND bound k=2 (deferred from S3b), deploy, and remove TEMPORARY drop-in `zz-memory-containment-TEMPORARY.conf` (12G/14G) only after a post-deploy EXTEND run is bounded — keep it through the 09-27 09:00Z rotation. Residual: deferred units have no alert | `ING-2_S3_plan_r2_2026-09-26.md` r3/r3.1 |
+| T5′ | HIGH | Gate RED since 2d36198: `test_control_scales_far_faster_than_the_coalesced_treatment` sees control ΔRSS=0 under host memory pressure (file-backed RSS evicted). Redesign to a residency-invariant metric, thresholds unchanged, in TDD (`breezy-t5p`). Gates at 08535a9 were red on this test only (+ FU-11, since fixed) | 09-26 gate logs |
+| AUD-07 | HIGH | Code S′ a40d433 merged; `breezy-aud07-m1c-seg-0927a` armed 09-27 02:10–08:40Z: CAL rerun → cal_check → 20k (F_GATE_MAX=1.0, PR-3) → 80k → `--final` → AC7 ruling; then base §7 steps 7, 7b, 8 | `RULING_aud07_m1c_eps_k_decision_rule_2026-09-26.md` |
+| AUD-02 | MED | WP-D1 live (`breezy-discovery-pull.timer` 16:52Z; day 1 = 09-26); A0 fee-evidence earliest close 09-30; DoD 10 coordinator block / Amendment C pointer | completion plan §2, §5 |
 | AUD-05 | MED | §7 step 8: observe three consecutive 17:20Z v4 tally runs (1 so far) | AUD-05 §7 |
-| AUD-10b | MED | Evidence doc `PROMOTION_PROPOSAL_MECHANISM_<date>.md` (C1–C20); unattended runs need the replay timer (AUD-09b) | AUD-10 §8 |
-| AUD-18 | MED | (a) DONE: H-ARCHIVE-RECAL-2026-09 registered UNDERPOWERED. (b) Schema-v2 stratum/draw binding BLOCKED until a look-taking registration or REPLAY_VALIDITY flip, with the replay timer healthy | AUD-18 plan amendment |
-| FU-1b | MED | NO positions monitored but never marked (no `^no` depth subscription); decide with any exit-family arming. FU-1c short-YES netting parked | `FU-1_plan_r2_2026-09-25.md` |
-| FU-3c | MED | FU-3b reconciles residual settlements (09-14 → OK); still owed: residual-fill P&L attribution in the ROI rollup and D9 GATED_UNSETTLED_CAPITAL | `FU-3_capital_flow_attribution_2026-09-26.md` |
-| R-7-IMPL | LOW | Merged 72f95e0, live from the 09-26 16:50Z spawn: confirm the first `R7_POSITION_REPORTING_LAG` line after a create-path fill (PREREG v3 A2 floor verification); `R7_LAG_REJECT` reasons are diagnostics | `RULING_R-7_position_reporting_lag_2026-09-26.md` |
-| TALLY-V2 | LOW | Re-verify the 17:20Z `breezy-family-tally@pm_us_crh_v2` run after a normal 16:50Z launch (09-24/09-25 = NO_NODE) | R-5 ruling §3(2) |
-| DIGEST | LOW | FU-6 `halt_enforced` digest field deployed; no artefact yet (no node 09-24/25) — verify after tonight | FU-6 |
-| FU-8 | LOW | Resolver `_resolve_accept_fill` can emit OrderFilled with no OrderSubmitted across sessions (order-1 was NOT a head defect) — harden | `ORDER1_NO_ORDERSUBMITTED_2026-09-26.md` |
-| OPS-1 | LOW | Host-local regular files shadow repo units: `breezy-trade-supervisor.service` (drift) and `breezy-nws-ingest.service`; reconcile or record | `deploy/systemd/README.md` status line |
-| FU-7 | LOW | 09-25 review follow-ups: registrar `--registered-at` ISO validation; ingest `results_by_cls` collapses duplicate data_types; definitions-failing instance reselected every run; salvage `NotImplementedError` retried every run (7f353f94 mark_price); T7 name DEAD vs THREATENED; no NO-leg `submit_exit` test; ingest R4 (03–09Z boot misses day-D definitions); `_select_replay_capture_instruments` `inspect.signature` dispatch | 09-25 reviews |
-| HUNT-1 | CRIT/GATED | Requirement stands (operator, 9ddcb8b); nothing built until a re-open trigger fires (≥15 clusters at an off-window hour, live sub-degree source, AUD-18 CONFIRMED, or a new family via AUD-18). Never treat as moot | `RULING_HUNT-1_all_hours_hunting_2026-09-26.md` |
-| SP-5/R-3 | S | Coverage diagnostic (blips vs outages vs dead-recorder rows) + §9 tolerance ruling (options i–iv, v1 §7 re-registration) | `COVERAGE_KILL_CLOCK_2026-09-12.md` |
+| AUD-10b | MED | Replay timer now live (AUD-09b closed); proposal evaluates (`NO_PROPOSAL(C-ESTIMATOR,C-N,C-VALIDITY) INERT(C-PAIRED)`). Owed: evidence doc `PROMOTION_PROPOSAL_MECHANISM_<date>.md` (C1–C20) from unattended runs | AUD-10 §8 |
+| AUD-18 | MED | (b) schema-v2 stratum/draw binding BLOCKED until a look-taking registration or REPLAY_VALIDITY flip | AUD-18 plan amendment |
+| FU-3d | MED | Scored-path P&L is per-contract (residual is qty-scaled) — scale the scored path; track the fee_unverified ≤1¢ residual bias | FU-3c plan r1.1 |
+| FU-9 | MED | ROI report: `StorePositiveControlFailedError` skips 4 station scans for `pm_us_crh_exit_v4` — investigate | 09-26 FU-3c run |
+| FU-8b | LOW | Runtime refusals re-polled only on ComponentStateChanged (no timer) — add a native Nautilus clock timer re-poll | FU-8 plan r2 |
+| SP-5b | LOW | Build indeterminate-exclusion of dead-recorder gap rows, prospective (new registrations only); 60 s tolerance REJECTED | `RULING_SP-5_R-3_coverage_tolerance_2026-09-26.md` |
+| FU-1d-reopen | LOW | Shared `_station_day_exit_counts`; defense-in-depth in `unmappable_exit_order_reason`; walked-VWAP vs realised NO fills. NO-leg exits stay off until a manifest declares `no_leg_exit` | FU-1d plan r1.3 |
+| R-7-IMPL | LOW | Live from the 09-26 16:50Z spawn: confirm the first `R7_POSITION_REPORTING_LAG` line after a create-path fill | `RULING_R-7_position_reporting_lag_2026-09-26.md` |
+| TALLY-V2 / DIGEST | LOW | Re-verify the 17:20Z v2 tally and the `halt_enforced` digest field after a normal 16:50Z launch | R-5 ruling §3(2); FU-6 |
+| FU-7 | LOW | 09-25 review follow-ups: registrar `--registered-at` ISO validation; ingest `results_by_cls` collapses duplicate data_types; definitions-failing instance reselected every run; salvage `NotImplementedError` retried every run (7f353f94 mark_price, 44×/12h on 09-26 — pre-S3a); T7 name DEAD vs THREATENED; ingest R4 (03–09Z boot misses day-D definitions); `_select_replay_capture_instruments` `inspect.signature` dispatch | 09-25 reviews |
+| HUNT-1 | CRIT/GATED | Requirement stands (operator, 9ddcb8b); nothing built until a re-open trigger fires. Never treat as moot | `RULING_HUNT-1_all_hours_hunting_2026-09-26.md` |
 | AUD-11 | BLOCKED | §7 step 5 captured-tape proof: backtest OOM at 6G — rerun with a higher cap in a quiet window | `POINT_IN_TIME_CLASSIFICATION_2026-09-21.md:134` |
 | AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family | AUD-06b |
 
-**Order:** AUD-09b rerun (14:25Z) → ING-2 S3 Phase 0 → S3a → AUD-07 (seg 0927a) → AUD-02/05/10b →
-FU-3c, FU-1b → SP-5/R-3 ruling → LOW items. Watch tonight: 16:50Z node spawn (first live ADM-1 pending-fills
-Σq, SP-3r durable-fill index, R-7 lag), 16:52Z discovery pull, 17:20Z tallies.
+**Closed 09-26:** WP-D1, R-7-IMPL build, AUD-07 eps_k build, OPS-1, FU-1b (ruling → FU-1d merged 5b13f26), FU-3c (c33c720), FU-8 (060f346), SP-5/R-3 ruling (→ SP-5b), AUD-09b C2 (B26 PASS, B5 set, timer enabled; `AUD09B_C2_B26_B5_2026-09-26.md`), FU-10 (08535a9, replay unit exec-state DB env), FU-11 (da7528a, step14 test isolation).
+
+**Order:** T5′ → S3b → deploy + drop-in removal → AUD-07 (seg 0927a) → AUD-10b doc → FU-3d/FU-9 → SP-5b/FU-8b → LOW.
+Watch: 16:50Z node spawn (ADM-1 pending-fills Σq, SP-3r durable-fill index, R-7 lag, FU-8 latch), 16:52Z discovery pull, 17:20Z tallies, 17:40Z ROI report.
 
 **KILL clock / live n (09-25):** champion (v4) counter 10 covered-listed station-days (09-20..09-25);
 v4 tally n=3 (1 win), under one completed look. Exec store 9 fills (newest 09-22). A1 halt SET 09-24.
