@@ -253,6 +253,10 @@ _RECONCILIATION_REFUSAL_DETAILS: Final[frozenset[str]] = frozenset(
         "RECORD_VENUE_DISAGREEMENT",
         "FEE_COEFFICIENT_AMBIGUOUS",
         "DURABLE_REPORTS_BUILD_FAILED",
+        # FU-8 r2/r2.1: informational only (a runtime latch, never a boot-pass
+        # refusal) -- named here so it is never sent as the generic
+        # `RECONCILIATION_REFUSAL_UNKNOWN` member.
+        "RESOLVER_FILL_NOT_BOOKED",
     }
 )
 _RECONCILIATION_REFUSAL_UNKNOWN_DETAIL: Final[str] = "RECONCILIATION_REFUSAL_UNKNOWN"

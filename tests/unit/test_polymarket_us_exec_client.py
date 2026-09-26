@@ -4753,9 +4753,17 @@ async def test_a_resolver_accept_fill_books_the_contexts_real_order_side(
         await rig.client._connect()
         # Only the latch needs to be armed and OPEN; the initiating order's
         # own side is irrelevant to this test -- `_resolve_accept_fill`
-        # reads the durable context's `order_side`, built manually below,
-        # never the order that armed the intent.
-        await rig.client._submit_order(rig.limit_buy())
+        # reads the durable context's `order_side`, never the order that
+        # armed the intent. FU-8: the real `ExecutionEngine` adds a submitted
+        # order to the cache before it ever reaches the client
+        # (`execution/engine.pyx:1122`); this rig calls `_submit_order`
+        # directly, so it is replicated here -- otherwise
+        # `_resolver_fill_order_unknown` (FU-8) sees no cached order for
+        # this SAME-session fill and (correctly, for a genuinely unknown
+        # order) defers it instead of booking it.
+        command = rig.limit_buy()
+        rig.client._cache.add_order(command.order, position_id=None)
+        await rig.client._submit_order(command)
 
         assert rig.client._latch is not None
         current = rig.client._latch.current_open()
@@ -4767,7 +4775,7 @@ async def test_a_resolver_accept_fill_books_the_contexts_real_order_side(
             intent_id=current.intent_id,
             venue_order_id=order_id,
             instrument_id=str(instrument.id),
-            client_order_id="O-does-not-matter",
+            client_order_id=command.order.client_order_id.value,
             strategy_id=str(STRATEGY_ID.value),
             notional_usd=Decimal("0.40"),
             booking_id=1,
