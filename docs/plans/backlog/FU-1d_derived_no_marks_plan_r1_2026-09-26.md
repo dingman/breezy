@@ -172,3 +172,14 @@ HIGH (~88%). The one uncertainty is whether every NO fill is attributed to the `
 - (i) `_station_day_exit_counts` (`position_monitor.py:547,584`) is shared by both legs, so a NO exit would consume the YES cap. Decide per-leg vs shared at arming.
 - (ii) Add defence in depth: the NO-leg declaration check in `exec/submit_chain.unmappable_exit_order_reason` (`:464-487`), which today checks only the family gate.
 - (iii) Walked-ask VWAP vs realised NO fills (from the ruling).
+
+## r1.3: architect confirmation APPROVE, with a counter-semantics fix
+- **(e) assertions.**
+  - `Δevaluations == number of NO evaluations`: it increments per evaluation that passes facts/running_max, `position_monitor.py:496`.
+  - `Δemitted == number of NO rows`, per `should_emit`, `:510`/`:623`.
+  - Positive controls: YES mark rows are non-empty, YES offer-tape rows are non-empty, and there is at least 1 NO row.
+  - Keep total rows below both `maxlen` and the 256 flush threshold, so there is no eviction or flush before the comparison.
+- **The eviction test** builds `PositionMonitor` directly with `MarkBuffer(maxlen=3)`, like test :171, or adds a `buffer=` override to the helpers with default `MarkBuffer()`.
+- **Risk wording:** the MarkBuffer coupling can bite only under sustained flush failure. maxlen is 2048, flush happens at 256, and a flush is retried on every emit.
+
+**STATUS: CONVERGED.** Domain reviewer HIGH; architect APPROVE (r1.2 plus this fix).
