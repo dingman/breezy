@@ -280,3 +280,7 @@ Round 2: architect REQUEST_CHANGES (minor; B1–B7 confirmed resolved), trading-
 4. **R4 missing key.** A replayed key whose census row is ABSENT is drifted too (verdict `MISSING`); add that case to R-e.
 5. **C6 cache key.** Fold `std_utc_offset_hours` for the instance's stations into the fingerprint (or equivalently the registry's offset table hash), so a registry offset change invalidates the cached spans.
 6. **B27 note.** AUD-10's `C-VALIDITY` must read `replay_drift.jsonl` as well as `replay_results.jsonl`.
+
+## B5 ratchet recorded (coordinator, 2026-09-26)
+
+B26 PASSED and the timer is enabled. The first-real-run baseline is LAX 09-17: row RSS 1.127 GB, row wall 137.7 s, unit wall ~758 s. **B5 is set to:** row `peak_rss_bytes` ≤ 2.25 GB, row `wall_s` ≤ 275 s, unit wall ≤ 1517 s. Evidence: `docs/evidence/AUD09B_C2_B26_B5_2026-09-26.md`.
