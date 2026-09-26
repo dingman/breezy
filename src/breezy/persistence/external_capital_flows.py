@@ -100,11 +100,8 @@ def default_output_dir(env: Mapping[str, str] | None = None) -> Path:
     second, potentially-drifting copy of the rule (FU-13b plan "Same
     directory rule" / round-2 review binding amendment 2).
 
-    ``scripts/analysis/portfolio_roi_report.py`` is owned by a parallel build
-    stage and is not edited here (this stage may not touch it); that stage is
-    expected to replace its own ``_default_output_dir`` body with a
-    delegation to this function so the two never diverge. Until then, both
-    read the identical env var with the identical fallback, which is what
+    ``scripts/analysis/portfolio_roi_report.py``'s own ``_default_output_dir``
+    delegates to this function so the two never diverge, which is what
     :func:`test_puller_dir_matches_report_dir_rule`
     (``tests/unit/test_polymarket_us_capital_flow_pull.py``) verifies against
     the report script's OWN function, not a copy of its logic.

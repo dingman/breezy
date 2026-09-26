@@ -107,6 +107,8 @@ from breezy.persistence.external_capital_flows import (
     STATUS_NOT_CONFIGURED,
     ExternalFlowEvidence,
     WindowFlows,
+    default_capital_flows_dir,
+    default_output_dir,
     load_evidence,
     window_flows,
 )
@@ -3543,10 +3545,11 @@ def _default_logs_dir() -> Path:
 
 
 def _default_output_dir() -> Path:
-    override = os.environ.get("BREEZY_LIVE_TALLY_OUTPUT_DIR", "").strip()
-    if override:
-        return Path(override)
-    return Path.home() / ".local" / "share" / "breezy" / "derived"
+    """Delegates to the single persistence rule -- see
+    ``breezy.persistence.external_capital_flows.default_output_dir`` (FU-13b
+    review HIGH finding: this used to be a byte-identical copy of that
+    function's env-or-default rule)."""
+    return default_output_dir()
 
 
 def _default_families_dir() -> Path:
@@ -4232,10 +4235,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         now_ns=time.time_ns(),
         sink=resolve_alert_sink(os.environ),
         catalog_base=_default_catalog_base(),
-        # FU-13b: same `_default_output_dir()` root the wrapper argv never
+        # FU-13b: same `default_output_dir()` root the wrapper argv never
         # changes -- the puller (stage S2) writes snapshots to this same
         # subdirectory.
-        capital_flows_dir=_default_output_dir() / "capital_flows",
+        capital_flows_dir=default_capital_flows_dir(),
     )
 
 

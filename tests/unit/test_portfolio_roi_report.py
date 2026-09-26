@@ -5301,3 +5301,81 @@ class TestFu13bNetOfExternalFlowReconciliation:
         )
         assert report["external_flow_evidence_status"] == "OK"
         assert report["n_external_flow_records"] == 1
+
+    def test_fu13b_balance_unknown_rows_excluded_from_net_cumulative(self) -> None:
+        """Binding amendment 5 (round-2 domain review): a `BALANCE_UNKNOWN`
+        row must be excluded from `settled_cumulative_unexplained_net`
+        exactly as the raw filter already excludes it from
+        `settled_cumulative_unexplained` -- both sums are drawn from the
+        SAME `unexplained is not None`-filtered `settled_rows`
+        (`cumulative_reconciliation`/`_unexplained_net_or_raw`), so a
+        BALANCE_UNKNOWN row (whose `unexplained` is always `None`) never
+        contributes to either, even when it carries its own `net_classification
+        == BALANCE_UNKNOWN_LABEL`."""
+        hole_day = "2026-09-09"  # a fill with no balance entry at all -> BALANCE_UNKNOWN
+        daily_balances = {
+            "2026-09-11": Decimal("100.00"),
+            "2026-09-12": Decimal("100.00"),
+            "2026-09-13": Decimal("140.00"),  # +$40, no lag-eligible event anywhere
+        }
+        fill_on_hole = _fill(
+            ts_event=_ns_of_day(hole_day),
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal("0.03"),
+        )
+        flows = (
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_REFERRAL_BONUS",
+                signed_amount=Decimal(25),
+                create_ts_ns=_ns_of_day("2026-09-13") + 1,
+            ),
+            _flow(
+                kind="ACCOUNT_ACTIVITY_TYPE_TRANSFER",
+                signed_amount=Decimal(5),
+                create_ts_ns=_ns_of_day("2026-09-13") + 2,
+            ),
+            # The $10 ACCOUNT_DEPOSIT is missing -- leaves a $10 net breach.
+        )
+        evidence = _evidence(
+            flows, pulled_at_ns=_ns_of_day("2026-09-14"), covered_from_ns=_ns_of_day("2026-09-01")
+        )
+
+        rows = reconcile_daily(
+            fills=[fill_on_hole],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            external_flows=evidence,
+        )
+        rows_by_day = {r.day: r for r in rows}
+
+        unknown_row = rows_by_day[hole_day]
+        assert unknown_row.classification == BALANCE_UNKNOWN_LABEL
+        assert unknown_row.net_classification == BALANCE_UNKNOWN_LABEL
+        assert unknown_row.unexplained is None
+        assert unknown_row.unexplained_net is None
+
+        settled_row = rows_by_day["2026-09-13"]
+        assert settled_row.net_classification == EXTERNAL_FLOW_MISMATCH_LABEL
+        assert settled_row.unexplained_net == Decimal("10.00")
+
+        cumulative = cumulative_reconciliation(daily_rows=rows, settled_through="2026-09-13")
+        assert cumulative.n_balance_unknown_days == 1
+        # The BALANCE_UNKNOWN row's indeterminate contribution enters neither
+        # sum -- the NET cumulative equals the normal settled row's own net
+        # contribution only, exactly like the raw cumulative already does.
+        assert cumulative.settled_cumulative_unexplained_net == Decimal("10.00")
+
+    def test_default_output_dir_delegates_to_persistence_rule(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Review HIGH finding (FU-13b): the report's `_default_output_dir`
+        used to be a byte-identical copy of
+        `breezy.persistence.external_capital_flows.default_output_dir`'s
+        env-or-default rule. Guard against re-duplicating it: patch the
+        persistence function and observe the report's own function returns
+        the patched value, proving delegation rather than a parallel
+        re-implementation."""
+        sentinel = tmp_path / "sentinel-output-dir"
+        monkeypatch.setattr(_prr, "default_output_dir", lambda: sentinel)
+
+        assert _prr._default_output_dir() == sentinel
