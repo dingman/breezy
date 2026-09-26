@@ -53,7 +53,7 @@ markers = [
     "live: performs REAL network I/O against api.weather.gov and needs BREEZY_LIVE=1; deselected by default",
     "venue_live: test performs real authenticated calls against the live Polymarket.us venue; gated behind BREEZY_VENUE_LIVE=1 AND BREEZY_ALLOW_CREDENTIALED_PYTEST=1 AND --venue-live",
     "real_money: can place or affect real-money venue orders and needs BREEZY_REAL_MONEY=1 plus operator approval; deselected by default",
-    "memory: child-process RSS assertions (ING-2 S3); runs in the default gate by design",
+    "memory: chunk-count materialization assertions (ING-2 S3); runs in the default gate by design",
 ]
 
 [tool.importlinter]
