@@ -1344,6 +1344,7 @@ def _fill_record(
     instrument_id: str,
     qty: str,
     cost: str,
+    fee: str = "0",
     ts_event: int = NOW_NS,
 ) -> DurableFillRecord:
     return DurableFillRecord(
@@ -1353,7 +1354,7 @@ def _fill_record(
         order_side="BUY",
         cumulative_qty=Decimal(qty),
         cumulative_cost=Decimal(cost),
-        cumulative_fee=Decimal(0),
+        cumulative_fee=Decimal(fee),
         fee_reconciled=True,
         ts_event=ts_event,
     )
@@ -2046,6 +2047,160 @@ class TestStationDayAdmission:
                 "yes",
                 Decimal("0.90"),
                 existing_instrument_ids=(other_instrument,),
+            )
+        assert got is None
+
+    # -----------------------------------------------------------------
+    # ADM-1: Sigma-q must count a committed-but-unrecorded leg (the
+    # create-path window between the durable fill write and the TRIAL/
+    # TAKEN record landing on a later engine turn).
+    # -----------------------------------------------------------------
+
+    def test_a_committed_fill_without_a_taken_record_counts_toward_sigma_q(
+        self, store_path: Path,
+    ) -> None:
+        """RED (pre-fix): leg A's fill is committed but its TRIAL record
+        has not landed -- the sibling candidate must still see A's spent
+        capital via ``pending_fills``."""
+        other_instrument = "POLY-LAX-TMAX-70-71.POLYMARKET_US"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            fill = _fill_record(
+                venue_order_id="V-1",
+                instrument_id=other_instrument,
+                qty="1",
+                cost="0.50",
+                fee="0.01",
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.55"),
+                existing_instrument_ids=(other_instrument,),
+                pending_fills={other_instrument: fill},
+            )
+        # be = (0.50 + 0.01) / 1 = 0.51; 0.51 + 0.55 == 1.06 > 1.
+        assert got == Refusal(STATION_DAY_ADMISSION_REASON)
+
+    def test_a_leg_with_both_a_taken_record_and_a_pending_fill_counts_once_from_taken(
+        self, store_path: Path,
+    ) -> None:
+        """AC2 / r1.1 guard 2: once a leg has a genuine TRIAL record,
+        ``pending_fills`` for that SAME leg is never consulted -- otherwise
+        the leg would be double-counted."""
+        other_instrument = "POLY-LAX-TMAX-70-71.POLYMARKET_US"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=other_instrument,
+                ask=Decimal("0.10"),
+                reason="taken",
+                fee=Decimal("0.01"),
+                key_instrument_id=other_instrument,
+            )
+            # If this were consulted instead of (or alongside) the TAKEN
+            # record, its own be (0.90) would push the sum above 1.
+            inflated_fill = _fill_record(
+                venue_order_id="V-2",
+                instrument_id=other_instrument,
+                qty="1",
+                cost="0.89",
+                fee="0.01",
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.55"),
+                existing_instrument_ids=(other_instrument,),
+                pending_fills={other_instrument: inflated_fill},
+            )
+        # TAKEN be = 0.10 + 0.01 = 0.11; 0.11 + 0.55 = 0.66 <= 1 -- admitted
+        # only if the inflated pending fill was correctly ignored.
+        assert got is None
+
+    def test_a_pending_fill_with_zero_fee_computes_a_known_q(
+        self, store_path: Path,
+    ) -> None:
+        """A zero fee on a ``DurableFillRecord`` is a KNOWN value (the
+        field is required, unlike the optional ``TrialDayRecord.fee``) --
+        it must not be treated as the legacy 'unknown fee' refusal."""
+        other_instrument = "POLY-LAX-TMAX-70-71.POLYMARKET_US"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            fill = _fill_record(
+                venue_order_id="V-3",
+                instrument_id=other_instrument,
+                qty="1",
+                cost="0.30",
+                fee="0",
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.55"),
+                existing_instrument_ids=(other_instrument,),
+                pending_fills={other_instrument: fill},
+            )
+        # be = 0.30 / 1 = 0.30; 0.30 + 0.55 = 0.85 <= 1 -- admitted.
+        assert got is None
+
+    def test_a_pending_fill_with_zero_cumulative_qty_is_refused_rather_than_divide(
+        self, store_path: Path,
+    ) -> None:
+        """r1.1 guard 1: ``cumulative_qty <= 0`` means the average cost is
+        unknown -- never divide, refuse the whole candidate."""
+        other_instrument = "POLY-LAX-TMAX-70-71.POLYMARKET_US"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            fill = _fill_record(
+                venue_order_id="V-4",
+                instrument_id=other_instrument,
+                qty="0",
+                cost="0",
+                fee="0",
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.10"),
+                existing_instrument_ids=(other_instrument,),
+                pending_fills={other_instrument: fill},
+            )
+        assert got == Refusal(STATION_DAY_ADMISSION_REASON)
+
+    def test_an_in_flight_leg_with_no_trial_record_and_no_pending_fill_contributes_zero(
+        self, store_path: Path,
+    ) -> None:
+        """A leg that is merely IN_FLIGHT -- no TRIAL record and no
+        committed fill yet -- contributes 0, exactly as before ADM-1."""
+        other_instrument = "POLY-LAX-TMAX-70-71.POLYMARKET_US"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.90"),
+                existing_instrument_ids=(other_instrument,),
+                pending_fills={},
             )
         assert got is None
 
