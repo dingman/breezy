@@ -54,11 +54,22 @@ class BatchCoalescer:
         self._coalesce_rows = coalesce_rows
         self._pending: list[pa.RecordBatch] = []
         self._pending_rows = 0
+        self._pending_bytes = 0
         self._done: list[pa.RecordBatch] = []
+        #: Running max, over every ``add()`` call, of ``sum(b.nbytes for b in
+        #: self._pending)`` -- plain Python arithmetic on the batches' own
+        #: reported sizes, immune to OS page eviction and allocator lag
+        #: (unlike ``pa.default_memory_pool().bytes_allocated()``, a proven
+        #: dead end per Stage-0 F3 "after read": it is only sampled once the
+        #: C++ allocator has already reclaimed transient buffers). Tracked
+        #: incrementally (O(1) per add) rather than resummed each call.
+        self.peak_pending_bytes = 0
 
     def add(self, batch: pa.RecordBatch) -> None:
         self._pending.append(batch)
         self._pending_rows += batch.num_rows
+        self._pending_bytes += batch.nbytes
+        self.peak_pending_bytes = max(self.peak_pending_bytes, self._pending_bytes)
         if self._pending_rows >= self._coalesce_rows:
             self._flush()
 
@@ -69,6 +80,7 @@ class BatchCoalescer:
         self._done.extend(table.to_batches())
         self._pending = []
         self._pending_rows = 0
+        self._pending_bytes = 0
 
     def to_table(self) -> pa.Table:
         self._flush()
