@@ -227,8 +227,31 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 | AMBIGUOUS resolver GET + retry | client.py | Phase 1: bounded, jittered backoff, fail-closed |
 | `_retire_unlocked` raise on non-OPEN singleton | runtime/submit_intent.py | Phase 1: line 441–450 (already exists) |
 | Duplicate-fill bucket + family halt | strategy.on_order_filled, trial_day_latch.py | Phase 1: `record_duplicate_fill`, halt key write |
-| `PositionReportingLag` record type & emission | resolver path | Phase 0b: record type; Phase 1: emission plumbing (values require live fill) |
+| `PositionReportingLag` record type & emission | create-path accept-fill (`_submit_order` `KIND_ACCEPT_FILL` branch → next eof-complete positions read) — A2; registered text: 'resolver path' | Phase 0b: record type; Phase 1: emission plumbing (values require live fill) |
 | Dollar halt KILL condition | family tally | Phase 1: check scored_pnl − residual ≤ −60 |
+
+---
+
+### 11.1 Amendment A2 (2026-09-26) — emission location (REGISTERED)
+
+**Status: REGISTERED 2026-09-26.** Authority: `docs/evidence/RULING_R-7_position_reporting_lag_2026-09-26.md`
+(strategy-lead ruling, coordinator-signed under the operator standing grant; no
+operator-reserved value is involved). **The registered §11 row above is
+preserved, struck through in effect only by this subsection** — additive, in
+the manner of Amendment A1 (§5.1).
+
+- **The resolver path cannot produce the quantity.** The registered text
+  assigned emission to the resolver path. That is impossible as specified:
+  the delta comes out negative (positions are read before `now_ns` is taken),
+  and the GET response carries no venue fill instant.
+- **Fill instant = venue `transactTime`, accepted only inside
+  `[send_ns − B, recv_ns + B]`**, with `B = _FILL_TS_EVENT_MAX_SKEW_NS`
+  (build-side, 2 s). No local-clock fallback: an absent or out-of-bound
+  `tsEvent` is rejected, never substituted.
+- **Confirmation = `ts_ns` of the first eof-complete evidence row** showing
+  the resulting LONG after `recv_ns`.
+- **Diagnostic only, unchanged from the registered text.** It never feeds a
+  verdict, and it is lost on restart.
 
 ---
 
@@ -261,7 +284,7 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 - `parse_quote_tick` vs `parse_order_book_depth10` `ts_event` identity (read parsing.py before de-dupe).
 - DataEngine topic routing (strongly implied, not verified).
 - Live `minimumTradeQty` and in-window quote rate.
-- 120 s re-arm floor (unverified until first `PositionReportingLag` record with live fill).
+- 120 s re-arm floor (unverified until first `PositionReportingLag` record with live fill; A2: emitted on the create-path accept-fill branch, skew-guarded venue `transactTime`, never local time — see §11.1).
 - Phase 1 only: bounded GET retries sufficient; venue 5xx / 404 wire shapes.
 
 ---
@@ -296,6 +319,8 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 - Residual mutually exclusive per-fill classification.
 
 **Amendment A1 (2026-09-20):** §5.1 registers the FOURTH residual bucket `no_side_first_order_residual` (last in the first-match-wins ordering, applies from climate_day 2026-09-15, conservative -- only ever removes fills from `n`) and pins admissibility to the residual sidecar rather than the scored-parquet `excluded_reason` column alone. Ruling: `docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md`.
+
+**Amendment A2 (2026-09-26):** §11.1 retargets `PositionReportingLag` emission from the registered-but-impossible resolver path to the create-path accept-fill branch (`_submit_order`'s `KIND_ACCEPT_FILL` branch, confirmed by the next eof-complete positions read showing the resulting LONG), guarded by a skew-bounded venue `transactTime` with no local-clock fallback. Changes the instrument's LOCATION only -- the estimand, statistic, trigger, populations and n are unchanged. Ruling: `docs/evidence/RULING_R-7_position_reporting_lag_2026-09-26.md`.
 
 ---
 
