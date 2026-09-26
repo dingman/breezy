@@ -17,8 +17,10 @@ from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimate
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.settlement.trial_scorer import (
     FilledTrial,
+    ScoredPathQtyInvariantError,
     ScoredTrial,
     ScoreRefusal,
+    assert_scored_pairs_are_unit_qty,
     score_trial,
     score_trials,
 )
@@ -298,6 +300,34 @@ def test_a_dotted_no_leg_instrument_id_string_still_inverts() -> None:
     assert isinstance(result, ScoredTrial)
     assert result.held is False
     assert result.pnl == Decimal(0) - Decimal("0.42") - Decimal("0.01")
+
+
+# ---------------------------------------------------------------------------
+# FU-3d AC1: the shared qty==1 guard both scored-store writers call before
+# `score_trials` (`current_rung_hold_paper_replay.py`, `score_live_trials.py`).
+# ---------------------------------------------------------------------------
+
+
+def test_unit_qty_guard_refuses_a_qty_two_pair_naming_the_trial() -> None:
+    trial = _trial(trial_id="t-qty-2", qty=Decimal(2))
+    with pytest.raises(ScoredPathQtyInvariantError) as excinfo:
+        assert_scored_pairs_are_unit_qty([(trial, None)])
+    assert "t-qty-2" in str(excinfo.value)
+    assert "2" in str(excinfo.value)
+
+
+def test_unit_qty_guard_refuses_a_fractional_qty_pair() -> None:
+    trial = _trial(trial_id="t-qty-frac", qty=Decimal("0.5"))
+    with pytest.raises(ScoredPathQtyInvariantError) as excinfo:
+        assert_scored_pairs_are_unit_qty([(trial, None)])
+    assert "t-qty-frac" in str(excinfo.value)
+    assert "0.5" in str(excinfo.value)
+
+
+def test_unit_qty_guard_passes_all_qty_one_pairs_and_the_empty_sequence() -> None:
+    trial = _trial(trial_id="t-qty-1", qty=Decimal(1))
+    assert_scored_pairs_are_unit_qty([(trial, None), (trial, _record())])
+    assert_scored_pairs_are_unit_qty([])
 
 
 def test_a_yes_leg_instrument_id_is_byte_identical_to_before_the_no_side_change() -> None:

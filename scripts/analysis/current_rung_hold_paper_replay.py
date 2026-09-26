@@ -111,7 +111,11 @@ from breezy.settlement.roi_bound import (
     ROIInputRow,
     compute_roi_bound,
 )
-from breezy.settlement.trial_scorer import FilledTrial, score_trials
+from breezy.settlement.trial_scorer import (
+    FilledTrial,
+    assert_scored_pairs_are_unit_qty,
+    score_trials,
+)
 from breezy.strategy.current_rung_hold.backtest_only import (
     CurrentRungHoldBacktestStrategy,
 )
@@ -1430,6 +1434,20 @@ def _pairs_with_settlement(
 def _print_roi_and_wilson(
     trials: Sequence[FilledTrial], settlement_by_key: SettlementByKey, now_ns: int,
 ) -> None:
+    """Per-arm, reporting-only ROI/Wilson-interval print (MECHANISM TEST,
+    never a verdict). Deliberately calls `score_trials` directly, never
+    through `assert_scored_pairs_are_unit_qty` -- this function writes
+    nothing to the scored-trial store, so FU-3d's guard does not apply here
+    (it fires only immediately before `main`'s own scored-store write,
+    below).
+
+    Risk (FU-3d, accepted): if a qty!=1 `FilledTrial` ever reached this
+    function (today it cannot -- see the plan's Edge Cases), it would print
+    a per-contract `ScoredTrial.pnl` to stdout via the Wilson/ROI-bound
+    lines before `main`'s own guard raises on the SAME trials later. Nothing
+    is persisted by this print; it is accepted because this function's
+    entire purpose is a stdout mechanism check, not a durable artefact.
+    """
     scored, refused = score_trials(
         _pairs_with_settlement(trials, settlement_by_key), now_ns=now_ns,
     )
@@ -1699,9 +1717,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         _print_roi_and_wilson(result.trials, settlement, now_ns)
 
-    scored, _refused = score_trials(
-        _pairs_with_settlement(all_trials, settlement), now_ns=now_ns,
-    )
+    # FU-3d AC1b: defence in depth against an engine over-fill (the only
+    # residual path to qty!=1 here, since backtest fills are qty==1 by
+    # construction -- see the plan's Edge Cases). Fails closed BEFORE the
+    # scored-store write, before `score_trials` even runs.
+    scored_pairs = _pairs_with_settlement(all_trials, settlement)
+    assert_scored_pairs_are_unit_qty(scored_pairs)
+    scored, _refused = score_trials(scored_pairs, now_ns=now_ns)
     if scored:
         write_scored_trials(args.output_dir, scored, now_ns=now_ns)
     resolved_family_id = (

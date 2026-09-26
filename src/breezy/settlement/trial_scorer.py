@@ -129,7 +129,11 @@ class FilledTrial:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ScoredTrial:
-    """One trial's settlement outcome -- `held`, `pnl`, and full provenance."""
+    """One trial's settlement outcome -- `held`, `pnl`, and full provenance.
+
+    `pnl` is per-contract; both production writers (`score_live_trials`,
+    `current_rung_hold_paper_replay`) assert qty==1 before scoring, so it is
+    also per-fill (FU-3d)."""
 
     trial_id: str
     station: str
@@ -278,6 +282,46 @@ def score_trials(
         else:
             scored.append(result)
     return tuple(scored), tuple(refused)
+
+
+class ScoredPathQtyInvariantError(Exception):
+    """A `(FilledTrial, record)` pair reaching `score_trials` had `qty != 1`.
+
+    Ruling Q1 + FU-3d: `ScoredTrial.pnl` is per-contract (`score_trial`,
+    :206). It is also per-fill -- and every downstream consumer that treats
+    it that way (the PREREG draw, the tally, the ROI-bound ratio, the
+    payout identity -- see `docs/plans/backlog/FU-3d_plan_r2_2026-09-26.md`
+    "Design & Data Flow") stays correct -- ONLY because both production
+    writers of the ScoredTrial store (`scripts/analysis/score_live_trials.py`
+    `score_live_trials`, `scripts/analysis/current_rung_hold_paper_replay.py`
+    `main`) call :func:`assert_scored_pairs_are_unit_qty` immediately before
+    `score_trials` and never persist a refused run. A future qty>1 family
+    (Increment B / the station-day trial unit ruling, L-40) must lift this
+    guard deliberately, not bypass it silently.
+    """
+
+
+def assert_scored_pairs_are_unit_qty(
+    pairs: Sequence[tuple[FilledTrial, NwsClimateDay | None]],
+) -> None:
+    """Fail-closed guard: every `trial.qty` in `pairs` must equal ``1``.
+
+    Raises :class:`ScoredPathQtyInvariantError`, naming every offending
+    `trial_id` and its `qty`, if any pair violates the invariant. Pure and
+    side-effect-free -- it is the caller's job to never reach `score_trials`
+    (and therefore never write a scored-store row) once this raises. Kept
+    separate from `score_trial`/`score_trials`, which never change: this
+    lets a caller with no settlement store (e.g. `_print_roi_and_wilson`'s
+    reporting-only call) keep calling `score_trials` directly.
+    """
+    offenders = [
+        (trial.trial_id, trial.qty) for trial, _record in pairs if trial.qty != Decimal(1)
+    ]
+    if offenders:
+        detail = ", ".join(f"{trial_id!r} (qty={qty})" for trial_id, qty in offenders)
+        raise ScoredPathQtyInvariantError(
+            "refusing to score: qty != 1 for pair(s) " + detail
+        )
 
 
 def _pending_reason(record: NwsClimateDay | None) -> RefusalReason:

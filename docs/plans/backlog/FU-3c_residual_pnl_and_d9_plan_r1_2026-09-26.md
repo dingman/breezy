@@ -111,3 +111,17 @@ Amendments folded in:
 - **Correction.** AUD-06b has no current consumer, so "update the AUD-06b reader" is dropped. The v3 ripple is `read_portfolio_roi_report`'s version gate and the test pins, nothing else.
 - **Divergence label.** The markdown P&L block must label the qty divergence (FU-3d) in the report output itself: "residual P&L is qty-scaled; scored P&L is per-contract until FU-3d".
 - **FU-3d** is added to PROGRESS as its own row (scored-path qty scaling), with a note to track the residual bias from `fee_unverified` (≤1¢ per contract).
+
+## r1.2 erratum (FU-3d, 2026-09-26)
+- **"≤1¢ per contract" is false for p in [~0.326, ~0.674].** The fee rounds
+  to 0.02, not 0.01, whenever `theta * p * (1-p) >= 0.015`. At the post-drift
+  `theta=0.0695`, that band is p in [~0.326, ~0.674], which contains p=0.5.
+  Worked examples: at theta=0.0695, p=0.5, the exact fee is 0.017375, which
+  rounds half-even to **0.02**; the pre-drift `theta=0.06`, p=0.5 case is
+  0.015, which also rounds half-even to 0.02. The original CFJ485874TMM
+  example (theta=0.0695, p=0.70) is 0.014595, which rounds to 0.01 and is
+  outside the band -- that specific worked example was never wrong, but the
+  general "≤1¢" claim it was generalised into is. See FU-3d AC4 (the
+  Markdown-only `fee_unverified residuals` disclosure line), which reports
+  the modelled-minus-recorded delta as a signed, per-run-computed quantity
+  rather than repeating this now-corrected bound.

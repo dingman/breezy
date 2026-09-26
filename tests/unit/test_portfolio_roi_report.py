@@ -36,7 +36,7 @@ from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimate
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.persistence.catalog import open_station_catalog, write_records
 from breezy.persistence.family_manifest import FamilyManifest
-from breezy.persistence.residual_fills import EXCLUDED_FILLS_FILENAME
+from breezy.persistence.residual_fills import EXCLUDED_FILLS_FILENAME, ExcludedFill
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial, SettlementBasis
@@ -160,6 +160,13 @@ ResidualSettlement = _prr.ResidualSettlement
 ResidualPending = _prr.ResidualPending
 residual_settlement = _prr.residual_settlement
 _resolve_residual_settlements = _prr._resolve_residual_settlements
+
+# -- FU-3d additions (qty==1 guard label + fee_unverified Markdown disclosure) --
+FeeUnverifiedResidualDisclosure = _prr.FeeUnverifiedResidualDisclosure
+fee_unverified_residual_disclosure = _prr.fee_unverified_residual_disclosure
+_fee_unverified_fills_deduped = _prr._fee_unverified_fills_deduped
+_portfolio_roi_json_dict = _prr._portfolio_roi_json_dict
+_AMBIGUOUS_FEE_WINDOW_NS = 1_789_620_000_000_000_000  # inside [START, END) -- fees.py:121-122
 
 from breezy.runtime import alert_ladder as _ladder
 
@@ -563,6 +570,19 @@ class TestReportHeader:
         assert "settled_through_statistic=max lag_sample_n=4" in report or (
             "settled_through_statistic=max" in report and "lag_sample_n=4" in report
         )
+
+
+class TestScoredPnlLabel:
+    def test_markdown_states_scored_pnl_is_per_fill_by_the_q1_guard(self) -> None:
+        data = _report_data()
+        report = render_markdown_report(data)
+
+        assert "until FU-3d" not in report
+        assert (
+            "residual P&L is qty-scaled; scored P&L is per-fill = per-contract: "
+            "both scored-store writers admit qty==1 fills only, ruling Q1 + "
+            "FU-3d guard"
+        ) in report
 
 
 class TestJournalLineNoCurrency:
@@ -3458,6 +3478,259 @@ class TestResidualSettlementCash:
         )
         rows_by_day = {row["day"]: row for row in report["daily_reconciliation"]}
         assert rows_by_day["2026-09-14"]["classification"] == UNEXPLAINED_OK_LABEL
+
+
+def _fee_unverified_excluded_fill(
+    *,
+    trial_id: str,
+    venue_order_id: str = "vo-fu",
+    scored_run_utc: str = "2026-09-20T00:00:00Z",
+    qty: Decimal = Decimal(1),
+) -> ExcludedFill:
+    return ExcludedFill(
+        trial_id=trial_id,
+        station="LAX",
+        climate_day="2026-09-20",
+        venue_order_id=venue_order_id,
+        qty=qty,
+        reason="fee_unverified",
+        filled_at_ns=_ns_of_day("2026-09-20"),
+        scored_run_utc=scored_run_utc,
+    )
+
+
+class TestFeeUnverifiedResidualDisclosure:
+    """FU-3d AC4/AC5: the Markdown-only "modelled, never booked" fee_unverified
+    disclosure -- computed from the trial's real `FilledTrial` and
+    `taker_fee_at_fill`, never touching JSON or any booked P&L (AC2/AC6)."""
+
+    def test_at_p070_qty1_recorded_zero_the_model_minus_recorded_is_one_cent(self) -> None:
+        # post-drift (theta=0.0695): 0.0695*1*0.70*0.30 = 0.014595 -> 0.01
+        trial_id = "fam/trial/LAX/2026-09-20"
+        trial = _residual_trial(
+            trial_id=trial_id,
+            climate_day="2026-09-20",
+            scheduled_release_day="2026-09-21",
+            fill_px=Decimal("0.70"),
+            fee=Decimal(0),
+            qty=Decimal(1),
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id)
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.n_fee_unverified_settled == 1
+        assert result.model_minus_recorded_fee == Decimal("0.01")
+        assert result.n_fee_unverified_unmodelled == 0
+
+    def test_at_p050_the_model_minus_recorded_is_two_cents(self) -> None:
+        # post-drift: 0.0695*1*0.50*0.50 = 0.017375 -> 0.02
+        trial_id = "fam/trial/LAX/2026-09-20-b"
+        trial = _residual_trial(
+            trial_id=trial_id,
+            climate_day="2026-09-20",
+            scheduled_release_day="2026-09-21",
+            fill_px=Decimal("0.50"),
+            fee=Decimal(0),
+            qty=Decimal(1),
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-b")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.model_minus_recorded_fee == Decimal("0.02")
+
+    def test_negative_when_recorded_exceeds_the_model(self) -> None:
+        trial_id = "fam/trial/LAX/2026-09-20-c"
+        trial = _residual_trial(
+            trial_id=trial_id,
+            climate_day="2026-09-20",
+            scheduled_release_day="2026-09-21",
+            fill_px=Decimal("0.50"),
+            fee=Decimal("0.03"),
+            qty=Decimal(1),
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-c")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.model_minus_recorded_fee == Decimal("-0.01")
+
+    def test_an_unmodelled_theta_is_counted_never_zeroed(self) -> None:
+        trial_id = "fam/trial/LAX/2026-09-17"
+        trial = _residual_trial(
+            trial_id=trial_id,
+            climate_day="2026-09-17",
+            scheduled_release_day="2026-09-18",
+            fill_px=Decimal("0.50"),
+            fee=Decimal(0),
+            qty=Decimal(1),
+        )
+        trial = dataclasses.replace(trial, filled_at_ns=_AMBIGUOUS_FEE_WINDOW_NS)
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-d")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.n_fee_unverified_settled == 1
+        assert result.n_fee_unverified_unmodelled == 1
+        assert result.model_minus_recorded_fee == Decimal(0)
+
+    def test_an_out_of_range_price_is_counted_unmodelled_not_raised(self) -> None:
+        trial_id = "fam/trial/LAX/2026-09-20-e"
+        trial = _residual_trial(
+            trial_id=trial_id,
+            climate_day="2026-09-20",
+            scheduled_release_day="2026-09-21",
+            fill_px=Decimal("1.50"),
+            fee=Decimal(0),
+            qty=Decimal(1),
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-e")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.n_fee_unverified_settled == 1
+        assert result.n_fee_unverified_unmodelled == 1
+        assert result.model_minus_recorded_fee == Decimal(0)
+
+    def test_no_leg_residual_subtracts_the_legs_recorded_fee(self) -> None:
+        """L-44: the NO leg's `fill_px` is the leg's own paid price, and
+        `p(1-p)` is symmetric, so leg inversion is never discriminated here."""
+        trial_id = "fam/trial/LAX/2026-09-20-no"
+        trial = _residual_trial(
+            trial_id=trial_id,
+            climate_day="2026-09-20",
+            scheduled_release_day="2026-09-21",
+            fill_px=Decimal("0.30"),
+            fee=Decimal("0.003"),
+            qty=Decimal(1),
+            instrument_id="LAX-92-94.POLYMARKET_US^no",
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-no")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.n_fee_unverified_settled == 1
+        assert result.model_minus_recorded_fee == Decimal("0.007")
+
+    def test_a_sidecar_fee_unverified_fill_now_reconciled_in_the_state_db_is_not_disclosed(
+        self,
+    ) -> None:
+        trial_id = "fam/trial/LAX/2026-09-20-f"
+        trial = _residual_trial(
+            trial_id=trial_id, climate_day="2026-09-20", scheduled_release_day="2026-09-21",
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-f")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            # The state DB now says fee_reconciled=True -- dropped.
+            fee_reconciled_by_trial_id={trial_id: (True, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset({trial_id}),
+        )
+
+        assert result.n_fee_unverified_settled == 0
+        assert result.model_minus_recorded_fee == Decimal(0)
+
+    def test_a_fill_with_no_booked_residual_settlement_is_not_disclosed(self) -> None:
+        trial_id = "fam/trial/LAX/2026-09-20-g"
+        trial = _residual_trial(
+            trial_id=trial_id, climate_day="2026-09-20", scheduled_release_day="2026-09-21",
+        )
+        fill = _fee_unverified_excluded_fill(trial_id=trial_id, venue_order_id="vo-fu-g")
+
+        result = fee_unverified_residual_disclosure(
+            fee_unverified_fills={fill.venue_order_id: fill},
+            filled_trials=[trial],
+            fee_reconciled_by_trial_id={trial_id: (False, fill.venue_order_id, False)},
+            residual_settlement_trial_ids=frozenset(),  # never booked
+        )
+
+        assert result.n_fee_unverified_settled == 0
+
+    def test_a_fee_unverified_fill_listed_in_two_sidecars_counts_once(
+        self, tmp_path: Path
+    ) -> None:
+        scored_trials_dir = tmp_path / "scored_trials"
+        trial_id = "fam/trial/LAX/2026-09-20-dup"
+        older = score_live_trials.FillExclusion(
+            trial_id=trial_id,
+            station="LAX",
+            climate_day="2026-09-20",
+            qty="1",
+            reason="fee_unverified",
+            detail="older",
+            venue_order_id="vo-dup",
+            filled_at_ns=_ns_of_day("2026-09-20"),
+        )
+        # Legacy top-level (dedupe-only read, never a booked row -- AC5).
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir, [older], scored_run_utc="2026-09-20T00:00:00Z",
+        )
+        # Per-family child dir, SAME venue_order_id, LATER scored_run_utc.
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam", [older], scored_run_utc="2026-09-20T12:00:00Z",
+        )
+
+        deduped = _fee_unverified_fills_deduped(scored_trials_dir)
+
+        assert len(deduped) == 1
+        assert deduped["vo-dup"].scored_run_utc == "2026-09-20T12:00:00Z"
+
+    def test_disclosure_never_reaches_the_json_dict(self) -> None:
+        """AC4/AC6: `_portfolio_roi_json_dict` is an explicit literal --
+        adding the disclosure feature must never introduce a new key."""
+        data = _report_data()
+        assert "fee_unverified" not in json.dumps(_portfolio_roi_json_dict(data))
+
+    def test_the_markdown_line_appears_only_when_a_disclosure_is_passed(self) -> None:
+        data = _report_data()
+        disclosure = FeeUnverifiedResidualDisclosure(
+            n_fee_unverified_settled=2,
+            model_minus_recorded_fee=Decimal("0.03"),
+            n_fee_unverified_unmodelled=1,
+        )
+
+        without = render_markdown_report(data)
+        with_disclosure = render_markdown_report(data, fee_unverified=disclosure)
+
+        assert "fee_unverified residuals" not in without
+        assert (
+            "fee_unverified residuals (FU-3d, modelled, never booked): n=2, "
+            "model minus recorded fee=0.03 (n unmodelled" in with_disclosure
+        )
+        assert "θ unresolved: 1" in with_disclosure
 
 
 class TestFu3bResidualCountsSurfaced:

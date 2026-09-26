@@ -135,6 +135,7 @@ from breezy.settlement.trial_scorer import (
     FilledTrial,
     ScoredTrial,
     ScoreRefusal,
+    assert_scored_pairs_are_unit_qty,
     score_trials,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -1524,6 +1525,11 @@ def score_live_trials(
 
     filled_at_ns_by_trial_id = {trial.trial_id: trial.filled_at_ns for trial, _record in pairs}
 
+    # FU-3d AC1a: fail-closed before any scored-store write -- a regressed
+    # admission gate that let a qty!=1 fill reach here must refuse the whole
+    # run, never persist a parquet row, fill-order entry or provenance
+    # sidecar for it.
+    assert_scored_pairs_are_unit_qty(pairs)
     scored, refused = score_trials(pairs, now_ns=now_ns)
     refused = refused + tuple(extra_refusals)
 
