@@ -32,6 +32,9 @@ from typing import Any
 import pytest
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
+from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
+from breezy.persistence.catalog import open_station_catalog, write_records
 from breezy.persistence.family_manifest import FamilyManifest
 from breezy.persistence.residual_fills import EXCLUDED_FILLS_FILENAME
 from breezy.persistence.scored_trial_store import write_scored_trials
@@ -151,9 +154,23 @@ UNKNOWN_TRIAL_FAMILY_LABEL = _prr.UNKNOWN_TRIAL_FAMILY_LABEL
 _load_registered_family_manifests = _prr._load_registered_family_manifests
 _family_id_of_trial = _prr._family_id_of_trial
 
+# -- FU-3b additions (residual-fill settlement payout reconciliation) --
+ResidualSettlement = _prr.ResidualSettlement
+ResidualPending = _prr.ResidualPending
+residual_settlement = _prr.residual_settlement
+_resolve_residual_settlements = _prr._resolve_residual_settlements
+
 from breezy.runtime import alert_ladder as _ladder
 
 alert_ladder = _ladder
+
+# `_load_module()` above already inserted `scripts/analysis` onto `sys.path`
+# (`portfolio_roi_report.py`'s own module-level `sys.path.insert`), so this
+# resolves the SAME cached `score_live_trials` module `portfolio_roi_report`
+# itself imports from -- needed here only for the real `FillExclusion`/
+# `_append_excluded_fills` writer (test_run_reconciles_a_residual_written_
+# through_the_real_writers).
+import score_live_trials
 
 _FRESH_LATCH = _ladder.LatchState(
     schema_version=_ladder.LATCH_SCHEMA_VERSION,
@@ -2966,3 +2983,378 @@ class TestScoredTrialDedupRefusesEconomicMismatch:
         assert "n_duplicate_scored_trials=1" in line
         assert "$" not in line
         assert not re.search(r"\d+\.\d+", line)
+
+
+# ===========================================================================
+# FU-3b -- residual-fill settlement payouts folded into the cash identity
+# (plan docs/plans/backlog/FU-3b_residual_payout_reconciliation_plan_r1_
+# 2026-09-26.md, r1.1 peer-converged). Scope: cash reconciliation only --
+# never `src/`, `trial_scorer.py`, `score_live_trials.py` or
+# `residual_fills.py`, and a residual settlement must never reach a
+# `ScoredTrial`, the scored-trial store, `n_scored`, `trial_rows`, the lags
+# sample, or `total_realised_pnl_*`.
+# ===========================================================================
+
+
+def _residual_bucket(
+    *, lower_f: int | None, upper_f: int | None, climate_day: str = "2026-09-13"
+) -> WeatherBucketFacts:
+    return WeatherBucketFacts(
+        settlement_station="LAX",
+        climate_day=date.fromisoformat(climate_day),
+        measure=Measure.HIGH,
+        lower_f=lower_f,
+        upper_f=upper_f,
+    )
+
+
+def _residual_trial(
+    *,
+    trial_id: str,
+    climate_day: str = "2026-09-13",
+    scheduled_release_day: str = "2026-09-14",
+    qty: Decimal = Decimal(1),
+    fill_px: Decimal = Decimal("0.70"),
+    fee: Decimal = Decimal(0),
+    instrument_id: str = "LAX-92-94.POLYMARKET_US",
+    bucket: WeatherBucketFacts | None = None,
+) -> FilledTrial:
+    return FilledTrial(
+        trial_id=trial_id,
+        station="LAX",
+        climate_day=climate_day,
+        instrument_id=instrument_id,
+        bucket=(
+            bucket
+            if bucket is not None
+            else _residual_bucket(lower_f=92, upper_f=94, climate_day=climate_day)
+        ),
+        fill_px=fill_px,
+        fee=fee,
+        qty=qty,
+        filled_at_ns=_ns_of_day(climate_day),
+        entry_ask=fill_px,
+        scheduled_release_at_ns=_ns_of_day(scheduled_release_day),
+    )
+
+
+def _residual_record(*, climate_day: str, tmax_f: int) -> NwsClimateDay:
+    day = date.fromisoformat(climate_day)
+    base_ns = _ns_of_day(climate_day)
+    return NwsClimateDay(
+        station="LAX",
+        climate_day=day,
+        tmax_f=tmax_f,
+        tmin_f=tmax_f - 15,
+        tavg_f=tmax_f - 7,
+        tavg_flag=None,
+        tmax_flag=None,
+        tmin_flag=None,
+        is_final=True,
+        correction_flag=False,
+        revision_seq=1,
+        is_superseded=False,
+        issuing_office="KLAX",
+        issuance_time_ns=base_ns,
+        retrieved_at_ns=base_ns,
+        parser_version="test",
+        registry_version="test",
+        raw_sha256="b" * 64,
+        source_channel="test",
+        schema_version=CLIMATE_DAY_SCHEMA_VERSION,
+        ts_event=base_ns,
+    )
+
+
+def _account_state_line(day: str, total_usd: str) -> str:
+    """The shape `parse_account_state_line`/`_ACCOUNT_STATE_RE` requires,
+    parameterised by day and balance -- see `_REAL_ACCOUNT_STATE_LINE` above
+    for the verbatim (synthetic-amount) fixture this mirrors."""
+    return (
+        f"{day}T00:00:00.000000000Z [INFO] Updated "
+        "AccountState(account_id=POLYMARKET_US-MAIN, account_type=CASH, "
+        "base_currency=USD, is_reported=True, "
+        f"balances=[AccountBalance(total={total_usd} USD, locked=0.00 USD, "
+        f"free={total_usd} USD)], margins=[], event_id=test)"
+    )
+
+
+class TestResidualSettlementCash:
+    def test_a_winning_yes_residual_pays_qty_times_one(self) -> None:
+        trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13", qty=Decimal(1))
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)  # inside [92, 94]
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.payout == Decimal(1)
+        assert result.trial_id == trial.trial_id
+        assert result.climate_day == trial.climate_day
+        assert result.settlement_basis == "nws_final"
+
+    def test_a_no_leg_residual_holds_when_high_is_outside_the_rung(self) -> None:
+        """L-44: a NO-leg composite instrument (`^no` suffix) holds exactly
+        when HIGH is OUTSIDE the rung -- the same leg-flip `score_trial`
+        already applies, which `residual_settlement` must inherit
+        unmodified via `scored.held`."""
+        trial = _residual_trial(
+            trial_id="fam/trial/LAX/2026-09-13^no",
+            instrument_id="LAX-92-94^no.POLYMARKET_US",
+            bucket=_residual_bucket(lower_f=92, upper_f=94),
+        )
+        record = _residual_record(climate_day="2026-09-13", tmax_f=99)  # outside [92, 94]
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.payout == Decimal(1)
+
+    def test_a_multi_fill_residual_payout_scales_with_qty(self) -> None:
+        """RED (pre-fix): reusing `settlement_payout` -- which is per-
+        CONTRACT and assumes qty=1 -- pays 1.00 regardless of qty. The
+        payout must scale: `qty * 1{held}`, never `settlement_payout()`."""
+        trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13", qty=Decimal(3))
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.payout == Decimal(3)
+
+    def test_a_residual_payout_is_dated_at_scheduled_release_not_scored_at(self) -> None:
+        trial = _residual_trial(
+            trial_id="fam/trial/LAX/2026-09-13",
+            climate_day="2026-09-13",
+            scheduled_release_day="2026-09-14",
+        )
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-20"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.dated_at_ns == trial.scheduled_release_at_ns
+        assert result.dated_at_ns == _ns_of_day("2026-09-14")
+        assert result.dated_at_ns != _ns_of_day("2026-09-20")
+
+    def test_fu3b_0914_cfj485874tmm_residual_payout_reconciles_ok(self) -> None:
+        """The regression case (plan r1.1, premises verified): ledger
+        capital 0.70, payout 1.00 (qty=1, held), delta_balance +0.29 ->
+        unexplained = -0.01, within the one-fill tolerance -- OK, never
+        UNEXPLAINED_CAPITAL_FLOW. No balance snapshot exists strictly
+        between the BUY fill's own timestamp and the residual's scheduled
+        release (mirrors the real MIA 09-13/09-14 case: the release falls
+        between the 09-13 16:50 and 09-14 16:50 node-log snapshots), so
+        both land in ONE window.
+        """
+        open_fill = _fill(
+            venue_order_id="CFJ485874TMM",
+            ts_event=_ns_of_day("2026-09-13"),
+            cumulative_cost=Decimal("0.70"),
+            cumulative_fee=Decimal(0),
+        )
+        settlement = ResidualSettlement(
+            trial_id="fam/trial/LAX/2026-09-13",
+            climate_day="2026-09-13",
+            payout=Decimal("1.00"),
+            dated_at_ns=_ns_of_day("2026-09-14"),
+            settlement_basis="nws_final",
+        )
+        daily_balances = {
+            "2026-09-12": Decimal("100.00"),
+            "2026-09-14": Decimal("100.29"),
+        }
+
+        rows = reconcile_daily(
+            fills=[open_fill],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=[settlement],
+        )
+        rows_by_day = {row.day: row for row in rows}
+
+        assert rows_by_day["2026-09-14"].classification == UNEXPLAINED_OK_LABEL
+        assert rows_by_day["2026-09-14"].unexplained == Decimal("-0.01")
+
+    def test_a_pending_residual_past_release_is_proxy_lag_not_capital_flow(self) -> None:
+        """A residual with no settlement-grade record adds no payout (§8 AC
+        #4) -- but from `release_day` on, any breach in that window is
+        reclassified UNEXPLAINED_PROXY_LAG rather than a hard
+        UNEXPLAINED_CAPITAL_FLOW, exactly like a normally-scored trial's own
+        lag reclassification, because its still-unknown eventual payout
+        could explain the breach once it resolves. Never netted away: the
+        magnitude is identical with or without the reclassification."""
+        daily_balances = {
+            "2026-09-13": Decimal("100.00"),
+            "2026-09-20": Decimal("105.00"),  # unexplained by any fill or proceeds
+        }
+        pending = ResidualPending(
+            trial_id="fam/trial/LAX/2026-09-13", release_day="2026-09-14"
+        )
+
+        without_pending = reconcile_daily(
+            fills=[], scored_trials=[], daily_balances=daily_balances
+        )
+        with_pending = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_pending=[pending],
+        )
+
+        row_without = {row.day: row for row in without_pending}["2026-09-20"]
+        row_with = {row.day: row for row in with_pending}["2026-09-20"]
+
+        assert row_without.breaches_tolerance is True
+        assert row_without.classification == UNEXPLAINED_CAPITAL_FLOW_LABEL
+        assert row_with.breaches_tolerance is True
+        assert row_with.classification == UNEXPLAINED_PROXY_LAG_LABEL
+        assert row_with.unexplained == row_without.unexplained
+
+    def test_a_trial_both_scored_and_residual_pays_once(self, tmp_path: Path) -> None:
+        """A trial_id present in BOTH the scored set and the residual
+        (excluded_fills) set is paid by the scored row only. `_run` narrows
+        `residual_trial_ids` by subtracting `scored_ids` BEFORE calling
+        `_resolve_residual_settlements` -- this pins that narrowing: the
+        narrowed set is empty, so the shell resolves nothing for this
+        trial_id, no matter what its own ledger/catalog inputs look like."""
+        trial_id = "both/trial/LAX/2026-09-13"
+        trial = _residual_trial(trial_id=trial_id)
+        raw_residual_ids = frozenset({trial_id})
+        scored_ids = frozenset({trial_id})  # the same id also has a scored row
+
+        narrowed_ids = frozenset(raw_residual_ids - scored_ids)
+        settlements, pending, n_unresolved = _resolve_residual_settlements(
+            [trial],
+            residual_trial_ids=narrowed_ids,
+            station_by_trial_id={trial_id: "LAX"},
+            catalog_base=tmp_path / "catalog",
+            venue="polymarket_us",
+            now_ns=_ns_of_day("2026-09-14"),
+        )
+
+        assert narrowed_ids == frozenset()
+        assert settlements == ()
+        assert pending == ()
+        assert n_unresolved == 0
+        assert not (tmp_path / "catalog").exists()  # never touched: gated by membership
+
+    def test_residual_settlements_never_enter_scored_statistics(self) -> None:
+        """Characterisation guard (§8 AC #3): `ResidualSettlement`/
+        `ResidualPending` are deliberately NOT `ScoredTrial` -- a different,
+        narrower shape carrying none of `ScoredTrial`'s own scored-statistics
+        provenance (`held`, `revision_seq`, `raw_sha256`, `score_seq`), so a
+        caller that duck-types instead of checking `isinstance` cannot
+        mistake one for the other. `residual_settlement()`'s return value is
+        never fed to `total_realised_pnl_all_settled`, `dedupe_scored_
+        trials`, `settlement_lag_days`, or `trial_rows_of` -- each of which
+        requires a `ScoredTrial`. Backed by mutation evidence (see the PR/
+        commit notes): injecting a `ResidualSettlement` into a
+        `scored_trials` tuple and calling `total_realised_pnl_all_settled`
+        on it raises `AttributeError` (no `.pnl`), which is exactly the
+        failure this guard exists to make impossible in production code.
+        """
+        trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13")
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert not isinstance(result, ScoredTrial)
+        for scored_only_field in ("held", "revision_seq", "raw_sha256", "score_seq"):
+            assert not hasattr(result, scored_only_field)
+
+        scored_trials = (_scored_trial(trial_id="clean/trial/1", pnl=Decimal("0.10")),)
+        assert _prr.total_realised_pnl_all_settled(scored_trials) == Decimal("0.10")
+
+    def test_run_reconciles_a_residual_written_through_the_real_writers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """L-42: end to end through `_run()`, using the real
+        `score_live_trials._append_excluded_fills` writer, the real NWS
+        catalog writer (`open_station_catalog`/`write_records`), and
+        `_run`'s own fixtures -- never a hand-built `ResidualSettlement`.
+        """
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
+        )
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(
+                venue_order_id="vo-res",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.70"),
+                cumulative_fee=Decimal(0),
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-res", fill.to_bytes())
+        finally:
+            store.close()
+
+        trial_id = "fam_res/trial/LAX/2026-09-13"
+        raw_trial = _residual_trial(trial_id=trial_id)
+        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        release_ns = _ns_of_day("2026-09-14")
+        monkeypatch.setattr(
+            _prr,
+            "_with_scheduled_release_at_ns",
+            lambda trial, *, venue, city: dataclasses.replace(
+                trial, scheduled_release_at_ns=release_ns
+            ),
+        )
+
+        # The real excluded_fills.jsonl writer (I2 3.0(c)) -- this is the
+        # artefact that makes the fill RESIDUAL, never a hand-built line.
+        scored_trials_dir = tmp_path / "scored_trials"
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam_res",
+            [
+                score_live_trials.FillExclusion(
+                    trial_id=trial_id,
+                    station="LAX",
+                    climate_day="2026-09-13",
+                    qty="1",
+                    reason="fee_unverified",
+                    detail="test fixture",
+                    venue_order_id="vo-res",
+                    filled_at_ns=_ns_of_day("2026-09-13"),
+                )
+            ],
+            scored_run_utc="2026-09-13T00:00:00Z",
+        )
+
+        # The real NWS catalog writer -- a settlement-grade FINAL landing
+        # inside the rung, so the residual is a WIN.
+        catalog_base = tmp_path / "catalog"
+        catalog = open_station_catalog(catalog_base, "polymarket_us", "LAX")
+        write_records(catalog, [_residual_record(climate_day="2026-09-13", tmax_f=93)])
+
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "breezy-trade-20260914T000000Z.log").write_text(
+            _account_state_line("2026-09-12", "100.00")
+            + "\n"
+            + _account_state_line("2026-09-14", "100.29")
+            + "\n"
+        )
+
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=logs_dir,
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=_ns_of_day("2026-09-14"),
+            sink=_prr.resolve_alert_sink({}),
+            catalog_base=catalog_base,
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-14.json").read_text()
+        )
+        rows_by_day = {row["day"]: row for row in report["daily_reconciliation"]}
+        assert rows_by_day["2026-09-14"]["classification"] == UNEXPLAINED_OK_LABEL

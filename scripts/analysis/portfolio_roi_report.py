@@ -95,6 +95,13 @@ from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFi
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
 from breezy.adapters.polymarket_us.operator_controls import _round_cost_up_to_cent
 from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
+from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.domain.weather_bucket_facts import WeatherBucketFacts
+from breezy.persistence.catalog import (
+    CatalogPathError,
+    open_station_catalog,
+    read_climate_day_including_corrections,
+)
 from breezy.persistence.family_manifest import (
     FamilyManifest,
     FamilyManifestError,
@@ -112,7 +119,13 @@ from breezy.runtime.health import (
     log_alert_egress_status,
     resolve_alert_sink,
 )
-from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial
+from breezy.settlement.trial_scorer import (
+    FilledTrial,
+    ScoredTrial,
+    ScoreRefusal,
+    SettlementBasis,
+    score_trial,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -121,8 +134,11 @@ from position_monitor_nightly_report import (
     resolve_trial_family,
 )
 from score_live_trials import (
+    DEFAULT_NWS_CATALOG_BASE,
     FillSourceUnreadableError,
     StorePositiveControlFailedError,
+    _bucket_facts_from_instrument_id,
+    _read_bucket_facts_by_instrument_id,
     _with_scheduled_release_at_ns,
     read_filled_trials_state_db,
 )
@@ -169,6 +185,8 @@ __all__ = [
     "PortfolioRoiReportMalformedFieldError",
     "PortfolioRoiReportView",
     "PortfolioRoiTrialRow",
+    "ResidualPending",
+    "ResidualSettlement",
     "RoiAgainstBaselines",
     "UnknownOrderSideError",
     "UnknownPortfolioRoiSchemaError",
@@ -213,6 +231,7 @@ __all__ = [
     "read_scored_trials_pooled",
     "reconcile_daily",
     "render_markdown_report",
+    "residual_settlement",
     "residual_trial_ids",
     "residual_trial_ids_pooled",
     "roi",
@@ -894,6 +913,7 @@ def _cash_between(
     scored_trials: Sequence[ScoredTrial],
     after_ts: int | None,
     through_ts: int,
+    residual_settlements: Sequence[ResidualSettlement] = (),
 ) -> tuple[Decimal, Decimal, int]:
     """Capital, proceeds, and BUY-fill count for one snapshot interval.
 
@@ -904,10 +924,18 @@ def _cash_between(
     Inclusive at ``through_ts``: an event stamped exactly at the closing
     snapshot's own ts happened no later than the balance it is being
     reconciled against, so it belongs to the interval that closes there.
+
+    FU-3b: ``residual_settlements`` contributes to ``proceeds`` exactly like
+    a scored trial's :func:`settlement_payout`, dated by ``dated_at_ns``
+    instead of ``scored_at_ns`` -- it never touches ``capital`` (a residual
+    fill's cost is already counted via ``buy_fills``) or the BUY-fill count.
     """
     if after_ts is None:
         chosen_fills = tuple(fill for fill in buy_fills if fill.ts_event <= through_ts)
         chosen_trials = tuple(trial for trial in scored_trials if trial.scored_at_ns <= through_ts)
+        chosen_residuals = tuple(
+            residual for residual in residual_settlements if residual.dated_at_ns <= through_ts
+        )
     else:
         chosen_fills = tuple(
             fill for fill in buy_fills if after_ts < fill.ts_event <= through_ts
@@ -915,8 +943,15 @@ def _cash_between(
         chosen_trials = tuple(
             trial for trial in scored_trials if after_ts < trial.scored_at_ns <= through_ts
         )
+        chosen_residuals = tuple(
+            residual
+            for residual in residual_settlements
+            if after_ts < residual.dated_at_ns <= through_ts
+        )
     capital = sum((capital_deployed_for_fill(fill) for fill in chosen_fills), start=Decimal(0))
-    proceeds = sum((settlement_payout(trial) for trial in chosen_trials), start=Decimal(0))
+    proceeds = sum((settlement_payout(trial) for trial in chosen_trials), start=Decimal(0)) + sum(
+        (residual.payout for residual in chosen_residuals), start=Decimal(0)
+    )
     return capital, proceeds, len(chosen_fills)
 
 
@@ -962,6 +997,81 @@ def settlement_payout(trial: ScoredTrial) -> Decimal:
     cost - fee, booked once, on the settlement date.'
     """
     return trial.pnl + trial.fill_px + trial.fee
+
+
+#: FU-3b: the proxy-lag window granted to a residual settlement's own dated
+#: day, mirroring the "lag > 1" rule :func:`_days_potentially_explained_by_
+#: proxy_lag` already applies to a normally-scored trial's
+#: ``settlement_lag_days``. A residual is never scored, so it has no
+#: ``scored_at_ns`` to measure an observed lag from -- this is a fixed
+#: structural window (the release day itself, plus one day for ordinary
+#: venue processing lag) rather than an observed statistic.
+_RESIDUAL_PROXY_LAG_DAYS: Final[int] = 2
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ResidualSettlement:
+    """One residual (PREREG-excluded) fill's cash settlement payout.
+
+    FU-3b: a residual fill's cost is already counted in
+    ``capital_deployed`` (it is a real ledger fill), but absent this type its
+    payout was never counted anywhere -- a false ``UNEXPLAINED_CAPITAL_FLOW``
+    on the day it actually paid out. This is a plain cash record: it is never
+    a ``ScoredTrial``, never written to the scored-trial store, and never
+    reaches ``n_scored``/``trial_rows``/the lags sample/``total_realised_
+    pnl_*`` (§8 AC #3).
+    """
+
+    trial_id: str
+    climate_day: str
+    payout: Decimal
+    dated_at_ns: int
+    settlement_basis: SettlementBasis
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ResidualPending:
+    """A residual fill whose settlement truth has not landed yet.
+
+    Its capital is already deployed with no proceeds yet -- absent this
+    type, that shows up as a false ``UNEXPLAINED_CAPITAL_FLOW``. From
+    ``release_day`` on, it is instead tagged ``UNEXPLAINED_PROXY_LAG`` (§8 AC
+    #4), the same reclassification :func:`_days_potentially_explained_by_
+    proxy_lag` already applies to a normally-scored trial's lag.
+    """
+
+    trial_id: str
+    release_day: str
+
+
+def residual_settlement(
+    trial: FilledTrial, record: NwsClimateDay | None, *, now_ns: int
+) -> ResidualSettlement | ResidualPending:
+    """One residual fill's cash settlement, or the fact that it is still
+    pending.
+
+    Calls :func:`score_trial` and keeps the returned ``ScoredTrial`` --
+    ``held`` and ``settlement_basis`` only -- strictly LOCAL to this
+    function: it is never returned, stored, or otherwise let escape into any
+    scored statistic (§8 AC #3). The payout is ``qty * 1{held}`` -- never
+    :func:`settlement_payout`, which is per-CONTRACT (assumes ``qty=1``) and
+    would silently under-pay a multi-contract residual.
+    """
+    scored_or_refusal = score_trial(trial, record, now_ns=now_ns)
+    if isinstance(scored_or_refusal, ScoreRefusal):
+        return ResidualPending(
+            trial_id=trial.trial_id,
+            release_day=_utc_day_of_ns(trial.scheduled_release_at_ns),
+        )
+    scored = scored_or_refusal
+    payout = trial.qty * (Decimal(1) if scored.held else Decimal(0))
+    return ResidualSettlement(
+        trial_id=trial.trial_id,
+        climate_day=trial.climate_day,
+        payout=payout,
+        dated_at_ns=trial.scheduled_release_at_ns,
+        settlement_basis=scored.settlement_basis,
+    )
 
 
 #: §6 D4 R3: "proceeds(D) is dated by the UTC calendar day of scored_at_ns,
@@ -1260,6 +1370,8 @@ def reconcile_daily(
     scored_trials: Sequence[ScoredTrial],
     daily_balances: Mapping[str, Decimal | None],
     balance_timestamps_ns: Mapping[str, int] | None = None,
+    residual_settlements: Sequence[ResidualSettlement] = (),
+    residual_pending: Sequence[ResidualPending] = (),
 ) -> tuple[DailyUnexplained, ...]:
     """The cash identity (§6 D4), one row per balance interval.
 
@@ -1279,12 +1391,35 @@ def reconcile_daily(
     them, and :class:`BALANCE_UNKNOWN_LABEL` rows never enter that sum.
     A balance jump with no fill and no settlement in the interval stays
     :data:`UNEXPLAINED_CAPITAL_FLOW_LABEL` at its full magnitude.
+
+    FU-3b: ``residual_settlements``' payouts are folded into ``proceeds``
+    (via :func:`_cash_between`) exactly like a scored trial's, and their
+    ``dated_at_ns`` day (plus the following day, for ordinary venue
+    processing lag) is folded into the proxy-lag day set alongside
+    ``residual_pending``'s ``release_day`` through the latest day this call
+    covers -- a residual with no settlement-grade record yet is never
+    misclassified as an unexplained capital flow while it is still pending.
     """
     scored_trials, _n_duplicate = dedupe_scored_trials(tuple(scored_trials))
     capital_by_day = capital_deployed_by_day(fills)
     fills_opened_count = _fills_opened_count_by_day(fills)
     proceeds_totals = proceeds_by_day(scored_trials)
-    proxy_lag_days = _days_potentially_explained_by_proxy_lag(scored_trials)
+    proxy_lag_days = dict(_days_potentially_explained_by_proxy_lag(scored_trials))
+    for settlement in residual_settlements:
+        release_day = _utc_day_of_ns(settlement.dated_at_ns)
+        for day in (release_day, _shift_iso_day(release_day, 1)):
+            proxy_lag_days[day] = max(proxy_lag_days.get(day, 0), _RESIDUAL_PROXY_LAG_DAYS)
+    if residual_pending:
+        # "Through today": bounded by the latest day this call's own
+        # `daily_balances` covers (in a real run, the report's `period_end`)
+        # -- never unbounded, and never requiring a separate `now_ns` input.
+        report_bound_day = max(daily_balances) if daily_balances else None
+        for pending in residual_pending:
+            end_day = pending.release_day
+            if report_bound_day is not None and report_bound_day > end_day:
+                end_day = report_bound_day
+            for day in _days_between_inclusive(pending.release_day, end_day):
+                proxy_lag_days[day] = max(proxy_lag_days.get(day, 0), _RESIDUAL_PROXY_LAG_DAYS)
     buy_fills = tuple(fill for fill in fills if fill_side_label(fill) == ORDER_SIDE_BUY)
 
     rows: list[DailyUnexplained] = []
@@ -1301,6 +1436,7 @@ def reconcile_daily(
             scored_trials=scored_trials,
             after_ts=prev_ts,
             through_ts=this_ts,
+            residual_settlements=residual_settlements,
         )
         unexplained = window.delta - proceeds + capital_deployed
         tolerance = per_day_tolerance(n_fills_in_span)
@@ -1355,6 +1491,7 @@ def reconcile_daily(
                 scored_trials=scored_trials,
                 after_ts=None,
                 through_ts=first_ts,
+                residual_settlements=residual_settlements,
             )
             rows.append(
                 DailyUnexplained(
@@ -2716,6 +2853,18 @@ def _default_families_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "deploy" / "families"
 
 
+def _default_catalog_base() -> Path:
+    """FU-3b: the NWS catalog root residual settlement resolution reads
+    settlement truth from -- same env-var-or-literal-default convention as
+    every other `_default_*` here, defaulting to
+    `score_live_trials.DEFAULT_NWS_CATALOG_BASE` (the same root
+    `score_live_trials.py` itself resolves to when no override is set)."""
+    override = os.environ.get("BREEZY_NWS_CATALOG_BASE", "").strip()
+    if override:
+        return Path(override)
+    return DEFAULT_NWS_CATALOG_BASE
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FamilyManifestAttribution:
     """:func:`attribute_fills_via_family_manifests`'s return shape:
@@ -2883,6 +3032,121 @@ def attribute_fills_via_family_manifests(
 
 
 # --------------------------------------------------------------------------
+# FU-3b -- residual-fill settlement payout resolution shell
+# --------------------------------------------------------------------------
+
+#: Closed, named exception tuple for :func:`_resolve_residual_settlements`
+#: (modelled on `station_candidate_register._READ_ERRORS`) -- never a broad
+#: `except Exception`. :class:`CatalogPathError` covers an unsafe/symlinked
+#: catalog path; `OSError` covers a filesystem failure opening or reading a
+#: station's NWS catalog.
+_RESIDUAL_SETTLEMENT_READ_ERRORS: Final[tuple[type[Exception], ...]] = (
+    OSError,
+    CatalogPathError,
+)
+
+
+def _resolve_residual_settlements(
+    filled_trials: Sequence[FilledTrial],
+    *,
+    residual_trial_ids: frozenset[str],
+    station_by_trial_id: Mapping[str, str],
+    catalog_base: Path,
+    venue: str,
+    now_ns: int,
+) -> tuple[tuple[ResidualSettlement, ...], tuple[ResidualPending, ...], int]:
+    """Resolve every RESIDUAL-bucket trial's cash settlement, best-effort.
+
+    Deduplicated by `trial_id` -- `filled_trials` is the flattened union of
+    every (family, station) pair's own trials (F8's shared enumeration), and
+    two families can legitimately enumerate the same residual trial_id.
+    Only trials in `residual_trial_ids` are considered; a caller that has
+    already removed any trial_id that is ALSO a scored row (the scored row
+    already pays it) passes the narrowed set.
+
+    Rung resolution mirrors `score_live_trials.score_live_trials`'s own
+    precedent exactly: a trial's own `bucket` wins if already resolved,
+    else the persisted instrument definition
+    (`_read_bucket_facts_by_instrument_id`, cached per station), else the
+    instrument id's own slug grammar (`_bucket_facts_from_instrument_id`).
+
+    Best-effort per trial: a trial this function cannot resolve -- no known
+    station, no resolvable rung, or a read failure opening/reading its
+    station's NWS catalog -- increments the returned unresolved count and is
+    logged by `trial_id`, the exception's type name and message (never an
+    amount) when an exception is the cause.
+    """
+    settlements: list[ResidualSettlement] = []
+    pending: list[ResidualPending] = []
+    n_unresolved = 0
+    seen: set[str] = set()
+    bucket_facts_by_station: dict[str, dict[str, WeatherBucketFacts]] = {}
+
+    for trial in filled_trials:
+        if trial.trial_id not in residual_trial_ids or trial.trial_id in seen:
+            continue
+        seen.add(trial.trial_id)
+
+        station = station_by_trial_id.get(trial.trial_id)
+        if station is None:
+            n_unresolved += 1
+            logger.warning(
+                "portfolio_roi_report: residual settlement unresolved "
+                "trial_id=%s: no attributed station",
+                trial.trial_id,
+            )
+            continue
+
+        try:
+            resolved_bucket = trial.bucket
+            if resolved_bucket is None:
+                by_instrument = bucket_facts_by_station.get(station)
+                if by_instrument is None:
+                    by_instrument = _read_bucket_facts_by_instrument_id(
+                        catalog_base, venue=venue, city=station
+                    )
+                    bucket_facts_by_station[station] = by_instrument
+                resolved_bucket = by_instrument.get(trial.instrument_id)
+                if resolved_bucket is None:
+                    resolved_bucket = _bucket_facts_from_instrument_id(trial.instrument_id)
+            if resolved_bucket is None:
+                n_unresolved += 1
+                logger.warning(
+                    "portfolio_roi_report: residual settlement unresolved "
+                    "trial_id=%s: rung_unresolved",
+                    trial.trial_id,
+                )
+                continue
+            resolved_trial = trial if trial.bucket is not None else replace(
+                trial, bucket=resolved_bucket
+            )
+            catalog = open_station_catalog(catalog_base, venue, station)
+            record = read_climate_day_including_corrections(
+                catalog,
+                station=trial.station,
+                climate_day=date.fromisoformat(trial.climate_day),
+            )
+        except _RESIDUAL_SETTLEMENT_READ_ERRORS as exc:
+            n_unresolved += 1
+            logger.warning(
+                "portfolio_roi_report: residual settlement lookup failed "
+                "trial_id=%s type=%s: %s",
+                trial.trial_id,
+                type(exc).__name__,
+                exc,
+            )
+            continue
+
+        result = residual_settlement(resolved_trial, record, now_ns=now_ns)
+        if isinstance(result, ResidualSettlement):
+            settlements.append(result)
+        else:
+            pending.append(result)
+
+    return tuple(settlements), tuple(pending), n_unresolved
+
+
+# --------------------------------------------------------------------------
 # C2 -- CLI (`main`, argv=None-friendly per the wrapper's no-args contract)
 # --------------------------------------------------------------------------
 
@@ -2896,6 +3160,7 @@ def _run(
     families_dir: Path,
     now_ns: int,
     sink: AlertSink,
+    catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
 ) -> int:
     """The I/O shell's actual work, factored out of `main()` as an explicit
     test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
@@ -2906,6 +3171,11 @@ def _run(
     `main()` reads. `main([])`'s own no-argument CLI contract (pinned by
     `deploy/systemd/portfolio-roi-run.sh` and
     `tests/unit/test_portfolio_roi_deploy.py`) is unchanged by this split.
+
+    `catalog_base` (FU-3b) is only ever read when at least one residual
+    trial_id needs resolving (`_resolve_residual_settlements`) -- a run with
+    no residual fills touches no catalog path, so the default is safe for
+    every pre-existing caller/test that never writes one.
     """
     ledger_result = read_ledger_fills_with_counts(exec_state_db_path)
     if ledger_result is None:
@@ -3043,11 +3313,44 @@ def _run(
                 }
                 balance_timestamps_ns[lookback_day] = balance_point_ts_ns(lookback_point.ts_iso)
 
+        # D9's own list, materialized here (rather than just before its use
+        # below) because FU-3b's residual settlement resolution -- which
+        # must feed `reconcile_daily` -- needs it too: both consume the SAME
+        # `family_station_results` the attribution join above already
+        # gathered (F8), no second `read_filled_trials_state_db` pass.
+        filled_trials: list[FilledTrial] = [
+            trial for result in family_station_results for trial in result.trials
+        ]
+
+        # FU-3b: a residual fill's cost is already counted in
+        # `capital_deployed` (it is a real ledger fill); absent this, its
+        # payout was never counted anywhere. Resolved best-effort, over the
+        # RESIDUAL-bucket trial_ids only -- a trial_id that is ALSO a scored
+        # row is excluded here (the scored row already pays it, §8 AC
+        # "both scored and residual pays once").
+        station_by_trial_id = {
+            trial.trial_id: result.station
+            for result in family_station_results
+            for trial in result.trials
+        }
+        residual_settlements, residual_pending, _n_residual_unresolved = (
+            _resolve_residual_settlements(
+                filled_trials,
+                residual_trial_ids=frozenset(residual_ids - scored_ids),
+                station_by_trial_id=station_by_trial_id,
+                catalog_base=catalog_base,
+                venue="polymarket_us",
+                now_ns=now_ns,
+            )
+        )
+
         daily_rows = reconcile_daily(
             fills=fills,
             scored_trials=scored_trials,
             daily_balances=daily_balances,
             balance_timestamps_ns=balance_timestamps_ns,
+            residual_settlements=residual_settlements,
+            residual_pending=residual_pending,
         )
         # G1: a successful look-back above adds a day BEFORE `period_start`
         # into `daily_balances` purely as a window anchor -- it is never
@@ -3065,11 +3368,8 @@ def _run(
         )
 
         # D9: the permanently-unsettled left-anti-join, over the SAME
-        # `family_station_results` the attribution join above already
-        # gathered (F8) -- no second `read_filled_trials_state_db` pass.
-        filled_trials: list[FilledTrial] = [
-            trial for result in family_station_results for trial in result.trials
-        ]
+        # `family_station_results`/`filled_trials` gathered above (F8) -- no
+        # second `read_filled_trials_state_db` pass.
         permanently_unsettled = permanently_unsettled_trials(
             filled_trials, scored_trial_ids=scored_ids, now_ns=now_ns
         )
@@ -3162,6 +3462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         families_dir=_default_families_dir(),
         now_ns=time.time_ns(),
         sink=resolve_alert_sink(os.environ),
+        catalog_base=_default_catalog_base(),
     )
 
 
