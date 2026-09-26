@@ -1573,6 +1573,8 @@ systemd-analyze --user verify ~/.config/systemd/user/breezy-hypothesis-triage.{s
     --freeze-commit <40-hex> --register-forecast-taker-closed
 .venv/bin/python scripts/analysis/hypothesis_register.py --registered-at <YYYY-MM-DD> \
     --register-underpowered H-NO-SIDE-2026-09
+.venv/bin/python scripts/analysis/hypothesis_register.py --registered-at <YYYY-MM-DD> \
+    --register-underpowered H-ARCHIVE-RECAL-2026-09
 
 # 4. Enable the timer. This starts nothing; no stamp file exists yet, so there is no catch-up run.
 systemctl --user enable --now breezy-hypothesis-triage.timer

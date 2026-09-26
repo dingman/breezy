@@ -27,7 +27,12 @@ sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 import hypothesis_register
 from hypothesis_register import (
+    ARCHIVE_RECAL_FREEZE_COMMIT,
+    ARCHIVE_RECAL_HYPOTHESIS_CLASS,
     ARCHIVE_RECAL_HYPOTHESIS_ID,
+    ARCHIVE_RECAL_MDE,
+    ARCHIVE_RECAL_PLAUSIBILITY_BOUND,
+    ARCHIVE_RECAL_REFERENCE_ASK,
     FORECAST_TAKER_HYPOTHESIS_ID,
     FORECAST_TAKER_K_VARIANTS,
     NO_SIDE_FREEZE_COMMIT,
@@ -40,6 +45,7 @@ from hypothesis_register import (
     default_derived_root,
     ledger_path,
     main,
+    register_archive_recal_underpowered,
     register_forecast_taker_closed_disposition,
     register_no_side_underpowered,
 )
@@ -62,6 +68,10 @@ _VALID_FREEZE_SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 RULING_PATH = (
     REPO_ROOT / "docs/evidence/RULING_H-NO-SIDE-2026-09_horizon_2026-09-25.md"
+)
+
+ARCHIVE_RECAL_RULING_PATH = (
+    REPO_ROOT / "docs/evidence/RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md"
 )
 
 
@@ -257,8 +267,13 @@ def test_append_keeps_closed_line_byte_identical(tmp_path: Path) -> None:
     assert closed_line_after == closed_line_before
 
 
-def test_archive_recal_is_not_a_registrable_choice(tmp_path: Path) -> None:
-    """T6."""
+def test_unknown_hypothesis_is_not_a_registrable_choice(tmp_path: Path) -> None:
+    """Supersedes T6 (AUD-18a plan): the refusal property is a preservation
+    guard, kept and retargeted from `H-ARCHIVE-RECAL-2026-09` (now
+    registrable per its ruling's `The :137 condition is closed.`) to a
+    genuinely unknown id. Green immediately -- argparse's `choices` refuses
+    it before any ledger file is touched, before this slice's own
+    implementation lands."""
     path = ledger_path(tmp_path)
     with pytest.raises(SystemExit) as exc_info:
         main(
@@ -268,10 +283,139 @@ def test_archive_recal_is_not_a_registrable_choice(tmp_path: Path) -> None:
                 "--registered-at",
                 "2026-09-25",
                 "--register-underpowered",
-                ARCHIVE_RECAL_HYPOTHESIS_ID,
+                "H-SOME-UNKNOWN-HYPOTHESIS",
             ]
         )
     assert exc_info.value.code == 2
+    assert not path.exists()
+
+
+def test_archive_recal_constants_match_ruling_lines() -> None:
+    """T1: pins exact ruling STRINGS, never line numbers (AUD-18a plan r1.1:
+    the ruling's line numbers moved +2 when a STATUS line was added on
+    09-26). `k_variants` and `min_station_days` are pinned against their
+    canonical bold table-cell rows per r1.1's citation correction; every
+    other value is pinned against non-bold prose."""
+    text = ARCHIVE_RECAL_RULING_PATH.read_text(encoding="utf-8")
+    assert "`hypothesis_id` | `H-ARCHIVE-RECAL-2026-09`" in text
+    assert "`hypothesis_class` | `pm_us_crh_v4_archive_recalibration`" in text
+    assert "| `k_variants` | **1** |" in text
+    assert "`min_station_days` (with-takes, §6.1 zero-take rule) | **600** |" in text
+    assert "`freeze_commit` | `49261a5c2119fc621863ad7df05af1e2a96c6b55`" in text
+    assert "per_variant_alpha=0.0125" in text
+    assert "3.08302/48.9898 = 0.0629" in text
+    assert "reference ask `a = 0.30`" in text
+    assert "theta = 0.0695" in text
+    assert "mde_plausibility_bound = 0.03" in text
+    assert "MDE (0.0629) > mde_plausibility_bound (0.03)" in text
+    assert "CONFIRMED-WITH-NOTES" in text
+    assert "The :137 condition is closed." in text
+
+    assert ARCHIVE_RECAL_HYPOTHESIS_ID == "H-ARCHIVE-RECAL-2026-09"
+    assert ARCHIVE_RECAL_HYPOTHESIS_CLASS == "pm_us_crh_v4_archive_recalibration"
+    assert ARCHIVE_RECAL_FREEZE_COMMIT == "49261a5c2119fc621863ad7df05af1e2a96c6b55"
+    assert ARCHIVE_RECAL_PLAUSIBILITY_BOUND == 0.03
+    assert ARCHIVE_RECAL_REFERENCE_ASK == 0.30
+
+    recomputed = recompute_mde(per_variant_alpha=0.0125, n_station_days=600)
+    assert abs(recomputed - ARCHIVE_RECAL_MDE) <= MDE_MISMATCH_TOLERANCE
+
+
+def test_register_underpowered_archive_recal_writes_zero_look_record(tmp_path: Path) -> None:
+    """T2."""
+    path = ledger_path(tmp_path)
+    record = register_archive_recal_underpowered(path=path, registered_at="2026-09-25")
+
+    assert record.hypothesis_id == ARCHIVE_RECAL_HYPOTHESIS_ID
+    assert record.status == "UNDERPOWERED_NOT_REGISTERED"
+    assert record.allocated_alpha == 0.0
+    assert record.per_variant_alpha == 0.0
+    assert record.is_zero_look is True
+    assert record.look_policy == "SINGLE_LOOK"
+    assert record.mde_fee_theta == pytest.approx(0.0695)
+    assert record.order_quantity == 1
+    assert record.station_day_statistic == "MEAN_EXCESS_PER_TAKE"
+    assert record.freeze_commit == ARCHIVE_RECAL_FREEZE_COMMIT
+
+    round_tripped = read_hypothesis_ledger(path)
+    assert round_tripped == (record,)
+    assert programme_budget_remaining(round_tripped) == 4
+
+
+def test_archive_recal_powered_up_design_leaves_ledger_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3: mirrors the NO-SIDE T3 -- monkeypatching the plausibility bound to
+    0.20 would power this design up to `REGISTERED` under the OLD write
+    order (compute, then write unconditionally). The check-before-write path
+    refuses it before any bytes reach the file."""
+    path = ledger_path(tmp_path)
+    write_hypothesis_ledger(path, ())
+    before_bytes = path.read_bytes()
+    before_mtime_ns = path.stat().st_mtime_ns
+
+    monkeypatch.setattr(hypothesis_register, "ARCHIVE_RECAL_PLAUSIBILITY_BOUND", 0.20)
+    with pytest.raises(UnexpectedRegistrationStatusError):
+        register_archive_recal_underpowered(path=path, registered_at="2026-09-25")
+
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_archive_recal_cli_second_run_exits_one_file_unchanged(tmp_path: Path) -> None:
+    """T4."""
+    argv = [
+        "--derived-root",
+        str(tmp_path),
+        "--registered-at",
+        "2026-09-26",
+        "--register-underpowered",
+        ARCHIVE_RECAL_HYPOTHESIS_ID,
+    ]
+    assert main(argv) == 0
+    path = ledger_path(tmp_path)
+    after_first = path.read_bytes()
+
+    assert main(argv) == 1
+    assert path.read_bytes() == after_first
+
+
+def test_archive_recal_append_keeps_existing_lines_byte_identical(tmp_path: Path) -> None:
+    """T5. AC4: the forecast-taker and NO-side lines stay byte-identical
+    after `H-ARCHIVE-RECAL-2026-09` is appended."""
+    path = ledger_path(tmp_path)
+    closed = register_forecast_taker_closed_disposition(
+        path=path, registered_at="2026-09-20", freeze_commit="deadbee"
+    )
+    closed_line_before = json.dumps(closed.to_dict(), sort_keys=True)
+
+    no_side = register_no_side_underpowered(path=path, registered_at="2026-09-25")
+    no_side_line_before = json.dumps(no_side.to_dict(), sort_keys=True)
+
+    register_archive_recal_underpowered(path=path, registered_at="2026-09-26")
+
+    records = {record.hypothesis_id: record for record in read_hypothesis_ledger(path)}
+    closed_line_after = json.dumps(records[FORECAST_TAKER_HYPOTHESIS_ID].to_dict(), sort_keys=True)
+    no_side_line_after = json.dumps(records[NO_SIDE_HYPOTHESIS_ID].to_dict(), sort_keys=True)
+    assert closed_line_after == closed_line_before
+    assert no_side_line_after == no_side_line_before
+
+
+def test_archive_recal_registered_at_before_ruling_date_refused(tmp_path: Path) -> None:
+    """Per-hypothesis date gate: `H-ARCHIVE-RECAL-2026-09`'s own ruling date
+    (2026-09-25) gates it independently of `NO_SIDE_RULING_DATE`."""
+    path = ledger_path(tmp_path)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(tmp_path),
+            "--registered-at",
+            "2026-09-24",
+            "--register-underpowered",
+            ARCHIVE_RECAL_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 2
     assert not path.exists()
 
 
