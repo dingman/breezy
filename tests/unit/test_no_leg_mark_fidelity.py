@@ -22,6 +22,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.strategy.current_rung_hold.monitor_decision import _BOOK_STALE_NS
 from breezy.strategy.current_rung_hold.monitor_evidence import walk_exit_vwap
 from tests.unit.polymarket_us_exec_shapes import build_instrument, build_no_leg_instrument
@@ -308,15 +309,41 @@ def test_unreadable_store_exits_2_without_writing(tmp_path: Path) -> None:
 
 
 def test_store_opened_read_only(tmp_path: Path) -> None:
+    """Fixture is a real `SqliteStateStore` (WAL mode + synchronous=FULL,
+    the exact pragmas production sets, `sqlite_store.py:123-124`), left
+    OPEN while the reader runs -- the actual concurrent read-while-write
+    shape `_open_readonly`'s docstring claims safety for, not a closed
+    file. In WAL mode a write lands in `-wal` before any checkpoint, so
+    the main file's mtime proves nothing on its own; `-wal` byte-identity
+    is the assertion that actually discriminates. Verified by mutation: a
+    plain read-write `sqlite3.connect` that writes one row leaves the main
+    file's mtime/bytes untouched but grows `-wal` by 8240 bytes and bumps
+    its mtime -- exactly what `wal_before` below would catch.
+    """
     db_path = tmp_path / "exec_state.sqlite"
+    store = SqliteStateStore(db_path)
     fill = _fill(instrument_id=_YES_ID, order_side="BUY", px="0.40", qty=1, ts_event=_T)
-    _write_state_db(db_path, {f"exec/polymarket_us/fill/{fill.venue_order_id}": fill.to_bytes()})
-    mtime_before = db_path.stat().st_mtime_ns
+    store.set(f"exec/polymarket_us/fill/{fill.venue_order_id}", fill.to_bytes())
 
-    fills = read_fill_records(db_path)
+    wal_path = db_path.with_name(db_path.name + "-wal")
+    shm_path = db_path.with_name(db_path.name + "-shm")
+    journal_path = db_path.with_name(db_path.name + "-journal")
+    sidecars_before = {p for p in (wal_path, shm_path, journal_path) if p.exists()}
+    # Sanity: the fixture is really WAL, with both live sidecars present --
+    # if this fails the fixture stopped mirroring production.
+    assert sidecars_before == {wal_path, shm_path}
 
-    assert len(fills) == 1
-    assert db_path.stat().st_mtime_ns == mtime_before
-    assert not db_path.with_name(db_path.name + "-wal").exists()
-    assert not db_path.with_name(db_path.name + "-journal").exists()
-    assert not db_path.with_name(db_path.name + "-shm").exists()
+    main_before = (db_path.stat().st_mtime_ns, db_path.read_bytes())
+    wal_before = (wal_path.stat().st_mtime_ns, wal_path.read_bytes())
+
+    try:
+        fills = read_fill_records(db_path)
+
+        assert len(fills) == 1
+        assert (db_path.stat().st_mtime_ns, db_path.read_bytes()) == main_before
+        assert (wal_path.stat().st_mtime_ns, wal_path.read_bytes()) == wal_before
+        assert not journal_path.exists()
+        after = {p for p in (wal_path, shm_path, journal_path) if p.exists()}
+        assert after == sidecars_before, "reader must not create a sidecar that didn't exist"
+    finally:
+        store.close()
