@@ -71,6 +71,7 @@ from aud07_live_rule_crossing_sim import (
     EPS_FLOOR,
     LOOK_STEP,
     M1C_GRID,
+    N_DEPTHS,
     N_MAX,
     ResumeKeyConflictError,
     StreamingBoundary,
@@ -121,9 +122,17 @@ class CensusCellStats:
     p999_abs_delta_b: float
     min_dt: float
     min_t1: float
+    #: AUD-07 M1c-eps_k (RULING PR-1): per-depth max |delta b| (index 0 =
+    #: depth 1, `None` where this cell/rep never reached that depth before
+    #: its first terminal look) and the max |delta b| observed AT a
+    #: terminal look, classified strictly by the sim's own stop rule
+    #: (`t >= 1` or `look_n >= N_MAX`), never by ordinal position. Both
+    #: `None` (the default) for a legacy scalar-only census row.
+    max_abs_delta_by_depth: tuple[float | None, ...] | None = None
+    terminal_max_abs_delta: float | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "cell_index": self.cell_index,
             "n_reps": self.n_reps,
             "max_abs_delta_b": self.max_abs_delta_b,
@@ -131,6 +140,11 @@ class CensusCellStats:
             "min_dt": self.min_dt,
             "min_t1": self.min_t1,
         }
+        if self.max_abs_delta_by_depth is not None:
+            payload["max_abs_delta_by_depth"] = list(self.max_abs_delta_by_depth)
+        if self.terminal_max_abs_delta is not None:
+            payload["terminal_max_abs_delta"] = self.terminal_max_abs_delta
+        return payload
 
 
 def _p999(values: list[float]) -> float:
@@ -146,7 +160,15 @@ def run_census_cell(
 ) -> CensusCellStats:
     """Run both grids over the full no-stop schedule for `n_reps`
     replicates of `M1C_GRID[cell_index]`, recording the per-cell max/p99.9
-    |delta b| and the minimum dt/t_1 observed."""
+    |delta b| and the minimum dt/t_1 observed.
+
+    AUD-07 M1c-eps_k (RULING PR-1): ALSO buckets each look's |delta b| by
+    ordinal depth or into the terminal bucket, classified strictly by the
+    sim's own stop rule (`t >= 1` or `look_n >= N_MAX`, never ordinal
+    position) -- only up to and including a rep's FIRST such terminal look
+    (matching what one real replicate would ever reach; a look past it is
+    never bucketed, though the schedule below still runs in full, so the
+    pre-existing pooled `deltas`/`min_dt`/`min_t1` stats are UNCHANGED)."""
     cell = M1C_GRID[cell_index]
     seed = seed if seed is not None else seed_for(CAL_B_STAGE, cell_index)
     rng = random.Random(seed)
@@ -154,6 +176,8 @@ def run_census_cell(
     deltas: list[float] = []
     min_dt = float("inf")
     min_t1 = float("inf")
+    depth_deltas: dict[int, list[float]] = {}
+    terminal_deltas: list[float] = []
 
     for _rep in range(n_reps):
         try:
@@ -166,6 +190,7 @@ def run_census_cell(
 
         t_history: list[float] = []
         prev_t = 0.0
+        terminal_found = False
         for look_n in range(LOOK_STEP, N_MAX + 1, LOOK_STEP):
             state = score_combined(draws[:look_n])
             t = information_fraction(state.information, i_max=I_MAX)
@@ -173,19 +198,37 @@ def run_census_cell(
             is_terminal = look_n >= N_MAX
             b_eff_c, b_fut_c = coarse(tuple(t_history), is_terminal=is_terminal)
             b_eff_f, b_fut_f = fine(tuple(t_history), is_terminal=is_terminal)
+            depth = look_n // LOOK_STEP
+            is_sim_terminal = t >= 1.0 or look_n >= N_MAX
             for xc, xf in ((b_eff_c, b_eff_f), (b_fut_c, b_fut_f)):
                 if xc == xf:
                     continue
                 if math.isfinite(xc) and math.isfinite(xf):
-                    deltas.append(abs(xc - xf))
+                    delta = abs(xc - xf)
+                    deltas.append(delta)
+                    if not terminal_found:
+                        if is_sim_terminal:
+                            terminal_deltas.append(delta)
+                        else:
+                            depth_deltas.setdefault(depth, []).append(delta)
             dt = t - prev_t
             if len(t_history) == 1:
                 min_t1 = min(min_t1, t)
             elif dt > 0:
                 min_dt = min(min_dt, dt)
             prev_t = t
+            if is_sim_terminal:
+                terminal_found = True
+
+    max_abs_delta_by_depth = tuple(
+        max(depth_deltas[depth]) if depth in depth_deltas else None
+        for depth in range(1, N_DEPTHS + 1)
+    )
+    terminal_max_abs_delta = max(terminal_deltas) if terminal_deltas else None
 
     return CensusCellStats(
+        max_abs_delta_by_depth=max_abs_delta_by_depth,
+        terminal_max_abs_delta=terminal_max_abs_delta,
         cell_index=cell_index,
         n_reps=n_reps,
         max_abs_delta_b=max(deltas) if deltas else 0.0,
@@ -403,10 +446,56 @@ def derive_eps_pin(
     dt across cells, further lowered (never raised) by the stress set's
     raw `results`, filtered by THIS eps at derivation time (amendment §5:
     "The stress set can only lower DT_MIN, and only where it shows
-    Δb ≤ EPS/3")."""
-    census_max = max((s.max_abs_delta_b for s in cell_stats), default=0.0)
+    Δb ≤ EPS/3").
+
+    AUD-07 M1c-eps_k (RULING PR-1): when EVERY `cell_stats` row carries a
+    `max_abs_delta_by_depth`, ALSO derives `eps_by_depth`/`eps_terminal`
+    (same floor/3x rule, per depth; a depth with NO cell observation falls
+    back to the pooled-scalar eps, never the floor) plus
+    `census_max_by_depth`/`census_terminal_max` for `load_eps_pin`'s
+    validation. The disclosure `eps`/`census_max` are then RECOMPUTED as
+    `max(eps_by_depth, eps_terminal)` / `max(census_max_by_depth,
+    census_terminal_max)` -- the per-depth data is stop-aware (only up to
+    each rep's first terminal look) and can be smaller than the pooled,
+    unrestricted `max_abs_delta_b`. Absent per-depth data (any legacy row),
+    this is byte-identical to the pre-eps_k scalar-only derivation."""
+    pooled_census_max = max((s.max_abs_delta_b for s in cell_stats), default=0.0)
     dt_min = min((s.min_dt for s in cell_stats if s.min_dt > 0), default=0.0)
-    eps = max(EPS_FLOOR, 3.0 * census_max)
+    eps = max(EPS_FLOOR, 3.0 * pooled_census_max)
+    census_max = pooled_census_max
+
+    have_depth_data = bool(cell_stats) and all(
+        s.max_abs_delta_by_depth is not None for s in cell_stats
+    )
+    eps_by_depth: list[float] | None = None
+    census_max_by_depth: list[float] | None = None
+    eps_terminal: float | None = None
+    census_terminal_max: float | None = None
+
+    if have_depth_data:
+        global_fallback_eps = eps
+
+        def _max_observed_at(depth_idx: int) -> float | None:
+            observed: list[float] = [
+                value
+                for s in cell_stats
+                if (value := s.max_abs_delta_by_depth[depth_idx]) is not None  # type: ignore[index]
+            ]
+            return max(observed) if observed else None
+
+        census_max_by_depth_raw = [_max_observed_at(depth_idx) for depth_idx in range(N_DEPTHS)]
+        eps_by_depth = [
+            max(EPS_FLOOR, 3.0 * m) if m is not None else global_fallback_eps
+            for m in census_max_by_depth_raw
+        ]
+        census_max_by_depth = [m if m is not None else 0.0 for m in census_max_by_depth_raw]
+        census_terminal_max = max(
+            (s.terminal_max_abs_delta for s in cell_stats if s.terminal_max_abs_delta is not None),
+            default=0.0,
+        )
+        eps_terminal = max(EPS_FLOOR, 3.0 * census_terminal_max)
+        eps = max([*eps_by_depth, eps_terminal])
+        census_max = max([*census_max_by_depth, census_terminal_max])
 
     if stress is not None:
         safe_dts = [
@@ -417,13 +506,19 @@ def derive_eps_pin(
             dt_min = min(dt_min, stress_dt) if dt_min > 0 else stress_dt
 
     census_sha256 = hashlib.sha256(census_json_path.read_bytes()).hexdigest()
-    return {
+    pin: dict[str, Any] = {
         "eps": eps,
         "dt_min": dt_min,
         "census_max": census_max,
         "census_sha256": census_sha256,
         "code_sha": code_sha,
     }
+    if have_depth_data:
+        pin["eps_by_depth"] = eps_by_depth
+        pin["census_max_by_depth"] = census_max_by_depth
+        pin["eps_terminal"] = eps_terminal
+        pin["census_terminal_max"] = census_terminal_max
+    return pin
 
 
 def _collect_cal_b_rows(
@@ -479,6 +574,15 @@ def run_derive_pin(*, in_dir: Path, out_census: Path, out_pin: Path) -> dict[str
             p999_abs_delta_b=row["p999_abs_delta_b"],
             min_dt=row["min_dt"],
             min_t1=row["min_t1"],
+            # AUD-07 M1c-eps_k (RULING PR-1): round-trip the optional
+            # per-depth fields when the row carries them (`.get`, never
+            # `[...]`, so a legacy row without them still loads).
+            max_abs_delta_by_depth=(
+                tuple(row["max_abs_delta_by_depth"])
+                if row.get("max_abs_delta_by_depth") is not None
+                else None
+            ),
+            terminal_max_abs_delta=row.get("terminal_max_abs_delta"),
         )
         for row in sorted(cell_rows, key=lambda r: r["cell_index"])
     ]
