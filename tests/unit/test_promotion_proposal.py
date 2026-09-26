@@ -387,9 +387,9 @@ def test_stale_champion_clock_refuses(tmp_path: Path) -> None:
     assert "KILL_CLOCK_STALE" in output
 
 
-def test_step14_one_real_run_against_todays_evidence_c8() -> None:
+def test_step14_one_real_run_against_todays_evidence_c8(tmp_path: Path) -> None:
     """AUD-10b step 14 / C8. Read-only against the real derived evidence tree;
-    writes only under a worktree-local scratch directory, never the live
+    writes only under a per-run pytest ``tmp_path`` directory, never the live
     ``~/.local/share/breezy/derived`` tree. Skips (never fails) on a host
     lacking the real artefacts, since this asserts against live host state,
     not a fixture.
@@ -418,7 +418,7 @@ def test_step14_one_real_run_against_todays_evidence_c8() -> None:
     ):
         pytest.skip("real evidence artefacts are not present on this host")
 
-    output_root = _REPO / "scratch" / "aud10b_step14" / "derived" / "promotion"
+    output_root = _output_root(tmp_path)
     module = _proposal()
     code, output = module.main_capture(
         [
