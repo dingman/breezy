@@ -43,6 +43,14 @@ MemoryHigh=4G
 MemoryMax=6G
 UMask=0077
 
+# ING-2 S2 (2026-09-26): make this unit's own OOM-kill preference explicit
+# rather than inherited. A user-manager default is not a decision this repo
+# controls (U3, open) -- 500 says plainly "kill this before anything trading
+# related" without relying on that default landing the same way. Never set
+# on breezy-trade-supervisor.service (the live trading node) -- pinned by
+# `tests/unit/test_quote_tape_ingest_unit_contract.py`.
+OOMScoreAdjust=500
+
 # SP-1/I2d (2026-09-12): deprioritised against the shared nightly studies.
 # This unit fires `*:0/15` and still runs INSIDE the protected window P --
 # unlike the three heavy studies, it is deliberately NOT behind the studies
@@ -67,7 +75,16 @@ Environment=BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG=/home/jon/.local/share/breez
 # decide whether the newest instance is currently live (see the module
 # docstring's live-write-avoidance rule) -- it sends no signal to the
 # recorder and never restarts it.
-ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-quote-tape-ingest
+#
+# ING-2 S2: `--deadline-seconds 600` bounds how many NEW conversion units a
+# single run may START (deferred units retry next run -- see the `deadline`
+# count line this process prints on every non-dry run). 600 is the module
+# default (`DEFAULT_DEADLINE_SECONDS`); 600 + the 180s startup/tail
+# allowance stays at 780s, comfortably under this unit's 900s early-warning
+# margin and well under `TimeoutStartSec` below. NEVER hand-run this while
+# `systemctl --user is-active breezy-quote-tape-ingest.service` reports
+# active -- two writers would race the same markers and catalog (L-50).
+ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-quote-tape-ingest --deadline-seconds 600
 
 # Mirrors breezy-k1-daily.service and breezy-offer-gate-daily.service: for
 # Type=oneshot this bounds the whole run. A conversion pass over a full
@@ -83,11 +100,14 @@ StandardError=journal
 SyslogIdentifier=breezy-quote-tape-ingest
 
 # NO SuccessExitStatus. Exit 0 = ran (even if every instance was skipped as
-# live, truncated, or already converted); exit 2 = usage/configuration error
-# (no catalog root, or the configured path is not a directory); exit 3 = at
+# live, truncated, or already converted, or deferred by the deadline
+# budget -- deadline deferral is never a failure: deferred units retry next
+# run; see the `deadline` count line this process prints on every non-dry
+# run); exit 2 = usage/configuration error (no catalog root, the configured
+# path is not a directory, or an invalid --deadline-seconds); exit 3 = at
 # least one instance's outcome was "failed" -- a hard per-file or per-type
-# conversion failure, distinct from an ordinary skip (SP-1/I3,
-# EXIT_CONVERSION_FAILED). See
+# conversion failure, distinct from an ordinary skip or a deadline deferral
+# (SP-1/I3, EXIT_CONVERSION_FAILED). See
 # src/breezy/runtime/quote_tape_ingest_cli.py's module docstring.
 
 # NOTE: no [Install] section. This unit is started BY the timer, never

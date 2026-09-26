@@ -224,6 +224,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -246,10 +247,17 @@ from breezy.persistence.feather_preflight import (
     list_instance_ids,
     scan_instance,
 )
+from breezy.runtime.ingest_deadline import (
+    DEFAULT_DEADLINE_SECONDS,
+    DEFERRED_DEADLINE,
+    RunDeadline,
+    count_deferred,
+)
 from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
 from breezy.runtime.quote_tape_salvage import (
     _file_belongs_to_data_cls,
+    _is_salvage_marked,
     salvage_truncated_instance,
     write_fresh_capture_rows,
 )
@@ -292,6 +300,22 @@ MARKER_PREFIX = ".converted-"
 #: creating the next one, so a marked file's bytes are frozen forever the
 #: moment it is marked.
 FILE_MARKER_PREFIX = ".converted-file-"
+
+#: Prefix for the per-(instance, data type) poison-attempt breadcrumb
+#: (ING-2 S2 / L-49). Written just before a gated unit starts real work and
+#: cleared on any TERMINAL outcome (a marker written, a caught ``ValueError``,
+#: or an admitted per-file loop completing normally) -- so a breadcrumb
+#: survives ONLY a hard kill (``MemoryMax``/``TimeoutStartSec``) or a
+#: propagating ``BaseException`` mid-unit. Its presence, without the matching
+#: ``.converted-*`` marker, demotes that (instance, type) to run LAST next
+#: time (see :func:`_poison_first_order`) -- it never blocks the unit itself,
+#: only its ordering relative to siblings.
+ATTEMPT_PREFIX = ".attempt-"
+
+#: The salvage breadcrumb name is fixed (one per instance, not per type):
+#: :func:`salvage_truncated_instance` is one unit regardless of how many
+#: truncated files it covers.
+_SALVAGE_ATTEMPT_NAME = f"{ATTEMPT_PREFIX}salvage"
 
 #: The exact set the recorder persists (`breezy.runtime.node_config`), reused
 #: rather than re-declared: a duplicate list here would silently drift from
@@ -389,6 +413,80 @@ def _instance_is_fully_converted(instance_dir: Path, data_types: Sequence[type])
 
 def _mark_converted(instance_dir: Path, data_cls: type) -> None:
     _marker_path(instance_dir, data_cls).touch()
+    # A deadline-gated run may have left a poison breadcrumb for this type
+    # (ING-2 S2); a marker write is always a terminal, successful outcome,
+    # so any breadcrumb is stale the instant the marker lands. Harmless
+    # no-op (missing_ok) when no deadline was ever set -- AC-D10.
+    _clear_attempt(instance_dir, data_cls)
+
+
+def _attempt_path(instance_dir: Path, data_cls: type) -> Path:
+    return instance_dir / f"{ATTEMPT_PREFIX}{class_to_filename(data_cls)}"
+
+
+def _write_attempt(instance_dir: Path, data_cls: type) -> None:
+    _attempt_path(instance_dir, data_cls).touch()
+
+
+def _clear_attempt(instance_dir: Path, data_cls: type) -> None:
+    _attempt_path(instance_dir, data_cls).unlink(missing_ok=True)
+
+
+def _salvage_attempt_path(instance_dir: Path) -> Path:
+    return instance_dir / _SALVAGE_ATTEMPT_NAME
+
+
+def _write_salvage_attempt(instance_dir: Path) -> None:
+    _salvage_attempt_path(instance_dir).touch()
+
+
+def _clear_salvage_attempt(instance_dir: Path) -> None:
+    _salvage_attempt_path(instance_dir).unlink(missing_ok=True)
+
+
+def _instance_is_poisoned(instance_dir: Path) -> bool:
+    """True if a poison breadcrumb survives without its matching marker.
+
+    Scans the directory directly (never a fixed ``data_types`` list) so a
+    breadcrumb for a type outside the CURRENT run's requested types is still
+    detected -- ordering must reflect every breadcrumb physically on disk.
+    """
+    if not instance_dir.is_dir():
+        return False
+    if _salvage_attempt_path(instance_dir).is_file():
+        return True
+    for path in instance_dir.iterdir():
+        if not path.is_file() or not path.name.startswith(ATTEMPT_PREFIX):
+            continue
+        if path.name == _SALVAGE_ATTEMPT_NAME:
+            continue
+        marker_name = f"{MARKER_PREFIX}{path.name[len(ATTEMPT_PREFIX):]}"
+        if not (instance_dir / marker_name).is_file():
+            return True
+    return False
+
+
+def _poison_first_order(
+    ids: Sequence[str],
+    snap: LivenessSnapshot,
+    catalog_root: Path,
+    subdirectory: str,
+) -> tuple[str, ...]:
+    """Stable sort: not-poisoned before poisoned, newest before the rest,
+    then original list index -- so a poisoned instance runs LAST among its
+    peers (blocking only itself) and, among the rest, the current instance
+    is attempted first (AC-D5/T-p1-order).
+    """
+
+    def sort_key(pair: tuple[int, str]) -> tuple[bool, bool, int]:
+        index, instance_id = pair
+        instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
+        poisoned = _instance_is_poisoned(instance_dir)
+        not_newest = instance_id != snap.newest_instance_id
+        return (poisoned, not_newest, index)
+
+    ordered = sorted(enumerate(ids), key=sort_key)
+    return tuple(instance_id for _, instance_id in ordered)
 
 
 def _file_marker_path(instance_dir: Path, path: Path) -> Path:
@@ -867,14 +965,26 @@ class InstanceIngestResult:
     """The outcome for one run instance."""
 
     instance_id: str
-    outcome: str  # "converted" | "skipped-live" | "skipped-truncated" | "dry-run" | "failed"
+    # "converted" | "skipped-live" | "skipped-truncated" | "dry-run" |
+    # "failed" | "deferred-deadline" (ING-2 S2)
+    outcome: str
     reason: str = ""
     type_results: tuple[TypeConversionResult, ...] = field(default_factory=tuple)
+    #: True when this instance's truncated-file salvage was itself skipped
+    #: by the deadline gate (N4/ING-2 S2). Independent of ``type_results``:
+    #: salvage is one unit per instance, not per type.
+    salvage_deferred: bool = False
 
     def summary_line(self) -> str:
         """One line: rows-relevant outcome per type, or the skip reason."""
+        if self.outcome == DEFERRED_DEADLINE and not self.type_results:
+            # The loop-top gate deferred the WHOLE instance before any scan.
+            return f"instance {self.instance_id}: deferred (deadline; not evaluated)"
         if self.outcome in ("skipped-live", "skipped-truncated"):
-            return f"instance {self.instance_id}: skipped ({self.reason})"
+            line = f"instance {self.instance_id}: skipped ({self.reason})"
+            if self.salvage_deferred:
+                line += "; salvage deferred (deadline)"
+            return line
         parts = [
             f"{class_to_filename(result.data_cls)}={result.outcome}"
             for result in self.type_results
@@ -883,6 +993,8 @@ class InstanceIngestResult:
             prefix = "would ingest"
         elif self.outcome == "failed":
             prefix = "attempted"
+        elif self.outcome == DEFERRED_DEADLINE:
+            prefix = "partially ingested (deadline)"
         else:
             prefix = "ingested"
         return f"instance {self.instance_id}: {prefix} " + " ".join(parts)
@@ -896,6 +1008,7 @@ def ingest_instance(
     data_types: Sequence[type],
     *,
     convert_fn: ConvertFn = default_convert,
+    deadline: RunDeadline | None = None,
 ) -> InstanceIngestResult:
     """Convert every not-yet-converted data type for one instance.
 
@@ -911,6 +1024,12 @@ def ingest_instance(
     kill partway through this call therefore always leaves this instance's
     own definitions landed first. ``type_results`` is still returned in the
     REQUESTED ``data_types`` order; only the attempt order changes.
+
+    ``deadline``, when given (ING-2 S2), gates each not-yet-marked type: a
+    marker-skip is a no-op and never consults it (N2); a denied gate defers
+    that type only (``DEFERRED_DEADLINE``) and never starts ``convert_fn``.
+    ``deadline=None`` is byte-identical to before this parameter existed
+    (AC-D10).
     """
     instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
     results_by_cls: dict[type, TypeConversionResult] = {}
@@ -919,7 +1038,13 @@ def ingest_instance(
             results_by_cls[data_cls] = TypeConversionResult(
                 data_cls, "skipped-already-converted"
             )
+            _clear_attempt(instance_dir, data_cls)
             continue
+        if deadline is not None:
+            if not deadline.admit():
+                results_by_cls[data_cls] = TypeConversionResult(data_cls, DEFERRED_DEADLINE)
+                continue
+            _write_attempt(instance_dir, data_cls)
         try:
             outcome = convert_fn(catalog, instance_id, data_cls, subdirectory)
         except ValueError as exc:
@@ -930,17 +1055,26 @@ def ingest_instance(
                 exc,
             )
             results_by_cls[data_cls] = TypeConversionResult(data_cls, "failed", str(exc))
+            _clear_attempt(instance_dir, data_cls)
             continue
         _mark_converted(instance_dir, data_cls)
         results_by_cls[data_cls] = TypeConversionResult(data_cls, outcome or CONVERTED)
     type_results = tuple(results_by_cls[data_cls] for data_cls in data_types)
     any_failure = any(_outcome_has_failure(result.outcome) for result in type_results)
+    any_deferred = any(result.outcome == DEFERRED_DEADLINE for result in type_results)
+    if any_failure:
+        outcome = "failed"
+        reason = "at least one type failed conversion; see type_results for detail"
+    elif any_deferred:
+        outcome = DEFERRED_DEADLINE
+        reason = ""
+    else:
+        outcome = "converted"
+        reason = ""
     return InstanceIngestResult(
         instance_id=instance_id,
-        outcome="failed" if any_failure else "converted",
-        reason="at least one type failed conversion; see type_results for detail"
-        if any_failure
-        else "",
+        outcome=outcome,
+        reason=reason,
         type_results=type_results,
     )
 
@@ -1044,21 +1178,32 @@ def _convert_one_definition_type(
     *,
     convert_fn: ConvertFn,
     dry_run: bool,
+    deadline: RunDeadline | None = None,
 ) -> tuple[TypeConversionResult, bool, bool]:
-    """Convert one instrument-definition type. Returns ``(result, converted, open)``."""
+    """Convert one instrument-definition type. Returns ``(result, converted, open)``.
+
+    ``deadline`` (ING-2 S2) gates only after every no-op return (open file,
+    nothing to convert, dry-run) -- a no-op never consults it (N2).
+    """
     cls_open, cls_closed = _cls_open_and_closed_files(instance_dir, data_cls, open_files)
     if cls_open:
         return TypeConversionResult(data_cls, "skipped-open"), False, True
     if not cls_closed:
+        _clear_attempt(instance_dir, data_cls)
         return TypeConversionResult(data_cls, "skipped-already-converted"), False, False
     if dry_run:
         return TypeConversionResult(data_cls, "would-convert"), False, False
+    if deadline is not None:
+        if not deadline.admit():
+            return TypeConversionResult(data_cls, DEFERRED_DEADLINE), False, False
+        _write_attempt(instance_dir, data_cls)
     try:
         outcome = convert_fn(catalog, instance_id, data_cls, subdirectory)
     except ValueError as exc:
         logger.error(
             "instance %s: conversion of %s failed: %s", instance_id, data_cls.__name__, exc
         )
+        _clear_attempt(instance_dir, data_cls)
         return TypeConversionResult(data_cls, "failed", str(exc)), False, False
     _mark_converted(instance_dir, data_cls)
     return TypeConversionResult(data_cls, outcome or CONVERTED), True, False
@@ -1074,6 +1219,7 @@ def _convert_one_tick_type_per_file(
     *,
     instance_is_dead: bool,
     dry_run: bool,
+    deadline: RunDeadline | None = None,
 ) -> tuple[TypeConversionResult, bool, bool]:
     """Convert one non-definition type's not-yet-marked files, per file.
 
@@ -1087,10 +1233,19 @@ def _convert_one_tick_type_per_file(
     got to call ``close()``", exactly like the pre-existing whole-instance
     dead-instance path has always accepted. In a LIVE instance a no-EOS file
     is left unmarked (``skipped-unclosed``) and retried next run instead.
+
+    ``deadline`` (ING-2 S2) gates this WHOLE TYPE as one unit, LAZILY: the
+    check happens only once, at the first file that clears every no-op
+    filter below (marked/unreported/unreadable/truncated/empty/unclosed) --
+    a type with nothing convertible never calls ``admit()`` at all (N2). A
+    denied gate stops this type's loop entirely (the remaining files are
+    retried next run) and the type reports ``DEFERRED_DEADLINE``.
     """
     cls_open, cls_closed = _cls_open_and_closed_files(instance_dir, data_cls, open_files)
     counts: dict[str, int] = {}
     any_new_conversion = False
+    admitted_this_type = False
+    deferred_this_type = False
 
     for path in cls_closed:
         if _is_file_marked_converted(instance_dir, path):
@@ -1131,6 +1286,12 @@ def _convert_one_tick_type_per_file(
         if dry_run:
             counts["would-convert"] = counts.get("would-convert", 0) + 1
             continue
+        if deadline is not None and not admitted_this_type:
+            if not deadline.admit():
+                deferred_this_type = True
+                break
+            admitted_this_type = True
+            _write_attempt(instance_dir, data_cls)
         table = catalog._read_feather_file(str(path))
         if table is None:
             logger.error(
@@ -1200,6 +1361,15 @@ def _convert_one_tick_type_per_file(
     if cls_open:
         counts["skipped-open"] = len(cls_open)
 
+    if deferred_this_type:
+        return TypeConversionResult(data_cls, DEFERRED_DEADLINE), any_new_conversion, any_open_seen
+
+    if cls_closed and all(_is_file_marked_converted(instance_dir, path) for path in cls_closed):
+        # N6: every physically-present closed file is already marked -- a
+        # stale breadcrumb from an earlier gated-but-then-killed run can
+        # never be earned back by this type again.
+        _clear_attempt(instance_dir, data_cls)
+
     summary = " ".join(f"{key}={value}" for key, value in counts.items() if value)
     return (
         TypeConversionResult(data_cls, summary or "skipped-already-converted"),
@@ -1220,6 +1390,7 @@ def _ingest_instance_per_file(
     instance_is_dead: bool,
     convert_fn: ConvertFn,
     dry_run: bool,
+    deadline: RunDeadline | None = None,
 ) -> InstanceIngestResult:
     """Convert every complete, non-open feather file, per file (GL-14/BL-24).
 
@@ -1252,10 +1423,28 @@ def _ingest_instance_per_file(
     unresolved_unreadable = tuple(
         report for report in preflight_report.unreadable if report.path not in open_files
     )
+    salvage_deferred = False
     if not dry_run and truncated_to_salvage:
-        salvage_truncated_instance(
-            catalog, instance_dir, instance_id, data_types, truncated_to_salvage
+        # r3.1 S1: the salvage gate applies only when real work remains --
+        # an instance whose truncated files are ALL already salvage-marked
+        # must never poison itself or burn the deadline for a no-op re-scan
+        # (T-n4-noop).
+        needs_salvage_work = any(
+            not _is_salvage_marked(instance_dir, report.path) for report in truncated_to_salvage
         )
+        if deadline is not None and needs_salvage_work:
+            if not deadline.admit():
+                salvage_deferred = True
+            else:
+                _write_salvage_attempt(instance_dir)
+                salvage_truncated_instance(
+                    catalog, instance_dir, instance_id, data_types, truncated_to_salvage
+                )
+                _clear_salvage_attempt(instance_dir)
+        else:
+            salvage_truncated_instance(
+                catalog, instance_dir, instance_id, data_types, truncated_to_salvage
+            )
     has_unresolved_truncation = bool(truncated_to_salvage) or bool(unresolved_unreadable)
 
     results_by_cls: dict[type, TypeConversionResult] = {}
@@ -1269,6 +1458,7 @@ def _ingest_instance_per_file(
     for data_cls in definition_types:
         if _is_marked_converted(instance_dir, data_cls):
             results_by_cls[data_cls] = TypeConversionResult(data_cls, "skipped-already-converted")
+            _clear_attempt(instance_dir, data_cls)
             continue
         result, converted, is_open = _convert_one_definition_type(
             catalog,
@@ -1279,6 +1469,7 @@ def _ingest_instance_per_file(
             open_files,
             convert_fn=convert_fn,
             dry_run=dry_run,
+            deadline=deadline,
         )
         results_by_cls[data_cls] = result
         any_new_conversion = any_new_conversion or converted
@@ -1289,6 +1480,7 @@ def _ingest_instance_per_file(
     for data_cls in tick_types:
         if _is_marked_converted(instance_dir, data_cls):
             results_by_cls[data_cls] = TypeConversionResult(data_cls, "skipped-already-converted")
+            _clear_attempt(instance_dir, data_cls)
             continue
         if definitions_have_open_file:
             results_by_cls[data_cls] = TypeConversionResult(
@@ -1298,7 +1490,7 @@ def _ingest_instance_per_file(
             continue
         result, converted, is_open = _convert_one_tick_type_per_file(
             catalog, instance_dir, instance_id, data_cls, open_files, reports_by_path,
-            instance_is_dead=instance_is_dead, dry_run=dry_run,
+            instance_is_dead=instance_is_dead, dry_run=dry_run, deadline=deadline,
         )
         results_by_cls[data_cls] = result
         any_new_conversion = any_new_conversion or converted
@@ -1306,6 +1498,7 @@ def _ingest_instance_per_file(
 
     type_results = tuple(results_by_cls[data_cls] for data_cls in data_types)
     any_failure = any(_outcome_has_failure(result.outcome) for result in type_results)
+    any_deferred = any(result.outcome == DEFERRED_DEADLINE for result in type_results)
 
     if has_unresolved_truncation:
         outcome = "skipped-truncated"
@@ -1319,6 +1512,9 @@ def _ingest_instance_per_file(
     elif any_failure:
         outcome = "failed"
         reason = "at least one file failed conversion; see type_results for detail"
+    elif any_deferred:
+        outcome = DEFERRED_DEADLINE
+        reason = ""
     elif any_new_conversion:
         outcome = "converted"
         reason = ""
@@ -1337,6 +1533,7 @@ def _ingest_instance_per_file(
         outcome=outcome,
         reason=reason,
         type_results=type_results,
+        salvage_deferred=salvage_deferred,
     )
 
 
@@ -1385,6 +1582,7 @@ def run_ingest(
     convert_fn: ConvertFn = default_convert,
     dry_run: bool = False,
     snapshot: LivenessSnapshot | None = None,
+    deadline: RunDeadline | None = None,
 ) -> tuple[InstanceIngestResult, ...]:
     """Enumerate instances and convert every one that is safe to convert.
 
@@ -1395,6 +1593,13 @@ def run_ingest(
     snapshot's. Passing both ``snapshot`` and ``now_ns`` is a caller error
     (:func:`take_liveness_snapshot` already folds ``now_ns`` into the
     snapshot) and raises ``ValueError``.
+
+    ``deadline`` (ING-2 S2), when given, is peeked at the top of the loop
+    (``can_admit()``) before ANYTHING happens for that instance -- a denied
+    peek defers the WHOLE instance (``DEFERRED_DEADLINE``, reason
+    ``"not evaluated"``, no scan) -- and is threaded into every conversion
+    call below. ``deadline=None`` is byte-identical to before this
+    parameter existed (AC-D10): no gate, no reorder, no breadcrumb.
     """
     if snapshot is not None and now_ns is not None:
         raise ValueError("snapshot and now_ns are mutually exclusive")
@@ -1419,6 +1624,9 @@ def run_ingest(
     catalog = ParquetDataCatalog(str(catalog_root))
     results: list[InstanceIngestResult] = []
     for instance_id in instance_ids:
+        if deadline is not None and not deadline.can_admit():
+            results.append(InstanceIngestResult(instance_id, DEFERRED_DEADLINE, "not evaluated"))
+            continue
         instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
         # The instance-wide liveness predicate rule (b) alone applies (see
         # the module docstring): the newest-started instance while the
@@ -1457,10 +1665,13 @@ def run_ingest(
                         subdirectory,
                         data_types,
                         convert_fn=convert_fn,
+                        deadline=deadline,
                     )
                 )
             continue
 
+        if deadline is not None:
+            deadline.note_scan()
         try:
             preflight_report = scan_instance(catalog_root, instance_id, subdirectory)
         except PreflightError as exc:
@@ -1484,6 +1695,7 @@ def run_ingest(
                         subdirectory,
                         data_types,
                         convert_fn=convert_fn,
+                        deadline=deadline,
                     )
                 )
             continue
@@ -1504,43 +1716,83 @@ def run_ingest(
                 instance_is_dead=instance_is_dead,
                 convert_fn=convert_fn,
                 dry_run=dry_run,
+                deadline=deadline,
             )
         )
     return tuple(results)
 
 
+#: Instance-level outcome precedence, LEAST to MOST significant. Higher rank
+#: wins a merge (ING-2 S2 r3). Every literal value
+#: :class:`InstanceIngestResult`.outcome can hold appears exactly once.
+_OUTCOME_LADDER: tuple[str, ...] = (
+    "skipped-live",
+    "converted",
+    DEFERRED_DEADLINE,
+    "failed",
+    "dry-run",
+    "skipped-truncated",
+)
+
+
+def _ladder_rank(outcome: str) -> int:
+    return _OUTCOME_LADDER.index(outcome)
+
+
 def _merge_pass_results(
     pass_one: tuple[InstanceIngestResult, ...],
     pass_two: tuple[InstanceIngestResult, ...],
+    *,
+    order: Sequence[str],
 ) -> tuple[InstanceIngestResult, ...]:
-    """Combine both passes' results, one row per instance in pass 2's order.
+    """Combine both passes' results, one row per instance, re-sorted to
+    ``order`` (the ORIGINAL, unreordered ``snap.instance_ids`` -- identity
+    when neither pass was poison-reordered).
 
-    Pass 2 already covers every instance in the run (the whole
-    ``instance_ids`` list), so its results are the base. An instance whose
-    definitions pass FAILED (its instrument-definition conversion raised a
-    caught ``ValueError``) is reported as ``"failed"`` regardless of what
-    pass 2 did with it -- even if pass 2's own retry of that same type
-    happened to succeed -- with the reason prefixed to say so. This only
-    ever matters for an ordinary caught ``ValueError``: a ``BaseException``
-    mid pass 1 propagates before pass 2 is ever called, so this function is
-    never reached in that case. ``type_results`` are pass 2's; pass 1's are
-    used only as a fallback when pass 2 produced none for that instance.
+    An instance present in only one pass keeps that pass's row unchanged
+    (pass 2 covers every instance in the run, so this only ever happens for
+    an instance :func:`_needs_definition_pass` never selected). Otherwise
+    the merged outcome is the HIGHER rung of :data:`_OUTCOME_LADDER` between
+    the two passes' outcomes for that instance; ties keep pass 2. A p1
+    ``"failed"`` that WINS the ladder keeps its reason prefixed
+    ``"definitions pass failed; "`` -- this only ever matters for an
+    ordinary caught ``ValueError``: a ``BaseException`` mid pass 1
+    propagates before pass 2 is ever called, so this function is never
+    reached in that case. ``type_results`` prefer pass 2's, falling back to
+    pass 1's only when pass 2 produced none. ``salvage_deferred`` is the
+    logical OR of both passes (N4).
     """
     pass_one_by_id = {result.instance_id: result for result in pass_one}
+    pass_two_by_id = {result.instance_id: result for result in pass_two}
     merged: list[InstanceIngestResult] = []
-    for result in pass_two:
-        p1 = pass_one_by_id.get(result.instance_id)
-        if p1 is not None and p1.outcome == "failed":
+    for instance_id in order:
+        p1 = pass_one_by_id.get(instance_id)
+        p2 = pass_two_by_id.get(instance_id)
+        if p2 is None:
+            if p1 is not None:
+                merged.append(p1)
+            continue
+        if p1 is None:
+            merged.append(p2)
+            continue
+        salvage_deferred = p1.salvage_deferred or p2.salvage_deferred
+        type_results = p2.type_results or p1.type_results
+        if _ladder_rank(p1.outcome) > _ladder_rank(p2.outcome):
+            reason = (
+                f"definitions pass failed; {p1.reason}" if p1.outcome == "failed" else p1.reason
+            )
             merged.append(
                 replace(
-                    result,
-                    outcome="failed",
-                    reason=f"definitions pass failed; {p1.reason}",
-                    type_results=result.type_results or p1.type_results,
+                    p1,
+                    reason=reason,
+                    type_results=type_results,
+                    salvage_deferred=salvage_deferred,
                 )
             )
         else:
-            merged.append(result)
+            merged.append(
+                replace(p2, type_results=type_results, salvage_deferred=salvage_deferred)
+            )
     return tuple(merged)
 
 
@@ -1554,6 +1806,7 @@ def run_ingest_definitions_first(
     service_active_probe: ServiceActiveProbe = default_service_active_probe,
     convert_fn: ConvertFn = default_convert,
     dry_run: bool = False,
+    deadline: RunDeadline | None = None,
 ) -> tuple[InstanceIngestResult, ...]:
     """Convert every instance's instrument definitions before any tick
     type, across the WHOLE run -- not merely within one instance (see the
@@ -1572,6 +1825,15 @@ def run_ingest_definitions_first(
     pass 1 is skipped entirely and the output is identical to a single
     :func:`run_ingest` call (dry-run must never touch disk, including via a
     preview-only pass 1).
+
+    ``deadline`` (ING-2 S2), when given, is shared by BOTH passes (one
+    sticky budget per run, not per pass -- T7b) and threaded straight
+    through to :func:`run_ingest`. It also reorders each pass's own
+    instance list poison-first (:func:`_poison_first_order`) -- a unit that
+    was killed mid-attempt on an earlier run runs LAST among its peers this
+    run, never blocking them, while the merged output stays in the
+    ORIGINAL, unreordered ``snap.instance_ids`` order (AC-D5).
+    ``deadline=None`` reorders nothing (AC-D10).
     """
     snap = take_liveness_snapshot(
         catalog_root,
@@ -1593,25 +1855,40 @@ def run_ingest_definitions_first(
 
     pass_one: tuple[InstanceIngestResult, ...] = ()
     if selected:
+        pass_one_ids = (
+            _poison_first_order(selected, snap, catalog_root, subdirectory)
+            if deadline is not None
+            else selected
+        )
         pass_one = run_ingest(
             catalog_root,
             subdirectory=subdirectory,
             data_types=definition_types,
-            snapshot=replace(snap, instance_ids=selected),
+            snapshot=replace(snap, instance_ids=pass_one_ids),
             convert_fn=convert_fn,
             dry_run=dry_run,
+            deadline=deadline,
         )
 
+    pass_two_ids = (
+        _poison_first_order(snap.instance_ids, snap, catalog_root, subdirectory)
+        if deadline is not None
+        else snap.instance_ids
+    )
     pass_two = run_ingest(
         catalog_root,
         subdirectory=subdirectory,
         data_types=data_types,
-        snapshot=snap,
+        snapshot=replace(snap, instance_ids=pass_two_ids),
         convert_fn=convert_fn,
         dry_run=dry_run,
+        deadline=deadline,
     )
 
-    return _merge_pass_results(pass_one, pass_two)
+    if deadline is not None:
+        deadline.record(count_deferred(pass_one + pass_two))
+
+    return _merge_pass_results(pass_one, pass_two, order=snap.instance_ids)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1652,7 +1929,27 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report what would be converted without converting or writing markers.",
     )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=DEFAULT_DEADLINE_SECONDS,
+        help=(
+            "Wall-clock budget for this run (ING-2 S2): once elapsed, no NEW "
+            "conversion unit starts -- deferred units retry next run. Must be "
+            f"a finite number > 0 (default: {DEFAULT_DEADLINE_SECONDS})."
+        ),
+    )
     return parser
+
+
+def _validate_deadline_seconds(value: float) -> str | None:
+    """``None`` if valid, else the usage-error message to print (AC-D8)."""
+    if not math.isfinite(value) or value <= 0:
+        return (
+            f"{PROGRAM}: --deadline-seconds must be a finite number greater than "
+            f"0 (got {value!r})"
+        )
+    return None
 
 
 def _resolve_catalog(namespace: argparse.Namespace, env: Mapping[str, str]) -> Path:
@@ -1677,8 +1974,15 @@ def run(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     now_ns: int | None = None,
+    clock_ns: Callable[[], int] | None = None,
 ) -> int:
-    """Ingest, report, and return the process exit code. Never raises."""
+    """Ingest, report, and return the process exit code. Never raises.
+
+    ``clock_ns`` (ING-2 S2), when given, is the MONOTONIC clock
+    :class:`~breezy.runtime.ingest_deadline.RunDeadline` uses -- independent
+    of ``now_ns`` (the WALL clock the liveness/inventory read uses). A
+    dry run never builds a deadline at all (AC-D6).
+    """
     out = sys.stdout if stdout is None else stdout
     err = sys.stderr if stderr is None else stderr
     active_env: Mapping[str, str] = env if env is not None else {}
@@ -1689,6 +1993,35 @@ def run(
     except SystemExit:
         return EXIT_USAGE
 
+    deadline_seconds: float = namespace.deadline_seconds
+    error = _validate_deadline_seconds(deadline_seconds)
+    if error is not None:
+        # AC-D8: an argparse-level configuration error -- no budget was ever
+        # built, so no deadline line is printed for this path.
+        print(error, file=err)
+        return EXIT_USAGE
+
+    # The deadline is built BEFORE the snapshot/catalog resolution, per the
+    # module design: a PreflightError below still reports a (zero-progress)
+    # deadline line, since the budget already existed at that point (AC-D7).
+    deadline: RunDeadline | None = (
+        None
+        if namespace.dry_run
+        else RunDeadline(
+            budget_ns=int(deadline_seconds * 1_000_000_000),
+            clock_ns=clock_ns if clock_ns is not None else time.monotonic_ns,
+        )
+    )
+
+    def _deadline_line(instance_count: int) -> str:
+        assert deadline is not None
+        elapsed_seconds = deadline.elapsed_ns / 1_000_000_000
+        return (
+            f"{PROGRAM}: deadline budget={deadline_seconds:g}s "
+            f"elapsed={elapsed_seconds:.0f}s deferred_units={deadline.deferred_units} "
+            f"deferred_instances={deadline.deferred_instances} instances={instance_count}"
+        )
+
     try:
         root = _resolve_catalog(namespace, active_env)
         results = run_ingest_definitions_first(
@@ -1698,15 +2031,20 @@ def run(
             service_active_probe=lambda: default_service_active_probe(namespace.service_unit),
             dry_run=namespace.dry_run,
             now_ns=now_ns,
+            deadline=deadline,
         )
     except PreflightError as exc:
         print(f"{PROGRAM}: {exc}", file=err)
+        if deadline is not None:
+            print(_deadline_line(0), file=out)
         return EXIT_USAGE
 
     mode = " (dry-run)" if namespace.dry_run else ""
     print(f"{PROGRAM}: catalog={root} subdirectory={namespace.subdirectory}{mode}", file=out)
     for result in results:
         print(result.summary_line(), file=out)
+    if deadline is not None:
+        print(_deadline_line(len(results)), file=out)
     if any(result.outcome == "failed" for result in results):
         return EXIT_CONVERSION_FAILED
     return EXIT_OK

@@ -647,7 +647,9 @@ class TestMergePassResults:
         p2_a = InstanceIngestResult(INSTANCE, "converted")
         p2_b = InstanceIngestResult(OTHER_INSTANCE, "converted")
 
-        merged = ingest_cli_module._merge_pass_results((p1_ok, p1_failed), (p2_a, p2_b))
+        merged = ingest_cli_module._merge_pass_results(
+            (p1_ok, p1_failed), (p2_a, p2_b), order=(INSTANCE, OTHER_INSTANCE)
+        )
 
         assert merged == (
             p2_a,
@@ -670,7 +672,9 @@ class TestMergePassResults:
         )
         p2_empty = InstanceIngestResult(INSTANCE, "converted", type_results=())
 
-        merged = ingest_cli_module._merge_pass_results((p1_failed,), (p2_empty,))
+        merged = ingest_cli_module._merge_pass_results(
+            (p1_failed,), (p2_empty,), order=(INSTANCE,)
+        )
 
         assert merged[0].type_results == p1_failed.type_results
 
