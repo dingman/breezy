@@ -3,10 +3,12 @@
 Closes the gap ``breezy.runtime.quote_tape_cli`` deliberately left open: the
 recorder streams Arrow IPC feather under ``<catalog>/live/<instance>/``, and
 turning that into the parquet layout every analysis script queries is a
-single native call (``ParquetDataCatalog.convert_stream_to_data``) that
-nothing has ever automated. It had been run by hand twice, ever -- 199,079
-depth rows for 2026-09-01 afternoon were invisible on disk until a manual
-conversion.
+single native call (``ParquetDataCatalog.convert_stream_to_data``, or since
+ING-2 S3a a Breezy mirror of it -- :func:`_convert_stream_natively` -- that
+reads with a bounded, coalesced read and still calls native
+``_convert_feather_table_to_parquet`` per file) that nothing has ever
+automated. It had been run by hand twice, ever -- 199,079 depth rows for
+2026-09-01 afternoon were invisible on disk until a manual conversion.
 
 A SEPARATE process from the recorder and from the preflight checker, for the
 same reason those two are separate from each other: different failure
@@ -18,8 +20,14 @@ Null hypothesis, checked before writing any of this:
 
 * **Conversion is native.** ``ParquetDataCatalog.convert_stream_to_data``
   (``persistence/catalog/parquet.py:2604``) does the feather -> parquet work.
-  This module supplies only instance enumeration, live-write avoidance,
-  truncation refusal, and idempotency bookkeeping around that one call.
+  Since ING-2 S3a the fast path calls a Breezy mirror,
+  :func:`_convert_stream_natively`, which reads each feather file through
+  :func:`breezy.persistence.feather_read.read_feather_coalesced` instead of
+  ``_read_feather_file``'s ``reader.read_all()`` (bounded memory on a
+  one-row-per-message stream), then still calls native
+  ``_convert_feather_table_to_parquet`` per file, unchanged. This module
+  otherwise supplies only instance enumeration, live-write avoidance,
+  truncation refusal, and idempotency bookkeeping around that call.
 * **Per-file idempotency is ALREADY native but insufficient alone.**
   ``_convert_feather_table_to_parquet`` skips a parquet file that already
   exists at the same name (a bare ``print``, ``parquet.py`` ~:2680) and
@@ -38,7 +46,8 @@ Null hypothesis, checked before writing any of this:
 
 Instrument definitions convert row-wise (the re-emission defect)
 ----------------------------------------------------------------
-``convert_stream_to_data`` converts feather files ONE AT A TIME, deriving
+``convert_stream_to_data`` (or its Breezy mirror, :func:`_convert_stream_natively`)
+converts feather files ONE AT A TIME, deriving
 each file's interval from ``[min ts_init, max ts_init]``, and raises
 ``ValueError`` when that interval overlaps one already in the type's data
 directory. For capture-timed types (quotes, depth, trades) intervals are
@@ -184,14 +193,15 @@ first pass already committed -- every instance definitions pass 1 reached is
 resolvable in the catalog regardless of what happens next. ``run()`` calls
 this wrapper, not :func:`run_ingest` directly.
 
-A ``None`` table from the native feather reader (ArrowInvalid/OSError,
-already-truncated bytes that slipped past preflight, or a post-transform
-table that comes back empty despite a nonzero preflight row count) is a
-HARD per-file failure here -- logged at ``ERROR``, never marked, counted
-under ``failed`` -- unlike ``convert_stream_to_data``'s own native caller,
-which treats the same ``None`` as "nothing to do" and silently marks the
-whole type converted. An instance with any such failure reports outcome
-``"failed"``.
+A ``None`` table from the feather reader (``read_feather_coalesced``, the
+ING-2 S3a coalesced mirror of native ``_read_feather_file`` -- same
+ArrowInvalid/OSError scope, already-truncated bytes that slipped past
+preflight, or a post-transform table that comes back empty despite a
+nonzero preflight row count) is a HARD per-file failure here -- logged at
+``ERROR``, never marked, counted under ``failed`` -- unlike
+``convert_stream_to_data``'s own native caller, which treats the same
+``None`` as "nothing to do" and silently marks the whole type converted. An
+instance with any such failure reports outcome ``"failed"``.
 
 Idempotency
 -----------
@@ -247,6 +257,7 @@ from breezy.persistence.feather_preflight import (
     list_instance_ids,
     scan_instance,
 )
+from breezy.persistence.feather_read import read_feather_coalesced
 from breezy.runtime.ingest_deadline import (
     DEFAULT_DEADLINE_SECONDS,
     DEFERRED_DEADLINE,
@@ -256,6 +267,7 @@ from breezy.runtime.ingest_deadline import (
 from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
 from breezy.runtime.quote_tape_salvage import (
+    ExtendWriteMismatch,
     _file_belongs_to_data_cls,
     _is_salvage_marked,
     salvage_truncated_instance,
@@ -702,6 +714,44 @@ def convert_instrument_definitions(
     return CONVERTED
 
 
+def _convert_stream_natively(
+    catalog: ParquetDataCatalog,
+    instance_id: str,
+    data_cls: type,
+    subdirectory: str,
+    *,
+    target: ParquetDataCatalog | None = None,
+) -> None:
+    """Breezy mirror of native ``convert_stream_to_data`` (ING-2 S3a, Arch S2).
+
+    Byte-for-byte the native loop (``parquet.py:2636-2654``), with one
+    change: the feather read goes through :func:`read_feather_coalesced`
+    instead of ``catalog._read_feather_file``, so at most one file's table is
+    ever alive at a time and that table is coalesced while it is built,
+    instead of materialised in one ``reader.read_all()``. Every other
+    behaviour is unchanged: a ``None`` table means ``continue`` (native
+    parity), ``used_catalog`` is computed exactly like native (A1), and the
+    conversion call uses native's own defaults
+    (``use_ts_event_for_ts_init=False``, ``identifiers=None``).
+    """
+    used_catalog = catalog if target is None else target
+    for feather_file in catalog._list_feather_data_files(
+        kind=subdirectory,
+        instance_id=instance_id,
+        data_cls=data_cls,
+    ):
+        feather_table = read_feather_coalesced(catalog.fs, feather_file.path)
+        if feather_table is None:
+            continue
+        catalog._convert_feather_table_to_parquet(
+            feather_table=feather_table,
+            feather_path=feather_file.path,
+            data_cls=data_cls,
+            used_catalog=used_catalog,
+        )
+        del feather_table
+
+
 def default_convert(
     catalog: ParquetDataCatalog,
     instance_id: str,
@@ -713,23 +763,23 @@ def default_convert(
     """The one native call this module exists to schedule and guard.
 
     Instrument definitions take the row-wise path instead; every other type
-    is one ``convert_stream_to_data``, unchanged, except the ING-1
-    non-disjoint fallback (:func:`_extend_overlapping_stream`). ``target``
-    defaults to ``None``, which is byte-for-byte the pre-existing behaviour
-    (every existing caller, including :func:`ingest_instance`, omits it);
-    passing it writes the converted rows into a SEPARATE catalog instead of
-    ``catalog`` itself -- the shape ``_convert_live_capture`` needs to convert
-    a read-only capture into a disposable work catalog without duplicating
-    this function's dispatch logic.
+    goes through :func:`_convert_stream_natively`, a Breezy mirror of native
+    ``convert_stream_to_data`` with a coalesced read (ING-2 S3a), unchanged
+    in every other respect, except the ING-1 non-disjoint fallback
+    (:func:`_extend_overlapping_stream`). ``target`` defaults to ``None``,
+    which is byte-for-byte the pre-existing behaviour (every existing
+    caller, including :func:`ingest_instance`, omits it); passing it writes
+    the converted rows into a SEPARATE catalog instead of ``catalog`` itself
+    -- the shape ``_convert_live_capture`` needs to convert a read-only
+    capture into a disposable work catalog without duplicating this
+    function's dispatch logic.
     """
     if _is_instrument_definition(data_cls):
         return convert_instrument_definitions(
             catalog, instance_id, data_cls, subdirectory, target=target
         )
     try:
-        catalog.convert_stream_to_data(
-            instance_id, data_cls, other_catalog=target, subdirectory=subdirectory
-        )
+        _convert_stream_natively(catalog, instance_id, data_cls, subdirectory, target=target)
     except ValueError as exc:
         if not _is_non_disjoint_refusal(exc):
             raise
@@ -781,7 +831,7 @@ def _extend_overlapping_stream(
         instance_id=instance_id,
         data_cls=data_cls,
     ):
-        table = catalog._read_feather_file(feather_file.path)
+        table = read_feather_coalesced(catalog.fs, feather_file.path)
         if table is None or len(table) == 0:
             continue
         objects = list(catalog._handle_table_nautilus(table=table, data_cls=data_cls))
@@ -1292,7 +1342,7 @@ def _convert_one_tick_type_per_file(
                 break
             admitted_this_type = True
             _write_attempt(instance_dir, data_cls)
-        table = catalog._read_feather_file(str(path))
+        table = read_feather_coalesced(catalog.fs, str(path))
         if table is None:
             logger.error(
                 "instance %s: conversion of %s file %s failed -- feather "
@@ -1341,7 +1391,19 @@ def _convert_one_tick_type_per_file(
                 counts["failed"] = counts.get("failed", 0) + 1
                 continue
             objects = list(catalog._handle_table_nautilus(table=table, data_cls=data_cls))
-            written = write_fresh_capture_rows(catalog, data_cls, objects)
+            try:
+                written = write_fresh_capture_rows(catalog, data_cls, objects)
+            except ExtendWriteMismatch as mismatch:
+                logger.error(
+                    "instance %s: conversion of %s file %s failed "
+                    "[reason=extend_write_mismatch]: %s; left unmarked for triage",
+                    instance_id,
+                    data_cls.__name__,
+                    path,
+                    mismatch,
+                )
+                counts["failed"] = counts.get("failed", 0) + 1
+                continue
             if written or objects:
                 _mark_file_converted(instance_dir, path)
                 key = "converted" if written else "converted-nothing-new"

@@ -1554,8 +1554,9 @@ When a unit fails with CPU/wall < 0.3, check `memory.high` throttling (`wchan`, 
 ### How to apply
 Triage line for any repeatedly failing unit: `systemctl --user show -p MemoryHigh,MemoryMax,TimeoutStartSec`, plus the journal's "Consumed X CPU over Y wall". Status of the ingest durable fix (2026-09-25):
 - Instruments-before-depths ordering is DELIVERED by ING-2 S1 (merge c5d1e24): a definitions-only pass over a frozen liveness snapshot runs before any tick type. A killed run still leaves resolvable instruments.
-- Still owed: S2 (a per-run deadline) and S3 (bounded per-run memory; measure first).
-- Until S3 lands, the conversion of a whole instance after rotation can still exceed 4G.
+- S2 (a per-run deadline) is DELIVERED.
+- S3a (2026-09-26): the fast and per-file feather reads are now bounded, via `breezy.persistence.feather_read.read_feather_coalesced` -- never `reader.read_all()` on a one-row-per-message stream. Measured on the real 891,170-message F3 file: native `read_all()` peaks at ~5.87 GB (5.3 KB/message); the coalesced read's ΔRSS is ~164 MiB. **Amendment: never `read_all()` a one-row-per-message Arrow IPC stream. Measure memory as a ΔRSS over a post-import, post-warm-up baseline in a fresh child process (`ru_maxrss`), never as absolute RSS -- `tracemalloc` cannot see Arrow/IPC allocations at all (pool `bytes_allocated` was 0 throughout Stage-0).**
+- Still unbounded after S3a: EXTEND (`_extend_overlapping_stream`, the per-file EXTEND fallback) still materializes a whole file's rows as objects and runs an unfiltered dedupe query. S3b (chunked EXTEND) is conditional on Phase 0's measured trigger; see `docs/plans/backlog/ING-2_2026-09-25/README.md`.
 
 Related: L-29 (unbounded buffers), L-20 (the catalog you query is not the tape you capture).
 

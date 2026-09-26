@@ -77,9 +77,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 import pyarrow as pa
+
+from breezy.persistence.feather_read import BatchCoalescer
 
 __all__ = [
     "END_OF_STREAM_MARKER",
@@ -305,11 +306,11 @@ def _scan_stream(path: Path, *, collect: bool) -> _StreamScan:
     ``tell()`` equals the file size), and batches are copied out of it, so the
     salvaged table outlives the handle.
     """
-    batches: list[Any] = []
     rows = 0
     count = 0
     failure: str | None = None
     ended_mid_message = False
+    coalescer: BatchCoalescer | None = None
 
     with pa.OSFile(str(path), "rb") as source:
         try:
@@ -327,6 +328,9 @@ def _scan_stream(path: Path, *, collect: bool) -> _StreamScan:
                 table=None,
             )
 
+        if collect:
+            coalescer = BatchCoalescer(reader.schema)
+
         consumed = source.tell()
         while True:
             try:
@@ -343,16 +347,10 @@ def _scan_stream(path: Path, *, collect: bool) -> _StreamScan:
             count += 1
             rows += batch.num_rows
             consumed = source.tell()
-            if collect:
-                batches.append(batch)
+            if coalescer is not None:
+                coalescer.add(batch)
 
-        table: pa.Table | None = None
-        if collect:
-            table = (
-                pa.Table.from_batches(batches, reader.schema)
-                if batches
-                else reader.schema.empty_table()
-            )
+        table: pa.Table | None = coalescer.to_table() if coalescer is not None else None
 
     return _StreamScan(
         batches=count,
