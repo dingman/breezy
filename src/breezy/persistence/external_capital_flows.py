@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -47,6 +48,8 @@ __all__ = [
     "ExternalCapitalFlow",
     "ExternalFlowEvidence",
     "WindowFlows",
+    "default_capital_flows_dir",
+    "default_output_dir",
     "flows_between",
     "load_evidence",
     "read_latest_snapshot",
@@ -55,6 +58,13 @@ __all__ = [
 ]
 
 _logger = logging.getLogger(__name__)
+
+#: Same env var `scripts/analysis/portfolio_roi_report._default_output_dir`
+#: reads (FU-13b plan "Same directory rule" / round-2 review binding
+#: amendment 2). Duplicated as a STRING, not imported from that script: a
+#: `scripts/` module has no importable package identity, and this constant
+#: only needs to name the env var, not reach into that module's code.
+_LIVE_TALLY_OUTPUT_DIR_ENV_VAR: Final[str] = "BREEZY_LIVE_TALLY_OUTPUT_DIR"
 
 SNAPSHOT_SCHEMA_VERSION: Final[int] = 1
 
@@ -80,6 +90,36 @@ _PARSE_STATUS_OK: Final[str] = "OK"
 
 _DIR_MODE: Final[int] = 0o700
 _FILE_MODE: Final[int] = 0o600
+
+
+def default_output_dir(env: Mapping[str, str] | None = None) -> Path:
+    """The SAME env-or-default rule ``scripts/analysis/portfolio_roi_report.
+    _default_output_dir`` applies, factored out here so the read-only capital-
+    flow puller (``scripts/venue/polymarket_us_capital_flow_pull.py``, a
+    separate process) and the ROI report resolve the IDENTICAL root without a
+    second, potentially-drifting copy of the rule (FU-13b plan "Same
+    directory rule" / round-2 review binding amendment 2).
+
+    ``scripts/analysis/portfolio_roi_report.py`` is owned by a parallel build
+    stage and is not edited here (this stage may not touch it); that stage is
+    expected to replace its own ``_default_output_dir`` body with a
+    delegation to this function so the two never diverge. Until then, both
+    read the identical env var with the identical fallback, which is what
+    :func:`test_puller_dir_matches_report_dir_rule`
+    (``tests/unit/test_polymarket_us_capital_flow_pull.py``) verifies against
+    the report script's OWN function, not a copy of its logic.
+    """
+    source = os.environ if env is None else env
+    override = source.get(_LIVE_TALLY_OUTPUT_DIR_ENV_VAR, "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "breezy" / "derived"
+
+
+def default_capital_flows_dir(env: Mapping[str, str] | None = None) -> Path:
+    """``default_output_dir() / "capital_flows"`` -- the puller's own output
+    root, and the directory the ROI report must read evidence from."""
+    return default_output_dir(env) / "capital_flows"
 
 
 @dataclass(frozen=True)

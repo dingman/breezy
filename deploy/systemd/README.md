@@ -1597,3 +1597,106 @@ Rules and checks:
 - **Never start the service by hand inside [16:35Z, 01:15Z).** Linking and enabling start nothing, so both may run at any time.
 - **Ledger path:** `~/.local/share/breezy/derived/hypothesis/hypothesis_ledger.jsonl`. The registrar and triage share this default, and neither the unit nor the wrapper sets `BREEZY_DERIVED_ROOT`.
 - **"CLEAN no look-taking hypothesis" appears in two cases:** when the ledger is absent, and when every record is zero-look. So check the ledger contents directly with `read_hypothesis_ledger` (L-30).
+
+## `breezy-capital-flow-pull` — FU-13b read-only capital-flow puller (2026-09-26, PREPARED, NOT ACTIVATED)
+
+`breezy-capital-flow-pull.service` + `.timer` + `deploy/systemd/
+capital-flow-pull-run.sh` ship the daily, unattended, read-only pull of
+Polymarket.us's `GET /v1/portfolio/activities` (deposits, withdrawals,
+referral bonuses, transfers), per
+`docs/plans/backlog/NIGHT_2026-09-26/FU-13b_plan_r2_2026-09-26.md`. Each run
+invokes `scripts/venue/polymarket_us_capital_flow_pull.py`, which pages the
+endpoint to `eof` (bounded by `MAX_PAGES=20`, `limit=100`) through the
+shared, credentialed `PolymarketUSHttpClient` — the SAME production wiring
+`breezy.strategy.current_rung_hold.set_family_halt_cli` reuses for its own
+build-side read — and writes one immutable, closed-schema snapshot under
+`~/.local/share/breezy/derived/capital_flows/`
+(`breezy.persistence.external_capital_flows.write_snapshot`, O_EXCL, 0600 in
+a 0700 dir). `scripts/analysis/portfolio_roi_report.py` reads the newest
+valid snapshot as EVIDENCE for its net-of-flow reconciliation ladder — never
+by inference, and never gating the raw D4 identity that stays the
+accounting-bug detector.
+
+**Read-only, GET-only, by construction.** The only venue call reachable from
+this module is `PolymarketUSHttpClient.get_authenticated`, bound to
+`account_activity.PORTFOLIO_ACTIVITIES_PATH` — imported, never restated as a
+literal (that literal appears in exactly one module under `src/`/`scripts/`,
+`account_activity.py`, pinned by
+`tests/unit/test_polymarket_us_capital_flow_pull.py`). It imports no venue
+SDK, nothing from `exec/`, and neither of the two barred permit functions;
+`tests/unit/test_execution_egress_firewall_guard.py`'s N2 exact-set pin is
+unchanged by this unit landing.
+
+**Standalone unit, not folded into the supervisor or quote-tape (Risk
+Register).** `breezy-trade-supervisor` is launch-critical, so a pull failure
+or hang must never couple to node launch; `breezy-quote-tape` is a
+continuous stream, a lifecycle mismatch with a daily oneshot. This is the
+only unit besides the supervisor and quote-tape that loads
+`~/.config/breezy/polymarket.env`.
+
+**No temp file (round-2 review, security REQUEST_CHANGES, resolved by
+design).** Unlike `portfolio-roi-run.sh`'s `mktemp`-plus-scan pattern, this
+wrapper never writes the puller's stdout/stderr to disk: `set -o pipefail`
+plus a pipe straight into `grep '^CAPITAL_FLOW_PULL '` keeps only the one
+dimensionless summary line in memory, so a crash or an OOM-kill leaves no
+residual file that could carry an amount, an id, or a cursor. The puller's
+own summary line already withholds all of those (AC9/AC10); the
+currency-shaped-token withhold in the wrapper is defence in depth, mirroring
+`portfolio-roi-run.sh`'s own guard. The puller's ERROR path prints the
+exception CLASS only (`CAPITAL_FLOW_PULL status=ERROR error=<ClassName>`),
+so `OnFailure=` alerts stay diagnosable without ever surfacing a message
+that could carry a redacted-but-structured venue detail.
+
+**Same-directory rule.** The puller resolves its output directory with
+`breezy.persistence.external_capital_flows.default_capital_flows_dir` — the
+identical `BREEZY_LIVE_TALLY_OUTPUT_DIR`-or-default rule
+`scripts/analysis/portfolio_roi_report._default_output_dir` uses for its own
+output root, plus `/capital_flows` — so the puller and the report always
+agree on where the evidence lives without a second, potentially-drifting
+copy of the rule.
+
+**`Before=breezy-portfolio-roi.service`.** Orders the pull ahead of the
+report that reads it; this ordering holds even under a
+missed-then-caught-up `Persistent=true` firing of both timers together.
+
+**Environment files.** `-%h/.config/breezy/breezy.env` (non-credential,
+`POLYMARKET_US_USER_AGENT`'s contact string convention),
+`-%h/.config/breezy/polymarket.env` (the Ed25519 signing key — the one
+credential this unit needs), and `-%h/.config/breezy/alerts.env`. Never
+`breezy-trade.env` or `operator.env`: this unit must never see an
+operator-reserved control, pinned by
+`tests/unit/test_capital_flow_pull_deploy.py`.
+
+**Light unit.** `MemoryMax=512M`, no `breezy-studies.slice`/flock — a
+single bounded JSON pull (`<=20` requests at the shared portfolio quota's
+`<=12`/min pacing, well under `TimeoutStartSec=300`) is a light read, the
+same class as `breezy-fee-evidence-pull.service`, which likewise does not
+take the shared studies lock.
+
+Scheduled at **17:30 UTC** — between `breezy-family-tally@.timer`'s 17:20
+tick and `breezy-portfolio-roi.timer`'s 17:40 tick, free against every
+occupied `OnCalendar=` on this host, and deliberately NOT 17:25 (the
+RETIRED `breezy-pm-crh-cont-tally` slot,
+`test_1715_and_1725_utc_are_unowned_after_the_wp11b_template_merge` pins it
+permanently unowned) — pinned by `tests/unit/test_deploy_timer_hours.py`.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/capital-flow-pull-run.sh
+OK
+```
+
+To activate: symlink all three files (`breezy-capital-flow-pull.service`,
+`breezy-capital-flow-pull.timer`, and `capital-flow-pull-run.sh` stays a
+plain file referenced by `ExecStart=`, not symlinked itself) into
+`~/.config/systemd/user/` (§2's pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-capital-flow-pull.timer` — never
+`start` the service directly. **Not activated by this change** — the
+coordinator installs it.
+
+**Rollback:** `systemctl --user disable --now breezy-capital-flow-pull.timer`
+and revert the commit. `portfolio_roi_report.py` treats an absent/stale
+snapshot directory as `NOT_CONFIGURED`/`UNAVAILABLE` (never inferred), so
+every window simply keeps its raw classification — rollback is total and
+fail-closed.
