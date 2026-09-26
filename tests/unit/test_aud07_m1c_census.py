@@ -24,11 +24,19 @@ _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
-from aud07_live_rule_crossing_sim import M1C_GRID, ResumeKeyConflictError
+from aud07_live_rule_crossing_sim import (
+    LOOK_STEP,
+    M1C_GRID,
+    N_DEPTHS,
+    N_MAX,
+    ResumeKeyConflictError,
+    load_eps_pin,
+)
 from aud07_m1c_census import (
     STRESS_CELL_INDEX,
     CensusCellStats,
     derive_eps_pin,
+    run_census_cell,
     run_census_chunk,
     run_derive_pin,
     run_stress_chunk,
@@ -218,3 +226,89 @@ def test_derive_pin_refuses_missing_stress_row(tmp_path: Path) -> None:
 def test_stress_row_identity_never_collides_with_a_real_cell() -> None:
     assert STRESS_CELL_INDEX < 0
     assert all(c != STRESS_CELL_INDEX for c in range(len(M1C_GRID)))
+
+
+# ---------------------------------------------------------------------------
+# AUD-07 M1c-eps_k (RULING PR-1, 2026-09-26): per-depth census + terminal
+# bucket, and `derive_eps_pin`'s per-depth pin.
+# ---------------------------------------------------------------------------
+
+
+def test_run_census_cell_buckets_deltas_by_depth_and_a_terminal_bucket() -> None:
+    """`run_census_cell` reports a length-`N_DEPTHS` per-depth table
+    (`None` where a rep's first terminal look pre-empted that depth) plus a
+    terminal bucket, without changing the pre-existing pooled fields'
+    shape."""
+    stats = run_census_cell(0, n_reps=5, seed=20260926_001)
+    assert stats.max_abs_delta_by_depth is not None
+    assert len(stats.max_abs_delta_by_depth) == N_DEPTHS
+    assert all(v is None or v >= 0.0 for v in stats.max_abs_delta_by_depth)
+    assert stats.terminal_max_abs_delta is None or stats.terminal_max_abs_delta >= 0.0
+    # The last depth coincides with look_n == N_MAX, structurally always a
+    # terminal look -- never populated in the interim table.
+    assert N_MAX // LOOK_STEP == N_DEPTHS
+    assert stats.max_abs_delta_by_depth[N_DEPTHS - 1] is None
+
+
+def test_derive_eps_pin_produces_a_per_depth_pin_that_load_eps_pin_accepts(
+    tmp_path: Path,
+) -> None:
+    """When every cell carries per-depth data, `derive_eps_pin` emits
+    `eps_by_depth`/`eps_terminal`/`census_max_by_depth`/
+    `census_terminal_max`, and the result LOADS cleanly via
+    `load_eps_pin` -- proving the two layers agree on shape and the floor/
+    3x-census invariants."""
+    stats = [
+        CensusCellStats(
+            cell_index=i, n_reps=10, max_abs_delta_b=0.05, p999_abs_delta_b=0.05,
+            min_dt=0.02, min_t1=0.2,
+            max_abs_delta_by_depth=tuple(
+                (0.01 * (depth + 1)) if depth < 3 else None for depth in range(N_DEPTHS)
+            ),
+            terminal_max_abs_delta=0.005,
+        )
+        for i in range(2)
+    ]
+    census_path = tmp_path / "census.json"
+    census_path.write_text("{}", encoding="utf-8")
+
+    pin = derive_eps_pin(stats, code_sha="abc123", census_json_path=census_path)
+
+    assert len(pin["eps_by_depth"]) == N_DEPTHS
+    assert len(pin["census_max_by_depth"]) == N_DEPTHS
+    assert pin["eps_terminal"] == pytest.approx(max(0.02, 3.0 * 0.005))
+    assert pin["eps"] == max([*pin["eps_by_depth"], pin["eps_terminal"]])
+    # depth 4 (index 3) has NO observation (None on both stats rows, since
+    # only depths 1-3 -- indices 0-2 -- were given a value above) -- falls
+    # back to the global disclosure eps, never the floor.
+    assert pin["eps_by_depth"][3] == pin["eps"]
+
+    pin_path = tmp_path / "eps_pin.json"
+    pin_path.write_text(json.dumps(pin), encoding="utf-8")
+    loaded = load_eps_pin(pin_path, code_sha="abc123")
+    assert loaded.eps_by_depth == tuple(pin["eps_by_depth"])
+    assert loaded.eps_terminal == pin["eps_terminal"]
+
+
+def test_derive_eps_pin_omits_per_depth_keys_when_any_cell_lacks_depth_data(
+    tmp_path: Path,
+) -> None:
+    """A single legacy (scalar-only) row anywhere in `cell_stats` keeps the
+    WHOLE derivation legacy -- never a partially-populated table."""
+    stats = [
+        CensusCellStats(
+            cell_index=0, n_reps=10, max_abs_delta_b=0.01, p999_abs_delta_b=0.01,
+            min_dt=0.02, min_t1=0.2,
+            max_abs_delta_by_depth=(0.01,) * N_DEPTHS, terminal_max_abs_delta=0.001,
+        ),
+        CensusCellStats(
+            cell_index=1, n_reps=10, max_abs_delta_b=0.01, p999_abs_delta_b=0.01,
+            min_dt=0.02, min_t1=0.2,
+        ),
+    ]
+    census_path = tmp_path / "census.json"
+    census_path.write_text("{}", encoding="utf-8")
+
+    pin = derive_eps_pin(stats, code_sha="abc123", census_json_path=census_path)
+    assert "eps_by_depth" not in pin
+    assert "eps_terminal" not in pin

@@ -34,13 +34,16 @@ from aud07_live_rule_crossing_sim import (
     ALL_YES_K1_CONTROL,
     LOOK_STEP,
     M1C_GRID,
+    N_DEPTHS,
     N_MAX,
     SEED_BASE,
     SEED_CAL_BASE,
     SEED_RERUN_BASE,
     EpsPin,
     EpsPinValidationError,
+    M1cCellResult,
     StreamingBoundary,
+    _audit_violates_eps,
     _decisions,
     _max_abs_delta_b,
     _needs_refine,
@@ -59,6 +62,30 @@ def _look(*, t: float, s: float, b_eff: float, b_fut: float) -> SimpleNamespace:
     """A minimal stand-in for a `LookRecord`: `_needs_refine`/`_decisions`/
     `_max_abs_delta_b` only read `.t`, `.state.s`, `.b_eff`, `.b_fut`."""
     return SimpleNamespace(t=t, b_eff=b_eff, b_fut=b_fut, state=SimpleNamespace(s=s))
+
+
+def _depth_look(
+    *, look_n: int, terminal: bool, t: float, s: float, b_eff: float, b_fut: float
+) -> SimpleNamespace:
+    """AUD-07 M1c-eps_k: a `_look` stand-in that also carries `.look_n`/
+    `.terminal`, the two fields `_eps_for_look` reads to pick a per-depth
+    or terminal eps."""
+    return SimpleNamespace(
+        t=t, b_eff=b_eff, b_fut=b_fut, state=SimpleNamespace(s=s), look_n=look_n, terminal=terminal
+    )
+
+
+def _minimal_cell_result(**overrides: object) -> M1cCellResult:
+    """A minimally-populated `M1cCellResult` for `to_json` field tests --
+    only the fields under test vary."""
+    base: dict[str, object] = {
+        "cell_index": 0, "label": "x", "side_mix": "mixed", "k": 2, "dispersion": "d", "r": None,
+        "seed": 1, "n_reps": 1, "npts": 401, "crossing_count": 0, "crossing_rate": 0.0,
+        "cp_upper": 0.0, "cp_lower": 0.0, "mean_s_terminal": 0.0, "var_s_terminal": 0.0,
+        "mean_look_count": 1.0, "loss_stop_count": 0,
+    }
+    base.update(overrides)
+    return M1cCellResult(**base)  # type: ignore[arg-type]
 
 
 #: Gate-fast eps pin (§8 preamble: "gate-fast tests use a cheap grid pair:
@@ -504,3 +531,193 @@ def test_eps_pin_validation_rejects_eps_below_floor_or_below_3x_census_max_or_fo
     foreign_sha = _write_pin(code_sha="someone-elses-sha")
     with pytest.raises(EpsPinValidationError, match="code_sha"):
         load_eps_pin(foreign_sha, code_sha=code_sha)
+
+
+# ---------------------------------------------------------------------------
+# AUD-07 M1c-eps_k (RULING PR-1/PR-2, 2026-09-26): per-depth eps_k table
+# plus an authoritative eps_terminal.
+# ---------------------------------------------------------------------------
+
+
+def test_needs_refine_selects_eps_by_the_looks_terminal_flag_never_ordinal() -> None:
+    """RULING PR-1: terminal classification keys STRICTLY on the look's own
+    `.terminal` (the sim's stop rule), never on whether `look_n` happens to
+    be the max ordinal, and never on how early a genuinely terminal look
+    occurs."""
+    # A NON-terminal look at the MAX ordinal (depth == N_DEPTHS): margin
+    # 0.05 clears the depth eps (0.02) but would NOT clear a wide
+    # eps_terminal (0.5) -- if the code wrongly treated "max ordinal" as
+    # terminal, this would wrongly flag "eff".
+    max_ordinal_interim = _depth_look(
+        look_n=N_MAX, terminal=False, t=0.9, s=1.05, b_eff=1.00, b_fut=-100.0
+    )
+    tight_by_depth = {depth: 0.02 for depth in range(1, N_DEPTHS + 1)}
+    assert _needs_refine(
+        (max_ordinal_interim,), eps=0.6, dt_min=1e-6,
+        eps_by_depth=tight_by_depth, eps_terminal=0.5,
+    ) is None
+
+    # A genuinely TERMINAL look at an EARLY ordinal (depth 3, far from the
+    # max): margin 0.05 clears a tight eps_terminal (0.02) but not a wide
+    # depth-3 eps (0.5) -- proving eps_terminal governs once `.terminal` is
+    # True, regardless of ordinal position.
+    early_terminal = _depth_look(
+        look_n=3 * LOOK_STEP, terminal=True, t=1.0, s=1.05, b_eff=1.00, b_fut=-100.0
+    )
+    wide_by_depth = {depth: 0.5 for depth in range(1, N_DEPTHS + 1)}
+    assert _needs_refine(
+        (early_terminal,), eps=0.6, dt_min=1e-6,
+        eps_by_depth=wide_by_depth, eps_terminal=0.02,
+    ) is None
+    assert _needs_refine(
+        (early_terminal,), eps=0.6, dt_min=1e-6,
+        eps_by_depth=wide_by_depth, eps_terminal=0.06,
+    ) == "eff"
+
+
+def test_needs_refine_falls_back_to_the_global_eps_for_a_depth_missing_from_the_table() -> None:
+    """RULING PR-1: a depth absent from `eps_by_depth` (no census
+    observation) falls back to the GLOBAL scalar eps, never the floor --
+    verified by matching the no-table call exactly."""
+    sparse_by_depth = {1: 10.0}  # only depth 1 present; this look is depth 15.
+    look = _depth_look(
+        look_n=15 * LOOK_STEP, terminal=False, t=0.9, s=1.05, b_eff=1.00, b_fut=-100.0
+    )
+    with_table = _needs_refine(
+        (look,), eps=0.02, dt_min=1e-6, eps_by_depth=sparse_by_depth, eps_terminal=0.02
+    )
+    without_table = _needs_refine((look,), eps=0.02, dt_min=1e-6)
+    assert with_table == without_table is None
+
+
+def test_load_eps_pin_normalises_a_legacy_scalar_pin_to_a_constant_per_depth_table(
+    tmp_path: Path,
+) -> None:
+    """Architect code note: a legacy pin (no `eps_by_depth`/`eps_terminal`
+    keys) is normalised to a constant table so downstream consumers
+    (`M1cCellResult`, `_needs_refine`) have ONE representation."""
+    path = tmp_path / "legacy_pin.json"
+    path.write_text(
+        json.dumps(
+            {
+                "eps": 0.03, "dt_min": 1e-3, "census_max": 0.005,
+                "census_sha256": "d" * 64, "code_sha": "abc123",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pin = load_eps_pin(path, code_sha="abc123")
+    assert pin.eps_by_depth == (pin.eps,) * N_DEPTHS
+    assert pin.eps_terminal == pin.eps
+    assert len(pin.eps_by_depth) == N_DEPTHS
+
+
+def test_load_eps_pin_refuses_a_bad_eps_by_depth_table(tmp_path: Path) -> None:
+    """Each pin-refusal case from RULING PR-1: wrong table length, a
+    missing `eps_terminal`, a per-depth/eps_terminal floor or 3x-census
+    violation, and a scalar `eps` that does not equal
+    `max(eps_by_depth, eps_terminal)`."""
+    ok_table = [0.02] * N_DEPTHS
+
+    def _payload(**overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "eps": 0.02, "dt_min": 1e-3, "census_max": 0.0,
+            "census_sha256": "d" * 64, "code_sha": "abc123",
+            "eps_by_depth": list(ok_table), "eps_terminal": 0.02,
+        }
+        base.update(overrides)
+        return base
+
+    def _write(name: str, **overrides: object) -> Path:
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(_payload(**overrides)), encoding="utf-8")
+        return path
+
+    ok_pin = load_eps_pin(_write("ok"), code_sha="abc123")
+    assert ok_pin.eps_by_depth == tuple(ok_table)
+    assert ok_pin.eps_terminal == 0.02
+
+    with pytest.raises(EpsPinValidationError, match="entries"):
+        load_eps_pin(_write("short", eps_by_depth=ok_table[:-1]), code_sha="abc123")
+
+    no_terminal = _payload()
+    del no_terminal["eps_terminal"]
+    path = tmp_path / "no_terminal.json"
+    path.write_text(json.dumps(no_terminal), encoding="utf-8")
+    with pytest.raises(EpsPinValidationError, match="eps_terminal"):
+        load_eps_pin(path, code_sha="abc123")
+
+    below_floor_table = list(ok_table)
+    below_floor_table[2] = 0.01
+    with pytest.raises(EpsPinValidationError, match="floor"):
+        load_eps_pin(_write("depth_floor", eps_by_depth=below_floor_table), code_sha="abc123")
+
+    with pytest.raises(EpsPinValidationError, match="3x"):
+        load_eps_pin(
+            _write(
+                "depth_3x",
+                census_max_by_depth=[0.01] + [0.0] * (N_DEPTHS - 1),
+            ),
+            code_sha="abc123",
+        )  # 0.02 < 3x0.01=0.03
+
+    with pytest.raises(EpsPinValidationError, match="floor"):
+        load_eps_pin(_write("terminal_floor", eps_terminal=0.01), code_sha="abc123")
+
+    with pytest.raises(EpsPinValidationError, match="3x"):
+        load_eps_pin(
+            _write("terminal_3x", eps_terminal=0.02, census_terminal_max=0.01),
+            code_sha="abc123",
+        )  # 0.02 < 3x0.01=0.03
+
+    with pytest.raises(EpsPinValidationError, match="does not equal"):
+        load_eps_pin(_write("scalar_mismatch", eps=0.5), code_sha="abc123")
+
+
+def test_m1c_cell_result_to_json_round_trips_eps_by_depth_and_omits_it_when_none() -> None:
+    """Architect code note: `to_json` omits `eps_by_depth` entirely when
+    `None` (pure mode -- test 17 relies on this to stay byte-unchanged),
+    and round-trips the table as a plain list when present (refined mode)."""
+    pure = _minimal_cell_result(eps_by_depth=None)
+    refined = _minimal_cell_result(eps_by_depth=(0.02,) * N_DEPTHS)
+
+    pure_json = pure.to_json()
+    refined_json = refined.to_json()
+
+    assert "eps_by_depth" not in pure_json
+    assert refined_json["eps_by_depth"] == [0.02] * N_DEPTHS
+
+
+def test_audit_violates_eps_uses_the_looks_own_depth_eps_not_the_scalar() -> None:
+    """The in-run audit abort (RULING PR-1: "the audit abort becomes
+    per-depth") catches a delta the legacy scalar-only check would miss."""
+    pin = EpsPin(
+        eps=0.6, dt_min=1e-6, census_sha256="0" * 64, census_max=0.0, code_sha="test-sha",
+        sha256="0" * 64, eps_by_depth=(0.05,) * N_DEPTHS, eps_terminal=0.6,
+    )
+    look_a = _depth_look(look_n=LOOK_STEP, terminal=False, t=0.1, s=0.0, b_eff=1.0, b_fut=-1.0)
+    over_threshold = _depth_look(
+        look_n=LOOK_STEP, terminal=False, t=0.1, s=0.0, b_eff=1.1, b_fut=-1.0
+    )
+    under_threshold = _depth_look(
+        look_n=LOOK_STEP, terminal=False, t=0.1, s=0.0, b_eff=1.01, b_fut=-1.0
+    )
+    # delta=0.1: below the scalar eps (0.6) but ABOVE this look's depth eps
+    # (0.05) -- the legacy scalar-only check would have missed it.
+    assert _audit_violates_eps((look_a,), (over_threshold,), pin) is True
+    assert _audit_violates_eps((look_a,), (under_threshold,), pin) is False
+
+
+def test_audit_violates_eps_matches_the_legacy_scalar_check_when_no_table_is_present() -> None:
+    """With no `eps_by_depth` table (`_FAST_PIN`), `_audit_violates_eps`
+    reduces exactly to the pre-eps_k `max_abs_delta_b >= pin.eps` check."""
+    pin = _FAST_PIN
+    look_a = _look(t=0.1, s=0.0, b_eff=1.0, b_fut=-1.0)
+    look_over = _look(t=0.1, s=0.0, b_eff=1.25, b_fut=-1.0)
+    look_under = _look(t=0.1, s=0.0, b_eff=1.05, b_fut=-1.0)
+    assert _audit_violates_eps((look_a,), (look_over,), pin) == (
+        _max_abs_delta_b((look_a,), (look_over,)) >= pin.eps
+    )
+    assert _audit_violates_eps((look_a,), (look_under,), pin) == (
+        _max_abs_delta_b((look_a,), (look_under,)) >= pin.eps
+    )

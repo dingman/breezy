@@ -7,6 +7,8 @@ module exists before any number does (amendment §6 step 1).
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import sys
 from pathlib import Path
 
@@ -113,3 +115,24 @@ def test_branch_v_needs_all_16_any_i_fires_i() -> None:
 
     one_i_among_mixed = ("V",) * 10 + ("INDETERMINATE",) * 5 + ("I",)
     assert branch(one_i_among_mixed) == "I"
+
+
+#: Captured from `aud07_m2_gate.py` at 32a764d (pre-AUD-07-M1c-eps_k), the
+#: last commit before the eps_k switch. AUD-07 M1c-eps_k (RULING PR-1/PR-2)
+#: only ever changes the f-producing SIM/pin layer -- f is performance-only
+#: (RULING finding 1) and must never touch this V/I/INDETERMINATE gate.
+_GATE_CODE_SHA256_AT_32A764D = (
+    "71a0dbeea4fdf247ca007c2fc922469aa4d365b8dd4cfc1b117972486bcb9049"
+)
+
+
+def test_classify_final_class_and_branch_are_byte_unchanged_by_the_eps_k_switch() -> None:
+    """The eps_k switch (AUD-07 M1c-eps_k) touches only the f-producing
+    sim/pin layer; `classify_cell`/`final_class`/`branch` -- the actual
+    V/I/INDETERMINATE gate -- must stay byte-for-byte identical."""
+    source = (
+        inspect.getsource(classify_cell)
+        + inspect.getsource(final_class)
+        + inspect.getsource(branch)
+    )
+    assert hashlib.sha256(source.encode("utf-8")).hexdigest() == _GATE_CODE_SHA256_AT_32A764D

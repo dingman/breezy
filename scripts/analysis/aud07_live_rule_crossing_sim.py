@@ -61,7 +61,7 @@ import os
 import random
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -110,6 +110,7 @@ __all__ = [
     "COARSE_NPTS",
     "LOOK_STEP",
     "M1C_GRID",
+    "N_DEPTHS",
     "N_MAX",
     "N_SUBSTREAMS_80K",
     "REDUCED_NPTS",
@@ -195,6 +196,12 @@ AUDIT_TARGET: Final[int] = 400
 #: EPS floor (amendment §1 "EPS and DT_MIN"): `EPS = max(0.02, 3 x census
 #: max)`, never below this regardless of the census.
 EPS_FLOOR: Final[float] = 0.02
+
+#: AUD-07 M1c-eps_k (RULING PR-1, 2026-09-26): the per-depth `eps_k` table's
+#: fixed length, `N_MAX / LOOK_STEP` -- one entry per scheduled interim
+#: look ordinal. Terminal looks use the separate, authoritative
+#: `eps_terminal`, never an entry of this table.
+N_DEPTHS: Final[int] = N_MAX // LOOK_STEP
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +414,15 @@ class M1cCellResult:
     sum_look_count: int = 0
     numpy_version: str | None = None
     scipy_version: str | None = None
+    #: AUD-07 M1c-eps_k (RULING PR-1): the per-depth eps table the pin used
+    #: for this run's refined-mode replicates, disclosure only -- `None` in
+    #: `pure` mode (no pin at all). `to_json` OMITS this key entirely when
+    #: `None` (architect code note) so every existing pure-mode row's exact
+    #: key set stays byte-unchanged (test 17).
+    eps_by_depth: tuple[float, ...] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "cell_index": self.cell_index,
             "label": self.label,
             "side_mix": self.side_mix,
@@ -449,6 +462,9 @@ class M1cCellResult:
             "numpy_version": self.numpy_version,
             "scipy_version": self.scipy_version,
         }
+        if self.eps_by_depth is not None:
+            payload["eps_by_depth"] = list(self.eps_by_depth)
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -491,13 +507,30 @@ class EpsPin:
     code_sha: str
     #: sha256 of the pin FILE's own canonical bytes, stamped on every row.
     sha256: str
+    #: AUD-07 M1c-eps_k (RULING PR-1): the per-depth eps table (length
+    #: `N_DEPTHS`, index 0 = depth 1) and the authoritative terminal eps.
+    #: `None` only for an :class:`EpsPin` built directly (bypassing
+    #: `load_eps_pin`) without a table -- `load_eps_pin` itself ALWAYS
+    #: returns both populated, normalising a legacy scalar pin to a
+    #: constant table (architect code note).
+    eps_by_depth: tuple[float, ...] | None = None
+    eps_terminal: float | None = None
 
 
 def load_eps_pin(path: Path, *, code_sha: str) -> EpsPin:
     """Load and validate `eps_pin.json` (amendment §5 "Pin"): `EPS >=
     0.02`, `EPS >= 3 x census max`, and the pin's own `code_sha` must match
     the running code -- each violation is a refusal, never a silent clamp
-    (test 28)."""
+    (test 28).
+
+    AUD-07 M1c-eps_k (RULING PR-1, 2026-09-26): an optional per-depth
+    `eps_by_depth` (length `N_DEPTHS`) plus an authoritative `eps_terminal`.
+    A legacy pin (neither key present) is NORMALISED to a constant table --
+    `eps_by_depth = (eps,) * N_DEPTHS`, `eps_terminal = eps` -- so every
+    downstream consumer has ONE representation (architect code note). Each
+    entry passes the SAME floor/3x-census validation as the scalar `eps`;
+    the pin refuses a table of the wrong length and refuses a scalar `eps`
+    that does not equal `max(eps_by_depth, eps_terminal)`."""
     raw = path.read_bytes()
     payload = json.loads(raw)
     eps = float(payload["eps"])
@@ -510,6 +543,63 @@ def load_eps_pin(path: Path, *, code_sha: str) -> EpsPin:
         raise EpsPinValidationError(
             f"eps_pin code_sha {pin_code_sha!r} does not match the running "
             f"code_sha {code_sha!r} (foreign pin)"
+        )
+
+    eps_by_depth_raw = payload.get("eps_by_depth")
+    if eps_by_depth_raw is None:
+        # Legacy scalar pin: normalise to a constant per-depth table.
+        eps_by_depth_list = [eps] * N_DEPTHS
+        eps_terminal = eps
+        census_max_by_depth = [census_max] * N_DEPTHS
+        census_terminal_max = census_max
+    else:
+        eps_by_depth_list = [float(v) for v in eps_by_depth_raw]
+        if len(eps_by_depth_list) != N_DEPTHS:
+            raise EpsPinValidationError(
+                f"eps_by_depth has {len(eps_by_depth_list)} entries, expected "
+                f"{N_DEPTHS} (N_MAX/LOOK_STEP)"
+            )
+        if "eps_terminal" not in payload:
+            raise EpsPinValidationError("eps_by_depth is present but eps_terminal is missing")
+        eps_terminal = float(payload["eps_terminal"])
+        census_max_by_depth_raw = payload.get("census_max_by_depth")
+        if census_max_by_depth_raw is None:
+            census_max_by_depth = [0.0] * N_DEPTHS
+        else:
+            census_max_by_depth = [float(v) for v in census_max_by_depth_raw]
+            if len(census_max_by_depth) != N_DEPTHS:
+                raise EpsPinValidationError(
+                    f"census_max_by_depth has {len(census_max_by_depth)} entries, "
+                    f"expected {N_DEPTHS} (N_MAX/LOOK_STEP)"
+                )
+        census_terminal_max = float(payload.get("census_terminal_max", 0.0))
+
+    paired_depths = zip(eps_by_depth_list, census_max_by_depth)
+    for depth, (eps_k_val, max_k) in enumerate(paired_depths, start=1):
+        if eps_k_val < EPS_FLOOR:
+            raise EpsPinValidationError(
+                f"eps_by_depth[{depth}] {eps_k_val!r} is below the floor {EPS_FLOOR!r}"
+            )
+        if eps_k_val < 3.0 * max_k:
+            raise EpsPinValidationError(
+                f"eps_by_depth[{depth}] {eps_k_val!r} is below 3x its census max "
+                f"{max_k!r} ({3.0 * max_k!r})"
+            )
+    if eps_terminal < EPS_FLOOR:
+        raise EpsPinValidationError(
+            f"eps_terminal {eps_terminal!r} is below the floor {EPS_FLOOR!r}"
+        )
+    if eps_terminal < 3.0 * census_terminal_max:
+        raise EpsPinValidationError(
+            f"eps_terminal {eps_terminal!r} is below 3x the terminal census max "
+            f"{census_terminal_max!r} ({3.0 * census_terminal_max!r})"
+        )
+
+    expected_scalar_eps = max([*eps_by_depth_list, eps_terminal])
+    if eps != expected_scalar_eps:
+        raise EpsPinValidationError(
+            f"scalar eps {eps!r} does not equal max(eps_by_depth, eps_terminal) "
+            f"{expected_scalar_eps!r}"
         )
     if eps < EPS_FLOOR:
         raise EpsPinValidationError(f"eps {eps!r} is below the floor {EPS_FLOOR!r}")
@@ -528,6 +618,8 @@ def load_eps_pin(path: Path, *, code_sha: str) -> EpsPin:
         census_max=census_max,
         code_sha=pin_code_sha,
         sha256=hashlib.sha256(raw).hexdigest(),
+        eps_by_depth=tuple(eps_by_depth_list),
+        eps_terminal=eps_terminal,
     )
 
 
@@ -548,22 +640,76 @@ def _resolve_audit_every(n_reps: int, audit_every: int | None) -> int:
     return audit_every
 
 
-def _needs_refine(looks: Sequence[Any], *, eps: float, dt_min: float) -> str | None:
+def _depth_table_as_mapping(table: tuple[float, ...] | None) -> dict[int, float] | None:
+    """`pin.eps_by_depth` is a 0-indexed tuple (index 0 = depth 1); expose
+    it to :func:`_eps_for_look` as the depth-keyed mapping it expects."""
+    if table is None:
+        return None
+    return dict(enumerate(table, start=1))
+
+
+def _eps_for_look(
+    look: Any,
+    *,
+    eps: float,
+    eps_by_depth: Mapping[int, float] | None,
+    eps_terminal: float | None,
+) -> float:
+    """AUD-07 M1c-eps_k (RULING PR-1): the per-look eps -- `eps_terminal`
+    for a look the SIM'S OWN stop rule marks `terminal` (never by ordinal
+    position), else `eps_by_depth[depth]` for that look's ordinal depth
+    (`look_n // LOOK_STEP`), falling back to the GLOBAL scalar `eps` (never
+    the floor) when `eps_by_depth` is absent entirely or has no entry for
+    that depth."""
+    if eps_by_depth is None:
+        return eps
+    if look.terminal:
+        return eps_terminal if eps_terminal is not None else eps
+    depth = look.look_n // LOOK_STEP
+    return eps_by_depth.get(depth, eps)
+
+
+def _needs_refine(
+    looks: Sequence[Any],
+    *,
+    eps: float,
+    dt_min: float,
+    eps_by_depth: Mapping[int, float] | None = None,
+    eps_terminal: float | None = None,
+) -> str | None:
     """`None` only if ALL of eff/fut/dt/nonfinite hold over the reached
     coarse looks (amendment §2.1). Returns the FIRST failing category's
-    short name otherwise."""
+    short name otherwise.
+
+    AUD-07 M1c-eps_k (RULING PR-1): `eps_by_depth`/`eps_terminal` are
+    optional and default to `None`, in which case every look uses the
+    single scalar `eps` -- byte-identical to the pre-eps_k behaviour (tests
+    1-16, 4a/4b, the M1b golden). When present, the eff/fut checks use
+    EACH look's own eps via :func:`_eps_for_look`. PR-2: `dt_min` stays one
+    global scalar, unaffected by eps_k."""
     if not looks:
         return None
 
-    confident_crossing = any((look.state.s - look.b_eff) >= eps for look in looks)
-    confident_non_crossing = all((look.state.s - look.b_eff) <= -eps for look in looks)
+    confident_crossing = any(
+        (look.state.s - look.b_eff)
+        >= _eps_for_look(look, eps=eps, eps_by_depth=eps_by_depth, eps_terminal=eps_terminal)
+        for look in looks
+    )
+    confident_non_crossing = all(
+        (look.state.s - look.b_eff)
+        <= -_eps_for_look(look, eps=eps, eps_by_depth=eps_by_depth, eps_terminal=eps_terminal)
+        for look in looks
+    )
     if not (confident_crossing or confident_non_crossing):
         return "eff"
 
     for look in looks:
         if look.b_fut == float("-inf"):
             continue  # tie pair: infinite margin, always passes.
-        if abs(look.state.s - look.b_fut) < eps:
+        look_eps = _eps_for_look(
+            look, eps=eps, eps_by_depth=eps_by_depth, eps_terminal=eps_terminal
+        )
+        if abs(look.state.s - look.b_fut) < look_eps:
             return "fut"
 
     prev_t = 0.0
@@ -611,6 +757,28 @@ def _max_abs_delta_b(looks_a: Sequence[Any], looks_b: Sequence[Any]) -> float:
     return max_delta
 
 
+def _audit_violates_eps(looks_a: Sequence[Any], looks_b: Sequence[Any], pin: EpsPin) -> bool:
+    """AUD-07 M1c-eps_k (RULING PR-1): the audit abort is per-depth --
+    each matching look pair is checked against THAT look's own eps
+    (:func:`_eps_for_look`, keyed off `looks_a`'s `.terminal`/`.look_n`)
+    rather than the single scalar `pin.eps`. With no `eps_by_depth` table
+    this reduces exactly to the legacy `max_abs_delta_b >= pin.eps` check
+    (test 18)."""
+    eps_by_depth = _depth_table_as_mapping(pin.eps_by_depth)
+    for look_a, look_b in zip(looks_a, looks_b, strict=False):
+        threshold = _eps_for_look(
+            look_a, eps=pin.eps, eps_by_depth=eps_by_depth, eps_terminal=pin.eps_terminal
+        )
+        for xa, xb in ((look_a.b_eff, look_b.b_eff), (look_a.b_fut, look_b.b_fut)):
+            if xa == xb:
+                continue
+            if not (math.isfinite(xa) and math.isfinite(xb)):
+                return True
+            if abs(xa - xb) >= threshold:
+                return True
+    return False
+
+
 def _run_replicate(
     draws: list[CombinedDraw],
     *,
@@ -644,7 +812,13 @@ def _run_replicate(
         reason: str | None = "solver"
         looks_c = ()
     else:
-        reason = _needs_refine(looks_c, eps=pin.eps, dt_min=pin.dt_min)
+        reason = _needs_refine(
+            looks_c,
+            eps=pin.eps,
+            dt_min=pin.dt_min,
+            eps_by_depth=_depth_table_as_mapping(pin.eps_by_depth),
+            eps_terminal=pin.eps_terminal,
+        )
 
     audit_stats: dict[str, Any] = {
         "audited": False,
@@ -673,7 +847,7 @@ def _run_replicate(
                 "max_abs_delta_b": max_delta,
                 "disagreement": disagreement,
             }
-            if disagreement or max_delta >= pin.eps:
+            if disagreement or _audit_violates_eps(looks_c, looks_f, pin):
                 raise AuditPremiseViolation(
                     cell_index=cell_index,
                     rep_index=rep_index,
@@ -927,6 +1101,7 @@ def run_cell(
         eps=eps_pin.eps if eps_pin is not None else None,
         dt_min=eps_pin.dt_min if eps_pin is not None else None,
         eps_pin_sha256=eps_pin.sha256 if eps_pin is not None else None,
+        eps_by_depth=eps_pin.eps_by_depth if eps_pin is not None else None,
         audit_every=audit_every_effective,
         refined_count=refined_count,
         refine_reasons=tuple(sorted(refine_reason_counts.items())),
