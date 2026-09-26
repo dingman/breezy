@@ -3839,3 +3839,195 @@ def test_the_shipped_resolver_reaches_no_violation() -> None:
         assert find_exec_resolver_violations(path, source) == []
         return
     raise AssertionError("client.py was not reached by the scan roots")
+
+
+# ---------------------------------------------------------------------------
+# R-7-IMPL compensating strengthening (security review, plan r1.1): a new
+# helper (`_match_position_lag`) sits outside BOTH `ORDER_LIFECYCLE_COROUTINES`
+# and `EXEC_RESOLVER_COROUTINES` -- a pre-existing pattern (every OTHER
+# unscanned helper `_write_startup_position_evidence` already calls) that this
+# plan extends. The compensating control is narrower and sharper than vetting
+# what the new helper may call: NO function outside `__init__` and the two
+# vetted coroutine sets may ever REFERENCE the order-sender attribute at all,
+# by name, whether called or merely read.
+# ---------------------------------------------------------------------------
+
+#: Function/method names permitted to reference `self._order_sender`.
+#: `__init__` binds it; `ORDER_LIFECYCLE_COROUTINES` (`_submit_order`) sends
+#: through it. `EXEC_RESOLVER_COROUTINES` is included per the security
+#: reviewer's ruling (plan r1.1) so a FUTURE resolver change that reached it
+#: would be caught by the resolver's OWN allowlist
+#: (`EXEC_RESOLVER_PERMITTED_CALLEES`, which already excludes
+#: `self._order_sender.post_order` by construction) rather than by this ban
+#: silently widening around it.
+ORDER_SENDER_REFERENCE_PERMITTED_SCOPES = (
+    frozenset({"__init__"}) | ORDER_LIFECYCLE_COROUTINES | EXEC_RESOLVER_COROUTINES
+)
+
+#: Pinned at HEAD (2026-09-26, before R-7-IMPL): the exact set of functions in
+#: the shipped `exec/client.py` that reference `self._order_sender`.
+#: `__init__` binds it (`self._order_sender = order_sender`); `_submit_order`
+#: is the only coroutine that calls `.post_order`. Any OTHER function
+#: referencing it -- including a new helper the create-path accept-fill
+#: branch calls, such as R-7-IMPL's `_match_position_lag` -- is exactly what
+#: `find_order_sender_reference_violations` below refuses.
+ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD = frozenset({"__init__", "_submit_order"})
+
+
+def _functions_referencing_order_sender(path: str, source: str) -> set[str]:
+    """Every function/method name (any nesting) whose body references
+    ``self._order_sender`` -- bare, or as the base of ``.post_order`` -- at
+    least once.
+
+    Matches on the INNER attribute (``.attr == "_order_sender"`` with a
+    ``self`` base) rather than the full dotted callee, so a bare reference
+    and a ``.post_order`` call are caught by the SAME node with exactly one
+    match per occurrence: ``self._order_sender.post_order(...)``'s outer
+    ``Attribute`` node has this inner node as its ``.value``.
+    """
+    if not path.startswith(EXEC_PACKAGE_PATH_PREFIX):
+        return set()
+    tree = ast.parse(source, filename=path)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Attribute)
+                and inner.attr == "_order_sender"
+                and isinstance(inner.value, ast.Name)
+                and inner.value.id == "self"
+            ):
+                found.add(node.name)
+                break
+    return found
+
+
+def find_order_sender_reference_violations(path: str, source: str) -> list[Violation]:
+    """Compensating strengthening (security review, plan r1.1): any function
+    outside :data:`ORDER_SENDER_REFERENCE_PERMITTED_SCOPES` that references
+    ``self._order_sender`` is a violation.
+
+    ``_match_position_lag`` (R-7-IMPL) sits outside both
+    ``ORDER_LIFECYCLE_COROUTINES`` and ``EXEC_RESOLVER_COROUTINES`` -- the
+    plan extends a pre-existing pattern, per the security reviewer -- so this
+    scan is the compensating control: it does not vet what
+    ``_match_position_lag`` may call, only that NO helper outside the two
+    vetted coroutine sets (plus ``__init__``, which merely binds the
+    attribute) may ever reach the order-sender at all.
+    """
+    if not path.startswith(EXEC_PACKAGE_PATH_PREFIX):
+        return []
+    tree = ast.parse(source, filename=path)
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if node.name in ORDER_SENDER_REFERENCE_PERMITTED_SCOPES:
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Attribute)
+                and inner.attr == "_order_sender"
+                and isinstance(inner.value, ast.Name)
+                and inner.value.id == "self"
+            ):
+                violations.append(
+                    Violation(
+                        path,
+                        inner.lineno,
+                        "E0-NOSEND-SENDER-REF",
+                        f"{node.name}() references self._order_sender, which only "
+                        "__init__ and the vetted order-lifecycle/resolver coroutines "
+                        "may reach",
+                    )
+                )
+    return violations
+
+
+def test_order_sender_reference_scan_is_scoped_to_the_exec_package() -> None:
+    """Same path-prefix fail-closed shape as every other E0 scan here."""
+    source = (
+        "class C:\n"
+        "    def _match_position_lag(self):\n"
+        "        return self._order_sender.post_order\n"
+    )
+    assert find_order_sender_reference_violations("src/breezy/domain/not_exec.py", source) == []
+
+
+def test_order_sender_reference_scan_permits_init_and_the_vetted_coroutines() -> None:
+    """Control: the two shapes the shipped tree actually uses are legal."""
+    source = (
+        "class C:\n"
+        "    def __init__(self, order_sender):\n"
+        "        self._order_sender = order_sender\n"
+        "\n"
+        "    async def _submit_order(self, command):\n"
+        "        return await self._order_sender.post_order(command)\n"
+        "\n"
+        "    async def _resolve_ambiguous_intents(self):\n"
+        "        return self._order_sender\n"
+    )
+    assert (
+        find_order_sender_reference_violations(
+            "src/breezy/adapters/polymarket_us/exec/client.py", source
+        )
+        == []
+    )
+
+
+def test_order_sender_reference_scan_detects_a_planted_reference_in_a_helper() -> None:
+    """Non-vacuity: a helper outside every permitted scope -- exactly the
+    shape R-7-IMPL's `_match_position_lag` must never take -- goes RED."""
+    source = (
+        "class C:\n"
+        "    def _match_position_lag(self, raw_positions, now_ns):\n"
+        "        return self._order_sender.post_order\n"
+    )
+    violations = find_order_sender_reference_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py", source
+    )
+    assert [v.rule for v in violations] == ["E0-NOSEND-SENDER-REF"]
+
+
+def test_order_sender_reference_scan_detects_a_bare_reference_with_no_call() -> None:
+    """A bare reference (no ``.post_order``, no call at all) is banned too --
+    the ban is on REACHING the attribute, not on calling through it."""
+    source = (
+        "class C:\n"
+        "    def _leak(self):\n"
+        "        sender = self._order_sender\n"
+        "        return sender\n"
+    )
+    violations = find_order_sender_reference_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py", source
+    )
+    assert [v.rule for v in violations] == ["E0-NOSEND-SENDER-REF"]
+
+
+def test_order_sender_reference_pin_matches_the_shipped_tree_exactly() -> None:
+    """Enumerates the existing references at HEAD (plan r1.1) and pins them:
+    a future change that adds or removes a reference fails loudly here,
+    rather than the ban silently widening or narrowing around it."""
+    for path, source in iter_python_sources(EGRESS_SCAN_ROOTS):
+        if path != "src/breezy/adapters/polymarket_us/exec/client.py":
+            continue
+        assert (
+            _functions_referencing_order_sender(path, source)
+            == ORDER_SENDER_REFERENCE_FUNCTIONS_AT_HEAD
+        )
+        return
+    raise AssertionError("client.py was not reached by the scan roots")
+
+
+def test_the_shipped_tree_has_no_order_sender_reference_violations() -> None:
+    """The live barrier: every module under `exec/` clears the ban."""
+    violations = [
+        v
+        for path, source in iter_python_sources(EGRESS_SCAN_ROOTS)
+        for v in find_order_sender_reference_violations(path, source)
+    ]
+    assert violations == [], "E0-NOSEND-SENDER-REF violations:\n" + "\n".join(
+        str(v) for v in violations
+    )

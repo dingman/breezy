@@ -70,10 +70,12 @@ from breezy.runtime.submit_intent import (
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.polymarket_us_exec_shapes import (
     ACCOUNT_ID,
+    TS_EVENT_NANOS,
     TS_EVENT_TEXT,
     build_execution,
     build_instrument,
     build_order,
+    build_position,
 )
 from tests.unit.test_polymarket_us_permit_issuance import credentials, enable_operator_gate
 from tests.unit.test_polymarket_us_readonly_guard import iter_python_sources
@@ -191,6 +193,38 @@ def _durable_accept_body(
 
 def _status_reject_body() -> bytes:
     return json.dumps({"code": 3, "message": "invalid", "details": []}).encode("utf-8")
+
+
+def _rfc3339_nanos_utc(ns: int) -> str:
+    """Render `ns` (UNIX epoch nanoseconds) in the venue's own RFC 3339
+    shape -- the inverse of `parsing.parse_rfc3339_nanos`. Used only by the
+    R-7 end-to-end chain test below, which needs a `transactTime` close to
+    `LiveClock`'s real wall-clock `now` (the fixed `TS_EVENT_TEXT` fixture
+    is dated weeks in the past and the R-7 skew guard would reject it)."""
+    from datetime import UTC, datetime
+
+    seconds, nanos = divmod(ns, 1_000_000_000)
+    moment = datetime.fromtimestamp(seconds, tz=UTC)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S") + f".{nanos:09d}Z"
+
+
+def _durable_accept_body_at(slug: str, *, transact_time_text: str) -> bytes:
+    """Same shape as `_durable_accept_body`, with a caller-chosen
+    `transactTime` rather than the fixed `TS_EVENT_TEXT`."""
+    order = build_order(slug)
+    order["id"] = "ord-r7-chain"
+    order["quantity"] = 1
+    order["cumQuantity"] = 1
+    order["leavesQuantity"] = 0
+    order["state"] = "ORDER_STATE_FILLED"
+    order["price"] = {"value": "0.37", "currency": "USD"}
+    order["avgPx"] = {"value": "0.37", "currency": "USD"}
+    execution = build_execution(order)
+    execution["lastShares"] = "1"
+    execution["lastPx"] = {"value": "0.37", "currency": "USD"}
+    execution["commissionNotionalCollected"] = {"value": "0.03", "currency": "USD"}
+    execution["transactTime"] = transact_time_text
+    return json.dumps({"id": "ord-r7-chain", "executions": [execution]}).encode("utf-8")
 
 
 class _ChainRig:
@@ -2506,3 +2540,244 @@ def test_a_captured_2026_09_13_execution_drift_body_classifies_accept_fill() -> 
     # that logic's own quantity identity, independent of this change.
     # Documented here, not a claim this change alters that logic.
     assert outcome.fee_reconciled is False
+
+
+# ---------------------------------------------------------------------------
+# R-7-IMPL (RULING R-7, plan `docs/plans/backlog/R-7-IMPL_plan_r1_2026-09-26.md`):
+# the create-path accept-fill branch's producer half.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_r7_accept_fill_populates_the_position_lag_pending_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """T2 (producer half): a create-path accept-fill records
+    `(fill.ts_event, send_ns, recv_ns, client_order_id, 0)`, keyed by
+    instrument, for `_match_position_lag` to confirm against later."""
+    sender = _FakeSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(str(build_instrument().raw_symbol)),
+    )
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+        command = rig.limit_buy()
+        before_ns = rig.clock.timestamp_ns()
+        await rig.client._submit_order(command)
+        after_ns = rig.clock.timestamp_ns()
+        await rig.client._disconnect()
+
+    pending = rig.client._position_lag_pending
+    assert list(pending) == [rig.instrument.id]
+    fill_ts_event, send_ns, recv_ns, client_order_id, reads_without_long = pending[
+        rig.instrument.id
+    ]
+    assert fill_ts_event == TS_EVENT_NANOS
+    assert before_ns <= send_ns <= recv_ns <= after_ns
+    assert client_order_id == command.order.client_order_id.value
+    assert reads_without_long == 0
+
+
+@pytest.mark.asyncio
+async def test_r7_the_full_producer_to_matcher_chain_emits_one_confirmed_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """Gap 1 (integration): every other R-7 test drives the producer
+    (`_submit_order`'s accept-fill branch) or the matcher
+    (`_match_position_lag`) in isolation, seeding a synthetic pending entry
+    for whichever half it skips. This test drives BOTH, for real, in
+    sequence: a genuine `_submit_order` accept-fill, then a genuine
+    `_write_startup_position_evidence` call (the same call site `_connect`
+    and the resolver refresh use) carrying an eof-complete positions payload
+    showing the resulting LONG -- so a desync between what the producer
+    writes and what the matcher expects can no longer hide behind two tests
+    that never actually hand data from one to the other.
+
+    `self._log` is Nautilus's Cython `Logger`, not stdlib-observable by
+    `caplog` (see `test_ambiguous_exception_path_source_logs_the_exception_
+    type_never_its_str` above for the same, already-established
+    limitation), so the emitted record is observed via a narrow seam: the
+    module-level `PositionReportingLag` constructor is wrapped to capture
+    every instance it builds, while still delegating to the real class."""
+    from breezy.adapters.polymarket_us.exec import client as client_module
+    from breezy.adapters.polymarket_us.exec.client import _PendingPositionLag
+    from breezy.domain.position_reporting_lag import PositionReportingLag as real_record_cls
+
+    captured: list[Any] = []
+
+    def _capturing(*args: Any, **kwargs: Any) -> Any:
+        record = real_record_cls(*args, **kwargs)
+        captured.append(record)
+        return record
+
+    monkeypatch.setattr(client_module, "PositionReportingLag", _capturing)
+
+    sender = _FakeSender()
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+
+        before_ns = rig.clock.timestamp_ns()
+        # 250ms before `now`: comfortably inside the 2s skew bound around
+        # the POST this fixture is about to drive.
+        transact_time_text = _rfc3339_nanos_utc(before_ns - 250_000_000)
+        sender.response = VenueResponse(
+            status=200,
+            headers={},
+            body=_durable_accept_body_at(
+                str(rig.instrument.raw_symbol), transact_time_text=transact_time_text
+            ),
+        )
+        command = rig.limit_buy()
+        await rig.client._submit_order(command)
+
+        pending_after_submit = rig.client._position_lag_pending
+        assert list(pending_after_submit) == [rig.instrument.id]
+        # `_PendingPositionLag(*...)`: the producer writes a plain
+        # positional tuple (deliberately -- see the E0-NOSEND comment at its
+        # write site), normalised here the same way `_match_position_lag`
+        # normalises it, purely so the assertions below can name fields.
+        pending_entry = _PendingPositionLag(*pending_after_submit[rig.instrument.id])
+        # Gap 1's mutation target: a producer that swapped `send_ns` and
+        # `recv_ns` would violate this ordering.
+        assert pending_entry.send_ns <= pending_entry.recv_ns
+
+        slug = str(rig.instrument.raw_symbol)
+        confirm_ns = rig.clock.timestamp_ns() + 1_000_000  # strictly after recv_ns
+        rig.client._write_startup_position_evidence(
+            now_ns=confirm_ns,
+            eof_complete=True,
+            position_read_refused=False,
+            raw_positions={slug: build_position(slug)},
+        )
+
+        await rig.client._disconnect()
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset({rig.instrument.id})
+    assert len(captured) == 1
+    record = captured[0]
+    assert record.instrument_id == rig.instrument.id
+    assert record.fill_ts_event == pending_entry.fill_ts_event
+    assert record.fill_ts_event_source == "venue_transactTime"
+    assert record.first_eof_read_ts_showing_long == confirm_ns
+    assert record.delta_ns == confirm_ns - record.fill_ts_event
+
+
+@pytest.mark.asyncio
+async def test_r7_a_second_accept_fill_on_an_already_pending_instrument_poisons_the_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """T8 (producer half, MULTI_FILL_PENDING): a create-path accept-fill on
+    an instrument that ALREADY carries an unconfirmed entry poisons it with
+    the multi-fill sentinel rather than overwriting it -- neither fill's
+    confirmation could be attributed to a single POST. Seeded directly
+    (rather than driven by two real submits) because the daily submit-intent
+    latch makes a second real POST for the same station-day unreachable --
+    this isolates the poisoning branch itself, which is exactly what T8
+    tests."""
+    from breezy.adapters.polymarket_us.exec.client import _MULTI_FILL_PENDING_SENTINEL
+
+    sender = _FakeSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(str(build_instrument().raw_symbol)),
+    )
+    seeded_entry = (123, 456, 789, "prior-order-id", 2)
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+        rig.client._position_lag_pending = {rig.instrument.id: seeded_entry}
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    entry = rig.client._position_lag_pending[rig.instrument.id]
+    assert entry == (123, 456, 789, _MULTI_FILL_PENDING_SENTINEL, 2)
+
+
+def test_r7_the_accept_fill_branch_skips_position_lag_pending_for_an_exit_order() -> None:
+    """T9 (exit half, STRUCTURAL): every `self._position_lag_pending = ...`
+    write inside `_submit_order` is a genuine AST descendant of the BODY
+    (never the `orelse`) of the `if not is_exit_order:` guard -- not merely
+    two independent substrings that a mutation moving the write out of the
+    guard (while leaving both strings present somewhere in the function)
+    would still satisfy. Builds parent-reachable node-id sets the same way
+    `find_exec_resolver_violations` walks a function body in
+    `test_execution_egress_firewall_guard.py`, rather than slicing source
+    text. A real end-to-end exit accept-fill needs a full `FamilyManifest` +
+    exit-tag wiring this suite does not otherwise carry, so the structural
+    AST check is the precise, still-directly-inspectable alternative."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(PolymarketUSExecutionClient._submit_order))
+    func = ast.parse(source).body[0]
+    assert isinstance(func, ast.AsyncFunctionDef)
+
+    def _is_not_is_exit_order(test: ast.expr) -> bool:
+        return (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Name)
+            and test.operand.id == "is_exit_order"
+        )
+
+    guards = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.If) and _is_not_is_exit_order(node.test)
+    ]
+    assert len(guards) == 1, "expected exactly one `if not is_exit_order:` guard"
+    guard = guards[0]
+
+    def _node_ids(stmts: list[ast.stmt]) -> set[int]:
+        ids: set[int] = set()
+        for stmt in stmts:
+            for sub in ast.walk(stmt):
+                ids.add(id(sub))
+        return ids
+
+    body_ids = _node_ids(guard.body)
+    orelse_ids = _node_ids(guard.orelse)
+
+    def _writes_position_lag_pending(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and node.targets[0].attr == "_position_lag_pending"
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "self"
+        )
+
+    writes = [node for node in ast.walk(func) if _writes_position_lag_pending(node)]
+    assert writes, "expected at least one `self._position_lag_pending = ...` write"
+    for write in writes:
+        assert id(write) in body_ids, (
+            "a `_position_lag_pending` write sits outside the "
+            "`if not is_exit_order:` body -- an exit accept-fill would reach it"
+        )
+        assert id(write) not in orelse_ids
+
+
+def test_r7_the_resolver_accept_fill_path_never_touches_position_lag_pending() -> None:
+    """T9 (resolver half): a GET-confirmed fill on the resolver path
+    (`_resolve_accept_fill`) never creates a `_position_lag_pending` entry --
+    only the create-path accept-fill branch in `_submit_order` does. Source
+    check for the same reason as above: `_position_lag_pending` must not
+    appear anywhere in the resolver's own terminal-fill helper."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._resolve_accept_fill)
+    assert "_position_lag_pending" not in source

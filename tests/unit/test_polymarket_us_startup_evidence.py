@@ -24,6 +24,9 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
 
 from breezy.adapters.polymarket_us.exec.client import (
+    _FILL_TS_EVENT_MAX_SKEW_NS,
+    _MULTI_FILL_PENDING_SENTINEL,
+    _POSITION_LAG_PENDING_TTL_NS,
     FILL_INDEX_KEY_PREFIX,
     STARTUP_EVIDENCE_KEY,
     PolymarketUSExecutionClient,
@@ -37,6 +40,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.runtime.sqlite_store import SqliteStateStore
+from tests.unit.polymarket_us_exec_shapes import build_position
 from tests.unit.test_polymarket_us_exec_client import (
     ACCOUNT_NUMBER,
     CLIENT_ID,
@@ -44,6 +48,7 @@ from tests.unit.test_polymarket_us_exec_client import (
     _balances_payload,
     _build_rig,
     _clean_exec_fault_latch,  # noqa: F401 -- reused as a fixture
+    _no_leg_instrument,
     _PrivateReadStub,
 )
 
@@ -443,3 +448,318 @@ def test_a_pre_open_order_record_decodes_as_open_orders_refused() -> None:
     decoded = StartupPositionEvidence.from_bytes(legacy)
     assert decoded.open_orders_read_refused is True
     assert decoded.open_orders == ()
+
+
+# ---------------------------------------------------------------------------
+# R-7-IMPL (RULING R-7, plan `docs/plans/backlog/R-7-IMPL_plan_r1_2026-09-26.md`):
+# `_match_position_lag`'s confirming half, driven directly with seeded
+# pending entries -- deterministic, no dependency on wall-clock skew.
+# ---------------------------------------------------------------------------
+
+_SEND_NS = 10_000_000_000_000
+_RECV_NS = _SEND_NS + 500_000_000
+_FILL_TS_EVENT = _SEND_NS + 50_000_000
+
+
+def _seed(client: PolymarketUSExecutionClient, instrument_id: Any, entry: tuple[Any, ...]) -> None:
+    client._position_lag_pending = {instrument_id: entry}
+
+
+@pytest.mark.asyncio
+async def test_r7_a_confirming_long_read_emits_and_pops_the_pending_entry(
+    tmp_path: Path,
+) -> None:
+    """T2 (matcher half): the confirming read pops the entry and records the
+    instrument as last-known-long."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    _seed(rig.client, rig.instrument.id, (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset({rig.instrument.id})
+
+
+@pytest.mark.asyncio
+async def test_r7_a_no_leg_confirming_long_read_emits_and_pops_the_pending_entry(
+    tmp_path: Path,
+) -> None:
+    """T3 (NO leg): the same confirmation works for a NO-leg instrument id,
+    keyed against the shared base slug, with a NO-shaped position payload."""
+    rig = _build_rig(tmp_path)
+    no_instrument = _no_leg_instrument()
+    rig.client._cache.add_instrument(no_instrument)
+    slug = str(rig.instrument.raw_symbol)
+    no_position = build_position(slug)
+    no_position["netPosition"] = "-4"
+    no_position["marketMetadata"] = {"slug": slug, "outcome": "No"}
+    _seed(rig.client, no_instrument.id, (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: no_position}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset({no_instrument.id})
+
+
+@pytest.mark.asyncio
+async def test_r7_a_zero_or_negative_fill_ts_event_is_rejected_and_dropped(
+    tmp_path: Path,
+) -> None:
+    """T4 (second defence): `fill_ts_event <= 0` is rejected as
+    `TS_EVENT_ABSENT` and never produces a record."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    _seed(rig.client, rig.instrument.id, (0, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("absent_fill_ts_event", [0, -1])
+async def test_r7_ts_event_absent_is_rejected_even_when_a_local_now_fallback_would_pass_skew(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absent_fill_ts_event: int,
+) -> None:
+    """T4 (ISOLATED): the test above shares `_RECV_NS + 5_000_000_000` as its
+    confirming read, which lands `TS_EVENT_SKEW_FUTURE`-rejected too if a
+    regression dropped the `<= 0` guard and fell back to that same local
+    `now_ns` -- the two guards mask each other, and the old test cannot tell
+    which one actually fired (mutation evidence gap, L-33).
+
+    Here the confirming read is chosen at `_RECV_NS + 1`: *inside* the skew
+    window a local-`now_ns` fallback would land in (mutation M-b: drop the
+    `<= 0` guard, substitute `now_ns` for the absent `fill_ts_event`). Under
+    M-b this fixture would pass both skew checks and confirm the read as
+    LONG. Only `TS_EVENT_ABSENT` firing on its own -- independent of skew --
+    keeps it pending-cleared with NO record ever constructed and the
+    instrument NEVER marked long."""
+    from breezy.adapters.polymarket_us.exec import client as client_module
+    from breezy.domain.position_reporting_lag import PositionReportingLag as real_record_cls
+
+    captured: list[Any] = []
+
+    def _capturing(*args: Any, **kwargs: Any) -> Any:
+        record = real_record_cls(*args, **kwargs)
+        captured.append(record)
+        return record
+
+    monkeypatch.setattr(client_module, "PositionReportingLag", _capturing)
+
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    _seed(
+        rig.client,
+        rig.instrument.id,
+        (absent_fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0),
+    )
+
+    confirming_read_ts = _RECV_NS + 1  # inside the fallback's skew window
+
+    rig.client._match_position_lag({slug: build_position(slug)}, confirming_read_ts)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+    assert captured == []
+
+
+def test_r7_the_skew_bound_is_pinned_to_two_seconds() -> None:
+    """T5 (magnitude pin): the plan
+    (`docs/plans/backlog/R-7-IMPL_plan_r1_2026-09-26.md:48`,
+    `_FILL_TS_EVENT_MAX_SKEW_NS: Final[int] = 2 * 1_000_000_000`) fixes the
+    skew bound at exactly 2s. The boundary tests around this one compute
+    their own fixtures FROM the live constant, so they self-adjust if its
+    magnitude ever changes and would keep passing against a materially
+    widened bound (mutation M-c: widen to 100s) -- only a literal pin like
+    this one catches that."""
+    assert _FILL_TS_EVENT_MAX_SKEW_NS == 2_000_000_000
+
+
+@pytest.mark.asyncio
+async def test_r7_a_fill_two_point_five_seconds_before_send_is_rejected_literal(
+    tmp_path: Path,
+) -> None:
+    """T5 (literal boundary): independent of the live constant's magnitude,
+    a fill whose venue `tsEvent` lands 2.5s before `send_ns` -- comfortably
+    past the plan's registered 2s bound -- must be rejected as
+    `TS_EVENT_SKEW_PAST`, even though the read IS long. A bound mutated to
+    100s (M-c) would accept this fixture and confirm it LONG instead."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    fill_ts_event = _SEND_NS - 2_500_000_000
+    _seed(rig.client, rig.instrument.id, (fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_r7_exactly_the_past_skew_bound_is_accepted(tmp_path: Path) -> None:
+    """T5: `fill_ts_event == send_ns - bound` is the boundary -- accepted."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    fill_ts_event = _SEND_NS - _FILL_TS_EVENT_MAX_SKEW_NS
+    _seed(rig.client, rig.instrument.id, (fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset({rig.instrument.id})
+
+
+@pytest.mark.asyncio
+async def test_r7_one_nanosecond_past_the_past_skew_bound_is_rejected(tmp_path: Path) -> None:
+    """T5: `fill_ts_event == send_ns - bound - 1` is rejected as
+    `TS_EVENT_SKEW_PAST`, even though the position IS long."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    fill_ts_event = _SEND_NS - _FILL_TS_EVENT_MAX_SKEW_NS - 1
+    _seed(rig.client, rig.instrument.id, (fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_r7_exactly_the_future_skew_bound_is_accepted(tmp_path: Path) -> None:
+    """T5: `fill_ts_event == recv_ns + bound` is the boundary -- accepted."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    fill_ts_event = _RECV_NS + _FILL_TS_EVENT_MAX_SKEW_NS
+    _seed(rig.client, rig.instrument.id, (fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, fill_ts_event + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset({rig.instrument.id})
+
+
+@pytest.mark.asyncio
+async def test_r7_one_nanosecond_past_the_future_skew_bound_is_rejected(tmp_path: Path) -> None:
+    """T5: `fill_ts_event == recv_ns + bound + 1` is rejected as
+    `TS_EVENT_SKEW_FUTURE`, even though the position IS long."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    fill_ts_event = _RECV_NS + _FILL_TS_EVENT_MAX_SKEW_NS + 1
+    _seed(rig.client, rig.instrument.id, (fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, fill_ts_event + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_r7_a_read_timestamped_at_or_before_recv_is_not_consumed(tmp_path: Path) -> None:
+    """T6: a read taken at (or before) `recv_ns` is not a confirming read --
+    the entry is left completely unchanged, including its `reads_without_long`."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    entry = (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, "coid-1", 0)
+    _seed(rig.client, rig.instrument.id, entry)
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS)
+
+    assert rig.client._position_lag_pending == {rig.instrument.id: entry}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_r7_reads_without_long_increments_on_each_non_confirming_pass(
+    tmp_path: Path,
+) -> None:
+    """T7: a determined-not-long pass (here, the slug absent from the page --
+    a confirmed-flat read) increments `reads_without_long` and keeps the
+    entry pending."""
+    rig = _build_rig(tmp_path)
+    _seed(rig.client, rig.instrument.id, (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    now_ns_1 = _RECV_NS + 1_000_000_000
+    rig.client._match_position_lag({}, now_ns_1)
+    assert rig.client._position_lag_pending[rig.instrument.id][4] == 1
+
+    now_ns_2 = now_ns_1 + 1_000_000_000
+    rig.client._match_position_lag({}, now_ns_2)
+    assert rig.client._position_lag_pending[rig.instrument.id][4] == 2
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_r7_an_instrument_already_known_long_rejects_as_prior_long(
+    tmp_path: Path,
+) -> None:
+    """T8 (PRIOR_LONG): an instrument already flagged long as of the LAST
+    pass is dropped without ever reaching the position check -- a SECOND
+    fill's confirmation on an already-open LONG is not attributable."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    _seed(rig.client, rig.instrument.id, (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, "coid-1", 0))
+    rig.client._position_lag_last_long = frozenset({rig.instrument.id})
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+
+
+@pytest.mark.asyncio
+async def test_r7_a_multi_fill_poisoned_entry_rejects_at_match_time(tmp_path: Path) -> None:
+    """T8 (MULTI_FILL_PENDING): a poisoned entry is dropped without ever
+    confirming, regardless of what the positions page shows."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    _seed(
+        rig.client,
+        rig.instrument.id,
+        (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, _MULTI_FILL_PENDING_SENTINEL, 0),
+    )
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_r7_an_entry_past_the_ttl_is_dropped_as_unconfirmed(tmp_path: Path) -> None:
+    """T8 (UNCONFIRMED_TTL): an entry that never confirms LONG ages out and
+    is dropped once the TTL floor is crossed."""
+    rig = _build_rig(tmp_path)
+    _seed(rig.client, rig.instrument.id, (_FILL_TS_EVENT, _SEND_NS, _RECV_NS, "coid-1", 5))
+
+    now_ns = _RECV_NS + _POSITION_LAG_PENDING_TTL_NS + 1
+    rig.client._match_position_lag({}, now_ns)
+
+    assert rig.client._position_lag_pending == {}
+
+
+@pytest.mark.asyncio
+async def test_r7_a_raising_match_pass_is_contained_and_evidence_stays_correct(
+    tmp_path: Path,
+) -> None:
+    """T10: a malformed pending entry makes `_match_position_lag` raise
+    during unpacking; `_write_startup_position_evidence`'s own broad
+    `except` contains it -- the evidence row it already wrote is unaffected,
+    and the caller (`_connect`, standing in for the resolver's identical
+    call site) completes normally rather than propagating the exception."""
+    slug = "tc-temp-nyc-h-2026-09-11-70-72"
+    rig = _build_rig(tmp_path, positions=_positions(slug, "3"))
+    # Deliberately the wrong arity -- `_match_position_lag`'s tuple-unpack
+    # raises `ValueError` before any guard/read logic runs.
+    rig.client._position_lag_pending = {rig.instrument.id: (1, 2, 3)}  # type: ignore[dict-item]
+
+    await rig.client._connect()
+
+    evidence = rig.client.read_startup_position_evidence()
+    assert evidence is not None
+    assert evidence.eof_complete is True
+    assert evidence.position_read_refused is False
+    assert evidence.positions == (StartupPositionSnapshot(slug=slug, net_position="3"),)
+    await rig.client._disconnect()
