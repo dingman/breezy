@@ -1159,6 +1159,54 @@ class ContinuousRungHoldStrategy(Strategy):
             return None
         return station, parsed.climate_date
 
+    def _station_day_existing_legs(
+        self, station_day: tuple[str, str],
+    ) -> tuple[tuple[str, ...], Mapping[str, DurableFillRecord]]:
+        """ADM-1 shared helper for the YES (``:2143-2161`` pre-fix) and NO
+        (``:2550-2568`` pre-fix) arm-time gates: every instrument-leg
+        belonging to ``station_day`` -- today's facts ladder plus any
+        durable fill reachable via ``iter_fill_records``, each deduped with
+        its sibling -- PLUS a ``pending_fills`` map (keyed by the fill
+        record's own dotted instrument id) for
+        :func:`station_day_admission`'s ADM-1 fallback: a leg whose fill is
+        already committed but has no TRIAL record yet (the create-path
+        window between ``record_fill`` and this strategy processing the
+        queued ``OrderFilled``) is still counted, from the fill's own
+        realized cost, rather than silently contributing zero to Sigma-q.
+        """
+        assert self._latch is not None
+        existing_ids: list[str] = []
+        seen_ids: set[str] = set()
+        pending_fills: dict[str, DurableFillRecord] = {}
+
+        def _add_leg(instrument_id_obj: InstrumentId) -> None:
+            leg_iid = str(instrument_id_obj)
+            if leg_iid in seen_ids:
+                return
+            seen_ids.add(leg_iid)
+            existing_ids.append(leg_iid)
+
+        for other_iid, other_facts in self._facts.items():
+            if (
+                other_facts.settlement_station,
+                other_facts.climate_day.isoformat(),
+            ) != station_day:
+                continue
+            other_iid_obj = InstrumentId.from_str(other_iid)
+            _add_leg(other_iid_obj)
+            _add_leg(sibling_instrument_id(other_iid_obj))
+        for fill_record in self._latch.iter_fill_records(self._candidate_instrument_ids()):
+            joined = self._join_fill_to_station_day(
+                InstrumentId.from_str(fill_record.instrument_id),
+            )
+            if joined != station_day:
+                continue
+            fill_iid_obj = InstrumentId.from_str(fill_record.instrument_id)
+            _add_leg(fill_iid_obj)
+            _add_leg(sibling_instrument_id(fill_iid_obj))
+            pending_fills[fill_record.instrument_id] = fill_record
+        return tuple(existing_ids), pending_fills
+
     def on_stop(self) -> None:
         self.log.info(self._diagnostics_snapshot_message())
         self.log.info(self._illegal_cell_snapshot_message())
@@ -2121,36 +2169,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 store, prefix, station, climate_day_key, iid,
             )
             if yes_admission_refusal is None:
-                existing_ids: list[str] = []
-                seen_ids: set[str] = set()
-
-                def _add_leg(instrument_id_obj: InstrumentId) -> None:
-                    leg_iid = str(instrument_id_obj)
-                    if leg_iid in seen_ids:
-                        return
-                    seen_ids.add(leg_iid)
-                    existing_ids.append(leg_iid)
-
-                for other_iid, other_facts in self._facts.items():
-                    if (
-                        other_facts.settlement_station,
-                        other_facts.climate_day.isoformat(),
-                    ) != station_day:
-                        continue
-                    other_iid_obj = InstrumentId.from_str(other_iid)
-                    _add_leg(other_iid_obj)
-                    _add_leg(sibling_instrument_id(other_iid_obj))
-                for fill_record in self._latch.iter_fill_records(
-                    self._candidate_instrument_ids(),
-                ):
-                    joined = self._join_fill_to_station_day(
-                        InstrumentId.from_str(fill_record.instrument_id),
-                    )
-                    if joined != station_day:
-                        continue
-                    fill_iid_obj = InstrumentId.from_str(fill_record.instrument_id)
-                    _add_leg(fill_iid_obj)
-                    _add_leg(sibling_instrument_id(fill_iid_obj))
+                existing_ids, pending_fills = self._station_day_existing_legs(station_day)
                 yes_admission_refusal = station_day_admission(
                     store,
                     prefix,
@@ -2158,7 +2177,8 @@ class ContinuousRungHoldStrategy(Strategy):
                     climate_day_key,
                     "yes",
                     decision.break_even,
-                    existing_instrument_ids=tuple(existing_ids),
+                    existing_instrument_ids=existing_ids,
+                    pending_fills=pending_fills,
                 )
 
         reason = decision.reason if isinstance(decision, Refuse) else "taken"
@@ -2533,31 +2553,7 @@ class ContinuousRungHoldStrategy(Strategy):
             _append_no_offer_tape(decision_label="refuse", admission_reason=sibling_refusal.reason)
             return
 
-        existing_ids: list[str] = []
-        seen_ids: set[str] = set()
-
-        def _add_leg(instrument_id_obj: InstrumentId) -> None:
-            leg_iid = str(instrument_id_obj)
-            if leg_iid in seen_ids:
-                return
-            seen_ids.add(leg_iid)
-            existing_ids.append(leg_iid)
-
-        for iid, facts in self._facts.items():
-            if (facts.settlement_station, facts.climate_day.isoformat()) != station_day:
-                continue
-            yes_iid_obj = InstrumentId.from_str(iid)
-            _add_leg(yes_iid_obj)
-            _add_leg(sibling_instrument_id(yes_iid_obj))
-        for fill_record in self._latch.iter_fill_records(self._candidate_instrument_ids()):
-            joined = self._join_fill_to_station_day(
-                InstrumentId.from_str(fill_record.instrument_id),
-            )
-            if joined != station_day:
-                continue
-            fill_iid_obj = InstrumentId.from_str(fill_record.instrument_id)
-            _add_leg(fill_iid_obj)
-            _add_leg(sibling_instrument_id(fill_iid_obj))
+        existing_ids, pending_fills = self._station_day_existing_legs(station_day)
         admission_refusal = station_day_admission(
             store,
             prefix,
@@ -2565,7 +2561,8 @@ class ContinuousRungHoldStrategy(Strategy):
             climate_day_key,
             "no",
             no_decision.break_even,
-            existing_instrument_ids=tuple(existing_ids),
+            existing_instrument_ids=existing_ids,
+            pending_fills=pending_fills,
         )
         if admission_refusal is not None:
             _refuse_once(admission_refusal.reason)

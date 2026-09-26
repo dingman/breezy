@@ -53,9 +53,10 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Final
 
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
@@ -1485,6 +1486,11 @@ def refuse_if_sibling_leg_traded(
     return Refusal(SIBLING_LEG_TRADED_REASON)
 
 
+#: Immutable default for ``station_day_admission``'s ``pending_fills``
+#: kwarg (ADM-1) -- never a mutable ``{}`` literal as a default value.
+_NO_PENDING_FILLS: Final[Mapping[str, DurableFillRecord]] = MappingProxyType({})
+
+
 def station_day_admission(
     store: StateStore,
     prefix: str,
@@ -1494,6 +1500,7 @@ def station_day_admission(
     candidate_be: Decimal,
     *,
     existing_instrument_ids: Iterable[str] = (),
+    pending_fills: Mapping[str, DurableFillRecord] = _NO_PENDING_FILLS,
 ) -> Refusal | None:
     """R3-7: the arm-time Sigma-q admission gate.
 
@@ -1535,12 +1542,42 @@ def station_day_admission(
     canonical form before the lookup, and the stored
     ``record.instrument_id`` is normalised via :func:`_bare_symbol` before
     ``leg_of``/``_leg_instrument_id`` (which require the bare form).
+
+    ADM-1: the create path writes a leg's durable fill record, retires the
+    intent, and only THEN emits ``OrderFilled`` -- whose processing (and
+    with it the leg's TRIAL/TAKEN record via ``_consume_or_flag_duplicate``)
+    is queued to a LATER engine turn. A sibling rung's depth frame landing
+    inside that window finds no TRIAL record for the committed leg (``raw
+    is None`` below) and, before this fix, contributed zero to Sigma-q --
+    undercounting a leg that has already spent capital. ``pending_fills``
+    (keyed by the SAME dotted-or-bare form as ``existing_instrument_ids``,
+    normalised here via :func:`_dotted_key_id`) is consulted ONLY in that
+    ``raw is None`` branch (r1.1 guard 2) -- a leg with a genuine TRIAL
+    record is counted from that record alone, never doubled with its own
+    fill. ``be`` is the realized per-contract cost,
+    ``(cumulative_cost + cumulative_fee) / cumulative_qty`` (USD/contract,
+    the same unit as a TRIAL record's ``ask + fee``) -- a materially
+    different number from the TAKEN path's decision-time ``ask``, which is
+    why a leg is never counted from both sources. ``cumulative_qty <= 0``
+    means the average cannot be safely computed, so ``q`` is UNKNOWN and
+    the whole candidate is refused (r1.1 guard 1) rather than dividing by
+    zero or guessing.
     """
     total_q = _cell_probability(candidate_be, candidate_side)
     for instrument_id in existing_instrument_ids:
         key = _key(station, climate_day, key_prefix=prefix, key_instrument_id=instrument_id)
         raw = store.get(key)
         if raw is None:
+            fill_record = pending_fills.get(_dotted_key_id(instrument_id))
+            if fill_record is None:
+                continue
+            if fill_record.cumulative_qty <= 0:
+                return Refusal(STATION_DAY_ADMISSION_REASON)
+            fill_side = leg_of(_leg_instrument_id(_bare_symbol(fill_record.instrument_id)))
+            fill_be = (
+                fill_record.cumulative_cost + fill_record.cumulative_fee
+            ) / fill_record.cumulative_qty
+            total_q += _cell_probability(fill_be, fill_side)
             continue
         record = TrialDayRecord.from_bytes(raw)
         if record.reason not in _FILLED_REASONS:

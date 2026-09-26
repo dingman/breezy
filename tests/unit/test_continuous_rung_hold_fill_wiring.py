@@ -2123,6 +2123,70 @@ def test_an_unreconciled_durable_fill_record_still_refuses_the_second_rung(
     assert yes_records[0].admission_reason == "station_day_admission"
 
 
+# ---------------------------------------------------------------------------
+# ADM-1: Sigma-q must count a leg whose fill is committed but whose TRIAL/
+# TAKEN record has not landed yet -- the create-path window between
+# `record_fill` (+ intent retire) and this strategy processing the QUEUED
+# `OrderFilled` (`_consume_or_flag_duplicate`). `OrderFilled` is deliberately
+# held back here (never delivered to `on_order_filled`) to reproduce that
+# exact window -- unlike every test above, which delivers the fill event and
+# so always has a genuine TRIAL record by the time the sibling is evaluated.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fill_committed_with_no_trial_record_yet_refuses_the_sibling_rung(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """Leg A (``OPEN_UPPER_ID``) is retired and its durable fill record is
+    committed (the create path's own write, `_write_durable_fill_record_into`
+    mirroring `client.py::record_fill`) -- but `OrderFilled` is HELD BACK, so
+    leg A has NO TRIAL record. A sibling rung's (`INTERIOR_ID`) depth frame
+    landing inside that window must still see A's spent capital via
+    `pending_fills` and refuse `station_day_admission`, never submit."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    _write_durable_fill_record_into(
+        strategy._latch._store,
+        instrument_id=OPEN_UPPER_ID,
+        venue_order_id="ord-committed-not-yet-taken",
+        cumulative_qty=Decimal(1),
+        cumulative_fee=Decimal("0.01"),
+        fee_reconciled=True,
+        cumulative_cost=Decimal("0.80"),
+    )
+    # Confirm the window: the fill is committed, but no TRIAL record exists
+    # for it yet -- `OrderFilled` was never delivered.
+    other_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+    )
+    assert other_record is None
+
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    # be(A) = (0.80 + 0.01) / 1 = 0.81; 0.81 + 0.40 == 1.21 > 1.
+    assert submitted == []
+    assert strategy.refusals.count("station_day_admission") == 1
+    yes_records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    assert len(yes_records) == 1
+    assert yes_records[0].decision == "refuse"
+    assert yes_records[0].admission_reason == "station_day_admission"
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        is False
+    )
+
+
 def test_recorded_fee_for_is_none_when_no_durable_record_exists(
     store_path: Path,
     interior_instrument: BinaryOption,
