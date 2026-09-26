@@ -242,6 +242,7 @@ __all__ = [
     "total_capital_deployed",
     "total_realised_pnl_admissible",
     "total_realised_pnl_all_settled",
+    "total_realised_pnl_residual",
     "trial_rows_of",
     "write_portfolio_roi_json",
 ]
@@ -703,6 +704,20 @@ def total_realised_pnl_admissible(
     return total_realised_pnl_all_settled(admissible)
 
 
+def total_realised_pnl_residual(settlements: Iterable[ResidualSettlement]) -> Decimal:
+    """Σ ``realised_pnl`` over every settled residual fill (FU-3c AC1/AC2).
+
+    Deliberately over :class:`ResidualSettlement`, never :class:`ScoredTrial`
+    -- this is the numerator term AUD-04 I3 was missing (a residual fill
+    moved real money and must count in portfolio P&L), kept strictly
+    separate from :func:`total_realised_pnl_all_settled`/
+    :func:`total_realised_pnl_admissible` so it can never reach
+    `admissible_scored_trials`, `n_scored`, `trial_rows`, or the lags sample
+    (AC5).
+    """
+    return sum((settlement.realised_pnl for settlement in settlements), start=Decimal(0))
+
+
 # --------------------------------------------------------------------------
 # I4 -- balance-series line parser
 # --------------------------------------------------------------------------
@@ -1027,6 +1042,14 @@ class ResidualSettlement:
     payout: Decimal
     dated_at_ns: int
     settlement_basis: SettlementBasis
+    #: FU-3c AC1: ``qty * (1{held} - fill_px - fee)`` -- the same formula
+    #: `score_trial` uses for a `ScoredTrial.pnl` (`trial_scorer.py:206`),
+    #: scaled by `qty` for consistency with `payout`/`capital_deployed`
+    #: (never per-contract like the scored path -- see FU-3d). This field
+    #: feeds ONLY `total_realised_pnl_residual`; it must never reach
+    #: `admissible_scored_trials`, `n_scored`, `trial_rows`, the lags sample,
+    #: or the scored-trial store (AC5).
+    realised_pnl: Decimal
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1064,13 +1087,19 @@ def residual_settlement(
             release_day=_utc_day_of_ns(trial.scheduled_release_at_ns),
         )
     scored = scored_or_refusal
-    payout = trial.qty * (Decimal(1) if scored.held else Decimal(0))
+    held_indicator = Decimal(1) if scored.held else Decimal(0)
+    payout = trial.qty * held_indicator
+    # FU-3c AC1: qty * (1{held} - fill_px - fee) -- `fill_px`/`fee` are
+    # per-contract (`FilledTrial`'s own contract, `trial_scorer.py:93`), so
+    # the whole bracket is scaled by `qty` here, exactly like `payout` above.
+    realised_pnl = trial.qty * (held_indicator - trial.fill_px - trial.fee)
     return ResidualSettlement(
         trial_id=trial.trial_id,
         climate_day=trial.climate_day,
         payout=payout,
         dated_at_ns=trial.scheduled_release_at_ns,
         settlement_basis=scored.settlement_basis,
+        realised_pnl=realised_pnl,
     )
 
 
@@ -1821,10 +1850,13 @@ def roi_against_baselines(
 
 #: §6 D7: '"schema_version": 1" as a top-level integer ... additive-only
 #: within a major version; any removal or semantic change increments it.'
-#: Stage C3 bumps this to 2 for `trial_rows` (see the module docstring's
+#: Stage C3 bumped this to 2 for `trial_rows` (see the module docstring's
 #: "Stage C3 adds" paragraph for why THIS field bumps the version rather
-#: than landing as another additive-within-1 key).
-PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 2
+#: than landing as another additive-within-1 key). FU-3c bumps it again to 3:
+#: `roi`/`roi_minus_b0`/`roi_minus_b1` now fold `realised_pnl_residual_total`
+#: into their numerator (Decision 2/R1) -- a semantic change to an existing
+#: field, not an additive-only one, so D7 requires the bump.
+PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 3
 
 #: The version `trial_rows` was introduced at -- every `schema_version` at
 #: or above this REQUIRES the key (see `_require_trial_rows`); below it,
@@ -1834,7 +1866,7 @@ _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS: Final[int] = 2
 #: Every `schema_version` this reader accepts -- `PORTFOLIO_ROI_SCHEMA_VERSION`
 #: (the current, writer-stamped version) plus every prior version this
 #: module still reads. Anything else raises `UnknownPortfolioRoiSchemaError`.
-_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2})
+_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3})
 
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
@@ -2153,6 +2185,14 @@ class PortfolioRoiReportData:
     n_residual_settlements: int = 0
     n_residual_pending: int = 0
     n_residual_unresolved: int = 0
+    # -- FU-3c (schema_version=3): the residual numerator term AUD-04 I3
+    # required but never had. `realised_pnl_residual_total` is qty-scaled
+    # (FU-3d note: `realised_pnl_after_fees_total` stays per-contract until
+    # that lands); `realised_pnl_portfolio_total` is their sum and is the
+    # figure `roi`/`roi_minus_b0`/`roi_minus_b1` are actually computed
+    # against (AC2). Neither ever reaches `trial_rows`/`n_scored` (AC5).
+    realised_pnl_residual_total: Decimal = Decimal(0)
+    realised_pnl_portfolio_total: Decimal = Decimal(0)
     # -- Stage C3: the per-trial P&L breakdown (schema_version=2). Empty by
     # default only for a caller (e.g. a test) that never supplies scored
     # trials -- `build_portfolio_roi_report_data` always populates this from
@@ -2194,6 +2234,7 @@ def build_portfolio_roi_report_data(
     n_residual_settlements: int = 0,
     n_residual_pending: int = 0,
     n_residual_unresolved: int = 0,
+    realised_pnl_residual_total: Decimal = Decimal(0),
     scored_trials: Iterable[ScoredTrial] = (),
     registered_manifests: Sequence[FamilyManifest] = (),
 ) -> PortfolioRoiReportData:
@@ -2258,6 +2299,8 @@ def build_portfolio_roi_report_data(
         n_residual_settlements=n_residual_settlements,
         n_residual_pending=n_residual_pending,
         n_residual_unresolved=n_residual_unresolved,
+        realised_pnl_residual_total=realised_pnl_residual_total,
+        realised_pnl_portfolio_total=total_realised_pnl + realised_pnl_residual_total,
         trial_rows=trial_rows_of(scored_trials, registered_manifests=registered_manifests),
     )
 
@@ -2277,6 +2320,8 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "n_unreconciled": data.n_unreconciled,
         "power_caveat": data.power_caveat,
         "realised_pnl_after_fees_total": str(data.realised_pnl_after_fees_total),
+        "realised_pnl_residual_total": str(data.realised_pnl_residual_total),
+        "realised_pnl_portfolio_total": str(data.realised_pnl_portfolio_total),
         "capital_deployed_total": str(data.capital_deployed_total),
         "roi": str(data.roi),
         "roi_minus_b0": str(data.roi_minus_b0),
@@ -2356,6 +2401,11 @@ class PortfolioRoiReportView:
     n_unreconciled: int
     power_caveat: str
     realised_pnl_after_fees_total: Decimal
+    #: FU-3c, absent on v1/v2 -- `None` means "this report predates the
+    #: field", never `Decimal(0)` (which would misreport a report that KNOWS
+    #: the field and genuinely settled zero residuals).
+    realised_pnl_residual_total: Decimal | None
+    realised_pnl_portfolio_total: Decimal | None
     capital_deployed_total: Decimal
     unexplained_flow_days: int
     settled_through: str
@@ -2458,6 +2508,16 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
         power_caveat=_require_str(raw, "power_caveat"),
         realised_pnl_after_fees_total=_require_decimal_str(
             raw, "realised_pnl_after_fees_total"
+        ),
+        realised_pnl_residual_total=(
+            _require_decimal_str(raw, "realised_pnl_residual_total")
+            if "realised_pnl_residual_total" in raw
+            else None
+        ),
+        realised_pnl_portfolio_total=(
+            _require_decimal_str(raw, "realised_pnl_portfolio_total")
+            if "realised_pnl_portfolio_total" in raw
+            else None
         ),
         capital_deployed_total=_require_decimal_str(raw, "capital_deployed_total"),
         unexplained_flow_days=_require_int(raw, "unexplained_flow_days"),
@@ -2597,6 +2657,12 @@ def render_markdown_report(data: PortfolioRoiReportData) -> str:
         "",
         "## Totals",
         f"- realised P&L after fees (total): {data.realised_pnl_after_fees_total}",
+        f"- realised P&L residual fills (total, FU-3c): {data.realised_pnl_residual_total}",
+        f"- realised P&L portfolio (scored + residual, FU-3c): {data.realised_pnl_portfolio_total}",
+        (
+            "  (residual P&L is qty-scaled; scored P&L is per-contract "
+            "until FU-3d)"
+        ),
         f"- capital deployed (total, leg-summed, never netted): {data.capital_deployed_total}",
         f"- ROI: {_roi_or_gated(data, data.roi)}",
         f"- ROI - B0 (cash): {_roi_or_gated(data, data.roi_minus_b0)}",
@@ -3296,11 +3362,10 @@ def _run(
     # offending `venue_order_id` (never an amount), non-zero exit, and no
     # report written for this run.
     try:
+        # AC3: scored-only, unchanged by FU-3c -- `realised_pnl_after_fees_
+        # total` and `trial_rows` must stay exactly this figure.
         total_pnl = total_realised_pnl_all_settled(scored_trials)
         total_capital = total_capital_deployed(fills)
-        baselines = roi_against_baselines(
-            total_realised_pnl=total_pnl, total_capital_deployed=total_capital, fills=fills
-        )
 
         lags = [settlement_lag_days(trial) for trial in scored_trials]
         now_day = _utc_day_of_ns(now_ns)
@@ -3383,6 +3448,17 @@ def _run(
             )
         )
 
+        # FU-3c AC1/AC2: the residual numerator term, folded into `roi`'s
+        # baseline computation only AFTER residual settlements are resolved
+        # -- `total_pnl` above (AC3) is never touched. Stays inside this
+        # SAME `UnknownOrderSideError` try block (Decision 2 file-by-file).
+        residual_pnl = total_realised_pnl_residual(residual_settlements)
+        baselines = roi_against_baselines(
+            total_realised_pnl=total_pnl + residual_pnl,
+            total_capital_deployed=total_capital,
+            fills=fills,
+        )
+
         daily_rows = reconcile_daily(
             fills=fills,
             scored_trials=scored_trials,
@@ -3409,8 +3485,15 @@ def _run(
         # D9: the permanently-unsettled left-anti-join, over the SAME
         # `family_station_results`/`filled_trials` gathered above (F8) -- no
         # second `read_filled_trials_state_db` pass.
+        # FU-3c AC4: "settled" for D9 means scored OR resolved-residual --
+        # `permanently_unsettled_trials` itself (Decision 3) is unchanged;
+        # only the union it is called with grows. A pending/unresolved
+        # residual contributes no trial_id here, so it stays flagged past
+        # its horizon exactly as before (the negative half stays fail-closed).
         permanently_unsettled = permanently_unsettled_trials(
-            filled_trials, scored_trial_ids=scored_ids, now_ns=now_ns
+            filled_trials,
+            scored_trial_ids=scored_ids | frozenset(s.trial_id for s in residual_settlements),
+            now_ns=now_ns,
         )
 
         # F5: SELL exits, visible only as a dimensionless count -- see
@@ -3440,6 +3523,7 @@ def _run(
         n_residual_settlements=len(residual_settlements),
         n_residual_pending=len(residual_pending),
         n_residual_unresolved=n_residual_unresolved,
+        realised_pnl_residual_total=residual_pnl,
         scored_trials=scored_trials,
         registered_manifests=registered_manifests,
     )

@@ -74,6 +74,7 @@ read_ledger_fills = _prr.read_ledger_fills
 total_capital_deployed = _prr.total_capital_deployed
 total_realised_pnl_admissible = _prr.total_realised_pnl_admissible
 total_realised_pnl_all_settled = _prr.total_realised_pnl_all_settled
+total_realised_pnl_residual = _prr.total_realised_pnl_residual
 
 # -- C1b additions --
 MIN_LAG_SAMPLE_N = _prr.MIN_LAG_SAMPLE_N
@@ -240,7 +241,7 @@ class TestJsonSchemaVersion:
 
         raw = json.loads(path.read_text())
         # Stage C3 bumps this to 2 (the per-trial `trial_rows` breakdown).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 2
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 3
         # D6: the JSON is PRIVATE, mode 0600.
         assert (path.stat().st_mode & 0o777) == 0o600
 
@@ -380,7 +381,7 @@ class TestPerTrialPnlBreakdown:
         write_portfolio_roi_json(path, data)
         raw = json.loads(path.read_text())
 
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 2
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 3
         assert raw["trial_rows"] == [
             {
                 "trial_id": "fam_a/trial/1",
@@ -1986,7 +1987,7 @@ class TestAdditiveSchemaFieldBackwardCompat:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 2
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 3
         assert view.n_family_station_refusals == 0
 
     def test_the_journal_line_carries_the_new_dimensionless_count(self) -> None:
@@ -2047,7 +2048,7 @@ class TestF1CumulativeReconciliationReachesTheArtefact:
         ]
         # These fields are additive-within-version (D7); the schema_version
         # bump to 2 is unrelated (Stage C3's `trial_rows` field).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 2
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 3
 
         view = read_portfolio_roi_report(path)
         assert view.settled_cumulative_passes is False
@@ -3158,6 +3159,8 @@ class TestResidualSettlementCash:
             payout=Decimal("1.00"),
             dated_at_ns=_ns_of_day("2026-09-14"),
             settlement_basis="nws_final",
+            # FU-3c AC1: qty(1) * (1{held=True} - fill_px(0.70) - fee(0)).
+            realised_pnl=Decimal("0.30"),
         )
         daily_balances = {
             "2026-09-12": Decimal("100.00"),
@@ -3534,3 +3537,548 @@ class TestFu3bResidualCountsSurfaced:
 
         stdout = capsys.readouterr().out
         assert "n_residual_unresolved=1" in stdout
+
+
+# ===========================================================================
+# FU-3c -- residual-fill P&L folded into the ROI numerator, and D9 no longer
+# gating on a settled residual (plan docs/plans/backlog/FU-3c_residual_pnl_
+# and_d9_plan_r1_2026-09-26.md, r1.1 peer-converged). Scope: the analysis
+# script only -- a residual's realised_pnl must never reach
+# admissible_scored_trials, n_scored, trial_rows, the lags sample, the
+# scored-trial store, or family_tally_v2 (AC5).
+# ===========================================================================
+
+
+class TestResidualPnlAndD9:
+    def test_a_winning_yes_residual_realised_pnl_is_qty_times_one_minus_px_minus_fee(
+        self,
+    ) -> None:
+        """AC1: qty(1) * (1{held=True} - fill_px(0.70) - fee(0)) == 0.30."""
+        trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13", qty=Decimal(1))
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)  # inside [92, 94]
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.realised_pnl == Decimal("0.30")
+
+    def test_a_losing_no_leg_residual_realised_pnl_is_negative_cost(self) -> None:
+        """L-44: a NO-leg composite instrument holds exactly when HIGH is
+        OUTSIDE the rung -- `residual_settlement` must inherit that leg flip
+        via `scored.held` unmodified. Here HIGH lands INSIDE the rung, so the
+        NO leg LOSES: realised_pnl == -(fill_px + fee), never a positive or
+        zero figure."""
+        trial = _residual_trial(
+            trial_id="fam/trial/LAX/2026-09-13^no",
+            instrument_id="LAX-92-94^no.POLYMARKET_US",
+            bucket=_residual_bucket(lower_f=92, upper_f=94),
+            fill_px=Decimal("0.70"),
+            fee=Decimal("0.02"),
+        )
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)  # inside [92, 94]
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.realised_pnl == Decimal("-0.72")
+
+    def test_a_multi_contract_residual_pnl_scales_with_qty(self) -> None:
+        """AC1 edge case: P&L scales with qty exactly like payout does --
+        never `settlement_payout`'s per-contract assumption."""
+        trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13", qty=Decimal(3))
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)
+
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+
+        assert isinstance(result, ResidualSettlement)
+        assert result.realised_pnl == Decimal("0.90")
+
+    def test_roi_numerator_includes_residual_realised_pnl(self) -> None:
+        """RED today: `total_realised_pnl_residual` does not exist yet, so
+        `roi` has no way to see the residual's +0.30 (AC1/AC2)."""
+        scored = (_scored_trial(trial_id="t1", pnl=Decimal("0.10")),)
+        settlement = ResidualSettlement(
+            trial_id="r1",
+            climate_day="2026-09-13",
+            payout=Decimal(1),
+            dated_at_ns=_ns_of_day("2026-09-14"),
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("0.30"),
+        )
+        fills = (
+            _fill(
+                venue_order_id="vo-1",
+                cumulative_cost=Decimal("1.00"),
+                cumulative_fee=Decimal(0),
+            ),
+        )
+
+        total_pnl = total_realised_pnl_all_settled(scored)
+        residual_pnl = total_realised_pnl_residual((settlement,))
+        baselines = roi_against_baselines(
+            total_realised_pnl=total_pnl + residual_pnl,
+            total_capital_deployed=Decimal("1.00"),
+            fills=fills,
+        )
+
+        assert residual_pnl == Decimal("0.30")
+        assert baselines.roi == Decimal("0.40")
+
+    def test_trial_rows_sum_still_equals_realised_pnl_after_fees_total_with_residuals(
+        self,
+    ) -> None:
+        """AC3 invariant guard: adding residual P&L must never perturb the
+        scored-only sum identity `trial_rows` already pins (test :1839)."""
+        scored = (
+            _scored_trial(trial_id="t1", pnl=Decimal("0.10")),
+            _scored_trial(trial_id="t2", pnl=Decimal("0.20")),
+        )
+        settlement = ResidualSettlement(
+            trial_id="r1",
+            climate_day="2026-09-13",
+            payout=Decimal(1),
+            dated_at_ns=_ns_of_day("2026-09-14"),
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("0.55"),
+        )
+
+        total_pnl = total_realised_pnl_all_settled(scored)
+        trial_rows = trial_rows_of(scored, registered_manifests=())
+        row_sum = sum((row.pnl for row in trial_rows), start=Decimal(0))
+        residual_pnl = total_realised_pnl_residual((settlement,))
+
+        assert row_sum == total_pnl == Decimal("0.30")
+        assert residual_pnl == Decimal("0.55")
+        # Adding the residual term perturbs neither side of the identity.
+        assert row_sum == total_pnl
+
+    def test_residual_pnl_never_enters_admissible_or_n_scored(self) -> None:
+        """L-33 mutation-evidenced characterisation guard (AC5):
+        `ResidualSettlement` carries none of the fields
+        `admissible_scored_trials`/`trial_rows_of` read (`excluded_reason`,
+        `instrument_id`) -- pooling one into the scored population those
+        functions consume fails LOUDLY, never silently inflating n_scored or
+        the per-trial breakdown with a residual's realised_pnl. Mutation
+        evidence (recorded in the agent report): temporarily changing `_run`
+        to pool `residual_settlements` into the `scored_trials` collection it
+        passes onward is killed -- `AttributeError` from the pooled call,
+        exactly as asserted below."""
+        clean = _scored_trial(trial_id="clean/trial/1", pnl=Decimal("0.10"))
+        settlement = ResidualSettlement(
+            trial_id="r1",
+            climate_day="2026-09-13",
+            payout=Decimal(1),
+            dated_at_ns=_ns_of_day("2026-09-14"),
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("0.55"),
+        )
+        contaminated = (clean, settlement)
+
+        with pytest.raises(AttributeError):
+            admissible_scored_trials(contaminated, residual_trial_ids=frozenset())
+
+        with pytest.raises(AttributeError):
+            trial_rows_of(contaminated, registered_manifests=())
+
+    def test_d9_does_not_flag_a_settled_residual_past_horizon(self) -> None:
+        """AC4, RED today: pins the exact call-site composition `_run` now
+        uses (`scored_ids | {settlement.trial_id, ...}`) -- the pure
+        `permanently_unsettled_trials` core itself is unchanged (Decision
+        3). `now_ns` is release + 11 days, past the +10-day
+        MAX_SETTLEMENT_HORIZON_NS (7-day scorer window + 3-day grace)."""
+        trial = _filled_trial(
+            trial_id="fam/trial/LAX/2026-09-14", scheduled_release_day="2026-09-14"
+        )
+        settlement = ResidualSettlement(
+            trial_id=trial.trial_id,
+            climate_day="2026-09-14",
+            payout=Decimal(1),
+            dated_at_ns=trial.scheduled_release_at_ns,
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("0.30"),
+        )
+        now_ns = _ns_of_day("2026-09-25")
+
+        flagged = permanently_unsettled_trials(
+            [trial],
+            scored_trial_ids=frozenset() | frozenset(s.trial_id for s in (settlement,)),
+            now_ns=now_ns,
+        )
+
+        assert flagged == ()
+
+    def test_d9_still_flags_a_pending_residual_past_horizon(self) -> None:
+        """The negative half (AC4): a pending residual produces no
+        `ResidualSettlement`, so it contributes no trial_id to the D9 union
+        `_run` builds -- ungating everything would fail this test."""
+        trial = _filled_trial(
+            trial_id="fam/trial/LAX/2026-09-14", scheduled_release_day="2026-09-14"
+        )
+        pending = ResidualPending(trial_id=trial.trial_id, release_day="2026-09-14")
+        now_ns = _ns_of_day("2026-09-25")
+
+        # No ResidualSettlement exists for this trial (it is still
+        # ResidualPending) -- the union `_run` builds stays scored-only.
+        flagged = permanently_unsettled_trials(
+            [trial], scored_trial_ids=frozenset(), now_ns=now_ns
+        )
+
+        assert len(flagged) == 1
+        assert flagged[0].trial_id == trial.trial_id
+        assert pending.trial_id == trial.trial_id
+
+    def test_d9_still_flags_an_unresolved_residual_past_horizon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other negative half (AC4), end to end via `_run`: a residual
+        `_resolve_residual_settlements` cannot resolve (here, a catalog read
+        failure -- the same fixture as
+        `test_an_unresolved_residual_shows_n_residual_unresolved_one_in_the_
+        report_and_journal`) also produces no `ResidualSettlement`, so it
+        must still be flagged once its horizon passes -- ungating everything
+        would fail this test too."""
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
+        )
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(
+                venue_order_id="vo-res",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.70"),
+                cumulative_fee=Decimal(0),
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-res", fill.to_bytes())
+        finally:
+            store.close()
+
+        trial_id = "fam_res/trial/LAX/2026-09-13"
+        raw_trial = _residual_trial(trial_id=trial_id, scheduled_release_day="2026-09-14")
+        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        release_ns = _ns_of_day("2026-09-14")
+        monkeypatch.setattr(
+            _prr,
+            "_with_scheduled_release_at_ns",
+            lambda trial, *, venue, city: dataclasses.replace(
+                trial, scheduled_release_at_ns=release_ns
+            ),
+        )
+
+        scored_trials_dir = tmp_path / "scored_trials"
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam_res",
+            [
+                score_live_trials.FillExclusion(
+                    trial_id=trial_id,
+                    station="LAX",
+                    climate_day="2026-09-13",
+                    qty="1",
+                    reason="fee_unverified",
+                    detail="test fixture",
+                    venue_order_id="vo-res",
+                    filled_at_ns=_ns_of_day("2026-09-13"),
+                )
+            ],
+            scored_run_utc="2026-09-13T00:00:00Z",
+        )
+
+        def _raise_os_error(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("simulated catalog read failure")
+
+        monkeypatch.setattr(_prr, "open_station_catalog", _raise_os_error)
+
+        now_ns = _ns_of_day("2026-09-25")  # release + 11 days: past the +10-day horizon
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=tmp_path / "logs",
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=now_ns,
+            sink=_prr.resolve_alert_sink({}),
+            catalog_base=tmp_path / "catalog",
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-25.json").read_text()
+        )
+        assert report["n_residual_unresolved"] == 1
+        assert report["roi_status"] == ROI_STATUS_GATED_UNSETTLED_CAPITAL
+        assert report["unsettled_capital_positions"] == 1
+
+    def test_a_trial_both_scored_and_residual_contributes_pnl_once(self) -> None:
+        """The 09-15 MIA `^no` contradiction edge case: `_run` narrows
+        `residual_trial_ids` by `residual_ids - scored_ids` BEFORE calling
+        `_resolve_residual_settlements` (pinned directly, on the payout side,
+        by `test_a_trial_both_scored_and_residual_pays_once` above) -- so no
+        `ResidualSettlement` is ever produced for a trial_id that is also
+        scored. The portfolio P&L total below is therefore exactly the
+        scored trial's own pnl, paid once, never doubled."""
+        scored = (_scored_trial(trial_id="both/trial/LAX/2026-09-13", pnl=Decimal("0.10")),)
+        # No ResidualSettlement is produced for this trial_id -- the narrowed
+        # residual set is empty (mirrors the narrowing test above). No type
+        # annotation here: `ResidualSettlement` is loaded dynamically via
+        # `_load_module()` (module docstring above) and mypy cannot resolve
+        # it as a static type, the same constraint `_report_data`'s own
+        # docstring documents for `PortfolioRoiReportData`.
+        settlements = ()
+
+        total_pnl = total_realised_pnl_all_settled(scored)
+        residual_pnl = total_realised_pnl_residual(settlements)
+
+        assert total_pnl + residual_pnl == Decimal("0.10")
+
+    def test_reader_accepts_v3_and_reads_absent_residual_pnl_as_none_on_v2(
+        self, tmp_path: Path
+    ) -> None:
+        """D7: `_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS` now includes 3. A
+        genuinely older v2 report predates the field entirely -- `None`
+        (unknown), never `Decimal(0)` (which would misreport a report that
+        KNOWS the field and genuinely settled zero residuals)."""
+        data = dataclasses.replace(
+            _report_data(),
+            realised_pnl_residual_total=Decimal("0.30"),
+            realised_pnl_portfolio_total=Decimal("0.87"),
+        )
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, data)
+
+        view = read_portfolio_roi_report(path)
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert view.realised_pnl_residual_total == Decimal("0.30")
+        assert view.realised_pnl_portfolio_total == Decimal("0.87")
+
+        raw = json.loads(path.read_text())
+        raw["schema_version"] = 2
+        del raw["realised_pnl_residual_total"]
+        del raw["realised_pnl_portfolio_total"]
+        path.write_text(json.dumps(raw))
+
+        v2_view = read_portfolio_roi_report(path)
+        assert v2_view.schema_version == 2
+        assert v2_view.realised_pnl_residual_total is None
+        assert v2_view.realised_pnl_portfolio_total is None
+
+    def test_run_cfj485874tmm_shape_is_roi_ok_with_residual_pnl_through_real_writers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """L-42, the regression case (plan r1.1, premise CONFIRMED): the real
+        09-13/09-14 CFJ485874TMM-shaped residual, run PAST its settlement
+        horizon (release + 11 days), through the real
+        `score_live_trials._append_excluded_fills` writer, the real NWS
+        catalog writer, and `_run`'s own fixtures -- never a hand-built
+        `ResidualSettlement`. Asserts both halves of this plan land
+        together: `roi_status == "OK"` (AC4, D9 no longer gates a settled
+        residual) and the +0.30 residual P&L reaches the numerator
+        (AC1/AC2)."""
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
+        )
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(
+                venue_order_id="vo-res",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.70"),
+                cumulative_fee=Decimal(0),
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-res", fill.to_bytes())
+        finally:
+            store.close()
+
+        trial_id = "fam_res/trial/LAX/2026-09-13"
+        raw_trial = _residual_trial(trial_id=trial_id)
+        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        release_ns = _ns_of_day("2026-09-14")
+        monkeypatch.setattr(
+            _prr,
+            "_with_scheduled_release_at_ns",
+            lambda trial, *, venue, city: dataclasses.replace(
+                trial, scheduled_release_at_ns=release_ns
+            ),
+        )
+
+        # The real excluded_fills.jsonl writer -- makes the fill RESIDUAL.
+        scored_trials_dir = tmp_path / "scored_trials"
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam_res",
+            [
+                score_live_trials.FillExclusion(
+                    trial_id=trial_id,
+                    station="LAX",
+                    climate_day="2026-09-13",
+                    qty="1",
+                    reason="fee_unverified",
+                    detail="test fixture",
+                    venue_order_id="vo-res",
+                    filled_at_ns=_ns_of_day("2026-09-13"),
+                )
+            ],
+            scored_run_utc="2026-09-13T00:00:00Z",
+        )
+
+        # The real NWS catalog writer -- a settlement-grade FINAL landing
+        # inside the rung, so the residual is a WIN.
+        catalog_base = tmp_path / "catalog"
+        catalog = open_station_catalog(catalog_base, "polymarket_us", "LAX")
+        write_records(catalog, [_residual_record(climate_day="2026-09-13", tmax_f=93)])
+
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "breezy-trade-20260925T000000Z.log").write_text(
+            _account_state_line("2026-09-12", "100.00")
+            + "\n"
+            + _account_state_line("2026-09-14", "100.29")
+            + "\n"
+        )
+
+        now_ns = _ns_of_day("2026-09-25")  # release + 11 days: past the +10-day horizon
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=logs_dir,
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=now_ns,
+            sink=_prr.resolve_alert_sink({}),
+            catalog_base=catalog_base,
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-25.json").read_text()
+        )
+        assert report["roi_status"] == ROI_STATUS_OK
+        assert report["unsettled_capital_positions"] == 0
+        assert report["realised_pnl_after_fees_total"] == "0"
+        assert report["realised_pnl_residual_total"] == "0.30"
+        assert report["realised_pnl_portfolio_total"] == "0.30"
+        assert Decimal(report["roi"]) == roi(
+            total_realised_pnl=Decimal("0.30"), total_capital_deployed=Decimal("0.70")
+        )
+
+    def test_run_a_trial_both_scored_and_residual_pays_once_through_real_writers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """L-42, `_run`-level regression (kills R7): a `trial_id` with BOTH a
+        real scored-trial-store row (`write_scored_trials`) AND a real
+        `excluded_fills.jsonl` row (`score_live_trials._append_excluded_fills`)
+        must be paid ONCE, by the scored row -- never twice. `_run`'s own
+        `residual_trial_ids=frozenset(residual_ids - scored_ids)` narrowing
+        (portfolio_roi_report.py:~3443) is what removes this trial_id from
+        the residual-resolution set; the two existing "pays once" tests only
+        exercise `_resolve_residual_settlements` directly and never touch
+        `_run`'s own narrowing line, so dropping `- scored_ids` there still
+        passed all 131 tests before this one existed."""
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir, family_id="fam_both", trial_id_prefix="fam_both/trial/"
+        )
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(
+                venue_order_id="vo-both",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.40"),
+                cumulative_fee=Decimal("0.03"),
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-both", fill.to_bytes())
+        finally:
+            store.close()
+
+        trial_id = "fam_both/trial/LAX/2026-09-13"
+
+        # The stub `read_filled_trials_state_db` -- gives `_run`'s residual
+        # path (which the mutant would wrongly enter) a real `FilledTrial`
+        # and station mapping to resolve against, exactly like the
+        # narrowed-away case above.
+        raw_trial = _residual_trial(trial_id=trial_id)
+        reader = _stub_reader({("fam_both/trial/", "LAX"): ((raw_trial,), {})})
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        release_ns = _ns_of_day("2026-09-14")
+        monkeypatch.setattr(
+            _prr,
+            "_with_scheduled_release_at_ns",
+            lambda trial, *, venue, city: dataclasses.replace(
+                trial, scheduled_release_at_ns=release_ns
+            ),
+        )
+
+        scored_trials_dir = tmp_path / "scored_trials"
+
+        # The real scored-trial-store writer -- makes the trial_id SCORED.
+        write_scored_trials(
+            scored_trials_dir / "fam_both",
+            [
+                _scored_trial(
+                    trial_id=trial_id,
+                    pnl=Decimal("0.57"),
+                    climate_day="2026-09-13",
+                )
+            ],
+            now_ns=_ns_of_day("2026-09-13"),
+        )
+
+        # The real excluded_fills.jsonl writer -- makes the SAME trial_id
+        # RESIDUAL too.
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam_both",
+            [
+                score_live_trials.FillExclusion(
+                    trial_id=trial_id,
+                    station="LAX",
+                    climate_day="2026-09-13",
+                    qty="1",
+                    reason="fee_unverified",
+                    detail="test fixture",
+                    venue_order_id="vo-both",
+                    filled_at_ns=_ns_of_day("2026-09-13"),
+                )
+            ],
+            scored_run_utc="2026-09-13T00:00:00Z",
+        )
+
+        # A settlement-grade NWS FINAL for the trial's station-day -- so
+        # that IF the mutant's un-narrowed residual set reached
+        # `_resolve_residual_settlements`, it would resolve (and double-pay)
+        # rather than merely going unresolved.
+        catalog_base = tmp_path / "catalog"
+        catalog = open_station_catalog(catalog_base, "polymarket_us", "LAX")
+        write_records(catalog, [_residual_record(climate_day="2026-09-13", tmax_f=93)])
+
+        now_ns = _ns_of_day("2026-09-25")
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=tmp_path / "logs",
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=now_ns,
+            sink=_prr.resolve_alert_sink({}),
+            catalog_base=catalog_base,
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-25.json").read_text()
+        )
+        assert report["n_residual_settlements"] == 0
+        assert report["realised_pnl_residual_total"] == "0"
+        assert report["realised_pnl_portfolio_total"] == "0.57"
+        assert Decimal(report["roi"]) == roi(
+            total_realised_pnl=Decimal("0.57"), total_capital_deployed=Decimal("0.43")
+        )
