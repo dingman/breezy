@@ -104,6 +104,10 @@ _QUANTITY: Final[int] = 1
 #: there is no existing constant to import -- this is a NEW, module-local
 #: PROVISIONAL value, never tuned off a live firing without a registered
 #: amendment (Class-C, PREREG v4 §7).
+#: FU-1d S1: the count this bounds (`PositionMonitor._station_day_exit_
+#: counts`) is SHARED across a station-day's YES and NO legs, deliberately
+#: -- PREREG v4 :48 and L-40 both name the station-day, not the leg, as the
+#: trial unit this cap bounds.
 MAX_STATION_DAY_EXIT_ORDERS: Final[int] = 2
 
 _REASON_FAMILY_NOT_REGISTERED: Final[str] = "family_not_exit_registered"

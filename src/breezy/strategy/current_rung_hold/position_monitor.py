@@ -278,6 +278,16 @@ class PositionMonitor:
         self._emitted = 0
         #: INC-E3: exit orders fired this process, per (station, climate_day)
         #: -- the per-station-day cap `exit_decider.decide_exit` enforces.
+        #: FU-1d S1 (deliberate, not an oversight): keyed by (station,
+        #: climate_day) ONLY -- SHARED across a station-day's YES and NO
+        #: legs. PREREG v4 section3b:48 ("a per-station-day cap bounds a
+        #: flapping book") and L-40 both name the station-day, never a leg,
+        #: as the trial unit; a fired YES exit for this station-day is
+        #: therefore visible to the very next NO-leg evaluation of the SAME
+        #: station-day. Keying by leg instead would double the possible
+        #: exits per station-day -- a Class-C amendment of
+        #: `MAX_STATION_DAY_EXIT_ORDERS` (PREREG v4 :112), never a bare
+        #: refactor of this dict.
         self._station_day_exit_counts: dict[tuple[str, str], int] = {}
 
     @property

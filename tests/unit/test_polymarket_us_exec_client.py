@@ -188,10 +188,13 @@ ACCOUNT_NUMBER: Final[str] = "001"
 _ZERO_SHA256: Final[str] = "0" * 64
 
 
-def _family_manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
+def _family_manifest(
+    *, family_id: str, exit_rule: str | None, no_leg_exit: bool = False,
+) -> FamilyManifest:
     """INC-E2c: a manifest built directly (never `load_family_manifest`,
-    which reads a real file) -- only `family_id`/`exit_rule` vary across the
-    tests below; every other field is a well-formed placeholder."""
+    which reads a real file) -- only `family_id`/`exit_rule`/`no_leg_exit`
+    vary across the tests below; every other field is a well-formed
+    placeholder."""
     return FamilyManifest(
         family_id=family_id,
         venue="polymarket_us",
@@ -207,6 +210,7 @@ def _family_manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest
         status="REGISTERED",
         manifest_sha256=_ZERO_SHA256,
         exit_rule=exit_rule,
+        no_leg_exit=no_leg_exit,
     )
 
 
@@ -220,9 +224,16 @@ LIVE_UNARMED_MANIFEST: Final[FamilyManifest] = _family_manifest(
 #: The TEST-ONLY armed configuration: the one family
 #: `persistence/exit_gate.py._EXIT_RULE_REGISTERED_FAMILIES` names, with a
 #: manifest that also declares `exit_rule` -- `family_declares_exit_rule`
-#: gates `True`.
+#: gates `True`. Deliberately does NOT declare `no_leg_exit` (FU-1d S2): the
+#: NO-exit tests below that use THIS manifest exercise the new refusal.
 ARMED_EXIT_MANIFEST: Final[FamilyManifest] = _family_manifest(
     family_id="pm_us_crh_exit_v4", exit_rule="R_THREAT",
+)
+
+#: FU-1d S2: the SAME armed family, additionally declaring `no_leg_exit` --
+#: the fixture every NO-exit test that must actually MAP (not refuse) uses.
+ARMED_NO_LEG_EXIT_MANIFEST: Final[FamilyManifest] = _family_manifest(
+    family_id="pm_us_crh_exit_v4", exit_rule="R_THREAT", no_leg_exit=True,
 )
 
 #: A ``GetAccountBalancesResponse`` with a spendable USD balance. The literals
@@ -3234,7 +3245,7 @@ async def test_an_authorised_no_exit_maps_with_the_complemented_price(
     exec-client wiring)."""
     sender = _FakeOrderSender()
     rig = _build_accept_fill_rig(
-        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_NO_LEG_EXIT_MANIFEST,
     )
     no_instrument = _no_leg_instrument()
     rig.client._cache.add_instrument(no_instrument)
@@ -3254,6 +3265,38 @@ async def test_an_authorised_no_exit_maps_with_the_complemented_price(
 
     denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
     assert denials == []
+
+
+@pytest.mark.asyncio
+async def test_a_tagged_no_exit_is_denied_when_the_armed_manifest_does_not_declare_no_leg_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """FU-1d S2 (defense in depth, `RULING_FU-1b_no_leg_marks_2026-09-26.md`
+    re-open item 2). RED against today's code: `ARMED_EXIT_MANIFEST` is
+    registered and armed for an exit, but does NOT declare `no_leg_exit` --
+    a tagged NO exit must be denied at the exec-client boundary with the
+    new reason, exactly one `OrderDenied`, and `sender.calls == []` (never
+    reaching transport)."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    no_instrument = _no_leg_instrument()
+    rig.client._cache.add_instrument(no_instrument)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(
+            rig.limit_exit_sell(price="0.09", instrument=no_instrument)
+        )
+        await rig.client._disconnect()
+
+    assert sender.calls == [], "a NO exit refused for an undeclared no_leg_exit must never send"
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert denials[0].reason == "family does not declare a NO-leg exit; refusing"
 
 
 @pytest.mark.asyncio
@@ -3547,7 +3590,7 @@ async def test_an_authorised_no_exit_with_the_pinned_mirrored_echo_now_accepts(
         ),
     )
     rig = _build_accept_fill_rig(
-        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_NO_LEG_EXIT_MANIFEST,
     )
     rig.client._cache.add_instrument(no_instrument)
 
@@ -3598,7 +3641,7 @@ async def test_a_no_exit_echoed_with_the_wrong_side_stays_ambiguous(
         ),
     )
     rig = _build_accept_fill_rig(
-        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_NO_LEG_EXIT_MANIFEST,
     )
     rig.client._cache.add_instrument(no_instrument)
 

@@ -41,7 +41,7 @@ from breezy.adapters.polymarket_us.leg_prices import (
 from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
 from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
-from breezy.persistence.exit_gate import family_declares_exit_rule
+from breezy.persistence.exit_gate import family_declares_exit_rule, family_declares_no_leg_exit
 from breezy.persistence.family_manifest import FamilyManifest
 
 logger = logging.getLogger(__name__)
@@ -471,6 +471,15 @@ def unmappable_exit_order_reason(
     `None`. Reachable only with a real `authorization` -- a missing one is a
     caller defect, not a refusal, and raises `TypeError` (mirrors the same
     posture the plan requires of `build_exit_order_body`).
+
+    FU-1d S2 (defense in depth, `RULING_FU-1b_no_leg_marks_2026-09-26.md`
+    re-open item 2): after the family and family_id checks, a NO-leg
+    instrument also requires `family_declares_no_leg_exit(manifest)` --
+    the SAME gate `exit_decider.decide_exit` already enforces upstream, now
+    re-checked at the one seam both this client and the exec-client
+    boundary reach (`client.py`), so a NO exit can never be constructed here
+    even if a caller reached this function with a decider-bypassing
+    authorization.
     """
     if authorization is None:
         raise TypeError(
@@ -484,6 +493,10 @@ def unmappable_exit_order_reason(
         return "family does not declare a registered exit rule; refusing"
     if manifest.family_id != authorization.family_id:
         return "manifest family_id does not match the authorization; refusing"
+    if leg_of(getattr(instrument, "id")) == "no" and not family_declares_no_leg_exit(  # noqa: B009
+        manifest,
+    ):
+        return "family does not declare a NO-leg exit; refusing"
     return None
 
 

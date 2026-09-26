@@ -3179,6 +3179,11 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     `SOCKET_RESTORING_MARKERS` -- the probe/helper scripts it exercises
     import nothing from `exec.*` themselves; only this test module's own
     import statement brings it inside X1's rule.
+
+    FU-1d S3 adds one more: `test_no_leg_mark_fidelity.py` imports
+    `DurableFillRecord` from `exec.client` to build fixtures for the offline
+    walked-VWAP-vs-realised-fill measurement script -- see the row comment
+    at the assertion below for the full justification.
     """
     # CRH step 8 wiring adds one: `test_current_rung_hold_order_submission_
     # wiring.py` imports `PolymarketUSExecutionClient` to drive the real
@@ -3485,6 +3490,17 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # and opens no socket -- `is_no_side_pending` is a pure read over an
     # injected `SqliteStateStore`, the same idiom as this set's other
     # plain-data/pure-helper rows.
+    #
+    # Old -> new (this row, FU-1d S3 2026-09-26, NO-leg mark fidelity):
+    # added `tests/unit/test_no_leg_mark_fidelity.py`, which imports
+    # `DurableFillRecord` from `exec.client` to build fill fixtures for the
+    # offline walked-VWAP-vs-realised-fill measurement -- the SAME
+    # plain-data-record idiom as its `test_fill_time_count.py`/
+    # `test_measured_slippage_from_fills.py` siblings above. WIDENED, not
+    # relaxed (L-6/L-12): the comparison is still `==`; the module carries NO
+    # pytest mark at all -- none of `SOCKET_RESTORING_MARKERS` appears in it
+    # -- constructs no client and opens no socket (the exec state store is
+    # opened read-only via `fill_time_count._open_readonly`).
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3551,6 +3567,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_measured_slippage_from_fills.py",
         "tests/unit/test_position_monitor_nightly_report.py",
         "tests/unit/test_continuous_rung_hold_no_only_hunt_2026_09_24.py",
+        "tests/unit/test_no_leg_mark_fidelity.py",
     }
 
 

@@ -117,7 +117,9 @@ class _OrderWithPositionId:
         return self._position_id
 
 
-def _manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
+def _manifest(
+    *, family_id: str, exit_rule: str | None, no_leg_exit: bool = False,
+) -> FamilyManifest:
     return FamilyManifest(
         family_id=family_id,
         venue="polymarket_us",
@@ -133,11 +135,21 @@ def _manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
         status="DRAFT_NOT_REGISTERED",
         manifest_sha256="b" * 64,
         exit_rule=exit_rule,
+        no_leg_exit=no_leg_exit,
     )
 
 
 def _registered_manifest() -> FamilyManifest:
     return _manifest(family_id=REGISTERED_FAMILY_ID, exit_rule=REGISTERED_EXIT_RULE)
+
+
+def _registered_no_leg_manifest() -> FamilyManifest:
+    """FU-1d S2: the SAME registered family, additionally armed for a
+    NO-leg exit -- the fixture every NO-exit-mapping test below must use
+    once `unmappable_exit_order_reason` re-checks the declaration."""
+    return _manifest(
+        family_id=REGISTERED_FAMILY_ID, exit_rule=REGISTERED_EXIT_RULE, no_leg_exit=True,
+    )
 
 
 def _threat_exit_authorization(
@@ -219,13 +231,22 @@ def test_an_authorised_yes_exit_maps_to_a_sell_action_body(
 def test_an_authorised_no_exit_maps_to_a_sell_action_body_with_complemented_price(
     legs: tuple[BinaryOption, BinaryOption],
 ) -> None:
-    """NO at instrument price 0.09 -> wire price 0.91 (plan §3 INC-E2b)."""
+    """NO at instrument price 0.09 -> wire price 0.91 (plan §3 INC-E2b).
+
+    FU-1d S2 retarget (reviewer sign-off: a fixture tightening, never a
+    weakening -- every assertion below is unchanged): the manifest is now
+    `_registered_no_leg_manifest()`, since `unmappable_exit_order_reason`
+    also re-checks `family_declares_no_leg_exit` for a NO-leg instrument.
+    Running this exact body against the OLD `_registered_manifest()` (no
+    `no_leg_exit`) is the RED proof of the new gate's need -- it now
+    refuses `"family does not declare a NO-leg exit; refusing"`.
+    """
     _yes, no = legs
     order = _limit_sell(no, price="0.09", client_order_id="O-NO-1")
     authorization = _dead_exit_authorization(
         leg="no", position_id="POS-NO-1", client_order_id="O-NO-1"
     )
-    manifest = _registered_manifest()
+    manifest = _registered_no_leg_manifest()
 
     assert submit_chain.unmappable_exit_order_reason(order, no, authorization, manifest) is None
 
@@ -235,6 +256,76 @@ def test_an_authorised_no_exit_maps_to_a_sell_action_body_with_complemented_pric
     assert body["price"] == {"value": "0.91", "currency": "USD"}
     assert set(body) == submit_chain.ORDER_BODY_KEYS
     assert "intent" not in body
+
+
+# ---------------------------------------------------------------------------
+# FU-1d S2: the NO-leg exit-declaration gate, defense in depth
+# (`RULING_FU-1b_no_leg_marks_2026-09-26.md` re-open item 2). Mirrors
+# `exit_decider.decide_exit`'s own gate (`test_current_rung_hold_exit_
+# decider.py`), re-checked at this seam.
+# ---------------------------------------------------------------------------
+
+
+def test_a_no_exit_refuses_when_the_family_does_not_declare_no_leg_exit(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    """RED against today's code: the family and family_id checks both pass
+    (a registered family, matching authorization), but the manifest does
+    NOT declare `no_leg_exit` -- the NO exit must still refuse."""
+    _yes, no = legs
+    order = _limit_sell(no, price="0.09", client_order_id="O-NO-GATE-1")
+    authorization = _dead_exit_authorization(
+        leg="no", position_id="POS-NO-GATE-1", client_order_id="O-NO-GATE-1"
+    )
+    manifest = _registered_manifest()  # no_leg_exit=False (default)
+
+    reason = submit_chain.unmappable_exit_order_reason(order, no, authorization, manifest)
+    assert reason == "family does not declare a NO-leg exit; refusing"
+    # `build_exit_order_body` takes no manifest and re-applies no manifest
+    # gate of its own (module docstring) -- the caller (`exec/client.py`)
+    # is the one that must consult `unmappable_exit_order_reason` FIRST and
+    # never call `build_exit_order_body` once it returns a reason. That
+    # caller contract is exercised by the exec-client test below, not here.
+
+
+def test_a_yes_exit_is_unaffected_by_the_no_leg_declaration(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    """A YES-leg exit ignores the new check entirely, even against a
+    manifest that declares `no_leg_exit=True` -- the gate only ever keys
+    off `leg_of(instrument.id) == "no"`."""
+    yes, _no = legs
+    order = _limit_sell(yes, price="0.55", client_order_id="O-YES-GATE-1")
+    authorization = _threat_exit_authorization(
+        leg="yes", position_id="POS-YES-GATE-1", client_order_id="O-YES-GATE-1"
+    )
+    manifest = _registered_no_leg_manifest()
+
+    assert submit_chain.unmappable_exit_order_reason(order, yes, authorization, manifest) is None
+
+    body = submit_chain.build_exit_order_body(order, yes, authorization)
+    assert body["outcomeSide"] == "OUTCOME_SIDE_YES"
+    assert body["price"] == {"value": "0.55", "currency": "USD"}
+
+
+def test_the_no_leg_refusal_follows_the_family_and_family_id_checks(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    """Order pin: a NO exit on an UNREGISTERED family still returns the
+    pre-existing family-gate reason, byte-unchanged, never the new NO-leg
+    reason -- the new check is placed strictly after both existing gates."""
+    _yes, no = legs
+    order = _limit_sell(no, price="0.09", client_order_id="O-NO-ORDER-1")
+    authorization = _dead_exit_authorization(
+        leg="no",
+        position_id="POS-NO-ORDER-1",
+        client_order_id="O-NO-ORDER-1",
+        family_id="pm_us_crh_cont",
+    )
+    manifest = _manifest(family_id="pm_us_crh_cont", exit_rule="some_exit_rule_v1")
+
+    reason = submit_chain.unmappable_exit_order_reason(order, no, authorization, manifest)
+    assert reason == "family does not declare a registered exit rule; refusing"
 
 
 # ---------------------------------------------------------------------------
