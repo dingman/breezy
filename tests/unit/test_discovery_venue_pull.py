@@ -6,18 +6,21 @@ matching the plan's own instruction ("using a fake client and no egress").
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from breezy.adapters.polymarket_us.provider import MARKET_LIST_PATH
+from breezy.adapters.polymarket_us.provider import MARKET_BY_SLUG_PATH, MARKET_LIST_PATH
 from scripts.analysis.discovery_venue_pull import (
     FollowState,
     build_discovery_provider,
     find_initial_trigger,
+    main,
     poll_node_logs_once,
     run_discovery_pull,
 )
@@ -232,3 +235,74 @@ def test_follow_does_not_consume_a_partial_trailing_line(tmp_path: Path) -> None
     _state, records, _truncated = poll_node_logs_once(tmp_path, state)
     assert len(records) == 1
     assert records[0].message.startswith("Polymarket.us discovery cycle initial")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end CLI
+# ---------------------------------------------------------------------------
+
+
+def test_cli_computes_node_active_and_gets_missing_slugs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pull CLI must replay N from the triggering log file (never
+    ``()``) and GET every slug in N - V by slug (review fix: `main` used to
+    hardcode `node_active_slugs=()`, so this by-slug GET never fired)."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    out_dir = tmp_path / "evidence"
+
+    slug_in_venue = _MARKET["slug"]
+    slug_missing_from_venue = "tc-temp-miahigh-2026-09-23-lt79f"
+
+    log_path = log_dir / "breezy-trade-20260923T165046Z.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                _summary_plain(
+                    "2026-09-23T16:36:00.000000000",
+                    "initial",
+                    subscribed=(slug_in_venue, slug_missing_from_venue),
+                )
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    client = FakeClient(
+        page_for_offset=lambda offset: {"markets": [_MARKET]},
+        by_slug={slug_missing_from_venue: {"slug": slug_missing_from_venue, "closed": True}},
+    )
+
+    monkeypatch.setattr(
+        "scripts.venue.fee_drift_evidence_pull.build_default_client",
+        lambda *, user_agent: client,
+    )
+
+    now = datetime(2026, 9, 23, 16, 40, tzinfo=UTC)
+    exit_code = main(
+        [
+            "--node-log-dir",
+            str(log_dir),
+            "--out-dir",
+            str(out_dir),
+            "--user-agent",
+            "wp-d1-test",
+        ],
+        now=now,
+    )
+    assert exit_code == 0
+
+    payload = json.loads((out_dir / "2026-09-23.json").read_text(encoding="utf-8"))
+    node_active = set(payload["node_active"])
+    assert node_active == {slug_in_venue, slug_missing_from_venue}
+    assert payload["venue_active"] == [slug_in_venue]
+
+    by_slug_calls = [call for call in client.calls if call[0] != MARKET_LIST_PATH]
+    assert len(by_slug_calls) == 1
+    assert by_slug_calls[0][0] == MARKET_BY_SLUG_PATH.format(slug=slug_missing_from_venue)
+
+    by_slug_lookup = payload["by_slug_lookup"]
+    assert by_slug_lookup[slug_missing_from_venue]["slug"] == slug_missing_from_venue
+    assert slug_in_venue not in by_slug_lookup

@@ -241,11 +241,24 @@ class PullOutcome:
     by_slug_lookup: Mapping[str, Mapping[str, Any] | None]
 
 
+def _replay_node_active_slugs(path: Path, *, up_to_ns: int) -> tuple[str, ...]:
+    """N = R ∪ B (r2 AC2 finding: ``active_market_slugs = R ∪ B``,
+    disjoint): replay the TRIGGERING file's own discovery cycles up to and
+    including P (``up_to_ns``), using the SAME parser/replay the offline
+    analysis uses -- never a second, competing reimplementation.
+    """
+    from scripts.analysis.discovery_set_equality import iter_node_log_records, replay_cycles
+
+    records = tuple(r for r in iter_node_log_records(path) if r.ts_ns <= up_to_ns)
+    result = replay_cycles(records)
+    return tuple(sorted(set(result.final_active) | set(result.final_blocked)))
+
+
 async def run_discovery_pull(
     *,
     client: PublicReadClient,
     log_dir: Path,
-    node_active_slugs: Sequence[str],
+    node_active_slugs: Sequence[str] | None,
     since_ns: int,
     deadline_ns: int,
     poll_sleep: float = 10.0,
@@ -257,20 +270,24 @@ async def run_discovery_pull(
     pull the venue's list once and GET every node-only slug (r3 "Pull
     trigger", steps 1-6).
 
-    ``node_active_slugs`` is the CALLER's already-replayed ``N`` (this
-    script never re-implements log replay -- see
-    :func:`scripts.analysis.discovery_set_equality.replay_file`).
+    ``node_active_slugs`` is ``N`` (plan step 5: GET every slug in ``N - V``
+    by slug). Pass an explicit sequence to override (tests); ``None`` (the
+    CLI's own default) replays the TRIGGERING file up to P via
+    :func:`_replay_node_active_slugs` -- this script never re-implements
+    that replay a second, independent way.
     """
     clock = now_ns if now_ns is not None else time.time_ns
     sleeper = sleep if sleep is not None else asyncio.sleep
 
     state = FollowState()
     triggered_ts_ns: int | None = None
+    trigger_source: Path | None = None
     while True:
         state, records, _truncated = poll_node_logs_once(log_dir, state)
         trigger = find_initial_trigger(records, since_ns=since_ns)
         if trigger is not None:
             triggered_ts_ns = trigger.ts_ns
+            trigger_source = trigger.source
             break
         if clock() >= deadline_ns:
             return PullOutcome(
@@ -286,6 +303,10 @@ async def run_discovery_pull(
                 by_slug_lookup={},
             )
         await sleeper(poll_sleep)
+
+    if node_active_slugs is None:
+        assert trigger_source is not None and triggered_ts_ns is not None
+        node_active_slugs = _replay_node_active_slugs(trigger_source, up_to_ns=triggered_ts_ns)
 
     pull_start_ns = clock()
     provider, recorder = build_discovery_provider(client)
@@ -347,22 +368,22 @@ def _today_window_ns(now: datetime) -> tuple[int, int]:
     return int(since.timestamp() * 1_000_000_000), int(deadline.timestamp() * 1_000_000_000)
 
 
-async def _main_async(argv: Sequence[str] | None) -> int:  # pragma: no cover - thin CLI shell
+async def _main_async(argv: Sequence[str] | None, *, now: datetime | None = None) -> int:
     args = _parse_args(argv)
     from scripts.venue.fee_drift_evidence_pull import build_default_client
 
-    since_ns, deadline_ns = _today_window_ns(datetime.now(tz=UTC))
+    effective_now = now if now is not None else datetime.now(tz=UTC)
+    since_ns, deadline_ns = _today_window_ns(effective_now)
     client = build_default_client(user_agent=args.user_agent)
     outcome = await run_discovery_pull(
         client=client,
         log_dir=args.node_log_dir,
-        node_active_slugs=(),
+        node_active_slugs=None,
         since_ns=since_ns,
         deadline_ns=deadline_ns,
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    day = datetime.now(tz=UTC).date().isoformat()
-    out_name = "no_pull.json" if not outcome.paired_ts_ns else f"{day}.json"
+    day = effective_now.astimezone(UTC).date().isoformat()
     payload = {
         "date": day,
         "complete": outcome.complete,
@@ -370,9 +391,11 @@ async def _main_async(argv: Sequence[str] | None) -> int:  # pragma: no cover - 
         "pull_start_ns": outcome.pull_start_ns,
         "pull_end_ns": outcome.pull_end_ns,
         "paired_ts_ns": outcome.paired_ts_ns,
+        "node_active": list(outcome.node_active),
         "venue_active": list(outcome.venue_active),
+        "by_slug_lookup": dict(outcome.by_slug_lookup),
     }
-    (args.out_dir / out_name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    (args.out_dir / f"{day}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     if outcome.pages:
         (args.out_dir / f"{day}_pages.json").write_text(
             json.dumps(list(outcome.pages), indent=2), encoding="utf-8"
@@ -380,9 +403,9 @@ async def _main_async(argv: Sequence[str] | None) -> int:  # pragma: no cover - 
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - thin CLI shell
-    return asyncio.run(_main_async(argv))
+def main(argv: Sequence[str] | None = None, *, now: datetime | None = None) -> int:
+    return asyncio.run(_main_async(argv, now=now))
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":  # pragma: no cover - process entry point, not itself testable
     raise SystemExit(main(sys.argv[1:]))

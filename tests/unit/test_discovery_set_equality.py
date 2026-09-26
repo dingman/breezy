@@ -10,6 +10,7 @@ fixture.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
 from scripts.analysis.discovery_set_equality import (
@@ -669,3 +670,158 @@ def test_four_clean_days_is_not_superseded() -> None:
 def test_five_clean_days_superseded() -> None:
     days = [_eligible_equal_day(dt.date(2026, 9, d)) for d in range(1, 6)]
     assert overall_verdict(days) == "SUPERSEDED-BY AUD-08a"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end CLI (analysis)
+# ---------------------------------------------------------------------------
+
+
+def _venue_market(
+    slug: str, climate_date: str, *, city_name: str = "New York City", **extra: object
+) -> dict[str, object]:
+    market: dict[str, object] = {
+        "slug": slug,
+        "question": f"Highest temperature in {city_name} on {climate_date}?",
+    }
+    market.update(extra)
+    return market
+
+
+def _page_with(*markets: dict[str, object]) -> dict[str, object]:
+    return {"markets": list(markets)}
+
+
+def _write_pull(
+    venue_pulls: Path,
+    day: dt.date,
+    *,
+    paired_ts_ns: int,
+    pull_start_ns: int,
+    pull_end_ns: int,
+    node_active: list[str],
+    by_slug_lookup: dict[str, object] | None = None,
+    pages: list[dict[str, object]] | None = None,
+) -> None:
+    payload = {
+        "date": day.isoformat(),
+        "complete": True,
+        "reason": None,
+        "pull_start_ns": pull_start_ns,
+        "pull_end_ns": pull_end_ns,
+        "paired_ts_ns": paired_ts_ns,
+        "node_active": node_active,
+        "venue_active": [],
+        "by_slug_lookup": by_slug_lookup or {},
+    }
+    (venue_pulls / f"{day.isoformat()}.json").write_text(json.dumps(payload), encoding="utf-8")
+    if pages is not None:
+        (venue_pulls / f"{day.isoformat()}_pages.json").write_text(
+            json.dumps(pages), encoding="utf-8"
+        )
+
+
+def test_cli_end_to_end_equal_not_equal_explained_and_no_pull(tmp_path: Path) -> None:
+    from scripts.analysis.discovery_set_equality import main as analysis_main
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    venue_pulls = tmp_path / "pulls"
+    venue_pulls.mkdir()
+    out_path = tmp_path / "note.md"
+
+    # --- Day 1 (2026-09-10): EQUAL -- V == N exactly. ---
+    day1 = dt.date(2026, 9, 10)
+    slug1 = "tc-temp-nychigh-2026-09-10-lt65f"
+    ts1 = "2026-09-10T16:36:00.000000000"
+    _write_log(
+        log_dir,
+        "breezy-trade-20260910T163600Z.log",
+        [_count_line(ts1, 1), _summary_line(ts1, "initial", subscribed=(slug1,))],
+    )
+    p1_ns = _ns(ts1)
+    _write_pull(
+        venue_pulls,
+        day1,
+        paired_ts_ns=p1_ns,
+        pull_start_ns=p1_ns + 60 * _NS,
+        pull_end_ns=p1_ns + 65 * _NS,
+        node_active=[slug1],
+        pages=[_page_with(_venue_market(slug1, "2026-09-10"))],
+    )
+
+    # --- Day 2 (2026-09-11): NOT-EQUAL -- an unexplained venue_only slug. ---
+    day2 = dt.date(2026, 9, 11)
+    slug2 = "tc-temp-nychigh-2026-09-11-lt65f"
+    slug2_extra = "tc-temp-nychigh-2026-09-11-gte65lt66f"
+    ts2 = "2026-09-11T16:36:00.000000000"
+    _write_log(
+        log_dir,
+        "breezy-trade-20260911T163600Z.log",
+        [_count_line(ts2, 1), _summary_line(ts2, "initial", subscribed=(slug2,))],
+    )
+    p2_ns = _ns(ts2)
+    _write_pull(
+        venue_pulls,
+        day2,
+        paired_ts_ns=p2_ns,
+        pull_start_ns=p2_ns + 60 * _NS,
+        pull_end_ns=p2_ns + 65 * _NS,
+        node_active=[slug2],
+        pages=[_page_with(
+            _venue_market(slug2, "2026-09-11"),
+            _venue_market(slug2_extra, "2026-09-11"),  # no createdAt/startDate -> unexplained
+        )],
+    )
+
+    # --- Day 3 (2026-09-12): EXPLAINED -- a venue_only slug created in-window. ---
+    day3 = dt.date(2026, 9, 12)
+    slug3 = "tc-temp-nychigh-2026-09-12-lt65f"
+    slug3_new = "tc-temp-nychigh-2026-09-12-gte65lt66f"
+    ts3 = "2026-09-12T16:36:00.000000000"
+    _write_log(
+        log_dir,
+        "breezy-trade-20260912T163600Z.log",
+        [_count_line(ts3, 1), _summary_line(ts3, "initial", subscribed=(slug3,))],
+    )
+    p3_ns = _ns(ts3)
+    pull_start3 = p3_ns + 60 * _NS
+    created_ns = p3_ns + 30 * _NS  # strictly inside (P, pull_start]
+    created_iso = (
+        dt.datetime.fromtimestamp(created_ns / _NS, tz=dt.UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _write_pull(
+        venue_pulls,
+        day3,
+        paired_ts_ns=p3_ns,
+        pull_start_ns=pull_start3,
+        pull_end_ns=pull_start3 + 5 * _NS,
+        node_active=[slug3],
+        pages=[_page_with(
+            _venue_market(slug3, "2026-09-12"),
+            _venue_market(slug3_new, "2026-09-12", createdAt=created_iso),
+        )],
+    )
+
+    # --- Day 4 (2026-09-13): NO-PULL -- node log exists, no pull artefact. ---
+    ts4 = "2026-09-13T16:36:00.000000000"
+    slug4 = "tc-temp-nychigh-2026-09-13-lt65f"
+    _write_log(
+        log_dir,
+        "breezy-trade-20260913T163600Z.log",
+        [_count_line(ts4, 1), _summary_line(ts4, "initial", subscribed=(slug4,))],
+    )
+    # Deliberately no 2026-09-13.json under venue_pulls.
+
+    exit_code = analysis_main(
+        ["--node-log-dir", str(log_dir), "--venue-pulls", str(venue_pulls), "--out", str(out_path)]
+    )
+    assert exit_code == 0
+    note = out_path.read_text(encoding="utf-8")
+
+    assert "2026-09-10: EQUAL venue_only=0 node_only=0 explained=0" in note
+    assert "2026-09-11: NOT-EQUAL venue_only=1 node_only=0 explained=0" in note
+    assert "2026-09-12: EQUAL venue_only=1 node_only=0 explained=1" in note
+    assert "2026-09-13: INELIGIBLE (NO-PULL)" in note

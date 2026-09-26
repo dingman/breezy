@@ -60,6 +60,7 @@ __all__ = [
     "replay_file",
     "select_day_files",
     "venue_active_set",
+    "venue_payloads_from_pages",
 ]
 
 # ---------------------------------------------------------------------------
@@ -462,6 +463,28 @@ def venue_active_set(
     )
 
 
+def venue_payloads_from_pages(pages: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """``slug -> raw market payload``, over EVERY listed market on every
+    stored page -- not just the active ones :func:`venue_active_set` keeps.
+
+    :func:`classify_differences` needs a ``venue_only`` slug's own
+    ``createdAt``/``startDate`` even when that slug is itself resolved or
+    from an unregistered city, so this is a plain, unvalidated slug index,
+    never the provider's weather-grammar filter.
+    """
+    payloads: dict[str, Mapping[str, Any]] = {}
+    for page in pages:
+        markets = page.get("markets") if isinstance(page, Mapping) else None
+        if not isinstance(markets, list):
+            continue
+        for market in markets:
+            if isinstance(market, Mapping):
+                slug = market.get("slug")
+                if isinstance(slug, str):
+                    payloads[slug] = market
+    return payloads
+
+
 # ---------------------------------------------------------------------------
 # AC4 -- pairing
 # ---------------------------------------------------------------------------
@@ -762,6 +785,7 @@ def render_note(day_verdicts: Sequence[DayVerdict], *, closing_rule_header: str)
         status = "EQUAL" if verdict.equal else "NOT-EQUAL"
         venue_only = sum(1 for d in verdict.differences if d.side == "venue_only")
         node_only = sum(1 for d in verdict.differences if d.side == "node_only")
+        explained = sum(1 for d in verdict.differences if d.explained)
         errors = verdict.error_counts
         error_text = (
             f"errors(filtered={errors.filtered}, unfiltered={errors.unfiltered})"
@@ -770,7 +794,7 @@ def render_note(day_verdicts: Sequence[DayVerdict], *, closing_rule_header: str)
         )
         lines.append(
             f"- {verdict.day.isoformat()}: {status} venue_only={venue_only} "
-            f"node_only={node_only} {error_text}"
+            f"node_only={node_only} explained={explained} {error_text}"
         )
     lines.append("")
     lines.append(f"Verdict: {overall_verdict(day_verdicts)}")
@@ -792,13 +816,71 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - thin CLI shell
+def _candidate_days(node_log_dir: Path) -> tuple[date, ...]:
+    """Every UTC calendar date any node log line falls on -- so a day with
+    NO pull artefact at all is still reported (NO-PULL), never silently
+    skipped because nothing under ``--venue-pulls`` named it.
+    """
+    days: set[date] = set()
+    for path in sorted(node_log_dir.glob(NODE_LOG_GLOB)):
+        for record in iter_node_log_records(path):
+            days.add(datetime.fromtimestamp(record.ts_ns / 1_000_000_000, tz=UTC).date())
+    return tuple(sorted(days))
+
+
+def _pull_artefacts(venue_pulls: Path, day: date) -> tuple[Mapping[str, Any] | None, list[Any]]:
+    """The day's ``{day}.json`` pull-result payload (``None`` if the file is
+    absent -- AC7 ``NO-PULL``) and its sibling ``{day}_pages.json`` raw
+    venue pages (``[]`` if absent, e.g. an INCOMPLETE or NO-PULL day).
+    """
+    pull_file = venue_pulls / f"{day.isoformat()}.json"
+    if not pull_file.is_file():
+        return None, []
+    payload = json.loads(pull_file.read_text(encoding="utf-8"))
+    pages_file = venue_pulls / f"{day.isoformat()}_pages.json"
+    pages = json.loads(pages_file.read_text(encoding="utf-8")) if pages_file.is_file() else []
+    return payload, pages
+
+
+def _pairing_summary_and_events(
+    replays: Mapping[Path, ReplayResult], *, paired_ts_ns: int
+) -> tuple[list[DiscoverySummary], tuple[int, ...], Path | None]:
+    """The cycle matching ``paired_ts_ns`` (restated as a ``DiscoverySummary``
+    for :func:`pair_pull`), the file it lives in (r3: "N comes from the file
+    containing P"), and every OTHER cycle's timestamp across the day's files
+    as candidate interleaving events (AC4 amended).
+    """
+    p_file: Path | None = None
+    p_cycle: CycleReplay | None = None
+    other_events: list[int] = []
+    for path, replay in replays.items():
+        for cycle in replay.cycles:
+            if cycle.ts_ns == paired_ts_ns:
+                p_file = path
+                p_cycle = cycle
+            else:
+                other_events.append(cycle.ts_ns)
+    if p_cycle is None:
+        return [], tuple(other_events), None
+    summary = DiscoverySummary(
+        ts_ns=p_cycle.ts_ns,
+        cycle=p_cycle.cycle,
+        subscribed=p_cycle.subscribed,
+        unsubscribed=p_cycle.unsubscribed,
+        unsubscribed_pairs=(),
+        blocked=p_cycle.blocked,
+    )
+    return [summary], tuple(other_events), p_file
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    pull_files = sorted(args.venue_pulls.glob("*.json"))
+    from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
+
+    city_codes = PolymarketUSMarketDiscoveryConfig().city_codes
+
     day_verdicts: list[DayVerdict] = []
-    for pull_file in pull_files:
-        pull_payload = json.loads(pull_file.read_text(encoding="utf-8"))
-        day = date.fromisoformat(pull_payload["date"])
+    for day in _candidate_days(args.node_log_dir):
         files = select_day_files(args.node_log_dir, day)
         if not files:
             day_verdicts.append(
@@ -808,17 +890,70 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - thin C
                 )
             )
             continue
-        records = filter_unit_records(
+
+        replays = {path: replay_cycles(iter_node_log_records(path)) for path in files}
+        window_records = filter_unit_records(
             tuple(record for path in files for record in iter_node_log_records(path)), day=day
         )
-        replay = replay_cycles(records)
-        errors = count_errors(records)
+        errors = count_errors(window_records)
+        latest_replay = replays[files[-1]]
+
+        pull_payload, pages = _pull_artefacts(args.venue_pulls, day)
+        if pull_payload is None:
+            day_verdicts.append(
+                day_verdict(
+                    day=day, replay=latest_replay, pull_attempted=False, pair=None,
+                    differences=(), error_counts=errors,
+                )
+            )
+            continue
+
+        paired_ts_ns = pull_payload.get("paired_ts_ns")
+        pull_start_ns = pull_payload.get("pull_start_ns")
+        pull_end_ns = pull_payload.get("pull_end_ns")
+        if paired_ts_ns is None or pull_start_ns is None or pull_end_ns is None:
+            # The pull was attempted but never paired (RELAUNCH-FAILED, the
+            # 17:12Z deadline, or a PULL-INCOMPLETE before any GET) -- still
+            # reported against the day's own replay, with no pairing to check.
+            day_verdicts.append(
+                day_verdict(
+                    day=day, replay=latest_replay, pull_attempted=True, pair=None,
+                    differences=(), error_counts=errors,
+                )
+            )
+            continue
+
+        summaries, other_events, p_file = _pairing_summary_and_events(
+            replays, paired_ts_ns=paired_ts_ns
+        )
+        primary_replay = replays[p_file] if p_file is not None else latest_replay
+        pair = pair_pull(
+            summaries=summaries,
+            other_discovery_event_ns=other_events,
+            pull_start_ns=pull_start_ns,
+            pull_end_ns=pull_end_ns,
+        )
+
+        venue = venue_active_set(pages, city_codes)
+        venue_payloads = venue_payloads_from_pages(pages)
+        node_active = tuple(pull_payload.get("node_active", ()))
+        by_slug_lookup = pull_payload.get("by_slug_lookup", {})
+        differences = classify_differences(
+            node_active=node_active,
+            venue_active=venue.active,
+            p_ts_ns=paired_ts_ns,
+            pull_start_ns=pull_start_ns,
+            venue_payloads=venue_payloads,
+            by_slug_lookup=by_slug_lookup,
+        )
+
         day_verdicts.append(
             day_verdict(
-                day=day, replay=replay, pull_attempted=True, pair=None,
-                differences=(), error_counts=errors,
+                day=day, replay=primary_replay, pull_attempted=True, pair=pair,
+                differences=differences, error_counts=errors,
             )
         )
+
     note = render_note(day_verdicts, closing_rule_header="# WP-D1 discovery set equality")
     args.out.write_text(note, encoding="utf-8")
     return 0
