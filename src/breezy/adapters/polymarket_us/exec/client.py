@@ -235,7 +235,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Final, Protocol, Self
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, Self
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import (
@@ -585,6 +585,25 @@ _POSITION_LAG_PENDING_TTL_NS: Final[int] = 30 * 60 * 1_000_000_000
 #: `MULTI_FILL_PENDING` -- a `PositionReportingLag` cannot be attributed to
 #: one of two fills.
 _MULTI_FILL_PENDING_SENTINEL: Final[str] = "R7_MULTI_FILL_PENDING"
+
+
+class _PendingPositionLag(NamedTuple):
+    """One unconfirmed create-path accept-fill, keyed by instrument in
+    `_position_lag_pending` (test-gap hardening, 2026-09-26).
+
+    A plain positional 5-tuple let the producer (`_submit_order`) and the
+    matcher (`_match_position_lag`) desync silently on field ORDER -- e.g. a
+    `send_ns`/`recv_ns` transposition reads clean at each call site and only
+    surfaces as a wrong skew/ordering computation. A `NamedTuple` is still a
+    tuple (unpacking, equality and indexing against existing test fixtures
+    are unaffected), but every producer/matcher access now names the field.
+    """
+
+    fill_ts_event: int
+    send_ns: int
+    recv_ns: int
+    client_order_id: str
+    reads_without_long: int
 
 #: The only order side Breezy OPENS with. ``allow_short=False`` is permanent
 #: (``strategy/weather_common/risk.py:139``).
@@ -4008,10 +4027,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if not self._position_lag_pending:
             return
         bound_ns = _FILL_TS_EVENT_MAX_SKEW_NS
-        still_pending: dict[InstrumentId, tuple[int, int, int, str, int]] = {}
+        still_pending: dict[InstrumentId, _PendingPositionLag] = {}
         determined_long: set[InstrumentId] = set()
         determined_not_long: set[InstrumentId] = set()
-        for instrument_id, entry in self._position_lag_pending.items():
+        for instrument_id, raw_entry in self._position_lag_pending.items():
+            # `*raw_entry` accepts either a `_PendingPositionLag` (the
+            # producer's real shape) or a same-length plain tuple (test
+            # fixtures seed both) -- normalising here means `._replace()`
+            # below never sees a bare tuple. A too-short/too-long
+            # `raw_entry` (T10: a malformed pending entry) still raises,
+            # caught by the caller's broad `except`.
+            entry = _PendingPositionLag(*raw_entry)
             fill_ts_event, send_ns, recv_ns, client_order_id, reads_without_long = entry
             reject_reason: str | None = None
             if client_order_id == _MULTI_FILL_PENDING_SENTINEL:
@@ -4094,12 +4120,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"send_ns={send_ns} recv_ns={recv_ns} bound_ns={bound_ns}"
                 )
                 continue
-            still_pending[instrument_id] = (
-                fill_ts_event,
-                send_ns,
-                recv_ns,
-                client_order_id,
-                reads_without_long + 1,
+            still_pending[instrument_id] = entry._replace(
+                reads_without_long=reads_without_long + 1
             )
         self._position_lag_pending = still_pending
         self._position_lag_last_long = (
@@ -4729,10 +4751,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # against the next eof-complete positions read. One statement,
             # after every effect above, no `await`, no new callee --
             # `self._clock.timestamp_ns` is already permitted (E0-NOSEND).
-            # `in` is a membership test, not an `ast.Call`, and a dict
-            # literal is not one either -- both invisible to
+            # `in` is a membership test, not an `ast.Call`, and a dict/tuple
+            # LITERAL is not one either -- both invisible to
             # `find_exec_send_path_violations`, the same shape
             # `_last_evidence_write_ns`'s plain assignment already uses.
+            # Deliberately still a plain positional tuple, NOT
+            # `_PendingPositionLag(...)`/`._replace()` -- either would be an
+            # `ast.Call` this order-lifecycle coroutine may not make
+            # (E0-NOSEND; confirmed by planting one and watching
+            # `test_e0_inert_no_shipped_exec_module_can_reach_the_network`
+            # go red). `_match_position_lag` -- outside the scanned set --
+            # normalises every entry to `_PendingPositionLag` on read, so
+            # the field ORDER below must match that NamedTuple's declared
+            # order exactly: `(fill_ts_event, send_ns, recv_ns,
+            # client_order_id, reads_without_long)`.
             # Never for an exit order (INC-E2 widened this branch to close
             # fills too): only a create-path ENTRY establishes the LONG this
             # record measures confirmation of. A SECOND accept-fill on an

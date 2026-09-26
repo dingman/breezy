@@ -519,6 +519,87 @@ async def test_r7_a_zero_or_negative_fill_ts_event_is_rejected_and_dropped(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("absent_fill_ts_event", [0, -1])
+async def test_r7_ts_event_absent_is_rejected_even_when_a_local_now_fallback_would_pass_skew(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absent_fill_ts_event: int,
+) -> None:
+    """T4 (ISOLATED): the test above shares `_RECV_NS + 5_000_000_000` as its
+    confirming read, which lands `TS_EVENT_SKEW_FUTURE`-rejected too if a
+    regression dropped the `<= 0` guard and fell back to that same local
+    `now_ns` -- the two guards mask each other, and the old test cannot tell
+    which one actually fired (mutation evidence gap, L-33).
+
+    Here the confirming read is chosen at `_RECV_NS + 1`: *inside* the skew
+    window a local-`now_ns` fallback would land in (mutation M-b: drop the
+    `<= 0` guard, substitute `now_ns` for the absent `fill_ts_event`). Under
+    M-b this fixture would pass both skew checks and confirm the read as
+    LONG. Only `TS_EVENT_ABSENT` firing on its own -- independent of skew --
+    keeps it pending-cleared with NO record ever constructed and the
+    instrument NEVER marked long."""
+    from breezy.adapters.polymarket_us.exec import client as client_module
+    from breezy.domain.position_reporting_lag import PositionReportingLag as real_record_cls
+
+    captured: list[Any] = []
+
+    def _capturing(*args: Any, **kwargs: Any) -> Any:
+        record = real_record_cls(*args, **kwargs)
+        captured.append(record)
+        return record
+
+    monkeypatch.setattr(client_module, "PositionReportingLag", _capturing)
+
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    _seed(
+        rig.client,
+        rig.instrument.id,
+        (absent_fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0),
+    )
+
+    confirming_read_ts = _RECV_NS + 1  # inside the fallback's skew window
+
+    rig.client._match_position_lag({slug: build_position(slug)}, confirming_read_ts)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+    assert captured == []
+
+
+def test_r7_the_skew_bound_is_pinned_to_two_seconds() -> None:
+    """T5 (magnitude pin): the plan
+    (`docs/plans/backlog/R-7-IMPL_plan_r1_2026-09-26.md:48`,
+    `_FILL_TS_EVENT_MAX_SKEW_NS: Final[int] = 2 * 1_000_000_000`) fixes the
+    skew bound at exactly 2s. The boundary tests around this one compute
+    their own fixtures FROM the live constant, so they self-adjust if its
+    magnitude ever changes and would keep passing against a materially
+    widened bound (mutation M-c: widen to 100s) -- only a literal pin like
+    this one catches that."""
+    assert _FILL_TS_EVENT_MAX_SKEW_NS == 2_000_000_000
+
+
+@pytest.mark.asyncio
+async def test_r7_a_fill_two_point_five_seconds_before_send_is_rejected_literal(
+    tmp_path: Path,
+) -> None:
+    """T5 (literal boundary): independent of the live constant's magnitude,
+    a fill whose venue `tsEvent` lands 2.5s before `send_ns` -- comfortably
+    past the plan's registered 2s bound -- must be rejected as
+    `TS_EVENT_SKEW_PAST`, even though the read IS long. A bound mutated to
+    100s (M-c) would accept this fixture and confirm it LONG instead."""
+    rig = _build_rig(tmp_path)
+    slug = str(rig.instrument.raw_symbol)
+    fill_ts_event = _SEND_NS - 2_500_000_000
+    _seed(rig.client, rig.instrument.id, (fill_ts_event, _SEND_NS, _RECV_NS, "coid-1", 0))
+
+    rig.client._match_position_lag({slug: build_position(slug)}, _RECV_NS + 5_000_000_000)
+
+    assert rig.client._position_lag_pending == {}
+    assert rig.client._position_lag_last_long == frozenset()
+
+
+@pytest.mark.asyncio
 async def test_r7_exactly_the_past_skew_bound_is_accepted(tmp_path: Path) -> None:
     """T5: `fill_ts_event == send_ns - bound` is the boundary -- accepted."""
     rig = _build_rig(tmp_path)
