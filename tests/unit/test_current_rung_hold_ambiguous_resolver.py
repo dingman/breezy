@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
@@ -856,7 +857,46 @@ async def test_a_load_hit_after_the_retry_interval_retires_the_intent(
             else None
         )
 
-        await _run_resolver_passes(client, count=1)
+        # `_run_resolver_passes` bounds its wait to a FIXED count of
+        # zero-delay `asyncio.sleep(0)` yields -- correct for every OTHER
+        # pass in this test file, which never actually leaves the event
+        # loop, but WRONG here: the retry gate now passes, so THIS pass
+        # calls the loader via `self._loop.run_in_executor(...)` -- a real
+        # hop to an OS thread whose completion is posted back via
+        # `call_soon_threadsafe` from a different thread and races the
+        # fixed yield budget. Confirmed by direct instrumentation: the gate
+        # evaluates correctly every time (elapsed >= the interval, since
+        # real wall-clock time only moves forward from the backdate call),
+        # but intermittently the resolver task was still suspended on that
+        # executor Future -- never having reached
+        # `self._cache.add_instrument(instrument)` -- when
+        # `_run_resolver_passes` cancelled it after its fixed budget ran
+        # out. A pure yield-count bound (even a large one) is still a CPU
+        # proxy for wall time, not wall time itself, and can be exhausted in
+        # a few milliseconds regardless of count -- too short if the host is
+        # under memory pressure and the executor thread hop is slow. Poll
+        # for the actual observable outcome against a real wall-clock
+        # deadline instead: deterministic because it terminates on the real
+        # condition, and still bounded so a genuine regression fails loudly
+        # rather than hanging.
+        client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+        resolver_task = asyncio.get_event_loop().create_task(
+            client._resolve_ambiguous_intents(),
+        )
+        try:
+            deadline = time.monotonic() + 10.0
+            while True:
+                refreshed = client._latch.current()
+                if refreshed is not None and refreshed.state is SubmitIntentState.RETIRED:
+                    break
+                if time.monotonic() >= deadline:
+                    pytest.fail(
+                        "the load-hit pass never retired the intent within the poll budget",
+                    )
+                await asyncio.sleep(0.005)
+        finally:
+            resolver_task.cancel()
+            await asyncio.gather(resolver_task, return_exceptions=True)
 
         assert client._cache.instrument(stale_instrument.id) is stale_instrument
         refreshed = client._latch.current()
