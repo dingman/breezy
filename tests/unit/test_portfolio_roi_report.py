@@ -1325,6 +1325,125 @@ class TestProxyLagClassification:
         assert cumulative == Decimal("0.00")
 
 
+class TestProxyLagRequiresSufficientPayoutCapacity:
+    """FU-13: a calendar-day overlap with a lag-eligible payout (§6 D4 R3)
+    is necessary but NOT sufficient for UNEXPLAINED_PROXY_LAG -- the summed
+    payout of every lag-eligible event overlapping the window must also be
+    able to cover the window's own |unexplained| within its per-day
+    tolerance. Otherwise a large, genuinely-unexplained capital flow that
+    merely shares a day with an unrelated few-dollar residual settlement is
+    silently relabelled away from UNEXPLAINED_CAPITAL_FLOW -- the live
+    2026-09-13 case: ~$40 unexplained relabelled PROXY_LAG by a ~$1 residual
+    (CFJ485874TMM)."""
+
+    def test_a_large_unexplained_flow_overlapping_a_small_residual_stays_capital_flow(
+        self,
+    ) -> None:
+        settlement = ResidualSettlement(
+            trial_id="fam/trial/LAX/2026-09-12",
+            climate_day="2026-09-12",
+            payout=Decimal("1.00"),
+            dated_at_ns=_ns_of_day("2026-09-12"),
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("0.30"),
+        )
+        daily_balances = {
+            "2026-09-11": Decimal("100.00"),
+            "2026-09-12": Decimal("101.00"),  # the $1 residual settling cleanly
+            "2026-09-13": Decimal("141.00"),  # a genuinely unexplained +$40
+        }
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=[settlement],
+        )
+        row = {r.day: r for r in rows}["2026-09-13"]
+
+        assert row.unexplained == Decimal("40.00")
+        assert row.breaches_tolerance is True
+        assert row.settlement_lag_days is not None  # the date overlap IS present
+        assert row.classification == UNEXPLAINED_CAPITAL_FLOW_LABEL
+
+    def test_a_residual_settlement_that_can_cover_the_unexplained_amount_stays_proxy_lag(
+        self,
+    ) -> None:
+        """Existing behaviour preserved: when the overlapping payout CAN
+        explain the breach, PROXY_LAG still applies (companion to
+        ``TestProxyLagClassification.
+        test_a_breach_explained_entirely_by_proxy_lag_is_classified_not_netted``,
+        which covers the ``ScoredTrial`` path; this covers the
+        ``ResidualSettlement`` path the fix also touches)."""
+        settlement = ResidualSettlement(
+            trial_id="fam/trial/LAX/2026-09-12",
+            climate_day="2026-09-12",
+            payout=Decimal("40.00"),
+            dated_at_ns=_ns_of_day("2026-09-12"),
+            settlement_basis="nws_final",
+            realised_pnl=Decimal("39.30"),
+        )
+        daily_balances = {
+            "2026-09-11": Decimal("100.00"),
+            "2026-09-12": Decimal("140.00"),
+            "2026-09-13": Decimal("180.00"),  # +$40, fully coverable by the $40 residual
+        }
+
+        rows = reconcile_daily(
+            fills=[],
+            scored_trials=[],
+            daily_balances=daily_balances,
+            residual_settlements=[settlement],
+        )
+        row = {r.day: r for r in rows}["2026-09-13"]
+
+        assert row.unexplained == Decimal("40.00")
+        assert row.breaches_tolerance is True
+        assert row.classification == UNEXPLAINED_PROXY_LAG_LABEL
+
+    def test_boundary_at_capacity_plus_tolerance(self) -> None:
+        """capacity + tolerance == |unexplained| still counts as covered;
+        one cent short of that flips the classification."""
+
+        def _row_for(*, payout: Decimal) -> Any:
+            settlement = ResidualSettlement(
+                trial_id="fam/trial/LAX/2026-09-12",
+                climate_day="2026-09-12",
+                payout=payout,
+                dated_at_ns=_ns_of_day("2026-09-12"),
+                settlement_basis="nws_final",
+                realised_pnl=payout,
+            )
+            fill = _fill(
+                venue_order_id="vo-boundary",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.40"),
+                cumulative_fee=Decimal("0.01"),
+            )
+            daily_balances = {
+                "2026-09-11": Decimal("100.00"),
+                "2026-09-12": Decimal("100.00"),
+                # +$40.00 anomaly, net of the $0.41 the BUY fill spends.
+                "2026-09-13": Decimal("100.00") - Decimal("0.41") + Decimal("40.00"),
+            }
+            rows = reconcile_daily(
+                fills=[fill],
+                scored_trials=[],
+                daily_balances=daily_balances,
+                residual_settlements=[settlement],
+            )
+            return {r.day: r for r in rows}["2026-09-13"]
+
+        covered = _row_for(payout=Decimal("39.99"))  # == unexplained(40.00) - tolerance(0.01)
+        assert covered.unexplained == Decimal("40.00")
+        assert covered.tolerance == Decimal("0.01")
+        assert covered.classification == UNEXPLAINED_PROXY_LAG_LABEL
+
+        short = _row_for(payout=Decimal("39.98"))  # one cent short of covering
+        assert short.unexplained == Decimal("40.00")
+        assert short.classification == UNEXPLAINED_CAPITAL_FLOW_LABEL
+
+
 class TestSettledThroughCutoff:
     def test_a_small_lag_sample_uses_max_not_p99_and_says_so_in_the_header(self) -> None:
         """§6 D4 R5/R6: 'below n = 20 [p99] is an extrapolation ... With

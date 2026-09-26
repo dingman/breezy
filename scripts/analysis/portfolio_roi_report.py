@@ -1504,6 +1504,56 @@ def _balance_windows(daily_balances: Mapping[str, Decimal | None]) -> tuple[_Bal
     return tuple(windows)
 
 
+def _proxy_lag_capacity_for_window(
+    *,
+    span_days: frozenset[str],
+    scored_trials: Sequence[ScoredTrial],
+    residual_settlements: Sequence[ResidualSettlement],
+    residual_pending: Sequence[ResidualPending],
+    report_bound_day: str | None,
+) -> Decimal | None:
+    """FU-13: the most this window's lag-eligible events could plausibly
+    have paid out -- gates :data:`UNEXPLAINED_PROXY_LAG_LABEL` against the
+    window's own ``|unexplained|`` so a bare calendar-day overlap (§6 D4 R3)
+    is never sufficient by itself when the overlapping event is far too
+    small to explain the breach (the live 2026-09-13 case: a ~$40 breach
+    sharing a day with a ~$1 residual settlement, CFJ485874TMM).
+
+    Returns ``None`` for "unbounded" -- a still-:class:`ResidualPending`
+    event overlaps, whose eventual payout this reader has no field for yet
+    (it has not settled: no ``qty``/payout is carried on that type), so it
+    can never be ruled OUT as the explanation. This preserves the
+    pre-existing, still-tested behaviour that an unresolved pending residual
+    always reclassifies its window.
+
+    "Maximum possible payout" for a bounded event is its OWN already-settled
+    cash value -- never a bound over an unknown outcome, because both
+    sources here are already scored/settled:
+
+    - a lag-eligible :class:`ScoredTrial`: ``abs(settlement_payout(trial))``.
+    - a :class:`ResidualSettlement`: ``abs(settlement.payout)``.
+    """
+    capacity = Decimal(0)
+    for trial in scored_trials:
+        lag = settlement_lag_days(trial)
+        is_proxy_lag = lag > 1 or trial.settlement_basis == "venue_last_fair_price_fallback"
+        if not is_proxy_lag:
+            continue
+        if trial.climate_day in span_days or proceeds_date(trial) in span_days:
+            capacity += abs(settlement_payout(trial))
+    for settlement in residual_settlements:
+        release_day = _utc_day_of_ns(settlement.dated_at_ns)
+        if release_day in span_days or _shift_iso_day(release_day, 1) in span_days:
+            capacity += abs(settlement.payout)
+    for pending in residual_pending:
+        end_day = pending.release_day
+        if report_bound_day is not None and report_bound_day > end_day:
+            end_day = report_bound_day
+        if set(_days_between_inclusive(pending.release_day, end_day)) & span_days:
+            return None
+    return capacity
+
+
 def reconcile_daily(
     *,
     fills: Sequence[DurableFillRecord],
@@ -1549,11 +1599,13 @@ def reconcile_daily(
         release_day = _utc_day_of_ns(settlement.dated_at_ns)
         for day in (release_day, _shift_iso_day(release_day, 1)):
             proxy_lag_days[day] = max(proxy_lag_days.get(day, 0), _RESIDUAL_PROXY_LAG_DAYS)
+    # "Through today": bounded by the latest day this call's own
+    # `daily_balances` covers (in a real run, the report's `period_end`) --
+    # never unbounded, and never requiring a separate `now_ns` input. Also
+    # feeds `_proxy_lag_capacity_for_window` below, regardless of whether
+    # any `residual_pending` exists.
+    report_bound_day = max(daily_balances) if daily_balances else None
     if residual_pending:
-        # "Through today": bounded by the latest day this call's own
-        # `daily_balances` covers (in a real run, the report's `period_end`)
-        # -- never unbounded, and never requiring a separate `now_ns` input.
-        report_bound_day = max(daily_balances) if daily_balances else None
         for pending in residual_pending:
             end_day = pending.release_day
             if report_bound_day is not None and report_bound_day > end_day:
@@ -1587,7 +1639,20 @@ def reconcile_daily(
         if not breaches:
             classification = UNEXPLAINED_OK_LABEL
         elif lag is not None:
-            classification = UNEXPLAINED_PROXY_LAG_LABEL
+            capacity = _proxy_lag_capacity_for_window(
+                span_days=frozenset(span_days),
+                scored_trials=scored_trials,
+                residual_settlements=residual_settlements,
+                residual_pending=residual_pending,
+                report_bound_day=report_bound_day,
+            )
+            # `None` = unbounded (an unresolved `ResidualPending` overlaps).
+            # Otherwise the overlap must plausibly be ABLE to explain the
+            # breach, not just share a calendar day with it (FU-13).
+            if capacity is None or capacity >= abs(unexplained) - tolerance:
+                classification = UNEXPLAINED_PROXY_LAG_LABEL
+            else:
+                classification = UNEXPLAINED_CAPITAL_FLOW_LABEL
         else:
             classification = UNEXPLAINED_CAPITAL_FLOW_LABEL
         proceeds_date_proxy = PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
