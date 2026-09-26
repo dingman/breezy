@@ -34,6 +34,19 @@ UMask=0077
 # only). Never breezy-trade.env, polymarket.env, or operator.env. The `-`
 # prefix keeps the unit startable when the file is absent (log-only sink).
 EnvironmentFile=-%h/.config/breezy/alerts.env
+
+# FU-6: this state-db path is a single non-secret filesystem path literal,
+# byte-identical to the same line in breezy-exit-window-study.service /
+# breezy-score-live-trials.service / breezy-live-tally.service (I3
+# BLOCK-1.1/BLOCK-1.3) -- never a venue credential. Without it,
+# `decision-funnel-digest-run.sh` has no way to supply `--store-path` to
+# the digest, and `halt_enforced` silently resolves `unknown` on every run
+# (`_resolve_halt_status`'s `ExecStateDbNotConfiguredError` fallback) --
+# the exact gap this line closes. The digest opens this path READ-ONLY
+# (`file:<path>?mode=ro`, see `read_family_halt_status`'s own docstring)
+# and never writes to it.
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
 ExecStart=/home/jon/breezy/deploy/systemd/decision-funnel-digest-run.sh
 
 TimeoutStartSec=180

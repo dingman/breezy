@@ -34,6 +34,16 @@ _DIGEST = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _DIGEST
 _SPEC.loader.exec_module(_DIGEST)
 
+# FU-6: the deploy wrapper + unit, checked by static text -- not imported,
+# never executed by this test file (no sqlite/systemd fixture needed).
+_DEPLOY_DIR = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
+_RUN_SCRIPT = _DEPLOY_DIR / "decision-funnel-digest-run.sh"
+_SERVICE_UNIT = _DEPLOY_DIR / "breezy-decision-funnel-digest.service"
+#: The measured, real production exec state-DB path -- byte-identical to the
+#: same literal in breezy-exit-window-study.service / breezy-live-tally.service
+#: / breezy-score-live-trials.service (I3 BLOCK-1.1/BLOCK-1.3), never invented.
+_LIVE_STATE_DB_ENV_LITERAL = "/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite"
+
 
 def _row(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
@@ -564,6 +574,41 @@ def test_main_reports_halt_enforced_yes_from_a_real_store(
     artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
     assert artefact["halt_enforced"] == "yes"
     assert artefact["halt_reason"] is None
+
+
+def test_digest_run_script_supplies_the_exec_store_path() -> None:
+    """FU-6: the deployed run script and unit actually wire up
+    ``halt_enforced`` -- without both of these, ``_resolve_halt_status``'s
+    ``ExecStateDbNotConfiguredError`` fallback (asserted above) is not a
+    fixture-only edge case: it is what EVERY real nightly run hits, since
+    ``decision-funnel-digest-run.sh`` invoked ``decision_funnel_daily_digest.py``
+    with no ``--store-path`` and the unit's only ``EnvironmentFile=``
+    (alerts.env) never carries ``POLYMARKET_US_EXEC_STATE_DB``.
+
+    Pins three things, by static text (no sqlite/systemd fixture needed):
+    (1) the unit supplies the SAME non-secret path literal its sibling
+    analysis units already carry (``Environment=``, never an
+    ``EnvironmentFile=`` -- this unit's own comment forbids loading
+    ``breezy-trade.env``/``polymarket.env``/``operator.env``); (2) the run
+    script requires ``POLYMARKET_US_EXEC_STATE_DB`` to be set (fails loud,
+    never silently proceeds without it); (3) the run script passes it
+    through to the digest as ``--store-path``.
+    """
+    unit_text = _SERVICE_UNIT.read_text(encoding="utf-8")
+    assert (
+        f"Environment=POLYMARKET_US_EXEC_STATE_DB={_LIVE_STATE_DB_ENV_LITERAL}" in unit_text
+    ), "breezy-decision-funnel-digest.service does not export POLYMARKET_US_EXEC_STATE_DB"
+
+    script_text = _RUN_SCRIPT.read_text(encoding="utf-8")
+    assert "POLYMARKET_US_EXEC_STATE_DB" in script_text, (
+        "decision-funnel-digest-run.sh never references POLYMARKET_US_EXEC_STATE_DB"
+    )
+    assert "--store-path" in script_text, (
+        "decision-funnel-digest-run.sh never passes --store-path to the digest"
+    )
+    # The var must actually gate the run (fail loud, never silently absent) --
+    # the same `${VAR:?...}` idiom the sibling wrappers use.
+    assert "POLYMARKET_US_EXEC_STATE_DB:?" in script_text
 
 
 # ---------------------------------------------------------------------------
