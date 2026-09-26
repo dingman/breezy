@@ -3967,3 +3967,118 @@ class TestResidualPnlAndD9:
         assert Decimal(report["roi"]) == roi(
             total_realised_pnl=Decimal("0.30"), total_capital_deployed=Decimal("0.70")
         )
+
+    def test_run_a_trial_both_scored_and_residual_pays_once_through_real_writers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """L-42, `_run`-level regression (kills R7): a `trial_id` with BOTH a
+        real scored-trial-store row (`write_scored_trials`) AND a real
+        `excluded_fills.jsonl` row (`score_live_trials._append_excluded_fills`)
+        must be paid ONCE, by the scored row -- never twice. `_run`'s own
+        `residual_trial_ids=frozenset(residual_ids - scored_ids)` narrowing
+        (portfolio_roi_report.py:~3443) is what removes this trial_id from
+        the residual-resolution set; the two existing "pays once" tests only
+        exercise `_resolve_residual_settlements` directly and never touch
+        `_run`'s own narrowing line, so dropping `- scored_ids` there still
+        passed all 131 tests before this one existed."""
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir, family_id="fam_both", trial_id_prefix="fam_both/trial/"
+        )
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(
+                venue_order_id="vo-both",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.40"),
+                cumulative_fee=Decimal("0.03"),
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-both", fill.to_bytes())
+        finally:
+            store.close()
+
+        trial_id = "fam_both/trial/LAX/2026-09-13"
+
+        # The stub `read_filled_trials_state_db` -- gives `_run`'s residual
+        # path (which the mutant would wrongly enter) a real `FilledTrial`
+        # and station mapping to resolve against, exactly like the
+        # narrowed-away case above.
+        raw_trial = _residual_trial(trial_id=trial_id)
+        reader = _stub_reader({("fam_both/trial/", "LAX"): ((raw_trial,), {})})
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        release_ns = _ns_of_day("2026-09-14")
+        monkeypatch.setattr(
+            _prr,
+            "_with_scheduled_release_at_ns",
+            lambda trial, *, venue, city: dataclasses.replace(
+                trial, scheduled_release_at_ns=release_ns
+            ),
+        )
+
+        scored_trials_dir = tmp_path / "scored_trials"
+
+        # The real scored-trial-store writer -- makes the trial_id SCORED.
+        write_scored_trials(
+            scored_trials_dir / "fam_both",
+            [
+                _scored_trial(
+                    trial_id=trial_id,
+                    pnl=Decimal("0.57"),
+                    climate_day="2026-09-13",
+                )
+            ],
+            now_ns=_ns_of_day("2026-09-13"),
+        )
+
+        # The real excluded_fills.jsonl writer -- makes the SAME trial_id
+        # RESIDUAL too.
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam_both",
+            [
+                score_live_trials.FillExclusion(
+                    trial_id=trial_id,
+                    station="LAX",
+                    climate_day="2026-09-13",
+                    qty="1",
+                    reason="fee_unverified",
+                    detail="test fixture",
+                    venue_order_id="vo-both",
+                    filled_at_ns=_ns_of_day("2026-09-13"),
+                )
+            ],
+            scored_run_utc="2026-09-13T00:00:00Z",
+        )
+
+        # A settlement-grade NWS FINAL for the trial's station-day -- so
+        # that IF the mutant's un-narrowed residual set reached
+        # `_resolve_residual_settlements`, it would resolve (and double-pay)
+        # rather than merely going unresolved.
+        catalog_base = tmp_path / "catalog"
+        catalog = open_station_catalog(catalog_base, "polymarket_us", "LAX")
+        write_records(catalog, [_residual_record(climate_day="2026-09-13", tmax_f=93)])
+
+        now_ns = _ns_of_day("2026-09-25")
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=tmp_path / "logs",
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=now_ns,
+            sink=_prr.resolve_alert_sink({}),
+            catalog_base=catalog_base,
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-25.json").read_text()
+        )
+        assert report["n_residual_settlements"] == 0
+        assert report["realised_pnl_residual_total"] == "0"
+        assert report["realised_pnl_portfolio_total"] == "0.57"
+        assert Decimal(report["roi"]) == roi(
+            total_realised_pnl=Decimal("0.57"), total_capital_deployed=Decimal("0.43")
+        )
