@@ -72,6 +72,7 @@ credential and no ``user_agent_contact``.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 from nautilus_trader.common.enums import ComponentState
@@ -80,9 +81,10 @@ from nautilus_trader.common.messages import ComponentStateChanged
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    import asyncio
     from collections.abc import Callable, Mapping, Sequence
 
-    from nautilus_trader.common.component import MessageBus
+    from nautilus_trader.common.component import Clock, MessageBus, TimeEvent
 
     from breezy.runtime.health import AlertSink
 
@@ -163,8 +165,11 @@ def install_stale_intent_alert(
     ``install_component_degraded_alert`` subscribes -- exactly the "secondary
     path" idiom ``current_rung_hold.composition.
     install_current_rung_hold_refusal_watch`` already uses to re-check a
-    non-event-driven surface on every state change in the run, rather than
-    adding a second timer.
+    non-event-driven surface on every state change in the run. FU-8b adds a
+    SECOND trigger, :func:`install_refusal_repoll_timer`, a native
+    ``LiveClock`` timer that calls the SAME handler this function returns on
+    a fixed interval -- so a latch appearing between state changes is still
+    alerted. Both triggers share this closure's own dedupe set unchanged.
 
     Parameters
     ----------
@@ -271,14 +276,19 @@ def install_reconciliation_refusal_alert(
     """Emit one WARN alert per NEW latched durable-reconciliation refusal.
 
     Rides the SAME ``COMPONENT_STATE_TOPIC`` heartbeat as
-    :func:`install_stale_intent_alert` -- no timer. The poll is guaranteed to
-    run after the startup reconciliation: ``NautilusKernel.start_async``
-    awaits the reconciliation (``system/kernel.py:1027-1029``) and only then
-    starts the ``OrderEmulator`` (``:1033``) and the trader (``:1039``), each
-    of which publishes a ``ComponentStateChanged`` on ``events.system.*``.
-    The shipped ``LiveExecEngineConfig`` enables no periodic reconciliation
+    :func:`install_stale_intent_alert`. The poll is guaranteed to run after
+    the startup reconciliation: ``NautilusKernel.start_async`` awaits the
+    reconciliation (``system/kernel.py:1027-1029``) and only then starts the
+    ``OrderEmulator`` (``:1033``) and the trader (``:1039``), each of which
+    publishes a ``ComponentStateChanged`` on ``events.system.*``. The shipped
+    ``LiveExecEngineConfig`` enables no periodic reconciliation
     (``open_check_interval_secs``/``position_check_interval_secs`` stay
-    ``None``), and any later state change re-polls regardless.
+    ``None``), and any later state change re-polls regardless. FU-8b adds a
+    SECOND trigger, :func:`install_refusal_repoll_timer`, a native
+    ``LiveClock`` timer that calls the SAME handler this function returns on
+    a fixed interval, so a latch added at runtime is alerted without waiting
+    for an unrelated component's state change. Both triggers share this
+    closure's own dedupe set unchanged.
 
     Dedupe is by ``(latch, subject)`` -- the client latches each once per
     process -- but only the fixed-enum ``detail`` is sent.
@@ -317,6 +327,171 @@ def install_reconciliation_refusal_alert(
 
     msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
     return _on_component_state
+
+
+#: FU-8b: the ``Clock.set_timer`` name this module's re-poll timer is armed
+#: under. A single, fixed name -- one timer, never a per-caller name -- so a
+#: duplicate ``install_refusal_repoll_timer`` call on the SAME clock fails
+#: loudly at install time (``Condition.not_in``, a ``KeyError``) rather than
+#: silently doubling the poll rate.
+REFUSAL_REPOLL_TIMER_NAME: Final[str] = "breezy-refusal-repoll"
+
+#: 60 seconds. The stale-intent threshold this re-poll shortens is 15 minutes
+#: (``exec/client.py:569``), so this adds at most 6.7% latency to that
+#: signal; the surfaces it reads change at most once per resolver pass (5 s,
+#: ``exec/client.py:551``); and minute granularity is what an operator reads
+#: a log timestamp at. The cost -- two small tuple copies and a handful of
+#: set lookups per minute -- is negligible.
+REFUSAL_REPOLL_INTERVAL: Final[timedelta] = timedelta(seconds=60)
+
+#: 60 ticks of the 60 s :data:`REFUSAL_REPOLL_INTERVAL` -- hourly. A low-rate
+#: positive liveness signal, distinct from the one-time "armed" INFO line:
+#: without it an operator reading the log cannot tell a dead timer (Rust/tokio
+#: thread wedged, or silently uninstalled) from a quiet interval with nothing
+#: to alert on. Emitted from ``_poll`` -- the loop-thread function, never
+#: ``_on_timer`` -- so the signal only fires once the ``call_soon_threadsafe``
+#: hop actually lands, which is the same liveness the alert handlers depend
+#: on. Not per-tick: a 60 s INFO line would drown the log for no operator
+#: benefit.
+REFUSAL_REPOLL_HEARTBEAT_TICKS: Final[int] = 60
+
+
+def install_refusal_repoll_timer(
+    clock: Clock,
+    *,
+    loop: asyncio.AbstractEventLoop,
+    handlers: Sequence[Callable[[object], None]],
+    interval: timedelta = REFUSAL_REPOLL_INTERVAL,
+) -> Callable[[], None]:
+    """Arm a native ``Clock`` timer that re-polls ``handlers`` on an interval.
+
+    FU-8b. :func:`install_reconciliation_refusal_alert` and
+    :func:`install_stale_intent_alert` alert only when SOMETHING ELSE
+    publishes a ``ComponentStateChanged`` -- a runtime latch (for example
+    ``RESOLVER_FILL_NOT_BOOKED``) or a newly-stale intent between two state
+    changes stays unalerted until an unrelated component happens to
+    transition. This function is the second trigger: it calls the SAME
+    handler closures those two installers already return, on a fixed
+    interval, sharing their existing dedupe sets unchanged. No synthetic
+    ``ComponentStateChanged`` is ever published.
+
+    Thread model (measured, ``tests/contract/test_live_timer_thread_
+    affinity.py``): a ``LiveClock`` timer callback runs on a Rust/tokio
+    thread, never the asyncio loop thread, and a raise inside it is silently
+    discarded by the pyo3 wrapper. So ``_on_timer`` -- the callback armed
+    directly on ``clock`` -- does almost nothing itself: wrapped in
+    ``try/except BaseException``, it checks whether ``loop`` is already
+    closed (a fire racing ``dispose()``) and, if not, hops to the loop thread
+    via ``loop.call_soon_threadsafe``. Any failure to schedule -- including
+    the closed-loop race between the check and the call -- is logged at
+    ERROR with the exception TYPE only, mirroring ``health.emit_alert``'s own
+    discipline. "At most one ERROR" holds only for the loop-CLOSING race:
+    once ``loop.is_closed()`` answers ``True``, every later tick returns
+    before scheduling anything, so that failure mode logs once. A
+    PERSISTENT, non-closing ``call_soon_threadsafe`` failure (the loop stays
+    open but scheduling keeps raising for some other reason) is not
+    contained the same way and re-logs one ERROR every interval for as long
+    as the failure persists -- still bounded to one per tick, but loud.
+
+    ``_poll`` -- the function handed to the loop -- runs each handler inside
+    its OWN ``try/except Exception``, so one raising handler is logged (named,
+    so an operator can tell which of ``handlers`` failed) and neither blocks
+    its sibling in the same tick nor any later tick. Every
+    :data:`REFUSAL_REPOLL_HEARTBEAT_TICKS` th tick, after the handlers run,
+    ``_poll`` also emits one low-rate INFO heartbeat so a dead timer is
+    distinguishable from a quiet interval.
+
+    Parameters
+    ----------
+    clock
+        A LIVE node's ``node.kernel.clock``, after ``build()``.
+    loop
+        The SAME node's ``node.kernel.loop`` -- the asyncio loop the msgbus
+        trigger's handlers already run on, so both triggers stay mutually
+        serial with no lock needed on the shared dedupe sets.
+    handlers
+        The handler closures :func:`install_reconciliation_refusal_alert`
+        and :func:`install_stale_intent_alert` already returned. Called in
+        the given order on every fire.
+    interval
+        Defaults to :data:`REFUSAL_REPOLL_INTERVAL`. Overridable only for
+        tests (the contract test injects 50 ms).
+
+    Returns
+    -------
+    ``cancel``: an idempotent callable that removes the timer if it is still
+    armed. Safe to call more than once, and safe to call after the clock
+    already removed it (a live kernel's own ``_cancel_timers`` on stop).
+
+    Notes
+    -----
+    A duplicate call on the SAME clock is NOT contained -- ``clock.set_timer``
+    raises ``KeyError`` (``Condition.not_in``) synchronously, at install
+    time, never inside a callback -- so a caller arming this twice by mistake
+    fails loudly rather than doubling the poll rate.
+    """
+
+    tick_count = 0
+
+    def _poll(event: object) -> None:
+        nonlocal tick_count
+        for index, handler in enumerate(handlers):
+            try:
+                handler(event)
+            # Broad, deliberately: one broken handler must not block its
+            # sibling in this tick, or any later tick (CONTAINMENT, module
+            # docstring).
+            except Exception:
+                handler_name = (
+                    getattr(handler, "__qualname__", None)
+                    or getattr(handler, "__name__", None)
+                    or f"handlers[{index}]"
+                )
+                logger.exception("refusal re-poll handler failed handler=%s", handler_name)
+
+        tick_count += 1
+        if tick_count % REFUSAL_REPOLL_HEARTBEAT_TICKS == 0:
+            logger.info(
+                "refusal re-poll alive name=%s ticks=%d",
+                REFUSAL_REPOLL_TIMER_NAME,
+                tick_count,
+            )
+
+    def _on_timer(event: TimeEvent) -> None:
+        try:
+            if loop.is_closed():
+                return
+            loop.call_soon_threadsafe(_poll, event)
+        # BaseException, deliberately: this callback runs on a foreign
+        # (Rust/tokio) thread where a raise is silently discarded (L-16), so
+        # nothing may escape it, for any reason.
+        except BaseException as exc:  # noqa: BLE001
+            logger.error(
+                "failed to schedule refusal re-poll exception_type=%s",
+                type(exc).__name__,
+            )
+
+    clock.set_timer(
+        name=REFUSAL_REPOLL_TIMER_NAME,
+        interval=interval,
+        callback=_on_timer,
+        fire_immediately=False,
+    )
+    logger.info(
+        "refusal re-poll timer armed name=%s interval_s=%s",
+        REFUSAL_REPOLL_TIMER_NAME,
+        int(interval.total_seconds()),
+    )
+
+    def cancel() -> None:
+        if REFUSAL_REPOLL_TIMER_NAME not in clock.timer_names:
+            return
+        try:
+            clock.cancel_timer(REFUSAL_REPOLL_TIMER_NAME)
+        except (KeyError, ValueError):
+            logger.debug("refusal re-poll timer already cancelled")
+
+    return cancel
 
 
 def install_component_degraded_alert(

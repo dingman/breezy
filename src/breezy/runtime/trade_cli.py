@@ -103,6 +103,7 @@ from breezy.runtime.backtest_order_guard import install_live_order_guard
 from breezy.runtime.component_health_watch import (
     install_component_degraded_alert,
     install_reconciliation_refusal_alert,
+    install_refusal_repoll_timer,
     install_stale_intent_alert,
 )
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
@@ -267,6 +268,10 @@ class Node(Protocol):
     conformance check for `TradingNode` in a way a real stub would not --
     the SAME reason :func:`install_order_guard` leaves ``engine.kernel``
     untyped for a ``BacktestEngine``.
+
+    FU-8b reads one more attribute off that same untyped slice:
+    ``kernel.loop``, the asyncio loop the refusal re-poll timer's callback
+    hops to via ``call_soon_threadsafe``.
     """
 
     kernel: Any
@@ -543,9 +548,23 @@ def _run_node(
     pre-WP-B2 one. This is DEFENCE IN DEPTH: ``adapters.polymarket_us.safety.
     assert_live_order_submission_permitted`` stays the authoritative expiry
     check at venue egress.
+
+    FU-8b arms :func:`~breezy.runtime.component_health_watch.
+    install_refusal_repoll_timer` on ``node.kernel.clock`` immediately after
+    the stale-intent and reconciliation-refusal watches are installed --
+    after ``assembled = True``, so a node that never finishes ``build()``
+    never arms a timer either. The timer's callback runs on a foreign
+    (Rust/tokio) thread and hops to ``node.kernel.loop`` before calling
+    either handler, so both triggers stay mutually serial on the loop
+    thread. Arming failure is caught and reported through ``_report`` alone
+    (informational delivery, never a control: FU-8 r2.1) and never blocks
+    boot. The returned ``cancel`` is called in ``finally``, BEFORE
+    ``node.dispose()``, so the timer never outlives the loop it hops to --
+    idempotently alongside the kernel's own ``_cancel_timers`` on stop.
     """
     node: Node | None = None
     assembled = False
+    cancel_repoll: Callable[[], None] | None = None
     try:
         node = node_factory(config)
         node.add_data_client_factory(
@@ -573,14 +592,25 @@ def _run_node(
             component_id=POLYMARKET_US_CLIENT_NAME,
             reasons=_exec_client_refusal_reader(node),
         )
-        install_stale_intent_alert(
+        stale_h = install_stale_intent_alert(
             node.kernel.msgbus,
             stale_alerts=_exec_client_stale_intent_reader(node),
         )
-        install_reconciliation_refusal_alert(
+        recon_h = install_reconciliation_refusal_alert(
             node.kernel.msgbus,
             refusals=_exec_client_reconciliation_refusal_reader(node),
         )
+        try:
+            cancel_repoll = install_refusal_repoll_timer(
+                node.kernel.clock,
+                loop=node.kernel.loop,
+                handlers=(recon_h, stale_h),
+            )
+        # Broad, deliberately: an informational re-poll timer must never
+        # block boot (FU-8 r2.1 ruling; AC9). The state-change path above is
+        # already wired and stays unaffected.
+        except Exception as exc:  # noqa: BLE001
+            _report(stderr, "refusal re-poll timer NOT armed", exc, expected=False)
         install_account_presence_halt(
             node.kernel.msgbus,
             node.kernel.cache,
@@ -592,7 +622,8 @@ def _run_node(
         node.run()
         # A reconciliation failure does not raise. When ``run()`` returns
         # with the trader never started, say so. The exit code below is
-        # unchanged either way. One read of public trader state; no timer.
+        # unchanged either way. One read of public trader state (the FU-8b
+        # re-poll timer is separate and is cancelled in ``finally``).
         _emit_boot_halt_alert(node, stop_intent_store_path)
         return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
@@ -612,6 +643,13 @@ def _run_node(
         return EXIT_RUNTIME_ERROR
     finally:
         if node is not None:
+            if cancel_repoll is not None:
+                try:
+                    cancel_repoll()
+                except Exception as exc:  # noqa: BLE001 - must not block dispose
+                    _report(
+                        stderr, "error cancelling the refusal re-poll timer", exc, expected=False
+                    )
             try:
                 node.dispose()
             except Exception as exc:  # noqa: BLE001  # pragma: no cover - defensive
