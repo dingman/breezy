@@ -86,3 +86,69 @@ systemd-run --user --wait --pipe --collect -p MemoryMax=2G -p MemorySwapMax=0 \
 Scratch paths (not committed): `/tmp/claude-1000/-home-jon-breezy/79dfa8fd-ce2b-4de9-b90f-b4cbd9fbda7e/scratchpad/ing2-stage0/{arm_f3.py,arm_f4.py,f3/,f4/,f3_uncapped.log,f4_2g.log}`.
 
 **Coordinator note (09-26).** The F3 arm was also run UNCAPPED (peak ≈5.87 GB), against a brief that asked for one retry at 4G. The host survived and no service was affected, but the containment rule applies: every future Stage-0/S3 run stays under a `MemoryMax`. The S3 fix direction is (1) chunked record-batch iteration in Breezy's own read path, never `read_all()` on a large one-row-per-message stream, and (2) writer-side row batching. Both need a fresh S3 plan and peer review.
+
+## Phase 0 results (2026-09-26)
+
+Ran per `ING-2_S3_plan_r2_2026-09-26.md` r3 amendment ("Phase 0 → Conditions",
+"Metric", the r3 arm table + row 3a-ii, "Seeding"). Quiet window confirmed
+before the first arm: `breezy-quote-tape-ingest.service` went `inactive` at
+11:25:16Z (it had been mid-backlog-drain since ~10:45Z; waited it out),
+`breezy-studies.slice` showed `Act. Units: 0 / Tasks: 0`, no `pytest` /
+`run_tests_no_egress.sh` process was actually running (matches against those
+strings were stale wait-loop wrapper processes from earlier background Bash
+calls, not real test runs), `free -g` available was 21 GiB. All six
+`systemd-run` units (seeding ×2, arms 0/1/2/3a-i/3a-ii) ran back-to-back
+between 11:25:37Z and 11:28:37Z, one at a time, all inside the deadline
+(14:05Z). No OOM kill on any unit; the failure ladder (L1/L2) was **not
+invoked** because arms 1 and 2 both passed with wide margin.
+
+- **F3 identity.** `instrument_status_1789462839523897147.feather`, size
+  697,670,024 bytes (matches the plan's fixed value exactly; the sibling file
+  in the same instance dir, `instrument_status_1789516801432621471.feather`,
+  is 167,884,336 bytes and was not used).
+  sha256 of the scratch copy: `6dd884c4d13353ca829a33af098fa4961cdf023fee2bf238c6899ad606aa1ac8`.
+- **Repo state at run time.** `git rev-parse HEAD` = `394af0ecac9ed7a7bb9177df542513d02dceb4f6`;
+  `git status -sb` = `## feat/data-capture-and-risk...origin/feat/data-capture-and-risk [ahead 733]` (clean).
+- **Scratchpad root (`P0`).** `/tmp/claude-1000/-home-jon-breezy/79dfa8fd-ce2b-4de9-b90f-b4cbd9fbda7e/scratchpad/ing2-s3-phase0`.
+  Layout matches the plan: `proto/` (`proto_feather_read.py` — verbatim per
+  Arch §1 + the P1 assembly fix; `arm_common.py`, a small helper for the
+  baseline-VmRSS print and the plan's exact `_cgroup_memory_peak()` code),
+  `arms/`, `src/live/c0c77dec-.../`, `seed/`, `cat/`, `logs/`.
+- **PYTHONPATH.** `$P0/proto:/home/jon/breezy/src` for every unit, per r3.
+
+### Seeding (r3 Seeding, fraction 0.9)
+
+| Step | Unit | Result | ΔRSS | wall |
+|---|---|---|---|---|
+| 1. `seed_flat_prefix.py` | `ing2-s3-p0-seed-prefix` | counted 891,170 total messages, wrote first `ceil(0.9×891170)=802053` messages to a new flat IPC stream | baseline 58,708 KB → max 66,124 KB (7,416 KB, trivial) | 13.31s |
+| 2. `seed_catalog.py` | `ing2-s3-p0-seed-cat` | native `_convert_feather_table_to_parquet` into `$P0/seed/cat_prefix90`; layout assertion held: exactly one `*.parquet` at depth 1 under `data/instrument_status/`, no subdirectories, `num_rows == 802053` | baseline 262,960 KB → max 429,340 KB (166,380 KB) | 7.42s |
+
+`$P0/cat/arm3a-ii` was then made as `cp -a $P0/seed/cat_prefix90 $P0/cat/arm3a-ii` (plain copy, not under `systemd-run`, per r3: only the two seeding steps above are the capped units).
+
+### Arm table
+
+| Arm | ΔRSS (pass criterion) | vs 1 GiB line | cgroup `memory.peak` | wall time | OOM | rows written |
+|---|---|---|---|---|---|---|
+| 0 (baseline, `_scan_stream(collect=False)`) | 267,716 − 263,288 = 4,428 KB (≈4.3 MiB) | n/a (floor check only; ≪1 GiB) | 123,744,256 B (≈118 MiB) | 3.66s | no | n/a |
+| 1 (`read_feather_coalesced` alone) | 431,268 − 263,080 = 168,188 KB (≈164.3 MiB, 0.1604 GiB) | **PASS** | 287,666,176 B (≈274.3 MiB) | 8.27s | no | n/a |
+| 2 (arm 1 + native `_convert_feather_table_to_parquet`) | 442,640 − 263,192 = 179,448 KB (≈175.2 MiB, 0.1711 GiB) | **PASS** | 311,238,656 B (≈296.8 MiB) | 8.63s | no | 891,170 (fast-path convert, empty catalog) |
+| 3a-i (unchunked EXTEND, empty catalog) | 1,174,660 − 309,592 = 865,068 KB (≈844.8 MiB, **0.8250 GiB**) | **PASS** (margin ≈179 MiB under the 1,073,741,824 B line) | 1,037,160,448 B (≈989.1 MiB, 0.9659 GiB) | 56.51s | no | 891,170 (all fresh; empty catalog) |
+| 3a-ii (unchunked EXTEND, seeded flat-prefix-90 catalog copy) | 1,632,748 − 309,804 = 1,322,944 KB (≈1292.1 MiB, **1.2618 GiB**) | **FAIL** (exceeds both the 1 GiB general line and the 0.5 GiB 3a-ii line) | 1,497,767,936 B (≈1428.1 MiB, 1.3946 GiB) | 15.99s | no | 89,117 fresh (802,053 of 891,170 dropped as already-landed, matching the ≈0.9M-query / ≈0.1M-write shape r3 predicted) |
+
+No arm hit `cap-pressured` (`memory.peak ≥ 0.95 × 2 GiB` = 2,040,109,465.6 B); the highest peak (arm 3a-ii) was 1.3946 GiB, comfortably under both the cap and the pressure-annotation line.
+
+### Ladder outcome
+
+**Not invoked.** The failure ladder (L1 `COALESCE_ROWS=1024`, L2 `+MALLOC_ARENA_MAX=2`, L3 Option D) applies only to a failing arm 1 or arm 2 (r2 A5 / r3 Phase 0 "Failure ladder"). Both passed cleanly on the first capped run at the default `COALESCE_ROWS=8192`, so no ladder rung was run.
+
+### S3b trigger (T-a / T-b) verdict
+
+- **T-a: FIRED.** Arm 3a-ii ΔRSS = 1.2618 GiB > the 0.5 GiB line for 3a-ii (also > the 1 GiB general line). Arm 3a-i alone passed (0.8250 GiB ≤ 1 GiB), so T-a fires solely on the 3a-ii number — the near-worst-case unfiltered dedupe query over a mostly-landed range is exactly the term r3's tighter 0.5 GiB line was written to catch (RS-3 / `_drop_already_landed_unfiltered`).
+- **T-b: not measured in Phase 0.** T-b is AC-S3-5(b), a post-merge production check on the merged S3a code; it is out of scope for this Phase 0 session.
+- **Conclusion: S3b is triggered by T-a and must be queued as the next ING-2 item** (per r3 Success criteria), independent of T-b. Arm 3b itself was **not run** in this session, as instructed — it is S3b's own gate, run when S3b is built.
+
+### Adaptations
+
+**None required.** Every Nautilus internal the plan named was re-checked against the installed tree (`nautilus_trader/persistence/catalog/parquet.py` in `.venv`) before writing the arm scripts, and every signature matched exactly as documented in the plan: `_read_feather_file(path) -> pa.Table | None`, `_convert_feather_table_to_parquet(feather_table, feather_path, data_cls, used_catalog, use_ts_event_for_ts_init=False)`, `_handle_table_nautilus(table, data_cls, convert_bar_type_to_external=False, use_ts_event_for_ts_init=False)` (staticmethod), `_make_path(data_cls, identifier)`, and `breezy.runtime.quote_tape_salvage.write_fresh_capture_rows(write_target, data_cls, objects) -> int`. `ParquetDataCatalog` imports cleanly from both `nautilus_trader.persistence.catalog` and `nautilus_trader.persistence.catalog.parquet`. `InstrumentStatus` imports from `nautilus_trader.model.data`. The prototype (`proto_feather_read.py`) was written top-level exactly per Arch §1 plus the r1/P1 python fix (`.to_batches()` per coalesced group, final `Table.from_batches(batches, schema=reader.schema)`) and smoke-tested against a synthetic 500-message flat prefix of the real F3 stream before being run against the full file, with no code changes needed afterward.
+
+One process note, not a plan deviation: the quiet-window wait (§ above) needed a `systemctl --user is-active` poll loop rather than a single check, because the ingest unit was genuinely mid-backlog-drain (started ~10:45Z, per `journalctl`) when this session began; it went `inactive` at 11:25:16Z and the six Phase 0 units ran immediately after with no further contention.
