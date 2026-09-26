@@ -903,10 +903,20 @@ def _extend_overlapping_stream(
     with nothing to extend stays ``failed``. Each file's table is EXTENDed in
     bounded row chunks (ING-2 S3b, :func:`_extend_table_chunked`), never
     materialised as one write.
+
+    A file whose source table is non-empty but whose post-transform table
+    comes back empty is a HARD failure here (FU-14 review of e199f07: TRUE
+    PARITY with the fast path's identical guard, ~:1459-1470) -- logged at
+    ``ERROR`` naming the instance, data class, file, and source row count,
+    then raised as a ``ValueError`` once every file has been attempted. The
+    type is therefore never marked converted and is revisited next run;
+    other files' rows landed earlier in THIS call stay written (the ING-2
+    S3b dedupe makes a rerun over the same source idempotent).
     """
     write_target = catalog if target is None else target
     streamed_any = False
     written = 0
+    zero_row_failures: list[tuple[Any, int]] = []
     for feather_file in catalog._list_feather_data_files(
         kind=subdirectory,
         instance_id=instance_id,
@@ -921,23 +931,30 @@ def _extend_overlapping_stream(
         if not chunk_streamed:
             # Only reachable when the post-transform table came back empty
             # despite this file's source table being non-empty (checked
-            # above): mirrors the fast path's loud guard (~:1443-1454).
-            # Not counted toward written/streamed_any -- the fast path's
-            # "counted as failed, never marked converted" outcome for this
-            # file, even though another file in the same instance may still
-            # carry the overall result to CONVERTED.
-            logger.warning(
-                "instance %s: EXTEND of %s file %s saw %d row(s) in the "
-                "source but the post-transform table is empty; skipping "
-                "this file",
+            # above): mirrors the fast path's loud guard (~:1443-1454) --
+            # ERROR, not WARNING, and this file fails the WHOLE type (see
+            # the raise below) rather than being silently skipped toward a
+            # CONVERTED outcome.
+            logger.error(
+                "instance %s: EXTEND of %s file %s failed -- saw %d row(s) "
+                "in the source but the post-transform table is empty; "
+                "refusing a silent zero-row conversion",
                 instance_id,
                 data_cls.__name__,
                 feather_file.path,
                 len(table),
             )
+            zero_row_failures.append((feather_file.path, len(table)))
             continue
         streamed_any = True
         written += chunk_written
+    if zero_row_failures:
+        failed_path, failed_rows = zero_row_failures[0]
+        raise ValueError(
+            f"conversion of {data_cls.__name__} failed: EXTEND file "
+            f"{failed_path} saw {failed_rows} row(s) in the source but the "
+            "post-transform table is empty"
+        )
     if written:
         return CONVERTED
     if streamed_any:
