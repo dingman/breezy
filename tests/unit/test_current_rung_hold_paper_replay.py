@@ -51,6 +51,7 @@ from breezy.persistence.family_manifest import (
     UnregisteredFamilyManifestError,
     load_family_manifest,
 )
+from breezy.persistence.scored_trial_store import read_scored_trials
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import SettlementInvariantError, backtest
 from breezy.runtime.paper_replay import (
@@ -70,7 +71,12 @@ from breezy.runtime.paper_replay import (
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.settlement.roi_bound import ROIBound, ROIBoundUnderpowered
-from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial, score_trial
+from breezy.settlement.trial_scorer import (
+    FilledTrial,
+    ScoredPathQtyInvariantError,
+    ScoredTrial,
+    score_trial,
+)
 from breezy.strategy.current_rung_hold.backtest_only import CurrentRungHoldBacktestStrategy
 from breezy.strategy.current_rung_hold.config import (
     STALE_OBSERVATION_MINUTES,
@@ -1792,6 +1798,71 @@ def test_family_manifest_threads_the_registered_taker_fee_coefficient(
     assert captured["trial_id_prefix"] == "continuous_rung_hold/trial/"
 
 
+def test_a_multi_contract_backtest_fill_is_refused_before_the_scored_store_write(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FU-3d AC1b mutation test (L-33/L-42): the only residual path to
+    qty!=1 here is an engine over-fill (backtest fills are qty==1 by
+    construction otherwise -- see the plan's Edge Cases). Monkeypatch
+    `run_one_precision_arm` (precedent: `_spy_run_one_precision_arm` above)
+    to return a qty=2 `FilledTrial`, with a REAL settlement record for its
+    (station, climate_day) so the pair would actually score, and drive
+    `main` with `--family-manifest` so both the parquet and the
+    `family_params.json` sidecar are live write targets today. The guard
+    must raise before either is written."""
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(
+        driver, ask="0.40", size=10, fee_coefficient=THETA,
+    )
+    over_filled_trial = driver.FilledTrial(
+        trial_id="continuous_rung_hold/trial/LAX/over-fill",
+        station=STATION,
+        climate_day=CLIMATE_DAY.isoformat(),
+        instrument_id=str(INSTRUMENT_ID),
+        bucket=read_weather_bucket_facts(_instrument().info),
+        fill_px=Decimal("0.40"),
+        fee=Decimal("0.01"),
+        qty=Decimal(2),
+        filled_at_ns=WINDOW_OPEN_NS,
+        entry_ask=Decimal("0.40"),
+        scheduled_release_at_ns=WINDOW_OPEN_NS,
+    )
+    settlement_record = _final_climate_day(tmax_f=86)  # inside the 86..87 rung -> would score
+
+    monkeypatch.setattr(
+        driver,
+        "run_one_precision_arm",
+        lambda **kwargs: driver.PrecisionArmResult(trials=(over_filled_trial,)),
+    )
+    monkeypatch.setattr(
+        driver, "_convert_live_capture", lambda **kw: _StubReplayCatalog(tape_instrument),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(
+        driver,
+        "climate_day_records_to_settlement",
+        lambda *a, **kw: {(STATION, CLIMATE_DAY.isoformat()): settlement_record},
+    )
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+
+    manifest_path = _write_family_manifest(tmp_path)
+    argv = [
+        *_minimal_argv(tmp_path, strategy="continuous_rung_hold"),
+        "--family-manifest", str(manifest_path),
+    ]
+
+    with pytest.raises(ScoredPathQtyInvariantError) as excinfo:
+        driver.main(argv)
+    assert "over-fill" in str(excinfo.value)
+
+    output_dir = tmp_path / "out"
+    assert read_scored_trials(output_dir) == ()
+    assert not (output_dir / driver._FAMILY_PARAMS_SIDECAR_FILENAME).exists()
+
+
 # ---------------------------------------------------------------------------
 # AUD-09b fee-regime plan, Phase 3: the exact tape-vs-manifest preflight
 # ---------------------------------------------------------------------------
@@ -2732,3 +2803,4 @@ def test_two_precision_arms_write_monitor_output_to_distinct_per_arm_directories
     # contained under its own <precision_mode> subdirectory.
     assert not (monitor_out_dir / "monitor_summaries").exists()
     assert not (monitor_out_dir / "monitor").exists()
+

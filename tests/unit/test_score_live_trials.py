@@ -36,7 +36,10 @@ from nautilus_trader.model.objects import Price, Quantity
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
+import score_live_trials as score_live_trials_module
 from score_live_trials import (
+    _FILL_ORDER_SIDECAR_NAME,
+    _PROVENANCE_SIDECAR_NAME,
     FillExclusion,
     ProvenanceConflict,
     _admit_fill,
@@ -64,7 +67,7 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.persistence.catalog import open_station_catalog, write_records
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
-from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial
+from breezy.settlement.trial_scorer import FilledTrial, ScoredPathQtyInvariantError, ScoredTrial
 
 _BASE_NS = int(dt.datetime(2026, 9, 1, 6, 31, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
 _SHA = hashlib.sha256(b"score-live-trials-test").hexdigest()
@@ -625,6 +628,44 @@ def test_end_to_end_a_multi_fill_is_excluded_not_scored_and_reported(tmp_path: P
     assert len(excluded) == 1
     assert excluded[0].reason == "multi_fill"
     assert excluded[0].trial_id == "multi"
+
+
+def test_a_regressed_admission_gate_cannot_persist_a_multi_contract_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FU-3d AC1a mutation test (L-33/L-42): if `_admit_fill` ever regressed
+    to admit a qty!=1 fill, `assert_scored_pairs_are_unit_qty` is the last
+    line of defence -- it must raise BEFORE any of `write_scored_trials`,
+    `_append_fill_order_entries` or `_write_or_assert_live_provenance_sidecar`
+    run, so a refused run writes no parquet, no fill-order sidecar and no
+    provenance sidecar."""
+    # Arrange -- a qty=2 fill that would ordinarily be excluded as
+    # `multi_fill`; monkeypatch the admission gate to (incorrectly) admit it,
+    # simulating the regression the guard defends against.
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="regressed-multi", qty="2")) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(score_live_trials_module, "_admit_fill", lambda *a, **k: None)
+
+    # Act / Assert
+    with pytest.raises(ScoredPathQtyInvariantError) as excinfo:
+        score_live_trials(
+            fills_path=fills_path,
+            catalog_base=catalog_base,
+            venue=_VENUE,
+            city=_CITY,
+            derived_dir=derived_dir,
+            now_ns=_BASE_NS,
+        )
+    assert "regressed-multi" in str(excinfo.value)
+    assert read_scored_trials(derived_dir) == ()
+    assert not (derived_dir / _FILL_ORDER_SIDECAR_NAME).exists()
+    assert not (derived_dir / _PROVENANCE_SIDECAR_NAME).exists()
 
 
 def test_end_to_end_a_zero_qty_fill_is_refused_loudly_never_scored_never_silently_dropped(

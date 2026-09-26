@@ -93,6 +93,7 @@ from typing import Final, Literal
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+from breezy.adapters.polymarket_us.fees import taker_fee_at_fill
 from breezy.adapters.polymarket_us.operator_controls import _round_cost_up_to_cent
 from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
 from breezy.domain.nws_climate_day import NwsClimateDay
@@ -108,7 +109,7 @@ from breezy.persistence.family_manifest import (
     load_family_manifest,
 )
 from breezy.persistence.realized_draws import admissible_scored_trials
-from breezy.persistence.residual_fills import residual_trial_ids
+from breezy.persistence.residual_fills import ExcludedFill, read_excluded_fills, residual_trial_ids
 from breezy.persistence.scored_trial_store import read_scored_trials, read_scored_trials_pooled
 from breezy.registry.sites import SiteNotFoundError, default_registry
 from breezy.runtime import alert_ladder
@@ -620,6 +621,114 @@ def scored_trial_ids_of(scored_trials: Iterable[ScoredTrial]) -> frozenset[str]:
     return frozenset(trial.trial_id for trial in scored_trials)
 
 
+# --------------------------------------------------------------------------
+# FU-3d AC4/AC5: the Markdown-only fee_unverified residual disclosure.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FeeUnverifiedResidualDisclosure:
+    """FU-3d AC4: three quantities over settled `fee_unverified` residual
+    fills, deduped by `venue_order_id` -- Markdown-only, never JSON, never a
+    correction to any booked P&L (§8 AC #3's residual-cash-identity rule
+    extends here unchanged)."""
+
+    n_fee_unverified_settled: int
+    model_minus_recorded_fee: Decimal
+    n_fee_unverified_unmodelled: int
+
+
+def _fee_unverified_fills_deduped(scored_trials_dir: Path) -> dict[str, ExcludedFill]:
+    """AC5: every `reason == "fee_unverified"` line under `scored_trials_dir`
+    -- read from the legacy top-level `excluded_fills.jsonl` (dedupe input
+    only; `residual_trial_ids_pooled` deliberately never unions this level
+    for BOOKING, see its own docstring -- this function reads it anyway
+    because AC5 requires it for the dedupe identity, and booking is decided
+    separately, downstream, by :func:`fee_unverified_residual_disclosure`'s
+    `residual_settlement_trial_ids` filter) and every per-family child
+    directory -- deduped by `venue_order_id`, latest `scored_run_utc` wins
+    (the `family_tally_v2.py:1130-1142` rule, restated here since this
+    module does not import that script)."""
+    all_fills: list[ExcludedFill] = []
+    if scored_trials_dir.exists():
+        all_fills.extend(read_excluded_fills(scored_trials_dir))
+        for child in sorted(p for p in scored_trials_dir.iterdir() if p.is_dir()):
+            all_fills.extend(read_excluded_fills(child))
+    latest: dict[str, ExcludedFill] = {}
+    for fill in all_fills:
+        if fill.reason != "fee_unverified":
+            continue
+        current = latest.get(fill.venue_order_id)
+        if current is None or fill.scored_run_utc >= current.scored_run_utc:
+            latest[fill.venue_order_id] = fill
+    return latest
+
+
+def fee_unverified_residual_disclosure(
+    *,
+    fee_unverified_fills: Mapping[str, ExcludedFill],
+    filled_trials: Sequence[FilledTrial],
+    fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str, bool]],
+    residual_settlement_trial_ids: frozenset[str],
+) -> FeeUnverifiedResidualDisclosure:
+    """Pure (AC4/AC5/Edge Cases): compute (i) `n`, (ii) the signed model-
+    minus-recorded fee sum over fills whose theta resolves, and (iii)
+    `n_unmodelled`, from already-loaded inputs -- no I/O here.
+
+    A fill is disclosed only if (a) its `trial_id` has a booked
+    :class:`ResidualSettlement` (`residual_settlement_trial_ids`) and (b) the
+    state DB does not now say `fee_reconciled=True` for it (the state DB is
+    authoritative over a stale sidecar line, per the tuple's first element).
+    `fee_coefficient_at_fill=None` always -- `FilledTrial` carries no theta
+    field, so this uses the dated schedule at the fill's own `filled_at_ns`
+    (`taker_fee_at_fill`'s own documented fallback). An out-of-range price
+    (`ValueError`) is caught per fill and counted in `n_unmodelled`, never
+    aborting the whole disclosure. The NO leg is never discriminated: `fee`
+    is the leg's own recorded per-contract fee and `p(1-p)` is symmetric.
+    """
+    trial_by_id = {trial.trial_id: trial for trial in filled_trials}
+    n_settled = 0
+    model_minus_recorded = Decimal(0)
+    n_unmodelled = 0
+    for fill in fee_unverified_fills.values():
+        trial_id = fill.trial_id
+        if not trial_id or trial_id not in residual_settlement_trial_ids:
+            continue
+        fee_reconciled, _venue_order_id, _skip_ask_guard = fee_reconciled_by_trial_id.get(
+            trial_id, (False, "", False),
+        )
+        if fee_reconciled:
+            continue
+        trial = trial_by_id.get(trial_id)
+        if trial is None:
+            continue
+        n_settled += 1
+        try:
+            modelled = taker_fee_at_fill(
+                quantity=trial.qty,
+                price=trial.fill_px,
+                ts_event_ns=trial.filled_at_ns,
+                fee_coefficient_at_fill=None,
+            )
+        except ValueError:
+            logger.warning(
+                "portfolio_roi_report: fee_unverified disclosure: out-of-range "
+                "price for trial_id=%s -- counted unmodelled, not raised",
+                trial_id,
+            )
+            n_unmodelled += 1
+            continue
+        if modelled is None:
+            n_unmodelled += 1
+            continue
+        model_minus_recorded += modelled.as_decimal() - trial.qty * trial.fee
+    return FeeUnverifiedResidualDisclosure(
+        n_fee_unverified_settled=n_settled,
+        model_minus_recorded_fee=model_minus_recorded,
+        n_fee_unverified_unmodelled=n_unmodelled,
+    )
+
+
 #: `trial_rows_of`'s fallback whenever `resolve_trial_family` cannot bind a
 #: trial to exactly one REGISTERED family -- no prefix match at all, or a
 #: prefix match whose declared `d0_climate_day..terminal_climate_day` window
@@ -1045,7 +1154,9 @@ class ResidualSettlement:
     #: FU-3c AC1: ``qty * (1{held} - fill_px - fee)`` -- the same formula
     #: `score_trial` uses for a `ScoredTrial.pnl` (`trial_scorer.py:206`),
     #: scaled by `qty` for consistency with `payout`/`capital_deployed`
-    #: (never per-contract like the scored path -- see FU-3d). This field
+    #: (never per-contract like the scored path, which is per-fill = per-
+    #: contract because both scored-store writers admit qty==1 fills only,
+    #: ruling Q1 + the FU-3d guard). This field
     #: feeds ONLY `total_realised_pnl_residual`; it must never reach
     #: `admissible_scored_trials`, `n_scored`, `trial_rows`, the lags sample,
     #: or the scored-trial store (AC5).
@@ -2187,8 +2298,9 @@ class PortfolioRoiReportData:
     n_residual_unresolved: int = 0
     # -- FU-3c (schema_version=3): the residual numerator term AUD-04 I3
     # required but never had. `realised_pnl_residual_total` is qty-scaled
-    # (FU-3d note: `realised_pnl_after_fees_total` stays per-contract until
-    # that lands); `realised_pnl_portfolio_total` is their sum and is the
+    # (`realised_pnl_after_fees_total` is per-contract, and per-fill because
+    # both scored-store writers admit qty==1 fills only, ruling Q1 + FU-3d);
+    # `realised_pnl_portfolio_total` is their sum and is the
     # figure `roi`/`roi_minus_b0`/`roi_minus_b1` are actually computed
     # against (AC2). Neither ever reaches `trial_rows`/`n_scored` (AC5).
     realised_pnl_residual_total: Decimal = Decimal(0)
@@ -2618,10 +2730,28 @@ def _roi_or_gated(data: PortfolioRoiReportData, value: Decimal) -> str:
     return str(value) if data.roi_status == ROI_STATUS_OK else "GATED -- see roi_status"
 
 
-def render_markdown_report(data: PortfolioRoiReportData) -> str:
+def _fee_unverified_disclosure_line(fee_unverified: FeeUnverifiedResidualDisclosure) -> str:
+    return (
+        "- fee_unverified residuals (FU-3d, modelled, never booked): "
+        f"n={fee_unverified.n_fee_unverified_settled}, "
+        f"model minus recorded fee={fee_unverified.model_minus_recorded_fee} "
+        f"(n unmodelled, θ unresolved: {fee_unverified.n_fee_unverified_unmodelled}); "
+        "positive ⇒ residual P&L likely overstated by ≈ this, negative "
+        "⇒ understated; per-fill rounding, error either direction."
+    )
+
+
+def render_markdown_report(
+    data: PortfolioRoiReportData,
+    *,
+    fee_unverified: FeeUnverifiedResidualDisclosure | None = None,
+) -> str:
     """The PRIVATE Markdown sibling. Every currency figure lives ONLY here
     and in the JSON sibling (§6 D6) -- never in the journal line or an
-    alert."""
+    alert. `fee_unverified` (FU-3d AC4) is optional and Markdown-only: it
+    never reaches `PortfolioRoiReportData`/the JSON sibling; omitted
+    (`None`) callers render byte-identical to before this parameter
+    existed."""
     lines = [
         "# Portfolio ROI Report (AUD-04, PRIVATE -- do not share outside the operator)",
         "",
@@ -2660,9 +2790,11 @@ def render_markdown_report(data: PortfolioRoiReportData) -> str:
         f"- realised P&L residual fills (total, FU-3c): {data.realised_pnl_residual_total}",
         f"- realised P&L portfolio (scored + residual, FU-3c): {data.realised_pnl_portfolio_total}",
         (
-            "  (residual P&L is qty-scaled; scored P&L is per-contract "
-            "until FU-3d)"
+            "  (residual P&L is qty-scaled; scored P&L is per-fill = "
+            "per-contract: both scored-store writers admit qty==1 fills "
+            "only, ruling Q1 + FU-3d guard)"
         ),
+        *([_fee_unverified_disclosure_line(fee_unverified)] if fee_unverified is not None else []),
         f"- capital deployed (total, leg-summed, never netted): {data.capital_deployed_total}",
         f"- ROI: {_roi_or_gated(data, data.roi)}",
         f"- ROI - B0 (cash): {_roi_or_gated(data, data.roi_minus_b0)}",
@@ -3462,6 +3594,22 @@ def _run(
             )
         )
 
+        # FU-3d AC4/AC5: the Markdown-only fee_unverified disclosure -- read-
+        # only, over the SAME `family_station_results`/`filled_trials` F8
+        # already gathered above, no second DB pass. Never folded into
+        # `residual_pnl`/`total_pnl`/`baselines` below (AC2/AC6).
+        fee_reconciled_by_trial_id_pooled: dict[str, tuple[bool, str, bool]] = {
+            trial_id: value
+            for result in family_station_results
+            for trial_id, value in result.fee_reconciled_by_trial_id.items()
+        }
+        fee_unverified_disclosure = fee_unverified_residual_disclosure(
+            fee_unverified_fills=_fee_unverified_fills_deduped(scored_trials_dir),
+            filled_trials=filled_trials,
+            fee_reconciled_by_trial_id=fee_reconciled_by_trial_id_pooled,
+            residual_settlement_trial_ids=frozenset(s.trial_id for s in residual_settlements),
+        )
+
         # FU-3c AC1/AC2: the residual numerator term, folded into `roi`'s
         # baseline computation only AFTER residual settlements are resolved
         # -- `total_pnl` above (AC3) is never touched. Stays inside this
@@ -3548,7 +3696,12 @@ def _run(
     json_path = output_dir / f"PRIVATE_portfolio_roi_{stamp}.json"
     md_path = output_dir / f"PRIVATE_portfolio_roi_{stamp}.md"
     write_portfolio_roi_json(json_path, report_data)
-    _atomic_write_bytes(md_path, render_markdown_report(report_data).encode("utf-8"))
+    _atomic_write_bytes(
+        md_path,
+        render_markdown_report(report_data, fee_unverified=fee_unverified_disclosure).encode(
+            "utf-8"
+        ),
+    )
 
     print(journal_line(report_data))
 
