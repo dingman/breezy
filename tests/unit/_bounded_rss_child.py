@@ -58,7 +58,12 @@ def main() -> int:
     table = _read(args.reader, catalog, args.path)
 
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    nbytes = int(table.nbytes) if table is not None else 0
+
+    if table is None:
+        print("read failed: reader returned None", file=sys.stderr)
+        return 75
+
+    nbytes = int(table.nbytes)
 
     print(json.dumps({"baseline_kb": baseline_kb, "peak_kb": peak_kb, "nbytes": nbytes}))
     return 0

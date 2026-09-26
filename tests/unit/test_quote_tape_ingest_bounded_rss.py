@@ -61,25 +61,41 @@ def _write_stream(path: Path, count: int) -> None:
         writer.close()
 
 
+_CHILD_MAX_ATTEMPTS = 3
+_CHILD_ENOMEM_RETRY_CODE = 75
+
+
 def _run_child(path: Path, warmup_path: Path, reader: str) -> dict[str, int]:
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(_CHILD_SCRIPT),
-            "--path",
-            str(path),
-            "--warmup-path",
-            str(warmup_path),
-            "--reader",
-            reader,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")},
-    )
-    payload: dict[str, int] = json.loads(result.stdout.strip().splitlines()[-1])
-    return payload
+    # A read failure inside the child (e.g. `OSError(ENOMEM)` from a `read()`
+    # syscall under host memory pressure) is caught by native
+    # `_read_feather_file`, which returns `None`; the child then exits 75
+    # instead of emitting a payload. That is a transient environmental
+    # condition, not a code regression, so retry it a bounded number of times
+    # before failing for real.
+    for attempt in range(_CHILD_MAX_ATTEMPTS):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_CHILD_SCRIPT),
+                "--path",
+                str(path),
+                "--warmup-path",
+                str(warmup_path),
+                "--reader",
+                reader,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")},
+        )
+        is_last_attempt = attempt == _CHILD_MAX_ATTEMPTS - 1
+        if result.returncode == _CHILD_ENOMEM_RETRY_CODE and not is_last_attempt:
+            continue
+        result.check_returncode()
+        payload: dict[str, int] = json.loads(result.stdout.strip().splitlines()[-1])
+        return payload
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 @pytest.fixture(scope="module")
