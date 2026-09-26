@@ -24,7 +24,9 @@ _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
+import aud07_m1c_census as census_mod
 from aud07_live_rule_crossing_sim import (
+    COARSE_NPTS,
     LOOK_STEP,
     M1C_GRID,
     N_DEPTHS,
@@ -248,6 +250,49 @@ def test_run_census_cell_buckets_deltas_by_depth_and_a_terminal_bucket() -> None
     # terminal look -- never populated in the interim table.
     assert N_MAX // LOOK_STEP == N_DEPTHS
     assert stats.max_abs_delta_by_depth[N_DEPTHS - 1] is None
+
+
+def test_run_census_cell_terminal_bucket_counts_first_terminal_look_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation-review fix (M7): once a replicate's FIRST terminal look is
+    found, every LATER look in the SAME replicate must not be re-bucketed
+    into the terminal set, even when the sim's own stop rule (`t >= 1.0`)
+    also calls a later look terminal.
+
+    Fully-controlled fakes (never real math) make the expected count
+    unambiguous: `information_fraction` is forced to `1.5` so EVERY look is
+    `t >= 1.0`-terminal from the very first one, and a fake boundary
+    callable returns a per-call INCREASING `b_eff` delta (call 1 -> 0.10,
+    call 2 -> 0.20, ...). Bucketing only the first terminal look must report
+    `terminal_max_abs_delta == 0.10`; bucketing every terminal look (the
+    mutation) would report a later, larger delta instead."""
+    monkeypatch.setattr(census_mod, "information_fraction", lambda information, *, i_max: 1.5)
+
+    class _FakeBoundary:
+        """`coarse` (`npts=COARSE_NPTS`) always returns a constant `b_eff`;
+        `fine` (any other `npts`) returns a per-call increasing `b_eff`, so
+        the delta at call `n` is exactly `0.10 * n`. `b_fut` is held
+        constant (equal on both) so only the `b_eff` pair ever contributes a
+        delta."""
+
+        def __init__(self, *, alpha: float, npts: int, halfwidth_sd: float = 0.0) -> None:
+            self._npts = npts
+            self._n = 0
+
+        def __call__(self, t_history: object, *, is_terminal: bool) -> tuple[float, float]:
+            self._n += 1
+            offset = 0.0 if self._npts == COARSE_NPTS else 0.10 * self._n
+            return (1.0 + offset, -1.0)
+
+    monkeypatch.setattr(census_mod, "StreamingBoundary", _FakeBoundary)
+
+    stats = census_mod.run_census_cell(0, n_reps=1, seed=20260926_007)
+
+    assert stats.terminal_max_abs_delta == pytest.approx(0.10)
+    # Every look was forced terminal from the first one onward, so the
+    # interim per-depth table must stay entirely unpopulated.
+    assert stats.max_abs_delta_by_depth == (None,) * N_DEPTHS
 
 
 def test_derive_eps_pin_produces_a_per_depth_pin_that_load_eps_pin_accepts(

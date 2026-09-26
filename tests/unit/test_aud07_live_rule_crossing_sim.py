@@ -590,6 +590,27 @@ def test_needs_refine_falls_back_to_the_global_eps_for_a_depth_missing_from_the_
     assert with_table == without_table is None
 
 
+def test_needs_refine_falls_back_to_the_global_eps_never_the_floor_for_a_missing_depth() -> None:
+    """Mutation-review fix (M2): the sibling test above uses `eps=0.02`,
+    which EQUALS `EPS_FLOOR` and so cannot distinguish "fell back to the
+    global eps" from "fell back to the floor" -- it stayed green under a
+    mutant that swaps the fallback for `EPS_FLOOR`. This uses a global eps
+    clearly above the floor (0.30) and a margin (0.10) strictly between the
+    two: falling back to the floor (0.02) would wrongly call 0.10 a
+    confident crossing (result `None`); only the correct fallback to the
+    global 0.30 reports "eff" (not yet confident, needs refine)."""
+    sparse_by_depth = {1: 10.0}  # only depth 1 present; this look is depth 15.
+    look = _depth_look(
+        look_n=15 * LOOK_STEP, terminal=False, t=0.9, s=1.10, b_eff=1.00, b_fut=-100.0
+    )
+    assert (
+        _needs_refine(
+            (look,), eps=0.30, dt_min=1e-6, eps_by_depth=sparse_by_depth, eps_terminal=0.02
+        )
+        == "eff"
+    )
+
+
 def test_load_eps_pin_normalises_a_legacy_scalar_pin_to_a_constant_per_depth_table(
     tmp_path: Path,
 ) -> None:

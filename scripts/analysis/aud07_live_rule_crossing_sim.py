@@ -666,6 +666,10 @@ def _eps_for_look(
     if look.terminal:
         return eps_terminal if eps_terminal is not None else eps
     depth = look.look_n // LOOK_STEP
+    # A look at depth N_DEPTHS (look_n == N_MAX) is always terminal (the
+    # `look.terminal` branch above), so `eps_by_depth[N_DEPTHS]` can never be
+    # reached here by design -- the table still carries that entry only to
+    # satisfy the fixed-length (N_DEPTHS) table-shape contract.
     return eps_by_depth.get(depth, eps)
 
 
