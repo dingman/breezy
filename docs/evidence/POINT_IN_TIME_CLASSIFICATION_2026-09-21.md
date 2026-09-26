@@ -195,3 +195,101 @@ follow-up either needs a higher memory allowance explicitly authorized
 above this task's 6G cap, or a quiet window with more free system memory
 (this task's brief does not authorize either change; both are coordinator
 decisions).
+
+## 2026-09-26 rerun at 12G -- still OOM; root cause identified (not fixed)
+
+Coordinator-authorized rerun at a higher cap, in the 22:58-01:50Z quiet
+window (host: ~30G RAM, ~19G available, live node and quote-tape recorder
+left running throughout, untouched). Command (unchanged, primary tree,
+commit `41802df`, branch `feat/data-capture-and-risk`):
+
+```
+systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=2G -- \
+  uv run python scripts/analysis/run_weather_strategy_backtests.py \
+  --output-dir <scratch>/aud11_output
+```
+
+`journalctl --user` for `run-p1926925-i56437347.scope`:
+
+```
+Sep 26 22:58:04 ... Started run-p1926925-i56437347.scope ...
+Sep 26 23:07:30 ... The kernel OOM killer killed some processes in this unit.
+Sep 26 23:07:31 ... Failed with result 'oom-kill'.
+Sep 26 23:07:31 ... Consumed 10min 32.530s CPU time over 9min 26.906s wall
+clock time, 12G memory peak, 379.4M memory swap peak.
+```
+
+stdout/stderr (`/home/jon/.cache/aud11/run1.log`): only the `systemd-run`
+banner plus `uv`'s own build/install lines (`Building breezy`, `Installed 1
+package`); `EXIT_CODE=137`. As with both 2026-09-24 runs, the process never
+reached any of the script's own `print` statements, so the documenting
+`assert_available_before_decision` call is again **not captured** at 12G
+either -- doubling the cap did not change where the process dies, only
+delayed it (6min23s wall / 6G peak on 09-24 vs 9min27s wall / 12G peak
+tonight), which is itself evidence the footprint scales with the cap rather
+than converging.
+
+**Root cause, located by inspection (no source edited per this task's
+constraint):** `_select_tape_instruments`
+(`scripts/analysis/run_weather_strategy_backtests.py:679-721`) is called
+from `main` (line 1802) with no station/date filter of any kind. It calls
+`catalog.instruments()` once, then for **every** instrument returned --
+not just the 2026-08-30 NYC/MIA tape's instruments -- calls
+`catalog.order_book_depth10(instrument_ids=[instrument.id.value])` and
+`catalog.quote_ticks(instrument_ids=[instrument.id.value])` and retains
+every returned Nautilus object in `depths_by_id`/`quotes_by_id` (lines
+690-698), before `select_tradable_instrument_ids` ever runs to pick the
+handful that are actually tradable (line 700). `DEFAULT_QUOTE_CATALOG_PATH`
+(line 346-348) points at the live, shared, ever-growing capture catalog
+(`/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us`), not a
+2026-08-30-scoped export: it is 107G on disk today, with 765
+`quote_tick/<instrument>` partitions and 815 `order_book_depths/<instrument>`
+partitions covering 2026-09-01 through 2026-09-27 across 5 cities -- only 5
+of those partitions belong to 2026-08-30. The function therefore
+materialises the full multi-week tape's depth10 and quote history into
+Python objects in memory before discarding all but 5 instruments' worth,
+which is why memory scales with calendar days captured (growing daily as
+the recorder keeps running) rather than with the fixed 2026-08-30 tape the
+script is meant to prove against, and why raising the cgroup cap alone
+cannot converge -- the catalog will keep growing past any fixed cap.
+
+**Bounded-read fix needed (not applied -- source is read-only for this
+task):** `_select_tape_instruments` needs to narrow to the target
+instruments *before* calling `order_book_depth10`/`quote_ticks`, e.g. by
+filtering `catalog.instruments()` to the known `("NYC","MIA")` /
+`CLIMATE_DAY` (2026-08-30) bucket-id pattern already used elsewhere in this
+file (`read_weather_bucket_facts`), or by passing a `start`/`end` window to
+the catalog query methods if the installed `ParquetDataCatalog` version
+supports it, so only the ~5 in-scope instrument partitions are ever
+materialised. Note for whoever picks this up: S3a's coalesced-read change
+(merged since 2026-09-24) may already reduce per-partition overhead, but it
+does not change the fact that all 765+/815+ instrument partitions are read
+before filtering -- the fix is a filter-before-read reordering, not a
+read-path efficiency tweak.
+
+**Acceptance criteria (plan §8) status, this run:**
+
+- Documenting `assert_available_before_decision` raise/no-raise for the
+  known tape, captured verbatim -- **FAIL**, not reached (OOM before any
+  script `print`).
+- `N == len(exc.offending_records) == len(records)` for this tape -- **FAIL**,
+  not reached.
+- `real_observed`/scenario byte-identical output pre/post-refactor -- **FAIL**,
+  not reached.
+- `naive`/`realistic` per-strategy trading-result identity after
+  `weather_data` removal -- **FAIL**, not reached.
+- Survey deliverable table (this document, all rows classified with
+  `ts_init` provenance) -- **PASS** (already complete, independent of this
+  run).
+- RED->GREEN unit tests (`test_point_in_time_guard.py`,
+  `test_run_weather_strategy_backtests_selection.py`, round-4
+  missing-station fixtures) -- **PASS** (already captured in prior work,
+  independent of this run; not re-executed tonight).
+
+**AUD-11 cannot close.** The four tape-proof criteria remain unmet after
+two cap levels (6G, 12G); this is not a quiet-window or cap-size problem,
+it is `_select_tape_instruments` reading the whole shared, growing capture
+catalog instead of the ~5 instruments the 2026-08-30 NYC/MIA proof needs.
+Closing requires the filter-before-read fix above (a source change, out of
+this task's scope) followed by one more capped run, which should then need
+well under 6G.
