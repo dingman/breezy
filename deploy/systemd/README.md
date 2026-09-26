@@ -1,6 +1,6 @@
 # G-14 — reboot-durable supervision for the quote tape and the K1 study
 
-**Status: ACTIVATED** (the 09-12 header "PREPARED, NOT ACTIVATED" is superseded; counts pending re-measurement at deploy 2026-09-26 — `breezy-trade-supervisor.service` is now a host symlink to the repo copy (coordinator's change; no longer the shadowing regular file described previously), and `breezy-nws-ingest.service` is now versioned here (`deploy/systemd/breezy-nws-ingest.service`, byte-identical to the host copy) along with the `breezy.slice.d/memory.conf` drop-in (`deploy/systemd/breezy.slice.d/memory.conf`); both remain host-local regular files until the coordinator's next symlinking pass converts them, at which point the host's regular-file count for these two goes from 2 to 0; 17 active timers; 4 services running). The cutover in §3 is run by the coordinator, with eyes on
+**Status: ACTIVATED** (the 09-12 header "PREPARED, NOT ACTIVATED" is superseded; measured 2026-09-26 12:40Z after OPS-1: 40 `breezy-*` entries in `~/.config/systemd/user` are symlinks into this directory, 0 are host-local regular files; `breezy.slice.d/memory.conf` is a symlink to this repo; 18 active timers; 3 services running; TEMPORARY drop-ins `breezy-quote-tape-ingest.service.d/zz-memory-containment-TEMPORARY.conf` and `breezy-replay-daily.service.d/zz-c2-time-v-TEMPORARY.conf` are host-local by design and removed when their item closes). The cutover in §3 is run by the coordinator, with eyes on
 it, because it briefly stops the one data stream Breezy cannot re-acquire.
 
 ## 1. What this replaces, and why it is urgent
@@ -1428,9 +1428,7 @@ unit starts inside P") as satisfied by this item is reading it wrong.
 unit is now versioned at `deploy/systemd/breezy-nws-ingest.service`
 (byte-identical to the host copy, confirmed via `cmp`), along with the
 `breezy.slice.d/memory.conf` drop-in at
-`deploy/systemd/breezy.slice.d/memory.conf`. Both remain host-local regular
-files -- not yet symlinks -- until the coordinator's next host symlinking
-pass (re-measured at deploy 2026-09-26).
+`deploy/systemd/breezy.slice.d/memory.conf`. Both are symlinked on the host (2026-09-26 12:40Z).
 
 **Declared stale cross-references (A-20).** MOVED 2026-09-12 retimed
 exactly `breezy-k1-daily.timer` (was `22:30`, MOVED 2026-09-12) and the
