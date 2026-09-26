@@ -22,12 +22,15 @@ Two safety properties, both load-bearing:
   a RETRYABLE one -- ``ValueError`` (deserialisation or non-disjoint-interval
   refusal), ``pyarrow.ArrowInvalid`` (a salvaged table that still fails a
   later Arrow operation), ``OSError`` (the file vanishing or becoming
-  unreadable between preflight and salvage) -- left unmarked so a later run
-  may retry; and a TERMINAL one -- ``NotImplementedError``
+  unreadable between preflight and salvage), and a plain ``NotImplementedError``
+  from anywhere other than deserialisation -- left unmarked so a later run
+  may retry; and a TERMINAL one -- a ``NotImplementedError`` raised
+  specifically by the deserialise call-site
   (``ArrowSerializer._deserialize_rust`` when the type's Rust wrangler is
   ``None`` -- measured for ``MarkPriceUpdate``, also ``InstrumentClose`` /
-  ``IndexPriceUpdate``) -- deterministic and permanent for the installed
-  Nautilus version, so it earns its own marker
+  ``IndexPriceUpdate``), narrowed via the private :class:`_UnsupportedSalvageType`
+  sentinel so no other ``NotImplementedError`` is misclassified -- deterministic
+  and permanent for the installed Nautilus version, so it earns its own marker
   (:data:`SALVAGE_UNSUPPORTED_PREFIX`) instead of being retried forever
   (FU-7 item 4). A ``MemoryError``/``RecursionError`` is deliberately NOT
   caught here, for the same reason ``_read_streamed`` does not catch it: it
@@ -100,7 +103,27 @@ _ISOLATED_ERRORS: tuple[type[BaseException], ...] = (
     ValueError,
     pa.ArrowInvalid,
     OSError,
+    NotImplementedError,
 )
+
+
+class _UnsupportedSalvageType(Exception):
+    """Sentinel: the deserialise call-site raised ``NotImplementedError``.
+
+    Raised ONLY around ``catalog._handle_table_nautilus`` in
+    :func:`_salvage_one_file` -- the sole reachable ``NotImplementedError``
+    site is ``ArrowSerializer._deserialize_rust`` (deterministic per
+    installed Nautilus version). Caught immediately by
+    :func:`salvage_truncated_instance` to write the terminal marker; never
+    escapes this module. A ``NotImplementedError`` raised anywhere else (the
+    write path, a future query-side call) is NOT wrapped here, so it falls
+    through to :data:`_ISOLATED_ERRORS` above and is treated as an ordinary
+    retryable failure instead of being wrongly marked terminal.
+    """
+
+    def __init__(self, original: NotImplementedError) -> None:
+        super().__init__(str(original))
+        self.original = original
 
 
 def _salvage_marker_path(instance_dir: Path, file_path: Path) -> Path:
@@ -368,7 +391,8 @@ def salvage_truncated_instance(
                 _salvage_one_file(
                     catalog, write_target, instance_dir, instance_id, cls_name, data_cls, report
                 )
-            except NotImplementedError as exc:
+            except _UnsupportedSalvageType as exc:
+                original = exc.original
                 marker_path = _salvage_unsupported_marker_path(instance_dir, report.path)
                 logger.error(
                     "instance %s: salvage of %s truncated file %s skipped %s "
@@ -377,9 +401,9 @@ def salvage_truncated_instance(
                     instance_id,
                     cls_name,
                     report.path,
-                    type(exc).__name__,
+                    type(original).__name__,
                     nautilus_trader.__version__,
-                    exc,
+                    original,
                     marker_path,
                 )
                 _mark_salvage_unsupported(instance_dir, report.path)
@@ -418,7 +442,10 @@ def _salvage_one_file(
         _mark_salvaged(instance_dir, report.path)
         return
 
-    objects = list(catalog._handle_table_nautilus(table=result.table, data_cls=data_cls))
+    try:
+        objects = list(catalog._handle_table_nautilus(table=result.table, data_cls=data_cls))
+    except NotImplementedError as exc:
+        raise _UnsupportedSalvageType(exc) from exc
     fresh = _drop_already_landed(write_target, data_cls, objects)
     duplicates = len(objects) - len(fresh)
     if duplicates:

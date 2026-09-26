@@ -245,3 +245,50 @@ class TestUnsupportedTypeGetsATerminalMarker:
             )
         # unmarked -- a second call retries and logs again
         assert len(caplog.records) == 1
+
+    def test_not_implemented_error_from_the_write_path_is_not_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Only the deserialise call-site earns the terminal marker.
+
+        A ``NotImplementedError`` raised anywhere else -- here,
+        ``_drop_already_landed`` on the write side, reached only AFTER
+        deserialisation already succeeded for an ordinary type (``QuoteTick``,
+        not ``MarkPriceUpdate``) -- must be treated as an ordinary isolated
+        failure: no ``.salvage-unsupported-`` marker, and a later run retries
+        it. Before this change the outer ``except NotImplementedError`` around
+        the whole ``_salvage_one_file`` call wrongly classified this as the
+        deterministic no-Arrow-wrangler case.
+        """
+        instance_dir = tmp_path / SUBDIRECTORY / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(20)], QuoteTick, close=False
+        )
+        _truncate_tail(quote_path)
+        report = inspect_feather_file(quote_path)
+        assert report.is_truncated
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+
+        def _raise_not_implemented(*args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError("no native writer for this shape")
+
+        monkeypatch.setattr(
+            "breezy.runtime.quote_tape_salvage._drop_already_landed", _raise_not_implemented
+        )
+
+        with caplog.at_level(logging.ERROR, logger="breezy.runtime.quote_tape_salvage"):
+            salvage_truncated_instance(catalog, instance_dir, INSTANCE, (QuoteTick,), (report,))
+
+        from breezy.runtime.quote_tape_salvage import SALVAGE_UNSUPPORTED_PREFIX
+
+        assert not (instance_dir / f"{SALVAGE_UNSUPPORTED_PREFIX}{quote_path.name}").is_file()
+        assert not (instance_dir / f"{SALVAGE_MARKER_PREFIX}{quote_path.name}").is_file()
+        assert any("NotImplementedError" in record.getMessage() for record in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="breezy.runtime.quote_tape_salvage"):
+            salvage_truncated_instance(catalog, instance_dir, INSTANCE, (QuoteTick,), (report,))
+        # unmarked -- a second call retries and logs again
+        assert len(caplog.records) == 1
