@@ -990,6 +990,7 @@ def run_exit_window_study(
     #: and nothing loaded" -- a cache hit is not a failed attempt, so one cached
     #: station plus one HTTP 429 is a partial outage and does not raise.
     loaded_stations = 0
+    attempted_stations = 0
     failed_fetches = 0
     #: `no_taken_latch`/`ambiguous_latch` exclusions carry an empty
     #: `station` by design and are emitted IDENTICALLY by every city's
@@ -1045,6 +1046,7 @@ def run_exit_window_study(
                 **settlement_catalog_bucket_by_instrument,
             }
 
+            attempted_stations += 1
             try:
                 station_text = _station_asos_text(
                     cache_dir=asos_cache_dir, spec=spec, obs_source=obs_source, client=client,
@@ -1053,6 +1055,13 @@ def run_exit_window_study(
             except (httpx.HTTPStatusError, httpx.TransportError) as exc:
                 failed_fetches += 1
                 missing.append(_asos_fetch_failure(city, spec.iem_asos_id, exc))
+                continue
+            except OSError as exc:
+                failed_fetches += 1
+                missing.append(
+                    f"{city}: ASOS cache for {spec.iem_asos_id} unreadable "
+                    f"({type(exc).__name__})",
+                )
                 continue
             if station_text is None:
                 missing.append(
@@ -1147,6 +1156,10 @@ def run_exit_window_study(
                     ),
                 )
 
+    print(
+        f"[exit-window-study] ASOS stations loaded: {loaded_stations}/{attempted_stations}",
+        file=sys.stderr,
+    )
     result = (tuple(rows), tuple(missing))
     if failed_fetches > 0 and loaded_stations == 0:
         raise _TotalAsosFetchOutage(result[0], result[1])
