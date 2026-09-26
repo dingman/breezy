@@ -20,6 +20,7 @@ flat write is possible without breaking deserialisation).
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -885,3 +886,127 @@ def test_per_file_extend_fallback_routes_through_extend_table_chunked(
 
     assert converted
     assert calls == [7]
+
+
+def _patch_zero_row_file(
+    monkeypatch: pytest.MonkeyPatch, zero_row_count: int
+) -> None:
+    """Make ``_extend_table_chunked`` report ``(0, False)`` for the one file
+    whose source table has ``zero_row_count`` rows -- simulating a
+    non-empty source that transforms to zero rows -- and behave normally
+    (real chunking) for every other file, exactly like
+    :func:`test_extend_overlapping_stream_routes_through_extend_table_chunked`.
+    """
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    real_chunked = cli_module._extend_table_chunked
+
+    def spy_chunked(
+        catalog_arg: ParquetDataCatalog,
+        write_target: ParquetDataCatalog,
+        data_cls: type,
+        table: Any,
+        **kwargs: Any,
+    ) -> tuple[int, bool]:
+        if len(table) == zero_row_count:
+            return 0, False
+        return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+
+
+def test_extend_overlapping_stream_zero_row_file_fails_like_the_fast_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FU-14 (review of e199f07, TRUE PARITY): one file's post-transform
+    table comes back empty despite a non-empty source table. The fast path's
+    equivalent guard (quote_tape_ingest_cli.py:1459-1470) logs ERROR and
+    counts the file ``failed`` so the type is never marked converted; the
+    whole-instance EXTEND path must match -- a WARNING plus a silent
+    ``CONVERTED`` return is permanent, silent row loss (the type is never
+    revisited). The other, good file's rows still land this run (only the
+    rerun test asserts they are not duplicated)."""
+    instance_dir = tmp_path / "live" / "instance-1"
+    empty_path = instance_dir / "instrument_status_0.feather"
+    good_path = instance_dir / "instrument_status_1.feather"
+    _write_flat_stream(empty_path, [_status(i) for i in range(5)], InstrumentStatus)
+    _write_flat_stream(good_path, [_status(50 + i) for i in range(7)], InstrumentStatus)
+    catalog = ParquetDataCatalog(str(tmp_path))
+
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    _patch_zero_row_file(monkeypatch, zero_row_count=5)
+
+    with (
+        caplog.at_level(logging.ERROR, logger=cli_module.__name__),
+        pytest.raises(ValueError, match="InstrumentStatus"),
+    ):
+        _extend_overlapping_stream(catalog, "instance-1", InstrumentStatus, "live")
+
+    # The good file's rows still land this run -- only a rerun (see below)
+    # proves they are not duplicated.
+    assert len(catalog.query(data_cls=InstrumentStatus)) == 7
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors, "the empty-post-transform file must log an ERROR, not skip silently"
+    message = errors[0].getMessage()
+    assert "instance-1" in message
+    assert str(empty_path) in message
+    assert "5" in message
+
+
+def test_extend_overlapping_stream_zero_row_rerun_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FU-14: because the type is never marked converted, a second run over
+    the SAME unchanged tape retries -- and must not duplicate the good
+    file's rows (dedupe via ``_drop_already_landed_unfiltered``)."""
+    instance_dir = tmp_path / "live" / "instance-1"
+    empty_path = instance_dir / "instrument_status_0.feather"
+    good_path = instance_dir / "instrument_status_1.feather"
+    _write_flat_stream(empty_path, [_status(i) for i in range(5)], InstrumentStatus)
+    _write_flat_stream(good_path, [_status(50 + i) for i in range(7)], InstrumentStatus)
+    catalog = ParquetDataCatalog(str(tmp_path))
+
+    _patch_zero_row_file(monkeypatch, zero_row_count=5)
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="InstrumentStatus"):
+            _extend_overlapping_stream(catalog, "instance-1", InstrumentStatus, "live")
+
+    assert len(catalog.query(data_cls=InstrumentStatus)) == 7
+
+
+def test_ingest_instance_treats_extends_zero_row_file_as_a_failed_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FU-14: through :func:`ingest_instance` (:func:`_extend_overlapping_stream`
+    used directly as ``convert_fn``, matching its ``ConvertFn`` signature),
+    the zero-row-file ``ValueError`` must be caught exactly like any other
+    type failure -- ``TypeConversionResult.outcome == "failed"``, the
+    ``.converted-instrument_status`` marker is never written, and the
+    INSTANCE outcome is ``"failed"`` (never silently ``"converted"``)."""
+    instance_dir = tmp_path / "live" / "instance-1"
+    empty_path = instance_dir / "instrument_status_0.feather"
+    good_path = instance_dir / "instrument_status_1.feather"
+    _write_flat_stream(empty_path, [_status(i) for i in range(5)], InstrumentStatus)
+    _write_flat_stream(good_path, [_status(50 + i) for i in range(7)], InstrumentStatus)
+    catalog = ParquetDataCatalog(str(tmp_path))
+
+    _patch_zero_row_file(monkeypatch, zero_row_count=5)
+
+    from breezy.runtime.quote_tape_ingest_cli import ingest_instance
+
+    result = ingest_instance(
+        catalog,
+        tmp_path,
+        "instance-1",
+        "live",
+        (InstrumentStatus,),
+        convert_fn=_extend_overlapping_stream,
+    )
+
+    assert result.outcome == "failed"
+    assert result.type_results[0].outcome == "failed"
+    assert not (instance_dir / ".converted-instrument_status").exists()
+    assert len(catalog.query(data_cls=InstrumentStatus)) == 7

@@ -1630,6 +1630,58 @@ class TestExitCodeReflectsAHardConversionFailure:
         assert code == EXIT_CONVERSION_FAILED
         assert "failed=1" in out.getvalue()
 
+    def test_an_extend_zero_row_file_exits_conversion_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FU-14 (review of e199f07): the whole-instance EXTEND fallback
+        (:func:`_extend_overlapping_stream`) hitting a non-empty-source,
+        zero-post-transform-rows file must fail the run through the real
+        ``run()`` CLI entry point exactly like any other hard conversion
+        failure -- never a silent ``EXIT_OK`` with the type marked
+        converted. Forces native's non-disjoint refusal (so ``default_convert``
+        dispatches into EXTEND) and the zero-row transform deterministically,
+        the same two seams the unit-level EXTEND tests patch; the feather
+        read and EXTEND accounting themselves are real."""
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(quote_path, (stamp, stamp))
+
+        real_native = ingest_cli_module._convert_stream_natively
+
+        def flaky_native(
+            catalog: ParquetDataCatalog,
+            instance_id: str,
+            data_cls: type,
+            subdirectory: str,
+            **kwargs: Any,
+        ) -> None:
+            if data_cls is QuoteTick:
+                raise ValueError("would create non-disjoint intervals")
+            return real_native(catalog, instance_id, data_cls, subdirectory, **kwargs)
+
+        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", flaky_native)
+        monkeypatch.setattr(
+            ingest_cli_module, "_extend_table_chunked", lambda *a, **kw: (0, False)
+        )
+        # Deterministic "dead instance" regardless of the sandbox's own
+        # systemctl/dbus availability (default_service_active_probe fails
+        # CLOSED toward "live" when it cannot ask) -- otherwise the aged
+        # file could still be treated as the live newest-instance file and
+        # routed through the per-file path instead of the whole-instance
+        # `ingest_instance`/EXTEND path this test targets.
+        monkeypatch.setattr(ingest_cli_module, "default_service_active_probe", lambda unit: False)
+
+        out, err = io.StringIO(), io.StringIO()
+        code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+
+        assert code == EXIT_CONVERSION_FAILED
+        assert "quote_tick=failed" in out.getvalue()
+        assert not (instance_dir / ".converted-quote_tick").exists()
+
     def test_a_skipped_live_outcome_still_exits_ok(self, tmp_path: Path) -> None:
         _touch(tmp_path, INSTANCE, "quote_tick_1.feather", age_minutes=0.0)
 
