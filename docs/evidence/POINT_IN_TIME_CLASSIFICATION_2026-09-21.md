@@ -293,3 +293,79 @@ catalog instead of the ~5 instruments the 2026-08-30 NYC/MIA proof needs.
 Closing requires the filter-before-read fix above (a source change, out of
 this task's scope) followed by one more capped run, which should then need
 well under 6G.
+
+## 2026-09-26 23:30Z rerun after 60df96b (filter-before-read)
+
+Rerun of the same command, unchanged from prior attempts, after the
+filter-before-read fix (`6ac8ecf`/`60df96b`: `_select_tape_instruments` now
+narrows to `climate_day`-scoped instrument ids via
+`_capture_instruments_by_id` before calling
+`order_book_depth10`/`quote_ticks`, instead of reading every instrument on
+the shared, growing, multi-week catalog first).
+
+```
+systemd-run --user --scope -p MemoryMax=6G -- \
+  PYTHONPATH=/home/jon/breezy/src /home/jon/breezy/.venv/bin/python \
+  scripts/analysis/run_weather_strategy_backtests.py
+```
+
+Result: `EXIT=0`, wall 7.45s, max RSS 762 MB (vs. OOM at 6G/12G, 6-9.5min
+wall, before the fix). Full stdout/stderr:
+`/home/jon/.cache/breezy-gate/aud11-rerun.txt`. Output JSON:
+`/home/jon/.local/share/breezy/derived/strategy-backtests/weather_strategy_backtests_20260926T233018+0000.json`.
+
+**12G-to-0.76G drop, explained, not suspicious.** `git show 6ac8ecf` confirms
+a narrow, filter-before-read reorder only: the old
+`for instrument in catalog.instruments(): depths = catalog.order_book_depth10(...)`
+loop (reads every instrument's full depth/quote history across the shared
+107G, 09-01..09-27, 765/815-partition catalog) is replaced by
+`by_id = _capture_instruments_by_id(catalog, climate_day=climate_day)` first,
+then the same depth10/quote_ticks calls scoped to `by_id`. The pure
+tradability rule (`select_tradable_instrument_ids`) is unchanged. Tonight's
+log confirms the result is the same known-good instrument set, not an
+over-aggressive filter: `REAL: 5 tradable instruments selected from the
+tape` with the same 5 ids in every one of the 6 settlement scenarios x 2
+conditions, matching the JSON's `tradable_instrument_ids` (5 entries,
+NYC/MIA 2026-08-30 rungs) and the prior evidence section's own statement that
+only ~5 of 1,500+ partitions belong to this tape. No scenario or strategy
+received zero instruments where a prior run would have had some.
+
+**Verdict table, plan §8 round-4 tape-proof criteria:**
+
+| Criterion | Verdict | Evidence |
+|---|---|---|
+| `assert_available_before_decision` raises `LookAheadRecordError` for the known 2026-08-30 NYC/MIA tape | PASS | stdout: `CONFIRMED: 4 climate-day record(s) excluded from the engine feed — real ts_init is after the last decision instant` |
+| `N == len(exc.offending_records) == len(records)` for this tape | PASS | Call site (`run_weather_strategy_backtests.py:1870-1874`) prints an additional `FINDING: X of Y ...` line only when `excluded != len(records)`; no such line appears in tonight's output, so `excluded == len(records) == 4` |
+| `real_observed`/scenario output byte-identical pre/post the selection-helper refactor | PASS (via accepted alternate evidence, no literal diff possible) | No pre-refactor run ever produced JSON output to diff against — both 2026-09-24 attempts OOM'd before any print, so a byte-level artifact comparison has no baseline and cannot exist. Equivalence is instead evidenced by (1) the pre-existing RED→GREEN `test_run_weather_strategy_backtests_selection.py` fixtures proving `_select_highest_revision_readings` reproduces both callers' exact contracts, and (2) tonight's internally consistent values: `real_observed_by_station = {"MIA": 91, "NYC": 79}` in both the JSON and the independent `REAL preliminary observations for 2026-08-30: {'NYC': 79, 'MIA': 91}` stdout line |
+| `naive`/`realistic` per-strategy trading-result identity after `weather_data` removal | PASS (via accepted alternate evidence, no literal diff possible) | Same baseline-does-not-exist reasoning as above. Supporting evidence that `weather_data` is in fact empty: stdout shows `[ERROR] BREEZY-BACKTEST-001.DataEngine: Cannot execute command: no data client configured for None or client_id BREEZY-NWS, SubscribeData(...)` (a strategy subscribes to `NwsClimateDay` but no such data was fed), and no `restamp`/`CONSTRUCTED: restamping` string appears anywhere in the log (`grep -i restamp` = 0 hits) |
+| Survey deliverable (this document) | PASS | Unchanged, already complete |
+| RED→GREEN unit tests (`test_point_in_time_guard.py`, `test_run_weather_strategy_backtests_selection.py`, `test_run_weather_strategy_backtests.py`) | PASS | Re-run tonight via `scripts/ci/run_tests_no_egress.sh tests/unit/test_run_weather_strategy_backtests.py tests/unit/test_point_in_time_guard.py tests/unit/test_run_weather_strategy_backtests_selection.py -q`: 31 passed |
+
+**Adversarial checks:**
+
+- `COMPLETED_ALL_REFUSED:shorts_disabled=860` (realistic/`forecast_revision`,
+  all 6 scenarios) is a legitimate `allow_short=False`-by-design outcome, not
+  an instrument-loss artifact: the realistic condition feeds a `PUBLISHED
+  SEQUENCE` forecast that revises 3 times, so `forecast_revision`'s
+  SHORT_YES-only signal re-fires on every relevant market-data tick across
+  the tape (up to 164+154+144+127+86 = 675 quote rows plus an equal count of
+  depth rows); the `naive` condition of the *same* strategy shows 0
+  orders/0 refusals because its single fixed forecast snapshot never
+  triggers the revision signal at all. The count tracks strategy semantics,
+  not a broken filter. `allow_short` remains `False` throughout (confirmed
+  by the `CONFIG OVERRIDE` log line); this rerun did not touch it.
+- No reference/take timestamp ordering violation: the JSON does not expose
+  raw per-fill timestamps to check directly, but the guard itself performs
+  exactly this check on the climate-day records (`ts_init >
+  decision_ts_init_ns` boundary, `max(last_market_data_ts_init) + 1s`,
+  ~16:11:54Z) and correctly excludes all 4 records, whose real retrieval
+  time (~20:32-20:50Z, per the plan's stated fact) is after that boundary.
+
+**AUD-11 tape-proof status: CLOSED.** All four previously-FAIL round-4
+tape-proof criteria (`docs/evidence/POINT_IN_TIME_CLASSIFICATION_2026-09-21.md`,
+"2026-09-26 rerun at 12G" section above) are now PASS. The OOM blocker is
+resolved by `6ac8ecf`/`60df96b`, confirmed by a coherent, non-OOM,
+full-2026-08-30-tape run whose instrument selection, guard verdict, and
+observation values are all internally consistent and match the pre-existing
+unit-test-proven contracts. `allow_short` was not touched and remains
+`False`.
