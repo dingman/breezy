@@ -321,10 +321,15 @@ from breezy.adapters.polymarket_us.safety import (
     unrestore_live_trading_budget,
 )
 from breezy.adapters.polymarket_us.symbology import (
+    base_slug_of,
     instrument_id_to_slug,
     leg_of,
     no_leg_instrument_id,
     slug_to_instrument_id,
+)
+from breezy.domain.position_reporting_lag import (
+    FILL_TS_EVENT_SOURCE_VENUE_TRANSACT_TIME,
+    PositionReportingLag,
 )
 from breezy.ingest.gate import assert_state_store_durable
 from breezy.persistence.exit_tags import (
@@ -554,6 +559,32 @@ _STALE_INTENT_ALERT_AFTER_NS: Final[int] = 15 * 60 * 1_000_000_000
 #: saturates at ``_RESOLVER_BACKOFF_CAP_SECS`` well under 15 minutes), so
 #: this constant is what actually bounds the scan's own frequency.
 _RESOLVER_INSTRUMENT_LOAD_RETRY_NS: Final[int] = 15 * 60 * 1_000_000_000
+
+#: R-7-IMPL (`RULING R-7`, plan `docs/plans/backlog/R-7-IMPL_plan_r1_2026-09-26.md`
+#: section 3): the venue `tsEvent` (`fill.ts_event`, sourced from
+#: `transactTime`) a create-path accept-fill carries is trusted only inside
+#: `[send_ns - bound, recv_ns + bound]` around the POST that produced it --
+#: outside that window it is rejected, never substituted with a local clock.
+#: Build-side, not operator-reserved. Evidence for the bound: a read-only log
+#: grep of the 8 create-path fills observed 2026-09-13 through 2026-09-22 --
+#: `transactTime` landed 21-83ms before local receive and 115ms-3.16s after
+#: the preceding event, zero overshoot against either side. 2s is <=1.7% of
+#: the `_REARM_MIN_DELAY_SECS=120` floor this record exists to verify.
+_FILL_TS_EVENT_MAX_SKEW_NS: Final[int] = 2 * 1_000_000_000
+
+#: R-7-IMPL: how long a create-path accept-fill's pending `PositionReportingLag`
+#: entry waits for an eof-complete read to confirm the resulting LONG before
+#: it is dropped as `UNCONFIRMED_TTL`. Diagnostic only (RULING R-7): an entry
+#: that never confirms costs nothing but a bounded amount of process memory.
+_POSITION_LAG_PENDING_TTL_NS: Final[int] = 30 * 60 * 1_000_000_000
+
+#: R-7-IMPL: the poison value a SECOND create-path accept-fill on an
+#: instrument with an already-pending entry writes over the entry's
+#: `client_order_id` slot, instead of overwriting the entry outright.
+#: `_match_position_lag` recognises it and drops the entry as
+#: `MULTI_FILL_PENDING` -- a `PositionReportingLag` cannot be attributed to
+#: one of two fills.
+_MULTI_FILL_PENDING_SENTINEL: Final[str] = "R7_MULTI_FILL_PENDING"
 
 #: The only order side Breezy OPENS with. ``allow_short=False`` is permanent
 #: (``strategy/weather_common/risk.py:139``).
@@ -1498,6 +1529,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # Set by `_map_position` at each return, read by the durable pass to
         # tell an unparseable row (fails the whole read) from a settled one.
         self._position_map_outcome: str = ""
+        # R-7-IMPL (RULING R-7): `(fill_ts_event, send_ns, recv_ns,
+        # client_order_id, reads_without_long)`, keyed by instrument -- one
+        # entry per unconfirmed create-path accept-fill. Populated ONLY by
+        # `_submit_order`'s accept-fill branch (never the resolver's);
+        # matched and popped by `_match_position_lag`, called from
+        # `_write_startup_position_evidence`. In memory only, lost on
+        # restart -- an unconfirmed entry costs nothing but bounded memory.
+        self._position_lag_pending: Mapping[InstrumentId, tuple[int, int, int, str, int]] = {}
+        # R-7-IMPL: instruments `_match_position_lag` confirmed LONG as of
+        # its LAST pass that actually read this instrument's position --
+        # used to reject a SECOND pending fill's confirmation as
+        # `PRIOR_LONG` (ambiguous attribution) instead of double-counting an
+        # already-open LONG.
+        self._position_lag_last_long: frozenset[InstrumentId] = frozenset()
 
     # -- observable state ---------------------------------------------------
 
@@ -3922,6 +3967,144 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # refresh reads against -- a plain attribute assignment, invisible
         # to `find_exec_resolver_violations` (walks `ast.Call` only).
         self._last_evidence_write_ns = now_ns
+        # R-7-IMPL (RULING R-7): the only place a create-path accept-fill's
+        # `PositionReportingLag` can be confirmed -- an eof-complete,
+        # non-refused positions read, exactly like the one just written
+        # above. Never runs on a refused or non-eof-complete page (matching
+        # neither confirms nor denies a LONG). `_match_position_lag` sits
+        # outside both the order-lifecycle and resolver callee allowlists --
+        # a pre-existing pattern this plan extends (security review, plan
+        # r1.1), compensated by the order-sender reference ban in
+        # `tests/unit/test_execution_egress_firewall_guard.py` -- so the
+        # broad `except` here is required: any failure inside it must be
+        # contained rather than propagate into a caller (`_connect`, the
+        # resolver's age-gated refresh) that expects this method never to
+        # raise. Evidence bytes above are unaffected either way -- they are
+        # already durable by the time this runs.
+        if eof_complete and not position_read_refused:
+            try:
+                self._match_position_lag(raw_positions, now_ns)
+            except Exception as exc:  # noqa: BLE001 - contained; diagnostic only
+                self._log.warning(
+                    f"R7_LAG_REJECT reason=MATCH_FAILED detail="
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+
+    def _match_position_lag(self, raw_positions: Mapping[str, Any], now_ns: int) -> None:
+        """R-7-IMPL producer's confirming half (RULING R-7).
+
+        Per pending create-path accept-fill entry, in `_position_lag_pending`
+        insertion order: reject a poisoned/implausible `tsEvent` outright;
+        otherwise wait for a read taken after the fill's own receive time,
+        then confirm or count a non-LONG read, until either a LONG confirms
+        (a `PositionReportingLag` is logged and the entry is popped) or the
+        entry ages out (`UNCONFIRMED_TTL`). Never calls `_map_position`,
+        which latches trading refusals and mutates settled-position state --
+        this function is a pure diagnostic and must have zero side effect
+        on trading. An undetermined position (no payload for this instrument's
+        slug, or a payload `parse_position_status_report` cannot map) leaves
+        the entry pending, unchanged, for a later pass to resolve.
+        """
+        if not self._position_lag_pending:
+            return
+        bound_ns = _FILL_TS_EVENT_MAX_SKEW_NS
+        still_pending: dict[InstrumentId, tuple[int, int, int, str, int]] = {}
+        determined_long: set[InstrumentId] = set()
+        determined_not_long: set[InstrumentId] = set()
+        for instrument_id, entry in self._position_lag_pending.items():
+            fill_ts_event, send_ns, recv_ns, client_order_id, reads_without_long = entry
+            reject_reason: str | None = None
+            if client_order_id == _MULTI_FILL_PENDING_SENTINEL:
+                reject_reason = "MULTI_FILL_PENDING"
+            elif fill_ts_event <= 0:
+                reject_reason = "TS_EVENT_ABSENT"
+            elif fill_ts_event < send_ns - bound_ns:
+                reject_reason = "TS_EVENT_SKEW_PAST"
+            elif fill_ts_event > recv_ns + bound_ns:
+                reject_reason = "TS_EVENT_SKEW_FUTURE"
+            if reject_reason is not None:
+                self._log.warning(
+                    f"R7_LAG_REJECT reason={reject_reason} instrument_id={instrument_id} "
+                    f"client_order_id={client_order_id} fill_ts_event={fill_ts_event} "
+                    f"send_ns={send_ns} recv_ns={recv_ns} bound_ns={bound_ns}"
+                )
+                continue
+            if now_ns <= recv_ns:
+                still_pending[instrument_id] = entry
+                continue
+            if instrument_id in self._position_lag_last_long:
+                self._log.warning(
+                    f"R7_LAG_REJECT reason=PRIOR_LONG instrument_id={instrument_id} "
+                    f"client_order_id={client_order_id} fill_ts_event={fill_ts_event} "
+                    f"send_ns={send_ns} recv_ns={recv_ns} bound_ns={bound_ns}"
+                )
+                continue
+            slug = base_slug_of(instrument_id)
+            payload = raw_positions.get(slug)
+            instrument = self._cache.instrument(instrument_id)
+            is_long = False
+            determined = False
+            if payload is None:
+                determined = True
+            elif instrument is not None and isinstance(payload, Mapping):
+                try:
+                    mapped = parse_position_status_report(
+                        payload,
+                        market_slug=slug,
+                        instrument=instrument,
+                        account_id=self._issued_account_id,
+                        report_id=UUID4(),
+                        ts_init=now_ns,
+                    )
+                except Exception:  # noqa: BLE001 - one bad position never blocks the rest
+                    mapped = None
+                if mapped is not None:
+                    determined = True
+                    is_long = (
+                        not mapped.expired
+                        and mapped.report.position_side == PositionSide.LONG
+                        and mapped.leg == leg_of(instrument_id)
+                    )
+            if is_long:
+                delta_ns = now_ns - fill_ts_event
+                record = PositionReportingLag(
+                    instrument_id=instrument_id,
+                    fill_ts_event=fill_ts_event,
+                    first_eof_read_ts_showing_long=now_ns,
+                    delta_ns=delta_ns,
+                    fill_ts_event_source=FILL_TS_EVENT_SOURCE_VENUE_TRANSACT_TIME,
+                )
+                self._log.info(
+                    f"R7_POSITION_REPORTING_LAG instrument_id={record.instrument_id} "
+                    f"client_order_id={client_order_id} fill_ts_event={record.fill_ts_event} "
+                    f"fill_ts_event_source={record.fill_ts_event_source} "
+                    f"first_eof_read_ts_showing_long={record.first_eof_read_ts_showing_long} "
+                    f"delta_ns={record.delta_ns} delta_ms={record.delta_ns // 1_000_000} "
+                    f"reads_without_long={reads_without_long} "
+                    f"recv_skew_ns={fill_ts_event - recv_ns}"
+                )
+                determined_long.add(instrument_id)
+                continue
+            if determined:
+                determined_not_long.add(instrument_id)
+            if now_ns - recv_ns > _POSITION_LAG_PENDING_TTL_NS:
+                self._log.warning(
+                    f"R7_LAG_REJECT reason=UNCONFIRMED_TTL instrument_id={instrument_id} "
+                    f"client_order_id={client_order_id} fill_ts_event={fill_ts_event} "
+                    f"send_ns={send_ns} recv_ns={recv_ns} bound_ns={bound_ns}"
+                )
+                continue
+            still_pending[instrument_id] = (
+                fill_ts_event,
+                send_ns,
+                recv_ns,
+                client_order_id,
+                reads_without_long + 1,
+            )
+        self._position_lag_pending = still_pending
+        self._position_lag_last_long = (
+            self._position_lag_last_long - determined_not_long
+        ) | determined_long
 
     async def _refresh_startup_position_evidence(self) -> None:
         """C1: fresh positions read at the END of `_connect`.
@@ -4541,6 +4724,45 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 liquidity_side=LiquiditySide.TAKER,
                 ts_event=fill.ts_event,
             )
+            # R-7-IMPL (RULING R-7): remember this fill's venue `tsEvent`,
+            # keyed by instrument, for `_match_position_lag` to confirm
+            # against the next eof-complete positions read. One statement,
+            # after every effect above, no `await`, no new callee --
+            # `self._clock.timestamp_ns` is already permitted (E0-NOSEND).
+            # `in` is a membership test, not an `ast.Call`, and a dict
+            # literal is not one either -- both invisible to
+            # `find_exec_send_path_violations`, the same shape
+            # `_last_evidence_write_ns`'s plain assignment already uses.
+            # Never for an exit order (INC-E2 widened this branch to close
+            # fills too): only a create-path ENTRY establishes the LONG this
+            # record measures confirmation of. A SECOND accept-fill on an
+            # instrument with an unconfirmed entry poisons it with
+            # `_MULTI_FILL_PENDING_SENTINEL` instead of overwriting it --
+            # neither fill's confirmation would be attributable to one POST.
+            if not is_exit_order:
+                if order.instrument_id in self._position_lag_pending:
+                    existing_lag_entry = self._position_lag_pending[order.instrument_id]
+                    self._position_lag_pending = {
+                        **self._position_lag_pending,
+                        order.instrument_id: (
+                            existing_lag_entry[0],
+                            existing_lag_entry[1],
+                            existing_lag_entry[2],
+                            _MULTI_FILL_PENDING_SENTINEL,
+                            existing_lag_entry[4],
+                        ),
+                    }
+                else:
+                    self._position_lag_pending = {
+                        **self._position_lag_pending,
+                        order.instrument_id: (
+                            fill.ts_event,
+                            now_ns,
+                            self._clock.timestamp_ns(),
+                            order.client_order_id.value,
+                            0,
+                        ),
+                    }
             return
         if (
             outcome.kind == submit_chain.KIND_ZERO_FILL

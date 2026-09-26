@@ -70,6 +70,7 @@ from breezy.runtime.submit_intent import (
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.polymarket_us_exec_shapes import (
     ACCOUNT_ID,
+    TS_EVENT_NANOS,
     TS_EVENT_TEXT,
     build_execution,
     build_instrument,
@@ -2506,3 +2507,110 @@ def test_a_captured_2026_09_13_execution_drift_body_classifies_accept_fill() -> 
     # that logic's own quantity identity, independent of this change.
     # Documented here, not a claim this change alters that logic.
     assert outcome.fee_reconciled is False
+
+
+# ---------------------------------------------------------------------------
+# R-7-IMPL (RULING R-7, plan `docs/plans/backlog/R-7-IMPL_plan_r1_2026-09-26.md`):
+# the create-path accept-fill branch's producer half.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_r7_accept_fill_populates_the_position_lag_pending_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """T2 (producer half): a create-path accept-fill records
+    `(fill.ts_event, send_ns, recv_ns, client_order_id, 0)`, keyed by
+    instrument, for `_match_position_lag` to confirm against later."""
+    sender = _FakeSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(str(build_instrument().raw_symbol)),
+    )
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+        command = rig.limit_buy()
+        before_ns = rig.clock.timestamp_ns()
+        await rig.client._submit_order(command)
+        after_ns = rig.clock.timestamp_ns()
+        await rig.client._disconnect()
+
+    pending = rig.client._position_lag_pending
+    assert list(pending) == [rig.instrument.id]
+    fill_ts_event, send_ns, recv_ns, client_order_id, reads_without_long = pending[
+        rig.instrument.id
+    ]
+    assert fill_ts_event == TS_EVENT_NANOS
+    assert before_ns <= send_ns <= recv_ns <= after_ns
+    assert client_order_id == command.order.client_order_id.value
+    assert reads_without_long == 0
+
+
+@pytest.mark.asyncio
+async def test_r7_a_second_accept_fill_on_an_already_pending_instrument_poisons_the_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """T8 (producer half, MULTI_FILL_PENDING): a create-path accept-fill on
+    an instrument that ALREADY carries an unconfirmed entry poisons it with
+    the multi-fill sentinel rather than overwriting it -- neither fill's
+    confirmation could be attributed to a single POST. Seeded directly
+    (rather than driven by two real submits) because the daily submit-intent
+    latch makes a second real POST for the same station-day unreachable --
+    this isolates the poisoning branch itself, which is exactly what T8
+    tests."""
+    from breezy.adapters.polymarket_us.exec.client import _MULTI_FILL_PENDING_SENTINEL
+
+    sender = _FakeSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(str(build_instrument().raw_symbol)),
+    )
+    seeded_entry = (123, 456, 789, "prior-order-id", 2)
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+        rig.client._position_lag_pending = {rig.instrument.id: seeded_entry}
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    entry = rig.client._position_lag_pending[rig.instrument.id]
+    assert entry == (123, 456, 789, _MULTI_FILL_PENDING_SENTINEL, 2)
+
+
+def test_r7_the_accept_fill_branch_skips_position_lag_pending_for_an_exit_order() -> None:
+    """T9 (exit half): the producer statement is gated `if not is_exit_order`,
+    so a create-path accept-fill on an EXIT never creates or touches a
+    `_position_lag_pending` entry. Source-text check (module docstring
+    precedent: `test_ambiguous_classified_path_source_logs_the_venues_shape_
+    not_its_body` above) -- a real end-to-end exit accept-fill needs a full
+    `FamilyManifest` + exit-tag wiring this suite does not otherwise carry,
+    and the guard itself is a single, directly-inspectable boolean gate."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._submit_order)
+    start = source.index("self.generate_order_filled(\n")
+    end = source.index(
+        "return\n        if (\n            outcome.kind == submit_chain.KIND_ZERO_FILL"
+    )
+    block = source[start:end]
+    assert "if not is_exit_order:" in block
+    assert "_position_lag_pending" in block
+
+
+def test_r7_the_resolver_accept_fill_path_never_touches_position_lag_pending() -> None:
+    """T9 (resolver half): a GET-confirmed fill on the resolver path
+    (`_resolve_accept_fill`) never creates a `_position_lag_pending` entry --
+    only the create-path accept-fill branch in `_submit_order` does. Source
+    check for the same reason as above: `_position_lag_pending` must not
+    appear anywhere in the resolver's own terminal-fill helper."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._resolve_accept_fill)
+    assert "_position_lag_pending" not in source
