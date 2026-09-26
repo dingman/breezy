@@ -1,6 +1,6 @@
 # G-14 — reboot-durable supervision for the quote tape and the K1 study
 
-**Status: ACTIVATED** (the 09-12 header "PREPARED, NOT ACTIVATED" is superseded; measured 2026-09-26: 36 `breezy-*` symlinks into this directory plus 2 host-local regular files, `breezy-nws-ingest.service` (no source here) and `breezy-trade-supervisor.service` (a regular file that shadows the repo copy, with .bak copies from 09-20/09-21); 17 active timers; 4 services running). The cutover in §3 is run by the coordinator, with eyes on
+**Status: ACTIVATED** (the 09-12 header "PREPARED, NOT ACTIVATED" is superseded; counts pending re-measurement at deploy 2026-09-26 — `breezy-trade-supervisor.service` is now a host symlink to the repo copy (coordinator's change; no longer the shadowing regular file described previously), and `breezy-nws-ingest.service` is now versioned here (`deploy/systemd/breezy-nws-ingest.service`, byte-identical to the host copy) along with the `breezy.slice.d/memory.conf` drop-in (`deploy/systemd/breezy.slice.d/memory.conf`); both remain host-local regular files until the coordinator's next symlinking pass converts them, at which point the host's regular-file count for these two goes from 2 to 0; 17 active timers; 4 services running). The cutover in §3 is run by the coordinator, with eyes on
 it, because it briefly stops the one data stream Breezy cannot re-acquire.
 
 ## 1. What this replaces, and why it is urgent
@@ -1424,9 +1424,13 @@ which could itself be starved indefinitely by the live node's own I/O), not
 serialized behind the studies lock. Anyone reading Rev 2's G2 ("no >1 GB
 unit starts inside P") as satisfied by this item is reading it wrong.
 
-**`breezy-nws-ingest.service` residual.** This unit is installed on the host
-with no copy in this repo -- a pre-existing, out-of-scope residual, named
-here rather than silently inherited.
+**`breezy-nws-ingest.service` residual.** RESOLVED 2026-09-26 (OPS-1): the
+unit is now versioned at `deploy/systemd/breezy-nws-ingest.service`
+(byte-identical to the host copy, confirmed via `cmp`), along with the
+`breezy.slice.d/memory.conf` drop-in at
+`deploy/systemd/breezy.slice.d/memory.conf`. Both remain host-local regular
+files -- not yet symlinks -- until the coordinator's next host symlinking
+pass (re-measured at deploy 2026-09-26).
 
 **Declared stale cross-references (A-20).** MOVED 2026-09-12 retimed
 exactly `breezy-k1-daily.timer` (was `22:30`, MOVED 2026-09-12) and the
