@@ -39,7 +39,14 @@ mkdir -p "$LOCK_DIR" 2>>"$LOG" || { say "SKIPPED-INFRA -- no studies lock direct
 exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studies lock"; exit 75; }
 flock -n 9                     || { say "SKIPPED -- another study holds the studies lock"; exit 0; }
 
-if "$PY" "$REPO/scripts/analysis/decision_funnel_daily_digest.py"; then
+# FU-6: supplied by the unit's own Environment= line (a non-secret path
+# literal, byte-identical to the sibling analysis units -- see the unit
+# file's own comment). Passed through explicitly as --store-path so the
+# digest's halt_enforced read never silently falls back to "unknown" for
+# want of this var.
+STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is required}"
+
+if "$PY" "$REPO/scripts/analysis/decision_funnel_daily_digest.py" --store-path "$STATE_DB"; then
   say "decision funnel digest ok"
 else
   status=$?

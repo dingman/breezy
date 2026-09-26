@@ -107,7 +107,11 @@ def test_pending_does_not_refuse_evaluation_and_the_shadow_log_marks_pending_1(
     )
     assert submitted == []
     assert strategy.last_no_take_shadow is not None
-    assert strategy.last_no_take_shadow.endswith("pending=1")
+    # FU-2: `pending=` is no longer the line's last token -- the running-max
+    # bounds/obs-ts/staleness fields now follow it (see
+    # test_continuous_rung_hold_no_side_shadow_2026_09_14.py) -- so this
+    # asserts the field's VALUE, not the line's ending.
+    assert "pending=1 " in strategy.last_no_take_shadow
     assert strategy.last_no_refuse is None
 
 
@@ -121,7 +125,8 @@ def test_not_pending_the_shadow_log_marks_pending_0(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
     )
     assert strategy.last_no_take_shadow is not None
-    assert strategy.last_no_take_shadow.endswith("pending=0")
+    # FU-2: see the `pending=1 ` comment above -- same reasoning, `pending=0`.
+    assert "pending=0 " in strategy.last_no_take_shadow
 
 
 def test_pending_with_the_captured_key_also_present_marks_pending_0(
@@ -138,7 +143,8 @@ def test_pending_with_the_captured_key_also_present_marks_pending_0(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
     )
     assert strategy.last_no_take_shadow is not None
-    assert strategy.last_no_take_shadow.endswith("pending=0")
+    # FU-2: see the `pending=1 ` comment above -- same reasoning, `pending=0`.
+    assert "pending=0 " in strategy.last_no_take_shadow
 
 
 def test_pending_still_lets_the_sibling_leg_traded_gate_fire_first(

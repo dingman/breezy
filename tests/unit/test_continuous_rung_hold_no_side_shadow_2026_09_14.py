@@ -152,6 +152,65 @@ def test_a_clearing_no_frame_logs_exactly_one_shadow_line_and_submits_nothing(
     )
 
 
+def test_no_take_shadow_line_carries_the_running_max_bounds_and_obs_ts(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """FU-2: the `no_take_shadow:` line's `pending=` field is now followed
+    by the running max's Fahrenheit interval, the observing row's own
+    timestamp, and the staleness in seconds -- mirroring the YES `take:`
+    line's own `R=[...]`/staleness fields (``:2298-2304``), so a NO-shadow
+    postmortem carries the same observability the YES take path already
+    has.
+
+    ``temp_c_tenths=300`` is an exact METAR point (30.0 C -> 86 F), so
+    ``running_max`` collapses to ``[86,86]``; the single observation is
+    ``observed_at_ns=WINDOW_OPEN_NS - 1``, and the quote arrives one
+    nanosecond later, so ``staleness_s == 1e-09``.
+    """
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
+    )
+    assert strategy.last_no_take_shadow is not None
+    assert "R=[86,86]" in strategy.last_no_take_shadow
+    assert f"obs_ts_ns={WINDOW_OPEN_NS - 1}" in strategy.last_no_take_shadow
+    assert "staleness_s=1e-09" in strategy.last_no_take_shadow
+
+
+def test_no_take_shadow_line_renders_none_when_running_max_absent(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """FU-2: called directly with no ``running_max``/``staleness_ns`` (both
+    default ``None`` -- exactly the two direct-call-site convention this
+    module's docstring names), the new fields render
+    ``R=None obs_ts_ns=None staleness_s=None``, never a ``NoneType`` crash
+    on ``.lower_f``/``.upper_f``."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    no_take = Take(
+        quantity=1,
+        limit_price=Decimal("0.15"),
+        p_hold_lower=Decimal("0.2211"),
+        break_even=Decimal("0.16"),
+        rung=(86, 87),
+        side="no",
+        p_bound=Decimal("0.2211"),
+    )
+    strategy._evaluate_no_side_shadow(
+        station=STATION,
+        climate_day_key=CLIMATE_DAY.isoformat(),
+        station_day=(STATION, CLIMATE_DAY.isoformat()),
+        yes_instrument_id=INTERIOR_ID,
+        no_decision=no_take,
+        now_ns=WINDOW_OPEN_NS,
+        bid_size=Decimal(2),
+    )
+    assert strategy.last_no_take_shadow is not None
+    assert "R=None obs_ts_ns=None staleness_s=None" in strategy.last_no_take_shadow
+
+
 def test_sibling_yes_filled_refuses_the_no_take_with_sibling_leg_traded(
     store_path: Path,
     interior_instrument: BinaryOption,

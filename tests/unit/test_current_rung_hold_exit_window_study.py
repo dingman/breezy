@@ -1605,6 +1605,20 @@ def _seed_cached_asos(cache_dir: Path, city: str) -> None:
     path.write_text("station,valid,metar\n", encoding="utf-8")
 
 
+def _seed_unreadable_asos_cache(cache_dir: Path, city: str) -> None:
+    """A cache entry that EXISTS but cannot be read as text -- a directory
+    in place of the expected file forces `Path.read_text()` to raise
+    `IsADirectoryError` (an `OSError` subclass) on every platform, without
+    depending on permission bits a root/CI user can bypass."""
+    spec = next(spec for spec in settlement.load_sites() if spec.city == city)
+    url = settlement.asos_url(
+        spec.iem_asos_id, prelock.ASOS_FETCH_START, prelock.ASOS_FETCH_END,
+    )
+    path = settlement.cache_path_for_url(cache_dir, url, ".txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir()
+
+
 def _study_argv(
     tmp_path: Path, *, cache_dir: Path, aud04_report: Path | None = None,
 ) -> list[str]:
@@ -1684,6 +1698,73 @@ def test_a_transport_error_on_one_station_is_missing_and_the_cached_station_cont
     failed = [item for item in missing if _FAILED_CITY in item]
     assert failed
     assert all("ConnectError" in item for item in failed)
+
+
+def test_an_unreadable_cached_asos_file_is_reported_per_station_and_the_run_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FU-4: a cache entry that exists but cannot be read as text (`OSError`,
+    e.g. a truncated/corrupted or permission-denied file) is reported per
+    station -- never an uncaught crash -- counted toward `failed_fetches`
+    (so a TOTAL outage still exits non-zero), and the run continues on to
+    the next station, mirroring the existing 429/`TransportError`
+    per-station-failure contract."""
+    cache_dir = tmp_path / "asos"
+    _seed_unreadable_asos_cache(cache_dir, _FAILED_CITY)
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="cache",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=lambda seconds: None,
+    )
+
+    assert [row.position.station for row in rows] == [_CACHED_CITY]
+    failed = [item for item in missing if _FAILED_CITY in item]
+    assert failed
+    assert any("unreadable" in item and "IsADirectoryError" in item for item in failed)
+
+
+def test_the_run_prints_an_n_of_m_stations_loaded_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FU-4: `run_exit_window_study` prints one
+    `[exit-window-study] ASOS stations loaded: N/M` line to stderr before
+    returning -- N counts stations whose ASOS text actually loaded (cache
+    hit or fetch success), M counts every station an attempt was made for.
+    Reuses the 429-partial-outage fixture, where exactly one of the two
+    stations loads."""
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+
+    study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=lambda seconds: None,
+    )
+
+    captured = capsys.readouterr()
+    assert "[exit-window-study] ASOS stations loaded: 1/2" in captured.err
 
 
 def test_every_station_429_exits_non_zero_and_names_each_station(
