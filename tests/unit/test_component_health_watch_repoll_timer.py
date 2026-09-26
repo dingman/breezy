@@ -27,6 +27,7 @@ from nautilus_trader.common.component import LiveClock, MessageBus, TestClock
 from nautilus_trader.model.identifiers import TraderId
 
 from breezy.runtime.component_health_watch import (
+    REFUSAL_REPOLL_HEARTBEAT_TICKS,
     REFUSAL_REPOLL_INTERVAL,
     REFUSAL_REPOLL_TIMER_NAME,
     install_reconciliation_refusal_alert,
@@ -323,3 +324,68 @@ class TestArmingSignals:
         assert len(info_records) == 1
         assert REFUSAL_REPOLL_TIMER_NAME in info_records[0].message
         assert "interval_s=60" in info_records[0].message
+
+
+class TestHeartbeat:
+    """FU-8b silent-failure fix 1: a low-rate positive liveness signal, so an
+    operator can distinguish a dead timer from a quiet interval."""
+
+    def test_heartbeat_does_not_fire_before_tick_60(self, caplog: Any) -> None:
+        assert REFUSAL_REPOLL_HEARTBEAT_TICKS == 60
+        clock = TestClock()
+        install_refusal_repoll_timer(clock, loop=_InlineLoop(), handlers=())
+
+        with caplog.at_level("INFO"):
+            for _ in range(REFUSAL_REPOLL_HEARTBEAT_TICKS - 1):
+                _fire(clock)
+
+        heartbeats = [r for r in caplog.records if "refusal re-poll alive" in r.message]
+        assert heartbeats == []
+
+    def test_heartbeat_fires_exactly_once_at_tick_60(self, caplog: Any) -> None:
+        clock = TestClock()
+        install_refusal_repoll_timer(clock, loop=_InlineLoop(), handlers=())
+
+        with caplog.at_level("INFO"):
+            for _ in range(REFUSAL_REPOLL_HEARTBEAT_TICKS):
+                _fire(clock)
+
+        heartbeats = [r for r in caplog.records if "refusal re-poll alive" in r.message]
+        assert len(heartbeats) == 1
+        assert f"name={REFUSAL_REPOLL_TIMER_NAME}" in heartbeats[0].message
+        assert "ticks=60" in heartbeats[0].message
+
+    def test_heartbeat_fires_again_at_tick_120(self, caplog: Any) -> None:
+        clock = TestClock()
+        install_refusal_repoll_timer(clock, loop=_InlineLoop(), handlers=())
+
+        with caplog.at_level("INFO"):
+            for _ in range(2 * REFUSAL_REPOLL_HEARTBEAT_TICKS):
+                _fire(clock)
+
+        heartbeats = [r for r in caplog.records if "refusal re-poll alive" in r.message]
+        assert len(heartbeats) == 2
+        assert "ticks=120" in heartbeats[1].message
+
+
+class TestFailedHandlerIsNamed:
+    """FU-8b silent-failure fix 2: the ERROR log must name which handler
+    failed, not just that "a" handler failed."""
+
+    def test_the_error_log_names_the_failing_handler(self, caplog: Any) -> None:
+        def _named_raiser(event: object) -> None:
+            raise ValueError("boom")
+
+        clock = TestClock()
+        install_refusal_repoll_timer(
+            clock,
+            loop=_InlineLoop(),
+            handlers=(lambda event: None, _named_raiser),
+        )
+
+        with caplog.at_level("ERROR"):
+            _fire(clock)
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "_named_raiser" in errors[0].message

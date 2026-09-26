@@ -344,6 +344,17 @@ REFUSAL_REPOLL_TIMER_NAME: Final[str] = "breezy-refusal-repoll"
 #: set lookups per minute -- is negligible.
 REFUSAL_REPOLL_INTERVAL: Final[timedelta] = timedelta(seconds=60)
 
+#: 60 ticks of the 60 s :data:`REFUSAL_REPOLL_INTERVAL` -- hourly. A low-rate
+#: positive liveness signal, distinct from the one-time "armed" INFO line:
+#: without it an operator reading the log cannot tell a dead timer (Rust/tokio
+#: thread wedged, or silently uninstalled) from a quiet interval with nothing
+#: to alert on. Emitted from ``_poll`` -- the loop-thread function, never
+#: ``_on_timer`` -- so the signal only fires once the ``call_soon_threadsafe``
+#: hop actually lands, which is the same liveness the alert handlers depend
+#: on. Not per-tick: a 60 s INFO line would drown the log for no operator
+#: benefit.
+REFUSAL_REPOLL_HEARTBEAT_TICKS: Final[int] = 60
+
 
 def install_refusal_repoll_timer(
     clock: Clock,
@@ -374,11 +385,21 @@ def install_refusal_repoll_timer(
     via ``loop.call_soon_threadsafe``. Any failure to schedule -- including
     the closed-loop race between the check and the call -- is logged at
     ERROR with the exception TYPE only, mirroring ``health.emit_alert``'s own
-    discipline, and yields at most one ERROR rather than a 60-second stream.
+    discipline. "At most one ERROR" holds only for the loop-CLOSING race:
+    once ``loop.is_closed()`` answers ``True``, every later tick returns
+    before scheduling anything, so that failure mode logs once. A
+    PERSISTENT, non-closing ``call_soon_threadsafe`` failure (the loop stays
+    open but scheduling keeps raising for some other reason) is not
+    contained the same way and re-logs one ERROR every interval for as long
+    as the failure persists -- still bounded to one per tick, but loud.
 
     ``_poll`` -- the function handed to the loop -- runs each handler inside
-    its OWN ``try/except Exception``, so one raising handler is logged and
-    neither blocks its sibling in the same tick nor any later tick.
+    its OWN ``try/except Exception``, so one raising handler is logged (named,
+    so an operator can tell which of ``handlers`` failed) and neither blocks
+    its sibling in the same tick nor any later tick. Every
+    :data:`REFUSAL_REPOLL_HEARTBEAT_TICKS` th tick, after the handlers run,
+    ``_poll`` also emits one low-rate INFO heartbeat so a dead timer is
+    distinguishable from a quiet interval.
 
     Parameters
     ----------
@@ -410,15 +431,31 @@ def install_refusal_repoll_timer(
     fails loudly rather than doubling the poll rate.
     """
 
+    tick_count = 0
+
     def _poll(event: object) -> None:
-        for handler in handlers:
+        nonlocal tick_count
+        for index, handler in enumerate(handlers):
             try:
                 handler(event)
             # Broad, deliberately: one broken handler must not block its
             # sibling in this tick, or any later tick (CONTAINMENT, module
             # docstring).
             except Exception:
-                logger.exception("refusal re-poll handler failed")
+                handler_name = (
+                    getattr(handler, "__qualname__", None)
+                    or getattr(handler, "__name__", None)
+                    or f"handlers[{index}]"
+                )
+                logger.exception("refusal re-poll handler failed handler=%s", handler_name)
+
+        tick_count += 1
+        if tick_count % REFUSAL_REPOLL_HEARTBEAT_TICKS == 0:
+            logger.info(
+                "refusal re-poll alive name=%s ticks=%d",
+                REFUSAL_REPOLL_TIMER_NAME,
+                tick_count,
+            )
 
     def _on_timer(event: TimeEvent) -> None:
         try:
