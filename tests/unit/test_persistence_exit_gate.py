@@ -13,6 +13,7 @@ because it is not, and must never become, a member of the frozenset.
 
 from __future__ import annotations
 
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 
@@ -228,6 +229,80 @@ def test_a_manifest_both_registered_and_declaring_exit_rule_gates_true(
         exit_rule="hold_to_settlement",
     )
     assert exit_gate_module.family_declares_exit_rule(manifest) is True
+
+
+# ---------------------------------------------------------------------------
+# FU-1d: the NO-leg exit-declaration gate (RULING_FU-1b_no_leg_marks_
+# 2026-09-26.md item 2).
+# ---------------------------------------------------------------------------
+
+
+def test_every_committed_manifest_loads_unchanged_and_declares_no_no_leg_exit() -> None:
+    """AC4: every committed manifest loads with NO change to its bytes or
+    `manifest_sha256`, and none of them declares `no_leg_exit` today."""
+    for path in _committed_manifest_paths():
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest = _load_any(path)
+        after = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert before == after, f"{path}: bytes changed by loading"
+        assert manifest.manifest_sha256 == before
+        assert manifest.no_leg_exit is False
+
+
+def test_family_declares_no_leg_exit_requires_the_exit_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`family_declares_no_leg_exit` can only ever ADD a restriction on top
+    of `family_declares_exit_rule` -- never grant one independently."""
+    import breezy.persistence.exit_gate as exit_gate_module
+
+    monkeypatch.setattr(
+        exit_gate_module, "_EXIT_RULE_REGISTERED_FAMILIES", frozenset({"registered_family"}),
+    )
+
+    def _manifest(*, family_id: str, exit_rule: str | None, no_leg_exit: bool) -> FamilyManifest:
+        return FamilyManifest(
+            family_id=family_id,
+            venue="polymarket_us",
+            taker_fee_coefficient=Decimal("0.06"),
+            trial_id_prefix="registered/trial/",
+            d0_climate_day="2026-09-15",
+            boundary_artefact_path=Path("deploy/families/does_not_matter.json"),
+            boundary_inputs_sha256="a" * 64,
+            composition_kind="continuous_rung_hold",
+            density_artefact_path=Path("deploy/families/artefacts/not_applicable_density.json"),
+            density_artefact_sha256=(
+                "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65"
+            ),
+            stations=("SFO",),
+            status="REGISTERED",
+            manifest_sha256="b" * 64,
+            exit_rule=exit_rule,
+            no_leg_exit=no_leg_exit,
+        )
+
+    # Registered + exit_rule + no_leg_exit=True -> True (both halves present).
+    assert (
+        exit_gate_module.family_declares_no_leg_exit(
+            _manifest(family_id="registered_family", exit_rule="rule", no_leg_exit=True)
+        )
+        is True
+    )
+    # Registered + exit_rule but no_leg_exit=False -> False.
+    assert (
+        exit_gate_module.family_declares_no_leg_exit(
+            _manifest(family_id="registered_family", exit_rule="rule", no_leg_exit=False)
+        )
+        is False
+    )
+    # no_leg_exit=True but the family is NOT code-registered -> False: the
+    # family gate is not bypassable by the narrower one.
+    assert (
+        exit_gate_module.family_declares_no_leg_exit(
+            _manifest(family_id="unregistered_family", exit_rule="rule", no_leg_exit=True)
+        )
+        is False
+    )
 
 
 def test_live_composition_still_resolves_pm_us_crh_cont_not_the_draft_exit_family() -> None:

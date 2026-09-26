@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+from nautilus_trader.model.enums import OmsType, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
@@ -34,7 +36,7 @@ from breezy.strategy.current_rung_hold.monitor_decision import (
     Verdict,
     evaluate_monitor,
 )
-from breezy.strategy.current_rung_hold.monitor_evidence import MonitorEvidence
+from breezy.strategy.current_rung_hold.monitor_evidence import MonitorEvidence, walk_exit_vwap
 from breezy.strategy.current_rung_hold.monitor_store import (
     MarkBuffer,
     read_monitor_summaries,
@@ -149,6 +151,14 @@ def _build_monitor(
     hour_lst_for: Callable[[str, int], int] = lambda station, now_ns: 14,
     report: Callable[[str, Mapping[str, object]], None] | None = None,
     clock_ns: Callable[[], int] = lambda: WINDOW_OPEN_NS,
+    sibling_for: Callable[[str], str | None] | None = None,
+    buffer: MarkBuffer | None = None,
+    exit_decider: Callable[..., object] | None = None,
+    exit_manifest: object | None = None,
+    exit_family_id: str | None = None,
+    exit_client_order_id_factory: Callable[[], str] | None = None,
+    submit_exit: Callable[..., None] | None = None,
+    record_exit_offer: Callable[..., None] | None = None,
 ) -> tuple[PositionMonitor, list[tuple[str, Mapping[str, object]]]]:
     reports: list[tuple[str, Mapping[str, object]]] = []
 
@@ -168,10 +178,17 @@ def _build_monitor(
         hour_lst_for=hour_lst_for,
         stale_observation_bound_ns=_STALE_BOUND_NS,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
-        buffer=MarkBuffer(),
+        buffer=buffer if buffer is not None else MarkBuffer(),
         catalog_root=tmp_path / "monitor",
         summaries_dir=tmp_path / "monitor" / "summaries",
         report=report if report is not None else _default_report,
+        sibling_for=sibling_for,
+        exit_decider=exit_decider,  # type: ignore[arg-type]
+        exit_manifest=exit_manifest,  # type: ignore[arg-type]
+        exit_family_id=exit_family_id,
+        exit_client_order_id_factory=exit_client_order_id_factory,
+        submit_exit=submit_exit,
+        record_exit_offer=record_exit_offer,
     )
     return monitor, reports
 
@@ -186,6 +203,42 @@ class _FakeDepth:
         self.ts_event = ts_event
         self.bids: list[object] = []
         self.asks: list[object] = []
+
+
+def _book_order(side: OrderSide, price: str, size: str) -> BookOrder:
+    return BookOrder(side, Price(float(price), 2), Quantity(float(size), 2), 0)
+
+
+def _book_depth10(
+    *,
+    instrument_id: InstrumentId,
+    bids: tuple[tuple[str, str], ...],
+    asks: tuple[tuple[str, str], ...],
+    ts_ns: int,
+) -> OrderBookDepth10:
+    """A REAL `OrderBookDepth10` (never `_FakeDepth`'s empty stub), for the
+    FU-1d sibling-routing tests below that actually walk `depth.bids`/
+    `depth.asks` through `walk_exit_vwap`. Same zero-size-filler shape as
+    `test_current_rung_hold_monitor_evidence.py`'s own `_depth` helper --
+    Nautilus requires equal bid/ask lengths."""
+    bid_orders = [_book_order(OrderSide.BUY, p, s) for p, s in bids]
+    ask_orders = [_book_order(OrderSide.SELL, p, s) for p, s in asks]
+    n = max(len(bid_orders), len(ask_orders))
+    while len(bid_orders) < n:
+        bid_orders.append(_book_order(OrderSide.BUY, "0", "0"))
+    while len(ask_orders) < n:
+        ask_orders.append(_book_order(OrderSide.SELL, "0", "0"))
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bid_orders,
+        asks=ask_orders,
+        bid_counts=[1] * len(bid_orders),
+        ask_counts=[1] * len(ask_orders),
+        flags=0,
+        sequence=0,
+        ts_event=ts_ns,
+        ts_init=ts_ns,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +508,17 @@ def _wire_monitor(
     exit_client_order_id_factory: Callable[[], str] | None = None,
     submit_exit: Callable[..., None] | None = None,
     record_exit_offer: Callable[..., None] | None = None,
+    sibling_for: Callable[[str], str | None] | None = None,
 ) -> PositionMonitor:
     """Test-only DRY (file-by-file item 2, F1): builds the eight closures
     from the PRODUCTION `build_monitor_callables` factory instead of hand-
     copying them a fourth time -- byte-identical behaviour to the three
     call sites it already unifies (`monitor_wiring.py`'s own docstring), so
-    every existing assertion below is unchanged."""
+    every existing assertion below is unchanged.
+
+    FU-1d: `sibling_for` defaults to `None`, so every existing call site
+    (and its assertions) stays byte-unedited -- only the new NO-leg-routing
+    tests pass `sibling_for=callables.sibling_for` explicitly."""
     callables = build_monitor_callables(strategy)
 
     return PositionMonitor(
@@ -486,6 +544,7 @@ def _wire_monitor(
         exit_client_order_id_factory=exit_client_order_id_factory,
         submit_exit=submit_exit,
         record_exit_offer=record_exit_offer,
+        sibling_for=sibling_for,
     )
 
 
@@ -643,7 +702,9 @@ _DEAD_TEMP_C_TENTHS = 320  # 32.0C -> 90F, strictly above rung_high=87
 _DEAD_CONFIRM_SPAN_MIN = 6  # >= monitor_decision._DEAD_MIN_CONFIRM_SPAN_NS (5 min)
 
 
-def _manifest_for_exit_test(*, exit_rule: str | None) -> FamilyManifest:
+def _manifest_for_exit_test(
+    *, exit_rule: str | None, no_leg_exit: bool = False,
+) -> FamilyManifest:
     from breezy.persistence.family_manifest import FamilyManifest
 
     return FamilyManifest(
@@ -661,6 +722,7 @@ def _manifest_for_exit_test(*, exit_rule: str | None) -> FamilyManifest:
         status="REGISTERED" if exit_rule is not None else "DRAFT_NOT_REGISTERED",
         manifest_sha256="b" * 64,
         exit_rule=exit_rule,
+        no_leg_exit=no_leg_exit,
     )
 
 
@@ -884,10 +946,14 @@ def _build_position_monitor_via_callables(
     exit_client_order_id_factory: Callable[[], str] | None = None,
     submit_exit: Callable[..., None] | None = None,
     record_exit_offer: Callable[..., None] | None = None,
+    sibling_for: Callable[[str], str | None] | None = None,
 ) -> PositionMonitor:
     """The production `build_monitor_callables` factory, wired into a real
     `PositionMonitor` -- the FU-1-relevant twin of `_wire_monitor` above,
-    over a duck-typed fake rather than a real `ContinuousRungHoldStrategy`."""
+    over a duck-typed fake rather than a real `ContinuousRungHoldStrategy`.
+
+    FU-1d: `sibling_for` defaults to `None` (see `_wire_monitor`'s own
+    docstring note)."""
     callables = build_monitor_callables(strategy)  # type: ignore[arg-type]
     return PositionMonitor(
         clock_ns=lambda: WINDOW_OPEN_NS,
@@ -912,6 +978,7 @@ def _build_position_monitor_via_callables(
         exit_client_order_id_factory=exit_client_order_id_factory,
         submit_exit=submit_exit,
         record_exit_offer=record_exit_offer,
+        sibling_for=sibling_for,
     )
 
 
@@ -1193,14 +1260,19 @@ def test_no_leg_dead_with_gated_false_manifest_writes_only_refusal_rows_and_neve
     assert all(getattr(call, "side", None) == "NO" for call in offer_calls)
 
 
-def test_no_leg_dead_with_an_armed_family_refuses_book_not_executable_while_no_marks_exist(
+def test_no_leg_threatened_with_an_armed_family_refuses_no_leg_exit_not_declared(
     tmp_path: Path,
 ) -> None:
-    """Reviewer finding: an ARMED family (`exit_rule` set, family registered)
-    still refuses -- the NO leg's exit-side book was never walked (no depth
-    ever pushed here), so `decide_exit`'s own `_book_is_executable` check
-    refuses every evaluation with `book_not_executable`, and `submit_exit`
-    is never called."""
+    """FU-1d retarget (was `..._refuses_book_not_executable_while_no_marks_
+    exist`): an ARMED family (`exit_rule` set, family registered) but one
+    that does NOT declare `no_leg_exit` now refuses at the NEW, earlier
+    NO-leg declaration gate -- `no_leg_exit_not_declared` -- before
+    `decide_exit`'s own `_book_is_executable` check is ever reached (no
+    depth is pushed here either, so the book check would ALSO refuse, but
+    the new gate fires first per its placement directly after the family
+    gate). `submit_exit` is still never called. (f), in
+    `test_current_rung_hold_exit_decider.py`, keeps the old book-gate
+    assertion covered for a family that DOES declare `no_leg_exit`."""
     from breezy.strategy.current_rung_hold.exit_decider import decide_exit
 
     submit_calls: list[object] = []
@@ -1241,5 +1313,549 @@ def test_no_leg_dead_with_an_armed_family_refuses_book_not_executable_while_no_m
     assert submit_calls == []
     assert offer_calls, "at least one refusal row must still be persisted"
     assert all(
-        getattr(call, "exit_reason_code", None) == "book_not_executable" for call in offer_calls
+        getattr(call, "exit_reason_code", None) == "no_leg_exit_not_declared"
+        for call in offer_calls
     )
+
+
+# ---------------------------------------------------------------------------
+# FU-1d (RULING_FU-1b_no_leg_marks_2026-09-26.md, plan
+# FU-1d_derived_no_marks_plan_r1_2026-09-26.md): a YES `OrderBookDepth10`
+# frame is also routed to a registered NO-leg sibling, marked via
+# `walk_exit_vwap(..., leg="NO", ...)`. Driven through the isolated
+# `_build_monitor` stub harness (never `_build_position_monitor_via_
+# callables`'s duck-typed strategy, and never the production `_sibling_for`
+# closure) with plain lambda stubs standing in for `sibling_for` -- the
+# production `monitor_wiring._sibling_for` closure itself is covered by
+# `test_current_rung_hold_monitor_wiring.py`.
+# ---------------------------------------------------------------------------
+
+def _leg_for_yes_no(iid: str) -> str:
+    return "NO" if iid == _NO_IID else "YES"
+
+
+def _sibling_for_stub(iid: str) -> str | None:
+    """Production shape: routes ONLY the YES id forward, never a NO id
+    (edge case table: "a NO-leg frame is never re-routed")."""
+    return _NO_IID if iid == _IID else None
+
+
+def test_no_leg_position_receives_a_mark_from_its_yes_siblings_depth_frame(
+    tmp_path: Path,
+) -> None:
+    """RED without the fix: the NO position stays `mark_source="missing"`
+    forever because nothing ever routes a depth frame to it."""
+    positions = _PositionsOpenStub()
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+    assert monitor._buffer.records() == ()  # registration alone never evaluates
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.90", "5"),),
+        asks=(("0.30", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 0
+    no_records = [r for r in monitor._buffer.records() if r.leg == "NO"]
+    assert len(no_records) == 1
+    assert no_records[0].mark_source == "depth_walk"
+
+
+def test_no_leg_mark_equals_one_minus_walked_yes_ask_vwap(tmp_path: Path) -> None:
+    """(b): asks (0.30x2, 0.34x3), qty 4 -> walked ask VWAP 0.32, NO mark
+    `Decimal("0.68")` -- computed through the real `walk_exit_vwap`, never
+    hand-written. Bids at 0.90 are a decoy: NO must never touch them."""
+    positions = _PositionsOpenStub()
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=4)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=4), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.90", "10"),),
+        asks=(("0.30", "2"), ("0.34", "3")),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    expected_vwap, sufficient = walk_exit_vwap(depth, "NO", 4)
+    assert sufficient
+    assert expected_vwap == Decimal("0.68")
+    no_records = [r for r in monitor._buffer.records() if r.leg == "NO"]
+    assert len(no_records) == 1
+    assert no_records[0].mark_vwap == expected_vwap
+
+
+def test_no_leg_registers_from_sibling_frame_when_yes_is_not_held(tmp_path: Path) -> None:
+    """AC2: NO is held (in the cache) but YES is NOT -- the YES
+    `_ensure_registered` returns `None` and must no longer return early;
+    routing to the NO sibling still runs and lazily registers it."""
+    positions = _PositionsOpenStub()
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+
+    @dataclass
+    class _FakeRecord:
+        latched_at_ns: int
+
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+        latch_record=lambda *a, **k: _FakeRecord(latched_at_ns=WINDOW_OPEN_NS),
+    )
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(),
+        asks=(("0.30", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert _IID not in monitor._positions  # YES was never held; never registered
+    assert _NO_IID in monitor._positions
+    assert monitor._positions[_NO_IID].entry_context == "reconciled"
+
+
+def test_no_leg_registers_from_sibling_frame_reconciled_after_restart(tmp_path: Path) -> None:
+    """AC2, restart shape: BOTH legs are already open at the venue but
+    `PositionMonitor._positions` starts empty (a fresh process) -- the
+    first YES depth frame must lazily register BOTH, exactly as a solo YES
+    restart already does (`test_a_boot_inherited_position_lazily_registers_
+    as_reconciled_no_record`)."""
+    positions = _PositionsOpenStub()
+    positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)])
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.90", "5"),),
+        asks=(("0.30", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert monitor._positions[_IID].entry_context == "reconciled_no_record"
+    assert monitor._positions[_NO_IID].entry_context == "reconciled_no_record"
+
+
+def test_both_legs_held_are_each_marked_from_one_frame(tmp_path: Path) -> None:
+    positions = _PositionsOpenStub()
+    positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)])
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.30", "5"),),
+        asks=(("0.35", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert monitor.counters["evaluations"] == 2
+    records = monitor._buffer.records()
+    assert {r.leg for r in records} == {"YES", "NO"}
+    yes_record = next(r for r in records if r.leg == "YES")
+    no_record = next(r for r in records if r.leg == "NO")
+    assert yes_record.mark_source == "depth_walk"
+    assert no_record.mark_source == "depth_walk"
+    assert monitor._positions[_IID].last_book_ts_ns == WINDOW_OPEN_NS
+    assert monitor._positions[_NO_IID].last_book_ts_ns == WINDOW_OPEN_NS
+
+
+def test_bid_only_frame_leaves_no_leg_missing(tmp_path: Path) -> None:
+    positions = _PositionsOpenStub()
+    positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)])
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.30", "5"),),
+        asks=(),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    records = monitor._buffer.records()
+    yes_record = next(r for r in records if r.leg == "YES")
+    no_record = next(r for r in records if r.leg == "NO")
+    assert yes_record.mark_source == "depth_walk"  # nobody is selling YES: bids still mark it
+    assert no_record.mark_source == "missing"
+
+
+def test_no_leg_qty_beyond_displayed_asks_is_missing_never_partial(tmp_path: Path) -> None:
+    positions = _PositionsOpenStub()
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=10)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=10), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(),
+        asks=(("0.30", "5"),),  # only 5 displayed; held qty is 10
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    no_records = [r for r in monitor._buffer.records() if r.leg == "NO"]
+    assert len(no_records) == 1
+    assert no_records[0].mark_source == "missing"
+    assert no_records[0].mark_vwap is None
+
+
+def test_stale_cached_sibling_book_refuses_book_stale_for_no(tmp_path: Path) -> None:
+    """Edge case table: `last_book_ts_ns` is stamped from the routed frame
+    like YES already gets; a LATER `on_observation` (no new depth) re-uses
+    the cached book, so `book_staleness_ns` keeps growing -- the same
+    staleness-accrual behaviour YES already has."""
+    positions = _PositionsOpenStub()
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.90", "5"),),
+        asks=(("0.30", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    assert monitor._positions[_NO_IID].last_book_ts_ns == WINDOW_OPEN_NS
+
+    later_ns = WINDOW_OPEN_NS + 5 * _MINUTE_NS
+    monitor.on_observation(STATION, later_ns)
+
+    assert monitor._positions[_NO_IID].last_book_ts_ns == WINDOW_OPEN_NS  # never refreshed
+    no_records = [r for r in monitor._buffer.records() if r.leg == "NO"]
+    assert no_records[-1].book_staleness_ns == 5 * _MINUTE_NS
+
+
+def test_a_no_leg_frame_is_never_rerouted(tmp_path: Path) -> None:
+    """Edge case table: a Depth10 frame keyed by a `^no` id should never
+    happen in production (the subscribe path never produces one), but even
+    if it did, `sibling_for` returns `None` for a NO id -- no YES<->NO
+    ping-pong. (The primary `_on_depth` path still evaluates the NO
+    position directly off this frame, generically, exactly as it would for
+    any other registered instrument id -- that is pre-existing, unrelated
+    behaviour; the only thing under test here is that routing never sends
+    it BACK to `_IID`.)"""
+    positions = _PositionsOpenStub()
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    calls: list[str] = []
+
+    def _recording_sibling_for(iid: str) -> str | None:
+        calls.append(iid)
+        return _sibling_for_stub(iid)
+
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_recording_sibling_for,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_NO_IID),  # malformed in production: never happens
+        bids=(("0.90", "5"),),
+        asks=(("0.30", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert calls == [_NO_IID]
+    assert monitor.counters["monitor_errors"] == 0
+    assert _IID not in monitor._positions  # never re-routed back to YES
+
+
+def test_sibling_evaluation_error_is_counted_and_yes_record_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    positions = _PositionsOpenStub()
+    positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)])
+
+    def _raising_positions_open(iid: str) -> Sequence[_FakePosition]:
+        if iid == _NO_IID:
+            raise RuntimeError("boom")
+        return positions(iid)
+
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, reports = _build_monitor(
+        tmp_path,
+        positions_open=_raising_positions_open,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+    )
+
+    depth = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.90", "5"),),
+        asks=(("0.30", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    assert monitor.counters["monitor_errors"] == 1, reports
+    assert monitor.counters["evaluations"] == 1  # YES only -- the NO eval never ran
+    records = monitor._buffer.records()
+    assert {r.leg for r in records} == {"YES"}
+    assert _NO_IID not in monitor._positions
+
+
+def _run_e_scenario(
+    *, tmp_path: Path, sibling_for: Callable[[str], str | None] | None,
+) -> dict[str, object]:
+    """Shared driver for `test_yes_leg_evidence_is_unchanged_by_no_sibling_
+    routing`: the IDENTICAL script (one YES position registration, two YES
+    depth pushes 6 minutes apart with the running max fixed above the rung
+    -- confirming YES DEAD on the second push, RISING mode) run once with
+    `sibling_for=None` and once with it set. NO is deliberately registered
+    ONLY via the depth-routing path (never `on_position_opened`), so its
+    presence in the second run is entirely attributable to `sibling_for`,
+    never to shared test setup."""
+    from breezy.strategy.current_rung_hold.exit_decider import decide_exit
+
+    positions = _PositionsOpenStub()
+    positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)])
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=90, upper_f=90, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    submit_calls: list[object] = []
+    offer_calls: list[object] = []
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=sibling_for,
+        exit_decider=decide_exit,
+        exit_manifest=_manifest_for_exit_test(
+            exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+        ),
+        exit_family_id="pm_us_crh_exit_v4",
+        exit_client_order_id_factory=lambda: "exit-coid-e",
+        submit_exit=submit_calls.append,
+        record_exit_offer=offer_calls.append,
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    depth1 = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.30", "5"),),
+        asks=(("0.90", "5"),),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    monitor.on_depth(depth1, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+
+    later_ns = WINDOW_OPEN_NS + 6 * _MINUTE_NS
+    accumulator._running_max = _FakeRunningMax(
+        lower_f=90, upper_f=90, source_observed_at_ns=later_ns,
+    )
+    depth2 = _book_depth10(
+        instrument_id=InstrumentId.from_str(_IID),
+        bids=(("0.30", "5"),),
+        asks=(("0.90", "5"),),
+        ts_ns=later_ns,
+    )
+    monitor.on_depth(depth2, later_ns)  # type: ignore[arg-type]
+
+    return {
+        "yes_records": tuple(r for r in monitor._buffer.records() if r.leg == "YES"),
+        "no_records": tuple(r for r in monitor._buffer.records() if r.leg == "NO"),
+        # `PositionMarkRecord` is a Nautilus `Data` subclass with NO value
+        # `__eq__` (identity only) -- project through its own `to_dict()`
+        # for a real field-by-field comparison across the two separately
+        # -constructed runs.
+        "yes_record_dicts": tuple(
+            r.to_dict() for r in monitor._buffer.records() if r.leg == "YES"
+        ),
+        "yes_offer_calls": tuple(c for c in offer_calls if getattr(c, "side", None) == "YES"),
+        "counters": dict(monitor.counters),
+        "yes_summary": (
+            monitor._positions[_IID].history.last_state,
+            monitor._positions[_IID].last_book_ts_ns,
+            monitor._positions[_IID].last_held_qty,
+        ),
+    }
+
+
+def test_yes_leg_evidence_is_unchanged_by_no_sibling_routing(tmp_path: Path) -> None:
+    """(e), r1.2/r1.3 redesign: BOTH legs are potentially in play in BOTH
+    runs (`sibling_for=None` and `sibling_for` set) -- the YES-only mark
+    rows, YES-only offer-tape rows, and the YES position's own tracked
+    summary must be byte-identical either way, and the ONLY counter delta
+    is exactly the NO-driven rows `sibling_for` adds."""
+    run_a = _run_e_scenario(tmp_path=tmp_path / "a", sibling_for=None)
+    run_b = _run_e_scenario(tmp_path=tmp_path / "b", sibling_for=_sibling_for_stub)
+
+    # Positive controls (r1.3 architect fix): the scenario actually fired.
+    assert run_a["yes_records"], "YES mark rows must be non-empty"
+    assert run_a["yes_offer_calls"], "YES offer-tape rows must be non-empty"
+    assert run_a["no_records"] == ()  # sibling_for=None: NO never even registers
+    assert len(run_b["no_records"]) >= 1, "at least 1 NO row once sibling_for is set"
+
+    # The YES-only facts are byte-identical regardless of sibling routing.
+    assert run_a["yes_record_dicts"] == run_b["yes_record_dicts"]
+    assert run_a["yes_offer_calls"] == run_b["yes_offer_calls"]
+    assert run_a["yes_summary"] == run_b["yes_summary"]
+
+    # r1.3 counter semantics: the ONLY delta is exactly the NO-driven rows.
+    no_evaluations = len(run_b["no_records"])  # every NO eval here emits
+    a_counters, b_counters = run_a["counters"], run_b["counters"]
+    assert b_counters["evaluations"] - a_counters["evaluations"] == no_evaluations
+    assert b_counters["emitted"] - a_counters["emitted"] == len(run_b["no_records"])
+    assert a_counters["monitor_errors"] == 0
+    assert b_counters["monitor_errors"] == 0
+
+
+def test_shared_mark_buffer_eviction_with_no_rows_is_counted(tmp_path: Path) -> None:
+    """r1.2/r1.3: once both legs share ONE `MarkBuffer`, a NO row can evict
+    a YES row (and vice versa). States and bounds the coupling with a tiny
+    `maxlen=3` (production `maxlen` is 2048, headroom at the live
+    instrument count) -- eviction is COUNTED, never a raise."""
+    positions = _PositionsOpenStub()
+    positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)])
+    positions.set(_NO_IID, [_FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)])
+    accumulator = _RecordingAccumulator(
+        _FakeRunningMax(lower_f=85, upper_f=85, source_observed_at_ns=WINDOW_OPEN_NS),
+    )
+    monitor, _reports = _build_monitor(
+        tmp_path,
+        positions_open=positions,
+        accumulators={STATION: accumulator},
+        leg_for=_leg_for_yes_no,
+        sibling_for=_sibling_for_stub,
+        buffer=MarkBuffer(maxlen=3),
+    )
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+    monitor.on_position_opened(
+        _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
+    )  # type: ignore[arg-type]
+
+    def _push(ts_ns: int) -> None:
+        depth = _book_depth10(
+            instrument_id=InstrumentId.from_str(_IID),
+            bids=(("0.30", "5"),),
+            asks=(("0.90", "5"),),
+            ts_ns=ts_ns,
+        )
+        monitor.on_depth(depth, ts_ns)  # type: ignore[arg-type]
+
+    _push(WINDOW_OPEN_NS)  # 2 emits (YES + NO)
+    _push(WINDOW_OPEN_NS + 61_000_000_000)  # heartbeat elapsed -> 2 more emits, 1 must evict
+
+    assert monitor.counters["monitor_errors"] == 0
+    assert monitor.counters["monitor_marks_dropped"] > 0
+    assert len(monitor._buffer.records()) == 3  # capped at maxlen

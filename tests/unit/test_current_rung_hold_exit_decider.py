@@ -91,7 +91,10 @@ _DEFAULT_EXIT_RULE: str = "crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP"
 
 
 def _manifest(
-    *, family_id: str = "pm_us_crh_exit_v4", exit_rule: str | None = _DEFAULT_EXIT_RULE,
+    *,
+    family_id: str = "pm_us_crh_exit_v4",
+    exit_rule: str | None = _DEFAULT_EXIT_RULE,
+    no_leg_exit: bool = False,
 ) -> FamilyManifest:
     return FamilyManifest(
         family_id=family_id,
@@ -108,6 +111,7 @@ def _manifest(
         status="REGISTERED" if exit_rule is not None else "DRAFT_NOT_REGISTERED",
         manifest_sha256="b" * 64,
         exit_rule=exit_rule,
+        no_leg_exit=no_leg_exit,
     )
 
 
@@ -166,6 +170,77 @@ def test_pm_us_crh_cont_never_fires_even_with_an_exit_rule_string_hypothetically
 
 
 # ---------------------------------------------------------------------------
+# FU-1d: the NO-leg exit-declaration gate (RULING_FU-1b_no_leg_marks_
+# 2026-09-26.md item 2, plan FU-1d_derived_no_marks_plan_r1_2026-09-26.md).
+# Two deliberate gates guard a NO exit: the pre-existing family gate above,
+# and this new, narrower one -- never missing data.
+# ---------------------------------------------------------------------------
+
+
+def test_no_leg_exit_still_refuses_at_family_gate_today() -> None:
+    """(c): the REAL committed `pm_us_crh_exit_v4` manifest has no
+    `exit_rule` yet -- a NO-leg evaluation refuses at the pre-existing
+    family gate, exactly like a YES one would, never reaching the new
+    NO-leg gate at all."""
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest = load_family_manifest(
+        repo_root / "deploy" / "families" / "pm_us_crh_exit_v4.json", allow_draft=True,
+    )
+    assert manifest.exit_rule is None
+
+    outcome = _decide(
+        _decision(ThesisState.DEAD_BY_OBSERVATION, Verdict.EXIT_RECOMMENDED),
+        _evidence(leg="NO", mark_vwap=Decimal("0.10")),
+        manifest=manifest,
+    )
+    assert isinstance(outcome, ExitRefusal)
+    assert outcome.reason == "family_not_exit_registered"
+    assert outcome.rule is None
+
+
+def test_no_leg_refuses_at_no_leg_gate_when_family_armed_but_undeclared() -> None:
+    """(d): the family IS armed (`exit_rule` set, code-registered) but its
+    manifest does NOT declare `no_leg_exit` -- a NO-leg evaluation refuses
+    at the new gate with `rule=None`, EVEN THOUGH a `depth_walk` mark is
+    present and the state is DEAD (a rule would otherwise have selected)."""
+    outcome = _decide(
+        _decision(ThesisState.DEAD_BY_OBSERVATION, Verdict.EXIT_RECOMMENDED),
+        _evidence(leg="NO", mark_vwap=Decimal("0.85"), mark_source="depth_walk"),
+        manifest=_manifest(no_leg_exit=False),
+    )
+    assert isinstance(outcome, ExitRefusal)
+    assert outcome.reason == "no_leg_exit_not_declared"
+    assert outcome.rule is None
+
+
+def test_declared_no_leg_with_missing_mark_still_refuses_book_not_executable() -> None:
+    """(f): once a family DOES declare `no_leg_exit`, the downstream book
+    gate is still there -- a missing mark still refuses
+    `book_not_executable`, never silently promoted to firing."""
+    outcome = _decide(
+        _decision(ThesisState.THREATENED, Verdict.REDUCE_RECOMMENDED),
+        _evidence(leg="NO", mark_source="missing", mark_vwap=None, depth_sufficient=False),
+        manifest=_manifest(no_leg_exit=True),
+    )
+    assert isinstance(outcome, ExitRefusal)
+    assert outcome.reason == "book_not_executable"
+
+
+def test_yes_leg_ignores_the_no_leg_gate() -> None:
+    """A YES-leg evaluation is completely unaffected by `no_leg_exit` being
+    absent -- the gate only ever applies to `evidence.leg == "NO"`."""
+    outcome = _decide(
+        _decision(ThesisState.THREATENED, Verdict.REDUCE_RECOMMENDED),
+        _evidence(leg="YES", p_hold_at_t=Decimal("0.30"), mark_vwap=Decimal("0.50")),
+        manifest=_manifest(no_leg_exit=False),
+    )
+    assert isinstance(outcome, ExitProposal)
+    assert outcome.authorization.rule is ExitRule.R_THREAT
+
+
+# ---------------------------------------------------------------------------
 # Rule selection / MISSING_STOP / no-exit-condition
 # ---------------------------------------------------------------------------
 
@@ -214,9 +289,15 @@ def test_r_dead_fires_on_confirmed_dead_and_exit_recommended_yes_leg() -> None:
 
 
 def test_r_dead_fires_on_confirmed_dead_and_exit_recommended_no_leg() -> None:
+    """FU-1d PLAN-GAP FIX (reviewer sign-off required, same category as the
+    :1196 retarget): this test predates the NO-leg declaration gate and
+    must now also arm it via `no_leg_exit=True`, or every NO-leg evaluation
+    refuses `no_leg_exit_not_declared` before a rule is ever selected. The
+    original assertions (a fired R_DEAD proposal) are unchanged."""
     outcome = _decide(
         _decision(ThesisState.DEAD_BY_OBSERVATION, Verdict.EXIT_RECOMMENDED),
         _evidence(leg="NO", mark_vwap=Decimal("0.05")),
+        manifest=_manifest(no_leg_exit=True),
     )
     assert isinstance(outcome, ExitProposal)
     assert outcome.authorization.rule is ExitRule.R_DEAD
@@ -261,9 +342,12 @@ def test_r_threat_fires_on_threatened_yes_leg(verdict: Verdict) -> None:
 
 
 def test_r_threat_fires_on_threatened_no_leg() -> None:
+    """FU-1d PLAN-GAP FIX (reviewer sign-off required): see the sibling
+    R_DEAD test's docstring above -- same fix, same reason."""
     outcome = _decide(
         _decision(ThesisState.THREATENED, Verdict.REDUCE_RECOMMENDED),
         _evidence(leg="NO", p_hold_at_t=Decimal("0.30"), mark_vwap=Decimal("0.85")),
+        manifest=_manifest(no_leg_exit=True),
     )
     assert isinstance(outcome, ExitProposal)
     assert outcome.authorization.rule is ExitRule.R_THREAT

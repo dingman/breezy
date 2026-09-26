@@ -67,7 +67,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
-from breezy.persistence.exit_gate import family_declares_exit_rule
+from breezy.persistence.exit_gate import family_declares_exit_rule, family_declares_no_leg_exit
 from breezy.strategy.current_rung_hold.exit_authorization import (
     ExitAuthorization,
     ExitAuthorizationRefusalError,
@@ -107,6 +107,7 @@ _QUANTITY: Final[int] = 1
 MAX_STATION_DAY_EXIT_ORDERS: Final[int] = 2
 
 _REASON_FAMILY_NOT_REGISTERED: Final[str] = "family_not_exit_registered"
+_REASON_NO_LEG_EXIT_NOT_DECLARED: Final[str] = "no_leg_exit_not_declared"
 _REASON_MISSING_STOP: Final[str] = "missing_stop_no_order"
 _REASON_NO_EXIT_CONDITION: Final[str] = "no_exit_condition"
 _REASON_BOOK_NOT_EXECUTABLE: Final[str] = "book_not_executable"
@@ -220,6 +221,19 @@ def decide_exit(
             instrument_id=evidence.instrument_id,
             rule=None,
             reason=_REASON_FAMILY_NOT_REGISTERED,
+            decided_at_ns=now_ns,
+        )
+
+    # FU-1d: the NO-leg declaration gate. Placed directly after the family
+    # gate and before rule selection, so a NO-leg evaluation refuses
+    # unconditionally (rule=None) regardless of state/verdict -- this can
+    # only ADD a restriction on top of the family gate above, never grant
+    # an exit on its own (`family_declares_no_leg_exit`'s own docstring).
+    if evidence.leg == "NO" and not family_declares_no_leg_exit(manifest):
+        return ExitRefusal(
+            instrument_id=evidence.instrument_id,
+            rule=None,
+            reason=_REASON_NO_LEG_EXIT_NOT_DECLARED,
             decided_at_ns=now_ns,
         )
 

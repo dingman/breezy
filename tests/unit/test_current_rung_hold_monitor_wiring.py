@@ -117,12 +117,12 @@ def _strategy(**overrides: object) -> _FakeStrategy:
     return _FakeStrategy(**defaults)  # type: ignore[arg-type]
 
 
-def test_build_monitor_callables_returns_all_eight_named_fields() -> None:
+def test_build_monitor_callables_returns_all_nine_named_fields() -> None:
     callables = build_monitor_callables(_strategy())  # type: ignore[arg-type]
     assert isinstance(callables, MonitorCallables)
     for name in (
         "positions_open", "latch_record", "rung_geometry", "fee_coefficient_for",
-        "leg_for", "station_for", "climate_day_for", "hour_lst_for",
+        "leg_for", "station_for", "climate_day_for", "hour_lst_for", "sibling_for",
     ):
         assert callable(getattr(callables, name))
 
@@ -278,3 +278,27 @@ def test_hour_lst_for_matches_the_shared_local_hour_derivation() -> None:
     assert callables.hour_lst_for(STATION, WINDOW_OPEN_NS) == _local_hour(
         WINDOW_OPEN_NS, offsets[STATION],
     )
+
+
+# ---------------------------------------------------------------------------
+# FU-1d: `sibling_for` -- the NO leg's mark source (RULING_FU-1b_no_leg_
+# marks_2026-09-26.md item 1).
+# ---------------------------------------------------------------------------
+
+
+def test_sibling_for_maps_yes_to_no_and_refuses_no_malformed_foreign() -> None:
+    callables = build_monitor_callables(_strategy())  # type: ignore[arg-type]
+
+    assert callables.sibling_for(_IID) == _NO_IID
+
+    # A NO-leg id never routes forward again (no YES<->NO ping-pong).
+    assert callables.sibling_for(_NO_IID) is None
+
+    # Malformed (unparseable): `ValueError` -> `None`, never a raised error.
+    assert callables.sibling_for("not-a-valid-instrument-id") is None
+
+    # A foreign-venue YES id: `sibling_instrument_id`'s own venue check
+    # raises `VenuePayloadError` internally -- caught, never propagated,
+    # resolving to `None` rather than a guessed sibling.
+    foreign_yes_id = str(InstrumentId.from_str("lax-86-87.KALSHI"))
+    assert callables.sibling_for(foreign_yes_id) is None
