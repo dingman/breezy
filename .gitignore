@@ -27,6 +27,7 @@ docs/evidence/venue/**/PRIVATE_*
 # FEE_DRIFT_EVIDENCE_2026-09-25.md) records each day's sha256 manifest
 # instead, and no retention job may prune this directory (Rev 2.1 item 4).
 data/evidence/fee_drift/
+data/evidence/discovery_set_equality/
 
 # AUD-10b step 14: the one real promotion-proposal run's output. Derived
 # from live venue/exec-state data read-only; never committed, never the
