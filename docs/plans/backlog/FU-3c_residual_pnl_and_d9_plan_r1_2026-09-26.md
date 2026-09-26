@@ -113,9 +113,9 @@ Amendments folded in:
 - **FU-3d** is added to PROGRESS as its own row (scored-path qty scaling), with a note to track the residual bias from `fee_unverified` (≤1¢ per contract).
 
 ## r1.2 erratum (FU-3d, 2026-09-26)
-- **"≤1¢ per contract" is false for p in [~0.326, ~0.674].** The fee rounds
+- **"≤1¢ per contract" is false for p in [~0.315, ~0.685] (exact: p(1−p) ≥ 0.015/0.0695 ≈ 0.2158).** The fee rounds
   to 0.02, not 0.01, whenever `theta * p * (1-p) >= 0.015`. At the post-drift
-  `theta=0.0695`, that band is p in [~0.326, ~0.674], which contains p=0.5.
+  `theta=0.0695`, that band is p in [~0.315, ~0.685] (exact: p(1−p) ≥ 0.015/0.0695 ≈ 0.2158), which contains p=0.5.
   Worked examples: at theta=0.0695, p=0.5, the exact fee is 0.017375, which
   rounds half-even to **0.02**; the pre-drift `theta=0.06`, p=0.5 case is
   0.015, which also rounds half-even to 0.02. The original CFJ485874TMM
