@@ -99,9 +99,11 @@ class _FillProbe:
     def __init__(self, result: object) -> None:
         self.result = result
         self.calls: list[str] = []
+        self.created_ns_calls: list[int] = []
 
-    def __call__(self, fingerprint: str) -> object:
+    def __call__(self, fingerprint: str, created_ns: int) -> object:
         self.calls.append(fingerprint)
+        self.created_ns_calls.append(created_ns)
         return self.result
 
 
@@ -487,6 +489,7 @@ class TestReconcileAtStartup:
             assert result.state is SubmitIntentState.RETIRED
             assert result.retirement_reason is RetirementReason.STARTUP_FILL_RECORD_MATCH
             assert probe.calls == [FINGERPRINT]
+            assert probe.created_ns_calls == [NOW_NS]
 
     def test_open_plus_neither_stays_open_and_invokes_callable_with_fingerprint(
         self, store_path: Path
@@ -501,6 +504,7 @@ class TestReconcileAtStartup:
             assert result.state is SubmitIntentState.OPEN
             assert result.intent_id == armed.intent_id
             assert probe.calls == [FINGERPRINT]
+            assert probe.created_ns_calls == [NOW_NS]
             assert latch.is_latched() is True
 
     @pytest.mark.parametrize("probe_result", ["maybe", {"filled": True}, Mock()])
@@ -633,7 +637,9 @@ class TestProcessLock:
         with pytest.raises(SubmitIntentLockNotHeld):
             latch.retire("0" * 32, RetirementReason.DEFINITIVE_REJECT, now_ns=NOW_NS)
         with pytest.raises(SubmitIntentLockNotHeld):
-            latch.reconcile_at_startup(has_durable_fill_record=lambda _: False, now_ns=NOW_NS)
+            latch.reconcile_at_startup(
+                has_durable_fill_record=lambda _f, _c: False, now_ns=NOW_NS
+            )
 
     def test_missing_parent_raises_lock_error(self, tmp_path: Path) -> None:
         store_path = tmp_path / "missing" / "state.db"
