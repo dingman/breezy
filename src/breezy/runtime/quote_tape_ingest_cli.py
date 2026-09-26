@@ -919,6 +919,22 @@ def _extend_overlapping_stream(
             catalog, write_target, data_cls, table
         )
         if not chunk_streamed:
+            # Only reachable when the post-transform table came back empty
+            # despite this file's source table being non-empty (checked
+            # above): mirrors the fast path's loud guard (~:1443-1454).
+            # Not counted toward written/streamed_any -- the fast path's
+            # "counted as failed, never marked converted" outcome for this
+            # file, even though another file in the same instance may still
+            # carry the overall result to CONVERTED.
+            logger.warning(
+                "instance %s: EXTEND of %s file %s saw %d row(s) in the "
+                "source but the post-transform table is empty; skipping "
+                "this file",
+                instance_id,
+                data_cls.__name__,
+                feather_file.path,
+                len(table),
+            )
             continue
         streamed_any = True
         written += chunk_written

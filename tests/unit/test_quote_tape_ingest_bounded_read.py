@@ -20,6 +20,7 @@ flat write is possible without breaking deserialisation).
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -885,3 +886,52 @@ def test_per_file_extend_fallback_routes_through_extend_table_chunked(
 
     assert converted
     assert calls == [7]
+
+
+def test_extend_overlapping_stream_logs_a_zero_row_file_but_still_converts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FU-14: one file's post-transform table comes back empty despite a
+    non-empty source table (simulated the same way
+    :func:`test_extend_overlapping_stream_routes_through_extend_table_chunked`
+    wraps ``_extend_table_chunked``, returning ``(0, False)`` for that file's
+    row count only). The other file still lands its rows, so the instance
+    still reports ``converted`` -- but the empty file's skip must be logged
+    by name, not silently masked (mirrors the fast path's per-file guard at
+    quote_tape_ingest_cli.py:1443-1454)."""
+    instance_dir = tmp_path / "live" / "instance-1"
+    empty_path = instance_dir / "instrument_status_0.feather"
+    good_path = instance_dir / "instrument_status_1.feather"
+    _write_flat_stream(empty_path, [_status(i) for i in range(5)], InstrumentStatus)
+    _write_flat_stream(good_path, [_status(50 + i) for i in range(7)], InstrumentStatus)
+    catalog = ParquetDataCatalog(str(tmp_path))
+
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    real_chunked = cli_module._extend_table_chunked
+
+    def spy_chunked(
+        catalog_arg: ParquetDataCatalog,
+        write_target: ParquetDataCatalog,
+        data_cls: type,
+        table: Any,
+        **kwargs: Any,
+    ) -> tuple[int, bool]:
+        if len(table) == 5:  # empty_path's row count -- simulate empty post-transform
+            return 0, False
+        return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+
+    with caplog.at_level(logging.WARNING, logger=cli_module.__name__):
+        outcome = _extend_overlapping_stream(catalog, "instance-1", InstrumentStatus, "live")
+
+    assert outcome == "converted"
+    assert len(catalog.query(data_cls=InstrumentStatus)) == 7
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "the empty-post-transform file must log a WARNING, not skip silently"
+    message = warnings[0].getMessage()
+    assert "instance-1" in message
+    assert str(empty_path) in message
+    assert "5" in message
