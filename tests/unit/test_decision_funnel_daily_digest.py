@@ -292,9 +292,16 @@ def test_main_emits_one_info_payload_for_a_real_shaped_jsonl(
 def test_missing_tape_is_a_named_info_diagnostic_not_a_zero_funnel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """FU-12: a missing tape still resolves and records halt state -- a
+    halted family legitimately stops OfferTape writes, so "no tape" alone
+    must never look identical to a genuine no-trade day. No store/env is
+    configured here, so the halt read is `unknown` (deterministic: `env={}`
+    means `resolve_store_path` cannot find a var accidentally set in the
+    ambient shell)."""
     sink = _Sink()
     monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
     missing = tmp_path / "offer_tape_2026-09-20.jsonl"
+    out = tmp_path / "out"
     code = _DIGEST.main(
         [
             "--tape",
@@ -302,16 +309,116 @@ def test_missing_tape_is_a_named_info_diagnostic_not_a_zero_funnel(
             "--climate-day",
             "2026-09-20",
             "--output-dir",
-            str(tmp_path / "out"),
-        ]
+            str(out),
+        ],
+        env={},
     )
     assert code == 0
     assert len(sink.payloads) == 1
     payload = sink.payloads[0]
     assert payload.severity == "INFO"
-    assert payload.detail == "no decision tape found for 2026-09-20"
+    assert payload.detail.startswith("no decision tape found for 2026-09-20")
+    assert "halt=unknown" in payload.detail
     assert "e=" not in payload.detail
-    assert not (tmp_path / "out" / "decision_funnel_2026-09-20.json").exists()
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["decision_tape_present"] is False
+    assert artefact["halt_enforced"] == "unknown"
+    assert "totals" not in artefact
+
+
+def test_missing_tape_with_halt_set_names_halt_in_alert_and_artefact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FU-12 RED: this is the exact scenario that hid a multi-day halt --
+    tape absent BECAUSE the family is halted. The alert and artefact must
+    both say so, distinctly from a plain no-trade day."""
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    missing = tmp_path / "offer_tape_2026-09-20.jsonl"
+    out = tmp_path / "out"
+    store_path = _store_with_halt_value(
+        tmp_path, b'{"v":1,"reason":"policy_halt","tsNs":1,"detail":"x","evidenceSha256":"a"}'
+    )
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(missing),
+            "--climate-day", "2026-09-20",
+            "--output-dir", str(out),
+            "--store-path", str(store_path),
+        ]
+    )
+
+    assert code == 0
+    payload = sink.payloads[0]
+    assert payload.detail.startswith("no decision tape found for 2026-09-20")
+    assert "halt=yes" in payload.detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["decision_tape_present"] is False
+    assert artefact["halt_enforced"] == "yes"
+    assert "totals" not in artefact
+
+
+def test_missing_tape_with_no_halt_reports_halt_enforced_no(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    missing = tmp_path / "offer_tape_2026-09-20.jsonl"
+    out = tmp_path / "out"
+    store_path = _store_with_halt_value(tmp_path, None)
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(missing),
+            "--climate-day", "2026-09-20",
+            "--output-dir", str(out),
+            "--store-path", str(store_path),
+        ]
+    )
+
+    assert code == 0
+    payload = sink.payloads[0]
+    assert "halt=no" in payload.detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["decision_tape_present"] is False
+    assert artefact["halt_enforced"] == "no"
+
+
+def test_missing_tape_halt_read_failure_does_not_crash_and_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FU-12 (c): an unexpected exception from the halt read on the
+    missing-tape path must complete the digest (exit 0, artefact written)
+    rather than crash, and must not be swallowed silently -- it is logged."""
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    monkeypatch.setattr(
+        _DIGEST,
+        "read_family_halt_status",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    missing = tmp_path / "offer_tape_2026-09-20.jsonl"
+    out = tmp_path / "out"
+
+    with caplog.at_level("WARNING", logger=_DIGEST.__name__):
+        code = _DIGEST.main(
+            [
+                "--tape", str(missing),
+                "--climate-day", "2026-09-20",
+                "--output-dir", str(out),
+                "--store-path", str(tmp_path / "irrelevant.db"),
+            ]
+        )
+
+    assert code == 0
+    payload = sink.payloads[0]
+    assert "halt=unknown" in payload.detail
+    artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
+    assert artefact["halt_enforced"] == "unknown"
+    assert any(
+        "halt status read raised unexpectedly" in record.message for record in caplog.records
+    )
 
 
 def test_empty_tape_is_a_real_zero_funnel_distinct_from_a_missing_file(

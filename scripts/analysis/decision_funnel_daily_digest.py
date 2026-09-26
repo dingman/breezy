@@ -714,6 +714,20 @@ def _artefact(
     return artefact
 
 
+def _write_json_artefact(directory: Path, climate_day: str, artefact: Mapping[str, object]) -> None:
+    """Low-level writer shared by :func:`_write_artefact` (the normal,
+    funnel-bearing record) and the missing-tape halt-only record built by
+    `main` -- byte-identical mkdir/write/chmod mechanics either way, so the
+    two artefact shapes never drift in how they reach disk."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"decision_funnel_{climate_day}.json"
+    path.write_text(
+        json.dumps(dict(artefact), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
 def _write_artefact(
     directory: Path,
     report: FunnelReport,
@@ -722,14 +736,59 @@ def _write_artefact(
     halt: FamilyHaltStatus | None = None,
     capped_total: int = 0,
 ) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"decision_funnel_{climate_day}.json"
     artefact = _artefact(report, climate_day=climate_day, halt=halt, capped_total=capped_total)
-    path.write_text(
-        json.dumps(artefact, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o600)
+    _write_json_artefact(directory, climate_day, artefact)
+
+
+def _missing_tape_artefact(climate_day: str, halt: FamilyHaltStatus) -> dict[str, object]:
+    """Halt-state-only record for a climate day with no decision tape at
+    all: no funnel counts (there is nothing to count), explicit
+    ``decision_tape_present: false``, and the same ``halt_enforced``/
+    ``halt_reason`` fields the funnel-bearing artefact already carries --
+    reusing :func:`_write_json_artefact` rather than a second schema."""
+    return {
+        "climate_day": climate_day,
+        "decision_tape_present": False,
+        "halt_enforced": halt.value,
+        "halt_reason": halt.reason,
+    }
+
+
+def _missing_tape_detail(climate_day: str, halt: FamilyHaltStatus) -> str:
+    """Distinguishes "no tape" from "no tape while halted" in the alert
+    line itself (the defect this closes: a halted family silently looked
+    identical to a no-trade day). ``halt=<value>`` is never dropped; the
+    free-text ``halt_reason`` is the first thing cut if the line would
+    exceed ``MAX_ALERT_DETAIL_CHARS``, mirroring :func:`format_digest_detail`'s
+    own drop order."""
+    base = f"{_MISSING_DETAIL.format(climate_day=climate_day)} halt={halt.value}"
+    if halt.reason:
+        with_reason = f"{base} halt_reason={halt.reason}"
+        if len(with_reason) <= MAX_ALERT_DETAIL_CHARS:
+            return with_reason
+    return base[:MAX_ALERT_DETAIL_CHARS]
+
+
+def _resolve_halt_status_safe(
+    args: argparse.Namespace, source_env: Mapping[str, str]
+) -> FamilyHaltStatus:
+    """Wraps :func:`_resolve_halt_status` in a catch-all: an unexpected
+    exception from the halt read (anything ``read_family_halt_status``
+    itself does not already convert to ``unknown``) must never crash the
+    digest -- losing the funnel counts too on a day the tape IS present --
+    nor be swallowed silently. Logged once, then reported as ``unknown``,
+    the same three-state contract every other halt-read failure mode uses.
+    """
+    try:
+        return _resolve_halt_status(args, source_env)
+    except Exception as exc:  # noqa: BLE001 - deliberate last-resort guard
+        logger.warning(
+            "decision_funnel_daily_digest: halt status read raised unexpectedly "
+            "(%s: %s); reporting halt_enforced=unknown",
+            type(exc).__name__,
+            exc,
+        )
+        return FamilyHaltStatus(value="unknown", reason=f"{type(exc).__name__}: {exc}")
 
 
 def _emit(sink: AlertSink, *, detail: str) -> None:
@@ -795,8 +854,16 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         else WINDOW_OPEN_STATIONS
     )
     if not tape.is_file():
-        missing = DecisionTapeNotFound(climate_day)
-        _emit(sink, detail=str(missing))
+        # Resolved BEFORE emitting: a legitimately-halted family also stops
+        # OfferTape writes (offer_tape.py, reached only from
+        # continuous_strategy._hunt_tick), so a bare "no tape" alert was
+        # indistinguishable from a genuine no-trade day -- the defect this
+        # branch closes. `halt_enforced` (and, on failure, its reason) is
+        # named in the alert AND persisted, so "no tape" vs "no tape while
+        # halted" never looks the same again.
+        halt = _resolve_halt_status_safe(args, source_env)
+        _emit(sink, detail=_missing_tape_detail(climate_day, halt))
+        _write_json_artefact(output_dir, climate_day, _missing_tape_artefact(climate_day, halt))
         return 0
     try:
         report = funnel_for_day(_iter_jsonl(tape), window_open_stations=stations)
@@ -806,7 +873,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     except (json.JSONDecodeError, ValueError, TypeError):
         _emit(sink, detail=f"decision tape unreadable for {climate_day}")
         return 1
-    halt = _resolve_halt_status(args, source_env)
+    halt = _resolve_halt_status_safe(args, source_env)
     summary_totals = _read_diagnostics_summary_totals(tape, climate_day)
     capped_total = summary_totals.capped_total
     is_stale = summary_totals.status == "ok" and _pre_tape_is_stale(
