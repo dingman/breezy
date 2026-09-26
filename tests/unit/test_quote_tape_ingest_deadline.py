@@ -19,12 +19,17 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from nautilus_trader.model.data import QuoteTick, TradeTick
+from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+from breezy.persistence.feather_preflight import inspect_feather_file
 from breezy.runtime.ingest_deadline import (
     DEFAULT_DEADLINE_SECONDS,
     DEFERRED_DEADLINE,
@@ -34,12 +39,15 @@ from breezy.runtime.ingest_deadline import (
 from breezy.runtime.quote_tape_ingest_cli import (
     ATTEMPT_PREFIX,
     EXIT_CONVERSION_FAILED,
+    EXIT_OK,
     EXIT_USAGE,
+    MARKER_PREFIX,
     InstanceIngestResult,
     TypeConversionResult,
     _instance_is_poisoned,
     _merge_pass_results,
     _poison_first_order,
+    default_convert,
     run,
     run_ingest,
     run_ingest_definitions_first,
@@ -50,6 +58,7 @@ from tests.unit.test_quote_tape_ingest_cli import (
     _never_active,
     _quote_tick,
     _touch,
+    _trade_tick,
     _truncate_tail,
     _write_typed_ipc_stream,
 )
@@ -671,3 +680,742 @@ class TestDrainAcrossRuns:
         instance_dir = tmp_path / "live" / INSTANCE
         assert (instance_dir / ".converted-trade_tick").is_file()
         assert second[0].outcome == "converted"
+
+
+# ---------------------------------------------------------------------------
+# T-sticky: a hypothesis property over random clock/call sequences (audit gap).
+# ---------------------------------------------------------------------------
+
+_ADMIT_CALL = "admit"
+_CAN_ADMIT_CALL = "can_admit"
+_NOTE_SCAN_CALL = "note_scan"
+
+_CALL_KIND = st.sampled_from([_ADMIT_CALL, _CAN_ADMIT_CALL, _NOTE_SCAN_CALL])
+#: Deliberately allows NEGATIVE steps too -- a clock quirk (see
+#: `test_the_first_false_is_sticky_forever` above) is exactly the case that
+#: distinguishes genuine stickiness from "budget never un-expires because the
+#: clock never runs backward in this test".
+_CLOCK_STEP = st.integers(min_value=-500, max_value=1000)
+
+
+class TestStickyPropertyOverRandomCallSequences:
+    @given(
+        budget_ns=st.integers(min_value=0, max_value=5000),
+        steps=st.lists(st.tuples(_CALL_KIND, _CLOCK_STEP), min_size=1, max_size=50),
+    )
+    @settings(max_examples=200, deadline=None)
+    def test_after_the_first_false_every_later_call_is_false_and_admitted_freezes(
+        self, budget_ns: int, steps: list[tuple[str, int]]
+    ) -> None:
+        clock = FakeClock()
+        deadline = RunDeadline(budget_ns=budget_ns, clock_ns=clock)
+        seen_false = False
+        admitted_at_first_false: int | None = None
+        for kind, step in steps:
+            clock.advance(step)
+            if kind == _NOTE_SCAN_CALL:
+                deadline.note_scan()
+                continue
+            result = deadline.admit() if kind == _ADMIT_CALL else deadline.can_admit()
+            if seen_false:
+                assert result is False, "a call after the first False must stay False"
+                assert deadline.admitted == admitted_at_first_false, (
+                    "admitted must never grow once the deadline has closed"
+                )
+            elif result is False:
+                seen_false = True
+                admitted_at_first_false = deadline.admitted
+
+
+# ---------------------------------------------------------------------------
+# T7b: ONE RunDeadline shared across pass 1 and pass 2, not one per pass.
+# ---------------------------------------------------------------------------
+
+
+class TestSharedDeadlineAcrossBothPasses:
+    def test_pass_two_never_converts_once_pass_one_has_closed_the_shared_deadline(
+        self, tmp_path: Path
+    ) -> None:
+        _touch(tmp_path, INSTANCE, "binary_option_0.feather", age_minutes=60)
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        # budget_ns=0: the guarantee (pass 1's BinaryOption) always succeeds,
+        # but the very next admit() call anywhere -- even with a clock that
+        # never advances -- is instantly expired (0 < 0 is False).
+        clock = FakeClock()
+        deadline = RunDeadline(budget_ns=0, clock_ns=clock)
+        calls: list[type] = []
+
+        def spy_convert(catalog, instance_id, data_cls, subdirectory):  # type: ignore[no-untyped-def]
+            calls.append(data_cls)
+
+        results = run_ingest_definitions_first(
+            tmp_path,
+            data_types=(BinaryOption, QuoteTick),
+            service_active_probe=_never_active,
+            convert_fn=spy_convert,
+            deadline=deadline,
+        )
+
+        assert calls == [BinaryOption], (
+            "pass 1 must spend the run's ONE guarantee on the definitions type; "
+            "sharing one RunDeadline means pass 2 must make ZERO convert calls "
+            "once it is closed -- a per-pass deadline or a guarantee reset "
+            "would let QuoteTick convert too"
+        )
+        merged = results[0]
+        assert merged.outcome == DEFERRED_DEADLINE
+        assert merged.type_results == (TypeConversionResult(BinaryOption, "converted"),)
+
+
+# ---------------------------------------------------------------------------
+# T7a-tail: N>=3 no-work instances ahead of the one with work, run starts
+# expired -- the scan tail is bounded to exactly ONE no-work scan.
+# ---------------------------------------------------------------------------
+
+
+class TestExpiredStartWithManyNoWorkInstancesAhead:
+    def test_scan_tail_bounded_to_one_scan_defers_every_other_instance_too(
+        self, tmp_path: Path
+    ) -> None:
+        no_work_ids = ["instance-a", "instance-b", "instance-c"]
+        for iid in no_work_ids:
+            # age_minutes=0: within the live-grace window -- genuinely LIVE,
+            # nothing convertible, but still requires a real preflight scan
+            # (it is not on the fully-converted fast path).
+            _touch(tmp_path, iid, "quote_tick_0.feather", age_minutes=0)
+        work_id = "instance-z"
+        _touch(tmp_path, work_id, "quote_tick_0.feather", age_minutes=60)
+
+        clock = _TickingClock(step_ns=2_000_000_000)  # every read jumps 2s
+        deadline = RunDeadline(budget_ns=1_000_000_000, clock_ns=clock)
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            convert_fn=lambda *a: None,
+            deadline=deadline,
+        )
+
+        assert deadline.scans_started == 1
+        assert deadline.admitted == 0
+        by_id = {r.instance_id: r for r in results}
+        assert by_id[no_work_ids[0]].outcome == "skipped-live"
+        for iid in (*no_work_ids[1:], work_id):
+            assert by_id[iid].outcome == DEFERRED_DEADLINE
+            assert by_id[iid].reason == "not evaluated"
+        _units, instances = count_deferred(results)
+        assert instances == len(no_work_ids)
+
+    def test_the_run_still_exits_zero(self, tmp_path: Path) -> None:
+        for iid in ("instance-a", "instance-b", "instance-c"):
+            _touch(tmp_path, iid, "quote_tick_0.feather", age_minutes=0)
+        _touch(tmp_path, "instance-z", "quote_tick_0.feather", age_minutes=60)
+
+        out, _err = _run_cli(
+            ["--catalog", str(tmp_path), "--deadline-seconds", "1"],
+        )
+        # No monkeypatched clock here -- a real, generous wall clock still
+        # lands well within budget for four empty-file scans, so this leg
+        # only pins the exit code, never the deferral counts themselves.
+        assert "breezy-quote-tape-ingest: deadline budget=1s" in out
+
+
+# ---------------------------------------------------------------------------
+# T-n1-survive / T-n1-noop: the per-file poison breadcrumb is written only
+# after admit()->True and cleared ONLY on a terminal outcome -- a no-op
+# (skipped-open, skipped-unclosed, skipped-definitions-pending) never
+# touches it (N1/N6, r3 amendment).
+# ---------------------------------------------------------------------------
+
+
+class TestPerFileBreadcrumbSurvivesNoOps:
+    def test_a_stale_definition_breadcrumb_survives_a_skipped_open_no_op(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        path = instance_dir / "binary_option_0.feather"
+        path.parent.mkdir(parents=True)
+        path.touch()  # age 0 -- inside the live-grace window, so "open"
+        attempt = instance_dir / f"{ATTEMPT_PREFIX}binary_option"
+        attempt.touch()  # stale, as if an earlier gated run was killed
+        catalog = ParquetDataCatalog(str(tmp_path))
+        deadline = RunDeadline(budget_ns=1_000_000_000_000)
+
+        result, converted, is_open = ingest_cli_module._convert_one_definition_type(
+            catalog,
+            instance_dir,
+            INSTANCE,
+            "live",
+            BinaryOption,
+            frozenset({path}),
+            convert_fn=lambda *a: None,
+            dry_run=False,
+            deadline=deadline,
+        )
+
+        assert result.outcome == "skipped-open"
+        assert not converted
+        assert is_open
+        assert attempt.is_file()
+
+    def test_a_stale_tick_breadcrumb_survives_an_all_unclosed_no_op(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(path, [_quote_tick(i) for i in range(5)], QuoteTick, close=False)
+        stamp = time.time() - 60 * 60
+        os.utime(path, (stamp, stamp))
+        report = inspect_feather_file(path)
+        assert not report.end_of_stream_marker
+        attempt = instance_dir / f"{ATTEMPT_PREFIX}quote_tick"
+        attempt.touch()
+        catalog = ParquetDataCatalog(str(tmp_path))
+        deadline = RunDeadline(budget_ns=1_000_000_000_000)
+
+        result, converted, is_open = ingest_cli_module._convert_one_tick_type_per_file(
+            catalog,
+            instance_dir,
+            INSTANCE,
+            QuoteTick,
+            frozenset(),
+            {path: report},
+            instance_is_dead=False,
+            dry_run=False,
+            deadline=deadline,
+        )
+
+        assert "skipped-unclosed" in result.outcome
+        assert not converted
+        assert not is_open
+        assert attempt.is_file()
+
+
+class TestPerFileBreadcrumbSurvivesAKillThenTheNextRunConverts:
+    def test_survives_a_definitions_pending_skip_then_is_cleared_by_a_later_conversion(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        # The genuinely-convertible file, sibling to an OPEN file in the same
+        # type group -- open_files non-empty forces the per-file route
+        # without needing an unrelated truncated file at all.
+        quote_0 = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(quote_0, [_quote_tick(i) for i in range(5)], QuoteTick, close=True)
+        stamp = time.time() - 60 * 60
+        os.utime(quote_0, (stamp, stamp))
+        quote_1 = instance_dir / "quote_tick_1.feather"
+        quote_1.touch()  # age 0 -- open sibling in the SAME group
+
+        attempt = instance_dir / f"{ATTEMPT_PREFIX}quote_tick"
+        raised = {"count": 0}
+        real_read = ParquetDataCatalog._read_feather_file
+
+        def flaky_read(self, path, *a, **kw):  # type: ignore[no-untyped-def]
+            if raised["count"] == 0:
+                raised["count"] += 1
+                raise KeyboardInterrupt("simulated hard kill on the first read")
+            return real_read(self, path, *a, **kw)
+
+        # Run 1: a hard kill mid-conversion leaves the breadcrumb, no marker.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ParquetDataCatalog, "_read_feather_file", flaky_read)
+            deadline = RunDeadline(budget_ns=1_000_000_000_000)
+            with pytest.raises(KeyboardInterrupt):
+                run_ingest(
+                    tmp_path,
+                    data_types=(QuoteTick,),
+                    service_active_probe=_never_active,
+                    deadline=deadline,
+                )
+        assert attempt.is_file()
+        assert not (instance_dir / ".converted-file-quote_tick_0.feather").exists()
+
+        # Run 2: an OPEN instrument-definition file makes every tick type
+        # `skipped-definitions-pending` -- a pure no-op that never touches
+        # the tick breadcrumb (N1).
+        binary_path = instance_dir / "binary_option_0.feather"
+        binary_path.touch()  # age 0 -- open
+        deadline_2 = RunDeadline(budget_ns=1_000_000_000_000)
+        run_ingest(
+            tmp_path,
+            data_types=(BinaryOption, QuoteTick),
+            service_active_probe=_never_active,
+            convert_fn=lambda *a: None,
+            deadline=deadline_2,
+        )
+        assert attempt.is_file(), "a skipped-definitions-pending no-op must never clear it"
+
+        # Run 3: the definitions gate is gone (BinaryOption not requested),
+        # the earlier kill is fixed -- the file finally converts and the
+        # breadcrumb clears.
+        deadline_3 = RunDeadline(budget_ns=1_000_000_000_000)
+        third = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            deadline=deadline_3,
+        )
+        assert not attempt.exists()
+        assert (instance_dir / ".converted-file-quote_tick_0.feather").is_file()
+        assert third[0].outcome != "failed"
+
+
+# ---------------------------------------------------------------------------
+# T-n6: a marker touched with a kill before the breadcrumb unlink (simulated
+# here directly, since the real window is two Python statements wide) --
+# verified against the ACTUAL shipped code (not the r3 amendment's summary
+# prose): the marked-skip path unlinks a stale breadcrumb UNCONDITIONALLY,
+# whether or not a deadline is set this run. `_mark_converted`'s own
+# docstring calls this "harmless no-op (missing_ok) when no deadline was
+# ever set -- AC-D10", and R9 in the r3 amendment separately confirms a
+# stale breadcrumb under `deadline=None` is "inert (no reorder)" either way
+# -- reordering, the only consumer of breadcrumb state, never runs when
+# `deadline` is `None`. (NOTE: the r3 amendment's own test-list prose says
+# "deadline=None leaves it"; that is NOT what the shipped code does, and
+# this test pins the code's actual, safer, documented behavior instead.)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkedSkipUnlinksAStaleBreadcrumbEitherWay:
+    def test_a_marker_touched_with_a_kill_before_the_unlink_is_swept_by_the_next_runs_skip(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        # Simulate a kill landing between `_mark_converted`'s marker `.touch()`
+        # and its breadcrumb `.unlink()` -- both files present at once.
+        (instance_dir / f"{MARKER_PREFIX}quote_tick").touch()
+        attempt = instance_dir / f"{ATTEMPT_PREFIX}quote_tick"
+        attempt.touch()
+
+        run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active, deadline=None
+        )
+
+        assert not attempt.exists(), (
+            "the marked-skip path must sweep a stale breadcrumb even with "
+            "deadline=None -- it is a harmless no-op by construction (AC-D10)"
+        )
+
+    def test_the_same_kill_is_swept_when_a_deadline_is_set(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        (instance_dir / f"{MARKER_PREFIX}quote_tick").touch()
+        attempt = instance_dir / f"{ATTEMPT_PREFIX}quote_tick"
+        attempt.touch()
+
+        run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            deadline=RunDeadline(budget_ns=1_000_000_000_000),
+        )
+
+        assert not attempt.exists()
+
+
+# ---------------------------------------------------------------------------
+# T-n2-marked: an expired run over fully-marked definition types is a pure
+# no-op -- it must never consult the deadline at all.
+# ---------------------------------------------------------------------------
+
+
+class TestExpiredRunOverFullyMarkedTypesIsANoOp:
+    def test_expired_run_over_a_fully_marked_definition_type(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        _touch(tmp_path, INSTANCE, "binary_option_0.feather", age_minutes=60)
+        (instance_dir / f"{MARKER_PREFIX}binary_option").touch()
+        deadline = RunDeadline(budget_ns=0)  # expired from the first check onward
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(BinaryOption,),
+            service_active_probe=_never_active,
+            deadline=deadline,
+        )
+
+        assert results[0].type_results[0].outcome == "skipped-already-converted"
+        assert deadline.admitted == 0
+        assert not any(instance_dir.glob(f"{ATTEMPT_PREFIX}*"))
+        units, instances = count_deferred(results)
+        assert units == 0
+        assert instances == 0
+
+
+# ---------------------------------------------------------------------------
+# T-n2-lazy: the per-file tick gate is consulted lazily, exactly once per
+# type per call -- never for a type with nothing convertible.
+# ---------------------------------------------------------------------------
+
+
+class TestPerFileLazyGateTiming:
+    def test_an_open_unclosed_only_type_never_calls_admit(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(path, [_quote_tick(i) for i in range(3)], QuoteTick, close=False)
+        stamp = time.time() - 60 * 60
+        os.utime(path, (stamp, stamp))
+        report = inspect_feather_file(path)
+        catalog = ParquetDataCatalog(str(tmp_path))
+        deadline = RunDeadline(budget_ns=1_000_000_000_000)
+
+        _result, converted, is_open = ingest_cli_module._convert_one_tick_type_per_file(
+            catalog, instance_dir, INSTANCE, QuoteTick, frozenset(), {path: report},
+            instance_is_dead=False, dry_run=False, deadline=deadline,
+        )
+
+        assert deadline.admitted == 0
+        assert not converted
+        assert not is_open
+
+    def test_a_type_whose_first_convertible_file_is_its_third_admits_exactly_once(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        marked_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            marked_path, [_quote_tick(i) for i in range(3)], QuoteTick, close=True
+        )
+        ingest_cli_module._mark_file_converted(instance_dir, marked_path)  # no-op #1
+
+        unreported_path = instance_dir / "quote_tick_1.feather"
+        unreported_path.touch()  # present on disk but absent from reports_by_path -- no-op #2
+
+        convertible_a = instance_dir / "quote_tick_2.feather"
+        _write_typed_ipc_stream(
+            convertible_a, [_quote_tick(100 + i) for i in range(3)], QuoteTick, close=True
+        )
+        convertible_b = instance_dir / "quote_tick_3.feather"
+        _write_typed_ipc_stream(
+            convertible_b, [_quote_tick(200 + i) for i in range(3)], QuoteTick, close=True
+        )
+        for path in (marked_path, unreported_path, convertible_a, convertible_b):
+            stamp = time.time() - 60 * 60
+            os.utime(path, (stamp, stamp))
+
+        reports_by_path = {
+            marked_path: inspect_feather_file(marked_path),
+            convertible_a: inspect_feather_file(convertible_a),
+            convertible_b: inspect_feather_file(convertible_b),
+        }
+        catalog = ParquetDataCatalog(str(tmp_path))
+        deadline = RunDeadline(budget_ns=1_000_000_000_000)
+
+        _result, converted, _is_open = ingest_cli_module._convert_one_tick_type_per_file(
+            catalog, instance_dir, INSTANCE, QuoteTick, frozenset(), reports_by_path,
+            instance_is_dead=False, dry_run=False, deadline=deadline,
+        )
+
+        # ONE admit() call gates the whole type; both convertible files in
+        # THIS call then proceed without a second check (lazy, per-type).
+        assert deadline.admitted == 1
+        assert converted
+        assert (instance_dir / f".converted-file-{convertible_a.name}").is_file()
+        assert (instance_dir / f".converted-file-{convertible_b.name}").is_file()
+
+    def test_a_convertible_file_after_expiry_is_deferred_and_earlier_files_are_not_re_read(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        marked_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            marked_path, [_quote_tick(i) for i in range(3)], QuoteTick, close=True
+        )
+        ingest_cli_module._mark_file_converted(instance_dir, marked_path)
+        convertible_path = instance_dir / "quote_tick_1.feather"
+        _write_typed_ipc_stream(
+            convertible_path, [_quote_tick(50 + i) for i in range(3)], QuoteTick, close=True
+        )
+        for path in (marked_path, convertible_path):
+            stamp = time.time() - 60 * 60
+            os.utime(path, (stamp, stamp))
+        reports_by_path = {
+            marked_path: inspect_feather_file(marked_path),
+            convertible_path: inspect_feather_file(convertible_path),
+        }
+        catalog = ParquetDataCatalog(str(tmp_path))
+        # Already closed BEFORE this call: the guarantee spent, and time has
+        # since moved on.
+        deadline = RunDeadline(budget_ns=0)
+        deadline.admit()
+        deadline.admit()
+        assert deadline.admitted == 1
+
+        read_calls: list[Path] = []
+        real_read = ParquetDataCatalog._read_feather_file
+
+        def counting_read(self, path, *a, **kw):  # type: ignore[no-untyped-def]
+            read_calls.append(Path(path))
+            return real_read(self, path, *a, **kw)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ParquetDataCatalog, "_read_feather_file", counting_read)
+            result, converted, _is_open = ingest_cli_module._convert_one_tick_type_per_file(
+                catalog, instance_dir, INSTANCE, QuoteTick, frozenset(), reports_by_path,
+                instance_is_dead=False, dry_run=False, deadline=deadline,
+            )
+
+        assert result.outcome == DEFERRED_DEADLINE
+        assert not converted
+        assert read_calls == [], "neither the marked nor the deferred file may be read"
+        assert not (instance_dir / f"{ATTEMPT_PREFIX}quote_tick").exists()
+
+
+# ---------------------------------------------------------------------------
+# T-newest-skip: a live instance with nothing convertible must never burn the
+# run's one guarantee -- the next instance still gets it.
+# ---------------------------------------------------------------------------
+
+
+class TestALiveInstanceWithNothingConvertibleNeverBurnsTheGuarantee:
+    def test_the_next_instance_consumes_the_guarantee_instead(self, tmp_path: Path) -> None:
+        newest_id, next_id = "instance-a", "instance-b"
+        _touch(tmp_path, newest_id, "quote_tick_0.feather", age_minutes=0)
+        _touch(tmp_path, next_id, "quote_tick_0.feather", age_minutes=60)
+        deadline = RunDeadline(budget_ns=1_000_000_000_000)
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            convert_fn=lambda *a: None,
+            deadline=deadline,
+        )
+
+        by_id = {r.instance_id: r for r in results}
+        assert by_id[newest_id].outcome == "skipped-live"
+        assert by_id[next_id].outcome == "converted"
+        assert deadline.admitted == 1
+
+
+# ---------------------------------------------------------------------------
+# T-scan-clock: time spent inside `scan_instance` counts against the SAME
+# budget the next instance's loop-top peek reads.
+# ---------------------------------------------------------------------------
+
+
+class TestScanTimeCountsAgainstTheBudget:
+    def test_a_slow_scan_closes_the_gate_for_the_next_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _touch(tmp_path, INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        _touch(tmp_path, OTHER_INSTANCE, "quote_tick_0.feather", age_minutes=60)
+        clock = FakeClock()
+        deadline = RunDeadline(budget_ns=5_000, clock_ns=clock)
+        real_scan_instance = ingest_cli_module.scan_instance
+        scan_calls: list[str] = []
+
+        def slow_scan_instance(catalog_root, instance_id, subdirectory):  # type: ignore[no-untyped-def]
+            scan_calls.append(instance_id)
+            clock.advance(0.00001)  # 10_000 ns -- more than the whole budget
+            return real_scan_instance(catalog_root, instance_id, subdirectory)
+
+        monkeypatch.setattr(ingest_cli_module, "scan_instance", slow_scan_instance)
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            convert_fn=lambda *a: None,
+            deadline=deadline,
+        )
+
+        assert scan_calls == [INSTANCE]
+        by_id = {r.instance_id: r for r in results}
+        assert by_id[INSTANCE].outcome == "converted"
+        assert by_id[OTHER_INSTANCE].outcome == DEFERRED_DEADLINE
+        assert by_id[OTHER_INSTANCE].reason == "not evaluated"
+
+
+# ---------------------------------------------------------------------------
+# Rework of T6b / T-partial-whole / T-drain with REAL feather streams and the
+# real StreamingFeatherWriter/catalog (L-42): row counts after the drain
+# must equal a single no-deadline run's, with no duplicates.
+# ---------------------------------------------------------------------------
+
+
+class TestRealFeatherDrainMatchesANoDeadlineRun:
+    @staticmethod
+    def _seed(catalog_root: Path, instance_id: str) -> None:
+        quote_path = catalog_root / "live" / instance_id / "quote_tick_0.feather"
+        trade_path = catalog_root / "live" / instance_id / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(30)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            trade_path, [_trade_tick(i) for i in range(30)], TradeTick, close=True
+        )
+        stamp = time.time() - 60 * 60
+        for path in (quote_path, trade_path):
+            os.utime(path, (stamp, stamp))
+
+    def test_a_type_deferred_mid_instance_lands_identical_rows_to_a_single_no_deadline_run(
+        self, tmp_path: Path
+    ) -> None:
+        deadline_root = tmp_path / "deadline"
+        control_root = tmp_path / "control"
+        (deadline_root / "live").mkdir(parents=True)
+        (control_root / "live").mkdir(parents=True)
+        self._seed(deadline_root, INSTANCE)
+        self._seed(control_root, INSTANCE)
+
+        clock = FakeClock()
+
+        def counting_convert(catalog, instance_id, data_cls, subdirectory):  # type: ignore[no-untyped-def]
+            outcome = default_convert(catalog, instance_id, data_cls, subdirectory)
+            clock.advance(1000)  # the first REAL conversion spends the whole budget
+            return outcome
+
+        deadline = RunDeadline(budget_ns=1, clock_ns=clock)
+        first = run_ingest(
+            deadline_root,
+            data_types=(QuoteTick, TradeTick),
+            service_active_probe=_never_active,
+            convert_fn=counting_convert,
+            deadline=deadline,
+        )
+        deferred_types = [
+            r.data_cls for r in first[0].type_results if r.outcome == DEFERRED_DEADLINE
+        ]
+        assert deferred_types, "fixture must actually defer at least one type"
+        instance_dir = deadline_root / "live" / INSTANCE
+        assert (instance_dir / ".converted-quote_tick").is_file()
+        assert not (instance_dir / ".converted-trade_tick").exists()
+
+        second = run_ingest(
+            deadline_root, data_types=(QuoteTick, TradeTick), service_active_probe=_never_active
+        )
+        assert second[0].outcome == "converted"
+        assert (instance_dir / ".converted-trade_tick").is_file()
+
+        control = run_ingest(
+            control_root, data_types=(QuoteTick, TradeTick), service_active_probe=_never_active
+        )
+        assert control[0].outcome == "converted"
+
+        deadline_catalog = ParquetDataCatalog(str(deadline_root))
+        control_catalog = ParquetDataCatalog(str(control_root))
+        for data_cls in (QuoteTick, TradeTick):
+            deadline_rows = deadline_catalog.query(data_cls=data_cls)
+            control_rows = control_catalog.query(data_cls=data_cls)
+            assert len(deadline_rows) == len(control_rows) == 30
+            deadline_ts = [t.ts_init for t in deadline_rows]
+            assert len(deadline_ts) == len(set(deadline_ts)), "no duplicate rows (L-42)"
+
+
+# ---------------------------------------------------------------------------
+# T-poison end to end across runs: A dies mid-unit, leaving a breadcrumb; the
+# NEXT run attempts B and C before A, and A's eventual marker write clears
+# the breadcrumb.
+# ---------------------------------------------------------------------------
+
+
+class TestPoisonEndToEndAcrossRuns:
+    def test_a_poisoned_instance_runs_last_next_time_and_clears_on_success(
+        self, tmp_path: Path
+    ) -> None:
+        ids = ("instance-a", "instance-b", "instance-c")
+        stamp = time.time() - 60 * 60
+        for iid in ids:
+            path = _touch(tmp_path, iid, "quote_tick_0.feather")
+            os.utime(path, (stamp, stamp))  # identical mtimes -- no "newest" tiebreak
+
+        def fail_on_a(catalog, instance_id, data_cls, subdirectory):  # type: ignore[no-untyped-def]
+            if instance_id == "instance-a":
+                raise KeyboardInterrupt("simulated hard kill on instance-a")
+
+        deadline_1 = RunDeadline(budget_ns=1_000_000_000_000)
+        with pytest.raises(KeyboardInterrupt):
+            run_ingest_definitions_first(
+                tmp_path,
+                data_types=(QuoteTick,),
+                service_active_probe=_never_active,
+                convert_fn=fail_on_a,
+                deadline=deadline_1,
+            )
+        instance_a_dir = tmp_path / "live" / "instance-a"
+        assert (instance_a_dir / f"{ATTEMPT_PREFIX}quote_tick").is_file()
+        assert not (instance_a_dir / ".converted-quote_tick").exists()
+
+        order_seen: list[str] = []
+
+        def convert_and_record(catalog, instance_id, data_cls, subdirectory):  # type: ignore[no-untyped-def]
+            order_seen.append(instance_id)
+
+        deadline_2 = RunDeadline(budget_ns=1_000_000_000_000)
+        run_ingest_definitions_first(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            convert_fn=convert_and_record,
+            deadline=deadline_2,
+        )
+
+        assert order_seen == ["instance-b", "instance-c", "instance-a"], (
+            "B and C must convert before the poisoned A; A still runs LAST, never skipped"
+        )
+        assert (instance_a_dir / ".converted-quote_tick").is_file()
+        assert not (instance_a_dir / f"{ATTEMPT_PREFIX}quote_tick").exists()
+
+
+# ---------------------------------------------------------------------------
+# T-merge raw-count integration: `run_ingest_definitions_first` must record
+# deferral counts from the RAW (pre-merge) pass results.
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRawCountIntegration:
+    def test_records_counts_from_raw_pass_results_not_the_merged_view(
+        self, tmp_path: Path
+    ) -> None:
+        _touch(tmp_path, INSTANCE, "binary_option_0.feather", age_minutes=60)
+        # `_TickingClock` lands the crossing precisely between the loop-top
+        # peek and the definitions-type admit() inside pass 1 -- see
+        # `TestSalvageGate`'s docstring for the same technique.
+        clock = _TickingClock(step_ns=1000)
+        deadline = RunDeadline(budget_ns=1500, clock_ns=clock)
+        deadline.admit()  # pre-consume this run's one guarantee
+
+        results = run_ingest_definitions_first(
+            tmp_path,
+            data_types=(BinaryOption,),
+            service_active_probe=_never_active,
+            convert_fn=lambda *a: None,
+            deadline=deadline,
+        )
+
+        assert deadline.deferred_units == 1
+        assert deadline.deferred_instances == 1
+        merged = results[0]
+        assert merged.outcome == DEFERRED_DEADLINE
+        assert merged.reason == "not evaluated"
+        assert merged.type_results == (TypeConversionResult(BinaryOption, DEFERRED_DEADLINE),)
+
+
+# ---------------------------------------------------------------------------
+# T-exit: a deferral-only run (no failures) always exits 0.
+# ---------------------------------------------------------------------------
+
+
+class TestExitZeroOnADeferralOnlyRun:
+    def test_run_exits_zero_when_every_non_success_is_a_deferral(self, tmp_path: Path) -> None:
+        _touch(tmp_path, "instance-a", "quote_tick_0.feather", age_minutes=60)
+        _touch(tmp_path, "instance-b", "quote_tick_0.feather", age_minutes=60)
+
+        code, (out, _err) = _run_cli_with_code(
+            ["--catalog", str(tmp_path), "--deadline-seconds", "1"],
+            clock_ns=_TickingClock(step_ns=2_000_000_000),
+        )
+
+        assert code == EXIT_OK
+        assert "failed" not in out
+        assert "deferred (deadline; not evaluated)" in out
+
+
+def _run_cli_with_code(argv: list[str], **kwargs: Any) -> tuple[int, tuple[str, str]]:
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    code = run(argv, stdout=out, stderr=err, **kwargs)
+    return code, (out.getvalue(), err.getvalue())
