@@ -3244,14 +3244,13 @@ class TestResidualSettlementCash:
         narrower shape carrying none of `ScoredTrial`'s own scored-statistics
         provenance (`held`, `revision_seq`, `raw_sha256`, `score_seq`), so a
         caller that duck-types instead of checking `isinstance` cannot
-        mistake one for the other. `residual_settlement()`'s return value is
-        never fed to `total_realised_pnl_all_settled`, `dedupe_scored_
-        trials`, `settlement_lag_days`, or `trial_rows_of` -- each of which
-        requires a `ScoredTrial`. Backed by mutation evidence (see the PR/
-        commit notes): injecting a `ResidualSettlement` into a
-        `scored_trials` tuple and calling `total_realised_pnl_all_settled`
-        on it raises `AttributeError` (no `.pnl`), which is exactly the
-        failure this guard exists to make impossible in production code.
+        mistake one for the other. Asserts the shape distinction directly,
+        and that a real settled trial's own P&L is unaffected by a residual
+        settlement having been computed alongside it in the same run. The
+        companion test below,
+        `test_injecting_a_residual_settlement_into_scored_trials_fails_loud`,
+        makes the "cannot be fed to a scored-only function" half of this
+        guard an executable check rather than a docstring claim.
         """
         trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13")
         record = _residual_record(climate_day="2026-09-13", tmax_f=93)
@@ -3265,6 +3264,26 @@ class TestResidualSettlementCash:
 
         scored_trials = (_scored_trial(trial_id="clean/trial/1", pnl=Decimal("0.10")),)
         assert _prr.total_realised_pnl_all_settled(scored_trials) == Decimal("0.10")
+
+    def test_injecting_a_residual_settlement_into_scored_trials_fails_loud(self) -> None:
+        """The mutation check made real (§8 AC #3): `ResidualSettlement` is
+        missing every field a scored-statistics function needs (here,
+        `.pnl`) -- a caller that accidentally pools a residual settlement
+        into a `scored_trials` collection fails LOUDLY with `AttributeError`,
+        never silently double-counting it or coercing it into a phantom
+        `ScoredTrial`. This is the executable half of the characterisation
+        guard above."""
+        trial = _residual_trial(trial_id="fam/trial/LAX/2026-09-13")
+        record = _residual_record(climate_day="2026-09-13", tmax_f=93)
+        result = residual_settlement(trial, record, now_ns=_ns_of_day("2026-09-14"))
+        assert isinstance(result, ResidualSettlement)
+
+        contaminated = (
+            _scored_trial(trial_id="clean/trial/1", pnl=Decimal("0.10")),
+            result,
+        )
+        with pytest.raises(AttributeError):
+            _prr.total_realised_pnl_all_settled(contaminated)
 
     def test_run_reconciles_a_residual_written_through_the_real_writers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3358,3 +3377,160 @@ class TestResidualSettlementCash:
         )
         rows_by_day = {row["day"]: row for row in report["daily_reconciliation"]}
         assert rows_by_day["2026-09-14"]["classification"] == UNEXPLAINED_OK_LABEL
+
+
+class TestFu3bResidualCountsSurfaced:
+    """Code-review REQUEST_CHANGES follow-up: `n_residual_settlements`,
+    `n_residual_pending` and `n_residual_unresolved` must be visible in the
+    persisted report exactly the way `n_duplicate_scored_trials`/
+    `n_family_station_refusals` already are -- `PortfolioRoiReportData`, the
+    JSON (additive-optional-on-read, defaulting to 0), the Markdown render
+    and the D6 journal line. Counts only, never an amount: the payouts
+    themselves stay cash-identity-only (§8 AC #3), never reaching the
+    journal.
+    """
+
+    def test_the_counts_round_trip_through_write_and_read(self, tmp_path: Path) -> None:
+        data = dataclasses.replace(
+            _report_data(),
+            n_residual_settlements=2,
+            n_residual_pending=1,
+            n_residual_unresolved=3,
+        )
+        path = tmp_path / "report.json"
+
+        write_portfolio_roi_json(path, data)
+        view = read_portfolio_roi_report(path)
+
+        assert view.n_residual_settlements == 2
+        assert view.n_residual_pending == 1
+        assert view.n_residual_unresolved == 3
+
+    def test_an_old_json_sibling_without_the_residual_counts_reads_as_zero(
+        self, tmp_path: Path
+    ) -> None:
+        """§6 D7 additive-only rule: a JSON sibling written before these
+        three fields existed has no such keys, and must still read under the
+        current schema_version, each defaulting to 0."""
+        data = _report_data()
+        path = tmp_path / "report.json"
+        write_portfolio_roi_json(path, data)
+        raw = json.loads(path.read_text())
+        del raw["n_residual_settlements"]
+        del raw["n_residual_pending"]
+        del raw["n_residual_unresolved"]
+        path.write_text(json.dumps(raw))
+
+        view = read_portfolio_roi_report(path)
+
+        assert view.n_residual_settlements == 0
+        assert view.n_residual_pending == 0
+        assert view.n_residual_unresolved == 0
+
+    def test_the_markdown_and_journal_carry_the_new_dimensionless_counts(self) -> None:
+        data = dataclasses.replace(
+            _report_data(),
+            n_residual_settlements=2,
+            n_residual_pending=1,
+            n_residual_unresolved=3,
+        )
+
+        report = render_markdown_report(data)
+        assert "n_residual_settlements" in report
+        assert "n_residual_pending" in report
+        assert "n_residual_unresolved" in report
+
+        line = journal_line(data)
+        assert "n_residual_settlements=2" in line
+        assert "n_residual_pending=1" in line
+        assert "n_residual_unresolved=3" in line
+        assert "$" not in line
+        assert not re.search(r"\d+\.\d+", line)
+
+    def test_an_unresolved_residual_shows_n_residual_unresolved_one_in_the_report_and_journal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An unresolved residual (here: a catalog read error) must be
+        VISIBLE in the persisted report -- never a silent gap in the cash
+        identity."""
+        families_dir = tmp_path / "families"
+        _write_family_manifest(
+            families_dir, family_id="fam_res", trial_id_prefix="fam_res/trial/"
+        )
+
+        store_path = tmp_path / "state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            fill = _fill(
+                venue_order_id="vo-res",
+                ts_event=_ns_of_day("2026-09-13"),
+                cumulative_cost=Decimal("0.70"),
+                cumulative_fee=Decimal(0),
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-res", fill.to_bytes())
+        finally:
+            store.close()
+
+        trial_id = "fam_res/trial/LAX/2026-09-13"
+        raw_trial = _residual_trial(trial_id=trial_id)
+        reader = _stub_reader({("fam_res/trial/", "LAX"): ((raw_trial,), {})})
+        monkeypatch.setattr(_prr, "read_filled_trials_state_db", reader)
+
+        release_ns = _ns_of_day("2026-09-14")
+        monkeypatch.setattr(
+            _prr,
+            "_with_scheduled_release_at_ns",
+            lambda trial, *, venue, city: dataclasses.replace(
+                trial, scheduled_release_at_ns=release_ns
+            ),
+        )
+
+        # The real excluded_fills.jsonl writer -- makes the fill RESIDUAL.
+        scored_trials_dir = tmp_path / "scored_trials"
+        score_live_trials._append_excluded_fills(
+            scored_trials_dir / "fam_res",
+            [
+                score_live_trials.FillExclusion(
+                    trial_id=trial_id,
+                    station="LAX",
+                    climate_day="2026-09-13",
+                    qty="1",
+                    reason="fee_unverified",
+                    detail="test fixture",
+                    venue_order_id="vo-res",
+                    filled_at_ns=_ns_of_day("2026-09-13"),
+                )
+            ],
+            scored_run_utc="2026-09-13T00:00:00Z",
+        )
+
+        # The catalog read failure: deterministic, never relying on a real
+        # filesystem edge case -- `_resolve_residual_settlements`'s own
+        # closed exception tuple (`OSError`, `CatalogPathError`) must catch
+        # this and count it, never raise out of `_run`.
+        def _raise_os_error(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("simulated catalog read failure")
+
+        monkeypatch.setattr(_prr, "open_station_catalog", _raise_os_error)
+
+        exit_code = _run(
+            exec_state_db_path=store_path,
+            scored_trials_dir=scored_trials_dir,
+            logs_dir=tmp_path / "logs",
+            output_dir=tmp_path / "derived",
+            families_dir=families_dir,
+            now_ns=_ns_of_day("2026-09-14"),
+            sink=_prr.resolve_alert_sink({}),
+            catalog_base=tmp_path / "catalog",
+        )
+
+        assert exit_code == 0
+        report = json.loads(
+            (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-09-14.json").read_text()
+        )
+        assert report["n_residual_unresolved"] == 1
+        assert report["n_residual_settlements"] == 0
+        assert report["n_residual_pending"] == 0
+
+        stdout = capsys.readouterr().out
+        assert "n_residual_unresolved=1" in stdout

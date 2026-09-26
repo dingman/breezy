@@ -2145,6 +2145,14 @@ class PortfolioRoiReportData:
     # Rows dropped before proceeds: same trial_id in more than one family
     # store. Latest scored_at_ns is kept. Dimensionless.
     n_duplicate_scored_trials: int = 0
+    # -- FU-3b: residual-fill settlement payout reconciliation, counts only
+    # (never an amount -- the payouts themselves stay cash-identity-only,
+    # never reaching the journal per D6). `n_residual_unresolved` must be
+    # visible here: an unresolved residual is a silent gap in the cash
+    # identity otherwise.
+    n_residual_settlements: int = 0
+    n_residual_pending: int = 0
+    n_residual_unresolved: int = 0
     # -- Stage C3: the per-trial P&L breakdown (schema_version=2). Empty by
     # default only for a caller (e.g. a test) that never supplies scored
     # trials -- `build_portfolio_roi_report_data` always populates this from
@@ -2183,6 +2191,9 @@ def build_portfolio_roi_report_data(
     n_undecodable_ledger_rows: int = 0,
     n_exit_fills: int = 0,
     n_duplicate_scored_trials: int = 0,
+    n_residual_settlements: int = 0,
+    n_residual_pending: int = 0,
+    n_residual_unresolved: int = 0,
     scored_trials: Iterable[ScoredTrial] = (),
     registered_manifests: Sequence[FamilyManifest] = (),
 ) -> PortfolioRoiReportData:
@@ -2244,6 +2255,9 @@ def build_portfolio_roi_report_data(
         n_undecodable_ledger_rows=n_undecodable_ledger_rows,
         n_exit_fills=n_exit_fills,
         n_duplicate_scored_trials=n_duplicate_scored_trials,
+        n_residual_settlements=n_residual_settlements,
+        n_residual_pending=n_residual_pending,
+        n_residual_unresolved=n_residual_unresolved,
         trial_rows=trial_rows_of(scored_trials, registered_manifests=registered_manifests),
     )
 
@@ -2295,6 +2309,9 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "n_undecodable_ledger_rows": data.n_undecodable_ledger_rows,
         "n_exit_fills": data.n_exit_fills,
         "n_duplicate_scored_trials": data.n_duplicate_scored_trials,
+        "n_residual_settlements": data.n_residual_settlements,
+        "n_residual_pending": data.n_residual_pending,
+        "n_residual_unresolved": data.n_residual_unresolved,
         "trial_rows": [
             {
                 "trial_id": row.trial_id,
@@ -2359,6 +2376,9 @@ class PortfolioRoiReportView:
     n_undecodable_ledger_rows: int
     n_exit_fills: int
     n_duplicate_scored_trials: int
+    n_residual_settlements: int
+    n_residual_pending: int
+    n_residual_unresolved: int
     #: G2: the per-day table, typed/validated the same way as every other
     #: field (never a raw list of dicts) -- absent on an old JSON sibling
     #: (schema_version=1 predates this field) reads as `()`, the only
@@ -2505,6 +2525,19 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
             if "n_duplicate_scored_trials" in raw
             else 0
         ),
+        n_residual_settlements=(
+            _require_int(raw, "n_residual_settlements")
+            if "n_residual_settlements" in raw
+            else 0
+        ),
+        n_residual_pending=(
+            _require_int(raw, "n_residual_pending") if "n_residual_pending" in raw else 0
+        ),
+        n_residual_unresolved=(
+            _require_int(raw, "n_residual_unresolved")
+            if "n_residual_unresolved" in raw
+            else 0
+        ),
         trial_rows=(
             _require_trial_rows(raw)
             if version >= _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS
@@ -2586,6 +2619,9 @@ def render_markdown_report(data: PortfolioRoiReportData) -> str:
         f"- max_days_past_horizon: {data.max_days_past_horizon}",
         f"- n_family_station_refusals: {data.n_family_station_refusals}",
         f"- n_duplicate_scored_trials: {data.n_duplicate_scored_trials}",
+        f"- n_residual_settlements (FU-3b): {data.n_residual_settlements}",
+        f"- n_residual_pending (FU-3b): {data.n_residual_pending}",
+        f"- n_residual_unresolved (FU-3b): {data.n_residual_unresolved}",
         "",
         "## Settled-window cash-identity verdict (F1, §6 D4)",
         f"- settled_cumulative_unexplained: {data.settled_cumulative_unexplained}",
@@ -2647,7 +2683,10 @@ def journal_line(data: PortfolioRoiReportData) -> str:
         f"unsettled_capital_positions={data.unsettled_capital_positions} "
         f"settled_through_statistic={data.settled_through_statistic} "
         f"lag_sample_n={data.lag_sample_n} "
-        f"n_family_station_refusals={data.n_family_station_refusals}"
+        f"n_family_station_refusals={data.n_family_station_refusals} "
+        f"n_residual_settlements={data.n_residual_settlements} "
+        f"n_residual_pending={data.n_residual_pending} "
+        f"n_residual_unresolved={data.n_residual_unresolved}"
     )
 
 
@@ -3333,7 +3372,7 @@ def _run(
             for result in family_station_results
             for trial in result.trials
         }
-        residual_settlements, residual_pending, _n_residual_unresolved = (
+        residual_settlements, residual_pending, n_residual_unresolved = (
             _resolve_residual_settlements(
                 filled_trials,
                 residual_trial_ids=frozenset(residual_ids - scored_ids),
@@ -3398,6 +3437,9 @@ def _run(
         n_undecodable_ledger_rows=ledger_result.n_undecodable_ledger_rows,
         n_exit_fills=n_exit_fills,
         n_duplicate_scored_trials=n_duplicate_scored_trials,
+        n_residual_settlements=len(residual_settlements),
+        n_residual_pending=len(residual_pending),
+        n_residual_unresolved=n_residual_unresolved,
         scored_trials=scored_trials,
         registered_manifests=registered_manifests,
     )
