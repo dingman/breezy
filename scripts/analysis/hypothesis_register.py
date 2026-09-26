@@ -24,10 +24,18 @@ Registers `H-NO-SIDE-2026-09` per
 of 0.04, so `register_hypothesis` returns `UNDERPOWERED_NOT_REGISTERED`,
 consuming no alpha and no slot. Every `NO_SIDE_*` constant below is pinned to
 that ruling's numbered lines (cited inline) and its 2026-09-25 independent
-peer pass appended in commit `329380f` (ENDORSED-WITH-NOTES). `H-ARCHIVE-RECAL-2026-09`
-is deliberately NOT a registrable choice here -- its own ruling's peer
-confirmation of the corpus rationale is a separate, later registration slice
-(see the AUD-18 plan doc's dated 2026-09-25 amendment).
+peer pass appended in commit `329380f` (ENDORSED-WITH-NOTES).
+
+**Archive-table recalibration UNDERPOWERED disposition (AUD-18a, 2026-09-26).**
+Registers `H-ARCHIVE-RECAL-2026-09` per
+`docs/evidence/RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md` §1/§4:
+MDE 0.0629 at the pre-registered `n=600` exceeds the ruling's
+`mde_plausibility_bound` of 0.03, so `register_hypothesis` returns
+`UNDERPOWERED_NOT_REGISTERED`, consuming no alpha and no slot. Every
+`ARCHIVE_RECAL_*` constant below is pinned to that ruling's exact text (cited
+inline); the ruling's own peer confirmation ("The :137 condition is closed.")
+unblocked registration as this separate, later slice (see the AUD-18a plan
+doc, `docs/plans/backlog/AUDIT_2026-09-21/AUD-18a_register_archive_recal_plan_r1_2026-09-26.md`).
 
 **Never run against the real derived directory from a test.** Every test in
 `tests/unit/test_hypothesis_register.py` passes an explicit
@@ -41,6 +49,7 @@ import argparse
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
@@ -60,7 +69,17 @@ from breezy.analysis.hypothesis_ledger import (
 )
 
 __all__ = [
+    "ARCHIVE_RECAL_FREEZE_COMMIT",
+    "ARCHIVE_RECAL_HYPOTHESIS_CLASS",
     "ARCHIVE_RECAL_HYPOTHESIS_ID",
+    "ARCHIVE_RECAL_K_VARIANTS",
+    "ARCHIVE_RECAL_MDE",
+    "ARCHIVE_RECAL_MIN_STATION_DAYS",
+    "ARCHIVE_RECAL_PER_VARIANT_ALPHA",
+    "ARCHIVE_RECAL_PLAUSIBILITY_BOUND",
+    "ARCHIVE_RECAL_REFERENCE_ASK",
+    "ARCHIVE_RECAL_RULING_DATE",
+    "ARCHIVE_RECAL_SLIPPAGE_ALLOWANCE",
     "DERIVED_ROOT_ENV_VAR",
     "FORECAST_TAKER_HYPOTHESIS_CLASS",
     "FORECAST_TAKER_HYPOTHESIS_ID",
@@ -81,6 +100,7 @@ __all__ = [
     "ledger_path",
     "main",
     "register_and_persist",
+    "register_archive_recal_underpowered",
     "register_forecast_taker_closed_disposition",
     "register_no_side_underpowered",
 ]
@@ -127,13 +147,38 @@ NO_SIDE_FREEZE_COMMIT: Final[str] = "49261a5c2119fc621863ad7df05af1e2a96c6b55"
 #: Peer section dated 2026-09-25; the independent pass appended the same date.
 NO_SIDE_RULING_DATE: Final[str] = "2026-09-25"
 
-#: Named only to be REFUSED by `--register-underpowered`'s CLI choices.
-#: `H-ARCHIVE-RECAL-2026-09`'s own ruling's :137 corpus-rationale peer
-#: confirmation has since landed (`329380f`, CONFIRMED-WITH-NOTES) and
-#: registration is unblocked, but it is a deliberately separate, later
-#: registration slice -- not reachable through this CLI action, per the
-#: AUD-18 plan doc's dated 2026-09-25 amendment.
+#: RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md §1 table --
+#: `hypothesis_id`/`hypothesis_class`. The ruling's own peer confirmation
+#: ("The :137 condition is closed.") unblocked registration as this
+#: deliberately separate, later slice (AUD-18a).
 ARCHIVE_RECAL_HYPOTHESIS_ID: Final[str] = "H-ARCHIVE-RECAL-2026-09"
+ARCHIVE_RECAL_HYPOTHESIS_CLASS: Final[str] = "pm_us_crh_v4_archive_recalibration"
+#: §1 -- one recalibration design, not a sweep ("| `k_variants` | **1** |").
+ARCHIVE_RECAL_K_VARIANTS: Final[int] = 1
+#: §1 -- with-takes station-days pooled across the design's registered
+#: strata ("`min_station_days` (with-takes, §6.1 zero-take rule) | **600** |").
+ARCHIVE_RECAL_MIN_STATION_DAYS: Final[int] = 600
+#: §1/§2 -- `allocated_alpha = PROGRAMME_ALPHA / MAX_HYPOTHESES = 0.05/4 =
+#: 0.0125`; `per_variant_alpha = 0.0125 / ARCHIVE_RECAL_K_VARIANTS = 0.0125`
+#: ("`per_variant_alpha=0.0125`").
+ARCHIVE_RECAL_PER_VARIANT_ALPHA: Final[float] = (
+    PROGRAMME_ALPHA / MAX_HYPOTHESES / ARCHIVE_RECAL_K_VARIANTS
+)
+#: §2 -- "`3.08302/48.9898 = 0.0629`" at `n=600`; `recompute_mde` reproduces
+#: this within `MDE_MISMATCH_TOLERANCE` (`hypothesis_ledger.py:469-482`).
+ARCHIVE_RECAL_MDE: Final[float] = 0.0629
+#: §3 -- "`mde_plausibility_bound = 0.03`".
+ARCHIVE_RECAL_PLAUSIBILITY_BOUND: Final[float] = 0.03
+#: §2 Market terms -- "reference ask `a = 0.30`".
+ARCHIVE_RECAL_REFERENCE_ASK: Final[float] = 0.30
+#: §2 Market terms -- AUD-12's unmeasured placeholder, restated PROVISIONAL
+#: by the ruling's §6.
+ARCHIVE_RECAL_SLIPPAGE_ALLOWANCE: Final[float] = 0.01
+#: §0/§1 -- "`freeze_commit` | `49261a5c2119fc621863ad7df05af1e2a96c6b55`".
+ARCHIVE_RECAL_FREEZE_COMMIT: Final[str] = "49261a5c2119fc621863ad7df05af1e2a96c6b55"
+#: The ruling's own dated table date; the appended peer-confirmation pass
+#: is the same date.
+ARCHIVE_RECAL_RULING_DATE: Final[str] = "2026-09-25"
 
 #: The 40-hex git sha shape. Lives ONLY at the CLI boundary (`main`) -- the
 #: functions below (`register_forecast_taker_closed_disposition`,
@@ -249,6 +294,65 @@ def register_no_side_underpowered(*, path: Path, registered_at: str) -> Hypothes
     )
 
 
+def register_archive_recal_underpowered(*, path: Path, registered_at: str) -> HypothesisRecord:
+    """RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md §1/§4 (peer
+    confirmation appended 2026-09-25, CONFIRMED-WITH-NOTES, closing the :137
+    condition): registers the archive-table recalibration hypothesis's
+    pre-decided `UNDERPOWERED_NOT_REGISTERED` disposition (MDE 0.0629 >
+    plausibility bound 0.03 at the pre-registered `n=600`,
+    `hypothesis_ledger.py:648-673`).
+
+    Every `ARCHIVE_RECAL_*` input is referenced here as a module global, read
+    at CALL time -- never bound as a default-argument value -- mirroring
+    `register_no_side_underpowered`, so a test can `monkeypatch.setattr` this
+    module's constant (e.g. `ARCHIVE_RECAL_PLAUSIBILITY_BOUND`) and observe
+    the effect on the next call, including `register_and_persist`'s
+    check-before-write refusal.
+    """
+    return register_and_persist(
+        path=path,
+        hypothesis_id=ARCHIVE_RECAL_HYPOTHESIS_ID,
+        hypothesis_class=ARCHIVE_RECAL_HYPOTHESIS_CLASS,
+        registered_at=registered_at,
+        k_variants=ARCHIVE_RECAL_K_VARIANTS,
+        freeze_commit=ARCHIVE_RECAL_FREEZE_COMMIT,
+        disposition="NORMAL",
+        min_station_days=ARCHIVE_RECAL_MIN_STATION_DAYS,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=ARCHIVE_RECAL_MDE,
+        mde_plausibility_bound=ARCHIVE_RECAL_PLAUSIBILITY_BOUND,
+        power_is_primary_only=True,
+        mde_reference_ask=ARCHIVE_RECAL_REFERENCE_ASK,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=ARCHIVE_RECAL_SLIPPAGE_ALLOWANCE,
+        mde_variance_bound=VARIANCE_BOUND,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=PINNED_ORDER_QUANTITY,
+        look_policy="SINGLE_LOOK",
+        require_status="UNDERPOWERED_NOT_REGISTERED",
+    )
+
+
+#: `--register-underpowered`'s per-id dispatch table: maps a registrable
+#: hypothesis_id to (registration function, its ruling's date gate, the
+#: ruling file named in the CLI's date-gate error message). Replaces the
+#: single `NO_SIDE_RULING_DATE` gate now that a second id is registrable.
+_UNDERPOWERED_REGISTRATIONS: Final[
+    dict[str, tuple[Callable[..., HypothesisRecord], str, str]]
+] = {
+    NO_SIDE_HYPOTHESIS_ID: (
+        register_no_side_underpowered,
+        NO_SIDE_RULING_DATE,
+        "RULING_H-NO-SIDE-2026-09_horizon_2026-09-25.md",
+    ),
+    ARCHIVE_RECAL_HYPOTHESIS_ID: (
+        register_archive_recal_underpowered,
+        ARCHIVE_RECAL_RULING_DATE,
+        "RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md",
+    ),
+}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -274,7 +378,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     action_group.add_argument(
         "--register-underpowered",
-        choices=[NO_SIDE_HYPOTHESIS_ID],
+        choices=list(_UNDERPOWERED_REGISTRATIONS),
         default=None,
         help="Register the named hypothesis's pre-decided "
         "UNDERPOWERED_NOT_REGISTERED disposition.",
@@ -313,15 +417,18 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.registered_at < NO_SIDE_RULING_DATE:
+        register_fn, ruling_date, ruling_file = _UNDERPOWERED_REGISTRATIONS[
+            args.register_underpowered
+        ]
+        if args.registered_at < ruling_date:
             print(
-                f"error: --registered-at must be on or after {NO_SIDE_RULING_DATE} "
-                f"(RULING_H-NO-SIDE-2026-09_horizon_2026-09-25.md's date)",
+                f"error: --registered-at must be on or after {ruling_date} "
+                f"({ruling_file}'s date)",
                 file=sys.stderr,
             )
             return 2
         try:
-            record = register_no_side_underpowered(path=path, registered_at=args.registered_at)
+            record = register_fn(path=path, registered_at=args.registered_at)
         except (DuplicateHypothesisIdError, UnexpectedRegistrationStatusError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
