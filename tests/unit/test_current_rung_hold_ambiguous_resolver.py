@@ -25,16 +25,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
-from nautilus_trader.common.component import LiveClock
+from nautilus_trader.accounting.factory import AccountFactory
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.cache.config import CacheConfig
+from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.events import OrderDenied
+from nautilus_trader.model.events import AccountState, OrderDenied
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
 from breezy.adapters.polymarket_us.exec.client import (
@@ -46,14 +52,23 @@ from breezy.adapters.polymarket_us.exec.client import (
     StartupPositionSnapshot,
     _synthetic_get_fill_trade_id,
 )
-from breezy.adapters.polymarket_us.exec.endpoints import OPEN_ORDERS_PATH, PORTFOLIO_POSITIONS_PATH
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    ACCOUNT_BALANCES_PATH,
+    OPEN_ORDERS_PATH,
+    PORTFOLIO_POSITIONS_PATH,
+)
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
+    DailySpendLedger,
 )
-from breezy.adapters.polymarket_us.safety import live_trading_budget_remaining
-from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
+from breezy.adapters.polymarket_us.safety import (
+    issue_live_trading_permit,
+    live_trading_budget_remaining,
+)
+from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, instrument_id_to_slug
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
     RetirementReason,
@@ -61,6 +76,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentCorrupt,
     SubmitIntentMismatch,
     SubmitIntentState,
+    open_submit_intent_latch,
 )
 from breezy.strategy.current_rung_hold.composition import family_halt_submit_veto
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -74,14 +90,19 @@ from tests.unit.polymarket_us_exec_shapes import (
     build_second_instrument,
 )
 from tests.unit.test_current_rung_hold_pre_arm_race import (
+    ACCOUNT_NUMBER,
+    CLIENT_ID,
     STRATEGY_ID,
     TRADER_ID,
     _build_race_client,
     _SlowSender,
     _submit_command,
 )
-from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+from tests.unit.test_polymarket_us_permit_issuance import credentials, enable_operator_gate
 from tests.unit.test_polymarket_us_submit_order_chain import (
+    _balances_payload,
+    _FakeSigner,
+    _PrivateReadStub,
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
 
@@ -2466,3 +2487,254 @@ async def test_the_same_get_body_under_an_entry_context_stays_mapping_error(
             "an entry context must never resolve against a close echo"
         )
         await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# FU-5 (2026-09-26 boot-overlap fix): `_connect` must not create the
+# periodic resolver task until AFTER `_wait_for_instruments` and the
+# immediate `first_pass_immediate=True` pass have both been awaited. Before
+# the fix, the periodic task was created FIRST -- a slow boot's periodic
+# first pass could then overlap the immediate pass's own in-flight
+# `run_in_executor` instrument load, see the just-set
+# `_resolver_instrument_load_attempted_ns` gate, skip its own load, and
+# falsely log/escalate "not in the cache and could not be loaded" for an
+# instrument the immediate pass was still loading successfully.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_periodic_resolver_task_is_created_only_after_the_immediate_pass_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED on today's ordering: ``_connect`` calls ``create_task`` for the
+    periodic resolver BEFORE it awaits the immediate
+    ``first_pass_immediate=True`` pass. Recorded via a faked
+    ``_resolve_ambiguous_intents`` and a wrapped ``create_task`` so the
+    ordering is observed directly, not inferred from timing.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+    events: list[str] = []
+
+    async def fake_resolve(self: Any, *, first_pass_immediate: bool = False) -> None:
+        if first_pass_immediate:
+            events.append("immediate_pass_start")
+            await asyncio.sleep(0)
+            events.append("immediate_pass_end")
+        else:
+            events.append("periodic_pass_start")
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(
+        PolymarketUSExecutionClient, "_resolve_ambiguous_intents", fake_resolve, raising=True,
+    )
+    real_create_task = PolymarketUSExecutionClient.create_task
+
+    def fake_create_task(self: Any, coro: Any, **kwargs: Any) -> Any:
+        events.append("resolver_task_created")
+        return real_create_task(self, coro, **kwargs)
+
+    monkeypatch.setattr(
+        PolymarketUSExecutionClient, "create_task", fake_create_task, raising=True,
+    )
+    sender = _SlowSender()
+    sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+
+    assert events == [
+        "immediate_pass_start",
+        "immediate_pass_end",
+        "resolver_task_created",
+    ], events
+    client._resolver_task.cancel()
+    await asyncio.gather(client._resolver_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_periodic_resolver_task_exists_after_connect_when_the_immediate_pass_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The periodic task must still exist, and not be done, after `_connect`
+    returns even when the immediate pass raises an exception `_connect`
+    catches internally -- the `finally` that creates it must run on that
+    path exactly as it does on the success path.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+
+    async def fake_resolve(self: Any, *, first_pass_immediate: bool = False) -> None:
+        if first_pass_immediate:
+            raise RuntimeError("immediate pass boom")
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(
+        PolymarketUSExecutionClient, "_resolve_ambiguous_intents", fake_resolve, raising=True,
+    )
+    sender = _SlowSender()
+    sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+
+    assert client._resolver_task is not None
+    assert not client._resolver_task.done()
+    client._resolver_task.cancel()
+    await asyncio.gather(client._resolver_task, return_exceptions=True)
+
+
+async def _build_client_with_custom_loader(
+    tmp_path: Path,
+    *,
+    store_path: Path,
+    resolver_instrument_loader: Callable[[str], Any] | None,
+) -> tuple[PolymarketUSExecutionClient, Any]:
+    """Like ``_build_race_client``, but stops SHORT of calling ``_connect``
+    -- the caller drives it -- and accepts an injected
+    ``resolver_instrument_loader``, a seam ``_build_race_client`` has none
+    for. Built with an EMPTY cache/provider (no ``build_instrument()`` add):
+    reproduces a process restart against a durable store that already
+    carries an OPEN with-id AMBIGUOUS intent for an instrument this fresh
+    process has not loaded yet -- exactly the shape the loader exists for.
+    """
+    loop = asyncio.get_running_loop()
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
+    cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
+    provider = InstrumentProvider()
+
+    read = _PrivateReadStub(
+        {
+            ACCOUNT_BALANCES_PATH: _balances_payload(),
+            PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+        },
+    )
+
+    def _on_account_state(state: AccountState) -> None:
+        if cache.account(state.account_id) is None:
+            cache.add_account(AccountFactory.create(state))
+        else:
+            cache.account(state.account_id).apply(state)
+
+    msgbus.register(endpoint="Portfolio.update_account", handler=_on_account_state)
+
+    live_permit = issue_live_trading_permit(clock=clock)
+    latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
+    submit_intent_latch = latch_cm.__enter__()
+    ledger = DailySpendLedger()
+
+    client = PolymarketUSExecutionClient(
+        loop=loop,
+        client_id=CLIENT_ID,
+        venue=POLYMARKET_US_VENUE,
+        instrument_provider=provider,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        private_read=read,
+        state_store_opener=lambda: SqliteStateStore(store_path),
+        account_number=ACCOUNT_NUMBER,
+        instrument_wait_timeout_s=1.0,
+        account_registration_timeout_s=1.0,
+        order_sender=_SlowSender(),
+        write_signer=_FakeSigner(),
+        live_trading_permit=live_permit,
+        spend_ledger=ledger,
+        submit_intent_latch=submit_intent_latch,
+        credentials=credentials(),
+        api_base_url="https://api.polymarket.us",
+        retirement_reasons=RetirementReason,
+        resolver_instrument_loader=resolver_instrument_loader,
+    )
+    return client, latch_cm
+
+
+@pytest.mark.asyncio
+async def test_an_overlapping_boot_does_not_log_could_not_be_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RED on today's ordering: a slow instrument loader lets the immediate
+    pass's ``run_in_executor`` load stay in flight while a (buggy-code)
+    periodic first pass reaches the SAME gate, sees the just-set
+    ``_resolver_instrument_load_attempted_ns`` entry, skips its own load,
+    and falsely counts/escalates the "could not be loaded" failure for an
+    instrument the immediate pass is actually about to load successfully.
+
+    ``self._log`` is Nautilus's own Cython logger and cannot be observed
+    directly (see this module's other static-log tests) --
+    ``_resolver_consecutive_failures`` and
+    ``_resolver_missing_instrument_logged`` are the same proxy the rest of
+    this suite already uses for this ERROR's gating.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+    store_path = tmp_path / "exec_state.db"
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        # First "process": arms one with-id AMBIGUOUS intent against
+        # `build_instrument()`, then "restarts" -- releasing the exclusive
+        # flock (the same idiom `test_cross_restart_second_engine_never_
+        # takes_a_second_trial` uses) -- leaving the OPEN intent + durable
+        # resolver context on disk for the second client to inherit.
+        first_client, order_id, slug, first_latch_cm, _order_events = (
+            await _arm_one_ambiguous_intent(tmp_path)
+        )
+        await first_client._disconnect()
+        first_latch_cm.__exit__(None, None, None)
+
+        target_instrument = build_instrument()
+        release = threading.Event()
+        load_started = threading.Event()
+
+        def _slow_loader(instrument_id: str) -> Any:
+            load_started.set()
+            release.wait(timeout=5.0)
+            return target_instrument if instrument_id == str(target_instrument.id) else None
+
+        client, latch_cm = await _build_client_with_custom_loader(
+            tmp_path, store_path=store_path, resolver_instrument_loader=_slow_loader,
+        )
+        # A benign, non-terminal GET body for the durable intent's own venue
+        # order -- isolates the counter under test to the instrument-load
+        # race: an unstubbed path here would 404/KeyError and increment
+        # `_resolver_consecutive_failures` for an UNRELATED reason on every
+        # pass, confounding the assertion below.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+        client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+        try:
+            connect_task = asyncio.get_event_loop().create_task(client._connect())
+            # Let the immediate pass reach the slow loader and suspend there.
+            for _ in range(500):
+                if load_started.is_set():
+                    break
+                await asyncio.sleep(0)
+            assert load_started.is_set(), "the immediate pass never reached the slow loader"
+            # Give a (buggy-code) periodic task every opportunity to run
+            # while the loader thread is still blocked.
+            for _ in range(500):
+                await asyncio.sleep(0)
+            release.set()
+            await connect_task
+        finally:
+            release.set()
+            await client._disconnect()
+            latch_cm.__exit__(None, None, None)
+
+    assert client._resolver_consecutive_failures == 0, (
+        "an overlapping periodic pass falsely counted the immediate pass's "
+        "in-flight load as a failure"
+    )
+    assert client._resolver_missing_instrument_logged == set(), (
+        "an overlapping periodic pass falsely escalated the 'could not be "
+        "loaded' ERROR for an instrument the immediate pass was still loading"
+    )
+    assert client._cache.instrument(target_instrument.id) is not None

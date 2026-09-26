@@ -1597,43 +1597,69 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         try:
             self._set_account_id(self._issued_account_id)
             self._open_state_store()
-            # Resolution A (plan rev 6.1): started here, unconditionally,
-            # for the client's lifetime -- a named, firewall-scanned
-            # coroutine (`EXEC_RESOLVER_COROUTINES`), never awaited inline.
-            # It is a no-op every pass until an AMBIGUOUS outcome writes a
-            # durable resolver context via `_note_ambiguous_open`.
-            self._resolver_task = self.create_task(
-                self._resolve_ambiguous_intents(),
-                log_msg="resolve_ambiguous_intents",
-            )
-            await self._wait_for_instruments()
-            # Item 2 (2026-09-12 boot-ordering addendum): ONE synchronous,
-            # bounded resolver pass -- AWAITED here, not merely scheduled --
-            # after instruments are loaded (the pass needs
-            # `self._cache.instrument(...)` to resolve anything) but still
-            # well before this method returns and before Nautilus's own
-            # kernel-level reconciliation ever runs. A boot with nothing to
-            # resolve (no latch bound yet, or no OPEN intent) completes this
-            # with no sleep and no observable delay -- see
-            # `_resolve_ambiguous_intents`'s `first_pass_immediate` docstring.
-            # The periodic task above still runs for the client's lifetime;
-            # this is an ADDITIONAL early pass, not a replacement.
-            #
-            # Review fix (2026-09-12): caught LOCALLY, deliberately narrower
-            # than this method's own `except BaseException` below. The
-            # periodic task's exceptions are only ever logged by Nautilus's
-            # native `_on_task_completed` -- never fatal -- and this
-            # immediate call must fail exactly the same way, not latch a
-            # fatal fault and shut the node down at boot over a transient
-            # read this SAME coroutine's periodic run would retry moments
-            # later. Only `type(exc).__name__` is logged, never `exc` or any
-            # resolver-context value (durable state can carry venue ids).
+            # FU-5 (2026-09-26 boot-overlap fix): the periodic resolver task
+            # is now started in the `finally` below, AFTER `_wait_for_
+            # instruments` and the immediate pass have both been awaited --
+            # never before. Starting it here, unconditionally, let a slow
+            # boot's periodic FIRST pass overlap the immediate pass's own
+            # in-flight `run_in_executor` instrument load: the periodic pass
+            # would see `_resolver_instrument_load_attempted_ns` just set by
+            # the immediate pass, skip its own load under that gate, and
+            # falsely log/escalate "not in the cache and could not be
+            # loaded" for an instrument the immediate pass was still loading
+            # successfully. Moving the `create_task` into the `finally`
+            # below removes the overlap window entirely: the periodic task
+            # provably does not exist until the immediate pass has returned
+            # (normally, or via the exception it catches internally, or
+            # even if `_wait_for_instruments` itself raises).
             try:
-                await self._resolve_ambiguous_intents(first_pass_immediate=True)
-            except Exception as exc:  # noqa: BLE001 - see comment above
-                self._log.warning(
-                    f"immediate resolver pass failed; periodic resolver "
-                    f"continues ({type(exc).__name__})"
+                await self._wait_for_instruments()
+                # Item 2 (2026-09-12 boot-ordering addendum): ONE synchronous,
+                # bounded resolver pass -- AWAITED here, not merely scheduled --
+                # after instruments are loaded (the pass needs
+                # `self._cache.instrument(...)` to resolve anything) but still
+                # well before this method returns and before Nautilus's own
+                # kernel-level reconciliation ever runs. A boot with nothing to
+                # resolve (no latch bound yet, or no OPEN intent) completes this
+                # with no sleep and no observable delay -- see
+                # `_resolve_ambiguous_intents`'s `first_pass_immediate` docstring.
+                # The periodic task started in `finally` below still runs for
+                # the client's lifetime; this is an ADDITIONAL early pass, not
+                # a replacement.
+                #
+                # Review fix (2026-09-12): caught LOCALLY, deliberately narrower
+                # than this method's own `except BaseException` below. The
+                # periodic task's exceptions are only ever logged by Nautilus's
+                # native `_on_task_completed` -- never fatal -- and this
+                # immediate call must fail exactly the same way, not latch a
+                # fatal fault and shut the node down at boot over a transient
+                # read this SAME coroutine's periodic run would retry moments
+                # later. Only `type(exc).__name__` is logged, never `exc` or any
+                # resolver-context value (durable state can carry venue ids).
+                try:
+                    await self._resolve_ambiguous_intents(first_pass_immediate=True)
+                except Exception as exc:  # noqa: BLE001 - see comment above
+                    self._log.warning(
+                        f"immediate resolver pass failed; periodic resolver "
+                        f"continues ({type(exc).__name__})"
+                    )
+            finally:
+                # Resolution A (plan rev 6.1): started here, for the
+                # client's lifetime -- a named, firewall-scanned coroutine
+                # (`EXEC_RESOLVER_COROUTINES`), never awaited inline. It is
+                # a no-op every pass until an AMBIGUOUS outcome writes a
+                # durable resolver context via `_note_ambiguous_open`. A
+                # `finally`, not a plain trailing statement: it must run
+                # even if `_wait_for_instruments` raises, so
+                # `_cancel_resolver_task` (`_disconnect`, reached
+                # unconditionally by the kernel's shutdown sequence even
+                # when `_connect` itself never completes -- see
+                # `execution_engine.py`'s unconditional `client.disconnect()`
+                # and `system/kernel.py:stop_async`'s `_disconnect_clients`)
+                # always has a task to cancel.
+                self._resolver_task = self.create_task(
+                    self._resolve_ambiguous_intents(),
+                    log_msg="resolve_ambiguous_intents",
                 )
             await self._publish_account_state()
             await self._confirm_account_registered()
