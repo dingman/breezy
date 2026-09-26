@@ -463,6 +463,16 @@ FEE_COEFFICIENT_AMBIGUOUS: Final[str] = "fee_coefficient_ambiguous"
 #: defect in one position's build never drops every other position's reports.
 DURABLE_REPORTS_BUILD_FAILED: Final[str] = "durable_reports_build_failed"
 
+#: FU-8 r2/r2.1 (option A): a resolver-discovered fill whose order is unknown
+#: to THIS run's cache (a cross-session fill) is NEVER booked at runtime --
+#: booking it would double an already-visible position (L-47) or open a
+#: phantom long on a settled market (L-18). This latch NAMES that outcome; it
+#: is informational, NOT a control (the boot's own AUD-13b pass, and for a
+#: venue-held T2 case `RECORD_VENUE_DISAGREEMENT`, are what actually alert and
+#: attribute). Never counted on the boot pass's own `refusals` line --
+#: `_BOOT_PASS_REFUSAL_LATCHES` below is what that sum iterates.
+RESOLVER_FILL_NOT_BOOKED: Final[str] = "resolver_fill_not_booked"
+
 #: What `_map_position` did with one venue position (AUD-13b). Anything that
 #: is not one of the first three -- a mapping error, a non-long side -- is
 #: `_MAP_UNPARSEABLE`, which fails the WHOLE read for the durable reports.
@@ -477,7 +487,22 @@ _RECONCILIATION_REFUSAL_DETAILS: Final[Mapping[str, str]] = {
     RECORD_VENUE_DISAGREEMENT: "RECORD_VENUE_DISAGREEMENT",
     FEE_COEFFICIENT_AMBIGUOUS: "FEE_COEFFICIENT_AMBIGUOUS",
     DURABLE_REPORTS_BUILD_FAILED: "DURABLE_REPORTS_BUILD_FAILED",
+    RESOLVER_FILL_NOT_BOOKED: "RESOLVER_FILL_NOT_BOOKED",
 }
+
+#: FU-8 r2.1 (architect REQUEST_CHANGES, load-bearing): the four latches the
+#: boot pass's own `refusals` field sums over (`_durable_reconciliation_pass`
+#: below). `RESOLVER_FILL_NOT_BOOKED` is deliberately EXCLUDED -- it is not a
+#: boot-pass outcome at all (the resolver latches it outside any mass-status
+#: pass), and it has no `refusals_resolver_fill_not_booked` field in
+#: `_RECONCILIATION_COUNT_FIELDS`. Iterating `_RECONCILIATION_REFUSAL_DETAILS`
+#: directly there instead would KeyError the moment this latch existed.
+_BOOT_PASS_REFUSAL_LATCHES: Final[tuple[str, ...]] = (
+    POSITIONS_READ_FAILED,
+    RECORD_VENUE_DISAGREEMENT,
+    FEE_COEFFICIENT_AMBIGUOUS,
+    DURABLE_REPORTS_BUILD_FAILED,
+)
 
 #: The counts line's fields, in their fixed order (plan §6 "Regression
 #: detector"). ``refusals`` is the sum of the per-cause fields.
@@ -1545,6 +1570,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # One memoised positions read (and its durable reports) per
         # `generate_mass_status` pass; `None` outside a pass.
         self._reconciliation_pass: _ReconciliationPass | None = None
+        # FU-8 r2/r2.1: set True as the FIRST statement of
+        # `generate_mass_status` (boot-only -- see that method's own
+        # docstring and `test_the_settlement_landmine_stays_disarmed_only_
+        # while_the_position_check_is_off`, which pins that no periodic
+        # native reconciliation is ever enabled). Never reset -- a later
+        # cache-miss fill after a reconnect still latches, the conservative
+        # direction (plan r2 "Reconnect" edge case).
+        self._boot_snapshot_started: bool = False
         # Set by `_map_position` at each return, read by the durable pass to
         # tell an unparseable row (fails the whole read) from a settled one.
         self._position_map_outcome: str = ""
@@ -2049,6 +2082,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         never-arm ``on_start`` walk replays it into TRIAL state (next
         slice), so nothing this record represents is actually lost.
 
+        FU-8 r2/r2.1: a fill resolved for an order this RUN never submitted
+        (a cross-session fill, ``self._cache.order(...)`` returns ``None``)
+        is never handed to ``generate_order_filled`` at all --
+        ``_resolve_accept_fill``'s own ``_resolver_fill_order_unknown`` gate
+        (next to ``_latch_reconciliation_refusal``) decides, and a crash
+        anywhere in this coroutine still leaves the durable record as the
+        source of truth either way.
+
         The LONG gate (``_resolver_long_position_state``) is slug-level
         ``netPosition > 0`` corroboration ONLY, never magnitude-matched
         against the GET's own ``filled_qty`` -- the order-specific GET
@@ -2540,6 +2581,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``generate_order_filled`` (the native event) -- a crash at any point
         still leaves the durable evidence a restart can read.
 
+        FU-8 r2/r2.1 (option A): ``generate_order_filled`` itself is now
+        gated by ``_resolver_fill_order_unknown`` -- a fill for an order this
+        RUN never submitted (cross-session) is NEVER booked at runtime. That
+        gate runs AFTER the durable writes above (record_fill / retire /
+        venue-id map), never before -- this method's own crash-safety
+        ordering is unchanged. The gate is INFORMATIONAL, not a control: see
+        its docstring.
+
         SAFETY H2 and ARCH M2 apply identically to :meth:`_resolve_terminal_
         zero`: refuses to act absent a this-run GET timestamp, and reads
         ``current()`` first so a re-entry against an already-retired
@@ -2660,6 +2709,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 venue_order_id=context.venue_order_id,
                 order_notional_usd=context.notional_usd,
             )
+        # FU-8 r2/r2.1 (option A): a cross-session fill (this run never
+        # submitted the order) is NEVER booked at runtime -- see the
+        # helper's own docstring. Every durable write above (record_fill,
+        # retire, venue-id map, permit true-up) has already happened.
+        if self._resolver_fill_order_unknown(context, report):
+            return
         self.generate_order_filled(
             strategy_id=StrategyId(context.strategy_id),
             instrument_id=InstrumentId.from_str(context.instrument_id),
@@ -2873,7 +2928,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         balances and positions surfaces take no time window -- so there is no
         window to narrow, and pretending to honour one would be worse than
         saying so.
+
+        FU-8 r2/r2.1: ``self._boot_snapshot_started`` is set True as the
+        FIRST statement below, before any ``await``. A resolver fill that
+        races this exact pass -- observing the flag already ``True`` while
+        THIS pass has not yet actually read the position that would explain
+        it -- latches ``RESOLVER_FILL_NOT_BOOKED`` even though this same
+        pass would, a moment later, have accounted for it. That is a false
+        ALERT, never silence (plan r2 "Race during the mass status") -- the
+        conservative direction the resolver is sync (``_resolve_ambiguous_
+        intents``) has no ``await`` between ``record_fill`` and this check.
         """
+        self._boot_snapshot_started = True
         self.reconciliation_active = True
         # AUD-13b: one memoised positions read per pass, shared by all three
         # generators so the durable gating and the position report can never
@@ -3196,7 +3262,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         counts["order_reports"] = len(order_reports)
         counts["fill_reports"] = len(fill_reports)
         counts["refusals"] = sum(
-            counts[f"refusals_{latch}"] for latch in _RECONCILIATION_REFUSAL_DETAILS
+            counts[f"refusals_{latch}"] for latch in _BOOT_PASS_REFUSAL_LATCHES
         )
         self._reconciliation_counts = counts
         self._reconciled_fee_sources = fee_sources
@@ -3393,6 +3459,75 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             client_order_id=client_order_id,
         )
         return order_report, fill_report
+
+    def _resolver_fill_order_unknown(
+        self,
+        context: AmbiguousResolverContext,
+        report: Any,
+    ) -> bool:
+        """FU-8 r2/r2.1 (option A): whether ``_resolve_accept_fill``'s fill
+        must NOT be booked at runtime -- ``True`` skips ``generate_order_
+        filled`` entirely; ``False`` means proceed exactly as before this
+        change.
+
+        ``False`` (same session): ``self._cache.order(...)`` finds the
+        order this run itself submitted -- byte-identical to HEAD (AC1).
+
+        ``True`` (cross-session -- the order is unknown to this run's
+        cache), told apart by ``self._boot_snapshot_started`` (set as the
+        first statement of ``generate_mass_status``):
+
+        * **T1, before the boot snapshot.** The startup mass status has not
+          run yet; AUD-13b's durable reconciliation books this fill natively
+          moments later, with full attribution (plan r2 boot trace). Nothing
+          is latched -- one INFO line only, so the deferral is visible.
+        * **T2, after the boot snapshot.** The boot pass already ran and
+          either accounted for the position under a synthetic order (venue
+          still held -- qty right, attribution coarse) or found nothing to
+          hold (settled/closed). Booking here would double the position
+          (L-47) or open a phantom long on a settled market (L-18) instead.
+          Latches the NAMED refusal ``RESOLVER_FILL_NOT_BOOKED`` (subject
+          ``_redact_order_id(context.venue_order_id)``) and logs one ERROR
+          line with the instrument, the fill qty and Nautilus's own net qty
+          (``positions_open``) -- log only, no branching on those numbers.
+
+        This latch is INFORMATIONAL, not a control: it changes no booking
+        decision and gates no order. Runtime delivery for it (and every
+        other runtime latch) is a pre-existing, cross-cutting gap tracked
+        separately as FU-8b -- the position itself stays visible either way,
+        and the T2-held case is already alerted at boot via
+        ``RECORD_VENUE_DISAGREEMENT``. Depends on ``generate_mass_status``
+        staying boot-only, pinned by
+        ``test_the_settlement_landmine_stays_disarmed_only_while_the_
+        position_check_is_off`` and
+        ``test_starts_no_continuous_reconciliation_polling``. Takes no
+        sender or transport parameter and never references
+        ``self._order_sender`` -- this reads only the already-reconciled
+        ``self._cache``, never the venue.
+        """
+        if self._cache.order(ClientOrderId(context.client_order_id)) is not None:
+            return False
+        redacted = _redact_order_id(context.venue_order_id)
+        if not self._boot_snapshot_started:
+            self._log.info(
+                f"resolver: fill for venue order {redacted} on "
+                f"{context.instrument_id} arrived before the boot snapshot; "
+                "deferred to boot durable reconciliation (AUD-13b) -- "
+                "nothing booked here, nothing latched"
+            )
+            return True
+        positions = self._cache.positions_open(
+            instrument_id=InstrumentId.from_str(context.instrument_id),
+        )
+        net_qty = sum((position.signed_decimal_qty() for position in positions), Decimal(0))
+        self._log.error(
+            f"resolver: fill for venue order {redacted} on {context.instrument_id} "
+            f"arrived after the boot snapshot -- fill_qty="
+            f"{report.filled_qty.as_decimal()} nautilus_net_qty={net_qty}; NOT "
+            "booked at runtime (FU-8 option A)"
+        )
+        self._latch_reconciliation_refusal(RESOLVER_FILL_NOT_BOOKED, redacted)
+        return True
 
     def _latch_reconciliation_refusal(self, latch: str, subject: str, **extra: str) -> None:
         """Latch one NAMED durable-reconciliation refusal (deduped by latch and

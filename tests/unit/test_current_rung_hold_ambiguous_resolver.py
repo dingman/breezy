@@ -27,7 +27,7 @@ import asyncio
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -40,14 +40,19 @@ from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.live.config import LiveExecEngineConfig
+from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import AccountState, OrderDenied
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
 from breezy.adapters.polymarket_us.exec.client import (
+    _BOOT_PASS_REFUSAL_LATCHES,
+    _RECONCILIATION_COUNT_FIELDS,
     _RESOLVER_INSTRUMENT_LOAD_RETRY_NS,
     _VENUE_ID_MAP_WRITE_FAILED,
     RESOLVER_CONTEXT_KEY_PREFIX,
+    RESOLVER_FILL_NOT_BOOKED,
     AmbiguousResolverContext,
     PolymarketUSExecutionClient,
     StartupPositionSnapshot,
@@ -88,6 +93,8 @@ from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
     TS_EVENT_TEXT,
     build_instrument,
+    build_no_leg_instrument,
+    build_position,
     build_second_instrument,
 )
 from tests.unit.test_current_rung_hold_pre_arm_race import (
@@ -188,6 +195,15 @@ async def _arm_one_ambiguous_intent(
     client, order_events, _permit, latch_cm = await _build_race_client(tmp_path, sender=sender)
     factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())
     command = _submit_command(client, factory, "a")
+    # FU-8: the real `ExecutionEngine` adds a submitted order to the cache
+    # BEFORE it ever reaches the client (`execution/engine.pyx:1122`). This
+    # harness calls `_submit_order` directly, bypassing that engine step, so
+    # it is replicated here -- otherwise `self._cache.order(...)` can never
+    # find an order THIS SAME test run submitted, which is exactly the
+    # cross-session shape `_resolver_fill_order_unknown` (FU-8) exists to
+    # detect, and every same-session resolver fixture below would be
+    # spuriously treated as cross-session.
+    client._cache.add_order(command.order, position_id=None)
     await client._submit_order(command)
 
     assert client._latch is not None
@@ -2778,3 +2794,659 @@ async def test_an_overlapping_boot_does_not_log_could_not_be_loaded(
         "loaded' ERROR for an instrument the immediate pass was still loading"
     )
     assert client._cache.instrument(target_instrument.id) is not None
+
+
+# ---------------------------------------------------------------------------
+# FU-8 r2/r2.1: a cross-session resolver fill is never booked at runtime; a
+# named informational latch (`resolver_fill_not_booked`) records it instead.
+#
+# Every test below drives the REAL `_resolve_accept_fill` and its REAL
+# `record_fill` (L-42) directly, rather than through the full with-id
+# AMBIGUOUS create-order dance (already proven end to end by this module's
+# own characterisation pin, `test_a_get_confirmed_fill_with_a_long_present_
+# records_a_synthesized_fill_and_retires`, which is ALSO this suite's
+# mutation check for M1: forcing `_resolver_fill_order_unknown` to return
+# `True` unconditionally fails that test, because its order IS in the
+# client's own cache -- the same-session case). The latch (`self._latch`)
+# is armed directly via `SubmitIntentLatch.arm`, which is the exact
+# mechanism `_submit_order` itself uses -- so `self._latch.current_open()`
+# sees a real OPEN intent, without needing a live venue POST.
+#
+# A real `Cache` and a real `LiveExecutionEngine` are used throughout (Test
+# Strategy header, plan r2) -- registered exactly like `test_exec_client_
+# reconciliation_contract.py`'s own `_build_engine`/`_build_client`, but
+# defined locally here: `tests/unit` does not import from `tests/contract`
+# (the dependency runs the other way across this suite).
+# ---------------------------------------------------------------------------
+
+
+class _Fu8Qty:
+    """Duck-typed ``Quantity``/``Price`` stand-in: only ``.as_decimal()`` is
+    read by `_resolve_accept_fill`."""
+
+    def __init__(self, value: Decimal) -> None:
+        self._value = value
+
+    def as_decimal(self) -> Decimal:
+        return self._value
+
+
+class _Fu8FillReport:
+    """Duck-typed stand-in matching every field `_resolve_accept_fill` reads
+    off its ``report`` argument: ``avg_px``, ``filled_qty.as_decimal()`` and
+    ``quantity.as_decimal()`` (the venue's echoed ORIGINAL order size, a
+    DIFFERENT field from ``filled_qty`` -- see `record.order_qty`)."""
+
+    def __init__(self, *, avg_px: Decimal, filled_qty: Decimal, order_qty: Decimal) -> None:
+        self.avg_px = avg_px
+        self.filled_qty = _Fu8Qty(filled_qty)
+        self.quantity = _Fu8Qty(order_qty)
+
+
+def _fu8_build_engine(
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[LiveExecutionEngine, Cache, MessageBus, LiveClock]:
+    """A real ``Cache`` and a real ``LiveExecutionEngine``, the shipped
+    ``LiveExecEngineConfig`` defaults (``position_check_interval_secs=None``,
+    pinned elsewhere -- see this helper's own docstring citation of test 10:
+    ``test_the_settlement_landmine_stays_disarmed_only_while_the_position_
+    check_is_off`` and ``test_starts_no_continuous_reconciliation_polling``).
+    """
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
+    cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
+    cache.add_instrument(build_instrument())
+    engine = LiveExecutionEngine(
+        loop=loop, msgbus=msgbus, cache=cache, clock=clock, config=LiveExecEngineConfig(),
+    )
+    return engine, cache, msgbus, clock
+
+
+def _fu8_build_client(
+    loop: asyncio.AbstractEventLoop,
+    tmp_path: Path,
+    *,
+    read: Any,
+    cache: Cache,
+    msgbus: MessageBus,
+    clock: LiveClock,
+    submit_intent_latch: Any,
+) -> PolymarketUSExecutionClient:
+    provider = InstrumentProvider()
+    provider.add(build_instrument())
+    provider.add(build_no_leg_instrument())
+    return PolymarketUSExecutionClient(
+        loop=loop,
+        client_id=CLIENT_ID,
+        venue=POLYMARKET_US_VENUE,
+        instrument_provider=provider,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        private_read=read,
+        state_store_opener=lambda: SqliteStateStore(tmp_path / "exec_state.db"),
+        account_number=ACCOUNT_NUMBER,
+        instrument_wait_timeout_s=2.0,
+        account_registration_timeout_s=2.0,
+        submit_intent_latch=submit_intent_latch,
+        retirement_reasons=RetirementReason,
+    )
+
+
+async def _fu8_rig(
+    tmp_path: Path,
+    *,
+    positions_payload: Mapping[str, Any] | None = None,
+) -> tuple[PolymarketUSExecutionClient, LiveExecutionEngine, Cache, Any]:
+    """One connected client + a registered real engine, with an OPEN
+    submit-intent latch ready for ``arm`` -- no order ever submitted through
+    ``_submit_order``, so ``self._cache.order(...)`` starts genuinely empty
+    (the cross-session shape FU-8 exists for)."""
+    loop = asyncio.get_running_loop()
+    engine, cache, msgbus, clock = _fu8_build_engine(loop)
+    cache.add_instrument(build_no_leg_instrument())
+
+    def _on_account_state(state: AccountState) -> None:
+        if cache.account(state.account_id) is None:
+            cache.add_account(AccountFactory.create(state))
+        else:
+            cache.account(state.account_id).apply(state)
+
+    msgbus.register(endpoint="Portfolio.update_account", handler=_on_account_state)
+
+    read = _PrivateReadStub(
+        {
+            ACCOUNT_BALANCES_PATH: _balances_payload(),
+            PORTFOLIO_POSITIONS_PATH: positions_payload
+            if positions_payload is not None
+            else {"positions": {}, "eof": True},
+        },
+    )
+    store_path = tmp_path / "exec_state.db"
+    latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
+    submit_intent_latch = latch_cm.__enter__()
+    client = _fu8_build_client(
+        loop, tmp_path, read=read, cache=cache, msgbus=msgbus, clock=clock,
+        submit_intent_latch=submit_intent_latch,
+    )
+    engine.register_client(client)
+    await client._connect()
+    return client, engine, cache, latch_cm
+
+
+async def _fu8_teardown(client: PolymarketUSExecutionClient, latch_cm: Any) -> None:
+    await client._disconnect()
+    latch_cm.__exit__(None, None, None)
+
+
+def _fu8_arm(client: PolymarketUSExecutionClient) -> Any:
+    """Arm the latch directly -- the same mechanism `_submit_order` itself
+    uses -- so `self._latch.current_open()` sees a real OPEN intent with no
+    live venue POST."""
+    now_ns = client._clock.timestamp_ns()
+    intent = client._latch.arm("a" * 64, now_ns=now_ns)
+    client._resolved_by_get_ts_ns[intent.intent_id] = now_ns
+    return intent
+
+
+@pytest.mark.asyncio
+async def test_fu8_t1_before_the_boot_snapshot_defers_and_the_boot_pass_books_it_natively(
+    tmp_path: Path,
+) -> None:
+    """AC2/AC4, plain T1: `_boot_snapshot_started` is False, so the fill is
+    NOT booked here -- no latch, `generate_order_filled` never runs. The
+    durable `record_fill` write (L-42) already happened, so the LATER boot
+    pass (`engine.reconcile_execution_state`) books it natively, under the
+    real client order id, with the real quantity -- AC2's "booked" outcome."""
+    client, engine, cache, latch_cm = await _fu8_rig(tmp_path)
+    try:
+        assert client._boot_snapshot_started is False
+        instrument = build_instrument()
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-T1-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-T1-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
+        )
+        filled_calls: list[Any] = []
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        assert filled_calls == [], "T1: generate_order_filled must never run"
+        assert client.reconciliation_refusals == (), "T1: nothing is latched"
+        assert len(client.fill_records_for(instrument.id)) == 1, "record_fill still ran"
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+
+        # The client-order-id map row was ALSO written (A1-b) -- required for
+        # the boot pass below to attribute the durable record correctly.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {
+                instrument_id_to_slug(instrument.id): {
+                    **build_position(instrument_id_to_slug(instrument.id)),
+                    "netPosition": "1",
+                    "qtyBought": "1",
+                    "qtySold": "0",
+                    "cost": {"value": "0.40", "currency": "USD"},
+                },
+            },
+            "eof": True,
+        }
+
+        assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+
+        assert cache.order(ClientOrderId("O-FU8-T1-1")) is not None, (
+            "the later boot pass must book the fill natively, with attribution"
+        )
+        positions = cache.positions_open(instrument_id=instrument.id)
+        assert len(positions) == 1
+        assert positions[0].quantity == instrument.make_qty(1)
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_t1_on_a_settled_market_books_nothing_and_latches_nothing(
+    tmp_path: Path,
+) -> None:
+    """r2.1 AC2 addendum: a T1 deferral whose boot pass finds the market
+    SETTLED (`expired`, gated out -- `_map_position`) attributes nothing,
+    because there is nothing held to attribute -- accepted in writing (r2.1
+    item 2). No latch either: a settled market is not a disagreement."""
+    client, engine, cache, latch_cm = await _fu8_rig(tmp_path)
+    try:
+        instrument = build_instrument()
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-T1-SETTLED-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-T1-SETTLED-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
+        )
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+        assert client.reconciliation_refusals == ()
+
+        slug = instrument_id_to_slug(instrument.id)
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {**build_position(slug), "expired": True}},
+            "eof": True,
+        }
+
+        assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+
+        assert cache.order(ClientOrderId("O-FU8-T1-SETTLED-1")) is None, "nothing to attribute"
+        assert cache.positions_open(instrument_id=instrument.id) == []
+        assert client.reconciliation_refusals == (), "a settled market is not a disagreement"
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_t1_with_a_venue_disagreement_latches_record_venue_disagreement(
+    tmp_path: Path,
+) -> None:
+    """r2.1 AC2 addendum: a T1 deferral whose boot pass finds the venue
+    reporting a DIFFERENT quantity than the durable record latches
+    `record_venue_disagreement` -- a pre-existing boot outcome, unrelated to
+    FU-8's own latch, but one T1 can now land on."""
+    client, engine, cache, latch_cm = await _fu8_rig(tmp_path)
+    try:
+        instrument = build_instrument()
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-T1-DISAGREE-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-T1-DISAGREE-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
+        )
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        # The record says qty=1; the venue disagrees and reports 5.
+        slug = instrument_id_to_slug(instrument.id)
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {
+                slug: {
+                    **build_position(slug),
+                    "netPosition": "5",
+                    "qtyBought": "5",
+                    "qtySold": "0",
+                },
+            },
+            "eof": True,
+        }
+
+        assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+
+        assert cache.order(ClientOrderId("O-FU8-T1-DISAGREE-1")) is None
+        assert any(
+            r["latch"] == "record_venue_disagreement" for r in client.reconciliation_refusals
+        ), client.reconciliation_refusals
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_t2_venue_held_never_doubles_the_position_and_latches_resolver_fill_not_booked(
+    tmp_path: Path,
+) -> None:
+    """AC3/AC4, architect 6a: the boot pass ALREADY ran (no durable record
+    yet, so it latches `record_venue_disagreement` and forwards the position
+    -- Nautilus synthesizes a RECONCILIATION order for the venue's own qty).
+    A LATER resolver fill for the SAME qty must not double it, must book no
+    order for its own client order id, and must latch
+    `resolver_fill_not_booked`."""
+    instrument = build_instrument()
+    slug = instrument_id_to_slug(instrument.id)
+    client, engine, cache, latch_cm = await _fu8_rig(
+        tmp_path,
+        positions_payload={
+            "positions": {
+                slug: {
+                    **build_position(slug),
+                    "netPosition": "4",
+                    "qtyBought": "4",
+                    "qtySold": "0",
+                },
+            },
+            "eof": True,
+        },
+    )
+    try:
+        assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+        assert client._boot_snapshot_started is True
+        positions_before = cache.positions_open(instrument_id=instrument.id)
+        assert len(positions_before) == 1
+        assert positions_before[0].quantity == instrument.make_qty(4)
+
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-T2-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-T2-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("1.48"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.37"), filled_qty=Decimal(4), order_qty=Decimal(4),
+        )
+        filled_calls: list[Any] = []
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        assert filled_calls == [], "T2: generate_order_filled must never run"
+        assert cache.order(ClientOrderId("O-FU8-T2-1")) is None
+        positions_after = cache.positions_open(instrument_id=instrument.id)
+        assert len(positions_after) == 1
+        assert positions_after[0].quantity == instrument.make_qty(4), "must not double"
+        assert len(client.fill_records_for(instrument.id)) == 1, "record_fill still ran"
+        assert any(
+            r["latch"] == RESOLVER_FILL_NOT_BOOKED for r in client.reconciliation_refusals
+        ), client.reconciliation_refusals
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_t2_venue_expired_books_nothing_and_latches_resolver_fill_not_booked(
+    tmp_path: Path,
+) -> None:
+    """AC3/AC4, architect 6b (expired): the boot pass gates the position out
+    entirely (settled, `_map_position`'s `expired` branch) -- Nautilus holds
+    NOTHING. A later resolver fill must still book nothing (never a phantom
+    long on a settled market, L-18) and must latch."""
+    instrument = build_instrument()
+    slug = instrument_id_to_slug(instrument.id)
+    client, engine, cache, latch_cm = await _fu8_rig(
+        tmp_path,
+        positions_payload={
+            "positions": {slug: {**build_position(slug), "expired": True}},
+            "eof": True,
+        },
+    )
+    try:
+        assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+        assert client._boot_snapshot_started is True
+        assert cache.positions_open(instrument_id=instrument.id) == []
+
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-T2-EXPIRED-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-T2-EXPIRED-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("1.48"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.37"), filled_qty=Decimal(4), order_qty=Decimal(4),
+        )
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        assert cache.positions_open(instrument_id=instrument.id) == [], "no phantom long"
+        assert cache.order(ClientOrderId("O-FU8-T2-EXPIRED-1")) is None
+        assert any(
+            r["latch"] == RESOLVER_FILL_NOT_BOOKED for r in client.reconciliation_refusals
+        ), client.reconciliation_refusals
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_t2_venue_flat_books_nothing_and_latches_resolver_fill_not_booked(
+    tmp_path: Path,
+) -> None:
+    """AC3/AC4, architect 6b (FLAT): same as the expired case, but the venue
+    reports a genuine FLAT (`netPosition=0`, gated out) rather than expired."""
+    instrument = build_instrument()
+    slug = instrument_id_to_slug(instrument.id)
+    client, engine, cache, latch_cm = await _fu8_rig(
+        tmp_path,
+        positions_payload={
+            "positions": {
+                slug: {
+                    **build_position(slug),
+                    "netPosition": "0",
+                    "qtyBought": "4",
+                    "qtySold": "4",
+                },
+            },
+            "eof": True,
+        },
+    )
+    try:
+        assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+        assert cache.positions_open(instrument_id=instrument.id) == []
+
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-T2-FLAT-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-T2-FLAT-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("1.48"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.37"), filled_qty=Decimal(4), order_qty=Decimal(4),
+        )
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        assert cache.positions_open(instrument_id=instrument.id) == []
+        assert cache.order(ClientOrderId("O-FU8-T2-FLAT-1")) is None
+        assert any(
+            r["latch"] == RESOLVER_FILL_NOT_BOOKED for r in client.reconciliation_refusals
+        ), client.reconciliation_refusals
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_no_leg_fill_never_touches_the_yes_sibling(tmp_path: Path) -> None:
+    """Architect 6c: the subject and log use the leg-resolved
+    `context.instrument_id` (a `^no` composite id) -- the YES sibling stays
+    untouched throughout."""
+    yes_instrument = build_instrument()
+    no_instrument = build_no_leg_instrument()
+    client, _engine, cache, latch_cm = await _fu8_rig(tmp_path)
+    try:
+        # T2: the NO-leg shape itself is under test, not the boot dance.
+        client._boot_snapshot_started = True
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-NO-1",
+            instrument_id=no_instrument.id.value,
+            client_order_id="O-FU8-NO-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
+        )
+        filled_calls: list[Any] = []
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+
+        client._resolve_accept_fill(context, report, no_instrument, now_ns)
+
+        assert filled_calls == []
+        assert cache.order(ClientOrderId("O-FU8-NO-1")) is None
+        assert cache.positions_open(instrument_id=no_instrument.id) == []
+        assert cache.positions_open(instrument_id=yes_instrument.id) == [], "YES sibling untouched"
+        assert any(
+            r["latch"] == RESOLVER_FILL_NOT_BOOKED for r in client.reconciliation_refusals
+        ), client.reconciliation_refusals
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_security_cache_miss_sends_no_report_and_still_retires(
+    tmp_path: Path,
+) -> None:
+    """Security (c), strengthened: on the cache-miss path, spies on
+    `_send_mass_status_report`, `_send_order_status_report` and
+    `generate_order_filled` record ZERO calls, and the intent still retires."""
+    instrument = build_instrument()
+    client, _engine, _cache, latch_cm = await _fu8_rig(tmp_path)
+    try:
+        client._boot_snapshot_started = True
+        mass_status_calls: list[Any] = []
+        order_status_calls: list[Any] = []
+        filled_calls: list[Any] = []
+        client._send_mass_status_report = lambda *a, **kw: mass_status_calls.append(  # type: ignore[method-assign]
+            (a, kw),
+        )
+        client._send_order_status_report = lambda *a, **kw: order_status_calls.append(  # type: ignore[method-assign]
+            (a, kw),
+        )
+        client.generate_order_filled = lambda **kw: filled_calls.append(kw)  # type: ignore[method-assign]
+
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-SEC-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-SEC-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.40"), filled_qty=Decimal(1), order_qty=Decimal(1),
+        )
+
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        assert mass_status_calls == []
+        assert order_status_calls == []
+        assert filled_calls == []
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, "the intent must still retire"
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+@pytest.mark.asyncio
+async def test_fu8_a_resolve_race_at_the_boot_snapshot_latches_even_though_it_would_explain_it(
+    tmp_path: Path,
+) -> None:
+    """Plan r2 edge case "Race during the mass status": `_boot_snapshot_
+    started` is set as the FIRST statement of `generate_mass_status`, before
+    its first await. A resolve landing while THIS SAME pass is still in
+    flight (and would, moments later, have explained the position) still
+    latches -- a false ALERT, never silence."""
+    instrument = build_instrument()
+    slug = instrument_id_to_slug(instrument.id)
+    client, engine, _cache, latch_cm = await _fu8_rig(
+        tmp_path,
+        positions_payload={
+            "positions": {
+                slug: {
+                    **build_position(slug),
+                    "netPosition": "4",
+                    "qtyBought": "4",
+                    "qtySold": "0",
+                },
+            },
+            "eof": True,
+        },
+    )
+    try:
+        assert client._boot_snapshot_started is False
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_position_reports = client.generate_position_status_reports
+
+        async def _slow_positions(lookback_mins: int | None = None) -> Any:
+            entered.set()
+            await release.wait()
+            return await original_position_reports(lookback_mins)
+
+        client.generate_position_status_reports = _slow_positions  # type: ignore[method-assign]
+
+        boot_task = asyncio.ensure_future(engine.reconcile_execution_state(timeout_secs=5.0))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        assert client._boot_snapshot_started is True, "set before the first await"
+
+        intent = _fu8_arm(client)
+        now_ns = client._clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=intent.intent_id,
+            venue_order_id="V-FU8-RACE-1",
+            instrument_id=instrument.id.value,
+            client_order_id="O-FU8-RACE-1",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("1.48"),
+            booking_id=1,
+            created_ns=now_ns,
+        )
+        report = _Fu8FillReport(
+            avg_px=Decimal("0.37"), filled_qty=Decimal(4), order_qty=Decimal(4),
+        )
+        client._resolve_accept_fill(context, report, instrument, now_ns)
+
+        assert any(
+            r["latch"] == RESOLVER_FILL_NOT_BOOKED for r in client.reconciliation_refusals
+        ), "a false alert, never silence, even though this in-flight pass would have explained it"
+
+        release.set()
+        assert await boot_task is True
+    finally:
+        await _fu8_teardown(client, latch_cm)
+
+
+def test_fu8_boot_pass_refusal_latches_all_have_a_counts_field_and_the_new_latch_has_none() -> None:
+    """r2.1 item 4 / M3 mutation guard: every `_BOOT_PASS_REFUSAL_LATCHES`
+    entry has a `refusals_<latch>` field in `_RECONCILIATION_COUNT_FIELDS`
+    (AC6's load-bearing invariant -- dropping this tuple and summing over
+    ALL details instead would KeyError the moment `resolver_fill_not_booked`
+    existed), and the new latch itself has none -- it is not a boot-pass
+    outcome, so the counts line stays byte-identical (test 9)."""
+    for latch in _BOOT_PASS_REFUSAL_LATCHES:
+        assert f"refusals_{latch}" in _RECONCILIATION_COUNT_FIELDS, latch
+    assert f"refusals_{RESOLVER_FILL_NOT_BOOKED}" not in _RECONCILIATION_COUNT_FIELDS
+    assert RESOLVER_FILL_NOT_BOOKED not in _BOOT_PASS_REFUSAL_LATCHES

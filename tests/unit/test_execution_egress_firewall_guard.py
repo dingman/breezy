@@ -2145,6 +2145,15 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # socket, no `await`. Used by both resolver terminals.
         "self.record_venue_order_id",
         "self._refuse",
+        # FU-8 r2/r2.1: the runtime no-booking gate for a cross-session fill.
+        # Deliberately in NEITHER `EXEC_RESOLVER_COROUTINES` (security
+        # condition (a): it is a plain read-only classifier, not scanned as
+        # a resolver action site) NOR
+        # `ORDER_SENDER_REFERENCE_PERMITTED_SCOPES` below -- it takes no
+        # sender/transport parameter and never references
+        # `self._order_sender` (security condition (b)); it only reads the
+        # already-reconciled `self._cache`.
+        "self._resolver_fill_order_unknown",
         "self.generate_order_filled",
         "_synthetic_get_fill_trade_id",
         "instrument.make_price",

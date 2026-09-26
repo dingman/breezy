@@ -35,7 +35,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.identifiers import AccountId, ClientId
 from nautilus_trader.model.instruments import BinaryOption
 
-from breezy.adapters.polymarket_us.parsing import parse_binary_option
+from breezy.adapters.polymarket_us.parsing import parse_binary_option, parse_binary_option_pair
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -71,6 +71,24 @@ def build_instrument() -> BinaryOption:
         (RAW / "market_open_510636_by_slug.json").read_text(encoding="utf-8")
     )
     return parse_binary_option(market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
+def build_no_leg_instrument() -> BinaryOption:
+    """The NO leg of :func:`build_instrument`'s SAME market (FU-8).
+
+    Built through `parse_binary_option_pair`'s ONE bijection
+    (`symbology.no_leg_instrument_id`), so this is guaranteed the true
+    sibling of `build_instrument()`'s YES leg -- never an independently
+    parsed pair that only coincidentally shares a slug.
+    """
+    market: dict[str, Any] = json.loads(
+        (RAW / "market_open_510636_by_slug.json").read_text(encoding="utf-8")
+    )
+    _yes, no_instrument = parse_binary_option_pair(
+        market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT,
+    )
+    assert no_instrument is not None
+    return no_instrument
 
 
 def build_second_instrument() -> BinaryOption:

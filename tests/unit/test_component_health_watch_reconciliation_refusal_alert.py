@@ -152,6 +152,24 @@ def test_a_durable_reports_build_failed_refusal_alerts_under_its_own_name() -> N
     assert payload.detail == "DURABLE_REPORTS_BUILD_FAILED"
 
 
+def test_a_resolver_fill_not_booked_refusal_alerts_under_its_own_name() -> None:
+    """FU-8 r2/r2.1, test 8: the runtime-only, informational latch
+    (`resolver_fill_not_booked`) reaches the sink with ITS OWN detail,
+    never collapsed to the generic `RECONCILIATION_REFUSAL_UNKNOWN` member
+    -- the same treatment every OTHER named refusal already gets, even
+    though this one is never summed on the boot pass's own `refusals` line
+    (`_BOOT_PASS_REFUSAL_LATCHES`, `exec/client.py`)."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    surface = (
+        _refusal("resolver_fill_not_booked", "RESOLVER_FILL_NOT_BOOKED", "ord…"),
+    )
+    install_reconciliation_refusal_alert(msgbus, refusals=lambda: surface, sink=sink)
+    _tick(msgbus)
+    (payload,) = sink.payloads
+    assert payload.detail == "RESOLVER_FILL_NOT_BOOKED"
+
+
 def test_a_broken_surface_reader_does_not_crash_the_handler() -> None:
     msgbus = _new_bus()
     sink = _RecordingSink()
