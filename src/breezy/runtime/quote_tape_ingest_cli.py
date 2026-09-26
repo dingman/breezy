@@ -342,6 +342,13 @@ CONVERTED = "converted"
 #: legible in the log without printing any instrument id or value.
 CONVERTED_NOTHING_NEW = "converted-nothing-new"
 
+#: ING-2 S3b (Arch §4): the row budget for one chunked EXTEND write. Bounded
+#: EXTEND materialises at most one chunk's worth of deserialised objects at a
+#: time instead of the whole file -- Phase 0 arm 3a-ii (the near-worst-case
+#: unfiltered dedupe query over a mostly-landed range) measured unchunked
+#: EXTEND's ΔRSS at 1.2618 GiB, which fired the S3b trigger (T-a).
+EXTEND_CHUNK_ROWS = 50_000
+
 #: The stream subdirectories Nautilus itself supports, each with its own
 #: public reader. ``_read_feather(kind=...)`` is private; these two are not.
 _STREAM_SUBDIRECTORIES = ("live", "backtest")
@@ -805,6 +812,78 @@ def _is_non_disjoint_refusal(exc: BaseException) -> bool:
     return "non-disjoint" in str(exc)
 
 
+def _extend_table_chunked(
+    catalog: ParquetDataCatalog,
+    write_target: ParquetDataCatalog,
+    data_cls: type,
+    table: Any,
+    *,
+    chunk_rows: int = EXTEND_CHUNK_ROWS,
+) -> tuple[int, bool]:
+    """EXTEND ``table`` in bounded row chunks (ING-2 S3b, Arch §4).
+
+    Applies native's own ``_apply_stream_conversion_transforms`` ONCE, with
+    the same defaults unchunked EXTEND has always used implicitly through
+    ``_handle_table_nautilus``'s own call to that method (A4:
+    ``use_ts_event_for_ts_init=False``, ``convert_bar_type_to_external=False``
+    -- NOT the ``True`` the per-file fast path uses). That call sorts by
+    ``ts_init`` only if the table is unsorted (native's own
+    ``_enforce_monotonic_ts``, P3).
+
+    The sorted table is then sliced into chunks of at most ``chunk_rows``
+    rows, with EVERY cut advanced past any run of equal ``ts_init`` so a
+    same-key pair is never split across chunks: a split pair would have its
+    second row silently dropped by the NEXT chunk's own dedupe query
+    (:func:`breezy.runtime.quote_tape_salvage._drop_already_landed_unfiltered`,
+    scoped to that chunk's own ``[lo, hi]``), which would find the first row
+    of the pair already landed under the identical ``(instrument_id,
+    ts_init)`` key. Bound (AC-S3-2): no call receives more than
+    ``chunk_rows + R - 1`` rows, where R is the longest run of equal
+    ``ts_init``. The degenerate case, R >= the table's row count, gives
+    exactly one chunk -- today's unchunked EXTEND, not a regression.
+
+    Each chunk is converted with ``_handle_table_nautilus`` (whose own
+    internal transform call is then a no-op, since the slice is already
+    sorted) and written with
+    :func:`breezy.runtime.quote_tape_salvage.write_fresh_capture_rows`, one
+    chunk fully written before the next chunk is even converted. An
+    :class:`~breezy.runtime.quote_tape_salvage.ExtendWriteMismatch` from a
+    later chunk propagates immediately: earlier chunks' writes stand, and a
+    rerun over the same (unmodified) source is idempotent, because the
+    per-instrument-id, per-``ts_init`` dedupe drops every row that already
+    landed before the retry writes anything (T8b).
+
+    Returns ``(written, streamed_any)``: ``written`` is the total row count
+    actually landed across every chunk; ``streamed_any`` is ``True`` if any
+    chunk produced at least one deserialised object, even if every one of
+    those objects was already landed (0 written) -- the same
+    ``CONVERTED``/``CONVERTED_NOTHING_NEW`` distinction unchunked EXTEND makes.
+    """
+    transformed = catalog._apply_stream_conversion_transforms(
+        table, use_ts_event_for_ts_init=False, convert_bar_type_to_external=False
+    )
+    total_rows = len(transformed)
+    written = 0
+    streamed_any = False
+    if total_rows == 0:
+        return written, streamed_any
+    ts_init = transformed.column("ts_init")
+    start = 0
+    while start < total_rows:
+        end = min(start + chunk_rows, total_rows)
+        if end < total_rows:
+            boundary_value = ts_init[end - 1].as_py()
+            while end < total_rows and ts_init[end].as_py() == boundary_value:
+                end += 1
+        chunk = transformed.slice(start, end - start)
+        objects = list(catalog._handle_table_nautilus(table=chunk, data_cls=data_cls))
+        if objects:
+            streamed_any = True
+            written += write_fresh_capture_rows(write_target, data_cls, objects)
+        start = end
+    return written, streamed_any
+
+
 def _extend_overlapping_stream(
     catalog: ParquetDataCatalog,
     instance_id: str,
@@ -821,7 +900,9 @@ def _extend_overlapping_stream(
     instance would not fit the ingest unit's memory ceiling. Does not
     delete, does not rewrite an existing filename, and does not restamp
     ``ts_init``. Empty stream re-raises so a monkeypatched native failure
-    with nothing to extend stays ``failed``.
+    with nothing to extend stays ``failed``. Each file's table is EXTENDed in
+    bounded row chunks (ING-2 S3b, :func:`_extend_table_chunked`), never
+    materialised as one write.
     """
     write_target = catalog if target is None else target
     streamed_any = False
@@ -834,11 +915,13 @@ def _extend_overlapping_stream(
         table = read_feather_coalesced(catalog.fs, feather_file.path)
         if table is None or len(table) == 0:
             continue
-        objects = list(catalog._handle_table_nautilus(table=table, data_cls=data_cls))
-        if not objects:
+        chunk_written, chunk_streamed = _extend_table_chunked(
+            catalog, write_target, data_cls, table
+        )
+        if not chunk_streamed:
             continue
         streamed_any = True
-        written += write_fresh_capture_rows(write_target, data_cls, objects)
+        written += chunk_written
     if written:
         return CONVERTED
     if streamed_any:
@@ -1390,9 +1473,8 @@ def _convert_one_tick_type_per_file(
                 )
                 counts["failed"] = counts.get("failed", 0) + 1
                 continue
-            objects = list(catalog._handle_table_nautilus(table=table, data_cls=data_cls))
             try:
-                written = write_fresh_capture_rows(catalog, data_cls, objects)
+                written, streamed_any = _extend_table_chunked(catalog, catalog, data_cls, table)
             except ExtendWriteMismatch as mismatch:
                 logger.error(
                     "instance %s: conversion of %s file %s failed "
@@ -1404,7 +1486,7 @@ def _convert_one_tick_type_per_file(
                 )
                 counts["failed"] = counts.get("failed", 0) + 1
                 continue
-            if written or objects:
+            if written or streamed_any:
                 _mark_file_converted(instance_dir, path)
                 key = "converted" if written else "converted-nothing-new"
                 counts[key] = counts.get(key, 0) + 1
