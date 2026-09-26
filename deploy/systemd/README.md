@@ -1386,6 +1386,17 @@ avoids.
 each is <=1 GB / <=60 s, well under the exemption threshold, and none is
 retimed or wrapped by this item.
 
+**AUD-02 WP-D1 addition (2026-09-26).** `breezy-discovery-pull` (16:52Z)
+joins this exemption: MemoryHigh=128M/MemoryMax=256M, no
+`breezy-studies.slice`, no flock. Unlike the three units above, its WALL
+CLOCK can run considerably longer than 60s -- it polls the trade node's own
+log file every 10s for the node's initial discovery summary, up to a 17:12Z
+deadline, before making a single bounded round of venue GETs
+(`TimeoutStartSec=1800` covers this). Its MEMORY footprint stays in the same
+light band as its siblings; only its wall-clock budget differs, because it
+is a wait-for-trigger job, not a fixed-cost read. It takes no studies flock
+and shares no state with the node (r2.1 Blocker A).
+
 **Worst-case-runtime rule.** No heavy study starts within its own worst-case
 observed runtime before `16:35Z`: `breezy-k1-daily` at `01:35Z` clears by a
 wide margin. (Historical, pre-retirement figures: `breezy-offer-gate-daily`

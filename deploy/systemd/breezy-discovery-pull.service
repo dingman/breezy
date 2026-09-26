@@ -1,0 +1,70 @@
+[Unit]
+# AUD-02 WP-D1 (docs/plans/backlog/AUDIT_2026-09-21/AUD-02_WP-D1_plan_r2_2026-09-26.md,
+# folded through r2.1/r3/r3.1). Unattended, unauthenticated public-GET
+# discovery pull: waits for the trade node's own INITIAL discovery summary
+# (read from its log FILE under %h/.local/share/breezy/logs -- the node is a
+# bare Popen, never a systemd unit, so there is no journal for it), then
+# pages the venue's weather-market list once and GETs any node-only slug.
+# Read-only; never touches the node, the order path, or a venue credential --
+# see scripts/analysis/discovery_venue_pull.py's own module docstring.
+Description=Breezy AUD-02 WP-D1 unattended discovery venue pull (unauthenticated, read-only)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/discovery_venue_pull.py
+Documentation=file:///home/jon/breezy/scripts/analysis/discovery_set_equality.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-02_WP-D1_plan_r2_2026-09-26.md
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+# Reaching the 17:12Z deadline with no initial summary is NOT a failure: the
+# script exits 0 and writes no_pull.json.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Light-job exemption (r2.1 Blocker A): this unit pages one list endpoint
+# plus a bounded number of by-slug GETs for node-only slugs, all JSON, no
+# catalog/tape read. Deliberately NOT breezy-studies.slice and NOT
+# serialized behind breezy-studies.lock -- see deploy/systemd/README.md's
+# "Light-job exemption" paragraph, which this unit is added to.
+MemoryHigh=128M
+MemoryMax=256M
+Nice=10
+UMask=0077
+
+# F4: the node's log directory is read-only input; the ONLY write target is
+# the evidence directory this pull owns. ProtectHome=read-only plus a
+# narrow ReadWritePaths= exception is the documented alternative to no
+# ProtectHome at all (r3.1 F4) -- taken here because it is the more
+# restrictive of the two.
+ProtectHome=read-only
+ReadWritePaths=/home/jon/breezy/data/evidence/discovery_set_equality
+
+# breezy.env (mode 0600, BREEZY_USER_AGENT only -- same non-credential
+# operator contact string breezy-fee-evidence-pull.service already sources)
+# has NO `-` prefix: a missing file fails the unit loudly rather than
+# silently substituting an empty user agent. alerts.env keeps its `-`
+# prefix, same discipline as every other analysis unit. Never
+# breezy-trade.env / polymarket.env / operator.env: this unit holds no
+# venue credential and no operator-reserved value.
+EnvironmentFile=%h/.config/breezy/breezy.env
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/discovery_venue_pull.py --node-log-dir %h/.local/share/breezy/logs --out-dir /home/jon/breezy/data/evidence/discovery_set_equality --user-agent "${BREEZY_USER_AGENT}"
+
+# r2.1 Blocker B: the oneshot default of 90s would kill the up-to-~20-minute
+# poll (16:52Z start, 17:12Z deadline, plus pull wall time). 1800s (30 min)
+# covers the worst case with headroom.
+TimeoutStartSec=1800
+
+# No Restart=. A missed run is not an incident on its own -- tomorrow's run
+# is a fresh day's evidence regardless. The timer's Persistent=true recovers
+# a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-discovery-pull
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-discovery-pull.timer`
+# is the only thing to enable. NOT enabled by this change -- the coordinator
+# installs it.
