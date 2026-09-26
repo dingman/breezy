@@ -1,0 +1,29 @@
+[Unit]
+Description=17:30 UTC trigger for the Breezy FU-13b capital-flow puller
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/venue/polymarket_us_capital_flow_pull.py
+
+[Timer]
+Unit=breezy-capital-flow-pull.service
+
+# 17:30 UTC -- between breezy-family-tally@.timer's 17:20 tick and
+# breezy-portfolio-roi.timer's 17:40 tick, free against every occupied
+# OnCalendar= on this host (tests/unit/test_deploy_timer_hours.py enforces
+# uniqueness), and deliberately NOT 17:25: that tick is the RETIRED
+# breezy-pm-crh-cont-tally slot, which
+# test_1715_and_1725_utc_are_unowned_after_the_wp11b_template_merge pins as
+# permanently unowned (WP-11b) -- a future timer, this one included, may
+# never re-claim it. Ahead of 17:40 so the Before= ordering on the .service
+# also holds under a missed-then-caught-up Persistent=true firing of both
+# timers at once. UTC is stated explicitly so a host timezone change cannot
+# move this schedule.
+OnCalendar=*-*-* 17:30:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of being silently skipped until the following day.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
