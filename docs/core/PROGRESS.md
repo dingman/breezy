@@ -56,7 +56,6 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | FU-9 | MED | ROI report: `StorePositiveControlFailedError` skips 4 station scans for `pm_us_crh_exit_v4` — investigate | 09-26 FU-3c run |
 | FU-8b | LOW | Runtime refusals re-polled only on ComponentStateChanged (no timer) — add a native Nautilus clock timer re-poll | FU-8 plan r2 |
 | SP-5b | LOW | Build indeterminate-exclusion of dead-recorder gap rows, prospective (new registrations only); 60 s tolerance REJECTED | `RULING_SP-5_R-3_coverage_tolerance_2026-09-26.md` |
-| FU-1d-reopen | LOW | Shared `_station_day_exit_counts`; defense-in-depth in `unmappable_exit_order_reason`; walked-VWAP vs realised NO fills. NO-leg exits stay off until a manifest declares `no_leg_exit` | FU-1d plan r1.3 |
 | R-7-IMPL | LOW | Live from the 09-26 16:50Z spawn: confirm the first `R7_POSITION_REPORTING_LAG` line after a create-path fill | `RULING_R-7_position_reporting_lag_2026-09-26.md` |
 | TALLY-V2 / DIGEST | LOW | Re-verify the 17:20Z v2 tally and the `halt_enforced` digest field after a normal 16:50Z launch | R-5 ruling §3(2); FU-6 |
 | FU-7 | LOW | 09-25 review follow-ups: registrar `--registered-at` ISO validation; ingest `results_by_cls` collapses duplicate data_types; definitions-failing instance reselected every run; salvage `NotImplementedError` retried every run (7f353f94 mark_price, 44×/12h on 09-26 — pre-S3a); T7 name DEAD vs THREATENED; ingest R4 (03–09Z boot misses day-D definitions); `_select_replay_capture_instruments` `inspect.signature` dispatch | 09-25 reviews |
@@ -64,7 +63,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | AUD-11 | BLOCKED | §7 step 5 captured-tape proof: backtest OOM at 6G — rerun with a higher cap in a quiet window | `POINT_IN_TIME_CLASSIFICATION_2026-09-21.md:134` |
 | AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family | AUD-06b |
 
-**Closed 09-26:** WP-D1, R-7-IMPL build, AUD-07 eps_k build, OPS-1, FU-1b (ruling → FU-1d merged 5b13f26), FU-3c (c33c720), FU-8 (060f346), SP-5/R-3 ruling (→ SP-5b), AUD-09b C2 (B26 PASS, B5 set, timer enabled; `AUD09B_C2_B26_B5_2026-09-26.md`), FU-10 (08535a9, replay unit exec-state DB env), FU-11 (da7528a, step14 test isolation).
+**Closed 09-26:** WP-D1, R-7-IMPL build, AUD-07 eps_k build, OPS-1, FU-1b (ruling → FU-1d merged 5b13f26), FU-3c (c33c720), FU-8 (060f346), SP-5/R-3 ruling (→ SP-5b), AUD-09b C2 (B26 PASS, B5 set, timer enabled; `AUD09B_C2_B26_B5_2026-09-26.md`), FU-10 (08535a9, replay unit exec-state DB env), FU-11 (da7528a, step14 test isolation), FU-1d-reopen (S1 508c218 shared station-day exit cap pinned; S2 472bd22 defense-in-depth `unmappable_exit_order_reason` NO-leg gate; S3 `no_leg_mark_fidelity.py` + `NO_LEG_MARK_FIDELITY_2026-09-26.md` — n=9, NO=3, n(NO exit fills)=0, ruling's 2nd re-open trigger NOT EVALUABLE).
 
 **Order:** T5′ → S3b → deploy + drop-in removal → AUD-07 (seg 0927a) → AUD-10b doc → FU-3d/FU-9 → SP-5b/FU-8b → LOW.
 Watch: 16:50Z node spawn (ADM-1 pending-fills Σq, SP-3r durable-fill index, R-7 lag, FU-8 latch), 16:52Z discovery pull, 17:20Z tallies, 17:40Z ROI report.
