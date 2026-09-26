@@ -8,10 +8,12 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from breezy.analysis.promotion_criteria import champion_kill_clock_path
 from breezy.analysis.replay_results import REPLAY_RESULTS_SCHEMA_VERSION, REPLAY_VALIDITY, ReplayResult
 from breezy.persistence.family_manifest import (
     UnregisteredFamilyManifestError,
@@ -401,7 +403,19 @@ def test_step14_one_real_run_against_todays_evidence_c8() -> None:
         )
     )
     replay_results = derived / "replay" / "replay_results.jsonl"
-    if not (_V4.is_file() and replay_results.is_file() and exec_db.is_file()):
+    # The script defaults `on_date` to *today* (UTC) when `--on-date` is not
+    # passed (as it is not, below), then derives the champion KILL-clock path
+    # from it. That file is written by the nightly tally job at 14:15Z, so
+    # before that time on a fresh UTC day it does not exist yet and the run
+    # would fail (not skip) on a host that otherwise has every other real
+    # artefact. Guarded here exactly like the other required artefacts.
+    champion_clock = champion_kill_clock_path(derived, on_date=datetime.now(UTC).date())
+    if not (
+        _V4.is_file()
+        and replay_results.is_file()
+        and exec_db.is_file()
+        and champion_clock.is_file()
+    ):
         pytest.skip("real evidence artefacts are not present on this host")
 
     output_root = _REPO / "scratch" / "aud10b_step14" / "derived" / "promotion"

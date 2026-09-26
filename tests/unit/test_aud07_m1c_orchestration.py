@@ -54,6 +54,18 @@ _SWEEP_SH = _SCRIPTS_ANALYSIS_DIR / "aud07_m1c_sweep.sh"
 _CELL_SH = _SCRIPTS_ANALYSIS_DIR / "aud07_m1c_cell.sh"
 
 
+def _future_cutoff_iso(days: int = 1) -> str:
+    """A ``--cutoff``/``CUTOFF`` value guaranteed to be in the future.
+
+    Computed at test-run time rather than hardcoded: a hardcoded absolute
+    cutoff rots the instant that date is in the past, since ``cell.sh``
+    treats a past/near cutoff as a reason to DEFER before it ever reaches
+    the test stub or its regex -- failing tests that have nothing to do
+    with the deferral behavior itself (GATE-1).
+    """
+    return (datetime.now(UTC) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # ---------------------------------------------------------------------------
 # Test 22
 # ---------------------------------------------------------------------------
@@ -91,7 +103,7 @@ def test_audit_premise_violation_aborts_the_cell_writes_no_row_and_the_driver_ex
             "--queue",
             str(queue),
             "--cutoff",
-            "2026-09-26T00:00:00Z",
+            _future_cutoff_iso(),
             "-P",
             "1",
         ],
@@ -119,7 +131,7 @@ def test_audit_premise_violation_aborts_the_cell_writes_no_row_and_the_driver_ex
             "--queue",
             str(queue),
             "--cutoff",
-            "2026-09-26T00:00:00Z",
+            _future_cutoff_iso(),
             "-P",
             "1",
         ],
@@ -460,7 +472,7 @@ def test_cell_sh_rejects_shell_metacharacters_in_cell_arg_stage_and_cmd_without_
         **os.environ,
         "RUN_DIR": str(run_dir),
         "STAGE": "20k",
-        "CUTOFF": "2026-09-26T00:00:00Z",
+        "CUTOFF": _future_cutoff_iso(),
         "AUD07_CELL_CMD": str(stub),
     }
 
@@ -517,7 +529,7 @@ def test_cell_sh_defers_near_cutoff_runs_far_cutoff_and_uses_the_class_median(
             ["bash", str(_CELL_SH), cell_arg], env=env, capture_output=True, text=True, check=False
         )
 
-    far = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    far = _future_cutoff_iso()
     r_far = _run("48", far)
     assert r_far.returncode == 0, r_far.stderr
     assert "ran 48" in calls_file.read_text(encoding="utf-8")
@@ -568,7 +580,7 @@ def test_sweep_sh_exports_thread_env_vars_itself(tmp_path: Path) -> None:
         [
             "bash", str(_SWEEP_SH),
             "--code-sha", "deadbeef", "--stage", "20k",
-            "--queue", str(queue), "--cutoff", "2026-09-26T00:00:00Z", "-P", "1",
+            "--queue", str(queue), "--cutoff", _future_cutoff_iso(), "-P", "1",
         ],
         env=env, capture_output=True, text=True, check=False,
     )
