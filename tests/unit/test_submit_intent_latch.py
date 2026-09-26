@@ -7,12 +7,13 @@ is value-free in str/repr; fingerprints stay out of every exception message.
 from __future__ import annotations
 
 import ast
+import errno
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -659,6 +660,45 @@ class TestProcessLock:
             open_submit_intent_latch(_DictStore(), store_path),
         ):
             raise AssertionError("symlinked lock path must not yield")
+
+    def test_emfile_on_open_raises_lock_error_naming_the_errno_and_chains_the_cause(
+        self, store_path: Path
+    ) -> None:
+        emfile = OSError(errno.EMFILE, "Too many open files")
+        with (
+            patch("os.open", side_effect=emfile),
+            pytest.raises(SubmitIntentLockError) as excinfo,
+            hold_submit_intent_process_lock(store_path),
+        ):
+            raise AssertionError("EMFILE must not yield")
+        assert "EMFILE" in str(excinfo.value)
+        assert "Too many open files" in str(excinfo.value)
+        assert excinfo.value.__cause__ is emfile
+
+    def test_emfile_on_flock_raises_lock_error_naming_the_errno_and_chains_the_cause(
+        self, store_path: Path
+    ) -> None:
+        emfile = OSError(errno.EMFILE, "Too many open files")
+        with (
+            patch("fcntl.flock", side_effect=emfile),
+            pytest.raises(SubmitIntentLockError) as excinfo,
+            hold_submit_intent_process_lock(store_path),
+        ):
+            raise AssertionError("EMFILE must not yield")
+        assert "EMFILE" in str(excinfo.value)
+        assert excinfo.value.__cause__ is emfile
+
+    def test_contention_message_unchanged_and_not_confused_with_infrastructure_failure(
+        self, store_path: Path
+    ) -> None:
+        with (
+            hold_submit_intent_process_lock(store_path),
+            pytest.raises(SubmitIntentLockHeld) as held,
+            hold_submit_intent_process_lock(store_path),
+        ):
+            raise AssertionError("nested acquire must not enter the body")
+        assert str(held.value) == "submit intent process lock is held"
+        assert "EMFILE" not in str(held.value)
 
     def test_cross_process_acquire_while_held_exits_with_marker(self, store_path: Path) -> None:
         child = (
