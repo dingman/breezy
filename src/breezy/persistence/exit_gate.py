@@ -50,7 +50,7 @@ from typing import Final
 
 from breezy.persistence.family_manifest import FamilyManifest
 
-__all__ = ["family_declares_exit_rule"]
+__all__ = ["family_declares_exit_rule", "family_declares_no_leg_exit"]
 
 _EXIT_RULE_REGISTERED_FAMILIES: Final[frozenset[str]] = frozenset({"pm_us_crh_exit_v4"})
 
@@ -68,3 +68,16 @@ def family_declares_exit_rule(manifest: FamilyManifest) -> bool:
         manifest.family_id in _EXIT_RULE_REGISTERED_FAMILIES
         and manifest.exit_rule is not None
     )
+
+
+def family_declares_no_leg_exit(manifest: FamilyManifest) -> bool:
+    """True only if `family_declares_exit_rule(manifest)` is True AND the
+    manifest itself declares `no_leg_exit`.
+
+    FU-1d: a NO-leg exit is guarded by TWO deliberate gates, never by
+    missing data. This is the second, narrower one -- it can only ever
+    ADD a restriction on top of `family_declares_exit_rule`, never grant an
+    exit on its own (a manifest cannot set `no_leg_exit` without also
+    declaring `exit_rule`; see `family_manifest.load_family_manifest`).
+    """
+    return family_declares_exit_rule(manifest) and manifest.no_leg_exit

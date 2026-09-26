@@ -79,6 +79,7 @@ def _wire_monitor(strategy, *, tmp_path: Path) -> PositionMonitor:
         station_for=callables.station_for,
         climate_day_for=callables.climate_day_for,
         hour_lst_for=callables.hour_lst_for,
+        sibling_for=callables.sibling_for,
         stale_observation_bound_ns=strategy._config.stale_observation_minutes * _MINUTE_NS,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
         buffer=MarkBuffer(),

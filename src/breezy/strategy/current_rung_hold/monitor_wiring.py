@@ -111,14 +111,45 @@ def _facts_for_either_leg(
     return facts.get(str(sibling_id))
 
 
+def _sibling_for(iid: str) -> str | None:
+    """FU-1d (`RULING_FU-1b_no_leg_marks_2026-09-26.md`): resolve `iid`'s
+    sibling instrument id for `PositionMonitor.on_depth`'s NO-leg routing.
+
+    Mirrors `_facts_for_either_leg`'s own defence-in-depth shape: a
+    malformed id (`InstrumentId.from_str` raises `ValueError`) resolves to
+    `None`, never a raised error. A NO-leg id resolves to `None` too --
+    routing only ever runs FORWARD, from a YES depth frame to its NO
+    sibling, never the reverse (there is no NO-leg book to walk, and this
+    also rules out a YES<->NO ping-pong if a NO-keyed frame somehow ever
+    arrived here, which the subscribe path never produces). A foreign-venue
+    sibling (`VenuePayloadError`) also resolves to `None`.
+    """
+    try:
+        instrument_id = InstrumentId.from_str(iid)
+    except ValueError:
+        return None
+    if leg_of(instrument_id) == "no":
+        return None
+    try:
+        return str(sibling_instrument_id(instrument_id))
+    except VenuePayloadError:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class MonitorCallables:
-    """The eight read-only closures a ``PositionMonitor`` constructor call
+    """The nine read-only closures a ``PositionMonitor`` constructor call
     needs, bound to one already-constructed ``ContinuousRungHoldStrategy``
     (or a subclass, e.g. ``ContinuousRungHoldBacktestStrategy``). Field
     names match the corresponding ``PositionMonitor.__init__`` parameters
     exactly (``position_monitor.py``), so a call site passes each field
     straight through.
+
+    L-44 (FU-1d): ``sibling_for`` is the NO leg's mark source -- the YES
+    sibling's own depth frame, walking the asks (see
+    ``position_monitor.PositionMonitor._on_sibling_depth`` and
+    ``monitor_evidence.walk_exit_vwap``). There is no NO-leg book to
+    subscribe to (`RULING_FU-1b_no_leg_marks_2026-09-26.md`).
     """
 
     positions_open: Callable[[str], Sequence[Position]]
@@ -129,6 +160,7 @@ class MonitorCallables:
     station_for: Callable[[str], str]
     climate_day_for: Callable[[str], str]
     hour_lst_for: Callable[[str, int], int]
+    sibling_for: Callable[[str], str | None]
 
 
 def build_monitor_callables(strategy: ContinuousRungHoldStrategy) -> MonitorCallables:
@@ -194,4 +226,5 @@ def build_monitor_callables(strategy: ContinuousRungHoldStrategy) -> MonitorCall
         station_for=_station_for,
         climate_day_for=_climate_day_for,
         hour_lst_for=_hour_lst_for,
+        sibling_for=_sibling_for,
     )

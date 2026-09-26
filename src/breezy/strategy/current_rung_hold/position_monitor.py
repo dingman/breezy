@@ -231,6 +231,7 @@ class PositionMonitor:
         submit_exit: Callable[[ExitProposal], None] | None = None,
         record_exit_offer: Callable[[OfferTapeRecord], None] | None = None,
         check_ambiguous_exit: Callable[..., None] | None = None,
+        sibling_for: Callable[[str], str | None] | None = None,
     ) -> None:
         self._clock_ns = clock_ns
         self._positions_open = positions_open
@@ -261,6 +262,12 @@ class PositionMonitor:
         #: Review finding B: the SAME shadow-only default posture --
         #: `None` unless a caller opts in alongside the five above.
         self._check_ambiguous_exit = check_ambiguous_exit
+        #: FU-1d: routes a YES `OrderBookDepth10` frame to its registered
+        #: sibling NO position too (`RULING_FU-1b_no_leg_marks_2026-09-26.md`).
+        #: `None` (the default) is byte-identical shadow behaviour -- no
+        #: caller of this constructor before FU-1d passes anything here, so
+        #: `on_depth`'s existing YES-only behaviour is completely unchanged.
+        self._sibling_for = sibling_for
 
         self._positions: dict[str, _MonitoredPosition] = {}
         #: A3: negative `TrialDayRecord` lookups cached per (instrument_id,
@@ -291,6 +298,7 @@ class PositionMonitor:
 
     def on_depth(self, depth: OrderBookDepth10, now_ns: int) -> None:
         self._guarded("on_depth", lambda: self._on_depth(depth, now_ns))
+        self._guarded("on_depth_sibling", lambda: self._on_sibling_depth(depth, now_ns))
 
     def on_position_opened(self, position: Position, now_ns: int) -> None:
         self._guarded(
@@ -326,6 +334,32 @@ class PositionMonitor:
         if monitored is None:
             return
         self._evaluate(monitored, iid, now_ns, depth=depth)
+
+    def _on_sibling_depth(self, depth: OrderBookDepth10, now_ns: int) -> None:
+        """FU-1d (RULING_FU-1b_no_leg_marks_2026-09-26.md): re-route THIS
+        SAME YES depth frame to its registered NO-leg sibling, evaluated
+        independently of `_on_depth` above -- its own `_guarded` site
+        (`on_depth_sibling`) means an error here can never suppress or alter
+        the YES evaluation, and vice versa.
+
+        A no-op whenever `sibling_for` is `None` (the default: byte-
+        identical shadow behaviour for every caller that predates FU-1d).
+        `sibling_for` itself returns `None` for a NO-leg frame (defence in
+        depth against a YES<->NO ping-pong that should never happen -- the
+        venue has one book per market slug, subscribed only under the YES
+        id) and for a malformed/foreign-venue id, in which case this is
+        also a no-op.
+        """
+        if self._sibling_for is None:
+            return
+        iid = str(depth.instrument_id)
+        sibling_iid = self._sibling_for(iid)
+        if sibling_iid is None:
+            return
+        monitored = self._ensure_registered(sibling_iid, now_ns)
+        if monitored is None:
+            return
+        self._evaluate(monitored, sibling_iid, now_ns, depth=depth)
 
     def _on_position_opened(self, position: Position, now_ns: int) -> None:
         iid = str(position.instrument_id)

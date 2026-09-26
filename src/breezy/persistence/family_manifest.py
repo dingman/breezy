@@ -56,6 +56,21 @@ the family (see that module's docstring for why the split is unforgeable).
 A present `exit_rule` must be a non-empty string; an absent one loads as
 `None`. Every other key in `_REQUIRED_KEYS` stays mandatory and the
 exact-set refusal for a genuinely unknown key is unchanged (L-12).
+
+`no_leg_exit` (optional, FU-1d) declares that this family's armed exit rule
+also covers a NO-leg position, not just YES. It is a SECOND, narrower gate
+layered on top of `exit_rule`/`persistence/exit_gate.family_declares_exit_rule`
+(see `exit_gate.family_declares_no_leg_exit`) -- a family with `exit_rule` but
+no `no_leg_exit` still gates every NO-leg exit closed. The key accepts ONLY
+the literal JSON `true` (identity-checked, never `==`, so the integer `1`
+cannot slip through): `false`, `1`, `"true"` and every other spelling are
+refused with a message telling the author to omit the key instead (matching
+`taker_fee_coefficient`'s one-spelling-per-meaning precedent). `true` without
+`exit_rule` also present is refused as incoherent -- a NO-leg exit
+declaration with no armed exit rule to extend has nothing to attach to. An
+absent key loads as `False`, and `dump_family_manifest` omits the key
+whenever it is `False`, so every manifest committed before this key existed
+loads with byte-identical `manifest_sha256`.
 """
 
 from __future__ import annotations
@@ -125,7 +140,9 @@ _STRING_FIELDS: Final[tuple[str, ...]] = (
     "density_artefact_sha256",
     "taker_fee_coefficient",
 )
-_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"exit_rule", "terminal_climate_day"})
+_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset(
+    {"exit_rule", "terminal_climate_day", "no_leg_exit"}
+)
 
 #: Deliberately NARROWER than ``Decimal``'s own grammar. ``Decimal`` accepts
 #: ``" 0.0695 "``, ``6.95E-2``, ``NaN``, ``Infinity``, ``+0.06`` and
@@ -209,6 +226,9 @@ class FamilyManifest:
     #: open". Set when a family is superseded -- see the module docstring
     #: and ``settlement/family_barrier.assert_family_only``.
     terminal_climate_day: str | None = None
+    #: FU-1d: declares this family's armed ``exit_rule`` also covers a
+    #: NO-leg position. See the module docstring's ``no_leg_exit`` section.
+    no_leg_exit: bool = False
 
 
 def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyManifest:
@@ -340,6 +360,21 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             f"{path}: exit_rule must be a non-empty string when present"
         )
 
+    no_leg_exit = False
+    if "no_leg_exit" in payload:
+        no_leg_exit_raw = payload["no_leg_exit"]
+        if no_leg_exit_raw is not True:  # identity check (never `==`): refuses `1`, `"true"`
+            raise FamilyManifestValidationError(
+                f"{path}: no_leg_exit must be the literal JSON `true` when present "
+                f"(got {no_leg_exit_raw!r}); omit the key instead of writing `false`"
+            )
+        no_leg_exit = True
+    if no_leg_exit and exit_rule is None:
+        raise FamilyManifestValidationError(
+            f"{path}: no_leg_exit is true but exit_rule is absent; a NO-leg exit "
+            "declaration is incoherent without an armed exit_rule to extend"
+        )
+
     return FamilyManifest(
         family_id=payload["family_id"],
         venue=payload["venue"],
@@ -356,6 +391,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         taker_fee_coefficient=taker_fee_coefficient,
         exit_rule=exit_rule,
         terminal_climate_day=terminal_climate_day,
+        no_leg_exit=no_leg_exit,
     )
 
 
@@ -383,6 +419,7 @@ def _field_getters() -> dict[str, Callable[[FamilyManifest], object]]:
         "taker_fee_coefficient": lambda manifest: str(manifest.taker_fee_coefficient),
         "exit_rule": lambda manifest: manifest.exit_rule,
         "terminal_climate_day": lambda manifest: manifest.terminal_climate_day,
+        "no_leg_exit": lambda manifest: True if manifest.no_leg_exit else None,
     }
 
 

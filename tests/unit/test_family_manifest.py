@@ -228,6 +228,51 @@ def test_an_empty_string_exit_rule_is_refused(tmp_path: Path) -> None:
         load_family_manifest(_write(tmp_path, payload))
 
 
+def test_no_leg_exit_absent_defaults_to_false(tmp_path: Path) -> None:
+    manifest = load_family_manifest(_write(tmp_path, _VALID))
+    assert manifest.no_leg_exit is False
+
+
+def test_no_leg_exit_true_is_accepted_when_exit_rule_present(tmp_path: Path) -> None:
+    payload = dict(_VALID, exit_rule="hold_to_settlement", no_leg_exit=True)
+    manifest = load_family_manifest(_write(tmp_path, payload))
+    assert manifest.no_leg_exit is True
+
+
+def test_no_leg_exit_true_without_exit_rule_is_refused(tmp_path: Path) -> None:
+    payload = dict(_VALID, no_leg_exit=True)
+    with pytest.raises(FamilyManifestValidationError, match="incoherent"):
+        load_family_manifest(_write(tmp_path, payload))
+
+
+@pytest.mark.parametrize("bad_value", [False, 1, "true", "True", 1.0])
+def test_no_leg_exit_accepts_only_literal_true(tmp_path: Path, bad_value: object) -> None:
+    payload = dict(_VALID, exit_rule="hold_to_settlement", no_leg_exit=bad_value)
+    with pytest.raises(FamilyManifestValidationError, match="no_leg_exit"):
+        load_family_manifest(_write(tmp_path, payload))
+
+
+def test_dump_omits_no_leg_exit_when_false_and_round_trips_true(tmp_path: Path) -> None:
+    from breezy.persistence.family_manifest import dump_family_manifest, write_family_manifest
+
+    without = load_family_manifest(_write(tmp_path, _VALID))
+    assert without.no_leg_exit is False
+    assert "no_leg_exit" not in dump_family_manifest(without)
+
+    draft = dict(_VALID, status="DRAFT_NOT_REGISTERED", exit_rule="hold_to_settlement")
+    draft["no_leg_exit"] = True
+    skeleton = load_family_manifest(_write(tmp_path, draft), allow_draft=True)
+    assert skeleton.no_leg_exit is True
+    assert dump_family_manifest(skeleton)["no_leg_exit"] is True
+
+    once = write_family_manifest(tmp_path / "no_leg_exit_once.json", skeleton)
+    pinned = replace(
+        skeleton, manifest_sha256=hashlib.sha256(once.read_bytes()).hexdigest(),
+    )
+    reloaded = load_family_manifest(once, allow_draft=True)
+    assert reloaded == pinned
+
+
 def test_a_manifest_round_trips_through_the_serialiser(tmp_path: Path) -> None:
     """AUD-10b step 8: load(write(m), allow_draft=True) == m.
 
