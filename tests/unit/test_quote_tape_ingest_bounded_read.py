@@ -36,10 +36,12 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.persistence.feather_read import COALESCE_ROWS, BatchCoalescer, read_feather_coalesced
 from breezy.runtime.quote_tape_ingest_cli import (
+    EXTEND_CHUNK_ROWS,
     FILE_MARKER_PREFIX,
     _convert_one_tick_type_per_file,
     _convert_stream_natively,
     _extend_overlapping_stream,
+    _extend_table_chunked,
     _is_non_disjoint_refusal,
     default_convert,
 )
@@ -546,3 +548,340 @@ def test_write_data_group_and_parquet_set_on_a_flat_type_root(tmp_path: Path) ->
     flat_set = _parquet_set(catalog, flat_root)
     assert flat_set == {f"{flat_root}/flat.parquet"}
     assert all("nested.parquet" not in entry for entry in flat_set)
+
+
+# ---------------------------------------------------------------------------
+# S3b (ING-2 S3 plan r2, Arch §4/§5b): chunked EXTEND bounds overlapping-
+# stream memory. T4, T8a, T8b, T-R5, plus wiring checks for §5b.
+# ---------------------------------------------------------------------------
+
+
+def _extend_status_table(catalog: ParquetDataCatalog, path: Path, ts_inits: list[int]) -> Any:
+    """A raw (untransformed) table of ``InstrumentStatus`` rows at the given
+    ``ts_init`` values, read back through the S3a coalesced reader -- exactly
+    what ``_extend_overlapping_stream``/the per-file fallback hand to EXTEND.
+    """
+    objects = [
+        InstrumentStatus(
+            instrument_id=IID,
+            action=MarketStatusAction.TRADING,
+            ts_event=ts,
+            ts_init=ts,
+        )
+        for ts in ts_inits
+    ]
+    _write_flat_stream(path, objects, InstrumentStatus)
+    return read_feather_coalesced(catalog.fs, str(path))
+
+
+def test_extend_chunk_rows_default_matches_the_plan() -> None:
+    assert EXTEND_CHUNK_ROWS == 50_000
+
+
+def test_extend_chunked_never_exceeds_the_bound_and_dedupe_window_is_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T4: EXTEND never holds more than one chunk; each chunk's dedupe query
+    uses that chunk's OWN [lo, hi], not the full table's."""
+    catalog = ParquetDataCatalog(str(tmp_path))
+    path = tmp_path / "live" / "instance-1" / "instrument_status_0.feather"
+    ts_inits = [1_000_000_000 + i for i in range(12)]  # no ties, 12 rows
+    table = _extend_status_table(catalog, path, ts_inits)
+    assert table is not None
+
+    query_windows: list[tuple[int, int]] = []
+    real_query = ParquetDataCatalog.query
+
+    def spy_query(self: ParquetDataCatalog, *args: Any, **kwargs: Any) -> list[Any]:
+        if "start" in kwargs and "end" in kwargs:
+            query_windows.append((kwargs["start"], kwargs["end"]))
+        return real_query(self, *args, **kwargs)
+
+    write_calls: list[int] = []
+    real_write = write_fresh_capture_rows
+
+    def spy_write(write_target: ParquetDataCatalog, data_cls: type, objects: list[Any]) -> int:
+        write_calls.append(len(objects))
+        return real_write(write_target, data_cls, objects)
+
+    monkeypatch.setattr(ParquetDataCatalog, "query", spy_query)
+    monkeypatch.setattr("breezy.runtime.quote_tape_ingest_cli.write_fresh_capture_rows", spy_write)
+
+    written, streamed_any = _extend_table_chunked(
+        catalog, catalog, InstrumentStatus, table, chunk_rows=5
+    )
+
+    assert streamed_any
+    assert written == 12
+    assert write_calls == [5, 5, 2]
+    assert all(count <= 5 for count in write_calls)
+    assert query_windows == [
+        (1_000_000_000, 1_000_000_004),
+        (1_000_000_005, 1_000_000_009),
+        (1_000_000_010, 1_000_000_011),
+    ]
+    landed = catalog.query(data_cls=InstrumentStatus)
+    assert {r.ts_init for r in landed} == set(ts_inits)
+
+
+def test_extend_chunked_tie_pair_on_boundary_matches_unchunked(tmp_path: Path) -> None:
+    """T8a (a): a same-ts_init tie straddling a chunk boundary lands both rows
+    when chunked, exactly as unchunked EXTEND does (no silent drop). Without
+    the tie-advance, the second row of the pair is silently dropped by the
+    NEXT chunk's own [lo, hi] dedupe query, which finds the first row of the
+    pair already landed under the identical (instrument_id, ts_init) key.
+    """
+    ts_inits = (
+        [1_000_000_000 + i for i in range(4)]
+        + [1_000_000_004, 1_000_000_004]
+        + [1_000_000_005 + i for i in range(4)]
+    )  # 10 rows; positions 4 and 5 (0-indexed) tie at ts_init=...004
+
+    unchunked_catalog = ParquetDataCatalog(str(tmp_path / "unchunked"))
+    unchunked_path = tmp_path / "unchunked" / "live" / "instance-1" / "instrument_status_0.feather"
+    unchunked_table = _extend_status_table(unchunked_catalog, unchunked_path, ts_inits)
+    unchunked_objects = list(
+        unchunked_catalog._handle_table_nautilus(table=unchunked_table, data_cls=InstrumentStatus)
+    )
+    unchunked_written = write_fresh_capture_rows(
+        unchunked_catalog, InstrumentStatus, unchunked_objects
+    )
+
+    chunked_catalog = ParquetDataCatalog(str(tmp_path / "chunked"))
+    chunked_path = tmp_path / "chunked" / "live" / "instance-1" / "instrument_status_0.feather"
+    chunked_table = _extend_status_table(chunked_catalog, chunked_path, ts_inits)
+    chunked_written, chunked_streamed = _extend_table_chunked(
+        chunked_catalog, chunked_catalog, InstrumentStatus, chunked_table, chunk_rows=5
+    )
+
+    assert chunked_streamed
+    assert chunked_written == unchunked_written == 10
+    unchunked_rows = sorted(r.ts_init for r in unchunked_catalog.query(data_cls=InstrumentStatus))
+    chunked_rows = sorted(r.ts_init for r in chunked_catalog.query(data_cls=InstrumentStatus))
+    assert unchunked_rows == chunked_rows == sorted(ts_inits)
+
+
+def test_extend_chunked_all_equal_ts_init_collapses_to_one_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8a (b): every row shares one ts_init -> a single chunk, matching
+    today's unchunked EXTEND (the plan's stated degenerate case, Arch §4)."""
+    ts_inits = [1_000_000_000] * 6
+    catalog = ParquetDataCatalog(str(tmp_path))
+    path = tmp_path / "live" / "instance-1" / "instrument_status_0.feather"
+    table = _extend_status_table(catalog, path, ts_inits)
+
+    calls: list[int] = []
+    real_write = write_fresh_capture_rows
+
+    def counting_write(write_target: ParquetDataCatalog, data_cls: type, objects: list[Any]) -> int:
+        calls.append(len(objects))
+        return real_write(write_target, data_cls, objects)
+
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    monkeypatch.setattr(cli_module, "write_fresh_capture_rows", counting_write)
+
+    written, streamed_any = _extend_table_chunked(
+        catalog, catalog, InstrumentStatus, table, chunk_rows=3
+    )
+
+    assert streamed_any
+    assert written == 6
+    assert calls == [6]  # ONE chunk, never three of size <= 3
+
+
+def test_extend_chunked_bar_internal_stays_internal(tmp_path: Path) -> None:
+    """T8a (c): a Bar-INTERNAL feather's objects keep '-INTERNAL' through
+    chunked EXTEND (A4: convert_bar_type_to_external=False, matching what
+    unchunked EXTEND has always done implicitly via ``_handle_table_nautilus``'s
+    own defaults)."""
+    from nautilus_trader.model.data import Bar, BarType
+    from nautilus_trader.model.objects import Price, Quantity
+
+    bar_type = BarType.from_str("EUR/USD.SIM-1-MINUTE-BID-INTERNAL")
+    bars = [
+        Bar(
+            bar_type=bar_type,
+            open=Price.from_str("1.0"),
+            high=Price.from_str("1.0"),
+            low=Price.from_str("1.0"),
+            close=Price.from_str("1.0"),
+            volume=Quantity.from_str("1"),
+            ts_event=1_000_000_000 + i,
+            ts_init=1_000_000_000 + i,
+        )
+        for i in range(6)
+    ]
+    catalog = ParquetDataCatalog(str(tmp_path))
+    path = tmp_path / "live" / "instance-1" / "bar_0.feather"
+    _write_flat_stream(path, bars, Bar)
+    table = read_feather_coalesced(catalog.fs, str(path))
+    assert table is not None
+
+    written, streamed_any = _extend_table_chunked(catalog, catalog, Bar, table, chunk_rows=3)
+
+    assert streamed_any
+    assert written == 6
+    landed = catalog.query(data_cls=Bar)
+    assert len(landed) == 6
+    assert all(str(bar.bar_type).endswith("-INTERNAL") for bar in landed)
+    assert not any(str(bar.bar_type).endswith("-EXTERNAL") for bar in landed)
+
+
+def test_extend_chunked_crash_then_rerun_is_idempotent(tmp_path: Path) -> None:
+    """T8b: a crash after chunk k, then a rerun over the same (unmodified)
+    source, lands exactly the full row set with no ``ExtendWriteMismatch``."""
+    ts_inits = [1_000_000_000 + i for i in range(9)]
+    catalog = ParquetDataCatalog(str(tmp_path))
+    path = tmp_path / "live" / "instance-1" / "instrument_status_0.feather"
+    table = _extend_status_table(catalog, path, ts_inits)
+
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    real_write = cli_module.write_fresh_capture_rows
+    call_count = {"n": 0}
+
+    def crashing_write(
+        write_target: ParquetDataCatalog, data_cls: type, objects: list[Any]
+    ) -> int:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated crash mid-EXTEND")
+        return real_write(write_target, data_cls, objects)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cli_module, "write_fresh_capture_rows", crashing_write)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            _extend_table_chunked(catalog, catalog, InstrumentStatus, table, chunk_rows=3)
+
+    landed_after_crash = {r.ts_init for r in catalog.query(data_cls=InstrumentStatus)}
+    assert landed_after_crash == {1_000_000_000, 1_000_000_001, 1_000_000_002}  # chunk 1 only
+
+    rerun_table = read_feather_coalesced(catalog.fs, str(path))
+    written, streamed_any = _extend_table_chunked(
+        catalog, catalog, InstrumentStatus, rerun_table, chunk_rows=3
+    )
+
+    assert streamed_any
+    landed_final = {r.ts_init for r in catalog.query(data_cls=InstrumentStatus)}
+    assert landed_final == set(ts_inits)
+    assert written == 6  # only the 6 rows chunk 2+3 hold; chunk 1's 3 dedupe to 0
+
+
+def test_extend_chunked_unsorted_input_each_chunk_dedupe_window_is_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-R5: an unsorted source is sorted ONCE (P3), then each chunk's dedupe
+    window is that chunk's own [lo, hi] on the SORTED order, never the file's
+    original (unsorted) order or the full table's range."""
+    catalog = ParquetDataCatalog(str(tmp_path))
+    path = tmp_path / "live" / "instance-1" / "instrument_status_0.feather"
+    unsorted_order = [3, 1, 4, 0, 2, 5, 8, 6, 7, 9]  # 10 rows, out of order
+    ts_inits = [1_000_000_000 + i for i in unsorted_order]
+    table = _extend_status_table(catalog, path, ts_inits)
+
+    query_windows: list[tuple[int, int]] = []
+    real_query = ParquetDataCatalog.query
+
+    def spy_query(self: ParquetDataCatalog, *args: Any, **kwargs: Any) -> list[Any]:
+        if "start" in kwargs and "end" in kwargs:
+            query_windows.append((kwargs["start"], kwargs["end"]))
+        return real_query(self, *args, **kwargs)
+
+    monkeypatch.setattr(ParquetDataCatalog, "query", spy_query)
+
+    written, streamed_any = _extend_table_chunked(
+        catalog, catalog, InstrumentStatus, table, chunk_rows=4
+    )
+
+    assert streamed_any
+    assert written == 10
+    assert query_windows == [
+        (1_000_000_000, 1_000_000_003),
+        (1_000_000_004, 1_000_000_007),
+        (1_000_000_008, 1_000_000_009),
+    ]
+    landed = sorted(r.ts_init for r in catalog.query(data_cls=InstrumentStatus))
+    assert landed == sorted(ts_inits)
+
+
+def test_extend_overlapping_stream_routes_through_extend_table_chunked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5b wiring: the whole-instance EXTEND path calls
+    :func:`_extend_table_chunked`, not the raw unchunked pair directly."""
+    fixture_dir = tmp_path / "extend"
+    instance_dir = fixture_dir / "live" / "instance-1"
+    path = instance_dir / "instrument_status_0.feather"
+    _write_flat_stream(path, [_status(i) for i in range(5)], InstrumentStatus)
+    catalog = ParquetDataCatalog(str(fixture_dir))
+    catalog.convert_stream_to_data("instance-1", InstrumentStatus, subdirectory="live")
+    _write_flat_stream(path, [_status(i) for i in range(20)], InstrumentStatus)
+
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    calls: list[int] = []
+    real_chunked = cli_module._extend_table_chunked
+
+    def spy_chunked(
+        catalog_arg: ParquetDataCatalog,
+        write_target: ParquetDataCatalog,
+        data_cls: type,
+        table: Any,
+        **kwargs: Any,
+    ) -> tuple[int, bool]:
+        calls.append(len(table))
+        return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+
+    outcome = _extend_overlapping_stream(catalog, "instance-1", InstrumentStatus, "live")
+
+    assert outcome == "converted"
+    assert calls == [20]
+    assert len(catalog.query(data_cls=InstrumentStatus)) == 20
+
+
+def test_per_file_extend_fallback_routes_through_extend_table_chunked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5b wiring: the per-file EXTEND fallback calls
+    :func:`_extend_table_chunked` too."""
+    fixture = _TR8Fixture(tmp_path)
+    fixture.seed(range(5))
+    path = fixture.instance_dir / "instrument_status_0.feather"
+    _write_flat_stream(path, [_status(i) for i in range(3, 10)], InstrumentStatus)
+    _age(path)
+    report = inspect_feather_file(path)
+
+    import breezy.runtime.quote_tape_ingest_cli as cli_module
+
+    calls: list[int] = []
+    real_chunked = cli_module._extend_table_chunked
+
+    def spy_chunked(
+        catalog_arg: ParquetDataCatalog,
+        write_target: ParquetDataCatalog,
+        data_cls: type,
+        table: Any,
+        **kwargs: Any,
+    ) -> tuple[int, bool]:
+        calls.append(len(table))
+        return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+
+    _result, converted, _open = _convert_one_tick_type_per_file(
+        fixture.catalog,
+        fixture.instance_dir,
+        fixture.instance,
+        InstrumentStatus,
+        frozenset(),
+        {path: report},
+        instance_is_dead=True,
+        dry_run=False,
+    )
+
+    assert converted
+    assert calls == [7]
