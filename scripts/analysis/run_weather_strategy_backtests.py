@@ -676,29 +676,38 @@ class RunResult:
         }
 
 
-def _select_tape_instruments(catalog: ParquetDataCatalog) -> list[TapeInstrument]:
-    """Every instrument on the tape with REAL depth AND quote coverage.
+def _select_tape_instruments(
+    catalog: ParquetDataCatalog,
+    *,
+    climate_day: dt.date = CLIMATE_DAY,
+) -> list[TapeInstrument]:
+    """Every `climate_day` instrument on the tape with REAL depth AND quote
+    coverage.
 
-    Queries every captured instrument's depth/quote counts (I/O; not the pure
-    selection rule itself -- that is
+    Narrows to `climate_day` FIRST via `_capture_instruments_by_id` -- the
+    same single id-discovery-and-filter seam `_select_capture_instruments`
+    uses -- so `order_book_depth10`/`quote_ticks` (I/O) are only ever called
+    for in-scope ids, never for the many other-day instruments recorded on
+    the same shared tape (AUD-11: this used to read every captured
+    instrument's full depth/quote lists before narrowing, OOMing on the
+    production catalog). The pure selection rule itself is
     `weather_strategy_backtest_lib.select_tradable_instrument_ids`, unit
-    tested against fabricated counts) and returns only the ones that clear it.
+    tested against fabricated counts.
     """
-    instruments = catalog.instruments()
+    by_id = _capture_instruments_by_id(catalog, climate_day=climate_day)
     depth_counts: dict[str, int] = {}
     quote_counts: dict[str, int] = {}
     depths_by_id: dict[str, list[OrderBookDepth10]] = {}
     quotes_by_id: dict[str, list[QuoteTick]] = {}
-    for instrument in instruments:
-        depths = catalog.order_book_depth10(instrument_ids=[instrument.id.value])
-        quotes = catalog.quote_ticks(instrument_ids=[instrument.id.value])
-        depth_counts[instrument.id.value] = len(depths)
-        quote_counts[instrument.id.value] = len(quotes)
-        depths_by_id[instrument.id.value] = depths
-        quotes_by_id[instrument.id.value] = quotes
+    for instrument_id in by_id:
+        depths = catalog.order_book_depth10(instrument_ids=[instrument_id])
+        quotes = catalog.quote_ticks(instrument_ids=[instrument_id])
+        depth_counts[instrument_id] = len(depths)
+        quote_counts[instrument_id] = len(quotes)
+        depths_by_id[instrument_id] = depths
+        quotes_by_id[instrument_id] = quotes
 
     tradable_ids = set(select_tradable_instrument_ids(depth_counts, quote_counts))
-    by_id: dict[str, Instrument] = {i.id.value: i for i in instruments}
 
     result: list[TapeInstrument] = []
     for instrument_id in sorted(tradable_ids):

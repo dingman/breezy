@@ -28,11 +28,32 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import sys
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
+
+from breezy.adapters.polymarket_us.parsing import (
+    FEE_COEFFICIENT_KEY,
+    FEE_SCHEDULE_STATUS_KEY,
+    FEE_SCHEDULE_STATUS_KNOWN,
+)
+from breezy.domain.weather_bucket_facts import (
+    CLIMATE_DAY_KEY,
+    MEASURE_KEY,
+    SETTLEMENT_STATION_KEY,
+    STRIKE_LOWER_F_KEY,
+    STRIKE_UPPER_F_KEY,
+    WEATHER_FACTS_STATUS_KEY,
+    WEATHER_FACTS_STATUS_KNOWN,
+)
 
 
 def _load_runner_module() -> ModuleType:
@@ -347,3 +368,131 @@ def test_the_summary_table_prints_both_returns() -> None:
     assert "ret_cap%" in text
     assert "-22.08" in text
     assert "-0.05" in text
+
+
+# ---------------------------------------------------------------------------
+# AUD-11 -- _select_tape_instruments filters to in-scope instruments BEFORE
+# reading depth/quotes, instead of materialising every captured instrument's
+# full depth/quote lists and narrowing only afterward (the OOM in
+# docs/evidence/POINT_IN_TIME_CLASSIFICATION_2026-09-21.md's last section).
+# ---------------------------------------------------------------------------
+
+
+def _tape_instrument_stub(symbol: str, *, station: str, day: dt.date) -> BinaryOption:
+    increment = Price.from_str("0.01")
+    size_increment = Quantity.from_str("1")
+    instrument_id = InstrumentId(Symbol(symbol), Venue("POLYMARKET_US"))
+    return BinaryOption(
+        instrument_id=instrument_id,
+        raw_symbol=instrument_id.symbol,
+        outcome="Yes",
+        description=f"{station} daily high",
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=increment.precision,
+        price_increment=increment,
+        size_precision=size_increment.precision,
+        size_increment=size_increment,
+        activation_ns=0,
+        expiration_ns=200 * 3_600_000_000_000,
+        max_quantity=None,
+        min_quantity=Quantity.from_int(1),
+        maker_fee=Decimal("0.06"),
+        taker_fee=Decimal("0.06"),
+        ts_event=0,
+        ts_init=0,
+        info={
+            WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
+            SETTLEMENT_STATION_KEY: station,
+            CLIMATE_DAY_KEY: day.isoformat(),
+            MEASURE_KEY: "high",
+            STRIKE_LOWER_F_KEY: 76,
+            STRIKE_UPPER_F_KEY: 77,
+            FEE_SCHEDULE_STATUS_KEY: FEE_SCHEDULE_STATUS_KNOWN,
+            FEE_COEFFICIENT_KEY: "0.06",
+        },
+    )
+
+
+class _TapeSpyCatalog:
+    """Mirrors `_SpyCatalog` in `test_paper_replay_catalog_bounds.py`: records
+    every `order_book_depth10`/`quote_ticks` call so a test can assert which
+    instrument ids were actually queried, not just what was selected.
+
+    Carries the REAL shape from the module docstring: in-scope (CLIMATE_DAY)
+    instruments with real depth+quote coverage, plus out-of-scope (other-day)
+    captured instruments with ZERO book/quote rows -- exactly "the other 55
+    captured instruments have no book/quote rows at all."
+    """
+
+    def __init__(self, *, in_scope: list[BinaryOption], out_of_scope: list[BinaryOption]) -> None:
+        self._in_scope = in_scope
+        self._out_of_scope = out_of_scope
+        self._covered_ids = {str(instrument.id) for instrument in in_scope}
+        self.depth_calls: list[list[str]] = []
+        self.quote_calls: list[list[str]] = []
+
+    def instruments(self) -> list[BinaryOption]:
+        return [*self._in_scope, *self._out_of_scope]
+
+    def order_book_depth10(self, *, instrument_ids: list[str]) -> list[object]:
+        self.depth_calls.append(instrument_ids)
+        [instrument_id] = instrument_ids
+        return [object()] if instrument_id in self._covered_ids else []
+
+    def quote_ticks(self, *, instrument_ids: list[str]) -> list[object]:
+        self.quote_calls.append(instrument_ids)
+        [instrument_id] = instrument_ids
+        return [object()] if instrument_id in self._covered_ids else []
+
+
+def _build_tape_spy_catalog() -> tuple[_TapeSpyCatalog, list[str]]:
+    climate_day = runner.CLIMATE_DAY
+    in_scope = [
+        _tape_instrument_stub("tc-temp-nychigh-2026-08-30-a", station="NYC", day=climate_day),
+        _tape_instrument_stub("tc-temp-miahigh-2026-08-30-a", station="MIA", day=climate_day),
+    ]
+    out_of_scope = [
+        _tape_instrument_stub(
+            "tc-temp-nychigh-2026-09-01-a",
+            station="NYC",
+            day=dt.date(2026, 9, 1),
+        ),
+        _tape_instrument_stub(
+            "tc-temp-mdwhigh-2026-09-05-a",
+            station="MDW",
+            day=dt.date(2026, 9, 5),
+        ),
+    ]
+    catalog = _TapeSpyCatalog(in_scope=in_scope, out_of_scope=out_of_scope)
+    expected_ids = sorted(str(instrument.id) for instrument in in_scope)
+    return catalog, expected_ids
+
+
+def test_select_tape_instruments_never_queries_out_of_scope_depth_or_quotes() -> None:
+    """RED today: the current implementation reads `catalog.instruments()`
+    and calls `order_book_depth10`/`quote_ticks` for EVERY instrument on the
+    tape before narrowing, so the out-of-scope ids show up in the spy's call
+    log. The fix must filter to `CLIMATE_DAY` first, so only in-scope ids are
+    ever queried."""
+    catalog, expected_ids = _build_tape_spy_catalog()
+
+    runner._select_tape_instruments(catalog)
+
+    queried_depth_ids = {iid for call in catalog.depth_calls for iid in call}
+    queried_quote_ids = {iid for call in catalog.quote_calls for iid in call}
+    assert queried_depth_ids == set(expected_ids)
+    assert queried_quote_ids == set(expected_ids)
+
+
+def test_select_tape_instruments_selection_is_identical_to_the_old_full_scan() -> None:
+    """Pin: the selected ids equal what the OLD (unfiltered) selection would
+    have produced for this same catalog -- the out-of-scope instruments carry
+    zero book/quote rows (the real shape per the module docstring), so
+    filtering them out before the read changes nothing about which ids clear
+    `select_tradable_instrument_ids`."""
+    catalog, expected_ids = _build_tape_spy_catalog()
+
+    selected = runner._select_tape_instruments(catalog)
+
+    assert sorted(str(ti.instrument.id) for ti in selected) == expected_ids
