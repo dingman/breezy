@@ -50,6 +50,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 from typing import Final
 
@@ -353,6 +354,22 @@ _UNDERPOWERED_REGISTRATIONS: Final[
 }
 
 
+def _iso_date(value: str) -> str:
+    """argparse `type=` for `--registered-at`: refuses any string that does
+    not round-trip byte-for-byte through `date.fromisoformat` (canonical
+    `YYYY-MM-DD` only), so `2026-9-30`, `20260925`, a datetime with a time
+    component, an ISO week date, or garbage are all refused by argparse
+    itself -- before `main()` opens the derived root or touches the ledger.
+    """
+    try:
+        canonical = date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be YYYY-MM-DD") from exc
+    if value != canonical:
+        raise argparse.ArgumentTypeError("must be YYYY-MM-DD")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -362,7 +379,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Overrides {DERIVED_ROOT_ENV_VAR} / the default derived root.",
     )
     parser.add_argument(
-        "--registered-at", required=True, help="ISO date, pre-registration commit date."
+        "--registered-at",
+        required=True,
+        type=_iso_date,
+        help="ISO date, pre-registration commit date.",
     )
     parser.add_argument(
         "--freeze-commit",

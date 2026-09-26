@@ -471,3 +471,55 @@ def test_freeze_commit_with_underpowered_refused(tmp_path: Path) -> None:
     )
     assert exit_code == 2
     assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "bad_date",
+    ["2026-9-30", "20260925", "2026-09-25T10:00:00", "garbage", "2026-W39-3"],
+)
+@pytest.mark.parametrize(
+    "action_flag,action_value",
+    [
+        ("--register-underpowered", NO_SIDE_HYPOTHESIS_ID),
+        ("--register-underpowered", ARCHIVE_RECAL_HYPOTHESIS_ID),
+    ],
+)
+def test_non_canonical_registered_at_is_refused_before_any_write(
+    tmp_path: Path, bad_date: str, action_flag: str, action_value: str
+) -> None:
+    """FU-7b1 Unit B: `--registered-at` must round-trip byte-for-byte
+    through `date.fromisoformat` -- a non-canonical or invalid ISO date is
+    refused by argparse itself (`SystemExit(2)`), before `main()` opens the
+    derived root or writes anything."""
+    path = ledger_path(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--derived-root",
+                str(tmp_path),
+                "--registered-at",
+                bad_date,
+                action_flag,
+                action_value,
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert not path.exists()
+
+
+def test_canonical_registered_at_on_the_ruling_date_is_accepted(tmp_path: Path) -> None:
+    """Positive control for the refusal above: the exact canonical ruling
+    date still registers successfully."""
+    path = ledger_path(tmp_path)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(tmp_path),
+            "--registered-at",
+            "2026-09-25",
+            "--register-underpowered",
+            NO_SIDE_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 0
+    assert path.exists()
