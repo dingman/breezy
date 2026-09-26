@@ -50,7 +50,21 @@ ReadWritePaths=/home/jon/breezy/data/evidence/discovery_set_equality
 # venue credential and no operator-reserved value.
 EnvironmentFile=%h/.config/breezy/breezy.env
 EnvironmentFile=-%h/.config/breezy/alerts.env
-ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/discovery_venue_pull.py --node-log-dir %h/.local/share/breezy/logs --out-dir /home/jon/breezy/data/evidence/discovery_set_equality --user-agent "${BREEZY_USER_AGENT}"
+
+# 2026-09-26 postmortem: `discovery_venue_pull.py` does
+# `from scripts.analysis.discovery_set_equality import ...` (a sibling
+# script module, not the installed `breezy` package). Invoking the file
+# directly (`python /path/to/discovery_venue_pull.py`) puts only the
+# script's OWN directory on sys.path[0] and dies with
+# `ModuleNotFoundError: No module named 'scripts'` -- WorkingDirectory is
+# never added to sys.path for a bare file invocation. `-m` is the fix: it
+# puts WorkingDirectory (cwd) on sys.path[0] instead, the SAME mechanism
+# `scripts/ci/run_tests_no_egress.sh` already relies on
+# (`--chdir "$REPO_ROOT" ... "$PYTHON" -m pytest`) for this exact import to
+# resolve in the test suite. No other sibling unit needs this because none
+# of them import `scripts.*` -- they only import the installed `breezy`
+# package, which is importable regardless of invocation style.
+ExecStart=/home/jon/breezy/.venv/bin/python -m scripts.analysis.discovery_venue_pull --node-log-dir %h/.local/share/breezy/logs --out-dir /home/jon/breezy/data/evidence/discovery_set_equality --user-agent "${BREEZY_USER_AGENT}"
 
 # r2.1 Blocker B: the oneshot default of 90s would kill the up-to-~20-minute
 # poll (16:52Z start, 17:12Z deadline, plus pull wall time). 1800s (30 min)
