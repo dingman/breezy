@@ -79,5 +79,14 @@ def family_declares_no_leg_exit(manifest: FamilyManifest) -> bool:
     ADD a restriction on top of `family_declares_exit_rule`, never grant an
     exit on its own (a manifest cannot set `no_leg_exit` without also
     declaring `exit_rule`; see `family_manifest.load_family_manifest`).
+
+    FU-1d S2 (`RULING_FU-1b_no_leg_marks_2026-09-26.md` re-open item 2):
+    has TWO consumers, deliberately, not one -- `exit_decider.decide_exit`
+    (the primary gate, strategy layer) and
+    `adapters.polymarket_us.exec.submit_chain.unmappable_exit_order_reason`
+    (the defense-in-depth re-check at the exec seam both the standalone
+    submit-chain client and `exec/client.py`'s exec-client boundary reach).
+    Both consumers call the SAME function, never a re-literalled copy, so
+    they can never silently disagree on which families may close a NO leg.
     """
     return family_declares_exit_rule(manifest) and manifest.no_leg_exit
