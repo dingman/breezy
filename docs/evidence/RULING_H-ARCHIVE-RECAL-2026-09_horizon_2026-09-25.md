@@ -10,6 +10,8 @@ Ruled by: trading-bot-architect (AUTHOR) + prediction-market-reviewer (ADVERSARI
 REVIEWER), briefed blind and separately per §7 step 8's dispatch instruction.
 DRAFT pending the adversarial peer's independent pass — not yet dated/signed.
 
+**STATUS (2026-09-26, coordinator): SIGNED 2026-09-25.** The status line above is superseded by the two dated passes appended below: the adversarial peer pass at :130-137, and the mle-reviewer CONFIRMED-WITH-NOTES at "Peer confirmation", which closes the :137 condition. This status line changes no value in the ruling.
+
 Binding, not re-litigated: `forecast-edge-closed-pmus-rungs` (TERMINAL, a different
 class); `two-structural-gates-block-every-take`; §6.1 POWER-PRIMARY-ONLY (anchor,
 not restated here beyond citation).
