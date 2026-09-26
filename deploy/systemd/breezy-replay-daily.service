@@ -49,6 +49,14 @@ UMask=0077
 # operator-reserved value.
 EnvironmentFile=-%h/.config/breezy/alerts.env
 
+# FU-10 / AUD-10b: the sanctioned third invocation (promotion_proposal.py)
+# resolves this non-secret sqlite path from POLYMARKET_US_EXEC_STATE_DB in
+# process (mode=ro); without it _fill_count returns None and the whole run
+# fails KILL_CLOCK_NOT_EVALUABLE. Byte-identical to the same line in
+# breezy-live-tally.service / breezy-score-live-trials.service /
+# breezy-family-tally@.service (tests/unit/test_score_live_trials_deploy.py).
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
 ExecStart=/home/jon/breezy/deploy/systemd/replay-daily-run.sh
 
 TimeoutStartSec=1800

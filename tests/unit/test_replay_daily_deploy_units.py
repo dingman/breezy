@@ -88,3 +88,50 @@ def test_wrapper_invokes_both_the_census_and_the_runner() -> None:
     text = _WRAPPER.read_text()
     assert "replay_sufficiency_census.py" in text
     assert "replay_daily_runner.py" in text
+
+
+#: FU-10 / AUD-10b: the non-secret sqlite path literal
+#: `promotion_proposal.py`'s `--tally-output-dir` run resolves
+#: `POLYMARKET_US_EXEC_STATE_DB` from, byte-identical to the same line in
+#: `breezy-live-tally.service` (and `breezy-score-live-trials.service` /
+#: `breezy-family-tally@.service` -- see
+#: `tests/unit/test_score_live_trials_deploy.py`'s own
+#: `_PINNED_STATE_DB_LITERAL`).
+_PINNED_STATE_DB_LITERAL = (
+    "Environment=POLYMARKET_US_EXEC_STATE_DB="
+    "/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite"
+)
+
+_LIVE_TALLY_SERVICE = _DEPLOY_DIR / "breezy-live-tally.service"
+
+
+def test_service_carries_the_pinned_exec_state_db_env_line() -> None:
+    """FU-10: without this line, promotion_proposal.py's `_fill_count`
+    resolves `os.environ["POLYMARKET_US_EXEC_STATE_DB"]` to None and the
+    whole scheduled unit fails with KILL_CLOCK_NOT_EVALUABLE (observed
+    2026-09-26 14:33Z)."""
+    text = _SERVICE.read_text()
+    matching = [
+        line
+        for line in text.splitlines()
+        if line.startswith("Environment=POLYMARKET_US_EXEC_STATE_DB=")
+    ]
+    assert len(matching) == 1
+    assert matching[0] == _PINNED_STATE_DB_LITERAL
+
+    live_tally_matching = [
+        line
+        for line in _LIVE_TALLY_SERVICE.read_text().splitlines()
+        if line.startswith("Environment=POLYMARKET_US_EXEC_STATE_DB=")
+    ]
+    assert len(live_tally_matching) == 1
+    assert matching[0] == live_tally_matching[0]
+
+
+def test_service_carries_no_environment_file_other_than_alerts_env() -> None:
+    env_file_lines = [
+        line.strip()
+        for line in _SERVICE.read_text().splitlines()
+        if line.strip().startswith("EnvironmentFile=")
+    ]
+    assert env_file_lines == ["EnvironmentFile=-%h/.config/breezy/alerts.env"]
