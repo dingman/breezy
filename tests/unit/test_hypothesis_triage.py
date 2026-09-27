@@ -10,6 +10,7 @@ import ast
 import json
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import replace
 from datetime import date, timedelta
@@ -1440,12 +1441,53 @@ def _imports_hypothesis_record(tree: ast.Module) -> bool:
     return False
 
 
+def _dataclasses_replace_bypass_offenses(tree: ast.Module) -> list[str]:
+    """R3-4 AST barrier, alias-resolving: flags every call form that reaches
+    `dataclasses.replace`, regardless of import aliasing --
+    `import dataclasses as dc` + `dc.replace(...)`, and
+    `from dataclasses import replace as r` + `r(...)` -- not just the literal
+    `dataclasses.replace(...)` spelling. Free of false positives on
+    `os.replace` or a local helper such as `_replace_status` (neither binds
+    an alias to the `dataclasses` module or its `replace` function)."""
+    module_aliases: set[str] = set()
+    replace_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "dataclasses":
+                    module_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+            for alias in node.names:
+                if alias.name == "replace":
+                    replace_aliases.add(alias.asname or alias.name)
+
+    offenses: list[str] = []
+    if replace_aliases:
+        offenses.append(f"imports `replace` from dataclasses (as {sorted(replace_aliases)!r})")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "replace"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in module_aliases
+        ):
+            offenses.append(f"calls {func.value.id}.replace (dataclasses alias)")
+        elif isinstance(func, ast.Name) and func.id in replace_aliases:
+            offenses.append(f"calls {func.id}(...) (dataclasses.replace alias)")
+    return offenses
+
+
 def test_no_module_importing_hypothesisrecord_uses_dataclasses_replace() -> None:
     """R3-4: only `hypothesis_ledger.py` (the definer) may call
     `dataclasses.replace`/`replace(...)` on a `HypothesisRecord`. Every other
     module that imports `HypothesisRecord` must go through
     `replace_record_status` instead. Must NOT trip on `os.replace` or a local
-    name such as `_replace_status`."""
+    name such as `_replace_status`. Alias-resolving (`import dataclasses as
+    dc`, `from dataclasses import replace as r`) -- see
+    `_dataclasses_replace_bypass_offenses`."""
     offenders: list[str] = []
     for path in _module_source_files():
         if path.name == "hypothesis_ledger.py":
@@ -1453,26 +1495,55 @@ def test_no_module_importing_hypothesisrecord_uses_dataclasses_replace() -> None
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         if not _imports_hypothesis_record(tree):
             continue
-        imports_bare_replace = any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "dataclasses"
-            and any(alias.name == "replace" for alias in node.names)
-            for node in ast.walk(tree)
+        offenders.extend(
+            f"{path}: {offense}" for offense in _dataclasses_replace_bypass_offenses(tree)
         )
-        if imports_bare_replace:
-            offenders.append(f"{path}: imports `replace` from dataclasses")
-            continue
-        calls_dataclasses_replace = any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "replace"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "dataclasses"
-            for node in ast.walk(tree)
-        )
-        if calls_dataclasses_replace:
-            offenders.append(f"{path}: calls dataclasses.replace")
     assert offenders == []
+
+
+def test_dataclasses_replace_bypass_scanner_catches_aliased_module_import() -> None:
+    """Negative control 1: `import dataclasses as dc` + `dc.replace(...)`."""
+    source = textwrap.dedent(
+        """
+        import dataclasses as dc
+
+        def bad(rec):
+            return dc.replace(rec, status="REGISTERED")
+        """
+    )
+    offenses = _dataclasses_replace_bypass_offenses(ast.parse(source))
+    assert any("dc.replace" in offense for offense in offenses), offenses
+
+
+def test_dataclasses_replace_bypass_scanner_catches_aliased_replace_import() -> None:
+    """Negative control 2: `from dataclasses import replace as r` + `r(...)`."""
+    source = textwrap.dedent(
+        """
+        from dataclasses import replace as r
+
+        def bad(rec):
+            return r(rec, status="REGISTERED")
+        """
+    )
+    offenses = _dataclasses_replace_bypass_offenses(ast.parse(source))
+    assert offenses != []
+    assert any("r(...)" in offense for offense in offenses), offenses
+
+
+def test_dataclasses_replace_bypass_scanner_ignores_os_replace_and_local_helper() -> None:
+    """Must NOT false-positive on `os.replace` or a `_replace_status`-shaped
+    local helper -- neither binds an alias to `dataclasses` or its
+    `replace`."""
+    source = textwrap.dedent(
+        """
+        import os
+
+        def _replace_status(rec, status):
+            os.replace("a", "b")
+            return rec
+        """
+    )
+    assert _dataclasses_replace_bypass_offenses(ast.parse(source)) == []
 
 
 def test_no_module_other_than_hypothesis_ledger_reads_re_arm_gating_attribute() -> None:

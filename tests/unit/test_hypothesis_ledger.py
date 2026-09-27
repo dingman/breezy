@@ -853,18 +853,58 @@ def test_max_hypotheses_and_re_arm_gating_alpha_are_pinned() -> None:
     )
 
 
+# L-24 anti-vacuity (M3 mutation-test finding, 2026-09-27): match the
+# refusal's OWN message text, not a bare ValueError -- a schema_version=3
+# call with re_arm_gating=True and no variant_stratum_filters also raises
+# StratumFilterCountMismatchError (itself a ValueError) once it reaches the
+# REGISTERED branch, which would let a disabled re_arm_gating refusal pass
+# these tests vacuously.
+_RE_ARM_GATING_OVERRIDE_REFUSAL_MESSAGE = "re_arm_gating=True requires programme_alpha_override"
+
+
 def test_re_arm_gating_without_0_025_override_is_refused() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=_RE_ARM_GATING_OVERRIDE_REFUSAL_MESSAGE):
         register_hypothesis(
             **_valid_kwargs(hypothesis_id="H-GATE-NO-OVERRIDE", k_variants=1, re_arm_gating=True)
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=_RE_ARM_GATING_OVERRIDE_REFUSAL_MESSAGE):
         register_hypothesis(
             **_valid_kwargs(
                 hypothesis_id="H-GATE-TOO-LOOSE",
                 k_variants=1,
                 re_arm_gating=True,
                 programme_alpha_override=0.05,
+            )
+        )
+
+
+def test_re_arm_gating_without_override_is_refused_even_when_underpowered() -> None:
+    """L-24/M3: Plan D-1 requires this refusal for EVERY outcome, zero-look
+    included -- it must fire ahead of the SS6.1 power check, not only when
+    the inputs would otherwise reach REGISTERED. These inputs mirror
+    `test_underpowered_registration_consumes_no_alpha_slot_or_look`'s own
+    UNDERPOWERED fixture (mde_at_allocated_alpha=0.1032,
+    mde_plausibility_bound=0.01 at the default k_variants=4/min_station_days=
+    300): absent this refusal, register_hypothesis would silently return an
+    UNDERPOWERED_NOT_REGISTERED, is_zero_look=True record instead of
+    raising."""
+    with pytest.raises(ValueError, match=_RE_ARM_GATING_OVERRIDE_REFUSAL_MESSAGE):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-GATE-NO-OVERRIDE-ZERO-LOOK",
+                re_arm_gating=True,
+                mde_at_allocated_alpha=0.1032,
+                mde_plausibility_bound=0.01,
+            )
+        )
+    with pytest.raises(ValueError, match=_RE_ARM_GATING_OVERRIDE_REFUSAL_MESSAGE):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-GATE-TOO-LOOSE-ZERO-LOOK",
+                re_arm_gating=True,
+                programme_alpha_override=0.05,
+                mde_at_allocated_alpha=0.1032,
+                mde_plausibility_bound=0.01,
             )
         )
 
