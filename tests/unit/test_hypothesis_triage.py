@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -19,21 +20,33 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts" / "analysis").as_posix())
 
-from hypothesis_triage import (  # noqa: E402
+import hypothesis_triage as triage_module
+from hypothesis_register import (
+    main as register_main,
+)
+from hypothesis_register import (
+    register_forecast_taker_closed_disposition,
+)
+from hypothesis_triage import (
     AlreadyLookedRefusal,
     DuplicateHypothesisLookError,
     ZeroLookRefusal,
+    _Args,
     _has_registered_draw_binding,
     append_hypothesis_evaluation,
     assert_look_permitted,
+    cluster_bootstrap_ci,
+)
+from hypothesis_triage import (
+    run as triage_run,
 )
 
-from breezy.analysis.hypothesis_ledger import (  # noqa: E402
+from breezy.analysis.hypothesis_ledger import (
+    EVIDENCED_FEE_THETA,
     MAX_HYPOTHESES,
     MAX_SINGLE_DAY_LEG_SHARE,
     PROGRAMME_ALPHA,
     STATION_DAY_STATISTIC,
-    EVIDENCED_FEE_THETA,
     VARIANCE_BOUND,
     HypothesisLook,
     read_hypothesis_ledger,
@@ -42,27 +55,23 @@ from breezy.analysis.hypothesis_ledger import (  # noqa: E402
     station_day_mean_x,
     write_hypothesis_ledger,
 )
-from breezy.analysis.replay_results import (  # noqa: E402
+from breezy.analysis.replay_results import (
     REPLAY_RESULTS_SCHEMA_VERSION,
     REPLAY_VALIDITY,
     ReplayResult,
     append_replay_result,
 )
-from breezy.analysis.replay_sufficiency import (  # noqa: E402
+from breezy.analysis.replay_sufficiency import (
     REPLAY_SUFFICIENCY_SCHEMA_VERSION,
     ReplaySufficiency,
     write_replay_sufficiency,
 )
-from breezy.persistence.scored_trial_store import write_scored_trials  # noqa: E402
-from breezy.settlement.current_rung_hold_v2 import (  # noqa: E402
+from breezy.persistence.scored_trial_store import write_scored_trials
+from breezy.settlement.current_rung_hold_v2 import (
     StratumRow,
     combine_station_day,
 )
-from breezy.settlement.trial_scorer import ScoredTrial  # noqa: E402
-from hypothesis_register import (  # noqa: E402
-    main as register_main,
-    register_forecast_taker_closed_disposition,
-)
+from breezy.settlement.trial_scorer import ScoredTrial
 
 SCRIPT = REPO_ROOT / "scripts" / "analysis" / "hypothesis_triage.py"
 STRATEGY = "fixture"
@@ -150,6 +159,7 @@ def _register(
     registered_at: str = "2026-09-20",
     status: str = "PARKED_INSUFFICIENT_DATA",
     k_variants: int = 1,
+    variant_stratum_filters: tuple[str, ...] | None = None,
 ) -> None:
     per_variant_alpha = (PROGRAMME_ALPHA / MAX_HYPOTHESES) / k_variants
     mde = recompute_mde(
@@ -174,6 +184,7 @@ def _register(
         station_day_statistic=STATION_DAY_STATISTIC,
         order_quantity=1,
         look_policy="SINGLE_LOOK",
+        variant_stratum_filters=variant_stratum_filters,
     )
     assert record.is_zero_look is False
     write_hypothesis_ledger(_ledger(derived), (replace(record, status=status),))
@@ -272,6 +283,10 @@ def _write_replay(
         )
 
 
+def _append_replay(path: Path, row: ReplayResult) -> None:
+    append_replay_result(path, row)
+
+
 def _trial(
     *,
     trial_id: str,
@@ -290,14 +305,14 @@ def _trial(
         instrument_id=instrument_id,
         settlement_tmax_f=70,
         held=held,
-        pnl=Decimal("0"),
+        pnl=Decimal(0),
         revision_seq=1,
         raw_sha256="abc",
         scored_at_ns=1,
         score_seq=0,
         settlement_basis="nws_final",
         excluded_reason=None,
-        slippage=Decimal("0"),
+        slippage=Decimal(0),
         entry_ask=ask,
         fill_px=ask,
         fee=Decimal(fee),
@@ -339,12 +354,235 @@ def _empty_replay_files(derived: Path) -> None:
     (derived / "replay" / "replay_results.jsonl").write_text("", encoding="utf-8")
 
 
+def _triage_args(derived: Path, *, as_of: str = "2026-09-25") -> _Args:
+    return _Args(
+        derived_root=derived,
+        as_of=as_of,
+        horizon_days=21,
+        alert_log=None,
+        attempt_hypothesis_id=None,
+    )
+
+
+def test_bootstrap_iterations_resolve_tail_for_small_alpha() -> None:
+    assert triage_module._bootstrap_iterations_for_alpha(0.00625) == 16000
+    assert triage_module._bootstrap_iterations_for_alpha(0.25) == 400
+
+
+def test_cluster_bootstrap_default_uses_alpha_resolved_iterations() -> None:
+    means = tuple(index / 100.0 for index in range(12))
+
+    assert cluster_bootstrap_ci(means, alpha=0.00625, seed=12345) == cluster_bootstrap_ci(
+        means,
+        alpha=0.00625,
+        iterations=16000,
+        seed=12345,
+    )
+
+
+def test_cluster_bootstrap_seed_remains_deterministic() -> None:
+    means = tuple(index / 100.0 for index in range(12))
+
+    first = cluster_bootstrap_ci(means, alpha=0.00625, seed=20260925)
+    second = cluster_bootstrap_ci(means, alpha=0.00625, seed=20260925)
+
+    assert first == second
+
+
+def test_cluster_bootstrap_small_sample_runtime_sanity() -> None:
+    means = tuple(index / 100.0 for index in range(12))
+
+    started = time.perf_counter()
+    cluster_bootstrap_ci(means, alpha=0.00625, seed=20260925)
+
+    assert time.perf_counter() - started < 3.0
+
+
+def _registered_binding() -> tuple[str, ...]:
+    return ("station=SFO|hour_lst=10-11|side=YES|composition_kind=taker",)
+
+
+def _materialized_output_bytes(derived: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(derived).as_posix(): path.read_bytes()
+        for path in sorted((derived / "hypothesis").rglob("*"))
+        if path.is_file()
+    }
+
+
 def test_missing_ledger_is_a_clean_non_alerting_outcome(tmp_path: Path) -> None:
     proc, alerts = _run(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert alerts == []
     assert "CLEAN" in proc.stdout
     assert not _evaluations(tmp_path).exists()
+
+
+def test_a_candidate_replay_row_reaches_triage_via_the_named_input_seam(
+    tmp_path: Path,
+) -> None:
+    hypothesis_id = "H-CANDIDATE-SEAM"
+    climate_day = _day(0)
+    _register(
+        tmp_path,
+        hypothesis_id=hypothesis_id,
+        min_station_days=1,
+        variant_stratum_filters=_registered_binding(),
+    )
+    write_replay_sufficiency(
+        tmp_path / "replay" / "replay_sufficiency.jsonl",
+        [_sufficiency("SFO", climate_day)],
+    )
+    champion = tmp_path / "replay" / "replay_results.jsonl"
+    champion.parent.mkdir(parents=True, exist_ok=True)
+    champion.write_text("", encoding="utf-8")
+    candidate = tmp_path / "candidate" / "replay_results.jsonl"
+    _append_replay(candidate, _result(station="SFO", climate_day=climate_day, fills=1))
+    _write_store(tmp_path, [_winner("SFO", climate_day, trial_id="candidate-winner")])
+
+    assert (
+        triage_run(
+            _triage_args(tmp_path),
+            replay_result_sources=(("candidate-family", candidate),),
+        )
+        == 0
+    )
+
+    looks = _looks(tmp_path)
+    assert len(looks) == 1
+    assert looks[0]["hypothesis_id"] == hypothesis_id
+    assert looks[0]["n_station_days"] == 1
+    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PRIMARY_PASSED_PNL_VETO"
+
+
+def test_triage_with_no_seam_argument_reads_only_replay_results_jsonl_byte_identically(
+    tmp_path: Path,
+) -> None:
+    def fixture(derived: Path) -> Path:
+        _register(
+            derived,
+            hypothesis_id="H-DEFAULT-BYTES",
+            min_station_days=2,
+            variant_stratum_filters=_registered_binding(),
+        )
+        champion_day = _day(0)
+        candidate_day = _day(1)
+        write_replay_sufficiency(
+            derived / "replay" / "replay_sufficiency.jsonl",
+            [_sufficiency("SFO", champion_day), _sufficiency("SFO", candidate_day)],
+        )
+        _append_replay(
+            derived / "replay" / "replay_results.jsonl",
+            _result(station="SFO", climate_day=champion_day, fills=1),
+        )
+        candidate = derived / "candidate" / "replay_results.jsonl"
+        _append_replay(
+            candidate,
+            _result(station="SFO", climate_day=candidate_day, fills=1),
+        )
+        _write_store(
+            derived,
+            [
+                _winner("SFO", champion_day, trial_id="champion-winner"),
+                _winner("SFO", candidate_day, trial_id="candidate-winner"),
+            ],
+        )
+        return candidate
+
+    default_root = tmp_path / "default"
+    explicit_root = tmp_path / "explicit"
+    fixture(default_root)
+    fixture(explicit_root)
+
+    assert triage_run(_triage_args(default_root)) == 0
+    assert (
+        triage_run(
+            _triage_args(explicit_root),
+            replay_result_sources=(
+                ("champion", explicit_root / "replay" / "replay_results.jsonl"),
+            ),
+        )
+        == 0
+    )
+
+    assert _materialized_output_bytes(default_root) == _materialized_output_bytes(
+        explicit_root
+    )
+    assert read_hypothesis_ledger(_ledger(default_root))[0].status == (
+        read_hypothesis_ledger(_ledger(explicit_root))[0].status
+    )
+    assert _looks(default_root) == _looks(explicit_root) == []
+
+
+def test_exact_duplicate_replay_rows_across_named_sources_are_deduped(
+    tmp_path: Path,
+) -> None:
+    climate_day = _day(0)
+    _register(
+        tmp_path,
+        hypothesis_id="H-DUPE-EXACT",
+        min_station_days=1,
+        variant_stratum_filters=_registered_binding(),
+    )
+    write_replay_sufficiency(
+        tmp_path / "replay" / "replay_sufficiency.jsonl",
+        [_sufficiency("SFO", climate_day)],
+    )
+    row = _result(station="SFO", climate_day=climate_day, fills=1)
+    first = tmp_path / "candidate-a" / "replay_results.jsonl"
+    second = tmp_path / "candidate-b" / "replay_results.jsonl"
+    _append_replay(first, row)
+    _append_replay(second, row)
+    _write_store(tmp_path, [_winner("SFO", climate_day, trial_id="dupe-winner")])
+
+    assert (
+        triage_run(
+            _triage_args(tmp_path),
+            replay_result_sources=(("candidate-a", first), ("candidate-b", second)),
+        )
+        == 0
+    )
+
+    (look,) = _looks(tmp_path)
+    assert look["n_station_days"] == 1
+    assert look["n_station_days_observed"] == 1
+
+
+def test_conflicting_duplicate_replay_rows_across_named_sources_raise(
+    tmp_path: Path,
+) -> None:
+    climate_day = _day(0)
+    _register(
+        tmp_path,
+        hypothesis_id="H-DUPE-CONFLICT",
+        min_station_days=1,
+        variant_stratum_filters=_registered_binding(),
+    )
+    write_replay_sufficiency(
+        tmp_path / "replay" / "replay_sufficiency.jsonl",
+        [_sufficiency("SFO", climate_day)],
+    )
+    first = tmp_path / "candidate-a" / "replay_results.jsonl"
+    second = tmp_path / "candidate-b" / "replay_results.jsonl"
+    row = _result(station="SFO", climate_day=climate_day, fills=1)
+    _append_replay(first, row)
+    _append_replay(second, replace(row, fills=2))
+
+    proc, alerts = _run(
+        tmp_path,
+        "--replay-results-source",
+        f"candidate-a={first}",
+        "--replay-results-source",
+        f"candidate-b={second}",
+    )
+
+    assert proc.returncode == 1
+    assert len(alerts) == 1
+    assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_FAILED"
+    assert "conflicting duplicate replay result" in alerts[0]["detail"]
+    assert "candidate-a" in alerts[0]["detail"]
+    assert "candidate-b" in alerts[0]["detail"]
+    assert _looks(tmp_path) == []
 
 
 def test_refused_only_ledger_is_a_clean_non_alerting_outcome(tmp_path: Path) -> None:
