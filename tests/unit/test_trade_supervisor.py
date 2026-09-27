@@ -2679,6 +2679,22 @@ def _read_proc_stat_state(pid: int) -> str | None:
     return fields[0] if fields else None
 
 
+def _guaranteed_unallocated_pid() -> int:
+    """A pid value the kernel will never hand out to any process on this
+    host: one past ``/proc/sys/kernel/pid_max`` (valid pids run
+    ``1 .. pid_max - 1``), so ``os.kill(pid, 0)`` is guaranteed to raise
+    ``ProcessLookupError`` no matter what else is running.
+
+    Deliberately NOT ``some_pid + 1``: on a busy, multi-agent host an
+    unrelated real process can legitimately occupy the very next pid at
+    the moment of the probe (pids are handed out sequentially), which is
+    exactly the ~1-in-5-to-20 flake this replaces -- confirmed by looping
+    the old ``proc.pid + 1`` version and observing ``process_is_alive``
+    correctly report ``True`` for a live, unrelated pid."""
+    pid_max = int(Path("/proc/sys/kernel/pid_max").read_text().strip())
+    return pid_max + 1
+
+
 def _wait_for_zombie(pid: int, *, timeout: float = 1.0) -> None:
     """Poll briefly for ``pid`` to become a zombie. Raises (never a bare
     ``assert``) if the deadline passes first, so a child that never exits
@@ -6047,7 +6063,14 @@ class TestWp0aLiveFamilyMiddayWatchAndReap:
     def test_a_retained_zombie_is_reaped_when_another_pid_is_probed(self):
         """Sweep the whole retain table: a dead child we are not currently
         asking about must still be waitpid'd, otherwise it sits
-        ``<defunct>`` until the supervisor exits."""
+        ``<defunct>`` until the supervisor exits.
+
+        ``other_pid`` must be guaranteed never alive (``_guaranteed_
+        unallocated_pid``), never a nearby guess like ``proc.pid + 1`` --
+        pids are allocated sequentially, so on a busy host an unrelated
+        real process can legitimately land on the very next pid, which
+        flakes this assertion without saying anything about the reap
+        logic under test."""
         from breezy.runtime.trade_supervisor import _retain_spawned_child
 
         proc = subprocess.Popen(
@@ -6058,7 +6081,7 @@ class TestWp0aLiveFamilyMiddayWatchAndReap:
             _wait_for_zombie(proc.pid)
             assert _read_proc_stat_state(proc.pid) == "Z"
             _retain_spawned_child(proc)
-            other_pid = proc.pid + 1
+            other_pid = _guaranteed_unallocated_pid()
             assert process_is_alive(other_pid) is False
             assert _read_proc_stat_state(proc.pid) is None
         finally:
