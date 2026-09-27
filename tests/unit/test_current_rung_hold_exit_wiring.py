@@ -328,6 +328,40 @@ def test_submit_exit_refuses_when_the_family_is_already_halted(
     strategy.submit_exit(proposal)
 
 
+def test_an_exit_submitted_while_fee_unverified_is_not_blocked_by_this_check(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """EDGE-1 (architect #1, mandatory): the fee-unverified veto is
+    entry-only -- `exit_wiring.submit_exit` must never even consult it."""
+    calls: list[int] = []
+
+    def _spy_check(now_ns: int) -> bool:
+        calls.append(now_ns)
+        return False
+
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        fee_verified_check=_spy_check,
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is False
+
+    proposal = ExitProposal(
+        instrument_id=str(INTERIOR_ID),
+        authorization=_authorization(
+            position_id="P-unverified", limit_price=Decimal("0.30"), rule=ExitRule.R_DEAD,
+        ),
+        decided_at_ns=WINDOW_OPEN_NS,
+    )
+    # No position exists in this lightweight harness's cache, so this
+    # returns quietly after the instrument/position lookups -- the point is
+    # that `_spy_check` is never invoked anywhere on this path.
+    strategy.submit_exit(proposal)
+
+    assert calls == [], "the fee-verified veto must never be consulted on the exit path"
+
+
 def _exit_order_filled_event(
     strategy: ContinuousRungHoldStrategy,
     *,

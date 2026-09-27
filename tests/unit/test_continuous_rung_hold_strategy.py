@@ -101,6 +101,7 @@ def _register(
     offer_tape: OfferTape | None = None,
     position_evidence_reader: Any | None = None,
     shadow_rest_summary_dir: Path | None = None,
+    fee_verified_check: Callable[[int], bool] | None = None,
 ) -> ContinuousRungHoldStrategy:
     cfg = CurrentRungHoldConfig(
         instrument_ids=tuple(instrument.id for instrument in instruments),
@@ -115,6 +116,7 @@ def _register(
         offer_tape=offer_tape,
         position_evidence_reader=position_evidence_reader,
         shadow_rest_summary_dir=shadow_rest_summary_dir,
+        fee_verified_check=fee_verified_check,
     )
     used_clock = TestClock() if clock is None else clock
     used_clock.set_time(WINDOW_OPEN_NS)
@@ -141,6 +143,7 @@ def _register_and_start(
     offer_tape: OfferTape | None = None,
     position_evidence_reader: Any | None = None,
     shadow_rest_summary_dir: Path | None = None,
+    fee_verified_check: Callable[[int], bool] | None = None,
 ) -> ContinuousRungHoldStrategy:
     strategy = _register(
         store_path=store_path,
@@ -149,6 +152,7 @@ def _register_and_start(
         offer_tape=offer_tape,
         position_evidence_reader=position_evidence_reader,
         shadow_rest_summary_dir=shadow_rest_summary_dir,
+        fee_verified_check=fee_verified_check,
     )
     strategy.start()
     return strategy
@@ -433,6 +437,89 @@ def test_a_take_decision_with_permit_none_never_calls_submit_order(
     # ask=0.40 clears break-even (same fixture as test_inflight_commits_before_arm).
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
     assert submitted == []
+
+
+# ---------------------------------------------------------------------------
+# EDGE-1 (r2/AM-1..4): the entry-only "fee unverified" staleness veto.
+# Placed immediately after the existing `is_family_halted()`/`self._fee_halt`
+# checks in `_hunt_tick`, ahead of every other entry gate -- reachable even
+# on a minimal/unregistered instrument, since it fires before `iid`/`facts`
+# are ever looked up.
+# ---------------------------------------------------------------------------
+
+
+def test_hunt_tick_refuses_a_new_entry_while_fee_unverified_and_records_the_diagnostic(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        fee_verified_check=lambda now_ns: False,
+    )
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert submitted == []
+    assert strategy.diagnostics.count(continuous_strategy_module._DIAG_FEE_UNVERIFIED) == 1
+
+
+def test_a_verified_check_never_refuses_an_otherwise_eligible_entry(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """A non-None check that returns `True` must be behaviourally inert --
+    proves the gate is a pure veto, never a second, redundant admission
+    requirement."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        fee_verified_check=lambda now_ns: True,
+    )
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert strategy.diagnostics.count(continuous_strategy_module._DIAG_FEE_UNVERIFIED) == 0
+    assert strategy.takes == 1, "a verified check must never block an otherwise-eligible take"
+
+
+def test_fee_staleness_is_computed_on_the_strategy_clock_not_market_data_time(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """AM-1 (security, binding): the staleness comparison MUST use the
+    strategy's own `self.clock.timestamp_ns()`, never `snapshot.ts_event` --
+    market-data time can lag wall time under feed backlog, which would
+    understate elapsed time and fail OPEN. Feeds a snapshot whose `ts_event`
+    is stale while the strategy clock has advanced well past it, and proves
+    the check received the CLOCK's time, not the snapshot's."""
+    received_now_ns: list[int] = []
+
+    def _check(now_ns: int) -> bool:
+        received_now_ns.append(now_ns)
+        return False
+
+    clock = TestClock()
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        clock=clock,
+        fee_verified_check=_check,
+    )
+    stale_ts_event = WINDOW_OPEN_NS
+    advanced_now_ns = WINDOW_OPEN_NS + 999_000_000_000
+    clock.set_time(advanced_now_ns)
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=stale_ts_event))
+
+    assert received_now_ns == [advanced_now_ns], (
+        "the staleness check must be called with the strategy's own clock time, "
+        "never snapshot.ts_event"
+    )
+    assert strategy.diagnostics.count(continuous_strategy_module._DIAG_FEE_UNVERIFIED) == 1
 
 
 def test_offer_tape_records_eligible_nonfills_and_is_bounded(

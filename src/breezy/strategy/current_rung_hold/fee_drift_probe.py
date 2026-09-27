@@ -103,6 +103,32 @@ found -- but emits a SEPARATE ``fee_drift_probe_halt_set_failed`` CRITICAL
 alert, distinct from the mismatch alert, so "halted" and "found drift but
 could not halt" never look the same in the alert stream. See
 ``probe_once``'s own docstring.
+
+**EDGE-1 (2026-09-27): the wire read was NEVER once successful.**
+:func:`fetch_wire_fee_coefficient` unwraps the ``"market"`` envelope
+``GET /v1/market/slug/{slug}`` ALWAYS wraps the market object under --
+the prior code read ``feeCoefficient`` directly off the top-level payload,
+which never has that key, so every fire since deployment raised
+``WireFeeCoefficientError`` and returned ``"UNKNOWN"``. There is NO
+fallback to a flat top-level read: an absent/malformed ``"market"``
+envelope is UNKNOWN, full stop -- a shape this probe has never actually
+seen surfaces as "I don't know," never a guess.
+
+**EDGE-1: sustained UNKNOWN now has a fail-closed consequence, entry-only.**
+A repeated UNKNOWN (or the absence of any ``AGREE`` since process boot)
+previously had no downstream effect at all -- the family kept arming NEW
+entries indefinitely with its own fee schedule unverified. ``FeeDriftProbeActor``
+now tracks ``_last_agree_at_ns`` (an ordinary, in-memory attribute -- no
+durable key, no store write, no clear callable) and exposes
+:meth:`FeeDriftProbeActor.is_fee_verified`, an in-memory, time-based
+staleness check: verified iff the last ``AGREE`` was within
+:data:`_FEE_VERIFIED_STALENESS_NS` (~4h, 2x the default probe cadence).
+``app/trade.py`` wires this, through a late-bound holder, into
+``ContinuousRungHoldStrategy``'s entry path (``_hunt_tick``) ONLY --
+exits are structurally untouched. Restart cannot bypass this (a fresh
+boot starts unverified, unconditionally); a stopped timer cannot either
+(the check is evaluated at entry-submit time against elapsed wall time,
+not driven by the timer firing).
 """
 
 from __future__ import annotations
@@ -139,8 +165,27 @@ __all__ = [
 #: -- read verbatim, never renamed.
 FEE_COEFFICIENT_WIRE_KEY: Final[str] = "feeCoefficient"
 
+#: EDGE-1 root cause fix: ``GET /v1/market/slug/{slug}`` ALWAYS wraps the
+#: market object under this key (three independent sources: the venue SDK's
+#: own ``GetMarketResponse`` TypedDict, two real captured payloads, and this
+#: repo's own ``adapters/polymarket_us/parsing.py`` parser). There is no
+#: fallback to a flat top-level read -- an absent/malformed envelope is
+#: ``UNKNOWN``, never a guess.
+_MARKET_ENVELOPE_KEY: Final[str] = "market"
+
 #: No coarser than 2 hours (plan §6 item 3 / §7 step 3a).
 DEFAULT_FEE_DRIFT_PROBE_INTERVAL_SECONDS: Final[int] = 2 * 60 * 60
+
+#: EDGE-1 (r2/B2'): the in-memory "fee unverified" staleness bound -- 2x the
+#: default 2h probe cadence, absorbing one missed fire without a truly-stale
+#: cycle going unnoticed. Never durable, never a fire-counter: measured
+#: against an externally-supplied ``now_ns`` (the STRATEGY's own clock, per
+#: AM-1 -- this module never reads its own clock for this comparison).
+_FEE_VERIFIED_STALENESS_NS: Final[int] = 4 * 60 * 60 * 1_000_000_000
+
+#: 24h reminder cadence while persistently stale, mirroring
+#: ``_MISMATCH_SUPPRESSION_WINDOW_NS``'s own re-arming idiom.
+_FEE_UNVERIFIED_PERSISTING_WINDOW_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
 
 #: Dedupe/re-arm window for a repeated DISAGREE against the SAME wire value
 #: (``RULING_fee_drift_probe_target_2026-09-25.md``). Measured on this
@@ -176,17 +221,28 @@ async def fetch_wire_fee_coefficient(
     """Read `slug`'s currently-advertised fee coefficient, read-only.
 
     Calls ONLY `client.get_public` -- see the module docstring's
-    "unauthenticated gateway_base_url path" note. Raises
-    :class:`WireFeeCoefficientError` on anything other than a present,
-    numeric `feeCoefficient`; an absent or malformed field is UNKNOWN, never
-    silently treated as "agrees".
+    "unauthenticated gateway_base_url path" note. `GET /v1/market/slug/
+    {slug}` ALWAYS wraps the market object under a `"market"` key
+    (EDGE-1 root cause fix) -- this unwraps it and raises
+    :class:`WireFeeCoefficientError` immediately if `"market"` is absent or
+    not a mapping. There is NO fallback to a flat top-level read: an
+    envelope shape this probe has never actually seen surfaces as UNKNOWN,
+    never a guess. Beneath the envelope, anything other than a present,
+    numeric `feeCoefficient` is likewise UNKNOWN, never silently treated as
+    "agrees".
     """
     path = MARKET_BY_SLUG_PATH.format(slug=slug)
     payload = await client.get_public(path, quota_key=quota_key)
-    raw = payload.get(FEE_COEFFICIENT_WIRE_KEY)
+    market = payload.get(_MARKET_ENVELOPE_KEY)
+    if not isinstance(market, Mapping):
+        raise WireFeeCoefficientError(
+            f"{path} returned no {_MARKET_ENVELOPE_KEY!r} envelope for slug {slug!r}"
+        )
+    raw = market.get(FEE_COEFFICIENT_WIRE_KEY)
     if raw is None:
         raise WireFeeCoefficientError(
-            f"{path} returned no {FEE_COEFFICIENT_WIRE_KEY!r} for slug {slug!r}"
+            f"{path} returned no {FEE_COEFFICIENT_WIRE_KEY!r} under "
+            f"{_MARKET_ENVELOPE_KEY!r} for slug {slug!r}"
         )
     try:
         return Decimal(str(raw))
@@ -231,6 +287,19 @@ class FeeDriftProbeActor(Actor):
         #: first DISAGREE this process has seen.
         self._last_mismatch_wire_fee: Decimal | None = None
         self._last_mismatch_alert_ts_ns: int | None = None
+
+        #: EDGE-1 (r2/B2'): in-memory, time-based "fee unverified" staleness
+        #: state. ``None`` at every process boot (restart cannot inherit a
+        #: prior "last known good" -- security #1) and set ONLY on AGREE
+        #: (never DISAGREE, never UNKNOWN). Not a store key: an ordinary
+        #: Python attribute, gone on process exit.
+        self._last_agree_at_ns: int | None = None
+        #: Dedupe state for the two staleness alerts, mirroring
+        #: ``_last_mismatch_*`` above but independent of it: ``True`` once
+        #: the first-crossing alert has fired and not yet cleared by a
+        #: later AGREE.
+        self._fee_unverified_alerted = False
+        self._fee_unverified_last_alert_ns: int | None = None
 
     # -- observability --------------------------------------------------
 
@@ -350,6 +419,10 @@ class FeeDriftProbeActor(Actor):
         except Exception as exc:  # noqa: BLE001 - any read failure is UNKNOWN, never "agrees"
             self._alert_unknown(exc)
             self.counters["unknown"] += 1
+            logger.info(
+                "event=fee_drift_probe outcome=UNKNOWN wire=none registered=%s",
+                self._documented,
+            )
             return "UNKNOWN"
         if wire_fee == self._documented:
             # A flap is news: an AGREE means the drift this dedupe state was
@@ -358,7 +431,14 @@ class FeeDriftProbeActor(Actor):
             # immediately rather than being swallowed by the old window.
             self._last_mismatch_wire_fee = None
             self._last_mismatch_alert_ts_ns = None
+            # EDGE-1: only AGREE ever refreshes the staleness clock.
+            self._last_agree_at_ns = self.clock.timestamp_ns()
             self.counters["agree"] += 1
+            logger.info(
+                "event=fee_drift_probe outcome=AGREE wire=%s registered=%s",
+                wire_fee,
+                self._documented,
+            )
             return "AGREE"
         self._dedupe_and_alert_mismatch(wire_fee)
         try:
@@ -367,6 +447,11 @@ class FeeDriftProbeActor(Actor):
             self._alert_halt_set_failed(exc, wire_fee)
             self.counters["halt_set_failed"] += 1
         self.counters["disagree"] += 1
+        logger.info(
+            "event=fee_drift_probe outcome=DISAGREE wire=%s registered=%s",
+            wire_fee,
+            self._documented,
+        )
         return "DISAGREE"
 
     def _alert_unknown(self, exc: BaseException) -> None:
@@ -452,5 +537,79 @@ class FeeDriftProbeActor(Actor):
                 event="fee_drift_probe_halt_set_failed",
                 site=self._site,
                 detail=f"halt-set failed after DISAGREE (wire={wire_fee}): {type(exc).__name__}",
+            ),
+        )
+
+    # -- EDGE-1 (r2/B2'): the in-memory "fee unverified" staleness veto -----
+
+    def is_fee_verified(self, now_ns: int) -> bool:
+        """``True`` iff the last ``AGREE`` was within the staleness bound.
+
+        ``now_ns`` is supplied by the CALLER -- AM-1 (security, binding):
+        the strategy's entry gate must pass its OWN ``self.clock.
+        timestamp_ns()``, never a market-data-derived time
+        (``snapshot.ts_event`` can lag wall time under feed backlog, which
+        would understate elapsed time and extend the "verified" window past
+        its real staleness -- a fail-open bug). This method never reads its
+        own clock for the comparison, so it reasons about whatever instant
+        the caller hands it, identically in a test or a live process.
+
+        Fires the two staleness alerts on the transition into "stale" and on
+        the :data:`_FEE_UNVERIFIED_PERSISTING_WINDOW_NS` reminder cadence
+        while it remains stale; clearing (a later ``AGREE``) is logged INFO
+        only, matching this module's existing AGREE-is-silent asymmetry.
+        Never raises.
+        """
+        verified = (
+            self._last_agree_at_ns is not None
+            and now_ns - self._last_agree_at_ns <= _FEE_VERIFIED_STALENESS_NS
+        )
+        if verified:
+            if self._fee_unverified_alerted:
+                self._fee_unverified_alerted = False
+                self._fee_unverified_last_alert_ns = None
+                logger.info(
+                    "%s: fee-verified state cleared (AGREE within the staleness bound)",
+                    self._site,
+                )
+            return True
+        if not self._fee_unverified_alerted:
+            self._fee_unverified_alerted = True
+            self._fee_unverified_last_alert_ns = now_ns
+            self._alert_fee_unverified_stale(now_ns)
+        else:
+            assert self._fee_unverified_last_alert_ns is not None  # set alongside the flag, above
+            elapsed_ns = now_ns - self._fee_unverified_last_alert_ns
+            if elapsed_ns >= _FEE_UNVERIFIED_PERSISTING_WINDOW_NS:
+                self._fee_unverified_last_alert_ns = now_ns
+                self._alert_fee_unverified_stale_persisting(elapsed_ns)
+        return False
+
+    def _alert_fee_unverified_stale(self, now_ns: int) -> None:
+        elapsed_s = (
+            "never"
+            if self._last_agree_at_ns is None
+            else str((now_ns - self._last_agree_at_ns) // 1_000_000_000)
+        )
+        emit_alert(
+            self._alert_sink,
+            AlertPayload(
+                severity="CRITICAL",
+                event="fee_drift_probe_fee_unverified_stale",
+                site=self._site,
+                detail=elapsed_s,
+            ),
+        )
+
+    def _alert_fee_unverified_stale_persisting(self, elapsed_ns: int) -> None:
+        """A 24h reminder while still stale, mirroring
+        ``_alert_mismatch_persisting``'s own re-arming idiom."""
+        emit_alert(
+            self._alert_sink,
+            AlertPayload(
+                severity="CRITICAL",
+                event="fee_drift_probe_fee_unverified_stale_persisting",
+                site=self._site,
+                detail=f"persisting_ns={elapsed_ns}",
             ),
         )

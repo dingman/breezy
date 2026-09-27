@@ -267,6 +267,34 @@ def _representative_fee_drift_slug(strategies: Sequence[Strategy]) -> str | None
     return None
 
 
+class _FeeVerifiedHolder:
+    """EDGE-1 (AM-4): a single, late-bound mutable slot over
+    ``FeeDriftProbeActor.is_fee_verified``.
+
+    ``app/trade.py`` composes the strategy (which needs the read-side
+    callable AT CONSTRUCTION) BEFORE it constructs ``FeeDriftProbeActor``
+    (the existing ``~532``/``~552`` ordering) -- so the callable the
+    strategy holds must be indirection over a slot filled in later, never
+    the actor object itself passed too early.
+
+    Starts unbound: :meth:`is_fee_verified` then reads as UNVERIFIED
+    (``False``) for any ``now_ns``, regardless of the value -- this is the
+    correct behaviour both before ``bind`` runs and permanently, when
+    :func:`_build_fee_drift_probe` returns ``None`` (no instrument resolved
+    for any composed station, AM-3): nothing is tradable in that case
+    either way, so a permanent veto is safe and intended, never a bug.
+    """
+
+    def __init__(self) -> None:
+        self._check: Callable[[int], bool] | None = None
+
+    def bind(self, check: Callable[[int], bool]) -> None:
+        self._check = check
+
+    def is_fee_verified(self, now_ns: int) -> bool:
+        return self._check is not None and self._check(now_ns)
+
+
 def _build_fee_drift_probe(
     *,
     strategies: Sequence[Strategy],
@@ -528,6 +556,12 @@ def run(
                 # ever reached it). One load, one object, passed to both --
                 # never two independent reads of the same file.
                 exit_manifest = manifest
+                # EDGE-1 (AM-4): created BEFORE strategy composition -- the
+                # composed strategies need the read-side callable at
+                # construction, but the probe (whose `is_fee_verified` the
+                # holder will forward to) is not built until after them, a
+                # few lines below. Binding happens once the probe exists.
+                fee_verified_holder = _FeeVerifiedHolder()
                 strategies.extend(
                     build_continuous_rung_hold_strategies(
                         catalog_root=catalog_root,
@@ -544,6 +578,11 @@ def run(
                         # See the v2 branch above: the theta every station
                         # prices against comes from THIS family's manifest.
                         required_fee_coefficient=manifest.taker_fee_coefficient,
+                        # EDGE-1: the live composition root is the ONE
+                        # caller that ever passes a non-None check (paper
+                        # replay's ContinuousRungHoldBacktestStrategy never
+                        # exposes this parameter at all).
+                        fee_verified_check=fee_verified_holder.is_fee_verified,
                     )
                 )
                 # AUD-12b: unattended fee-schedule drift probe, this
@@ -559,6 +598,13 @@ def run(
                 )
                 if built_probe is not None:
                     fee_drift_actor, fee_drift_resolve_client = built_probe
+                    # EDGE-1 (AM-4): bound only once the probe exists. When
+                    # `built_probe` is `None` (AM-3: no instrument resolved
+                    # for any composed station), the holder stays unbound
+                    # for the rest of this process's life, which reads as
+                    # permanently unverified -- safe, since nothing is
+                    # tradable either way.
+                    fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
             elif manifest.composition_kind == "forecast_ladder":
                 # WP-14 has not landed: the strategy this composition_kind
                 # names does not exist yet. Refuse to boot rather than
