@@ -290,6 +290,12 @@ from breezy.runtime.ingest_deferral_streak import (
     step as _step_deferral_streak,
 )
 from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
+from breezy.runtime.quote_tape_exit_codes import (
+    EXIT_CONVERSION_FAILED,
+    EXIT_DEFERRAL_STALLED,
+    EXIT_USAGE,
+    PROGRAM,
+)
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
 from breezy.runtime.quote_tape_salvage import (
     ExtendWriteMismatch,
@@ -302,21 +308,13 @@ from breezy.runtime.quote_tape_salvage import (
 
 logger = logging.getLogger(__name__)
 
-PROGRAM = "breezy-quote-tape-ingest"
-
+#: `PROGRAM`, `EXIT_USAGE`, `EXIT_CONVERSION_FAILED` and `EXIT_DEFERRAL_STALLED`
+#: live in `quote_tape_exit_codes` (a stdlib-only leaf module) and are
+#: imported above -- re-exported here under the same names so nothing that
+#: already reads them off this module breaks. See that module's docstring
+#: for why: `breezy.runtime.study_failure_notifier` needs them without
+#: paying for this module's `nautilus_trader`/`pyarrow` import chain.
 EXIT_OK = 0
-EXIT_USAGE = 2
-#: At least one instance's outcome was "failed" (a hard per-file conversion
-#: failure -- see the module docstring's "Per-file conversion" section).
-#: Distinct from EXIT_OK's "ran, even if every instance was skipped": a skip
-#: is an ordinary, expected outcome, never a failure.
-EXIT_CONVERSION_FAILED = 3
-
-#: EDGE-6 6f: pending deferred work has crossed the stall threshold in
-#: ``breezy.runtime.ingest_deferral_streak`` (>= 4 consecutive runs AND
-#: >= 60 minutes). Lower precedence than :data:`EXIT_CONVERSION_FAILED` --
-#: see :func:`run` and the module docstring's exit-precedence note.
-EXIT_DEFERRAL_STALLED = 4
 
 #: A file touched more recently than this may be mid-write. Configurable via
 #: ``--live-grace-minutes`` because the right value depends on how bursty a
