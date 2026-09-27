@@ -622,6 +622,20 @@ pattern) alongside every unit that references it, `daemon-reload`. There is
 no `[Install]` section to enable -- this unit is invoked only via a sibling's
 `OnFailure=` line.
 
+### `breezy-quote-tape-ingest` preflight memo (EDGE-6b, 2026-09-27)
+
+The ingest preflight writes one memo per recorder instance:
+`<catalog>/live/<instance>/.preflight-memo-v1.json`. It caches only closed
+feather-file reports, keyed by `(st_dev, st_ino, st_size, st_mtime_ns)` from
+the same pre-scan stat used by the report. Files still considered open by the
+ingest liveness rules are always scanned cold and are never retained in the
+memo, including when they were cached by an earlier run.
+
+The memo is an optimization only. If it is missing, corrupt, or has an unknown
+version, ingest logs one warning, scans the instance cold, and rewrites the
+memo atomically. Deleting the file is safe; it only makes the next run pay the
+cold preflight cost again.
+
 ---
 
 ## AUD-15 alert env file (`~/.config/breezy/alerts.env`) (amendment, 2026-09-22)

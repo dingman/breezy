@@ -1727,15 +1727,23 @@ class TestAMissingPreflightReportIsNeverSilent:
         stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
         os.utime(quote_path, (stamp, stamp))
 
-        real_scan_instance = ingest_cli_module.scan_instance
+        real_scan_instance = ingest_cli_module.scan_instance_memoized
 
-        def _drop_quote_report(catalog_root: Path, instance_id: str, subdirectory: str) -> Any:
-            report = real_scan_instance(catalog_root, instance_id, subdirectory)
+        def _drop_quote_report(
+            catalog_root: Path,
+            instance_id: str,
+            subdirectory: str,
+            *,
+            open_files: frozenset[Path],
+        ) -> Any:
+            report = real_scan_instance(
+                catalog_root, instance_id, subdirectory, open_files=open_files
+            )
             return dataclasses.replace(
                 report, files=tuple(f for f in report.files if f.path != quote_path)
             )
 
-        monkeypatch.setattr(ingest_cli_module, "scan_instance", _drop_quote_report)
+        monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", _drop_quote_report)
 
         with caplog.at_level(logging.WARNING, logger="breezy.runtime.quote_tape_ingest_cli"):
             results = run_ingest(
