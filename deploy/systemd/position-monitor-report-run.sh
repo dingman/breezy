@@ -113,11 +113,11 @@ if [ -d "$FAMILIES_DIR" ]; then
   done
 fi
 
-# Host-wide mutual exclusion, same convention as k1-daily-run.sh /
-# mb-daily-run.sh / offer-gate-daily-run.sh (SP-1.rev4.md). Skip-not-kill:
-# CONTENTION exits 0 so Persistent=true does not retrigger and no sibling
-# OnFailure= fires on a healthy skip; LOCK-INFRASTRUCTURE failure exits 75
-# (EX_TEMPFAIL) so a persistently broken lock dir is loud in journalctl
+# Host-wide mutual exclusion, same lock path as asos-refresh-run.sh and the
+# surviving shared-flock wrappers. Skip-not-kill: CONTENTION exits 0 so
+# Persistent=true does not retrigger and no sibling OnFailure= fires on a
+# healthy skip; LOCK-INFRASTRUCTURE failure exits 75 (EX_TEMPFAIL) so a
+# persistently broken lock dir is loud in journalctl.
 # instead of silently skipping forever. `Conflicts=` is deliberately NOT
 # used -- it would SIGTERM the RUNNING job (the 2026-09-11 shape).
 #

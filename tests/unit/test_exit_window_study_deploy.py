@@ -355,10 +355,10 @@ def test_lock_contention_skips_without_invoking_python(tmp_path: Path) -> None:
         os.close(lock_fd)
 
 
-def test_wrapper_names_the_shared_studies_lock_path_identically_to_k1() -> None:
-    k1_wrapper = _SYSTEMD_DIR / "k1-daily-run.sh"
+def test_wrapper_names_the_shared_studies_lock_path_identically_to_asos() -> None:
+    asos_wrapper = _SYSTEMD_DIR / "asos-refresh-run.sh"
     mine = _WRAPPER.read_text()
-    theirs = k1_wrapper.read_text()
+    theirs = asos_wrapper.read_text()
     assert 'LOCK="$LOCK_DIR/breezy-studies.lock"' in mine
     assert 'LOCK="$LOCK_DIR/breezy-studies.lock"' in theirs
 

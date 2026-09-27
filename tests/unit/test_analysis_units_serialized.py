@@ -1,15 +1,11 @@
 """SP-1 (2026-09-12): serialization for the nightly analysis studies.
 
-`breezy-k1-daily.service` and `breezy-mb-daily.service` are two independent
-`systemd --user` timers with no shared lock, so they can (and, per the
-2026-09-11 incident, did) run concurrently -- each already capped at its own
-`MemoryHigh=12G`/`MemoryMax=16G` (`tests/unit/test_analysis_units_memory_capped.py`),
-but nothing stops two 12-16G studies stacking at once, nor stops either from
-starting beside the live trading node (pid 895135) during its LST-derived
-decision window. This module is I2's whole test suite: the protected window
-derivation, the shared `breezy-studies.slice` aggregate ceiling, the
-host-wide `flock` mutual exclusion in every heavy wrapper, and the
-ingest-unit deprioritisation -- see `SP-1.rev4.md` for the full design.
+`breezy-k1-daily.service` and `breezy-mb-daily.service` were independent
+`systemd --user` timers with no shared lock, so they could (and, per the
+2026-09-11 incident, did) run concurrently. EDGE-6c-R2 retires the final
+scheduled K1 heavy unit; this module now keeps the serialization guards alive
+by DISCOVERING any future `MemoryHigh >= 12G` unit instead of parametrizing
+over a stale literal list that could silently become empty.
 
 L-27 (A-19): the real-state-directory leak guard. `~/.local/share/breezy/`
 is written continuously by the live node, recorder and supervisor, so a
@@ -352,39 +348,22 @@ _WINDOW_END_CONST: Final[str] = "_WINDOW_END_HOUR_LST"
 _STUDIES_SLICE: Final[Path] = _DEPLOY_DIR / "breezy-studies.slice"
 _LOCK_FILENAME: Final[str] = "breezy-studies.lock"
 
-#: Literal expected sets (L-24 anti-vacuity): every test below that iterates
-#: one of these asserts it equals the hardcoded expectation FIRST, so a
-#: missing file fails loudly on set membership rather than silently
-#: iterating over zero items.
-#: AUD-15: `breezy-mb-daily`/`breezy-offer-gate-daily` RETIRED 2026-09-22
-#: (`docs/evidence/RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md`
-#: RULING 1). `breezy-k1-daily` is now the only unit in the "heavy study"
-#: band; the re-homed `breezy-asos-refresh` is a LIGHT unit (§6 of the AUD-15
-#: plan) and deliberately does NOT join these sets -- it takes the shared
-#: flock (tested separately, `tests/unit/test_asos_refresh_wrapper_
-#: contention.py`) but is not a 12-16G heavy study.
-_HEAVY_TIMERS: Final[frozenset[str]] = frozenset(
+#: EDGE-6c-R2: scheduled K1 is RETIRED by
+#: `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2/C3. The
+#: declared heavy band is now empty, but the tests below discover any
+#: `MemoryHigh >= 12G` service and include synthetic controls so an empty
+#: parametrization cannot pass vacuously (L-24).
+_HEAVY_TIMERS: Final[frozenset[str]] = frozenset()
+_HEAVY_SERVICES: Final[frozenset[str]] = frozenset()
+_WRAPPERS: Final[frozenset[str]] = frozenset()
+_LOCK_PREAMBLE_WRAPPERS: Final[frozenset[str]] = frozenset(
     {
-        "breezy-k1-daily.timer",
+        "asos-refresh-run.sh",
+        "decision-funnel-digest-run.sh",
+        "portfolio-roi-run.sh",
+        "station-candidate-register-run.sh",
     }
 )
-_HEAVY_SERVICES: Final[frozenset[str]] = frozenset(
-    {
-        "breezy-k1-daily.service",
-    }
-)
-_WRAPPERS: Final[frozenset[str]] = frozenset(
-    {
-        "k1-daily-run.sh",
-    }
-)
-
-_WRAPPER_OUTPUT_ENV_VAR: Final[dict[str, str | None]] = {
-    "k1-daily-run.sh": "BREEZY_K1_OUTPUT_DIR",
-}
-_WRAPPER_LOG_FILENAME: Final[dict[str, str]] = {
-    "k1-daily-run.sh": "k1_daily.log",
-}
 
 _SIZE_MULTIPLIERS: Final[dict[str, int]] = {
     "": 1,
@@ -412,6 +391,32 @@ def _directive_value(unit_text: str, directive: str) -> str | None:
         if stripped.startswith(prefix):
             return stripped[len(prefix) :]
     return None
+
+
+def _discover_heavy_service_paths(search_dir: Path) -> list[Path]:
+    heavy: list[Path] = []
+    for service_path in sorted(search_dir.glob("*.service")):
+        memory_high = _directive_value(service_path.read_text(), "MemoryHigh")
+        if memory_high is None:
+            continue
+        if _parse_systemd_size(memory_high) >= _parse_systemd_size("12G"):
+            heavy.append(service_path)
+    return heavy
+
+
+def _discover_heavy_service_names(search_dir: Path) -> frozenset[str]:
+    return frozenset(path.name for path in _discover_heavy_service_paths(search_dir))
+
+
+def _assert_timer_text_fires_outside_protected_window(timer_name: str, timer_text: str) -> None:
+    window = _protected_window()
+    ticks = _on_calendar_hhmm(timer_text)
+    assert ticks, f"{timer_name} has no parseable OnCalendar= line"
+    for hour, minute in ticks:
+        assert not window.contains(hour, minute), (
+            f"{timer_name} fires at {hour:02d}:{minute:02d}Z, inside the "
+            f"protected window {window.as_hhmm()}"
+        )
 
 
 def _on_calendar_hhmm(timer_text: str) -> list[tuple[int, int]]:
@@ -556,21 +561,15 @@ def test_the_protected_window_is_derived_from_the_declared_std_offsets() -> None
     assert constants.get("AFTERNOON_WINDOW_END") == (17, 0)
 
 
-@pytest.mark.parametrize("timer_name", sorted(_HEAVY_TIMERS))
-def test_no_heavy_unit_timer_fires_inside_the_lst_derived_protected_window(timer_name: str) -> None:
-    assert _HEAVY_TIMERS == {
-        "breezy-k1-daily.timer",
-    }
-    timer_path = _DEPLOY_DIR / timer_name
-    assert timer_path.is_file(), f"{timer_name} does not exist"
-    window = _protected_window()
-    ticks = _on_calendar_hhmm(timer_path.read_text())
-    assert ticks, f"{timer_name} has no parseable OnCalendar= line"
-    for hour, minute in ticks:
-        assert not window.contains(hour, minute), (
-            f"{timer_name} fires at {hour:02d}:{minute:02d}Z, inside the "
-            f"protected window {window.as_hhmm()}"
-        )
+def test_no_declared_heavy_unit_timer_fires_inside_the_lst_derived_protected_window() -> None:
+    # EDGE-6c-R2 K1 retirement:
+    # `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2.
+    assert _HEAVY_TIMERS == frozenset()
+
+    synthetic_timer = "[Timer]\nOnCalendar=*-*-* 01:35:00 UTC\n"
+    _assert_timer_text_fires_outside_protected_window(
+        "synthetic-heavy.timer", synthetic_timer
+    )
 
 
 def test_the_protected_window_predicate_rejects_a_synthetic_in_window_tick() -> None:
@@ -610,14 +609,32 @@ def test_the_v3_strategy_imports_the_v1_decision_window_and_redeclares_neither()
                 )
 
 
-@pytest.mark.parametrize("service_name", sorted(_HEAVY_SERVICES))
-def test_every_heavy_study_unit_declares_the_shared_studies_slice(service_name: str) -> None:
-    assert _HEAVY_SERVICES == {
-        "breezy-k1-daily.service",
-    }
-    service_path = _DEPLOY_DIR / service_name
-    assert service_path.is_file(), f"{service_name} does not exist"
-    assert "Slice=breezy-studies.slice" in service_path.read_text().splitlines()
+def test_heavy_study_band_is_discovered_from_memory_high_with_negative_control(
+    tmp_path: Path,
+) -> None:
+    # EDGE-6c-R2 K1 retirement:
+    # `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2.
+    assert _HEAVY_SERVICES == frozenset()
+    assert _discover_heavy_service_names(_DEPLOY_DIR) == _HEAVY_SERVICES
+
+    synthetic = tmp_path / "synthetic-heavy.service"
+    synthetic.write_text("[Service]\nMemoryHigh=12G\nMemoryMax=16G\n")
+    assert _discover_heavy_service_names(tmp_path) == frozenset({synthetic.name})
+
+
+def test_every_discovered_heavy_study_unit_declares_the_shared_studies_slice(
+    tmp_path: Path,
+) -> None:
+    # EDGE-6c-R2 C2: keep the slice assertion executable even when the real
+    # heavy band is empty after K1 retirement.
+    synthetic = tmp_path / "synthetic-heavy.service"
+    synthetic.write_text(
+        "[Service]\nMemoryHigh=12G\nMemoryMax=16G\nSlice=breezy-studies.slice\n"
+    )
+    service_paths = _discover_heavy_service_paths(_DEPLOY_DIR) + [synthetic]
+    assert service_paths
+    for service_path in service_paths:
+        assert "Slice=breezy-studies.slice" in service_path.read_text().splitlines()
 
 
 def test_the_studies_slice_declares_its_own_memory_ceiling() -> None:
@@ -652,7 +669,11 @@ def test_the_ingest_unit_comment_matches_the_cli_exit_contract() -> None:
 
 _A20_SCOPE: Final[frozenset[str]] = frozenset(
     {
-        "deploy/systemd/breezy-k1-daily.timer",
+        # EDGE-6c-R2: breezy-k1-daily.timer is RETIRED
+        # (`docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2/C3).
+        # Its retimed "01:35" tick is now retained only as a historical README
+        # claim, so the stale-tick guard stays non-vacuous without the deleted
+        # timer file.
         # AUD-15: breezy-offer-gate-daily.timer RETIRED 2026-09-22 (ruling
         # `RULING_study_units_order_ceiling_exit_prereq_2026-09-21.md`
         # RULING 1) -- its retimed "02:05" tick is preserved as a historical
@@ -707,95 +728,30 @@ def test_no_retimed_unit_or_readme_line_still_asserts_the_old_tick() -> None:
 # I2c -- wrapper lock serialization
 ##############################################################################
 
-
-def _spawn_wrapper(
-    wrapper_filename: str,
-    tmp_path: Path,
-    *,
-    provide_output_arg: bool = True,
-    xdg_runtime_dir: Path | None = None,
-) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
-    """Spawn one wrapper under a fully isolated, `tmp_path`-scoped env.
-    Returns `(result, out_dir, log_path)`."""
-    token = new_run_token()
-    out_dir = tmp_path / f"{token}-out"
-    env_var = _WRAPPER_OUTPUT_ENV_VAR[wrapper_filename]
-    output_dirs: dict[str, Path] = {(env_var or "BREEZY_OFFER_GATE_OUTPUT_DIR"): out_dir}
-    env = build_wrapper_env(
-        tmp_path, token, output_dirs=output_dirs, xdg_runtime_dir=xdg_runtime_dir
-    )
-    argv = ["bash", str(_DEPLOY_DIR / wrapper_filename)]
-    if env_var is None and provide_output_arg:
-        argv.append(str(out_dir))
-    result = subprocess.run(
-        argv, env=env, capture_output=True, text=True, timeout=30, check=False
-    )
-    log_path = out_dir / _WRAPPER_LOG_FILENAME[wrapper_filename]
-    return result, out_dir, log_path
+# EDGE-6c-R2 (line :741 pin): `test_every_heavy_study_wrapper_takes_the_
+# studies_flock_and_skips_when_held` and `test_the_wrapper_skips_when_the_
+# lock_directory_is_missing_or_unwritable` are RETIRED, not replaced by a
+# synthetic stand-in -- `_WRAPPERS` (the declared heavy-wrapper set) is now
+# permanently empty per
+# `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2/C3, so
+# parametrizing over it would silently collect zero cases (L-24), and a
+# same-named synthetic test that only re-reads a string it just wrote would
+# be non-vacuous in form but assert nothing about real wrapper behaviour.
+# The underlying contract -- a wrapper skips cleanly when the shared studies
+# flock is held, and refuses loudly when the lock directory is missing or
+# unwritable -- is already exercised end-to-end, by spawning the REAL
+# script, for every surviving flock-taking wrapper:
+# `tests/unit/test_exit_window_study_deploy.py::
+# test_lock_contention_skips_without_invoking_python`,
+# `tests/unit/test_position_monitor_report_deploy.py::
+# test_lock_contention_skips_without_invoking_python`, and
+# `tests/unit/test_asos_refresh_wrapper_contention.py::
+# test_the_staleness_check_still_runs_when_the_studies_flock_is_held`.
+# `_spawn_wrapper` (the K1-only helper these two tests used) is removed with
+# them.
 
 
-@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
-def test_every_heavy_study_wrapper_takes_the_studies_flock_and_skips_when_held(
-    wrapper_filename: str, tmp_path: Path
-) -> None:
-    assert _WRAPPERS == {"k1-daily-run.sh"}
-    token = new_run_token()
-    xdg_runtime_dir = tmp_path / f"{token}-xdg-runtime"
-    xdg_runtime_dir.mkdir(parents=True)
-    lock_path = xdg_runtime_dir / _LOCK_FILENAME
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        result, out_dir, log_path = _spawn_wrapper(
-            wrapper_filename, tmp_path, xdg_runtime_dir=xdg_runtime_dir
-        )
-        assert result.returncode == 0
-        assert log_path.is_file()
-        expected = "SKIPPED -- another study holds the studies lock"
-        assert expected in log_path.read_text()
-        assert expected in result.stdout
-        artefacts = [p for p in out_dir.iterdir() if p != log_path]
-        assert artefacts == [], f"the study ran despite the held lock: {artefacts}"
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission refusals are bypassed as root")
-@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
-def test_the_wrapper_skips_when_the_lock_directory_is_missing_or_unwritable(
-    wrapper_filename: str, tmp_path: Path
-) -> None:
-    # Case 1: a FILE occupies the path `mkdir -p "$LOCK_DIR"` must create --
-    # "non-creatable".
-    blocked_runtime_dir = tmp_path / f"{new_run_token()}-blocked"
-    blocked_runtime_dir.write_bytes(b"")
-    result, _out_dir, log_path = _spawn_wrapper(
-        wrapper_filename, tmp_path, xdg_runtime_dir=blocked_runtime_dir
-    )
-    assert result.returncode == 75
-    combined = result.stdout + (log_path.read_text() if log_path.is_file() else "")
-    assert "SKIPPED-INFRA" in combined
-    assert "SKIPPED -- another study holds the studies lock" not in combined
-
-    # Case 2: LOCK_DIR exists but is unwritable (mode 0500) -- `mkdir -p`
-    # succeeds trivially; opening a NEW file inside it fails.
-    restricted_runtime_dir = tmp_path / f"{new_run_token()}-restricted"
-    restricted_runtime_dir.mkdir(parents=True)
-    restricted_runtime_dir.chmod(0o500)
-    try:
-        result2, _out_dir2, log_path2 = _spawn_wrapper(
-            wrapper_filename, tmp_path, xdg_runtime_dir=restricted_runtime_dir
-        )
-        assert result2.returncode == 75
-        combined2 = result2.stdout + (log_path2.read_text() if log_path2.is_file() else "")
-        assert "SKIPPED-INFRA" in combined2
-        assert "SKIPPED -- another study holds the studies lock" not in combined2
-    finally:
-        restricted_runtime_dir.chmod(0o700)
-
-
-@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+@pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_PREAMBLE_WRAPPERS))
 def test_every_study_wrapper_is_executable(wrapper_filename: str) -> None:
     path = _DEPLOY_DIR / wrapper_filename
     assert path.is_file(), f"{wrapper_filename} does not exist"
@@ -832,7 +788,7 @@ def test_every_flock_taking_wrapper_names_the_same_lock_path() -> None:
 _EXEC_LOCK_LINE_RE: Final[re.Pattern[str]] = re.compile(r'^exec 9>>"\$LOCK"\s')
 
 
-@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+@pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_PREAMBLE_WRAPPERS))
 def test_the_exec_line_carries_no_stderr_redirect(wrapper_filename: str) -> None:
     """R4-N1, measured: an `exec` with no command applies its redirections
     to the SHELL for the rest of the run (74 bytes of subsequent shell
@@ -853,7 +809,7 @@ _INTERPRETER_INVOCATION_RE: Final[re.Pattern[str]] = re.compile(
 _PREAMBLE_MARKER: Final[str] = "unset POSIXLY_CORRECT"
 
 
-@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+@pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_PREAMBLE_WRAPPERS))
 def test_the_lock_preamble_precedes_the_first_interpreter_invocation_in_every_wrapper(
     wrapper_filename: str,
 ) -> None:
@@ -874,7 +830,7 @@ def test_the_lock_preamble_precedes_the_first_interpreter_invocation_in_every_wr
     )
 
 
-@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+@pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_PREAMBLE_WRAPPERS))
 def test_no_study_wrapper_enables_posix_mode(wrapper_filename: str) -> None:
     """C2-B3 + R4-N2: neither door is open -- no ACTUAL `set -o posix`
     directive (a mention of the literal string inside an explanatory
