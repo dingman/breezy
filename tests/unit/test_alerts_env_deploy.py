@@ -24,8 +24,6 @@ resolve_alert_sink/emit_alert/alert_ladder calls):
         hypothesis-triage-run.sh)
     breezy-decisions-retention.service
         NO -- scripts/ops/decisions_retention.py: no alert import
-    breezy-k1-daily.service
-        NO -- scripts/analysis/k1_cheap_open_settlement.py: no alert import
     breezy-live-tally.service
         NO -- scripts/analysis/live_family_tally.py: no alert import
         (retired; timer disabled)
@@ -77,7 +75,6 @@ _ALL_AUDITED_UNITS = frozenset(
         "breezy-decisions-retention.service",
         "breezy-family-tally@.service",
         "breezy-hypothesis-triage.service",
-        "breezy-k1-daily.service",
         "breezy-live-tally.service",
         "breezy-position-monitor-report.service",
         "breezy-quote-tape-ingest.service",

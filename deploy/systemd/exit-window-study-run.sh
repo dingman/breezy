@@ -50,12 +50,11 @@ mkdir -p "$OUT"
 
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 
-# Host-wide mutual exclusion, same convention as k1-daily-run.sh /
-# mb-daily-run.sh / offer-gate-daily-run.sh / position-monitor-report-run.sh
-# (SP-1.rev4.md). Skip-not-kill: CONTENTION exits 0 so Persistent=true does
-# not retrigger and no sibling OnFailure= fires on a healthy skip;
-# LOCK-INFRASTRUCTURE failure exits 75 (EX_TEMPFAIL) so a persistently
-# broken lock dir is loud in journalctl instead of silently skipping
+# Host-wide mutual exclusion, same lock path as asos-refresh-run.sh and
+# position-monitor-report-run.sh. Skip-not-kill: CONTENTION exits 0 so
+# Persistent=true does not retrigger and no sibling OnFailure= fires on a
+# healthy skip; LOCK-INFRASTRUCTURE failure exits 75 (EX_TEMPFAIL) so a
+# persistently broken lock dir is loud in journalctl instead of silently skipping
 # forever. `Conflicts=` is deliberately NOT used -- it would SIGTERM the
 # RUNNING job (the 2026-09-11 shape).
 #

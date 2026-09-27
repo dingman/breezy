@@ -25,10 +25,11 @@ WorkingDirectory=/home/jon/breezy
 # two already-persisted local stores (the exec-state SQLite ledger and the
 # scored-trial parquet store) plus a bounded scan of log lines for the
 # balance series -- never a raw quote-tape scan like the heavy nightly
-# studies (breezy-k1-daily.service, MemoryHigh=12G/MemoryMax=16G, the
-# 2026-09-11 K1 incident's 17.6 GB peak). Still cites that incident's date
-# and unit because every unit on this host now carries an explicit ceiling
-# for that reason, however small its own working set.
+# studies (the retired breezy-k1-daily.service carried
+# MemoryHigh=12G/MemoryMax=16G after the 2026-09-11 K1 incident's 17.6 GB
+# peak). Still cites that incident's date and unit because every unit on
+# this host now carries an explicit ceiling for that reason, however small
+# its own working set.
 MemoryHigh=512M
 MemoryMax=1G
 
@@ -49,8 +50,8 @@ UMask=0077
 EnvironmentFile=-%h/.config/breezy/alerts.env
 ExecStart=/home/jon/breezy/deploy/systemd/portfolio-roi-run.sh
 
-# A bounded ledger/parquet join and a log scan -- generous but far under
-# breezy-k1-daily's heavy-study budget.
+# A bounded ledger/parquet join and a log scan -- generous but far under the
+# retired K1 heavy-study budget.
 TimeoutStartSec=600
 
 # No Restart=. A missed run is not an incident on its own -- the ledger and

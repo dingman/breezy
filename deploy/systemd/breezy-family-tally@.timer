@@ -19,7 +19,7 @@ Unit=breezy-family-tally@%i.service
 # Unique as an hour:minute tick (ingest already owns :15 at 00/06/12/18,
 # score-live-trials owns 14:15, live-tally owns 14:30).
 # Occupied elsewhere: 09:00 rotate, 13:30 mb-daily, 14:15 score-live-trials,
-# 14:30 live-tally, 22:30 k1-daily, 22:45 offer-gate-daily.
+# 14:30 live-tally, 22:45 offer-gate-daily.
 # Persistent=true boot catch-up before 16:50 exits 1 with no report --
 # accepted (the structural pin is not READY before launch).
 # No two Breezy timers ever fire in the same hour:minute tick

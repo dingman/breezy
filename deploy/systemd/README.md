@@ -1,6 +1,14 @@
-# G-14 — reboot-durable supervision for the quote tape and the K1 study
+# G-14 — reboot-durable supervision for the quote tape and retired K1 study
 
-**Status: ACTIVATED** (the 09-12 header "PREPARED, NOT ACTIVATED" is superseded; measured 2026-09-26 12:40Z after OPS-1: 40 `breezy-*` entries in `~/.config/systemd/user` are symlinks into this directory, 0 are host-local regular files; `breezy.slice.d/memory.conf` is a symlink to this repo; 18 active timers; 3 services running; TEMPORARY drop-ins `breezy-quote-tape-ingest.service.d/zz-memory-containment-TEMPORARY.conf` and `breezy-replay-daily.service.d/zz-c2-time-v-TEMPORARY.conf` are host-local by design and removed when their item closes). The cutover in §3 is run by the coordinator, with eyes on
+**Status: ACTIVATED; K1 scheduled unit RETIRED 2026-09-27 per
+`docs/evidence/RULING_k1_daily_disposition_2026-09-27.md`.** (The 09-12
+header "PREPARED, NOT ACTIVATED" is superseded; measured 2026-09-26 12:40Z
+after OPS-1: 40 `breezy-*` entries in `~/.config/systemd/user` are symlinks
+into this directory, 0 are host-local regular files; `breezy.slice.d/memory.conf`
+is a symlink to this repo; 18 active timers; 3 services running; TEMPORARY
+drop-ins `breezy-quote-tape-ingest.service.d/zz-memory-containment-TEMPORARY.conf`
+and `breezy-replay-daily.service.d/zz-c2-time-v-TEMPORARY.conf` are host-local
+by design and removed when their item closes). The cutover in §3 is run by the coordinator, with eyes on
 it, because it briefly stops the one data stream Breezy cannot re-acquire.
 
 ## 1. What this replaces, and why it is urgent
@@ -12,7 +20,7 @@ a **session scratchpad under `/tmp`**:
 |---|---|---|---|
 | capture supervisor (H3) | `tape_supervisor.sh` | 30 s | 2026-09-02T14:00Z |
 | capture supervisor (K1) | `tape_supervisor_k1.sh` | 60 s | 2026-10-01T00:00Z |
-| K1 daily driver | `k1_daily.sh` | `sleep 86400` | 2026-10-01T12:00Z |
+| K1 daily driver | `k1_daily.sh` | RETIRED 2026-09-27 | `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` |
 
 All three are `/tmp/claude-1000/-home-jon-breezy/cf107d94-6203-4ff5-a844-294812f915b0/scratchpad/*.sh`.
 
@@ -35,13 +43,11 @@ hour that is gone. That is the entire justification for the care in §3.
 ```bash
 # Symlink, so edits in the repo are the deployed truth and `git` is the audit log.
 ln -s /home/jon/breezy/deploy/systemd/breezy-quote-tape.service ~/.config/systemd/user/
-ln -s /home/jon/breezy/deploy/systemd/breezy-k1-daily.service   ~/.config/systemd/user/
-ln -s /home/jon/breezy/deploy/systemd/breezy-k1-daily.timer     ~/.config/systemd/user/
+# RETIRED 2026-09-27 per docs/evidence/RULING_k1_daily_disposition_2026-09-27.md:
+# do not symlink breezy-k1-daily.service or breezy-k1-daily.timer.
 
 systemctl --user daemon-reload
-systemd-analyze --user verify ~/.config/systemd/user/breezy-quote-tape.service \
-                              ~/.config/systemd/user/breezy-k1-daily.service \
-                              ~/.config/systemd/user/breezy-k1-daily.timer
+systemd-analyze --user verify ~/.config/systemd/user/breezy-quote-tape.service
 ```
 
 `daemon-reload` starts nothing. `verify` prints **nothing** when the units are
@@ -146,14 +152,14 @@ echo "recorder=$REC instance=$INST"
    Expect `POLYMARKET_US_USER_AGENT=breezy/1.0 (+mailto:weather-breezy@jonathan.vc)`
    with **no** surrounding quotes.
 
-7. **Only then, enable the timer.**
+7. **RETIRED 2026-09-27: do not enable the K1 timer.**
    ```bash
-   systemctl --user enable --now breezy-k1-daily.timer
-   systemctl --user list-timers breezy-k1-daily.timer --no-pager   # next run 01:35Z (MOVED 2026-09-12, was 22:30Z)
+   # RETIRED per docs/evidence/RULING_k1_daily_disposition_2026-09-27.md.
+   # systemctl --user enable --now breezy-k1-daily.timer
+   # systemctl --user list-timers breezy-k1-daily.timer --no-pager
    ```
-   `--now` starts the *timer*, not the service. To prove the study runs without
-   waiting for 01:35Z (MOVED 2026-09-12, was 22:30Z): `systemctl --user start
-   breezy-k1-daily.service` and read `~/.local/share/breezy/k1/k1_daily.log`.
+   Re-open trigger C1 requires EDGE-6d true-open capture plus a declared SEARCH
+   corpus; any future K1 run is manual `k1_cheap_open_settlement.py`, never a timer.
 
 ### Expected capture gap
 
@@ -196,7 +202,7 @@ anything else moves.
 
 ```bash
 systemctl --user disable --now breezy-quote-tape.service
-systemctl --user disable --now breezy-k1-daily.timer
+# RETIRED 2026-09-27; coordinator already disabled breezy-k1-daily.timer.
 ```
 
 Then relaunch the recorder with the supervisors' verbatim command line
@@ -220,7 +226,8 @@ been reaped — that is the defect being fixed):
 ```bash
 S=/tmp/claude-1000/-home-jon-breezy/cf107d94-6203-4ff5-a844-294812f915b0/scratchpad
 nohup "$S/tape_supervisor_k1.sh" >/dev/null 2>&1 &
-nohup "$S/k1_daily.sh"           >/dev/null 2>&1 &
+# RETIRED 2026-09-27 per docs/evidence/RULING_k1_daily_disposition_2026-09-27.md.
+# nohup "$S/k1_daily.sh"         >/dev/null 2>&1 &
 ```
 
 If `breezy-quote-tape.service` has entered `failed` because of an exit-2
@@ -301,21 +308,20 @@ BOTH gone, not just the timer disabled.
 - **journald, not the `/tmp` log file.** `StandardOutput/Error=journal` +
   `SyslogIdentifier=`, mirroring the NWS unit. Reboot-durable, rotated, queryable
   per-unit. The `/tmp` append-log is part of what G-14 removes.
-- **The K1 service holds no credential.** No `EnvironmentFile`. It reads the tape
-  and the settlement catalog from absolute defaults
-  (`k1_cheap_open_settlement.py:143-146`) and opens no socket — the same role
-  separation that keeps the recorder and the NWS collector apart.
+- **RETIRED 2026-09-27: the K1 service held no credential.** No
+  `EnvironmentFile`. It read the tape and the settlement catalog from absolute
+  defaults (`k1_cheap_open_settlement.py:143-146`) and opened no socket; the
+  script is retained for manual reruns under the ruling's C1 trigger.
 
 ## 7. Validation performed (2026-09-02, no unit activated)
 
 ```
-$ systemd-analyze --user verify deploy/systemd/breezy-quote-tape.service \
-    deploy/systemd/breezy-k1-daily.service deploy/systemd/breezy-k1-daily.timer
+$ systemd-analyze --user verify deploy/systemd/breezy-quote-tape.service
 (no output)
 EXIT=0
 
-$ bash -n deploy/systemd/k1-daily-run.sh
-OK
+# Historical 2026-09-02 validation included deploy/systemd/k1-daily-run.sh.
+# That wrapper is RETIRED 2026-09-27 by docs/evidence/RULING_k1_daily_disposition_2026-09-27.md.
 
 $ loginctl show-user jon -p Linger
 Linger=yes
@@ -370,12 +376,11 @@ when the timer will fire, never which version of the service it will fire.
 
 - **ACTIVATED AND VERIFIED.** Units symlinked into `~/.config/systemd/user/`,
   `daemon-reload`ed, `systemd-analyze --user verify` silent (= clean).
-  `breezy-quote-tape.service` active, `NRestarts=0`; `breezy-k1-daily.timer`
-  enabled, next fire 22:30Z (ANNOTATED, MOVED 2026-09-12: true as of this
-  2026-09-02 record; `breezy-k1-daily.timer` now fires 01:35Z instead -- see
-  "Protected window and serialization" below; this dated observation is
-  annotated in place, never rewritten). `Linger=yes`, so both survive reboot
-  and logout.
+  `breezy-quote-tape.service` active, `NRestarts=0`. Historical note:
+  `breezy-k1-daily.timer` was enabled with next fire 22:30Z (MOVED 2026-09-12,
+  now 01:35Z) in the 2026-09-02 record; it is RETIRED 2026-09-27 per
+  `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md`. `Linger=yes`,
+  so the quote-tape service survives reboot and logout.
 - **Nothing was lost.** The recorder took **28 s** to shut down cleanly on
   SIGTERM (inside the 120 s `TimeoutStopSec`, which is why that value is not
   the default 90). Preflight on the closed pre-cutover instance
@@ -607,7 +612,7 @@ lands in `failed` (visible in `systemctl --user list-units --all
 'breezy-*'`) but nothing pages on it, a named and accepted residual rather
 than a second-order watchdog that would reintroduce an alert loop.
 
-Covers, as of this revision: `breezy-k1-daily`, `breezy-exit-window-study`,
+Covers, as of this revision: `breezy-exit-window-study`,
 `breezy-family-tally@`, `breezy-live-tally`, `breezy-position-monitor-report`,
 `breezy-quote-tape-ingest`, `breezy-quote-tape-rotate`,
 `breezy-score-live-trials`, and the new `breezy-asos-refresh` -- every unit
@@ -884,7 +889,8 @@ historical/architecture record of what the unit did while active.
 
 `breezy-live-tally.service` + `.timer` run `scripts/analysis/
 live_family_tally.py` daily at **14:30 UTC** via a wrapper script,
-`deploy/systemd/live-tally-run.sh`, in the same style as `k1-daily-run.sh`:
+`deploy/systemd/live-tally-run.sh`, in the same style as the scheduled
+wrapper pattern:
 the timer owns cadence, the script owns the work. The script reads the 6c
 scored-trial parquet store (`~/.local/share/breezy/derived/scored_trials`,
 written by `scripts/analysis/score_live_trials.py`), builds realized-hold-rate
@@ -902,9 +908,9 @@ naive normal-approximation interval EXEC_SPINE R-9 refuses by name.
 Scheduled a full hour AFTER the 13:30 UTC tick (occupied by the now-retired
 `breezy-mb-daily`, AUD-15's `breezy-asos-refresh` since 2026-09-22) so the
 tally's read of the (unrelated) parquet store never races that unit's work,
-and a distinct hour from every other Breezy timer (`breezy-quote-tape-rotate`
-09:00, `breezy-quote-tape-ingest` 00,06,12,18:15, `breezy-k1-daily` 01:35,
-the now-retired `breezy-offer-gate-daily` 02:05 (MOVED 2026-09-12, was 22:45)) —
+and a distinct hour from every other surviving Breezy timer (`breezy-quote-tape-rotate`
+09:00, `breezy-quote-tape-ingest` 00,06,12,18:15; historical retired slots:
+`breezy-k1-daily` 01:35 and `breezy-offer-gate-daily` 02:05) —
 pinned by
 `tests/unit/test_deploy_timer_hours.py`, which parses every
 `deploy/systemd/*.timer`'s `OnCalendar=` line as text (no `systemd-analyze`
@@ -912,8 +918,8 @@ shelling in the test suite; that check stays a manual step, below). No
 network: the store is local, and the unit carries no `EnvironmentFile`.
 
 Artefacts land under `~/.local/share/breezy/derived/`, dated
-(`live_family_tally_<date>.md`), one snapshot per day — same convention as
-`breezy-k1-daily`; the unit never writes into `docs/evidence/`.
+(`live_family_tally_<date>.md`), one snapshot per day — same durable-output
+convention the retired K1 unit used; the unit never writes into `docs/evidence/`.
 
 Validation performed (no unit activated):
 
@@ -1033,14 +1039,14 @@ scored-trials store this report joins against), and outside the protected
 LST-union window -- pinned by `tests/unit/test_deploy_timer_hours.py`. The
 unit carries no `Environment=`/`EnvironmentFile=`: it holds no venue
 credential and opens no socket, mirroring `breezy-k1-daily.service`'s own
-stance.
+retired no-credential stance.
 
 **Deliberate deviation from the "light-job exemption."** Unlike
 `breezy-score-live-trials`/`breezy-live-tally`/`breezy-pm-crh-v2-tally`
 (all <=1GB/<=60s, exempted from the studies flock/slice above), this unit
 opts INTO `breezy-studies.slice` and the shared host-wide
 `breezy-studies.lock` (same skip-not-kill convention as
-`k1-daily-run.sh`/`mb-daily-run.sh`/`offer-gate-daily-run.sh`: contention
+`asos-refresh-run.sh` and the report wrappers: contention
 exits 0, lock-infrastructure failure exits 75) even though it is itself
 light (`MemoryHigh=512M`/`MemoryMax=1G`, well under the 12G/16G heavy-study
 floor) -- it reads from the same quote-tape-catalog-derived directory tree
@@ -1369,11 +1375,11 @@ prevent.
 ## Protected window and serialization
 
 **AUD-15 (2026-09-22): `breezy-mb-daily` and `breezy-offer-gate-daily` are
-RETIRED** (see their own section above). This section is retained as the
+RETIRED; EDGE-6c-R2 (2026-09-27): `breezy-k1-daily` is RETIRED per
+`docs/evidence/RULING_k1_daily_disposition_2026-09-27.md`.** This section is retained as the
 historical design record for the protected window and the flock, which both
-still apply to the surviving `breezy-k1-daily` and to the new light
-`breezy-asos-refresh` unit (its own section documents its use of the same
-lock).
+still apply to the light `breezy-asos-refresh` and report units that take
+the shared lock.
 
 SP-1 (2026-09-12): `breezy-k1-daily`, `breezy-mb-daily` and
 `breezy-offer-gate-daily` were the three nightly analysis studies at the
@@ -1400,24 +1406,21 @@ two constants rather than re-declaring them
 
 **What moved.**
 
-- `breezy-k1-daily.timer`: `22:30Z -> 01:35Z` (MOVED 2026-09-12).
+- `breezy-k1-daily.timer`: `22:30Z -> 01:35Z` (MOVED 2026-09-12), then
+  RETIRED 2026-09-27 by `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md`.
 - `breezy-offer-gate-daily.timer`: `22:45Z -> 02:05Z` (MOVED 2026-09-12).
 
-Both are now outside `P`, with `Persistent=true` kept on both.
+Both were outside `P` while active, with `Persistent=true` kept on both.
 `breezy-mb-daily.timer` stays at `13:30Z`, already outside `P`.
 
-**Serialization.** `breezy-studies.slice` (new) gives the three heavy
-studies a shared `MemoryHigh=12G`/`MemoryMax=16G` aggregate ceiling --
-usually redundant with each unit's own per-service cap once the flock below
-holds, and mainly defence-in-depth against a bypassed lock or a future unit
-added to the slice before it is wrapped. It only binds once **installed**:
+**Serialization.** `breezy-studies.slice` gives lock-taking studies a shared
+aggregate ceiling and now also acts as a guardrail for any future heavy unit
+discovered by `tests/unit/test_analysis_units_serialized.py`. It only binds once **installed**:
 `daemon-reload` alone does not create the `~/.config/systemd/user/`
 symlink; without it systemd instantiates an implicit, unbounded slice while
 `show <service> -p Slice` still reports the configured name (false green).
 The real observable is `systemctl --user show breezy-studies.slice -p
-MemoryHigh -p MemoryMax`. `k1-daily-run.sh` (the sole surviving heavy
-wrapper after AUD-15's retirement) and the new light `asos-refresh-run.sh`
-both take a
+MemoryHigh -p MemoryMax`. The light `asos-refresh-run.sh` and report wrappers take a
 host-wide, non-blocking `flock` on `breezy-studies.lock` (resolved under
 `$XDG_RUNTIME_DIR`, falling back to `$HOME/.local/share/breezy`) before
 doing any work: contention exits 0 (skip-not-kill -- `Persistent=true`
@@ -1444,12 +1447,11 @@ light band as its siblings; only its wall-clock budget differs, because it
 is a wait-for-trigger job, not a fixed-cost read. It takes no studies flock
 and shares no state with the node (r2.1 Blocker A).
 
-**Worst-case-runtime rule.** No heavy study starts within its own worst-case
-observed runtime before `16:35Z`: `breezy-k1-daily` at `01:35Z` clears by a
-wide margin. (Historical, pre-retirement figures: `breezy-offer-gate-daily`
-11.5 min, `breezy-mb-daily` 36 min (13:30Z + 36 min = ~14:06Z, clear) --
-both units are now retired.) `breezy-asos-refresh` is a light unit, not
-subject to this rule.
+**Worst-case-runtime rule.** No active heavy study remains after the K1
+retirement. Historical, pre-retirement figures: `breezy-k1-daily` at 01:35Z,
+`breezy-offer-gate-daily` 11.5 min, and `breezy-mb-daily` 36 min (13:30Z +
+36 min = ~14:06Z, clear). `breezy-asos-refresh` is a light unit, not subject
+to this rule.
 
 **Reboot-catch-up residual.** `daemon-reload` can trigger an immediate
 `Persistent=true` catch-up run; a reboot can still fire a relocated heavy
