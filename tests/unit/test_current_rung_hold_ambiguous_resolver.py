@@ -31,7 +31,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pytest
 from nautilus_trader.accounting.factory import AccountFactory
@@ -47,15 +47,23 @@ from nautilus_trader.model.events import AccountState, OrderDenied
 from nautilus_trader.model.identifiers import ClientOrderId, Venue, VenueOrderId
 from nautilus_trader.model.instruments import BinaryOption
 
+from breezy.adapters.polymarket_us.account_activity import PORTFOLIO_ACTIVITIES_PATH
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     _BOOT_PASS_REFUSAL_LATCHES,
     _RECONCILIATION_COUNT_FIELDS,
     _RESOLVER_INSTRUMENT_LOAD_RETRY_NS,
+    # EDGE-2 slice D (AC4(d)): every resolver-pass fixture that drives a
+    # zero-fill decision must now age its context past this floor -- see
+    # `_ARMED_AGE_PAST_MIN_NS` and `_backdate_resolver_context` below.
+    _RESOLVER_ZERO_FILL_MIN_AGE_NS,
     _VENUE_ID_MAP_WRITE_FAILED,
+    FILL_INDEX_KEY_PREFIX,
+    FILL_KEY_PREFIX,
     RESOLVER_CONTEXT_KEY_PREFIX,
     RESOLVER_FILL_NOT_BOOKED,
     AmbiguousResolverContext,
+    DurableFillRecord,
     PolymarketUSExecutionClient,
     StartupPositionSnapshot,
     _resolver_long_position_state,
@@ -216,6 +224,35 @@ def _no_leg_order_get_body(
     return body
 
 
+#: EDGE-2 slice D (AC4(d)): comfortably past `_RESOLVER_ZERO_FILL_MIN_AGE_NS`
+#: (one extra second) -- every fixture in this module that drives a
+#: zero-fill decision through the FULL `_resolve_ambiguous_intents` pass
+#: must age its context past the floor, since a fresh `LiveClock()`-stamped
+#: context (the pre-slice-D shape every helper here built) is always well
+#: under it.
+_ARMED_AGE_PAST_MIN_NS: Final[int] = _RESOLVER_ZERO_FILL_MIN_AGE_NS + 1_000_000_000
+
+
+def _backdate_resolver_context(
+    client: PolymarketUSExecutionClient, intent_id: str, *, age_ns: int = _ARMED_AGE_PAST_MIN_NS,
+) -> None:
+    """Rewrite the durable resolver context's ``created_ns`` to ``age_ns``
+    before "now" -- mirrors :func:`_rewrite_resolver_context_instrument`'s
+    in-place rewrite pattern. Without this, EVERY resolver-pass fixture
+    below would fail AC4(d)'s new minimum-age gate: a `LiveClock()`-stamped
+    context is always well under
+    :data:`_RESOLVER_ZERO_FILL_MIN_AGE_NS`, and the plan's own r3 AC4(d)
+    makes that floor mandatory for a resolver zero-fill, superseding the
+    pre-slice-D immediate-retirement shape these fixtures originally built.
+    """
+    raw = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+    assert raw is not None
+    context = AmbiguousResolverContext.from_bytes(raw)
+    backdated_ns = client._clock.timestamp_ns() - age_ns
+    rewritten = replace(context, created_ns=backdated_ns)
+    client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", rewritten.to_bytes())
+
+
 async def _arm_one_ambiguous_intent(
     tmp_path: Path,
 ) -> tuple[PolymarketUSExecutionClient, str, str, Any, list[Any]]:
@@ -248,6 +285,13 @@ async def _arm_one_ambiguous_intent(
 
     assert client._latch is not None
     assert client._latch.is_latched() is True, "the with-id AMBIGUOUS outcome must leave OPEN"
+    # EDGE-2 slice D (AC4(d)): age the context past the new mandatory
+    # zero-fill min-age floor -- see `_backdate_resolver_context`'s own
+    # docstring. A CALLER that needs to test the floor ITSELF (a fresh,
+    # unaged context) rewrites `created_ns` back via the SAME helper.
+    current = client._latch.current_open()
+    assert current is not None
+    _backdate_resolver_context(client, current.intent_id)
     instrument = build_instrument()
     slug = instrument_id_to_slug(instrument.id)
     return client, order_id, slug, latch_cm, order_events
@@ -315,7 +359,9 @@ async def _arm_one_no_leg_ambiguous_intent(
         strategy_id=STRATEGY_ID.value,
         notional_usd=Decimal("0.40"),
         booking_id=1,
-        created_ns=client._clock.timestamp_ns(),
+        # EDGE-2 slice D (AC4(d)): pre-aged past the mandatory zero-fill
+        # min-age floor -- see `_backdate_resolver_context`'s docstring.
+        created_ns=client._clock.timestamp_ns() - _ARMED_AGE_PAST_MIN_NS,
     )
     client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{armed.intent_id}", context.to_bytes())
     return client, venue_order_id, slug, latch_cm
@@ -2849,6 +2895,8 @@ async def _build_client_with_custom_loader(
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            # EDGE-2 slice D (AC4(c)): EOF-complete, no trade rows, by default.
+            PORTFOLIO_ACTIVITIES_PATH: {"activities": [], "eof": True},
         },
     )
 
@@ -3888,4 +3936,717 @@ async def test_periodic_resolver_task_survives_a_no_leg_pass(
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# EDGE-2 slice D (AC4/AC7/AC10): the resolver's zero-fill evidence gate.
+#
+# Authority: docs/plans/backlog/EDGE_2026-09-27/
+# EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md, section 7.
+# Binding coordinator amendment (2026-09-27, Step 0 evidence and its
+# review): AC4(c) completeness is EOF-ONLY -- the
+# ``min(createTime) < createdNs`` branch is UNLICENSED until a real
+# multi-page traversal is observed (follow-up EDGE-2-MULTIPAGE).
+# ---------------------------------------------------------------------------
+
+
+def test_min_age_constant_equals_strategy_rearm_floor() -> None:
+    """AC4(d): the borrowed, UNVERIFIED 120s floor is pinned EQUAL to the
+    strategy's own re-arm floor. This test imports both; production code
+    never imports `strategy` from `adapters` (the layer contract)."""
+    from breezy.strategy.current_rung_hold.continuous_strategy import (
+        _REARM_MIN_DELAY_SECS,
+    )
+
+    assert _RESOLVER_ZERO_FILL_MIN_AGE_NS == _REARM_MIN_DELAY_SECS * 1_000_000_000
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_before_min_age_stays_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(d): otherwise-clean zero-fill evidence (terminal GET, complete
+    activities with no trade, no create-time fill evidence) is NOT enough on
+    its own -- a context younger than `_RESOLVER_ZERO_FILL_MIN_AGE_NS` stays
+    AMBIGUOUS."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        _backdate_resolver_context(client, current.intent_id, age_ns=0)  # freshly armed
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        # Default activities payload (`_build_race_client`) is already
+        # eof-complete with zero trade rows.
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "a context younger than the min-age floor must never retire"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_requires_complete_activities_with_no_trade_for_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(c): an INCOMPLETE activities read (no `eof`, no `nextCursor` --
+    the read simply stops) never authorizes a zero-fill, even with every
+    other AC4 condition satisfied."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [], "eof": False,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_trade_activity_for_order_id_blocks_zero_fill_and_raises_contradiction_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4: a GET-terminal-zero order whose activities join finds a real
+    TRADE row for THIS venue order id is a CONTRADICTION, not a zero-fill --
+    stays AMBIGUOUS and raises the `resolver_evidence_contradiction`
+    CRITICAL health-surface entry."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": order_id},
+                        "marketSlug": slug,
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+        assert client.resolver_evidence_contradictions == ()
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, "a contradiction never retires"
+        contradictions = client.resolver_evidence_contradictions
+        assert len(contradictions) == 1
+        assert contradictions[0]["severity"] == "CRITICAL"
+        assert contradictions[0]["event"] == "resolver_evidence_contradiction"
+        assert contradictions[0]["venue_order_id"] == order_id
+        assert contradictions[0]["trade_count"] == "1"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_create_fill_evidence_fill_type_blocks_zero_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(b): `createFillEvidence=fill_type_present` blocks a zero-fill
+    even with an otherwise-clean GET and activities join, and raises the
+    same contradiction CRITICAL."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw is not None
+        context = AmbiguousResolverContext.from_bytes(raw)
+        blocked = replace(
+            context, create_fill_evidence=submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT,
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", blocked.to_bytes(),
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        # Default activities payload: eof-complete, zero trade rows -- proves
+        # (b) alone, independent of (c), blocks the zero-fill.
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        contradictions = client.resolver_evidence_contradictions
+        assert len(contradictions) == 1
+        assert contradictions[0]["create_fill_evidence"] == (
+            submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unknown_create_fill_evidence_still_requires_activities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(b): `unknown` (a legacy blob) is admissible but never sufficient
+    on its own -- it still needs (c)/(d)/(e) to retire. Proven here by
+    pairing `unknown` with an INCOMPLETE activities read: must stay
+    AMBIGUOUS, exactly like `none` would."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw is not None
+        context = AmbiguousResolverContext.from_bytes(raw)
+        unknown = replace(
+            context, create_fill_evidence=submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN,
+        )
+        client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", unknown.to_bytes())
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [], "eof": False,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "unknown is admissible but never short-circuits (c)/(d)/(e)"
+        )
+        # Never a contradiction: `unknown` does not block, and no trade was found.
+        assert client.resolver_evidence_contradictions == ()
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_activities_read_failure_stays_ambiguous_and_counts_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(c): a raised exception on the activities GET is a read failure,
+    not a completeness signal -- stays AMBIGUOUS, never a contradiction."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        original_read = client._private_read
+
+        async def _failing_activities_read(
+            path: str, query: Mapping[str, object] | None = None,
+        ) -> Any:
+            if path == PORTFOLIO_ACTIVITIES_PATH:
+                raise RuntimeError("synthetic activities failure")
+            return await original_read(path, query)
+
+        client._private_read = _failing_activities_read
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        assert client.resolver_evidence_contradictions == ()
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_min_create_time_below_created_ns_without_eof_is_not_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Binding coordinator amendment (2026-09-27): AC4(c) completeness is
+    EOF-ONLY. A read that pages `_RESOLVER_ACTIVITY_MAX_PAGES` times, NEVER
+    reaching `eof`, but whose running minimum `createTime` is already far
+    below `context.createdNs` on every page, must still be INCOMPLETE --
+    the `min(createTime) < createdNs` shortcut stays UNLICENSED
+    (follow-up EDGE-2-MULTIPAGE) until a real multi-page traversal is
+    observed. RED today only in the sense that a licensed-shortcut
+    implementation would retire here; the coordinator amendment forbids
+    that implementation."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        activities_calls = {"count": 0}
+        original_read = client._private_read
+
+        async def _never_eof_activities(
+            path: str, query: Mapping[str, object] | None = None,
+        ) -> Any:
+            if path == PORTFOLIO_ACTIVITIES_PATH:
+                activities_calls["count"] += 1
+                # `createTime` is far in the past on EVERY page -- if the
+                # (forbidden) threshold shortcut were licensed, the FIRST
+                # page alone would already satisfy it.
+                return {
+                    "activities": [
+                        {
+                            "type": "ACTIVITY_TYPE_TRADE",
+                            "trade": {
+                                "aggressor": {"id": "SOME-OTHER-ORDER"},
+                                "marketSlug": slug,
+                                "qtyDecimal": "1",
+                                "createTime": "2020-01-01T00:00:00.000000000Z",
+                            },
+                        },
+                    ],
+                    "eof": False,
+                    "nextCursor": f"page-{activities_calls['count']}",
+                }
+            return await original_read(path, query)
+
+        client._private_read = _never_eof_activities
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "a read that never reaches eof must stay AMBIGUOUS regardless of "
+            "how far in the past the running minimum createTime is"
+        )
+        # The cap: each resolver pass makes EXACTLY `_RESOLVER_ACTIVITY_MAX_
+        # PAGES` (20) GETs before giving up incomplete, never more per pass
+        # -- `_run_resolver_passes` may drive several passes in one bounded
+        # window (the intent never resolves), so the total is a positive
+        # multiple of 20, not 20 itself.
+        assert activities_calls["count"] > 0
+        assert activities_calls["count"] % 20 == 0
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_same_day_prior_durable_holding_does_not_block_true_zero_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(e)/AC7(iii): a same-day PRIOR durable fill on this instrument
+    explains the venue's LONG holding, so a true zero-fill for a SECOND,
+    unrelated order on the SAME instrument still retires -- the holding
+    cannot wedge it."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        instrument = build_instrument()
+        prior_fill = DurableFillRecord(
+            venue_order_id="ord-prior-fill-1",
+            client_order_id="C-ord-prior-fill-1",
+            instrument_id=str(instrument.id),
+            order_side="BUY",
+            cumulative_qty=Decimal(1),
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal(0),
+            fee_reconciled=True,
+            ts_event=client._clock.timestamp_ns(),
+        )
+        client.record_fill(prior_fill)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        # The venue reports a LONG explained EXACTLY by the prior fill.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}}, "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, (
+            "a fully-explained prior holding must never wedge a true zero-fill"
+        )
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_same_day_unexplained_holding_blocks_zero_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(e) negative: the SAME venue-reported LONG, but with NO durable
+    fill record to explain it, must NOT retire as zero-fill."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        # No durable fill record explains this LONG at all.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}}, "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "an unexplained holding must never be waved through as zero-fill"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_durable_net_qty_read_failure_stays_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(e): an unreadable durable-fill index for THIS instrument is
+    undetermined, never zero -- stays AMBIGUOUS, counted as a resolver
+    error, never retired on evidence it could not read."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        instrument = build_instrument()
+        client._store_set(f"{FILL_INDEX_KEY_PREFIX}{instrument.id}", b"not-valid-json")
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}}, "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "an unreadable durable-fill index is undetermined, never zero -- "
+            "must never retire on evidence it could not read"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_past_day_read_skips_holding_leg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(e): past-day reads (instrument absent from
+    `_instrument_provider.list_all()`) skip the holding leg entirely --
+    proven by a holding that would FAIL (e) if it were evaluated (no
+    durable fill explains it) still retiring as zero-fill, because it is
+    never checked for a past-day instrument (D2: a settled market's
+    position is meaningless corroboration)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        # `build_second_instrument()` is added to the CACHE only, never to
+        # `_instrument_provider` -- the same-day membership test this plan's
+        # AC4(e) baseline reads must see it as a past-day instrument.
+        stale_instrument = build_second_instrument()
+        assert client._cache.instrument(stale_instrument.id) is None
+        client._cache.add_instrument(stale_instrument)
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        # An UNEXPLAINED holding on the past-day slug -- would fail (e) if
+        # evaluated, since no durable fill record exists for this instrument.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {stale_slug: {"netPosition": "1"}}, "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, (
+            "a past-day read must skip AC4(e)'s holding leg entirely"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_fill_resolves_on_trade_join_when_holding_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D7: a GET-confirmed FILL with NO holding present (a settled market or
+    a completed exit) still resolves -- via the activities trade join, not
+    the positions leg -- and records the synthesized fill."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=1, avg_px="0.40",
+            leaves_quantity=0,
+        )
+        # No holding at all -- the settled-market/completed-exit shape.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": order_id},
+                        "marketSlug": slug,
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+        raw = client._store_get(f"{FILL_KEY_PREFIX}{order_id}")
+        assert raw is not None, "the trade-join-confirmed fill must be recorded durably"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_mia_0923_past_day_shape_retires_zero_fill_with_empty_trade_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC7(i): the verbatim MIA 09-23 shape (past-day loader instrument,
+    positions `{}` eof, GET `EXPIRED qty=1 cum=0 leaves=0`, complete
+    activities with no trade for the id) retires as
+    `STATUS_REPORT_ZERO_FILL_TERMINAL`."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        assert client._cache.instrument(stale_instrument.id) is None
+        client._cache.add_instrument(stale_instrument)
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [], "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_mia_0923_past_day_shape_with_trade_row_stays_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC7(ii): the SAME MIA 09-23 shape, but the activities page carries a
+    real TRADE row for this venue order id -- CONTRADICTION, stays
+    AMBIGUOUS."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        assert client._cache.instrument(stale_instrument.id) is None
+        client._cache.add_instrument(stale_instrument)
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": order_id},
+                        "marketSlug": stale_slug,
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "a real trade row for this id must never let the order retire as zero-fill"
+        )
+        contradictions = client.resolver_evidence_contradictions
+        assert len(contradictions) == 1
+        assert contradictions[0]["venue_order_id"] == order_id
         await client._disconnect()

@@ -42,6 +42,7 @@ from nautilus_trader.model.events import AccountState, OrderDenied
 from nautilus_trader.model.identifiers import ClientId, StrategyId, TraderId
 from nautilus_trader.model.objects import Quantity
 
+from breezy.adapters.polymarket_us.account_activity import PORTFOLIO_ACTIVITIES_PATH
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
 from breezy.adapters.polymarket_us.exec.endpoints import (
@@ -130,6 +131,10 @@ async def _build_race_client(tmp_path: Path, *, sender: Any) -> tuple[
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            # EDGE-2 slice D (AC4(c)): EOF-complete, no trade rows, by
+            # default -- overridden per-test where a trade join must find
+            # (or fail to find) something.
+            PORTFOLIO_ACTIVITIES_PATH: {"activities": [], "eof": True},
         },
     )
     order_events: list[Any] = []

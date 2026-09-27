@@ -337,6 +337,13 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # the `PrivateRead` seam. Old(21) -> new(22); the widened
                 # neighbour below (`_send_signed_request`) is still refused.
                 "_read_open_orders",
+                # EDGE-2 slice D (plan docs/plans/backlog/EDGE_2026-09-27/
+                # EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md,
+                # AC9): the resolver's activities trade-join read. Old(22)
+                # -> new(23); scanned by `EXEC_RESOLVER_COROUTINES`/
+                # `EXEC_RESOLVER_PERMITTED_CALLEES` exactly like
+                # `_resolve_ambiguous_intents` itself.
+                "_order_trade_activity",
                 "__call__",
             }
         ),
@@ -589,6 +596,15 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # own tags -- the SAME intra-module/inert shape as
                 # `DurableFillRecord` above; no I/O.
                 "_AdapterExitAuthorization",
+                # EDGE-2 slice A (plan docs/plans/backlog/EDGE_2026-09-27/
+                # EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md,
+                # AC9 row a): the create-time fill-evidence extractor --
+                # closed-set-token dataclass, no I/O, no path, no payload, no
+                # socket. Closing a companion-pin gap this file's own slice-A
+                # merge left open (this test file was not updated then;
+                # `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES` itself already
+                # carries this row in `client.py`).
+                "submit_chain.create_fill_evidence",
             }
         ),
         widened=frozenset(

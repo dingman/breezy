@@ -122,9 +122,16 @@ class _PrivateReadStub:
     def __init__(self, payloads: dict[str, Mapping[str, Any]]) -> None:
         self._payloads: dict[str, Mapping[str, Any]] = payloads
         self.paths: list[str] = []
+        # EDGE-2 slice D (AC10): every query this stub was called with, in
+        # call order -- paired 1:1 with `self.paths`, so a caller can assert
+        # a specific page's query shape without owning a second stub type.
+        self.queries: list[Mapping[str, object] | None] = []
 
-    async def __call__(self, path: str) -> Mapping[str, Any]:
+    async def __call__(
+        self, path: str, query: Mapping[str, object] | None = None
+    ) -> Mapping[str, Any]:
         self.paths.append(path)
+        self.queries.append(query)
         return self._payloads[path]
 
 

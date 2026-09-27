@@ -86,7 +86,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     decode_private_payload,
 )
 from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused
-from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
+from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, build_query_string
 from breezy.adapters.polymarket_us.operator_controls import DailySpendLedger
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
@@ -718,11 +718,18 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
     (``transport.py:242-325``) -- and signs through
     ``Ed25519RequestSigner.sign_headers``, whose ``PERMITTED_METHODS ==
     frozenset({"GET"})`` (``signing.py:84``) refuses every other verb
-    (``:260-265``). **No ``query`` parameter exists on the closure or on
-    ``PrivateRead.__call__`` itself** -- the same reasoning that keeps a
-    paginated read from being smuggled into a signed path segment applies
-    here: ``query_string`` is always the empty string, so the signature is
-    always over the BARE path.
+    (``:260-265``). **EDGE-2 slice D (AC10, ruling b): the closure now
+    accepts an optional ``query``.** ``PrivateRead.__call__`` renders it
+    EXACTLY ONCE, via
+    :func:`~breezy.adapters.polymarket_us.http.build_query_string` (the same
+    renderer ``PolymarketUSHttpClient._dispatch`` uses), and signs and sends
+    that ONE resulting string -- never two independent renderings that could
+    drift apart. With ``query=None`` (or omitted), the rendered string is
+    ``""``, so the request is BYTE-IDENTICAL to the pre-slice-D closure: the
+    same bare-path canonical string is signed, and no ``?`` is appended to
+    the URL. This is what makes the resolver's own paginated activities read
+    (``exec/client.py``'s ``_order_trade_activity``) possible without a
+    second, parallel signed-read mechanism.
 
     **The durable-store opener is injected, never imported.** This module is
     an ``adapters`` package; ``breezy.runtime.sqlite_store.SqliteStateStore``
@@ -791,14 +798,21 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
         write = _shared_polymarket_us_write_transport(venue_config)
         order_sender = write if WRITE_CANONICAL_STRING_VERIFIED is True else None
 
-        async def private_read(path: str) -> Mapping[str, Any]:
+        async def private_read(
+            path: str, query: Mapping[str, object] | None = None
+        ) -> Mapping[str, Any]:
             """The injected ``PrivateRead``: one signed GET, decoded Decimal-safe.
 
-            No ``query`` parameter, by construction (see the class docstring):
-            the bare ``path`` is what is signed AND what is fetched, so the two
-            can never drift apart. ``PolymarketUSHttpClient`` is deliberately
-            NOT used for this call: its own ``_decode`` (`http.py:249-263`)
-            calls ``json.loads`` with no ``parse_float``, which would silently
+            EDGE-2 slice D (AC10, ruling b): ``query`` is rendered EXACTLY
+            ONCE, by :func:`build_query_string`, into ``qs`` -- and that ONE
+            string feeds BOTH the signer and the URL, mirroring
+            ``PolymarketUSHttpClient._dispatch``'s own invariant
+            (``http.py:17-22``). With ``query=None`` (every existing caller,
+            unchanged), ``qs == ""``: the signed canonical string and the
+            fetched URL are BYTE-IDENTICAL to the pre-slice-D closure.
+            ``PolymarketUSHttpClient`` is deliberately NOT used for this
+            call: its own ``_decode`` (`http.py:249-263`) calls
+            ``json.loads`` with no ``parse_float``, which would silently
             replace a private-surface money literal with a different `float`
             (`exec/endpoints.py` module docstring). ``decode_private_payload``
             is the Decimal-preserving decode this surface requires.
@@ -815,9 +829,13 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             docstring (``exec/client.py``): every implementation, present or
             future, carries this same obligation.
             """
-            headers = dict(signer.sign_headers("GET", path, query_string=""))
+            qs = build_query_string(query)
+            headers = dict(signer.sign_headers("GET", path, query_string=qs))
+            url = f"{stripped_api_base_url}{path}"
+            if qs:
+                url = f"{url}?{qs}"
             response = await transport.get(
-                f"{stripped_api_base_url}{path}",
+                url,
                 headers=headers,
                 quota_key=PRIVATE_READ_QUOTA_KEY,
             )

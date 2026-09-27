@@ -1839,6 +1839,12 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # `_send_signed_request` widened neighbour in
         # `test_cage_rule_constants_are_pinned.py` is still refused.
         "_read_open_orders",
+        # EDGE-2 slice D (AC9): the resolver's activities trade-join read,
+        # paginated over the injected `PrivateRead` seam -- named separately
+        # so its body is scanned by `EXEC_RESOLVER_COROUTINES`/
+        # `EXEC_RESOLVER_PERMITTED_CALLEES` below, exactly like
+        # `_resolve_ambiguous_intents` itself.
+        "_order_trade_activity",
         # The injected read protocol's own call signature.
         "__call__",
     }
@@ -2074,7 +2080,15 @@ EXEC_DECLARED_UNIMPLEMENTED_COROUTINES = frozenset({"_query_order"})
 #: laundered through an unscanned helper would defeat the whole point of an
 #: allowlist.
 EXEC_RESOLVER_COROUTINES = frozenset(
-    {"_resolve_ambiguous_intents", "_resolve_terminal_zero", "_resolve_accept_fill"}
+    {
+        "_resolve_ambiguous_intents",
+        "_resolve_terminal_zero",
+        "_resolve_accept_fill",
+        # EDGE-2 slice D (AC9): the trade-activity join is I/O (paginated
+        # GETs), so it is scanned exactly like `_resolve_ambiguous_intents`
+        # itself, not treated as a plain read-only classifier callee.
+        "_order_trade_activity",
+    }
 )
 
 #: Unlike `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`, this allowlist permits
@@ -2209,6 +2223,34 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # awaits the result; it opens no socket, sends no order, and
         # creates no market-data subscription.
         "self._loop.run_in_executor",
+        # EDGE-2 slice D (AC9, plan docs/plans/backlog/EDGE_2026-09-27/
+        # EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md): the
+        # activities trade-join coroutine and its dispatch wiring. Every
+        # entry below is either the read seam itself, a pure helper with no
+        # callee of its own (`account_activity.py`/`submit_chain.py` are
+        # NOT under `exec/`, so their bodies are not scanned by this rule),
+        # a stdlib builtin over already-in-hand values, or a plain local
+        # read (`self._instrument_provider.list_all`, `self._durable_net_
+        # qty`) -- none reaches `self._order_sender.post_order`, which
+        # stays absent from this set.
+        "self._order_trade_activity",
+        "_redact_order_id",
+        "range",
+        "page.get",
+        "trade_refs.extend",
+        "trade_rows_for_order",
+        "page_min_create_ts_ns",
+        "bool",
+        "len",
+        "sum",
+        "max",
+        "TradeJoin",
+        # AC4(e) baseline: today's-instruments membership check (the SAME
+        # provider walk `_seed_spend_from_durable_fills` already uses) and
+        # the leg-magnitude/durable-net-quantity pair it feeds.
+        "self._instrument_provider.list_all",
+        "_resolver_leg_holding_qty",
+        "self._durable_net_qty",
     }
 )
 

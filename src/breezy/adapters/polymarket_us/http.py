@@ -58,7 +58,12 @@ from breezy.adapters.polymarket_us.transport import (
     assert_permitted_quota_key,
 )
 
-__all__ = ["PERMITTED_METHODS", "PolymarketUSHttpClient", "SupportsVenueLog"]
+__all__ = [
+    "PERMITTED_METHODS",
+    "PolymarketUSHttpClient",
+    "SupportsVenueLog",
+    "build_query_string",
+]
 
 #: Barrier B1. The read-only slice dispatches GET and nothing else.
 PERMITTED_METHODS: frozenset[str] = frozenset({"GET"})
@@ -70,6 +75,39 @@ _UNAUTHORIZED_STATUS: int = 401
 _FORBIDDEN_STATUS: int = 403
 _OK_LOWER: int = 200
 _OK_UPPER: int = 300
+
+
+def build_query_string(query: Mapping[str, object] | None) -> str:
+    """Render ``query`` deterministically: sorted by key, percent-encoded.
+
+    EDGE-2 slice D (AC10, ruling b): lifted verbatim out of
+    :meth:`PolymarketUSHttpClient._build_query_string`, which now delegates
+    to this module-level function -- byte-identical output, one renderer
+    instead of two. This is the SAME string a resolver-side ``PrivateRead``
+    closure (``factories.py``) now signs and sends for a query-carrying GET
+    (``exec/client.py``'s ``_order_trade_activity``), so the "one string,
+    signed and sent" invariant (module docstring above) holds across BOTH
+    callers, not only this client's own dispatch.
+
+    Determinism is not cosmetic. The same string is signed and sent, so any
+    ordering or encoding difference between two renderings of the same
+    mapping would be an intermittent signature failure visible only in
+    production.
+    """
+    if not query:
+        return ""
+    normalised: list[tuple[str, object]] = []
+    for key, value in sorted(query.items()):
+        if isinstance(value, bool):
+            normalised.append((key, str(value).lower()))
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for item in value:
+                normalised.append(
+                    (key, str(item).lower() if isinstance(item, bool) else item)
+                )
+        else:
+            normalised.append((key, value))
+    return urlencode(normalised, quote_via=quote, doseq=True)
 
 
 class SupportsVenueLog(Protocol):
@@ -154,27 +192,11 @@ class PolymarketUSHttpClient:
     # -- internals ----------------------------------------------------------
 
     def _build_query_string(self, query: Mapping[str, object] | None) -> str:
-        """Render ``query`` deterministically: sorted by key, percent-encoded.
-
-        Determinism is not cosmetic. The same string is signed and sent, so any
-        ordering or encoding difference between two renderings of the same
-        mapping would be an intermittent signature failure visible only in
-        production.
+        """Delegates to the module-level :func:`build_query_string` (AC10,
+        ruling b) -- byte-identical output; kept as a method only so every
+        existing call site above stays unchanged.
         """
-        if not query:
-            return ""
-        normalised: list[tuple[str, object]] = []
-        for key, value in sorted(query.items()):
-            if isinstance(value, bool):
-                normalised.append((key, str(value).lower()))
-            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-                for item in value:
-                    normalised.append(
-                        (key, str(item).lower() if isinstance(item, bool) else item)
-                    )
-            else:
-                normalised.append((key, value))
-        return urlencode(normalised, quote_via=quote, doseq=True)
+        return build_query_string(query)
 
     async def _dispatch(
         self,

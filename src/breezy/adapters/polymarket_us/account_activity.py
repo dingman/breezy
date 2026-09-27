@@ -54,7 +54,10 @@ __all__ = [
     "PARSE_STATUS_UNPARSEABLE",
     "PORTFOLIO_ACTIVITIES_PATH",
     "UNRECOGNISED_KIND",
+    "TradeActivityRef",
+    "page_min_create_ts_ns",
     "parse_external_flows",
+    "trade_rows_for_order",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -327,3 +330,155 @@ def parse_external_flows(page: Mapping[str, Any]) -> list[ExternalCapitalFlow]:
             continue
         flows.append(_parse_activity(activity, index, activity_type))
     return flows
+
+
+# ---------------------------------------------------------------------------
+# EDGE-2 slice D (AC4(c)): the resolver's trade-activity join.
+#
+# Authority: docs/plans/backlog/EDGE_2026-09-27/
+# EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md section 5 (file
+# `account_activity.py` row). Pure, no I/O -- the resolver coroutine
+# (`exec/client.py::_order_trade_activity`) owns the paginated GET and hands
+# each decoded page to these functions.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TradeActivityRef:
+    """One ``ACTIVITY_TYPE_TRADE`` activity row naming a specific venue order
+    id, extracted from a portfolio activities page.
+
+    AC3/AC4(c): never carries a price or a dollar amount -- only what the
+    resolver's zero-fill gate needs to prove a trade happened, roughly when,
+    and how much. A malformed ``qtyDecimal`` or ``createTime`` on an
+    otherwise-matched row never drops the match itself (a genuine trade for
+    this order id must never be silently lost); it degrades to ``Decimal(0)``
+    / ``0`` instead, so the row still counts toward ``trade_count``.
+    """
+
+    qty: Decimal
+    create_ts_ns: int
+    is_aggressor: bool
+
+
+def _trade_qty_decimal(trade: Mapping[str, Any]) -> Decimal:
+    raw = trade.get("qtyDecimal")
+    if raw is None:
+        return Decimal(0)
+    try:
+        return Decimal(str(raw))
+    except InvalidOperation:
+        return Decimal(0)
+
+
+def _trade_create_ts_ns(trade: Mapping[str, Any]) -> int:
+    try:
+        return _parse_rfc3339_ns(trade.get("createTime"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def trade_rows_for_order(
+    page: Mapping[str, Any], venue_order_id: str
+) -> tuple[TradeActivityRef, ...]:
+    """AC4(c): every ``ACTIVITY_TYPE_TRADE`` row on ``page`` whose aggressor
+    or passive leg names ``venue_order_id`` -- an EXACT id match on
+    ``trade.aggressor.id`` / ``trade.passive.id`` (captured shape:
+    ``docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/
+    activities_p0.json``).
+
+    ``marketSlug`` is deliberately NOT consulted here: L-17's captured
+    evidence (``activities_slug.json``) proved the venue's ``marketSlug``
+    query parameter is not a trade filter, so this module never treats slug
+    equality as evidence of a match for a SPECIFIC order id either -- only
+    the id itself.
+    """
+    activities = page.get("activities")
+    if not isinstance(activities, list):
+        return ()
+    refs: list[TradeActivityRef] = []
+    for activity in activities:
+        if not isinstance(activity, Mapping):
+            continue
+        if activity.get("type") != "ACTIVITY_TYPE_TRADE":
+            continue
+        trade = activity.get("trade")
+        trade = trade if isinstance(trade, Mapping) else {}
+        aggressor = trade.get("aggressor")
+        aggressor = aggressor if isinstance(aggressor, Mapping) else {}
+        passive = trade.get("passive")
+        passive = passive if isinstance(passive, Mapping) else {}
+        is_aggressor = aggressor.get("id") == venue_order_id
+        is_passive = passive.get("id") == venue_order_id
+        if not (is_aggressor or is_passive):
+            continue
+        refs.append(
+            TradeActivityRef(
+                qty=_trade_qty_decimal(trade),
+                create_ts_ns=_trade_create_ts_ns(trade),
+                is_aggressor=is_aggressor,
+            )
+        )
+    return tuple(refs)
+
+
+def _activity_create_ts_ns(activity: Mapping[str, Any]) -> int | None:
+    """The one timestamp ``activity`` carries, by type, in nanoseconds --
+    mirrors ``scripts/venue/edge2_ambiguous_order_probe.py``'s
+    ``activity_create_time`` type dispatch exactly (trade -> its own
+    ``createTime``; position-resolution -> the after-leg's ``updateTime``;
+    everything else -> the balance-change top-level-then-nested-fallback
+    ``createTime``, L-17). Returns ``None`` if no parseable timestamp is
+    found -- never guessed.
+    """
+    kind = activity.get("type")
+    if kind == "ACTIVITY_TYPE_TRADE":
+        trade = activity.get("trade")
+        raw = trade.get("createTime") if isinstance(trade, Mapping) else None
+    elif kind == "ACTIVITY_TYPE_POSITION_RESOLUTION":
+        resolution = activity.get("positionResolution")
+        after = resolution.get("afterPosition") if isinstance(resolution, Mapping) else None
+        raw = after.get("updateTime") if isinstance(after, Mapping) else None
+    else:
+        balance = activity.get("accountBalanceChange")
+        balance = balance if isinstance(balance, Mapping) else None
+        raw = balance.get("createTime") if balance is not None else None
+        if raw is None:
+            nested = _nested_first(balance)
+            raw = nested.get("createTime") if nested is not None else None
+    try:
+        return _parse_rfc3339_ns(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def page_min_create_ts_ns(page: Mapping[str, Any]) -> int | None:
+    """The minimum activity ``createTime`` on ``page``, in nanoseconds.
+
+    **Observability only (EDGE-2 slice D coordinator amendment,
+    2026-09-27).** Step 0 (``docs/evidence/venue/polymarket_us/
+    AMBIGUOUS_ORDER_2026-09-23_MIA/README.md``) found the account's entire
+    35-row history fit on ONE page (``eof=true``) on every traversal, so the
+    plan's ``min(createTime) < createdNs`` completeness branch was never
+    exercised against the real venue and stays UNLICENSED (follow-up
+    ``EDGE-2-MULTIPAGE``) until a real multi-page traversal is observed and
+    Q2s is re-verified across a page boundary. The resolver's own
+    ``_order_trade_activity`` therefore computes ``complete`` from ``eof``
+    ALONE and never from this value -- this function exists so the running
+    minimum can still be logged (``page_min_create_ts_ns=``) for that future
+    verification.
+
+    Returns ``None`` if no activity on ``page`` carries a parseable
+    timestamp of any kind.
+    """
+    activities = page.get("activities")
+    if not isinstance(activities, list):
+        return None
+    times: list[int] = []
+    for activity in activities:
+        if not isinstance(activity, Mapping):
+            continue
+        ts = _activity_create_ts_ns(activity)
+        if ts is not None:
+            times.append(ts)
+    return min(times) if times else None
