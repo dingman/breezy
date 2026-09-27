@@ -68,6 +68,13 @@ def _mde_for(k_variants: int, min_station_days: int) -> float:
     return recompute_mde(per_variant_alpha=per_variant_alpha, n_station_days=min_station_days)
 
 
+def _mde_for_alpha(programme_alpha: float, k_variants: int, min_station_days: int) -> float:
+    if k_variants < 1:
+        return 0.0
+    per_variant_alpha = (programme_alpha / MAX_HYPOTHESES) / k_variants
+    return recompute_mde(per_variant_alpha=per_variant_alpha, n_station_days=min_station_days)
+
+
 def _valid_kwargs(**overrides: Any) -> dict[str, Any]:
     k_variants = overrides.get("k_variants", 4)
     min_station_days = overrides.get("min_station_days", 300)
@@ -134,6 +141,45 @@ def test_allocated_and_per_variant_alpha_are_assigned_exactly() -> None:
     record = register_hypothesis(**_valid_kwargs(k_variants=4))
     assert record.allocated_alpha == pytest.approx(PROGRAMME_ALPHA / MAX_HYPOTHESES)
     assert record.per_variant_alpha == pytest.approx(record.allocated_alpha / 4)
+
+
+def test_rearm_gating_hypothesis_uses_0_025_not_programme_alpha() -> None:
+    record = register_hypothesis(
+        **_valid_kwargs(
+            k_variants=1,
+            mde_at_allocated_alpha=_mde_for_alpha(0.025, 1, 300),
+            programme_alpha_override=0.025,
+        )
+    )
+    assert record.allocated_alpha == pytest.approx(0.025 / MAX_HYPOTHESES)
+    assert record.per_variant_alpha == pytest.approx(0.00625)
+
+
+def test_missing_programme_alpha_override_keeps_programme_alpha_allocation_and_serialisation() -> (
+    None
+):
+    implicit = register_hypothesis(**_valid_kwargs(k_variants=1))
+    explicit_none = register_hypothesis(
+        **_valid_kwargs(k_variants=1, programme_alpha_override=None)
+    )
+    assert implicit.per_variant_alpha == pytest.approx(PROGRAMME_ALPHA / MAX_HYPOTHESES)
+    assert json.dumps(implicit.to_dict(), sort_keys=True) == json.dumps(
+        explicit_none.to_dict(), sort_keys=True
+    )
+
+
+@pytest.mark.parametrize("override", [0.0, -0.001, PROGRAMME_ALPHA + 0.001])
+def test_programme_alpha_override_must_be_positive_and_no_larger_than_programme_alpha(
+    override: float,
+) -> None:
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            **_valid_kwargs(
+                k_variants=1,
+                mde_at_allocated_alpha=_mde_for_alpha(PROGRAMME_ALPHA, 1, 300),
+                programme_alpha_override=override,
+            )
+        )
 
 
 def test_caller_supplied_alpha_is_refused_structurally() -> None:

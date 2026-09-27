@@ -151,6 +151,7 @@ WEATHER_VENUE: Final[str] = "polymarket_us"
 DEFAULT_STRATEGY: Final[str] = "continuous_rung_hold"
 #: Matches the base plan's own literal command block (§6b.3).
 DEFAULT_LAG_MINUTES: Final[int] = 30
+AUD11_AND_AUD12_LANDED: Final[bool] = False
 
 _DERIVED_ROOT: Final[Path] = Path.home() / ".local/share/breezy/derived"
 DEFAULT_REPLAY_SUFFICIENCY_PATH: Final[Path] = (
@@ -1108,6 +1109,11 @@ def _append_terminal(
     wall_s: float | None = None,
     peak_rss_bytes: int | None = None,
 ) -> None:
+    validity = (
+        "PARAMS_VERIFIED"
+        if params_match is True and AUD11_AND_AUD12_LANDED
+        else REPLAY_VALIDITY
+    )
     row = ReplayResult(
         schema_version=REPLAY_RESULTS_SCHEMA_VERSION,
         run_ts=now_ts(),
@@ -1116,7 +1122,7 @@ def _append_terminal(
         strategy=strategy,
         lag_minutes=config.lag_minutes,
         outcome=outcome,
-        validity=REPLAY_VALIDITY,
+        validity=validity,
         blocked_reason=None,
         exception_type=exception_type,
         family_id=family_id,
