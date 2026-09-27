@@ -246,17 +246,16 @@ def test_importing_the_notifier_never_pulls_in_the_ingest_cli() -> None:
     carries whatever earlier tests in this session imported, so only a
     clean interpreter proves the notifier's own import graph is light.
 
-    NOT asserted here: that `nautilus_trader` itself is absent.
-    `breezy.runtime.__init__` (the PACKAGE this notifier lives in, not this
-    module) already imports `breezy.runtime.composition` eagerly, which
-    imports `nautilus_trader.live.node` -- so importing ANY
-    `breezy.runtime.*` submodule, including this one, already loads
-    Nautilus regardless of this module's own imports. That is a pre-existing
-    coupling in `breezy/runtime/__init__.py`, unrelated to and unfixed by
-    this change (fixing it means lazily loading that package's whole public
-    surface, a separate, larger change) -- verified empirically: a full
-    Nautilus-absence assertion fails even after this fix, solely because of
-    the package `__init__`, not because of anything this module imports.
+    NOT asserted here: that `nautilus_trader` itself is absent. That is
+    `test_runtime_import_isolation.py::test_notifier_import_never_loads_nautilus`
+    (T1)'s job -- it is the test that proves importing this notifier, package
+    and all, leaves `sys.modules` free of `nautilus_trader*`
+    (NOTIFIER-IMPORT-ISOLATION). `breezy/runtime/__init__.py` used to import
+    `breezy.runtime.composition` eagerly, which pulled in
+    `nautilus_trader.live.node` on ANY `breezy.runtime.*` import including
+    this one; that package `__init__` is now import-free, so this test's own
+    narrower assertion (the ingest CLI's absence) and T1's broader one (all of
+    Nautilus) are both satisfied by the same fix.
     """
     script = (
         "import sys\n"
