@@ -73,6 +73,7 @@ framing**:
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -91,6 +92,7 @@ __all__ = [
     "SalvageResult",
     "TruncatedTapeError",
     "inspect_feather_file",
+    "inspect_feather_file_with_stat",
     "list_instance_ids",
     "salvage_feather_file",
     "scan_instance",
@@ -376,11 +378,17 @@ def _classify(scan: _StreamScan) -> FeatherStatus:
     return FeatherStatus.INTACT
 
 
-def _inspect(path: Path, *, collect: bool) -> tuple[FeatherFileReport, pa.Table | None]:
-    try:
-        stat = path.stat()
-    except OSError as exc:
-        raise PreflightError(f"cannot stat {path}: {exc}") from exc
+def _inspect(
+    path: Path,
+    *,
+    collect: bool,
+    stat: os.stat_result | None = None,
+) -> tuple[FeatherFileReport, pa.Table | None, os.stat_result]:
+    if stat is None:
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise PreflightError(f"cannot stat {path}: {exc}") from exc
 
     size = stat.st_size
     mtime_ns = stat.st_mtime_ns
@@ -404,6 +412,7 @@ def _inspect(path: Path, *, collect: bool) -> tuple[FeatherFileReport, pa.Table 
                 failure=None,
             ),
             None,
+            stat,
         )
 
     try:
@@ -424,6 +433,7 @@ def _inspect(path: Path, *, collect: bool) -> tuple[FeatherFileReport, pa.Table 
                 failure=f"{type(exc).__name__}: {exc}",
             ),
             None,
+            stat,
         )
 
     tail = _read_tail(path, len(END_OF_STREAM_MARKER))
@@ -443,6 +453,7 @@ def _inspect(path: Path, *, collect: bool) -> tuple[FeatherFileReport, pa.Table 
             failure=scan.failure,
         ),
         scan.table,
+        stat,
     )
 
 
@@ -458,9 +469,19 @@ def inspect_feather_file(path: Path) -> FeatherFileReport:
     return _inspect(path, collect=False)[0]
 
 
+def inspect_feather_file_with_stat(
+    path: Path,
+    *,
+    stat: os.stat_result | None = None,
+) -> tuple[FeatherFileReport, os.stat_result]:
+    """Classify one feather file and return the stat used for the report."""
+    report, _, used_stat = _inspect(path, collect=False, stat=stat)
+    return report, used_stat
+
+
 def salvage_feather_file(path: Path) -> SalvageResult:
     """Recover the readable prefix of a feather file as an explicit PARTIAL."""
-    report, table = _inspect(path, collect=True)
+    report, table, _ = _inspect(path, collect=True)
     return SalvageResult(report=report, table=table)
 
 

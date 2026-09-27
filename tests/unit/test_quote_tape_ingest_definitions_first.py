@@ -469,13 +469,13 @@ class TestDefinitionPassScansOnlyInstancesNeedingDefinitions:
             path.touch()
 
         scans: list[str] = []
-        real_scan = ingest_cli_module.scan_instance
+        real_scan = ingest_cli_module.scan_instance_memoized
 
         def spy_scan(*args: Any, **kwargs: Any) -> Any:
             scans.append(args[1] if len(args) > 1 else kwargs["instance_id"])
             return real_scan(*args, **kwargs)
 
-        monkeypatch.setattr(ingest_cli_module, "scan_instance", spy_scan)
+        monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", spy_scan)
 
         calls: list[tuple[str, type]] = []
         _touch_fresh(grace_tick_path)

@@ -236,6 +236,7 @@ import argparse
 import logging
 import math
 import os
+import resource
 import subprocess
 import sys
 import time
@@ -255,9 +256,9 @@ from breezy.persistence.feather_preflight import (
     PreflightReport,
     iter_feather_files,
     list_instance_ids,
-    scan_instance,
 )
 from breezy.persistence.feather_read import read_feather_coalesced
+from breezy.persistence.preflight_memo import scan_instance_memoized
 from breezy.runtime.ingest_deadline import (
     DEFAULT_DEADLINE_SECONDS,
     DEFERRED_DEADLINE,
@@ -1850,7 +1851,12 @@ def run_ingest(
         if deadline is not None:
             deadline.note_scan()
         try:
-            preflight_report = scan_instance(catalog_root, instance_id, subdirectory)
+            preflight_report = scan_instance_memoized(
+                catalog_root,
+                instance_id,
+                subdirectory,
+                open_files=frozenset(open_files),
+            )
         except PreflightError as exc:
             results.append(InstanceIngestResult(instance_id, "skipped-truncated", str(exc)))
             continue
@@ -2193,10 +2199,12 @@ def run(
     def _deadline_line(instance_count: int) -> str:
         assert deadline is not None
         elapsed_seconds = deadline.elapsed_ns / 1_000_000_000
+        rss_peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
         return (
             f"{PROGRAM}: deadline budget={deadline_seconds:g}s "
             f"elapsed={elapsed_seconds:.0f}s deferred_units={deadline.deferred_units} "
-            f"deferred_instances={deadline.deferred_instances} instances={instance_count}"
+            f"deferred_instances={deadline.deferred_instances} instances={instance_count} "
+            f"rss_peak_mb={rss_peak_mb}"
         )
 
     try:
