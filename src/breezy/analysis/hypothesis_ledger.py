@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from breezy.settlement.current_rung_hold_v2 import CombinedDraw
 __all__ = [
     "EVIDENCED_FEE_THETA",
     "HYPOTHESIS_LEDGER_SCHEMA_VERSION",
+    "HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2",
     "MAX_HYPOTHESES",
     "MAX_SINGLE_DAY_LEG_SHARE",
     "MAX_VARIANTS_PER_HYPOTHESIS",
@@ -53,12 +55,15 @@ __all__ = [
     "ZERO_TAKE_STATION_DAYS_EXCLUDED",
     "DuplicateHypothesisIdError",
     "DuplicateHypothesisLedgerRecordError",
+    "DuplicateStratumAxisError",
     "HypothesisLedgerRecordError",
     "HypothesisLook",
     "HypothesisRecord",
     "InvalidLookPolicyError",
+    "MalformedStratumRangeError",
     "MdeMismatchError",
     "MissingRegistrationInputError",
+    "MissingStratumAxisError",
     "NonMeanStationDayStatisticError",
     "NonPinnedLegShareCapError",
     "NonPositiveVariantCountError",
@@ -67,8 +72,11 @@ __all__ = [
     "PowerPrimaryOnlyRequiredError",
     "ProgrammeBudgetExhaustedError",
     "StaleFeeThetaError",
+    "StratumFilter",
+    "StratumFilterCountMismatchError",
     "UnjustifiedVarianceBoundError",
     "UnknownHypothesisLedgerSchemaError",
+    "UnknownStratumAxisError",
     "VariantCountCeilingExceededError",
     "ZeroTakeFilterResult",
     "alpha_remaining",
@@ -77,6 +85,7 @@ __all__ = [
     "filter_zero_take_station_days",
     "is_variant_eligible",
     "max_single_day_leg_share",
+    "parse_stratum_filter",
     "pooled_net_pnl_per_contract",
     "programme_budget_remaining",
     "read_hypothesis_ledger",
@@ -89,7 +98,20 @@ __all__ = [
 
 #: Hand-off shape for this item's own artefact -- an unrecognised version is a
 #: hard refusal, never a silent fallback (mirrors AUD-09's H0 discipline).
+#: This is schema V1 -- kept exactly as-is, never bumped in place (RA-2,
+#: EDGE-5 2026-09-27): the 3 existing on-disk rows are written at this
+#: version and must keep reading and round-tripping byte-identically.
 HYPOTHESIS_LEDGER_SCHEMA_VERSION: Final[int] = 1
+#: Schema V2 (RA-2, EDGE-5 2026-09-27): adds `variant_stratum_filters` to
+#: `HypothesisRecord`, the hypothesis/variant -> stratum/draw-population
+#: binding AUD-18 SS7 step 8 names. `read_hypothesis_ledger` accepts both
+#: {1, 2} and refuses anything else; a V1 record never round-trips forward
+#: as V2 (its own `to_dict()` keeps emitting `schema_version: 1` and omits
+#: the new key entirely).
+HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2: Final[int] = 2
+_SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset(
+    {HYPOTHESIS_LEDGER_SCHEMA_VERSION, HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2}
+)
 
 #: Programme-level, fixed BEFORE any intake (SS6.1); never re-derived from data.
 PROGRAMME_ALPHA: Final[float] = 0.05
@@ -230,6 +252,113 @@ class NonPinnedLegShareCapError(ValueError):
     naming `NON_PINNED_LEG_SHARE_CAP`."""
 
 
+class UnknownStratumAxisError(ValueError):
+    """A `variant_stratum_filters` entry names an axis outside the closed,
+    validated vocabulary (`station`, `hour_lst`, `side`, `composition_kind`)
+    -- a wrong or missing axis is a REFUSAL, never a silent gap (RA-2)."""
+
+
+class MalformedStratumRangeError(ValueError):
+    """A `variant_stratum_filters` entry's `hour_lst` value is not `ALL`, a
+    single hour `0-23`, or an ascending `N-M` range within `0-23`."""
+
+
+class DuplicateStratumAxisError(ValueError):
+    """A `variant_stratum_filters` entry names the same axis twice."""
+
+
+class MissingStratumAxisError(ValueError):
+    """A `variant_stratum_filters` entry omits a required axis."""
+
+
+class StratumFilterCountMismatchError(ValueError):
+    """A NORMAL-disposition registration's `variant_stratum_filters` does not
+    have exactly `k_variants` entries."""
+
+
+#: RA-2's closed, validated vocabulary (never a free-form DSL) -- exactly the
+#: axes `RULING_HUNT-1`'s own triggers name (EDGE-5 plan r1 SS5).
+_STRATUM_AXES: Final[tuple[str, ...]] = ("station", "hour_lst", "side", "composition_kind")
+_STRATUM_SIDE_VALUES: Final[frozenset[str]] = frozenset({"YES", "NO", "ALL"})
+_HOUR_LST_RE: Final[re.Pattern[str]] = re.compile(r"^(ALL|[0-9]{1,2}(-[0-9]{1,2})?)$")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StratumFilter:
+    """One parsed, validated `variant_stratum_filters` entry (RA-2).
+
+    Fields are kept as their validated STRING form (never further parsed into
+    e.g. a station tuple) -- `_has_registered_draw_binding` only needs to know
+    a filter parses; matching it against a real replay row's shape is a later
+    slice's scope (EDGE-5 RA-9b), not this one's.
+    """
+
+    station: str
+    hour_lst: str
+    side: str
+    composition_kind: str
+
+
+def _parse_hour_lst(value: str) -> None:
+    if not _HOUR_LST_RE.match(value):
+        raise MalformedStratumRangeError(
+            f"malformed hour_lst {value!r}: expected ALL, a single hour 0-23, "
+            "or an ascending N-M range within 0-23"
+        )
+    if value == "ALL":
+        return
+    bounds = tuple(int(part) for part in value.split("-"))
+    if any(bound < 0 or bound > 23 for bound in bounds):
+        raise MalformedStratumRangeError(f"malformed hour_lst {value!r}: hour(s) out of range 0-23")
+    if len(bounds) == 2 and bounds[0] > bounds[1]:
+        raise MalformedStratumRangeError(
+            f"malformed hour_lst {value!r}: range must be ascending (N <= M)"
+        )
+
+
+def parse_stratum_filter(spec: str) -> StratumFilter:
+    """Parse one pipe-joined `variant_stratum_filters` entry (RA-2):
+
+        station=<ALL|comma-set>|hour_lst=<ALL|N|N-M>|side=<YES|NO|ALL>|composition_kind=<name>
+
+    Refuses an unknown axis, a duplicate axis, a missing axis, an invalid
+    `side`, or a malformed `hour_lst` -- never silently drops or defaults.
+    """
+    values: dict[str, str] = {}
+    for part in spec.split("|"):
+        axis, separator, value = part.partition("=")
+        if not separator:
+            raise UnknownStratumAxisError(
+                f"malformed stratum filter segment {part!r} in {spec!r}: expected axis=value"
+            )
+        if axis not in _STRATUM_AXES:
+            raise UnknownStratumAxisError(
+                f"unknown stratum filter axis {axis!r} in {spec!r}; expected one of {_STRATUM_AXES}"
+            )
+        if axis in values:
+            raise DuplicateStratumAxisError(f"duplicate stratum filter axis {axis!r} in {spec!r}")
+        if not value:
+            raise MissingStratumAxisError(
+                f"stratum filter axis {axis!r} in {spec!r} has an empty value"
+            )
+        values[axis] = value
+    missing = [axis for axis in _STRATUM_AXES if axis not in values]
+    if missing:
+        raise MissingStratumAxisError(f"stratum filter {spec!r} is missing axis(es): {missing}")
+    if values["side"] not in _STRATUM_SIDE_VALUES:
+        raise ValueError(
+            f"stratum filter side must be one of {sorted(_STRATUM_SIDE_VALUES)}, "
+            f"got {values['side']!r} in {spec!r}"
+        )
+    _parse_hour_lst(values["hour_lst"])
+    return StratumFilter(
+        station=values["station"],
+        hour_lst=values["hour_lst"],
+        side=values["side"],
+        composition_kind=values["composition_kind"],
+    )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HypothesisRecord:
     """One programme-level hypothesis pre-registration (SS6.2).
@@ -265,6 +394,13 @@ class HypothesisRecord:
     freeze_commit: str
     status: str
     is_zero_look: bool
+    #: V2-only (RA-2). Always `()` on a V1 record -- `from_dict` never
+    #: populates this from a V1 payload, and `to_dict` never emits the key
+    #: for a V1 record (see `test_v1_record_to_dict_never_emits_variant_stratum_filters`).
+    #: On a V2 look-taking record, length must equal `k_variants`, one
+    #: canonical pipe-joined `parse_stratum_filter`-shaped string per variant,
+    #: in `v1, v2, ...` order.
+    variant_stratum_filters: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in _STATUS_VALUES:
@@ -272,9 +408,29 @@ class HypothesisRecord:
                 f"HypothesisRecord.status must be one of {sorted(_STATUS_VALUES)}, "
                 f"got {self.status!r}"
             )
+        if self.schema_version not in _SUPPORTED_SCHEMA_VERSIONS:
+            raise ValueError(
+                f"HypothesisRecord.schema_version must be one of "
+                f"{sorted(_SUPPORTED_SCHEMA_VERSIONS)}, got {self.schema_version!r}"
+            )
+        if self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION and self.variant_stratum_filters:
+            raise ValueError(
+                f"schema_version={HYPOTHESIS_LEDGER_SCHEMA_VERSION} (V1) records must not "
+                "carry variant_stratum_filters"
+            )
+        if (
+            self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+            and not self.is_zero_look
+            and len(self.variant_stratum_filters) != self.k_variants
+        ):
+            raise StratumFilterCountMismatchError(
+                f"schema_version=2 look-taking record {self.hypothesis_id!r} must carry "
+                f"variant_stratum_filters of length k_variants={self.k_variants}, "
+                f"got {len(self.variant_stratum_filters)}"
+            )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "hypothesis_id": self.hypothesis_id,
             "hypothesis_class": self.hypothesis_class,
@@ -299,10 +455,23 @@ class HypothesisRecord:
             "status": self.status,
             "is_zero_look": self.is_zero_look,
         }
+        if self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2:
+            payload["variant_stratum_filters"] = list(self.variant_stratum_filters)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> HypothesisRecord:
-        known_keys = set(_HYPOTHESIS_RECORD_FIELD_TYPES)
+        version = payload.get("schema_version")
+        if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION:
+            field_types = _HYPOTHESIS_RECORD_FIELD_TYPES_V1
+        elif version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2:
+            field_types = _HYPOTHESIS_RECORD_FIELD_TYPES_V2
+        else:
+            raise HypothesisLedgerRecordError(
+                f"hypothesis_ledger record has unrecognised schema_version {version!r} "
+                f"(expected one of {sorted(_SUPPORTED_SCHEMA_VERSIONS)})"
+            )
+        known_keys = set(field_types)
         keys = set(payload)
         missing = known_keys - keys
         if missing:
@@ -314,7 +483,16 @@ class HypothesisRecord:
             raise HypothesisLedgerRecordError(
                 f"hypothesis_ledger record has unexpected key(s): {sorted(extra)}"
             )
-        for name, expected_type in _HYPOTHESIS_RECORD_FIELD_TYPES.items():
+        for name, expected_type in field_types.items():
+            if name == "variant_stratum_filters":
+                value = payload[name]
+                if not isinstance(value, (list, tuple)) or not all(
+                    isinstance(item, str) for item in value
+                ):
+                    raise HypothesisLedgerRecordError(
+                        f"{name!r} must be a list of str, got {type(value).__name__}"
+                    )
+                continue
             value = payload[name]
             if value is None:
                 if name == "mde_variance_bound_justification":
@@ -339,6 +517,11 @@ class HypothesisRecord:
                 raise HypothesisLedgerRecordError(
                     f"{name!r} must be a str, got {type(value).__name__}"
                 )
+        variant_stratum_filters = (
+            tuple(payload["variant_stratum_filters"])  # type: ignore[arg-type]
+            if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+            else ()
+        )
         return cls(
             schema_version=payload["schema_version"],  # type: ignore[arg-type]
             hypothesis_id=payload["hypothesis_id"],  # type: ignore[arg-type]
@@ -363,10 +546,11 @@ class HypothesisRecord:
             freeze_commit=payload["freeze_commit"],  # type: ignore[arg-type]
             status=payload["status"],  # type: ignore[arg-type]
             is_zero_look=payload["is_zero_look"],  # type: ignore[arg-type]
+            variant_stratum_filters=variant_stratum_filters,
         )
 
 
-_HYPOTHESIS_RECORD_FIELD_TYPES: Final[dict[str, type]] = {
+_HYPOTHESIS_RECORD_FIELD_TYPES_V1: Final[dict[str, type]] = {
     "schema_version": int,
     "hypothesis_id": str,
     "hypothesis_class": str,
@@ -390,6 +574,13 @@ _HYPOTHESIS_RECORD_FIELD_TYPES: Final[dict[str, type]] = {
     "freeze_commit": str,
     "status": str,
     "is_zero_look": bool,
+}
+
+#: V2 = V1 plus RA-2's own field. A V1 payload on disk must NOT carry this
+#: key (`from_dict` refuses an unexpected key); a V2 payload MUST.
+_HYPOTHESIS_RECORD_FIELD_TYPES_V2: Final[dict[str, type]] = {
+    **_HYPOTHESIS_RECORD_FIELD_TYPES_V1,
+    "variant_stratum_filters": tuple,
 }
 
 
@@ -505,6 +696,7 @@ def register_hypothesis(
     order_quantity: int | None = None,
     look_policy: str | None = None,
     programme_alpha_override: float | None = None,
+    variant_stratum_filters: tuple[str, ...] | None = None,
 ) -> HypothesisRecord:
     """Register one hypothesis (SS6.2).
 
@@ -520,6 +712,16 @@ def register_hypothesis(
     `PREREG_WP7_MULTIPLICITY_RULE` already did, elsewhere). `disposition=
     "NORMAL"` (default) is the full look-taking intake path, gated by the
     SS6.1 power check.
+
+    `variant_stratum_filters` (RA-2, EDGE-5 2026-09-27) is the schema-V2
+    hypothesis/variant -> stratum/draw-population binding: omitted (`None`,
+    the default), a NORMAL-disposition registration is written at
+    schema_version=1 exactly as before -- byte-identical to pre-RA-2
+    behaviour. Supplied, it must have exactly `k_variants` entries, each a
+    `parse_stratum_filter`-shaped string; the resulting record (REGISTERED or
+    UNDERPOWERED_NOT_REGISTERED) is written at schema_version=2. Never
+    accepted for `disposition="CLOSED"` -- a zero-look, no-variant-shape
+    record has nothing to bind.
     """
     if k_variants < 1:
         raise NonPositiveVariantCountError(f"k_variants must be >= 1, got {k_variants}")
@@ -538,6 +740,8 @@ def register_hypothesis(
         )
 
     if disposition == "CLOSED":
+        if variant_stratum_filters is not None:
+            raise ValueError("variant_stratum_filters is not applicable to disposition=CLOSED")
         return HypothesisRecord(
             schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION,
             hypothesis_id=hypothesis_id,
@@ -595,6 +799,20 @@ def register_hypothesis(
     assert station_day_statistic is not None
     assert order_quantity is not None
     assert look_policy is not None
+
+    if variant_stratum_filters is None:
+        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION
+        stored_stratum_filters: tuple[str, ...] = ()
+    else:
+        if len(variant_stratum_filters) != k_variants:
+            raise StratumFilterCountMismatchError(
+                f"variant_stratum_filters has {len(variant_stratum_filters)} entries, "
+                f"expected k_variants={k_variants}"
+            )
+        for spec in variant_stratum_filters:
+            parse_stratum_filter(spec)
+        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+        stored_stratum_filters = tuple(variant_stratum_filters)
 
     if k_variants > MAX_VARIANTS_PER_HYPOTHESIS:
         raise VariantCountCeilingExceededError(
@@ -657,7 +875,7 @@ def register_hypothesis(
 
     if recomputed_mde > mde_plausibility_bound:
         return HypothesisRecord(
-            schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION,
+            schema_version=record_schema_version,
             hypothesis_id=hypothesis_id,
             hypothesis_class=hypothesis_class,
             registered_at=registered_at,
@@ -680,10 +898,11 @@ def register_hypothesis(
             freeze_commit=freeze_commit,
             status="UNDERPOWERED_NOT_REGISTERED",
             is_zero_look=True,
+            variant_stratum_filters=stored_stratum_filters,
         )
 
     return HypothesisRecord(
-        schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION,
+        schema_version=record_schema_version,
         hypothesis_id=hypothesis_id,
         hypothesis_class=hypothesis_class,
         registered_at=registered_at,
@@ -706,6 +925,7 @@ def register_hypothesis(
         freeze_commit=freeze_commit,
         status="REGISTERED",
         is_zero_look=False,
+        variant_stratum_filters=stored_stratum_filters,
     )
 
 
@@ -846,10 +1066,10 @@ def read_hypothesis_ledger(path: Path) -> tuple[HypothesisRecord, ...]:
                 continue
             payload = json.loads(line)
             version = payload.get("schema_version")
-            if version != HYPOTHESIS_LEDGER_SCHEMA_VERSION:
+            if version not in _SUPPORTED_SCHEMA_VERSIONS:
                 raise UnknownHypothesisLedgerSchemaError(
                     f"{path}:{line_number}: unknown hypothesis_ledger schema_version "
-                    f"{version!r} (expected {HYPOTHESIS_LEDGER_SCHEMA_VERSION})"
+                    f"{version!r} (expected one of {sorted(_SUPPORTED_SCHEMA_VERSIONS)})"
                 )
             record = HypothesisRecord.from_dict(payload)
             if record.hypothesis_id in seen:

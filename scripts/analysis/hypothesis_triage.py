@@ -33,14 +33,19 @@ from pathlib import Path
 
 from breezy.analysis.hypothesis_ledger import (
     HYPOTHESIS_LEDGER_SCHEMA_VERSION,
+    DuplicateStratumAxisError,
     HypothesisLedgerRecordError,
     HypothesisLook,
     HypothesisRecord,
+    MalformedStratumRangeError,
+    MissingStratumAxisError,
     UnknownHypothesisLedgerSchemaError,
+    UnknownStratumAxisError,
     evaluate_pooled_pnl_veto,
     filter_zero_take_station_days,
     is_variant_eligible,
     max_single_day_leg_share,
+    parse_stratum_filter,
     pooled_net_pnl_per_contract,
     read_hypothesis_ledger,
     station_day_mean_x,
@@ -481,16 +486,57 @@ def _horizon_reached(record: HypothesisRecord, *, as_of: str, horizon_days: int)
     return parked_for > horizon_days
 
 
-def _has_registered_draw_binding(record: HypothesisRecord, variant_id: str) -> bool:
-    """Current schema has no hypothesis/variant -> stratum/draw-population key.
+_VARIANT_ID_RE = re.compile(r"^v(\d+)$")
 
-    The strict ledger reader accepts exactly the fields on `HypothesisRecord`;
-    none names a stratum, station set, replay strategy/lag, or variant-specific
-    draw population. Until a future schema adds that field, every look-taking
-    record fails closed instead of consuming the global replay corpus.
+_STRATUM_FILTER_PARSE_ERRORS = (
+    UnknownStratumAxisError,
+    MalformedStratumRangeError,
+    DuplicateStratumAxisError,
+    MissingStratumAxisError,
+    ValueError,
+)
+
+
+def _variant_index(variant_id: str) -> int | None:
+    """`"v1"` -> `0`, `"v2"` -> `1`, ... `None` for an unrecognised shape.
+
+    Every `variant_id` this module itself generates comes from `_variant_ids`
+    (`"v{1..k_variants}"`); a shape this doesn't recognise is never produced
+    internally, but this stays total (never raises) so a caller can't turn an
+    unexpected id into an unhandled exception mid-triage.
     """
-    _ = (record, variant_id)
-    return False
+    match = _VARIANT_ID_RE.match(variant_id)
+    if match is None:
+        return None
+    return int(match.group(1)) - 1
+
+
+def _has_registered_draw_binding(record: HypothesisRecord, variant_id: str) -> bool:
+    """RA-2 (EDGE-5, 2026-09-27): a real predicate over the schema-v2
+    `variant_stratum_filters` field.
+
+    Fails closed for a DIFFERENT, more specific reason than before: a V1
+    record (or a V2 record whose `variant_stratum_filters` entry for this
+    variant is absent, empty, or does not parse) has "no filter registered
+    for this variant" rather than "the schema has no such field at all" --
+    the schema now has the field; this checks whether IT was populated.
+    Never raises: an index out of range or a malformed stored filter is a
+    missing binding, not a crash.
+    """
+    index = _variant_index(variant_id)
+    if index is None:
+        return False
+    filters = record.variant_stratum_filters
+    if index >= len(filters):
+        return False
+    spec = filters[index]
+    if not spec:
+        return False
+    try:
+        parse_stratum_filter(spec)
+    except _STRATUM_FILTER_PARSE_ERRORS:
+        return False
+    return True
 
 
 def _skip(record: HypothesisRecord, variant_id: str, reason: str) -> None:

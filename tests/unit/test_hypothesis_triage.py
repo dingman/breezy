@@ -23,6 +23,7 @@ from hypothesis_triage import (  # noqa: E402
     AlreadyLookedRefusal,
     DuplicateHypothesisLookError,
     ZeroLookRefusal,
+    _has_registered_draw_binding,
     append_hypothesis_evaluation,
     assert_look_permitted,
 )
@@ -900,3 +901,109 @@ def test_triage_clean_on_cli_written_closed_plus_no_side_ledger(tmp_path: Path) 
     assert len(alerts2) == 1
     assert alerts2[0]["severity"] == "CRITICAL"
     assert alerts2[0]["event"] == "HYPOTHESIS_TRIAGE_FAILED"
+
+
+# --------------------------------------------------------------------------
+# RA-2 (EDGE-5, 2026-09-27): _has_registered_draw_binding real predicate
+# --------------------------------------------------------------------------
+
+
+def test_has_registered_draw_binding_true_for_a_matching_filter() -> None:
+    record = register_hypothesis(
+        hypothesis_id="H-BINDING-TRUE",
+        hypothesis_class="ALL_HOURS",
+        registered_at="2026-09-27",
+        k_variants=1,
+        freeze_commit="abc1234",
+        existing_records=(),
+        min_station_days=300,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=recompute_mde(
+            per_variant_alpha=PROGRAMME_ALPHA / MAX_HYPOTHESES, n_station_days=300
+        ),
+        mde_plausibility_bound=1.0,
+        power_is_primary_only=True,
+        mde_reference_ask=0.30,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=0.01,
+        mde_variance_bound=VARIANCE_BOUND,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=1,
+        look_policy="SINGLE_LOOK",
+        variant_stratum_filters=("station=SFO|hour_lst=10-11|side=YES|composition_kind=taker",),
+    )
+    assert _has_registered_draw_binding(record, "v1") is True
+
+
+def test_has_registered_draw_binding_false_and_names_the_missing_variant() -> None:
+    # A v1 record: the schema field is entirely absent (empty tuple).
+    v1_record = register_hypothesis(
+        hypothesis_id="H-BINDING-FALSE-V1",
+        hypothesis_class="ALL_HOURS",
+        registered_at="2026-09-27",
+        k_variants=1,
+        freeze_commit="abc1234",
+        existing_records=(),
+        min_station_days=300,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=recompute_mde(
+            per_variant_alpha=PROGRAMME_ALPHA / MAX_HYPOTHESES, n_station_days=300
+        ),
+        mde_plausibility_bound=1.0,
+        power_is_primary_only=True,
+        mde_reference_ask=0.30,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=0.01,
+        mde_variance_bound=VARIANCE_BOUND,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=1,
+        look_policy="SINGLE_LOOK",
+    )
+    assert _has_registered_draw_binding(v1_record, "v1") is False
+
+    # A v2 record with 2 variants, both legitimately registered (register_
+    # hypothesis validates every entry eagerly -- it never accepts an empty
+    # or malformed filter at intake).
+    v2_record = register_hypothesis(
+        hypothesis_id="H-BINDING-FALSE-V2",
+        hypothesis_class="ALL_HOURS",
+        registered_at="2026-09-27",
+        k_variants=2,
+        freeze_commit="abc1234",
+        existing_records=(v1_record,),
+        min_station_days=300,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=recompute_mde(
+            per_variant_alpha=(PROGRAMME_ALPHA / MAX_HYPOTHESES) / 2, n_station_days=300
+        ),
+        mde_plausibility_bound=1.0,
+        power_is_primary_only=True,
+        mde_reference_ask=0.30,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=0.01,
+        mde_variance_bound=VARIANCE_BOUND,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=1,
+        look_policy="SINGLE_LOOK",
+        variant_stratum_filters=(
+            "station=SFO|hour_lst=10-11|side=YES|composition_kind=taker",
+            "station=MDW|hour_lst=10-11|side=YES|composition_kind=taker",
+        ),
+    )
+    assert _has_registered_draw_binding(v2_record, "v1") is True
+    assert _has_registered_draw_binding(v2_record, "v2") is True
+
+    # `from_dict` (the READ path) only checks variant_stratum_filters is a
+    # list of str -- it does not re-parse each entry. A corrupted/incomplete
+    # on-disk row (v2's own binding blank) must still fail closed for v2
+    # without disturbing v1's real binding -- exercised via `replace`,
+    # mirroring what a read of such a row would reconstruct.
+    corrupted = replace(
+        v2_record,
+        variant_stratum_filters=(
+            "station=SFO|hour_lst=10-11|side=YES|composition_kind=taker",
+            "",
+        ),
+    )
+    assert _has_registered_draw_binding(corrupted, "v1") is True
+    assert _has_registered_draw_binding(corrupted, "v2") is False
