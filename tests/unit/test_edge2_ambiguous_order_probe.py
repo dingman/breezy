@@ -1,5 +1,7 @@
-"""EDGE-2 Step 0: the read-only MIA 09-23 ambiguous-order probe
-(``scripts/venue/edge2_ambiguous_order_probe.py``).
+"""EDGE-2 Step 0: the read-only MIA 09-23 ambiguous-order probe, archived
+after its one run as ``docs/evidence/venue/polymarket_us/
+AMBIGUOUS_ORDER_2026-09-23_MIA/edge2_ambiguous_order_probe.py.txt`` (it lived
+at ``scripts/venue/edge2_ambiguous_order_probe.py`` while active).
 
 Authority: ``docs/plans/backlog/EDGE_2026-09-27/
 EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md`` section 6 (Step
@@ -24,17 +26,37 @@ import os
 import stat
 import sys
 from decimal import Decimal
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPT_PATH = _REPO_ROOT / "scripts" / "venue" / "edge2_ambiguous_order_probe.py"
+#: Archived after the 09-27 EDGE-2 batch-2 gate (repo-wide read-only guards
+#: B1-B6 scan `scripts/` for order-path literals by design): this one-shot,
+#: already-run probe is evidence now, not a live script, so it lives beside
+#: the evidence pack it produced -- mirroring the 09-05 SFO precedent
+#: (`docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/
+#: probe.py.txt`). To re-run it: copy this file back to `scripts/venue/`,
+#: run it, then remove it again.
+_SCRIPT_PATH = (
+    _REPO_ROOT
+    / "docs"
+    / "evidence"
+    / "venue"
+    / "polymarket_us"
+    / "AMBIGUOUS_ORDER_2026-09-23_MIA"
+    / "edge2_ambiguous_order_probe.py.txt"
+)
 
 
 def _load_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("edge2_ambiguous_order_probe", _SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "edge2_ambiguous_order_probe",
+        _SCRIPT_PATH,
+        loader=SourceFileLoader("edge2_ambiguous_order_probe", str(_SCRIPT_PATH)),
+    )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
