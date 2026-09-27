@@ -43,8 +43,10 @@ is actually light.
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Final
 
@@ -53,6 +55,9 @@ import pytest
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SRC_DIR: Final[Path] = REPO_ROOT / "src"
 RUNTIME_INIT_PATH: Final[Path] = SRC_DIR / "breezy" / "runtime" / "__init__.py"
+PYPROJECT_PATH: Final[Path] = REPO_ROOT / "pyproject.toml"
+DEPLOY_SYSTEMD_DIR: Final[Path] = REPO_ROOT / "deploy" / "systemd"
+SCRIPTS_DIR: Final[Path] = REPO_ROOT / "scripts"
 
 #: The Stage 0 entry set (D-2 + R3-2), reproduced here so T9 is
 #: self-documenting: every `[project.scripts]` entry (`pyproject.toml:306-381`,
@@ -98,7 +103,122 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # package.
     "breezy.strategy.current_rung_hold.clear_family_halt_cli",
     "breezy.strategy.current_rung_hold.set_family_halt_cli",
+    # `deploy/systemd/{family-tally-v2,live-tally,score-live-trials}-run.sh`
+    # all invoke `"$PY" -m breezy.runtime.exec_state_db_path --check`, and
+    # `family-tally-v2-run.sh` additionally invokes `"$PY" -m
+    # breezy.runtime.structural_pin_guard`. Both were missing from this list
+    # (independent review finding, NOTIFIER-IMPORT-ISOLATION) despite being
+    # real `-m` entry points reachable from a deployed wrapper script.
+    "breezy.runtime.exec_state_db_path",
+    "breezy.runtime.structural_pin_guard",
 )
+
+#: Entries that WOULD be required by `test_entry_module_list_covers_every_
+#: entry_point`'s derivation below but are deliberately not tracked in
+#: `STAGE0_ENTRY_MODULES`. Empty today -- Stage 0 plus this review found no
+#: entry that needs the escape hatch -- but the mechanism must exist so a
+#: future deliberate exclusion is a one-line, commented, test-asserted
+#: decision rather than a silent omission.
+STAGE0_EXCLUDED_ENTRY_MODULES: Final[frozenset[str]] = frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Meta-test (independent review finding, MEDIUM): STAGE0_ENTRY_MODULES is a
+# hard-coded tuple, so a newly added entry point could go untested without
+# anyone noticing. This derives the entry set FRESH, at test time, from the
+# same three sources Stage 0 used, and pins STAGE0_ENTRY_MODULES against it.
+# ---------------------------------------------------------------------------
+
+
+def _entry_modules_from_pyproject_scripts() -> set[str]:
+    """(a) Every `[project.scripts]` target module, `pyproject.toml:306-381`."""
+    data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+    scripts = data["project"]["scripts"]
+    return {target.split(":", 1)[0] for target in scripts.values()}
+
+
+def _entry_modules_from_systemd() -> set[str]:
+    """(b) Every Python module named in a `deploy/systemd/**` `ExecStart=`
+    line (`-m module` and bare `path/to/module.py` forms), plus every `-m
+    breezy.<mod>` invocation found inside a `deploy/systemd/*.sh` wrapper
+    script (an `ExecStart=` line that only names the wrapper can't show
+    this -- the module lives one hop down, inside the script).
+    """
+    exec_start_re = re.compile(r"^ExecStart=(.*)$", re.MULTILINE)
+    module_flag_re = re.compile(r"(?:^|\s)-m\s+([A-Za-z_][\w.]*)")
+    py_path_re = re.compile(r"(?:^|/)(scripts/[\w/]+)\.py\b")
+    wrapper_module_re = re.compile(r"(?:^|\s)-m\s+(breezy\.[\w.]*)")
+
+    modules: set[str] = set()
+    for service_path in sorted(DEPLOY_SYSTEMD_DIR.rglob("*.service")):
+        text = service_path.read_text(encoding="utf-8")
+        for exec_line in exec_start_re.finditer(text):
+            line = exec_line.group(1)
+            modules.update(module_flag_re.findall(line))
+            modules.update(m.replace("/", ".") for m in py_path_re.findall(line))
+
+    for sh_path in sorted(DEPLOY_SYSTEMD_DIR.rglob("*.sh")):
+        text = sh_path.read_text(encoding="utf-8")
+        modules.update(wrapper_module_re.findall(text))
+
+    return modules
+
+
+def _entry_modules_from_scripts_importing_runtime() -> set[str]:
+    """(c) Every `scripts/**/*.py` that actually imports `breezy.runtime`
+    (an `Import`/`ImportFrom` AST node, so a comment-only mention such as
+    `scripts/archive/backup_irreplaceable_data.py` is excluded).
+    """
+    modules: set[str] = set()
+    for script_path in sorted(SCRIPTS_DIR.rglob("*.py")):
+        tree = ast.parse(script_path.read_text(encoding="utf-8"), filename=str(script_path))
+        imports_runtime = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(
+                    alias.name == "breezy.runtime" or alias.name.startswith("breezy.runtime.")
+                    for alias in node.names
+                ):
+                    imports_runtime = True
+            elif isinstance(node, ast.ImportFrom) and node.module and (
+                node.module == "breezy.runtime" or node.module.startswith("breezy.runtime.")
+            ):
+                imports_runtime = True
+        if imports_runtime:
+            rel = script_path.relative_to(REPO_ROOT)
+            modules.add(".".join(rel.with_suffix("").parts))
+    return modules
+
+
+def test_entry_module_list_covers_every_entry_point() -> None:
+    """Never RED at HEAD once green -- this is the drift guard. RED proof
+    (both confirmed by hand for this fix): (1) deleting any single entry
+    from `STAGE0_ENTRY_MODULES` makes this fail, naming that entry; (2)
+    before `breezy.runtime.exec_state_db_path` /
+    `breezy.runtime.structural_pin_guard` were added to the tuple, this
+    failed naming exactly those two -- they are real `-m` entries in the
+    `deploy/systemd/*-run.sh` wrappers (source (b)) that the hard-coded
+    tuple had never picked up.
+    """
+    required = (
+        _entry_modules_from_pyproject_scripts()
+        | _entry_modules_from_systemd()
+        | _entry_modules_from_scripts_importing_runtime()
+    )
+    tracked = set(STAGE0_ENTRY_MODULES)
+
+    assert STAGE0_EXCLUDED_ENTRY_MODULES <= required, (
+        "STAGE0_EXCLUDED_ENTRY_MODULES contains an entry that no longer "
+        "derives from pyproject.toml/deploy/systemd/scripts -- remove it: "
+        f"{sorted(STAGE0_EXCLUDED_ENTRY_MODULES - required)}"
+    )
+
+    missing = (required - STAGE0_EXCLUDED_ENTRY_MODULES) - tracked
+    assert not missing, (
+        "entry point(s) not covered by STAGE0_ENTRY_MODULES -- add each to "
+        "the tuple, or, if deliberately untested, to "
+        f"STAGE0_EXCLUDED_ENTRY_MODULES with a comment explaining why: {sorted(missing)}"
+    )
 
 #: Prepended to every T2/T3 child script (D-3). Installs a `find_spec`
 #: finder -- `find_module` no longer exists on Python 3.13
@@ -148,6 +268,12 @@ def _run_child(script: str, *, timeout: float = 30.0) -> subprocess.CompletedPro
 
 
 def _assert_positive_control(result: subprocess.CompletedProcess[str]) -> None:
+    """Proves the `_BlockNautilus` meta-path finder installed by
+    `_FINDER_PREAMBLE` is actually present and actually intercepting in this
+    child -- not that the notifier's own import chain would otherwise reach
+    Nautilus without it. That absence-vs-presence fact is T1's job
+    (`test_notifier_import_never_loads_nautilus`), not this helper's.
+    """
     combined = result.stdout + result.stderr
     assert "POSITIVE_CONTROL_FAILED" not in combined, combined
     assert "BLOCKED=" in result.stdout, combined
@@ -301,9 +427,12 @@ print("OK")
 
 # ---------------------------------------------------------------------------
 # T9 (R3-2): fresh-process import smoke, one per Stage 0 entry. Never RED at
-# HEAD (nothing is broken yet) -- this is the regression guard that catches
-# mutant M-e (a module-scope `breezy.runtime.health` import added to
-# `nws_actor`) and any future entry that comes to depend on the eager chain.
+# HEAD (nothing is broken yet) -- this is the regression guard for any future
+# entry that comes to depend on the eager chain. Mutant M-e (a module-scope
+# `breezy.runtime.health` import added to `nws_actor`) is structurally inert
+# once D-1 is applied (there is no eager chain left for it to depend on); T7
+# (`test_runtime_init_has_no_import_nodes`, the AST pin on `__init__.py`) is
+# the operative guard against it, not this test.
 # ---------------------------------------------------------------------------
 
 
