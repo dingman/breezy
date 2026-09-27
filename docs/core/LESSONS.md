@@ -1620,5 +1620,9 @@ Before a read can retire, clear, or credit anything, state which outcomes it can
 ### How to apply
 - Name the distinguishing evidence in the plan, and test each collapsed case explicitly. For example: an unreadable index means stays AMBIGUOUS; completeness counts only at eof; an I/O failure means retry, never absent.
 - A new detector must ship with its delivery path, proven end to end (09-20 alerts-reach-nobody).
+- **Amendment (2026-09-27, ING-2-RSS):** a `caplog` test does not prove delivery.
+  - The `extend_dedupe:` line was written with `logger.info` and pinned by caplog tests. Its sibling lines all use `print(..., file=out)`.
+  - Production configures no INFO handler for that logger, so the first live run (11:30Z) logged nothing. Every test was still green.
+  - Rule: an operator-visible line must be asserted on the stream the unit actually writes to, meaning the entrypoint's stdout or journal. It must also be checked in the journal after the first live run, before the item is called done.
 
 Related: L-36 (strict ZERO_FILL is unreachable), EDGE-2 plan r3, `AMBIGUOUS_ORDER_2026-09-23_MIA/README.md`, SUP-ADOPT-PERMIT.
