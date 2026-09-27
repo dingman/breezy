@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import breezy.analysis.hypothesis_ledger as hypothesis_ledger_module
 from breezy.analysis.hypothesis_ledger import (
     _SUPPORTED_SCHEMA_VERSIONS,
     EVIDENCED_FEE_THETA,
@@ -26,6 +27,7 @@ from breezy.analysis.hypothesis_ledger import (
     MAX_SINGLE_DAY_LEG_SHARE,
     MAX_VARIANTS_PER_HYPOTHESIS,
     MIN_PER_VARIANT_ALPHA,
+    PATH_B_SOURCE_GATE_LANDED,
     PROGRAMME_ALPHA,
     RE_ARM_GATING_PROGRAMME_ALPHA,
     RULED_HORIZON_DAYS,
@@ -45,6 +47,7 @@ from breezy.analysis.hypothesis_ledger import (
     NonPinnedLegShareCapError,
     NonPositiveVariantCountError,
     NonUnitOrderQuantityError,
+    PathBSourceGateNotLandedError,
     PowerPrimaryOnlyRequiredError,
     ProgrammeBudgetExhaustedError,
     StaleFeeThetaError,
@@ -52,6 +55,7 @@ from breezy.analysis.hypothesis_ledger import (
     UnjustifiedVarianceBoundError,
     UnknownHypothesisLedgerSchemaError,
     UnknownStratumAxisError,
+    V2LookTakingRegistrationRefusedError,
     VariantCountCeilingExceededError,
     alpha_remaining,
     break_even,
@@ -122,6 +126,20 @@ def _valid_kwargs(**overrides: Any) -> dict[str, Any]:
     }
     kwargs.update(overrides)
     return kwargs
+
+
+def _as_v2(record: HypothesisRecord, filters: tuple[str, ...]) -> HypothesisRecord:
+    """Build a genuine schema_version=2 look-taking (non-zero-look) record
+    from a v1 record `register_hypothesis` already computed, for tests that
+    need that shape even though `register_hypothesis` itself now refuses a
+    v2 REGISTERED outcome. `__post_init__` re-validates the filter count
+    against `k_variants`, and every alpha/MDE value stays
+    `register_hypothesis`'s own output (V2-LOOK-GATE r2 V-1)."""
+    return dc_replace(
+        record,
+        schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
+        variant_stratum_filters=filters,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -563,9 +581,11 @@ def test_read_hypothesis_ledger_accepts_v1_v2_v3_and_refuses_v4(tmp_path: Path) 
             hypothesis_id="H-V2",
             k_variants=1,
             variant_stratum_filters=(_VALID_FILTER,),
+            mde_plausibility_bound=0.01,
         )
     )
     assert v2_record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+    assert v2_record.status == "UNDERPOWERED_NOT_REGISTERED"
     path = tmp_path / "hypothesis_ledger.jsonl"
     write_hypothesis_ledger(path, (v1_record, v2_record))
     round_tripped = {r.hypothesis_id: r for r in read_hypothesis_ledger(path)}
@@ -607,6 +627,7 @@ def test_v2_record_to_dict_emits_its_own_variant_stratum_filters() -> None:
             hypothesis_id="H-V2-DICT",
             k_variants=1,
             variant_stratum_filters=(_VALID_FILTER,),
+            mde_plausibility_bound=0.01,
         )
     )
     payload = record.to_dict()
@@ -630,6 +651,7 @@ def test_mixed_v1_v2_whole_file_rewrite_leaves_existing_v1_lines_byte_identical(
             k_variants=1,
             existing_records=existing,
             variant_stratum_filters=(_VALID_FILTER,),
+            mde_plausibility_bound=0.01,
         )
     )
     write_hypothesis_ledger(path, (*existing, new_v2))
@@ -947,13 +969,10 @@ def test_undeclared_v1_v2_record_cannot_gate_re_arm() -> None:
     v1 = register_hypothesis(**_valid_kwargs(hypothesis_id="H-UNDECLARED-V1"))
     assert v1.re_arm_gating is None
     assert may_gate_re_arm(v1) is False
-    v2 = register_hypothesis(
-        **_valid_kwargs(
-            hypothesis_id="H-UNDECLARED-V2",
-            k_variants=1,
-            variant_stratum_filters=(_VALID_FILTER,),
-        )
+    v1_for_v2 = register_hypothesis(
+        **_valid_kwargs(hypothesis_id="H-UNDECLARED-V2", k_variants=1)
     )
+    v2 = _as_v2(v1_for_v2, (_VALID_FILTER,))
     assert v2.re_arm_gating is None
     assert may_gate_re_arm(v2) is False
 
@@ -1100,12 +1119,88 @@ def test_replace_record_status_refuses_frozen_field_change() -> None:
     assert updated.is_zero_look == record.is_zero_look
 
 
+# --------------------------------------------------------------------------
+# V2-LOOK-GATE (RULING_RA-9 Path B item 3/A-3, Path B item 1): a v2 REGISTERED
+# outcome is refused permanently; a v3 REGISTERED outcome needs BOTH
+# HORIZON_TOLLING_LANDED and PATH_B_SOURCE_GATE_LANDED.
+# --------------------------------------------------------------------------
+
+
+def test_v2_look_taking_registration_is_refused() -> None:
+    """RA-9 Path B item 3 / A-3: v2 has no field to declare re-arm gating, so
+    a REGISTERED (look-taking) outcome is refused outright.
+    `k_variants=1` pins the refusal to schema_version, not variant count
+    (kills the mutant that refuses only when k_variants > 1)."""
+    with pytest.raises(V2LookTakingRegistrationRefusedError) as excinfo:
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-V2-LOOK-REFUSED",
+                k_variants=1,
+                variant_stratum_filters=(_VALID_FILTER,),
+            )
+        )
+    message = str(excinfo.value)
+    assert "RA-9" in message
+    assert "Path B" in message
+
+
+def test_v2_underpowered_registration_still_writes_v2() -> None:
+    """Guard (RA-9 Path A): an UNDERPOWERED v2 outcome is unaffected by the
+    REGISTERED-branch-only refusal above and still writes schema_version=2
+    with its filters."""
+    record = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-V2-UNDERPOWERED-GUARD",
+            k_variants=1,
+            variant_stratum_filters=(_VALID_FILTER,),
+            mde_plausibility_bound=0.01,
+        )
+    )
+    assert record.status == "UNDERPOWERED_NOT_REGISTERED"
+    assert record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+    assert record.variant_stratum_filters == (_VALID_FILTER,)
+    assert record.is_zero_look is True
+
+
+def test_v2_refusal_survives_tolling_flag_flip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kills the mutant that conditions the v2 refusal on
+    `not HORIZON_TOLLING_LANDED` -- RA-9f's flip must never re-admit a v2
+    REGISTERED record; the refusal is unconditional."""
+    monkeypatch.setattr(hypothesis_ledger_module, "HORIZON_TOLLING_LANDED", True)
+    with pytest.raises(V2LookTakingRegistrationRefusedError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-V2-TOLLING-FLIP",
+                k_variants=1,
+                variant_stratum_filters=(_VALID_FILTER,),
+            )
+        )
+
+
 def test_v3_look_taking_refused_while_tolling_not_landed() -> None:
     assert HORIZON_TOLLING_LANDED is False
     with pytest.raises(HorizonTollingNotLandedError):
         register_hypothesis(
             **_valid_kwargs(
                 hypothesis_id="H-V3-TOLLING",
+                k_variants=1,
+                re_arm_gating=False,
+                variant_stratum_filters=(_VALID_FILTER,),
+            )
+        )
+
+
+def test_v3_tolling_flip_alone_still_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RA-9 Path B item 1: flipping `HORIZON_TOLLING_LANDED` alone must not
+    admit a v3 REGISTERED record -- `PATH_B_SOURCE_GATE_LANDED` (the
+    PATH-B-SOURCE-GATE follow-up item) still refuses it. Kills the mutant
+    that drops this second flag check."""
+    monkeypatch.setattr(hypothesis_ledger_module, "HORIZON_TOLLING_LANDED", True)
+    assert PATH_B_SOURCE_GATE_LANDED is False
+    with pytest.raises(PathBSourceGateNotLandedError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-V3-SOURCE-GATE",
                 k_variants=1,
                 re_arm_gating=False,
                 variant_stratum_filters=(_VALID_FILTER,),
