@@ -295,6 +295,7 @@ from breezy.runtime.quote_tape_salvage import (
     ExtendWriteMismatch,
     _file_belongs_to_data_cls,
     _is_salvage_marked,
+    extend_dedupe_counters,
     salvage_truncated_instance,
     write_fresh_capture_rows,
 )
@@ -932,7 +933,13 @@ def _extend_table_chunked(
     internal transform call is then a no-op, since the slice is already
     sorted) and written with
     :func:`breezy.runtime.quote_tape_salvage.write_fresh_capture_rows`, one
-    chunk fully written before the next chunk is even converted. An
+    chunk fully written before the next chunk is even converted. ING-2-RSS:
+    that dedupe is now a guarded, identifier-filtered native ``query`` for
+    the metadata-keyed tick types (``QuoteTick``, ``TradeTick``,
+    ``OrderBookDepth10``) whenever the type root holds no FLAT file --
+    reading only this chunk's own instruments instead of every landed
+    instrument in the window. Every other type, and any tick-type root that
+    does hold a FLAT file, keeps the unfiltered query unchanged. An
     :class:`~breezy.runtime.quote_tape_salvage.ExtendWriteMismatch` from a
     later chunk propagates immediately: earlier chunks' writes stand, and a
     rerun over the same (unmodified) source is idempotent, because the
@@ -2352,6 +2359,7 @@ def run(
             f"rss_peak_mb={rss_peak_mb}"
         )
 
+    extend_dedupe_counters.reset()
     try:
         root = _resolve_catalog(namespace, active_env)
         results = run_ingest_definitions_first(
@@ -2375,6 +2383,11 @@ def run(
         print(result.summary_line(), file=out)
     if deadline is not None:
         print(_deadline_line(len(results)), file=out)
+    # ING-2-RSS observability (L-30/L-52): counts only, one line every run,
+    # including a run with zero EXTEND chunks -- that makes "EXTEND never
+    # ran" distinguishable from "EXTEND ran and every chunk took the
+    # unfiltered path".
+    logger.info(extend_dedupe_counters.summary_line())
 
     # EDGE-6 6f: the deferral-stall streak. Independent of `deadline` (a
     # dry run never builds a deadline either, but pending-ness is still

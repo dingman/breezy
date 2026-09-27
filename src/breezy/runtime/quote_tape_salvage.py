@@ -63,7 +63,7 @@ from typing import Any
 import nautilus_trader
 import pyarrow as pa
 import pyarrow.parquet as pq
-from nautilus_trader.model.data import CustomData
+from nautilus_trader.model.data import CustomData, OrderBookDepth10, QuoteTick, TradeTick
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.funcs import class_to_filename
@@ -209,20 +209,107 @@ def _drop_already_landed(
     return [obj for obj in objects if _object_key(obj) not in known]
 
 
+#: The metadata-keyed Rust types (ING-2-RSS). For these, and ONLY these, a
+#: guarded identifier-filtered query is attempted first -- every other type
+#: (InstrumentStatus, custom types, definitions such as ``BinaryOption``)
+#: keeps the unconditional unfiltered query unchanged, so T4 and the tie-run
+#: spy tests (``bounded_read.py:582-612``, ``:784-797``), which use
+#: ``InstrumentStatus``, keep passing without edits.
+_TICK_TYPES = frozenset({QuoteTick, TradeTick, OrderBookDepth10})
+
+
+class _ExtendDedupeCounters:
+    """Per-process counts of the EXTEND dedupe dispatch (ING-2-RSS, L-30/L-52).
+
+    Counts only -- never an instrument id or a value. Reset once per ingest
+    run by :mod:`breezy.runtime.quote_tape_ingest_cli`'s ``run()`` so the
+    summary line reflects exactly one run, even when several runs happen in
+    one process (e.g. under pytest).
+    """
+
+    def __init__(self) -> None:
+        self.chunks = 0
+        self.filtered = 0
+        self.unfiltered = 0
+        #: ``class_to_filename`` name -> [filtered_count, unfiltered_count].
+        self.by_type: dict[str, list[int]] = {}
+
+    def record(self, data_cls: type, *, filtered: bool) -> None:
+        self.chunks += 1
+        if filtered:
+            self.filtered += 1
+        else:
+            self.unfiltered += 1
+        counts = self.by_type.setdefault(class_to_filename(data_cls), [0, 0])
+        counts[0 if filtered else 1] += 1
+
+    def reset(self) -> None:
+        self.chunks = 0
+        self.filtered = 0
+        self.unfiltered = 0
+        self.by_type.clear()
+
+    def summary_line(self) -> str:
+        by_type = ",".join(f"{name}:{f}/{u}" for name, (f, u) in sorted(self.by_type.items()))
+        return (
+            f"extend_dedupe: chunks={self.chunks} filtered={self.filtered} "
+            f"unfiltered={self.unfiltered} by_type={by_type}"
+        )
+
+
+#: Module-level singleton (ING-2-RSS observability). Mutable by design: one
+#: counters object per process, shared across every EXTEND chunk in a run.
+extend_dedupe_counters = _ExtendDedupeCounters()
+
+
+def _type_root_has_flat_files(write_target: ParquetDataCatalog, data_cls: type) -> bool:
+    """True when ``data_cls``'s type root already holds a depth-1 (FLAT) file.
+
+    The type-dir name comes from ``ParquetDataCatalog._make_path`` (native's
+    own ``class_to_filename``-derived mapping, e.g. ``order_book_depths`` for
+    ``OrderBookDepth10`` -- never hard-coded). A non-empty result means a
+    ``convert_stream_to_data`` FLAT write landed here (``TestTheMixedCatalogLayoutIsPinned``),
+    which an identifier-filtered query would silently omit.
+    """
+    type_root = write_target._make_path(data_cls=data_cls, identifier=None)
+    return bool(_parquet_set(write_target, type_root))
+
+
 def _drop_already_landed_unfiltered(
     write_target: ParquetDataCatalog, data_cls: type, objects: list[Any]
 ) -> list[Any]:
-    """Drop landed rows using an unfiltered, time-bounded query.
+    """Drop landed rows already in the catalog, filtered when it is safe to.
 
     Identifier-filtered ``query`` silently omits FLAT ``convert_stream_to_data``
     files (``parquet.py:2249``; ``TestTheMixedCatalogLayoutIsPinned``). The
     ING-1 partial slice is exactly that layout, so EXTEND must see it.
+
+    ING-2-RSS: for the metadata-keyed tick types (:data:`_TICK_TYPES`), an
+    unfiltered query deserialises every OTHER instrument's landed rows in
+    the chunk's time window too, which is what drove EXTEND's memory and
+    wall time up (root cause). When this data class's type root holds no
+    FLAT file, an identifier-filtered query is exactly equivalent (nothing
+    is omitted) and reads only this chunk's own instruments. When a FLAT
+    file IS present -- or for every non-tick type -- the query stays
+    unfiltered, byte-identical to before. A read error (``ArrowInvalid``,
+    ``FileNotFoundError``, etc.) is never caught here: turning it into an
+    empty existing-set would mean silent duplicates.
     """
     if not objects:
         return []
     lo = min(obj.ts_init for obj in objects)
     hi = max(obj.ts_init for obj in objects)
-    existing = write_target.query(data_cls=data_cls, start=lo, end=hi)
+    identifiers = sorted({key[0] for obj in objects if (key := _object_key(obj))[0] is not None})
+    use_filtered = (
+        data_cls in _TICK_TYPES
+        and bool(identifiers)
+        and not _type_root_has_flat_files(write_target, data_cls)
+    )
+    if use_filtered:
+        existing = write_target.query(data_cls=data_cls, identifiers=identifiers, start=lo, end=hi)
+    else:
+        existing = write_target.query(data_cls=data_cls, start=lo, end=hi)
+    extend_dedupe_counters.record(data_cls, filtered=use_filtered)
     known = {_object_key(_catalog_row(landed)) for landed in existing}
     return [obj for obj in objects if _object_key(obj) not in known]
 
