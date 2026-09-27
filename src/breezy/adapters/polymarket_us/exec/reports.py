@@ -1407,7 +1407,7 @@ class MappedPosition(NamedTuple):
     ``PositionStatusReport``, unwrapped and unmodified.
 
     ``leg`` is the OUTCOME the exposure belongs to -- ``"yes"`` or ``"no"`` --
-    determined by :func:`_position_leg`. This module performs no I/O
+    determined by :func:`position_leg`. This module performs no I/O
     (module docstring) and therefore never resolves an actual NO-leg
     ``Instrument``: ``report.instrument_id`` is left on the YES id it was
     given (unchanged from before this field existed), and a caller that
@@ -1423,7 +1423,7 @@ class MappedPosition(NamedTuple):
     leg: Leg
 
 
-def _position_leg(*, net: Decimal, metadata: Mapping[str, Any] | None, context: str) -> Leg:
+def position_leg(*, net: Decimal, metadata: Mapping[str, Any] | None, context: str) -> Leg:
     """Which leg -- YES or NO -- a position's exposure belongs to.
 
     Ruling: ``docs/evidence/RULING_no_side_position_shape_2026-09-16.md``. A
@@ -1535,11 +1535,11 @@ def parse_position_status_report(
         field=f"{context}.netPosition",
         error=ExecutionReportMappingError,
     )
-    leg = _position_leg(net=net, metadata=metadata, context=context)
+    leg = position_leg(net=net, metadata=metadata, context=context)
     # A NO holding's exposure is LONG on the NO leg, never SHORT on the YES
     # one -- `leg` above already carries that distinction, so the only
     # `position_side` this function ever reports again is LONG (net != 0) or
-    # FLAT (net == 0). See `_position_leg` and the ruling it cites.
+    # FLAT (net == 0). See `position_leg` and the ruling it cites.
     side = PositionSide.FLAT if net == 0 else PositionSide.LONG
 
     return MappedPosition(

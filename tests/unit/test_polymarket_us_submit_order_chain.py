@@ -2781,3 +2781,205 @@ def test_r7_the_resolver_accept_fill_path_never_touches_position_lag_pending() -
 
     source = inspect.getsource(PolymarketUSExecutionClient._resolve_accept_fill)
     assert "_position_lag_pending" not in source
+
+
+# ==========================================================================
+# EDGE-2 slice A (AC2/AC3): `submit_chain.create_fill_evidence` -- closed-set
+# create-time fill evidence for a with-id AMBIGUOUS outcome, independent of
+# `classify_create_order_outcome`/`_durable_execution`/`CreateOrderOutcome`
+# (all three stay byte-unchanged -- see the source-hash pin below).
+# ==========================================================================
+
+
+def _mia_0923_synthetic_body() -> bytes:
+    """MIA 09-23 (venue order CP05MNWMAWP6, EDGE-2 plan r3 §2.1): log
+    ``:938`` lists KEY NAMES only (``'executions'[2]: {...'type'...,
+    'order': {...'state','cumQuantity','leavesQuantity'...}}, 'id'``) --
+    the two execution ``type`` VALUES and the nested order's enum values
+    below are a SYNTHETIC fixture standing in for the unrecoverable real
+    ones (L-17), stated here rather than presented as captured evidence.
+    """
+    return json.dumps(
+        {
+            "id": "CP05MNWMAWP6",
+            "executions": [
+                {
+                    "type": "EXECUTION_TYPE_NEW",
+                    "order": {
+                        "state": "ORDER_STATE_NEW",
+                        "cumQuantity": "0",
+                        "leavesQuantity": "1",
+                    },
+                },
+                {
+                    "type": "EXECUTION_TYPE_EXPIRED",
+                    "order": {
+                        "state": "ORDER_STATE_EXPIRED",
+                        "cumQuantity": "0",
+                        "leavesQuantity": "0",
+                    },
+                },
+            ],
+        }
+    ).encode("utf-8")
+
+
+def test_mia_0923_executions_present_nonfill_tree_stays_ambiguous_at_create() -> None:
+    """AC2: the MIA 09-23 ``executions-present`` key tree (synthetic non-fill
+    enum values) classifies KIND_AMBIGUOUS at create time, and stays that
+    way -- a regression pin, not a claim that this is the captured body."""
+    response = VenueResponse(status=200, headers={}, body=_mia_0923_synthetic_body())
+    outcome = classify_create_order_outcome(
+        response, instrument=build_instrument(), account_id=ACCOUNT_ID, ts_init=TS_INIT,
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.venue_order_id == "CP05MNWMAWP6"
+
+
+def test_create_fill_evidence_none_for_nonfill_lifecycle_rows() -> None:
+    """Neither execution row is fill-type (`EXECUTION_TYPE_NEW`/
+    `EXECUTION_TYPE_EXPIRED`) -- ``none``, and every row's raw `type` value
+    is echoed verbatim in `exec_types` since both match the closed-set
+    `EXECUTION_TYPE_[A-Z_]+` shape."""
+    evidence = submit_chain.create_fill_evidence(_mia_0923_synthetic_body())
+    assert evidence.token == submit_chain.CREATE_FILL_EVIDENCE_NONE
+    assert evidence.exec_types == ("EXECUTION_TYPE_NEW", "EXECUTION_TYPE_EXPIRED")
+    assert evidence.skips == ()
+
+
+def test_create_fill_evidence_fill_type_present_for_mapped_fill() -> None:
+    """A complete fill-type row (`_durable_execution` finds a candidate) is
+    ``fill_type_present`` -- this token BLOCKS zero-fill (AC4(b)) even
+    though `classify_create_order_outcome` may still end up AMBIGUOUS via a
+    separate `fill_generation` failure."""
+    body = _durable_accept_body(str(build_instrument().raw_symbol))
+    evidence = submit_chain.create_fill_evidence(body)
+    assert evidence.token == submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT
+    assert evidence.exec_types == ("EXECUTION_TYPE_PARTIAL_FILL",)
+    assert evidence.order_state == "ORDER_STATE_FILLED"
+    assert evidence.order_cum == "nonzero"
+    assert evidence.skips == ()
+
+
+def test_create_fill_evidence_unmappable_names_the_skipped_field() -> None:
+    """A fill-type row missing `tradeId` is skipped by `_durable_execution`
+    (L-37) -- named in `skips`, never dropped silently, and the overall
+    token is ``fill_type_unmappable`` (a fill-type row exists, but none
+    maps to a durable candidate)."""
+    body = json.dumps(
+        {
+            "id": "ord-unmappable",
+            "executions": [
+                {
+                    "type": "EXECUTION_TYPE_FILL",
+                    "order": {"id": "o1"},
+                    "lastPx": {"value": "0.50", "currency": "USD"},
+                    "lastShares": "1",
+                    # tradeId deliberately absent.
+                }
+            ],
+        }
+    ).encode("utf-8")
+    evidence = submit_chain.create_fill_evidence(body)
+    assert evidence.token == submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE
+    assert evidence.skips == ("tradeId missing",)
+
+
+def test_create_fill_evidence_unknown_type_renders_other_never_value() -> None:
+    """I6: an unhashable (`dict`/`list`) or adversarially long `type` value
+    never reaches a set-membership or regex-echo path -- ``other`` for
+    every one, and the long value is never rendered anywhere on the
+    evidence (never a value, per AC3)."""
+    long_value = "x" * 5000
+    body = json.dumps(
+        {
+            "id": "ord-adversarial",
+            "executions": [
+                {"type": {"nested": "dict"}},
+                {"type": ["list", "value"]},
+                {"type": long_value},
+            ],
+        }
+    ).encode("utf-8")
+    evidence = submit_chain.create_fill_evidence(body)
+    assert evidence.exec_types == ("other", "other", "other")
+    assert evidence.token == submit_chain.CREATE_FILL_EVIDENCE_NONE
+    assert long_value not in repr(evidence)
+
+
+def test_create_fill_evidence_unparseable_body_is_unknown() -> None:
+    """A body that is not valid JSON (or not a JSON object) is ``unknown`` --
+    the same closed-set vocabulary a legacy durable blob decodes to."""
+    evidence = submit_chain.create_fill_evidence(b"not json")
+    assert evidence.token == submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
+    assert evidence.exec_types == ()
+    assert evidence.order_state == "absent"
+    assert evidence.order_cum == "absent"
+    assert evidence.skips == ()
+
+
+@pytest.mark.parametrize(
+    ("last_execution", "expected_state", "expected_cum"),
+    [
+        ({"type": "EXECUTION_TYPE_NEW"}, "absent", "absent"),
+        ({"type": "EXECUTION_TYPE_NEW", "order": {}}, "absent", "absent"),
+        (
+            {
+                "type": "EXECUTION_TYPE_NEW",
+                "order": {"state": "ORDER_STATE_EXPIRED", "cumQuantity": "0"},
+            },
+            "ORDER_STATE_EXPIRED",
+            "0",
+        ),
+        (
+            {
+                "type": "EXECUTION_TYPE_NEW",
+                "order": {"state": "ORDER_STATE_NEW", "cumQuantity": "3"},
+            },
+            "ORDER_STATE_NEW",
+            "nonzero",
+        ),
+        (
+            {
+                "type": "EXECUTION_TYPE_NEW",
+                "order": {"state": "not-a-real-state", "cumQuantity": "not-a-number"},
+            },
+            "other",
+            "unparseable",
+        ),
+    ],
+)
+def test_create_fill_evidence_reads_nested_order_state_and_cum_tokens(
+    last_execution: dict[str, Any],
+    expected_state: str,
+    expected_cum: str,
+) -> None:
+    """`order_state`/`order_cum` are read from the LAST execution's nested
+    ``order`` ONLY -- never a top-level fallback, never the raw value."""
+    body = json.dumps({"id": "ord-x", "executions": [last_execution]}).encode("utf-8")
+    evidence = submit_chain.create_fill_evidence(body)
+    assert evidence.order_state == expected_state
+    assert evidence.order_cum == expected_cum
+
+
+#: Captured from `submit_chain.py` before EDGE-2 slice A ever touched this
+#: file. AC2: `classify_create_order_outcome` and `CreateOrderOutcome` must
+#: stay byte-unchanged by `create_fill_evidence`'s addition -- this makes
+#: that structural, not just a claim in a docstring.
+_CREATE_PATH_SHA256_BEFORE_EDGE2A = (
+    "5d5cb5c8768a0d777c5ed5f344c993c0409b98e9ab92003f334b2bef3b8f79b8"
+)
+
+
+def test_classify_create_order_outcome_and_outcome_type_are_byte_unchanged() -> None:
+    """EDGE-2 slice A (AC2): `create_fill_evidence` is a wholly NEW function
+    that reuses `_durable_execution`/`_fill_type_executions` READ-ONLY --
+    it must never edit `classify_create_order_outcome` or
+    `CreateOrderOutcome` themselves."""
+    import hashlib
+    import inspect
+
+    source = inspect.getsource(submit_chain.classify_create_order_outcome) + inspect.getsource(
+        submit_chain.CreateOrderOutcome
+    )
+    assert hashlib.sha256(source.encode("utf-8")).hexdigest() == _CREATE_PATH_SHA256_BEFORE_EDGE2A

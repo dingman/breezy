@@ -606,6 +606,7 @@ def build_continuous_rung_hold_strategies(
     enable_position_monitor: bool = True,
     exit_manifest: FamilyManifest | None = None,
     required_fee_coefficient: Decimal | None = None,
+    fee_verified_check: Callable[[int], bool] | None = None,
 ) -> tuple[ContinuousRungHoldStrategy, ...]:
     """One continuous-rung-hold strategy per supported station with instruments.
 
@@ -644,6 +645,11 @@ def build_continuous_rung_hold_strategies(
     A build-side switch, never an operator control and never a new env var
     (plan D1) -- tests that want the pre-INC-5 byte-identical strategy pass
     ``False``.
+
+    ``fee_verified_check`` (EDGE-1, AM-2): ``None`` by default, forwarded
+    unchanged to every station's ``ContinuousRungHoldStrategy`` constructor
+    -- see its own docstring. ``app/trade.py`` is the one caller that passes
+    a non-None, late-bound holder over ``FeeDriftProbeActor.is_fee_verified``.
     """
     if phase0_permit_guard and order_submission_permit is not None:
         raise Phase0PermitForbiddenError(
@@ -721,6 +727,7 @@ def build_continuous_rung_hold_strategies(
             phase0_permit_guard=phase0_permit_guard,
             diagnostics_summary=diagnostics_summary,
             build_sha=build_sha,
+            fee_verified_check=fee_verified_check,
         )
         if enable_position_monitor:
             # Attribute assignment, not a constructor kwarg: the monitor's

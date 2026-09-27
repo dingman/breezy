@@ -44,8 +44,10 @@ from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import AccountState, OrderDenied
-from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
+from nautilus_trader.model.identifiers import ClientOrderId, Venue, VenueOrderId
+from nautilus_trader.model.instruments import BinaryOption
 
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     _BOOT_PASS_REFUSAL_LATCHES,
     _RECONCILIATION_COUNT_FIELDS,
@@ -56,6 +58,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     AmbiguousResolverContext,
     PolymarketUSExecutionClient,
     StartupPositionSnapshot,
+    _resolver_long_position_state,
     _synthetic_get_fill_trade_id,
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
@@ -68,11 +71,16 @@ from breezy.adapters.polymarket_us.operator_controls import (
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
+from breezy.adapters.polymarket_us.parsing import parse_binary_option
 from breezy.adapters.polymarket_us.safety import (
     issue_live_trading_permit,
     live_trading_budget_remaining,
 )
-from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, instrument_id_to_slug
+from breezy.adapters.polymarket_us.symbology import (
+    POLYMARKET_US_VENUE,
+    base_slug_of,
+    instrument_id_to_slug,
+)
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -92,6 +100,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
     TS_EVENT_TEXT,
+    TS_INIT,
     build_instrument,
     build_no_leg_instrument,
     build_position,
@@ -176,6 +185,37 @@ def _order_get_body(
     }
 
 
+def _no_leg_order_get_body(
+    order_id: str,
+    *,
+    slug: str,
+    state: str,
+    cum_quantity: float,
+    avg_px: str | None = None,
+    leaves_quantity: float | None = None,
+) -> dict[str, Any]:
+    """EDGE-2C: :func:`_order_get_body`'s NO-leg sibling. The venue's real
+    echo for an OPENING order on the NO leg is exactly
+    ``(ORDER_SIDE_SELL, ORDER_INTENT_BUY_SHORT)``
+    (``leg_prices.VENUE_SIDE_FOR_LEG``/``VENUE_INTENT_FOR_LEG``,
+    ``assert_echo_matches_leg``), never the YES leg's
+    ``(ORDER_SIDE_BUY, ORDER_INTENT_BUY_LONG)`` `_order_get_body` always
+    builds -- a NO-leg GET body carrying the YES echo would itself be
+    refused by ``_order_side_for_leg`` as a wrong-leg echo, unrelated to the
+    crash this module tests."""
+    body = _order_get_body(
+        order_id,
+        slug=slug,
+        state=state,
+        cum_quantity=cum_quantity,
+        avg_px=avg_px,
+        leaves_quantity=leaves_quantity,
+    )
+    body["order"]["side"] = "ORDER_SIDE_SELL"
+    body["order"]["intent"] = "ORDER_INTENT_BUY_SHORT"
+    return body
+
+
 async def _arm_one_ambiguous_intent(
     tmp_path: Path,
 ) -> tuple[PolymarketUSExecutionClient, str, str, Any, list[Any]]:
@@ -239,6 +279,68 @@ async def _arm_one_ambiguous_intent_isolating_resolver_writes(
         "the submit-path write must be suppressed for this fixture to be non-vacuous"
     )
     return result
+
+
+async def _arm_one_no_leg_ambiguous_intent(
+    tmp_path: Path,
+) -> tuple[PolymarketUSExecutionClient, str, str, Any]:
+    """EDGE-2C: arms an account-wide OPEN intent whose durable resolver
+    context points at the NO-leg sibling of :func:`build_instrument`'s
+    market -- the with-id AMBIGUOUS shape a real NO-side entry leaves (S5).
+
+    Built directly against the latch/context primitives (the same shape
+    ``test_no_side_fill_attribution_2026_09_14.py``'s
+    ``test_a_resolved_fill_books_to_the_context_instrument_not_a_slug_lookup``
+    uses), never through ``_submit_order``: every submission rig in THIS
+    module (``_submit_command``) hard-codes the YES instrument.
+
+    Returns the client, the venue order id, the NO leg's base slug (equal to
+    the YES leg's -- both legs share one market), and the latch context
+    manager the caller MUST keep referenced.
+    """
+    sender = _SlowSender()
+    client, _order_events, _permit, latch_cm = await _build_race_client(tmp_path, sender=sender)
+    no_instrument = build_no_leg_instrument()
+    client._cache.add_instrument(no_instrument)
+    client._instrument_provider.add(no_instrument)
+    slug = base_slug_of(no_instrument.id)
+
+    armed = client._latch.arm("1" * 64, now_ns=client._clock.timestamp_ns())
+    venue_order_id = "ord-no-amb-1"
+    context = AmbiguousResolverContext(
+        intent_id=armed.intent_id,
+        venue_order_id=venue_order_id,
+        instrument_id=str(no_instrument.id),
+        client_order_id="O-NO-AMB-1",
+        strategy_id=STRATEGY_ID.value,
+        notional_usd=Decimal("0.40"),
+        booking_id=1,
+        created_ns=client._clock.timestamp_ns(),
+    )
+    client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{armed.intent_id}", context.to_bytes())
+    return client, venue_order_id, slug, latch_cm
+
+
+def _foreign_venue_instrument() -> BinaryOption:
+    """EDGE-2C test 8: the SAME captured market as :func:`build_instrument`,
+    parsed onto a venue that is NOT ``POLYMARKET_US`` -- ``base_slug_of``'s
+    own venue check (``symbology.py:310-314``) raises ``VenuePayloadError``
+    for it, a slug-derivation failure this plan's AC3 guard must survive
+    (unlike the NO-leg reserved-separator raise AC1 makes disappear
+    entirely, THIS raise still happens after the fix -- it is exactly what
+    the guard exists for)."""
+    market: dict[str, Any] = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "docs"
+            / "evidence"
+            / "venue"
+            / "polymarket_us"
+            / "raw"
+            / "market_open_510636_by_slug.json"
+        ).read_text(encoding="utf-8")
+    )
+    return parse_binary_option(market, venue=Venue("KALSHI"), ts_init=TS_INIT)
 
 
 async def _run_resolver_passes(client: PolymarketUSExecutionClient, count: int) -> None:
@@ -326,6 +428,85 @@ async def _run_n_passes_recording_sleeps(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     return sleeps
+
+
+# ==========================================================================
+# EDGE-2 slice A (AC3): `AmbiguousResolverContext.create_fill_evidence` --
+# the closed-set `createFillEvidence` token threaded from
+# `submit_chain.create_fill_evidence` through `_note_ambiguous_open` into the
+# durable context, with the same AR-N6 trailing-optional shape as
+# `create_detail`/`fill_parse_error`/`order_side`.
+# ==========================================================================
+
+
+def test_resolver_context_round_trips_create_fill_evidence() -> None:
+    """A NEW row round-trips whatever token it was given, through
+    `to_bytes`/`from_bytes`."""
+    context = AmbiguousResolverContext(
+        intent_id="intent-cfe",
+        venue_order_id="venue-cfe",
+        instrument_id="instrument-cfe",
+        client_order_id="client-cfe",
+        strategy_id="strategy-cfe",
+        notional_usd=Decimal("1.00"),
+        booking_id=1,
+        created_ns=TS_INIT,
+        create_fill_evidence=submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT,
+    )
+    round_tripped = AmbiguousResolverContext.from_bytes(context.to_bytes())
+    assert round_tripped.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT
+
+
+def test_legacy_resolver_context_without_field_decodes_as_unknown() -> None:
+    """AR-N6: a blob written before EDGE-2 slice A (no `createFillEvidence`
+    key at all) decodes to `submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN` --
+    the same token an unparseable create-order body renders, since neither
+    case tells the resolver anything about create-time fill evidence."""
+    old_blob = json.dumps(
+        {
+            "intentId": "intent-old-cfe",
+            "venueOrderId": "venue-old-cfe",
+            "instrumentId": "instrument-old-cfe",
+            "clientOrderId": "client-old-cfe",
+            "strategyId": "strategy-old-cfe",
+            "notionalUsd": "1.00",
+            "bookingId": 11,
+            "createdNs": TS_INIT,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    old_context = AmbiguousResolverContext.from_bytes(old_blob)
+    assert old_context.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_submit_order_passes_response_body_evidence_to_note_ambiguous_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """End-to-end: `_submit_order`'s with-id AMBIGUOUS branch computes
+    `submit_chain.create_fill_evidence(response.body)` and threads its
+    `.token` into the durable `AmbiguousResolverContext` -- never a price,
+    quantity, or id, and never `unknown` for a body that parsed cleanly to
+    `executions: []` (that is `none`, a decided absence, not decode
+    failure)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        assert context.venue_order_id == order_id
+        assert context.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_NONE
+        await client._disconnect()
 
 
 @pytest.mark.asyncio
@@ -3450,3 +3631,261 @@ def test_fu8_boot_pass_refusal_latches_all_have_a_counts_field_and_the_new_latch
         assert f"refusals_{latch}" in _RECONCILIATION_COUNT_FIELDS, latch
     assert f"refusals_{RESOLVER_FILL_NOT_BOOKED}" not in _RECONCILIATION_COUNT_FIELDS
     assert RESOLVER_FILL_NOT_BOOKED not in _BOOT_PASS_REFUSAL_LATCHES
+
+
+# ---------------------------------------------------------------------------
+# EDGE-2C: the NO-leg resolver crash (`instrument_id_to_slug` raised outside
+# any `try` at the old `client.py:2419-2420`). Tests 1/2/8/9 drive the REAL
+# `_resolve_ambiguous_intents` pass; tests 3-7 exercise the pure
+# `_resolver_long_position_state` helper directly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_leg_terminal_get_does_not_raise_on_reserved_separator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC1/AC3: a with-id AMBIGUOUS intent on the NO leg must not crash the
+    resolver coroutine. RED today: `instrument_id_to_slug` raises
+    `VenuePayloadError` on the NO leg's composite id (the reserved `^`
+    separator), unwrapped -- the intent never retires."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(tmp_path)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{venue_order_id}"
+        ] = _no_leg_order_get_body(
+            venue_order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_no_leg_terminal_fill_with_short_yes_net_resolves_accept_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC2/AC4: a NO-leg terminal fill, corroborated by a NEGATIVE
+    `netPosition` on the base slug (a short YES == a NO holding, per the
+    2026-09-16 ruling), resolves through `_resolve_accept_fill` -- no
+    deadlock. RED today: the unwrapped raise kills the pass before the fill
+    is ever considered, so the intent never retires."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(tmp_path)
+        no_instrument = build_no_leg_instrument()
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{venue_order_id}"
+        ] = _no_leg_order_get_body(
+            venue_order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1,
+            avg_px="0.40",
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {slug: {**build_position(slug), "netPosition": "-1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+        records = client.fill_records_for(no_instrument.id)
+        assert len(records) == 1
+        # Risk register (plan §9): the synthesized cumulative_cost is
+        # cum x avgPx, in the ALREADY-leg-translated (instrument) price
+        # space -- wire avgPx 0.40 (YES-denominated) is 1 - 0.40 = 0.60 on
+        # the NO instrument (Rev 5 E5-1), so cost = 1 x 0.60 = 0.60.
+        assert records[0].cumulative_cost == Decimal("0.60")
+        await client._disconnect()
+
+
+def test_no_leg_positive_net_on_base_slug_is_not_a_no_holding() -> None:
+    """AC2 regression: a POSITIVE `netPosition` on the base slug is a YES
+    holding, never a NO holding -- `held` is `False` for the NO leg, so a
+    NO-leg terminal fill against it must disagree (stay AMBIGUOUS), never
+    resolve as accepted. RED today: the 2-arg signature refuses the `leg`
+    the fix adds."""
+    slug = instrument_id_to_slug(build_instrument().id)
+    positions = {slug: {**build_position(slug), "netPosition": "4"}}
+    assert _resolver_long_position_state(positions, slug, "no") is False
+
+
+def test_no_leg_outcome_no_with_negative_net_is_a_no_holding() -> None:
+    """AC2: `marketMetadata.outcome="No"` with a negative `netPosition` is a
+    NO holding -- `held` is `True` for the NO leg."""
+    slug = instrument_id_to_slug(build_instrument().id)
+    positions = {
+        slug: {
+            **build_position(slug),
+            "netPosition": "-4",
+            "marketMetadata": {"slug": slug, "outcome": "No"},
+        },
+    }
+    assert _resolver_long_position_state(positions, slug, "no") is True
+
+
+def test_holding_outcome_sign_contradiction_is_undetermined_for_both_legs() -> None:
+    """AC2/`position_leg`'s own ruling: an `outcome`/sign contradiction is
+    refused rather than guessed -- `held` is `None` (undetermined, stays
+    AMBIGUOUS) for either leg, never a guess in either direction."""
+    slug = instrument_id_to_slug(build_instrument().id)
+    yes_contradiction = {
+        slug: {
+            **build_position(slug),
+            "netPosition": "-4",
+            "marketMetadata": {"slug": slug, "outcome": "Yes"},
+        },
+    }
+    no_contradiction = {
+        slug: {
+            **build_position(slug),
+            "netPosition": "4",
+            "marketMetadata": {"slug": slug, "outcome": "No"},
+        },
+    }
+    assert _resolver_long_position_state(yes_contradiction, slug, "yes") is None
+    assert _resolver_long_position_state(no_contradiction, slug, "no") is None
+
+
+def test_yes_leg_holding_semantics_unchanged() -> None:
+    """AC4 regression matrix: the YES leg's `held` reading is byte-identical
+    to before this plan -- absent -> False, net>0 -> True, net==0 -> False,
+    net<0 -> False."""
+    slug = instrument_id_to_slug(build_instrument().id)
+    assert _resolver_long_position_state({}, slug, "yes") is False
+    assert (
+        _resolver_long_position_state(
+            {slug: {**build_position(slug), "netPosition": "4"}}, slug, "yes",
+        )
+        is True
+    )
+    assert (
+        _resolver_long_position_state(
+            {slug: {**build_position(slug), "netPosition": "0"}}, slug, "yes",
+        )
+        is False
+    )
+    assert (
+        _resolver_long_position_state(
+            {slug: {**build_position(slug), "netPosition": "-4"}}, slug, "yes",
+        )
+        is False
+    )
+
+
+def test_malformed_net_position_stays_ambiguous_for_both_legs() -> None:
+    """Unchanged: a `netPosition` that does not parse as a finite decimal is
+    undetermined (`None`) for either leg, never guessed."""
+    slug = instrument_id_to_slug(build_instrument().id)
+    positions = {slug: {**build_position(slug), "netPosition": "not-a-number"}}
+    assert _resolver_long_position_state(positions, slug, "yes") is None
+    assert _resolver_long_position_state(positions, slug, "no") is None
+
+
+@pytest.mark.asyncio
+async def test_slug_derivation_failure_is_logged_counted_and_resolver_keeps_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC3: ANY exception deriving the slug/leg/holding -- not only the
+    NO-leg reserved-separator shape AC1 fixes -- is caught, counted via
+    `_note_resolver_error`, and never kills the task. A genuinely
+    foreign-venue instrument (`base_slug_of`'s own venue check) is used here
+    because it is a raise this plan does NOT make disappear -- exactly what
+    AC3's per-intent guard exists for."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        foreign_instrument = _foreign_venue_instrument()
+        client._cache.add_instrument(foreign_instrument)
+        current_open = client._latch.current_open()
+        assert current_open is not None
+        _rewrite_resolver_context_instrument(
+            client, current_open.intent_id, str(foreign_instrument.id),
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        # Exactly ONE pass (`first_pass_immediate=True` runs the body once and
+        # returns -- `client.py`'s own docstring): unlike the terminal-
+        # resolving tests above, this intent never retires, so driving it
+        # through `_run_resolver_passes`'s many zero-interval spins would
+        # re-fail on every single pass and inflate the counter past 1.
+        await client._resolve_ambiguous_intents(first_pass_immediate=True)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "an undetermined slug derivation must stay AMBIGUOUS, never retire"
+        )
+        assert client._resolver_error_count == 1
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_periodic_resolver_task_survives_a_no_leg_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC3, direct: the REAL periodic task (`_resolve_ambiguous_intents`, no
+    `first_pass_immediate`) is still `done() is False` after a NO-leg pass
+    whose GET is terminal-zero. RED today: the unwrapped raise ends the
+    task, so it is `done()` (with an exception) after exactly one pass."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, venue_order_id, slug, _latch_cm = await _arm_one_no_leg_ambiguous_intent(tmp_path)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{venue_order_id}"
+        ] = _no_leg_order_get_body(
+            venue_order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+        client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+
+        task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+        try:
+            for _ in range(55):
+                await asyncio.sleep(0)
+            assert task.done() is False, "the periodic task must survive a NO-leg pass"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await client._disconnect()

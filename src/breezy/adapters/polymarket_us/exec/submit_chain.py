@@ -1310,5 +1310,178 @@ def classify_create_order_outcome(
     )
 
 
+#: EDGE-2 slice A (AC3): closed-set `createFillEvidence` tokens. `none` and
+#: `unknown` are admissible on their own (never sufficient) for the
+#: resolver's zero-fill gate; `fill_type_present` and `fill_type_unmappable`
+#: block it and raise a contradiction if the resolver still reaches
+#: terminal-zero (AC4(b)).
+CREATE_FILL_EVIDENCE_NONE: Final[str] = "none"
+CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT: Final[str] = "fill_type_present"
+CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE: Final[str] = "fill_type_unmappable"
+CREATE_FILL_EVIDENCE_UNKNOWN: Final[str] = "unknown"
+
+#: Closed-set token vocabulary for a single execution row's raw `type`
+#: value: the value itself, EXACTLY when it is a `str` shaped like the SDK's
+#: `ExecutionType` literals (`EXECUTION_TYPE_[A-Z_]+`); `other` for anything
+#: else. Mirrors `_ORDER_STATE_TOKEN`'s existing pattern in this file. I6:
+#: `isinstance(..., str)` is checked FIRST, so an unhashable `dict`/`list`
+#: value never reaches the regex.
+_EXECUTION_TYPE_TOKEN: Final[re.Pattern[str]] = re.compile(r"^EXECUTION_TYPE_[A-Z_]+$")
+
+_SKIP_ORDER_MISSING: Final[str] = "order missing"
+_SKIP_ORDER_ID_MISSING: Final[str] = "order.id missing"
+_SKIP_LAST_PX_MISSING: Final[str] = "lastPx missing"
+_SKIP_LAST_SHARES_MISSING: Final[str] = "lastShares missing"
+_SKIP_TRADE_ID_MISSING: Final[str] = "tradeId missing"
+
+
+@dataclass(frozen=True, slots=True)
+class CreateFillEvidence:
+    """Closed-set, log-safe evidence extracted from a create-order response
+    body, computed independently of `classify_create_order_outcome` (AC2:
+    that function, `_durable_execution`, and `CreateOrderOutcome` stay
+    byte-unchanged). Every field is a name or a closed-set enum-shaped
+    token -- never a price, quantity, or id (AC3).
+    """
+
+    #: One of the four `CREATE_FILL_EVIDENCE_*` constants above.
+    token: str
+    #: Every execution row's raw `type`, in payload order -- the closed-set
+    #: token from :func:`_execution_type_token`.
+    exec_types: tuple[str, ...]
+    #: The LAST execution's nested `order.state`, tokenised.
+    order_state: str
+    #: The LAST execution's nested `order.cumQuantity`, tokenised.
+    order_cum: str
+    #: Why each fill-type row (in payload order) was skipped by
+    #: `_durable_execution`'s own gate -- never dropped silently (L-37).
+    skips: tuple[str, ...]
+
+
+def _execution_type_token(item: Mapping[str, Any]) -> str:
+    raw = item.get("type")
+    if isinstance(raw, str) and _EXECUTION_TYPE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _last_execution_order(executions: list[Any]) -> Mapping[str, Any] | None:
+    """The LAST execution row's nested ``order``, or ``None`` -- never a
+    fallback to an earlier row, and never the top-level shape
+    :func:`_terminal_state`/:func:`_cum_quantity` also read."""
+    if not executions:
+        return None
+    last = executions[-1]
+    if not isinstance(last, Mapping):
+        return None
+    order = last.get("order")
+    return order if isinstance(order, Mapping) else None
+
+
+def _execution_order_state_token(order: Mapping[str, Any] | None) -> str:
+    if order is None:
+        return _TOKEN_ABSENT
+    raw = order.get("state")
+    if raw is None:
+        return _TOKEN_ABSENT
+    if isinstance(raw, str) and _ORDER_STATE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _execution_order_cum_token(order: Mapping[str, Any] | None) -> str:
+    if order is None:
+        return _TOKEN_ABSENT
+    raw = order.get("cumQuantity")
+    if raw is None:
+        return _TOKEN_ABSENT
+    try:
+        qty = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return _TOKEN_UNPARSEABLE
+    return "0" if qty == ZERO else "nonzero"
+
+
+def _fill_row_skip_reason(item: Mapping[str, Any]) -> str | None:
+    """Why :func:`_durable_execution` would skip this fill-type row, or
+    ``None`` if it would not. Mirrors that function's own gate, in the same
+    order -- named here (L-37) rather than silently `continue`-d."""
+    order = item.get("order")
+    if not isinstance(order, Mapping):
+        return _SKIP_ORDER_MISSING
+    order_id = order.get("id")
+    if not isinstance(order_id, str) or not order_id:
+        return _SKIP_ORDER_ID_MISSING
+    if item.get("lastPx") is None:
+        return _SKIP_LAST_PX_MISSING
+    if item.get("lastShares") is None:
+        return _SKIP_LAST_SHARES_MISSING
+    trade_id = item.get("tradeId")
+    if not isinstance(trade_id, str) or not trade_id:
+        return _SKIP_TRADE_ID_MISSING
+    return None
+
+
+def _fill_row_skips(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        reason
+        for item in _fill_type_executions(payload)
+        if (reason := _fill_row_skip_reason(item)) is not None
+    )
+
+
+def create_fill_evidence(body: bytes) -> CreateFillEvidence:
+    """EDGE-2 slice A (AC3): closed-set create-time fill evidence for a
+    with-id AMBIGUOUS outcome, parsed independently via
+    :func:`_parse_json_object` (option F1 -- a second parse of a ≤ few-KB
+    body, only on the AMBIGUOUS-with-id branch).
+
+    Reuses `_durable_execution`/`_fill_type_executions` READ-ONLY -- calling
+    them does not change their bytes (AC2). The token is:
+
+    - :data:`CREATE_FILL_EVIDENCE_UNKNOWN`: the body is not parseable JSON,
+      or not a JSON object -- the same token a legacy durable blob with no
+      `createFillEvidence` key decodes to.
+    - :data:`CREATE_FILL_EVIDENCE_NONE`: no execution row is fill-type.
+    - :data:`CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE`: a fill-type row
+      exists, but none of them carries a complete durable candidate
+      (`order.id`, `lastPx`, `lastShares`, `tradeId`) -- the L-37
+      silent-skip class, now named in `skips`.
+    - :data:`CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT`: `_durable_execution`
+      found a complete candidate. The outcome can still be AMBIGUOUS here
+      (`fill_generation` may still fail to map it), so this token, unlike
+      the other two, BLOCKS a resolver zero-fill (AC4(b)).
+    """
+    payload = _parse_json_object(body)
+    if payload is None:
+        return CreateFillEvidence(
+            token=CREATE_FILL_EVIDENCE_UNKNOWN,
+            exec_types=(),
+            order_state=_TOKEN_ABSENT,
+            order_cum=_TOKEN_ABSENT,
+            skips=(),
+        )
+    executions = payload.get("executions")
+    execution_rows: list[Any] = executions if isinstance(executions, list) else []
+    exec_types = tuple(
+        _execution_type_token(item) for item in execution_rows if isinstance(item, Mapping)
+    )
+    skips = _fill_row_skips(payload)
+    if _durable_execution(payload) is not None:
+        token = CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT
+    elif _fill_type_executions(payload):
+        token = CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE
+    else:
+        token = CREATE_FILL_EVIDENCE_NONE
+    last_order = _last_execution_order(execution_rows)
+    return CreateFillEvidence(
+        token=token,
+        exec_types=exec_types,
+        order_state=_execution_order_state_token(last_order),
+        order_cum=_execution_order_cum_token(last_order),
+        skips=skips,
+    )
+
+
 def retirement_member(reasons: object, name: str) -> object:
     return getattr(reasons, name)

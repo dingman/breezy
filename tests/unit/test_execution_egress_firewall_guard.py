@@ -2024,6 +2024,12 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # tags -- the SAME intra-module/inert shape as `DurableFillRecord`
         # above; no I/O.
         "_AdapterExitAuthorization",
+        # Widened EDGE-2 slice A (2026-09-27, AC3/AC9): a pure module-level
+        # helper -- parses `response.body` (already in hand, no new read)
+        # with the module's own `_parse_json_object` and returns a frozen,
+        # closed-set-token dataclass; no I/O, no path, no payload, no
+        # socket.
+        "submit_chain.create_fill_evidence",
     }
 )
 
@@ -2121,7 +2127,14 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # Inert attribute-method call on the already-parsed report; no I/O.
         "report.quantity.as_decimal",
         "self._declared_positions",
-        "instrument_id_to_slug",
+        # EDGE-2C plan (docs/plans/backlog/EDGE_2026-09-27/EDGE-2C_no_leg_
+        # resolver_crash_plan_r1_2026-09-27.md §5): the sanctioned slug/leg
+        # readers for EITHER leg's id -- pure symbology helpers, no I/O, no
+        # await, no sender reference. Replaces `instrument_id_to_slug`
+        # (removed below), which refuses a NO-leg id outright and crashed
+        # this coroutine (L-48).
+        "base_slug_of",
+        "leg_of",
         "_resolver_long_position_state",
         "self._clock.timestamp_ns",
         "self._resolve_terminal_zero",
@@ -3110,6 +3123,9 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # site's comment above.
             "leg_of",
             "_AdapterExitAuthorization",
+            # Widened EDGE-2 slice A (2026-09-27, AC3/AC9): a pure helper,
+            # no I/O -- see the definition site's comment above.
+            "submit_chain.create_fill_evidence",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:

@@ -504,13 +504,14 @@ def register_hypothesis(
     station_day_statistic: str | None = None,
     order_quantity: int | None = None,
     look_policy: str | None = None,
+    programme_alpha_override: float | None = None,
 ) -> HypothesisRecord:
     """Register one hypothesis (SS6.2).
 
     `allocated_alpha`/`per_variant_alpha` are ASSIGNED here, by the fixed
-    Bonferroni split -- there is deliberately no parameter through which a
-    caller could supply them (SS6.1: "assigned, never supplied by the
-    caller").
+    Bonferroni split. `programme_alpha_override` may only narrow the
+    programme-level budget for a registered ruling; callers still never
+    supply an already-split allocation.
 
     `disposition="CLOSED"` is the SS7 step 7 zero-look path: it records a
     pre-decided disposition (the forecast-taker's CLOSED, TERMINAL ruling) as
@@ -525,6 +526,15 @@ def register_hypothesis(
     if any(record.hypothesis_id == hypothesis_id for record in existing_records):
         raise DuplicateHypothesisIdError(
             f"hypothesis_id {hypothesis_id!r} is already registered -- refusing a duplicate intake"
+        )
+
+    programme_alpha = (
+        PROGRAMME_ALPHA if programme_alpha_override is None else programme_alpha_override
+    )
+    if not (0.0 < programme_alpha <= PROGRAMME_ALPHA):
+        raise ValueError(
+            f"programme_alpha_override must be > 0 and <= PROGRAMME_ALPHA={PROGRAMME_ALPHA}; "
+            f"got {programme_alpha_override}"
         )
 
     if disposition == "CLOSED":
@@ -634,7 +644,7 @@ def register_hypothesis(
             "refusing a further intake rather than shrinking an existing allocation"
         )
 
-    allocated_alpha = PROGRAMME_ALPHA / MAX_HYPOTHESES
+    allocated_alpha = programme_alpha / MAX_HYPOTHESES
     per_variant_alpha = allocated_alpha / k_variants
     recomputed_mde = recompute_mde(
         per_variant_alpha=per_variant_alpha, n_station_days=min_station_days

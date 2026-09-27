@@ -622,6 +622,53 @@ pattern) alongside every unit that references it, `daemon-reload`. There is
 no `[Install]` section to enable -- this unit is invoked only via a sibling's
 `OnFailure=` line.
 
+### `breezy-quote-tape-ingest` preflight memo (EDGE-6b, 2026-09-27)
+
+The ingest preflight writes one memo per recorder instance:
+`<catalog>/live/<instance>/.preflight-memo-v1.json`. It caches only closed
+feather-file reports, keyed by `(st_dev, st_ino, st_size, st_mtime_ns)` from
+the same pre-scan stat used by the report. Files still considered open by the
+ingest liveness rules are always scanned cold and are never retained in the
+memo, including when they were cached by an earlier run.
+
+The memo is an optimization only. If it is missing, corrupt, or has an unknown
+version, ingest logs one warning, scans the instance cold, and rewrites the
+memo atomically. Deleting the file is safe; it only makes the next run pay the
+cold preflight cost again.
+
+### `breezy-quote-tape-ingest` deferral-stall alert (EDGE-6f, 2026-09-27)
+
+`run()` exits 0 on any deadline deferral by contract -- correct, since a
+deferred unit retries next run, but silent if the SAME work keeps deferring
+run after run (live 09-27 02:25Z/02:40Z, 24 instances deferred each; the
+only alert path is `OnFailure=`, and a deferral is never a failure by
+itself). One streak file per catalog,
+`<catalog_root>/.ingest-deferral-streak-v1.json` (never under `live/`),
+tracks how many CONSECUTIVE runs have had genuine pending work
+(`breezy.runtime.ingest_deferral_streak`, pure state machine). Once pending
+work has persisted for >= 4 consecutive runs AND >= 60 minutes, the run
+prints a value-free `DEFERRAL_STALLED runs=… age_s=… pending_units=…` line
+and exits 4 (`EXIT_DEFERRAL_STALLED`); it re-alerts every 16th run
+(~4 hours at this unit's 15-minute cadence) while the stall persists, and
+resets the instant a run has nothing pending. There is no `SuccessExitStatus=`
+override, so exit 4 is already an ordinary unit failure and `OnFailure=`
+above delivers it exactly like exit 2 or 3, with no extra configuration.
+
+"Pending" is marker-aware, not a blind count of deferred instances: a
+"not evaluated" (loop-top, deadline-denied-before-any-scan) instance only
+counts if it still has a real, unaccounted-for closed file -- one that is
+NOT already blanket-, per-file-, or salvage-marked, and is not currently
+open. Without that, an instance permanently stuck on the per-file
+conversion path (never earning the blanket `.converted-<type>` marker --
+see the 6b memo section above, and the three known 09-27 instances) would
+count as pending on every single run and alert forever.
+
+A missing, corrupt, or unknown-version streak file resets to a fresh
+streak with one WARNING, never a fabricated "already stalled" state: losing
+history only delays a real stall's next alert by at most one stall window,
+while treating garbage as "already alerted" could suppress every future
+alert instead. A `--dry-run` never reads or writes the streak file.
+
 ---
 
 ## AUD-15 alert env file (`~/.config/breezy/alerts.env`) (amendment, 2026-09-22)
@@ -1700,3 +1747,47 @@ and revert the commit. `portfolio_roi_report.py` treats an absent/stale
 snapshot directory as `NOT_CONFIGURED`/`UNAVAILABLE` (never inferred), so
 every window simply keeps its raw classification — rollback is total and
 fail-closed.
+
+## `breezy-quote-tape` — recorder discovery-reload override (EDGE-6 6d, 2026-09-27)
+
+Added one directive, `Environment=POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS=15`,
+to `breezy-quote-tape.service`. **Zero code change** — `data.py:1202-1204`
+(`_next_reload_delay_secs`) already treats an explicit
+`instrument_reload_interval_mins` as an OPTIONAL operator override that wins
+outright over the derived cadence, and `factories.py:145,283-297,325`
+(`config_from_env`) already reads it from this exact environment variable
+name. This is the Nautilus/adapter reload loop's own native extension
+point, reused rather than reimplemented.
+
+**Why.** The derived cadence targets exact venue boundaries on the
+currently-discovered market set, so a newly-listed D+1 market is not picked
+up until the next derived boundary — measured at ~5h13m after listing on
+09-26. 15 minutes bounds that capture lag to the same window, at the cost
+of 96 discovery GETs/day (vs ~4 today), well under the shared discovery
+quota.
+
+**Recorder-only, on purpose.** `breezy-quote-tape.service` and
+`breezy-trade-supervisor.service` both load `EnvironmentFile=
+/home/jon/.config/breezy/polymarket.env`. The override is an
+`Environment=` line in the recorder unit, **never** in `polymarket.env`:
+putting it in the shared file would change the live trade node's own
+reload cadence too. `tests/unit/test_quote_tape_unit_env.py` pins the
+directive's presence in the recorder unit and its absence from the
+supervisor unit. A count-only deploy check
+(`grep -c POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS
+~/.config/breezy/polymarket.env`, never printing the file's contents)
+must read 0 before and after this change — `polymarket.env` is host
+config, outside the repo, and is not a place this variable is ever
+expected.
+
+**Deploy:** merge, then `systemctl --user daemon-reload` — the running
+recorder does not pick this up until its next rotation-driven
+`try-restart` (never restart it ad hoc; see the "TRAP" section above and
+`breezy-quote-tape-rotate.service`). On that boot the recorder logs
+`discovery reload cadence: operator override, 15 minute(s)`
+(`quote_tape_cli.py:263-268`); the derived-cadence WARN
+("clamped to the ceiling of …") disappears because the derive path is
+bypassed entirely while the override is set.
+
+**Rollback:** remove the `Environment=` line, `daemon-reload`; the
+recorder returns to the derived cadence at its next rotation.

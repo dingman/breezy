@@ -107,7 +107,16 @@ SyslogIdentifier=breezy-quote-tape-ingest
 # path is not a directory, or an invalid --deadline-seconds); exit 3 = at
 # least one instance's outcome was "failed" -- a hard per-file or per-type
 # conversion failure, distinct from an ordinary skip or a deadline deferral
-# (SP-1/I3, EXIT_CONVERSION_FAILED). See
+# (SP-1/I3, EXIT_CONVERSION_FAILED); exit 4 = the EDGE-6 6f deferral-stall
+# alert (EXIT_DEFERRAL_STALLED) -- pending work has been deferred on >= 4
+# consecutive runs AND for >= 60 minutes (see
+# src/breezy/runtime/ingest_deferral_streak.py). Exit 3 outranks exit 4 when
+# both apply on the same run: the run still exits 3, but the
+# `DEFERRAL_STALLED` line still prints in that SAME invocation's journal, so
+# the reason is visible either way. Because there is no SuccessExitStatus=
+# override, exits 2/3/4 are ALL, already, ordinary systemd unit failures --
+# `OnFailure=` above fires on every one of them without any further
+# configuration; nothing here is unique to exit 4. See
 # src/breezy/runtime/quote_tape_ingest_cli.py's module docstring.
 
 # NOTE: no [Install] section. This unit is started BY the timer, never

@@ -1203,15 +1203,19 @@ class TestScanTimeCountsAgainstTheBudget:
         _touch(tmp_path, OTHER_INSTANCE, "quote_tick_0.feather", age_minutes=60)
         clock = FakeClock()
         deadline = RunDeadline(budget_ns=5_000, clock_ns=clock)
-        real_scan_instance = ingest_cli_module.scan_instance
+        real_scan_instance = ingest_cli_module.scan_instance_memoized
         scan_calls: list[str] = []
 
-        def slow_scan_instance(catalog_root, instance_id, subdirectory):  # type: ignore[no-untyped-def]
+        def slow_scan_instance(  # type: ignore[no-untyped-def]
+            catalog_root, instance_id, subdirectory, *, open_files
+        ):
             scan_calls.append(instance_id)
             clock.advance(0.00001)  # 10_000 ns -- more than the whole budget
-            return real_scan_instance(catalog_root, instance_id, subdirectory)
+            return real_scan_instance(
+                catalog_root, instance_id, subdirectory, open_files=open_files
+            )
 
-        monkeypatch.setattr(ingest_cli_module, "scan_instance", slow_scan_instance)
+        monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", slow_scan_instance)
 
         results = run_ingest(
             tmp_path,

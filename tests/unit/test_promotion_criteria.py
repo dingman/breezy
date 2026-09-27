@@ -443,6 +443,22 @@ def test_c_validity_refuses_mechanism_only() -> None:
     assert row.detail is not None and "MECHANISM_ONLY" in row.detail
 
 
+def test_c_validity_passes_a_params_verified_row() -> None:
+    """RA-3 finding: `evaluate_c_validity` (promotion_criteria.py:427) gates on
+    `row.validity == REPLAY_VALIDITY` ("MECHANISM_ONLY") alone -- it has no
+    special case for "PARAMS_VERIFIED" specifically, it simply passes any
+    validity value that is not MECHANISM_ONLY. This pins that a
+    PARAMS_VERIFIED row clears the validity predicate with no reason cited,
+    same as any other non-MECHANISM_ONLY string."""
+    row = _validity(
+        (_row(validity="PARAMS_VERIFIED", params_match=True),),
+        {("LAX", "2026-09-21"): _census()},
+        frozenset(),
+    )
+    assert row.verdict == "true"
+    assert row.detail is None
+
+
 def test_c_validity_refuses_partial_window_fragment_and_drift() -> None:
     whole = {("LAX", "2026-09-21"): _census()}
     partial = _validity(

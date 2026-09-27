@@ -255,6 +255,18 @@ def test_the_subclass_defines_exactly_three_methods() -> None:
     assert method_names == {"__init__", "on_start", "_submission_armed"}
 
 
+def test_the_backtest_subclass_never_exposes_a_fee_verified_check_parameter() -> None:
+    """EDGE-1 (AM-2): paper replay must never be able to pass a non-None
+    `fee_verified_check` -- this subclass's own `__init__` does not even
+    expose the parameter, so it always inherits the parent's `None`
+    default, byte-identical to every construction site before this
+    parameter existed."""
+    import inspect
+
+    sig = inspect.signature(ContinuousRungHoldBacktestStrategy.__init__)
+    assert "fee_verified_check" not in sig.parameters
+
+
 # ---------------------------------------------------------------------------
 # on_start: the TestClock barrier, the never-arm walk, L-24 negatives
 # ---------------------------------------------------------------------------

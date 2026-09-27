@@ -22,6 +22,7 @@ capture ("0.06") so a future edit there is caught here too.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -52,6 +53,29 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 
 _SLUG = "tc-temp-sfohigh-2026-09-21-gte70f"
+
+#: EDGE-1 AC1: the real, captured venue envelope shape -- not a flattened
+#: stand-in. `GET /v1/market/slug/{slug}` always wraps the market object
+#: under a `"market"` key (root cause of the wire-read defect this item
+#: fixes).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REAL_MARKET_ENVELOPE_PATH = (
+    _REPO_ROOT
+    / "docs"
+    / "evidence"
+    / "venue"
+    / "polymarket_us"
+    / "raw"
+    / "market_open_510636_by_slug.json"
+)
+
+
+def _envelope(fee_coefficient: Any) -> dict[str, Any]:
+    """A minimal, correctly-nested `{"market": {...}}` envelope -- the
+    ONLY shape `fetch_wire_fee_coefficient` accepts post-fix. `fee_coefficient
+    ` is placed exactly where the real venue places it (nested, never flat).
+    """
+    return {"market": {FEE_COEFFICIENT_WIRE_KEY: fee_coefficient, "slug": _SLUG}}
 
 
 class _RecordingAlertSink:
@@ -132,6 +156,7 @@ def _register(actor: FeeDriftProbeActor, clock: TestClock) -> None:
 @pytest.mark.asyncio
 async def test_probe_once_agrees_and_never_alerts_or_halts() -> None:
     actor, sink, setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+    _register(actor, TestClock())
 
     outcome = await actor.probe_once()
 
@@ -345,7 +370,7 @@ class _RecordingHttpClient:
 
 @pytest.mark.asyncio
 async def test_fetch_wire_fee_coefficient_uses_the_unauthenticated_gateway_path() -> None:
-    client = _RecordingHttpClient({FEE_COEFFICIENT_WIRE_KEY: "0.06"})
+    client = _RecordingHttpClient(_envelope("0.06"))
 
     result = await fetch_wire_fee_coefficient(client, _SLUG, quota_key=QUOTA_KEY_DISCOVERY)
 
@@ -357,8 +382,20 @@ async def test_fetch_wire_fee_coefficient_uses_the_unauthenticated_gateway_path(
 
 
 @pytest.mark.asyncio
+async def test_fetch_wire_fee_coefficient_unwraps_the_market_envelope() -> None:
+    """AC1: the REAL captured venue envelope (`{"market": {...}}`), not a
+    flattened stand-in, parses to the expected `Decimal`."""
+    payload = json.loads(_REAL_MARKET_ENVELOPE_PATH.read_text())
+    client = _RecordingHttpClient(payload)
+
+    result = await fetch_wire_fee_coefficient(client, _SLUG, quota_key=QUOTA_KEY_DISCOVERY)
+
+    assert result == Decimal("0.06")
+
+
+@pytest.mark.asyncio
 async def test_fetch_wire_fee_coefficient_raises_on_a_missing_field() -> None:
-    client = _RecordingHttpClient({"slug": _SLUG})
+    client = _RecordingHttpClient({"market": {"slug": _SLUG}})
 
     with pytest.raises(WireFeeCoefficientError):
         await fetch_wire_fee_coefficient(client, _SLUG, quota_key=QUOTA_KEY_DISCOVERY)
@@ -366,7 +403,17 @@ async def test_fetch_wire_fee_coefficient_raises_on_a_missing_field() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_wire_fee_coefficient_raises_on_a_malformed_field() -> None:
-    client = _RecordingHttpClient({FEE_COEFFICIENT_WIRE_KEY: "not-a-number"})
+    client = _RecordingHttpClient(_envelope("not-a-number"))
+
+    with pytest.raises(WireFeeCoefficientError):
+        await fetch_wire_fee_coefficient(client, _SLUG, quota_key=QUOTA_KEY_DISCOVERY)
+
+
+@pytest.mark.asyncio
+async def test_fetch_wire_fee_coefficient_raises_when_the_market_envelope_is_absent() -> None:
+    """Ruling (r2): a flat payload with no `"market"` key at all is
+    UNKNOWN, full stop -- there is no fallback read of a top-level field."""
+    client = _RecordingHttpClient({FEE_COEFFICIENT_WIRE_KEY: "0.06", "slug": _SLUG})
 
     with pytest.raises(WireFeeCoefficientError):
         await fetch_wire_fee_coefficient(client, _SLUG, quota_key=QUOTA_KEY_DISCOVERY)
@@ -411,6 +458,109 @@ def test_documented_fee_coefficient_default_is_byte_identical_to_the_pin() -> No
     assert DOCUMENTED_TAKER_FEE_COEFFICIENT == Decimal("0.06")
     actor, _sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
     assert actor._documented == DOCUMENTED_TAKER_FEE_COEFFICIENT
+
+
+# ---------------------------------------------------------------------------
+# EDGE-1 (r2/AM-1..4): in-memory, time-based "fee unverified" staleness veto.
+# `is_fee_verified(now_ns)` takes an EXTERNALLY supplied `now_ns` -- AM-1
+# requires the STRATEGY's own clock (`self.clock.timestamp_ns()`), never
+# `snapshot.ts_event`; this module never reads its own clock for that
+# comparison either, so the caller fully controls it (proven here via
+# TestClock and an explicit `now_ns` argument, and by the strategy-side test
+# in test_continuous_rung_hold_strategy.py).
+# ---------------------------------------------------------------------------
+
+_FOUR_HOURS_NS = 4 * 60 * 60 * 1_000_000_000
+
+
+def test_a_fresh_boot_is_unverified_until_the_first_agree() -> None:
+    actor, _sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+
+    assert actor.is_fee_verified(0) is False
+
+
+@pytest.mark.asyncio
+async def test_an_agree_clears_the_stale_state_and_refreshes_the_clock() -> None:
+    actor, _sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+    clock = TestClock()
+    _register(actor, clock)
+    clock.set_time(1_000)
+
+    await actor.probe_once()
+
+    assert actor.is_fee_verified(1_000) is True
+    assert actor.is_fee_verified(1_000 + _FOUR_HOURS_NS) is True
+    assert actor.is_fee_verified(1_000 + _FOUR_HOURS_NS + 1) is False
+
+
+@pytest.mark.asyncio
+async def test_the_veto_reengages_once_the_staleness_bound_elapses_with_no_further_agree() -> None:
+    actor, sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+    clock = TestClock()
+    _register(actor, clock)
+    clock.set_time(0)
+    await actor.probe_once()
+    assert actor.is_fee_verified(0) is True
+
+    stale_at = _FOUR_HOURS_NS + 1
+    assert actor.is_fee_verified(stale_at) is False
+    stale_events = [p for p in sink.emitted if p.event == "fee_drift_probe_fee_unverified_stale"]
+    assert len(stale_events) == 1
+    assert stale_events[0].severity == "CRITICAL"
+
+
+@pytest.mark.asyncio
+async def test_a_disagree_does_not_clear_the_stale_state() -> None:
+    actor, _sink, _setter = _build_actor(wire_fee_fetcher=_disagreeing_fetcher("0.0695"))
+    clock = TestClock()
+    _register(actor, clock)
+    clock.set_time(0)
+
+    outcome = await actor.probe_once()
+
+    assert outcome == "DISAGREE"
+    assert actor.is_fee_verified(0) is False, "only AGREE may ever clear the staleness veto"
+
+
+def test_crossing_the_staleness_bound_alerts_exactly_once() -> None:
+    actor, sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+
+    first = actor.is_fee_verified(0)
+    second = actor.is_fee_verified(1)
+    third = actor.is_fee_verified(2)
+
+    assert (first, second, third) == (False, False, False)
+    stale_events = [p for p in sink.emitted if p.event == "fee_drift_probe_fee_unverified_stale"]
+    assert len(stale_events) == 1, "the first-crossing alert must not repeat on every check"
+
+
+def test_the_stale_state_persisting_past_the_escalation_window_fires_exactly_one_reminder() -> None:
+    actor, sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+    twenty_four_hours_ns = 24 * 60 * 60 * 1_000_000_000
+
+    actor.is_fee_verified(0)  # first crossing (boot, never verified)
+    actor.is_fee_verified(twenty_four_hours_ns - 1)  # still inside the reminder window
+    actor.is_fee_verified(twenty_four_hours_ns)  # >=24h since the first alert: one reminder
+    actor.is_fee_verified(twenty_four_hours_ns + 1)  # freshly re-armed window: no second reminder
+
+    stale_events = [p for p in sink.emitted if p.event == "fee_drift_probe_fee_unverified_stale"]
+    persisting_events = [
+        p for p in sink.emitted if p.event == "fee_drift_probe_fee_unverified_stale_persisting"
+    ]
+    assert len(stale_events) == 1
+    assert len(persisting_events) == 1
+    assert persisting_events[0].severity == "CRITICAL"
+
+
+def test_stale_alert_detail_is_never_the_raw_exception_string() -> None:
+    """Security fix: `detail=` is a number or a fixed literal, never
+    exception text (which could embed the slug)."""
+    actor, sink, _setter = _build_actor(wire_fee_fetcher=_agreeing_fetcher())
+
+    actor.is_fee_verified(0)
+
+    (payload,) = sink.emitted
+    assert payload.detail == "never"
 
 
 # ---------------------------------------------------------------------------

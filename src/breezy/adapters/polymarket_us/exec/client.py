@@ -298,6 +298,7 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_open_orders,
     parse_order_status_report,
     parse_position_status_report,
+    position_leg,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import (
@@ -322,7 +323,6 @@ from breezy.adapters.polymarket_us.safety import (
 )
 from breezy.adapters.polymarket_us.symbology import (
     base_slug_of,
-    instrument_id_to_slug,
     leg_of,
     no_leg_instrument_id,
     slug_to_instrument_id,
@@ -1064,6 +1064,14 @@ class AmbiguousResolverContext:
     #: was a BUY) has no key at all and decodes to ``LONG_ONLY_SIDE`` --
     #: exactly what it always was.
     order_side: str = LONG_ONLY_SIDE
+    #: EDGE-2 slice A (AC3): the closed-set ``submit_chain.create_fill_
+    #: evidence(...).token`` for this with-id AMBIGUOUS create response.
+    #: Same AR-N6 trailing-optional shape as the three fields above: an OLD
+    #: blob (written before this change) has no ``createFillEvidence`` key,
+    #: and absence decodes to ``submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN``
+    #: -- the same token an unparseable body itself renders, since neither
+    #: case tells the resolver anything about create-time fill evidence.
+    create_fill_evidence: str = submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -1079,6 +1087,7 @@ class AmbiguousResolverContext:
                 "createDetail": self.create_detail,
                 "fillParseError": self.fill_parse_error,
                 "orderSide": self.order_side,
+                "createFillEvidence": self.create_fill_evidence,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -1108,6 +1117,16 @@ class AmbiguousResolverContext:
         # BUY), so absence decodes to `LONG_ONLY_SIDE`, never `None`.
         raw_order_side = payload.get("orderSide")
         order_side = LONG_ONLY_SIDE if raw_order_side is None else str(raw_order_side)
+        # EDGE-2 slice A (AC3): same trailing-optional shape -- an old blob
+        # has no `createFillEvidence` key at all (written before this
+        # change), so absence decodes to
+        # `submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN`.
+        raw_create_fill_evidence = payload.get("createFillEvidence")
+        create_fill_evidence = (
+            submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
+            if raw_create_fill_evidence is None
+            else str(raw_create_fill_evidence)
+        )
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -1125,6 +1144,7 @@ class AmbiguousResolverContext:
                 create_detail=create_detail,
                 fill_parse_error=fill_parse_error,
                 order_side=order_side,
+                create_fill_evidence=create_fill_evidence,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1314,12 +1334,18 @@ _RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = NON_FILL_TERMINAL_S
 _RESOLVER_FILL_STATUSES: Final[frozenset[OrderStatus]] = frozenset({OrderStatus.FILLED})
 
 
-def _resolver_long_position_state(positions: Mapping[str, Any], slug: str) -> bool | None:
-    """Resolution C: ``True`` -- a LONG is present at ``slug``. ``False`` --
-    confirmed no LONG (the slug is absent, which IS a confirmed zero
-    position). ``None`` -- undetermined (malformed ``netPosition``); the
-    caller MUST treat this exactly like a read failure: take no action,
-    stay AMBIGUOUS, try again next pass. Never ``_refuse``s.
+def _resolver_long_position_state(
+    positions: Mapping[str, Any], slug: str, leg: Leg
+) -> bool | None:
+    """Resolution C/EDGE-2C: ``True`` -- a LONG on ``leg`` is present at
+    ``slug`` (``leg`` KEEPS its name: per the 2026-09-16 ruling a NO holding
+    IS a LONG on the NO-leg instrument, never a SHORT on the YES one).
+    ``False`` -- confirmed no LONG on ``leg`` (the slug is absent, which IS a
+    confirmed zero position, or the sign/outcome present belongs to the
+    OTHER leg). ``None`` -- undetermined (malformed ``netPosition``, or an
+    outcome/sign contradiction :func:`position_leg` refuses to guess); the
+    caller MUST treat this exactly like a read failure: take no action, stay
+    AMBIGUOUS, try again next pass. Never ``_refuse``s.
     """
     payload = positions.get(slug)
     if payload is None:
@@ -1333,7 +1359,17 @@ def _resolver_long_position_state(positions: Mapping[str, Any], slug: str) -> bo
         net = _to_decimal(net_raw, field="netPosition", error=ExecutionReportMappingError)
     except ExecutionReportMappingError:
         return None
-    return net > 0
+    if net == 0:
+        return False
+    metadata = payload.get("marketMetadata")
+    metadata = metadata if isinstance(metadata, Mapping) else None
+    try:
+        held_leg = position_leg(
+            net=net, metadata=metadata, context=f"resolver positions[{slug!r}]"
+        )
+    except ExecutionReportMappingError:
+        return None
+    return held_leg == leg
 
 
 def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
@@ -2090,12 +2126,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         anywhere in this coroutine still leaves the durable record as the
         source of truth either way.
 
-        The LONG gate (``_resolver_long_position_state``) is slug-level
-        ``netPosition > 0`` corroboration ONLY, never magnitude-matched
-        against the GET's own ``filled_qty`` -- the order-specific GET
-        report is the sole authority for the quantity and price a fill is
-        synthesized from; the positions read exists only to confirm a LONG
-        exists at all before acting.
+        The LONG gate (``_resolver_long_position_state``) is slug-level,
+        leg-aware ``netPosition`` sign corroboration ONLY (per
+        ``reports.position_leg``), never magnitude-matched against the GET's
+        own ``filled_qty`` -- the order-specific GET report is the sole
+        authority for the quantity and price a fill is synthesized from; the
+        positions read exists only to confirm a LONG on THIS order's own leg
+        exists at all before acting (EDGE-2C: a NO holding is a LONG on the
+        NO-leg instrument, per the 2026-09-16 ruling, never a SHORT on the
+        YES one).
         """
         first_iteration = True
         while True:
@@ -2416,8 +2455,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 continue
 
-            slug = instrument_id_to_slug(instrument.id)
-            long_state = _resolver_long_position_state(positions, slug)
+            # EDGE-2C (AC1/AC3): `base_slug_of`/`leg_of` are the sanctioned
+            # readers for EITHER leg's id (`instrument_id_to_slug` refuses a
+            # NO-leg id outright -- the L-48 crash this guard exists to
+            # close); the whole derivation sits in one `try` because a
+            # slug/leg/holding failure must never kill this coroutine any
+            # more than a `_resolve_terminal_zero`/`_resolve_accept_fill`
+            # failure does below.
+            try:
+                leg = leg_of(instrument.id)
+                slug = base_slug_of(instrument.id)
+                long_state = _resolver_long_position_state(positions, slug, leg)
+            except Exception as exc:  # noqa: BLE001 - see the comment above
+                self._note_resolver_error(context.intent_id, exc)
+                continue
             if long_state is None:
                 self._log.warning(
                     f"resolver could not determine {slug}'s position from an "
@@ -4501,6 +4552,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         now_ns: int,
         create_detail: str | None = None,
         fill_parse_error: str | None = None,
+        create_fill_evidence: str = submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN,
     ) -> None:
         """Resolution A/E: record durable resolver context for a with-id
         AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
@@ -4519,6 +4571,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         so ``booking_id`` records the sentinel ``-1`` (``_BOOKING_IDS`` is
         1-indexed, `operator_controls.py:157`, so it never collides with a
         real booking) rather than dereferencing a ``None``.
+
+        EDGE-2 slice A (AC3): ``create_fill_evidence`` is the caller's
+        already-computed ``submit_chain.create_fill_evidence(response.body)
+        .token`` -- a closed-set name, never a price, quantity, or id.
         """
         context = AmbiguousResolverContext(
             intent_id=intent_id,
@@ -4532,6 +4588,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             create_detail=create_detail,
             fill_parse_error=fill_parse_error,
             order_side=order.side.name,
+            create_fill_evidence=create_fill_evidence,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         self._ambiguous_bookings[intent_id] = booking
@@ -4991,6 +5048,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # L-36 / Resolution A2: with-id only. A no-id AMBIGUOUS has
             # nothing a GET could ever resolve and stays operator-only
             # (`clear_submit_intent`, untouched).
+            #
+            # EDGE-2 slice A (AC3): closed-set create-time fill evidence,
+            # parsed independently of `outcome` (option F1 -- a second
+            # parse of the same body, only on this with-id branch).
+            # `evidence.exec_types`/`.order_state`/`.order_cum`/`.skips` are
+            # tuples/names/enum-shaped tokens only (never a price, quantity,
+            # or id), embedded via f-string so this coroutine makes no
+            # dotted call the E0-NOSEND allowlist does not already name.
+            evidence = submit_chain.create_fill_evidence(response.body)
+            self._log.error(
+                "create-order AMBIGUOUS create-fill-evidence: "
+                f"token={evidence.token} exec_types={evidence.exec_types} "
+                f"order_state={evidence.order_state} order_cum={evidence.order_cum} "
+                f"skips={evidence.skips} "
+                f"client_order_id={order.client_order_id.value}"
+            )
             self._note_ambiguous_open(
                 intent_id=intent.intent_id,
                 venue_order_id=outcome.venue_order_id,
@@ -5000,6 +5073,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 now_ns=now_ns,
                 create_detail=outcome.detail,
                 fill_parse_error=outcome.fill_parse_error,
+                create_fill_evidence=evidence.token,
             )
 
     async def _cancel_order(self, command: CancelOrder) -> None:

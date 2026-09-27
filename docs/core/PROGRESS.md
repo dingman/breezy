@@ -45,20 +45,19 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| EDGE-2C | CRIT | READY. Fix the NO-leg resolver crash (`exec/client.py:2419`), which wedges OPEN intents. Hard precondition of any re-arm. | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
-| EDGE-1 | HIGH | READY. The fee-drift probe has been blind since deploy (envelope unwrap). Add a staleness veto on entries only. Closes AUD-12b and is the A0 precondition. | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
-| EDGE-2 | HIGH | READY after EDGE-2C. Resolver: create-time evidence, activities trade-join, AC6b budget refusal. Step 0 is read-only venue queries (MIA 09-23). | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
+| EDGE-DEPLOY | HIGH | EDGE-2C (9c3f01b) + EDGE-1 (c32b53b) merged, gate 13565/0; node code, live on the next 16:50Z respawn. Proof in node log FILE: `event=fee_drift_probe outcome=AGREE` (θ registered 0.0695) and no resolver crash on a NO-leg intent | `EDGE_2026-09-27/README.md` |
+| EDGE-2 | HIGH | Step 0 DONE: MIA 09-23 `CP05MNWMAWP6` = ZERO_FILL_BENIGN (Q2s STABLE on one page; PC passed) → slice E dropped; slice D licensed with **eof-only** completeness (EDGE-2-MULTIPAGE reopens the min-createTime branch). Slice A in review, B building, D after A | `AMBIGUOUS_ORDER_2026-09-23_MIA/README.md` |
 | EDGE-3 | MED | READY. Per-family halt key with read-time attribution of the A1 halt by pinned sha. Needed before any fresh family. | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
-| EDGE-6 | MED | READY. 6c-0 K1 timeout drop-in DEPLOYED 09-27. Next: 6d recorder reload 15 min and 6b ingest memo (HIGH, before the 09-28 09:00Z rotation), the K1 retirement ruling (by 10-01), 6f. | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
-| EDGE-5 | CRIT | READY (programme). Re-arm roadmap RA-2..RA-13. Infra ~10-04; an edge is 3–5+ months away, and a KILL is more likely than CONFIRMED. | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
-| AUD-12 | HIGH | Previously untracked. Blocks every CONFIRMED result and every re-arm. 12b = EDGE-1. 12a = two-peer ruling (recommended: retain the 0.01 slippage allowance as conservative). | `docs/plans/backlog/EDGE_2026-09-27/README.md` |
+| EDGE-6 | MED | 6b LIVE 5947e5f (07:31Z no-op run 45 s vs p50 399 s). 6d merged dd2e3e8 + daemon-reload: verify the 09-28 09:00Z recorder boot shows the 15-min reload (AM-3). 6c-R RULED RETIRE 8175ab4, timer disabled; slice in rework (guard tests). 6f in review | `EDGE-6…r2` |
+| EDGE-5 | CRIT | READY (programme). RA-3 + RA-8b merged dea0965 (inert: `AUD11_AND_AUD12_LANDED=False`). RA-2 building. Infra ~10-04; edge 3–5+ months; KILL likelier than CONFIRMED | `EDGE_2026-09-27/README.md` |
+| AUD-12 | HIGH | 12a RULED: retain 0.01 as a conservative qty-1 allowance (93dc12f). 12b = EDGE-1, live at respawn. AUD-12 lands only when the RA-3 flag is flipped by its own ruling | `RULING_AUD-12a_slippage_allowance_2026-09-27.md` |
 | ING-2 | HIGH | S3a+S3b merged and LIVE (S3b 0974667, chunked EXTEND). Owed: observe the first EXTEND-path ingest run after the 09-27 09:00Z rotation (journal `ingested …` not all `skipped-already-converted`); if its peak ≪ 12G, remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. 19:15Z run (3.4G) converted nothing — not evidence. Residual: deferred units have no alert | `ING-2_S3_plan_r2_2026-09-26.md` |
 | ING-2-AMEND | HIGH | Drop-in removal criterion: cgroup peak counts page cache. On the post-rotation conversion run, require anon peak ≤2G, CPU/wall ≥0.8, and memory.events `high` <1/s. | `EDGE-6…r2` §C-6 |
 | AUD-07 | HIGH | `breezy-aud07-m1c-seg-0927a` armed 09-27 02:10–08:40Z: CAL rerun → cal_check → 20k (F_GATE_MAX=1.0, PR-3) → 80k → `--final` → AC7 ruling; then base §7 steps 7, 7b, 8 | `RULING_aud07_m1c_eps_k_decision_rule_2026-09-26.md` |
 | AUD-02 | MED | WP-D1 live; 09-26 16:52Z timer run failed pre-fix (`-m` fix 2e109ec merged later, unit is a symlink — 09-27 run is the first real check); 17:29Z rerun OK. A0 fee-evidence earliest close 09-30; DoD 10 coordinator block / Amendment C pointer | completion plan §2, §5 |
 | AUD-05 | MED | §7 step 8: three consecutive 17:20Z v4 tally runs — 2 so far (09-25, 09-26); 3rd = 09-27 17:20Z | AUD-05 §7 |
 | AUD-10b | MED | Evidence doc `PROMOTION_PROPOSAL_MECHANISM_2026-09-26.md`: 19/20 PASS (C7 closed 55781d0). Only C12 open: judge idempotency after the 09-27 15:50Z unattended replay (same hash only if inputs unchanged — else record why) | AUD-10 §8 |
-| AUD-18 | MED | (b) schema-v2 stratum/draw binding BLOCKED until a look-taking registration or REPLAY_VALIDITY flip | AUD-18 plan amendment |
+| AUD-18 | MED | (b) = EDGE-5 RA-2, building 09-27 (EDGE-5 r4 supersedes the BLOCKED note) | AUD-18 plan amendment |
 | FU-8b-DEPLOY | LOW | Merged 150c10c; live on next node respawn (never kill a live node to deploy). Proof: node log FILE shows `refusal re-poll timer armed name=breezy-refusal-repoll interval_s=60`, then `refusal re-poll alive … ticks=60` hourly | FU-8b plan r2 |
 | DIGEST | LOW | FU-12 merged 1bae25a: digest now writes a halt-state artefact with no tape. Verify 09-27 09:20Z: `derived/decision_funnel/decision_funnel_2026-09-26.json` exists with `halt_enforced` and `decision_tape_present:false` (A1 halt SET ⇒ no offer tape since 09-23 is expected) | FU-12 |
 | R-7-IMPL | LOW | Confirm the first `R7_POSITION_REPORTING_LAG` line after a create-path fill — NOT evaluable while the A1 halt is set (no fills possible) | `RULING_R-7_position_reporting_lag_2026-09-26.md` |
@@ -66,10 +65,11 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | FU-17b | LOW | Follow-ups from FU-17 review: split `_do_boot_retry` (~189 lines); interim WARN for the unowned/unknown-log fallback (silent until the 01:00Z window-close CRITICAL); stack trace in the contained window-close dispatch log; `_SUPERVISOR_SPAWNED` pruned only at STOP_PRIOR. | FU-17 python + silent-failure reviews 09-27 |
 | HUNT-1 | CRIT/GATED | Requirement stands (operator, 9ddcb8b); nothing built until a re-open trigger fires. Never treat as moot | `RULING_HUNT-1_all_hours_hunting_2026-09-26.md` |
 | AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family | AUD-06b |
+| FOLLOW-UPS 09-27 | LOW | EDGE-2-MULTIPAGE; THIN-BOOK-REFUSAL (winning-rung level-0 median 0.58 < qty 1); RA-8b str override raises TypeError not ValueError; 7 gate tests hardcode `REPO_ROOT/.venv` (worktrees need a symlink); study-failed alert is cause-agnostic (exit 4 ≡ 2/3) | this session |
 
 
 **Order (next session, re-synced 09-27 ~04:30Z):**
-1. Execute EDGE in parallel waves: EDGE-2C ∥ EDGE-1 ∥ EDGE-6 (6d + 6b before the 09-28 09:00Z rotation), then EDGE-2 ∥ EDGE-3, then the EDGE-5 fast track (RA-2/RA-3/RA-8b + AUD-12a ruling).
+1. Wave 1 merged 09-27 07:45Z. Remaining: EDGE-2 A/B/D, EDGE-3, EDGE-6f + K1 slice, RA-2; then RA-5a/RA-6/RA-11a.
 2. Keep the 09-27 watch: 09:00Z rotation + ING-2-AMEND, 09:20Z digest, 15:50Z replay/AUD-10b C12, 16:50Z node/FU-8b, 16:52Z discovery (6a proof), 17:20Z AUD-05 #3.
 3. SP-5b at its trigger.
 Watch: 16:50Z node spawn (permit line + tape advancing; A1 halt SET ⇒ never arms), 16:52Z discovery pull, 17:20Z tallies, 17:30Z capital-flow pull (one `CAPITAL_FLOW_PULL status=OK` line) → 17:40Z ROI report (`settled_cumulative_passes_net` expected True; raw stays False by design).
