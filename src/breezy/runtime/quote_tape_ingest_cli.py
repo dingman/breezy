@@ -2372,6 +2372,9 @@ def run(
             deadline=deadline,
         )
     except PreflightError as exc:
+        # Review finding 2 (ING-2-RSS): no `extend_dedupe:` summary line here
+        # -- nothing ran (no instance was ever reached), and `PreflightError`
+        # already logs its own diagnostic above.
         print(f"{PROGRAM}: {exc}", file=err)
         if deadline is not None:
             print(_deadline_line(0), file=out)
