@@ -98,8 +98,15 @@ def count_depth_rows(files: Sequence[str]) -> int:
     ``weather_strategy_backtest_lib.py:492-513``), without ever reading a row
     -- ``pyarrow.parquet.ParquetFile(f).metadata.num_rows`` reads only the
     file footer, so memory here is O(1) per file (D-1).
+
+    Each file is opened via ``with`` (review finding 1) so its handle closes
+    deterministically even if a later file in ``files`` raises.
     """
-    return sum(pq.ParquetFile(file_path).metadata.num_rows for file_path in files)
+    total = 0
+    for file_path in files:
+        with pq.ParquetFile(file_path) as parquet_file:
+            total += parquet_file.metadata.num_rows
+    return total
 
 
 def _field_type(schema: pa.Schema, name: str, *, file_path: str) -> pa.DataType:
@@ -151,7 +158,12 @@ def _ask_size_byte_width(
             f"{file_path}: ask_size width {width} does not match "
             f"NAUTILUS_ARROW_SCHEMA width {expected_width}"
         )
-    return width  # type: ignore[return-value]
+    # `width is None` would mean `_ASK_SIZE_COLUMNS` was empty, which is
+    # statically impossible (it is a fixed 10-element tuple) -- and would
+    # have raised just above anyway, since `None != expected_width`. The
+    # assert narrows the type for mypy instead of a bare `# type: ignore`.
+    assert width is not None
+    return width
 
 
 def _assert_no_nulls(batch: pa.RecordBatch, columns: Sequence[str], *, file_path: str) -> None:
@@ -213,6 +225,14 @@ def scan_depth_window(
     function never catches ``BaseException``, so a stop request always
     propagates and this function never returns a partial extent (D-4).
 
+    ``should_stop`` stays typed ``Callable[[], None]`` rather than
+    ``Callable[[], NoReturn]``: the injected callable, the census's own
+    ``_raise_if_terminating``, only raises CONDITIONALLY (when a stop has
+    actually been requested) and otherwise returns normally, so it is not a
+    ``NoReturn`` function -- mypy rejects binding a ``Callable[[], None]``
+    where a ``Callable[[], NoReturn]`` is expected (confirmed locally), since
+    that would claim the call itself never returns.
+
     Returns plain Python ``int``s (never ``numpy`` scalars, M13): the row
     count, and the first/last in-window ``ts_event`` (``None`` if no row
     qualified).
@@ -223,22 +243,25 @@ def scan_depth_window(
     last_ns: int | None = None
     row_count = 0
     for file_path in files:
-        parquet_file = pq.ParquetFile(file_path)
-        file_schema = parquet_file.schema_arrow
-        _assert_ts_event_type(file_schema, expected_schema, file_path=file_path)
-        width = _ask_size_byte_width(file_schema, expected_schema, file_path=file_path)
-        zero = _zero_binary_scalar(width)
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=list(columns)):
-            should_stop()
-            _assert_no_nulls(batch, columns, file_path=file_path)
-            ts_column = batch.column(_TS_EVENT_COLUMN)
-            combined_mask = pc.and_(
-                _ask_mask(batch, zero),
-                _window_mask(ts_column, start_ns=start_ns, end_ns=end_ns),
-            )
-            matched = ts_column.filter(combined_mask).to_pylist()
-            row_count += len(matched)
-            first_ns, last_ns = _fold_extent(first_ns, last_ns, matched)
+        # `with` (review finding 1) closes the file deterministically even
+        # when `should_stop()` raises mid-scan -- never left to the garbage
+        # collector.
+        with pq.ParquetFile(file_path) as parquet_file:
+            file_schema = parquet_file.schema_arrow
+            _assert_ts_event_type(file_schema, expected_schema, file_path=file_path)
+            width = _ask_size_byte_width(file_schema, expected_schema, file_path=file_path)
+            zero = _zero_binary_scalar(width)
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=list(columns)):
+                should_stop()
+                _assert_no_nulls(batch, columns, file_path=file_path)
+                ts_column = batch.column(_TS_EVENT_COLUMN)
+                combined_mask = pc.and_(
+                    _ask_mask(batch, zero),
+                    _window_mask(ts_column, start_ns=start_ns, end_ns=end_ns),
+                )
+                matched = ts_column.filter(combined_mask).to_pylist()
+                row_count += len(matched)
+                first_ns, last_ns = _fold_extent(first_ns, last_ns, matched)
     return row_count, first_ns, last_ns
 
 
@@ -264,15 +287,16 @@ def scan_quote_window(
     last_ns: int | None = None
     row_count = 0
     for file_path in files:
-        parquet_file = pq.ParquetFile(file_path)
-        _assert_ts_event_type(parquet_file.schema_arrow, expected_schema, file_path=file_path)
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=list(columns)):
-            should_stop()
-            _assert_no_nulls(batch, columns, file_path=file_path)
-            ts_column = batch.column(_TS_EVENT_COLUMN)
-            matched = ts_column.filter(
-                _window_mask(ts_column, start_ns=start_ns, end_ns=end_ns)
-            ).to_pylist()
-            row_count += len(matched)
-            first_ns, last_ns = _fold_extent(first_ns, last_ns, matched)
+        # `with` (review finding 1): see `scan_depth_window`.
+        with pq.ParquetFile(file_path) as parquet_file:
+            _assert_ts_event_type(parquet_file.schema_arrow, expected_schema, file_path=file_path)
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=list(columns)):
+                should_stop()
+                _assert_no_nulls(batch, columns, file_path=file_path)
+                ts_column = batch.column(_TS_EVENT_COLUMN)
+                matched = ts_column.filter(
+                    _window_mask(ts_column, start_ns=start_ns, end_ns=end_ns)
+                ).to_pylist()
+                row_count += len(matched)
+                first_ns, last_ns = _fold_extent(first_ns, last_ns, matched)
     return row_count, first_ns, last_ns

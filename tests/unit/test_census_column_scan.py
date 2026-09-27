@@ -18,11 +18,13 @@ exercised separately, end-to-end from real feather, by E-B2 only.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
 import sys
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
+from typing import Self
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -1005,3 +1007,294 @@ class TestEB2EndToEndFromLiveFeather:
 
         assert oracle == new_flat
         assert oracle[("SFO", "2026-09-01")].distinct_instruments == 1
+
+
+# ---------------------------------------------------------------------------
+# REPLAY-BIGINST review finding 1 (HIGH): parquet handles must close
+# deterministically, including when `should_stop` raises mid-scan.
+# ---------------------------------------------------------------------------
+
+
+def _spying_parquet_file_class(real_parquet_file: type) -> type:
+    """A `pq.ParquetFile` stand-in that counts opens/closes, delegating
+    everything else to the real class -- used to prove a raising scan still
+    closes every file it opened (finding 1)."""
+
+    class _SpyParquetFile:
+        open_count = 0
+        close_count = 0
+
+        def __init__(self, path: str, *args: object, **kwargs: object) -> None:
+            type(self).open_count += 1
+            self._inner = real_parquet_file(path, *args, **kwargs)
+
+        def close(self) -> None:
+            type(self).close_count += 1
+            self._inner.close()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            self.close()
+            return False
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    return _SpyParquetFile
+
+
+class TestFinding1ParquetHandlesCloseDeterministically:
+    def test_scan_depth_window_closes_the_file_even_when_should_stop_raises_mid_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        iid = InstrumentId(symbol=Symbol("CLOSE-DEPTH-A"), venue=_VENUE)
+        rows = [_depth(iid, ts_event=i, ts_init=i, real_ask_level=0) for i in range(5)]
+        catalog = _build_depth_catalog(tmp_path, rows)
+        files = _depth_files_for(catalog, iid)
+
+        spy_cls = _spying_parquet_file_class(pq.ParquetFile)
+        monkeypatch.setattr(pq, "ParquetFile", spy_cls)
+
+        def should_stop() -> None:
+            raise SystemExit(143)
+
+        with pytest.raises(SystemExit):
+            scan_depth_window(
+                files, start_ns=0, end_ns=1_000, should_stop=should_stop, batch_size=1
+            )
+
+        assert spy_cls.open_count >= 1
+        assert spy_cls.close_count == spy_cls.open_count
+
+    def test_scan_quote_window_closes_the_file_even_when_should_stop_raises_mid_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        iid = InstrumentId(symbol=Symbol("CLOSE-QUOTE-A"), venue=_VENUE)
+        catalog = ParquetDataCatalog(tmp_path)
+        catalog.write_data([_quote(iid, ts_event=i) for i in range(5)])
+        files = _quote_files_for(catalog, iid)
+
+        spy_cls = _spying_parquet_file_class(pq.ParquetFile)
+        monkeypatch.setattr(pq, "ParquetFile", spy_cls)
+
+        def should_stop() -> None:
+            raise SystemExit(143)
+
+        with pytest.raises(SystemExit):
+            scan_quote_window(
+                files, start_ns=0, end_ns=1_000, should_stop=should_stop, batch_size=1
+            )
+
+        assert spy_cls.open_count >= 1
+        assert spy_cls.close_count == spy_cls.open_count
+
+    def test_count_depth_rows_closes_every_file_it_opens(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        iid = InstrumentId(symbol=Symbol("CLOSE-COUNT-A"), venue=_VENUE)
+        rows = [_depth(iid, ts_event=0, ts_init=0), _depth(iid, ts_event=1, ts_init=1)]
+        catalog = _build_depth_catalog(tmp_path, rows)
+        files = _depth_files_for(catalog, iid)
+
+        spy_cls = _spying_parquet_file_class(pq.ParquetFile)
+        monkeypatch.setattr(pq, "ParquetFile", spy_cls)
+
+        assert count_depth_rows(files) == 2
+        assert spy_cls.open_count >= 1
+        assert spy_cls.close_count == spy_cls.open_count
+
+
+# ---------------------------------------------------------------------------
+# REPLAY-BIGINST review finding 3 (MEDIUM, R3-3): the BinaryOption type check
+# runs over ALL book-backed ids, sorted, BEFORE any scan touches a file.
+# ---------------------------------------------------------------------------
+
+
+class TestFinding3TypeCheckRunsBeforeAnyScan:
+    def test_a_corrupt_depth_file_on_an_earlier_id_never_masks_a_later_type_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fake_registry: _FakeRegistry
+    ) -> None:
+        """`aaa-corrupt` sorts before `zzz-bad-type`: if the type check ran
+        interleaved with the scan (the pre-fix order), `aaa-corrupt`'s scan
+        would run FIRST and raise `CatalogColumnScanError` from its corrupt
+        depth file, and `zzz-bad-type`'s `TypeError` would never surface. R3-3
+        requires every book-backed id's type to be checked, in sorted order,
+        before any scan starts."""
+        good = _weather_binary_option(
+            symbol="aaa-corrupt", station="SFO", climate_day="2026-09-01"
+        )
+        bad = _weather_currency_pair(
+            symbol="zzz-bad-type", station="SFO", climate_day="2026-09-01"
+        )
+        catalog = ParquetDataCatalog(tmp_path)
+        catalog.write_data([good, bad])
+        w_start, _w_end = decision_window_ns(
+            climate_day=dt.date(2026, 9, 1), std_utc_offset_hours=-8.0
+        )
+        good_iid = InstrumentId(symbol=Symbol("aaa-corrupt"), venue=_VENUE)
+        bad_iid = InstrumentId(symbol=Symbol("zzz-bad-type"), venue=_VENUE)
+        catalog.write_data([_depth(good_iid, ts_event=w_start, ts_init=0)])
+        catalog.write_data([_depth(bad_iid, ts_event=w_start, ts_init=1)])
+
+        good_files = _depth_files_for(catalog, good_iid)
+        table = pq.read_table(good_files[0])
+        table = table.drop(["ask_size_3"])
+        pq.write_table(table, good_files[0])
+
+        with pytest.raises(TypeError, match="zzz-bad-type"):
+            _new_spans(monkeypatch, catalog, instance_id="instance-1")
+
+
+# ---------------------------------------------------------------------------
+# REPLAY-BIGINST review finding 2 (MEDIUM): a stop or a TypeError writes
+# NOTHING -- checked at the `run_census` level (cache file + checkpoint).
+# ---------------------------------------------------------------------------
+
+
+def _stub_run_census_collaborators(
+    monkeypatch: pytest.MonkeyPatch, *, instance_id: str, catalog: ParquetDataCatalog
+) -> None:
+    monkeypatch.setattr(
+        census_module, "list_instance_ids", lambda _root, _subdir: (instance_id,)
+    )
+    monkeypatch.setattr(
+        census_module, "scan_instance", lambda _root, iid, _subdir: iid
+    )
+    monkeypatch.setattr(
+        census_module, "classify_instance", lambda _report, *, now_ns: "CLEAN"
+    )
+    monkeypatch.setattr(census_module, "_convert_live_capture", lambda **_kwargs: catalog)
+    monkeypatch.setattr(
+        census_module,
+        "_corrupt_instance_station_days",
+        lambda quote_catalog, subdirectory, corrupt_ids: set(),
+    )
+    monkeypatch.setattr(
+        census_module,
+        "_live_instance_registrations",
+        lambda quote_catalog, subdirectory, live_ids: {},
+    )
+    monkeypatch.setattr(census_module, "_read_station_candidates", lambda path: ())
+
+
+class TestESigIntegrationRunCensus:
+    """E-SIG-int: `should_stop` flips mid-scan, after batch 1, with a
+    `batch_size` smaller than the row count (R3-4) -- `run_census` must leave
+    NOTHING in the cache file/checkpoint for this instance."""
+
+    def test_should_stop_raising_leaves_no_cache_entry_or_checkpoint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fake_registry: _FakeRegistry
+    ) -> None:
+        instance_id = "sig-int-a"
+        instance_dir = tmp_path / "live" / instance_id
+        instance_dir.mkdir(parents=True)
+        (instance_dir / "binary_option_0.feather").write_bytes(b"sig-int-fixture")
+
+        instrument = _weather_binary_option(
+            symbol="SIG-INT-A", station="SFO", climate_day="2026-09-01"
+        )
+        catalog = ParquetDataCatalog(tmp_path / "catalog")
+        catalog.write_data([instrument])
+        w_start, _w_end = decision_window_ns(
+            climate_day=dt.date(2026, 9, 1), std_utc_offset_hours=-8.0
+        )
+        iid = InstrumentId(symbol=Symbol("SIG-INT-A"), venue=_VENUE)
+        # 5 rows against batch_size=2 (below): 3 batches, so `should_stop` is
+        # called more than once -- the flag flips AFTER batch 1, mid-scan,
+        # never at the natural end of the file (R3-4).
+        catalog.write_data(
+            [_depth(iid, ts_event=w_start + i * _SEC, ts_init=i) for i in range(5)]
+        )
+
+        _stub_run_census_collaborators(monkeypatch, instance_id=instance_id, catalog=catalog)
+        monkeypatch.setattr(
+            census_module,
+            "scan_depth_window",
+            functools.partial(scan_depth_window, batch_size=2),
+        )
+
+        calls = {"n": 0}
+
+        def _flip_after_batch_one() -> None:
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise SystemExit(143)
+
+        monkeypatch.setitem(
+            census_module._discover_clean_spans.__kwdefaults__,
+            "should_stop",
+            _flip_after_batch_one,
+        )
+
+        cache_path = tmp_path / "instance_spans.v2.jsonl"
+        with pytest.raises(SystemExit) as excinfo:
+            census_module.run_census(
+                catalog_root=tmp_path,
+                subdirectory="live",
+                work_root=tmp_path / "work",
+                station_candidates_path=tmp_path / "station_candidates.jsonl",
+                computed_day="2026-09-27",
+                now_ns=1,
+                instance_spans_cache_path=cache_path,
+            )
+
+        assert excinfo.value.code == 143
+        assert calls["n"] >= 2
+        assert read_instance_span_cache(cache_path) == {}
+
+
+class TestEB7bIntegrationRunCensus:
+    """E-B7b-int: a book-backed id that is not a `BinaryOption` -- `run_census`
+    must leave NOTHING in the cache file/checkpoint for this instance."""
+
+    def test_typeerror_leaves_no_cache_entry_or_checkpoint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fake_registry: _FakeRegistry
+    ) -> None:
+        instance_id = "b7b-int-a"
+        instance_dir = tmp_path / "live" / instance_id
+        instance_dir.mkdir(parents=True)
+        (instance_dir / "binary_option_0.feather").write_bytes(b"b7b-int-fixture")
+
+        good = _weather_binary_option(
+            symbol="good-b7b", station="SFO", climate_day="2026-09-01"
+        )
+        bad = _weather_currency_pair(
+            symbol="zzz-bad-b7b", station="SFO", climate_day="2026-09-01"
+        )
+        catalog = ParquetDataCatalog(tmp_path / "catalog")
+        catalog.write_data([good, bad])
+        w_start, _w_end = decision_window_ns(
+            climate_day=dt.date(2026, 9, 1), std_utc_offset_hours=-8.0
+        )
+        catalog.write_data(
+            [
+                _depth(
+                    InstrumentId(symbol=Symbol("good-b7b"), venue=_VENUE),
+                    ts_event=w_start,
+                    ts_init=0,
+                ),
+                _depth(
+                    InstrumentId(symbol=Symbol("zzz-bad-b7b"), venue=_VENUE),
+                    ts_event=w_start,
+                    ts_init=1,
+                ),
+            ]
+        )
+
+        _stub_run_census_collaborators(monkeypatch, instance_id=instance_id, catalog=catalog)
+
+        cache_path = tmp_path / "instance_spans.v2.jsonl"
+        with pytest.raises(TypeError):
+            census_module.run_census(
+                catalog_root=tmp_path,
+                subdirectory="live",
+                work_root=tmp_path / "work",
+                station_candidates_path=tmp_path / "station_candidates.jsonl",
+                computed_day="2026-09-27",
+                now_ns=1,
+                instance_spans_cache_path=cache_path,
+            )
+
+        assert read_instance_span_cache(cache_path) == {}

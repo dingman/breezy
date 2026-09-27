@@ -79,16 +79,17 @@ bias `delta in {0.02, 0.05}`, while the price (and hence `BE_i`, and hence
 an edge the market does not offer" -- exactly the R3-8 concern -- and its
 crossing-rate inflation is reported.
 
-No `slow`/`nightly` pytest marker exists in this repo (checked
-`pyproject.toml` `[tool.pytest.ini_options].markers` and
+No `slow`/`nightly` pytest marker existed in this repo when this module was
+written (checked `pyproject.toml` `[tool.pytest.ini_options].markers` and
 `tests/conftest.py::pytest_configure` -- only `live`/`venue_live`/
-`real_money`, all venue/network gates, not a compute-size gate). Rather than
-add a new marker to shared pytest config from this worktree, the full-size
-run (>=20k reps/config) is gated by the `BREEZY_FULL_MC` environment
-variable and is NOT part of the default collected/asserted test; the default
-test below runs a small smoke size for regression coverage on every gate
-run. The full-size numbers are captured once and recorded in
-`docs/evidence/NO_SIDE_LDOBF_REVALIDATION_2026-09-14.md`.
+`real_money`, all venue/network gates, not a compute-size gate). A `slow`
+marker has SINCE been added to `pyproject.toml` for other tests
+(REPLAY-BIGINST), but this module's own full-size run predates it and is
+left gated by its existing, already-working `BREEZY_FULL_MC` environment
+variable rather than migrated here -- it is NOT part of the default
+collected/asserted test; the default test below runs a small smoke size for
+regression coverage on every gate run. The full-size numbers are captured
+once and recorded in `docs/evidence/NO_SIDE_LDOBF_REVALIDATION_2026-09-14.md`.
 """
 
 from __future__ import annotations
@@ -481,8 +482,9 @@ def _run_real_rule_monte_carlo(
 # (1) LD-OBF re-validation under the real selection rule, NULL-EXACT
 #     (registered null: BE_i IS the true cell probability), k in
 #     {1,2,3,4}, n_cal in {90,300}, qty==1. Smoke size by default; full
-#     size (>=20k reps/config) is gated behind BREEZY_FULL_MC=1 (no
-#     slow/nightly marker exists in this repo -- see module docstring).
+#     size (>=20k reps/config) is gated behind BREEZY_FULL_MC=1 (a slow
+#     marker now exists in this repo, but this module predates it and keeps
+#     its own working gate -- see module docstring).
 # ---------------------------------------------------------------------------
 
 _SMOKE_N_REPS = 120
