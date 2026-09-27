@@ -1032,6 +1032,10 @@ class DaySchedulerState:
     #: [FU-17] Gates ``AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY`` to
     #: once per day -- day-level, never cleared by :func:`record_child_adopted`.
     boot_retry_window_closed_alert_sent: bool = False
+    #: [FU-17b] Gates the interim WARNING for the unowned/unknown-log
+    #: boot-retry fallback to once per trading day. This is log-only
+    #: observability, not an alert.
+    boot_retry_unknown_log_fallback_warned: bool = False
     #: [SUP-ADOPT-PERMIT, 2026-09-27] Consecutive-poll counter for an
     #: adoption-time boot-log replay (`ports.read_log_from_start`) that
     #: raised ``OSError`` -- distinct from "log read cleanly, no permit
@@ -1456,6 +1460,17 @@ def record_boot_retry_window_closed_alert_sent(
     if effective.boot_retry_window_closed_alert_sent:
         return effective
     return replace(effective, boot_retry_window_closed_alert_sent=True)
+
+
+def record_boot_retry_unknown_log_fallback_warned(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17b] Idempotent day-level latch for the log-only interim WARNING
+    when the unowned/unknown-log boot-retry fallback is taken."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_retry_unknown_log_fallback_warned:
+        return effective
+    return replace(effective, boot_retry_unknown_log_fallback_warned=True)
 
 
 def decide_boot_retry(
