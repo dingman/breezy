@@ -44,11 +44,18 @@ from replay_sufficiency_census import (
     _assert_census_is_complete,
     _candidate_rows_to_replay_sufficiency,
     _live_instance_registrations,
+    _locked_cache,
+    _locked_work_dir,
     _read_station_candidates,
     build_census,
     run_census,
 )
 
+from breezy.analysis.instance_span_cache import (
+    SPAN_ALGO_VERSION,
+    CachedInstanceSpans,
+    append_instance_span_cache_entry,
+)
 from breezy.analysis.replay_sufficiency import (
     CANDIDATE_UNSUPPORTED_STATION,
     CORRUPT_ONLY,
@@ -59,6 +66,7 @@ from breezy.analysis.replay_sufficiency import (
     window_extent,
 )
 from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
+from breezy.persistence.feather_preflight import PREFLIGHT_CLASSIFIER_VERSION
 from breezy.persistence.station_candidates import (
     STATION_CANDIDATES_SCHEMA_VERSION,
     StationCandidate,
@@ -69,6 +77,18 @@ COMPUTED_DAY = "2026-09-24"
 _VENUE = Venue("BREEZY_TEST")
 
 
+class _FakeWindow:
+    std_utc_offset_hours = -8.0
+
+
+class _FakeRegistry:
+    def pairs(self) -> tuple[tuple[str, str], ...]:
+        return (("polymarket_us", "SFO"),)
+
+    def climate_day_window(self, _venue: str, _station: str) -> _FakeWindow:
+        return _FakeWindow()
+
+
 def _span(verdict: str, depth: float = 0.0, instance_id: str = "instance-1") -> InstanceSpan:
     return InstanceSpan(
         instance_id=instance_id,
@@ -77,6 +97,38 @@ def _span(verdict: str, depth: float = 0.0, instance_id: str = "instance-1") -> 
         quote_window_minutes=0.0,
         distinct_instruments=1,
     )
+
+
+def _cached_entry(*, instance_id: str, last_full_scan: str) -> CachedInstanceSpans:
+    return CachedInstanceSpans(
+        spans={("SFO", "2026-09-01"): _span("CLEAN", depth=45.0, instance_id=instance_id)},
+        station_offsets={"SFO": -8.0},
+        last_full_scan=last_full_scan,
+    )
+
+
+def _seed_cached_instance(
+    tmp_path: Path, *, instance_id: str = "instance-1", last_full_scan: str = "2026-09-27"
+) -> tuple[Path, Path]:
+    instance_dir = tmp_path / "live" / instance_id
+    instance_dir.mkdir(parents=True)
+    (instance_dir / "binary_option_0.feather").write_bytes(b"not-real-arrow-but-fingerprinted")
+    files = census_module._instance_file_fingerprints(instance_dir)
+    fingerprint = census_module._instance_fingerprint(files)
+    cache_path = tmp_path / "instance_spans.v2.jsonl"
+    entry = _cached_entry(instance_id=instance_id, last_full_scan=last_full_scan)
+    entry = CachedInstanceSpans(
+        spans=dict(entry.spans),
+        station_offsets=dict(entry.station_offsets),
+        last_full_scan=entry.last_full_scan,
+        files=files,
+    )
+    append_instance_span_cache_entry(
+        cache_path,
+        (instance_id, fingerprint, SPAN_ALGO_VERSION, PREFLIGHT_CLASSIFIER_VERSION),
+        entry,
+    )
+    return instance_dir, cache_path
 
 
 def test_build_census_emits_one_row_per_station_climate_day() -> None:
@@ -136,7 +188,8 @@ def _fake_candidate(*, venue: str, city_token: str, last_seen_day: str) -> Stati
 
 
 def test_read_station_candidates_missing_file_warns_and_yields_empty_set(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     missing = tmp_path / "station_candidates.jsonl"
 
@@ -228,6 +281,104 @@ def test_candidate_rows_never_enter_the_replay_queue() -> None:
     assert rows[0].reason == CANDIDATE_UNSUPPORTED_STATION
     assert rows[0].verdict == "INSUFFICIENT"
     assert rows[0].winner_instance_id is None
+
+
+class TestIncrementalInstanceSpanCache:
+    def test_warm_clean_hit_skips_scan_and_conversion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        _instance_dir, cache_path = _seed_cached_instance(tmp_path)
+        monkeypatch.setattr(census_module, "default_registry", lambda: _FakeRegistry())
+        monkeypatch.setattr(
+            census_module,
+            "scan_instance",
+            lambda *args, **kwargs: pytest.fail("warm cache hit must not scan"),
+        )
+        monkeypatch.setattr(
+            census_module,
+            "_discover_clean_spans",
+            lambda **kwargs: pytest.fail("warm cache hit must not convert"),
+        )
+        monkeypatch.setattr(census_module, "_read_station_candidates", lambda path: ())
+
+        rows = run_census(
+            catalog_root=tmp_path,
+            subdirectory="live",
+            work_root=tmp_path / "work",
+            station_candidates_path=tmp_path / "station_candidates.jsonl",
+            computed_day="2026-09-27",
+            now_ns=1,
+            instance_spans_cache_path=cache_path,
+        )
+
+        assert [(row.station, row.climate_day) for row in rows] == [("SFO", "2026-09-01")]
+
+    def test_due_clean_hit_rescans_without_reconversion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        _instance_dir, cache_path = _seed_cached_instance(tmp_path, last_full_scan="2026-09-19")
+        scanned: list[str] = []
+        monkeypatch.setattr(census_module, "default_registry", lambda: _FakeRegistry())
+        monkeypatch.setattr(
+            census_module,
+            "scan_instance",
+            lambda _root, instance_id, _subdir: scanned.append(instance_id) or object(),
+        )
+        monkeypatch.setattr(census_module, "classify_instance", lambda _report, *, now_ns: "CLEAN")
+        monkeypatch.setattr(
+            census_module,
+            "_discover_clean_spans",
+            lambda **kwargs: pytest.fail("due unchanged CLEAN entry must not reconvert"),
+        )
+        monkeypatch.setattr(census_module, "_read_station_candidates", lambda path: ())
+
+        rows = run_census(
+            catalog_root=tmp_path,
+            subdirectory="live",
+            work_root=tmp_path / "work",
+            station_candidates_path=tmp_path / "station_candidates.jsonl",
+            computed_day="2026-09-27",
+            now_ns=1,
+            instance_spans_cache_path=cache_path,
+        )
+
+        assert scanned == ["instance-1"]
+        assert [(row.station, row.climate_day) for row in rows] == [("SFO", "2026-09-01")]
+
+    def test_cache_sidecar_lock_fails_loudly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        cache_path = tmp_path / "instance_spans.v2.jsonl"
+        monkeypatch.setattr(
+            census_module.fcntl,
+            "flock",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(BlockingIOError()),
+        )
+
+        with pytest.raises(RuntimeError, match="already held"), _locked_cache(cache_path):
+            pass
+
+    def test_work_sweep_skips_lockless_and_young_dirs(self, tmp_path: Path) -> None:
+        parent = tmp_path / "work-parent"
+        lockless = parent / "replay-sufficiency-census-lockless"
+        young = parent / "replay-sufficiency-census-young"
+        lockless.mkdir(parents=True)
+        young.mkdir(parents=True)
+        (young / ".lock").touch()
+
+        with _locked_work_dir(parent) as work_dir:
+            assert work_dir.exists()
+            assert (work_dir / ".lock").exists()
+
+        assert not work_dir.exists()
+        assert lockless.exists()
+        assert young.exists()
 
 
 class TestCensusCompletenessAssertion:
@@ -326,7 +477,8 @@ def _write_truncated_open_stream(path: Path, objects: list[QuoteTick]) -> None:
 
 class TestLiveAndEmptyInstancesGetARow:
     def test_a_live_only_day_gets_a_no_clean_instance_row_not_no_row_at_all(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         instance_dir = tmp_path / "live" / "instance-live-1"
         _write_binary_option_feather(
@@ -355,7 +507,8 @@ class TestLiveAndEmptyInstancesGetARow:
         assert row.reason == NO_CLEAN_INSTANCE
 
     def test_an_empty_only_instance_yields_zero_rows_and_does_not_crash(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         instance_dir = tmp_path / "live" / "instance-empty-1"
         instance_dir.mkdir(parents=True)
@@ -375,7 +528,8 @@ class TestLiveAndEmptyInstancesGetARow:
         assert rows == ()
 
     def test_a_registry_seed_candidate_never_duplicates_a_live_tape_key(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Reproduces the 2026-09-25 production incident byte-for-byte: NYC
         seeded as a candidate for the SAME still-open day a live instance is
@@ -395,7 +549,9 @@ class TestLiveAndEmptyInstancesGetARow:
 
         register_path = tmp_path / "station_candidates.jsonl"
         candidate = _fake_candidate(
-            venue="polymarket_us", city_token="nyc", last_seen_day="2026-09-25",
+            venue="polymarket_us",
+            city_token="nyc",
+            last_seen_day="2026-09-25",
         )
         register_path.write_text(json.dumps(asdict(candidate)) + "\n", encoding="utf-8")
 
@@ -425,7 +581,8 @@ class TestLiveAndEmptyInstancesGetARow:
 
 class TestLiveInstanceRegistrations:
     def test_returns_the_stations_days_and_the_instances_own_min_ts_init(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         instance_dir = tmp_path / "live" / "instance-live-1"
         _write_binary_option_feather(
@@ -437,7 +594,9 @@ class TestLiveInstanceRegistrations:
         )
 
         result = _live_instance_registrations(
-            quote_catalog=tmp_path, subdirectory="live", live_ids=["instance-live-1"],
+            quote_catalog=tmp_path,
+            subdirectory="live",
+            live_ids=["instance-live-1"],
         )
 
         station_days, capture_start = result["instance-live-1"]
@@ -471,7 +630,9 @@ class TestLiveInstanceRegistrations:
         (instance_dir / "binary_option_0.feather").touch()
 
         result = _live_instance_registrations(
-            quote_catalog=tmp_path, subdirectory="live", live_ids=["instance-empty"],
+            quote_catalog=tmp_path,
+            subdirectory="live",
+            live_ids=["instance-empty"],
         )
 
         station_days, capture_start = result["instance-empty"]
@@ -488,7 +649,8 @@ class TestLiveInstanceRegistrations:
 
 
 def _pad(
-    side: OrderSide, levels: tuple[tuple[str, int], ...],
+    side: OrderSide,
+    levels: tuple[tuple[str, int], ...],
 ) -> tuple[list[BookOrder], list[int]]:
     filler = BookOrder(side, Price(0, 2), Quantity(0, 0), 0)
     orders = [BookOrder(side, Price.from_str(px), Quantity(size, 0), 0) for px, size in levels]
@@ -528,7 +690,8 @@ def _fake_quote(*, instrument_id: InstrumentId, ts_event: int) -> QuoteTick:
 
 
 def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     station = "SFO"
     climate_day = dt.date(2026, 9, 1)
@@ -537,7 +700,9 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
     ts_event = start_ns + 10 * 60_000_000_000  # 10 minutes into the window
 
     instrument = _weather_binary_option(
-        station=station, climate_day=climate_day.isoformat(), ts_init=0,
+        station=station,
+        climate_day=climate_day.isoformat(),
+        ts_init=0,
     )
     depth = _fake_depth(instrument_id=instrument.id, ask="0.50", ts_event=ts_event)
     quote = _fake_quote(instrument_id=instrument.id, ts_event=ts_event)
@@ -552,7 +717,10 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
     calls: list[tuple[tuple[int, ...], int, int]] = []
 
     def _recording_window_extent(
-        ts_event_ns: Iterable[int], *, start_ns: int, end_ns: int,
+        ts_event_ns: Iterable[int],
+        *,
+        start_ns: int,
+        end_ns: int,
     ) -> WindowExtent:
         values = tuple(ts_event_ns)
         calls.append((values, start_ns, end_ns))
@@ -560,11 +728,13 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
 
     monkeypatch.setattr(census_module, "window_extent", _recording_window_extent)
     monkeypatch.setattr(
-        census_module, "_convert_live_capture",
+        census_module,
+        "_convert_live_capture",
         lambda **kwargs: SimpleNamespace(instruments=lambda: [instrument]),
     )
     monkeypatch.setattr(
-        census_module, "_select_capture_instruments",
+        census_module,
+        "_select_capture_instruments",
         lambda catalog, *, climate_day: [tape_instrument],
     )
 
@@ -581,4 +751,3 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
     assert span.first_in_window_ns == ts_event
     assert span.last_in_window_ns == ts_event
     assert (station, climate_day.isoformat()) in window_bounds
-

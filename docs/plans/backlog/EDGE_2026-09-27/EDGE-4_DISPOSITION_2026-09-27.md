@@ -17,6 +17,7 @@ The r1 plan is `EDGE-4_live_feed_calibration_parity_plan_r1_2026-09-27.md`. It w
 
 ## What carries forward
 - **A binding rule for every EDGE/AUD-18 study:** no exploratory statistic may read tape station-days after the 2026-09-25 freeze unless that corpus is explicitly declared SEARCH for H-ARCHIVE-RECAL-2026-09, with the cost recorded in both plans.
+- **REPLAY-INCR R3-E:** before any ruling cites an EDGE-4 revival count or any other census-derived CONFIRM count, the cited count MUST come from a census run with `--no-instance-spans-cache`, and that run's `census_provenance:` stdout line must be quoted in the ruling.
 - **A settled fact (T0 resolved):** `running_max_lower/upper` are populated on every offer-tape row, refused rows included (`continuous_strategy.py:2231-2266`). The only null rows are `exit_refused:family_not_exit_registered` position-monitor rows from 09-21.
 - **Revival trigger, owned by AUD-18a/`hypothesis_triage.py`:** post-freeze confirmatory station-days for H-ARCHIVE-RECAL-2026-09 reach at least 50% of 600. At that point, re-plan within AUD-18 §6.3 using the replay corpus, with the defects above fixed.
 - **Refusal-rate observability:** the existing digest already reports refusals by reason (`decision_funnel_daily_digest.py:280-351`). No new build is needed.
