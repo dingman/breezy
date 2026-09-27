@@ -636,6 +636,39 @@ version, ingest logs one warning, scans the instance cold, and rewrites the
 memo atomically. Deleting the file is safe; it only makes the next run pay the
 cold preflight cost again.
 
+### `breezy-quote-tape-ingest` deferral-stall alert (EDGE-6f, 2026-09-27)
+
+`run()` exits 0 on any deadline deferral by contract -- correct, since a
+deferred unit retries next run, but silent if the SAME work keeps deferring
+run after run (live 09-27 02:25Z/02:40Z, 24 instances deferred each; the
+only alert path is `OnFailure=`, and a deferral is never a failure by
+itself). One streak file per catalog,
+`<catalog_root>/.ingest-deferral-streak-v1.json` (never under `live/`),
+tracks how many CONSECUTIVE runs have had genuine pending work
+(`breezy.runtime.ingest_deferral_streak`, pure state machine). Once pending
+work has persisted for >= 4 consecutive runs AND >= 60 minutes, the run
+prints a value-free `DEFERRAL_STALLED runs=… age_s=… pending_units=…` line
+and exits 4 (`EXIT_DEFERRAL_STALLED`); it re-alerts every 16th run
+(~4 hours at this unit's 15-minute cadence) while the stall persists, and
+resets the instant a run has nothing pending. There is no `SuccessExitStatus=`
+override, so exit 4 is already an ordinary unit failure and `OnFailure=`
+above delivers it exactly like exit 2 or 3, with no extra configuration.
+
+"Pending" is marker-aware, not a blind count of deferred instances: a
+"not evaluated" (loop-top, deadline-denied-before-any-scan) instance only
+counts if it still has a real, unaccounted-for closed file -- one that is
+NOT already blanket-, per-file-, or salvage-marked, and is not currently
+open. Without that, an instance permanently stuck on the per-file
+conversion path (never earning the blanket `.converted-<type>` marker --
+see the 6b memo section above, and the three known 09-27 instances) would
+count as pending on every single run and alert forever.
+
+A missing, corrupt, or unknown-version streak file resets to a fresh
+streak with one WARNING, never a fabricated "already stalled" state: losing
+history only delays a real stall's next alert by at most one stall window,
+while treating garbage as "already alerted" could suppress every future
+alert instead. A `--dry-run` never reads or writes the streak file.
+
 ---
 
 ## AUD-15 alert env file (`~/.config/breezy/alerts.env`) (amendment, 2026-09-22)

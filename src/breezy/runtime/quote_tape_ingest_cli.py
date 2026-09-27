@@ -227,7 +227,18 @@ Ran, nothing failed             0  every instance skipped-live/-truncated,
 Usage / configuration error     2  no catalog root, path is not a directory
 At least one hard per-file      3  a ``None`` table or empty-after-transform
 conversion failure                read (see "Per-file conversion" above)
+Deferral-stall alert             4  pending work deferred >= 4 consecutive
+(EDGE-6 6f)                        runs AND >= 60 minutes (see
+                                   :mod:`breezy.runtime.ingest_deferral_streak`)
 ===========================  ====  ==========================================
+
+Exit-code precedence when more than one condition applies on the SAME run
+(EDGE-6 6f, C-5): usage (2) beats a conversion failure (3), which beats a
+deferral-stall alert (4), which beats a clean run (0). A conversion
+failure with pending work also stalled still exits 3 -- but the
+``DEFERRAL_STALLED`` line still prints in that invocation's journal, so
+``OnFailure=`` fires exactly once and the reason is visible either way (see
+:func:`run`).
 """
 
 from __future__ import annotations
@@ -242,6 +253,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -265,6 +277,18 @@ from breezy.runtime.ingest_deadline import (
     RunDeadline,
     count_deferred,
 )
+from breezy.runtime.ingest_deferral_streak import (
+    STATE_FILENAME as DEFERRAL_STREAK_STATE_FILENAME,
+)
+from breezy.runtime.ingest_deferral_streak import (
+    load_state as _load_deferral_streak_state,
+)
+from breezy.runtime.ingest_deferral_streak import (
+    save_state as _save_deferral_streak_state,
+)
+from breezy.runtime.ingest_deferral_streak import (
+    step as _step_deferral_streak,
+)
 from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
 from breezy.runtime.quote_tape_salvage import (
@@ -286,6 +310,12 @@ EXIT_USAGE = 2
 #: Distinct from EXIT_OK's "ran, even if every instance was skipped": a skip
 #: is an ordinary, expected outcome, never a failure.
 EXIT_CONVERSION_FAILED = 3
+
+#: EDGE-6 6f: pending deferred work has crossed the stall threshold in
+#: ``breezy.runtime.ingest_deferral_streak`` (>= 4 consecutive runs AND
+#: >= 60 minutes). Lower precedence than :data:`EXIT_CONVERSION_FAILED` --
+#: see :func:`run` and the module docstring's exit-precedence note.
+EXIT_DEFERRAL_STALLED = 4
 
 #: A file touched more recently than this may be mid-write. Configurable via
 #: ``--live-grace-minutes`` because the right value depends on how bursty a
@@ -429,6 +459,61 @@ def _instance_is_fully_converted(instance_dir: Path, data_types: Sequence[type])
         if matched is None or not _is_marked_converted(instance_dir, matched):
             return False
     return True
+
+
+def _instance_has_pending_work(
+    instance_dir: Path,
+    open_files: frozenset[Path],
+    data_types: Sequence[type] = DEFAULT_DATA_TYPES,
+) -> bool:
+    """True iff some closed, non-open feather file is unaccounted for.
+
+    EDGE-6 6f / AC-6f-5. A "not evaluated" (loop-top deadline-deferred)
+    instance never has :func:`_open_files_for_instance` called for it (the
+    deferral happens before that), so this predicate re-derives closure
+    from the SAME four states :func:`run_ingest`'s own conversion paths can
+    leave a file in, deliberately marker-aware in a way
+    :func:`_instance_is_fully_converted` is NOT:
+
+    * blanket type-marked (:func:`_is_marked_converted`) -- the whole-
+      instance fast path already converted this file's type;
+    * per-file-marked (:func:`_is_file_marked_converted`) -- the per-file
+      path (:func:`_ingest_instance_per_file`) converted this exact file
+      without (and without needing) a blanket marker for its type;
+    * salvage-marked, including the terminal "no Arrow wrangler" marker
+      (:func:`_is_salvage_marked`) -- a truncated file that was already
+      salvaged, or is permanently unsalvageable, is not "pending" work;
+    * currently open (in ``open_files``) -- a live writer's file is never
+      pending; it is retried on its own schedule, not this one.
+
+    Without the per-file and salvage awareness, an instance stuck on the
+    per-file path forever (plan §2.2.1: never earns the blanket marker
+    because nothing promotes a fully per-file-converted type to it) would
+    count as pending on every single run and never stop alerting (R6).
+    """
+    known_types = tuple(dict.fromkeys((*data_types, *DEFAULT_DATA_TYPES)))
+    for path in iter_feather_files(instance_dir):
+        if path.name.startswith("."):
+            # `iter_feather_files`'s `rglob("*.feather")` also matches the
+            # per-file and salvage markers THEMSELVES, since each is named
+            # by appending a real feather filename (which already ends in
+            # `.feather`) to a dotfile prefix. No genuine recorder-written
+            # feather file is ever a dotfile, so this is never a real,
+            # unaccounted-for capture -- without this guard, an instance
+            # made entirely of marked, per-file-converted files would still
+            # register its OWN marker names as "pending".
+            continue
+        if path in open_files:
+            continue
+        if _is_file_marked_converted(instance_dir, path):
+            continue
+        if _is_salvage_marked(instance_dir, path):
+            continue
+        matched = _data_cls_for_feather(instance_dir, path, known_types)
+        if matched is not None and _is_marked_converted(instance_dir, matched):
+            continue
+        return True
+    return False
 
 
 def _mark_converted(instance_dir: Path, data_cls: type) -> None:
@@ -2150,6 +2235,66 @@ def _resolve_catalog(namespace: argparse.Namespace, env: Mapping[str, str]) -> P
     return root
 
 
+def _count_pending_deferral_units(
+    results: Sequence[InstanceIngestResult],
+    catalog_root: Path,
+    subdirectory: str,
+    data_types: Sequence[type],
+    *,
+    now_ns: int | None,
+    grace_minutes: float,
+    service_active_probe: ServiceActiveProbe,
+) -> int:
+    """How much of ``results`` is genuinely still pending, for the EDGE-6 6f
+    deferral-stall streak -- deliberately NOT a read of ``result.outcome``
+    (AM-2). A salvage-deferred instance's outcome is ``"skipped-truncated"``,
+    never ``DEFERRED_DEADLINE`` (see :func:`_ingest_instance_per_file`'s
+    outcome precedence: unresolved truncation always wins), so counting by
+    outcome string alone would silently miss it.
+
+    Mirrors :func:`~breezy.runtime.ingest_deadline.count_deferred`'s own two
+    signals -- a per-type ``DEFERRED_DEADLINE`` outcome, and
+    ``result.salvage_deferred`` -- but replaces its blanket "every loop-top
+    'not evaluated' instance counts" rule with the AC-6f-5 marker-aware
+    :func:`_instance_has_pending_work` predicate (AM-1): a "not evaluated"
+    instance was deferred before :func:`_open_files_for_instance` was ever
+    called for it, so THIS function calls it directly, once, from a single
+    liveness snapshot shared across every such instance in ``results``
+    (never more than one extra read regardless of how many are pending).
+    """
+    units = 0
+    snapshot: LivenessSnapshot | None = None
+    for result in results:
+        for type_result in result.type_results:
+            if type_result.outcome == DEFERRED_DEADLINE:
+                units += 1
+        if result.salvage_deferred:
+            units += 1
+        if result.outcome == DEFERRED_DEADLINE and result.reason == "not evaluated":
+            if snapshot is None:
+                snapshot = take_liveness_snapshot(
+                    catalog_root,
+                    subdirectory,
+                    now_ns=now_ns,
+                    grace_minutes=grace_minutes,
+                    service_active_probe=service_active_probe,
+                )
+            instance_dir = _instance_dir(catalog_root, result.instance_id, subdirectory)
+            open_files = _open_files_for_instance(
+                catalog_root,
+                result.instance_id,
+                subdirectory,
+                data_types,
+                now_ns=snapshot.now_ns,
+                grace_ns=snapshot.grace_ns,
+                newest_instance_id=snapshot.newest_instance_id,
+                service_active=snapshot.service_active,
+            )
+            if _instance_has_pending_work(instance_dir, open_files, data_types):
+                units += 1
+    return units
+
+
 def run(
     argv: Sequence[str] | None = None,
     *,
@@ -2230,8 +2375,52 @@ def run(
         print(result.summary_line(), file=out)
     if deadline is not None:
         print(_deadline_line(len(results)), file=out)
+
+    # EDGE-6 6f: the deferral-stall streak. Independent of `deadline` (a
+    # dry run never builds a deadline either, but pending-ness is still
+    # meaningful in principle) -- gated on `dry_run` alone (AC: a dry run
+    # never touches the streak file, since it never converts or marks
+    # anything real).
+    alert_due = False
+    if not namespace.dry_run:
+        pending_units = _count_pending_deferral_units(
+            results,
+            root,
+            namespace.subdirectory,
+            DEFAULT_DATA_TYPES,
+            now_ns=now_ns,
+            grace_minutes=namespace.live_grace_minutes,
+            service_active_probe=lambda: default_service_active_probe(namespace.service_unit),
+        )
+        streak_path = root / DEFERRAL_STREAK_STATE_FILENAME
+        streak_state = _load_deferral_streak_state(streak_path)
+        now_utc = datetime.fromtimestamp(
+            (now_ns if now_ns is not None else time.time_ns()) / 1_000_000_000,
+            tz=UTC,
+        )
+        new_streak_state, alert_due = _step_deferral_streak(
+            streak_state, pending=pending_units > 0, now=now_utc
+        )
+        _save_deferral_streak_state(streak_path, new_streak_state)
+        if alert_due:
+            first_deferred = datetime.fromisoformat(new_streak_state.first_deferred_utc)
+            age_s = int((now_utc - first_deferred).total_seconds())
+            print(
+                f"{PROGRAM}: DEFERRAL_STALLED runs={new_streak_state.consecutive_runs} "
+                f"age_s={age_s} pending_units={pending_units}",
+                file=out,
+            )
+
+    # Exit-code precedence (C-5): usage (2, already returned above) beats a
+    # conversion failure (3), which beats a deferral-stall alert (4), which
+    # beats a clean run (0). A failure with a stall also due still exits 3
+    # -- the DEFERRAL_STALLED line above already printed either way, so
+    # `OnFailure=` fires exactly once and the reason is visible regardless
+    # of which code wins.
     if any(result.outcome == "failed" for result in results):
         return EXIT_CONVERSION_FAILED
+    if alert_due:
+        return EXIT_DEFERRAL_STALLED
     return EXIT_OK
 
 
