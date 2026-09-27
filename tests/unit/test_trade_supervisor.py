@@ -567,6 +567,35 @@ class TestZeroInstrumentsRefusalIn:
         assert zero_instruments_refusal_in(skip) is False
         assert zero_instruments_refusal_in(yesterday) is False
 
+    def test_matches_the_actual_zero_instruments_message_byte_for_byte(self):
+        # [marker byte-identity] The REAL `_zero_instruments_message` output
+        # -- not a hand-copied literal -- must match; the module's own two
+        # healthy, prefix-interrupted warnings (current AND continuous
+        # variants) must never match, confirmed against their live %-format
+        # strings.
+        from breezy.strategy.current_rung_hold.composition import _zero_instruments_message
+
+        message = _zero_instruments_message(
+            resolved={"SFO": ()}, today_by_station={"SFO": dt.date(2026, 9, 4)}
+        )
+        assert zero_instruments_refusal_in(message) is True
+
+        current_skip = "current_rung_hold: skipping {}; resolved 0 instruments for {}".format(
+            "SFO", "2026-09-04"
+        )
+        continuous_skip = (
+            "continuous_rung_hold: skipping {}; resolved 0 instruments for {}".format(
+                "SFO", "2026-09-04"
+            )
+        )
+        continuous_yesterday = (
+            "continuous_rung_hold: {} resolved 0 instruments for yesterday {}; "
+            "external order claim covers today only".format("SFO", "2026-09-03")
+        )
+        assert zero_instruments_refusal_in(current_skip) is False
+        assert zero_instruments_refusal_in(continuous_skip) is False
+        assert zero_instruments_refusal_in(continuous_yesterday) is False
+
 
 _BASE_DAY = dt.datetime(2026, 9, 4, tzinfo=dt.UTC)
 
@@ -4834,6 +4863,40 @@ class TestDoMiddayWatchBootRetryEntryGuard:
         assert sink.payloads == []
         assert result == (6002, None, state)
 
+    def test_adopted_unknown_log_node_dies_transient_and_owned_is_false_so_nothing_spawns(
+        self, tmp_path
+    ):
+        # [ruling 1/3, item-A regression] An ADOPTED node -- never spawned
+        # by this supervisor, so `owned()` is False -- whose log path could
+        # not be determined dies with a TRANSIENT (`TRADING_NODE_FAILED`)
+        # cause. Because its log is unknown, the ordinary body's own
+        # top-of-function guard returns before ever reading or classifying
+        # anything: no spawn, no boot-retry dispatch, no alert.
+        adopted_pid = 17001
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            process_alive=lambda _pid: False,  # the adopted node has died
+            alert_sink=sink,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        assert owned(adopted_pid, process_alive=ports.process_alive) is False
+
+        result = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 30),
+            tracked_pid=adopted_pid,
+            node_log=None,  # adoption could not determine the log path
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert spawner.calls == []
+        assert sink.payloads == []
+        assert result == (adopted_pid, None, state)
+
 
 # ===========================================================================
 # [FU-17] `_do_boot_retry` -- the retry path itself.
@@ -5028,7 +5091,9 @@ class TestDoBootRetry:
         # Attempt IS consumed regardless of the precheck outcome (decision F).
         assert state.boot_retry_attempts == 1
 
-    def test_final_drain_catches_permit_written_between_read_and_liveness_check(self, tmp_path):
+    def test_boot_retry_final_drain_catches_permit_written_between_read_and_liveness_check(
+        self, tmp_path
+    ):
         # [AM-1] Step (a)'s own read sees no permit yet; the child then
         # writes one and dies before the liveness check. The final drain,
         # immediately before spawn, must catch it and hand off instead.
@@ -5064,6 +5129,119 @@ class TestDoBootRetry:
         assert spawner.calls == []
         assert new_pid == 11001
         assert state.first_boot_permit_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+
+    def test_uses_latched_cause_when_refusal_seen_alive_then_dead_with_no_new_output(
+        self, tmp_path
+    ):
+        # [architect round-2 binding item] The zero-instrument refusal line
+        # is drained on a poll where the child is still ALIVE (latching
+        # `midday_cause_seen` via THIS read); the child is then confirmed
+        # dead on a LATER poll whose own delta no longer contains the
+        # marker text (already drained). The retry decision must come from
+        # the LATCH, not a fresh (now-UNKNOWN) classification of the empty
+        # new output -- and must actually spawn a retry.
+        node_log = tmp_path / "node.log"
+        refusal_text = (
+            "current_rung_hold: resolved 0 instruments for 2026-09-04 (SFO=0); "
+            "refusing to start\n"
+        )
+        node_log.write_text(refusal_text)
+        reads = iter([refusal_text, "", ""])
+        spawner = FakeSpawner()
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        # Poll 1: alive -- drains and latches the refusal line.
+        alive_ports = _make_ports(
+            spawn=spawner, process_alive=lambda _pid: True, read_log_new=lambda p: next(reads)
+        )
+        pid, node_log, state = _do_boot_retry(
+            ports=alive_ports,
+            state=state,
+            now=_utc(17, 15),
+            tracked_pid=16001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert state.midday_cause_seen is RelaunchCause.TRANSIENT
+        assert pid == 16001
+
+        # Poll 2: dead -- THIS poll's own read (and the AM-1 final drain
+        # read) are both empty, already drained by poll 1 above.
+        dead_ports = _make_ports(
+            spawn=spawner, process_alive=lambda _pid: False, read_log_new=lambda p: next(reads)
+        )
+        new_pid, _new_log, state = _do_boot_retry(
+            ports=dead_ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid != 16001
+        assert state.boot_retry_nontransient_alert_sent is False
+
+    def test_hand_off_leaves_readiness_observed_false_if_lock_not_yet_held(self, tmp_path):
+        # [item H, negative] The hand-off race: the permit line is observed
+        # and latched, but the intent lock is not yet held by `tracked_pid`
+        # at this exact poll -- `readiness_observed` must stay False (an
+        # accepted, tested limitation), while the hand-off itself still
+        # proceeds (both permit latches fire, no spawn).
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_PERMIT_ISSUED_LINE)
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda p: p.read_text(),
+            resolve_intent_lock_holder=lambda _p: None,  # lock not held by tracked_pid yet
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        new_pid, new_log, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=14001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert new_pid == 14001
+        assert new_log == node_log
+        assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+        assert state.first_boot_permit_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+        assert state.readiness_observed is False
+
+    def test_precheck_refused_lock_held_adopts_the_verified_live_node_no_spawn(self, tmp_path):
+        # The precheck is refused because the lock is held by a live node;
+        # that node verifies as the flock holder and is ADOPTED instead --
+        # the attempt is still consumed (decision F), and nothing is spawned.
+        spawner = FakeSpawner()
+        adopted_log = tmp_path / "adopted.log"
+        adopted_log.write_text("")
+        ports = _make_ports(
+            spawn=spawner,
+            intent_lock_free=lambda _p: False,
+            find_node_pid=lambda: 15555,
+            resolve_intent_lock_holder=lambda _p: 15555,
+            find_adopted_log=lambda _log_dir, _pid: adopted_log,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        new_pid, new_log, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert spawner.calls == []
+        assert new_pid == 15555
+        assert new_log == adopted_log
+        assert state.boot_retry_attempts == 1
 
 
 class TestDoMiddayWatchBootRetryNoDoubleCritical:
@@ -5136,7 +5314,7 @@ class TestDoBootRetryWindowClosedCheck:
 
 
 class TestRunForeverBootRetryWindowClosed:
-    def test_fires_boot_retry_window_closed_alert_once_when_phase_is_none_past_0100z(
+    def test_run_forever_fires_boot_retry_window_closed_alert_once_when_phase_is_none_past_0100z(
         self, tmp_path, monkeypatch
     ):
         # [AM-3] The day-scoped reset inside `boot_retry_window_closed` must
