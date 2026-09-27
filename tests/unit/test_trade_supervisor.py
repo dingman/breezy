@@ -33,6 +33,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_intent_marker_path
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
+    _ADOPTION_LOG_UNREADABLE_MAX_POLLS,
     _SELF_CHECK_PASS_RESULTS,
     BUILD_REVISION_ENV_VAR,
     EXIT_CONFIG_ERROR,
@@ -2403,6 +2404,19 @@ class TestIncrementalLogReader:
     def test_missing_file_returns_carry_without_raising(self, tmp_path):
         reader = IncrementalLogReader()
         assert reader.read_new(tmp_path / "missing.log") == ""
+
+    def test_read_from_start_marks_current_file_consumed(self, tmp_path):
+        path = tmp_path / "node.log"
+        path.write_text("boot permit line\n")
+        reader = IncrementalLogReader()
+
+        assert reader.read_from_start_and_mark_consumed(path) == "boot permit line\n"
+        assert reader.bytes_read(path) == len("boot permit line\n")
+        with path.open("a") as fh:
+            fh.write("tail-marker\n")
+
+        assert reader.read_new(path) == "boot permit line\ntail-marker\n"
+        assert reader.bytes_read(path) == len("boot permit line\ntail-marker\n")
 
 
 # ---------------------------------------------------------------------------
@@ -6087,6 +6101,197 @@ def _b1_ready_state(**overrides) -> DaySchedulerState:
 
 
 class TestB1PermitWatch:
+    def _adoption_ports(
+        self, *, adopted_log: Path, alert_sink: _RecordingAlertSink | None = None
+    ) -> SupervisorPorts:
+        adopted_pid = 777
+        return _make_ports(
+            find_node_pid=lambda: adopted_pid,
+            resolve_intent_lock_holder=lambda _p: adopted_pid,
+            process_alive=lambda pid: pid == adopted_pid,
+            find_adopted_log=lambda _log_dir, _pid: adopted_log,
+            # Adoption must recover boot-time evidence from the log file
+            # itself, not depend on the incremental reader's current delta.
+            read_log_new=lambda _p: "",
+            alert_sink=alert_sink if alert_sink is not None else _RecordingAlertSink(),
+        )
+
+    def test_adoption_replays_boot_permit_daily_ceiling_gap_without_critical(
+        self, tmp_path, caplog
+    ):
+        close = _utc(1, 0, day=_DAY + dt.timedelta(days=1))
+        expiry = int((close + dt.timedelta(hours=1, minutes=50)).timestamp() * 1e9)
+        now = close + dt.timedelta(hours=7, minutes=55)
+        node_log = tmp_path / "adopted.log"
+        node_log.write_text(
+            _STRATEGY_SUBSCRIBED_LINE
+            + (
+                "live-trading permit issued issued_at_ns=1788713409710026893 "
+                f"expires_at_ns={expiry} ttl_s=36000\n"
+            )
+        )
+        sink = _RecordingAlertSink()
+        ports = self._adoption_ports(adopted_log=node_log, alert_sink=sink)
+
+        with caplog.at_level("INFO"):
+            tracked_pid, node_log_out, state = _do_permit_watch(
+                ports=ports,
+                state=_b1_ready_state(),
+                now=now,
+                tracked_pid=None,
+                node_log=None,
+                handler_read_log=False,
+                **_b1_common_kwargs(tmp_path),
+            )
+
+        assert tracked_pid == 777
+        assert node_log_out == node_log
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns == expiry
+        assert state.first_boot_permit_expires_at_ns == expiry
+        gap_lines = [
+            r.getMessage() for r in caplog.records if "permit_accepted_gap" in r.getMessage()
+        ]
+        assert gap_lines == [f"permit_accepted_gap expires_at_ns={expiry} ruling=B3"]
+
+    def test_adoption_without_boot_permit_line_still_pages_absent(self, tmp_path):
+        node_log = tmp_path / "adopted.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE)
+        sink = _RecordingAlertSink()
+        ports = self._adoption_ports(adopted_log=node_log, alert_sink=sink)
+
+        _tracked_pid, _node_log_out, state = _do_permit_watch(
+            ports=ports,
+            state=_b1_ready_state(),
+            now=_utc(20, 0),
+            tracked_pid=None,
+            node_log=None,
+            handler_read_log=False,
+            **_b1_common_kwargs(tmp_path),
+        )
+
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_ABSENT_IN_DECISION_WINDOW.value
+        ]
+        assert [p.severity for p in sink.payloads] == ["CRITICAL"]
+        assert state.permit_issued_seen_expires_at_ns is None
+
+    def test_adoption_replays_future_boot_permit_as_valid_without_alert(self, tmp_path):
+        now = _utc(20, 0)
+        expiry = int((now + dt.timedelta(hours=1)).timestamp() * 1e9)
+        node_log = tmp_path / "adopted.log"
+        node_log.write_text(
+            _STRATEGY_SUBSCRIBED_LINE
+            + (
+                "live-trading permit issued issued_at_ns=1788713409710026893 "
+                f"expires_at_ns={expiry} ttl_s=36000\n"
+            )
+        )
+        sink = _RecordingAlertSink()
+        ports = self._adoption_ports(adopted_log=node_log, alert_sink=sink)
+
+        _tracked_pid, _node_log_out, state = _do_permit_watch(
+            ports=ports,
+            state=_b1_ready_state(),
+            now=now,
+            tracked_pid=None,
+            node_log=None,
+            handler_read_log=False,
+            **_b1_common_kwargs(tmp_path),
+        )
+
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns == expiry
+        assert state.first_boot_permit_expires_at_ns == expiry
+
+    # -- SUP-ADOPT-PERMIT (2026-09-27): an adoption-time boot-log replay
+    # that raises OSError must be distinguished from "log read cleanly, no
+    # permit marker yet" -- the false positive behind the 08:55Z CRITICAL.
+    def test_adoption_read_oserror_does_not_page_or_latch_and_retries(self, tmp_path, caplog):
+        node_log = tmp_path / "adopted.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE)
+        sink = _RecordingAlertSink()
+        ports = self._adoption_ports(adopted_log=node_log, alert_sink=sink)
+        ports = replace(
+            ports,
+            read_log_from_start=lambda _p: (_ for _ in ()).throw(OSError("boot log unreadable")),
+        )
+
+        with caplog.at_level("WARNING"):
+            tracked_pid, node_log_out, state = _do_permit_watch(
+                ports=ports,
+                state=_b1_ready_state(),
+                now=_utc(20, 0),
+                tracked_pid=None,
+                node_log=None,
+                handler_read_log=False,
+                **_b1_common_kwargs(tmp_path),
+            )
+
+        # Adoption itself still succeeds (the process IS the verified flock
+        # holder) -- only the boot-log replay is retried.
+        assert tracked_pid == 777
+        assert node_log_out == node_log
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns is None
+        assert state.adoption_log_unreadable_polls == 1
+        warn_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING" and "permit_watch_adoption_log_unreadable" in r.getMessage()
+        ]
+        assert len(warn_lines) == 1
+        assert "consecutive_failures=1" in warn_lines[0]
+
+        # A second poll (same still-alive adopted pid, still-failing log)
+        # retries the SAME from-byte-0 replay -- never re-attempts
+        # `_attempt_adoption`, and still never pages.
+        tracked_pid_2, node_log_out_2, state_2 = _do_permit_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 5),
+            tracked_pid=tracked_pid,
+            node_log=node_log_out,
+            handler_read_log=False,
+            **_b1_common_kwargs(tmp_path),
+        )
+        assert tracked_pid_2 == 777
+        assert node_log_out_2 == node_log
+        assert sink.payloads == []
+        assert state_2.adoption_log_unreadable_polls == 2
+
+    def test_adoption_read_oserror_persisting_n_polls_pages(self, tmp_path):
+        node_log = tmp_path / "adopted.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE)
+        sink = _RecordingAlertSink()
+        ports = self._adoption_ports(adopted_log=node_log, alert_sink=sink)
+        ports = replace(
+            ports,
+            read_log_from_start=lambda _p: (_ for _ in ()).throw(OSError("boot log unreadable")),
+        )
+
+        tracked_pid: int | None = None
+        node_log_out: Path | None = None
+        state = _b1_ready_state()
+        for i in range(_ADOPTION_LOG_UNREADABLE_MAX_POLLS):
+            tracked_pid, node_log_out, state = _do_permit_watch(
+                ports=ports,
+                state=state,
+                now=_utc(20, i),
+                tracked_pid=tracked_pid,
+                node_log=node_log_out,
+                handler_read_log=False,
+                **_b1_common_kwargs(tmp_path),
+            )
+
+        assert state.adoption_log_unreadable_polls == _ADOPTION_LOG_UNREADABLE_MAX_POLLS
+        # [D8] The existing WATCH_FAILED containment fires -- never the
+        # false-positive PERMIT_ABSENT_IN_DECISION_WINDOW.
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.PERMIT_WATCH_EXCEPTION_CONTAINED.value
+        ]
+        assert [p.severity for p in sink.payloads] == ["CRITICAL"]
+
     # -- AC1 -----------------------------------------------------------
     def test_nominal_1650z_to_0300z_never_pages_and_logs_one_accepted_gap_info(
         self, tmp_path, caplog
