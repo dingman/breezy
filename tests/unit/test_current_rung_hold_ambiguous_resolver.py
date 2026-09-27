@@ -5206,3 +5206,549 @@ async def test_a_resolver_contradiction_is_delivered_through_the_installed_watch
         _tick_health_watch_topic(client._msgbus)
         assert len(sink.payloads) == 1
         await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# EDGE-2-REFACTOR step 0 (2026-09-27): characterization tests G1-G14, pinning
+# `_resolve_ambiguous_intents`'s CURRENT behaviour with no source change --
+# see docs/plans/backlog/EDGE_2026-09-27/EDGE-2-REFACTOR_plan_r1_2026-09-27.md
+# section 3. `self._log` is Nautilus's own read-only Cython logger (see the
+# established limitation documented above, e.g.
+# `test_connect_immediate_pass_exception_handler_logs_type_only_never_the_
+# value`) -- every assertion below is on STATE: counters, latch state, alert
+# dictionaries, and the `_PrivateReadStub`'s own `.paths` call log, never a
+# log line.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolver_backoff_caps_after_seven_consecutive_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G1: 5s, 5s, 10s, 20s, 40s, 80s, 160s, then the 8th sleep CLAMPS at
+    `_RESOLVER_BACKOFF_CAP_SECS` (300s) rather than doubling to 320s -- the
+    existing backoff test (`:569`) only ever reaches 80s and never proves
+    the cap itself engages."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        # No payload wired for the order GET -- every attempt raises a plain
+        # `KeyError`, the same "GET always fails" shape `:569` uses.
+        sleeps = await _run_n_passes_recording_sleeps(client, passes=8, monkeypatch=monkeypatch)
+
+        assert sleeps == [5.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0]
+        assert client._resolver_consecutive_failures == 8
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_no_latch_bound_makes_no_get_and_the_pass_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G2: when `self._latch is None` the pass makes no GET at all, and the
+    resolver task survives the pass rather than crashing on a `None`
+    dereference."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        sender = _SlowSender()
+        sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+        client._latch = None  # type: ignore[assignment]
+        before_paths = list(client._private_read.paths)  # type: ignore[attr-defined]
+
+        client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+        task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+        try:
+            for _ in range(3 * 50 + 5):
+                await asyncio.sleep(0)
+            assert task.done() is False, "a pass with no latch bound must survive"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert client._private_read.paths == before_paths, (  # type: ignore[attr-defined]
+            "no latch bound must make no GET at all"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_open_intent_without_a_durable_context_makes_no_get_and_stays_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G4: an account-wide OPEN intent with no durable resolver context at
+    all (a no-id AMBIGUOUS, or nothing written yet) makes no GET, and the
+    intent stays OPEN."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        sender = _SlowSender()
+        sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+        assert client._latch is not None
+        client._latch.arm("2" * 64, now_ns=client._clock.timestamp_ns())
+        before_paths = list(client._private_read.paths)  # type: ignore[attr-defined]
+
+        client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+        task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+        try:
+            for _ in range(3 * 50 + 5):
+                await asyncio.sleep(0)
+            assert task.done() is False, "an OPEN intent with no context must survive"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert client._private_read.paths == before_paths, (  # type: ignore[attr-defined]
+            "an OPEN intent with no durable context must never GET"
+        )
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_malformed_resolver_context_bytes_stays_ambiguous_with_unchanged_failure_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G5: a durable resolver context that fails to decode
+    (`ExecutionReportMappingError`) leaves the intent AMBIGUOUS and never
+    touches `_resolver_consecutive_failures` -- that counter belongs to the
+    GET/instrument paths, not a local decode failure, and this branch never
+    reaches the order GET at all."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", b"not valid json",
+        )
+        failures_before = client._resolver_consecutive_failures
+        before_paths = list(client._private_read.paths)  # type: ignore[attr-defined]
+
+        await _run_exactly_one_pass(client)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN
+        assert client._resolver_consecutive_failures == failures_before
+        assert client._private_read.paths == before_paths, (  # type: ignore[attr-defined]
+            "a malformed context must never reach the order GET"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_intent_id_in_the_context_refuses_to_act_with_no_get(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G6: a durable resolver context whose OWN `intent_id` disagrees with
+    the key it was stored under (`current.intent_id`) is refused outright --
+    no GET is ever made -- and the intent stays OPEN."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw is not None
+        context = AmbiguousResolverContext.from_bytes(raw)
+        foreign = replace(context, intent_id="a-completely-foreign-intent-id")
+        client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", foreign.to_bytes())
+        before_paths = list(client._private_read.paths)  # type: ignore[attr-defined]
+
+        await _run_exactly_one_pass(client)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN
+        assert client._private_read.paths == before_paths, (  # type: ignore[attr-defined]
+            "a foreign intent_id in the context must never reach the order GET"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_stale_alert_carries_the_actual_last_failure_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G7: the stale-intent alert's `last_failure_kind` entry must be the
+    RECORDED failure kind for this intent, not the dict-membership default
+    `"none"` -- `test_a_stale_open_intent_alerts_once_and_resets_on_
+    retirement` (`:608`) never drives a non-default value through it."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        # No payload wired for the order GET -- every attempt raises,
+        # recording a "get_exception" failure kind for this intent.
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[current.intent_id] == "get_exception"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "get_exception"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_flat_unnested_get_body_resolves_the_same_as_a_nested_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G8: every fixture in this module nests the GET body under an
+    `"order"` key (`:201-203`) -- the resolver's own fallback branch
+    (`order_body = order_payload` when the body is a `Mapping` with no
+    nested `"order"` key) is never otherwise exercised. A flat body must
+    resolve identically to the nested shape."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        flat_body = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0,
+        )["order"]
+        assert "order" not in flat_body
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = flat_body
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_unmappable_get_body_neither_increments_nor_resets_the_backoff_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G9: a GET body that is not a `Mapping` at all (a bare JSON list, say)
+    takes the "unmappable body shape" branch, which -- unlike the
+    GET-exception and mapping-error branches -- touches
+    `_resolver_consecutive_failures` NEITHER way: it neither increments it
+    (a distinct failure mode from those two) nor resets it to zero (unlike
+    a body that DID map)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        # First pass: no payload wired -- a GET exception, establishing a
+        # known nonzero baseline for the counter.
+        await _run_exactly_one_pass(client)
+        assert client._resolver_consecutive_failures == 1
+
+        # Second pass: the GET succeeds transport-wise but returns a body
+        # that is not itself a `Mapping`.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = ["not", "a", "mapping"]
+
+        await _run_exactly_one_pass(client)
+
+        assert client._resolver_consecutive_failures == 1, (
+            "an unmappable body must neither increment nor reset the counter"
+        )
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_positions_read_failure_after_a_mapped_terminal_get_stays_at_zero_and_unstamped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G10: a positions-read failure AFTER a terminal GET that itself
+    mapped cleanly (which already reset the backoff counter to zero)
+    leaves the counter at zero -- and never stamps `_resolved_by_get_ts_ns`
+    for this intent, since the SAFETY H2 stamp sits strictly after the
+    positions read in program order."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        del client._private_read._payloads["/v1/portfolio/positions"]  # type: ignore[attr-defined]
+
+        await _run_exactly_one_pass(client)
+
+        assert client._resolver_consecutive_failures == 0
+        assert current.intent_id not in client._resolved_by_get_ts_ns
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_long_state_none_end_to_end_stays_ambiguous_before_the_h2_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G11: `_resolver_long_position_state` returning `None` (undetermined)
+    is unit-tested in isolation (`:3856`) but never through the FULL
+    resolver dispatch. A malformed `netPosition` on an otherwise-clean
+    terminal-zero GET must leave the intent OPEN via a clean `continue` --
+    BEFORE the SAFETY H2 stamp and without counting a resolver error, never
+    via the zero-fill/contradiction machinery below it."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        errors_before = client._resolver_error_count
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "not-a-number"}},
+            "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN
+        assert current.intent_id not in client._resolved_by_get_ts_ns, (
+            "the None-long_state guard must fire before the H2 stamp"
+        )
+        assert client._resolver_error_count == errors_before, (
+            "an undetermined long_state is a clean continue, never a counted resolver error"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_long_skips_the_activities_join_entirely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G12: `long_state is True` already proves a fill without a second
+    read -- the activities join must be skipped ENTIRELY (no activities GET
+    is ever made), never merely fetched and ignored."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert PORTFOLIO_ACTIVITIES_PATH not in client._private_read.paths, (  # type: ignore[attr-defined]
+            "a confirmed LONG must resolve without ever reading activities"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_resolve_accept_fill_raise_counts_the_error_and_stays_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G13: `_resolve_accept_fill` raising must be caught, counted via
+    `_note_resolver_error`, and leave the intent OPEN -- the existing raise
+    test (`:1983`) covers only its terminal-zero sibling
+    (`_resolve_terminal_zero`), never this one."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+        errors_before = client._resolver_error_count
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("synthetic accept-fill failure")
+
+        client._resolve_accept_fill = _boom  # type: ignore[method-assign]
+
+        await _run_exactly_one_pass(client)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        assert client._resolver_error_count == errors_before + 1
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_missing_instrument_with_no_loader_wired_skips_the_load_attempt_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G14: when no `_resolver_instrument_loader` is wired at all (the
+    production default -- distinct from `:886`'s "loader wired but returns
+    None" case), the load-attempt gate is skipped entirely: no load is ever
+    attempted, `_resolver_instrument_load_attempted_ns` is never touched,
+    and the pass falls straight to the ordinary missing-instrument failure
+    path."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._resolver_instrument_loader is None
+        stale_instrument = build_second_instrument()
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+
+        await _run_resolver_passes(client, count=1)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN
+        assert client._resolver_instrument_load_attempted_ns == {}
+        assert client._resolver_last_failure_kind[current.intent_id] == "instrument_unavailable"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_open_orders_refresh_failure_still_writes_the_evidence_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """G3: the open-orders half of the age-gated startup-evidence refresh
+    can fail independently of the positions half -- the error is recorded
+    via `_note_open_orders_outcome(error=...)`, and the evidence record is
+    still written from the positions read that DID succeed."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        # Non-terminal GET: isolates the refresh's own behaviour from the
+        # order-GET resolution path (which does NOT touch positions/open
+        # orders at all for a still-pending order).
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+        before = client.read_startup_position_evidence()
+        assert before is not None
+        # `OPEN_ORDERS_PATH` carries no default payload (`_build_race_client`)
+        # -- the stub's own `KeyError` on it is the "open-orders read failed"
+        # shape this test needs, with zero extra wiring.
+        assert OPEN_ORDERS_PATH not in client._private_read._payloads  # type: ignore[attr-defined]
+        client._last_evidence_write_ns = 0  # back-date -- force the refresh
+
+        await _run_exactly_one_pass(client)
+
+        after = client.read_startup_position_evidence()
+        assert after is not None
+        assert after.ts_ns > before.ts_ns, (
+            "a failed open-orders refresh must not block the positions write"
+        )
+        assert client._open_orders_read_refused is True
+        await client._disconnect()
