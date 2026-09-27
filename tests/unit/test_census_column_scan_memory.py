@@ -36,6 +36,7 @@ six months later.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -230,8 +231,15 @@ class TestNewPathDeltaRssBoundAtD6_150k:
     real calibration (D-7: "calibrated in a dry run and written down with
     the measured numbers"), not the r1 guess: 40 MiB delta (real ~33 MiB +
     headroom), 160 MiB absolute (real ~97 MiB + headroom). This is the
-    plan's own D=6 x 150k case; excluded from the default gate as `slow`."""
+    plan's own D=6 x 150k case; opts into the gate via BREEZY_RUN_SLOW=1
+    (the `slow` marker itself is not deselected by the pinned addopts, so
+    this environment-variable skip is what actually keeps it out of the
+    default run)."""
 
+    @pytest.mark.skipif(
+        os.environ.get("BREEZY_RUN_SLOW") != "1",
+        reason="slow D=6x150k memory test; set BREEZY_RUN_SLOW=1 to run",
+    )
     def test_d1_vs_d6_at_150k_rows_per_day(self, tmp_path: Path) -> None:
         cat1 = _build_catalog(1, 150_000, tmp_path, tag="d1-150k")
         cat6 = _build_catalog(6, 150_000, tmp_path, tag="d6-150k")
