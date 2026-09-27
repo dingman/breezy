@@ -101,6 +101,7 @@ __all__ = [
     "ReplaySufficiencyVerdict",
     "UnknownReplaySufficiencySchemaError",
     "WindowExtent",
+    "WindowExtentFold",
     "classify_station_day",
     "count_live_instances_in_window",
     "decision_window_ns",
@@ -251,6 +252,64 @@ def window_extent(ts_event_ns: Iterable[int], *, start_ns: int, end_ns: int) -> 
     first_ns, last_ns = in_window[0], in_window[-1]
     span_ns = (last_ns - first_ns) if len(in_window) >= 2 else 0
     return WindowExtent(first_ns=first_ns, last_ns=last_ns, span_ns=span_ns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WindowExtentFold:
+    """Streaming, associative equivalent of :func:`window_extent` (REPLAY-BIGINST).
+
+    :func:`window_extent` sorts every in-window instant and reads off the
+    first/last. A running min/max over the same in-window instants gives an
+    IDENTICAL :class:`WindowExtent`, because ``span_ns = last_ns - first_ns``
+    is exactly ``0`` whenever the window holds fewer than two DISTINCT
+    instants: zero instants leaves both ``None`` (span ``0`` by construction
+    below); exactly one instant, or several sharing one timestamp, folds to
+    ``first_ns == last_ns`` (span ``0`` algebraically, not by a separate
+    count check). This is the algorithm that lets a batch-at-a-time catalog
+    scan reproduce :func:`window_extent`'s result one pyarrow batch at a
+    time, without ever materialising the full in-window set in Python
+    objects -- :mod:`breezy.persistence.catalog_column_scan` keeps its own
+    copy of this (three-line) reduction rather than importing this class
+    directly, because the layering contract
+    (``pyproject.toml``'s ``[[tool.importlinter.contracts]]``) forbids
+    ``breezy.persistence`` from importing ``breezy.analysis`` at all. This
+    class remains the tested, documented reference for the algorithm and is
+    available to any ANALYSIS-layer caller.
+
+    Immutable: :meth:`combine` returns a NEW fold; it never mutates ``self``.
+    """
+
+    first_ns: int | None = None
+    last_ns: int | None = None
+
+    def combine(
+        self,
+        ts_event_ns: Iterable[int],
+        *,
+        start_ns: int,
+        end_ns: int,
+    ) -> WindowExtentFold:
+        """Fold another chunk of (possibly out-of-window) instants in.
+
+        Same half-open ``[start_ns, end_ns)`` window rule as
+        :func:`window_extent`; an out-of-window instant never affects the
+        result, so chunks may be folded in any order or grouping.
+        """
+        first_ns = self.first_ns
+        last_ns = self.last_ns
+        for ts in ts_event_ns:
+            if not (start_ns <= ts < end_ns):
+                continue
+            if first_ns is None or ts < first_ns:
+                first_ns = ts
+            if last_ns is None or ts > last_ns:
+                last_ns = ts
+        return WindowExtentFold(first_ns=first_ns, last_ns=last_ns)
+
+    def extent(self) -> WindowExtent:
+        """The :class:`WindowExtent` this fold has accumulated so far."""
+        span_ns = 0 if self.first_ns is None else self.last_ns - self.first_ns  # type: ignore[operator]
+        return WindowExtent(first_ns=self.first_ns, last_ns=self.last_ns, span_ns=span_ns)
 
 
 def count_live_instances_in_window(
