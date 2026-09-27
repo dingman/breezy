@@ -46,14 +46,14 @@ polymarket-us = ["polymarket-us==0.1.2"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
-addopts = "-q --strict-markers --strict-config -m 'not live and not venue_live and not real_money and not slow'"
+addopts = "-q --strict-markers --strict-config -m 'not live and not venue_live and not real_money'"
 markers = [
     "contract: pins verified NautilusTrader 1.231.0 behaviour; run first on any version bump",
     "replay: live/backtest parity tests",
     "live: performs REAL network I/O against api.weather.gov and needs BREEZY_LIVE=1; deselected by default",
     "venue_live: test performs real authenticated calls against the live Polymarket.us venue; gated behind BREEZY_VENUE_LIVE=1 AND BREEZY_ALLOW_CREDENTIALED_PYTEST=1 AND --venue-live",
     "real_money: can place or affect real-money venue orders and needs BREEZY_REAL_MONEY=1 plus operator approval; deselected by default",
-    "slow: expensive fixture/IO cost (e.g. large synthetic catalogs); deselected by default, run explicitly with `-m slow`",
+    "slow: expensive fixture/IO cost (e.g. large synthetic catalogs); opt-in via BREEZY_RUN_SLOW=1 (not deselected by -m addopts)",
     "memory: chunk-count materialization assertions (ING-2 S3); runs in the default gate by design",
 ]
 
