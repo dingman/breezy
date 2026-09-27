@@ -26,6 +26,7 @@ over re-invention.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -260,7 +261,9 @@ class UnknownStratumAxisError(ValueError):
 
 class MalformedStratumRangeError(ValueError):
     """A `variant_stratum_filters` entry's `hour_lst` value is not `ALL`, a
-    single hour `0-23`, or an ascending `N-M` range within `0-23`."""
+    single hour `0-23`, a single ascending `N-M` range within `0-23`, or a
+    comma-joined list of ascending, pairwise-disjoint ranges of that shape
+    (RA-2b, RULING_RA-9 SS6)."""
 
 
 class DuplicateStratumAxisError(ValueError):
@@ -280,7 +283,10 @@ class StratumFilterCountMismatchError(ValueError):
 #: axes `RULING_HUNT-1`'s own triggers name (EDGE-5 plan r1 SS5).
 _STRATUM_AXES: Final[tuple[str, ...]] = ("station", "hour_lst", "side", "composition_kind")
 _STRATUM_SIDE_VALUES: Final[frozenset[str]] = frozenset({"YES", "NO", "ALL"})
-_HOUR_LST_RE: Final[re.Pattern[str]] = re.compile(r"^(ALL|[0-9]{1,2}(-[0-9]{1,2})?)$")
+#: One `hour_lst` list item: a single hour `0-23` or an ascending `N-M` range
+#: within `0-23` (RA-2b). `ALL` is handled separately -- it is only valid as
+#: the WHOLE value, never as one item in a comma-joined list.
+_HOUR_LST_ITEM_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9]{1,2}(-[0-9]{1,2})?$")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -299,27 +305,54 @@ class StratumFilter:
     composition_kind: str
 
 
-def _parse_hour_lst(value: str) -> None:
-    if not _HOUR_LST_RE.match(value):
+def _parse_hour_lst_item(item: str, *, whole_value: str) -> tuple[int, int]:
+    """Parse one comma-list item (or the sole item of a non-list value) into
+    its inclusive `(start, end)` bounds. Raises `MalformedStratumRangeError`
+    naming the FULL original `whole_value`, never just the item, so a
+    refusal is diagnosable against what the caller actually passed."""
+    if not _HOUR_LST_ITEM_RE.match(item):
         raise MalformedStratumRangeError(
-            f"malformed hour_lst {value!r}: expected ALL, a single hour 0-23, "
-            "or an ascending N-M range within 0-23"
+            f"malformed hour_lst {whole_value!r}: expected ALL, a single hour 0-23, "
+            "or a comma-joined list of ascending N-M ranges within 0-23"
         )
-    if value == "ALL":
-        return
-    bounds = tuple(int(part) for part in value.split("-"))
+    bounds = tuple(int(part) for part in item.split("-"))
     if any(bound < 0 or bound > 23 for bound in bounds):
-        raise MalformedStratumRangeError(f"malformed hour_lst {value!r}: hour(s) out of range 0-23")
+        raise MalformedStratumRangeError(
+            f"malformed hour_lst {whole_value!r}: hour(s) out of range 0-23"
+        )
     if len(bounds) == 2 and bounds[0] > bounds[1]:
         raise MalformedStratumRangeError(
-            f"malformed hour_lst {value!r}: range must be ascending (N <= M)"
+            f"malformed hour_lst {whole_value!r}: range must be ascending (N <= M)"
         )
+    return bounds[0], bounds[-1]
+
+
+def _parse_hour_lst(value: str) -> None:
+    if value == "ALL":
+        return
+    items = value.split(",")
+    if len(items) == 1:
+        _parse_hour_lst_item(items[0], whole_value=value)
+        return
+    if any(item == "" for item in items):
+        raise MalformedStratumRangeError(
+            f"malformed hour_lst {value!r}: an empty item or a trailing/leading comma "
+            "is not allowed in a comma-joined list"
+        )
+    ranges = [_parse_hour_lst_item(item, whole_value=value) for item in items]
+    for previous, current in itertools.pairwise(ranges):
+        if current[0] <= previous[1]:
+            raise MalformedStratumRangeError(
+                f"malformed hour_lst {value!r}: ranges must be ascending and "
+                "pairwise-disjoint (a comma-joined list is never overlapping or "
+                "out of order)"
+            )
 
 
 def parse_stratum_filter(spec: str) -> StratumFilter:
     """Parse one pipe-joined `variant_stratum_filters` entry (RA-2):
 
-        station=<ALL|comma-set>|hour_lst=<ALL|N|N-M>|side=<YES|NO|ALL>|composition_kind=<name>
+        station=<ALL|comma-set>|hour_lst=<ALL|N|N-M|N-M,N-M,...>|side=<YES|NO|ALL>|composition_kind=<name>
 
     Refuses an unknown axis, a duplicate axis, a missing axis, an invalid
     `side`, or a malformed `hour_lst` -- never silently drops or defaults.

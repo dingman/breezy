@@ -659,6 +659,89 @@ def test_variant_stratum_filter_accepts_a_well_formed_spec() -> None:
     assert parsed.composition_kind == "taker"
 
 
+@pytest.mark.parametrize("value", ["ALL", "5", "5-10"])
+def test_hour_lst_single_forms_stay_byte_identical_in_behaviour(value: str) -> None:
+    """RA-2b: widening `hour_lst` to accept a comma-separated list must not
+    change ALL/H/H-H, the three pre-existing single-item forms."""
+    parsed = parse_stratum_filter(f"station=SFO|hour_lst={value}|side=YES|composition_kind=taker")
+    assert parsed.hour_lst == value
+
+
+def test_hour_lst_accepts_disjoint_ascending_range_union() -> None:
+    """RULING_RA-9 §6: the exact RED this ruling names."""
+    parsed = parse_stratum_filter("station=SFO|hour_lst=0-9,12-23|side=YES|composition_kind=taker")
+    assert parsed.hour_lst == "0-9,12-23"
+
+
+def test_hour_lst_accepts_a_list_mixing_single_hours_and_ranges() -> None:
+    parsed = parse_stratum_filter(
+        "station=SFO|hour_lst=0-9,11,14-23|side=YES|composition_kind=taker"
+    )
+    assert parsed.hour_lst == "0-9,11,14-23"
+
+
+def test_hour_lst_rejects_overlapping_ranges() -> None:
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=0-9,5-12|side=YES|composition_kind=taker")
+
+
+def test_hour_lst_rejects_descending_order() -> None:
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=12-23,0-9|side=YES|composition_kind=taker")
+
+
+@pytest.mark.parametrize("value", ["0-9,", ",12-23", "0-9,,12-23"])
+def test_hour_lst_rejects_empty_item_or_trailing_comma(value: str) -> None:
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter(f"station=SFO|hour_lst={value}|side=YES|composition_kind=taker")
+
+
+def test_hour_lst_rejects_an_hour_outside_0_23_within_a_list() -> None:
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=0-9,20-25|side=YES|composition_kind=taker")
+
+
+def test_hour_lst_rejects_start_greater_than_end_within_a_list_item() -> None:
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=0-9,15-12|side=YES|composition_kind=taker")
+
+
+def test_hour_lst_rejects_adjacent_touching_ranges_as_overlap() -> None:
+    """`0-9,9-12` shares hour 9 -- not disjoint, so it is refused too."""
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=0-9,9-12|side=YES|composition_kind=taker")
+
+
+def test_hour_lst_rejects_a_wrap_range_even_inside_a_list() -> None:
+    """RULING_RA-9 §6: `17-8` (a wrap) must keep refusing."""
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=0-9,17-8|side=YES|composition_kind=taker")
+
+
+def test_hour_lst_ruling_ra9_exact_offwindow_filter_string() -> None:
+    """Pins the exact `variant_stratum_filters` string RULING_RA-9 §6 names
+    for `H-OFFWINDOW-T4-2026-09`'s eventual Path A zero-look registration."""
+    parsed = parse_stratum_filter(
+        "station=ALL|hour_lst=0-8,17-23|side=YES|composition_kind=pm_us_crh_offwindow_price_cap_v1"
+    )
+    assert parsed.hour_lst == "0-8,17-23"
+
+
+def test_live_ledger_v1_fixture_rows_still_parse_after_hour_lst_widening() -> None:
+    """RA-2b must not perturb existing ledger lines -- the 3 live v1 fixture
+    rows carry no `variant_stratum_filters` (all zero-look), so this pins
+    that `read_hypothesis_ledger` still parses them to the same values."""
+    records = read_hypothesis_ledger(LIVE_LEDGER_V1_FIXTURE)
+    assert len(records) == 3
+    assert all(record.variant_stratum_filters == () for record in records)
+    ids = {record.hypothesis_id for record in records}
+    assert ids == {
+        "H-ARCHIVE-RECAL-2026-09",
+        "H-FORECAST-TAKER-RUNG-SCREEN-2026-09-20",
+        "H-NO-SIDE-2026-09",
+    }
+
+
 def test_register_hypothesis_variant_stratum_filters_count_mismatch_is_refused() -> None:
     with pytest.raises(StratumFilterCountMismatchError):
         register_hypothesis(
