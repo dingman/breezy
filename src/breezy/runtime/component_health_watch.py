@@ -235,6 +235,111 @@ def install_stale_intent_alert(
     return _on_component_state
 
 
+#: The ``AlertPayload.event`` for EDGE-2 slice D's
+#: ``resolver_evidence_contradiction`` health-surface entry: a GET-terminal
+#: zero-fill whose own create-time evidence or activities trade join
+#: disagrees with it. See
+#: ``PolymarketUSExecutionClient.resolver_evidence_contradictions`` (AC4):
+#: that property only RECORDS the condition -- the client may not import
+#: this layer (barrier E0-TRANSPORT), so this is where it is dispatched,
+#: exactly like :data:`STALE_INTENT_ALERT_EVENT` immediately above. A
+#: detector that only records and never delivers is not a control (the
+#: 2026-09-20 alerts-reach-nobody incident, module docstring precedent).
+RESOLVER_CONTRADICTION_ALERT_EVENT: Final[str] = "resolver_evidence_contradiction"
+
+#: CRITICAL: an intent that CANNOT resolve as zero-fill on its own evidence
+#: needs an operator, not next week's log review -- same severity as the
+#: stale-intent watch immediately above.
+RESOLVER_CONTRADICTION_ALERT_SEVERITY: Final[str] = "CRITICAL"
+
+#: Process-wide, like every other watch in this module: the intent's
+#: identity travels in ``detail``.
+RESOLVER_CONTRADICTION_ALERT_SITE: Final[str] = "global"
+
+
+def _resolver_contradiction_detail(alert: Mapping[str, str]) -> str:
+    intent_id = alert.get("intent_id", "<unknown>")
+    venue_order_id = alert.get("venue_order_id", "<unknown>")
+    trade_count = alert.get("trade_count", "<unknown>")
+    create_fill_evidence = alert.get("create_fill_evidence", "<unknown>")
+    return (
+        f"intent {intent_id} (venue order {venue_order_id}) reports a GET "
+        "terminal zero-fill that disagrees with the resolver's own evidence "
+        f"(trade_count={trade_count}, create_fill_evidence={create_fill_evidence}); "
+        "stays AMBIGUOUS pending an operator review"
+    )
+
+
+def install_resolver_contradiction_alert(
+    msgbus: MessageBus,
+    *,
+    contradictions: Callable[[], Sequence[Mapping[str, str]]],
+    sink: AlertSink | None = None,
+) -> Callable[[object], None]:
+    """Subscribe one operator alert per intent id whose resolver evidence
+    contradicts a GET-reported zero-fill.
+
+    Mirrors :func:`install_stale_intent_alert` EXACTLY: the same
+    ``COMPONENT_STATE_TOPIC`` heartbeat trigger,
+    :func:`install_refusal_repoll_timer` as the SAME second (fixed-interval)
+    trigger, and dedupe by ``intent_id`` with the identical forget-on-
+    disappearance semantics -- ``_retire`` clears
+    ``PolymarketUSExecutionClient``'s own bookkeeping the moment an intent
+    stops contradicting (a later pass resolves it, or an operator clears it),
+    so a LATER intent that happens to reach the same shape alerts again.
+
+    Parameters
+    ----------
+    msgbus
+        A LIVE node's ``node.kernel.msgbus``, after ``build()``.
+    contradictions
+        Reads the execution client's ``resolver_evidence_contradictions``
+        health property at the moment of the poll. A callable, exactly like
+        ``stale_alerts`` above, so this module never pins the client object
+        into its own closure and never names the venue it came from.
+    sink
+        Defaults to :func:`~breezy.runtime.health.resolve_alert_sink`.
+
+    Returns
+    -------
+    The subscribed handler, so a caller (and a test) can hold it -- and pass
+    it to :func:`install_refusal_repoll_timer` alongside the other watches.
+    """
+    active_sink = resolve_alert_sink() if sink is None else sink
+    alerted_intent_ids: set[str] = set()
+
+    def _on_component_state(event: object) -> None:
+        del event
+        try:
+            current = tuple(contradictions())
+        # Broad, deliberately: a broken reader must not crash the component
+        # publishing the triggering event (CONTAINMENT, module docstring).
+        except Exception:
+            logger.exception("failed to read resolver_evidence_contradictions")
+            return
+
+        current_ids = {alert.get("intent_id", "") for alert in current}
+        alerted_intent_ids.intersection_update(current_ids)
+
+        for alert in current:
+            intent_id = alert.get("intent_id", "")
+            if intent_id in alerted_intent_ids:
+                continue
+            alerted_intent_ids.add(intent_id)
+            emit_alert(
+                active_sink,
+                AlertPayload(
+                    severity=RESOLVER_CONTRADICTION_ALERT_SEVERITY,
+                    event=RESOLVER_CONTRADICTION_ALERT_EVENT,
+                    site=RESOLVER_CONTRADICTION_ALERT_SITE,
+                    detail=_resolver_contradiction_detail(alert),
+                ),
+            )
+
+    msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
+    return _on_component_state
+
+
 #: AUD-13b: the event every latched durable-reconciliation refusal of an
 #: execution client is delivered under (plan §6, "emit a WARN alert"). The
 #: client only RECORDS the refusal on ``reconciliation_refusals`` -- it may not

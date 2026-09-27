@@ -38,13 +38,16 @@ from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.common.enums import ComponentState
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.common.messages import ComponentStateChanged
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import AccountState, OrderDenied
-from nautilus_trader.model.identifiers import ClientOrderId, Venue, VenueOrderId
+from nautilus_trader.model.identifiers import ClientId, ClientOrderId, Venue, VenueOrderId
 from nautilus_trader.model.instruments import BinaryOption
 
 from breezy.adapters.polymarket_us.account_activity import PORTFOLIO_ACTIVITIES_PATH
@@ -90,6 +93,8 @@ from breezy.adapters.polymarket_us.symbology import (
     instrument_id_to_slug,
 )
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.runtime.component_health_watch import install_resolver_contradiction_alert
+from breezy.runtime.health import AlertPayload
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
@@ -4649,4 +4654,113 @@ async def test_mia_0923_past_day_shape_with_trade_row_stays_ambiguous(
         contradictions = client.resolver_evidence_contradictions
         assert len(contradictions) == 1
         assert contradictions[0]["venue_order_id"] == order_id
+        await client._disconnect()
+
+
+class _RecordingAlertSink:
+    """An `AlertSink` that keeps every payload it is handed."""
+
+    def __init__(self) -> None:
+        self.payloads: list[AlertPayload] = []
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.payloads.append(payload)
+
+
+def _tick_health_watch_topic(msgbus: MessageBus) -> None:
+    """Publish one `ComponentStateChanged` on the shared health-watch topic
+    -- the SAME poll-trigger shape `install_resolver_contradiction_alert`'s
+    own test module drives by hand."""
+    msgbus.publish(
+        topic="events.system.SOME_COMPONENT",
+        msg=ComponentStateChanged(
+            trader_id=TRADER_ID,
+            component_id=ClientId("SOME_COMPONENT"),
+            component_type="SomeComponent",
+            state=ComponentState.RUNNING,
+            config={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_contradiction_is_delivered_through_the_installed_watch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Silent-failure review of 75b9008 (BLOCKING): a contradiction the REAL
+    resolver raises must reach an operator through the REAL
+    `install_resolver_contradiction_alert` watch -- recording it on
+    `resolver_evidence_contradictions` alone is not delivery. Negative
+    control: no contradiction, no alert, even after the watch polls."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        sink = _RecordingAlertSink()
+        install_resolver_contradiction_alert(
+            client._msgbus,
+            contradictions=lambda: client.resolver_evidence_contradictions,
+            sink=sink,
+        )
+
+        # Negative control FIRST: a clean, non-contradicting pass (the
+        # shared rig's default terminal-zero-friendly fixtures are not
+        # wired here, so this pass simply finds nothing terminal yet) must
+        # never alert, even once the watch polls.
+        _tick_health_watch_topic(client._msgbus)
+        assert sink.payloads == []
+
+        # Now wire the CONTRADICTION shape: GET terminal zero, but the
+        # activities join finds a real TRADE row for this venue order id.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": order_id},
+                        "marketSlug": slug,
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        # The resolver pass itself records the condition but publishes no
+        # `ComponentStateChanged` of its own -- delivery requires the watch
+        # to actually poll.
+        assert client.resolver_evidence_contradictions != ()
+        assert sink.payloads == [], "recording alone is not delivery"
+
+        _tick_health_watch_topic(client._msgbus)
+
+        assert len(sink.payloads) == 1, sink.payloads
+        payload = sink.payloads[0]
+        assert payload.severity == "CRITICAL"
+        assert payload.event == "resolver_evidence_contradiction"
+        assert order_id in payload.detail
+
+        # A second poll with the SAME still-open contradiction must not
+        # re-alert (dedupe by intent id).
+        _tick_health_watch_topic(client._msgbus)
+        assert len(sink.payloads) == 1
         await client._disconnect()
