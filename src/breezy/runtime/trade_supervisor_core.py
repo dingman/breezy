@@ -19,6 +19,7 @@ file's source, not merely asserted here.)
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -199,12 +200,18 @@ PHASE0_PERMIT_FORBIDDEN_MARKER: Final[str] = "Phase0PermitForbiddenError"
 #: [2026-09-12] The two ``SqliteStateStore`` keys the continuous family's
 #: self-check reads directly -- literal duplicates of
 #: ``strategy/current_rung_hold/trial_day_latch.py``'s own
-#: ``STARTUP_EVIDENCE_KEY``/``FAMILY_HALT_KEY``, never imported from there:
+#: ``STARTUP_EVIDENCE_KEY``/``LEGACY_FAMILY_HALT_KEY``, never imported from there:
 #: the layers contract (``pyproject.toml``) forbids ``runtime`` reaching up
 #: into ``strategy``. Pinned against the real source the same way as the
 #: markers above.
 CONTINUOUS_STARTUP_EVIDENCE_KEY: Final[str] = "exec/polymarket_us/startup_evidence"
-CONTINUOUS_FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+CONTINUOUS_LEGACY_FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+CONTINUOUS_FAMILY_HALT_KEY_PREFIX: Final[str] = "continuous_rung_hold/family_halt/"
+CONTINUOUS_LEGACY_HALT_ATTRIBUTED_FAMILY_ID: Final[str] = "pm_us_crh_v4"
+CONTINUOUS_LEGACY_HALT_PINNED_SHA256: Final[str] = (
+    "5a82b40140618de8d35338c0c9463afb256de37b73729ebbe32ffd8d75b19f28"
+)
+CONTINUOUS_FAMILY_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 
 
 def continuous_family_startup_evidence_key(sending_family_id: str) -> str:
@@ -224,28 +231,16 @@ def continuous_family_startup_evidence_key(sending_family_id: str) -> str:
 
 
 def continuous_family_halt_key(sending_family_id: str) -> str:
-    """WP-11b: the family-halt key expressed as a function of
-    ``sending_family_id``.
-
-    Returns :data:`CONTINUOUS_FAMILY_HALT_KEY` regardless of the argument.
-    The underlying key is written by ``TrialDayLatch`` instances opened
-    with ``CONTINUOUS_TRIAL_KEY_PREFIX`` -- a fixed, ``composition_kind``
-    -scoped prefix, not the manifest's own ``family_id`` -- so under
-    cardinality-1 (WP-11b) at most one family is EVER the continuous-kind
-    sender, and "halted" is GLOBAL-equivalent to "this node's only sender
-    is halted" (F6) no matter which literal family id currently occupies
-    that slot. A future increment that lifts cardinality-1 would need to
-    widen this function's body, not just its call sites -- the parameter
-    is threaded through now so that is a one-function change.
-    """
-    del sending_family_id  # composition-kind-scoped, not family-id-scoped
-    return CONTINUOUS_FAMILY_HALT_KEY
+    """Return the validated per-family continuous-rung-hold halt key."""
+    if CONTINUOUS_FAMILY_ID_PATTERN.fullmatch(sending_family_id) is None:
+        raise ValueError(f"invalid sending_family_id: {sending_family_id!r}")
+    return f"{CONTINUOUS_FAMILY_HALT_KEY_PREFIX}{sending_family_id}"
 
 
 #: [2026-09-12 cross-seam fix] The store has no delete, so
 #: ``breezy-clear-family-halt`` (``trial_day_latch.TrialDayLatch.clear_family_halt``)
-#: overwrites ``CONTINUOUS_FAMILY_HALT_KEY`` with this exact sentinel rather
-#: than leaving an absent key. Literal duplicate of that module's own
+#: overwrites the legacy or per-family halt key with this exact sentinel
+#: rather than leaving an absent key. Literal duplicate of that module's own
 #: private ``_HALT_CLEARED_MARKER`` -- pinned byte-for-byte against it in
 #: ``tests/unit/test_trade_supervisor_cont_self_check.py`` (tests may import
 #: both layers; production code here still never imports ``strategy``).
@@ -453,18 +448,40 @@ def continuous_startup_evidence_valid(
     return evidence.get("position_read_refused") is False
 
 
-def continuous_family_is_halted(raw_halt_value: bytes | None) -> bool:
-    """(c): mirrors ``TrialDayLatch.is_family_halted()`` exactly. The store
-    has no delete, so a legitimate ``breezy-clear-family-halt`` run leaves
-    :data:`CONTINUOUS_FAMILY_HALT_CLEARED_MARKER` in place rather than an
-    absent key -- key-present therefore does NOT mean halted on its own.
+def continuous_classify_legacy_family_halt(raw_halt_value: bytes | None) -> str:
+    if raw_halt_value is None:
+        return "absent"
+    if raw_halt_value == CONTINUOUS_FAMILY_HALT_CLEARED_MARKER:
+        return "cleared"
+    if hashlib.sha256(raw_halt_value).hexdigest() == CONTINUOUS_LEGACY_HALT_PINNED_SHA256:
+        return "attributable_to_v4"
+    return "halts_all"
 
-    Absent key or exactly the cleared sentinel -> not halted. Any other
-    stored value -- including corrupt or unrecognised bytes -- IS halted,
-    fail-closed, matching the strategy layer's own stance rather than
-    laundering an unknown value into a false PASS.
-    """
-    return raw_halt_value is not None and raw_halt_value != CONTINUOUS_FAMILY_HALT_CLEARED_MARKER
+
+@dataclass(frozen=True, slots=True)
+class ContinuousFamilyHaltState:
+    halted: bool
+    source: str
+    legacy: str
+
+
+def continuous_family_halt_state(
+    sending_family_id: str, legacy_raw: bytes | None, family_raw: bytes | None
+) -> ContinuousFamilyHaltState:
+    continuous_family_halt_key(sending_family_id)
+    legacy = continuous_classify_legacy_family_halt(legacy_raw)
+    if legacy == "halts_all":
+        source = "legacy_halts_all"
+    elif family_raw is not None and family_raw != CONTINUOUS_FAMILY_HALT_CLEARED_MARKER:
+        source = "per_family"
+    elif (
+        legacy == "attributable_to_v4"
+        and sending_family_id == CONTINUOUS_LEGACY_HALT_ATTRIBUTED_FAMILY_ID
+    ):
+        source = "legacy_attributed"
+    else:
+        source = "none"
+    return ContinuousFamilyHaltState(halted=source != "none", source=source, legacy=legacy)
 
 
 def continuous_family_check(

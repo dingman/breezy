@@ -1141,7 +1141,7 @@ def test_family_halt_submit_veto_is_none_until_the_halt_key_is_set(tmp_path: Pat
     store_path = tmp_path / "state.db"
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
         trial_day_latch = open_trial_day_latch(
-            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
         )
         veto = family_halt_submit_veto(trial_day_latch)
 
@@ -1166,14 +1166,18 @@ def test_family_halt_submit_veto_is_none_until_the_halt_key_is_set(tmp_path: Pat
 def test_family_halt_submit_veto_reads_a_family_wide_key_not_a_station_scoped_one(
     tmp_path: Path,
 ) -> None:
-    """The halt is FAMILY-wide (`FAMILY_HALT_KEY`, one singleton per store),
-    so a veto built from ANY station's `TrialDayLatch` binding observes a
-    halt set via any other station's fill -- same store, same key, same
-    flock."""
+    """The halt is FAMILY-wide (one per-family key per store), so a veto
+    built from ANY station's `TrialDayLatch` binding -- bound to the SAME
+    family id -- observes a halt set via any other station's fill: same
+    store, same per-family key, same flock."""
     store_path = tmp_path / "state.db"
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        sfo_latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
-        lax_latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        sfo_latch = open_trial_day_latch(
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+        )
+        lax_latch = open_trial_day_latch(
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+        )
         veto_for_lax = family_halt_submit_veto(lax_latch)
 
         assert veto_for_lax() is None

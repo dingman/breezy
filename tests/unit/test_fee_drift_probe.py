@@ -587,7 +587,9 @@ async def test_disagree_persists_the_halt_through_a_real_trial_day_latch_and_the
         SqliteStateStore(store_path) as store,
         open_submit_intent_latch(store, store_path) as latch,
     ):
-        family_halt_latch = open_trial_day_latch(latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        family_halt_latch = open_trial_day_latch(
+            latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+        )
         submit_veto = family_halt_submit_veto(family_halt_latch)
         assert submit_veto() is None, "must start un-halted"
 

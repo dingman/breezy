@@ -1143,7 +1143,8 @@ async def test_three_consecutive_reconciliations_leave_the_halt_key_absent(
     ``continuous_rung_hold/halt``."""
     from breezy.strategy.current_rung_hold.trial_day_latch import (
         DUPLICATE_FILL_KEY_PREFIX,
-        FAMILY_HALT_KEY,
+        FAMILY_HALT_KEY_PREFIX,
+        LEGACY_FAMILY_HALT_KEY,
     )
     from tests.unit.test_current_rung_hold_strategy import (
         CLIMATE_DAY,
@@ -1179,7 +1180,17 @@ async def test_three_consecutive_reconciliations_leave_the_halt_key_absent(
         assert record is not None, f"boot {boot}: the reconciled fill reached on_order_filled"
         assert record.venue_order_id == "V-REPLAY-1"
         assert latch.is_family_halted() is False, f"boot {boot}"
-        assert latch._store.get(FAMILY_HALT_KEY) is None, f"boot {boot}"
+        assert latch._store.get(LEGACY_FAMILY_HALT_KEY) is None, f"boot {boot}"
+        # AM-2: a prefix scan, not a single literal -- a write to the WRONG
+        # family's key must fail this pin too.
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(strategy_store)
+        try:
+            all_keys = {row[0] for row in conn.execute("SELECT key FROM state")}
+        finally:
+            conn.close()
+        assert not any(k.startswith(FAMILY_HALT_KEY_PREFIX) for k in all_keys), f"boot {boot}"
         assert latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}V-REPLAY-1") is None, f"boot {boot}"
         strategy.stop()
         await rig.client._disconnect()

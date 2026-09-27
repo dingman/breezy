@@ -67,6 +67,7 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.runtime.trade_supervisor_core import (
     BOOT_RETRY_READINESS_TIMEOUT,
+    CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_READINESS_RECHECK_TIMEOUT,
@@ -101,7 +102,7 @@ from breezy.runtime.trade_supervisor_core import (
     classify_exit1_cause,
     continuous_family_check,
     continuous_family_halt_key,
-    continuous_family_is_halted,
+    continuous_family_halt_state,
     continuous_family_startup_evidence_key,
     decide_boot_retry,
     decide_launch_action,
@@ -413,6 +414,8 @@ def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
 class ContinuousFamilyStoreState:
     startup_evidence: Mapping[str, object] | None
     family_halted: bool
+    family_halt_source: str = "none"
+    family_halt_legacy: str = "absent"
 
 
 def _decode_startup_evidence(raw: bytes | None) -> Mapping[str, object] | None:
@@ -447,14 +450,23 @@ def read_continuous_family_store_state(
     [2026-09-12 cross-seam fix] ``family_halted`` is NOT mere key presence:
     the store has no delete, so a legitimate ``breezy-clear-family-halt``
     run leaves the cleared sentinel in place rather than an absent key --
-    see :func:`continuous_family_is_halted`.
+    see :func:`continuous_family_halt_state`.
     """
     startup_evidence_key = continuous_family_startup_evidence_key(sending_family_id)
-    family_halt_key = continuous_family_halt_key(sending_family_id)
+    halt_key = continuous_family_halt_key(sending_family_id)
     with SqliteStateStore(store_path) as store:
         evidence = _decode_startup_evidence(store.get(startup_evidence_key))
-        family_halted = continuous_family_is_halted(store.get(family_halt_key))
-    return ContinuousFamilyStoreState(startup_evidence=evidence, family_halted=family_halted)
+        halt_state = continuous_family_halt_state(
+            sending_family_id,
+            store.get(CONTINUOUS_LEGACY_FAMILY_HALT_KEY),
+            store.get(halt_key),
+        )
+    return ContinuousFamilyStoreState(
+        startup_evidence=evidence,
+        family_halted=halt_state.halted,
+        family_halt_source=halt_state.source,
+        family_halt_legacy=halt_state.legacy,
+    )
 
 
 def sending_family_active() -> bool:
@@ -2037,9 +2049,11 @@ def _do_self_check(
         permit_expiry_at_daily_ceiling = False
 
     continuous_check: ContinuousFamilyCheck | None = None
+    continuous_family_halt_source: str | None = None
     if ports.continuous_family_active():
         sending_family_id = ports.resolve_sending_family_id() or ""
         store_state = ports.read_continuous_family_store_state(store_path, sending_family_id)
+        continuous_family_halt_source = store_state.family_halt_source
         launch_day = state.day if state is not None else now.date()
         continuous_check = continuous_family_check(
             log_text=log_text,
@@ -2082,6 +2096,7 @@ def _do_self_check(
             continuous_phase0_clean=continuous_check.phase0_clean,
             continuous_startup_evidence_valid=continuous_check.startup_evidence_valid,
             continuous_family_not_halted=continuous_check.family_not_halted,
+            continuous_family_halt_source=continuous_family_halt_source or "unknown",
         )
     if load_outcome is EscalationLoadOutcome.ABSENT:
         # The only outcome permitted to be silent -- the count is known

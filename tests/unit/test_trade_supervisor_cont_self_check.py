@@ -29,7 +29,7 @@ from breezy.runtime.trade_supervisor import (
 )
 from breezy.runtime.trade_supervisor_core import (
     CONTINUOUS_FAMILY_HALT_CLEARED_MARKER,
-    CONTINUOUS_FAMILY_HALT_KEY,
+    CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     CONTINUOUS_STARTUP_EVIDENCE_KEY,
     PHASE0_PERMIT_FORBIDDEN_MARKER,
     SELF_CHECK_ALERT_DETAIL,
@@ -37,13 +37,18 @@ from breezy.runtime.trade_supervisor_core import (
     ContinuousFamilyCheck,
     SelfCheckResult,
     continuous_family_check,
-    continuous_family_is_halted,
+    continuous_family_halt_key,
+    continuous_family_halt_state,
     continuous_startup_evidence_valid,
     launch_time_ns,
     self_check,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+#: A generic, non-``pm_us_crh_v4`` test family id for this module's direct
+#: per-family key reads/writes -- these tests exercise the self-check's
+#: continuous-family wiring generically, never v4's legacy attribution.
+_TEST_FAMILY_ID = "pm_us_crh_cont"
 
 _LAUNCH_NS = 1_000_000_000_000
 _VALID_EVIDENCE = {
@@ -242,7 +247,7 @@ class TestMarkerAndKeyConstantsPinnedAgainstRealEmitters:
         latch_source = (
             REPO_ROOT / "src/breezy/strategy/current_rung_hold/trial_day_latch.py"
         ).read_text()
-        assert f'"{CONTINUOUS_FAMILY_HALT_KEY}"' in latch_source
+        assert f'"{CONTINUOUS_LEGACY_FAMILY_HALT_KEY}"' in latch_source
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +317,7 @@ class TestReadContinuousFamilyStoreState:
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path):
             pass  # just create the file/table, write nothing
-        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
+        state = read_continuous_family_store_state(store_path, _TEST_FAMILY_ID)
         assert state == ContinuousFamilyStoreState(startup_evidence=None, family_halted=False)
 
     def test_reads_the_evidence_and_halt_keys_the_client_writes(self, tmp_path):
@@ -323,8 +328,8 @@ class TestReadContinuousFamilyStoreState:
                 CONTINUOUS_STARTUP_EVIDENCE_KEY,
                 json.dumps(evidence).encode("utf-8"),
             )
-            store.set(CONTINUOUS_FAMILY_HALT_KEY, b'{"v":1}')
-        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
+            store.set(continuous_family_halt_key(_TEST_FAMILY_ID), b'{"v":1}')
+        state = read_continuous_family_store_state(store_path, _TEST_FAMILY_ID)
         assert state.startup_evidence == evidence
         assert state.family_halted is True
 
@@ -332,7 +337,7 @@ class TestReadContinuousFamilyStoreState:
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as store:
             store.set(CONTINUOUS_STARTUP_EVIDENCE_KEY, b"not json")
-        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
+        state = read_continuous_family_store_state(store_path, _TEST_FAMILY_ID)
         assert state.startup_evidence is None
 
     def test_read_is_safe_via_a_second_independent_connection_while_a_writer_handle_is_open(
@@ -343,10 +348,10 @@ class TestReadContinuousFamilyStoreState:
         supervisor opens its OWN read-only connection concurrently."""
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as writer:
-            writer.set(CONTINUOUS_FAMILY_HALT_KEY, b'{"v":1}')
+            writer.set(continuous_family_halt_key(_TEST_FAMILY_ID), b'{"v":1}')
             # writer handle still open here -- the read below must not block
             # or raise against it (WAL serves concurrent readers).
-            state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
+            state = read_continuous_family_store_state(store_path, _TEST_FAMILY_ID)
         assert state.family_halted is True
 
 
@@ -498,51 +503,69 @@ class TestDoSelfCheckContinuousWiring:
 # ---------------------------------------------------------------------------
 
 
-class TestContinuousFamilyIsHalted:
-    """Pure mirror of ``TrialDayLatch.is_family_halted()``: absent key or the
-    exact cleared sentinel is NOT halted; any other stored value (including
-    corrupt/unknown bytes) IS halted -- fail-closed, matching the strategy
-    layer's own stance."""
+class TestContinuousFamilyHaltState:
+    """Per-family mirror of ``TrialDayLatch.family_halt_state()``: absent key
+    or the exact cleared sentinel is NOT halted; any other stored value
+    (including corrupt/unknown bytes) IS halted -- fail-closed, matching the
+    strategy layer's own stance. The legacy row is absent throughout, so
+    these pin the per-family branch only (test 26 pins the full
+    runtime/strategy cross-product, legacy included)."""
 
     def test_absent_key_is_not_halted(self):
-        assert continuous_family_is_halted(None) is False
+        state = continuous_family_halt_state(_TEST_FAMILY_ID, None, None)
+        assert state.halted is False
 
     def test_cleared_sentinel_is_not_halted(self):
-        assert continuous_family_is_halted(CONTINUOUS_FAMILY_HALT_CLEARED_MARKER) is False
+        state = continuous_family_halt_state(
+            _TEST_FAMILY_ID, None, CONTINUOUS_FAMILY_HALT_CLEARED_MARKER,
+        )
+        assert state.halted is False
 
     def test_a_genuine_halt_payload_is_halted(self):
-        assert continuous_family_is_halted(b'{"v":1,"reason":"duplicate_fill"}') is True
+        state = continuous_family_halt_state(
+            _TEST_FAMILY_ID, None, b'{"v":1,"reason":"duplicate_fill"}',
+        )
+        assert state.halted is True
 
     def test_corrupt_or_unknown_bytes_are_halted_fail_closed(self):
-        assert continuous_family_is_halted(b"not json") is True
-        assert continuous_family_is_halted(b"") is True
+        assert continuous_family_halt_state(_TEST_FAMILY_ID, None, b"not json").halted is True
+        assert continuous_family_halt_state(_TEST_FAMILY_ID, None, b"").halted is True
 
 
 class TestReadContinuousFamilyStoreStateHonoursTheClearedSentinel:
     def test_cleared_sentinel_reads_as_not_halted(self, tmp_path):
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as store:
-            store.set(CONTINUOUS_FAMILY_HALT_KEY, CONTINUOUS_FAMILY_HALT_CLEARED_MARKER)
-        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
+            store.set(
+                continuous_family_halt_key(_TEST_FAMILY_ID),
+                CONTINUOUS_FAMILY_HALT_CLEARED_MARKER,
+            )
+        state = read_continuous_family_store_state(store_path, _TEST_FAMILY_ID)
         assert state.family_halted is False
 
     def test_a_genuine_halt_payload_reads_as_halted(self, tmp_path):
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as store:
-            store.set(CONTINUOUS_FAMILY_HALT_KEY, b'{"v":1,"reason":"duplicate_fill"}')
-        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
+            store.set(
+                continuous_family_halt_key(_TEST_FAMILY_ID),
+                b'{"v":1,"reason":"duplicate_fill"}',
+            )
+        state = read_continuous_family_store_state(store_path, _TEST_FAMILY_ID)
         assert state.family_halted is True
 
 
 class TestDoSelfCheckPassesAfterALegitimateClear:
     def test_cleared_halt_key_self_check_passes_no_alert(self, tmp_path):
-        """RED case this fix targets: before the fix, ANY value at
-        FAMILY_HALT_KEY (including the cleared sentinel) read as halted, so
+        """RED case this fix targets: before the fix, ANY value at the
+        family-halt key (including the cleared sentinel) read as halted, so
         the 17:05Z self-check would FAIL forever after a legitimate clear."""
         store_path = tmp_path / "state" / "store.sqlite3"
         sink = _RecordingAlertSink()
         with SqliteStateStore(store_path) as store:
-            store.set(CONTINUOUS_FAMILY_HALT_KEY, CONTINUOUS_FAMILY_HALT_CLEARED_MARKER)
+            store.set(
+                continuous_family_halt_key(_TEST_FAMILY_ID),
+                CONTINUOUS_FAMILY_HALT_CLEARED_MARKER,
+            )
         launch_ns = launch_time_ns(dt.date(2026, 9, 12))
         with SqliteStateStore(store_path) as store:
             store.set(
@@ -559,6 +582,7 @@ class TestDoSelfCheckPassesAfterALegitimateClear:
             read_log_new=lambda _p: _READY_LOG_LINE,
             alert_sink=sink,
             continuous_family_active=lambda: True,
+            resolve_sending_family_id=lambda: _TEST_FAMILY_ID,
             read_continuous_family_store_state=read_continuous_family_store_state,
         )
         _do_self_check(
@@ -642,9 +666,9 @@ class TestRuntimeLiteralsPinnedAgainstTheStrategyLayer:
     their strategy-layer originals, so they can never drift silently."""
 
     def test_family_halt_key_matches_the_strategy_layer_constant(self):
-        from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_HALT_KEY
+        from breezy.strategy.current_rung_hold.trial_day_latch import LEGACY_FAMILY_HALT_KEY
 
-        assert CONTINUOUS_FAMILY_HALT_KEY == FAMILY_HALT_KEY
+        assert CONTINUOUS_LEGACY_FAMILY_HALT_KEY == LEGACY_FAMILY_HALT_KEY
 
     def test_startup_evidence_key_matches_the_strategy_layer_constant(self):
         from breezy.strategy.current_rung_hold.trial_day_latch import STARTUP_EVIDENCE_KEY
@@ -655,3 +679,96 @@ class TestRuntimeLiteralsPinnedAgainstTheStrategyLayer:
         from breezy.strategy.current_rung_hold.trial_day_latch import _HALT_CLEARED_MARKER
 
         assert CONTINUOUS_FAMILY_HALT_CLEARED_MARKER == _HALT_CLEARED_MARKER
+
+
+# ---------------------------------------------------------------------------
+# EDGE-3 test 26 (r1 34+35): the runtime duplicate and the strategy original
+# agree on every constant, and their decode tables agree on the FULL
+# cross-product -- key, prefix, CLEARED marker, pinned sha, attributed
+# family id, and the id regex are equal; the digest's decoder `is` the
+# strategy's own function (an identity check, per plan D1).
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_and_strategy_halt_constants_and_decoders_agree_on_the_full_cross_product() -> None:
+    from breezy.runtime.trade_supervisor_core import (
+        CONTINUOUS_FAMILY_HALT_KEY_PREFIX,
+        CONTINUOUS_FAMILY_ID_PATTERN,
+        CONTINUOUS_LEGACY_HALT_ATTRIBUTED_FAMILY_ID,
+        CONTINUOUS_LEGACY_HALT_PINNED_SHA256,
+        continuous_family_halt_state,
+    )
+    from breezy.strategy.current_rung_hold.trial_day_latch import (
+        _HALT_CLEARED_MARKER,
+        FAMILY_HALT_KEY_PREFIX,
+        FAMILY_ID_PATTERN,
+        LEGACY_FAMILY_HALT_KEY,
+        LEGACY_HALT_ATTRIBUTED_FAMILY_ID,
+        LEGACY_HALT_PINNED_SHA256,
+        decode_family_halt_state,
+    )
+
+    assert CONTINUOUS_LEGACY_FAMILY_HALT_KEY == LEGACY_FAMILY_HALT_KEY
+    assert CONTINUOUS_FAMILY_HALT_KEY_PREFIX == FAMILY_HALT_KEY_PREFIX
+    assert CONTINUOUS_FAMILY_HALT_CLEARED_MARKER == _HALT_CLEARED_MARKER
+    assert CONTINUOUS_LEGACY_HALT_PINNED_SHA256 == LEGACY_HALT_PINNED_SHA256
+    assert CONTINUOUS_LEGACY_HALT_ATTRIBUTED_FAMILY_ID == LEGACY_HALT_ATTRIBUTED_FAMILY_ID
+    assert CONTINUOUS_FAMILY_ID_PATTERN.pattern == FAMILY_ID_PATTERN.pattern
+
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "family_halt"
+        / "legacy_v4_halt_2026-09-24.bin"
+    ).read_bytes()
+    legacy_values = {
+        "absent": None,
+        "cleared": _HALT_CLEARED_MARKER,
+        "pinned": fixture,
+        "pinned_flipped": bytes([fixture[0] ^ 0xFF]) + fixture[1:],
+        "json_v1": b'{"v":1}',
+        "empty": b"",
+        "corrupt": b"\xff\xfe\x00garbage",
+    }
+    family_values = {
+        "absent": None,
+        "cleared": CONTINUOUS_FAMILY_HALT_CLEARED_MARKER,
+        "halted": b'{"v":1,"reason":"duplicate_fill"}',
+    }
+    for family_id in ("pm_us_crh_v4", "pm_us_crh_fresh"):
+        for legacy_name, legacy_raw in legacy_values.items():
+            for family_name, family_raw in family_values.items():
+                strategy_reading = decode_family_halt_state(family_id, legacy_raw, family_raw)
+                runtime_reading = continuous_family_halt_state(family_id, legacy_raw, family_raw)
+                assert strategy_reading.halted == runtime_reading.halted, (
+                    family_id, legacy_name, family_name,
+                )
+                assert strategy_reading.source == runtime_reading.source, (
+                    family_id, legacy_name, family_name,
+                )
+                assert strategy_reading.legacy == runtime_reading.legacy, (
+                    family_id, legacy_name, family_name,
+                )
+
+
+def test_digest_decoder_is_the_strategy_layer_function_by_identity() -> None:
+    """D1: the digest's decoder `is` the strategy's own function -- a third
+    literal/copy in the digest would be dead code beside this, and would
+    also be one more place to drift."""
+    import importlib.util
+    import sys
+
+    from breezy.strategy.current_rung_hold.trial_day_latch import decode_family_halt_state
+
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "analysis"
+        / "decision_funnel_daily_digest.py"
+    )
+    spec = importlib.util.spec_from_file_location("decision_funnel_daily_digest_id_check", script)
+    assert spec is not None and spec.loader is not None
+    digest = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = digest
+    spec.loader.exec_module(digest)
+    assert digest.decode_family_halt_state is decode_family_halt_state

@@ -1,4 +1,4 @@
-"""Operator tool to clear the ``pm_us_crh_cont`` family-wide halt.
+"""Operator tool to clear a continuous-rung-hold family halt.
 
 Mirrors ``breezy-clear-submit-intent`` (R-7, ``breezy.runtime.clear_submit_intent_cli``):
 never called from the trading process, never on a timer, never at startup.
@@ -37,10 +37,17 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLockNotHeld,
     open_submit_intent_latch,
 )
+from breezy.strategy.current_rung_hold.family_id_arg import (
+    FamilyIdArgError,
+    resolve_continuous_family_arg,
+)
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
+    LEGACY_HALT_ATTRIBUTED_FAMILY_ID,
     TrialDayLatchError,
+    decode_family_halt_state,
     open_trial_day_latch,
+    read_family_halt_rows_readonly,
 )
 
 EXIT_OK = 0
@@ -79,25 +86,71 @@ def clear_family_halt(
     err = sys.stderr if stderr is None else stderr
     source = os.environ if env is None else env
     parser = argparse.ArgumentParser(prog="breezy-clear-family-halt")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--family-id", help="continuous-rung-hold family id to clear")
+    target.add_argument(
+        "--legacy",
+        action="store_true",
+        help="clear only an unattributable legacy halt; refuses the pinned v4 halt",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="read-only: report family halt state without taking the submit-intent lock",
+    )
+    parser.add_argument(
+        "--families-dir",
+        type=Path,
+        default=Path("deploy/families"),
+        help="directory containing registered family manifests",
+    )
     parser.add_argument(
         "--reason",
-        required=True,
         type=_reason_type,
         help=f"non-trivial written justification, at least {MIN_REASON_LENGTH} characters",
     )
     parser.add_argument(
         "--evidence-path",
-        required=True,
         type=_evidence_path_type,
         help="path to an existing evidence artefact; only its sha256 is recorded",
     )
     args = parser.parse_args(argv)
+    if not args.status and (args.reason is None or args.evidence_path is None):
+        parser.error("--reason and --evidence-path are required unless --status is given")
+    if args.status and args.legacy:
+        parser.error("--status requires --family-id")
+
+    if args.family_id is not None:
+        try:
+            resolve_continuous_family_arg(args.family_id, args.families_dir)
+        except FamilyIdArgError as exc:
+            print(f"breezy-clear-family-halt: {exc}; refused", file=err)
+            return EXIT_REFUSED
 
     try:
         store_path = resolve_store_path(source)
     except ExecStateDbNotConfiguredError as exc:
         print(f"breezy-clear-family-halt: {exc}; refused", file=err)
         return EXIT_REFUSED
+
+    if args.status:
+        assert args.family_id is not None
+        try:
+            legacy_raw, family_raw = read_family_halt_rows_readonly(store_path, args.family_id)
+            reading = decode_family_halt_state(args.family_id, legacy_raw, family_raw)
+        except Exception as exc:  # noqa: BLE001 - any read-only status failure REFUSES
+            print(
+                f"breezy-clear-family-halt: status unreadable ({type(exc).__name__}); refused",
+                file=err,
+            )
+            return EXIT_REFUSED
+        print(
+            "breezy-clear-family-halt: "
+            f"family_id={args.family_id} halted={reading.halted} "
+            f"source={reading.source} legacy={reading.legacy}",
+            file=out,
+        )
+        return EXIT_OK
 
     evidence_sha256 = hashlib.sha256(args.evidence_path.read_bytes()).hexdigest()
 
@@ -106,9 +159,25 @@ def clear_family_halt(
         try:
             with open_submit_intent_latch(store, store_path) as intent_latch:
                 trial_latch = open_trial_day_latch(
-                    intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX
+                    intent_latch,
+                    key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    family_id=args.family_id if args.family_id is not None else None,
                 )
-                if not trial_latch.is_family_halted():
+                if args.legacy:
+                    try:
+                        trial_latch.clear_legacy_family_halt(
+                            reason=args.reason,
+                            evidence_sha256=evidence_sha256,
+                            ts_ns=time.time_ns(),
+                        )
+                    except TrialDayLatchError:
+                        print("breezy-clear-family-halt: nothing to clear", file=out)
+                        return EXIT_NOTHING_TO_CLEAR
+                    print("breezy-clear-family-halt: legacy cleared", file=out)
+                    return EXIT_OK
+                assert args.family_id is not None
+                state = trial_latch.family_halt_state()
+                if not state.halted:
                     print("breezy-clear-family-halt: nothing to clear", file=out)
                     return EXIT_NOTHING_TO_CLEAR
                 try:
@@ -131,7 +200,10 @@ def clear_family_halt(
             return EXIT_REFUSED
     finally:
         store.close()
-    print("breezy-clear-family-halt: cleared", file=out)
+    if args.family_id == LEGACY_HALT_ATTRIBUTED_FAMILY_ID:
+        print("breezy-clear-family-halt: cleared family and retired pinned legacy", file=out)
+    else:
+        print("breezy-clear-family-halt: cleared", file=out)
     return EXIT_OK
 
 

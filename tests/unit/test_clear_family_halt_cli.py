@@ -25,13 +25,22 @@ from breezy.strategy.current_rung_hold.clear_family_halt_cli import (
     main,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
-    FAMILY_HALT_KEY,
-    HALT_CLEARED_KEY_PREFIX,
+    FAMILY_HALT_CLEARED_KEY_PREFIX,
+    LEGACY_FAMILY_HALT_KEY,
+    family_halt_key,
     open_trial_day_latch,
 )
 
 DUP_FILL_TS_NS = 1_787_617_213_000_000_000
 CLEAR_TS_NS = 1_787_700_000_000_000_000
+#: The real, checked-in v4 manifest -- mirrors `test_set_family_halt_cli.py`:
+#: every test uses this id against the repo's real `deploy/families/` (the
+#: default `--families-dir`), so no test needs to fabricate a manifest.
+TEST_FAMILY_ID = "pm_us_crh_v4"
+
+
+def _audit_key(ts_ns: int, family_id: str = TEST_FAMILY_ID) -> str:
+    return f"{FAMILY_HALT_CLEARED_KEY_PREFIX}{family_id}/{ts_ns}"
 
 
 def _evidence(tmp_path: Path, name: str = "evidence.txt") -> Path:
@@ -44,10 +53,10 @@ def _env(store_path: Path) -> dict[str, str]:
     return {EXEC_STATE_DB_ENV_VAR: str(store_path)}
 
 
-def _seed_halt(store_path: Path) -> None:
+def _seed_halt(store_path: Path, *, family_id: str = TEST_FAMILY_ID) -> None:
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=family_id)
         trial_latch.record_duplicate_fill(
             "KSFO",
             "2026-09-12",
@@ -68,6 +77,8 @@ def _run(
     stderr: io.StringIO,
     ts_ns: int = CLEAR_TS_NS,
 ) -> int:
+    if "--family-id" not in argv and "--legacy" not in argv:
+        argv = [*argv, "--family-id", TEST_FAMILY_ID]
     with patch(
         "breezy.strategy.current_rung_hold.clear_family_halt_cli.time.time_ns",
         return_value=ts_ns,
@@ -75,12 +86,12 @@ def _run(
         return main(argv, env=_env(store_path), stdout=stdout, stderr=stderr)
 
 
-def _seed_raw_halt(store_path: Path, raw: bytes) -> None:
-    """Write `raw` directly under `FAMILY_HALT_KEY`, bypassing
+def _seed_raw_halt(store_path: Path, raw: bytes, *, family_id: str = TEST_FAMILY_ID) -> None:
+    """Write `raw` directly under the per-family halt key, bypassing
     `record_duplicate_fill` -- used to simulate a corrupt or legacy-schema
     halt record that no writer in this codebase produces today."""
     store = SqliteStateStore(store_path)
-    store.set(FAMILY_HALT_KEY, raw)
+    store.set(family_halt_key(family_id), raw)
     store.close()
 
 
@@ -103,7 +114,8 @@ def test_refuses_when_the_halt_key_is_absent(tmp_path: Path) -> None:
     assert "nothing to clear" in stdout.getvalue()
 
     store = SqliteStateStore(store_path)
-    assert store.get(FAMILY_HALT_KEY) is None
+    assert store.get(family_halt_key(TEST_FAMILY_ID)) is None
+    assert store.get(LEGACY_FAMILY_HALT_KEY) is None
     store.close()
 
 
@@ -131,9 +143,9 @@ def test_refuses_while_the_node_holds_the_lock(tmp_path: Path) -> None:
 
     store2 = SqliteStateStore(store_path)
     with open_submit_intent_latch(store2, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=TEST_FAMILY_ID)
         assert trial_latch.is_family_halted() is True
-    assert store2.get(f"{HALT_CLEARED_KEY_PREFIX}{CLEAR_TS_NS}") is None
+    assert store2.get(_audit_key(CLEAR_TS_NS)) is None
     store2.close()
 
 
@@ -154,9 +166,9 @@ def test_happy_path_clears_the_halt_and_writes_an_audit_record(tmp_path: Path) -
 
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=TEST_FAMILY_ID)
         assert trial_latch.is_family_halted() is False
-    audit_raw = store.get(f"{HALT_CLEARED_KEY_PREFIX}{CLEAR_TS_NS}")
+    audit_raw = store.get(_audit_key(CLEAR_TS_NS))
     store.close()
     assert audit_raw is not None
     audit = json.loads(audit_raw.decode("utf-8"))
@@ -206,7 +218,7 @@ def test_argparse_rejects_a_too_short_reason(tmp_path: Path) -> None:
         assert exc.code == 2
     assert raised
     store = SqliteStateStore(store_path)
-    assert store.get(FAMILY_HALT_KEY) is not None  # unchanged: still the live halt payload
+    assert store.get(family_halt_key(TEST_FAMILY_ID)) is not None  # unchanged: still live
     store.close()
 
 
@@ -232,7 +244,7 @@ def test_argparse_rejects_a_missing_evidence_file(tmp_path: Path) -> None:
         assert exc.code == 2
     assert raised
     store = SqliteStateStore(store_path)
-    assert store.get(FAMILY_HALT_KEY) is not None  # unchanged
+    assert store.get(family_halt_key(TEST_FAMILY_ID)) is not None  # unchanged
     store.close()
 
 
@@ -259,7 +271,7 @@ def test_a_corrupt_or_legacy_halt_payload_fails_closed_and_is_still_clearable(
 
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=TEST_FAMILY_ID)
         assert trial_latch.is_family_halted() is True
     store.close()
 
@@ -279,9 +291,9 @@ def test_a_corrupt_or_legacy_halt_payload_fails_closed_and_is_still_clearable(
     assert "cleared" in stdout.getvalue()
 
     store2 = SqliteStateStore(store_path)
-    audit_raw = store2.get(f"{HALT_CLEARED_KEY_PREFIX}{CLEAR_TS_NS}")
+    audit_raw = store2.get(_audit_key(CLEAR_TS_NS))
     with open_submit_intent_latch(store2, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=TEST_FAMILY_ID)
         assert trial_latch.is_family_halted() is False
     store2.close()
     assert audit_raw is not None
@@ -320,7 +332,7 @@ def test_clearing_never_blocks_a_later_genuine_halt_and_each_clear_gets_its_own_
     # FRESH payload -- not the cleared sentinel left behind above.
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=TEST_FAMILY_ID)
         assert trial_latch.is_family_halted() is False
         trial_latch.record_duplicate_fill(
             "KLAX",
@@ -351,10 +363,10 @@ def test_clearing_never_blocks_a_later_genuine_halt_and_each_clear_gets_its_own_
     assert "cleared" in stdout2.getvalue()
 
     store2 = SqliteStateStore(store_path)
-    first_audit = store2.get(f"{HALT_CLEARED_KEY_PREFIX}{first_clear_ts_ns}")
-    second_audit = store2.get(f"{HALT_CLEARED_KEY_PREFIX}{second_clear_ts_ns}")
+    first_audit = store2.get(_audit_key(first_clear_ts_ns))
+    second_audit = store2.get(_audit_key(second_clear_ts_ns))
     with open_submit_intent_latch(store2, store_path) as intent_latch:
-        trial_latch = open_trial_day_latch(intent_latch)
+        trial_latch = open_trial_day_latch(intent_latch, family_id=TEST_FAMILY_ID)
         assert trial_latch.is_family_halted() is False
     store2.close()
 
@@ -363,3 +375,124 @@ def test_clearing_never_blocks_a_later_genuine_halt_and_each_clear_gets_its_own_
     assert first_audit != second_audit
     second_payload = json.loads(second_audit.decode("utf-8"))
     assert second_payload["priorHalt"]["venueOrderId"] == "v-dup-2"
+
+
+# ---------------------------------------------------------------------------
+# EDGE-3 test 22: unknown / non-continuous / mismatched / escaping family id,
+# plus the required, mutually-exclusive --family-id/--legacy group.
+# ---------------------------------------------------------------------------
+
+
+def test_set_and_clear_refuse_unknown_non_continuous_mismatched_or_escaping_family_id(
+    tmp_path: Path,
+) -> None:
+    import json as _json
+
+    families = tmp_path / "families"
+    families.mkdir()
+
+    # (a) unknown: no manifest file at all.
+    store_path = tmp_path / "state.db"
+    SqliteStateStore(store_path).close()
+    code_unknown = main(
+        [
+            "--family-id", "pm_us_crh_does_not_exist",
+            "--families-dir", str(families),
+            "--reason", "attempted clear of an unregistered family id here",
+            "--evidence-path", str(_evidence(tmp_path, "u.txt")),
+        ],
+        env=_env(store_path),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert code_unknown == EXIT_REFUSED
+
+    # (b) non-continuous composition_kind.
+    v4_manifest = _json.loads(Path("deploy/families/pm_us_crh_v4.json").read_text())
+    non_continuous = dict(
+        v4_manifest, family_id="pm_us_crh_noncont", composition_kind="current_rung_hold",
+    )
+    (families / "pm_us_crh_noncont.json").write_text(_json.dumps(non_continuous))
+    code_noncont = main(
+        [
+            "--family-id", "pm_us_crh_noncont",
+            "--families-dir", str(families),
+            "--reason", "attempted clear of a non-continuous family here",
+            "--evidence-path", str(_evidence(tmp_path, "b.txt")),
+        ],
+        env=_env(store_path),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert code_noncont == EXIT_REFUSED
+
+    # (c) mismatched: the manifest's own family_id disagrees with the arg.
+    mismatched = dict(v4_manifest, family_id="pm_us_crh_someone_else")
+    (families / "pm_us_crh_mismatch.json").write_text(_json.dumps(mismatched))
+    code_mismatch = main(
+        [
+            "--family-id", "pm_us_crh_mismatch",
+            "--families-dir", str(families),
+            "--reason", "attempted clear of a mismatched family id here",
+            "--evidence-path", str(_evidence(tmp_path, "c.txt")),
+        ],
+        env=_env(store_path),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert code_mismatch == EXIT_REFUSED
+
+    # (d) escaping: a symlink inside `families/` whose target lives outside it.
+    outside = tmp_path / "outside_secret.json"
+    outside.write_text(_json.dumps(dict(v4_manifest, family_id="pm_us_crh_escape")))
+    escape_link = families / "pm_us_crh_escape.json"
+    escape_link.symlink_to(outside)
+    code_escape = main(
+        [
+            "--family-id", "pm_us_crh_escape",
+            "--families-dir", str(families),
+            "--reason", "attempted clear via a families-dir-escaping symlink",
+            "--evidence-path", str(_evidence(tmp_path, "d.txt")),
+        ],
+        env=_env(store_path),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert code_escape == EXIT_REFUSED
+    # The symlink target itself must never have been read as a valid escape.
+    assert outside.exists()
+
+
+def test_clear_family_id_and_legacy_are_a_required_mutually_exclusive_group(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.db"
+    SqliteStateStore(store_path).close()
+
+    # Neither given.
+    with pytest.raises(SystemExit) as neither_exc:
+        main(
+            [
+                "--reason", "neither --family-id nor --legacy given here",
+                "--evidence-path", str(_evidence(tmp_path, "neither.txt")),
+            ],
+            env=_env(store_path),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+    assert neither_exc.value.code == 2
+
+    # Both given.
+    with pytest.raises(SystemExit) as both_exc:
+        main(
+            [
+                "--family-id", "pm_us_crh_v4",
+                "--legacy",
+                "--reason", "both --family-id and --legacy given here",
+                "--evidence-path", str(_evidence(tmp_path, "both.txt")),
+            ],
+            env=_env(store_path),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+    assert both_exc.value.code == 2

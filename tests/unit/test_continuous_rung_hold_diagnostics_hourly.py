@@ -60,16 +60,23 @@ def interior_instrument() -> BinaryOption:
     return _instrument(INTERIOR_ID, lower_f=86, upper_f=87)
 
 
+_TEST_FAMILY_ID = "pm_us_crh_test"
+
+
 @contextmanager
-def _open_cont_latch(store_path: Path) -> Iterator[TrialDayLatch]:
+def _open_cont_latch(
+    store_path: Path, *, family_id: str = _TEST_FAMILY_ID,
+) -> Iterator[TrialDayLatch]:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        yield open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        yield open_trial_day_latch(
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=family_id,
+        )
 
 
 def _cont_latch_factory(
-    store_path: Path,
+    store_path: Path, *, family_id: str = _TEST_FAMILY_ID,
 ) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
-    return lambda: _open_cont_latch(store_path)
+    return lambda: _open_cont_latch(store_path, family_id=family_id)
 
 
 def _register_and_start(

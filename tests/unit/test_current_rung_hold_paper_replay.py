@@ -197,14 +197,27 @@ def _depth(
     )
 
 
+#: EDGE-3 (AM-3, class B): every continuous latch opened for a halt-reaching
+#: test binds a family id -- an arbitrary but fixed non-v4 test id, since
+#: none of these tests exercise v4's legacy attribution specifically. This
+#: module's OWN local helper, distinct from the `current_rung_hold_paper_
+#: replay` script's own `_latch_context`/`_latch_factory` (reached via the
+#: `driver` fixture below), which already default `family_id="paper_replay"`.
+_TEST_FAMILY_ID = "pm_us_crh_test"
+
+
 @contextmanager
-def _latch_context(store_path: Path) -> Iterator[TrialDayLatch]:
+def _latch_context(
+    store_path: Path, *, family_id: str = _TEST_FAMILY_ID,
+) -> Iterator[TrialDayLatch]:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        yield open_trial_day_latch(intent_latch)
+        yield open_trial_day_latch(intent_latch, family_id=family_id)
 
 
-def _latch_factory(store_path: Path) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
-    return lambda: _latch_context(store_path)
+def _latch_factory(
+    store_path: Path, *, family_id: str = _TEST_FAMILY_ID,
+) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
+    return lambda: _latch_context(store_path, family_id=family_id)
 
 
 # ---------------------------------------------------------------------------

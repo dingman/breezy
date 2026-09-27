@@ -338,7 +338,9 @@ def _compose(tmp_path: Path, *, permit: Any) -> _Composition:
     store_path = tmp_path / "exec_state.db"
     latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
     latch = latch_cm.__enter__()
-    family_halt_latch = open_trial_day_latch(latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+    family_halt_latch = open_trial_day_latch(
+        latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+    )
     submit_veto = family_halt_submit_veto(family_halt_latch)
     assert submit_veto() is None
     ledger = DailySpendLedger()

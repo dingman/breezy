@@ -19,7 +19,7 @@ import pytest
 
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import hold_submit_intent_process_lock
-from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_HALT_KEY
+from breezy.strategy.current_rung_hold.trial_day_latch import LEGACY_FAMILY_HALT_KEY
 
 _SCRIPT = (
     Path(__file__).resolve().parents[2]
@@ -346,6 +346,7 @@ def test_missing_tape_with_halt_set_names_halt_in_alert_and_artefact(
             "--climate-day", "2026-09-20",
             "--output-dir", str(out),
             "--store-path", str(store_path),
+            "--family-id", "pm_us_crh_v4",
         ]
     )
 
@@ -374,6 +375,7 @@ def test_missing_tape_with_no_halt_reports_halt_enforced_no(
             "--climate-day", "2026-09-20",
             "--output-dir", str(out),
             "--store-path", str(store_path),
+            "--family-id", "pm_us_crh_v4",
         ]
     )
 
@@ -408,6 +410,7 @@ def test_missing_tape_halt_read_failure_does_not_crash_and_is_logged(
                 "--climate-day", "2026-09-20",
                 "--output-dir", str(out),
                 "--store-path", str(tmp_path / "irrelevant.db"),
+                "--family-id", "pm_us_crh_v4",
             ]
         )
 
@@ -460,7 +463,7 @@ def _store_with_halt_value(tmp_path: Path, raw: bytes | None) -> Path:
     store = SqliteStateStore(store_path)
     try:
         if raw is not None:
-            store.set(FAMILY_HALT_KEY, raw)
+            store.set(LEGACY_FAMILY_HALT_KEY, raw)
     finally:
         store.close()
     return store_path
@@ -469,7 +472,7 @@ def _store_with_halt_value(tmp_path: Path, raw: bytes | None) -> Path:
 def test_read_family_halt_status_is_no_when_the_key_is_absent(tmp_path: Path) -> None:
     store_path = _store_with_halt_value(tmp_path, None)
 
-    status = _DIGEST.read_family_halt_status(store_path)
+    status = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4")
 
     assert status.value == "no"
     assert status.reason is None
@@ -480,7 +483,7 @@ def test_read_family_halt_status_is_yes_when_a_halt_is_recorded(tmp_path: Path) 
         tmp_path, b'{"v":1,"reason":"policy_halt","tsNs":1,"detail":"x","evidenceSha256":"a"}'
     )
 
-    status = _DIGEST.read_family_halt_status(store_path)
+    status = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4")
 
     assert status.value == "yes"
     assert status.reason is None
@@ -489,7 +492,7 @@ def test_read_family_halt_status_is_yes_when_a_halt_is_recorded(tmp_path: Path) 
 def test_read_family_halt_status_is_no_when_the_halt_was_cleared(tmp_path: Path) -> None:
     store_path = _store_with_halt_value(tmp_path, b'{"v":1,"state":"cleared"}')
 
-    status = _DIGEST.read_family_halt_status(store_path)
+    status = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4")
 
     assert status.value == "no"
     assert status.reason is None
@@ -498,7 +501,7 @@ def test_read_family_halt_status_is_no_when_the_halt_was_cleared(tmp_path: Path)
 def test_read_family_halt_status_is_unknown_when_the_store_file_is_missing(tmp_path: Path) -> None:
     missing = tmp_path / "does-not-exist.db"
 
-    status = _DIGEST.read_family_halt_status(missing)
+    status = _DIGEST.read_family_halt_status(missing, "pm_us_crh_v4")
 
     assert status.value == "unknown"
     assert status.reason
@@ -515,11 +518,13 @@ def test_read_family_halt_status_is_unknown_when_the_stored_value_is_malformed(
     store_path = tmp_path / "exec-state.db"
     conn = sqlite3.connect(store_path)
     conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
-    conn.execute("INSERT INTO state (key, value) VALUES (?, ?)", (FAMILY_HALT_KEY, "not-bytes"))
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES (?, ?)", (LEGACY_FAMILY_HALT_KEY, "not-bytes"),
+    )
     conn.commit()
     conn.close()
 
-    status = _DIGEST.read_family_halt_status(store_path)
+    status = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4")
 
     assert status.value == "unknown"
     assert status.reason
@@ -534,7 +539,7 @@ def test_read_family_halt_status_is_unknown_when_locked_beyond_the_busy_timeout(
     def _always_locked(*args: object, **kwargs: object) -> sqlite3.Connection:
         raise sqlite3.OperationalError("database is locked")
 
-    status = _DIGEST.read_family_halt_status(store_path, connect=_always_locked)
+    status = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4", connect=_always_locked)
 
     assert status.value == "unknown"
     assert status.reason
@@ -548,7 +553,7 @@ def test_read_family_halt_status_never_fails_open_to_no_or_closed_to_yes_on_erro
     `unknown`, distinct from both `yes` and `no`."""
     missing = tmp_path / "does-not-exist.db"
 
-    status = _DIGEST.read_family_halt_status(missing)
+    status = _DIGEST.read_family_halt_status(missing, "pm_us_crh_v4")
 
     assert status.value not in ("yes", "no")
 
@@ -565,7 +570,7 @@ def test_read_family_halt_status_succeeds_while_the_node_holds_the_submit_intent
     )
 
     with hold_submit_intent_process_lock(store_path):
-        status = _DIGEST.read_family_halt_status(store_path)
+        status = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4")
 
     assert status.value == "yes"
     assert status.reason is None
@@ -642,6 +647,7 @@ def test_main_reports_halt_enforced_unknown_when_the_store_path_does_not_exist(
             "--stations", "MIA",
             "--output-dir", str(out),
             "--store-path", str(missing_store),
+            "--family-id", "pm_us_crh_v4",
         ]
     )
 
@@ -672,6 +678,7 @@ def test_main_reports_halt_enforced_yes_from_a_real_store(
             "--stations", "MIA",
             "--output-dir", str(out),
             "--store-path", str(store_path),
+            "--family-id", "pm_us_crh_v4",
         ]
     )
 
@@ -1293,3 +1300,40 @@ class TestPreTapeStaleness:
         assert "pre_tape_stale" not in sink.payloads[0].detail
         artefact = json.loads((out / "decision_funnel_2026-09-20.json").read_text(encoding="utf-8"))
         assert "pre_tape_stale" not in artefact
+
+
+# ---------------------------------------------------------------------------
+# EDGE-3 test 28 (r1 39+40): the digest reports family/source/legacy, and
+# `unknown` is never `no` -- neither absent nor invalid family ids are ever
+# laundered into a false "not halted".
+# ---------------------------------------------------------------------------
+
+
+def test_digest_reports_family_source_legacy_and_unknown_without_or_with_invalid_family_id_never_no(
+    tmp_path: Path,
+) -> None:
+    fixture_bytes = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "family_halt"
+        / "legacy_v4_halt_2026-09-24.bin"
+    ).read_bytes()
+    store_path = _store_with_halt_value(tmp_path, fixture_bytes)
+
+    with_family = _DIGEST.read_family_halt_status(store_path, "pm_us_crh_v4")
+    assert with_family.value == "yes"
+    assert with_family.family_id == "pm_us_crh_v4"
+    assert with_family.source == "legacy_attributed"
+    assert with_family.legacy == "attributable_to_v4"
+
+    # An invalid family id is `unknown`, never `no`.
+    invalid = _DIGEST.read_family_halt_status(store_path, "../escape")
+    assert invalid.value == "unknown"
+    assert invalid.value != "no"
+
+    # No family id resolvable at all (neither --family-id nor the env var).
+    args = _DIGEST._parse_args(["--store-path", str(store_path)])
+    no_family = _DIGEST._resolve_halt_status(args, {})
+    assert no_family.value == "unknown"
+    assert no_family.value != "no"
+    assert no_family.reason == "no family id"

@@ -9,6 +9,7 @@ Reuses the real-store harness from ``test_continuous_rung_hold_strategy.py``
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -45,12 +46,14 @@ from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     DUPLICATE_FILL_KEY_PREFIX,
-    FAMILY_HALT_KEY,
+    LEGACY_FAMILY_HALT_KEY,
     TrialDayLatch,
+    family_halt_key,
     open_trial_day_latch,
 )
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
+    TEST_CONT_FAMILY_ID,
     _register,
     _register_and_start,
     _register_armed_and_start,
@@ -173,7 +176,8 @@ def test_a_replayed_fill_with_the_same_venue_order_id_is_idempotent(
     )
     assert record is not None and record.venue_order_id == "ord-1"
     assert strategy._latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}ord-1") is None
-    assert strategy._latch._store.get(FAMILY_HALT_KEY) is None
+    assert strategy._latch._store.get(LEGACY_FAMILY_HALT_KEY) is None
+    assert strategy._latch._store.get(family_halt_key(TEST_CONT_FAMILY_ID)) is None
 
 
 def test_a_replayed_reconciled_fill_writes_no_duplicate_bucket_and_no_halt(
@@ -235,7 +239,8 @@ def test_a_replayed_reconciled_fill_writes_no_duplicate_bucket_and_no_halt(
     latch = restarted._latch
     assert latch is not None
     assert latch.is_family_halted() is False
-    assert latch._store.get(FAMILY_HALT_KEY) is None
+    assert latch._store.get(LEGACY_FAMILY_HALT_KEY) is None
+    assert latch._store.get(family_halt_key(TEST_CONT_FAMILY_ID)) is None
     assert latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}ord-1") is None
     record = latch.record(STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID))
     assert record is not None and record.venue_order_id == "ord-1"
@@ -782,6 +787,50 @@ def test_never_arm_walk_halts_when_the_family_is_already_halted(
     )
     assert strategy._run_never_arm_walk() is False
     assert strategy.position_events.count("family_halt_at_start") == 1
+
+
+def test_never_arm_log_names_family_id_and_source(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """EDGE-3 test 20 (§6.2): the never-arm error line names both the
+    bound family id and the halt's decoded source -- AC-10.
+
+    Nautilus's own Rust-backed logger writes straight to the process's
+    stderr file descriptor, bypassing Python's stdlib `logging` module --
+    `caplog` cannot see it (it hooks `logging` handlers only), so this
+    reads the captured fd-level output instead, mirroring the pattern the
+    strategy tests elsewhere in this module already use for
+    `capsys`/stderr-based assertions.
+    """
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy._latch.record_duplicate_fill(
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        venue_order_id="ord-log",
+        qty=Decimal(1),
+        fill_px=Decimal("0.4"),
+        fee=Decimal(0),
+        ts_ns=WINDOW_OPEN_NS,
+    )
+    capfd.readouterr()  # drain anything buffered before this point
+    assert strategy._run_never_arm_walk() is False
+    # Nautilus's Rust-backed logger writes on its own background thread --
+    # a short, bounded wait for the flush, never a retry loop on content
+    # (the same pattern `test_continuous_rung_hold_backtest_only.py`'s
+    # `test_on_start_refuses_a_non_testclock` uses).
+    time.sleep(0.1)
+    captured = capfd.readouterr()
+    assert "family halt is set" in captured.err
+    assert f"family_id={TEST_CONT_FAMILY_ID}" in captured.err
+    assert "source=per_family" in captured.err
+    assert "never arming" in captured.err
 
 
 def test_never_arm_walk_consumes_a_durable_fill_with_no_trial(
@@ -1605,7 +1654,7 @@ def test_every_never_arm_walk_exit_path_emits_the_startup_evidence_summary_at_in
 
 
 def test_family_halt_key_literal(store_path: Path) -> None:
-    assert FAMILY_HALT_KEY == "continuous_rung_hold/halt"
+    assert LEGACY_FAMILY_HALT_KEY == "continuous_rung_hold/halt"
 
 
 # ---------------------------------------------------------------------------
@@ -1668,7 +1717,9 @@ def _cont_latch_context_for(store_path: Path) -> Iterator[TrialDayLatch]:
     from breezy.strategy.current_rung_hold.trial_day_latch import CONTINUOUS_TRIAL_KEY_PREFIX
 
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        yield open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        yield open_trial_day_latch(
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_CONT_FAMILY_ID,
+        )
 
 
 def _register_bare(
