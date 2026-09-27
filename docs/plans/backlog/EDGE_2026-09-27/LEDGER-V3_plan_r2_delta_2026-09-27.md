@@ -64,6 +64,25 @@ Changes to existing tests:
 - The renamed test `..._accepts_v1_v2_v3_and_refuses_v4` keeps its exact refusal assertions and ALSO asserts `_SUPPORTED_SCHEMA_VERSIONS == frozenset({1, 2, 3})` (exact equality).
 - The version-99 test at `:132` is untouched.
 
+## r3 amendments (round 2: architect REQUEST_CHANGES, 2 mechanical; domain ENDORSE-WITH-CHANGES). BINDING.
+- **R3-1 (replaces D-4's deny-list).**
+  - `replace_record_status(record, *, status)` accepts ONLY `status`. Every other field is frozen by construction, including `is_zero_look`, `hypothesis_class` and `schema_version`, which is where the deny-list had gaps.
+  - All four triage sites (`hypothesis_triage.py:640/678/728/780`) change only `status` (architect read each one).
+- **R3-2 (placement of the D-2 and D-6 refusals).** Both refusals (tolling-not-landed, and look-taking without filters) go in the REGISTERED branch of `register_hypothesis` only, AFTER `recompute_mde` and the power check (`hypothesis_ledger.py:~918`). They must never sit beside the filter validation (~:845).
+  - Test: a v3 UNDERPOWERED call with no filters and `HORIZON_TOLLING_LANDED=False` registers fine. This keeps RA-9 Path A working.
+- **R3-3 (fixes D-2 wording).** CLOSED records always stay v1: r1 AC6 and `test_closed_disposition_refuses_v3_kwargs` stand. D-2's phrase "CLOSED remain allowed" is struck out.
+- **R3-4 (the D-4 AST barrier, reworded).**
+  - Scope: every non-test module under `src/` or `scripts/` that imports `HypothesisRecord`, except `hypothesis_ledger.py` (so it also covers `hypothesis_register.py`).
+  - Rule: such a module must not import `replace` from `dataclasses` and must not call `dataclasses.replace`.
+  - Must not trip: `os.replace` (`hypothesis_triage.py:241`), or local names such as `_replace_status`.
+- **R3-5 (scope of the D-5 barrier).** Scan only `src/` and `scripts/`. Tests may read `.re_arm_gating`.
+- **R3-6 (handoff signature).** `_write_handoff(derived_root, look, record)`: the caller at `:789` passes the record. No reader of the handoff JSON exists today.
+- **R3-7 (per-variant bound).** The D-1 invariant also requires `per_variant_alpha * k_variants <= allocated_alpha`, compared exactly. Triage's CI uses `per_variant_alpha` (`:697`).
+- **R3-8 (the ≤ reading of A-3).** Signed as ruling amendment A-3a in `RULING_RA-9…:218ff`, not left to a code comment (domain edit 6 / round-2 gap 2).
+- **Noted, not built.** A class→horizon mapping (architect LOW: a NO-side record could register at 180). This is not a forking path, because the value is chosen before any data. It is deferred.
+
+**Confidence after round 2: HIGH.** Both round-2 peers find no design objection, and every remaining item is mechanical.
+
 ## Unchanged from r1
 - Option B: UNDECLARED legacy records fail closed.
 - RA-9f is split out.

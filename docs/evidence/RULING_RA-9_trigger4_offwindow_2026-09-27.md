@@ -219,6 +219,10 @@ Peers: the trading-bot-architect and the prediction-market-reviewer, each briefe
   - Every future re-arm-gating registration MUST pass `programme_alpha_override=0.025`.
   - A research-only hypothesis may keep the 0.05 default, but its result can NEVER gate a re-arm or feed an A1-class ruling.
   - Follow-up RA-8c: enforce this in code by refusing a re-arm-gating flag without the override.
+  - **A-3a (amendment 2026-09-27, LEDGER-V3 peer loop).** The bound is "≤ 0.025", not "exactly 0.025". A re-arm-gating registration MUST pass `programme_alpha_override` ≤ 0.025. A stricter α is conservative: it can only lower the FWER.
+    - Peers: prediction-market-reviewer (round 2: "defensible… get an explicit sign-off") and trading-bot-architect (round 2: exact comparison is sound).
+    - The code check is an exact float comparison with no tolerance (`allocated_alpha × MAX_HYPOTHESES ≤ 0.025`).
+    - Changing MAX_HYPOTHESES (4) requires re-deriving this bound in a ruling first.
 - **A-4 (domain: H-ARCHIVE-RECAL status).** Its registration status is `UNDERPOWERED_NOT_REGISTERED` (zero alpha). Its "accruing" refers only to EDGE-4's revival-trigger corpus tracking. The SEARCH forfeiture in §0 still binds that corpus.
 - **A-5 (C: AUD-12 stalls).** Any 180-day horizon **pauses** while every candidate row is forced to `MECHANISM_ONLY` by the AUD-12 validity gate. The pause ends on the day the RA-3 flag is flipped by its own ruling. This is recorded in the look schedule.
 - **A-6 (architect: a factual fix to §7 B-3).** `hypothesis-triage-run.sh` passes no `--horizon-days`. The 21-day default (`hypothesis_triage.py:88`) is what applies, and the defect stands.
