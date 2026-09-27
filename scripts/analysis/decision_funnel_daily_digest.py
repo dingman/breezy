@@ -18,15 +18,16 @@ The A1-open-age line is not implemented here; AUD-02's Amendment C is not in
 ``POST_FORECAST_PHASE_2026-09-20.md``, so AUD-03 §8's fallback applied (see
 ``docs/plans/backlog/AUDIT_2026-09-21/AUD-03-FOLLOWUP-a1-digest-line.md``).
 Its replacement -- a ``halt_enforced: yes|no|unknown`` field read from the
-SAME ``FAMILY_HALT_KEY`` the submit veto reads -- IS implemented here
+same legacy/family halt rows the submit veto reads -- IS implemented here
 (coordinator build decision, 2026-09-24): :func:`read_family_halt_status`
-opens its OWN read-only sqlite connection (``file:<path>?mode=ro``) directly
+delegates row access to :func:`read_family_halt_rows_readonly`, which opens
+its OWN read-only sqlite connection (``file:<path>?mode=ro``) directly
 against the exec-state store, never the node's exclusive submit-intent flock
 (``breezy.runtime.submit_intent.hold_submit_intent_process_lock``, held for
 the node's full process lifetime and therefore unusable by a periodic
 read-only digest -- see that test file for the two-connection proof). The
 decode itself is the single shared
-``breezy.strategy.current_rung_hold.trial_day_latch.decode_family_halt``
+``breezy.strategy.current_rung_hold.trial_day_latch.decode_family_halt_state``
 pure helper, never re-implemented here. Every read failure -- missing
 store, a lock that outlives ``_HALT_BUSY_TIMEOUT_SECONDS``, a malformed
 stored value, any exception -- reports ``unknown`` with a reason; this field

@@ -730,6 +730,15 @@ def register_hypothesis(
             f"hypothesis_id {hypothesis_id!r} is already registered -- refusing a duplicate intake"
         )
 
+    if programme_alpha_override is not None and (
+        isinstance(programme_alpha_override, bool)
+        or not isinstance(programme_alpha_override, (int, float))
+    ):
+        raise ValueError(
+            "programme_alpha_override must be an int or float, or None; "
+            f"got {programme_alpha_override!r}"
+        )
+
     programme_alpha = (
         PROGRAMME_ALPHA if programme_alpha_override is None else programme_alpha_override
     )
