@@ -367,16 +367,23 @@ def _passes_c_validity(row: ReplayResult) -> bool:
     return row.validity != REPLAY_VALIDITY and row.params_match is True
 
 
+def _bootstrap_iterations_for_alpha(alpha: float) -> int:
+    return max(_BOOTSTRAP_ITERATIONS, math.ceil(100.0 / alpha))
+
+
 def cluster_bootstrap_ci(
     means: Sequence[float],
     *,
     alpha: float,
-    iterations: int = _BOOTSTRAP_ITERATIONS,
+    iterations: int | None = None,
     seed: int = _BOOTSTRAP_SEED,
 ) -> tuple[float, float]:
     """Station-day cluster bootstrap of the mean. Whole station-days are
-    resampled, B=400, percentile interval at `alpha` (one-sided lower) and
-    `1 - alpha` (upper). A one-day sample is the point itself."""
+    resampled, B=max(400, ceil(100 / alpha)), percentile interval at `alpha`
+    (one-sided lower) and `1 - alpha` (upper). A one-day sample is the point
+    itself."""
+    if iterations is None:
+        iterations = _bootstrap_iterations_for_alpha(alpha)
     n = len(means)
     if n <= 0:
         raise ValueError("cluster bootstrap is undefined for an empty sample")

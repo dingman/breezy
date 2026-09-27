@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -19,6 +20,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts" / "analysis").as_posix())
 
+import hypothesis_triage as triage_module
 from hypothesis_register import (
     main as register_main,
 )
@@ -33,6 +35,7 @@ from hypothesis_triage import (
     _has_registered_draw_binding,
     append_hypothesis_evaluation,
     assert_look_permitted,
+    cluster_bootstrap_ci,
 )
 from hypothesis_triage import (
     run as triage_run,
@@ -359,6 +362,40 @@ def _triage_args(derived: Path, *, as_of: str = "2026-09-25") -> _Args:
         alert_log=None,
         attempt_hypothesis_id=None,
     )
+
+
+def test_bootstrap_iterations_resolve_tail_for_small_alpha() -> None:
+    assert triage_module._bootstrap_iterations_for_alpha(0.00625) == 16000
+    assert triage_module._bootstrap_iterations_for_alpha(0.25) == 400
+
+
+def test_cluster_bootstrap_default_uses_alpha_resolved_iterations() -> None:
+    means = tuple(index / 100.0 for index in range(12))
+
+    assert cluster_bootstrap_ci(means, alpha=0.00625, seed=12345) == cluster_bootstrap_ci(
+        means,
+        alpha=0.00625,
+        iterations=16000,
+        seed=12345,
+    )
+
+
+def test_cluster_bootstrap_seed_remains_deterministic() -> None:
+    means = tuple(index / 100.0 for index in range(12))
+
+    first = cluster_bootstrap_ci(means, alpha=0.00625, seed=20260925)
+    second = cluster_bootstrap_ci(means, alpha=0.00625, seed=20260925)
+
+    assert first == second
+
+
+def test_cluster_bootstrap_small_sample_runtime_sanity() -> None:
+    means = tuple(index / 100.0 for index in range(12))
+
+    started = time.perf_counter()
+    cluster_bootstrap_ci(means, alpha=0.00625, seed=20260925)
+
+    assert time.perf_counter() - started < 3.0
 
 
 def _registered_binding() -> tuple[str, ...]:
