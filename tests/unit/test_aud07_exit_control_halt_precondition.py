@@ -226,6 +226,23 @@ def test_BLOCKED_HALT_STATE_UNREADABLE_fires_when_the_reader_raises(tmp_path: Pa
     assert reading.verdict == BLOCKED_HALT_STATE_UNREADABLE
 
 
+def test_malformed_family_id_is_BLOCKED_HALT_STATE_UNREADABLE_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+
+    before = hashlib.sha256(store_path.read_bytes()).hexdigest()
+
+    for malformed_family_id in ("../x", "", "A B"):
+        reading = read_exit_control_halt_precondition(
+            store_path, malformed_family_id, now_ns=8,
+        )
+
+        assert reading.verdict == BLOCKED_HALT_STATE_UNREADABLE
+        assert hashlib.sha256(store_path.read_bytes()).hexdigest() == before
+
+
 def test_a_nonexistent_store_path_is_BLOCKED_HALT_STATE_UNREADABLE_and_creates_nothing(
     tmp_path: Path,
 ) -> None:
