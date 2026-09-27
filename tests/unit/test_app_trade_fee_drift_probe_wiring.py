@@ -43,7 +43,7 @@ from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
-from breezy.app.trade import run
+from breezy.app.trade import _FeeVerifiedHolder, run
 from breezy.runtime.health import AlertPayload
 from breezy.runtime.settings import (
     LIVE_OBSERVATIONS_VAR,
@@ -155,6 +155,7 @@ def test_wire_equal_to_the_registered_family_theta_agrees_with_no_alert_and_no_h
     class _Capture(RecordingNode):
         def run(self) -> None:
             (actor,) = _fee_drift_actors(self)
+            _register_clock(actor, TestClock())
             submit_veto = self.config.exec_clients[POLYMARKET_US_CLIENT_NAME].submit_veto
 
             async def _agreeing() -> Decimal:
@@ -308,7 +309,7 @@ def test_client_resolution_is_retried_each_probe_until_it_first_succeeds(
     """Item 3 (silent-failure-hunter review, 2026-09-25): a first-resolve
     failure must not be cached forever -- a data client that only becomes
     available after the first probe fire must be picked up by the NEXT one."""
-    fake_client = _FakeVenueHttpClient({FEE_COEFFICIENT_WIRE_KEY: "0.06"})
+    fake_client = _FakeVenueHttpClient({"market": {FEE_COEFFICIENT_WIRE_KEY: "0.06"}})
     monkeypatch.setattr(
         "breezy.app.trade.shared_polymarket_us_http_client",
         lambda venue_config, clock: fake_client,
@@ -325,6 +326,7 @@ def test_client_resolution_is_retried_each_probe_until_it_first_succeeds(
     class _Capture(RecordingNode):
         def run(self) -> None:
             (actor,) = _fee_drift_actors(self)
+            _register_clock(actor, TestClock())
             # No `data_engine` on this fake kernel yet -- the first fire
             # must fail closed to UNKNOWN, not raise.
             results["first"] = asyncio.run(actor.probe_once())
@@ -338,3 +340,80 @@ def test_client_resolution_is_retried_each_probe_until_it_first_succeeds(
     assert code == EXIT_OK
     assert results["first"] == "UNKNOWN"
     assert results["second"] == "AGREE", "resolution must be retried, not cached as a failure"
+
+
+# ---------------------------------------------------------------------------
+# EDGE-1 (r2/AM-2..4): the late-bound `_FeeVerifiedHolder` and its wiring
+# into the live composition root only.
+# ---------------------------------------------------------------------------
+
+
+def test_the_holder_starts_unbound_and_reads_as_unverified_before_the_probe_is_constructed() -> (
+    None
+):
+    holder = _FeeVerifiedHolder()
+
+    assert holder.is_fee_verified(0) is False
+
+
+def test_the_holder_is_bound_to_the_real_probes_is_fee_verified_after_composition(
+    tmp_path: Path,
+) -> None:
+    """AM-4: the holder is bound to the SAME actor the node registered --
+    proven by mutating the actor's own staleness state directly and
+    observing the composed strategy's `_fee_verified_check` reflect it live,
+    never a stale snapshot taken at bind time."""
+    code = run(env=_continuous_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    node = RecordingNode.instances[-1]
+    (actor,) = _fee_drift_actors(node)
+    strategies = node.trader.strategies
+    assert strategies
+    strategy = strategies[0]
+    assert strategy._fee_verified_check is not None
+
+    assert strategy._fee_verified_check(0) is False, "unverified until the first AGREE"
+    actor._last_agree_at_ns = 0
+    assert strategy._fee_verified_check(0) is True, (
+        "the holder must reflect the SAME actor's live state, not a snapshot"
+    )
+
+
+def test_the_live_composition_root_passes_a_non_none_fee_verified_check(
+    tmp_path: Path,
+) -> None:
+    """AM-2: the live path (`app/trade.py`) is the ONE caller that passes a
+    non-None check to `ContinuousRungHoldStrategy`."""
+    code = run(env=_continuous_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    node = RecordingNode.instances[-1]
+    strategies = node.trader.strategies
+    assert strategies
+    assert all(strategy._fee_verified_check is not None for strategy in strategies)
+
+
+def test_when_no_probe_is_built_the_holder_stays_unbound_and_vetoes_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AM-3: `_build_fee_drift_probe` returns `None` when no instrument
+    resolves for any composed station (`trade.py:318-324`) -- the holder
+    then stays unbound for the rest of the process's life, which reads as
+    permanently unverified. Safe: nothing is tradable either way."""
+    monkeypatch.setattr(
+        "breezy.app.trade._representative_fee_drift_slug", lambda strategies: None,
+    )
+
+    code = run(env=_continuous_env(tmp_path), node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    node = RecordingNode.instances[-1]
+    assert _fee_drift_actors(node) == [], "no probe should have been registered"
+    strategies = node.trader.strategies
+    assert strategies
+    strategy = strategies[0]
+    assert strategy._fee_verified_check is not None
+    assert strategy._fee_verified_check(0) is False, (
+        "an unbound holder must veto every entry, unconditionally"
+    )

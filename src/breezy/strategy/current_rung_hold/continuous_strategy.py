@@ -201,6 +201,11 @@ NO_SIDE_SHADOW_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
 _DIAG_OPEN_INTENT_WAIT: Final[str] = "open_intent_wait"
 #: Slice 4 item B1 (plan rev 6.1): the family-wide duplicate-fill halt WAIT.
 _DIAG_FAMILY_HALT: Final[str] = "family_halt_duplicate_fill"
+#: EDGE-1 (AM-4): the entry-only "fee unverified" staleness veto WAIT --
+#: distinct from `_DIAG_FAMILY_HALT` and from `self._fee_halt`'s own
+#: (unnamed, bare-`return`) `fee_schedule_mismatch` refusal. Never engages
+#: on the exit path (structurally untouched -- see `exit_wiring.py`).
+_DIAG_FEE_UNVERIFIED: Final[str] = "fee_unverified"
 #: Slice 4 item E1 (plan rev 6.1, Resolution F): a re-arm gate WAIT.
 _DIAG_REARM_WAIT: Final[str] = "rearm_wait"
 #: HF-4 Decision 1 (1B): a stale IN_FLIGHT marker was released this tick.
@@ -429,6 +434,7 @@ class ContinuousRungHoldStrategy(Strategy):
         shadow_rest_summary_dir: Path | None = None,
         diagnostics_summary: DiagnosticsSummarySink | None = None,
         build_sha: str = "unknown",
+        fee_verified_check: Callable[[int], bool] | None = None,
     ) -> None:
         """``phase0_permit_guard=True`` (default) keeps Phase 0's seal: a
         non-None ``order_submission_permit`` raises
@@ -439,6 +445,19 @@ class ContinuousRungHoldStrategy(Strategy):
         strategy never flips that default itself; only a caller (a
         composition root, or a test exercising the gated Phase 1 code paths
         directly) may.
+
+        ``fee_verified_check`` (EDGE-1, AM-2): ``None`` by default -- byte-
+        identical to before this parameter existed, and the shape every
+        paper-replay/test call site keeps (``ContinuousRungHoldBacktestStrategy``
+        never exposes this parameter at all, so it always inherits this
+        default). ``app/trade.py``'s live composition root is the ONE
+        caller that passes a non-None callable (a late-bound holder over
+        ``FeeDriftProbeActor.is_fee_verified``). When non-None, ``_hunt_tick``
+        calls it with ``self.clock.timestamp_ns()`` -- never
+        ``snapshot.ts_event`` (AM-1) -- immediately after the existing
+        ``is_family_halted()``/``self._fee_halt`` checks, and refuses a NEW
+        entry (never an exit -- structurally unreachable from
+        ``exit_wiring.py``) whenever it returns ``False``.
         """
         if phase0_permit_guard and order_submission_permit is not None:
             raise Phase0PermitForbiddenError(
@@ -497,6 +516,10 @@ class ContinuousRungHoldStrategy(Strategy):
         self._illegal_cell_station_days: set[tuple[str, str]] = set()
         self._eligible_snap_counts: dict[tuple[str, str], int] = {}
         self._fee_halt = False
+        #: EDGE-1 (AM-2): ``None`` means no check is configured -- every
+        #: entry tick is treated as fee-verified, byte-identical to before
+        #: this parameter existed. See the constructor docstring.
+        self._fee_verified_check = fee_verified_check
         self.offer_tape = offer_tape if offer_tape is not None else OfferTape(offer_tape_path)
         # De-dupe key for the LAST ask evaluated per instrument, so a WS frame
         # that yields BOTH a QuoteTick and an OrderBookDepth10 (identical
@@ -1831,6 +1854,24 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             return
         if self._fee_halt:
+            return
+        # EDGE-1 (AM-4): a DIFFERENT failure class from `self._fee_halt`
+        # above (which is set on a `fee_schedule_mismatch` decision refusal
+        # and never clears) -- this is the fee-DRIFT-PROBE's own staleness
+        # veto, entry-only. `self.clock.timestamp_ns()`, never
+        # `snapshot.ts_event` (AM-1: market-data time can lag wall time
+        # under feed backlog, which would understate elapsed time and
+        # fail-open). An unhandled exception here aborts this tick before
+        # submit -- fails closed, consistent with every other unwrapped
+        # check in this method.
+        if self._fee_verified_check is not None and not self._fee_verified_check(
+            self.clock.timestamp_ns()
+        ):
+            self.diagnostics.record(_DIAG_FEE_UNVERIFIED)
+            self._report_alerter(
+                self.diagnostics_alerter,
+                "continuous_rung_hold diagnostics report failed",
+            )
             return
         iid = str(snapshot.instrument_id)
         if iid in self._unjoinable_fill_instruments:
