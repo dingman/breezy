@@ -92,6 +92,21 @@ EnvironmentFile=-%h/.config/breezy/alerts.env
 # default and must be absolute -- src/breezy/runtime/settings.py:557-576.
 Environment=BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG=/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us
 
+# EDGE-6 6d (docs/plans/backlog/EDGE_2026-09-27/EDGE-6_ops_reliability_
+# plan_r2_2026-09-27.md section 2.4/4): an OPTIONAL operator override of the
+# adapter's native discovery-reload cadence
+# (data.py:1202-1204 -- an explicit `instrument_reload_interval_mins` wins
+# outright over the derived cadence). 15 minutes bounds the recorder's
+# capture lag on a newly-listed D+1 market to that window, versus the
+# ~5h13m lag measured under the derived cadence (which targets exact venue
+# boundaries, not a fixed poll). Recorder-only, on PURPOSE:
+# `breezy-trade-supervisor.service` also loads polymarket.env, and the live
+# node's cadence must not change, so this goes here as `Environment=`,
+# NEVER in polymarket.env (shared with the supervisor) -- see AM-3 in the
+# plan's r2 final amendment, and `test_trade_supervisor_unit_does_not_set_
+# discovery_reload_interval` in `tests/unit/test_quote_tape_unit_env.py`.
+Environment=POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS=15
+
 # Byte-identical to what the supervisors launch (tape_supervisor.sh:21-22,
 # tape_supervisor_k1.sh:31-32) and to the running recorder's
 # /proc/<pid>/cmdline. The explicit interpreter form is kept rather than the

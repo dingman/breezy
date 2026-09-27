@@ -1700,3 +1700,47 @@ and revert the commit. `portfolio_roi_report.py` treats an absent/stale
 snapshot directory as `NOT_CONFIGURED`/`UNAVAILABLE` (never inferred), so
 every window simply keeps its raw classification — rollback is total and
 fail-closed.
+
+## `breezy-quote-tape` — recorder discovery-reload override (EDGE-6 6d, 2026-09-27)
+
+Added one directive, `Environment=POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS=15`,
+to `breezy-quote-tape.service`. **Zero code change** — `data.py:1202-1204`
+(`_next_reload_delay_secs`) already treats an explicit
+`instrument_reload_interval_mins` as an OPTIONAL operator override that wins
+outright over the derived cadence, and `factories.py:145,283-297,325`
+(`config_from_env`) already reads it from this exact environment variable
+name. This is the Nautilus/adapter reload loop's own native extension
+point, reused rather than reimplemented.
+
+**Why.** The derived cadence targets exact venue boundaries on the
+currently-discovered market set, so a newly-listed D+1 market is not picked
+up until the next derived boundary — measured at ~5h13m after listing on
+09-26. 15 minutes bounds that capture lag to the same window, at the cost
+of 96 discovery GETs/day (vs ~4 today), well under the shared discovery
+quota.
+
+**Recorder-only, on purpose.** `breezy-quote-tape.service` and
+`breezy-trade-supervisor.service` both load `EnvironmentFile=
+/home/jon/.config/breezy/polymarket.env`. The override is an
+`Environment=` line in the recorder unit, **never** in `polymarket.env`:
+putting it in the shared file would change the live trade node's own
+reload cadence too. `tests/unit/test_quote_tape_unit_env.py` pins the
+directive's presence in the recorder unit and its absence from the
+supervisor unit. A count-only deploy check
+(`grep -c POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS
+~/.config/breezy/polymarket.env`, never printing the file's contents)
+must read 0 before and after this change — `polymarket.env` is host
+config, outside the repo, and is not a place this variable is ever
+expected.
+
+**Deploy:** merge, then `systemctl --user daemon-reload` — the running
+recorder does not pick this up until its next rotation-driven
+`try-restart` (never restart it ad hoc; see the "TRAP" section above and
+`breezy-quote-tape-rotate.service`). On that boot the recorder logs
+`discovery reload cadence: operator override, 15 minute(s)`
+(`quote_tape_cli.py:263-268`); the derived-cadence WARN
+("clamped to the ceiling of …") disappears because the derive path is
+bypassed entirely while the override is set.
+
+**Rollback:** remove the `Environment=` line, `daemon-reload`; the
+recorder returns to the derived cadence at its next rotation.
