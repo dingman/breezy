@@ -66,6 +66,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
+    BOOT_RETRY_READINESS_TIMEOUT,
     LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_READINESS_RECHECK_TIMEOUT,
@@ -79,6 +80,7 @@ from breezy.runtime.trade_supervisor_core import (
     SELF_CHECK_ESCALATION_STORE_KEY,
     SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS,
     SELF_CHECK_UTC,
+    SELF_CHECK_WINDOW_END_UTC,
     STOP_PRIOR_UTC,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
@@ -95,11 +97,13 @@ from breezy.runtime.trade_supervisor_core import (
     StopPriorAction,
     _trading_day,
     assert_no_live_node_before_intent_probe,
+    boot_retry_window_closed,
     classify_exit1_cause,
     continuous_family_check,
     continuous_family_halt_key,
     continuous_family_is_halted,
     continuous_family_startup_evidence_key,
+    decide_boot_retry,
     decide_launch_action,
     decide_midday_relaunch,
     decide_permit_alert,
@@ -120,6 +124,13 @@ from breezy.runtime.trade_supervisor_core import (
     permit_expiry_valid,
     permit_watch_window,
     readiness_observed,
+    record_boot_retry_attempt,
+    record_boot_retry_exhausted_alert_sent,
+    record_boot_retry_first_attempt_alert_sent,
+    record_boot_retry_nontransient_alert_sent,
+    record_boot_retry_not_ready_alert_sent,
+    record_boot_retry_window_closed_alert_sent,
+    record_boot_zero_instruments_seen,
     record_child_adopted,
     record_first_boot_permit_seen,
     record_midday_alert_sent,
@@ -142,6 +153,7 @@ from breezy.runtime.trade_supervisor_core import (
     self_check,
     self_check_gap_hours,
     strategy_subscribed_in,
+    zero_instruments_refusal_in,
 )
 
 logger = logging.getLogger(__name__)
@@ -579,10 +591,47 @@ def _proc_state_char(pid: int) -> str | None:
 # :func:`process_is_alive`. Adopted pids have no Popen and are not retained.
 _SPAWNED_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
 
+#: [FU-17] Distinct from ``_SPAWNED_CHILDREN`` above: NEVER popped by
+#: ``owned()`` -- a genuinely dead pid this supervisor spawned must still
+#: resolve as "owned" (see ``owned``'s own docstring). Pruned only at
+#: trading-day rollover by ``_prune_supervisor_spawned`` (bounded growth).
+_SUPERVISOR_SPAWNED: dict[int, subprocess.Popen[bytes]] = {}
+
 
 def _retain_spawned_child(proc: subprocess.Popen[bytes]) -> None:
     """Keep the Popen so ``poll``/``waitpid`` can reap it."""
     _SPAWNED_CHILDREN[proc.pid] = proc
+    _SUPERVISOR_SPAWNED[proc.pid] = proc
+
+
+def owned(pid: int, *, process_alive: Callable[[int], bool]) -> bool:
+    """[FU-17, AC16] True iff ``pid`` is a process THIS supervisor itself
+    spawned (recorded in ``_SUPERVISOR_SPAWNED`` by every spawn call site,
+    via :func:`_retain_spawned_child`), UNLESS our own ``Popen`` shows it
+    has already exited while the OS-level pid is somehow still alive (pid
+    reuse: whatever is now running at that pid is no longer ours, so this
+    returns ``False`` rather than falsely trusting a stale record). A
+    genuinely dead pid we spawned (``Popen.poll()`` non-``None`` AND the OS
+    agrees it is gone) is still ``owned`` -- boot-retry's entry guard relies
+    on recognizing its own, now-dead retry children."""
+    proc = _SUPERVISOR_SPAWNED.get(pid)
+    if proc is None:
+        return False
+    reused = proc.poll() is not None and process_alive(pid)
+    return not reused
+
+
+def _prune_supervisor_spawned() -> None:
+    """[FU-17, AM-4] Bounded growth: ``_SUPERVISOR_SPAWNED`` is never popped
+    by ``owned()`` itself (a genuinely dead pid must still resolve as
+    owned), so without this it would grow by one entry per boot-retry/
+    relaunch spawn forever. Called once per trading-day rollover
+    (``_do_stop_prior``, 16:40Z): drops every entry whose ``Popen`` has
+    already exited -- a live entry (still possibly polled by ``owned()``
+    today) is left alone."""
+    for pid, proc in list(_SUPERVISOR_SPAWNED.items()):
+        if proc.poll() is not None:
+            _SUPERVISOR_SPAWNED.pop(pid, None)
 
 
 def _reap_spawned_children() -> None:
@@ -981,6 +1030,10 @@ def _do_stop_prior(
     ``tracked_pid`` falls back to :func:`SupervisorPorts.find_node_pid`,
     same as when nothing was tracked at all.
     """
+    # [FU-17, AM-4] STOP_PRIOR fires at most once per trading-day rollover
+    # (16:40Z) -- the natural, once-daily hook for bounding
+    # `_SUPERVISOR_SPAWNED`'s growth.
+    _prune_supervisor_spawned()
     lock_path = intent_lock_path(store_path)
     tracked_pid_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
     discovered = tracked_pid if tracked_pid_alive else ports.find_node_pid()
@@ -1181,6 +1234,11 @@ def _do_relaunch_check(
     cause = classify_exit1_cause(log_text)
     if cause is not RelaunchCause.UNKNOWN:
         state = record_midday_cause_seen(state, now, cause)
+    # [FU-17] The ONLY call site that can ever set this latch for the
+    # ORIGINAL boot -- that child dies within the RELAUNCH_CHECK window,
+    # well before 17:00Z, so no later handler's read can be first to see it.
+    if zero_instruments_refusal_in(log_text):
+        state = record_boot_zero_instruments_seen(state, now)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),
@@ -1209,6 +1267,234 @@ def _do_relaunch_check(
     proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
     _retain_spawned_child(proc)
     return proc.pid, new_log, record_relaunch_attempt(state, now)
+
+
+def _do_boot_retry(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    repo_root: Path,
+    node_bin: Path,
+    log_dir: Path,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[FU-17] Dispatched instead of :func:`_do_midday_watch`'s ordinary body
+    whenever its entry guard (AC16) is satisfied -- a bounded, fixed-cadence
+    retry of a zero-instrument boot refusal, reusing every safety precheck
+    :func:`_do_launch` already performs (AC6) and minting an unrestricted,
+    never-clamped first-boot permit exactly like a normal 16:50Z LAUNCH
+    (AC10) -- see the plan's Hard-invariant cross-check for why this can
+    never collide with A-1's clamp on an ALREADY-observed permit.
+
+    **(a)** if a tracked child's log is known: read it, latch every fact
+    that read observes (subscribe/zero-instruments/cause/orders-not-
+    requested), and if a permit line is now seen, hand off PERMANENTLY to
+    the ordinary mid-day-relaunch path (AC11) -- also latching
+    ``readiness_observed`` when the lock/permit/subscribe three-way holds at
+    this exact poll (item H). If still alive, bound how long a never-ready
+    child is watched silently (AC8/AC9/AC18). If confirmed dead with a
+    non-``TRANSIENT`` latched cause, stop the retry path permanently
+    (AC13). **(b)** Reached when there is no tracked child at all, or the
+    child from (a) was just confirmed dead with a ``TRANSIENT`` cause:
+    apply the bounded attempt/gap budget (:func:`decide_boot_retry`); on
+    eligibility, perform one FINAL drain immediately before spawning
+    (AM-1 -- closes the TOCTOU window between step (a)'s read and its own
+    liveness check), then reuse :func:`decide_launch_action`/
+    :func:`_attempt_adoption` exactly as :func:`_do_launch` does.
+    """
+    watch_open_at = dt.datetime.combine(state.day, SELF_CHECK_WINDOW_END_UTC, tzinfo=dt.UTC)
+
+    if tracked_pid is not None and node_log is not None:
+        log_text = ports.read_log_new(node_log)
+        if strategy_subscribed_in(log_text):
+            state = record_strategy_subscribed_seen(state, now)
+        if zero_instruments_refusal_in(log_text):
+            state = record_boot_zero_instruments_seen(state, now)
+        permit_expiry_ns = parse_permit_expiry_ns(log_text)
+        if permit_expiry_ns is not None:
+            # [item H] Resolve readiness for the hand-off instant itself --
+            # nothing in the ordinary mid-day path this hand-off transfers
+            # control to ever gets a first chance to latch it for a child
+            # with no `last_midday_relaunch_attempt_at`.
+            holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
+            if readiness_observed(
+                holds_intent_lock=(holder == tracked_pid),
+                permit_issued=True,
+                strategy_subscribed=state.strategy_subscribed_seen,
+            ):
+                state = record_readiness_observed(state, now)
+            # [ruling 5] Both latches -- the per-child evidence latch AND
+            # the day-level first-boot anchor -- exactly like every other
+            # permit-observing call site.
+            state = record_permit_issued_seen(state, now, permit_expiry_ns)
+            state = record_first_boot_permit_seen(state, now, permit_expiry_ns)
+            log_decision("boot_retry_hand_off_to_midday_relaunch", pid=tracked_pid)
+            return tracked_pid, node_log, state
+
+        cause_from_read = classify_exit1_cause(log_text)
+        if cause_from_read is not RelaunchCause.UNKNOWN:
+            state = record_midday_cause_seen(state, now, cause_from_read)
+        if PERMIT_NOT_REQUESTED_MARKER in log_text:
+            state = record_orders_not_requested_seen(state, now)
+
+        if ports.process_alive(tracked_pid):
+            anchor = (
+                state.last_boot_retry_attempt_at
+                if state.last_boot_retry_attempt_at is not None
+                else watch_open_at
+            )
+            if (
+                not state.boot_retry_not_ready_alert_sent
+                and (now - anchor) > BOOT_RETRY_READINESS_TIMEOUT
+            ):
+                alert(
+                    ports.alert_sink,
+                    event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+                    severity="WARN",
+                    detail=AlertDetail.BOOT_RETRY_CHILD_NOT_READY,
+                )
+                state = record_boot_retry_not_ready_alert_sent(state, now)
+            return tracked_pid, node_log, state
+
+        cause = state.midday_cause_seen if state.midday_cause_seen is not None else cause_from_read
+        if cause is not RelaunchCause.TRANSIENT:
+            log_decision("boot_retry_child_nontransient_exit")
+            alert(
+                ports.alert_sink,
+                event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+                severity="CRITICAL",
+                detail=AlertDetail.BOOT_RETRY_CHILD_NONTRANSIENT_EXIT,
+            )
+            state = record_boot_retry_nontransient_alert_sent(state, now)
+            return None, node_log, state
+        # TRANSIENT -- fall through to (b).
+
+    elif tracked_pid is not None and ports.process_alive(tracked_pid):
+        # [item E, defense-in-depth] A live child whose log is unknown must
+        # never be misread as "no live child" -- unreachable via AC16's own
+        # outer guard today, kept so a future guard change cannot silently
+        # reopen this misread. Consumes no attempt, spawns nothing.
+        return tracked_pid, node_log, state
+
+    # (b) `tracked_pid` is None, or confirmed dead (TRANSIENT) above.
+    decision = decide_boot_retry(
+        now=now,
+        attempts_so_far=state.boot_retry_attempts,
+        last_attempt_at=state.last_boot_retry_attempt_at,
+    )
+    if not decision.should_relaunch:
+        log_decision("boot_retry_declined", reason=decision.reason)
+        exhausted = decision.reason == "attempt budget exhausted"
+        if exhausted and not state.boot_retry_exhausted_alert_sent:
+            alert(
+                ports.alert_sink,
+                event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+                severity="CRITICAL",
+                detail=AlertDetail.BOOT_RETRY_ATTEMPTS_EXHAUSTED,
+            )
+            state = record_boot_retry_exhausted_alert_sent(state, now)
+        return tracked_pid, node_log, state
+
+    # [AM-1] Final drain immediately before spawn, only after death is
+    # confirmed above -- catches a permit line written by the dying child
+    # AFTER step (a)'s own read but BEFORE its liveness check (a TOCTOU
+    # window `_do_relaunch_check` shares and does not itself close).
+    if node_log is not None:
+        final_log_text = ports.read_log_new(node_log)
+        state = latch_log_facts(state, now, final_log_text)
+        if state.first_boot_permit_expires_at_ns is not None:
+            log_decision("boot_retry_final_drain_caught_permit")
+            return tracked_pid, node_log, state
+
+    if state.boot_retry_attempts == 0:
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+            severity="WARN",
+            detail=AlertDetail.BOOT_RETRY_FIRST_ATTEMPT,
+        )
+        state = record_boot_retry_first_attempt_alert_sent(state, now)
+    # [decision F] The attempt is consumed regardless of the precheck
+    # outcome below -- clears per-child latches for the incoming child.
+    state = record_boot_retry_attempt(state, now)
+
+    lock_path = intent_lock_path(store_path)
+    lock_free = ports.intent_lock_free(lock_path)
+    open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
+    action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
+
+    if action is LaunchAction.REFUSE_LOCK_HELD:
+        adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
+        if adoption is not None:
+            pid, adopted_log = adoption
+            log_decision("boot_retry_adopted_live_node", pid=pid)
+            return pid, adopted_log, record_child_adopted(state, now)
+        log_decision("boot_retry_precheck_refused_lock_held")
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+            severity="WARN",
+            detail=AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_LOCK_HELD,
+        )
+        return tracked_pid, node_log, state
+
+    if action is LaunchAction.REFUSE_INTENT_OPEN:
+        log_decision("boot_retry_precheck_refused_intent_open")
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+            severity="CRITICAL",
+            detail=AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN,
+        )
+        return tracked_pid, node_log, state
+
+    new_log = node_log_path(log_dir, now)
+    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    _retain_spawned_child(proc)
+    log_decision("boot_retry_launched", pid=proc.pid)
+    return proc.pid, new_log, state
+
+
+def _do_boot_retry_window_closed_check(
+    *, ports: SupervisorPorts, state: DaySchedulerState, now: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17, r4->r5 ruling 2/3] A SEPARATE, unconditional per-tick check --
+    never a branch inside :func:`decide_boot_retry`/:func:`_do_boot_retry`,
+    which only run when a boot-retry poll is actually dispatched (never on
+    an ordinary "still alive" tick once a child is up). Closes the gap a
+    retry child that dies only after long, live intervals would otherwise
+    leave open: the 8-attempt budget never exhausting by day close, with no
+    terminal alert."""
+    if not boot_retry_window_closed(state, now):
+        return state
+    alert(
+        ports.alert_sink,
+        event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+        severity="CRITICAL",
+        detail=AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY,
+    )
+    return record_boot_retry_window_closed_alert_sent(state, now)
+
+
+def _dispatch_boot_retry_window_closed_check(
+    *, ports: SupervisorPorts, state: DaySchedulerState, now: dt.datetime
+) -> DaySchedulerState:
+    """[silent-failure-review A2 pattern] A containment layer around
+    :func:`_do_boot_retry_window_closed_check`, matching
+    :func:`_dispatch_permit_watch`'s own shape -- a fault here must never
+    stop the loop or skip the next phase dispatch."""
+    try:
+        return _do_boot_retry_window_closed_check(ports=ports, state=state, now=now)
+    except Exception as exc:  # noqa: BLE001 -- deliberate: see docstring.
+        log_decision(
+            "phase_exception_contained",
+            phase="boot_retry_window_closed",
+            error_type=type(exc).__name__,
+        )
+        return state
 
 
 def _do_midday_watch(
@@ -1253,7 +1539,57 @@ def _do_midday_watch(
     ``return None, node_log, state`` on decline, correct for boot since
     that window is genuinely over). Keeping the dead PID visible names it
     in every subsequent :func:`log_decision` line for operator diagnosis.
+
+    [FU-17, AC16] As the very FIRST statement: a zero-instrument boot day
+    with neither readiness nor any permit ever observed, and neither
+    terminal boot-retry alert already sent, dispatches to
+    :func:`_do_boot_retry` instead -- but ONLY when there is no tracked
+    child at all, or the tracked child is one THIS supervisor spawned
+    (:func:`owned`) with a KNOWN log. Any OTHER tracked pid (not owned by
+    this supervisor) falls through to this function's own unmodified body
+    below -- but that body's own top-of-function guard
+    (``tracked_pid is None or node_log is None``) means the fallthrough is
+    NOT symmetric across a known vs. an unresolved log path: a not-owned
+    pid with a KNOWN log reaches the body and independently fails closed
+    via its own ``first_boot_permit_expires_at_ns is None`` ->
+    ``CEILING_UNKNOWN`` branch once that child is later observed dead; a
+    not-owned pid with an UNRESOLVED log path (``node_log is None``) never
+    reaches that branch at all -- the body's own top-of-function guard
+    returns first, with no read and no alert. That second sub-case stays
+    silent, never a second unclamped spawn, until
+    :func:`boot_retry_window_closed`'s own terminal, once-per-day
+    ``BOOT_RETRY_WINDOW_CLOSED_NEVER_READY`` CRITICAL closes it at 01:00Z
+    (r5 ruling 3) -- never ``CEILING_UNKNOWN``.
     """
+    if (
+        state.boot_zero_instruments_seen
+        and not state.readiness_observed
+        and state.first_boot_permit_expires_at_ns is None
+        and not state.boot_retry_nontransient_alert_sent
+        and not state.boot_retry_exhausted_alert_sent
+        and (
+            tracked_pid is None
+            or (owned(tracked_pid, process_alive=ports.process_alive) and node_log is not None)
+        )
+    ):
+        return _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+            repo_root=repo_root,
+            node_bin=node_bin,
+            log_dir=log_dir,
+        )
+    # [AM-5] Once boot-retry has permanently terminated (either terminal
+    # CRITICAL already sent), no permit was ever observed by construction --
+    # falling through to the ordinary body below would re-derive and page
+    # `MIDDAY_RELAUNCH_CEILING_UNKNOWN` for the SAME already-alerted
+    # condition. Return unchanged instead: this spawns nothing either way.
+    if state.boot_retry_nontransient_alert_sent or state.boot_retry_exhausted_alert_sent:
+        return tracked_pid, node_log, state
     if state.midday_alert_sent:
         return tracked_pid, node_log, state
     if tracked_pid is None or node_log is None:
@@ -1664,6 +2000,11 @@ def _do_self_check(
             state = record_midday_cause_seen(state, now, live_cause)
         if PERMIT_NOT_REQUESTED_MARKER in log_text:
             state = record_orders_not_requested_seen(state, now)
+        # [FU-17, r4->r5 ruling 6] Same drain-safe placement as the two
+        # latches just above -- this handler's own read can be the first (or
+        # only) one to see the marker.
+        if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
+            state = record_boot_zero_instruments_seen(state, now)
         latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
         permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
         if latched_permit_expiry_ns is not None:
@@ -1980,6 +2321,16 @@ def _run_forever(
             iterations += 1
             now = clock()
             phase, _fire_at = next_due(now, state)
+            # [FU-17, r4->r5 ruling 2] Phase-independent -- runs exactly once
+            # per loop iteration regardless of which phase `next_due` just
+            # returned (including `Phase.NONE`), so this still fires after
+            # `next_due` starts returning `Phase.NONE` for the rest of the
+            # day past 01:00Z. The OLD idea of a post-dispatch-only site is
+            # unreachable once the `Phase.NONE` branch's own `continue`
+            # below is taken every remaining iteration.
+            state = _dispatch_boot_retry_window_closed_check(
+                ports=active_ports, state=state, now=now
+            )
 
             if phase is Phase.NONE:
                 # WP-0a review residual: a child SIGTERM'd at STOP_PRIOR is

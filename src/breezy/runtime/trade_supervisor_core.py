@@ -58,6 +58,15 @@ MIDDAY_MIN_RELAUNCH_GAP: Final[dt.timedelta] = dt.timedelta(minutes=5)
 #: forced extra relaunch attempt.
 MIDDAY_READINESS_RECHECK_TIMEOUT: Final[dt.timedelta] = dt.timedelta(minutes=2)
 
+#: [FU-17] Boot-retry's own budget/cadence -- independent of both the
+#: boot-time (MAX_RELAUNCH_ATTEMPTS/MIN_RELAUNCH_GAP) and mid-day
+#: (MIDDAY_MAX_RELAUNCH_ATTEMPTS/MIDDAY_MIN_RELAUNCH_GAP) budgets above.
+BOOT_RETRY_MAX_ATTEMPTS: Final[int] = 8
+BOOT_RETRY_MIN_GAP: Final[dt.timedelta] = dt.timedelta(minutes=15)
+#: How long a boot-retry child may stay alive without ever producing a
+#: permit-issued line before ``BOOT_RETRY_CHILD_NOT_READY`` WARNs once.
+BOOT_RETRY_READINESS_TIMEOUT: Final[dt.timedelta] = dt.timedelta(minutes=15)
+
 #: The console entry's required first positional argv token -- distinct from
 #: the node's own argv so ``pgrep -f`` can anchor on either without
 #: substring-matching the other [R8].
@@ -81,6 +90,32 @@ SUPERVISOR_ARGV_ANCHOR: Final[str] = f"{SUPERVISOR_ARGV_TOKEN}$"
 PERMIT_ISSUED_MARKER: Final[str] = "live-trading permit issued issued_at_ns="
 PERMIT_NOT_ISSUED_MARKER: Final[str] = "order submission permit not issued"
 TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
+
+#: [FU-17] The zero-instrument-refusal marker: `_zero_instruments_message`
+#: (`strategy/current_rung_hold/composition.py`) builds its whole message
+#: from these two constants, byte-identical to the pre-FU-17 literal. Kept
+#: in `runtime` (stdlib-only) so `composition.py` reaches DOWN to import
+#: them (a `strategy -> runtime` import, the direction the layers contract
+#: already permits) rather than `runtime` reaching up into `strategy`.
+ZERO_INSTRUMENTS_REFUSAL_PREFIX: Final[str] = "current_rung_hold: resolved 0 instruments for"
+ZERO_INSTRUMENTS_REFUSAL_SUFFIX: Final[str] = "; refusing to start"
+
+#: [FU-17, architect item 4] Prefix and suffix must appear on the SAME log
+#: line -- a whole-text substring check would false-match a prefix on one
+#: line and an unrelated suffix fragment on another. `composition.py`'s own
+#: skip/yesterday warnings carry a "resolved 0 instruments for" fragment but
+#: never the full, contiguous prefix (a station name interrupts it) and
+#: never the suffix; `settings.py`'s empty-site-set sentence carries the
+#: suffix fragment but never the prefix.
+_ZERO_INSTRUMENTS_REFUSAL_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    re.escape(ZERO_INSTRUMENTS_REFUSAL_PREFIX) + r".*" + re.escape(ZERO_INSTRUMENTS_REFUSAL_SUFFIX)
+)
+
+
+def zero_instruments_refusal_in(log_text: str) -> bool:
+    """True iff any single line of ``log_text`` carries the exact
+    zero-instrument refusal marker (prefix ... suffix, same line)."""
+    return any(_ZERO_INSTRUMENTS_REFUSAL_LINE_RE.search(line) for line in log_text.splitlines())
 
 #: [A-1, 2026-09-25] Injected by ``_do_midday_watch`` into a mid-day-relaunched
 #: child's environment, read by ``app/trade.py::main`` and passed to
@@ -288,6 +323,15 @@ class AlertDetail(str, Enum):
     PERMIT_UNVERIFIABLE = "permit_unverifiable"
     PERMIT_WATCH_EXCEPTION_CONTAINED = "permit_watch_exception_contained"
     PERMIT_NOT_REQUIRED_SHADOW = "permit_not_required_shadow"
+    #: [FU-17] Boot-retry path -- see ``decide_boot_retry``/``_do_boot_retry``
+    #: (``trade_supervisor.py``) and ``boot_retry_window_closed`` below.
+    BOOT_RETRY_ATTEMPTS_EXHAUSTED = "boot_retry_attempts_exhausted"
+    BOOT_RETRY_CHILD_NONTRANSIENT_EXIT = "boot_retry_child_nontransient_exit"
+    BOOT_RETRY_PRECHECK_REFUSED_LOCK_HELD = "boot_retry_precheck_refused_lock_held"
+    BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN = "boot_retry_precheck_refused_intent_open"
+    BOOT_RETRY_FIRST_ATTEMPT = "boot_retry_first_attempt"
+    BOOT_RETRY_CHILD_NOT_READY = "boot_retry_child_not_ready"
+    BOOT_RETRY_WINDOW_CLOSED_NEVER_READY = "boot_retry_window_closed_never_ready"
 
 
 class StopPriorAction(str, Enum):
@@ -312,13 +356,6 @@ class RelaunchCause(str, Enum):
     TRANSIENT = "transient"
     DETERMINISTIC = "deterministic"
     UNKNOWN = "unknown"
-
-
-class ExitConfigErrorCause(str, Enum):
-    """[R7b] Exit-2 is disambiguated by the intent flock, not the exit code."""
-
-    DUPLICATE_NODE = "duplicate_node"
-    CONFIG_ERROR = "config_error"
 
 
 class SelfCheckResult(str, Enum):
@@ -528,16 +565,13 @@ def classify_exit1_cause(log_text: str) -> RelaunchCause:
         return RelaunchCause.TRANSIENT
     if FATAL_MARKET_DATA_FAULT_MARKER in log_text or FATAL_EXEC_CLIENT_FAULT_MARKER in log_text:
         return RelaunchCause.TRANSIENT
+    # [FU-17] Purely additive, checked last: a zero-instrument boot refusal
+    # is a config/data-timing issue, not a code fault, but is retried the
+    # same way -- see `boot_zero_instruments_seen` for the DEDICATED latch
+    # that keys boot-retry eligibility, never this broader TRANSIENT bucket.
+    if zero_instruments_refusal_in(log_text):
+        return RelaunchCause.TRANSIENT
     return RelaunchCause.UNKNOWN
-
-
-def disambiguate_exit_config_error(*, lock_held: bool) -> ExitConfigErrorCause:
-    """[R7b] Exit code 2 is read off the intent flock, not the exit code
-    alone: held -> duplicate-node path (never retried); free -> config
-    error (retryable once before 17:00 UTC)."""
-    if lock_held:
-        return ExitConfigErrorCause.DUPLICATE_NODE
-    return ExitConfigErrorCause.CONFIG_ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -951,6 +985,36 @@ class DaySchedulerState:
     #: by :func:`record_child_adopted` for a new child, same as every other
     #: per-child evidence latch above.
     orders_not_requested_seen: bool = False
+    #: [FU-17] Day-level, monotonic latch set ONLY by a direct
+    #: ``zero_instruments_refusal_in`` check on a log read -- NEVER inferred
+    #: from ``classify_exit1_cause(...) is RelaunchCause.TRANSIENT``, which
+    #: also covers ``TRADING_NODE_FAILED_MARKER``/``FATAL_*`` and can fire on
+    #: a child that already minted a permit and traded. Never cleared by
+    #: :func:`record_child_adopted` -- once a day is a zero-instrument boot
+    #: day, it stays one for the rest of the day, regardless of which child
+    #: is currently tracked.
+    boot_zero_instruments_seen: bool = False
+    #: [FU-17] Boot-retry's own attempt/gap bookkeeping -- day-level,
+    #: independent of ``relaunch_attempts``/``midday_relaunch_attempts``.
+    boot_retry_attempts: int = 0
+    last_boot_retry_attempt_at: dt.datetime | None = None
+    #: [FU-17] Terminal, once-per-day CRITICAL latches for the boot-retry
+    #: path -- day-level, never cleared by :func:`record_child_adopted`.
+    boot_retry_exhausted_alert_sent: bool = False
+    boot_retry_nontransient_alert_sent: bool = False
+    #: [FU-17] Gates ``AlertDetail.BOOT_RETRY_FIRST_ATTEMPT`` WARN to once
+    #: per day -- day-level, checked before ``boot_retry_attempts`` is
+    #: bumped for the very first eligible attempt.
+    boot_retry_first_attempt_alert_sent: bool = False
+    #: [FU-17] Per-child latch: a boot-retry child that stays alive without
+    #: ever producing a permit-issued line for longer than
+    #: ``BOOT_RETRY_READINESS_TIMEOUT`` gets exactly one WARN. Cleared by
+    #: :func:`record_child_adopted` for the NEXT retry child, same shape as
+    #: ``midday_not_ready_alert_sent``.
+    boot_retry_not_ready_alert_sent: bool = False
+    #: [FU-17] Gates ``AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY`` to
+    #: once per day -- day-level, never cleared by :func:`record_child_adopted`.
+    boot_retry_window_closed_alert_sent: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -1020,9 +1084,12 @@ def next_due(now_utc: dt.datetime, state: DaySchedulerState) -> tuple[Phase, dt.
 
     watch_open_at = _at(effective.day, SELF_CHECK_WINDOW_END_UTC)
     watch_close_at = midday_watch_window_end(effective.day)
+    # [FU-17] The OR is nested INSIDE the existing three-way AND, never a
+    # top-level OR of two whole clauses -- a bare top-level OR would dispatch
+    # MIDDAY_WATCH before SELF_CHECK, and even before `launch_done`.
     if (
         effective.launch_done
-        and effective.readiness_observed
+        and (effective.readiness_observed or effective.boot_zero_instruments_seen)
         and watch_open_at <= now_utc < watch_close_at
     ):
         return Phase.MIDDAY_WATCH, watch_open_at
@@ -1088,6 +1155,7 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
         midday_not_ready_alert_sent=False,
         midday_readiness_recheck_done=False,
         orders_not_requested_seen=False,
+        boot_retry_not_ready_alert_sent=False,
     )
 
 
@@ -1264,6 +1332,125 @@ def decide_midday_relaunch(
     if last_attempt_at is not None and (now - last_attempt_at) < MIDDAY_MIN_RELAUNCH_GAP:
         return RelaunchDecision(False, "minimum inter-attempt gap not elapsed")
     return RelaunchDecision(True, "transient failure, within budget and window")
+
+
+def record_boot_zero_instruments_seen(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17] Idempotent day-level latch -- see
+    :attr:`DaySchedulerState.boot_zero_instruments_seen`'s own docstring."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_zero_instruments_seen:
+        return effective
+    return replace(effective, boot_zero_instruments_seen=True)
+
+
+def record_boot_retry_attempt(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    """[FU-17] Clears per-child evidence latches (via
+    :func:`record_child_adopted`) for the incoming retry child, then bumps
+    the INDEPENDENT boot-retry attempt/last-attempt bookkeeping. Never
+    touches ``boot_zero_instruments_seen``, ``first_boot_permit_expires_at_ns``,
+    ``relaunch_attempts``, or ``midday_relaunch_attempts``."""
+    effective = record_child_adopted(state, now_utc)
+    return replace(
+        effective,
+        boot_retry_attempts=effective.boot_retry_attempts + 1,
+        last_boot_retry_attempt_at=now_utc,
+    )
+
+
+def record_boot_retry_exhausted_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17] Idempotent day-level latch for ``BOOT_RETRY_ATTEMPTS_EXHAUSTED``."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_retry_exhausted_alert_sent:
+        return effective
+    return replace(effective, boot_retry_exhausted_alert_sent=True)
+
+
+def record_boot_retry_nontransient_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17] Idempotent day-level latch for ``BOOT_RETRY_CHILD_NONTRANSIENT_EXIT``."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_retry_nontransient_alert_sent:
+        return effective
+    return replace(effective, boot_retry_nontransient_alert_sent=True)
+
+
+def record_boot_retry_first_attempt_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17] Idempotent day-level latch for ``BOOT_RETRY_FIRST_ATTEMPT``."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_retry_first_attempt_alert_sent:
+        return effective
+    return replace(effective, boot_retry_first_attempt_alert_sent=True)
+
+
+def record_boot_retry_not_ready_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17] Idempotent PER-CHILD latch for ``BOOT_RETRY_CHILD_NOT_READY`` --
+    cleared by :func:`record_child_adopted` for the next retry child."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_retry_not_ready_alert_sent:
+        return effective
+    return replace(effective, boot_retry_not_ready_alert_sent=True)
+
+
+def record_boot_retry_window_closed_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[FU-17] Idempotent day-level latch for
+    ``BOOT_RETRY_WINDOW_CLOSED_NEVER_READY``."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.boot_retry_window_closed_alert_sent:
+        return effective
+    return replace(effective, boot_retry_window_closed_alert_sent=True)
+
+
+def decide_boot_retry(
+    *,
+    now: dt.datetime,
+    attempts_so_far: int,
+    last_attempt_at: dt.datetime | None,
+) -> RelaunchDecision:
+    """[FU-17] Boot-retry's own pure attempt/gap check -- deliberately no
+    ``window_end``/``cause``/``catalog_ready`` parameter: the window-close
+    case is handled entirely OUTSIDE this function, by the separate,
+    unconditional per-tick predicate :func:`boot_retry_window_closed`."""
+    if attempts_so_far >= BOOT_RETRY_MAX_ATTEMPTS:
+        return RelaunchDecision(False, "attempt budget exhausted")
+    if last_attempt_at is not None and (now - last_attempt_at) < BOOT_RETRY_MIN_GAP:
+        return RelaunchDecision(False, "minimum inter-attempt gap not elapsed")
+    return RelaunchDecision(True, "eligible")
+
+
+def boot_retry_window_closed(state: DaySchedulerState, now_utc: dt.datetime) -> bool:
+    """[FU-17, r4->r5 ruling 3 + disclosed fix] True once a boot-zero-
+    instruments day reaches ``midday_watch_window_end`` (01:00Z the next
+    day) with boot-retry still structurally eligible -- i.e. no readiness
+    or permit was ever observed, and neither terminal alert (exhausted,
+    non-transient-exit, or this alert itself) has already fired -- WITHOUT
+    the attempt budget ever having exhausted (one or more retry children
+    stayed alive long enough between deaths that fewer than
+    ``BOOT_RETRY_MAX_ATTEMPTS`` were consumed by day close). Also excludes a
+    day where the not-owned/known-log fall-through already alerted
+    ``MIDDAY_RELAUNCH_CEILING_UNKNOWN`` -- that branch's own alert is this
+    day's terminal signal; this predicate must not ALSO page for it."""
+    effective = _for_day(state, _trading_day(now_utc))
+    return (
+        effective.boot_zero_instruments_seen
+        and not effective.readiness_observed
+        and effective.first_boot_permit_expires_at_ns is None
+        and not effective.boot_retry_nontransient_alert_sent
+        and not effective.boot_retry_exhausted_alert_sent
+        and not effective.boot_retry_window_closed_alert_sent
+        and not effective.midday_ceiling_unknown_alert_sent
+        and now_utc >= midday_watch_window_end(effective.day)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1700,12 @@ def latch_log_facts(
         state = record_midday_cause_seen(state, now_utc, cause)
     if PERMIT_NOT_REQUESTED_MARKER in log_text:
         state = record_orders_not_requested_seen(state, now_utc)
+    # [FU-17, r4->r5 ruling 6] The identical per-site gap the 2026-09-25
+    # FU-1 fix already had to close once for `midday_cause_seen`/
+    # `orders_not_requested_seen` above: this latch must be wired at EVERY
+    # log-read site, not just `_do_relaunch_check`'s.
+    if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
+        state = record_boot_zero_instruments_seen(state, now_utc)
     return state
 
 
