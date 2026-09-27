@@ -2121,7 +2121,14 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # Inert attribute-method call on the already-parsed report; no I/O.
         "report.quantity.as_decimal",
         "self._declared_positions",
-        "instrument_id_to_slug",
+        # EDGE-2C plan (docs/plans/backlog/EDGE_2026-09-27/EDGE-2C_no_leg_
+        # resolver_crash_plan_r1_2026-09-27.md §5): the sanctioned slug/leg
+        # readers for EITHER leg's id -- pure symbology helpers, no I/O, no
+        # await, no sender reference. Replaces `instrument_id_to_slug`
+        # (removed below), which refuses a NO-leg id outright and crashed
+        # this coroutine (L-48).
+        "base_slug_of",
+        "leg_of",
         "_resolver_long_position_state",
         "self._clock.timestamp_ns",
         "self._resolve_terminal_zero",
