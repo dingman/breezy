@@ -78,6 +78,36 @@ Skipping the scan on a hit removes today's always-on content check. This counter
 - **Target:** warm census wall time of at most 600 s, leaving headroom inside the shared 1800 s budget for the runner and the proposal step.
 - Remove the orphan `/tmp/replay-sufficiency-census-*` directory once, as part of the rollout.
 
+## r3 amendments (round 2, BINDING; they override I-2, I-4, I-5 and I-10 where the two conflict)
+Round 2 results:
+- architect: REQUEST_CHANGES, with 3 blocking items. Each came with a concrete fix, and all three fixes are adopted below.
+- domain: ENDORSE-WITH-CHANGES.
+
+- **R3-A: replaces I-2's tail probe.** The architect checked real files: 0 of 4 closed recorder files end with the Arrow end-of-stream (EOS) marker, and the preflight never uses the marker (`feather_preflight.py:368-378`; test `test_a_kill_on_a_message_boundary_is_intact_without_an_end_of_stream_marker`).
+  - During a full scan, and only for a file with `consumed_bytes == size`, store `head_digest` (sha256 of the first 4 KiB) and `tail_digest` (sha256 of the last 4 KiB).
+  - On a cache hit, re-read those 8 KiB and compare. A mismatch counts as a MISS, which triggers a full scan.
+  - Add `st_ino` and `st_dev` to the file fingerprint, as the preflight memo does (`preflight_memo.py:29`).
+  - E8 is reworded to "head/tail digest mismatch".
+- **R3-B: replaces I-5.** This avoids a flock conflict: the wrapper holds `breezy-studies.lock` on an inherited fd 9 (`replay-daily-run.sh:87-88`), so a second lock on it in a new open file description fails with EWOULDBLOCK or deadlocks.
+  - The census instead takes a non-blocking lock on a sidecar file, `instance_spans.v2.jsonl.lock`, held for the whole run. The invariant it enforces is one writer per cache.
+  - If the lock is already held, the census **FAILS LOUDLY** with a nonzero exit and a stated reason. It never skips silently, because a silent skip would let the runner consume a stale census.
+  - No change to the wrapper.
+- **R3-C: replaces I-2's global epoch.** This avoids a weekly synchronized cold run.
+  - Each entry stores `last_full_scan` (a UTC date).
+  - An entry is due for a rescan when `today - last_full_scan >= 7`.
+  - A due entry is RESCANNED ONLY. If the rescan returns CLEAN with the same fingerprint, the cached spans are reused, with **no reconversion**, and `last_full_scan` is updated.
+  - Stagger: migrated v1 entries (I-10) and new entries get `last_full_scan = today - (sha256(instance_id) mod 7)` days. About 1/7 of the corpus therefore comes due on any day, from the first run onward.
+  - Test: with N entries at steady state, at most ceil(N/7)+1 rescans happen per run, and no entry goes unscanned for more than 7 days.
+- **R3-D: fixes the I-4 race.**
+  - Create `.lock` and flock it straight after `mkdtemp`.
+  - The sweeper skips any directory that has no `.lock`, or whose mtime is less than 300 s old.
+  - Both cases go into the I-4 test.
+- **R3-E: I-11, the domain round-2 requirement for threshold-proximate counts.** Before any ruling cites an EDGE-4 revival count or any other census-derived CONFIRM count, the cited count MUST come from a census run with `--no-instance-spans-cache` (an existing flag, census:650-653), and that run's provenance line must be quoted in the ruling.
+  - This is a governance rule. It needs no new code.
+  - It is added to the EDGE-4 revival procedure: an amendment line goes into `EDGE-4_DISPOSITION_2026-09-27.md` at implementation merge.
+
+**Confidence after round 2: HIGH.** Every blocking item has a precise reviewer-specified fix. The implementation review (python-reviewer + architect) must confirm R3-A to R3-D are implemented as written.
+
 ## Unchanged from r1
 - Option (a) is chosen; (b) and (c) are rejected.
 - No cap or timeout changes.
