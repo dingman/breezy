@@ -589,6 +589,13 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # own tags -- the SAME intra-module/inert shape as
                 # `DurableFillRecord` above; no I/O.
                 "_AdapterExitAuthorization",
+                # Widened 2026-09-27 (EDGE-2 AC9, slice A --
+                # docs/plans/backlog/EDGE_2026-09-27/EDGE-2_ambiguous_
+                # executions_resolver_plan_r3_2026-09-27.md): a second,
+                # independent parse of the create-response body on the
+                # with-id AMBIGUOUS branch (AC3) -- pure, read-only over
+                # already-received bytes, no `await`, no network.
+                "submit_chain.create_fill_evidence",
             }
         ),
         widened=frozenset(
@@ -652,7 +659,12 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         "Widened 2026-09-14 (daily-budget day stop, plan D1): "
         "`self._mark_budget_exhausted` -- one inert synchronous "
         "local-store write in the ledger/permit dollar-ceiling except "
-        "arms; no await, no network.",
+        "arms; no await, no network. Widened 2026-09-27 (EDGE-2 AC9, "
+        "slice A, docs/plans/backlog/EDGE_2026-09-27/"
+        "EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md): "
+        "`submit_chain.create_fill_evidence` -- a second, independent, "
+        "read-only parse of the create-response body on the with-id "
+        "AMBIGUOUS branch; no await, no network.",
     ),
     RulePin(
         module="firewall",
