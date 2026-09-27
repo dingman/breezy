@@ -1604,3 +1604,21 @@ A worktree isolates the checked-out files and the index. It does not isolate:
 - After every implementer returns, and before merging, the coordinator runs `git stash list` (must be empty), `git status -s` on every live worktree, and an import smoke of the shared venv (`python -c "import nautilus_trader, breezy, pyarrow"`, versions unchanged).
 
 Related: L-50 (shared read-modify-write state), [[never-uv-sync-the-shared-venv]], [[never-git-stash-in-a-shared-tree]], [[worktree-needs-pythonpath]].
+
+## L-52 — A corroborating read is evidence only if it can tell the outcomes apart at the time it is read (2026-09-27)
+
+### What happened
+- EDGE-2: the resolver retired an AMBIGUOUS order as zero-fill on a positions read. Once a market has settled, its position leaves the page, so an empty positions page cannot tell "never filled" from "filled and settled".
+- The same pattern turned up in three more places:
+  - a create-response body whose fill rows were skipped;
+  - a cross-process fill that no daily budget charged;
+  - a supervisor adoption read that returned nothing and was treated as "no permit".
+
+### The rule
+Before a read can retire, clear, or credit anything, state which outcomes it can distinguish at the moment it runs (settled vs. unsettled, same-day vs. past-day, read-failed vs. read-empty). A read that collapses two outcomes into one value must leave the state AMBIGUOUS or UNKNOWN, never terminal.
+
+### How to apply
+- Name the distinguishing evidence in the plan, and test each collapsed case explicitly. For example: an unreadable index means stays AMBIGUOUS; completeness counts only at eof; an I/O failure means retry, never absent.
+- A new detector must ship with its delivery path, proven end to end (09-20 alerts-reach-nobody).
+
+Related: L-36 (strict ZERO_FILL is unreachable), EDGE-2 plan r3, `AMBIGUOUS_ORDER_2026-09-23_MIA/README.md`, SUP-ADOPT-PERMIT.
