@@ -17,6 +17,7 @@ import pytest
 from breezy.analysis.hypothesis_ledger import (
     EVIDENCED_FEE_THETA,
     HYPOTHESIS_LEDGER_SCHEMA_VERSION,
+    HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
     MAX_HYPOTHESES,
     MAX_SINGLE_DAY_LEG_SHARE,
     MAX_VARIANTS_PER_HYPOTHESIS,
@@ -26,9 +27,12 @@ from breezy.analysis.hypothesis_ledger import (
     VARIANCE_BOUND,
     DuplicateHypothesisIdError,
     DuplicateHypothesisLedgerRecordError,
+    DuplicateStratumAxisError,
+    HypothesisLedgerRecordError,
     HypothesisLook,
     HypothesisRecord,
     InvalidLookPolicyError,
+    MalformedStratumRangeError,
     MdeMismatchError,
     NonMeanStationDayStatisticError,
     NonPinnedLegShareCapError,
@@ -37,8 +41,10 @@ from breezy.analysis.hypothesis_ledger import (
     PowerPrimaryOnlyRequiredError,
     ProgrammeBudgetExhaustedError,
     StaleFeeThetaError,
+    StratumFilterCountMismatchError,
     UnjustifiedVarianceBoundError,
     UnknownHypothesisLedgerSchemaError,
+    UnknownStratumAxisError,
     VariantCountCeilingExceededError,
     alpha_remaining,
     break_even,
@@ -46,6 +52,7 @@ from breezy.analysis.hypothesis_ledger import (
     filter_zero_take_station_days,
     is_variant_eligible,
     max_single_day_leg_share,
+    parse_stratum_filter,
     pooled_net_pnl_per_contract,
     programme_budget_remaining,
     read_hypothesis_ledger,
@@ -59,6 +66,8 @@ from breezy.settlement.current_rung_hold_v2 import CombinedDraw, StratumRow, com
 
 REGISTERED_AT = "2026-09-25"
 FREEZE_COMMIT = "abc1234"
+FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "hypothesis"
+LIVE_LEDGER_V1_FIXTURE = FIXTURES_DIR / "hypothesis_ledger_v1_2026-09-27.jsonl"
 
 
 def _mde_for(k_variants: int, min_station_days: int) -> float:
@@ -510,3 +519,161 @@ def test_duplicate_hypothesis_id_on_disk_is_a_hard_error(tmp_path: Path) -> None
     path.write_text(line + "\n" + line + "\n", encoding="utf-8")
     with pytest.raises(DuplicateHypothesisLedgerRecordError):
         read_hypothesis_ledger(path)
+
+
+# --------------------------------------------------------------------------
+# RA-2 (EDGE-5, 2026-09-27): schema-v2 hypothesis/variant -> stratum binding
+# --------------------------------------------------------------------------
+
+
+_VALID_FILTER = "station=SFO|hour_lst=10-11|side=YES|composition_kind=taker"
+
+
+def test_read_hypothesis_ledger_accepts_v1_and_v2_and_refuses_v3(tmp_path: Path) -> None:
+    v1_record = register_hypothesis(**_valid_kwargs(hypothesis_id="H-V1"))
+    v2_record = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-V2",
+            k_variants=1,
+            variant_stratum_filters=(_VALID_FILTER,),
+        )
+    )
+    assert v2_record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+    path = tmp_path / "hypothesis_ledger.jsonl"
+    write_hypothesis_ledger(path, (v1_record, v2_record))
+    round_tripped = {r.hypothesis_id: r for r in read_hypothesis_ledger(path)}
+    assert round_tripped["H-V1"].schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION
+    assert round_tripped["H-V2"].schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+    assert round_tripped["H-V2"].variant_stratum_filters == (_VALID_FILTER,)
+
+    bad_path = tmp_path / "v3_ledger.jsonl"
+    bad_path.write_text(json.dumps({"schema_version": 3}) + "\n", encoding="utf-8")
+    with pytest.raises(UnknownHypothesisLedgerSchemaError) as excinfo:
+        read_hypothesis_ledger(bad_path)
+    message = str(excinfo.value)
+    assert "3" in message
+    assert "1" in message and "2" in message
+
+
+def test_v1_record_round_trip_is_byte_unchanged(tmp_path: Path) -> None:
+    original_bytes = LIVE_LEDGER_V1_FIXTURE.read_bytes()
+    path = tmp_path / "hypothesis_ledger.jsonl"
+    path.write_bytes(original_bytes)
+    records = read_hypothesis_ledger(path)
+    assert len(records) == 3
+    assert all(record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION for record in records)
+    assert all(record.variant_stratum_filters == () for record in records)
+    write_hypothesis_ledger(path, records)
+    assert path.read_bytes() == original_bytes
+
+
+def test_v1_record_to_dict_never_emits_variant_stratum_filters() -> None:
+    record = register_hypothesis(**_valid_kwargs(hypothesis_id="H-V1-DICT"))
+    assert record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION
+    payload = record.to_dict()
+    assert "variant_stratum_filters" not in payload
+
+
+def test_v2_record_to_dict_emits_its_own_variant_stratum_filters() -> None:
+    record = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-V2-DICT",
+            k_variants=1,
+            variant_stratum_filters=(_VALID_FILTER,),
+        )
+    )
+    payload = record.to_dict()
+    assert payload["schema_version"] == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+    assert payload["variant_stratum_filters"] == [_VALID_FILTER]
+
+
+def test_mixed_v1_v2_whole_file_rewrite_leaves_existing_v1_lines_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """`write_hypothesis_ledger` rewrites the WHOLE file -- adding one new v2
+    record must not perturb the pre-existing v1 lines' own bytes."""
+    original_bytes = LIVE_LEDGER_V1_FIXTURE.read_bytes()
+    path = tmp_path / "hypothesis_ledger.jsonl"
+    path.write_bytes(original_bytes)
+    existing = read_hypothesis_ledger(path)
+
+    new_v2 = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-ZZZ-NEW-V2",
+            k_variants=1,
+            existing_records=existing,
+            variant_stratum_filters=(_VALID_FILTER,),
+        )
+    )
+    write_hypothesis_ledger(path, (*existing, new_v2))
+
+    rewritten_lines = path.read_text(encoding="utf-8").splitlines()
+    original_lines = original_bytes.decode("utf-8").splitlines()
+    # H-ZZZ-NEW-V2 sorts after all 3 existing ids (H-ARCHIVE.., H-FORECAST..,
+    # H-NO-SIDE..) -- write_hypothesis_ledger orders by hypothesis_id.
+    assert rewritten_lines[:3] == original_lines
+    assert len(rewritten_lines) == 4
+    assert json.loads(rewritten_lines[3])["hypothesis_id"] == "H-ZZZ-NEW-V2"
+
+    round_tripped = read_hypothesis_ledger(path)
+    ids = {r.hypothesis_id for r in round_tripped}
+    assert ids == {r.hypothesis_id for r in existing} | {"H-ZZZ-NEW-V2"}
+
+
+def test_variant_stratum_filter_rejects_unknown_axis() -> None:
+    with pytest.raises(UnknownStratumAxisError):
+        parse_stratum_filter("planet=Mars|hour_lst=ALL|side=YES|composition_kind=taker")
+
+
+def test_variant_stratum_filter_rejects_malformed_range() -> None:
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=14-10|side=YES|composition_kind=taker")
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=25|side=YES|composition_kind=taker")
+    with pytest.raises(MalformedStratumRangeError):
+        parse_stratum_filter("station=SFO|hour_lst=not-a-range|side=YES|composition_kind=taker")
+
+
+def test_variant_stratum_filter_rejects_duplicate_axis() -> None:
+    with pytest.raises(DuplicateStratumAxisError):
+        parse_stratum_filter("station=SFO|station=MDW|hour_lst=ALL|side=YES|composition_kind=taker")
+
+
+def test_variant_stratum_filter_accepts_a_well_formed_spec() -> None:
+    parsed = parse_stratum_filter(_VALID_FILTER)
+    assert parsed.station == "SFO"
+    assert parsed.hour_lst == "10-11"
+    assert parsed.side == "YES"
+    assert parsed.composition_kind == "taker"
+
+
+def test_register_hypothesis_variant_stratum_filters_count_mismatch_is_refused() -> None:
+    with pytest.raises(StratumFilterCountMismatchError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-COUNT-MISMATCH",
+                k_variants=2,
+                variant_stratum_filters=(_VALID_FILTER,),
+            )
+        )
+
+
+def test_register_hypothesis_variant_stratum_filters_refused_for_closed_disposition() -> None:
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            hypothesis_id="H-CLOSED-FILTERS",
+            hypothesis_class="FORECAST_TAKER",
+            registered_at=REGISTERED_AT,
+            k_variants=1,
+            freeze_commit=FREEZE_COMMIT,
+            existing_records=(),
+            disposition="CLOSED",
+            variant_stratum_filters=(_VALID_FILTER,),
+        )
+
+
+def test_v1_from_dict_refuses_an_unexpected_variant_stratum_filters_key() -> None:
+    record = register_hypothesis(**_valid_kwargs(hypothesis_id="H-V1-EXTRA"))
+    payload = {**record.to_dict(), "variant_stratum_filters": [_VALID_FILTER]}
+    with pytest.raises(HypothesisLedgerRecordError):
+        HypothesisRecord.from_dict(payload)
