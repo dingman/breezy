@@ -3584,6 +3584,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_position_monitor_nightly_report.py",
         "tests/unit/test_continuous_rung_hold_no_only_hunt_2026_09_24.py",
         "tests/unit/test_no_leg_mark_fidelity.py",
+        # EDGE-2 plan r3 slice B (AC6/AC6b) adds one: `test_edge2_ac6b_
+        # cross_process_fill_budget.py` imports `exec.client` directly to
+        # drive `_resolve_accept_fill`/`_resolve_terminal_zero`/`record_fill`/
+        # `_seed_spend_from_durable_fills` against real rigs. WIDENED, not
+        # relaxed (L-6/L-12): the comparison is still `==`; the module
+        # carries no `SOCKET_RESTORING_MARKERS`, reuses the SAME injected
+        # fakes (`_FakeOrderSender`/`_PrivateReadStub`) every sibling exec
+        # suite already uses, and never opens a socket.
+        "tests/unit/test_edge2_ac6b_cross_process_fill_budget.py",
     }
 
 

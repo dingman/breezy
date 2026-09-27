@@ -720,8 +720,10 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     old(33) -> new(34) by the position-shape ruling
     (`docs/evidence/RULING_no_side_position_shape_2026-09-16.md`):
     `_map_position` gained one new fail-closed refusal for a NO-leg
-    holding whose NO instrument is not loaded. Never relaxed, only
-    widened (L-12).
+    holding whose NO instrument is not loaded. Widened AGAIN old(34) ->
+    new(35) by EDGE-2 plan r3 (AC6b): `_resolve_accept_fill` gained a
+    third `self._refuse(_RESOLVER_FILL_UNBUDGETED)` site, the cross-process
+    unbudgeted-fill latch. Never relaxed, only widened (L-12).
 
     The authoritative, triaged inventory is
     `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`,
@@ -739,7 +741,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 34
+    assert count == 35
 
 
 @pytest.mark.asyncio

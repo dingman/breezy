@@ -340,6 +340,8 @@ from breezy.persistence.exit_tags import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from datetime import date
+
     from nautilus_trader.cache.cache import Cache
     from nautilus_trader.common.component import LiveClock, MessageBus
     from nautilus_trader.common.providers import InstrumentProvider
@@ -368,6 +370,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "BUDGET_EXHAUSTED_KEY_PREFIX",
     "BUDGET_RESTORE_KEY_PREFIX",
+    "FILL_BY_DAY_KEY_PREFIX",
     "FILL_INDEX_KEY_PREFIX",
     "FILL_KEY_PREFIX",
     "RESOLVER_CONTEXT_KEY_PREFIX",
@@ -399,6 +402,23 @@ FILL_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill/"
 #: Instrument -> the venue order ids whose fill records belong to it. Needed
 #: because the store has no prefix scan; see the module docstring.
 FILL_INDEX_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_index/"
+
+#: AC6b/G4 (EDGE-2 plan r3, D9): ``<UTC day of DurableFillRecord.ts_event>``
+#: -> the venue order ids whose fill records were written for that day, a
+#: CANDIDATE set only (``record.ts_event`` is the sole authority on which
+#: day a record actually belongs to -- a stale entry here is harmless,
+#: filtered by the same day check the per-instrument walk already applies).
+#: Exists because the boot-time spend seed (`_seed_spend_from_durable_fills`)
+#: otherwise walks only `self._instrument_provider.list_all()`, and a
+#: resolver fill resolved against a PAST-DAY instrument (the past-day loader
+#: adds its instrument to `self._cache` only, never to the provider) is
+#: reachable through no other index -- the store has no prefix scan. Written
+#: INLINE inside :meth:`record_fill`, after the per-instrument
+#: `FILL_INDEX_KEY_PREFIX` entry and before `FILL_BY_FINGERPRINT_KEY_PREFIX`,
+#: for the same reason that entry is inline (see its own docstring below):
+#: this module's own E0-NOSEND-RESOLVER invariant permits no separate
+#: `self._store_set` callee from a scanned resolver coroutine.
+FILL_BY_DAY_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_by_day/"
 
 #: SP-3r: ``<UTC day>:<intent_fingerprint>`` -> the venue order id whose
 #: fill record it names. Written INLINE inside :meth:`record_fill` (never as
@@ -677,6 +697,26 @@ _FEE_UNRECONCILED: Final[str] = (
 _VENUE_ID_MAP_WRITE_FAILED: Final[str] = (
     "the venue order id -> client order id map write raised; this client "
     "refuses further submits until an operator investigates"
+)
+
+#: AC6b (EDGE-2 plan r3, D8/D9): a cross-process BUY fill resolved by
+#: `_resolve_accept_fill` AFTER this process's own boot spend-seed
+#: (`_seed_spend_from_durable_fills`) has already run. `booking is None`
+#: means a PRIOR process took the booking this resolver pass is finishing;
+#: `self._spend_seeded` means that walk already totalled today's fills
+#: before this record existed, so it cannot have counted it -- the daily
+#: budget would silently under-count unless this client stops trading until
+#: a respawn's fresh seed reads `FILL_BY_DAY_KEY_PREFIX` and books the
+#: record. A fill resolved BEFORE the seed ran is exempt (the seed counts
+#: it, D8); every exit fill (`context.order_side == "SELL"`) is exempt too
+#: (it spends no budget). ONE fixed reason so `_refuse` dedupes on it, the
+#: same shape as `_FILL_WRITE_FAILED`/`_VENUE_ID_MAP_WRITE_FAILED` above --
+#: no amount, no venue order id, in the reason string itself.
+_RESOLVER_FILL_UNBUDGETED: Final[str] = (
+    "a cross-process fill was resolved after this process's boot spend seed "
+    "already ran; the daily budget cannot account for it until a respawn "
+    "reseeds from today's fill index; this client refuses further submits "
+    "until then"
 )
 
 #: INC-E2c: an exit-tagged order reached this coroutine with no
@@ -1535,6 +1575,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # guards against.
         self._resolver_instrument_load_attempted_ns: dict[str, int] = {}
         self._intent_reconciled: bool = False
+        # AC6b (EDGE-2 plan r3, D8): set `True` immediately after
+        # `_seed_spend_from_durable_fills()` returns in `_connect`, with no
+        # `await` between -- so every resolver-path fill this process ever
+        # records is exactly one of two things: visible to the seed (this
+        # flag still `False`), or refused as unbudgeted (this flag already
+        # `True`). Never reset: the seed itself is idempotent per process
+        # (`DailySpendLedger._seeded`, `_SEEDED_PERMIT_BUDGETS`), so a fill
+        # found after a SECOND `_connect()` in the same process must still
+        # refuse -- the seed will not re-walk it.
+        self._spend_seeded: bool = False
         # Resolution A/E (plan rev 6.1): the live `SpendBooking` for a
         # with-id AMBIGUOUS intent, held ONLY for same-process true-up.
         # Restart re-entry finds this dict empty (the ledger died too) and
@@ -1821,6 +1871,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # read below -- a mid-day relaunch must not re-grant budget a
             # prior process in this same calendar day already spent.
             self._seed_spend_from_durable_fills()
+            # AC6b (EDGE-2 plan r3, D8): the NEXT statement, no `await`
+            # between -- a fill the resolver's own immediate pass above
+            # already recorded (before this line runs) was necessarily
+            # visible to the seed call directly above; a fill recorded by
+            # ANY later resolver pass in this process (periodic, or a
+            # second `_connect`) cannot have been, and must refuse.
+            self._spend_seeded = True
             # NO-SIDE S5 (E3-8/E4-1/E4-5): the equivalent boot-time trigger
             # for the bounded first-order containment window -- runs
             # immediately AFTER the spend seed (same walk target: today's
@@ -1929,25 +1986,63 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
         self._intent_reconciled = True
 
+    def _seed_candidate_ids(self, today: date) -> list[str]:
+        """AC6b/G4 (EDGE-2 plan r3, D9): every venue order id
+        :meth:`_seed_spend_from_durable_fills` must consider -- the
+        per-instrument ``FILL_INDEX_KEY_PREFIX`` walk over every instrument
+        this client's provider has loaded (unchanged), followed by today's
+        ``FILL_BY_DAY_KEY_PREFIX`` index, so a fill recorded against a
+        PAST-DAY instrument the provider never loaded (the past-day loader
+        populates only ``self._cache``) is still reachable.
+
+        Not de-duplicated here: the caller's own ``seen`` set is the single
+        de-dupe point, exactly as it already was for the provider walk
+        alone -- an id reachable through BOTH walks is still counted once.
+
+        Fails CLOSED exactly like the caller: an unreadable index of
+        EITHER kind raises immediately rather than silently walking a
+        partial set.
+        """
+        candidate_ids: list[str] = []
+        for instrument in self._instrument_provider.list_all():
+            instrument_id = str(instrument.id)
+            index_key = f"{FILL_INDEX_KEY_PREFIX}{instrument_id}"
+            indexed = self._read_fill_index(index_key)
+            if indexed is None:
+                raise PolymarketUSError(
+                    f"the durable fill index at {index_key!r} could not be read; "
+                    "the boot-time spend seed refuses to arm on an incomplete walk"
+                )
+            candidate_ids.extend(indexed)
+        day_index_key = f"{FILL_BY_DAY_KEY_PREFIX}{today.isoformat()}"
+        day_indexed = self._read_fill_index(day_index_key)
+        if day_indexed is None:
+            raise PolymarketUSError(
+                f"the durable day-fill index at {day_index_key!r} could not be "
+                "read; the boot-time spend seed refuses to arm on an incomplete walk"
+            )
+        candidate_ids.extend(day_indexed)
+        return candidate_ids
+
     def _seed_spend_from_durable_fills(self) -> None:
         """S0 (plan rev 3, R3-1): book today's already-spent USD into the
         daily ledger and the permit's session budget before anything can
         arm.
 
-        Walks the SAME per-instrument ``FILL_INDEX_KEY_PREFIX`` index
-        :meth:`record_fill`/``iter_fill_records`` already maintain, over
-        every instrument this client's provider has loaded -- summing
+        Walks every instrument this client's provider has loaded, plus
+        today's day index (:meth:`_seed_candidate_ids`) -- summing
         ``DurableFillRecord.cumulative_cost`` for records whose ``ts_event``
         falls in today's UTC calendar day, de-duplicated per
         ``venue_order_id`` (the create and resolver paths overwrite the same
-        key, so one order is counted once).
+        key, and an id reachable through both walks is still one order, so
+        one order is counted once).
 
-        **Fails CLOSED.** ``_read_fill_index`` returning ``None`` for ANY
-        ONE instrument -- a per-instrument corruption, not only a wholesale
-        walk exception -- or a fill index naming a record this store cannot
-        produce, RAISES. Left uncaught, this propagates to ``_connect``'s
-        own fault latch, which records the fault and requests a native
-        shutdown: the same direction ``_run_never_arm_walk``'s
+        **Fails CLOSED.** ``_seed_candidate_ids`` raising -- a per-instrument
+        or day-index corruption, not only a wholesale walk exception -- or a
+        fill index naming a record this store cannot produce, propagates
+        unchanged. Left uncaught, this reaches ``_connect``'s own fault
+        latch, which records the fault and requests a native shutdown: the
+        same direction ``_run_never_arm_walk``'s
         ``_POSITION_FILL_WALK_UNREADABLE`` path takes, one layer up.
 
         **Never reads or logs an operator-control value.** The only inputs
@@ -1966,30 +2061,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         seen: set[str] = set()
         total = Decimal(0)
         count = 0
-        for instrument in self._instrument_provider.list_all():
-            instrument_id = str(instrument.id)
-            index_key = f"{FILL_INDEX_KEY_PREFIX}{instrument_id}"
-            indexed = self._read_fill_index(index_key)
-            if indexed is None:
+        for venue_order_id in self._seed_candidate_ids(today):
+            if venue_order_id in seen:
+                continue
+            seen.add(venue_order_id)
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+            if raw is None:
                 raise PolymarketUSError(
-                    f"the durable fill index at {index_key!r} could not be read; "
-                    "the boot-time spend seed refuses to arm on an incomplete walk"
+                    f"a durable fill index names venue order {venue_order_id!r} "
+                    "but no record exists for it"
                 )
-            for venue_order_id in indexed:
-                if venue_order_id in seen:
-                    continue
-                seen.add(venue_order_id)
-                raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
-                if raw is None:
-                    raise PolymarketUSError(
-                        f"the fill index for {instrument_id} names venue order "
-                        f"{venue_order_id!r} but no record exists for it"
-                    )
-                record = DurableFillRecord.from_bytes(raw)
-                if utc_day_for_ns(record.ts_event) != today:
-                    continue
-                total += record.cumulative_cost
-                count += 1
+            record = DurableFillRecord.from_bytes(raw)
+            if utc_day_for_ns(record.ts_event) != today:
+                continue
+            total += record.cumulative_cost
+            count += 1
         if count == 0:
             return
         self._ledger.seed_spent(day=today, spent_usd=total, now_ns=now_ns)
@@ -2581,12 +2667,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # with the process and this dict is empty -- the reminted
             # budget already starts whole, so there is nothing to true up.
             self._ledger.true_up_booking(booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns)
-        if self._permit is not None and restore_live_trading_budget(
-            permit=self._permit,
-            venue_order_id=context.venue_order_id,
-            order_notional_usd=context.notional_usd,
-        ):
-            self._mark_budget_restored(context.venue_order_id)
+            # AC6 (EDGE-2 plan r3, D3): the permit restore is gated on the
+            # SAME `booking is not None` check as the ledger true-up right
+            # above -- a cross-process or next-day terminal-zero never took
+            # a booking in THIS process, so the one permit slot it would
+            # give back was never debited by this process's own ledger in
+            # the first place. Restoring it anyway would re-grant a slot
+            # nothing here ever spent (D3).
+            if self._permit is not None and restore_live_trading_budget(
+                permit=self._permit,
+                venue_order_id=context.venue_order_id,
+                order_notional_usd=context.notional_usd,
+            ):
+                self._mark_budget_restored(context.venue_order_id)
+        else:
+            self._log.info(
+                "resolver: cross-process terminal-zero; permit restore skipped"
+            )
         if positions is not None:
             self._write_startup_position_evidence(
                 now_ns=now_ns,
@@ -2760,6 +2857,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 venue_order_id=context.venue_order_id,
                 order_notional_usd=context.notional_usd,
             )
+        # AC6b (EDGE-2 plan r3, D6/D8/D9): a fill resolved in a PRIOR
+        # process (`booking is None`) AFTER this process's own boot spend
+        # seed already totalled today's fills (`self._spend_seeded`) is
+        # invisible to that seed -- the daily budget would silently
+        # under-count it for the rest of this process's lifetime (D6).
+        # Exempt: a fill resolved BEFORE the seed ran (the seed counts it,
+        # D8) and every exit fill (`order_side == "SELL"` spends no budget;
+        # a legacy context with no recorded side decodes as `LONG_ONLY_SIDE`
+        # and refuses, fail-closed). This only LATCHES a refusal -- it never
+        # touches the record, ledger or permit already written above, and
+        # it clears on respawn: the new process's seed reads
+        # `FILL_BY_DAY_KEY_PREFIX` and books this record whether or not its
+        # instrument is loaded (G4).
+        if (
+            booking is None
+            and context.order_side != "SELL"
+            and self._spend_seeded
+        ):
+            self._log.error(f"{_RESOLVER_FILL_UNBUDGETED}; intent={context.intent_id}")
+            self._refuse(_RESOLVER_FILL_UNBUDGETED)
         # FU-8 r2/r2.1 (option A): a cross-session fill (this run never
         # submitted the order) is NEVER booked at runtime -- see the
         # helper's own docstring. Every durable write above (record_fill,
@@ -3969,6 +4086,25 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if record.venue_order_id not in indexed:
             indexed.append(record.venue_order_id)
             self._store_set(index_key, json.dumps(indexed).encode("utf-8"))
+        # AC6b/G4 (EDGE-2 plan r3, D9): a day-scoped candidate index, keyed
+        # by `record.ts_event`'s OWN UTC day -- never `intent_created_ns` --
+        # so the boot seed can reach a fill recorded under a PAST-DAY
+        # instrument the instrument provider never loaded (the past-day
+        # loader populates only `self._cache`). Same three-way
+        # `_read_fill_index` read and fail-closed raise as the per-
+        # instrument index above: overwriting an unreadable day index would
+        # orphan every OTHER id it still names for that day.
+        day_index_key = f"{FILL_BY_DAY_KEY_PREFIX}{utc_day_for_ns(record.ts_event).isoformat()}"
+        day_indexed = self._read_fill_index(day_index_key)
+        if day_indexed is None:
+            raise PolymarketUSError(
+                f"the durable day-fill index at {day_index_key!r} could not be "
+                "read, so it cannot be safely rewritten: overwriting it would "
+                "orphan every fill record it still names"
+            )
+        if record.venue_order_id not in day_indexed:
+            day_indexed.append(record.venue_order_id)
+            self._store_set(day_index_key, json.dumps(day_indexed).encode("utf-8"))
         if intent_fingerprint is not None and intent_created_ns is not None:
             day = utc_day_for_ns(intent_created_ns).isoformat()
             self._store_set(

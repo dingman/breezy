@@ -89,9 +89,18 @@ _resolve_accept_fill#1              EXCEPTIONAL   fail-closed: the resolver's ow
                                                    durable record could not be built or written
 _resolve_accept_fill#2              EXCEPTIONAL   fail-closed: the venue-id map write raised on a
                                                    GET-confirmed fill; the fill itself is durable
+_resolve_accept_fill#3              EXCEPTIONAL   AC6b (EDGE-2 r3): a cross-process BUY fill was
+                                                   resolved after this process's own boot spend
+                                                   seed ran; the daily budget cannot see it until
+                                                   a respawn reseeds from today's fill index
 _resolve_terminal_zero#1            EXCEPTIONAL   fail-closed: the venue-id map write raised on a
                                                    GET-confirmed terminal zero; the retire proceeds
 ==================================  ============  ================================================
+
+Seven ROUTINE, twenty-eight EXCEPTIONAL (EDGE-2 r3 AC6b: old total 34 -> new
+total 35 -- `_resolve_accept_fill` gains a third `self._refuse(...)` site,
+the cross-process unbudgeted-fill latch, appended AFTER the existing `#1`
+and `#2` so neither renumbers).
 
 Seven ROUTINE, twenty-seven EXCEPTIONAL (position-shape ruling 2026-09-16,
 old total 33 -> new total 34). `_map_position` gained a fourth
@@ -225,6 +234,10 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         "_submit_order#2",
         "_submit_order#5",
         "_resolve_accept_fill#2",
+        # EDGE-2 plan r3 (AC6b): a third `_resolve_accept_fill` refusal
+        # site -- the cross-process unbudgeted-fill latch -- appended AFTER
+        # the existing `#1` and `#2`, so neither renumbers: old 34 -> new 35.
+        "_resolve_accept_fill#3",
         "_resolve_terminal_zero#1",
     }
 )
@@ -303,7 +316,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 34  # position-shape ruling: old 33 -> new 34 (A1: old 30 -> new 33)
+    assert len(scanned) == 35  # EDGE-2 r3 AC6b: old 34 -> new 35 (position-shape: old 33 -> 34)
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -318,7 +331,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 35  # position-shape ruling: old 34 -> new 35 (planting breaks the pin)
+    assert len(scanned) == 36  # EDGE-2 r3 AC6b baseline 35 -> new 36 (planting breaks the pin)
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -351,6 +364,9 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
         "stale_rows": sorted(set(triaged) - REFUSAL_PRODUCERS),
     }
     counts = Counter(triaged.values())
+    # EDGE-2 plan r3 (AC6b): a new EXCEPTIONAL `_resolve_accept_fill#3` (the
+    # cross-process unbudgeted-fill latch): old {"EXCEPTIONAL": 27,
+    # "ROUTINE": 7} -> new {"EXCEPTIONAL": 28, "ROUTINE": 7}.
     # Position-shape ruling (2026-09-16): new `_map_position#3` is ROUTINE
     # (+1 ROUTINE) and old `_map_position#3` -> `#4` is RECLASSIFIED
     # ROUTINE -> EXCEPTIONAL (-1 ROUTINE, +1 EXCEPTIONAL): old
@@ -358,7 +374,7 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
     # A1 (AM-3): old {"EXCEPTIONAL": 23, "ROUTINE": 7} -> new {"EXCEPTIONAL": 26, "ROUTINE": 7}
     # (slice 3: old {"EXCEPTIONAL": 22, "ROUTINE": 7} -> new {"EXCEPTIONAL": 23, "ROUTINE": 7};
     # I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7})
-    assert counts == {"EXCEPTIONAL": 27, "ROUTINE": 7}, counts
+    assert counts == {"EXCEPTIONAL": 28, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------
