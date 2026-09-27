@@ -771,6 +771,93 @@ def test_run_once_writes_a_completed_row_from_the_sidecar_and_parquet(tmp_path: 
     )
 
 
+def _append_terminal_row(
+    tmp_path: Path,
+    *,
+    params_match: bool | None,
+    aud11_and_aud12_landed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ReplayResult:
+    config = _config(tmp_path)
+    monkeypatch.setattr(runner, "AUD11_AND_AUD12_LANDED", aud11_and_aud12_landed)
+    runner._append_terminal(
+        config,
+        _row(),
+        strategy=STRATEGY,
+        now_ts=lambda: "2026-09-25T15:50:00+00:00",
+        outcome="COMPLETED",
+        family_id="pm_us_crh_v4",
+        manifest_sha256="a" * 64,
+        manifest_taker_fee_coefficient="0.0695",
+        engine_required_fee_coefficient="0.0695",
+        engine_params_source="FAMILY_MANIFEST",
+        params_match=params_match,
+        composition_kind="continuous_rung_hold",
+        trials=1,
+        fills=1,
+        fill_price_vs_decision_ask=("0.01",),
+        wall_s=10.0,
+        peak_rss_bytes=1_000,
+    )
+    (row,) = read_replay_results(config.replay_results_path)
+    return row
+
+
+def test_append_terminal_keeps_mechanism_only_when_landed_gate_false_even_if_params_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _append_terminal_row(
+        tmp_path,
+        params_match=True,
+        aud11_and_aud12_landed=False,
+        monkeypatch=monkeypatch,
+    )
+    assert row.validity == "MECHANISM_ONLY"
+
+
+def test_append_terminal_writes_params_verified_when_landed_gate_true_and_params_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _append_terminal_row(
+        tmp_path,
+        params_match=True,
+        aud11_and_aud12_landed=True,
+        monkeypatch=monkeypatch,
+    )
+    assert row.validity == "PARAMS_VERIFIED"
+
+
+def test_append_terminal_keeps_mechanism_only_when_landed_gate_true_but_params_do_not_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _append_terminal_row(
+        tmp_path,
+        params_match=False,
+        aud11_and_aud12_landed=True,
+        monkeypatch=monkeypatch,
+    )
+    assert row.validity == "MECHANISM_ONLY"
+
+
+def test_append_terminal_default_gate_preserves_today_terminal_row_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _append_terminal_row(
+        tmp_path,
+        params_match=True,
+        aud11_and_aud12_landed=False,
+        monkeypatch=monkeypatch,
+    )
+    expected = _terminal_row()
+    assert json.dumps(row.to_dict(), sort_keys=True) == json.dumps(
+        expected.to_dict(), sort_keys=True
+    )
+
+
 def test_run_once_replays_a_current_rung_hold_composition_family_without_a_strategy_flag(
     tmp_path: Path,
 ) -> None:
