@@ -298,6 +298,7 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_open_orders,
     parse_order_status_report,
     parse_position_status_report,
+    position_leg,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import (
@@ -322,7 +323,6 @@ from breezy.adapters.polymarket_us.safety import (
 )
 from breezy.adapters.polymarket_us.symbology import (
     base_slug_of,
-    instrument_id_to_slug,
     leg_of,
     no_leg_instrument_id,
     slug_to_instrument_id,
@@ -1314,12 +1314,18 @@ _RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = NON_FILL_TERMINAL_S
 _RESOLVER_FILL_STATUSES: Final[frozenset[OrderStatus]] = frozenset({OrderStatus.FILLED})
 
 
-def _resolver_long_position_state(positions: Mapping[str, Any], slug: str) -> bool | None:
-    """Resolution C: ``True`` -- a LONG is present at ``slug``. ``False`` --
-    confirmed no LONG (the slug is absent, which IS a confirmed zero
-    position). ``None`` -- undetermined (malformed ``netPosition``); the
-    caller MUST treat this exactly like a read failure: take no action,
-    stay AMBIGUOUS, try again next pass. Never ``_refuse``s.
+def _resolver_long_position_state(
+    positions: Mapping[str, Any], slug: str, leg: Leg
+) -> bool | None:
+    """Resolution C/EDGE-2C: ``True`` -- a LONG on ``leg`` is present at
+    ``slug`` (``leg`` KEEPS its name: per the 2026-09-16 ruling a NO holding
+    IS a LONG on the NO-leg instrument, never a SHORT on the YES one).
+    ``False`` -- confirmed no LONG on ``leg`` (the slug is absent, which IS a
+    confirmed zero position, or the sign/outcome present belongs to the
+    OTHER leg). ``None`` -- undetermined (malformed ``netPosition``, or an
+    outcome/sign contradiction :func:`position_leg` refuses to guess); the
+    caller MUST treat this exactly like a read failure: take no action, stay
+    AMBIGUOUS, try again next pass. Never ``_refuse``s.
     """
     payload = positions.get(slug)
     if payload is None:
@@ -1333,7 +1339,17 @@ def _resolver_long_position_state(positions: Mapping[str, Any], slug: str) -> bo
         net = _to_decimal(net_raw, field="netPosition", error=ExecutionReportMappingError)
     except ExecutionReportMappingError:
         return None
-    return net > 0
+    if net == 0:
+        return False
+    metadata = payload.get("marketMetadata")
+    metadata = metadata if isinstance(metadata, Mapping) else None
+    try:
+        held_leg = position_leg(
+            net=net, metadata=metadata, context=f"resolver positions[{slug!r}]"
+        )
+    except ExecutionReportMappingError:
+        return None
+    return held_leg == leg
 
 
 def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
@@ -2090,12 +2106,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         anywhere in this coroutine still leaves the durable record as the
         source of truth either way.
 
-        The LONG gate (``_resolver_long_position_state``) is slug-level
-        ``netPosition > 0`` corroboration ONLY, never magnitude-matched
-        against the GET's own ``filled_qty`` -- the order-specific GET
-        report is the sole authority for the quantity and price a fill is
-        synthesized from; the positions read exists only to confirm a LONG
-        exists at all before acting.
+        The LONG gate (``_resolver_long_position_state``) is slug-level,
+        leg-aware ``netPosition`` sign corroboration ONLY (per
+        ``reports.position_leg``), never magnitude-matched against the GET's
+        own ``filled_qty`` -- the order-specific GET report is the sole
+        authority for the quantity and price a fill is synthesized from; the
+        positions read exists only to confirm a LONG on THIS order's own leg
+        exists at all before acting (EDGE-2C: a NO holding is a LONG on the
+        NO-leg instrument, per the 2026-09-16 ruling, never a SHORT on the
+        YES one).
         """
         first_iteration = True
         while True:
@@ -2416,8 +2435,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 continue
 
-            slug = instrument_id_to_slug(instrument.id)
-            long_state = _resolver_long_position_state(positions, slug)
+            # EDGE-2C (AC1/AC3): `base_slug_of`/`leg_of` are the sanctioned
+            # readers for EITHER leg's id (`instrument_id_to_slug` refuses a
+            # NO-leg id outright -- the L-48 crash this guard exists to
+            # close); the whole derivation sits in one `try` because a
+            # slug/leg/holding failure must never kill this coroutine any
+            # more than a `_resolve_terminal_zero`/`_resolve_accept_fill`
+            # failure does below.
+            try:
+                leg = leg_of(instrument.id)
+                slug = base_slug_of(instrument.id)
+                long_state = _resolver_long_position_state(positions, slug, leg)
+            except Exception as exc:  # noqa: BLE001 - see the comment above
+                self._note_resolver_error(context.intent_id, exc)
+                continue
             if long_state is None:
                 self._log.warning(
                     f"resolver could not determine {slug}'s position from an "
