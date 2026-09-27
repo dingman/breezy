@@ -47,6 +47,7 @@ from nautilus_trader.model.events import AccountState, OrderDenied
 from nautilus_trader.model.identifiers import ClientOrderId, Venue, VenueOrderId
 from nautilus_trader.model.instruments import BinaryOption
 
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     _BOOT_PASS_REFUSAL_LATCHES,
     _RECONCILIATION_COUNT_FIELDS,
@@ -427,6 +428,85 @@ async def _run_n_passes_recording_sleeps(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     return sleeps
+
+
+# ==========================================================================
+# EDGE-2 slice A (AC3): `AmbiguousResolverContext.create_fill_evidence` --
+# the closed-set `createFillEvidence` token threaded from
+# `submit_chain.create_fill_evidence` through `_note_ambiguous_open` into the
+# durable context, with the same AR-N6 trailing-optional shape as
+# `create_detail`/`fill_parse_error`/`order_side`.
+# ==========================================================================
+
+
+def test_resolver_context_round_trips_create_fill_evidence() -> None:
+    """A NEW row round-trips whatever token it was given, through
+    `to_bytes`/`from_bytes`."""
+    context = AmbiguousResolverContext(
+        intent_id="intent-cfe",
+        venue_order_id="venue-cfe",
+        instrument_id="instrument-cfe",
+        client_order_id="client-cfe",
+        strategy_id="strategy-cfe",
+        notional_usd=Decimal("1.00"),
+        booking_id=1,
+        created_ns=TS_INIT,
+        create_fill_evidence=submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT,
+    )
+    round_tripped = AmbiguousResolverContext.from_bytes(context.to_bytes())
+    assert round_tripped.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT
+
+
+def test_legacy_resolver_context_without_field_decodes_as_unknown() -> None:
+    """AR-N6: a blob written before EDGE-2 slice A (no `createFillEvidence`
+    key at all) decodes to `submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN` --
+    the same token an unparseable create-order body renders, since neither
+    case tells the resolver anything about create-time fill evidence."""
+    old_blob = json.dumps(
+        {
+            "intentId": "intent-old-cfe",
+            "venueOrderId": "venue-old-cfe",
+            "instrumentId": "instrument-old-cfe",
+            "clientOrderId": "client-old-cfe",
+            "strategyId": "strategy-old-cfe",
+            "notionalUsd": "1.00",
+            "bookingId": 11,
+            "createdNs": TS_INIT,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    old_context = AmbiguousResolverContext.from_bytes(old_blob)
+    assert old_context.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_submit_order_passes_response_body_evidence_to_note_ambiguous_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """End-to-end: `_submit_order`'s with-id AMBIGUOUS branch computes
+    `submit_chain.create_fill_evidence(response.body)` and threads its
+    `.token` into the durable `AmbiguousResolverContext` -- never a price,
+    quantity, or id, and never `unknown` for a body that parsed cleanly to
+    `executions: []` (that is `none`, a decided absence, not decode
+    failure)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        assert context.venue_order_id == order_id
+        assert context.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_NONE
+        await client._disconnect()
 
 
 @pytest.mark.asyncio

@@ -2024,6 +2024,12 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # tags -- the SAME intra-module/inert shape as `DurableFillRecord`
         # above; no I/O.
         "_AdapterExitAuthorization",
+        # Widened EDGE-2 slice A (2026-09-27, AC3/AC9): a pure module-level
+        # helper -- parses `response.body` (already in hand, no new read)
+        # with the module's own `_parse_json_object` and returns a frozen,
+        # closed-set-token dataclass; no I/O, no path, no payload, no
+        # socket.
+        "submit_chain.create_fill_evidence",
     }
 )
 
@@ -3117,6 +3123,9 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # site's comment above.
             "leg_of",
             "_AdapterExitAuthorization",
+            # Widened EDGE-2 slice A (2026-09-27, AC3/AC9): a pure helper,
+            # no I/O -- see the definition site's comment above.
+            "submit_chain.create_fill_evidence",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:
