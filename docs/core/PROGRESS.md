@@ -63,7 +63,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | SP-5b | LOW/DEFERRED | Coordinator ruling (plan doc addendum): build before the next champion/family registration, with the two trading-bot-architect fixes (exclude `gs_boundary_*.json` from AC-11; restart-race test) | `NIGHT_2026-09-26/SP-5b_plan_r1_2026-09-26.md` |
 | HUNT-1 | CRIT/GATED | Requirement stands (operator, 9ddcb8b); nothing built until a re-open trigger fires. Never treat as moot | `RULING_HUNT-1_all_hours_hunting_2026-09-26.md` |
 | AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family | AUD-06b |
-| FOLLOW-UPS 09-27 | LOW | EDGE-2-MULTIPAGE; THIN-BOOK-REFUSAL (winning-rung level-0 median 0.58 < qty 1); NOTIFIER-IMPORT-ISOLATION (`breezy/runtime/__init__.py` eagerly imports Nautilus, so the study-failure notifier fails with any Nautilus import fault; lazy-load needs a plan); RA-9c hard gate for **v2** look-taking registrations (LEDGER-V3 D-2 refuses only v3); EDGE-2-REFACTOR (`_resolve_ambiguous_intents` ~530 lines); exit-window study IEM 429 (09-24) + studies-lock skip (09-26) | this session |
+| FOLLOW-UPS 09-27 | LOW | EDGE-2-MULTIPAGE; THIN-BOOK-REFUSAL (winning-rung level-0 median 0.58 < qty 1); NOTIFIER-IMPORT-ISOLATION (`breezy/runtime/__init__.py` eagerly imports Nautilus, so the study-failure notifier fails with any Nautilus import fault; lazy-load needs a plan); RA-9c hard gate for **v2** look-taking registrations (LEDGER-V3 D-2 refuses only v3); EDGE-2-REFACTOR (`_resolve_ambiguous_intents` ~530 lines); AUD-04 ROI `settled_through=2026-09-19` while the exit study covers 09-21/09-22 fills (check the 17:40Z report) | this session |
 
 
 **Order (next session, re-synced 09-27 ~04:30Z):**
