@@ -28,7 +28,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from breezy.analysis.hypothesis_ledger import (
@@ -54,8 +54,10 @@ from breezy.analysis.hypothesis_ledger import (
 from breezy.analysis.replay_results import (
     REPLAY_VALIDITY,
     ReplayResult,
+    ResultKey,
     UnknownReplayResultSchemaError,
     read_replay_results,
+    result_key,
 )
 from breezy.analysis.replay_sufficiency import (
     UnknownReplaySufficiencySchemaError,
@@ -133,6 +135,10 @@ class _Args:
     horizon_days: int
     alert_log: Path | None
     attempt_hypothesis_id: str | None
+    replay_result_sources: tuple[ReplayResultSource, ...] | None = None
+
+
+ReplayResultSource = tuple[str, Path]
 
 
 def default_derived_root() -> Path:
@@ -160,6 +166,10 @@ def _sufficiency_path(derived_root: Path) -> Path:
 
 def _results_path(derived_root: Path) -> Path:
     return derived_root / "replay" / "replay_results.jsonl"
+
+
+def _default_replay_result_sources(derived_root: Path) -> tuple[ReplayResultSource, ...]:
+    return (("champion", _results_path(derived_root)),)
 
 
 def _store_dir(derived_root: Path, station: str, climate_day: str, lag_minutes: int) -> Path:
@@ -451,19 +461,68 @@ def _emit(
     emit_alert(resolve_alert_sink(), payload)
 
 
-def _load_aud09(derived_root: Path) -> tuple[object, tuple[ReplayResult, ...]]:
+def _load_aud09(
+    derived_root: Path, replay_result_sources: Sequence[ReplayResultSource] | None = None
+) -> tuple[object, tuple[ReplayResult, ...]]:
     sufficiency_path = _sufficiency_path(derived_root)
-    results_path = _results_path(derived_root)
     try:
         sufficiency = read_replay_sufficiency(sufficiency_path)
-        results = read_replay_results(results_path)
     except FileNotFoundError as exc:
         raise _TriageFailure("absent AUD-09 artefact") from exc
     except OSError as exc:
         raise _TriageFailure("unreadable AUD-09 artefact") from exc
-    except (UnknownReplaySufficiencySchemaError, UnknownReplayResultSchemaError) as exc:
+    except UnknownReplaySufficiencySchemaError as exc:
         raise _TriageFailure(_public_detail(exc)) from exc
+    results = _load_replay_result_sources(
+        tuple(replay_result_sources)
+        if replay_result_sources is not None
+        else _default_replay_result_sources(derived_root)
+    )
     return sufficiency, results
+
+
+def _load_replay_result_sources(
+    sources: Sequence[ReplayResultSource],
+) -> tuple[ReplayResult, ...]:
+    """Read ordered replay result sources and merge by replay key.
+
+    Duplicate policy for this input seam: the first row for a replay key wins
+    only when every later row for that key is byte-for-byte the same payload
+    after strict parsing. A same-key row with different fields is a hard
+    failure, because two sources disagreeing on one station-day would make the
+    triage count untrustworthy.
+    """
+    merged: list[ReplayResult] = []
+    seen: dict[ResultKey, tuple[str, dict[str, object]]] = {}
+    for source_label, path in sources:
+        try:
+            rows = read_replay_results(path)
+        except FileNotFoundError as exc:
+            raise _TriageFailure(
+                f"absent AUD-09 replay result source {source_label!r}"
+            ) from exc
+        except OSError as exc:
+            raise _TriageFailure(
+                f"unreadable AUD-09 replay result source {source_label!r}"
+            ) from exc
+        except UnknownReplayResultSchemaError as exc:
+            raise _TriageFailure(_public_detail(exc)) from exc
+        for row in rows:
+            key = result_key(row)
+            payload = row.to_dict()
+            previous = seen.get(key)
+            if previous is None:
+                seen[key] = (source_label, payload)
+                merged.append(row)
+                continue
+            previous_label, previous_payload = previous
+            if payload == previous_payload:
+                continue
+            raise _TriageFailure(
+                "conflicting duplicate replay result "
+                f"key={key!r} sources={previous_label!r},{source_label!r}"
+            )
+    return tuple(merged)
 
 
 def _completed_on_whole_days(
@@ -662,7 +721,9 @@ def _triage_record(
     return replace(record, status=status), look, event
 
 
-def run(args: _Args) -> int:
+def run(
+    args: _Args, replay_result_sources: Sequence[ReplayResultSource] | None = None
+) -> int:
     path = ledger_path(args.derived_root)
     if not path.exists():
         if args.attempt_hypothesis_id is not None:
@@ -734,7 +795,10 @@ def run(args: _Args) -> int:
         return 0
 
     active = [record for record in look_taking if record.status in _ACTIVE_STATUSES]
-    _sufficiency, results = _load_aud09(args.derived_root)
+    sources = replay_result_sources
+    if sources is None:
+        sources = args.replay_result_sources
+    _sufficiency, results = _load_aud09(args.derived_root, sources)
     completed = _completed_on_whole_days(_sufficiency, results)  # type: ignore[arg-type]
     horizon_state_path = _alert_state_path(args.derived_root, kind=_HORIZON_ALERT_KIND)
     horizon_alerted = _read_alert_state(horizon_state_path, label="horizon")
@@ -804,18 +868,42 @@ def run(args: _Args) -> int:
 def _parse(argv: Sequence[str]) -> _Args:
     parser = argparse.ArgumentParser(description="AUD-18 hypothesis triage")
     parser.add_argument("--derived-root", type=Path, default=None)
-    parser.add_argument("--as-of", default=date.today().isoformat())
+    parser.add_argument("--as-of", default=datetime.now(tz=UTC).date().isoformat())
     parser.add_argument("--horizon-days", type=int, default=_DEFAULT_HORIZON_DAYS)
     parser.add_argument("--alert-log", type=Path, default=None)
     parser.add_argument("--attempt-hypothesis-id", default=None)
+    parser.add_argument(
+        "--replay-results-source",
+        action="append",
+        default=None,
+        metavar="LABEL=PATH",
+        help=(
+            "Additional explicit replay_results.jsonl input source. "
+            "May be repeated; omitted means champion replay/replay_results.jsonl only."
+        ),
+    )
     namespace = parser.parse_args(list(argv))
-    derived = namespace.derived_root if namespace.derived_root is not None else default_derived_root()
+    derived = (
+        namespace.derived_root
+        if namespace.derived_root is not None
+        else default_derived_root()
+    )
+    replay_result_sources = None
+    if namespace.replay_results_source is not None:
+        parsed_sources: list[ReplayResultSource] = []
+        for raw_source in namespace.replay_results_source:
+            label, separator, raw_path = str(raw_source).partition("=")
+            if not separator or not label or not raw_path:
+                parser.error("--replay-results-source must be LABEL=PATH")
+            parsed_sources.append((label, Path(raw_path)))
+        replay_result_sources = tuple(parsed_sources)
     return _Args(
         derived_root=derived,
         as_of=str(namespace.as_of),
         horizon_days=int(namespace.horizon_days),
         alert_log=namespace.alert_log,
         attempt_hypothesis_id=namespace.attempt_hypothesis_id,
+        replay_result_sources=replay_result_sources,
     )
 
 
