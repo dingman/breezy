@@ -566,6 +566,19 @@ def test_no_declared_heavy_unit_timer_fires_inside_the_lst_derived_protected_win
     # `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2.
     assert _HEAVY_TIMERS == frozenset()
 
+    # Architect finding: tie every DISCOVERED heavy service to its own real
+    # `.timer` (same stem, `.timer` suffix), never just the synthetic case --
+    # a future heavy unit is checked automatically, with no test edit.
+    for service_path in _discover_heavy_service_paths(_DEPLOY_DIR):
+        timer_path = service_path.with_suffix(".timer")
+        assert timer_path.is_file(), (
+            f"{service_path.name} is a discovered heavy service with no "
+            f"companion {timer_path.name}"
+        )
+        _assert_timer_text_fires_outside_protected_window(
+            timer_path.name, timer_path.read_text()
+        )
+
     synthetic_timer = "[Timer]\nOnCalendar=*-*-* 01:35:00 UTC\n"
     _assert_timer_text_fires_outside_protected_window(
         "synthetic-heavy.timer", synthetic_timer
@@ -728,27 +741,333 @@ def test_no_retimed_unit_or_readme_line_still_asserts_the_old_tick() -> None:
 # I2c -- wrapper lock serialization
 ##############################################################################
 
-# EDGE-6c-R2 (line :741 pin): `test_every_heavy_study_wrapper_takes_the_
-# studies_flock_and_skips_when_held` and `test_the_wrapper_skips_when_the_
-# lock_directory_is_missing_or_unwritable` are RETIRED, not replaced by a
-# synthetic stand-in -- `_WRAPPERS` (the declared heavy-wrapper set) is now
-# permanently empty per
-# `docs/evidence/RULING_k1_daily_disposition_2026-09-27.md` C2/C3, so
-# parametrizing over it would silently collect zero cases (L-24), and a
-# same-named synthetic test that only re-reads a string it just wrote would
-# be non-vacuous in form but assert nothing about real wrapper behaviour.
-# The underlying contract -- a wrapper skips cleanly when the shared studies
-# flock is held, and refuses loudly when the lock directory is missing or
-# unwritable -- is already exercised end-to-end, by spawning the REAL
-# script, for every surviving flock-taking wrapper:
-# `tests/unit/test_exit_window_study_deploy.py::
-# test_lock_contention_skips_without_invoking_python`,
-# `tests/unit/test_position_monitor_report_deploy.py::
-# test_lock_contention_skips_without_invoking_python`, and
-# `tests/unit/test_asos_refresh_wrapper_contention.py::
-# test_the_staleness_check_still_runs_when_the_studies_flock_is_held`.
-# `_spawn_wrapper` (the K1-only helper these two tests used) is removed with
-# them.
+# Architect REQUEST_CHANGES on EDGE-6c-R2 (ebec4f7): the first cut retired
+# the K1-only heavy-wrapper flock tests outright, on the reasoning that the
+# declared heavy-wrapper set (`_WRAPPERS`) is now permanently empty and every
+# surviving flock-taking wrapper already has its own real-process coverage
+# in its sibling deploy test file. That left two real gaps: nothing asserted
+# the exit-75 loud refusal on an unwritable lock dir for ANY wrapper in
+# *this* module, and nothing tied a future DISCOVERED heavy unit back to a
+# wrapper that actually takes the shared flock. The two tests below close
+# both gaps, driven by `_discover_heavy_service_paths` plus synthetic
+# fixtures so neither can ever collect zero cases (L-24), each with its own
+# N6c negative control proving the helper can detect a real violation.
+
+#: The one environment variable each KNOWN flock-taking wrapper accepts to
+#: override its own `PY=` resolution, or `None` for `asos-refresh-run.sh`,
+#: whose `PY="$REPO/.venv/bin/python"` has no such override (AUD-18 B1) --
+#: for that one wrapper, `_prepared_wrapper_invocation` below instead copies
+#: it with its `REPO=` line rewritten to a stub `.venv/bin/python` tree, the
+#: same idiom `test_asos_refresh_wrapper_contention.py` uses.
+_WRAPPER_PYTHON_ENV_VAR: Final[dict[str, str | None]] = {
+    "asos-refresh-run.sh": None,
+    "decision-funnel-digest-run.sh": "BREEZY_DECISION_FUNNEL_PYTHON",
+    "portfolio-roi-run.sh": "BREEZY_PORTFOLIO_ROI_PYTHON",
+    "station-candidate-register-run.sh": "BREEZY_STATION_CANDIDATES_PYTHON",
+    "exit-window-study-run.sh": "BREEZY_EXIT_WINDOW_STUDY_PYTHON",
+    "position-monitor-report-run.sh": "BREEZY_POSITION_MONITOR_REPORT_PYTHON",
+    "decisions-retention-run.sh": "BREEZY_DECISIONS_RETENTION_PYTHON",
+}
+_WRAPPER_OUTPUT_ENV_VAR: Final[dict[str, str]] = {
+    "asos-refresh-run.sh": "BREEZY_ASOS_REFRESH_OUTPUT_DIR",
+    "decision-funnel-digest-run.sh": "BREEZY_DECISION_FUNNEL_OUTPUT_DIR",
+    "portfolio-roi-run.sh": "BREEZY_LIVE_TALLY_OUTPUT_DIR",
+    "station-candidate-register-run.sh": "BREEZY_STATION_CANDIDATES_OUTPUT_DIR",
+    "exit-window-study-run.sh": "BREEZY_LIVE_TALLY_OUTPUT_DIR",
+    "position-monitor-report-run.sh": "BREEZY_LIVE_TALLY_OUTPUT_DIR",
+    "decisions-retention-run.sh": "BREEZY_DECISIONS_RETENTION_OUTPUT_DIR",
+}
+_WRAPPER_LOG_FILENAME: Final[dict[str, str]] = {
+    "asos-refresh-run.sh": "asos_refresh.log",
+    "decision-funnel-digest-run.sh": "decision_funnel_digest.log",
+    "portfolio-roi-run.sh": "portfolio_roi.log",
+    "station-candidate-register-run.sh": "station_candidate_register.log",
+    "exit-window-study-run.sh": "exit_window_study.log",
+    "position-monitor-report-run.sh": "position_monitor_report.log",
+    "decisions-retention-run.sh": "decisions_retention.log",
+}
+
+#: `_LOCK_PREAMBLE_WRAPPERS` plus the three wrappers that were never in the
+#: old K1-only `_WRAPPERS` set at all but still take the identical preamble
+#: -- the coordinator's exact scope for the lock-dir-failure test below.
+_LOCK_DIR_FAILURE_WRAPPERS: Final[frozenset[str]] = _LOCK_PREAMBLE_WRAPPERS | frozenset(
+    {
+        "exit-window-study-run.sh",
+        "position-monitor-report-run.sh",
+        "decisions-retention-run.sh",
+    }
+)
+
+#: A stub `$PY`: records that it ran (never what it was asked to run -- the
+#: tests below only need proof of invocation, never argv shape) and exits 0.
+_STUB_PYTHON_SCRIPT: Final[str] = """#!/usr/bin/env bash
+: "${STUB_INVOKED_MARKER:?STUB_INVOKED_MARKER must be set}"
+echo "invoked $*" >> "$STUB_INVOKED_MARKER"
+exit 0
+"""
+_WRAPPER_REPO_LINE: Final[str] = "REPO=/home/jon/breezy\n"
+
+
+def _wrapper_copy_with_repo(
+    wrapper_filename: str, tmp_path: Path, repo_root: Path, token: str
+) -> Path:
+    """Copy the real `wrapper_filename` to `tmp_path` with its `REPO=` line
+    rewritten to `repo_root` -- the only way to redirect `asos-refresh-run.sh`'s
+    non-overridable `PY=` (AUD-18 B1's idiom)."""
+    original = (_DEPLOY_DIR / wrapper_filename).read_text()
+    assert original.count(_WRAPPER_REPO_LINE) == 1, (
+        f"{wrapper_filename}: REPO= line not found exactly once"
+    )
+    rewritten = original.replace(_WRAPPER_REPO_LINE, f"REPO={repo_root}\n", 1)
+    target = tmp_path / f"{token}-{wrapper_filename}"
+    target.write_text(rewritten)
+    target.chmod(0o755)
+    return target
+
+
+def _prepared_wrapper_invocation(
+    wrapper_filename: str, tmp_path: Path, token: str, marker_path: Path
+) -> tuple[Path, dict[str, str]]:
+    """`(wrapper_path, extra_env)` for a KNOWN flock-taking wrapper with its
+    interpreter replaced by the marker-writing stub above."""
+    extra_env: dict[str, str] = {"STUB_INVOKED_MARKER": str(marker_path)}
+    python_env_var = _WRAPPER_PYTHON_ENV_VAR[wrapper_filename]
+    stub_python = tmp_path / f"{token}-stub-python.sh"
+    stub_python.write_text(_STUB_PYTHON_SCRIPT)
+    stub_python.chmod(0o755)
+    if python_env_var is not None:
+        extra_env[python_env_var] = str(stub_python)
+        return _DEPLOY_DIR / wrapper_filename, extra_env
+    stub_repo = tmp_path / f"{token}-stub-repo"
+    stub_repo_python = stub_repo / ".venv" / "bin" / "python"
+    stub_repo_python.parent.mkdir(parents=True)
+    stub_repo_python.write_text(_STUB_PYTHON_SCRIPT)
+    stub_repo_python.chmod(0o755)
+    wrapper_path = _wrapper_copy_with_repo(wrapper_filename, tmp_path, stub_repo, token)
+    return wrapper_path, extra_env
+
+
+def _run_wrapper_under_held_lock(
+    wrapper_path: Path,
+    tmp_path: Path,
+    *,
+    extra_env: dict[str, str],
+    output_env_var: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Spawn `wrapper_path` while the shared studies lock is held under a
+    fresh `tmp_path`-scoped `XDG_RUNTIME_DIR`. Returns `(result, out_dir)`."""
+    token = new_run_token()
+    xdg_runtime_dir = tmp_path / f"{token}-xdg-runtime"
+    xdg_runtime_dir.mkdir(parents=True)
+    out_dir = tmp_path / f"{token}-out"
+    lock_path = xdg_runtime_dir / _LOCK_FILENAME
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        env = build_wrapper_env(
+            tmp_path,
+            token,
+            output_dirs={output_env_var: out_dir},
+            xdg_runtime_dir=xdg_runtime_dir,
+            extra=extra_env,
+        )
+        result = subprocess.run(
+            ["bash", str(wrapper_path)], env=env, capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+        return result, out_dir
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _assert_skips_cleanly_under_held_lock(
+    wrapper_path: Path,
+    tmp_path: Path,
+    *,
+    extra_env: dict[str, str],
+    output_env_var: str,
+    log_filename: str,
+    marker_path: Path,
+) -> None:
+    result, out_dir = _run_wrapper_under_held_lock(
+        wrapper_path, tmp_path, extra_env=extra_env, output_env_var=output_env_var
+    )
+    log_path = out_dir / log_filename
+    combined = result.stdout + (log_path.read_text() if log_path.is_file() else "")
+    assert result.returncode == 0, combined
+    assert "another study holds the studies lock" in combined, combined
+    assert not marker_path.exists(), (
+        f"{wrapper_path.name}'s interpreter WAS invoked despite the held "
+        f"lock: {marker_path.read_text() if marker_path.exists() else ''}"
+    )
+
+
+def test_every_discovered_heavy_unit_wrapper_takes_the_studies_flock_and_skips_when_held(
+    tmp_path: Path,
+) -> None:
+    """Ties a discovered heavy unit (real or synthetic) to a wrapper that
+    actually takes the shared flock, and proves that wrapper skips cleanly
+    under contention. `_discover_heavy_service_paths` is empty on the real
+    tree today (K1 retired), so the synthetic case -- a heavy `.service`
+    whose `ExecStart=` points at the real `decision-funnel-digest-run.sh` --
+    is what keeps this executing a real assertion; a future heavy unit is
+    picked up automatically, with no test edit required."""
+    synthetic_service = tmp_path / "synthetic-heavy.service"
+    synthetic_service.write_text(
+        "[Service]\nMemoryHigh=12G\nMemoryMax=16G\n"
+        f"ExecStart={_DEPLOY_DIR / 'decision-funnel-digest-run.sh'}\n"
+    )
+
+    service_paths = _discover_heavy_service_paths(_DEPLOY_DIR) + [synthetic_service]
+    assert service_paths, "no heavy service to check -- would collect zero cases"
+
+    for service_path in service_paths:
+        exec_start = _directive_value(service_path.read_text(), "ExecStart")
+        assert exec_start is not None, f"{service_path.name} has no ExecStart="
+        wrapper_name = Path(exec_start).name
+        assert wrapper_name in _LOCK_PREAMBLE_WRAPPERS, (
+            f"{service_path.name}'s ExecStart wrapper {wrapper_name!r} does "
+            "not take the shared studies flock"
+        )
+        case_token = new_run_token()
+        marker_path = tmp_path / f"{case_token}-invoked.log"
+        wrapper_path, extra_env = _prepared_wrapper_invocation(
+            wrapper_name, tmp_path, case_token, marker_path
+        )
+        _assert_skips_cleanly_under_held_lock(
+            wrapper_path,
+            tmp_path,
+            extra_env=extra_env,
+            output_env_var=_WRAPPER_OUTPUT_ENV_VAR[wrapper_name],
+            log_filename=_WRAPPER_LOG_FILENAME[wrapper_name],
+            marker_path=marker_path,
+        )
+
+    # N6c negative control (L-24): a wrapper that takes NO flock at all must
+    # FAIL the helper above -- proof it can detect a real violation, not
+    # just always pass.
+    no_flock_token = new_run_token()
+    no_flock_marker = tmp_path / f"{no_flock_token}-invoked.log"
+    stub_repo = tmp_path / f"{no_flock_token}-no-flock-stub-repo"
+    stub_repo_python = stub_repo / ".venv" / "bin" / "python"
+    stub_repo_python.parent.mkdir(parents=True)
+    stub_repo_python.write_text(_STUB_PYTHON_SCRIPT)
+    stub_repo_python.chmod(0o755)
+    no_flock_wrapper = tmp_path / f"{no_flock_token}-no-flock-run.sh"
+    no_flock_wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        f"REPO={stub_repo}\n"
+        'PY="$REPO/.venv/bin/python"\n'
+        '"$PY" -c "print(1)"\n'
+        "exit 0\n"
+    )
+    no_flock_wrapper.chmod(0o755)
+    with pytest.raises(AssertionError):
+        _assert_skips_cleanly_under_held_lock(
+            no_flock_wrapper,
+            tmp_path,
+            extra_env={"STUB_INVOKED_MARKER": str(no_flock_marker)},
+            output_env_var="BREEZY_TEST_NEGATIVE_CONTROL_OUTPUT_DIR",
+            log_filename="no-flock.log",
+            marker_path=no_flock_marker,
+        )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission refusals are bypassed as root")
+@pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_DIR_FAILURE_WRAPPERS))
+def test_every_flock_wrapper_refuses_loudly_when_the_lock_dir_is_unwritable(
+    wrapper_filename: str, tmp_path: Path
+) -> None:
+    """Every flock-taking wrapper -- not just the one the deleted K1-only
+    test covered -- refuses loudly (exit 75, `SKIPPED-INFRA`) and never
+    invokes its interpreter when `XDG_RUNTIME_DIR` exists but is unwritable
+    (`mkdir -p` on an already-existing dir is a permission-free no-op; the
+    NEW file `exec 9>>"$LOCK"` tries to open inside it is what actually
+    fails)."""
+    token = new_run_token()
+    marker_path = tmp_path / f"{token}-invoked.log"
+    wrapper_path, extra_env = _prepared_wrapper_invocation(
+        wrapper_filename, tmp_path, token, marker_path
+    )
+    restricted_runtime_dir = tmp_path / f"{token}-restricted"
+    restricted_runtime_dir.mkdir(parents=True)
+    restricted_runtime_dir.chmod(0o500)
+    out_dir = tmp_path / f"{token}-out"
+    try:
+        env = build_wrapper_env(
+            tmp_path,
+            token,
+            output_dirs={_WRAPPER_OUTPUT_ENV_VAR[wrapper_filename]: out_dir},
+            xdg_runtime_dir=restricted_runtime_dir,
+            extra=extra_env,
+        )
+        result = subprocess.run(
+            ["bash", str(wrapper_path)], env=env, capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+        log_path = out_dir / _WRAPPER_LOG_FILENAME[wrapper_filename]
+        combined = (
+            result.stdout
+            + result.stderr
+            + (log_path.read_text() if log_path.is_file() else "")
+        )
+        assert result.returncode == 75, combined
+        assert "SKIPPED-INFRA" in combined, combined
+        assert not marker_path.exists(), (
+            f"{wrapper_filename}'s interpreter WAS invoked despite the "
+            f"unwritable lock directory: {marker_path.read_text() if marker_path.exists() else ''}"
+        )
+    finally:
+        restricted_runtime_dir.chmod(0o700)
+
+
+@pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_DIR_FAILURE_WRAPPERS))
+def test_every_flock_wrapper_refuses_loudly_when_the_lock_dir_path_is_a_file(
+    wrapper_filename: str, tmp_path: Path
+) -> None:
+    """Restores the OTHER non-creatable-lock-dir case the deleted K1-only
+    test covered (Case 1 of `test_the_wrapper_skips_when_the_lock_directory_
+    is_missing_or_unwritable`, pre-K1-retirement): a plain FILE occupies the
+    path `mkdir -p "$LOCK_DIR"` must create, so `mkdir -p` itself fails --
+    distinct from the sibling test above, where `mkdir -p` succeeds
+    trivially (the dir already exists) and it is the NEW file `exec 9>>"$LOCK"`
+    that fails. Every flock-taking wrapper -- not just the retired K1 one --
+    refuses loudly (exit 75, `SKIPPED-INFRA`) and never invokes its
+    interpreter when `XDG_RUNTIME_DIR` is a file rather than a directory."""
+    token = new_run_token()
+    marker_path = tmp_path / f"{token}-invoked.log"
+    wrapper_path, extra_env = _prepared_wrapper_invocation(
+        wrapper_filename, tmp_path, token, marker_path
+    )
+    blocked_runtime_dir = tmp_path / f"{token}-blocked"
+    blocked_runtime_dir.write_bytes(b"")
+    out_dir = tmp_path / f"{token}-out"
+    env = build_wrapper_env(
+        tmp_path,
+        token,
+        output_dirs={_WRAPPER_OUTPUT_ENV_VAR[wrapper_filename]: out_dir},
+        xdg_runtime_dir=blocked_runtime_dir,
+        extra=extra_env,
+    )
+    result = subprocess.run(
+        ["bash", str(wrapper_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    log_path = out_dir / _WRAPPER_LOG_FILENAME[wrapper_filename]
+    combined = result.stdout + result.stderr + (log_path.read_text() if log_path.is_file() else "")
+    assert result.returncode == 75, combined
+    assert "SKIPPED-INFRA" in combined, combined
+    assert not marker_path.exists(), (
+        f"{wrapper_filename}'s interpreter WAS invoked despite the "
+        f"lock directory path being occupied by a file: "
+        f"{marker_path.read_text() if marker_path.exists() else ''}"
+    )
 
 
 @pytest.mark.parametrize("wrapper_filename", sorted(_LOCK_PREAMBLE_WRAPPERS))

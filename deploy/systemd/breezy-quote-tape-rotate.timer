@@ -20,9 +20,8 @@ Unit=breezy-quote-tape-rotate.service
 # pass is guaranteed to see a genuinely quiet, non-live instance and convert
 # it -- landing it in the parquet catalog in time for `breezy-mb-daily`'s
 # 13:30 UTC read. Full daily sequence: rotate 09:00 -> ingest 12:15 ->
-# mb-daily 13:30. UTC is stated explicitly (this host's clock is UTC -- see
-# breezy-k1-daily.timer's own comment) so the schedule cannot move if the
-# host timezone is ever changed.
+# mb-daily 13:30. UTC is stated explicitly (this host's clock is UTC) so
+# the schedule cannot move if the host timezone is ever changed.
 OnCalendar=*-*-* 09:00:00 UTC
 
 # A rotation missed because the host was down fires as soon as the timer is
