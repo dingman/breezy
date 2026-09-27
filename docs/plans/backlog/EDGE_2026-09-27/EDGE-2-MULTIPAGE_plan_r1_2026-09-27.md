@@ -58,6 +58,7 @@
 | Venue ignores `limit` or has a small page size | Safe (stuck AMBIGUOUS) | Stale alert; Step 2 measures it |
 | History exceeds 2000 rows | Safe | Trigger to revisit C |
 | A new callee trips the egress firewall | Build failure (safe) | Inline checks; guard run unmodified |
+| NO-side trades match by id only, side never consulted (r2 M-6) | Observed, not dangerous | A real captured `ACTIVITY_TYPE_TRADE` row DOES carry the NO-side (SELL/BUY_SHORT) leg's `id`: `docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/activities_p0.json`, `activities[4]`/`[5]`/`[7]`/`[8]`, `passive.side="ORDER_SIDE_SELL"`, `passive.intent="ORDER_INTENT_BUY_SHORT"`, `passive.id` present (scrubbed). `trade_rows_for_order` (`account_activity.py:411-413`) matches `aggressor.id`/`passive.id` only, which this fixture shows is structurally sufficient for a NO-side leg too -- side is redundant for matching, not a gap in it. |
 
 **Invariants:** Nautilus, operator caps, live enablement, the NO-SEND firewall and `allow_short` are untouched, and no safety test is weakened. An unresolved read ends up as `None` or incomplete, which means the order stays AMBIGUOUS.
 

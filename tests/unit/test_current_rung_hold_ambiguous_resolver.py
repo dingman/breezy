@@ -4443,6 +4443,326 @@ async def test_min_create_time_below_created_ns_without_eof_is_not_complete(
         await client._disconnect()
 
 
+# ---------------------------------------------------------------------------
+# EDGE-2-MULTIPAGE step 1 (r2 delta M-1/M-2/M-3/M-5): D1 (`bool(page.get(
+# "eof"))` treats any truthy non-bool as EOF) and D2 (a page whose
+# `activities` field is not a list silently contributes zero rows while the
+# loop pages on) could each make a read look complete when it was not. Both
+# are refused below: a malformed page (non-list `activities`, or a present
+# non-bool `eof`) stops the read INCOMPLETE, the same shape a page-cap hit
+# already has -- never `None`, so a trade an EARLIER page already found is
+# never discarded.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("eof_value", "expected_complete"),
+    [
+        ("false", False),
+        ("true", False),
+        (1, False),
+        ("0", False),
+        (0, False),
+        (None, False),  # a present null -- distinct from a missing key
+        (True, True),  # control
+    ],
+)
+async def test_eof_non_bool_truthy_is_incomplete(
+    eof_value: object,
+    expected_complete: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T1 (r2 M-5): JSON decodes only `true`/`false` to `bool`, so any
+    non-bool `eof` PRESENT on the page -- including an explicit null -- is
+    venue schema drift (D1), never evidence of completion. RED today:
+    `bool("false")`, `bool(1)` and `bool("0")` are all truthy, so the read
+    is wrongly reported complete for every non-bool case; only the `True`
+    control is genuinely complete."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+
+        async def _single_page(path: str, query: Mapping[str, object] | None = None) -> Any:
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            return {"activities": [], "eof": eof_value}
+
+        client._private_read = _single_page
+
+        join = await client._order_trade_activity(order_id, client._clock.timestamp_ns())
+
+        assert join is not None
+        assert join.complete is expected_complete
+        assert join.trade_count == 0
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_page_without_activities_list_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T2 (r2 M-1/M-5): page 1 carries no `activities` field at all (D2).
+    The read must stop THERE, incomplete -- never page past it to page 2's
+    `eof=True` and report a false complete-with-zero-trades. RED today:
+    `complete=True, trade_count=0` (the malformed page silently contributes
+    zero rows and the loop pages on to page 2's eof)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        pages: list[Mapping[str, object]] = [
+            {"eof": False, "nextCursor": "c1"},
+            {"activities": [], "eof": True},
+        ]
+        queries: list[Mapping[str, object] | None] = []
+
+        async def _paged_read(path: str, query: Mapping[str, object] | None = None) -> Any:
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            queries.append(query)
+            return pages[len(queries) - 1]
+
+        client._private_read = _paged_read
+
+        join = await client._order_trade_activity(order_id, client._clock.timestamp_ns())
+
+        assert join is not None
+        assert join.complete is False
+        assert join.trade_count == 0
+        assert len(queries) == 1, (
+            "a malformed page must stop the read immediately, never page past it"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_page_two_without_activities_list_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T2b (r2 M-5 domain item 2; kills M9): page 1 is well-formed with a
+    NON-matching trade row, page 2 is malformed. The malformed-page guard
+    must fire on EVERY page, not only page 1 -- a guard hoisted before the
+    loop would let page 2 through unchecked and wrongly report `eof=True`
+    as complete."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        pages: list[Mapping[str, object]] = [
+            {
+                "activities": [
+                    {
+                        "type": "ACTIVITY_TYPE_TRADE",
+                        "trade": {
+                            "aggressor": {"id": "SOME-OTHER-ORDER"},
+                            "qtyDecimal": "1",
+                            "createTime": "2026-09-23T17:22:07.900000000Z",
+                        },
+                    },
+                ],
+                "eof": False,
+                "nextCursor": "c1",
+            },
+            {"activities": "not-a-list", "eof": True},
+        ]
+        queries: list[Mapping[str, object] | None] = []
+
+        async def _paged_read(path: str, query: Mapping[str, object] | None = None) -> Any:
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            queries.append(query)
+            return pages[len(queries) - 1]
+
+        client._private_read = _paged_read
+
+        join = await client._order_trade_activity(order_id, client._clock.timestamp_ns())
+
+        assert join is not None
+        assert join.complete is False
+        assert join.trade_count == 0
+        assert len(queries) == 2, "page 2 must be READ, then refused -- not skipped"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_with_malformed_eof_never_retires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T3 (r2 M-5), end to end: a single page whose `eof` is a truthy
+    non-bool (`"false"`), with otherwise-clean zero-fill evidence (terminal
+    GET, empty activities, min age and baseline already satisfied by
+    `_arm_one_ambiguous_intent`), must stay AMBIGUOUS -- never retire. RED
+    today: `bool("false")` is truthy, so `_order_trade_activity` reports the
+    read complete and `_resolve_terminal_zero` retires it as
+    `STATUS_REPORT_ZERO_FILL_TERMINAL`."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [], "eof": "false",
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "a malformed non-bool eof must never authorize a zero-fill retirement"
+        )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_trade_on_page_one_then_malformed_page_two_still_contradicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T7 (r2 M-5; pins M-1): a real TRADE for THIS venue order id on page
+    1, followed by a malformed page 2, with a GET-terminal-zero order. The
+    resolver's evidence-contradiction CRITICAL must still fire -- a
+    malformed LATER page must never discard a trade an EARLIER page already
+    found. RED today (pre-M-1 `return None` shape): `_order_trade_activity`
+    returns `None` for the malformed page, so the caller's `join is None`
+    branch stays AMBIGUOUS WITHOUT ever raising the CRITICAL -- the trade
+    found on page 1 is silently lost."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        terminal_zero_body = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        positions_body = {"positions": {}, "eof": True}
+        activities_pages: list[Mapping[str, object]] = [
+            {
+                "activities": [
+                    {
+                        "type": "ACTIVITY_TYPE_TRADE",
+                        "trade": {
+                            "aggressor": {"id": order_id},
+                            "marketSlug": slug,
+                            "qtyDecimal": "1",
+                            "createTime": "2026-09-23T17:22:07.900000000Z",
+                        },
+                    },
+                ],
+                "eof": False,
+                "nextCursor": "c1",
+            },
+            {"activities": "not-a-list", "eof": True},
+        ]
+        activities_calls = {"count": 0}
+
+        async def _routed_read(path: str, query: Mapping[str, object] | None = None) -> Any:
+            if path == f"/v1/order/{order_id}":
+                return terminal_zero_body
+            if path == PORTFOLIO_POSITIONS_PATH:
+                return positions_body
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            page = activities_pages[activities_calls["count"]]
+            activities_calls["count"] += 1
+            return page
+
+        client._private_read = _routed_read
+        assert client.resolver_evidence_contradictions == ()
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, "a contradiction never retires"
+        contradictions = client.resolver_evidence_contradictions
+        assert len(contradictions) == 1
+        assert contradictions[0]["severity"] == "CRITICAL"
+        assert contradictions[0]["trade_count"] == "1"
+        await client._disconnect()
+
+
+def test_the_malformed_page_warnings_name_the_keys_they_saw() -> None:
+    """r2 M-2/M-5 (L-37): the malformed-page refusals must name the keys
+    they saw on the offending page, never `type(...).__name__` -- `self.
+    _log` is Nautilus's own Cython logger and cannot be observed at runtime
+    (established limitation, see the docstrings above), so this is a
+    source-level AST check that the function contains exactly two
+    `[k for k in page]` list comprehensions (the shape M-2 mandates,
+    because it adds no new callee the egress firewall guard would need to
+    admit -- `.keys()`/`list()`/`sorted()` are NOT on its allowlist)."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(
+        inspect.getsource(PolymarketUSExecutionClient._order_trade_activity),
+    )
+    tree = ast.parse(source)
+    key_naming_comprehensions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ListComp)
+        and isinstance(node.elt, ast.Name)
+        and node.elt.id == "k"
+        and node.generators
+        and isinstance(node.generators[0].target, ast.Name)
+        and node.generators[0].target.id == "k"
+        and isinstance(node.generators[0].iter, ast.Name)
+        and node.generators[0].iter.id == "page"
+    ]
+    assert len(key_naming_comprehensions) == 2, (
+        "both the non-list-activities and non-bool-eof warnings must name "
+        "the keys they saw via `[k for k in page]`"
+    )
+
+
+def test_a_multi_page_activities_read_logs_an_info_signal() -> None:
+    """T8 (r2 M-3, M-5): a read that traverses more than one page must log
+    an INFO line naming the page count -- the Step 2 probe trigger. `self.
+    _log` cannot be observed at runtime (see above), so this is the same
+    source-level pin idiom
+    `test_the_missing_instrument_escalation_is_gated_by_the_dedup_set`
+    already uses."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._order_trade_activity)
+    marker = "_page_index > 0"
+    assert marker in source, "the multi-page signal must be gated on more than one page"
+    idx = source.index(marker)
+    block = source[idx : idx + 400]
+    assert "self._log.info(" in block
+    assert "pages" in block
+
+
 @pytest.mark.asyncio
 async def test_same_day_prior_durable_holding_does_not_block_true_zero_fill(
     tmp_path: Path,

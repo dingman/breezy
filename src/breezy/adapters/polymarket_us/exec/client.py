@@ -1528,6 +1528,20 @@ class TradeJoin:
     -- which :func:`PolymarketUSExecutionClient._order_trade_activity`
     still computes and logs (``page_min_create_ts_ns``), for observability
     only, never as a completeness signal.
+
+    **EDGE-2-MULTIPAGE step 1 (2026-09-27): a malformed page also stops the
+    read INCOMPLETE, never guessed complete.** Two defects (D1/D2) could
+    previously make a read look complete when it was not: ``bool(page.get(
+    "eof"))`` treated any truthy non-bool ``eof`` (``"false"``, ``1``, ...)
+    as EOF (D1), and a page whose ``activities`` field was missing or not a
+    list silently contributed zero rows while the loop carried on to a
+    later ``eof`` (D2). Both are now refused: any page with a non-list
+    ``activities`` or a present, non-bool ``eof`` stops the read the same
+    way a page-cap hit does -- ``complete=False``, with whatever trades were
+    already found on EARLIER pages still counted (a trade found before the
+    malformed page must still raise a contradiction, never be discarded).
+    The pagination boundary itself (D3, whether a cursor can skip or
+    reorder rows) stays UNLICENSED until the Step 2 probe runs.
     """
 
     complete: bool
@@ -3180,6 +3194,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         line) for the future ``EDGE-2-MULTIPAGE`` threshold branch; it is
         NOT consulted for completeness today (see :class:`TradeJoin`'s own
         docstring -- the coordinator amendment makes ``complete`` EOF-ONLY).
+
+        EDGE-2-MULTIPAGE step 1 (r2 M-1): a MALFORMED page (``activities``
+        not a list, or ``eof`` present and not a bool) never returns
+        ``None`` -- unlike the read-failure/non-object shapes above, a
+        malformed page still carries whatever trades earlier pages already
+        found, so it stops the read the same way a page-cap hit does:
+        ``TradeJoin(complete=False, ...)`` with those trades counted. A
+        trade already found before the malformed page must still raise the
+        resolver's evidence-contradiction CRITICAL; a bare ``None`` would
+        have silently discarded that evidence instead.
         """
         cursor: str | None = None
         trade_refs: list[TradeActivityRef] = []
@@ -3207,19 +3231,43 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     "not an object; trade join incomplete"
                 )
                 return None
+            activities_field = page.get("activities")
+            if not isinstance(activities_field, list):
+                self._log.warning(
+                    f"resolver: activities page for venue order {redacted} carried "
+                    f"a non-list activities field (keys={[k for k in page]}); "
+                    "trade join incomplete"
+                )
+                break
             trade_refs.extend(trade_rows_for_order(page, venue_order_id))
             page_min = page_min_create_ts_ns(page)
             if page_min is not None and (
                 running_min_create_ts_ns is None or page_min < running_min_create_ts_ns
             ):
                 running_min_create_ts_ns = page_min
-            if bool(page.get("eof")):
+            eof_value = page.get("eof")
+            if "eof" in page and not isinstance(eof_value, bool):
+                self._log.warning(
+                    f"resolver: activities page for venue order {redacted} carried "
+                    f"a non-bool eof field (keys={[k for k in page]}); "
+                    "trade join incomplete"
+                )
+                break
+            if eof_value is True:
                 reached_eof = True
                 break
             next_cursor = page.get("nextCursor")
             cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
             if not cursor:
                 break
+        if _page_index > 0:
+            # M-3 (r2 delta): a multi-page read is visible at INFO -- the
+            # Step 2 probe is triggered when this line appears (or the
+            # account's activity count reaches 80+, checked outside code).
+            self._log.info(
+                f"resolver: activities join for venue order {redacted} traversed "
+                f"{_page_index + 1} pages"
+            )
         self._log.debug(
             f"resolver: activities join for venue order {redacted} "
             f"complete={reached_eof} trade_count={len(trade_refs)} "
