@@ -4898,7 +4898,40 @@ class TestDoMiddayWatchBootRetryEntryGuard:
 
         assert read_calls == []
         assert sink.payloads == []
-        assert result == (6002, None, state)
+        # [FU-17b item 2] This exact fallback branch now latches a
+        # once-per-day interim WARNING -- extended from a bare identity
+        # check to account for that one new field.
+        assert result == (6002, None, replace(state, boot_retry_unknown_log_fallback_warned=True))
+
+    def test_unowned_unknown_log_fallback_warns_once_per_trading_day(self, tmp_path, caplog):
+        ports = _make_ports(process_alive=lambda _pid: False)
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        with caplog.at_level("WARNING", logger="breezy.runtime.trade_supervisor"):
+            _pid, _log, state = _do_midday_watch(
+                ports=ports,
+                state=state,
+                now=_utc(17, 25),
+                tracked_pid=6002,
+                node_log=None,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+            _do_midday_watch(
+                ports=ports,
+                state=state,
+                now=_utc(17, 30),
+                tracked_pid=6002,
+                node_log=None,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+
+        fallback_records = [
+            r for r in caplog.records if "boot_retry_unknown_log_fallback" in r.getMessage()
+        ]
+        assert len(fallback_records) == 1
+        assert fallback_records[0].levelname == "WARNING"
+        assert "reason=unowned_unknown_log" in fallback_records[0].getMessage()
+        assert "6002" not in fallback_records[0].getMessage()
 
     def test_adopted_unknown_log_node_dies_transient_and_owned_is_false_so_nothing_spawns(
         self, tmp_path
@@ -4932,7 +4965,12 @@ class TestDoMiddayWatchBootRetryEntryGuard:
 
         assert spawner.calls == []
         assert sink.payloads == []
-        assert result == (adopted_pid, None, state)
+        # [FU-17b item 2] Same latch as above -- extended, not weakened.
+        assert result == (
+            adopted_pid,
+            None,
+            replace(state, boot_retry_unknown_log_fallback_warned=True),
+        )
 
 
 # ===========================================================================
@@ -5419,7 +5457,7 @@ class TestDoBootRetryWindowClosedCheck:
             AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY.value
         ]
 
-    def test_dispatch_wrapper_contains_a_raising_check(self, monkeypatch):
+    def test_dispatch_wrapper_contains_a_raising_check(self, monkeypatch, caplog):
         import breezy.runtime.trade_supervisor as ts
 
         def _boom(**_kw):
@@ -5428,10 +5466,19 @@ class TestDoBootRetryWindowClosedCheck:
         monkeypatch.setattr(ts, "_do_boot_retry_window_closed_check", _boom)
         ports = _make_ports()
         state = _boot_retry_limbo_state(_DAY)
-        result = _dispatch_boot_retry_window_closed_check(
-            ports=ports, state=state, now=midday_watch_window_end(_DAY)
-        )
+        with caplog.at_level("INFO", logger="breezy.runtime.trade_supervisor"):
+            result = _dispatch_boot_retry_window_closed_check(
+                ports=ports, state=state, now=midday_watch_window_end(_DAY)
+            )
         assert result is state
+        records = [
+            r
+            for r in caplog.records
+            if "phase_exception_contained" in r.getMessage()
+            and "phase=boot_retry_window_closed" in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
 
 
 class TestRunForeverBootRetryWindowClosed:
