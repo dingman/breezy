@@ -6,6 +6,7 @@ them reads or writes `~/.local/share/breezy/derived`.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -49,6 +50,7 @@ from breezy.analysis.hypothesis_ledger import (
     STATION_DAY_STATISTIC,
     VARIANCE_BOUND,
     HypothesisLook,
+    HypothesisRecord,
     read_hypothesis_ledger,
     recompute_mde,
     register_hypothesis,
@@ -1245,3 +1247,244 @@ def test_has_registered_draw_binding_false_and_names_the_missing_variant() -> No
     )
     assert _has_registered_draw_binding(corrupted, "v1") is True
     assert _has_registered_draw_binding(corrupted, "v2") is False
+
+
+# --------------------------------------------------------------------------
+# LEDGER-V3 (RA-9d per-record horizon + RA-8c re_arm_gating), EDGE-5 2026-09-27
+# --------------------------------------------------------------------------
+
+_V3_TEST_FILTER = "station=ALL|hour_lst=ALL|side=ALL|composition_kind=test"
+
+
+def _v3_horizon_record(
+    *, hypothesis_id: str, registered_at: str, horizon_days: int | None
+) -> HypothesisRecord:
+    """A schema_version=3 record, built directly (not via `register_hypothesis`,
+    which refuses any v3 call reaching REGISTERED/PARKED look-taking status
+    while `HORIZON_TOLLING_LANDED` is False) -- mirrors the plan's own note
+    that "the triage tests build HypothesisRecord directly"."""
+    per_variant_alpha = (PROGRAMME_ALPHA / MAX_HYPOTHESES) / 1
+    mde = recompute_mde(per_variant_alpha=per_variant_alpha, n_station_days=20)
+    return HypothesisRecord(
+        schema_version=3,
+        hypothesis_id=hypothesis_id,
+        hypothesis_class="ARCHIVE_RECAL",
+        registered_at=registered_at,
+        k_variants=1,
+        allocated_alpha=PROGRAMME_ALPHA / MAX_HYPOTHESES,
+        per_variant_alpha=per_variant_alpha,
+        min_station_days=20,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=mde,
+        mde_plausibility_bound=mde + 1.0,
+        power_is_primary_only=True,
+        mde_reference_ask=0.30,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=0.01,
+        mde_variance_bound=VARIANCE_BOUND,
+        mde_variance_bound_justification=None,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=1,
+        look_policy="SINGLE_LOOK",
+        freeze_commit="abc1234",
+        status="PARKED_INSUFFICIENT_DATA",
+        is_zero_look=False,
+        variant_stratum_filters=(_V3_TEST_FILTER,),
+        horizon_days=horizon_days,
+        re_arm_gating=False,
+    )
+
+
+def _v3_confirmed_shape_record(
+    *, hypothesis_id: str, re_arm_gating: bool, allocated_alpha: float, per_variant_alpha: float
+) -> HypothesisRecord:
+    """A schema_version=3, non-zero-look record shaped for `_write_handoff`
+    (`may_gate_re_arm`) tests -- status is irrelevant to that predicate."""
+    return HypothesisRecord(
+        schema_version=3,
+        hypothesis_id=hypothesis_id,
+        hypothesis_class="ARCHIVE_RECAL",
+        registered_at="2026-09-01",
+        k_variants=1,
+        allocated_alpha=allocated_alpha,
+        per_variant_alpha=per_variant_alpha,
+        min_station_days=1,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=0.5,
+        mde_plausibility_bound=0.5,
+        power_is_primary_only=True,
+        mde_reference_ask=0.30,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=0.01,
+        mde_variance_bound=VARIANCE_BOUND,
+        mde_variance_bound_justification=None,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=1,
+        look_policy="SINGLE_LOOK",
+        freeze_commit="abc1234",
+        status="CONFIRMED",
+        is_zero_look=False,
+        variant_stratum_filters=(_V3_TEST_FILTER,),
+        horizon_days=None,
+        re_arm_gating=re_arm_gating,
+    )
+
+
+def test_v3_180_day_horizon_does_not_stall_at_day_22(tmp_path: Path) -> None:
+    """Regression twin of `test_parked_past_horizon_...` (v1, 21-day default)
+    -- a v3 record's own 180-day horizon must not stall at day 31."""
+    hypothesis_id = "H-V3-HORIZON-180-OK"
+    record = _v3_horizon_record(
+        hypothesis_id=hypothesis_id, registered_at="2026-08-01", horizon_days=180
+    )
+    write_hypothesis_ledger(_ledger(tmp_path), (record,))
+    _empty_replay_files(tmp_path)
+    proc, alerts = _run(tmp_path, as_of="2026-09-01")
+    assert proc.returncode == 0, proc.stderr
+    assert alerts == []
+    assert read_hypothesis_ledger(_ledger(tmp_path))[0].status == "PARKED_INSUFFICIENT_DATA"
+
+
+def test_v3_180_day_horizon_stalls_at_day_181(tmp_path: Path) -> None:
+    hypothesis_id = "H-V3-HORIZON-180-STALL"
+    record = _v3_horizon_record(
+        hypothesis_id=hypothesis_id, registered_at="2026-01-01", horizon_days=180
+    )
+    write_hypothesis_ledger(_ledger(tmp_path), (record,))
+    _empty_replay_files(tmp_path)
+    as_of = (date(2026, 1, 1) + timedelta(days=181)).isoformat()
+    proc, alerts = _run(tmp_path, as_of=as_of)
+    assert proc.returncode == 0, proc.stderr
+    assert len(alerts) == 1
+    assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_HORIZON_STALL"
+    assert "180" in alerts[0]["detail"]
+
+
+def test_v3_null_horizon_falls_back_to_cli(tmp_path: Path) -> None:
+    """A v3 record with `horizon_days=None` behaves exactly like a v1/v2
+    record: the CLI default (21 days, `_run` passes no `--horizon-days`)
+    applies, and the alert names THAT horizon."""
+    hypothesis_id = "H-V3-HORIZON-NULL"
+    record = _v3_horizon_record(
+        hypothesis_id=hypothesis_id, registered_at="2026-08-01", horizon_days=None
+    )
+    write_hypothesis_ledger(_ledger(tmp_path), (record,))
+    _empty_replay_files(tmp_path)
+    proc, alerts = _run(tmp_path, as_of="2026-09-01")
+    assert proc.returncode == 0, proc.stderr
+    assert len(alerts) == 1
+    assert alerts[0]["event"] == "HYPOTHESIS_TRIAGE_HORIZON_STALL"
+    assert "21" in alerts[0]["detail"]
+
+
+def test_handoff_carries_may_gate_re_arm(tmp_path: Path) -> None:
+    look = HypothesisLook(
+        hypothesis_id="H-HANDOFF-RESEARCH",
+        variant_id="v1",
+        looked_at="2026-09-25",
+        n_station_days=300,
+        n_station_days_observed=300,
+        n_station_days_with_takes=300,
+        take_rate=1.0,
+        ci_lower=0.01,
+        ci_upper=0.05,
+        pooled_net_pnl_per_contract=10.0,
+        max_single_day_leg_share=0.1,
+        veto_reason="NONE",
+        alpha_spent_cumulative=0.0125,
+        is_terminal_look=True,
+    )
+    research_record = _v3_confirmed_shape_record(
+        hypothesis_id="H-HANDOFF-RESEARCH",
+        re_arm_gating=False,
+        allocated_alpha=PROGRAMME_ALPHA / MAX_HYPOTHESES,
+        per_variant_alpha=PROGRAMME_ALPHA / MAX_HYPOTHESES,
+    )
+    triage_module._write_handoff(tmp_path, look, research_record)
+    research_payload = json.loads(
+        (tmp_path / "hypothesis" / f"handoff_{look.hypothesis_id}.json").read_text()
+    )
+    assert research_payload["may_gate_re_arm"] is False
+
+    gating_look = replace(look, hypothesis_id="H-HANDOFF-GATING")
+    gating_record = _v3_confirmed_shape_record(
+        hypothesis_id="H-HANDOFF-GATING",
+        re_arm_gating=True,
+        allocated_alpha=0.025 / MAX_HYPOTHESES,
+        per_variant_alpha=0.025 / MAX_HYPOTHESES,
+    )
+    triage_module._write_handoff(tmp_path, gating_look, gating_record)
+    gating_payload = json.loads(
+        (tmp_path / "hypothesis" / f"handoff_{gating_look.hypothesis_id}.json").read_text()
+    )
+    assert gating_payload["may_gate_re_arm"] is True
+
+
+def _module_source_files() -> list[Path]:
+    """Every non-test `.py` file under `src/` or `scripts/` (R3-4/R3-5 scope)."""
+    files: list[Path] = []
+    for root_name in ("src", "scripts"):
+        files.extend((REPO_ROOT / root_name).rglob("*.py"))
+    return [path for path in files if "tests" not in path.parts]
+
+
+def _imports_hypothesis_record(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.endswith("hypothesis_ledger")
+            and any(alias.name == "HypothesisRecord" for alias in node.names)
+        ):
+            return True
+    return False
+
+
+def test_no_module_importing_hypothesisrecord_uses_dataclasses_replace() -> None:
+    """R3-4: only `hypothesis_ledger.py` (the definer) may call
+    `dataclasses.replace`/`replace(...)` on a `HypothesisRecord`. Every other
+    module that imports `HypothesisRecord` must go through
+    `replace_record_status` instead. Must NOT trip on `os.replace` or a local
+    name such as `_replace_status`."""
+    offenders: list[str] = []
+    for path in _module_source_files():
+        if path.name == "hypothesis_ledger.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if not _imports_hypothesis_record(tree):
+            continue
+        imports_bare_replace = any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "dataclasses"
+            and any(alias.name == "replace" for alias in node.names)
+            for node in ast.walk(tree)
+        )
+        if imports_bare_replace:
+            offenders.append(f"{path}: imports `replace` from dataclasses")
+            continue
+        calls_dataclasses_replace = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "replace"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "dataclasses"
+            for node in ast.walk(tree)
+        )
+        if calls_dataclasses_replace:
+            offenders.append(f"{path}: calls dataclasses.replace")
+    assert offenders == []
+
+
+def test_no_module_other_than_hypothesis_ledger_reads_re_arm_gating_attribute() -> None:
+    """R3-5: scope is `src/` and `scripts/` only -- tests may read
+    `.re_arm_gating` directly; every non-test consumer must call
+    `may_gate_re_arm` instead."""
+    offenders: list[str] = []
+    for path in _module_source_files():
+        if path.name == "hypothesis_ledger.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "re_arm_gating":
+                offenders.append(f"{path}:{node.lineno}")
+    assert offenders == []

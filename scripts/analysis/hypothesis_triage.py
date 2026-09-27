@@ -27,7 +27,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -45,9 +45,11 @@ from breezy.analysis.hypothesis_ledger import (
     filter_zero_take_station_days,
     is_variant_eligible,
     max_single_day_leg_share,
+    may_gate_re_arm,
     parse_stratum_filter,
     pooled_net_pnl_per_contract,
     read_hypothesis_ledger,
+    replace_record_status,
     station_day_mean_x,
     write_hypothesis_ledger,
 )
@@ -438,7 +440,10 @@ def _replace_status(
     )
 
 
-def _write_handoff(derived_root: Path, look: HypothesisLook) -> None:
+def _write_handoff(derived_root: Path, look: HypothesisLook, record: HypothesisRecord) -> None:
+    """R3-6: the only downstream artefact for a CONFIRMED record. Carries
+    `may_gate_re_arm` (D-5) so a future re-arm consumer never has to read
+    `.re_arm_gating` itself -- no reader of this JSON exists today."""
     path = derived_root / "hypothesis" / f"handoff_{look.hypothesis_id}.json"
     payload = {
         "hypothesis_id": look.hypothesis_id,
@@ -448,6 +453,7 @@ def _write_handoff(derived_root: Path, look: HypothesisLook) -> None:
         "ci_upper": look.ci_upper,
         "take_rate": look.take_rate,
         "pooled_net_pnl_per_contract": look.pooled_net_pnl_per_contract,
+        "may_gate_re_arm": may_gate_re_arm(record),
     }
     _atomic_write_lines(path, [json.dumps(payload, sort_keys=True)])
 
@@ -547,9 +553,17 @@ def _completed_on_whole_days(
     ]
 
 
+def _effective_horizon(record: HypothesisRecord, cli_horizon_days: int) -> int:
+    """RA-9d: a schema_version=3 record's own `horizon_days` (when set)
+    always wins over the CLI `--horizon-days` value; `None` (every V1/V2
+    record, and a V3 record that declares no override) falls back to it."""
+    return record.horizon_days if record.horizon_days is not None else cli_horizon_days
+
+
 def _horizon_reached(record: HypothesisRecord, *, as_of: str, horizon_days: int) -> bool:
+    effective = _effective_horizon(record, horizon_days)
     parked_for = (date.fromisoformat(as_of) - date.fromisoformat(record.registered_at)).days
-    return parked_for > horizon_days
+    return parked_for > effective
 
 
 _VARIANT_ID_RE = re.compile(r"^v(\d+)$")
@@ -637,7 +651,7 @@ def _triage_record(
             _skip(record, variant_id, "ALREADY_LOOKED")
         rolled = _terminal_status(record, looks)
         if rolled is not None and rolled != record.status:
-            return replace(record, status=rolled), None, (
+            return replace_record_status(record, status=rolled), None, (
                 "HYPOTHESIS_ABANDONED_CAP_EXHAUSTED"
                 if rolled == "ABANDONED_CAP_EXHAUSTED"
                 else None
@@ -675,7 +689,7 @@ def _triage_record(
     if counted.n_station_days_with_takes < record.min_station_days:
         updated = record
         if record.status != "PARKED_INSUFFICIENT_DATA":
-            updated = replace(record, status="PARKED_INSUFFICIENT_DATA")
+            updated = replace_record_status(record, status="PARKED_INSUFFICIENT_DATA")
         event = None
         if _horizon_reached(updated, as_of=as_of, horizon_days=horizon_days):
             event = "HYPOTHESIS_TRIAGE_HORIZON_STALL"
@@ -725,7 +739,7 @@ def _triage_record(
     print(
         f"LOOK hypothesis_id={record.hypothesis_id} variant_id={variant_id} status={status}"
     )
-    return replace(record, status=status), look, event
+    return replace_record_status(record, status=status), look, event
 
 
 def run(
@@ -777,7 +791,9 @@ def run(
             rolled = _terminal_status(record, looks)
             if rolled is None or rolled == record.status:
                 continue
-            updated_records = _replace_status(updated_records, replace(record, status=rolled))
+            updated_records = _replace_status(
+                updated_records, replace_record_status(record, status=rolled)
+            )
             if rolled == "CONFIRMED":
                 confirming = next(
                     look
@@ -786,7 +802,7 @@ def run(
                     and look.ci_lower > 0
                     and look.veto_reason == "NONE"
                 )
-                _write_handoff(args.derived_root, confirming)
+                _write_handoff(args.derived_root, confirming, record)
             elif rolled == "ABANDONED_CAP_EXHAUSTED":
                 _emit(
                     alert_log=args.alert_log,
@@ -827,7 +843,7 @@ def run(
             append_hypothesis_evaluation(evaluations_path(args.derived_root), new_look)
             looks = (*looks, new_look)
             if updated.status == "CONFIRMED":
-                _write_handoff(args.derived_root, new_look)
+                _write_handoff(args.derived_root, new_look, record)
         if updated != record:
             updated_records = _replace_status(updated_records, updated)
         if event == "HYPOTHESIS_TRIAGE_HORIZON_STALL":
@@ -838,7 +854,7 @@ def run(
                     event=event,
                     detail=(
                         f"hypothesis {record.hypothesis_id} stayed PARKED_INSUFFICIENT_DATA "
-                        f"past the {args.horizon_days}-day horizon"
+                        f"past the {_effective_horizon(record, args.horizon_days)}-day horizon"
                     ),
                 )
                 horizon_alerted = frozenset((*horizon_alerted, record.hypothesis_id))

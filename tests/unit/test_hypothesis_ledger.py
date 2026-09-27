@@ -8,6 +8,7 @@ SS6.1/SS6.2, SS7 step 1, D1/D4/D6(i)/D12/D13.
 from __future__ import annotations
 
 import json
+from dataclasses import replace as dc_replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -15,19 +16,25 @@ from typing import Any
 import pytest
 
 from breezy.analysis.hypothesis_ledger import (
+    _SUPPORTED_SCHEMA_VERSIONS,
     EVIDENCED_FEE_THETA,
+    HORIZON_TOLLING_LANDED,
     HYPOTHESIS_LEDGER_SCHEMA_VERSION,
     HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
+    HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3,
     MAX_HYPOTHESES,
     MAX_SINGLE_DAY_LEG_SHARE,
     MAX_VARIANTS_PER_HYPOTHESIS,
     MIN_PER_VARIANT_ALPHA,
     PROGRAMME_ALPHA,
+    RE_ARM_GATING_PROGRAMME_ALPHA,
+    RULED_HORIZON_DAYS,
     STATION_DAY_STATISTIC,
     VARIANCE_BOUND,
     DuplicateHypothesisIdError,
     DuplicateHypothesisLedgerRecordError,
     DuplicateStratumAxisError,
+    HorizonTollingNotLandedError,
     HypothesisLedgerRecordError,
     HypothesisLook,
     HypothesisRecord,
@@ -52,12 +59,14 @@ from breezy.analysis.hypothesis_ledger import (
     filter_zero_take_station_days,
     is_variant_eligible,
     max_single_day_leg_share,
+    may_gate_re_arm,
     parse_stratum_filter,
     pooled_net_pnl_per_contract,
     programme_budget_remaining,
     read_hypothesis_ledger,
     recompute_mde,
     register_hypothesis,
+    replace_record_status,
     station_day_mean_variance,
     station_day_mean_x,
     write_hypothesis_ledger,
@@ -68,6 +77,8 @@ REGISTERED_AT = "2026-09-25"
 FREEZE_COMMIT = "abc1234"
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "hypothesis"
 LIVE_LEDGER_V1_FIXTURE = FIXTURES_DIR / "hypothesis_ledger_v1_2026-09-27.jsonl"
+LIVE_LEDGER_V2_FIXTURE = FIXTURES_DIR / "hypothesis_ledger_v2_2026-09-27.jsonl"
+LIVE_LEDGER_V3_FIXTURE = FIXTURES_DIR / "hypothesis_ledger_v3_2026-09-27.jsonl"
 
 
 def _mde_for(k_variants: int, min_station_days: int) -> float:
@@ -541,7 +552,11 @@ def test_duplicate_hypothesis_id_on_disk_is_a_hard_error(tmp_path: Path) -> None
 _VALID_FILTER = "station=SFO|hour_lst=10-11|side=YES|composition_kind=taker"
 
 
-def test_read_hypothesis_ledger_accepts_v1_and_v2_and_refuses_v3(tmp_path: Path) -> None:
+def test_read_hypothesis_ledger_accepts_v1_v2_v3_and_refuses_v4(tmp_path: Path) -> None:
+    """Renamed from `..._refuses_v3` (LEDGER-V3 D-7): the refusal keeps its
+    exact assertions, now naming schema_version=4, and pins the exact
+    supported set (`_SUPPORTED_SCHEMA_VERSIONS == frozenset({1, 2, 3})`)."""
+    assert _SUPPORTED_SCHEMA_VERSIONS == frozenset({1, 2, 3})
     v1_record = register_hypothesis(**_valid_kwargs(hypothesis_id="H-V1"))
     v2_record = register_hypothesis(
         **_valid_kwargs(
@@ -558,13 +573,13 @@ def test_read_hypothesis_ledger_accepts_v1_and_v2_and_refuses_v3(tmp_path: Path)
     assert round_tripped["H-V2"].schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
     assert round_tripped["H-V2"].variant_stratum_filters == (_VALID_FILTER,)
 
-    bad_path = tmp_path / "v3_ledger.jsonl"
-    bad_path.write_text(json.dumps({"schema_version": 3}) + "\n", encoding="utf-8")
+    bad_path = tmp_path / "v4_ledger.jsonl"
+    bad_path.write_text(json.dumps({"schema_version": 4}) + "\n", encoding="utf-8")
     with pytest.raises(UnknownHypothesisLedgerSchemaError) as excinfo:
         read_hypothesis_ledger(bad_path)
     message = str(excinfo.value)
-    assert "3" in message
-    assert "1" in message and "2" in message
+    assert "4" in message
+    assert "1" in message and "2" in message and "3" in message
 
 
 def test_v1_record_round_trip_is_byte_unchanged(tmp_path: Path) -> None:
@@ -772,3 +787,345 @@ def test_v1_from_dict_refuses_an_unexpected_variant_stratum_filters_key() -> Non
     payload = {**record.to_dict(), "variant_stratum_filters": [_VALID_FILTER]}
     with pytest.raises(HypothesisLedgerRecordError):
         HypothesisRecord.from_dict(payload)
+
+
+# --------------------------------------------------------------------------
+# LEDGER-V3 (RA-9d horizon_days + RA-8c re_arm_gating), EDGE-5 2026-09-27
+# --------------------------------------------------------------------------
+
+
+def _direct_v3_record(
+    *,
+    hypothesis_id: str = "H-V3-DIRECT",
+    horizon_days: int | None = None,
+    re_arm_gating: bool = False,
+    status: str = "UNDERPOWERED_NOT_REGISTERED",
+    is_zero_look: bool = True,
+    k_variants: int = 1,
+    allocated_alpha: float = 0.0,
+    per_variant_alpha: float = 0.0,
+    variant_stratum_filters: tuple[str, ...] = (),
+) -> HypothesisRecord:
+    """A schema_version=3 `HypothesisRecord`, built directly rather than via
+    `register_hypothesis` -- lets a test hold `HORIZON_TOLLING_LANDED=False`
+    and `re_arm_gating`/`is_zero_look` combinations `register_hypothesis`'s
+    own REGISTERED-branch refusals would otherwise block (mirrors the triage
+    tests, which build `HypothesisRecord` directly for the same reason)."""
+    return HypothesisRecord(
+        schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3,
+        hypothesis_id=hypothesis_id,
+        hypothesis_class="V3_DIRECT_TEST",
+        registered_at=REGISTERED_AT,
+        k_variants=k_variants,
+        allocated_alpha=allocated_alpha,
+        per_variant_alpha=per_variant_alpha,
+        min_station_days=300,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=0.5,
+        mde_plausibility_bound=0.5,
+        power_is_primary_only=True,
+        mde_reference_ask=0.30,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=0.01,
+        mde_variance_bound=VARIANCE_BOUND,
+        mde_variance_bound_justification=None,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=1,
+        look_policy="SINGLE_LOOK",
+        freeze_commit=FREEZE_COMMIT,
+        status=status,
+        is_zero_look=is_zero_look,
+        variant_stratum_filters=variant_stratum_filters,
+        horizon_days=horizon_days,
+        re_arm_gating=re_arm_gating,
+    )
+
+
+def test_max_hypotheses_and_re_arm_gating_alpha_are_pinned() -> None:
+    """D-1 MAX_HYPOTHESES coupling: both values are locked together by the
+    RULING_RA-9 A-3a bound; changing either needs a new ruling first."""
+    assert MAX_HYPOTHESES == 4, (
+        "the RULING_RA-9 A-3a bound (allocated_alpha * MAX_HYPOTHESES <= 0.025) "
+        "must be re-derived by a ruling before MAX_HYPOTHESES changes"
+    )
+    assert RE_ARM_GATING_PROGRAMME_ALPHA == 0.025, (
+        "RULING_RA-9 A-3a fixes this bound; changing it needs a new ruling"
+    )
+
+
+def test_re_arm_gating_without_0_025_override_is_refused() -> None:
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            **_valid_kwargs(hypothesis_id="H-GATE-NO-OVERRIDE", k_variants=1, re_arm_gating=True)
+        )
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-GATE-TOO-LOOSE",
+                k_variants=1,
+                re_arm_gating=True,
+                programme_alpha_override=0.05,
+            )
+        )
+
+
+def test_re_arm_gating_with_override_0_025_registers_v3() -> None:
+    """`re_arm_gating=True` with a compliant override "registers" (no
+    exception) as schema_version=3 -- forced UNDERPOWERED here so the call
+    does not also need `HORIZON_TOLLING_LANDED` (RA-9 Path A, R3-2)."""
+    record = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-GATE-OK",
+            k_variants=1,
+            re_arm_gating=True,
+            programme_alpha_override=0.025,
+            mde_at_allocated_alpha=_mde_for_alpha(0.025, 1, 300),
+            mde_plausibility_bound=0.01,
+        )
+    )
+    assert record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
+    assert record.status == "UNDERPOWERED_NOT_REGISTERED"
+    assert record.is_zero_look is True
+    assert record.re_arm_gating is True
+
+
+def test_research_only_may_keep_0_05_but_never_gates() -> None:
+    record = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-RESEARCH-ONLY",
+            k_variants=1,
+            re_arm_gating=False,
+            mde_plausibility_bound=0.01,
+        )
+    )
+    assert record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
+    assert record.re_arm_gating is False
+    assert may_gate_re_arm(record) is False
+
+
+def test_undeclared_v1_v2_record_cannot_gate_re_arm() -> None:
+    v1 = register_hypothesis(**_valid_kwargs(hypothesis_id="H-UNDECLARED-V1"))
+    assert v1.re_arm_gating is None
+    assert may_gate_re_arm(v1) is False
+    v2 = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-UNDECLARED-V2",
+            k_variants=1,
+            variant_stratum_filters=(_VALID_FILTER,),
+        )
+    )
+    assert v2.re_arm_gating is None
+    assert may_gate_re_arm(v2) is False
+
+
+def test_replace_to_gating_above_0_025_raises() -> None:
+    """The forgeability attack D-1 defends against: naively flipping
+    `re_arm_gating` on a record registered at the default 0.05 programme
+    alpha must not silently gate a re-arm."""
+    record = register_hypothesis(**_valid_kwargs(hypothesis_id="H-REPLACE-GATE"))
+    with pytest.raises(ValueError):
+        dc_replace(
+            record,
+            schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3,
+            re_arm_gating=True,
+        )
+
+
+def test_v3_from_dict_refuses_null_re_arm_gating() -> None:
+    record = _direct_v3_record(horizon_days=180, re_arm_gating=True)
+    payload = {**record.to_dict(), "re_arm_gating": None}
+    with pytest.raises(HypothesisLedgerRecordError):
+        HypothesisRecord.from_dict(payload)
+
+
+def test_horizon_days_without_re_arm_gating_is_refused() -> None:
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-HORIZON-NO-GATE",
+                horizon_days=180,
+                mde_plausibility_bound=0.01,
+            )
+        )
+
+
+def test_closed_disposition_refuses_v3_kwargs() -> None:
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            hypothesis_id="H-CLOSED-V3",
+            hypothesis_class="FORECAST_TAKER",
+            registered_at=REGISTERED_AT,
+            k_variants=1,
+            freeze_commit=FREEZE_COMMIT,
+            existing_records=(),
+            disposition="CLOSED",
+            horizon_days=180,
+            re_arm_gating=True,
+        )
+
+
+def test_v3_from_dict_refuses_missing_key() -> None:
+    record = _direct_v3_record(horizon_days=180, re_arm_gating=True)
+    payload = record.to_dict()
+    del payload["re_arm_gating"]
+    with pytest.raises(HypothesisLedgerRecordError):
+        HypothesisRecord.from_dict(payload)
+
+
+def test_v3_from_dict_refuses_extra_key() -> None:
+    record = _direct_v3_record(horizon_days=180, re_arm_gating=True)
+    payload = {**record.to_dict(), "unexpected_v3_key": 1}
+    with pytest.raises(HypothesisLedgerRecordError):
+        HypothesisRecord.from_dict(payload)
+
+
+def test_v3_from_dict_refuses_bool_horizon_days() -> None:
+    record = _direct_v3_record(horizon_days=180, re_arm_gating=True)
+    payload = {**record.to_dict(), "horizon_days": True}
+    with pytest.raises(HypothesisLedgerRecordError):
+        HypothesisRecord.from_dict(payload)
+
+
+@pytest.mark.parametrize("bad_horizon", [0, 1, 181, 90])
+def test_horizon_days_not_in_ruled_set_is_refused(bad_horizon: int) -> None:
+    assert bad_horizon not in RULED_HORIZON_DAYS
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id=f"H-BAD-HORIZON-{bad_horizon}",
+                horizon_days=bad_horizon,
+                re_arm_gating=False,
+                mde_plausibility_bound=0.01,
+            )
+        )
+
+
+def test_re_arm_gating_boundary_exact_0_025_passes_and_0_025_plus_eps_fails() -> None:
+    """R3-8: an EXACT float comparison, no tolerance."""
+    base_kwargs: dict[str, Any] = {
+        "schema_version": HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3,
+        "hypothesis_class": "TEST",
+        "registered_at": REGISTERED_AT,
+        "k_variants": 1,
+        "min_station_days": 300,
+        "max_single_day_leg_share_cap": MAX_SINGLE_DAY_LEG_SHARE,
+        "mde_at_allocated_alpha": 0.5,
+        "mde_plausibility_bound": 0.5,
+        "power_is_primary_only": True,
+        "mde_reference_ask": 0.30,
+        "mde_fee_theta": EVIDENCED_FEE_THETA,
+        "mde_slippage_allowance": 0.01,
+        "mde_variance_bound": VARIANCE_BOUND,
+        "mde_variance_bound_justification": None,
+        "station_day_statistic": STATION_DAY_STATISTIC,
+        "order_quantity": 1,
+        "look_policy": "SINGLE_LOOK",
+        "freeze_commit": FREEZE_COMMIT,
+        "status": "REGISTERED",
+        "is_zero_look": False,
+        "variant_stratum_filters": (_VALID_FILTER,),
+        "horizon_days": None,
+        "re_arm_gating": True,
+    }
+    exact_alpha = RE_ARM_GATING_PROGRAMME_ALPHA / MAX_HYPOTHESES
+    passing = HypothesisRecord(
+        hypothesis_id="H-BOUNDARY-PASS",
+        allocated_alpha=exact_alpha,
+        per_variant_alpha=exact_alpha,
+        **base_kwargs,
+    )
+    assert passing.allocated_alpha * MAX_HYPOTHESES == RE_ARM_GATING_PROGRAMME_ALPHA
+    with pytest.raises(ValueError):
+        HypothesisRecord(
+            hypothesis_id="H-BOUNDARY-FAIL",
+            allocated_alpha=exact_alpha + 1e-9,
+            per_variant_alpha=exact_alpha + 1e-9,
+            **base_kwargs,
+        )
+
+
+def test_replace_record_status_refuses_frozen_field_change() -> None:
+    """R3-1: the signature accepts ONLY `status` -- every other field is
+    frozen by construction (a keyword `replace_record_status` doesn't
+    declare is a `TypeError`, not a deny-list to keep in sync)."""
+    record = register_hypothesis(**_valid_kwargs(hypothesis_id="H-REPLACE-STATUS"))
+    with pytest.raises(TypeError):
+        replace_record_status(  # type: ignore[call-arg]
+            record, status="REJECTED", hypothesis_class="OTHER"
+        )
+    updated = replace_record_status(record, status="REJECTED")
+    assert updated.status == "REJECTED"
+    assert updated.hypothesis_class == record.hypothesis_class
+    assert updated.schema_version == record.schema_version
+    assert updated.is_zero_look == record.is_zero_look
+
+
+def test_v3_look_taking_refused_while_tolling_not_landed() -> None:
+    assert HORIZON_TOLLING_LANDED is False
+    with pytest.raises(HorizonTollingNotLandedError):
+        register_hypothesis(
+            **_valid_kwargs(
+                hypothesis_id="H-V3-TOLLING",
+                k_variants=1,
+                re_arm_gating=False,
+                variant_stratum_filters=(_VALID_FILTER,),
+            )
+        )
+
+
+def test_v3_look_taking_without_filters_refused() -> None:
+    """Distinct from the tolling refusal above (`StratumFilterCountMismatchError`
+    vs `HorizonTollingNotLandedError`) -- R3-2 places the filters check first,
+    so a missing-filters call fails for its OWN reason even though
+    `HORIZON_TOLLING_LANDED` is also False."""
+    with pytest.raises(StratumFilterCountMismatchError):
+        register_hypothesis(
+            **_valid_kwargs(hypothesis_id="H-V3-NO-FILTERS", k_variants=1, re_arm_gating=False)
+        )
+
+
+def test_v3_underpowered_call_with_no_filters_and_tolling_not_landed_registers_fine() -> None:
+    """R3-2: RA-9 Path A keeps working -- a v3 UNDERPOWERED outcome is never
+    blocked by either REGISTERED-branch-only refusal."""
+    assert HORIZON_TOLLING_LANDED is False
+    record = register_hypothesis(
+        **_valid_kwargs(
+            hypothesis_id="H-V3-PATH-A",
+            k_variants=1,
+            re_arm_gating=False,
+            mde_plausibility_bound=0.01,
+        )
+    )
+    assert record.status == "UNDERPOWERED_NOT_REGISTERED"
+    assert record.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
+    assert record.is_zero_look is True
+    assert record.variant_stratum_filters == ()
+
+
+@pytest.mark.parametrize(
+    "fixture_path", [LIVE_LEDGER_V1_FIXTURE, LIVE_LEDGER_V2_FIXTURE, LIVE_LEDGER_V3_FIXTURE]
+)
+def test_each_fixture_round_trips_byte_identically(fixture_path: Path, tmp_path: Path) -> None:
+    original_bytes = fixture_path.read_bytes()
+    path = tmp_path / fixture_path.name
+    path.write_bytes(original_bytes)
+    records = read_hypothesis_ledger(path)
+    assert len(records) >= 1
+    write_hypothesis_ledger(path, records)
+    assert path.read_bytes() == original_bytes
+
+
+def test_mixed_v1_v2_v3_whole_file_rewrite_leaves_existing_lines_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """AC1 extends the pre-existing v1+v2 mixed-rewrite test to v1+v2+v3."""
+    v1_bytes = LIVE_LEDGER_V1_FIXTURE.read_bytes()
+    v2_bytes = LIVE_LEDGER_V2_FIXTURE.read_bytes()
+    v3_bytes = LIVE_LEDGER_V3_FIXTURE.read_bytes()
+    path = tmp_path / "mixed.jsonl"
+    path.write_bytes(v1_bytes + v2_bytes + v3_bytes)
+    existing = read_hypothesis_ledger(path)
+    write_hypothesis_ledger(path, existing)
+    rewritten_lines = set(path.read_text(encoding="utf-8").splitlines())
+    original_lines = set((v1_bytes + v2_bytes + v3_bytes).decode("utf-8").splitlines())
+    assert rewritten_lines == original_lines
