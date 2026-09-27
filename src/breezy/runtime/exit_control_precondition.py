@@ -67,20 +67,29 @@ def read_exit_control_halt_precondition(
     checks ``store_path.is_file()`` FIRST and returns
     :data:`BLOCKED_HALT_STATE_UNREADABLE` without ever calling ``reader``,
     and without creating the file or its parent directory, when the store
-    does not already exist.
+    does not already exist. A malformed ``sending_family_id`` likewise has
+    no trustworthy halt key to read and fails closed with the same unreadable
+    verdict before touching the store.
     """
-    halt_key = continuous_family_halt_key(sending_family_id)
-    if not store_path.is_file():
+    try:
+        halt_key = continuous_family_halt_key(sending_family_id)
+    except ValueError:
+        halt_key = ""
         verdict = BLOCKED_HALT_STATE_UNREADABLE
     else:
-        try:
-            state = reader(store_path, sending_family_id)
-        except Exception:  # noqa: BLE001 - any reader failure fails closed, never propagates
+        if not store_path.is_file():
             verdict = BLOCKED_HALT_STATE_UNREADABLE
         else:
-            verdict = (
-                BLOCKED_FAMILY_HALT_SET if state.family_halted else HALT_CLEAR_NEXT_PRECONDITION
-            )
+            try:
+                state = reader(store_path, sending_family_id)
+            except Exception:  # noqa: BLE001 - any reader failure fails closed, never propagates
+                verdict = BLOCKED_HALT_STATE_UNREADABLE
+            else:
+                verdict = (
+                    BLOCKED_FAMILY_HALT_SET
+                    if state.family_halted
+                    else HALT_CLEAR_NEXT_PRECONDITION
+                )
     return HaltPreconditionReading(
         verdict=verdict,
         halt_key=halt_key,
