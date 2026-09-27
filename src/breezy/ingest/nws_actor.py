@@ -307,12 +307,17 @@ DEFAULT_OBSERVABILITY_IO_TIMEOUT_S: Final[float] = 30.0
 def _health() -> Any:
     """Import :mod:`breezy.runtime.health` at CALL time, not import time.
 
-    ``breezy/runtime/__init__.py`` imports ``breezy.runtime.composition``,
-    which imports ``NwsIngestActor`` from this module -- so a module-scope
-    ``from breezy.runtime.health import ...`` here is a genuine circular
-    import, and not a latent one: it was executed and it fails outright with
+    Historical cause (measured, not hypothesised): ``breezy/runtime/__init__.py``
+    used to import ``breezy.runtime.composition`` eagerly, which imports
+    ``NwsIngestActor`` from this module -- so a module-scope
+    ``from breezy.runtime.health import ...`` here was a genuine circular
+    import, and not a latent one: it was executed and it failed outright with
     *"cannot import name 'NwsIngestActor' from partially initialized module"*
-    whenever this module is imported before ``breezy.runtime``.
+    whenever this module was imported before ``breezy.runtime``.
+    NOTIFIER-IMPORT-ISOLATION made that package ``__init__`` import-free,
+    which removes the eager leg of that cycle -- but flipping this back to a
+    module-scope import is a separate, untested change (YAGNI), so the
+    call-time import stays.
 
     Deferring to call time is the same fix :meth:`NwsIngestActor._have_final_for`
     already applies to ``read_climate_day_as_of_settlement``, and it costs one

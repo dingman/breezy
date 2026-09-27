@@ -1,104 +1,51 @@
 """Runtime wiring: settings, node composition, health/alerting, logging.
 
-Curates the genuine cross-module public surface. Deliberately omits:
+**This package `__init__.py` must stay import-free.** ``breezy-study-failed``
+(`study_failure_notifier.py`) is the LAST line of alert delivery for a failed
+study unit -- see that module's own docstring, "a detector without delivery
+is not a control" (`study_failure_notifier.py:55-56`). Importing it, or any
+other `breezy.runtime.*` submodule, always runs this file first (ordinary
+Python package-import semantics), so an eager import here of
+`breezy.runtime.composition` -- which pulls in `nautilus_trader.live.node` --
+meant a broken Nautilus install, a missing dependency, or a syntax error
+anywhere in that chain also silently killed the alert that was supposed to
+report exactly that kind of failure (NOTIFIER-IMPORT-ISOLATION,
+2026-09-27).
 
-* ``breezy.runtime.cli`` (``run``/``main``/``EXIT_*``) -- the process
-  entrypoint, an "endpoint helper" per the standard's exclusion, not a
-  library surface other modules import.
-* ``breezy.runtime.sqlite_store`` -- owned by a concurrent change in this
-  session; re-exporting it here would couple this facade to in-flight work.
-  Callers that need ``SqliteStateStore`` already import it directly from
-  ``breezy.runtime.sqlite_store``.
-* ``bootstrap_witness.WITNESS_STORE_KEY`` / ``WITNESS_FILENAME`` -- no
-  cross-module caller reaches for the raw constants (only the
-  ``witness_file_path``/``enforce_bootstrap_witness`` functions), so they
-  stay module-private to this facade.
+**Deleted, not made lazy.** An earlier revision of this file re-exported 41
+names via a PEP 562 `__getattr__` facade. Peer review (architect, round 1)
+found zero callers: no `from breezy.runtime import <name>` and no
+`breezy.runtime.<name>` attribute access anywhere in `src/`, `tests/`, or
+`scripts/` ever used the facade -- every real call site imports the owning
+submodule directly (`from breezy.runtime.health import resolve_alert_sink`,
+`from breezy.runtime.composition import build_ingest_node`, etc.). With no
+consumer, a lazy `__getattr__`/`_LAZY` mapping would only add a way for
+`breezy.runtime.<typo>` to silently resolve to `AttributeError` at the wrong
+call site instead of at import time -- deleting the facade is the simpler,
+KISS/YAGNI-correct fix.
+
+**Verified safe (Stage 0, D-2 + R3-1 of the plan below).** Every Breezy
+`register_arrow(` call sits at module scope in the class's own defining
+module (`domain/*.py`, `adapters/polymarket_us/tape_records.py`,
+`strategy/current_rung_hold/monitor_records.py`), so any caller that already
+holds the class has already triggered its registration independent of this
+package's own imports. A `grimp`-based static reachability check (with
+synthetic `module -> ancestor package` edges, since `grimp` does not
+otherwise model that importing a submodule runs its ancestors' `__init__.py`
+first) across every `[project.scripts]` entry, every `deploy/systemd/`
+`ExecStart` module, and every `scripts/**/*.py` that imports `breezy.runtime`
+found ZERO entries that lose reachability to any `register_arrow` module
+once this file's own imports are removed -- corroborated by a fresh-process
+`sys.modules` snapshot per entry. See
+`docs/plans/backlog/EDGE_2026-09-27/NOTIFIER-IMPORT-ISOLATION_plan_r1_2026-09-27.md`
+and its `..._plan_r2_delta_2026-09-27.md` (r3 amendments are binding) for the
+full method, and `tests/unit/test_runtime_import_isolation.py` for the tests
+this guarantees stay true (T1, T4, T7 pin this file directly; T9 is the
+fresh-process import smoke test per entry).
+
+**A missing registration fails LOUDLY, never silently** (verified in the
+round-2 peer review): `nautilus_trader.serialization.arrow.serializer`
+raises `TypeError` (`:240-247,313-323`) or `KeyError` (`:81-82`) on an
+unregistered custom type at catalog read or write time -- there is no silent
+degradation path this file's own imports were ever load-bearing for.
 """
-
-from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness, witness_file_path
-from breezy.runtime.composition import (
-    BreezyIngestRuntime,
-    build_ingest_actors,
-    build_ingest_node,
-    ingest_runtime,
-    load_site_registry,
-    site_snapshot_path,
-    site_stagger_offset_seconds,
-)
-from breezy.runtime.health import (
-    ALERT_WEBHOOK_URL_ENV_VAR,
-    ALLOWED_ALERT_PAYLOAD_KEYS,
-    DEFAULT_RENOTIFY_AFTER_NS,
-    MAX_ALERT_DETAIL_CHARS,
-    SCHEMA_VERSION,
-    AlertCondition,
-    AlertConditionKey,
-    AlertPayload,
-    AlertSink,
-    AlertState,
-    GapSummary,
-    HealthSnapshot,
-    LoggingAlertSink,
-    SiteHealth,
-    TeeAlertSink,
-    WebhookAlertSink,
-    emit_alert,
-    resolve_alert_sink,
-    write_snapshot_atomic,
-)
-from breezy.runtime.logging_bridge import BREEZY_LOGGER_NAME, NautilusLoggingBridgeHandler
-from breezy.runtime.logging_bridge import install as install_logging_bridge
-from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
-from breezy.runtime.node_config import (
-    NWS_INGEST_ACTOR_CONFIG_PATH,
-    NWS_INGEST_ACTOR_PATH,
-    NodeConfigError,
-    actor_component_id,
-    build_node_config,
-    validated_trader_id,
-)
-from breezy.runtime.settings import BreezyRuntimeSettings, SettingsError, load_settings
-
-__all__ = [
-    "ALERT_WEBHOOK_URL_ENV_VAR",
-    "ALLOWED_ALERT_PAYLOAD_KEYS",
-    "BREEZY_LOGGER_NAME",
-    "DEFAULT_RENOTIFY_AFTER_NS",
-    "MAX_ALERT_DETAIL_CHARS",
-    "NWS_INGEST_ACTOR_CONFIG_PATH",
-    "NWS_INGEST_ACTOR_PATH",
-    "SCHEMA_VERSION",
-    "AlertCondition",
-    "AlertConditionKey",
-    "AlertPayload",
-    "AlertSink",
-    "AlertState",
-    "BreezyIngestRuntime",
-    "BreezyRuntimeSettings",
-    "GapSummary",
-    "HealthSnapshot",
-    "LoggingAlertSink",
-    "NautilusLoggingBridgeHandler",
-    "NodeConfigError",
-    "SettingsError",
-    "SiteHealth",
-    "TeeAlertSink",
-    "WebhookAlertSink",
-    "actor_component_id",
-    "build_ingest_actors",
-    "build_ingest_node",
-    "build_node_config",
-    "emit_alert",
-    "enforce_bootstrap_witness",
-    "ingest_runtime",
-    "install_logging_bridge",
-    "load_settings",
-    "load_site_registry",
-    "resolve_alert_sink",
-    "site_snapshot_path",
-    "site_stagger_offset_seconds",
-    "uninstall_logging_bridge",
-    "validated_trader_id",
-    "witness_file_path",
-    "write_snapshot_atomic",
-]

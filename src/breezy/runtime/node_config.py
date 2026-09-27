@@ -102,13 +102,18 @@ from breezy.runtime.submit_intent import SubmitIntentLatch
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
-    # inside :func:`build_quote_tape_node_config`, never at module scope:
-    # `breezy/runtime/__init__.py` eagerly imports `composition`, which imports
-    # this module, while `adapters.polymarket_us.config` imports
-    # `breezy.runtime.settings` -- so a module-scope adapter import here closes
-    # the cycle and raises `ImportError: partially initialized module`.
-    # Measured, not hypothesised. Keeping it under TYPE_CHECKING means mypy
-    # still checks the signature with the real type.
+    # inside :func:`build_quote_tape_node_config`, never at module scope.
+    # Historical cause (measured, not hypothesised): `composition` imports
+    # this module, and `adapters.polymarket_us.config` imports
+    # `breezy.runtime.settings` -- while `breezy/runtime/__init__.py` still
+    # eagerly imported `composition`, a module-scope adapter import here
+    # closed that cycle and raised `ImportError: partially initialized
+    # module`. NOTIFIER-IMPORT-ISOLATION made the package `__init__`
+    # import-free, which removes the eager leg of that cycle -- but flipping
+    # this back to a module-scope import is a separate, untested change
+    # (YAGNI), so the TYPE_CHECKING guard and the call-site import inside
+    # :func:`build_quote_tape_node_config` stay. Keeping it under
+    # TYPE_CHECKING means mypy still checks the signature with the real type.
     from breezy.adapters.polymarket_us.config import (
         PolymarketUSDataClientConfig,
         PolymarketUSExecClientConfig,
