@@ -569,6 +569,22 @@ class TestConsoleEntrypoint:
         assert code == EXIT_USAGE
         assert CATALOG_ENV_VAR in err.getvalue()
 
+    def test_a_preflight_error_never_reaches_the_extend_dedupe_summary_line(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Review finding 2 (ING-2-RSS): the `PreflightError` early return in
+        `run()` happens before the `extend_dedupe:` summary log call -- no
+        ingestion ran, so there is nothing to summarise."""
+        out, err = io.StringIO(), io.StringIO()
+
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
+            code = run([], env={}, stdout=out, stderr=err)
+
+        assert code == EXIT_USAGE
+        assert not any(
+            record.getMessage().startswith("extend_dedupe:") for record in caplog.records
+        )
+
     def test_dry_run_reports_without_converting_or_marking(self, tmp_path: Path) -> None:
         _touch(
             tmp_path,
@@ -588,6 +604,83 @@ class TestConsoleEntrypoint:
         assert code == EXIT_OK
         assert "dry-run" in out.getvalue()
         assert not (tmp_path / "live" / INSTANCE / ".converted-quote_tick").exists()
+
+
+class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
+    """Review finding 1 (ING-2-RSS, L-30/L-52): the `extend_dedupe:` INFO
+    line `run()` logs once per call, via the module-level
+    `extend_dedupe_counters` singleton reset at the top of every `run()`."""
+
+    def _extend_dedupe_lines(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("extend_dedupe:")
+        ]
+
+    def test_a_run_with_no_extend_chunks_emits_exactly_one_zero_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (tmp_path / "live").mkdir()
+        out, err = io.StringIO(), io.StringIO()
+
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
+            code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+
+        assert code == EXIT_OK
+        assert self._extend_dedupe_lines(caplog) == [
+            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
+        ]
+
+    def test_a_second_run_does_not_inherit_a_prior_runs_counts(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Pre-loads the module-level counter (simulating leftover state
+        from EXTEND activity that mutated it outside this `run()` call) and
+        confirms the SECOND `run()` still reports zero -- `run()` resets the
+        singleton on every call, not just once per process."""
+        (tmp_path / "live").mkdir()
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
+            run(
+                [], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=io.StringIO(), stderr=io.StringIO()
+            )
+
+        ingest_cli_module.extend_dedupe_counters.record(QuoteTick, filtered=True)
+
+        caplog.clear()
+        out, err = io.StringIO(), io.StringIO()
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
+            code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+
+        assert code == EXIT_OK
+        assert self._extend_dedupe_lines(caplog) == [
+            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
+        ]
+
+    def test_the_line_is_counts_only_and_never_carries_an_instrument_id(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _touch(
+            tmp_path,
+            INSTANCE,
+            "quote_tick_1.feather",
+            age_minutes=DEFAULT_LIVE_GRACE_MINUTES + 5,
+        )
+        out, err = io.StringIO(), io.StringIO()
+
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
+            run(
+                ["--dry-run"],
+                env={CATALOG_ENV_VAR: str(tmp_path)},
+                stdout=out,
+                stderr=err,
+            )
+
+        lines = self._extend_dedupe_lines(caplog)
+        assert len(lines) == 1
+        assert INSTANCE not in lines[0]
 
 
 class TestReEmittedInstrumentDefinitionsStillLand:
