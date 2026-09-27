@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -94,10 +95,12 @@ __all__ = [
     "is_trade_for_order",
     "is_trade_on_slug",
     "main",
+    "make_private_dir",
     "min_create_time_across_pages",
     "positive_control_trade_count",
     "q2s_stability_verdict",
     "redact_secrets",
+    "write_private_file",
 ]
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,59 @@ def redact_secrets(text: str, secrets: Sequence[str]) -> str:
         if secret:
             text = text.replace(secret, "<REDACTED>")
     return text
+
+
+# ---------------------------------------------------------------------------
+# PRIVATE file writing (mode 0600 AT CREATION -- never `write_text` then
+# `chmod`, which leaves a TOCTOU window at the process umask between the
+# file existing and its mode being narrowed)
+# ---------------------------------------------------------------------------
+
+
+def write_private_file(path: Path, content: str) -> None:
+    """Create ``path`` with mode 0600 atomically at creation, via
+    ``os.open`` with an explicit mode -- never a ``write_text`` followed by
+    a separate ``chmod``, which lets a concurrent reader observe the file at
+    the process umask (0755/0644 under the common ``022``) before the mode
+    is narrowed. ``O_EXCL`` is deliberately NOT set: a rerun against the
+    same evidence directory must be able to overwrite its own prior file.
+    Asserts the final mode is exactly 0600 (defence in depth against a
+    umask wider than ``main()``'s own ``0o077`` somehow leaking through).
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _PRIVATE_FILE_MODE)
+    try:
+        os.write(fd, content.encode("utf-8"))
+    finally:
+        os.close(fd)
+    actual_mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert actual_mode == _PRIVATE_FILE_MODE, (
+        f"{path} was created with mode {oct(actual_mode)}, expected {oct(_PRIVATE_FILE_MODE)}"
+    )
+
+
+def make_private_dir(path: Path) -> None:
+    """Create ``path`` (and any missing parents) with mode 0700 at
+    creation -- ``mkdir(mode=0o700)`` directly, never a separate ``chmod``
+    afterwards. ``0o700`` sets no group/other bits, so this is exactly 0700
+    under every umask this process runs with (umask can only CLEAR bits;
+    ``main()`` additionally narrows the process umask to ``0o077`` as
+    defence in depth, but this function's own mode argument does not
+    depend on that). Parent directories created along the way inherit
+    :func:`Path.mkdir`'s own default mode handling for intermediate
+    components; only the leaf evidence directory's mode is asserted here,
+    since that is the one PRIVATE files are written into.
+    """
+    if path.exists():
+        actual_mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert actual_mode == _PRIVATE_DIR_MODE, (
+            f"{path} already exists with mode {oct(actual_mode)}, expected {oct(_PRIVATE_DIR_MODE)}"
+        )
+        return
+    path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIR_MODE)
+    actual_mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert actual_mode == _PRIVATE_DIR_MODE, (
+        f"{path} was created with mode {oct(actual_mode)}, expected {oct(_PRIVATE_DIR_MODE)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +631,8 @@ async def _fetch_and_save(
         json.dumps(payload, default=str) if payload is not None else "", secrets
     )
     fn = out_dir / f"PRIVATE_{tag}.json"
-    fn.write_text(
+    write_private_file(
+        fn,
         json.dumps(
             {
                 "path": path,
@@ -586,9 +643,8 @@ async def _fetch_and_save(
             },
             indent=1,
             default=str,
-        )
+        ),
     )
-    os.chmod(fn, _PRIVATE_FILE_MODE)
     print(f"[{tag}] GET {path} q={query} -> status={status} file={fn}")
     return _FetchResult(
         tag=tag, path=path, query=query, status=status, payload=payload, attempts=attempts
@@ -643,8 +699,7 @@ async def _paginate_activities(
 async def _run_step0(
     client: PolymarketUSHttpClient, *, out_dir: Path, secrets: Sequence[str]
 ) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(out_dir, _PRIVATE_DIR_MODE)
+    make_private_dir(out_dir)
 
     # Q1: order_by_id.
     await _fetch_and_save(
@@ -743,8 +798,7 @@ async def _run_step0(
         print(f"[market_settlement] GET failed: {type(exc).__name__}")
     if settlement_result is not None:
         fn = out_dir / "PRIVATE_market_settlement.json"
-        fn.write_text(json.dumps({"payload": settlement_result}, indent=1, default=str))
-        os.chmod(fn, _PRIVATE_FILE_MODE)
+        write_private_file(fn, json.dumps({"payload": settlement_result}, indent=1, default=str))
         print(f"[market_settlement] file={fn}")
 
     # PC: positive control, over the descending run-1 pages already fetched.
@@ -770,32 +824,42 @@ async def _run_step0(
         "any_non_2xx": non_2xx_any,
     }
     summary_path = out_dir / "PRIVATE_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=1, default=str))
-    os.chmod(summary_path, _PRIVATE_FILE_MODE)
+    write_private_file(summary_path, json.dumps(summary, indent=1, default=str))
     print(f"SUMMARY: {json.dumps(summary, default=str)}")
 
 
 def main() -> int:
-    pid_result = subprocess.run(
-        ["pgrep", "-f", "breezy-trade$"], capture_output=True, text=True, check=False
-    )
-    secrets: list[str] = []
-    if pid_result.returncode == 0 and pid_result.stdout.strip():
-        try:
-            pid = pid_result.stdout.split()[0]
-            environ_bytes = Path(f"/proc/{pid}/environ").read_bytes()
-            live_env = {}
-            for kv in environ_bytes.split(b"\0"):
-                if b"=" in kv:
-                    k, v = kv.split(b"=", 1)
-                    live_env[k.decode()] = v.decode(errors="replace")
-            secrets = _redaction_secrets_from_environ(live_env)
-        except OSError:
-            secrets = []
+    # Defence in depth alongside `write_private_file`/`make_private_dir`'s
+    # own explicit modes (0600/0700, which are already umask-invariant for
+    # any umask that only clears group/other bits): narrow the process
+    # umask so ANY incidental file this process creates -- not only the two
+    # helpers above -- is private by default. Restored unconditionally so a
+    # library this process imports never inherits a narrowed umask past
+    # this function's return.
+    previous_umask = os.umask(0o077)
+    try:
+        pid_result = subprocess.run(
+            ["pgrep", "-f", "breezy-trade$"], capture_output=True, text=True, check=False
+        )
+        secrets: list[str] = []
+        if pid_result.returncode == 0 and pid_result.stdout.strip():
+            try:
+                pid = pid_result.stdout.split()[0]
+                environ_bytes = Path(f"/proc/{pid}/environ").read_bytes()
+                live_env = {}
+                for kv in environ_bytes.split(b"\0"):
+                    if b"=" in kv:
+                        k, v = kv.split(b"=", 1)
+                        live_env[k.decode()] = v.decode(errors="replace")
+                secrets = _redaction_secrets_from_environ(live_env)
+            except OSError:
+                secrets = []
 
-    client = build_production_client()
-    asyncio.run(_run_step0(client, out_dir=OUT_DIR, secrets=secrets))
-    return 0
+        client = build_production_client()
+        asyncio.run(_run_step0(client, out_dir=OUT_DIR, secrets=secrets))
+        return 0
+    finally:
+        os.umask(previous_umask)
 
 
 if __name__ == "__main__":  # pragma: no cover - operator entrypoint

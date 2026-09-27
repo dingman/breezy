@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
+import stat
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -544,6 +546,72 @@ class TestClassifyVerdict:
     ) -> None:
         evidence = _evidence(probe, q2_position_resolution_before_qty=Decimal(5))
         assert probe.classify_verdict(evidence) == probe.VERDICT_INCONCLUSIVE
+
+
+# ---------------------------------------------------------------------------
+# PRIVATE file/dir modes -- no TOCTOU window at a permissive process umask
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateFileModes:
+    """Security fix (coordinator round-2 REQUEST_CHANGES): `write_private_file`
+    and `make_private_dir` must create files/dirs at mode 0600/0700 AT
+    CREATION -- never `write_text`/`mkdir` followed by a separate `chmod`,
+    which would leave a TOCTOU window at the process umask. Proven here
+    under a deliberately PERMISSIVE umask (0o022, the common default) so a
+    process that never calls this module's own `main()` (and therefore
+    never narrows the umask to 0o077) still gets private files."""
+
+    @pytest.fixture(autouse=True)
+    def _permissive_umask(self):
+        previous = os.umask(0o022)
+        yield
+        os.umask(previous)
+
+    def test_write_private_file_creates_mode_0600_under_a_permissive_umask(
+        self, probe: ModuleType, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "PRIVATE_example.json"
+        probe.write_private_file(target, '{"k": "v"}')
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o600
+        assert target.read_text() == '{"k": "v"}'
+
+    def test_write_private_file_overwrite_stays_mode_0600(
+        self, probe: ModuleType, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "PRIVATE_example.json"
+        probe.write_private_file(target, "first")
+        probe.write_private_file(target, "second")
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o600
+        assert target.read_text() == "second"
+
+    def test_make_private_dir_creates_mode_0700_under_a_permissive_umask(
+        self, probe: ModuleType, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "evidence_dir"
+        probe.make_private_dir(target)
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o700
+        assert target.is_dir()
+
+    def test_make_private_dir_creates_missing_parents(
+        self, probe: ModuleType, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "a" / "b" / "evidence_dir"
+        probe.make_private_dir(target)
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o700
+
+    def test_make_private_dir_is_idempotent_on_an_existing_private_dir(
+        self, probe: ModuleType, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "evidence_dir"
+        probe.make_private_dir(target)
+        probe.make_private_dir(target)  # second call must not raise
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o700
 
 
 # ---------------------------------------------------------------------------

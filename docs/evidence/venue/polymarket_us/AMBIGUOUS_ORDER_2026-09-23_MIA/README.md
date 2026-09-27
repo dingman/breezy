@@ -34,9 +34,19 @@ history (a single page, `eof=true` on every traversal):
    (`PRIVATE_activities_asc_p0.json`) is the exact reverse of the descending
    run 1 sequence.
 
-Since Q2s is `STABLE`, slice D's `complete = eof ∨ min(createTime) < createdNs`
-rule is trusted as designed; it does not need to fall back to "complete only
-at `eof`" (plan section 8).
+**Scope note (python review round 2).** The account's entire history fit in
+ONE page on every traversal (`eof=true` from the first page each time), so
+the cursor path was never exercised and the `min(createTime) < createdNs`
+half of `complete = eof ∨ min(createTime) < createdNs` was never reached --
+only the `eof` branch was. `STABLE` therefore holds under the plan's literal
+Q2s definition (all three checks were evaluated and passed over what the
+venue actually returned), but it licenses slice D's completeness rule ONLY
+for the `eof` branch. The `min(createTime) < createdNs` branch stays
+UNLICENSED by this run until a multi-page traversal is actually observed and
+Q2s is re-verified across a page boundary -- tracked as follow-up
+`EDGE-2-MULTIPAGE`. This does not affect the `ZERO_FILL_BENIGN` verdict
+above: that verdict rests on `eof` completeness, which this run did
+exercise.
 
 ## Positive control (PC)
 
@@ -193,5 +203,15 @@ worktree's diff); only this README and the producing script/test are.
 The MIA 2026-09-23 order `CP05MNWMAWP6` never traded. The 09-24 resolver
 retirement as `STATUS_REPORT_ZERO_FILL_TERMINAL` is correct and needs no
 remediation. AC1 is satisfied: `ZERO_FILL_BENIGN`, `Q2s=STABLE`, PC passed,
-evidence pack in place. Slice D (the hardened resolver corroboration) may
-now proceed per plan section 8, since Q2s is `STABLE`.
+evidence pack in place. This verdict is unaffected by the scope note above,
+because it rests entirely on `eof` completeness, which this run exercised
+directly.
+
+Slice D's completeness rule is licensed **only for its `eof` branch** by this
+run. Its `min(createTime) < createdNs` branch was never exercised (the
+account's 35-row history fit in one page on every traversal) and stays
+UNLICENSED until a multi-page traversal is observed and Q2s is re-verified
+across a real page boundary -- follow-up `EDGE-2-MULTIPAGE`. Slice D may
+proceed per plan section 8 on the strength of the `eof` branch alone; the
+threshold branch's design is unchanged, but its own corroborating evidence
+is still outstanding.
