@@ -468,6 +468,13 @@ def page_min_create_ts_ns(page: Mapping[str, Any]) -> int | None:
     minimum can still be logged (``page_min_create_ts_ns=``) for that future
     verification.
 
+    EDGE-2-MULTIPAGE step 1: this function already refuses a page whose
+    ``activities`` field is not a list (returns ``None``, D2's own defect)
+    -- ``_order_trade_activity`` additionally stops the WHOLE read on such a
+    page rather than silently treating it as zero rows and paging past it.
+    That boundary (D3: whether a cursor can skip or reorder rows) stays
+    UNLICENSED until the Step 2 probe runs.
+
     Returns ``None`` if no activity on ``page`` carries a parseable
     timestamp of any kind.
     """
