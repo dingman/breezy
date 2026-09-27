@@ -2389,8 +2389,13 @@ def run(
     # ING-2-RSS observability (L-30/L-52): counts only, one line every run,
     # including a run with zero EXTEND chunks -- that makes "EXTEND never
     # ran" distinguishable from "EXTEND ran and every chunk took the
-    # unfiltered path".
-    logger.info(extend_dedupe_counters.summary_line())
+    # unfiltered path". Printed to `out` (like every sibling summary line
+    # above) rather than logged: production configures no INFO handler for
+    # this logger, so a `logger.info` call here is silently never delivered
+    # (detector without delivery, L-52) -- confirmed by the 2026-09-27
+    # 11:30Z production run, which executed this code yet left no
+    # `extend_dedupe:` line in the journal at all.
+    print(extend_dedupe_counters.summary_line(), file=out)
 
     # EDGE-6 6f: the deferral-stall streak. Independent of `deadline` (a
     # dry run never builds a deadline either, but pending-ness is still
