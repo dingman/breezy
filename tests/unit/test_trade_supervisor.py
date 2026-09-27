@@ -41,12 +41,16 @@ from breezy.runtime.trade_supervisor import (
     IncrementalLogReader,
     StopPriorRaceRefused,
     SupervisorPorts,
+    _dispatch_boot_retry_window_closed_check,
+    _do_boot_retry,
+    _do_boot_retry_window_closed_check,
     _do_launch,
     _do_midday_watch,
     _do_permit_watch,
     _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
+    _prune_supervisor_spawned,
     _read_git_head_sha,
     _resolve_build_revision,
     _run_forever,
@@ -61,6 +65,7 @@ from breezy.runtime.trade_supervisor import (
     log_decision,
     main,
     node_log_path,
+    owned,
     probe_open_intent,
     process_is_alive,
     resolve_lock_holder_pid,
@@ -72,6 +77,9 @@ from breezy.runtime.trade_supervisor import (
 )
 from breezy.runtime.trade_supervisor_core import (
     _PASS_RESULT_VALUES,
+    BOOT_RETRY_MAX_ATTEMPTS,
+    BOOT_RETRY_MIN_GAP,
+    BOOT_RETRY_READINESS_TIMEOUT,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_MIN_RELAUNCH_GAP,
@@ -82,9 +90,10 @@ from breezy.runtime.trade_supervisor_core import (
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ESCALATION_STORE_KEY,
     SUPERVISOR_ARGV_TOKEN,
+    ZERO_INSTRUMENTS_REFUSAL_PREFIX,
+    ZERO_INSTRUMENTS_REFUSAL_SUFFIX,
     AlertDetail,
     DaySchedulerState,
-    ExitConfigErrorCause,
     LaunchAction,
     Phase,
     PreLaunchProbeInvariantError,
@@ -93,13 +102,14 @@ from breezy.runtime.trade_supervisor_core import (
     SelfCheckResult,
     StopPriorAction,
     assert_no_live_node_before_intent_probe,
+    boot_retry_window_closed,
     classify_exit1_cause,
+    decide_boot_retry,
     decide_launch_action,
     decide_midday_relaunch,
     decide_relaunch,
     decide_stop_prior_action,
     decode_self_check_escalation_state,
-    disambiguate_exit_config_error,
     encode_self_check_escalation_state,
     initial_scheduler_state,
     mark_phase_fired,
@@ -107,6 +117,10 @@ from breezy.runtime.trade_supervisor_core import (
     next_due,
     parse_permit_expiry_ns,
     readiness_observed,
+    record_boot_retry_attempt,
+    record_boot_retry_exhausted_alert_sent,
+    record_boot_retry_nontransient_alert_sent,
+    record_boot_zero_instruments_seen,
     record_child_adopted,
     record_first_boot_permit_seen,
     record_midday_cause_seen,
@@ -115,6 +129,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_relaunch_attempt,
     record_strategy_subscribed_seen,
     self_check,
+    zero_instruments_refusal_in,
 )
 from tests.support.real_tree_write_guard import install_real_tree_write_guard
 
@@ -148,6 +163,19 @@ def _clear_retained_spawned_children():
     ts._SPAWNED_CHILDREN.clear()
     yield
     ts._SPAWNED_CHILDREN.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_supervisor_spawned():
+    """[FU-17, AM-2] ``_SUPERVISOR_SPAWNED`` is process-global, same hazard
+    as ``_SPAWNED_CHILDREN`` above -- a ``FakePopen`` retained by one test
+    (via ``owned()``/``_retain_spawned_child``) must never shadow a later
+    test's own pid probe under pytest-randomly."""
+    from breezy.runtime import trade_supervisor as ts
+
+    ts._SUPERVISOR_SPAWNED.clear()
+    yield
+    ts._SUPERVISOR_SPAWNED.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -496,13 +524,48 @@ class TestClassifyExit1Cause:
         )
         assert classify_exit1_cause(log) is RelaunchCause.DETERMINISTIC
 
+    def test_classify_exit1_cause_recognizes_zero_instruments_refusal_as_transient(self):
+        log = (
+            "current_rung_hold: resolved 0 instruments for 2026-09-27 (SFO=0); "
+            "refusing to start\n"
+        )
+        assert classify_exit1_cause(log) is RelaunchCause.TRANSIENT
 
-class TestDisambiguateExitConfigError:
-    def test_lock_held_is_duplicate_node(self):
-        assert disambiguate_exit_config_error(lock_held=True) is ExitConfigErrorCause.DUPLICATE_NODE
 
-    def test_lock_free_is_config_error(self):
-        assert disambiguate_exit_config_error(lock_held=False) is ExitConfigErrorCause.CONFIG_ERROR
+# ===========================================================================
+# [FU-17] The zero-instrument-refusal marker: prefix+suffix on the SAME
+# line, never a whole-text substring check (architect item 4).
+# ===========================================================================
+
+
+class TestZeroInstrumentsRefusalIn:
+    def test_matches_the_real_refusal_line(self):
+        log = (
+            "current_rung_hold: resolved 0 instruments for 2026-09-27 (SFO=0); "
+            "refusing to start\n"
+        )
+        assert zero_instruments_refusal_in(log) is True
+
+    def test_requires_prefix_and_suffix_on_the_same_line(self):
+        log = (
+            f"{ZERO_INSTRUMENTS_REFUSAL_PREFIX} 2026-09-27 (SFO=0)\n"
+            f"some unrelated line{ZERO_INSTRUMENTS_REFUSAL_SUFFIX}\n"
+        )
+        assert zero_instruments_refusal_in(log) is False
+
+    def test_rejects_settings_empty_site_set_sentence(self):
+        # settings.py:303 -- carries the suffix fragment, never the prefix.
+        log = "there is nothing to run; refusing to start with an empty site set\n"
+        assert zero_instruments_refusal_in(log) is False
+
+    def test_rejects_composition_skip_and_yesterday_warnings(self):
+        skip = "current_rung_hold: skipping SFO; resolved 0 instruments for 2026-09-27\n"
+        yesterday = (
+            "SFO resolved 0 instruments for yesterday 2026-09-26; "
+            "external order claim covers today only\n"
+        )
+        assert zero_instruments_refusal_in(skip) is False
+        assert zero_instruments_refusal_in(yesterday) is False
 
 
 _BASE_DAY = dt.datetime(2026, 9, 4, tzinfo=dt.UTC)
@@ -733,6 +796,128 @@ class TestDecideMiddayRelaunch:
             state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
         )
         assert resolved_cause is RelaunchCause.TRANSIENT
+
+
+# ---------------------------------------------------------------------------
+# [FU-17] Boot-retry's own pure attempt/gap budget -- no window/cause
+# parameter at all (the window-close case is a SEPARATE per-tick predicate,
+# `boot_retry_window_closed`, below).
+# ---------------------------------------------------------------------------
+
+
+class TestDecideBootRetry:
+    def test_declines_when_attempt_budget_exhausted(self):
+        decision = decide_boot_retry(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            attempts_so_far=BOOT_RETRY_MAX_ATTEMPTS,
+            last_attempt_at=_BASE_DAY.replace(hour=19, minute=40),
+        )
+        assert decision.should_relaunch is False
+        assert decision.reason == "attempt budget exhausted"
+
+    def test_declines_when_min_gap_not_elapsed(self):
+        decision = decide_boot_retry(
+            now=_BASE_DAY.replace(hour=17, minute=20),
+            attempts_so_far=1,
+            last_attempt_at=_BASE_DAY.replace(hour=17, minute=10),
+        )
+        assert decision.should_relaunch is False
+
+    def test_eligible_within_budget_and_gap_elapsed(self):
+        decision = decide_boot_retry(
+            now=_BASE_DAY.replace(hour=17, minute=10) + BOOT_RETRY_MIN_GAP,
+            attempts_so_far=1,
+            last_attempt_at=_BASE_DAY.replace(hour=17, minute=10),
+        )
+        assert decision.should_relaunch is True
+
+    def test_first_attempt_of_the_day_needs_no_prior_gap(self):
+        decision = decide_boot_retry(
+            now=_BASE_DAY.replace(hour=17, minute=10),
+            attempts_so_far=0,
+            last_attempt_at=None,
+        )
+        assert decision.should_relaunch is True
+
+    def test_no_window_end_parameter(self):
+        # [item 7/decision from root-cause item 6] deliberately no
+        # window-end/cause/catalog_ready parameter -- the window-close case
+        # is handled entirely outside this function.
+        import inspect
+
+        params = inspect.signature(decide_boot_retry).parameters
+        assert "window_end" not in params
+        assert "cause" not in params
+        assert "catalog_ready" not in params
+
+    def test_8th_attempt_due_hours_before_midday_watch_window_close(self):
+        # [r3->r4 item B, arithmetic corrected] Under the idealized
+        # instant-death assumption: attempt k is due at
+        # watch_open_at + (k-1) * BOOT_RETRY_MIN_GAP. A future constant
+        # change that breaks this margin fails this test loudly.
+        watch_open_at = _BASE_DAY.replace(hour=17, minute=10)
+        eighth_attempt_due = watch_open_at + (BOOT_RETRY_MAX_ATTEMPTS - 1) * BOOT_RETRY_MIN_GAP
+        window_close = midday_watch_window_end(_BASE_DAY.date())
+        assert eighth_attempt_due == watch_open_at.replace(hour=18, minute=55)
+        assert window_close - eighth_attempt_due >= dt.timedelta(hours=5)
+
+
+# ---------------------------------------------------------------------------
+# [FU-17, r4->r5 ruling 2/3] The window-close terminal alert -- a SEPARATE,
+# unconditional per-tick predicate, never a branch inside `decide_boot_retry`.
+# ---------------------------------------------------------------------------
+
+
+def _boot_retry_limbo_state(day: dt.date | None = None) -> DaySchedulerState:
+    day = day if day is not None else _BASE_DAY.date()
+    state = initial_scheduler_state(day)
+    return record_boot_zero_instruments_seen(
+        state, dt.datetime.combine(day, dt.time(17, 10), tzinfo=dt.UTC)
+    )
+
+
+class TestBootRetryWindowClosed:
+    def test_true_when_limbo_persists_to_watch_close(self):
+        state = _boot_retry_limbo_state()
+        watch_close = midday_watch_window_end(_BASE_DAY.date())
+        assert boot_retry_window_closed(state, watch_close) is True
+
+    def test_false_before_watch_close(self):
+        state = _boot_retry_limbo_state()
+        assert boot_retry_window_closed(state, _BASE_DAY.replace(hour=20, minute=0)) is False
+
+    def test_false_once_readiness_observed(self):
+        state = _boot_retry_limbo_state()
+        state = record_readiness_observed(state, _BASE_DAY.replace(hour=18, minute=0))
+        watch_close = midday_watch_window_end(_BASE_DAY.date())
+        assert boot_retry_window_closed(state, watch_close) is False
+
+    def test_false_once_attempts_exhausted_alert_sent(self):
+        state = _boot_retry_limbo_state()
+        state = record_boot_retry_exhausted_alert_sent(state, _BASE_DAY.replace(hour=20, minute=0))
+        watch_close = midday_watch_window_end(_BASE_DAY.date())
+        assert boot_retry_window_closed(state, watch_close) is False
+
+    def test_false_once_nontransient_alert_sent(self):
+        state = _boot_retry_limbo_state()
+        state = record_boot_retry_nontransient_alert_sent(
+            state, _BASE_DAY.replace(hour=20, minute=0)
+        )
+        watch_close = midday_watch_window_end(_BASE_DAY.date())
+        assert boot_retry_window_closed(state, watch_close) is False
+
+    def test_false_once_midday_ceiling_unknown_alert_sent(self):
+        # [r4->r5 disclosed fix] The not-owned/known-log fall-through's own
+        # terminal CRITICAL already covers this day -- the window-close
+        # check must not ALSO page for it.
+        from breezy.runtime.trade_supervisor_core import record_midday_ceiling_unknown_alert_sent
+
+        state = _boot_retry_limbo_state()
+        state = record_midday_ceiling_unknown_alert_sent(
+            state, _BASE_DAY.replace(hour=20, minute=0)
+        )
+        watch_close = midday_watch_window_end(_BASE_DAY.date())
+        assert boot_retry_window_closed(state, watch_close) is False
 
 
 # ---------------------------------------------------------------------------
@@ -2019,6 +2204,69 @@ class TestNextDue:
         assert phase is Phase.NONE
         # today's (next_day's) own still-upcoming STOP_PRIOR -- never D+2.
         assert fire_at == _utc(16, 40, day=next_day)
+
+
+# ---------------------------------------------------------------------------
+# [FU-17] `next_due`'s MIDDAY_WATCH branch also opens for a zero-instrument
+# boot day with readiness never observed -- the actual "whole day lost" fix.
+# ---------------------------------------------------------------------------
+
+
+class TestNextDueBootRetry:
+    def test_returns_midday_watch_when_boot_zero_instruments_seen_and_readiness_never_observed(
+        self,
+    ):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_boot_zero_instruments_seen(state, _utc(16, 55))
+        phase, fire_at = next_due(_utc(20, 0), state)
+        assert phase is Phase.MIDDAY_WATCH
+        assert fire_at == _utc(17, 10)
+
+    def test_still_returns_none_when_a_different_transient_cause_seen_but_not_zero_instruments(
+        self,
+    ):
+        # item 1's core regression: a generic TRANSIENT cause (e.g.
+        # TRADING_NODE_FAILED) must never unlock MIDDAY_WATCH on its own --
+        # only the DEDICATED boot_zero_instruments_seen latch may.
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        phase, _ = next_due(_utc(20, 0), state)
+        assert phase is Phase.NONE
+
+    def test_does_not_return_midday_watch_before_1710z_even_when_latched_at_1702z(self):
+        # [r3->r4 item D] The OR is nested INSIDE the existing three-way AND
+        # -- never a top-level OR that would fire before SELF_CHECK/before
+        # launch_done.
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_boot_zero_instruments_seen(state, _utc(17, 2))
+        phase, _ = next_due(_utc(17, 3), state)
+        assert phase is not Phase.MIDDAY_WATCH
+
+    def test_record_boot_zero_instruments_seen_first_seen_wins_and_survives_record_child_adopted(
+        self,
+    ):
+        state = initial_scheduler_state(_DAY)
+        state = record_boot_zero_instruments_seen(state, _utc(17, 0))
+        state = record_child_adopted(state, _utc(18, 0))
+        assert state.boot_zero_instruments_seen is True
+
+    def test_record_child_adopted_clears_boot_retry_not_ready_alert_sent(self):
+        from breezy.runtime.trade_supervisor_core import record_boot_retry_not_ready_alert_sent
+
+        state = initial_scheduler_state(_DAY)
+        state = record_boot_retry_not_ready_alert_sent(state, _utc(17, 20))
+        state = record_child_adopted(state, _utc(18, 0))
+        assert state.boot_retry_not_ready_alert_sent is False
+
+    def test_latch_log_facts_latches_boot_zero_instruments_seen_from_its_own_read(self):
+        from breezy.runtime.trade_supervisor_core import latch_log_facts
+
+        state = initial_scheduler_state(_DAY)
+        log = (
+            "current_rung_hold: resolved 0 instruments for 2026-09-04 (SFO=0); "
+            "refusing to start\n"
+        )
+        state = latch_log_facts(state, _utc(18, 0), log)
+        assert state.boot_zero_instruments_seen is True
 
 
 def test_parse_permit_expiry_ns_extracts_the_real_marker_shape():
@@ -4392,6 +4640,552 @@ class TestDoMiddayWatch:
 
         assert len(spawner.calls) == 1
         assert new_pid != tracked_pid
+
+
+# ===========================================================================
+# [FU-17] `owned()`/`_SUPERVISOR_SPAWNED` -- the entry-guard eligibility test
+# AC16 rewrites around, replacing the whole `boot_retry_adoption_seen` latch.
+# ===========================================================================
+
+
+class _ConfigurablePopen:
+    """Like ``FakePopen``, but ``poll()``'s return is settable -- needed to
+    exercise ``owned()``'s pid-reuse guard (our own record says dead, the OS
+    disagrees)."""
+
+    def __init__(self, pid: int, *, poll_result: int | None = None) -> None:
+        self.pid = pid
+        self.poll_result = poll_result
+
+    def poll(self) -> int | None:
+        return self.poll_result
+
+
+class TestOwned:
+    def test_true_for_a_pid_this_supervisor_spawned_and_alive(self):
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        proc = _ConfigurablePopen(4001, poll_result=None)
+        _retain_spawned_child(proc)
+        assert owned(4001, process_alive=lambda _pid: True) is True
+
+    def test_true_for_a_pid_this_supervisor_spawned_now_dead_and_not_reused(self):
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        proc = _ConfigurablePopen(4002, poll_result=0)
+        _retain_spawned_child(proc)
+        assert owned(4002, process_alive=lambda _pid: False) is True
+
+    def test_false_for_a_never_spawned_external_pid(self):
+        assert owned(999999, process_alive=lambda _pid: True) is False
+
+    def test_false_when_our_popen_exited_but_os_pid_is_alive_pid_reuse_guard(self):
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        proc = _ConfigurablePopen(4003, poll_result=0)
+        _retain_spawned_child(proc)
+        # Our own record says dead, but the OS says a (different, reused)
+        # process now occupies this pid -- must not be trusted as ours.
+        assert owned(4003, process_alive=lambda _pid: True) is False
+
+
+class TestRetainSpawnedChild:
+    def test_records_into_supervisor_spawned_dict(self):
+        from breezy.runtime.trade_supervisor import _SUPERVISOR_SPAWNED, _retain_spawned_child
+
+        proc = _ConfigurablePopen(4004)
+        _retain_spawned_child(proc)
+        assert _SUPERVISOR_SPAWNED[4004] is proc
+
+
+class TestPruneSupervisorSpawned:
+    def test_drops_exited_entries_and_keeps_alive_ones(self):
+        from breezy.runtime.trade_supervisor import _SUPERVISOR_SPAWNED, _retain_spawned_child
+
+        dead = _ConfigurablePopen(4005, poll_result=0)
+        alive = _ConfigurablePopen(4006, poll_result=None)
+        _retain_spawned_child(dead)
+        _retain_spawned_child(alive)
+        _prune_supervisor_spawned()
+        assert 4005 not in _SUPERVISOR_SPAWNED
+        assert _SUPERVISOR_SPAWNED[4006] is alive
+
+
+# ===========================================================================
+# [FU-17] `_do_midday_watch`'s new AC16 entry guard -- dispatches to
+# `_do_boot_retry` only for `tracked_pid is None` or an owned, known-log pid;
+# any other live pid falls to the ordinary body below (never a second,
+# unclamped spawn).
+# ===========================================================================
+
+
+def _boot_retry_ready_state(now: dt.datetime) -> DaySchedulerState:
+    state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+    return record_boot_zero_instruments_seen(state, now)
+
+
+class TestDoMiddayWatchBootRetryEntryGuard:
+    def test_dispatches_boot_retry_when_tracked_pid_is_none(self, tmp_path):
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: False,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+
+        new_pid, _new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid is not None
+        assert state.boot_retry_attempts == 1
+
+    def test_dispatches_for_owned_dead_pid_with_known_log(self, tmp_path):
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            process_alive=lambda _pid: False,
+            read_log_new=lambda p: p.read_text(),
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: False,
+        )
+        _retain_spawned_child(_ConfigurablePopen(5001, poll_result=0))
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        new_pid, _new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 25),
+            tracked_pid=5001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid != 5001
+        assert state.boot_retry_attempts == 1
+
+    def test_declines_for_unowned_pid_with_known_log_falls_to_ordinary_body_and_reads_its_log(
+        self, tmp_path
+    ):
+        # An adopted/hand-relaunched, NOT-owned pid with a known log falls
+        # through to the ordinary body, which reads it like any other
+        # tracked child -- closing the observability gap the blanket
+        # `boot_retry_adoption_seen` latch (r4) could never close.
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        read_calls: list[Path] = []
+
+        def _read(p: Path) -> str:
+            read_calls.append(p)
+            return p.read_text()
+
+        spawner = FakeSpawner()
+        ports = _make_ports(spawn=spawner, process_alive=lambda _pid: False, read_log_new=_read)
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 25),
+            tracked_pid=6001,  # never spawned by this supervisor -- not owned
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert read_calls == [node_log]
+        # No boot-retry attempt consumed -- this poll went through the
+        # ordinary body, not `_do_boot_retry`.
+        assert spawner.calls == []
+
+    def test_declines_for_unowned_pid_with_unknown_log_no_read_no_alert(self, tmp_path):
+        read_calls: list[Path] = []
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            read_log_new=lambda p: (read_calls.append(p), "")[1],
+            alert_sink=sink,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        result = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 25),
+            tracked_pid=6002,  # not owned
+            node_log=None,  # unknown log
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert read_calls == []
+        assert sink.payloads == []
+        assert result == (6002, None, state)
+
+
+# ===========================================================================
+# [FU-17] `_do_boot_retry` -- the retry path itself.
+# ===========================================================================
+
+
+class TestDoBootRetry:
+    def test_hand_off_latches_permit_issued_seen_alongside_first_boot_permit_seen(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_PERMIT_ISSUED_LINE)
+        ports = _make_ports(process_alive=lambda _pid: True, read_log_new=lambda p: p.read_text())
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        new_pid, new_log, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=7001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert new_pid == 7001
+        assert new_log == node_log
+        assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+        assert state.first_boot_permit_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+
+    def test_first_attempt_alerts_warn_once(self, tmp_path):
+        sink = _RecordingAlertSink()
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: False,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        _, _, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert [p.detail for p in sink.payloads] == [AlertDetail.BOOT_RETRY_FIRST_ATTEMPT.value]
+        assert state.boot_retry_first_attempt_alert_sent is True
+
+        # A later, second attempt must not re-alert the first-attempt WARN.
+        _, _, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 10) + BOOT_RETRY_MIN_GAP,
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        first_attempt_alerts = [
+            p for p in sink.payloads if p.detail == AlertDetail.BOOT_RETRY_FIRST_ATTEMPT.value
+        ]
+        assert len(first_attempt_alerts) == 1
+
+    def test_exhausts_after_max_attempts_and_alerts_once(self, tmp_path):
+        sink = _RecordingAlertSink()
+        ports = _make_ports(alert_sink=sink)
+        state = _boot_retry_ready_state(_utc(17, 0))
+        for i in range(BOOT_RETRY_MAX_ATTEMPTS):
+            state = record_boot_retry_attempt(state, _utc(17, 10) + i * BOOT_RETRY_MIN_GAP)
+        assert state.boot_retry_attempts == BOOT_RETRY_MAX_ATTEMPTS
+
+        _, _, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 10) + BOOT_RETRY_MAX_ATTEMPTS * BOOT_RETRY_MIN_GAP,
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert state.boot_retry_exhausted_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.BOOT_RETRY_ATTEMPTS_EXHAUSTED.value
+        ]
+
+    def test_treats_unknown_log_live_child_as_alive_not_as_no_child(self, tmp_path):
+        # [item E, defense-in-depth] Calls `_do_boot_retry` directly,
+        # bypassing AC16's own outer guard -- `tracked_pid` set, `node_log`
+        # unknown, `process_alive` True: no attempt consumed, no spawn.
+        spawner = FakeSpawner()
+        ports = _make_ports(spawn=spawner, process_alive=lambda _pid: True)
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        result = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=8001,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert result == (8001, None, state)
+        assert spawner.calls == []
+        assert state.boot_retry_attempts == 0
+
+    def test_not_ready_timeout_anchors_on_watch_open_at_for_boot_time_carried_over_child(
+        self, tmp_path
+    ):
+        # [item F/AC18] `last_boot_retry_attempt_at` is None for the child
+        # inherited straight from the original 16:50Z boot -- the anchor
+        # must fall back to `watch_open_at` (17:10Z), not stay undefined.
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+        assert state.last_boot_retry_attempt_at is None
+
+        past_timeout = _utc(17, 10) + BOOT_RETRY_READINESS_TIMEOUT + dt.timedelta(seconds=1)
+        _, _, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=past_timeout,
+            tracked_pid=9001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert state.boot_retry_not_ready_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [AlertDetail.BOOT_RETRY_CHILD_NOT_READY.value]
+
+    def test_child_nontransient_exit_stops_permanently_and_alerts_once(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("some unrelated crash trace, no known marker\n")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        new_pid, _new_log, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=10001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert new_pid is None
+        assert state.boot_retry_nontransient_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.BOOT_RETRY_CHILD_NONTRANSIENT_EXIT.value
+        ]
+
+    def test_precheck_refused_intent_open_alerts_critical_no_spawn(self, tmp_path):
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            alert_sink=sink,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: True,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        _, _, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 10),
+            tracked_pid=None,
+            node_log=None,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert spawner.calls == []
+        # This is also the very first attempt of the day -- BOOT_RETRY_FIRST_
+        # ATTEMPT WARNs before the precheck runs, then the precheck itself
+        # refuses with its own distinct CRITICAL.
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.BOOT_RETRY_FIRST_ATTEMPT.value,
+            AlertDetail.BOOT_RETRY_PRECHECK_REFUSED_INTENT_OPEN.value,
+        ]
+        # Attempt IS consumed regardless of the precheck outcome (decision F).
+        assert state.boot_retry_attempts == 1
+
+    def test_final_drain_catches_permit_written_between_read_and_liveness_check(self, tmp_path):
+        # [AM-1] Step (a)'s own read sees no permit yet; the child then
+        # writes one and dies before the liveness check. The final drain,
+        # immediately before spawn, must catch it and hand off instead.
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+
+        def _read_then_reveal_permit(p: Path) -> str:
+            # First call (step (a)): no permit line yet.
+            # Second call (the AM-1 final drain): the permit line has now
+            # appeared, written by the child right before it died.
+            if not getattr(_read_then_reveal_permit, "_called", False):
+                _read_then_reveal_permit._called = True
+                return p.read_text()
+            return _PERMIT_ISSUED_LINE
+
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            process_alive=lambda _pid: False,
+            read_log_new=_read_then_reveal_permit,
+        )
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        new_pid, _new_log, state = _do_boot_retry(
+            ports=ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=11001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert spawner.calls == []
+        assert new_pid == 11001
+        assert state.first_boot_permit_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+
+
+class TestDoMiddayWatchBootRetryNoDoubleCritical:
+    def test_no_double_critical_once_boot_retry_exhausted_alert_sent(self, tmp_path):
+        # [AM-5] Once a terminal boot-retry CRITICAL has fired, the entry
+        # guard's own exclusion must not fall through into the ordinary
+        # body's `MIDDAY_RELAUNCH_CEILING_UNKNOWN` page for the identical
+        # already-alerted, no-permit-ever-observed condition.
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(process_alive=lambda _pid: False, alert_sink=sink)
+        _retain_spawned_child(_ConfigurablePopen(12001, poll_result=0))
+        state = _boot_retry_ready_state(_utc(17, 0))
+        for i in range(BOOT_RETRY_MAX_ATTEMPTS):
+            state = record_boot_retry_attempt(state, _utc(17, 10) + i * BOOT_RETRY_MIN_GAP)
+        state = record_boot_retry_exhausted_alert_sent(state, _utc(19, 0))
+
+        result = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=12001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert sink.payloads == []
+        assert result == (12001, node_log, state)
+
+
+# ===========================================================================
+# [FU-17, r4->r5 ruling 2/3] `_do_boot_retry_window_closed_check` -- a
+# separate, unconditional per-tick check wired into `_run_forever`.
+# ===========================================================================
+
+
+class TestDoBootRetryWindowClosedCheck:
+    def test_alerts_once_and_is_idempotent(self):
+        sink = _RecordingAlertSink()
+        ports = _make_ports(alert_sink=sink)
+        state = _boot_retry_limbo_state(_DAY)
+        watch_close = midday_watch_window_end(_DAY)
+
+        state = _do_boot_retry_window_closed_check(ports=ports, state=state, now=watch_close)
+        state = _do_boot_retry_window_closed_check(
+            ports=ports, state=state, now=watch_close + dt.timedelta(minutes=5)
+        )
+
+        assert state.boot_retry_window_closed_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY.value
+        ]
+
+    def test_dispatch_wrapper_contains_a_raising_check(self, monkeypatch):
+        import breezy.runtime.trade_supervisor as ts
+
+        def _boom(**_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ts, "_do_boot_retry_window_closed_check", _boom)
+        ports = _make_ports()
+        state = _boot_retry_limbo_state(_DAY)
+        result = _dispatch_boot_retry_window_closed_check(
+            ports=ports, state=state, now=midday_watch_window_end(_DAY)
+        )
+        assert result is state
+
+
+class TestRunForeverBootRetryWindowClosed:
+    def test_fires_boot_retry_window_closed_alert_once_when_phase_is_none_past_0100z(
+        self, tmp_path, monkeypatch
+    ):
+        # [AM-3] The day-scoped reset inside `boot_retry_window_closed` must
+        # use `_for_day(state, _trading_day(now_utc))`, never a bare
+        # `now_utc.date()` -- otherwise the state resets AT 01:00Z and the
+        # alert can never fire. Runs across the 00:59->01:00Z tick.
+        import breezy.runtime.trade_supervisor as ts
+
+        clock = FakeClock(_utc(0, 55, day=_DAY + dt.timedelta(days=1)))
+        sink = _RecordingAlertSink()
+        ports = _make_ports(alert_sink=sink)
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        def fake_next_due(now, state):
+            # Force the loop into Phase.NONE on every tick, matching a
+            # zero-instrument day with no live child, while still letting
+            # the real scheduler state accumulate boot-retry limbo.
+            return Phase.NONE, now
+
+        original_initial_state = ts.initial_scheduler_state
+
+        def seeded_initial_state(day):
+            state = original_initial_state(day)
+            return record_boot_zero_instruments_seen(
+                state, dt.datetime.combine(day, dt.time(17, 0), tzinfo=dt.UTC)
+            )
+
+        monkeypatch.setattr(ts, "next_due", fake_next_due)
+        monkeypatch.setattr(ts, "initial_scheduler_state", seeded_initial_state)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=6,
+        )
+
+        window_closed_alerts = [
+            p
+            for p in sink.payloads
+            if p.detail == AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY.value
+        ]
+        assert len(window_closed_alerts) == 1
 
 
 # ===========================================================================

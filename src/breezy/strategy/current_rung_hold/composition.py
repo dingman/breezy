@@ -45,6 +45,10 @@ from breezy.runtime.health import AlertPayload, AlertState, emit_alert, resolve_
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
+from breezy.runtime.trade_supervisor_core import (
+    ZERO_INSTRUMENTS_REFUSAL_PREFIX,
+    ZERO_INSTRUMENTS_REFUSAL_SUFFIX,
+)
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
@@ -410,8 +414,12 @@ def _zero_instruments_message(
     dates = sorted({day.isoformat() for day in today_by_station.values()})
     date_part = dates[0] if len(dates) == 1 else ",".join(dates)
     counts = " ".join(f"{station}={len(resolved[station])}" for station in resolved)
+    # [FU-17] Built from the shared marker constants (runtime, imported
+    # downward -- see the layers contract) so the supervisor's boot-retry
+    # classifier stays in lockstep with this message, byte-for-byte.
     return (
-        f"current_rung_hold: resolved 0 instruments for {date_part} ({counts}); refusing to start"
+        f"{ZERO_INSTRUMENTS_REFUSAL_PREFIX} {date_part} "
+        f"({counts}){ZERO_INSTRUMENTS_REFUSAL_SUFFIX}"
     )
 
 
