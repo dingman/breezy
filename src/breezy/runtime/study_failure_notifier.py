@@ -37,6 +37,23 @@ alert-detail contract in this repo (`trade_supervisor_core.AlertDetail`,
 text, never a value-bearing string. The unit name travels on the plain log
 line instead, as its own structured field, which is where an operator or a
 log-aggregation pipeline actually wants it.
+
+**Cause lookup (alertcause 2026-09-27).** The one property this module's own
+docstring above still calls "cause-agnostic" made every study failure read
+identically -- in particular, quote-tape-ingest exit 4
+(`EXIT_DEFERRAL_STALLED`) was indistinguishable from exits 2/3. The notifier
+now reads the failed unit's ``ExecMainStatus``/``Result`` with a read-only
+``systemctl --user show`` (:func:`_default_cause_reader`, mirroring
+`quote_tape_ingest_cli.default_service_active_probe`'s own query-only,
+never-signal convention) through an injectable seam
+(:data:`CauseReader`/``cause_reader``), so tests never touch systemd. The
+result lands on the plain log line as ``cause=<Result> exit=<code>`` -- for
+``breezy-quote-tape-ingest.service`` the code is also named from the
+constants :func:`quote_tape_ingest_cli` already defines, never duplicated as
+a literal. This is additive only: `AlertPayload.detail` stays the fixed
+enum above, and the lookup fails OPEN (``cause=unknown``) on any read or
+parse failure -- it must never suppress or delay the alert itself (L-52: a
+detector without delivery is not a control).
 """
 
 from __future__ import annotations
@@ -44,6 +61,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
 from collections.abc import Callable, Mapping
 from enum import Enum
 from typing import Final
@@ -55,11 +73,18 @@ from breezy.runtime.health import (
     log_alert_egress_status,
     resolve_alert_sink,
 )
+from breezy.runtime.quote_tape_ingest_cli import (
+    EXIT_CONVERSION_FAILED,
+    EXIT_DEFERRAL_STALLED,
+    EXIT_USAGE,
+)
+from breezy.runtime.quote_tape_ingest_cli import PROGRAM as _QUOTE_TAPE_INGEST_PROGRAM
 
 __all__ = [
     "STUDY_FAILED_ALERT_EVENT",
     "STUDY_FAILED_ALERT_SEVERITY",
     "STUDY_FAILED_ALERT_SITE",
+    "CauseReader",
     "StudyFailedDetail",
     "main",
     "notify_study_failed",
@@ -97,21 +122,100 @@ class StudyFailedDetail(str, Enum):
 #: sink, matching `check_alerts_cli.SinkFactory`'s own (correct) shape.
 SinkFactory = Callable[[Mapping[str, str]], AlertSink]
 
+#: Injectable seam for the cause-of-failure read (alertcause 2026-09-27):
+#: takes the failing unit's name, returns raw `systemctl --user show`
+#: output. Tests inject a fake here rather than touching systemd; the real
+#: default is :func:`_default_cause_reader`.
+CauseReader = Callable[[str], str]
+
+#: The one unit this module can currently name an exit code for. Built from
+#: `quote_tape_ingest_cli.PROGRAM` rather than a literal, so it can never
+#: silently drift from that module's own console-script name.
+_QUOTE_TAPE_INGEST_UNIT: Final[str] = f"{_QUOTE_TAPE_INGEST_PROGRAM}.service"
+
+#: Named exit codes for `breezy-quote-tape-ingest.service`, imported from
+#: `quote_tape_ingest_cli` and never duplicated as literals here -- see the
+#: module docstring's "Cause lookup" note.
+_QUOTE_TAPE_INGEST_EXIT_NAMES: Final[Mapping[int, str]] = {
+    EXIT_USAGE: "USAGE",
+    EXIT_CONVERSION_FAILED: "CONVERSION_FAILED",
+    EXIT_DEFERRAL_STALLED: "DEFERRAL_STALLED",
+}
+
+
+def _default_cause_reader(unit: str) -> str:
+    """Read-only ``systemctl --user show`` for ``unit``'s last exit.
+
+    Mirrors `quote_tape_ingest_cli.default_service_active_probe`'s own
+    convention: this QUERIES state, sends no signal, and never restarts
+    anything. Any failure to ask (missing systemctl, no user session,
+    timeout, non-zero exit) propagates to the caller -- :func:`_cause_text`
+    is the one place that catches it and falls open to ``cause=unknown``.
+    """
+    result = subprocess.run(
+        ["systemctl", "--user", "show", unit, "-p", "ExecMainStatus", "-p", "Result"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    return result.stdout
+
+
+def _parse_cause(raw: str) -> tuple[str, int]:
+    """``(Result, ExecMainStatus)`` parsed from ``systemctl --user show``'s
+    ``Key=Value`` output. Raises on anything that doesn't look like that --
+    the caller (:func:`_cause_text`) is the one place that catches it."""
+    fields: dict[str, str] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        key, sep, value = stripped.partition("=")
+        if not sep:
+            raise ValueError(f"unparseable systemctl show line: {stripped!r}")
+        fields[key] = value
+    return fields["Result"], int(fields["ExecMainStatus"])
+
+
+def _cause_text(unit: str, *, cause_reader: CauseReader) -> str:
+    """``cause=<Result> exit=<code>`` for the alert log line -- with a named
+    exit code for `breezy-quote-tape-ingest.service` -- or ``cause=unknown``
+    if the read fails or its output can't be parsed.
+
+    Never raises: whatever :func:`_parse_cause` or ``cause_reader`` throws is
+    caught here, broadly and intentionally (matching this module's own
+    `except BaseException:` convention around `emit_alert` below), because
+    the cause lookup must never suppress or delay the alert itself (L-52).
+    The failure is still logged at ``debug`` -- diagnosable, but never at a
+    level that competes with the WARN alert line itself.
+    """
+    try:
+        result, exit_code = _parse_cause(cause_reader(unit))
+    except BaseException:
+        logger.debug("%s: cause lookup failed for unit=%s", _PROG, unit, exc_info=True)
+        return "cause=unknown"
+    name = _QUOTE_TAPE_INGEST_EXIT_NAMES.get(exit_code) if unit == _QUOTE_TAPE_INGEST_UNIT else None
+    exit_part = f"exit={exit_code}" if name is None else f"exit={exit_code} ({name})"
+    return f"cause={result} {exit_part}"
+
 
 def notify_study_failed(
     argv: list[str] | None = None,
     *,
     env: Mapping[str, str] | None = None,
     sink_factory: SinkFactory | None = None,
+    cause_reader: CauseReader = _default_cause_reader,
 ) -> int:
     """Emit exactly one WARN alert for the unit named by ``--unit``.
 
     ``sink_factory``, if given, replaces :func:`resolve_alert_sink` --
     tests inject a recording sink here rather than monkeypatching module
-    state. Always returns ``0``: this process has no poll cycle and no
-    caller that could do anything useful with a non-zero exit -- systemd
-    would only log it, and `OnFailure=` chains are exactly the loop this
-    design refuses to build (module docstring).
+    state. ``cause_reader``, if given, replaces :func:`_default_cause_reader`
+    -- see :data:`CauseReader`. Always returns ``0``: this process has no
+    poll cycle and no caller that could do anything useful with a non-zero
+    exit -- systemd would only log it, and `OnFailure=` chains are exactly
+    the loop this design refuses to build (module docstring).
     """
     source: Mapping[str, str] = os.environ if env is None else env
     parser = argparse.ArgumentParser(
@@ -133,9 +237,10 @@ def notify_study_failed(
         return 0
 
     logger.warning(
-        "breezy study unit failed unit=%s event=%s",
+        "breezy study unit failed unit=%s event=%s %s",
         args.unit,
         STUDY_FAILED_ALERT_EVENT,
+        _cause_text(args.unit, cause_reader=cause_reader),
     )
 
     # AUD-15 amendment (2026-09-22): runtime visibility BEFORE resolving the

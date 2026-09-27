@@ -30,6 +30,7 @@ from breezy.runtime.health import (
     WebhookAlertSink,
     resolve_alert_sink,
 )
+from breezy.runtime.quote_tape_ingest_cli import EXIT_DEFERRAL_STALLED, PROGRAM
 from breezy.runtime.study_failure_notifier import (
     STUDY_FAILED_ALERT_EVENT,
     STUDY_FAILED_ALERT_SEVERITY,
@@ -37,6 +38,8 @@ from breezy.runtime.study_failure_notifier import (
     StudyFailedDetail,
     notify_study_failed,
 )
+
+_QUOTE_TAPE_INGEST_UNIT: Final[str] = f"{PROGRAM}.service"
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DEPLOY_DIR: Final[Path] = _REPO_ROOT / "deploy" / "systemd"
@@ -229,3 +232,129 @@ def test_the_notifier_contains_a_sink_failure_and_still_exits_0() -> None:
         sink_factory=lambda _env: _ExplodingSink(),
     )
     assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Cause-of-failure lookup (alertcause 2026-09-27): the notifier reads
+# ExecMainStatus/Result via an injectable seam -- these tests never touch
+# systemd, only fake the seam.
+# ---------------------------------------------------------------------------
+
+
+def _recording_sink_factory() -> tuple[list[AlertPayload], object]:
+    payloads: list[AlertPayload] = []
+
+    class _RecordingSink:
+        def emit(self, payload: AlertPayload) -> None:
+            payloads.append(payload)
+
+    return payloads, (lambda _env: _RecordingSink())
+
+
+def test_cause_lookup_names_the_exit_code_for_the_quote_tape_ingest_unit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payloads, sink_factory = _recording_sink_factory()
+
+    def _fake_cause_reader(unit: str) -> str:
+        assert unit == _QUOTE_TAPE_INGEST_UNIT
+        return f"ExecMainStatus={EXIT_DEFERRAL_STALLED}\nResult=exit-code\n"
+
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.study_failure_notifier"):
+        exit_code = notify_study_failed(
+            ["--unit", _QUOTE_TAPE_INGEST_UNIT],
+            sink_factory=sink_factory,
+            cause_reader=_fake_cause_reader,
+        )
+
+    assert exit_code == 0
+    assert len(payloads) == 1
+    assert any(
+        f"cause=exit-code exit={EXIT_DEFERRAL_STALLED} (DEFERRAL_STALLED)" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_cause_lookup_has_no_named_mapping_for_a_non_ingest_unit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payloads, sink_factory = _recording_sink_factory()
+
+    def _fake_cause_reader(unit: str) -> str:
+        return "ExecMainStatus=1\nResult=exit-code\n"
+
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.study_failure_notifier"):
+        exit_code = notify_study_failed(
+            ["--unit", "breezy-mb-daily.service"],
+            sink_factory=sink_factory,
+            cause_reader=_fake_cause_reader,
+        )
+
+    assert exit_code == 0
+    assert len(payloads) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("cause=exit-code exit=1" in message for message in messages)
+    assert not any("(" in message for message in messages if "cause=" in message)
+
+
+def test_a_raising_cause_reader_still_sends_the_alert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """L-52: a detector without delivery is not a control -- a broken cause
+    probe must never suppress or delay the alert itself."""
+    payloads, sink_factory = _recording_sink_factory()
+
+    def _raising_cause_reader(unit: str) -> str:
+        raise RuntimeError("no systemd user session")
+
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.study_failure_notifier"):
+        exit_code = notify_study_failed(
+            ["--unit", _QUOTE_TAPE_INGEST_UNIT],
+            sink_factory=sink_factory,
+            cause_reader=_raising_cause_reader,
+        )
+
+    assert exit_code == 0
+    assert len(payloads) == 1
+    assert any("cause=unknown" in record.getMessage() for record in caplog.records)
+
+
+def test_a_garbage_cause_reader_output_still_sends_the_alert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payloads, sink_factory = _recording_sink_factory()
+
+    def _garbage_cause_reader(unit: str) -> str:
+        return "not systemctl show output at all\nneither is this"
+
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.study_failure_notifier"):
+        exit_code = notify_study_failed(
+            ["--unit", _QUOTE_TAPE_INGEST_UNIT],
+            sink_factory=sink_factory,
+            cause_reader=_garbage_cause_reader,
+        )
+
+    assert exit_code == 0
+    assert len(payloads) == 1
+    assert any("cause=unknown" in record.getMessage() for record in caplog.records)
+
+
+def test_the_alert_payload_still_carries_no_unit_text_when_cause_is_present() -> None:
+    """The cause text lands on the log line only -- `AlertPayload.detail`
+    stays the fixed enum, matching
+    `test_the_notifier_alert_detail_is_a_fixed_enum_and_carries_no_unit_text`
+    above."""
+    payloads, sink_factory = _recording_sink_factory()
+
+    exit_code = notify_study_failed(
+        ["--unit", _QUOTE_TAPE_INGEST_UNIT],
+        sink_factory=sink_factory,
+        cause_reader=lambda _unit: f"ExecMainStatus={EXIT_DEFERRAL_STALLED}\nResult=exit-code\n",
+    )
+
+    assert exit_code == 0
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload.detail == StudyFailedDetail.STUDY_UNIT_REACHED_FAILED_STATE.value
+    assert "quote-tape" not in payload.detail
+    assert "exit" not in payload.detail
