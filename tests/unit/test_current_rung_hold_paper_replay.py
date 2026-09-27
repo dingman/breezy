@@ -202,7 +202,7 @@ def _depth(
 #: none of these tests exercise v4's legacy attribution specifically. This
 #: module's OWN local helper, distinct from the `current_rung_hold_paper_
 #: replay` script's own `_latch_context`/`_latch_factory` (reached via the
-#: `driver` fixture below), which already default `family_id="paper_replay"`.
+#: `driver` fixture below), which default `family_id=UNSCOPED_FAMILY_ID`.
 _TEST_FAMILY_ID = "pm_us_crh_test"
 
 
@@ -2843,4 +2843,3 @@ def test_two_precision_arms_write_monitor_output_to_distinct_per_arm_directories
     # contained under its own <precision_mode> subdirectory.
     assert not (monitor_out_dir / "monitor_summaries").exists()
     assert not (monitor_out_dir / "monitor").exists()
-

@@ -100,8 +100,10 @@ def test_a_set_family_halt_blocks_the_positive_control_as_BLOCKED_FAMILY_HALT_SE
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
         trial_latch = open_trial_day_latch(
-        intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
-    )
+            intent_latch,
+            key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            family_id="pm_us_crh_v4",
+        )
         trial_latch.record_policy_halt(reason=REASON, evidence_sha256="0" * 64, ts_ns=1)
     store.close()
 
@@ -120,8 +122,10 @@ def test_the_halt_precondition_reads_the_same_FAMILY_HALT_KEY_the_exit_veto_read
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
         trial_latch = open_trial_day_latch(
-        intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
-    )
+            intent_latch,
+            key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            family_id="pm_us_crh_v4",
+        )
         trial_latch.record_policy_halt(reason=REASON, evidence_sha256="0" * 64, ts_ns=1)
 
         fake_strategy = _FakeExitStrategy(trial_latch)
@@ -158,8 +162,10 @@ def test_the_cleared_sentinel_reads_as_halt_clear(tmp_path: Path) -> None:
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
         trial_latch = open_trial_day_latch(
-        intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
-    )
+            intent_latch,
+            key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            family_id="pm_us_crh_v4",
+        )
         trial_latch.record_policy_halt(reason=REASON, evidence_sha256="0" * 64, ts_ns=1)
         trial_latch.clear_family_halt(reason=REASON, evidence_sha256="0" * 64, ts_ns=2)
     store.close()
@@ -175,8 +181,10 @@ def test_the_precondition_performs_no_write(tmp_path: Path) -> None:
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
         trial_latch = open_trial_day_latch(
-        intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
-    )
+            intent_latch,
+            key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            family_id="pm_us_crh_v4",
+        )
         trial_latch.record_policy_halt(reason=REASON, evidence_sha256="0" * 64, ts_ns=1)
     store.close()
 
@@ -218,6 +226,23 @@ def test_BLOCKED_HALT_STATE_UNREADABLE_fires_when_the_reader_raises(tmp_path: Pa
     assert reading.verdict == BLOCKED_HALT_STATE_UNREADABLE
 
 
+def test_malformed_family_id_is_BLOCKED_HALT_STATE_UNREADABLE_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+
+    before = hashlib.sha256(store_path.read_bytes()).hexdigest()
+
+    for malformed_family_id in ("../x", "", "A B"):
+        reading = read_exit_control_halt_precondition(
+            store_path, malformed_family_id, now_ns=8,
+        )
+
+        assert reading.verdict == BLOCKED_HALT_STATE_UNREADABLE
+        assert hashlib.sha256(store_path.read_bytes()).hexdigest() == before
+
+
 def test_a_nonexistent_store_path_is_BLOCKED_HALT_STATE_UNREADABLE_and_creates_nothing(
     tmp_path: Path,
 ) -> None:
@@ -253,7 +278,9 @@ def test_self_check_and_aud07_are_per_family_and_block_every_family_on_unpinned_
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path) as intent_latch:
         latch_a = open_trial_day_latch(
-            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+            intent_latch,
+            key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            family_id="pm_us_crh_v4",
         )
         latch_a.record_policy_halt(reason=REASON, evidence_sha256="0" * 64, ts_ns=1)
     store.close()

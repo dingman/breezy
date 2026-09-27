@@ -191,6 +191,18 @@ def test_programme_alpha_override_must_be_positive_and_no_larger_than_programme_
         )
 
 
+@pytest.mark.parametrize("override", ["0.025", True, object()])
+def test_programme_alpha_override_must_be_numeric_when_present(override: Any) -> None:
+    with pytest.raises(ValueError):
+        register_hypothesis(
+            **_valid_kwargs(
+                k_variants=1,
+                mde_at_allocated_alpha=_mde_for_alpha(PROGRAMME_ALPHA, 1, 300),
+                programme_alpha_override=override,
+            )
+        )
+
+
 def test_caller_supplied_alpha_is_refused_structurally() -> None:
     with pytest.raises(TypeError):
         register_hypothesis(**_valid_kwargs(), allocated_alpha=0.01)  # type: ignore[call-arg]
