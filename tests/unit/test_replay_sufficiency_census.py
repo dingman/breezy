@@ -24,7 +24,6 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +37,7 @@ from nautilus_trader.model.enums import AssetClass, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -68,11 +68,8 @@ from breezy.analysis.replay_sufficiency import (
     CORRUPT_ONLY,
     NO_CLEAN_INSTANCE,
     InstanceSpan,
-    WindowExtent,
     decision_window_ns,
-    window_extent,
 )
-from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
 from breezy.persistence.feather_preflight import PREFLIGHT_CLASSIFIER_VERSION
 from breezy.persistence.station_candidates import (
     STATION_CANDIDATES_SCHEMA_VERSION,
@@ -1598,10 +1595,18 @@ def _fake_quote(*, instrument_id: InstrumentId, ts_event: int) -> QuoteTick:
     )
 
 
-def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
+def test_a10_discover_clean_spans_calls_the_column_scan_seam(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """REPLAY-BIGINST: `_discover_clean_spans` delegates window filtering to
+    `breezy.persistence.catalog_column_scan.scan_depth_window`/
+    `scan_quote_window` (the object-free column-scan seam) instead of
+    reimplementing it inline. Direct successor of this test's pre-
+    REPLAY-BIGINST version, which pinned the same property against the now-
+    replaced `window_extent`-on-`TapeInstrument`-objects seam -- that seam no
+    longer exists in `_discover_clean_spans` at all, by design (the plan's
+    whole point), so the spy moves to the seam that replaced it."""
     station = "SFO"
     climate_day = dt.date(2026, 9, 1)
     offset = -8.0
@@ -1615,37 +1620,32 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
     )
     depth = _fake_depth(instrument_id=instrument.id, ask="0.50", ts_event=ts_event)
     quote = _fake_quote(instrument_id=instrument.id, ts_event=ts_event)
-    tape_instrument = SimpleNamespace(
-        instrument=instrument,
-        facts=read_weather_bucket_facts(instrument.info),
-        depths=[depth],
-        quotes=[quote],
-        closes=[],
-    )
 
-    calls: list[tuple[tuple[int, ...], int, int]] = []
+    catalog = ParquetDataCatalog(tmp_path / "catalog")
+    catalog.write_data([instrument])
+    catalog.write_data([depth])
+    catalog.write_data([quote])
 
-    def _recording_window_extent(
-        ts_event_ns: Iterable[int],
-        *,
-        start_ns: int,
-        end_ns: int,
-    ) -> WindowExtent:
-        values = tuple(ts_event_ns)
-        calls.append((values, start_ns, end_ns))
-        return window_extent(values, start_ns=start_ns, end_ns=end_ns)
+    real_scan_depth_window = census_module.scan_depth_window
+    real_scan_quote_window = census_module.scan_quote_window
+    depth_calls: list[tuple[int, int]] = []
+    quote_calls: list[tuple[int, int]] = []
 
-    monkeypatch.setattr(census_module, "window_extent", _recording_window_extent)
-    monkeypatch.setattr(
-        census_module,
-        "_convert_live_capture",
-        lambda **kwargs: SimpleNamespace(instruments=lambda: [instrument]),
-    )
-    monkeypatch.setattr(
-        census_module,
-        "_select_capture_instruments",
-        lambda catalog, *, climate_day: [tape_instrument],
-    )
+    def _recording_scan_depth_window(files, *, start_ns, end_ns, should_stop, **kwargs):
+        depth_calls.append((start_ns, end_ns))
+        return real_scan_depth_window(
+            files, start_ns=start_ns, end_ns=end_ns, should_stop=should_stop, **kwargs
+        )
+
+    def _recording_scan_quote_window(files, *, start_ns, end_ns, should_stop, **kwargs):
+        quote_calls.append((start_ns, end_ns))
+        return real_scan_quote_window(
+            files, start_ns=start_ns, end_ns=end_ns, should_stop=should_stop, **kwargs
+        )
+
+    monkeypatch.setattr(census_module, "scan_depth_window", _recording_scan_depth_window)
+    monkeypatch.setattr(census_module, "scan_quote_window", _recording_scan_quote_window)
+    monkeypatch.setattr(census_module, "_convert_live_capture", lambda **kwargs: catalog)
 
     spans, clean_station_days, window_bounds = census_module._discover_clean_spans(
         catalog_root=tmp_path,
@@ -1654,7 +1654,8 @@ def test_a10_discover_clean_spans_calls_window_extent_through_the_seam(
         work_root=tmp_path / "work",
     )
 
-    assert calls, "window_extent must be called, not re-implemented inline"
+    assert depth_calls, "scan_depth_window must be called, not re-implemented inline"
+    assert quote_calls, "scan_quote_window must be called, not re-implemented inline"
     assert (station, climate_day.isoformat()) in clean_station_days
     span = spans[(station, climate_day.isoformat())][0]
     assert span.first_in_window_ns == ts_event

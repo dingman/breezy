@@ -16,11 +16,21 @@ This module is the impure I/O wrapper around the pure core in
   `iter_feather_files`;
 - `cli_basis_offer_gate_scan.classify_instance`, `_load_stream` and
   `station_days_only_on_corrupt_tape`;
-- `current_rung_hold_paper_replay._convert_live_capture` /
-  `_select_capture_instruments` and `whole_tape_paper_replay._corrupt_instance_station_days`
-  for the same feather-to-work-catalog conversion and corrupt-tape identity
-  read the whole-tape driver already performs, so this script derives no new
-  reading of the raw capture format.
+- `current_rung_hold_paper_replay._convert_live_capture` and
+  `whole_tape_paper_replay._corrupt_instance_station_days` for the same
+  feather-to-work-catalog conversion and corrupt-tape identity read the
+  whole-tape driver already performs, so this script derives no new reading
+  of the raw capture format;
+- `run_weather_strategy_backtests._capture_instruments_by_id` for the same
+  single id-discovery-and-filter seam every capture-scoped driver uses.
+
+**REPLAY-BIGINST**: `_discover_clean_spans` no longer reads every book-backed
+instrument's full `OrderBookDepth10`/`QuoteTick` object list via
+`_select_capture_instruments` -- that scales with the size of the largest
+captured instance. It instead column-scans the SAME converted parquet via
+`breezy.persistence.catalog_column_scan`, object-free, so census peak memory
+no longer scales with instance size
+(`docs/plans/backlog/EDGE_2026-09-27/REPLAY-BIGINST_plan_r1_2026-09-27.md`).
 
 **Window definition (AUD-09b amendment C1, B21)**: the decision window is
 computed via `breezy.analysis.replay_sufficiency.decision_window_ns`, which
@@ -63,7 +73,7 @@ import signal
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -77,10 +87,12 @@ from cli_basis_offer_gate_scan import (
 )
 from current_rung_hold_paper_replay import (  # type: ignore[attr-defined]
     _convert_live_capture,
-    _select_capture_instruments,
 )
+from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
 from nautilus_trader.model.instruments import BinaryOption
-from run_weather_strategy_backtests import WEATHER_VENUE, TapeInstrument
+from nautilus_trader.persistence.funcs import urisafe_identifier
+from run_weather_strategy_backtests import WEATHER_VENUE, _capture_instruments_by_id
+from weather_strategy_backtest_lib import select_book_backed_instrument_ids
 from whole_tape_paper_replay import _corrupt_instance_station_days
 
 from breezy.analysis.instance_span_cache import (
@@ -103,16 +115,21 @@ from breezy.analysis.replay_sufficiency import (
     REPLAY_SUFFICIENCY_SCHEMA_VERSION,
     InstanceSpan,
     ReplaySufficiency,
-    WindowExtent,
+    WindowExtentFold,
     classify_station_day,
     count_live_instances_in_window,
     decision_window_ns,
-    window_extent,
     write_replay_sufficiency,
 )
 from breezy.domain.weather_bucket_facts import (
     WeatherFactsUnavailableError,
     read_weather_bucket_facts,
+)
+from breezy.persistence.catalog_column_scan import (
+    count_depth_rows,
+    group_files_by_identifier,
+    scan_depth_window,
+    scan_quote_window,
 )
 from breezy.persistence.feather_preflight import (
     DEFAULT_SUBDIRECTORY,
@@ -124,7 +141,6 @@ from breezy.persistence.feather_preflight import (
 )
 from breezy.persistence.station_candidates import StationCandidate, read_station_candidates
 from breezy.registry import SiteNotFoundError, default_registry
-from breezy.strategy.depth10 import best_order
 
 __all__ = [
     "CensusCompletenessError",
@@ -598,12 +614,172 @@ def _window_bounds_for(
     return bounds
 
 
+def _scan_instrument_into_station_fold(
+    *,
+    instrument_id: str,
+    facts: object,
+    day: str,
+    depth_files_by_id: Mapping[str, list[str]],
+    quote_files_by_id: Mapping[str, list[str]],
+    registry: object,
+    window_bounds: MutableMapping[tuple[str, str], tuple[int, int]],
+    by_station: MutableMapping[str, tuple[WindowExtentFold, WindowExtentFold, int]],
+    should_stop: Callable[[], None],
+) -> None:
+    """One already-type-checked, book-backed instrument's depth+quote scan,
+    folded into its station's running `WindowExtentFold`s (extracted from
+    `_discover_clean_spans`, review finding 4: this was the innermost body of
+    a 4-level-deep loop nest).
+
+    `facts` is `WeatherBucketFacts` (kept as `object` here to avoid importing
+    it just for the annotation -- the caller already read it via
+    `read_weather_bucket_facts`).
+    """
+    station = facts.settlement_station  # type: ignore[attr-defined]
+    start_ns, end_ns = _window_bounds_for(
+        station,
+        day,
+        registry=registry,
+        window_bounds=window_bounds,
+    )
+    _depth_row_count, depth_lo, depth_hi = scan_depth_window(
+        depth_files_by_id.get(urisafe_identifier(instrument_id), []),
+        start_ns=start_ns,
+        end_ns=end_ns,
+        should_stop=should_stop,
+    )
+    _quote_row_count, quote_lo, quote_hi = scan_quote_window(
+        quote_files_by_id.get(urisafe_identifier(instrument_id), []),
+        start_ns=start_ns,
+        end_ns=end_ns,
+        should_stop=should_stop,
+    )
+    depth_fold, quote_fold, count = by_station.get(
+        station, (WindowExtentFold(), WindowExtentFold(), 0)
+    )
+    depth_fold = depth_fold.combine(
+        (v for v in (depth_lo, depth_hi) if v is not None),
+        start_ns=start_ns,
+        end_ns=end_ns,
+    )
+    quote_fold = quote_fold.combine(
+        (v for v in (quote_lo, quote_hi) if v is not None),
+        start_ns=start_ns,
+        end_ns=end_ns,
+    )
+    by_station[station] = (depth_fold, quote_fold, count + 1)
+
+
+def _discover_spans_for_climate_day(
+    *,
+    catalog: object,
+    climate_day: dt.date,
+    instance_id: str,
+    depth_files_by_id: Mapping[str, list[str]],
+    quote_files_by_id: Mapping[str, list[str]],
+    registry: object,
+    window_bounds: MutableMapping[tuple[str, str], tuple[int, int]],
+    should_stop: Callable[[], None],
+    spans: MutableMapping[tuple[str, str], list[InstanceSpan]],
+    clean_station_days: set[tuple[str, str]],
+) -> None:
+    """One instance's one climate day: dedup + book-backed filter, the
+    R3-3 type check over ALL of them before any scan, the per-instrument
+    scans (`_scan_instrument_into_station_fold`), and the resulting
+    per-station `InstanceSpan`s (review finding 4, split out of
+    `_discover_clean_spans`)."""
+    day = climate_day.isoformat()
+    # Dedup + this-day filter only -- the SAME single id-discovery-and-filter
+    # seam the old path used
+    # (`run_weather_strategy_backtests._capture_instruments_by_id`), never
+    # `catalog.instruments()` again here.
+    by_id = _capture_instruments_by_id(catalog, climate_day=climate_day)
+    facts_by_id = {
+        instrument_id: read_weather_bucket_facts(instrument.info)
+        for instrument_id, instrument in by_id.items()
+    }
+    # D-1: all-time, unwindowed, footer-only depth row counts -- computed for
+    # EVERY id, book-backed or not, exactly matching the oracle's own
+    # book-backed test.
+    depth_counts = {
+        instrument_id: count_depth_rows(
+            depth_files_by_id.get(urisafe_identifier(instrument_id), [])
+        )
+        for instrument_id in by_id
+    }
+    book_backed_ids = select_book_backed_instrument_ids(depth_counts)
+
+    # R3-3: the BinaryOption type check runs over EVERY book-backed id, in
+    # `book_backed_ids`' own sorted order, BEFORE any scan touches a file --
+    # never interleaved with the scan loop below. Otherwise a corrupt file on
+    # an earlier id could raise `CatalogColumnScanError` before a later id's
+    # `TypeError` is ever checked (review finding 3).
+    for instrument_id in book_backed_ids:
+        instrument = by_id[instrument_id]
+        if not isinstance(instrument, BinaryOption):
+            raise TypeError(
+                f"{instrument_id} is a {type(instrument).__name__}, not a BinaryOption",
+            )
+
+    # Per-station accumulator for THIS climate day only -- `day` is fixed for
+    # the whole loop below, so grouping only needs the station half of the
+    # old `(station, day)` key.
+    by_station: dict[str, tuple[WindowExtentFold, WindowExtentFold, int]] = {}
+
+    for instrument_id in book_backed_ids:
+        _scan_instrument_into_station_fold(
+            instrument_id=instrument_id,
+            facts=facts_by_id[instrument_id],
+            day=day,
+            depth_files_by_id=depth_files_by_id,
+            quote_files_by_id=quote_files_by_id,
+            registry=registry,
+            window_bounds=window_bounds,
+            by_station=by_station,
+            should_stop=should_stop,
+        )
+
+    for station, (depth_fold, quote_fold, count) in by_station.items():
+        depth_extent = depth_fold.extent()
+        quote_extent = quote_fold.extent()
+        span = InstanceSpan(
+            instance_id=instance_id,
+            verdict="CLEAN",
+            depth_window_minutes=depth_extent.span_ns / 1_000_000_000 / 60,
+            quote_window_minutes=quote_extent.span_ns / 1_000_000_000 / 60,
+            distinct_instruments=count,
+            first_in_window_ns=depth_extent.first_ns,
+            last_in_window_ns=depth_extent.last_ns,
+        )
+        spans[(station, day)].append(span)
+        clean_station_days.add((station, day))
+
+
+def _cleanup_work_catalog(work_catalog: Path) -> None:
+    """Best-effort removal of one instance's work catalog -- tolerant of a
+    directory that was never created (conversion failed before creating it),
+    but a genuine removal failure is now a WARN, never silently swallowed
+    (review finding 5)."""
+    if not work_catalog.exists():
+        return
+
+    def _on_error(function: object, path: str, exc: BaseException) -> None:
+        print(
+            f"replay-sufficiency-census: WARN -- failed to remove work catalog "
+            f"{work_catalog} ({getattr(function, '__name__', function)} on {path}): {exc}",
+            file=sys.stderr,
+        )
+
+    shutil.rmtree(work_catalog, onexc=_on_error)
+
+
 def _discover_clean_spans(
     *,
     catalog_root: Path,
     subdirectory: str,
     clean_ids: Sequence[str],
     work_root: Path,
+    should_stop: Callable[[], None] = _raise_if_terminating,
 ) -> tuple[
     dict[tuple[str, str], list[InstanceSpan]],
     set[tuple[str, str]],
@@ -611,14 +787,40 @@ def _discover_clean_spans(
 ]:
     """Real catalog conversion + per-station-day depth/quote span computation.
 
-    Not directly unit-tested (see the test module's docstring): this is the
-    same conversion `whole_tape_paper_replay._load_clean_instance` performs,
-    reused rather than re-derived, and validated by the plan's real run
-    against production data.
+    REPLAY-BIGINST: object-free. Conversion (`_convert_live_capture`) and the
+    climate-day discovery loop are unchanged from before. What used to run
+    AFTER that -- `_select_capture_instruments` pulling every book-backed
+    instrument's full Depth10/QuoteTick object lists -- is replaced with
+    column-projected scans (`breezy.persistence.catalog_column_scan`) over
+    the SAME converted parquet, folded with `WindowExtentFold`. Not directly
+    unit-tested at the full run_census level (see the test module's
+    docstring): the column-scan equivalence to the old, object-based path is
+    covered by `tests/unit/test_census_column_scan.py`'s E-B* tests against
+    the oracle helper frozen there.
+
+    `should_stop` defaults to the module's own `_raise_if_terminating`; tests
+    inject a stub. It is called after every scanned batch and is expected to
+    RAISE (never return) to signal a stop request (D-4/R3-4): this function
+    never returns a partial `InstanceSpan` for an instance whose scan was
+    interrupted, because a raised exception aborts the whole call instead.
+    ``should_stop`` stays typed ``Callable[[], None]`` rather than
+    ``Callable[[], NoReturn]`` -- the injected `_raise_if_terminating` only
+    raises conditionally and otherwise returns normally, so it genuinely is
+    not a `NoReturn` callable (mypy rejects binding it as one; confirmed
+    locally).
 
     Cache lookup/checkpointing is deliberately outside this helper: `run_census`
     computes the cheap fingerprint before scan and only calls this conversion
-    helper for instances that actually need reconversion.
+    helper for instances that actually need reconversion, and only writes a
+    cache entry / checkpoint line after this function RETURNS (never after a
+    raise) -- so a stop request or a `TypeError` (below, re-homed into
+    `_discover_spans_for_climate_day`) leaves no partial cache entry and no
+    checkpoint line for the instance that raised (E-SIG, E-B7b -- see the
+    `run_census`-level E-SIG-int/E-B7b-int integration tests).
+
+    Per-instance work is split into `_discover_spans_for_climate_day` and
+    `_scan_instrument_into_station_fold` (review finding 4): this function
+    now owns only conversion, climate-day discovery, and cleanup.
     """
     registry = default_registry()
     spans: dict[tuple[str, str], list[InstanceSpan]] = defaultdict(list)
@@ -627,57 +829,46 @@ def _discover_clean_spans(
 
     for instance_id in clean_ids:
         work_catalog = work_root / f"{instance_id}"
-        catalog = _convert_live_capture(
-            quote_catalog=catalog_root,
-            instance_id=instance_id,
-            subdirectory=subdirectory,
-            work_catalog=work_catalog,
-        )
-        climate_days: dict[dt.date, None] = {}
-        for instrument in catalog.instruments():
-            try:
-                facts = read_weather_bucket_facts(instrument.info)
-            except WeatherFactsUnavailableError:
-                continue
-            climate_days.setdefault(facts.climate_day, None)
-
-        by_station_day: dict[tuple[str, str], list[TapeInstrument]] = defaultdict(list)
-        for climate_day in climate_days:
-            for tape_instrument in _select_capture_instruments(catalog, climate_day=climate_day):
-                key = (tape_instrument.facts.settlement_station, climate_day.isoformat())
-                by_station_day[key].append(tape_instrument)
-
-        for (station, day), tape_instruments in by_station_day.items():
-            start_ns, end_ns = _window_bounds_for(
-                station,
-                day,
-                registry=registry,
-                window_bounds=window_bounds,
-            )
-            depth_ts = [
-                depth.ts_event
-                for tape_instrument in tape_instruments
-                for depth in tape_instrument.depths
-                if best_order(depth.asks) is not None
-            ]
-            quote_ts = [
-                quote.ts_event
-                for tape_instrument in tape_instruments
-                for quote in tape_instrument.quotes
-            ]
-            depth_extent: WindowExtent = window_extent(depth_ts, start_ns=start_ns, end_ns=end_ns)
-            quote_extent: WindowExtent = window_extent(quote_ts, start_ns=start_ns, end_ns=end_ns)
-            span = InstanceSpan(
+        try:
+            catalog = _convert_live_capture(
+                quote_catalog=catalog_root,
                 instance_id=instance_id,
-                verdict="CLEAN",
-                depth_window_minutes=depth_extent.span_ns / 1_000_000_000 / 60,
-                quote_window_minutes=quote_extent.span_ns / 1_000_000_000 / 60,
-                distinct_instruments=len(tape_instruments),
-                first_in_window_ns=depth_extent.first_ns,
-                last_in_window_ns=depth_extent.last_ns,
+                subdirectory=subdirectory,
+                work_catalog=work_catalog,
             )
-            spans[(station, day)].append(span)
-            clean_station_days.add((station, day))
+
+            climate_days: dict[dt.date, None] = {}
+            for instrument in catalog.instruments():
+                try:
+                    facts = read_weather_bucket_facts(instrument.info)
+                except WeatherFactsUnavailableError:
+                    continue
+                climate_days.setdefault(facts.climate_day, None)
+
+            # Globbed ONCE per instance, per type (r2 "smaller items"), then
+            # grouped by `urisafe_identifier(id)` (R3-1) -- never once per id.
+            depth_files_by_id = group_files_by_identifier(catalog, OrderBookDepth10)
+            quote_files_by_id = group_files_by_identifier(catalog, QuoteTick)
+
+            for climate_day in climate_days:
+                _discover_spans_for_climate_day(
+                    catalog=catalog,
+                    climate_day=climate_day,
+                    instance_id=instance_id,
+                    depth_files_by_id=depth_files_by_id,
+                    quote_files_by_id=quote_files_by_id,
+                    registry=registry,
+                    window_bounds=window_bounds,
+                    should_stop=should_stop,
+                    spans=spans,
+                    clean_station_days=clean_station_days,
+                )
+        finally:
+            # Finding 5: cleanup now runs even when `_convert_live_capture`
+            # itself fails partway (the `try` now starts BEFORE the
+            # conversion call, not after it), and a genuine removal failure
+            # is WARNed, never silently swallowed.
+            _cleanup_work_catalog(work_catalog)
 
     return dict(spans), clean_station_days, window_bounds
 
