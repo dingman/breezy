@@ -1626,3 +1626,20 @@ Before a read can retire, clear, or credit anything, state which outcomes it can
   - Rule: an operator-visible line must be asserted on the stream the unit actually writes to, meaning the entrypoint's stdout or journal. It must also be checked in the journal after the first live run, before the item is called done.
 
 Related: L-36 (strict ZERO_FILL is unreachable), EDGE-2 plan r3, `AMBIGUOUS_ORDER_2026-09-23_MIA/README.md`, SUP-ADOPT-PERMIT.
+
+## L-53 — A cache cannot fix an input that never completes; one oversized item makes a capped job fail forever (2026-09-27)
+
+### What happened
+- REPLAY-INCR added a per-instance census cache so the daily replay would stop re-doing work. The plan assumed the 09-27 timeout came from corpus growth.
+- Warm run 1 showed otherwise. The run spent all 30 minutes on ONE 8.2 GB instance (`ea485c90`, the 09-27 rotation), throttled at MemoryHigh=3G (CPU/wall 0.19).
+- An item that cannot finish is never cached. It is a miss on every run, so the job fails every day regardless of how warm the rest of the cache is.
+
+### The rule
+Before designing an incremental or caching fix for a capped job that timed out, find the **largest single work item** and check that it can complete within the cap on its own. If it cannot, the fix is bounded-memory processing of that item, not caching around it.
+
+### How to apply
+- Size the per-item worst case first: `du` of the biggest instance, and a measured peak from one capped run.
+- Watch for L-49 CPU/wall < 0.3 on that item.
+- A SIGTERM cannot interrupt a long native call. Plan for SIGKILL (TimeoutStopSec) to be the real stop, and keep per-chunk work bounded.
+
+Related: L-29 (a cap is containment), L-49 (throttle signature), REPLAY-INCR / REPLAY-BIGINST plans.
