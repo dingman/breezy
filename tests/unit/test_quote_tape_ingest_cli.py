@@ -30,6 +30,8 @@ import dataclasses
 import io
 import logging
 import os
+import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from decimal import Decimal
@@ -91,6 +93,7 @@ def _recording_convert(
 
 INSTANCE = "instance-1"
 OTHER_INSTANCE = "instance-2"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _touch(
@@ -570,20 +573,20 @@ class TestConsoleEntrypoint:
         assert CATALOG_ENV_VAR in err.getvalue()
 
     def test_a_preflight_error_never_reaches_the_extend_dedupe_summary_line(
-        self, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
         """Review finding 2 (ING-2-RSS): the `PreflightError` early return in
-        `run()` happens before the `extend_dedupe:` summary log call -- no
-        ingestion ran, so there is nothing to summarise."""
+        `run()` happens before the `extend_dedupe:` summary print call --
+        no ingestion ran (an empty ``env`` makes ``_resolve_catalog`` raise
+        ``PreflightError`` for the missing catalog env var), so there is
+        nothing to summarise."""
         out, err = io.StringIO(), io.StringIO()
 
-        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
-            code = run([], env={}, stdout=out, stderr=err)
+        code = run([], env={}, stdout=out, stderr=err)
 
         assert code == EXIT_USAGE
-        assert not any(
-            record.getMessage().startswith("extend_dedupe:") for record in caplog.records
-        )
+        assert "extend_dedupe:" not in out.getvalue()
+        assert "extend_dedupe:" not in err.getvalue()
 
     def test_dry_run_reports_without_converting_or_marking(self, tmp_path: Path) -> None:
         _touch(
@@ -607,60 +610,59 @@ class TestConsoleEntrypoint:
 
 
 class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
-    """Review finding 1 (ING-2-RSS, L-30/L-52): the `extend_dedupe:` INFO
-    line `run()` logs once per call, via the module-level
-    `extend_dedupe_counters` singleton reset at the top of every `run()`."""
+    """Review finding 1 (ING-2-RSS, L-30/L-52): the `extend_dedupe:` line
+    `run()` prints once per call to the SAME ``out`` stream as every other
+    per-run summary line, via the module-level `extend_dedupe_counters`
+    singleton reset at the top of every `run()`.
 
-    def _extend_dedupe_lines(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> list[str]:
+    Asserted against ``out`` (the stream `run()` is handed and the process
+    actually writes to), not ``caplog`` -- a captured log record proves
+    nothing about delivery, since caplog captures records regardless of
+    whether production configures a handler for this logger at all (it
+    does not; see ``TestRealConsoleEntrypointDelivery`` below for the
+    end-to-end proof).
+    """
+
+    def _extend_dedupe_lines(self, out: io.StringIO) -> list[str]:
         return [
-            record.getMessage()
-            for record in caplog.records
-            if record.getMessage().startswith("extend_dedupe:")
+            line for line in out.getvalue().splitlines() if line.startswith("extend_dedupe:")
         ]
 
     def test_a_run_with_no_extend_chunks_emits_exactly_one_zero_line(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
         (tmp_path / "live").mkdir()
         out, err = io.StringIO(), io.StringIO()
 
-        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
-            code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+        code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
 
         assert code == EXIT_OK
-        assert self._extend_dedupe_lines(caplog) == [
+        assert self._extend_dedupe_lines(out) == [
             "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
         ]
 
     def test_a_second_run_does_not_inherit_a_prior_runs_counts(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
         """Pre-loads the module-level counter (simulating leftover state
         from EXTEND activity that mutated it outside this `run()` call) and
         confirms the SECOND `run()` still reports zero -- `run()` resets the
         singleton on every call, not just once per process."""
         (tmp_path / "live").mkdir()
-        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
-            run(
-                [], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=io.StringIO(), stderr=io.StringIO()
-            )
+        run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=io.StringIO(), stderr=io.StringIO())
 
         ingest_cli_module.extend_dedupe_counters.record(QuoteTick, filtered=True)
 
-        caplog.clear()
         out, err = io.StringIO(), io.StringIO()
-        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
-            code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+        code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
 
         assert code == EXIT_OK
-        assert self._extend_dedupe_lines(caplog) == [
+        assert self._extend_dedupe_lines(out) == [
             "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
         ]
 
     def test_the_line_is_counts_only_and_never_carries_an_instrument_id(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
         _touch(
             tmp_path,
@@ -670,17 +672,54 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
         )
         out, err = io.StringIO(), io.StringIO()
 
-        with caplog.at_level(logging.INFO, logger="breezy.runtime.quote_tape_ingest_cli"):
-            run(
-                ["--dry-run"],
-                env={CATALOG_ENV_VAR: str(tmp_path)},
-                stdout=out,
-                stderr=err,
-            )
+        run(
+            ["--dry-run"],
+            env={CATALOG_ENV_VAR: str(tmp_path)},
+            stdout=out,
+            stderr=err,
+        )
 
-        lines = self._extend_dedupe_lines(caplog)
+        lines = self._extend_dedupe_lines(out)
         assert len(lines) == 1
         assert INSTANCE not in lines[0]
+
+
+class TestRealConsoleEntrypointDelivery:
+    """ING-2-RSS review finding 3 / L-52: the caplog-based tests above prove
+    the LINE is produced, never that it is DELIVERED -- caplog captures log
+    records regardless of production's logging configuration, which
+    installs no handler for this logger at all (the 2026-09-27 11:30Z
+    production run executed the merged code and printed nothing). This
+    exercises the ACTUAL console-script entrypoint the systemd unit's
+    ``ExecStart`` runs (`deploy/systemd/breezy-quote-tape-ingest.service`),
+    as a real subprocess with real, unpatched ``sys.stdout`` -- not
+    `run()`'s injectable ``stdout=`` parameter -- so the assertion is on
+    what actually reaches the process's stdout file descriptor.
+    """
+
+    def test_the_summary_line_reaches_real_process_stdout(self, tmp_path: Path) -> None:
+        (tmp_path / "live").mkdir()
+        script = Path(sys.executable).parent / "breezy-quote-tape-ingest"
+        assert script.is_file(), f"console script missing: {script}"
+
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            env={
+                **os.environ,
+                "PYTHONPATH": str(_REPO_ROOT / "src"),
+                CATALOG_ENV_VAR: str(tmp_path),
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        assert result.returncode == EXIT_OK, result.stderr
+        lines = [
+            line for line in result.stdout.splitlines() if line.startswith("extend_dedupe:")
+        ]
+        assert lines == ["extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="]
 
 
 class TestReEmittedInstrumentDefinitionsStillLand:
