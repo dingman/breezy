@@ -22,6 +22,14 @@ mechanically by the two-way `import-linter` `forbidden` contract in
 in the layer stack is `breezy.settlement.current_rung_hold_v2`'s
 `CombinedDraw`/`combine_station_day` family, exactly as SS6.1 mandates reuse
 over re-invention.
+
+**Known residuals (V2-LOOK-GATE, RA-9 Path B):** the registration-time gates
+in `register_hypothesis` are the only sanctioned entry point -- they do not
+extend to direct `HypothesisRecord` construction or a hand-edited ledger
+line, both of which bypass them. `read_hypothesis_ledger` and
+`scripts/analysis/hypothesis_triage.py` only re-validate schema and filter
+shape; they re-enforce nothing this module already refused. The only
+sanctioned writer is `register_and_persist`.
 """
 
 from __future__ import annotations
@@ -50,6 +58,7 @@ __all__ = [
     "MAX_VARIANTS_PER_HYPOTHESIS",
     "MDE_MISMATCH_TOLERANCE",
     "MIN_PER_VARIANT_ALPHA",
+    "PATH_B_SOURCE_GATE_LANDED",
     "PINNED_ORDER_QUANTITY",
     "POOLED_PNL_VETO_REQUIRED",
     "POWER",
@@ -74,6 +83,7 @@ __all__ = [
     "NonPinnedLegShareCapError",
     "NonPositiveVariantCountError",
     "NonUnitOrderQuantityError",
+    "PathBSourceGateNotLandedError",
     "PooledPnlVetoOutcome",
     "PowerPrimaryOnlyRequiredError",
     "ProgrammeBudgetExhaustedError",
@@ -83,6 +93,7 @@ __all__ = [
     "UnjustifiedVarianceBoundError",
     "UnknownHypothesisLedgerSchemaError",
     "UnknownStratumAxisError",
+    "V2LookTakingRegistrationRefusedError",
     "VariantCountCeilingExceededError",
     "ZeroTakeFilterResult",
     "alpha_remaining",
@@ -147,8 +158,18 @@ RE_ARM_GATING_PROGRAMME_ALPHA: Final[float] = 0.025
 #: `register_hypothesis` refuses any schema_version=3 call that would reach
 #: REGISTERED (look-taking) status. RA-9f flips this in its own reviewed
 #: RED->GREEN change, which also deletes the refusal test this constant
-#: currently requires (L-12).
+#: currently requires (L-12). Flipping this ALONE is inert: a schema_version=3
+#: REGISTERED call is refused by `PATH_B_SOURCE_GATE_LANDED` below until
+#: PATH-B-SOURCE-GATE also lands.
 HORIZON_TOLLING_LANDED: Final[bool] = False
+#: RULING_RA-9 §7 Path B item 1 / A-7 precondition. While False,
+#: `register_hypothesis` refuses a schema_version=3 REGISTERED call even once
+#: `HORIZON_TOLLING_LANDED` is True: `hypothesis_triage.py`'s
+#: `_default_replay_result_sources`/`_store_dir` are champion-only and not yet
+#: scoped by `composition_kind` (RA-9c2 was STOPPED before building that
+#: scope). The PATH-B-SOURCE-GATE item rules on the scoping semantics, builds
+#: the gate, and flips this.
+PATH_B_SOURCE_GATE_LANDED: Final[bool] = False
 
 #: Programme-level, fixed BEFORE any intake (SS6.1); never re-derived from data.
 PROGRAMME_ALPHA: Final[float] = 0.05
@@ -320,6 +341,25 @@ class HorizonTollingNotLandedError(ValueError):
     (look-taking) status while `HORIZON_TOLLING_LANDED` is still False
     (RULING_RA-9 A-5; LEDGER-V3 D-2/R3-2). Never raised for a zero-look
     outcome (UNDERPOWERED_NOT_REGISTERED) -- RA-9 Path A keeps working."""
+
+
+class PathBSourceGateNotLandedError(ValueError):
+    """A schema_version=3 `register_hypothesis` call would reach REGISTERED
+    (look-taking) status while `HORIZON_TOLLING_LANDED` is True but
+    `PATH_B_SOURCE_GATE_LANDED` is still False (RULING_RA-9 §7 Path B item 1,
+    A-7). Raised only once the tolling flag has already passed -- while
+    `HORIZON_TOLLING_LANDED` is False, `HorizonTollingNotLandedError` is
+    raised instead."""
+
+
+class V2LookTakingRegistrationRefusedError(ValueError):
+    """A schema_version=2 `register_hypothesis` call would reach REGISTERED
+    (look-taking) status. RULING_RA-9 §7 Path B item 3 and A-3 bar ANY
+    REGISTERED look-taking record until it can declare an explicit re-arm-
+    gating flag, which schema_version=2 has no field for (`may_gate_re_arm`
+    is always False for v2). A v2 UNDERPOWERED_NOT_REGISTERED outcome is
+    unaffected -- RA-9 Path A keeps working. Look-taking registrations must
+    use schema_version=3 instead."""
 
 
 #: RA-2's closed, validated vocabulary (never a free-form DSL) -- exactly the
@@ -879,8 +919,10 @@ def register_hypothesis(
     the default), a NORMAL-disposition registration is written at
     schema_version=1 exactly as before -- byte-identical to pre-RA-2
     behaviour. Supplied, it must have exactly `k_variants` entries, each a
-    `parse_stratum_filter`-shaped string; the resulting record (REGISTERED or
-    UNDERPOWERED_NOT_REGISTERED) is written at schema_version=2. Never
+    `parse_stratum_filter`-shaped string. Only an UNDERPOWERED_NOT_REGISTERED
+    outcome is accepted at schema_version=2 -- a REGISTERED (look-taking)
+    outcome is refused (`V2LookTakingRegistrationRefusedError`; RULING_RA-9
+    Path B item 3, A-3: v2 has no field to declare re-arm gating). Never
     accepted for `disposition="CLOSED"` -- a zero-look, no-variant-shape
     record has nothing to bind.
 
@@ -893,8 +935,10 @@ def register_hypothesis(
     A-3/A-3a). Never accepted for `disposition="CLOSED"` (CLOSED always stays
     schema_version=1, R3-3). While `HORIZON_TOLLING_LANDED` is False, a
     schema_version=3 call that would reach REGISTERED status is refused
-    (`HorizonTollingNotLandedError`) -- a v3 UNDERPOWERED outcome is
-    unaffected (RA-9 Path A).
+    (`HorizonTollingNotLandedError`); once that flag is True, the same
+    attempt is refused instead by `PathBSourceGateNotLandedError` while
+    `PATH_B_SOURCE_GATE_LANDED` is False (RULING_RA-9 Path B item 1). A v3
+    UNDERPOWERED outcome is unaffected by either flag (RA-9 Path A).
     """
     if k_variants < 1:
         raise NonPositiveVariantCountError(f"k_variants must be >= 1, got {k_variants}")
@@ -1110,10 +1154,17 @@ def register_hypothesis(
             re_arm_gating=re_arm_gating,
         )
 
-    # R3-2: both refusals below apply ONLY to a REGISTERED (look-taking)
+    # R3-2: all refusals below apply ONLY to a REGISTERED (look-taking)
     # outcome, placed AFTER the power check -- never beside the ~:845 filter
-    # validation. A v3 UNDERPOWERED outcome (above) is never blocked by
-    # either, keeping RA-9 Path A working.
+    # validation. A v1/v2/v3 UNDERPOWERED outcome (above) is never blocked by
+    # any of them, keeping RA-9 Path A working.
+    if record_schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2:
+        raise V2LookTakingRegistrationRefusedError(
+            f"hypothesis_id={hypothesis_id!r}: a schema_version=2 registration cannot "
+            "reach REGISTERED status -- RULING_RA-9 Path B item 3 and A-3 bar any "
+            "REGISTERED look-taking record until it can declare an explicit re-arm-gating "
+            "flag, which schema_version=2 has no field for; use schema_version=3 instead"
+        )
     if record_schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3:
         if not stored_stratum_filters:
             raise StratumFilterCountMismatchError(
@@ -1125,6 +1176,13 @@ def register_hypothesis(
                 f"hypothesis_id={hypothesis_id!r}: a schema_version=3 registration cannot "
                 "reach REGISTERED status while HORIZON_TOLLING_LANDED is False "
                 "(RULING_RA-9 A-5; RA-9f is the precondition that flips this)"
+            )
+        if not PATH_B_SOURCE_GATE_LANDED:
+            raise PathBSourceGateNotLandedError(
+                f"hypothesis_id={hypothesis_id!r}: a schema_version=3 registration cannot "
+                "reach REGISTERED status while PATH_B_SOURCE_GATE_LANDED is False, even "
+                "though HORIZON_TOLLING_LANDED is True (RULING_RA-9 Path B item 1, A-7; "
+                "PATH-B-SOURCE-GATE is the precondition that flips this)"
             )
 
     return HypothesisRecord(

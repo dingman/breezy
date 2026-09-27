@@ -45,6 +45,7 @@ from hypothesis_triage import (
 
 from breezy.analysis.hypothesis_ledger import (
     EVIDENCED_FEE_THETA,
+    HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
     MAX_HYPOTHESES,
     MAX_SINGLE_DAY_LEG_SHARE,
     PROGRAMME_ALPHA,
@@ -187,9 +188,19 @@ def _register(
         station_day_statistic=STATION_DAY_STATISTIC,
         order_quantity=1,
         look_policy="SINGLE_LOOK",
-        variant_stratum_filters=variant_stratum_filters,
     )
     assert record.is_zero_look is False
+    if variant_stratum_filters is not None:
+        # V2-LOOK-GATE: register_hypothesis now refuses a v2 REGISTERED
+        # outcome outright, so a filter-bound v2 record for these triage
+        # look-path tests is built directly here from the REGISTERED v1
+        # record register_hypothesis already computed -- every alpha/MDE
+        # value stays register_hypothesis's own output (V2-LOOK-GATE r2 V-1).
+        record = replace(
+            record,
+            schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
+            variant_stratum_filters=variant_stratum_filters,
+        )
     write_hypothesis_ledger(_ledger(derived), (replace(record, status=status),))
 
 
@@ -1162,7 +1173,7 @@ def test_has_registered_draw_binding_true_for_a_matching_filter() -> None:
         mde_at_allocated_alpha=recompute_mde(
             per_variant_alpha=PROGRAMME_ALPHA / MAX_HYPOTHESES, n_station_days=300
         ),
-        mde_plausibility_bound=1.0,
+        mde_plausibility_bound=0.01,
         power_is_primary_only=True,
         mde_reference_ask=0.30,
         mde_fee_theta=EVIDENCED_FEE_THETA,
@@ -1173,6 +1184,11 @@ def test_has_registered_draw_binding_true_for_a_matching_filter() -> None:
         look_policy="SINGLE_LOOK",
         variant_stratum_filters=("station=SFO|hour_lst=10-11|side=YES|composition_kind=taker",),
     )
+    # V2-LOOK-GATE: register_hypothesis now refuses a v2 REGISTERED outcome,
+    # so this is a real UNDERPOWERED_NOT_REGISTERED v2 record instead --
+    # `_has_registered_draw_binding` is status-independent (it only reads
+    # `variant_stratum_filters`), so the predicate under test is unaffected.
+    assert record.status == "UNDERPOWERED_NOT_REGISTERED"
     assert _has_registered_draw_binding(record, "v1") is True
 
 
@@ -1217,7 +1233,7 @@ def test_has_registered_draw_binding_false_and_names_the_missing_variant() -> No
         mde_at_allocated_alpha=recompute_mde(
             per_variant_alpha=(PROGRAMME_ALPHA / MAX_HYPOTHESES) / 2, n_station_days=300
         ),
-        mde_plausibility_bound=1.0,
+        mde_plausibility_bound=0.01,
         power_is_primary_only=True,
         mde_reference_ask=0.30,
         mde_fee_theta=EVIDENCED_FEE_THETA,
@@ -1231,6 +1247,9 @@ def test_has_registered_draw_binding_false_and_names_the_missing_variant() -> No
             "station=MDW|hour_lst=10-11|side=YES|composition_kind=taker",
         ),
     )
+    # V2-LOOK-GATE: real UNDERPOWERED_NOT_REGISTERED v2 record (see the v1
+    # case above for why the predicate under test is unaffected).
+    assert v2_record.status == "UNDERPOWERED_NOT_REGISTERED"
     assert _has_registered_draw_binding(v2_record, "v1") is True
     assert _has_registered_draw_binding(v2_record, "v2") is True
 
