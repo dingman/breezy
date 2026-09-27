@@ -1545,11 +1545,21 @@ def _do_midday_watch(
     terminal boot-retry alert already sent, dispatches to
     :func:`_do_boot_retry` instead -- but ONLY when there is no tracked
     child at all, or the tracked child is one THIS supervisor spawned
-    (:func:`owned`) with a KNOWN log. Any OTHER live, not-owned pid (an
-    adoption, or an unresolved log path) falls through to this function's
-    own unmodified body below, which independently fails closed via its own
-    ``first_boot_permit_expires_at_ns is None`` -> ``CEILING_UNKNOWN``
-    branch -- never a second, unclamped spawn.
+    (:func:`owned`) with a KNOWN log. Any OTHER tracked pid (not owned by
+    this supervisor) falls through to this function's own unmodified body
+    below -- but that body's own top-of-function guard
+    (``tracked_pid is None or node_log is None``) means the fallthrough is
+    NOT symmetric across a known vs. an unresolved log path: a not-owned
+    pid with a KNOWN log reaches the body and independently fails closed
+    via its own ``first_boot_permit_expires_at_ns is None`` ->
+    ``CEILING_UNKNOWN`` branch once that child is later observed dead; a
+    not-owned pid with an UNRESOLVED log path (``node_log is None``) never
+    reaches that branch at all -- the body's own top-of-function guard
+    returns first, with no read and no alert. That second sub-case stays
+    silent, never a second unclamped spawn, until
+    :func:`boot_retry_window_closed`'s own terminal, once-per-day
+    ``BOOT_RETRY_WINDOW_CLOSED_NEVER_READY`` CRITICAL closes it at 01:00Z
+    (r5 ruling 3) -- never ``CEILING_UNKNOWN``.
     """
     if (
         state.boot_zero_instruments_seen
