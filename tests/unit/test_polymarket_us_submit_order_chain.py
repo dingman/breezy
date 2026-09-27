@@ -123,7 +123,16 @@ class _PrivateReadStub:
         self._payloads: dict[str, Mapping[str, Any]] = payloads
         self.paths: list[str] = []
 
-    async def __call__(self, path: str) -> Mapping[str, Any]:
+    async def __call__(
+        self, path: str, query: Mapping[str, object] | None = None
+    ) -> Mapping[str, Any]:
+        # EDGE-2 slice D (AC10): `query` is accepted (never recorded here --
+        # nothing in this module's tests asserts a query shape through this
+        # stub; the resolver's own cursor-forwarding tests replace
+        # `_private_read` with a purpose-built local fake instead, in
+        # `test_current_rung_hold_ambiguous_resolver.py`) so this stub stays
+        # a byte-identical drop-in for the widened `PrivateRead` protocol.
+        del query
         self.paths.append(path)
         return self._payloads[path]
 

@@ -233,3 +233,125 @@ def test_unparseable_diagnostic_has_no_payload(caplog: Any) -> None:
     assert "123.45" not in log_text
     assert "SENTINELID" not in log_text
     assert "SENTINELID2" not in log_text
+
+
+# ---------------------------------------------------------------------------
+# EDGE-2 slice D (AC4(c)): the resolver's trade-activity join.
+#
+# Fixtures below are shaped like the captured trade-row shape (``docs/
+# evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/
+# activities_p0.json``: ``trade.aggressor.id`` / ``trade.passive.id`` /
+# ``qtyDecimal`` / ``createTime``) but every id and amount is SYNTHETIC.
+# ---------------------------------------------------------------------------
+
+
+def _trade_activity(
+    *,
+    aggressor_id: str | None = None,
+    passive_id: str | None = None,
+    qty_decimal: str | None = "1",
+    create_time: str | None = "2026-09-23T17:22:07.900000000Z",
+    market_slug: str = "tc-temp-miahigh-2026-09-23-gte82lt83f",
+) -> dict[str, Any]:
+    trade: dict[str, Any] = {"marketSlug": market_slug}
+    if aggressor_id is not None:
+        trade["aggressor"] = {"id": aggressor_id}
+    if passive_id is not None:
+        trade["passive"] = {"id": passive_id}
+    if qty_decimal is not None:
+        trade["qtyDecimal"] = qty_decimal
+    if create_time is not None:
+        trade["createTime"] = create_time
+    return {"type": "ACTIVITY_TYPE_TRADE", "trade": trade}
+
+
+def test_trade_rows_for_order_joins_aggressor_and_passive_ids() -> None:
+    page = {
+        "activities": [
+            _trade_activity(aggressor_id="SYN-ORDER-1", qty_decimal="1"),
+            _trade_activity(passive_id="SYN-ORDER-1", qty_decimal="0.5"),
+            _trade_activity(aggressor_id="SYN-OTHER", passive_id="SYN-OTHER-2"),
+        ]
+    }
+    refs = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert len(refs) == 2
+    assert refs[0].is_aggressor is True
+    assert refs[0].qty == Decimal(1)
+    assert refs[1].is_aggressor is False
+    assert refs[1].qty == Decimal("0.5")
+
+
+def test_trade_rows_for_order_ignores_marketslug_match_without_id_match() -> None:
+    """L-17: the venue's `marketSlug` filter is NOT a trade filter for a
+    specific order id -- a same-slug trade naming a DIFFERENT order must
+    never be counted."""
+    page = {
+        "activities": [
+            _trade_activity(
+                aggressor_id="SYN-OTHER-ORDER",
+                market_slug="tc-temp-miahigh-2026-09-23-gte82lt83f",
+            ),
+        ]
+    }
+    assert aa.trade_rows_for_order(page, "SYN-ORDER-1") == ()
+
+
+def test_trade_rows_for_order_ignores_non_trade_activities() -> None:
+    page = {
+        "activities": [
+            _activity("ACTIVITY_TYPE_ACCOUNT_DEPOSIT", _balance_change()),
+            {"type": "ACTIVITY_TYPE_POSITION_RESOLUTION", "positionResolution": {}},
+        ]
+    }
+    assert aa.trade_rows_for_order(page, "SYN-ORDER-1") == ()
+
+
+def test_trade_rows_for_order_degrades_never_drops_a_malformed_match() -> None:
+    """A genuine match (id equality) is NEVER dropped for a malformed
+    ``qtyDecimal``/``createTime`` -- losing a real trade row silently is
+    exactly the false-zero-fill risk AC4(c) exists to close."""
+    page = {
+        "activities": [
+            _trade_activity(
+                aggressor_id="SYN-ORDER-1", qty_decimal="not-a-number", create_time="garbage",
+            ),
+        ]
+    }
+    refs = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert len(refs) == 1
+    assert refs[0].qty == Decimal(0)
+    assert refs[0].create_ts_ns == 0
+
+
+def test_trade_rows_for_order_returns_empty_for_non_list_activities() -> None:
+    assert aa.trade_rows_for_order({"activities": "not-a-list"}, "SYN-ORDER-1") == ()
+    assert aa.trade_rows_for_order({}, "SYN-ORDER-1") == ()
+
+
+def test_page_min_create_ts_ns_handles_missing_and_malformed_times() -> None:
+    page = {
+        "activities": [
+            _trade_activity(
+                aggressor_id="SYN-1",
+                create_time="2026-09-23T17:22:07.900000000Z",
+            ),
+            _trade_activity(aggressor_id="SYN-2", create_time="not-a-timestamp"),
+            _activity("ACTIVITY_TYPE_ACCOUNT_DEPOSIT", _balance_change(
+                create_time="2026-09-20T00:00:00.000000000Z",
+            )),
+            {"type": "ACTIVITY_TYPE_WEIRD"},
+        ]
+    }
+    result = aa.page_min_create_ts_ns(page)
+    assert result is not None
+    # 2026-09-20 predates 2026-09-23, so the balance-change row's timestamp
+    # is the minimum; the malformed trade row and the untimestamped weird
+    # row are both excluded rather than corrupting the minimum.
+    expected = aa._parse_rfc3339_ns("2026-09-20T00:00:00.000000000Z")
+    assert result == expected
+
+
+def test_page_min_create_ts_ns_returns_none_with_no_parseable_timestamp() -> None:
+    page = {"activities": [{"type": "ACTIVITY_TYPE_WEIRD"}]}
+    assert aa.page_min_create_ts_ns(page) is None
+    assert aa.page_min_create_ts_ns({"activities": "not-a-list"}) is None

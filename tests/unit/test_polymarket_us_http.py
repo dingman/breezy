@@ -27,7 +27,7 @@ from breezy.adapters.polymarket_us.errors import (
     VenueStatusError,
     VenueTransportError,
 )
-from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
+from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, build_query_string
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
 from breezy.adapters.polymarket_us.signing import (
     ACCESS_KEY_HEADER,
@@ -187,6 +187,25 @@ async def test_no_query_string_yields_a_bare_path() -> None:
     client = _client(transport)
     await client.get_authenticated("/v1/markets", query={}, quota_key=QUOTA_KEY_INSTRUMENTS)
     assert transport.calls[0]["url"] == f"{_API_BASE}/v1/markets"
+
+
+def test_build_query_string_matches_http_client_rendering() -> None:
+    """EDGE-2 slice D (AC10, ruling b): the module-level
+    :func:`build_query_string` -- lifted out of
+    ``PolymarketUSHttpClient._build_query_string``, which now delegates to
+    it -- renders BYTE-IDENTICAL output to the method for the same mapping.
+    This is the SAME renderer a resolver-side query-carrying `PrivateRead`
+    call (``exec/client.py``'s ``_order_trade_activity``) now uses, so the
+    "one string, signed and sent" invariant holds across BOTH callers."""
+    transport = _RecordingTransport()
+    client = _client(transport)
+    query = {
+        "limit": 100,
+        "sortOrder": "SORT_ORDER_DESCENDING",
+        "types": ["ACTIVITY_TYPE_TRADE"],
+    }
+    assert build_query_string(query) == client._build_query_string(query)
+    assert build_query_string(None) == client._build_query_string(None) == ""
 
 
 # --------------------------------------------------------------------------

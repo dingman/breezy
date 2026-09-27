@@ -337,6 +337,13 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # the `PrivateRead` seam. Old(21) -> new(22); the widened
                 # neighbour below (`_send_signed_request`) is still refused.
                 "_read_open_orders",
+                # EDGE-2 slice D (plan docs/plans/backlog/EDGE_2026-09-27/
+                # EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md,
+                # AC9): the resolver's activities trade-join read. Old(22)
+                # -> new(23); scanned by `EXEC_RESOLVER_COROUTINES`/
+                # `EXEC_RESOLVER_PERMITTED_CALLEES` exactly like
+                # `_resolve_ambiguous_intents` itself.
+                "_order_trade_activity",
                 "__call__",
             }
         ),

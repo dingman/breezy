@@ -411,7 +411,12 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
     AUD-13b adds the third: `install_reconciliation_refusal_alert`, the SAME
     idiom again -- the kernel publishes the OrderEmulator/trader RUNNING
     transitions after the startup reconciliation returns, so the first poll
-    after the pass sees its latched refusals. Still no timer."""
+    after the pass sees its latched refusals. Still no timer.
+
+    EDGE-2 slice D (silent-failure review, 75b9008) adds the fourth:
+    `install_resolver_contradiction_alert`, the SAME idiom again, delivering
+    `resolver_evidence_contradictions` -- a detector with no subscriber is
+    not a control."""
     run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
     node = RecordingNode.instances[0]
 
@@ -420,7 +425,7 @@ def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None
         for topic, handler in node.kernel.msgbus.subscriptions
         if topic == COMPONENT_STATE_TOPIC
     ]
-    assert len(component_state_subscribers) == 3, node.kernel.msgbus.subscriptions
+    assert len(component_state_subscribers) == 4, node.kernel.msgbus.subscriptions
 
 
 def test_the_reconciliation_refusal_reader_reads_the_exec_client_surface() -> None:
@@ -439,6 +444,30 @@ def test_the_reconciliation_refusal_reader_reads_the_exec_client_surface() -> No
     assert read() == ()
     clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = client
     assert read() == (refusal,)
+
+
+def test_the_resolver_contradiction_reader_reads_the_exec_client_surface() -> None:
+    """EDGE-2 slice D (silent-failure review, 75b9008): the reader resolves
+    the exec client at POLL time and reads its read-only
+    `resolver_evidence_contradictions`; a missing client or a client without
+    the attribute yields `()`, never a raise inside a bus handler -- same
+    shape as `_exec_client_reconciliation_refusal_reader` immediately
+    above."""
+    contradiction = {
+        "severity": "CRITICAL", "event": "resolver_evidence_contradiction", "site": "global",
+        "intent_id": "intent-1", "venue_order_id": "vo-1", "trade_count": "1",
+        "create_fill_evidence": "none",
+    }
+    client = SimpleNamespace(resolver_evidence_contradictions=(contradiction,))
+    clients: dict[object, object] = {}
+    node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=SimpleNamespace(_clients=clients)))
+    read = trade_cli._exec_client_resolver_contradiction_reader(node)  # type: ignore[arg-type]
+
+    assert read() == ()
+    clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = SimpleNamespace()
+    assert read() == ()
+    clients[ClientId(POLYMARKET_US_CLIENT_NAME)] = client
+    assert read() == (contradiction,)
 
 
 def test_the_entrypoint_source_registers_no_strategy_or_exec_algorithm_or_raw_submit() -> None:

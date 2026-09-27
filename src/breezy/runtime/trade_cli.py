@@ -104,6 +104,7 @@ from breezy.runtime.component_health_watch import (
     install_component_degraded_alert,
     install_reconciliation_refusal_alert,
     install_refusal_repoll_timer,
+    install_resolver_contradiction_alert,
     install_stale_intent_alert,
 )
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
@@ -463,6 +464,28 @@ def _exec_client_reconciliation_refusal_reader(
     return _read
 
 
+def _exec_client_resolver_contradiction_reader(
+    node: Node,
+) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the ``contradictions`` reader EDGE-2 slice D's
+    ``resolver_evidence_contradiction`` watch requires.
+
+    Same lookup and lazy resolution as
+    :func:`_exec_client_stale_intent_reader`: the client is looked up at poll
+    time, and a missing client or one without
+    ``resolver_evidence_contradictions`` yields ``()`` rather than raising
+    inside a message-bus handler.
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(getattr(client, "resolver_evidence_contradictions", ()))
+
+    return _read
+
+
 def _run_node(
     config: TradingNodeConfig,
     node_factory: NodeFactory,
@@ -551,12 +574,13 @@ def _run_node(
 
     FU-8b arms :func:`~breezy.runtime.component_health_watch.
     install_refusal_repoll_timer` on ``node.kernel.clock`` immediately after
-    the stale-intent and reconciliation-refusal watches are installed --
-    after ``assembled = True``, so a node that never finishes ``build()``
-    never arms a timer either. The timer's callback runs on a foreign
-    (Rust/tokio) thread and hops to ``node.kernel.loop`` before calling
-    either handler, so both triggers stay mutually serial on the loop
-    thread. Arming failure is caught and reported through ``_report`` alone
+    the stale-intent, reconciliation-refusal AND (EDGE-2 slice D) resolver-
+    evidence-contradiction watches are installed -- after ``assembled =
+    True``, so a node that never finishes ``build()`` never arms a timer
+    either. The timer's callback runs on a foreign (Rust/tokio) thread and
+    hops to ``node.kernel.loop`` before calling each handler, so all three
+    triggers stay mutually serial on the loop thread. Arming failure is
+    caught and reported through ``_report`` alone
     (informational delivery, never a control: FU-8 r2.1) and never blocks
     boot. The returned ``cancel`` is called in ``finally``, BEFORE
     ``node.dispose()``, so the timer never outlives the loop it hops to --
@@ -600,11 +624,15 @@ def _run_node(
             node.kernel.msgbus,
             refusals=_exec_client_reconciliation_refusal_reader(node),
         )
+        contradiction_h = install_resolver_contradiction_alert(
+            node.kernel.msgbus,
+            contradictions=_exec_client_resolver_contradiction_reader(node),
+        )
         try:
             cancel_repoll = install_refusal_repoll_timer(
                 node.kernel.clock,
                 loop=node.kernel.loop,
-                handlers=(recon_h, stale_h),
+                handlers=(recon_h, stale_h, contradiction_h),
             )
         # Broad, deliberately: an informational re-poll timer must never
         # block boot (FU-8 r2.1 ruling; AC9). The state-change path above is

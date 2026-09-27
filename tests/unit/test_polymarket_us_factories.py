@@ -78,6 +78,7 @@ from breezy.adapters.polymarket_us.factories import (
     config_from_env,
     exec_config_from_env,
 )
+from breezy.adapters.polymarket_us.http import build_query_string
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import (
     PolymarketUSInstrumentProvider,
@@ -650,9 +651,11 @@ class RecordingTransport:
 def test_the_wired_private_read_signs_exactly_one_get_over_the_bare_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
 ) -> None:
-    """The GET-only guarantee lives HERE (class docstring): no `query`
-    parameter exists on the closure at all, so the signed string and the
-    fetched URL can never drift apart."""
+    """PIN, updated by EDGE-2 slice D (AC10, ruling b): the GET-only
+    guarantee lives HERE (class docstring) -- no verb but GET is ever
+    expressible -- but a query-less call (``query=None``, every existing
+    caller) is now proven BYTE-IDENTICAL to the pre-slice-D closure: no `?`
+    reaches the URL, and the signed string is over the bare path alone."""
     RecordingTransport.instances = []
     monkeypatch.setattr(factories_module, "NautilusHttpTransport", RecordingTransport)
     client = build_exec_client(make_exec_config(tmp_path))
@@ -663,7 +666,10 @@ def test_the_wired_private_read_signs_exactly_one_get_over_the_bare_path(
     recorded = RecordingTransport.instances[0].calls
     assert len(recorded) == 1
     assert recorded[0]["url"].endswith(ACCOUNT_BALANCES_PATH)
-    assert "?" not in recorded[0]["url"], "no query string may ever reach a signed private read"
+    assert "?" not in recorded[0]["url"], (
+        "query=None must be byte-identical to the pre-slice-D closure: no "
+        "query string reaches a bare-path signed private read"
+    )
     # Decimal-preserving decode (`decode_private_payload`), not the plain
     # `json.loads` `PolymarketUSHttpClient._decode` would have used.
     balance = payload["balances"][0]
@@ -671,15 +677,44 @@ def test_the_wired_private_read_signs_exactly_one_get_over_the_bare_path(
     assert balance["currentBalance"] == Decimal("4242.42")
 
 
-def test_the_wired_private_read_has_no_query_parameter_in_its_signature(
+def test_the_wired_private_read_takes_a_path_and_an_optional_query(
     tmp_path: Path, wired: dict[str, Any]
 ) -> None:
-    """Non-vacuity for the test above, at the signature rather than the call:
-    a query CANNOT be smuggled in because the closure accepts none."""
+    """PIN, updated by EDGE-2 slice D (AC10, ruling b): `query` is now an
+    explicit, OPTIONAL second parameter -- non-vacuity for the byte-identical
+    claim above, at the signature rather than the call."""
     client = build_exec_client(make_exec_config(tmp_path))
 
-    params = inspect.signature(client._private_read).parameters
-    assert list(params) == ["path"]
+    signature = inspect.signature(client._private_read)
+    params = list(signature.parameters)
+    assert params == ["path", "query"]
+    assert signature.parameters["query"].default is None
+
+
+def test_the_wired_private_read_signs_and_sends_the_same_query_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    """AC10: a query-carrying call renders ``build_query_string(query)``
+    EXACTLY ONCE and that ONE string is both signed and sent -- the signed
+    canonical string (recoverable from the ``x-pm-signature`` the fake
+    signer/transport never inspects, so this asserts on the URL, the
+    observable half of the invariant) carries the identical query string
+    `PolymarketUSHttpClient._build_query_string` would render for the same
+    mapping."""
+    RecordingTransport.instances = []
+    monkeypatch.setattr(factories_module, "NautilusHttpTransport", RecordingTransport)
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    asyncio.run(
+        client._private_read(
+            ACCOUNT_BALANCES_PATH, {"limit": 100, "sortOrder": "SORT_ORDER_DESCENDING"},
+        )
+    )
+
+    recorded = RecordingTransport.instances[0].calls
+    assert len(recorded) == 1
+    expected_qs = build_query_string({"limit": 100, "sortOrder": "SORT_ORDER_DESCENDING"})
+    assert recorded[0]["url"].endswith(f"{ACCOUNT_BALANCES_PATH}?{expected_qs}")
 
 
 # ---------------------------------------------------------------------------

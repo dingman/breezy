@@ -92,6 +92,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.model.orders.list import OrderList
 
 import breezy.adapters.polymarket_us.exec.client as client_module
+from breezy.adapters.polymarket_us.account_activity import PORTFOLIO_ACTIVITIES_PATH
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, PolymarketUSError
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
@@ -289,7 +290,16 @@ class _PrivateReadStub:
         self.paths: list[str] = []
         self.raises: dict[str, Exception] = {}
 
-    async def __call__(self, path: str) -> Mapping[str, Any]:
+    async def __call__(
+        self, path: str, query: Mapping[str, object] | None = None
+    ) -> Mapping[str, Any]:
+        # EDGE-2 slice D (AC10): `query` is accepted but not recorded here --
+        # the resolver's own cursor-forwarding tests
+        # (`test_current_rung_hold_ambiguous_resolver.py`) replace
+        # `_private_read` with a purpose-built local fake instead, so this
+        # stub stays a byte-identical drop-in for the widened `PrivateRead`
+        # protocol without dead instrumentation.
+        del query
         self.paths.append(path)
         error = self.raises.get(path)
         if error is not None:
@@ -376,6 +386,11 @@ def _build_rig(
             # -- EMPTY by default, the "nothing rests" book every existing
             # `_connect` test assumes.
             OPEN_ORDERS_PATH: {"orders": []},
+            # EDGE-2 slice D (AC4(c)): the resolver's activities trade-join
+            # read -- EOF-complete with no trade rows by default, the
+            # "nothing has traded" book every existing zero-fill/fill test
+            # assumes unless it overrides this key.
+            PORTFOLIO_ACTIVITIES_PATH: {"activities": [], "eof": True},
         },
     )
 
@@ -699,11 +714,19 @@ def test_classify_venue_refusal_has_a_production_caller() -> None:
     assert "classify_venue_refusal(" in source
 
 
-def test_private_read_call_still_takes_only_a_path() -> None:
-    """PIN: the GET-only, no-query guarantee. D1/D2/D3 touch the refusal
-    store and the closure's body, never `PrivateRead.__call__`'s signature."""
-    params = list(inspect.signature(PrivateRead.__call__).parameters)
-    assert params == ["self", "path"]
+def test_private_read_call_takes_a_path_and_an_optional_query() -> None:
+    """PIN, updated by EDGE-2 slice D (AC10, ruling b): the GET-only
+    guarantee stays -- no verb but GET is ever expressible on this protocol
+    -- but `query` is now an explicit, OPTIONAL second parameter, defaulted
+    to `None` so every existing single-argument call site is unaffected.
+    D1/D2/D3 touch the refusal store and the closure's body, never this
+    signature; slice D is the one deliberate, reviewed exception (plan
+    docs/plans/backlog/EDGE_2026-09-27/
+    EDGE-2_ambiguous_executions_resolver_plan_r3_2026-09-27.md, AC10)."""
+    signature = inspect.signature(PrivateRead.__call__)
+    params = list(signature.parameters)
+    assert params == ["self", "path", "query"]
+    assert signature.parameters["query"].default is None
 
 
 def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:

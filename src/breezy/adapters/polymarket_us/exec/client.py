@@ -266,6 +266,12 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.objects import Money
 
 import breezy.adapters.polymarket_us.write_transport as write_transport  # noqa: PLR0402
+from breezy.adapters.polymarket_us.account_activity import (
+    PORTFOLIO_ACTIVITIES_PATH,
+    TradeActivityRef,
+    page_min_create_ts_ns,
+    trade_rows_for_order,
+)
 from breezy.adapters.polymarket_us.errors import (
     ExecutionReportMappingError,
     FeeScheduleUnknownError,
@@ -792,9 +798,19 @@ class PrivateRead(Protocol):
     could never be reached. This obligation binds every implementation,
     present or future -- a second venue (Kalshi) inherits it from this
     docstring rather than rediscovering the defect.
+
+    **EDGE-2 slice D (AC10, ruling b): ``query`` is an optional mapping,
+    rendered EXACTLY ONCE and signed AND sent as that one string** -- never
+    two independent renderings that could drift apart (the classic Ed25519
+    integration failure; see ``http.py``'s module docstring). ``query=None``
+    (every call site this protocol had before slice D) must remain
+    byte-identical to the bare-path signature: an implementation MUST NOT
+    append a query string when ``query`` is empty or absent.
     """
 
-    async def __call__(self, path: str) -> Mapping[str, Any]: ...
+    async def __call__(
+        self, path: str, query: Mapping[str, object] | None = None
+    ) -> Mapping[str, Any]: ...
 
 
 def _require_bool(value: object, *, field: str) -> bool:
@@ -1412,6 +1428,114 @@ def _resolver_long_position_state(
     return held_leg == leg
 
 
+def _resolver_leg_holding_qty(
+    positions: Mapping[str, Any], slug: str, leg: Leg
+) -> Decimal | None:
+    """EDGE-2 slice D (AC4(e)): the ABSOLUTE venue-reported holding on
+    ``leg`` at ``slug``, from the SAME eof-complete positions page
+    :func:`_resolver_long_position_state` reads -- its magnitude-aware
+    sibling.
+
+    ``Decimal(0)`` -- confirmed no holding on ``leg`` (the slug is absent,
+    net is zero, or the holding present belongs to the OTHER leg -- mirrors
+    :func:`_resolver_long_position_state`'s own ``held_leg == leg``
+    comparison). ``None`` -- undetermined (malformed ``netPosition``, or a
+    sign/outcome contradiction :func:`position_leg` refuses to guess); the
+    caller MUST treat this exactly like a read failure: stay AMBIGUOUS,
+    never retire on evidence it could not actually read.
+
+    A prior same-day fill on this SAME instrument can leave a genuine LONG
+    on ``leg`` even though THIS order never filled (AC4(e)'s whole reason
+    for existing) -- the caller compares this magnitude against
+    :meth:`PolymarketUSExecutionClient._durable_net_qty`'s own baseline
+    rather than treating any holding at all as proof of a fill.
+    """
+    payload = positions.get(slug)
+    if payload is None:
+        return Decimal(0)
+    if not isinstance(payload, Mapping):
+        return None
+    net_raw = payload.get("netPosition")
+    if net_raw is None:
+        return None
+    try:
+        net = _to_decimal(net_raw, field="netPosition", error=ExecutionReportMappingError)
+    except ExecutionReportMappingError:
+        return None
+    if net == 0:
+        return Decimal(0)
+    metadata = payload.get("marketMetadata")
+    metadata = metadata if isinstance(metadata, Mapping) else None
+    try:
+        held_leg = position_leg(
+            net=net, metadata=metadata, context=f"resolver positions[{slug!r}]"
+        )
+    except ExecutionReportMappingError:
+        return None
+    if held_leg != leg:
+        return Decimal(0)
+    return abs(net)
+
+
+#: EDGE-2 slice D (AC4(c)): the page cap for one resolver trade-activity
+#: join -- the SAME cap Step 0 used (plan section 6, Q2 row). The account's
+#: entire recorded history was 35 rows on 2026-09-27 (one page); 20 pages of
+#: 100 rows each is ample headroom while still bounding worst-case portfolio-
+#: quota pressure to a fixed number of GETs per resolver pass.
+_RESOLVER_ACTIVITY_MAX_PAGES: Final[int] = 20
+_RESOLVER_ACTIVITY_PAGE_LIMIT: Final[int] = 100
+_RESOLVER_ACTIVITY_SORT_ORDER: Final[str] = "SORT_ORDER_DESCENDING"
+
+#: AC4(d): a borrowed, UNVERIFIED defence-in-depth floor -- pinned EQUAL to
+#: the strategy's own `_REARM_MIN_DELAY_SECS`
+#: (`domain/position_reporting_lag.py:32`) by test
+#: (`test_min_age_constant_equals_strategy_rearm_floor`), never imported
+#: from `strategy` here: `adapters` sits BELOW `strategy` in the
+#: import-linter layer contract, so this module names the same number
+#: independently rather than importing it.
+_RESOLVER_ZERO_FILL_MIN_AGE_NS: Final[int] = 120 * 1_000_000_000
+
+#: AC4(b): the two `createFillEvidence` tokens that BLOCK a resolver
+#: zero-fill and raise `resolver_evidence_contradiction` if the GET still
+#: reports terminal zero. `none` and `unknown` (legacy) are both admissible
+#: on their own and never appear here -- neither short-circuits: AC4(c)/(d)/
+#: (e) still gate every zero-fill regardless of which of those two applies.
+_CREATE_FILL_EVIDENCE_BLOCKS_ZERO_FILL: Final[frozenset[str]] = frozenset(
+    {
+        submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_PRESENT,
+        submit_chain.CREATE_FILL_EVIDENCE_FILL_TYPE_UNMAPPABLE,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TradeJoin:
+    """EDGE-2 slice D (AC4(c)): the outcome of paging
+    ``/v1/portfolio/activities`` for ``ACTIVITY_TYPE_TRADE`` rows naming one
+    venue order id.
+
+    **``complete`` is EOF-ONLY** (binding coordinator amendment,
+    2026-09-27, from the Step 0 evidence and its review -- see
+    ``docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-23_MIA/
+    README.md``, "Scope note"). Step 0 found the account's entire 35-row
+    history fit on ONE page (``eof=true``) on every traversal, so the plan's
+    ``min(createTime) < createdNs`` completeness branch was never exercised
+    against the real venue and stays UNLICENSED (follow-up
+    ``EDGE-2-MULTIPAGE``) until a real multi-page traversal is observed and
+    Q2s is re-verified across a page boundary. A read that hits
+    :data:`_RESOLVER_ACTIVITY_MAX_PAGES` before ``eof`` is therefore
+    INCOMPLETE, never guessed complete from the running minimum createTime
+    -- which :func:`PolymarketUSExecutionClient._order_trade_activity`
+    still computes and logs (``page_min_create_ts_ns``), for observability
+    only, never as a completeness signal.
+    """
+
+    complete: bool
+    trade_count: int
+    qty: Decimal
+    last_trade_ts_ns: int | None
+
+
 def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
     """Slice 3: a pure, deterministic function of ``venue_order_id`` alone.
 
@@ -1631,6 +1755,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # never `.add`/`.update`, for the same E0-NOSEND-RESOLVER reason.
         self._resolver_stale_alerted_intent_ids: frozenset[str] = frozenset()
         self._resolver_stale_alert_details: dict[str, Mapping[str, str]] = {}
+        # EDGE-2 slice D (AC4): the health-surface bookkeeping for a
+        # `resolver_evidence_contradiction` CRITICAL -- same shape and same
+        # whole-value-reassignment discipline as the stale-intent pair
+        # immediately above; `_retire` drops the entry on retirement (a
+        # contradiction always leaves the intent OPEN, so only an operator
+        # clearing path or a later consistent pass reaches `_retire` at all).
+        self._resolver_contradiction_details: dict[str, Mapping[str, str]] = {}
         #: R-9a (HF-4 rev2, B4 supply side): the wall-clock timestamp of the
         #: MOST RECENT startup-evidence write -- the single writer is
         #: `_write_startup_position_evidence` (assigned at its own end), so
@@ -1862,6 +1993,16 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     self._resolve_ambiguous_intents(),
                     log_msg="resolve_ambiguous_intents",
                 )
+            # EDGE-2 slice D: one boot-time liveness line naming the
+            # resolver's zero-fill corroboration mechanism and its two
+            # tunables -- so a node log FILE proves the hardened resolver is
+            # the one actually running, without naming any operator-control
+            # value (§9 deploy criteria).
+            self._log.info(
+                "resolver: zero-fill corroboration=activities_v1 "
+                f"min_age_s={_RESOLVER_ZERO_FILL_MIN_AGE_NS // 1_000_000_000} "
+                "legs=yes,no"
+            )
             await self._publish_account_state()
             await self._confirm_account_registered()
             self._reconcile_submit_intent()
@@ -2161,6 +2302,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         surfaces again.
         """
         return tuple(self._resolver_stale_alert_details.values())
+
+    @property
+    def resolver_evidence_contradictions(self) -> tuple[Mapping[str, str], ...]:
+        """EDGE-2 slice D (AC4): the health surface for a
+        ``resolver_evidence_contradiction`` -- the GET evidence says
+        terminal zero-fill, but the create-time evidence or the activities
+        trade join for this venue order id says otherwise.
+
+        **Read-only surface, deliberately -- not an emitted alert**, for the
+        identical E0-TRANSPORT/E0-NOSEND-RESOLVER reason
+        :attr:`stale_ambiguous_intent_alerts` documents: this module cannot
+        import an `AlertSink`, and `_resolve_ambiguous_intents` may add no
+        new callee beyond the ones this plan's AC9 rows allowlist. The
+        runtime layer's health-watch subscriber builds the CRITICAL
+        `AlertPayload` from this tuple.
+
+        One entry per intent currently in contradiction -- `_retire` drops
+        the entry on retirement, mirroring the stale-intent pair above.
+        """
+        return tuple(self._resolver_contradiction_details.values())
 
     async def _resolve_ambiguous_intents(self, *, first_pass_immediate: bool = False) -> None:
         """Resolution A (plan rev 6.1): named, firewall-scanned client
@@ -2568,7 +2729,102 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # authorize a retirement.
             self._resolved_by_get_ts_ns[current.intent_id] = now_ns
 
-            if is_terminal_zero and long_state is False:
+            # EDGE-2 slice D (AC4): the two shapes EDGE-2C's own boolean
+            # corroboration (`long_state`) cannot decide alone -- the
+            # ordinary zero-fill candidate (AC4(c)/(d)/(e) are now MANDATORY
+            # for every terminal-zero, not only the ones `long_state`
+            # already agreed with), a same-day PRIOR durable holding that
+            # would otherwise wedge a true zero-fill (AC4(e)/AC7(iii)), and
+            # an unheld fill on a settled market or a completed exit (D7).
+            # `long_state is True` already proves a fill without a second
+            # read (the ordinary same-session entry-fill shape); the join
+            # is skipped ONLY in that one case.
+            zero_fill_needs_evidence = is_terminal_zero
+            fill_needs_evidence = is_fill and long_state is not True
+            join: TradeJoin | None = None
+            if zero_fill_needs_evidence or fill_needs_evidence:
+                join = await self._order_trade_activity(context.venue_order_id, context.created_ns)
+            trade_found = join is not None and join.trade_count >= 1
+            evidence_blocks_zero_fill = (
+                context.create_fill_evidence in _CREATE_FILL_EVIDENCE_BLOCKS_ZERO_FILL
+            )
+
+            if is_terminal_zero:
+                if trade_found or evidence_blocks_zero_fill:
+                    # AC4: (c) found a trade, or (b) carries create-time
+                    # fill evidence, while the GET itself reports terminal
+                    # zero -- the two sources of truth disagree. Stays
+                    # AMBIGUOUS; never terminal.
+                    self._resolver_contradiction_details = {
+                        **self._resolver_contradiction_details,
+                        context.intent_id: {
+                            "severity": "CRITICAL",
+                            "event": "resolver_evidence_contradiction",
+                            "site": "global",
+                            "intent_id": context.intent_id,
+                            "venue_order_id": context.venue_order_id,
+                            "trade_count": f"{join.trade_count if join is not None else 0}",
+                            "create_fill_evidence": context.create_fill_evidence,
+                        },
+                    }
+                    self._log.error(
+                        "resolver: evidence contradiction for venue order "
+                        f"{context.venue_order_id} -- GET reports terminal "
+                        f"zero-fill but trade_count="
+                        f"{join.trade_count if join is not None else 0} "
+                        f"create_fill_evidence={context.create_fill_evidence!r}; "
+                        "stays AMBIGUOUS"
+                    )
+                    continue
+                if join is None or not join.complete:
+                    self._log.warning(
+                        f"resolver: activities join incomplete for venue "
+                        f"order {context.venue_order_id}; zero-fill stays "
+                        "AMBIGUOUS pending a complete read"
+                    )
+                    continue
+                age_ns = now_ns - context.created_ns
+                if age_ns < _RESOLVER_ZERO_FILL_MIN_AGE_NS:
+                    self._log.info(
+                        f"resolver: venue order {context.venue_order_id} is "
+                        "below the "
+                        f"{_RESOLVER_ZERO_FILL_MIN_AGE_NS // 1_000_000_000}s "
+                        "zero-fill min age; stays AMBIGUOUS"
+                    )
+                    continue
+                # AC4(e): same-day reads only -- an instrument from the
+                # past-day loader skips this leg entirely (a settled market
+                # leaves the positions page, D2). "Same-day" is the SAME
+                # provider walk `_seed_spend_from_durable_fills` uses: the
+                # node loads only today's instruments into the provider, so
+                # membership there (never the Nautilus `Cache`, which the
+                # past-day loader also populates) is what distinguishes the
+                # two regimes on every pass, not only the one where the
+                # loader actually fired.
+                same_day_instrument = False
+                for candidate in self._instrument_provider.list_all():
+                    if candidate.id == instrument.id:
+                        same_day_instrument = True
+                        break
+                if same_day_instrument:
+                    try:
+                        venue_leg_qty = _resolver_leg_holding_qty(positions, slug, leg)
+                        durable_qty = self._durable_net_qty(instrument.id)
+                    except Exception as exc:  # noqa: BLE001 - see the comment above
+                        self._note_resolver_error(context.intent_id, exc)
+                        continue
+                    if (
+                        venue_leg_qty is None
+                        or durable_qty is None
+                        or venue_leg_qty > durable_qty
+                    ):
+                        self._log.warning(
+                            "resolver: same-day holding baseline does not "
+                            f"clear venue order {context.venue_order_id} "
+                            f"(venue_leg_qty={venue_leg_qty} durable_qty="
+                            f"{durable_qty}); stays AMBIGUOUS"
+                        )
+                        continue
                 # Item 1 (slice 4 review): `restore_live_trading_budget` can
                 # raise `LiveTradingPermissionError` and `_retire` can raise
                 # `SubmitIntentMismatch` (ARCH M2) -- unlike the GET/positions
@@ -2580,19 +2836,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 except Exception as exc:  # noqa: BLE001 - see the comment above
                     self._note_resolver_error(context.intent_id, exc)
                     continue
-            elif is_fill and long_state is True:
-                try:
-                    self._resolve_accept_fill(context, report, instrument, now_ns)
-                except Exception as exc:  # noqa: BLE001 - see the comment above
-                    self._note_resolver_error(context.intent_id, exc)
-                    continue
-            else:
-                self._log.warning(
-                    "resolver: GET evidence and the positions read disagree "
-                    f"for venue order {context.venue_order_id} "
-                    f"(status={report.order_status}, long_present={long_state}); "
-                    "stays AMBIGUOUS pending a consistent read"
+            elif is_fill:
+                fill_confirmed = long_state is True or (
+                    join is not None and join.complete and join.trade_count >= 1
                 )
+                if fill_confirmed:
+                    try:
+                        self._resolve_accept_fill(context, report, instrument, now_ns)
+                    except Exception as exc:  # noqa: BLE001 - see the comment above
+                        self._note_resolver_error(context.intent_id, exc)
+                        continue
+                else:
+                    self._log.warning(
+                        "resolver: GET evidence and the positions/activities "
+                        f"read disagree for venue order {context.venue_order_id} "
+                        f"(status={report.order_status}, long_present={long_state}); "
+                        "stays AMBIGUOUS pending a consistent read"
+                    )
 
     def _resolve_terminal_zero(
         self,
@@ -2903,6 +3163,111 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             liquidity_side=LiquiditySide.TAKER,
             ts_event=now_ns,
         )
+
+    async def _order_trade_activity(
+        self, venue_order_id: str, created_ns: int
+    ) -> TradeJoin | None:
+        """EDGE-2 slice D (AC4(c)/§4): page ``/v1/portfolio/activities``
+        (``sortOrder=SORT_ORDER_DESCENDING``) until ``eof`` or
+        :data:`_RESOLVER_ACTIVITY_MAX_PAGES`, joining every
+        ``ACTIVITY_TYPE_TRADE`` row naming ``venue_order_id``
+        (:func:`~breezy.adapters.polymarket_us.account_activity.
+        trade_rows_for_order`).
+
+        Returns ``None`` on any read or shape failure -- the caller treats
+        that exactly like a positions-read failure: stay AMBIGUOUS, try
+        again next pass. ``created_ns`` is accepted (and named in the log
+        line) for the future ``EDGE-2-MULTIPAGE`` threshold branch; it is
+        NOT consulted for completeness today (see :class:`TradeJoin`'s own
+        docstring -- the coordinator amendment makes ``complete`` EOF-ONLY).
+        """
+        cursor: str | None = None
+        trade_refs: list[TradeActivityRef] = []
+        running_min_create_ts_ns: int | None = None
+        reached_eof = False
+        redacted = _redact_order_id(venue_order_id)
+        for _page_index in range(_RESOLVER_ACTIVITY_MAX_PAGES):
+            query: dict[str, object] = {
+                "limit": _RESOLVER_ACTIVITY_PAGE_LIMIT,
+                "sortOrder": _RESOLVER_ACTIVITY_SORT_ORDER,
+            }
+            if cursor:
+                query["cursor"] = cursor
+            try:
+                page = await self._private_read(PORTFOLIO_ACTIVITIES_PATH, query)
+            except Exception as exc:  # noqa: BLE001 - read failure stays AMBIGUOUS
+                self._log.warning(
+                    f"resolver: activities read failed for venue order {redacted} "
+                    f"({type(exc).__name__}: {exc}); trade join incomplete"
+                )
+                return None
+            if not isinstance(page, Mapping):
+                self._log.warning(
+                    f"resolver: activities page for venue order {redacted} was "
+                    "not an object; trade join incomplete"
+                )
+                return None
+            trade_refs.extend(trade_rows_for_order(page, venue_order_id))
+            page_min = page_min_create_ts_ns(page)
+            if page_min is not None and (
+                running_min_create_ts_ns is None or page_min < running_min_create_ts_ns
+            ):
+                running_min_create_ts_ns = page_min
+            if bool(page.get("eof")):
+                reached_eof = True
+                break
+            next_cursor = page.get("nextCursor")
+            cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
+            if not cursor:
+                break
+        self._log.debug(
+            f"resolver: activities join for venue order {redacted} "
+            f"complete={reached_eof} trade_count={len(trade_refs)} "
+            f"page_min_create_ts_ns={running_min_create_ts_ns} created_ns={created_ns}"
+        )
+        if not trade_refs:
+            return TradeJoin(
+                complete=reached_eof, trade_count=0, qty=submit_chain.ZERO, last_trade_ts_ns=None
+            )
+        total_qty = sum((ref.qty for ref in trade_refs), submit_chain.ZERO)
+        last_ts = max(ref.create_ts_ns for ref in trade_refs)
+        return TradeJoin(
+            complete=reached_eof, trade_count=len(trade_refs), qty=total_qty,
+            last_trade_ts_ns=last_ts,
+        )
+
+    def _durable_net_qty(self, instrument_id: InstrumentId) -> Decimal | None:
+        """EDGE-2 slice D (§4 AC4(e) baseline): THIS instrument's own
+        durable net quantity -- every recorded fill's ``cumulative_qty``,
+        signed per :data:`_RECORD_SIGNS` (entry positive, exit negative) and
+        summed. The SAME per-instrument ``FILL_INDEX_KEY_PREFIX`` walk
+        :meth:`_seed_spend_from_durable_fills` uses, for ONE instrument.
+
+        Returns ``None`` -- undetermined, never a synonym for zero -- on an
+        unreadable index, an index naming a record this store cannot
+        produce, a malformed record, or an unrecognised ``order_side``:
+        AC4(e) must never retire a zero-fill on evidence it could not
+        actually read. Like :meth:`_resolver_fill_order_unknown`, this is a
+        read-only classifier listed as a resolver CALLEE only, never as a
+        scanned resolver action site of its own.
+        """
+        index_key = f"{FILL_INDEX_KEY_PREFIX}{instrument_id}"
+        indexed = self._read_fill_index(index_key)
+        if indexed is None:
+            return None
+        net = Decimal(0)
+        for venue_order_id in indexed:
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+            if raw is None:
+                return None
+            try:
+                record = DurableFillRecord.from_bytes(raw)
+            except ExecutionReportMappingError:
+                return None
+            if record.order_side not in _RECORD_SIGNS:
+                return None
+            net += _RECORD_SIGNS[record.order_side] * record.cumulative_qty
+        return net
 
     async def _disconnect(self) -> None:
         """Close the durable store. A failing close does not fail the shutdown.
@@ -4667,6 +5032,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             intent_id
         }
         self._resolver_stale_alert_details.pop(intent_id, None)
+        # EDGE-2 slice D (AC4): same clearing discipline for the
+        # contradiction health surface -- a no-op when `intent_id` never
+        # contradicted.
+        self._resolver_contradiction_details.pop(intent_id, None)
 
     def _generate_submitted(self, order: Any, now_ns: int) -> None:
         """``OrderSubmitted`` -- shared by every D9 leaf that reaches a POST."""
