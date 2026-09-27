@@ -1286,7 +1286,7 @@ class TestEB7bIntegrationRunCensus:
         _stub_run_census_collaborators(monkeypatch, instance_id=instance_id, catalog=catalog)
 
         cache_path = tmp_path / "instance_spans.v2.jsonl"
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="zzz-bad-b7b"):
             census_module.run_census(
                 catalog_root=tmp_path,
                 subdirectory="live",
