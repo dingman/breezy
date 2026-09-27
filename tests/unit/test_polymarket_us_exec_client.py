@@ -289,15 +289,18 @@ class _PrivateReadStub:
         self._payloads = payloads
         self.paths: list[str] = []
         self.raises: dict[str, Exception] = {}
-        # EDGE-2 slice D (AC10): every query this stub was called with, in
-        # call order -- paired 1:1 with `self.paths`.
-        self.queries: list[Mapping[str, object] | None] = []
 
     async def __call__(
         self, path: str, query: Mapping[str, object] | None = None
     ) -> Mapping[str, Any]:
+        # EDGE-2 slice D (AC10): `query` is accepted but not recorded here --
+        # the resolver's own cursor-forwarding tests
+        # (`test_current_rung_hold_ambiguous_resolver.py`) replace
+        # `_private_read` with a purpose-built local fake instead, so this
+        # stub stays a byte-identical drop-in for the widened `PrivateRead`
+        # protocol without dead instrumentation.
+        del query
         self.paths.append(path)
-        self.queries.append(query)
         error = self.raises.get(path)
         if error is not None:
             raise error

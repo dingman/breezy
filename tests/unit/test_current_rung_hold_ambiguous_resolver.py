@@ -55,6 +55,11 @@ from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     _BOOT_PASS_REFUSAL_LATCHES,
     _RECONCILIATION_COUNT_FIELDS,
+    # EDGE-2 slice D (AC4(c)): the activities pagination tunables, asserted
+    # directly by the `_order_trade_activity` cursor-forwarding tests below.
+    _RESOLVER_ACTIVITY_MAX_PAGES,
+    _RESOLVER_ACTIVITY_PAGE_LIMIT,
+    _RESOLVER_ACTIVITY_SORT_ORDER,
     _RESOLVER_INSTRUMENT_LOAD_RETRY_NS,
     # EDGE-2 slice D (AC4(d)): every resolver-pass fixture that drives a
     # zero-fill decision must now age its context past this floor -- see
@@ -4005,6 +4010,123 @@ async def test_zero_fill_before_min_age_stays_ambiguous(
         assert current.state is SubmitIntentState.OPEN, (
             "a context younger than the min-age floor must never retire"
         )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_trade_activity_requests_page_two_with_next_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(c)/AC10, direct: page 1's `nextCursor` is forwarded VERBATIM as
+    page 2's `cursor`, with `sortOrder`/`limit` unchanged -- proven directly
+    against `_order_trade_activity`, not the full resolver dispatch. Page 2
+    is `eof`, so the join is complete."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        pages = [
+            {"activities": [], "eof": False, "nextCursor": "c1"},
+            {"activities": [], "eof": True},
+        ]
+        queries: list[Mapping[str, object] | None] = []
+
+        async def _paged_read(path: str, query: Mapping[str, object] | None = None) -> Any:
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            queries.append(query)
+            return pages[len(queries) - 1]
+
+        client._private_read = _paged_read
+
+        join = await client._order_trade_activity(order_id, client._clock.timestamp_ns())
+
+        assert join is not None
+        assert join.complete is True
+        assert len(queries) == 2
+        assert queries[0] == {
+            "limit": _RESOLVER_ACTIVITY_PAGE_LIMIT, "sortOrder": _RESOLVER_ACTIVITY_SORT_ORDER,
+        }
+        assert queries[1] == {
+            "limit": _RESOLVER_ACTIVITY_PAGE_LIMIT, "sortOrder": _RESOLVER_ACTIVITY_SORT_ORDER,
+            "cursor": "c1",
+        }
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_trade_activity_missing_cursor_without_eof_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(c), direct: `eof=false` with NO `nextCursor` means the read
+    stops -- never loops, never guesses a next page -- and the join is
+    INCOMPLETE, never complete."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        queries: list[Mapping[str, object] | None] = []
+
+        async def _no_cursor_read(path: str, query: Mapping[str, object] | None = None) -> Any:
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            queries.append(query)
+            return {"activities": [], "eof": False}
+
+        client._private_read = _no_cursor_read
+
+        join = await client._order_trade_activity(order_id, client._clock.timestamp_ns())
+
+        assert join is not None
+        assert join.complete is False
+        assert len(queries) == 1, "a missing cursor must stop the read after ONE page"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_trade_activity_cap_hit_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC4(c), direct: 20 pages, each carrying a fresh `nextCursor`, NEVER
+    `eof` -- the read stops at `_RESOLVER_ACTIVITY_MAX_PAGES` and the join
+    is INCOMPLETE. Also proves cursor forwarding holds across the WHOLE run
+    (not just page 1 -> page 2): query N+1 always carries page N's own
+    `nextCursor`."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        queries: list[Mapping[str, object] | None] = []
+
+        async def _never_eof_read(path: str, query: Mapping[str, object] | None = None) -> Any:
+            assert path == PORTFOLIO_ACTIVITIES_PATH
+            queries.append(query)
+            return {"activities": [], "eof": False, "nextCursor": f"c{len(queries)}"}
+
+        client._private_read = _never_eof_read
+
+        join = await client._order_trade_activity(order_id, client._clock.timestamp_ns())
+
+        assert join is not None
+        assert join.complete is False
+        assert len(queries) == _RESOLVER_ACTIVITY_MAX_PAGES
+        for index in range(1, len(queries)):
+            assert queries[index]["cursor"] == f"c{index}", (
+                f"query {index} must carry page {index - 1}'s own nextCursor"
+            )
         await client._disconnect()
 
 

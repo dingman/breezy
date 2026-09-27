@@ -239,7 +239,7 @@ def install_stale_intent_alert(
 #: ``resolver_evidence_contradiction`` health-surface entry: a GET-terminal
 #: zero-fill whose own create-time evidence or activities trade join
 #: disagrees with it. See
-#: ``PolymarketUSExecutionClient.resolver_evidence_contradictions`` (AC4):
+#: ``resolver_evidence_contradictions`` on the venue execution client (AC4):
 #: that property only RECORDS the condition -- the client may not import
 #: this layer (barrier E0-TRANSPORT), so this is where it is dispatched,
 #: exactly like :data:`STALE_INTENT_ALERT_EVENT` immediately above. A
@@ -283,10 +283,10 @@ def install_resolver_contradiction_alert(
     ``COMPONENT_STATE_TOPIC`` heartbeat trigger,
     :func:`install_refusal_repoll_timer` as the SAME second (fixed-interval)
     trigger, and dedupe by ``intent_id`` with the identical forget-on-
-    disappearance semantics -- ``_retire`` clears
-    ``PolymarketUSExecutionClient``'s own bookkeeping the moment an intent
-    stops contradicting (a later pass resolves it, or an operator clears it),
-    so a LATER intent that happens to reach the same shape alerts again.
+    disappearance semantics -- ``_retire`` clears the venue execution
+    client's own bookkeeping the moment an intent stops contradicting (a
+    later pass resolves it, or an operator clears it), so a LATER intent
+    that happens to reach the same shape alerts again.
 
     Parameters
     ----------
