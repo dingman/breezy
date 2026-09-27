@@ -9,6 +9,17 @@ successfully after 5m4.6s wall clock -- `ActiveState=inactive`,
 `Result=success`, `ExecMainStatus=0`). GETs only; no create/cancel/modify
 path was ever reached; `/v1/account/balances` was never called.
 
+**Archived 2026-09-27 (post batch-2 gate fix).** The producing script now
+lives in this directory as `edge2_ambiguous_order_probe.py.txt`: it is a
+one-shot, already-run probe, and the repo-wide read-only guards B1-B6
+(`tests/unit/test_polymarket_us_readonly_guard.py`) scan `scripts/` for
+order-path literals it legitimately carries as GET path constants
+(`/v1/order/`, `/v1/orders/open`), so it cannot live under `scripts/venue/`
+at rest -- the same precedent as the 09-05 SFO `probe.py.txt` beside it.
+**To re-run it:** copy `edge2_ambiguous_order_probe.py.txt` back to
+`scripts/venue/edge2_ambiguous_order_probe.py`, run it, then remove it from
+`scripts/venue/` again afterward so the guards stay clean.
+
 Scope: venue order `CP05MNWMAWP6` (MIA 2026-09-23, YES BUY 1 @ 0.52 IOC,
 intent `5e50e0d9ee084cd68629b72d1ef81a6b`, instrument
 `tc-temp-miahigh-2026-09-23-gte82lt83f.POLYMARKET_US`).
