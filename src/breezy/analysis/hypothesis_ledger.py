@@ -32,7 +32,7 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import NormalDist
 from typing import Final, Literal
@@ -41,8 +41,10 @@ from breezy.settlement.current_rung_hold_v2 import CombinedDraw
 
 __all__ = [
     "EVIDENCED_FEE_THETA",
+    "HORIZON_TOLLING_LANDED",
     "HYPOTHESIS_LEDGER_SCHEMA_VERSION",
     "HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2",
+    "HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3",
     "MAX_HYPOTHESES",
     "MAX_SINGLE_DAY_LEG_SHARE",
     "MAX_VARIANTS_PER_HYPOTHESIS",
@@ -52,11 +54,14 @@ __all__ = [
     "POOLED_PNL_VETO_REQUIRED",
     "POWER",
     "PROGRAMME_ALPHA",
+    "RE_ARM_GATING_PROGRAMME_ALPHA",
+    "RULED_HORIZON_DAYS",
     "STATION_DAY_STATISTIC",
     "ZERO_TAKE_STATION_DAYS_EXCLUDED",
     "DuplicateHypothesisIdError",
     "DuplicateHypothesisLedgerRecordError",
     "DuplicateStratumAxisError",
+    "HorizonTollingNotLandedError",
     "HypothesisLedgerRecordError",
     "HypothesisLook",
     "HypothesisRecord",
@@ -86,12 +91,14 @@ __all__ = [
     "filter_zero_take_station_days",
     "is_variant_eligible",
     "max_single_day_leg_share",
+    "may_gate_re_arm",
     "parse_stratum_filter",
     "pooled_net_pnl_per_contract",
     "programme_budget_remaining",
     "read_hypothesis_ledger",
     "recompute_mde",
     "register_hypothesis",
+    "replace_record_status",
     "station_day_mean_variance",
     "station_day_mean_x",
     "write_hypothesis_ledger",
@@ -110,9 +117,38 @@ HYPOTHESIS_LEDGER_SCHEMA_VERSION: Final[int] = 1
 #: as V2 (its own `to_dict()` keeps emitting `schema_version: 1` and omits
 #: the new key entirely).
 HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2: Final[int] = 2
+#: Schema V3 (RA-9d/RA-8c, LEDGER-V3 EDGE-5 2026-09-27): adds `horizon_days`
+#: (a per-record override of triage's CLI `--horizon-days`) and `re_arm_gating`
+#: (an explicit, never-null-once-V3 bool) to `HypothesisRecord`. V3 keeps V2's
+#: `variant_stratum_filters` and its look-taking rule unchanged. A V1/V2
+#: payload never carries either new key; a V3 payload always carries both
+#: (`re_arm_gating` is never null; `horizon_days` may be null, meaning "use
+#: the CLI value").
+HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3: Final[int] = 3
 _SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset(
-    {HYPOTHESIS_LEDGER_SCHEMA_VERSION, HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2}
+    {
+        HYPOTHESIS_LEDGER_SCHEMA_VERSION,
+        HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
+        HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3,
+    }
 )
+#: RA-9d (LEDGER-V3 D-3): the ONLY admitted `horizon_days` values, each tied
+#: to a ruling -- 120 (RULING_H-NO-SIDE-2026-09) and 180
+#: (RULING_H-ARCHIVE-RECAL-2026-09 / RULING_RA-9 A-5). A new value needs a
+#: ruling that adds one row here (L-12); this rules out any forking path
+#: where the horizon is picked after seeing data.
+RULED_HORIZON_DAYS: Final[frozenset[int]] = frozenset({120, 180})
+#: RULING_RA-9 A-3/A-3a (LEDGER-V3 D-1): the programme-wide FWER bound for
+#: EVERY re-arm-gating hypothesis is <= 0.025 (a stricter alpha is
+#: conservative -- it can only LOWER the FWER). Checked with an EXACT float
+#: comparison, no tolerance (R3-8).
+RE_ARM_GATING_PROGRAMME_ALPHA: Final[float] = 0.025
+#: RA-9f precondition (LEDGER-V3 D-2/R3-2, RULING_RA-9 A-5). While False,
+#: `register_hypothesis` refuses any schema_version=3 call that would reach
+#: REGISTERED (look-taking) status. RA-9f flips this in its own reviewed
+#: RED->GREEN change, which also deletes the refusal test this constant
+#: currently requires (L-12).
+HORIZON_TOLLING_LANDED: Final[bool] = False
 
 #: Programme-level, fixed BEFORE any intake (SS6.1); never re-derived from data.
 PROGRAMME_ALPHA: Final[float] = 0.05
@@ -279,6 +315,13 @@ class StratumFilterCountMismatchError(ValueError):
     have exactly `k_variants` entries."""
 
 
+class HorizonTollingNotLandedError(ValueError):
+    """A schema_version=3 `register_hypothesis` call would reach REGISTERED
+    (look-taking) status while `HORIZON_TOLLING_LANDED` is still False
+    (RULING_RA-9 A-5; LEDGER-V3 D-2/R3-2). Never raised for a zero-look
+    outcome (UNDERPOWERED_NOT_REGISTERED) -- RA-9 Path A keeps working."""
+
+
 #: RA-2's closed, validated vocabulary (never a free-form DSL) -- exactly the
 #: axes `RULING_HUNT-1`'s own triggers name (EDGE-5 plan r1 SS5).
 _STRATUM_AXES: Final[tuple[str, ...]] = ("station", "hour_lst", "side", "composition_kind")
@@ -434,6 +477,14 @@ class HypothesisRecord:
     #: canonical pipe-joined `parse_stratum_filter`-shaped string per variant,
     #: in `v1, v2, ...` order.
     variant_stratum_filters: tuple[str, ...] = ()
+    #: V3-only (RA-9d). `None` on every V1/V2 record; on a V3 record, `None`
+    #: means "use triage's CLI --horizon-days value", else a member of
+    #: `RULED_HORIZON_DAYS`.
+    horizon_days: int | None = None
+    #: V3-only (RA-8c). `None` on every V1/V2 record; once `schema_version`
+    #: is V3 this is always an explicit bool -- never null (Option B,
+    #: UNDECLARED legacy records fail closed via `may_gate_re_arm`).
+    re_arm_gating: bool | None = None
 
     def __post_init__(self) -> None:
         if self.status not in _STATUS_VALUES:
@@ -452,15 +503,55 @@ class HypothesisRecord:
                 "carry variant_stratum_filters"
             )
         if (
-            self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+            self.schema_version
+            in (HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2, HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3)
             and not self.is_zero_look
             and len(self.variant_stratum_filters) != self.k_variants
         ):
             raise StratumFilterCountMismatchError(
-                f"schema_version=2 look-taking record {self.hypothesis_id!r} must carry "
-                f"variant_stratum_filters of length k_variants={self.k_variants}, "
-                f"got {len(self.variant_stratum_filters)}"
+                f"schema_version={self.schema_version} look-taking record "
+                f"{self.hypothesis_id!r} must carry variant_stratum_filters of length "
+                f"k_variants={self.k_variants}, got {len(self.variant_stratum_filters)}"
             )
+        if self.schema_version != HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3 and (
+            self.horizon_days is not None or self.re_arm_gating is not None
+        ):
+            raise ValueError(
+                f"schema_version={self.schema_version} records must not carry "
+                "horizon_days or re_arm_gating (V3-only fields)"
+            )
+        if self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3:
+            if self.re_arm_gating is None:
+                raise ValueError(
+                    "schema_version=3 records must carry an explicit re_arm_gating "
+                    "bool -- never null (Option B: UNDECLARED is only a V1/V2 state)"
+                )
+            if self.horizon_days is not None and (
+                isinstance(self.horizon_days, bool)
+                or not isinstance(self.horizon_days, int)
+                or self.horizon_days not in RULED_HORIZON_DAYS
+            ):
+                raise ValueError(
+                    f"horizon_days must be None or one of {sorted(RULED_HORIZON_DAYS)}, "
+                    f"got {self.horizon_days!r}"
+                )
+            if self.re_arm_gating is True and not self.is_zero_look:
+                bound = self.allocated_alpha * MAX_HYPOTHESES
+                if bound > RE_ARM_GATING_PROGRAMME_ALPHA:
+                    raise ValueError(
+                        "re_arm_gating=True requires allocated_alpha * MAX_HYPOTHESES <= "
+                        f"RE_ARM_GATING_PROGRAMME_ALPHA={RE_ARM_GATING_PROGRAMME_ALPHA} "
+                        f"(RULING_RA-9 A-3/A-3a); got allocated_alpha={self.allocated_alpha} "
+                        f"* MAX_HYPOTHESES={MAX_HYPOTHESES} = {bound}"
+                    )
+                per_variant_bound = self.per_variant_alpha * self.k_variants
+                if per_variant_bound > self.allocated_alpha:
+                    raise ValueError(
+                        "re_arm_gating=True requires per_variant_alpha * k_variants <= "
+                        f"allocated_alpha (R3-7); got per_variant_alpha={self.per_variant_alpha} "
+                        f"* k_variants={self.k_variants} = {per_variant_bound} > "
+                        f"allocated_alpha={self.allocated_alpha}"
+                    )
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -488,8 +579,14 @@ class HypothesisRecord:
             "status": self.status,
             "is_zero_look": self.is_zero_look,
         }
-        if self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2:
+        if self.schema_version in (
+            HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2,
+            HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3,
+        ):
             payload["variant_stratum_filters"] = list(self.variant_stratum_filters)
+        if self.schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3:
+            payload["horizon_days"] = self.horizon_days
+            payload["re_arm_gating"] = self.re_arm_gating
         return payload
 
     @classmethod
@@ -499,6 +596,8 @@ class HypothesisRecord:
             field_types = _HYPOTHESIS_RECORD_FIELD_TYPES_V1
         elif version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2:
             field_types = _HYPOTHESIS_RECORD_FIELD_TYPES_V2
+        elif version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3:
+            field_types = _HYPOTHESIS_RECORD_FIELD_TYPES_V3
         else:
             raise HypothesisLedgerRecordError(
                 f"hypothesis_ledger record has unrecognised schema_version {version!r} "
@@ -528,7 +627,7 @@ class HypothesisRecord:
                 continue
             value = payload[name]
             if value is None:
-                if name == "mde_variance_bound_justification":
+                if name in _NULLABLE_FIELDS:
                     continue
                 raise HypothesisLedgerRecordError(f"{name!r} must not be null")
             is_bool_value = isinstance(value, bool)
@@ -552,8 +651,18 @@ class HypothesisRecord:
                 )
         variant_stratum_filters = (
             tuple(payload["variant_stratum_filters"])  # type: ignore[arg-type]
-            if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+            if version in (HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2, HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3)
             else ()
+        )
+        horizon_days = (
+            payload["horizon_days"]  # type: ignore[assignment]
+            if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
+            else None
+        )
+        re_arm_gating = (
+            payload["re_arm_gating"]  # type: ignore[assignment]
+            if version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
+            else None
         )
         return cls(
             schema_version=payload["schema_version"],  # type: ignore[arg-type]
@@ -580,6 +689,8 @@ class HypothesisRecord:
             status=payload["status"],  # type: ignore[arg-type]
             is_zero_look=payload["is_zero_look"],  # type: ignore[arg-type]
             variant_stratum_filters=variant_stratum_filters,
+            horizon_days=horizon_days,
+            re_arm_gating=re_arm_gating,
         )
 
 
@@ -615,6 +726,21 @@ _HYPOTHESIS_RECORD_FIELD_TYPES_V2: Final[dict[str, type]] = {
     **_HYPOTHESIS_RECORD_FIELD_TYPES_V1,
     "variant_stratum_filters": tuple,
 }
+
+#: V3 = V2 plus LEDGER-V3's two own fields (`horizon_days`, `re_arm_gating`).
+_HYPOTHESIS_RECORD_FIELD_TYPES_V3: Final[dict[str, type]] = {
+    **_HYPOTHESIS_RECORD_FIELD_TYPES_V2,
+    "horizon_days": int,
+    "re_arm_gating": bool,
+}
+
+#: `from_dict` field names that MAY carry a JSON `null` -- every other known
+#: key must not be null. `horizon_days` is V3-only and nullable ("use the
+#: CLI value"); `re_arm_gating` is deliberately absent here, so a V3 payload
+#: with a null `re_arm_gating` is refused (never UNDECLARED once V3).
+_NULLABLE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"mde_variance_bound_justification", "horizon_days"}
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -730,6 +856,8 @@ def register_hypothesis(
     look_policy: str | None = None,
     programme_alpha_override: float | None = None,
     variant_stratum_filters: tuple[str, ...] | None = None,
+    horizon_days: int | None = None,
+    re_arm_gating: bool | None = None,
 ) -> HypothesisRecord:
     """Register one hypothesis (SS6.2).
 
@@ -755,6 +883,18 @@ def register_hypothesis(
     UNDERPOWERED_NOT_REGISTERED) is written at schema_version=2. Never
     accepted for `disposition="CLOSED"` -- a zero-look, no-variant-shape
     record has nothing to bind.
+
+    `horizon_days`/`re_arm_gating` (RA-9d/RA-8c, LEDGER-V3 2026-09-27): both
+    `None` (the default), a NORMAL-disposition registration is written at
+    schema_version=1 or 2 exactly as before. Either one supplied writes
+    schema_version=3. `horizon_days` requires `re_arm_gating` to be supplied
+    too (never the reverse). `re_arm_gating=True` requires
+    `programme_alpha_override <= RE_ARM_GATING_PROGRAMME_ALPHA` (RULING_RA-9
+    A-3/A-3a). Never accepted for `disposition="CLOSED"` (CLOSED always stays
+    schema_version=1, R3-3). While `HORIZON_TOLLING_LANDED` is False, a
+    schema_version=3 call that would reach REGISTERED status is refused
+    (`HorizonTollingNotLandedError`) -- a v3 UNDERPOWERED outcome is
+    unaffected (RA-9 Path A).
     """
     if k_variants < 1:
         raise NonPositiveVariantCountError(f"k_variants must be >= 1, got {k_variants}")
@@ -784,6 +924,11 @@ def register_hypothesis(
     if disposition == "CLOSED":
         if variant_stratum_filters is not None:
             raise ValueError("variant_stratum_filters is not applicable to disposition=CLOSED")
+        if horizon_days is not None or re_arm_gating is not None:
+            raise ValueError(
+                "horizon_days/re_arm_gating are not applicable to disposition=CLOSED "
+                "(R3-3: a CLOSED record always stays schema_version=1)"
+            )
         return HypothesisRecord(
             schema_version=HYPOTHESIS_LEDGER_SCHEMA_VERSION,
             hypothesis_id=hypothesis_id,
@@ -842,8 +987,22 @@ def register_hypothesis(
     assert order_quantity is not None
     assert look_policy is not None
 
+    if horizon_days is not None and re_arm_gating is None:
+        raise ValueError(
+            "horizon_days requires re_arm_gating to be set (True or False) -- a "
+            "horizon may only be declared alongside an explicit re-arm-gating decision"
+        )
+    if re_arm_gating is True and (
+        programme_alpha_override is None or programme_alpha_override > RE_ARM_GATING_PROGRAMME_ALPHA
+    ):
+        raise ValueError(
+            "re_arm_gating=True requires programme_alpha_override <= "
+            f"RE_ARM_GATING_PROGRAMME_ALPHA={RE_ARM_GATING_PROGRAMME_ALPHA} "
+            f"(RULING_RA-9 A-3/A-3a); got programme_alpha_override="
+            f"{programme_alpha_override!r}"
+        )
+
     if variant_stratum_filters is None:
-        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION
         stored_stratum_filters: tuple[str, ...] = ()
     else:
         if len(variant_stratum_filters) != k_variants:
@@ -853,8 +1012,14 @@ def register_hypothesis(
             )
         for spec in variant_stratum_filters:
             parse_stratum_filter(spec)
-        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
         stored_stratum_filters = tuple(variant_stratum_filters)
+
+    if horizon_days is not None or re_arm_gating is not None:
+        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3
+    elif variant_stratum_filters is not None:
+        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION_V2
+    else:
+        record_schema_version = HYPOTHESIS_LEDGER_SCHEMA_VERSION
 
     if k_variants > MAX_VARIANTS_PER_HYPOTHESIS:
         raise VariantCountCeilingExceededError(
@@ -941,7 +1106,26 @@ def register_hypothesis(
             status="UNDERPOWERED_NOT_REGISTERED",
             is_zero_look=True,
             variant_stratum_filters=stored_stratum_filters,
+            horizon_days=horizon_days,
+            re_arm_gating=re_arm_gating,
         )
+
+    # R3-2: both refusals below apply ONLY to a REGISTERED (look-taking)
+    # outcome, placed AFTER the power check -- never beside the ~:845 filter
+    # validation. A v3 UNDERPOWERED outcome (above) is never blocked by
+    # either, keeping RA-9 Path A working.
+    if record_schema_version == HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3:
+        if not stored_stratum_filters:
+            raise StratumFilterCountMismatchError(
+                f"schema_version=3 look-taking record {hypothesis_id!r} must carry "
+                f"variant_stratum_filters of length k_variants={k_variants}, got 0"
+            )
+        if not HORIZON_TOLLING_LANDED:
+            raise HorizonTollingNotLandedError(
+                f"hypothesis_id={hypothesis_id!r}: a schema_version=3 registration cannot "
+                "reach REGISTERED status while HORIZON_TOLLING_LANDED is False "
+                "(RULING_RA-9 A-5; RA-9f is the precondition that flips this)"
+            )
 
     return HypothesisRecord(
         schema_version=record_schema_version,
@@ -968,7 +1152,38 @@ def register_hypothesis(
         status="REGISTERED",
         is_zero_look=False,
         variant_stratum_filters=stored_stratum_filters,
+        horizon_days=horizon_days,
+        re_arm_gating=re_arm_gating,
     )
+
+
+def replace_record_status(record: HypothesisRecord, *, status: str) -> HypothesisRecord:
+    """R3-1: the ONLY sanctioned way to change a registered record's status.
+
+    Accepts nothing else -- every other field, including `is_zero_look`,
+    `hypothesis_class` and `schema_version`, is frozen by construction: this
+    signature has no deny-list to keep in sync (that was D-4's gap). Callers
+    outside this module must use this instead of `dataclasses.replace`
+    directly (enforced mechanically, see the R3-4 AST-barrier test)."""
+    return replace(record, status=status)
+
+
+def may_gate_re_arm(record: HypothesisRecord) -> bool:
+    """D-5: True only for a schema_version=3, explicitly re-arm-gating,
+    look-taking record whose allocated alpha proves the RULING_RA-9 A-3/A-3a
+    bound. False for every V1/V2 record and every UNDECLARED
+    (`re_arm_gating is None`) record -- Option B fails closed. Callers must
+    call this rather than read `.re_arm_gating` directly (see the R3-5
+    AST-barrier test)."""
+    if record.schema_version != HYPOTHESIS_LEDGER_SCHEMA_VERSION_V3:
+        return False
+    if record.re_arm_gating is not True:
+        return False
+    if record.is_zero_look:
+        return False
+    if record.allocated_alpha * MAX_HYPOTHESES > RE_ARM_GATING_PROGRAMME_ALPHA:
+        return False
+    return record.per_variant_alpha * record.k_variants <= record.allocated_alpha
 
 
 def station_day_mean_x(draw: CombinedDraw) -> float:
