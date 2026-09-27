@@ -2261,6 +2261,43 @@ class TestNextDueBootRetry:
         phase, _ = next_due(_utc(20, 0), state)
         assert phase is Phase.NONE
 
+    @pytest.mark.parametrize(
+        ("marker_text"),
+        [
+            "breezy-trade: trading node failed: ConnectionError\n",
+            "breezy-trade: FATAL market-data fault in Foo: bar. The trading process shut down.\n",
+            (
+                "breezy-trade: FATAL execution-client fault in Foo: bar. "
+                "The trading process shut down.\n"
+            ),
+        ],
+        ids=[
+            "trading_node_failed_marker",
+            "fatal_market_data_fault_marker",
+            "fatal_exec_client_fault_marker",
+        ],
+    )
+    def test_record_boot_zero_instruments_seen_is_not_set_by_a_broader_transient_marker(
+        self, marker_text
+    ):
+        # [architect round-2 HIGH] `classify_exit1_cause`'s TRANSIENT bucket
+        # also covers TRADING_NODE_FAILED_MARKER and the two FATAL_* markers
+        # -- each firable on a node that already minted a permit and traded.
+        # `boot_zero_instruments_seen` must be set ONLY by a direct
+        # `zero_instruments_refusal_in` check, never inferred from
+        # `classify_exit1_cause(...) is TRANSIENT`. Goes through the REAL
+        # log-latch path (`latch_log_facts`), feeding ONLY this one marker.
+        from breezy.runtime.trade_supervisor_core import latch_log_facts
+
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = latch_log_facts(state, _utc(17, 0), marker_text)
+
+        assert state.boot_zero_instruments_seen is False
+        # And the actual consequence: eligibility (next_due's MIDDAY_WATCH
+        # boot-retry OR-clause) never unlocks from this marker alone.
+        phase, _ = next_due(_utc(20, 0), state)
+        assert phase is not Phase.MIDDAY_WATCH
+
     def test_does_not_return_midday_watch_before_1710z_even_when_latched_at_1702z(self):
         # [r3->r4 item D] The OR is nested INSIDE the existing three-way AND
         # -- never a top-level OR that would fire before SELF_CHECK/before
@@ -5060,6 +5097,58 @@ class TestDoBootRetry:
             AlertDetail.BOOT_RETRY_CHILD_NONTRANSIENT_EXIT.value
         ]
 
+    def test_do_midday_watch_boot_retry_child_dies_deterministic_stops_retry_and_alerts_once(
+        self, tmp_path
+    ):
+        # [decision D] A DETERMINISTIC exit (PERMIT_NOT_ISSUED_MARKER, the
+        # marker `classify_exit1_cause` checks -- and latches -- FIRST,
+        # ahead of every TRANSIENT branch) permanently stops the retry path
+        # exactly like a non-TRANSIENT UNKNOWN exit: one CRITICAL, no spawn,
+        # and the SECOND poll (now routed away from `_do_boot_retry`
+        # entirely by AM-5's own guard) must not re-alert or spawn either.
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("order submission permit not issued: RungHoldNotReadyError\n")
+        sink = _RecordingAlertSink()
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            process_alive=lambda _pid: False,
+            read_log_new=lambda p: p.read_text(),
+            alert_sink=sink,
+        )
+        _retain_spawned_child(_ConfigurablePopen(18001, poll_result=0))
+        state = _boot_retry_ready_state(_utc(17, 0))
+
+        # Poll 1: dead, DETERMINISTIC cause -- one CRITICAL, permanent stop.
+        pid_1, node_log_1, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 20),
+            tracked_pid=18001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert pid_1 is None
+        assert state.boot_retry_nontransient_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.BOOT_RETRY_CHILD_NONTRANSIENT_EXIT.value
+        ]
+
+        # Poll 2: nothing further -- no re-alert, no spawn.
+        pid_2, _node_log_2, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(17, 40),
+            tracked_pid=pid_1,
+            node_log=node_log_1,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert pid_2 is None
+        assert spawner.calls == []
+        assert len(sink.payloads) == 1
+
     def test_precheck_refused_intent_open_alerts_critical_no_spawn(self, tmp_path):
         spawner = FakeSpawner()
         sink = _RecordingAlertSink()
@@ -5273,6 +5362,38 @@ class TestDoMiddayWatchBootRetryNoDoubleCritical:
 
         assert sink.payloads == []
         assert result == (12001, node_log, state)
+
+    def test_do_midday_watch_does_not_route_to_boot_retry_once_nontransient_alert_sent(
+        self, tmp_path
+    ):
+        # [AM-5, nontransient half] Same guard, the OTHER terminal latch:
+        # once `boot_retry_nontransient_alert_sent` is set, the entry guard
+        # must not fall through into the ordinary body's
+        # `MIDDAY_RELAUNCH_CEILING_UNKNOWN` page either -- no spawn, no
+        # second CRITICAL.
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("some unrelated crash trace, no known marker\n")
+        sink = _RecordingAlertSink()
+        spawner = FakeSpawner()
+        ports = _make_ports(spawn=spawner, process_alive=lambda _pid: False, alert_sink=sink)
+        _retain_spawned_child(_ConfigurablePopen(12002, poll_result=0))
+        state = _boot_retry_ready_state(_utc(17, 0))
+        state = record_boot_retry_nontransient_alert_sent(state, _utc(17, 30))
+
+        result = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=12002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert spawner.calls == []
+        assert sink.payloads == []
+        assert result == (12002, node_log, state)
 
 
 # ===========================================================================
