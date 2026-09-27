@@ -125,6 +125,7 @@ from breezy.runtime.trade_supervisor_core import (
     permit_expiry_valid,
     permit_watch_window,
     readiness_observed,
+    record_adoption_log_unreadable_poll,
     record_boot_retry_attempt,
     record_boot_retry_exhausted_alert_sent,
     record_boot_retry_first_attempt_alert_sent,
@@ -187,6 +188,20 @@ _RELAUNCH_POLL_INTERVAL_S: Final[float] = 15.0
 #: everywhere it is read, so tests can point at a synthetic file with real
 #: dev/inode-matching content instead of the kernel's own table.
 DEFAULT_PROC_LOCKS_PATH: Final[Path] = Path("/proc/locks")
+
+#: Adoption-only boot evidence replay cap. The permit/subscription lines are
+#: boot-time facts near the front of the child log; the cap prevents a restarted
+#: supervisor from reading an unbounded multi-hour log prefix on adoption.
+_ADOPTION_LOG_REPLAY_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+
+#: [SUP-ADOPT-PERMIT] How many consecutive polls an adoption-time boot-log
+#: replay may fail with ``OSError`` before B1 stops silently retrying and
+#: fails loud via the existing D8 ``WATCH_FAILED`` containment. No existing
+#: attempt-budget constant fits: `MAX_RELAUNCH_ATTEMPTS`/
+#: `MIDDAY_MAX_RELAUNCH_ATTEMPTS`/`BOOT_RETRY_MAX_ATTEMPTS` all budget
+#: process-relaunch attempts, not read retries of an already-alive child's
+#: log.
+_ADOPTION_LOG_UNREADABLE_MAX_POLLS: Final[int] = 3
 
 #: /proc/locks' lock-type field: this module's own lock and the node's
 #: intent lock are both `fcntl.flock` (BSD) locks, which the kernel reports
@@ -714,10 +729,40 @@ class IncrementalLogReader:
         self._carry[path] = combined[-self._carry_bytes :] if combined else ""
         return combined
 
+    def read_from_start_and_mark_consumed(
+        self, path: Path, *, max_bytes: int = _ADOPTION_LOG_REPLAY_MAX_BYTES
+    ) -> str:
+        """Adoption-only replay from byte 0, then resume tailing at EOF.
+
+        [SUP-ADOPT-PERMIT] Unlike ``read_new``, an ``OSError`` here is NOT
+        swallowed into an empty-string return: this is a one-shot boot-
+        evidence replay, and silently returning "" would be indistinguishable
+        from "log read cleanly, no permit marker yet" -- exactly the
+        false-positive ``PermitCapability.ABSENT`` CRITICAL this method
+        exists to prevent. The caller
+        (``_permit_watch_replay_boot_log_on_adoption``) catches this to
+        retry rather than misclassify.
+        """
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            new_bytes = fh.read(min(size, max_bytes))
+        self._offsets[path] = size
+        combined = new_bytes.decode("utf-8", errors="replace")
+        self._carry[path] = combined[-self._carry_bytes :] if combined else ""
+        return combined
+
     def bytes_read(self, path: Path) -> int:
         """Test/introspection helper: total bytes consumed from ``path``
         across every ``read_new`` call so far."""
         return self._offsets.get(path, 0)
+
+
+def _read_log_from_start(path: Path) -> str:
+    """[SUP-ADOPT-PERMIT] Default ``read_log_from_start`` port. Deliberately
+    does not catch ``OSError`` -- see
+    ``IncrementalLogReader.read_from_start_and_mark_consumed``."""
+    with open(path, "rb") as fh:
+        return fh.read(_ADOPTION_LOG_REPLAY_MAX_BYTES).decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +896,17 @@ def log_decision(event: str, **fields: int | str) -> None:
         logger.info(event)
 
 
+def log_warning(event: str, **fields: int | str) -> None:
+    """[SUP-ADOPT-PERMIT] Same static-event-name/int-str-fields-only
+    discipline as :func:`log_decision`, at WARNING level -- for a condition
+    that is retried and self-heals, never itself an operator page."""
+    if fields:
+        rendered = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.warning("%s %s", event, rendered)
+    else:
+        logger.warning(event)
+
+
 def alert(
     sink: AlertSink,
     *,
@@ -971,6 +1027,7 @@ class SupervisorPorts:
     spawn: Callable[..., subprocess.Popen[bytes]]
     read_log_new: Callable[[Path], str]
     alert_sink: AlertSink
+    read_log_from_start: Callable[[Path], str] = field(default=_read_log_from_start)
     sigterm_poll_sleep: Callable[[float], None] = field(default=_time.sleep)
     find_adopted_log: Callable[[Path, int], Path | None] = field(default=find_adopted_node_log)
     #: [2026-09-12] Defaults preserve v2 behaviour for every test/caller that
@@ -1015,6 +1072,7 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         spawn=spawn_node,
         read_log_new=log_reader.read_new,
         alert_sink=alert_sink if alert_sink is not None else _boot_alert_sink(),
+        read_log_from_start=log_reader.read_from_start_and_mark_consumed,
         find_adopted_log=find_adopted_node_log,
         continuous_family_active=sending_family_active,
         resolve_sending_family_id=resolve_sending_family_id,
@@ -1731,6 +1789,55 @@ def _do_midday_watch(
 # ---------------------------------------------------------------------------
 
 
+class _AdoptionLogPermanentlyUnreadableError(OSError):
+    """[SUP-ADOPT-PERMIT] Raised by
+    :func:`_permit_watch_replay_boot_log_on_adoption` once its own
+    from-byte-0 read has failed with ``OSError`` for
+    ``_ADOPTION_LOG_UNREADABLE_MAX_POLLS`` consecutive polls. Carries the
+    already-updated ``state`` (with the failure counter latched) so
+    :func:`_do_permit_watch`'s [D8] containment does not silently drop that
+    update -- a bare ``raise`` would discard the local reassignment the
+    caller's ``state = ...`` never got to see."""
+
+    def __init__(self, state: DaySchedulerState, cause: OSError) -> None:
+        super().__init__(str(cause))
+        self.state = state
+
+
+def _permit_watch_replay_boot_log_on_adoption(
+    *, ports: SupervisorPorts, state: DaySchedulerState, now: dt.datetime, node_log: Path
+) -> tuple[DaySchedulerState, bool]:
+    """[SUP-ADOPT-PERMIT] Replay an adopted child's log from byte 0 once, so
+    the boot-time permit/subscription lines the shared, offset-draining
+    ``IncrementalLogReader`` will never see again in its own delta are
+    latched before B1 classifies capability. Returns ``(state, succeeded)``;
+    the caller must short-circuit (skip capability evaluation/alerting
+    entirely for this poll) whenever ``succeeded`` is ``False``, so a read
+    failure is never misclassified as ``PermitCapability.ABSENT``.
+
+    An ``OSError`` here (a stale offset, a not-yet-flushed inode, a
+    permission race) is retried SILENTLY for up to
+    ``_ADOPTION_LOG_UNREADABLE_MAX_POLLS`` consecutive polls -- never
+    paged, never latched as today's ``permit_accepted_gap`` -- then raises
+    :class:`_AdoptionLogPermanentlyUnreadableError` so [D8]'s existing
+    ``WATCH_FAILED`` exception containment in :func:`_do_permit_watch` fails
+    loud rather than staying silent forever."""
+    try:
+        log_text = ports.read_log_from_start(node_log)
+    except OSError as exc:
+        state = record_adoption_log_unreadable_poll(state, now)
+        log_warning(
+            "permit_watch_adoption_log_unreadable",
+            phase="permit_watch",
+            consecutive_failures=state.adoption_log_unreadable_polls,
+            max_polls=_ADOPTION_LOG_UNREADABLE_MAX_POLLS,
+        )
+        if state.adoption_log_unreadable_polls >= _ADOPTION_LOG_UNREADABLE_MAX_POLLS:
+            raise _AdoptionLogPermanentlyUnreadableError(state, exc) from exc
+        return state, False
+    return latch_log_facts(state, now, log_text), True
+
+
 def _permit_watch_adopt_and_evaluate(
     *,
     ports: SupervisorPorts,
@@ -1755,6 +1862,23 @@ def _permit_watch_adopt_and_evaluate(
             tracked_pid, node_log = adoption
             log_decision("permit_watch_adopted_live_node", pid=tracked_pid)
             state = record_child_adopted(state, now)
+            if node_log is not None:
+                state, replayed = _permit_watch_replay_boot_log_on_adoption(
+                    ports=ports, state=state, now=now, node_log=node_log
+                )
+                if not replayed:
+                    return tracked_pid, node_log, state
+    elif node_log is not None and state.adoption_log_unreadable_polls > 0:
+        # [SUP-ADOPT-PERMIT] The child was adopted on an earlier poll but its
+        # boot-log replay has not yet succeeded (still under threshold) --
+        # retry the SAME from-byte-0 replay rather than falling through to
+        # the ordinary incremental drain below, which would never see the
+        # boot-time lines again.
+        state, replayed = _permit_watch_replay_boot_log_on_adoption(
+            ports=ports, state=state, now=now, node_log=node_log
+        )
+        if not replayed:
+            return tracked_pid, node_log, state
 
     child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
     log_available = node_log is not None
@@ -1868,30 +1992,68 @@ def _do_permit_watch(
             log_dir=log_dir,
             handler_read_log=handler_read_log,
         )
-    except Exception as exc:  # noqa: BLE001 -- [D8] B1's own containment.
-        log_decision(
-            "permit_watch_exception_contained",
-            phase="permit_watch",
+    except _AdoptionLogPermanentlyUnreadableError as exc:
+        # [SUP-ADOPT-PERMIT] The exception carries the state update (failure
+        # counter latched) that a bare re-raise inside the helper would
+        # otherwise have discarded before it ever reached this scope's
+        # ``state`` variable.
+        return _contain_permit_watch_failure(
+            ports=ports,
+            state=exc.state,
+            now=now,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
             error_type=type(exc).__name__,
         )
-        decision = decide_permit_alert(
-            capability=PermitCapability.WATCH_FAILED,
+    except Exception as exc:  # noqa: BLE001 -- [D8] B1's own containment.
+        return _contain_permit_watch_failure(
+            ports=ports,
+            state=state,
             now=now,
-            last_sent_at=state.permit_alert_last_sent_at,
-            last_capability=state.permit_alert_last_capability,
-            not_required_warned=state.permit_not_required_warned,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            error_type=type(exc).__name__,
         )
-        if decision.action is PermitAlertAction.ALERT:
-            sent = _send_permit_alert(
-                ports.alert_sink,
-                event=decision.event,
-                severity=decision.severity,
-                detail=decision.detail,
-            )
-            if not sent:  # [A2] retried on the next poll, never latched.
-                return tracked_pid, node_log, state
-            state = record_permit_alert_sent(state, now, capability=PermitCapability.WATCH_FAILED)
-        return tracked_pid, node_log, state
+
+
+def _contain_permit_watch_failure(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    error_type: str,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[D8] B1's own exception containment, shared by every fault path that
+    reaches :func:`_do_permit_watch`'s ``try`` -- a plain unexpected
+    exception, and (SUP-ADOPT-PERMIT) an adoption-time boot-log replay that
+    stayed unreadable through every retry. Never lets a fault end the
+    supervisor or skip the next phase dispatch; always fails loud via
+    ``PermitCapability.WATCH_FAILED`` rather than silence."""
+    log_decision(
+        "permit_watch_exception_contained",
+        phase="permit_watch",
+        error_type=error_type,
+    )
+    decision = decide_permit_alert(
+        capability=PermitCapability.WATCH_FAILED,
+        now=now,
+        last_sent_at=state.permit_alert_last_sent_at,
+        last_capability=state.permit_alert_last_capability,
+        not_required_warned=state.permit_not_required_warned,
+    )
+    if decision.action is PermitAlertAction.ALERT:
+        sent = _send_permit_alert(
+            ports.alert_sink,
+            event=decision.event,
+            severity=decision.severity,
+            detail=decision.detail,
+        )
+        if not sent:  # [A2] retried on the next poll, never latched.
+            return tracked_pid, node_log, state
+        state = record_permit_alert_sent(state, now, capability=PermitCapability.WATCH_FAILED)
+    return tracked_pid, node_log, state
 
 
 #: Self-check results that are a PASS of some kind -- never alerted on.

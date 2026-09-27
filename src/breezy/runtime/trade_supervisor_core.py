@@ -1032,6 +1032,17 @@ class DaySchedulerState:
     #: [FU-17] Gates ``AlertDetail.BOOT_RETRY_WINDOW_CLOSED_NEVER_READY`` to
     #: once per day -- day-level, never cleared by :func:`record_child_adopted`.
     boot_retry_window_closed_alert_sent: bool = False
+    #: [SUP-ADOPT-PERMIT, 2026-09-27] Consecutive-poll counter for an
+    #: adoption-time boot-log replay (`ports.read_log_from_start`) that
+    #: raised ``OSError`` -- distinct from "log read cleanly, no permit
+    #: marker yet", which must never page as
+    #: ``PermitCapability.ABSENT``. Reset to 0 by
+    #: :func:`record_child_adopted` for a NEW child (a fresh child gets its
+    #: own retry budget); NOT reset between polls for the SAME still-failing
+    #: adopted child, so it keeps counting toward
+    #: ``_ADOPTION_LOG_UNREADABLE_MAX_POLLS`` until either a read succeeds or
+    #: the day rolls over.
+    adoption_log_unreadable_polls: int = 0
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -1162,7 +1173,10 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
     inheriting a prior child's already-fired alert latch. [2026-09-15 F1]
     Also clears ``midday_readiness_recheck_done`` -- the new child gets
     its own recheck window rather than inheriting a prior child's
-    already-latched verdict."""
+    already-latched verdict. [SUP-ADOPT-PERMIT] Also clears
+    ``adoption_log_unreadable_polls`` -- a NEW child's boot-log replay gets
+    its own fresh retry budget, never inheriting a prior child's failure
+    count."""
     effective = _for_day(state, _trading_day(now_utc))
     return replace(
         effective,
@@ -1173,6 +1187,22 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
         midday_readiness_recheck_done=False,
         orders_not_requested_seen=False,
         boot_retry_not_ready_alert_sent=False,
+        adoption_log_unreadable_polls=0,
+    )
+
+
+def record_adoption_log_unreadable_poll(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[SUP-ADOPT-PERMIT] Increment the consecutive-failure counter for an
+    adoption-time boot-log replay that raised ``OSError``. Day-scoped like
+    every other latch here; cleared only by :func:`record_child_adopted`
+    (a new child) or the trading-day rollover -- a persistently unreadable
+    log for the SAME adopted child keeps counting toward
+    ``_ADOPTION_LOG_UNREADABLE_MAX_POLLS``."""
+    effective = _for_day(state, _trading_day(now_utc))
+    return replace(
+        effective, adoption_log_unreadable_polls=effective.adoption_log_unreadable_polls + 1
     )
 
 
