@@ -88,6 +88,7 @@ Round 2 results:
   - On a cache hit, re-read those 8 KiB and compare. A mismatch counts as a MISS, which triggers a full scan.
   - Add `st_ino` and `st_dev` to the file fingerprint, as the preflight memo does (`preflight_memo.py:29`).
   - E8 is reworded to "head/tail digest mismatch".
+  - Implementation note: digests are computed on all files, not only files with `consumed_bytes == size`; this can cause more misses, never fewer, and is reviewer-accepted.
 - **R3-B: replaces I-5.** This avoids a flock conflict: the wrapper holds `breezy-studies.lock` on an inherited fd 9 (`replay-daily-run.sh:87-88`), so a second lock on it in a new open file description fails with EWOULDBLOCK or deadlocks.
   - The census instead takes a non-blocking lock on a sidecar file, `instance_spans.v2.jsonl.lock`, held for the whole run. The invariant it enforces is one writer per cache.
   - If the lock is already held, the census **FAILS LOUDLY** with a nonzero exit and a stated reason. It never skips silently, because a silent skip would let the runner consume a stale census.

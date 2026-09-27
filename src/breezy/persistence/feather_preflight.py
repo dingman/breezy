@@ -85,6 +85,7 @@ from breezy.persistence.feather_read import BatchCoalescer
 
 __all__ = [
     "END_OF_STREAM_MARKER",
+    "PREFLIGHT_CLASSIFIER_VERSION",
     "FeatherFileReport",
     "FeatherStatus",
     "PreflightError",
@@ -105,6 +106,10 @@ END_OF_STREAM_MARKER = b"\xff\xff\xff\xff\x00\x00\x00\x00"
 #: The subdirectory the live recorder stages feather under. ``backtest`` is the
 #: other value Nautilus uses (``parquet.py:2539``, ``:2561``).
 DEFAULT_SUBDIRECTORY = "live"
+
+#: Bump when the byte-level truncation/readability classifier changes in a way
+#: that can alter ``classify_instance`` outcomes for the same on-disk stream.
+PREFLIGHT_CLASSIFIER_VERSION = 1
 
 #: Failures pyarrow raises for a stream that ran out of bytes mid-message. This
 #: is deliberately the SAME tuple Nautilus catches at ``parquet.py:2799`` -- if
