@@ -24,5 +24,6 @@ No SEARCH cost is incurred by AUD-05 or AUD-07.
 2. **Its output is barred.** Output from this study may never be cited toward any H-ARCHIVE-RECAL verdict, or toward any other registered hypothesis's CONFIRM leg.
 3. **Station-days count as SEARCH.** Every post-freeze station-day whose Depth10 rows the study reads is **declared SEARCH, meaning forfeited for CONFIRM**. This is conservative: it can only shrink the CONFIRM corpus, never contaminate it.
    - While the A1 halt is SET, no new fills occur. The study then touches only exit windows of fills made on or before 2026-09-24 [INFERRED: those windows close by settlement, roughly 2026-09-25].
-   - So the forfeiture should be about zero today. This is **unverified**. Follow-up RA-13-FW2 must confirm the study's max read timestamp from its own output before any CONFIRM count is quoted.
+   - **RA-13-FW2 VERIFIED (coordinator, 2026-09-27):** the latest run that wrote output was `derived/exit_window_study/2026-09-25_nightly/`, covering 8 positions. The newest date anywhere in its output is **2026-09-22**, which is before the freeze. The 09-26 15:20Z run was SKIPPED (the studies lock was held).
+   - **Forfeiture to date: 0 post-freeze station-days.** The SEARCH declaration applies from the first run that reads a climate day of 2026-09-26 or later. That happens only after new fills, which require the A1 halt to be cleared.
 4. **The study keeps running.** It is the evidence base for the UNARMED exit seam.
