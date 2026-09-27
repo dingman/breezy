@@ -49,11 +49,20 @@ never-signal convention) through an injectable seam
 (:data:`CauseReader`/``cause_reader``), so tests never touch systemd. The
 result lands on the plain log line as ``cause=<Result> exit=<code>`` -- for
 ``breezy-quote-tape-ingest.service`` the code is also named from the
-constants :func:`quote_tape_ingest_cli` already defines, never duplicated as
-a literal. This is additive only: `AlertPayload.detail` stays the fixed
-enum above, and the lookup fails OPEN (``cause=unknown``) on any read or
-parse failure -- it must never suppress or delay the alert itself (L-52: a
+constants `quote_tape_ingest_cli` already defines, never duplicated as a
+literal. This is additive only: `AlertPayload.detail` stays the fixed enum
+above, and the lookup fails OPEN (``cause=unknown``) on any read or parse
+failure -- it must never suppress or delay the alert itself (L-52: a
 detector without delivery is not a control).
+
+**Never a heavy import (alertcause 2026-09-27 review fix).** The exit-code
+constants above are imported from `breezy.runtime.quote_tape_exit_codes`, a
+stdlib-only leaf module -- NOT from `quote_tape_ingest_cli` itself, which
+pulls in `nautilus_trader` and `pyarrow` at import time. This module is the
+LAST line of alert delivery; a broken Nautilus install or a syntax error
+anywhere in the ingest module's import chain (exactly the kind of fault
+that can make a study fail) must never crash the notifier before it can
+send its alert.
 """
 
 from __future__ import annotations
@@ -73,12 +82,12 @@ from breezy.runtime.health import (
     log_alert_egress_status,
     resolve_alert_sink,
 )
-from breezy.runtime.quote_tape_ingest_cli import (
+from breezy.runtime.quote_tape_exit_codes import (
     EXIT_CONVERSION_FAILED,
     EXIT_DEFERRAL_STALLED,
     EXIT_USAGE,
 )
-from breezy.runtime.quote_tape_ingest_cli import PROGRAM as _QUOTE_TAPE_INGEST_PROGRAM
+from breezy.runtime.quote_tape_exit_codes import PROGRAM as _QUOTE_TAPE_INGEST_PROGRAM
 
 __all__ = [
     "STUDY_FAILED_ALERT_EVENT",

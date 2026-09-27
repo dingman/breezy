@@ -18,6 +18,8 @@ and alerted nobody. This module pins:
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from typing import Final
 
@@ -30,7 +32,7 @@ from breezy.runtime.health import (
     WebhookAlertSink,
     resolve_alert_sink,
 )
-from breezy.runtime.quote_tape_ingest_cli import EXIT_DEFERRAL_STALLED, PROGRAM
+from breezy.runtime.quote_tape_exit_codes import EXIT_DEFERRAL_STALLED, PROGRAM
 from breezy.runtime.study_failure_notifier import (
     STUDY_FAILED_ALERT_EVENT,
     STUDY_FAILED_ALERT_SEVERITY,
@@ -232,6 +234,45 @@ def test_the_notifier_contains_a_sink_failure_and_still_exits_0() -> None:
         sink_factory=lambda _env: _ExplodingSink(),
     )
     assert exit_code == 0
+
+
+def test_importing_the_notifier_never_pulls_in_the_ingest_cli() -> None:
+    """The notifier is the LAST line of alert delivery (module docstring's
+    "Never a heavy import" note). A missing `pyarrow` wheel or a syntax
+    error anywhere in `quote_tape_ingest_cli`'s own import chain --
+    exactly the kind of fault that can make a study unit fail in the first
+    place -- must never crash the notifier before it can send its alert
+    (L-52). Run in a FRESH subprocess: `sys.modules` in-process already
+    carries whatever earlier tests in this session imported, so only a
+    clean interpreter proves the notifier's own import graph is light.
+
+    NOT asserted here: that `nautilus_trader` itself is absent.
+    `breezy.runtime.__init__` (the PACKAGE this notifier lives in, not this
+    module) already imports `breezy.runtime.composition` eagerly, which
+    imports `nautilus_trader.live.node` -- so importing ANY
+    `breezy.runtime.*` submodule, including this one, already loads
+    Nautilus regardless of this module's own imports. That is a pre-existing
+    coupling in `breezy/runtime/__init__.py`, unrelated to and unfixed by
+    this change (fixing it means lazily loading that package's whole public
+    surface, a separate, larger change) -- verified empirically: a full
+    Nautilus-absence assertion fails even after this fix, solely because of
+    the package `__init__`, not because of anything this module imports.
+    """
+    script = (
+        "import sys\n"
+        "import breezy.runtime.study_failure_notifier\n"
+        "assert 'breezy.runtime.quote_tape_ingest_cli' not in sys.modules, sorted(sys.modules)\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK" in result.stdout
 
 
 # ---------------------------------------------------------------------------
