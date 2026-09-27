@@ -7,7 +7,10 @@ input=$(cat)
 cmd=$(printf '%s' "$input" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("tool_input",{}).get("command",""))
 except Exception: print("")' 2>/dev/null)
-if printf '%s' "$cmd" | grep -qE '(^|[;&|(`[:space:]])git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-c[[:space:]]+[^[:space:]]+|--[a-z-]+(=[^[:space:]]+)?))*[[:space:]]+stash([[:space:]]|$)'; then
+# Read-only inspection (stash list / stash show) stays allowed: the coordinator
+# uses `stash list` to verify no agent left a stash behind.
+stripped=$(printf '%s' "$cmd" | sed -E 's/git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+stash[[:space:]]+(list|show)([[:space:]]|$)/git-stash-readonly /g')
+if printf '%s' "$stripped" | grep -qE '(^|[;&|(`[:space:]])git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-c[[:space:]]+[^[:space:]]+|--[a-z-]+(=[^[:space:]]+)?))*[[:space:]]+stash([[:space:]]|$)'; then
   echo "BLOCKED: git stash is banned in this repo (shared across worktrees). For a baseline, use a detached base worktree under ~/.cache/breezy-gate/<slug>/base, or 'git show HEAD:<file>'." >&2
   exit 2
 fi
