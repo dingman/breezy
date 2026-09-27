@@ -780,16 +780,22 @@ def read_asos_rows(csv_path: Path) -> list[dict[str, str]]:
 
 @contextmanager
 def _latch_context(
-    store_path: Path, *, key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    store_path: Path,
+    *,
+    key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    family_id: str = UNSCOPED_FAMILY_ID,
 ) -> Iterator[TrialDayLatch]:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        yield open_trial_day_latch(intent_latch, key_prefix=key_prefix)
+        yield open_trial_day_latch(intent_latch, key_prefix=key_prefix, family_id=family_id)
 
 
 def _latch_factory(
-    store_path: Path, *, key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    store_path: Path,
+    *,
+    key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    family_id: str = UNSCOPED_FAMILY_ID,
 ) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
-    return lambda: _latch_context(store_path, key_prefix=key_prefix)
+    return lambda: _latch_context(store_path, key_prefix=key_prefix, family_id=family_id)
 
 
 def _entry_context_for(
@@ -1299,7 +1305,9 @@ def run_one_precision_arm(
         strategy = ContinuousRungHoldBacktestStrategy(
             cfg,
             trial_day_latch_factory=_latch_factory(
-                latch_store_path, key_prefix=latch_key_prefix,
+                latch_store_path,
+                key_prefix=latch_key_prefix,
+                family_id=family_id,
             ),
             position_evidence_reader=evidence,
         )
@@ -1315,7 +1323,9 @@ def run_one_precision_arm(
         strategy = strategy_cls(
             cfg,
             trial_day_latch_factory=_latch_factory(
-                latch_store_path, key_prefix=latch_key_prefix,
+                latch_store_path,
+                key_prefix=latch_key_prefix,
+                family_id=family_id,
             ),
         )
 

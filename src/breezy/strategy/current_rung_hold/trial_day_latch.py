@@ -51,11 +51,15 @@ state this ordering makes unreachable: nothing may call ``arm()`` before its
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import sqlite3
 import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
@@ -87,15 +91,21 @@ __all__ = [
     "CONTINUOUS_TRIAL_KEY_PREFIX",
     "DEFAULT_TRIAL_KEY_PREFIX",
     "DUPLICATE_FILL_KEY_PREFIX",
-    "FAMILY_HALT_KEY",
-    "HALT_CLEARED_KEY_PREFIX",
+    "FAMILY_HALT_CLEARED_KEY_PREFIX",
+    "FAMILY_HALT_KEY_PREFIX",
+    "FAMILY_ID_PATTERN",
     "LATCH_GATE_REFUSAL_REASONS",
+    "LEGACY_FAMILY_HALT_KEY",
+    "LEGACY_HALT_ATTRIBUTED_FAMILY_ID",
+    "LEGACY_HALT_PINNED_SHA256",
     "NO_SIDE_FIRST_ORDER_PENDING_REASON",
     "SIBLING_LEG_TRADED_REASON",
     "STARTUP_EVIDENCE_KEY",
     "STARTUP_OPEN_ORDERS_PRESENT_REASON",
     "STATION_DAY_ADMISSION_REASON",
     "TAKEN_FROM_FILL_WALK_REASON",
+    "FamilyHaltReading",
+    "MalformedHaltValue",
     "Refusal",
     "TrialDayAlreadyConsumed",
     "TrialDayInvalidReason",
@@ -103,8 +113,11 @@ __all__ = [
     "TrialDayLatchError",
     "TrialDayRecord",
     "TrialDayRecordCorrupt",
-    "decode_family_halt",
+    "classify_legacy",
+    "decode_family_halt_state",
+    "family_halt_key",
     "open_trial_day_latch",
+    "read_family_halt_rows_readonly",
     "refuse_if_sibling_leg_traded",
     "startup_evidence_confirms_absent_flat",
     "startup_evidence_lists_slug",
@@ -275,48 +288,95 @@ def _cell_probability(be: Decimal, side: str) -> Decimal:
     (money/probability sums stay Decimal, never float)."""
     return be if side == "yes" else Decimal(1) - be
 
-#: Slice 4 item B1 (plan rev 6.1): v3-only, family-wide keys -- literal
-#: strings, NOT derived from a `TrialDayLatch`'s own `_key_prefix` (v2 never
-#: writes either of these; there is exactly one continuous-rung-hold family).
-#:
-#: WP-11b (active-family registry, cardinality-1, 2026-09-19): this key is
-#: scoped by COMPOSITION KIND (every ``continuous_rung_hold`` family opens
-#: its latch with `CONTINUOUS_TRIAL_KEY_PREFIX`, a fixed constant), never by
-#: the manifest's own `family_id` -- under cardinality-1 at most one family
-#: is ever the continuous-kind sender, so "halted" stays GLOBAL-equivalent
-#: to "this node's only sender is halted" (F6) no matter which literal
-#: family id currently occupies that slot. `trade_supervisor_core.
-#: continuous_family_halt_key(sending_family_id)` duplicates this literal
-#: (runtime must not import strategy) and is pinned against it byte-for-byte
-#: in `tests/unit/test_trade_supervisor_cont_self_check.py`.
 DUPLICATE_FILL_KEY_PREFIX: Final[str] = "continuous_rung_hold/duplicate_fill/"
-FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
-#: Audit trail for `breezy-clear-family-halt` (build-side clear only -- there
-#: is no automated clear). One record per clear, keyed by the clearing
-#: ts_ns so a family can be halted, cleared, and re-halted across restarts
-#: without ever overwriting a prior audit entry.
+LEGACY_FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+FAMILY_HALT_KEY_PREFIX: Final[str] = "continuous_rung_hold/family_halt/"
+FAMILY_HALT_CLEARED_KEY_PREFIX: Final[str] = "continuous_rung_hold/family_halt_cleared/"
 HALT_CLEARED_KEY_PREFIX: Final[str] = "continuous_rung_hold/halt_cleared/"
-#: Sentinel written over `FAMILY_HALT_KEY` by `clear_family_halt` -- the
-#: store has no delete (`StateStore.set`/`get` only), so "cleared" is a
-#: distinguishable value rather than an absent key, mirroring
-#: `_INFLIGHT_CLEARED` above.
 _HALT_CLEARED_MARKER: Final[bytes] = b'{"v":1,"state":"cleared"}'
+LEGACY_HALT_ATTRIBUTED_FAMILY_ID: Final[str] = "pm_us_crh_v4"
+LEGACY_HALT_PINNED_SHA256: Final[str] = (
+    "5a82b40140618de8d35338c0c9463afb256de37b73729ebbe32ffd8d75b19f28"
+)
+FAMILY_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 
 
-def decode_family_halt(raw: bytes | None) -> bool:
-    """Pure decode of a ``FAMILY_HALT_KEY`` store value: ``True`` iff present
-    and not the ``_HALT_CLEARED_MARKER`` sentinel.
+@dataclass(frozen=True, slots=True)
+class FamilyHaltReading:
+    halted: bool
+    source: str
+    legacy: str
 
-    No I/O, no lock, no ``TrialDayLatch`` instance required -- this is the
-    SINGLE SOURCE OF TRUTH :meth:`TrialDayLatch.is_family_halted` itself
-    calls after its own ``_require_held()`` check. A caller that does not
-    (and must not) hold this family's exclusive submit-intent latch --
-    ``scripts/analysis/decision_funnel_daily_digest.py``'s ``halt_enforced``
-    field, reading the SAME key through its own separate, read-only sqlite
-    connection -- calls this function directly instead of duplicating the
-    two-line comparison.
+
+class MalformedHaltValue(Exception):
+    """Raised by lock-free readers when SQLite returns a non-bytes halt value."""
+
+
+def family_halt_key(family_id: str) -> str:
+    """Return the per-family halt key after validating the path segment."""
+    if FAMILY_ID_PATTERN.fullmatch(family_id) is None:
+        raise ValueError(f"invalid family_id: {family_id!r}")
+    return f"{FAMILY_HALT_KEY_PREFIX}{family_id}"
+
+
+def classify_legacy(raw: bytes | None) -> str:
+    """Classify the legacy un-keyed halt value without performing I/O."""
+    if raw is None:
+        return "absent"
+    if raw == _HALT_CLEARED_MARKER:
+        return "cleared"
+    if hashlib.sha256(raw).hexdigest() == LEGACY_HALT_PINNED_SHA256:
+        return "attributable_to_v4"
+    return "halts_all"
+
+
+def decode_family_halt_state(
+    family_id: str, legacy_raw: bytes | None, family_raw: bytes | None
+) -> FamilyHaltReading:
+    """Pure per-family halt decode.
+
+    The pinned legacy value is attributed to ``pm_us_crh_v4`` only. Any
+    other non-cleared legacy value fails closed for every family.
     """
-    return raw is not None and raw != _HALT_CLEARED_MARKER
+    family_halt_key(family_id)
+    legacy = classify_legacy(legacy_raw)
+    if legacy == "halts_all":
+        source = "legacy_halts_all"
+    elif family_raw is not None and family_raw != _HALT_CLEARED_MARKER:
+        source = "per_family"
+    elif legacy == "attributable_to_v4" and family_id == LEGACY_HALT_ATTRIBUTED_FAMILY_ID:
+        source = "legacy_attributed"
+    else:
+        source = "none"
+    return FamilyHaltReading(halted=source != "none", source=source, legacy=legacy)
+
+
+def read_family_halt_rows_readonly(
+    store_path: Path,
+    family_id: str,
+    *,
+    busy_timeout_s: float = 1.0,
+    connect: object = sqlite3.connect,
+) -> tuple[bytes | None, bytes | None]:
+    """Read legacy and per-family halt rows through a SQLite read-only URI."""
+    key = family_halt_key(family_id)
+    uri = f"file:{Path(store_path)}?mode=ro"
+    conn = connect(uri, uri=True, timeout=busy_timeout_s)
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM state WHERE key IN (?, ?)",
+            (LEGACY_FAMILY_HALT_KEY, key),
+        ).fetchall()
+    finally:
+        conn.close()
+    values: dict[str, bytes | None] = {LEGACY_FAMILY_HALT_KEY: None, key: None}
+    for row_key, raw in rows:
+        if raw is not None and not isinstance(raw, bytes):
+            raise MalformedHaltValue(
+                f"malformed halt value for {row_key}: expected bytes, got {type(raw).__name__}"
+            )
+        values[row_key] = raw
+    return values[LEGACY_FAMILY_HALT_KEY], values[key]
 
 
 def _decode_halt_payload(raw: bytes) -> dict[str, object]:
@@ -619,11 +679,14 @@ class TrialDayLatch:
         *,
         key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
         intent_latch: SubmitIntentLatch | None = None,
+        family_id: str | None = None,
     ) -> None:
         self._store = store
         self._lock = lock
         self._key_prefix = key_prefix
         self._inflight_prefix = _inflight_prefix(key_prefix)
+        self._family_id = family_id
+        self._family_halt_key = family_halt_key(family_id) if family_id is not None else None
         #: Resolution B (plan rev 6.1): bound at construction by
         #: :func:`open_trial_day_latch`, never opened here. ``None`` for a
         #: ``TrialDayLatch`` built directly (existing test doubles) -- such
@@ -640,6 +703,19 @@ class TrialDayLatch:
     def _require_held(self) -> None:
         if not self._lock.held:
             raise SubmitIntentLockNotHeld()
+
+    def _require_family_id(self) -> str:
+        if self._family_id is None or self._family_halt_key is None:
+            raise TrialDayLatchError(
+                "family halt operations require a family_id-bound TrialDayLatch; "
+                "pass family_id to open_trial_day_latch"
+            )
+        return self._family_id
+
+    @property
+    def family_id(self) -> str | None:
+        """The family id bound for halt operations, if any."""
+        return self._family_id
 
     def is_intent_open(self) -> bool:
         """Resolution B (plan rev 6.1): ``True`` while the account-wide
@@ -897,9 +973,10 @@ class TrialDayLatch:
         ``consume_if_absent``'s own instrument-day keying). This method
         only ever fires for a second fill on the SAME already-consumed
         instrument-day. Its BLAST RADIUS is unchanged by that re-keying:
-        the halt it sets is family-wide (``FAMILY_HALT_KEY`` has no
+        the halt it sets is family-wide (the per-family key has no
         station/instrument component and never has), stopping every
-        station and every rung, not just the offending instrument-day.
+        station and every rung of THIS family, not just the offending
+        instrument-day.
 
         Idempotent per ``venue_order_id``: a replayed call for the SAME
         duplicate fill (or the SAME id racing two writers) writes neither
@@ -908,6 +985,7 @@ class TrialDayLatch:
         this SAME flock.
         """
         self._require_held()
+        self._require_family_id()
         bucket_key = f"{DUPLICATE_FILL_KEY_PREFIX}{venue_order_id}"
         if self._store.get(bucket_key) is None:
             payload = {
@@ -918,6 +996,7 @@ class TrialDayLatch:
                 "tsNs": ts_ns,
                 "station": station,
                 "climateDay": climate_day,
+                "familyId": self._family_id,
             }
             self._store.set(bucket_key, json.dumps(payload, sort_keys=True).encode("utf-8"))
         if not self.is_family_halted():
@@ -926,9 +1005,11 @@ class TrialDayLatch:
                 "reason": "duplicate_fill",
                 "tsNs": ts_ns,
                 "venueOrderId": venue_order_id,
+                "familyId": self._family_id,
             }
             self._store.set(
-                FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+                self._family_halt_key,
+                json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
             )
 
     # -- INC-E3 (plan §3, PREREG v4 §3b/§5b): exit provenance + kill rule --
@@ -1004,6 +1085,7 @@ class TrialDayLatch:
         wins, mirroring :meth:`record_duplicate_fill`'s own idempotency.
         """
         self._require_held()
+        self._require_family_id()
         if self.is_family_halted():
             return
         halt_payload = {
@@ -1012,9 +1094,11 @@ class TrialDayLatch:
             "tsNs": ts_ns,
             "positionId": position_id,
             "detail": reason,
+            "familyId": self._family_id,
         }
         self._store.set(
-            FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+            self._family_halt_key,
+            json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
         )
 
     def record_policy_halt(
@@ -1039,6 +1123,7 @@ class TrialDayLatch:
         cause wins, mirroring :meth:`record_duplicate_fill`'s own idempotency.
         """
         self._require_held()
+        self._require_family_id()
         if self.is_family_halted():
             return
         halt_payload = {
@@ -1047,19 +1132,32 @@ class TrialDayLatch:
             "tsNs": ts_ns,
             "detail": reason,
             "evidenceSha256": evidence_sha256,
+            "familyId": self._family_id,
         }
         self._store.set(
-            FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+            self._family_halt_key,
+            json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+        )
+
+    def family_halt_state(self) -> FamilyHaltReading:
+        """Read this latch's per-family halt state plus the legacy attribution row."""
+        self._require_held()
+        self._require_family_id()
+        return decode_family_halt_state(
+            self._family_id,
+            self._store.get(LEGACY_FAMILY_HALT_KEY),
+            self._store.get(self._family_halt_key),
         )
 
     def is_family_halted(self) -> bool:
-        """``True`` once ANY of this latch's three ``FAMILY_HALT_KEY``
-        writers has fired for THIS family and no ``breezy-clear-family-halt``
-        run has cleared it since. Durable -- survives restart, unlike
-        ``_trading_refusals``. The three writers, added across separate
-        slices and unified here (AUD-02b, docstring-only note -- no code
-        change on this read path): :meth:`record_duplicate_fill` (an
-        automatic consequence of a second genuine fill on an
+        """``True`` once ANY of this latch's three per-family halt writers
+        has fired for THIS family (or the legacy key is pinned/attributed to
+        it -- EDGE-3, ``family_halt_state``) and no
+        ``breezy-clear-family-halt`` run has cleared it since. Durable --
+        survives restart, unlike ``_trading_refusals``. The three writers,
+        added across separate slices and unified here (AUD-02b, docstring-only
+        note -- no code change on this read path): :meth:`record_duplicate_fill`
+        (an automatic consequence of a second genuine fill on an
         already-consumed instrument-day), :meth:`record_ambiguous_exit` (an
         automatic consequence of an AMBIGUOUS or rejected exit order), and
         :meth:`record_policy_halt` (a deliberate, evidenced operator
@@ -1068,16 +1166,16 @@ class TrialDayLatch:
         identically here; this method cannot and does not distinguish which
         one fired.
 
-        The decode itself is :func:`decode_family_halt` -- see that
-        function for the ``_HALT_CLEARED_MARKER`` rationale. This method
-        only adds the ``_require_held()`` discipline every other method on
-        this class carries; a caller with no legitimate held latch (AUD-03's
-        daily digest, reading through its OWN read-only sqlite connection,
-        never this latch's exclusive flock) calls :func:`decode_family_halt`
-        directly instead.
+        The decode itself is :func:`decode_family_halt_state` -- see that
+        function for the ``_HALT_CLEARED_MARKER`` and legacy-attribution
+        rationale. This method only adds the ``_require_held()`` discipline
+        every other method on this class carries; a caller with no
+        legitimate held latch (AUD-03's daily digest, reading through its
+        OWN read-only sqlite connection, never this latch's exclusive flock)
+        calls :func:`read_family_halt_rows_readonly` plus
+        :func:`decode_family_halt_state` directly instead.
         """
-        self._require_held()
-        return decode_family_halt(self._store.get(FAMILY_HALT_KEY))
+        return self.family_halt_state().halted
 
     def is_day_budget_exhausted(self, utc_day: str) -> bool:
         """``True`` once the exec client has marked ``utc_day`` (a
@@ -1104,12 +1202,14 @@ class TrialDayLatch:
         no automated clear; this is the sole writer, invoked exclusively by
         the ``breezy-clear-family-halt`` operator CLI.
 
-        Writes an audit record under ``HALT_CLEARED_KEY_PREFIX + ts_ns``
+        Writes an audit record under
+        ``FAMILY_HALT_CLEARED_KEY_PREFIX + family_id + "/" + ts_ns``
         containing the prior halt payload, ``reason``, ``evidence_sha256``
-        and ``ts_ns`` BEFORE overwriting ``FAMILY_HALT_KEY`` with the
-        cleared sentinel -- so a crash between the two writes leaves the
-        halt still active (fail closed) with an orphaned audit record,
-        never a cleared halt with no audit trail.
+        and ``ts_ns`` BEFORE overwriting the per-family key (and, when
+        attributed, the legacy key LAST -- EDGE-3 §4.3) with the cleared
+        sentinel -- so a crash between the writes leaves the halt still
+        active (fail closed) with an orphaned audit record, never a cleared
+        halt with no audit trail.
 
         Raises :class:`TrialDayLatchError` if the halt is not currently set
         (re-checked here under the SAME flock rather than trusting an
@@ -1124,9 +1224,55 @@ class TrialDayLatch:
         audit record (either the decoded dict, or the raw-bytes fallback).
         """
         self._require_held()
-        raw = self._store.get(FAMILY_HALT_KEY)
-        if raw is None or raw == _HALT_CLEARED_MARKER:
+        family_id = self._require_family_id()
+        legacy_raw = self._store.get(LEGACY_FAMILY_HALT_KEY)
+        family_raw = self._store.get(self._family_halt_key)
+        reading = decode_family_halt_state(family_id, legacy_raw, family_raw)
+        if reading.legacy == "halts_all":
+            raise TrialDayLatchError(
+                "legacy family halt is unattributable and halts every family; "
+                "clear it with clear_legacy_family_halt"
+            )
+        if not reading.halted:
             raise TrialDayLatchError("no family halt is currently set; nothing to clear")
+        prior_payload = _decode_halt_payload(family_raw or legacy_raw or b"")
+        audit_payload = {
+            "v": 1,
+            "familyId": family_id,
+            "priorHalt": prior_payload,
+            "reason": reason,
+            "evidenceSha256": evidence_sha256,
+            "tsNs": ts_ns,
+            "source": reading.source,
+        }
+        if legacy_raw is not None:
+            audit_payload["legacySha256"] = hashlib.sha256(legacy_raw).hexdigest()
+        self._store.set(
+            f"{FAMILY_HALT_CLEARED_KEY_PREFIX}{family_id}/{ts_ns}",
+            json.dumps(audit_payload, sort_keys=True).encode("utf-8"),
+        )
+        if family_raw is not None and family_raw != _HALT_CLEARED_MARKER:
+            self._store.set(self._family_halt_key, _HALT_CLEARED_MARKER)
+        if (
+            family_id == LEGACY_HALT_ATTRIBUTED_FAMILY_ID
+            and classify_legacy(legacy_raw) == "attributable_to_v4"
+        ):
+            self._store.set(LEGACY_FAMILY_HALT_KEY, _HALT_CLEARED_MARKER)
+        return prior_payload
+
+    def clear_legacy_family_halt(
+        self,
+        *,
+        reason: str,
+        evidence_sha256: str,
+        ts_ns: int,
+    ) -> dict[str, object]:
+        """Clear only an unattributable legacy halt that currently halts all families."""
+        self._require_held()
+        raw = self._store.get(LEGACY_FAMILY_HALT_KEY)
+        if classify_legacy(raw) != "halts_all":
+            raise TrialDayLatchError("legacy halt is absent, cleared, or pinned; refusing")
+        assert raw is not None
         prior_payload = _decode_halt_payload(raw)
         audit_payload = {
             "v": 1,
@@ -1134,12 +1280,13 @@ class TrialDayLatch:
             "reason": reason,
             "evidenceSha256": evidence_sha256,
             "tsNs": ts_ns,
+            "legacySha256": hashlib.sha256(raw).hexdigest(),
         }
         self._store.set(
             f"{HALT_CLEARED_KEY_PREFIX}{ts_ns}",
             json.dumps(audit_payload, sort_keys=True).encode("utf-8"),
         )
-        self._store.set(FAMILY_HALT_KEY, _HALT_CLEARED_MARKER)
+        self._store.set(LEGACY_FAMILY_HALT_KEY, _HALT_CLEARED_MARKER)
         return prior_payload
 
     # -- Slice 4 item A2 (plan rev 6.1): never-arm startup evidence + fill walk --
@@ -1427,6 +1574,7 @@ def open_trial_day_latch(
     intent_latch: SubmitIntentLatch,
     *,
     key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    family_id: str | None = None,
 ) -> TrialDayLatch:
     """Bind a :class:`TrialDayLatch` to an already-opened ``SubmitIntentLatch``.
 
@@ -1436,11 +1584,17 @@ def open_trial_day_latch(
     ``with`` has exited -- so a caller cannot construct a working
     ``TrialDayLatch`` from a latch it does not currently, genuinely hold.
 
-    ``key_prefix`` defaults to the v2 live prefix so existing callers stay
-    byte-identical.
+    ``key_prefix`` defaults to the v2 live prefix so existing non-halt callers
+    stay byte-identical. Halt operations require ``family_id``.
     """
     store, lock = intent_latch.shared_state_binding()
-    return TrialDayLatch(store, lock, key_prefix=key_prefix, intent_latch=intent_latch)
+    return TrialDayLatch(
+        store,
+        lock,
+        key_prefix=key_prefix,
+        intent_latch=intent_latch,
+        family_id=family_id,
+    )
 
 
 def refuse_if_sibling_leg_traded(

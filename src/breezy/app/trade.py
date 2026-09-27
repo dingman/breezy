@@ -466,6 +466,11 @@ def run(
             manifest.status,
             manifest.manifest_sha256,
         )
+        if manifest.family_id != settings.sending_family_id:
+            raise SettingsError(
+                "sending family id does not match manifest family_id: "
+                f"{settings.sending_family_id!r} != {manifest.family_id!r}"
+            )
         # Manifest stations, not SUPPORTED_STATIONS. The call has to follow
         # the load: the composable set is a property of this manifest.
         today_by_station = _today_by_station(_composable_stations(manifest))
@@ -484,7 +489,7 @@ def run(
             fee_drift_resolve_client: Callable[[Any], None] | None = None
 
             if manifest.composition_kind == "current_rung_hold":
-                factory = make_trial_day_latch_factory(latch)
+                factory = make_trial_day_latch_factory(latch, family_id=manifest.family_id)
                 strategies.extend(
                     build_current_rung_hold_strategies(
                         catalog_root=catalog_root,
@@ -502,7 +507,9 @@ def run(
                 )
             elif manifest.composition_kind == "continuous_rung_hold":
                 cont_factory = make_trial_day_latch_factory(
-                    latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    latch,
+                    key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    family_id=manifest.family_id,
                 )
                 # Item 4 (slice 4 review): the exec client's `_submit_order`
                 # consults an injected `submit_veto: Callable[[], str |
@@ -516,8 +523,31 @@ def run(
                 # `is_family_halted()` under the intent latch this process
                 # already holds for its lifetime -- no fresh open, no await.
                 family_halt_latch = open_trial_day_latch(
-                    latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    latch,
+                    key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    family_id=manifest.family_id,
                 )
+                halt_state = family_halt_latch.family_halt_state()
+                _boot_logger.info(
+                    "family_halt_state family_id=%s halted=%s source=%s legacy=%s",
+                    manifest.family_id,
+                    halt_state.halted,
+                    halt_state.source,
+                    halt_state.legacy,
+                )
+                if halt_state.legacy == "halts_all":
+                    emit_alert(
+                        resolve_alert_sink(),
+                        AlertPayload(
+                            severity="CRITICAL",
+                            event="LEGACY_FAMILY_HALT_UNATTRIBUTABLE",
+                            site="breezy-trade",
+                            detail=(
+                                f"family_id={manifest.family_id} source={halt_state.source} "
+                                f"legacy={halt_state.legacy}"
+                            ),
+                        ),
+                    )
                 submit_veto = family_halt_submit_veto(family_halt_latch)
                 # Review finding A(1)/A(2): the sending family's own
                 # manifest (loaded once, above), threaded into BOTH the

@@ -57,7 +57,12 @@ from breezy.runtime.health import (
     emit_alert,
     resolve_alert_sink,
 )
-from breezy.strategy.current_rung_hold.trial_day_latch import FAMILY_HALT_KEY, decode_family_halt
+from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    MalformedHaltValue,
+    decode_family_halt_state,
+    read_family_halt_rows_readonly,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +89,6 @@ _DEFAULT_OUTPUT_DIR = Path.home() / ".local/share/breezy/derived/decision_funnel
 #: than stalling the whole digest run).
 _HALT_BUSY_TIMEOUT_SECONDS: float = 2.0
 
-_SELECT_HALT_SQL = "SELECT value FROM state WHERE key = ?"
-
 #: Silent-failure review (2026-09-25): the plan does not name a number for
 #: THIS specific staleness check (distinct from F-2's own hourly rollover
 #: cadence) -- 2h is a stated, reviewable default: long enough to tolerate
@@ -110,10 +113,14 @@ class FamilyHaltStatus:
 
     value: Literal["yes", "no", "unknown"]
     reason: str | None
+    family_id: str | None = None
+    source: str = "unknown"
+    legacy: str = "unknown"
 
 
 def read_family_halt_status(
     store_path: Path,
+    family_id: str,
     *,
     busy_timeout_s: float = _HALT_BUSY_TIMEOUT_SECONDS,
     connect: Callable[..., sqlite3.Connection] = sqlite3.connect,
@@ -143,29 +150,26 @@ def read_family_halt_status(
     itself as untrustworthy in either direction.
     """
     try:
-        conn = connect(f"file:{store_path}?mode=ro", uri=True, timeout=busy_timeout_s)
-    except (sqlite3.Error, OSError) as exc:
-        return FamilyHaltStatus(value="unknown", reason=f"{type(exc).__name__}: {exc}")
-    try:
-        try:
-            row = conn.execute(_SELECT_HALT_SQL, (FAMILY_HALT_KEY,)).fetchone()
-        finally:
-            conn.close()
-    except (sqlite3.Error, OSError) as exc:
-        return FamilyHaltStatus(value="unknown", reason=f"{type(exc).__name__}: {exc}")
-
-    raw = row[0] if row is not None else None
-    if raw is not None and not isinstance(raw, bytes | bytearray):
+        legacy_raw, family_raw = read_family_halt_rows_readonly(
+            store_path,
+            family_id,
+            busy_timeout_s=busy_timeout_s,
+            connect=connect,
+        )
+        reading = decode_family_halt_state(family_id, legacy_raw, family_raw)
+    except (sqlite3.Error, OSError, ValueError, MalformedHaltValue) as exc:
         return FamilyHaltStatus(
             value="unknown",
-            reason=f"malformed FAMILY_HALT_KEY value: expected bytes, got {type(raw).__name__}",
+            reason=f"{type(exc).__name__}: {exc}",
+            family_id=family_id,
         )
-    # `decode_family_halt` is a pure `bytes | None -> bool` comparison (see
-    # its docstring) -- it cannot raise on the `bytes | None` this function
-    # already guarantees above, so no further try/except is warranted here
-    # (YAGNI: an unreachable defensive branch is dead code, not safety).
-    halted = decode_family_halt(bytes(raw) if raw is not None else None)
-    return FamilyHaltStatus(value="yes" if halted else "no", reason=None)
+    return FamilyHaltStatus(
+        value="yes" if reading.halted else "no",
+        reason=None,
+        family_id=family_id,
+        source=reading.source,
+        legacy=reading.legacy,
+    )
 
 
 class UnknownOfferTapeSourceError(ValueError):
@@ -414,6 +418,11 @@ def format_digest_detail(
     else:
         coverage = f"{report.coverage_min_observed_at_ns}-{report.coverage_max_observed_at_ns}"
     halt_reason = f"halt_reason={halt.reason}" if halt is not None and halt.reason else None
+    halt_family = (
+        f"halt_family={halt.family_id}:{halt.source}"
+        if halt is not None and halt.family_id is not None
+        else None
+    )
     why = ",".join(f"{name}:{count}" for name, count in report.entry_reasons)
 
     def _base(stall: str, *, include_extra: bool) -> str:
@@ -433,6 +442,7 @@ def format_digest_detail(
                 _stationed_counts_token("no_oob", report.no_out_of_band_by_station),
                 _pre_tape_status_token(report),
                 "pre_tape_stale=1" if report.pre_tape_stale else None,
+                halt_family,
             ):
                 if token:
                     rendered = f"{rendered} {token}"
@@ -680,6 +690,9 @@ def _artefact(
     if halt is not None:
         artefact["halt_enforced"] = halt.value
         artefact["halt_reason"] = halt.reason
+        artefact["halt_family_id"] = halt.family_id
+        artefact["halt_source"] = halt.source
+        artefact["halt_legacy"] = halt.legacy
     if capped_total > 0:
         artefact["truncated"] = 1
     # F-2 AC6: stalled stations get their pre-tape counts in the artefact --
@@ -751,6 +764,9 @@ def _missing_tape_artefact(climate_day: str, halt: FamilyHaltStatus) -> dict[str
         "decision_tape_present": False,
         "halt_enforced": halt.value,
         "halt_reason": halt.reason,
+        "halt_family_id": halt.family_id,
+        "halt_source": halt.source,
+        "halt_legacy": halt.legacy,
     }
 
 
@@ -809,6 +825,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "EXEC_STATE_DB_ENV_VAR"
         ),
     )
+    parser.add_argument("--family-id", default=None, help="sending family id for halt attribution")
     return parser.parse_args(argv)
 
 
@@ -818,13 +835,16 @@ def _resolve_halt_status(
     """Never raises: a misconfigured/absent store is `unknown`, not a digest
     failure -- `halt_enforced` is supplementary to the offer-tape funnel,
     which is this digest's binding read-only contract (module docstring)."""
+    family_id = args.family_id or source_env.get(SENDING_FAMILY_ID_VAR)
+    if not family_id:
+        return FamilyHaltStatus(value="unknown", reason="no family id")
     if args.store_path:
-        return read_family_halt_status(Path(args.store_path))
+        return read_family_halt_status(Path(args.store_path), family_id)
     try:
         store_path = resolve_store_path(source_env)
     except ExecStateDbNotConfiguredError as exc:
-        return FamilyHaltStatus(value="unknown", reason=str(exc))
-    return read_family_halt_status(store_path)
+        return FamilyHaltStatus(value="unknown", reason=str(exc), family_id=family_id)
+    return read_family_halt_status(store_path, family_id)
 
 
 def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None) -> int:

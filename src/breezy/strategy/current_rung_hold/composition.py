@@ -198,6 +198,7 @@ def make_trial_day_latch_factory(
     intent_latch: SubmitIntentLatch,
     *,
     key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    family_id: str | None = None,
 ) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
     """Return a factory that binds a ``TrialDayLatch`` to *intent_latch*.
 
@@ -206,12 +207,13 @@ def make_trial_day_latch_factory(
     ``on_start`` enters this factory; ``on_stop`` exits it.
 
     ``key_prefix`` defaults to the v2 live prefix so existing callers stay
-    byte-identical.
+    byte-identical. Continuous-family callers bind ``family_id`` so halt reads
+    are scoped to the manifest family.
     """
 
     @contextmanager
     def _factory() -> Iterator[TrialDayLatch]:
-        yield open_trial_day_latch(intent_latch, key_prefix=key_prefix)
+        yield open_trial_day_latch(intent_latch, key_prefix=key_prefix, family_id=family_id)
 
     return _factory
 

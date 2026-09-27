@@ -111,3 +111,26 @@ Both pass as part of the full suite.
 ---
 
 **Ready for Amendment C commit** with this file path cited per plan §1.
+
+---
+
+## Erratum (EDGE-3, 2026-09-27)
+
+Line 18's claim above ("Live node holds the latch; --status reached the
+store in read-only mode") is **false** as a description of the code that
+actually ran. `docs/plans/backlog/EDGE_2026-09-27/EDGE-3_per_family_halt_plan_r2_2026-09-27.md`
+§2 traces the CLI as it existed at the cited timestamp: `--status` at that
+commit (`e837511`) entered `open_submit_intent_latch` *before* reading
+`args.status`, so a run against a store the live node already held would
+have raised `SubmitIntentLockHeld` ("the node holds the lock; refused"),
+never a read-only status line. The node log confirms the node held the
+flock at 03:15:30Z. The line quoted at :18 could not have come from that
+code path on that store.
+
+This does not put the HALT ITSELF in doubt: §2's decoded payload and its
+sha256 are independently verified against the live store, and EDGE-3's own
+2026-09-27 read-only re-check (its plan §2) reproduces the same 259-byte,
+same-sha256 record. What is corrected is only the *mechanism* claim about
+how that read was taken. EDGE-3 makes the described behavior real: `--status`
+is now a genuine lock-free `mode=ro` read (AC-8), so a future report citing
+"--status while the node holds the lock" will be accurate on its own code.

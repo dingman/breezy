@@ -1,0 +1,1 @@
+{"detail": "Ruling A1 2026-09-21: pm_us_crh_v4 may not SEND orders; node, capture and KILL clock keep running", "evidenceSha256": "754e5cbef13e2896854dc99391e6c64923fe7813ccd03909b7a8fef898b87353", "reason": "policy_halt", "tsNs": 1790268150964821245, "v": 1}

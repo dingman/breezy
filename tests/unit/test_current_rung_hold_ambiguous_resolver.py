@@ -1833,7 +1833,7 @@ async def test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots
         )
         assert client._latch is not None
         trial_day_latch = open_trial_day_latch(
-            client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
         )
         client._submit_veto = family_halt_submit_veto(  # type: ignore[method-assign]
             trial_day_latch,
@@ -1888,7 +1888,7 @@ async def test_a_policy_halt_veto_denies_wait_class_and_spends_zero_permit_slots
         )
         assert client._latch is not None
         trial_day_latch = open_trial_day_latch(
-            client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
         )
         client._submit_veto = family_halt_submit_veto(  # type: ignore[method-assign]
             trial_day_latch,

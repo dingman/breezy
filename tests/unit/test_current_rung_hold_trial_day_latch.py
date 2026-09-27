@@ -35,8 +35,8 @@ from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     DEFAULT_TRIAL_KEY_PREFIX,
-    FAMILY_HALT_KEY,
     LATCH_GATE_REFUSAL_REASONS,
+    LEGACY_FAMILY_HALT_KEY,
     NO_SIDE_FIRST_ORDER_PENDING_REASON,
     SIBLING_LEG_TRADED_REASON,
     STARTUP_EVIDENCE_KEY,
@@ -48,6 +48,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatchError,
     TrialDayRecord,
     TrialDayRecordCorrupt,
+    family_halt_key,
     open_trial_day_latch,
     refuse_if_sibling_leg_traded,
     startup_evidence_confirms_absent_flat,
@@ -62,6 +63,10 @@ STATION = "LAX"
 CLIMATE_DAY = "2026-09-04"
 OTHER_CLIMATE_DAY = "2026-09-05"
 INSTRUMENT_ID = "POLY-LAX-TMAX-92-94.US"
+#: Any valid, non-``pm_us_crh_v4`` id -- these tests exercise the per-family
+#: halt mechanism itself, not v4's legacy attribution (that is covered by
+#: ``tests/unit/test_edge3_per_family_halt.py``).
+TEST_FAMILY_ID = "pm_us_crh_test"
 
 
 @pytest.fixture
@@ -733,7 +738,9 @@ class TestDuplicateFillAndFamilyHalt:
         store_path: Path,
     ) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             assert latch.is_family_halted() is False
             latch.record_duplicate_fill(
                 STATION,
@@ -747,14 +754,17 @@ class TestDuplicateFillAndFamilyHalt:
             assert latch.is_family_halted() is True
         keys = _committed_keys(store_path)
         assert "continuous_rung_hold/duplicate_fill/ord-dup-1" in keys
-        assert FAMILY_HALT_KEY in keys
+        assert family_halt_key(TEST_FAMILY_ID) in keys
+        assert LEGACY_FAMILY_HALT_KEY not in keys
 
     def test_recording_the_same_duplicate_id_twice_writes_neither_bucket_twice(
         self,
         store_path: Path,
     ) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             latch.record_duplicate_fill(
                 STATION,
                 CLIMATE_DAY,
@@ -780,7 +790,9 @@ class TestDuplicateFillAndFamilyHalt:
 
     def test_family_halt_is_false_on_a_fresh_latch(self, store_path: Path) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             assert latch.is_family_halted() is False
 
 
@@ -901,20 +913,25 @@ class TestExitProvenanceAndAmbiguousHalt:
         self, store_path: Path,
     ) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             assert latch.is_family_halted() is False
             latch.record_ambiguous_exit(
                 position_id="P-1", reason="order_rejected:test", ts_ns=NOW_NS,
             )
             assert latch.is_family_halted() is True
         keys = _committed_keys(store_path)
-        assert FAMILY_HALT_KEY in keys
+        assert family_halt_key(TEST_FAMILY_ID) in keys
+        assert LEGACY_FAMILY_HALT_KEY not in keys
 
     def test_record_ambiguous_exit_is_idempotent_once_already_halted(
         self, store_path: Path,
     ) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             latch.record_duplicate_fill(
                 STATION,
                 CLIMATE_DAY,
@@ -932,7 +949,7 @@ class TestExitProvenanceAndAmbiguousHalt:
             assert latch.is_family_halted() is True
         with sqlite3.connect(store_path) as conn:
             row = conn.execute(
-                "SELECT value FROM state WHERE key = ?", (FAMILY_HALT_KEY,),
+                "SELECT value FROM state WHERE key = ?", (family_halt_key(TEST_FAMILY_ID),),
             ).fetchone()
         assert row is not None
         assert b"duplicate_fill" in row[0]
@@ -947,7 +964,9 @@ class TestExitProvenanceAndAmbiguousHalt:
         opened over the SAME on-disk store file, never re-derived from
         in-memory state."""
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             latch.record_ambiguous_exit(
                 position_id="P-restart", reason="order_denied:test", ts_ns=NOW_NS,
             )
@@ -955,7 +974,9 @@ class TestExitProvenanceAndAmbiguousHalt:
         # Simulates a process restart: a BRAND NEW SqliteStateStore instance
         # and a brand new intent latch, over the same file on disk.
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-            restarted = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            restarted = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id=TEST_FAMILY_ID,
+            )
             assert restarted.is_family_halted() is True
 
 

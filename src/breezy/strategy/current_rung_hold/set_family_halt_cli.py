@@ -3,7 +3,7 @@ ruling, ``docs/evidence/RULING_A1_pm_us_crh_v4_disposition_2026-09-21.md``).
 
 Mirrors ``clear_family_halt_cli.py``'s shape (``--reason``/``--evidence-path``,
 the same flock via ``open_submit_intent_latch``, the same ``resolve_store_path``)
-and writes exactly the ``FAMILY_HALT_KEY`` payload shape
+and writes exactly the per-family halt key payload shape
 ``TrialDayLatch.record_ambiguous_exit`` already writes, via
 ``TrialDayLatch.record_policy_halt``: no new state, no new veto, no new key.
 
@@ -119,9 +119,15 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLockNotHeld,
     open_submit_intent_latch,
 )
+from breezy.strategy.current_rung_hold.family_id_arg import (
+    FamilyIdArgError,
+    resolve_continuous_family_arg,
+)
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
+    decode_family_halt_state,
     open_trial_day_latch,
+    read_family_halt_rows_readonly,
 )
 
 logger = logging.getLogger(__name__)
@@ -356,6 +362,13 @@ def set_family_halt(
         action="store_true",
         help="read-only: report the halt state and store-path check; writes and sends nothing",
     )
+    parser.add_argument("--family-id", required=True, help="continuous-rung-hold family id")
+    parser.add_argument(
+        "--families-dir",
+        type=Path,
+        default=Path("deploy/families"),
+        help="directory containing registered family manifests",
+    )
     parser.add_argument(
         "--reason",
         type=_reason_type,
@@ -369,6 +382,11 @@ def set_family_halt(
     args = parser.parse_args(argv)
     if not args.status and (args.reason is None or args.evidence_path is None):
         parser.error("--reason and --evidence-path are required unless --status is given")
+    try:
+        resolve_continuous_family_arg(args.family_id, args.families_dir)
+    except FamilyIdArgError as exc:
+        print(f"breezy-set-family-halt: {exc}; refused", file=err)
+        return EXIT_REFUSED
 
     # P3(ii): hash the evidence FIRST -- before the store, the flock, or any
     # GET -- mirroring clear_family_halt_cli.py:94-104. An unreadable file
@@ -418,22 +436,35 @@ def set_family_halt(
         )
         return EXIT_REFUSED
 
+    if args.status:
+        try:
+            legacy_raw, family_raw = read_family_halt_rows_readonly(store_path, args.family_id)
+            reading = decode_family_halt_state(args.family_id, legacy_raw, family_raw)
+        except Exception as exc:  # noqa: BLE001 - any read-only status failure REFUSES
+            print(
+                f"breezy-set-family-halt: status unreadable ({type(exc).__name__}); refused",
+                file=err,
+            )
+            return EXIT_REFUSED
+        print(
+            "breezy-set-family-halt: "
+            f"store_path={path_check} family_id={args.family_id} halted={reading.halted} "
+            f"source={reading.source} legacy={reading.legacy}",
+            file=out,
+        )
+        return EXIT_OK
+
     store = SqliteStateStore(store_path)
     check: PositionCheckResult | None = None
     try:
         try:
             with open_submit_intent_latch(store, store_path) as intent_latch:
                 trial_latch = open_trial_day_latch(
-                    intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    intent_latch,
+                    key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    family_id=args.family_id,
                 )
                 halted = trial_latch.is_family_halted()
-
-                if args.status:
-                    print(
-                        f"breezy-set-family-halt: store_path={path_check} halted={halted}",
-                        file=out,
-                    )
-                    return EXIT_OK
 
                 if halted:
                     print("breezy-set-family-halt: already halted; nothing to do", file=out)
@@ -517,7 +548,10 @@ def set_family_halt(
             severity="WARN",
             event="family_halt_set",
             site="breezy-set-family-halt",
-            detail=f"reason={args.reason} evidence_sha256={evidence_sha256}",
+            detail=(
+                f"family_id={args.family_id} reason={args.reason} "
+                f"evidence_sha256={evidence_sha256}"
+            ),
         ),
     )
     if observed_sink.failed:

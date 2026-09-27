@@ -876,8 +876,13 @@ class ContinuousRungHoldStrategy(Strategy):
         """
         assert self._latch is not None
         now_ns = self.clock.timestamp_ns()
-        if self._latch.is_family_halted():
-            self.log.error("continuous_rung_hold: family halt is set; never arming")
+        halt_state = self._latch.family_halt_state()
+        if halt_state.halted:
+            self.log.error(
+                "continuous_rung_hold: family halt is set "
+                f"(family_id={self._latch.family_id} source={halt_state.source}); "
+                "never arming",
+            )
             self.position_events.record(_POSITION_FAMILY_HALT_AT_START)
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",

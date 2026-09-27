@@ -39,14 +39,47 @@ mkdir -p "$LOCK_DIR" 2>>"$LOG" || { say "SKIPPED-INFRA -- no studies lock direct
 exec 9>>"$LOCK"                || { say "SKIPPED-INFRA -- cannot open the studies lock"; exit 75; }
 flock -n 9                     || { say "SKIPPED -- another study holds the studies lock"; exit 0; }
 
+SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
+resolve_sending_family_id() {
+  local show id
+  if ! show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG"); then
+    say "SKIPPED-INFRA -- systemctl show failed, see $LOG"
+    return 2
+  fi
+  id=$(printf '%s\n' "$show" | sed -n 's/^Environment=//p' | tr ' ' '\n' | sed -n 's/^BREEZY_SENDING_FAMILY_ID=//p' | head -n1)
+  id=${id%\"}
+  id=${id#\"}
+  if [ -z "$id" ]; then
+    say "decision funnel digest: BREEZY_SENDING_FAMILY_ID absent; halt status will be unknown"
+    return 1
+  fi
+  case "$id" in
+    *[!A-Za-z0-9_-]*)
+      say "decision funnel digest: BREEZY_SENDING_FAMILY_ID is invalid; halt status will be unknown"
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$id"
+  return 0
+}
+
 # FU-6: supplied by the unit's own Environment= line (a non-secret path
 # literal, byte-identical to the sibling analysis units -- see the unit
 # file's own comment). Passed through explicitly as --store-path so the
 # digest's halt_enforced read never silently falls back to "unknown" for
 # want of this var.
 STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is required}"
+FAMILY_ID_ARG=()
+family_status=0
+family_id="$(resolve_sending_family_id)" || family_status=$?
+if [ "$family_status" -eq 2 ]; then
+  exit 75
+fi
+if [ "$family_status" -eq 0 ]; then
+  FAMILY_ID_ARG=(--family-id "$family_id")
+fi
 
-if "$PY" "$REPO/scripts/analysis/decision_funnel_daily_digest.py" --store-path "$STATE_DB"; then
+if "$PY" "$REPO/scripts/analysis/decision_funnel_daily_digest.py" --store-path "$STATE_DB" "${FAMILY_ID_ARG[@]}"; then
   say "decision funnel digest ok"
 else
   status=$?

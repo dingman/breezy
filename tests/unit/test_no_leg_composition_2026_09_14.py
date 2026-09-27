@@ -117,7 +117,9 @@ def _unused_latch_factory() -> Iterator[object]:
 
 def _real_continuous_latch_factory(store_path: Path) -> Iterator[object]:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        yield open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        yield open_trial_day_latch(
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+        )
 
 
 def test_resolve_station_instrument_ids_admits_only_the_yes_leg(tmp_path: Path) -> None:
