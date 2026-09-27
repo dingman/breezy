@@ -15,9 +15,11 @@ from breezy.analysis.instance_span_cache import (
     InstanceFileFingerprint,
     InstanceSpanCacheCorruptError,
     UnknownInstanceSpanCacheSchemaError,
+    append_instance_span_cache_entry,
     fingerprint_instance_files,
     lookup,
     read_instance_span_cache,
+    read_instance_span_cache_with_stats,
     write_instance_span_cache,
 )
 from breezy.analysis.replay_sufficiency import InstanceSpan
@@ -262,6 +264,44 @@ def test_read_refuses_a_top_level_key_with_the_wrong_type(tmp_path: Path) -> Non
     )
 
     with pytest.raises(InstanceSpanCacheCorruptError, match="algo_version"):
+        read_instance_span_cache(path)
+
+
+def test_append_repairs_torn_tail_and_reader_counts_it(tmp_path: Path) -> None:
+    path = tmp_path / "instance_spans.jsonl"
+    append_instance_span_cache_entry(path, ("instance-1", "fp-abc", 1, 1), _entry())
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"schema_version": 2, "instance_id"')
+
+    before_repair = read_instance_span_cache_with_stats(path)
+    assert before_repair.torn_lines == 1
+
+    append_instance_span_cache_entry(
+        path,
+        ("instance-2", "fp-def", 1, 1),
+        _entry(instance_id="instance-2"),
+    )
+    raw = path.read_text(encoding="utf-8")
+    assert raw.count("\n") == 2
+    assert '{"schema_version": 2, "instance_id"' not in raw
+    result = read_instance_span_cache_with_stats(path)
+    assert result.torn_lines == 0
+    assert ("instance-1", "fp-abc", 1, 1) in result.entries
+    assert ("instance-2", "fp-def", 1, 1) in result.entries
+
+
+def test_read_refuses_corrupt_middle_line_with_typed_error(tmp_path: Path) -> None:
+    path = tmp_path / "instance_spans.jsonl"
+    append_instance_span_cache_entry(path, ("instance-1", "fp-abc", 1, 1), _entry())
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"schema_version": 2, "instance_id"\n')
+    append_instance_span_cache_entry(
+        path,
+        ("instance-2", "fp-def", 1, 1),
+        _entry(instance_id="instance-2"),
+    )
+
+    with pytest.raises(InstanceSpanCacheCorruptError, match="malformed instance_spans cache JSON"):
         read_instance_span_cache(path)
 
 

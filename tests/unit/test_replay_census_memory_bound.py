@@ -1,4 +1,10 @@
-"""Memory-bound regression for the REPLAY-INCR warm-cache census path."""
+"""Instrumented warm-cache work bound for REPLAY-INCR.
+
+This replaces the old RSS delta check: synthetic fixtures are too small for
+`ru_maxrss` to prove anything reliably. The invariant that matters for the
+warm path is that cached CLEAN instances do not scan bytes and do not create
+converter objects as N grows.
+"""
 
 from __future__ import annotations
 
@@ -11,13 +17,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _warm_cache_delta_kib(instance_count: int, tmp_path: Path) -> int:
+def _warm_cache_work(instance_count: int, tmp_path: Path) -> dict[str, int]:
     code = r"""
 import json
-import resource
 import sys
-import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 repo = Path(sys.argv[1])
 instance_count = int(sys.argv[2])
@@ -34,16 +39,12 @@ from breezy.analysis.replay_sufficiency import InstanceSpan
 from breezy.persistence.feather_preflight import PREFLIGHT_CLASSIFIER_VERSION
 
 
-class _Window:
-    std_utc_offset_hours = -8.0
-
-
 class _Registry:
     def pairs(self):
         return (("polymarket_us", "SFO"),)
 
     def climate_day_window(self, _venue, _station):
-        return _Window()
+        return SimpleNamespace(std_utc_offset_hours=-8.0)
 
 
 catalog = root / "catalog"
@@ -52,7 +53,8 @@ for idx in range(instance_count):
     instance_id = f"instance-{idx:03d}"
     instance_dir = catalog / "live" / instance_id
     instance_dir.mkdir(parents=True)
-    (instance_dir / "binary_option_0.feather").write_bytes(f"payload-{idx}".encode())
+    payload = (f"payload-{idx}" * 128).encode()
+    (instance_dir / "binary_option_0.feather").write_bytes(payload)
     files = census._instance_file_fingerprints(instance_dir)
     fingerprint = census._instance_fingerprint(files)
     span = InstanceSpan(
@@ -63,7 +65,7 @@ for idx in range(instance_count):
         distinct_instruments=1,
     )
     entry = CachedInstanceSpans(
-        spans={("SFO", "2026-09-01"): span},
+        spans={(f"SFO", f"2026-09-{idx + 1:02d}"): span},
         station_offsets={"SFO": -8.0},
         last_full_scan="2026-09-27",
         files=files,
@@ -74,12 +76,29 @@ for idx in range(instance_count):
         entry,
     )
 
+work = {"scan_bytes": 0, "converter_objects": 0}
 census.default_registry = lambda: _Registry()
-census._read_station_candidates = lambda path: ()
-census.scan_instance = lambda *args, **kwargs: (_ for _ in ()).throw(
-    AssertionError("warm cache path must not scan")
+census.list_instance_ids = lambda _root, _subdir: tuple(
+    f"instance-{idx:03d}" for idx in range(instance_count)
 )
-baseline = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+census._read_station_candidates = lambda path: ()
+census._corrupt_instance_station_days = lambda quote_catalog, subdirectory, corrupt_ids: set()
+census._live_instance_registrations = lambda quote_catalog, subdirectory, live_ids: {}
+
+
+def _scan(root, instance_id, subdirectory):
+    path = root / subdirectory / instance_id / "binary_option_0.feather"
+    work["scan_bytes"] += path.stat().st_size
+    return instance_id
+
+
+def _convert(**kwargs):
+    work["converter_objects"] += 1
+    raise AssertionError("warm cache path must not convert")
+
+
+census.scan_instance = _scan
+census._discover_clean_spans = _convert
 census.run_census(
     catalog_root=catalog,
     subdirectory="live",
@@ -89,8 +108,7 @@ census.run_census(
     now_ns=1,
     instance_spans_cache_path=cache_path,
 )
-after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-print(json.dumps({"delta_kib": after - baseline}))
+print(json.dumps(work))
 """
     run_root = tmp_path / f"n{instance_count}"
     run_root.mkdir()
@@ -103,11 +121,12 @@ print(json.dumps({"delta_kib": after - baseline}))
         env=env,
         text=True,
     )
-    return int(json.loads(result.stdout.splitlines()[-1])["delta_kib"])
+    return json.loads(result.stdout.splitlines()[-1])
 
 
-def test_warm_cache_rss_is_flat_in_instance_count(tmp_path: Path) -> None:
-    small = _warm_cache_delta_kib(2, tmp_path)
-    large = _warm_cache_delta_kib(20, tmp_path)
+def test_warm_cache_work_is_independent_of_instance_count(tmp_path: Path) -> None:
+    small = _warm_cache_work(2, tmp_path)
+    large = _warm_cache_work(20, tmp_path)
 
-    assert large - small <= 15 * 1024
+    assert small == {"scan_bytes": 0, "converter_objects": 0}
+    assert large == {"scan_bytes": 0, "converter_objects": 0}

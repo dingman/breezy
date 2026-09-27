@@ -60,6 +60,7 @@ __all__ = [
     "fingerprint_instance_files",
     "lookup",
     "read_instance_span_cache",
+    "read_instance_span_cache_with_stats",
     "read_legacy_instance_span_cache",
     "staggered_last_full_scan",
     "write_instance_span_cache",
@@ -115,6 +116,12 @@ class CachedInstanceSpans:
     station_offsets: dict[str, float]
     last_full_scan: str
     files: tuple[InstanceFileFingerprint, ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceSpanCacheReadResult:
+    entries: dict[CacheKey, CachedInstanceSpans]
+    torn_lines: int = 0
 
 
 def fingerprint_instance_files(files: Iterable[InstanceFileFingerprint]) -> str:
@@ -286,9 +293,19 @@ def append_instance_span_cache_entry(path: Path, key: CacheKey, entry: CachedIns
     """Append one checkpoint line and fsync it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = _payload_for_entry(key, entry)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True))
-        handle.write("\n")
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    with path.open("ab+") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        if size:
+            handle.seek(size - 1)
+            if handle.read(1) != b"\n":
+                handle.seek(0)
+                previous_newline = handle.read().rfind(b"\n")
+                truncate_at = previous_newline + 1 if previous_newline >= 0 else 0
+                os.ftruncate(handle.fileno(), truncate_at)
+                handle.seek(0, os.SEEK_END)
+        handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -342,10 +359,11 @@ def _require_top_level_key(
     return value
 
 
-def _read_payloads(path: Path) -> list[tuple[int, Mapping[str, object]]]:
+def _read_payloads(path: Path) -> tuple[list[tuple[int, Mapping[str, object]]], int]:
     payloads: list[tuple[int, Mapping[str, object]]] = []
     if not path.exists():
-        return payloads
+        return payloads, 0
+    torn_lines = 0
     with path.open("r", encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
@@ -358,7 +376,10 @@ def _read_payloads(path: Path) -> list[tuple[int, Mapping[str, object]]]:
                 # torn final line; a malformed middle line means the cache is
                 # not trustworthy.
                 if raw_line.endswith("\n"):
-                    raise
+                    raise InstanceSpanCacheCorruptError(
+                        f"{path}:{line_number}: malformed instance_spans cache JSON"
+                    ) from None
+                torn_lines += 1
                 continue
             if not isinstance(payload, Mapping):
                 raise InstanceSpanCacheCorruptError(
@@ -366,16 +387,17 @@ def _read_payloads(path: Path) -> list[tuple[int, Mapping[str, object]]]:
                     f"object, got {type(payload).__name__}"
                 )
             payloads.append((line_number, payload))
-    return payloads
+    return payloads, torn_lines
 
 
-def read_instance_span_cache(path: Path) -> dict[CacheKey, CachedInstanceSpans]:
+def read_instance_span_cache_with_stats(path: Path) -> InstanceSpanCacheReadResult:
     """Absent file = empty cache. Refuses an unrecognised ``schema_version``,
     a non-object line, a missing top-level key, or a top-level key of the
     wrong type -- always :class:`InstanceSpanCacheCorruptError` naming the
     bad key, never a bare `KeyError`/`TypeError`/`AttributeError`."""
     typed: dict[CacheKey, CachedInstanceSpans] = {}
-    for line_number, payload in _read_payloads(path):
+    payloads, torn_lines = _read_payloads(path)
+    for line_number, payload in payloads:
         version = payload.get("schema_version")
         if version != INSTANCE_SPANS_SCHEMA_VERSION:
             raise UnknownInstanceSpanCacheSchemaError(
@@ -461,7 +483,11 @@ def read_instance_span_cache(path: Path) -> dict[CacheKey, CachedInstanceSpans]:
             last_full_scan=last_full_scan,  # type: ignore[arg-type]
             files=files,
         )
-    return typed
+    return InstanceSpanCacheReadResult(entries=typed, torn_lines=torn_lines)
+
+
+def read_instance_span_cache(path: Path) -> dict[CacheKey, CachedInstanceSpans]:
+    return read_instance_span_cache_with_stats(path).entries
 
 
 def read_legacy_instance_span_cache(
@@ -469,7 +495,8 @@ def read_legacy_instance_span_cache(
 ) -> dict[tuple[str, str, int], dict[tuple[str, str], InstanceSpan]]:
     """Read schema-v1 entries for one-time migration."""
     legacy: dict[tuple[str, str, int], dict[tuple[str, str], InstanceSpan]] = {}
-    for line_number, payload in _read_payloads(path):
+    payloads, _torn_lines = _read_payloads(path)
+    for line_number, payload in payloads:
         version = payload.get("schema_version")
         if version != 1:
             raise UnknownInstanceSpanCacheSchemaError(

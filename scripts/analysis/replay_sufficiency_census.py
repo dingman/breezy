@@ -93,7 +93,7 @@ from breezy.analysis.instance_span_cache import (
     append_instance_span_cache_entry,
     fingerprint_instance_files,
     legacy_fingerprint_instance_files,
-    read_instance_span_cache,
+    read_instance_span_cache_with_stats,
     read_legacy_instance_span_cache,
     staggered_last_full_scan,
     write_instance_span_cache,
@@ -156,15 +156,21 @@ _TERMINATE_REQUESTED = False
 
 @dataclass(slots=True)
 class _CacheStats:
-    cache_hit: int = 0
+    hit: int = 0
     probe_fail: int = 0
+    offset_miss: int = 0
     rescanned: int = 0
+    cold: int = 0
+
+    def total(self) -> int:
+        return self.hit + self.probe_fail + self.offset_miss + self.rescanned + self.cold
 
 
 @dataclass(slots=True)
 class _LoadedCache:
     entries: dict[CacheKey, CachedInstanceSpans]
     migrated: bool = False
+    torn_lines: int = 0
 
 
 def _request_termination(_signum: int, _frame: object) -> None:
@@ -529,7 +535,8 @@ def _load_span_cache(
     registry: object,
 ) -> _LoadedCache:
     if cache_path.exists():
-        return _LoadedCache(entries=dict(read_instance_span_cache(cache_path)))
+        loaded = read_instance_span_cache_with_stats(cache_path)
+        return _LoadedCache(entries=dict(loaded.entries), torn_lines=loaded.torn_lines)
 
     legacy_path = LEGACY_INSTANCE_SPANS_PATH
     if cache_path != DEFAULT_INSTANCE_SPANS_PATH:
@@ -562,6 +569,7 @@ def _load_span_cache(
                 files=files,
             )
         )
+    write_instance_span_cache(cache_path, migrated)
     return _LoadedCache(entries=migrated, migrated=True)
 
 
@@ -745,14 +753,18 @@ def run_census(
     span_cache: dict[CacheKey, CachedInstanceSpans] | None = None
     kept_cache_keys: set[CacheKey] = set()
     cache_stats = _CacheStats()
+    torn_cache_lines = 0
+    cache_enabled = instance_spans_cache_path is not None
     if instance_spans_cache_path is not None:
-        span_cache = _load_span_cache(
+        loaded_cache = _load_span_cache(
             cache_path=instance_spans_cache_path,
             catalog_root=catalog_root,
             subdirectory=subdirectory,
             today=computed_day,
             registry=registry,
-        ).entries
+        )
+        span_cache = loaded_cache.entries
+        torn_cache_lines = loaded_cache.torn_lines
 
     spans: dict[tuple[str, str], list[InstanceSpan]] = defaultdict(list)
     clean_station_days: set[tuple[str, str]] = set()
@@ -770,6 +782,9 @@ def run_census(
             PREFLIGHT_CLASSIFIER_VERSION,
         )
         cached_entry = span_cache.get(cache_key) if span_cache is not None else None
+        has_entry_for_instance = span_cache is not None and any(
+            key[0] == instance_id for key in span_cache
+        )
         if cached_entry is not None and _entry_offsets_still_match(cached_entry, registry=registry):
             if _entry_due_for_rescan(cached_entry, today=computed_day):
                 cache_stats.rescanned += 1
@@ -802,7 +817,7 @@ def run_census(
                     live_or_empty_ids.append(instance_id)
                 continue
 
-            cache_stats.cache_hit += 1
+            cache_stats.hit += 1
             kept_cache_keys.add(cache_key)
             _merge_cached_spans(
                 entry=cached_entry,
@@ -813,12 +828,14 @@ def run_census(
             )
             continue
 
-        if (
-            cached_entry is None
-            and span_cache is not None
-            and any(key[0] == instance_id for key in span_cache)
-        ):
+        if span_cache is None:
+            cache_stats.cold += 1
+        elif cached_entry is not None:
+            cache_stats.offset_miss += 1
+        elif has_entry_for_instance:
             cache_stats.probe_fail += 1
+        else:
+            cache_stats.cold += 1
 
         report = scan_instance(catalog_root, instance_id, subdirectory)
         verdict = classify_instance(report, now_ns=now_ns)
@@ -857,6 +874,12 @@ def run_census(
             # every (station, climate_day) the tape contains -- silently
             # dropping a LIVE-only day's identity was the completeness bug.
             live_or_empty_ids.append(instance_id)
+
+    if cache_stats.total() != len(instance_ids):
+        raise AssertionError(
+            "cache provenance counters are not exhaustive: "
+            f"instances={len(instance_ids)} accounted={cache_stats.total()}"
+        )
 
     if (
         instance_spans_cache_path is not None
@@ -972,8 +995,10 @@ def run_census(
     print(
         "census_provenance: "
         f"run={computed_day} instances={len(instance_ids)} "
-        f"cache_hit={cache_stats.cache_hit} probe_fail={cache_stats.probe_fail} "
-        f"rescanned={cache_stats.rescanned} epoch=staggered-v2"
+        f"cache={'on' if cache_enabled else 'off'} "
+        f"hit={cache_stats.hit} probe_fail={cache_stats.probe_fail} "
+        f"offset_miss={cache_stats.offset_miss} rescanned={cache_stats.rescanned} "
+        f"cold={cache_stats.cold} rescan_due={cache_stats.rescanned} torn={torn_cache_lines}"
     )
     return rows
 
