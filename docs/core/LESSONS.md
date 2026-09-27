@@ -1643,3 +1643,20 @@ Before designing an incremental or caching fix for a capped job that timed out, 
 - A SIGTERM cannot interrupt a long native call. Plan for SIGKILL (TimeoutStopSec) to be the real stop, and keep per-chunk work bounded.
 
 Related: L-29 (a cap is containment), L-49 (throttle signature), REPLAY-INCR / REPLAY-BIGINST plans.
+
+## L-54 — Shared test config is pinned by containment tests; any edit to it needs a search for its pins first (2026-09-27)
+
+### What happened
+- REPLAY-BIGINST appended `and not slow` to `[tool.pytest.ini_options] addopts`, so a new slow memory test would be deselected by default.
+- Two plan peer rounds and two implementation reviews approved the change. The focused test runs were green.
+- The full gate failed on `test_probe_containment.py::test_pyproject_addopts_deselect_the_probe_markers`. That test pins the exact `-m 'not live and not venue_live and not real_money'` substring, because it is the one guarantee that live and real-money tests never run by default.
+
+### The rule
+Before editing a shared config surface (`pyproject.toml` pytest or import-linter sections, the gate wrapper, `conftest.py`), search the tests for literal pins of the text being changed. A containment pin is changed only by a safety-reviewed item, never as a side effect of a feature.
+
+### How to apply
+- Briefs that touch `pyproject.toml` or `conftest.py` must say: "grep `tests/` for the exact string you are changing; if a test pins it, do not change it."
+- Opt a single test out by env-gated `skipif` or a marker the defaults already exclude. Never widen or reword the pinned default filter.
+- Focused runs cannot catch this. It surfaces only in the full gate, so run the full gate after every merge (L-43).
+
+Related: L-43 (full gate after every merge), REPLAY-BIGINST, fix 0cc87c2.
