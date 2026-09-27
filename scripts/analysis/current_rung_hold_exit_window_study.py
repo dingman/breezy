@@ -256,8 +256,9 @@ _RECONCILIATION_TOLERANCE: Final[Decimal] = Decimal(0)
 #: study runs at 15:20Z; AUD-04 (`breezy-portfolio-roi.timer`) runs at
 #: 17:40Z. Comparing today's cumulative sum_hold_pnl against YESTERDAY's
 #: AUD-04 total at zero tolerance produced spurious mismatches. A report
-#: older than this many days past the run date is stale and SKIPPED rather
-#: than compared.
+#: whose own `period_end` is older than this many days past the run date is
+#: stale and SKIPPED rather than compared. `settled_through` is deliberately
+#: older by construction and remains only the join cutoff.
 _MAX_AUD04_STALENESS_DAYS: Final[int] = 2
 #: Domain review item 3: this caveat must appear in the stderr line AND the
 #: alert detail text, not only in a docstring.
@@ -271,7 +272,11 @@ def _utc_date_from_ns(now_ns: int) -> str:
 
 
 def aud04_reconciliation_readiness(
-    *, settled_through: str, run_date: str, max_staleness_days: int = _MAX_AUD04_STALENESS_DAYS,
+    *,
+    period_end: str | None,
+    settled_through: str,
+    run_date: str,
+    max_staleness_days: int = _MAX_AUD04_STALENESS_DAYS,
 ) -> tuple[str | None, str | None]:
     """Decide whether AUD-04's report can be reconciled against today's run,
     and if so, the CUTOFF to restrict both sides to (domain review item 2).
@@ -279,26 +284,33 @@ def aud04_reconciliation_readiness(
     Returns ``(cutoff, skip_reason)`` -- exactly one is ``None``.
     ``settled_through`` (`PortfolioRoiReportView.settled_through`) is
     AUD-04's own climate-day bound past which its daily rows are provisional
-    (`apply_settled_through`'s docstring) -- the best available "as-of"
-    field the published schema carries; used here as the join cutoff for
-    BOTH sides, never assumed same-day. Skips (never compares mismatched
-    periods) when ``settled_through`` does not parse as an ISO-8601 date, or
-    when it is more than ``max_staleness_days`` before ``run_date``.
+    (`apply_settled_through`'s docstring); it is the join cutoff for BOTH
+    sides, never a freshness signal. Freshness comes from ``period_end`` (the
+    report's as-of day). Skips (never compares mismatched periods) when
+    ``settled_through`` does not parse as an ISO-8601 date, or when
+    ``period_end`` is missing, unparseable, or more than
+    ``max_staleness_days`` before ``run_date``.
     """
     try:
-        settled_through_date = dt.date.fromisoformat(settled_through)
+        dt.date.fromisoformat(settled_through)
     except ValueError:
         return None, (
             f"AUD-04 settled_through={settled_through!r} is not a usable ISO-8601 date"
         )
+    if period_end is None:
+        return None, "AUD-04 period_end is missing"
+    try:
+        period_end_date = dt.date.fromisoformat(period_end)
+    except ValueError:
+        return None, f"AUD-04 period_end={period_end!r} is not a usable ISO-8601 date"
     try:
         run_date_parsed = dt.date.fromisoformat(run_date)
     except ValueError:
         return None, f"run_date={run_date!r} is not a usable ISO-8601 date"
-    age_days = (run_date_parsed - settled_through_date).days
+    age_days = (run_date_parsed - period_end_date).days
     if age_days > max_staleness_days:
         return None, (
-            f"WARN: AUD-04 report is stale -- settled_through={settled_through} is "
+            f"WARN: AUD-04 report is stale -- period_end={period_end} is "
             f"{age_days} day(s) before run_date={run_date} (max {max_staleness_days})"
         )
     return settled_through, None
@@ -1317,7 +1329,8 @@ def main(
         else:
             run_date = _utc_date_from_ns(resolved_now_ns)
             cutoff, skip_reason = aud04_reconciliation_readiness(
-                settled_through=aud04_view.settled_through, run_date=run_date,
+                period_end=aud04_view.period_end, settled_through=aud04_view.settled_through,
+                run_date=run_date,
             )
             if skip_reason is not None:
                 print(

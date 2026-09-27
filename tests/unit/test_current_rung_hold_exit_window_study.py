@@ -1121,8 +1121,8 @@ class TestAud04V1FallsBackToTotalLevel:
 
         aud04_report = tmp_path / "PRIVATE_portfolio_roi_v2.json"
         _write_minimal_aud04_report(aud04_report, realised_pnl_after_fees_total=Decimal("0.61"))
-        # settled_through in this fixture is "2026-01-08"; run_date must be
-        # within the staleness bound for the reconciliation to actually run.
+        # period_end in this fixture is "2026-01-10"; run_date must be within
+        # the staleness bound for the reconciliation to actually run.
         now_ns = int(dt.datetime(2026, 1, 9, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
 
         calls: list[str] = []
@@ -1184,36 +1184,50 @@ class TestAud04V1FallsBackToTotalLevel:
 class TestAud04ReconciliationReadiness:
     """Domain review item 2: reconcile like with like -- restrict both sides
     to AUD-04's own `settled_through` cutoff; skip (never compare mismatched
-    periods) on an unusable or stale cutoff."""
+    periods) on an unusable cutoff or stale report period_end."""
 
-    def test_a_fresh_report_yields_the_settled_through_cutoff(self) -> None:
+    def test_a_fresh_report_with_an_old_settled_through_yields_the_settled_through_cutoff(
+        self,
+    ) -> None:
         cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
-            settled_through="2026-01-08", run_date="2026-01-09",
-        )
-        assert cutoff == "2026-01-08"
-        assert skip_reason is None
-
-    def test_a_report_exactly_at_the_staleness_bound_is_not_skipped(self) -> None:
-        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
-            settled_through="2026-01-01", run_date="2026-01-03",
+            period_end="2026-01-08", settled_through="2026-01-01", run_date="2026-01-09",
         )
         assert cutoff == "2026-01-01"
         assert skip_reason is None
 
-    def test_a_report_older_than_two_days_is_skipped_with_a_warn_line_naming_its_age(
+    def test_a_report_exactly_at_the_staleness_bound_is_not_skipped(self) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            period_end="2026-01-01", settled_through="2025-12-25", run_date="2026-01-03",
+        )
+        assert cutoff == "2025-12-25"
+        assert skip_reason is None
+
+    def test_a_period_end_older_than_two_days_is_skipped_with_a_warn_line_naming_its_age(
         self,
     ) -> None:
         cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
-            settled_through="2026-01-01", run_date="2026-01-05",
+            period_end="2026-01-06", settled_through="2025-12-29", run_date="2026-01-09",
         )
         assert cutoff is None
         assert skip_reason is not None
         assert "WARN" in skip_reason
-        assert "4 day(s)" in skip_reason
+        assert "period_end=2026-01-06" in skip_reason
+        assert "3 day(s)" in skip_reason
+
+    @pytest.mark.parametrize("period_end", [None, "not-a-date"])
+    def test_a_missing_or_unparseable_period_end_is_skipped_with_a_stated_reason(
+        self, period_end: str | None,
+    ) -> None:
+        cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
+            period_end=period_end, settled_through="2026-01-01", run_date="2026-01-02",
+        )
+        assert cutoff is None
+        assert skip_reason is not None
+        assert "period_end" in skip_reason
 
     def test_an_unparseable_settled_through_is_skipped_with_a_stated_reason(self) -> None:
         cutoff, skip_reason = study_mod.aud04_reconciliation_readiness(
-            settled_through="not-a-date", run_date="2026-01-05",
+            period_end="2026-01-04", settled_through="not-a-date", run_date="2026-01-05",
         )
         assert cutoff is None
         assert skip_reason is not None
