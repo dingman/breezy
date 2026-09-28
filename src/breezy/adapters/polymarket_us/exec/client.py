@@ -1128,6 +1128,16 @@ class AmbiguousResolverContext:
     #: -- the same token an unparseable body itself renders, since neither
     #: case tells the resolver anything about create-time fill evidence.
     create_fill_evidence: str = submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
+    #: FAILURE-KIND-DURABLE (2026-09-28): the last resolver failure kind
+    #: classified for this intent, mirrored durably here so a restart does
+    #: not lose it -- ``_resolver_last_failure_kind`` (this client's own
+    #: field, seeded from this value on the first pass after a restart) is
+    #: process-local memory only and dies with the process. Same AR-N6
+    #: trailing-optional shape as the fields above: an OLD blob (written
+    #: before this change) has no ``lastFailureKind`` key at all, and
+    #: absence decodes to ``"none"`` -- exactly what an untouched intent's
+    #: kind always was.
+    last_failure_kind: str = "none"
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -1144,6 +1154,7 @@ class AmbiguousResolverContext:
                 "fillParseError": self.fill_parse_error,
                 "orderSide": self.order_side,
                 "createFillEvidence": self.create_fill_evidence,
+                "lastFailureKind": self.last_failure_kind,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -1183,6 +1194,12 @@ class AmbiguousResolverContext:
             if raw_create_fill_evidence is None
             else str(raw_create_fill_evidence)
         )
+        # FAILURE-KIND-DURABLE: same trailing-optional shape -- an old blob
+        # has no `lastFailureKind` key at all (written before this change),
+        # so absence decodes to `"none"`, exactly what an untouched intent's
+        # kind always was.
+        raw_last_failure_kind = payload.get("lastFailureKind")
+        last_failure_kind = "none" if raw_last_failure_kind is None else str(raw_last_failure_kind)
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -1201,6 +1218,7 @@ class AmbiguousResolverContext:
                 fill_parse_error=fill_parse_error,
                 order_side=order_side,
                 create_fill_evidence=create_fill_evidence,
+                last_failure_kind=last_failure_kind,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -2536,6 +2554,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"foreign intent_id {context.intent_id}; refusing to act on it"
                 )
                 continue
+            # FAILURE-KIND-DURABLE (2026-09-28): seed this process's
+            # in-memory failure-kind map from the durable context the FIRST
+            # time this intent is seen -- a restart's `_resolver_last_
+            # failure_kind` starts empty (process-local memory), so without
+            # this the first stale CRITICAL after a restart would always
+            # read the dict-membership default `"none"`, discarding
+            # whatever an earlier process already classified. Plain `in`/
+            # `!=`/subscript/assignment only: no new callee
+            # (E0-NOSEND-RESOLVER). A `"none"` durable kind seeds nothing --
+            # identical to never having seeded at all.
+            if (
+                context.intent_id not in self._resolver_last_failure_kind
+                and context.last_failure_kind != "none"
+            ):
+                self._resolver_last_failure_kind[context.intent_id] = context.last_failure_kind
             # Item 3 (2026-09-11 incident addendum), inlined for the same
             # E0-NOSEND-RESOLVER reason as the backoff above: a one-shot
             # health-surface entry (`stale_ambiguous_intent_alerts`) the
@@ -2645,7 +2678,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 # the GET path below uses -- every pass this intent fails to
                 # progress on, for whatever reason, slows the next attempt.
                 self._resolver_consecutive_failures += 1
-                self._resolver_last_failure_kind[context.intent_id] = "instrument_unavailable"
+                self._set_resolver_last_failure_kind(context, "instrument_unavailable")
                 if context.instrument_id not in self._resolver_missing_instrument_logged:
                     self._resolver_missing_instrument_logged = (
                         self._resolver_missing_instrument_logged | {context.instrument_id}
@@ -2671,7 +2704,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
             except Exception as exc:  # noqa: BLE001 - GET failure stays AMBIGUOUS
                 self._resolver_consecutive_failures += 1
-                self._resolver_last_failure_kind[context.intent_id] = "get_exception"
+                self._set_resolver_last_failure_kind(context, "get_exception")
                 self._log.warning(
                     f"resolver GET failed for venue order {context.venue_order_id} "
                     f"({type(exc).__name__}: {exc}); stays AMBIGUOUS "
@@ -2710,7 +2743,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
             except Exception as exc:  # noqa: BLE001 - malformed stays AMBIGUOUS
                 self._resolver_consecutive_failures += 1
-                self._resolver_last_failure_kind[context.intent_id] = "mapping_error"
+                self._set_resolver_last_failure_kind(context, "mapping_error")
                 self._log.warning(
                     f"resolver GET body for venue order {context.venue_order_id} "
                     f"did not map ({type(exc).__name__}: {exc}); stays AMBIGUOUS "
@@ -2735,7 +2768,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 or self._resolver_last_failure_kind[context.intent_id]
                 != "activities_uninterpretable"
             ):
-                self._resolver_last_failure_kind[context.intent_id] = "none"
+                self._set_resolver_last_failure_kind(context, "none")
 
             if report.order_status is OrderStatus.PARTIALLY_FILLED:
                 # A LIVE state: the order can still receive more fills or
@@ -2825,18 +2858,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 if join is not None and join.uninterpretable_rows:
                     # TRADE-ROW-DRIFT r2 T-1: diagnosable, delivered via the
                     # SAME `open_intent_stale` CRITICAL every other failure
-                    # kind above already reaches -- a plain dict assignment,
-                    # never a new callee (E0-NOSEND-RESOLVER).
-                    self._resolver_last_failure_kind[context.intent_id] = (
-                        "activities_uninterpretable"
-                    )
+                    # kind above already reaches -- `self._set_resolver_last_
+                    # failure_kind` is the E0-NOSEND-RESOLVER-allowlisted,
+                    # durable-mirroring sibling of the plain dict assignment
+                    # this used to be (FAILURE-KIND-DURABLE, 2026-09-28).
+                    self._set_resolver_last_failure_kind(context, "activities_uninterpretable")
                 elif join is not None and not join.uninterpretable_rows:
                     # FAILURE-KIND-PERSIST (r2/r3, ARCH B1): a CLEAN join
                     # (whether or not it is COMPLETE -- :2809 below decides
                     # that separately) clears a stale
                     # `activities_uninterpretable` kind the guarded reset
                     # above deliberately left alone.
-                    self._resolver_last_failure_kind[context.intent_id] = "none"
+                    self._set_resolver_last_failure_kind(context, "none")
             trade_found = join is not None and join.trade_count >= 1
             evidence_blocks_zero_fill = (
                 context.create_fill_evidence in _CREATE_FILL_EVIDENCE_BLOCKS_ZERO_FILL
@@ -5244,6 +5277,52 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         self._ambiguous_bookings[intent_id] = booking
+
+    def _set_resolver_last_failure_kind(
+        self,
+        context: AmbiguousResolverContext,
+        kind: str,
+    ) -> None:
+        """FAILURE-KIND-DURABLE (2026-09-28): update the in-memory failure-
+        kind map AND rewrite the durable resolver context's
+        ``lastFailureKind`` so a restart does not lose it -- ``self.
+        _resolver_last_failure_kind`` alone is process-local memory (see its
+        field comment in ``__init__``) and the seed at the top of
+        ``_resolve_ambiguous_intents`` is a restart's only other source.
+
+        Plan r2 delta, helper discipline (L-48):
+
+        * Writes to the store ONLY when ``kind`` actually CHANGES from what
+          this process already has recorded in memory for ``context.
+          intent_id`` -- the guarded reset a successful GET runs on EVERY
+          pass would otherwise turn every clean poll into a durable write.
+        * Synchronous, never ``await``s -- E0-NOSEND-RESOLVER allowlisted,
+          exactly like :meth:`record_venue_order_id` above: one key, to the
+          already-open local store, no path, no payload, no socket.
+        * Wrapped in a broad ``except`` that logs and NEVER re-raises: every
+          call site here sits OUTSIDE the narrow per-operation ``try``
+          blocks the resolver pass otherwise uses, so an unguarded store
+          failure would propagate out of ``_resolve_ambiguous_intents``
+          itself and kill the resolver task for the process lifetime -- the
+          exact crash L-48 exists to close. A failed durable write leaves
+          the intent exactly as resolvable as it was before this call: still
+          AMBIGUOUS, still polled next pass.
+        """
+        changed = self._resolver_last_failure_kind.get(context.intent_id) != kind
+        self._resolver_last_failure_kind[context.intent_id] = kind
+        if not changed:
+            return
+        try:
+            rewritten = dataclasses.replace(context, last_failure_kind=kind)
+            self._store_set(
+                f"{RESOLVER_CONTEXT_KEY_PREFIX}{context.intent_id}", rewritten.to_bytes(),
+            )
+        except Exception as exc:  # noqa: BLE001 - L-48: never raise into the resolver
+            self._log.warning(
+                f"resolver: could not durably record last_failure_kind={kind!r} for "
+                f"intent {context.intent_id} ({type(exc).__name__}: {exc}); staying "
+                "in-memory only for this process"
+            )
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         """Authorize, arm, POST, retire. Deny before any venue contact."""
