@@ -218,9 +218,18 @@ def _drop_already_landed(
 #: ``InstrumentStatus``, keep passing without edits. ``DepthTruncation``
 #: joined the metadata-keyed Rust types (``QuoteTick``, ``TradeTick``,
 #: ``OrderBookDepth10``) because it is a per-instrument-directory pyarrow-path
-#: custom type with the SAME layout (ING-2-AMEND2: 839 per-instrument
-#: subdirectories, 0 depth-1 files, 100% unfiltered EXTEND dispatch before
-#: this fix).
+#: custom type with the SAME layout (ING-2-AMEND2: the 09-28 09:45Z incident
+#: measured 839 per-instrument subdirectories, 0 flat files, 100% unfiltered
+#: EXTEND dispatch). A FLAT file for it is still possible -- an isolated
+#: native conversion of a single instance (``default_convert`` ->
+#: ``_convert_stream_natively``, ``quote_tape_ingest_cli.py:847-881``) writes
+#: ``DepthTruncation`` FLAT regardless of instrument count, because its
+#: identifier is always ``None`` to native (no schema metadata, and the
+#: recorder's ``live/<instance>/`` layout never matches native's own
+#: per-file path fallback, ``parquet.py:2768-2785``). Once that happens the
+#: guard below keeps every subsequent EXTEND correct (never a duplicate) but
+#: permanently unfiltered for this type -- :func:`_ExtendDedupeCounters.record_flat_root`
+#: is what makes that fallback visible instead of silent (ING-2-AMEND2 review).
 _ID_FILTERABLE_TYPES = frozenset({QuoteTick, TradeTick, OrderBookDepth10, DepthTruncation})
 
 
@@ -239,6 +248,9 @@ class _ExtendDedupeCounters:
         self.unfiltered = 0
         #: ``class_to_filename`` name -> [filtered_count, unfiltered_count].
         self.by_type: dict[str, list[int]] = {}
+        #: ``class_to_filename`` names for which the flat-root fallback
+        #: (ING-2-AMEND2 review) forced the unfiltered path THIS run.
+        self.flat_root_types: set[str] = set()
 
     def record(self, data_cls: type, *, filtered: bool) -> None:
         self.chunks += 1
@@ -249,17 +261,44 @@ class _ExtendDedupeCounters:
         counts = self.by_type.setdefault(class_to_filename(data_cls), [0, 0])
         counts[0 if filtered else 1] += 1
 
+    def record_flat_root(self, data_cls: type, flat_file_count: int) -> None:
+        """Make the flat-root fallback visible for ``data_cls``, once per run.
+
+        ING-2-AMEND2 review: the 09-28 incident was exactly this fallback --
+        correct (no duplicates) but permanently unfiltered for the type and,
+        until now, invisible. Logs a WARNING the FIRST time this type hits
+        the fallback in a run (never once per chunk -- a busy run would
+        otherwise flood the log with an identical line) and always records
+        the type so :meth:`summary_line` surfaces it too. Counts and a type
+        name only -- never an instrument id or a value.
+        """
+        name = class_to_filename(data_cls)
+        if name in self.flat_root_types:
+            return
+        self.flat_root_types.add(name)
+        logger.warning(
+            "EXTEND dedupe: %s's type root holds %d flat file(s); the "
+            "identifier-filtered query is skipped for every %s chunk this "
+            "run (ING-2-AMEND2) -- correct, but slower than the filtered "
+            "path; see docs/plans backlog ING-2-AMEND2 for the removal path",
+            name,
+            flat_file_count,
+            name,
+        )
+
     def reset(self) -> None:
         self.chunks = 0
         self.filtered = 0
         self.unfiltered = 0
         self.by_type.clear()
+        self.flat_root_types.clear()
 
     def summary_line(self) -> str:
         by_type = ",".join(f"{name}:{f}/{u}" for name, (f, u) in sorted(self.by_type.items()))
+        flat_root = ",".join(sorted(self.flat_root_types)) if self.flat_root_types else "none"
         return (
             f"extend_dedupe: chunks={self.chunks} filtered={self.filtered} "
-            f"unfiltered={self.unfiltered} by_type={by_type}"
+            f"unfiltered={self.unfiltered} by_type={by_type} flat_root={flat_root}"
         )
 
 
@@ -268,17 +307,25 @@ class _ExtendDedupeCounters:
 extend_dedupe_counters = _ExtendDedupeCounters()
 
 
-def _type_root_has_flat_files(write_target: ParquetDataCatalog, data_cls: type) -> bool:
-    """True when ``data_cls``'s type root already holds a depth-1 (FLAT) file.
+def _flat_root_file_count(write_target: ParquetDataCatalog, data_cls: type) -> int:
+    """The number of depth-1 (FLAT) files at ``data_cls``'s type root.
 
     The type-dir name comes from ``ParquetDataCatalog._make_path`` (native's
     own ``class_to_filename``-derived mapping, e.g. ``order_book_depths`` for
-    ``OrderBookDepth10`` -- never hard-coded). A non-empty result means a
+    ``OrderBookDepth10`` -- never hard-coded). A non-zero result means a
     ``convert_stream_to_data`` FLAT write landed here (``TestTheMixedCatalogLayoutIsPinned``),
     which an identifier-filtered query would silently omit.
     """
     type_root = write_target._make_path(data_cls=data_cls, identifier=None)
-    return bool(_parquet_set(write_target, type_root))
+    return len(_parquet_set(write_target, type_root))
+
+
+def _type_root_has_flat_files(write_target: ParquetDataCatalog, data_cls: type) -> bool:
+    """True when ``data_cls``'s type root already holds a depth-1 (FLAT) file.
+
+    See :func:`_flat_root_file_count`; this is just its truthiness.
+    """
+    return bool(_flat_root_file_count(write_target, data_cls))
 
 
 def _drop_already_landed_unfiltered(
@@ -300,17 +347,26 @@ def _drop_already_landed_unfiltered(
     unfiltered, byte-identical to before. A read error (``ArrowInvalid``,
     ``FileNotFoundError``, etc.) is never caught here: turning it into an
     empty existing-set would mean silent duplicates.
+
+    ING-2-AMEND2 review: a FLAT file for an :data:`_ID_FILTERABLE_TYPES`
+    member can arrive from an ordinary, isolated native conversion (see
+    :data:`_ID_FILTERABLE_TYPES`'s own docstring), not only from a mixed
+    catalog layout. When that forces this call onto the unfiltered path,
+    :meth:`_ExtendDedupeCounters.record_flat_root` makes it visible (a
+    once-per-run WARNING plus the summary line's ``flat_root=`` field)
+    instead of silently slow forever, which is what the 09-28 incident was.
     """
     if not objects:
         return []
     lo = min(obj.ts_init for obj in objects)
     hi = max(obj.ts_init for obj in objects)
     identifiers = sorted({key[0] for obj in objects if (key := _object_key(obj))[0] is not None})
-    use_filtered = (
-        data_cls in _ID_FILTERABLE_TYPES
-        and bool(identifiers)
-        and not _type_root_has_flat_files(write_target, data_cls)
-    )
+    has_flat_root = _type_root_has_flat_files(write_target, data_cls)
+    use_filtered = data_cls in _ID_FILTERABLE_TYPES and bool(identifiers) and not has_flat_root
+    if data_cls in _ID_FILTERABLE_TYPES and bool(identifiers) and has_flat_root:
+        extend_dedupe_counters.record_flat_root(
+            data_cls, _flat_root_file_count(write_target, data_cls)
+        )
     if use_filtered:
         existing = write_target.query(data_cls=data_cls, identifiers=identifiers, start=lo, end=hi)
     else:

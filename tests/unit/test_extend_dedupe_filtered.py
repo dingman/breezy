@@ -28,6 +28,7 @@ opened (``TestTheMixedCatalogLayoutIsPinned``).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -188,48 +189,34 @@ def test_boundary_ts_init_is_inclusive_both_ends(tmp_path: Path, data_cls: type)
 # ---------------------------------------------------------------------------
 
 
-_OTHER_FLAT = InstrumentId.from_str("OTHFLAT/USD.SIM")
-
-
 def _write_flat_file_without_instrument_id_metadata(
     catalog: ParquetDataCatalog, instance_id: str, data_cls: type, ts: int
 ) -> None:
-    """Land a row at ``ts`` (for :data:`_A`) as a genuine FLAT file at
+    """Land a single row at ``ts`` (for :data:`_A`) as a genuine FLAT file at
     ``data_cls``'s type root, via the real native writer
     (``convert_stream_to_data``).
 
     For ``QuoteTick``/``OrderBookDepth10``, this strips the ``instrument_id``
     schema-metadata key -- the one condition that makes native's own
-    converter place the result FLAT instead of per-instrument. ``DepthTruncation``
-    carries no schema metadata at all (confirmed empirically, ING-2-AMEND2:
-    ``ArrowSerializer.serialize_batch`` returns a bare ``pa.Table`` with
-    ``schema.metadata is None`` for it -- its wrangler keys off the ordinary
-    ``instrument_id`` COLUMN, not footer metadata), so metadata-stripping
-    cannot produce a FLAT file for it. A FLAT write is instead produced the
-    way native itself produces one for this type: two DIFFERENT instruments'
-    rows (``_A`` at ``ts``, :data:`_OTHER_FLAT` at the same ``ts``) in the
-    SAME feather stream, which ``convert_stream_to_data`` cannot key to a
-    single per-instrument directory and writes to the type root instead
-    (empirically confirmed: still a genuine ``_type_root_has_flat_files``
-    hit, and an identifier-filtered query for ``_A`` alone excludes it, same
-    as the metadata-stripped case). This file must NEVER be read back
-    through an *unfiltered* ``query()`` in this test file -- see the module
-    docstring for why that aborts the whole process for the Rust-native types.
+    converter place the result FLAT instead of per-instrument.
+    ``DepthTruncation`` needs no such trick: its identifier is ALWAYS
+    ``None`` to native regardless of instrument count (confirmed
+    empirically, ING-2-AMEND2 code review -- this is the exact 09-28
+    incident condition, not a test-only construction), so an ordinary
+    single-instrument, single-row conversion already lands FLAT. This file
+    must NEVER be read back through an *unfiltered* ``query()`` in this test
+    file -- see the module docstring for why that aborts the whole process
+    for the Rust-native types.
     """
     if data_cls is DepthTruncation:
-        objects = [_BUILDERS[data_cls](_A, ts), _BUILDERS[data_cls](_OTHER_FLAT, ts)]
+        obj = _BUILDERS[data_cls](_A, ts)
+        piece = ArrowSerializer.serialize_batch([obj], data_cls=data_cls)
         instance_dir = Path(catalog.path) / "live" / instance_id
         instance_dir.mkdir(parents=True, exist_ok=True)
         feather_path = instance_dir / f"{class_to_filename(data_cls)}_0.feather"
-        first = ArrowSerializer.serialize_batch([objects[0]], data_cls=data_cls)
         with feather_path.open("wb") as handle:
-            writer = pa.ipc.new_stream(handle, first.schema)
-            for obj in objects:
-                piece = ArrowSerializer.serialize_batch([obj], data_cls=data_cls)
-                table = (
-                    pa.Table.from_batches([piece]) if isinstance(piece, pa.RecordBatch) else piece
-                )
-                writer.write_table(table)
+            writer = pa.ipc.new_stream(handle, piece.schema)
+            writer.write_table(piece)
             writer.close()
         catalog.convert_stream_to_data(instance_id, data_cls, subdirectory="live")
         return
@@ -308,6 +295,74 @@ def test_forcing_the_filtered_path_over_a_flat_file_leaks_the_row(
         "already-landed row back in as fresh -- proving the guard, not "
         "luck, is what keeps it out normally"
     )
+
+
+# ---------------------------------------------------------------------------
+# T-FLAT-VISIBILITY (ING-2-AMEND2 code review): the flat-root fallback above
+# is correct (no duplicates) but was invisible -- exactly the 09-28 incident
+# shape. A WARNING fires once per run per type, and the stdout summary
+# line's ``flat_root=`` field names every type the fallback hit this run.
+# ---------------------------------------------------------------------------
+
+_SALVAGE_LOGGER = "breezy.runtime.quote_tape_salvage"
+
+
+def test_flat_root_fallback_logs_a_warning_and_the_summary_line_names_the_type(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED on today's code: neither the WARNING nor the ``flat_root=`` field
+    exists yet."""
+    quote_tape_salvage.extend_dedupe_counters.reset()
+    catalog = ParquetDataCatalog(str(tmp_path))
+    _write_flat_file_without_instrument_id_metadata(catalog, "instance-flat", DepthTruncation, 305)
+    assert _type_root_has_flat_files(catalog, DepthTruncation)
+
+    chunk = [_depth_truncation(_A, 305)]
+    with caplog.at_level(logging.WARNING, logger=_SALVAGE_LOGGER):
+        _drop_already_landed_unfiltered(catalog, DepthTruncation, list(chunk))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one WARNING, got {len(warnings)}: {warnings}"
+    assert "custom_depth_truncation" in warnings[0].getMessage()
+    assert "1 flat file" in warnings[0].getMessage(), (
+        f"expected the flat file count in the warning, got: {warnings[0].getMessage()!r}"
+    )
+
+    line = quote_tape_salvage.extend_dedupe_counters.summary_line()
+    assert "flat_root=custom_depth_truncation" in line, line
+
+
+def test_flat_root_fallback_warns_once_per_run_not_once_per_chunk(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two chunks in the SAME run hitting the SAME type's flat root must log
+    only ONE warning -- a busy run must never flood the log with duplicates
+    of the identical line."""
+    quote_tape_salvage.extend_dedupe_counters.reset()
+    catalog = ParquetDataCatalog(str(tmp_path))
+    _write_flat_file_without_instrument_id_metadata(catalog, "instance-flat", DepthTruncation, 305)
+
+    chunk = [_depth_truncation(_A, 305)]
+    with caplog.at_level(logging.WARNING, logger=_SALVAGE_LOGGER):
+        _drop_already_landed_unfiltered(catalog, DepthTruncation, list(chunk))
+        _drop_already_landed_unfiltered(catalog, DepthTruncation, list(chunk))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, (
+        f"expected exactly one WARNING across two chunks in the same run, got {len(warnings)}"
+    )
+
+
+def test_flat_root_field_is_none_when_no_type_hit_the_fallback(tmp_path: Path) -> None:
+    quote_tape_salvage.extend_dedupe_counters.reset()
+    catalog = ParquetDataCatalog(str(tmp_path))
+    catalog.write_data([_depth_truncation(_A, ts) for ts in range(200, 205)])
+
+    chunk = [_depth_truncation(_A, ts) for ts in range(200, 205)]
+    _drop_already_landed_unfiltered(catalog, DepthTruncation, list(chunk))
+
+    line = quote_tape_salvage.extend_dedupe_counters.summary_line()
+    assert "flat_root=none" in line, line
 
 
 # ---------------------------------------------------------------------------

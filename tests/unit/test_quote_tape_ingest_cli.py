@@ -640,7 +640,7 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
 
         assert code == EXIT_OK
         assert self._extend_dedupe_lines(out) == [
-            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
+            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type= flat_root=none"
         ]
 
     def test_a_second_run_does_not_inherit_a_prior_runs_counts(
@@ -660,7 +660,7 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
 
         assert code == EXIT_OK
         assert self._extend_dedupe_lines(out) == [
-            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
+            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type= flat_root=none"
         ]
 
     def test_the_line_is_counts_only_and_never_carries_an_instrument_id(
@@ -700,16 +700,19 @@ class TestByTypeShowsDepthTruncationAfterARealExtend:
         self, tmp_path: Path
     ) -> None:
         """The already-landed rows are seeded with ``write_data`` (per-instrument
-        directories), never native ``convert_stream_to_data`` -- confirmed
-        empirically (ING-2-AMEND2) that native's own conversion writes
-        ``DepthTruncation`` FLAT even for a single instrument, which would
-        force the unfiltered path via the (correctly working) flat-file
-        guard and defeat this test's purpose. This mirrors how production
-        actually populates the type: every real instance's overlapping
-        window trips the ING-1 non-disjoint refusal immediately, so the type
-        root is landed exclusively through EXTEND's own ``write_data`` calls
-        -- consistent with the 09-28 09:45Z evidence of 839 per-instrument
-        subdirectories and 0 flat files.
+        directories), never native ``convert_stream_to_data``: confirmed
+        empirically (ING-2-AMEND2 code review) that an ISOLATED native
+        conversion writes ``DepthTruncation`` FLAT even for a single
+        instrument -- ``DepthTruncation``'s identifier is always ``None`` to
+        native, regardless of instrument count (no schema metadata, and the
+        recorder's ``live/<instance>/`` layout never matches native's own
+        per-file path fallback). That is a real condition production can
+        hit, not just a test artifact; it is guarded (never a duplicate,
+        `test_extend_dedupe_filtered.py`'s T-FLAT-GUARD section) and now
+        logged (`test_flat_root_fallback_logs_a_warning_and_the_summary_line_names_the_type`).
+        Seeding via ``write_data`` here simply keeps THIS test's fixture
+        free of that fallback, so it isolates the ``by_type`` claim instead
+        of re-proving the flat-root guard.
         """
         target_id = InstrumentId.from_str("EUR/USD.POLYUS")
         other_id = InstrumentId.from_str("OTHEXT/USD.SIM")
@@ -778,7 +781,7 @@ class TestRealConsoleEntrypointDelivery:
         lines = [
             line for line in result.stdout.splitlines() if line.startswith("extend_dedupe:")
         ]
-        assert lines == ["extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="]
+        assert lines == ["extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type= flat_root=none"]
 
 
 class TestReEmittedInstrumentDefinitionsStillLand:
