@@ -986,6 +986,82 @@ class TestAud04PerTrialReconciliation:
         assert set(result.divergent_trial_ids) == {"dup-on-aud04-side", "dup-on-exit-side"}
 
 
+class TestFeeReconciledExitRowsForAud04Reconciliation:
+    """RECON-MIA-0913: AUD-04 (FU-3d) deliberately keeps a fee-unverified
+    fill OUT of `trial_rows` as a `fee_unverified` residual
+    (`portfolio_roi_report.py`). An exit-side row for that same trial has
+    nothing to join against on the AUD-04 side and reads as a false-positive
+    `n_exit_only` mismatch unless the exit-side input to the per-trial
+    reconciliation is first restricted to fee-reconciled trials -- exactly
+    what produced `matched=False n_exit_only=1` for
+    `continuous_rung_hold/trial/MIA/2026-09-13`."""
+
+    def test_a_fee_unverified_exit_row_is_excluded_and_the_count_is_reported(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="fee-reconciled-trial", first_threatened_ts_ns=None,
+                first_dead_ts_ns=None, last_executable_ts_ns=_ns_at(14, 20),
+                hold_pnl_value=Decimal("0.50"), r_dead_pnl=Decimal("0.50"),
+                r_threat_pnl=Decimal("0.50"), r_best_pnl=Decimal("0.50"),
+                climate_day="2026-01-05",
+            ),
+            _synthetic_row(
+                trial_id="fee-unverified-trial", first_threatened_ts_ns=None,
+                first_dead_ts_ns=None, last_executable_ts_ns=_ns_at(14, 20),
+                hold_pnl_value=Decimal("0.30"), r_dead_pnl=Decimal("0.30"),
+                r_threat_pnl=Decimal("0.30"), r_best_pnl=Decimal("0.30"),
+                climate_day="2026-01-05",
+            ),
+        )
+        aud04_trial_rows = (
+            _trial_row(
+                trial_id="fee-reconciled-trial", climate_day="2026-01-05", pnl=Decimal("0.50"),
+            ),
+        )
+        fee_reconciled_by_trial_id = {
+            "fee-reconciled-trial": True,
+            "fee-unverified-trial": False,
+        }
+
+        # Today: the exit-side input is unfiltered, so the fee-unverified
+        # trial's row has no AUD-04 counterpart and is a false-positive
+        # n_exit_only=1 mismatch.
+        unfiltered = study_mod.reconcile_with_aud04_per_trial(
+            rows=rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+        assert unfiltered.matched is False
+        assert unfiltered.n_exit_only == 1
+        assert unfiltered.exit_only_trial_ids == ("fee-unverified-trial",)
+
+        filtered_rows, n_fee_unverified_excluded = study_mod._fee_reconciled_exit_rows(
+            rows, fee_reconciled_by_trial_id,
+        )
+        assert n_fee_unverified_excluded == 1
+        assert [row.position.trial_id for row in filtered_rows] == ["fee-reconciled-trial"]
+
+        result = study_mod.reconcile_with_aud04_per_trial(
+            rows=filtered_rows, cutoff="2026-01-10", aud04_trial_rows=aud04_trial_rows,
+        )
+        assert result.matched is True
+        assert result.n_exit_only == 0
+
+    def test_a_trial_id_absent_from_the_mapping_is_excluded_fail_closed(self) -> None:
+        rows = (
+            _synthetic_row(
+                trial_id="unknown-fee-status", first_threatened_ts_ns=None,
+                first_dead_ts_ns=None, last_executable_ts_ns=_ns_at(14, 20),
+                hold_pnl_value=Decimal("0.50"), r_dead_pnl=Decimal("0.50"),
+                r_threat_pnl=Decimal("0.50"), r_best_pnl=Decimal("0.50"),
+                climate_day="2026-01-05",
+            ),
+        )
+
+        filtered_rows, n_fee_unverified_excluded = study_mod._fee_reconciled_exit_rows(rows, {})
+
+        assert filtered_rows == ()
+        assert n_fee_unverified_excluded == 1
+
+
 class TestAud04PerTrialReconciliationLadder:
     def test_a_persistent_per_trial_mismatch_names_divergent_trial_ids_without_the_caveat(
         self,
@@ -1685,6 +1761,77 @@ def test_one_station_429_is_missing_and_the_cached_station_still_produces_rows(
     assert study_mod.main(
         _study_argv(tmp_path, cache_dir=cache_dir), sleep=lambda seconds: None,
     ) == 0
+
+
+def test_the_fee_reconciled_output_param_is_populated_across_every_station(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RECON-MIA-0913: `run_exit_window_study` pools `fee_reconciled` from
+    every city's `read_filled_trials_state_db` call into the caller-supplied
+    dict -- never into the study's own rows/P&L output. `None` (unset)
+    stays a no-op, matching every OTHER `run_exit_window_study` call site in
+    this file that never passes it."""
+    cache_dir = tmp_path / "asos"
+    _seed_cached_asos(cache_dir, _CACHED_CITY)
+    _install_offline_study_fakes(monkeypatch, _StatusClient(429))
+
+    def _trials(
+        state_db: Path,
+        *,
+        family_prefix: str,
+        city: str,
+        cli_location: str,
+        since_climate_day: str,
+        stations: Sequence[str],
+    ) -> tuple[
+        tuple[FilledTrial, ...], tuple[object, ...],
+        dict[str, tuple[bool, str, bool]], dict[str, object],
+    ]:
+        del state_db, family_prefix, cli_location, since_climate_day, stations
+        trial = _synthetic_trial(city)
+        return (trial,), (), {trial.trial_id: (city == _CACHED_CITY, "order-1", False)}, {}
+
+    monkeypatch.setattr(study_mod, "read_filled_trials_state_db", _trials)
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+
+    fee_reconciled_by_trial_id: dict[str, bool] = {}
+    rows, _missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_FAILED_CITY, _CACHED_CITY),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=lambda seconds: None,
+        fee_reconciled_by_trial_id=fee_reconciled_by_trial_id,
+    )
+
+    cached_trial_id = _synthetic_trial(_CACHED_CITY).trial_id
+    failed_trial_id = _synthetic_trial(_FAILED_CITY).trial_id
+    assert fee_reconciled_by_trial_id[cached_trial_id] is True
+    assert fee_reconciled_by_trial_id[failed_trial_id] is False
+    # Never leaked into the rows/P&L output this run actually produces.
+    assert not any(hasattr(row, "fee_reconciled") for row in rows)
+
+    # Unset (the default None): a plain no-op, unchanged from every other
+    # call site in this module.
+    rows_again, _missing_again = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(_CACHED_CITY,),
+        since_climate_day=_FETCH_CLIMATE_DAY,
+        catalog_root=catalog,
+        scored_trials_dir=tmp_path / "scored",
+        asos_cache_dir=cache_dir,
+        obs_source="fetch",
+        depth_source="catalog",
+        live_catalog_root=tmp_path / "live",
+        sleep=lambda seconds: None,
+    )
+    assert [row.position.station for row in rows_again] == [_CACHED_CITY]
 
 
 def test_a_transport_error_on_one_station_is_missing_and_the_cached_station_continues(

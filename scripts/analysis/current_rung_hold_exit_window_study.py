@@ -471,6 +471,33 @@ def reconcile_with_aud04_per_trial(
     )
 
 
+def _fee_reconciled_exit_rows(
+    rows: Sequence[PositionExitRow],
+    fee_reconciled_by_trial_id: Mapping[str, bool],
+) -> tuple[tuple[PositionExitRow, ...], int]:
+    """RECON-MIA-0913: restrict the exit-side input to
+    :func:`reconcile_with_aud04_per_trial` to trials whose fee is reconciled.
+
+    AUD-04 (``portfolio_roi_report.py``, FU-3d) deliberately keeps a
+    fee-unverified fill OUT of its per-trial ``trial_rows`` as a
+    ``fee_unverified`` residual. An exit-side row for that same trial has
+    nothing to join against on the AUD-04 side and, left unfiltered, reads
+    as a false-positive ``n_exit_only`` mismatch (this is exactly what
+    produced ``matched=False n_exit_only=1`` for
+    ``continuous_rung_hold/trial/MIA/2026-09-13``). A ``trial_id`` absent
+    from the mapping is excluded too -- fail-closed, since its absence is no
+    evidence its fee is reconciled.
+
+    Never changes the study's own rows or P&L output -- only the copy
+    handed to the AUD-04 reconciliation. Returns ``(filtered_rows,
+    n_excluded)``.
+    """
+    filtered = tuple(
+        row for row in rows if fee_reconciled_by_trial_id.get(row.position.trial_id, False)
+    )
+    return filtered, len(rows) - len(filtered)
+
+
 def apply_pnl_reconciliation_ladder_per_trial(
     *, result: Aud04PerTrialReconciliationResult, latch: alert_ladder.LatchState, now_ns: int,
 ) -> tuple[alert_ladder.LatchState, AlertPayload | None]:
@@ -961,6 +988,7 @@ def run_exit_window_study(
     live_catalog_root: Path = _DEFAULT_LIVE_CATALOG_ROOT,
     sleep: Callable[[float], None] = time.sleep,
     retry_wait_budget_s: float = _TOTAL_RETRY_WAIT_BUDGET_S,
+    fee_reconciled_by_trial_id: dict[str, bool] | None = None,
 ) -> tuple[tuple[PositionExitRow, ...], tuple[str, ...]]:
     """Build one exit-window row per filled position across ``stations``.
 
@@ -975,7 +1003,18 @@ def run_exit_window_study(
     that into a non-zero exit after writing the report). ``sleep`` and
     ``retry_wait_budget_s`` are test seams (default to the real
     ``time.sleep`` and ``_TOTAL_RETRY_WAIT_BUDGET_S``).
+
+    RECON-MIA-0913: when a caller passes a ``fee_reconciled_by_trial_id``
+    dict, it is populated (mutated) in place with every admitted trial's
+    fee-reconciled status pooled across every city's
+    `read_filled_trials_state_db` call -- an output parameter rather than a
+    third return value so every existing two-value ``rows, missing =
+    run_exit_window_study(...)`` call site stays unchanged. Never consulted
+    by this function's own rows/P&L output; ``None`` (the default) opts out.
     """
+    _fee_reconciled_out: dict[str, bool] = (
+        {} if fee_reconciled_by_trial_id is None else fee_reconciled_by_trial_id
+    )
     config = CurrentRungHoldConfig(stations=tuple(stations))
     fee_coefficient = config.required_fee_coefficient
     stale_observation_bound_ns = config.stale_observation_minutes * 60_000_000_000
@@ -1028,10 +1067,12 @@ def run_exit_window_study(
                 missing.append(f"{city}: no registered site spec")
                 continue
             cli_location = registry.settlement_site(_VENUE, city).cli_location
-            trials, exclusions, _fee_reconciled, _no_side_residual = read_filled_trials_state_db(
+            trials, exclusions, fee_reconciled, _no_side_residual = read_filled_trials_state_db(
                 state_db, family_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, city=city,
                 cli_location=cli_location, since_climate_day=since_climate_day, stations=stations,
             )
+            for trial_id, (reconciled, _venue_order_id, _skip_ask_guard) in fee_reconciled.items():
+                _fee_reconciled_out[trial_id] = reconciled
             for exclusion in exclusions:
                 key = (exclusion.venue_order_id, exclusion.reason)
                 if key in seen_exclusions:
@@ -1234,6 +1275,11 @@ def main(
     resolved_sleep = time.sleep if sleep is None else sleep
 
     total_fetch_outage = False
+    #: RECON-MIA-0913: populated (mutated in place) by `run_exit_window_study`
+    #: regardless of whether it returns normally or raises
+    #: `_TotalAsosFetchOutage` -- consulted only by the AUD-04 per-trial
+    #: reconciliation below, never by this run's own rows/P&L output.
+    fee_reconciled_by_trial_id: dict[str, bool] = {}
     try:
         rows, missing = run_exit_window_study(
             state_db=args.state_db, stations=tuple(args.stations),
@@ -1241,6 +1287,7 @@ def main(
             scored_trials_dir=args.scored_trials_dir, asos_cache_dir=args.asos_cache_dir,
             obs_source=args.obs_source, depth_source=args.depth_source,
             live_catalog_root=args.live_catalog_root, sleep=resolved_sleep,
+            fee_reconciled_by_trial_id=fee_reconciled_by_trial_id,
         )
     except _TotalAsosFetchOutage as exc:
         rows, missing = exc.rows, exc.missing
@@ -1347,8 +1394,18 @@ def main(
                     # (§6 "standing P&L reconciliation with AUD-04", the
                     # per-row upgrade -- catches an equal-and-opposite
                     # per-trial error pair a total alone would miss).
+                    # RECON-MIA-0913: the exit side is restricted to
+                    # fee-reconciled trials FIRST -- AUD-04 (FU-3d) keeps a
+                    # fee-unverified fill out of `trial_rows` as a residual,
+                    # so an unfiltered exit-side row for that same trial is a
+                    # false-positive `n_exit_only` mismatch, never a genuine
+                    # divergence.
+                    fee_reconciled_rows, n_fee_unverified_excluded = _fee_reconciled_exit_rows(
+                        rows, fee_reconciled_by_trial_id,
+                    )
                     per_trial_result = reconcile_with_aud04_per_trial(
-                        rows=rows, cutoff=cutoff, aud04_trial_rows=aud04_view.trial_rows,
+                        rows=fee_reconciled_rows, cutoff=cutoff,
+                        aud04_trial_rows=aud04_view.trial_rows,
                     )
                     cap = _MAX_NAMED_DIVERGENT_TRIAL_IDS
                     print(
@@ -1359,6 +1416,7 @@ def main(
                         f"n_aud04_only={per_trial_result.n_aud04_only} "
                         f"n_duplicate_exit={per_trial_result.n_duplicate_exit} "
                         f"n_duplicate_aud04={per_trial_result.n_duplicate_aud04} "
+                        f"n_fee_unverified_excluded={n_fee_unverified_excluded} "
                         f"divergent_trial_ids={list(per_trial_result.divergent_trial_ids)} "
                         f"exit_only_trial_ids="
                         f"{list(per_trial_result.exit_only_trial_ids[:cap])} "
