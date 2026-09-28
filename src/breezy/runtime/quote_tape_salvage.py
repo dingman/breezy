@@ -68,6 +68,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.funcs import class_to_filename
 
+from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.persistence.feather_preflight import FeatherFileReport, salvage_feather_file
 
 logger = logging.getLogger(__name__)
@@ -209,13 +210,18 @@ def _drop_already_landed(
     return [obj for obj in objects if _object_key(obj) not in known]
 
 
-#: The metadata-keyed Rust types (ING-2-RSS). For these, and ONLY these, a
-#: guarded identifier-filtered query is attempted first -- every other type
-#: (InstrumentStatus, custom types, definitions such as ``BinaryOption``)
+#: The identifier-keyed types (ING-2-RSS, widened ING-2-AMEND2). For these,
+#: and ONLY these, a guarded identifier-filtered query is attempted first --
+#: every other type (InstrumentStatus, definitions such as ``BinaryOption``)
 #: keeps the unconditional unfiltered query unchanged, so T4 and the tie-run
 #: spy tests (``bounded_read.py:582-612``, ``:784-797``), which use
-#: ``InstrumentStatus``, keep passing without edits.
-_TICK_TYPES = frozenset({QuoteTick, TradeTick, OrderBookDepth10})
+#: ``InstrumentStatus``, keep passing without edits. ``DepthTruncation``
+#: joined the metadata-keyed Rust types (``QuoteTick``, ``TradeTick``,
+#: ``OrderBookDepth10``) because it is a per-instrument-directory pyarrow-path
+#: custom type with the SAME layout (ING-2-AMEND2: 839 per-instrument
+#: subdirectories, 0 depth-1 files, 100% unfiltered EXTEND dispatch before
+#: this fix).
+_ID_FILTERABLE_TYPES = frozenset({QuoteTick, TradeTick, OrderBookDepth10, DepthTruncation})
 
 
 class _ExtendDedupeCounters:
@@ -284,13 +290,13 @@ def _drop_already_landed_unfiltered(
     files (``parquet.py:2249``; ``TestTheMixedCatalogLayoutIsPinned``). The
     ING-1 partial slice is exactly that layout, so EXTEND must see it.
 
-    ING-2-RSS: for the metadata-keyed tick types (:data:`_TICK_TYPES`), an
-    unfiltered query deserialises every OTHER instrument's landed rows in
+    ING-2-RSS: for the identifier-keyed types (:data:`_ID_FILTERABLE_TYPES`),
+    an unfiltered query deserialises every OTHER instrument's landed rows in
     the chunk's time window too, which is what drove EXTEND's memory and
     wall time up (root cause). When this data class's type root holds no
     FLAT file, an identifier-filtered query is exactly equivalent (nothing
     is omitted) and reads only this chunk's own instruments. When a FLAT
-    file IS present -- or for every non-tick type -- the query stays
+    file IS present -- or for every other type -- the query stays
     unfiltered, byte-identical to before. A read error (``ArrowInvalid``,
     ``FileNotFoundError``, etc.) is never caught here: turning it into an
     empty existing-set would mean silent duplicates.
@@ -301,7 +307,7 @@ def _drop_already_landed_unfiltered(
     hi = max(obj.ts_init for obj in objects)
     identifiers = sorted({key[0] for obj in objects if (key := _object_key(obj))[0] is not None})
     use_filtered = (
-        data_cls in _TICK_TYPES
+        data_cls in _ID_FILTERABLE_TYPES
         and bool(identifiers)
         and not _type_root_has_flat_files(write_target, data_cls)
     )

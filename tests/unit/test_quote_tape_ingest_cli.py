@@ -52,6 +52,7 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.runtime.quote_tape_ingest_cli import (
     CONVERTED,
@@ -63,6 +64,7 @@ from breezy.runtime.quote_tape_ingest_cli import (
     EXIT_USAGE,
     FILE_MARKER_PREFIX,
     MARKER_PREFIX,
+    _extend_overlapping_stream,
     default_convert,
     ingest_instance,
     run,
@@ -684,6 +686,63 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
         assert INSTANCE not in lines[0]
 
 
+class TestByTypeShowsDepthTruncationAfterARealExtend:
+    """ING-2-AMEND2 plan r1 test 4: a real EXTEND over ``DepthTruncation``
+    rows, sharing a window with another instrument's already-landed rows,
+    must dispatch through the filtered path and show up in the summary
+    line's ``by_type`` as ``custom_depth_truncation:<n>/0`` -- RED on
+    today's code, which dispatches this type unfiltered
+    (``custom_depth_truncation:0/<n>``, matching the 09-28 09:45Z production
+    evidence cited by the plan).
+    """
+
+    def test_by_type_shows_the_filtered_count_after_a_real_extend_run(
+        self, tmp_path: Path
+    ) -> None:
+        """The already-landed rows are seeded with ``write_data`` (per-instrument
+        directories), never native ``convert_stream_to_data`` -- confirmed
+        empirically (ING-2-AMEND2) that native's own conversion writes
+        ``DepthTruncation`` FLAT even for a single instrument, which would
+        force the unfiltered path via the (correctly working) flat-file
+        guard and defeat this test's purpose. This mirrors how production
+        actually populates the type: every real instance's overlapping
+        window trips the ING-1 non-disjoint refusal immediately, so the type
+        root is landed exclusively through EXTEND's own ``write_data`` calls
+        -- consistent with the 09-28 09:45Z evidence of 839 per-instrument
+        subdirectories and 0 flat files.
+        """
+        target_id = InstrumentId.from_str("EUR/USD.POLYUS")
+        other_id = InstrumentId.from_str("OTHEXT/USD.SIM")
+        base_ts = 1_000_000_000
+        catalog = ParquetDataCatalog(str(tmp_path))
+
+        # Already landed: the target instrument's first 5 rows, plus an
+        # OTHER instrument's rows sharing the SAME window the target
+        # instance's EXTEND chunk below will occupy.
+        catalog.write_data([_depth_truncation(target_id, base_ts + i) for i in range(5)])
+        catalog.write_data([_depth_truncation(other_id, base_ts + i) for i in range(5)])
+
+        instance_dir = tmp_path / "live" / INSTANCE
+        path = instance_dir / "custom_depth_truncation_0.feather"
+        # The instance's feather stream has grown past what was already
+        # landed -- the ING-1 non-disjoint shape EXTEND exists to handle.
+        _write_typed_ipc_stream(
+            path,
+            [_depth_truncation(target_id, base_ts + i) for i in range(20)],
+            DepthTruncation,
+            close=True,
+        )
+
+        ingest_cli_module.extend_dedupe_counters.reset()
+        outcome = _extend_overlapping_stream(catalog, INSTANCE, DepthTruncation, "live")
+
+        assert outcome == CONVERTED
+        line = ingest_cli_module.extend_dedupe_counters.summary_line()
+        assert "custom_depth_truncation:1/0" in line, (
+            f"expected a single filtered chunk for custom_depth_truncation, got: {line!r}"
+        )
+
+
 class TestRealConsoleEntrypointDelivery:
     """ING-2-RSS review finding 3 / L-52: the caplog-based tests above prove
     the LINE is produced, never that it is DELIVERED -- caplog captures log
@@ -1206,6 +1265,17 @@ def _mark_price(index: int) -> MarkPriceUpdate:
         value=Price.from_str("1.00000"),
         ts_event=1_000_000_000 + index,
         ts_init=1_000_000_000 + index,
+    )
+
+
+def _depth_truncation(instrument_id: InstrumentId, ts: int) -> DepthTruncation:
+    return DepthTruncation(
+        instrument_id=instrument_id,
+        bid_levels_seen=12,
+        ask_levels_seen=14,
+        levels_dropped=2,
+        ts_event=ts,
+        ts_init=ts,
     )
 
 
