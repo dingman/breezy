@@ -1046,6 +1046,32 @@ def _run_subprocess_with_rss(
     return result, rusage.ru_maxrss * 1024
 
 
+def _default_batch_run_subprocess(
+    argv: Sequence[str], *, timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`run_batch`'s own default `run_subprocess` (coordinator review
+    follow-up on commit 0868fbb, CRITICAL): `_run_one` always passes
+    `timeout=` to the driver call once `driver_timeout_s` is not `None` --
+    true for every `run_batch` call, since it always computes a real
+    numeric budget -- so the default `run_subprocess` a real (fake-free)
+    `run_batch` invocation uses MUST itself accept `timeout=`.
+    `_default_run_subprocess` (single-arg, `run_once`'s own default) does
+    not and must stay that way: `run_once`'s byte-identity (item 7) is
+    pinned against it unchanged.
+
+    Adapts `_run_subprocess_with_rss` -- the ONLY per-child-accurate RSS
+    measurement (item 4) -- to the plain `SubprocessRunner` shape
+    (`Callable[[Sequence[str]], CompletedProcess]`-compatible, `timeout`
+    optional) `_run_one` calls, by stashing the measured
+    `peak_rss_bytes` as an attribute on the returned `CompletedProcess`
+    (`_run_one` already reads exactly this via `getattr(driver_result,
+    "peak_rss_bytes", None)`) -- so a real batch run wires the RSS fix
+    into production, not just a test fake that sets the same attribute."""
+    result, peak_rss_bytes = _run_subprocess_with_rss(argv, timeout=timeout)
+    result.peak_rss_bytes = peak_rss_bytes  # type: ignore[attr-defined]
+    return result
+
+
 def _default_work_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix="breezy-replay-daily-"))
 
@@ -1634,7 +1660,7 @@ def run_batch(
     max_targets: int = 1,
     budget_s: float,
     reserve_s: float = DEFAULT_REPLAY_BATCH_RESERVE_S,
-    run_subprocess: SubprocessRunner = _default_run_subprocess,
+    run_subprocess: SubprocessRunner = _default_batch_run_subprocess,
     sink: AlertSink | None = None,
     now_ts: Callable[[], str] = _now_ts,
     work_dir_factory: Callable[[], Path] = _default_work_dir,
