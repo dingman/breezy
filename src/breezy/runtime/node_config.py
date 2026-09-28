@@ -8,10 +8,12 @@ Three roles, three functions, deliberately not one parameterised function:
 * :func:`build_quote_tape_node_config` -- the venue quote-tape recorder.
   One read-only data client, native streaming persistence, zero Actors,
   zero exec clients. It cannot start without venue configuration.
-* :func:`build_trade_node_config` -- the trading process (EXEC SPINE R-2).
-  One read-only data client, no streaming, and -- in THIS increment -- still
-  zero exec clients, zero strategies and zero exec algorithms: it is a
-  process shell that can start, run and stop, and cannot submit an order.
+* :func:`build_trade_node_config` -- the trading process (EXEC SPINE R-2;
+  the execution client itself was wired in at EXEC SPINE W). One read-only
+  data client, no streaming, and one execution client -- constructed and
+  reachable -- but still zero strategies and zero exec algorithms: nothing
+  on this process calls ``submit_order``, so it remains a process shell
+  that can start, run, stop and reconcile, and cannot ORIGINATE an order.
   It additionally refuses to start without a trading identity of its own.
 
 Collapsing them would make venue configuration a hard startup requirement of
