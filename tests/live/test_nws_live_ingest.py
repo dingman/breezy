@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -80,10 +81,23 @@ pytestmark = pytest.mark.live
 VENUE = "polymarket_us"
 CITY = "NYC"
 
-#: A real, identifiable contact -- NWS's own API etiquette guidance asks for
-#: one, and an unidentified/default UA is the documented route into a 403
-#: UA-trap block.
-LIVE_USER_AGENT = "breezy-live-test/0.1 (+mailto:jon@gopoint.com)"
+def _live_user_agent() -> str:
+    """Return the operator's monitored contact UA, or SKIP the test.
+
+    NWS's own API etiquette guidance asks for a real, identifiable contact --
+    an unidentified/default UA is the documented route into a 403 UA-trap
+    block -- but that contact is an operator value, never a literal committed
+    to source control. ``BREEZY_USER_AGENT`` is the one variable every other
+    live probe in this repo already reads for the same purpose (see
+    ``breezy.ingest.http.USER_AGENT_ENV_VAR``,
+    ``tests/live/test_open_meteo_previous_runs_probe_live.py``,
+    ``tests/live/test_iem_afos_forecast_pil_probe_live.py``); this module
+    reuses it rather than inventing a second one.
+    """
+    user_agent = os.environ.get("BREEZY_USER_AGENT")
+    if not user_agent:
+        pytest.skip("BREEZY_USER_AGENT must name a monitored contact for a live probe")
+    return user_agent
 
 
 def _local_probe(path: Path) -> FilesystemProbe:
@@ -154,7 +168,7 @@ async def test_fetch_discovery_list_and_newest_product_parse_cleanly_for_nyc() -
         allowed_hosts=DEFAULT_ALLOWED_HOSTS,
         clock=time.time_ns,
         base_url=DEFAULT_BASE_URL,
-        user_agent=LIVE_USER_AGENT,
+        user_agent=_live_user_agent(),
     )
 
     discovery = await transport.fetch_discovery_list(site.cli_location)
@@ -226,7 +240,8 @@ def test_full_e2e_poll_persists_a_climate_day_and_a_raw_product(
     Calling the Actor's own `poll_once()` -- the exact coroutine the timer
     callback submits -- drives one real cycle directly and deterministically.
     """
-    monkeypatch.setenv("BREEZY_USER_AGENT", LIVE_USER_AGENT)
+    user_agent = _live_user_agent()
+    monkeypatch.setenv("BREEZY_USER_AGENT", user_agent)
 
     registry = default_registry()
     site = registry.settlement_site(VENUE, CITY)
@@ -253,7 +268,7 @@ def test_full_e2e_poll_persists_a_climate_day_and_a_raw_product(
             allowed_hosts=DEFAULT_ALLOWED_HOSTS,
             clock=time.time_ns,
             base_url=DEFAULT_BASE_URL,
-            user_agent=LIVE_USER_AGENT,
+            user_agent=user_agent,
         )
         result = await transport.fetch_discovery_list(site.cli_location)
         assert result.text is not None
