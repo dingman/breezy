@@ -229,6 +229,30 @@ logger = logging.getLogger(__name__)
 #: enum"), so the wiring owning the condition also owns its name.
 LEDGER_UNAVAILABLE: Final[str] = "ledger_unavailable"
 
+#: `AlertCondition.key.kind`/`event` for "this site's CLI parses have left a
+#: non-settlement-bearing field (tmin/tavg) unreadable for
+#: :data:`CHRONIC_UNREADABLE_PRODUCT_STREAK` CONSECUTIVE parses" -- CF-5b.
+#:
+#: CF-5's own per-occurrence signal (the `logger.warning` loop in
+#: `_prepare_product`) is correct as the immediate, always-fires-per-poll
+#: log line: a field warning must never hard-block the site, so it cannot
+#: route through the gate the way a genuine parse failure does. But nothing
+#: previously tracked the condition CHRONICALLY, so a field left unreadable
+#: for days produced an unbroken stream of identical WARNING lines and never
+#: reached the operator-facing `AlertState` every other standing condition
+#: here goes through. Declared here, alongside `LEDGER_UNAVAILABLE`, for the
+#: same reason that constant is: the condition is raised only from this
+#: module's own parse path, and `health.py` knows nothing of it.
+CHRONIC_UNREADABLE_PRODUCT: Final[str] = "chronic_unreadable_product"
+
+#: A site with an unreadable field on this many CONSECUTIVE CLI parses raises
+#: the deduped `CHRONIC_UNREADABLE_PRODUCT` alert. Same reasoning as
+#: `SITE_BLOCKED_ALERT_INTERVALS`: patience before paging, without a second
+#: knob to keep in sync with the poll cadence -- though this one counts
+#: consecutive PARSES (one per fetched product), not poll intervals, since a
+#: parse only happens when a product was actually fetched.
+CHRONIC_UNREADABLE_PRODUCT_STREAK: Final[int] = 4
+
 #: Character ceiling for the scrubbed ledger-failure detail. Deliberately
 #: tighter than `health.MAX_ALERT_DETAIL_CHARS` (200): that constant bounds
 #: over-collection into a webhook, this one bounds how much attacker- or
@@ -550,6 +574,12 @@ class NwsIngestActor(Actor):
         #: `LEDGER_UNAVAILABLE`, so a swallowed ledger failure is loud.
         self._ledger_failure_detail: str | None = None
         self._blocked_since_ns: int | None = None
+        #: CF-5b: consecutive CLI parses (this process, in-memory only, same
+        #: cold-start stance as `AlertState` itself) that left a
+        #: non-settlement-bearing field unreadable. Read by
+        #: `_alert_conditions` to raise `CHRONIC_UNREADABLE_PRODUCT`. See
+        #: `_record_field_read_outcome`.
+        self._unreadable_field_streak: int = 0
         self._process_started_at_ns = shared.clock()
 
     # -- read-only accessors -------------------------------------------
@@ -1228,6 +1258,10 @@ class NwsIngestActor(Actor):
                 warning.field,
                 warning.token,
             )
+        # CF-5b: the per-occurrence WARNING above never dedupes and never
+        # reaches an operator -- track the CONSECUTIVE-parse streak so a
+        # chronic run raises exactly one alert through `AlertState` instead.
+        self._record_field_read_outcome(unreadable=bool(parsed.field_warnings))
 
         logger.info(
             "%s/%s prepared %s product %s for climate day %s (correction_evidence=%s)",
@@ -1241,6 +1275,24 @@ class NwsIngestActor(Actor):
         return _PreparedProduct(
             fetch=result, envelope=envelope, header=header, parsed=parsed
         )
+
+    def _record_field_read_outcome(self, *, unreadable: bool) -> None:
+        """CF-5b: update the consecutive-unreadable-parse streak.
+
+        In-memory only, matching `_blocked_since_ns`'s own cold-start stance
+        (and `AlertState`'s: see its class docstring) -- this is deliberately
+        NOT persisted, so a process restart starts the streak fresh rather
+        than replaying a stale count against a possibly-already-recovered
+        field. A single clean parse clears it: a site that recovers must
+        re-arm for the NEXT genuine chronic run rather than staying at a
+        stuck non-zero count that never again crosses the threshold from
+        zero (which would silently disable the alert for the rest of the
+        process's life).
+        """
+        if unreadable:
+            self._unreadable_field_streak += 1
+        else:
+            self._unreadable_field_streak = 0
 
     def _parse_envelope(self, result: FetchResult) -> ProductEnvelope:
         text = result.text
@@ -2008,6 +2060,22 @@ class NwsIngestActor(Actor):
                 detail=(
                     "gap ledger reconciliation failed; open_gaps in this snapshot is "
                     f"NOT authoritative ({self._ledger_failure_detail})"
+                ),
+            ),
+            # CF-5b: WARN, not CRITICAL -- this never hard-blocks the site
+            # (CF-5's own ruling), it only means a non-settlement-bearing
+            # field has been unreadable for a while. Passed on EVERY cycle,
+            # inactive included, for the same false->true re-arming reason as
+            # `LEDGER_UNAVAILABLE` above.
+            health.AlertCondition(
+                key=health.AlertConditionKey(kind=CHRONIC_UNREADABLE_PRODUCT, site=site_label),
+                active=self._unreadable_field_streak >= CHRONIC_UNREADABLE_PRODUCT_STREAK,
+                severity="WARN",
+                event=CHRONIC_UNREADABLE_PRODUCT,
+                detail=(
+                    f"{self._unreadable_field_streak} consecutive CLI parse(s) left a "
+                    "non-settlement-bearing field unreadable; settlement-bearing "
+                    "fields are unaffected"
                 ),
             ),
         ]
