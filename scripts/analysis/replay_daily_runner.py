@@ -76,6 +76,7 @@ from typing import Final, Literal
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from argv_digest import argv_sha256
+from hypothesis_register import NO_SIDE_RULING_DATE
 
 from breezy.analysis.replay_results import (
     FEE_SCHEDULE_MISMATCH_REFUSAL,
@@ -117,6 +118,7 @@ __all__ = [
     "DEFAULT_REPLAY_SUFFICIENCY_PATH",
     "DEFAULT_SKIP_STATE_PATH",
     "DEFAULT_STRATEGY",
+    "FREEZE_CLIMATE_DAY",
     "REPLAY_DRIFT_SCHEMA_VERSION",
     "REPLAY_TARGET_RSS_WARN_BYTES",
     "STALL_ALERT_RUN_LENGTH",
@@ -152,6 +154,14 @@ __all__ = [
 #: Same literal every replay driver/census script uses
 #: (`run_weather_strategy_backtests.py:352`).
 WEATHER_VENUE: Final[str] = "polymarket_us"
+
+#: R3-VIABILITY r2 delta "R3V-b" item 2: sourced from the hypothesis
+#: register's own freeze record (`NO_SIDE_RULING_DATE`,
+#: `hypothesis_register.py:174`), never a new literal. A row with
+#: `climate_day == FREEZE_CLIMATE_DAY` counts as pre-freeze; the COMPLETED
+#: log line below withholds `trials=`/`fills=` only strictly AFTER it.
+#: `r3_viability.py` imports this same constant for its own firewall.
+FREEZE_CLIMATE_DAY: Final[str] = NO_SIDE_RULING_DATE
 
 DEFAULT_STRATEGY: Final[str] = "continuous_rung_hold"
 #: Matches the base plan's own literal command block (§6b.3).
@@ -1602,8 +1612,20 @@ def _run_one(
             )
         else:
             interval = "[?, ?) LST"
+        # R3-VIABILITY r1 §3.4 / r2 delta "R3V-b" item 5: a post-freeze
+        # COMPLETED line withholds `trials=`/`fills=` entirely -- the STORED
+        # row (above) still carries the real counts; only this printed line
+        # hides them, so a live log tail (or `journalctl`) never leaks a
+        # post-freeze take-rate. `_run_one` is the ONE place the COMPLETED
+        # line is printed for both `run_once` (single target) and
+        # `run_batch` (R3V-a's loop), so withholding it here covers both.
+        counts = (
+            "post-freeze: counts withheld"
+            if climate_day > FREEZE_CLIMATE_DAY
+            else f"trials={len(scored)} fills={len(scored)}"
+        )
         print(
-            f"COMPLETED {station} {climate_day} -- trials={len(scored)} fills={len(scored)} "
+            f"COMPLETED {station} {climate_day} -- {counts} "
             f"replayed {interval} of [12:00, 17:00); window_complete={target.window_complete} "
             f"coverage_kind={target.coverage_kind}"
         )
