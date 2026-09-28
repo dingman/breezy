@@ -56,12 +56,13 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | AUD-07 gate | 97c4325 | `--stage 80k` refused while `20k/DEFERRED` non-empty (repo copy; the pinned a40d433 copy drives the drain) |
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
+| CF-11 | merged, gate green | `src/` formatted (104 files); `exec/client.py` left unformatted (formatting surfaces 6 noqa-sensitive findings) |
 | CF-5b / CF-6 / T-6 / CF-12 | 645baf5 | CF-12 new baseline: mypy 1891 errors / 247 files (914 checked) — plan the burn-down |
 
 ### BUILD
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| CF-11 | LOW | `src/` ruff format (105 files), one mechanical commit, gate-green | ruling §2 |
+| WT-VENV | LOW | 9 tests hardcode `REPO_ROOT/.venv/bin/...` (native-import gate ×3, strategy-module gate, probe containment, archive import contract, asos wrapper, archive-table ×2) → fail in every worktree; make them honour `BREEZY_PYTHON` | CF-11 return 09-28 |
 
 ### RUN / ANALYSE
 | ID | Open work (exact) |
