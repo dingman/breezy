@@ -34,6 +34,7 @@ from breezy.runtime.stop_intent_marker import consume_stop_intent_marker, stop_i
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
     _ADOPTION_LOG_UNREADABLE_MAX_POLLS,
+    _NODE_LOG_NAME_RE,
     _SELF_CHECK_PASS_RESULTS,
     BUILD_REVISION_ENV_VAR,
     EXIT_CONFIG_ERROR,
@@ -2024,6 +2025,28 @@ def test_node_log_path_is_timestamped_under_the_log_dir(tmp_path):
     path = node_log_path(tmp_path, now)
     assert path.parent == tmp_path
     assert path.name == "breezy-trade-20260904T165000Z.log"
+
+
+def test_node_log_path_output_always_matches_the_adoption_glob_pattern():
+    """[SUP-ADOPT-LOG-GLOB] Pin: `find_adopted_node_log`'s naming filter is
+    derived from -- and must never drift from -- what `node_log_path`
+    actually produces."""
+    for now in (
+        dt.datetime(2026, 9, 4, 16, 50, 0, tzinfo=dt.UTC),
+        dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=dt.UTC),
+        dt.datetime(2026, 12, 31, 23, 59, 59, tzinfo=dt.UTC),
+    ):
+        name = node_log_path(Path("/irrelevant"), now).name
+        assert _NODE_LOG_NAME_RE.match(name), name
+
+    # The supervisor's own log names must never match.
+    for supervisor_name in (
+        "breezy-trade-supervisor.log",
+        "breezy-trade-supervisor-20260904T165000Z.log",
+        "breezy-trade-supervisor-stdout-20260904T165000Z.log",
+        "breezy-trade-supervisor.launch-20260904T165000Z.log",
+    ):
+        assert not _NODE_LOG_NAME_RE.match(supervisor_name), supervisor_name
 
 
 def test_node_console_script_name_matches_pyproject_entry():
@@ -4018,6 +4041,38 @@ class TestFindAdoptedNodeLog:
 
         result = find_adopted_node_log(tmp_path, os.getpid())
         assert result == new_log
+
+    # -- SUP-ADOPT-LOG-GLOB (2026-09-28) --------------------------------
+    def test_only_node_stamped_logs_are_candidates_never_the_supervisors_own(
+        self, tmp_path, monkeypatch
+    ):
+        """A supervisor restart writes its own fresh `breezy-trade-
+        supervisor.log` (and `-stdout-`/`.launch-` variants) that share the
+        `breezy-trade-` prefix with a node log and are newer than the
+        already-running node's log -- the naming filter, not mtime
+        ordering, must exclude them."""
+        from breezy.runtime import trade_supervisor as ts
+
+        # The pid's start predates every candidate file below, so the
+        # existing mtime rule alone would qualify ALL of them -- isolating
+        # the naming filter as the only thing under test.
+        monkeypatch.setattr(ts, "_process_start_time", lambda _pid: 0.0)
+
+        node_log = tmp_path / "breezy-trade-20260101T000000Z.log"
+        node_log.write_text("live-trading permit issued issued_at_ns=1 expires_at_ns=2 ttl_s=3\n")
+        old_mtime = time.time() - 100
+        os.utime(node_log, (old_mtime, old_mtime))
+
+        for name in (
+            "breezy-trade-supervisor.log",
+            "breezy-trade-supervisor-20260928T010528Z.log",
+            "breezy-trade-supervisor-stdout-20260928T010528Z.log",
+            "breezy-trade-supervisor.launch-20260928T010528Z.log",
+        ):
+            (tmp_path / name).write_text("supervisor's own log, no permit line\n")
+
+        result = find_adopted_node_log(tmp_path, pid=424242)
+        assert result == node_log
 
 
 # ===========================================================================
@@ -6270,6 +6325,70 @@ class TestB1PermitWatch:
             **_b1_common_kwargs(tmp_path),
         )
 
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns == expiry
+        assert state.first_boot_permit_expires_at_ns == expiry
+
+    # -- SUP-ADOPT-LOG-GLOB (2026-09-28): end-to-end through the REAL
+    # `find_adopted_node_log` port (never overridden here, unlike
+    # `_adoption_ports` above) with a `log_dir` laid out exactly like a
+    # supervisor restart: a freshly written `breezy-trade-supervisor.log`
+    # (plus its `-stdout-`/`.launch-` variants) newer than the actual
+    # adopted node's own log. This reproduces the 2026-09-28 01:05:28Z false
+    # `permit_absent_in_decision_window` CRITICAL.
+    def test_adoption_finds_the_node_log_not_the_supervisors_own_end_to_end(
+        self, tmp_path, monkeypatch
+    ):
+        from breezy.runtime import trade_supervisor as ts
+
+        adopted_pid = 777
+        monkeypatch.setattr(ts, "_process_start_time", lambda _pid: 0.0)
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+
+        now = _utc(20, 0)
+        expiry = int((now + dt.timedelta(hours=1)).timestamp() * 1e9)
+        node_log = log_dir / "breezy-trade-20260927T165036Z.log"
+        node_log.write_text(
+            _STRATEGY_SUBSCRIBED_LINE
+            + (
+                "live-trading permit issued issued_at_ns=1788713409710026893 "
+                f"expires_at_ns={expiry} ttl_s=36000\n"
+            )
+        )
+        old_mtime = time.time() - 100
+        os.utime(node_log, (old_mtime, old_mtime))
+
+        for name in (
+            "breezy-trade-supervisor.log",
+            "breezy-trade-supervisor-20260928T010528Z.log",
+            "breezy-trade-supervisor-stdout-20260928T010528Z.log",
+            "breezy-trade-supervisor.launch-20260928T010528Z.log",
+        ):
+            (log_dir / name).write_text("supervisor's own log, no permit line\n")
+
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            find_node_pid=lambda: adopted_pid,
+            resolve_intent_lock_holder=lambda _p: adopted_pid,
+            process_alive=lambda pid: pid == adopted_pid,
+            alert_sink=sink,
+        )
+
+        tracked_pid, node_log_out, state = _do_permit_watch(
+            ports=ports,
+            state=_b1_ready_state(),
+            now=now,
+            tracked_pid=None,
+            node_log=None,
+            handler_read_log=False,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=log_dir,
+        )
+
+        assert tracked_pid == adopted_pid
+        assert node_log_out == node_log
         assert sink.payloads == []
         assert state.permit_issued_seen_expires_at_ns == expiry
         assert state.first_boot_permit_expires_at_ns == expiry
