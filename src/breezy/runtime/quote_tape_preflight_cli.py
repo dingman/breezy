@@ -121,9 +121,7 @@ def _resolve_catalog(namespace: argparse.Namespace, env: Mapping[str, str]) -> P
     else:
         raw = env.get(CATALOG_ENV_VAR, "").strip()
         if not raw:
-            raise PreflightError(
-                f"no catalog root: pass --catalog or set {CATALOG_ENV_VAR}"
-            )
+            raise PreflightError(f"no catalog root: pass --catalog or set {CATALOG_ENV_VAR}")
         root = Path(raw)
     if not root.is_dir():
         raise PreflightError(f"catalog root {root} is not a directory")
@@ -202,9 +200,7 @@ def _render(
 ) -> None:
     for report in reports:
         print(f"instance {report.instance_id}:", file=stdout)
-        shown = (
-            report.truncated + report.unreadable if quiet else report.files
-        )
+        shown = report.truncated + report.unreadable if quiet else report.files
         for file in shown:
             print(_file_line(file, now_ns), file=stdout)
         if quiet and len(shown) < len(report.files):
@@ -299,9 +295,7 @@ def run(
             for name in instance_ids:
                 print(name, file=out)
             return EXIT_OK
-        reports = [
-            scan_instance(root, instance_id, subdirectory) for instance_id in instance_ids
-        ]
+        reports = [scan_instance(root, instance_id, subdirectory) for instance_id in instance_ids]
     except PreflightError as exc:
         print(f"{PROGRAM}: {exc}", file=err)
         return EXIT_USAGE
@@ -326,10 +320,7 @@ def run(
         )
         _announce(verdict, out, err)
         active = sum(
-            1
-            for report in reports
-            for file in report.truncated
-            if _recently_written(file, now)
+            1 for report in reports for file in report.truncated if _recently_written(file, now)
         )
         if active:
             # A live writer's tail is byte-identical to a cut one. Say so at

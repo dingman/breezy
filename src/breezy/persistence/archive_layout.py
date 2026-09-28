@@ -19,6 +19,4 @@ BACKED_UP_ARCHIVE_DATASET_DIR: Final[Path] = (
     Path.home() / ".local/share/breezy/archive/settlement-alignment-cache"
 )
 
-DEFAULT_IEM_CACHE_DIR: Final[Path] = (
-    Path.home() / ".local/share/breezy/archive/iem-asos-1min"
-)
+DEFAULT_IEM_CACHE_DIR: Final[Path] = Path.home() / ".local/share/breezy/archive/iem-asos-1min"

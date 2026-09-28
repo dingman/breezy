@@ -431,7 +431,8 @@ class SharedExposureView:
         return total
 
     def mutually_exclusive_group(
-        self, contract: MispricingContract,
+        self,
+        contract: MispricingContract,
     ) -> list[MispricingContract]:
         return [
             other
@@ -465,7 +466,10 @@ class RiskManager:
         return self._exposure_view.instrument_ids(local_instrument_ids)
 
     def quote_tradable(
-        self, quote: MarketQuote, price_scale: float, now_ts_age_minutes: float,
+        self,
+        quote: MarketQuote,
+        price_scale: float,
+        now_ts_age_minutes: float,
     ) -> tuple[bool, str]:
         if quote.bid is None and quote.ask is None:
             return False, "missing_bid_ask"
@@ -642,15 +646,23 @@ class RiskManager:
                 return self._refuse("max_position")
             signed_qty_delta = room if signed_qty_delta > 0 else -room
 
-        event_after = self.event_notional(portfolio, contract.event_key) + abs(
-            signed_qty_delta,
-        ) * contract.contract_size
+        event_after = (
+            self.event_notional(portfolio, contract.event_key)
+            + abs(
+                signed_qty_delta,
+            )
+            * contract.contract_size
+        )
         if event_after > limits.max_event_notional:
             return self._refuse("max_event_notional")
 
-        loc_after = self.location_notional(portfolio, contract.location_id) + abs(
-            signed_qty_delta,
-        ) * contract.contract_size
+        loc_after = (
+            self.location_notional(portfolio, contract.location_id)
+            + abs(
+                signed_qty_delta,
+            )
+            * contract.contract_size
+        )
         if loc_after > limits.max_location_notional:
             return self._refuse("max_location_notional")
 
@@ -697,7 +709,8 @@ class RiskManager:
             order_notional = signed_qty_delta * contract.contract_size
             if order_notional > limits.max_equity_fraction * equity:
                 clipped = (limits.max_equity_fraction * equity) / max(
-                    contract.contract_size, 1e-9,
+                    contract.contract_size,
+                    1e-9,
                 )
                 if clipped < 1.0:
                     return self._refuse("equity_fraction")

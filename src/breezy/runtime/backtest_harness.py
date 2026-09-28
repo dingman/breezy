@@ -598,9 +598,7 @@ def assert_weather_is_wrapped(weather_data: Sequence[Data]) -> None:
     UnwrappedWeatherRecordError
 
     """
-    unwrapped = [
-        type(record).__name__ for record in weather_data if type(record) is not CustomData
-    ]
+    unwrapped = [type(record).__name__ for record in weather_data if type(record) is not CustomData]
     if unwrapped:
         raise UnwrappedWeatherRecordError(
             f"{len(unwrapped)} weather record(s) reached the harness unwrapped "

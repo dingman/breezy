@@ -407,9 +407,7 @@ class HaltDetector:
         ]
         conditions.extend(
             AlertCondition(
-                key=AlertConditionKey(
-                    kind=ALL_REFUSED_EVENT, site=self._site, extra=reason
-                ),
+                key=AlertConditionKey(kind=ALL_REFUSED_EVENT, site=self._site, extra=reason),
                 active=reason == halted_reason,
                 severity="CRITICAL",
                 event=ALL_REFUSED_EVENT,

@@ -257,9 +257,7 @@ def assert_clean_proxy_env(approved: frozenset[str] | set[str] | None = None) ->
     """
     approved_set = frozenset(approved) if approved else frozenset()
     offending = [
-        var
-        for var in _SENSITIVE_PROXY_ENV_VARS
-        if os.environ.get(var) and var not in approved_set
+        var for var in _SENSITIVE_PROXY_ENV_VARS if os.environ.get(var) and var not in approved_set
     ]
     if offending:
         raise ProxyEnvironmentError(

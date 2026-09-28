@@ -174,9 +174,7 @@ def score(rows: list[StratumRow] | tuple[StratumRow, ...]) -> ScoreState:
             "score() is undefined at I <= 0 (no rows, or every BE_i in "
             "{0.0, 1.0}); refusing to return a degenerate 0.0"
         )
-    numerator = sum(
-        (1.0 if row.held else 0.0) - be for row, be in zip(rows, bes, strict=True)
-    )
+    numerator = sum((1.0 if row.held else 0.0) - be for row, be in zip(rows, bes, strict=True))
     s = numerator / math.sqrt(information)
     return ScoreState(s=s, information=information, n=len(rows))
 

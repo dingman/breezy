@@ -55,15 +55,12 @@ RETIRE_ACCEPT_FILL: Final[str] = "ACCEPTED_WITH_DURABLE_FILL"
 RETIRE_ZERO_FILL: Final[str] = "ACCEPTED_ZERO_FILL_TERMINAL"
 RETIRE_REJECT: Final[str] = "DEFINITIVE_REJECT"
 
-SENDER_ABSENT_REASON: Final[str] = (
-    "order sender is not injected; this client refuses to submit"
-)
+SENDER_ABSENT_REASON: Final[str] = "order sender is not injected; this client refuses to submit"
 CANONICAL_UNVERIFIED_REASON: Final[str] = (
     "write canonical string is unverified; this client refuses to submit"
 )
 PERMIT_ABSENT_REASON: Final[str] = (
-    "live-trading permit is absent or not a LiveTradingPermit; "
-    "this client refuses to submit"
+    "live-trading permit is absent or not a LiveTradingPermit; this client refuses to submit"
 )
 RECONCILE_NOT_RUN_REASON: Final[str] = (
     "submit-intent reconcile_at_startup has not run; this client refuses to submit"
@@ -199,10 +196,7 @@ def latched_refusal_reason(first_reason: str) -> str:
 
 
 def missing_account_reason(venue: object) -> str:
-    return (
-        f"no AccountState is cached for {venue}, so every Nautilus "
-        "risk cap is inert; refusing"
-    )
+    return f"no AccountState is cached for {venue}, so every Nautilus risk cap is inert; refusing"
 
 
 def permit_is_missing(permit: object) -> bool:
@@ -899,11 +893,7 @@ def _cumulative_fee_and_reconciliation(
     if order_total is not None:
         exact_match = leg_fee is not None and order_total == leg_fee
         rounded_leg = _bankers_cent(leg_fee) if leg_fee is not None else None
-        bankers_match = (
-            not exact_match
-            and rounded_leg is not None
-            and order_total == rounded_leg
-        )
+        bankers_match = not exact_match and rounded_leg is not None and order_total == rounded_leg
         fee_reconciled = qty_reconciled and (exact_match or bankers_match)
         if fee_reconciled and exact_match:
             branch = "exact"
@@ -1097,9 +1087,7 @@ def venue_order_id(order_id: str) -> VenueOrderId:
 
 #: Detail for the ``response is None`` AMBIGUOUS case: there is no HTTP
 #: response at all, so every field is the "none" sentinel.
-_AMBIGUOUS_DETAIL_NO_RESPONSE: Final[str] = (
-    "status=none body_kind=none rpc_code=none body_len=0"
-)
+_AMBIGUOUS_DETAIL_NO_RESPONSE: Final[str] = "status=none body_kind=none rpc_code=none body_len=0"
 _ORDER_STATE_TOKEN: Final[re.Pattern[str]] = re.compile(r"^ORDER_STATE_[A-Z_]+$")
 
 

@@ -208,7 +208,9 @@ def forecast_catalog_root(base: Path, station: str) -> Path:
 
     """
     return station_catalog_path(
-        base, FORECAST_CATALOG_NAMESPACE, normalise_station(station),
+        base,
+        FORECAST_CATALOG_NAMESPACE,
+        normalise_station(station),
     )
 
 
@@ -220,7 +222,9 @@ def open_forecast_catalog(base: Path, station: str) -> ParquetDataCatalog:
     indistinguishable to an operator.
     """
     return open_station_catalog(
-        base, FORECAST_CATALOG_NAMESPACE, normalise_station(station),
+        base,
+        FORECAST_CATALOG_NAMESPACE,
+        normalise_station(station),
     )
 
 
@@ -242,9 +246,13 @@ def require_disjoint_catalog_roots(root: Path, *other_roots: Path) -> None:
 
     for other in other_roots:
         resolved_other = Path(other).resolve()
-        if resolved == resolved_other or resolved.is_relative_to(
-            resolved_other,
-        ) or resolved_other.is_relative_to(resolved):
+        if (
+            resolved == resolved_other
+            or resolved.is_relative_to(
+                resolved_other,
+            )
+            or resolved_other.is_relative_to(resolved)
+        ):
             raise ForecastCatalogRootError(
                 f"the forecast catalog root {resolved} overlaps {resolved_other}; "
                 f"the forecast archive must occupy a directory no other data "

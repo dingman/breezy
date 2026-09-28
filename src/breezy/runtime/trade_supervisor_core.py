@@ -118,6 +118,7 @@ def zero_instruments_refusal_in(log_text: str) -> bool:
     zero-instrument refusal marker (prefix ... suffix, same line)."""
     return any(_ZERO_INSTRUMENTS_REFUSAL_LINE_RE.search(line) for line in log_text.splitlines())
 
+
 #: [A-1, 2026-09-25] Injected by ``_do_midday_watch`` into a mid-day-relaunched
 #: child's environment, read by ``app/trade.py::main`` and passed to
 #: ``issue_live_trading_permit`` as ``max_expires_at_ns`` -- caps that
@@ -164,9 +165,7 @@ COMPOSITION_KIND_SUBSCRIBED_MARKERS: Final[dict[str, str]] = {
 }
 #: Back-compat names for the two markers that existed before WP-11b --
 #: several call sites/tests reference these directly.
-STRATEGY_SUBSCRIBED_MARKER: Final[str] = COMPOSITION_KIND_SUBSCRIBED_MARKERS[
-    "current_rung_hold"
-]
+STRATEGY_SUBSCRIBED_MARKER: Final[str] = COMPOSITION_KIND_SUBSCRIBED_MARKERS["current_rung_hold"]
 CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER: Final[str] = COMPOSITION_KIND_SUBSCRIBED_MARKERS[
     "continuous_rung_hold"
 ]
@@ -270,9 +269,7 @@ class AlertDetail(str, Enum):
     SELF_CHECK_FAIL_CHILD_EXITED = "self_check_fail_child_exited"
     #: [2026-09-12] Continuous-family-only self-check extensions -- each
     #: names exactly one of the three checks in ``ContinuousFamilyCheck``.
-    SELF_CHECK_FAIL_CONTINUOUS_PHASE0_FORBIDDEN = (
-        "self_check_fail_continuous_phase0_forbidden"
-    )
+    SELF_CHECK_FAIL_CONTINUOUS_PHASE0_FORBIDDEN = "self_check_fail_continuous_phase0_forbidden"
     SELF_CHECK_FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID = (
         "self_check_fail_continuous_startup_evidence_invalid"
     )

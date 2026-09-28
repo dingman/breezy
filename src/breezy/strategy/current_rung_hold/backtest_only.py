@@ -85,8 +85,7 @@ class CurrentRungHoldBacktestStrategy(CurrentRungHoldStrategy):
         self,
         config: CurrentRungHoldConfig,
         *,
-        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]]
-        | None = None,
+        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]] | None = None,
     ) -> None:
         super().__init__(config, trial_day_latch_factory=trial_day_latch_factory)
         #: Internal, backtest-only submit gate. NEVER read from

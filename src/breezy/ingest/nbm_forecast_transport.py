@@ -171,9 +171,7 @@ class NbmForecastTransport(HttpTransport):
                 "a string would let a caller place arbitrary text in the path"
             )
         if isinstance(cycle_hour, bool) or not isinstance(cycle_hour, int):
-            raise TypeError(
-                f"`cycle_hour` must be an int, was {type(cycle_hour).__name__}"
-            )
+            raise TypeError(f"`cycle_hour` must be an int, was {type(cycle_hour).__name__}")
         if not 0 <= cycle_hour <= 23:
             raise ValueError(f"`cycle_hour` must be in 0..23, was {cycle_hour}")
         day = f"{cycle_date:%Y%m%d}"

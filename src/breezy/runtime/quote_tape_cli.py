@@ -185,9 +185,7 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
     node: Node | None = None
     try:
         node = node_factory(config)
-        node.add_data_client_factory(
-            POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory
-        )
+        node.add_data_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory)
         node.build()
         node.run()
         return _exit_code_for_completed_run(stderr)

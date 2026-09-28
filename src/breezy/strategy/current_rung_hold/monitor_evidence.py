@@ -159,9 +159,7 @@ def _decimal_or_none(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
 
-def walk_exit_vwap(
-    depth: OrderBookDepth10, leg: Leg, qty: int
-) -> tuple[Decimal | None, bool]:
+def walk_exit_vwap(depth: OrderBookDepth10, leg: Leg, qty: int) -> tuple[Decimal | None, bool]:
     """Walk the correct side of ``depth`` for ``qty`` contracts, best-first.
 
     YES walks ``depth.bids`` directly. NO walks ``depth.asks`` and returns
@@ -306,9 +304,7 @@ def build_monitor_evidence(
         "depth_walk" if mark_vwap is not None else "missing"
     )
 
-    exit_fee_at_mark = (
-        None if mark_vwap is None else exit_fee(mark_vwap, held_qty, fee_coefficient)
-    )
+    exit_fee_at_mark = None if mark_vwap is None else exit_fee(mark_vwap, held_qty, fee_coefficient)
     unrealized_pnl = None if mark_vwap is None else (mark_vwap - fill_px) * held_qty
     recoverable_value = (
         None

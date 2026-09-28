@@ -634,6 +634,4 @@ register_arrow(
     _encode_snapshots,
     _decode_snapshots,
 )
-register_arrow(
-    DepthTruncation, DepthTruncation.schema(), _encode_truncations, _decode_truncations
-)
+register_arrow(DepthTruncation, DepthTruncation.schema(), _encode_truncations, _decode_truncations)

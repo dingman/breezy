@@ -285,9 +285,7 @@ def phase1_sending_permit(
     argument.
     """
     if not sending_family_id:
-        raise SettingsError(
-            "phase1_sending_permit: sending_family_id must be non-empty"
-        )
+        raise SettingsError("phase1_sending_permit: sending_family_id must be non-empty")
     if phase0_shadow:
         return None
     return permit
@@ -351,9 +349,7 @@ def _bucket_station_instrument_ids(
 ) -> dict[str, tuple[InstrumentId, ...]]:
     """``resolve_station_instrument_ids``'s bucketing over an already-read
     catalog, so one boot can bucket more than one day off ONE read."""
-    buckets: dict[str, dict[InstrumentId, None]] = {
-        station: {} for station in today_by_station
-    }
+    buckets: dict[str, dict[InstrumentId, None]] = {station: {} for station in today_by_station}
     for instrument in instruments:
         parsed = _facts_from_instrument(instrument)
         if parsed is None:
@@ -420,8 +416,7 @@ def _zero_instruments_message(
     # downward -- see the layers contract) so the supervisor's boot-retry
     # classifier stays in lockstep with this message, byte-for-byte.
     return (
-        f"{ZERO_INSTRUMENTS_REFUSAL_PREFIX} {date_part} "
-        f"({counts}){ZERO_INSTRUMENTS_REFUSAL_SUFFIX}"
+        f"{ZERO_INSTRUMENTS_REFUSAL_PREFIX} {date_part} ({counts}){ZERO_INSTRUMENTS_REFUSAL_SUFFIX}"
     )
 
 
@@ -735,7 +730,9 @@ def build_continuous_rung_hold_strategies(
             # only populated once `on_start` runs), so it can only be built
             # AFTER construction -- see `_build_position_monitor_for`.
             strategy._position_monitor = _build_position_monitor_for(
-                strategy, monitor_root=monitor_root, exit_manifest=exit_manifest,
+                strategy,
+                monitor_root=monitor_root,
+                exit_manifest=exit_manifest,
             )
         strategies.append(strategy)
     _assert_disjoint_claims(strategies)
@@ -782,7 +779,10 @@ def _build_position_monitor_for(
         emit_alert(
             sink,
             AlertPayload(
-                severity="WARN", event=event, site=str(strategy.id), detail=str(dict(detail)),
+                severity="WARN",
+                event=event,
+                site=str(strategy.id),
+                detail=str(dict(detail)),
             ),
         )
 
@@ -802,8 +802,7 @@ def _build_position_monitor_for(
         climate_day_for=callables.climate_day_for,
         hour_lst_for=callables.hour_lst_for,
         sibling_for=callables.sibling_for,
-        stale_observation_bound_ns=strategy._config.stale_observation_minutes
-        * _NS_PER_MINUTE,
+        stale_observation_bound_ns=strategy._config.stale_observation_minutes * _NS_PER_MINUTE,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
         buffer=MarkBuffer(),
         catalog_root=monitor_root,

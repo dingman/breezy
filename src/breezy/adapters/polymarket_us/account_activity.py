@@ -177,8 +177,10 @@ def _resolve_record(
     if all(balance_change.get(key) is not None for key in _REQUIRED_TOP_LEVEL_KEYS):
         return balance_change, None
     transactions = balance_change.get("transactions")
-    if isinstance(transactions, list) and len(transactions) == 1 and isinstance(
-        transactions[0], Mapping
+    if (
+        isinstance(transactions, list)
+        and len(transactions) == 1
+        and isinstance(transactions[0], Mapping)
     ):
         return transactions[0], None
     count = len(transactions) if isinstance(transactions, list) else 0
@@ -248,9 +250,7 @@ def _parse_activity(
     fallback_kind = spec.kind if spec is not None else UNRECOGNISED_KIND
 
     if record is None:
-        _logger.warning(
-            "activities[%d] type=%s unparseable: %s", index, activity_type, reason
-        )
+        _logger.warning("activities[%d] type=%s unparseable: %s", index, activity_type, reason)
         return _unparseable_flow(fallback_kind)
 
     try:
@@ -261,9 +261,7 @@ def _parse_activity(
 
     update_time = record.get("updateTime")
     try:
-        update_ts_ns = (
-            _parse_rfc3339_ns(update_time) if update_time is not None else create_ts_ns
-        )
+        update_ts_ns = _parse_rfc3339_ns(update_time) if update_time is not None else create_ts_ns
     except (ValueError, TypeError):
         update_ts_ns = create_ts_ns
 
@@ -440,7 +438,10 @@ def _leg_execution_order_id(trade: Mapping[str, Any], execution_key: str) -> str
 
 
 def _leg_status(
-    trade: Mapping[str, Any], leg_key: str, execution_key: str, venue_order_id: str,
+    trade: Mapping[str, Any],
+    leg_key: str,
+    execution_key: str,
+    venue_order_id: str,
 ) -> tuple[bool, bool]:
     """One leg's ``(matched, uninterpretable)`` verdict.
 
@@ -539,10 +540,16 @@ def trade_rows_for_order(page: Mapping[str, Any], venue_order_id: str) -> TradeR
             first_reason = first_reason or _uninterpretable_reason(activity)
             continue
         aggressor_matched, aggressor_bad = _leg_status(
-            trade, "aggressor", "aggressorExecution", venue_order_id,
+            trade,
+            "aggressor",
+            "aggressorExecution",
+            venue_order_id,
         )
         passive_matched, passive_bad = _leg_status(
-            trade, "passive", "passiveExecution", venue_order_id,
+            trade,
+            "passive",
+            "passiveExecution",
+            venue_order_id,
         )
         if aggressor_matched or passive_matched:
             refs.append(

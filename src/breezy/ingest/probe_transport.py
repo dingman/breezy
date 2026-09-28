@@ -580,8 +580,7 @@ class ProbeEvidenceWriter:
                     "excerpt_lines": len(excerpt_lines),
                     "sha256_of_full_body": exchange.sha256,
                     "recoverable_by": (
-                        f"Re-GET {exchange.url} and verify sha256 matches "
-                        "sha256_of_full_body."
+                        f"Re-GET {exchange.url} and verify sha256 matches sha256_of_full_body."
                     ),
                 }
             payload = {

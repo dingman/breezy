@@ -253,9 +253,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
     keys = set(payload)
     missing = _REQUIRED_KEYS - keys
     if missing:
-        raise FamilyManifestValidationError(
-            f"{path}: missing required key(s): {sorted(missing)}"
-        )
+        raise FamilyManifestValidationError(f"{path}: missing required key(s): {sorted(missing)}")
     unknown = keys - _REQUIRED_KEYS - _OPTIONAL_KEYS
     if unknown:
         raise FamilyManifestValidationError(f"{path}: unknown key(s): {sorted(unknown)}")
@@ -296,8 +294,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
     composition_kind = payload["composition_kind"]
     if composition_kind not in _COMPOSITION_KINDS:
         raise FamilyManifestValidationError(
-            f"{path}: composition_kind {composition_kind!r} not one of "
-            f"{sorted(_COMPOSITION_KINDS)}"
+            f"{path}: composition_kind {composition_kind!r} not one of {sorted(_COMPOSITION_KINDS)}"
         )
 
     density_sha = payload["density_artefact_sha256"]
@@ -317,21 +314,18 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         or not stations_raw
         or not all(isinstance(station, str) for station in stations_raw)
     ):
-        raise FamilyManifestValidationError(
-            f"{path}: stations must be a non-empty list of strings"
-        )
+        raise FamilyManifestValidationError(f"{path}: stations must be a non-empty list of strings")
 
     raw_theta = payload["taker_fee_coefficient"]
     if not _TAKER_FEE_COEFFICIENT_RE.match(raw_theta):
         raise FamilyManifestValidationError(
             f"{path}: taker_fee_coefficient {raw_theta!r} must be a plain decimal "
-            f"fraction matching {_TAKER_FEE_COEFFICIENT_RE.pattern!r} (e.g. \"0.0695\")"
+            f'fraction matching {_TAKER_FEE_COEFFICIENT_RE.pattern!r} (e.g. "0.0695")'
         )
     taker_fee_coefficient = Decimal(raw_theta)
     if not (Decimal(0) < taker_fee_coefficient < Decimal(1)):
         raise FamilyManifestValidationError(
-            f"{path}: taker_fee_coefficient {raw_theta!r} must be strictly between "
-            "0 and 1"
+            f"{path}: taker_fee_coefficient {raw_theta!r} must be strictly between 0 and 1"
         )
 
     terminal_climate_day = payload.get("terminal_climate_day")
@@ -344,8 +338,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             date.fromisoformat(terminal_climate_day)
         except ValueError as exc:
             raise FamilyManifestValidationError(
-                f"{path}: terminal_climate_day {terminal_climate_day!r} is not a "
-                "real ISO-8601 date"
+                f"{path}: terminal_climate_day {terminal_climate_day!r} is not a real ISO-8601 date"
             ) from exc
         if terminal_climate_day < d0_climate_day:
             raise FamilyManifestValidationError(
@@ -434,9 +427,7 @@ def dump_family_manifest(manifest: FamilyManifest) -> dict[str, object]:
     keys = _REQUIRED_KEYS | _OPTIONAL_KEYS
     missing = sorted(keys - getters.keys())
     if missing:
-        raise FamilyManifestValidationError(
-            f"serialiser has no mapping for key(s): {missing}"
-        )
+        raise FamilyManifestValidationError(f"serialiser has no mapping for key(s): {missing}")
     payload: dict[str, object] = {}
     for key in sorted(keys):
         value = getters[key](manifest)

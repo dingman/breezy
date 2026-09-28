@@ -19,10 +19,18 @@ __all__ = ["season_for"]
 #: Mirrors ``scripts/analysis/pmr_climatology_study.py:182-187``
 #: (``_SEASON_BY_MONTH``) verbatim.
 _SEASON_BY_MONTH: Final[dict[int, str]] = {
-    12: "DJF", 1: "DJF", 2: "DJF",
-    3: "MAM", 4: "MAM", 5: "MAM",
-    6: "JJA", 7: "JJA", 8: "JJA",
-    9: "SON", 10: "SON", 11: "SON",
+    12: "DJF",
+    1: "DJF",
+    2: "DJF",
+    3: "MAM",
+    4: "MAM",
+    5: "MAM",
+    6: "JJA",
+    7: "JJA",
+    8: "JJA",
+    9: "SON",
+    10: "SON",
+    11: "SON",
 }
 
 

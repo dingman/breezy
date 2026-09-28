@@ -252,7 +252,8 @@ def load_replay_observations(
 
 
 def _assert_no_foreign_market_data(
-    market_data: Sequence[Data], capture_window_ns: tuple[int, int],
+    market_data: Sequence[Data],
+    capture_window_ns: tuple[int, int],
 ) -> None:
     """Every non-close record must fall inside `capture_window_ns`.
 

@@ -1649,7 +1649,6 @@ def assert_state_store_durable(store: StateStore, *, opener: StateStoreOpener) -
         survivor.close()
 
     logger.info(
-        "state store certified durable: probe key=%s round-tripped through two "
-        "independent handles",
+        "state store certified durable: probe key=%s round-tripped through two independent handles",
         DURABILITY_PROBE_KEY,
     )

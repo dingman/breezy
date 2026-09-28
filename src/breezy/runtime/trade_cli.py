@@ -221,9 +221,7 @@ def _emit_boot_halt_alert(node: Node, stop_intent_store_path: Path | None) -> No
         if _trader_reached_running(node):
             return
         if stop_was_requested:
-            logger.info(
-                "boot-halt alert suppressed: an intentional Breezy stop was requested"
-            )
+            logger.info("boot-halt alert suppressed: an intentional Breezy stop was requested")
             return
         emit_alert(
             resolve_alert_sink(),
@@ -591,12 +589,8 @@ def _run_node(
     cancel_repoll: Callable[[], None] | None = None
     try:
         node = node_factory(config)
-        node.add_data_client_factory(
-            POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory
-        )
-        node.add_exec_client_factory(
-            POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory
-        )
+        node.add_data_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory)
+        node.add_exec_client_factory(POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory)
         for actor in (*actors, *extra_actors):
             node.trader.add_actor(actor)
         for strategy in strategies:

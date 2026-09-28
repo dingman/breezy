@@ -167,7 +167,9 @@ def evaluate_instrument(
     # is the live value. Left exactly as it was by T-11, which moved only the
     # forecast-error horizon.
     se = engine.expected_probability_se(
-        cal_p, forecast.horizon_hours, extra_market_noise=cfg.extra_market_noise,
+        cal_p,
+        forecast.horizon_hours,
+        extra_market_noise=cfg.extra_market_noise,
     )
     z_mid = (mid_p - cal_p) / se
     gap = mid_p - cal_p

@@ -321,7 +321,9 @@ class WeatherProbabilityEngine:
         mu, sigma = self.mu_sigma(expected_high_f, horizon_hours, location_id, target_date)
         cc = self.error_model.continuity_correction_f
         raw = self.error_model.cdf(hi_f + cc, mu, sigma) - self.error_model.cdf(
-            lo_f - cc, mu, sigma,
+            lo_f - cc,
+            mu,
+            sigma,
         )
         return self._clip(max(raw, 0.0))
 

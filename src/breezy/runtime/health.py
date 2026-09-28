@@ -626,9 +626,7 @@ def alert_egress_configured(env: Mapping[str, str] | None = None) -> bool:
     return bool(active_env.get(ALERT_WEBHOOK_URL_ENV_VAR))
 
 
-def log_alert_egress_status(
-    env: Mapping[str, str] | None = None, *, component: str
-) -> bool:
+def log_alert_egress_status(env: Mapping[str, str] | None = None, *, component: str) -> bool:
     """Make alert reachability VISIBLE at boot. Returns the predicate.
 
     [WP-B0] Before this existed, an unset webhook degraded in total

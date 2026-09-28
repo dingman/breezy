@@ -163,9 +163,7 @@ class PolymarketUSWriteTransport:
         """Dispatch the one pinned cancel-all write. No method, query, or body."""
         url = f"{api_base_url.rstrip('/')}{CANCEL_ALL_PATH}"
         try:
-            response = await self._post(
-                url, headers=dict(headers), keys=[QUOTA_KEY_PORTFOLIO]
-            )
+            response = await self._post(url, headers=dict(headers), keys=[QUOTA_KEY_PORTFOLIO])
         except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError):
             raise VenueTransportError(
                 f"{_WRITE_METHOD} {redact_url(url)} failed at the transport layer"

@@ -345,11 +345,7 @@ def evaluate_decision(inputs: DecisionInputs) -> Decision:
 
     running_max = inputs.running_max
     stale_bound_ns = inputs.config.stale_observation_minutes * _NS_PER_MINUTE
-    if (
-        running_max is None
-        or inputs.staleness_ns is None
-        or inputs.staleness_ns > stale_bound_ns
-    ):
+    if running_max is None or inputs.staleness_ns is None or inputs.staleness_ns > stale_bound_ns:
         return Refuse("observation_unavailable")
 
     if running_max.spans(inputs.ladder):
@@ -453,11 +449,7 @@ def no_leg_executable(
     exactly the executable-band-plus-size test ``_is_executable`` already
     runs, on the NO leg's own complement price, with no independent copy.
     """
-    return (
-        bid is not None
-        and bid_size is not None
-        and _is_executable(_ONE - bid, bid_size, config)
-    )
+    return bid is not None and bid_size is not None and _is_executable(_ONE - bid, bid_size, config)
 
 
 def _evaluate_no_side(

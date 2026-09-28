@@ -61,6 +61,7 @@ class ObservationSidecarWriter(Protocol):
 
     def append(self, row: ObservationSidecarRow) -> None: ...
 
+
 #: The `StationObservation.source_channel` for rows from the NWS API.
 NWS_OBSERVATION_SOURCE_CHANNEL: Final[str] = "nws_api_observations"
 

@@ -679,8 +679,10 @@ class HypothesisRecord:
                 raise HypothesisLedgerRecordError(
                     f"{name!r} must be an int, got {type(value).__name__}"
                 )
-            if expected_type is float and not isinstance(value, (int, float)) or (
-                expected_type is float and is_bool_value
+            if (
+                expected_type is float
+                and not isinstance(value, (int, float))
+                or (expected_type is float and is_bool_value)
             ):
                 raise HypothesisLedgerRecordError(
                     f"{name!r} must be a float, got {type(value).__name__}"

@@ -324,12 +324,15 @@ class ForecastPoint(Data):
         self.value_f = forecast_value_or_none(value_f)
         self.issuance_seq = require_int(issuance_seq, "issuance_seq")
         self.measured_publication_lag_ns = require_int(
-            measured_publication_lag_ns, "measured_publication_lag_ns",
+            measured_publication_lag_ns,
+            "measured_publication_lag_ns",
         )
         self.available_at_ns = require_int(available_at_ns, "available_at_ns")
         self.ingested_at_ns = require_int(ingested_at_ns, "ingested_at_ns")
         self.absence_reason = _resolved_absence_reason(
-            absence_reason, value_f=value_f, parsed=self.value_f,
+            absence_reason,
+            value_f=value_f,
+            parsed=self.value_f,
         )
         self.schema_version = require_int(schema_version, "schema_version")
 
@@ -551,8 +554,7 @@ def _resolved_absence_reason(
     reason = require_text(absence_reason, "absence_reason").strip()
     if reason not in FORECAST_ABSENCE_REASONS:
         raise ValueError(
-            f"`absence_reason` must be one of {FORECAST_ABSENCE_REASONS}, "
-            f"was {reason!r}",
+            f"`absence_reason` must be one of {FORECAST_ABSENCE_REASONS}, was {reason!r}",
         )
     return reason
 
@@ -597,8 +599,7 @@ def _validated_issuances(points: Iterable[ForecastPoint]) -> list[ForecastPoint]
     join_keys = {point.join_key for point in issuances}
     if len(join_keys) != 1:
         raise ValueError(
-            f"every record must share one join key, found {len(join_keys)}: "
-            f"{sorted(join_keys)!r}",
+            f"every record must share one join key, found {len(join_keys)}: {sorted(join_keys)!r}",
         )
 
     ordered = sorted(issuances, key=lambda point: point.issuance_seq)
@@ -659,9 +660,7 @@ def latest_as_of(
     for point in points:
         grouped.setdefault(point.join_key, []).append(point)
 
-    selected = {
-        key: select_as_of(group, as_of_ns=as_of_ns) for key, group in grouped.items()
-    }
+    selected = {key: select_as_of(group, as_of_ns=as_of_ns) for key, group in grouped.items()}
     return {key: point for key, point in selected.items() if point is not None}
 
 

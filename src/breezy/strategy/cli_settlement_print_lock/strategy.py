@@ -607,7 +607,10 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
 
     def _assert_theta_is_this_markets(
-        self, instrument_id: InstrumentId, info: object, theta: float,
+        self,
+        instrument_id: InstrumentId,
+        info: object,
+        theta: float,
     ) -> None:
         """Cross-check the INJECTED coefficient against the instrument in hand.
 
@@ -829,7 +832,8 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                 f"RISK block {contract.instrument_id}: {risk_decision.reason} "
                 f"edge={decision.edge:.3f}"
                 + reduce_only_refusal_note(
-                    risk_decision.reason, tick_ts_ns=self.clock.timestamp_ns(),
+                    risk_decision.reason,
+                    tick_ts_ns=self.clock.timestamp_ns(),
                 ),
             )
             self._report_refusals()
@@ -941,7 +945,9 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         )
 
     def _marketable_limit_price(
-        self, contract: MispricingContract, quote: MarketQuote,
+        self,
+        contract: MispricingContract,
+        quote: MarketQuote,
     ) -> float | None:
         """``ask + slippage_prob``, in RAW venue units, ON the tick grid.
 

@@ -358,8 +358,7 @@ def _startup_evidence_summary(
     """
     if evidence is None:
         return (
-            "continuous_rung_hold startup_evidence: evidence=absent "
-            f"decisions={dict(decisions)!r}"
+            f"continuous_rung_hold startup_evidence: evidence=absent decisions={dict(decisions)!r}"
         )
     eof_complete = evidence.get("eof_complete")
     position_read_refused = evidence.get("position_read_refused")
@@ -423,8 +422,7 @@ class ContinuousRungHoldStrategy(Strategy):
         self,
         config: CurrentRungHoldConfig,
         *,
-        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]]
-        | None = None,
+        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]] | None = None,
         order_submission_permit: OrderSubmissionPermit | None = None,
         offer_tape: OfferTape | None = None,
         offer_tape_path: Path | None = None,
@@ -461,8 +459,7 @@ class ContinuousRungHoldStrategy(Strategy):
         """
         if phase0_permit_guard and order_submission_permit is not None:
             raise Phase0PermitForbiddenError(
-                "ContinuousRungHoldStrategy: Phase 0 forbids a non-None "
-                "order_submission_permit"
+                "ContinuousRungHoldStrategy: Phase 0 forbids a non-None order_submission_permit"
             )
         super().__init__(config)
         self._config: CurrentRungHoldConfig = config
@@ -715,7 +712,10 @@ class ContinuousRungHoldStrategy(Strategy):
             self.log.exception(message, exc)  # noqa: TRY401
             result = _SHADOW_REST_DECIDER_ERROR_RESULT
         self._record_shadow_rest_tick(
-            station=station, climate_day_key=climate_day_key, leg=leg, result=result,
+            station=station,
+            climate_day_key=climate_day_key,
+            leg=leg,
+            result=result,
         )
         self._drain_shadow_rest_evictions()
         return result
@@ -730,7 +730,10 @@ class ContinuousRungHoldStrategy(Strategy):
         """
         for (station, climate_day, leg), result in self._shadow_rest_decider.drain_evictions():
             self._record_shadow_rest_tick(
-                station=station, climate_day_key=climate_day, leg=leg, result=result,
+                station=station,
+                climate_day_key=climate_day,
+                leg=leg,
+                result=result,
             )
         self._evict_stale_shadow_rest_summaries()
 
@@ -777,9 +780,11 @@ class ContinuousRungHoldStrategy(Strategy):
         already pins -- writes nothing rather than re-writing a stale run.
         """
         try:
-            for (station, climate_day, leg), result in (
-                self._shadow_rest_decider.close_all_windows()
-            ):
+            for (
+                station,
+                climate_day,
+                leg,
+            ), result in self._shadow_rest_decider.close_all_windows():
                 summary_key = f"{station}|{climate_day}|{leg}"
                 summary = self._shadow_rest_summaries.get(summary_key)
                 if summary is not None:
@@ -885,7 +890,8 @@ class ContinuousRungHoldStrategy(Strategy):
             return
 
         self.subscribe_data(
-            station_observation_data_type(), client_id=NWS_BACKTEST_CLIENT_ID,
+            station_observation_data_type(),
+            client_id=NWS_BACKTEST_CLIENT_ID,
         )
 
     def _run_never_arm_walk(self) -> bool:
@@ -908,14 +914,13 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             self.position_events.record(_POSITION_FAMILY_HALT_AT_START)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
             self._record_startup_evidence_summary(None, now_ns=now_ns, decisions={})
             return False
 
-        evidence = (
-            self._position_evidence_reader() if self._position_evidence_reader else None
-        )
+        evidence = self._position_evidence_reader() if self._position_evidence_reader else None
         if not startup_evidence_permits_arm(evidence):
             self.log.error(
                 "continuous_rung_hold: startup position evidence is absent, "
@@ -924,7 +929,8 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             self.position_events.record(_POSITION_STARTUP_EVIDENCE_MISSING)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
             self._record_startup_evidence_summary(evidence, now_ns=now_ns, decisions={})
             return False
@@ -938,7 +944,8 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             self.position_events.record(_POSITION_FILL_WALK_UNREADABLE)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
             self._record_startup_evidence_summary(evidence, now_ns=now_ns, decisions={})
             return False
@@ -962,7 +969,9 @@ class ContinuousRungHoldStrategy(Strategy):
             no_iid = str(sibling_instrument_id(InstrumentId.from_str(iid)))
             try:
                 no_has_fill = self._latch.is_consumed(
-                    station, climate_day_key, key_instrument_id=no_iid,
+                    station,
+                    climate_day_key,
+                    key_instrument_id=no_iid,
                 ) or bool(self._latch.iter_fill_records(frozenset({no_iid})))
             except (TrialDayRecordCorrupt, ExecutionReportMappingError) as exc:
                 # Fail closed exactly like the entry-level walk (:527) and
@@ -974,10 +983,13 @@ class ContinuousRungHoldStrategy(Strategy):
                 )
                 self.position_events.record(_POSITION_FILL_WALK_UNREADABLE)
                 self._report_alerter(
-                    self.position_alerter, "continuous_rung_hold position report failed",
+                    self.position_alerter,
+                    "continuous_rung_hold position report failed",
                 )
                 self._record_startup_evidence_summary(
-                    evidence, now_ns=now_ns, decisions=decisions,
+                    evidence,
+                    now_ns=now_ns,
+                    decisions=decisions,
                 )
                 return False
             decisions[no_iid] = "UNKNOWN" if no_has_fill else "flat"
@@ -996,8 +1008,8 @@ class ContinuousRungHoldStrategy(Strategy):
             if startup_evidence_lists_slug(evidence, slug):
                 net_position = startup_evidence_position_for(evidence, slug)
                 slug_ok = net_position is not None and net_position <= 0
-                decisions[iid] = "present-flat" if slug_ok else (
-                    "UNKNOWN" if net_position is None else "LONG"
+                decisions[iid] = (
+                    "present-flat" if slug_ok else ("UNKNOWN" if net_position is None else "LONG")
                 )
             else:
                 # Option B (T3, N-T3): a LATER, independent read -- Nautilus's
@@ -1006,11 +1018,15 @@ class ContinuousRungHoldStrategy(Strategy):
                 # AND on the arming side that can only ever refuse an arm the
                 # evidence read alone would have granted, never grant one it
                 # alone would have refused (AC-11).
-                slug_ok = startup_evidence_confirms_absent_flat(
-                    evidence, slug,
-                    now_ns=now_ns,
-                    max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
-                ) and self.portfolio.net_position(InstrumentId.from_str(iid)) <= 0
+                slug_ok = (
+                    startup_evidence_confirms_absent_flat(
+                        evidence,
+                        slug,
+                        now_ns=now_ns,
+                        max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
+                    )
+                    and self.portfolio.net_position(InstrumentId.from_str(iid)) <= 0
+                )
                 decisions[iid] = "absent-flat" if slug_ok else "UNKNOWN"
             if not slug_ok:
                 # E3-1 (S5 plan Rev 3/Rev 4 E4-8): a venue LONG on the YES id
@@ -1047,10 +1063,13 @@ class ContinuousRungHoldStrategy(Strategy):
                 )
                 self.position_events.record(_POSITION_UNRECONCILED_LONG)
                 self._report_alerter(
-                    self.position_alerter, "continuous_rung_hold position report failed",
+                    self.position_alerter,
+                    "continuous_rung_hold position report failed",
                 )
                 self._record_startup_evidence_summary(
-                    evidence, now_ns=now_ns, decisions=decisions,
+                    evidence,
+                    now_ns=now_ns,
+                    decisions=decisions,
                 )
                 return False
         self._record_startup_evidence_summary(evidence, now_ns=now_ns, decisions=decisions)
@@ -1146,7 +1165,8 @@ class ContinuousRungHoldStrategy(Strategy):
         )
 
     def _join_fill_to_station_day(
-        self, instrument_id: InstrumentId,
+        self,
+        instrument_id: InstrumentId,
     ) -> tuple[str, str] | None:
         """Slice 4 item A1 (plan rev 6.1): ``(station, climate_day)`` for a
         fill -- ``self._facts`` first, then a slug fallback.
@@ -1188,7 +1208,8 @@ class ContinuousRungHoldStrategy(Strategy):
         return station, parsed.climate_date
 
     def _station_day_existing_legs(
-        self, station_day: tuple[str, str],
+        self,
+        station_day: tuple[str, str],
     ) -> tuple[tuple[str, ...], Mapping[str, DurableFillRecord]]:
         """ADM-1 shared helper for the YES (``:2143-2161`` pre-fix) and NO
         (``:2550-2568`` pre-fix) arm-time gates: every instrument-leg
@@ -1264,7 +1285,8 @@ class ContinuousRungHoldStrategy(Strategy):
             # event's own hand-off.
             self.position_events.record(_POSITION_OPENED_EVENT_UNRESOLVED)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
             return
         self._forward_to_monitor(
@@ -1286,7 +1308,8 @@ class ContinuousRungHoldStrategy(Strategy):
         except Exception:  # noqa: BLE001 - a monitor must never affect the strategy's own path
             self.position_events.record(_POSITION_MONITOR_ERROR)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
 
     def _diagnostics_snapshot_message(self) -> str:
@@ -1344,7 +1367,8 @@ class ContinuousRungHoldStrategy(Strategy):
         emitted = self._run_observability(
             "continuous_rung_hold diagnostics-summary rollover failed",
             lambda: self._emit_diagnostics_row(
-                hour_utc_start_ns=closed_hour_start_ns, final=False,
+                hour_utc_start_ns=closed_hour_start_ns,
+                final=False,
             ),
         )
         # Silent-failure review (2026-09-25): the bucket (and therefore the
@@ -1389,9 +1413,7 @@ class ContinuousRungHoldStrategy(Strategy):
         bid_only_delta = cast(int, current["bid_only_in_window"]) - cast(
             int, baseline["bid_only_in_window"]
         )
-        no_oob_delta = cast(int, current["no_out_of_band"]) - cast(
-            int, baseline["no_out_of_band"]
-        )
+        no_oob_delta = cast(int, current["no_out_of_band"]) - cast(int, baseline["no_out_of_band"])
         summary_errors_delta = cast(int, current["diagnostics_summary_errors"]) - cast(
             int, baseline["diagnostics_summary_errors"]
         )
@@ -1454,7 +1476,8 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         offset = self._std_utc_offset_hours_by_station[station]
         accumulator = self._accumulators.setdefault(
-            station, RunningExtremeAccumulator(std_utc_offset_hours=offset),
+            station,
+            RunningExtremeAccumulator(std_utc_offset_hours=offset),
         )
         accumulator.push(
             data.observed_at_ns,
@@ -1601,7 +1624,11 @@ class ContinuousRungHoldStrategy(Strategy):
                 return
 
             setup = self._eligible_setup(
-                snapshot.instrument_id, facts, running_max, accumulator, now_ns,
+                snapshot.instrument_id,
+                facts,
+                running_max,
+                accumulator,
+                now_ns,
             )
             no_decision: Decision
             if snapshot.ask is not None:
@@ -1795,9 +1822,16 @@ class ContinuousRungHoldStrategy(Strategy):
             store = self._latch._store
             prefix = self._latch._key_prefix
             no_iid = str(sibling_instrument_id(InstrumentId.from_str(iid)))
-            if refuse_if_sibling_leg_traded(
-                store, prefix, station, climate_day_key, no_iid,
-            ) is not None:
+            if (
+                refuse_if_sibling_leg_traded(
+                    store,
+                    prefix,
+                    station,
+                    climate_day_key,
+                    no_iid,
+                )
+                is not None
+            ):
                 self._yes_fill_blocks_no.add(cache_key)
                 return
 
@@ -1898,9 +1932,7 @@ class ContinuousRungHoldStrategy(Strategy):
             # inputs -- `size` is always `0` for an ask-less snapshot and
             # would collapse two DIFFERENT bids at the same `ts_event` into
             # one dedupe key.
-            dedupe_key: (
-                tuple[int, Decimal, int] | tuple[int, None, Decimal | None, Decimal | None]
-            )
+            dedupe_key: tuple[int, Decimal, int] | tuple[int, None, Decimal | None, Decimal | None]
             if snapshot.ask is not None:
                 dedupe_key = (snapshot.ts_event, snapshot.ask, snapshot.size)
             else:
@@ -1964,7 +1996,9 @@ class ContinuousRungHoldStrategy(Strategy):
         # while this leg's fill outcome is unresolved, so NO is not
         # evaluated on this branch.
         if self._latch.is_inflight(
-            station, climate_day_key, key_instrument_id=iid,
+            station,
+            climate_day_key,
+            key_instrument_id=iid,
         ) and not self._release_stale_inflight(
             station,
             climate_day_key,
@@ -2138,7 +2172,11 @@ class ContinuousRungHoldStrategy(Strategy):
         # can share these exact three lookups -- same calls, same order, no
         # behaviour change on this (YES) path.
         setup = self._eligible_setup(
-            snapshot.instrument_id, facts, running_max, accumulator, now_ns,
+            snapshot.instrument_id,
+            facts,
+            running_max,
+            accumulator,
+            now_ns,
         )
         width_code, m_code = setup.width_code, setup.m_code
         fee_coefficient = setup.fee_coefficient
@@ -2212,7 +2250,11 @@ class ContinuousRungHoldStrategy(Strategy):
             store = self._latch._store
             prefix = self._latch._key_prefix
             yes_admission_refusal = refuse_if_sibling_leg_traded(
-                store, prefix, station, climate_day_key, iid,
+                store,
+                prefix,
+                station,
+                climate_day_key,
+                iid,
             )
             if yes_admission_refusal is None:
                 existing_ids, pending_fills = self._station_day_existing_legs(station_day)
@@ -2382,15 +2424,17 @@ class ContinuousRungHoldStrategy(Strategy):
         self._latch.set_inflight(station, climate_day_key, key_instrument_id=iid)
         if self._submission_armed():
             self._latch.record_attempt(
-                station, climate_day_key, ts_ns=snapshot.ts_event, key_instrument_id=iid,
+                station,
+                climate_day_key,
+                ts_ns=snapshot.ts_event,
+                key_instrument_id=iid,
             )
             if attempt_state[0] > 0:
                 # B3 (Decision 3, HF-4 rev2): a genuine RE-arm (attempts
                 # already > 0 before this one), never the first attempt --
                 # the boot walk already has its own INFO line for that.
                 self._record_rearm_decision(
-                    f"rearm: {station}/{climate_day_key} re-armed "
-                    f"(attempt={attempt_state[0] + 1})"
+                    f"rearm: {station}/{climate_day_key} re-armed (attempt={attempt_state[0] + 1})"
                 )
         self._maybe_submit(iid, decision)
         if not self._submission_armed():
@@ -2592,7 +2636,11 @@ class ContinuousRungHoldStrategy(Strategy):
         pending = is_no_side_pending(store)
 
         sibling_refusal = refuse_if_sibling_leg_traded(
-            store, prefix, station, climate_day_key, no_iid,
+            store,
+            prefix,
+            station,
+            climate_day_key,
+            no_iid,
         )
         if sibling_refusal is not None:
             _refuse_once(sibling_refusal.reason)
@@ -2613,7 +2661,8 @@ class ContinuousRungHoldStrategy(Strategy):
         if admission_refusal is not None:
             _refuse_once(admission_refusal.reason)
             _append_no_offer_tape(
-                decision_label="refuse", admission_reason=admission_refusal.reason,
+                decision_label="refuse",
+                admission_reason=admission_refusal.reason,
             )
             return
 
@@ -2621,13 +2670,15 @@ class ContinuousRungHoldStrategy(Strategy):
         if self._latch.is_day_budget_exhausted(utc_day):
             _refuse_once(_NO_REFUSE_DAY_BUDGET_EXHAUSTED)
             _append_no_offer_tape(
-                decision_label="refuse", admission_reason=_NO_REFUSE_DAY_BUDGET_EXHAUSTED,
+                decision_label="refuse",
+                admission_reason=_NO_REFUSE_DAY_BUDGET_EXHAUSTED,
             )
             return
         if self._latch.is_consumed(station, climate_day_key, key_instrument_id=no_iid):
             _refuse_once(_NO_REFUSE_TRIAL_DAY_CONSUMED)
             _append_no_offer_tape(
-                decision_label="refuse", admission_reason=_NO_REFUSE_TRIAL_DAY_CONSUMED,
+                decision_label="refuse",
+                admission_reason=_NO_REFUSE_TRIAL_DAY_CONSUMED,
             )
             return
 
@@ -2649,8 +2700,7 @@ class ContinuousRungHoldStrategy(Strategy):
             # `staleness_ns` are absent (the two direct-call-site unit tests
             # never supply them), never a `NoneType` crash on `.lower_f`.
             no_r_bounds = (
-                "None" if running_max is None
-                else f"[{running_max.lower_f},{running_max.upper_f}]"
+                "None" if running_max is None else f"[{running_max.lower_f},{running_max.upper_f}]"
             )
             no_obs_ts_ns = None if running_max is None else running_max.source_observed_at_ns
             no_staleness_s = None if staleness_ns is None else staleness_ns / _NS_PER_SECOND
@@ -2706,7 +2756,10 @@ class ContinuousRungHoldStrategy(Strategy):
         self.no_takes += 1
         self._latch.set_inflight(station, climate_day_key, key_instrument_id=no_iid)
         self._latch.record_attempt(
-            station, climate_day_key, ts_ns=now_ns, key_instrument_id=no_iid,
+            station,
+            climate_day_key,
+            ts_ns=now_ns,
+            key_instrument_id=no_iid,
         )
         self._record_rearm_decision(
             f"rearm: {station}/{climate_day_key} NO armed instrument={no_iid}"
@@ -2780,9 +2833,7 @@ class ContinuousRungHoldStrategy(Strategy):
             return False
         if last_attempt_ns is not None and now_ns < last_attempt_ns + _REARM_MIN_DELAY_NS:
             return False
-        evidence = (
-            self._position_evidence_reader() if self._position_evidence_reader else None
-        )
+        evidence = self._position_evidence_reader() if self._position_evidence_reader else None
         if not startup_evidence_permits_arm(evidence):
             return False
         slug = InstrumentId.from_str(instrument_id).symbol.value
@@ -2812,11 +2863,15 @@ class ContinuousRungHoldStrategy(Strategy):
         # (R-9a): the RE-ARM ceiling (180s) is tighter than the boot-walk's
         # 600s -- `_STARTUP_EVIDENCE_MAX_AGE_NS` keeps its only OTHER
         # consumer, site 1 `_run_never_arm_walk`.
-        return startup_evidence_confirms_absent_flat(
-            evidence, slug,
-            now_ns=self.clock.timestamp_ns(),
-            max_age_ns=_REARM_EVIDENCE_MAX_AGE_NS,
-        ) and self.portfolio.net_position(InstrumentId.from_str(instrument_id)) <= 0
+        return (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                slug,
+                now_ns=self.clock.timestamp_ns(),
+                max_age_ns=_REARM_EVIDENCE_MAX_AGE_NS,
+            )
+            and self.portfolio.net_position(InstrumentId.from_str(instrument_id)) <= 0
+        )
 
     def on_order_denied(self, event: OrderDenied) -> None:
         """SAFETY C1 (plan rev 6.1): clear IN_FLIGHT for a WAIT-class deny.
@@ -2876,7 +2931,11 @@ class ContinuousRungHoldStrategy(Strategy):
             )
 
     def _halt_family_for_ambiguous_exit(
-        self, *, position_id: str, reason: str, ts_ns: int,
+        self,
+        *,
+        position_id: str,
+        reason: str,
+        ts_ns: int,
     ) -> None:
         """Thin delegator (extraction: `exit_wiring.py`, brief's "keep
         continuous_strategy.py growth small") -- kept as a bound method
@@ -2884,7 +2943,10 @@ class ContinuousRungHoldStrategy(Strategy):
         overrides that must stay on this class.
         """
         exit_wiring.halt_family_for_ambiguous_exit(
-            self, position_id=position_id, reason=reason, ts_ns=ts_ns,
+            self,
+            position_id=position_id,
+            reason=reason,
+            ts_ns=ts_ns,
         )
 
     def _release_stale_inflight(
@@ -2969,8 +3031,7 @@ class ContinuousRungHoldStrategy(Strategy):
             self._rearm_decision_dedupe = set()
         self._rearm_decision_dedupe.add(key)
         self._record_rearm_decision(
-            f"rearm: {station_day[0]}/{station_day[1]} denied reason={reason} "
-            f"attempts={attempts}"
+            f"rearm: {station_day[0]}/{station_day[1]} denied reason={reason} attempts={attempts}"
         )
 
     def _record_rearm_decision(self, summary: str) -> None:
@@ -3022,18 +3083,13 @@ class ContinuousRungHoldStrategy(Strategy):
             # this one (a genuine, if narrow, race) -- nothing to log.
             return
         state = self._open_intent_wait_log_state
-        if (
-            state is not None
-            and state[0] == intent.intent_id
-            and now_ns - state[1] < _NS_PER_HOUR
-        ):
+        if state is not None and state[0] == intent.intent_id and now_ns - state[1] < _NS_PER_HOUR:
             return
         self._open_intent_wait_log_state = (intent.intent_id, now_ns)
         station = ",".join(self._config.stations)
         age_s = (now_ns - intent.created_ns) / _NS_PER_SECOND
         self._record_open_intent_wait(
-            f"open_intent_wait: station={station} intent_id={intent.intent_id} "
-            f"age_s={age_s}"
+            f"open_intent_wait: station={station} intent_id={intent.intent_id} age_s={age_s}"
         )
 
     def _record_open_intent_wait(self, summary: str) -> None:
@@ -3107,7 +3163,8 @@ class ContinuousRungHoldStrategy(Strategy):
             self._unjoinable_fill_instruments.add(str(event.instrument_id))
             self.position_events.record(_POSITION_UNJOINABLE_FILL)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
             return
         station, climate_day_key = joined
@@ -3123,7 +3180,8 @@ class ContinuousRungHoldStrategy(Strategy):
             self._unjoinable_fill_instruments.add(iid)
             self.position_events.record(_POSITION_FILL_JOIN_ERROR)
             self._report_alerter(
-                self.position_alerter, "continuous_rung_hold position report failed",
+                self.position_alerter,
+                "continuous_rung_hold position report failed",
             )
 
     def _on_exit_order_filled(self, event: OrderFilled) -> None:
@@ -3145,7 +3203,11 @@ class ContinuousRungHoldStrategy(Strategy):
         exit_wiring.submit_exit(self, proposal)
 
     def check_ambiguous_exit_intent(
-        self, *, client_order_id: str, position_id: str, now_ns: int,
+        self,
+        *,
+        client_order_id: str,
+        position_id: str,
+        now_ns: int,
     ) -> None:
         """Injected into `PositionMonitor` as its `check_ambiguous_exit`
         callable (review finding B). Thin delegator (extraction:
@@ -3155,11 +3217,16 @@ class ContinuousRungHoldStrategy(Strategy):
         `exit_wiring` itself.
         """
         exit_wiring.check_exit_intent_for_ambiguous_send(
-            self, client_order_id=client_order_id, position_id=position_id, now_ns=now_ns,
+            self,
+            client_order_id=client_order_id,
+            position_id=position_id,
+            now_ns=now_ns,
         )
 
     def _recorded_fee_for(
-        self, instrument_id: InstrumentId, venue_order_id: str,
+        self,
+        instrument_id: InstrumentId,
+        venue_order_id: str,
     ) -> Decimal | None:
         """The per-contract venue fee this fill's own durable
         `DurableFillRecord` supports, when known.
@@ -3192,7 +3259,11 @@ class ContinuousRungHoldStrategy(Strategy):
         return None
 
     def _consume_or_flag_duplicate(
-        self, station: str, climate_day_key: str, *, event: OrderFilled,
+        self,
+        station: str,
+        climate_day_key: str,
+        *,
+        event: OrderFilled,
     ) -> None:
         """The latch read/write body of `on_order_filled`, isolated so its
         caller can wrap it in exactly one try/except (review item 1).
@@ -3219,7 +3290,10 @@ class ContinuousRungHoldStrategy(Strategy):
             fee=fee,
         )
         wrote = self._latch.consume_if_absent(
-            station, climate_day_key, record, key_instrument_id=instrument_id,
+            station,
+            climate_day_key,
+            record,
+            key_instrument_id=instrument_id,
         )
         if wrote:
             # Live evidence (09-13): `continuous_rung_hold/inflight/MIA/
@@ -3232,7 +3306,9 @@ class ContinuousRungHoldStrategy(Strategy):
             self._latch.clear_inflight(station, climate_day_key, key_instrument_id=instrument_id)
             return
         existing = self._latch.record_with_legacy_fallback(
-            station, climate_day_key, key_instrument_id=instrument_id,
+            station,
+            climate_day_key,
+            key_instrument_id=instrument_id,
         )
         if existing is None:
             return
@@ -3243,7 +3319,8 @@ class ContinuousRungHoldStrategy(Strategy):
             # so this must never fire the family halt.
             self.log.warning(
                 _LEGACY_RECORD_NO_VENUE_ORDER_ID_WARNING.format(
-                    station=station, climate_day=climate_day_key,
+                    station=station,
+                    climate_day=climate_day_key,
                 ),
             )
             return
@@ -3331,8 +3408,7 @@ class ContinuousRungHoldStrategy(Strategy):
 
     def _maybe_submit(self, instrument_id: str, decision: Take) -> None:
         if not (
-            self._submission_armed()
-            and isinstance(self._config.stale_observation_minutes, int)
+            self._submission_armed() and isinstance(self._config.stale_observation_minutes, int)
         ):
             self.log.info(
                 "TAKE recorded, no submit "

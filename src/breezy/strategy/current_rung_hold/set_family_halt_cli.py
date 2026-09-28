@@ -248,7 +248,8 @@ def _positions_from_live_payload(payload: Mapping[str, Any]) -> dict[str, Decima
 
 
 def check_pre_set_position(
-    *, positions_reader: Callable[[], Mapping[str, Any]],
+    *,
+    positions_reader: Callable[[], Mapping[str, Any]],
 ) -> PositionCheckResult:
     """The mandatory pre-set open-position read (plan §6.5, AUD-02b
     amendment P1). The live positions GET is the ONLY accepted evidence of
@@ -287,7 +288,9 @@ def check_pre_set_position(
         # caller sees stays the class name only, regardless.
         logger.exception("live positions GET failed")
         return PositionCheckResult(
-            SOURCE_LIVE, VERDICT_UNKNOWN, f"LIVE_GET_FAILED:{type(exc).__name__}",
+            SOURCE_LIVE,
+            VERDICT_UNKNOWN,
+            f"LIVE_GET_FAILED:{type(exc).__name__}",
         )
     try:
         positions = _positions_from_live_payload(payload)
@@ -295,7 +298,9 @@ def check_pre_set_position(
         return PositionCheckResult(SOURCE_LIVE, VERDICT_UNKNOWN, f"LIVE_PAGE_REJECTED:{exc}")
     if positions is None:
         return PositionCheckResult(
-            SOURCE_LIVE, VERDICT_UNKNOWN, "LIVE_PAGE_REJECTED:slug_entry_invalid",
+            SOURCE_LIVE,
+            VERDICT_UNKNOWN,
+            "LIVE_PAGE_REJECTED:slug_entry_invalid",
         )
     if any(net != 0 for net in positions.values()):
         return PositionCheckResult(SOURCE_LIVE, VERDICT_OPEN, "non_zero_net_position")
@@ -496,7 +501,9 @@ def set_family_halt(
                 assert evidence_sha256 is not None  # narrows for mypy; set above, non-status path
                 now_ns = time.time_ns()
                 trial_latch.record_policy_halt(
-                    reason=args.reason, evidence_sha256=evidence_sha256, ts_ns=now_ns,
+                    reason=args.reason,
+                    evidence_sha256=evidence_sha256,
+                    ts_ns=now_ns,
                 )
 
                 # P3(iv): read back through the SAME chokepoint the veto
@@ -549,8 +556,7 @@ def set_family_halt(
             event="family_halt_set",
             site="breezy-set-family-halt",
             detail=(
-                f"family_id={args.family_id} reason={args.reason} "
-                f"evidence_sha256={evidence_sha256}"
+                f"family_id={args.family_id} reason={args.reason} evidence_sha256={evidence_sha256}"
             ),
         ),
     )

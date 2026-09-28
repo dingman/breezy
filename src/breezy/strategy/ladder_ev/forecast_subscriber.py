@@ -54,9 +54,7 @@ class ForecastStateActor(Actor):
             raise ValueError("`stations` must name at least one station")
         self._variable = variable
         self._client_id = client_id
-        self._states: dict[str, ForecastState] = {
-            station: ForecastState() for station in stations
-        }
+        self._states: dict[str, ForecastState] = {station: ForecastState() for station in stations}
         self.counters: Counter[str] = Counter()
 
     def state_for(self, station: str) -> ForecastState:

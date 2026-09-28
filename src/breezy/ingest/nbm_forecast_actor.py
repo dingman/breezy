@@ -100,9 +100,7 @@ DEFAULT_NBM_TIMER_INTERVAL_SECONDS: Final[int] = 900
 class BulletinFetcher(Protocol):
     """The one transport method the Actor calls."""
 
-    async def fetch_nbs_bulletin(
-        self, *, cycle_date: dt.date, cycle_hour: int
-    ) -> FetchResult: ...
+    async def fetch_nbs_bulletin(self, *, cycle_date: dt.date, cycle_hour: int) -> FetchResult: ...
 
 
 #: Builds the transport ON THE ACTOR'S CLOCK -- called from `on_start` with

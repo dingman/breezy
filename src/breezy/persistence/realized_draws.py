@@ -295,8 +295,6 @@ def load_realized_draws(store_dir: Path) -> RealizedDraws:
         n_admissible_fills=len(admissible),
         n_dropped_residual=sum(1 for row in rows if row.trial_id in residual),
         n_dropped_excluded_reason=sum(
-            1
-            for row in rows
-            if row.trial_id not in residual and row.excluded_reason is not None
+            1 for row in rows if row.trial_id not in residual and row.excluded_reason is not None
         ),
     )

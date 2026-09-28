@@ -477,8 +477,8 @@ TERMINAL_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
 #: quantity`` too -- a body claiming FILLED with a short ``cumQuantity`` and
 #: zero leaves is a genuine contradiction, not a legitimate terminal shape,
 #: so it keeps the strict ``leaves == quantity - cumQuantity`` identity.
-NON_FILL_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = (
-    TERMINAL_ORDER_STATUSES - frozenset({OrderStatus.FILLED})
+NON_FILL_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = TERMINAL_ORDER_STATUSES - frozenset(
+    {OrderStatus.FILLED}
 )
 
 #: The two ``ExecutionType`` members that describe a trade
@@ -613,9 +613,7 @@ def _key_tree(payload: Mapping[str, Any], *, depth: int = 0) -> str:
             elif depth >= _KEY_TREE_MAX_DEPTH:
                 parts.append(f"{name}[{len(value)}]: {{{_DEPTH_CAPPED}}}")
             else:
-                rendered = ", ".join(
-                    f"{{{_key_tree(row, depth=depth + 1)}}}" for row in rows
-                )
+                rendered = ", ".join(f"{{{_key_tree(row, depth=depth + 1)}}}" for row in rows)
                 more = (
                     f", +{len(value) - _KEY_TREE_MAX_LIST_ROWS} more"
                     if len(value) > _KEY_TREE_MAX_LIST_ROWS
@@ -641,8 +639,7 @@ def _require_text(payload: Mapping[str, Any], key: str, *, context: str) -> str:
     value = _require(payload, key, context=context)
     if not isinstance(value, str) or not value:
         raise ExecutionReportMappingError(
-            f"{context} field {key!r} must be a non-empty string, got "
-            f"{type(value).__name__}"
+            f"{context} field {key!r} must be a non-empty string, got {type(value).__name__}"
         )
     return value
 
@@ -656,9 +653,7 @@ def _require_bool(payload: Mapping[str, Any], key: str, *, context: str) -> bool
     return value
 
 
-def _lookup[T](
-    table: Mapping[str, T], payload: Mapping[str, Any], key: str, *, context: str
-) -> T:
+def _lookup[T](table: Mapping[str, T], payload: Mapping[str, Any], key: str, *, context: str) -> T:
     value = _require(payload, key, context=context)
     if not isinstance(value, str) or value not in table:
         raise ExecutionReportMappingError(
@@ -707,9 +702,7 @@ def _quantity_field(
         field=field,
         error=ExecutionReportMappingError,
     )
-    return _report_quantity(
-        value, instrument=instrument, field=field, allow_zero=allow_zero
-    )
+    return _report_quantity(value, instrument=instrument, field=field, allow_zero=allow_zero)
 
 
 def _amount_field(payload: Mapping[str, Any], key: str, *, context: str) -> Decimal:
@@ -1000,8 +993,7 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
     entries = _require(payload, "balances", context=context)
     if isinstance(entries, (str, bytes)) or not isinstance(entries, Sequence):
         raise ExecutionReportMappingError(
-            f"{context} field 'balances' must be a JSON array, got "
-            f"{type(entries).__name__}"
+            f"{context} field 'balances' must be a JSON array, got {type(entries).__name__}"
         )
     if not entries:
         raise ExecutionReportMappingError(
@@ -1076,9 +1068,7 @@ def _usd_commission(value: Decimal, *, field: str, raw: str) -> Money:
     return Money(representable, USD)
 
 
-def _parse_account_balance(
-    payload: object, *, context: str
-) -> tuple[AccountBalance, int]:
+def _parse_account_balance(payload: object, *, context: str) -> tuple[AccountBalance, int]:
     balance = _assert_known_keys(
         payload,
         known=_USER_BALANCE_KEYS | _USER_BALANCE_DRIFT_ALLOWED_KEYS,
@@ -1162,9 +1152,7 @@ def parse_order_status_report(
     """
     context = "order status report"
     order = _known_order(payload, context=context)
-    _assert_market_matches(
-        order.get("marketSlug"), instrument=instrument, context=context
-    )
+    _assert_market_matches(order.get("marketSlug"), instrument=instrument, context=context)
     leg = leg_of(instrument.id)
     order_side = _order_side_for_leg(order, leg=leg, context=context, closing=closing)
 
@@ -1325,17 +1313,13 @@ def parse_fill_report(
 
     order_context = f"{context}.order"
     order = _known_order(_require(execution, "order", context=context), context=order_context)
-    _assert_market_matches(
-        order.get("marketSlug"), instrument=instrument, context=order_context
-    )
+    _assert_market_matches(order.get("marketSlug"), instrument=instrument, context=order_context)
     leg = leg_of(instrument.id)
     order_side = _order_side_for_leg(order, leg=leg, context=order_context, closing=closing)
 
     _assert_taker_fill(execution, context=context)
 
-    commission_payload = _require(
-        execution, "commissionNotionalCollected", context=context
-    )
+    commission_payload = _require(execution, "commissionNotionalCollected", context=context)
     commission_dec = _parse_amount(
         commission_payload,
         field=f"{context}.commissionNotionalCollected",
@@ -1346,9 +1330,7 @@ def parse_fill_report(
         if isinstance(commission_payload, Mapping)
         else commission_payload
     )
-    if isinstance(raw_value, bool) or not isinstance(
-        raw_value, (str, int, float, Decimal)
-    ):
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (str, int, float, Decimal)):
         raise ExecutionReportMappingError(
             f"{context} field 'commissionNotionalCollected.value' must be a "
             f"number or numeric string, got {type(raw_value).__name__}"
@@ -1360,9 +1342,7 @@ def parse_fill_report(
         venue_order_id=VenueOrderId(_require_text(order, "id", context=order_context)),
         trade_id=TradeId(_require_text(execution, "tradeId", context=context)),
         order_side=order_side,
-        last_qty=_quantity_field(
-            execution, "lastShares", instrument=instrument, context=context
-        ),
+        last_qty=_quantity_field(execution, "lastShares", instrument=instrument, context=context),
         last_px=_leg_price_field(
             execution, "lastPx", instrument=instrument, leg=leg, context=context
         ),

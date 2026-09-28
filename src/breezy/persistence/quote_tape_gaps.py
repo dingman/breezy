@@ -115,7 +115,6 @@ def _query_gap_rows(catalog: ParquetDataCatalog) -> list[QuoteTapeGap]:
             rows.append(item.data)
         else:  # pragma: no cover - defensive against Nautilus API drift
             raise TypeError(
-                "expected QuoteTapeGap rows from Nautilus catalog query, "
-                f"got {type(item).__name__}"
+                f"expected QuoteTapeGap rows from Nautilus catalog query, got {type(item).__name__}"
             )
     return rows

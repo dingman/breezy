@@ -80,7 +80,8 @@ __all__ = ["MonitorCallables", "build_monitor_callables"]
 
 
 def _facts_for_either_leg(
-    facts: Mapping[str, WeatherBucketFacts], iid: str,
+    facts: Mapping[str, WeatherBucketFacts],
+    iid: str,
 ) -> WeatherBucketFacts | None:
     """FU-1: resolve ``iid``'s rung geometry, falling back to its YES
     sibling's facts when ``iid`` is a NO-leg id absent from ``facts``.
@@ -180,12 +181,17 @@ def build_monitor_callables(strategy: ContinuousRungHoldStrategy) -> MonitorCall
         )
 
     def _latch_record(
-        station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> TrialDayRecord | None:
         if strategy._latch is None:
             return None
         return strategy._latch.record_with_legacy_fallback(
-            station, climate_day, key_instrument_id=key_instrument_id,
+            station,
+            climate_day,
+            key_instrument_id=key_instrument_id,
         )
 
     def _rung_geometry(iid: str) -> WeatherBucketFacts | None:

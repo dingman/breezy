@@ -247,9 +247,7 @@ def write_monitor_summaries(
     table = pa.Table.from_pylist(rows, schema=MONITOR_SUMMARY_SCHEMA)
     target = directory / f"{_SUMMARY_FILE_PREFIX}{_stamp(now_ns)}{_SUMMARY_FILE_SUFFIX}"
 
-    fd, tmp_name = tempfile.mkstemp(
-        dir=directory, prefix=f".{_SUMMARY_FILE_PREFIX}", suffix=".tmp"
-    )
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{_SUMMARY_FILE_PREFIX}", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
         os.close(fd)

@@ -168,9 +168,7 @@ def main(
     sink_factory: SinkFactory | None = None,
 ) -> int:
     """Console-script entrypoint. The one caller of :func:`check_alerts`."""
-    return check_alerts(
-        argv, env=env, stdout=stdout, stderr=stderr, sink_factory=sink_factory
-    )
+    return check_alerts(argv, env=env, stdout=stdout, stderr=stderr, sink_factory=sink_factory)
 
 
 if __name__ == "__main__":

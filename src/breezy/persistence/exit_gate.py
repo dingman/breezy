@@ -64,10 +64,7 @@ def family_declares_exit_rule(manifest: FamilyManifest) -> bool:
     `_EXIT_RULE_REGISTERED_FAMILIES` gates False, and a code-registered
     family whose manifest omits `exit_rule` also gates False.
     """
-    return (
-        manifest.family_id in _EXIT_RULE_REGISTERED_FAMILIES
-        and manifest.exit_rule is not None
-    )
+    return manifest.family_id in _EXIT_RULE_REGISTERED_FAMILIES and manifest.exit_rule is not None
 
 
 def family_declares_no_leg_exit(manifest: FamilyManifest) -> bool:

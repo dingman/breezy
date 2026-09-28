@@ -81,9 +81,7 @@ def _default_observation_sidecar_path(
     """
     now = dt.datetime.now(tz=dt.UTC)
     days = [
-        climate_day_for_instant(
-            now, registry.climate_day_window(venue, city).std_utc_offset_hours
-        )
+        climate_day_for_instant(now, registry.climate_day_window(venue, city).std_utc_offset_hours)
         for venue, city, _site in eligible
     ]
     day = min(days) if days else now.date()

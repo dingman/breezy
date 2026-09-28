@@ -329,8 +329,7 @@ class PositionMonitorSummary:
         _require_optional_decimal(self.settled_pnl, "settled_pnl")
         if self.settled_held is not None and not isinstance(self.settled_held, bool):
             raise TypeError(
-                f"`settled_held` must be a `bool` or `None`, was "
-                f"{type(self.settled_held).__name__}"
+                f"`settled_held` must be a `bool` or `None`, was {type(self.settled_held).__name__}"
             )
         require_bool(self.monitor_intervened, "monitor_intervened")
         if self.monitor_intervened:
@@ -406,7 +405,8 @@ class PositionMonitorSummary:
                 else None
             ),
             verdict_at_signal=(
-                str(values["verdict_at_signal"]) if values["verdict_at_signal"] is not None
+                str(values["verdict_at_signal"])
+                if values["verdict_at_signal"] is not None
                 else None
             ),
             recoverable_value_at_signal=_str_to_decimal(
@@ -420,9 +420,7 @@ class PositionMonitorSummary:
             settled_held=(
                 bool(values["settled_held"]) if values["settled_held"] is not None else None
             ),
-            exit_rule=(
-                str(values["exit_rule"]) if values.get("exit_rule") is not None else None
-            ),
+            exit_rule=(str(values["exit_rule"]) if values.get("exit_rule") is not None else None),
             exit_decision=(
                 str(values["exit_decision"]) if values.get("exit_decision") is not None else None
             ),
@@ -431,9 +429,7 @@ class PositionMonitorSummary:
                 if values.get("exit_reason_code") is not None
                 else None
             ),
-            exit_limit_price=_str_to_decimal(
-                values.get("exit_limit_price"), "exit_limit_price"
-            ),
+            exit_limit_price=_str_to_decimal(values.get("exit_limit_price"), "exit_limit_price"),
             expected_settlement_value=_str_to_decimal(
                 values.get("expected_settlement_value"), "expected_settlement_value"
             ),

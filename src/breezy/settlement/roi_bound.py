@@ -179,9 +179,7 @@ def compute_roi_bound(rows: Sequence[ROIInputRow]) -> ROIBoundResult:
     """
     total = len(rows)
     excluded_count = sum(1 for row in rows if row.excluded_reason is not None)
-    exclusion_fraction = (
-        Decimal(excluded_count) / Decimal(total) if total > 0 else Decimal(0)
-    )
+    exclusion_fraction = Decimal(excluded_count) / Decimal(total) if total > 0 else Decimal(0)
     if exclusion_fraction > EXCLUSION_FRACTION_CEILING:
         return ROIBoundRefused(exclusion_fraction=exclusion_fraction)
 

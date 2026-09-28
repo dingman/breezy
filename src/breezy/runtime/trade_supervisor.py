@@ -1059,9 +1059,7 @@ class SupervisorPorts:
     #: bool above so ``_do_self_check`` can pass it to
     #: ``read_continuous_family_store_state`` below.
     resolve_sending_family_id: Callable[[], str | None] = field(default=lambda: None)
-    read_continuous_family_store_state: Callable[
-        [Path, str], ContinuousFamilyStoreState
-    ] = field(
+    read_continuous_family_store_state: Callable[[Path, str], ContinuousFamilyStoreState] = field(
         default=lambda _p, _f: ContinuousFamilyStoreState(
             startup_evidence=None, family_halted=False
         )
@@ -1958,9 +1956,7 @@ def _do_midday_watch(
             reason="first-boot permit expiry unknown",
         )
         if not state.midday_ceiling_unknown_alert_sent:
-            log_decision(
-                "midday_relaunch_ceiling_unknown", phase="midday_watch", pid=tracked_pid
-            )
+            log_decision("midday_relaunch_ceiling_unknown", phase="midday_watch", pid=tracked_pid)
             alert(
                 ports.alert_sink,
                 event="TRADE_SUPERVISOR_MIDDAY_WATCH",

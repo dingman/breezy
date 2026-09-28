@@ -212,10 +212,13 @@ def trade_cost_prob(
             f"Slippage {slippage_prob!r} is negative or non-finite; a negative "
             "execution term is a rebate on execution and there is no such thing",
         )
-    return venue_fee_prob(
-        executable_price=executable_price,
-        fee_coefficient=fee_coefficient,
-    ) + slippage_prob
+    return (
+        venue_fee_prob(
+            executable_price=executable_price,
+            fee_coefficient=fee_coefficient,
+        )
+        + slippage_prob
+    )
 
 
 class NoExecutableDepthError(ValueError):

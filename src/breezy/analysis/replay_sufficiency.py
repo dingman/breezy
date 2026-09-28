@@ -313,7 +313,9 @@ class WindowExtentFold:
 
 
 def count_live_instances_in_window(
-    capture_start_ns_values: Sequence[int], *, window_end_ns: int,
+    capture_start_ns_values: Sequence[int],
+    *,
+    window_end_ns: int,
 ) -> int:
     """C3/B7: count LIVE instances whose CAPTURE START precedes the window's end.
 
@@ -609,8 +611,7 @@ def _parse_excluded_fragments(payload: object) -> tuple[FragmentSpan, ...]:
                 )
             if expected_type is str and not isinstance(value, str):
                 raise ReplaySufficiencyRecordError(
-                    f"'excluded_fragments' entry {name!r} must be a str, "
-                    f"got {type(value).__name__}"
+                    f"'excluded_fragments' entry {name!r} must be a str, got {type(value).__name__}"
                 )
         fragments.append(
             FragmentSpan(
@@ -677,7 +678,10 @@ def is_replayable_whole_day(row: ReplaySufficiency) -> bool:
 
 
 def _window_complete(
-    *, winner: InstanceSpan | None, window_start_ns: int, window_end_ns: int,
+    *,
+    winner: InstanceSpan | None,
+    window_start_ns: int,
+    window_end_ns: int,
 ) -> bool:
     if winner is None or winner.first_in_window_ns is None or winner.last_in_window_ns is None:
         return False
@@ -844,7 +848,8 @@ def _overlap_ns(a: InstanceSpan, b: InstanceSpan) -> int | None:
     if b.first_in_window_ns is None or b.last_in_window_ns is None:
         return None
     return min(a.last_in_window_ns, b.last_in_window_ns) - max(
-        a.first_in_window_ns, b.first_in_window_ns,
+        a.first_in_window_ns,
+        b.first_in_window_ns,
     )
 
 
@@ -873,7 +878,9 @@ def _pick_winner(eligible: Sequence[InstanceSpan]) -> InstanceSpan:
 
 
 def _fragment_analysis(
-    *, winner: InstanceSpan, clean: Sequence[InstanceSpan],
+    *,
+    winner: InstanceSpan,
+    clean: Sequence[InstanceSpan],
 ) -> tuple[str, tuple[FragmentSpan, ...]]:
     """AUD-09b amendment Stage B (§3): `coverage_kind` plus `excluded_fragments`.
 
@@ -936,7 +943,9 @@ def _sufficient(
         winner_first_in_window_ns=winner.first_in_window_ns,
         winner_last_in_window_ns=winner.last_in_window_ns,
         window_complete=_window_complete(
-            winner=winner, window_start_ns=window_start_ns, window_end_ns=window_end_ns,
+            winner=winner,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
         ),
         live_instance_count=live_instance_count,
         coverage_kind=coverage_kind,

@@ -499,9 +499,7 @@ def _build_price(
     field: str,
     error: type[VenuePayloadError] = VenuePayloadError,
 ) -> Price:
-    quantised = _assert_price_representable(
-        value, precision=precision, field=field, error=error
-    )
+    quantised = _assert_price_representable(value, precision=precision, field=field, error=error)
     return Price.from_str(format(quantised, f".{precision}f"))
 
 
@@ -559,9 +557,7 @@ def parse_rfc3339_nanos(
     keeps every market-data caller unchanged.
     """
     if not isinstance(value, str):
-        raise error(
-            f"Field {field!r} must be an RFC 3339 UTC string, got {type(value).__name__}"
-        )
+        raise error(f"Field {field!r} must be an RFC 3339 UTC string, got {type(value).__name__}")
     match = _RFC3339_RE.match(value)
     if match is None:
         raise error(f"Field {field!r} is not an RFC 3339 UTC timestamp ending in 'Z'")
@@ -961,13 +957,10 @@ def parse_trade_tick(
             f"Trade frame is for slug {observed_slug!r} but was parsed against "
             f"instrument {expected_slug!r}"
         )
-    price = _parse_amount(
-        _require(trade, "price", error=VenuePayloadError), field="trade.price"
-    )
+    price = _parse_amount(_require(trade, "price", error=VenuePayloadError), field="trade.price")
     if price < _PRICE_MIN or price > _PRICE_MAX:
         raise VenuePayloadError(
-            f"Trade price {price} is outside the binary-option range "
-            f"[{_PRICE_MIN}, {_PRICE_MAX}]"
+            f"Trade price {price} is outside the binary-option range [{_PRICE_MIN}, {_PRICE_MAX}]"
         )
     size = _parse_trade_quantity(
         _require(trade, "quantity", error=VenuePayloadError), field="trade.quantity"
@@ -1000,9 +993,7 @@ def parse_trade_tick(
     return TradeTick(
         instrument_id=instrument.id,
         price=_build_price(price, precision=instrument.price_precision, field="trade.price"),
-        size=_build_quantity(
-            size, precision=instrument.size_precision, field="trade.quantity"
-        ),
+        size=_build_quantity(size, precision=instrument.size_precision, field="trade.quantity"),
         aggressor_side=aggressor,
         trade_id=TradeId(derived_id),
         ts_event=ts_event,
@@ -1212,9 +1203,7 @@ def parse_mark_price(
     price, ts_event = settlement
     return MarkPriceUpdate(
         instrument_id=instrument.id,
-        value=_build_price(
-            price, precision=instrument.price_precision, field="stats.settlementPx"
-        ),
+        value=_build_price(price, precision=instrument.price_precision, field="stats.settlementPx"),
         ts_event=ts_event,
         ts_init=ts_init,
     )

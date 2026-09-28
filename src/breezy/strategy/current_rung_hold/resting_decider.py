@@ -313,7 +313,12 @@ class ShadowRestingDecider:
         price_secondary: Decimal | None = None
         if p_bound is not None and best_ask is not None:
             price_secondary, _ = compute_p_star(
-                p_bound, best_ask, margin_secondary, floor=floor, ceiling=ceiling, tick=tick,
+                p_bound,
+                best_ask,
+                margin_secondary,
+                floor=floor,
+                ceiling=ceiling,
+                tick=tick,
             )
 
         if family_halted:
@@ -334,7 +339,12 @@ class ShadowRestingDecider:
             return self._exit(key, "p_hold_undefined", price_secondary)
 
         price, reason = compute_p_star(
-            p_bound, best_ask, margin_primary, floor=floor, ceiling=ceiling, tick=tick,
+            p_bound,
+            best_ask,
+            margin_primary,
+            floor=floor,
+            ceiling=ceiling,
+            tick=tick,
         )
         if price is None:
             assert reason is not None
@@ -356,7 +366,9 @@ class ShadowRestingDecider:
         fill_event, crossed_active = self._crossing_event(current, best_ask)
         if price != current.price:
             self._states[key] = _LegState(
-                price=price, last_ask=best_ask, crossed_active=False,
+                price=price,
+                last_ask=best_ask,
+                crossed_active=False,
             )
             return ShadowRestTickResult(
                 state="RESTING",
@@ -368,7 +380,9 @@ class ShadowRestingDecider:
             )
 
         self._states[key] = _LegState(
-            price=price, last_ask=best_ask, crossed_active=crossed_active,
+            price=price,
+            last_ask=best_ask,
+            crossed_active=crossed_active,
         )
         return ShadowRestTickResult(
             state="RESTING",
@@ -395,7 +409,10 @@ class ShadowRestingDecider:
         return fill_event, is_crossed
 
     def _exit(
-        self, key: RestKey, reason: str, price_secondary: Decimal | None,
+        self,
+        key: RestKey,
+        reason: str,
+        price_secondary: Decimal | None,
     ) -> ShadowRestTickResult:
         """A CANCEL (if a rest was live) or a plain WAIT (if it was not),
         both reported the same way -- see :class:`ShadowRestTickResult`'s
@@ -433,7 +450,11 @@ class ShadowRestingDecider:
         return tuple(events)
 
     def evict_stale_climate_days(
-        self, station: str, leg: Leg, *, keep_newest: int = MAX_CLIMATE_DAYS_PER_STATION_LEG,
+        self,
+        station: str,
+        leg: Leg,
+        *,
+        keep_newest: int = MAX_CLIMATE_DAYS_PER_STATION_LEG,
     ) -> tuple[tuple[RestKey, ShadowRestTickResult], ...]:
         """Hard cap (domain review of 87446c2, finding 2): keep only the
         ``keep_newest`` climate_days (by string/date order) tracked in

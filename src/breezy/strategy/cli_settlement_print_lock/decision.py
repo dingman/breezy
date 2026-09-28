@@ -308,9 +308,7 @@ def worst_admissible_ask(
         root = remainder
     else:
         b = 1.0 + fee_coefficient
-        root = (b - math.sqrt(b * b - 4.0 * fee_coefficient * remainder)) / (
-            2.0 * fee_coefficient
-        )
+        root = (b - math.sqrt(b * b - 4.0 * fee_coefficient * remainder)) / (2.0 * fee_coefficient)
     root = min(max(root, 0.0), 1.0)
     if tick_size is None or tick_size <= 0.0:
         return root

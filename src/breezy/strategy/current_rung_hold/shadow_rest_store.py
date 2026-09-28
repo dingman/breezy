@@ -169,7 +169,9 @@ def write_shadow_rest_summaries(
     target = directory / f"{_SUMMARY_FILE_PREFIX}{_stamp(now_ns)}{_SUMMARY_FILE_SUFFIX}"
 
     fd, tmp_name = tempfile.mkstemp(
-        dir=directory, prefix=f".{_SUMMARY_FILE_PREFIX}", suffix=".tmp",
+        dir=directory,
+        prefix=f".{_SUMMARY_FILE_PREFIX}",
+        suffix=".tmp",
     )
     tmp_path = Path(tmp_name)
     try:

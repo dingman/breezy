@@ -405,8 +405,7 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
             )
         if not isinstance(self.trade_shard_halving, bool):
             raise SettingsError(
-                "trade_shard_halving must be a bool, was "
-                f"{type(self.trade_shard_halving).__name__}"
+                f"trade_shard_halving must be a bool, was {type(self.trade_shard_halving).__name__}"
             )
         if (
             not isinstance(self.empty_discovery_retry_secs, int | float)
@@ -510,17 +509,14 @@ def assert_well_formed_origin(
     parts = urlsplit(origin)
     if parts.scheme != scheme:
         raise SettingsError(
-            f"PolymarketUSDataClientConfig.{field} must use the {scheme!r} "
-            f"scheme, was {origin!r}"
+            f"PolymarketUSDataClientConfig.{field} must use the {scheme!r} scheme, was {origin!r}"
         )
     if not parts.netloc or not parts.hostname:
         raise SettingsError(
             f"PolymarketUSDataClientConfig.{field} must carry a host, was {origin!r}"
         )
     if "@" in parts.netloc:
-        raise SettingsError(
-            f"PolymarketUSDataClientConfig.{field} must not embed credentials"
-        )
+        raise SettingsError(f"PolymarketUSDataClientConfig.{field} must not embed credentials")
     # Keyed on the RAW delimiters, not on the parsed components. `urlsplit`
     # reports an EMPTY query for 'https://api.polymarket.us?' and an EMPTY
     # fragment for '...#', so a component test passes both. The composed URL
@@ -531,9 +527,7 @@ def assert_well_formed_origin(
             f"PolymarketUSDataClientConfig.{field} must be a bare origin with no "
             f"path, query or fragment, was {origin!r}"
         )
-    _assert_host_on_the_venue_domain(
-        field, origin, parts.hostname, allow_foreign=allow_foreign
-    )
+    _assert_host_on_the_venue_domain(field, origin, parts.hostname, allow_foreign=allow_foreign)
     return origin
 
 
@@ -676,8 +670,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
             )
         if not _is_present(self.state_store_path):
             raise SettingsError(
-                "PolymarketUSExecClientConfig.state_store_path is required and "
-                "has no default"
+                "PolymarketUSExecClientConfig.state_store_path is required and has no default"
             )
         path = Path(self.state_store_path)  # type: ignore[arg-type]
         if not path.is_absolute():
@@ -694,8 +687,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
                 raise SettingsError(
-                    f"PolymarketUSExecClientConfig.{name} must be a positive "
-                    f"number, was {value!r}"
+                    f"PolymarketUSExecClientConfig.{name} must be a positive number, was {value!r}"
                 )
 
 

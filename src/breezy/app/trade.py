@@ -132,6 +132,7 @@ def _resolve_permit_expiry_ceiling_ns() -> int | None:
         )
     return int(raw)
 
+
 #: ``AlertPayload.detail`` is a small closed set of static reasons -- never
 #: exception text, never a permit/config value (L-22 shape). ``main()`` has
 #: exactly one catch site for ``issue_live_trading_permit``'s
@@ -346,8 +347,7 @@ def _build_fee_drift_probe(
     slug = _representative_fee_drift_slug(strategies)
     if slug is None:
         _boot_logger.warning(
-            "fee_drift_probe: no instrument resolved for any composed station; "
-            "probe not registered"
+            "fee_drift_probe: no instrument resolved for any composed station; probe not registered"
         )
         return None
 

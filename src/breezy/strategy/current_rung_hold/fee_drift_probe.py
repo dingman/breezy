@@ -248,8 +248,7 @@ async def fetch_wire_fee_coefficient(
         return Decimal(str(raw))
     except (ArithmeticError, ValueError, TypeError) as exc:
         raise WireFeeCoefficientError(
-            f"{path} returned an unusable {FEE_COEFFICIENT_WIRE_KEY!r}={raw!r} "
-            f"for slug {slug!r}"
+            f"{path} returned an unusable {FEE_COEFFICIENT_WIRE_KEY!r}={raw!r} for slug {slug!r}"
         ) from exc
 
 
@@ -515,8 +514,7 @@ class FeeDriftProbeActor(Actor):
                 event="fee_drift_probe_mismatch_persisting",
                 site=self._site,
                 detail=(
-                    f"documented={self._documented} wire={wire_fee} "
-                    f"persisting_ns={elapsed_ns}"
+                    f"documented={self._documented} wire={wire_fee} persisting_ns={elapsed_ns}"
                 ),
             ),
         )
