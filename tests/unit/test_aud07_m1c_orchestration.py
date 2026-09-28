@@ -716,3 +716,162 @@ def test_cell_sh_cal_b_dispatches_to_the_census_per_cell_cli_and_validates_its_a
     )
     assert result2.returncode != 0
     assert not (run_dir / "cal_b" / "cell_01.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# AUD-07 DEFERRED gate (RULING_backlog_resolution_2026-09-28.md, "the AUD-07
+# chain never advances to 80k while 20k/DEFERRED is non-empty or 20k coverage
+# of cells 0-48 is incomplete"). Nothing enforced this before: `sweep.sh`
+# only refused on an existing FAILED file, and `--mixed-only` merges needed
+# only cells 0-15 and 48. These tests exercise the smallest enforcement --
+# `sweep.sh` itself refusing `--stage 80k` -- via the same `AUD07_CELL_CMD`
+# stub pattern used above, never a real Monte-Carlo cell.
+# ---------------------------------------------------------------------------
+def _stub_cell_cmd(tmp_path: Path, calls_file: Path) -> Path:
+    stub = tmp_path / "stub_80k_cmd.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$1" >> "{calls_file}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    return stub
+
+
+def _write_full_20k_coverage(run_dir: Path) -> None:
+    """49 synthetic, minimal `stage=20k` rows -- cells 0..48 -- the exact
+    shape `check_coverage_20k` (`aud07_m1c_merge.py`) needs and nothing
+    more (no `code_sha`/`eps_pin_sha256`: this path never calls
+    `merge_stage`, only `load_stage_rows` + `check_coverage_20k`)."""
+    twentyk_dir = run_dir / "20k"
+    twentyk_dir.mkdir(parents=True, exist_ok=True)
+    lines = "\n".join(
+        json.dumps({"stage": "20k", "cell_index": i, "substream": None}) for i in range(49)
+    )
+    (twentyk_dir / "cell_all.jsonl").write_text(lines + "\n", encoding="utf-8")
+
+
+def test_sweep_sh_refuses_stage_80k_when_20k_deferred_is_non_empty(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs"
+    _write_full_20k_coverage(run_dir)
+    (run_dir / "20k" / "DEFERRED").write_text("12\n", encoding="utf-8")
+
+    queue = tmp_path / "queue.txt"
+    queue.write_text("0\n", encoding="utf-8")
+    calls_file = tmp_path / "calls.txt"
+    stub = _stub_cell_cmd(tmp_path, calls_file)
+    env = {**os.environ, "RUN_DIR": str(run_dir), "AUD07_CELL_CMD": str(stub)}
+
+    result = subprocess.run(
+        [
+            "bash", str(_SWEEP_SH),
+            "--code-sha", "deadbeef", "--stage", "80k",
+            "--queue", str(queue), "--cutoff", _future_cutoff_iso(), "-P", "1",
+        ],
+        env=env, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode != 0
+    assert "DEFERRED" in result.stderr
+    assert not calls_file.exists(), (
+        "the 80k cell command must never run while 20k/DEFERRED is non-empty"
+    )
+
+
+def test_sweep_sh_refuses_stage_80k_when_20k_coverage_is_incomplete(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs"
+    # 20k/ exists but is missing cell 48 -- incomplete coverage, no DEFERRED file at all.
+    twentyk_dir = run_dir / "20k"
+    twentyk_dir.mkdir(parents=True, exist_ok=True)
+    lines = "\n".join(
+        json.dumps({"stage": "20k", "cell_index": i, "substream": None}) for i in range(48)
+    )
+    (twentyk_dir / "cell_all.jsonl").write_text(lines + "\n", encoding="utf-8")
+
+    queue = tmp_path / "queue.txt"
+    queue.write_text("0\n", encoding="utf-8")
+    calls_file = tmp_path / "calls.txt"
+    stub = _stub_cell_cmd(tmp_path, calls_file)
+    env = {**os.environ, "RUN_DIR": str(run_dir), "AUD07_CELL_CMD": str(stub)}
+
+    result = subprocess.run(
+        [
+            "bash", str(_SWEEP_SH),
+            "--code-sha", "deadbeef", "--stage", "80k",
+            "--queue", str(queue), "--cutoff", _future_cutoff_iso(), "-P", "1",
+        ],
+        env=env, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode != 0
+    assert "coverage" in result.stderr
+    # Review fix: the underlying `check_coverage_20k` exception text (which
+    # names the actual missing cell) must be INCORPORATED into the one
+    # refusal line -- not merely present somewhere in combined stderr (the
+    # python subprocess's stderr passes through unprefixed regardless, so a
+    # bare substring check would pass even with the bug: the refusal line
+    # itself renders as "...is incomplete: " with nothing after the colon).
+    refusal_lines = [
+        line for line in result.stderr.splitlines() if "is incomplete:" in line
+    ]
+    assert refusal_lines, result.stderr
+    assert len(refusal_lines) == 1, result.stderr
+    detail = refusal_lines[0].split("is incomplete:", 1)[1].strip()
+    assert detail, f"refusal line carries no detail after the colon: {refusal_lines[0]!r}"
+    assert "missing cell(s)" in detail
+    assert "48" in detail
+    assert not calls_file.exists(), (
+        "the 80k cell command must never run while 20k coverage is incomplete"
+    )
+
+
+def test_sweep_sh_allows_stage_80k_once_20k_is_fully_covered_and_deferred_is_empty(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "runs"
+    _write_full_20k_coverage(run_dir)
+    # An empty DEFERRED file (every deferred cell later drained) must not refuse.
+    (run_dir / "20k" / "DEFERRED").write_text("", encoding="utf-8")
+
+    queue = tmp_path / "queue.txt"
+    queue.write_text("0\n", encoding="utf-8")
+    calls_file = tmp_path / "calls.txt"
+    stub = _stub_cell_cmd(tmp_path, calls_file)
+    env = {**os.environ, "RUN_DIR": str(run_dir), "AUD07_CELL_CMD": str(stub)}
+
+    result = subprocess.run(
+        [
+            "bash", str(_SWEEP_SH),
+            "--code-sha", "deadbeef", "--stage", "80k",
+            "--queue", str(queue), "--cutoff", _future_cutoff_iso(), "-P", "1",
+        ],
+        env=env, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls_file.read_text(encoding="utf-8").strip().splitlines() == ["0"]
+
+
+def test_sweep_sh_never_gates_stages_other_than_80k(tmp_path: Path) -> None:
+    """A `--stage 20k` sweep must never consult its own DEFERRED/coverage
+    state -- the gate is an 80k-only precondition."""
+    run_dir = tmp_path / "runs"
+    # No 20k/ directory at all; a 20k-gating-itself bug would refuse here.
+    queue = tmp_path / "queue.txt"
+    queue.write_text("0\n", encoding="utf-8")
+    calls_file = tmp_path / "calls.txt"
+    stub = _stub_cell_cmd(tmp_path, calls_file)
+    env = {**os.environ, "RUN_DIR": str(run_dir), "AUD07_CELL_CMD": str(stub)}
+
+    result = subprocess.run(
+        [
+            "bash", str(_SWEEP_SH),
+            "--code-sha", "deadbeef", "--stage", "20k",
+            "--queue", str(queue), "--cutoff", _future_cutoff_iso(), "-P", "1",
+        ],
+        env=env, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls_file.read_text(encoding="utf-8").strip().splitlines() == ["0"]
