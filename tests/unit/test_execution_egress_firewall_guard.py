@@ -2171,6 +2171,15 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         # key to the already-open local store, no path, no payload, no
         # socket, no `await`. Used by both resolver terminals.
         "self.record_venue_order_id",
+        # FAILURE-KIND-DURABLE (2026-09-28, r2 delta point 3): the durable
+        # mirror of `_resolver_last_failure_kind` -- the SAME A1 exemption
+        # shape as `self.record_venue_order_id` immediately above: one key
+        # (the resolver context, rewritten with only its `lastFailureKind`
+        # field changed), to the already-open local store, no path, no
+        # payload, no socket, no `await`. Shape-pinned (not just allowlist
+        # membership) by `test_set_resolver_last_failure_kind_writes_only_
+        # the_resolver_context_key_with_a_single_key` below.
+        "self._set_resolver_last_failure_kind",
         "self._refuse",
         # FU-8 r2/r2.1: the runtime no-booking gate for a cross-session fill.
         # Deliberately in NEITHER `EXEC_RESOLVER_COROUTINES` (security
@@ -3932,6 +3941,132 @@ def test_the_shipped_resolver_reaches_no_violation() -> None:
         assert find_exec_resolver_violations(path, source) == []
         return
     raise AssertionError("client.py was not reached by the scan roots")
+
+
+# ---------------------------------------------------------------------------
+# FAILURE-KIND-DURABLE (2026-09-28, r2 delta point 3): `self._set_resolver_
+# last_failure_kind` sits OUTSIDE `EXEC_RESOLVER_COROUTINES` (it is a plain
+# sync helper the resolver coroutines call, exactly like `record_venue_
+# order_id`/`_retire` above), so allowlist membership alone only proves the
+# CALLER may reach it -- it says nothing about what the HELPER ITSELF does
+# once inside. This is the compensating strengthening, mirroring the shape
+# `record_venue_order_id` was already trusted to have (r2 delta: "an AST
+# shape test mirroring record_venue_order_id"): the helper's own body must
+# reach `self._store_set` on EXACTLY ONE key, and that key must be built
+# from `RESOLVER_CONTEXT_KEY_PREFIX` plus the context's own `intent_id`
+# only -- never an arbitrary or second key.
+# ---------------------------------------------------------------------------
+
+
+def _set_resolver_last_failure_kind_is_shaped_correctly(source: str) -> bool:
+    """``True`` iff ``_set_resolver_last_failure_kind`` (defined anywhere in
+    ``source``) calls ``self._store_set`` exactly once, with a first
+    argument that is an f-string built from exactly
+    ``{RESOLVER_CONTEXT_KEY_PREFIX}{context.intent_id}`` (any order, no
+    other text). ``False`` for a missing function, zero or multiple
+    ``_store_set`` calls, or any other key shape -- a variant helper that
+    writes an unrelated or additional key must be rejected, not waved
+    through because the callee name happened to match.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name == "_set_resolver_last_failure_kind"
+        ):
+            continue
+        store_set_calls = [
+            inner
+            for inner in ast.walk(node)
+            if isinstance(inner, ast.Call) and _dotted_callee(inner.func) == "self._store_set"
+        ]
+        if len(store_set_calls) != 1:
+            return False
+        call = store_set_calls[0]
+        if not call.args:
+            return False
+        key_arg = call.args[0]
+        if not isinstance(key_arg, ast.JoinedStr):
+            return False
+        part_names = set()
+        for value in key_arg.values:
+            if not isinstance(value, ast.FormattedValue):
+                return False  # literal text in the key -- not the pinned shape
+            dotted = _dotted_callee(value.value)
+            if dotted is None:
+                return False
+            part_names.add(dotted)
+        return part_names == {"RESOLVER_CONTEXT_KEY_PREFIX", "context.intent_id"}
+    return False
+
+
+def test_set_resolver_last_failure_kind_writes_only_the_resolver_context_key() -> None:
+    """Non-vacuity + positive control: the ACTUAL shipped helper must clear
+    its own shape check (exactly one ``_store_set``, keyed by
+    ``RESOLVER_CONTEXT_KEY_PREFIX`` + ``context.intent_id`` only)."""
+    for path, source in iter_python_sources(EGRESS_SCAN_ROOTS):
+        if path != "src/breezy/adapters/polymarket_us/exec/client.py":
+            continue
+        assert _set_resolver_last_failure_kind_is_shaped_correctly(source) is True
+        return
+    raise AssertionError("client.py was not reached by the scan roots")
+
+
+def test_a_variant_helper_writing_an_arbitrary_key_is_rejected_by_the_shape_check() -> None:
+    """RED control: a look-alike helper that writes a DIFFERENT key (not
+    built from ``RESOLVER_CONTEXT_KEY_PREFIX`` + ``context.intent_id``) must
+    be rejected, proving the check inspects the key's shape and not merely
+    the callee's name."""
+    source = (
+        "class C:\n"
+        "    def _set_resolver_last_failure_kind(self, context, kind):\n"
+        "        self._resolver_last_failure_kind[context.intent_id] = kind\n"
+        "        self._store_set(f'{SOME_OTHER_PREFIX}{kind}', b'x')\n"
+    )
+    assert _set_resolver_last_failure_kind_is_shaped_correctly(source) is False
+
+
+def test_a_variant_helper_writing_two_keys_is_rejected_by_the_shape_check() -> None:
+    """RED control: a look-alike helper that writes the right key AND a
+    second, unrelated one must be rejected -- exactly one write is
+    permitted."""
+    source = (
+        "class C:\n"
+        "    def _set_resolver_last_failure_kind(self, context, kind):\n"
+        "        self._resolver_last_failure_kind[context.intent_id] = kind\n"
+        "        self._store_set(\n"
+        "            f'{RESOLVER_CONTEXT_KEY_PREFIX}{context.intent_id}', b'x',\n"
+        "        )\n"
+        "        self._store_set('some/other/key', b'y')\n"
+    )
+    assert _set_resolver_last_failure_kind_is_shaped_correctly(source) is False
+
+
+def test_a_variant_helper_with_no_store_write_is_rejected_by_the_shape_check() -> None:
+    """RED control: a look-alike helper that never reaches ``_store_set`` at
+    all (e.g. a stripped-down refactor) must be rejected, not silently
+    treated as "even safer than required"."""
+    source = (
+        "class C:\n"
+        "    def _set_resolver_last_failure_kind(self, context, kind):\n"
+        "        self._resolver_last_failure_kind[context.intent_id] = kind\n"
+    )
+    assert _set_resolver_last_failure_kind_is_shaped_correctly(source) is False
+
+
+def test_the_correct_shape_is_accepted_by_the_shape_check() -> None:
+    """Control: the EXACT shape the shipped helper uses (order of the two
+    f-string parts reversed, to prove the check is order-independent) must
+    clear."""
+    source = (
+        "class C:\n"
+        "    def _set_resolver_last_failure_kind(self, context, kind):\n"
+        "        self._resolver_last_failure_kind[context.intent_id] = kind\n"
+        "        self._store_set(\n"
+        "            f'{context.intent_id}{RESOLVER_CONTEXT_KEY_PREFIX}', b'x',\n"
+        "        )\n"
+    )
+    assert _set_resolver_last_failure_kind_is_shaped_correctly(source) is True
 
 
 # ---------------------------------------------------------------------------

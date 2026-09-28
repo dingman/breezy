@@ -539,6 +539,30 @@ def test_legacy_resolver_context_without_field_decodes_as_unknown() -> None:
     assert old_context.create_fill_evidence == submit_chain.CREATE_FILL_EVIDENCE_UNKNOWN
 
 
+def test_resolver_context_last_failure_kind_defaults_legacy_rows_to_none() -> None:
+    """FAILURE-KIND-DURABLE (r1 AC1): same AR-N6 trailing-optional shape as
+    `createFillEvidence` above -- a blob written before this change (no
+    `lastFailureKind` key at all) must still decode, and must decode to
+    `"none"`: an untouched intent's failure kind always was `"none"`. RED:
+    the field does not exist today (`AttributeError` on `.last_failure_kind`)."""
+    old_blob = json.dumps(
+        {
+            "intentId": "intent-old-lfk",
+            "venueOrderId": "venue-old-lfk",
+            "instrumentId": "instrument-old-lfk",
+            "clientOrderId": "client-old-lfk",
+            "strategyId": "strategy-old-lfk",
+            "notionalUsd": "1.00",
+            "bookingId": 12,
+            "createdNs": TS_INIT,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    old_context = AmbiguousResolverContext.from_bytes(old_blob)
+    assert old_context.last_failure_kind == "none"
+
+
 @pytest.mark.asyncio
 async def test_submit_order_passes_response_body_evidence_to_note_ambiguous_open(
     tmp_path: Path,
@@ -6651,3 +6675,315 @@ async def test_open_orders_refresh_failure_still_writes_the_evidence_record(
         )
         assert client._open_orders_read_refused is True
         await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# FAILURE-KIND-DURABLE (2026-09-28): the last resolver failure kind is now
+# mirrored onto the durable resolver context, so a restart does not lose it
+# -- see docs/plans/backlog/RESOLUTION_2026-09-28/FAILURE-KIND-DURABLE_plan_
+# r1_2026-09-28.md and its r2 delta. Supersedes FAILURE-KIND-PERSIST's
+# restart-loses-it acceptance above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_resolver_last_failure_kind_rewrites_the_context_preserving_every_other_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """r2 delta (added tests, bullet 1): the durable rewrite must change
+    ONLY `lastFailureKind` -- every other field (`orderSide`,
+    `createFillEvidence`, `bookingId`, ...) must round-trip byte-identical.
+    RED: `_set_resolver_last_failure_kind` does not exist today
+    (`AttributeError`)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw_before = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_before is not None
+        context = AmbiguousResolverContext.from_bytes(raw_before)
+        assert context.last_failure_kind == "none"
+
+        client._set_resolver_last_failure_kind(context, "get_exception")
+
+        raw_after = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_after is not None
+        rewritten = AmbiguousResolverContext.from_bytes(raw_after)
+        assert rewritten.last_failure_kind == "get_exception"
+        assert replace(rewritten, last_failure_kind="none") == replace(
+            context, last_failure_kind="none",
+        ), "every OTHER field must round-trip byte-identical"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_durable_write_never_raises_out_of_the_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """r2 delta (helper discipline, L-48): a store that raises on the
+    durable rewrite must never propagate -- the resolver task must stay
+    alive and the intent must stay AMBIGUOUS-resolvable. RED:
+    `_set_resolver_last_failure_kind` does not exist today (`AttributeError`,
+    not the raised `RuntimeError` -- there is nothing yet to catch it)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+
+        def _raise(key: str, value: bytes) -> None:
+            raise RuntimeError("durable store is unavailable")
+
+        client._store_set = _raise  # type: ignore[method-assign]
+
+        client._set_resolver_last_failure_kind(context, "get_exception")  # must not raise
+
+        assert client._resolver_last_failure_kind[current.intent_id] == "get_exception"
+        current_after = client._latch.current()
+        assert current_after is not None
+        assert current_after.state is SubmitIntentState.OPEN, (
+            "a durable-write failure must never itself resolve or lose the intent"
+        )
+        await client._disconnect()
+
+
+_LFK_UNINTERPRETABLE_ACTIVITIES: Final[dict[str, Any]] = {
+    "activities": [
+        {
+            "type": "ACTIVITY_TYPE_TRADE",
+            "trade": {
+                "aggressor": {"id": "SOME-OTHER-ORDER"},
+                "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                "qtyDecimal": "1",
+                "createTime": "2026-09-23T17:22:07.900000000Z",
+            },
+        },
+    ],
+    "eof": True,
+}
+
+
+async def _process_a_records_activities_uninterpretable_then_restarts(
+    tmp_path: Path,
+) -> tuple[str, str, str]:
+    """Arms one with-id AMBIGUOUS intent through the real `_submit_order` ->
+    `_note_ambiguous_open` path (L-42: no hand-built rows), drives ONE
+    resolver pass that classifies `activities_uninterpretable` -- well
+    before the stale threshold, so THIS process never itself alerts -- then
+    "restarts": releases the flock and disconnects, leaving the OPEN intent
+    and its durable resolver context (now carrying the classified kind) on
+    disk for a second client over the SAME store to inherit.
+
+    Returns ``(order_id, slug, intent_id)``.
+    """
+    client, order_id, slug, latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+    current = client._latch.current_open()
+    assert current is not None
+    intent_id = current.intent_id
+    client._private_read._payloads[  # type: ignore[attr-defined]
+        f"/v1/order/{order_id}"
+    ] = _order_get_body(
+        order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+    )
+    client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+        "positions": {}, "eof": True,
+    }
+    client._private_read._payloads[  # type: ignore[attr-defined]
+        PORTFOLIO_ACTIVITIES_PATH
+    ] = _LFK_UNINTERPRETABLE_ACTIVITIES
+
+    await _run_exactly_one_pass(client)
+    assert client._resolver_last_failure_kind[intent_id] == "activities_uninterpretable"
+    assert len(client.stale_ambiguous_intent_alerts) == 0, (
+        "process A must not itself go stale -- this fixture isolates the SEED, "
+        "not the same-process alert"
+    )
+    await client._disconnect()
+    latch_cm.__exit__(None, None, None)
+    return order_id, slug, intent_id
+
+
+@pytest.mark.asyncio
+async def test_activities_uninterpretable_failure_kind_is_written_to_durable_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """r1 AC (build report item 5, test 2): a pass that records
+    `activities_uninterpretable` in memory (T-1) must ALSO durably persist
+    it on the resolver context -- rereading the SAME context after the pass
+    must show the classified kind, never the default `"none"`. RED: only
+    the in-memory dict changes today; the durable context is unaffected."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            PORTFOLIO_ACTIVITIES_PATH
+        ] = _LFK_UNINTERPRETABLE_ACTIVITIES
+
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[current.intent_id] == "activities_uninterpretable"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        assert context.last_failure_kind == "activities_uninterpretable"
+        await client._disconnect()
+
+
+async def _restart_second_client_over(
+    tmp_path: Path, *, order_id: str, slug: str, intent_id: str,
+) -> tuple[PolymarketUSExecutionClient, Any]:
+    """Builds process B: a fresh client over the SAME durable store left by
+    :func:`_process_a_records_activities_uninterpretable_then_restarts` --
+    an EMPTY `_resolver_last_failure_kind` (a restart's process-local memory
+    loss) -- with the instrument re-added (a fresh cache never carries it).
+    The order GET is wired to a LIVE, non-terminal state BEFORE `_connect()`
+    (whose own boot pass is the first thing to open the durable store and
+    read the context, exactly like `test_stale_restart_cause_followup_
+    after_the_boot_pass`), so no pass -- boot or otherwise -- reclassifies
+    anything; the durable context is then backdated past the stale
+    threshold, the SAME rewrite idiom that test already uses (every OTHER
+    field, including the durable kind process A just wrote, is left
+    untouched), isolating the SEED the caller's own pass then exercises.
+    """
+    store_path = tmp_path / "exec_state.db"
+    client, latch_cm = await _build_client_with_custom_loader(
+        tmp_path, store_path=store_path, resolver_instrument_loader=None,
+    )
+    instrument = build_instrument()
+    client._cache.add_instrument(instrument)
+    client._instrument_provider.add(instrument)
+    assert intent_id not in client._resolver_last_failure_kind, (
+        "process B must start with no in-memory failure history"
+    )
+    client._private_read._payloads[  # type: ignore[attr-defined]
+        f"/v1/order/{order_id}"
+    ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+
+    await client._connect()  # opens the durable store; boot pass only, non-terminal
+
+    raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+    assert raw_context is not None
+    context = AmbiguousResolverContext.from_bytes(raw_context)
+    assert context.last_failure_kind == "activities_uninterpretable"
+    backdated = replace(
+        context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+    )
+    client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", backdated.to_bytes())
+    return client, latch_cm
+
+
+@pytest.mark.asyncio
+async def test_restart_stale_alert_uses_durable_activities_uninterpretable_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """r1 AC2: process B's FIRST stale CRITICAL after a restart must name
+    the real kind process A classified and persisted -- never the dict-
+    membership default `"none"`. RED: today `_resolver_last_failure_kind`
+    is process-local only, so process B's first stale alert reads `"none"`."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        order_id, slug, intent_id = (
+            await _process_a_records_activities_uninterpretable_then_restarts(tmp_path)
+        )
+        client, latch_cm = await _restart_second_client_over(
+            tmp_path, order_id=order_id, slug=slug, intent_id=intent_id,
+        )
+
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "activities_uninterpretable"
+        await client._disconnect()
+        latch_cm.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_durable_seed_prevents_a_redundant_cause_followup_for_the_same_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """r2 delta (added tests, bullet 2): once process B seeds
+    `_resolver_last_failure_kind` from the durable kind on boot, the r2/r3
+    cause follow-up (`:2578`-area logic) must NOT fire again for a LATER
+    pass that reconfirms the SAME kind -- the follow-up exists to surface a
+    CHANGE the stale alert missed, not to repeat a kind it already named.
+    RED: today the seed never happens, so process B's first alert is
+    `"none"` and the very next classifying pass DOES add a `:cause`
+    follow-up -- the opposite of what this test requires."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        order_id, slug, intent_id = (
+            await _process_a_records_activities_uninterpretable_then_restarts(tmp_path)
+        )
+        client, latch_cm = await _restart_second_client_over(
+            tmp_path, order_id=order_id, slug=slug, intent_id=intent_id,
+        )
+
+        await _run_exactly_one_pass(client)
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "activities_uninterpretable"
+
+        # A SECOND pass reconfirms the SAME kind via a fresh uninterpretable
+        # join -- no new `:cause` entry may appear.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            PORTFOLIO_ACTIVITIES_PATH
+        ] = _LFK_UNINTERPRETABLE_ACTIVITIES
+
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1, (
+            "a reconfirmed, unchanged kind must never add a `:cause` followup"
+        )
+        assert f"{intent_id}:cause" not in {a.get("alert_key") for a in alerts}
+        await client._disconnect()
+        latch_cm.__exit__(None, None, None)
