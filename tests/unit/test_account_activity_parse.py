@@ -376,6 +376,25 @@ def test_trade_rows_for_order_returns_empty_for_non_list_activities() -> None:
             lambda: [
                 {
                     "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        # T1 (review LOW, mutant coverage): aggressor renamed
+                        # -- the aggressor-side twin of "passive_renamed"
+                        # above, roles swapped; the passive leg stays
+                        # well-formed AND foreign (a genuine other order, not
+                        # `SYN-ORDER-1`).
+                        "aggressorOrder": {"id": "SYN-OTHER-AGGRESSOR"},
+                        "passive": {"id": "SYN-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "aggressor_renamed",
+        ),
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
                     # M9: `trade` itself renamed away.
                     "tradeInfo": {
                         "aggressor": {"id": "SYN-OTHER-ORDER"},
@@ -558,6 +577,31 @@ def test_trade_rows_for_order_flags_id_drift_between_leg_and_execution_block() -
     assert scan.uninterpretable_rows == 1
 
 
+def test_trade_rows_for_order_flags_id_drift_between_passive_leg_and_execution_block() -> None:
+    """r2 T-2, passive-side twin of the test above (kills M17 on the passive
+    call site too): `passive.id` and `passiveExecution.order.id` are both
+    non-empty strings but DISAGREE -- uninterpretable, never silently
+    ignored as an ordinary foreign trade. The aggressor-side test alone
+    never exercises `_leg_status`'s passive call site."""
+    page = {
+        "activities": [
+            {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "aggressor": {"id": "SYN-OTHER-ORDER"},
+                    "passive": {"id": "SYN-OTHER-PASSIVE"},
+                    "passiveExecution": {"order": {"id": "SYN-DRIFTED-EXEC-ID"}},
+                    "qtyDecimal": "1",
+                    "createTime": "2026-09-23T17:22:07.900000000Z",
+                },
+            },
+        ],
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.refs == ()
+    assert scan.uninterpretable_rows == 1
+
+
 def test_trade_rows_for_order_execution_block_absence_is_fine() -> None:
     """r2 T-2: "absence is fine" -- an ordinary foreign trade with NO
     execution block at all must never be flagged uninterpretable just
@@ -630,3 +674,55 @@ def test_page_min_create_ts_ns_returns_none_with_no_parseable_timestamp() -> Non
     page = {"activities": [{"type": "ACTIVITY_TYPE_WEIRD"}]}
     assert aa.page_min_create_ts_ns(page) is None
     assert aa.page_min_create_ts_ns({"activities": "not-a-list"}) is None
+
+
+# ---------------------------------------------------------------------------
+# TRADE-ROW-DRIFT review (LOW): `first_reason` documents `type` plus key
+# NAMES only -- never a value. A `type` that itself drifts to a non-string
+# (e.g. a nested object) must never have its raw value printed.
+# ---------------------------------------------------------------------------
+
+
+def test_first_reason_never_leaks_a_non_string_type_value() -> None:
+    """review LOW: when `type` is not a `str`, `first_reason` must print
+    `type(activity_type).__name__` ("dict" here), never the raw value --
+    printing the value would leak whatever it holds, e.g. an id-like secret
+    string, straight into a diagnostic string."""
+    secret = "SYN-SECRET-ID-DO-NOT-LEAK"
+    page = {
+        "activities": [
+            {
+                "type": {"id": secret},
+                "trade": {"aggressor": {"id": "SYN-OTHER"}, "passive": {"id": "SYN-OTHER-2"}},
+            },
+        ]
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.uninterpretable_rows == 1
+    assert secret not in scan.first_reason
+    assert "dict" in scan.first_reason
+
+
+def test_first_reason_never_contains_a_leg_id_value() -> None:
+    """review LOW: `first_reason` documents `type` plus key NAMES only --
+    across a genuine drift shape (both legs carry a synthetic "secret" id),
+    neither leg's id value may ever appear in it."""
+    aggressor_secret = "SYN-AGGRESSOR-SECRET-ID"
+    passive_secret = "SYN-PASSIVE-SECRET-ID"
+    page = {
+        "activities": [
+            {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "aggressor": {"id": aggressor_secret},
+                    "passiveOrder": {"id": passive_secret},
+                    "qtyDecimal": "1",
+                    "createTime": "2026-09-23T17:22:07.900000000Z",
+                },
+            },
+        ]
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.uninterpretable_rows == 1
+    assert aggressor_secret not in scan.first_reason
+    assert passive_secret not in scan.first_reason

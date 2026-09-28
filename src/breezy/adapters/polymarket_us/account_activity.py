@@ -469,12 +469,20 @@ def _leg_status(
 def _uninterpretable_reason(activity: Any) -> str:
     """r2 T-1: the activity ``type`` plus the key NAMES it carries -- never a
     value. ``activity`` may itself be a non-object list element, which has
-    neither."""
+    neither.
+
+    Review LOW fix: ``type`` itself can drift to a non-string (e.g. a
+    nested object) on a sufficiently malformed row. When it is not a
+    ``str``, print ``type(activity_type).__name__`` instead of the raw
+    value -- printing the value here would leak whatever it holds (an
+    id-like secret string, for instance), which is exactly what this
+    function exists to never do."""
     if not isinstance(activity, Mapping):
         return f"non-object activity element (python type={type(activity).__name__})"
     activity_type = activity.get("type")
     keys = sorted(str(key) for key in activity)
-    return f"type={activity_type!r} keys={keys}"
+    type_display = activity_type if isinstance(activity_type, str) else type(activity_type).__name__
+    return f"type={type_display!r} keys={keys}"
 
 
 def trade_rows_for_order(page: Mapping[str, Any], venue_order_id: str) -> TradeRowScan:

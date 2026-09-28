@@ -5247,6 +5247,71 @@ async def test_uninterpretable_trade_row_blocks_a_false_zero_fill_past_day(
 
 
 @pytest.mark.asyncio
+async def test_stale_alert_carries_activities_uninterpretable_failure_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """TRADE-ROW-DRIFT review (MEDIUM): end-to-end delivery. A pass that
+    records `activities_uninterpretable` (T-1, `:5182` above) must surface
+    through the SAME `open_intent_stale` CRITICAL a stale intent already
+    alerts via -- G7's backdate mechanism (`test_stale_alert_carries_the_
+    actual_last_failure_kind`, `:5664`) -- carrying THIS failure kind, never
+    the dict-membership default `"none"` or a stale prior kind."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[current.intent_id] == "activities_uninterpretable"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "activities_uninterpretable"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
 async def test_a_well_formed_foreign_trade_row_still_retires(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
