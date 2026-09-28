@@ -314,14 +314,10 @@ def assert_scored_pairs_are_unit_qty(
     lets a caller with no settlement store (e.g. `_print_roi_and_wilson`'s
     reporting-only call) keep calling `score_trials` directly.
     """
-    offenders = [
-        (trial.trial_id, trial.qty) for trial, _record in pairs if trial.qty != Decimal(1)
-    ]
+    offenders = [(trial.trial_id, trial.qty) for trial, _record in pairs if trial.qty != Decimal(1)]
     if offenders:
         detail = ", ".join(f"{trial_id!r} (qty={qty})" for trial_id, qty in offenders)
-        raise ScoredPathQtyInvariantError(
-            "refusing to score: qty != 1 for pair(s) " + detail
-        )
+        raise ScoredPathQtyInvariantError("refusing to score: qty != 1 for pair(s) " + detail)
 
 
 def _pending_reason(record: NwsClimateDay | None) -> RefusalReason:

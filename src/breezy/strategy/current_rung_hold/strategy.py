@@ -204,7 +204,10 @@ _VENUE: Final[str] = "polymarket_us"
 #: -- mirrors ``breezy/registry/sites.toml``'s ``iem_asos_id`` (identical to
 #: ``icao`` for all four: ``KLAX``/``KMDW``/``KMIA``/``KSFO``).
 _ICAO_BY_STATION: Final[dict[str, str]] = {
-    "LAX": "KLAX", "MDW": "KMDW", "MIA": "KMIA", "SFO": "KSFO",
+    "LAX": "KLAX",
+    "MDW": "KMDW",
+    "MIA": "KMIA",
+    "SFO": "KSFO",
 }
 _STATION_BY_ICAO: Final[dict[str, str]] = {
     icao: station for station, icao in _ICAO_BY_STATION.items()
@@ -238,8 +241,7 @@ class CurrentRungHoldStrategy(Strategy):
         self,
         config: CurrentRungHoldConfig,
         *,
-        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]]
-        | None = None,
+        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]] | None = None,
         order_submission_permit: OrderSubmissionPermit | None = None,
     ) -> None:
         super().__init__(config)
@@ -374,7 +376,8 @@ class CurrentRungHoldStrategy(Strategy):
             return
 
         self.subscribe_data(
-            station_observation_data_type(), client_id=NWS_BACKTEST_CLIENT_ID,
+            station_observation_data_type(),
+            client_id=NWS_BACKTEST_CLIENT_ID,
         )
 
     def on_stop(self) -> None:
@@ -427,7 +430,8 @@ class CurrentRungHoldStrategy(Strategy):
             return
         offset = self._std_utc_offset_hours_by_station[station]
         accumulator = self._accumulators.setdefault(
-            station, RunningExtremeAccumulator(std_utc_offset_hours=offset),
+            station,
+            RunningExtremeAccumulator(std_utc_offset_hours=offset),
         )
         accumulator.push(
             data.observed_at_ns,
@@ -626,7 +630,8 @@ class CurrentRungHoldStrategy(Strategy):
             )
 
         self._run_observability(
-            "current_rung_hold position-opened report failed", _report,
+            "current_rung_hold position-opened report failed",
+            _report,
         )
 
     def _report_open_position_mark(self, tick: QuoteTick) -> None:
@@ -657,7 +662,8 @@ class CurrentRungHoldStrategy(Strategy):
                 self.log.info(self._open_position_mark_message(position, tick))
 
         self._run_observability(
-            "current_rung_hold open-position mark report failed", _report,
+            "current_rung_hold open-position mark report failed",
+            _report,
         )
 
     def _run_observability(self, message: str, action: Callable[[], object]) -> object:

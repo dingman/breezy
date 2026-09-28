@@ -250,7 +250,8 @@ class RunningExtremeAccumulator:
         has no separate receipt instant.
         """
         day = climate_day_for_instant(
-            _instant_from_ns(observed_at_ns), self._std_utc_offset_hours,
+            _instant_from_ns(observed_at_ns),
+            self._std_utc_offset_hours,
         )
         if self._current_climate_day is not None and day != self._current_climate_day:
             self._rows = {}
@@ -355,14 +356,14 @@ class RunningExtremeAccumulator:
         )
         if not eligible_ns:
             return CoverageReport(
-                first_observed_ns=None, last_observed_ns=None, largest_gap_ns=None,
+                first_observed_ns=None,
+                last_observed_ns=None,
+                largest_gap_ns=None,
             )
 
         largest_gap_ns: int | None = None
         if len(eligible_ns) >= 2:
-            largest_gap_ns = max(
-                later - earlier for earlier, later in pairwise(eligible_ns)
-            )
+            largest_gap_ns = max(later - earlier for earlier, later in pairwise(eligible_ns))
 
         return CoverageReport(
             first_observed_ns=eligible_ns[0],

@@ -102,9 +102,7 @@ def build_query_string(query: Mapping[str, object] | None) -> str:
             normalised.append((key, str(value).lower()))
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             for item in value:
-                normalised.append(
-                    (key, str(item).lower() if isinstance(item, bool) else item)
-                )
+                normalised.append((key, str(item).lower() if isinstance(item, bool) else item))
         else:
             normalised.append((key, value))
     return urlencode(normalised, quote_via=quote, doseq=True)

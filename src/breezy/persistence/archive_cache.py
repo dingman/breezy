@@ -287,9 +287,7 @@ def iem_mos_window_request(
         )
     window_start = dt.datetime(start.year, start.month, start.day, tzinfo=dt.UTC)
     last_day = end - dt.timedelta(days=1)
-    window_end = dt.datetime(
-        last_day.year, last_day.month, last_day.day, 23, 59, tzinfo=dt.UTC
-    )
+    window_end = dt.datetime(last_day.year, last_day.month, last_day.day, 23, 59, tzinfo=dt.UTC)
     return ArchiveRequest(
         source=IEM_MOS_SOURCE,
         station=station,
@@ -378,9 +376,7 @@ class ArchiveCache:
     def read(self, request: ArchiveRequest) -> bytes:
         entry = self._entry_for(request)
         if entry is None:
-            raise ArchiveCacheMissingPayloadError(
-                f"no manifest entry for {request.cache_key()}"
-            )
+            raise ArchiveCacheMissingPayloadError(f"no manifest entry for {request.cache_key()}")
         self._require_matching_window(request, entry)
         return self._read_payload(request, entry)
 

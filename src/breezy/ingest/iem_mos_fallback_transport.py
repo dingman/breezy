@@ -228,9 +228,7 @@ class IemMosFallbackTransport(HttpTransport):
             )
         for name, value in (("sts", sts), ("ets", ets)):
             if not isinstance(value, str) or _STAMP_PATTERN.match(value) is None:
-                raise ValueError(
-                    f"`{name}` must be YYYY-MM-DDTHH:MMZ; {value!r} is refused"
-                )
+                raise ValueError(f"`{name}` must be YYYY-MM-DDTHH:MMZ; {value!r} is refused")
         query = urlencode(
             {"station": station, "model": model, "format": "csv", "sts": sts, "ets": ets}
         )

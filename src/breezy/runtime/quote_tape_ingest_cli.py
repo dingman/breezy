@@ -564,7 +564,7 @@ def _instance_is_poisoned(instance_dir: Path) -> bool:
             continue
         if path.name == _SALVAGE_ATTEMPT_NAME:
             continue
-        marker_name = f"{MARKER_PREFIX}{path.name[len(ATTEMPT_PREFIX):]}"
+        marker_name = f"{MARKER_PREFIX}{path.name[len(ATTEMPT_PREFIX) :]}"
         if not (instance_dir / marker_name).is_file():
             return True
     return False
@@ -1112,14 +1112,10 @@ def _newest_started_instance_id(
     is active", just scoped differently.
     """
     windows = {
-        instance_id: _instance_write_window(
-            _instance_dir(catalog_root, instance_id, subdirectory)
-        )
+        instance_id: _instance_write_window(_instance_dir(catalog_root, instance_id, subdirectory))
         for instance_id in instance_ids
     }
-    started = {
-        instance_id: start for instance_id, (start, _end) in windows.items() if start > 0
-    }
+    started = {instance_id: start for instance_id, (start, _end) in windows.items() if start > 0}
     return max(started, key=lambda instance_id: started[instance_id], default=None)
 
 
@@ -1134,9 +1130,7 @@ def classify_liveness(
 ) -> dict[str, LiveDetection]:
     """Classify every instance as live or not. See the module docstring for the rule."""
     windows = {
-        instance_id: _instance_write_window(
-            _instance_dir(catalog_root, instance_id, subdirectory)
-        )
+        instance_id: _instance_write_window(_instance_dir(catalog_root, instance_id, subdirectory))
         for instance_id in instance_ids
     }
     newest_id = _newest_started_instance_id(catalog_root, instance_ids, subdirectory)
@@ -1243,8 +1237,7 @@ class InstanceIngestResult:
                 line += "; salvage deferred (deadline)"
             return line
         parts = [
-            f"{class_to_filename(result.data_cls)}={result.outcome}"
-            for result in self.type_results
+            f"{class_to_filename(result.data_cls)}={result.outcome}" for result in self.type_results
         ]
         if self.outcome == "dry-run":
             prefix = "would ingest"
@@ -1292,9 +1285,7 @@ def ingest_instance(
     results_by_cls: dict[type, TypeConversionResult] = {}
     for data_cls in _definitions_first(data_types):
         if _is_marked_converted(instance_dir, data_cls):
-            results_by_cls[data_cls] = TypeConversionResult(
-                data_cls, "skipped-already-converted"
-            )
+            results_by_cls[data_cls] = TypeConversionResult(data_cls, "skipped-already-converted")
             _clear_attempt(instance_dir, data_cls)
             continue
         if deadline is not None:
@@ -1398,9 +1389,7 @@ def _needs_definition_pass(
     scan_instance`, so an instance that does not need pass 1 is never
     rescanned merely to find that out.
     """
-    definition_types = [
-        data_cls for data_cls in data_types if _is_instrument_definition(data_cls)
-    ]
+    definition_types = [data_cls for data_cls in data_types if _is_instrument_definition(data_cls)]
     if not definition_types:
         return False
     instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
@@ -1511,8 +1500,7 @@ def _convert_one_tick_type_per_file(
         report = reports_by_path.get(path)
         if report is None:
             logger.warning(
-                "instance %s: %s file %s has no preflight report -- skipped "
-                "this run, retried next",
+                "instance %s: %s file %s has no preflight report -- skipped this run, retried next",
                 instance_id,
                 data_cls.__name__,
                 path,
@@ -1751,14 +1739,19 @@ def _ingest_instance_per_file(
             _clear_attempt(instance_dir, data_cls)
             continue
         if definitions_have_open_file:
-            results_by_cls[data_cls] = TypeConversionResult(
-                data_cls, "skipped-definitions-pending"
-            )
+            results_by_cls[data_cls] = TypeConversionResult(data_cls, "skipped-definitions-pending")
             any_open_seen = True
             continue
         result, converted, is_open = _convert_one_tick_type_per_file(
-            catalog, instance_dir, instance_id, data_cls, open_files, reports_by_path,
-            instance_is_dead=instance_is_dead, dry_run=dry_run, deadline=deadline,
+            catalog,
+            instance_dir,
+            instance_id,
+            data_cls,
+            open_files,
+            reports_by_path,
+            instance_is_dead=instance_is_dead,
+            dry_run=dry_run,
+            deadline=deadline,
         )
         results_by_cls[data_cls] = result
         any_new_conversion = any_new_conversion or converted
@@ -2063,9 +2056,7 @@ def _merge_pass_results(
                 )
             )
         else:
-            merged.append(
-                replace(p2, type_results=type_results, salvage_deferred=salvage_deferred)
-            )
+            merged.append(replace(p2, type_results=type_results, salvage_deferred=salvage_deferred))
     return tuple(merged)
 
 
@@ -2219,8 +2210,7 @@ def _validate_deadline_seconds(value: float) -> str | None:
     """``None`` if valid, else the usage-error message to print (AC-D8)."""
     if not math.isfinite(value) or value <= 0:
         return (
-            f"{PROGRAM}: --deadline-seconds must be a finite number greater than "
-            f"0 (got {value!r})"
+            f"{PROGRAM}: --deadline-seconds must be a finite number greater than 0 (got {value!r})"
         )
     return None
 
@@ -2231,9 +2221,7 @@ def _resolve_catalog(namespace: argparse.Namespace, env: Mapping[str, str]) -> P
     else:
         raw = env.get(CATALOG_ENV_VAR, "").strip()
         if not raw:
-            raise PreflightError(
-                f"no catalog root: pass --catalog or set {CATALOG_ENV_VAR}"
-            )
+            raise PreflightError(f"no catalog root: pass --catalog or set {CATALOG_ENV_VAR}")
         root = Path(raw)
     if not root.is_dir():
         raise PreflightError(f"catalog root {root} is not a directory")

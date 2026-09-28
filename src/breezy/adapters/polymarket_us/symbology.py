@@ -412,9 +412,7 @@ _PROSE_GE_RE: re.Pattern[str] = re.compile(
 #: distinction is the whole point of B6: ``lt`` carries offset ``-1`` in the
 #: one-token family and offset ``0`` in the two-token family, so there is no
 #: per-token rule to write down. A family absent from this table is refused.
-_OBSERVED_SLUG_FAMILIES: frozenset[tuple[str, ...]] = frozenset(
-    {("lt",), ("gte",), ("gte", "lt")}
-)
+_OBSERVED_SLUG_FAMILIES: frozenset[tuple[str, ...]] = frozenset({("lt",), ("gte",), ("gte", "lt")})
 
 
 @dataclass(frozen=True, slots=True)

@@ -185,17 +185,13 @@ class LadderEvConfig(StrategyConfig, frozen=True):
 
     def __post_init__(self) -> None:
         if self.allow_short:
-            raise AllowShortNotPermittedError(
-                "allow_short must stay False; SHORT_YES is forbidden"
-            )
+            raise AllowShortNotPermittedError("allow_short must stay False; SHORT_YES is forbidden")
         if self.mode == "full":
             raise ModeFullNotPermittedError(
                 "mode='full' is refused; legal modes are 'degraded' and 'forecast'"
             )
         if self.mode not in ("degraded", "forecast"):
-            raise ValueError(
-                f"mode must be 'degraded' or 'forecast', was {self.mode!r}"
-            )
+            raise ValueError(f"mode must be 'degraded' or 'forecast', was {self.mode!r}")
         if self.n_min_cell < 1:
             raise ValueError(f"n_min_cell must be >= 1, was {self.n_min_cell!r}")
         if self.margin_m24 < self.margin_m0:
@@ -218,9 +214,7 @@ class LadderEvConfig(StrategyConfig, frozen=True):
                 f"was {self.forecast_staleness_bound_ns!r}"
             )
         if self.publication_lag_ns < 0:
-            raise ValueError(
-                f"publication_lag_ns must be >= 0, was {self.publication_lag_ns!r}"
-            )
+            raise ValueError(f"publication_lag_ns must be >= 0, was {self.publication_lag_ns!r}")
         if self.raw_corpus_pin != CORPUS_SHA256:
             raise RawCorpusPinMismatchError(
                 "raw_corpus_pin must equal density_table.CORPUS_SHA256 "

@@ -200,12 +200,18 @@ class _PlateauProgress:
 
 
 _PlateauProgress.EMPTY = _PlateauProgress(
-    first_ts_ns=None, qualifying_count=0, has_observation=False,
+    first_ts_ns=None,
+    qualifying_count=0,
+    has_observation=False,
 )
 
 
 def _update_plateau_confirmation(
-    progress: _PlateauProgress, ts_ns: int, observed_at_ns: int | None, *, qualifies: bool,
+    progress: _PlateauProgress,
+    ts_ns: int,
+    observed_at_ns: int | None,
+    *,
+    qualifies: bool,
 ) -> tuple[_PlateauProgress, bool]:
     """Fold one reading into a PLATEAU confirmation window.
 
@@ -380,7 +386,10 @@ def _evaluate_hysteresis(
 
     if not relevant:
         new_history = dataclasses.replace(
-            history, candidate_state=None, candidate_count=0, candidate_first_ts_ns=None,
+            history,
+            candidate_state=None,
+            candidate_count=0,
+            candidate_first_ts_ns=None,
         )
         state = ThesisState.THREATENED if currently_threatened else ThesisState.ALIVE
         verdict = Verdict.REDUCE_RECOMMENDED if currently_threatened else Verdict.HOLD
@@ -399,17 +408,27 @@ def _evaluate_hysteresis(
     if flips:
         state = ThesisState.ALIVE if currently_threatened else ThesisState.THREATENED
         new_history = dataclasses.replace(
-            history, candidate_state=None, candidate_count=0, candidate_first_ts_ns=None,
+            history,
+            candidate_state=None,
+            candidate_count=0,
+            candidate_first_ts_ns=None,
         )
-        return state, (
-            Verdict.REDUCE_RECOMMENDED if state is ThesisState.THREATENED else Verdict.HOLD
-        ), (), 0, new_history
+        return (
+            state,
+            (Verdict.REDUCE_RECOMMENDED if state is ThesisState.THREATENED else Verdict.HOLD),
+            (),
+            0,
+            new_history,
+        )
 
     state = ThesisState.THREATENED if currently_threatened else ThesisState.ALIVE
     verdict = Verdict.REDUCE_RECOMMENDED if currently_threatened else Verdict.HOLD
     reason = toward_alive_reason if label == _TOWARD_ALIVE else toward_threatened_reason
     new_history = dataclasses.replace(
-        history, candidate_state=label, candidate_count=count, candidate_first_ts_ns=first_ts,
+        history,
+        candidate_state=label,
+        candidate_count=count,
+        candidate_first_ts_ns=first_ts,
     )
     return state, verdict, (reason,), count, new_history
 
@@ -424,7 +443,10 @@ def _evaluate_threatened_alive(
         state = ThesisState.THREATENED if currently_threatened else ThesisState.ALIVE
         verdict = Verdict.REDUCE_RECOMMENDED if currently_threatened else Verdict.HOLD
         new_history = dataclasses.replace(
-            history, candidate_state=None, candidate_count=0, candidate_first_ts_ns=None,
+            history,
+            candidate_state=None,
+            candidate_count=0,
+            candidate_first_ts_ns=None,
         )
         return state, verdict, ("p_hold_undefined",), 0, new_history
 
@@ -458,7 +480,8 @@ def _evaluate_no_leg_threat(
 
 
 def _evaluate_yes(
-    evidence: MonitorEvidence, history: MonitorHistory,
+    evidence: MonitorEvidence,
+    history: MonitorHistory,
 ) -> tuple[MonitorDecision, MonitorHistory]:
     """YES leg (module docstring rules 2-5). Rule 2 (DEAD) stays RISING-mode,
     UNCHANGED. Rule 4 (LOCKED) is now PLATEAU-mode (2026-09-16 correction --
@@ -468,7 +491,9 @@ def _evaluate_yes(
         evidence.rung_high is not None and evidence.running_max_lower > evidence.rung_high
     )
     dead_confirm_ns, dead_confirmed = _update_dead_confirmation(
-        history.dead_confirm_observed_ns, _dead_confirm_key(evidence), qualifies=dead_qualifies,
+        history.dead_confirm_observed_ns,
+        _dead_confirm_key(evidence),
+        qualifies=dead_qualifies,
     )
 
     if dead_confirmed:
@@ -511,7 +536,9 @@ def _evaluate_yes(
 
     lock_qualifies = _is_locked(evidence)
     lock_progress, lock_confirmed = _update_plateau_confirmation(
-        history.locked_confirm_progress, evidence.ts_ns, evidence.observed_at_ns,
+        history.locked_confirm_progress,
+        evidence.ts_ns,
+        evidence.observed_at_ns,
         qualifies=lock_qualifies,
     )
 
@@ -553,7 +580,8 @@ def _evaluate_yes(
         return decision, new_history
 
     state, verdict, reason_codes, confirmations, ta_history = _evaluate_threatened_alive(
-        evidence, history,
+        evidence,
+        history,
     )
     new_history = dataclasses.replace(
         ta_history,
@@ -573,7 +601,8 @@ def _evaluate_yes(
 
 
 def _evaluate_no(
-    evidence: MonitorEvidence, history: MonitorHistory,
+    evidence: MonitorEvidence,
+    history: MonitorHistory,
 ) -> tuple[MonitorDecision, MonitorHistory]:
     """NO leg (module docstring's leg semantics section): the two geometric
     facts YES uses for DEAD/LOCKED swap outcomes (win-lock stays RISING-mode,
@@ -629,7 +658,9 @@ def _evaluate_no(
 
     dead_lock_qualifies = _is_locked(evidence)
     dead_lock_progress, dead_lock_confirmed = _update_plateau_confirmation(
-        history.locked_confirm_progress, evidence.ts_ns, evidence.observed_at_ns,
+        history.locked_confirm_progress,
+        evidence.ts_ns,
+        evidence.observed_at_ns,
         qualifies=dead_lock_qualifies,
     )
 
@@ -658,7 +689,9 @@ def _evaluate_no(
         prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
         prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
         new_history = dataclasses.replace(
-            history, dead_confirm_observed_ns=(), locked_confirm_progress=dead_lock_progress,
+            history,
+            dead_confirm_observed_ns=(),
+            locked_confirm_progress=dead_lock_progress,
         )
         decision = MonitorDecision(
             state=prev_state,
@@ -670,7 +703,8 @@ def _evaluate_no(
         return decision, new_history
 
     state, verdict, reason_codes, confirmations, ta_history = _evaluate_no_leg_threat(
-        evidence, history,
+        evidence,
+        history,
     )
     new_history = dataclasses.replace(
         ta_history,

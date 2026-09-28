@@ -109,8 +109,7 @@ class ContinuousRungHoldBacktestStrategy(ContinuousRungHoldStrategy):
         self,
         config: CurrentRungHoldConfig,
         *,
-        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]]
-        | None = None,
+        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]] | None = None,
         offer_tape: OfferTape | None = None,
         offer_tape_path: Path | None = None,
         position_evidence_reader: Callable[[], dict[str, object] | None] | None = None,

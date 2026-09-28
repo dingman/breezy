@@ -280,8 +280,12 @@ def evaluate_instrument(
     )
     if ensure_aware(now) > window_end:
         return _maybe_exit_caught_up(
-            contract=contract, quote=quote, current_qty=current_qty,
-            state=state, cfg=cfg, price_scale=scale,
+            contract=contract,
+            quote=quote,
+            current_qty=current_qty,
+            state=state,
+            cfg=cfg,
+            price_scale=scale,
         )
 
     last_traded = state.traded_publication.get(contract.instrument_id)
@@ -289,8 +293,12 @@ def evaluate_instrument(
         current.published_at,
     ):
         return _maybe_exit_caught_up(
-            contract=contract, quote=quote, current_qty=current_qty,
-            state=state, cfg=cfg, price_scale=scale,
+            contract=contract,
+            quote=quote,
+            current_qty=current_qty,
+            state=state,
+            cfg=cfg,
+            price_scale=scale,
         )
     if last_traded is not None:
         cooldown_until = ensure_aware(last_traded) + timedelta(minutes=cfg.cooldown_minutes)

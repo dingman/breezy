@@ -82,8 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         parsed = parser.parse_args(args_list)
     except argparse.ArgumentError as exc:
         print(
-            "structural-pin-guard: usage: --family ID --token TOKEN "
-            f"[--now HH:MM[:SS]] ({exc})",
+            f"structural-pin-guard: usage: --family ID --token TOKEN [--now HH:MM[:SS]] ({exc})",
             file=sys.stderr,
         )
         return EXIT_USAGE
@@ -107,8 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         print(result)
         return EXIT_OK
     print(
-        f"structural-pin-guard: {result} token={parsed.token!r} "
-        f"(required {REQUIRED_TOKEN})",
+        f"structural-pin-guard: {result} token={parsed.token!r} (required {REQUIRED_TOKEN})",
         file=sys.stderr,
     )
     return EXIT_NOT_READY

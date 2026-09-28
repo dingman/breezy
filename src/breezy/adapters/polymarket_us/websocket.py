@@ -675,9 +675,7 @@ class PolymarketUSMarketsWebSocket:
         for slug in tradeable:
             self._trade_subscriptions[slug] = request_id
 
-    def _subscribe_sent_info(
-        self, kind: str, request_id: str, slugs: Sequence[str]
-    ) -> str:
+    def _subscribe_sent_info(self, kind: str, request_id: str, slugs: Sequence[str]) -> str:
         """One INFO after a successful MARKET_DATA or TRADE subscribe send.
 
         Public slugs only -- never the envelope JSON, signatures, or headers.
@@ -1393,9 +1391,7 @@ class PolymarketUSMarketsWebSocketPool:
         #: this preserves the pre-2026-09-17 shard count for both the live
         #: trade node (`subscribe_trades` off) and the recorder's current
         #: default (`subscribe_trades` on, `trade_shard_halving` off).
-        self._slugs_per_shard: int = (
-            cap // 2 if (subscribe_trades and trade_shard_halving) else cap
-        )
+        self._slugs_per_shard: int = cap // 2 if (subscribe_trades and trade_shard_halving) else cap
 
         #: Built eagerly (never connected) so configuration -- URL, signer --
         #: is inspectable before `connect()`, exactly like a bare
@@ -1622,9 +1618,7 @@ class PolymarketUSMarketsWebSocketPool:
     async def unsubscribe(self, request_id: str) -> None:
         """Cancel one subscription request on whichever shard owns it."""
         for shard in self._shards:
-            removed_slugs = [
-                slug for slug, rid in shard.subscriptions.items() if rid == request_id
-            ]
+            removed_slugs = [slug for slug, rid in shard.subscriptions.items() if rid == request_id]
             if not removed_slugs:
                 continue
             await shard.unsubscribe(request_id)

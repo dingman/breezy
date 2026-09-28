@@ -190,17 +190,13 @@ class ReplayResult:
                     f"{name!r} must be a float, got {type(value).__name__}"
                 )
             if expected_type is str and not isinstance(value, str):
-                raise ReplayResultRecordError(
-                    f"{name!r} must be a str, got {type(value).__name__}"
-                )
+                raise ReplayResultRecordError(f"{name!r} must be a str, got {type(value).__name__}")
 
         fill_prices = payload["fill_price_vs_decision_ask"]
         if not isinstance(fill_prices, list) or not all(
             isinstance(item, str) for item in fill_prices
         ):
-            raise ReplayResultRecordError(
-                "'fill_price_vs_decision_ask' must be a list of str"
-            )
+            raise ReplayResultRecordError("'fill_price_vs_decision_ask' must be a list of str")
         refusal_counts = payload["refusal_counts"]
         if not isinstance(refusal_counts, Mapping) or not all(
             isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
@@ -277,9 +273,7 @@ _FIELD_TYPES: Final[dict[str, type]] = {
     "census_schema_version": int,
 }
 
-_NESTED_FIELDS: Final[frozenset[str]] = frozenset(
-    {"fill_price_vs_decision_ask", "refusal_counts"}
-)
+_NESTED_FIELDS: Final[frozenset[str]] = frozenset({"fill_price_vs_decision_ask", "refusal_counts"})
 
 _NULLABLE_FIELDS: Final[frozenset[str]] = frozenset(
     {

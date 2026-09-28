@@ -448,8 +448,7 @@ def prepare_quote_tape_root(root: Path) -> Path:
         )
     if not stat.S_ISDIR(status.st_mode):
         raise CatalogPathError(
-            f"quote-tape root {root} exists and is not a directory; refusing to "
-            "record through it"
+            f"quote-tape root {root} exists and is not a directory; refusing to record through it"
         )
 
     # `mkdir`'s mode argument is masked by the umask, and an already-existing
@@ -907,9 +906,7 @@ def build_trade_node_config(
     # is refused at config-build time, before it ever reaches the client.
     from breezy.runtime.submit_intent import RetirementReason
 
-    if submit_intent_latch is not None and not isinstance(
-        submit_intent_latch, SubmitIntentLatch
-    ):
+    if submit_intent_latch is not None and not isinstance(submit_intent_latch, SubmitIntentLatch):
         raise NodeConfigError(
             "submit_intent_latch must be a real breezy.runtime.submit_intent."
             f"SubmitIntentLatch (or None); got {type(submit_intent_latch).__name__!r}"

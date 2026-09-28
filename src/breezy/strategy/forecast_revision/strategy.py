@@ -415,7 +415,8 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
                 f"RISK block {contract.instrument_id}: {risk_decision.reason} "
                 f"edge={decision.edge:.3f}"
                 + reduce_only_refusal_note(
-                    risk_decision.reason, tick_ts_ns=self.clock.timestamp_ns(),
+                    risk_decision.reason,
+                    tick_ts_ns=self.clock.timestamp_ns(),
                 ),
             )
             self._report_refusals()

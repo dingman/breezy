@@ -312,7 +312,8 @@ class PositionMonitor:
 
     def on_position_opened(self, position: Position, now_ns: int) -> None:
         self._guarded(
-            "on_position_opened", lambda: self._on_position_opened(position, now_ns),
+            "on_position_opened",
+            lambda: self._on_position_opened(position, now_ns),
         )
 
     def on_stop(self, now_ns: int) -> None:
@@ -325,7 +326,8 @@ class PositionMonitor:
             self._monitor_errors += 1
             try:
                 self._report(
-                    "monitor_error", {"site": site, "exc_type": type(exc).__name__},
+                    "monitor_error",
+                    {"site": site, "exc_type": type(exc).__name__},
                 )
             except Exception:  # the report sink itself must never propagate
                 logger.exception("PositionMonitor: report() failed for site=%s", site)
@@ -406,7 +408,12 @@ class PositionMonitor:
         return self._register(iid, candidates[0], now_ns, entry_context="reconciled")
 
     def _register(
-        self, iid: str, position: Position, now_ns: int, *, entry_context: str,
+        self,
+        iid: str,
+        position: Position,
+        now_ns: int,
+        *,
+        entry_context: str,
     ) -> _MonitoredPosition:
         station = self._station_for(iid)
         climate_day = self._climate_day_for(iid)
@@ -445,7 +452,10 @@ class PositionMonitor:
         return monitored
 
     def _recover_p_hold_at_entry(
-        self, iid: str, station: str, record: TrialDayRecord,
+        self,
+        iid: str,
+        station: str,
+        record: TrialDayRecord,
     ) -> Decimal | None:
         """Best-effort re-derivation of the estimand entry evaluated.
 
@@ -534,7 +544,9 @@ class PositionMonitor:
 
         pre_history = monitored.history
         decision, new_history = evaluate_monitor(
-            evidence, pre_history, stale_observation_bound_ns=self._stale_observation_bound_ns,
+            evidence,
+            pre_history,
+            stale_observation_bound_ns=self._stale_observation_bound_ns,
         )
         monitored.history = new_history
         self._evaluations += 1

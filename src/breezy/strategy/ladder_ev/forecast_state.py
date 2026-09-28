@@ -127,12 +127,16 @@ class ForecastState:
         snapshot = self.value_at(now_ns)
         if snapshot is None:
             return ForecastVisibility(
-                snapshot=None, reason=FORECAST_UNAVAILABLE, staleness_ns=None,
+                snapshot=None,
+                reason=FORECAST_UNAVAILABLE,
+                staleness_ns=None,
             )
         staleness_ns = now_ns - snapshot.available_at_ns
         reason = FORECAST_STALE if staleness_ns > max_staleness_ns else FORECAST_OK
         return ForecastVisibility(
-            snapshot=snapshot, reason=reason, staleness_ns=staleness_ns,
+            snapshot=snapshot,
+            reason=reason,
+            staleness_ns=staleness_ns,
         )
 
 

@@ -611,18 +611,12 @@ class NwsIngestActor(Actor):
     @property
     def staleness_degraded_after_ns(self) -> int:
         return (
-            int(self._config.poll_interval_seconds)
-            * STALENESS_DEGRADE_INTERVALS
-            * _NS_PER_SECOND
+            int(self._config.poll_interval_seconds) * STALENESS_DEGRADE_INTERVALS * _NS_PER_SECOND
         )
 
     @property
     def staleness_blocked_after_ns(self) -> int:
-        return (
-            int(self._config.poll_interval_seconds)
-            * STALENESS_BLOCK_INTERVALS
-            * _NS_PER_SECOND
-        )
+        return int(self._config.poll_interval_seconds) * STALENESS_BLOCK_INTERVALS * _NS_PER_SECOND
 
     # -- lifecycle ------------------------------------------------------
 
@@ -684,9 +678,7 @@ class NwsIngestActor(Actor):
         # stays satisfied indefinitely, and no record is ever written.
         self.clock.set_timer(
             name=self._deadline_timer_name,
-            interval=timedelta(
-                seconds=int(self._config.final_deadline_check_interval_seconds)
-            ),
+            interval=timedelta(seconds=int(self._config.final_deadline_check_interval_seconds)),
             # `start_time=None` -- UNSTAGGERED, deliberately, and the asymmetry
             # with the poll timer above is the point. The stagger exists to
             # spread concurrent HTTP requests to `api.weather.gov` across five
@@ -811,9 +803,7 @@ class NwsIngestActor(Actor):
         loop.call_soon_threadsafe(self._record_task_death, exc)
 
     def _record_task_death(self, exc: BaseException) -> None:
-        logger.critical(
-            "poll task for %s/%s died: %r", self._venue, self._city, exc, exc_info=exc
-        )
+        logger.critical("poll task for %s/%s died: %r", self._venue, self._city, exc, exc_info=exc)
         self._execute(route_unhandled_exception(exc))
 
     # -- SS6 step 1: may we perform network I/O? --------------------------
@@ -903,8 +893,7 @@ class NwsIngestActor(Actor):
         """
         if self._poll_in_flight:
             logger.warning(
-                "skipping overlapping poll cycle for %s/%s: the previous cycle "
-                "is still running",
+                "skipping overlapping poll cycle for %s/%s: the previous cycle is still running",
                 self._venue,
                 self._city,
             )
@@ -1272,9 +1261,7 @@ class NwsIngestActor(Actor):
             parsed.summary_date.isoformat(),
             has_correction_evidence(envelope.product_text),
         )
-        return _PreparedProduct(
-            fetch=result, envelope=envelope, header=header, parsed=parsed
-        )
+        return _PreparedProduct(fetch=result, envelope=envelope, header=header, parsed=parsed)
 
     def _record_field_read_outcome(self, *, unreadable: bool) -> None:
         """CF-5b: update the consecutive-unreadable-parse streak.
@@ -1400,9 +1387,7 @@ class NwsIngestActor(Actor):
         self._integrity_alarm(uuid, observation.detail)
         return False
 
-    async def _persist_batch(
-        self, prepared: Sequence[_PreparedProduct]
-    ) -> tuple[Data, ...] | None:
+    async def _persist_batch(self, prepared: Sequence[_PreparedProduct]) -> tuple[Data, ...] | None:
         """Steps 9-11 for the whole poll. Returns the written records, or
         `None` when the write did not complete (the gate is already driven).
         """
@@ -1493,7 +1478,6 @@ class NwsIngestActor(Actor):
         if decision.outcome is not PollOutcome.PERSISTED:
             return None
         return ordered
-
 
     # -- publication and the resume cursor (SS3.3) ------------------------
 
@@ -1931,9 +1915,7 @@ class NwsIngestActor(Actor):
             # stalled disk must not be able to hold the poll cycle's thread.
             # BOUNDED for the second reason: off-loop-and-unbounded is a
             # fail-open, not a fix -- see `_bounded_io`.
-            await self._bounded_io(
-                lambda: health.write_snapshot_atomic(snapshot_path, snapshot)
-            )
+            await self._bounded_io(lambda: health.write_snapshot_atomic(snapshot_path, snapshot))
 
     @staticmethod
     def _emit_all(health: Any, sink: AlertSink, payloads: Sequence[AlertPayload]) -> None:
@@ -2424,9 +2406,7 @@ class NwsIngestActor(Actor):
         killed, so `wait_for` frees the *cycle*, not the worker. The stall
         still surfaces -- loudly, as task death -- instead of hanging.
         """
-        return await asyncio.wait_for(
-            self._run_off_loop(fn), self.observability_io_timeout_s
-        )
+        return await asyncio.wait_for(self._run_off_loop(fn), self.observability_io_timeout_s)
 
     async def _bounded[T](self, fn: Callable[[], T]) -> T:
         """Run ``fn`` off the loop under a real wall-clock ceiling.

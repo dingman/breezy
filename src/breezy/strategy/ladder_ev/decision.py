@@ -26,9 +26,7 @@ _POST_PEAK_P_MAX = 0.05
 # Scan-time rung/forecast relation (includes the coarse class ``above``).
 # Distinct from ``FORECAST_OUTCOME_ALPHABET`` (settled-outcome labels), which
 # has no bare ``above`` — ``above1``/``above2``/``above3+`` are the outcomes.
-ForecastRungRelation = Literal[
-    "below", "contains", "above", "above1", "above2", "above3+"
-]
+ForecastRungRelation = Literal["below", "contains", "above", "above1", "above2", "above3+"]
 _FORECAST_RUNG_RELATIONS: Final[frozenset[ForecastRungRelation]] = frozenset(
     {"contains", "above", "above1", "above2", "above3+"}
 )

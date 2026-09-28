@@ -63,17 +63,11 @@ _HEALTH_SNAPSHOT_DIR_VAR = "BREEZY_HEALTH_SNAPSHOT_DIR"
 #: :func:`load_settings`. See that function's docstring for why the venue
 #: role is loaded separately.
 QUOTE_TAPE_CATALOG_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG"
-_QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR = (
-    "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING"
-)
+_QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING"
 _QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_ERROR"
-_QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR = (
-    "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING"
-)
+_QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING"
 _QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_ERROR"
-_QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = (
-    "BREEZY_POLYMARKET_US_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS"
-)
+_QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS"
 
 #: The TRADING role's own trader id. Read ONLY by
 #: :func:`load_trade_settings`, and deliberately a DIFFERENT variable from
@@ -353,8 +347,7 @@ def _parse_sending_family_id(env: Mapping[str, str]) -> str | None:
         return None
     if not raw.strip():
         raise SettingsError(
-            f"{SENDING_FAMILY_ID_VAR} must not be blank; unset it entirely for no "
-            "sending family"
+            f"{SENDING_FAMILY_ID_VAR} must not be blank; unset it entirely for no sending family"
         )
     if "\x00" in raw:
         raise SettingsError(f"{SENDING_FAMILY_ID_VAR} must not contain a NUL byte")
@@ -412,9 +405,7 @@ def _parse_trade_catalog_root(env: Mapping[str, str]) -> Path:
         raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} must not contain a NUL byte")
     catalog_root = Path(raw.strip())
     if not catalog_root.is_absolute():
-        raise SettingsError(
-            f"{TRADE_CATALOG_ROOT_VAR} must be an absolute path, was {raw!r}"
-        )
+        raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} must be an absolute path, was {raw!r}")
     if any(part == ".." for part in catalog_root.parts):
         raise SettingsError(
             f"{TRADE_CATALOG_ROOT_VAR} must not contain a '..' segment, was {raw!r}"
@@ -469,9 +460,7 @@ def _parse_health_snapshot_dir(env: Mapping[str, str]) -> Path | None:
         raise SettingsError(f"{_HEALTH_SNAPSHOT_DIR_VAR} must not contain a NUL byte")
     path = Path(raw)
     if not path.is_absolute():
-        raise SettingsError(
-            f"{_HEALTH_SNAPSHOT_DIR_VAR} must be an absolute path, was {raw!r}"
-        )
+        raise SettingsError(f"{_HEALTH_SNAPSHOT_DIR_VAR} must be an absolute path, was {raw!r}")
     return path
 
 
@@ -717,9 +706,7 @@ def load_quote_tape_settings(
         raise SettingsError(f"{QUOTE_TAPE_CATALOG_VAR} must not contain a NUL byte")
     catalog_root = Path(raw.strip())
     if not catalog_root.is_absolute():
-        raise SettingsError(
-            f"{QUOTE_TAPE_CATALOG_VAR} must be an absolute path, was {raw!r}"
-        )
+        raise SettingsError(f"{QUOTE_TAPE_CATALOG_VAR} must be an absolute path, was {raw!r}")
     # Refused, not resolved. Normalising would mean the directory an operator
     # reads in the unit file is not the directory the tape lands in, and the
     # tape is the one artifact that cannot be re-created if it lands somewhere

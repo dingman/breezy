@@ -149,9 +149,7 @@ MAX_LINE_LENGTH = 200
 padding); this gives ~2.5x headroom while catching a single giant line
 (e.g. no newlines at all) in O(1) per line, before any regex sees it."""
 
-_WMO_HEADING_RE = re.compile(
-    r"^[A-Z]{4}\d{2}\s+[A-Z]{4}\s+\d{6}(?:\s+(?P<bbb>[A-Z]{3}))?$"
-)
+_WMO_HEADING_RE = re.compile(r"^[A-Z]{4}\d{2}\s+[A-Z]{4}\s+\d{6}(?:\s+(?P<bbb>[A-Z]{3}))?$")
 """WMO abbreviated heading shape: T1T2A1A2ii + WFO + ddhhmm, with an
 optional trailing BBB indicator.
 
@@ -472,9 +470,7 @@ def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliSt
     # Expected shape: [0] blank transmission leader, [1] WMO transmission
     # sequence, [2] WMO abbreviated heading, [3] AWIPS PIL.
     if len(lines) < 4:
-        raise CliStructuralError(
-            "product is too short to contain a WMO header and AWIPS PIL"
-        )
+        raise CliStructuralError("product is too short to contain a WMO header and AWIPS PIL")
 
     transmission_sequence = lines[1].strip()
     # Use \Z, not $, because `$` also matches before a trailing newline. The
@@ -482,8 +478,7 @@ def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliSt
     # if this check is ever refactored to validate an unstripped line.
     if _WMO_TRANSMISSION_SEQUENCE_RE.match(transmission_sequence) is None:
         raise CliStructuralError(
-            f"unexpected transmission indicator line: {lines[1]!r}; "
-            "expected 1-6 ASCII digits"
+            f"unexpected transmission indicator line: {lines[1]!r}; expected 1-6 ASCII digits"
         )
 
     wmo_match = _WMO_HEADING_RE.match(lines[2].strip())
@@ -496,9 +491,7 @@ def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliSt
     if not actual_pil:
         # No PIL line at all is a SHAPE problem, not an addressing one:
         # this body is not another station's product, it is not a product.
-        raise CliStructuralError(
-            "product has no AWIPS PIL on line 4 of the transmission header"
-        )
+        raise CliStructuralError("product has no AWIPS PIL on line 4 of the transmission header")
 
     expected_pil = f"CLI{cli_location}"
     if actual_pil != expected_pil:
@@ -582,9 +575,7 @@ def parse_cli_product(
 
     month_number = _MONTH_NAME_TO_NUMBER.get(headline_match.group("month").upper())
     if month_number is None:
-        raise CliContentError(
-            f"unrecognized month name in headline: {station_header_line!r}"
-        )
+        raise CliContentError(f"unrecognized month name in headline: {station_header_line!r}")
     try:
         summary_date = date(
             int(headline_match.group("year")),

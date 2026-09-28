@@ -167,9 +167,7 @@ def _row(
     )
 
 
-def _structural_dead(
-    *, covered_listed_station_days: int, filled_takes: int | None
-) -> _DeadVerdict:
+def _structural_dead(*, covered_listed_station_days: int, filled_takes: int | None) -> _DeadVerdict:
     """The shipped `structural_dead`, loaded from the script that owns it.
 
     Not a re-implementation. Imported by file location so this module's
@@ -499,9 +497,7 @@ def evaluate_c_n(*, store_dir: Path) -> CriterionRow:
     )
 
 
-def _ratio_of_sums(
-    values: np.ndarray, qty: np.ndarray, axis: int = -1
-) -> np.ndarray:
+def _ratio_of_sums(values: np.ndarray, qty: np.ndarray, axis: int = -1) -> np.ndarray:
     return np.sum(values, axis=axis) / np.sum(qty, axis=axis)
 
 
@@ -614,9 +610,7 @@ def evaluate_c_pin(proposal: FamilyManifest) -> CriterionRow:
     )
 
 
-def assemble_outcome(
-    rows: Sequence[CriterionRow], *, criteria_status: str
-) -> PromotionVerdict:
+def assemble_outcome(rows: Sequence[CriterionRow], *, criteria_status: str) -> PromotionVerdict:
     """Any INERT bars PROPOSAL and keeps the criteria tag provisional.
 
     A failing predicate dominates: the outcome is NO_PROPOSAL even if C-PIN

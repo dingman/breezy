@@ -133,7 +133,8 @@ class StationObservation(Data):
         self.is_metar = require_bool(is_metar, "is_metar")
         self.source_channel = require_text(source_channel, "source_channel")
         self.assumed_publication_lag_ns = require_int(
-            assumed_publication_lag_ns, "assumed_publication_lag_ns",
+            assumed_publication_lag_ns,
+            "assumed_publication_lag_ns",
         )
         self.schema_version = require_int(schema_version, "schema_version")
 
@@ -144,10 +145,7 @@ class StationObservation(Data):
                 f"or coincide with the measurement it reports",
             )
 
-        if (
-            self.source_channel in _POSITIVE_LAG_CHANNELS
-            and self.assumed_publication_lag_ns <= 0
-        ):
+        if self.source_channel in _POSITIVE_LAG_CHANNELS and self.assumed_publication_lag_ns <= 0:
             raise ValueError(
                 "`assumed_publication_lag_ns` must be positive for "
                 f"source_channel={self.source_channel!r}, "

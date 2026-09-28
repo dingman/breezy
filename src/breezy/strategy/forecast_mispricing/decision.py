@@ -98,7 +98,9 @@ def evaluate_instrument(
     # SIGMA TAKES THE LEAD AT ISSUANCE, NEVER THE LIVE HORIZON (T-11).
     sigma_lead_h = issuance_lead_hours(settlement_deadline, forecast)
     model_p = engine.bucket_probability(
-        contract.facts, forecast.expected_high_f, sigma_lead_h,
+        contract.facts,
+        forecast.expected_high_f,
+        sigma_lead_h,
     )
     scale = (
         cfg.price_scale_override if cfg.price_scale_override is not None else contract.price_scale

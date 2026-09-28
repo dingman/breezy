@@ -48,7 +48,10 @@ class _ReadableStore(Protocol):
 
 
 def first_live_order_payload(
-    instrument_id: str, ts_ns: int, *, venue_order_id: str | None = None,
+    instrument_id: str,
+    ts_ns: int,
+    *,
+    venue_order_id: str | None = None,
 ) -> bytes:
     """The single, shared payload shape for :data:`NO_SIDE_FIRST_LIVE_ORDER_KEY`.
 

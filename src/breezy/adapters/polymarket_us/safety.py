@@ -658,9 +658,7 @@ def operator_max_order_notional_whole_usd() -> int:
             cap, or if derivation is needed and the per-position cap is
             absent. The message names the control and never echoes its value.
     """
-    ceiling = _session_money(
-        MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling
-    )
+    ceiling = _session_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling)
     whole = int(ceiling)  # Truncation toward zero; the money reader is > 0.
     if whole < 1:
         raise LiveTradingPermissionError(
@@ -715,15 +713,9 @@ def issue_live_trading_permit(
             f"there is no default and no truthiness coercion"
         )
 
-    ceiling = _session_money(
-        MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling
-    )
-    budget_notional = _session_money(
-        SESSION_NOTIONAL_USD_ENV_VAR, derive=_derived_session_notional
-    )
-    budget_orders = _session_count(
-        SESSION_ORDER_COUNT_ENV_VAR, derive=_derived_session_order_count
-    )
+    ceiling = _session_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling)
+    budget_notional = _session_money(SESSION_NOTIONAL_USD_ENV_VAR, derive=_derived_session_notional)
+    budget_orders = _session_count(SESSION_ORDER_COUNT_ENV_VAR, derive=_derived_session_order_count)
     operator_id = _require_operator_value(OPERATOR_ID_ENV_VAR).strip()
     issued_at_ns = _read_clock(clock)
 
@@ -804,9 +796,7 @@ def live_trading_budget_remaining(permit: LiveTradingPermit) -> tuple[Decimal, i
     return budget.remaining_notional_usd, budget.remaining_order_count
 
 
-def seed_permit_budget_from_prior_spend(
-    *, permit: LiveTradingPermit, spent_usd: Decimal
-) -> bool:
+def seed_permit_budget_from_prior_spend(*, permit: LiveTradingPermit, spent_usd: Decimal) -> bool:
     """S0 (plan rev 3, R3-1): reduce a freshly-issued permit's remaining
     session notional by USD already spent today, from the SAME durable-fill
     walk that seeds :meth:`DailySpendLedger.seed_spent` -- never from an
@@ -839,18 +829,14 @@ def seed_permit_budget_from_prior_spend(
             f"spent_usd must be exactly Decimal, not {type(spent_usd).__name__}"
         )
     if not spent_usd.is_finite() or spent_usd < Decimal(0):
-        raise LiveTradingPermissionError(
-            "spent_usd must be a non-negative finite decimal amount"
-        )
+        raise LiveTradingPermissionError("spent_usd must be a non-negative finite decimal amount")
     with _REGISTRY_LOCK:
         if permit.permit_id in _SEEDED_PERMIT_BUDGETS:
             return False
         budget = _PERMIT_BUDGETS.get(permit.permit_id)
         if budget is None:
             raise LiveTradingPermissionError("permit budget is unknown to this process")
-        budget.remaining_notional_usd = max(
-            Decimal(0), budget.remaining_notional_usd - spent_usd
-        )
+        budget.remaining_notional_usd = max(Decimal(0), budget.remaining_notional_usd - spent_usd)
         _SEEDED_PERMIT_BUDGETS.add(permit.permit_id)
     return True
 
@@ -904,7 +890,8 @@ def restore_live_trading_budget(
         if key in _RESTORED_BUDGET_DELTAS:
             return False
         new_notional = min(
-            budget.remaining_notional_usd + order_notional_usd, permit.budget_notional_usd,
+            budget.remaining_notional_usd + order_notional_usd,
+            permit.budget_notional_usd,
         )
         new_count = min(budget.remaining_order_count + 1, permit.budget_order_count)
         applied_notional_delta = new_notional - budget.remaining_notional_usd

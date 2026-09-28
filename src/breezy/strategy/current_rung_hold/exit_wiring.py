@@ -122,7 +122,11 @@ def exit_rule_from_tags(order: Order) -> str | None:
 
 
 def halt_family_for_ambiguous_exit(
-    strategy: ContinuousRungHoldStrategy, *, position_id: str, reason: str, ts_ns: int,
+    strategy: ContinuousRungHoldStrategy,
+    *,
+    position_id: str,
+    reason: str,
+    ts_ns: int,
 ) -> None:
     """Plan §5.4: the durable family-wide kill for an AMBIGUOUS or rejected
     exit order -- writes the SAME durable state
@@ -133,7 +137,8 @@ def halt_family_for_ambiguous_exit(
     strategy.diagnostics.record(_DIAG_FAMILY_HALT_AMBIGUOUS_EXIT)
     strategy.position_events.record(_POSITION_EXIT_ORDER_REJECTED)
     strategy._report_alerter(
-        strategy.diagnostics_alerter, "continuous_rung_hold diagnostics report failed",
+        strategy.diagnostics_alerter,
+        "continuous_rung_hold diagnostics report failed",
     )
 
 
@@ -212,7 +217,8 @@ def on_exit_order_filled(strategy: ContinuousRungHoldStrategy, event: OrderFille
         )
         strategy.position_events.record(_POSITION_EXIT_FILL_JOIN_ERROR)
         strategy._report_alerter(
-            strategy.position_alerter, "continuous_rung_hold position report failed",
+            strategy.position_alerter,
+            "continuous_rung_hold position report failed",
         )
         return
     station, climate_day_key = joined
@@ -234,12 +240,14 @@ def on_exit_order_filled(strategy: ContinuousRungHoldStrategy, event: OrderFille
         )
         strategy.position_events.record(_POSITION_EXIT_FILL_JOIN_ERROR)
         strategy._report_alerter(
-            strategy.position_alerter, "continuous_rung_hold position report failed",
+            strategy.position_alerter,
+            "continuous_rung_hold position report failed",
         )
         return
     strategy.position_events.record(_POSITION_EXIT_FILLED)
     strategy._report_alerter(
-        strategy.position_alerter, "continuous_rung_hold position report failed",
+        strategy.position_alerter,
+        "continuous_rung_hold position report failed",
     )
 
 
@@ -270,7 +278,8 @@ def submit_exit(strategy: ContinuousRungHoldStrategy, proposal: ExitProposal) ->
     if strategy._latch.is_family_halted():
         strategy.diagnostics.record(_DIAG_FAMILY_HALT)
         strategy._report_alerter(
-            strategy.diagnostics_alerter, "continuous_rung_hold diagnostics report failed",
+            strategy.diagnostics_alerter,
+            "continuous_rung_hold diagnostics report failed",
         )
         return
     auth = proposal.authorization

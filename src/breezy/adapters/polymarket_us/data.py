@@ -774,9 +774,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         # to a per-process UUID4 so a client built OUTSIDE the recorder role
         # still produces partitionable rows -- never to a blank, which
         # `QuoteTapeGap` refuses outright.
-        self._recorder_instance_id: str = (
-            config.recorder_instance_id or f"unmanaged-{uuid.uuid4()}"
-        )
+        self._recorder_instance_id: str = config.recorder_instance_id or f"unmanaged-{uuid.uuid4()}"
         self._dropped_frames: int = 0
         self._frames_missing_routing_key: int = 0
         self._quotes_published: int = 0
@@ -1246,8 +1244,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                         LogColor.RED,
                     )
                 self._log.debug(
-                    "Scheduled task 'update_instruments' to run in "
-                    f"{delay_secs:.0f} seconds"
+                    f"Scheduled task 'update_instruments' to run in {delay_secs:.0f} seconds"
                 )
                 await asyncio.sleep(delay_secs)
                 try:
@@ -1344,8 +1341,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     def _alert_on_discovery_counts(self, *, before: int, after: int) -> None:
         resolved = self._provider_resolved_reasons()
         self._log.info(
-            f"Polymarket.us discovery count before={before} after={after} "
-            f"resolved={len(resolved)}"
+            f"Polymarket.us discovery count before={before} after={after} resolved={len(resolved)}"
         )
         if after == 0:
             self._log.error(
@@ -1411,17 +1407,13 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         finished being handled. The cache IS the post-processing state this
         alert is about, so it is the thing observed.
         """
-        pending = tuple(
-            (slug, slug_to_instrument_id(slug, self.venue)) for slug in slugs
-        )
+        pending = tuple((slug, slug_to_instrument_id(slug, self.venue)) for slug in slugs)
         deadline_ns = self._clock.timestamp_ns() + int(
             INSTRUMENT_CACHE_DRAIN_TIMEOUT_SECS * 1_000_000_000
         )
         first_pass = True
         while True:
-            pending = tuple(
-                entry for entry in pending if self._cache.instrument(entry[1]) is None
-            )
+            pending = tuple(entry for entry in pending if self._cache.instrument(entry[1]) is None)
             if not pending:
                 return ()
             if self._clock.timestamp_ns() >= deadline_ns:
@@ -1621,9 +1613,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                     continue
                 # The settlement-provenance record is a custom type and must be
                 # wrapped; the other three are native and must not be.
-                if isinstance(record, Data) and type(record).__module__.endswith(
-                    "tape_records"
-                ):
+                if isinstance(record, Data) and type(record).__module__.endswith("tape_records"):
                     self._publish_custom(record)
                 else:
                     self._handle_data(record)
@@ -1774,9 +1764,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             self._note_one_sided_book(instrument, exc)
             return None
         except (PolymarketUSError, ValueError, KeyError, TypeError) as exc:
-            message = (
-                f"Could not parse {label} for {instrument.id}: {type(exc).__name__}"
-            )
+            message = f"Could not parse {label} for {instrument.id}: {type(exc).__name__}"
             if required:
                 self._log.error(message)
             else:
@@ -1833,9 +1821,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                 "depth capture is unaffected."
             )
 
-    def _note_depth_truncation(
-        self, payload: Mapping[str, Any], depth: Any, ts_init: int
-    ) -> int:
+    def _note_depth_truncation(self, payload: Mapping[str, Any], depth: Any, ts_init: int) -> int:
         """Record -- to the TAPE -- how much of this snapshot did not fit.
 
         A process-memory counter cannot answer the question an analyst actually

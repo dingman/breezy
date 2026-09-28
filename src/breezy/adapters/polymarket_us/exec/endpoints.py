@@ -139,6 +139,7 @@ def order_by_id_path(order_id: str) -> str:
         raise ValueError("venue order id carries a path, query, fragment or whitespace character")
     return f"{ORDER_BY_ID_PATH_PREFIX}{order_id}"
 
+
 #: The rate-limit budget both private reads spend from. Not a new quota key:
 #: ``QUOTA_KEY_PORTFOLIO`` already exists and is already provisioned
 #: (``transport.py:92``, ``:233``), and an unbudgeted read is refused outright

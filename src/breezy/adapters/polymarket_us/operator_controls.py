@@ -126,6 +126,7 @@ from breezy.adapters.polymarket_us.safety import (
 class DailyBudgetExhausted(LiveTradingPermissionError):
     """The daily USD budget was reached; today's remaining orders are denied."""
 
+
 #: The operator's rolling calendar-day (UTC) ceiling on USD notional spent.
 #: Operator-reserved: this repo never assigns it a value.
 MAX_DAILY_BUDGET_USD_ENV_VAR: Final = "BREEZY_MAX_DAILY_BUDGET_USD"

@@ -269,9 +269,7 @@ def _build_climate_day_window(venue: str, city: str, table: dict[str, Any]) -> C
     )
 
 
-def _build_settlement_deadline(
-    venue: str, city: str, table: dict[str, Any]
-) -> SettlementDeadline:
+def _build_settlement_deadline(venue: str, city: str, table: dict[str, Any]) -> SettlementDeadline:
     site_key = f"{venue}.{city}"
     for field in _REQUIRED_SETTLEMENT_DEADLINE_FIELDS:
         _require_field(table, field, site_key)
@@ -396,8 +394,7 @@ class SiteRegistry:
             return self._sites_by_venue_city_token[(venue, token)]
         except KeyError as exc:
             raise SiteNotFoundError(
-                f"no settlement site registered for venue={venue!r} "
-                f"venue_city_token={token!r}"
+                f"no settlement site registered for venue={venue!r} venue_city_token={token!r}"
             ) from exc
 
     def climate_day_window(self, venue: str, city: str) -> ClimateDayWindow:
@@ -484,15 +481,9 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
             settlement_sites[(venue, city)] = site
             venue_symbologies[(venue, city)] = symbology
             sites_by_venue_city_token[token_key] = site
-            climate_day_windows[(venue, city)] = _build_climate_day_window(
-                venue, city, table_raw
-            )
-            settlement_deadlines[(venue, city)] = _build_settlement_deadline(
-                venue, city, table_raw
-            )
-            enrichment_sites[(venue, city)] = _build_enrichment_coordinates(
-                venue, city, table_raw
-            )
+            climate_day_windows[(venue, city)] = _build_climate_day_window(venue, city, table_raw)
+            settlement_deadlines[(venue, city)] = _build_settlement_deadline(venue, city, table_raw)
+            enrichment_sites[(venue, city)] = _build_enrichment_coordinates(venue, city, table_raw)
 
     return SiteRegistry(
         registry_version=registry_version,

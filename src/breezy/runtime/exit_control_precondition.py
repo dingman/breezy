@@ -86,9 +86,7 @@ def read_exit_control_halt_precondition(
                 verdict = BLOCKED_HALT_STATE_UNREADABLE
             else:
                 verdict = (
-                    BLOCKED_FAMILY_HALT_SET
-                    if state.family_halted
-                    else HALT_CLEAR_NEXT_PRECONDITION
+                    BLOCKED_FAMILY_HALT_SET if state.family_halted else HALT_CLEAR_NEXT_PRECONDITION
                 )
     return HaltPreconditionReading(
         verdict=verdict,

@@ -143,8 +143,7 @@ def _series_entries(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     raw = payload.get("series")
     if not isinstance(raw, list):
         raise SeriesDerivationError(
-            "series payload has no list under the 'series' key; "
-            f"got keys {sorted(payload)}"
+            f"series payload has no list under the 'series' key; got keys {sorted(payload)}"
         )
     return [entry for entry in raw if isinstance(entry, Mapping)]
 
@@ -163,9 +162,7 @@ def parse_weather_series(payload: Mapping[str, Any]) -> tuple[WeatherSeries, ...
     for entry in _series_entries(payload):
         slug = entry.get("slug")
         if slug is None:
-            raise SeriesDerivationError(
-                f"series entry has no 'slug': id={entry.get('id')!r}"
-            )
+            raise SeriesDerivationError(f"series entry has no 'slug': id={entry.get('id')!r}")
         if not isinstance(slug, str):
             raise SeriesDerivationError(f"series 'slug' is not a string: {slug!r}")
         if not slug.startswith(_WEATHER_DAILY_PREFIX):
@@ -199,8 +196,7 @@ def _event_entries(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     raw = payload.get("events")
     if not isinstance(raw, list):
         raise SeriesDerivationError(
-            "events payload has no list under the 'events' key; "
-            f"got keys {sorted(payload)}"
+            f"events payload has no list under the 'events' key; got keys {sorted(payload)}"
         )
     return [entry for entry in raw if isinstance(entry, Mapping)]
 
@@ -253,9 +249,7 @@ def _markets(event: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
     if raw is None:
         return ()
     if not isinstance(raw, list):
-        raise SeriesDerivationError(
-            f"event {event.get('slug')!r} has a non-list 'markets' value"
-        )
+        raise SeriesDerivationError(f"event {event.get('slug')!r} has a non-list 'markets' value")
     return [entry for entry in raw if isinstance(entry, Mapping)]
 
 
@@ -292,9 +286,7 @@ def derive_series_universe(
             unresolved.append(entry)
             continue
         icao, market_slug = joined
-        resolved.append(
-            ResolvedSeries(series=entry, icao=icao, evidence_market_slug=market_slug)
-        )
+        resolved.append(ResolvedSeries(series=entry, icao=icao, evidence_market_slug=market_slug))
 
     return SeriesUniverse(resolved=tuple(resolved), unresolved=tuple(unresolved))
 

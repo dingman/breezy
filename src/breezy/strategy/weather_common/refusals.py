@@ -107,6 +107,7 @@ def observation_refusal(
         return OBSERVATION_AMBIGUOUS
     return None
 
+
 #: The refusal reason, and simultaneously the ``RiskDecision.reason`` string
 #: the risk manager returns. One spelling, shared by the guard, the decision
 #: layer and the counter, so a rename cannot silently decouple them.
@@ -230,9 +231,7 @@ class RefusalAlerter:
         generalise: any reason the counter has ever seen is covered, with no
         second, drifting list of reasons to keep in sync.
         """
-        return tuple(
-            self._condition_for(reason) for reason in self._counter.counts
-        )
+        return tuple(self._condition_for(reason) for reason in self._counter.counts)
 
     def _condition_for(self, reason: str) -> AlertCondition:
         refused = self._counter.count(reason)

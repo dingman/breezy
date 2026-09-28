@@ -231,8 +231,7 @@ class Refusal:
     def __post_init__(self) -> None:
         if self.reason not in LATCH_GATE_REFUSAL_REASONS:
             raise ValueError(
-                f"reason must be one of {sorted(LATCH_GATE_REFUSAL_REASONS)!r}, "
-                f"was {self.reason!r}"
+                f"reason must be one of {sorted(LATCH_GATE_REFUSAL_REASONS)!r}, was {self.reason!r}"
             )
 
 
@@ -287,6 +286,7 @@ def _cell_probability(be: Decimal, side: str) -> Decimal:
     ``BE_i`` for a YES leg, ``1 - BE_i`` for a NO leg. Decimal throughout
     (money/probability sums stay Decimal, never float)."""
     return be if side == "yes" else Decimal(1) - be
+
 
 DUPLICATE_FILL_KEY_PREFIX: Final[str] = "continuous_rung_hold/duplicate_fill/"
 LEGACY_FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
@@ -397,6 +397,7 @@ def _decode_halt_payload(raw: bytes) -> dict[str, object]:
         return {"corrupt": True, "rawHex": raw.hex()}
     return decoded
 
+
 #: Slice 4 item A2 (plan rev 6.1): the exec client's durable startup/re-arm
 #: evidence key -- written at the end of every connect and after each
 #: resolver terminal-zero (client.py, another agent's seam; not written
@@ -445,9 +446,7 @@ class TrialDayRecordCorrupt(TrialDayLatchError):
 
 def _inflight_prefix(trial_prefix: str) -> str:
     if not trial_prefix.endswith(_TRIAL_SUFFIX):
-        raise ValueError(
-            f"trial key prefix must end with {_TRIAL_SUFFIX!r}, was {trial_prefix!r}"
-        )
+        raise ValueError(f"trial key prefix must end with {_TRIAL_SUFFIX!r}, was {trial_prefix!r}")
     return trial_prefix[: -len(_TRIAL_SUFFIX)] + _INFLIGHT_SUFFIX
 
 
@@ -489,7 +488,10 @@ def _key(
 
 
 def trial_id_for(
-    key_prefix: str, station: str, climate_day: str, instrument_id: str,
+    key_prefix: str,
+    station: str,
+    climate_day: str,
+    instrument_id: str,
 ) -> str:
     """The canonical ``trial_id`` string for one (station, climate_day,
     instrument_id) trial under ``key_prefix`` -- a public, read-only wrapper
@@ -761,14 +763,25 @@ class TrialDayLatch:
         return self._intent_latch.current_open()
 
     def _trial_key(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> str:
         return _key(
-            station, climate_day, key_prefix=self._key_prefix, key_instrument_id=key_instrument_id,
+            station,
+            climate_day,
+            key_prefix=self._key_prefix,
+            key_instrument_id=key_instrument_id,
         )
 
     def _inflight_key(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> str:
         base = f"{self._inflight_prefix}{station}/{climate_day}"
         if key_instrument_id is None:
@@ -776,7 +789,11 @@ class TrialDayLatch:
         return f"{base}/{key_instrument_id}"
 
     def record(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> TrialDayRecord | None:
         """Return the durable record for this station-day (or, when
         ``key_instrument_id`` is given, this instrument-day -- plan S1), or
@@ -791,7 +808,11 @@ class TrialDayLatch:
         return TrialDayRecord.from_bytes(raw)
 
     def record_with_legacy_fallback(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None,
     ) -> TrialDayRecord | None:
         """Read-compat shim (operator ruling 2026-09-14 / plan S1): the
         instrument-day record if one exists, else a LEGACY station-day row
@@ -813,7 +834,11 @@ class TrialDayLatch:
         return None
 
     def is_consumed(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> bool:
         """``True`` once this station-day's (or, keyed, this instrument-
         day's -- plan S1) single trial has been recorded. See
@@ -821,7 +846,9 @@ class TrialDayLatch:
         """
         return (
             self.record_with_legacy_fallback(
-                station, climate_day, key_instrument_id=key_instrument_id,
+                station,
+                climate_day,
+                key_instrument_id=key_instrument_id,
             )
             is not None
         )
@@ -919,7 +946,11 @@ class TrialDayLatch:
         return True
 
     def is_inflight(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> bool:
         """``True`` while this station-day (or, keyed, instrument-day --
         plan S1) has a durable IN_FLIGHT marker."""
@@ -930,7 +961,11 @@ class TrialDayLatch:
         return raw == _INFLIGHT_OPEN
 
     def set_inflight(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> None:
         """COMMIT the IN_FLIGHT marker for this station-day (or instrument-
         day -- plan S1). Must precede ``arm()``."""
@@ -941,7 +976,11 @@ class TrialDayLatch:
         )
 
     def clear_inflight(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> None:
         """Clear the IN_FLIGHT marker (StateStore has no delete -- write cleared)."""
         self._require_held()
@@ -1044,7 +1083,9 @@ class TrialDayLatch:
         if exit_reason not in _EXIT_REASONS:
             raise TrialDayInvalidReason(exit_reason)
         existing = self.record_with_legacy_fallback(
-            station, climate_day, key_instrument_id=key_instrument_id,
+            station,
+            climate_day,
+            key_instrument_id=key_instrument_id,
         )
         if existing is None:
             raise TrialDayLatchError(
@@ -1351,7 +1392,11 @@ class TrialDayLatch:
     # -- Slice 4 item E1 (plan rev 6.1, Resolution F): re-arm attempt counter --
 
     def _attempt_key(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> str:
         base = f"{ATTEMPT_COUNTER_KEY_PREFIX}{station}/{climate_day}"
         if key_instrument_id is None:
@@ -1359,7 +1404,11 @@ class TrialDayLatch:
         return f"{base}/{key_instrument_id}"
 
     def attempt_state(
-        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str | None = None,
     ) -> tuple[int, int | None]:
         """``(attempt_count, last_attempt_ts_ns)`` for this station-day's (or
         instrument-day's -- plan S1) re-arm counter -- ``(0, None)`` before
@@ -1458,7 +1507,8 @@ def startup_evidence_permits_arm(evidence: dict[str, object] | None) -> bool:
 
 
 def startup_evidence_position_for(
-    evidence: dict[str, object] | None, slug: str,
+    evidence: dict[str, object] | None,
+    slug: str,
 ) -> Decimal | None:
     """The net position for ``slug`` out of ``evidence["positions"]``, when
     ``slug`` is LISTED on the page.

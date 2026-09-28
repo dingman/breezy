@@ -259,9 +259,7 @@ class NwsObservationActor(Actor):
         loop.call_soon_threadsafe(self._record_task_death, exc)
 
     def _record_task_death(self, exc: BaseException) -> None:
-        logger.critical(
-            "observation poll task for %s died: %r", self._icao, exc, exc_info=exc
-        )
+        logger.critical("observation poll task for %s died: %r", self._icao, exc, exc_info=exc)
         self.counters["task_death"] += 1
         # Fail closed: whatever state the poll left behind, the next attempt
         # re-proves coverage from midnight before anything is published.
@@ -348,9 +346,7 @@ class NwsObservationActor(Actor):
         self.counters.update(drops)
         return sorted(observations, key=lambda record: record.observed_at_ns)
 
-    def _accept_rebuild(
-        self, rows: list[StationObservation], limit: int, midnight_ns: int
-    ) -> bool:
+    def _accept_rebuild(self, rows: list[StationObservation], limit: int, midnight_ns: int) -> bool:
         trusted = rebuild_is_trusted(
             sorted_observed_ns=[record.observed_at_ns for record in rows],
             midnight_ns=midnight_ns,

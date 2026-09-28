@@ -98,8 +98,7 @@ def read_weather_bucket_facts(info: object) -> WeatherBucketFacts:
     status = _require_present(mapping, WEATHER_FACTS_STATUS_KEY)
     if status != WEATHER_FACTS_STATUS_KNOWN:
         raise WeatherFactsUnavailableError(
-            f"{WEATHER_FACTS_STATUS_KEY}: expected {WEATHER_FACTS_STATUS_KNOWN!r}, "
-            f"got {status!r}"
+            f"{WEATHER_FACTS_STATUS_KEY}: expected {WEATHER_FACTS_STATUS_KNOWN!r}, got {status!r}"
         )
 
     settlement_station = _require_text_fact(mapping, SETTLEMENT_STATION_KEY)

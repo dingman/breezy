@@ -169,8 +169,7 @@ def parse_iso8601_to_ns(value: str) -> int:
 
     if parsed.utcoffset() is None:
         raise NwsEnvelopeTimestampError(
-            f"timestamp {value!r} is naive (carries no UTC offset); refusing to "
-            "assume UTC"
+            f"timestamp {value!r} is naive (carries no UTC offset); refusing to assume UTC"
         )
 
     delta = parsed - _EPOCH
@@ -192,9 +191,7 @@ def _enforce_bounds(payload: Any) -> None:
 def _walk_bounds(node: Any, *, depth: int, counter: list[int]) -> None:
     counter[0] += 1
     if counter[0] > MAX_JSON_NODES:
-        raise NwsEnvelopeStructureError(
-            f"payload exceeds the {MAX_JSON_NODES}-node structural cap"
-        )
+        raise NwsEnvelopeStructureError(f"payload exceeds the {MAX_JSON_NODES}-node structural cap")
     if depth > MAX_JSON_DEPTH:
         raise NwsEnvelopeStructureError(
             f"payload exceeds the {MAX_JSON_DEPTH}-level nesting-depth cap"
@@ -223,9 +220,7 @@ def _require_str(payload: Mapping[str, Any], key: str, *, context: str) -> str:
 def _require_uuid(payload: Mapping[str, Any], key: str, *, context: str) -> str:
     value = _require_str(payload, key, context=context)
     if _UUID_PATTERN.match(value) is None:
-        raise NwsEnvelopeUuidError(
-            f"{context}: field {key!r} is not a canonical UUID string"
-        )
+        raise NwsEnvelopeUuidError(f"{context}: field {key!r} is not a canonical UUID string")
     return value
 
 
@@ -257,9 +252,7 @@ def _parse_metadata(payload: Mapping[str, Any], *, context: str) -> tuple[str, s
     product_code = _require_str(payload, "productCode", context=context)
     issuing_office = _require_str(payload, "issuingOffice", context=context)
     wmo_collective_id = _require_str(payload, "wmoCollectiveId", context=context)
-    issuance_time_ns = parse_iso8601_to_ns(
-        _require_str(payload, "issuanceTime", context=context)
-    )
+    issuance_time_ns = parse_iso8601_to_ns(_require_str(payload, "issuanceTime", context=context))
     return product_uuid, product_code, issuing_office, wmo_collective_id, issuance_time_ns
 
 
@@ -287,9 +280,7 @@ def parse_discovery_list(
 
     graph = payload["@graph"]
     if not isinstance(graph, list):
-        raise NwsEnvelopeStructureError(
-            f"'@graph' must be a list, was {type(graph).__name__}"
-        )
+        raise NwsEnvelopeStructureError(f"'@graph' must be a list, was {type(graph).__name__}")
     if len(graph) > max_items:
         raise NwsEnvelopeStructureError(
             f"'@graph' has {len(graph)} entries, exceeding the {max_items}-item cap"

@@ -169,8 +169,7 @@ class OrderSubmissionPermit:
     def __post_init__(self) -> None:
         if self.seal is not _SEAL:
             raise OrderSubmissionPermitForgeryError(
-                "OrderSubmissionPermit is obtainable only from "
-                "OrderSubmissionPermit.issue()"
+                "OrderSubmissionPermit is obtainable only from OrderSubmissionPermit.issue()"
             )
 
     @classmethod
@@ -189,14 +188,11 @@ class OrderSubmissionPermit:
         sibling helper (L-22).
         """
         if not isinstance(settings, SettingsLike):
-            raise SettingsNotSettingsLikeError(
-                "settings must satisfy the SettingsLike protocol"
-            )
+            raise SettingsNotSettingsLikeError("settings must satisfy the SettingsLike protocol")
 
         if settings.orders_enabled_requested is not True:
             raise OrdersNotRequestedError(
-                "orders_enabled_requested must be exactly True; enablement was "
-                "not requested"
+                "orders_enabled_requested must be exactly True; enablement was not requested"
             )
 
         if not isinstance(live_trading_permit, LiveTradingPermit):
