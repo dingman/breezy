@@ -141,16 +141,37 @@ STALE_INTENT_ALERT_SEVERITY: Final[str] = "CRITICAL"
 STALE_INTENT_ALERT_SITE: Final[str] = "global"
 
 
+def _alert_key(alert: Mapping[str, str]) -> str:
+    """FAILURE-KIND-PERSIST (r2/r3): dedupe/forget key for one surface entry.
+
+    A follow-up entry carries the SAME ``intent_id`` as its original stale
+    entry (deliberately -- it renders as that intent's cause, per
+    :func:`_stale_intent_detail`), so keying dedupe on ``intent_id`` alone
+    would skip it forever (it is never a NEW id) and `_retire` dropping the
+    original would never forget it either (the id lookup would still find
+    the follow-up's identical id). ``alert_key`` -- present only on a
+    follow-up -- disambiguates the two; a legacy entry with no ``alert_key``
+    (every non-follow-up entry, past and present) falls back to
+    ``intent_id`` unchanged. A ``def``, not a lambda (ruff E731).
+    """
+    return alert.get("alert_key", alert.get("intent_id", ""))
+
+
 def _stale_intent_detail(alert: Mapping[str, str]) -> str:
     intent_id = alert.get("intent_id", "<unknown>")
     venue_order_id = alert.get("venue_order_id", "<unknown>")
     age_minutes = alert.get("age_minutes", "<unknown>")
     last_failure_kind = alert.get("last_failure_kind", "<unknown>")
-    return (
+    base = (
         f"intent {intent_id} (venue order {venue_order_id}) has been OPEN "
         f"AMBIGUOUS and unresolved for {age_minutes} minute(s); last "
         f"resolver failure: {last_failure_kind}"
     )
+    if alert.get("followup") == "cause":
+        # FAILURE-KIND-PERSIST (r2/r3): marks the SECOND CRITICAL for this
+        # intent as what it is, rather than looking like an unrelated repeat.
+        return f"{base}; cause identified after the first alert"
+    return base
 
 
 def install_stale_intent_alert(
@@ -190,12 +211,17 @@ def install_stale_intent_alert(
 
     Notes
     -----
-    Dedupe is by ``intent_id``, never by call count: an id already alerted
-    on is skipped on every later poll, and an id that drops out of the
-    surface (the exec client's ``_retire`` clears its own bookkeeping the
-    moment the intent retires) is forgotten here too, so a LATER intent
-    that happens to reach the same age alerts again -- exactly the
-    semantics the property's own docstring documents.
+    Dedupe is by :func:`_alert_key` (``alert_key`` when present, else
+    ``intent_id``), never by call count: a key already alerted on is skipped
+    on every later poll, and a key that drops out of the surface (the exec
+    client's ``_retire`` clears its own bookkeeping the moment the intent
+    retires) is forgotten here too, so a LATER intent that happens to reach
+    the same age alerts again -- exactly the semantics the property's own
+    docstring documents. FAILURE-KIND-PERSIST (r2/r3): a follow-up entry
+    carries the SAME ``intent_id`` as its original but a DIFFERENT
+    ``alert_key`` (``f"{intent_id}:cause"``), so it is never conflated with
+    -- and never suppressed by -- the original's own dedupe entry: one
+    intent can therefore surface as two separate CRITICALs.
     """
     active_sink = resolve_alert_sink() if sink is None else sink
     alerted_intent_ids: set[str] = set()
@@ -213,14 +239,14 @@ def install_stale_intent_alert(
             logger.exception("failed to read stale_ambiguous_intent_alerts")
             return
 
-        current_ids = {alert.get("intent_id", "") for alert in current}
+        current_ids = {_alert_key(alert) for alert in current}
         alerted_intent_ids.intersection_update(current_ids)
 
         for alert in current:
-            intent_id = alert.get("intent_id", "")
-            if intent_id in alerted_intent_ids:
+            key = _alert_key(alert)
+            if key in alerted_intent_ids:
                 continue
-            alerted_intent_ids.add(intent_id)
+            alerted_intent_ids.add(key)
             emit_alert(
                 active_sink,
                 AlertPayload(
