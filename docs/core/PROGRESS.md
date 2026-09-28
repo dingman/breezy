@@ -52,7 +52,6 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | BL-10 | HIGH | Send-boundary fingerprint hashes caller-chosen bytes (`submit_chain.py:248-263`); fingerprint method+path+serialized body; security review | ruling §2 |
 | FAILURE-KIND-DURABLE | MED | Persist last failure kind with the durable ambiguous intent; restart keeps it | `FAILURE-KIND-PERSIST_plan_r2` |
 | RA-9f-A | MED | Zero-look `UNDERPOWERED_NOT_REGISTERED` registrar for `H-OFFWINDOW-T4-2026-09`; do NOT flip `HORIZON_TOLLING_LANDED` | `RULING_RA-9…:108,121-138` |
-| HALT-FSM | LOW | Halted strategy emits `InvalidStateTrigger STOPPED->START_COMPLETED` ×4/boot; stop cleanly, never arm | `continuous_strategy.py:883-914` |
 | CF-5b / CF-6 / T-6 | LOW | chronic-UNREADABLE deduped alert; live-test contact from env; stale `node_config.py:11-14` summary | ruling §2 |
 | CF-11 / CF-12 | LOW | `src/` format (105 files, one mechanical commit); mypy 2 collection blockers then re-measure (ruff 84) | ruling §2 |
 
@@ -68,7 +67,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 - **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).
 - **Evidence floor:** AUD-06b (CONFIRMED unit-qty edge + new family), CF-13 (live CCA/CCB), CF-14b (1-of-N stage-3 failure).
 - **Trigger watches:** EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration).
-- **Rules:** T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
+- **Rules:** HALT-FSM = accepted cosmetic (Nautilus swallows it; fail-safe; whitelist `InvalidStateTrigger STOPPED->START_COMPLETED` in greps); T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
 
 **Closed 09-28 by ruling:** EDGE-2-REFACTOR, `max_simultaneous_positions` (dbd91d9), FU-8b/NOTIFIER (live), ING-2 residual alert (exit 4 → OnFailure), whole-tape regen, G-16/G-17, PREREG v2 residue, CF-1, CF-8, PF-1, GL-4P, AUD04-FRESH, EDGE-6, TRADE-ROW-DRIFT, SUP-ADOPT-LOG-GLOB (AUD-12a closed by its 09-27 ruling; LADDER_EV stage 2 PARKED). AUD-18 stays the R3 evidence producer (only (b) closed). PROBE-CLASSIFIER-DRIFT rides MULTIPAGE step 2.
 

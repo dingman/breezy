@@ -40,7 +40,7 @@
 | T-9 | RULE | No blind-flatten patch. Each family's PREREG states its exit policy. CRH stays hold-to-settlement unless the 09-16 exit seam is armed. |
 | T-6 | BUILD (doc) | Correct the stale `node_config.py:11-14` summary. |
 | `max_simultaneous_positions` | CLOSE | Fixed in dbd91d9 (`risk.py:327-335`). |
-| `InvalidStateTrigger STOPPED->START_COMPLETED` ×4 per boot | BUILD | A halted strategy must reach `stop` without the FSM error, still never arming. |
+| `InvalidStateTrigger STOPPED->START_COMPLETED` ×4 per boot (HALT-FSM) | RULE: accepted cosmetic (amended 18:40Z) | Nautilus swallows the trigger (`component.pyx:2195-2197`, log + return). The strategy stays STOPPED, and `Actor.handle_*` dispatches only while RUNNING (`actor.pyx:4401-4431`), so today's behaviour is fail-safe. The deferred-stop fix was NOT-READY (python-reviewer, BLOCK): quotes subscribed at `continuous_strategy.py:868-870` could reach `_maybe_submit` on 3 of 4 never-arm branches. A log-hygiene fix must not open an order path. Whitelist the line in log greps. Reopen only as the `_never_arm_this_boot` flag design, checked first in `_hunt_tick`, if the noise ever masks a real error. |
 | FU-8b-DEPLOY / NOTIFIER-IMPORT-ISOLATION | CLOSE | Live: the `refusal re-poll timer armed` line appears in node log 20260928T165022Z. The node imported and booted post-merge. |
 | ING-2-AMEND | BUILD | The removal check FAILED on 09-28 09:45Z: chunks=324, peak 6G, 610 s, deferred_instances=45. The TEMPORARY drop-in stays. Diagnose and bound the path that still defers. |
 | ING-2 residual (deferred-unit alert) | CLOSE | Exit 4 means `DEFERRAL_STALLED`, and `OnFailure=` routes it to `study_failure_notifier` (`quote_tape_exit_codes.py:33-38`). |
@@ -71,7 +71,7 @@
 
 ## 3. What remains after this ruling
 
-- **Build:** RA-9f Path A, FAILURE-KIND durable, halted-FSM noise, ING-2-AMEND2, BL-10, CF-5b, CF-6, CF-11, CF-12, T-6.
+- **Build:** RA-9f Path A, FAILURE-KIND durable, ING-2-AMEND2, BL-10, CF-5b, CF-6, CF-11, CF-12, T-6.
 - **Analysis:** R3-PROJ, RECON-MIA-0913.
 - **Run:** AUD-07 20k drain, AUD-10b Stage 0 / R3-5 and the 10G explanation.
 - **Watch or gated:** everything else.
