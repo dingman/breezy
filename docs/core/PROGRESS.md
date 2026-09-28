@@ -43,25 +43,32 @@ only via a ruling under `docs/evidence/`. L-1 null-hypothesis verdict per increm
 via `systemd-run --user` (L-26); worktree commands need `PYTHONPATH=<wt>/src`; never `uv`/`pip` from a
 worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plans: `docs/plans/backlog/AUDIT_2026-09-21/`.
 
-**Revival path (RA-13):** R3 only, as an evidence-gated watch (EDGE-4 ≥300 post-freeze CONFIRM station-days + `census_provenance:`); R2 physically absent, R4 unestimated. Programme KILL backstop 2027-01-25; Kalshi K-2 is the post-KILL successor.
+**Revival path (RA-13):** R3 only; viability kill-screen R3V-b runs 10-01 (`R3-VIABILITY_plan_r2_delta`), as an evidence-gated watch (EDGE-4 ≥300 post-freeze CONFIRM station-days + `census_provenance:`); R2 physically absent, R4 unestimated. Programme KILL backstop 2027-01-25; Kalshi K-2 is the post-KILL successor.
 
-### BUILD (plan → peer review → TDD → gate → merge)
+### LIVE-PROOF owed (all merged 09-28, gate green after each merge; loads noted)
+| ID | Merge | Proof owed (exact) |
+|---|---|---|
+| ING-2-AMEND2 | 9730f1e | 09-29 ~09:45Z post-rotation ingest: `extend_dedupe:` shows `custom_depth_truncation:<n>/0` + `flat_root=none`, deferred_instances=0, ≤600 s, cgroup `memory.peak` ≤2G (measured directly, never from RSS) → remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. `flat_root=custom_depth_truncation` WARN = native flat write happened → open structural fix |
+| BL-10 | fdf28aa | Next node spawn (16:50Z): boot clean; first create-path order (A1 halt SET ⇒ none) shows no permit refusal. Also fixes a real budget leak (raising `build_order_body` spent permit budget) |
+| FAILURE-KIND-DURABLE | bdba573 | Next node spawn; a restart with an OPEN AMBIGUOUS intent names the durable kind (not `none`) in the stale CRITICAL |
+| RA-9f-A | 16f403d | DONE live 18:25Z: ledger line 4 `H-OFFWINDOW-T4-2026-09 UNDERPOWERED_NOT_REGISTERED` freeze 16f403d; duplicate refused, bytes unchanged. Backup in session scratchpad |
+| RECON-MIA-0913 | 97c4325 | 09-29 15:20Z exit study: per-trial reconciliation `matched=True` with `n_fee_unverified_excluded=1` |
+| AUD-07 gate | 97c4325 | `--stage 80k` refused while `20k/DEFERRED` non-empty (repo copy; the pinned a40d433 copy drives the drain) |
+| R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
+| R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
+| CF-5b / CF-6 / T-6 / CF-12 | 645baf5 | CF-12 new baseline: mypy 1891 errors / 247 files (914 checked) — plan the burn-down |
+
+### BUILD
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| ING-2-AMEND2 | HIGH | 09-28 09:45Z removal check FAILED (chunks=324, peak 6G, 610 s, deferred_instances=45); TEMPORARY ingest drop-in stays. Diagnose + bound the path that still defers | ruling §2 |
-| BL-10 | HIGH | Send-boundary fingerprint hashes caller-chosen bytes (`submit_chain.py:248-263`); fingerprint method+path+serialized body; security review | ruling §2 |
-| FAILURE-KIND-DURABLE | MED | Persist last failure kind with the durable ambiguous intent; restart keeps it | `FAILURE-KIND-PERSIST_plan_r2` |
-| RA-9f-A | MED | Zero-look `UNDERPOWERED_NOT_REGISTERED` registrar for `H-OFFWINDOW-T4-2026-09`; do NOT flip `HORIZON_TOLLING_LANDED` | `RULING_RA-9…:108,121-138` |
-| CF-5b / CF-6 / T-6 | LOW | chronic-UNREADABLE deduped alert; live-test contact from env; stale `node_config.py:11-14` summary | ruling §2 |
-| CF-11 / CF-12 | LOW | `src/` format (105 files, one mechanical commit); mypy 2 collection blockers then re-measure (ruff 84) | ruling §2 |
+| CF-11 | LOW | `src/` ruff format (105 files), one mechanical commit, gate-green | ruling §2 |
 
 ### RUN / ANALYSE
 | ID | Open work (exact) |
 |---|---|
-| AUD-07 | seg-0928a exit 0 but 32 cells in `20k/DEFERRED`; drain 20k in a gate-free night window; never advance to 80k while DEFERRED non-empty; then 80k → `--final` → AC7 ruling |
-| AUD-10b | C12 met (09-28 15:50Z replay finished 15:58Z) but at **10G peak = the TEMPORARY cap**; explain vs the REPLAY-BIGINST claim, then Stage 0 + R3-5 byte-diff before drop-in removal |
-| RECON-MIA-0913 | AUD04-FRESH proven 17:33Z (reconciliation ran): `matched=False n_exit_only=1` → `continuous_rung_hold/trial/MIA/2026-09-13`; find which side is wrong |
-| R3-PROJ | Project EDGE-4 CONFIRM-day accrual vs 2027-01-25; no statistic on post-09-25 tape |
+| AUD-07 | 20k drain: `breezy-aud07-m1c-seg-0929a` armed 09-29 02:10Z (8 cells/night ⇒ ~4 nights; rename `20k/DEFERRED` before each run); then 80k → `--final` → AC7 ruling |
+| AUD-10b | C12 met at 10G peak; cause = conversion of 16 cache-miss instances (`ANALYSIS_replay_10g_2026-09-28.md`); Stage 0 + R3-5 before drop-in removal, run after ING-2-AMEND2 proves out |
+| R3 blockers (only if R3V-b says viable) | (1) MECHANISM_ONLY validity = AUD-11+AUD-12 landing; (2) `UNDERPOWERED_NOT_REGISTERED` not in `_ACTIVE_STATUSES`; (3) no post-freeze filter in `_completed_on_whole_days`. Real f so far 2/5 (Wilson .12–.77); f_req 0.625 |
 
 ### WATCH / GATED (no build owed; re-open only on the named trigger)
 - **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).

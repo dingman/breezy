@@ -1660,3 +1660,19 @@ Before editing a shared config surface (`pyproject.toml` pytest or import-linter
 - Focused runs cannot catch this. It surfaces only in the full gate, so run the full gate after every merge (L-43).
 
 Related: L-43 (full gate after every merge), REPLAY-BIGINST, fix 0cc87c2.
+
+## L-55 — A test that injects a fake dependency must also run the production default once (2026-09-28)
+
+### What happened
+- R3V-a added batch mode to `replay_daily_runner.py`. `run_batch` passes `timeout=` to its `run_subprocess` dependency.
+- All 20 new tests injected fakes that accept `timeout`. The production default, `_default_run_subprocess(argv)`, does not. Every real batch run would have crashed with `TypeError` on its first target.
+- The per-target RSS fix (`_run_subprocess_with_rss`) was unit-tested in isolation but never wired as the default, so it was dead in production.
+- 135/135 tests were green. The code review found it by calling the default directly (fixed in faef60d).
+
+### The rule
+When a function takes an injectable dependency with a production default, at least one test must call the function WITHOUT injecting it, against a real, cheap stand-in: a short-lived child process, a tmp file, a local store. It asserts the production contract end to end.
+
+### How to apply
+- Briefs that add an injectable seam say: "one test runs the real default."
+- Reviewers grep new tests: if every call site passes the seam, that is a finding.
+- Related: L-42 (fixtures through the real writer path), L-28 (defaults are part of what is measured).
