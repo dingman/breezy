@@ -36,7 +36,7 @@
 | EDGE-2-MULTIPAGE step 2 | WATCH | Trigger: `resolver: activities join … traversed N pages` or ≥80 activities. Building before the trigger would contradict its own plan. |
 | EDGE-2-REFACTOR | CLOSE | Refactor steps 1–8 are YAGNI. G1–G14 (77ef02c) stay as a guard. Reopen only inside a behaviour change that touches `_resolve_ambiguous_intents`. |
 | FAILURE-KIND durable | BUILD | Persist the last failure kind with the durable ambiguous intent, so the kind survives a restart. |
-| SP-5b | BUILD | Its trigger is prospective (before the next registration), so building early is strictly safer. Carry the two architect fixes. |
+| SP-5b | PREREQUISITE of the R3 re-plan (amended 18:00Z) | The 09-26 review found the flag's only effect is an `INDETERMINATE excluded` stderr label with no consumer, and the architect voted DEFER (`SP-5b_plan_r1…:162-172`). Its trigger (the next family registration) cannot fire before an R3 re-plan, so it is built as step 0 of that re-plan, with both architect fixes. No standalone build. |
 | T-9 | RULE | No blind-flatten patch. Each family's PREREG states its exit policy. CRH stays hold-to-settlement unless the 09-16 exit seam is armed. |
 | T-6 | BUILD (doc) | Correct the stale `node_config.py:11-14` summary. |
 | `max_simultaneous_positions` | CLOSE | Fixed in dbd91d9 (`risk.py:327-335`). |
@@ -71,7 +71,7 @@
 
 ## 3. What remains after this ruling
 
-- **Build:** RA-9f Path A, FAILURE-KIND durable, SP-5b, halted-FSM noise, ING-2-AMEND2, BL-10, CF-5b, CF-6, CF-11, CF-12, T-6.
+- **Build:** RA-9f Path A, FAILURE-KIND durable, halted-FSM noise, ING-2-AMEND2, BL-10, CF-5b, CF-6, CF-11, CF-12, T-6.
 - **Analysis:** R3-PROJ, RECON-MIA-0913.
 - **Run:** AUD-07 20k drain, AUD-10b Stage 0 / R3-5 and the 10G explanation.
 - **Watch or gated:** everything else.
