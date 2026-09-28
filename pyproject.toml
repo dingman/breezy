@@ -214,6 +214,12 @@ extend-exclude = [
     "docs/evidence/venue/polymarket_us/sdk_snapshot",
 ]
 
+[tool.ruff.format]
+# FROZEN generated module: its bytes are pinned by the regeneration tests
+# (test_current_rung_hold_archive_table.py, test_archive_table_upper_bound_2026_09_14.py).
+# Formatting it breaks byte-identity (CF-11, 2026-09-28). Lint still applies.
+exclude = ["src/breezy/strategy/current_rung_hold/archive_table.py"]
+
 [tool.ruff.lint]
 # Isort ordering is enforced by default; E501 must be opted in explicitly
 # because Ruff excludes it even under a broad select (formatter-adjacent rule).
