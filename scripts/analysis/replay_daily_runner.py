@@ -60,9 +60,11 @@ import json
 import os
 import re
 import resource
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -109,12 +111,14 @@ from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 
 __all__ = [
     "DEFAULT_LAG_MINUTES",
+    "DEFAULT_REPLAY_BATCH_RESERVE_S",
     "DEFAULT_REPLAY_DRIFT_PATH",
     "DEFAULT_REPLAY_RESULTS_PATH",
     "DEFAULT_REPLAY_SUFFICIENCY_PATH",
     "DEFAULT_SKIP_STATE_PATH",
     "DEFAULT_STRATEGY",
     "REPLAY_DRIFT_SCHEMA_VERSION",
+    "REPLAY_TARGET_RSS_WARN_BYTES",
     "STALL_ALERT_RUN_LENGTH",
     "WEATHER_VENUE",
     "DriftRecord",
@@ -138,6 +142,7 @@ __all__ = [
     "record_skip",
     "reset_skip_state",
     "resolve_strategy_from_manifest",
+    "run_batch",
     "run_once",
     "select_target",
     "stall_run_length",
@@ -152,6 +157,17 @@ DEFAULT_STRATEGY: Final[str] = "continuous_rung_hold"
 #: Matches the base plan's own literal command block (§6b.3).
 DEFAULT_LAG_MINUTES: Final[int] = 30
 AUD11_AND_AUD12_LANDED: Final[bool] = False
+
+#: R3V-a (R3-VIABILITY plan r2 delta): the batch loop stops offering new
+#: targets once `budget_s - elapsed <= DEFAULT_REPLAY_BATCH_RESERVE_S` --
+#: r1 plan §2's "240 s reserve" for `promotion_proposal.py` and the
+#: wrapper's own tail (log flush, lock release).
+DEFAULT_REPLAY_BATCH_RESERVE_S: Final[float] = 240.0
+#: R3V-a item 4: a single target's own driver child exceeding this triggers
+#: one `BREEZY_REPLAY_TARGET_RSS_HIGH` warning -- never a batch-stopping
+#: failure, since the unit's own `MemoryHigh=3G`/`MemoryMax=4G`
+#: (`breezy-replay-daily.service:32-35`) is the actual enforcement.
+REPLAY_TARGET_RSS_WARN_BYTES: Final[int] = 2 * 1024**3
 
 _DERIVED_ROOT: Final[Path] = Path.home() / ".local/share/breezy/derived"
 DEFAULT_REPLAY_SUFFICIENCY_PATH: Final[Path] = (
@@ -387,11 +403,19 @@ def _pre_fee_eligible_rows(
     strategy: str,
     lag_minutes: int,
     required_fee_coefficient: Decimal | None,
+    exclude: frozenset[ResultKey] = frozenset(),
 ) -> list[ReplaySufficiency]:
     """Every AUD-09b amendment R1 predicate, PLUS AC2's durable fee-void
     exclusion. Factored out so a future consumer of "otherwise eligible"
     (e.g. a fee-regime exclusion count) shares this exact definition rather
-    than re-deriving it."""
+    than re-deriving it.
+
+    `exclude` (R3V-a) is keys `run_batch` already TRIED earlier in the same
+    batch -- regardless of outcome, including `BLOCKED` (which is not
+    terminal). Fixes the batch-mode head-of-line problem: a persistently
+    BLOCKED day no longer stalls every remaining target this batch.
+    Defaults to empty, so every pre-existing caller (never passing this
+    kwarg) selects byte-identically to before this plan."""
     done = terminal_keys(replayed)
     drifted_keys = {d.key for d in drift}
     fee_blocked_keys = fee_void_keys(replayed, required_fee_coefficient)
@@ -404,6 +428,7 @@ def _pre_fee_eligible_rows(
         and (row.station, row.climate_day, strategy, lag_minutes) not in done
         and (row.station, row.climate_day, strategy, lag_minutes) not in drifted_keys
         and (row.station, row.climate_day, strategy, lag_minutes) not in fee_blocked_keys
+        and (row.station, row.climate_day, strategy, lag_minutes) not in exclude
     ]
 
 
@@ -438,6 +463,7 @@ def select_target(
     lag_minutes: int = DEFAULT_LAG_MINUTES,
     required_fee_coefficient: Decimal | None = None,
     fee_coefficient_as_of: Callable[[int], Decimal | None] | None = None,
+    exclude: frozenset[ResultKey] = frozenset(),
 ) -> ReplaySufficiency | None:
     """The oldest eligible `(station, climate_day)`, tie-broken by
     `SUPPORTED_STATIONS` order (base plan §6b.3; AUD-09b amendment R1).
@@ -455,7 +481,7 @@ def select_target(
     """
     pre_fee_eligible = _pre_fee_eligible_rows(
         rows=rows, replayed=replayed, drift=drift, strategy=strategy, lag_minutes=lag_minutes,
-        required_fee_coefficient=required_fee_coefficient,
+        required_fee_coefficient=required_fee_coefficient, exclude=exclude,
     )
     eligible = [
         row
@@ -969,6 +995,57 @@ def _default_run_subprocess(argv: Sequence[str]) -> subprocess.CompletedProcess[
     )
 
 
+def _run_subprocess_with_rss(
+    argv: Sequence[str], *, timeout: float | None = None,
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """R3V-a item 4: like `_default_run_subprocess`, but returns
+    `(result, peak_rss_bytes)` measured for THIS CHILD ALONE via
+    `os.wait4` at reap time.
+
+    `resource.getrusage(RUSAGE_CHILDREN).ru_maxrss` is a cumulative,
+    NON-DECREASING watermark across every child a process has ever reaped
+    -- a delta taken around a second, smaller target in the same batch
+    reads 0 (the day the queue would otherwise silently under-report every
+    target after the first, largest one). `subprocess.run`/`Popen.wait`
+    reap via `os.waitpid`, which discards the child's own rusage, so the
+    pipes are drained on background threads (mirrors `Popen.communicate`'s
+    own approach) and the child is reaped with `os.wait4` ourselves
+    instead."""
+    proc = subprocess.Popen(
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    stdout_box: list[str] = []
+    stderr_box: list[str] = []
+
+    def _drain(stream: object, box: list[str]) -> None:
+        box.append(stream.read())  # type: ignore[attr-defined]
+
+    stdout_thread = threading.Thread(target=_drain, args=(proc.stdout, stdout_box))
+    stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, stderr_box))
+    stdout_thread.start()
+    stderr_thread.start()
+    stdout_thread.join(timeout=timeout)
+    stderr_thread.join(timeout=timeout)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        proc.kill()
+        stdout_thread.join()
+        stderr_thread.join()
+        try:
+            os.wait4(proc.pid, 0)
+        except ChildProcessError:
+            pass
+        raise subprocess.TimeoutExpired(list(argv), timeout)
+    _reaped_pid, status, rusage = os.wait4(proc.pid, 0)
+    returncode = os.waitstatus_to_exitcode(status)
+    result = subprocess.CompletedProcess(
+        args=list(argv), returncode=returncode,
+        stdout="".join(stdout_box), stderr="".join(stderr_box),
+    )
+    return result, rusage.ru_maxrss * 1024
+
+
 def _default_work_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix="breezy-replay-daily-"))
 
@@ -1256,6 +1333,45 @@ def run_once(
             )
         return 0
 
+    exit_code, _outcome, _wall_s = _run_one(
+        config, target, strategy=strategy, run_subprocess=run_subprocess,
+        sink=active_sink, now_ts=now_ts, work_dir_factory=work_dir_factory,
+        std_utc_offset_hours_for=std_utc_offset_hours_for,
+    )
+    return exit_code
+
+
+def _run_one(
+    config: RunConfig,
+    target: ReplaySufficiency,
+    *,
+    strategy: str,
+    run_subprocess: SubprocessRunner,
+    sink: AlertSink,
+    now_ts: Callable[[], str],
+    work_dir_factory: Callable[[], Path],
+    std_utc_offset_hours_for: Callable[[str], float] | None,
+    driver_timeout_s: float | None = None,
+) -> tuple[int, str, float]:
+    """Runs ONE already-selected target end to end: the ASOS producer, the
+    driver, and every terminal/`BLOCKED` row this can produce. R3V-a
+    factored this out of `run_once` (which calls it exactly once, keeping
+    its own observable behaviour -- stdout and the row appended --
+    unchanged) so `run_batch` can call it in a loop; batching still runs
+    each target as its OWN isolated subprocess (never a single
+    long-lived engine across targets) -- see the unit's own
+    `MemoryHigh=3G`/`MemoryMax=4G` comment, `breezy-replay-daily.
+    service:32-35`, for why that isolation matters.
+
+    Returns `(exit_code, outcome, wall_s)`. `outcome` is one of
+    `RECOVERED`/`BLOCKED`/`FAILED`/`COMPLETED` -- the caller handles the
+    target-is-`None` `EMPTY` case itself, before ever calling this.
+    `driver_timeout_s`, when given (R3V-a item 1, "L-53"), bounds only the
+    DRIVER subprocess (never the cheap ASOS producer); a `TimeoutExpired`
+    there is recorded as a terminal `FAILED` row with
+    `exception_type=DRIVER_TIMEOUT` and a non-zero exit, so `run_batch`
+    stops loudly rather than burning the rest of its budget on one stuck
+    target."""
     station, climate_day = target.station, target.climate_day
     output_dir = _output_dir_for(config, station=station, climate_day=climate_day)
 
@@ -1274,167 +1390,399 @@ def run_once(
                     f"FAILED {station} {climate_day} -- unreadable parquet {latest}",
                     file=sys.stderr,
                 )
-                return 1
+                return 1, "FAILED", 0.0
             _append_terminal(
                 config, target, strategy=strategy, now_ts=now_ts, outcome="RECOVERED",
                 parquet_sha256=digest,
             )
             print(f"RECOVERED {station} {climate_day} -- {latest.name}")
-            return 0
+            return 0, "RECOVERED", 0.0
 
     work_dir = work_dir_factory()
-    asos_csv = work_dir / f"asos_{station}_{climate_day}.csv"
-    asos_result = run_subprocess(
-        build_asos_argv(
-            python_executable=config.python_executable,
-            station=station, climate_day=climate_day, out_path=asos_csv,
+    try:
+        asos_csv = work_dir / f"asos_{station}_{climate_day}.csv"
+        asos_result = run_subprocess(
+            build_asos_argv(
+                python_executable=config.python_executable,
+                station=station, climate_day=climate_day, out_path=asos_csv,
+            )
         )
-    )
-    if asos_result.returncode != 0:
-        reason = classify_asos_failure(returncode=asos_result.returncode)
-        record_blocked(
-            results_path=config.replay_results_path, station=station, climate_day=climate_day,
-            strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
-            sufficiency_reason=target.reason, census_schema_version=target.schema_version,
-            sink=active_sink, now_ts=now_ts,
-        )
-        print(f"BLOCKED {station} {climate_day} -- {reason}")
-        return 0
-
-    work_catalog = work_dir / "work_catalog"
-    started = time.monotonic()
-    rss_before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    driver_argv = build_driver_argv(
-        python_executable=config.python_executable,
-        station=station, climate_day=climate_day,
-        tape_instance_id=target.winner_instance_id or "",
-        quote_catalog=config.quote_catalog, work_catalog=work_catalog,
-        asos_cache_csv=asos_csv, weather_catalog_root=config.weather_catalog_root,
-        output_dir=output_dir, family_manifest_path=config.family_manifest_path,
-        lag_minutes=config.lag_minutes,
-    )
-    expected_argv_sha256 = argv_sha256(_resolved_driver_argv(driver_argv))
-    driver_result = run_subprocess(driver_argv)
-    wall_s = time.monotonic() - started
-    rss_after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    peak_rss_bytes = max(0, (rss_after - rss_before)) * 1024
-
-    if driver_result.returncode != 0:
-        outcome, reason = classify_driver_failure(
-            returncode=driver_result.returncode, stderr=driver_result.stderr or "",
-        )
-        if outcome == "BLOCKED":
+        if asos_result.returncode != 0:
+            reason = classify_asos_failure(returncode=asos_result.returncode)
             record_blocked(
                 results_path=config.replay_results_path, station=station, climate_day=climate_day,
                 strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
                 sufficiency_reason=target.reason, census_schema_version=target.schema_version,
-                sink=active_sink, now_ts=now_ts,
+                sink=sink, now_ts=now_ts,
             )
             print(f"BLOCKED {station} {climate_day} -- {reason}")
-            return 0
+            return 0, "BLOCKED", 0.0
+
+        work_catalog = work_dir / "work_catalog"
+        started = time.monotonic()
+        rss_before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        driver_argv = build_driver_argv(
+            python_executable=config.python_executable,
+            station=station, climate_day=climate_day,
+            tape_instance_id=target.winner_instance_id or "",
+            quote_catalog=config.quote_catalog, work_catalog=work_catalog,
+            asos_cache_csv=asos_csv, weather_catalog_root=config.weather_catalog_root,
+            output_dir=output_dir, family_manifest_path=config.family_manifest_path,
+            lag_minutes=config.lag_minutes,
+        )
+        expected_argv_sha256 = argv_sha256(_resolved_driver_argv(driver_argv))
+        try:
+            if driver_timeout_s is not None:
+                driver_result = run_subprocess(driver_argv, timeout=driver_timeout_s)
+            else:
+                driver_result = run_subprocess(driver_argv)
+        except subprocess.TimeoutExpired:
+            wall_s = time.monotonic() - started
+            _append_terminal(
+                config, target, strategy=strategy, now_ts=now_ts, outcome="FAILED",
+                exception_type="DRIVER_TIMEOUT", wall_s=wall_s,
+            )
+            print(f"FAILED {station} {climate_day} -- DRIVER_TIMEOUT", file=sys.stderr)
+            return 1, "FAILED", wall_s
+        wall_s = time.monotonic() - started
+        measured_rss = getattr(driver_result, "peak_rss_bytes", None)
+        if measured_rss is None:
+            rss_after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            peak_rss_bytes = max(0, (rss_after - rss_before)) * 1024
+        else:
+            peak_rss_bytes = measured_rss
+        if peak_rss_bytes > REPLAY_TARGET_RSS_WARN_BYTES:
+            emit_alert(
+                sink,
+                AlertPayload(
+                    severity="warning",
+                    event="BREEZY_REPLAY_TARGET_RSS_HIGH",
+                    site=station,
+                    detail=(
+                        f"{climate_day}: peak_rss_bytes={peak_rss_bytes} exceeds "
+                        f"REPLAY_TARGET_RSS_WARN_BYTES={REPLAY_TARGET_RSS_WARN_BYTES}"
+                    ),
+                ),
+            )
+
+        if driver_result.returncode != 0:
+            outcome, reason = classify_driver_failure(
+                returncode=driver_result.returncode, stderr=driver_result.stderr or "",
+            )
+            if outcome == "BLOCKED":
+                record_blocked(
+                    results_path=config.replay_results_path, station=station,
+                    climate_day=climate_day, strategy=strategy, lag_minutes=config.lag_minutes,
+                    blocked_reason=reason, sufficiency_reason=target.reason,
+                    census_schema_version=target.schema_version, sink=sink, now_ts=now_ts,
+                )
+                print(f"BLOCKED {station} {climate_day} -- {reason}")
+                return 0, "BLOCKED", wall_s
+            _append_terminal(
+                config, target, strategy=strategy, now_ts=now_ts, outcome="FAILED",
+                exception_type=reason, wall_s=wall_s, peak_rss_bytes=peak_rss_bytes,
+            )
+            print(f"FAILED {station} {climate_day} -- {reason}", file=sys.stderr)
+            return 1, "FAILED", wall_s
+
+        sidecar_path = output_dir / "family_params.json"
+        sidecar, sidecar_refusal = _verified_family_params(sidecar_path, expected_argv_sha256)
+        if sidecar is None:
+            reason = sidecar_refusal or "FAMILY_PARAMS_SIDECAR_MISSING"
+            record_blocked(
+                results_path=config.replay_results_path, station=station, climate_day=climate_day,
+                strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
+                sufficiency_reason=target.reason, census_schema_version=target.schema_version,
+                sink=sink, now_ts=now_ts,
+            )
+            print(f"BLOCKED {station} {climate_day} -- {reason}")
+            return 0, "BLOCKED", wall_s
+        manifest_taker_fee_coefficient = sidecar.get("manifest_taker_fee_coefficient")
+        engine_required_fee_coefficient = sidecar.get("engine_required_fee_coefficient")
+        scored = read_scored_trials(output_dir)
+        fill_price_vs_decision_ask = tuple(str(trial.slippage) for trial in scored)
+        refusal_counts = _parse_strategy_refusals(driver_result.stdout or "")
+
+        # AUD-09b fee-regime plan, Phase 1: net (1), the exact post-hoc
+        # safety backstop. A day the engine ever refused on
+        # `fee_schedule_mismatch` is VOID regardless of `trials` -- a
+        # partial day under a latched halt is contaminated (AC1) -- so it
+        # is quarantined and recorded `BLOCKED`, never `COMPLETED`, and
+        # stays queued for re-selection under a DIFFERENT family's theta
+        # only (`fee_void_keys`, AC2).
+        if refusal_counts.get(FEE_SCHEDULE_MISMATCH_REFUSAL, 0) >= 1:
+            _quarantine_fee_void_output_dir(output_dir, now_ts=now_ts)
+            record_blocked(
+                results_path=config.replay_results_path, station=station, climate_day=climate_day,
+                strategy=strategy, lag_minutes=config.lag_minutes,
+                blocked_reason="FEE_SCHEDULE_MISMATCH",
+                sufficiency_reason=target.reason, census_schema_version=target.schema_version,
+                family_id=sidecar.get("family_id"),  # type: ignore[arg-type]
+                manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,  # type: ignore[arg-type]
+                engine_required_fee_coefficient=engine_required_fee_coefficient,  # type: ignore[arg-type]
+                tape_instance_id=target.winner_instance_id,
+                refusal_counts=refusal_counts,
+                sink=sink, now_ts=now_ts,
+            )
+            print(f"BLOCKED {station} {climate_day} -- FEE_SCHEDULE_MISMATCH")
+            return 0, "BLOCKED", wall_s
+
+        parquet_files = sorted(output_dir.glob("scored_trials_*.parquet"))
+        parquet_sha256 = (
+            hashlib.sha256(parquet_files[-1].read_bytes()).hexdigest() if parquet_files else None
+        )
+
         _append_terminal(
-            config, target, strategy=strategy, now_ts=now_ts, outcome="FAILED",
-            exception_type=reason, wall_s=wall_s, peak_rss_bytes=peak_rss_bytes,
-        )
-        print(f"FAILED {station} {climate_day} -- {reason}", file=sys.stderr)
-        return 1
-
-    sidecar_path = output_dir / "family_params.json"
-    sidecar, sidecar_refusal = _verified_family_params(sidecar_path, expected_argv_sha256)
-    if sidecar is None:
-        reason = sidecar_refusal or "FAMILY_PARAMS_SIDECAR_MISSING"
-        record_blocked(
-            results_path=config.replay_results_path, station=station, climate_day=climate_day,
-            strategy=strategy, lag_minutes=config.lag_minutes, blocked_reason=reason,
-            sufficiency_reason=target.reason, census_schema_version=target.schema_version,
-            sink=active_sink, now_ts=now_ts,
-        )
-        print(f"BLOCKED {station} {climate_day} -- {reason}")
-        return 0
-    manifest_taker_fee_coefficient = sidecar.get("manifest_taker_fee_coefficient")
-    engine_required_fee_coefficient = sidecar.get("engine_required_fee_coefficient")
-    scored = read_scored_trials(output_dir)
-    fill_price_vs_decision_ask = tuple(str(trial.slippage) for trial in scored)
-    refusal_counts = _parse_strategy_refusals(driver_result.stdout or "")
-
-    # AUD-09b fee-regime plan, Phase 1: net (1), the exact post-hoc safety
-    # backstop. A day the engine ever refused on `fee_schedule_mismatch` is
-    # VOID regardless of `trials` -- a partial day under a latched halt is
-    # contaminated (AC1) -- so it is quarantined and recorded `BLOCKED`,
-    # never `COMPLETED`, and stays queued for re-selection under a
-    # DIFFERENT family's theta only (`fee_void_keys`, AC2).
-    if refusal_counts.get(FEE_SCHEDULE_MISMATCH_REFUSAL, 0) >= 1:
-        _quarantine_fee_void_output_dir(output_dir, now_ts=now_ts)
-        record_blocked(
-            results_path=config.replay_results_path, station=station, climate_day=climate_day,
-            strategy=strategy, lag_minutes=config.lag_minutes,
-            blocked_reason="FEE_SCHEDULE_MISMATCH",
-            sufficiency_reason=target.reason, census_schema_version=target.schema_version,
+            config, target, strategy=strategy, now_ts=now_ts, outcome="COMPLETED",
             family_id=sidecar.get("family_id"),  # type: ignore[arg-type]
+            manifest_sha256=sidecar.get("manifest_sha256"),  # type: ignore[arg-type]
             manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,  # type: ignore[arg-type]
             engine_required_fee_coefficient=engine_required_fee_coefficient,  # type: ignore[arg-type]
-            tape_instance_id=target.winner_instance_id,
+            engine_params_source=sidecar.get("engine_params_source"),  # type: ignore[arg-type]
+            params_match=sidecar.get("params_match"),  # type: ignore[arg-type]
+            composition_kind=sidecar.get("composition_kind"),  # type: ignore[arg-type]
+            trials=len(scored),
+            fills=len(scored),
+            fill_price_vs_decision_ask=fill_price_vs_decision_ask,
             refusal_counts=refusal_counts,
-            sink=active_sink, now_ts=now_ts,
+            wall_s=wall_s,
+            peak_rss_bytes=peak_rss_bytes,
+            parquet_sha256=parquet_sha256,
         )
-        print(f"BLOCKED {station} {climate_day} -- FEE_SCHEDULE_MISMATCH")
+        # Review fix 6 (MEDIUM): trials=0 AND an empty refusal_counts is
+        # indistinguishable from a broken engine -- a real quiet day still
+        # logs at least one strategy refusal (e.g. outside_decision_window)
+        # for every candidate it considered. Still COMPLETED (a genuine
+        # mechanism outcome), but escalated once as a WARN so it is never
+        # silently absorbed into the ordinary zero-trade case.
+        if len(scored) == 0 and not refusal_counts:
+            emit_alert(
+                sink,
+                AlertPayload(
+                    severity="warning",
+                    event="BREEZY_REPLAY_SUSPECT_ZERO_ACTIVITY",
+                    site=station,
+                    detail=(
+                        f"{climate_day}: COMPLETED with 0 trials and an empty refusal "
+                        "histogram -- check the engine actually evaluated this day"
+                    ),
+                ),
+            )
+        if std_utc_offset_hours_for is not None:
+            offset = std_utc_offset_hours_for(station)
+            interval = (
+                f"[{_format_lst(target.winner_first_in_window_ns, std_utc_offset_hours=offset)}, "
+                f"{_format_lst(target.winner_last_in_window_ns, std_utc_offset_hours=offset)}) LST"
+            )
+        else:
+            interval = "[?, ?) LST"
+        print(
+            f"COMPLETED {station} {climate_day} -- trials={len(scored)} fills={len(scored)} "
+            f"replayed {interval} of [12:00, 17:00); window_complete={target.window_complete} "
+            f"coverage_kind={target.coverage_kind}"
+        )
+        return 0, "COMPLETED", wall_s
+    finally:
+        # R3V-a item 6: a batch of `max_targets` mkdtemp work dirs is never
+        # left behind -- best-effort, never masks the real outcome above.
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _queue_empty_message(*, rows: Sequence[ReplaySufficiency], excluded_count: int) -> str:
+    """The same three-way "nothing to do" message `run_once` prints
+    inline, kept here as an independent copy -- `run_once` itself is not
+    touched by this plan at all (item 7's byte-identity guarantee), so
+    this is deliberately duplicated rather than extracted out from under
+    it."""
+    sufficient_count = sum(1 for row in rows if row.verdict == "SUFFICIENT")
+    if sufficient_count == 0:
+        histogram = dict(
+            sorted(Counter(row.reason for row in rows if row.verdict == "INSUFFICIENT").items())
+        )
+        return f"EVERY DAY INSUFFICIENT -- {histogram}"
+    if excluded_count > 0:
+        return (
+            f"QUEUE EMPTY (FEE REGIME) -- {excluded_count} station-day(s) excluded by the "
+            "dated fee schedule; table=FEE_SCHEDULE_PIN_2026-09-18"
+        )
+    return (
+        f"QUEUE EMPTY -- {sufficient_count} SUFFICIENT day(s), all replayed under "
+        "key (station, climate_day, strategy, lag)"
+    )
+
+
+def _in_protected_window(now: dt.datetime) -> bool:
+    """R3V-a item 3: reuses the SAME `[16:35Z, 01:15Z)` no-start window
+    `scripts/venue/fee_drift_evidence_pull.py` already defines
+    (`deploy/systemd/README.md`) -- never a second literal copy of the
+    bounds. Imported lazily (like `main`'s own `taker_fee_coefficient_as_
+    of` import) so every caller that never runs `run_batch` -- every test
+    in this suite except the batch ones -- never pays for that module's
+    own (heavier) import surface."""
+    venue_dir = str(Path(__file__).resolve().parent.parent / "venue")
+    if venue_dir not in sys.path:
+        sys.path.insert(0, venue_dir)
+    from fee_drift_evidence_pull import is_protected_window
+
+    return is_protected_window(now)
+
+
+def run_batch(
+    config: RunConfig,
+    *,
+    max_targets: int = 1,
+    budget_s: float,
+    reserve_s: float = DEFAULT_REPLAY_BATCH_RESERVE_S,
+    run_subprocess: SubprocessRunner = _default_run_subprocess,
+    sink: AlertSink | None = None,
+    now_ts: Callable[[], str] = _now_ts,
+    work_dir_factory: Callable[[], Path] = _default_work_dir,
+    std_utc_offset_hours_for: Callable[[str], float] | None = None,
+    fee_coefficient_as_of: Callable[[int], Decimal | None] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    now_utc: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+) -> int:
+    """R3-VIABILITY plan r1 §3 items 1-3/§5-6, AS AMENDED by r2 delta
+    "R3V-a" (r2 wins). One census read, drift computation, and manifest
+    resolve -- "per-batch state", item 5: `reset_skip_state`, the manifest
+    resolve, `compute_drift`/`write_replay_drift`/`emit_new_drift_alerts`,
+    and the `FEE_REGIME_EXCLUDED` line all run EXACTLY ONCE regardless of
+    `max_targets` -- then a bounded loop over `_run_one` until one of:
+
+    - the queue is empty;
+    - `max_targets` is reached;
+    - the budget (`budget_s` minus `reserve_s`) is spent;
+    - the protected no-start window `[16:35Z, 01:15Z)` is reached (item 3
+      -- checked before EVERY new target, never only at batch start);
+    - the first target with a non-zero exit, which stops the batch loudly
+      so `OnFailure=` fires (item 1's `DRIVER_TIMEOUT` is one such exit).
+
+    A key tried THIS batch is excluded from re-selection even when its
+    outcome was `BLOCKED` (not terminal) -- the single-target runner's own
+    head-of-line risk (r1 §3).
+
+    `max_targets=1` still runs the FULL batch machinery below (the budget
+    and protected-window checks apply, and `run_batch` never delegates to
+    `run_once`) -- but prints no `BATCH_SUMMARY` line (item 5). The
+    byte-identity guarantee (item 7) comes from `main`: a bare invocation
+    with neither `--max-targets` nor `--budget-s` calls `run_once`
+    directly, which this plan has not touched at all."""
+    batch_started = monotonic()
+    active_sink = sink if sink is not None else resolve_alert_sink(os.environ)
+    reset_skip_state(config.skip_state_path)
+
+    try:
+        strategy = resolve_strategy_from_manifest(config.family_manifest_path)
+        required_fee_coefficient = load_family_manifest(
+            config.family_manifest_path,
+        ).taker_fee_coefficient
+    except (OSError, FamilyManifestError, UnsupportedCompositionKindError) as exc:
+        print(f"replay_daily_runner: family manifest unusable: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        rows = read_replay_sufficiency(config.replay_sufficiency_path)
+    except OSError as exc:
+        print(f"replay_daily_runner: cannot read replay_sufficiency.jsonl: {exc}", file=sys.stderr)
+        return 1
+    except (UnknownReplaySufficiencySchemaError, DuplicateReplaySufficiencyRecordError) as exc:
+        print(f"replay_daily_runner: refused: {exc}", file=sys.stderr)
+        return 1
+
+    if config.replay_results_path.exists():
+        try:
+            existing_results = read_replay_results(config.replay_results_path)
+        except (UnknownReplayResultSchemaError, DuplicateReplayResultError) as exc:
+            print(f"replay_daily_runner: refused: {exc}", file=sys.stderr)
+            return 1
+    else:
+        existing_results = ()
+
+    census_by_station_day = {(row.station, row.climate_day): row for row in rows}
+    previous_drift = read_replay_drift(config.replay_drift_path)
+    current_drift = compute_drift(
+        replayed=existing_results, census_by_station_day=census_by_station_day,
+    )
+    write_replay_drift(config.replay_drift_path, current_drift)
+    emit_new_drift_alerts(previous=previous_drift, current=current_drift, sink=active_sink)
+
+    excluded_count = fee_regime_excluded_count(
+        rows=rows,
+        replayed=existing_results,
+        drift=current_drift,
+        strategy=strategy,
+        lag_minutes=config.lag_minutes,
+        required_fee_coefficient=required_fee_coefficient,
+        fee_coefficient_as_of=fee_coefficient_as_of,
+    )
+    print(
+        f"FEE_REGIME_EXCLUDED {excluded_count} station-day(s) "
+        f"(required theta={required_fee_coefficient}; table=FEE_SCHEDULE_PIN_2026-09-18)"
+    )
+
+    # Item 2: a budget at or below the reserve starts zero targets --
+    # including a negative budget (a wrapper arithmetic bug must never
+    # crash the runner, only pause it).
+    if budget_s <= reserve_s:
+        print(
+            f"QUEUE PAUSED (BUDGET) -- budget_s={budget_s} <= reserve_s={reserve_s}; "
+            "started 0 target(s)"
+        )
         return 0
 
-    parquet_files = sorted(output_dir.glob("scored_trials_*.parquet"))
-    parquet_sha256 = (
-        hashlib.sha256(parquet_files[-1].read_bytes()).hexdigest() if parquet_files else None
-    )
+    tried: set[ResultKey] = set()
+    summaries: list[tuple[str, str, str, float]] = []
+    exit_code = 0
+    stop_reason = "MAX_TARGETS"
 
-    _append_terminal(
-        config, target, strategy=strategy, now_ts=now_ts, outcome="COMPLETED",
-        family_id=sidecar.get("family_id"),  # type: ignore[arg-type]
-        manifest_sha256=sidecar.get("manifest_sha256"),  # type: ignore[arg-type]
-        manifest_taker_fee_coefficient=manifest_taker_fee_coefficient,  # type: ignore[arg-type]
-        engine_required_fee_coefficient=engine_required_fee_coefficient,  # type: ignore[arg-type]
-        engine_params_source=sidecar.get("engine_params_source"),  # type: ignore[arg-type]
-        params_match=sidecar.get("params_match"),  # type: ignore[arg-type]
-        composition_kind=sidecar.get("composition_kind"),  # type: ignore[arg-type]
-        trials=len(scored),
-        fills=len(scored),
-        fill_price_vs_decision_ask=fill_price_vs_decision_ask,
-        refusal_counts=refusal_counts,
-        wall_s=wall_s,
-        peak_rss_bytes=peak_rss_bytes,
-        parquet_sha256=parquet_sha256,
-    )
-    # Review fix 6 (MEDIUM): trials=0 AND an empty refusal_counts is
-    # indistinguishable from a broken engine -- a real quiet day still logs
-    # at least one strategy refusal (e.g. outside_decision_window) for
-    # every candidate it considered. Still COMPLETED (a genuine mechanism
-    # outcome), but escalated once as a WARN so it is never silently
-    # absorbed into the ordinary zero-trade case.
-    if len(scored) == 0 and not refusal_counts:
-        emit_alert(
-            active_sink,
-            AlertPayload(
-                severity="warning",
-                event="BREEZY_REPLAY_SUSPECT_ZERO_ACTIVITY",
-                site=station,
-                detail=(
-                    f"{climate_day}: COMPLETED with 0 trials and an empty refusal "
-                    "histogram -- check the engine actually evaluated this day"
-                ),
-            ),
+    while len(summaries) < max_targets:
+        elapsed = monotonic() - batch_started
+        if budget_s - elapsed <= reserve_s:
+            stop_reason = "BUDGET"
+            break
+        if _in_protected_window(now_utc()):
+            stop_reason = "PROTECTED_WINDOW"
+            break
+
+        target = select_target(
+            rows=rows,
+            replayed=existing_results,
+            drift=current_drift,
+            strategy=strategy,
+            lag_minutes=config.lag_minutes,
+            required_fee_coefficient=required_fee_coefficient,
+            fee_coefficient_as_of=fee_coefficient_as_of,
+            exclude=frozenset(tried),
         )
-    if std_utc_offset_hours_for is not None:
-        offset = std_utc_offset_hours_for(station)
-        interval = (
-            f"[{_format_lst(target.winner_first_in_window_ns, std_utc_offset_hours=offset)}, "
-            f"{_format_lst(target.winner_last_in_window_ns, std_utc_offset_hours=offset)}) LST"
+        if target is None:
+            stop_reason = "EMPTY"
+            if not summaries:
+                print(_queue_empty_message(rows=rows, excluded_count=excluded_count))
+            break
+
+        tried.add((target.station, target.climate_day, strategy, config.lag_minutes))
+        remaining = budget_s - (monotonic() - batch_started)
+        driver_timeout_s = max(0.0, remaining - reserve_s)
+        target_exit_code, outcome, wall_s = _run_one(
+            config, target, strategy=strategy, run_subprocess=run_subprocess,
+            sink=active_sink, now_ts=now_ts, work_dir_factory=work_dir_factory,
+            std_utc_offset_hours_for=std_utc_offset_hours_for,
+            driver_timeout_s=driver_timeout_s,
         )
-    else:
-        interval = "[?, ?) LST"
-    print(
-        f"COMPLETED {station} {climate_day} -- trials={len(scored)} fills={len(scored)} "
-        f"replayed {interval} of [12:00, 17:00); window_complete={target.window_complete} "
-        f"coverage_kind={target.coverage_kind}"
-    )
-    return 0
+        summaries.append((target.station, target.climate_day, outcome, wall_s))
+        if target_exit_code != 0:
+            exit_code = target_exit_code
+            stop_reason = "TARGET_FAILED"
+            break
+
+    # Item 5: no batch summary at max_targets=1. Item 10: the summary is
+    # one stdout line, with per-target wall_s, so the wrapper's own $LOG
+    # redirect captures it (L-52).
+    if max_targets != 1:
+        detail = " ".join(f"{s}/{d}={o}(wall_s={w:.1f})" for s, d, o, w in summaries)
+        print(f"BATCH_SUMMARY {len(summaries)} target(s) stop={stop_reason} -- {detail}")
+    return exit_code
 
 
 def _resolve_std_utc_offset_hours(station: str) -> float:
@@ -1490,6 +1838,32 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="With --quarantine-legacy-fee-void, list affected keys without renaming.",
     )
+    parser.add_argument(
+        "--max-targets",
+        type=int,
+        default=1,
+        help=(
+            "R3V-a: replay up to this many (station, climate_day) targets "
+            "in one invocation, re-selecting from the same census each "
+            "time (a key tried this batch is excluded even if BLOCKED). "
+            "Default 1 -- today's behaviour: main() calls run_once "
+            "directly (never run_batch) whenever this is left at 1, for a "
+            "byte-identical default path."
+        ),
+    )
+    parser.add_argument(
+        "--budget-s",
+        type=float,
+        default=None,
+        help=(
+            "R3V-a: required whenever --max-targets != 1. Wall-clock "
+            "budget for the whole batch; the loop stops offering new "
+            "targets once the remaining budget reaches "
+            "DEFAULT_REPLAY_BATCH_RESERVE_S. May be zero or negative "
+            "(the wrapper's own arithmetic can run past TimeoutStartSec) "
+            "-- that starts zero targets and exits 0, never a crash."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.report_skip is None and not args.quarantine_legacy_fee_void:
         missing = [
@@ -1504,6 +1878,8 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ]
         if missing:
             parser.error(f"the following arguments are required: {', '.join(missing)}")
+        if args.max_targets != 1 and args.budget_s is None:
+            parser.error("--budget-s is required when --max-targets is not 1")
     elif args.quarantine_legacy_fee_void and args.output_root is None:
         parser.error("--quarantine-legacy-fee-void requires --output-root")
     return args
@@ -1544,8 +1920,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     from breezy.adapters.polymarket_us.fees import taker_fee_coefficient_as_of
 
-    return run_once(
+    # item 7: a bare invocation (no --max-targets) calls run_once directly
+    # -- this plan has not touched run_once at all, so the default path is
+    # byte-identical to before it, not merely equivalent through run_batch.
+    if args.max_targets == 1:
+        return run_once(
+            config,
+            std_utc_offset_hours_for=_resolve_std_utc_offset_hours,
+            fee_coefficient_as_of=taker_fee_coefficient_as_of,
+        )
+    return run_batch(
         config,
+        max_targets=args.max_targets,
+        budget_s=args.budget_s,
         std_utc_offset_hours_for=_resolve_std_utc_offset_hours,
         fee_coefficient_as_of=taker_fee_coefficient_as_of,
     )

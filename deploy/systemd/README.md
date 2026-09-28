@@ -1613,6 +1613,28 @@ coordinator installs and enables it.
 and revert the commit. Nothing reads `data/evidence/fee_drift/` except the
 evidence doc's own dated notes, so rollback is total.
 
+## `breezy-replay-daily` — R3V-a batch mode (2026-09-28)
+
+`replay-daily-run.sh` invokes `replay_daily_runner.py` with `--max-targets`
+and `--budget-s` (`BREEZY_REPLAY_DAILY_MAX_TARGETS`, default 6): one census
+read per invocation, then a bounded loop that re-selects from it, excluding
+every key already tried THIS run even when `BLOCKED` (fixes the single-target
+runner's own head-of-line risk). The loop stops on an empty queue,
+`--max-targets`, the budget minus a 240s reserve, the protected no-start
+window `[16:35Z, 01:15Z)`, or the first non-zero-exit target — whichever
+comes first; a `BATCH_SUMMARY` line (per-target `wall_s`) is printed to
+`$LOG` whenever `--max-targets` is not 1. `--budget-s` is derived each run
+from `$SECONDS` and the PREVIOUS run's own measured `promotion_proposal.py`
+wall time (`~/.local/share/breezy/derived/replay/promotion_proposal_wall_s`),
+never a hardcoded constant. A bare invocation (`--max-targets` omitted, or
+left at its default of 1) still calls `run_once` inside the runner
+byte-identically to before this change.
+
+**One-time backfill.** The coordinator runs the same unit once by hand
+(`systemd-run --user -p LimitNOFILE=524288 ...`, `--max-targets 40`),
+serialized through `breezy-studies.lock` like every other invocation,
+outside AUD-07 (02:10-08:40Z) and the protected window.
+
 ## `breezy-hypothesis-triage` — AUD-18 nightly hypothesis triage (DEPLOYED 2026-09-25 21:17Z)
 
 The timer fires at 01:20 UTC (`Persistent=true`). The service has no `[Install]` section and is started only by the timer. It is ordered `After=breezy-replay-daily.service`, but does not require it.

@@ -9,6 +9,7 @@ driver.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -71,6 +72,7 @@ def _run_wrapper(
     python_stub: Path,
     systemctl_stub: Path,
     hold_lock: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     home = tmp_path / "home"
@@ -89,6 +91,8 @@ def _run_wrapper(
     # wrapper's own `$REPO` is hardcoded to `/home/jon/breezy`) -- this
     # worktree's own manifests are what the fixture below asserts against.
     env["BREEZY_REPLAY_DAILY_FAMILIES_DIR"] = str(_REPO_ROOT / "deploy" / "families")
+    if extra_env:
+        env.update(extra_env)
 
     lock_holder = None
     if hold_lock:
@@ -199,3 +203,67 @@ def test_a_normal_run_invokes_the_census_then_the_runner_and_no_skip(tmp_path: P
     assert "CENSUS" in log_text
     assert "RUNNER" in log_text
     assert "REPORT_SKIP" not in log_text
+
+
+def _runner_argv_line(argv_log: Path) -> str:
+    (line,) = [
+        line for line in argv_log.read_text().splitlines() if line.startswith("RUNNER")
+    ]
+    return line
+
+
+def test_the_runner_invocation_carries_max_targets_and_budget_s(tmp_path: Path) -> None:
+    """R3V-a item 8/"wrapper argv carries both flags": the nightly wrapper
+    always passes `--max-targets`/`--budget-s` -- never a bare invocation
+    that would fall back to `run_once` inside the runner."""
+    python_stub, argv_log = _python_stub(tmp_path)
+    systemctl_stub = _systemctl_stub(
+        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+    )
+    result = _run_wrapper(tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub)
+    assert result.returncode == 0, result.stderr
+    runner_line = _runner_argv_line(argv_log)
+    assert "--max-targets 6" in runner_line
+    assert re.search(r"--budget-s -?\d+", runner_line), runner_line
+
+
+def test_the_runner_invocation_honours_a_max_targets_override(tmp_path: Path) -> None:
+    """R3V-a item 9: the coordinator's hand-run backfill overrides the
+    nightly default via the SAME env var, never a second wrapper script."""
+    python_stub, argv_log = _python_stub(tmp_path)
+    systemctl_stub = _systemctl_stub(
+        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+    )
+    result = _run_wrapper(
+        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub,
+        extra_env={"BREEZY_REPLAY_DAILY_MAX_TARGETS": "40"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--max-targets 40" in _runner_argv_line(argv_log)
+
+
+def test_budget_arithmetic_stays_sane_when_seconds_already_exceeds_the_timeout(
+    tmp_path: Path,
+) -> None:
+    """R3V-a's own "Added tests" list: the wrapper's budget arithmetic is
+    correct when `$SECONDS` is past the budget -- a negative `--budget-s`
+    is passed through as a valid, parseable value (the runner itself
+    starts 0 targets and exits 0 on it; covered in
+    test_replay_daily_runner_batch.py), never a shell arithmetic crash or
+    a malformed argv."""
+    python_stub, argv_log = _python_stub(tmp_path)
+    systemctl_stub = _systemctl_stub(
+        tmp_path, environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4",
+    )
+    result = _run_wrapper(
+        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub,
+        # bash seeds its builtin $SECONDS from an inherited env var of the
+        # same name -- forces the wrapper's own elapsed-time read far past
+        # TimeoutStartSec without an actual 1800s sleep.
+        extra_env={"SECONDS": "9999", "BREEZY_REPLAY_DAILY_TIMEOUT_START_SEC": "1800"},
+    )
+    assert result.returncode == 0, result.stderr
+    runner_line = _runner_argv_line(argv_log)
+    match = re.search(r"--budget-s (-?\d+)", runner_line)
+    assert match, runner_line
+    assert int(match.group(1)) < 0

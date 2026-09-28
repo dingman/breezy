@@ -40,6 +40,22 @@ WEATHER_CATALOG_ROOT=${BREEZY_WEATHER_CATALOG_ROOT:-$HOME/.local/share/breezy/ca
 OUT_ROOT=${BREEZY_REPLAY_DAILY_OUTPUT_ROOT:-$HOME/.local/share/breezy/derived}
 REPLAY_DIR=$OUT/replay
 SKIP_STATE_PATH="${BREEZY_REPLAY_DAILY_SKIP_STATE:-$REPLAY_DIR/wrapper_skip_state}"
+# R3V-a item 8/9: the nightly timer passes 6 (4 accrual + slack); the
+# coordinator's hand-run backfill (2026-09-29, ~10:30Z, outside AUD-07 and
+# the protected window) overrides this to 40 via the same env var under
+# `systemd-run`.
+MAX_TARGETS="${BREEZY_REPLAY_DAILY_MAX_TARGETS:-6}"
+# Must equal breezy-replay-daily.service's own TimeoutStartSec= -- the
+# override exists only so a test wrapper never has to wait out 1800s.
+TIMEOUT_START_SEC="${BREEZY_REPLAY_DAILY_TIMEOUT_START_SEC:-1800}"
+# R3V-a item 2: the budget passed to replay_daily_runner.py is never the
+# hardcoded 1500 the r1 plan drafted -- it is derived from THIS run's own
+# elapsed $SECONDS (the census already ran by the time this is computed)
+# and the PREVIOUS run's measured promotion_proposal.py wall time (that
+# script runs AFTER the runner, so this run's own duration is unknowable
+# yet; last run's is the best available estimate). 300s covers every
+# measured promotion_proposal run so far if no estimate exists yet.
+PROMOTION_WALL_FILE="$REPLAY_DIR/promotion_proposal_wall_s"
 
 mkdir -p "$OUT" "$REPLAY_DIR"
 
@@ -157,22 +173,37 @@ if ! "$PY" "$REPO/scripts/analysis/replay_sufficiency_census.py" >>"$LOG" 2>&1; 
   exit 1
 fi
 
+# R3V-a item 2: est_promotion_s is last run's OWN measured
+# promotion_proposal.py wall time (written at the tail of this script,
+# below) -- a missing or non-numeric file (first run ever, or a
+# hand-edited state dir) falls back to 300s, never crashes the arithmetic.
+est_promotion_s=$(cat "$PROMOTION_WALL_FILE" 2>/dev/null || true)
+est_promotion_s=${est_promotion_s%%.*}
+case "$est_promotion_s" in
+  ''|*[!0-9]*) est_promotion_s=300 ;;
+esac
+BUDGET_S=$(( TIMEOUT_START_SEC - SECONDS - est_promotion_s ))
+
 # Step 2: the runner -- everything else (H0 read, target selection, ASOS
 # producer + driver subprocess invocations, RECOVERED/FAILED,
-# record_blocked, the row append, the summary line) lives in
+# record_blocked, the row append, the summary/batch-summary line) lives in
 # replay_daily_runner.py, never here.
 if ! "$PY" "$REPO/scripts/analysis/replay_daily_runner.py" \
      --quote-catalog "$QUOTE_CATALOG" \
      --weather-catalog-root "$WEATHER_CATALOG_ROOT" \
      --family-manifest "$FAMILY_MANIFEST" \
      --output-root "$OUT_ROOT" \
-     --python "$PY" >>"$LOG" 2>&1; then
+     --python "$PY" \
+     --max-targets "$MAX_TARGETS" \
+     --budget-s "$BUDGET_S" >>"$LOG" 2>&1; then
   say "REPLAY DAILY FAILED (see $LOG)"
   exit 1
 fi
 
 # AUD-10b: sanctioned third invocation, still inside breezy-studies.lock,
 # after the replay. Disk-only proposal. No JSONL parsing in this wrapper.
+# R3V-a: timed so the NEXT run's own --budget-s estimate improves.
+promotion_started=$SECONDS
 if ! "$PY" "$REPO/scripts/analysis/promotion_proposal.py" \
      --family-manifest "$FAMILY_MANIFEST" \
      --output-root "$OUT/promotion" \
@@ -180,5 +211,9 @@ if ! "$PY" "$REPO/scripts/analysis/promotion_proposal.py" \
   say "REPLAY DAILY FAILED -- promotion proposal (see $LOG)"
   exit 1
 fi
+promotion_wall_s=$(( SECONDS - promotion_started ))
+printf '%s\n' "$promotion_wall_s" > "$PROMOTION_WALL_FILE.tmp" 2>>"$LOG" \
+  && mv -f "$PROMOTION_WALL_FILE.tmp" "$PROMOTION_WALL_FILE" 2>>"$LOG" \
+  || say "promotion_proposal wall-time estimate NOT updated (non-fatal, see $LOG)"
 say "replay daily ok"
 exit 0
