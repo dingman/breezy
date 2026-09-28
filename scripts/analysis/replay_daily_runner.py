@@ -76,7 +76,7 @@ from typing import Final, Literal
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from argv_digest import argv_sha256
-from hypothesis_register import NO_SIDE_RULING_DATE
+from hypothesis_register import ARCHIVE_RECAL_RULING_DATE
 
 from breezy.analysis.replay_results import (
     FEE_SCHEDULE_MISMATCH_REFUSAL,
@@ -156,12 +156,17 @@ __all__ = [
 WEATHER_VENUE: Final[str] = "polymarket_us"
 
 #: R3-VIABILITY r2 delta "R3V-b" item 2: sourced from the hypothesis
-#: register's own freeze record (`NO_SIDE_RULING_DATE`,
-#: `hypothesis_register.py:174`), never a new literal. A row with
-#: `climate_day == FREEZE_CLIMATE_DAY` counts as pre-freeze; the COMPLETED
-#: log line below withholds `trials=`/`fills=` only strictly AFTER it.
-#: `r3_viability.py` imports this same constant for its own firewall.
-FREEZE_CLIMATE_DAY: Final[str] = NO_SIDE_RULING_DATE
+#: register's own freeze record for H-ARCHIVE-RECAL-2026-09
+#: (`ARCHIVE_RECAL_RULING_DATE`, `hypothesis_register.py:207`) -- the
+#: record that OWNS the 2026-09-25 tape freeze
+#: (`EDGE-4_DISPOSITION_2026-09-27.md:6,19`), never a new literal. Never
+#: `NO_SIDE_RULING_DATE`: that is a DIFFERENT hypothesis's ruling date that
+#: happens to equal the same day today (CRITICAL fix, code review
+#: 2026-09-28). A row with `climate_day == FREEZE_CLIMATE_DAY` counts as
+#: pre-freeze; the COMPLETED log line below withholds `trials=`/`fills=`
+#: only strictly AFTER it. `r3_viability.py` imports this same constant for
+#: its own firewall.
+FREEZE_CLIMATE_DAY: Final[str] = ARCHIVE_RECAL_RULING_DATE
 
 DEFAULT_STRATEGY: Final[str] = "continuous_rung_hold"
 #: Matches the base plan's own literal command block (§6b.3).

@@ -26,9 +26,13 @@ post-freeze row's fill count is structurally never read by this module
 proves it with a duck-typed spy).
 
 **Freeze date (r2 delta item 2).** Sourced from the hypothesis register's
-own freeze record, ``hypothesis_register.NO_SIDE_RULING_DATE`` -- never a
-new literal -- and shared with `replay_daily_runner.py`'s own
+own freeze record, ``hypothesis_register.ARCHIVE_RECAL_RULING_DATE`` --
+never a new literal -- and shared with `replay_daily_runner.py`'s own
 ``FREEZE_CLIMATE_DAY`` (its post-freeze COMPLETED-line log withholding).
+The 2026-09-25 tape freeze is owned by ``H-ARCHIVE-RECAL-2026-09``
+(`EDGE-4_DISPOSITION_2026-09-27.md:6,19`), not ``H-NO-SIDE-2026-09`` --
+``NO_SIDE_RULING_DATE`` equals the same date today only by coincidence and
+MUST NOT be used here (CRITICAL fix, code review 2026-09-28).
 ``climate_day == FREEZE_CLIMATE_DAY`` itself counts as pre-freeze; the
 firewall binds strictly AFTER it.
 
@@ -75,7 +79,7 @@ from typing import Final, Literal, Protocol
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from archive_correction_probe import Z_95, wilson_interval
-from hypothesis_register import NO_SIDE_RULING_DATE
+from hypothesis_register import ARCHIVE_RECAL_RULING_DATE
 
 from breezy.analysis.replay_results import (
     ReplayResult,
@@ -103,9 +107,12 @@ __all__ = [
 ]
 
 #: r2 delta "R3V-b" item 2: sourced from the hypothesis register's own
-#: freeze record, never a new literal. Shared with
-#: `replay_daily_runner.FREEZE_CLIMATE_DAY` (module docstring above).
-FREEZE_CLIMATE_DAY: Final[str] = NO_SIDE_RULING_DATE
+#: freeze record for H-ARCHIVE-RECAL-2026-09 (the record that OWNS the
+#: 2026-09-25 tape freeze -- `EDGE-4_DISPOSITION_2026-09-27.md:6,19`; never
+#: `NO_SIDE_RULING_DATE`, which is a different hypothesis's ruling date
+#: that happens to equal the same day today). Never a new literal. Shared
+#: with `replay_daily_runner.FREEZE_CLIMATE_DAY` (module docstring above).
+FREEZE_CLIMATE_DAY: Final[str] = ARCHIVE_RECAL_RULING_DATE
 
 #: r2 delta item 1: below this, the verdict is INSUFFICIENT_N regardless of k.
 MIN_N: Final[int] = 20

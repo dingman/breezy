@@ -9,6 +9,7 @@ constraint: "Never read the live ... replay_results.jsonl in a test").
 
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -115,9 +116,29 @@ def _result_row(
 # ---------------------------------------------------------------------------
 
 
-def test_freeze_climate_day_is_sourced_from_the_hypothesis_register() -> None:
-    assert viability.FREEZE_CLIMATE_DAY == hypothesis_register.NO_SIDE_RULING_DATE
+def test_freeze_climate_day_is_sourced_from_archive_recal_not_no_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CRITICAL fix (code review, 2026-09-28): the tape freeze is owned by
+    `H-ARCHIVE-RECAL-2026-09` (`EDGE-4_DISPOSITION_2026-09-27.md:6,19`:
+    "the freeze commit on 2026-09-25" is that hypothesis's own bar), not
+    `H-NO-SIDE-2026-09` -- `NO_SIDE_RULING_DATE` equals the same date today
+    only by coincidence. A bare value-equality assertion cannot catch a
+    wrong-source bug when the two constants coincide, so this pins SOURCE:
+    monkeypatch `NO_SIDE_RULING_DATE` to a different date and reload --
+    `FREEZE_CLIMATE_DAY` must not move, because it must never have been
+    wired to it in the first place."""
+    assert viability.FREEZE_CLIMATE_DAY == hypothesis_register.ARCHIVE_RECAL_RULING_DATE
     assert viability.FREEZE_CLIMATE_DAY == "2026-09-25"
+
+    monkeypatch.setattr(hypothesis_register, "NO_SIDE_RULING_DATE", "2099-01-01")
+    try:
+        importlib.reload(viability)
+        assert viability.FREEZE_CLIMATE_DAY == hypothesis_register.ARCHIVE_RECAL_RULING_DATE
+        assert viability.FREEZE_CLIMATE_DAY != "2099-01-01"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(viability)
 
 
 # ---------------------------------------------------------------------------
