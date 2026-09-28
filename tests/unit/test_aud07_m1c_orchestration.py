@@ -806,6 +806,21 @@ def test_sweep_sh_refuses_stage_80k_when_20k_coverage_is_incomplete(tmp_path: Pa
 
     assert result.returncode != 0
     assert "coverage" in result.stderr
+    # Review fix: the underlying `check_coverage_20k` exception text (which
+    # names the actual missing cell) must be INCORPORATED into the one
+    # refusal line -- not merely present somewhere in combined stderr (the
+    # python subprocess's stderr passes through unprefixed regardless, so a
+    # bare substring check would pass even with the bug: the refusal line
+    # itself renders as "...is incomplete: " with nothing after the colon).
+    refusal_lines = [
+        line for line in result.stderr.splitlines() if "is incomplete:" in line
+    ]
+    assert refusal_lines, result.stderr
+    assert len(refusal_lines) == 1, result.stderr
+    detail = refusal_lines[0].split("is incomplete:", 1)[1].strip()
+    assert detail, f"refusal line carries no detail after the colon: {refusal_lines[0]!r}"
+    assert "missing cell(s)" in detail
+    assert "48" in detail
     assert not calls_file.exists(), (
         "the 80k cell command must never run while 20k coverage is incomplete"
     )

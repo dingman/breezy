@@ -78,7 +78,12 @@ try:
     rows = dedupe_rows(load_stage_rows(sorted(Path(twentyk_dir).glob("*.jsonl")), stage="20k"))
     check_coverage_20k(rows)
 except (MergeCoverageError, MergeStageError) as exc:
-    print(str(exc), file=sys.stderr)
+    # stdout, not stderr: `$(... )` command substitution only captures
+    # stdout, and the caller (sweep.sh) folds this text into its own
+    # refusal line -- printing it to stderr instead leaves that line empty
+    # after the colon while the detail leaks out as a separate, unprefixed
+    # line (review fix, 2026-09-28).
+    print(str(exc))
     sys.exit(1)
 PYEOF
   )"; then
