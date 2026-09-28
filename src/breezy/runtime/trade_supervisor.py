@@ -29,6 +29,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import resource
 import signal
 import subprocess
@@ -777,6 +778,15 @@ def node_log_path(log_dir: Path, now: dt.datetime) -> Path:
     return log_dir / f"breezy-trade-{stamp}.log"
 
 
+#: [SUP-ADOPT-LOG-GLOB] The exact shape ``node_log_path`` produces --
+#: kept immediately adjacent to it so the two cannot drift apart.
+#: ``find_adopted_node_log`` must match ONLY this: the supervisor's own logs
+#: (``breezy-trade-supervisor.log`` and its ``-stdout-``/``.launch-``
+#: variants) all share the ``breezy-trade-`` prefix but must never qualify
+#: as an adopted node's log.
+_NODE_LOG_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^breezy-trade-\d{8}T\d{6}Z\.log$")
+
+
 def supervisor_log_path(log_dir: Path) -> Path:
     return log_dir / "breezy-trade-supervisor.log"
 
@@ -791,17 +801,26 @@ def _process_start_time(pid: int) -> float | None:
 
 
 def find_adopted_node_log(log_dir: Path, pid: int) -> Path | None:
-    """[D2] Best-effort: the newest ``breezy-trade-*.log`` under
-    ``log_dir`` whose mtime is at or after ``pid``'s own process-start
-    time -- ``None`` if that can't be determined (unreadable
+    """[D2/SUP-ADOPT-LOG-GLOB] Best-effort: the newest NODE-stamped log
+    (matching ``_NODE_LOG_NAME_RE``, i.e. exactly what ``node_log_path``
+    produces) under ``log_dir`` whose mtime is at or after ``pid``'s own
+    process-start time -- ``None`` if that can't be determined (unreadable
     ``/proc/<pid>``, or no candidate log qualifies), in which case the
-    caller degrades gracefully rather than guessing."""
+    caller degrades gracefully rather than guessing.
+
+    Deliberately narrower than a ``breezy-trade-*.log`` glob: the
+    supervisor's own logs (``breezy-trade-supervisor.log`` and its
+    ``-stdout-``/``.launch-`` variants) share that prefix, and a freshly
+    restarted supervisor writes one just after adoption -- newer than any
+    node log -- which a looser glob would wrongly return, producing a false
+    ``PermitCapability.ABSENT`` CRITICAL when that supervisor log lacks a
+    permit line."""
     start = _process_start_time(pid)
     if start is None:
         return None
     try:
         candidates = sorted(
-            log_dir.glob("breezy-trade-*.log"),
+            (p for p in log_dir.glob("breezy-trade-*.log") if _NODE_LOG_NAME_RE.match(p.name)),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
