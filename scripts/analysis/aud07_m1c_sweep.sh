@@ -52,6 +52,41 @@ if [ "${#existing_failed[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# AUD-07 DEFERRED gate (RULING_backlog_resolution_2026-09-28.md): the chain
+# never advances to 80k while 20k/DEFERRED is non-empty or 20k coverage of
+# cells 0-48 is incomplete. 80k-only -- a 20k (or any other stage) sweep
+# never consults its own state here.
+if [ "$stage" = "80k" ]; then
+  twentyk_dir="$run_dir/20k"
+  twentyk_deferred="$twentyk_dir/DEFERRED"
+  if [ -s "$twentyk_deferred" ]; then
+    echo "[aud07-m1c-sweep] refusing --stage 80k: $twentyk_deferred is non-empty -- drain every deferred 20k cell before advancing to 80k" >&2
+    exit 1
+  fi
+
+  script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+  py="${BREEZY_PYTHON:-$(cd "$script_dir/../.." && pwd -P)/.venv/bin/python}"
+  if ! coverage_error="$("$py" - "$script_dir" "$twentyk_dir" <<'PYEOF'
+import sys
+from pathlib import Path
+
+script_dir, twentyk_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, script_dir)
+from aud07_m1c_merge import MergeCoverageError, MergeStageError, check_coverage_20k, dedupe_rows, load_stage_rows
+
+try:
+    rows = dedupe_rows(load_stage_rows(sorted(Path(twentyk_dir).glob("*.jsonl")), stage="20k"))
+    check_coverage_20k(rows)
+except (MergeCoverageError, MergeStageError) as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+PYEOF
+  )"; then
+    echo "[aud07-m1c-sweep] refusing --stage 80k: 20k coverage of cells 0-48 is incomplete: $coverage_error" >&2
+    exit 1
+  fi
+fi
+
 stage_dir="$run_dir/$stage"
 mkdir -p "$stage_dir"
 
