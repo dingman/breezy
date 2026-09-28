@@ -771,6 +771,56 @@ def test_run_once_writes_a_completed_row_from_the_sidecar_and_parquet(tmp_path: 
     )
 
 
+def test_run_once_withholds_trials_and_fills_on_a_post_freeze_completed_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R3-VIABILITY r1 §3.4 / r2 delta "R3V-b" item 5: a post-freeze
+    (`climate_day > runner.FREEZE_CLIMATE_DAY`) COMPLETED line prints
+    `post-freeze: counts withheld` and carries neither `trials=` nor
+    `fills=` -- only the stored row (read by `r3_viability.py`) still
+    carries the real counts."""
+    post_freeze_day = "2026-09-26"
+    assert post_freeze_day > runner.FREEZE_CLIMATE_DAY
+    config = _config(tmp_path)
+    write_replay_sufficiency(config.replay_sufficiency_path, [_row(climate_day=post_freeze_day)])
+    output_dir = _output_dir_for(config, post_freeze_day)
+
+    def fake_subprocess(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        script = argv[1]
+        if "asos_cache_csv.py" in script:
+            return _completed_process(0)
+        assert "current_rung_hold_paper_replay.py" in script
+        output_dir.mkdir(parents=True, exist_ok=True)
+        scored = ScoredTrial(
+            trial_id="t1", station=STATION, climate_day=post_freeze_day, instrument_id="i1",
+            settlement_tmax_f=70, held=True, pnl=Decimal("0.5"), revision_seq=1, raw_sha256="x",
+            scored_at_ns=1, score_seq=0, settlement_basis="nws_final", excluded_reason=None,
+            slippage=Decimal("0.01"), entry_ask=Decimal("0.4"), fill_px=Decimal("0.41"),
+            fee=Decimal("0.02"),
+        )
+        write_scored_trials(output_dir, [scored], now_ns=2)
+        (output_dir / "family_params.json").write_text(
+            json.dumps(_matching_sidecar(argv)), encoding="utf-8",
+        )
+        return _completed_process(0)
+
+    capsys.readouterr()
+    exit_code = runner.run_once(
+        config, run_subprocess=fake_subprocess, sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "post-freeze: counts withheld" in out
+    assert "trials=" not in out
+    assert "fills=" not in out
+    # The stored row is unaffected -- only the printed line withholds.
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    assert rows[0].trials == 1
+    assert rows[0].fills == 1
+
+
 def _append_terminal_row(
     tmp_path: Path,
     *,

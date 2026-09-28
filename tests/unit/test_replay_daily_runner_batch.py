@@ -251,6 +251,42 @@ def test_run_batch_runs_at_most_max_targets(tmp_path: Path) -> None:
     ]
 
 
+def test_run_batch_completed_line_for_a_post_freeze_day_withholds_trials_and_fills(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R3-VIABILITY r2 delta "R3V-b" item 5, ported through R3V-a's batch
+    path: `_run_one` is the ONE place the COMPLETED line is printed for
+    BOTH `run_once` (single target) and `run_batch` (R3V-a's loop calls it
+    too), so a post-freeze row inside a BATCH run must withhold
+    `trials=`/`fills=` exactly like the single-target path already does
+    (`test_replay_daily_runner.py::test_run_once_withholds_trials_and_
+    fills_on_a_post_freeze_completed_line`)."""
+    post_freeze_day = "2026-09-26"
+    assert post_freeze_day > runner.FREEZE_CLIMATE_DAY
+    config = _config(tmp_path)
+    write_replay_sufficiency(
+        config.replay_sufficiency_path, [_row(station="LAX", climate_day=post_freeze_day)],
+    )
+    capsys.readouterr()
+    exit_code = runner.run_batch(
+        config, max_targets=1, budget_s=10_000.0,
+        run_subprocess=_happy_subprocess(config), sink=_RecordingSink(),
+        work_dir_factory=lambda: tmp_path / "work",
+        now_utc=_SAFE_NOW_UTC,
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "post-freeze: counts withheld" in out
+    assert "trials=" not in out
+    assert "fills=" not in out
+    # The stored row is unaffected -- only the printed line withholds.
+    rows = read_replay_results(config.replay_results_path)
+    assert len(rows) == 1
+    assert rows[0].outcome == "COMPLETED"
+    assert rows[0].trials == 1
+    assert rows[0].fills == 1
+
+
 def test_run_batch_never_reselects_an_always_blocked_target_within_the_batch(
     tmp_path: Path,
 ) -> None:
