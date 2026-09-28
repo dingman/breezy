@@ -1,0 +1,3 @@
+<!-- Codex read-only output, rollout rollout-2026-09-28T17-36-01-01a0e916-80df-72e2-a36d-1ebfd1504ba7.jsonl -->
+
+I have enough to write the plan now. One nuance matters for the design: I’m not going to recommend changing deadline accounting just to hide deferrals; the evidence says the budget was exceeded by still-unbounded `custom_depth_truncation` work, so the smallest fix is to bound that work and let the existing deadline criterion pass naturally.

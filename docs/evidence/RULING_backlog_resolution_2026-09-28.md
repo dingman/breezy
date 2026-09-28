@@ -14,7 +14,7 @@
 - R4 has no verified powered estimand.
 - R3 is the only path backed by data that already accrues: EDGE-4 reaching ≥300 post-freeze CONFIRM station-days, with the `census_provenance:` line quoted (`EDGE-4_DISPOSITION_2026-09-27.md:20-22`).
 
-**Obligation added (R3-PROJ):** project the R3 accrual date against the 2027-01-25 backstop. If R3 cannot reach 300 before the backstop, the honest outcome is the programme KILL, with Kalshi K-2 as the successor (`KALSHI_K-1…:70-79`). R3-PROJ is analysis only. Per the EDGE backlog insight, it must not compute any statistic on post-09-25 tape.
+**Obligation added (R3-PROJ):** RA-13 already infers that R3 cannot fire before about 2026-11-24 (300 days at 5 station-days/day from 09-26; `RULING_RA-13…:14`, INFERRED), which is before the backstop. R3-PROJ verifies that date against the real accrual rate (venue-skipped days, node-down days). If R3 cannot reach 300 before the backstop, the honest outcome is the programme KILL, with Kalshi K-2 as the successor (`KALSHI_K-1…:70-79`). R3-PROJ is analysis only. Per the EDGE backlog insight, it must not compute any statistic on post-09-25 tape.
 
 **RA-11a:** stays parked. It is only needed if R2, R3 or R4 fires, and it dies with the KILL otherwise.
 
@@ -29,7 +29,7 @@
 | HUNT-1 | WATCH | The requirement stands. Its triggers are unchanged (`RULING_HUNT-1…:34-38`). |
 | THIN-BOOK-REFUSAL | RULE | This is fill-rate and opportunity-cost evidence, not slippage (`RULING_AUD-12a…:42-43`). It must not feed sizing before the AUD-06b gates. |
 | Kalshi sibling | RULE | A post-KILL successor, not a revival path. |
-| LADDER_EV stage 2 | CLOSE | Dead for the pre-backstop path. The stage-1 modules stay. |
+| LADDER_EV stage 2 | PARKED (outside the revival path) | Nothing on the R3 path consumes it. Reopen only if an R3 re-plan names a ladder estimand. The stage-1 modules stay. |
 | G-16 / G-17 | CLOSE | Superseded by the AUD-17 / AUD-03 plans (`AUDIT_2026-09-21/README.md:41,56`). |
 | PREREG v2 residue | CLOSE | No new revival work uses v2 (V2-LOOK-GATE 0287442 refuses v2 look-taking). |
 | EDGE-2-LIVE / EDGE-2-LAG / R-7-IMPL / EXEC SPINE R-7 residue | KEEP-GATED (A1 floor) | Watch for the first post-re-arm AMBIGUOUS order and the first create-path `R7_POSITION_REPORTING_LAG` line. Deterministic tests already cover AC7. |
@@ -61,7 +61,13 @@
 | CF-13, CF-14b | KEEP-GATED (evidence floor) | No live CCA/CCB correction event, and no observed 1-of-N stage-3 failure. |
 | PF-1 | CLOSE | Micro-perf with no measured problem. Reopen on a profile. |
 | BL-10 | BUILD (security review required) | The send-boundary fingerprint still hashes caller-chosen bytes (`submit_chain.py:248-263`). It must fingerprint method, path and serialized body. |
+| AUD-18 | OPEN as the evidence producer | Only sub-item (b), RA-2 d10272b, is closed. AUD-18a / `hypothesis_triage.py` owns the R3 revival count. |
+| EDGE-6 | CLOSE | 6b/6d/6f live; 6c K1 retired in 833bada. The only residue was ING-2-AMEND, now ING-2-AMEND2. |
+| TRADE-ROW-DRIFT / SUP-ADOPT-LOG-GLOB | CLOSE | Merged in be206e0 and d5b688f; the latter verified live at 01:40Z on 09-28. |
+| PROBE-CLASSIFIER-DRIFT | Folded into EDGE-2-MULTIPAGE step 2 | Same trigger (M-4 1b). |
 | GL-4P | CLOSE | Satisfied by the 09-23 MIA evidence pack (`README.md:109-121`). |
+
+**Peer review:** Codex adversarial review r1 (`docs/plans/backlog/RESOLUTION_2026-09-28/RULING_review_codex_r1_2026-09-28.md`) returned ENDORSE-WITH-AMENDMENTS. All amendments are applied above. It found no hard-invariant violation.
 
 ## 3. What remains after this ruling
 
