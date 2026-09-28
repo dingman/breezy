@@ -802,7 +802,7 @@ def build_default_client(*, user_agent: str) -> PublicReadClient:
     transport = NautilusHttpTransport(client=native_client)
     return PolymarketUSHttpClient(
         transport=transport,
-        signer=None,  # type: ignore[arg-type]  -- see docstring: unreachable for get_public
+        signer=None,  # type: ignore[arg-type]  # see docstring: unreachable for get_public
         api_base_url=POLYMARKET_US_API_BASE_URL,
         gateway_base_url=POLYMARKET_US_GATEWAY_BASE_URL,
         logger=Logger("fee-drift-evidence-pull"),

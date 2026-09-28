@@ -222,6 +222,28 @@ extend-select = ["E501"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
+# CF-12: `scripts/` (and `scripts/analysis/`) ships no `__init__.py` --
+# deliberate, matching the rest of this `files` list's implicit-namespace-
+# package convention -- so without this, mypy resolves
+# `scripts/analysis/discovery_set_equality.py` as the bare top-level module
+# `discovery_set_equality` when it is globbed directly here, but as the
+# qualified `scripts.analysis.discovery_set_equality` when it is reached via
+# `tests/unit/test_discovery_set_equality.py`'s own
+# `from scripts.analysis.discovery_set_equality import ...` -- two module
+# identities for one file, which mypy refuses outright ("Source file found
+# twice under different module names"). `explicit_package_bases` makes every
+# module name derive from the nearest `__init__.py`-free root under the
+# current directory (mypy's own resolution for exactly this shape), so both
+# paths agree on `scripts.analysis.discovery_set_equality`. Config-only: it
+# changes how a module is NAMED, not what is type-checked or which errors are
+# reported for it.
+explicit_package_bases = true
+# Names `breezy.*` from `src/breezy/...` relative to THIS base, so
+# `explicit_package_bases` (above) does not ALSO name the same files
+# `src.breezy.*` relative to the current directory -- the two-name collision
+# `explicit_package_bases` alone reproduced for every `src/breezy` module the
+# moment it was turned on.
+mypy_path = "src"
 files = [
     "src/breezy/adapters",
     "src/breezy/normalize",
