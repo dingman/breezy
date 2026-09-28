@@ -98,7 +98,10 @@ from breezy.adapters.polymarket_us.symbology import (
     instrument_id_to_slug,
 )
 from breezy.adapters.polymarket_us.transport import VenueResponse
-from breezy.runtime.component_health_watch import install_resolver_contradiction_alert
+from breezy.runtime.component_health_watch import (
+    install_resolver_contradiction_alert,
+    install_stale_intent_alert,
+)
 from breezy.runtime.health import AlertPayload
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -5826,6 +5829,510 @@ async def test_stale_alert_carries_the_actual_last_failure_kind(
         alerts = client.stale_ambiguous_intent_alerts
         assert len(alerts) == 1
         assert alerts[0]["last_failure_kind"] == "get_exception"
+        await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# FAILURE-KIND-PERSIST (r2/r3, 2026-09-28): a stale-intent CRITICAL that a
+# restart or a crash loop leaves stuck at `last_failure_kind == "none"` gets
+# a SEPARATE follow-up CRITICAL, at most once per intent per process, once a
+# real cause is identified -- see docs/plans/backlog/EDGE_2026-09-27/
+# FAILURE-KIND-PERSIST_plan_r2_2026-09-28.md and its r3 amendments.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_restart_cause_followup_after_the_boot_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T1: a restart's boot pass alerts with "none" (this fresh process has
+    no failure history yet); the cause identified one pass later must reach
+    the surface as a SEPARATE follow-up entry, keyed `f"{id}:cause"`, never
+    overwriting the original -- and never overwritten itself by a LATER
+    kind flip (R3-3, M12). RED: today no follow-up entry ever appears."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    store_path = tmp_path / "exec_state.db"
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        # Process A: arm one with-id AMBIGUOUS intent, backdate its context
+        # past the stale threshold, then "restart" -- releasing the flock --
+        # leaving the OPEN intent + durable resolver context on disk.
+        first_client, order_id, slug, first_latch_cm, _order_events = (
+            await _arm_one_ambiguous_intent(tmp_path)
+        )
+        current = first_client._latch.current_open()
+        assert current is not None
+        intent_id = current.intent_id
+        raw_context = first_client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=first_client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        first_client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", backdated.to_bytes())
+        await first_client._disconnect()
+        first_latch_cm.__exit__(None, None, None)
+
+        # Process B: a fresh client over the SAME durable store, whose boot
+        # pass will find the GET terminal-zero but the activities join
+        # uninterpretable.
+        client, latch_cm = await _build_client_with_custom_loader(
+            tmp_path, store_path=store_path, resolver_instrument_loader=None,
+        )
+        instrument = build_instrument()
+        client._cache.add_instrument(instrument)
+        client._instrument_provider.add(instrument)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await client._connect()  # boot pass only (first_pass_immediate)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1, "the boot pass must alert exactly once, with no cause yet"
+        assert alerts[0]["last_failure_kind"] == "none"
+
+        # One background pass later, the cause identified DURING the boot
+        # pass (activities_uninterpretable) must surface as a follow-up.
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 2, alerts
+        by_key = {a.get("alert_key", a["intent_id"]): a for a in alerts}
+        assert by_key[intent_id]["last_failure_kind"] == "none"
+        assert by_key[f"{intent_id}:cause"]["last_failure_kind"] == "activities_uninterpretable"
+        assert by_key[f"{intent_id}:cause"]["followup"] == "cause"
+
+        # R3-3: flip the GET to raise, run TWO more passes -- the follow-up
+        # entry must not be overwritten by the new kind (M12).
+        del client._private_read._payloads[f"/v1/order/{order_id}"]  # type: ignore[attr-defined]
+        await _run_exactly_one_pass(client)
+        await _run_exactly_one_pass(client)
+
+        assert client._resolver_last_failure_kind[intent_id] == "get_exception"
+        alerts = client.stale_ambiguous_intent_alerts
+        by_key = {a.get("alert_key", a["intent_id"]): a for a in alerts}
+        assert by_key[f"{intent_id}:cause"]["last_failure_kind"] == "activities_uninterpretable"
+
+        await client._disconnect()
+        latch_cm.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_stale_alert_survives_a_crash_loop_faster_than_one_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T2 (crash loop, regression lock): the CRITICAL itself is NEVER
+    deferred, even across three restarts each faster than one resolver pass
+    -- the r1 deferral (option E, REJECTED) would have delayed it. GREEN
+    today (locks in current behaviour); RED under M1 (defer on first
+    sighting)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    store_path = tmp_path / "exec_state.db"
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        first_client, order_id, slug, first_latch_cm, _order_events = (
+            await _arm_one_ambiguous_intent(tmp_path)
+        )
+        current = first_client._latch.current_open()
+        assert current is not None
+        raw_context = first_client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=first_client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        first_client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+        await first_client._disconnect()
+        first_latch_cm.__exit__(None, None, None)
+
+        instrument = build_instrument()
+        for _ in range(3):
+            client, latch_cm = await _build_client_with_custom_loader(
+                tmp_path, store_path=store_path, resolver_instrument_loader=None,
+            )
+            client._cache.add_instrument(instrument)
+            client._instrument_provider.add(instrument)
+            client._private_read._payloads[  # type: ignore[attr-defined]
+                f"/v1/order/{order_id}"
+            ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+
+            await client._connect()  # boot pass only, then this "process" dies
+
+            surface = client.stale_ambiguous_intent_alerts
+            assert len(surface) == 1, "every restart's boot pass must alert, never defer"
+
+            sink = _RecordingAlertSink()
+            install_stale_intent_alert(
+                client._msgbus,
+                stale_alerts=lambda c=client: c.stale_ambiguous_intent_alerts,
+                sink=sink,
+            )
+            _tick_health_watch_topic(client._msgbus)
+            assert len(sink.payloads) == 1, sink.payloads
+            assert sink.payloads[0].severity == "CRITICAL"
+
+            await client._disconnect()
+            latch_cm.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_failure_kind_resets_to_none_after_a_get_that_maps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T3: a GET that eventually maps clears a stale `get_exception` kind
+    back to "none" -- the guarded reset (ARCH B1). RED: today the kind
+    stays `get_exception` forever (no reset exists)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        # Pass 1: no payload wired -- the GET raises.
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[current.intent_id] == "get_exception"
+
+        # Pass 2: a NEW (non-terminal) GET maps cleanly.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+        await _run_exactly_one_pass(client)
+
+        assert client._resolver_last_failure_kind[current.intent_id] == "none"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_failure_kind_survives_a_join_the_guard_never_re_examines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T5 (ARCH B1): pass 1 records `activities_uninterpretable`; pass 2's
+    GET maps (a successful GET) but the activities READ ITSELF fails, so
+    the join is `None` and neither the uninterpretable-row branch nor the
+    clean-join clear ever re-examines the kind -- the guarded reset at the
+    successful-GET point is the ONLY thing standing between "unconditional"
+    and "correct" here. Passes today (nothing resets the kind at all); RED
+    under M8 (an unconditional reset would wipe it to "none" on pass 2,
+    even though the join never said the cause went away)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+        await _run_exactly_one_pass(client)
+        assert (
+            client._resolver_last_failure_kind[current.intent_id] == "activities_uninterpretable"
+        )
+
+        # Pass 2: the SAME GET maps (success), but the activities READ
+        # itself raises -- `_order_trade_activity` returns `None` (~3244-
+        # 3255), so neither join branch below the guarded reset ever runs.
+        del client._private_read._payloads[  # type: ignore[attr-defined]
+            PORTFOLIO_ACTIVITIES_PATH
+        ]
+        await _run_exactly_one_pass(client)
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+
+        # Pass 3: the stale alert must carry the cause the guard preserved.
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "activities_uninterpretable"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_failure_kind_clears_to_none_on_a_clean_but_incomplete_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T6: a CLEAN join (no uninterpretable rows) -- even one that is
+    merely INCOMPLETE, never reaching eof -- clears a stale
+    `activities_uninterpretable` kind. RED under M9 (no clean-join
+    clear)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+        await _run_exactly_one_pass(client)
+        assert (
+            client._resolver_last_failure_kind[current.intent_id] == "activities_uninterpretable"
+        )
+
+        # Pass 2: the SAME terminal-zero GET, but a clean activities page
+        # that never reaches eof (no uninterpretable rows, incomplete).
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [],
+        }
+        await _run_exactly_one_pass(client)
+
+        assert client._resolver_last_failure_kind[current.intent_id] == "none"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_no_followup_when_the_stale_alert_already_carries_the_current_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T7: the SAME kind recorded before AND after the stale alert first
+    fires must never produce a follow-up -- only a DIFFERENT kind does. RED
+    under M6 (drop the differs-from-first-kind check), which would flap a
+    follow-up on every repeated `get_exception`."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        # Pass 1: no payload wired -- the GET raises, recording get_exception.
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[current.intent_id] == "get_exception"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+
+        # The stale pass, then two more -- the GET keeps raising the SAME
+        # kind every time.
+        await _run_exactly_one_pass(client)
+        await _run_exactly_one_pass(client)
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1, alerts
+        assert alerts[0]["last_failure_kind"] == "get_exception"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_no_cause_followup_ever_appears_when_the_last_kind_is_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T8 (rebuilt, R3-1): a stale alert carrying "get_exception" whose
+    VERY NEXT pass resets the kind to "none" must never grow a `:cause`
+    entry, on that pass or any later one. RED under M7 (drop the not-none
+    check)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        intent_id = current.intent_id
+
+        # Pass 1: the GET raises.
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[intent_id] == "get_exception"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", backdated.to_bytes())
+
+        # Pass 2: the stale alert fires with "get_exception"; the GET now
+        # maps to NEW, resetting the kind to "none" this SAME pass.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "get_exception"
+        assert client._resolver_last_failure_kind[intent_id] == "none"
+
+        # Pass 3: no `:cause` entry, ever.
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1, alerts
+        assert f"{intent_id}:cause" not in {a.get("alert_key", a["intent_id"]) for a in alerts}
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_retire_pops_the_cause_followup_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T9 (rebuilt, R3-2): `_retire` must clear the `:cause` follow-up
+    entry exactly like the original stale entry -- a later intent reaching
+    the same age must not inherit a dead one's bookkeeping. RED under M5
+    (`_retire` does not pop `:cause`)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        intent_id = current.intent_id
+
+        # Pass 1: a NEW (non-terminal) GET maps cleanly -- kind is "none".
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[intent_id] == "none"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", backdated.to_bytes())
+
+        # Pass 2: the stale alert fires with "none"; the GET now raises.
+        del client._private_read._payloads[f"/v1/order/{order_id}"]  # type: ignore[attr-defined]
+        await _run_exactly_one_pass(client)
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "none"
+        assert client._resolver_last_failure_kind[intent_id] == "get_exception"
+
+        # Pass 3: the follow-up appears.
+        await _run_exactly_one_pass(client)
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 2, alerts
+        assert f"{intent_id}:cause" in {a.get("alert_key", a["intent_id"]) for a in alerts}
+
+        # Make the GET terminal (zero-fill) and let it retire.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        await _run_resolver_passes(client, count=1)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.RETIRED
+        assert client.stale_ambiguous_intent_alerts == ()
         await client._disconnect()
 
 

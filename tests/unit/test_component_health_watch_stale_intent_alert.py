@@ -80,8 +80,10 @@ def _alert(
     venue_order_id: str = "vo-1",
     age_minutes: str = "16",
     last_failure_kind: str = "get_exception",
+    alert_key: str | None = None,
+    followup: str | None = None,
 ) -> dict[str, str]:
-    return {
+    payload = {
         "severity": "CRITICAL",
         "event": "open_intent_stale",
         "site": "global",
@@ -90,6 +92,11 @@ def _alert(
         "age_minutes": age_minutes,
         "last_failure_kind": last_failure_kind,
     }
+    if alert_key is not None:
+        payload["alert_key"] = alert_key
+    if followup is not None:
+        payload["followup"] = followup
+    return payload
 
 
 def test_the_watch_subscribes_the_shared_component_state_topic() -> None:
@@ -189,3 +196,98 @@ def test_a_failing_sink_never_unwinds_into_the_message_bus() -> None:
     install_stale_intent_alert(msgbus, stale_alerts=lambda: (_alert(),), sink=_BrokenSink())
 
     _tick(msgbus)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# FAILURE-KIND-PERSIST (r2/r3, 2026-09-28): a follow-up entry shares its
+# `intent_id` with the original stale entry but carries a DIFFERENT
+# `alert_key` -- the watch's dedupe/forget bookkeeping must key on
+# `alert_key` (falling back to `intent_id` for a legacy entry with none), or
+# a follow-up is either forgotten on every poll (never emitted) or silently
+# folded into the original's own dedupe entry (never emitted either).
+# ---------------------------------------------------------------------------
+
+
+def test_two_entries_with_the_same_intent_id_but_different_alert_keys_both_emit() -> None:
+    """W1: the original stale entry and its `:cause` follow-up are two
+    DISTINCT emits, even though `intent_id` is identical on both. RED under
+    M11 (keying the emit dedupe on `intent_id` alone)."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    surface = (
+        _alert(intent_id="intent-1"),
+        _alert(
+            intent_id="intent-1",
+            alert_key="intent-1:cause",
+            last_failure_kind="activities_uninterpretable",
+            followup="cause",
+        ),
+    )
+    install_stale_intent_alert(msgbus, stale_alerts=lambda: surface, sink=sink)
+
+    _tick(msgbus)
+
+    assert len(sink.payloads) == 2, sink.payloads
+
+
+def test_three_polls_of_the_same_two_keyed_entries_still_emit_exactly_two() -> None:
+    """W2: `current_ids` must also key on `alert_key`, not `intent_id` --
+    otherwise the SECOND identical `intent_id` in one poll's surface makes
+    the dedupe set think both entries are already alerted before either one
+    is checked, or forgets the first every poll. RED under M10 (keying
+    `current_ids` on `intent_id` alone)."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    surface = (
+        _alert(intent_id="intent-1"),
+        _alert(
+            intent_id="intent-1",
+            alert_key="intent-1:cause",
+            last_failure_kind="activities_uninterpretable",
+            followup="cause",
+        ),
+    )
+    install_stale_intent_alert(msgbus, stale_alerts=lambda: surface, sink=sink)
+
+    _tick(msgbus)
+    _tick(msgbus)
+    _tick(msgbus)
+
+    assert len(sink.payloads) == 2, sink.payloads
+
+
+def test_a_legacy_entry_with_no_alert_key_still_dedupes_by_intent_id() -> None:
+    """W3: every entry this module has ever emitted before FAILURE-KIND-
+    PERSIST carries no `alert_key` at all -- `_alert_key` must fall back to
+    `intent_id` for it, exactly like before."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    surface: tuple[dict[str, str], ...] = (_alert(intent_id="intent-1"),)
+    install_stale_intent_alert(msgbus, stale_alerts=lambda: surface, sink=sink)
+
+    _tick(msgbus)
+    _tick(msgbus)
+
+    assert len(sink.payloads) == 1, sink.payloads
+
+
+def test_the_followup_detail_carries_the_cause_marker() -> None:
+    """W4: a follow-up's rendered detail names itself as one, so an
+    operator reading two CRITICALs for one intent is not left guessing
+    whether the second is a duplicate or a distinct incident."""
+    msgbus = _new_bus()
+    sink = _RecordingSink()
+    surface: tuple[dict[str, str], ...] = (
+        _alert(
+            intent_id="intent-1",
+            alert_key="intent-1:cause",
+            last_failure_kind="activities_uninterpretable",
+            followup="cause",
+        ),
+    )
+    install_stale_intent_alert(msgbus, stale_alerts=lambda: surface, sink=sink)
+
+    _tick(msgbus)
+
+    assert len(sink.payloads) == 1, sink.payloads
+    assert "cause identified after the first alert" in sink.payloads[0].detail

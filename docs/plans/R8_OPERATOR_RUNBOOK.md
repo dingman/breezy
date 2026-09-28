@@ -536,6 +536,10 @@ The 17:05Z supervisor self-check (commit a858b93) automatically verifies items 1
 If an intent is still in OPEN state at the 16:50Z launch window, the supervisor **refuses** launch with
 `REFUSE_INTENT_OPEN`. A CRITICAL `open_intent_stale` alert fires when an intent is unresolved for >15 minutes.
 The resolver backs off 5→300 s polling; failure cases (GET 5xx, timeout, malformed response) keep it AMBIGUOUS.
+FAILURE-KIND-PERSIST (2026-09-28): an operator can see a SECOND CRITICAL `open_intent_stale` for the SAME
+intent one pass later, with detail suffix "cause identified after the first alert" — this is the same
+still-open condition, now carrying the resolver failure kind the first alert could not (a fresh process's
+first pass has no failure history yet). It is not a new or distinct incident.
 
 **Recovery:**
 - **Node not live:** Use `breezy-clear-submit-intent --yes --resolution <order-id=ID or no-order-exists> --evidence <positions-file>`.

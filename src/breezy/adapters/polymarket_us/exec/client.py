@@ -1776,6 +1776,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # by whole-value reassignment (`x = x | {...}` / dict-unpacking),
         # never `.add`/`.update`, for the same E0-NOSEND-RESOLVER reason.
         self._resolver_stale_alerted_intent_ids: frozenset[str] = frozenset()
+        # FAILURE-KIND-PERSIST (r2/r3): `_resolver_stale_alert_details` now
+        # holds up to TWO entries per intent id -- `id` (the first stale
+        # sighting, set above) and `f"{id}:cause"` (a follow-up written only
+        # once, only when a real cause is later identified; see the block
+        # after the stale check below). Still mutated ONLY by whole-value
+        # reassignment, for the same E0-NOSEND-RESOLVER reason.
         self._resolver_stale_alert_details: dict[str, Mapping[str, str]] = {}
         # EDGE-2 slice D (AC4): the health-surface bookkeeping for a
         # `resolver_evidence_contradiction` CRITICAL -- same shape and same
@@ -2318,10 +2324,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         `open_intent_stale` `AlertPayload` (intent_id, venue_order_id, age
         in minutes, last failure kind) is built from this tuple.
 
-        One entry per currently-latched intent id -- `_retire` (the single
-        chokepoint every resolution path runs through) drops the entry the
-        moment the intent retires, so a LATER intent reaching the same age
-        surfaces again.
+        Up to TWO entries per currently-latched intent id: the first stale
+        sighting (`last_failure_kind` as of that pass, "none" if this
+        process has not yet classified a failure for it), and -- at most
+        once, one pass later -- a follow-up carrying the cause once this
+        process identifies one (FAILURE-KIND-PERSIST). An operator can
+        therefore see two CRITICALs for one intent. `_retire` (the single
+        chokepoint every resolution path runs through) drops BOTH entries
+        the moment the intent retires, so a LATER intent reaching the same
+        age surfaces again.
         """
         return tuple(self._resolver_stale_alert_details.values())
 
@@ -2556,6 +2567,38 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         "last_failure_kind": last_failure_kind,
                     },
                 }
+            # FAILURE-KIND-PERSIST (r2/r3): a follow-up entry, written AT
+            # MOST ONCE per intent per process, once a real cause is later
+            # identified for an already-alerted intent. `last_failure_kind`
+            # here is deliberately the value THIS process recorded on an
+            # EARLIER pass (never this pass's own classification, which has
+            # not run yet) -- the same one-pass-behind read the stale block
+            # above already uses. Plain `in`/`!=`/subscript/f-string/dict-
+            # unpacking only: no new callee (E0-NOSEND-RESOLVER).
+            if (
+                context.intent_id in self._resolver_stale_alerted_intent_ids
+                and context.intent_id in self._resolver_last_failure_kind
+                and self._resolver_last_failure_kind[context.intent_id] != "none"
+                and self._resolver_last_failure_kind[context.intent_id]
+                != self._resolver_stale_alert_details[context.intent_id]["last_failure_kind"]
+                and f"{context.intent_id}:cause" not in self._resolver_stale_alert_details
+            ):
+                self._resolver_stale_alert_details = {
+                    **self._resolver_stale_alert_details,
+                    f"{context.intent_id}:cause": {
+                        "severity": "CRITICAL",
+                        "event": "open_intent_stale",
+                        "site": "global",
+                        "intent_id": context.intent_id,
+                        "venue_order_id": context.venue_order_id,
+                        "age_minutes": f"{stale_age_ns // 60_000_000_000}",
+                        "last_failure_kind": self._resolver_last_failure_kind[
+                            context.intent_id
+                        ],
+                        "alert_key": f"{context.intent_id}:cause",
+                        "followup": "cause",
+                    },
+                }
             instrument = self._cache.instrument(InstrumentId.from_str(context.instrument_id))
             if instrument is None and self._resolver_instrument_loader is not None:
                 # 2026-09-24 fix: the OPEN intent's instrument may belong to
@@ -2680,6 +2723,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # is reachable and the shape still parses, which is exactly what
             # the backoff exists to detect the absence of.
             self._resolver_consecutive_failures = 0
+            # FAILURE-KIND-PERSIST (r2/r3, ARCH B1): a successful GET means
+            # THIS pass's evidence supersedes whatever kind an earlier pass
+            # recorded -- reset to "none" UNLESS the recorded kind is
+            # `activities_uninterpretable`, which this pass's own join
+            # (below) has not been re-examined yet and may still hold; the
+            # clean-join clear right after the join call is the one place
+            # that kind is reset. Plain `in`/`!=`/subscript: no new callee.
+            if (
+                context.intent_id not in self._resolver_last_failure_kind
+                or self._resolver_last_failure_kind[context.intent_id]
+                != "activities_uninterpretable"
+            ):
+                self._resolver_last_failure_kind[context.intent_id] = "none"
 
             if report.order_status is OrderStatus.PARTIALLY_FILLED:
                 # A LIVE state: the order can still receive more fills or
@@ -2774,6 +2830,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     self._resolver_last_failure_kind[context.intent_id] = (
                         "activities_uninterpretable"
                     )
+                elif join is not None and not join.uninterpretable_rows:
+                    # FAILURE-KIND-PERSIST (r2/r3, ARCH B1): a CLEAN join
+                    # (whether or not it is COMPLETE -- :2809 below decides
+                    # that separately) clears a stale
+                    # `activities_uninterpretable` kind the guarded reset
+                    # above deliberately left alone.
+                    self._resolver_last_failure_kind[context.intent_id] = "none"
             trade_found = join is not None and join.trade_count >= 1
             evidence_blocks_zero_fill = (
                 context.create_fill_evidence in _CREATE_FILL_EVIDENCE_BLOCKS_ZERO_FILL
@@ -5113,6 +5176,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             intent_id
         }
         self._resolver_stale_alert_details.pop(intent_id, None)
+        # FAILURE-KIND-PERSIST (r2/r3): the follow-up entry (item 6 in the
+        # file-by-file plan), same clearing discipline.
+        self._resolver_stale_alert_details.pop(f"{intent_id}:cause", None)
         # EDGE-2 slice D (AC4): same clearing discipline for the
         # contradiction health surface -- a no-op when `intent_id` never
         # contradicted.
