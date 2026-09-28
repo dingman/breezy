@@ -52,6 +52,7 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.runtime.quote_tape_ingest_cli import (
     CONVERTED,
@@ -63,6 +64,7 @@ from breezy.runtime.quote_tape_ingest_cli import (
     EXIT_USAGE,
     FILE_MARKER_PREFIX,
     MARKER_PREFIX,
+    _extend_overlapping_stream,
     default_convert,
     ingest_instance,
     run,
@@ -638,7 +640,7 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
 
         assert code == EXIT_OK
         assert self._extend_dedupe_lines(out) == [
-            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
+            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type= flat_root=none"
         ]
 
     def test_a_second_run_does_not_inherit_a_prior_runs_counts(
@@ -658,7 +660,7 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
 
         assert code == EXIT_OK
         assert self._extend_dedupe_lines(out) == [
-            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="
+            "extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type= flat_root=none"
         ]
 
     def test_the_line_is_counts_only_and_never_carries_an_instrument_id(
@@ -682,6 +684,66 @@ class TestExtendDedupeSummaryLineIsLoggedOncePerRun:
         lines = self._extend_dedupe_lines(out)
         assert len(lines) == 1
         assert INSTANCE not in lines[0]
+
+
+class TestByTypeShowsDepthTruncationAfterARealExtend:
+    """ING-2-AMEND2 plan r1 test 4: a real EXTEND over ``DepthTruncation``
+    rows, sharing a window with another instrument's already-landed rows,
+    must dispatch through the filtered path and show up in the summary
+    line's ``by_type`` as ``custom_depth_truncation:<n>/0`` -- RED on
+    today's code, which dispatches this type unfiltered
+    (``custom_depth_truncation:0/<n>``, matching the 09-28 09:45Z production
+    evidence cited by the plan).
+    """
+
+    def test_by_type_shows_the_filtered_count_after_a_real_extend_run(
+        self, tmp_path: Path
+    ) -> None:
+        """The already-landed rows are seeded with ``write_data`` (per-instrument
+        directories), never native ``convert_stream_to_data``: confirmed
+        empirically (ING-2-AMEND2 code review) that an ISOLATED native
+        conversion writes ``DepthTruncation`` FLAT even for a single
+        instrument -- ``DepthTruncation``'s identifier is always ``None`` to
+        native, regardless of instrument count (no schema metadata, and the
+        recorder's ``live/<instance>/`` layout never matches native's own
+        per-file path fallback). That is a real condition production can
+        hit, not just a test artifact; it is guarded (never a duplicate,
+        `test_extend_dedupe_filtered.py`'s T-FLAT-GUARD section) and now
+        logged (`test_flat_root_fallback_logs_a_warning_and_the_summary_line_names_the_type`).
+        Seeding via ``write_data`` here simply keeps THIS test's fixture
+        free of that fallback, so it isolates the ``by_type`` claim instead
+        of re-proving the flat-root guard.
+        """
+        target_id = InstrumentId.from_str("EUR/USD.POLYUS")
+        other_id = InstrumentId.from_str("OTHEXT/USD.SIM")
+        base_ts = 1_000_000_000
+        catalog = ParquetDataCatalog(str(tmp_path))
+
+        # Already landed: the target instrument's first 5 rows, plus an
+        # OTHER instrument's rows sharing the SAME window the target
+        # instance's EXTEND chunk below will occupy.
+        catalog.write_data([_depth_truncation(target_id, base_ts + i) for i in range(5)])
+        catalog.write_data([_depth_truncation(other_id, base_ts + i) for i in range(5)])
+
+        instance_dir = tmp_path / "live" / INSTANCE
+        path = instance_dir / "custom_depth_truncation_0.feather"
+        # The instance's feather stream has grown past what was already
+        # landed -- the ING-1 non-disjoint shape EXTEND exists to handle.
+        _write_typed_ipc_stream(
+            path,
+            [_depth_truncation(target_id, base_ts + i) for i in range(20)],
+            DepthTruncation,
+            close=True,
+        )
+
+        ingest_cli_module.extend_dedupe_counters.reset()
+        outcome = _extend_overlapping_stream(catalog, INSTANCE, DepthTruncation, "live")
+
+        assert outcome == CONVERTED
+        line = ingest_cli_module.extend_dedupe_counters.summary_line()
+        assert "custom_depth_truncation:1/0" in line, (
+            f"expected a single filtered chunk for custom_depth_truncation, got: {line!r}"
+        )
 
 
 class TestRealConsoleEntrypointDelivery:
@@ -719,7 +781,7 @@ class TestRealConsoleEntrypointDelivery:
         lines = [
             line for line in result.stdout.splitlines() if line.startswith("extend_dedupe:")
         ]
-        assert lines == ["extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type="]
+        assert lines == ["extend_dedupe: chunks=0 filtered=0 unfiltered=0 by_type= flat_root=none"]
 
 
 class TestReEmittedInstrumentDefinitionsStillLand:
@@ -1206,6 +1268,17 @@ def _mark_price(index: int) -> MarkPriceUpdate:
         value=Price.from_str("1.00000"),
         ts_event=1_000_000_000 + index,
         ts_init=1_000_000_000 + index,
+    )
+
+
+def _depth_truncation(instrument_id: InstrumentId, ts: int) -> DepthTruncation:
+    return DepthTruncation(
+        instrument_id=instrument_id,
+        bid_levels_seen=12,
+        ask_levels_seen=14,
+        levels_dropped=2,
+        ts_event=ts,
+        ts_init=ts,
     )
 
 
