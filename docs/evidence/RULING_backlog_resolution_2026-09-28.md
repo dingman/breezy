@@ -14,7 +14,12 @@
 - R4 has no verified powered estimand.
 - R3 is the only path backed by data that already accrues: EDGE-4 reaching ≥300 post-freeze CONFIRM station-days, with the `census_provenance:` line quoted (`EDGE-4_DISPOSITION_2026-09-27.md:20-22`).
 
-**Obligation added (R3-PROJ):** RA-13 already infers that R3 cannot fire before about 2026-11-24 (300 days at 5 station-days/day from 09-26; `RULING_RA-13…:14`, INFERRED), which is before the backstop. R3-PROJ verifies that date against the real accrual rate (venue-skipped days, node-down days). If R3 cannot reach 300 before the backstop, the honest outcome is the programme KILL, with Kalshi K-2 as the successor (`KALSHI_K-1…:70-79`). R3-PROJ is analysis only. Per the EDGE backlog insight, it must not compute any statistic on post-09-25 tape.
+**Obligation added (R3-PROJ):** RA-13 already infers that R3 cannot fire before about 2026-11-24 (300 days at 5 station-days/day from 09-26; `RULING_RA-13…:14`, INFERRED), which is before the backstop. R3-PROJ verifies that date against the real accrual rate (venue-skipped days, node-down days).
+
+**R3-PROJ result (18:55Z, trading-bot-architect ×2):**
+- A first pass read 2.5 SUFFICIENT/day (landing 2027-01-24). That was a **measurement artifact**: all 10 non-SUFFICIENT post-freeze cells had `window_complete=false`, because the 15:50Z census always includes today's and tomorrow's open windows.
+- The closed post-freeze days (09-26, 09-27) are 10/10 SUFFICIENT, which is 5/day, so the ceiling is about 2026-11-25. The 09-28 reboot cost 0 station-days.
+- CONFIRM additionally needs ≥1 take. The with-takes fraction f is being estimated from PRE-freeze data only. Until then, R3 stays the chosen path. If R3 cannot reach 300 before the backstop, the honest outcome is the programme KILL, with Kalshi K-2 as the successor (`KALSHI_K-1…:70-79`). R3-PROJ is analysis only. Per the EDGE backlog insight, it must not compute any statistic on post-09-25 tape.
 
 **RA-11a:** stays parked. It is only needed if R2, R3 or R4 fires, and it dies with the KILL otherwise.
 
@@ -72,6 +77,6 @@
 ## 3. What remains after this ruling
 
 - **Build:** RA-9f Path A, FAILURE-KIND durable, ING-2-AMEND2, BL-10, CF-5b, CF-6, CF-11, CF-12, T-6.
-- **Analysis:** R3-PROJ, RECON-MIA-0913.
+- **Analysis:** R3-PROJ (f estimate + census-consumer `window_complete` audit), RECON-MIA-0913 (a false positive; the exit-study fix is being built).
 - **Run:** AUD-07 20k drain, AUD-10b Stage 0 / R3-5 and the 10G explanation.
 - **Watch or gated:** everything else.
