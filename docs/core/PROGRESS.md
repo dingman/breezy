@@ -34,7 +34,7 @@ Everything else is build-side.
 
 ---
 
-## BACKLOG — verified open set (re-synced 2026-09-26 16:35Z against merges, evidence and host)
+## BACKLOG — verified open set (re-synced 2026-09-28 18:00Z; every item dispositioned by `docs/evidence/RULING_backlog_resolution_2026-09-28.md`)
 
 **Binding on EVERY item.** Never set `allow_short=True`; never weaken `BacktestOrderGuard` or any
 safety, settlement, contract or NO-SEND firewall test (widen exact sets by one reviewed row, L-12);
@@ -43,42 +43,37 @@ only via a ruling under `docs/evidence/`. L-1 null-hypothesis verdict per increm
 via `systemd-run --user` (L-26); worktree commands need `PYTHONPATH=<wt>/src`; never `uv`/`pip` from a
 worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plans: `docs/plans/backlog/AUDIT_2026-09-21/`.
 
+**Revival path (RA-13):** R3 only, as an evidence-gated watch (EDGE-4 ≥300 post-freeze CONFIRM station-days + `census_provenance:`); R2 physically absent, R4 unestimated. Programme KILL backstop 2027-01-25; Kalshi K-2 is the post-KILL successor.
+
+### BUILD (plan → peer review → TDD → gate → merge)
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| EDGE-2 | HIGH | LIVE 09-27 16:50Z node (log breezy-trade-20260927T165036Z): `resolver: zero-fill corroboration=activities_v1`, `fee_drift_probe outcome=AGREE wire=0.0695` (EDGE-1; 09-26 was CRITICAL every 2 h), v4 halt read `source=legacy_attributed` (EDGE-3). Open: EDGE-2-LIVE (first post-re-arm AMBIGUOUS), EDGE-2-LAG, EDGE-2-MULTIPAGE, EDGE-2-REFACTOR; pre-existing `InvalidStateTrigger STOPPED->START_COMPLETED` ×4 per boot on halted strategies (also 09-26) | `AMBIGUOUS_ORDER_2026-09-23_MIA/README.md` |
-| EDGE-6 | LOW | 6b/6d/6f LIVE, 6c K1 RETIRED (833bada, host C3 done). No open work beyond ING-2-AMEND | `EDGE-6…r2` |
-| EDGE-5 | CRIT | RA-2/RA-3/RA-8b/RA-9c/RA-9e merged (inert); RA-5a VERIFIED-ISOLATED. RA-9 UNDERPOWERED_NOT_REGISTERED (5b1e3fb). **RA-13 PARTIAL (79923e5): trigger-4 path KILLED (RA-9b/RA-10/RA-9c2 CLOSED); programme KILL backstop 2027-01-25 unless R2 sub-degree obs / R3 EDGE-4 revival (+§6.6 conjunction, B-1) / R4 new powered estimand; RA-11a PARKED.** K-1 memo DONE f991051 (17 candidate new stations, 0 admissible today, 11 triage prerequisites). RA-13-FW CLEAN + FW2 verified (exit-window study max date 09-22; 0 station-days forfeited); RA-2b MERGED; **LEDGER-V3 MERGED** (RA-9d ruled per-record horizon {120,180} + RA-8c re_arm_gating ≤0.025 per A-3a; v3 look-taking REFUSED until RA-9f); open: **RA-9f** tolling (flip `HORIZON_TOLLING_LANDED`), Path A record | `RULING_RA-13_programme_kill_2026-09-27.md` |
-| AUD-12 | HIGH | 12a RULED: retain 0.01 as a conservative qty-1 allowance (93dc12f). 12b = EDGE-1, live at respawn. AUD-12 lands only when the RA-3 flag is flipped by its own ruling | `RULING_AUD-12a_slippage_allowance_2026-09-27.md` |
-| ING-2 | HIGH | S3a+S3b merged and LIVE (S3b 0974667, chunked EXTEND). Owed: observe the first EXTEND-path ingest run after the 09-27 09:00Z rotation (journal `ingested …` not all `skipped-already-converted`); if its peak ≪ 12G, remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. 19:15Z run (3.4G) converted nothing — not evidence. Residual: deferred units have no alert | `ING-2_S3_plan_r2_2026-09-26.md` |
-| ING-2-AMEND | HIGH | 09-27 09:45Z post-rotation conversion peaked at rss 7374 MB / 773 s (FAILED the removal check). **ING-2-RSS FIXED + LIVE**: guarded identifier-filtered EXTEND dedupe for tick types (d37b6e6; behavioural RED ΔRSS 62664 KiB vs 0) + stdout `extend_dedupe:` line (0607b7f; seen in the journal at 11:45Z). **Drop-in removal criterion:** first post-rotation run (~09-28 09:45Z) whose `extend_dedupe:` line shows chunks>0 with cgroup memory peak ≤2G, elapsed ≤600 s and deferred_instances=0 → remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. Residual: sibling-EXTEND same-key race (covered by A8) | `EDGE_2026-09-27/ING-2-RSS_plan_r2_delta_2026-09-27.md` |
-| AUD-07 | HIGH | seg-0927a INCOMPLETE (exit 3: cal_b cell 47 deferred at cutoff; host contended by test gates). RESUME armed `breezy-aud07-m1c-seg-0928a` 09-28 02:10Z (cell-resumable). **No full test gates 02:10–08:40Z.** Then CAL-c → cal_check → 20k → 80k → `--final` → AC7 ruling → base §7 steps 7, 7b, 8 | `RULING_aud07_m1c_eps_k_decision_rule_2026-09-26.md` |
-| AUD-02 | MED | WP-D1 live; 09-26 16:52Z timer run failed pre-fix (`-m` fix 2e109ec merged later, unit is a symlink — 09-27 run is the first real check); 17:29Z rerun OK. A0 fee-evidence earliest close 09-30; DoD 10 coordinator block / Amendment C pointer | completion plan §2, §5 |
-| AUD-10b | MED | 19/20 PASS; C12 = the 09-28 15:50Z replay. REPLAY-BIGINST MERGED f205349 (object-free column-projected spans; census peak no longer scales with instance size, L-53). TEMPORARY drop-in `breezy-replay-daily.service.d/zz-memory-containment-TEMPORARY.conf` (10G/12G) stays until (1) Stage 0 conversion-alone peak <2.5G at 3G/4G, (2) R3-5 old-vs-new byte-diff on a pinned hardlinked snapshot is clean, (3) one 15:50Z run completes at 3G/4G | `REPLAY-BIGINST_plan_r2_delta_2026-09-27.md` |
-| AUD-18 | MED | (b) = RA-2 MERGED d10272b (schema v2; the 3 v1 lines byte-identical; binding predicate False for every live record) | AUD-18 plan amendment |
-| FU-8b-DEPLOY | LOW | Merged 150c10c; live on next node respawn (never kill a live node to deploy). Proof: node log FILE shows `refusal re-poll timer armed name=breezy-refusal-repoll interval_s=60`, then `refusal re-poll alive … ticks=60` hourly | FU-8b plan r2 |
-| R-7-IMPL | LOW | Confirm the first `R7_POSITION_REPORTING_LAG` line after a create-path fill — NOT evaluable while the A1 halt is set (no fills possible) | `RULING_R-7_position_reporting_lag_2026-09-26.md` |
-| SP-5b | LOW/DEFERRED | Coordinator ruling (plan doc addendum): build before the next champion/family registration, with the two trading-bot-architect fixes (exclude `gs_boundary_*.json` from AC-11; restart-race test) | `NIGHT_2026-09-26/SP-5b_plan_r1_2026-09-26.md` |
-| HUNT-1 | CRIT/GATED | Requirement stands (operator, 9ddcb8b); nothing built until a re-open trigger fires. Never treat as moot | `RULING_HUNT-1_all_hours_hunting_2026-09-26.md` |
-| AUD-06b | BLOCKED | Needs an AUD-18 CONFIRMED edge + newly registered family | AUD-06b |
-| FOLLOW-UPS 09-27 | LOW | MERGED 09-27: NOTIFIER-IMPORT-ISOLATION 0c4d9bb (live at next respawn); EDGE-2-MULTIPAGE step 1 60963a6 (step 2 probe DEFERRED until the `traversed N pages` INFO line or ≥80 activities); V2-LOOK-GATE 0287442. OPEN: PATH-B-SOURCE-GATE PARKED (flag False = fail-closed; reopen on RA-13 R2/R3/R4, any move to flip RA-9f, a candidate-replay plan, or the RA-3/AUD-12 flip; a `family_id` join key needs a signed RA-9 amendment); TRADE-ROW-DRIFT MERGED be206e0 (uninterpretable TRADE row → read INCOMPLETE + id cross-check; stale CRITICAL names `activities_uninterpretable`); FAILURE-KIND-PERSIST MERGED 0297b16 09-28 (one-time cause follow-up CRITICAL + guarded reset; gate green 02:46Z; live at next respawn; kind is still in-memory, lost on restart); PROBE-CLASSIFIER-DRIFT folded into EDGE-2-MULTIPAGE Step 2 (M-4 1b); SUP-ADOPT-LOG-GLOB MERGED d5b688f, verified live 01:40Z; EDGE-2-REFACTOR DEFERRED (step 0 G1–G14 MERGED 77ef02c); THIN-BOOK-REFUSAL (winning-rung level-0 median 0.58 < qty 1). **AUD04-FRESH: verify the 09-28 15:20Z exit-study log shows the AUD-04 reconciliation NOT SKIPPED** | `docs/plans/backlog/EDGE_2026-09-27/` |
+| ING-2-AMEND2 | HIGH | 09-28 09:45Z removal check FAILED (chunks=324, peak 6G, 610 s, deferred_instances=45); TEMPORARY ingest drop-in stays. Diagnose + bound the path that still defers | ruling §2 |
+| BL-10 | HIGH | Send-boundary fingerprint hashes caller-chosen bytes (`submit_chain.py:248-263`); fingerprint method+path+serialized body; security review | ruling §2 |
+| FAILURE-KIND-DURABLE | MED | Persist last failure kind with the durable ambiguous intent; restart keeps it | `FAILURE-KIND-PERSIST_plan_r2` |
+| RA-9f-A | MED | Zero-look `UNDERPOWERED_NOT_REGISTERED` registrar for `H-OFFWINDOW-T4-2026-09`; do NOT flip `HORIZON_TOLLING_LANDED` | `RULING_RA-9…:108,121-138` |
+| SP-5b | MED | Build now (prospective trigger) with both architect fixes | `NIGHT_2026-09-26/SP-5b_plan_r1` |
+| HALT-FSM | LOW | Halted strategy emits `InvalidStateTrigger STOPPED->START_COMPLETED` ×4/boot; stop cleanly, never arm | `continuous_strategy.py:883-914` |
+| CF-5b / CF-6 / T-6 | LOW | chronic-UNREADABLE deduped alert; live-test contact from env; stale `node_config.py:11-14` summary | ruling §2 |
+| CF-11 / CF-12 | LOW | `src/` format (105 files, one mechanical commit); mypy 2 collection blockers then re-measure (ruff 84) | ruling §2 |
 
+### RUN / ANALYSE
+| ID | Open work (exact) |
+|---|---|
+| AUD-07 | seg-0928a exit 0 but 32 cells in `20k/DEFERRED`; drain 20k in a gate-free night window; never advance to 80k while DEFERRED non-empty; then 80k → `--final` → AC7 ruling |
+| AUD-10b | C12 met (09-28 15:50Z replay finished 15:58Z) but at **10G peak = the TEMPORARY cap**; explain vs the REPLAY-BIGINST claim, then Stage 0 + R3-5 byte-diff before drop-in removal |
+| RECON-MIA-0913 | AUD04-FRESH proven 17:33Z (reconciliation ran): `matched=False n_exit_only=1` → `continuous_rung_hold/trial/MIA/2026-09-13`; find which side is wrong |
+| R3-PROJ | Project EDGE-4 CONFIRM-day accrual vs 2027-01-25; no statistic on post-09-25 tape |
 
-**Order (next session, re-synced 09-27 ~04:30Z):**
-1. Wave 1 merged 09-27 07:45Z. Remaining: EDGE-2 A/B/D, EDGE-3, EDGE-6f + K1 slice, RA-2; then RA-5a/RA-6/RA-11a.
-2. Keep the 09-27 watch: 09:00Z rotation + ING-2-AMEND, 09:20Z digest, 15:50Z replay/AUD-10b C12, 16:50Z node/FU-8b, 16:52Z discovery (6a proof), 17:20Z AUD-05 #3.
-3. SP-5b at its trigger.
-Watch: 16:50Z node spawn (permit line + tape advancing; A1 halt SET ⇒ never arms), 16:52Z discovery pull, 17:20Z tallies, 17:30Z capital-flow pull (one `CAPITAL_FLOW_PULL status=OK` line) → 17:40Z ROI report (`settled_cumulative_passes_net` expected True; raw stays False by design).
+### WATCH / GATED (no build owed; re-open only on the named trigger)
+- **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).
+- **Evidence floor:** AUD-06b (CONFIRMED unit-qty edge + new family), CF-13 (live CCA/CCB), CF-14b (1-of-N stage-3 failure).
+- **Trigger watches:** EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4.
+- **Rules:** T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
 
-**KILL clock / live n (09-25):** champion (v4) counter 10 covered-listed station-days (09-20..09-25);
-v4 tally n=3 (1 win), under one completed look. Exec store 9 fills (newest 09-22). A1 halt SET 09-24.
+**Closed 09-28 by ruling:** EDGE-2-REFACTOR, `max_simultaneous_positions` (dbd91d9), FU-8b/NOTIFIER (live), ING-2 residual alert (exit 4 → OnFailure), whole-tape regen, LADDER_EV stage 2, G-16/G-17, PREREG v2 residue, CF-1, CF-8, PF-1, GL-4P, AUD04-FRESH, EDGE-6, AUD-18, AUD-12a.
 
-**Parked (re-open trigger: a v3 verdict, or fills at rate).** Kalshi sibling (`wip/kalshi-s4-registry`,
-`kalshi_crh_v1.json` DRAFT, S11 operator-only); LADDER_EV stage 2 (stage-1 modules stay);
-whole-tape replay regen; G-16/G-17 (calendar; NO-GO stops the programme);
-PREREG v2 residue; EXEC SPINE R-7 residue; blind-risk T-9/T-6/`max_simultaneous_positions`.
-Debt carried without a slot: CF-1, CF-2 (no consumer), CF-4, CF-5b, CF-6, CF-7, CF-8, CF-11
-(`ruff format --check` 268 files incl. 64 under src/), CF-12 (mypy 433/41, all tests+scripts;
-ruff 24 incl. `persistence/family_manifest.py:42`), CF-13, CF-14b, PF-1, BL-10, GL-4P.
+**Host 09-28:** reboot 15:21Z killed node + 15:20Z study; node respawned 16:50:22Z (permit ttl 10 h); A1 halt SET (`source=legacy_attributed`); tape advancing.
 
 ---
 
