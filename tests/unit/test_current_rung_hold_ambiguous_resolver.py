@@ -5364,6 +5364,68 @@ async def test_a_well_formed_foreign_trade_row_still_retires(
 
 
 @pytest.mark.asyncio
+async def test_a_well_formed_foreign_trade_row_still_retires_past_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T5, past-day sibling (r1 T-5): the SAME well-formed-foreign-row
+    liveness positive control as the test above, but on the PAST-DAY
+    harness (~4996-5116), where AC4(e)'s same-day holding backstop never
+    runs at all. Proves TRADE-ROW-DRIFT did not over-block retirement on
+    the path with no holdings backstop to fall back on."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        assert client._cache.instrument(stale_instrument.id) is None
+        client._cache.add_instrument(stale_instrument)
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passive": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, (
+            "a well-formed foreign trade row must never itself block a true zero-fill, "
+            "even with no same-day holding backstop to fall back on"
+        )
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
 async def test_matched_trade_then_uninterpretable_row_same_page_still_contradicts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
