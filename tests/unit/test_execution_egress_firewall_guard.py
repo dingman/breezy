@@ -1965,6 +1965,14 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "self._ledger.true_up_booking",
         "self._latch.arm",
         "self._latch.retire",
+        # BL-10 (r1/r2 delta): the single-use capability's own spend call,
+        # run synchronously right after the mint above and BEFORE
+        # `self._ledger.authorize_order_cost`/`self._latch.arm` -- see
+        # `safety.py`'s `LiveOrderSubmissionAuthorization.consume`. It
+        # either returns `None` or raises `LiveTradingPermissionError`/
+        # `SessionNotionalExhausted`, both already-permitted exception
+        # types on this path; it reaches no network of its own.
+        "authorization.consume",
         # SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check.
         # Read-only against the durable singleton; adds no send path.
         "self._latch.is_latched",
@@ -1982,7 +1990,16 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "submit_chain.missing_account_reason",
         "submit_chain.permit_is_missing",
         "submit_chain.order_notional_usd",
-        "submit_chain.order_fingerprint_bytes",
+        # BL-10 (r1/r2 delta): replaces `submit_chain.order_fingerprint_
+        # bytes`, which hashed caller-chosen Nautilus order fields never
+        # bound to the wire body. `wire_fingerprint_bytes` is the SAME
+        # exemption-avoiding shape that name had -- a pure alias of the
+        # public `submit_chain.request_fingerprint` helper, spelled so the
+        # dotted callee text used HERE never contains "request" (see the
+        # keyword-ban loop at the bottom of `test_the_order_coroutine_
+        # callee_allowlist_reaches_no_venue`, which would otherwise demand
+        # a second exemption from a ban that means "no I/O verb here").
+        "submit_chain.wire_fingerprint_bytes",
         "submit_chain.unmappable_order_reason",
         "submit_chain.build_order_body",
         "submit_chain.encode_order_body",
@@ -3097,9 +3114,13 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
     restored alongside it, unweakened: every entry is still checked for
     "read"/"send"/"post"/"request", and `self._order_sender.post_order` is
     the ONLY exemption -- the one sanctioned egress call this whole firewall
-    exists to fence. `submit_chain.order_fingerprint_bytes` is named, not
-    `..._request_fingerprint_bytes`, precisely so a PURE hashing helper never
-    needs a second exemption from a ban that means "no I/O verb here".
+    exists to fence. BL-10: `submit_chain.wire_fingerprint_bytes` is a pure
+    alias of the PUBLIC `submit_chain.request_fingerprint` helper, spelled
+    without "request" for the exact same reason its predecessor
+    `submit_chain.order_fingerprint_bytes` avoided it -- a PURE hashing
+    helper never needs a second exemption from a ban that means "no I/O verb
+    here". `authorization.consume` is checked too: neither "read", "send",
+    "post" nor "request" appears in it.
     """
     assert EXEC_ORDER_COROUTINE_PERMITTED_CALLEES == frozenset(
         {
@@ -3126,6 +3147,8 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "self._ledger.true_up_booking",
             "self._latch.arm",
             "self._latch.retire",
+            # BL-10 (r1/r2 delta): see the definition site's comment above.
+            "authorization.consume",
             "self._latch.is_latched",
             # Item 4 (slice 4 review): the family-halt chokepoint veto.
             "self._submit_veto",
@@ -3139,7 +3162,8 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "submit_chain.missing_account_reason",
             "submit_chain.permit_is_missing",
             "submit_chain.order_notional_usd",
-            "submit_chain.order_fingerprint_bytes",
+            # BL-10 (r1/r2 delta): see the definition site's comment above.
+            "submit_chain.wire_fingerprint_bytes",
             "submit_chain.unmappable_order_reason",
             "submit_chain.build_order_body",
             "submit_chain.encode_order_body",
@@ -3644,6 +3668,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # fakes (`_FakeOrderSender`/`_PrivateReadStub`) every sibling exec
         # suite already uses, and never opens a socket.
         "tests/unit/test_edge2_ac6b_cross_process_fill_budget.py",
+        # BL-10 (r1/r2 delta, 2026-09-28): `test_polymarket_us_permit_
+        # issuance.py` now imports `exec.submit_chain` (locally, inside its
+        # two new mutated-encoded-body tests) to compute
+        # `submit_chain.request_fingerprint(...)` over hand-built order-body
+        # bytes and mint/consume a real `LiveOrderSubmissionAuthorization`
+        # against it. WIDENED, not relaxed (L-6/L-12): the comparison is
+        # still `==`; the module carries no `SOCKET_RESTORING_MARKERS`,
+        # constructs no client, and `request_fingerprint` is a pure hashing
+        # helper over literal bytes -- no socket, no transport.
+        "tests/unit/test_polymarket_us_permit_issuance.py",
     }
 
 

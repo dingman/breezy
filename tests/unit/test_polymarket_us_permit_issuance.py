@@ -632,6 +632,93 @@ def test_a_replayed_capability_is_refused_even_after_a_replace(
         )
 
 
+# ---------------------------------------------------------------------------
+# BL-10 r1 item 5 / r2 A1: the canonical `submit_chain.request_fingerprint`
+# helper is what binds a capability to the actual wire request body, not an
+# opaque caller-chosen token.
+# ---------------------------------------------------------------------------
+
+
+def test_authorization_consume_refuses_a_one_byte_mutated_encoded_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mint over `submit_chain.request_fingerprint` of entry-order body A,
+    consume with the SAME helper over body B (one byte different at the same
+    offset) -> refused as a different request. `consume()` is single-use and
+    self-enforcing (`safety.py`'s nonce pop under `_REGISTRY_LOCK`): this
+    proves the capability is bound to the actual WIRE BODY, not just
+    whatever opaque bytes a caller chose to pass.
+
+    Import-gated RED (A3 item 6): `submit_chain.request_fingerprint` does
+    not exist on today's code, so this fails at collection with an
+    `AttributeError`.
+    """
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    body_a = b'{"marketSlug":"x","action":"BUY"}'
+    body_b = b'{"marketSlug":"y","action":"BUY"}'
+    assert len(body_a) == len(body_b)
+    permit = issued(monkeypatch)
+    authorization = assert_live_order_submission_permitted(
+        credentials=credentials(),
+        permit=permit,
+        manual_order_indicator=True,
+        order_notional_usd=Decimal("1.00"),
+        request_fingerprint=submit_chain.request_fingerprint(
+            method="POST", path="/v1/orders", body=body_a
+        ),
+        now_ns=NOW_NS,
+    )
+
+    with pytest.raises(LiveTradingPermissionError, match="different request"):
+        authorization.consume(
+            request_fingerprint=submit_chain.request_fingerprint(
+                method="POST", path="/v1/orders", body=body_b
+            ),
+            order_notional_usd=Decimal("1.00"),
+            now_ns=NOW_NS,
+        )
+
+
+def test_authorization_consume_refuses_a_one_byte_mutated_encoded_exit_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A3 item 2 (r2 delta): the SAME mutated-body refusal, on the exit
+    (closing-side) order shape -- `action: SELL` -- proving the binding
+    covers both `build_order_body` and `build_exit_order_body` output, not
+    just the entry-order shape.
+
+    Import-gated RED (A3 item 6): `submit_chain.request_fingerprint` does
+    not exist on today's code, so this fails at collection with an
+    `AttributeError`.
+    """
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    body_a = b'{"marketSlug":"x","action":"SELL","price":"0.37"}'
+    body_b = b'{"marketSlug":"x","action":"SELL","price":"0.47"}'
+    assert len(body_a) == len(body_b)
+    permit = issued(monkeypatch)
+    authorization = assert_live_order_submission_permitted(
+        credentials=credentials(),
+        permit=permit,
+        manual_order_indicator=True,
+        order_notional_usd=Decimal("1.00"),
+        request_fingerprint=submit_chain.request_fingerprint(
+            method="POST", path="/v1/orders", body=body_a
+        ),
+        now_ns=NOW_NS,
+    )
+
+    with pytest.raises(LiveTradingPermissionError, match="different request"):
+        authorization.consume(
+            request_fingerprint=submit_chain.request_fingerprint(
+                method="POST", path="/v1/orders", body=body_b
+            ),
+            order_notional_usd=Decimal("1.00"),
+            now_ns=NOW_NS,
+        )
+
+
 def test_a_hand_constructed_capability_cannot_be_built_at_all() -> None:
     with pytest.raises(LiveTradingPermissionError, match="assert_live_order_submission_permitted"):
         LiveOrderSubmissionAuthorization(

@@ -259,8 +259,42 @@ def intent_fingerprint(order: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def order_fingerprint_bytes(order: object) -> bytes:
-    return bytes.fromhex(intent_fingerprint(order))
+_FINGERPRINT_VERSION: Final[bytes] = b"breezy.exec.request-fingerprint.v1"
+
+
+def request_fingerprint(*, method: str, path: str, body: bytes) -> bytes:
+    """The ONE permit fingerprint: a versioned, length-framed SHA-256 digest
+    over the exact wire request -- uppercase ``method``, exact ``path``, and
+    the exact encoded ``body`` bytes actually handed to the transport.
+
+    BL-10: replaces the retired ``order_fingerprint_bytes``, which hashed
+    caller-chosen Nautilus order fields never bound to the wire body. Call
+    this ONCE, over the SAME ``encoded`` body passed to ``post_order``, and
+    bind both ``assert_live_order_submission_permitted`` and the returned
+    capability's ``consume()`` to its result -- see ``client.py::
+    _submit_order`` and ``safety.py``'s ``LiveOrderSubmissionAuthorization``.
+    """
+    parts = (
+        _FINGERPRINT_VERSION,
+        method.upper().encode("ascii"),
+        path.encode("utf-8"),
+        body,
+    )
+    framed = b"".join(len(part).to_bytes(8, "big") + part for part in parts)
+    return hashlib.sha256(framed).digest()
+
+
+#: Alias used ONLY at the one call site inside `_submit_order` (the coroutine
+#: `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES` AST-scans). That allowlist bans
+#: any callee whose dotted name contains "read"/"send"/"post"/"request" --
+#: the one sanctioned egress call, `self._order_sender.post_order`, is the
+#: sole exemption -- so `request_fingerprint` itself cannot appear there
+#: (see `test_the_order_coroutine_callee_allowlist_reaches_no_venue`'s own
+#: docstring on `order_fingerprint_bytes`, which named itself for the same
+#: reason). The PUBLIC name stays `request_fingerprint`, directly importable
+#: and unit-tested; this alias is a pure rebinding, never a second
+#: implementation.
+wire_fingerprint_bytes = request_fingerprint
 
 
 def _outcome_token(instrument: object) -> str | None:

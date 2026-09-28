@@ -533,6 +533,10 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "self._ledger.true_up_booking",
                 "self._latch.arm",
                 "self._latch.retire",
+                # BL-10 (r1/r2 delta): the single-use capability's own spend
+                # call -- see `firewall.EXEC_ORDER_COROUTINE_PERMITTED_
+                # CALLEES`'s definition-site comment.
+                "authorization.consume",
                 # SAFETY C1 (plan rev 6.1): the pre-spend re-check, read-only
                 # against the durable singleton -- adds no send path.
                 "self._latch.is_latched",
@@ -549,7 +553,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "submit_chain.missing_account_reason",
                 "submit_chain.permit_is_missing",
                 "submit_chain.order_notional_usd",
-                "submit_chain.order_fingerprint_bytes",
+                # BL-10 (r1/r2 delta): replaces `submit_chain.order_
+                # fingerprint_bytes` -- see the definition-site comment.
+                "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",
@@ -636,7 +642,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "submit_chain.missing_account_reason",
                 "submit_chain.permit_is_missing",
                 "submit_chain.order_notional_usd",
-                "submit_chain.order_fingerprint_bytes",
+                # BL-10 (r1/r2 delta): replaces `submit_chain.order_
+                # fingerprint_bytes` -- see the definition-site comment.
+                "submit_chain.wire_fingerprint_bytes",
                 "submit_chain.unmappable_order_reason",
                 "submit_chain.build_order_body",
                 "submit_chain.encode_order_body",

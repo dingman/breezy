@@ -981,8 +981,11 @@ def assert_live_order_submission_permitted(
     forgery is refused at use as well as at construction.
 
     Args:
-        request_fingerprint: opaque bytes identifying THIS request, computed by
-            the caller over whatever uniquely determines it. The returned
+        request_fingerprint: bytes identifying THIS request. BL-10: the
+            caller must compute this with the canonical
+            ``submit_chain.request_fingerprint(method=..., path=..., body=...)``
+            helper, over the SAME encoded body bytes about to be POSTed --
+            never an opaque or caller-invented digest. The returned
             capability is bound to it and will refuse any other.
         now_ns: the current time from the injected clock. Never sampled here.
 

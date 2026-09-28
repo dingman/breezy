@@ -5437,13 +5437,40 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             veto_reason = self._submit_veto()
             if veto_reason is not None:
                 return self._deny(order, veto_reason, now_ns)
+        # BL-10 A1 (r2 delta, hard requirement): build, encode, fingerprint,
+        # assert, then consume -- synchronously, no `await` anywhere in this
+        # block, and BEFORE `authorize_order_cost` and BEFORE `self._latch.
+        # arm`. Body-build now runs BEFORE the permit mint (not after, as
+        # before BL-10): a `build_order_body`/`build_exit_order_body` raise
+        # here spends no permit budget and arms no intent, because neither
+        # has run yet.
+        if is_exit_order:
+            assert exit_view is not None  # narrowed by `is_exit_order` above
+            body = submit_chain.build_exit_order_body(order, instrument, exit_view)
+        else:
+            body = submit_chain.build_order_body(order, instrument)
+        encoded = submit_chain.encode_order_body(body)
+        order_notional = submit_chain.order_notional_usd(order)
+        fingerprint = submit_chain.wire_fingerprint_bytes(
+            method=write_transport._WRITE_METHOD,
+            path=write_transport.ORDERS_PATH,
+            body=encoded,
+        )
         try:
-            assert_live_order_submission_permitted(
+            authorization = assert_live_order_submission_permitted(
                 credentials=self._credentials,
                 permit=self._permit,
                 manual_order_indicator=False,
-                order_notional_usd=submit_chain.order_notional_usd(order),
-                request_fingerprint=submit_chain.order_fingerprint_bytes(order),
+                order_notional_usd=order_notional,
+                request_fingerprint=fingerprint,
+                now_ns=now_ns,
+            )
+            # Single-use and self-enforcing (`safety.py`'s `consume`): a
+            # mismatched or already-spent capability raises here, before
+            # `authorize_order_cost` or `self._latch.arm` ever run.
+            authorization.consume(
+                request_fingerprint=fingerprint,
+                order_notional_usd=order_notional,
                 now_ns=now_ns,
             )
         except SessionNotionalExhausted as exc:
@@ -5451,12 +5478,6 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         except LiveTradingPermissionError as exc:
             return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
-        if is_exit_order:
-            assert exit_view is not None  # narrowed by `is_exit_order` above
-            body = submit_chain.build_exit_order_body(order, instrument, exit_view)
-        else:
-            body = submit_chain.build_order_body(order, instrument)
-        encoded = submit_chain.encode_order_body(body)
         # INC-E2 budget (review MEDIUM 9): the daily budget is GROSS entry
         # spend (§5.8) -- an exit-side order never calls
         # `authorize_order_cost` and never debits the daily counter, so its

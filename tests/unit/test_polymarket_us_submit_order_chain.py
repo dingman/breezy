@@ -33,7 +33,7 @@ from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import ClientId, StrategyId, TradeId, TraderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 
-from breezy.adapters.polymarket_us import parsing, write_transport
+from breezy.adapters.polymarket_us import parsing, safety, write_transport
 from breezy.adapters.polymarket_us.errors import VenuePayloadError
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
@@ -57,7 +57,10 @@ from breezy.adapters.polymarket_us.operator_controls import (
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
 )
-from breezy.adapters.polymarket_us.safety import issue_live_trading_permit
+from breezy.adapters.polymarket_us.safety import (
+    issue_live_trading_permit,
+    live_trading_budget_remaining,
+)
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -596,6 +599,156 @@ async def test_no_post_is_reachable_while_the_write_canonical_string_is_unverifi
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
     ]
+
+
+# ---------------------------------------------------------------------------
+# BL-10: canonical request fingerprint, synchronous mint-then-consume
+# ---------------------------------------------------------------------------
+
+
+def test_request_fingerprint_changes_on_one_byte_body_mutation() -> None:
+    """BL-10 r1 item 5: same method/path, one body byte flipped at the SAME
+    offset -> the digest differs. Import-gated RED (A3 item 6):
+    `submit_chain.request_fingerprint` does not exist on today's code, so
+    this fails at collection with an `AttributeError`, not an assertion.
+    """
+    body_a = b'{"marketSlug":"x"}'
+    body_b = b'{"marketSlug":"y"}'
+    assert len(body_a) == len(body_b)
+    fp_a = submit_chain.request_fingerprint(method="POST", path="/v1/orders", body=body_a)
+    fp_b = submit_chain.request_fingerprint(method="POST", path="/v1/orders", body=body_b)
+    assert isinstance(fp_a, bytes)
+    assert fp_a != fp_b
+    # Deterministic: the SAME inputs mint the SAME digest.
+    assert fp_a == submit_chain.request_fingerprint(method="POST", path="/v1/orders", body=body_a)
+
+
+def test_the_fingerprint_helper_and_sign_headers_use_the_same_write_constants() -> None:
+    """A3 item 4 (r2 delta): the fingerprint helper must be called with the
+    SAME `write_transport._WRITE_METHOD`/`write_transport.ORDERS_PATH`
+    tokens `self._write_signer.sign_headers` is called with -- asserted by
+    comparing the source text of both call sites, not by re-deriving the
+    values, so a hand-typed literal drifting from the constants is caught.
+
+    Import-gated RED (A3 item 6): today's `_submit_order` has no
+    `wire_fingerprint_bytes`/`request_fingerprint` call at all, so the
+    `next()` below raises `StopIteration` at collection, not an assertion.
+    """
+    source = None
+    target = "src/breezy/adapters/polymarket_us/exec/client.py"
+    for path, text in iter_python_sources(("src",)):
+        if path == target:
+            source = text
+            break
+    assert source is not None, f"{target} not found by iter_python_sources"
+    tree = ast.parse(source, filename=target)
+    submit_order = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_submit_order"
+    )
+    fingerprint_call = next(
+        node
+        for node in ast.walk(submit_order)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "wire_fingerprint_bytes"
+    )
+    sign_call = next(
+        node
+        for node in ast.walk(submit_order)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "sign_headers"
+    )
+    fp_kwargs = {kw.arg: ast.unparse(kw.value) for kw in fingerprint_call.keywords}
+    sign_args = [ast.unparse(a) for a in sign_call.args]
+    assert sign_args[:2] == ["write_transport._WRITE_METHOD", "write_transport.ORDERS_PATH"]
+    assert fp_kwargs["method"] == sign_args[0]
+    assert fp_kwargs["path"] == sign_args[1]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_build_order_body_spends_no_permit_budget_and_arms_no_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """BL-10 A3 item 1 (r2 delta): a `build_order_body` that raises must
+    spend NEITHER the permit's own order-count/notional budget NOR arm a
+    submit intent NOR issue a POST.
+
+    Real assertion failure on today's code (not import-gated): before BL-10,
+    body-build ran AFTER the permit mint (`assert_live_order_submission_
+    permitted`), so a raise here already leaked one permit order-count slot
+    and some notional with nothing sent -- `before == after` fails today
+    because the remaining count/notional are decremented before the raise
+    propagates.
+    """
+    sender = _FakeSender()
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        permit = rig.client._permit
+        monkeypatch.setattr(
+            submit_chain,
+            "build_order_body",
+            lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")),
+        )
+        await rig.client._connect()
+        before = live_trading_budget_remaining(permit)
+        with pytest.raises(ValueError, match="boom"):
+            await rig.client._submit_order(rig.limit_buy())
+        after = live_trading_budget_remaining(permit)
+        await rig.client._disconnect()
+    assert after == before
+    assert sender.calls == []
+    intent = rig.client._latch.current()
+    assert intent is None or intent.state is not SubmitIntentState.OPEN
+
+
+@pytest.mark.asyncio
+async def test_submit_order_consumes_authorization_for_encoded_transport_body_before_post(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    """A1/A3 items 3 and 5 (r2 delta): `_submit_order` must call
+    `LiveOrderSubmissionAuthorization.consume()` -- exactly once, for the
+    SAME encoded body actually handed to the transport -- before `post_order`
+    ever runs. `consume()` is single-use and self-enforcing (`safety.py`,
+    the pop from `_UNSPENT_NONCES` under `_REGISTRY_LOCK`): a caller cannot
+    accidentally consume twice, and this spy proves today's `_submit_order`
+    never consumes at all.
+
+    Real assertion failure on today's code, NOT import-gated (A3 item 6):
+    today's `_submit_order` mints an authorization via
+    `assert_live_order_submission_permitted` and discards the return value --
+    `.consume()` is never called -- so the spy records ZERO calls while the
+    fake sender still receives exactly one POST.
+    """
+    consume_calls: list[bytes] = []
+    original_consume = safety.LiveOrderSubmissionAuthorization.consume
+
+    def _spy_consume(self: Any, **kwargs: Any) -> None:
+        consume_calls.append(kwargs["request_fingerprint"])
+        original_consume(self, **kwargs)
+
+    monkeypatch.setattr(safety.LiveOrderSubmissionAuthorization, "consume", _spy_consume)
+    sender = _FakeSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(str(build_instrument().raw_symbol)),
+    )
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+    assert len(sender.calls) == 1
+    assert len(consume_calls) == 1, (
+        "authorization.consume() must be called exactly once before post_order"
+    )
 
 
 @pytest.mark.asyncio
