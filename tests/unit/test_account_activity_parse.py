@@ -14,6 +14,8 @@ import logging
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from breezy.adapters.polymarket_us import account_activity as aa
 from breezy.persistence.external_capital_flows import ExternalCapitalFlow
 
@@ -268,32 +270,43 @@ def _trade_activity(
 def test_trade_rows_for_order_joins_aggressor_and_passive_ids() -> None:
     page = {
         "activities": [
-            _trade_activity(aggressor_id="SYN-ORDER-1", qty_decimal="1"),
-            _trade_activity(passive_id="SYN-ORDER-1", qty_decimal="0.5"),
+            _trade_activity(
+                aggressor_id="SYN-ORDER-1", passive_id="SYN-OTHER-9", qty_decimal="1",
+            ),
+            _trade_activity(
+                aggressor_id="SYN-OTHER-9", passive_id="SYN-ORDER-1", qty_decimal="0.5",
+            ),
             _trade_activity(aggressor_id="SYN-OTHER", passive_id="SYN-OTHER-2"),
         ]
     }
-    refs = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    refs = scan.refs
     assert len(refs) == 2
     assert refs[0].is_aggressor is True
     assert refs[0].qty == Decimal(1)
     assert refs[1].is_aggressor is False
     assert refs[1].qty == Decimal("0.5")
+    assert scan.uninterpretable_rows == 0
 
 
 def test_trade_rows_for_order_ignores_marketslug_match_without_id_match() -> None:
     """L-17: the venue's `marketSlug` filter is NOT a trade filter for a
     specific order id -- a same-slug trade naming a DIFFERENT order must
-    never be counted."""
+    never be counted. The passive leg is given a realistic foreign id (F3:
+    every captured row carries both legs) so this stays an ordinary foreign
+    trade, never an uninterpretable row under the both-legs-required rule."""
     page = {
         "activities": [
             _trade_activity(
                 aggressor_id="SYN-OTHER-ORDER",
+                passive_id="SYN-OTHER-PASSIVE",
                 market_slug="tc-temp-miahigh-2026-09-23-gte82lt83f",
             ),
         ]
     }
-    assert aa.trade_rows_for_order(page, "SYN-ORDER-1") == ()
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.refs == ()
+    assert scan.uninterpretable_rows == 0
 
 
 def test_trade_rows_for_order_ignores_non_trade_activities() -> None:
@@ -303,7 +316,7 @@ def test_trade_rows_for_order_ignores_non_trade_activities() -> None:
             {"type": "ACTIVITY_TYPE_POSITION_RESOLUTION", "positionResolution": {}},
         ]
     }
-    assert aa.trade_rows_for_order(page, "SYN-ORDER-1") == ()
+    assert aa.trade_rows_for_order(page, "SYN-ORDER-1") == aa.TradeRowScan((), 0)
 
 
 def test_trade_rows_for_order_degrades_never_drops_a_malformed_match() -> None:
@@ -317,15 +330,277 @@ def test_trade_rows_for_order_degrades_never_drops_a_malformed_match() -> None:
             ),
         ]
     }
-    refs = aa.trade_rows_for_order(page, "SYN-ORDER-1")
-    assert len(refs) == 1
-    assert refs[0].qty == Decimal(0)
-    assert refs[0].create_ts_ns == 0
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert len(scan.refs) == 1
+    assert scan.refs[0].qty == Decimal(0)
+    assert scan.refs[0].create_ts_ns == 0
+    assert scan.uninterpretable_rows == 0
 
 
 def test_trade_rows_for_order_returns_empty_for_non_list_activities() -> None:
-    assert aa.trade_rows_for_order({"activities": "not-a-list"}, "SYN-ORDER-1") == ()
-    assert aa.trade_rows_for_order({}, "SYN-ORDER-1") == ()
+    assert aa.trade_rows_for_order({"activities": "not-a-list"}, "SYN-ORDER-1") == aa.TradeRowScan(
+        refs=(), uninterpretable_rows=1,
+    )
+    assert aa.trade_rows_for_order({}, "SYN-ORDER-1") == aa.TradeRowScan(
+        refs=(), uninterpretable_rows=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TRADE-ROW-DRIFT (plan r1/r2, 2026-09-27): an unreadable TRADE row must
+# never silently count as "not ours" -- it must be counted in
+# ``uninterpretable_rows`` instead, never simply dropped as `()`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("build_activities", "case_name"),
+    [
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SYN-OTHER-ORDER"},
+                        # M3/M14: passive renamed -- the leg this order could
+                        # be resting on is unreadable.
+                        "passiveOrder": {"id": "SYN-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "passive_renamed",
+        ),
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    # M9: `trade` itself renamed away.
+                    "tradeInfo": {
+                        "aggressor": {"id": "SYN-OTHER-ORDER"},
+                        "passive": {"id": "SYN-OTHER-PASSIVE"},
+                    },
+                },
+            ],
+            "trade_renamed",
+        ),
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        # M11: leg id is an int, not a string.
+                        "aggressor": {"id": 12345},
+                        "passive": {"id": "SYN-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "aggressor_id_is_int",
+        ),
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        # M10: leg id is an empty string.
+                        "aggressor": {"id": ""},
+                        "passive": {"id": "SYN-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "aggressor_id_is_empty_string",
+        ),
+        (
+            # M9: the list element itself is not an object.
+            lambda: ["x"],
+            "element_not_an_object",
+        ),
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SYN-OTHER-ORDER"},
+                        # M14: passive also drifted, both legs bad at once.
+                        "passive": {"id": 999},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "both_legs_bad",
+        ),
+        (
+            lambda: [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": ""},
+                        "passive": {"id": ""},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "both_legs_empty_string",
+        ),
+    ],
+)
+def test_trade_rows_for_order_flags_one_uninterpretable_row_per_drift(
+    build_activities: Any, case_name: str,
+) -> None:
+    """T1 (r1) + M14 (r2): each drift shape gives `uninterpretable_rows == 1`
+    with EMPTY refs -- today (RED, pre-fix) every one of these silently
+    returns `()`, i.e. "not ours", which is exactly the false-zero-fill risk
+    this plan closes. M16: the malformed row must never leak into `refs`."""
+    page = {"activities": build_activities()}
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.refs == (), case_name
+    assert scan.uninterpretable_rows == 1, case_name
+
+
+@pytest.mark.parametrize(
+    ("activity_type", "has_trade_key", "expected_uninterpretable"),
+    [
+        (None, False, 1),  # T2: type missing.
+        ("ACTIVITY_TYPE_BRAND_NEW", True, 1),  # T2: unknown type WITH a trade key.
+        ("ACTIVITY_TYPE_BRAND_NEW", False, 0),  # T2: unknown type, no trade key (routine, L-37).
+    ],
+)
+def test_trade_rows_for_order_type_drift_classification(
+    activity_type: str | None, has_trade_key: bool, expected_uninterpretable: int,
+) -> None:
+    """T2 (r1, T-3 simplified rule): an unknown/missing `type` is flagged
+    ONLY when the row also carries a `trade` key, or the type itself is
+    missing -- a brand-new activity type with no `trade` key is routine
+    drift (L-37) and must never stall every read."""
+    activity: dict[str, Any] = {}
+    if activity_type is not None:
+        activity["type"] = activity_type
+    if has_trade_key:
+        activity["trade"] = {"aggressor": {"id": "SYN-OTHER"}, "passive": {"id": "SYN-OTHER-2"}}
+    page = {"activities": [activity]}
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.refs == ()
+    assert scan.uninterpretable_rows == expected_uninterpretable
+
+
+def test_trade_rows_for_order_matched_row_with_malformed_other_leg_is_not_flagged() -> None:
+    """T3 (r1; kills M4): a matching aggressor plus a malformed (renamed)
+    passive leg still counts as ONE match, and must NOT also be counted as
+    uninterpretable -- flagging a row we ALREADY have positive evidence for
+    would needlessly block a genuine retirement."""
+    page = {
+        "activities": [
+            {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "aggressor": {"id": "SYN-ORDER-1"},
+                    "passiveOrder": {"id": "irrelevant"},
+                    "qtyDecimal": "1",
+                    "createTime": "2026-09-23T17:22:07.900000000Z",
+                },
+            },
+        ],
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert len(scan.refs) == 1
+    assert scan.uninterpretable_rows == 0
+
+
+def test_trade_rows_for_order_self_trade_matches_once_as_aggressor() -> None:
+    """Domain review item 1 (r2 T-4): our id on BOTH legs (a self-trade)
+    gives exactly one ref, `is_aggressor=True` -- pins the CURRENT semantics
+    (`aggressor` is checked first), never two refs for one row."""
+    page = {
+        "activities": [
+            _trade_activity(aggressor_id="SYN-ORDER-1", passive_id="SYN-ORDER-1"),
+        ]
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert len(scan.refs) == 1
+    assert scan.refs[0].is_aggressor is True
+    assert scan.uninterpretable_rows == 0
+
+
+# ---------------------------------------------------------------------------
+# r2 T-2: the id cross-check against `aggressorExecution.order.id` /
+# `passiveExecution.order.id` (R3's "the id keeps its name but its meaning
+# drifted" residual risk).
+# ---------------------------------------------------------------------------
+
+
+def test_trade_rows_for_order_flags_id_drift_between_leg_and_execution_block() -> None:
+    """r2 T-2 (kills M17): `aggressor.id` and `aggressorExecution.order.id`
+    are both non-empty strings but DISAGREE -- uninterpretable, never
+    silently ignored as an ordinary foreign trade."""
+    page = {
+        "activities": [
+            {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "aggressor": {"id": "SYN-OTHER-ORDER"},
+                    "aggressorExecution": {"order": {"id": "SYN-DRIFTED-EXEC-ID"}},
+                    "passive": {"id": "SYN-OTHER-PASSIVE"},
+                    "qtyDecimal": "1",
+                    "createTime": "2026-09-23T17:22:07.900000000Z",
+                },
+            },
+        ],
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.refs == ()
+    assert scan.uninterpretable_rows == 1
+
+
+def test_trade_rows_for_order_execution_block_absence_is_fine() -> None:
+    """r2 T-2: "absence is fine" -- an ordinary foreign trade with NO
+    execution block at all must never be flagged uninterpretable just
+    because the (optional) cross-check has nothing to compare."""
+    page = {
+        "activities": [
+            {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "aggressor": {"id": "SYN-OTHER-ORDER"},
+                    "passive": {"id": "SYN-OTHER-PASSIVE"},
+                    "qtyDecimal": "1",
+                    "createTime": "2026-09-23T17:22:07.900000000Z",
+                },
+            },
+        ],
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert scan.refs == ()
+    assert scan.uninterpretable_rows == 0
+
+
+def test_trade_rows_for_order_matches_via_execution_block_id_alone() -> None:
+    """r2 T-2: "ours" matches EITHER location -- our id at
+    `aggressorExecution.order.id` alone (even though the leg's own `id`
+    disagrees) is still a match, never a false negative."""
+    page = {
+        "activities": [
+            {
+                "type": "ACTIVITY_TYPE_TRADE",
+                "trade": {
+                    "aggressor": {"id": "SOME-OTHER-ID"},
+                    "aggressorExecution": {"order": {"id": "SYN-ORDER-1"}},
+                    "passive": {"id": "SYN-OTHER-PASSIVE"},
+                    "qtyDecimal": "1",
+                    "createTime": "2026-09-23T17:22:07.900000000Z",
+                },
+            },
+        ],
+    }
+    scan = aa.trade_rows_for_order(page, "SYN-ORDER-1")
+    assert len(scan.refs) == 1
+    assert scan.uninterpretable_rows == 0
 
 
 def test_page_min_create_ts_ns_handles_missing_and_malformed_times() -> None:

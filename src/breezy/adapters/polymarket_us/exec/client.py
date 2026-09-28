@@ -1542,12 +1542,20 @@ class TradeJoin:
     malformed page must still raise a contradiction, never be discarded).
     The pagination boundary itself (D3, whether a cursor can skip or
     reorder rows) stays UNLICENSED until the Step 2 probe runs.
+
+    **TRADE-ROW-DRIFT (2026-09-27): ``uninterpretable_rows`` mirrors the
+    malformed-page shape above, one level down.** A TRADE row this join
+    cannot read with confidence (``account_activity.TradeRowScan``) stops
+    the read the same way a malformed PAGE does -- ``complete=False``, with
+    trades already found (this page and earlier) still counted, never
+    discarded.
     """
 
     complete: bool
     trade_count: int
     qty: Decimal
     last_trade_ts_ns: int | None
+    uninterpretable_rows: int = 0
 
 
 def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
@@ -2758,6 +2766,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             join: TradeJoin | None = None
             if zero_fill_needs_evidence or fill_needs_evidence:
                 join = await self._order_trade_activity(context.venue_order_id, context.created_ns)
+                if join is not None and join.uninterpretable_rows:
+                    # TRADE-ROW-DRIFT r2 T-1: diagnosable, delivered via the
+                    # SAME `open_intent_stale` CRITICAL every other failure
+                    # kind above already reaches -- a plain dict assignment,
+                    # never a new callee (E0-NOSEND-RESOLVER).
+                    self._resolver_last_failure_kind[context.intent_id] = (
+                        "activities_uninterpretable"
+                    )
             trade_found = join is not None and join.trade_count >= 1
             evidence_blocks_zero_fill = (
                 context.create_fill_evidence in _CREATE_FILL_EVIDENCE_BLOCKS_ZERO_FILL
@@ -3204,9 +3220,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         trade already found before the malformed page must still raise the
         resolver's evidence-contradiction CRITICAL; a bare ``None`` would
         have silently discarded that evidence instead.
+
+        TRADE-ROW-DRIFT (r2): an uninterpretable TRADE row (:func:`~breezy.
+        adapters.polymarket_us.account_activity.trade_rows_for_order`) stops
+        the read the same way -- ``complete=False``, matches already found
+        (this page and earlier) still counted, never discarded.
         """
         cursor: str | None = None
         trade_refs: list[TradeActivityRef] = []
+        uninterpretable_rows = 0
         running_min_create_ts_ns: int | None = None
         reached_eof = False
         redacted = _redact_order_id(venue_order_id)
@@ -3239,7 +3261,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     "trade join incomplete"
                 )
                 break
-            trade_refs.extend(trade_rows_for_order(page, venue_order_id))
+            scan = trade_rows_for_order(page, venue_order_id)
+            trade_refs.extend(scan.refs)
+            if scan.uninterpretable_rows:
+                uninterpretable_rows += scan.uninterpretable_rows
+                self._log.warning(
+                    f"resolver: activities page for venue order {redacted} "
+                    f"carried {scan.uninterpretable_rows} uninterpretable "
+                    f"trade row(s) (first_reason={scan.first_reason}); "
+                    "trade join incomplete"
+                )
+                break
             page_min = page_min_create_ts_ns(page)
             if page_min is not None and (
                 running_min_create_ts_ns is None or page_min < running_min_create_ts_ns
@@ -3275,13 +3307,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
         if not trade_refs:
             return TradeJoin(
-                complete=reached_eof, trade_count=0, qty=submit_chain.ZERO, last_trade_ts_ns=None
+                complete=reached_eof, trade_count=0, qty=submit_chain.ZERO,
+                last_trade_ts_ns=None, uninterpretable_rows=uninterpretable_rows,
             )
         total_qty = sum((ref.qty for ref in trade_refs), submit_chain.ZERO)
         last_ts = max(ref.create_ts_ns for ref in trade_refs)
         return TradeJoin(
             complete=reached_eof, trade_count=len(trade_refs), qty=total_qty,
-            last_trade_ts_ns=last_ts,
+            last_trade_ts_ns=last_ts, uninterpretable_rows=uninterpretable_rows,
         )
 
     def _durable_net_qty(self, instrument_id: InstrumentId) -> Decimal | None:

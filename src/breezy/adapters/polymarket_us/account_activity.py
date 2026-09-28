@@ -55,6 +55,7 @@ __all__ = [
     "PORTFOLIO_ACTIVITIES_PATH",
     "UNRECOGNISED_KIND",
     "TradeActivityRef",
+    "TradeRowScan",
     "page_min_create_ts_ns",
     "parse_external_flows",
     "trade_rows_for_order",
@@ -378,48 +379,176 @@ def _trade_create_ts_ns(trade: Mapping[str, Any]) -> int:
         return 0
 
 
-def trade_rows_for_order(
-    page: Mapping[str, Any], venue_order_id: str
-) -> tuple[TradeActivityRef, ...]:
-    """AC4(c): every ``ACTIVITY_TYPE_TRADE`` row on ``page`` whose aggressor
-    or passive leg names ``venue_order_id`` -- an EXACT id match on
-    ``trade.aggressor.id`` / ``trade.passive.id`` (captured shape:
-    ``docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/
-    activities_p0.json``).
+@dataclass(frozen=True, slots=True)
+class TradeRowScan:
+    """TRADE-ROW-DRIFT: the outcome of scanning one activities page for rows
+    naming a specific venue order id (Option A of the plan).
+
+    Today, any TRADE row whose ``trade``, ``aggressor``, ``passive`` or a leg
+    ``id`` drifted silently counted as "not ours" -- an end-of-feed read with
+    zero matches then let the resolver retire an AMBIGUOUS order as a false
+    ZERO_FILL (docs/plans/backlog/EDGE_2026-09-27/TRADE-ROW-DRIFT_plan_r1_
+    2026-09-27.md). This type makes that failure mode visible instead: a row
+    this classifier cannot read with confidence is never silently dropped --
+    it is counted in ``uninterpretable_rows``, which the caller
+    (:func:`~breezy.adapters.polymarket_us.exec.client.
+    PolymarketUSExecutionClient._order_trade_activity`) treats as reason to
+    stop the read incomplete, the same way a page-cap hit or a malformed page
+    already does.
+
+    ``refs``: every row interpreted as ours -- unchanged join semantics.
+    ``uninterpretable_rows``: how many rows on this page could not be read
+    with confidence (never how many are simply foreign trades -- a
+    well-formed row for someone else's order is ordinary and ignored, not
+    uninterpretable).
+    ``first_reason`` (r2 T-1): the activity ``type`` plus the key NAMES of
+    the first uninterpretable row on this page -- NEVER a value (id, amount,
+    or otherwise). Empty string when ``uninterpretable_rows == 0``.
+    """
+
+    refs: tuple[TradeActivityRef, ...]
+    uninterpretable_rows: int
+    first_reason: str = ""
+
+
+def _leg_id(leg: Any) -> str | None:
+    """The leg's own ``id``, or ``None`` if the leg is not an object with a
+    non-empty string id -- "not well-formed" for classification purposes."""
+    if not isinstance(leg, Mapping):
+        return None
+    leg_id = leg.get("id")
+    if not isinstance(leg_id, str) or leg_id == "":
+        return None
+    return leg_id
+
+
+def _leg_execution_order_id(trade: Mapping[str, Any], execution_key: str) -> str | None:
+    """r2 T-2: the id at ``trade[execution_key].order.id`` (e.g.
+    ``aggressorExecution.order.id``), or ``None`` if that path is absent or
+    malformed -- absence is fine (T-2: "do NOT require the execution block
+    to be present")."""
+    execution = trade.get(execution_key)
+    if not isinstance(execution, Mapping):
+        return None
+    order = execution.get("order")
+    if not isinstance(order, Mapping):
+        return None
+    order_id = order.get("id")
+    if not isinstance(order_id, str) or order_id == "":
+        return None
+    return order_id
+
+
+def _leg_status(
+    trade: Mapping[str, Any], leg_key: str, execution_key: str, venue_order_id: str,
+) -> tuple[bool, bool]:
+    """One leg's ``(matched, uninterpretable)`` verdict.
+
+    ``matched``: our id appears at EITHER the leg's own ``id`` or its
+    execution block's ``order.id`` (r2 T-2: "ours" matches either location --
+    this only ADDS matches, never removes one).
+
+    ``uninterpretable``: the leg itself is not well-formed (missing, not an
+    object, or a missing/non-string/empty ``id`` -- F3: every captured row
+    carries both legs, so a missing leg is drift, not routine), OR (r2 T-2)
+    the leg's own id and its execution block's order id are both non-empty
+    strings that DISAGREE -- the id kept its name but its meaning drifted
+    (R3).
+    """
+    leg = trade.get(leg_key)
+    leg_id = _leg_id(leg)
+    execution_id = _leg_execution_order_id(trade, execution_key)
+    matched = leg_id == venue_order_id or execution_id == venue_order_id
+    if leg_id is None:
+        return matched, True
+    if execution_id is not None and execution_id != leg_id:
+        return matched, True
+    return matched, False
+
+
+def _uninterpretable_reason(activity: Any) -> str:
+    """r2 T-1: the activity ``type`` plus the key NAMES it carries -- never a
+    value. ``activity`` may itself be a non-object list element, which has
+    neither."""
+    if not isinstance(activity, Mapping):
+        return f"non-object activity element (python type={type(activity).__name__})"
+    activity_type = activity.get("type")
+    keys = sorted(str(key) for key in activity)
+    return f"type={activity_type!r} keys={keys}"
+
+
+def trade_rows_for_order(page: Mapping[str, Any], venue_order_id: str) -> TradeRowScan:
+    """AC4(c) + TRADE-ROW-DRIFT: every ``ACTIVITY_TYPE_TRADE`` row on
+    ``page`` whose aggressor or passive leg names ``venue_order_id`` -- an
+    EXACT id match on ``trade.aggressor.id`` / ``trade.passive.id``, or (r2
+    T-2) on ``trade.aggressorExecution.order.id`` / ``trade.
+    passiveExecution.order.id`` (captured shape: ``docs/evidence/venue/
+    polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/activities_p0.json``).
 
     ``marketSlug`` is deliberately NOT consulted here: L-17's captured
     evidence (``activities_slug.json``) proved the venue's ``marketSlug``
     query parameter is not a trade filter, so this module never treats slug
     equality as evidence of a match for a SPECIFIC order id either -- only
     the id itself.
+
+    A row that is neither a match nor a legitimate, well-formed foreign
+    trade is counted in the returned scan's ``uninterpretable_rows`` instead
+    of silently being treated as "not ours" -- see :class:`TradeRowScan`.
+    Classification (plan r2, T-3 simplified):
+
+    * ``type`` missing, not a string, or not ``"ACTIVITY_TYPE_TRADE"``: flag
+      uninterpretable only if the row also carries a ``trade`` key, or its
+      ``type`` is missing/not a string -- an unknown type with no ``trade``
+      key is routine drift (L-37) and is ignored, never flagged.
+    * ``type == "ACTIVITY_TYPE_TRADE"``: if either leg matches (see
+      :func:`_leg_status`), the row is ours regardless of the other leg's
+      shape. Otherwise it is uninterpretable if either leg is not
+      well-formed, or if a leg's id disagrees with its own execution
+      block's order id (r2 T-2). A row with two well-formed, non-matching,
+      non-drifted legs is an ordinary foreign trade and is ignored.
+    * A list element that is not an object is always uninterpretable.
     """
     activities = page.get("activities")
     if not isinstance(activities, list):
-        return ()
+        return TradeRowScan((), 1)
     refs: list[TradeActivityRef] = []
+    uninterpretable_rows = 0
+    first_reason = ""
     for activity in activities:
         if not isinstance(activity, Mapping):
+            uninterpretable_rows += 1
+            first_reason = first_reason or _uninterpretable_reason(activity)
             continue
-        if activity.get("type") != "ACTIVITY_TYPE_TRADE":
+        activity_type = activity.get("type")
+        if activity_type != "ACTIVITY_TYPE_TRADE":
+            if "trade" in activity or not isinstance(activity_type, str):
+                uninterpretable_rows += 1
+                first_reason = first_reason or _uninterpretable_reason(activity)
             continue
         trade = activity.get("trade")
-        trade = trade if isinstance(trade, Mapping) else {}
-        aggressor = trade.get("aggressor")
-        aggressor = aggressor if isinstance(aggressor, Mapping) else {}
-        passive = trade.get("passive")
-        passive = passive if isinstance(passive, Mapping) else {}
-        is_aggressor = aggressor.get("id") == venue_order_id
-        is_passive = passive.get("id") == venue_order_id
-        if not (is_aggressor or is_passive):
+        if not isinstance(trade, Mapping):
+            uninterpretable_rows += 1
+            first_reason = first_reason or _uninterpretable_reason(activity)
             continue
-        refs.append(
-            TradeActivityRef(
-                qty=_trade_qty_decimal(trade),
-                create_ts_ns=_trade_create_ts_ns(trade),
-                is_aggressor=is_aggressor,
-            )
+        aggressor_matched, aggressor_bad = _leg_status(
+            trade, "aggressor", "aggressorExecution", venue_order_id,
         )
-    return tuple(refs)
+        passive_matched, passive_bad = _leg_status(
+            trade, "passive", "passiveExecution", venue_order_id,
+        )
+        if aggressor_matched or passive_matched:
+            refs.append(
+                TradeActivityRef(
+                    qty=_trade_qty_decimal(trade),
+                    create_ts_ns=_trade_create_ts_ns(trade),
+                    is_aggressor=aggressor_matched,
+                )
+            )
+            continue
+        if aggressor_bad or passive_bad:
+            uninterpretable_rows += 1
+            first_reason = first_reason or _uninterpretable_reason(activity)
+    return TradeRowScan(tuple(refs), uninterpretable_rows, first_reason)
 
 
 def _activity_create_ts_ns(activity: Mapping[str, Any]) -> int | None:
