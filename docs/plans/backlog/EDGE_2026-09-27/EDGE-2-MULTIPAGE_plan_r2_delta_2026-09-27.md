@@ -60,3 +60,16 @@ Missing `eof` behaves as before: it counts as not-EOF, so the loop continues to 
 A trade row with malformed or renamed `trade`, `aggressor` or `passive` fields is treated as not matching (`account_activity.py:405-414`). Under field drift (L-37), that is a more likely route to a false ZERO_FILL than D1 is. It is out of scope for this item. Add it to the PROGRESS follow-ups.
 
 **Confidence after r2:** HIGH. Every blocking item has a reviewer-specified fix. The implementation review must confirm M-1 through M-3 against the unmodified firewall guard.
+
+## M-4 step 1b (PROBE-CLASSIFIER-DRIFT, folded in 2026-09-28; binding when Step 2 fires)
+When the probe is revived:
+- replace the bodies of `is_trade_for_order` and `trade_qty_for_order` with `account_activity.trade_rows_for_order(page, order_id)`, and delete the probe's own copy;
+- any page with `uninterpretable_rows > 0` makes the read incomplete, so `q2_complete` is False and the verdict is INCONCLUSIVE;
+- leave `is_trade_on_slug`, the position-resolution filter and `activity_identity` unchanged.
+
+Tests are written first:
+- a drifted-leg row gives INCONCLUSIVE;
+- a match found only via `aggressorExecution.order.id` counts;
+- an unknown type that carries a `trade` key is flagged.
+
+`TestModuleSafety` stays unchanged. The probe diverges from the resolver in five places today (probe .txt :228-265). Nothing is harmed now, because the probe runs only at Step 2.
