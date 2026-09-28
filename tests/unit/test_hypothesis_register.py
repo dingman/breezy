@@ -17,6 +17,7 @@ which this test module deliberately never invokes without `--derived-root`.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +42,15 @@ from hypothesis_register import (
     NO_SIDE_MDE,
     NO_SIDE_PLAUSIBILITY_BOUND,
     NO_SIDE_REFERENCE_ASK,
+    OFFWINDOW_T4_HYPOTHESIS_CLASS,
+    OFFWINDOW_T4_HYPOTHESIS_ID,
+    OFFWINDOW_T4_K_VARIANTS,
+    OFFWINDOW_T4_MDE,
+    OFFWINDOW_T4_MIN_STATION_DAYS,
+    OFFWINDOW_T4_PLAUSIBILITY_BOUND,
+    OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE,
+    OFFWINDOW_T4_REFERENCE_ASK,
+    OFFWINDOW_T4_RULING_DATE,
     UnexpectedRegistrationStatusError,
     default_derived_root,
     ledger_path,
@@ -48,9 +58,11 @@ from hypothesis_register import (
     register_archive_recal_underpowered,
     register_forecast_taker_closed_disposition,
     register_no_side_underpowered,
+    register_offwindow_t4_underpowered,
 )
 
 from breezy.analysis.hypothesis_ledger import (
+    HORIZON_TOLLING_LANDED,
     MDE_MISMATCH_TOLERANCE,
     DuplicateHypothesisIdError,
     programme_budget_remaining,
@@ -73,6 +85,20 @@ RULING_PATH = (
 ARCHIVE_RECAL_RULING_PATH = (
     REPO_ROOT / "docs/evidence/RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md"
 )
+
+OFFWINDOW_T4_RULING_PATH = (
+    REPO_ROOT / "docs/evidence/RULING_RA-9_trigger4_offwindow_2026-09-27.md"
+)
+
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+
+
+def _dirty_git_repo(root: Path) -> Path:
+    _init_git_repo(root)
+    (root / "untracked.txt").write_text("dirty", encoding="utf-8")
+    return root
 
 
 def test_default_derived_root_honours_env_override(
@@ -523,3 +549,232 @@ def test_canonical_registered_at_on_the_ruling_date_is_accepted(tmp_path: Path) 
     )
     assert exit_code == 0
     assert path.exists()
+
+
+# --- RA-9f-A (2026-09-28): H-OFFWINDOW-T4-2026-09, Plan A AS AMENDED by r2 ---
+
+
+def test_offwindow_t4_constants_match_ruling_lines() -> None:
+    """Pins exact ruling STRINGS (never a bare line number), mirroring the
+    NO-SIDE/ARCHIVE-RECAL constants tests."""
+    text = OFFWINDOW_T4_RULING_PATH.read_text(encoding="utf-8")
+    assert (
+        "| `hypothesis_id` / `hypothesis_class` | `H-OFFWINDOW-T4-2026-09` / "
+        "`pm_us_crh_offwindow_price_only` |" in text
+    )
+    assert "| `k_variants` | 1 |" in text
+    assert (
+        "| `programme_alpha_override` | 0.025 → `allocated_alpha` = 0.00625, "
+        "`per_variant_alpha` = **0.00625** (RA-8b) |" in text
+    )
+    assert "| `min_station_days` (with-takes) | **300**." in text
+    assert "n = 300 → **0.0964**" in text
+    assert "**`mde_plausibility_bound = 0.04`.**" in text
+    assert "**`MDE (0.0964) > bound (0.04)`" in text
+    assert "`order_quantity` / statistic | 1 / `MEAN_EXCESS_PER_TAKE` |" in text
+    assert (
+        "`mde_reference_ask` / θ / slippage / variance | 0.30 (house convention; "
+        "not a claim about admitted asks) / 0.0695 / 0.01 / 0.25." in text
+    )
+
+    assert OFFWINDOW_T4_HYPOTHESIS_ID == "H-OFFWINDOW-T4-2026-09"
+    assert OFFWINDOW_T4_HYPOTHESIS_CLASS == "pm_us_crh_offwindow_price_only"
+    assert OFFWINDOW_T4_K_VARIANTS == 1
+    assert OFFWINDOW_T4_MIN_STATION_DAYS == 300
+    assert OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE == 0.025
+    assert OFFWINDOW_T4_PLAUSIBILITY_BOUND == 0.04
+    assert OFFWINDOW_T4_REFERENCE_ASK == 0.30
+    assert OFFWINDOW_T4_RULING_DATE == "2026-09-27"
+
+    per_variant_alpha = OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE / 4 / OFFWINDOW_T4_K_VARIANTS
+    assert per_variant_alpha == pytest.approx(0.00625)
+    recomputed = recompute_mde(per_variant_alpha=per_variant_alpha, n_station_days=300)
+    assert abs(recomputed - OFFWINDOW_T4_MDE) <= MDE_MISMATCH_TOLERANCE
+
+
+def test_register_underpowered_offwindow_t4_writes_zero_look_record(tmp_path: Path) -> None:
+    path = ledger_path(tmp_path)
+    record = register_offwindow_t4_underpowered(
+        path=path, registered_at="2026-09-27", freeze_commit=_VALID_FREEZE_SHA
+    )
+
+    assert record.hypothesis_id == OFFWINDOW_T4_HYPOTHESIS_ID
+    assert record.hypothesis_class == OFFWINDOW_T4_HYPOTHESIS_CLASS
+    assert record.status == "UNDERPOWERED_NOT_REGISTERED"
+    assert record.allocated_alpha == 0.0
+    assert record.per_variant_alpha == 0.0
+    assert record.is_zero_look is True
+    assert record.look_policy == "SINGLE_LOOK"
+    assert record.mde_fee_theta == pytest.approx(0.0695)
+    assert record.order_quantity == 1
+    assert record.station_day_statistic == "MEAN_EXCESS_PER_TAKE"
+    assert record.freeze_commit == _VALID_FREEZE_SHA
+
+    round_tripped = read_hypothesis_ledger(path)
+    assert round_tripped == (record,)
+    assert programme_budget_remaining(round_tripped) == 4
+
+
+def test_offwindow_t4_unexpected_registered_status_leaves_bytes_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors the NO-SIDE/ARCHIVE-RECAL T3: monkeypatching the plausibility
+    bound up would power this design to `REGISTERED` under the OLD
+    compute-then-write-unconditionally order. Check-before-write refuses it
+    before any bytes reach the file."""
+    path = ledger_path(tmp_path)
+    write_hypothesis_ledger(path, ())
+    before_bytes = path.read_bytes()
+    before_mtime_ns = path.stat().st_mtime_ns
+
+    monkeypatch.setattr(hypothesis_register, "OFFWINDOW_T4_PLAUSIBILITY_BOUND", 0.20)
+    with pytest.raises(UnexpectedRegistrationStatusError):
+        register_offwindow_t4_underpowered(
+            path=path, registered_at="2026-09-27", freeze_commit=_VALID_FREEZE_SHA
+        )
+
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_offwindow_t4_does_not_flip_horizon_tolling() -> None:
+    """RA-9f-A must never flip `HORIZON_TOLLING_LANDED` -- it stays False
+    both as a bare import and after this hypothesis is (zero-look)
+    registered, since this UNDERPOWERED path never reaches the
+    schema_version=3 REGISTERED branch that flag gates."""
+    assert HORIZON_TOLLING_LANDED is False
+
+
+def test_offwindow_t4_is_a_registrable_underpowered_choice() -> None:
+    assert OFFWINDOW_T4_HYPOTHESIS_ID in hypothesis_register._UNDERPOWERED_REGISTRATIONS
+    entry = hypothesis_register._UNDERPOWERED_REGISTRATIONS[OFFWINDOW_T4_HYPOTHESIS_ID]
+    assert entry.requires_freeze_commit is True
+
+
+def test_offwindow_t4_cli_missing_freeze_commit_is_refused(tmp_path: Path) -> None:
+    path = ledger_path(tmp_path)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(tmp_path),
+            "--registered-at",
+            "2026-09-27",
+            "--register-underpowered",
+            OFFWINDOW_T4_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 2
+    assert not path.exists()
+
+
+def test_offwindow_t4_cli_malformed_freeze_commit_is_refused(tmp_path: Path) -> None:
+    path = ledger_path(tmp_path)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(tmp_path),
+            "--registered-at",
+            "2026-09-27",
+            "--freeze-commit",
+            "deadbee",
+            "--register-underpowered",
+            OFFWINDOW_T4_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 2
+    assert not path.exists()
+
+
+def test_offwindow_t4_cli_dirty_tree_is_refused(tmp_path: Path) -> None:
+    repo_root = _dirty_git_repo(tmp_path / "repo")
+    derived_root = tmp_path / "derived"
+    path = ledger_path(derived_root)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(derived_root),
+            "--registered-at",
+            "2026-09-27",
+            "--freeze-commit",
+            _VALID_FREEZE_SHA,
+            "--repo-root",
+            str(repo_root),
+            "--register-underpowered",
+            OFFWINDOW_T4_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 2
+    assert not path.exists()
+
+
+def test_offwindow_t4_cli_clean_tree_registers_and_duplicate_leaves_bytes_unchanged(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    derived_root = tmp_path / "derived"
+    path = ledger_path(derived_root)
+    argv = [
+        "--derived-root",
+        str(derived_root),
+        "--registered-at",
+        "2026-09-27",
+        "--freeze-commit",
+        _VALID_FREEZE_SHA,
+        "--repo-root",
+        str(repo_root),
+        "--register-underpowered",
+        OFFWINDOW_T4_HYPOTHESIS_ID,
+    ]
+    assert main(argv) == 0
+    records = read_hypothesis_ledger(path)
+    assert len(records) == 1
+    assert records[0].hypothesis_id == OFFWINDOW_T4_HYPOTHESIS_ID
+    assert records[0].freeze_commit == _VALID_FREEZE_SHA
+    after_first = path.read_bytes()
+
+    assert main(argv) == 1
+    assert path.read_bytes() == after_first
+
+
+def test_offwindow_t4_registered_at_before_ruling_date_refused(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    derived_root = tmp_path / "derived"
+    path = ledger_path(derived_root)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(derived_root),
+            "--registered-at",
+            "2026-09-26",
+            "--freeze-commit",
+            _VALID_FREEZE_SHA,
+            "--repo-root",
+            str(repo_root),
+            "--register-underpowered",
+            OFFWINDOW_T4_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 2
+    assert not path.exists()
+
+
+def test_existing_underpowered_ids_still_refuse_freeze_commit(tmp_path: Path) -> None:
+    """Regression: adding a freeze-commit-requiring third id must not widen
+    NO-SIDE/ARCHIVE-RECAL's existing refusal."""
+    path = ledger_path(tmp_path)
+    exit_code = main(
+        [
+            "--derived-root",
+            str(tmp_path),
+            "--registered-at",
+            "2026-09-26",
+            "--freeze-commit",
+            _VALID_FREEZE_SHA,
+            "--register-underpowered",
+            ARCHIVE_RECAL_HYPOTHESIS_ID,
+        ]
+    )
+    assert exit_code == 2
+    assert not path.exists()
