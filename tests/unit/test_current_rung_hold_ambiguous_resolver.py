@@ -4412,6 +4412,14 @@ async def test_min_create_time_below_created_ns_without_eof_is_not_complete(
                             "type": "ACTIVITY_TYPE_TRADE",
                             "trade": {
                                 "aggressor": {"id": "SOME-OTHER-ORDER"},
+                                # TRADE-ROW-DRIFT (fixture realism, not a
+                                # weakening -- see the commit message): F3
+                                # shows every captured row carries BOTH legs.
+                                # Without a well-formed foreign passive, the
+                                # new both-legs-required rule would flag this
+                                # row uninterpretable and stop the read on
+                                # page 1, which is not what THIS test proves.
+                                "passive": {"id": "SOME-OTHER-PASSIVE"},
                                 "marketSlug": slug,
                                 "qtyDecimal": "1",
                                 "createTime": "2020-01-01T00:00:00.000000000Z",
@@ -4570,6 +4578,14 @@ async def test_page_two_without_activities_list_is_refused(
                         "type": "ACTIVITY_TYPE_TRADE",
                         "trade": {
                             "aggressor": {"id": "SOME-OTHER-ORDER"},
+                            # TRADE-ROW-DRIFT (fixture realism, not a
+                            # weakening -- see the commit message): without a
+                            # well-formed foreign passive, the new
+                            # both-legs-required rule would flag this row
+                            # uninterpretable and stop the read on page 1 --
+                            # this test's own point is that the malformed
+                            # PAGE 2 guard fires, not page 1.
+                            "passive": {"id": "SOME-OTHER-PASSIVE"},
                             "qtyDecimal": "1",
                             "createTime": "2026-09-23T17:22:07.900000000Z",
                         },
@@ -5096,6 +5112,320 @@ async def test_mia_0923_past_day_shape_with_trade_row_stays_ambiguous(
         contradictions = client.resolver_evidence_contradictions
         assert len(contradictions) == 1
         assert contradictions[0]["venue_order_id"] == order_id
+        await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# TRADE-ROW-DRIFT (plan r1/r2, 2026-09-27): an uninterpretable TRADE row
+# (aggressor/passive/trade drifted, or a leg id disagreeing with its own
+# execution block) must stop the activities read incomplete -- never let a
+# false ZERO_FILL retire on a read that silently dropped it as "not ours".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_uninterpretable_trade_row_blocks_a_false_zero_fill_same_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T4 (r1, key test) + M1/M12/M15: a GET-confirmed terminal zero-fill, an
+    eof-complete empty positions read, and ONE `eof=True` activities page
+    carrying a single uninterpretable TRADE row (foreign aggressor, passive
+    leg renamed) must NEVER retire. RED today: the row silently counts as
+    `()`, the read is reported complete with zero trades, and the order
+    retires as a false ZERO_FILL. Same-day instrument (default harness) --
+    see the past-day sibling below for AC4(e)'s missing backstop."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN, (
+            "an uninterpretable trade row must never authorize a zero-fill retirement"
+        )
+        activities_queries = client._private_read.paths.count(  # type: ignore[attr-defined]
+            PORTFOLIO_ACTIVITIES_PATH,
+        )
+        assert activities_queries == 1, "the read must stop at the drifted page, never page past it"
+        assert client._resolver_last_failure_kind[current.intent_id] == "activities_uninterpretable"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_uninterpretable_trade_row_blocks_a_false_zero_fill_past_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T4, past-day sibling (r2 T-4): the SAME uninterpretable-row shape on
+    the PAST-DAY harness (~4892/4996), where AC4(e)'s same-day holding
+    backstop never runs at all -- proving the block does not depend on that
+    backstop existing."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        stale_instrument = build_second_instrument()
+        assert client._cache.instrument(stale_instrument.id) is None
+        client._cache.add_instrument(stale_instrument)
+        current = client._latch.current_open()
+        assert current is not None
+        _rewrite_resolver_context_instrument(client, current.intent_id, str(stale_instrument.id))
+        stale_slug = instrument_id_to_slug(stale_instrument.id)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=stale_slug, state="ORDER_STATE_EXPIRED", cum_quantity=0,
+            leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+
+        refreshed = client._latch.current()
+        assert refreshed is not None
+        assert refreshed.state is SubmitIntentState.OPEN, (
+            "an uninterpretable trade row must never authorize a zero-fill retirement, "
+            "even with no same-day holding backstop to fall back on"
+        )
+        activities_queries = client._private_read.paths.count(  # type: ignore[attr-defined]
+            PORTFOLIO_ACTIVITIES_PATH,
+        )
+        assert activities_queries == 1, "the read must stop at the drifted page, never page past it"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_stale_alert_carries_activities_uninterpretable_failure_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """TRADE-ROW-DRIFT review (MEDIUM): end-to-end delivery. A pass that
+    records `activities_uninterpretable` (T-1, `:5182` above) must surface
+    through the SAME `open_intent_stale` CRITICAL a stale intent already
+    alerts via -- G7's backdate mechanism (`test_stale_alert_carries_the_
+    actual_last_failure_kind`, `:5664`) -- carrying THIS failure kind, never
+    the dict-membership default `"none"` or a stale prior kind."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        current = client._latch.current_open()
+        assert current is not None
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+        assert client._resolver_last_failure_kind[current.intent_id] == "activities_uninterpretable"
+
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+
+        await _run_exactly_one_pass(client)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1
+        assert alerts[0]["last_failure_kind"] == "activities_uninterpretable"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_well_formed_foreign_trade_row_still_retires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T5 (r1): liveness positive control -- the SAME single-page shape as
+    the test above, but the foreign row's passive leg is well-formed (not
+    renamed). An ordinary foreign trade must never itself block a true
+    zero-fill; only an UNINTERPRETABLE row does."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passive": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, (
+            "a well-formed foreign trade row must never itself block a true zero-fill"
+        )
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_matched_trade_then_uninterpretable_row_same_page_still_contradicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """T6 (r1) + M2/M15: page 1 carries BOTH a real TRADE for this venue
+    order id AND an uninterpretable row. `extend` must run before the
+    uninterpretable-row `break` (M2: a `break` placed BEFORE `extend` would
+    silently discard the matched trade this test proves is never lost) --
+    the evidence-contradiction CRITICAL must still fire, `complete=False`,
+    `trade_count=1`, in exactly one query."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_EXPIRED", cum_quantity=0, leaves_quantity=0,
+        )
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[PORTFOLIO_ACTIVITIES_PATH] = {  # type: ignore[attr-defined]
+            "activities": [
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": order_id},
+                        "marketSlug": slug,
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+                {
+                    "type": "ACTIVITY_TYPE_TRADE",
+                    "trade": {
+                        "aggressor": {"id": "SOME-OTHER-ORDER"},
+                        "passiveOrder": {"id": "SOME-OTHER-PASSIVE"},
+                        "qtyDecimal": "1",
+                        "createTime": "2026-09-23T17:22:07.900000000Z",
+                    },
+                },
+            ],
+            "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, "a contradiction never retires"
+        contradictions = client.resolver_evidence_contradictions
+        assert len(contradictions) == 1
+        assert contradictions[0]["trade_count"] == "1"
+        activities_queries = client._private_read.paths.count(  # type: ignore[attr-defined]
+            PORTFOLIO_ACTIVITIES_PATH,
+        )
+        assert activities_queries == 1
         await client._disconnect()
 
 
