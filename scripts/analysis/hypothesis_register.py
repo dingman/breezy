@@ -37,6 +37,19 @@ inline); the ruling's own peer confirmation ("The :137 condition is closed.")
 unblocked registration as this separate, later slice (see the AUD-18a plan
 doc, `docs/plans/backlog/AUDIT_2026-09-21/AUD-18a_register_archive_recal_plan_r1_2026-09-26.md`).
 
+**Trigger-4 off-window UNDERPOWERED disposition (RA-9f-A, 2026-09-28).**
+Registers `H-OFFWINDOW-T4-2026-09` per
+`docs/evidence/RULING_RA-9_trigger4_offwindow_2026-09-27.md` §4/§5: MDE 0.0964
+at the pre-registered `n=300` (`programme_alpha_override=0.025`) exceeds the
+ruling's `mde_plausibility_bound` of 0.04, so `register_hypothesis` returns
+`UNDERPOWERED_NOT_REGISTERED`, consuming no alpha and no slot. Unlike the two
+dispositions above, this one's `--freeze-commit` is REQUIRED (40-hex,
+CLI-validated) rather than refused, and the live append additionally refuses
+on a dirty tree (`git status --porcelain` at `--repo-root`, default this
+script's own repo root) -- see `_UnderpoweredRegistration.requires_freeze_commit`
+and `_git_tree_is_dirty`. This never flips
+`breezy.analysis.hypothesis_ledger.HORIZON_TOLLING_LANDED`.
+
 **Never run against the real derived directory from a test.** Every test in
 `tests/unit/test_hypothesis_register.py` passes an explicit
 `--derived-root`/`path=` into a `tmp_path`. The real invocation this item
@@ -48,11 +61,12 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 from breezy.analysis.hypothesis_ledger import (
     EVIDENCED_FEE_THETA,
@@ -96,6 +110,16 @@ __all__ = [
     "NO_SIDE_REFERENCE_ASK",
     "NO_SIDE_RULING_DATE",
     "NO_SIDE_SLIPPAGE_ALLOWANCE",
+    "OFFWINDOW_T4_HYPOTHESIS_CLASS",
+    "OFFWINDOW_T4_HYPOTHESIS_ID",
+    "OFFWINDOW_T4_K_VARIANTS",
+    "OFFWINDOW_T4_MDE",
+    "OFFWINDOW_T4_MIN_STATION_DAYS",
+    "OFFWINDOW_T4_PLAUSIBILITY_BOUND",
+    "OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE",
+    "OFFWINDOW_T4_REFERENCE_ASK",
+    "OFFWINDOW_T4_RULING_DATE",
+    "OFFWINDOW_T4_SLIPPAGE_ALLOWANCE",
     "UnexpectedRegistrationStatusError",
     "default_derived_root",
     "ledger_path",
@@ -104,6 +128,7 @@ __all__ = [
     "register_archive_recal_underpowered",
     "register_forecast_taker_closed_disposition",
     "register_no_side_underpowered",
+    "register_offwindow_t4_underpowered",
 ]
 
 #: Shared with `scripts/analysis/whole_tape_paper_replay.py`'s own override
@@ -181,12 +206,43 @@ ARCHIVE_RECAL_FREEZE_COMMIT: Final[str] = "49261a5c2119fc621863ad7df05af1e2a96c6
 #: is the same date.
 ARCHIVE_RECAL_RULING_DATE: Final[str] = "2026-09-25"
 
+#: RULING_RA-9_trigger4_offwindow_2026-09-27.md §4 table -- `hypothesis_id` /
+#: `hypothesis_class`. RA-9f-A Plan A (r1, AS AMENDED by the r2 delta).
+OFFWINDOW_T4_HYPOTHESIS_ID: Final[str] = "H-OFFWINDOW-T4-2026-09"
+OFFWINDOW_T4_HYPOTHESIS_CLASS: Final[str] = "pm_us_crh_offwindow_price_only"
+#: §1/§4 -- "`k_variants` | 1". One two-range-window design, not a sweep.
+OFFWINDOW_T4_K_VARIANTS: Final[int] = 1
+#: §4 -- "`min_station_days` (with-takes) | **300**."
+OFFWINDOW_T4_MIN_STATION_DAYS: Final[int] = 300
+#: §4/RULING_RA-9 A-3/A-3a -- "`programme_alpha_override` | 0.025 ->
+#: `allocated_alpha` = 0.00625, `per_variant_alpha` = **0.00625** (RA-8b)".
+OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE: Final[float] = 0.025
+#: §5 -- "n = 300 -> **0.0964**" (`recompute_mde` reproduces this within
+#: `MDE_MISMATCH_TOLERANCE`, given `OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE` /
+#: `MAX_HYPOTHESES` / `OFFWINDOW_T4_K_VARIANTS`).
+OFFWINDOW_T4_MDE: Final[float] = 0.0964
+#: §5 -- "**`mde_plausibility_bound = 0.04`.**"
+OFFWINDOW_T4_PLAUSIBILITY_BOUND: Final[float] = 0.04
+#: §4 -- "`mde_reference_ask` / theta / slippage / variance | 0.30 (...) /
+#: 0.0695 / 0.01 / 0.25."
+OFFWINDOW_T4_REFERENCE_ASK: Final[float] = 0.30
+OFFWINDOW_T4_SLIPPAGE_ALLOWANCE: Final[float] = 0.01
+#: r2 delta amendment 2 -- the `_UNDERPOWERED_REGISTRATIONS` entry carries the
+#: ruling date `2026-09-27` (NOT the ruling's own `04-25` corpus-declaration
+#: date, which governs SEARCH/CONFIRM, not this CLI gate).
+OFFWINDOW_T4_RULING_DATE: Final[str] = "2026-09-27"
+
 #: The 40-hex git sha shape. Lives ONLY at the CLI boundary (`main`) -- the
 #: functions below (`register_forecast_taker_closed_disposition`,
 #: `register_and_persist`) never validate `freeze_commit`'s format, so
 #: existing direct-call tests using placeholder shas like `"deadbee"` stay
 #: green.
 _FREEZE_COMMIT_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}$")
+
+#: This script's own repo root, used as the default `--repo-root` for the
+#: dirty-tree check below (`Path(__file__)` is
+#: `<repo>/scripts/analysis/hypothesis_register.py`).
+_DEFAULT_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 
 
 class UnexpectedRegistrationStatusError(ValueError):
@@ -334,22 +390,108 @@ def register_archive_recal_underpowered(*, path: Path, registered_at: str) -> Hy
     )
 
 
+def register_offwindow_t4_underpowered(
+    *, path: Path, registered_at: str, freeze_commit: str
+) -> HypothesisRecord:
+    """RULING_RA-9_trigger4_offwindow_2026-09-27.md §4/§5 (RA-9f-A Plan A,
+    r1 AS AMENDED by the r2 delta): registers the trigger-4 off-window
+    price-only hypothesis's pre-decided `UNDERPOWERED_NOT_REGISTERED`
+    disposition (MDE 0.0964 > plausibility bound 0.04 at the pre-registered
+    `n=300`, `programme_alpha_override=0.025`).
+
+    Unlike `register_no_side_underpowered`/`register_archive_recal_underpowered`,
+    `freeze_commit` is a caller-supplied argument, never a module constant:
+    the r2 delta drops the r1 plan's `git rev-parse HEAD`-at-append-time
+    design in favour of an explicit, 40-hex-validated `--freeze-commit` at
+    the CLI boundary (`main`), checked against a clean tree at append time.
+    This function itself performs neither check -- see `main` and
+    `_git_tree_is_dirty`.
+
+    Every `OFFWINDOW_T4_*` input is referenced here as a module global, read
+    at CALL time -- never bound as a default-argument value -- mirroring the
+    existing two registrars, so a test can `monkeypatch.setattr` this
+    module's constant (e.g. `OFFWINDOW_T4_PLAUSIBILITY_BOUND`) and observe
+    the effect on the next call, including `register_and_persist`'s
+    check-before-write refusal.
+    """
+    return register_and_persist(
+        path=path,
+        hypothesis_id=OFFWINDOW_T4_HYPOTHESIS_ID,
+        hypothesis_class=OFFWINDOW_T4_HYPOTHESIS_CLASS,
+        registered_at=registered_at,
+        k_variants=OFFWINDOW_T4_K_VARIANTS,
+        freeze_commit=freeze_commit,
+        disposition="NORMAL",
+        min_station_days=OFFWINDOW_T4_MIN_STATION_DAYS,
+        max_single_day_leg_share_cap=MAX_SINGLE_DAY_LEG_SHARE,
+        mde_at_allocated_alpha=OFFWINDOW_T4_MDE,
+        mde_plausibility_bound=OFFWINDOW_T4_PLAUSIBILITY_BOUND,
+        power_is_primary_only=True,
+        mde_reference_ask=OFFWINDOW_T4_REFERENCE_ASK,
+        mde_fee_theta=EVIDENCED_FEE_THETA,
+        mde_slippage_allowance=OFFWINDOW_T4_SLIPPAGE_ALLOWANCE,
+        mde_variance_bound=VARIANCE_BOUND,
+        station_day_statistic=STATION_DAY_STATISTIC,
+        order_quantity=PINNED_ORDER_QUANTITY,
+        look_policy="SINGLE_LOOK",
+        programme_alpha_override=OFFWINDOW_T4_PROGRAMME_ALPHA_OVERRIDE,
+        require_status="UNDERPOWERED_NOT_REGISTERED",
+    )
+
+
+class _UnderpoweredRegistration(NamedTuple):
+    """One `--register-underpowered` dispatch entry."""
+
+    register_fn: Callable[..., HypothesisRecord]
+    ruling_date: str
+    ruling_file: str
+    #: r2 delta amendment 1: True ONLY for `H-OFFWINDOW-T4-2026-09` -- an
+    #: explicit, 40-hex `--freeze-commit` is required (never derived from
+    #: `git rev-parse HEAD`), and the live append additionally refuses on a
+    #: dirty tree. False (default) preserves the existing NO-SIDE/
+    #: ARCHIVE-RECAL behaviour, where `--freeze-commit` is refused outright.
+    requires_freeze_commit: bool = False
+
+
+def _git_tree_is_dirty(repo_root: Path) -> bool:
+    """True if `git status --porcelain` at `repo_root` reports anything, OR
+    if the `git` invocation itself fails -- fails CLOSED (treated as dirty)
+    rather than silently treating an unreadable tree as clean. Takes an
+    explicit `repo_root` (never a bare `git status`) so tests can point this
+    at a disposable tmp_path repo instead of the real checkout."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return True
+    return bool(result.stdout.strip())
+
+
 #: `--register-underpowered`'s per-id dispatch table: maps a registrable
 #: hypothesis_id to (registration function, its ruling's date gate, the
-#: ruling file named in the CLI's date-gate error message). Replaces the
-#: single `NO_SIDE_RULING_DATE` gate now that a second id is registrable.
-_UNDERPOWERED_REGISTRATIONS: Final[
-    dict[str, tuple[Callable[..., HypothesisRecord], str, str]]
-] = {
-    NO_SIDE_HYPOTHESIS_ID: (
+#: ruling file named in the CLI's date-gate error message, whether it
+#: requires --freeze-commit). Replaces the single `NO_SIDE_RULING_DATE` gate
+#: now that a third id is registrable.
+_UNDERPOWERED_REGISTRATIONS: Final[dict[str, _UnderpoweredRegistration]] = {
+    NO_SIDE_HYPOTHESIS_ID: _UnderpoweredRegistration(
         register_no_side_underpowered,
         NO_SIDE_RULING_DATE,
         "RULING_H-NO-SIDE-2026-09_horizon_2026-09-25.md",
     ),
-    ARCHIVE_RECAL_HYPOTHESIS_ID: (
+    ARCHIVE_RECAL_HYPOTHESIS_ID: _UnderpoweredRegistration(
         register_archive_recal_underpowered,
         ARCHIVE_RECAL_RULING_DATE,
         "RULING_H-ARCHIVE-RECAL-2026-09_horizon_2026-09-25.md",
+    ),
+    OFFWINDOW_T4_HYPOTHESIS_ID: _UnderpoweredRegistration(
+        register_offwindow_t4_underpowered,
+        OFFWINDOW_T4_RULING_DATE,
+        "RULING_RA-9_trigger4_offwindow_2026-09-27.md",
+        requires_freeze_commit=True,
     ),
 }
 
@@ -387,8 +529,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--freeze-commit",
         default=None,
-        help="git sha of the freeze-date commit. Required only for "
-        "--register-forecast-taker-closed; refused for --register-underpowered.",
+        help="git sha of the freeze-date commit. Required for "
+        "--register-forecast-taker-closed and for "
+        f"--register-underpowered {OFFWINDOW_T4_HYPOTHESIS_ID}; refused for "
+        "every other --register-underpowered id.",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Repo root for the dirty-tree check that gates "
+        f"--register-underpowered {OFFWINDOW_T4_HYPOTHESIS_ID} (default: this "
+        "script's own repo root). Ignored by every other action.",
     )
     action_group = parser.add_mutually_exclusive_group()
     action_group.add_argument(
@@ -430,25 +582,49 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.register_underpowered:
-        if args.freeze_commit is not None:
+        entry = _UNDERPOWERED_REGISTRATIONS[args.register_underpowered]
+
+        if entry.requires_freeze_commit:
+            if not args.freeze_commit or not _FREEZE_COMMIT_RE.match(args.freeze_commit):
+                print(
+                    "error: --freeze-commit must be a 40-hex git sha for "
+                    f"--register-underpowered {args.register_underpowered}",
+                    file=sys.stderr,
+                )
+                return 2
+            repo_root = args.repo_root or _DEFAULT_REPO_ROOT
+            if _git_tree_is_dirty(repo_root):
+                print(
+                    f"error: refusing --register-underpowered {args.register_underpowered}: "
+                    f"git tree at {repo_root} is dirty (git status --porcelain)",
+                    file=sys.stderr,
+                )
+                return 2
+        elif args.freeze_commit is not None:
             print(
                 "error: --freeze-commit is only valid with "
-                "--register-forecast-taker-closed",
+                "--register-forecast-taker-closed or "
+                f"--register-underpowered {OFFWINDOW_T4_HYPOTHESIS_ID}",
                 file=sys.stderr,
             )
             return 2
-        register_fn, ruling_date, ruling_file = _UNDERPOWERED_REGISTRATIONS[
-            args.register_underpowered
-        ]
-        if args.registered_at < ruling_date:
+
+        if args.registered_at < entry.ruling_date:
             print(
-                f"error: --registered-at must be on or after {ruling_date} "
-                f"({ruling_file}'s date)",
+                f"error: --registered-at must be on or after {entry.ruling_date} "
+                f"({entry.ruling_file}'s date)",
                 file=sys.stderr,
             )
             return 2
         try:
-            record = register_fn(path=path, registered_at=args.registered_at)
+            if entry.requires_freeze_commit:
+                record = entry.register_fn(
+                    path=path,
+                    registered_at=args.registered_at,
+                    freeze_commit=args.freeze_commit,
+                )
+            else:
+                record = entry.register_fn(path=path, registered_at=args.registered_at)
         except (DuplicateHypothesisIdError, UnexpectedRegistrationStatusError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
