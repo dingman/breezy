@@ -417,7 +417,7 @@ If S0 (Q5) cannot certify that post-freeze logs stay unscored, S4-infra parity i
 4. An optional Var-bound tightening for ask-capped variants needs an outcome-free justification [VER :293-295]. The gain is small (≤ 8%) [INF].
 
 **S2 statistics (R3-04):**
-- Rung-event Brier, Murphy decomposition `Brier = rel − res + unc`, with an exact-reconstruction check. On six-rung ladders, unc = 5/36 [VER ruling :36-38].
+- Rung-event Brier, Murphy decomposition `Brier = rel − res + unc`, with an exact-reconstruction check. unc = ō(1−ō) is computed from data; it equals 5/36 only when each of the six rungs wins 1/6 of the time, which is an empirical property of the 09-20 corpus [VER ruling :36-38], not a structural law. Rung events within a station-day are mutually exclusive, so every CI uses the station-day cluster bootstrap.
 - **No Murphy implementation exists in the repo** [VER: grep `murphy` over `*.py` = 0 hits; `forecast_conditional_scoring.py:139-162` has reliability buckets only]. It is built in SL-7.
 - **Holdout size.**
   - The v5.0 holdout (07-01..) holds ≈90 days × 4 ≈ **360 station-days** to 2026-09-28, before label gaps. The expected paired-Brier CI half-width is ≈ 1.96·0.11/√360 ≈ **±0.011** [INF].
