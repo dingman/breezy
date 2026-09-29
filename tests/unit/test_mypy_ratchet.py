@@ -286,6 +286,11 @@ CLEAN: Final[tuple[str, ...]] = (
     # `src/breezy/analysis` package -- same pattern as the archive_table.py
     # override below. The package ceiling (13) stays unchanged.
     "src/breezy/analysis/brier_decomposition.py",
+    # SL-8 (FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md, build-slice
+    # row SL-8): the hierarchical EMOS calibration + S2 gate module -- same
+    # single-module override pattern as SL-7's brier_decomposition.py above.
+    # The package ceiling (13) stays unchanged.
+    "src/breezy/analysis/nbp_calibration.py",
     "src/breezy/domain",
     "src/breezy/ingest",
     "src/breezy/normalize",
