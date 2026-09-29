@@ -43,6 +43,12 @@ _COMMITTED_MANIFEST_NAMES: tuple[str, ...] = (
     # (0.0695). It declares no `exit_rule` either, so the gate stays closed
     # for it exactly as for every sibling above.
     "pm_us_crh_v4.json",
+    # SL-13 (2026-09-29): the forecast_quantile_ladder family. Shadow-only,
+    # status DRAFT_NOT_REGISTERED, `family_id` absent from
+    # `_EXIT_RULE_REGISTERED_FAMILIES`, and the manifest declares neither
+    # `exit_rule` nor `no_leg_exit` -- it satisfies both invariants below
+    # exactly like every other committed manifest.
+    "pm_us_crh_fq_v1.json",
 )
 
 

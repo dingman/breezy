@@ -218,6 +218,11 @@ def test_the_family_line_is_not_a_supervisor_readiness_marker() -> None:
         "current_rung_hold": "CurrentRungHoldStrategy subscribed",
         "continuous_rung_hold": "ContinuousRungHoldStrategy subscribed",
         "forecast_ladder": "ForecastLadderStrategy subscribed",
+        # SL-13: ForecastQuantileLadderStrategy.on_start's own
+        # `self.log.info(f"{_CLASS_NAME} subscribed")` -- distinct from, and
+        # never colliding with, the `boot_family ...` observability line
+        # (`_BOOT_FAMILY_RE`) or any other readiness marker above.
+        "forecast_quantile_ladder": "ForecastQuantileLadderStrategy subscribed",
     }
     for marker in COMPOSITION_KIND_SUBSCRIBED_MARKERS.values():
         assert "boot_family" not in marker

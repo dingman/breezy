@@ -111,6 +111,14 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # real `-m` entry points reachable from a deployed wrapper script.
     "breezy.runtime.exec_state_db_path",
     "breezy.runtime.structural_pin_guard",
+    # SL-13p A-5 (2026-09-29): the shadow-parity harness and its pure batch
+    # sibling both import `breezy.runtime` (the former via
+    # `breezy.runtime.backtest_harness`, the latter via
+    # `breezy.runtime.trade_supervisor_core.LAUNCH_UTC`), so source (c)
+    # picks both up -- tracked here rather than excluded, since neither is
+    # known to be unimportable under Stage 0.
+    "scripts.analysis.nbp_shadow_parity",
+    "scripts.analysis.nbp_shadow_parity_pure",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

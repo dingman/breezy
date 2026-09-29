@@ -40,7 +40,21 @@ from scripts.analysis.nbp_shadow_parity_pure import (
     run_batch_parity,
 )
 
-STATION = "KMIA"
+#: The registry's `(venue, city)` key space is the city TOKEN ("MIA"), never
+#: the ICAO station id ("KMIA") -- `SiteRegistry.climate_day_window` (and
+#: every sibling accessor) is keyed by `sites.toml`'s `[sites.polymarket_us
+#: .MIA]` section name. `ForecastQuantileLadderStrategy.on_start` resolves
+#: `std_utc_offset_hours` for every station in `self.config.stations`
+#: through that same registry call -- exactly mirroring
+#: `forecast_quantile_ladder.composition.build_forecast_quantile_ladder_
+#: strategies`, whose `stations` always come from `app.trade._today_by_
+#: station`'s `SUPPORTED_STATIONS` (city tokens: LAX/MDW/MIA/SFO), never an
+#: ICAO code. `STATION` is threaded through every other identifier in this
+#: fixture too (`ForecastPoint.station`, the synthetic instrument symbol,
+#: `ForecastQuantileStateActor`'s state keys), so it must be internally
+#: consistent one way or the other -- the registry lookup is the one call
+#: that fixes which way: the city token.
+STATION = "MIA"
 STD_UTC_OFFSET_HOURS = -5.0
 CLIMATE_DAY = dt.date(2026, 9, 2)
 LADDER = (Rung(rung_id="i1", lo=None, hi=None),)
@@ -82,7 +96,7 @@ def _instrument() -> BinaryOption:
         instrument_id=_INSTRUMENT_ID,
         raw_symbol=_INSTRUMENT_ID.symbol,
         outcome="Yes",
-        description="KMIA daily high, synthetic SL-13p fixture",
+        description="MIA daily high, synthetic SL-13p fixture",
         asset_class=AssetClass.ALTERNATIVE,
         currency=USD,
         price_precision=increment.precision,
