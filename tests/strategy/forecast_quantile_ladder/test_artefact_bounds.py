@@ -44,6 +44,7 @@ _VALID_PAYLOAD: dict[str, Any] = {
     "n_min": 30,
     "sigma_d": 1.0,
     "rung_probability_bounds": {},
+    "fit_status": "OK",
 }
 
 
@@ -84,6 +85,29 @@ def test_an_unpinned_all_zero_expected_sha_is_refused(tmp_path: Path) -> None:
 
 def test_zero_draws_is_refused(tmp_path: Path) -> None:
     payload = dict(_VALID_PAYLOAD, emos_draws_by_version={"v1": []})
+    path, sha = _write(tmp_path, payload)
+
+    with pytest.raises(BoundsArtefactPinMismatchError):
+        load_bounds_artefact_draws(path, expected_sha256=sha)
+
+
+def test_a_non_converged_fit_status_is_refused(tmp_path: Path) -> None:
+    """SL-8b2: a `NbpCalibrationArtefact` whose fit never converged must
+    fail this loader closed, exactly like a bad sha pin -- never silently
+    hand the live strategy bootstrap draws from an unconverged fit."""
+    payload = dict(_VALID_PAYLOAD, fit_status="FIT_NOT_CONVERGED")
+    path, sha = _write(tmp_path, payload)
+
+    with pytest.raises(BoundsArtefactPinMismatchError):
+        load_bounds_artefact_draws(path, expected_sha256=sha)
+
+
+def test_a_missing_fit_status_key_is_refused_as_unknown(tmp_path: Path) -> None:
+    """SL-8b2: an artefact that never asserted convergence at all (no
+    `fit_status` key) must fail closed as UNKNOWN, never fall back to
+    "assume converged" -- there is no production artefact predating this
+    schema to stay compatible with."""
+    payload = {key: value for key, value in _VALID_PAYLOAD.items() if key != "fit_status"}
     path, sha = _write(tmp_path, payload)
 
     with pytest.raises(BoundsArtefactPinMismatchError):

@@ -706,6 +706,27 @@ def test_g20a_ignores_stations_outside_the_stratum_map() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SL-8b2: no S2 gate may report PASS or FAIL on a non-converged fit.
+# ---------------------------------------------------------------------------
+
+
+def test_g20_refuses_on_a_non_converged_fit_status() -> None:
+    rows = [_residual("KMIA", dt.date(2025, 1, 1), 0.05)]
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.evaluate_g20(
+            rows, tercile_edges=(10.0, 14.0), fit_status=calib.FIT_STATUS_NOT_CONVERGED
+        )
+
+
+def test_g20a_refuses_on_an_unknown_fit_status() -> None:
+    rows = [_residual("KMIA", dt.date(2025, 1, 1), 0.05)]
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.evaluate_g20a(
+            rows, stratum_of_station={"KMIA": "KMIA"}, fit_status=calib.FIT_STATUS_UNKNOWN
+        )
+
+
+# ---------------------------------------------------------------------------
 # G2.1 (+ review item 5)
 # ---------------------------------------------------------------------------
 
@@ -732,6 +753,12 @@ def test_g21_with_no_populated_bucket_trivially_passes() -> None:
     result = calib.evaluate_g21(events)
     assert result.buckets == ()
     assert result.passed is True
+
+
+def test_g21_refuses_on_a_non_converged_fit_status() -> None:
+    events = [_rung_event("KMIA", dt.date(2025, 1, 1), 0.5, True)]
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.evaluate_g21(events, fit_status=calib.FIT_STATUS_NOT_CONVERGED)
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +815,18 @@ def test_g23_fails_when_m2_and_m0_are_identical() -> None:
     assert result.d_res_point == pytest.approx(0.0, abs=1e-9)
 
 
+def test_g22_refuses_on_a_non_converged_fit_status() -> None:
+    events = _matched_events(10)
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.evaluate_g22(events, iterations=200, fit_status=calib.FIT_STATUS_NOT_CONVERGED)
+
+
+def test_g23_refuses_on_a_non_converged_fit_status() -> None:
+    events = _matched_events(10)
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.evaluate_g23(events, iterations=200, fit_status=calib.FIT_STATUS_NOT_CONVERGED)
+
+
 # ---------------------------------------------------------------------------
 # C-1
 # ---------------------------------------------------------------------------
@@ -835,6 +874,30 @@ def test_c1_reevaluate_runs_the_full_gate_set_when_clean() -> None:
     assert result.g20.groups == ()
     assert isinstance(result.g22.passed, bool)
     assert isinstance(result.g23.passed, bool)
+
+
+def test_c1_reevaluate_refuses_on_a_non_converged_fit_status() -> None:
+    """SL-8b2: none of the four C-1 gates may report a result computed from
+    a fit that did not converge -- refuses BEFORE returning a
+    ``C1Reevaluation`` a caller might otherwise trust."""
+    deviation = calib.C1Deviation(
+        declared_at=dt.date(2026, 11, 1), reason="G2.1 holdout-only failure", co_signed_by="mle-reviewer"
+    )
+    primary_window = (dt.date(2026, 7, 1), dt.date(2026, 10, 31))
+    events = _matched_events(10)  # all in 2025, outside the primary window.
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.reevaluate_c1(
+            deviation=deviation,
+            primary_holdout_window=primary_window,
+            g20_rows=[],
+            g20a_rows=[],
+            g20a_stratum_of_station={},
+            g21_events=[],
+            g22_events=events,
+            g23_events=events,
+            tercile_edges=(10.0, 14.0),
+            fit_status=calib.FIT_STATUS_NOT_CONVERGED,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -918,6 +981,29 @@ def test_write_artefact_writes_json_and_sha256_sidecar(tmp_path: Path) -> None:
     assert sidecar.exists()
     assert sidecar.read_text().strip() == digest
     assert digest == calib.artefact_sha256(_fixed_artefact())
+
+
+def test_write_artefact_refuses_a_non_ok_fit_status(tmp_path: Path) -> None:
+    """SL-8b2: `write_artefact` is the ONE path live code sees calibration
+    through (module docstring) -- it must refuse a non-converged fit rather
+    than write it where the live strategy could load it."""
+    artefact = dataclasses.replace(_fixed_artefact(), fit_status=calib.FIT_STATUS_NOT_CONVERGED)
+    path = tmp_path / "nbp_calibration.json"
+
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.write_artefact(path, artefact)
+
+    assert not path.exists()
+
+
+def test_write_artefact_refuses_an_unknown_fit_status(tmp_path: Path) -> None:
+    artefact = dataclasses.replace(_fixed_artefact(), fit_status=calib.FIT_STATUS_UNKNOWN)
+    path = tmp_path / "nbp_calibration.json"
+
+    with pytest.raises(calib.FitNotConvergedError):
+        calib.write_artefact(path, artefact)
+
+    assert not path.exists()
 
 
 def dataclasses_replace(instance: calib.MatchedEvent, **changes: object) -> calib.MatchedEvent:
@@ -1068,10 +1154,12 @@ def test_artefact_from_json_dict_round_trips_the_new_convergence_fields() -> Non
     assert parsed.emos_params_by_version == {"v5.0": (0.5, 0.1)}
 
 
-def test_artefact_from_json_dict_defaults_convergence_fields_for_a_pre_schema_payload() -> None:
+def test_artefact_from_json_dict_defaults_informational_fields_for_a_pre_schema_payload() -> None:
     """An artefact written BEFORE this schema change carries none of the
-    new keys -- the parser must default exactly like the dataclass itself
-    ("assume converged"), never raise KeyError."""
+    new keys -- the parser must default the four purely INFORMATIONAL
+    fields exactly like the dataclass itself ("assume converged"), never
+    raise KeyError. ``fit_status`` itself is NOT given that treatment (SL-8b2
+    review, next test) -- it is the gate-blocking field."""
     payload = {
         "schema_version": 1,
         "cdf_method": "normal",
@@ -1092,11 +1180,36 @@ def test_artefact_from_json_dict_defaults_convergence_fields_for_a_pre_schema_pa
     assert parsed.delta_nfev == 0
     assert parsed.converged_by_version == {}
     assert parsed.nfev_by_version == {}
-    assert parsed.fit_status == calib.FIT_STATUS_OK
     assert parsed.kappa == math.inf
     # The pre-review-item-3 2-element draw entries still parse, delta
     # falling back to the artefact's own top-level delta.
     assert parsed.emos_draws_by_version["v5.0"] == ((0.4, 0.08, 1.0), (0.6, 0.12, 1.0))
+
+
+def test_artefact_from_json_dict_missing_fit_status_parses_unknown_not_ok() -> None:
+    """SL-8b2 review: `fit_status` is the single GATE-BLOCKING field --
+    unlike the informational convergence fields above, a payload missing it
+    parses to UNKNOWN, never falls back to OK ("assume converged"). There
+    are no production artefacts predating this schema to stay compatible
+    with (the fix-first review's own finding)."""
+    payload = {
+        "schema_version": 1,
+        "cdf_method": "normal",
+        "recalibration": "none",
+        "correction_form": "none",
+        "delta": 1.0,
+        "kappa": 1.0,
+        "emos_params_by_version": {"v5.0": [0.5, 0.1]},
+        "emos_draws_by_version": {"v5.0": [[0.4, 0.08, 1.0]]},
+        "n_min": 412,
+        "sigma_d": 0.11,
+        "rung_probability_bounds": {},
+    }
+
+    parsed = calib.artefact_from_json_dict(payload)
+
+    assert parsed.fit_status == calib.FIT_STATUS_UNKNOWN
+    assert parsed.fit_status != calib.FIT_STATUS_OK
 
 
 # ---------------------------------------------------------------------------

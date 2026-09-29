@@ -115,6 +115,8 @@ __all__ = [
     "DeltaFitDiagnostics",
     "FIT_STATUS_NOT_CONVERGED",
     "FIT_STATUS_OK",
+    "FIT_STATUS_UNKNOWN",
+    "FitNotConvergedError",
     "G20GroupResult",
     "G20Result",
     "G20aResult",
@@ -384,6 +386,43 @@ def open_holdout(
 class PrimaryHoldoutLeakError(RuntimeError):
     """A holdout-tagged row reached kappa selection, parameter fitting, or a
     C-1 reevaluation input that must never see it."""
+
+
+#: `NbpCalibrationArtefact.fit_status` (SL-8b review item 2) -- a
+#: gate-blocking flag, not merely a log line. `FIT_STATUS_NOT_CONVERGED`
+#: means the shared delta fit, or at least one version's own `(a_v,
+#: gamma_v)` fit, did not converge; a consumer must refuse to trust rung
+#: probabilities derived from such an artefact. Defined here (ahead of the
+#: G2.0-G2.3 gate evaluators below, SL-8b2) because `FIT_STATUS_OK` is each
+#: evaluator's own default `fit_status` argument value, evaluated at
+#: function-definition time.
+FIT_STATUS_OK: Final[str] = "OK"
+FIT_STATUS_NOT_CONVERGED: Final[str] = "FIT_NOT_CONVERGED"
+#: SL-8b2: an artefact payload that never asserted convergence at all (no
+#: `fit_status` key -- see `artefact_from_json_dict`) parses to UNKNOWN, not
+#: OK. There are no production artefacts predating this schema, so there is
+#: no "assume converged" compatibility burden to preserve for this field.
+FIT_STATUS_UNKNOWN: Final[str] = "UNKNOWN"
+
+
+class FitNotConvergedError(RuntimeError):
+    """Raised by an S2 gate evaluator, :func:`reevaluate_c1`, or
+    :func:`write_artefact` when handed a ``fit_status`` other than
+    :data:`FIT_STATUS_OK` (SL-8b2) -- a non-converged, or UNKNOWN, fit must
+    never produce a gate PASS or a written artefact the live strategy could
+    load."""
+
+
+def _refuse_unless_fit_converged(fit_status: str, *, gate: str) -> None:
+    """Shared guard for every S2 gate evaluator and :func:`reevaluate_c1`
+    (SL-8b2) -- a gate may never report ANY result (PASS or FAIL) computed
+    from a fit that did not converge, or whose convergence was never
+    asserted at all (``FIT_STATUS_UNKNOWN``)."""
+    if fit_status != FIT_STATUS_OK:
+        raise FitNotConvergedError(
+            f"{gate} refuses on fit_status={fit_status!r} (SL-8b2): an S2 gate "
+            "may never evaluate a non-converged (or UNKNOWN) calibration fit"
+        )
 
 
 BOOTSTRAP_ITERATIONS: Final[int] = 2000
@@ -1389,9 +1428,16 @@ def evaluate_g20(
     seed: int = BOOTSTRAP_SEED,
     iterations: int = BOOTSTRAP_ITERATIONS,
     alpha: float = 0.05,
+    fit_status: str = FIT_STATUS_OK,
 ) -> G20Result:
     """G2.0 window-mismatch gate: residual by calendar month and by
-    day-length tercile, Holm-corrected, date-clustered (plan S4.1)."""
+    day-length tercile, Holm-corrected, date-clustered (plan S4.1).
+
+    Raises :class:`FitNotConvergedError` (SL-8b2) if ``fit_status`` is
+    anything other than :data:`FIT_STATUS_OK` -- this gate may never report
+    PASS or FAIL against a calibration fit that did not converge.
+    """
+    _refuse_unless_fit_converged(fit_status, gate="evaluate_g20")
     groups = _month_and_tercile_groups(rows, tercile_edges=tercile_edges)
     group_results = _evaluate_residual_groups(groups, seed=seed, iterations=iterations, alpha=alpha)
     flat = not any(result.holm_rejected for result in group_results if result.status == "TESTED")
@@ -1419,12 +1465,18 @@ def evaluate_g20a(
     seed: int = BOOTSTRAP_SEED,
     iterations: int = BOOTSTRAP_ITERATIONS,
     alpha: float = 0.05,
+    fit_status: str = FIT_STATUS_OK,
 ) -> G20aResult:
     """G2.0a near-midnight-max stratum gate (amendment A-6). ``rows`` must
     already be filtered to near-midnight station-days (within 2h of LST
     midnight) by the caller -- that filter needs the IEM ASOS 1-min daily-max
     instant, which this module never reads. ``stratum_of_station`` maps each
-    row's station to its :data:`NEAR_MIDNIGHT_STRATA` key."""
+    row's station to its :data:`NEAR_MIDNIGHT_STRATA` key.
+
+    Raises :class:`FitNotConvergedError` (SL-8b2) if ``fit_status`` is not
+    :data:`FIT_STATUS_OK`.
+    """
+    _refuse_unless_fit_converged(fit_status, gate="evaluate_g20a")
     groups: dict[str, list[StationDayResidual]] = {}
     for row in rows:
         stratum = stratum_of_station.get(row.station)
@@ -1486,10 +1538,16 @@ def evaluate_g21(
     seed: int = BOOTSTRAP_SEED,
     iterations: int = BOOTSTRAP_ITERATIONS,
     alpha: float = 0.05,
+    fit_status: str = FIT_STATUS_OK,
 ) -> G21Result:
     """G2.1 calibration gate: per-bucket ``z = (observed-predicted)/SE``,
     ``SE`` from the station-day cluster bootstrap, Holm-corrected. FAILs
-    only if Holm rejects in at least one bucket (plan S4.1)."""
+    only if Holm rejects in at least one bucket (plan S4.1).
+
+    Raises :class:`FitNotConvergedError` (SL-8b2) if ``fit_status`` is not
+    :data:`FIT_STATUS_OK`.
+    """
+    _refuse_unless_fit_converged(fit_status, gate="evaluate_g21")
     bucketed: dict[tuple[float, float], list[RungEvent]] = {}
     for lower, upper in pairwise(edges):
         members = [
@@ -1604,9 +1662,15 @@ def evaluate_g22(
     seed: int = BOOTSTRAP_SEED,
     iterations: int = BOOTSTRAP_ITERATIONS,
     alpha: float = 0.05,
+    fit_status: str = FIT_STATUS_OK,
 ) -> SkillGateResult:
     """G2.2 skill vs M1: paired rung-Brier difference (M2-M1) CI upper < 0,
-    OR ``D_res(M2-M1)`` CI lower > 0 (plan S4.1)."""
+    OR ``D_res(M2-M1)`` CI lower > 0 (plan S4.1).
+
+    Raises :class:`FitNotConvergedError` (SL-8b2) if ``fit_status`` is not
+    :data:`FIT_STATUS_OK`.
+    """
+    _refuse_unless_fit_converged(fit_status, gate="evaluate_g22")
     brier_point = _brier(events, "p_m2") - _brier(events, "p_m1")
     brier_draws = cluster_bootstrap_draws(
         events,
@@ -1649,9 +1713,15 @@ def evaluate_g23(
     iterations: int = BOOTSTRAP_ITERATIONS,
     alpha: float = 0.05,
     floor: float = G22_TARGET_DIFFERENCE_X,
+    fit_status: str = FIT_STATUS_OK,
 ) -> G23Result:
     """G2.3 materiality vs M0: ``D_res(M2-M0)`` station-day-clustered CI
-    lower > 0 AND point estimate >= ``floor`` (plan S4.1, R2-12)."""
+    lower > 0 AND point estimate >= ``floor`` (plan S4.1, R2-12).
+
+    Raises :class:`FitNotConvergedError` (SL-8b2) if ``fit_status`` is not
+    :data:`FIT_STATUS_OK`.
+    """
+    _refuse_unless_fit_converged(fit_status, gate="evaluate_g23")
     point = _d_res(events, a="p_m2", b="p_m0")
     draws = cluster_bootstrap_draws(
         events,
@@ -1691,12 +1761,19 @@ def reevaluate_c1(
     g22_events: Sequence[MatchedEvent],
     g23_events: Sequence[MatchedEvent],
     tercile_edges: tuple[float, float],
+    fit_status: str = FIT_STATUS_OK,
 ) -> C1Reevaluation:
     """Re-evaluates G2.0-G2.3 AS A SET on a fresh C-1 holdout (plan S4.1;
     ruling S12 recorded residual note). Raises :class:`PrimaryHoldoutLeakError`
     if ANY input row's ``climate_day`` falls inside the once-peeked primary
     holdout window -- none of the four gates may reference, pool with, or be
-    conditioned on it."""
+    conditioned on it.
+
+    Also raises :class:`FitNotConvergedError` (SL-8b2, forwarded to every
+    sub-gate) if ``fit_status`` is not :data:`FIT_STATUS_OK` -- none of the
+    four gates may report a result computed from a fit that did not
+    converge.
+    """
     start, end = primary_holdout_window
     all_dates = (
         [row.climate_day for row in g20_rows]
@@ -1713,11 +1790,13 @@ def reevaluate_c1(
             )
     return C1Reevaluation(
         deviation=deviation,
-        g20=evaluate_g20(g20_rows, tercile_edges=tercile_edges),
-        g20a=evaluate_g20a(g20a_rows, stratum_of_station=g20a_stratum_of_station),
-        g21=evaluate_g21(g21_events),
-        g22=evaluate_g22(g22_events),
-        g23=evaluate_g23(g23_events),
+        g20=evaluate_g20(g20_rows, tercile_edges=tercile_edges, fit_status=fit_status),
+        g20a=evaluate_g20a(
+            g20a_rows, stratum_of_station=g20a_stratum_of_station, fit_status=fit_status
+        ),
+        g21=evaluate_g21(g21_events, fit_status=fit_status),
+        g22=evaluate_g22(g22_events, fit_status=fit_status),
+        g23=evaluate_g23(g23_events, fit_status=fit_status),
     )
 
 
@@ -1727,13 +1806,11 @@ def reevaluate_c1(
 
 ARTEFACT_SCHEMA_VERSION: Final[int] = 1
 
-#: `NbpCalibrationArtefact.fit_status` (SL-8b review item 2) -- a
-#: gate-blocking flag, not merely a log line. `FIT_STATUS_NOT_CONVERGED`
-#: means the shared delta fit, or at least one version's own `(a_v,
-#: gamma_v)` fit, did not converge; a consumer must refuse to trust rung
-#: probabilities derived from such an artefact.
-FIT_STATUS_OK: Final[str] = "OK"
-FIT_STATUS_NOT_CONVERGED: Final[str] = "FIT_NOT_CONVERGED"
+# `FIT_STATUS_OK` / `FIT_STATUS_NOT_CONVERGED` / `FIT_STATUS_UNKNOWN` /
+# `FitNotConvergedError` now live earlier in this module (SL-8b2), right
+# after `PrimaryHoldoutLeakError` -- the G2.0-G2.3 gate evaluators need
+# `FIT_STATUS_OK` as a default argument value, which Python evaluates at
+# function-definition time, well before this point in the file.
 
 
 def rung_bounds_from_calibration(
@@ -1876,12 +1953,18 @@ def artefact_from_json_dict(payload: Mapping[str, Any]) -> NbpCalibrationArtefac
     at the coercion, not silently downstream.
 
     BACKWARD COMPATIBLE with an artefact written before the convergence
-    diagnostics existed: ``delta_converged``/``delta_nfev``/
-    ``converged_by_version``/``nfev_by_version``/``fit_status`` are all
-    OPTIONAL keys in ``payload`` -- absent, each falls back to the
-    dataclass's own default ("assume converged"), exactly like
+    diagnostics existed for the four purely INFORMATIONAL fields --
+    ``delta_converged``/``delta_nfev``/``converged_by_version``/
+    ``nfev_by_version`` are OPTIONAL keys in ``payload``; absent, each falls
+    back to the dataclass's own default ("assume converged"), exactly like
     :func:`emos_params_from_draw_entry`'s own 2-vs-3-element tolerance for
     ``emos_draws_by_version`` entries.
+
+    ``fit_status`` is NOT given that treatment (SL-8b2 review): it is the
+    single GATE-BLOCKING field every consumer checks, and there are no
+    production artefacts predating this schema to stay compatible with. A
+    payload missing ``fit_status`` parses to :data:`FIT_STATUS_UNKNOWN`, not
+    :data:`FIT_STATUS_OK` -- fail CLOSED, never "assume converged."
     """
     delta = float(payload["delta"])
     kappa = payload["kappa"]
@@ -1919,8 +2002,9 @@ def artefact_from_json_dict(payload: Mapping[str, Any]) -> NbpCalibrationArtefac
         kwargs["nfev_by_version"] = {
             version: int(nfev) for version, nfev in payload["nfev_by_version"].items()
         }
-    if "fit_status" in payload:
-        kwargs["fit_status"] = str(payload["fit_status"])
+    kwargs["fit_status"] = (
+        str(payload["fit_status"]) if "fit_status" in payload else FIT_STATUS_UNKNOWN
+    )
     return NbpCalibrationArtefact(**kwargs)
 
 
@@ -1996,7 +2080,22 @@ def artefact_sha256(artefact: NbpCalibrationArtefact) -> str:
 def write_artefact(path: Path, artefact: NbpCalibrationArtefact) -> str:
     """Writes ``path`` (the json) and a ``.sha256`` sidecar next to it,
     returning the digest (plan S3.2 item 9: live code sees calibration only
-    through the sha-pinned manifest artefact)."""
+    through the sha-pinned manifest artefact).
+
+    Refuses (SL-8b2) to write an ``artefact`` whose ``fit_status`` is not
+    :data:`FIT_STATUS_OK` -- this is the ONE path "live code sees
+    calibration only through" (module docstring), so refusing HERE keeps a
+    non-converged (or UNKNOWN) fit from ever reaching a sha-pinned manifest,
+    rather than relying on every future producer script to remember the
+    check itself.
+    """
+    if artefact.fit_status != FIT_STATUS_OK:
+        raise FitNotConvergedError(
+            f"write_artefact refuses to write {path} (SL-8b2): "
+            f"fit_status={artefact.fit_status!r}, not {FIT_STATUS_OK!r} -- a "
+            "consumer must never load calibration params from an unconverged "
+            "(or UNKNOWN) fit"
+        )
     digest = artefact_sha256(artefact)
     path.write_text(artefact_json(artefact))
     path.with_suffix(path.suffix + ".sha256").write_text(digest + "\n")

@@ -56,11 +56,24 @@ __all__ = [
 
 _UNPINNED_SHA256: Final[str] = "0" * 64
 
+#: Mirrors `breezy.analysis.nbp_calibration.FIT_STATUS_OK`/
+#: `FIT_STATUS_UNKNOWN` by VALUE only -- `breezy.strategy` (the live trading
+#: path) may never import `breezy.analysis` (pyproject.toml, "The live
+#: trading path never imports the offline analysis layer"), so this is a
+#: deliberate, contract-required duplication of the two string constants,
+#: not a second source of truth for the convergence RULE itself (SL-8b2: a
+#: non-OK `fit_status` must fail this loader closed exactly like a bad sha
+#: pin).
+_FIT_STATUS_OK: Final[str] = "OK"
+_FIT_STATUS_UNKNOWN: Final[str] = "UNKNOWN"
+
 
 class BoundsArtefactPinMismatchError(ValueError):
     """Raised when ``expected_sha256`` is the unpinned all-zero placeholder,
-    when the artefact file's own sha256 disagrees with it, or when the
-    parsed artefact carries zero bootstrap draws."""
+    when the artefact file's own sha256 disagrees with it, when the parsed
+    artefact carries zero bootstrap draws, or when the artefact's own
+    ``fit_status`` is not ``"OK"`` (SL-8b2 -- missing entirely counts as
+    ``"UNKNOWN"``, not OK)."""
 
 
 class BoundsNotReadyError(RuntimeError):
@@ -85,6 +98,13 @@ def load_bounds_artefact_draws(path: str, *, expected_sha256: str) -> BoundsArte
     ``NbpCalibrationArtefact.emos_draws_by_version``'s own convention) and
     pooled into ONE flat ``draws`` tuple -- ``rung_probability_interval``
     takes a single ``Sequence[EmosParams]``, not one per version.
+
+    Raises :class:`BoundsArtefactPinMismatchError` (SL-8b2) if the
+    artefact's own ``fit_status`` is not ``"OK"`` -- a missing ``fit_status``
+    key counts as ``"UNKNOWN"``, not OK, exactly like
+    ``breezy.analysis.nbp_calibration.artefact_from_json_dict``'s own
+    parser. The live strategy must never trade off bootstrap draws from a
+    fit that did not converge, or never asserted convergence at all.
     """
     if expected_sha256 == _UNPINNED_SHA256:
         raise BoundsArtefactPinMismatchError(
@@ -99,6 +119,14 @@ def load_bounds_artefact_draws(path: str, *, expected_sha256: str) -> BoundsArte
             f"expected the manifest-pinned {expected_sha256!r}",
         )
     payload: dict[str, Any] = json.loads(raw)
+    fit_status = str(payload.get("fit_status", _FIT_STATUS_UNKNOWN))
+    if fit_status != _FIT_STATUS_OK:
+        raise BoundsArtefactPinMismatchError(
+            f"bounds artefact at {path!r} carries fit_status={fit_status!r}, "
+            f"not {_FIT_STATUS_OK!r} (SL-8b2) -- refusing to trade off a "
+            "calibration fit that did not converge, or never asserted "
+            "convergence at all",
+        )
     delta = float(payload["delta"])
     cdf_method = CdfMethod(payload["cdf_method"])
     draws: list[EmosParams] = []

@@ -71,6 +71,7 @@ _ARTEFACT_PAYLOAD = {
     "n_min": 30,
     "sigma_d": 1.0,
     "rung_probability_bounds": {},
+    "fit_status": "OK",
 }
 
 
@@ -267,6 +268,42 @@ def test_a_schema_missing_key_artefact_fails_closed_with_a_clean_config_error(
     raw = json.dumps(payload).encode("utf-8")
     artefact_path.write_bytes(raw)
     family_id = "pm_us_crh_fq_missing_key"
+    _write_manifest_pointing_at(
+        families_dir,
+        family_id=family_id,
+        artefact_path=artefact_path,
+        artefact_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        env=_boot_env_and_catalog(tmp_path, family_id=family_id),
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+
+    assert code == EXIT_CONFIG_ERROR
+    assert RecordingNode.instances == []
+
+
+def test_a_non_converged_fit_status_artefact_fails_closed_with_a_clean_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    """SL-8b2: an artefact whose own `fit_status` is not `"OK"` must refuse
+    to boot exactly like a bad sha pin, malformed JSON, or a schema-missing
+    key -- `load_bounds_artefact_draws` raises `BoundsArtefactPinMismatchError`,
+    already in `app/trade.py`'s clean `EXIT_CONFIG_ERROR` tuple."""
+    families_dir = tmp_path / "deploy" / "families"
+    artefacts_dir = families_dir / "artefacts"
+    artefacts_dir.mkdir(parents=True, exist_ok=True)
+    artefact_path = artefacts_dir / "not_converged_density.json"
+    payload = dict(_ARTEFACT_PAYLOAD, fit_status="FIT_NOT_CONVERGED")
+    raw = json.dumps(payload).encode("utf-8")
+    artefact_path.write_bytes(raw)
+    family_id = "pm_us_crh_fq_not_converged"
     _write_manifest_pointing_at(
         families_dir,
         family_id=family_id,

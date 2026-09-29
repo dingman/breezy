@@ -75,6 +75,7 @@ _ARTEFACT_PAYLOAD: dict[str, Any] = {
     "n_min": 30,
     "sigma_d": 1.0,
     "rung_probability_bounds": {},
+    "fit_status": "OK",
 }
 
 
