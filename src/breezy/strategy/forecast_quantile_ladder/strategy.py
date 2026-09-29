@@ -37,25 +37,17 @@ from typing import Literal, Protocol, runtime_checkable
 
 from nautilus_trader.trading.strategy import Strategy
 
+from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
-from breezy.strategy.forecast_quantile_ladder.decision import Decision, Take, evaluate
+from breezy.strategy.forecast_quantile_ladder.decision import Decision, SidedAsk, Take, evaluate
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
 from breezy.strategy.ladder_ev.quantile_density import Rung
 
-__all__ = ["ForecastQuantileLadderStrategy", "SubmissionRefused"]
-
-
-class SubmissionRefused(Exception):
-    """Raised by nothing here -- callers use :meth:`try_submit`'s return value.
-
-    Kept as a named type so a future caller that DOES want to raise on a
-    refused guard has one ready, without inventing a new name at that call
-    site.
-    """
+__all__ = ["ForecastQuantileLadderStrategy", "SupportsExpiresAtNs"]
 
 
 @runtime_checkable
@@ -91,6 +83,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         quantile_actor: ForecastQuantileStateActor,
         artefact: CalibrationArtefact,
         ladder_cfg: LadderEvConfig,
+        bounds_provider: BoundsProvider,
         latch: QuantileLadderLatch | None = None,
         order_submission_permit: SupportsExpiresAtNs | None = None,
         submit_veto: Callable[[], str | None] | None = None,
@@ -100,6 +93,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         self._quantile_actor = quantile_actor
         self._artefact = artefact
         self._ladder_cfg = ladder_cfg
+        self._bounds_provider = bounds_provider
         self._latch = latch if latch is not None else QuantileLadderLatch()
         self._order_submission_permit = order_submission_permit
         self._submit_veto = submit_veto
@@ -117,17 +111,16 @@ class ForecastQuantileLadderStrategy(Strategy):
         self,
         *,
         now_ns: int,
+        std_utc_offset_hours: float,
         station: str,
         climate_day: date,
-        instrument_id: str,
         ladder: Sequence[Rung],
         rung_id: str,
         side: Literal["yes", "no"] = "yes",
-        ask: float,
+        ask: SidedAsk,
         fee_coefficient: float,
         slippage_floor_prob: float,
         h_hours: float,
-        n_cell: int,
     ) -> Decision:
         """Evaluate one (station-day, rung, side) snapshot and log it.
 
@@ -139,11 +132,12 @@ class ForecastQuantileLadderStrategy(Strategy):
             station,
         ).value_at(now_ns)
         decision = evaluate(
+            now_ns=now_ns,
+            std_utc_offset_hours=std_utc_offset_hours,
             permit_covers=self._permit_covers(now_ns),
             vector=vector,
             station=station,
             climate_day=climate_day,
-            instrument_id=instrument_id,
             ladder=ladder,
             rung_id=rung_id,
             side=side,
@@ -151,9 +145,9 @@ class ForecastQuantileLadderStrategy(Strategy):
             fee_coefficient=fee_coefficient,
             slippage_floor_prob=slippage_floor_prob,
             h_hours=h_hours,
-            n_cell=n_cell,
             cfg=self._ladder_cfg,
             artefact=self._artefact,
+            bounds_provider=self._bounds_provider,
             latch=self._latch,
         )
         self.shadow_decisions.append(self._shadow_log_line(decision, now_ns=now_ns))

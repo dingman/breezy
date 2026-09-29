@@ -41,7 +41,10 @@ _FORBIDDEN_IMPORTED_NAMES = (
 
 
 def _package_py_files() -> list[Path]:
-    files = sorted(_PACKAGE_ROOT.glob("*.py"))
+    """Recursive: a later slice may nest modules under this package, and the
+    contract must keep covering them without anyone remembering to widen a
+    ``glob("*.py")`` (item 6, SL-12 review)."""
+    files = sorted(_PACKAGE_ROOT.rglob("*.py"))
     assert files, f"expected at least one module under {_PACKAGE_ROOT}"
     return files
 

@@ -1,4 +1,4 @@
-"""Sha-pinned calibration artefact loader (EMOS params + rung-probability haircuts).
+"""Sha-pinned calibration artefact loader (EMOS location-scale params only).
 
 Plan §2.2 / §3.2 item 9 (`FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md`):
 "Live code sees calibration only through the sha-pinned manifest artefact."
@@ -7,6 +7,12 @@ package needs -- reading the artefact bytes -- and refuses outright unless
 the artefact's own sha256 equals the caller-supplied ``expected_sha256``
 (which in production is the family manifest's pinned
 ``density_artefact_sha256``, never a source constant).
+
+**No haircut fields (SL-12 review item 4).** ``p_lower``/``p_upper`` are
+never derived here from a fixed haircut around a point estimate -- they are
+bootstrap draws (ruling A-6, A-4) supplied at evaluation time through an
+injected ``bounds.BoundsProvider``. This artefact carries only what builds
+the point-estimate CDF.
 """
 
 from __future__ import annotations
@@ -40,10 +46,6 @@ class CalibrationArtefact:
     sha256: str
     cdf_method: CdfMethod
     emos: EmosParams
-    #: Conservative haircuts applied around the point rung-probability
-    #: estimate to obtain ``p_lower``/``p_upper`` for :func:`decision.evaluate`.
-    p_lower_haircut: float
-    p_upper_haircut: float
 
 
 def load_calibration_artefact(path: str, *, expected_sha256: str) -> CalibrationArtefact:
@@ -77,6 +79,4 @@ def load_calibration_artefact(path: str, *, expected_sha256: str) -> Calibration
             gamma=float(emos_payload["gamma"]),
             delta=float(emos_payload["delta"]),
         ),
-        p_lower_haircut=float(payload["p_lower_haircut"]),
-        p_upper_haircut=float(payload["p_upper_haircut"]),
     )

@@ -8,24 +8,33 @@ real-MessageBus style (no Nautilus internals monkeypatched).
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
-from breezy.strategy.forecast_quantile_ladder.decision import NotExecutable, Take
+from breezy.strategy.forecast_quantile_ladder.decision import NotExecutable, SidedAsk, Take
 from breezy.strategy.forecast_quantile_ladder.strategy import (
     ForecastQuantileLadderStrategy,
     SupportsExpiresAtNs,
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
-from breezy.strategy.ladder_ev.quantile_density import CdfMethod, EmosParams, Rung
+from breezy.strategy.ladder_ev.quantile_density import (
+    CdfMethod,
+    EmosParams,
+    Rung,
+    rung_probabilities,
+)
 
 _DAY = dt.date(2026, 10, 1)
+_KMIA_OFFSET = -5.0
+# 2026-09-30T12:00:00Z: LST for KMIA (-5) is 2026-09-30 -> D+1 is _DAY.
+_NOW_NS = int(dt.datetime(2026, 9, 30, 12, 0, 0, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
 _LADDER = (
     Rung("lt", None, 77),
     Rung("i0", 78, 79),
@@ -49,9 +58,14 @@ def _artefact() -> CalibrationArtefact:
         sha256="a" * 64,
         cdf_method=CdfMethod.NORMAL,
         emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
-        p_lower_haircut=0.03,
-        p_upper_haircut=0.03,
     )
+
+
+def _bounds_provider(
+    *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str
+) -> RungBounds:
+    p_hat = rung_probabilities(cdf, ladder)[rung_id]
+    return RungBounds(p_hat=p_hat, p_lower=max(0.0, p_hat - 0.03), p_upper=min(1.0, p_hat + 0.03))
 
 
 def _build(
@@ -62,7 +76,7 @@ def _build(
 ) -> ForecastQuantileLadderStrategy:
     quantile_actor = ForecastQuantileStateActor(stations=("KMIA",))
     clock = TestClock()
-    clock.set_time(1_000_000_000_000)
+    clock.set_time(_NOW_NS)
     quantile_actor.register_base(
         portfolio=TestComponentStubs.portfolio(),
         msgbus=TestComponentStubs.msgbus(),
@@ -75,6 +89,7 @@ def _build(
         quantile_actor=quantile_actor,
         artefact=_artefact(),
         ladder_cfg=LadderEvConfig(),
+        bounds_provider=_bounds_provider,
         order_submission_permit=order_submission_permit,
         submit_veto=submit_veto,
         fee_verified=fee_verified,
@@ -91,17 +106,16 @@ def test_evaluate_snapshot_with_no_forecast_yet_refuses_and_logs_it() -> None:
     strategy = _build()
 
     decision = strategy.evaluate_snapshot(
-        now_ns=1_000_000_000_000,
+        now_ns=_NOW_NS,
+        std_utc_offset_hours=_KMIA_OFFSET,
         station="KMIA",
         climate_day=_DAY,
-        instrument_id="KMIA-2026-10-01-i1.POLY_US",
         ladder=_LADDER,
         rung_id="i1",
-        ask=0.30,
+        ask=SidedAsk(side="yes", instrument_id="KMIA-2026-10-01-i1.POLY_US", price=0.30),
         fee_coefficient=0.0695,
         slippage_floor_prob=0.01,
         h_hours=6.0,
-        n_cell=90,
     )
 
     assert isinstance(decision, NotExecutable)

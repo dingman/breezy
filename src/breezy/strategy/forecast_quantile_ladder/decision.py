@@ -8,6 +8,19 @@ never latched and never counted as a trial... A new cycle never re-opens a
 latched rung. Sizing never reads ``kelly_stake_fraction``, and no
 operator-reserved value is read or assigned."
 
+Ruling A-6 (docs/evidence/RULING_forecast_nbp_reopen_2026-09-29.md §12,
+SL-12 domain review) is binding here:
+
+* The margin comes from :func:`breezy.strategy.forecast_quantile_ladder.
+  margin.forecast_margin`, never ``ladder_ev.scoring.margin`` (no
+  ``n_cell``/archive-cell gate for this family).
+* The take rule is side-specific: YES needs ``p_lower - ask - fee(ask) >
+  margin``; NO needs ``(1 - p_upper) - no_ask - fee(no_ask) > margin``, and
+  ``no_ask`` MUST be quoted from the native NO instrument -- see
+  :class:`SidedAsk` and :func:`evaluate`'s first check.
+* ``p_lower``/``p_upper`` are bootstrap draws (A-4), never an inline
+  haircut -- see :mod:`bounds`.
+
 Deliberately does NOT import
 :func:`breezy.strategy.ladder_ev.decision.exclusion_filter` /
 :class:`breezy.strategy.ladder_ev.decision.ExclusionInputs` (the DEGRADED-mode
@@ -22,27 +35,28 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
+from breezy.ingest.gaps import local_standard_date
+from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
+from breezy.strategy.forecast_quantile_ladder.margin import forecast_margin
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
-from breezy.strategy.ladder_ev.quantile_density import (
-    Percentiles,
-    Rung,
-    apply_emos,
-    build_cdf,
-    rung_probabilities,
-)
-from breezy.strategy.ladder_ev.scoring import ev_net, ev_net_no, margin
+from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung, apply_emos, build_cdf
+from breezy.strategy.ladder_ev.scoring import ev_net, ev_net_no
 from breezy.strategy.weather_common.costs import DepthAwareTradeCost, venue_fee_prob
 
 __all__ = [
+    "QTY",
+    "AskSideMismatchError",
     "Decision",
+    "NotDPlus1",
     "NotExecutable",
     "Refuse",
+    "SidedAsk",
     "Take",
     "evaluate",
 ]
@@ -52,12 +66,46 @@ __all__ = [
 QTY: Literal[1] = 1
 
 
+class AskSideMismatchError(ValueError):
+    """Raised when the supplied :class:`SidedAsk` was quoted from the WRONG
+    side's instrument -- e.g. a YES ask passed for a NO evaluation.
+
+    Review HIGH (SL-12): the NO leg must be priced from its own native NO
+    instrument, never derived or substituted from the YES ask.
+    """
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SidedAsk:
+    """One venue ask, tagged with the side and instrument it was quoted from.
+
+    The single source of truth for "which instrument did this price come
+    from" -- :func:`evaluate` asserts ``ask.side == side`` before pricing
+    anything with it, so a caller cannot accidentally price a NO take off a
+    YES quote (or vice versa).
+    """
+
+    side: Literal["yes", "no"]
+    instrument_id: str
+    price: float
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class NotExecutable:
     """Outside a live order-permit window: never latched, never counted as a
     trial (plan §3.3)."""
 
     reason: str = "outside_permit_window"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NotDPlus1:
+    """``climate_day`` is not D+1 of ``now_ns`` in the station's LST (plan
+    §2.3: V1 is D+1 only). Never latched, never counted as a trial -- the
+    same non-trial treatment as :class:`NotExecutable`, for a distinct
+    reason."""
+
+    reason: str = "not_d_plus_1"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -72,7 +120,8 @@ class Take:
     """The first qualifying snapshot for this (station-day, rung, side).
 
     ``qty`` is always :data:`QTY` -- present on the record for observability,
-    never accepted as a caller input.
+    never accepted as a caller input. ``instrument_id`` is read off the
+    winning :class:`SidedAsk`, never a separate caller-supplied value.
     """
 
     instrument_id: str
@@ -87,34 +136,61 @@ class Take:
     p_upper: float
 
 
-Decision = NotExecutable | Refuse | Take
+Decision = NotExecutable | NotDPlus1 | Refuse | Take
+
+
+def _is_d_plus_1(*, now_ns: int, climate_day: date, std_utc_offset_hours: float) -> bool:
+    today_lst = local_standard_date(now_ns, std_utc_offset_hours)
+    return climate_day == today_lst + timedelta(days=1)
 
 
 def evaluate(
     *,
+    now_ns: int,
+    std_utc_offset_hours: float,
     permit_covers: bool,
     vector: ForecastQuantileVector | None,
     station: str,
     climate_day: date,
-    instrument_id: str,
     ladder: Sequence[Rung],
     rung_id: str,
     side: Literal["yes", "no"] = "yes",
-    ask: float,
+    ask: SidedAsk,
     fee_coefficient: float,
     slippage_floor_prob: float,
     h_hours: float,
-    n_cell: int,
     cfg: LadderEvConfig,
     artefact: CalibrationArtefact,
+    bounds_provider: BoundsProvider,
     latch: QuantileLadderLatch,
 ) -> Decision:
     """Evaluate ONE rung at ONE snapshot. Pure; mutates only ``latch`` on a Take.
 
-    Order of checks matches plan §3.3, permit first: a decision outside the
-    permit is NEVER latched and NEVER counted as a trial, regardless of what
-    the forecast or the ask would otherwise have supported.
+    Check order: (1) the ask/side binding and (2) ``rung_id`` membership are
+    caller-contract invariants and raise unconditionally -- a mismatch here
+    is a wiring bug, never a business decision, so it is checked before
+    anything else and regardless of permit/latch state. Then (3) D+1 scope,
+    (4) the permit, and (5) the latch -- each a distinct non-trial verdict,
+    matching plan §3.3's "never latched and never counted as a trial" for
+    every one of them.
     """
+    if ask.side != side:
+        raise AskSideMismatchError(
+            f"ask was quoted from the {ask.side!r} instrument {ask.instrument_id!r}, "
+            f"but this evaluation is for side {side!r}; the {side!r} leg must be "
+            f"priced from its own native instrument (ruling A-6)",
+        )
+
+    rung_ids = {rung.rung_id for rung in ladder}
+    if rung_id not in rung_ids:
+        raise ValueError(f"rung_id {rung_id!r} is not a member of `ladder`")
+
+    is_d_plus_1 = _is_d_plus_1(
+        now_ns=now_ns, climate_day=climate_day, std_utc_offset_hours=std_utc_offset_hours,
+    )
+    if not is_d_plus_1:
+        return NotDPlus1()
+
     if not permit_covers:
         return NotExecutable()
 
@@ -135,22 +211,18 @@ def evaluate(
     )
     base_cdf = build_cdf(artefact.cdf_method, percentiles)
     cdf = apply_emos(base_cdf, percentiles, artefact.emos)
-    probabilities = rung_probabilities(cdf, ladder)
-    if rung_id not in probabilities:
-        raise ValueError(f"rung_id {rung_id!r} is not a member of `ladder`")
-    p_hat = probabilities[rung_id]
-    p_lower = max(0.0, p_hat - artefact.p_lower_haircut)
-    p_upper = min(1.0, p_hat + artefact.p_upper_haircut)
+    bounds = bounds_provider(cdf=cdf, ladder=ladder, rung_id=rung_id)
+    p_hat, p_lower, p_upper = bounds.p_hat, bounds.p_lower, bounds.p_upper
 
     # V1 is qty 1 at a single quoted price -- no ladder walk, so the
     # executable/top-of-book/worst prices coincide and the fill is never
     # depth-exhausted. Depth-aware sizing beyond 1 contract is out of scope
     # for this slice (plan §3.3: "qty 1").
-    fee_prob = venue_fee_prob(executable_price=ask, fee_coefficient=fee_coefficient)
+    fee_prob = venue_fee_prob(executable_price=ask.price, fee_coefficient=fee_coefficient)
     cost = DepthAwareTradeCost(
-        executable_price=ask,
-        top_of_book_price=ask,
-        worst_price=ask,
+        executable_price=ask.price,
+        top_of_book_price=ask.price,
+        worst_price=ask.price,
         fee_prob=fee_prob,
         slippage_prob=slippage_floor_prob,
         total_prob=fee_prob + slippage_floor_prob,
@@ -162,13 +234,13 @@ def evaluate(
     if net is None:
         return Refuse(reason="not_executable")
 
-    buffer = margin(h_hours, n_cell, cfg)
-    if buffer is None or not (net > buffer):
+    buffer = forecast_margin(h_hours, cfg)
+    if not (net > buffer):
         return Refuse(reason="below_margin")
 
     latch.latch(station=station, climate_day=climate_day, rung_id=rung_id, side=side)
     return Take(
-        instrument_id=instrument_id,
+        instrument_id=ask.instrument_id,
         station=station,
         climate_day=climate_day,
         side=side,
