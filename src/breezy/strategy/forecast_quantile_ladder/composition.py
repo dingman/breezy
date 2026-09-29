@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import datetime as dt
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Final
 
+from breezy.ingest.gaps import local_standard_date
+from breezy.registry.sites import default_registry
 from breezy.strategy.current_rung_hold.composition import resolve_station_instrument_ids
 from breezy.strategy.current_rung_hold.continuous_strategy import Phase0PermitForbiddenError
 from breezy.strategy.forecast_quantile_ladder.artefact_bounds import (
@@ -66,6 +68,39 @@ class NoTradableForecastInstrumentsError(RuntimeError):
 def strategy_component_id(station: str) -> str:
     """Unique ``strategy_id`` per station -- ``Trader.add_strategy`` rejects a collision."""
     return f"{_COMPONENT_ID_PREFIX}-{station}"
+
+
+def _d_plus_1_climate_days(stations: Iterable[str], *, now_ns: int) -> dict[str, dt.date]:
+    """Tomorrow's climate day per station, in EACH station's own LST.
+
+    Review item (SL-13 fix-first, "open item"): this family trades D+1 ONLY
+    (plan §3.3 / ``decision._is_d_plus_1``), but ``resolve_station_
+    instrument_ids`` buckets to whatever day mapping it is CALLED with --
+    passing it ``app/trade.py``'s own ``today_by_station`` (today's LST
+    climate day, the SAME mapping ``current_rung_hold``/
+    ``continuous_rung_hold`` use for their OWN same-day markets) would
+    resolve TODAY's instruments, which ``decision.evaluate``'s own D+1 gate
+    then refuses forever -- a real boot would never find a tradable rung.
+
+    Uses :func:`breezy.ingest.gaps.local_standard_date`, the SAME helper
+    ``decision._is_d_plus_1`` calls, so "D+1" means the identical calendar
+    date at both the catalog-discovery boundary (here) and the per-tick
+    decision gate -- never a second, independently-derived definition of
+    "tomorrow" that could silently drift from the first.
+
+    ``resolve_station_instrument_ids`` itself, and every existing caller of
+    it (``current_rung_hold``/``continuous_rung_hold``, both same-day
+    families), are UNCHANGED -- this function only computes a DIFFERENT
+    ``Mapping[str, date]`` to hand that same, untouched resolver.
+    """
+    registry = default_registry()
+    return {
+        station: local_standard_date(
+            now_ns, registry.climate_day_window(_VENUE, station).std_utc_offset_hours,
+        )
+        + dt.timedelta(days=1)
+        for station in stations
+    }
 
 
 def _percentiles_reader(
@@ -136,11 +171,24 @@ def build_forecast_quantile_ladder_strategies(
             "non-None order_submission_permit",
         )
 
-    resolved = resolve_station_instrument_ids(catalog_root, today_by_station)
+    # Review item (SL-13 fix-first, "open item"): resolve TOMORROW's
+    # instruments in each station's own LST, never today's -- see
+    # `_d_plus_1_climate_days`'s own docstring. `resolve_station_
+    # instrument_ids` itself is untouched; only the day mapping handed to
+    # it differs from `current_rung_hold`/`continuous_rung_hold`'s own
+    # same-day callers (which still pass `today_by_station` unmodified).
+    d_plus_1_by_station = _d_plus_1_climate_days(today_by_station, now_ns=now_ns_fn())
+    resolved = resolve_station_instrument_ids(catalog_root, d_plus_1_by_station)
     if all(len(ids) == 0 for ids in resolved.values()):
+        # Never falls back to today's instruments -- a venue that has not
+        # yet listed tomorrow's markets (or listed them under a DIFFERENT
+        # climate day than this station's own LST predicts) refuses
+        # cleanly here, the SAME clean EXIT_CONFIG_ERROR path (via
+        # `app/trade.py`'s `SettingsError` re-raise) every other
+        # artefact-load failure in this family already uses.
         raise NoTradableForecastInstrumentsError(
-            "build_forecast_quantile_ladder_strategies: zero catalog "
-            f"instruments resolved for {sorted(today_by_station)}",
+            "build_forecast_quantile_ladder_strategies: zero D+1 catalog "
+            f"instruments resolved for {sorted(d_plus_1_by_station.items())}",
         )
 
     artefact = load_calibration_artefact(

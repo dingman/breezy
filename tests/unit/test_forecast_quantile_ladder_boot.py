@@ -13,9 +13,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from datetime import date, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 from breezy.app.trade import run
 from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, SENDING_FAMILY_ID_VAR, TRADE_CATALOG_ROOT_VAR
@@ -26,11 +29,34 @@ from breezy.ingest.nbm_quantile_actor import NbmQuantileActor
 from tests.unit.test_trade_cli_current_rung_hold import (  # noqa: F401 -- reused harness
     RecordingNode,
     _clean_nodes,
+    _instrument,
     _operator_order_ceiling,
+    _today_by_station,
     _trade_env,
     _write_today_catalog,
 )
 from tests.unit.test_wp11b_active_family_registry import _write_forecast_ladder_manifest
+
+
+def _write_d_plus_1_catalog(catalog_root: Path) -> None:
+    """Same shape as ``_write_today_catalog``, but every instrument's own
+    ``climate_day`` is TOMORROW in its station's LST -- this family trades
+    D+1 only (SL-13 fix-first follow-up: ``build_forecast_quantile_ladder_
+    strategies`` now resolves D+1, never today, so a boot-level test must
+    give it a D+1-dated catalog to find anything)."""
+    catalog = ParquetDataCatalog(str(catalog_root))
+    catalog.write_data(
+        [
+            # `_today_by_station` is typed `dict[str, object]` upstream (a
+            # pre-existing widening, not introduced here); every real value
+            # is a `datetime.date` (`climate_day_for_instant`'s own return
+            # type), so `.isoformat()`/`+ timedelta` are always valid at
+            # runtime -- `cast` documents that, matching this module's own
+            # `_write_today_catalog` caller convention.
+            _instrument(station=station, climate_day=cast("date", day) + timedelta(days=1))
+            for station, day in _today_by_station().items()
+        ],
+    )
 
 _ARTEFACT_PAYLOAD = {
     "schema_version": 1,
@@ -94,7 +120,7 @@ def test_forecast_quantile_ladder_composes_real_strategies_and_actors(
 
     catalog_root = tmp_path / "catalog"
     catalog_root.mkdir()
-    _write_today_catalog(catalog_root)
+    _write_d_plus_1_catalog(catalog_root)
 
     env = _trade_env(
         tmp_path,
@@ -150,7 +176,14 @@ def _boot_env_and_catalog(tmp_path: Path, *, family_id: str) -> dict[str, str]:
     catalog_root = tmp_path / "catalog"
     if not catalog_root.exists():
         catalog_root.mkdir()
-        _write_today_catalog(catalog_root)
+        # D+1-dated (not `_write_today_catalog`'s D0): `build_forecast_
+        # quantile_ladder_strategies` now resolves D+1 instruments BEFORE
+        # ever loading the artefact, so these artefact-failure tests need a
+        # catalog that clears instrument resolution -- otherwise a bad
+        # artefact would never be reached, and `NoTradableForecastInstrumentsError`
+        # (also a clean `EXIT_CONFIG_ERROR`) would mask the property each of
+        # these tests actually names.
+        _write_d_plus_1_catalog(catalog_root)
     return _trade_env(
         tmp_path,
         **{
