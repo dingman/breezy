@@ -281,6 +281,11 @@ def test_a_report_matching_clean_and_ceilings_exactly_has_no_failures() -> None:
 #: Packages/files that must carry exactly zero mypy errors. Only ever grows.
 CLEAN: Final[tuple[str, ...]] = (
     "src/breezy/adapters",
+    # SL-7 (FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md, build-slice
+    # row SL-7): a single-module CLEAN override inside the ceilinged
+    # `src/breezy/analysis` package -- same pattern as the archive_table.py
+    # override below. The package ceiling (13) stays unchanged.
+    "src/breezy/analysis/brier_decomposition.py",
     "src/breezy/domain",
     "src/breezy/ingest",
     "src/breezy/normalize",
