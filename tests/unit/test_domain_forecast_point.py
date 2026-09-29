@@ -664,7 +664,7 @@ def test_a_negative_lag_is_refused() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("model", ["NBM_NBS", "GFS_MOS"])
+@pytest.mark.parametrize("model", ["NBM_NBS", "GFS_MOS", "NBM_NBP"])
 def test_each_whitelisted_model_is_accepted(model: str) -> None:
     assert make_point(model=model, measured_publication_lag_ns=4 * 3_600_000_000_000).model == model
 
@@ -705,6 +705,70 @@ def test_the_ingest_instant_is_separate_from_the_vintage() -> None:
 def test_an_ingest_instant_before_the_cycle_is_refused() -> None:
     with pytest.raises(ValueError, match="ingested_at_ns"):
         make_point(ingested_at_ns=_CYCLE_RUNTIME_NS - 1)
+
+
+# ---------------------------------------------------------------------------
+# 5b. NBM_NBP admission (SL-1)
+# ---------------------------------------------------------------------------
+
+#: Minimum measured v5.0 NBP publication lag across the 13Z/19Z/01Z cycles,
+#: rounded down to 5 minutes, per the SL-3 lag census
+#: [VER `docs/evidence/NBP_LAG_CENSUS_2026-09-29.md`, records sha256
+#: d31d6436ffda7e24f40c0e2f264caf205c8ff448ef2e9df2722c67bf933ac731].
+_NBM_NBP_FLOOR_NS = 60 * 60 * 1_000_000_000
+
+#: The seven NBM v5.0 quantile/summary variables Breezy archives for NBP.
+_NBP_QUANTILE_VARIABLES = (
+    "TXN_Q10",
+    "TXN_Q25",
+    "TXN_Q50",
+    "TXN_Q75",
+    "TXN_Q90",
+    "TXN_MEAN",
+    "TXN_SD",
+)
+
+
+def test_the_model_whitelist_and_the_floor_table_share_exactly_one_key_set() -> None:
+    """A model admitted without a floor would reinstate the zero-lag hazard."""
+    assert set(FORECAST_MODELS) == set(MINIMUM_PUBLICATION_LAG_NS)
+
+
+@pytest.mark.parametrize("variable", _NBP_QUANTILE_VARIABLES)
+def test_each_nbp_quantile_variable_survives_the_arrow_round_trip(variable: str) -> None:
+    from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+    original = make_point(
+        model="NBM_NBP",
+        variable=variable,
+        measured_publication_lag_ns=_NBM_NBP_FLOOR_NS,
+    )
+
+    batch = ArrowSerializer.serialize(original, ForecastPoint)
+    (restored,) = ArrowSerializer.deserialize(ForecastPoint, pa.Table.from_batches([batch]))
+
+    assert restored.to_dict() == original.to_dict()
+    assert restored.model == "NBM_NBP"
+    assert restored.variable == variable
+
+
+def test_a_lag_below_the_nbp_floor_is_refused() -> None:
+    """59 minutes is one below the 60-minute NBP floor.
+
+    The SL-3 census measured a minimum of 61.05 minutes across the 13Z/19Z/01Z
+    cycles, rounded down to 5 minutes
+    [VER `docs/evidence/NBP_LAG_CENSUS_2026-09-29.md`, records sha256
+    d31d6436ffda7e24f40c0e2f264caf205c8ff448ef2e9df2722c67bf933ac731].
+    """
+    with pytest.raises(ValueError, match="measured_publication_lag_ns"):
+        make_point(model="NBM_NBP", measured_publication_lag_ns=59 * 60 * 1_000_000_000)
+
+
+def test_a_lag_at_the_nbp_floor_is_accepted() -> None:
+    point = make_point(model="NBM_NBP", measured_publication_lag_ns=_NBM_NBP_FLOOR_NS)
+
+    assert point.model == "NBM_NBP"
+    assert point.measured_publication_lag_ns == _NBM_NBP_FLOOR_NS
 
 
 # ---------------------------------------------------------------------------

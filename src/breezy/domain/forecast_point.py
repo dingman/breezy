@@ -143,7 +143,7 @@ FORECAST_POINT_SCHEMA_VERSION: Final[int] = 1
 #: and then quietly split a station's calibration sample in two.
 #:
 #: WIDEN this tuple to admit a new model; never relax it to accept anything.
-FORECAST_MODELS: Final[tuple[str, ...]] = ("NBM_NBS", "GFS_MOS")
+FORECAST_MODELS: Final[tuple[str, ...]] = ("NBM_NBS", "GFS_MOS", "NBM_NBP")
 
 #: Smallest publication lag accepted per model, in nanoseconds.
 #:
@@ -156,9 +156,16 @@ FORECAST_MODELS: Final[tuple[str, ...]] = ("NBM_NBS", "GFS_MOS")
 #: (floor 60 minutes). A model admitted to `FORECAST_MODELS` without a floor
 #: here would silently reinstate the zero-lag hazard, so the two sets are
 #: required to match.
+#:
+#: NBM_NBP's 60-minute floor is the SL-3 lag census minimum (61.05 minutes,
+#: the smallest measured v5.0 NBP publication lag across the 13Z/19Z/01Z
+#: cycles) rounded down to 5 minutes -- never guessed
+#: [VER `docs/evidence/NBP_LAG_CENSUS_2026-09-29.md`, records sha256
+#: d31d6436ffda7e24f40c0e2f264caf205c8ff448ef2e9df2722c67bf933ac731].
 MINIMUM_PUBLICATION_LAG_NS: Final[dict[str, int]] = {
     "NBM_NBS": 20 * 60 * 1_000_000_000,
     "GFS_MOS": 60 * 60 * 1_000_000_000,
+    "NBM_NBP": 60 * 60 * 1_000_000_000,
 }
 
 #: The "no value published" codes used by the upstream text products.
