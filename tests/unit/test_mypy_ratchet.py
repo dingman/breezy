@@ -286,7 +286,9 @@ CLEAN: Final[tuple[str, ...]] = (
     "src/breezy/normalize",
     "src/breezy/persistence",
     "src/breezy/registry",
+    "src/breezy/runtime",  # CF-12 Wave 1 (c94066e)
     "src/breezy/settlement",
+    "src/breezy/strategy",  # CF-12 Wave 1 (c94066e)
     # FROZEN: regeneration tests pin its bytes (5046132). Never edit it to
     # silence a future error here -- a single-module override pinned by a
     # test is the only sanctioned response (plan, "Carve-outs and don'ts").
@@ -300,8 +302,6 @@ CLEAN: Final[tuple[str, ...]] = (
 #: "lower the ceiling to N" so a ceiling can never go stale.
 CEILINGS: Final[dict[str, int]] = {
     "src/breezy/analysis": 13,
-    "src/breezy/runtime": 7,
-    "src/breezy/strategy": 9,
     "scripts/analysis": 364,
     "scripts/archive": 8,
     "scripts/venue": 23,
@@ -309,7 +309,7 @@ CEILINGS: Final[dict[str, int]] = {
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1471,
+    "tests/unit": 1466,
 }
 
 
