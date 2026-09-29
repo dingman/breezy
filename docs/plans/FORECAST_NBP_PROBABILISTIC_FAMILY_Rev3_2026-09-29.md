@@ -310,6 +310,11 @@ S2 and S3a may **drop** a variant before S3b; they never add one (the WP7 rule (
   - **Closed correction set (R3-07):** {none, one offset per calendar month, linear in LST day-length}.
     - It is evaluated first on the validation split, where it spans all 12 months. The form is chosen there only. No other form may be introduced after S0.
     - It is then re-reported on the holdout. **A non-flat holdout result blocks G2.3.**
+- **G2.0a Near-midnight stratum (amendment A-6, 2026-09-29, from the SL-2 domain review).**
+  - **Why:** under the assumed NBM 12Z–06Z max window, KMIA's window runs 07:00–01:00 LST, one hour into the NEXT CLI day, and KMDW's runs 06:00–00:00 LST, on the boundary.
+  - **Test:** G2.0 therefore also reports the residual for station-days whose observed daily max, taken from the IEM ASOS 1-min archive, occurred within 2 h of LST midnight. The strata are KMIA, KMDW, and KLAX+KSFO pooled.
+  - **Rule:** each stratum with ≥ N final station-days joins G2.0's Holm family. A non-flat stratum blocks G2.3 exactly as the month strata do. Strata below N are flagged `UNTESTED` and tracked by L.
+  - **Correction:** none is added. The closed correction set is unchanged.
 - **G2.1 Calibration (R2-05):**
   - For each populated reliability bucket with n ≥ 30: z = (observed − predicted)/SE, where SE is the station-day cluster-bootstrap SE (rung events share a station-day).
   - FAIL only if Holm at family α = 0.05 rejects in at least one bucket.
