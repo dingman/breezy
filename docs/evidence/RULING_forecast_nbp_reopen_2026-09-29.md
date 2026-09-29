@@ -315,6 +315,14 @@ Each amendment below supersedes any conflicting text above.
   self-comparison. Post-freeze live logs are liveness-only (§6(b)) until
   S4-gate.
 
+- **A-6 (SL-12 domain review) Forecast-mode margin — PINNED before any tape is scored.**
+  - **Formula:** margin(h) = m0 + (m24 − m0)·clamp((h − h0)/(24 − h0), 0, 1), with m0 = 0.02, m24 = 0.06 and h0 = 6 h, where h is the hours from decision to settlement.
+  - **Why these values:** they are the existing, committed `LadderEvConfig` defaults (`src/breezy/strategy/ladder_ev/config.py:159-162`, pre-dating any NBP data). Adopting them is therefore outcome-free.
+  - **Archive-cell gate dropped:** the `n_cell`/`n_min_cell` gate is removed for this family. `p_hat` comes from a calibrated CDF, not a cell frequency, and all statistical uncertainty is carried by the bootstrap `p_lower`/`p_upper` (A-4 draws).
+  - **Take rule:**
+    - YES: take if `p_lower − ask − fee(ask) > margin(h)`.
+    - NO: take if `(1 − p_upper) − no_ask − fee(no_ask) > margin(h)`, where `no_ask` is quoted from the native NO instrument.
+  - **Same rule everywhere:** S3a, S3b and live use this identical rule.
 - **Recorded residuals (LOW, not blocking):**
   - (i) A-5 parity shares the pure math modules between both paths, so a bug
     inside that shared math is invisible to parity. SL-6/SL-7 unit tests
