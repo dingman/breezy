@@ -38,7 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
-from typing import Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, runtime_checkable
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
@@ -46,6 +46,8 @@ from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.symbology import leg_of, sibling_instrument_id
 from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
+from breezy.registry.sites import default_registry
+from breezy.strategy.depth10 import best_order
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
@@ -63,9 +65,23 @@ from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
 from breezy.strategy.ladder_ev.quantile_density import Rung
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
+
 __all__ = ["ForecastQuantileLadderStrategy", "SupportsExpiresAtNs"]
 
 _CLASS_NAME: str = "ForecastQuantileLadderStrategy"
+_VENUE: Final[str] = "polymarket_us"
+_NS_PER_HOUR: Final[int] = 3_600_000_000_000
+#: Review item 2 (SL-13 fix-first): the tick loop calls `evaluate_snapshot`
+#: on every live depth/quote update, which appends to `shadow_decisions` --
+#: a real, unbounded-by-default list is exactly the shape of the OOM lesson
+#: ("A unit memory cap is containment" -- an unbounded diagnostics list).
+#: Bounded FIFO, not a hard cap on FUNCTIONALITY: the shadow log is
+#: observability, never read back by any decision path, so trimming the
+#: oldest entries once this many have accumulated is lossless for every
+#: correctness property this class holds.
+_MAX_SHADOW_DECISIONS: Final[int] = 5_000
 
 
 @runtime_checkable
@@ -133,6 +149,23 @@ class ForecastQuantileLadderStrategy(Strategy):
         #: :meth:`on_start` from the resolved YES-leg instruments' own weather
         #: bucket facts.
         self.rung_ladders: dict[tuple[str, str], list[Rung]] = {}
+        #: SL-13 item 2: ``instrument_id str -> (station, climate_day_key,
+        #: rung_id, side)``, populated at :meth:`on_start` for BOTH legs of
+        #: every resolved rung -- the reverse index the tick handlers need to
+        #: turn a bare ``InstrumentId`` off a live depth/quote update back
+        #: into the (station, day, rung, side) key ``evaluate_snapshot`` wants.
+        self._instrument_context: dict[str, tuple[str, str, str, Literal["yes", "no"]]] = {}
+        #: ``(station, climate_day_key) -> the YES instrument's own native
+        #: ``expiration_ns``, populated at :meth:`on_start`. The SAME
+        #: settlement-deadline value the tick handlers use to compute
+        #: ``h_hours`` -- never a wall-clock guess (mirrors
+        #: ``ForecastSnapshot``'s own "the same value the settlement halt
+        #: reads" convention, ``weather_common/models.py``).
+        self.rung_expiration_ns: dict[tuple[str, str], int] = {}
+        #: ``station -> std_utc_offset_hours``, populated once at
+        #: :meth:`on_start` (mirrors ``ContinuousRungHoldStrategy``'s own
+        #: ``_std_utc_offset_hours_by_station``).
+        self._std_utc_offset_hours: dict[str, float] = {}
         self.shadow_decisions: list[Mapping[str, object]] = []
 
     def on_start(self) -> None:
@@ -148,12 +181,25 @@ class ForecastQuantileLadderStrategy(Strategy):
         subscribed for quotes and depth and recorded into
         :attr:`rung_instruments`/:attr:`rung_ladders`.
 
-        Never calls :meth:`_maybe_submit` or ``self.submit_order`` itself --
-        this method only subscribes and resolves; a decision-evaluating
-        driver (an ``on_quote_tick``/``on_data`` handler, or a test/backtest
-        caller) is what turns a :class:`~breezy.strategy.forecast_quantile_ladder.decision.Take`
-        into a submission, via :meth:`_maybe_submit`.
+        SL-13 item 2: also subscribes each rung's NO-leg id (its OWN book,
+        never derived from the YES side -- ruling A-6), populates the
+        instrument -> (station, day, rung, side) reverse index
+        :attr:`_instrument_context` for both legs, the rung's settlement
+        deadline (:attr:`rung_expiration_ns`, off the YES instrument's own
+        ``expiration_ns``), and each configured station's
+        ``std_utc_offset_hours`` -- everything :meth:`on_order_book_depth`/
+        :meth:`on_quote_tick` need to call :meth:`evaluate_snapshot` without
+        a second catalog or registry read per tick.
+
+        Never calls :meth:`_maybe_submit` or ``self.submit_order`` directly
+        -- only :meth:`on_order_book_depth`/:meth:`on_quote_tick` (via
+        :meth:`_maybe_submit`) do that, on a ``Take``.
         """
+        registry = default_registry()
+        self._std_utc_offset_hours = {
+            station: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
+            for station in self.config.stations
+        }
         for raw_id in self._instrument_ids:
             instrument_id = (
                 InstrumentId.from_str(raw_id) if isinstance(raw_id, str) else raw_id
@@ -193,8 +239,26 @@ class ForecastQuantileLadderStrategy(Strategy):
             self.rung_ladders.setdefault((facts.settlement_station, climate_day_key), []).append(
                 Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f),
             )
+            self._instrument_context[str(instrument_id)] = (
+                facts.settlement_station, climate_day_key, rung_id, "yes",
+            )
+            self._instrument_context[str(no_instrument_id)] = (
+                facts.settlement_station, climate_day_key, rung_id, "no",
+            )
+            self.rung_expiration_ns[(facts.settlement_station, climate_day_key)] = (
+                instrument.expiration_ns
+            )
             self.subscribe_quote_ticks(instrument_id)
             self.subscribe_order_book_depth(instrument_id)
+            # SL-13 item 2: the NO leg's OWN book -- never synthesised from
+            # the YES side (ruling A-6). Subscribed unconditionally even
+            # though the NO instrument itself is never looked up in
+            # `self.cache` here -- `on_order_book_depth`/`on_quote_tick`
+            # resolve it purely from `_instrument_context`, and a missing
+            # NO instrument in the cache surfaces there as `no_instrument`,
+            # never here.
+            self.subscribe_quote_ticks(no_instrument_id)
+            self.subscribe_order_book_depth(no_instrument_id)
             self.log.info(f"{_CLASS_NAME} subscribed {instrument_id}")
         self.log.info(f"{_CLASS_NAME} subscribed")
 
@@ -253,6 +317,13 @@ class ForecastQuantileLadderStrategy(Strategy):
             latch=cast("QuantileLadderLatch", self._latch),
         )
         self.shadow_decisions.append(self._shadow_log_line(decision, now_ns=now_ns))
+        # Review item 2: bounded FIFO -- see `_MAX_SHADOW_DECISIONS`'s own
+        # docstring. `del [:n]` trims in one slice-assignment rather than N
+        # individual `pop(0)` calls when (rarely) more than one entry over
+        # cap has accumulated between checks.
+        overflow = len(self.shadow_decisions) - _MAX_SHADOW_DECISIONS
+        if overflow > 0:
+            del self.shadow_decisions[:overflow]
         return decision
 
     def _shadow_log_line(self, decision: Decision, *, now_ns: int) -> Mapping[str, object]:
@@ -322,3 +393,112 @@ class ForecastQuantileLadderStrategy(Strategy):
             post_only=False,
         )
         self.submit_order(order)
+
+    # -- SL-13 item 2: the live tick loop -----------------------------------
+
+    def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
+        """Hunt on the venue's own Depth10 book -- the REQUIRED trigger.
+
+        Depth carries a one-sided book (e.g. an ask with no bid) that a
+        ``QuoteTick`` cannot represent (``parse_quote_tick`` requires both
+        sides) -- mirrors ``ContinuousRungHoldStrategy.on_order_book_depth``'s
+        own reasoning. ``best_order`` skips the Depth10 size-0 Arrow pad.
+        Never raises (L-16): every failure path below is a logged skip, and
+        :meth:`_evaluate_instrument_update` itself is wrapped in a catch-all.
+        """
+        ask = best_order(depth.asks)
+        self._safe_evaluate(
+            depth.instrument_id,
+            ask_price=ask.price.as_decimal() if ask is not None else None,
+            ts_event=depth.ts_event,
+            source="depth",
+        )
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        """Hunt on a live two-sided quote too, where the venue emits one."""
+        self._safe_evaluate(
+            tick.instrument_id,
+            ask_price=tick.ask_price.as_decimal(),
+            ts_event=tick.ts_event,
+            source="quote_tick",
+        )
+
+    def _safe_evaluate(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        ask_price: Decimal | None,
+        ts_event: int,
+        source: str,
+    ) -> None:
+        """L-16: a data handler must never raise. Every exception from
+        :meth:`_evaluate_instrument_update` is caught and logged here,
+        exactly once, rather than propagating into Nautilus's own event loop.
+        """
+        try:
+            self._evaluate_instrument_update(instrument_id, ask_price=ask_price, ts_event=ts_event)
+        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
+            self.log.exception(
+                f"{_CLASS_NAME}: {source} handler failed for {instrument_id}", exc,
+            )
+
+    def _evaluate_instrument_update(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        ask_price: Decimal | None,
+        ts_event: int,
+    ) -> None:
+        """Resolve ``instrument_id`` to its (station, day, rung, side) via
+        :attr:`_instrument_context` (built at :meth:`on_start`), build the
+        :class:`~breezy.strategy.forecast_quantile_ladder.decision.SidedAsk`
+        from THIS instrument's own ask (never synthesised from the sibling
+        leg -- ruling A-6), call :meth:`evaluate_snapshot` (which already
+        logs the decision), and call :meth:`_maybe_submit` only on a
+        ``Take``. The latch and permit/veto/fee-verified checks all live
+        inside ``evaluate``/:meth:`try_submit` -- this method adds no second
+        gate. A D0 or D+2 instrument's own ``climate_day`` (resolved at
+        ``on_start`` from ITS weather-bucket facts, never assumed) fails
+        ``evaluate``'s own D+1 check and returns a non-``Take`` decision,
+        same as any other Refuse -- no special-casing needed here.
+        """
+        iid = str(instrument_id)
+        context = self._instrument_context.get(iid)
+        if context is None:
+            # Not one of ours -- structurally unreachable given `on_start`
+            # only ever subscribes ids it has just indexed here, but a data
+            # handler fails closed on an unexpected id rather than assuming.
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=unrecognised_instrument")
+            return
+        station, climate_day_key, rung_id, side = context
+        if ask_price is None:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_ask")
+            return
+        ladder = self.rung_ladders.get((station, climate_day_key))
+        if not ladder:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_ladder")
+            return
+        expiration_ns = self.rung_expiration_ns.get((station, climate_day_key))
+        if expiration_ns is None:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_expiration")
+            return
+        std_utc_offset_hours = self._std_utc_offset_hours.get(station)
+        if std_utc_offset_hours is None:
+            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_std_offset")
+            return
+        h_hours = max(0.0, (expiration_ns - ts_event) / _NS_PER_HOUR)
+        decision = self.evaluate_snapshot(
+            now_ns=ts_event,
+            std_utc_offset_hours=std_utc_offset_hours,
+            station=station,
+            climate_day=date.fromisoformat(climate_day_key),
+            ladder=ladder,
+            rung_id=rung_id,
+            side=side,
+            ask=SidedAsk(side=side, instrument_id=iid, price=float(ask_price)),
+            fee_coefficient=self.config.required_fee_coefficient,
+            slippage_floor_prob=self._ladder_cfg.slippage_floor_prob,
+            h_hours=h_hours,
+        )
+        if isinstance(decision, Take):
+            self._maybe_submit(decision, limit_price=ask_price)
