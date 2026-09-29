@@ -12,7 +12,7 @@ import datetime as dt
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pyarrow.parquet as pq
 import pytest
@@ -190,6 +190,28 @@ def _write_settlement_truth(rows: list[SettlementTruthRow], path: Path) -> None:
 # ---------------------------------------------------------------------------
 # complete_percentile_windows
 # ---------------------------------------------------------------------------
+
+
+#: Real observed NBM lead-hour grid (coordinator correction 2026-09-29,
+#: verified against BOTH real archived sources: `tests/fixtures/nbm/
+#: nbptx_t{13,19,01}z_excerpt.txt` -- a real 2026-09-28/29 capture whose FHR
+#: row shows the first MAX (00Z) column at these exact leads -- and a
+#: full-archive scan of the real on-disk IEM MOS NBS cache, whose txn-
+#: populated ftimes land at the IDENTICAL leads. Neither source ever
+#: publishes a shorter "nearest calendar 00Z" lead (e.g. 11h/5h after a
+#: 13Z/19Z cycle): the grid jumps straight from the cycle to the first
+#: MAX/MIN pair at these hours. So on REAL data, explicit
+#: climate_day_for_txn selection agrees with "the first/nearest available
+#: MAX column" -- both point to the SAME row. The second entry of each pair
+#: is the NEXT real MAX column (24h later), which maps to D+2, not the
+#: target D+1; the selector must discriminate between these two REAL
+#: candidates, never approximate with whichever is merely nearest without
+#: checking.
+_REAL_FIRST_AND_SECOND_MAX_LEAD_HOURS: Final[dict[int, tuple[int, int]]] = {
+    13: (35, 59),
+    19: (29, 53),
+    1: (23, 47),
+}
 
 
 def test_complete_percentile_windows_drops_incomplete_groups_and_counts_them() -> None:
@@ -795,6 +817,78 @@ def test_build_comparator_matched_events_carries_the_near_midnight_stratum() -> 
     assert events[0].near_midnight_stratum == "KMIA"
 
 
+def test_build_comparator_matched_events_selects_the_d1_window_at_every_station_and_hour() -> None:
+    """CRITICAL fix (coordinator review 2026-09-29), shared selector
+    (`_select_d1_window`, SL-8c rebase DRY directive): given BOTH the real
+    D+1 MAX column and the real D+2 one (24h later) for a (station, cycle),
+    `build_comparator_matched_events` must pick the D+1 one -- never
+    "whichever window is in the list first". Settlement is pinned to the
+    D+1 window's own q50 (70), so a wrong (D+2, q50=80) selection would
+    flip the rung outcome to False rather than silently matching."""
+    registry = nbp_skill_study.station_registry()
+    day = dt.date(2025, 6, 2)
+
+    for station in ("KLAX", "KMDW", "KMIA", "KSFO"):
+        offset = registry.std_utc_offset_hours_by_icao[station]
+        settlement_station = registry.settlement_station_by_icao[station]
+        for hour, (first_lead, second_lead) in _REAL_FIRST_AND_SECOND_MAX_LEAD_HOURS.items():
+            cycle = _cycle_runtime_ns(day, hour)
+            climate_day = target_climate_day(cycle, offset)
+            cycle_dt = dt.datetime(day.year, day.month, day.day, hour, tzinfo=dt.UTC)
+            first_ns = int((cycle_dt + dt.timedelta(hours=first_lead)).timestamp()) * _NS
+            second_ns = int((cycle_dt + dt.timedelta(hours=second_lead)).timestamp()) * _NS
+
+            d1_window = _comparator_window(
+                station=station, cycle_runtime_ns=cycle, valid_start_ns=first_ns, q50=70.0
+            )
+            d2_window = _comparator_window(
+                station=station, cycle_runtime_ns=cycle, valid_start_ns=second_ns, q50=80.0
+            )
+            settlement = {
+                (settlement_station, climate_day): _settlement_row(
+                    station=settlement_station, climate_day=climate_day, tmax_f=70
+                )
+            }
+            mos_by_cycle = {
+                (station, cycle): nbp_skill_study.RawMosTxnXnd(txn_f=70.0, xnd_f=2.0)
+            }
+
+            events, report = nbp_skill_study.build_comparator_matched_events(
+                [d1_window, d2_window],
+                settlement,
+                mos_by_cycle,
+                {},
+                _frozen_error_model(),
+                registry=registry,
+            )
+
+            assert report.no_d1_window_cycles == 0, f"{station} {hour}Z"
+            assert len(events) == 1, f"{station} {hour}Z"
+            assert events[0].outcome is True, (
+                f"{station} {hour}Z: selected the D+2 (q50=80) window instead of D+1 (q50=70)"
+            )
+
+
+def test_build_comparator_matched_events_counts_a_cycle_with_no_d1_window() -> None:
+    registry = nbp_skill_study.station_registry()
+    day = dt.date(2025, 6, 2)
+    cycle = _cycle_runtime_ns(day, 13)
+    # Only a (wrong-day) window is present -- no candidate maps to the
+    # explicit D+1 target, so the cycle must be dropped and counted, never
+    # approximated by "nearest".
+    wrong_day_ns = _valid_00z_ns(day + dt.timedelta(days=1))
+    window = _comparator_window(
+        station="KMIA", cycle_runtime_ns=cycle, valid_start_ns=wrong_day_ns, q50=70.0
+    )
+
+    events, report = nbp_skill_study.build_comparator_matched_events(
+        [window], {}, {}, {}, _frozen_error_model(), registry=registry
+    )
+
+    assert events == ()
+    assert report.no_d1_window_cycles == 1
+
+
 # ---------------------------------------------------------------------------
 # mos_txn_xnd_by_cycle -- real archive-cache read (seeded via get_or_fetch).
 # ---------------------------------------------------------------------------
@@ -823,13 +917,23 @@ def _seed_mos_archive(tmp_path: Path, *, station: str, body: bytes) -> Path:
 
 
 def test_mos_txn_xnd_by_cycle_reads_a_real_seeded_archive_entry(tmp_path: Path) -> None:
+    # KMIA (UTC-5), 01Z cycle on 2025-06-02: local_standard_date shifts back
+    # one UTC day (01:00Z - 5h = 20:00 the PREVIOUS UTC day, 2025-06-01), so
+    # target_climate_day = 2025-06-01 + 1 = 2025-06-02. The ONLY valid
+    # daily-max ftime hour is 00Z (`TXN_MAX_PERIOD_END_UTC_HOUR`), and 00Z on
+    # 2025-06-03 maps back to climate_day 2025-06-02 (00:00Z - 5h = 19:00 on
+    # 2025-06-02) -- the matching row, at 23h lead (the "nearest" 00Z after a
+    # 01Z cycle IS correct; only 13Z/19Z need the one AFTER nearest).
     body = (
         b"station,runtime,ftime,txn,xnd\n"
-        b"KMIA,2025-06-02 01:00:00,2025-06-02 06:00:00,90,2.0\n"
+        b"KMIA,2025-06-02 01:00:00,2025-06-03 00:00:00,90,2.0\n"
     )
     archive_root = _seed_mos_archive(tmp_path, station="KMIA", body=body)
+    registry = nbp_skill_study.station_registry()
 
-    result = nbp_skill_study.mos_txn_xnd_by_cycle(archive_root=archive_root, stations=("KMIA",))
+    result = nbp_skill_study.mos_txn_xnd_by_cycle(
+        archive_root=archive_root, registry=registry, stations=("KMIA",)
+    )
 
     cycle_ns = _cycle_runtime_ns(dt.date(2025, 6, 2), 1)
     key = ("KMIA", cycle_ns)
@@ -838,8 +942,73 @@ def test_mos_txn_xnd_by_cycle_reads_a_real_seeded_archive_entry(tmp_path: Path) 
     assert result[key].xnd_f == pytest.approx(2.0)
 
 
+def test_mos_txn_xnd_by_cycle_selects_the_target_day_row_at_every_station_and_hour(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL fix (coordinator review 2026-09-29), all 4 stations,
+    13Z/19Z/01Z, using the REAL observed MOS/NBS lead-hour grid (a
+    full-archive scan of the real on-disk cache; see
+    `_REAL_FIRST_AND_SECOND_MAX_LEAD_HOURS`). Real MOS never publishes a
+    same-cycle-day 00Z ``txn`` row for 13Z/19Z -- the shortest available MAX
+    lead is 35h/29h -- so the correction is not "pick the non-nearest row"
+    but "verify explicitly rather than trust proximity": the explicit
+    `climate_day_for_txn` selection must pick the FIRST real MAX column
+    (which also happens to be nearest) and reject the SECOND real one (24h
+    later, D+2), for every station and cycle hour.
+    """
+    from forecast_climate_day_map import climate_day_for_txn
+
+    registry = nbp_skill_study.station_registry()
+    day = dt.date(2025, 6, 2)
+
+    for station in ("KLAX", "KMDW", "KMIA", "KSFO"):
+        offset = registry.std_utc_offset_hours_by_icao[station]
+        for hour, (first_lead, second_lead) in _REAL_FIRST_AND_SECOND_MAX_LEAD_HOURS.items():
+            cycle_ns = _cycle_runtime_ns(day, hour)
+            target = target_climate_day(cycle_ns, offset)
+            cycle_dt = dt.datetime(day.year, day.month, day.day, hour, tzinfo=dt.UTC)
+            first_00z = cycle_dt + dt.timedelta(hours=first_lead)
+            second_00z = cycle_dt + dt.timedelta(hours=second_lead)
+
+            body = (
+                b"station,runtime,ftime,txn,xnd\n"
+                + f"{station},{cycle_dt:%Y-%m-%d %H:%M:%S},"
+                f"{first_00z:%Y-%m-%d %H:%M:%S},77,3.0\n".encode()
+                + f"{station},{cycle_dt:%Y-%m-%d %H:%M:%S},"
+                f"{second_00z:%Y-%m-%d %H:%M:%S},88,4.0\n".encode()
+            )
+            archive_root = _seed_mos_archive(
+                tmp_path / f"{station}-h{hour}", station=station, body=body
+            )
+
+            result = nbp_skill_study.mos_txn_xnd_by_cycle(
+                archive_root=archive_root, registry=registry, stations=(station,)
+            )
+
+            key = (station, cycle_ns)
+            assert key in result, f"{station} {hour}Z: no D+1-matching row found"
+            mapped_day = climate_day_for_txn(
+                icao=station,
+                runtime_ns=cycle_ns,
+                ftime_ns=int(first_00z.timestamp()) * _NS,
+                std_utc_offset_hours=offset,
+                model="NBS",
+                kind="max",
+            )
+            assert mapped_day == target, f"{station} {hour}Z: first real MAX column is not D+1"
+            # The FIRST real MAX column is correct here; the SECOND (24h
+            # later, a real D+2 column) must be rejected.
+            assert result[key].txn_f == pytest.approx(77.0), (
+                f"{station} {hour}Z: selected the D+2 column instead of the D+1 one"
+            )
+            assert result[key].xnd_f == pytest.approx(3.0)
+
+
 def test_mos_txn_xnd_by_cycle_over_a_missing_archive_root_is_empty(tmp_path: Path) -> None:
-    result = nbp_skill_study.mos_txn_xnd_by_cycle(archive_root=tmp_path / "does-not-exist")
+    registry = nbp_skill_study.station_registry()
+    result = nbp_skill_study.mos_txn_xnd_by_cycle(
+        archive_root=tmp_path / "does-not-exist", registry=registry
+    )
     assert result == {}
 
 
@@ -849,3 +1018,58 @@ def test_daily_max_instants_over_a_missing_archive_root_is_empty(tmp_path: Path)
         archive_root=tmp_path / "does-not-exist", registry=registry
     )
     assert result == {}
+
+
+def _seed_asos_archive(tmp_path: Path, *, station: str, body: bytes) -> Path:
+    from breezy.persistence.archive_cache import IEM_ASOS_1MIN_SOURCE
+
+    archive_root = tmp_path / "archive"
+    request = ArchiveRequest(
+        source=IEM_ASOS_1MIN_SOURCE,
+        station=station,
+        product="asos-1min",
+        window_start=0,
+        window_end=10**18,
+        model=None,
+    )
+    cache = ArchiveCache(
+        root=archive_root / IEM_ASOS_1MIN_SOURCE, fetch=lambda _req: body, clock=_FixedClock()
+    )
+    cache.get_or_fetch(request)
+    return archive_root
+
+
+def test_daily_max_instants_reads_a_real_seeded_archive_entry(tmp_path: Path) -> None:
+    registry = nbp_skill_study.station_registry()
+    body = (
+        b"valid(UTC),tmpf\n"
+        b"2025-06-01 20:00,88\n"
+        b"2025-06-01 21:00,90\n"
+        b"2025-06-01 22:00,89\n"
+    )
+    archive_root = _seed_asos_archive(tmp_path, station="KMIA", body=body)
+
+    result = nbp_skill_study.daily_max_instants(archive_root=archive_root, registry=registry)
+
+    settlement_station = registry.settlement_station_by_icao["KMIA"]
+    # KMIA UTC-5: 21:00Z -> 16:00 LST on 2025-06-01, the max of the three readings.
+    key = (settlement_station, dt.date(2025, 6, 1))
+    assert key in result
+    assert result[key].value_f == pytest.approx(90.0)
+    assert result[key].lst_seconds_from_midnight == 16 * 3600
+
+
+def test_daily_max_instants_raises_loudly_on_an_out_of_order_row(tmp_path: Path) -> None:
+    """MEDIUM fix (coordinator review 2026-09-29): the tie-break-to-first-
+    occurrence convention depends on a chronological stream -- an
+    out-of-order row must raise, never be silently accepted or re-sorted."""
+    registry = nbp_skill_study.station_registry()
+    body = (
+        b"valid(UTC),tmpf\n"
+        b"2025-06-01 21:00,90\n"
+        b"2025-06-01 20:00,88\n"  # earlier timestamp AFTER a later one: out of order
+    )
+    archive_root = _seed_asos_archive(tmp_path, station="KMIA", body=body)
+
+    with pytest.raises(nbp_skill_study.AsosRowOrderError):
+        nbp_skill_study.daily_max_instants(archive_root=archive_root, registry=registry)

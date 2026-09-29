@@ -72,11 +72,19 @@
   "min_samples_for_local": 40,
   "provenance": {
     "fitter": "breezy.strategy.weather_common.calibration.fit_error_model via scripts/analysis/forecast_conditional_model_study.fit_train_error_model",
-    "generated_at_note": "reproduced 2026-09-29 for SL-8c from the SAME cached WP-6 corpus that produced docs/evidence/FC_0b_FIT_AND_HOLDOUT_2026-09-19.md (n_train=5808, n_holdout=1441 match that artefact); this JSON is the FROZEN 0b bias/sigma error model and must never be refit",
+    "freeze_established_at": "2026-09-29",
+    "freeze_note": "THIS FILE IS THE FREEZE POINT. It was NOT copied from a pre-existing 2026-09-19 artefact -- none was ever persisted to disk; it is a REPRODUCTION, generated 2026-09-29 for SL-8c by calling the shipped fitter once against the SAME cached WP-6 TRAIN corpus that produced docs/evidence/FC_0b_FIT_AND_HOLDOUT_2026-09-19.md. Its n_train/n_holdout counts MATCH that evidence doc's headline counts (5808/1441); this is not a claim of byte-equality with any prior run of the fitter, which never wrote its bias/sigma tables to disk. From this commit forward, THIS JSON is authoritative and must never be refit or regenerated.",
     "n_train_station_days": 5808,
+    "n_holdout_station_days": 1441,
     "primary_lead_hours": 17,
     "source_corpus": "forecast_conditional_corpus_wp6.json",
     "source_corpus_sha256": "425d1b7f002601e7e0874daed4270043947f40668403eb4e849da978e9f307af",
+    "code_git_commit_sha": "779b2c8248497acd53013d997601ded358b624e8",
+    "code_sha256": {
+      "scripts/analysis/forecast_conditional_model_study.py": "9676de854851b11c973f6a9111988048141bec9fe004f486cd50a0569239fbbd",
+      "scripts/analysis/forecast_conditional_corpus.py": "38ebe6f3d792f0b2391979f7095765ea1e45e27f8a5e351f3cc87bcc6cdccd48",
+      "src/breezy/strategy/weather_common/calibration.py": "40424b5ae85374c020c72a4097dbd639ca5012f37e54eb18af08fdd6fa75a57e"
+    },
     "train_window": "2021-01-01..2024-12-31"
   },
   "sample_size_by_key": {

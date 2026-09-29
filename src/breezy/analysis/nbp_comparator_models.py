@@ -17,6 +17,19 @@ refit. :func:`load_frozen_0b_error_model` loads it byte-for-byte from that
 JSON; no code path in this module or its callers may call
 ``fit_error_model`` again on this data.
 
+**Provenance, stated precisely (coordinator review 2026-09-29).** The
+committed JSON is a REPRODUCTION: the original WP-6 fit
+(`docs/evidence/FC_0b_FIT_AND_HOLDOUT_2026-09-19.md`) never persisted its
+``bias_by_key``/``sigma_by_key`` tables to disk, only aggregate Brier/BSS
+scores. This JSON was generated 2026-09-29 for SL-8c by calling the SAME
+shipped fitter against the SAME cached WP-6 TRAIN corpus, and its
+``n_train``/``n_holdout`` counts (5808/1441) match that evidence doc's
+headline counts -- see the JSON's own ``provenance`` block for the source
+corpus sha256, the fitter code's sha256, and the git commit this was
+generated from. It is NOT a claim of byte-equality with any historical
+09-19 run (none exists to compare against). From the commit that added it
+forward, THIS JSON is the freeze point and must never be refit.
+
 **M1 -- NBS TXN mean + XND sd (plan S2.2 table, row M1).** The raw NBS MOS
 CSV carries both `txn` (the max/min temperature element) and `xnd`, a
 NUMERIC companion field immediately following it in the header
@@ -81,8 +94,9 @@ __all__ = [
 ]
 
 #: Relative to the repo root. The frozen 0b error model artefact (SL-8c),
-#: fitted once on the WP-6 TRAIN split and committed so M0 can reproduce the
-#: 09-20 numbers byte-for-byte without ever re-running the fit.
+#: fitted once on the WP-6 TRAIN split and committed as the freeze point
+#: (module docstring "Provenance, stated precisely") so M0 never re-runs the
+#: fit.
 FROZEN_0B_ARTEFACT_RELPATH: Final[str] = "docs/evidence/FC_0b_FROZEN_ERROR_MODEL_2026-09-19.json"
 
 #: The WP-6 TRAIN station-day count the frozen artefact was fitted on

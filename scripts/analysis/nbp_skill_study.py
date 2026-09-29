@@ -119,6 +119,7 @@ __all__ = [
     "DEFAULT_SETTLEMENT_TRUTH_PARQUET",
     "QUALIFYING_CYCLE_HOURS",
     "TXN_VARIABLES",
+    "AsosRowOrderError",
     "ComparatorJoinReport",
     "ComparatorMatchedEvent",
     "HoldoutNotCoordinatorAuthorizedError",
@@ -711,21 +712,36 @@ def _mos_row_txn_xnd(row: MosTxnRow) -> tuple[float, float | None] | None:
 
 
 def mos_txn_xnd_by_cycle(
-    *, archive_root: Path, stations: Sequence[str] = _JOIN_STATIONS, model: str = "NBS"
+    *,
+    archive_root: Path,
+    registry: StationRegistry,
+    stations: Sequence[str] = _JOIN_STATIONS,
+    model: str = "NBS",
 ) -> dict[tuple[str, int], RawMosTxnXnd]:
     """Real NBS TXN + XND per ``(station, cycle_runtime_ns)`` (SL-8c tasks
     1/2), read-only from the on-disk IEM MOS archive cache -- never fetches.
 
-    For a cycle with multiple ftime rows carrying a populated ``txn``, the
-    NEAREST future ftime is kept (the daily-max forecast closest to the
-    cycle's own runtime) -- this selects WHICH raw row to read, never a
-    climate day; the day comes from :func:`~breezy.analysis
-    .nbp_comparator_models.target_climate_day` alone (coordinator directive).
+    **Row selection (coordinator review 2026-09-29, CRITICAL fix).** For a
+    cycle with multiple candidate ftime rows carrying a populated ``txn``,
+    the SELECTED row is the one whose
+    `forecast_climate_day_map.climate_day_for_txn(..., kind="max")` equals
+    that cycle's own :func:`~breezy.analysis.nbp_comparator_models
+    .target_climate_day` -- verified explicitly, never assumed correct by
+    proximity alone. **Measured against the real on-disk archive (full
+    scan, all 4 stations):** the real MOS grid never publishes a
+    same-cycle-day 00Z ``txn`` row for a 13Z/19Z cycle -- the shortest
+    available MAX lead is 35h (13Z) / 29h (19Z) / 23h (01Z), and that FIRST
+    available MAX column already IS the correct D+1 target at every station
+    and cycle hour checked. The NEXT real MAX column (24h later) maps to
+    D+2 and must be rejected -- this function's explicit check is what
+    guarantees that rejection; it does not depend on "nearest" happening to
+    be right. A cycle with no candidate row mapping to its own target day is
+    simply ABSENT from the returned dict -- never approximated.
     """
     cache = _read_only_archive_cache(IEM_MOS_SOURCE, archive_root=archive_root)
     product = IEM_MOS_MODEL_PRODUCTS[model]
     wanted = frozenset(stations)
-    best: dict[tuple[str, int], tuple[int, RawMosTxnXnd]] = {}
+    candidates: dict[tuple[str, int], list[tuple[int, RawMosTxnXnd]]] = {}
     for entry in cache.entries(IEM_MOS_SOURCE):
         if entry.station not in wanted or entry.product != product:
             continue
@@ -751,11 +767,40 @@ def mos_txn_xnd_by_cycle(
                 continue
             runtime_ns = int(runtime.timestamp()) * _NS_PER_SECOND
             ftime_ns = int(ftime.timestamp()) * _NS_PER_SECOND
-            key = (entry.station, runtime_ns)
-            current = best.get(key)
-            if current is None or ftime_ns < current[0]:
-                best[key] = (ftime_ns, RawMosTxnXnd(txn_f=parsed[0], xnd_f=parsed[1]))
-    return {key: value[1] for key, value in best.items()}
+            candidates.setdefault((entry.station, runtime_ns), []).append(
+                (ftime_ns, RawMosTxnXnd(txn_f=parsed[0], xnd_f=parsed[1]))
+            )
+
+    result: dict[tuple[str, int], RawMosTxnXnd] = {}
+    for (station, runtime_ns), rows in candidates.items():
+        offset = registry.std_utc_offset_hours_by_icao.get(station)
+        if offset is None:
+            continue
+        target = target_climate_day(runtime_ns, offset)
+        for ftime_ns, raw in sorted(rows, key=lambda pair: pair[0]):
+            try:
+                mapped_day = climate_day_for_txn(
+                    icao=station,
+                    runtime_ns=runtime_ns,
+                    ftime_ns=ftime_ns,
+                    std_utc_offset_hours=offset,
+                    model=model,
+                    kind="max",
+                )
+            except ForecastValidPeriodError:
+                continue
+            if mapped_day == target:
+                result[(station, runtime_ns)] = raw
+                break
+    return result
+
+
+class AsosRowOrderError(RuntimeError):
+    """A raw IEM ASOS 1-minute payload's rows are not chronologically
+    ordered -- `daily_max_instants`'s tie-break-to-first-occurrence
+    convention depends on file order, so an out-of-order row fails loudly
+    rather than silently trusting or re-sorting it (coordinator review
+    2026-09-29)."""
 
 
 def daily_max_instants(
@@ -768,9 +813,13 @@ def daily_max_instants(
     ``forecast_conditional_corpus.observations_from_asos_payload``'s own
     streamed-reduce-then-drop shape. A station-day with no samples is simply
     ABSENT from the returned mapping -- never imputed. Ties are resolved to
-    the FIRST occurrence by relying on the archive's own chronological row
-    order (the same convention `observations_from_asos_payload` uses: a
-    strict ``>`` comparison never lets a later, equal reading win).
+    the FIRST occurrence: a strict ``>`` comparison never lets a later,
+    equal reading win, PROVIDED the stream is chronological -- which is
+    checked, not assumed (coordinator review 2026-09-29, MEDIUM fix): each
+    row's ``valid(UTC)`` is asserted non-decreasing against the previous row
+    of the SAME entry as it streams, and :class:`AsosRowOrderError` is
+    raised immediately (never silently reordered or skipped) the first time
+    that fails, rather than sorting the whole entry into memory up front.
     """
     cache = _read_only_archive_cache(IEM_ASOS_1MIN_SOURCE, archive_root=archive_root)
     wanted = frozenset(stations)
@@ -795,6 +844,7 @@ def daily_max_instants(
         except Exception:  # noqa: BLE001 - a partial backfill payload is a gap, not fatal
             continue
         running: dict[dt.date, tuple[int, float]] = {}
+        last_when: dt.datetime | None = None
         stream = io.TextIOWrapper(io.BytesIO(body), encoding="utf-8", newline="")
         reader = csv.reader(stream)
         try:
@@ -816,6 +866,15 @@ def daily_max_instants(
                 value = float(raw_temp)
             except ValueError:
                 continue
+            if last_when is not None and when < last_when:
+                raise AsosRowOrderError(
+                    f"{entry.station} {entry.window_start}: ASOS 1-minute row out of "
+                    f"chronological order ({when.isoformat()} after "
+                    f"{last_when.isoformat()}) -- the tie-break-to-first-occurrence "
+                    "convention requires a chronological stream; refusing rather than "
+                    "silently accepting an unordered file"
+                )
+            last_when = when
             climate_day, seconds = lst_clock_time(when, std_utc_offset_hours=offset)
             if value > running.get(climate_day, (0, -999.0))[1]:
                 running[climate_day] = (seconds, value)
@@ -1038,7 +1097,7 @@ def run_comparator_validate(
             continue
         all_windows.extend(complete_percentile_windows(rows))
 
-    mos_by_cycle = mos_txn_xnd_by_cycle(archive_root=archive_root)
+    mos_by_cycle = mos_txn_xnd_by_cycle(archive_root=archive_root, registry=registry)
     daily_max_by_station_day = daily_max_instants(archive_root=archive_root, registry=registry)
 
     return build_comparator_matched_events(
