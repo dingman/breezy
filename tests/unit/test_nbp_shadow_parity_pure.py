@@ -83,6 +83,7 @@ def _nbp_rows() -> tuple[NbpQuantileRow, ...]:
             cycle_runtime_ns=_CYCLE_NS,
             value_f=value,
             available_at_ns=_AVAILABLE_AT_NS,
+            climate_day=CLIMATE_DAY,
         )
         for variable, value in _PERCENTILES.items()
     )

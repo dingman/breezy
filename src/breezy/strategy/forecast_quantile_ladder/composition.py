@@ -199,7 +199,30 @@ def build_forecast_quantile_ladder_strategies(
     )
     resolved_ladder_cfg = ladder_cfg if ladder_cfg is not None else LadderEvConfig()
 
-    quantile_actor = ForecastQuantileStateActor(stations=tuple(today_by_station))
+    # SL-13e fix: `ForecastQuantileStateActor` must be keyed by the SAME
+    # identifier `NbmQuantileActor` actually publishes `ForecastPoint.station`
+    # under -- the ICAO id (`app/trade.py`'s own `station_icaos = tuple(
+    # registry.settlement_site(_VENUE, station).icao for station in
+    # today_by_station)`), never the city token `today_by_station` itself
+    # uses. Built here, at the ONE composition boundary that owns both
+    # vocabularies, via the existing registry ICAO<->city mapping -- no
+    # second mapping table. Every reader of this ONE shared actor instance
+    # (the `_percentiles_reader` closure below, and each composed strategy's
+    # own `evaluate_snapshot` read, via `quantile_station_keys`) is handed
+    # the SAME translated ICAO key so `on_data`'s `data.station` (ICAO) can
+    # ever match a served station.
+    registry = default_registry()
+    icao_by_station = {
+        station: registry.settlement_site(_VENUE, station).icao for station in today_by_station
+    }
+    std_utc_offset_hours_by_icao = {
+        icao_by_station[station]: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
+        for station in today_by_station
+    }
+    quantile_actor = ForecastQuantileStateActor(
+        stations=tuple(icao_by_station.values()),
+        std_utc_offset_hours=std_utc_offset_hours_by_icao,
+    )
 
     strategies: list[ForecastQuantileLadderStrategy] = []
     for station in today_by_station:
@@ -219,7 +242,7 @@ def build_forecast_quantile_ladder_strategies(
         bounds_provider = ArtefactBoundsProvider(
             cdf_method=bounds_draws.cdf_method,
             draws=bounds_draws.draws,
-            percentiles_fn=_percentiles_reader(quantile_actor, station, now_ns_fn),
+            percentiles_fn=_percentiles_reader(quantile_actor, icao_by_station[station], now_ns_fn),
         )
         strategies.append(
             ForecastQuantileLadderStrategy(
@@ -233,6 +256,7 @@ def build_forecast_quantile_ladder_strategies(
                 submit_veto=submit_veto,
                 fee_verified=fee_verified,
                 instrument_ids=tuple(str(iid) for iid in instrument_ids),
+                quantile_station_keys={station: icao_by_station[station]},
             ),
         )
     return tuple(strategies), quantile_actor

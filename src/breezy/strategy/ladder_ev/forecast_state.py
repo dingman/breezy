@@ -22,6 +22,7 @@ license a take.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Final
 
 __all__ = [
@@ -182,6 +183,18 @@ class ForecastQuantileVector:
     ``available_at_ns`` is the vector's OWN vintage: the max of the 7
     variables' own ``available_at_ns``, never an individual variable's. A
     vector is never partial -- see :meth:`ForecastQuantileState.value_at`.
+
+    ``climate_day`` (SL-13e defence-in-depth) is the D+1 calendar day this
+    cycle's MAX-column window targets, in the station's own local standard
+    time -- the SAME mapping ``breezy.ingest.nbm_quantile_parse.
+    max_column_lst_climate_day`` derives, computed once by
+    :class:`~breezy.strategy.ladder_ev.forecast_subscriber.
+    ForecastQuantileStateActor` at push time (it is the only caller that
+    knows both the point's own ``valid_end_ns`` and the station's
+    ``std_utc_offset_hours``). Never inferred downstream from
+    ``cycle_runtime_ns`` -- that instant is NOT the MAX window's own instant
+    (see the parser module's own docstring on why a 13Z cycle's nearest MAX
+    column lands roughly 11h later, at 00Z the following day).
     """
 
     q10: float
@@ -193,6 +206,7 @@ class ForecastQuantileVector:
     sd: float
     available_at_ns: int
     cycle_runtime_ns: int
+    climate_day: date
 
 
 class ForecastQuantileState:
@@ -209,6 +223,7 @@ class ForecastQuantileState:
 
     def __init__(self) -> None:
         self._by_cycle: dict[int, dict[str, tuple[float, int]]] = {}
+        self._climate_day_by_cycle: dict[int, date] = {}
 
     def push(
         self,
@@ -217,6 +232,7 @@ class ForecastQuantileState:
         value_f: float | None,
         available_at_ns: int,
         cycle_runtime_ns: int,
+        climate_day: date,
     ) -> None:
         if variable not in NBP_QUANTILE_VARIABLES:
             raise ValueError(
@@ -224,6 +240,15 @@ class ForecastQuantileState:
             )
         if value_f is None:
             return
+        existing_day = self._climate_day_by_cycle.get(cycle_runtime_ns)
+        if existing_day is not None and existing_day != climate_day:
+            raise ValueError(
+                f"cycle {cycle_runtime_ns} already recorded climate_day "
+                f"{existing_day.isoformat()}; {variable!r} carries "
+                f"{climate_day.isoformat()} -- every variable of one cycle "
+                f"must target the SAME climate day",
+            )
+        self._climate_day_by_cycle[cycle_runtime_ns] = climate_day
         cell = self._by_cycle.setdefault(cycle_runtime_ns, {})
         cell[variable] = (value_f, available_at_ns)
 
@@ -242,6 +267,7 @@ class ForecastQuantileState:
             sd=cell["TXN_SD"][0],
             available_at_ns=vintage,
             cycle_runtime_ns=cycle_runtime_ns,
+            climate_day=self._climate_day_by_cycle[cycle_runtime_ns],
         )
 
     def value_at(self, now_ns: int) -> ForecastQuantileVector | None:

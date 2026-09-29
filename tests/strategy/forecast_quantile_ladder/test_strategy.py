@@ -74,7 +74,9 @@ def _build(
     submit_veto: Callable[[], str | None] | None = None,
     fee_verified: Callable[[], bool] | None = None,
 ) -> ForecastQuantileLadderStrategy:
-    quantile_actor = ForecastQuantileStateActor(stations=("KMIA",))
+    quantile_actor = ForecastQuantileStateActor(
+        stations=("KMIA",), std_utc_offset_hours={"KMIA": _KMIA_OFFSET},
+    )
     clock = TestClock()
     clock.set_time(_NOW_NS)
     quantile_actor.register_base(

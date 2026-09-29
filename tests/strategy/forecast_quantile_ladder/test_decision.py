@@ -64,7 +64,9 @@ def _ns(y: int, m: int, d: int, h: int = 0, mi: int = 0) -> int:
     return int(dt.datetime(y, m, d, h, mi, 0, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
 
 
-def _vector(*, mean: float = 80.0, sd: float = 2.5) -> ForecastQuantileVector:
+def _vector(
+    *, mean: float = 80.0, sd: float = 2.5, climate_day: dt.date = _DAY,
+) -> ForecastQuantileVector:
     return ForecastQuantileVector(
         q10=mean - 3.2,
         q25=mean - 1.7,
@@ -75,6 +77,7 @@ def _vector(*, mean: float = 80.0, sd: float = 2.5) -> ForecastQuantileVector:
         sd=sd,
         available_at_ns=1_000,
         cycle_runtime_ns=500,
+        climate_day=climate_day,
     )
 
 
@@ -216,6 +219,7 @@ def test_klax_at_d_plus_1_is_accepted() -> None:
         station="KLAX",
         climate_day=dt.date(2026, 9, 30),
         ask=_yes_ask(0.10),
+        vector=_vector(climate_day=dt.date(2026, 9, 30)),
     )
     assert isinstance(result, Take)
 
@@ -352,6 +356,36 @@ def test_a_missing_vector_refuses_forecast_unavailable() -> None:
 
     assert isinstance(result, Refuse)
     assert result.reason == "forecast_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# SL-13e defence-in-depth: the vector's own climate_day must match the
+# instrument's.
+# ---------------------------------------------------------------------------
+
+
+def test_a_matching_vector_day_evaluates() -> None:
+    result = _run(ask=_yes_ask(0.10), vector=_vector(climate_day=_DAY))
+
+    assert isinstance(result, Take)
+
+
+def test_a_mismatched_vector_day_refuses_with_the_named_reason() -> None:
+    mismatched = _vector(climate_day=_DAY + dt.timedelta(days=1))
+
+    result = _run(ask=_yes_ask(0.10), vector=mismatched)
+
+    assert isinstance(result, Refuse)
+    assert result.reason == "vector_day_mismatch"
+
+
+def test_a_mismatched_vector_day_never_latches() -> None:
+    latch = QuantileLadderLatch()
+    mismatched = _vector(climate_day=_DAY + dt.timedelta(days=1))
+
+    _run(ask=_yes_ask(0.10), vector=mismatched, latch=latch)
+
+    assert latch.is_latched(station=_STATION, climate_day=_DAY, rung_id="i1", side="yes") is False
 
 
 # ---------------------------------------------------------------------------

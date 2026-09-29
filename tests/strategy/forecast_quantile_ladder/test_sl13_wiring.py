@@ -78,7 +78,9 @@ def _build_registered(
     submit_veto: Callable[[], str | None] | None = None,
     fee_verified: Callable[[], bool] | None = None,
 ) -> ForecastQuantileLadderStrategy:
-    quantile_actor = ForecastQuantileStateActor(stations=(STATION,))
+    quantile_actor = ForecastQuantileStateActor(
+        stations=(STATION,), std_utc_offset_hours={STATION: -8.0},
+    )
     clock = TestClock()
     clock.set_time(1_700_000_000_000_000_000)
     msgbus = TestComponentStubs.msgbus()

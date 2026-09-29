@@ -264,7 +264,9 @@ def run_live_parity(
     permit = _NominalWindowPermit(now_box=now_box)
     _assert_supports_expires_at_ns(permit)
 
-    quantile_actor = ForecastQuantileStateActor(stations=tuple(stations))
+    quantile_actor = ForecastQuantileStateActor(
+        stations=tuple(stations), std_utc_offset_hours=std_utc_offset_hours_by_station,
+    )
     latch = QuantileLadderLatch()
     strategy_config = ForecastQuantileLadderConfig(
         stations=tuple(stations),

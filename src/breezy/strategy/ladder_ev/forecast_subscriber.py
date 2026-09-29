@@ -23,12 +23,14 @@ serve is counted too, rather than silently ignored.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.identifiers import ClientId
 
 from breezy.domain.forecast_point import ForecastPoint
+from breezy.ingest.gaps import local_standard_date
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.strategy.ladder_ev.forecast_state import (
@@ -135,14 +137,23 @@ class ForecastQuantileStateActor(Actor):
         self,
         *,
         stations: tuple[str, ...],
+        std_utc_offset_hours: Mapping[str, float],
         model: str = NBP_QUANTILE_MODEL,
         client_id: ClientId = NWS_BACKTEST_CLIENT_ID,
     ) -> None:
         super().__init__()
         if not stations:
             raise ValueError("`stations` must name at least one station")
+        missing_offsets = [station for station in stations if station not in std_utc_offset_hours]
+        if missing_offsets:
+            raise ValueError(
+                f"`std_utc_offset_hours` is missing entries for {missing_offsets}; "
+                f"every served station needs its own LST offset to derive "
+                f"`ForecastQuantileVector.climate_day` (SL-13e)",
+            )
         self._model = model
         self._client_id = client_id
+        self._std_utc_offset_hours: dict[str, float] = dict(std_utc_offset_hours)
         self._states: dict[str, ForecastQuantileState] = {
             station: ForecastQuantileState() for station in stations
         }
@@ -179,10 +190,14 @@ class ForecastQuantileStateActor(Actor):
         if data.value_f is None:
             self.counters[f"absent_{data.absence_reason}"] += 1
             return
+        climate_day = local_standard_date(
+            data.valid_end_ns, self._std_utc_offset_hours[data.station],
+        )
         state.push(
             variable=data.variable,
             value_f=data.value_f,
             available_at_ns=data.available_at_ns,
             cycle_runtime_ns=data.cycle_runtime_ns,
+            climate_day=climate_day,
         )
         self.counters["pushed"] += 1

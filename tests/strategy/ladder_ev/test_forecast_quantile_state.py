@@ -13,12 +13,16 @@ future vintage.
 
 from __future__ import annotations
 
+import datetime as dt
+
 from breezy.strategy.ladder_ev.forecast_state import (
     NBP_QUANTILE_VARIABLES,
     ForecastQuantileState,
 )
 
 _Q10, _Q25, _Q50, _Q75, _Q90, _MEAN, _SD = NBP_QUANTILE_VARIABLES
+_CLIMATE_DAY = dt.date(2026, 9, 20)
+_OTHER_CLIMATE_DAY = dt.date(2026, 9, 30)
 
 
 def _push_all(
@@ -27,6 +31,7 @@ def _push_all(
     cycle_runtime_ns: int,
     available_at_ns: int,
     base: float = 80.0,
+    climate_day: dt.date = _CLIMATE_DAY,
 ) -> None:
     values = {
         _Q10: base - 4.0,
@@ -43,6 +48,7 @@ def _push_all(
             value_f=value_f,
             available_at_ns=available_at_ns,
             cycle_runtime_ns=cycle_runtime_ns,
+            climate_day=climate_day,
         )
 
 
@@ -67,7 +73,13 @@ def test_a_partial_vector_is_never_visible_even_after_its_vintage() -> None:
     """Six of seven variables arrive; the vector must stay invisible."""
     state = ForecastQuantileState()
     for variable in NBP_QUANTILE_VARIABLES[:-1]:
-        state.push(variable=variable, value_f=80.0, available_at_ns=100, cycle_runtime_ns=50)
+        state.push(
+            variable=variable,
+            value_f=80.0,
+            available_at_ns=100,
+            cycle_runtime_ns=50,
+            climate_day=_CLIMATE_DAY,
+        )
 
     assert state.value_at(10_000) is None
 
@@ -87,6 +99,30 @@ def test_the_vector_becomes_visible_once_all_seven_arrive_and_now_covers_the_vin
     assert vector.mean == 80.0
     assert vector.sd == 2.5
     assert vector.cycle_runtime_ns == 50
+    assert vector.climate_day == _CLIMATE_DAY
+
+
+def test_a_climate_day_disagreement_within_one_cycle_is_refused() -> None:
+    """SL-13e: every variable of ONE cycle must target the SAME climate day."""
+    import pytest
+
+    state = ForecastQuantileState()
+    state.push(
+        variable=_Q10,
+        value_f=76.0,
+        available_at_ns=100,
+        cycle_runtime_ns=50,
+        climate_day=_CLIMATE_DAY,
+    )
+
+    with pytest.raises(ValueError, match="climate_day"):
+        state.push(
+            variable=_Q25,
+            value_f=78.0,
+            available_at_ns=100,
+            cycle_runtime_ns=50,
+            climate_day=_OTHER_CLIMATE_DAY,
+        )
 
 
 def test_the_vectors_vintage_is_the_max_of_its_sevens_own_available_at_ns() -> None:
@@ -94,9 +130,21 @@ def test_the_vectors_vintage_is_the_max_of_its_sevens_own_available_at_ns() -> N
     state = ForecastQuantileState()
     early = NBP_QUANTILE_VARIABLES[:-1]
     for variable in early:
-        state.push(variable=variable, value_f=80.0, available_at_ns=100, cycle_runtime_ns=50)
+        state.push(
+            variable=variable,
+            value_f=80.0,
+            available_at_ns=100,
+            cycle_runtime_ns=50,
+            climate_day=_CLIMATE_DAY,
+        )
     late_variable = NBP_QUANTILE_VARIABLES[-1]
-    state.push(variable=late_variable, value_f=2.5, available_at_ns=250, cycle_runtime_ns=50)
+    state.push(
+        variable=late_variable,
+        value_f=2.5,
+        available_at_ns=250,
+        cycle_runtime_ns=50,
+        climate_day=_CLIMATE_DAY,
+    )
 
     assert state.value_at(200) is None
     vector = state.value_at(250)
@@ -120,12 +168,24 @@ def test_pushing_an_unknown_variable_is_refused() -> None:
 
     state = ForecastQuantileState()
     with pytest.raises(ValueError, match="TMP"):
-        state.push(variable="TMP", value_f=1.0, available_at_ns=1, cycle_runtime_ns=1)
+        state.push(
+            variable="TMP",
+            value_f=1.0,
+            available_at_ns=1,
+            cycle_runtime_ns=1,
+            climate_day=_CLIMATE_DAY,
+        )
 
 
 def test_pushing_a_none_value_is_a_no_op_not_a_stored_absence() -> None:
     state = ForecastQuantileState()
     for variable in NBP_QUANTILE_VARIABLES:
-        state.push(variable=variable, value_f=None, available_at_ns=100, cycle_runtime_ns=50)
+        state.push(
+            variable=variable,
+            value_f=None,
+            available_at_ns=100,
+            cycle_runtime_ns=50,
+            climate_day=_CLIMATE_DAY,
+        )
 
     assert state.value_at(10_000) is None

@@ -123,6 +123,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         submit_veto: Callable[[], str | None] | None = None,
         fee_verified: Callable[[], bool] | None = None,
         instrument_ids: Sequence[str | InstrumentId] = (),
+        quantile_station_keys: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(config)
         self._quantile_actor = quantile_actor
@@ -133,6 +134,18 @@ class ForecastQuantileLadderStrategy(Strategy):
         self._order_submission_permit = order_submission_permit
         self._submit_veto = submit_veto
         self._fee_verified = fee_verified
+        #: SL-13e: maps a `self.config.stations` city token to whatever key
+        #: `quantile_actor` was actually constructed with (composition.py
+        #: builds it ICAO-keyed, to match what `NbmQuantileActor` really
+        #: publishes `ForecastPoint.station` under). Defaults to empty, which
+        #: makes :meth:`evaluate_snapshot`'s lookup an identity pass-through
+        #: -- every caller that builds its own self-consistent
+        #: ``ForecastQuantileStateActor`` directly (this class's own unit
+        #: tests, the SL-13p shadow-parity harness) relies on that default
+        #: unchanged; only composition.py injects a real translation.
+        self._quantile_station_keys: Mapping[str, str] = (
+            quantile_station_keys if quantile_station_keys is not None else {}
+        )
         #: SL-13: candidate YES-leg instrument ids to resolve from
         #: ``self.cache`` at :meth:`on_start`. Never a msgspec ``StrategyConfig``
         #: field (mirrors ``order_submission_permit``/``submit_veto``/
@@ -286,9 +299,15 @@ class ForecastQuantileLadderStrategy(Strategy):
         Reads the visible quantile vector from ``self._quantile_actor`` at
         ``now_ns`` -- never a catalog read, mirroring
         ``ForecastState``'s own actor-push pattern (WP-12 Seam D).
+
+        ``station`` is translated through :attr:`_quantile_station_keys`
+        first (SL-13e): ``self._quantile_actor`` may be keyed differently
+        (e.g. ICAO) than ``station`` itself (a ``self.config.stations`` city
+        token) -- see that attribute's own docstring.
         """
+        actor_station = self._quantile_station_keys.get(station, station)
         vector: ForecastQuantileVector | None = self._quantile_actor.state_for(
-            station,
+            actor_station,
         ).value_at(now_ns)
         decision = evaluate(
             now_ns=now_ns,

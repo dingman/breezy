@@ -25,6 +25,10 @@ LAG_NS = _NBP_FLOOR_NS + 600 * NS
 CYCLE_NS = int(dt.datetime(2026, 9, 19, 13, tzinfo=dt.UTC).timestamp()) * NS
 AVAILABLE_NS = CYCLE_NS + LAG_NS
 NOW_NS = AVAILABLE_NS + 60 * NS
+#: KMIA's own registry offset (matches `sites.toml`'s `polymarket_us.MIA`
+#: entry) -- used only to derive `climate_day` at push time; not exercised
+#: against the registry itself here (this suite stays registry-free).
+_KMIA_STD_UTC_OFFSET_HOURS = -5.0
 
 
 def make_point(
@@ -61,11 +65,18 @@ class Publisher(Actor):  # type: ignore[misc]
 
 
 def build(
-    *, stations: tuple[str, ...] = ("KMIA",)
+    *,
+    stations: tuple[str, ...] = ("KMIA",),
+    std_utc_offset_hours: dict[str, float] | None = None,
 ) -> tuple[ForecastQuantileStateActor, Publisher]:
     clock = TestClock()
     clock.set_time(NOW_NS)
-    subscriber = ForecastQuantileStateActor(stations=stations)
+    offsets = (
+        std_utc_offset_hours
+        if std_utc_offset_hours is not None
+        else dict.fromkeys(stations, _KMIA_STD_UTC_OFFSET_HOURS)
+    )
+    subscriber = ForecastQuantileStateActor(stations=stations, std_utc_offset_hours=offsets)
     publisher = Publisher()
     msgbus = TestComponentStubs.msgbus()
     for actor in (subscriber, publisher):
@@ -102,6 +113,18 @@ def test_publishing_all_seven_variables_completes_the_vector() -> None:
     assert vector is not None
     assert vector.q50 == 80.0
     assert vector.sd == 2.5
+    # valid_end_ns = CYCLE_NS + 24h = 2026-09-20T13:00Z; KMIA (-5) LST is
+    # 2026-09-20T08:00, so the vector's own climate_day is 2026-09-20
+    # (SL-13e: derived at push time via `local_standard_date`, the same
+    # mapping `nbm_quantile_parse.max_column_lst_climate_day` uses).
+    assert vector.climate_day == dt.date(2026, 9, 20)
+
+
+def test_constructing_without_an_offset_for_a_served_station_is_refused() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="std_utc_offset_hours"):
+        ForecastQuantileStateActor(stations=("KMIA", "KSFO"), std_utc_offset_hours={"KMIA": -5.0})
 
 
 def test_a_partial_publication_never_completes_the_vector() -> None:
@@ -161,4 +184,4 @@ def test_constructing_with_no_stations_is_refused() -> None:
     import pytest
 
     with pytest.raises(ValueError, match="stations"):
-        ForecastQuantileStateActor(stations=())
+        ForecastQuantileStateActor(stations=(), std_utc_offset_hours={})

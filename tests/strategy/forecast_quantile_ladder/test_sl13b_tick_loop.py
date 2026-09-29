@@ -64,6 +64,9 @@ from tests.unit.test_current_rung_hold_strategy import (
 _NOW_NS = WINDOW_OPEN_NS - 24 * 3_600 * 10**9
 _NO_INTERIOR_ID = sibling_instrument_id(INTERIOR_ID)
 _DEPTH10_LEVELS = 10
+#: LAX_STD_OFFSET_HOURS per the module docstring -- the actor's own
+#: constructor validation (SL-13e) needs an offset per served station.
+_STD_UTC_OFFSET_HOURS = {STATION: -8.0}
 
 
 def _config() -> ForecastQuantileLadderConfig:
@@ -92,11 +95,20 @@ def _bounds_provider_factory(
 
 def _push_vector(actor: ForecastQuantileStateActor, *, station: str, now_ns: int) -> None:
     """A complete, already-visible 7-variable NBP vector -- see
-    ``ForecastQuantileState.push``/``value_at``."""
+    ``ForecastQuantileState.push``/``value_at``.
+
+    ``climate_day=CLIMATE_DAY`` matches every ``Take``-producing fixture
+    instrument's own settlement day in this file (``_instrument``'s default);
+    the D0/D+2 tests never reach the vector-day check at all (they refuse
+    earlier, at ``decision.evaluate``'s D+1 gate)."""
     state = actor.state_for(station)
     for variable in NBP_QUANTILE_VARIABLES:
         state.push(
-            variable=variable, value_f=80.0, available_at_ns=now_ns - 1, cycle_runtime_ns=now_ns - 1,
+            variable=variable,
+            value_f=80.0,
+            available_at_ns=now_ns - 1,
+            cycle_runtime_ns=now_ns - 1,
+            climate_day=CLIMATE_DAY,
         )
 
 
@@ -187,7 +199,9 @@ def _build_registered(
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
 ) -> ForecastQuantileLadderStrategy:
-    quantile_actor = ForecastQuantileStateActor(stations=(STATION,))
+    quantile_actor = ForecastQuantileStateActor(
+        stations=(STATION,), std_utc_offset_hours=_STD_UTC_OFFSET_HOURS,
+    )
     clock = TestClock()
     clock.set_time(_NOW_NS)
     msgbus = TestComponentStubs.msgbus()

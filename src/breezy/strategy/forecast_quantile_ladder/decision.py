@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Literal
+from typing import Final, Literal
 
 from breezy.ingest.gaps import local_standard_date
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
@@ -51,6 +51,7 @@ from breezy.strategy.weather_common.costs import DepthAwareTradeCost, venue_fee_
 
 __all__ = [
     "QTY",
+    "VECTOR_DAY_MISMATCH",
     "AskSideMismatchError",
     "Decision",
     "NotDPlus1",
@@ -65,6 +66,16 @@ __all__ = [
 #: Sizing is always exactly 1 contract (plan §3.3: "qty 1"). Never a config
 #: field, never derived from `kelly_stake_fraction` -- there is no such input.
 QTY: Literal[1] = 1
+
+#: SL-13e defence-in-depth: a `ForecastQuantileVector` carries its own
+#: target `climate_day` (the D+1 calendar day its MAX-column window was
+#: computed against, at push time). A vector whose `climate_day` disagrees
+#: with the instrument's own `climate_day` (this evaluation's caller-supplied
+#: value) must never be scored against that instrument -- the numbers would
+#: describe a DIFFERENT day's high than the one this rung settles on. Refused
+#: with this named reason rather than silently scored, exactly like every
+#: other non-trial verdict in this module.
+VECTOR_DAY_MISMATCH: Final[str] = "vector_day_mismatch"
 
 
 class AskSideMismatchError(ValueError):
@@ -238,6 +249,9 @@ def evaluate(
 
     if vector is None:
         return Refuse(reason="forecast_unavailable")
+
+    if vector.climate_day != climate_day:
+        return Refuse(reason=VECTOR_DAY_MISMATCH)
 
     percentiles = Percentiles(
         q10=vector.q10,

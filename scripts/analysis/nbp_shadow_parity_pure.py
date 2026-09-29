@@ -352,6 +352,7 @@ class NbpQuantileRow:
     cycle_runtime_ns: int
     value_f: float | None
     available_at_ns: int
+    climate_day: date
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -449,6 +450,7 @@ def run_batch_parity(
             value_f=nbp_row.value_f,
             available_at_ns=nbp_row.available_at_ns,
             cycle_runtime_ns=nbp_row.cycle_runtime_ns,
+            climate_day=nbp_row.climate_day,
         )
 
     for row in ordered:
