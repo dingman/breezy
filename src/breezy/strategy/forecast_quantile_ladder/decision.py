@@ -58,6 +58,7 @@ __all__ = [
     "Refuse",
     "SidedAsk",
     "Take",
+    "decision_log_fields",
     "evaluate",
 ]
 
@@ -137,6 +138,44 @@ class Take:
 
 
 Decision = NotExecutable | NotDPlus1 | Refuse | Take
+
+
+def decision_log_fields(decision: Decision) -> dict[str, object]:
+    """Explicit, field-by-field serialisation of one ``Decision`` -- the
+    shadow log's ONLY encoder (plan §7 row SL-12: "logs every decision
+    (keys and inputs) as a shadow decision log line").
+
+    ``dataclasses.asdict`` is banned repo-wide outside the closed allowlist
+    in ``tests/unit/test_polymarket_us_credential_serialization.py`` (item 2,
+    the partial-secret-leak guard), and this package is never on it -- see
+    ``tests/strategy/forecast_quantile_ladder/test_forbidden_imports.py``.
+    Each branch below lists its dataclass's fields BY NAME, so a future field
+    added to a ``Decision`` variant without a matching line here is a diff a
+    reviewer sees, never a silent drop from the log.
+
+    Fails CLOSED: an unrecognised ``Decision`` type raises rather than
+    silently emitting nothing.
+    """
+    if isinstance(decision, NotExecutable):
+        return {"reason": decision.reason}
+    if isinstance(decision, NotDPlus1):
+        return {"reason": decision.reason}
+    if isinstance(decision, Refuse):
+        return {"reason": decision.reason}
+    if isinstance(decision, Take):
+        return {
+            "instrument_id": decision.instrument_id,
+            "station": decision.station,
+            "climate_day": decision.climate_day,
+            "side": decision.side,
+            "rung_id": decision.rung_id,
+            "qty": decision.qty,
+            "ev_net": decision.ev_net,
+            "p_hat": decision.p_hat,
+            "p_lower": decision.p_lower,
+            "p_upper": decision.p_upper,
+        }
+    raise TypeError(f"decision_log_fields: unrecognised Decision type {type(decision)!r}")
 
 
 def _is_d_plus_1(*, now_ns: int, climate_day: date, std_utc_offset_hours: float) -> bool:

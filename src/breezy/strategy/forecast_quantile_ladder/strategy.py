@@ -31,7 +31,6 @@ untouched by this file, byte-for-byte, exactly as the plan requires.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
 from datetime import date
 from typing import Literal, Protocol, runtime_checkable
 
@@ -40,7 +39,13 @@ from nautilus_trader.trading.strategy import Strategy
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
-from breezy.strategy.forecast_quantile_ladder.decision import Decision, SidedAsk, Take, evaluate
+from breezy.strategy.forecast_quantile_ladder.decision import (
+    Decision,
+    SidedAsk,
+    Take,
+    decision_log_fields,
+    evaluate,
+)
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
@@ -158,8 +163,15 @@ class ForecastQuantileLadderStrategy(Strategy):
 
         Plan §4.4 item 1: "The shadow log carries decision keys and decision
         inputs only." No settlement/CLI/P&L module is imported by this file.
+        Serialised via :func:`decision_log_fields`, never ``dataclasses.
+        asdict`` -- that is banned repo-wide outside the closed allowlist in
+        ``tests/unit/test_polymarket_us_credential_serialization.py``.
         """
-        return {"now_ns": now_ns, "kind": type(decision).__name__, **asdict(decision)}
+        return {
+            "now_ns": now_ns,
+            "kind": type(decision).__name__,
+            **decision_log_fields(decision),
+        }
 
     def try_submit(self, take: Take) -> str | None:
         """Run the phase-0 permit, family-halt-veto and fee-verified guards.

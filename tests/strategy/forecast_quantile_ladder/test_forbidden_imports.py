@@ -95,3 +95,32 @@ def test_no_module_in_the_package_imports_p_hold_bound_names_from_anywhere() -> 
             assert name not in ("P_HOLD_LOWER", "P_HOLD_UPPER"), (
                 f"{path.name} imports {name!r}, the closed model's collider cell"
             )
+
+
+def _asdict_call_sites(path: Path) -> list[str]:
+    """Mirror ``test_polymarket_us_credential_serialization.py``'s own
+    ``find_unallowlisted_asdict_calls`` detection shape: a ``Call`` whose
+    function name (attribute or bare name) is exactly ``"asdict"``.
+    ``dataclasses.asdict`` is banned repo-wide outside that file's closed
+    allowlist, and this package must never be on it -- the shadow log
+    serialises every ``Decision`` variant via ``decision_log_fields``
+    instead."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    sites: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name == "asdict":
+            sites.append(f"{path.name}:{node.lineno}")
+    return sites
+
+
+def test_no_module_in_the_package_calls_asdict() -> None:
+    for path in _package_py_files():
+        sites = _asdict_call_sites(path)
+        assert not sites, (
+            f"asdict() is banned repo-wide outside the closed allowlist in "
+            f"test_polymarket_us_credential_serialization.py; found: {sites}"
+        )
