@@ -14,8 +14,20 @@ mean and an SD into a monotone CDF over degrees Fahrenheit (§9 Q1):
   through the 5 percentile knots, with normal tails below Q10 and above Q90
   anchored so the CDF is continuous at both junctions.
 * :attr:`CdfMethod.SKEW_NORMAL` -- a skew-normal fitted to the 5 percentiles
-  plus the mean/SD by least squares (never reads S2's holdout; that choice
-  is made once, on validation data, by the caller -- see plan §2.2).
+  plus the mean/SD by **interval-censored** least squares (plan §9 Q1(c),
+  §3.2 item 7): each integer percentile Q_i contributes a ZERO residual
+  whenever the model's own CDF band ``[F(Q_i-0.5), F(Q_i+0.5)]`` already
+  contains the target probability p_i -- equivalently, whenever the model's
+  p_i-quantile falls inside ``[Q_i-0.5, Q_i+0.5]`` -- and only the shortfall
+  outside that band otherwise. Mean and SD are soft anchors (weighted
+  residuals, never hard constraints). The fit is deterministic
+  (Levenberg-Marquardt from a fixed initial guess, no randomness). If the
+  solver does not converge (``OptimizeResult.success`` is False), the fit
+  falls back to :attr:`CdfMethod.NORMAL`\\(mean, sd) and logs a warning;
+  either way the returned callable exposes an inspectable
+  ``fit_fell_back: bool`` attribute (never reads S2's holdout; the method
+  choice itself is made once, on validation data, by the caller -- plan
+  §2.2).
 
 ``rung_probabilities`` turns any such CDF into per-rung probabilities over a
 *complete* integer-°F partition (open-lower / interior / open-upper, §3.2
@@ -32,6 +44,7 @@ ladder pass ``RUNG_IDS`` values for the rung ids; see
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -51,6 +64,12 @@ __all__ = [
     "build_cdf",
     "rung_probabilities",
 ]
+
+#: Logging only (never file/network I/O, never read back): observability for
+#: the SKEW_NORMAL non-convergence fallback (review item 2). Does not affect
+#: the module's determinism or purity -- the same inputs always produce the
+#: same CDF regardless of whether a handler is configured.
+_logger = logging.getLogger(__name__)
 
 _SQRT2: float = math.sqrt(2.0)
 
@@ -117,6 +136,23 @@ def _normal_cdf_fn(mean: float, sd: float) -> Callable[[float], float]:
     return f
 
 
+@dataclass(frozen=True, slots=True)
+class _FitFallbackAwareCdf:
+    """Wraps a CDF callable with an inspectable convergence flag.
+
+    ``fit_fell_back`` (review item 2) is False when the wrapped CDF is a
+    converged least-squares fit, and True when the fit failed to converge
+    and ``_inner`` is the :attr:`CdfMethod.NORMAL` fallback instead. Callers
+    that care can check ``getattr(cdf, "fit_fell_back", False)``.
+    """
+
+    _inner: Callable[[float], float]
+    fit_fell_back: bool
+
+    def __call__(self, x: float) -> float:
+        return self._inner(x)
+
+
 def _dedup_knots(xs: Sequence[float], ps: Sequence[float]) -> tuple[list[float], list[float]]:
     """Collapse consecutive tied x-knots, averaging their target probabilities.
 
@@ -173,14 +209,28 @@ def _pchip_normal_tails_cdf(percentiles: Percentiles) -> Callable[[float], float
     return f
 
 
-def _skew_normal_cdf(percentiles: Percentiles) -> Callable[[float], float]:
-    """Skew-normal fitted to the 5 percentiles plus mean/SD, by least squares.
+def _skew_normal_cdf(percentiles: Percentiles, *, max_nfev: int = 2000) -> Callable[[float], float]:
+    """Skew-normal fitted to the 5 percentiles plus mean/SD, by
+    interval-censored least squares (plan §9 Q1(c), §3.2 item 7).
 
-    "Interval-censored" (plan §9 Q1): each integer percentile Q_i is treated
-    as the (mean/SD-scaled) target ``F(Q_i) = p_i`` rather than as an exact
-    point sample, matching the same ±0.5 latent-interval treatment used
-    elsewhere for integer °F labels (plan §3.2 item 7) -- the residual for
-    each knot is the CDF-probability gap, not a raw temperature gap.
+    Each integer percentile Q_i is latent in ``[Q_i-0.5, Q_i+0.5)`` (the
+    same integer-rounding treatment as §3.2 item 7), so a fit landing
+    ANYWHERE in that band is exactly as good as landing precisely on Q_i.
+    The per-knot residual is therefore zero whenever the trial CDF already
+    satisfies ``F(Q_i-0.5) <= p_i <= F(Q_i+0.5)`` -- equivalently, whenever
+    the trial distribution's own p_i-quantile falls inside
+    ``[Q_i-0.5, Q_i+0.5]`` (evaluating in CDF space avoids an extra
+    ``ppf`` inversion per residual) -- and otherwise the shortfall to the
+    nearer band edge. Mean and SD stay soft anchors (weighted residuals,
+    never hard constraints). ``max_nfev`` is exposed for tests that need to
+    force non-convergence; production callers use the default.
+
+    Deterministic: Levenberg-Marquardt (``method="lm"``) from a fixed
+    initial guess, no randomness. If the solver's own convergence check
+    (``OptimizeResult.success``) is False, this logs a warning and falls
+    back to :attr:`CdfMethod.NORMAL`\\(mean, sd) instead of returning a
+    poorly-fit distribution silently (review item 2); either branch returns
+    a :class:`_FitFallbackAwareCdf` so callers can inspect ``fit_fell_back``.
     """
     xs = (percentiles.q10, percentiles.q25, percentiles.q50, percentiles.q75, percentiles.q90)
     sd = percentiles.sd
@@ -189,17 +239,38 @@ def _skew_normal_cdf(percentiles: Percentiles) -> Callable[[float], float]:
     def residuals(params: Sequence[float]) -> list[float]:
         shape, loc, log_scale = params
         scale = math.exp(log_scale)
-        cdf_resid = [
-            float(skewnorm.cdf(x, shape, loc=loc, scale=scale)) - p
-            for x, p in zip(xs, _PERCENTILE_PROBS)
-        ]
+        band_resid: list[float] = []
+        for x, p in zip(xs, _PERCENTILE_PROBS):
+            low = float(skewnorm.cdf(x - 0.5, shape, loc=loc, scale=scale))
+            high = float(skewnorm.cdf(x + 0.5, shape, loc=loc, scale=scale))
+            if p < low:
+                band_resid.append(low - p)
+            elif p > high:
+                band_resid.append(p - high)
+            else:
+                band_resid.append(0.0)
         model_mean, model_var = skewnorm.stats(shape, loc=loc, scale=scale, moments="mv")
         mean_resid = (float(model_mean) - percentiles.mean) / scale_guard
         sd_resid = (math.sqrt(max(float(model_var), 0.0)) - sd) / scale_guard
-        return [*cdf_resid, mean_resid, sd_resid]
+        return [*band_resid, mean_resid, sd_resid]
 
     x0 = [0.0, percentiles.q50, math.log(scale_guard)]
-    result = least_squares(residuals, x0=x0, method="lm", max_nfev=2000)
+    result = least_squares(residuals, x0=x0, method="lm", max_nfev=max_nfev)
+    if not bool(result.success):
+        _logger.warning(
+            "SKEW_NORMAL interval-censored fit did not converge "
+            "(max_nfev=%d, percentiles=%r) -- falling back to "
+            "CdfMethod.NORMAL(mean=%r, sd=%r)",
+            max_nfev,
+            percentiles,
+            percentiles.mean,
+            percentiles.sd,
+        )
+        return _FitFallbackAwareCdf(
+            _inner=_normal_cdf_fn(percentiles.mean, percentiles.sd),
+            fit_fell_back=True,
+        )
+
     shape_fit = float(result.x[0])
     loc_fit = float(result.x[1])
     scale_fit = math.exp(float(result.x[2]))
@@ -207,7 +278,7 @@ def _skew_normal_cdf(percentiles: Percentiles) -> Callable[[float], float]:
     def f(x: float) -> float:
         return float(skewnorm.cdf(x, shape_fit, loc=loc_fit, scale=scale_fit))
 
-    return f
+    return _FitFallbackAwareCdf(_inner=f, fit_fell_back=False)
 
 
 def build_cdf(method: CdfMethod, percentiles: Percentiles) -> Callable[[float], float]:
@@ -225,21 +296,27 @@ def build_cdf(method: CdfMethod, percentiles: Percentiles) -> Callable[[float], 
 
 def apply_emos(
     base_cdf: Callable[[float], float],
-    *,
-    q50: float,
-    txn_sd: float,
+    percentiles: Percentiles,
     params: EmosParams,
 ) -> Callable[[float], float]:
-    """Apply the EMOS location-scale transform (plan §2.2) around ``q50``.
+    """Apply the EMOS location-scale transform (plan §2.2) around Q50.
 
-    ``mu = q50 + params.a``; ``s = exp(params.gamma + params.delta *
-    log(txn_sd))``. The identity ``EmosParams(a=0, gamma=0, delta=1)``
-    (with ``s == txn_sd``) leaves ``base_cdf`` unchanged: ``mu == q50`` and
-    the location-scale ratio collapses to 1, regardless of what ``base_cdf``
-    itself is.
+    ``percentiles`` MUST be the same :class:`Percentiles` used to build
+    ``base_cdf`` via :func:`build_cdf` -- ``q50`` and ``sd`` are read
+    directly off it rather than accepted as separate caller-supplied
+    scalars (review item 3), so the EMOS transform can never be applied
+    with a different SD than the one ``base_cdf`` was itself built from.
+
+    ``mu = percentiles.q50 + params.a``; ``s = exp(params.gamma +
+    params.delta * log(percentiles.sd))``. The identity ``EmosParams(a=0,
+    gamma=0, delta=1)`` (``s == percentiles.sd``) leaves ``base_cdf``
+    unchanged: ``mu == q50`` and the location-scale ratio collapses to 1,
+    regardless of what ``base_cdf`` itself is.
     """
+    txn_sd = percentiles.sd
     if txn_sd <= 0.0:
-        raise ValueError(f"txn_sd must be positive, was {txn_sd!r}")
+        raise ValueError(f"percentiles.sd must be positive, was {txn_sd!r}")
+    q50 = percentiles.q50
     mu = q50 + params.a
     s = math.exp(params.gamma + params.delta * math.log(txn_sd))
     if s <= 0.0:
