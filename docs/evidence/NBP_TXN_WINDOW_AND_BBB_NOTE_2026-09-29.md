@@ -153,6 +153,42 @@ read as the cycle's **own LST day**, not its printed UTC calendar date — the t
 
 ---
 
+## (d) Settlement-day spillover, under the assumed (still UNKNOWN-for-NBP) window
+
+**This section is conditional**, not a new claim: part (a) above records the 12Z-current-day-to-06Z-next-day,
+18-hour MAX window as VERIFIED only for the sibling NBS/NBE products and UNKNOWN for NBP itself. Taking that
+window as a hypothesis anyway (it is the only concrete window-length text the primary source offers for this
+physical quantity), converting its two UTC endpoints to each station's FIXED standard-time offset by hand
+(local = UTC + offset; `-` denotes the LST day rolls back relative to the window's own UTC "current day") gives:
+
+| Station | Offset | Window start (12Z UTC → LST) | Window end (06Z next-day UTC → LST) | LST span | Relationship to the CLI day |
+|---|---|---|---|---|---|
+| KLAX | −8 | `12:00 − 8h = 04:00` (curday) | `06:00 − 8h = 22:00` (curday) | **04:00–22:00** | Contained within the CLI day |
+| KSFO | −8 | `12:00 − 8h = 04:00` (curday) | `06:00 − 8h = 22:00` (curday) | **04:00–22:00** | Contained within the CLI day |
+| KMDW | −6 | `12:00 − 6h = 06:00` (curday) | `06:00 − 6h = 00:00` (curday+1) | **06:00–00:00** | On the boundary (ends exactly at LST midnight) |
+| KMIA | −5 | `12:00 − 5h = 07:00` (curday) | `06:00 − 5h = 01:00` (curday+1) | **07:00–01:00** | Runs 1 hour PAST LST midnight, into the NEXT CLI day |
+
+**The KMIA case is the one worth stating plainly.** A daily max that this window's own data actually realises
+between 00:00 and 01:00 LST (i.e. in the first hour after local midnight) is, under the assumed window,
+CAPTURED by that station-day's MAX forecast — but the CLI settlement-truth day boundary is exactly local
+midnight (§3.2 item 3 of the plan: "CLI day = local standard time midnight to midnight, no DST"), so that
+realised extreme SETTLES on the *next* CLI calendar day, not the one the forecast window nominally targets. A
+forecast-vs-truth comparison that ignores this is comparing the model's window to the wrong settlement day on
+exactly those station-days where the true max happens to fall in that first post-midnight hour at KMIA (and,
+on the boundary, potentially at KMDW too, depending on how a value realised at exactly 00:00 is attributed).
+
+**Control, not a correction (plan amendment A-6).** SL-2 does **not** attempt to correct for this spillover: the
+parser's job is to stay faithful to what the bulletin actually says (`valid_start_ns == valid_end_ns`, the 00Z
+grid instant only — part (a) above), never to silently shift a station-day boundary on an assumed, unverified
+window. Instead, **plan gate G2.0 (§4.1) now carries an added stratum, station × near-midnight-max, as the
+empirical control for this effect** — alongside its existing by-calendar-month and by-day-length-tercile
+strata — so that a KMIA-specific (or KMDW-boundary) settlement-day-spillover bias, if the assumed window is
+real, shows up as a detectable residual pattern in G2.0 rather than being invisibly absorbed into the general
+fit. This is recorded here as the evidence trail for that amendment; implementing the added stratum itself is
+S2 work (SL-8), not this slice.
+
+---
+
 ## Summary of what is pinned vs. still open
 
 | Item | Status |
@@ -162,3 +198,4 @@ read as the cycle's **own LST day**, not its printed UTC calendar date — the t
 | BBB correction indicator | VERIFIED ABSENT on all 16 real station-header lines examined; parser can parse one if a future capture ever carries it |
 | Cycle → D+1 LST column mapping (13Z/19Z/01Z) | VERIFIED against real fixtures, all 4 stations, general rule stated above |
 | `-99` missing-data sentinel | VERIFIED (primary source, NBP's own "Missing Data" note); reuses the existing `FORECAST_VALUE_SENTINELS` rule unchanged |
+| Settlement-day spillover (KMIA, under the assumed window) | Conditional on the still-UNKNOWN window; hand-computed in part (d) above; not corrected here (parser stays faithful to the bulletin) — G2.0 gets a station × near-midnight-max stratum (amendment A-6) as the empirical control |

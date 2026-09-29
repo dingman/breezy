@@ -157,6 +157,73 @@ def test_01z_cycles_own_lst_day_is_the_utc_date_minus_one() -> None:
 
 
 # ---------------------------------------------------------------------------
+# HAND-COMPUTED D+1 target LST day (SL-2 review, MEDIUM): every expectation
+# below is a hard-coded literal, worked out by hand from the raw fixture's
+# FHR row -- NEVER via `local_standard_date`/`max_column_lst_climate_day` or
+# any other library call. Only the ACTUAL side of each assertion calls the
+# parser and the production helper.
+#
+# The FHR row is byte-identical across all four stations within one cycle
+# file (verified: `grep " FHR " tests/fixtures/nbm/nbptx_t*_excerpt.txt`), so
+# the first available MAX (00Z) column's own UTC valid instant is the SAME
+# for every station, per cycle:
+#
+#   13Z cycle (2026-09-28 13:00 UTC): first MAX column is FHR 35 (the
+#     grid's FIRST group, FHR 23, carries only the 12Z/MIN sub-value).
+#     13:00 UTC + 35h = 13:00 + 1d11h = (next day) 00:00 UTC, +1 more day
+#     = 2026-09-30 00:00:00 UTC.
+#
+#   19Z cycle (2026-09-28 19:00 UTC): first MAX column is FHR 29 (group 0,
+#     FHR 17, is MIN-only, same shape as the 13Z case).
+#     19:00 UTC + 29h = 19:00 + 1d5h = (next day) 00:00 UTC, +1 more day
+#     = 2026-09-30 00:00:00 UTC.
+#
+#   01Z cycle (2026-09-29 01:00 UTC): first MAX column is FHR 23 (this
+#     grid's very first group already carries BOTH 00Z and 12Z, since 01Z
+#     is early enough that the day-D MAX is already >= NBP's ~24h floor).
+#     01:00 UTC + 23h = 24:00 UTC = 2026-09-30 00:00:00 UTC.
+#
+# All three cycles converge on the SAME instant, 2026-09-30 00:00:00 UTC.
+# Converting it to each station's FIXED standard-time offset by hand
+# (UTC hour + offset; a negative result rolls the calendar date back one):
+#
+#   KLAX (offset -8): 00:00 - 8h = -08:00 -> 2026-09-29 16:00 LST -> day 2026-09-29
+#   KSFO (offset -8): 00:00 - 8h = -08:00 -> 2026-09-29 16:00 LST -> day 2026-09-29
+#   KMDW (offset -6): 00:00 - 6h = -06:00 -> 2026-09-29 18:00 LST -> day 2026-09-29
+#   KMIA (offset -5): 00:00 - 5h = -05:00 -> 2026-09-29 19:00 LST -> day 2026-09-29
+#
+# Every station lands on 2026-09-29, which is D+1: each cycle's own LST day
+# D is 2026-09-28 (13Z/19Z keep the UTC calendar date; 01Z's 2026-09-29 UTC
+# rolls back to 2026-09-28 LST at every one of these offsets -- worked
+# example 3, docs/evidence/NBP_TXN_WINDOW_AND_BBB_NOTE_2026-09-29.md).
+
+HAND_COMPUTED_FIRST_MAX_VALID_UTC = dt.datetime(2026, 9, 30, 0, 0, tzinfo=dt.UTC)
+
+HAND_COMPUTED_DPLUS1_LST_DAY: dict[str, dt.date] = {
+    "KLAX": dt.date(2026, 9, 29),
+    "KSFO": dt.date(2026, 9, 29),
+    "KMDW": dt.date(2026, 9, 29),
+    "KMIA": dt.date(2026, 9, 29),
+}
+
+
+@pytest.mark.parametrize("station", ["KLAX", "KSFO", "KMDW", "KMIA"])
+@pytest.mark.parametrize("name", ["13Z", "19Z", "01Z"])
+def test_hand_computed_dplus1_lst_day_per_station_per_cycle(name: str, station: str) -> None:
+    points, _ = parse_real(name)
+    station_points = [p for p in points if p.station == station]
+    first = min(station_points, key=lambda p: p.valid_end_ns)
+
+    first_instant = dt.datetime.fromtimestamp(first.valid_end_ns / NS, tz=dt.UTC)
+    assert first_instant == HAND_COMPUTED_FIRST_MAX_VALID_UTC
+
+    actual_lst_day = max_column_lst_climate_day(
+        first, std_utc_offset_hours=STD_UTC_OFFSET_HOURS[station]
+    )
+    assert actual_lst_day == HAND_COMPUTED_DPLUS1_LST_DAY[station]
+
+
+# ---------------------------------------------------------------------------
 # BBB correction indicator: parsed if present; PINNED absent on every fixture
 # (R3-08). Real NBP captures carry no WMO abbreviated-header line.
 # ---------------------------------------------------------------------------

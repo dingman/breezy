@@ -75,7 +75,11 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Final
 
-from breezy.domain.forecast_point import forecast_value_or_none
+from breezy.ingest._nbm_text_common import (
+    absence_from_token as _absence_from_token,
+    cycle_runtime_ns as _cycle_runtime_ns,
+    row_label as _row_label,
+)
 from breezy.ingest.gaps import local_standard_date
 
 __all__ = [
@@ -135,8 +139,6 @@ _STATION_HEADER_RE: Final[re.Pattern[str]] = re.compile(
     r"\s+(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})\s+(?P<cycle>\d{4})\s+UTC",
     re.MULTILINE,
 )
-
-_ROW_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^\s*(?P<label>[A-Z0-9]+)")
 
 
 class NbpBulletinDriftError(ValueError):
@@ -201,13 +203,6 @@ def max_column_lst_climate_day(
     return local_standard_date(point.valid_end_ns, std_utc_offset_hours)
 
 
-def _row_label(line: str) -> str:
-    match = _ROW_LABEL_RE.match(line)
-    if match is None:
-        return ""
-    return match.group("label")
-
-
 def _required_row(block_lines: list[str], label: str, station: str) -> str:
     for line in block_lines:
         if _row_label(line) == label:
@@ -218,20 +213,6 @@ def _required_row(block_lines: list[str], label: str, station: str) -> str:
         f"changed and is refused rather than parsed on a guess. Row labels "
         f"actually present: {present}"
     )
-
-
-def _cycle_runtime_ns(match: re.Match[str]) -> int:
-    cycle = match.group("cycle")
-    hour, minute = int(cycle[:2]), int(cycle[2:])
-    instant = dt.datetime(
-        int(match.group("year")),
-        int(match.group("month")),
-        int(match.group("day")),
-        hour,
-        minute,
-        tzinfo=dt.UTC,
-    )
-    return int(instant.timestamp()) * _NS_PER_SECOND
 
 
 def _strip_row_label(group: str, label: str, *, station: str, row_label: str) -> str:
@@ -305,18 +286,28 @@ def _flat_row_values(
     return values
 
 
-def _absence_from_token(token: str) -> tuple[float | None, str | None]:
-    """Return `(value_f, absence_reason)` for one TXN cell. Never invents a value."""
-    if not token:
-        return None, "not_published"
-    try:
-        raw = float(int(token))
-    except ValueError:
-        return None, "parse_failure"
-    value = forecast_value_or_none(raw)
-    if value is None:
-        return None, "sentinel"
-    return value, None
+def _flat_row_values_with_slot_counts(
+    row: str, label: str, *, station: str
+) -> tuple[list[str], list[int]]:
+    """Parse `row` in ONE pass, returning its flat values AND each group's slot count.
+
+    Used only for the FHR row: FHR is never blank (every offered grid column
+    has a forecast hour), so it is the one row whose own slot counts are
+    trustworthy -- UTC and every TXN row instead reuse those counts via
+    `_flat_row_values`, because a genuinely missing value must still occupy
+    its slot rather than collapse the grid. Splits and label-strips `row`
+    once; the caller previously derived `slot_counts` from the FHR row and
+    then called `_flat_row_values` on that SAME row a second time.
+    """
+    groups = row.split("|")
+    groups[0] = _strip_row_label(groups[0], label, station=station, row_label=label)
+    slot_counts: list[int] = []
+    values: list[str] = []
+    for group in groups:
+        slots = _slot_count(group)
+        slot_counts.append(slots)
+        values.extend(_slot_values(group, slots))
+    return values, slot_counts
 
 
 def _station_block_spans(text: str) -> dict[str, tuple[re.Match[str], int, int]]:
@@ -383,14 +374,10 @@ def _station_points(
     utc_line = _required_row(lines, "UTC", station)
     fhr_line = _required_row(lines, "FHR", station)
 
-    fhr_groups_raw = fhr_line.split("|")
-    fhr_groups_raw[0] = _strip_row_label(
-        fhr_groups_raw[0], "FHR", station=station, row_label="FHR"
+    fhr_values, slot_counts = _flat_row_values_with_slot_counts(
+        fhr_line, "FHR", station=station
     )
-    slot_counts = [_slot_count(group) for group in fhr_groups_raw]
-
     utc_values = _flat_row_values(utc_line, "UTC", slot_counts, station=station)
-    fhr_values = _flat_row_values(fhr_line, "FHR", slot_counts, station=station)
     if len(utc_values) != len(fhr_values):
         raise NbpBulletinDriftError(
             f"{station}: the UTC row yields {len(utc_values)} value(s) and the "

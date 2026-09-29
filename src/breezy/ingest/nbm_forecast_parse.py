@@ -46,12 +46,16 @@ read). None of the three is ever turned into a number.
 
 from __future__ import annotations
 
-import datetime as dt
 import re
 from collections import Counter
 from typing import Final
 
-from breezy.domain.forecast_point import ForecastPoint, forecast_value_or_none
+from breezy.domain.forecast_point import ForecastPoint
+from breezy.ingest._nbm_text_common import (
+    absence_from_token as _absence_from_token,
+    cycle_runtime_ns as _cycle_runtime_ns,
+    row_label as _row_label,
+)
 
 __all__ = [
     "NBM_NBS_MODEL",
@@ -72,7 +76,6 @@ _NS_PER_SECOND: Final[int] = 1_000_000_000
 _SECONDS_PER_HOUR: Final[int] = 3_600
 
 #: Column geometry (see the module docstring). Measured, not assumed.
-_LABEL_WIDTH: Final[int] = 4
 _COLUMN_START: Final[int] = 5
 _COLUMN_WIDTH: Final[int] = 3
 
@@ -90,10 +93,6 @@ _STATION_HEADER_RE: Final[re.Pattern[str]] = re.compile(
 
 class NbsBulletinDriftError(ValueError):
     """The bulletin does not have the shape this parser verified. Never coerced."""
-
-
-def _row_label(line: str) -> str:
-    return line[:_LABEL_WIDTH].strip()
 
 
 def _cell(line: str, index: int) -> str:
@@ -134,20 +133,6 @@ def _int_cells(line: str, count: int, *, label: str, station: str) -> list[int]:
     return values
 
 
-def _cycle_runtime_ns(match: re.Match[str]) -> int:
-    cycle = match.group("cycle")
-    hour, minute = int(cycle[:2]), int(cycle[2:])
-    instant = dt.datetime(
-        int(match.group("year")),
-        int(match.group("month")),
-        int(match.group("day")),
-        hour,
-        minute,
-        tzinfo=dt.UTC,
-    )
-    return int(instant.timestamp()) * _NS_PER_SECOND
-
-
 def _block_lines(text: str, start: int, end: int) -> list[str]:
     """Materialise ONE station block's lines. The only slice-and-split in this module.
 
@@ -178,20 +163,6 @@ def _station_block_spans(text: str) -> dict[str, tuple[re.Match[str], int, int]]
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         spans[match.group("station")] = (match, match.start(), end)
     return spans
-
-
-def _absence_from_token(token: str) -> tuple[float | None, str | None]:
-    """Return ``(value_f, absence_reason)`` for one TXN cell. Never invents a value."""
-    if not token:
-        return None, "not_published"
-    try:
-        raw = float(int(token))
-    except ValueError:
-        return None, "parse_failure"
-    value = forecast_value_or_none(raw)
-    if value is None:
-        return None, "sentinel"
-    return value, None
 
 
 def parse_nbs_bulletin(
