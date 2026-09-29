@@ -293,7 +293,10 @@ def archive_windows(
     2026-01-01..2026-09-28 window per city, which closes most of that hole.
     It defaults to ``False`` so the pre-SL-5 window set -- the one this
     function's own regression test pins -- is unchanged for every existing
-    caller; ``main`` is the one caller that opts in.
+    caller; ``main`` opts in only when invoked with ``--include-extension``.
+    Any future scheduled rebuild (nightly extension job, cron, systemd
+    timer) MUST pass ``--include-extension``, or it silently reverts to the
+    truncated pre-SL-5 window set.
     """
     registry = default_registry()
     windows: list[ArchiveWindow] = []
@@ -961,19 +964,25 @@ def final_rows_for_gate(rows: Sequence[SettlementTruthRow]) -> tuple[SettlementT
     subclass with unrelated ingest-provenance fields -- would import the
     live ingest stack into a script that promises never to touch it.
 
-    This selector is the defense-in-depth check on that promise: it excludes
-    every row that is not ``is_final=True`` (``PRELIMINARY_ONLY``,
-    ``NO_PRODUCT``, ``AMBIGUOUS_FINAL``), and it refuses outright if more
-    than one row for the same ``(station, climate_day)`` were ever final --
-    which should be structurally impossible given ``build_truth_rows``
-    groups by day before this is ever called, but a provisional label a
-    future nightly-extension job writes without going through that path
-    would be caught here rather than silently reaching a gate.
+    This selector is the defense-in-depth check on that promise: it admits
+    only rows with ``status == STATUS_FINAL`` and a real ``tmax_f``, and
+    excludes every other status -- ``PRELIMINARY_ONLY`` and ``NO_PRODUCT``
+    (``is_final=False``), ``AMBIGUOUS_FINAL`` (``is_final=False``), and
+    ``FINAL_TMAX_SENTINEL`` (``is_final=True`` but ``tmax_f=None``: a FINAL
+    issuance was selected, but its own reading carries a missing/trace
+    sentinel rather than a usable value, so ``row.is_final`` alone is NOT
+    the gate condition -- see ``_build_day_row``'s ``STATUS_FINAL_TMAX_SENTINEL``
+    branch). It also refuses outright if more than one row for the same
+    ``(station, climate_day)`` were ever final -- which should be
+    structurally impossible given ``build_truth_rows`` groups by day before
+    this is ever called, but a provisional label a future nightly-extension
+    job writes without going through that path would be caught here rather
+    than silently reaching a gate.
     """
     seen: set[tuple[str, dt.date]] = set()
     selected: list[SettlementTruthRow] = []
     for row in rows:
-        if not row.is_final:
+        if row.status != STATUS_FINAL or row.tmax_f is None:
             continue
         key = (row.station, row.climate_day)
         if key in seen:

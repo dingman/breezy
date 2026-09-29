@@ -9,10 +9,14 @@ for plan §3.2 item 10 / §7 SL-5 (`FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3`):
   ``test_settlement_truth_dataset.py`` pins);
 * absent days inside that window are reported, never interpolated;
 * ``final_rows_for_gate`` -- the new selector every split-bearing consumer
-  must read through -- excludes preliminary-only and no-product rows, keeps
-  only the post-supersession final value (never a superseded one), and
-  refuses if more than one final row ever reaches it for the same
-  ``(station, climate_day)``.
+  must read through -- excludes preliminary-only, no-product, ambiguous-final
+  and sentinel-tmax final rows, keeps only the post-supersession final value
+  (never a superseded one), and refuses if more than one final row ever
+  reaches it for the same ``(station, climate_day)``;
+* overlapping ``ArchiveWindow`` coverage for one city, flowing through
+  ``main()``'s real multi-window merge path, dedupes to one row per day via
+  the existing digest dedupe -- not merely via ``build_truth_rows``'s
+  one-row-per-day grouping, which is true by construction regardless.
 
 This file does not import or modify ``test_settlement_truth_dataset.py``;
 it reuses that file's own module-loading convention so both suites load one
@@ -22,8 +26,10 @@ consistent module object per test run.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import importlib.util
 import sys
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -33,6 +39,16 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
+_ANCHOR_PRODUCT_PATH = (
+    _REPO_ROOT
+    / "docs"
+    / "evidence"
+    / "venue"
+    / "polymarket_us"
+    / "raw"
+    / "nws"
+    / "CLINYC_202604240617-KOKX-CDUS41-CLINYC.txt"
+)
 
 
 def _load_module() -> ModuleType:
@@ -322,3 +338,128 @@ def test_main_only_passes_include_extension_when_the_cli_flag_is_set(
             ]
         )
     assert calls == [{"cities": ("NYC",), "include_extension": True}]
+
+
+# --- E. final_rows_for_gate excludes sentinel-tmax final rows ----------
+
+
+def test_final_rows_for_gate_excludes_final_tmax_sentinel_rows() -> None:
+    """A FINAL issuance whose own reading is a missing/trace sentinel sets
+    ``status=STATUS_FINAL_TMAX_SENTINEL`` and ``is_final=True`` --
+    ``_build_day_row``'s existing, untouched semantics (``is_final`` means a
+    FINAL issuance was selected, not that it carries a usable value). The
+    gate selector must still refuse it: ``is_final=True`` alone is not
+    admission, only ``status == STATUS_FINAL and tmax_f is not None`` is.
+    """
+    module = _load_module()
+
+    rows = module.build_truth_rows(
+        city="NYC",
+        station="NYC",
+        issuances=(_issuance(module, climate_day=dt.date(2026, 4, 23), tmax_f=None),),
+        expected_days=(dt.date(2026, 4, 23),),
+    )
+
+    assert rows[0].status == module.STATUS_FINAL_TMAX_SENTINEL
+    assert rows[0].is_final is True  # untouched _build_day_row semantics
+
+    gated = module.final_rows_for_gate(rows)
+
+    assert gated == ()
+
+
+def test_final_rows_for_gate_admits_a_real_final_alongside_an_excluded_sentinel() -> None:
+    """A mixed batch: one ordinary final and one sentinel-tmax final for a
+    different day. Only the ordinary final reaches the gate.
+    """
+    module = _load_module()
+
+    rows = module.build_truth_rows(
+        city="NYC",
+        station="NYC",
+        issuances=(
+            _issuance(module, climate_day=dt.date(2026, 4, 23), tmax_f=70),
+            _issuance(
+                module,
+                climate_day=dt.date(2026, 4, 24),
+                tmax_f=None,
+                issued_at_utc=dt.datetime(2026, 4, 25, 6, 17, tzinfo=dt.UTC),
+                product_id="202604250617-KOKX-CDUS41-CLINYC",
+                raw_sha256="c" * 64,
+            ),
+        ),
+        expected_days=(dt.date(2026, 4, 23), dt.date(2026, 4, 24)),
+    )
+
+    gated = module.final_rows_for_gate(rows)
+
+    assert {row.climate_day for row in gated} == {dt.date(2026, 4, 23)}
+    assert gated[0].tmax_f == 70
+
+
+# --- F. overlapping windows dedupe through main()'s real merge path ----
+
+
+def test_overlapping_windows_dedupe_to_one_row_per_day_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two ``ArchiveWindow``s for NYC overlap on 2026-04-23; each carries a
+    byte-identical transmission for that day in its own cached zip.
+
+    ``main()``'s per-city loop reads BOTH windows and ``.extend()``s their
+    issuances into one list before ``build_truth_rows`` is called -- the
+    real multi-window merge path, not just the pure ``build_truth_rows``
+    function tests exercise elsewhere. Asserting ``total_issuance_count
+    == 1`` (not just "exactly one row", which is true by construction
+    regardless of dedupe) proves the digest dedupe actually collapsed the
+    two identical transmissions rather than merely picking one arbitrarily.
+    """
+    module = _load_module()
+    anchor_bytes = _ANCHOR_PRODUCT_PATH.read_bytes()
+
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "out"
+
+    window_a = module.ArchiveWindow(
+        city="NYC",
+        cli_location="NYC",
+        start=dt.date(2026, 4, 20),
+        end=dt.date(2026, 4, 23),
+        limit=500,
+    )
+    window_b = module.ArchiveWindow(
+        city="NYC",
+        cli_location="NYC",
+        start=dt.date(2026, 4, 22),
+        end=dt.date(2026, 4, 25),
+        limit=500,
+    )
+    assert window_a.url != window_b.url  # distinct cache entries, overlapping dates
+
+    digests: dict[str, str] = {}
+    for window in (window_a, window_b):
+        zip_path = module.cache_path_for_url(cache_dir, window.url, suffix=".zip")
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CLINYC_202604240617.txt", anchor_bytes)
+        digests[zip_path.name] = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+
+    lines = [f"{digest}  {name}\n" for name, digest in sorted(digests.items())]
+    cache_dir.with_suffix(".sha256").write_text("".join(lines), encoding="utf-8")
+
+    monkeypatch.setattr(module, "archive_windows", lambda cities=None: (window_a, window_b))
+
+    exit_code = module.main(
+        ["--cache-dir", str(cache_dir), "--output-dir", str(output_dir), "--city", "NYC"]
+    )
+    assert exit_code == 0
+
+    import pyarrow.parquet as pq
+
+    records = pq.read_table(output_dir / "settlement_truth.parquet").to_pylist()
+    day_records = [r for r in records if r["climate_day"] == dt.date(2026, 4, 23)]
+
+    assert len(day_records) == 1
+    assert day_records[0]["total_issuance_count"] == 1
+    assert day_records[0]["tmax_f"] == 73
+    assert day_records[0]["status"] == module.STATUS_FINAL
