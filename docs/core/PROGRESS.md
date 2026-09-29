@@ -49,7 +49,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | ID | Merge | Proof owed (exact) |
 |---|---|---|
 | ING-2-AMEND2 | 9730f1e | 09-29 ~09:45Z post-rotation ingest: `extend_dedupe:` shows `custom_depth_truncation:<n>/0` + `flat_root=none`, deferred_instances=0, ≤600 s, cgroup `memory.peak` ≤2G (measured directly, never from RSS) → remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. `flat_root=custom_depth_truncation` WARN = native flat write happened → open structural fix |
-| BL-10 | fdf28aa | Next node spawn (16:50Z): boot clean; first create-path order (A1 halt SET ⇒ none) shows no permit refusal. Also fixes a real budget leak (raising `build_order_body` spent permit budget) |
+| BL-10 | fdf28aa | Boot clean PROVEN 09-28 16:50Z (0 FATAL, permit issued ttl 10 h). Owed: first create-path order shows no permit refusal (none possible while A1 halt SET). Also fixes a real budget leak (raising `build_order_body` spent permit budget) |
 | FAILURE-KIND-DURABLE | bdba573 | Next node spawn; a restart with an OPEN AMBIGUOUS intent names the durable kind (not `none`) in the stale CRITICAL |
 | RA-9f-A | 16f403d | DONE live 18:25Z: ledger line 4 `H-OFFWINDOW-T4-2026-09 UNDERPOWERED_NOT_REGISTERED` freeze 16f403d; duplicate refused, bytes unchanged. Backup in session scratchpad |
 | RECON-MIA-0913 | 97c4325 | 09-29 15:20Z exit study: per-trial reconciliation `matched=True` with `n_fee_unverified_excluded=1` |
@@ -57,12 +57,14 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
 | CF-11 | merged, gate green | `src/` formatted (104 files); `exec/client.py` left unformatted (formatting surfaces 6 noqa-sensitive findings) |
-| CF-5b / CF-6 / T-6 / CF-12 | 645baf5 | CF-12 new baseline: mypy 1891 errors / 247 files (914 checked) — plan the burn-down |
+| CF-12 W0+W1 | 1792e8c | Gate green 09-29 01:55Z, pushed. In-gate ratchet `tests/unit/test_mypy_ratchet.py`; runtime+strategy now CLEAN (16 errors, triage all-unreachable); CI mypy advisory. Plan `docs/plans/CF-12_MYPY_BURNDOWN_Rev2_2026-09-29.md` |
 
 ### BUILD
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| WT-VENV | LOW | 9 tests hardcode `REPO_ROOT/.venv/bin/...` (native-import gate ×3, strategy-module gate, probe containment, archive import contract, asos wrapper, archive-table ×2) → fail in every worktree; make them honour `BREEZY_PYTHON` | CF-11 return 09-28 |
+| CF-12-STAGE | LOW | `backlog/stage-cf12-w2-2026-09-29` @4b0b4f6 (Wave 2: 185 unused ignores removed, Codex, AST-verified; ratchet rejects mypy exit 2) — gate armed `breezy-gate-stage-cf12` 08:50Z (waits for AUD-07) → log `~/.cache/breezy-gate/stage-cf12.log`; EXIT=0 ⇒ ff-merge + push | CF-12 |
+| CF-12-W3 | LOW | 314 `import-not-found` (bare sibling-script imports): config-only `mypy_path` fix NOT viable (exit 2, duplicate module `x` vs `scripts.analysis.x`) → design pass (normalize qualified imports or invocation) | CF-12 trial 09-29 |
+| DEFER-STREAK-LOAD | LOW | `ingest_deferral_streak.load_state` (:190-195) accepts non-str `first_deferred_utc` from disk unchecked | CF-12 triage 09-29 |
 
 ### RUN / ANALYSE
 | ID | Open work (exact) |

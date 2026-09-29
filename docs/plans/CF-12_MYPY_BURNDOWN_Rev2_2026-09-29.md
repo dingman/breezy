@@ -110,6 +110,16 @@ A tagged-union refactor of `PermitAlertDecision` is out of scope (YAGNI).
 
 Separate follow-up, not CF-12: `ingest_deferral_streak.load_state` (`:190-195`) accepts a non-string `first_deferred_utc` from disk without a type check.
 
+## Execution log (2026-09-29)
+
+- W0 and W1 merged; full gate EXIT=0; pushed as 1792e8c.
+- W2 (Codex) and the ratchet exit-code fix are staged on `backlog/stage-cf12-w2-2026-09-29`.
+  - Codex review found the exit-code gap (HIGH): mypy exit 2 was accepted as a report.
+  - After W2 the ceilings are analysis 3, scripts/analysis 356, contract 7, unit 1303, for 1709 total.
+- W3 trial: adding the script dirs to `mypy_path` makes mypy exit 2.
+  - Cause: `Source file found twice under different module names` (`discovery_set_equality` vs `scripts.analysis.discovery_set_equality`; `fee_drift_evidence_pull` vs `scripts.venue.…`).
+  - So W3 is a design decision, not a config change. The choice is between normalizing qualified imports and changing how scripts are invoked, and it needs its own plan and peer review.
+
 ## Carve-outs and don'ts
 
 - **`strategy/current_rung_hold/archive_table.py` is FROZEN**: regeneration tests pin its bytes (5046132). It has 0 errors now, so it stays in CLEAN. If mypy ever reports errors there, allow a single-module override pinned by a test. Never edit the file's bytes.
