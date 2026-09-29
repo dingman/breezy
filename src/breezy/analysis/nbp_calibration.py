@@ -68,11 +68,11 @@ import math
 import random
 import statistics
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from itertools import pairwise
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import Any, Final, TypeVar
 
 from scipy.optimize import minimize, minimize_scalar
 
@@ -113,6 +113,8 @@ __all__ = [
     "CalibrationFit",
     "CorrectionForm",
     "DeltaFitDiagnostics",
+    "FIT_STATUS_NOT_CONVERGED",
+    "FIT_STATUS_OK",
     "G20GroupResult",
     "G20Result",
     "G20aResult",
@@ -139,6 +141,8 @@ __all__ = [
     "VersionEstimate",
     "VersionRow",
     "apply_correction_form",
+    "artefact_from_calibration_fit",
+    "artefact_from_json_dict",
     "artefact_json",
     "artefact_sha256",
     "bootstrap_emos_draws",
@@ -840,50 +844,19 @@ class VersionEmosDraws:
     draws: tuple[EmosParams, ...]
 
 
-def _bootstrap_version_emos_draws(
-    rows: Sequence[VersionRow],
-    *,
-    method: CdfMethod,
-    delta: float,
-    seed: int,
-    draws: int,
-    resample_delta: bool = True,
-    delta_bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
-    delta_xatol: float = DEFAULT_DELTA_XATOL,
-) -> tuple[EmosParams, ...]:
-    """``draws`` seeded station-day cluster-bootstrap refits of ``(a_v,
-    gamma_v)`` for ONE version.
-
-    **Delta resampling (SL-8b review item 3, supersedes the prior
-    fixed-delta convention).** When ``resample_delta`` is ``True`` (the
-    default), EACH draw's own delta is refit on that SAME resample via
-    :func:`fit_shared_delta` restricted to this one version's drawn rows --
-    so the returned :class:`EmosParams` carries a genuinely per-draw
-    ``delta``, and the interval :func:`~breezy.strategy.ladder_ev
-    .quantile_density.rung_probability_interval` derives from these draws
-    reflects delta's own sampling uncertainty, not just ``(a_v,
-    gamma_v)``'s. ``resample_delta=False`` reproduces the ORIGINAL SL-8
-    behaviour -- every draw pinned to the single caller-supplied ``delta``
-    -- kept for the direct fixed-vs-resampled interval-width comparison
-    (``tests/unit/test_nbp_calibration.py``).
+def _pooled_bootstrap_draw_rows(
+    blocks_by_version: Mapping[str, Sequence[Sequence[VersionRow]]], rng: random.Random
+) -> dict[str, list[VersionRow]]:
+    """One draw's resampled rows per version: EVERY version's OWN
+    station-day clusters are resampled with replacement to its own cluster
+    count, all drawn from ONE shared ``rng`` in sorted-version order -- so
+    the whole draw is a single deterministic pooled event (SL-8b review
+    item 3), never ``len(versions)`` independently-seeded draws.
     """
-    blocks = _clusters(rows, lambda row: (row.station, row.climate_day))
-    if not blocks:
-        raise ValueError("cannot bootstrap zero rows")
-    rng = random.Random(seed)
-    out: list[EmosParams] = []
-    for _ in range(draws):
-        drawn: list[VersionRow] = []
-        for _ in range(len(blocks)):
-            drawn.extend(blocks[rng.randrange(len(blocks))])
-        draw_delta = delta
-        if resample_delta:
-            draw_delta = fit_shared_delta(
-                {drawn[0].version: drawn}, method=method, bracket=delta_bracket, xatol=delta_xatol
-            )
-        estimate = fit_version_unshrunk(drawn, method=method, delta=draw_delta)
-        out.append(EmosParams(a=estimate.a, gamma=estimate.gamma, delta=draw_delta))
-    return tuple(out)
+    return {
+        version: [row for _ in range(len(blocks)) for row in blocks[rng.randrange(len(blocks))]]
+        for version, blocks in sorted(blocks_by_version.items())
+    }
 
 
 def bootstrap_emos_draws(
@@ -902,33 +875,73 @@ def bootstrap_emos_draws(
     gamma_v, delta)`` per version (review item 3), replacing the previous
     degenerate ``(p, p)`` artefact bound.
 
+    **Delta is a POOLED shared parameter, refit per draw (SL-8b review item
+    3, supersedes BOTH the pre-SL-8b fixed-delta convention AND the
+    SL-8b-original per-version-alone delta refit).** Per draw: station-day
+    clusters are resampled for EVERY version with its own rows from ONE
+    shared, seeded ``rng`` (:func:`_pooled_bootstrap_draw_rows`); when
+    ``resample_delta`` is ``True`` (the default), the shared delta is then
+    refit ONCE on the POOLED resample spanning ALL those versions, via
+    :func:`fit_shared_delta` called with every version's own resampled rows
+    in one dict -- mirroring how the PRIMARY delta is fit (plan S2.2:
+    "fitted by minimum CRPS on train", summed across versions), never a
+    ``{version: drawn}`` single-entry dict. Each version's own ``(a_v,
+    gamma_v)`` is THEN fit on its own resampled rows, CONDITIONAL on that
+    shared per-draw delta. Every version therefore carries the SAME delta
+    within one draw index, differing only ACROSS draws.
+    ``resample_delta=False`` reproduces the pre-SL-8b fixed-delta
+    convention -- every draw pinned to the single caller-supplied ``delta``
+    -- kept for the direct fixed-vs-resampled interval-width comparison
+    (``tests/unit/test_nbp_calibration.py``).
+
     A version with no rows of its own in ``rows_by_version`` (e.g. it has
     only train rows, already unshrunk and used purely as pooled-mean input)
     gets ``draws`` copies of its own point estimate -- there is no
     resampling population for it, so its interval collapses to the point,
-    which is honest rather than fabricated spread. The POINT estimate
-    always carries the caller-supplied shared ``delta`` regardless of
-    ``resample_delta`` -- only the draws' own delta is resampled (SL-8b
-    review item 3).
+    which is honest rather than fabricated spread, and it never enters the
+    pooled delta refit. The POINT estimate always carries the
+    caller-supplied shared ``delta`` regardless of ``resample_delta`` --
+    only the draws' own delta is resampled.
     """
+    points = {
+        version: EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta)
+        for version, estimate in shrunk_by_version.items()
+    }
     result: dict[str, VersionEmosDraws] = {}
-    for index, (version, estimate) in enumerate(sorted(shrunk_by_version.items())):
-        point = EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta)
-        rows = rows_by_version.get(version)
-        if not rows:
+    versions_with_rows = {version: rows for version, rows in rows_by_version.items() if rows}
+    for version, point in points.items():
+        if version not in versions_with_rows:
             result[version] = VersionEmosDraws(version=version, point=point, draws=(point,) * draws)
-            continue
-        version_draws = _bootstrap_version_emos_draws(
-            rows,
-            method=method,
-            delta=delta,
-            seed=seed + index,
-            draws=draws,
-            resample_delta=resample_delta,
-            delta_bracket=delta_bracket,
-            delta_xatol=delta_xatol,
+
+    if not versions_with_rows:
+        return result
+
+    blocks_by_version = {
+        version: _clusters(rows, lambda row: (row.station, row.climate_day))
+        for version, rows in versions_with_rows.items()
+    }
+    for version, blocks in blocks_by_version.items():
+        if not blocks:
+            raise ValueError(f"cannot bootstrap zero rows for version {version!r}")
+
+    rng = random.Random(seed)
+    draws_by_version: dict[str, list[EmosParams]] = {version: [] for version in versions_with_rows}
+    for _ in range(draws):
+        drawn_by_version = _pooled_bootstrap_draw_rows(blocks_by_version, rng)
+        if resample_delta:
+            draw_delta = fit_shared_delta(
+                drawn_by_version, method=method, bracket=delta_bracket, xatol=delta_xatol
+            )
+        else:
+            draw_delta = delta
+        for version, drawn_rows in drawn_by_version.items():
+            estimate = fit_version_unshrunk(drawn_rows, method=method, delta=draw_delta)
+            draws_by_version[version].append(EmosParams(a=estimate.a, gamma=estimate.gamma, delta=draw_delta))
+
+    for version in versions_with_rows:
+        result[version] = VersionEmosDraws(
+            version=version, point=points[version], draws=tuple(draws_by_version[version])
         )
-        result[version] = VersionEmosDraws(version=version, point=point, draws=version_draws)
     return result
 
 
@@ -1714,6 +1727,14 @@ def reevaluate_c1(
 
 ARTEFACT_SCHEMA_VERSION: Final[int] = 1
 
+#: `NbpCalibrationArtefact.fit_status` (SL-8b review item 2) -- a
+#: gate-blocking flag, not merely a log line. `FIT_STATUS_NOT_CONVERGED`
+#: means the shared delta fit, or at least one version's own `(a_v,
+#: gamma_v)` fit, did not converge; a consumer must refuse to trust rung
+#: probabilities derived from such an artefact.
+FIT_STATUS_OK: Final[str] = "OK"
+FIT_STATUS_NOT_CONVERGED: Final[str] = "FIT_NOT_CONVERGED"
+
 
 def rung_bounds_from_calibration(
     percentiles: Percentiles,
@@ -1781,6 +1802,30 @@ class NbpCalibrationArtefact:
     sigma_d: float
     #: Per-rung ``(p_point, p_lower, p_upper)`` (review item 3).
     rung_probability_bounds: Mapping[str, tuple[float, float, float]]
+    #: ``scipy.optimize.OptimizeResult.success`` from the bounded scalar
+    #: minimiser that fit the SHARED ``delta`` (SL-8b review item 2) --
+    #: ``DeltaFitDiagnostics.converged`` / ``CalibrationFit.delta_converged``
+    #: carried straight into the artefact, so a consumer never has to
+    #: re-fit to learn whether the pinned delta actually converged.
+    #: Defaults to ``True`` so an artefact hand-built before this field
+    #: existed (every fixture predating this schema change) parses as
+    #: "assume converged" -- never silently downgraded to failing.
+    delta_converged: bool = True
+    delta_nfev: int = 0
+    #: Per-version ``VersionEstimate.converged``/``.nfev`` from the
+    #: minimum-CRPS descent that produced each version's ``(a_v,
+    #: gamma_v)`` (SL-8b review item 2). Same backward-compatible default
+    #: convention as ``delta_converged``: a version absent from this
+    #: mapping is treated as converged.
+    converged_by_version: Mapping[str, bool] = field(default_factory=dict)
+    nfev_by_version: Mapping[str, int] = field(default_factory=dict)
+    #: :data:`FIT_STATUS_NOT_CONVERGED` if ``delta_converged`` is ``False``
+    #: or ANY entry in ``converged_by_version`` is ``False`` -- a
+    #: gate-blocking flag (SL-8b review item 2), not only a WARNING log
+    #: line. :func:`artefact_from_calibration_fit` computes this
+    #: automatically from a real fit; a hand-built artefact may set it
+    #: directly to exercise the blocking path.
+    fit_status: str = FIT_STATUS_OK
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -1804,7 +1849,140 @@ class NbpCalibrationArtefact:
                 rung_id: [point, lower, upper]
                 for rung_id, (point, lower, upper) in sorted(self.rung_probability_bounds.items())
             },
+            "delta_converged": self.delta_converged,
+            "delta_nfev": self.delta_nfev,
+            "converged_by_version": dict(sorted(self.converged_by_version.items())),
+            "nfev_by_version": dict(sorted(self.nfev_by_version.items())),
+            "fit_status": self.fit_status,
         }
+
+
+def _parse_draw_entries(
+    entries: Sequence[Sequence[float]], *, fallback_delta: float
+) -> tuple[tuple[float, float, float], ...]:
+    parsed: list[tuple[float, float, float]] = []
+    for entry in entries:
+        params = emos_params_from_draw_entry(entry, fallback_delta=fallback_delta)
+        parsed.append((params.a, params.gamma, params.delta))
+    return tuple(parsed)
+
+
+def artefact_from_json_dict(payload: Mapping[str, Any]) -> NbpCalibrationArtefact:
+    """Parses :meth:`NbpCalibrationArtefact.to_json_dict`'s own output back
+    into a :class:`NbpCalibrationArtefact` (SL-8b review item 2).
+
+    ``payload`` is untyped JSON (``Any`` values) by construction -- every
+    field is explicitly coerced below, so a malformed payload fails loudly
+    at the coercion, not silently downstream.
+
+    BACKWARD COMPATIBLE with an artefact written before the convergence
+    diagnostics existed: ``delta_converged``/``delta_nfev``/
+    ``converged_by_version``/``nfev_by_version``/``fit_status`` are all
+    OPTIONAL keys in ``payload`` -- absent, each falls back to the
+    dataclass's own default ("assume converged"), exactly like
+    :func:`emos_params_from_draw_entry`'s own 2-vs-3-element tolerance for
+    ``emos_draws_by_version`` entries.
+    """
+    delta = float(payload["delta"])
+    kappa = payload["kappa"]
+    kwargs: dict[str, Any] = {
+        "schema_version": int(payload["schema_version"]),
+        "cdf_method": str(payload["cdf_method"]),
+        "recalibration": str(payload["recalibration"]),
+        "correction_form": str(payload["correction_form"]),
+        "delta": delta,
+        "kappa": math.inf if kappa == "inf" else float(kappa),
+        "emos_params_by_version": {
+            version: (float(a), float(gamma))
+            for version, (a, gamma) in payload["emos_params_by_version"].items()
+        },
+        "emos_draws_by_version": {
+            version: _parse_draw_entries(entries, fallback_delta=delta)
+            for version, entries in payload["emos_draws_by_version"].items()
+        },
+        "n_min": int(payload["n_min"]),
+        "sigma_d": float(payload["sigma_d"]),
+        "rung_probability_bounds": {
+            rung_id: (float(point), float(lower), float(upper))
+            for rung_id, (point, lower, upper) in payload["rung_probability_bounds"].items()
+        },
+    }
+    if "delta_converged" in payload:
+        kwargs["delta_converged"] = bool(payload["delta_converged"])
+    if "delta_nfev" in payload:
+        kwargs["delta_nfev"] = int(payload["delta_nfev"])
+    if "converged_by_version" in payload:
+        kwargs["converged_by_version"] = {
+            version: bool(converged) for version, converged in payload["converged_by_version"].items()
+        }
+    if "nfev_by_version" in payload:
+        kwargs["nfev_by_version"] = {
+            version: int(nfev) for version, nfev in payload["nfev_by_version"].items()
+        }
+    if "fit_status" in payload:
+        kwargs["fit_status"] = str(payload["fit_status"])
+    return NbpCalibrationArtefact(**kwargs)
+
+
+def artefact_from_calibration_fit(
+    fit: CalibrationFit,
+    *,
+    cdf_method: CdfMethod,
+    recalibration: str,
+    correction_form: CorrectionForm,
+    n_min: int,
+    sigma_d: float,
+    rung_probability_bounds: Mapping[str, tuple[float, float, float]],
+    schema_version: int = ARTEFACT_SCHEMA_VERSION,
+) -> NbpCalibrationArtefact:
+    """The single path from a real :func:`fit_calibration` result to a
+    writable :class:`NbpCalibrationArtefact` (SL-8b review item 2, closing
+    the gap where the artefact and ``write_artefact`` had no real producer
+    -- every existing artefact was hand-built with fixed values). Every
+    convergence diagnostic -- ``fit.delta_converged``/``.delta_nfev``, and
+    each version's own ``VersionEstimate.converged``/``.nfev`` from
+    ``fit.hierarchical.shrunk_by_version`` -- is carried straight from the
+    REAL fit into the artefact, never re-derived or hand-picked.
+
+    A non-converged delta fit, or ANY non-converged per-version fit, sets
+    ``fit_status = FIT_NOT_CONVERGED`` -- a gate-blocking flag a caller
+    must check before trusting or shipping the artefact, on top of (never
+    instead of) the WARNING each non-converged fit already logs
+    (:func:`fit_version_unshrunk`, :func:`fit_shared_delta_with_diagnostics`).
+    """
+    hierarchical = fit.hierarchical
+    shrunk = hierarchical.shrunk_by_version
+    converged_by_version = {version: estimate.converged for version, estimate in shrunk.items()}
+    nfev_by_version = {version: estimate.nfev for version, estimate in shrunk.items()}
+    any_version_not_converged = any(not converged for converged in converged_by_version.values())
+    fit_status = (
+        FIT_STATUS_NOT_CONVERGED
+        if (not fit.delta_converged or any_version_not_converged)
+        else FIT_STATUS_OK
+    )
+    return NbpCalibrationArtefact(
+        schema_version=schema_version,
+        cdf_method=cdf_method.value,
+        recalibration=recalibration,
+        correction_form=correction_form.value,
+        delta=fit.delta,
+        kappa=hierarchical.kappa_selection.chosen_kappa,
+        emos_params_by_version={
+            version: (estimate.a, estimate.gamma) for version, estimate in shrunk.items()
+        },
+        emos_draws_by_version={
+            version: tuple((draw.a, draw.gamma, draw.delta) for draw in draws.draws)
+            for version, draws in hierarchical.draws_by_version.items()
+        },
+        n_min=n_min,
+        sigma_d=sigma_d,
+        rung_probability_bounds=rung_probability_bounds,
+        delta_converged=fit.delta_converged,
+        delta_nfev=fit.delta_nfev,
+        converged_by_version=converged_by_version,
+        nfev_by_version=nfev_by_version,
+        fit_status=fit_status,
+    )
 
 
 def artefact_json(artefact: NbpCalibrationArtefact) -> str:

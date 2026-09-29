@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import json
 import math
 from pathlib import Path
 
@@ -546,6 +547,56 @@ def test_bootstrap_emos_draws_repeats_the_point_for_a_version_with_no_own_rows()
     assert draws["v3.2"].draws == (draws["v3.2"].point,) * 3
 
 
+def test_bootstrap_emos_draws_pools_delta_across_versions_jointly() -> None:
+    """SL-8b review item 3: each bootstrap draw's shared delta comes from a
+    POOLED cluster resample spanning every version's rows, refit ONCE and
+    shared by every version in that draw -- never a per-version-alone
+    refit (the SL-8b-original bug this closes).
+
+    Version A's own rows (residual spread nearly flat across sd, 1.0 vs
+    5.0) alone identify a LOW delta; version B's own rows (residual spread
+    growing sharply with sd) alone identify a visibly HIGHER delta --
+    hand-verified below via `fit_shared_delta` on each version alone. If
+    the bootstrap still refit delta per-version-alone, draw A's delta would
+    track A's own ~0.25 and draw B's would track B's own ~2.0, and the two
+    would differ. Pooled, both versions in the SAME draw must carry the
+    IDENTICAL shared delta.
+    """
+    rows_a = [
+        _version_row("A", "validate", dt.date(2025, 1, 1), "KMIA", 90.0, 1.0, 90.2),
+        _version_row("A", "validate", dt.date(2025, 1, 2), "KMIA", 90.0, 1.0, 89.8),
+        _version_row("A", "validate", dt.date(2025, 1, 3), "KMIA", 90.0, 5.0, 90.3),
+        _version_row("A", "validate", dt.date(2025, 1, 4), "KMIA", 90.0, 5.0, 89.7),
+    ]
+    rows_b = [
+        _version_row("B", "validate", dt.date(2025, 1, 1), "KMIA", 90.0, 1.0, 90.1),
+        _version_row("B", "validate", dt.date(2025, 1, 2), "KMIA", 90.0, 1.0, 89.9),
+        _version_row("B", "validate", dt.date(2025, 1, 3), "KMIA", 90.0, 5.0, 92.5),
+        _version_row("B", "validate", dt.date(2025, 1, 4), "KMIA", 90.0, 5.0, 87.5),
+    ]
+    rows_by_version = {"A": rows_a, "B": rows_b}
+
+    delta_a_alone = calib.fit_shared_delta({"A": rows_a}, method=CdfMethod.NORMAL)
+    delta_b_alone = calib.fit_shared_delta({"B": rows_b}, method=CdfMethod.NORMAL)
+    assert abs(delta_a_alone - delta_b_alone) > 1.0  # visibly different single-version fits
+
+    shrunk_by_version = {
+        version: calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=1.0)
+        for version, rows in rows_by_version.items()
+    }
+    draws = calib.bootstrap_emos_draws(
+        rows_by_version, shrunk_by_version, method=CdfMethod.NORMAL, delta=1.0, draws=3, seed=7
+    )
+    for i in range(3):
+        delta_a_draw = draws["A"].draws[i].delta
+        delta_b_draw = draws["B"].draws[i].delta
+        # Pooled: both versions share the IDENTICAL per-draw delta.
+        assert delta_a_draw == pytest.approx(delta_b_draw)
+        # And it is pulled away from A's own flat-alone value by B's
+        # pooled-in data -- never simply A's own single-version fit.
+        assert delta_a_draw != pytest.approx(delta_a_alone, abs=0.3)
+
+
 # ---------------------------------------------------------------------------
 # G2.0 correction form (closed set)
 # ---------------------------------------------------------------------------
@@ -925,6 +976,127 @@ def test_fit_calibration_refuses_when_no_eligible_rows_present() -> None:
     ]
     with pytest.raises(ValueError, match="fit_calibration needs"):
         calib.fit_calibration(holdout_only, method=CdfMethod.NORMAL)
+
+
+# ---------------------------------------------------------------------------
+# SL-8b review item 2: convergence flags carried into the artefact + parsed
+# back, and a gate-blocking fit_status -- fit_calibration is the path a
+# writable artefact actually comes from.
+# ---------------------------------------------------------------------------
+
+
+def test_artefact_from_calibration_fit_carries_real_convergence_diagnostics() -> None:
+    rows = _calibration_fixture_rows()
+    fit = calib.fit_calibration(rows, method=CdfMethod.NORMAL, bootstrap_draws=2)
+
+    artefact = calib.artefact_from_calibration_fit(
+        fit,
+        cdf_method=CdfMethod.NORMAL,
+        recalibration="emos",
+        correction_form=calib.CorrectionForm.NONE,
+        n_min=412,
+        sigma_d=0.11,
+        rung_probability_bounds={},
+    )
+
+    assert artefact.delta_converged == fit.delta_converged
+    assert artefact.delta_nfev == fit.delta_nfev
+    assert artefact.converged_by_version == {
+        version: estimate.converged for version, estimate in fit.hierarchical.shrunk_by_version.items()
+    }
+    assert artefact.nfev_by_version == {
+        version: estimate.nfev for version, estimate in fit.hierarchical.shrunk_by_version.items()
+    }
+    # This fixture's tiny, well-behaved fit converges cleanly.
+    assert fit.delta_converged is True
+    assert all(estimate.converged for estimate in fit.hierarchical.shrunk_by_version.values())
+    assert artefact.fit_status == calib.FIT_STATUS_OK
+
+
+def test_artefact_from_calibration_fit_blocks_on_a_forced_non_convergent_delta_fit() -> None:
+    # delta_max_iterations=1 forces the bounded scalar minimiser to stop
+    # before converging (fit_shared_delta_with_diagnostics's own documented
+    # deterministic-non-convergence knob) -- never a flaky/random failure.
+    rows = _calibration_fixture_rows()
+    fit = calib.fit_calibration(rows, method=CdfMethod.NORMAL, bootstrap_draws=2, delta_max_iterations=1)
+    assert fit.delta_converged is False
+
+    artefact = calib.artefact_from_calibration_fit(
+        fit,
+        cdf_method=CdfMethod.NORMAL,
+        recalibration="emos",
+        correction_form=calib.CorrectionForm.NONE,
+        n_min=412,
+        sigma_d=0.11,
+        rung_probability_bounds={},
+    )
+
+    assert artefact.delta_converged is False
+    # A gate-blocking flag, not only the WARNING fit_shared_delta_with_
+    # diagnostics already logs.
+    assert artefact.fit_status == calib.FIT_STATUS_NOT_CONVERGED
+
+
+def test_artefact_from_json_dict_round_trips_the_new_convergence_fields() -> None:
+    artefact = calib.NbpCalibrationArtefact(
+        schema_version=calib.ARTEFACT_SCHEMA_VERSION,
+        cdf_method="normal",
+        recalibration="none",
+        correction_form="none",
+        delta=1.0,
+        kappa=120.0,
+        emos_params_by_version={"v5.0": (0.5, 0.1)},
+        emos_draws_by_version={"v5.0": ((0.4, 0.08, 1.0), (0.6, 0.12, 1.0))},
+        n_min=412,
+        sigma_d=0.11,
+        rung_probability_bounds={},
+        delta_converged=False,
+        delta_nfev=2,
+        converged_by_version={"v5.0": False},
+        nfev_by_version={"v5.0": 59},
+        fit_status=calib.FIT_STATUS_NOT_CONVERGED,
+    )
+    payload = json.loads(calib.artefact_json(artefact))
+
+    parsed = calib.artefact_from_json_dict(payload)
+
+    assert parsed.delta_converged is False
+    assert parsed.delta_nfev == 2
+    assert parsed.converged_by_version == {"v5.0": False}
+    assert parsed.nfev_by_version == {"v5.0": 59}
+    assert parsed.fit_status == calib.FIT_STATUS_NOT_CONVERGED
+    assert parsed.emos_params_by_version == {"v5.0": (0.5, 0.1)}
+
+
+def test_artefact_from_json_dict_defaults_convergence_fields_for_a_pre_schema_payload() -> None:
+    """An artefact written BEFORE this schema change carries none of the
+    new keys -- the parser must default exactly like the dataclass itself
+    ("assume converged"), never raise KeyError."""
+    payload = {
+        "schema_version": 1,
+        "cdf_method": "normal",
+        "recalibration": "none",
+        "correction_form": "none",
+        "delta": 1.0,
+        "kappa": "inf",
+        "emos_params_by_version": {"v5.0": [0.5, 0.1]},
+        "emos_draws_by_version": {"v5.0": [[0.4, 0.08], [0.6, 0.12]]},  # pre-review-item-3 2-tuple shape
+        "n_min": 412,
+        "sigma_d": 0.11,
+        "rung_probability_bounds": {},
+    }
+
+    parsed = calib.artefact_from_json_dict(payload)
+
+    assert parsed.delta_converged is True
+    assert parsed.delta_nfev == 0
+    assert parsed.converged_by_version == {}
+    assert parsed.nfev_by_version == {}
+    assert parsed.fit_status == calib.FIT_STATUS_OK
+    assert parsed.kappa == math.inf
+    # The pre-review-item-3 2-element draw entries still parse, delta
+    # falling back to the artefact's own top-level delta.
+    assert parsed.emos_draws_by_version["v5.0"] == ((0.4, 0.08, 1.0), (0.6, 0.12, 1.0))
 
 
 # ---------------------------------------------------------------------------

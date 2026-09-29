@@ -27,8 +27,18 @@ on-disk, already-backfilled sources -- never fetches:
 
 * NBP percentile rows from `breezy.persistence.nbp_derived_store`
   (`~/.local/share/breezy/derived/nbp` by default), restricted to the
-  13Z/19Z/01Z cycles and the NEAREST (D+1) 00Z daily-max window per
-  (station, cycle).
+  13Z/19Z/01Z cycles and the EXPLICIT D+1 00Z daily-max window per
+  (station, cycle) -- see :func:`build_version_rows`'s own docstring for
+  the exact target computation. The window is picked by matching
+  `climate_day_for_txn`'s own result to that target, never by "nearest
+  available `valid_start_ns`": on the REAL NBP bulletin grid the two
+  happen to select the identical window on every cycle observed so far
+  (`tests/unit/test_nbm_quantile_parse.py` pins that the FIRST published
+  MAX column already targets D+1 at every station, for 13Z, 19Z and 01Z
+  alike -- a same-LST-day MAX is never published), but the explicit match
+  is not merely cosmetic: it REFUSES (counted, never imputed) rather than
+  silently accepts a window at any other day, should a malformed partition
+  or a future grid change ever produce one (SL-8b review item 1).
 * Final CLI settlement labels via `settlement_truth_dataset
   .final_rows_for_gate`, read from the settlement-truth parquet
   (`~/.local/share/breezy/derived/settlement-truth/settlement_truth.parquet`
@@ -72,6 +82,7 @@ from settlement_alignment_study import IEM_ASOS_IDS, load_sites  # type: ignore[
 from settlement_truth_dataset import SettlementTruthRow, final_rows_for_gate  # type: ignore[import-not-found]  # noqa: E402
 
 from breezy.analysis.nbp_calibration import DEFAULT_SPLITS, Splits, VersionRow  # noqa: E402
+from breezy.ingest.gaps import local_standard_date  # noqa: E402
 from breezy.persistence.archive_cache import (  # noqa: E402
     IEM_ASOS_1MIN_SOURCE,
     IEM_MOS_MODEL_PRODUCTS,
@@ -93,11 +104,11 @@ __all__ = [
     "NbpPercentileWindow",
     "build_arg_parser",
     "build_version_rows",
+    "complete_percentile_windows",
     "iter_nbp_derived_rows",
     "main",
     "mos_txn_coverage",
     "asos_1min_row_coverage",
-    "nearest_percentile_windows",
     "read_settlement_truth_rows",
     "run_validate",
     "station_registry",
@@ -204,9 +215,13 @@ def station_registry(*, stations: Sequence[str] = _JOIN_STATIONS) -> StationRegi
 
 @dataclass(frozen=True, slots=True)
 class NbpPercentileWindow:
-    """One (station, cycle) forecast's D+1 (nearest) daily-max percentile
+    """One (station, cycle, valid_start) forecast's daily-max percentile
     bulletin, reconstructed from the 7 `TXN_VARIABLES` derived-store rows
-    that share the SAME (station, cycle_runtime_ns, valid_start_ns)."""
+    that share the SAME (station, cycle_runtime_ns, valid_start_ns). A
+    (station, cycle) may have more than one complete window (the venue can
+    publish several 00Z daily-max valid times per cycle) -- WHICH one is
+    the D+1 target is decided explicitly by :func:`build_version_rows`,
+    never here."""
 
     station: str
     cycle_runtime_ns: int
@@ -240,15 +255,22 @@ class _WindowGroupCounts:
     unparseable_partitions: int = 0
 
 
-def nearest_percentile_windows(
+def complete_percentile_windows(
     rows: Iterable[DerivedNbpRow], *, counts: _WindowGroupCounts | None = None
 ) -> list[NbpPercentileWindow]:
-    """Reduce derived rows to one :class:`NbpPercentileWindow` per (station,
-    cycle_runtime_ns) -- the NEAREST ``valid_start_ns`` window that carries
-    ALL seven :data:`TXN_VARIABLES` with a non-null ``value_f``. A window
-    missing any variable, or with a null value, is counted (never imputed,
-    never silently promoted to the next-nearest window under a different
-    identity).
+    """Reduce derived rows to one :class:`NbpPercentileWindow` per COMPLETE
+    (station, cycle_runtime_ns, valid_start_ns) group -- EVERY complete
+    window, never a single "nearest" one. A window missing any
+    :data:`TXN_VARIABLES` entry, or with a null ``value_f``, is counted
+    (never imputed, never silently substituted for a different identity).
+
+    Deliberately does NOT reduce further to one window per (station,
+    cycle): a cycle can publish more than one complete 00Z daily-max valid
+    window, and which one is the D+1 trading target is an EXPLICIT
+    decision made downstream, by :func:`build_version_rows` -- SL-8b
+    review item 1 (the prior "nearest ``valid_start_ns``" reduction here
+    relied on an undeclared assumption about the venue's publication grid
+    rather than on an explicit check; see that function's docstring).
     """
     by_group: dict[tuple[str, int, int], dict[str, DerivedNbpRow]] = {}
     for row in rows:
@@ -257,8 +279,8 @@ def nearest_percentile_windows(
         key = (row.station, row.cycle_runtime_ns, row.valid_start_ns)
         by_group.setdefault(key, {})[row.variable] = row
 
-    best: dict[tuple[str, int], tuple[int, dict[str, DerivedNbpRow]]] = {}
     incomplete = 0
+    windows: list[NbpPercentileWindow] = []
     for (station, cycle_runtime_ns, valid_start_ns), variables in by_group.items():
         complete = set(variables) == set(TXN_VARIABLES) and all(
             entry.value_f is not None for entry in variables.values()
@@ -266,15 +288,6 @@ def nearest_percentile_windows(
         if not complete:
             incomplete += 1
             continue
-        current = best.get((station, cycle_runtime_ns))
-        if current is None or valid_start_ns < current[0]:
-            best[(station, cycle_runtime_ns)] = (valid_start_ns, variables)
-
-    if counts is not None:
-        counts.incomplete_windows += incomplete
-
-    windows: list[NbpPercentileWindow] = []
-    for (station, cycle_runtime_ns), (valid_start_ns, variables) in best.items():
         any_row = next(iter(variables.values()))
         percentiles = Percentiles(
             q10=variables["TXN_Q10"].value_f,  # type: ignore[arg-type]
@@ -294,6 +307,9 @@ def nearest_percentile_windows(
                 percentiles=percentiles,
             )
         )
+
+    if counts is not None:
+        counts.incomplete_windows += incomplete
     return windows
 
 
@@ -362,6 +378,10 @@ class JoinReport:
     non_qualifying_cycle_windows: int
     unmapped_station_windows: int
     period_kind_mismatches: int
+    #: (station, cycle_runtime_ns) groups with no COMPLETE window mapping to
+    #: the explicit D+1 target climate day (SL-8b review item 1) -- counted,
+    #: never filled in from whatever window happens to be nearest.
+    no_d1_window_cycles: int
     holdout_excluded_windows: int
     missing_settlement_rows: int
     matched_version_rows: int
@@ -382,37 +402,99 @@ def build_version_rows(
 
     Returns ``(version_rows, gap_counts)`` -- ``gap_counts`` keys are
     ``non_qualifying_cycle``, ``unmapped_station``, ``period_kind_mismatch``,
-    ``holdout_excluded``, ``missing_settlement``. Every row this function
-    KEEPS has already passed the D+1 LST climate-day mapping
-    (`climate_day_for_txn`, kind="max") and is strictly before
-    ``splits.holdout_start`` -- checked TWICE (before the settlement lookup,
-    and again against `Splits.split_for_date`'s own classification) so a
-    holdout-dated row can never reach the returned tuple by either path.
+    ``no_d1_window``, ``holdout_excluded``, ``missing_settlement``. Every
+    row this function KEEPS maps to the EXPLICIT D+1 climate day and is
+    strictly before ``splits.holdout_start`` -- checked TWICE (before the
+    settlement lookup, and again against `Splits.split_for_date`'s own
+    classification) so a holdout-dated row can never reach the returned
+    tuple by either path.
+
+    **Explicit D+1 window selection (SL-8b review item 1; corrected against
+    the real NBP grid, coordinator note 2026-09-29).** A (station,
+    cycle_runtime_ns) group may carry more than one complete window (the
+    venue can publish several 00Z daily-max valid times per cycle). The ONE
+    this join uses is the window whose own climate day (via
+    `climate_day_for_txn`, kind="max") equals the cycle's explicit D+1
+    target, ``local_standard_date(cycle_runtime_ns, std_utc_offset_hours) +
+    1 day`` (`breezy.ingest.gaps.local_standard_date` -- the SAME helper
+    the strategy's own D+1 gate uses), rather than whichever window happens
+    to be temporally nearest. A group with no window at that exact target
+    is counted (``no_d1_window``), never substituted.
+
+    **On the real NBP bulletin grid this selects the SAME window "nearest
+    available" already did.** The venue never publishes a same-LST-day MAX
+    column: for a 13Z cycle the first MAX (00Z) column is FHR 35 (the
+    grid's first group, FHR 23, carries only the 12Z/MIN sub-value); for
+    19Z it is FHR 29; for 01Z the first group already carries both 00Z and
+    12Z. All three land on the D+1 target directly --
+    `tests/unit/test_nbm_quantile_parse.py` hand-verifies this against the
+    real captured bulletins (`test_hand_computed_dplus1_lst_day_per_
+    station_per_cycle`), and `tests/unit/test_nbp_skill_study.py`
+    independently re-confirms it against the real on-disk backfill (zero
+    mismatches across every real (station, cycle) group checked). The
+    explicit check is a robustness improvement, not a fix to an observed
+    real-data defect: it refuses (rather than silently accepting) a window
+    at the wrong day should a malformed partition or a future grid change
+    ever produce one.
+
+    Worked example (KLAX/KMDW/KMIA/KSFO, std_utc_offset_hours -8/-6/-5/-8
+    respectively; all four offsets keep 13Z/19Z/01Z within a single
+    day-shift regime, so the target is IDENTICAL across every station for a
+    given cycle):
+
+    * 13Z or 19Z cycle published on UTC day D: LST publish date is ALSO D
+      (13 or 19 minus each offset, at most 8h, stays >= 0 on day D) -- so
+      the D+1 target climate day is D+1, reached by the 00Z window whose
+      OWN UTC calendar day is D+2 (``local_standard_date`` of a 00Z instant
+      is always the PRECEDING UTC day for these negative offsets). This IS
+      the real grid's first available MAX column (FHR 35/29 respectively).
+    * 01Z cycle published on UTC day X (01:00 UTC): LST publish date is X-1
+      (01 minus each offset falls on the PRECEDING UTC day) -- so the D+1
+      target climate day is X, reached by the 00Z window whose own UTC
+      calendar day is X+1 -- also the real grid's first available MAX
+      column (FHR 23) here.
     """
+    windows_by_cycle: dict[tuple[str, int], list[NbpPercentileWindow]] = {}
+    for window in windows:
+        windows_by_cycle.setdefault((window.station, window.cycle_runtime_ns), []).append(window)
+
     gaps: Counter[str] = Counter()
     version_rows: list[VersionRow] = []
-    for window in windows:
-        if _cycle_hour(window.cycle_runtime_ns) not in QUALIFYING_CYCLE_HOURS:
+    for (station, cycle_runtime_ns), group_windows in windows_by_cycle.items():
+        if _cycle_hour(cycle_runtime_ns) not in QUALIFYING_CYCLE_HOURS:
             gaps["non_qualifying_cycle"] += 1
             continue
-        offset = registry.std_utc_offset_hours_by_icao.get(window.station)
-        settlement_station = registry.settlement_station_by_icao.get(window.station)
+        offset = registry.std_utc_offset_hours_by_icao.get(station)
+        settlement_station = registry.settlement_station_by_icao.get(station)
         if offset is None or settlement_station is None:
             gaps["unmapped_station"] += 1
             continue
-        try:
-            climate_day = climate_day_for_txn(
-                icao=window.station,
-                runtime_ns=window.cycle_runtime_ns,
-                ftime_ns=window.valid_start_ns,
-                std_utc_offset_hours=offset,
-                model=window.nbm_version_era,
-                kind="max",
-            )
-        except ForecastValidPeriodError:
-            gaps["period_kind_mismatch"] += 1
+
+        target_climate_day = local_standard_date(cycle_runtime_ns, offset) + dt.timedelta(days=1)
+
+        chosen: NbpPercentileWindow | None = None
+        for window in group_windows:
+            try:
+                window_climate_day = climate_day_for_txn(
+                    icao=station,
+                    runtime_ns=cycle_runtime_ns,
+                    ftime_ns=window.valid_start_ns,
+                    std_utc_offset_hours=offset,
+                    model=window.nbm_version_era,
+                    kind="max",
+                )
+            except ForecastValidPeriodError:
+                gaps["period_kind_mismatch"] += 1
+                continue
+            if window_climate_day == target_climate_day:
+                chosen = window
+                break
+
+        if chosen is None:
+            gaps["no_d1_window"] += 1
             continue
 
+        climate_day = target_climate_day
         if climate_day >= splits.holdout_start:
             gaps["holdout_excluded"] += 1
             continue
@@ -429,11 +511,11 @@ def build_version_rows(
 
         version_rows.append(
             VersionRow(
-                version=window.nbm_version_era,
+                version=chosen.nbm_version_era,
                 split=split,
                 station=settlement_station,
                 climate_day=climate_day,
-                percentiles=window.percentiles,
+                percentiles=chosen.percentiles,
                 cli_tmax_f=float(settlement_row.tmax_f),
             )
         )
@@ -531,7 +613,7 @@ def run_validate(
         if rows is None:
             counts.unparseable_partitions += 1
             continue
-        all_windows.extend(nearest_percentile_windows(rows, counts=counts))
+        all_windows.extend(complete_percentile_windows(rows, counts=counts))
 
     version_rows, gaps = build_version_rows(all_windows, settlement_by_station_day, registry=registry, splits=splits)
 
@@ -545,6 +627,7 @@ def run_validate(
         non_qualifying_cycle_windows=gaps.get("non_qualifying_cycle", 0),
         unmapped_station_windows=gaps.get("unmapped_station", 0),
         period_kind_mismatches=gaps.get("period_kind_mismatch", 0),
+        no_d1_window_cycles=gaps.get("no_d1_window", 0),
         holdout_excluded_windows=gaps.get("holdout_excluded", 0),
         missing_settlement_rows=gaps.get("missing_settlement", 0),
         matched_version_rows=len(version_rows),
@@ -564,6 +647,7 @@ def _report_to_json_dict(report: JoinReport) -> dict[str, object]:
         "non_qualifying_cycle_windows": report.non_qualifying_cycle_windows,
         "unmapped_station_windows": report.unmapped_station_windows,
         "period_kind_mismatches": report.period_kind_mismatches,
+        "no_d1_window_cycles": report.no_d1_window_cycles,
         "holdout_excluded_windows": report.holdout_excluded_windows,
         "missing_settlement_rows": report.missing_settlement_rows,
         "matched_version_rows": report.matched_version_rows,

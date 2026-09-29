@@ -12,6 +12,7 @@ import datetime as dt
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
@@ -59,6 +60,17 @@ def _cycle_runtime_ns(day: dt.date, hour: int) -> int:
 def _valid_00z_ns(day: dt.date) -> int:
     instant = dt.datetime(day.year, day.month, day.day, 0, tzinfo=dt.UTC)
     return int(instant.timestamp()) * _NS
+
+
+#: A 13Z (or 19Z) cycle published on UTC day D maps to D+1 via the window
+#: whose OWN valid UTC calendar day is D+2 -- never D+1 (that is the
+#: temporally-nearest window, and it resolves to D0; see
+#: `build_version_rows`'s docstring worked example). Both KMIA (-5) and
+#: KLAX (-8) share this target -- hand-verified against the real
+#: `climate_day_for_txn`/`local_standard_date` helpers, and pinned again in
+#: `test_d1_worked_example_*` below.
+def _d1_valid_ns_for_13z_or_19z(cycle_day: dt.date) -> int:
+    return _valid_00z_ns(cycle_day + dt.timedelta(days=2))
 
 
 def _derived_row(
@@ -166,11 +178,11 @@ def _write_settlement_truth(rows: list[SettlementTruthRow], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# nearest_percentile_windows
+# complete_percentile_windows
 # ---------------------------------------------------------------------------
 
 
-def test_nearest_percentile_windows_keeps_only_complete_groups() -> None:
+def test_complete_percentile_windows_drops_incomplete_groups_and_counts_them() -> None:
     day = dt.date(2025, 6, 1)
     cycle = _cycle_runtime_ns(day, 13)
     near = _valid_00z_ns(day + dt.timedelta(days=1))
@@ -180,14 +192,12 @@ def test_nearest_percentile_windows_keeps_only_complete_groups() -> None:
         *_complete_window_rows(station="KMIA", cycle_runtime_ns=cycle, valid_ns=far, q50=91.0),
     ]
     # Drop one variable from the NEAR window only -- it is reported
-    # (incomplete_windows), never imputed. The FAR window is a genuinely
-    # complete, real forecast (not fabricated), so it is the nearest
-    # COMPLETE window used -- falling back to it is real-data reuse, not
-    # imputation of the dropped near-window value.
+    # (incomplete_windows), never imputed and never silently replaced by a
+    # different window under the same identity.
     rows = [row for row in rows if not (row.valid_start_ns == near and row.variable == "TXN_SD")]
 
     counts = nbp_skill_study._WindowGroupCounts()
-    windows = nbp_skill_study.nearest_percentile_windows(rows, counts=counts)
+    windows = nbp_skill_study.complete_percentile_windows(rows, counts=counts)
 
     assert counts.incomplete_windows == 1
     assert len(windows) == 1
@@ -195,7 +205,11 @@ def test_nearest_percentile_windows_keeps_only_complete_groups() -> None:
     assert windows[0].percentiles.q50 == pytest.approx(91.0)
 
 
-def test_nearest_percentile_windows_picks_the_smallest_valid_start_ns() -> None:
+def test_complete_percentile_windows_keeps_every_complete_window_for_the_same_cycle() -> None:
+    """A (station, cycle) may publish more than one complete 00Z valid
+    window -- `complete_percentile_windows` keeps ALL of them; WHICH one is
+    the D+1 target is `build_version_rows`'s decision, never a "nearest"
+    reduction made here (SL-8b review item 1)."""
     day = dt.date(2025, 6, 1)
     cycle = _cycle_runtime_ns(day, 13)
     near = _valid_00z_ns(day + dt.timedelta(days=1))
@@ -204,10 +218,8 @@ def test_nearest_percentile_windows_picks_the_smallest_valid_start_ns() -> None:
         *_complete_window_rows(station="KMIA", cycle_runtime_ns=cycle, valid_ns=near, q50=90.0),
         *_complete_window_rows(station="KMIA", cycle_runtime_ns=cycle, valid_ns=far, q50=91.0),
     ]
-    windows = nbp_skill_study.nearest_percentile_windows(rows)
-    assert len(windows) == 1
-    assert windows[0].valid_start_ns == near
-    assert windows[0].percentiles.q50 == pytest.approx(90.0)
+    windows = nbp_skill_study.complete_percentile_windows(rows)
+    assert {window.valid_start_ns for window in windows} == {near, far}
 
 
 # ---------------------------------------------------------------------------
@@ -224,19 +236,26 @@ def _registry() -> object:
 
 
 def test_build_version_rows_matches_a_qualifying_window_to_its_settlement_row() -> None:
-    # climate_day_for_txn(kind="max") maps a 00Z ftime to the LOCAL date the
-    # evening before it (negative UTC offsets) -- so a 00Z window dated
-    # `day + 1` in UTC resolves to climate_day == `day` (verified against
-    # the real function; see NBP_TXN_WINDOW_AND_BBB_NOTE_2026-09-29.md).
+    # A 13Z cycle published on UTC day `day` has LST publish date == `day`
+    # at KMIA (offset -5; 13-5=8, still day `day`), so its EXPLICIT D+1
+    # target climate day is `day + 1`. That target is reached by the 00Z
+    # window whose OWN valid UTC calendar day is `day + 2` --
+    # `local_standard_date` of a 00Z instant is always the PRECEDING UTC
+    # day for KMIA's negative offset (verified against the real
+    # `climate_day_for_txn`/`local_standard_date` helpers; see
+    # `build_version_rows`'s own docstring worked example and
+    # NBP_TXN_WINDOW_AND_BBB_NOTE_2026-09-29.md). The temporally NEAREST
+    # 00Z window (`day + 1`) would instead resolve to climate_day == `day`
+    # (D0) -- exactly the SL-8b review item 1 bug this fix closes.
     day = dt.date(2025, 6, 1)
-    climate_day = day
+    climate_day = day + dt.timedelta(days=1)
     cycle = _cycle_runtime_ns(day, 13)
     from breezy.strategy.ladder_ev.quantile_density import Percentiles
 
     window = nbp_skill_study.NbpPercentileWindow(
         station="KMIA",
         cycle_runtime_ns=cycle,
-        valid_start_ns=_valid_00z_ns(day + dt.timedelta(days=1)),
+        valid_start_ns=_valid_00z_ns(day + dt.timedelta(days=2)),
         nbm_version_era="v5.0",
         percentiles=Percentiles(q10=86, q25=88, q50=90, q75=92, q90=94, mean=90, sd=3.0),
     )
@@ -274,13 +293,14 @@ def test_build_version_rows_counts_a_non_qualifying_cycle_hour() -> None:
 def test_build_version_rows_counts_a_missing_settlement_row() -> None:
     day = dt.date(2025, 6, 1)
     cycle = _cycle_runtime_ns(day, 13)
-    climate_day = day + dt.timedelta(days=1)
+    # See the explicit-D+1 note above: the target window's own valid UTC
+    # day is `day + 2`, not `climate_day` itself.
     from breezy.strategy.ladder_ev.quantile_density import Percentiles
 
     window = nbp_skill_study.NbpPercentileWindow(
         station="KMIA",
         cycle_runtime_ns=cycle,
-        valid_start_ns=_valid_00z_ns(climate_day),
+        valid_start_ns=_valid_00z_ns(day + dt.timedelta(days=2)),
         nbm_version_era="v5.0",
         percentiles=Percentiles(q10=86, q25=88, q50=90, q75=92, q90=94, mean=90, sd=3.0),
     )
@@ -295,9 +315,12 @@ def test_a_holdout_dated_row_is_never_present_in_validate_mode_output() -> None:
     from breezy.strategy.ladder_ev.quantile_density import Percentiles
 
     holdout_day = DEFAULT_SPLITS.holdout_start  # 2026-07-01
-    cycle = _cycle_runtime_ns(holdout_day, 13)
-    # A 00Z window one UTC day later resolves (kind="max") to climate_day ==
-    # holdout_day -- see the note in the previous test.
+    # A cycle published the DAY BEFORE holdout_day has target climate_day ==
+    # holdout_day (explicit D+1: LST publish date `holdout_day - 1`, plus
+    # one day) -- reached by the window whose own valid UTC day is
+    # `holdout_day + 1` (see the explicit-D+1 note above).
+    cycle_day = holdout_day - dt.timedelta(days=1)
+    cycle = _cycle_runtime_ns(cycle_day, 13)
     window = nbp_skill_study.NbpPercentileWindow(
         station="KMIA",
         cycle_runtime_ns=cycle,
@@ -369,12 +392,12 @@ def test_run_validate_end_to_end_over_synthetic_fixtures(tmp_path: Path) -> None
     archive_root = tmp_path / "archive"  # deliberately empty -- zero MOS/ASOS coverage, no crash
 
     day = dt.date(2025, 6, 1)
-    climate_day = day  # see the climate_day_for_txn note above
+    climate_day = day + dt.timedelta(days=1)  # explicit D+1 -- see the note above
     cycle = _cycle_runtime_ns(day, 13)
     rows = _complete_window_rows(
         station="KMIA",
         cycle_runtime_ns=cycle,
-        valid_ns=_valid_00z_ns(day + dt.timedelta(days=1)),
+        valid_ns=_valid_00z_ns(day + dt.timedelta(days=2)),
         q50=90.0,
     )
     write_partition(rows, nbp_root / "2025" / "06" / "nbp_20250601_13z.parquet")
@@ -396,6 +419,7 @@ def test_run_validate_end_to_end_over_synthetic_fixtures(tmp_path: Path) -> None
     assert report.unparseable_partitions == 1
     assert report.matched_version_rows == 1
     assert version_rows[0].station == "MIA"
+    assert version_rows[0].climate_day == climate_day
     assert version_rows[0].cli_tmax_f == 91.0
     assert report.n_by_split == {"validate": 1}
     assert report.n_by_version == {"v5.0": 1}
@@ -412,3 +436,170 @@ def test_run_validate_over_an_empty_root_returns_zero_coverage(tmp_path: Path) -
     assert version_rows == ()
     assert report.total_percentile_windows == 0
     assert report.matched_version_rows == 0
+
+
+# ---------------------------------------------------------------------------
+# Worked-example D+1 pins (SL-8b review item 1; coordinator-required
+# extension to all 4 join stations, and CORRECTED against the real NBP
+# bulletin grid -- coordinator correction 2026-09-29).
+#
+# **The real grid never publishes a same-UTC-day-after-cycle MAX column.**
+# `tests/unit/test_nbm_quantile_parse.py` already parses and hand-verifies
+# the REAL captured bulletins (`tests/fixtures/nbm/nbptx_t{13,19,01}z_
+# excerpt.txt`): for a 13Z cycle the grid's first group (FHR 23) carries
+# only the 12Z/MIN sub-value -- the FIRST MAX (00Z) column is FHR 35; for
+# 19Z it is FHR 29; for 01Z the first group already carries both 00Z and
+# 12Z, at FHR 23. All three converge on the SAME UTC instant for the
+# 2026-09-28/29 fixture cycles (2026-09-30 00:00 UTC -- see that module's
+# `test_hand_computed_dplus1_lst_day_per_station_per_cycle`), which is
+# ALREADY the D+1 LST target at every station. Confirmed independently
+# here against the real on-disk backfill (`~/.local/share/breezy/derived/
+# nbp/2025/09/nbp_20250925_{13,19}z.parquet`): the smallest available
+# valid_start_ns per (station, cycle) is day+2 (UTC), never day+1 -- a
+# day+1 TXN row is never populated by this venue's real feed. So the OLD
+# "nearest available complete window" reduction and the NEW explicit
+# `climate_day_for_txn`-matched target select the IDENTICAL window on
+# every real cycle this join has ever ingested (12/12 real (station,
+# cycle) groups checked, zero mismatches) -- this is NOT an observed
+# real-data D0 bug.
+#
+# The fix in `build_version_rows` is kept anyway, as an explicit-selection
+# ROBUSTNESS improvement: the old reduction's correctness depended on an
+# UNDECLARED assumption about the venue's publication grid (no day+1 MAX
+# column ever exists), not on anything the algorithm itself enforced. A
+# partial/malformed partition, a future NBM grid change, or an
+# out-of-order backfill write could in principle populate an earlier,
+# wrong-day row, and "nearest" would silently accept it; the explicit
+# target check refuses instead. The tests below assert the REAL-grid
+# equivalence (never a "picks the wrong day" claim), plus one adversarial
+# case proving the explicit check actually refuses a hypothetical
+# early/malformed row that "nearest" would have silently accepted.
+# ---------------------------------------------------------------------------
+
+from breezy.ingest.gaps import local_standard_date  # noqa: E402
+from forecast_climate_day_map import climate_day_for_txn  # type: ignore[import-not-found]  # noqa: E402
+
+_ALL_STATION_OFFSETS: dict[str, float] = {"KLAX": -8.0, "KMDW": -6.0, "KMIA": -5.0, "KSFO": -8.0}
+
+
+def _target_climate_day(offset: float, cycle_day: dt.date, cycle_hour: int) -> tuple[dt.date, int]:
+    """Independently reconstructs `build_version_rows`'s own D+1 target
+    computation from the PUBLIC helpers, for one hand-picked cycle."""
+    runtime_ns = _cycle_runtime_ns(cycle_day, cycle_hour)
+    publish_lst_date = local_standard_date(runtime_ns, offset)
+    target_climate_day = publish_lst_date + dt.timedelta(days=1)
+    return target_climate_day, runtime_ns
+
+
+@pytest.mark.parametrize("icao", sorted(_ALL_STATION_OFFSETS))
+def test_d1_worked_example_13z_and_19z_target_equals_the_real_grids_only_available_window(icao: str) -> None:
+    # HAND-WORKED (every join station, both cycle hours): a 13Z or 19Z
+    # cycle published on UTC day D keeps 13/19 minus the (<=8h) offset
+    # within day D itself (13-8=5, 13-6=7, 13-5=8; 19-8=11, 19-6=13,
+    # 19-5=14; all >= 0) -- so the LST publish date is D, and the D+1
+    # target climate_day is D+1. The window that reaches D+1 is the 00Z
+    # valid time on UTC day D+2 -- which is ALSO the real bulletin's FIRST
+    # available MAX column (FHR 35/29 respectively; a day+1 MAX is never
+    # published -- see the module-level note above). "Nearest available"
+    # and "explicit D+1 target" therefore select the SAME window here.
+    offset = _ALL_STATION_OFFSETS[icao]
+    day = dt.date(2025, 6, 1)
+    for hour in (13, 19):
+        target_climate_day, runtime_ns = _target_climate_day(offset, day, hour)
+        assert target_climate_day == day + dt.timedelta(days=1)
+
+        target_valid_ns = _valid_00z_ns(day + dt.timedelta(days=2))
+        target_window_climate_day = climate_day_for_txn(
+            icao=icao, runtime_ns=runtime_ns, ftime_ns=target_valid_ns, std_utc_offset_hours=offset,
+            model="v5.0", kind="max",
+        )
+        assert target_window_climate_day == target_climate_day
+
+
+@pytest.mark.parametrize("icao", sorted(_ALL_STATION_OFFSETS))
+def test_d1_worked_example_01z_is_issued_on_the_previous_lst_evening(icao: str) -> None:
+    # HAND-WORKED: a 01Z cycle published on UTC day X is 01:00 UTC; minus
+    # the (5-8h) offset that falls on UTC day X-1 (01-8=17, 01-6=19,
+    # 01-5=20, all negative before adding 24h -- i.e. the PREVIOUS day's
+    # evening), so the LST publish date is X-1, and the D+1 target
+    # climate_day is X. The window that reaches X is the 00Z valid time on
+    # UTC day X+1 -- the real bulletin's first available MAX column here
+    # too (FHR 23; the 01Z grid's very first group already carries both
+    # 00Z and 12Z).
+    offset = _ALL_STATION_OFFSETS[icao]
+    x = dt.date(2025, 6, 2)
+    target_climate_day, runtime_ns = _target_climate_day(offset, x, 1)
+    assert target_climate_day == x
+
+    target_valid_ns = _valid_00z_ns(x + dt.timedelta(days=1))
+    target_window_climate_day = climate_day_for_txn(
+        icao=icao, runtime_ns=runtime_ns, ftime_ns=target_valid_ns, std_utc_offset_hours=offset,
+        model="v5.0", kind="max",
+    )
+    assert target_window_climate_day == target_climate_day
+
+
+def test_real_archive_old_nearest_reduction_and_the_new_explicit_target_agree_on_every_group() -> None:
+    """Direct regression against the real on-disk backfill: for every
+    (station, cycle) group in a real 13Z/19Z/01Z partition trio, the OLD
+    "smallest available valid_start_ns" choice and the NEW explicit
+    `climate_day_for_txn`-matched-to-target choice select the SAME
+    climate_day. Skips (never fails) if the real archive is absent in this
+    environment -- it is a read-only cross-check of already-backfilled
+    data, not a fixture this test owns."""
+    from breezy.persistence.nbp_derived_store import read_partition
+
+    root = Path.home() / ".local/share/breezy/derived/nbp/2025/09"
+    paths = [
+        root / "nbp_20250925_13z.parquet",
+        root / "nbp_20250925_19z.parquet",
+        root / "nbp_20250926_01z.parquet",
+    ]
+    if not all(p.exists() for p in paths):
+        pytest.skip("real NBP archive not present in this environment")
+
+    registry = nbp_skill_study.station_registry()
+    rows = [row for path in paths for row in read_partition(path)]
+    windows = nbp_skill_study.complete_percentile_windows(rows)
+
+    # nbp_skill_study is loaded dynamically (see the module-level comment
+    # above `_registry()`), so mypy cannot resolve `NbpPercentileWindow` as
+    # a type expression here -- `Any` keeps attribute access typed-through.
+    old_best: dict[tuple[str, int], Any] = {}
+    for window in windows:
+        key = (window.station, window.cycle_runtime_ns)
+        if key not in old_best or window.valid_start_ns < old_best[key].valid_start_ns:
+            old_best[key] = window
+
+    assert len(old_best) == 12  # 4 stations x 3 cycles
+    for (station, cycle_runtime_ns), window in old_best.items():
+        offset = registry.std_utc_offset_hours_by_icao[station]
+        target = local_standard_date(cycle_runtime_ns, offset) + dt.timedelta(days=1)
+        old_climate_day = climate_day_for_txn(
+            icao=station, runtime_ns=cycle_runtime_ns, ftime_ns=window.valid_start_ns,
+            std_utc_offset_hours=offset, model=window.nbm_version_era, kind="max",
+        )
+        assert old_climate_day == target, (station, cycle_runtime_ns, old_climate_day, target)
+
+
+def test_explicit_target_refuses_a_hypothetical_early_window_nearest_would_have_accepted() -> None:
+    """The robustness case the real grid never exercises: IF a (station,
+    cycle) group ever carried a spurious day+1 window (malformed partition,
+    out-of-order backfill write -- something the real venue feed has never
+    produced, per the module note above), `build_version_rows` must refuse
+    it, counting `no_d1_window`, rather than silently accepting it the way
+    the OLD "nearest available" reduction would have."""
+    from breezy.strategy.ladder_ev.quantile_density import Percentiles
+
+    day = dt.date(2025, 6, 1)
+    cycle = _cycle_runtime_ns(day, 13)
+    early_but_wrong = nbp_skill_study.NbpPercentileWindow(
+        station="KMIA",
+        cycle_runtime_ns=cycle,
+        valid_start_ns=_valid_00z_ns(day + dt.timedelta(days=1)),  # never real; see module note
+        nbm_version_era="v5.0",
+        percentiles=Percentiles(q10=86, q25=88, q50=90, q75=92, q90=94, mean=90, sd=3.0),
+    )
+    version_rows, gaps = nbp_skill_study.build_version_rows([early_but_wrong], {}, registry=_registry())
+    assert version_rows == ()
+    assert gaps == {"no_d1_window": 1}
