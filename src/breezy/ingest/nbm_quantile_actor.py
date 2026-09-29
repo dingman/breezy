@@ -101,6 +101,7 @@ from breezy.ingest.nbm_quantile_transport import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BULLETIN_DRIFT_ALERT_MARKER",
     "DEFAULT_NBM_QUANTILE_CYCLE_HOURS",
     "DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS",
     "DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS",
@@ -139,6 +140,15 @@ DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS: Final[int] = 3 * _SECONDS_PER_HOUR
 #: interpolated with per-cycle detail INSIDE the marker itself -- the marker
 #: is what a matcher greps for; the detail is the rest of the log line.
 STALE_CYCLE_ALERT_MARKER: Final[str] = "NBM_NBP_STALE_CYCLE"
+
+#: Stable, greppable marker for a bulletin that failed to parse. Distinct
+#: from `STALE_CYCLE_ALERT_MARKER`: a bulletin drift IS a fetched cycle (the
+#: latch below still applies, so it is never retried in a loop), whereas a
+#: stale cycle never arrived at all. Also distinct from the generic
+#: `_record_task_death` "cycle task died" CRITICAL the re-raise still reaches
+#: (module docstring: that log line is shared by every kind of Actor bug and
+#: is not, on its own, a signal an alert matcher can act on).
+BULLETIN_DRIFT_ALERT_MARKER: Final[str] = "NBM_NBP_BULLETIN_DRIFT"
 
 
 class BulletinFetcher(Protocol):
@@ -457,7 +467,7 @@ class NbmQuantileActor(Actor):
         if lag_ns is None:
             return
         self._fetched_cycles.add(cycle_ns)
-        self._publish(result, lag_ns)
+        self._publish(result, lag_ns, cycle_ns=cycle_ns)
 
     def _measured_lag_ns(self, result: NbmQuantileFetchResult, cycle_ns: int) -> int | None:
         """The MEASURED publication lag, or `None` when it cannot be trusted.
@@ -492,14 +502,32 @@ class NbmQuantileActor(Actor):
             return None
         return lag_ns
 
-    def _publish(self, result: NbmQuantileFetchResult, lag_ns: int) -> None:
+    def _publish(
+        self, result: NbmQuantileFetchResult, lag_ns: int, *, cycle_ns: int
+    ) -> None:
         try:
             points, drops = parse_nbp_bulletin(result.text, stations=self._stations)
-        except NbpBulletinDriftError:
-            # Counted here AND re-raised: the count keeps the failure visible
-            # on the Actor, and the raise reaches the supervisor so a layout
-            # change cannot be a quiet no-op poll.
+        except NbpBulletinDriftError as exc:
+            # Counted, logged LOUD on a stable marker, AND re-raised. The
+            # caller already added `cycle_ns` to `_fetched_cycles` before
+            # calling this method, so a malformed bulletin is never retried
+            # in a loop -- which is exactly why this failure must never rely
+            # on the generic `_record_task_death` "cycle task died" CRITICAL
+            # the re-raise still reaches: that line is shared by every kind
+            # of Actor bug, and an alert matcher needs its OWN marker to
+            # distinguish "the bulletin layout changed" from an unrelated one.
             self.counters["bulletin_drift"] += 1
+            instant = dt.datetime.fromtimestamp(cycle_ns / _NS_PER_SECOND, tz=dt.UTC)
+            logger.error(
+                "%s: %s cycle %s %02dZ (cycle_runtime_ns=%d) failed to parse and is "
+                "latched as fetched with NOTHING published: %s",
+                BULLETIN_DRIFT_ALERT_MARKER,
+                NBM_NBP_MODEL,
+                instant.date().isoformat(),
+                instant.hour,
+                cycle_ns,
+                exc,
+            )
             raise
         self.counters.update(drops)
         data_type = nbm_forecast_point_data_type()

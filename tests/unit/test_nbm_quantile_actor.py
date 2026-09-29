@@ -32,6 +32,7 @@ from breezy.domain.forecast_point import MINIMUM_PUBLICATION_LAG_NS, ForecastPoi
 from breezy.ingest.http import TransportError
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.ingest.nbm_quantile_actor import (
+    BULLETIN_DRIFT_ALERT_MARKER,
     DEFAULT_NBM_QUANTILE_CYCLE_HOURS,
     DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS,
     STALE_CYCLE_ALERT_MARKER,
@@ -385,3 +386,122 @@ def test_the_production_transport_factory_constructs() -> None:
 
     transport = build_nbm_quantile_transport(lambda: NOW_NS, check_proxy_env=False)
     assert transport._allowed_hosts == NBM_QUANTILE_ALLOWED_HOSTS
+
+
+# ---------------------------------------------------------------------------
+# `_measured_lag_ns` refusal branches (SL-11 review, HIGH): a vintage that
+# cannot be measured, or is measured below the floor, must publish nothing
+# and be LOUD (L-17) -- mirrors test_nbm_forecast_actor.py's own
+# `test_a_missing_last_modified_publishes_nothing_and_is_loud` /
+# `test_a_publication_lag_below_the_model_floor_publishes_nothing`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_missing_last_modified_publishes_nothing_and_is_loud(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = build(last_modifieds=(None,))
+    with caplog.at_level(logging.CRITICAL):
+        harness.actor.start()
+        await harness.drain()
+
+    assert harness.published == []
+    assert harness.actor.counters["missing_last_modified"] == 1
+    assert any("Last-Modified" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_an_unparsable_last_modified_publishes_nothing_and_is_loud(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = build(last_modifieds=("not-a-valid-http-date",))
+    with caplog.at_level(logging.CRITICAL):
+        harness.actor.start()
+        await harness.drain()
+
+    assert harness.published == []
+    assert harness.actor.counters["unparsable_last_modified"] == 1
+    assert any("did not parse" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_publication_lag_below_the_model_floor_publishes_nothing() -> None:
+    """A zero or implausible lag grants look-ahead; it is refused, never clamped."""
+    early = _rfc2822(CYCLE_NS + 60 * NS)  # 60 s, below the 60 min NBM_NBP floor
+    harness = build(last_modifieds=(early,))
+    harness.actor.start()
+    await harness.drain()
+
+    assert harness.published == []
+    assert harness.actor.counters["publication_lag_below_floor"] == 1
+    assert FLOOR_NS == 60 * 60 * NS
+
+
+# ---------------------------------------------------------------------------
+# No running event loop (SL-11 review, HIGH): a backtest has no loop, so
+# nothing is armed and no network I/O is possible by construction -- mirrors
+# test_nbm_forecast_actor.py::test_with_no_running_loop_nothing_is_armed_and_no_transport_is_built.
+# ---------------------------------------------------------------------------
+
+
+def test_with_no_running_loop_nothing_is_armed_and_no_transport_is_built() -> None:
+    harness = build()
+    harness.actor.start()
+
+    assert harness.actor.poll_timer_armed is False
+    assert harness.fetchers == []
+
+
+# ---------------------------------------------------------------------------
+# Execution-egress firewall (SL-11 review, HIGH): this ingest Actor must
+# never become an execution-egress surface -- mirrors
+# test_nbm_forecast_actor.py's own WP12_MODULES guard.
+# ---------------------------------------------------------------------------
+
+SL11_MODULES = ("src/breezy/ingest/nbm_quantile_actor.py",)
+
+
+def test_no_sl11_module_is_an_execution_egress_surface() -> None:
+    from tests.unit.test_execution_egress_firewall_guard import find_execution_egress_modules
+
+    offenders = [v for v in find_execution_egress_modules() if v.path in SL11_MODULES]
+
+    assert offenders == [], "\n".join(str(v) for v in offenders)
+
+
+def test_the_egress_detector_would_still_fire_on_an_sl11_path() -> None:
+    """Non-vacuity: the scan above passes because the module is clean."""
+    from tests.unit.test_execution_egress_firewall_guard import _scan_source
+
+    planted = "class ForecastExecutionClient:\n    pass\n"
+    assert _scan_source("src/breezy/ingest/nbm_quantile_actor.py", planted) != []
+
+
+# ---------------------------------------------------------------------------
+# Bulletin drift is latched but never silent (SL-11 review, MEDIUM):
+# `_fetched_cycles.add(cycle_ns)` runs before `_publish`, so a malformed
+# bulletin is never retried in a loop -- but that latch must not lose the
+# failure quietly. `NBM_NBP_BULLETIN_DRIFT` is the stable marker.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_bulletin_drift_is_latched_but_never_silent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    malformed = "not an NBP bulletin at all\n"
+    harness = build(texts=(malformed,))
+    with caplog.at_level(logging.ERROR):
+        harness.actor.start()
+        await harness.drain()
+
+    assert harness.actor.counters["bulletin_drift"] == 1
+    assert harness.published == []
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any(BULLETIN_DRIFT_ALERT_MARKER in record.message for record in error_records)
+
+    # Latched: a subsequent timer fire must not re-fetch the same cycle.
+    fired = await harness.fire_due_timers(NOW_NS + 2 * 900 * NS)
+    assert fired >= 2
+    assert len(harness.fetcher.calls) == 1
