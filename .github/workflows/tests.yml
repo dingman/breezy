@@ -31,6 +31,9 @@ jobs:
         run: uv run ruff check .
 
       - name: Mypy
+        # CF-12: advisory until burn-down goal state; enforced locally by
+        # tests/unit/test_mypy_ratchet.py
+        continue-on-error: true
         run: uv run mypy
 
       - name: Import contracts
