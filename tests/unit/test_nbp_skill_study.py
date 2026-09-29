@@ -30,7 +30,10 @@ sys.path.insert(0, str(_REPO_ROOT / "scripts" / "analysis"))
 from settlement_truth_dataset import STATUS_FINAL, SettlementTruthRow, rows_to_table  # type: ignore[import-not-found]  # noqa: E402
 
 from breezy.analysis.nbp_calibration import DEFAULT_SPLITS  # noqa: E402
+from breezy.analysis.nbp_comparator_models import target_climate_day  # noqa: E402
+from breezy.persistence.archive_cache import ArchiveCache, ArchiveRequest, IEM_MOS_SOURCE  # noqa: E402
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, write_partition  # noqa: E402
+from breezy.strategy.weather_common.probability import ForecastErrorModel  # noqa: E402
 
 
 def test_default_stage_is_validate_and_never_needs_authorization() -> None:
@@ -71,6 +74,13 @@ def _valid_00z_ns(day: dt.date) -> int:
 #: `test_d1_worked_example_*` below.
 def _d1_valid_ns_for_13z_or_19z(cycle_day: dt.date) -> int:
     return _valid_00z_ns(cycle_day + dt.timedelta(days=2))
+
+
+#: A 01Z cycle published on UTC day X maps to D+1 (== X) via the window
+#: whose OWN valid UTC calendar day is X+1 -- see `build_version_rows`'s
+#: docstring worked example (01Z case).
+def _d1_valid_ns_for_01z(cycle_day: dt.date) -> int:
+    return _valid_00z_ns(cycle_day + dt.timedelta(days=1))
 
 
 def _derived_row(
@@ -603,3 +613,239 @@ def test_explicit_target_refuses_a_hypothetical_early_window_nearest_would_have_
     version_rows, gaps = nbp_skill_study.build_version_rows([early_but_wrong], {}, registry=_registry())
     assert version_rows == ()
     assert gaps == {"no_d1_window": 1}
+
+
+# ---------------------------------------------------------------------------
+# SL-8c: build_comparator_matched_events -- M0/M1/M2 + G2.0a wiring,
+# keyed on `target_climate_day` (coordinator directive, never "the nearest
+# window").
+# ---------------------------------------------------------------------------
+
+
+def _frozen_error_model() -> ForecastErrorModel:
+    # A plain, un-loaded ForecastErrorModel is a valid `ForecastErrorModel`
+    # for these join-shape tests -- they exercise the WIRING, not M0's own
+    # frozen-artefact byte-equality (covered in test_nbp_calibration.py).
+    return ForecastErrorModel()
+
+
+def _comparator_window(
+    *, station: str, cycle_runtime_ns: int, valid_start_ns: int, q50: float, sd: float = 3.0
+) -> object:
+    # `build_comparator_matched_events` now selects explicitly via
+    # `climate_day_for_txn(valid_start_ns) == target_climate_day` (shared
+    # `_select_d1_window`, DRY with `build_version_rows`) -- callers must
+    # pass a REAL D+1 00Z valid_start_ns, never an arbitrary instant.
+    from breezy.strategy.ladder_ev.quantile_density import Percentiles
+
+    return nbp_skill_study.NbpPercentileWindow(
+        station=station,
+        cycle_runtime_ns=cycle_runtime_ns,
+        valid_start_ns=valid_start_ns,
+        nbm_version_era="v5.0",
+        percentiles=Percentiles(
+            q10=q50 - 4, q25=q50 - 2, q50=q50, q75=q50 + 2, q90=q50 + 4, mean=q50, sd=sd
+        ),
+    )
+
+
+def test_build_comparator_matched_events_aligns_m0_m1_m2_on_the_same_event() -> None:
+    registry = nbp_skill_study.station_registry()
+    offset = registry.std_utc_offset_hours_by_icao["KMIA"]
+    settlement_station = registry.settlement_station_by_icao["KMIA"]
+    cycle_day = dt.date(2025, 6, 2)
+    cycle = _cycle_runtime_ns(cycle_day, 1)  # 01Z
+    climate_day = target_climate_day(cycle, offset)
+
+    window = _comparator_window(
+        station="KMIA",
+        cycle_runtime_ns=cycle,
+        valid_start_ns=_d1_valid_ns_for_01z(cycle_day),
+        q50=90.0,
+    )
+    settlement = {
+        (settlement_station, climate_day): _settlement_row(
+            station=settlement_station, climate_day=climate_day, tmax_f=90
+        )
+    }
+    mos_by_cycle = {("KMIA", cycle): nbp_skill_study.RawMosTxnXnd(txn_f=90.0, xnd_f=2.0)}
+
+    events, report = nbp_skill_study.build_comparator_matched_events(
+        [window], settlement, mos_by_cycle, {}, _frozen_error_model(), registry=registry
+    )
+
+    assert report.matched_events == 1
+    assert report.non_qualifying_cycle_windows == 0
+    assert report.unmapped_station_windows == 0
+    assert report.holdout_excluded_windows == 0
+    assert report.missing_settlement_rows == 0
+    assert report.missing_raw_mos_rows == 0
+    assert len(events) == 1
+    event = events[0]
+    # The SAME event key carries all three model probabilities.
+    assert event.station == settlement_station
+    assert event.climate_day == climate_day
+    for p in (event.p_m0, event.p_m1, event.p_m2):
+        assert 0.0 <= p <= 1.0
+    assert event.near_midnight is None
+    assert event.near_midnight_stratum is None
+
+
+def test_build_comparator_matched_events_never_admits_a_holdout_event() -> None:
+    registry = nbp_skill_study.station_registry()
+    offset = registry.std_utc_offset_hours_by_icao["KMIA"]
+    settlement_station = registry.settlement_station_by_icao["KMIA"]
+    # Choose a cycle whose D+1 target lands ON the holdout start: for a 01Z
+    # cycle at KMIA (UTC-5), local_standard_date shifts back one UTC day
+    # (01:00Z - 5h = 20:00 the PREVIOUS UTC day), so a 01Z cycle stamped on
+    # `holdout_start` itself has local_standard_date == holdout_start - 1
+    # day, and target_climate_day (+1) lands exactly on holdout_start.
+    holdout_start = DEFAULT_SPLITS.holdout_start
+    cycle = _cycle_runtime_ns(holdout_start, 1)
+    assert target_climate_day(cycle, offset) == holdout_start
+
+    window = _comparator_window(
+        station="KMIA",
+        cycle_runtime_ns=cycle,
+        valid_start_ns=_d1_valid_ns_for_01z(holdout_start),
+        q50=90.0,
+    )
+    settlement = {
+        (settlement_station, holdout_start): _settlement_row(
+            station=settlement_station, climate_day=holdout_start, tmax_f=90
+        )
+    }
+    mos_by_cycle = {("KMIA", cycle): nbp_skill_study.RawMosTxnXnd(txn_f=90.0, xnd_f=2.0)}
+
+    events, report = nbp_skill_study.build_comparator_matched_events(
+        [window], settlement, mos_by_cycle, {}, _frozen_error_model(), registry=registry
+    )
+
+    assert events == ()
+    assert report.holdout_excluded_windows == 1
+    assert all(event.climate_day < holdout_start for event in events)
+
+
+def test_build_comparator_matched_events_counts_a_missing_raw_mos_row() -> None:
+    registry = nbp_skill_study.station_registry()
+    offset = registry.std_utc_offset_hours_by_icao["KMIA"]
+    settlement_station = registry.settlement_station_by_icao["KMIA"]
+    cycle_day = dt.date(2025, 6, 2)
+    cycle = _cycle_runtime_ns(cycle_day, 1)
+    climate_day = target_climate_day(cycle, offset)
+
+    window = _comparator_window(
+        station="KMIA",
+        cycle_runtime_ns=cycle,
+        valid_start_ns=_d1_valid_ns_for_01z(cycle_day),
+        q50=90.0,
+    )
+    settlement = {
+        (settlement_station, climate_day): _settlement_row(
+            station=settlement_station, climate_day=climate_day, tmax_f=90
+        )
+    }
+
+    events, report = nbp_skill_study.build_comparator_matched_events(
+        [window], settlement, {}, {}, _frozen_error_model(), registry=registry
+    )
+
+    assert events == ()
+    assert report.missing_raw_mos_rows == 1
+
+
+def test_build_comparator_matched_events_carries_the_near_midnight_stratum() -> None:
+    from breezy.analysis.nbp_comparator_models import DailyMaxInstant
+
+    registry = nbp_skill_study.station_registry()
+    offset = registry.std_utc_offset_hours_by_icao["KMIA"]
+    settlement_station = registry.settlement_station_by_icao["KMIA"]
+    cycle_day = dt.date(2025, 6, 2)
+    cycle = _cycle_runtime_ns(cycle_day, 1)
+    climate_day = target_climate_day(cycle, offset)
+
+    window = _comparator_window(
+        station="KMIA",
+        cycle_runtime_ns=cycle,
+        valid_start_ns=_d1_valid_ns_for_01z(cycle_day),
+        q50=90.0,
+    )
+    settlement = {
+        (settlement_station, climate_day): _settlement_row(
+            station=settlement_station, climate_day=climate_day, tmax_f=90
+        )
+    }
+    mos_by_cycle = {("KMIA", cycle): nbp_skill_study.RawMosTxnXnd(txn_f=90.0, xnd_f=2.0)}
+    daily_max = {
+        (settlement_station, climate_day): DailyMaxInstant(
+            station=settlement_station,
+            climate_day=climate_day,
+            lst_seconds_from_midnight=1800,
+            value_f=90.0,
+            near_midnight=True,
+        )
+    }
+
+    events, _report = nbp_skill_study.build_comparator_matched_events(
+        [window], settlement, mos_by_cycle, daily_max, _frozen_error_model(), registry=registry
+    )
+
+    assert len(events) == 1
+    assert events[0].near_midnight is True
+    assert events[0].near_midnight_stratum == "KMIA"
+
+
+# ---------------------------------------------------------------------------
+# mos_txn_xnd_by_cycle -- real archive-cache read (seeded via get_or_fetch).
+# ---------------------------------------------------------------------------
+
+
+class _FixedClock:
+    def timestamp_ns(self) -> int:
+        return 0
+
+
+def _seed_mos_archive(tmp_path: Path, *, station: str, body: bytes) -> Path:
+    archive_root = tmp_path / "archive"
+    request = ArchiveRequest(
+        source=IEM_MOS_SOURCE,
+        station=station,
+        product="mos-nbs",
+        window_start=0,
+        window_end=10**18,
+        model="NBS",
+    )
+    cache = ArchiveCache(
+        root=archive_root / IEM_MOS_SOURCE, fetch=lambda _req: body, clock=_FixedClock()
+    )
+    cache.get_or_fetch(request)
+    return archive_root
+
+
+def test_mos_txn_xnd_by_cycle_reads_a_real_seeded_archive_entry(tmp_path: Path) -> None:
+    body = (
+        b"station,runtime,ftime,txn,xnd\n"
+        b"KMIA,2025-06-02 01:00:00,2025-06-02 06:00:00,90,2.0\n"
+    )
+    archive_root = _seed_mos_archive(tmp_path, station="KMIA", body=body)
+
+    result = nbp_skill_study.mos_txn_xnd_by_cycle(archive_root=archive_root, stations=("KMIA",))
+
+    cycle_ns = _cycle_runtime_ns(dt.date(2025, 6, 2), 1)
+    key = ("KMIA", cycle_ns)
+    assert key in result
+    assert result[key].txn_f == pytest.approx(90.0)
+    assert result[key].xnd_f == pytest.approx(2.0)
+
+
+def test_mos_txn_xnd_by_cycle_over_a_missing_archive_root_is_empty(tmp_path: Path) -> None:
+    result = nbp_skill_study.mos_txn_xnd_by_cycle(archive_root=tmp_path / "does-not-exist")
+    assert result == {}
+
+
+def test_daily_max_instants_over_a_missing_archive_root_is_empty(tmp_path: Path) -> None:
+    registry = nbp_skill_study.station_registry()
+    result = nbp_skill_study.daily_max_instants(
+        archive_root=tmp_path / "does-not-exist", registry=registry
+    )
+    assert result == {}

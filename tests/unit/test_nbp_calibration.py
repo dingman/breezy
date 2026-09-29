@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from breezy.analysis import nbp_calibration as calib
+from breezy.analysis import nbp_comparator_models as comparator
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
@@ -32,6 +33,8 @@ from breezy.strategy.ladder_ev.quantile_density import (
     apply_emos,
     build_cdf,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Splits
@@ -1401,3 +1404,248 @@ def test_p_point_equals_the_manual_mean_over_draws_a_scorer_would_compute() -> N
         manual_p_point = sum(per_draw) / len(per_draw)
         artefact_p_point = bounds[rung_id][0]
         assert manual_p_point == pytest.approx(artefact_p_point, abs=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# SL-8c: M0 (closed model, frozen 0b) + M1 comparators + G2.0a near-midnight
+# feature (plan S2.2, S3.2 item 7, S4.1 G2.0a).
+# ---------------------------------------------------------------------------
+
+_FROZEN_0B_PATH = _REPO_ROOT / comparator.FROZEN_0B_ARTEFACT_RELPATH
+
+
+def test_frozen_0b_artefact_is_committed_at_the_declared_path() -> None:
+    assert _FROZEN_0B_PATH.is_file()
+
+
+def test_load_frozen_0b_error_model_is_byte_equal_to_the_committed_json() -> None:
+    """The loader must reproduce the committed JSON's tables exactly -- never
+    refit, never round, never drop a key."""
+    raw = json.loads(_FROZEN_0B_PATH.read_text(encoding="utf-8"))
+
+    model = comparator.load_frozen_0b_error_model(_FROZEN_0B_PATH)
+
+    assert model.bias_by_key == raw["bias_by_key"]
+    assert model.sigma_by_key == raw["sigma_by_key"]
+    assert model.sample_size_by_key == raw["sample_size_by_key"]
+    assert model.distribution == raw["distribution"]
+    assert model.min_samples_for_local == raw["min_samples_for_local"]
+    assert model.continuity_correction_f == raw["continuity_correction_f"]
+    # The frozen fit's own declared TRAIN n (WP-6, n=5808) is the "*" catch-all
+    # sample count -- pinning both together catches a corrupted or truncated
+    # artefact, not just a malformed one.
+    assert model.sample_size_by_key["*"] == comparator.M0_FROZEN_TRAIN_STATION_DAYS
+
+
+def test_load_frozen_0b_error_model_raises_on_a_missing_required_key(tmp_path: Path) -> None:
+    bad = tmp_path / "bad_frozen_0b.json"
+    bad.write_text(json.dumps({"bias_by_key": {}, "distribution": "gaussian"}))
+    with pytest.raises(comparator.Frozen0bArtefactError):
+        comparator.load_frozen_0b_error_model(bad)
+
+
+def test_load_frozen_0b_error_model_raises_on_unparseable_json(tmp_path: Path) -> None:
+    bad = tmp_path / "not_json.json"
+    bad.write_text("not json at all")
+    with pytest.raises(comparator.Frozen0bArtefactError):
+        comparator.load_frozen_0b_error_model(bad)
+
+
+def test_m0_reproduces_a_known_value_from_the_committed_frozen_09_20_corpus() -> None:
+    """Positive control (plan task 1): the frozen artefact's own KMIA/August
+    bias+sigma, applied by hand, must match `m0_rung_probabilities` exactly."""
+    model = comparator.load_frozen_0b_error_model(_FROZEN_0B_PATH)
+    txn_f = 90.0
+    station = "KMIA"
+    climate_day = dt.date(2023, 8, 15)
+    horizon_hours = comparator.M0_PRIMARY_LEAD_HOURS
+
+    # Hand-computed from the committed artefact's KMIA|8|24 bucket (bias
+    # 0.20161290322580644, sigma 1.268632441529883 -- read directly off
+    # docs/evidence/FC_0b_FROZEN_ERROR_MODEL_2026-09-19.json).
+    bias = model.bias_by_key["KMIA|8|24"]
+    sigma = model.sigma_by_key["KMIA|8|24"]
+    assert model.bias(station, climate_day, horizon_hours) == pytest.approx(bias)
+    assert model.sigma(station, climate_day, horizon_hours) == pytest.approx(sigma)
+
+    mu = txn_f + bias
+    expected = {
+        "lt90": 0.5 * (1.0 + math.erf((89.5 - mu) / (sigma * math.sqrt(2.0)))),
+        "90_91": (
+            0.5 * (1.0 + math.erf((91.5 - mu) / (sigma * math.sqrt(2.0))))
+            - 0.5 * (1.0 + math.erf((89.5 - mu) / (sigma * math.sqrt(2.0))))
+        ),
+    }
+    expected["gt91"] = 1.0 - expected["lt90"] - expected["90_91"]
+
+    rungs = (Rung("lt90", None, 89), Rung("90_91", 90, 91), Rung("gt91", 92, None))
+    probabilities = comparator.m0_rung_probabilities(
+        txn_f=txn_f,
+        station=station,
+        climate_day=climate_day,
+        horizon_hours=horizon_hours,
+        error_model=model,
+        rungs=rungs,
+    )
+
+    assert probabilities["lt90"] == pytest.approx(expected["lt90"], abs=1e-12)
+    assert probabilities["90_91"] == pytest.approx(expected["90_91"], abs=1e-12)
+    assert probabilities["gt91"] == pytest.approx(expected["gt91"], abs=1e-12)
+    assert sum(probabilities.values()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_m0_never_mutates_the_frozen_model_across_repeated_calls() -> None:
+    """Calling m0 twice must not mutate the shared `ForecastErrorModel`."""
+    model = comparator.load_frozen_0b_error_model(_FROZEN_0B_PATH)
+    before_bias = dict(model.bias_by_key)
+    before_sigma = dict(model.sigma_by_key)
+    rungs = (Rung("lt90", None, 89), Rung("gte90", 90, None))
+
+    comparator.m0_rung_probabilities(
+        txn_f=88.0,
+        station="KSFO",
+        climate_day=dt.date(2022, 3, 1),
+        horizon_hours=comparator.M0_PRIMARY_LEAD_HOURS,
+        error_model=model,
+        rungs=rungs,
+    )
+
+    assert model.bias_by_key == before_bias
+    assert model.sigma_by_key == before_sigma
+
+
+def test_m1_rung_partition_sums_to_1() -> None:
+    rungs = (
+        Rung("lt80", None, 79),
+        Rung("80_81", 80, 81),
+        Rung("82_83", 82, 83),
+        Rung("gte84", 84, None),
+    )
+    probabilities = comparator.m1_rung_probabilities(txn_mean_f=81.5, xnd_sd_f=2.4, rungs=rungs)
+    assert sum(probabilities.values()) == pytest.approx(1.0, abs=1e-9)
+    assert all(0.0 <= p <= 1.0 for p in probabilities.values())
+
+
+def test_m1_uses_no_bias_correction_unlike_m0() -> None:
+    """M1 is the zero-plumbing baseline (plan S2.2): the mean IS the TXN
+    mean, with no bias term applied on top."""
+    rungs = (Rung("lt90", None, 89), Rung("gte90", 90, None))
+    probabilities = comparator.m1_rung_probabilities(txn_mean_f=90.0, xnd_sd_f=2.0, rungs=rungs)
+    # At the mean exactly, the continuity-adjusted split around 89.5 puts
+    # slightly more than half the mass above 90 -- a fixed, hand-verifiable
+    # value independent of any bias/sigma fit.
+    expected_below = 0.5 * (1.0 + math.erf((89.5 - 90.0) / (2.0 * math.sqrt(2.0))))
+    assert probabilities["lt90"] == pytest.approx(expected_below, abs=1e-12)
+
+
+def test_m1_refuses_a_non_positive_sd() -> None:
+    rungs = (Rung("lt90", None, 89), Rung("gte90", 90, None))
+    with pytest.raises(ValueError):
+        comparator.m1_rung_probabilities(txn_mean_f=90.0, xnd_sd_f=0.0, rungs=rungs)
+
+
+# ---------------------------------------------------------------------------
+# G2.0a: near-midnight LST instant (plan S4.1; hand-computed for KMIA
+# UTC-5 and KLAX UTC-8).
+# ---------------------------------------------------------------------------
+
+
+def test_near_midnight_flag_hand_computed_for_kmia_utc_minus_5() -> None:
+    # 04:30Z -> LST 23:30 (previous LST day) -- 30 min before midnight: near.
+    day, seconds = comparator.lst_clock_time(
+        dt.datetime(2025, 6, 2, 4, 30, tzinfo=dt.UTC), std_utc_offset_hours=-5.0
+    )
+    assert day == dt.date(2025, 6, 1)
+    assert seconds == 23 * 3600 + 30 * 60
+    assert comparator.is_near_lst_midnight(seconds) is True
+
+    # 06:30Z -> LST 01:30 -- 90 min after midnight: near.
+    _, seconds = comparator.lst_clock_time(
+        dt.datetime(2025, 6, 2, 6, 30, tzinfo=dt.UTC), std_utc_offset_hours=-5.0
+    )
+    assert seconds == 1 * 3600 + 30 * 60
+    assert comparator.is_near_lst_midnight(seconds) is True
+
+    # 12:00Z -> LST 07:00 -- 7h after midnight: not near.
+    _, seconds = comparator.lst_clock_time(
+        dt.datetime(2025, 6, 2, 12, 0, tzinfo=dt.UTC), std_utc_offset_hours=-5.0
+    )
+    assert seconds == 7 * 3600
+    assert comparator.is_near_lst_midnight(seconds) is False
+
+
+def test_near_midnight_flag_hand_computed_for_klax_utc_minus_8() -> None:
+    # 07:30Z -> LST 23:30 (previous LST day): near.
+    day, seconds = comparator.lst_clock_time(
+        dt.datetime(2025, 6, 2, 7, 30, tzinfo=dt.UTC), std_utc_offset_hours=-8.0
+    )
+    assert day == dt.date(2025, 6, 1)
+    assert seconds == 23 * 3600 + 30 * 60
+    assert comparator.is_near_lst_midnight(seconds) is True
+
+    # 09:30Z -> LST 01:30: near.
+    _, seconds = comparator.lst_clock_time(
+        dt.datetime(2025, 6, 2, 9, 30, tzinfo=dt.UTC), std_utc_offset_hours=-8.0
+    )
+    assert seconds == 1 * 3600 + 30 * 60
+    assert comparator.is_near_lst_midnight(seconds) is True
+
+    # 15:00Z -> LST 07:00: not near.
+    _, seconds = comparator.lst_clock_time(
+        dt.datetime(2025, 6, 2, 15, 0, tzinfo=dt.UTC), std_utc_offset_hours=-8.0
+    )
+    assert seconds == 7 * 3600
+    assert comparator.is_near_lst_midnight(seconds) is False
+
+
+def test_is_near_lst_midnight_refuses_an_out_of_range_value() -> None:
+    with pytest.raises(ValueError):
+        comparator.is_near_lst_midnight(86_400)
+    with pytest.raises(ValueError):
+        comparator.is_near_lst_midnight(-1)
+
+
+def test_daily_max_instant_from_samples_breaks_ties_to_the_first_occurrence() -> None:
+    # Two samples share the max value; the earlier LST instant wins.
+    samples = [(3600, 90.0), (7200, 90.0), (1800, 88.0)]
+    instant = comparator.daily_max_instant_from_samples(
+        samples, station="KMIA", climate_day=dt.date(2025, 6, 1)
+    )
+    assert instant is not None
+    assert instant.lst_seconds_from_midnight == 3600
+    assert instant.value_f == pytest.approx(90.0)
+
+
+def test_daily_max_instant_from_samples_is_missing_not_imputed_for_a_gap() -> None:
+    instant = comparator.daily_max_instant_from_samples(
+        [], station="KMIA", climate_day=dt.date(2025, 6, 1)
+    )
+    assert instant is None
+
+
+# ---------------------------------------------------------------------------
+# target_climate_day: D+1 keyed on the cycle's OWN publish instant, never on
+# "the nearest window" (coordinator directive, 2026-09-29).
+# ---------------------------------------------------------------------------
+
+_NS: int = 10**9
+
+
+def _ns(instant: dt.datetime) -> int:
+    return int(instant.timestamp()) * _NS
+
+
+def test_target_climate_day_pins_d_plus_1_for_a_01z_cycle_at_kmia() -> None:
+    # KMIA, UTC-5 (EST, standard -- never DST-aware). 01:00Z on 2025-06-02 is
+    # 20:00 local standard on 2025-06-01 -- local_standard_date == 2025-06-01
+    # -- so the D+1 target climate day is 2025-06-02.
+    cycle_publish_ns = _ns(dt.datetime(2025, 6, 2, 1, 0, tzinfo=dt.UTC))
+    assert comparator.target_climate_day(cycle_publish_ns, -5.0) == dt.date(2025, 6, 2)
+
+
+def test_target_climate_day_pins_d_plus_1_for_a_13z_cycle_at_klax() -> None:
+    # KLAX, UTC-8 (PST, standard). 13:00Z on 2025-06-02 is 05:00 local
+    # standard on 2025-06-02 -- local_standard_date == 2025-06-02 -- so the
+    # D+1 target climate day is 2025-06-03.
+    cycle_publish_ns = _ns(dt.datetime(2025, 6, 2, 13, 0, tzinfo=dt.UTC))
+    assert comparator.target_climate_day(cycle_publish_ns, -8.0) == dt.date(2025, 6, 3)

@@ -62,7 +62,9 @@ skipped and counted, never fatal.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
+import io
 import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -77,11 +79,22 @@ for _entry in (str(_SCRIPTS_ANALYSIS_DIR), str(_REPO_ROOT / "src")):
         sys.path.insert(0, _entry)
 
 from forecast_climate_day_map import ForecastValidPeriodError, climate_day_for_txn  # type: ignore[import-not-found]  # noqa: E402
-from mos_txn_occupancy import parse_mos_txn_rows  # type: ignore[import-not-found]  # noqa: E402
+from mos_txn_occupancy import MosTxnRow, parse_mos_txn_rows  # type: ignore[import-not-found]  # noqa: E402
 from settlement_alignment_study import IEM_ASOS_IDS, load_sites  # type: ignore[import-not-found]  # noqa: E402
 from settlement_truth_dataset import SettlementTruthRow, final_rows_for_gate  # type: ignore[import-not-found]  # noqa: E402
 
-from breezy.analysis.nbp_calibration import DEFAULT_SPLITS, Splits, VersionRow  # noqa: E402
+from breezy.analysis.nbp_calibration import DEFAULT_SPLITS, NEAR_MIDNIGHT_STRATA, Splits, VersionRow  # noqa: E402
+from breezy.analysis.nbp_comparator_models import (  # noqa: E402
+    FROZEN_0B_ARTEFACT_RELPATH,
+    M0_PRIMARY_LEAD_HOURS,
+    DailyMaxInstant,
+    is_near_lst_midnight,
+    load_frozen_0b_error_model,
+    lst_clock_time,
+    m0_rung_probabilities,
+    m1_rung_probabilities,
+    target_climate_day,
+)
 from breezy.ingest.gaps import local_standard_date  # noqa: E402
 from breezy.persistence.archive_cache import (  # noqa: E402
     IEM_ASOS_1MIN_SOURCE,
@@ -91,7 +104,14 @@ from breezy.persistence.archive_cache import (  # noqa: E402
     ArchiveRequest,
 )
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition  # noqa: E402
-from breezy.strategy.ladder_ev.quantile_density import Percentiles  # noqa: E402
+from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
+    CdfMethod,
+    Percentiles,
+    Rung,
+    build_cdf,
+    rung_probabilities,
+)
+from breezy.strategy.weather_common.probability import ForecastErrorModel  # noqa: E402
 
 __all__ = [
     "DEFAULT_ARCHIVE_ROOT",
@@ -99,17 +119,24 @@ __all__ = [
     "DEFAULT_SETTLEMENT_TRUTH_PARQUET",
     "QUALIFYING_CYCLE_HOURS",
     "TXN_VARIABLES",
+    "ComparatorJoinReport",
+    "ComparatorMatchedEvent",
     "HoldoutNotCoordinatorAuthorizedError",
     "JoinReport",
     "NbpPercentileWindow",
+    "RawMosTxnXnd",
     "build_arg_parser",
+    "build_comparator_matched_events",
     "build_version_rows",
     "complete_percentile_windows",
+    "daily_max_instants",
     "iter_nbp_derived_rows",
     "main",
     "mos_txn_coverage",
+    "mos_txn_xnd_by_cycle",
     "asos_1min_row_coverage",
     "read_settlement_truth_rows",
+    "run_comparator_validate",
     "run_validate",
     "station_registry",
 ]
@@ -175,6 +202,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory containing settlement_truth.parquet.",
     )
     parser.add_argument("--archive-root", type=Path, default=DEFAULT_ARCHIVE_ROOT)
+    parser.add_argument(
+        "--comparator-models",
+        action="store_true",
+        default=False,
+        help="Also run the SL-8c M0/M1/M2 + G2.0a comparator join. Opt-in: "
+        "unlike the coverage-only counts above, this fully parses the ASOS "
+        "1-minute archive, which is not cheap.",
+    )
     parser.add_argument("--out", type=Path, default=None)
     return parser
 
@@ -391,6 +426,43 @@ class JoinReport:
     asos_1min_rows_by_station: Mapping[str, int]
 
 
+def _select_d1_window(
+    group_windows: Sequence[NbpPercentileWindow],
+    *,
+    station: str,
+    cycle_runtime_ns: int,
+    offset: float,
+    target_day: dt.date,
+    gaps: Counter[str],
+) -> NbpPercentileWindow | None:
+    """The ONE shared explicit-D+1 selector (SL-8b review item 1). Reused by
+    BOTH `build_version_rows` and `build_comparator_matched_events` (SL-8c
+    rebase DRY directive, 2026-09-29) -- there is exactly one selector in
+    this module, never two independently-maintained copies. Returns the
+    window in ``group_windows`` whose own `climate_day_for_txn` (kind="max")
+    equals ``target_day``, or ``None`` if none does -- counting
+    ``period_kind_mismatch`` per non-matching window that raises
+    `ForecastValidPeriodError`, and ``no_d1_window`` once if nothing in the
+    group matches. Never falls back to "nearest"."""
+    for window in group_windows:
+        try:
+            window_climate_day = climate_day_for_txn(
+                icao=station,
+                runtime_ns=cycle_runtime_ns,
+                ftime_ns=window.valid_start_ns,
+                std_utc_offset_hours=offset,
+                model=window.nbm_version_era,
+                kind="max",
+            )
+        except ForecastValidPeriodError:
+            gaps["period_kind_mismatch"] += 1
+            continue
+        if window_climate_day == target_day:
+            return window
+    gaps["no_d1_window"] += 1
+    return None
+
+
 def build_version_rows(
     windows: Sequence[NbpPercentileWindow],
     settlement_by_station_day: Mapping[tuple[str, dt.date], SettlementTruthRow],
@@ -472,26 +544,15 @@ def build_version_rows(
 
         target_climate_day = local_standard_date(cycle_runtime_ns, offset) + dt.timedelta(days=1)
 
-        chosen: NbpPercentileWindow | None = None
-        for window in group_windows:
-            try:
-                window_climate_day = climate_day_for_txn(
-                    icao=station,
-                    runtime_ns=cycle_runtime_ns,
-                    ftime_ns=window.valid_start_ns,
-                    std_utc_offset_hours=offset,
-                    model=window.nbm_version_era,
-                    kind="max",
-                )
-            except ForecastValidPeriodError:
-                gaps["period_kind_mismatch"] += 1
-                continue
-            if window_climate_day == target_climate_day:
-                chosen = window
-                break
-
+        chosen = _select_d1_window(
+            group_windows,
+            station=station,
+            cycle_runtime_ns=cycle_runtime_ns,
+            offset=offset,
+            target_day=target_climate_day,
+            gaps=gaps,
+        )
         if chosen is None:
-            gaps["no_d1_window"] += 1
             continue
 
         climate_day = target_climate_day
@@ -590,6 +651,408 @@ def asos_1min_row_coverage(
 
 
 # ---------------------------------------------------------------------------
+# SL-8c: M0/M1 comparator models + G2.0a real-data wiring.
+#
+# Originally built as new functions only, alongside the (then still
+# "nearest window") `build_version_rows`. Rebased 2026-09-29 onto the SL-8b
+# review fix that made `build_version_rows` select explicitly via
+# `climate_day_for_txn`: `build_comparator_matched_events` below now shares
+# that SAME `_select_d1_window` selector (DRY -- one selector, not two).
+# Every event this section builds is still keyed on
+# `nbp_comparator_models.target_climate_day(cycle_runtime_ns, offset)` --
+# the D+1 day derived from the cycle's OWN publish instant -- never from a
+# percentile window's `valid_start_ns` alone.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RawMosTxnXnd:
+    """One (station, cycle) forecast's raw NBS TXN + XND, read straight off
+    the MOS CSV (SL-8c tasks 1/2). ``xnd_f`` is ``None`` when the column was
+    empty or non-numeric for every candidate row -- never imputed."""
+
+    txn_f: float
+    xnd_f: float | None
+
+
+_MOS_INSTANT_FORMATS: Final[tuple[str, ...]] = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%MZ",
+    "%Y-%m-%d",
+)
+
+
+def _parse_mos_instant(value: str) -> dt.datetime | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    for fmt in _MOS_INSTANT_FORMATS:
+        try:
+            return dt.datetime.strptime(stripped, fmt).replace(tzinfo=dt.UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def _mos_row_txn_xnd(row: MosTxnRow) -> tuple[float, float | None] | None:
+    if not row.txn_present:
+        return None
+    try:
+        txn_f = float(row.txn)
+    except ValueError:
+        return None
+    try:
+        xnd_f: float | None = float(row.xnd)
+    except ValueError:
+        xnd_f = None
+    return txn_f, xnd_f
+
+
+def mos_txn_xnd_by_cycle(
+    *, archive_root: Path, stations: Sequence[str] = _JOIN_STATIONS, model: str = "NBS"
+) -> dict[tuple[str, int], RawMosTxnXnd]:
+    """Real NBS TXN + XND per ``(station, cycle_runtime_ns)`` (SL-8c tasks
+    1/2), read-only from the on-disk IEM MOS archive cache -- never fetches.
+
+    For a cycle with multiple ftime rows carrying a populated ``txn``, the
+    NEAREST future ftime is kept (the daily-max forecast closest to the
+    cycle's own runtime) -- this selects WHICH raw row to read, never a
+    climate day; the day comes from :func:`~breezy.analysis
+    .nbp_comparator_models.target_climate_day` alone (coordinator directive).
+    """
+    cache = _read_only_archive_cache(IEM_MOS_SOURCE, archive_root=archive_root)
+    product = IEM_MOS_MODEL_PRODUCTS[model]
+    wanted = frozenset(stations)
+    best: dict[tuple[str, int], tuple[int, RawMosTxnXnd]] = {}
+    for entry in cache.entries(IEM_MOS_SOURCE):
+        if entry.station not in wanted or entry.product != product:
+            continue
+        request = ArchiveRequest(
+            source=IEM_MOS_SOURCE,
+            station=entry.station,
+            product=entry.product,
+            window_start=entry.window_start,
+            window_end=entry.window_end,
+            model=entry.model,
+        )
+        try:
+            body = cache.read(request)
+        except Exception:  # noqa: BLE001 - a partial backfill payload is a gap, not fatal
+            continue
+        for row in parse_mos_txn_rows(body.decode("utf-8", errors="replace")):
+            parsed = _mos_row_txn_xnd(row)
+            if parsed is None:
+                continue
+            runtime = _parse_mos_instant(row.runtime)
+            ftime = _parse_mos_instant(row.ftime)
+            if runtime is None or ftime is None or ftime < runtime:
+                continue
+            runtime_ns = int(runtime.timestamp()) * _NS_PER_SECOND
+            ftime_ns = int(ftime.timestamp()) * _NS_PER_SECOND
+            key = (entry.station, runtime_ns)
+            current = best.get(key)
+            if current is None or ftime_ns < current[0]:
+                best[key] = (ftime_ns, RawMosTxnXnd(txn_f=parsed[0], xnd_f=parsed[1]))
+    return {key: value[1] for key, value in best.items()}
+
+
+def daily_max_instants(
+    *, archive_root: Path, registry: StationRegistry, stations: Sequence[str] = _JOIN_STATIONS
+) -> dict[tuple[str, dt.date], DailyMaxInstant]:
+    """Real G2.0a daily-max LST instant per ``(settlement_station,
+    climate_day)`` (SL-8c task 3), read-only from the on-disk IEM ASOS
+    1-minute archive cache. ONE station-year entry is read and reduced to
+    its per-day maxima at a time -- bounded memory, mirroring
+    ``forecast_conditional_corpus.observations_from_asos_payload``'s own
+    streamed-reduce-then-drop shape. A station-day with no samples is simply
+    ABSENT from the returned mapping -- never imputed. Ties are resolved to
+    the FIRST occurrence by relying on the archive's own chronological row
+    order (the same convention `observations_from_asos_payload` uses: a
+    strict ``>`` comparison never lets a later, equal reading win).
+    """
+    cache = _read_only_archive_cache(IEM_ASOS_1MIN_SOURCE, archive_root=archive_root)
+    wanted = frozenset(stations)
+    result: dict[tuple[str, dt.date], DailyMaxInstant] = {}
+    for entry in cache.entries(IEM_ASOS_1MIN_SOURCE):
+        if entry.station not in wanted:
+            continue
+        settlement_station = registry.settlement_station_by_icao.get(entry.station)
+        offset = registry.std_utc_offset_hours_by_icao.get(entry.station)
+        if settlement_station is None or offset is None:
+            continue
+        request = ArchiveRequest(
+            source=IEM_ASOS_1MIN_SOURCE,
+            station=entry.station,
+            product=entry.product,
+            window_start=entry.window_start,
+            window_end=entry.window_end,
+            model=entry.model,
+        )
+        try:
+            body = cache.read(request)
+        except Exception:  # noqa: BLE001 - a partial backfill payload is a gap, not fatal
+            continue
+        running: dict[dt.date, tuple[int, float]] = {}
+        stream = io.TextIOWrapper(io.BytesIO(body), encoding="utf-8", newline="")
+        reader = csv.reader(stream)
+        try:
+            header = next(reader)
+            i_valid = header.index("valid(UTC)")
+            i_temp = header.index("tmpf")
+        except (StopIteration, ValueError):
+            continue
+        for raw_row in reader:
+            if len(raw_row) <= max(i_valid, i_temp):
+                continue
+            raw_temp = raw_row[i_temp].strip()
+            if not raw_temp or raw_temp == "M":
+                continue
+            try:
+                when = dt.datetime.strptime(
+                    raw_row[i_valid], "%Y-%m-%d %H:%M"
+                ).replace(tzinfo=dt.UTC)
+                value = float(raw_temp)
+            except ValueError:
+                continue
+            climate_day, seconds = lst_clock_time(when, std_utc_offset_hours=offset)
+            if value > running.get(climate_day, (0, -999.0))[1]:
+                running[climate_day] = (seconds, value)
+        for climate_day, (seconds, value) in running.items():
+            result[(settlement_station, climate_day)] = DailyMaxInstant(
+                station=settlement_station,
+                climate_day=climate_day,
+                lst_seconds_from_midnight=seconds,
+                value_f=value,
+                near_midnight=is_near_lst_midnight(seconds),
+            )
+    return result
+
+
+def _forecast_centered_ladder(center_f: int) -> tuple[Rung, ...]:
+    """A minimal 3-rung complete partition (plan S3.2 item 7): one 2 degF
+    interior rung ``[center, center+1]`` flanked by open tails, centered on
+    a FORECAST value -- never the settled outcome, which would leak the
+    outcome into rung selection. Every model in one matched event scores the
+    SAME ladder."""
+    return (
+        Rung("lt", None, center_f - 1),
+        Rung("mid", center_f, center_f + 1),
+        Rung("gte", center_f + 2, None),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ComparatorMatchedEvent:
+    """One D+1 rung event, scored under M0, M1 and M2 on the SAME rung
+    (SL-8c task 4). ``p_m2`` this slice is the NBP percentile bulletin's own
+    NORMAL(q50, sd) CDF, uncalibrated -- the hierarchical EMOS fit
+    (`breezy.analysis.nbp_calibration.fit_calibration`) is a later slice's
+    wiring; this keeps the three models comparable on one event now without
+    pre-empting that fit's own method choice (plan S9 Q1, still open)."""
+
+    station: str
+    climate_day: dt.date
+    split: str
+    p_m0: float
+    p_m1: float
+    p_m2: float
+    outcome: bool
+    near_midnight: bool | None
+    near_midnight_stratum: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ComparatorJoinReport:
+    windows_considered: int
+    non_qualifying_cycle_windows: int
+    unmapped_station_windows: int
+    period_kind_mismatch_windows: int
+    no_d1_window_cycles: int
+    holdout_excluded_windows: int
+    missing_settlement_rows: int
+    missing_raw_mos_rows: int
+    matched_events: int
+    n_by_split: Mapping[str, int]
+
+
+_NEAR_MIDNIGHT_STRATUM_OF_ICAO: Final[dict[str, str]] = {
+    icao: stratum for stratum, members in NEAR_MIDNIGHT_STRATA.items() for icao in members
+}
+
+
+def build_comparator_matched_events(
+    windows: Sequence[NbpPercentileWindow],
+    settlement_by_station_day: Mapping[tuple[str, dt.date], SettlementTruthRow],
+    mos_by_cycle: Mapping[tuple[str, int], RawMosTxnXnd],
+    daily_max_by_station_day: Mapping[tuple[str, dt.date], DailyMaxInstant],
+    frozen_0b_model: ForecastErrorModel,
+    *,
+    registry: StationRegistry,
+    splits: Splits = DEFAULT_SPLITS,
+) -> tuple[tuple[ComparatorMatchedEvent, ...], ComparatorJoinReport]:
+    """SL-8c task 4: per-event M0/M1/M2 probabilities + the G2.0a stratum
+    label, on the SAME matched events. Never opens the holdout -- every
+    event's ``climate_day`` is checked against ``splits.holdout_start``
+    exactly like `build_version_rows`.
+
+    **Explicit D+1 window selection, shared with `build_version_rows`
+    (SL-8c rebase DRY directive, 2026-09-29).** ``windows`` is grouped by
+    (station, cycle_runtime_ns) exactly like `build_version_rows`, and the
+    SAME `_select_d1_window` helper picks the one window per group whose own
+    `climate_day_for_txn` (kind="max") equals the cycle's explicit D+1
+    target -- never "whichever window happens to be in the list". There is
+    one selector in this module, not two.
+    """
+    windows_by_cycle: dict[tuple[str, int], list[NbpPercentileWindow]] = {}
+    for window in windows:
+        windows_by_cycle.setdefault((window.station, window.cycle_runtime_ns), []).append(window)
+
+    gaps: Counter[str] = Counter()
+    events: list[ComparatorMatchedEvent] = []
+    for (station, cycle_runtime_ns), group_windows in windows_by_cycle.items():
+        if _cycle_hour(cycle_runtime_ns) not in QUALIFYING_CYCLE_HOURS:
+            gaps["non_qualifying_cycle"] += 1
+            continue
+        offset = registry.std_utc_offset_hours_by_icao.get(station)
+        settlement_station = registry.settlement_station_by_icao.get(station)
+        if offset is None or settlement_station is None:
+            gaps["unmapped_station"] += 1
+            continue
+
+        climate_day = target_climate_day(cycle_runtime_ns, offset)
+
+        chosen = _select_d1_window(
+            group_windows,
+            station=station,
+            cycle_runtime_ns=cycle_runtime_ns,
+            offset=offset,
+            target_day=climate_day,
+            gaps=gaps,
+        )
+        if chosen is None:
+            continue
+
+        if climate_day >= splits.holdout_start:
+            gaps["holdout_excluded"] += 1
+            continue
+
+        settlement_row = settlement_by_station_day.get((settlement_station, climate_day))
+        if settlement_row is None or settlement_row.tmax_f is None:
+            gaps["missing_settlement"] += 1
+            continue
+
+        split = splits.split_for_date(climate_day)
+        if split == "holdout":  # pragma: no cover - defense in depth, unreachable above
+            gaps["holdout_excluded"] += 1
+            continue
+
+        raw_mos = mos_by_cycle.get((station, cycle_runtime_ns))
+        if raw_mos is None or raw_mos.xnd_f is None or raw_mos.xnd_f <= 0.0:
+            gaps["missing_raw_mos"] += 1
+            continue
+
+        center_f = round(chosen.percentiles.q50)
+        ladder = _forecast_centered_ladder(center_f)
+
+        p_m0 = m0_rung_probabilities(
+            txn_f=raw_mos.txn_f,
+            station=settlement_station,
+            climate_day=climate_day,
+            horizon_hours=M0_PRIMARY_LEAD_HOURS,
+            error_model=frozen_0b_model,
+            rungs=ladder,
+        )["mid"]
+        p_m1 = m1_rung_probabilities(
+            txn_mean_f=raw_mos.txn_f, xnd_sd_f=raw_mos.xnd_f, rungs=ladder
+        )["mid"]
+        # M2, this slice: the NBP percentile bulletin's own CDF, uncalibrated
+        # (see ComparatorMatchedEvent's docstring).
+        p_m2 = rung_probabilities(build_cdf(CdfMethod.NORMAL, chosen.percentiles), ladder)["mid"]
+
+        outcome = int(settlement_row.tmax_f) in (center_f, center_f + 1)
+        instant = daily_max_by_station_day.get((settlement_station, climate_day))
+        stratum = _NEAR_MIDNIGHT_STRATUM_OF_ICAO.get(station)
+
+        events.append(
+            ComparatorMatchedEvent(
+                station=settlement_station,
+                climate_day=climate_day,
+                split=split,
+                p_m0=p_m0,
+                p_m1=p_m1,
+                p_m2=p_m2,
+                outcome=outcome,
+                near_midnight=None if instant is None else instant.near_midnight,
+                near_midnight_stratum=(
+                    stratum if (instant is not None and instant.near_midnight) else None
+                ),
+            )
+        )
+
+    n_by_split: Counter[str] = Counter(event.split for event in events)
+    report = ComparatorJoinReport(
+        windows_considered=len(windows),
+        non_qualifying_cycle_windows=gaps.get("non_qualifying_cycle", 0),
+        unmapped_station_windows=gaps.get("unmapped_station", 0),
+        period_kind_mismatch_windows=gaps.get("period_kind_mismatch", 0),
+        no_d1_window_cycles=gaps.get("no_d1_window", 0),
+        holdout_excluded_windows=gaps.get("holdout_excluded", 0),
+        missing_settlement_rows=gaps.get("missing_settlement", 0),
+        missing_raw_mos_rows=gaps.get("missing_raw_mos", 0),
+        matched_events=len(events),
+        n_by_split=dict(n_by_split),
+    )
+    return tuple(events), report
+
+
+def run_comparator_validate(
+    *,
+    nbp_derived_root: Path,
+    settlement_truth_parquet: Path,
+    archive_root: Path,
+    frozen_0b_artefact_path: Path | None = None,
+    splits: Splits = DEFAULT_SPLITS,
+) -> tuple[tuple[ComparatorMatchedEvent, ...], ComparatorJoinReport]:
+    """SL-8c task 4 entry point: wires M0, M1, M2 and the G2.0a stratum
+    label into ONE real-data pass over the SAME sources `run_validate` reads
+    (never the holdout). Kept SEPARATE from `run_validate` itself
+    (coordinator directive) -- `main()` calls both."""
+    registry = station_registry()
+    resolved_frozen_path = (
+        frozen_0b_artefact_path
+        if frozen_0b_artefact_path is not None
+        else _REPO_ROOT / FROZEN_0B_ARTEFACT_RELPATH
+    )
+    frozen_0b_model = load_frozen_0b_error_model(resolved_frozen_path)
+
+    settlement_rows = read_settlement_truth_rows(
+        settlement_truth_parquet, climate_day_before=splits.holdout_start
+    )
+    settlement_by_station_day = _settlement_lookup(settlement_rows, holdout_start=splits.holdout_start)
+
+    all_windows: list[NbpPercentileWindow] = []
+    for _path, rows in iter_nbp_derived_rows(nbp_derived_root):
+        if rows is None:
+            continue
+        all_windows.extend(complete_percentile_windows(rows))
+
+    mos_by_cycle = mos_txn_xnd_by_cycle(archive_root=archive_root)
+    daily_max_by_station_day = daily_max_instants(archive_root=archive_root, registry=registry)
+
+    return build_comparator_matched_events(
+        all_windows,
+        settlement_by_station_day,
+        mos_by_cycle,
+        daily_max_by_station_day,
+        frozen_0b_model,
+        registry=registry,
+        splits=splits,
+    )
+
+
+# ---------------------------------------------------------------------------
 # The validate-stage run.
 # ---------------------------------------------------------------------------
 
@@ -658,6 +1121,21 @@ def _report_to_json_dict(report: JoinReport) -> dict[str, object]:
     }
 
 
+def _comparator_report_to_json_dict(report: ComparatorJoinReport) -> dict[str, object]:
+    return {
+        "windows_considered": report.windows_considered,
+        "non_qualifying_cycle_windows": report.non_qualifying_cycle_windows,
+        "unmapped_station_windows": report.unmapped_station_windows,
+        "period_kind_mismatch_windows": report.period_kind_mismatch_windows,
+        "no_d1_window_cycles": report.no_d1_window_cycles,
+        "holdout_excluded_windows": report.holdout_excluded_windows,
+        "missing_settlement_rows": report.missing_settlement_rows,
+        "missing_raw_mos_rows": report.missing_raw_mos_rows,
+        "matched_events": report.matched_events,
+        "n_by_split": dict(sorted(report.n_by_split.items())),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -679,6 +1157,17 @@ def main(argv: list[str] | None = None) -> int:
     import json
 
     payload = _report_to_json_dict(report)
+    if args.comparator_models:
+        # Opt-in: `daily_max_instants` fully parses the ASOS 1-minute
+        # archive (~367MB / 9.0M rows) rather than reading manifest row
+        # counts only, unlike every OTHER function `main()` calls by
+        # default -- so this stays off the default fast path (SL-8c).
+        _comparator_events, comparator_report = run_comparator_validate(
+            nbp_derived_root=args.nbp_derived_root,
+            settlement_truth_parquet=settlement_truth_parquet,
+            archive_root=args.archive_root,
+        )
+        payload["comparator_models"] = _comparator_report_to_json_dict(comparator_report)
     print(f"nbp_skill_study: stage=validate splits={DEFAULT_SPLITS!r}")
     print(json.dumps(payload, indent=2, sort_keys=True))
     if args.out is not None:
