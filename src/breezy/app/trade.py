@@ -39,6 +39,7 @@ from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
 from breezy.adapters.polymarket_us.transport import QUOTA_KEY_DISCOVERY
 from breezy.domain.climate_day import climate_day_for_instant
+from breezy.ingest.nbm_quantile_actor import NbmQuantileActor, NbmQuantileActorConfig
 from breezy.persistence.family_manifest import (
     FamilyManifest,
     FamilyManifestError,
@@ -80,6 +81,14 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
+)
+from breezy.strategy.forecast_quantile_ladder.composition import (
+    NoTradableForecastInstrumentsError,
+    build_forecast_quantile_ladder_strategies,
+)
+from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
+    FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
+    PersistentQuantileLadderLatch,
 )
 
 _VENUE = "polymarket_us"
@@ -515,6 +524,12 @@ def run(
             exit_manifest: FamilyManifest | None = None
             fee_drift_actor: FeeDriftProbeActor | None = None
             fee_drift_resolve_client: Callable[[Any], None] | None = None
+            #: SL-13: the `forecast_quantile_ladder` branch below is the only
+            #: one that ever populates this -- every other composition_kind
+            #: (including `fee_drift_actor` above) passes its own Actor(s)
+            #: through the `extra_actors` tuple at the `trade_cli.run` call
+            #: site unchanged, never through this list.
+            extra_actors: list[Any] = []
 
             if manifest.composition_kind == "current_rung_hold":
                 factory = make_trial_day_latch_factory(latch, family_id=manifest.family_id)
@@ -635,6 +650,73 @@ def run(
                     # permanently unverified -- safe, since nothing is
                     # tradable either way.
                     fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
+            elif manifest.composition_kind == "forecast_quantile_ladder":
+                # SL-13 (plan `FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29
+                # .md` §7 row SL-13, hypothesis H-FC-NBP-EV-2026-09): shadow-only
+                # wiring -- every manifest naming this composition_kind stays
+                # `DRAFT_NOT_REGISTERED` (see `deploy/families/pm_us_crh_fq_v1
+                # .json`), which `load_family_manifest` above refuses without
+                # `allow_draft=True` (never passed here), so this branch is
+                # unreachable from a production boot today. Kept real and
+                # tested (never a stub) so promoting a future REGISTERED
+                # manifest is a manifest + env act, never a source edit --
+                # exactly WP-11b's own cardinality-1 promotion contract.
+                #
+                # Same persistent-latch/halt-veto/permit-guard shape as the
+                # `continuous_rung_hold` branch above, reusing its own
+                # `open_trial_day_latch`/`family_halt_submit_veto` machinery
+                # unchanged -- only the key_prefix (this family's OWN durable
+                # namespace) and the latch ADAPTER (`PersistentQuantileLadderLatch`,
+                # matching `ForecastQuantileLadderStrategy`'s plain
+                # constructor-value `latch`, never a per-station factory --
+                # see `forecast_quantile_ladder.composition`'s docstring)
+                # differ.
+                forecast_halt_latch = open_trial_day_latch(
+                    latch,
+                    key_prefix=FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
+                    family_id=manifest.family_id,
+                )
+                halt_state = forecast_halt_latch.family_halt_state()
+                _boot_logger.info(
+                    "family_halt_state family_id=%s halted=%s source=%s legacy=%s",
+                    manifest.family_id,
+                    halt_state.halted,
+                    halt_state.source,
+                    halt_state.legacy,
+                )
+                submit_veto = family_halt_submit_veto(forecast_halt_latch)
+                exit_manifest = manifest
+                registry = default_registry()
+                station_icaos = tuple(
+                    registry.settlement_site(_VENUE, station).icao
+                    for station in today_by_station
+                )
+                nbm_actor = NbmQuantileActor(
+                    NbmQuantileActorConfig(station_icaos=station_icaos),
+                )
+                try:
+                    forecast_strategies, quantile_actor = build_forecast_quantile_ladder_strategies(
+                        catalog_root=catalog_root,
+                        today_by_station=today_by_station,
+                        latch=PersistentQuantileLadderLatch(forecast_halt_latch),
+                        # A single sha-pinned density artefact serves both the
+                        # point-calibrated CDF (`calibration_artefact.py`) and
+                        # the bootstrap-draw bounds (`artefact_bounds.py`) --
+                        # one manifest pin, `density_artefact_path`/
+                        # `density_artefact_sha256`, never two.
+                        calibration_artefact_path=str(manifest.density_artefact_path),
+                        calibration_artefact_sha256=manifest.density_artefact_sha256,
+                        bounds_artefact_path=str(manifest.density_artefact_path),
+                        bounds_artefact_sha256=manifest.density_artefact_sha256,
+                        order_submission_permit=sending_permit,
+                        phase0_permit_guard=sending_permit is None,
+                        submit_veto=submit_veto,
+                        required_fee_coefficient=float(manifest.taker_fee_coefficient),
+                    )
+                except NoTradableForecastInstrumentsError as exc:
+                    raise SettingsError(str(exc)) from exc
+                strategies.extend(forecast_strategies)
+                extra_actors.extend([quantile_actor, nbm_actor])
             elif manifest.composition_kind == "forecast_ladder":
                 # WP-14 has not landed: the strategy this composition_kind
                 # names does not exist yet. Refuse to boot rather than
@@ -660,7 +742,16 @@ def run(
             )
 
             def _after_build(node: Any) -> None:
-                install_current_rung_hold_refusal_watch(node, composed)
+                # SL-13: `install_current_rung_hold_refusal_watch` reads
+                # `.refusals`/`.diagnostics`/`.position_events`, attributes
+                # only `CurrentRungHoldStrategy`/`ContinuousRungHoldStrategy`
+                # carry -- a `forecast_quantile_ladder` boot's `composed`
+                # tuple holds `ForecastQuantileLadderStrategy` instances only
+                # (composition kinds are mutually exclusive per boot), so
+                # calling it unconditionally would crash every such boot.
+                if manifest.composition_kind in ("current_rung_hold", "continuous_rung_hold"):
+                    install_current_rung_hold_refusal_watch(node, composed)
+
                 # AUD-12b: resolved lazily, post-`build()`, because only
                 # then does `node.kernel`'s registered data client (and its
                 # `PolymarketUSDataClientConfig`) exist to share a transport
@@ -673,7 +764,8 @@ def run(
                 node_factory=node_factory,
                 stderr=out,
                 strategies=composed,
-                extra_actors=() if fee_drift_actor is None else (fee_drift_actor,),
+                extra_actors=tuple(extra_actors)
+                + (() if fee_drift_actor is None else (fee_drift_actor,)),
                 submit_intent_latch=latch,
                 after_build=_after_build,
                 live_trading_permit=live_trading_permit,

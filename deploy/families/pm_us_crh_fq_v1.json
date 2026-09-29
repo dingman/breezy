@@ -1,0 +1,19 @@
+{
+  "family_id": "pm_us_crh_fq_v1",
+  "venue": "polymarket_us",
+  "trial_id_prefix": "forecast_quantile_ladder/trial/pm_us_crh_fq_v1/",
+  "d0_climate_day": "2099-01-01",
+  "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_fq_v1.json",
+  "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "composition_kind": "forecast_quantile_ladder",
+  "density_artefact_path": "deploy/families/artefacts/not_yet_calibrated_forecast_density.json",
+  "density_artefact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "stations": [
+    "LAX",
+    "MDW",
+    "MIA",
+    "SFO"
+  ],
+  "taker_fee_coefficient": "0.0695",
+  "status": "DRAFT_NOT_REGISTERED"
+}

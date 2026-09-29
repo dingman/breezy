@@ -103,12 +103,20 @@ ManifestStatus = Literal["DRAFT_NOT_REGISTERED", "REGISTERED"]
 #: WP-11b (active-family registry, cardinality-1): which strategy builder a
 #: manifest dispatches to. ``forecast_ladder`` is wired here so the exact-set
 #: is complete, but its strategy does not exist yet -- a boot attempt refuses
-#: (``app/trade.py``) until WP-14 lands. Never a bool alongside another bool:
-#: this is the ONE slot that names the composition, matching the manifest's
-#: own cardinality-1 ``family_id``.
-CompositionKind = Literal["current_rung_hold", "continuous_rung_hold", "forecast_ladder"]
+#: (``app/trade.py``) until WP-14 lands. ``forecast_quantile_ladder`` (SL-13,
+#: plan `FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md` §7 row SL-13,
+#: hypothesis H-FC-NBP-EV-2026-09) DOES boot -- ``ForecastQuantileLadderStrategy``
+#: exists (SL-12) and is wired by ``app/trade.py`` -- but every manifest
+#: naming it committed so far stays ``DRAFT_NOT_REGISTERED`` (see
+#: ``deploy/families/pm_us_crh_fq_v1.json``), so it never becomes the sending
+#: family. Never a bool alongside another bool: this is the ONE slot that
+#: names the composition, matching the manifest's own cardinality-1
+#: ``family_id``.
+CompositionKind = Literal[
+    "current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"
+]
 _COMPOSITION_KINDS: Final[frozenset[str]] = frozenset(
-    {"current_rung_hold", "continuous_rung_hold", "forecast_ladder"}
+    {"current_rung_hold", "continuous_rung_hold", "forecast_ladder", "forecast_quantile_ladder"}
 )
 
 _REQUIRED_KEYS: Final[frozenset[str]] = frozenset(

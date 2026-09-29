@@ -162,6 +162,7 @@ COMPOSITION_KIND_SUBSCRIBED_MARKERS: Final[dict[str, str]] = {
     "current_rung_hold": "CurrentRungHoldStrategy subscribed",
     "continuous_rung_hold": "ContinuousRungHoldStrategy subscribed",
     "forecast_ladder": "ForecastLadderStrategy subscribed",
+    "forecast_quantile_ladder": "ForecastQuantileLadderStrategy subscribed",
 }
 #: Back-compat names for the two markers that existed before WP-11b --
 #: several call sites/tests reference these directly.
