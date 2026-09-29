@@ -44,6 +44,8 @@ from typing import Final
 
 import pytest
 
+from tests.support.host_python import resolve_sibling_entrypoint
+
 #: The strategy package under test.
 STRATEGY_PACKAGE: Final[Path] = (
     Path(__file__).resolve().parents[2] / "src" / "breezy" / "strategy"
@@ -119,7 +121,9 @@ def test_a_brand_new_strategy_module_keeps_the_import_contract(
     as well as the `.com`-adapter ban.
     """
     del generated_strategy
-    result = _run(str(REPO_ROOT / ".venv" / "bin" / "lint-imports"))
+    # WT-VENV: derived from the resolved interpreter's own `bin/`, not
+    # `REPO_ROOT` -- a worktree has no `.venv` of its own.
+    result = _run(str(resolve_sibling_entrypoint("lint-imports")))
 
     assert result.returncode == 0, result.stdout + result.stderr
 

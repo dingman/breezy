@@ -46,6 +46,8 @@ from typing import Final, Protocol
 
 import pytest
 
+from tests.support.host_python import resolve_sibling_entrypoint
+
 #: Repository root -- the working directory `lint-imports` must run from,
 #: since it reads `pyproject.toml` relative to it.
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -55,7 +57,10 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 #: contract without also tripping the LAYERS contract.
 _PROBE_PACKAGE: Final[Path] = REPO_ROOT / "src" / "breezy" / "runtime"
 
-_LINT_IMPORTS: Final[Path] = REPO_ROOT / ".venv" / "bin" / "lint-imports"
+#: WT-VENV: derived from the resolved interpreter's own `bin/`, not
+#: `REPO_ROOT` -- a worktree has no `.venv` of its own (see
+#: `tests/support/host_python.py`).
+_LINT_IMPORTS: Final[Path] = resolve_sibling_entrypoint("lint-imports")
 
 #: A brand-new module adopting a native, non-Polymarket Nautilus API. Under
 #: the old framework-wide ban this module broke `lint-imports` until somebody
