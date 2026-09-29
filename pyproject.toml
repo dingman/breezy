@@ -314,6 +314,7 @@ module = [
     "breezy.ingest.nws_actor",
     "breezy.ingest.nws_observation_actor",
     "breezy.ingest.nbm_forecast_actor",
+    "breezy.ingest.nbm_quantile_actor",
 ]
 disallow_subclassing_any = false
 
