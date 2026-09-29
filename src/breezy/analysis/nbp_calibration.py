@@ -25,6 +25,37 @@ NAME contains "lovo" or "kappa" refuses outright if handed a row tagged
 into that machinery -- so mutating a holdout-tagged row's values can never
 change the kappa choice or the fitted (a_v, gamma_v) (the "poisoned
 holdout" regression test pins this).
+
+**CRPS is shape-agnostic (review item 2).** Every CRPS this module computes
+against the ACTUAL chosen :class:`CdfMethod` (NORMAL, PCHIP_NORMAL_TAILS, or
+SKEW_NORMAL, plus the EMOS location-scale transform) goes through
+:func:`crps_numerical` -- deterministic numerical integration on a fixed
+0.1 degF grid over ``[Q50-40, Q50+40]`` (midpoint rule). :func:`crps_normal`
+(the closed-form Gneiting & Raftery formula) is kept ONLY as a test oracle
+for the NORMAL case -- no fitting or gate-scoring code path calls it.
+
+**Train-era versions (review item 4).** ``VersionRow.split == "train"`` rows
+are fitted unshrunk on their OWN version's train rows (plan S3.2 item 5's
+NBM version eras that predate the label gap -- v3.2/v4.0/v4.1/v4.2). They
+participate in the LEAVE-ONE-OUT POOLED MEAN used to shrink the
+validation/v5_fit_slice-era versions (v4.2's post-cutover tail, v4.3, v5.0),
+but the LOVO kappa-selection CURVE itself -- the first-half-fit/
+second-half-score CRPS loop that CHOOSES kappa -- still iterates only over
+the versions present in validation + the v5.0 fit slice (ruling S12 A-4):
+train rows are never a scored half.
+
+**The degenerate-SE convention (review item 5).** G2.0/G2.0a/G2.1's
+one-sample z-tests take their SE from a cluster bootstrap. When every
+drawn resample produces an IDENTICAL statistic (SE == 0) -- e.g. a
+one-cluster group, or every outcome in a bucket agreeing exactly -- a naive
+``z = diff / 0`` is undefined. This module's convention: a zero-variance
+bootstrap that still DISAGREES with the null (``observed != predicted``, or
+``mean != 0``) is treated as p=0 (reject) -- the STRONGEST possible
+evidence, not the weakest -- while a zero-variance bootstrap that agrees
+exactly is p=1 (never reject a perfect match). Every gate result that can
+hit this path carries a ``bootstrap_degenerate: bool`` field (``None`` on an
+``UNTESTED`` group) so the S2 evidence note can tell a bootstrap-degeneracy
+rejection apart from a substantive one.
 """
 
 from __future__ import annotations
@@ -42,6 +73,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Final, TypeVar
 
+from scipy.optimize import minimize, minimize_scalar
+
 from breezy.analysis.brier_decomposition import bin_by_value, resolution_difference
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
@@ -50,13 +83,16 @@ from breezy.strategy.ladder_ev.quantile_density import (
     Rung,
     apply_emos,
     build_cdf,
-    rung_probabilities,
+    rung_probability_interval,
 )
 
 __all__ = [
     "ARTEFACT_SCHEMA_VERSION",
     "BOOTSTRAP_ITERATIONS",
     "BOOTSTRAP_SEED",
+    "CRPS_GRID_HALF_WIDTH_F",
+    "CRPS_GRID_STEP_F",
+    "DEFAULT_BOOTSTRAP_DRAWS",
     "DEFAULT_SPLITS",
     "G20_MONTH_MIN_DATES",
     "G20_MONTH_N",
@@ -64,6 +100,7 @@ __all__ = [
     "G22_TARGET_DIFFERENCE_X",
     "KAPPA_GRID",
     "N_MIN_CEILING",
+    "NBM_VERSION_ERAS",
     "NEAR_MIDNIGHT_STRATA",
     "PMUS_INFEASIBLE_ROUTE_NODE4",
     "RELIABILITY_BUCKET_EDGES",
@@ -93,20 +130,24 @@ __all__ = [
     "SplitOrderError",
     "Splits",
     "StationDayResidual",
+    "VersionEmosDraws",
     "VersionEstimate",
     "VersionRow",
     "apply_correction_form",
     "artefact_json",
     "artefact_sha256",
+    "bootstrap_emos_draws",
     "cluster_bootstrap_draws",
     "compute_n_min",
     "crps_normal",
+    "crps_numerical",
     "evaluate_g20",
     "evaluate_g20a",
     "evaluate_g21",
     "evaluate_g22",
     "evaluate_g23",
     "fit_hierarchical_emos",
+    "fit_shared_delta",
     "fit_version_unshrunk",
     "holm_correction",
     "open_holdout",
@@ -331,19 +372,45 @@ class PrimaryHoldoutLeakError(RuntimeError):
     C-1 reevaluation input that must never see it."""
 
 
+BOOTSTRAP_ITERATIONS: Final[int] = 2000
+BOOTSTRAP_SEED: Final[int] = 20260929
+
+_ClusterItemT = TypeVar("_ClusterItemT")
+
+
+def _clusters(
+    items: Sequence[_ClusterItemT], key_fn: Callable[[_ClusterItemT], object]
+) -> list[list[_ClusterItemT]]:
+    grouped: dict[object, list[_ClusterItemT]] = {}
+    for item in items:
+        grouped.setdefault(key_fn(item), []).append(item)
+    return [grouped[key] for key in sorted(grouped, key=repr)]
+
+
+#: NBM version eras (plan S3.2 item 5), for documentation/reference only --
+#: this module never hardcodes which era a caller's ``VersionRow.version``
+#: belongs to, only whether its ``split`` is ``"train"`` (review item 4).
+NBM_VERSION_ERAS: Final[tuple[str, ...]] = ("v3.2", "v4.0", "v4.1", "v4.2", "v4.3", "v5.0")
+
+
 @dataclass(frozen=True, slots=True)
 class VersionRow:
-    """One station-day's NBP percentile summary versus CLI truth, tagged to
+    """One station-day's NBP percentile bulletin versus CLI truth, tagged to
     the NBM version whose bulletin produced it and to the split it falls in.
     ``split`` is one of ``"train"``, ``"validate"``, ``"v5_fit_slice"``, or
-    ``"holdout"`` (see :meth:`Splits.split_for_date`)."""
+    ``"holdout"`` (see :meth:`Splits.split_for_date`).
+
+    Carries the FULL ``Percentiles`` (not just ``q50``/``sd``) -- review item
+    2 requires CRPS to be scored against the actual chosen
+    :class:`CdfMethod` CDF (normal, PCHIP, or skew-normal), which needs every
+    percentile, not a two-parameter summary.
+    """
 
     version: str
     split: str
     station: str
     climate_day: dt.date
-    txn50_f: float
-    txn_sd_f: float
+    percentiles: Percentiles
     cli_tmax_f: float
 
 
@@ -355,38 +422,144 @@ class VersionEstimate:
     n: int
 
 
-def fit_version_unshrunk(rows: Sequence[VersionRow], *, delta: float) -> VersionEstimate:
-    """Closed-form point estimate of one version's ``(a_v, gamma_v)``.
-
-    ``a_v = mean(cli - txn50)`` (the bias). ``gamma_v`` is the
-    moment-matching value that makes the mean squared STANDARDIZED
-    residual -- ``residual / exp(gamma + delta * log(txn_sd))`` -- equal 1:
-    ``gamma_v = 0.5 * log(mean(residual_i^2 / txn_sd_i^(2*delta)))``.
-    """
-    if not rows:
-        raise ValueError("fit_version_unshrunk needs at least one row")
-    versions = {row.version for row in rows}
-    if len(versions) != 1:
-        raise ValueError(f"rows must all share one version, got {sorted(versions)!r}")
-    a_v = statistics.fmean(row.cli_tmax_f - row.txn50_f for row in rows)
-    ratios = [
-        ((row.cli_tmax_f - (row.txn50_f + a_v)) ** 2) / (row.txn_sd_f ** (2.0 * delta))
-        for row in rows
-    ]
-    mean_ratio = max(statistics.fmean(ratios), 1e-12)
-    gamma_v = 0.5 * math.log(mean_ratio)
-    return VersionEstimate(version=rows[0].version, a=a_v, gamma=gamma_v, n=len(rows))
-
-
 def crps_normal(mu: float, sigma: float, observed: float) -> float:
     """Closed-form CRPS of ``N(mu, sigma)`` against one observation
-    (Gneiting & Raftery 2007, eq. 5)."""
+    (Gneiting & Raftery 2007, eq. 5). Kept ONLY as a test oracle for the
+    NORMAL method -- no fitting or gate-scoring code in this module calls
+    it; use :func:`crps_numerical` for anything shape-agnostic (review item
+    2)."""
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, was {sigma!r}")
     z = (observed - mu) / sigma
     phi = math.exp(-0.5 * z * z) / _SQRT_2PI
     cdf = _std_normal_cdf(z)
     return sigma * (z * (2.0 * cdf - 1.0) + 2.0 * phi - _INV_SQRT_PI)
+
+
+#: Review item 2: a fixed 0.1 degF grid, +/-40 degF around each row's own Q50.
+CRPS_GRID_HALF_WIDTH_F: Final[float] = 40.0
+CRPS_GRID_STEP_F: Final[float] = 0.1
+
+
+def crps_numerical(
+    cdf: Callable[[float], float],
+    observed: float,
+    *,
+    center: float,
+    half_width: float = CRPS_GRID_HALF_WIDTH_F,
+    step: float = CRPS_GRID_STEP_F,
+) -> float:
+    """CRPS by deterministic numerical integration (review item 2):
+    ``integral (F(x) - 1{x >= observed})^2 dx`` via the midpoint rule on a
+    FIXED grid over ``[center-half_width, center+half_width]`` at ``step``
+    increments. Works for ANY monotone CDF callable -- normal, PCHIP, or
+    skew-normal (plus EMOS) -- unlike :func:`crps_normal`, which only
+    applies to a normal distribution.
+    """
+    if half_width <= 0.0:
+        raise ValueError(f"half_width must be positive, was {half_width!r}")
+    if step <= 0.0:
+        raise ValueError(f"step must be positive, was {step!r}")
+    lo = center - half_width
+    n_steps = max(1, round((2.0 * half_width) / step))
+    total = 0.0
+    for i in range(n_steps):
+        x_mid = lo + (i + 0.5) * step
+        indicator = 1.0 if x_mid >= observed else 0.0
+        total += (cdf(x_mid) - indicator) ** 2 * step
+    return total
+
+
+def fit_version_unshrunk(
+    rows: Sequence[VersionRow], *, method: CdfMethod, delta: float
+) -> VersionEstimate:
+    """Minimum-CRPS point estimate of one version's ``(a_v, gamma_v)`` (plan
+    S2.2; review item 1).
+
+    Starts at the closed-form moment-matching solution -- ``a0 = mean(cli -
+    q50)``; ``gamma0`` chosen so the mean squared STANDARDIZED residual
+    (``residual / exp(gamma + delta * log(sd))``) equals 1 -- then REFINES
+    it by minimising the TOTAL :func:`crps_numerical` of the calibrated
+    ``method`` CDF (:func:`~breezy.strategy.ladder_ev.quantile_density
+    .build_cdf` + :func:`~breezy.strategy.ladder_ev.quantile_density
+    .apply_emos`) against every row's CLI outcome, via a deterministic
+    Nelder-Mead descent (fixed start, fixed method, fixed tolerances -- no
+    randomness) from that moment-matching start.
+    """
+    if not rows:
+        raise ValueError("fit_version_unshrunk needs at least one row")
+    versions = {row.version for row in rows}
+    if len(versions) != 1:
+        raise ValueError(f"rows must all share one version, got {sorted(versions)!r}")
+
+    a0 = statistics.fmean(row.cli_tmax_f - row.percentiles.q50 for row in rows)
+    ratios = [
+        ((row.cli_tmax_f - (row.percentiles.q50 + a0)) ** 2) / (row.percentiles.sd ** (2.0 * delta))
+        for row in rows
+    ]
+    gamma0 = 0.5 * math.log(max(statistics.fmean(ratios), 1e-12))
+
+    # Each row's BASE cdf depends only on (method, percentiles) -- neither
+    # changes during the (a, gamma) search -- so it is built ONCE per row,
+    # not re-fit on every objective evaluation. For SKEW_NORMAL this avoids
+    # re-running its internal least-squares fit hundreds of times per call.
+    base_cdfs = [build_cdf(method, row.percentiles) for row in rows]
+
+    def total_crps(params: Sequence[float]) -> float:
+        a, gamma = params
+        total = 0.0
+        for row, base_cdf in zip(rows, base_cdfs, strict=True):
+            calibrated_cdf = apply_emos(base_cdf, row.percentiles, EmosParams(a=a, gamma=gamma, delta=delta))
+            total += crps_numerical(calibrated_cdf, row.cli_tmax_f, center=row.percentiles.q50)
+        return total
+
+    result = minimize(
+        total_crps,
+        x0=[a0, gamma0],
+        method="Nelder-Mead",
+        options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": 200},
+    )
+    a_v, gamma_v = float(result.x[0]), float(result.x[1])
+    return VersionEstimate(version=rows[0].version, a=a_v, gamma=gamma_v, n=len(rows))
+
+
+def fit_shared_delta(
+    rows_by_version: Mapping[str, Sequence[VersionRow]],
+    *,
+    method: CdfMethod,
+    bracket: tuple[float, float] = (0.1, 3.0),
+    xatol: float = 1e-3,
+) -> float:
+    """The shared delta, fitted by MINIMUM total CRPS across every version's
+    own rows (plan S2.2: "fitted by minimum CRPS on train"; review item 1).
+
+    For each candidate delta, every version in ``rows_by_version`` is refit
+    unshrunk via :func:`fit_version_unshrunk`, and the CRPS is summed across
+    ALL of every version's own rows; delta is chosen to minimise that total,
+    via a deterministic bounded scalar minimiser (fixed bracket, fixed
+    tolerance -- no randomness). Typically called with TRAIN rows (plan
+    S2.2), but takes whatever ``rows_by_version`` the caller supplies.
+    """
+    if not rows_by_version:
+        raise ValueError("fit_shared_delta needs at least one version's rows")
+
+    def total_crps_at(delta: float) -> float:
+        total = 0.0
+        for rows in rows_by_version.values():
+            estimate = fit_version_unshrunk(rows, method=method, delta=delta)
+            for row in rows:
+                calibrated_cdf = apply_emos(
+                    build_cdf(method, row.percentiles),
+                    row.percentiles,
+                    EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta),
+                )
+                total += crps_numerical(calibrated_cdf, row.cli_tmax_f, center=row.percentiles.q50)
+        return total
+
+    result = minimize_scalar(
+        total_crps_at, bounds=bracket, method="bounded", options={"xatol": xatol}
+    )
+    return float(result.x)
 
 
 def shrink_toward_lovo_pooled_mean(
@@ -452,6 +625,7 @@ def _assert_no_holdout_rows(rows_by_version: Mapping[str, Sequence[VersionRow]])
 def _select_by_lovo_crps(
     rows_by_version: Mapping[str, Sequence[VersionRow]],
     *,
+    method: CdfMethod,
     delta: float,
     grid: Sequence[float],
     weight_fn: Callable[[int, float], float],
@@ -460,7 +634,8 @@ def _select_by_lovo_crps(
     if len(rows_by_version) < 2:
         raise ValueError("LOVO selection needs at least two versions")
     unshrunk = {
-        version: fit_version_unshrunk(rows, delta=delta) for version, rows in rows_by_version.items()
+        version: fit_version_unshrunk(rows, method=method, delta=delta)
+        for version, rows in rows_by_version.items()
     }
     curve: list[KappaScore] = []
     for param in grid:
@@ -477,15 +652,19 @@ def _select_by_lovo_crps(
                 continue
             pooled_a = sum(other.a * other.n for other in others) / total_n
             pooled_gamma = sum(other.gamma * other.n for other in others) / total_n
-            first_half_estimate = fit_version_unshrunk(first_half, delta=delta)
+            first_half_estimate = fit_version_unshrunk(first_half, method=method, delta=delta)
             w = weight_fn(first_half_estimate.n, param)
             shrunk_a = w * first_half_estimate.a + (1.0 - w) * pooled_a
             shrunk_gamma = w * first_half_estimate.gamma + (1.0 - w) * pooled_gamma
             scores = [
-                crps_normal(
-                    row.txn50_f + shrunk_a,
-                    math.exp(shrunk_gamma + delta * math.log(row.txn_sd_f)),
+                crps_numerical(
+                    apply_emos(
+                        build_cdf(method, row.percentiles),
+                        row.percentiles,
+                        EmosParams(a=shrunk_a, gamma=shrunk_gamma, delta=delta),
+                    ),
                     row.cli_tmax_f,
+                    center=row.percentiles.q50,
                 )
                 for row in second_half
             ]
@@ -501,23 +680,31 @@ def _select_by_lovo_crps(
 def select_kappa_by_lovo_crps(
     rows_by_version: Mapping[str, Sequence[VersionRow]],
     *,
+    method: CdfMethod,
     delta: float,
     grid: Sequence[float] = KAPPA_GRID,
 ) -> KappaSelection:
     """LOVO first-half-fit / second-half-score CRPS kappa selection (plan
-    S2.2; ruling S12 A-4). Refuses any holdout-tagged input row."""
+    S2.2; ruling S12 A-4). Scores CRPS against the ACTUAL ``method`` CDF
+    (review item 2) via :func:`crps_numerical`. Refuses any holdout-tagged
+    input row. ``rows_by_version`` must hold only the versions present in
+    validation + the v5.0 fit slice (ruling S12 A-4) -- train-era versions
+    never enter this scoring loop (review item 4); they still shape the
+    pooled mean used here only insofar as :func:`fit_hierarchical_emos`
+    seeds ``pooled_a``/``pooled_gamma`` -- see that function's docstring."""
 
     def weight_fn(n: int, kappa: float) -> float:
         if kappa == math.inf:
             return 0.0
         return n / (n + kappa)
 
-    return _select_by_lovo_crps(rows_by_version, delta=delta, grid=grid, weight_fn=weight_fn)
+    return _select_by_lovo_crps(rows_by_version, method=method, delta=delta, grid=grid, weight_fn=weight_fn)
 
 
 def tau_fraction_sensitivity(
     rows_by_version: Mapping[str, Sequence[VersionRow]],
     *,
+    method: CdfMethod,
     delta: float,
     grid: Sequence[float] = TAU_GRID,
 ) -> KappaSelection:
@@ -526,48 +713,178 @@ def tau_fraction_sensitivity(
     def weight_fn(_n: int, tau: float) -> float:
         return tau
 
-    return _select_by_lovo_crps(rows_by_version, delta=delta, grid=grid, weight_fn=weight_fn)
+    return _select_by_lovo_crps(rows_by_version, method=method, delta=delta, grid=grid, weight_fn=weight_fn)
+
+
+#: Review item 3: B seeded station-day cluster-bootstrap draws per version.
+DEFAULT_BOOTSTRAP_DRAWS: Final[int] = 200
+
+
+@dataclass(frozen=True, slots=True)
+class VersionEmosDraws:
+    """One version's :class:`EmosParams` point estimate plus its bootstrap
+    draws (review item 3)."""
+
+    version: str
+    point: EmosParams
+    draws: tuple[EmosParams, ...]
+
+
+def _bootstrap_version_emos_draws(
+    rows: Sequence[VersionRow],
+    *,
+    method: CdfMethod,
+    delta: float,
+    seed: int,
+    draws: int,
+) -> tuple[EmosParams, ...]:
+    """``draws`` seeded station-day cluster-bootstrap refits of ``(a_v,
+    gamma_v)`` for ONE version, each carrying the SAME shared ``delta``.
+
+    Delta is not itself resampled per draw: it is fitted on a much larger
+    pooled corpus (:func:`fit_shared_delta`, typically over train rows), so
+    its own sampling uncertainty is not what a per-version interval is
+    meant to capture -- only ``(a_v, gamma_v)``'s per-version uncertainty is
+    resampled here (documented design choice, review item 3).
+    """
+    blocks = _clusters(rows, lambda row: (row.station, row.climate_day))
+    if not blocks:
+        raise ValueError("cannot bootstrap zero rows")
+    rng = random.Random(seed)
+    out: list[EmosParams] = []
+    for _ in range(draws):
+        drawn: list[VersionRow] = []
+        for _ in range(len(blocks)):
+            drawn.extend(blocks[rng.randrange(len(blocks))])
+        estimate = fit_version_unshrunk(drawn, method=method, delta=delta)
+        out.append(EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta))
+    return tuple(out)
+
+
+def bootstrap_emos_draws(
+    rows_by_version: Mapping[str, Sequence[VersionRow]],
+    shrunk_by_version: Mapping[str, VersionEstimate],
+    *,
+    method: CdfMethod,
+    delta: float,
+    seed: int = BOOTSTRAP_SEED,
+    draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+) -> dict[str, VersionEmosDraws]:
+    """``draws`` seeded station-day cluster-bootstrap draws of ``(a_v,
+    gamma_v, delta)`` per version (review item 3), replacing the previous
+    degenerate ``(p, p)`` artefact bound.
+
+    A version with no rows of its own in ``rows_by_version`` (e.g. it has
+    only train rows, already unshrunk and used purely as pooled-mean input)
+    gets ``draws`` copies of its own point estimate -- there is no
+    resampling population for it, so its interval collapses to the point,
+    which is honest rather than fabricated spread.
+    """
+    result: dict[str, VersionEmosDraws] = {}
+    for index, (version, estimate) in enumerate(sorted(shrunk_by_version.items())):
+        point = EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta)
+        rows = rows_by_version.get(version)
+        if not rows:
+            result[version] = VersionEmosDraws(version=version, point=point, draws=(point,) * draws)
+            continue
+        version_draws = _bootstrap_version_emos_draws(
+            rows, method=method, delta=delta, seed=seed + index, draws=draws
+        )
+        result[version] = VersionEmosDraws(version=version, point=point, draws=version_draws)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
 class HierarchicalEmosResult:
+    method: CdfMethod
     delta: float
     kappa_selection: KappaSelection
     tau_sensitivity: KappaSelection
     shrunk_by_version: Mapping[str, VersionEstimate]
+    draws_by_version: Mapping[str, VersionEmosDraws]
 
 
-def fit_hierarchical_emos(all_rows: Sequence[VersionRow], *, delta: float) -> HierarchicalEmosResult:
-    """Fit + precision-weight-shrink ``(a_v, gamma_v)`` for every version.
+def fit_hierarchical_emos(
+    all_rows: Sequence[VersionRow],
+    *,
+    method: CdfMethod,
+    delta: float,
+    bootstrap_draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
+) -> HierarchicalEmosResult:
+    """Fit + precision-weight-shrink ``(a_v, gamma_v)`` for every version,
+    train-era versions included (review item 4), plus their bootstrap draws
+    (review item 3).
 
     ``all_rows`` may carry rows from EVERY split, holdout included -- rows
     tagged ``split == "holdout"`` are filtered out before anything
-    downstream (kappa selection, the unshrunk fit, the pooled mean) ever
+    downstream (kappa selection, every unshrunk fit, the pooled mean) ever
     sees them, so mutating a holdout-tagged row's values in ``all_rows``
     can never change this function's output.
+
+    **Train-era versions (review item 4).** Rows tagged ``split ==
+    "train"`` are grouped by version and fitted UNSHRUNK on their own train
+    rows -- they have abundant data and need no shrinkage. Their fitted
+    estimates are folded into the ``unshrunk`` pool alongside the
+    validation/v5_fit_slice-era versions, so they PARTICIPATE in the
+    leave-one-out pooled mean used to shrink those other versions. But
+    :func:`select_kappa_by_lovo_crps`'s scoring loop -- which CHOOSES kappa
+    -- receives only the validation/v5_fit_slice ``rows_by_version`` (ruling
+    S12 A-4): train rows are never a scored half.
     """
+    train_rows = [row for row in all_rows if row.split == "train"]
     fit_rows = [row for row in all_rows if row.split in ("validate", "v5_fit_slice")]
     if not fit_rows:
         raise ValueError("fit_hierarchical_emos needs at least one validate/v5_fit_slice row")
+
+    train_by_version: dict[str, list[VersionRow]] = {}
+    for row in train_rows:
+        train_by_version.setdefault(row.version, []).append(row)
+
     rows_by_version: dict[str, list[VersionRow]] = {}
     for row in fit_rows:
         rows_by_version.setdefault(row.version, []).append(row)
-    kappa_selection = select_kappa_by_lovo_crps(rows_by_version, delta=delta)
-    tau_selection = tau_fraction_sensitivity(rows_by_version, delta=delta)
-    unshrunk = {
-        version: fit_version_unshrunk(rows, delta=delta) for version, rows in rows_by_version.items()
+
+    kappa_selection = select_kappa_by_lovo_crps(rows_by_version, method=method, delta=delta)
+    tau_selection = tau_fraction_sensitivity(rows_by_version, method=method, delta=delta)
+
+    unshrunk: dict[str, VersionEstimate] = {
+        version: fit_version_unshrunk(rows, method=method, delta=delta)
+        for version, rows in train_by_version.items()
     }
+    unshrunk.update(
+        {
+            version: fit_version_unshrunk(rows, method=method, delta=delta)
+            for version, rows in rows_by_version.items()
+        }
+    )
+
     shrunk: dict[str, VersionEstimate] = {}
-    for version, estimate in unshrunk.items():
+    for version in train_by_version:
+        # Train-era: abundant data, reported unshrunk (review item 4).
+        shrunk[version] = unshrunk[version]
+    for version in rows_by_version:
         others = [other for v, other in unshrunk.items() if v != version]
         shrunk[version] = shrink_toward_lovo_pooled_mean(
-            estimate, others, kappa=kappa_selection.chosen_kappa
+            unshrunk[version], others, kappa=kappa_selection.chosen_kappa
         )
+
+    draws_by_version = bootstrap_emos_draws(
+        rows_by_version,
+        shrunk,
+        method=method,
+        delta=delta,
+        seed=bootstrap_seed,
+        draws=bootstrap_draws,
+    )
+
     return HierarchicalEmosResult(
+        method=method,
         delta=delta,
         kappa_selection=kappa_selection,
         tau_sensitivity=tau_selection,
         shrunk_by_version=shrunk,
+        draws_by_version=draws_by_version,
     )
 
 
@@ -650,21 +967,6 @@ def holm_correction(
     return out
 
 
-BOOTSTRAP_ITERATIONS: Final[int] = 2000
-BOOTSTRAP_SEED: Final[int] = 20260929
-
-_ClusterItemT = TypeVar("_ClusterItemT")
-
-
-def _clusters(
-    items: Sequence[_ClusterItemT], key_fn: Callable[[_ClusterItemT], object]
-) -> list[list[_ClusterItemT]]:
-    grouped: dict[object, list[_ClusterItemT]] = {}
-    for item in items:
-        grouped.setdefault(key_fn(item), []).append(item)
-    return [grouped[key] for key in sorted(grouped, key=repr)]
-
-
 def cluster_bootstrap_draws(
     items: Sequence[_ClusterItemT],
     *,
@@ -704,10 +1006,13 @@ def percentile_interval(draws: Sequence[float], *, alpha: float = 0.05) -> tuple
 
 def _cluster_mean_p_value(
     rows: Sequence[StationDayResidual], *, seed: int, iterations: int
-) -> tuple[float, float]:
+) -> tuple[float, float, bool]:
     """One-sample two-sided test of ``mean(residual) != 0``, with the SE
     taken from the date-clustered bootstrap (plan G2.0: "Clustering is by
-    date")."""
+    date"). Returns ``(mean, p_value, bootstrap_degenerate)`` -- the
+    degenerate-SE convention (module docstring, review item 5): a
+    zero-variance bootstrap that still disagrees with the null is p=0
+    (reject); one that agrees exactly is p=1."""
     mean = statistics.fmean(row.residual_f for row in rows)
     draws = cluster_bootstrap_draws(
         rows,
@@ -718,10 +1023,10 @@ def _cluster_mean_p_value(
     )
     se = statistics.pstdev(draws) if len(draws) > 1 else 0.0
     if se <= 0.0:
-        return mean, (0.0 if mean != 0.0 else 1.0)
+        return mean, (0.0 if mean != 0.0 else 1.0), True
     z = mean / se
     p = 2.0 * (1.0 - _std_normal_cdf(abs(z)))
-    return mean, p
+    return mean, p, False
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +1064,10 @@ class G20GroupResult:
     mean_residual_f: float | None
     p_value: float | None
     holm_rejected: bool | None
+    #: True iff this group's p-value came from a zero-variance (degenerate)
+    #: bootstrap -- None for an UNTESTED group (review item 5; module
+    #: docstring "The degenerate-SE convention").
+    bootstrap_degenerate: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -806,16 +1115,19 @@ def _evaluate_residual_groups(
                 mean_residual_f=None,
                 p_value=None,
                 holm_rejected=None,
+                bootstrap_degenerate=None,
             )
         else:
             testable[key] = rows
 
     p_values: dict[str, float] = {}
     means: dict[str, float] = {}
+    degenerate: dict[str, bool] = {}
     for key, rows in testable.items():
-        mean, p_value = _cluster_mean_p_value(rows, seed=seed, iterations=iterations)
+        mean, p_value, is_degenerate = _cluster_mean_p_value(rows, seed=seed, iterations=iterations)
         means[key] = mean
         p_values[key] = p_value
+        degenerate[key] = is_degenerate
 
     holm = holm_correction(p_values, alpha=alpha) if p_values else {}
     for key, rows in testable.items():
@@ -829,6 +1141,7 @@ def _evaluate_residual_groups(
             mean_residual_f=means[key],
             p_value=p_values[key],
             holm_rejected=bool(entry["rejected"]),
+            bootstrap_degenerate=degenerate[key],
         )
     return tuple(results[key] for key in groups)
 
@@ -917,6 +1230,11 @@ class G21BucketResult:
     z: float
     p_value: float
     holm_rejected: bool
+    #: True iff this bucket's p-value came from a zero-variance (degenerate)
+    #: bootstrap (review item 5; module docstring "The degenerate-SE
+    #: convention"). Every populated bucket is tested, so unlike
+    #: :class:`G20GroupResult` this is never None.
+    bootstrap_degenerate: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -948,7 +1266,7 @@ def evaluate_g21(
     if not bucketed:
         return G21Result(buckets=(), passed=True)
 
-    stats: dict[tuple[float, float], tuple[float, float, float]] = {}
+    stats: dict[tuple[float, float], tuple[float, float, float, bool]] = {}
     p_values: dict[str, float] = {}
     for key, members in bucketed.items():
         predicted = statistics.fmean(event.p_model for event in members)
@@ -967,20 +1285,23 @@ def evaluate_g21(
             # A zero-variance bootstrap (e.g. every drawn outcome identical)
             # is the STRONGEST possible evidence when it still disagrees with
             # `predicted` -- treat it as p=0 (reject), not p=1 (mirrors
-            # `_cluster_mean_p_value`'s own degenerate-SE convention).
+            # `_cluster_mean_p_value`'s own degenerate-SE convention; module
+            # docstring "The degenerate-SE convention", review item 5).
             z = 0.0 if observed == predicted else math.inf
             p_value = 1.0 if observed == predicted else 0.0
+            is_degenerate = True
         else:
             z = (observed - predicted) / se
             p_value = 2.0 * (1.0 - _std_normal_cdf(abs(z)))
-        stats[key] = (predicted, observed, z)
+            is_degenerate = False
+        stats[key] = (predicted, observed, z, is_degenerate)
         p_values[f"{key[0]:.1f}_{key[1]:.1f}"] = p_value
 
     holm = holm_correction(p_values, alpha=alpha)
     buckets = []
     for key in bucketed:
         label = f"{key[0]:.1f}_{key[1]:.1f}"
-        predicted, observed, z = stats[key]
+        predicted, observed, z, is_degenerate = stats[key]
         entry = holm[label]
         buckets.append(
             G21BucketResult(
@@ -992,6 +1313,7 @@ def evaluate_g21(
                 z=z,
                 p_value=p_values[label],
                 holm_rejected=bool(entry["rejected"]),
+                bootstrap_degenerate=is_degenerate,
             )
         )
     passed = not any(bucket.holm_rejected for bucket in buckets)
@@ -1173,19 +1495,21 @@ ARTEFACT_SCHEMA_VERSION: Final[int] = 1
 def rung_bounds_from_calibration(
     percentiles: Percentiles,
     cdf_method: CdfMethod,
-    emos: EmosParams,
+    draws: Sequence[EmosParams],
     rungs: Sequence[Rung],
-) -> dict[str, tuple[float, float]]:
-    """The artefact's ``p_lower``/``p_upper`` per rung: the calibrated rung
-    probability, reported today as a degenerate ``(p, p)`` bound -- a
-    bootstrap-widened interval is a later slice's job; this module emits
-    the SHAPE the artefact promises (plan S7 row SL-8) via
-    ``breezy.strategy.ladder_ev.quantile_density``.
+    *,
+    level: float = 0.95,
+) -> dict[str, tuple[float, float, float]]:
+    """The artefact's per-rung ``(p_point, p_lower, p_upper)`` (review item
+    3: a degenerate ``(p, p)`` bound is no longer sufficient for any
+    ``ev_net`` consumer). A thin wrapper over
+    ``breezy.strategy.ladder_ev.quantile_density.rung_probability_interval``
+    -- that function lives in the strategy layer (importable from the live
+    trading path), not here, per the layers contract (`pyproject.toml`):
+    ``breezy.analysis`` may reach DOWN into ``breezy.strategy``, never the
+    reverse.
     """
-    base_cdf = build_cdf(cdf_method, percentiles)
-    calibrated_cdf = apply_emos(base_cdf, percentiles, emos)
-    probabilities = rung_probabilities(calibrated_cdf, rungs)
-    return {rung_id: (probability, probability) for rung_id, probability in probabilities.items()}
+    return rung_probability_interval(percentiles, cdf_method, draws, rungs, level=level)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1196,10 +1520,20 @@ class NbpCalibrationArtefact:
     correction_form: str
     delta: float
     kappa: float
+    #: Point estimate ``(a_v, gamma_v)`` per version -- ``delta`` (shared)
+    #: is recorded once, at ``delta`` above, not repeated per version.
     emos_params_by_version: Mapping[str, tuple[float, float]]
+    #: B seeded bootstrap draws of ``(a_v, gamma_v)`` per version (review
+    #: item 3) -- same shared-``delta`` convention as
+    #: ``emos_params_by_version``. Consumed by
+    #: ``breezy.strategy.ladder_ev.quantile_density.rung_probability_interval``
+    #: after reconstructing each draw's :class:`EmosParams` with this
+    #: artefact's own ``delta``.
+    emos_draws_by_version: Mapping[str, tuple[tuple[float, float], ...]]
     n_min: int
     sigma_d: float
-    rung_probability_bounds: Mapping[str, tuple[float, float]]
+    #: Per-rung ``(p_point, p_lower, p_upper)`` (review item 3).
+    rung_probability_bounds: Mapping[str, tuple[float, float, float]]
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -1213,11 +1547,15 @@ class NbpCalibrationArtefact:
                 version: [a, gamma]
                 for version, (a, gamma) in sorted(self.emos_params_by_version.items())
             },
+            "emos_draws_by_version": {
+                version: [[a, gamma] for a, gamma in draws]
+                for version, draws in sorted(self.emos_draws_by_version.items())
+            },
             "n_min": self.n_min,
             "sigma_d": self.sigma_d,
             "rung_probability_bounds": {
-                rung_id: [lo, hi]
-                for rung_id, (lo, hi) in sorted(self.rung_probability_bounds.items())
+                rung_id: [point, lower, upper]
+                for rung_id, (point, lower, upper) in sorted(self.rung_probability_bounds.items())
             },
         }
 

@@ -42,6 +42,7 @@ from breezy.strategy.ladder_ev.quantile_density import (
     apply_emos,
     build_cdf,
     rung_probabilities,
+    rung_probability_interval,
 )
 
 assert RUNG_IDS == ("lt", "i0", "i1", "i2", "i3", "gte")  # reused below (§9 Q1 reuse note)
@@ -444,3 +445,57 @@ def test_cdf_method_is_a_closed_enum_of_three() -> None:
         "PCHIP_NORMAL_TAILS",
         "SKEW_NORMAL",
     }
+
+
+# ---------------------------------------------------------------------------
+# rung_probability_interval (SL-8 review item 3)
+# ---------------------------------------------------------------------------
+
+
+def _emos_draws(deltas_a: Sequence[float], *, gamma: float = 0.0, delta: float = 1.0) -> tuple[EmosParams, ...]:
+    return tuple(EmosParams(a=a, gamma=gamma, delta=delta) for a in deltas_a)
+
+
+def test_rung_probability_interval_refuses_zero_draws() -> None:
+    with pytest.raises(ValueError, match="draw"):
+        rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, (), _HAND_LADDER)
+
+
+def test_rung_probability_interval_refuses_a_level_outside_unit_interval() -> None:
+    draws = _emos_draws([0.0, 0.5, -0.5])
+    with pytest.raises(ValueError, match="level"):
+        rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, draws, _HAND_LADDER, level=1.5)
+
+
+def test_rung_probability_interval_contains_the_point_estimate() -> None:
+    # A spread of `a` shifts around 0.0 -- the identity transform is the
+    # middle draw, so its own rung probabilities are a natural in-range check.
+    draws = _emos_draws([-2.0, -1.0, 0.0, 1.0, 2.0])
+    result = rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, draws, _HAND_LADDER)
+    for rung_id, (point, lower, upper) in result.items():
+        assert lower <= point <= upper, rung_id
+
+
+def test_rung_probability_interval_width_shrinks_as_draw_spread_shrinks() -> None:
+    wide_draws = _emos_draws([-5.0, -2.5, 0.0, 2.5, 5.0])
+    narrow_draws = _emos_draws([-0.5, -0.25, 0.0, 0.25, 0.5])
+    wide = rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, wide_draws, _HAND_LADDER)
+    narrow = rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, narrow_draws, _HAND_LADDER)
+    for rung_id in wide:
+        wide_width = wide[rung_id][2] - wide[rung_id][1]
+        narrow_width = narrow[rung_id][2] - narrow[rung_id][1]
+        assert narrow_width <= wide_width, rung_id
+
+
+def test_rung_probability_interval_is_deterministic_under_repeated_calls() -> None:
+    draws = _emos_draws([-2.0, -1.0, 0.0, 1.0, 2.0])
+    first = rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, draws, _HAND_LADDER)
+    second = rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, draws, _HAND_LADDER)
+    assert first == second
+
+
+def test_rung_probability_interval_sums_the_point_estimate_to_one() -> None:
+    draws = _emos_draws([-1.0, 0.0, 1.0])
+    result = rung_probability_interval(_TYPICAL_PERCENTILES, CdfMethod.NORMAL, draws, _HAND_LADDER)
+    total_point = sum(point for point, _lower, _upper in result.values())
+    assert total_point == pytest.approx(1.0, abs=1e-9)

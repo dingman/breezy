@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -63,6 +64,7 @@ __all__ = [
     "apply_emos",
     "build_cdf",
     "rung_probabilities",
+    "rung_probability_interval",
 ]
 
 #: Logging only (never file/network I/O, never read back): observability for
@@ -385,3 +387,56 @@ def rung_probabilities(cdf: Callable[[float], float], rungs: Sequence[Rung]) -> 
     if abs(total - 1.0) > 1e-12:
         raise ValueError(f"rung probabilities sum to {total!r}, not 1 within 1e-12")
     return probabilities
+
+
+def rung_probability_interval(
+    percentiles: Percentiles,
+    method: CdfMethod,
+    draws: Sequence[EmosParams],
+    rungs: Sequence[Rung],
+    *,
+    level: float = 0.95,
+) -> dict[str, tuple[float, float, float]]:
+    """Per-rung ``(p_point, p_lower, p_upper)`` from a set of bootstrap EMOS
+    parameter draws (SL-8 review item 3).
+
+    ``draws`` are produced elsewhere -- ``breezy.analysis.nbp_calibration``
+    builds them via a seeded station-day cluster bootstrap of ``(a_v,
+    gamma_v)`` per NBM version -- this module only EVALUATES rung
+    probabilities under each draw and takes the percentile interval, the
+    same "fitting happens elsewhere, this module only applies" boundary
+    :func:`apply_emos` already keeps (module docstring). This is deliberate:
+    ``breezy.analysis`` may reach DOWN into ``breezy.strategy``
+    (`pyproject.toml` layers contract), but never the reverse, so the
+    live-strategy-importable interval function has to live here, not there.
+
+    ``p_point`` is the MEAN of the per-draw rung probabilities -- not a
+    separately-fitted point estimate -- so it is deterministic given
+    ``draws`` alone, and (by linearity: every draw's own rung probabilities
+    already sum to 1, so their mean across rungs sums to 1 too) the returned
+    ``p_point`` values sum to 1 exactly, which a per-rung MEDIAN would not
+    guarantee. ``p_lower``/``p_upper`` are the ``level``-percentile interval
+    of the same per-draw values (``level=0.95`` -> 2.5/97.5).
+
+    Raises :class:`ValueError` for an empty ``draws`` or a ``level`` outside
+    ``(0.0, 1.0)``.
+    """
+    if not draws:
+        raise ValueError("rung_probability_interval needs at least one draw")
+    if not (0.0 < level < 1.0):
+        raise ValueError(f"level must be in (0.0, 1.0), was {level!r}")
+    base_cdf = build_cdf(method, percentiles)
+    per_rung_draws: dict[str, list[float]] = {rung.rung_id: [] for rung in rungs}
+    for draw in draws:
+        calibrated_cdf = apply_emos(base_cdf, percentiles, draw)
+        for rung_id, probability in rung_probabilities(calibrated_cdf, rungs).items():
+            per_rung_draws[rung_id].append(probability)
+    alpha = 1.0 - level
+    result: dict[str, tuple[float, float, float]] = {}
+    for rung_id, values in per_rung_draws.items():
+        ordered = sorted(values)
+        lower = ordered[max(0, math.floor((alpha / 2.0) * len(ordered)))]
+        upper = ordered[min(len(ordered) - 1, math.ceil((1.0 - alpha / 2.0) * len(ordered)) - 1)]
+        point = statistics.fmean(values)
+        result[rung_id] = (point, lower, upper)
+    return result
