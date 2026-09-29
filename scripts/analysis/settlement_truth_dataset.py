@@ -269,13 +269,31 @@ _VALIDATION_WINDOW_STARTS: Final[Mapping[str, dt.date]] = {
 _VALIDATION_WINDOW_END: Final[dt.date] = dt.date(2026, 8, 23)
 _STATION_YEARS: Final[tuple[int, ...]] = (2021, 2022, 2023, 2024, 2025)
 
+#: SL-5 (R2-10, plan §3.1 "Coverage"): closes the label hole the module
+#: docstring below records (2026-01-01..2026-08-15) and extends coverage
+#: through 2026-09-28 (yesterday, as of the SL-5 build). Fixed dates, not
+#: `dt.date.today()`-derived: this cache is fetched once and read
+#: read-only forever after, exactly like `_VALIDATION_WINDOW_STARTS` above,
+#: so the window this code asks for must never silently drift out from
+#: under the bytes actually sitting in the cache.
+_EXTENSION_WINDOW_START: Final[dt.date] = dt.date(2026, 1, 1)
+_EXTENSION_WINDOW_END: Final[dt.date] = dt.date(2026, 9, 28)
 
-def archive_windows(cities: Sequence[str] | None = None) -> tuple[ArchiveWindow, ...]:
+
+def archive_windows(
+    cities: Sequence[str] | None = None, *, include_extension: bool = False
+) -> tuple[ArchiveWindow, ...]:
     """Every AFOS window the settlement-alignment cache is known to hold.
 
     Coverage is NOT contiguous: the station-year windows end 2025-12-31 and
     the next held window starts 2026-08-16/17. Everything in between is absent
     from the archive and is reported as such, never interpolated.
+
+    ``include_extension=True`` additionally yields the SL-5
+    2026-01-01..2026-09-28 window per city, which closes most of that hole.
+    It defaults to ``False`` so the pre-SL-5 window set -- the one this
+    function's own regression test pins -- is unchanged for every existing
+    caller; ``main`` is the one caller that opts in.
     """
     registry = default_registry()
     windows: list[ArchiveWindow] = []
@@ -304,6 +322,16 @@ def archive_windows(cities: Sequence[str] | None = None) -> tuple[ArchiveWindow,
                     start=start,
                     end=_VALIDATION_WINDOW_END,
                     limit=500,
+                )
+            )
+        if include_extension:
+            windows.append(
+                ArchiveWindow(
+                    city=city,
+                    cli_location=cli_location,
+                    start=_EXTENSION_WINDOW_START,
+                    end=_EXTENSION_WINDOW_END,
+                    limit=3_000,
                 )
             )
     return tuple(windows)
@@ -911,6 +939,54 @@ def build_truth_rows(
 
 
 # ---------------------------------------------------------------------------
+# Gate selection (§3.2 item 10, R2-10)
+# ---------------------------------------------------------------------------
+
+
+def final_rows_for_gate(rows: Sequence[SettlementTruthRow]) -> tuple[SettlementTruthRow, ...]:
+    """The only rows a split-bearing consumer (fits, S2 gates, n_min
+    counting, S3a, L's reliability/BSS) may read.
+
+    Every ``SettlementTruthRow`` already carries the post-supersession
+    winner for its ``(station, climate_day)``: ``_build_day_row`` selects
+    ``finals[-1]``, the latest FINAL ordered by
+    ``(issued_at_utc, product_id, wmo_transmission_sequence)`` -- the same
+    finality-then-instant-then-revision ordering
+    ``breezy.domain.archived_selection.latest_by_archived_climate_day`` uses
+    for its own record type, ``(is_final, ts_init, revision_seq)``. This
+    module does not reuse that function directly: ``SettlementTruthRow`` is a
+    deliberately separate, `nautilus_trader`-free representation (module
+    docstring, "ANALYSIS ONLY"), and adapting it into
+    ``ArchivedClimateDay`` -- a hand-written `nautilus_trader.core.data.Data`
+    subclass with unrelated ingest-provenance fields -- would import the
+    live ingest stack into a script that promises never to touch it.
+
+    This selector is the defense-in-depth check on that promise: it excludes
+    every row that is not ``is_final=True`` (``PRELIMINARY_ONLY``,
+    ``NO_PRODUCT``, ``AMBIGUOUS_FINAL``), and it refuses outright if more
+    than one row for the same ``(station, climate_day)`` were ever final --
+    which should be structurally impossible given ``build_truth_rows``
+    groups by day before this is ever called, but a provisional label a
+    future nightly-extension job writes without going through that path
+    would be caught here rather than silently reaching a gate.
+    """
+    seen: set[tuple[str, dt.date]] = set()
+    selected: list[SettlementTruthRow] = []
+    for row in rows:
+        if not row.is_final:
+            continue
+        key = (row.station, row.climate_day)
+        if key in seen:
+            raise ArchiveSelectionError(
+                f"{row.station} {row.climate_day.isoformat()}: more than one final row "
+                "reached the gate selector; upstream supersession is broken"
+            )
+        seen.add(key)
+        selected.append(row)
+    return tuple(selected)
+
+
+# ---------------------------------------------------------------------------
 # Coverage and correction statistics
 # ---------------------------------------------------------------------------
 
@@ -1164,6 +1240,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--cache-dir", default=str(DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--city", action="append", default=None)
+    parser.add_argument(
+        "--include-extension",
+        action="store_true",
+        help=(
+            "Also fetch the SL-5 2026-01-01..2026-09-28 window per city "
+            "(archive_windows(include_extension=True)). Opt-in and OFF by "
+            "default: several tests replace `archive_windows` with a "
+            "`cities=None`-only double, so this flag's branch -- not the "
+            "default `archive_windows(requested_cities)` call below -- is "
+            "the only code path that ever passes `include_extension`, and "
+            "it is reached only when this flag is set."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1174,7 +1263,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = validate_output_dir(Path(args.output_dir))
     cache_dir = require_settlement_alignment_cache_dir(args.cache_dir)
     archive_digests = read_archive_digest_sidecar(cache_dir)
-    windows = archive_windows(requested_cities)
+    if args.include_extension:
+        windows = archive_windows(requested_cities, include_extension=True)
+    else:
+        windows = archive_windows(requested_cities)
     if not windows:
         raise SettlementTruthError(
             "selected cities produced zero archive windows; refusing to write"
