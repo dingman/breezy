@@ -32,7 +32,6 @@ from collections.abc import Callable, Mapping
 
 import pytest
 
-from breezy.ingest import http as http_module
 from breezy.ingest.http import (
     ContentEncodingError,
     DecodeError,
@@ -46,6 +45,10 @@ from breezy.ingest.http import (
     ServerError,
     TransportError,
     TransportTimeoutError,
+)
+from breezy.ingest.nbm_quantile_transport import (
+    BothHostsFailedError,
+    NbmQuantileFetchError,
 )
 from breezy.ingest.routing import (
     TRANSPORT_ERROR_ROUTES,
@@ -75,6 +78,12 @@ TRANSPORT_ERROR_CONSTRUCTORS: Mapping[type[TransportError], Callable[[], Transpo
     ContentEncodingError: lambda: ContentEncodingError("content-encoding: gzip"),
     InvalidCacheValidatorError: lambda: InvalidCacheValidatorError(
         "stored ETag contains a CR/LF"
+    ),
+    NbmQuantileFetchError: lambda: NbmQuantileFetchError("generic NBP fetch failure"),
+    BothHostsFailedError: lambda: BothHostsFailedError(
+        "both AWS S3 and NOMADS failed",
+        primary_error=TransportTimeoutError("s3 timeout"),
+        fallback_error=ServerError("nomads 503", status_code=503),
     ),
 }
 
@@ -172,7 +181,17 @@ def test_the_taxonomy_walk_actually_finds_the_hierarchy() -> None:
     assert len(taxonomy) >= 12
     assert TransportError in taxonomy
     assert ContentEncodingError in taxonomy
-    assert all(cls.__module__ == http_module.__name__ for cls in taxonomy)
+    # SL-3 widened this from an exact `== http_module.__name__` check: the
+    # taxonomy filter itself (`breezy_transport_error_taxonomy`, above) has
+    # always been prefix-based on `"breezy."`, and a second ingest module
+    # (`breezy.ingest.nbm_quantile_transport`, `BothHostsFailedError` /
+    # `NbmQuantileFetchError`) now legitimately defines `TransportError`
+    # subclasses too. This still proves the same thing the docstring names:
+    # the walk finds REAL `breezy.ingest` classes, not a vacuous match and
+    # not the test-local classes below (`tests.contract...`, excluded by the
+    # prefix either way) -- it just no longer over-assumes every subclass
+    # lives in exactly one file.
+    assert all(cls.__module__.startswith("breezy.ingest.") for cls in taxonomy)
 
 
 def test_every_routed_exception_actually_routes_when_constructed() -> None:

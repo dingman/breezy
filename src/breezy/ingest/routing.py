@@ -90,6 +90,10 @@ from breezy.ingest.http import (
     TransportTimeoutError,
     redact_url,
 )
+from breezy.ingest.nbm_quantile_transport import (
+    BothHostsFailedError,
+    NbmQuantileFetchError,
+)
 from breezy.normalize.cli_parse import (
     CliContentError,
     CliNotOurProductError,
@@ -556,6 +560,23 @@ _TRANSPORT_ERROR_ROUTES: dict[type[TransportError], PollOutcome] = {
     # looks like graceful degradation while silently converting a possible
     # injection attempt into a successful poll.
     InvalidCacheValidatorError: PollOutcome.CACHE_VALIDATOR,
+    # `NbmQuantileFetchError` is `NbmQuantileTransport`'s own base marker,
+    # exactly analogous to the bare `TransportError` row above: never raised
+    # directly today (only `BothHostsFailedError` extends it), so it is
+    # routed identically to that base-class row -- a generic, presumed-
+    # transient fetch hiccup, not an integrity alarm.
+    NbmQuantileFetchError: PollOutcome.NETWORK_FAILURE,
+    # `BothHostsFailedError` means the AWS S3 primary AND the NOMADS fallback
+    # both failed for one cycle. Each wrapped cause (`.primary_error`,
+    # `.fallback_error`) is itself an ordinary `TransportError` from
+    # `_fetch_one` (timeout, 5xx, reset, etc.) -- i.e. exactly the kind of
+    # thing `ServerError`/`TransportTimeoutError` already route as transient
+    # above. Losing BOTH mirrors on the same cycle is presumed a same-day
+    # upstream hiccup (see `docs/evidence/NBP_LAG_CENSUS_2026-09-29.md`'s
+    # 2026-09-24 same-day, multi-hour delay on three consecutive cycles),
+    # not a settlement-integrity event, so it shares the SERVER_ERROR
+    # transient bucket rather than a new one.
+    BothHostsFailedError: PollOutcome.SERVER_ERROR,
 }
 
 TRANSPORT_ERROR_ROUTES: MappingProxyType[type[TransportError], PollOutcome] = MappingProxyType(

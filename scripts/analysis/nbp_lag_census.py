@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -139,7 +139,21 @@ class CensusRecord:
     lag_minutes: float | None = None
 
     def to_json(self) -> dict[str, str | int | float | None]:
-        return dict(asdict(self))
+        # Explicit field-by-field construction, deliberately not `asdict`:
+        # the repo's credential-serialization guard closes every `asdict`
+        # call site to a reviewed allowlist (it deep-copies fields and
+        # bypasses hand-written redaction hooks), and this record carries no
+        # credential material to justify a new entry there.
+        return {
+            "date": self.date,
+            "cycle_hour": self.cycle_hour,
+            "version": self.version,
+            "cycle_iso": self.cycle_iso,
+            "status": self.status,
+            "last_modified": self.last_modified,
+            "lag_seconds": self.lag_seconds,
+            "lag_minutes": self.lag_minutes,
+        }
 
 
 def _prefix_for(date: dt.date, hour: int) -> str:
