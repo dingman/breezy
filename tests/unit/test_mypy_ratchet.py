@@ -343,15 +343,15 @@ CLEAN: Final[tuple[str, ...]] = (
 #: Per-package error ceilings, measured at HEAD. Falling below one fails with
 #: "lower the ceiling to N" so a ceiling can never go stale.
 CEILINGS: Final[dict[str, int]] = {
-    "src/breezy/analysis": 13,
-    "scripts/analysis": 364,
+    "src/breezy/analysis": 3,
+    "scripts/analysis": 356,
     "scripts/archive": 8,
     "scripts/venue": 23,
-    "tests/contract": 11,
+    "tests/contract": 7,
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1466,
+    "tests/unit": 1303,
 }
 
 
