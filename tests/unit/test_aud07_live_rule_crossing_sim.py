@@ -85,7 +85,7 @@ def _minimal_cell_result(**overrides: object) -> M1cCellResult:
         "mean_look_count": 1.0, "loss_stop_count": 0,
     }
     base.update(overrides)
-    return M1cCellResult(**base)  # type: ignore[arg-type]
+    return M1cCellResult(**base)
 
 
 #: Gate-fast eps pin (§8 preamble: "gate-fast tests use a cheap grid pair:

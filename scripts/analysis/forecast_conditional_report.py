@@ -232,7 +232,7 @@ def _interval_table(family: Mapping[str, object]) -> list[str]:
         "| vs | cluster | clusters | max cluster | Brier_fc - Brier_ref | 95% CI |",
         "|---|---|---|---|---|---|",
     ]
-    for ci in family["brier_difference_intervals"]:  # type: ignore[union-attr]
+    for ci in family["brier_difference_intervals"]:
         lines.append(
             f"| `{ci['against']}` | {ci['cluster']} | {ci['n_clusters']} | "
             f"{ci['max_cluster_size']} | {float(ci['point_estimate']):+.6f} | "
@@ -264,7 +264,7 @@ def _reliability_table(family: Mapping[str, object], model: str) -> list[str]:
             f"{float(b['abs_deviation']):.4f} | {ok} |"
         )
     if leg["failing_buckets"]:
-        worst = max(leg["failing_buckets"], key=lambda f: float(f["z"]))  # type: ignore[arg-type]
+        worst = max(leg["failing_buckets"], key=lambda f: float(f["z"]))
         lines += [
             "",
             (
@@ -333,7 +333,7 @@ def render_markdown(result) -> str:
         lines += ["", note, ""] if note != "not applicable" else [""]
         lines += _reliability_table(row, "p_fc")
         lines.append("")
-        under = row["underconfidence_fc"]  # type: ignore[index]
+        under = row["underconfidence_fc"]
         if under["all_buckets_underconfident"]:
             mean_dev = float(under["mean_signed_deviation_observed_minus_predicted"])
             lines += [
@@ -349,8 +349,8 @@ def render_markdown(result) -> str:
             "| station | n | Brier_fc | Brier_persistence | fc - persistence |",
             "|---|---|---|---|---|",
         ]
-        for station in sorted(row["by_station"]):  # type: ignore[call-overload]
-            s = row["by_station"][station]  # type: ignore[index]
+        for station in sorted(row["by_station"]):
+            s = row["by_station"][station]
             lines.append(
                 f"| {station} | {s['n_trials']} | {float(s['brier_by_model']['p_fc']):.4f} | "
                 f"{float(s['brier_by_model']['p_persistence']):.4f} | "

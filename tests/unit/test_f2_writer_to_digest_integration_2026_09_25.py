@@ -193,7 +193,7 @@ def test_offer_tape_cap_surfaces_as_truncated_through_the_digest(
         def emit(self, payload: object) -> None:
             sink_calls.append(payload)
 
-    digest_module.resolve_alert_sink = lambda env=None: _RecordingSink()  # type: ignore[assignment]
+    digest_module.resolve_alert_sink = lambda env=None: _RecordingSink()
     code = digest_module.main(
         [
             "--tape", str(tape_path),

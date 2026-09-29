@@ -292,9 +292,9 @@ def test_replay_calls_nws_integer_precision_arm_only_with_unique_work_catalogs(
     def fake_arm(**kwargs: object) -> SimpleNamespace:
         calls.append(
             (
-                kwargs["lag_minutes"],  # type: ignore[index]
-                kwargs["precision_mode"],  # type: ignore[index]
-                kwargs["latch_store_path"],  # type: ignore[index]
+                kwargs["lag_minutes"],
+                kwargs["precision_mode"],
+                kwargs["latch_store_path"],
             )
         )
         return SimpleNamespace(trials=(), strategy_refusals={}, strategy_diagnostics={})
@@ -345,7 +345,7 @@ def test_existing_scored_trials_parquet_skips_that_lag_only(
         whole_driver,
         "run_one_precision_arm",
         lambda **kwargs: (
-            calls.append(kwargs["lag_minutes"])  # type: ignore[index]
+            calls.append(kwargs["lag_minutes"])
             or SimpleNamespace(trials=(), strategy_refusals={}, strategy_diagnostics={})
         ),
     )
@@ -381,7 +381,7 @@ def test_a_genuinely_completed_replay_skips_the_same_lag_on_rerun(
         whole_driver,
         "run_one_precision_arm",
         lambda **kwargs: (
-            calls.append(kwargs["lag_minutes"])  # type: ignore[index]
+            calls.append(kwargs["lag_minutes"])
             or SimpleNamespace(trials=(), strategy_refusals={}, strategy_diagnostics={})
         ),
     )
@@ -471,7 +471,7 @@ def test_crash_before_the_completion_marker_reruns_rather_than_skipping(
         whole_driver,
         "run_one_precision_arm",
         lambda **kwargs: (
-            calls.append(kwargs["lag_minutes"])  # type: ignore[index]
+            calls.append(kwargs["lag_minutes"])
             or SimpleNamespace(trials=(), strategy_refusals={}, strategy_diagnostics={})
         ),
     )
@@ -868,7 +868,7 @@ def test_run_blocks_unsupported_stations_instead_of_crashing(
         whole_driver,
         "run_one_precision_arm",
         lambda **kwargs: (
-            calls.append(kwargs["station"])  # type: ignore[index]
+            calls.append(kwargs["station"])
             or SimpleNamespace(trials=(), strategy_refusals={}, strategy_diagnostics={})
         ),
     )
@@ -920,7 +920,7 @@ def test_run_blocks_a_winner_with_no_final_settlement_record(
         whole_driver,
         "run_one_precision_arm",
         lambda **kwargs: (
-            calls.append(kwargs["station"])  # type: ignore[index]
+            calls.append(kwargs["station"])
             or SimpleNamespace(trials=(), strategy_refusals={}, strategy_diagnostics={})
         ),
     )

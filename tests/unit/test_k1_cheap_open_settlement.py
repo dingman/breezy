@@ -246,7 +246,7 @@ def test_break_even_probability_is_price_plus_the_venue_fee() -> None:
 def test_break_even_probability_requires_an_explicit_theta() -> None:
     """There is deliberately no default theta: it is a per-market venue fact."""
     with pytest.raises(TypeError):
-        break_even_probability(ask=Decimal("0.01"))  # type: ignore[call-arg]
+        break_even_probability(ask=Decimal("0.01"))
 
 
 def test_break_even_rises_with_the_ask() -> None:

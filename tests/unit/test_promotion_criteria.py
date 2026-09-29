@@ -395,7 +395,7 @@ def test_c_stations_refuses_an_outside_station_and_reads_no_file(
 
     def _spy(*args: object, **kwargs: object):
         opened.append(args[0] if args else kwargs.get("file"))
-        return real_open(*args, **kwargs)  # type: ignore[arg-type]
+        return real_open(*args, **kwargs)
 
     monkeypatch.setattr("builtins.open", _spy)
     refused = evaluate_c_stations(("LAX", "NYC"))
@@ -418,7 +418,7 @@ def _validity(results: tuple[ReplayResult, ...], census: dict, drift, **kw: obje
         results_path="replay_results.jsonl",
         census_path="replay_sufficiency.jsonl",
         drift_path="replay_drift.jsonl",
-        **kw,  # type: ignore[arg-type]
+        **kw,
     )
 
 

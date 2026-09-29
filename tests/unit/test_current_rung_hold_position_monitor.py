@@ -168,7 +168,7 @@ def _build_monitor(
 
     monitor = PositionMonitor(
         clock_ns=clock_ns,
-        positions_open=positions_open,  # type: ignore[arg-type]
+        positions_open=positions_open,
         accumulators=accumulators,  # type: ignore[arg-type]
         latch_record=latch_record,
         rung_geometry=rung_geometry,  # type: ignore[arg-type]
@@ -258,10 +258,10 @@ def test_on_position_opened_registers_and_a_later_depth_evaluates(tmp_path: Path
     )
 
     fake_position = _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1)
-    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)
     assert monitor.counters["monitor_errors"] == 0
 
-    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS + _MINUTE_NS), WINDOW_OPEN_NS + _MINUTE_NS)  # type: ignore[arg-type]
+    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS + _MINUTE_NS), WINDOW_OPEN_NS + _MINUTE_NS)
 
     assert monitor.counters["monitor_errors"] == 0
     assert monitor.counters["evaluations"] == 1
@@ -283,7 +283,7 @@ def test_a_boot_inherited_position_lazily_registers_as_reconciled_no_record(
         tmp_path, positions_open=positions, accumulators={STATION: accumulator},
     )
 
-    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)
     monitor.on_stop(WINDOW_OPEN_NS + _MINUTE_NS)
 
     summaries = read_monitor_summaries(tmp_path / "monitor" / "summaries")
@@ -343,9 +343,9 @@ def test_accumulator_access_is_limited_to_value_at_and_staleness_ns(tmp_path: Pa
         tmp_path, positions_open=positions, accumulators={STATION: accumulator},
     )
 
-    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)
     monitor.on_observation(STATION, WINDOW_OPEN_NS + _MINUTE_NS)
-    monitor.on_depth(  # type: ignore[arg-type]
+    monitor.on_depth(
         _FakeDepth(_IID, WINDOW_OPEN_NS + 2 * _MINUTE_NS), WINDOW_OPEN_NS + 2 * _MINUTE_NS,
     )
 
@@ -363,11 +363,11 @@ def test_held_qty_is_read_fresh_on_every_evaluation(tmp_path: Path) -> None:
     monitor, _reports = _build_monitor(
         tmp_path, positions_open=positions, accumulators={STATION: accumulator},
     )
-    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)
 
     # MP-A style qty bump: a second leg fills before the next evaluation.
     positions.set(_IID, [_FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=2)])
-    monitor.on_depth(  # type: ignore[arg-type]
+    monitor.on_depth(
         _FakeDepth(_IID, WINDOW_OPEN_NS + _MINUTE_NS), WINDOW_OPEN_NS + _MINUTE_NS,
     )
     monitor.on_stop(WINDOW_OPEN_NS + 2 * _MINUTE_NS)
@@ -385,12 +385,12 @@ def test_emission_happens_only_on_state_change_or_heartbeat(tmp_path: Path) -> N
     monitor, _reports = _build_monitor(
         tmp_path, positions_open=positions, accumulators={STATION: accumulator},
     )
-    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)
     assert monitor.counters["emitted"] == 1  # first evaluation always emits
 
     # An immediate second evaluation with an unchanged state/verdict and no
     # heartbeat elapsed must NOT emit a second mark.
-    monitor.on_depth(  # type: ignore[arg-type]
+    monitor.on_depth(
         _FakeDepth(_IID, WINDOW_OPEN_NS + 1_000), WINDOW_OPEN_NS + 1_000,
     )
     assert monitor.counters["evaluations"] == 2
@@ -406,7 +406,7 @@ def test_on_stop_flushes_marks_and_writes_a_summary(tmp_path: Path) -> None:
     monitor, _reports = _build_monitor(
         tmp_path, positions_open=positions, accumulators={STATION: accumulator},
     )
-    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(_FakeDepth(_IID, WINDOW_OPEN_NS), WINDOW_OPEN_NS)
 
     monitor.on_stop(WINDOW_OPEN_NS + _MINUTE_NS)
 
@@ -977,11 +977,11 @@ def test_station_day_exit_count_is_shared_across_yes_and_no_legs_of_one_station_
         exit_client_order_id_factory=lambda: "exit-coid-s1",
         submit_exit=submit_calls.append,
     )
-    monitor.on_position_opened(  # type: ignore[arg-type]
+    monitor.on_position_opened(
         _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1, id="P-YES"),
         WINDOW_OPEN_NS,
     )
-    monitor.on_position_opened(  # type: ignore[arg-type]
+    monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1, id="P-NO"),
         WINDOW_OPEN_NS,
     )
@@ -1147,7 +1147,7 @@ def test_no_leg_position_opened_registers_with_sibling_station_day_and_no_monito
     )
 
     fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
-    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)
 
     assert monitor.counters["monitor_errors"] == 0
     assert _NO_IID in monitor._positions
@@ -1177,7 +1177,7 @@ def test_no_leg_position_is_evaluated_on_observation_with_mark_source_missing(
         strategy, tmp_path=tmp_path, accumulators={STATION: accumulator},
     )
     fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
-    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_position_opened(fake_position, WINDOW_OPEN_NS)
 
     monitor.on_observation(STATION, WINDOW_OPEN_NS + _MINUTE_NS)
 
@@ -1232,7 +1232,7 @@ def test_no_leg_recovered_p_hold_at_entry_is_one_minus_p_hold_upper(tmp_path: Pa
     )
 
     fake_position = _FakePosition(instrument_id=no_iid, avg_px_open=0.40, quantity=1)
-    monitor.on_position_opened(fake_position, latched_at_ns)  # type: ignore[arg-type]
+    monitor.on_position_opened(fake_position, latched_at_ns)
 
     assert monitor.counters["monitor_errors"] == 0
     assert monitor._positions[no_iid].p_hold_at_entry == expected_p_hold
@@ -1385,7 +1385,7 @@ def test_no_leg_dead_with_gated_false_manifest_writes_only_refusal_rows_and_neve
         record_exit_offer=offer_calls.append,
     )
     fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
-    monitor.on_position_opened(fake_position, start_ns)  # type: ignore[arg-type]
+    monitor.on_position_opened(fake_position, start_ns)
 
     _drive_no_leg_to_dead(monitor, station=STATION, start_ns=start_ns)
 
@@ -1444,7 +1444,7 @@ def test_no_leg_threatened_with_an_armed_family_refuses_no_leg_exit_not_declared
         record_exit_offer=offer_calls.append,
     )
     fake_position = _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1)
-    monitor.on_position_opened(fake_position, start_ns)  # type: ignore[arg-type]
+    monitor.on_position_opened(fake_position, start_ns)
 
     _drive_no_leg_to_threatened(monitor, station=STATION, start_ns=start_ns)
 
@@ -1497,7 +1497,7 @@ def test_no_leg_position_receives_a_mark_from_its_yes_siblings_depth_frame(
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
     assert monitor._buffer.records() == ()  # registration alone never evaluates
 
     depth = _book_depth10(
@@ -1506,7 +1506,7 @@ def test_no_leg_position_receives_a_mark_from_its_yes_siblings_depth_frame(
         asks=(("0.30", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     assert monitor.counters["monitor_errors"] == 0
     no_records = [r for r in monitor._buffer.records() if r.leg == "NO"]
@@ -1532,7 +1532,7 @@ def test_no_leg_mark_equals_one_minus_walked_yes_ask_vwap(tmp_path: Path) -> Non
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=4), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth = _book_depth10(
         instrument_id=InstrumentId.from_str(_IID),
@@ -1540,7 +1540,7 @@ def test_no_leg_mark_equals_one_minus_walked_yes_ask_vwap(tmp_path: Path) -> Non
         asks=(("0.30", "2"), ("0.34", "3")),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     expected_vwap, sufficient = walk_exit_vwap(depth, "NO", 4)
     assert sufficient
@@ -1579,7 +1579,7 @@ def test_no_leg_registers_from_sibling_frame_when_yes_is_not_held(tmp_path: Path
         asks=(("0.30", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     assert monitor.counters["monitor_errors"] == 0
     assert _IID not in monitor._positions  # YES was never held; never registered
@@ -1613,7 +1613,7 @@ def test_no_leg_registers_from_sibling_frame_reconciled_after_restart(tmp_path: 
         asks=(("0.30", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     assert monitor.counters["monitor_errors"] == 0
     assert monitor._positions[_IID].entry_context == "reconciled_no_record"
@@ -1636,10 +1636,10 @@ def test_both_legs_held_are_each_marked_from_one_frame(tmp_path: Path) -> None:
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth = _book_depth10(
         instrument_id=InstrumentId.from_str(_IID),
@@ -1647,7 +1647,7 @@ def test_both_legs_held_are_each_marked_from_one_frame(tmp_path: Path) -> None:
         asks=(("0.35", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     assert monitor.counters["monitor_errors"] == 0
     assert monitor.counters["evaluations"] == 2
@@ -1677,10 +1677,10 @@ def test_bid_only_frame_leaves_no_leg_missing(tmp_path: Path) -> None:
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth = _book_depth10(
         instrument_id=InstrumentId.from_str(_IID),
@@ -1688,7 +1688,7 @@ def test_bid_only_frame_leaves_no_leg_missing(tmp_path: Path) -> None:
         asks=(),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     records = monitor._buffer.records()
     yes_record = next(r for r in records if r.leg == "YES")
@@ -1712,7 +1712,7 @@ def test_no_leg_qty_beyond_displayed_asks_is_missing_never_partial(tmp_path: Pat
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=10), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth = _book_depth10(
         instrument_id=InstrumentId.from_str(_IID),
@@ -1720,7 +1720,7 @@ def test_no_leg_qty_beyond_displayed_asks_is_missing_never_partial(tmp_path: Pat
         asks=(("0.30", "5"),),  # only 5 displayed; held qty is 10
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     no_records = [r for r in monitor._buffer.records() if r.leg == "NO"]
     assert len(no_records) == 1
@@ -1747,7 +1747,7 @@ def test_stale_cached_sibling_book_refuses_book_stale_for_no(tmp_path: Path) -> 
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth = _book_depth10(
         instrument_id=InstrumentId.from_str(_IID),
@@ -1755,7 +1755,7 @@ def test_stale_cached_sibling_book_refuses_book_stale_for_no(tmp_path: Path) -> 
         asks=(("0.30", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
     assert monitor._positions[_NO_IID].last_book_ts_ns == WINDOW_OPEN_NS
 
     later_ns = WINDOW_OPEN_NS + 5 * _MINUTE_NS
@@ -1795,7 +1795,7 @@ def test_a_no_leg_frame_is_never_rerouted(tmp_path: Path) -> None:
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth = _book_depth10(
         instrument_id=InstrumentId.from_str(_NO_IID),  # malformed in production: never happens
@@ -1803,7 +1803,7 @@ def test_a_no_leg_frame_is_never_rerouted(tmp_path: Path) -> None:
         asks=(("0.30", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     assert calls == [_NO_IID]
     assert monitor.counters["monitor_errors"] == 0
@@ -1838,7 +1838,7 @@ def test_sibling_evaluation_error_is_counted_and_yes_record_is_unchanged(
         asks=(("0.30", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth, WINDOW_OPEN_NS)
 
     assert monitor.counters["monitor_errors"] == 1, reports
     assert monitor.counters["evaluations"] == 1  # YES only -- the NO eval never ran
@@ -1885,7 +1885,7 @@ def _run_e_scenario(
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     depth1 = _book_depth10(
         instrument_id=InstrumentId.from_str(_IID),
@@ -1893,7 +1893,7 @@ def _run_e_scenario(
         asks=(("0.90", "5"),),
         ts_ns=WINDOW_OPEN_NS,
     )
-    monitor.on_depth(depth1, WINDOW_OPEN_NS)  # type: ignore[arg-type]
+    monitor.on_depth(depth1, WINDOW_OPEN_NS)
 
     later_ns = WINDOW_OPEN_NS + 6 * _MINUTE_NS
     accumulator._running_max = _FakeRunningMax(
@@ -1905,7 +1905,7 @@ def _run_e_scenario(
         asks=(("0.90", "5"),),
         ts_ns=later_ns,
     )
-    monitor.on_depth(depth2, later_ns)  # type: ignore[arg-type]
+    monitor.on_depth(depth2, later_ns)
 
     return {
         "yes_records": tuple(r for r in monitor._buffer.records() if r.leg == "YES"),
@@ -1977,10 +1977,10 @@ def test_shared_mark_buffer_eviction_with_no_rows_is_counted(tmp_path: Path) -> 
     )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
     monitor.on_position_opened(
         _FakePosition(instrument_id=_NO_IID, avg_px_open=0.40, quantity=1), WINDOW_OPEN_NS,
-    )  # type: ignore[arg-type]
+    )
 
     def _push(ts_ns: int) -> None:
         depth = _book_depth10(
@@ -1989,7 +1989,7 @@ def test_shared_mark_buffer_eviction_with_no_rows_is_counted(tmp_path: Path) -> 
             asks=(("0.90", "5"),),
             ts_ns=ts_ns,
         )
-        monitor.on_depth(depth, ts_ns)  # type: ignore[arg-type]
+        monitor.on_depth(depth, ts_ns)
 
     _push(WINDOW_OPEN_NS)  # 2 emits (YES + NO)
     _push(WINDOW_OPEN_NS + 61_000_000_000)  # heartbeat elapsed -> 2 more emits, 1 must evict

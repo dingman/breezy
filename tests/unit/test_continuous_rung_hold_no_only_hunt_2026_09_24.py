@@ -363,7 +363,7 @@ def test_no_only_gate_closed_never_submits_sets_inflight_or_writes_first_order_k
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.97", bid=bid, ts_event=WINDOW_OPEN_NS))
 
@@ -485,7 +485,7 @@ def test_yes_in_band_tick_is_byte_identical(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     calls = _spy_no_side_shadow(strategy)
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
 
@@ -670,7 +670,7 @@ def test_bid_only_gate_closed_never_submits(
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_order_book_depth(
         _bid_only_depth(bid=_BAND_CLEARING_BID, ts_event=WINDOW_OPEN_NS)
@@ -698,7 +698,7 @@ def test_quote_tick_path_unchanged(
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
 

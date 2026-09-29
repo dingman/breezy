@@ -615,9 +615,9 @@ def _parse_excluded_fragments(payload: object) -> tuple[FragmentSpan, ...]:
                 )
         fragments.append(
             FragmentSpan(
-                instance_id=entry["instance_id"],  # type: ignore[arg-type]
-                first_in_window_ns=entry["first_in_window_ns"],  # type: ignore[arg-type]
-                last_in_window_ns=entry["last_in_window_ns"],  # type: ignore[arg-type]
+                instance_id=entry["instance_id"],
+                first_in_window_ns=entry["first_in_window_ns"],
+                last_in_window_ns=entry["last_in_window_ns"],
             )
         )
     return tuple(fragments)

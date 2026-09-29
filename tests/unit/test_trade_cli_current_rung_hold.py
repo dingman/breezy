@@ -96,7 +96,7 @@ def _instrument(
     lower_f: int = 80,
     upper_f: int = 81,
 ) -> BinaryOption:
-    day = climate_day.isoformat()  # type: ignore[union-attr]
+    day = climate_day.isoformat()
     slug = f"tc-temp-{station.lower()}high-{day}-gte{lower_f}lt{upper_f}f"
     instrument_id = InstrumentId(Symbol(slug), _POLYMARKET_VENUE)
     increment = Price.from_str("0.01")

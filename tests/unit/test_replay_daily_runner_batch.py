@@ -456,7 +456,7 @@ def test_run_batch_resolves_drift_and_manifest_exactly_once(tmp_path: Path) -> N
         calls.append(path)
         return real_resolve(path)
 
-    runner.resolve_strategy_from_manifest = counting_resolve  # type: ignore[assignment]
+    runner.resolve_strategy_from_manifest = counting_resolve
     try:
         runner.run_batch(
             config, max_targets=3, budget_s=10_000.0,
@@ -465,7 +465,7 @@ def test_run_batch_resolves_drift_and_manifest_exactly_once(tmp_path: Path) -> N
             now_utc=_SAFE_NOW_UTC,
         )
     finally:
-        runner.resolve_strategy_from_manifest = real_resolve  # type: ignore[assignment]
+        runner.resolve_strategy_from_manifest = real_resolve
     assert len(calls) == 1
 
 

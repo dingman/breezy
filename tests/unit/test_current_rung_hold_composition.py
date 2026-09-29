@@ -332,7 +332,7 @@ def test_on_start_subscribes_each_instrument_exactly_once_despite_re_emitted_def
         clock=clock,
     )
     subscribed: list[InstrumentId] = []
-    strategy.subscribe_quote_ticks = subscribed.append  # type: ignore[method-assign]
+    strategy.subscribe_quote_ticks = subscribed.append
     strategy.start()
 
     assert subscribed == [instrument.id]
@@ -827,10 +827,10 @@ def test_continuous_builder_defaults_the_offer_tape_to_a_sibling_decisions_dir(
     )
     assert len(v3) == 1
     offer_tape = v3[0].offer_tape
-    assert offer_tape._path is not None  # type: ignore[attr-defined]
-    assert offer_tape._path.parent.name == "decisions"  # type: ignore[attr-defined]
-    assert offer_tape._path.parent.parent == tmp_path.parent  # type: ignore[attr-defined]
-    assert offer_tape._path.name == f"offer_tape_{_DAY.isoformat()}.jsonl"  # type: ignore[attr-defined]
+    assert offer_tape._path is not None
+    assert offer_tape._path.parent.name == "decisions"
+    assert offer_tape._path.parent.parent == tmp_path.parent
+    assert offer_tape._path.name == f"offer_tape_{_DAY.isoformat()}.jsonl"
 
 
 def test_continuous_builder_honors_an_explicit_offer_tape_path(tmp_path: Path) -> None:
@@ -854,7 +854,7 @@ def test_continuous_builder_honors_an_explicit_offer_tape_path(tmp_path: Path) -
         order_submission_permit=None,
         offer_tape_path=explicit_path,
     )
-    assert v3[0].offer_tape._path == explicit_path  # type: ignore[attr-defined]
+    assert v3[0].offer_tape._path == explicit_path
 
 
 def test_build_continuous_rung_hold_strategies_survives_an_unwritable_offer_tape_sidecar(
@@ -913,12 +913,12 @@ def test_continuous_builder_defaults_the_diagnostics_summary_to_a_sibling_decisi
         order_submission_permit=None,
     )
     assert len(v3) == 1
-    sink = v3[0]._diagnostics_summary  # type: ignore[attr-defined]
+    sink = v3[0]._diagnostics_summary
     assert sink is not None
-    assert sink._path is not None  # type: ignore[attr-defined]
-    assert sink._path.parent.name == "decisions"  # type: ignore[attr-defined]
-    assert sink._path.parent.parent == tmp_path.parent  # type: ignore[attr-defined]
-    assert sink._path.name == f"diagnostics_summary_{_DAY.isoformat()}.jsonl"  # type: ignore[attr-defined]
+    assert sink._path is not None
+    assert sink._path.parent.name == "decisions"
+    assert sink._path.parent.parent == tmp_path.parent
+    assert sink._path.name == f"diagnostics_summary_{_DAY.isoformat()}.jsonl"
 
 
 def test_continuous_builder_honors_an_explicit_diagnostics_summary_path(
@@ -941,9 +941,9 @@ def test_continuous_builder_honors_an_explicit_diagnostics_summary_path(
         order_submission_permit=None,
         diagnostics_summary_path=explicit_path,
     )
-    sink = v3[0]._diagnostics_summary  # type: ignore[attr-defined]
+    sink = v3[0]._diagnostics_summary
     assert sink is not None
-    assert sink._path == explicit_path  # type: ignore[attr-defined]
+    assert sink._path == explicit_path
 
 
 def test_continuous_builder_resolves_a_real_build_sha_for_every_station(
@@ -974,7 +974,7 @@ def test_continuous_builder_resolves_a_real_build_sha_for_every_station(
         order_submission_permit=None,
     )
     assert len(v3) == 2
-    shas = {strategy._build_sha for strategy in v3}  # type: ignore[attr-defined]
+    shas = {strategy._build_sha for strategy in v3}
     assert len(shas) == 1
     (sha,) = shas
     assert sha != "unknown"

@@ -2460,7 +2460,7 @@ def test_a_reader_that_drops_a_facts_slug_fails_the_run_loudly(
         },
     )
     stopped: list[bool] = []
-    strategy.stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    strategy.stop = lambda: stopped.append(True)
     from nautilus_trader.common.component import TestClock
     from nautilus_trader.model.identifiers import TraderId
     from nautilus_trader.portfolio import Portfolio
