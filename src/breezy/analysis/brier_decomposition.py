@@ -59,6 +59,19 @@ every member, so ``W = 0`` and ``C = 0`` identically -- the extended formula
 collapses to the classic one, which is why ``bin_by_value`` reconstructs
 Brier to floating-point precision with ``within_bin_forecast_variance`` and
 ``within_bin_covariance`` both ~0.
+
+**On ``UNC`` and six-rung ladders.** ``UNC = obar * (1 - obar)`` is always
+computed FROM THE DATA -- ``obar`` is the corpus's measured mean outcome, not
+an assumed constant. On a six-rung ladder where each rung independently wins
+with EMPIRICAL frequency ``1/6`` in the scored corpus, that measured ``obar``
+happens to equal ``1/6`` and ``UNC`` happens to equal ``(1/6)(5/6) = 5/36``.
+That ``5/36`` figure is an **empirical property of the event set actually
+scored**, not a consequence of "exactly one rung wins per station-day" on its
+own -- a corpus where the six rungs win with unequal frequencies (or where
+ties/pushes/missing rungs skew the mix) would measure a different ``obar``
+and a different ``UNC``, even though exactly one rung still settles per
+station-day. This function never assumes ``1/6``; it always measures
+``obar`` from the ``outcomes`` it is given.
 """
 
 from __future__ import annotations
@@ -228,6 +241,10 @@ def resolution_difference(
     forecast from each system, plus one outcome, per matched event.
     Antisymmetric by construction: `resolution_difference(a, b, ...) ==
     -resolution_difference(b, a, ...)`.
+
+    Point estimate only -- rung events within a station-day are mutually
+    exclusive and negatively correlated; any CI must use the station-day
+    cluster bootstrap, never a naive per-event CI.
 
     Raises `ValueError` if the three sequences are not all the same length.
     """

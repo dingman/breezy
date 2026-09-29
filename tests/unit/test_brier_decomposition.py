@@ -5,7 +5,12 @@ S2 statistics (:419-421) and build-slice row SL-7 (:473): "rel - res + unc
 reconstructs Brier to 1e-12; six-rung unc = 5/36". Governing ruling:
 `docs/evidence/RULING_forecast_edge_programme_closes_2026-09-20.md:36-38`,
 which states `uncertainty = o(1-o) = (1/6)(5/6) = 5/36 = 0.138889` exactly,
-identically for both systems, because exactly one rung of six settles YES.
+identically for both systems. `unc = 5/36` holds ONLY because each of the
+six rungs wins with EMPIRICAL frequency 1/6 in the scored corpus -- an
+empirical property of that event set, not a consequence of "exactly one
+rung wins per station-day" on its own. `murphy_decomposition` always
+computes `obar` (and so `UNC`) from the supplied `outcomes`, never from an
+assumed 1/6.
 
 No Murphy implementation existed in the repo before this slice [VER: `grep
 -rn "murphy" --include="*.py"` = 0 hits before this commit].
@@ -82,15 +87,23 @@ def test_six_rung_climatology_uncertainty_is_5_over_36() -> None:
     # Arrange: 6 station-days, each a 6-rung ladder with a uniform
     # climatology forecast (p = 1/6 for every rung) and exactly one rung
     # settling YES per day, exactly like a real partition ladder -- base
-    # rate = 6 YES / 36 rungs = 1/6.
+    # rate = 6 YES / 36 rungs = 1/6. This is an EMPIRICAL property of THIS
+    # event set (each rung happens to win with frequency 1/6 across the 6
+    # station-days), not a consequence of "exactly one rung wins per
+    # station-day" alone -- a corpus where the rungs win with unequal
+    # frequencies would measure a different obar and a different unc, even
+    # though exactly one rung still settles per station-day.
     probs = [1.0 / 6.0] * 36
     outcomes = ([True, False, False, False, False, False]) * 6
 
     # Act
     decomposition = murphy_decomposition(probs, outcomes, bin_by_value)
 
-    # Assert: unc = o(1-o) = (1/6)(5/6) = 5/36, exactly as the 09-20 ruling
-    # states (`RULING_forecast_edge_programme_closes_2026-09-20.md:36-38`).
+    # Assert: unc = obar*(1-obar), and obar is MEASURED from `outcomes`
+    # above (6/36 = 1/6 in this corpus), never assumed -- it equals
+    # (1/6)(5/6) = 5/36 here exactly because this event set's measured
+    # obar is 1/6, matching the 09-20 ruling
+    # (`RULING_forecast_edge_programme_closes_2026-09-20.md:36-38`).
     assert math.isclose(decomposition.uncertainty, 5.0 / 36.0, rel_tol=0.0, abs_tol=1e-12)
 
 
