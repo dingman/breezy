@@ -60,6 +60,7 @@ from breezy.ingest.probe_transport import (
     RequestBudgetExceededError,
     SettlementHostForbiddenError,
 )
+from tests.support.host_python import resolve_breezy_python
 from tests.unit.test_polymarket_us_readonly_guard import (
     find_write_capable_receiver_exposures,
     find_write_egress_violations,
@@ -596,7 +597,9 @@ def test_the_probe_live_modules_collect_to_zero_under_default_addopts() -> None:
     """Not "they carry a marker" -- that the DEFAULT run selects none of them."""
     result = subprocess.run(
         [
-            str(REPO_ROOT / ".venv" / "bin" / "python"),
+            # WT-VENV: the resolved interpreter, not `REPO_ROOT/.venv` -- a
+            # worktree has no `.venv` of its own.
+            resolve_breezy_python(),
             "-m",
             "pytest",
             "--collect-only",

@@ -49,6 +49,7 @@ from typing import Final
 
 import pytest
 
+from tests.support.host_python import resolve_breezy_python
 from tests.support.loopback_https import (
     TlsMaterial,
     generate_loopback_tls_material,
@@ -62,13 +63,27 @@ _DEPLOY_DIR: Final[Path] = _REPO_ROOT / "deploy" / "systemd"
 _WRAPPER: Final[Path] = _DEPLOY_DIR / "asos-refresh-run.sh"
 _LOCK_FILENAME: Final[str] = "breezy-studies.lock"
 _ORIGINAL_REPO_LINE: Final[str] = "REPO=/home/jon/breezy\n"
+_ORIGINAL_PY_LINE: Final[str] = 'PY="$REPO/.venv/bin/python"\n'
 
 
 def _wrapper_for_repo_under_test(tmp_path: Path, repo_root: Path = _REPO_ROOT) -> Path:
     """Copy `_WRAPPER` to tmp with its `REPO=` line rewritten to `repo_root`
     (B1). The wrapper's own bash logic (lock handling, step sequencing, exit
     code) is exercised byte-for-byte; only WHICH tree the python steps
-    resolve under changes."""
+    resolve under changes.
+
+    WT-VENV: the wrapper derives its interpreter from `$REPO/.venv/bin/
+    python`, so rewriting `REPO=` alone breaks when `repo_root` is a
+    worktree, which never has a `.venv` of its own. The behavioural tests
+    below deliberately point `repo_root` at a throwaway stub tree that DOES
+    plant its own fake `.venv/bin/python` (`_build_stub_repo`), and that
+    stub must keep resolving via `$REPO` unmodified -- so the `PY=` line is
+    only rewritten when `repo_root` has no real `.venv/bin/python`, in which
+    case it is pointed at the interpreter this test SUITE itself is running
+    under (`BREEZY_PYTHON`, else `sys.executable` -- see `tests/support/
+    host_python.py`). Primary-tree default: `repo_root` IS `/home/jon/
+    breezy`, which has a real `.venv`, so this is a no-op there too.
+    """
     original = _WRAPPER.read_text()
     # Assert the line exists, not that the text changed: when the suite runs
     # in the primary tree, repo_root IS /home/jon/breezy and the rewrite is a
@@ -76,7 +91,12 @@ def _wrapper_for_repo_under_test(tmp_path: Path, repo_root: Path = _REPO_ROOT) -
     assert original.count(_ORIGINAL_REPO_LINE) == 1, (
         "REPO= line not found exactly once in the wrapper to rewrite"
     )
+    assert original.count(_ORIGINAL_PY_LINE) == 1, (
+        "PY= line not found exactly once in the wrapper to rewrite"
+    )
     rewritten = original.replace(_ORIGINAL_REPO_LINE, f"REPO={repo_root}\n", 1)
+    if not (repo_root / ".venv" / "bin" / "python").is_file():
+        rewritten = rewritten.replace(_ORIGINAL_PY_LINE, f'PY="{resolve_breezy_python()}"\n', 1)
     target = tmp_path / "asos-refresh-run.sh"
     target.write_text(rewritten)
     target.chmod(0o755)

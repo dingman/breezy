@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Final
 
 from breezy.ingest.shared_state import DEFAULT_ALLOWED_HOSTS
+from tests.support.host_python import resolve_sibling_entrypoint
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SRC_ROOT: Final[Path] = REPO_ROOT / "src" / "breezy"
@@ -30,8 +31,10 @@ _CATALOG_IMPORT = "\nfrom breezy.persistence import _gate_archive_intermediary\n
 
 def _run_lint_imports() -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "UV_CACHE_DIR": "/tmp/uv-cache"}
+    # WT-VENV: derived from the resolved interpreter's own `bin/`, not
+    # `REPO_ROOT` -- a worktree has no `.venv` of its own.
     return subprocess.run(
-        [str(REPO_ROOT / ".venv" / "bin" / "lint-imports")],
+        [str(resolve_sibling_entrypoint("lint-imports"))],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
