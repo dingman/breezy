@@ -116,6 +116,166 @@ def test_forecast_quantile_ladder_composes_real_strategies_and_actors(
     assert any(isinstance(a, NbmQuantileActor) for a in node.trader.actors)
 
 
+def _write_manifest_pointing_at(
+    families_dir: Path, *, family_id: str, artefact_path: Path, artefact_sha256: str,
+) -> None:
+    """A REGISTERED manifest naming an arbitrary (possibly bad) artefact
+    path/sha -- unlike ``_write_forecast_quantile_ladder_manifest``, this
+    never writes the artefact file itself; the caller has already written
+    (or deliberately NOT written) it."""
+    boundary_path = families_dir / "gs_boundary_fixture.json"
+    boundary_path.parent.mkdir(parents=True, exist_ok=True)
+    if not boundary_path.exists():
+        boundary_path.write_text(json.dumps({"boundary": "fixture"}))
+    boundary_sha = hashlib.sha256(boundary_path.read_bytes()).hexdigest()
+
+    payload = {
+        "family_id": family_id,
+        "venue": "polymarket_us",
+        "trial_id_prefix": f"forecast_quantile_ladder/trial/{family_id}/",
+        "d0_climate_day": "2026-09-19",
+        "taker_fee_coefficient": "0.06",
+        "boundary_artefact_path": str(boundary_path),
+        "boundary_inputs_sha256": boundary_sha,
+        "composition_kind": "forecast_quantile_ladder",
+        "density_artefact_path": str(artefact_path),
+        "density_artefact_sha256": artefact_sha256,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+        "status": "REGISTERED",
+    }
+    (families_dir / f"{family_id}.json").write_text(json.dumps(payload))
+
+
+def _boot_env_and_catalog(tmp_path: Path, *, family_id: str) -> dict[str, str]:
+    catalog_root = tmp_path / "catalog"
+    if not catalog_root.exists():
+        catalog_root.mkdir()
+        _write_today_catalog(catalog_root)
+    return _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: family_id,
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+
+
+def test_a_sha_mismatched_artefact_fails_closed_with_a_clean_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    families_dir = tmp_path / "deploy" / "families"
+    artefacts_dir = families_dir / "artefacts"
+    artefacts_dir.mkdir(parents=True, exist_ok=True)
+    artefact_path = artefacts_dir / "sha_mismatch_density.json"
+    artefact_path.write_bytes(json.dumps(_ARTEFACT_PAYLOAD).encode("utf-8"))
+    family_id = "pm_us_crh_fq_sha_mismatch"
+    _write_manifest_pointing_at(
+        families_dir, family_id=family_id, artefact_path=artefact_path, artefact_sha256="a" * 64,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        env=_boot_env_and_catalog(tmp_path, family_id=family_id),
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+
+    assert code == EXIT_CONFIG_ERROR
+    assert RecordingNode.instances == []
+
+
+def test_a_malformed_json_artefact_fails_closed_with_a_clean_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    families_dir = tmp_path / "deploy" / "families"
+    artefacts_dir = families_dir / "artefacts"
+    artefacts_dir.mkdir(parents=True, exist_ok=True)
+    artefact_path = artefacts_dir / "malformed_density.json"
+    raw = b"{not valid json at all"
+    artefact_path.write_bytes(raw)
+    family_id = "pm_us_crh_fq_malformed"
+    _write_manifest_pointing_at(
+        families_dir,
+        family_id=family_id,
+        artefact_path=artefact_path,
+        artefact_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        env=_boot_env_and_catalog(tmp_path, family_id=family_id),
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+
+    assert code == EXIT_CONFIG_ERROR
+    assert RecordingNode.instances == []
+
+
+def test_a_schema_missing_key_artefact_fails_closed_with_a_clean_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    families_dir = tmp_path / "deploy" / "families"
+    artefacts_dir = families_dir / "artefacts"
+    artefacts_dir.mkdir(parents=True, exist_ok=True)
+    artefact_path = artefacts_dir / "missing_key_density.json"
+    payload = dict(_ARTEFACT_PAYLOAD)
+    del payload["emos_draws_by_version"]  # schema-missing key -> KeyError inside the loader
+    raw = json.dumps(payload).encode("utf-8")
+    artefact_path.write_bytes(raw)
+    family_id = "pm_us_crh_fq_missing_key"
+    _write_manifest_pointing_at(
+        families_dir,
+        family_id=family_id,
+        artefact_path=artefact_path,
+        artefact_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        env=_boot_env_and_catalog(tmp_path, family_id=family_id),
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+
+    assert code == EXIT_CONFIG_ERROR
+    assert RecordingNode.instances == []
+
+
+def test_a_missing_artefact_file_fails_closed_with_a_clean_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    families_dir = tmp_path / "deploy" / "families"
+    artefact_path = families_dir / "artefacts" / "does_not_exist_density.json"
+    family_id = "pm_us_crh_fq_missing_file"
+    _write_manifest_pointing_at(
+        families_dir, family_id=family_id, artefact_path=artefact_path, artefact_sha256="b" * 64,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    code = run(
+        env=_boot_env_and_catalog(tmp_path, family_id=family_id),
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+
+    assert code == EXIT_CONFIG_ERROR
+    assert RecordingNode.instances == []
+
+
 def test_forecast_ladder_still_refuses_to_boot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

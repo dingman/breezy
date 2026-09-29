@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import logging
 import os
 import re
@@ -81,6 +82,10 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
+)
+from breezy.strategy.forecast_quantile_ladder.artefact_bounds import BoundsArtefactPinMismatchError
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
+    CalibrationArtefactPinMismatchError,
 )
 from breezy.strategy.forecast_quantile_ladder.composition import (
     NoTradableForecastInstrumentsError,
@@ -713,8 +718,27 @@ def run(
                         submit_veto=submit_veto,
                         required_fee_coefficient=float(manifest.taker_fee_coefficient),
                     )
-                except NoTradableForecastInstrumentsError as exc:
-                    raise SettingsError(str(exc)) from exc
+                except (
+                    NoTradableForecastInstrumentsError,
+                    # Review item 1 (SL-13 fix-first): every artefact-load
+                    # failure mode -- a bad sha pin (either loader), malformed
+                    # JSON, or a schema-missing key/wrong-shaped value in an
+                    # otherwise-parseable payload -- must fail this ONE
+                    # composition_kind closed, the same clean EXIT_CONFIG_ERROR
+                    # path `NoTradableForecastInstrumentsError` already uses,
+                    # never an unhandled crash. A missing artefact FILE
+                    # (`FileNotFoundError`) is already an `OSError`, already in
+                    # the outer `except` tuple below -- not repeated here.
+                    CalibrationArtefactPinMismatchError,
+                    BoundsArtefactPinMismatchError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    TypeError,
+                ) as exc:
+                    raise SettingsError(
+                        f"forecast_quantile_ladder composition failed for "
+                        f"{settings.sending_family_id}: {type(exc).__name__}: {exc}"
+                    ) from exc
                 strategies.extend(forecast_strategies)
                 extra_actors.extend([quantile_actor, nbm_actor])
             elif manifest.composition_kind == "forecast_ladder":
