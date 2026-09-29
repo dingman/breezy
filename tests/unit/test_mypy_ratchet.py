@@ -44,6 +44,8 @@ _SUMMARY_RE: Final[re.Pattern[str]] = re.compile(
     r"^Found (?P<errors>\d+) errors? in (?P<files>\d+) files?\b"
 )
 _SUCCESS_RE: Final[re.Pattern[str]] = re.compile(r"^Success: no issues found\b")
+_BLOCKER_SUMMARY_TEXT: Final[str] = "(errors prevented further checking)"
+_OUTPUT_TAIL_LINES: Final[int] = 20
 
 
 class MypyReportParseError(RuntimeError):
@@ -54,6 +56,16 @@ class MypyReportParseError(RuntimeError):
     either one means the count cannot be trusted, so the ratchet must not
     silently pass.
     """
+
+
+def check_mypy_exit(returncode: int, output: str) -> None:
+    """Accept only mypy's complete-run exit codes."""
+    if returncode in (0, 1):
+        return
+    tail = "\n".join(output.splitlines()[-_OUTPUT_TAIL_LINES:])
+    raise MypyReportParseError(
+        f"mypy exited with {returncode}; expected 0 or 1. stdout/stderr tail:\n{tail}"
+    )
 
 
 def parse_mypy_report(output: str) -> dict[str, int]:
@@ -70,6 +82,11 @@ def parse_mypy_report(output: str) -> dict[str, int]:
     summary_errors: int | None = None
     summary_files: int | None = None
     for line in output.splitlines():
+        if _BLOCKER_SUMMARY_TEXT in line:
+            raise MypyReportParseError(
+                "mypy reported errors prevented further checking -- "
+                f"the run is incomplete and cannot be trusted:\n{line}"
+            )
         error_match = _ERROR_LINE_RE.match(line)
         if error_match is not None:
             path = error_match.group("path")
@@ -223,6 +240,31 @@ def test_a_run_with_no_summary_line_raises_parse_error() -> None:
         parse_mypy_report(output)
 
 
+def test_mypy_exit_code_two_raises_parse_error() -> None:
+    output = (
+        "src/breezy/runtime/foo.py:12: error: Incompatible types  [assignment]\n"
+        "Found 1 error in 1 file (errors prevented further checking)\n"
+    )
+
+    with pytest.raises(MypyReportParseError):
+        check_mypy_exit(2, output)
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_mypy_exit_codes_zero_and_one_are_accepted(returncode: int) -> None:
+    check_mypy_exit(returncode, "Found 1 error in 1 file (checked 5 source files)\n")
+
+
+def test_a_summary_with_errors_prevented_further_checking_raises_parse_error() -> None:
+    output = (
+        "src/breezy/runtime/foo.py:12: error: Incompatible types  [assignment]\n"
+        "Found 1 error in 1 file (errors prevented further checking)\n"
+    )
+
+    with pytest.raises(MypyReportParseError):
+        parse_mypy_report(output)
+
+
 # ---------------------------------------------------------------------------
 # Ratchet comparator unit tests -- fake parsed counts, no subprocess.
 # ---------------------------------------------------------------------------
@@ -329,7 +371,9 @@ def mypy_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, int]:
         text=True,
         check=False,
     )
-    return parse_mypy_report(result.stdout + result.stderr)
+    output = result.stdout + result.stderr
+    check_mypy_exit(result.returncode, output)
+    return parse_mypy_report(output)
 
 
 def test_mypy_stays_within_the_cf12_clean_set_and_ceilings(
