@@ -100,7 +100,7 @@ def test_pending_does_not_refuse_evaluation_and_the_shadow_log_marks_pending_1(
     _write_first_order_key(store_path)
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -209,11 +209,11 @@ def test_no_order_is_submitted_on_the_no_leg_after_the_day_stop(
     )
     assert strategy._latch is not None
     utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
-    strategy._latch._store.set(  # type: ignore[attr-defined]
+    strategy._latch._store.set(
         f"{BUDGET_EXHAUSTED_KEY_PREFIX}{utc_day}", b"1",
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)

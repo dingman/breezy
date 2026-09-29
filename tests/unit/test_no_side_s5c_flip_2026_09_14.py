@@ -95,7 +95,7 @@ def test_flag_true_keeps_shadow_behaviour_byte_identical(
         instruments=(interior_instrument, no_interior_instrument),
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -118,7 +118,7 @@ def test_a_no_take_arms_consumes_and_submits_on_the_no_instrument(
     )
     strategy._order_submission_permit = object()  # type: ignore[assignment]
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -158,7 +158,7 @@ def test_a_no_order_prices_itself_at_the_no_ask(
     )
     strategy._order_submission_permit = object()  # type: ignore[assignment]
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -198,7 +198,7 @@ def test_a_second_no_take_is_refused_while_the_first_order_is_pending(
     assert strategy._latch._store.get(NO_SIDE_POSITION_SHAPE_CAPTURED_KEY) is None
 
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
@@ -316,7 +316,7 @@ def test_a_two_call_synchronous_burst_leaves_exactly_one_no_take_submitted(
     )
     strategy._order_submission_permit = object()  # type: ignore[assignment]
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     assert strategy._latch is not None
 
     strategy._evaluate_no_side_shadow(
@@ -369,7 +369,7 @@ def test_a_refused_submit_still_leaves_the_key_set_and_no_order(
     )
     assert strategy._order_submission_permit is None
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     assert strategy._latch is not None
 
     strategy._evaluate_no_side_shadow(
@@ -400,7 +400,7 @@ def test_the_key_persists_across_a_simulated_relaunch_and_blocks_further_arming(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     first._order_submission_permit = object()  # type: ignore[assignment]
-    first.submit_order = lambda order: None  # type: ignore[method-assign]
+    first.submit_order = lambda order: None
     first._evaluate_no_side_shadow(
         station=STATION,
         climate_day_key=CLIMATE_DAY.isoformat(),
@@ -424,7 +424,7 @@ def test_the_key_persists_across_a_simulated_relaunch_and_blocks_further_arming(
     )
     relaunched._order_submission_permit = object()  # type: ignore[assignment]
     submitted: list[object] = []
-    relaunched.submit_order = submitted.append  # type: ignore[method-assign]
+    relaunched.submit_order = submitted.append
     relaunched._evaluate_no_side_shadow(
         station="SFO",
         climate_day_key="2026-09-05",
@@ -459,7 +459,7 @@ def test_the_yes_path_is_untouched_by_the_strategy_side_key_write(
     )
     strategy._order_submission_permit = object()  # type: ignore[assignment]
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
     assert len(submitted) == 1

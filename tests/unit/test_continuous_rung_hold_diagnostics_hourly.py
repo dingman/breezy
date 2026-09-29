@@ -229,7 +229,7 @@ class TestPerProcessDeltasSumToSnapshot:
         assert len(rows) == 3  # two rollovers + one final
         summed: dict[str, int] = {}
         for row in rows:
-            for key, count in row["diagnostics"].items():  # type: ignore[union-attr]
+            for key, count in row["diagnostics"].items():
                 summed[key] = summed.get(key, 0) + count
         assert summed == dict(sorted(strategy.diagnostics.counts.items()))
 
@@ -436,10 +436,10 @@ class TestSinkHealthSurfacedInNextRow:
         # `sink._max_bytes` is private but this is the same sink instance
         # the strategy holds -- shrink its cap so a manual append is capped
         # before the rollover's own row is written.
-        sink._max_bytes = 1  # type: ignore[attr-defined]
+        sink._max_bytes = 1
         sink.append({"pid": 999})
         assert sink.capped == 1
-        sink._max_bytes = 4 * 1024 * 1024  # type: ignore[attr-defined]
+        sink._max_bytes = 4 * 1024 * 1024
 
         hour1_start = (hour0_bucket + 1) * _NS_PER_HOUR
         strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=hour1_start))

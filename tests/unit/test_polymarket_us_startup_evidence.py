@@ -94,7 +94,7 @@ async def test_a_5xx_positions_read_at_connect_is_recorded_as_refused(tmp_path: 
 @pytest.mark.asyncio
 async def test_a_non_eof_complete_page_at_connect_is_recorded_as_refused(tmp_path: Path) -> None:
     rig = _build_rig(tmp_path)
-    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {},
         "eof": False,
     }
@@ -121,7 +121,7 @@ async def test_evidence_is_overwritten_not_accumulated_across_connects(tmp_path:
     )
     await rig.client._disconnect()
 
-    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {},
         "eof": True,
     }
@@ -376,7 +376,7 @@ async def test_a_malformed_open_orders_body_at_connect_is_recorded_as_refused(
     tmp_path: Path,
 ) -> None:
     rig = _build_rig(tmp_path)
-    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [{"id": "x"}]}  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [{"id": "x"}]}
     await rig.client._connect()
     evidence = rig.client.read_startup_position_evidence()
     await rig.client._disconnect()
@@ -390,7 +390,7 @@ async def test_one_resting_order_at_connect_is_enumerated_into_the_evidence(
     tmp_path: Path,
 ) -> None:
     rig = _build_rig(tmp_path)
-    rig.read._payloads[OPEN_ORDERS_PATH] = _one_resting_order()  # type: ignore[attr-defined]
+    rig.read._payloads[OPEN_ORDERS_PATH] = _one_resting_order()
     await rig.client._connect()
     evidence = rig.client.read_startup_position_evidence()
     await rig.client._disconnect()

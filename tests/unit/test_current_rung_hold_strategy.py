@@ -579,7 +579,7 @@ class TestTakeNeverSubmits:
         rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
         strategy = rig.strategy
         submitted: list[object] = []
-        strategy.submit_order = submitted.append  # type: ignore[method-assign]
+        strategy.submit_order = submitted.append
         strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
         # LAX/SON/12/0/0 p_hold_lower=0.6982; ask=0.40 clears break-even easily.
         quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
@@ -601,7 +601,7 @@ class TestTakeNeverSubmits:
         strategy = rig.strategy
         assert strategy._order_submission_permit is None
         submitted: list[object] = []
-        strategy.submit_order = submitted.append  # type: ignore[method-assign]
+        strategy.submit_order = submitted.append
         strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
         quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
         strategy.on_quote_tick(quote)

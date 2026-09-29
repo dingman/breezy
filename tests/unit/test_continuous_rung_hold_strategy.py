@@ -729,7 +729,7 @@ def test_on_start_subscribes_order_book_depth_for_each_resolved_instrument(
 ) -> None:
     strategy = _register(store_path=store_path, instruments=(interior_instrument,))
     subscribed: list[object] = []
-    strategy.subscribe_order_book_depth = subscribed.append  # type: ignore[method-assign]
+    strategy.subscribe_order_book_depth = subscribed.append
 
     strategy.on_start()
 
@@ -742,7 +742,7 @@ def test_on_stop_unsubscribes_order_book_depth(
 ) -> None:
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     unsubscribed: list[object] = []
-    strategy.unsubscribe_order_book_depth = unsubscribed.append  # type: ignore[method-assign]
+    strategy.unsubscribe_order_book_depth = unsubscribed.append
 
     strategy.stop()
 
@@ -962,7 +962,7 @@ def test_hunt_tick_waits_while_the_account_wide_intent_is_open(
 
     def spy_maybe(*args: object, **kwargs: object) -> None:
         calls.append("maybe_submit")
-        return orig_maybe(*args, **kwargs)  # type: ignore[return-value]
+        return orig_maybe(*args, **kwargs)
 
     strategy._maybe_submit = spy_maybe  # type: ignore[method-assign]
 
@@ -1002,7 +1002,7 @@ def test_repeated_ticks_while_open_never_loop_and_the_alert_is_throttled(
 
     def spy_maybe(*args: object, **kwargs: object) -> None:
         calls.append("maybe_submit")
-        return orig_maybe(*args, **kwargs)  # type: ignore[return-value]
+        return orig_maybe(*args, **kwargs)
 
     strategy._maybe_submit = spy_maybe  # type: ignore[method-assign]
     sink = _RecordingSink()
@@ -1161,7 +1161,7 @@ def test_an_armed_strategy_consults_the_rearm_gate_after_the_first_attempt(
             key_instrument_id=str(INTERIOR_ID),
         )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -1197,7 +1197,7 @@ def test_an_armed_strategy_records_an_attempt_and_holds_in_flight(
     )
     assert strategy._latch is not None
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -1266,7 +1266,7 @@ def test_an_unarmed_strategy_never_records_an_attempt_across_many_eligible_depth
     assert strategy._order_submission_permit is None
     assert strategy._latch is not None
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
 
     for i in range(5):
@@ -1900,7 +1900,7 @@ def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
 
 def _mark_budget_exhausted(strategy: ContinuousRungHoldStrategy, utc_day: str) -> None:
     assert strategy._latch is not None
-    strategy._latch._store.set(  # type: ignore[attr-defined]
+    strategy._latch._store.set(
         f"{BUDGET_EXHAUSTED_KEY_PREFIX}{utc_day}", b"1",
     )
 
@@ -1922,7 +1922,7 @@ def test_a_marked_day_refuses_to_arm_and_leaves_inflight_and_the_attempt_counter
     utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
     _mark_budget_exhausted(strategy, utc_day)
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -2020,7 +2020,7 @@ def test_the_first_budget_denied_orders_inflight_record_is_orphaned_and_inert(
     utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
     _mark_budget_exhausted(strategy, utc_day)
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -2147,7 +2147,7 @@ class TestOpenIntentWaitObservability:
 
         strategy._latch.current_open_submit_intent = _boom  # type: ignore[method-assign]
         submitted: list[object] = []
-        strategy.submit_order = submitted.append  # type: ignore[method-assign]
+        strategy.submit_order = submitted.append
         strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
 
         strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
