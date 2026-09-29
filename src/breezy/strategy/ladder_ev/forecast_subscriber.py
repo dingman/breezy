@@ -31,12 +31,24 @@ from nautilus_trader.model.identifiers import ClientId
 from breezy.domain.forecast_point import ForecastPoint
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
-from breezy.strategy.ladder_ev.forecast_state import ForecastState
+from breezy.strategy.ladder_ev.forecast_state import (
+    NBP_QUANTILE_VARIABLES,
+    ForecastQuantileState,
+    ForecastState,
+)
 
-__all__ = ["FORECAST_SUBSCRIBER_VARIABLE", "ForecastStateActor"]
+__all__ = [
+    "FORECAST_SUBSCRIBER_VARIABLE",
+    "NBP_QUANTILE_MODEL",
+    "ForecastQuantileStateActor",
+    "ForecastStateActor",
+]
 
 #: The one forecast variable the ladder_ev decider consumes today.
 FORECAST_SUBSCRIBER_VARIABLE: str = "TXN"
+
+#: The one forecast model the quantile-vector decider consumes (SL-12).
+NBP_QUANTILE_MODEL: str = "NBM_NBP"
 
 
 class ForecastStateActor(Actor):
@@ -102,6 +114,73 @@ class ForecastStateActor(Actor):
             self.counters[f"absent_{data.absence_reason}"] += 1
             return
         state.push(
+            value_f=data.value_f,
+            available_at_ns=data.available_at_ns,
+            cycle_runtime_ns=data.cycle_runtime_ns,
+        )
+        self.counters["pushed"] += 1
+
+
+class ForecastQuantileStateActor(Actor):
+    """Subscribes to `ForecastPoint` and pushes each of the 7 NBP quantile/summary
+    variables into its station's :class:`ForecastQuantileState` (SL-12).
+
+    Purely additive alongside :class:`ForecastStateActor`: this class shares
+    the same subscription pattern (ONE shared ``DataType``, filtered here on
+    ``model`` and ``variable`` rather than left to a second `DataType`) but
+    owns its own per-station state, so the scalar TXN path stays untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        stations: tuple[str, ...],
+        model: str = NBP_QUANTILE_MODEL,
+        client_id: ClientId = NWS_BACKTEST_CLIENT_ID,
+    ) -> None:
+        super().__init__()
+        if not stations:
+            raise ValueError("`stations` must name at least one station")
+        self._model = model
+        self._client_id = client_id
+        self._states: dict[str, ForecastQuantileState] = {
+            station: ForecastQuantileState() for station in stations
+        }
+        self.counters: Counter[str] = Counter()
+
+    def state_for(self, station: str) -> ForecastQuantileState:
+        """The in-memory store for `station`. Raises for a station not served."""
+        try:
+            return self._states[station]
+        except KeyError:
+            raise KeyError(
+                f"{station!r} is not served by this forecast quantile subscriber; "
+                f"it holds {sorted(self._states)}"
+            ) from None
+
+    def on_start(self) -> None:
+        """Subscribe to the ONE shared `DataType` -- see `ForecastStateActor.on_start`."""
+        self.subscribe_data(nbm_forecast_point_data_type(), client_id=self._client_id)
+
+    def on_data(self, data: Data) -> None:
+        """Push one record. Never raises on a record it does not want."""
+        if not isinstance(data, ForecastPoint):
+            return
+        if data.model != self._model:
+            self.counters["foreign_model"] += 1
+            return
+        if data.variable not in NBP_QUANTILE_VARIABLES:
+            self.counters["foreign_variable"] += 1
+            return
+        state = self._states.get(data.station)
+        if state is None:
+            self.counters["unknown_station"] += 1
+            return
+        if data.value_f is None:
+            self.counters[f"absent_{data.absence_reason}"] += 1
+            return
+        state.push(
+            variable=data.variable,
             value_f=data.value_f,
             available_at_ns=data.available_at_ns,
             cycle_runtime_ns=data.cycle_runtime_ns,
