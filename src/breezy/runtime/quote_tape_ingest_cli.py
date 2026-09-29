@@ -2410,6 +2410,7 @@ def run(
         )
         _save_deferral_streak_state(streak_path, new_streak_state)
         if alert_due:
+            assert new_streak_state.first_deferred_utc is not None
             first_deferred = datetime.fromisoformat(new_streak_state.first_deferred_utc)
             age_s = int((now_utc - first_deferred).total_seconds())
             print(

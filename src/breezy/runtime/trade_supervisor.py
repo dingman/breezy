@@ -91,6 +91,7 @@ from breezy.runtime.trade_supervisor_core import (
     EscalationLoadOutcome,
     LaunchAction,
     PermitAlertAction,
+    PermitAlertDecision,
     PermitCapability,
     Phase,
     RelaunchCause,
@@ -961,6 +962,18 @@ def _send_permit_alert(
         log_decision("permit_watch_alert_send_failed", error_type=type(exc).__name__)
         return False
     return True
+
+
+def _require_permit_alert_fields(decision: PermitAlertDecision) -> tuple[str, str, AlertDetail]:
+    """[CF-12 Wave 1] ``decide_permit_alert`` fills ``event``, ``severity``
+    and ``detail`` on every branch that returns ``action=ALERT`` (see its own
+    docstring) -- both call sites below already guard on
+    ``decision.action is PermitAlertAction.ALERT`` before calling this, so
+    these fields are proven non-``None`` here, never actually missing."""
+    assert decision.event is not None
+    assert decision.severity is not None
+    assert decision.detail is not None
+    return decision.event, decision.severity, decision.detail
 
 
 # ---------------------------------------------------------------------------
@@ -2135,11 +2148,12 @@ def _permit_watch_adopt_and_evaluate(
         not_required_warned=state.permit_not_required_warned,
     )
     if decision.action is PermitAlertAction.ALERT:
+        event, severity, detail = _require_permit_alert_fields(decision)
         sent = _send_permit_alert(
             ports.alert_sink,
-            event=decision.event,
-            severity=decision.severity,
-            detail=decision.detail,
+            event=event,
+            severity=severity,
+            detail=detail,
         )
         if not sent:  # [A2] retried on the next poll, never latched as sent.
             return tracked_pid, node_log, state
@@ -2268,11 +2282,12 @@ def _contain_permit_watch_failure(
         not_required_warned=state.permit_not_required_warned,
     )
     if decision.action is PermitAlertAction.ALERT:
+        event, severity, detail = _require_permit_alert_fields(decision)
         sent = _send_permit_alert(
             ports.alert_sink,
-            event=decision.event,
-            severity=decision.severity,
-            detail=decision.detail,
+            event=event,
+            severity=severity,
+            detail=detail,
         )
         if not sent:  # [A2] retried on the next poll, never latched.
             return tracked_pid, node_log, state
