@@ -63,6 +63,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import math
 import random
 import statistics
@@ -93,6 +94,8 @@ __all__ = [
     "CRPS_GRID_HALF_WIDTH_F",
     "CRPS_GRID_STEP_F",
     "DEFAULT_BOOTSTRAP_DRAWS",
+    "DEFAULT_DELTA_BRACKET",
+    "DEFAULT_DELTA_XATOL",
     "DEFAULT_SPLITS",
     "G20_MONTH_MIN_DATES",
     "G20_MONTH_N",
@@ -107,7 +110,9 @@ __all__ = [
     "TAU_GRID",
     "C1Deviation",
     "C1Reevaluation",
+    "CalibrationFit",
     "CorrectionForm",
+    "DeltaFitDiagnostics",
     "G20GroupResult",
     "G20Result",
     "G20aResult",
@@ -141,13 +146,16 @@ __all__ = [
     "compute_n_min",
     "crps_normal",
     "crps_numerical",
+    "emos_params_from_draw_entry",
     "evaluate_g20",
     "evaluate_g20a",
     "evaluate_g21",
     "evaluate_g22",
     "evaluate_g23",
+    "fit_calibration",
     "fit_hierarchical_emos",
     "fit_shared_delta",
+    "fit_shared_delta_with_diagnostics",
     "fit_version_unshrunk",
     "holm_correction",
     "open_holdout",
@@ -160,6 +168,8 @@ __all__ = [
     "tau_fraction_sensitivity",
     "write_artefact",
 ]
+
+_logger = logging.getLogger(__name__)
 
 _SQRT2: Final[float] = math.sqrt(2.0)
 _SQRT_2PI: Final[float] = math.sqrt(2.0 * math.pi)
@@ -420,6 +430,16 @@ class VersionEstimate:
     a: float
     gamma: float
     n: int
+    #: SL-8b review item 2: ``scipy.optimize.OptimizeResult.success`` from the
+    #: minimum-CRPS descent that produced ``(a, gamma)``. ``True`` for every
+    #: caller that constructs a ``VersionEstimate`` by hand (tests, the
+    #: shrinkage math) -- only :func:`fit_version_unshrunk` itself, and
+    #: :func:`shrink_toward_lovo_pooled_mean` carrying its ``target``'s own
+    #: value through, ever set this to ``False``.
+    converged: bool = True
+    #: ``OptimizeResult.nfev`` from that same descent -- 0 for a hand-built
+    #: estimate.
+    nfev: int = 0
 
 
 def crps_normal(mu: float, sigma: float, observed: float) -> float:
@@ -470,8 +490,19 @@ def crps_numerical(
     return total
 
 
+#: Default Nelder-Mead iteration ceiling for :func:`fit_version_unshrunk`
+#: (SL-8b review item 2). Callers force non-convergence for tests by
+#: passing a small ``max_iterations`` (e.g. ``1``); production callers use
+#: the default.
+DEFAULT_VERSION_FIT_MAX_ITERATIONS: Final[int] = 200
+
+
 def fit_version_unshrunk(
-    rows: Sequence[VersionRow], *, method: CdfMethod, delta: float
+    rows: Sequence[VersionRow],
+    *,
+    method: CdfMethod,
+    delta: float,
+    max_iterations: int | None = None,
 ) -> VersionEstimate:
     """Minimum-CRPS point estimate of one version's ``(a_v, gamma_v)`` (plan
     S2.2; review item 1).
@@ -485,6 +516,15 @@ def fit_version_unshrunk(
     .apply_emos`) against every row's CLI outcome, via a deterministic
     Nelder-Mead descent (fixed start, fixed method, fixed tolerances -- no
     randomness) from that moment-matching start.
+
+    **Convergence (SL-8b review item 2).** ``scipy.optimize.OptimizeResult
+    .success`` and ``.nfev`` are inspected, never assumed: a non-converged
+    descent is logged at WARNING and surfaced on the returned
+    :class:`VersionEstimate` as ``converged=False`` -- the caller decides
+    what to do with a non-converged fit, but it is never accepted silently.
+    ``max_iterations`` overrides the Nelder-Mead ``maxiter`` option (default
+    :data:`DEFAULT_VERSION_FIT_MAX_ITERATIONS`); pass a small value (e.g.
+    ``1``) to force non-convergence deterministically in a test.
     """
     if not rows:
         raise ValueError("fit_version_unshrunk needs at least one row")
@@ -517,28 +557,59 @@ def fit_version_unshrunk(
         total_crps,
         x0=[a0, gamma0],
         method="Nelder-Mead",
-        options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": 200},
+        options={
+            "xatol": 1e-4,
+            "fatol": 1e-6,
+            "maxiter": DEFAULT_VERSION_FIT_MAX_ITERATIONS if max_iterations is None else max_iterations,
+        },
     )
+    converged = bool(result.success)
+    nfev = int(result.nfev)
+    if not converged:
+        _logger.warning(
+            "fit_version_unshrunk did not converge for version %r (n=%d, nfev=%d): %s",
+            rows[0].version,
+            len(rows),
+            nfev,
+            getattr(result, "message", ""),
+        )
     a_v, gamma_v = float(result.x[0]), float(result.x[1])
-    return VersionEstimate(version=rows[0].version, a=a_v, gamma=gamma_v, n=len(rows))
+    return VersionEstimate(
+        version=rows[0].version, a=a_v, gamma=gamma_v, n=len(rows), converged=converged, nfev=nfev
+    )
 
 
-def fit_shared_delta(
+#: Defaults shared by :func:`fit_shared_delta`/:func:`fit_shared_delta_with_diagnostics`
+#: and :func:`fit_calibration` (SL-8b pipeline glue).
+DEFAULT_DELTA_BRACKET: Final[tuple[float, float]] = (0.1, 3.0)
+DEFAULT_DELTA_XATOL: Final[float] = 1e-3
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaFitDiagnostics:
+    """:func:`fit_shared_delta_with_diagnostics`'s full result (SL-8b review
+    item 2) -- the bare delta plus the bounded scalar minimiser's own
+    ``OptimizeResult.success``/``.nfev``."""
+
+    delta: float
+    converged: bool
+    nfev: int
+
+
+def fit_shared_delta_with_diagnostics(
     rows_by_version: Mapping[str, Sequence[VersionRow]],
     *,
     method: CdfMethod,
-    bracket: tuple[float, float] = (0.1, 3.0),
-    xatol: float = 1e-3,
-) -> float:
-    """The shared delta, fitted by MINIMUM total CRPS across every version's
-    own rows (plan S2.2: "fitted by minimum CRPS on train"; review item 1).
-
-    For each candidate delta, every version in ``rows_by_version`` is refit
-    unshrunk via :func:`fit_version_unshrunk`, and the CRPS is summed across
-    ALL of every version's own rows; delta is chosen to minimise that total,
-    via a deterministic bounded scalar minimiser (fixed bracket, fixed
-    tolerance -- no randomness). Typically called with TRAIN rows (plan
-    S2.2), but takes whatever ``rows_by_version`` the caller supplies.
+    bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
+    xatol: float = DEFAULT_DELTA_XATOL,
+    max_iterations: int | None = None,
+) -> DeltaFitDiagnostics:
+    """:func:`fit_shared_delta`'s full result: the delta plus
+    ``scipy.optimize.OptimizeResult.success``/``.nfev`` from the bounded
+    scalar minimiser (SL-8b review item 2) -- inspected and logged, never
+    silently accepted. ``max_iterations`` overrides the minimiser's own
+    ``maxiter`` option; pass a small value (e.g. ``1``) to force
+    non-convergence deterministically in a test.
     """
     if not rows_by_version:
         raise ValueError("fit_shared_delta needs at least one version's rows")
@@ -556,10 +627,44 @@ def fit_shared_delta(
                 total += crps_numerical(calibrated_cdf, row.cli_tmax_f, center=row.percentiles.q50)
         return total
 
-    result = minimize_scalar(
-        total_crps_at, bounds=bracket, method="bounded", options={"xatol": xatol}
-    )
-    return float(result.x)
+    options: dict[str, float | int] = {"xatol": xatol}
+    if max_iterations is not None:
+        options["maxiter"] = max_iterations
+    result = minimize_scalar(total_crps_at, bounds=bracket, method="bounded", options=options)
+    converged = bool(result.success)
+    nfev = int(result.nfev)
+    if not converged:
+        _logger.warning(
+            "fit_shared_delta did not converge (bracket=%r, nfev=%d): %s",
+            bracket,
+            nfev,
+            getattr(result, "message", ""),
+        )
+    return DeltaFitDiagnostics(delta=float(result.x), converged=converged, nfev=nfev)
+
+
+def fit_shared_delta(
+    rows_by_version: Mapping[str, Sequence[VersionRow]],
+    *,
+    method: CdfMethod,
+    bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
+    xatol: float = DEFAULT_DELTA_XATOL,
+) -> float:
+    """The shared delta, fitted by MINIMUM total CRPS across every version's
+    own rows (plan S2.2: "fitted by minimum CRPS on train"; review item 1).
+
+    For each candidate delta, every version in ``rows_by_version`` is refit
+    unshrunk via :func:`fit_version_unshrunk`, and the CRPS is summed across
+    ALL of every version's own rows; delta is chosen to minimise that total,
+    via a deterministic bounded scalar minimiser (fixed bracket, fixed
+    tolerance -- no randomness). Typically called with TRAIN rows (plan
+    S2.2), but takes whatever ``rows_by_version`` the caller supplies.
+
+    Thin wrapper over :func:`fit_shared_delta_with_diagnostics` that returns
+    only the delta, preserving this function's original ``float`` return
+    contract; convergence is still inspected and logged inside that call.
+    """
+    return fit_shared_delta_with_diagnostics(rows_by_version, method=method, bracket=bracket, xatol=xatol).delta
 
 
 def shrink_toward_lovo_pooled_mean(
@@ -589,6 +694,11 @@ def shrink_toward_lovo_pooled_mean(
         a=w * target.a + (1.0 - w) * pooled_a,
         gamma=w * target.gamma + (1.0 - w) * pooled_gamma,
         n=target.n,
+        # Shrinkage does not refit -- it reweights `target`'s own already-fit
+        # (a, gamma) against a pooled mean -- so the shrunk estimate's
+        # convergence provenance is `target`'s own (SL-8b review item 2).
+        converged=target.converged,
+        nfev=target.nfev,
     )
 
 
@@ -737,15 +847,25 @@ def _bootstrap_version_emos_draws(
     delta: float,
     seed: int,
     draws: int,
+    resample_delta: bool = True,
+    delta_bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
+    delta_xatol: float = DEFAULT_DELTA_XATOL,
 ) -> tuple[EmosParams, ...]:
     """``draws`` seeded station-day cluster-bootstrap refits of ``(a_v,
-    gamma_v)`` for ONE version, each carrying the SAME shared ``delta``.
+    gamma_v)`` for ONE version.
 
-    Delta is not itself resampled per draw: it is fitted on a much larger
-    pooled corpus (:func:`fit_shared_delta`, typically over train rows), so
-    its own sampling uncertainty is not what a per-version interval is
-    meant to capture -- only ``(a_v, gamma_v)``'s per-version uncertainty is
-    resampled here (documented design choice, review item 3).
+    **Delta resampling (SL-8b review item 3, supersedes the prior
+    fixed-delta convention).** When ``resample_delta`` is ``True`` (the
+    default), EACH draw's own delta is refit on that SAME resample via
+    :func:`fit_shared_delta` restricted to this one version's drawn rows --
+    so the returned :class:`EmosParams` carries a genuinely per-draw
+    ``delta``, and the interval :func:`~breezy.strategy.ladder_ev
+    .quantile_density.rung_probability_interval` derives from these draws
+    reflects delta's own sampling uncertainty, not just ``(a_v,
+    gamma_v)``'s. ``resample_delta=False`` reproduces the ORIGINAL SL-8
+    behaviour -- every draw pinned to the single caller-supplied ``delta``
+    -- kept for the direct fixed-vs-resampled interval-width comparison
+    (``tests/unit/test_nbp_calibration.py``).
     """
     blocks = _clusters(rows, lambda row: (row.station, row.climate_day))
     if not blocks:
@@ -756,8 +876,13 @@ def _bootstrap_version_emos_draws(
         drawn: list[VersionRow] = []
         for _ in range(len(blocks)):
             drawn.extend(blocks[rng.randrange(len(blocks))])
-        estimate = fit_version_unshrunk(drawn, method=method, delta=delta)
-        out.append(EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta))
+        draw_delta = delta
+        if resample_delta:
+            draw_delta = fit_shared_delta(
+                {drawn[0].version: drawn}, method=method, bracket=delta_bracket, xatol=delta_xatol
+            )
+        estimate = fit_version_unshrunk(drawn, method=method, delta=draw_delta)
+        out.append(EmosParams(a=estimate.a, gamma=estimate.gamma, delta=draw_delta))
     return tuple(out)
 
 
@@ -769,6 +894,9 @@ def bootstrap_emos_draws(
     delta: float,
     seed: int = BOOTSTRAP_SEED,
     draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+    resample_delta: bool = True,
+    delta_bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
+    delta_xatol: float = DEFAULT_DELTA_XATOL,
 ) -> dict[str, VersionEmosDraws]:
     """``draws`` seeded station-day cluster-bootstrap draws of ``(a_v,
     gamma_v, delta)`` per version (review item 3), replacing the previous
@@ -778,7 +906,10 @@ def bootstrap_emos_draws(
     only train rows, already unshrunk and used purely as pooled-mean input)
     gets ``draws`` copies of its own point estimate -- there is no
     resampling population for it, so its interval collapses to the point,
-    which is honest rather than fabricated spread.
+    which is honest rather than fabricated spread. The POINT estimate
+    always carries the caller-supplied shared ``delta`` regardless of
+    ``resample_delta`` -- only the draws' own delta is resampled (SL-8b
+    review item 3).
     """
     result: dict[str, VersionEmosDraws] = {}
     for index, (version, estimate) in enumerate(sorted(shrunk_by_version.items())):
@@ -788,7 +919,14 @@ def bootstrap_emos_draws(
             result[version] = VersionEmosDraws(version=version, point=point, draws=(point,) * draws)
             continue
         version_draws = _bootstrap_version_emos_draws(
-            rows, method=method, delta=delta, seed=seed + index, draws=draws
+            rows,
+            method=method,
+            delta=delta,
+            seed=seed + index,
+            draws=draws,
+            resample_delta=resample_delta,
+            delta_bracket=delta_bracket,
+            delta_xatol=delta_xatol,
         )
         result[version] = VersionEmosDraws(version=version, point=point, draws=version_draws)
     return result
@@ -811,6 +949,9 @@ def fit_hierarchical_emos(
     delta: float,
     bootstrap_draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     bootstrap_seed: int = BOOTSTRAP_SEED,
+    resample_delta: bool = True,
+    delta_bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
+    delta_xatol: float = DEFAULT_DELTA_XATOL,
 ) -> HierarchicalEmosResult:
     """Fit + precision-weight-shrink ``(a_v, gamma_v)`` for every version,
     train-era versions included (review item 4), plus their bootstrap draws
@@ -876,6 +1017,9 @@ def fit_hierarchical_emos(
         delta=delta,
         seed=bootstrap_seed,
         draws=bootstrap_draws,
+        resample_delta=resample_delta,
+        delta_bracket=delta_bracket,
+        delta_xatol=delta_xatol,
     )
 
     return HierarchicalEmosResult(
@@ -885,6 +1029,85 @@ def fit_hierarchical_emos(
         tau_sensitivity=tau_selection,
         shrunk_by_version=shrunk,
         draws_by_version=draws_by_version,
+    )
+
+
+def _rows_by_version_for_splits(
+    rows: Sequence[VersionRow], *, splits: tuple[str, ...]
+) -> dict[str, list[VersionRow]]:
+    grouped: dict[str, list[VersionRow]] = {}
+    for row in rows:
+        if row.split in splits:
+            grouped.setdefault(row.version, []).append(row)
+    return grouped
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationFit:
+    """SL-8b pipeline glue: :func:`fit_shared_delta`'s output, wired straight
+    into :func:`fit_hierarchical_emos` in ONE entry point (SL-8b review item
+    1) -- the delta the per-version fits use (``hierarchical.delta``) always
+    equals ``delta`` on THIS object.
+    """
+
+    delta: float
+    delta_converged: bool
+    delta_nfev: int
+    hierarchical: HierarchicalEmosResult
+
+
+def fit_calibration(
+    all_rows: Sequence[VersionRow],
+    *,
+    method: CdfMethod,
+    delta_bracket: tuple[float, float] = DEFAULT_DELTA_BRACKET,
+    delta_xatol: float = DEFAULT_DELTA_XATOL,
+    delta_max_iterations: int | None = None,
+    bootstrap_draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
+    resample_delta: bool = True,
+) -> CalibrationFit:
+    """The single entry point: fit the shared delta, then fit + shrink every
+    version's ``(a_v, gamma_v)`` against THAT delta (SL-8b review item 1).
+
+    Delta is fitted on ``all_rows``' TRAIN rows when any are present (plan
+    S2.2: "fitted by minimum CRPS on train"), grouped by version. When
+    ``all_rows`` carries no train-split rows (e.g. a validate-only fixture),
+    it falls back to the validate/v5_fit_slice rows -- the same fit-eligible
+    rows :func:`fit_hierarchical_emos` itself uses -- so delta fitting never
+    needs a caller to pre-split its input. Either way, holdout rows are
+    NEVER used to fit delta, mirroring :func:`fit_hierarchical_emos`'s own
+    holdout filter (module docstring).
+    """
+    delta_rows_by_version = _rows_by_version_for_splits(all_rows, splits=("train",))
+    if not delta_rows_by_version:
+        delta_rows_by_version = _rows_by_version_for_splits(
+            all_rows, splits=("validate", "v5_fit_slice")
+        )
+    if not delta_rows_by_version:
+        raise ValueError(
+            "fit_calibration needs at least one train, validate, or v5_fit_slice row to fit delta"
+        )
+    delta_diagnostics = fit_shared_delta_with_diagnostics(
+        delta_rows_by_version,
+        method=method,
+        bracket=delta_bracket,
+        xatol=delta_xatol,
+        max_iterations=delta_max_iterations,
+    )
+    hierarchical = fit_hierarchical_emos(
+        all_rows,
+        method=method,
+        delta=delta_diagnostics.delta,
+        bootstrap_draws=bootstrap_draws,
+        bootstrap_seed=bootstrap_seed,
+        resample_delta=resample_delta,
+    )
+    return CalibrationFit(
+        delta=delta_diagnostics.delta,
+        delta_converged=delta_diagnostics.converged,
+        delta_nfev=delta_diagnostics.nfev,
+        hierarchical=hierarchical,
     )
 
 
@@ -1512,6 +1735,27 @@ def rung_bounds_from_calibration(
     return rung_probability_interval(percentiles, cdf_method, draws, rungs, level=level)
 
 
+def emos_params_from_draw_entry(entry: Sequence[float], *, fallback_delta: float) -> EmosParams:
+    """Parse one ``emos_draws_by_version`` JSON entry into :class:`EmosParams`
+    (SL-8b review item 3).
+
+    Accepts BOTH shapes: a 3-element ``[a, gamma, delta]`` entry (the
+    current schema -- each draw carries its OWN resampled delta) and a
+    2-element ``[a, gamma]`` entry (the pre-SL-8b schema, whose draws all
+    shared the artefact's single top-level ``delta``) -- ``fallback_delta``
+    (the artefact's own ``delta`` field) supplies the missing third value
+    for the old shape, so an artefact written before this schema change
+    still parses. Any other length is refused.
+    """
+    if len(entry) == 3:
+        a, gamma, delta = entry
+        return EmosParams(a=float(a), gamma=float(gamma), delta=float(delta))
+    if len(entry) == 2:
+        a, gamma = entry
+        return EmosParams(a=float(a), gamma=float(gamma), delta=float(fallback_delta))
+    raise ValueError(f"a draw entry must have 2 or 3 elements, got {len(entry)}: {entry!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class NbpCalibrationArtefact:
     schema_version: int
@@ -1523,13 +1767,16 @@ class NbpCalibrationArtefact:
     #: Point estimate ``(a_v, gamma_v)`` per version -- ``delta`` (shared)
     #: is recorded once, at ``delta`` above, not repeated per version.
     emos_params_by_version: Mapping[str, tuple[float, float]]
-    #: B seeded bootstrap draws of ``(a_v, gamma_v)`` per version (review
-    #: item 3) -- same shared-``delta`` convention as
-    #: ``emos_params_by_version``. Consumed by
+    #: B seeded bootstrap draws of ``(a_v, gamma_v, delta)`` per version
+    #: (SL-8b review item 3) -- EACH draw carries its OWN resampled delta
+    #: (:func:`bootstrap_emos_draws`'s ``resample_delta=True`` default),
+    #: unlike ``emos_params_by_version``'s point estimate, which stays
+    #: pinned to the shared ``delta`` above. Consumed by
     #: ``breezy.strategy.ladder_ev.quantile_density.rung_probability_interval``
-    #: after reconstructing each draw's :class:`EmosParams` with this
-    #: artefact's own ``delta``.
-    emos_draws_by_version: Mapping[str, tuple[tuple[float, float], ...]]
+    #: after reconstructing each draw's :class:`EmosParams` directly (or via
+    #: :func:`emos_params_from_draw_entry` when parsing JSON that may
+    #: predate this schema).
+    emos_draws_by_version: Mapping[str, tuple[tuple[float, float, float], ...]]
     n_min: int
     sigma_d: float
     #: Per-rung ``(p_point, p_lower, p_upper)`` (review item 3).
@@ -1548,7 +1795,7 @@ class NbpCalibrationArtefact:
                 for version, (a, gamma) in sorted(self.emos_params_by_version.items())
             },
             "emos_draws_by_version": {
-                version: [[a, gamma] for a, gamma in draws]
+                version: [[a, gamma, delta] for a, gamma, delta in draws]
                 for version, draws in sorted(self.emos_draws_by_version.items())
             },
             "n_min": self.n_min,

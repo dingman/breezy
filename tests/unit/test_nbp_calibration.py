@@ -500,6 +500,26 @@ def test_bootstrap_emos_draws_produces_the_requested_count_per_version() -> None
     )
     for version_draws in draws.values():
         assert len(version_draws.draws) == 4
+
+
+def test_bootstrap_emos_draws_with_resample_delta_false_pins_every_draws_delta() -> None:
+    # The pre-SL-8b fixed-delta convention, still reachable via
+    # resample_delta=False (SL-8b review item 3's own interval-width
+    # comparison needs both modes on the same input).
+    rows_by_version = _synthetic_rows_by_version()
+    shrunk_by_version = {
+        version: calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=1.0)
+        for version, rows in rows_by_version.items()
+    }
+    draws = calib.bootstrap_emos_draws(
+        rows_by_version,
+        shrunk_by_version,
+        method=CdfMethod.NORMAL,
+        delta=1.0,
+        draws=4,
+        resample_delta=False,
+    )
+    for version_draws in draws.values():
         for draw in version_draws.draws:
             assert draw.delta == pytest.approx(1.0)
 
@@ -793,8 +813,8 @@ def _fixed_artefact() -> calib.NbpCalibrationArtefact:
         kappa=120.0,
         emos_params_by_version={"v5.0": (0.5, 0.1), "v4.3": (0.0, 0.0)},
         emos_draws_by_version={
-            "v5.0": ((0.4, 0.08), (0.5, 0.1), (0.6, 0.12)),
-            "v4.3": ((-0.1, 0.0), (0.0, 0.0), (0.1, 0.0)),
+            "v5.0": ((0.4, 0.08, 1.0), (0.5, 0.1, 1.0), (0.6, 0.12, 1.0)),
+            "v4.3": ((-0.1, 0.0, 1.0), (0.0, 0.0, 1.0), (0.1, 0.0, 1.0)),
         },
         n_min=412,
         sigma_d=0.11,
@@ -818,7 +838,7 @@ def test_artefact_sha_is_stable_under_a_fixed_seed() -> None:
 def test_artefact_json_carries_emos_draws_by_version() -> None:
     payload = calib.artefact_json(_fixed_artefact())
     assert '"emos_draws_by_version"' in payload
-    assert '"v5.0":[[0.4,0.08],[0.5,0.1],[0.6,0.12]]' in payload
+    assert '"v5.0":[[0.4,0.08,1.0],[0.5,0.1,1.0],[0.6,0.12,1.0]]' in payload
 
 
 def test_artefact_json_round_trips_kappa_infinity_as_a_string() -> None:
@@ -851,3 +871,248 @@ def test_write_artefact_writes_json_and_sha256_sidecar(tmp_path: Path) -> None:
 
 def dataclasses_replace(instance: calib.MatchedEvent, **changes: object) -> calib.MatchedEvent:
     return dataclasses.replace(instance, **changes)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# SL-8b review item 1: pipeline glue -- fit_calibration wires
+# fit_shared_delta's output into fit_hierarchical_emos in one entry point.
+# ---------------------------------------------------------------------------
+
+
+def _calibration_fixture_rows() -> list[calib.VersionRow]:
+    rows: list[calib.VersionRow] = []
+    for version, offset in (("v4.3", 1.0), ("v5.0", 2.0)):
+        for i in range(3):
+            day = dt.date(2021, 1, 1) + dt.timedelta(days=i)
+            rows.append(_version_row(version, "train", day, "KMIA", 90.0 + offset, 2.0, 90.0 + offset + 0.3 * i))
+        for i in range(3):
+            day = dt.date(2025, 1, 1) + dt.timedelta(days=i)
+            rows.append(_version_row(version, "validate", day, "KMIA", 90.0 + offset, 2.0, 92.0 + offset))
+    return rows
+
+
+def test_fit_calibration_delta_matches_fit_shared_delta_on_the_same_train_rows() -> None:
+    rows = _calibration_fixture_rows()
+    train_by_version: dict[str, list[calib.VersionRow]] = {}
+    for row in rows:
+        if row.split == "train":
+            train_by_version.setdefault(row.version, []).append(row)
+    expected_delta = calib.fit_shared_delta(train_by_version, method=CdfMethod.NORMAL)
+
+    result = calib.fit_calibration(rows, method=CdfMethod.NORMAL, bootstrap_draws=2)
+
+    assert result.delta == pytest.approx(expected_delta)
+    # The SAME delta is what fit_hierarchical_emos actually fit the
+    # per-version (a_v, gamma_v) against -- the whole point of "one entry
+    # point" (review item 1).
+    assert result.hierarchical.delta == pytest.approx(expected_delta)
+
+
+def test_fit_calibration_falls_back_to_validate_rows_when_no_train_rows_present() -> None:
+    rows_by_version = _synthetic_rows_by_version(n_per_version=4, split="validate")
+    all_rows = [row for rows in rows_by_version.values() for row in rows]
+    expected_delta = calib.fit_shared_delta(rows_by_version, method=CdfMethod.NORMAL)
+
+    result = calib.fit_calibration(all_rows, method=CdfMethod.NORMAL, bootstrap_draws=2)
+
+    assert result.delta == pytest.approx(expected_delta)
+    assert result.hierarchical.delta == pytest.approx(expected_delta)
+
+
+def test_fit_calibration_refuses_when_no_eligible_rows_present() -> None:
+    holdout_only = [
+        _version_row("v5.0", "holdout", dt.date(2026, 7, 1), "KMIA", 90.0, 2.0, 92.0),
+    ]
+    with pytest.raises(ValueError, match="fit_calibration needs"):
+        calib.fit_calibration(holdout_only, method=CdfMethod.NORMAL)
+
+
+# ---------------------------------------------------------------------------
+# SL-8b review item 2: convergence is inspected, logged, and flagged --
+# never silently accepted.
+# ---------------------------------------------------------------------------
+
+
+def test_fit_version_unshrunk_flags_nonconvergence_when_forced(caplog: pytest.LogCaptureFixture) -> None:
+    rows = [
+        _version_row("v4.3", "validate", dt.date(2025, 6, 1), "KMIA", 90.0, 3.0, 90.0),
+        _version_row("v4.3", "validate", dt.date(2025, 6, 2), "KMIA", 90.0, 3.0, 92.0),
+        _version_row("v4.3", "validate", dt.date(2025, 6, 3), "KMIA", 90.0, 3.0, 88.0),
+    ]
+    with caplog.at_level("WARNING", logger="breezy.analysis.nbp_calibration"):
+        estimate = calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=1.0, max_iterations=1)
+
+    assert estimate.converged is False
+    assert estimate.nfev >= 1
+    assert any("did not converge" in record.message for record in caplog.records)
+
+
+def test_fit_version_unshrunk_converges_under_the_default_iteration_ceiling() -> None:
+    rows = [
+        _version_row("v4.3", "validate", dt.date(2025, 6, 1), "KMIA", 90.0, 3.0, 90.0),
+        _version_row("v4.3", "validate", dt.date(2025, 6, 2), "KMIA", 90.0, 3.0, 92.0),
+        _version_row("v4.3", "validate", dt.date(2025, 6, 3), "KMIA", 90.0, 3.0, 88.0),
+    ]
+    estimate = calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=1.0)
+    assert estimate.converged is True
+    assert estimate.nfev > 0
+
+
+def test_fit_shared_delta_with_diagnostics_flags_nonconvergence_when_forced(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rows_by_version = _synthetic_rows_by_version(n_per_version=3, split="train")
+    with caplog.at_level("WARNING", logger="breezy.analysis.nbp_calibration"):
+        diagnostics = calib.fit_shared_delta_with_diagnostics(
+            rows_by_version, method=CdfMethod.NORMAL, bracket=(0.2, 2.0), max_iterations=1
+        )
+
+    assert diagnostics.converged is False
+    assert diagnostics.nfev >= 1
+    assert any("did not converge" in record.message for record in caplog.records)
+
+
+def test_fit_shared_delta_with_diagnostics_converges_under_default_settings() -> None:
+    rows_by_version = _synthetic_rows_by_version(n_per_version=3, split="train")
+    diagnostics = calib.fit_shared_delta_with_diagnostics(
+        rows_by_version, method=CdfMethod.NORMAL, bracket=(0.2, 2.0)
+    )
+    assert diagnostics.converged is True
+    assert diagnostics.delta == pytest.approx(
+        calib.fit_shared_delta(rows_by_version, method=CdfMethod.NORMAL, bracket=(0.2, 2.0))
+    )
+
+
+def test_shrink_toward_lovo_pooled_mean_carries_the_targets_convergence_through() -> None:
+    target = calib.VersionEstimate(version="v5.0", a=3.0, gamma=0.5, n=50, converged=False, nfev=1)
+    others = [calib.VersionEstimate(version="v4.3", a=0.0, gamma=0.0, n=200)]
+    shrunk = calib.shrink_toward_lovo_pooled_mean(target, others, kappa=0.0)
+    assert shrunk.converged is False
+    assert shrunk.nfev == 1
+
+
+# ---------------------------------------------------------------------------
+# SL-8b review item 3: delta is resampled inside the bootstrap -- each draw
+# carries its OWN refit delta, and the resulting interval never narrows
+# relative to the old fixed-delta convention.
+# ---------------------------------------------------------------------------
+
+
+def _skewed_bootstrap_rows() -> list[calib.VersionRow]:
+    # A deliberately non-trivial residual pattern across station-days, so
+    # different cluster resamples fit genuinely different deltas.
+    clis = (90.0, 91.5, 88.0, 93.0, 89.0, 94.0, 87.5, 90.5)
+    return [
+        _version_row("v5.0", "validate", dt.date(2025, 1, 1) + dt.timedelta(days=i), "KMIA", 90.0, 3.0, cli)
+        for i, cli in enumerate(clis)
+    ]
+
+
+def test_bootstrap_draws_now_carry_a_per_draw_delta_that_is_not_all_identical() -> None:
+    rows = _skewed_bootstrap_rows()
+    shared_delta = 1.0
+    shrunk_by_version = {
+        "v5.0": calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=shared_delta),
+    }
+    draws = calib.bootstrap_emos_draws(
+        {"v5.0": rows},
+        shrunk_by_version,
+        method=CdfMethod.NORMAL,
+        delta=shared_delta,
+        draws=8,
+        resample_delta=True,
+    )
+    deltas = {draw.delta for draw in draws["v5.0"].draws}
+    # At least one resampled draw disagrees with the shared point delta --
+    # resampling is actually happening, not silently collapsing back to it.
+    assert deltas != {shared_delta}
+
+
+def test_resampled_delta_interval_never_narrows_relative_to_fixed_delta() -> None:
+    rows = _skewed_bootstrap_rows()
+    shared_delta = 1.0
+    shrunk_by_version = {
+        "v5.0": calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=shared_delta),
+    }
+    percentiles = _percentiles(90.0, sd=3.0)
+    rungs = (Rung("lt_90", None, 89), Rung("90_93", 90, 93), Rung("gt_93", 94, None))
+
+    fixed_draws = calib.bootstrap_emos_draws(
+        {"v5.0": rows},
+        shrunk_by_version,
+        method=CdfMethod.NORMAL,
+        delta=shared_delta,
+        draws=12,
+        resample_delta=False,
+    )["v5.0"].draws
+    resampled_draws = calib.bootstrap_emos_draws(
+        {"v5.0": rows},
+        shrunk_by_version,
+        method=CdfMethod.NORMAL,
+        delta=shared_delta,
+        draws=12,
+        resample_delta=True,
+    )["v5.0"].draws
+
+    fixed_bounds = calib.rung_bounds_from_calibration(percentiles, CdfMethod.NORMAL, fixed_draws, rungs)
+    resampled_bounds = calib.rung_bounds_from_calibration(
+        percentiles, CdfMethod.NORMAL, resampled_draws, rungs
+    )
+    # A per-rung comparison, not an exact one: independent re-fits (each
+    # draw's own fit_shared_delta bracket search) carry ordinary
+    # float/optimizer noise on the order of 1e-5 relative, which is not
+    # "narrower" in any meaningful sense -- the total width across every
+    # rung is the robust statistic review item 3 actually cares about.
+    fixed_total_width = sum(upper - lower for _, lower, upper in fixed_bounds.values())
+    resampled_total_width = sum(upper - lower for _, lower, upper in resampled_bounds.values())
+    assert resampled_total_width >= fixed_total_width - 1e-3, (fixed_total_width, resampled_total_width)
+
+
+def test_emos_params_from_draw_entry_prefers_its_own_delta() -> None:
+    params = calib.emos_params_from_draw_entry([0.3, 0.1, 1.4], fallback_delta=1.0)
+    assert params == EmosParams(a=0.3, gamma=0.1, delta=1.4)
+
+
+def test_emos_params_from_draw_entry_falls_back_to_the_artefact_delta_for_the_old_2_element_shape() -> None:
+    params = calib.emos_params_from_draw_entry([0.3, 0.1], fallback_delta=1.4)
+    assert params == EmosParams(a=0.3, gamma=0.1, delta=1.4)
+
+
+def test_emos_params_from_draw_entry_refuses_an_unexpected_length() -> None:
+    with pytest.raises(ValueError, match="2 or 3 elements"):
+        calib.emos_params_from_draw_entry([0.3], fallback_delta=1.0)
+
+
+# ---------------------------------------------------------------------------
+# SL-8b review item 4: p_point consistency -- the probability a G2.2/G2.3
+# scorer uses for one event equals the artefact's p_point for the same
+# inputs, because both are the mean over the same draws.
+# ---------------------------------------------------------------------------
+
+
+def test_p_point_equals_the_manual_mean_over_draws_a_scorer_would_compute() -> None:
+    percentiles = _percentiles(90.0, sd=3.0)
+    rungs = (Rung("lt_90", None, 89), Rung("90_93", 90, 93), Rung("gt_93", 94, None))
+    draws = (
+        EmosParams(a=0.2, gamma=0.05, delta=1.0),
+        EmosParams(a=0.4, gamma=0.10, delta=1.1),
+        EmosParams(a=-0.1, gamma=-0.05, delta=0.9),
+        EmosParams(a=0.6, gamma=0.15, delta=1.2),
+    )
+
+    bounds = calib.rung_bounds_from_calibration(percentiles, CdfMethod.NORMAL, draws, rungs)
+
+    # Reconstruct what a G2.2/G2.3 scorer would compute for ONE event's
+    # p_m2 from PUBLIC building blocks only: the base CDF, apply_emos under
+    # each draw, and rung_probabilities -- never reaching into
+    # rung_bounds_from_calibration's own internals.
+    base_cdf = build_cdf(CdfMethod.NORMAL, percentiles)
+    from breezy.strategy.ladder_ev.quantile_density import rung_probabilities
+
+    for rung_id in ("lt_90", "90_93", "gt_93"):
+        per_draw = [
+            rung_probabilities(apply_emos(base_cdf, percentiles, draw), rungs)[rung_id] for draw in draws
+        ]
+        manual_p_point = sum(per_draw) / len(per_draw)
+        artefact_p_point = bounds[rung_id][0]
+        assert manual_p_point == pytest.approx(artefact_p_point, abs=1e-12)
