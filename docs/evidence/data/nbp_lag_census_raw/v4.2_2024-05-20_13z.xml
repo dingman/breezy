@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>noaa-nbm-grib2-pds</Name><Prefix>blend.20240520/13/text/blend_nbptx</Prefix><KeyCount>1</KeyCount><MaxKeys>5</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>blend.20240520/13/text/blend_nbptx.t13z</Key><LastModified>2024-05-20T14:05:54.000Z</LastModified><ETag>&quot;6c5a3e55992a61e88c315fc25cdf8ff5&quot;</ETag><Size>34806674</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>
