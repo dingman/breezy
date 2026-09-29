@@ -143,6 +143,12 @@ forbidden_modules = [
     "breezy.persistence.archive_cache",
     "breezy.persistence.archive_request",
     "breezy.ingest.archive_records",
+    # SL-4 (FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md §7 row 4,
+    # L-12): the derived NBP-backfill store. Live code sees calibration only
+    # through the sha-pinned manifest artefact (plan §3.2 item 9); this store
+    # is `scripts/analysis/nbp_backfill.py`'s own backfill output, never a
+    # settlement/strategy import.
+    "breezy.persistence.nbp_derived_store",
 ]
 allow_indirect_imports = false
 
