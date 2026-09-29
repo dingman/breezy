@@ -141,7 +141,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from nautilus_trader.common.actor import Actor
 
@@ -204,7 +204,7 @@ class WireFeeCoefficientError(Exception):
     """The wire fee-schedule read is missing or malformed. Never a default."""
 
 
-class _PublicReadClient:
+class _PublicReadClient(Protocol):
     """The one method this module calls on a `PolymarketUSHttpClient`."""
 
     async def get_public(

@@ -56,7 +56,7 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -356,7 +356,7 @@ def read_family_halt_rows_readonly(
     family_id: str,
     *,
     busy_timeout_s: float = 1.0,
-    connect: object = sqlite3.connect,
+    connect: Callable[..., sqlite3.Connection] = sqlite3.connect,
 ) -> tuple[bytes | None, bytes | None]:
     """Read legacy and per-family halt rows through a SQLite read-only URI."""
     key = family_halt_key(family_id)
@@ -714,6 +714,16 @@ class TrialDayLatch:
             )
         return self._family_id
 
+    def _require_family_halt_key(self) -> str:
+        """[CF-12 Wave 1] ``_require_family_id`` raises unless both
+        ``_family_id`` and ``_family_halt_key`` are bound together (see
+        ``__init__``); once it returns without raising, ``_family_halt_key``
+        is proven non-``None`` here too -- narrows it for every halt-key
+        call site below, never actually missing."""
+        self._require_family_id()
+        assert self._family_halt_key is not None
+        return self._family_halt_key
+
     @property
     def family_id(self) -> str | None:
         """The family id bound for halt operations, if any."""
@@ -1024,7 +1034,7 @@ class TrialDayLatch:
         this SAME flock.
         """
         self._require_held()
-        self._require_family_id()
+        halt_key = self._require_family_halt_key()
         bucket_key = f"{DUPLICATE_FILL_KEY_PREFIX}{venue_order_id}"
         if self._store.get(bucket_key) is None:
             payload = {
@@ -1047,7 +1057,7 @@ class TrialDayLatch:
                 "familyId": self._family_id,
             }
             self._store.set(
-                self._family_halt_key,
+                halt_key,
                 json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
             )
 
@@ -1126,7 +1136,7 @@ class TrialDayLatch:
         wins, mirroring :meth:`record_duplicate_fill`'s own idempotency.
         """
         self._require_held()
-        self._require_family_id()
+        halt_key = self._require_family_halt_key()
         if self.is_family_halted():
             return
         halt_payload = {
@@ -1138,7 +1148,7 @@ class TrialDayLatch:
             "familyId": self._family_id,
         }
         self._store.set(
-            self._family_halt_key,
+            halt_key,
             json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
         )
 
@@ -1164,7 +1174,7 @@ class TrialDayLatch:
         cause wins, mirroring :meth:`record_duplicate_fill`'s own idempotency.
         """
         self._require_held()
-        self._require_family_id()
+        halt_key = self._require_family_halt_key()
         if self.is_family_halted():
             return
         halt_payload = {
@@ -1176,18 +1186,19 @@ class TrialDayLatch:
             "familyId": self._family_id,
         }
         self._store.set(
-            self._family_halt_key,
+            halt_key,
             json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
         )
 
     def family_halt_state(self) -> FamilyHaltReading:
         """Read this latch's per-family halt state plus the legacy attribution row."""
         self._require_held()
-        self._require_family_id()
+        family_id = self._require_family_id()
+        halt_key = self._require_family_halt_key()
         return decode_family_halt_state(
-            self._family_id,
+            family_id,
             self._store.get(LEGACY_FAMILY_HALT_KEY),
-            self._store.get(self._family_halt_key),
+            self._store.get(halt_key),
         )
 
     def is_family_halted(self) -> bool:
@@ -1266,8 +1277,9 @@ class TrialDayLatch:
         """
         self._require_held()
         family_id = self._require_family_id()
+        halt_key = self._require_family_halt_key()
         legacy_raw = self._store.get(LEGACY_FAMILY_HALT_KEY)
-        family_raw = self._store.get(self._family_halt_key)
+        family_raw = self._store.get(halt_key)
         reading = decode_family_halt_state(family_id, legacy_raw, family_raw)
         if reading.legacy == "halts_all":
             raise TrialDayLatchError(
@@ -1293,7 +1305,7 @@ class TrialDayLatch:
             json.dumps(audit_payload, sort_keys=True).encode("utf-8"),
         )
         if family_raw is not None and family_raw != _HALT_CLEARED_MARKER:
-            self._store.set(self._family_halt_key, _HALT_CLEARED_MARKER)
+            self._store.set(halt_key, _HALT_CLEARED_MARKER)
         if (
             family_id == LEGACY_HALT_ATTRIBUTED_FAMILY_ID
             and classify_legacy(legacy_raw) == "attributable_to_v4"
