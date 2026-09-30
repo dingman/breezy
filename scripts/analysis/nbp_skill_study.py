@@ -1486,7 +1486,16 @@ def _g20_to_json(result: G20Result | G20aResult, *, holm_family_size: int) -> _G
     }
 
 
-def _g21_to_json(result: G21Result) -> _G21GateJson:
+#: SL-8d coordinator correction (item 2b): every validate-stage row
+#: currently scored by G2.1/G2.2/G2.3 is, by plan design, drawn from a
+#: version that was ALSO used to fit that version's own (a_v, gamma_v) --
+#: the decisive verdict comes from the sealed holdout, never this rehearsal.
+#: Both labels are carried into the JSON `statistics` and the evidence note.
+IN_SAMPLE_LABEL: Final[str] = "in-sample (by plan design) -- diagnostic only"
+OUT_OF_SAMPLE_LABEL: Final[str] = "out-of-sample"
+
+
+def _g21_to_json(result: G21Result, *, sample_label: str) -> _G21GateJson:
     buckets: list[_BucketJson] = [
         {
             "lower": bucket.lower,
@@ -1505,19 +1514,20 @@ def _g21_to_json(result: G21Result) -> _G21GateJson:
     return {
         "status": status,
         "n": sum(bucket.n for bucket in result.buckets),
-        "statistics": {"buckets": buckets},
+        "statistics": {"buckets": buckets, "sample_label": sample_label},
         "cis": {},
         "buckets": buckets,
     }
 
 
-def _g22_to_json(result: SkillGateResult, *, n: int) -> _GateJson:
+def _g22_to_json(result: SkillGateResult, *, n: int, sample_label: str) -> _GateJson:
     return {
         "status": _status_from_bool(result.passed),
         "n": n,
         "statistics": {
             "brier_diff_point": result.brier_diff_point,
             "d_res_point": result.d_res_point,
+            "sample_label": sample_label,
         },
         "cis": {
             "brier_diff_ci": list(result.brier_diff_ci),
@@ -1526,19 +1536,32 @@ def _g22_to_json(result: SkillGateResult, *, n: int) -> _GateJson:
     }
 
 
-def _g23_to_json(result: G23Result, *, n: int) -> _GateJson:
+def _g23_to_json(result: G23Result, *, n: int, sample_label: str) -> _GateJson:
     return {
         "status": _status_from_bool(result.passed),
         "n": n,
-        "statistics": {"d_res_point": result.d_res_point},
+        "statistics": {"d_res_point": result.d_res_point, "sample_label": sample_label},
         "cis": {"d_res_ci": list(result.d_res_ci)},
     }
+
+
+def _untested_gate(*, sample_label: str) -> _GateJson:
+    return {"status": "UNTESTED", "n": 0, "statistics": {"sample_label": sample_label}, "cis": {}}
 
 
 def _fit_not_converged_gates() -> dict[str, _GateJson]:
     return {
         gate: {"status": FIT_STATUS_NOT_CONVERGED, "n": 0, "statistics": {}, "cis": {}}
-        for gate in ("G2.0", "G2.0a", "G2.1", "G2.2", "G2.3")
+        for gate in (
+            "G2.0",
+            "G2.0a",
+            "G2.1",
+            "G2.1_out_of_sample",
+            "G2.2",
+            "G2.2_out_of_sample",
+            "G2.3",
+            "G2.3_out_of_sample",
+        )
     }
 
 
@@ -1626,21 +1649,22 @@ def run_validate_gates_from_rows(
     validate_rows = [row for row in pre_holdout_rows if row.split == "validate"]
     validate_events_source = [event for event in pre_holdout_events if event.split == "validate"]
 
-    # Item 2 (review): the calibration fit never sees VALIDATE rows -- this
-    # validate-stage rehearsal scores VALIDATE with the gates below, so
-    # fitting on it too would be in-sample leakage. Plan S2.2, quoted
-    # verbatim: "Each version's parameters are fitted on its own pre-holdout
-    # rows: train for the 2020-2024 versions, validation for v4.2 (rows
-    # before 2025-05-27) and v4.3, and the v5.0 fit slice (2026-05-04..
-    # 06-30) for v5.0." This rehearsal simplifies that to TRAIN plus the
-    # v5.0 fit slice only -- never VALIDATE, because VALIDATE is what the
-    # gates below score.
-    fit_input_rows = [row for row in pre_holdout_rows if row.split != "validate"]
-
+    # Item 2 (coordinator correction, superseding the SL-8d review's original
+    # finding): the calibration fit sees EVERY pre-holdout row, VALIDATE
+    # included. Plan S2.2, quoted verbatim: "Each version's parameters are
+    # fitted on its own pre-holdout rows: train for the 2020-2024 versions,
+    # validation for v4.2 (rows before 2025-05-27) and v4.3, and the v5.0 fit
+    # slice (2026-05-04..06-30) for v5.0." Excluding VALIDATE would leave
+    # v4.2/v4.3 with no rows to fit at all, which deviates from the plan.
+    # Scoring validation rows that a version was fitted on is by design at
+    # this stage -- the decisive S2 verdict comes from the sealed holdout,
+    # never this rehearsal -- so every gate below that scores a
+    # per-version-fitted row is labelled `IN_SAMPLE_LABEL`, and G2.1/G2.2/
+    # G2.3 are ALSO reported over the out-of-sample subset only (item 2b).
     fit = (
         calibration_fit
         if calibration_fit is not None
-        else fit_calibration(fit_input_rows, method=cdf_method)
+        else fit_calibration(pre_holdout_rows, method=cdf_method)
     )
     fit_status = _fit_status_from_calibration(fit)
     kappa_curve: list[_KappaCurveJson] = [
@@ -1648,11 +1672,25 @@ def run_validate_gates_from_rows(
         for score in fit.hierarchical.kappa_selection.curve
     ]
 
+    # A version is "in-sample" for these gates iff its OWN pre-holdout rows
+    # include at least one VALIDATE row (i.e. its fit actually touched
+    # validation data) -- the only versions the plan fits on validation rows
+    # (v4.2, v4.3). A comparator event whose version never appears here (a
+    # train-era version, fitted purely on train) is genuinely out-of-sample:
+    # its validate-split row was scored against a fit that never saw any
+    # validation data for that version.
+    in_sample_versions = frozenset(
+        row.version for row in pre_holdout_rows if row.split == "validate"
+    )
+    out_of_sample_events_source = [
+        event for event in validate_events_source if event.version not in in_sample_versions
+    ]
+
     gate_days = [row.climate_day for row in validate_rows]
     gate_days.extend(event.climate_day for event in validate_events_source)
     coverage_counts: _CoverageCountsJson = {
-        "fit_rows": len(fit_input_rows),
-        "train_fit_rows": sum(1 for row in fit_input_rows if row.split == "train"),
+        "fit_rows": len(pre_holdout_rows),
+        "train_fit_rows": sum(1 for row in pre_holdout_rows if row.split == "train"),
         "validate_version_rows": len(validate_rows),
         "validate_comparator_events": len(validate_events_source),
         "holdout_version_rows_filtered": len(holdout_version_rows),
@@ -1685,7 +1723,7 @@ def run_validate_gates_from_rows(
     residual_rows = _g20_rows(validate_rows, calibration_fit=fit)
     train_day_lengths = [
         _daylight_hours(row.station, row.climate_day)
-        for row in fit_input_rows
+        for row in pre_holdout_rows
         if row.split == "train"
     ]
     tercile_edges = _tercile_edges(train_day_lengths)
@@ -1711,23 +1749,59 @@ def run_validate_gates_from_rows(
         stratum_of_station=stratum_of_station,
         iterations=bootstrap_iterations,
     )
+    # Item 2b (coordinator correction): the OUT-OF-SAMPLE subset of matched
+    # events, scored through the SAME fit -- never re-fit -- so G2.1/G2.2/
+    # G2.3 can also be read on rows whose version's fit never touched
+    # validation data.
+    matched_events_oos = validate_gate_events_from_comparator_events(
+        out_of_sample_events_source,
+        calibration_fit=fit,
+        cdf_method=cdf_method,
+    )
+
     gates: dict[str, _GateJson] = {}
     gates["G2.0"] = _g20_to_json(g20_result, holm_family_size=holm_family_size)
     gates["G2.0a"] = _g20_to_json(g20a_result, holm_family_size=holm_family_size)
+
     rung_events = _rung_events(matched_events)
-    gates["G2.1"] = _g21_to_json(evaluate_g21(rung_events, iterations=bootstrap_iterations))
+    rung_events_oos = _rung_events(matched_events_oos)
+    gates["G2.1"] = _g21_to_json(
+        evaluate_g21(rung_events, iterations=bootstrap_iterations), sample_label=IN_SAMPLE_LABEL
+    )
+    gates["G2.1_out_of_sample"] = _g21_to_json(
+        evaluate_g21(rung_events_oos, iterations=bootstrap_iterations),
+        sample_label=OUT_OF_SAMPLE_LABEL,
+    )
+
     if matched_events:
         gates["G2.2"] = _g22_to_json(
             evaluate_g22(matched_events, iterations=bootstrap_iterations),
             n=len(matched_events),
+            sample_label=IN_SAMPLE_LABEL,
         )
         gates["G2.3"] = _g23_to_json(
             evaluate_g23(matched_events, iterations=bootstrap_iterations),
             n=len(matched_events),
+            sample_label=IN_SAMPLE_LABEL,
         )
     else:
-        gates["G2.2"] = {"status": "UNTESTED", "n": 0, "statistics": {}, "cis": {}}
-        gates["G2.3"] = {"status": "UNTESTED", "n": 0, "statistics": {}, "cis": {}}
+        gates["G2.2"] = _untested_gate(sample_label=IN_SAMPLE_LABEL)
+        gates["G2.3"] = _untested_gate(sample_label=IN_SAMPLE_LABEL)
+
+    if matched_events_oos:
+        gates["G2.2_out_of_sample"] = _g22_to_json(
+            evaluate_g22(matched_events_oos, iterations=bootstrap_iterations),
+            n=len(matched_events_oos),
+            sample_label=OUT_OF_SAMPLE_LABEL,
+        )
+        gates["G2.3_out_of_sample"] = _g23_to_json(
+            evaluate_g23(matched_events_oos, iterations=bootstrap_iterations),
+            n=len(matched_events_oos),
+            sample_label=OUT_OF_SAMPLE_LABEL,
+        )
+    else:
+        gates["G2.2_out_of_sample"] = _untested_gate(sample_label=OUT_OF_SAMPLE_LABEL)
+        gates["G2.3_out_of_sample"] = _untested_gate(sample_label=OUT_OF_SAMPLE_LABEL)
 
     # Item 4 (review): sigma_d/n_min/status/w_v measured from real
     # validation data -- never the hard-coded n_min=0, sigma_d=0.0.
@@ -1800,11 +1874,25 @@ def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date
         "",
     ]
     if isinstance(gates, Mapping):
-        for gate_name in ("G2.0", "G2.0a", "G2.1", "G2.2", "G2.3"):
+        for gate_name in (
+            "G2.0",
+            "G2.0a",
+            "G2.1",
+            "G2.1_out_of_sample",
+            "G2.2",
+            "G2.2_out_of_sample",
+            "G2.3",
+            "G2.3_out_of_sample",
+        ):
             gate = gates.get(gate_name, {})
             status = gate.get("status") if isinstance(gate, Mapping) else None
             n_value = gate.get("n") if isinstance(gate, Mapping) else None
-            lines.append(f"- {gate_name}: `{status}` (n={n_value})")
+            gate_statistics = gate.get("statistics") if isinstance(gate, Mapping) else None
+            sample_label = (
+                gate_statistics.get("sample_label") if isinstance(gate_statistics, Mapping) else None
+            )
+            label_suffix = f" [{sample_label}]" if sample_label else ""
+            lines.append(f"- {gate_name}: `{status}` (n={n_value}){label_suffix}")
     lines.extend(
         [
             "",

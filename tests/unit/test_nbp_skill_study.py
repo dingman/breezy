@@ -1102,7 +1102,14 @@ def test_validate_gate_runner_filters_mistagged_holdout_climate_day_before_fit_a
         write_candidate_artefact=False,
     )
 
-    assert [row.climate_day for row in captured_fit_rows] == [dt.date(2024, 1, 1)]
+    # Item 1 only (item 2 was corrected by the coordinator: validate rows are
+    # NOT excluded from the fit -- v4.2/v4.3 are fitted on their own
+    # validation rows by plan design, plan S2.2). Only the row dated on/after
+    # the holdout start is ever dropped, regardless of its `split` tag.
+    assert sorted(row.climate_day for row in captured_fit_rows) == [
+        dt.date(2024, 1, 1),
+        dt.date(2025, 6, 3),
+    ]
     assert result["coverage_counts"]["validate_version_rows"] == 1
     assert result["coverage_counts"]["validate_comparator_events"] == 1
     assert result["coverage_counts"]["holdout_version_rows_filtered"] == 1
@@ -1110,33 +1117,170 @@ def test_validate_gate_runner_filters_mistagged_holdout_climate_day_before_fit_a
     assert result["coverage_counts"]["gate_climate_day_max"] < DEFAULT_SPLITS.holdout_start.isoformat()
 
 
-def test_validate_rows_never_enter_parameter_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fit_calibration_receives_every_pre_holdout_row_per_plan_s2_2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coordinator correction (SL-8d item 2): plan S2.2, quoted verbatim in
+    `run_validate_gates_from_rows`, fits v4.2 on its own validation rows
+    (before 2025-05-27) and v4.3 on its own validation rows, train-era
+    versions on train, and v5.0 on the v5.0 fit slice -- so the fit sees
+    EVERY pre-holdout row, never a subset that excludes VALIDATE. Only
+    holdout-dated rows (item 1) are ever dropped before the fit."""
     captured_fit_rows: list[calib.VersionRow] = []
 
     def fake_fit_calibration(
         rows: Sequence[calib.VersionRow], *, method: CdfMethod
     ) -> calib.CalibrationFit:
         captured_fit_rows.extend(rows)
-        return _fit_with_params()
+        return _fit_with_versions("v4.1", "v4.2", "v4.3", "v5.0")
 
     monkeypatch.setattr(nbp_skill_study, "fit_calibration", fake_fit_calibration)
 
-    result = nbp_skill_study.run_validate_gates_from_rows(
+    nbp_skill_study.run_validate_gates_from_rows(
         version_rows=[
-            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
-            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
-            _version_row(split="v5_fit_slice", climate_day=dt.date(2026, 6, 1)),
+            _version_row(split="train", version="v4.1", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", version="v4.2", climate_day=dt.date(2025, 3, 1)),
+            _version_row(split="validate", version="v4.3", climate_day=dt.date(2025, 6, 3)),
+            _version_row(split="v5_fit_slice", version="v5.0", climate_day=dt.date(2026, 6, 1)),
         ],
-        comparator_events=[
-            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
-        ],
+        comparator_events=[],
         artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
         bootstrap_iterations=3,
         write_candidate_artefact=False,
     )
 
-    assert {row.split for row in captured_fit_rows} == {"train", "v5_fit_slice"}
-    assert result["coverage_counts"]["validate_version_rows"] == 1
+    assert {row.version for row in captured_fit_rows} == {"v4.1", "v4.2", "v4.3", "v5.0"}
+    assert {row.split for row in captured_fit_rows} == {"train", "validate", "v5_fit_slice"}
+
+
+def test_train_era_version_shrunk_estimate_is_its_own_unshrunk_train_fit() -> None:
+    """A train-era version's point estimate is fitted UNSHRUNK on its OWN
+    train rows alone (plan S2.2; `nbp_calibration` review item 4) -- adding
+    MORE validation-era versions to the same calibration run must never move
+    it, proving train-era versions never see validation rows."""
+    from breezy.analysis.nbp_calibration import fit_calibration as real_fit_calibration
+
+    train_only_rows = [
+        _version_row(
+            split="train", version="v4.1", climate_day=dt.date(2024, 1, d), cli_tmax_f=88.0 + d
+        )
+        for d in range(1, 7)
+    ]
+    validate_rows_v42 = [
+        _version_row(
+            split="validate", version="v4.2", climate_day=dt.date(2025, 2, d), cli_tmax_f=70.0 + d
+        )
+        for d in range(1, 7)
+    ]
+    validate_rows_v43 = [
+        _version_row(
+            split="validate", version="v4.3", climate_day=dt.date(2025, 6, d), cli_tmax_f=90.0 + d
+        )
+        for d in range(1, 7)
+    ]
+    v5_fit_slice_rows = [
+        _version_row(
+            split="v5_fit_slice", version="v5.0", climate_day=dt.date(2026, 6, d), cli_tmax_f=95.0 + d
+        )
+        for d in range(1, 7)
+    ]
+
+    # `bootstrap_draws=1, resample_delta=False`: this test only checks the
+    # POINT estimate, never the bootstrap interval, so the (expensive, and
+    # here irrelevant) per-draw delta refit is skipped.
+    baseline = real_fit_calibration(
+        [*train_only_rows, *validate_rows_v42, *validate_rows_v43],
+        method=CdfMethod.NORMAL,
+        bootstrap_draws=1,
+        resample_delta=False,
+    )
+    with_more_versions = real_fit_calibration(
+        [*train_only_rows, *validate_rows_v42, *validate_rows_v43, *v5_fit_slice_rows],
+        method=CdfMethod.NORMAL,
+        bootstrap_draws=1,
+        resample_delta=False,
+    )
+
+    before = baseline.hierarchical.shrunk_by_version["v4.1"]
+    after = with_more_versions.hierarchical.shrunk_by_version["v4.1"]
+    assert before.a == pytest.approx(after.a)
+    assert before.gamma == pytest.approx(after.gamma)
+
+
+def _fit_with_versions(*versions: str) -> calib.CalibrationFit:
+    """Like `_fit_with_params` but with an arbitrary set of fitted versions
+    -- needed to score comparator/version rows tagged with more than one
+    version against a single hand-built fit."""
+    point = EmosParams(a=0.0, gamma=0.0, delta=1.0)
+    shrunk = {
+        version: calib.VersionEstimate(version=version, a=0.0, gamma=0.0, n=8, converged=True, nfev=3)
+        for version in versions
+    }
+    draws_by_version = {
+        version: calib.VersionEmosDraws(version=version, point=point, draws=(point,))
+        for version in versions
+    }
+    selection = calib.KappaSelection(
+        chosen_kappa=30.0, curve=(calib.KappaScore(kappa=30.0, mean_crps=1.0),)
+    )
+    return calib.CalibrationFit(
+        delta=1.0,
+        delta_converged=True,
+        delta_nfev=5,
+        hierarchical=calib.HierarchicalEmosResult(
+            method=CdfMethod.NORMAL,
+            delta=1.0,
+            kappa_selection=selection,
+            tau_sensitivity=selection,
+            shrunk_by_version=shrunk,
+            draws_by_version=draws_by_version,
+        ),
+    )
+
+
+def test_g21_g22_g23_report_all_and_out_of_sample_with_labels() -> None:
+    """Coordinator correction (SL-8d item 2b): G2.1/G2.2/G2.3 are reported
+    TWICE -- once over ALL validate rows (labelled in-sample, since by plan
+    design a version's own validation rows both fit and score it: "Scoring
+    validation rows that a version was fitted on is by design at this
+    stage"), and once over OUT-OF-SAMPLE validate rows only: comparator
+    events whose version had NO validation-split row in the fit input."""
+    fit = _fit_with_versions("v4.3", "v4.1")
+
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", version="v4.1", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", version="v4.3", climate_day=dt.date(2025, 6, 3)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", version="v4.3", climate_day=dt.date(2025, 6, 3)),
+            _comparator_event(split="validate", version="v4.1", climate_day=dt.date(2025, 6, 4)),
+        ],
+        calibration_fit=fit,
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    in_sample_label = "in-sample (by plan design) -- diagnostic only"
+    assert result["gates"]["G2.2"]["n"] == 2
+    assert result["gates"]["G2.2"]["statistics"]["sample_label"] == in_sample_label
+    assert result["gates"]["G2.3"]["n"] == 2
+    assert result["gates"]["G2.3"]["statistics"]["sample_label"] == in_sample_label
+    assert result["gates"]["G2.1"]["statistics"]["sample_label"] == in_sample_label
+
+    assert result["gates"]["G2.2_out_of_sample"]["n"] == 1
+    assert result["gates"]["G2.2_out_of_sample"]["statistics"]["sample_label"] == "out-of-sample"
+    assert result["gates"]["G2.3_out_of_sample"]["n"] == 1
+    assert result["gates"]["G2.3_out_of_sample"]["statistics"]["sample_label"] == "out-of-sample"
+    assert result["gates"]["G2.1_out_of_sample"]["statistics"]["sample_label"] == "out-of-sample"
+
+    note = nbp_skill_study.write_validate_evidence_note(result, date=dt.date(2026, 9, 30))
+    note_text = note.read_text(encoding="utf-8")
+    assert in_sample_label in note_text
+    assert "out-of-sample" in note_text
+    assert "G2.2_out_of_sample" in note_text
+    note.unlink()
 
 
 def test_g20_holm_family_combines_months_daylength_terciles_and_near_midnight_strata() -> None:
