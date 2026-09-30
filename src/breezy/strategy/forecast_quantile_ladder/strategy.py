@@ -38,7 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, NotRequired, Protocol, TypedDict, cast, runtime_checkable
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
@@ -68,7 +68,7 @@ from breezy.strategy.ladder_ev.quantile_density import Rung
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
 
-__all__ = ["ForecastQuantileLadderStrategy", "SupportsExpiresAtNs"]
+__all__ = ["ForecastQuantileLadderStrategy", "ShadowDecisionLogLine", "SupportsExpiresAtNs"]
 
 _CLASS_NAME: str = "ForecastQuantileLadderStrategy"
 _VENUE: Final[str] = "polymarket_us"
@@ -100,6 +100,22 @@ class SupportsExpiresAtNs(Protocol):
 
     @property
     def expires_at_ns(self) -> int: ...
+
+
+class ShadowDecisionLogLine(TypedDict):
+    now_ns: int
+    station: str
+    climate_day: date
+    rung_id: str
+    side: Literal["yes", "no"]
+    instrument_id: str
+    kind: str
+    reason: NotRequired[str]
+    qty: NotRequired[Literal[1]]
+    ev_net: NotRequired[float]
+    p_hat: NotRequired[float]
+    p_lower: NotRequired[float]
+    p_upper: NotRequired[float]
 
 
 class ForecastQuantileLadderStrategy(Strategy):
@@ -179,7 +195,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         #: :meth:`on_start` (mirrors ``ContinuousRungHoldStrategy``'s own
         #: ``_std_utc_offset_hours_by_station``).
         self._std_utc_offset_hours: dict[str, float] = {}
-        self.shadow_decisions: list[Mapping[str, object]] = []
+        self.shadow_decisions: list[ShadowDecisionLogLine] = []
 
     def on_start(self) -> None:
         """Resolve YES/NO instrument ids per rung and subscribe (SL-13).
@@ -335,7 +351,17 @@ class ForecastQuantileLadderStrategy(Strategy):
             # behaviour change.
             latch=cast("QuantileLadderLatch", self._latch),
         )
-        self.shadow_decisions.append(self._shadow_log_line(decision, now_ns=now_ns))
+        self.shadow_decisions.append(
+            self._shadow_log_line(
+                decision,
+                now_ns=now_ns,
+                station=station,
+                climate_day=climate_day,
+                rung_id=rung_id,
+                side=side,
+                instrument_id=ask.instrument_id,
+            ),
+        )
         # Review item 2: bounded FIFO -- see `_MAX_SHADOW_DECISIONS`'s own
         # docstring. `del [:n]` trims in one slice-assignment rather than N
         # individual `pop(0)` calls when (rarely) more than one entry over
@@ -345,7 +371,17 @@ class ForecastQuantileLadderStrategy(Strategy):
             del self.shadow_decisions[:overflow]
         return decision
 
-    def _shadow_log_line(self, decision: Decision, *, now_ns: int) -> Mapping[str, object]:
+    def _shadow_log_line(
+        self,
+        decision: Decision,
+        *,
+        now_ns: int,
+        station: str,
+        climate_day: date,
+        rung_id: str,
+        side: Literal["yes", "no"],
+        instrument_id: str,
+    ) -> ShadowDecisionLogLine:
         """Decision keys and inputs only -- never scored, never a catalog write.
 
         Plan §4.4 item 1: "The shadow log carries decision keys and decision
@@ -354,10 +390,31 @@ class ForecastQuantileLadderStrategy(Strategy):
         asdict`` -- that is banned repo-wide outside the closed allowlist in
         ``tests/unit/test_polymarket_us_credential_serialization.py``.
         """
+        fields = decision_log_fields(decision)
+        if isinstance(decision, Take):
+            return {
+                "now_ns": now_ns,
+                "station": cast("str", fields["station"]),
+                "climate_day": cast("date", fields["climate_day"]),
+                "rung_id": cast("str", fields["rung_id"]),
+                "side": cast('Literal["yes", "no"]', fields["side"]),
+                "instrument_id": cast("str", fields["instrument_id"]),
+                "kind": type(decision).__name__,
+                "qty": cast("Literal[1]", fields["qty"]),
+                "ev_net": cast("float", fields["ev_net"]),
+                "p_hat": cast("float", fields["p_hat"]),
+                "p_lower": cast("float", fields["p_lower"]),
+                "p_upper": cast("float", fields["p_upper"]),
+            }
         return {
             "now_ns": now_ns,
+            "station": station,
+            "climate_day": climate_day,
+            "rung_id": rung_id,
+            "side": side,
+            "instrument_id": instrument_id,
             "kind": type(decision).__name__,
-            **decision_log_fields(decision),
+            "reason": cast("str", fields["reason"]),
         }
 
     def try_submit(self, take: Take) -> str | None:

@@ -219,6 +219,7 @@ def test_the_report_carries_mismatch_counts_only() -> None:
         "n_matched",
         "n_live_only",
         "n_batch_only",
+        "n_numeric_mismatches",
         "n_mismatches",
     }
     forbidden_substrings = ("ev", "pnl", "p&l", "outcome", "settle", "profit", "loss")

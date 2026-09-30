@@ -33,7 +33,7 @@ from breezy.adapters.polymarket_us.safety import PERMIT_TTL_NS
 from breezy.runtime.trade_supervisor_core import LAUNCH_UTC
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
-from breezy.strategy.forecast_quantile_ladder.decision import Decision, SidedAsk, evaluate
+from breezy.strategy.forecast_quantile_ladder.decision import Decision, SidedAsk, Take, evaluate
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import (
@@ -45,6 +45,7 @@ from breezy.strategy.ladder_ev.quantile_density import Rung
 
 __all__ = [
     "MIN_PRE_FREEZE_DAYS",
+    "NUMERIC_FIELD_TOLERANCE",
     "PRE_FREEZE_END",
     "PRE_FREEZE_START",
     "BatchSnapshotInput",
@@ -70,6 +71,7 @@ __all__ = [
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
 _NS_PER_HOUR: Final[int] = 3_600 * _NS_PER_SECOND
+NUMERIC_FIELD_TOLERANCE: Final[float] = 1e-9
 
 #: A-5's pre-freeze tape window (ruling §12): "2026-08-30..09-25; >= 14 days
 #: are required, and about 27 are available." Both bounds inclusive.
@@ -208,9 +210,19 @@ class DecisionKey:
     station: str
     climate_day: date
     rung_id: str
+    instrument_id: str
     side: Literal["yes", "no"]
-    kind: str
+    action: str
+    reason: str | None
     ts_ns: int
+    ev_net: float | None = None
+    p_hat: float | None = None
+    p_lower: float | None = None
+    p_upper: float | None = None
+
+    @property
+    def kind(self) -> str:
+        return self.action
 
 
 def decision_key_from(
@@ -220,20 +232,67 @@ def decision_key_from(
     climate_day: date,
     rung_id: str,
     side: Literal["yes", "no"],
+    instrument_id: str,
     ts_ns: int,
 ) -> DecisionKey:
+    reason = getattr(decision, "reason", None)
+    ev_net = decision.ev_net if isinstance(decision, Take) else None
+    p_hat = decision.p_hat if isinstance(decision, Take) else None
+    p_lower = decision.p_lower if isinstance(decision, Take) else None
+    p_upper = decision.p_upper if isinstance(decision, Take) else None
     return DecisionKey(
         station=station,
         climate_day=climate_day,
         rung_id=rung_id,
+        instrument_id=decision.instrument_id if isinstance(decision, Take) else instrument_id,
         side=side,
-        kind=type(decision).__name__,
+        action=type(decision).__name__,
+        reason=None if reason is None else str(reason),
         ts_ns=ts_ns,
+        ev_net=ev_net,
+        p_hat=p_hat,
+        p_lower=p_lower,
+        p_upper=p_upper,
     )
 
 
-def _sort_key(key: DecisionKey) -> tuple[str, date, str, str, str, int]:
-    return (key.station, key.climate_day, key.rung_id, key.side, key.kind, key.ts_ns)
+def _sort_key(key: DecisionKey) -> tuple[str, date, str, str, str, str, str | None, int]:
+    return (
+        key.station,
+        key.climate_day,
+        key.rung_id,
+        key.instrument_id,
+        key.side,
+        key.action,
+        key.reason,
+        key.ts_ns,
+    )
+
+
+def _identity_key(key: DecisionKey) -> tuple[str, date, str, str, str, str, str | None, int]:
+    return (
+        key.station,
+        key.climate_day,
+        key.rung_id,
+        key.instrument_id,
+        key.side,
+        key.action,
+        key.reason,
+        key.ts_ns,
+    )
+
+
+def _numeric_fields_equal(live: DecisionKey, batch: DecisionKey) -> bool:
+    for name in ("ev_net", "p_hat", "p_lower", "p_upper"):
+        live_value = getattr(live, name)
+        batch_value = getattr(batch, name)
+        if live_value is None or batch_value is None:
+            if live_value != batch_value:
+                return False
+            continue
+        if abs(live_value - batch_value) > NUMERIC_FIELD_TOLERANCE:
+            return False
+    return True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -252,6 +311,7 @@ class ParityReport:
     n_matched: int
     live_only: tuple[DecisionKey, ...]
     batch_only: tuple[DecisionKey, ...]
+    numeric_mismatches: tuple[tuple[DecisionKey, DecisionKey], ...] = ()
 
     @property
     def n_live_only(self) -> int:
@@ -263,7 +323,11 @@ class ParityReport:
 
     @property
     def n_mismatches(self) -> int:
-        return self.n_live_only + self.n_batch_only
+        return self.n_live_only + self.n_batch_only + self.n_numeric_mismatches
+
+    @property
+    def n_numeric_mismatches(self) -> int:
+        return len(self.numeric_mismatches)
 
     def to_counts_dict(self) -> dict[str, int]:
         """Mismatch COUNTS only -- no key detail, no ev/p&l/outcome field."""
@@ -273,6 +337,7 @@ class ParityReport:
             "n_matched": self.n_matched,
             "n_live_only": self.n_live_only,
             "n_batch_only": self.n_batch_only,
+            "n_numeric_mismatches": self.n_numeric_mismatches,
             "n_mismatches": self.n_mismatches,
         }
 
@@ -281,15 +346,25 @@ def diff_decision_keys(
     live: Iterable[DecisionKey], batch: Iterable[DecisionKey],
 ) -> ParityReport:
     """decision-key set equality (ruling §12 A-5: "mismatches = 0")."""
-    live_set = frozenset(live)
-    batch_set = frozenset(batch)
+    live_by_key = {_identity_key(item): item for item in live}
+    batch_by_key = {_identity_key(item): item for item in batch}
+    live_set = frozenset(live_by_key)
+    batch_set = frozenset(batch_by_key)
     matched = live_set & batch_set
+    numeric_mismatches = tuple(
+        (live_by_key[key], batch_by_key[key])
+        for key in sorted(matched)
+        if not _numeric_fields_equal(live_by_key[key], batch_by_key[key])
+    )
     return ParityReport(
         n_live=len(live_set),
         n_batch=len(batch_set),
         n_matched=len(matched),
-        live_only=tuple(sorted(live_set - batch_set, key=_sort_key)),
-        batch_only=tuple(sorted(batch_set - live_set, key=_sort_key)),
+        live_only=tuple(sorted((live_by_key[key] for key in live_set - batch_set), key=_sort_key)),
+        batch_only=tuple(
+            sorted((batch_by_key[key] for key in batch_set - live_set), key=_sort_key),
+        ),
+        numeric_mismatches=numeric_mismatches,
     )
 
 
@@ -338,6 +413,10 @@ class DepthSnapshotRow:
     ts_ns: int
     best_ask_price: float | None
     best_ask_size: float | None
+    station: str | None = None
+    climate_day: date | None = None
+    rung_id: str | None = None
+    side: Literal["yes", "no"] = "yes"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -368,6 +447,13 @@ class BatchSnapshotInput:
     fee_coefficient: float
     slippage_floor_prob: float
     vector: ForecastQuantileVector | None
+
+
+def _row_context(row: DepthSnapshotRow) -> tuple[str, date, str, Literal["yes", "no"]]:
+    if row.station is not None and row.climate_day is not None and row.rung_id is not None:
+        return row.station, row.climate_day, row.rung_id, row.side
+    station, climate_day, rung_id = parse_rung_instrument_id(row.instrument_id)
+    return station, climate_day, rung_id, row.side
 
 
 def evaluate_batch_snapshot(
@@ -417,6 +503,7 @@ def run_batch_parity(
     fee_coefficient: float,
     slippage_floor_prob: float,
     std_utc_offset_hours_by_station: Mapping[str, float],
+    quantile_station_keys: Mapping[str, str] | None = None,
 ) -> tuple[DecisionKey, ...]:
     """The batch path's own driver loop: one YES-side evaluation per depth
     snapshot with a genuine (non-null) ask, latched across the whole run.
@@ -438,6 +525,7 @@ def run_batch_parity(
     full set of days a parity study actually covers, before treating that
     study as A-5-complete.
     """
+    station_key_map = quantile_station_keys if quantile_station_keys is not None else {}
     ordered = sorted(depth_snapshots, key=lambda row: row.ts_ns)
 
     states_by_station: dict[str, ForecastQuantileState] = {}
@@ -454,7 +542,7 @@ def run_batch_parity(
         )
 
     for row in ordered:
-        _station, climate_day, _rung_id = parse_rung_instrument_id(row.instrument_id)
+        _station, climate_day, _rung_id, _side = _row_context(row)
         assert_pre_freeze_tape_day(climate_day)
 
     latch = QuantileLadderLatch()
@@ -462,10 +550,10 @@ def run_batch_parity(
     for row in ordered:
         if row.best_ask_price is None:
             continue
-        station, climate_day, rung_id = parse_rung_instrument_id(row.instrument_id)
+        station, climate_day, rung_id, side = _row_context(row)
         ladder = ladder_by_key[(station, climate_day)]
         std_utc_offset_hours = std_utc_offset_hours_by_station[station]
-        vector = states_by_station.get(station)
+        vector = states_by_station.get(station_key_map.get(station, station))
         snapshot_input = BatchSnapshotInput(
             now_ns=row.ts_ns,
             std_utc_offset_hours=std_utc_offset_hours,
@@ -473,8 +561,8 @@ def run_batch_parity(
             climate_day=climate_day,
             ladder=ladder,
             rung_id=rung_id,
-            side="yes",
-            ask=SidedAsk(side="yes", instrument_id=row.instrument_id, price=row.best_ask_price),
+            side=side,
+            ask=SidedAsk(side=side, instrument_id=row.instrument_id, price=row.best_ask_price),
             fee_coefficient=fee_coefficient,
             slippage_floor_prob=slippage_floor_prob,
             vector=None if vector is None else vector.value_at(row.ts_ns),
@@ -492,7 +580,8 @@ def run_batch_parity(
                 station=station,
                 climate_day=climate_day,
                 rung_id=rung_id,
-                side="yes",
+                side=side,
+                instrument_id=row.instrument_id,
                 ts_ns=row.ts_ns,
             ),
         )
