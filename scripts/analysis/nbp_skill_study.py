@@ -7,8 +7,11 @@ NBP rows from `breezy.persistence.nbp_derived_store`, final-only CLI labels
 via `settlement_truth_dataset.final_rows_for_gate`, and (for M0/M1
 coverage/G2.0a) the on-disk, read-only IEM MOS NBS and IEM ASOS 1-minute
 archive caches. It runs the validation-stage real-data JOIN and reports
-coverage; it does not run the S2 gates themselves (a later slice) and never
-writes a sha-pinned calibration artefact.
+coverage by default. With explicit ``--run-gates`` on ``--stage validate``
+it fits the existing hierarchical EMOS calibration, scores calibrated M2 on
+validate events only, evaluates G2.0/G2.0a/G2.1/G2.2/G2.3, writes a JSON
+result, writes a generated evidence note, and writes a sha-pinned candidate
+artefact outside the repo only when the fit converges.
 
 **The holdout guard.** ``--stage validate`` (the default) never touches the
 holdout. Every NBP window is mapped to its climate day via
@@ -65,12 +68,14 @@ import argparse
 import csv
 import datetime as dt
 import io
+import json
+import math
 import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, TypedDict
 
 _SCRIPTS_ANALYSIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPTS_ANALYSIS_DIR.parents[1]
@@ -83,7 +88,33 @@ from mos_txn_occupancy import MosTxnRow, parse_mos_txn_rows  # type: ignore[impo
 from settlement_alignment_study import IEM_ASOS_IDS, load_sites  # type: ignore[import-not-found]  # noqa: E402
 from settlement_truth_dataset import SettlementTruthRow, final_rows_for_gate  # type: ignore[import-not-found]  # noqa: E402
 
-from breezy.analysis.nbp_calibration import DEFAULT_SPLITS, NEAR_MIDNIGHT_STRATA, Splits, VersionRow  # noqa: E402
+from breezy.analysis.nbp_calibration import (  # noqa: E402
+    DEFAULT_SPLITS,
+    FIT_STATUS_NOT_CONVERGED,
+    FIT_STATUS_OK,
+    NEAR_MIDNIGHT_STRATA,
+    CalibrationFit,
+    CorrectionForm,
+    FitNotConvergedError,
+    G20Result,
+    G20aResult,
+    G21Result,
+    G23Result,
+    MatchedEvent,
+    RungEvent,
+    SkillGateResult,
+    Splits,
+    StationDayResidual,
+    VersionRow,
+    artefact_from_calibration_fit,
+    evaluate_g20,
+    evaluate_g20a,
+    evaluate_g21,
+    evaluate_g22,
+    evaluate_g23,
+    fit_calibration,
+    write_artefact,
+)
 from breezy.analysis.nbp_comparator_models import (  # noqa: E402
     M0_PRIMARY_LEAD_HOURS,
     DailyMaxInstant,
@@ -105,8 +136,10 @@ from breezy.persistence.archive_cache import (  # noqa: E402
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition  # noqa: E402
 from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
     CdfMethod,
+    EmosParams,
     Percentiles,
     Rung,
+    apply_emos,
     build_cdf,
     rung_probabilities,
 )
@@ -129,6 +162,7 @@ __all__ = [
     "build_arg_parser",
     "build_comparator_matched_events",
     "build_version_rows",
+    "calibrated_m2_rung_probabilities",
     "complete_percentile_windows",
     "daily_max_instants",
     "iter_nbp_derived_rows",
@@ -138,8 +172,11 @@ __all__ = [
     "asos_1min_row_coverage",
     "read_settlement_truth_rows",
     "run_comparator_validate",
+    "run_validate_gates_from_rows",
     "run_validate",
     "station_registry",
+    "validate_gate_events_from_comparator_events",
+    "write_validate_evidence_note",
 ]
 
 _HOLDOUT_GUARD_FLAG: str = "--coordinator-authorized"
@@ -149,6 +186,88 @@ DEFAULT_SETTLEMENT_TRUTH_PARQUET: Final[Path] = (
     Path.home() / ".local/share/breezy/derived/settlement-truth/settlement_truth.parquet"
 )
 DEFAULT_ARCHIVE_ROOT: Final[Path] = Path.home() / ".local/share/breezy/archive"
+DEFAULT_CALIBRATION_ARTEFACT_DIR: Final[Path] = (
+    Path.home() / ".local/share/breezy/derived/nbp_calibration"
+)
+DEFAULT_VALIDATE_EVIDENCE_DIR: Final[Path] = _REPO_ROOT / "docs/evidence"
+
+
+class _GroupJson(TypedDict):
+    key: str
+    status: str
+    n: int
+    n_dates: int
+    mean_residual_f: float | None
+    p_value: float | None
+    holm_rejected: bool | None
+    bootstrap_degenerate: bool | None
+
+
+class _BucketJson(TypedDict):
+    lower: float
+    upper: float
+    n: int
+    predicted: float
+    observed: float
+    z: float
+    p_value: float
+    holm_rejected: bool
+    bootstrap_degenerate: bool
+
+
+class _GateJson(TypedDict):
+    status: str
+    n: int
+    statistics: dict[str, object]
+    cis: dict[str, object]
+
+
+class _G20GateJson(_GateJson):
+    groups: list[_GroupJson]
+
+
+class _G21GateJson(_GateJson):
+    buckets: list[_BucketJson]
+
+
+class _KappaCurveJson(TypedDict):
+    kappa: float
+    mean_crps: float
+
+
+class _CoverageCountsJson(TypedDict):
+    fit_rows: int
+    train_fit_rows: int
+    validate_version_rows: int
+    validate_comparator_events: int
+    holdout_version_rows_filtered: int
+    holdout_comparator_events_filtered: int
+    gate_climate_day_min: str | None
+    gate_climate_day_max: str | None
+
+
+class _ConvergenceJson(TypedDict, total=False):
+    delta_converged: bool
+    delta_nfev: int
+    converged_by_version: dict[str, bool]
+    nfev_by_version: dict[str, int]
+
+
+class _ArtefactJson(TypedDict):
+    path: str | None
+    sha256: str | None
+
+
+class ValidateGatePayload(TypedDict):
+    label: str
+    stage: str
+    fit_status: str
+    kappa_chosen: float
+    kappa_curve: list[_KappaCurveJson]
+    convergence: _ConvergenceJson
+    coverage_counts: _CoverageCountsJson
+    gates: dict[str, _GateJson]
+    artefact: _ArtefactJson
 
 #: Relative to the repo root. The frozen 0b error model artefact (SL-8c),
 #: fitted once on the WP-6 TRAIN split and committed as the freeze point
@@ -221,6 +340,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Also run the SL-8c M0/M1/M2 + G2.0a comparator join. Opt-in: "
         "unlike the coverage-only counts above, this fully parses the ASOS "
         "1-minute archive, which is not cheap.",
+    )
+    parser.add_argument(
+        "--run-gates",
+        action="store_true",
+        default=False,
+        help="Validate stage only: fit the hierarchical EMOS calibration, score "
+        "calibrated M2, evaluate G2.0/G2.0a/G2.1/G2.2/G2.3 on validate rows, "
+        "write the candidate artefact outside the repo if converged, and write "
+        "the generated validate evidence note.",
     )
     parser.add_argument("--out", type=Path, default=None)
     return parser
@@ -916,18 +1044,20 @@ def _forecast_centered_ladder(center_f: int) -> tuple[Rung, ...]:
 @dataclass(frozen=True, slots=True)
 class ComparatorMatchedEvent:
     """One D+1 rung event, scored under M0, M1 and M2 on the SAME rung
-    (SL-8c task 4). ``p_m2`` this slice is the NBP percentile bulletin's own
-    NORMAL(q50, sd) CDF, uncalibrated -- the hierarchical EMOS fit
-    (`breezy.analysis.nbp_calibration.fit_calibration`) is a later slice's
-    wiring; this keeps the three models comparable on one event now without
-    pre-empting that fit's own method choice (plan S9 Q1, still open)."""
+    (SL-8c task 4). ``version``/``percentiles``/``rung_id`` are carried so
+    SL-8d can replace the old uncalibrated M2 placeholder with calibrated
+    hierarchical-EMOS probabilities on the exact same event key."""
 
     station: str
     climate_day: dt.date
     split: str
+    version: str
+    percentiles: Percentiles
+    rung_id: str
     p_m0: float
     p_m1: float
     p_m2: float
+    cli_tmax_f: float
     outcome: bool
     near_midnight: bool | None
     near_midnight_stratum: str | None
@@ -1037,8 +1167,9 @@ def build_comparator_matched_events(
         p_m1 = m1_rung_probabilities(
             txn_mean_f=raw_mos.txn_f, xnd_sd_f=raw_mos.xnd_f, rungs=ladder
         )["mid"]
-        # M2, this slice: the NBP percentile bulletin's own CDF, uncalibrated
-        # (see ComparatorMatchedEvent's docstring).
+        # M2 placeholder retained only for coverage/comparator shape when no
+        # calibration fit is available; SL-8d gate scoring overwrites this via
+        # `validate_gate_events_from_comparator_events`.
         p_m2 = rung_probabilities(build_cdf(CdfMethod.NORMAL, chosen.percentiles), ladder)["mid"]
 
         outcome = int(settlement_row.tmax_f) in (center_f, center_f + 1)
@@ -1050,9 +1181,13 @@ def build_comparator_matched_events(
                 station=settlement_station,
                 climate_day=climate_day,
                 split=split,
+                version=chosen.nbm_version_era,
+                percentiles=chosen.percentiles,
+                rung_id="mid",
                 p_m0=p_m0,
                 p_m1=p_m1,
                 p_m2=p_m2,
+                cli_tmax_f=float(settlement_row.tmax_f),
                 outcome=outcome,
                 near_midnight=None if instant is None else instant.near_midnight,
                 near_midnight_stratum=(
@@ -1120,6 +1255,450 @@ def run_comparator_validate(
         registry=registry,
         splits=splits,
     )
+
+
+# ---------------------------------------------------------------------------
+# SL-8d: validate-stage calibrated M2 + gates.
+# ---------------------------------------------------------------------------
+
+
+_LATITUDE_BY_STATION: Final[Mapping[str, float]] = {
+    "KLAX": 33.93806,
+    "LAX": 33.93806,
+    "KMDW": 41.78417,
+    "MDW": 41.78417,
+    "KMIA": 25.79056,
+    "MIA": 25.79056,
+    "KSFO": 37.61961,
+    "SFO": 37.61961,
+}
+
+
+def _daylight_hours(station: str, day: dt.date) -> float:
+    """Approximate astronomical daylight hours for G2.0 tercile grouping.
+
+    The four station latitudes are copied from `src/breezy/registry/sites.toml`
+    to keep this script bounded and deterministic; the gate only needs a
+    stable day-length ordering for train-derived tercile edges.
+    """
+    latitude = math.radians(_LATITUDE_BY_STATION.get(station, 37.0))
+    year_days = 366 if day.replace(month=12, day=31).timetuple().tm_yday == 366 else 365
+    declination = math.radians(
+        23.44 * math.sin((2.0 * math.pi / year_days) * (day.timetuple().tm_yday - 80))
+    )
+    cos_hour_angle = -math.tan(latitude) * math.tan(declination)
+    cos_hour_angle = min(1.0, max(-1.0, cos_hour_angle))
+    hour_angle = math.acos(cos_hour_angle)
+    return (24.0 / math.pi) * hour_angle
+
+
+def _tercile_edges(values: Sequence[float]) -> tuple[float, float]:
+    if len(values) < 3:
+        return (10.0, 14.0)
+    ordered = sorted(values)
+    return (ordered[len(ordered) // 3], ordered[(2 * len(ordered)) // 3])
+
+
+def _fit_status_from_calibration(fit: CalibrationFit) -> str:
+    if not fit.delta_converged:
+        return FIT_STATUS_NOT_CONVERGED
+    if any(not estimate.converged for estimate in fit.hierarchical.shrunk_by_version.values()):
+        return FIT_STATUS_NOT_CONVERGED
+    return FIT_STATUS_OK
+
+
+def _emos_params_for_version(*, version: str, calibration_fit: CalibrationFit) -> EmosParams:
+    estimate = calibration_fit.hierarchical.shrunk_by_version[version]
+    return EmosParams(a=estimate.a, gamma=estimate.gamma, delta=calibration_fit.delta)
+
+
+def calibrated_m2_rung_probabilities(
+    *,
+    percentiles: Percentiles,
+    version: str,
+    calibration_fit: CalibrationFit,
+    rungs: Sequence[Rung],
+    cdf_method: CdfMethod,
+) -> dict[str, float]:
+    """M2: NBP percentiles -> selected CDF -> fitted EMOS -> rung probs."""
+    params = _emos_params_for_version(version=version, calibration_fit=calibration_fit)
+    return rung_probabilities(
+        apply_emos(build_cdf(cdf_method, percentiles), percentiles, params),
+        rungs,
+    )
+
+
+def _calibrated_median_f(row: VersionRow, *, calibration_fit: CalibrationFit) -> float:
+    params = _emos_params_for_version(version=row.version, calibration_fit=calibration_fit)
+    return row.percentiles.q50 + params.a
+
+
+def validate_gate_events_from_comparator_events(
+    events: Sequence[ComparatorMatchedEvent],
+    *,
+    calibration_fit: CalibrationFit,
+    cdf_method: CdfMethod,
+) -> tuple[MatchedEvent, ...]:
+    matched: list[MatchedEvent] = []
+    for event in events:
+        if event.split != "validate":
+            continue
+        center_f = round(event.percentiles.q50)
+        ladder = _forecast_centered_ladder(center_f)
+        p_m2 = calibrated_m2_rung_probabilities(
+            percentiles=event.percentiles,
+            version=event.version,
+            calibration_fit=calibration_fit,
+            rungs=ladder,
+            cdf_method=cdf_method,
+        )[event.rung_id]
+        matched.append(
+            MatchedEvent(
+                station=event.station,
+                climate_day=event.climate_day,
+                p_m2=p_m2,
+                p_m1=event.p_m1,
+                p_m0=event.p_m0,
+                outcome=event.outcome,
+            )
+        )
+    return tuple(matched)
+
+
+def _g20_rows(
+    rows: Sequence[VersionRow],
+    *,
+    calibration_fit: CalibrationFit,
+) -> tuple[StationDayResidual, ...]:
+    return tuple(
+        StationDayResidual(
+            station=row.station,
+            climate_day=row.climate_day,
+            residual_f=row.cli_tmax_f - _calibrated_median_f(row, calibration_fit=calibration_fit),
+            day_length_hours=_daylight_hours(row.station, row.climate_day),
+        )
+        for row in rows
+        if row.split == "validate"
+    )
+
+
+def _g20a_rows(
+    events: Sequence[ComparatorMatchedEvent],
+    *,
+    calibration_fit: CalibrationFit,
+) -> tuple[StationDayResidual, ...]:
+    rows: list[StationDayResidual] = []
+    for event in events:
+        if event.split != "validate" or event.near_midnight is not True:
+            continue
+        params = _emos_params_for_version(version=event.version, calibration_fit=calibration_fit)
+        rows.append(
+            StationDayResidual(
+                station=event.station,
+                climate_day=event.climate_day,
+                residual_f=event.cli_tmax_f - (event.percentiles.q50 + params.a),
+                day_length_hours=_daylight_hours(event.station, event.climate_day),
+            )
+        )
+    return tuple(rows)
+
+
+def _rung_events(events: Sequence[MatchedEvent]) -> tuple[RungEvent, ...]:
+    return tuple(
+        RungEvent(
+            station=event.station,
+            climate_day=event.climate_day,
+            rung_id="mid",
+            p_model=event.p_m2,
+            outcome=event.outcome,
+        )
+        for event in events
+    )
+
+
+def _status_from_bool(passed: bool) -> str:
+    return "PASS" if passed else "FAIL"
+
+
+def _g20_to_json(result: G20Result | G20aResult) -> _G20GateJson:
+    groups: list[_GroupJson] = [
+        {
+            "key": group.key,
+            "status": group.status,
+            "n": group.n,
+            "n_dates": group.n_dates,
+            "mean_residual_f": group.mean_residual_f,
+            "p_value": group.p_value,
+            "holm_rejected": group.holm_rejected,
+            "bootstrap_degenerate": group.bootstrap_degenerate,
+        }
+        for group in result.groups
+    ]
+    tested = [group for group in result.groups if group.status == "TESTED"]
+    status = "UNTESTED" if not tested else _status_from_bool(result.flat)
+    return {
+        "status": status,
+        "n": sum(group.n for group in result.groups),
+        "statistics": {"groups": groups},
+        "cis": {},
+        "groups": groups,
+    }
+
+
+def _g21_to_json(result: G21Result) -> _G21GateJson:
+    buckets: list[_BucketJson] = [
+        {
+            "lower": bucket.lower,
+            "upper": bucket.upper,
+            "n": bucket.n,
+            "predicted": bucket.predicted,
+            "observed": bucket.observed,
+            "z": bucket.z,
+            "p_value": bucket.p_value,
+            "holm_rejected": bucket.holm_rejected,
+            "bootstrap_degenerate": bucket.bootstrap_degenerate,
+        }
+        for bucket in result.buckets
+    ]
+    status = "UNTESTED" if not result.buckets else _status_from_bool(result.passed)
+    return {
+        "status": status,
+        "n": sum(bucket.n for bucket in result.buckets),
+        "statistics": {"buckets": buckets},
+        "cis": {},
+        "buckets": buckets,
+    }
+
+
+def _g22_to_json(result: SkillGateResult, *, n: int) -> _GateJson:
+    return {
+        "status": _status_from_bool(result.passed),
+        "n": n,
+        "statistics": {
+            "brier_diff_point": result.brier_diff_point,
+            "d_res_point": result.d_res_point,
+        },
+        "cis": {
+            "brier_diff_ci": list(result.brier_diff_ci),
+            "d_res_ci": list(result.d_res_ci),
+        },
+    }
+
+
+def _g23_to_json(result: G23Result, *, n: int) -> _GateJson:
+    return {
+        "status": _status_from_bool(result.passed),
+        "n": n,
+        "statistics": {"d_res_point": result.d_res_point},
+        "cis": {"d_res_ci": list(result.d_res_ci)},
+    }
+
+
+def _fit_not_converged_gates() -> dict[str, _GateJson]:
+    return {
+        gate: {"status": FIT_STATUS_NOT_CONVERGED, "n": 0, "statistics": {}, "cis": {}}
+        for gate in ("G2.0", "G2.0a", "G2.1", "G2.2", "G2.3")
+    }
+
+
+def _write_candidate_artefact(
+    *,
+    calibration_fit: CalibrationFit,
+    cdf_method: CdfMethod,
+    artefact_dir: Path,
+) -> _ArtefactJson:
+    artefact_dir.mkdir(parents=True, exist_ok=True)
+    artefact = artefact_from_calibration_fit(
+        calibration_fit,
+        cdf_method=cdf_method,
+        recalibration="hierarchical_emos",
+        correction_form=CorrectionForm.NONE,
+        n_min=0,
+        sigma_d=0.0,
+        rung_probability_bounds={},
+    )
+    path = artefact_dir / f"nbp_validate_candidate_{dt.date.today().isoformat()}.json"
+    digest = write_artefact(path, artefact)
+    return {"path": str(path), "sha256": digest}
+
+
+def run_validate_gates_from_rows(
+    *,
+    version_rows: Sequence[VersionRow],
+    comparator_events: Sequence[ComparatorMatchedEvent],
+    artefact_dir: Path = DEFAULT_CALIBRATION_ARTEFACT_DIR,
+    cdf_method: CdfMethod = CdfMethod.NORMAL,
+    calibration_fit: CalibrationFit | None = None,
+    bootstrap_iterations: int = 2_000,
+    write_candidate_artefact: bool = True,
+) -> ValidateGatePayload:
+    pre_holdout_rows = [row for row in version_rows if row.split != "holdout"]
+    validate_rows = [row for row in pre_holdout_rows if row.split == "validate"]
+    validate_events_source = [event for event in comparator_events if event.split == "validate"]
+    holdout_version_rows = [row for row in version_rows if row.split == "holdout"]
+    holdout_events = [event for event in comparator_events if event.split == "holdout"]
+
+    fit = (
+        calibration_fit
+        if calibration_fit is not None
+        else fit_calibration(pre_holdout_rows, method=cdf_method)
+    )
+    fit_status = _fit_status_from_calibration(fit)
+    kappa_curve: list[_KappaCurveJson] = [
+        {"kappa": score.kappa, "mean_crps": score.mean_crps}
+        for score in fit.hierarchical.kappa_selection.curve
+    ]
+
+    gate_days = [row.climate_day for row in validate_rows]
+    gate_days.extend(event.climate_day for event in validate_events_source)
+    coverage_counts: _CoverageCountsJson = {
+        "fit_rows": len(pre_holdout_rows),
+        "train_fit_rows": sum(1 for row in pre_holdout_rows if row.split == "train"),
+        "validate_version_rows": len(validate_rows),
+        "validate_comparator_events": len(validate_events_source),
+        "holdout_version_rows_filtered": len(holdout_version_rows),
+        "holdout_comparator_events_filtered": len(holdout_events),
+        "gate_climate_day_min": min(gate_days).isoformat() if gate_days else None,
+        "gate_climate_day_max": max(gate_days).isoformat() if gate_days else None,
+    }
+
+    if fit_status != FIT_STATUS_OK:
+        return {
+            "label": "validate-stage, pre-holdout -- NOT the S2 verdict",
+            "stage": "validate",
+            "fit_status": fit_status,
+            "kappa_chosen": fit.hierarchical.kappa_selection.chosen_kappa,
+            "kappa_curve": kappa_curve,
+            "convergence": {
+                "delta_converged": fit.delta_converged,
+                "converged_by_version": {
+                    version: estimate.converged
+                    for version, estimate in fit.hierarchical.shrunk_by_version.items()
+                },
+            },
+            "coverage_counts": coverage_counts,
+            "gates": _fit_not_converged_gates(),
+            "artefact": {"path": None, "sha256": None},
+        }
+
+    residual_rows = _g20_rows(validate_rows, calibration_fit=fit)
+    train_day_lengths = [
+        _daylight_hours(row.station, row.climate_day)
+        for row in pre_holdout_rows
+        if row.split == "train"
+    ]
+    tercile_edges = _tercile_edges(train_day_lengths)
+    matched_events = validate_gate_events_from_comparator_events(
+        validate_events_source,
+        calibration_fit=fit,
+        cdf_method=cdf_method,
+    )
+    g20a_residual_rows = _g20a_rows(validate_events_source, calibration_fit=fit)
+    stratum_of_station = {
+        event.station: event.near_midnight_stratum
+        for event in validate_events_source
+        if event.near_midnight_stratum is not None
+    }
+
+    gates: dict[str, _GateJson] = {}
+    gates["G2.0"] = _g20_to_json(
+        evaluate_g20(residual_rows, tercile_edges=tercile_edges, iterations=bootstrap_iterations)
+    )
+    gates["G2.0a"] = _g20_to_json(
+        evaluate_g20a(
+            g20a_residual_rows,
+            stratum_of_station=stratum_of_station,
+            iterations=bootstrap_iterations,
+        )
+    )
+    rung_events = _rung_events(matched_events)
+    gates["G2.1"] = _g21_to_json(evaluate_g21(rung_events, iterations=bootstrap_iterations))
+    if matched_events:
+        gates["G2.2"] = _g22_to_json(
+            evaluate_g22(matched_events, iterations=bootstrap_iterations),
+            n=len(matched_events),
+        )
+        gates["G2.3"] = _g23_to_json(
+            evaluate_g23(matched_events, iterations=bootstrap_iterations),
+            n=len(matched_events),
+        )
+    else:
+        gates["G2.2"] = {"status": "UNTESTED", "n": 0, "statistics": {}, "cis": {}}
+        gates["G2.3"] = {"status": "UNTESTED", "n": 0, "statistics": {}, "cis": {}}
+
+    artefact_info: _ArtefactJson = {"path": None, "sha256": None}
+    if write_candidate_artefact:
+        try:
+            artefact_info = _write_candidate_artefact(
+                calibration_fit=fit,
+                cdf_method=cdf_method,
+                artefact_dir=artefact_dir,
+            )
+        except FitNotConvergedError:
+            artefact_info = {"path": None, "sha256": None}
+
+    return {
+        "label": "validate-stage, pre-holdout -- NOT the S2 verdict",
+        "stage": "validate",
+        "fit_status": fit_status,
+        "kappa_chosen": fit.hierarchical.kappa_selection.chosen_kappa,
+        "kappa_curve": kappa_curve,
+        "convergence": {
+            "delta_converged": fit.delta_converged,
+            "delta_nfev": fit.delta_nfev,
+            "converged_by_version": {
+                version: estimate.converged
+                for version, estimate in fit.hierarchical.shrunk_by_version.items()
+            },
+            "nfev_by_version": {
+                version: estimate.nfev
+                for version, estimate in fit.hierarchical.shrunk_by_version.items()
+            },
+        },
+        "coverage_counts": coverage_counts,
+        "gates": gates,
+        "artefact": artefact_info,
+    }
+
+
+def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date) -> Path:
+    path = DEFAULT_VALIDATE_EVIDENCE_DIR / f"NBP_S2_VALIDATE_RESULT_{date.isoformat()}.md"
+    gates = payload.get("gates", {})
+    artefact = payload.get("artefact")
+    artefact_sha256 = artefact.get("sha256") if isinstance(artefact, Mapping) else None
+    lines = [
+        "# NBP S2 Validate Result",
+        "",
+        "**validate-stage, pre-holdout -- NOT the S2 verdict**",
+        "",
+        f"- fit_status: `{payload.get('fit_status')}`",
+        f"- kappa_chosen: `{payload.get('kappa_chosen')}`",
+        f"- artefact_sha256: `{artefact_sha256}`",
+        "",
+        "## Gates",
+        "",
+    ]
+    if isinstance(gates, Mapping):
+        for gate_name in ("G2.0", "G2.0a", "G2.1", "G2.2", "G2.3"):
+            gate = gates.get(gate_name, {})
+            status = gate.get("status") if isinstance(gate, Mapping) else None
+            n_value = gate.get("n") if isinstance(gate, Mapping) else None
+            lines.append(f"- {gate_name}: `{status}` (n={n_value})")
+    lines.extend(
+        [
+            "",
+            "## Source JSON",
+            "",
+            "This note is generated by `scripts/analysis/nbp_skill_study.py` from the JSON result; numbers are not hand-written.",
+            "",
+            "```json",
+            json.dumps(payload, indent=2, sort_keys=True),
+            "```",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1214,35 +1793,44 @@ def main(argv: list[str] | None = None) -> int:
             f"--stage holdout needs {_HOLDOUT_GUARD_FLAG} -- only an explicit "
             "coordinator call may open it (plan S7 row SL-8)"
         )
+    if args.stage == "holdout" and args.run_gates:
+        parser.error("--run-gates is validate-stage only; this script must not score holdout gates")
     if args.stage == "holdout":
         print(f"nbp_skill_study: stage={args.stage} splits={DEFAULT_SPLITS!r}")
         return 0
 
     settlement_truth_parquet = args.settlement_truth_root / DEFAULT_SETTLEMENT_TRUTH_PARQUET.name
-    _version_rows, report = run_validate(
+    version_rows, report = run_validate(
         nbp_derived_root=args.nbp_derived_root,
         settlement_truth_parquet=settlement_truth_parquet,
         archive_root=args.archive_root,
     )
-    import json
 
     payload = _report_to_json_dict(report)
-    if args.comparator_models:
+    if args.comparator_models or args.run_gates:
         # Opt-in: `daily_max_instants` fully parses the ASOS 1-minute
         # archive (~367MB / 9.0M rows) rather than reading manifest row
         # counts only, unlike every OTHER function `main()` calls by
         # default -- so this stays off the default fast path (SL-8c).
-        _comparator_events, comparator_report = run_comparator_validate(
+        comparator_events, comparator_report = run_comparator_validate(
             nbp_derived_root=args.nbp_derived_root,
             settlement_truth_parquet=settlement_truth_parquet,
             archive_root=args.archive_root,
         )
         payload["comparator_models"] = _comparator_report_to_json_dict(comparator_report)
+        if args.run_gates:
+            gate_payload = run_validate_gates_from_rows(
+                version_rows=version_rows,
+                comparator_events=comparator_events,
+            )
+            payload["validate_gates"] = gate_payload
+            evidence_note = write_validate_evidence_note(gate_payload, date=dt.date.today())
+            payload["validate_evidence_note"] = str(evidence_note)
     print(f"nbp_skill_study: stage=validate splits={DEFAULT_SPLITS!r}")
     print(json.dumps(payload, indent=2, sort_keys=True))
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        args.out.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return 0
 
 

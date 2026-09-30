@@ -12,7 +12,7 @@ import datetime as dt
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import pyarrow.parquet as pq
 import pytest
@@ -29,10 +29,19 @@ sys.path.insert(0, str(_REPO_ROOT / "scripts" / "analysis"))
 
 from settlement_truth_dataset import STATUS_FINAL, SettlementTruthRow, rows_to_table  # type: ignore[import-not-found]  # noqa: E402
 
+from breezy.analysis import nbp_calibration as calib  # noqa: E402
+from scripts.analysis.nbp_skill_study import ComparatorMatchedEvent as NbpComparatorMatchedEvent  # noqa: E402
 from breezy.analysis.nbp_calibration import DEFAULT_SPLITS  # noqa: E402
 from breezy.analysis.nbp_comparator_models import target_climate_day  # noqa: E402
 from breezy.persistence.archive_cache import ArchiveCache, ArchiveRequest, IEM_MOS_SOURCE  # noqa: E402
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, write_partition  # noqa: E402
+from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
+    CdfMethod,
+    EmosParams,
+    Percentiles,
+    build_cdf,
+    rung_probabilities,
+)
 from breezy.strategy.weather_common.probability import ForecastErrorModel  # noqa: E402
 
 
@@ -887,6 +896,223 @@ def test_build_comparator_matched_events_counts_a_cycle_with_no_d1_window() -> N
 
     assert events == ()
     assert report.no_d1_window_cycles == 1
+
+
+# ---------------------------------------------------------------------------
+# SL-8d: validate-stage calibrated M2 + gates.
+# ---------------------------------------------------------------------------
+
+
+def _fit_with_params(
+    *,
+    version: str = "v4.3",
+    a: float = 0.0,
+    gamma: float = 0.0,
+    delta: float = 1.0,
+    converged: bool = True,
+) -> calib.CalibrationFit:
+    point = EmosParams(a=a, gamma=gamma, delta=delta)
+    estimate = calib.VersionEstimate(
+        version=version,
+        a=a,
+        gamma=gamma,
+        n=8,
+        converged=converged,
+        nfev=3,
+    )
+    selection = calib.KappaSelection(
+        chosen_kappa=30.0,
+        curve=(calib.KappaScore(kappa=30.0, mean_crps=1.0),),
+    )
+    return calib.CalibrationFit(
+        delta=delta,
+        delta_converged=converged,
+        delta_nfev=5,
+        hierarchical=calib.HierarchicalEmosResult(
+            method=CdfMethod.NORMAL,
+            delta=delta,
+            kappa_selection=selection,
+            tau_sensitivity=selection,
+            shrunk_by_version={version: estimate},
+            draws_by_version={
+                version: calib.VersionEmosDraws(version=version, point=point, draws=(point,))
+            },
+        ),
+    )
+
+
+def _version_row(
+    *,
+    split: str,
+    climate_day: dt.date,
+    version: str = "v4.3",
+    station: str = "MIA",
+    q50: float = 90.0,
+    cli_tmax_f: float = 90.0,
+) -> calib.VersionRow:
+    return calib.VersionRow(
+        version=version,
+        split=split,
+        station=station,
+        climate_day=climate_day,
+        percentiles=Percentiles(
+            q10=q50 - 4.0,
+            q25=q50 - 2.0,
+            q50=q50,
+            q75=q50 + 2.0,
+            q90=q50 + 4.0,
+            mean=q50,
+            sd=3.0,
+        ),
+        cli_tmax_f=cli_tmax_f,
+    )
+
+
+def _comparator_event(
+    *,
+    split: str,
+    climate_day: dt.date,
+    version: str = "v4.3",
+    station: str = "MIA",
+    q50: float = 90.0,
+    outcome: bool = True,
+    near_midnight: bool | None = None,
+    near_midnight_stratum: str | None = None,
+) -> NbpComparatorMatchedEvent:
+    return cast(
+        NbpComparatorMatchedEvent,
+        nbp_skill_study.ComparatorMatchedEvent(
+            station=station,
+            climate_day=climate_day,
+            split=split,
+            version=version,
+            percentiles=Percentiles(
+                q10=q50 - 4.0,
+                q25=q50 - 2.0,
+                q50=q50,
+                q75=q50 + 2.0,
+                q90=q50 + 4.0,
+                mean=q50,
+                sd=3.0,
+            ),
+            rung_id="mid",
+            p_m0=0.40,
+            p_m1=0.45,
+            p_m2=0.50,
+            cli_tmax_f=q50,
+            outcome=outcome,
+            near_midnight=near_midnight,
+            near_midnight_stratum=near_midnight_stratum,
+        ),
+    )
+
+
+def test_calibrated_m2_uses_fitted_params_and_not_the_uncalibrated_placeholder() -> None:
+    percentiles = Percentiles(q10=66, q25=68, q50=70, q75=72, q90=74, mean=70, sd=3)
+    ladder = nbp_skill_study._forecast_centered_ladder(70)
+    placeholder = rung_probabilities(build_cdf(CdfMethod.NORMAL, percentiles), ladder)["mid"]
+
+    identity = nbp_skill_study.calibrated_m2_rung_probabilities(
+        percentiles=percentiles,
+        version="v4.3",
+        calibration_fit=_fit_with_params(a=0.0),
+        rungs=ladder,
+        cdf_method=CdfMethod.NORMAL,
+    )["mid"]
+    shifted = nbp_skill_study.calibrated_m2_rung_probabilities(
+        percentiles=percentiles,
+        version="v4.3",
+        calibration_fit=_fit_with_params(a=5.0),
+        rungs=ladder,
+        cdf_method=CdfMethod.NORMAL,
+    )["mid"]
+
+    assert identity == pytest.approx(placeholder)
+    assert shifted != pytest.approx(identity)
+    assert shifted != pytest.approx(placeholder)
+
+
+def test_validate_gate_events_preserve_identical_event_keys_across_m0_m1_and_m2() -> None:
+    event = _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3))
+
+    matched = nbp_skill_study.validate_gate_events_from_comparator_events(
+        [event],
+        calibration_fit=_fit_with_params(a=2.0),
+        cdf_method=CdfMethod.NORMAL,
+    )
+
+    assert len(matched) == 1
+    assert (matched[0].station, matched[0].climate_day) == (event.station, event.climate_day)
+    assert matched[0].p_m0 == pytest.approx(event.p_m0)
+    assert matched[0].p_m1 == pytest.approx(event.p_m1)
+    assert matched[0].p_m2 != pytest.approx(event.p_m2)
+
+
+def test_validate_gate_runner_filters_holdout_rows_before_any_gate() -> None:
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _version_row(split="holdout", climate_day=DEFAULT_SPLITS.holdout_start),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _comparator_event(split="holdout", climate_day=DEFAULT_SPLITS.holdout_start),
+        ],
+        calibration_fit=_fit_with_params(),
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert result["coverage_counts"]["validate_version_rows"] == 1
+    assert result["coverage_counts"]["validate_comparator_events"] == 1
+    assert result["coverage_counts"]["holdout_version_rows_filtered"] == 1
+    assert result["coverage_counts"]["holdout_comparator_events_filtered"] == 1
+    assert result["coverage_counts"]["gate_climate_day_max"] < DEFAULT_SPLITS.holdout_start.isoformat()
+
+
+def test_validate_gate_runner_reports_untested_gate_below_threshold_never_pass() -> None:
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        calibration_fit=_fit_with_params(),
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert result["gates"]["G2.0"]["status"] == "UNTESTED"
+    assert result["gates"]["G2.0"]["status"] != "PASS"
+    assert result["gates"]["G2.1"]["status"] == "UNTESTED"
+    assert result["gates"]["G2.1"]["status"] != "PASS"
+
+
+def test_validate_gate_runner_non_converged_fit_blocks_gates_and_artefact(tmp_path: Path) -> None:
+    artefact_dir = tmp_path / "derived"
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        calibration_fit=_fit_with_params(converged=False),
+        artefact_dir=artefact_dir,
+        bootstrap_iterations=3,
+        write_candidate_artefact=True,
+    )
+
+    assert result["fit_status"] == "FIT_NOT_CONVERGED"
+    assert result["artefact"]["path"] is None
+    assert result["artefact"]["sha256"] is None
+    assert not list(artefact_dir.glob("*.json"))
 
 
 # ---------------------------------------------------------------------------
