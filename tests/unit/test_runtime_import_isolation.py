@@ -117,6 +117,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # `breezy.runtime.trade_supervisor_core.LAUNCH_UTC`), so source (c)
     # picks both up -- tracked here rather than excluded, since neither is
     # known to be unimportable under Stage 0.
+    "scripts.analysis.nbp_market_comparison",
     "scripts.analysis.nbp_shadow_parity",
     "scripts.analysis.nbp_shadow_parity_pure",
 )
