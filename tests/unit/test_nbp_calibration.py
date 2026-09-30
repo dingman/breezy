@@ -19,9 +19,11 @@ import dataclasses
 import datetime as dt
 import json
 import math
+import time
 from pathlib import Path
 
 import pytest
+from scipy.optimize import minimize
 
 from breezy.analysis import nbp_calibration as calib
 from breezy.analysis import nbp_comparator_models as comparator
@@ -253,6 +255,53 @@ def _moment_matching_start(rows: list[calib.VersionRow], *, delta: float) -> tup
     return a0, gamma0
 
 
+def _old_reference_fit_version_unshrunk(
+    rows: list[calib.VersionRow], *, method: CdfMethod, delta: float
+) -> tuple[float, float]:
+    """Test-only copy of the pre-SL-8e optimiser/objective."""
+    a0, gamma0 = _moment_matching_start(rows, delta=delta)
+    base_cdfs = [build_cdf(method, row.percentiles) for row in rows]
+
+    def total_crps(params: tuple[float, float]) -> float:
+        a, gamma = params
+        total = 0.0
+        for row, base_cdf in zip(rows, base_cdfs, strict=True):
+            calibrated_cdf = apply_emos(
+                base_cdf, row.percentiles, EmosParams(a=a, gamma=gamma, delta=delta)
+            )
+            total += calib.crps_numerical(
+                calibrated_cdf, row.cli_tmax_f, center=row.percentiles.q50
+            )
+        return total
+
+    result = minimize(
+        total_crps,
+        x0=(a0, gamma0),
+        method="Nelder-Mead",
+        options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": calib.DEFAULT_VERSION_FIT_MAX_ITERATIONS},
+    )
+    assert result.success
+    return float(result.x[0]), float(result.x[1])
+
+
+def _seeded_normal_rows(
+    *,
+    n: int,
+    version: str = "v4.3",
+    split: str = "validate",
+    start_day: dt.date = dt.date(2025, 1, 1),
+) -> list[calib.VersionRow]:
+    rows: list[calib.VersionRow] = []
+    for i in range(n):
+        q50 = 62.0 + 23.0 * math.sin(i / 47.0) + 4.0 * math.cos(i / 19.0)
+        sd = 1.8 + (i % 11) * 0.37
+        bias = 1.35
+        residual = bias + math.sin(i * 1.7) * sd * 0.55 + math.cos(i / 13.0) * 0.8
+        day = start_day + dt.timedelta(days=i)
+        rows.append(_version_row(version, split, day, f"K{i % 17:03d}", q50, sd, q50 + residual))
+    return rows
+
+
 def test_fit_version_unshrunk_minimum_crps_differs_from_moment_matching_on_skewed_residuals() -> None:
     # Mostly-zero residuals with two large positive outliers -- a skewed
     # empirical residual distribution against a normal EMOS shape.
@@ -283,6 +332,52 @@ def test_fit_version_unshrunk_minimum_crps_differs_from_moment_matching_on_skewe
                 rows, method=CdfMethod.NORMAL, delta=delta, a=estimate.a + da, gamma=estimate.gamma + dg
             )
             assert at_fit <= neighbour + 1e-6, (da, dg, at_fit, neighbour)
+
+
+def test_fast_normal_fit_matches_old_reference_objective_on_seeded_rows() -> None:
+    rows = _seeded_normal_rows(n=36)
+    expected_a, expected_gamma = _old_reference_fit_version_unshrunk(
+        rows, method=CdfMethod.NORMAL, delta=0.95
+    )
+
+    estimate = calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=0.95)
+
+    assert estimate.converged is True
+    assert estimate.a == pytest.approx(expected_a, abs=2e-3)
+    assert estimate.gamma == pytest.approx(expected_gamma, abs=2e-3)
+
+
+def test_v43_like_normal_fit_converges_at_realistic_scale() -> None:
+    rows = _seeded_normal_rows(n=4_086, version="v4.3")
+
+    estimate = calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=1.0)
+
+    assert estimate.converged is True
+    assert estimate.n == 4_086
+    assert math.isfinite(estimate.a)
+    assert math.isfinite(estimate.gamma)
+
+
+def test_normal_fit_four_thousand_rows_stays_under_runtime_budget() -> None:
+    rows = _seeded_normal_rows(n=4_000, version="v4.3")
+    budget_seconds = 5.0
+
+    started = time.perf_counter()
+    estimate = calib.fit_version_unshrunk(rows, method=CdfMethod.NORMAL, delta=1.0)
+    elapsed = time.perf_counter() - started
+
+    assert estimate.converged is True
+    assert elapsed < budget_seconds
+
+
+def test_fast_normal_fit_still_flags_forced_non_convergence() -> None:
+    rows = _seeded_normal_rows(n=200, version="v4.3")
+
+    estimate = calib.fit_version_unshrunk(
+        rows, method=CdfMethod.NORMAL, delta=1.0, max_iterations=1
+    )
+
+    assert estimate.converged is False
 
 
 def test_fit_shared_delta_is_deterministic_and_within_its_bracket() -> None:

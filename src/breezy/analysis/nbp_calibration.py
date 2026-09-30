@@ -74,7 +74,10 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final, TypeVar
 
+import numpy as np
+from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
+from scipy.special import ndtr
 
 from breezy.analysis.brier_decomposition import bin_by_value, resolution_difference
 from breezy.strategy.ladder_ev.quantile_density import (
@@ -182,6 +185,7 @@ _logger = logging.getLogger(__name__)
 _SQRT2: Final[float] = math.sqrt(2.0)
 _SQRT_2PI: Final[float] = math.sqrt(2.0 * math.pi)
 _INV_SQRT_PI: Final[float] = 1.0 / math.sqrt(math.pi)
+_MIN_EMOS_SCALE: Final[float] = 1e-9
 
 
 def _std_normal_cdf(x: float) -> float:
@@ -535,6 +539,129 @@ def crps_numerical(
     return total
 
 
+_FloatArray = NDArray[np.float64]
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalEmosDesign:
+    """Vectorized design for the exact NORMAL + apply_emos distribution."""
+
+    version: str
+    n: int
+    q50: _FloatArray
+    sd: _FloatArray
+    mean_offset_over_sd: _FloatArray
+    observed: _FloatArray
+    sd_to_delta: _FloatArray
+
+
+def _normal_design(rows: Sequence[VersionRow], *, delta: float) -> _NormalEmosDesign:
+    q50 = np.asarray([row.percentiles.q50 for row in rows], dtype=np.float64)
+    sd = np.asarray([row.percentiles.sd for row in rows], dtype=np.float64)
+    mean = np.asarray([row.percentiles.mean for row in rows], dtype=np.float64)
+    observed = np.asarray([row.cli_tmax_f for row in rows], dtype=np.float64)
+    return _NormalEmosDesign(
+        version=rows[0].version,
+        n=len(rows),
+        q50=q50,
+        sd=sd,
+        mean_offset_over_sd=(mean - q50) / sd,
+        observed=observed,
+        sd_to_delta=np.exp(delta * np.log(sd)),
+    )
+
+
+def _normal_mu_sigma(
+    design: _NormalEmosDesign, *, a: float, gamma: float
+) -> tuple[_FloatArray, _FloatArray]:
+    sigma = np.exp(gamma) * design.sd_to_delta
+    # Exact equivalent of apply_emos(build_cdf(NORMAL, p), p, params):
+    # F(x) = Phi((x - q50 - a) / s + (q50 - mean) / sd).
+    mu = design.q50 + a + sigma * design.mean_offset_over_sd
+    return mu, sigma
+
+
+def _normal_crps_sum(design: _NormalEmosDesign, *, a: float, gamma: float) -> float:
+    mu, sigma = _normal_mu_sigma(design, a=a, gamma=gamma)
+    z = (design.observed - mu) / sigma
+    phi = np.exp(-0.5 * z * z) / _SQRT_2PI
+    cdf = ndtr(z)
+    crps = sigma * (z * (2.0 * cdf - 1.0) + 2.0 * phi - _INV_SQRT_PI)
+    return float(np.sum(crps))
+
+
+def _normal_fit_objective_and_gradient(
+    params: Sequence[float], design: _NormalEmosDesign
+) -> tuple[float, _FloatArray]:
+    a = float(params[0])
+    gamma = float(params[1])
+    mu, sigma = _normal_mu_sigma(design, a=a, gamma=gamma)
+    z = (design.observed - mu) / sigma
+    phi = np.exp(-0.5 * z * z) / _SQRT_2PI
+    cdf = ndtr(z)
+    d_crps_d_mu = -(2.0 * cdf - 1.0)
+    d_crps_d_sigma = 2.0 * phi - _INV_SQRT_PI
+    crps = sigma * (z * (2.0 * cdf - 1.0) + 2.0 * phi - _INV_SQRT_PI)
+    total = float(np.sum(crps))
+    grad_a = float(np.sum(d_crps_d_mu))
+    grad_gamma = float(
+        np.sum(
+            d_crps_d_mu * design.mean_offset_over_sd * sigma
+            + d_crps_d_sigma * sigma
+        )
+    )
+    gradient = np.asarray([grad_a / design.n, grad_gamma / design.n], dtype=np.float64)
+    return total / design.n, gradient
+
+
+def _fit_version_unshrunk_normal(
+    rows: Sequence[VersionRow],
+    *,
+    delta: float,
+    max_iterations: int | None,
+) -> VersionEstimate:
+    a0 = statistics.fmean(row.cli_tmax_f - row.percentiles.q50 for row in rows)
+    ratios = [
+        ((row.cli_tmax_f - (row.percentiles.q50 + a0)) ** 2) / (row.percentiles.sd ** (2.0 * delta))
+        for row in rows
+    ]
+    gamma0 = 0.5 * math.log(max(statistics.fmean(ratios), _MIN_EMOS_SCALE * _MIN_EMOS_SCALE))
+    design = _normal_design(rows, delta=delta)
+
+    result = minimize(
+        _normal_fit_objective_and_gradient,
+        x0=np.asarray([a0, gamma0], dtype=np.float64),
+        args=(design,),
+        method="L-BFGS-B",
+        jac=True,
+        options={
+            "maxiter": (
+                DEFAULT_VERSION_FIT_MAX_ITERATIONS if max_iterations is None else max_iterations
+            ),
+            "ftol": 1e-12,
+            "gtol": 1e-7,
+        },
+    )
+    converged = bool(result.success)
+    nfev = int(result.nfev)
+    if not converged:
+        _logger.warning(
+            "fit_version_unshrunk did not converge for version %r (n=%d, nfev=%d): %s",
+            rows[0].version,
+            len(rows),
+            nfev,
+            getattr(result, "message", ""),
+        )
+    return VersionEstimate(
+        version=rows[0].version,
+        a=float(result.x[0]),
+        gamma=float(result.x[1]),
+        n=len(rows),
+        converged=converged,
+        nfev=nfev,
+    )
+
+
 #: Default Nelder-Mead iteration ceiling for :func:`fit_version_unshrunk`
 #: (SL-8b review item 2). Callers force non-convergence for tests by
 #: passing a small ``max_iterations`` (e.g. ``1``); production callers use
@@ -576,6 +703,8 @@ def fit_version_unshrunk(
     versions = {row.version for row in rows}
     if len(versions) != 1:
         raise ValueError(f"rows must all share one version, got {sorted(versions)!r}")
+    if method is CdfMethod.NORMAL:
+        return _fit_version_unshrunk_normal(rows, delta=delta, max_iterations=max_iterations)
 
     a0 = statistics.fmean(row.cli_tmax_f - row.percentiles.q50 for row in rows)
     ratios = [
@@ -624,6 +753,27 @@ def fit_version_unshrunk(
     )
 
 
+def _score_rows_for_emos(
+    rows: Sequence[VersionRow],
+    *,
+    method: CdfMethod,
+    a: float,
+    gamma: float,
+    delta: float,
+) -> float:
+    if method is CdfMethod.NORMAL:
+        return _normal_crps_sum(_normal_design(rows, delta=delta), a=a, gamma=gamma)
+    total = 0.0
+    for row in rows:
+        calibrated_cdf = apply_emos(
+            build_cdf(method, row.percentiles),
+            row.percentiles,
+            EmosParams(a=a, gamma=gamma, delta=delta),
+        )
+        total += crps_numerical(calibrated_cdf, row.cli_tmax_f, center=row.percentiles.q50)
+    return total
+
+
 #: Defaults shared by :func:`fit_shared_delta`/:func:`fit_shared_delta_with_diagnostics`
 #: and :func:`fit_calibration` (SL-8b pipeline glue).
 DEFAULT_DELTA_BRACKET: Final[tuple[float, float]] = (0.1, 3.0)
@@ -663,13 +813,9 @@ def fit_shared_delta_with_diagnostics(
         total = 0.0
         for rows in rows_by_version.values():
             estimate = fit_version_unshrunk(rows, method=method, delta=delta)
-            for row in rows:
-                calibrated_cdf = apply_emos(
-                    build_cdf(method, row.percentiles),
-                    row.percentiles,
-                    EmosParams(a=estimate.a, gamma=estimate.gamma, delta=delta),
-                )
-                total += crps_numerical(calibrated_cdf, row.cli_tmax_f, center=row.percentiles.q50)
+            total += _score_rows_for_emos(
+                rows, method=method, a=estimate.a, gamma=estimate.gamma, delta=delta
+            )
         return total
 
     options: dict[str, float | int] = {"xatol": xatol}
@@ -821,19 +967,16 @@ def _select_by_lovo_crps(
             w = weight_fn(first_half_estimate.n, param)
             shrunk_a = w * first_half_estimate.a + (1.0 - w) * pooled_a
             shrunk_gamma = w * first_half_estimate.gamma + (1.0 - w) * pooled_gamma
-            scores = [
-                crps_numerical(
-                    apply_emos(
-                        build_cdf(method, row.percentiles),
-                        row.percentiles,
-                        EmosParams(a=shrunk_a, gamma=shrunk_gamma, delta=delta),
-                    ),
-                    row.cli_tmax_f,
-                    center=row.percentiles.q50,
+            per_version_crps.append(
+                _score_rows_for_emos(
+                    second_half,
+                    method=method,
+                    a=shrunk_a,
+                    gamma=shrunk_gamma,
+                    delta=delta,
                 )
-                for row in second_half
-            ]
-            per_version_crps.append(statistics.fmean(scores))
+                / len(second_half)
+            )
         if per_version_crps:
             curve.append(KappaScore(kappa=param, mean_crps=statistics.fmean(per_version_crps)))
     if not curve:
@@ -1164,6 +1307,8 @@ def fit_calibration(
         bootstrap_draws=bootstrap_draws,
         bootstrap_seed=bootstrap_seed,
         resample_delta=resample_delta,
+        delta_bracket=delta_bracket,
+        delta_xatol=delta_xatol,
     )
     return CalibrationFit(
         delta=delta_diagnostics.delta,
