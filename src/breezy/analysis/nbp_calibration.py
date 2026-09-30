@@ -154,6 +154,7 @@ __all__ = [
     "crps_numerical",
     "emos_params_from_draw_entry",
     "evaluate_g20",
+    "evaluate_g20_and_g20a_combined",
     "evaluate_g20a",
     "evaluate_g21",
     "evaluate_g22",
@@ -171,6 +172,7 @@ __all__ = [
     "rung_bounds_from_calibration",
     "select_kappa_by_lovo_crps",
     "shrink_toward_lovo_pooled_mean",
+    "shrinkage_weight",
     "tau_fraction_sensitivity",
     "write_artefact",
 ]
@@ -710,6 +712,21 @@ def fit_shared_delta(
     return fit_shared_delta_with_diagnostics(rows_by_version, method=method, bracket=bracket, xatol=xatol).delta
 
 
+def shrinkage_weight(n: int, *, kappa: float) -> float:
+    """``w = n / (n + kappa)`` (ruling S12 A-4) -- the precision-weighted
+    shrinkage weight shared by :func:`shrink_toward_lovo_pooled_mean` and
+    :func:`select_kappa_by_lovo_crps`'s own LOVO scoring loop, and reused by
+    ``scripts/analysis/nbp_skill_study.py`` to report each version's w_v
+    (SL-8d review item 4). ``kappa == math.inf`` is full pooling (``w =
+    0``); ``kappa == 0`` is unshrunk (``w = 1``).
+    """
+    if kappa == math.inf:
+        return 0.0
+    if kappa < 0.0:
+        raise ValueError(f"kappa must be >= 0, was {kappa!r}")
+    return n / (n + kappa)
+
+
 def shrink_toward_lovo_pooled_mean(
     target: VersionEstimate, others: Sequence[VersionEstimate], *, kappa: float
 ) -> VersionEstimate:
@@ -726,12 +743,7 @@ def shrink_toward_lovo_pooled_mean(
         raise ValueError("the leave-one-out pool has zero total station-days")
     pooled_a = sum(other.a * other.n for other in others) / total_n
     pooled_gamma = sum(other.gamma * other.n for other in others) / total_n
-    if kappa == math.inf:
-        w = 0.0
-    else:
-        if kappa < 0.0:
-            raise ValueError(f"kappa must be >= 0, was {kappa!r}")
-        w = target.n / (target.n + kappa)
+    w = shrinkage_weight(target.n, kappa=kappa)
     return VersionEstimate(
         version=target.version,
         a=w * target.a + (1.0 - w) * pooled_a,
@@ -847,9 +859,7 @@ def select_kappa_by_lovo_crps(
     seeds ``pooled_a``/``pooled_gamma`` -- see that function's docstring."""
 
     def weight_fn(n: int, kappa: float) -> float:
-        if kappa == math.inf:
-            return 0.0
-        return n / (n + kappa)
+        return shrinkage_weight(n, kappa=kappa)
 
     return _select_by_lovo_crps(rows_by_version, method=method, delta=delta, grid=grid, weight_fn=weight_fn)
 
@@ -1486,6 +1496,68 @@ def evaluate_g20a(
     group_results = _evaluate_residual_groups(groups, seed=seed, iterations=iterations, alpha=alpha)
     flat = not any(result.holm_rejected for result in group_results if result.status == "TESTED")
     return G20aResult(groups=group_results, flat=flat)
+
+
+def evaluate_g20_and_g20a_combined(
+    g20_rows: Sequence[StationDayResidual],
+    g20a_rows: Sequence[StationDayResidual],
+    *,
+    tercile_edges: tuple[float, float],
+    stratum_of_station: Mapping[str, str],
+    seed: int = BOOTSTRAP_SEED,
+    iterations: int = BOOTSTRAP_ITERATIONS,
+    alpha: float = 0.05,
+    fit_status: str = FIT_STATUS_OK,
+) -> tuple[G20Result, G20aResult, int]:
+    """G2.0 and G2.0a share ONE Holm-corrected family (months + day-length
+    terciles + near-midnight strata), per amendment A-6: "each stratum with
+    >= N final station-days joins G2.0's Holm family" (plan S4.1; SL-8d
+    review item 3) -- never two independently Holm-corrected families.
+
+    Returns ``(g20_result, g20a_result, holm_family_size)``: both results
+    carry groups drawn from the SAME combined Holm correction, and
+    ``holm_family_size`` (the total group count across both) is identical
+    for both -- a caller reports it on each gate.
+
+    Raises :class:`FitNotConvergedError` (SL-8b2) if ``fit_status`` is not
+    :data:`FIT_STATUS_OK`.
+    """
+    _refuse_unless_fit_converged(fit_status, gate="evaluate_g20_and_g20a_combined")
+    g20_groups = _month_and_tercile_groups(g20_rows, tercile_edges=tercile_edges)
+    g20a_groups: dict[str, list[StationDayResidual]] = {}
+    for row in g20a_rows:
+        stratum = stratum_of_station.get(row.station)
+        if stratum is None:
+            continue
+        g20a_groups.setdefault(stratum, []).append(row)
+
+    overlap = set(g20_groups) & set(g20a_groups)
+    if overlap:
+        raise ValueError(
+            "G2.0/G2.0a combined Holm family has colliding group keys: "
+            f"{sorted(overlap)!r}"
+        )
+
+    combined_groups: dict[str, list[StationDayResidual]] = {**g20_groups, **g20a_groups}
+    combined_results = _evaluate_residual_groups(
+        combined_groups, seed=seed, iterations=iterations, alpha=alpha
+    )
+    by_key = {result.key: result for result in combined_results}
+    holm_family_size = len(combined_results)
+
+    g20_result_groups = tuple(by_key[key] for key in g20_groups)
+    g20a_result_groups = tuple(by_key[key] for key in g20a_groups)
+    g20_flat = not any(
+        result.holm_rejected for result in g20_result_groups if result.status == "TESTED"
+    )
+    g20a_flat = not any(
+        result.holm_rejected for result in g20a_result_groups if result.status == "TESTED"
+    )
+    return (
+        G20Result(groups=g20_result_groups, flat=g20_flat),
+        G20aResult(groups=g20a_result_groups, flat=g20a_flat),
+        holm_family_size,
+    )
 
 
 # ---------------------------------------------------------------------------

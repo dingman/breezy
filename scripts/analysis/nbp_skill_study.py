@@ -70,10 +70,12 @@ import datetime as dt
 import io
 import json
 import math
+import statistics
 import sys
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Final, TypedDict
 
@@ -85,7 +87,7 @@ for _entry in (str(_SCRIPTS_ANALYSIS_DIR), str(_REPO_ROOT / "src")):
 
 from forecast_climate_day_map import ForecastValidPeriodError, climate_day_for_txn  # type: ignore[import-not-found]  # noqa: E402
 from mos_txn_occupancy import MosTxnRow, parse_mos_txn_rows  # type: ignore[import-not-found]  # noqa: E402
-from settlement_alignment_study import IEM_ASOS_IDS, load_sites  # type: ignore[import-not-found]  # noqa: E402
+from settlement_alignment_study import IEM_ASOS_IDS, VENUE, load_sites  # type: ignore[import-not-found]  # noqa: E402
 from settlement_truth_dataset import SettlementTruthRow, final_rows_for_gate  # type: ignore[import-not-found]  # noqa: E402
 
 from breezy.analysis.nbp_calibration import (  # noqa: E402
@@ -107,12 +109,13 @@ from breezy.analysis.nbp_calibration import (  # noqa: E402
     StationDayResidual,
     VersionRow,
     artefact_from_calibration_fit,
-    evaluate_g20,
-    evaluate_g20a,
+    compute_n_min,
+    evaluate_g20_and_g20a_combined,
     evaluate_g21,
     evaluate_g22,
     evaluate_g23,
     fit_calibration,
+    shrinkage_weight,
     write_artefact,
 )
 from breezy.analysis.nbp_comparator_models import (  # noqa: E402
@@ -134,6 +137,7 @@ from breezy.persistence.archive_cache import (  # noqa: E402
     ArchiveRequest,
 )
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition  # noqa: E402
+from breezy.registry.sites import default_registry  # noqa: E402
 from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
     CdfMethod,
     EmosParams,
@@ -258,6 +262,17 @@ class _ArtefactJson(TypedDict):
     sha256: str | None
 
 
+class _PowerJson(TypedDict):
+    """S2 power metadata (plan S4.1; SL-8d review item 4): the
+    validation-split estimate of sigma_d, the n_min it implies, and whether
+    that n_min is reachable (:data:`breezy.analysis.nbp_calibration
+    .N_MIN_CEILING`)."""
+
+    sigma_d: float
+    n_min: int
+    status: str
+
+
 class ValidateGatePayload(TypedDict):
     label: str
     stage: str
@@ -268,6 +283,8 @@ class ValidateGatePayload(TypedDict):
     coverage_counts: _CoverageCountsJson
     gates: dict[str, _GateJson]
     artefact: _ArtefactJson
+    power: _PowerJson
+    shrinkage_weights: dict[str, float]
 
 #: Relative to the repo root. The frozen 0b error model artefact (SL-8c),
 #: fitted once on the WP-6 TRAIN split and committed as the freeze point
@@ -1262,26 +1279,47 @@ def run_comparator_validate(
 # ---------------------------------------------------------------------------
 
 
-_LATITUDE_BY_STATION: Final[Mapping[str, float]] = {
-    "KLAX": 33.93806,
-    "LAX": 33.93806,
-    "KMDW": 41.78417,
-    "MDW": 41.78417,
-    "KMIA": 25.79056,
-    "MIA": 25.79056,
-    "KSFO": 37.61961,
-    "SFO": 37.61961,
-}
+class UnknownStationError(ValueError):
+    """`_daylight_hours` was asked for a station the registry does not know
+    (SL-8d review item 5) -- never silently defaulted to a placeholder
+    latitude."""
+
+
+@lru_cache(maxsize=1)
+def _station_latitudes() -> Mapping[str, float]:
+    """Every polymarket_us station's latitude, keyed by BOTH its ICAO and
+    its short settlement code (e.g. ``KMIA`` and ``MIA``), read from the
+    SAME registry every other lookup in this module uses
+    (`breezy.registry.sites`/``sites.toml``) -- never a second,
+    hand-maintained copy (SL-8d review item 5). Cached: the registry is
+    immutable for the process lifetime.
+    """
+    registry = default_registry()
+    latitudes: dict[str, float] = {}
+    for spec in load_sites():
+        coordinates = registry.enrichment_coordinates(VENUE, spec.city)
+        latitudes[spec.site.icao] = coordinates.lat
+        latitudes[spec.iem_asos_id] = coordinates.lat
+    return latitudes
 
 
 def _daylight_hours(station: str, day: dt.date) -> float:
     """Approximate astronomical daylight hours for G2.0 tercile grouping.
 
-    The four station latitudes are copied from `src/breezy/registry/sites.toml`
-    to keep this script bounded and deterministic; the gate only needs a
-    stable day-length ordering for train-derived tercile edges.
+    The latitude comes from `src/breezy/registry/sites.toml` via
+    :func:`_station_latitudes` -- an unknown station raises
+    :class:`UnknownStationError` rather than silently falling back to a
+    placeholder latitude (SL-8d review item 5); the gate only needs a
+    stable day-length ordering for train-derived tercile edges, never an
+    unverified guess for a station it does not recognise.
     """
-    latitude = math.radians(_LATITUDE_BY_STATION.get(station, 37.0))
+    try:
+        latitude_deg = _station_latitudes()[station]
+    except KeyError as exc:
+        raise UnknownStationError(
+            f"unknown station {station!r}: no latitude registered in sites.toml"
+        ) from exc
+    latitude = math.radians(latitude_deg)
     year_days = 366 if day.replace(month=12, day=31).timetuple().tm_yday == 366 else 365
     declination = math.radians(
         23.44 * math.sin((2.0 * math.pi / year_days) * (day.timetuple().tm_yday - 80))
@@ -1420,7 +1458,7 @@ def _status_from_bool(passed: bool) -> str:
     return "PASS" if passed else "FAIL"
 
 
-def _g20_to_json(result: G20Result | G20aResult) -> _G20GateJson:
+def _g20_to_json(result: G20Result | G20aResult, *, holm_family_size: int) -> _G20GateJson:
     groups: list[_GroupJson] = [
         {
             "key": group.key,
@@ -1439,7 +1477,10 @@ def _g20_to_json(result: G20Result | G20aResult) -> _G20GateJson:
     return {
         "status": status,
         "n": sum(group.n for group in result.groups),
-        "statistics": {"groups": groups},
+        # `holm_family_size` (SL-8d review item 3): the SAME combined
+        # G2.0/G2.0a Holm family size reported on BOTH gates -- never two
+        # independently-sized families.
+        "statistics": {"groups": groups, "holm_family_size": holm_family_size},
         "cis": {},
         "groups": groups,
     }
@@ -1501,11 +1542,51 @@ def _fit_not_converged_gates() -> dict[str, _GateJson]:
     }
 
 
+def _validation_power_metadata(events: Sequence[MatchedEvent]) -> _PowerJson:
+    """The validation-split estimate of sigma_d and the n_min it implies
+    (plan S4.1; SL-8d review item 4), never the hard-coded ``n_min=0,
+    sigma_d=0.0`` placeholder. sigma_d is the SD of each station-day's mean
+    paired Brier difference (M2-M1); n_min and its feasibility come straight
+    from :func:`breezy.analysis.nbp_calibration.compute_n_min` -- never a
+    second, hand-rolled copy of that formula.
+    """
+    diffs_by_station_day: dict[tuple[str, dt.date], list[float]] = {}
+    for event in events:
+        outcome = float(event.outcome)
+        diff = (event.p_m2 - outcome) ** 2 - (event.p_m1 - outcome) ** 2
+        diffs_by_station_day.setdefault((event.station, event.climate_day), []).append(diff)
+    per_day_means = [statistics.fmean(diffs) for diffs in diffs_by_station_day.values()]
+    sigma_d = statistics.pstdev(per_day_means) if len(per_day_means) > 1 else 0.0
+    if sigma_d <= 0.0:
+        return {"sigma_d": 0.0, "n_min": 0, "status": "OK"}
+    n_min_result = compute_n_min(sigma_d)
+    return {
+        "sigma_d": n_min_result.sigma_d,
+        "n_min": n_min_result.n_min,
+        "status": n_min_result.status,
+    }
+
+
+def _shrinkage_weights(fit: CalibrationFit) -> dict[str, float]:
+    """Per-version shrinkage weight w_v = n_v / (n_v + kappa) (ruling S12
+    A-4; SL-8d review item 4), via the SAME native
+    :func:`breezy.analysis.nbp_calibration.shrinkage_weight` the fit itself
+    used to shrink ``(a_v, gamma_v)`` -- never a second, hand-rolled copy.
+    """
+    kappa = fit.hierarchical.kappa_selection.chosen_kappa
+    return {
+        version: shrinkage_weight(estimate.n, kappa=kappa)
+        for version, estimate in fit.hierarchical.shrunk_by_version.items()
+    }
+
+
 def _write_candidate_artefact(
     *,
     calibration_fit: CalibrationFit,
     cdf_method: CdfMethod,
     artefact_dir: Path,
+    n_min: int,
+    sigma_d: float,
 ) -> _ArtefactJson:
     artefact_dir.mkdir(parents=True, exist_ok=True)
     artefact = artefact_from_calibration_fit(
@@ -1513,8 +1594,8 @@ def _write_candidate_artefact(
         cdf_method=cdf_method,
         recalibration="hierarchical_emos",
         correction_form=CorrectionForm.NONE,
-        n_min=0,
-        sigma_d=0.0,
+        n_min=n_min,
+        sigma_d=sigma_d,
         rung_probability_bounds={},
     )
     path = artefact_dir / f"nbp_validate_candidate_{dt.date.today().isoformat()}.json"
@@ -1532,16 +1613,34 @@ def run_validate_gates_from_rows(
     bootstrap_iterations: int = 2_000,
     write_candidate_artefact: bool = True,
 ) -> ValidateGatePayload:
-    pre_holdout_rows = [row for row in version_rows if row.split != "holdout"]
+    # Item 1 (review): a row is holdout by ITS OWN climate_day, never by its
+    # `split` tag alone -- a row mistagged e.g. "validate" but dated on or
+    # after the holdout start is dropped and counted here, before it can
+    # reach the fit or any gate input.
+    holdout_start = DEFAULT_SPLITS.holdout_start
+    pre_holdout_rows = [row for row in version_rows if row.climate_day < holdout_start]
+    holdout_version_rows = [row for row in version_rows if row.climate_day >= holdout_start]
+    pre_holdout_events = [event for event in comparator_events if event.climate_day < holdout_start]
+    holdout_events = [event for event in comparator_events if event.climate_day >= holdout_start]
+
     validate_rows = [row for row in pre_holdout_rows if row.split == "validate"]
-    validate_events_source = [event for event in comparator_events if event.split == "validate"]
-    holdout_version_rows = [row for row in version_rows if row.split == "holdout"]
-    holdout_events = [event for event in comparator_events if event.split == "holdout"]
+    validate_events_source = [event for event in pre_holdout_events if event.split == "validate"]
+
+    # Item 2 (review): the calibration fit never sees VALIDATE rows -- this
+    # validate-stage rehearsal scores VALIDATE with the gates below, so
+    # fitting on it too would be in-sample leakage. Plan S2.2, quoted
+    # verbatim: "Each version's parameters are fitted on its own pre-holdout
+    # rows: train for the 2020-2024 versions, validation for v4.2 (rows
+    # before 2025-05-27) and v4.3, and the v5.0 fit slice (2026-05-04..
+    # 06-30) for v5.0." This rehearsal simplifies that to TRAIN plus the
+    # v5.0 fit slice only -- never VALIDATE, because VALIDATE is what the
+    # gates below score.
+    fit_input_rows = [row for row in pre_holdout_rows if row.split != "validate"]
 
     fit = (
         calibration_fit
         if calibration_fit is not None
-        else fit_calibration(pre_holdout_rows, method=cdf_method)
+        else fit_calibration(fit_input_rows, method=cdf_method)
     )
     fit_status = _fit_status_from_calibration(fit)
     kappa_curve: list[_KappaCurveJson] = [
@@ -1552,8 +1651,8 @@ def run_validate_gates_from_rows(
     gate_days = [row.climate_day for row in validate_rows]
     gate_days.extend(event.climate_day for event in validate_events_source)
     coverage_counts: _CoverageCountsJson = {
-        "fit_rows": len(pre_holdout_rows),
-        "train_fit_rows": sum(1 for row in pre_holdout_rows if row.split == "train"),
+        "fit_rows": len(fit_input_rows),
+        "train_fit_rows": sum(1 for row in fit_input_rows if row.split == "train"),
         "validate_version_rows": len(validate_rows),
         "validate_comparator_events": len(validate_events_source),
         "holdout_version_rows_filtered": len(holdout_version_rows),
@@ -1579,12 +1678,14 @@ def run_validate_gates_from_rows(
             "coverage_counts": coverage_counts,
             "gates": _fit_not_converged_gates(),
             "artefact": {"path": None, "sha256": None},
+            "power": {"sigma_d": 0.0, "n_min": 0, "status": "OK"},
+            "shrinkage_weights": {},
         }
 
     residual_rows = _g20_rows(validate_rows, calibration_fit=fit)
     train_day_lengths = [
         _daylight_hours(row.station, row.climate_day)
-        for row in pre_holdout_rows
+        for row in fit_input_rows
         if row.split == "train"
     ]
     tercile_edges = _tercile_edges(train_day_lengths)
@@ -1600,17 +1701,19 @@ def run_validate_gates_from_rows(
         if event.near_midnight_stratum is not None
     }
 
+    # Item 3 (review): G2.0 and G2.0a share ONE combined Holm family
+    # (months + day-length terciles + near-midnight strata), per amendment
+    # A-6 -- never two independently Holm-corrected families.
+    g20_result, g20a_result, holm_family_size = evaluate_g20_and_g20a_combined(
+        residual_rows,
+        g20a_residual_rows,
+        tercile_edges=tercile_edges,
+        stratum_of_station=stratum_of_station,
+        iterations=bootstrap_iterations,
+    )
     gates: dict[str, _GateJson] = {}
-    gates["G2.0"] = _g20_to_json(
-        evaluate_g20(residual_rows, tercile_edges=tercile_edges, iterations=bootstrap_iterations)
-    )
-    gates["G2.0a"] = _g20_to_json(
-        evaluate_g20a(
-            g20a_residual_rows,
-            stratum_of_station=stratum_of_station,
-            iterations=bootstrap_iterations,
-        )
-    )
+    gates["G2.0"] = _g20_to_json(g20_result, holm_family_size=holm_family_size)
+    gates["G2.0a"] = _g20_to_json(g20a_result, holm_family_size=holm_family_size)
     rung_events = _rung_events(matched_events)
     gates["G2.1"] = _g21_to_json(evaluate_g21(rung_events, iterations=bootstrap_iterations))
     if matched_events:
@@ -1626,6 +1729,11 @@ def run_validate_gates_from_rows(
         gates["G2.2"] = {"status": "UNTESTED", "n": 0, "statistics": {}, "cis": {}}
         gates["G2.3"] = {"status": "UNTESTED", "n": 0, "statistics": {}, "cis": {}}
 
+    # Item 4 (review): sigma_d/n_min/status/w_v measured from real
+    # validation data -- never the hard-coded n_min=0, sigma_d=0.0.
+    power = _validation_power_metadata(matched_events)
+    shrinkage_weights = _shrinkage_weights(fit)
+
     artefact_info: _ArtefactJson = {"path": None, "sha256": None}
     if write_candidate_artefact:
         try:
@@ -1633,6 +1741,8 @@ def run_validate_gates_from_rows(
                 calibration_fit=fit,
                 cdf_method=cdf_method,
                 artefact_dir=artefact_dir,
+                n_min=power["n_min"],
+                sigma_d=power["sigma_d"],
             )
         except FitNotConvergedError:
             artefact_info = {"path": None, "sha256": None}
@@ -1658,6 +1768,8 @@ def run_validate_gates_from_rows(
         "coverage_counts": coverage_counts,
         "gates": gates,
         "artefact": artefact_info,
+        "power": power,
+        "shrinkage_weights": shrinkage_weights,
     }
 
 
@@ -1666,6 +1778,11 @@ def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date
     gates = payload.get("gates", {})
     artefact = payload.get("artefact")
     artefact_sha256 = artefact.get("sha256") if isinstance(artefact, Mapping) else None
+    power = payload.get("power")
+    power_sigma_d = power.get("sigma_d") if isinstance(power, Mapping) else None
+    power_n_min = power.get("n_min") if isinstance(power, Mapping) else None
+    power_status = power.get("status") if isinstance(power, Mapping) else None
+    shrinkage_weights = payload.get("shrinkage_weights")
     lines = [
         "# NBP S2 Validate Result",
         "",
@@ -1674,6 +1791,10 @@ def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date
         f"- fit_status: `{payload.get('fit_status')}`",
         f"- kappa_chosen: `{payload.get('kappa_chosen')}`",
         f"- artefact_sha256: `{artefact_sha256}`",
+        f"- sigma_d: `{power_sigma_d}`",
+        f"- n_min: `{power_n_min}`",
+        f"- power_status: `{power_status}`",
+        f"- shrinkage_weights: `{shrinkage_weights}`",
         "",
         "## Gates",
         "",

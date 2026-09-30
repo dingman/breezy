@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -1070,6 +1072,205 @@ def test_validate_gate_runner_filters_holdout_rows_before_any_gate() -> None:
     assert result["coverage_counts"]["holdout_version_rows_filtered"] == 1
     assert result["coverage_counts"]["holdout_comparator_events_filtered"] == 1
     assert result["coverage_counts"]["gate_climate_day_max"] < DEFAULT_SPLITS.holdout_start.isoformat()
+
+
+def test_validate_gate_runner_filters_mistagged_holdout_climate_day_before_fit_and_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_fit_rows: list[calib.VersionRow] = []
+
+    def fake_fit_calibration(
+        rows: Sequence[calib.VersionRow], *, method: CdfMethod
+    ) -> calib.CalibrationFit:
+        captured_fit_rows.extend(rows)
+        return _fit_with_params()
+
+    monkeypatch.setattr(nbp_skill_study, "fit_calibration", fake_fit_calibration)
+
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _version_row(split="validate", climate_day=DEFAULT_SPLITS.holdout_start),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _comparator_event(split="validate", climate_day=DEFAULT_SPLITS.holdout_start),
+        ],
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert [row.climate_day for row in captured_fit_rows] == [dt.date(2024, 1, 1)]
+    assert result["coverage_counts"]["validate_version_rows"] == 1
+    assert result["coverage_counts"]["validate_comparator_events"] == 1
+    assert result["coverage_counts"]["holdout_version_rows_filtered"] == 1
+    assert result["coverage_counts"]["holdout_comparator_events_filtered"] == 1
+    assert result["coverage_counts"]["gate_climate_day_max"] < DEFAULT_SPLITS.holdout_start.isoformat()
+
+
+def test_validate_rows_never_enter_parameter_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_fit_rows: list[calib.VersionRow] = []
+
+    def fake_fit_calibration(
+        rows: Sequence[calib.VersionRow], *, method: CdfMethod
+    ) -> calib.CalibrationFit:
+        captured_fit_rows.extend(rows)
+        return _fit_with_params()
+
+    monkeypatch.setattr(nbp_skill_study, "fit_calibration", fake_fit_calibration)
+
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+            _version_row(split="v5_fit_slice", climate_day=dt.date(2026, 6, 1)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert {row.split for row in captured_fit_rows} == {"train", "v5_fit_slice"}
+    assert result["coverage_counts"]["validate_version_rows"] == 1
+
+
+def test_g20_holm_family_combines_months_daylength_terciles_and_near_midnight_strata() -> None:
+    version_rows: list[calib.VersionRow] = [
+        _version_row(split="train", station="MDW", climate_day=dt.date(2024, 1, 1)),
+        _version_row(split="train", station="MDW", climate_day=dt.date(2024, 6, 1)),
+        _version_row(split="train", station="MIA", climate_day=dt.date(2024, 9, 1)),
+    ]
+    for month in range(1, 13):
+        for i in range(60):
+            day = dt.date(2025, month, (i % 20) + 1)
+            station = ("MIA", "MDW", "SFO", "LAX")[i % 4]
+            version_rows.append(
+                _version_row(
+                    split="validate",
+                    station=station,
+                    climate_day=day,
+                    q50=70.0,
+                    cli_tmax_f=70.0 + float((i % 5) - 2),
+                )
+            )
+
+    comparator_events: list[NbpComparatorMatchedEvent] = []
+    for station, stratum in (("MIA", "KMIA"), ("MDW", "KMDW"), ("SFO", "KLAX_KSFO_POOLED")):
+        for i in range(60):
+            comparator_events.append(
+                _comparator_event(
+                    split="validate",
+                    station=station,
+                    climate_day=dt.date(2025, 6, (i % 20) + 1),
+                    near_midnight=True,
+                    near_midnight_stratum=stratum,
+                )
+            )
+
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=version_rows,
+        comparator_events=comparator_events,
+        calibration_fit=_fit_with_params(),
+        artefact_dir=Path("/tmp/nbp-synthetic-no-write"),
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert result["gates"]["G2.0"]["statistics"]["holm_family_size"] == 18
+    assert result["gates"]["G2.0a"]["statistics"]["holm_family_size"] == 18
+    assert len(result["gates"]["G2.0"]["groups"]) == 15
+    assert len(result["gates"]["G2.0a"]["groups"]) == 3
+
+
+def test_validation_power_metadata_and_shrinkage_weights_are_emitted(tmp_path: Path) -> None:
+    events = [
+        calib.MatchedEvent(
+            station="MIA",
+            climate_day=dt.date(2025, 6, 1),
+            p_m2=1.0,
+            p_m1=0.0,
+            p_m0=0.0,
+            outcome=True,
+        ),
+        calib.MatchedEvent(
+            station="MIA",
+            climate_day=dt.date(2025, 6, 2),
+            p_m2=1.0,
+            p_m1=0.0,
+            p_m0=0.0,
+            outcome=False,
+        ),
+    ]
+
+    power = nbp_skill_study._validation_power_metadata(events)
+    assert power["sigma_d"] > 0.0
+    assert power["n_min"] > 520
+    assert power["status"] == "PMUS_INFEASIBLE_ROUTE_NODE4"
+
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 3)),
+        ],
+        calibration_fit=_fit_with_params(),
+        artefact_dir=tmp_path,
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert result["power"]["sigma_d"] == pytest.approx(0.0)
+    assert result["power"]["n_min"] == 0
+    assert result["power"]["status"] == "OK"
+    assert result["shrinkage_weights"] == {"v4.3": pytest.approx(8.0 / 38.0)}
+
+    note = nbp_skill_study.write_validate_evidence_note(result, date=dt.date(2026, 9, 30))
+    note_text = note.read_text(encoding="utf-8")
+    assert "sigma_d" in note_text
+    assert "n_min" in note_text
+    assert "shrinkage_weights" in note_text
+    note.unlink()
+
+
+def test_write_candidate_artefact_threads_measured_power_metadata_not_hardcoded_zero(
+    tmp_path: Path,
+) -> None:
+    """SL-8d review item 4: the persisted candidate artefact's `n_min`/
+    `sigma_d` come from the SAME measured `power` metadata the payload
+    reports -- never the hard-coded `n_min=0, sigma_d=0.0` placeholder."""
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 1), outcome=True),
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 2), outcome=False),
+        ],
+        calibration_fit=_fit_with_params(),
+        artefact_dir=tmp_path,
+        bootstrap_iterations=3,
+        write_candidate_artefact=True,
+    )
+
+    assert result["power"]["sigma_d"] > 0.0
+    assert result["power"]["n_min"] > 0
+    assert result["artefact"]["path"] is not None
+    written = json.loads(Path(result["artefact"]["path"]).read_text(encoding="utf-8"))
+    assert written["n_min"] == result["power"]["n_min"]
+    assert written["sigma_d"] == pytest.approx(result["power"]["sigma_d"])
+    assert written["n_min"] != 0
+
+
+def test_daylight_hours_refuses_unknown_station_instead_of_using_latitude_fallback() -> None:
+    with pytest.raises(ValueError, match="unknown station"):
+        nbp_skill_study._daylight_hours("KDEN", dt.date(2025, 6, 1))
 
 
 def test_validate_gate_runner_reports_untested_gate_below_threshold_never_pass() -> None:
