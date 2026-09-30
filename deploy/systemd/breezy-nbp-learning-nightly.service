@@ -1,0 +1,33 @@
+[Unit]
+Description=Breezy SL-15 NBP nightly learning loop
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/nbp_learning_nightly.py
+Documentation=file:///home/jon/breezy/docs/plans/FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md
+
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# The 2026-09-11 k1-daily incident reached a 17.6 GB peak without a cgroup
+# ceiling. This loop scans local derived weather rows and writes at most a
+# candidate artefact, so it is capped well below the retired heavy studies.
+MemoryHigh=3G
+MemoryMax=4G
+
+Slice=breezy-studies.slice
+UMask=0077
+
+# Alert delivery uses only the dedicated alerts.env convention. This unit
+# must never load operator.env, halt state, venue credentials, or trading
+# enablement controls.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/nbp_learning_nightly.py
+
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-nbp-learning-nightly
+
+# NOTE: no [Install] section. This unit is started by the timer.

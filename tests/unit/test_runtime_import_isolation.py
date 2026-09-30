@@ -120,6 +120,9 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.analysis.nbp_market_comparison",
     "scripts.analysis.nbp_shadow_parity",
     "scripts.analysis.nbp_shadow_parity_pure",
+    # SL-15: the NBP learning nightly imports `breezy.runtime.health` for alert
+    # delivery, so it is a covered Stage 0 entry rather than an exclusion.
+    "scripts.analysis.nbp_learning_nightly",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_
