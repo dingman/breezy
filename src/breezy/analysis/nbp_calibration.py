@@ -79,7 +79,7 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import ndtr
 
-from breezy.analysis.brier_decomposition import bin_by_value, resolution_difference
+from breezy.analysis.brier_decomposition import bin_by_edges, resolution_difference
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
@@ -115,6 +115,8 @@ __all__ = [
     "C1Reevaluation",
     "CalibrationFit",
     "CorrectionForm",
+    "CorrectionFitRow",
+    "CorrectionSelection",
     "DeltaFitDiagnostics",
     "FIT_STATUS_NOT_CONVERGED",
     "FIT_STATUS_OK",
@@ -135,7 +137,10 @@ __all__ = [
     "MatchedEvent",
     "NMinResult",
     "NbpCalibrationArtefact",
+    "ProbabilityRecalibrationForm",
+    "ProbabilityRecalibrationSelection",
     "PrimaryHoldoutLeakError",
+    "RecalibrationFitEvent",
     "RungEvent",
     "SkillGateResult",
     "SplitBounds",
@@ -146,6 +151,8 @@ __all__ = [
     "VersionEstimate",
     "VersionRow",
     "apply_correction_form",
+    "apply_probability_recalibration",
+    "apply_selected_correction",
     "artefact_from_calibration_fit",
     "artefact_from_json_dict",
     "artefact_json",
@@ -174,6 +181,8 @@ __all__ = [
     "reevaluate_c1",
     "rung_bounds_from_calibration",
     "select_kappa_by_lovo_crps",
+    "select_correction_form",
+    "select_probability_recalibration",
     "shrink_toward_lovo_pooled_mean",
     "shrinkage_weight",
     "tau_fraction_sensitivity",
@@ -1370,6 +1379,281 @@ def apply_correction_form(
     raise InvalidCorrectionFormError(f"unhandled CorrectionForm {form!r}")  # pragma: no cover
 
 
+@dataclass(frozen=True, slots=True)
+class CorrectionFitRow:
+    split: str
+    climate_day: dt.date
+    residual_f: float
+    day_length_hours: float
+    scale_f: float
+
+    @property
+    def month(self) -> int:
+        return self.climate_day.month
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionSelection:
+    form: CorrectionForm
+    month_offsets: Mapping[int, float] = field(default_factory=dict)
+    linear_coefficients: tuple[float, float] | None = None
+    validation_scores: Mapping[str, float] = field(default_factory=dict)
+
+
+def _validation_correction_rows(rows: Sequence[CorrectionFitRow]) -> tuple[CorrectionFitRow, ...]:
+    return tuple(
+        row for row in rows if row.split == "validate" and row.climate_day < DEFAULT_SPLITS.holdout_start
+    )
+
+
+def _fit_month_offsets(rows: Sequence[CorrectionFitRow]) -> dict[int, float]:
+    by_month: dict[int, list[float]] = {}
+    for row in rows:
+        by_month.setdefault(row.month, []).append(row.residual_f)
+    return {month: statistics.fmean(values) for month, values in by_month.items()}
+
+
+def _fit_linear_daylength(rows: Sequence[CorrectionFitRow]) -> tuple[float, float]:
+    xs = [row.day_length_hours for row in rows]
+    ys = [row.residual_f for row in rows]
+    x_bar = statistics.fmean(xs)
+    y_bar = statistics.fmean(ys)
+    denom = sum((x - x_bar) ** 2 for x in xs)
+    if denom <= 0.0:
+        return 0.0, y_bar
+    slope = sum((x - x_bar) * (y - y_bar) for x, y in zip(xs, ys, strict=True)) / denom
+    return slope, y_bar - slope * x_bar
+
+
+def _correction_prediction(selection: CorrectionSelection, row: CorrectionFitRow) -> float:
+    if selection.form is CorrectionForm.NONE:
+        return 0.0
+    if selection.form is CorrectionForm.MONTH_OFFSET:
+        return selection.month_offsets.get(row.month, 0.0)
+    if selection.form is CorrectionForm.LINEAR_DAYLENGTH:
+        if selection.linear_coefficients is None:
+            raise ValueError("linear correction selection lacks coefficients")
+        slope, intercept = selection.linear_coefficients
+        return slope * row.day_length_hours + intercept
+    raise InvalidCorrectionFormError(f"unhandled CorrectionForm {selection.form!r}")  # pragma: no cover
+
+
+def _score_correction(selection: CorrectionSelection, rows: Sequence[CorrectionFitRow]) -> float:
+    return statistics.fmean(
+        crps_normal(
+            _correction_prediction(selection, row),
+            max(row.scale_f, _MIN_EMOS_SCALE),
+            row.residual_f,
+        )
+        for row in rows
+    )
+
+
+def select_correction_form(rows: Sequence[CorrectionFitRow]) -> CorrectionSelection:
+    """Select the closed G2.0 correction form on VALIDATION rows only.
+
+    Governing text, quoted literally in code as requested:
+    "Closed correction set (R3-07): {none, one offset per calendar month,
+    linear in LST day-length}." "The form is chosen there only. No other form
+    may be introduced after S0." Ruling: "Correction set, closed: `{none, one
+    offset per calendar month, linear in LST day-length}` — chosen on the
+    validation split only; no other form may be introduced after S0." SL-8 row
+    8: "G2.0 correction form outside {none, month offset, linear day-length}
+    raises".
+    """
+    validation_rows = _validation_correction_rows(rows)
+    if not validation_rows:
+        raise ValueError("select_correction_form needs at least one validation row")
+    candidates = (
+        CorrectionSelection(form=CorrectionForm.NONE),
+        CorrectionSelection(
+            form=CorrectionForm.MONTH_OFFSET,
+            month_offsets=_fit_month_offsets(validation_rows),
+        ),
+        CorrectionSelection(
+            form=CorrectionForm.LINEAR_DAYLENGTH,
+            linear_coefficients=_fit_linear_daylength(validation_rows),
+        ),
+    )
+    scores = {candidate.form.value: _score_correction(candidate, validation_rows) for candidate in candidates}
+    order = {CorrectionForm.NONE.value: 0, CorrectionForm.MONTH_OFFSET.value: 1, CorrectionForm.LINEAR_DAYLENGTH.value: 2}
+    chosen = min(candidates, key=lambda candidate: (round(scores[candidate.form.value], 12), order[candidate.form.value]))
+    return CorrectionSelection(
+        form=chosen.form,
+        month_offsets=chosen.month_offsets,
+        linear_coefficients=chosen.linear_coefficients,
+        validation_scores=scores,
+    )
+
+
+def apply_selected_correction(
+    selection: CorrectionSelection,
+    *,
+    residual_f: float,
+    row: CorrectionFitRow,
+) -> float:
+    """Return the post-correction residual; callers add the same prediction to
+    M2's location before producing probabilities."""
+    return residual_f - _correction_prediction(selection, row)
+
+
+class ProbabilityRecalibrationForm(Enum):
+    NONE = "none"
+    AFFINE = "affine"
+    ISOTONIC = "isotonic"
+
+
+@dataclass(frozen=True, slots=True)
+class RecalibrationFitEvent:
+    split: str
+    climate_day: dt.date
+    rung_id: str
+    p_model: float
+    outcome: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityRecalibrationSelection:
+    form: ProbabilityRecalibrationForm
+    affine: tuple[float, float] | None = None
+    isotonic_points: tuple[tuple[float, float], ...] = ()
+    validation_brier: Mapping[str, float] = field(default_factory=dict)
+
+
+def _clip_probability(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+def _fit_affine(events: Sequence[RecalibrationFitEvent]) -> tuple[float, float]:
+    xs = [event.p_model for event in events]
+    ys = [float(event.outcome) for event in events]
+    x_bar = statistics.fmean(xs)
+    y_bar = statistics.fmean(ys)
+    denom = sum((x - x_bar) ** 2 for x in xs)
+    if denom <= 0.0:
+        return y_bar, 0.0
+    slope = sum((x - x_bar) * (y - y_bar) for x, y in zip(xs, ys, strict=True)) / denom
+    return y_bar - slope * x_bar, slope
+
+
+def _fit_isotonic_pav(events: Sequence[RecalibrationFitEvent]) -> tuple[tuple[float, float], ...]:
+    ordered = sorted((event.p_model, float(event.outcome)) for event in events)
+    blocks: list[tuple[float, float, int]] = []
+    for x, y in ordered:
+        blocks.append((x, y, 1))
+        while len(blocks) >= 2 and blocks[-2][1] > blocks[-1][1]:
+            x1, y1, n1 = blocks.pop()
+            x0, y0, n0 = blocks.pop()
+            n = n0 + n1
+            blocks.append(((x0 * n0 + x1 * n1) / n, (y0 * n0 + y1 * n1) / n, n))
+    return tuple((x, _clip_probability(y)) for x, y, _n in blocks)
+
+
+def _apply_recalibration_scalar(selection: ProbabilityRecalibrationSelection, p_model: float) -> float:
+    if selection.form is ProbabilityRecalibrationForm.NONE:
+        return _clip_probability(p_model)
+    if selection.form is ProbabilityRecalibrationForm.AFFINE:
+        if selection.affine is None:
+            raise ValueError("affine recalibration lacks coefficients")
+        intercept, slope = selection.affine
+        return _clip_probability(intercept + slope * p_model)
+    if selection.form is ProbabilityRecalibrationForm.ISOTONIC:
+        if not selection.isotonic_points:
+            raise ValueError("isotonic recalibration lacks fitted points")
+        best_y = selection.isotonic_points[0][1]
+        for x, y in selection.isotonic_points:
+            if p_model < x:
+                break
+            best_y = y
+        return _clip_probability(best_y)
+    raise AssertionError(f"unhandled recalibration form {selection.form!r}")  # pragma: no cover
+
+
+def _score_recalibration(
+    selection: ProbabilityRecalibrationSelection, events: Sequence[RecalibrationFitEvent]
+) -> float:
+    return statistics.fmean(
+        (_apply_recalibration_scalar(selection, event.p_model) - float(event.outcome)) ** 2
+        for event in events
+    )
+
+
+def select_probability_recalibration(
+    events: Sequence[RecalibrationFitEvent],
+) -> ProbabilityRecalibrationSelection:
+    """Select none/affine/isotonic using validation rung Brier.
+
+    Governing text, quoted literally in code as requested:
+    "Declared fallbacks, applied after EMOS to rung probabilities and chosen on
+    validation by rung Brier: (a) affine; (b) isotonic (monotone, fitted on
+    train, with the rung partition re-normalised and re-asserted complete).
+    \"None\" is also a candidate. No other form may be introduced after S0."
+    SL-8 row 8: "EMOS + affine/isotonic chosen on validation only." M1
+    fallback: "if M2 does not beat M1 at G2.2 but M1 passes G2.0–G2.3, M1
+    becomes the family model."
+    """
+    train_events = tuple(
+        event
+        for event in events
+        if event.split == "train" and event.climate_day < DEFAULT_SPLITS.holdout_start
+    )
+    validation_events = tuple(
+        event
+        for event in events
+        if event.split == "validate" and event.climate_day < DEFAULT_SPLITS.holdout_start
+    )
+    if not validation_events:
+        raise ValueError("select_probability_recalibration needs at least one validation event")
+    candidates = [ProbabilityRecalibrationSelection(form=ProbabilityRecalibrationForm.NONE)]
+    if train_events:
+        candidates.append(
+            ProbabilityRecalibrationSelection(
+                form=ProbabilityRecalibrationForm.AFFINE,
+                affine=_fit_affine(train_events),
+            )
+        )
+        candidates.append(
+            ProbabilityRecalibrationSelection(
+                form=ProbabilityRecalibrationForm.ISOTONIC,
+                isotonic_points=_fit_isotonic_pav(train_events),
+            )
+        )
+    scores = {
+        candidate.form.value: _score_recalibration(candidate, validation_events)
+        for candidate in candidates
+    }
+    order = {
+        ProbabilityRecalibrationForm.NONE.value: 0,
+        ProbabilityRecalibrationForm.AFFINE.value: 1,
+        ProbabilityRecalibrationForm.ISOTONIC.value: 2,
+    }
+    chosen = min(candidates, key=lambda candidate: (round(scores[candidate.form.value], 12), order[candidate.form.value]))
+    return ProbabilityRecalibrationSelection(
+        form=chosen.form,
+        affine=chosen.affine,
+        isotonic_points=chosen.isotonic_points,
+        validation_brier=scores,
+    )
+
+
+def apply_probability_recalibration(
+    selection: ProbabilityRecalibrationSelection,
+    probabilities: Mapping[str, float],
+) -> dict[str, float]:
+    adjusted = {
+        rung_id: _apply_recalibration_scalar(selection, probability)
+        for rung_id, probability in probabilities.items()
+    }
+    total = sum(adjusted.values())
+    if total <= 0.0:
+        raise ValueError("recalibrated rung partition has non-positive total")
+    normalised = {rung_id: probability / total for rung_id, probability in adjusted.items()}
+    partition_sum = sum(normalised.values())
+    if not math.isclose(partition_sum, 1.0, abs_tol=1e-12):
+        raise AssertionError(f"recalibrated rung partition sums to {partition_sum!r}, not 1")
+    return normalised
+
+
 # ---------------------------------------------------------------------------
 # Holm correction + the one cluster bootstrap loop this module uses
 # ---------------------------------------------------------------------------
@@ -1857,7 +2141,7 @@ def _d_res(events: Sequence[MatchedEvent], *, a: str, b: str) -> float:
     probs_a = [getattr(event, a) for event in events]
     probs_b = [getattr(event, b) for event in events]
     outcomes = [event.outcome for event in events]
-    return resolution_difference(probs_a, probs_b, outcomes, bin_by_value)
+    return resolution_difference(probs_a, probs_b, outcomes, bin_by_edges(RELIABILITY_BUCKET_EDGES))
 
 
 def _matched_event_cluster_key(event: MatchedEvent) -> object:
@@ -2096,6 +2380,12 @@ class NbpCalibrationArtefact:
     sigma_d: float
     #: Per-rung ``(p_point, p_lower, p_upper)`` (review item 3).
     rung_probability_bounds: Mapping[str, tuple[float, float, float]]
+    correction_month_offsets: Mapping[str, float] = field(default_factory=dict)
+    correction_linear_coefficients: tuple[float, float] | None = None
+    recalibration_affine: tuple[float, float] | None = None
+    recalibration_isotonic_points: tuple[tuple[float, float], ...] = ()
+    pooling: str = "partial"
+    effective_params_source: Mapping[str, str] = field(default_factory=dict)
     #: ``scipy.optimize.OptimizeResult.success`` from the bounded scalar
     #: minimiser that fit the SHARED ``delta`` (SL-8b review item 2) --
     #: ``DeltaFitDiagnostics.converged`` / ``CalibrationFit.delta_converged``
@@ -2143,6 +2433,22 @@ class NbpCalibrationArtefact:
                 rung_id: [point, lower, upper]
                 for rung_id, (point, lower, upper) in sorted(self.rung_probability_bounds.items())
             },
+            "correction_month_offsets": dict(sorted(self.correction_month_offsets.items())),
+            "correction_linear_coefficients": (
+                None
+                if self.correction_linear_coefficients is None
+                else [self.correction_linear_coefficients[0], self.correction_linear_coefficients[1]]
+            ),
+            "recalibration_affine": (
+                None
+                if self.recalibration_affine is None
+                else [self.recalibration_affine[0], self.recalibration_affine[1]]
+            ),
+            "recalibration_isotonic_points": [
+                [x, y] for x, y in self.recalibration_isotonic_points
+            ],
+            "pooling": self.pooling,
+            "effective_params_source": dict(sorted(self.effective_params_source.items())),
             "delta_converged": self.delta_converged,
             "delta_nfev": self.delta_nfev,
             "converged_by_version": dict(sorted(self.converged_by_version.items())),
@@ -2219,6 +2525,26 @@ def artefact_from_json_dict(payload: Mapping[str, Any]) -> NbpCalibrationArtefac
         kwargs["nfev_by_version"] = {
             version: int(nfev) for version, nfev in payload["nfev_by_version"].items()
         }
+    if "correction_month_offsets" in payload:
+        kwargs["correction_month_offsets"] = {
+            str(month): float(offset) for month, offset in payload["correction_month_offsets"].items()
+        }
+    if payload.get("correction_linear_coefficients") is not None:
+        linear = payload["correction_linear_coefficients"]
+        kwargs["correction_linear_coefficients"] = (float(linear[0]), float(linear[1]))
+    if payload.get("recalibration_affine") is not None:
+        affine = payload["recalibration_affine"]
+        kwargs["recalibration_affine"] = (float(affine[0]), float(affine[1]))
+    if "recalibration_isotonic_points" in payload:
+        kwargs["recalibration_isotonic_points"] = tuple(
+            (float(x), float(y)) for x, y in payload["recalibration_isotonic_points"]
+        )
+    if "pooling" in payload:
+        kwargs["pooling"] = str(payload["pooling"])
+    if "effective_params_source" in payload:
+        kwargs["effective_params_source"] = {
+            str(version): str(source) for version, source in payload["effective_params_source"].items()
+        }
     kwargs["fit_status"] = (
         str(payload["fit_status"]) if "fit_status" in payload else FIT_STATUS_UNKNOWN
     )
@@ -2231,6 +2557,10 @@ def artefact_from_calibration_fit(
     cdf_method: CdfMethod,
     recalibration: str,
     correction_form: CorrectionForm,
+    correction_selection: CorrectionSelection | None = None,
+    recalibration_selection: ProbabilityRecalibrationSelection | None = None,
+    pooling: str | None = None,
+    effective_params_source: Mapping[str, str] | None = None,
     n_min: int,
     sigma_d: float,
     rung_probability_bounds: Mapping[str, tuple[float, float, float]],
@@ -2278,6 +2608,26 @@ def artefact_from_calibration_fit(
         n_min=n_min,
         sigma_d=sigma_d,
         rung_probability_bounds=rung_probability_bounds,
+        correction_month_offsets=(
+            {}
+            if correction_selection is None
+            else {str(month): offset for month, offset in correction_selection.month_offsets.items()}
+        ),
+        correction_linear_coefficients=(
+            None if correction_selection is None else correction_selection.linear_coefficients
+        ),
+        recalibration_affine=(
+            None if recalibration_selection is None else recalibration_selection.affine
+        ),
+        recalibration_isotonic_points=(
+            () if recalibration_selection is None else recalibration_selection.isotonic_points
+        ),
+        pooling=(
+            pooling
+            if pooling is not None
+            else ("full" if hierarchical.kappa_selection.chosen_kappa == math.inf else "partial")
+        ),
+        effective_params_source={} if effective_params_source is None else dict(effective_params_source),
         delta_converged=fit.delta_converged,
         delta_nfev=fit.delta_nfev,
         converged_by_version=converged_by_version,

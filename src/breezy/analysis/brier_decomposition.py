@@ -242,6 +242,11 @@ def resolution_difference(
     Antisymmetric by construction: `resolution_difference(a, b, ...) ==
     -resolution_difference(b, a, ...)`.
 
+    Cross-model comparisons must use one predeclared COMMON binning scheme
+    for both models. ``bin_by_value`` is refused here because exact-value
+    bins let a continuous model fabricate near-uncertainty resolution against
+    a coarser model solely by having more distinct probabilities.
+
     Point estimate only -- rung events within a station-day are mutually
     exclusive and negatively correlated; any CI must use the station-day
     cluster bootstrap, never a naive per-event CI.
@@ -252,6 +257,11 @@ def resolution_difference(
         raise ValueError(
             "resolution_difference needs matched lengths: "
             f"probs_a={len(probs_a)}, probs_b={len(probs_b)}, outcomes={len(outcomes)}"
+        )
+    if bins is bin_by_value:
+        raise ValueError(
+            "resolution_difference refuses bin_by_value for cross-model comparisons; "
+            "use one fixed common binning scheme for every model"
         )
     resolution_a = murphy_decomposition(probs_a, outcomes, bins).resolution
     resolution_b = murphy_decomposition(probs_b, outcomes, bins).resolution

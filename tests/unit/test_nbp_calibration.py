@@ -19,6 +19,7 @@ import dataclasses
 import datetime as dt
 import json
 import math
+import statistics
 import time
 from pathlib import Path
 
@@ -913,6 +914,26 @@ def test_g23_fails_when_m2_and_m0_are_identical() -> None:
     assert result.d_res_point == pytest.approx(0.0, abs=1e-9)
 
 
+def test_cross_model_resolution_uses_common_bins_not_exact_noisy_values() -> None:
+    events = [
+        calib.MatchedEvent(
+            station=f"K{i % 4}",
+            climate_day=dt.date(2025, 1, 1) + dt.timedelta(days=i),
+            p_m2=0.500001 + i * 1e-8,
+            p_m1=0.5,
+            p_m0=0.5,
+            outcome=i % 2 == 0,
+        )
+        for i in range(200)
+    ]
+
+    g22 = calib.evaluate_g22(events, iterations=20)
+    g23 = calib.evaluate_g23(events, iterations=20, floor=0.0)
+
+    assert abs(g22.d_res_point) < 0.01
+    assert abs(g23.d_res_point) < 0.01
+
+
 def test_g22_refuses_on_a_non_converged_fit_status() -> None:
     events = _matched_events(10)
     with pytest.raises(calib.FitNotConvergedError):
@@ -1308,6 +1329,109 @@ def test_artefact_from_json_dict_missing_fit_status_parses_unknown_not_ok() -> N
 
     assert parsed.fit_status == calib.FIT_STATUS_UNKNOWN
     assert parsed.fit_status != calib.FIT_STATUS_OK
+
+
+def test_month_offset_correction_selection_wins_and_removes_monthly_bias() -> None:
+    rows: list[calib.CorrectionFitRow] = []
+    for month, bias in ((1, 2.0), (2, -1.0), (3, 0.0)):
+        for i in range(8):
+            rows.append(
+                calib.CorrectionFitRow(
+                    split="validate",
+                    climate_day=dt.date(2025, month, i + 1),
+                    residual_f=bias,
+                    day_length_hours=10.0 + month,
+                    scale_f=2.0,
+                )
+            )
+
+    selection = calib.select_correction_form(rows)
+    corrected = [
+        calib.apply_selected_correction(selection, residual_f=row.residual_f, row=row)
+        for row in rows
+    ]
+
+    assert selection.form is calib.CorrectionForm.MONTH_OFFSET
+    assert statistics.fmean(corrected) == pytest.approx(0.0, abs=1e-12)
+    assert selection.month_offsets == {1: pytest.approx(2.0), 2: pytest.approx(-1.0), 3: pytest.approx(0.0)}
+
+
+def test_correction_selection_chooses_none_without_validation_bias_and_ignores_holdout() -> None:
+    rows = [
+        calib.CorrectionFitRow(
+            split="validate",
+            climate_day=dt.date(2025, 1, i + 1),
+            residual_f=(-1.0) ** i,
+            day_length_hours=10.0,
+            scale_f=2.0,
+        )
+        for i in range(10)
+    ]
+    poisoned = [
+        *rows,
+        calib.CorrectionFitRow(
+            split="holdout",
+            climate_day=dt.date(2026, 7, 1),
+            residual_f=99.0,
+            day_length_hours=14.0,
+            scale_f=2.0,
+        ),
+    ]
+
+    baseline = calib.select_correction_form(rows)
+    with_holdout = calib.select_correction_form(poisoned)
+
+    assert baseline.form is calib.CorrectionForm.NONE
+    assert with_holdout.form is calib.CorrectionForm.NONE
+    assert with_holdout.validation_scores == baseline.validation_scores
+
+
+def test_affine_recalibration_selection_wins_and_partition_is_normalised() -> None:
+    events: list[calib.RecalibrationFitEvent] = []
+    for split in ("train", "validate"):
+        for i in range(40):
+            events.append(
+                calib.RecalibrationFitEvent(
+                    split=split,
+                    climate_day=dt.date(2024, 1, 1) if split == "train" else dt.date(2025, 1, 1),
+                    rung_id="low",
+                    p_model=0.30,
+                    outcome=i % 10 == 0,
+                )
+            )
+            events.append(
+                calib.RecalibrationFitEvent(
+                    split=split,
+                    climate_day=dt.date(2024, 1, 1) if split == "train" else dt.date(2025, 1, 1),
+                    rung_id="high",
+                    p_model=0.70,
+                    outcome=i % 10 != 0,
+                )
+            )
+
+    selection = calib.select_probability_recalibration(events)
+    partition = calib.apply_probability_recalibration(
+        selection, {"low": 0.30, "mid": 0.50, "high": 0.70}
+    )
+
+    assert selection.form is calib.ProbabilityRecalibrationForm.AFFINE
+    assert sum(partition.values()) == pytest.approx(1.0, abs=1e-12)
+    assert partition["high"] > partition["low"]
+
+
+def test_recalibration_selection_ignores_holdout_rows() -> None:
+    events = [
+        calib.RecalibrationFitEvent(split="train", climate_day=dt.date(2024, 1, 1), rung_id="mid", p_model=0.4, outcome=False),
+        calib.RecalibrationFitEvent(split="train", climate_day=dt.date(2024, 1, 2), rung_id="mid", p_model=0.6, outcome=True),
+        calib.RecalibrationFitEvent(split="validate", climate_day=dt.date(2025, 1, 1), rung_id="mid", p_model=0.4, outcome=False),
+        calib.RecalibrationFitEvent(split="validate", climate_day=dt.date(2025, 1, 2), rung_id="mid", p_model=0.6, outcome=True),
+    ]
+    poisoned = [
+        *events,
+        calib.RecalibrationFitEvent(split="validate", climate_day=dt.date(2026, 7, 1), rung_id="mid", p_model=0.01, outcome=True),
+    ]
+
+    assert calib.select_probability_recalibration(poisoned) == calib.select_probability_recalibration(events)
 
 
 # ---------------------------------------------------------------------------

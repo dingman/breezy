@@ -33,8 +33,8 @@ _LADDER = (
 _VALID_PAYLOAD: dict[str, Any] = {
     "schema_version": 1,
     "cdf_method": "normal",
-    "recalibration": "emos",
-    "correction_form": "additive",
+    "recalibration": "none",
+    "correction_form": "none",
     "delta": 1.0,
     "kappa": 1.0,
     "emos_params_by_version": {"v1": [0.0, 0.0]},
@@ -111,6 +111,22 @@ def test_a_missing_fit_status_key_is_refused_as_unknown(tmp_path: Path) -> None:
     path, sha = _write(tmp_path, payload)
 
     with pytest.raises(BoundsArtefactPinMismatchError):
+        load_bounds_artefact_draws(path, expected_sha256=sha)
+
+
+def test_unsupported_probability_recalibration_is_refused(tmp_path: Path) -> None:
+    payload = dict(_VALID_PAYLOAD, recalibration="affine")
+    path, sha = _write(tmp_path, payload)
+
+    with pytest.raises(BoundsArtefactPinMismatchError, match="recalibration"):
+        load_bounds_artefact_draws(path, expected_sha256=sha)
+
+
+def test_unsupported_location_correction_is_refused(tmp_path: Path) -> None:
+    payload = dict(_VALID_PAYLOAD, correction_form="month_offset")
+    path, sha = _write(tmp_path, payload)
+
+    with pytest.raises(BoundsArtefactPinMismatchError, match="correction_form"):
         load_bounds_artefact_draws(path, expected_sha256=sha)
 
 

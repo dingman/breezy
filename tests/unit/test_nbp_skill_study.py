@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import math
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -1353,8 +1354,15 @@ def test_validation_power_metadata_and_shrinkage_weights_are_emitted(tmp_path: P
 
     power = nbp_skill_study._validation_power_metadata(events)
     assert power["sigma_d"] > 0.0
+    assert power["sigma_d_ci"][0] >= 0.0
+    assert power["sigma_d_ci"][1] >= power["sigma_d_ci"][0]
     assert power["n_min"] > 520
+    assert power["n_min_range"][1] >= power["n_min_range"][0]
     assert power["status"] == "PMUS_INFEASIBLE_ROUTE_NODE4"
+    assert power["n_min_range_status"] in {
+        "FEASIBILITY_UNDETERMINED",
+        "PMUS_INFEASIBLE_ROUTE_NODE4",
+    }
 
     result = nbp_skill_study.run_validate_gates_from_rows(
         version_rows=[
@@ -1371,16 +1379,98 @@ def test_validation_power_metadata_and_shrinkage_weights_are_emitted(tmp_path: P
     )
 
     assert result["power"]["sigma_d"] == pytest.approx(0.0)
+    assert result["power"]["sigma_d_ci"] == [0.0, 0.0]
     assert result["power"]["n_min"] == 0
+    assert result["power"]["n_min_range"] == [0, 0]
     assert result["power"]["status"] == "OK"
+    assert result["power"]["n_min_range_status"] == "OK"
     assert result["shrinkage_weights"] == {"v4.3": pytest.approx(8.0 / 38.0)}
 
     note = nbp_skill_study.write_validate_evidence_note(result, date=dt.date(2026, 9, 30))
     note_text = note.read_text(encoding="utf-8")
     assert "sigma_d" in note_text
+    assert "sigma_d_ci" in note_text
     assert "n_min" in note_text
+    assert "n_min_range" in note_text
+    assert "n_min_range_status" in note_text
     assert "shrinkage_weights" in note_text
     note.unlink()
+
+
+def test_validation_power_metadata_bootstrap_is_deterministic_and_flags_straddle() -> None:
+    events = [
+        calib.MatchedEvent(
+            station="K",
+            climate_day=dt.date(2025, 1, 1) + dt.timedelta(days=i),
+            p_m2=math.sqrt(0.26 if i % 2 else 0.0),
+            p_m1=0.0,
+            p_m0=0.0,
+            outcome=False,
+        )
+        for i in range(40)
+    ]
+
+    first = nbp_skill_study._validation_power_metadata(events)
+    second = nbp_skill_study._validation_power_metadata(events)
+
+    assert first == second
+    assert first["status"] == "PMUS_INFEASIBLE_ROUTE_NODE4"
+    assert first["n_min_range"][0] <= 520 < first["n_min_range"][1]
+    assert first["n_min_range_status"] == "FEASIBILITY_UNDETERMINED"
+
+
+def test_validate_payload_emits_pooling_in_sample_versions_and_fit_provenance(
+    tmp_path: Path,
+) -> None:
+    fit = _fit_with_versions("v4.1", "v4.3")
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", version="v4.1", climate_day=dt.date(2024, 1, 1)),
+            _version_row(split="train", version="v4.1", climate_day=dt.date(2024, 1, 2)),
+            _version_row(split="validate", version="v4.3", climate_day=dt.date(2025, 6, 3)),
+        ],
+        comparator_events=[
+            _comparator_event(split="validate", version="v4.3", climate_day=dt.date(2025, 6, 3)),
+            _comparator_event(split="validate", version="v4.1", climate_day=dt.date(2025, 6, 4)),
+        ],
+        calibration_fit=fit,
+        artefact_dir=tmp_path,
+        bootstrap_iterations=3,
+        write_candidate_artefact=False,
+    )
+
+    assert result["pooling"] == "partial"
+    assert result["in_sample_versions"] == ["v4.3"]
+    assert result["fit_provenance"]["v4.1"]["train"]["rows"] == 2
+    assert result["fit_provenance"]["v4.3"]["validate"]["rows"] == 1
+    assert result["effective_params_source"]["v4.1"] == "train_unshrunk"
+    assert result["effective_params_source"]["v4.3"] == "validation_or_v5_fit_shrunk"
+
+
+def test_candidate_artefact_round_trips_selected_correction_and_recalibration(
+    tmp_path: Path,
+) -> None:
+    result = nbp_skill_study.run_validate_gates_from_rows(
+        version_rows=[
+            _version_row(split="train", climate_day=dt.date(2024, 1, 1)),
+        ],
+        comparator_events=[
+            _comparator_event(split="train", climate_day=dt.date(2024, 1, 1), outcome=False),
+            _comparator_event(split="train", climate_day=dt.date(2024, 1, 2), outcome=True),
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 1), outcome=False),
+            _comparator_event(split="validate", climate_day=dt.date(2025, 6, 2), outcome=True),
+        ],
+        calibration_fit=_fit_with_params(),
+        artefact_dir=tmp_path,
+        bootstrap_iterations=3,
+        write_candidate_artefact=True,
+    )
+
+    written = json.loads(Path(result["artefact"]["path"]).read_text(encoding="utf-8"))
+    assert written["correction_form"] == result["correction"]["form"]
+    assert written["recalibration"] == result["recalibration"]["form"]
+    assert "correction_month_offsets" in written
+    assert "recalibration_affine" in written
 
 
 def test_write_candidate_artefact_threads_measured_power_metadata_not_hardcoded_zero(

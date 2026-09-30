@@ -91,30 +91,44 @@ from settlement_alignment_study import IEM_ASOS_IDS, VENUE, load_sites  # type: 
 from settlement_truth_dataset import SettlementTruthRow, final_rows_for_gate  # type: ignore[import-not-found]  # noqa: E402
 
 from breezy.analysis.nbp_calibration import (  # noqa: E402
+    BOOTSTRAP_SEED,
     DEFAULT_SPLITS,
+    DEFAULT_BOOTSTRAP_DRAWS,
     FIT_STATUS_NOT_CONVERGED,
     FIT_STATUS_OK,
     NEAR_MIDNIGHT_STRATA,
+    N_MIN_CEILING,
     CalibrationFit,
+    CorrectionFitRow,
     CorrectionForm,
+    CorrectionSelection,
     FitNotConvergedError,
     G20Result,
     G20aResult,
     G21Result,
     G23Result,
     MatchedEvent,
+    ProbabilityRecalibrationForm,
+    ProbabilityRecalibrationSelection,
+    RecalibrationFitEvent,
     RungEvent,
     SkillGateResult,
     Splits,
     StationDayResidual,
     VersionRow,
+    apply_probability_recalibration,
+    apply_selected_correction,
     artefact_from_calibration_fit,
+    cluster_bootstrap_draws,
     compute_n_min,
     evaluate_g20_and_g20a_combined,
     evaluate_g21,
     evaluate_g22,
     evaluate_g23,
     fit_calibration,
+    percentile_interval,
+    select_correction_form,
+    select_probability_recalibration,
     shrinkage_weight,
     write_artefact,
 )
@@ -269,8 +283,25 @@ class _PowerJson(TypedDict):
     .N_MIN_CEILING`)."""
 
     sigma_d: float
+    sigma_d_ci: list[float]
     n_min: int
+    n_min_range: list[int]
     status: str
+    n_min_range_status: str
+
+
+class _CorrectionJson(TypedDict):
+    form: str
+    validation_crps: dict[str, float]
+    month_offsets: dict[str, float]
+    linear_coefficients: list[float] | None
+
+
+class _RecalibrationJson(TypedDict):
+    form: str
+    validation_brier: dict[str, float]
+    affine: list[float] | None
+    isotonic_points: list[list[float]]
 
 
 class ValidateGatePayload(TypedDict):
@@ -285,6 +316,12 @@ class ValidateGatePayload(TypedDict):
     artefact: _ArtefactJson
     power: _PowerJson
     shrinkage_weights: dict[str, float]
+    pooling: str
+    effective_params_source: dict[str, str]
+    in_sample_versions: list[str]
+    fit_provenance: dict[str, dict[str, dict[str, object]]]
+    correction: _CorrectionJson
+    recalibration: _RecalibrationJson
 
 #: Relative to the repo root. The frozen 0b error model artefact (SL-8c),
 #: fitted once on the WP-6 TRAIN split and committed as the freeze point
@@ -1357,13 +1394,19 @@ def calibrated_m2_rung_probabilities(
     calibration_fit: CalibrationFit,
     rungs: Sequence[Rung],
     cdf_method: CdfMethod,
+    correction_f: float = 0.0,
+    recalibration: ProbabilityRecalibrationSelection | None = None,
 ) -> dict[str, float]:
     """M2: NBP percentiles -> selected CDF -> fitted EMOS -> rung probs."""
     params = _emos_params_for_version(version=version, calibration_fit=calibration_fit)
-    return rung_probabilities(
-        apply_emos(build_cdf(cdf_method, percentiles), percentiles, params),
+    adjusted_params = EmosParams(a=params.a + correction_f, gamma=params.gamma, delta=params.delta)
+    probabilities = rung_probabilities(
+        apply_emos(build_cdf(cdf_method, percentiles), percentiles, adjusted_params),
         rungs,
     )
+    if recalibration is None:
+        return probabilities
+    return apply_probability_recalibration(recalibration, probabilities)
 
 
 def _calibrated_median_f(row: VersionRow, *, calibration_fit: CalibrationFit) -> float:
@@ -1371,24 +1414,67 @@ def _calibrated_median_f(row: VersionRow, *, calibration_fit: CalibrationFit) ->
     return row.percentiles.q50 + params.a
 
 
+def _correction_fit_row(row: VersionRow, *, calibration_fit: CalibrationFit) -> CorrectionFitRow:
+    params = _emos_params_for_version(version=row.version, calibration_fit=calibration_fit)
+    scale = math.exp(params.gamma + params.delta * math.log(row.percentiles.sd))
+    return CorrectionFitRow(
+        split=row.split,
+        climate_day=row.climate_day,
+        residual_f=row.cli_tmax_f - (row.percentiles.q50 + params.a),
+        day_length_hours=_daylight_hours(row.station, row.climate_day),
+        scale_f=scale,
+    )
+
+
+def _correction_amount(selection: CorrectionSelection, row: VersionRow, *, calibration_fit: CalibrationFit) -> float:
+    correction_row = _correction_fit_row(row, calibration_fit=calibration_fit)
+    return correction_row.residual_f - apply_selected_correction(
+        selection, residual_f=correction_row.residual_f, row=correction_row
+    )
+
+
 def validate_gate_events_from_comparator_events(
     events: Sequence[ComparatorMatchedEvent],
     *,
     calibration_fit: CalibrationFit,
     cdf_method: CdfMethod,
+    correction_selection: CorrectionSelection | None = None,
+    recalibration_selection: ProbabilityRecalibrationSelection | None = None,
 ) -> tuple[MatchedEvent, ...]:
     matched: list[MatchedEvent] = []
+    correction = (
+        correction_selection
+        if correction_selection is not None
+        else CorrectionSelection(form=CorrectionForm.NONE)
+    )
+    recalibration = (
+        recalibration_selection
+        if recalibration_selection is not None
+        else ProbabilityRecalibrationSelection(form=ProbabilityRecalibrationForm.NONE)
+    )
     for event in events:
         if event.split != "validate":
             continue
         center_f = round(event.percentiles.q50)
         ladder = _forecast_centered_ladder(center_f)
+        row = VersionRow(
+            version=event.version,
+            split=event.split,
+            station=event.station,
+            climate_day=event.climate_day,
+            percentiles=event.percentiles,
+            cli_tmax_f=event.cli_tmax_f,
+        )
         p_m2 = calibrated_m2_rung_probabilities(
             percentiles=event.percentiles,
             version=event.version,
             calibration_fit=calibration_fit,
             rungs=ladder,
             cdf_method=cdf_method,
+            correction_f=_correction_amount(
+                correction, row, calibration_fit=calibration_fit
+            ),
+            recalibration=recalibration,
         )[event.rung_id]
         matched.append(
             MatchedEvent(
@@ -1407,35 +1493,57 @@ def _g20_rows(
     rows: Sequence[VersionRow],
     *,
     calibration_fit: CalibrationFit,
+    correction_selection: CorrectionSelection,
 ) -> tuple[StationDayResidual, ...]:
-    return tuple(
-        StationDayResidual(
-            station=row.station,
-            climate_day=row.climate_day,
-            residual_f=row.cli_tmax_f - _calibrated_median_f(row, calibration_fit=calibration_fit),
-            day_length_hours=_daylight_hours(row.station, row.climate_day),
+    residual_rows: list[StationDayResidual] = []
+    for row in rows:
+        if row.split != "validate":
+            continue
+        correction_row = _correction_fit_row(row, calibration_fit=calibration_fit)
+        residual_rows.append(
+            StationDayResidual(
+                station=row.station,
+                climate_day=row.climate_day,
+                residual_f=apply_selected_correction(
+                    correction_selection,
+                    residual_f=correction_row.residual_f,
+                    row=correction_row,
+                ),
+                day_length_hours=correction_row.day_length_hours,
+            )
         )
-        for row in rows
-        if row.split == "validate"
-    )
+    return tuple(residual_rows)
 
 
 def _g20a_rows(
     events: Sequence[ComparatorMatchedEvent],
     *,
     calibration_fit: CalibrationFit,
+    correction_selection: CorrectionSelection,
 ) -> tuple[StationDayResidual, ...]:
     rows: list[StationDayResidual] = []
     for event in events:
         if event.split != "validate" or event.near_midnight is not True:
             continue
-        params = _emos_params_for_version(version=event.version, calibration_fit=calibration_fit)
+        row = VersionRow(
+            version=event.version,
+            split=event.split,
+            station=event.station,
+            climate_day=event.climate_day,
+            percentiles=event.percentiles,
+            cli_tmax_f=event.cli_tmax_f,
+        )
+        correction_row = _correction_fit_row(row, calibration_fit=calibration_fit)
         rows.append(
             StationDayResidual(
                 station=event.station,
                 climate_day=event.climate_day,
-                residual_f=event.cli_tmax_f - (event.percentiles.q50 + params.a),
-                day_length_hours=_daylight_hours(event.station, event.climate_day),
+                residual_f=apply_selected_correction(
+                    correction_selection,
+                    residual_f=correction_row.residual_f,
+                    row=correction_row,
+                ),
+                day_length_hours=correction_row.day_length_hours,
             )
         )
     return tuple(rows)
@@ -1549,6 +1657,17 @@ def _untested_gate(*, sample_label: str) -> _GateJson:
     return {"status": "UNTESTED", "n": 0, "statistics": {"sample_label": sample_label}, "cis": {}}
 
 
+def _zero_power_metadata() -> _PowerJson:
+    return {
+        "sigma_d": 0.0,
+        "sigma_d_ci": [0.0, 0.0],
+        "n_min": 0,
+        "n_min_range": [0, 0],
+        "status": "OK",
+        "n_min_range_status": "OK",
+    }
+
+
 def _fit_not_converged_gates() -> dict[str, _GateJson]:
     return {
         gate: {"status": FIT_STATUS_NOT_CONVERGED, "n": 0, "statistics": {}, "cis": {}}
@@ -1565,42 +1684,179 @@ def _fit_not_converged_gates() -> dict[str, _GateJson]:
     }
 
 
+def _n_min_for_sigma(sigma_d: float) -> int:
+    if sigma_d <= 0.0:
+        return 0
+    return compute_n_min(sigma_d).n_min
+
+
+def _n_min_range_status(n_min_range: Sequence[int]) -> str:
+    low, high = n_min_range
+    if low <= N_MIN_CEILING < high:
+        return "FEASIBILITY_UNDETERMINED"
+    if high > N_MIN_CEILING:
+        return "PMUS_INFEASIBLE_ROUTE_NODE4"
+    return "OK"
+
+
 def _validation_power_metadata(events: Sequence[MatchedEvent]) -> _PowerJson:
     """The validation-split estimate of sigma_d and the n_min it implies
     (plan S4.1; SL-8d review item 4), never the hard-coded ``n_min=0,
     sigma_d=0.0`` placeholder. sigma_d is the SD of each station-day's mean
-    paired Brier difference (M2-M1); n_min and its feasibility come straight
-    from :func:`breezy.analysis.nbp_calibration.compute_n_min` -- never a
-    second, hand-rolled copy of that formula.
+    paired Brier difference (M2-M1). Its uncertainty is a seeded station-day
+    cluster bootstrap with B=200. n_min and its feasibility come straight from
+    :func:`breezy.analysis.nbp_calibration.compute_n_min` -- never a second,
+    hand-rolled copy of that formula.
     """
     diffs_by_station_day: dict[tuple[str, dt.date], list[float]] = {}
     for event in events:
         outcome = float(event.outcome)
         diff = (event.p_m2 - outcome) ** 2 - (event.p_m1 - outcome) ** 2
         diffs_by_station_day.setdefault((event.station, event.climate_day), []).append(diff)
-    per_day_means = [statistics.fmean(diffs) for diffs in diffs_by_station_day.values()]
+    per_day_items = [
+        (key, statistics.fmean(diffs)) for key, diffs in sorted(diffs_by_station_day.items())
+    ]
+    per_day_means = [mean for _, mean in per_day_items]
     sigma_d = statistics.pstdev(per_day_means) if len(per_day_means) > 1 else 0.0
     if sigma_d <= 0.0:
-        return {"sigma_d": 0.0, "n_min": 0, "status": "OK"}
+        return _zero_power_metadata()
     n_min_result = compute_n_min(sigma_d)
+    sigma_draws = cluster_bootstrap_draws(
+        per_day_items,
+        statistic=lambda drawn: statistics.pstdev([mean for _, mean in drawn])
+        if len(drawn) > 1
+        else 0.0,
+        cluster_key=lambda item: item[0],
+        seed=BOOTSTRAP_SEED,
+        iterations=DEFAULT_BOOTSTRAP_DRAWS,
+    )
+    sigma_ci = percentile_interval(sigma_draws)
+    n_min_range = [_n_min_for_sigma(sigma_ci[0]), _n_min_for_sigma(sigma_ci[1])]
     return {
         "sigma_d": n_min_result.sigma_d,
+        "sigma_d_ci": [sigma_ci[0], sigma_ci[1]],
         "n_min": n_min_result.n_min,
+        "n_min_range": n_min_range,
         "status": n_min_result.status,
+        "n_min_range_status": _n_min_range_status(n_min_range),
     }
 
 
-def _shrinkage_weights(fit: CalibrationFit) -> dict[str, float]:
+def _shrinkage_weights(fit: CalibrationFit, *, fit_rows: Sequence[VersionRow]) -> dict[str, float]:
     """Per-version shrinkage weight w_v = n_v / (n_v + kappa) (ruling S12
     A-4; SL-8d review item 4), via the SAME native
     :func:`breezy.analysis.nbp_calibration.shrinkage_weight` the fit itself
     used to shrink ``(a_v, gamma_v)`` -- never a second, hand-rolled copy.
     """
     kappa = fit.hierarchical.kappa_selection.chosen_kappa
+    provenance = _fit_provenance(fit_rows)
+    weights: dict[str, float] = {}
+    for version, estimate in fit.hierarchical.shrunk_by_version.items():
+        by_split = provenance.get(version, {})
+        if by_split and set(by_split) <= {"train"}:
+            weights[version] = 1.0
+        else:
+            weights[version] = shrinkage_weight(estimate.n, kappa=kappa)
+    return weights
+
+
+def _fit_provenance(rows: Sequence[VersionRow]) -> dict[str, dict[str, dict[str, object]]]:
+    provenance: dict[str, dict[str, dict[str, object]]] = {}
+    for row in rows:
+        by_split = provenance.setdefault(row.version, {})
+        split_record = by_split.setdefault(
+            row.split,
+            {"rows": 0, "first_climate_day": row.climate_day.isoformat(), "last_climate_day": row.climate_day.isoformat()},
+        )
+        row_count = split_record["rows"]
+        if not isinstance(row_count, int):
+            raise TypeError(f"fit provenance row count for {row.version}/{row.split} is not int")
+        split_record["rows"] = row_count + 1
+        first = str(split_record["first_climate_day"])
+        last = str(split_record["last_climate_day"])
+        split_record["first_climate_day"] = min(first, row.climate_day.isoformat())
+        split_record["last_climate_day"] = max(last, row.climate_day.isoformat())
+    return provenance
+
+
+def _effective_params_source(rows: Sequence[VersionRow], fit: CalibrationFit) -> dict[str, str]:
+    provenance = _fit_provenance(rows)
+    result: dict[str, str] = {}
+    for version in fit.hierarchical.shrunk_by_version:
+        by_split = provenance.get(version, {})
+        if by_split and set(by_split) <= {"train"}:
+            result[version] = "train_unshrunk"
+        else:
+            result[version] = "validation_or_v5_fit_shrunk"
+    return result
+
+
+def _pooling_label(fit: CalibrationFit) -> str:
+    return "full" if fit.hierarchical.kappa_selection.chosen_kappa == math.inf else "partial"
+
+
+def _correction_to_json(selection: CorrectionSelection) -> _CorrectionJson:
     return {
-        version: shrinkage_weight(estimate.n, kappa=kappa)
-        for version, estimate in fit.hierarchical.shrunk_by_version.items()
+        "form": selection.form.value,
+        "validation_crps": dict(sorted(selection.validation_scores.items())),
+        "month_offsets": {str(month): value for month, value in sorted(selection.month_offsets.items())},
+        "linear_coefficients": (
+            None
+            if selection.linear_coefficients is None
+            else [selection.linear_coefficients[0], selection.linear_coefficients[1]]
+        ),
     }
+
+
+def _recalibration_to_json(selection: ProbabilityRecalibrationSelection) -> _RecalibrationJson:
+    return {
+        "form": selection.form.value,
+        "validation_brier": dict(sorted(selection.validation_brier.items())),
+        "affine": None if selection.affine is None else [selection.affine[0], selection.affine[1]],
+        "isotonic_points": [[x, y] for x, y in selection.isotonic_points],
+    }
+
+
+def _recalibration_events(
+    events: Sequence[ComparatorMatchedEvent],
+    *,
+    calibration_fit: CalibrationFit,
+    cdf_method: CdfMethod,
+    correction_selection: CorrectionSelection,
+) -> tuple[RecalibrationFitEvent, ...]:
+    result: list[RecalibrationFitEvent] = []
+    for event in events:
+        if event.split not in ("train", "validate"):
+            continue
+        center_f = round(event.percentiles.q50)
+        ladder = _forecast_centered_ladder(center_f)
+        row = VersionRow(
+            version=event.version,
+            split=event.split,
+            station=event.station,
+            climate_day=event.climate_day,
+            percentiles=event.percentiles,
+            cli_tmax_f=event.cli_tmax_f,
+        )
+        probabilities = calibrated_m2_rung_probabilities(
+            percentiles=event.percentiles,
+            version=event.version,
+            calibration_fit=calibration_fit,
+            rungs=ladder,
+            cdf_method=cdf_method,
+            correction_f=_correction_amount(correction_selection, row, calibration_fit=calibration_fit),
+            recalibration=None,
+        )
+        result.append(
+            RecalibrationFitEvent(
+                split=event.split,
+                climate_day=event.climate_day,
+                rung_id=event.rung_id,
+                p_model=probabilities[event.rung_id],
+                outcome=event.outcome,
+            )
+        )
+    return tuple(result)
 
 
 def _write_candidate_artefact(
@@ -1610,13 +1866,21 @@ def _write_candidate_artefact(
     artefact_dir: Path,
     n_min: int,
     sigma_d: float,
+    correction_selection: CorrectionSelection,
+    recalibration_selection: ProbabilityRecalibrationSelection,
+    pooling: str,
+    effective_params_source: Mapping[str, str],
 ) -> _ArtefactJson:
     artefact_dir.mkdir(parents=True, exist_ok=True)
     artefact = artefact_from_calibration_fit(
         calibration_fit,
         cdf_method=cdf_method,
-        recalibration="hierarchical_emos",
-        correction_form=CorrectionForm.NONE,
+        recalibration=recalibration_selection.form.value,
+        correction_form=correction_selection.form,
+        correction_selection=correction_selection,
+        recalibration_selection=recalibration_selection,
+        pooling=pooling,
+        effective_params_source=effective_params_source,
         n_min=n_min,
         sigma_d=sigma_d,
         rung_probability_bounds={},
@@ -1671,6 +1935,9 @@ def run_validate_gates_from_rows(
         {"kappa": score.kappa, "mean_crps": score.mean_crps}
         for score in fit.hierarchical.kappa_selection.curve
     ]
+    pooling = _pooling_label(fit)
+    effective_params_source = _effective_params_source(pre_holdout_rows, fit)
+    fit_provenance = _fit_provenance(pre_holdout_rows)
 
     # A version is "in-sample" for these gates iff its OWN pre-holdout rows
     # include at least one VALIDATE row (i.e. its fit actually touched
@@ -1700,6 +1967,10 @@ def run_validate_gates_from_rows(
     }
 
     if fit_status != FIT_STATUS_OK:
+        identity_correction = CorrectionSelection(form=CorrectionForm.NONE)
+        identity_recalibration = ProbabilityRecalibrationSelection(
+            form=ProbabilityRecalibrationForm.NONE
+        )
         return {
             "label": "validate-stage, pre-holdout -- NOT the S2 verdict",
             "stage": "validate",
@@ -1716,11 +1987,35 @@ def run_validate_gates_from_rows(
             "coverage_counts": coverage_counts,
             "gates": _fit_not_converged_gates(),
             "artefact": {"path": None, "sha256": None},
-            "power": {"sigma_d": 0.0, "n_min": 0, "status": "OK"},
+            "power": _zero_power_metadata(),
             "shrinkage_weights": {},
+            "pooling": pooling,
+            "effective_params_source": effective_params_source,
+            "in_sample_versions": sorted(in_sample_versions),
+            "fit_provenance": fit_provenance,
+            "correction": _correction_to_json(identity_correction),
+            "recalibration": _recalibration_to_json(identity_recalibration),
         }
 
-    residual_rows = _g20_rows(validate_rows, calibration_fit=fit)
+    correction_input = [_correction_fit_row(row, calibration_fit=fit) for row in pre_holdout_rows]
+    correction_selection = (
+        select_correction_form(correction_input)
+        if any(row.split == "validate" for row in correction_input)
+        else CorrectionSelection(form=CorrectionForm.NONE)
+    )
+    recalibration_input = _recalibration_events(
+        pre_holdout_events,
+        calibration_fit=fit,
+        cdf_method=cdf_method,
+        correction_selection=correction_selection,
+    )
+    recalibration_selection = (
+        select_probability_recalibration(recalibration_input)
+        if any(event.split == "validate" for event in recalibration_input)
+        else ProbabilityRecalibrationSelection(form=ProbabilityRecalibrationForm.NONE)
+    )
+
+    residual_rows = _g20_rows(validate_rows, calibration_fit=fit, correction_selection=correction_selection)
     train_day_lengths = [
         _daylight_hours(row.station, row.climate_day)
         for row in pre_holdout_rows
@@ -1731,8 +2026,14 @@ def run_validate_gates_from_rows(
         validate_events_source,
         calibration_fit=fit,
         cdf_method=cdf_method,
+        correction_selection=correction_selection,
+        recalibration_selection=recalibration_selection,
     )
-    g20a_residual_rows = _g20a_rows(validate_events_source, calibration_fit=fit)
+    g20a_residual_rows = _g20a_rows(
+        validate_events_source,
+        calibration_fit=fit,
+        correction_selection=correction_selection,
+    )
     stratum_of_station = {
         event.station: event.near_midnight_stratum
         for event in validate_events_source
@@ -1757,6 +2058,8 @@ def run_validate_gates_from_rows(
         out_of_sample_events_source,
         calibration_fit=fit,
         cdf_method=cdf_method,
+        correction_selection=correction_selection,
+        recalibration_selection=recalibration_selection,
     )
 
     gates: dict[str, _GateJson] = {}
@@ -1806,7 +2109,7 @@ def run_validate_gates_from_rows(
     # Item 4 (review): sigma_d/n_min/status/w_v measured from real
     # validation data -- never the hard-coded n_min=0, sigma_d=0.0.
     power = _validation_power_metadata(matched_events)
-    shrinkage_weights = _shrinkage_weights(fit)
+    shrinkage_weights = _shrinkage_weights(fit, fit_rows=pre_holdout_rows)
 
     artefact_info: _ArtefactJson = {"path": None, "sha256": None}
     if write_candidate_artefact:
@@ -1817,6 +2120,10 @@ def run_validate_gates_from_rows(
                 artefact_dir=artefact_dir,
                 n_min=power["n_min"],
                 sigma_d=power["sigma_d"],
+                correction_selection=correction_selection,
+                recalibration_selection=recalibration_selection,
+                pooling=pooling,
+                effective_params_source=effective_params_source,
             )
         except FitNotConvergedError:
             artefact_info = {"path": None, "sha256": None}
@@ -1844,6 +2151,12 @@ def run_validate_gates_from_rows(
         "artefact": artefact_info,
         "power": power,
         "shrinkage_weights": shrinkage_weights,
+        "pooling": pooling,
+        "effective_params_source": effective_params_source,
+        "in_sample_versions": sorted(in_sample_versions),
+        "fit_provenance": fit_provenance,
+        "correction": _correction_to_json(correction_selection),
+        "recalibration": _recalibration_to_json(recalibration_selection),
     }
 
 
@@ -1854,9 +2167,18 @@ def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date
     artefact_sha256 = artefact.get("sha256") if isinstance(artefact, Mapping) else None
     power = payload.get("power")
     power_sigma_d = power.get("sigma_d") if isinstance(power, Mapping) else None
+    power_sigma_d_ci = power.get("sigma_d_ci") if isinstance(power, Mapping) else None
     power_n_min = power.get("n_min") if isinstance(power, Mapping) else None
+    power_n_min_range = power.get("n_min_range") if isinstance(power, Mapping) else None
     power_status = power.get("status") if isinstance(power, Mapping) else None
+    power_n_min_range_status = (
+        power.get("n_min_range_status") if isinstance(power, Mapping) else None
+    )
     shrinkage_weights = payload.get("shrinkage_weights")
+    pooling = payload.get("pooling")
+    effective_params_source = payload.get("effective_params_source")
+    correction = payload.get("correction")
+    recalibration = payload.get("recalibration")
     lines = [
         "# NBP S2 Validate Result",
         "",
@@ -1866,9 +2188,16 @@ def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date
         f"- kappa_chosen: `{payload.get('kappa_chosen')}`",
         f"- artefact_sha256: `{artefact_sha256}`",
         f"- sigma_d: `{power_sigma_d}`",
+        f"- sigma_d_ci: `{power_sigma_d_ci}`",
         f"- n_min: `{power_n_min}`",
+        f"- n_min_range: `{power_n_min_range}`",
         f"- power_status: `{power_status}`",
+        f"- n_min_range_status: `{power_n_min_range_status}`",
         f"- shrinkage_weights: `{shrinkage_weights}`",
+        f"- pooling: `{pooling}`",
+        f"- effective_params_source: `{effective_params_source}`",
+        f"- correction: `{correction}`",
+        f"- recalibration: `{recalibration}`",
         "",
         "## Gates",
         "",

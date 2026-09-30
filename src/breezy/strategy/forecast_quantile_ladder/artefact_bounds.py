@@ -66,6 +66,8 @@ _UNPINNED_SHA256: Final[str] = "0" * 64
 #: pin).
 _FIT_STATUS_OK: Final[str] = "OK"
 _FIT_STATUS_UNKNOWN: Final[str] = "UNKNOWN"
+_SUPPORTED_RECALIBRATION: Final[str] = "none"
+_SUPPORTED_CORRECTION_FORM: Final[str] = "none"
 
 
 class BoundsArtefactPinMismatchError(ValueError):
@@ -126,6 +128,20 @@ def load_bounds_artefact_draws(path: str, *, expected_sha256: str) -> BoundsArte
             f"not {_FIT_STATUS_OK!r} (SL-8b2) -- refusing to trade off a "
             "calibration fit that did not converge, or never asserted "
             "convergence at all",
+        )
+    recalibration = str(payload.get("recalibration", _SUPPORTED_RECALIBRATION))
+    if recalibration != _SUPPORTED_RECALIBRATION:
+        raise BoundsArtefactPinMismatchError(
+            f"bounds artefact at {path!r} carries recalibration={recalibration!r}; "
+            "the live bounds path currently supports only 'none' and refuses "
+            "unsupported probability transforms closed",
+        )
+    correction_form = str(payload.get("correction_form", _SUPPORTED_CORRECTION_FORM))
+    if correction_form != _SUPPORTED_CORRECTION_FORM:
+        raise BoundsArtefactPinMismatchError(
+            f"bounds artefact at {path!r} carries correction_form={correction_form!r}; "
+            "the live bounds path currently supports only 'none' and refuses "
+            "unsupported location transforms closed",
         )
     delta = float(payload["delta"])
     cdf_method = CdfMethod(payload["cdf_method"])

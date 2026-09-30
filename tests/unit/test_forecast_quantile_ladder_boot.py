@@ -61,8 +61,8 @@ def _write_d_plus_1_catalog(catalog_root: Path) -> None:
 _ARTEFACT_PAYLOAD = {
     "schema_version": 1,
     "cdf_method": "normal",
-    "recalibration": "emos",
-    "correction_form": "additive",
+    "recalibration": "none",
+    "correction_form": "none",
     "delta": 1.0,
     "kappa": 1.0,
     "emos_params_by_version": {"v1": [0.0, 0.0]},

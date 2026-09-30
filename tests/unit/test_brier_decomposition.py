@@ -162,8 +162,9 @@ def test_resolution_difference_is_antisymmetric() -> None:
     probs_b = [rng.random() for _ in range(200)]
 
     # Act
-    d_ab = resolution_difference(probs_a, probs_b, outcomes, bin_by_value)
-    d_ba = resolution_difference(probs_b, probs_a, outcomes, bin_by_value)
+    bins = bin_by_edges(tuple(i / 10.0 for i in range(11)))
+    d_ab = resolution_difference(probs_a, probs_b, outcomes, bins)
+    d_ba = resolution_difference(probs_b, probs_a, outcomes, bins)
 
     # Assert
     assert math.isclose(d_ab, -d_ba, rel_tol=0.0, abs_tol=1e-12)
@@ -187,6 +188,11 @@ def test_murphy_decomposition_raises_on_empty_input() -> None:
 def test_resolution_difference_raises_on_mismatched_lengths() -> None:
     with pytest.raises(ValueError, match="matched lengths"):
         resolution_difference([0.1, 0.2], [0.1], [True, False], bin_by_value)
+
+
+def test_resolution_difference_refuses_exact_value_bins_for_cross_model_comparison() -> None:
+    with pytest.raises(ValueError, match="refuses bin_by_value"):
+        resolution_difference([0.1, 0.2], [0.2, 0.1], [True, False], bin_by_value)
 
 
 # ---------------------------------------------------------------------------

@@ -65,8 +65,8 @@ _MIA = "MIA"
 _ARTEFACT_PAYLOAD: dict[str, Any] = {
     "schema_version": 1,
     "cdf_method": "normal",
-    "recalibration": "emos",
-    "correction_form": "additive",
+    "recalibration": "none",
+    "correction_form": "none",
     "delta": 1.0,
     "kappa": 1.0,
     "emos_params_by_version": {"v1": [0.0, 0.0]},
