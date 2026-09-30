@@ -58,6 +58,15 @@ def _config() -> ForecastQuantileLadderConfig:
     )
 
 
+def _send_enabled_config() -> ForecastQuantileLadderConfig:
+    return ForecastQuantileLadderConfig(
+        stations=(STATION,),
+        calibration_artefact_path="/tmp/unused.json",
+        calibration_artefact_sha256="a" * 64,
+        shadow_only=False,
+    )
+
+
 def _artefact() -> CalibrationArtefact:
     return CalibrationArtefact(
         sha256="a" * 64, cdf_method=CdfMethod.NORMAL, emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
@@ -73,6 +82,7 @@ def _bounds_provider(
 
 def _build_registered(
     *,
+    config: ForecastQuantileLadderConfig | None = None,
     instruments: tuple[BinaryOption, ...] = (),
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
@@ -93,7 +103,7 @@ def _build_registered(
     quantile_actor.start()
 
     strategy = ForecastQuantileLadderStrategy(
-        _config(),
+        config if config is not None else _config(),
         quantile_actor=quantile_actor,
         artefact=_artefact(),
         ladder_cfg=LadderEvConfig(),
@@ -145,7 +155,7 @@ def _open_permit() -> _FakePermit:
 
 def test_maybe_submit_with_no_permit_never_reaches_submit_order() -> None:
     instrument = _instrument(YES_ID, lower_f=80, upper_f=81)
-    strategy = _build_registered(instruments=(instrument,))
+    strategy = _build_registered(config=_send_enabled_config(), instruments=(instrument,))
     strategy.submit_order = MagicMock()
 
     strategy._maybe_submit(_take(), limit_price=Decimal("0.30"))
@@ -156,6 +166,7 @@ def test_maybe_submit_with_no_permit_never_reaches_submit_order() -> None:
 def test_maybe_submit_honouring_the_family_halt_veto_never_reaches_submit_order() -> None:
     instrument = _instrument(YES_ID, lower_f=80, upper_f=81)
     strategy = _build_registered(
+        config=_send_enabled_config(),
         instruments=(instrument,),
         order_submission_permit=_open_permit(),
         submit_veto=lambda: "family_halt",
@@ -169,7 +180,11 @@ def test_maybe_submit_honouring_the_family_halt_veto_never_reaches_submit_order(
 
 def test_maybe_submit_with_a_clear_permit_submits_a_native_ioc_limit_order() -> None:
     instrument = _instrument(YES_ID, lower_f=80, upper_f=81)
-    strategy = _build_registered(instruments=(instrument,), order_submission_permit=_open_permit())
+    strategy = _build_registered(
+        config=_send_enabled_config(),
+        instruments=(instrument,),
+        order_submission_permit=_open_permit(),
+    )
     strategy.submit_order = MagicMock()
 
     strategy._maybe_submit(_take(), limit_price=Decimal("0.30"))

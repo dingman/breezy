@@ -47,6 +47,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import Calibr
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
 from breezy.strategy.forecast_quantile_ladder.strategy import (
     ForecastQuantileLadderStrategy,
+    ShadowDecisionLogLine,
     SupportsExpiresAtNs,
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
@@ -74,6 +75,15 @@ def _config() -> ForecastQuantileLadderConfig:
         stations=(STATION,),
         calibration_artefact_path="/tmp/unused.json",
         calibration_artefact_sha256="a" * 64,
+    )
+
+
+def _config_with_shadow_only(shadow_only: bool) -> ForecastQuantileLadderConfig:
+    return ForecastQuantileLadderConfig(
+        stations=(STATION,),
+        calibration_artefact_path="/tmp/unused.json",
+        calibration_artefact_sha256="a" * 64,
+        shadow_only=shadow_only,
     )
 
 
@@ -188,6 +198,11 @@ class _FakePermit:
     expires_at_ns: int
 
 
+@dataclass(slots=True)
+class _MutablePermit:
+    expires_at_ns: int
+
+
 def _open_permit() -> _FakePermit:
     return _FakePermit(expires_at_ns=_NOW_NS + 10 * 3_600_000_000_000)
 
@@ -198,6 +213,8 @@ def _build_registered(
     bounds_provider: Callable[..., RungBounds],
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
+    shadow_only: bool = False,
+    shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
 ) -> ForecastQuantileLadderStrategy:
     quantile_actor = ForecastQuantileStateActor(
         stations=(STATION,), std_utc_offset_hours=_STD_UTC_OFFSET_HOURS,
@@ -215,7 +232,7 @@ def _build_registered(
     _push_vector(quantile_actor, station=STATION, now_ns=_NOW_NS)
 
     strategy = ForecastQuantileLadderStrategy(
-        _config(),
+        _config_with_shadow_only(shadow_only),
         quantile_actor=quantile_actor,
         artefact=_artefact(),
         ladder_cfg=LadderEvConfig(),
@@ -223,6 +240,7 @@ def _build_registered(
         order_submission_permit=order_submission_permit,
         submit_veto=submit_veto,
         instrument_ids=tuple(str(i.id) for i in instruments),
+        shadow_decision_sink=shadow_decision_sink,
     )
     portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
     strategy.register(
@@ -237,10 +255,12 @@ _CLEAR_TAKE_NO = _bounds_provider_factory(p_hat=0.05, p_lower=0.02, p_upper=0.05
 
 
 def test_a_depth_update_produces_exactly_one_take_per_rung_and_side() -> None:
+    records: list[ShadowDecisionLogLine] = []
     strategy = _build_registered(
         instruments=(_instrument(INTERIOR_ID, lower_f=80, upper_f=81),),
         bounds_provider=_CLEAR_TAKE_YES,
         order_submission_permit=_open_permit(),
+        shadow_decision_sink=records.append,
     )
     strategy.submit_order = MagicMock()
 
@@ -248,12 +268,13 @@ def test_a_depth_update_produces_exactly_one_take_per_rung_and_side() -> None:
     # A second depth update on the SAME rung/side must NOT produce a second Take.
     strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(("0.10", 5),), ts_event=_NOW_NS + 1))
 
-    takes = [d for d in strategy.shadow_decisions if d["kind"] == "Take"]
+    takes = [d for d in records if d["kind"] == "Take"]
     assert len(takes) == 1
     strategy.submit_order.assert_called_once()
 
 
 def test_a_no_side_decision_uses_the_no_instruments_own_book() -> None:
+    records: list[ShadowDecisionLogLine] = []
     strategy = _build_registered(
         # The NO instrument itself must ALSO be resolvable from `self.cache`
         # for `_maybe_submit` to build a native order off it -- `on_start`
@@ -267,6 +288,7 @@ def test_a_no_side_decision_uses_the_no_instruments_own_book() -> None:
         ),
         bounds_provider=_CLEAR_TAKE_NO,
         order_submission_permit=_open_permit(),
+        shadow_decision_sink=records.append,
     )
     strategy.submit_order = MagicMock()
 
@@ -274,7 +296,7 @@ def test_a_no_side_decision_uses_the_no_instruments_own_book() -> None:
     # own depth update must drive a NO decision.
     strategy.on_order_book_depth(_depth(_NO_INTERIOR_ID, asks=(("0.05", 5),), ts_event=_NOW_NS))
 
-    takes = [d for d in strategy.shadow_decisions if d["kind"] == "Take"]
+    takes = [d for d in records if d["kind"] == "Take"]
     assert len(takes) == 1
     assert takes[0]["side"] == "no"
     assert takes[0]["instrument_id"] == str(_NO_INTERIOR_ID)
@@ -296,52 +318,95 @@ def test_a_book_with_no_populated_levels_is_a_logged_skip_never_an_exception() -
     strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(), bids=(), ts_event=_NOW_NS))
 
     strategy.submit_order.assert_not_called()
-    assert strategy.shadow_decisions == []
+    assert not hasattr(strategy, "shadow_decisions")
 
 
 def test_without_a_permit_submit_order_is_never_called() -> None:
+    records: list[ShadowDecisionLogLine] = []
     strategy = _build_registered(
         instruments=(_instrument(INTERIOR_ID, lower_f=80, upper_f=81),),
         bounds_provider=_CLEAR_TAKE_YES,
         order_submission_permit=None,
+        shadow_decision_sink=records.append,
     )
     strategy.submit_order = MagicMock()
 
     strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(("0.10", 5),), ts_event=_NOW_NS))
 
     strategy.submit_order.assert_not_called()
-    takes = [d for d in strategy.shadow_decisions if d["kind"] == "NotExecutable"]
+    takes = [d for d in records if d["kind"] == "NotExecutable"]
     assert takes  # phase-0 absent permit -> NotExecutable, never latched
 
 
+def test_shadow_only_true_never_reaches_submit_order_even_when_guards_clear() -> None:
+    records: list[ShadowDecisionLogLine] = []
+    strategy = _build_registered(
+        instruments=(_instrument(INTERIOR_ID, lower_f=80, upper_f=81),),
+        bounds_provider=_CLEAR_TAKE_YES,
+        order_submission_permit=_open_permit(),
+        shadow_only=True,
+        shadow_decision_sink=records.append,
+    )
+    strategy.submit_order = MagicMock()
+
+    strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(("0.10", 5),), ts_event=_NOW_NS))
+
+    assert [d["kind"] for d in records] == ["Take"]
+    strategy.submit_order.assert_not_called()
+
+
+def test_ticks_before_and_inside_the_permit_window_get_different_outcomes() -> None:
+    records: list[ShadowDecisionLogLine] = []
+    permit = _MutablePermit(expires_at_ns=_NOW_NS)
+    strategy = _build_registered(
+        instruments=(_instrument(INTERIOR_ID, lower_f=80, upper_f=81),),
+        bounds_provider=_CLEAR_TAKE_YES,
+        order_submission_permit=permit,
+        shadow_decision_sink=records.append,
+    )
+    strategy.submit_order = MagicMock()
+
+    before = _NOW_NS
+    inside = _NOW_NS + 1
+    strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(("0.10", 5),), ts_event=before))
+    permit.expires_at_ns = inside + 1
+    strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(("0.10", 5),), ts_event=inside))
+
+    assert [d["kind"] for d in records] == ["NotExecutable", "Take"]
+
+
 def test_a_d0_instrument_is_refused_never_taken() -> None:
+    records: list[ShadowDecisionLogLine] = []
     d0_id = InstrumentId.from_str("d0-lax-80-81.POLYMARKET_US")
     strategy = _build_registered(
         instruments=(_instrument_on(d0_id, climate_day=CLIMATE_DAY - dt.timedelta(days=1)),),
         bounds_provider=_CLEAR_TAKE_YES,
         order_submission_permit=_open_permit(),
+        shadow_decision_sink=records.append,
     )
     strategy.submit_order = MagicMock()
 
     strategy.on_order_book_depth(_depth(d0_id, asks=(("0.10", 5),), ts_event=_NOW_NS))
 
     strategy.submit_order.assert_not_called()
-    assert [d["kind"] for d in strategy.shadow_decisions] == ["NotDPlus1"]
+    assert [d["kind"] for d in records] == ["NotDPlus1"]
 
 
 def test_a_d_plus_2_instrument_is_refused_never_taken() -> None:
+    records: list[ShadowDecisionLogLine] = []
     d2_id = InstrumentId.from_str("dplus2-lax-80-81.POLYMARKET_US")
     strategy = _build_registered(
         instruments=(_instrument_on(d2_id, climate_day=CLIMATE_DAY + dt.timedelta(days=1)),),
         bounds_provider=_CLEAR_TAKE_YES,
         order_submission_permit=_open_permit(),
+        shadow_decision_sink=records.append,
     )
     strategy.submit_order = MagicMock()
 
     strategy.on_order_book_depth(_depth(d2_id, asks=(("0.10", 5),), ts_event=_NOW_NS))
 
     strategy.submit_order.assert_not_called()
-    assert [d["kind"] for d in strategy.shadow_decisions] == ["NotDPlus1"]
+    assert [d["kind"] for d in records] == ["NotDPlus1"]
 
 
 def test_on_quote_tick_also_drives_a_take() -> None:

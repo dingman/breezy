@@ -24,7 +24,20 @@ def test_default_construction_succeeds() -> None:
     )
 
     assert cfg.allow_short is False
+    assert cfg.shadow_only is True
     assert cfg.stations == _STATIONS
+
+
+def test_shadow_only_defaults_true() -> None:
+    from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
+
+    cfg = ForecastQuantileLadderConfig(
+        stations=_STATIONS,
+        calibration_artefact_path=_PATH,
+        calibration_artefact_sha256=_PINNED_SHA,
+    )
+
+    assert cfg.shadow_only is True
 
 
 def test_allow_short_true_is_refused() -> None:

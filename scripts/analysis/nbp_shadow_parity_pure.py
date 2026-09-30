@@ -9,10 +9,16 @@ Ruling `docs/evidence/RULING_forecast_nbp_reopen_2026-09-29.md` §12 A-5
   strategy composed in a native Nautilus `BacktestEngine` replay of the
   captured tape (``nbp_shadow_parity.py``, the sibling orchestrator);
 * (ii) the BATCH path -- THIS module. An offline recomputation of decisions
-  from the same NBP rows and tape, using ONLY the pure modules
-  (``quantile_density``, ``ladder_ev`` scoring via ``decision.evaluate``, the
-  latch/permit rules, ``margin``, ``bounds``), with NO import of the
-  strategy or actor classes. Pinned by
+  from the same NBP rows and tape, reimplementing the take/refuse formulas
+  DIRECTLY from the plan and ruling text (never calling
+  ``forecast_quantile_ladder.decision.evaluate``, ``.margin.forecast_margin``
+  or ``weather_common.costs.venue_fee_prob`` -- review item 1, SL-13p2: a
+  shared scoring call would make A-5 a vacuous self-comparison even though
+  the live/batch entry points differ). Only genuinely low-level, side-free
+  math primitives are shared: ``quantile_density`` (``build_cdf``,
+  ``apply_emos``, ``Percentiles``, ``Rung``) and the ``bounds``/``latch``
+  Protocols both paths are independently WIRED to (not the scoring logic
+  itself). NO import of the strategy or actor classes either. Pinned by
   ``tests/unit/test_nbp_shadow_parity_contract.py``.
 
 Parity = decision-key set equality, with mismatches = 0 (§12 A-5). This
@@ -30,10 +36,10 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Final, Literal
 
 from breezy.adapters.polymarket_us.safety import PERMIT_TTL_NS
+from breezy.ingest.gaps import local_standard_date
 from breezy.runtime.trade_supervisor_core import LAUNCH_UTC
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
-from breezy.strategy.forecast_quantile_ladder.decision import Decision, SidedAsk, Take, evaluate
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import (
@@ -41,7 +47,7 @@ from breezy.strategy.ladder_ev.forecast_state import (
     ForecastQuantileState,
     ForecastQuantileVector,
 )
-from breezy.strategy.ladder_ev.quantile_density import Rung
+from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung, apply_emos, build_cdf
 
 __all__ = [
     "MIN_PRE_FREEZE_DAYS",
@@ -369,8 +375,222 @@ def diff_decision_keys(
 
 
 # ---------------------------------------------------------------------------
-# The batch path: `decision.evaluate` directly, no strategy/actor import.
+# The batch path: an INDEPENDENT reimplementation of the take/refuse
+# formulas (review item 1, SL-13p2) -- never `decision.evaluate`, never a
+# strategy/actor import.
 # ---------------------------------------------------------------------------
+
+#: Sizing is always exactly 1 contract (plan §3.3), mirrored independently
+#: of `forecast_quantile_ladder.decision.QTY` (never imported).
+_QTY: Final = 1
+
+#: Same reason string `decision.py`'s `VECTOR_DAY_MISMATCH` constant carries
+#: -- kept textually identical (not imported) so a live-vs-batch
+#: `DecisionKey.reason` comparison is a real check, never a mismatch that is
+#: an artefact of two paths spelling the same refusal differently.
+_VECTOR_DAY_MISMATCH: Final[str] = "vector_day_mismatch"
+
+
+class AskSideMismatchError(ValueError):
+    """Raised when a :class:`SidedAsk` was quoted from the wrong side's
+    instrument -- mirrors ``decision.AskSideMismatchError`` (never imported)."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SidedAsk:
+    """One venue ask, tagged with the side and instrument it was quoted from.
+
+    Independently defined (never imported from ``decision.py``) -- review
+    item 1, SL-13p2.
+    """
+
+    side: Literal["yes", "no"]
+    instrument_id: str
+    price: float
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NotExecutable:
+    """Outside a live order-permit window: never latched, never a trial."""
+
+    reason: str = "outside_permit_window"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NotDPlus1:
+    """``climate_day`` is not D+1 of ``now_ns`` in the station's LST."""
+
+    reason: str = "not_d_plus_1"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Refuse:
+    """Evaluated, but not taken; the latch is untouched."""
+
+    reason: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Take:
+    """The first qualifying snapshot for this (station-day, rung, side)."""
+
+    instrument_id: str
+    station: str
+    climate_day: date
+    side: Literal["yes", "no"]
+    rung_id: str
+    qty: Literal[1]
+    ev_net: float
+    p_hat: float
+    p_lower: float
+    p_upper: float
+
+
+Decision = NotExecutable | NotDPlus1 | Refuse | Take
+
+
+def _is_d_plus_1(*, now_ns: int, climate_day: date, std_utc_offset_hours: float) -> bool:
+    """Plan §2.3: "V1 is D+1 only." Reimplemented from ``local_standard_date``
+    (a low-level calendar primitive, not forecast-quantile-ladder scoring
+    logic) directly, never via ``decision._is_d_plus_1`` (private, and would
+    re-couple the two paths regardless)."""
+    today_lst = local_standard_date(now_ns, std_utc_offset_hours)
+    return climate_day == today_lst + timedelta(days=1)
+
+
+def _forecast_margin(h_hours: float, cfg: LadderEvConfig) -> float:
+    """Ruling `RULING_forecast_nbp_reopen_2026-09-29.md` §12 A-6 (quoted in
+    `forecast_quantile_ladder/margin.py`'s own docstring) / review item 1:
+    "margin(h) = 0.02 + 0.04*clamp((h - 6)/18, 0, 1)". Reimplemented HERE,
+    independently of `forecast_quantile_ladder.margin.forecast_margin`
+    (never imported) -- reads the SAME `LadderEvConfig` fields
+    (`margin_m0`/`margin_m24`/`margin_h0_hours`) that function reads, so a
+    config change is reflected identically on both paths without either
+    path calling the other's code.
+    """
+    m0 = cfg.margin_m0
+    m24 = cfg.margin_m24
+    h0 = float(cfg.margin_h0_hours)
+    span = 24.0 - h0
+    t = min(1.0, max(0.0, (h_hours - h0) / span))
+    return m0 + (m24 - m0) * t
+
+
+def _fee_prob(*, price: float, fee_coefficient: float) -> float:
+    """Plan §4.2 / review item 1: "fee = 0.0695*p*(1-p) per share".
+    Reimplemented HERE, independently of
+    `weather_common.costs.venue_fee_prob` (never imported)."""
+    return fee_coefficient * price * (1.0 - price)
+
+
+def _evaluate_independently(
+    *,
+    now_ns: int,
+    std_utc_offset_hours: float,
+    permit_covers_now: bool,
+    vector: ForecastQuantileVector | None,
+    station: str,
+    climate_day: date,
+    ladder: Sequence[Rung],
+    rung_id: str,
+    side: Literal["yes", "no"],
+    ask: SidedAsk,
+    fee_coefficient: float,
+    slippage_floor_prob: float,
+    h_hours: float,
+    cfg: LadderEvConfig,
+    artefact: CalibrationArtefact,
+    bounds_provider: BoundsProvider,
+    latch: QuantileLadderLatch,
+) -> Decision:
+    """The pure path's OWN take/refuse evaluation (review item 1, SL-13p2).
+
+    Ruling `RULING_forecast_nbp_reopen_2026-09-29.md` §12 A-6 (quoted
+    verbatim in `forecast_quantile_ladder/decision.py`'s own docstring,
+    which this function deliberately never calls): "The take rule is
+    side-specific: YES needs `p_lower - ask - fee(ask) > margin`; NO needs
+    `(1 - p_upper) - no_ask - fee(no_ask) > margin`, and `no_ask` MUST be
+    quoted from the native NO instrument." ``ask.price`` here is always
+    THIS side's own instrument price (the caller builds ``SidedAsk`` off
+    the NO instrument's own book for a NO evaluation -- see
+    :func:`run_batch_parity`), never derived from the sibling leg.
+
+    Check order, reason strings and the D+1/permit/latch/vector-availability
+    gates mirror `decision.evaluate` exactly (so a live-vs-batch
+    `DecisionKey` compares like for like) -- only the ARITHMETIC (fee,
+    margin, net) and the control-flow that computes it are independently
+    written, never shared.
+    """
+    if ask.side != side:
+        raise AskSideMismatchError(
+            f"ask was quoted from the {ask.side!r} instrument {ask.instrument_id!r}, "
+            f"but this evaluation is for side {side!r}",
+        )
+
+    rung_ids = {rung.rung_id for rung in ladder}
+    if rung_id not in rung_ids:
+        raise ValueError(f"rung_id {rung_id!r} is not a member of `ladder`")
+
+    if not _is_d_plus_1(
+        now_ns=now_ns, climate_day=climate_day, std_utc_offset_hours=std_utc_offset_hours,
+    ):
+        return NotDPlus1()
+
+    if not permit_covers_now:
+        return NotExecutable()
+
+    if latch.is_latched(station=station, climate_day=climate_day, rung_id=rung_id, side=side):
+        return Refuse(reason="already_latched")
+
+    if vector is None:
+        return Refuse(reason="forecast_unavailable")
+
+    if vector.climate_day != climate_day:
+        return Refuse(reason=_VECTOR_DAY_MISMATCH)
+
+    percentiles = Percentiles(
+        q10=vector.q10,
+        q25=vector.q25,
+        q50=vector.q50,
+        q75=vector.q75,
+        q90=vector.q90,
+        mean=vector.mean,
+        sd=vector.sd,
+    )
+    base_cdf = build_cdf(artefact.cdf_method, percentiles)
+    cdf = apply_emos(base_cdf, percentiles, artefact.emos)
+    bounds = bounds_provider(cdf=cdf, ladder=ladder, rung_id=rung_id)
+    p_hat, p_lower, p_upper = bounds.p_hat, bounds.p_lower, bounds.p_upper
+
+    fee = _fee_prob(price=ask.price, fee_coefficient=fee_coefficient)
+    # Ruling §12 A-6's own formula carries no slippage term (it is always
+    # 0.0 at every call site in this repo); summed here anyway so a future
+    # non-zero `slippage_floor_prob` still parity-matches the live path's
+    # `DepthAwareTradeCost.total_prob = fee_prob + slippage_floor_prob`,
+    # rather than silently diverging from it.
+    if side == "yes":
+        net = p_lower - ask.price - fee - slippage_floor_prob
+    else:
+        net = (1.0 - p_upper) - ask.price - fee - slippage_floor_prob
+
+    buffer = _forecast_margin(h_hours, cfg)
+    if not (net > buffer):
+        return Refuse(reason="below_margin")
+
+    latch.latch(station=station, climate_day=climate_day, rung_id=rung_id, side=side)
+    return Take(
+        instrument_id=ask.instrument_id,
+        station=station,
+        climate_day=climate_day,
+        side=side,
+        rung_id=rung_id,
+        qty=_QTY,
+        ev_net=net,
+        p_hat=p_hat,
+        p_lower=p_lower,
+        p_upper=p_upper,
+    )
+
 
 #: ``<STATION>-<YYYY>-<MM>-<DD>-<RUNG_ID>.<SUFFIX>`` -- this harness's own
 #: naming convention, matching the fixture shape in
@@ -464,17 +684,18 @@ def evaluate_batch_snapshot(
     bounds_provider: BoundsProvider,
     latch: QuantileLadderLatch,
 ) -> Decision:
-    """Call ``decision.evaluate`` directly -- the ONE shared call both the
-    batch path and (through the strategy) the live path route through."""
+    """Call :func:`_evaluate_independently` -- review item 1 (SL-13p2): the
+    batch path's OWN reimplementation of the take/refuse formulas, never
+    ``decision.evaluate``."""
     h_hours = hours_to_settlement(
         now_ns=inp.now_ns,
         climate_day=inp.climate_day,
         std_utc_offset_hours=inp.std_utc_offset_hours,
     )
-    return evaluate(
+    return _evaluate_independently(
         now_ns=inp.now_ns,
         std_utc_offset_hours=inp.std_utc_offset_hours,
-        permit_covers=permit_covers(inp.now_ns),
+        permit_covers_now=permit_covers(inp.now_ns),
         vector=inp.vector,
         station=inp.station,
         climate_day=inp.climate_day,

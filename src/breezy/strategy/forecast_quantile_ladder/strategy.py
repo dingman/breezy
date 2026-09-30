@@ -38,7 +38,16 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final, Literal, NotRequired, Protocol, TypedDict, cast, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    Literal,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    cast,
+    runtime_checkable,
+)
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
@@ -73,15 +82,6 @@ __all__ = ["ForecastQuantileLadderStrategy", "ShadowDecisionLogLine", "SupportsE
 _CLASS_NAME: str = "ForecastQuantileLadderStrategy"
 _VENUE: Final[str] = "polymarket_us"
 _NS_PER_HOUR: Final[int] = 3_600_000_000_000
-#: Review item 2 (SL-13 fix-first): the tick loop calls `evaluate_snapshot`
-#: on every live depth/quote update, which appends to `shadow_decisions` --
-#: a real, unbounded-by-default list is exactly the shape of the OOM lesson
-#: ("A unit memory cap is containment" -- an unbounded diagnostics list).
-#: Bounded FIFO, not a hard cap on FUNCTIONALITY: the shadow log is
-#: observability, never read back by any decision path, so trimming the
-#: oldest entries once this many have accumulated is lossless for every
-#: correctness property this class holds.
-_MAX_SHADOW_DECISIONS: Final[int] = 5_000
 
 
 @runtime_checkable
@@ -121,7 +121,7 @@ class ShadowDecisionLogLine(TypedDict):
 class ForecastQuantileLadderStrategy(Strategy):
     """Evaluates NBP quantile-vector snapshots against a sha-pinned artefact.
 
-    Every evaluated snapshot is appended to :attr:`shadow_decisions` --
+    Every evaluated snapshot is emitted to the injected sink, when present --
     plan §7 row SL-12: "logs every decision (keys and inputs) as a shadow
     decision log line."
     """
@@ -140,6 +140,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         fee_verified: Callable[[], bool] | None = None,
         instrument_ids: Sequence[str | InstrumentId] = (),
         quantile_station_keys: Mapping[str, str] | None = None,
+        shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
     ) -> None:
         super().__init__(config)
         self._quantile_actor = quantile_actor
@@ -150,6 +151,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         self._order_submission_permit = order_submission_permit
         self._submit_veto = submit_veto
         self._fee_verified = fee_verified
+        self._shadow_decision_sink = shadow_decision_sink
         #: SL-13e: maps a `self.config.stations` city token to whatever key
         #: `quantile_actor` was actually constructed with (composition.py
         #: builds it ICAO-keyed, to match what `NbmQuantileActor` really
@@ -195,7 +197,6 @@ class ForecastQuantileLadderStrategy(Strategy):
         #: :meth:`on_start` (mirrors ``ContinuousRungHoldStrategy``'s own
         #: ``_std_utc_offset_hours_by_station``).
         self._std_utc_offset_hours: dict[str, float] = {}
-        self.shadow_decisions: list[ShadowDecisionLogLine] = []
 
     def on_start(self) -> None:
         """Resolve YES/NO instrument ids per rung and subscribe (SL-13).
@@ -351,9 +352,9 @@ class ForecastQuantileLadderStrategy(Strategy):
             # behaviour change.
             latch=cast("QuantileLadderLatch", self._latch),
         )
-        self.shadow_decisions.append(
+        self._emit_shadow_decision(
             self._shadow_log_line(
-                decision,
+                decision=decision,
                 now_ns=now_ns,
                 station=station,
                 climate_day=climate_day,
@@ -362,14 +363,13 @@ class ForecastQuantileLadderStrategy(Strategy):
                 instrument_id=ask.instrument_id,
             ),
         )
-        # Review item 2: bounded FIFO -- see `_MAX_SHADOW_DECISIONS`'s own
-        # docstring. `del [:n]` trims in one slice-assignment rather than N
-        # individual `pop(0)` calls when (rarely) more than one entry over
-        # cap has accumulated between checks.
-        overflow = len(self.shadow_decisions) - _MAX_SHADOW_DECISIONS
-        if overflow > 0:
-            del self.shadow_decisions[:overflow]
         return decision
+
+    def _emit_shadow_decision(self, line: ShadowDecisionLogLine) -> None:
+        sink = self._shadow_decision_sink
+        if sink is not None:
+            sink(line)
+        self.log.info(f"SHADOW_DECISION {line!r}")
 
     def _shadow_log_line(
         self,
@@ -447,6 +447,13 @@ class ForecastQuantileLadderStrategy(Strategy):
         ``order_factory.limit(...)`` shape exactly: IOC, not post-only, qty
         from ``take.qty`` (always 1, plan §3.3).
         """
+        if self.config.shadow_only:
+            self.log.info(
+                "TAKE recorded, shadow_only=True: "
+                f"{take.instrument_id} qty={take.qty} px={limit_price} "
+                f"p_hat={take.p_hat} ev_net={take.ev_net}",
+            )
+            return
         refusal = self.try_submit(take)
         if refusal is not None:
             self.log.info(

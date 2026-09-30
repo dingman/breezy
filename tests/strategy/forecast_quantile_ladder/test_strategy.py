@@ -20,6 +20,7 @@ from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadd
 from breezy.strategy.forecast_quantile_ladder.decision import NotExecutable, SidedAsk, Take
 from breezy.strategy.forecast_quantile_ladder.strategy import (
     ForecastQuantileLadderStrategy,
+    ShadowDecisionLogLine,
     SupportsExpiresAtNs,
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
@@ -73,6 +74,7 @@ def _build(
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
     fee_verified: Callable[[], bool] | None = None,
+    shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
 ) -> ForecastQuantileLadderStrategy:
     quantile_actor = ForecastQuantileStateActor(
         stations=("KMIA",), std_utc_offset_hours={"KMIA": _KMIA_OFFSET},
@@ -95,17 +97,19 @@ def _build(
         order_submission_permit=order_submission_permit,
         submit_veto=submit_veto,
         fee_verified=fee_verified,
+        shadow_decision_sink=shadow_decision_sink,
     )
 
 
 def test_construction_succeeds_with_no_permit_shadow_only() -> None:
     strategy = _build()
 
-    assert strategy.shadow_decisions == []
+    assert not hasattr(strategy, "shadow_decisions")
 
 
 def test_evaluate_snapshot_with_no_forecast_yet_refuses_and_logs_it() -> None:
-    strategy = _build()
+    records: list[ShadowDecisionLogLine] = []
+    strategy = _build(shadow_decision_sink=records.append)
 
     decision = strategy.evaluate_snapshot(
         now_ns=_NOW_NS,
@@ -121,8 +125,30 @@ def test_evaluate_snapshot_with_no_forecast_yet_refuses_and_logs_it() -> None:
     )
 
     assert isinstance(decision, NotExecutable)
-    assert len(strategy.shadow_decisions) == 1
-    assert strategy.shadow_decisions[0]["kind"] == "NotExecutable"
+    assert len(records) == 1
+    assert records[0]["kind"] == "NotExecutable"
+
+
+def test_shadow_records_are_emitted_without_a_strategy_retained_collection() -> None:
+    records: list[ShadowDecisionLogLine] = []
+    strategy = _build(shadow_decision_sink=records.append)
+
+    for offset in range(8):
+        strategy.evaluate_snapshot(
+            now_ns=_NOW_NS + offset,
+            std_utc_offset_hours=_KMIA_OFFSET,
+            station="KMIA",
+            climate_day=_DAY,
+            ladder=_LADDER,
+            rung_id="i1",
+            ask=SidedAsk(side="yes", instrument_id="KMIA-2026-10-01-i1.POLY_US", price=0.30),
+            fee_coefficient=0.0695,
+            slippage_floor_prob=0.01,
+            h_hours=6.0,
+        )
+
+    assert len(records) == 8
+    assert not hasattr(strategy, "shadow_decisions")
 
 
 def test_try_submit_with_no_permit_is_phase0_refused() -> None:

@@ -28,6 +28,7 @@ _HARNESS_MODULES = (
 #: imported name, so a re-export or a `from X import *` style indirection
 #: cannot quietly satisfy a narrower check.
 _FORBIDDEN_LIVE_PATH_MODULES = (
+    "breezy.strategy.forecast_quantile_ladder.decision",
     "breezy.strategy.forecast_quantile_ladder.strategy",
     "breezy.strategy.ladder_ev.forecast_subscriber",
     "breezy.ingest.nbm_quantile_actor",
@@ -35,6 +36,13 @@ _FORBIDDEN_LIVE_PATH_MODULES = (
     "nautilus_trader",
 )
 _FORBIDDEN_LIVE_PATH_NAMES = (
+    "Decision",
+    "NotDPlus1",
+    "NotExecutable",
+    "Refuse",
+    "SidedAsk",
+    "Take",
+    "evaluate",
     "ForecastQuantileLadderStrategy",
     "SupportsExpiresAtNs",
     "ForecastQuantileStateActor",
@@ -99,6 +107,20 @@ def test_the_batch_module_never_does_a_bare_import_of_nautilus_trader() -> None:
         assert not target.startswith("nautilus_trader"), (
             f"{_BATCH_MODULE.name} imports {target!r}; the batch path is pure "
             f"Python, no Nautilus dependency (ruling §12 A-5(ii))"
+        )
+
+
+def test_the_batch_module_imports_no_strategy_decision_or_strategy_module() -> None:
+    forbidden = {
+        "breezy.strategy.forecast_quantile_ladder.decision",
+        "breezy.strategy.forecast_quantile_ladder.strategy",
+    }
+    for module, _name in _imports_of(_BATCH_MODULE):
+        if module is None:
+            continue
+        assert module not in forbidden, (
+            f"{_BATCH_MODULE.name} imports {module!r}; A-5 requires the pure "
+            "batch path to implement the PLAN formulas independently"
         )
 
 

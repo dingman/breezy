@@ -72,6 +72,7 @@ class ForecastQuantileLadderConfig(StrategyConfig, frozen=True):
     forecast_staleness_bound_ns: int = 0
     required_fee_coefficient: float = 0.0695
     allow_short: bool = False
+    shadow_only: bool = True
 
     def __post_init__(self) -> None:
         if self.allow_short:

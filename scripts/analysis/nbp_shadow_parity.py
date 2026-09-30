@@ -23,7 +23,9 @@ module imports no settlement, CLI-label, or P&L module.
 ``ForecastQuantileLadderStrategy._permit_covers`` only checks the permit's
 ``expires_at_ns`` upper bound. This harness preserves the pre-existing permit
 stub shape, while the actual tick evaluation is now driven by the strategy's
-real ``on_order_book_depth`` handler.
+real ``on_order_book_depth`` handler. Review item 2 (SL-13p2): the permit's
+``now_ns`` reader is bound to the strategy's own native engine clock (never a
+value captured once before the run) -- see :class:`_NowBox`.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
+from typing import TYPE_CHECKING, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
 
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.model.currencies import USD
@@ -82,6 +84,9 @@ from scripts.analysis.nbp_shadow_parity_pure import (
     run_batch_parity,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nautilus_trader.common.component import Clock
+
 _Side = Literal["yes", "no"]
 _IntLike = str | bytes | bytearray | SupportsInt | SupportsIndex
 _FloatLike = str | bytes | bytearray | SupportsFloat | SupportsIndex
@@ -98,12 +103,44 @@ __all__ = [
 
 
 class _NowBox:
-    """A single mutable ``now_ns`` read by :class:`_NominalWindowPermit`."""
+    """Review item 2 (SL-13p2): bound to the ENGINE's own native clock once
+    the strategy that owns it is registered (:func:`run_live_parity`), never
+    a single ``now_ns`` captured once before the run.
 
-    __slots__ = ("value",)
+    The previous shape set ``value`` ONCE, to the max ``ts_event`` across the
+    whole tape, before ``engine.run()`` -- so :class:`_NominalWindowPermit`
+    handed the strategy the SAME ``expires_at_ns`` for every tick regardless
+    of that tick's own timestamp, making an early, pre-window tick appear
+    covered by a window computed from the LAST tick in the run.
+
+    ``BacktestEngine`` advances a strategy's own ``self.clock`` (a
+    ``TestClock``) to match each event's ``ts_event`` before dispatching
+    that event to the strategy's handler -- the SAME clock
+    ``ForecastQuantileLadderStrategy`` (and every other strategy in this
+    codebase) reads via ``self.clock.timestamp_ns()``. Reading it HERE, at
+    ``expires_at_ns`` access time (called from inside
+    ``evaluate_snapshot`` -> ``_permit_covers``, synchronously within that
+    SAME tick's handler call), is therefore tick-local by construction: it
+    always reads the CURRENTLY-processing event's own timestamp, never a
+    value fixed ahead of the run.
+    """
+
+    __slots__ = ("_clock",)
 
     def __init__(self) -> None:
-        self.value: int = 0
+        self._clock: Clock | None = None
+
+    def bind(self, clock: Clock) -> None:
+        self._clock = clock
+
+    @property
+    def now_ns(self) -> int:
+        if self._clock is None:
+            raise RuntimeError(
+                "_NowBox.bind(clock) must be called (after engine.add_strategy) "
+                "before any expires_at_ns read",
+            )
+        return int(self._clock.timestamp_ns())
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +154,7 @@ class _NominalWindowPermit:
 
     @property
     def expires_at_ns(self) -> int:
-        return nominal_permit_expiry_upper_bound(self.now_box.value)
+        return nominal_permit_expiry_upper_bound(self.now_box.now_ns)
 
 
 def _assert_supports_expires_at_ns(permit: SupportsExpiresAtNs) -> None:
@@ -224,10 +261,7 @@ def run_live_parity(
     )
 
     now_box = _NowBox()
-    for depth in market_data:
-        now_box.value = max(now_box.value, depth.ts_event)
     permit = _NominalWindowPermit(now_box=now_box)
-    _assert_supports_expires_at_ns(permit)
 
     station_key_map = quantile_station_keys if quantile_station_keys is not None else {}
     forecast_stations = tuple(station_key_map.get(station, station) for station in stations)
@@ -245,6 +279,11 @@ def run_live_parity(
         calibration_artefact_sha256=artefact.sha256,
         required_fee_coefficient=fee_coefficient,
     )
+    # Review item 4 (SL-13p2): the strategy no longer retains a
+    # `shadow_decisions` list -- every evaluated snapshot is emitted to the
+    # injected sink instead. This harness's OWN records list is its
+    # observability surface, never a strategy attribute.
+    shadow_records: list[ShadowDecisionLogLine] = []
     strategy = ForecastQuantileLadderStrategy(
         strategy_config,
         quantile_actor=quantile_actor,
@@ -256,17 +295,26 @@ def run_live_parity(
         submit_veto=lambda: "shadow_parity_harness",
         instrument_ids=tuple(instrument_ids),
         quantile_station_keys=station_key_map,
+        shadow_decision_sink=shadow_records.append,
     )
 
     engine = build_backtest_engine(config)
     try:
         engine.add_actor(quantile_actor)
         engine.add_strategy(strategy)
+        # Review item 2: bind the permit's clock reader to the strategy's
+        # OWN native clock only now that `add_strategy` has replaced the
+        # placeholder `Clock` with the engine's real `TestClock` -- doing
+        # this any earlier would bind an unusable clock; doing it via a
+        # value captured before `engine.run()` is exactly the bug this item
+        # fixes.
+        now_box.bind(strategy.clock)
+        _assert_supports_expires_at_ns(permit)
         engine.run()
     finally:
         engine.dispose()
 
-    return tuple(_shadow_log_key(line) for line in strategy.shadow_decisions)
+    return tuple(_shadow_log_key(line) for line in shadow_records)
 
 
 # ---------------------------------------------------------------------------

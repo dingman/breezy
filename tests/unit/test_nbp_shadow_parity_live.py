@@ -313,6 +313,33 @@ def test_the_live_path_uses_the_strategy_depth_handler(
     assert keys[0].kind == "Take"
 
 
+def test_a_pre_window_tick_and_an_in_window_tick_get_different_outcomes() -> None:
+    """Review item 2 (SL-13p2): the permit's ``now_ns`` must be tick-local.
+
+    The OLD shape captured ``now_box.value`` ONCE, as the max ``ts_event``
+    across the whole tape, before ``engine.run()`` -- so EVERY tick (even
+    one before the nominal permit window opens) saw the SAME
+    ``expires_at_ns``, computed from the LAST tick in the run. Here that bug
+    would make the pre-window tick incorrectly read ``permit_covers=True``
+    (16:00 < 02:50 the following day, the window's own end derived from the
+    18:00 in-window tick) and take first, latching the rung before the
+    genuinely in-window 18:00 tick ever gets a chance -- i.e. it would
+    produce ``["Take", "Refuse"]``, not the correct
+    ``["NotExecutable", "Take"]`` asserted below.
+    """
+    instrument = _instrument()
+    pre_window_ts = _ns(2026, 9, 1, 16, 0)  # before LAUNCH_UTC (16:50) opens
+    assert pre_window_ts < DEPTH_TS_NS
+    pre_window_depth = _depth_frame(instrument, ts_ns=pre_window_ts, ask_price=0.10, sequence=0)
+    in_window_depth = _depth_frame(instrument, ts_ns=DEPTH_TS_NS, ask_price=0.10, sequence=1)
+
+    keys = _run_live([pre_window_depth, in_window_depth])
+
+    assert [key.kind for key in keys] == ["NotExecutable", "Take"]
+    assert keys[0].ts_ns == pre_window_ts
+    assert keys[1].ts_ns == DEPTH_TS_NS
+
+
 def test_the_live_and_batch_paths_agree_on_identical_inputs() -> None:
     instrument = _instrument()
     depth = _depth_frame(instrument, ts_ns=DEPTH_TS_NS, ask_price=0.10, sequence=0)
