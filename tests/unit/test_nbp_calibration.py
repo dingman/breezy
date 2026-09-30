@@ -1411,7 +1411,11 @@ def test_p_point_equals_the_manual_mean_over_draws_a_scorer_would_compute() -> N
 # feature (plan S2.2, S3.2 item 7, S4.1 G2.0a).
 # ---------------------------------------------------------------------------
 
-_FROZEN_0B_PATH = _REPO_ROOT / comparator.FROZEN_0B_ARTEFACT_RELPATH
+# The relpath is declared in `scripts/analysis/nbp_skill_study.py`, the
+# caller allowed to name `docs/evidence/` (src/ is not -- see
+# `tests/unit/test_probe_containment.py::test_no_module_under_src_reads_docs_evidence`).
+# `load_frozen_0b_error_model` itself only ever takes an explicit path.
+_FROZEN_0B_PATH = _REPO_ROOT / "docs/evidence/FC_0b_FROZEN_ERROR_MODEL_2026-09-19.json"
 
 
 def test_frozen_0b_artefact_is_committed_at_the_declared_path() -> None:

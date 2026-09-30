@@ -85,7 +85,6 @@ from settlement_truth_dataset import SettlementTruthRow, final_rows_for_gate  # 
 
 from breezy.analysis.nbp_calibration import DEFAULT_SPLITS, NEAR_MIDNIGHT_STRATA, Splits, VersionRow  # noqa: E402
 from breezy.analysis.nbp_comparator_models import (  # noqa: E402
-    FROZEN_0B_ARTEFACT_RELPATH,
     M0_PRIMARY_LEAD_HOURS,
     DailyMaxInstant,
     is_near_lst_midnight,
@@ -117,6 +116,7 @@ __all__ = [
     "DEFAULT_ARCHIVE_ROOT",
     "DEFAULT_NBP_DERIVED_ROOT",
     "DEFAULT_SETTLEMENT_TRUTH_PARQUET",
+    "FROZEN_0B_ARTEFACT_RELPATH",
     "QUALIFYING_CYCLE_HOURS",
     "TXN_VARIABLES",
     "AsosRowOrderError",
@@ -149,6 +149,17 @@ DEFAULT_SETTLEMENT_TRUTH_PARQUET: Final[Path] = (
     Path.home() / ".local/share/breezy/derived/settlement-truth/settlement_truth.parquet"
 )
 DEFAULT_ARCHIVE_ROOT: Final[Path] = Path.home() / ".local/share/breezy/archive"
+
+#: Relative to the repo root. The frozen 0b error model artefact (SL-8c),
+#: fitted once on the WP-6 TRAIN split and committed as the freeze point
+#: (`breezy.analysis.nbp_comparator_models` module docstring "Provenance,
+#: stated precisely") so M0 never re-runs the fit. Lives HERE, not in
+#: `breezy.analysis.nbp_comparator_models`, because `docs/evidence/` is
+#: EVIDENCE ONLY -- NEVER INGEST from `src/` (see
+#: `tests/unit/test_probe_containment.py::test_no_module_under_src_reads_docs_evidence`);
+#: this script is the caller allowed to name that path and hand the loader an
+#: explicit :class:`~pathlib.Path`.
+FROZEN_0B_ARTEFACT_RELPATH: Final[str] = "docs/evidence/FC_0b_FROZEN_ERROR_MODEL_2026-09-19.json"
 
 #: 13Z/19Z/01Z -- the pre-decision-window cycles feeding a D+1 trading
 #: decision (SL-8b task 5's own instruction).

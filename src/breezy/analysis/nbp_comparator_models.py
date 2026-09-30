@@ -77,7 +77,6 @@ from breezy.strategy.ladder_ev.quantile_density import Rung, rung_probabilities
 from breezy.strategy.weather_common.probability import ForecastErrorModel
 
 __all__ = [
-    "FROZEN_0B_ARTEFACT_RELPATH",
     "M0_FROZEN_TRAIN_STATION_DAYS",
     "M0_PRIMARY_LEAD_HOURS",
     "NEAR_MIDNIGHT_WINDOW_SECONDS",
@@ -92,12 +91,6 @@ __all__ = [
     "m1_rung_probabilities",
     "target_climate_day",
 ]
-
-#: Relative to the repo root. The frozen 0b error model artefact (SL-8c),
-#: fitted once on the WP-6 TRAIN split and committed as the freeze point
-#: (module docstring "Provenance, stated precisely") so M0 never re-runs the
-#: fit.
-FROZEN_0B_ARTEFACT_RELPATH: Final[str] = "docs/evidence/FC_0b_FROZEN_ERROR_MODEL_2026-09-19.json"
 
 #: The WP-6 TRAIN station-day count the frozen artefact was fitted on
 #: (`docs/evidence/FC_0b_FIT_AND_HOLDOUT_2026-09-19.md`: "Train 2021-01-01
