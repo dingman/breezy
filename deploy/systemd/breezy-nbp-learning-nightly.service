@@ -23,7 +23,7 @@ UMask=0077
 # must never load operator.env, halt state, venue credentials, or trading
 # enablement controls.
 EnvironmentFile=-%h/.config/breezy/alerts.env
-ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/nbp_learning_nightly.py
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/nbp_learning_nightly.py --calibration-artefact %h/.local/share/breezy/derived/nbp_calibration/nbp_validate_candidate_2026-09-30.json
 
 TimeoutStartSec=900
 StandardOutput=journal

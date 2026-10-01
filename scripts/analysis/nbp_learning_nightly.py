@@ -36,12 +36,18 @@ from breezy.analysis.brier_decomposition import bin_by_value, murphy_decompositi
 from breezy.analysis.nbp_calibration import (
     DEFAULT_SPLITS,
     FIT_STATUS_OK,
+    G20_MONTH_MIN_DATES,
+    G20_MONTH_N,
     FitNotConvergedError,
     NbpCalibrationArtefact,
+    ProbabilityRecalibrationForm,
+    ProbabilityRecalibrationSelection,
     StationDayResidual,
+    apply_probability_recalibration,
     artefact_from_json_dict,
     artefact_sha256,
     crps_numerical,
+    parse_correction_form,
     write_artefact,
 )
 from breezy.analysis.nbp_comparator_models import m1_rung_probabilities
@@ -57,6 +63,7 @@ from breezy.runtime.health import (
     log_alert_egress_status,
     resolve_alert_sink,
 )
+from breezy.strategy.ladder_ev.location_correction import correction_prediction_f
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
@@ -64,6 +71,7 @@ from breezy.strategy.ladder_ev.quantile_density import (
     Rung,
     apply_emos,
     build_cdf,
+    rung_probabilities,
 )
 
 __all__ = [
@@ -112,6 +120,7 @@ DEFAULT_LEARNING_ROWS_JSONL: Final[Path] = (
 DEFAULT_CANDIDATE_ROOT: Final[Path] = (
     Path.home() / ".local/share/breezy/derived/nbp_calibration/candidates"
 )
+DEFAULT_ARCHIVE_ROOT: Final[Path] = Path.home() / ".local/share/breezy/archive"
 
 LABEL_STATUS_FINAL: Final[str] = "FINAL"
 LABEL_STATUS_PROVISIONAL: Final[str] = "PROVISIONAL"
@@ -120,6 +129,8 @@ NBP_STALE_CYCLE_ALERT_EVENT: Final[str] = "nbp_nightly_stale_cycle"
 NBP_STALE_FINAL_LABEL_ALERT_EVENT: Final[str] = "nbp_nightly_stale_final_label"
 NBP_DRIFT_ALERT_EVENT: Final[str] = "nbp_nightly_drift"
 NBP_CALIBRATION_DRIFT_ALERT_EVENT: Final[str] = "nbp_nightly_calibration_drift"
+NBP_MISSING_CALIBRATION_ARTEFACT_EVENT: Final[str] = "nbp_nightly_missing_calibration_artefact"
+NBP_SCORING_FAILED_EVENT: Final[str] = "nbp_nightly_scoring_failed"
 _ALERT_SEVERITY: Final[str] = "WARN"
 _ALERT_SITE: Final[str] = "global"
 _TEST_POSITIVE_CONTROL: Final[str] = "TEST_POSITIVE_CONTROL"
@@ -421,11 +432,206 @@ def _calibration_crps_delta(
     return statistics.fmean(deltas)
 
 
+def _forecast_centered_ladder(center_f: int) -> tuple[Rung, ...]:
+    """Same 3-rung partition as ``nbp_skill_study._forecast_centered_ladder``.
+
+    Centered on the forecast Q50, never on the settled outcome.
+    """
+    return (
+        Rung("lt", None, center_f - 1),
+        Rung("mid", center_f, center_f + 1),
+        Rung("gte", center_f + 2, None),
+    )
+
+
+def _location_correction_f(
+    artefact: NbpCalibrationArtefact, *, month: int, day_length_hours: float
+) -> float:
+    offsets = {
+        int(key): float(value) for key, value in artefact.correction_month_offsets.items()
+    }
+    return correction_prediction_f(
+        parse_correction_form(artefact.correction_form),
+        month=month,
+        day_length_hours=day_length_hours,
+        month_offsets=offsets,
+        linear_coefficients=artefact.correction_linear_coefficients,
+    )
+
+
+def _recalibrated_probabilities(
+    artefact: NbpCalibrationArtefact, probabilities: dict[str, float]
+) -> dict[str, float]:
+    selection = ProbabilityRecalibrationSelection(
+        form=ProbabilityRecalibrationForm(artefact.recalibration),
+        affine=artefact.recalibration_affine,
+        isotonic_points=artefact.recalibration_isotonic_points,
+    )
+    return apply_probability_recalibration(selection, probabilities)
+
+
+def frozen_m2_mid_probability(
+    *,
+    percentiles: Percentiles,
+    version: str,
+    artefact: NbpCalibrationArtefact,
+    day_length_hours: float,
+    climate_day: dt.date,
+) -> tuple[float, float]:
+    """Calibrated mid-rung probability and M2 median from a frozen artefact.
+
+    Reuses EMOS (``apply_emos`` / ``build_cdf`` / ``rung_probabilities``) and
+    the closed location correction (``correction_prediction_f``). The median
+    is ``q50 + a + correction``, the post-correction location S2's residual
+    uses. Returns ``(p_mid, median_f)``.
+    """
+    params = artefact.emos_params_by_version.get(version)
+    if params is None:
+        raise KeyError(f"frozen artefact has no EMOS params for NBM version {version!r}")
+    location_f, gamma = params
+    correction_f = _location_correction_f(
+        artefact, month=climate_day.month, day_length_hours=day_length_hours
+    )
+    adjusted = EmosParams(
+        a=location_f + correction_f, gamma=gamma, delta=artefact.delta
+    )
+    center_f = round(percentiles.q50)
+    cdf = apply_emos(
+        build_cdf(CdfMethod(artefact.cdf_method), percentiles),
+        percentiles,
+        adjusted,
+    )
+    probabilities = _recalibrated_probabilities(
+        artefact, rung_probabilities(cdf, _forecast_centered_ladder(center_f))
+    )
+    return probabilities["mid"], percentiles.q50 + location_f + correction_f
+
+
+def score_learning_row(
+    *,
+    station: str,
+    climate_day: dt.date,
+    cli_tmax_f: float,
+    percentiles: Percentiles,
+    version: str,
+    txn_mean_f: float,
+    xnd_sd_f: float,
+    artefact: NbpCalibrationArtefact,
+    day_length_hours: float,
+) -> LearningRow:
+    """One pre-holdout station-day scored with frozen M2 and NBS TXN+XND M1."""
+    if climate_day >= HOLDOUT_START:
+        raise HoldoutAuthorizationError(
+            f"refusing to score holdout climate day {climate_day.isoformat()}"
+        )
+    p_m2, median_f = frozen_m2_mid_probability(
+        percentiles=percentiles,
+        version=version,
+        artefact=artefact,
+        day_length_hours=day_length_hours,
+        climate_day=climate_day,
+    )
+    center_f = round(percentiles.q50)
+    p_m1 = m1_rung_probabilities(
+        txn_mean_f=txn_mean_f,
+        xnd_sd_f=xnd_sd_f,
+        rungs=_forecast_centered_ladder(center_f),
+    )["mid"]
+    return LearningRow(
+        station=station,
+        climate_day=climate_day,
+        label_status=LABEL_STATUS_FINAL,
+        cli_tmax_f=cli_tmax_f,
+        m2_median_f=median_f,
+        p_m2=p_m2,
+        p_m1=p_m1,
+        outcome=int(cli_tmax_f) in (center_f, center_f + 1),
+        percentiles=percentiles,
+        nbm_version=version,
+    )
+
+
+def scored_rows_from_artefact(
+    *,
+    artefact: NbpCalibrationArtefact,
+    nbp_derived_root: Path,
+    settlement_truth: Path,
+    archive_root: Path,
+) -> tuple[LearningRow, ...]:
+    """Pre-holdout D+1 events scored with the frozen artefact and real M1.
+
+    The join is the S2 comparator join (explicit D+1 window, final CLI only,
+    holdout dropped before lookup). M1 is that join's NBS TXN+XND probability.
+    M2 replaces the join's uncalibrated placeholder with ``frozen_m2_mid_probability``.
+    """
+    if artefact.fit_status != FIT_STATUS_OK:
+        raise FitNotConvergedError(
+            f"frozen artefact refused: fit_status={artefact.fit_status!r}, not {FIT_STATUS_OK!r}"
+        )
+    import nbp_skill_study as study  # type: ignore[import-not-found]
+
+    registry = study.station_registry()
+    settlement_rows = study.read_settlement_truth_rows(
+        settlement_truth, climate_day_before=HOLDOUT_START
+    )
+    settlement_by_station_day = study._settlement_lookup(
+        settlement_rows, holdout_start=HOLDOUT_START
+    )
+    windows: list[Any] = []
+    for _path, partition in study.iter_nbp_derived_rows(nbp_derived_root):
+        if partition is None:
+            continue
+        windows.extend(study.complete_percentile_windows(partition))
+    mos_by_cycle = study.mos_txn_xnd_by_cycle(archive_root=archive_root, registry=registry)
+    frozen_0b = study.load_frozen_0b_error_model(_REPO_ROOT / study.FROZEN_0B_ARTEFACT_RELPATH)
+    events, _report = study.build_comparator_matched_events(
+        windows,
+        settlement_by_station_day,
+        mos_by_cycle,
+        {},
+        frozen_0b,
+        registry=registry,
+    )
+    scored: list[LearningRow] = []
+    for event in events:
+        climate_day = event.climate_day
+        if not isinstance(climate_day, dt.date) or climate_day >= HOLDOUT_START:
+            continue
+        percentiles = event.percentiles
+        if not isinstance(percentiles, Percentiles):
+            raise TypeError("comparator event is missing NBP percentiles")
+        station = str(event.station)
+        version = str(event.version)
+        p_m2, median_f = frozen_m2_mid_probability(
+            percentiles=percentiles,
+            version=version,
+            artefact=artefact,
+            day_length_hours=float(study._daylight_hours(station, climate_day)),
+            climate_day=climate_day,
+        )
+        scored.append(
+            LearningRow(
+                station=station,
+                climate_day=climate_day,
+                label_status=LABEL_STATUS_FINAL,
+                cli_tmax_f=float(event.cli_tmax_f),
+                m2_median_f=median_f,
+                p_m2=p_m2,
+                p_m1=float(event.p_m1),
+                outcome=bool(event.outcome),
+                percentiles=percentiles,
+                nbm_version=version,
+            )
+        )
+    return tuple(scored)
+
+
 def residual_by_month(
     rows: Sequence[LearningRow], *, tested_months: set[int] | None = None
 ) -> tuple[MonthResidualReport, ...]:
     tested = tested_months or set()
     grouped: dict[str, list[float]] = {}
+    dates: dict[str, set[dt.date]] = {}
     month_numbers: dict[str, int] = {}
     residuals = tuple(
         StationDayResidual(
@@ -439,16 +645,20 @@ def residual_by_month(
     for residual in residuals:
         key = f"{residual.climate_day.year:04d}-{residual.climate_day.month:02d}"
         grouped.setdefault(key, []).append(residual.residual_f)
+        dates.setdefault(key, set()).add(residual.climate_day)
         month_numbers[key] = residual.month
 
     reports = []
     for key in sorted(grouped):
+        n = len(grouped[key])
+        meets_plan_n = n >= G20_MONTH_N and len(dates[key]) >= G20_MONTH_MIN_DATES
+        status = "TESTED" if month_numbers[key] in tested or meets_plan_n else "UNTESTED"
         reports.append(
             MonthResidualReport(
                 month=key,
-                n=len(grouped[key]),
+                n=n,
                 median_residual_f=float(statistics.median(grouped[key])),
-                status="TESTED" if month_numbers[key] in tested else "UNTESTED",
+                status=status,
             )
         )
     return tuple(reports)
@@ -547,27 +757,6 @@ def _load_final_label_days(path: Path) -> tuple[dt.date, ...]:
         value = record["climate_day"]
         days.append(value if isinstance(value, dt.date) else dt.date.fromisoformat(str(value)))
     return tuple(days)
-
-
-def _learning_rows_from_labels(rows: Sequence[Any]) -> tuple[LearningRow, ...]:
-    result = []
-    for row in final_rows_for_gate(rows):
-        if row.tmax_f is None:
-            continue
-        result.append(
-            LearningRow(
-                station=row.station,
-                climate_day=row.climate_day,
-                label_status=LABEL_STATUS_FINAL,
-                cli_tmax_f=float(row.tmax_f),
-                m2_median_f=float(row.tmax_f),
-                p_m2=0.5,
-                p_m1=0.5,
-                outcome=True,
-                percentiles=None,
-            )
-        )
-    return tuple(result)
 
 
 def _load_learning_rows_jsonl(path: Path) -> tuple[LearningRow, ...]:
@@ -678,6 +867,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nbp-derived-root", default=DEFAULT_NBP_DERIVED_ROOT.as_posix())
     parser.add_argument("--settlement-truth", default=DEFAULT_LABEL_PATH.as_posix())
     parser.add_argument("--learning-rows-jsonl", default=DEFAULT_LEARNING_ROWS_JSONL.as_posix())
+    parser.add_argument("--archive-root", default=DEFAULT_ARCHIVE_ROOT.as_posix())
+    parser.add_argument(
+        "--calibration-artefact",
+        help=(
+            "Frozen NBP calibration artefact JSON. Required. "
+            "Metrics are refused when it is omitted."
+        ),
+    )
     parser.add_argument("--candidate-artefact-json")
     parser.add_argument("--frozen-artefact-json")
     parser.add_argument("--candidate-root", default=DEFAULT_CANDIDATE_ROOT.as_posix())
@@ -729,28 +926,74 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     now = dt.datetime.now(dt.UTC)
 
     positive_control = _parse_positive_control(args.positive_control)
-    nbp_rows = _load_nbp_rows(Path(args.nbp_derived_root))
-    learning_rows = _load_learning_rows_jsonl(Path(args.learning_rows_jsonl))
-    final_label_days: tuple[dt.date, ...] | None = None
-    if not learning_rows:
-        settlement_truth_path = Path(args.settlement_truth)
-        final_label_days = _load_final_label_days(settlement_truth_path)
-        learning_rows = _learning_rows_from_labels(
-            _load_settlement_truth_rows(settlement_truth_path)
+    if not args.calibration_artefact:
+        send_alert(
+            sink,
+            event=NBP_MISSING_CALIBRATION_ARTEFACT_EVENT,
+            detail="refusing placeholder metrics; pass --calibration-artefact",
         )
+        return 1
+    artefact_path = Path(args.calibration_artefact)
+    if not artefact_path.is_file():
+        send_alert(
+            sink,
+            event=NBP_MISSING_CALIBRATION_ARTEFACT_EVENT,
+            detail=f"calibration artefact not found: {artefact_path}",
+        )
+        return 1
+    try:
+        artefact = _load_candidate_artefact(artefact_path)
+    except (OSError, TypeError, KeyError, ValueError) as exc:
+        send_alert(
+            sink,
+            event=NBP_MISSING_CALIBRATION_ARTEFACT_EVENT,
+            detail=f"calibration artefact refused: {exc}",
+        )
+        return 1
+    if artefact.fit_status != FIT_STATUS_OK:
+        send_alert(
+            sink,
+            event=NBP_MISSING_CALIBRATION_ARTEFACT_EVENT,
+            detail=(
+                f"calibration artefact fit_status={artefact.fit_status!r}, "
+                f"not {FIT_STATUS_OK!r}"
+            ),
+        )
+        return 1
 
+    nbp_rows = _load_nbp_rows(Path(args.nbp_derived_root))
+    settlement_truth_path = Path(args.settlement_truth)
+    final_label_days = _load_final_label_days(settlement_truth_path)
     check_freshness(
         nbp_rows=nbp_rows,
-        label_rows=learning_rows,
+        label_rows=(),
         final_label_days=final_label_days,
         now=now,
         sink=sink,
         positive_control=positive_control,
     )
+    try:
+        learning_rows = scored_rows_from_artefact(
+            artefact=artefact,
+            nbp_derived_root=Path(args.nbp_derived_root),
+            settlement_truth=settlement_truth_path,
+            archive_root=Path(args.archive_root),
+        )
+    except (OSError, TypeError, KeyError, ValueError, FitNotConvergedError) as exc:
+        send_alert(sink, event=NBP_SCORING_FAILED_EVENT, detail=str(exc))
+        print(f"NBP_SCORING_FAILED {exc}", file=sys.stderr)
+        return 1
+    if not learning_rows:
+        send_alert(
+            sink,
+            event=NBP_SCORING_FAILED_EVENT,
+            detail="no pre-holdout rows scored from the frozen artefact",
+        )
+        return 1
     frozen_artefact = (
         _load_candidate_artefact(Path(args.frozen_artefact_json))
         if args.frozen_artefact_json
-        else None
+        else artefact
     )
     check_drift(
         rows=learning_rows,
