@@ -83,6 +83,8 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 
 **Host 09-28:** reboot 15:21Z killed node + 15:20Z study; node respawned 16:50:22Z (permit ttl 10 h); A1 halt SET (`source=legacy_attributed`); tape advancing.
 
+**FQ go-live 10-01:** `pm_us_crh_fq_v1.json` REGISTERED (slice S8) with `live_orders_ruling=RULING_operator_fq_live_real_orders_2026-10-01`, density artefact sha-pinned to the committed byte copy `9c0b6d6e…923a5e`, boundary artefact pinned to the `not_applicable_boundary.json` sentinel; `d0_climate_day` and activation (S9) still pending `docs/plans/FQ_GO_LIVE_PLAN_2026-10-01.md` §4/§5.
+
 ---
 
 ## Pointers

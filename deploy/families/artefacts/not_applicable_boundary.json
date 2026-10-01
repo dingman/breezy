@@ -1,0 +1,6 @@
+{
+  "schema": "breezy_boundary_artefact_sentinel_v1",
+  "applicable": false,
+  "reason": "forecast_quantile_ladder prices via the nbp calibration density artefact (density_artefact_path/density_artefact_sha256), never a current_rung_hold/continuous_rung_hold group-sequential alpha-spending boundary; this sentinel is the committed boundary_artefact_path pin for pm_us_crh_fq_v1.json. It deliberately does not satisfy breezy.persistence.gs_boundary_artefact.load_boundary_artefact's required-key schema (plan FQ_GO_LIVE_PLAN_2026-10-01.md D4), so any accidental family_tally_v2 (or other group-sequential-boundary) run against this family refuses closed instead of silently tallying a composition kind the boundary math was never fitted for.",
+  "generated_by": "FQ-S8 (2026-10-01)"
+}
