@@ -8,9 +8,11 @@ no network, no captured venue payload.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import inspect
 import json
+import textwrap
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -55,6 +57,7 @@ from scripts.analysis.nbp_shadow_parity_pure import (
     DepthSnapshotRow,
     NbpQuantileRow,
     diff_decision_keys,
+    no_depth_census,
     run_batch_parity,
 )
 
@@ -117,10 +120,10 @@ _PERCENTILES = {
 assert set(_PERCENTILES) == set(NBP_QUANTILE_VARIABLES)
 
 
-def _facts_info() -> dict[str, object]:
+def _facts_info(station: str = STATION) -> dict[str, object]:
     return {
         WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
-        SETTLEMENT_STATION_KEY: STATION,
+        SETTLEMENT_STATION_KEY: station,
         CLIMATE_DAY_KEY: CLIMATE_DAY.isoformat(),
         MEASURE_KEY: "high",
         STRIKE_LOWER_F_KEY: 80,
@@ -128,7 +131,9 @@ def _facts_info() -> dict[str, object]:
     }
 
 
-def _instrument(instrument_id: InstrumentId = _INSTRUMENT_ID) -> BinaryOption:
+def _instrument(
+    instrument_id: InstrumentId = _INSTRUMENT_ID, *, station: str = STATION,
+) -> BinaryOption:
     increment = Price.from_str("0.01")
     size_increment = Quantity.from_str("1")
     option = BinaryOption(
@@ -150,7 +155,7 @@ def _instrument(instrument_id: InstrumentId = _INSTRUMENT_ID) -> BinaryOption:
         taker_fee=Decimal(str(FEE_COEFFICIENT)),
         ts_event=0,
         ts_init=0,
-        info=_facts_info(),
+        info=_facts_info(station),
     )
     if instrument_id == _NO_INSTRUMENT_ID:
         return BinaryOption.from_dict(
@@ -215,12 +220,12 @@ _MODEL_VERSION = "5.0"
 _ERA = f"v{_MODEL_VERSION}"
 
 
-def _forecast_points() -> tuple[ForecastPoint, ...]:
+def _forecast_points(station: str = STATION) -> tuple[ForecastPoint, ...]:
     points = []
     for variable, value in _PERCENTILES.items():
         points.append(
             ForecastPoint(
-                station=STATION,
+                station=station,
                 model="NBM_NBP",
                 model_version=_MODEL_VERSION,
                 variable=variable,
@@ -237,10 +242,10 @@ def _forecast_points() -> tuple[ForecastPoint, ...]:
     return tuple(points)
 
 
-def _nbp_rows() -> tuple[NbpQuantileRow, ...]:
+def _nbp_rows(station: str = STATION) -> tuple[NbpQuantileRow, ...]:
     return tuple(
         NbpQuantileRow(
-            station=STATION,
+            station=station,
             variable=variable,
             cycle_runtime_ns=_CYCLE_NS,
             valid_start_ns=_CYCLE_NS,
@@ -612,3 +617,218 @@ def test_main_refuses_an_artefact_whose_fit_status_is_not_ok(tmp_path: Path) -> 
     )
 
     assert code != 0
+
+
+def test_explicit_zero_slippage_beats_the_config_default_on_both_legs() -> None:
+    """A-6 is ``p_lower - ask - fee``. ``main`` passes both.
+
+    ``LadderEvConfig()`` defaults ``slippage_floor_prob`` to 0.01, and the
+    same call passes ``slippage_floor_prob=0.0``. The explicit 0.0 is the
+    spec term. A live leg that keeps the default is one tick low.
+    """
+    instrument = _instrument()
+    ask = 0.10
+    depth = _depth_frame(instrument, ts_ns=DEPTH_TS_NS, ask_price=ask, sequence=0)
+    row = DepthSnapshotRow(
+        instrument_id=str(instrument.id),
+        ts_ns=DEPTH_TS_NS,
+        best_ask_price=ask,
+        best_ask_size=25.0,
+        station=STATION,
+        climate_day=CLIMATE_DAY,
+        rung_id="80_81",
+        side="yes",
+    )
+    live = run_live_parity(
+        instruments=[_instrument(), _instrument(_NO_INSTRUMENT_ID)],
+        market_data=[depth],
+        forecast_points=_forecast_points(),
+        ladder_by_key=LADDER_BY_KEY,
+        calibration=_live_calibration(),
+        ladder_cfg=LadderEvConfig(),
+        bounds_provider=_bounds_provider,
+        fee_coefficient=FEE_COEFFICIENT,
+        slippage_floor_prob=0.0,
+        std_utc_offset_hours_by_station=STD_OFFSET_BY_STATION,
+        stations=(STATION,),
+    )
+    batch = run_batch_parity(
+        depth_snapshots=(row,),
+        nbp_rows=_nbp_rows(),
+        ladder_by_key=LADDER_BY_KEY,
+        calibration=_batch_calibration(),
+        ladder_cfg=LadderEvConfig(),
+        bounds_provider=_bounds_provider,
+        fee_coefficient=FEE_COEFFICIENT,
+        slippage_floor_prob=0.0,
+        std_utc_offset_hours_by_station=STD_OFFSET_BY_STATION,
+        latitude_deg_by_station=LATITUDE_DEG_BY_STATION,
+    )
+    fee = FEE_COEFFICIENT * ask * (1.0 - ask)
+    expected = 0.90 - ask - fee
+    assert len(live) == 1 and live[0].kind == "Take"
+    assert len(batch) == 1 and batch[0].kind == "Take"
+    assert live[0].ev_net == pytest.approx(expected, abs=1e-9)
+    assert batch[0].ev_net == pytest.approx(expected, abs=1e-9)
+
+
+def _composition_default_ladder_cfg() -> LadderEvConfig:
+    """The config composition.py builds when the caller passes no ladder config."""
+    from breezy.strategy.forecast_quantile_ladder.composition import (
+        build_forecast_quantile_ladder_strategies,
+    )
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(build_forecast_quantile_ladder_strategies)),
+    )
+    else_calls = [
+        node.orelse
+        for node in ast.walk(tree)
+        if isinstance(node, ast.IfExp)
+        and isinstance(node.orelse, ast.Call)
+        and isinstance(node.orelse.func, ast.Name)
+        and node.orelse.func.id == "LadderEvConfig"
+    ]
+    assert len(else_calls) == 1
+    call = else_calls[0]
+    assert isinstance(call, ast.Call)
+    assert call.args == [] and call.keywords == []
+    return LadderEvConfig()
+
+
+def test_harness_slippage_equals_the_deployed_composition_floor() -> None:
+    """Gate 5 replays the strategy as deployed.
+
+    ``main`` must pass composition's ``LadderEvConfig()`` floor to both
+    legs. A literal, or a change to either construction, fails this pin.
+    """
+    composed = _composition_default_ladder_cfg()
+    tree = ast.parse(textwrap.dedent(inspect.getsource(live_module.main)))
+    floors = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.keyword) and node.arg == "slippage_floor_prob"
+    ]
+    assert len(floors) == 2
+    for expr in floors:
+        assert isinstance(expr, ast.Call)
+        assert isinstance(expr.func, ast.Name)
+        assert expr.func.id == "production_slippage_floor_prob"
+        assert expr.args == [] and expr.keywords == []
+    helper = ast.parse(
+        textwrap.dedent(inspect.getsource(live_module.production_slippage_floor_prob)),
+    )
+    returned = [
+        node.value
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Return)
+    ]
+    assert len(returned) == 1
+    value = returned[0]
+    assert isinstance(value, ast.Attribute)
+    assert value.attr == "slippage_floor_prob"
+    assert isinstance(value.value, ast.Call)
+    assert isinstance(value.value.func, ast.Name)
+    assert value.value.func.id == "LadderEvConfig"
+    assert value.value.args == [] and value.value.keywords == []
+    assert live_module.production_slippage_floor_prob() == composed.slippage_floor_prob
+
+
+def test_a_non_manifest_station_tape_is_ignored_by_both_legs_and_cannot_satisfy_vacuity(
+    tmp_path: Path,
+) -> None:
+    """NYC is on the tape and in the registry, but not in the family manifest.
+
+    Both legs must drop it, the NO-depth census must not see it, and a tape
+    that contains only that station must still fail the vacuity guard.
+    """
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    repo_root = Path(__file__).resolve().parents[2]
+    allowed = live_module.manifest_stations(repo_root)
+    manifest = load_family_manifest(repo_root / "deploy" / "families" / "pm_us_crh_fq_v1.json")
+    assert allowed == manifest.stations
+    assert "NYC" not in allowed
+
+    nyc_id = InstrumentId(Symbol(f"nyc-{CLIMATE_DAY.isoformat()}-80_81"), POLYMARKET_US_VENUE)
+    nyc_instrument = _instrument(nyc_id, station="NYC")
+    depth = _depth_frame(nyc_instrument, ts_ns=DEPTH_TS_NS, ask_price=0.10, sequence=0)
+    row = DepthSnapshotRow(
+        instrument_id=str(nyc_instrument.id),
+        ts_ns=DEPTH_TS_NS,
+        best_ask_price=0.10,
+        best_ask_size=25.0,
+        station="NYC",
+        climate_day=CLIMATE_DAY,
+        rung_id="80_81",
+        side="yes",
+    )
+    batch_kwargs: dict[str, object] = {
+        "depth_snapshots": (row,),
+        "nbp_rows": _nbp_rows("NYC"),
+        "ladder_by_key": {("NYC", CLIMATE_DAY): LADDER},
+        "calibration": _batch_calibration(),
+        "ladder_cfg": LadderEvConfig(slippage_floor_prob=SLIPPAGE_FLOOR_PROB),
+        "bounds_provider": _bounds_provider,
+        "fee_coefficient": FEE_COEFFICIENT,
+        "slippage_floor_prob": SLIPPAGE_FLOOR_PROB,
+        "std_utc_offset_hours_by_station": {"NYC": -5.0},
+        "latitude_deg_by_station": {"NYC": 40.7},
+    }
+    unfiltered = run_batch_parity(**batch_kwargs)  # type: ignore[arg-type]
+    assert any(key.station == "NYC" and key.kind in {"Take", "Refuse"} for key in unfiltered)
+
+    batch_keys = run_batch_parity(**batch_kwargs, stations=allowed)  # type: ignore[arg-type]
+    live_keys = run_live_parity(
+        instruments=[nyc_instrument],
+        market_data=[depth],
+        forecast_points=_forecast_points("NYC"),
+        ladder_by_key={("NYC", CLIMATE_DAY): LADDER},
+        calibration=_live_calibration(),
+        ladder_cfg=LadderEvConfig(slippage_floor_prob=SLIPPAGE_FLOOR_PROB),
+        bounds_provider=_bounds_provider,
+        fee_coefficient=FEE_COEFFICIENT,
+        slippage_floor_prob=SLIPPAGE_FLOOR_PROB,
+        std_utc_offset_hours_by_station={"NYC": -5.0},
+        stations=allowed,
+    )
+    assert batch_keys == ()
+    assert live_keys == ()
+    assert "NYC" not in no_depth_census(())
+
+    class _NycInstrument:
+        def __init__(self) -> None:
+            self.id = nyc_id
+            self.info = _facts_info("NYC")
+
+    class _Catalog:
+        def query(self, data_cls: type, **kwargs: object) -> list[object]:
+            del kwargs
+            from nautilus_trader.model.instruments import BinaryOption as _BinaryOption
+
+            if data_cls is _BinaryOption:
+                return [_NycInstrument()]
+            return []
+
+    (
+        tmp_path / "data" / "binary_option" / f"tc-temp-nychigh-{CLIMATE_DAY.isoformat()}-x.POLYMARKET_US"
+    ).mkdir(parents=True)
+    _kept, _depths, batch_rows, ladders, offsets, _lats, _keys = live_module._load_catalog_inputs(
+        tmp_path,
+        start=CLIMATE_DAY,
+        end=CLIMATE_DAY,
+        catalog=_Catalog(),
+        stations=allowed,
+    )
+    assert batch_rows == ()
+    assert ladders == {}
+    assert "NYC" not in offsets
+    assert "NYC" not in no_depth_census(batch_rows)
+
+    report = diff_decision_keys(live_keys, batch_keys)
+    failures = live_module.vacuity_guard_failures(
+        report.side_kind_counts,
+        no_side_unexercisable_in_window=not any(no_depth_census(batch_rows).values()),
+    )
+    assert "live_yes" in failures
+    assert "batch_yes" in failures
