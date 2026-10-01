@@ -50,6 +50,7 @@ from breezy.strategy.ladder_ev.scoring import ev_net, ev_net_no
 from breezy.strategy.weather_common.costs import DepthAwareTradeCost, venue_fee_prob
 
 __all__ = [
+    "OPPOSITE_SIDE_LATCHED",
     "QTY",
     "VECTOR_DAY_MISMATCH",
     "AskSideMismatchError",
@@ -76,6 +77,17 @@ QTY: Literal[1] = 1
 #: with this named reason rather than silently scored, exactly like every
 #: other non-trial verdict in this module.
 VECTOR_DAY_MISMATCH: Final[str] = "vector_day_mismatch"
+
+#: D10 / S10. Once either side of a (station, climate_day, rung) has Taken,
+#: the other side refuses with this reason. Checked immediately after the
+#: own-side latch and before ``forecast_unavailable`` / ``vector_day_mismatch``
+#: — see :func:`evaluate`'s check-order comment. Do not reorder.
+OPPOSITE_SIDE_LATCHED: Final[str] = "opposite_side_latched"
+
+_OPPOSITE: Final[dict[Literal["yes", "no"], Literal["yes", "no"]]] = {
+    "yes": "no",
+    "no": "yes",
+}
 
 
 class AskSideMismatchError(ValueError):
@@ -216,13 +228,26 @@ def evaluate(
 ) -> Decision:
     """Evaluate ONE rung at ONE snapshot. Pure; mutates only ``latch`` on a Take.
 
-    Check order: (1) the ask/side binding and (2) ``rung_id`` membership are
-    caller-contract invariants and raise unconditionally -- a mismatch here
-    is a wiring bug, never a business decision, so it is checked before
-    anything else and regardless of permit/latch state. Then (3) D+1 scope,
-    (4) the permit, and (5) the latch -- each a distinct non-trial verdict,
-    matching plan §3.3's "never latched and never counted as a trial" for
-    every one of them.
+    Check order — do not reorder. Pinned by
+    ``test_evaluate_check_order_pins_opposite_side_between_own_side_and_later_refusals``.
+    Earliest true condition wins:
+
+    (1) ask/side binding and (2) ``rung_id`` membership raise unconditionally.
+    A mismatch here is a wiring bug, never a business decision, so it is
+    checked before anything else and regardless of permit or latch state.
+    (3) D+1 scope → :class:`NotDPlus1`.
+    (4) the permit → :class:`NotExecutable`.
+    (5) the own-side latch → ``Refuse("already_latched")``.
+    (6) the opposite-side latch → ``Refuse(OPPOSITE_SIDE_LATCHED)``.
+    (7) ``forecast_unavailable``.
+    (8) ``vector_day_mismatch``, then the later scoring refusals.
+
+    (3) and (4) stay ahead of both latch checks: they are non-trials (plan
+    §3.3, "never latched and never counted as a trial") and must not report
+    a latch reason. (6) is immediately after (5) and ahead of (7) and (8),
+    so a missing or day-mismatched forecast cannot mask the self-hedge
+    (D10). A later slice that adds a scoring refusal must insert it after
+    (8), never above (6).
     """
     if ask.side != side:
         raise AskSideMismatchError(
@@ -246,6 +271,17 @@ def evaluate(
 
     if latch.is_latched(station=station, climate_day=climate_day, rung_id=rung_id, side=side):
         return Refuse(reason="already_latched")
+
+    # Precedence, pinned: own-side latch (above) then this opposite-side
+    # check, then forecast_unavailable and vector_day_mismatch. D+1 and the
+    # permit stay above both latch checks. Do not reorder.
+    if latch.is_latched(
+        station=station,
+        climate_day=climate_day,
+        rung_id=rung_id,
+        side=_OPPOSITE[side],
+    ):
+        return Refuse(reason=OPPOSITE_SIDE_LATCHED)
 
     if vector is None:
         return Refuse(reason="forecast_unavailable")
