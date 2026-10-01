@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
+from typing import TYPE_CHECKING, Final, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
 
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.model.currencies import USD
@@ -54,15 +54,12 @@ from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition
 from breezy.runtime.backtest_harness import BreezyBacktestConfig, build_backtest_engine
 from breezy.runtime.settings import SettingsError, load_quote_tape_settings
 from breezy.registry.sites import default_registry
-from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider, RungBounds
-from breezy.strategy.forecast_quantile_ladder.artefact_bounds import (
-    BoundsArtefactPinMismatchError,
-    load_bounds_artefact_draws,
-)
+from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
+from breezy.strategy.forecast_quantile_ladder.artefact_bounds import ArtefactBoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
-    CalibrationArtefact,
     CalibrationArtefactPinMismatchError,
-    load_calibration_artefact,
+    LiveCalibration,
+    load_live_calibration,
 )
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
@@ -73,8 +70,9 @@ from breezy.strategy.forecast_quantile_ladder.strategy import (
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
-from breezy.strategy.ladder_ev.quantile_density import Rung, rung_probabilities
+from breezy.strategy.ladder_ev.quantile_density import Rung
 from scripts.analysis.nbp_shadow_parity_pure import (
+    BatchCalibration,
     DecisionKey,
     DepthSnapshotRow,
     NbpQuantileRow,
@@ -231,7 +229,7 @@ def run_live_parity(
     market_data: Sequence[OrderBookDepth10],
     forecast_points: Sequence[ForecastPoint],
     ladder_by_key: Mapping[tuple[str, date], Sequence[Rung]],
-    artefact: CalibrationArtefact,
+    calibration: LiveCalibration,
     ladder_cfg: LadderEvConfig,
     bounds_provider: BoundsProvider,
     fee_coefficient: float,
@@ -279,7 +277,7 @@ def run_live_parity(
     strategy_config = ForecastQuantileLadderConfig(
         stations=tuple(stations),
         calibration_artefact_path="",
-        calibration_artefact_sha256=artefact.sha256,
+        calibration_artefact_sha256=calibration.sha256,
         required_fee_coefficient=fee_coefficient,
     )
     # Review item 4 (SL-13p2): the strategy no longer retains a
@@ -290,7 +288,7 @@ def run_live_parity(
     strategy = ForecastQuantileLadderStrategy(
         strategy_config,
         quantile_actor=quantile_actor,
-        artefact=artefact,
+        calibration=calibration,
         ladder_cfg=ladder_cfg,
         bounds_provider=bounds_provider,
         latch=latch,
@@ -330,14 +328,6 @@ def _assert_pre_freeze_range(start: date, end: date) -> None:
         raise ValueError(f"end-date {end.isoformat()} is before start-date {start.isoformat()}")
     assert_pre_freeze_tape_day(start)
     assert_pre_freeze_tape_day(end)
-
-
-def _point_bounds_provider(
-    *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str,
-) -> RungBounds:
-    probabilities = rung_probabilities(cdf, ladder)
-    p_hat = probabilities[rung_id]
-    return RungBounds(p_hat=p_hat, p_lower=p_hat, p_upper=p_hat)
 
 
 def _std_offset_hours_by_icao() -> dict[str, float]:
@@ -395,6 +385,8 @@ def _load_nbp_rows(root: Path, *, start: date, end: date) -> tuple[NbpQuantileRo
                 station=row.station,
                 variable=row.variable,
                 cycle_runtime_ns=row.cycle_runtime_ns,
+                valid_start_ns=row.valid_start_ns,
+                valid_end_ns=row.valid_end_ns,
                 value_f=row.value_f,
                 available_at_ns=row.available_at_ns,
                 climate_day=climate_day,
@@ -422,6 +414,7 @@ def _load_catalog_inputs(
     tuple[OrderBookDepth10, ...],
     tuple[DepthSnapshotRow, ...],
     dict[tuple[str, date], tuple[Rung, ...]],
+    dict[str, float],
     dict[str, float],
     dict[str, str],
 ]:
@@ -481,6 +474,10 @@ def _load_catalog_inputs(
         station: registry.climate_day_window("polymarket_us", station).std_utc_offset_hours
         for station in stations
     }
+    latitude_deg_by_station = {
+        station: registry.enrichment_coordinates("polymarket_us", station).lat
+        for station in stations
+    }
     quantile_station_keys = {
         station: registry.settlement_site("polymarket_us", station).icao for station in stations
     }
@@ -490,6 +487,7 @@ def _load_catalog_inputs(
         tuple(batch_rows),
         {key: tuple(value) for key, value in ladder_by_key.items()},
         std_offsets,
+        latitude_deg_by_station,
         quantile_station_keys,
     )
 
@@ -522,16 +520,62 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+#: FQ-S4b vacuity guard (plan §3 S4b item 6, peer review disposition 6): a
+#: decision kind that counts as "evaluated", i.e. neither `NotExecutable` nor
+#: `NotDPlus1` (both are non-trials the strategy itself never counts either).
+_VACUOUS_KINDS: Final[frozenset[str]] = frozenset({"NotExecutable", "NotDPlus1"})
+_NON_VACUOUS_KINDS: Final[tuple[str, ...]] = ("Refuse", "Take")
+_PARITY_PATHS: Final[tuple[str, ...]] = ("live", "batch")
+_PARITY_SIDES: Final[tuple[str, ...]] = ("yes", "no")
+
+
+def _non_vacuous_count(side_kind_counts: Mapping[str, int], *, path: str, side: str) -> int:
+    return sum(side_kind_counts[f"n_{path}_{side}_{kind}"] for kind in _NON_VACUOUS_KINDS)
+
+
+def vacuity_guard_failures(
+    side_kind_counts: Mapping[str, int], *, no_side_unexercisable_in_window: bool,
+) -> tuple[str, ...]:
+    """The closed set of ``"{path}_{side}"`` buckets with ZERO evaluated
+    (non-`NotExecutable`/`NotDPlus1`) decisions (plan §3 S4b item 6).
+
+    Empty means the guard passes. When ``no_side_unexercisable_in_window`` is
+    ``True`` (the S4a NO-depth census found no NO-leg depth for any
+    station-day on either path's own window), the NO side is exempted on
+    BOTH paths -- disposition 6: "the guard requires YES only" -- and the
+    mandatory synthetic NO-path parity test
+    (``tests/unit/test_nbp_shadow_parity_no_side_synthetic.py``) is what
+    proves the NO-path formulas themselves still agree.
+    """
+    failures: list[str] = []
+    for path in _PARITY_PATHS:
+        for side in _PARITY_SIDES:
+            if side == "no" and no_side_unexercisable_in_window:
+                continue
+            if _non_vacuous_count(side_kind_counts, path=path, side=side) < 1:
+                failures.append(f"{path}_{side}")
+    return tuple(failures)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         _assert_pre_freeze_range(args.start_date, args.end_date)
-        artefact = load_calibration_artefact(
+        live_calibration = load_live_calibration(
             str(args.calibration_artefact), expected_sha256=args.calibration_sha256,
         )
-        load_bounds_artefact_draws(
-            str(args.calibration_artefact), expected_sha256=args.calibration_sha256,
+        batch_calibration = BatchCalibration(
+            cdf_method=live_calibration.cdf_method,
+            correction_form=live_calibration.correction_form,
+            linear_coefficients=live_calibration.linear_coefficients,
+            month_offsets=live_calibration.month_offsets,
+            point_by_version=live_calibration.point_by_version,
+            draws_by_version=live_calibration.draws_by_version,
         )
+        # Both legs use the SAME real bootstrap-draw bounds implementation
+        # (plan §3 S4b: "Both legs use the S2 calibration and bounds") --
+        # one `ArtefactBoundsProvider` instance, injected into both paths.
+        bounds_provider = ArtefactBoundsProvider(cdf_method=live_calibration.cdf_method)
         quote_settings = load_quote_tape_settings()
         (
             instruments,
@@ -539,6 +583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             depth_rows,
             ladder_by_key,
             std_offsets,
+            latitude_deg_by_station,
             quantile_station_keys,
         ) = _load_catalog_inputs(
             quote_settings.catalog_root, start=args.start_date, end=args.end_date,
@@ -551,11 +596,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ForecastPoint(
                     station=row.station,
                     model="NBM_NBP",
-                    model_version="stored",
+                    model_version=row.header_model_version,
                     variable=row.variable,
                     cycle_runtime_ns=row.cycle_runtime_ns,
-                    valid_start_ns=row.cycle_runtime_ns,
-                    valid_end_ns=row.cycle_runtime_ns,
+                    valid_start_ns=row.valid_start_ns,
+                    valid_end_ns=row.valid_end_ns,
                     value_f=row.value_f,
                     issuance_seq=0,
                     measured_publication_lag_ns=max(0, row.available_at_ns - row.cycle_runtime_ns),
@@ -565,9 +610,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for row in nbp_rows
             ),
             ladder_by_key=ladder_by_key,
-            artefact=artefact,
+            calibration=live_calibration,
             ladder_cfg=LadderEvConfig(),
-            bounds_provider=_point_bounds_provider,
+            bounds_provider=bounds_provider,
             fee_coefficient=0.0695,
             slippage_floor_prob=0.0,
             std_utc_offset_hours_by_station=std_offsets,
@@ -578,18 +623,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             depth_snapshots=depth_rows,
             nbp_rows=nbp_rows,
             ladder_by_key=ladder_by_key,
-            artefact=artefact,
+            calibration=batch_calibration,
             ladder_cfg=LadderEvConfig(),
-            bounds_provider=_point_bounds_provider,
+            bounds_provider=bounds_provider,
             fee_coefficient=0.0695,
             slippage_floor_prob=0.0,
             std_utc_offset_hours_by_station=std_offsets,
+            latitude_deg_by_station=latitude_deg_by_station,
             quantile_station_keys=quantile_station_keys,
         )
         report = diff_decision_keys(live, batch)
-        _write_report(args.output, _parity_report_payload(report, depth_rows))
+        no_depth_by_station = no_depth_census(depth_rows)
+        no_side_unexercisable_in_window = not any(no_depth_by_station.values())
+        payload = _parity_report_payload(report, depth_rows)
+        payload["no_side_unexercisable_in_window"] = no_side_unexercisable_in_window
+        guard_failures = vacuity_guard_failures(
+            report.side_kind_counts,
+            no_side_unexercisable_in_window=no_side_unexercisable_in_window,
+        )
+        payload["vacuity_guard_failures"] = list(guard_failures)
+        _write_report(args.output, payload)
+        if guard_failures:
+            return 1
     except (
-        BoundsArtefactPinMismatchError,
         CalibrationArtefactPinMismatchError,
         OSError,
         PostFreezeTapeRefusedError,

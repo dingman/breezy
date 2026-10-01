@@ -26,13 +26,14 @@ an otherwise-parseable payload also fails CLOSED with the same typed error,
 never an uncaught exception (plan §3 S2 item 8).
 
 ``CalibrationArtefact``/``load_calibration_artefact`` (the old flat,
-single-``EmosParams`` shape) are UNCHANGED and kept alongside: SL-13's own
+single-``EmosParams`` shape) are REMOVED (FQ-S4b, plan §3 S4b): SL-13's own
 live composition path (``composition.py``/``decision.py``/``strategy.py``)
-no longer uses them after this slice, but ``scripts/analysis/
-nbp_shadow_parity.py``/``nbp_shadow_parity_pure.py`` (S4, not yet migrated --
-plan §4: "S4b needs S2") still construct and pass them. Removing them here
-would break that out-of-scope script ahead of its own slice; S4b is the
-slice that migrates it onto ``LiveCalibration``.
+stopped using them at S2; ``scripts/analysis/nbp_shadow_parity.py``/
+``nbp_shadow_parity_pure.py`` (S4), their last callers, migrated onto
+``LiveCalibration``/``load_live_calibration`` in S4b -- the batch path
+(``nbp_shadow_parity_pure.py``) mirrors the per-version resolution
+INDEPENDENTLY (its own ``BatchCalibration``/``resolve_batch_calibration``,
+never importing this module's classes), per ruling §12 A-5(ii).
 """
 
 from __future__ import annotations
@@ -54,12 +55,10 @@ from breezy.strategy.ladder_ev.location_correction import (
 from breezy.strategy.ladder_ev.quantile_density import CdfMethod, EmosParams
 
 __all__ = [
-    "CalibrationArtefact",
     "CalibrationArtefactPinMismatchError",
     "CalibrationArtefactUnknownVersionError",
     "LiveCalibration",
     "ResolvedCalibration",
-    "load_calibration_artefact",
     "load_live_calibration",
 ]
 
@@ -85,55 +84,6 @@ class CalibrationArtefactUnknownVersionError(KeyError):
     version the artefact carries no parameters/draws for. The caller
     (``decision.evaluate``) turns this into ``Refuse("calibration_version_
     unavailable")`` -- never an uncaught exception on the live tick path."""
-
-
-@dataclass(frozen=True, slots=True)
-class CalibrationArtefact:
-    """A fitted, sha-pinned M2 recalibration -- never fitted here (plan §2.2).
-
-    Legacy flat shape (ONE ``EmosParams``, no per-version resolution, no
-    bootstrap draws). See the module docstring: kept only for
-    ``scripts/analysis/nbp_shadow_parity*.py`` (S4) until its own migration
-    slice (S4b).
-    """
-
-    sha256: str
-    cdf_method: CdfMethod
-    emos: EmosParams
-
-
-def load_calibration_artefact(path: str, *, expected_sha256: str) -> CalibrationArtefact:
-    """Read, hash-verify and parse the legacy flat artefact at ``path``.
-
-    Raises
-    ------
-    CalibrationArtefactPinMismatchError
-        If ``expected_sha256`` is the unpinned all-zero placeholder, or if
-        the file's own sha256 disagrees with it.
-    """
-    if expected_sha256 == _UNPINNED_SHA256:
-        raise CalibrationArtefactPinMismatchError(
-            "expected_sha256 is the unpinned all-zero placeholder; there is "
-            "no live refitting (plan §2.2, SL-12) -- a real manifest pin is required",
-        )
-    raw = Path(path).read_bytes()
-    actual_sha256 = hashlib.sha256(raw).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise CalibrationArtefactPinMismatchError(
-            f"calibration artefact at {path!r} hashes to {actual_sha256!r}, "
-            f"expected the manifest-pinned {expected_sha256!r}",
-        )
-    payload: dict[str, Any] = json.loads(raw)
-    emos_payload = payload["emos"]
-    return CalibrationArtefact(
-        sha256=actual_sha256,
-        cdf_method=CdfMethod(payload["cdf_method"]),
-        emos=EmosParams(
-            a=float(emos_payload["a"]),
-            gamma=float(emos_payload["gamma"]),
-            delta=float(emos_payload["delta"]),
-        ),
-    )
 
 
 @dataclass(frozen=True, slots=True)
