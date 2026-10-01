@@ -38,6 +38,7 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
 )
 from breezy.strategy.forecast_quantile_ladder.strategy import (
     ForecastQuantileLadderStrategy,
+    ShadowDecisionLogLine,
     SupportsExpiresAtNs,
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
@@ -87,6 +88,7 @@ def _build_registered(
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
     fee_verified: Callable[[], bool] | None = None,
+    shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
 ) -> ForecastQuantileLadderStrategy:
     quantile_actor = ForecastQuantileStateActor(
         stations=(STATION,), std_utc_offset_hours={STATION: -8.0},
@@ -112,6 +114,7 @@ def _build_registered(
         submit_veto=submit_veto,
         fee_verified=fee_verified,
         instrument_ids=tuple(str(i.id) for i in instruments),
+        shadow_decision_sink=shadow_decision_sink,
     )
     portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
     strategy.register(
@@ -192,6 +195,70 @@ def test_maybe_submit_with_a_clear_permit_submits_a_native_ioc_limit_order() -> 
     strategy.submit_order.assert_called_once()
     order = strategy.submit_order.call_args.args[0]
     assert str(order.instrument_id) == str(YES_ID)
+
+
+# ---------------------------------------------------------------------------
+# FQ-S11: `_maybe_submit`'s `try_submit` outcome is recorded through the SAME
+# `shadow_decision_sink` channel `evaluate_snapshot` already uses -- the ONE
+# localized hook the decision-funnel aggregator subscribes to.
+# ---------------------------------------------------------------------------
+
+
+def test_maybe_submit_with_no_permit_records_a_try_submit_refusal() -> None:
+    instrument = _instrument(YES_ID, lower_f=80, upper_f=81)
+    records: list[ShadowDecisionLogLine] = []
+    strategy = _build_registered(
+        config=_send_enabled_config(),
+        instruments=(instrument,),
+        shadow_decision_sink=records.append,
+    )
+    strategy.submit_order = MagicMock()
+
+    strategy._maybe_submit(_take(), limit_price=Decimal("0.30"))
+
+    outcomes = [r for r in records if r["kind"] == "TrySubmit"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["reason"] == "phase0_permit_absent"
+    strategy.submit_order.assert_not_called()
+
+
+def test_maybe_submit_honouring_the_family_halt_veto_records_the_reason() -> None:
+    instrument = _instrument(YES_ID, lower_f=80, upper_f=81)
+    records: list[ShadowDecisionLogLine] = []
+    strategy = _build_registered(
+        config=_send_enabled_config(),
+        instruments=(instrument,),
+        order_submission_permit=_open_permit(),
+        submit_veto=lambda: "family_halt",
+        shadow_decision_sink=records.append,
+    )
+    strategy.submit_order = MagicMock()
+
+    strategy._maybe_submit(_take(), limit_price=Decimal("0.30"))
+
+    outcomes = [r for r in records if r["kind"] == "TrySubmit"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["reason"] == "family_halt"
+    strategy.submit_order.assert_not_called()
+
+
+def test_maybe_submit_with_a_clear_permit_records_a_submitted_outcome() -> None:
+    instrument = _instrument(YES_ID, lower_f=80, upper_f=81)
+    records: list[ShadowDecisionLogLine] = []
+    strategy = _build_registered(
+        config=_send_enabled_config(),
+        instruments=(instrument,),
+        order_submission_permit=_open_permit(),
+        shadow_decision_sink=records.append,
+    )
+    strategy.submit_order = MagicMock()
+
+    strategy._maybe_submit(_take(), limit_price=Decimal("0.30"))
+
+    outcomes = [r for r in records if r["kind"] == "TrySubmit"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["reason"] == "submitted"
+    strategy.submit_order.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

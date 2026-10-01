@@ -454,6 +454,7 @@ class ForecastQuantileLadderStrategy(Strategy):
             )
             return
         refusal = self.try_submit(take)
+        self._emit_decision_outcome(take, refusal)
         if refusal is not None:
             self.log.info(
                 "TAKE recorded, no submit "
@@ -475,6 +476,27 @@ class ForecastQuantileLadderStrategy(Strategy):
             post_only=False,
         )
         self.submit_order(order)
+
+    def _emit_decision_outcome(self, take: Take, refusal: str | None) -> None:
+        """FQ-S11: counts the ``try_submit`` guard outcome through the SAME
+        ``shadow_decision_sink`` channel :meth:`evaluate_snapshot` already
+        uses -- a ``Take`` that clears every guard is recorded as
+        ``kind="TrySubmit" reason="submitted"``; a refusal is recorded
+        verbatim under its own reason (``phase0_permit_absent``,
+        ``family_halt``, ``fee_unverified``, or any future veto reason).
+        Never a second sink wiring: the one aggregator the composition root
+        wires into ``shadow_decision_sink`` stays the ONE subscriber for
+        both decision kinds and submit outcomes (plan §3 S11)."""
+        self._emit_shadow_decision({
+            "now_ns": self.clock.timestamp_ns(),
+            "station": take.station,
+            "climate_day": take.climate_day,
+            "rung_id": take.rung_id,
+            "side": take.side,
+            "instrument_id": take.instrument_id,
+            "kind": "TrySubmit",
+            "reason": refusal if refusal is not None else "submitted",
+        })
 
     # -- SL-13 item 2: the live tick loop -----------------------------------
 

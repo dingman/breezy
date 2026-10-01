@@ -41,6 +41,7 @@ from breezy.strategy.forecast_quantile_ladder.artefact_bounds import (
 )
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_calibration_artefact
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
+from breezy.strategy.forecast_quantile_ladder.decision_funnel import FqDecisionCounts
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import SupportsQuantileLatch
 from breezy.strategy.forecast_quantile_ladder.strategy import (
     ForecastQuantileLadderStrategy,
@@ -149,6 +150,7 @@ def build_forecast_quantile_ladder_strategies(
     fee_verified: Callable[[], bool] | None = None,
     required_fee_coefficient: float | None = None,
     now_ns_fn: Callable[[], int] = time.time_ns,
+    decision_counts: FqDecisionCounts | None = None,
 ) -> tuple[tuple[ForecastQuantileLadderStrategy, ...], ForecastQuantileStateActor]:
     """One ``ForecastQuantileLadderStrategy`` per supported station.
 
@@ -164,6 +166,15 @@ def build_forecast_quantile_ladder_strategies(
     ``order_submission_permit`` HERE, before any instrument resolution or
     strategy construction (reuses ``Phase0PermitForbiddenError``, never a
     second error type for the same invariant).
+
+    FQ-S11: ``decision_counts``, when given, is wired as EVERY composed
+    strategy's ``shadow_decision_sink`` -- ONE shared in-process
+    :class:`~breezy.strategy.forecast_quantile_ladder.decision_funnel.FqDecisionCounts`
+    aggregator, never one per station. The caller owns the
+    :class:`~breezy.strategy.forecast_quantile_ladder.decision_funnel.FqDecisionFunnelActor`
+    that reads it (never built here -- composing a Nautilus ``Actor`` is a
+    caller/``app.trade`` concern, mirroring how ``quantile_actor`` itself is
+    returned rather than registered by this function).
     """
     if phase0_permit_guard and order_submission_permit is not None:
         raise Phase0PermitForbiddenError(
@@ -257,6 +268,9 @@ def build_forecast_quantile_ladder_strategies(
                 fee_verified=fee_verified,
                 instrument_ids=tuple(str(iid) for iid in instrument_ids),
                 quantile_station_keys={station: icao_by_station[station]},
+                shadow_decision_sink=(
+                    decision_counts.record_line if decision_counts is not None else None
+                ),
             ),
         )
     return tuple(strategies), quantile_actor

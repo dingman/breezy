@@ -91,6 +91,10 @@ from breezy.strategy.forecast_quantile_ladder.composition import (
     NoTradableForecastInstrumentsError,
     build_forecast_quantile_ladder_strategies,
 )
+from breezy.strategy.forecast_quantile_ladder.decision_funnel import (
+    FqDecisionCounts,
+    FqDecisionFunnelActor,
+)
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
     PersistentQuantileLadderLatch,
@@ -699,6 +703,20 @@ def run(
                 nbm_actor = NbmQuantileActor(
                     NbmQuantileActorConfig(station_icaos=station_icaos),
                 )
+                # FQ-S11: ONE shared in-process decision-funnel aggregator for
+                # this boot, flushed every 15 minutes (plus once at on_stop) to
+                # the SAME sibling `decisions/` directory
+                # `current_rung_hold.composition._decisions_dir` already uses
+                # -- a sibling of the quote-tape catalog root, never nested
+                # under it. Built here (never inside `build_forecast_
+                # quantile_ladder_strategies`, which returns constructed
+                # objects only, same convention as `quantile_actor`) and
+                # registered via `extra_actors` below.
+                fq_decision_counts = FqDecisionCounts()
+                fq_funnel_actor = FqDecisionFunnelActor(
+                    output_dir=catalog_root.parent / "decisions",
+                    counts=fq_decision_counts,
+                )
                 try:
                     forecast_strategies, quantile_actor = build_forecast_quantile_ladder_strategies(
                         catalog_root=catalog_root,
@@ -717,6 +735,7 @@ def run(
                         phase0_permit_guard=sending_permit is None,
                         submit_veto=submit_veto,
                         required_fee_coefficient=float(manifest.taker_fee_coefficient),
+                        decision_counts=fq_decision_counts,
                     )
                 except (
                     NoTradableForecastInstrumentsError,
@@ -740,7 +759,7 @@ def run(
                         f"{settings.sending_family_id}: {type(exc).__name__}: {exc}"
                     ) from exc
                 strategies.extend(forecast_strategies)
-                extra_actors.extend([quantile_actor, nbm_actor])
+                extra_actors.extend([quantile_actor, nbm_actor, fq_funnel_actor])
             elif manifest.composition_kind == "forecast_ladder":
                 # WP-14 has not landed: the strategy this composition_kind
                 # names does not exist yet. Refuse to boot rather than
