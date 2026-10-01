@@ -182,7 +182,12 @@ def _book_side(
 
 
 def _depth_frame(
-    instrument: BinaryOption, *, ts_ns: int, ask_price: float, sequence: int,
+    instrument: BinaryOption,
+    *,
+    ts_ns: int,
+    ask_price: float,
+    sequence: int,
+    ts_init: int | None = None,
 ) -> OrderBookDepth10:
     bids, bid_counts = _book_side((("0.05", 50),), OrderSide.BUY, instrument)
     asks, ask_counts = _book_side(((f"{ask_price:.2f}", 25),), OrderSide.SELL, instrument)
@@ -195,7 +200,7 @@ def _depth_frame(
         flags=0,
         sequence=sequence,
         ts_event=ts_ns,
-        ts_init=ts_ns,
+        ts_init=ts_ns if ts_init is None else ts_init,
     )
 
 
@@ -351,6 +356,75 @@ def test_the_live_path_uses_the_strategy_depth_handler(
 
     assert calls == 1
     assert keys[0].kind == "Take"
+
+
+def test_a_later_ts_init_does_not_pull_a_pre_window_tick_inside_the_permit() -> None:
+    """Spec check (4) is the permit at the decision instant (``ts_event``).
+
+    Nautilus advances the backtest clock to ``ts_init`` before the depth
+    handler. The harness permit is one-sided on that clock and, outside the
+    window, returns the clock time itself. On this tape ``ts_init`` is always
+    strictly after ``ts_event``, so ``ts_event < ts_init`` reads as covered
+    and the live leg scores a Refuse or Take where the batch leg — and
+    ``decision.evaluate`` — return ``NotExecutable``.
+    """
+    instrument = _instrument()
+    pre_window_ts = _ns(2026, 9, 1, 16, 0)  # before LAUNCH_UTC (16:50)
+    skews = (
+        pre_window_ts + 60 * 1_000_000_000,  # still before the open
+        DEPTH_TS_NS,  # clock has crossed into the window
+    )
+    for sequence, ts_init in enumerate(skews):
+        depth = _depth_frame(
+            instrument,
+            ts_ns=pre_window_ts,
+            ask_price=0.10,
+            sequence=sequence,
+            ts_init=ts_init,
+        )
+        row = DepthSnapshotRow(
+            instrument_id=str(instrument.id),
+            ts_ns=pre_window_ts,
+            best_ask_price=0.10,
+            best_ask_size=25.0,
+            station=STATION,
+            climate_day=CLIMATE_DAY,
+            rung_id="80_81",
+            side="yes",
+        )
+
+        live_keys = _run_live([depth])
+        batch_keys = _run_batch([row])
+        report = diff_decision_keys(live_keys, batch_keys)
+
+        assert live_keys[0].kind == "NotExecutable"
+        assert live_keys[0].reason == "outside_permit_window"
+        assert live_keys[0].ts_ns == pre_window_ts
+        assert report.n_mismatches == 0, (ts_init, report.to_counts_dict(), live_keys, batch_keys)
+
+
+def test_an_in_window_tick_stays_covered_when_ts_init_is_past_the_window() -> None:
+    """A late ``ts_init`` must not push an in-window ``ts_event`` out either."""
+    instrument = _instrument()
+    past_window = _ns(2026, 9, 2, 3, 0)  # after the 02:50Z close
+    depth = _depth_frame(
+        instrument, ts_ns=DEPTH_TS_NS, ask_price=0.10, sequence=0, ts_init=past_window,
+    )
+    row = DepthSnapshotRow(
+        instrument_id=str(instrument.id),
+        ts_ns=DEPTH_TS_NS,
+        best_ask_price=0.10,
+        best_ask_size=25.0,
+        station=STATION,
+        climate_day=CLIMATE_DAY,
+        rung_id="80_81",
+        side="yes",
+    )
+
+    report = diff_decision_keys(_run_live([depth]), _run_batch([row]))
+
+    assert report.n_mismatches == 0, report.to_counts_dict()
+    assert report.n_live == 1
 
 
 def test_a_pre_window_tick_and_an_in_window_tick_get_different_outcomes() -> None:
