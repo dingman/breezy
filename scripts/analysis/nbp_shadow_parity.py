@@ -25,7 +25,9 @@ module imports no settlement, CLI-label, or P&L module.
 stub shape, while the actual tick evaluation is now driven by the strategy's
 real ``on_order_book_depth`` handler. Review item 2 (SL-13p2): the permit's
 ``now_ns`` reader is bound to the strategy's own native engine clock (never a
-value captured once before the run) -- see :class:`_NowBox`.
+value captured once before the run) -- see :class:`_NowBox`. That clock is
+``ts_init``; :func:`_depth_clocked_at_decision_instant` stamps it onto
+``ts_event`` so the one-sided check is the decision instant (spec check 4).
 """
 
 from __future__ import annotations
@@ -130,15 +132,18 @@ class _NowBox:
     covered by a window computed from the LAST tick in the run.
 
     ``BacktestEngine`` advances a strategy's own ``self.clock`` (a
-    ``TestClock``) to match each event's ``ts_event`` before dispatching
-    that event to the strategy's handler -- the SAME clock
-    ``ForecastQuantileLadderStrategy`` (and every other strategy in this
-    codebase) reads via ``self.clock.timestamp_ns()``. Reading it HERE, at
+    ``TestClock``) to the data's ``ts_init`` before dispatching the handler
+    (``engine.pyx`` ``_advance_time(data.ts_init)``). The strategy then
+    evaluates at ``ts_event``. Those differ on the captured tape, and the
+    one-sided permit stub returns this clock time when it is outside the
+    window, so ``ts_event < ts_init`` false-covers a pre-window tick.
+    :func:`_depth_clocked_at_decision_instant` stamps ``ts_init`` onto
+    ``ts_event`` before ``engine.run()``, which makes this clock the
+    decision instant the stub was written against. Reading it HERE, at
     ``expires_at_ns`` access time (called from inside
     ``evaluate_snapshot`` -> ``_permit_covers``, synchronously within that
-    SAME tick's handler call), is therefore tick-local by construction: it
-    always reads the CURRENTLY-processing event's own timestamp, never a
-    value fixed ahead of the run.
+    SAME tick's handler call), is therefore tick-local: the CURRENTLY
+    processing event's decision instant, never a value fixed ahead of the run.
     """
 
     __slots__ = ("_clock",)
@@ -176,6 +181,30 @@ class _NominalWindowPermit:
 def _assert_supports_expires_at_ns(permit: SupportsExpiresAtNs) -> None:
     """Fails loudly, at construction, if the Protocol shape ever drifts."""
     _ = permit.expires_at_ns
+
+
+def _depth_clocked_at_decision_instant(depth: OrderBookDepth10) -> OrderBookDepth10:
+    """Stamp ``ts_init`` onto ``ts_event`` so the engine clock is the decision instant.
+
+    Nautilus clocks to ``ts_init``. ``_permit_covers`` compares ``ts_event``
+    with a stub expiry read off that clock, and outside the window the stub
+    returns the clock time. ``ts_event < ts_init`` then reads as covered.
+    Spec check (4) is ``NotExecutable`` at the decision instant. The shadow
+    key stays ``ts_event``. Same object when the timestamps already agree.
+    """
+    if depth.ts_init == depth.ts_event:
+        return depth
+    return OrderBookDepth10(
+        instrument_id=depth.instrument_id,
+        bids=depth.bids,
+        asks=depth.asks,
+        bid_counts=depth.bid_counts,
+        ask_counts=depth.ask_counts,
+        flags=depth.flags,
+        sequence=depth.sequence,
+        ts_event=depth.ts_event,
+        ts_init=depth.ts_event,
+    )
 
 
 def _best_ask_price(asks: Sequence[BookOrder]) -> float | None:
@@ -261,6 +290,9 @@ def run_live_parity(
     observable without reaching ``submit_order``.
     """
     instrument_ids = [str(instrument.id) for instrument in instruments]
+    market_data = [
+        _depth_clocked_at_decision_instant(depth) for depth in market_data
+    ]
     weather_data = [
         CustomData(data_type=nbm_forecast_point_data_type(), data=point)
         for point in forecast_points
@@ -801,6 +833,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if not std_offsets:
                 continue
+            # Free the ts_init-stamped originals before the engine retains
+            # the decision-instant copies. See ``_depth_clocked_at_decision_instant``.
+            market_data = tuple(
+                _depth_clocked_at_decision_instant(depth) for depth in market_data
+            )
+            gc.collect()
             live = run_live_parity(
                 instruments=instruments,
                 market_data=market_data,
