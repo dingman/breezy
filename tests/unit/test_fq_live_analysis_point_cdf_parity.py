@@ -43,10 +43,13 @@ import pytest
 
 from breezy.analysis.nbp_calibration import (
     CalibrationFit,
+    CorrectionFitRow,
+    CorrectionSelection,
     HierarchicalEmosResult,
     KappaSelection,
     NbpCalibrationArtefact,
     VersionEstimate,
+    apply_selected_correction,
 )
 from breezy.registry.sites import default_registry
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
@@ -91,7 +94,11 @@ _PERCENTILES_BY_STATION: dict[str, Percentiles] = {
 _CLIMATE_DAY = dt.date(2026, 9, 15)
 
 
-def _write_live_artefact(tmp_path: Path) -> tuple[str, str]:
+def _write_live_artefact(
+    tmp_path: Path,
+    *,
+    linear_coefficients: tuple[float, float] = _LINEAR_COEFFICIENTS,
+) -> tuple[str, str]:
     artefact = NbpCalibrationArtefact(
         schema_version=1,
         cdf_method=CdfMethod.NORMAL.value,
@@ -109,7 +116,7 @@ def _write_live_artefact(tmp_path: Path) -> tuple[str, str]:
         n_min=30,
         sigma_d=1.0,
         rung_probability_bounds={},
-        correction_linear_coefficients=_LINEAR_COEFFICIENTS,
+        correction_linear_coefficients=linear_coefficients,
         fit_status="OK",
     )
     raw = json.dumps(artefact.to_json_dict()).encode("utf-8")
@@ -202,3 +209,89 @@ def test_resolved_calibration_point_is_the_unadjusted_mean_plus_correction() -> 
         draws_by_version={},
     )
     assert hierarchical.shrunk_by_version["v5.0"].a == pytest.approx(a)
+
+
+#: Rounded registered pair from
+#: ``tests/strategy/forecast_quantile_ladder/test_calibration_artefact.py``
+#: (``_VALID_PAYLOAD["correction_linear_coefficients"]``). Used when
+#: ``deploy/families/artefacts/`` has no calibration JSON carrying the key.
+_FIXTURE_LINEAR_COEFFICIENTS: tuple[float, float] = (-0.39835, 4.28148)
+
+
+def _registered_linear_coefficients() -> tuple[float, float]:
+    root = Path(__file__).resolve().parents[2] / "deploy" / "families" / "artefacts"
+    if root.is_dir():
+        for path in sorted(root.glob("*.json")):
+            loaded: object = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                continue
+            raw = loaded.get("correction_linear_coefficients")
+            if (
+                isinstance(raw, list)
+                and len(raw) == 2
+                and all(
+                    isinstance(item, (int, float)) and not isinstance(item, bool) for item in raw
+                )
+            ):
+                return (float(raw[0]), float(raw[1]))
+    return _FIXTURE_LINEAR_COEFFICIENTS
+
+
+def test_registered_coefficients_match_when_analysis_applies_its_own_correction(
+    tmp_path: Path,
+) -> None:
+    """Analysis correction comes from ``apply_selected_correction``, not the live value.
+
+    Coefficients are the registered linear pair (about ``[-0.39835, 4.28148]``),
+    read from ``deploy/families/artefacts/`` when a file carries them and
+    otherwise from the calibration-artefact fixture.
+    """
+    coefficients = _registered_linear_coefficients()
+    assert coefficients[0] == pytest.approx(-0.39835, abs=5e-4)
+    assert coefficients[1] == pytest.approx(4.28148, abs=5e-4)
+
+    station = "LAX"
+    version = "v5.0"
+    artefact_path, artefact_sha = _write_live_artefact(
+        tmp_path, linear_coefficients=coefficients,
+    )
+    percentiles = _PERCENTILES_BY_STATION[station]
+    latitude_deg = default_registry().enrichment_coordinates(_VENUE, station).lat
+    resolved = load_live_calibration(artefact_path, expected_sha256=artefact_sha).resolve(
+        version, latitude_deg=latitude_deg, climate_day=_CLIMATE_DAY,
+    )
+    live_probabilities = rung_probabilities(
+        apply_emos(
+            build_cdf(resolved.cdf_method, percentiles), percentiles, resolved.point,
+        ),
+        _LADDER,
+    )
+
+    selection = CorrectionSelection(
+        form=CorrectionForm.LINEAR_DAYLENGTH,
+        linear_coefficients=coefficients,
+    )
+    # residual_f cancels: correction = residual - (residual - prediction).
+    correction_row = CorrectionFitRow(
+        split="validate",
+        climate_day=_CLIMATE_DAY,
+        residual_f=1.25,
+        day_length_hours=daylight_hours(latitude_deg, _CLIMATE_DAY),
+        scale_f=1.0,
+    )
+    analysis_correction_f = correction_row.residual_f - apply_selected_correction(
+        selection, residual_f=correction_row.residual_f, row=correction_row,
+    )
+    analysis_probabilities = calibrated_m2_rung_probabilities(
+        percentiles=percentiles,
+        version=version,
+        calibration_fit=_calibration_fit_for(version),
+        rungs=_LADDER,
+        cdf_method=resolved.cdf_method,
+        correction_f=analysis_correction_f,
+    )
+
+    assert analysis_correction_f == pytest.approx(resolved.correction_f, abs=1e-12)
+    assert set(live_probabilities) == set(analysis_probabilities)
+    for rung_id, live_p in live_probabilities.items():
+        assert live_p == pytest.approx(analysis_probabilities[rung_id], abs=1e-12)

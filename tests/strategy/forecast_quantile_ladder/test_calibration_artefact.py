@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import fields
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
     CalibrationArtefactPinMismatchError,
     CalibrationArtefactUnknownVersionError,
     LiveCalibration,
+    ResolvedCalibration,
     load_live_calibration,
 )
 from breezy.strategy.ladder_ev.location_correction import CorrectionForm, daylight_hours
@@ -298,3 +300,10 @@ def test_resolve_applies_the_same_correction_to_point_and_every_draw(tmp_path: P
         assert resolved_draw.a == pytest.approx(raw_draw.a + expected_c)
         assert resolved_draw.gamma == pytest.approx(raw_draw.gamma)
         assert resolved_draw.delta == pytest.approx(raw_draw.delta)
+
+
+def test_live_and_resolved_calibration_name_no_haircut_field() -> None:
+    """Bounds are a bootstrap percentile interval. No field may reintroduce a haircut."""
+    for cls in (LiveCalibration, ResolvedCalibration):
+        named = [item.name for item in fields(cls) if "haircut" in item.name]
+        assert named == []

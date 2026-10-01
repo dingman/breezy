@@ -48,7 +48,7 @@ class ForecastQuantileLadderConfig(StrategyConfig, frozen=True):
     calibration_artefact_path : str
         Filesystem path to the sha-pinned calibration artefact (json: EMOS
         params + rung-probability haircuts). Read by
-        ``calibration_artefact.load_calibration_artefact``, never here.
+        ``calibration_artefact.load_live_calibration``, never here.
     calibration_artefact_sha256 : str
         The manifest-pinned artefact digest (64 lowercase hex, not
         all-zero). Checked here at construction (format + non-placeholder);
