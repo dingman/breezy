@@ -68,6 +68,7 @@ from breezy.strategy.forecast_quantile_ladder.decision import (
     evaluate,
 )
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
+from breezy.strategy.forecast_quantile_ladder.margin import hours_to_settlement
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import SupportsQuantileLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
@@ -81,7 +82,6 @@ __all__ = ["ForecastQuantileLadderStrategy", "ShadowDecisionLogLine", "SupportsE
 
 _CLASS_NAME: str = "ForecastQuantileLadderStrategy"
 _VENUE: Final[str] = "polymarket_us"
-_NS_PER_HOUR: Final[int] = 3_600_000_000_000
 
 
 @runtime_checkable
@@ -187,11 +187,10 @@ class ForecastQuantileLadderStrategy(Strategy):
         #: into the (station, day, rung, side) key ``evaluate_snapshot`` wants.
         self._instrument_context: dict[str, tuple[str, str, str, Literal["yes", "no"]]] = {}
         #: ``(station, climate_day_key) -> the YES instrument's own native
-        #: ``expiration_ns``, populated at :meth:`on_start`. The SAME
-        #: settlement-deadline value the tick handlers use to compute
-        #: ``h_hours`` -- never a wall-clock guess (mirrors
-        #: ``ForecastSnapshot``'s own "the same value the settlement halt
-        #: reads" convention, ``weather_common/models.py``).
+        #: ``expiration_ns``, populated at :meth:`on_start` for observability.
+        #: Not the settlement instant: ``h_hours`` is LST midnight ending the
+        #: climate day (``margin.hours_to_settlement``). A 05:00Z listing
+        #: ``endDate`` stays here and is not read by the tick path.
         self.rung_expiration_ns: dict[tuple[str, str], int] = {}
         #: ``station -> std_utc_offset_hours``, populated once at
         #: :meth:`on_start` (mirrors ``ContinuousRungHoldStrategy``'s own
@@ -214,12 +213,12 @@ class ForecastQuantileLadderStrategy(Strategy):
         SL-13 item 2: also subscribes each rung's NO-leg id (its OWN book,
         never derived from the YES side -- ruling A-6), populates the
         instrument -> (station, day, rung, side) reverse index
-        :attr:`_instrument_context` for both legs, the rung's settlement
-        deadline (:attr:`rung_expiration_ns`, off the YES instrument's own
-        ``expiration_ns``), and each configured station's
-        ``std_utc_offset_hours`` -- everything :meth:`on_order_book_depth`/
-        :meth:`on_quote_tick` need to call :meth:`evaluate_snapshot` without
-        a second catalog or registry read per tick.
+        :attr:`_instrument_context` for both legs, the rung's listing
+        ``expiration_ns`` (:attr:`rung_expiration_ns`, observability only),
+        and each configured station's ``std_utc_offset_hours``. The offset
+        is what :meth:`on_order_book_depth`/:meth:`on_quote_tick` need to
+        call :meth:`evaluate_snapshot` without a second registry read per
+        tick; hours to settlement are the LST midnight of the climate day.
 
         Never calls :meth:`_maybe_submit` or ``self.submit_order`` directly
         -- only :meth:`on_order_book_depth`/:meth:`on_quote_tick` (via
@@ -561,20 +560,21 @@ class ForecastQuantileLadderStrategy(Strategy):
         if not ladder:
             self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_ladder")
             return
-        expiration_ns = self.rung_expiration_ns.get((station, climate_day_key))
-        if expiration_ns is None:
-            self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_expiration")
-            return
         std_utc_offset_hours = self._std_utc_offset_hours.get(station)
         if std_utc_offset_hours is None:
             self.log.info(f"{_CLASS_NAME}: skip {iid} reason=no_std_offset")
             return
-        h_hours = max(0.0, (expiration_ns - ts_event) / _NS_PER_HOUR)
+        climate_day = date.fromisoformat(climate_day_key)
+        h_hours = hours_to_settlement(
+            now_ns=ts_event,
+            climate_day=climate_day,
+            std_utc_offset_hours=std_utc_offset_hours,
+        )
         decision = self.evaluate_snapshot(
             now_ns=ts_event,
             std_utc_offset_hours=std_utc_offset_hours,
             station=station,
-            climate_day=date.fromisoformat(climate_day_key),
+            climate_day=climate_day,
             ladder=ladder,
             rung_id=rung_id,
             side=side,
