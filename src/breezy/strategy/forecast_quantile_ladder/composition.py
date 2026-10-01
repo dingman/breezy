@@ -35,11 +35,8 @@ from breezy.ingest.gaps import local_standard_date
 from breezy.registry.sites import default_registry
 from breezy.strategy.current_rung_hold.composition import resolve_station_instrument_ids
 from breezy.strategy.current_rung_hold.continuous_strategy import Phase0PermitForbiddenError
-from breezy.strategy.forecast_quantile_ladder.artefact_bounds import (
-    ArtefactBoundsProvider,
-    load_bounds_artefact_draws,
-)
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_calibration_artefact
+from breezy.strategy.forecast_quantile_ladder.artefact_bounds import ArtefactBoundsProvider
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import SupportsQuantileLatch
 from breezy.strategy.forecast_quantile_ladder.strategy import (
@@ -47,9 +44,7 @@ from breezy.strategy.forecast_quantile_ladder.strategy import (
     SupportsExpiresAtNs,
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
-from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
-from breezy.strategy.ladder_ev.quantile_density import Percentiles
 
 __all__ = [
     "NoTradableForecastInstrumentsError",
@@ -117,36 +112,6 @@ def _d_plus_1_climate_days(stations: Iterable[str], *, now_ns: int) -> dict[str,
     }
 
 
-def _percentiles_reader(
-    quantile_actor: ForecastQuantileStateActor,
-    station: str,
-    now_ns_fn: Callable[[], int],
-) -> Callable[[], Percentiles | None]:
-    """Independently reads the SAME actor/station ``evaluate_snapshot``
-    itself reads -- see ``artefact_bounds``'s module docstring for why the
-    ``BoundsProvider`` Protocol needs this closure rather than the ``cdf``
-    it is actually called with.
-    """
-
-    def _read() -> Percentiles | None:
-        vector: ForecastQuantileVector | None = quantile_actor.state_for(station).value_at(
-            now_ns_fn(),
-        )
-        if vector is None:
-            return None
-        return Percentiles(
-            q10=vector.q10,
-            q25=vector.q25,
-            q50=vector.q50,
-            q75=vector.q75,
-            q90=vector.q90,
-            mean=vector.mean,
-            sd=vector.sd,
-        )
-
-    return _read
-
-
 def build_forecast_quantile_ladder_strategies(
     *,
     catalog_root: Path,
@@ -154,8 +119,6 @@ def build_forecast_quantile_ladder_strategies(
     latch: SupportsQuantileLatch,
     calibration_artefact_path: str,
     calibration_artefact_sha256: str,
-    bounds_artefact_path: str,
-    bounds_artefact_sha256: str,
     ladder_cfg: LadderEvConfig | None = None,
     order_submission_permit: SupportsExpiresAtNs | None = None,
     phase0_permit_guard: bool = True,
@@ -207,12 +170,10 @@ def build_forecast_quantile_ladder_strategies(
     # boot crash. `NoTradableForecastInstrumentsError` is kept importable
     # (see its own docstring) but is never raised from here.
 
-    artefact = load_calibration_artefact(
+    live_calibration = load_live_calibration(
         calibration_artefact_path, expected_sha256=calibration_artefact_sha256,
     )
-    bounds_draws = load_bounds_artefact_draws(
-        bounds_artefact_path, expected_sha256=bounds_artefact_sha256,
-    )
+    bounds_provider = ArtefactBoundsProvider(cdf_method=live_calibration.cdf_method)
     resolved_ladder_cfg = ladder_cfg if ladder_cfg is not None else LadderEvConfig()
 
     # SL-13e fix: `ForecastQuantileStateActor` must be keyed by the SAME
@@ -223,10 +184,9 @@ def build_forecast_quantile_ladder_strategies(
     # uses. Built here, at the ONE composition boundary that owns both
     # vocabularies, via the existing registry ICAO<->city mapping -- no
     # second mapping table. Every reader of this ONE shared actor instance
-    # (the `_percentiles_reader` closure below, and each composed strategy's
-    # own `evaluate_snapshot` read, via `quantile_station_keys`) is handed
-    # the SAME translated ICAO key so `on_data`'s `data.station` (ICAO) can
-    # ever match a served station.
+    # (each composed strategy's own `evaluate_snapshot` read, via
+    # `quantile_station_keys`) is handed the SAME translated ICAO key so
+    # `on_data`'s `data.station` (ICAO) can ever match a served station.
     registry = default_registry()
     icao_by_station = {
         station: registry.settlement_site(_VENUE, station).icao for station in today_by_station
@@ -271,16 +231,11 @@ def build_forecast_quantile_ladder_strategies(
         if required_fee_coefficient is not None:
             config_kwargs["required_fee_coefficient"] = required_fee_coefficient
         config = ForecastQuantileLadderConfig(**config_kwargs)  # type: ignore[arg-type]
-        bounds_provider = ArtefactBoundsProvider(
-            cdf_method=bounds_draws.cdf_method,
-            draws=bounds_draws.draws,
-            percentiles_fn=_percentiles_reader(quantile_actor, icao_by_station[station], now_ns_fn),
-        )
         strategies.append(
             ForecastQuantileLadderStrategy(
                 config,
                 quantile_actor=quantile_actor,
-                artefact=artefact,
+                calibration=live_calibration,
                 ladder_cfg=resolved_ladder_cfg,
                 bounds_provider=bounds_provider,
                 latch=latch,

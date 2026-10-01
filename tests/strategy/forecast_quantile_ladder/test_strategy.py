@@ -15,7 +15,7 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
 from breezy.strategy.forecast_quantile_ladder.decision import NotExecutable, SidedAsk, Take
 from breezy.strategy.forecast_quantile_ladder.strategy import (
@@ -25,10 +25,13 @@ from breezy.strategy.forecast_quantile_ladder.strategy import (
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
+from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
+    Percentiles,
     Rung,
+    build_cdf,
     rung_probabilities,
 )
 
@@ -54,17 +57,24 @@ def _config() -> ForecastQuantileLadderConfig:
     )
 
 
-def _artefact() -> CalibrationArtefact:
-    return CalibrationArtefact(
+def _artefact() -> LiveCalibration:
+    identity = EmosParams(a=0.0, gamma=0.0, delta=1.0)
+    return LiveCalibration(
         sha256="a" * 64,
         cdf_method=CdfMethod.NORMAL,
-        emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
+        correction_form=CorrectionForm.NONE,
+        linear_coefficients=None,
+        month_offsets={},
+        point_by_version={"": identity},
+        draws_by_version={"": (identity,)},
     )
 
 
 def _bounds_provider(
-    *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str
+    *, percentiles: Percentiles, draws: Sequence[EmosParams], ladder: Sequence[Rung], rung_id: str
 ) -> RungBounds:
+    del draws
+    cdf = build_cdf(CdfMethod.NORMAL, percentiles)
     p_hat = rung_probabilities(cdf, ladder)[rung_id]
     return RungBounds(p_hat=p_hat, p_lower=max(0.0, p_hat - 0.03), p_upper=min(1.0, p_hat + 0.03))
 
@@ -91,7 +101,7 @@ def _build(
     strategy = ForecastQuantileLadderStrategy(
         _config(),
         quantile_actor=quantile_actor,
-        artefact=_artefact(),
+        calibration=_artefact(),
         ladder_cfg=LadderEvConfig(),
         bounds_provider=_bounds_provider,
         order_submission_permit=order_submission_permit,

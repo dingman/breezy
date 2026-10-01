@@ -87,7 +87,6 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
 )
-from breezy.strategy.forecast_quantile_ladder.artefact_bounds import BoundsArtefactPinMismatchError
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
     CalibrationArtefactPinMismatchError,
 )
@@ -794,14 +793,13 @@ def run(
                         today_by_station=today_by_station,
                         latch=PersistentQuantileLadderLatch(forecast_halt_latch),
                         # A single sha-pinned density artefact serves both the
-                        # point-calibrated CDF (`calibration_artefact.py`) and
-                        # the bootstrap-draw bounds (`artefact_bounds.py`) --
-                        # one manifest pin, `density_artefact_path`/
-                        # `density_artefact_sha256`, never two.
+                        # per-version point calibration and the per-version
+                        # bootstrap-draw bounds -- ONE loader
+                        # (`calibration_artefact.load_live_calibration`), one
+                        # manifest pin, `density_artefact_path`/
+                        # `density_artefact_sha256` (SL-13 S2).
                         calibration_artefact_path=str(manifest.density_artefact_path),
                         calibration_artefact_sha256=manifest.density_artefact_sha256,
-                        bounds_artefact_path=str(manifest.density_artefact_path),
-                        bounds_artefact_sha256=manifest.density_artefact_sha256,
                         order_submission_permit=sending_permit,
                         phase0_permit_guard=sending_permit is None,
                         submit_veto=submit_veto,
@@ -811,17 +809,20 @@ def run(
                     )
                 except (
                     NoTradableForecastInstrumentsError,
-                    # Review item 1 (SL-13 fix-first): every artefact-load
-                    # failure mode -- a bad sha pin (either loader), malformed
+                    # Review item 1 (SL-13 fix-first; SL-13 S2 item 8): every
+                    # artefact-load failure mode -- a bad sha pin, malformed
                     # JSON, or a schema-missing key/wrong-shaped value in an
-                    # otherwise-parseable payload -- must fail this ONE
+                    # otherwise-parseable payload (including an unknown or
+                    # 3-element bootstrap-draw shape) -- must fail this ONE
                     # composition_kind closed, the same clean EXIT_CONFIG_ERROR
                     # path `NoTradableForecastInstrumentsError` already uses,
-                    # never an unhandled crash. A missing artefact FILE
-                    # (`FileNotFoundError`) is already an `OSError`, already in
-                    # the outer `except` tuple below -- not repeated here.
+                    # never an unhandled crash. `load_live_calibration` itself
+                    # already wraps every malformed-payload condition into
+                    # `CalibrationArtefactPinMismatchError` -- a missing
+                    # artefact FILE (`FileNotFoundError`) is already an
+                    # `OSError`, already in the outer `except` tuple below --
+                    # not repeated here.
                     CalibrationArtefactPinMismatchError,
-                    BoundsArtefactPinMismatchError,
                     json.JSONDecodeError,
                     KeyError,
                     TypeError,

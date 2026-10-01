@@ -203,6 +203,10 @@ class ForecastQuantileStateActor(Actor):
             available_at_ns=data.available_at_ns,
             cycle_runtime_ns=data.cycle_runtime_ns,
             climate_day=climate_day,
+            # SL-13 S2 / plan D2: "header wins" -- the SAME era convention
+            # `scripts/analysis/nbp_backfill.py` uses, never re-derived from
+            # the cycle's own UTC date.
+            model_version=f"v{data.model_version}",
         )
         self.counters["pushed"] += 1
         cycle_key = (data.station, data.cycle_runtime_ns)

@@ -195,6 +195,17 @@ class ForecastQuantileVector:
     ``cycle_runtime_ns`` -- that instant is NOT the MAX window's own instant
     (see the parser module's own docstring on why a 13Z cycle's nearest MAX
     column lands roughly 11h later, at 00Z the following day).
+
+    ``model_version`` (SL-13 S2, plan D2/F3) is the NBM version ERA string
+    (``f"v{header_model_version}"``, "header wins" -- the same convention
+    ``scripts/analysis/nbp_backfill.py`` uses) this cycle's bulletin was
+    issued under. The live calibration consumer
+    (``forecast_quantile_ladder.calibration_artefact.LiveCalibration.
+    resolve``) resolves EMOS parameters per this era, never pooled across
+    versions. Defaults to ``""`` only for callers that do not care about
+    per-version calibration (e.g. existing fixtures predating this field);
+    the real producer (``ForecastQuantileStateActor.on_data``) always
+    supplies a real era.
     """
 
     q10: float
@@ -207,6 +218,7 @@ class ForecastQuantileVector:
     available_at_ns: int
     cycle_runtime_ns: int
     climate_day: date
+    model_version: str = ""
 
 
 class ForecastQuantileState:
@@ -224,6 +236,7 @@ class ForecastQuantileState:
     def __init__(self) -> None:
         self._by_cycle: dict[int, dict[str, tuple[float, int]]] = {}
         self._climate_day_by_cycle: dict[int, date] = {}
+        self._model_version_by_cycle: dict[int, str] = {}
 
     def push(
         self,
@@ -233,6 +246,7 @@ class ForecastQuantileState:
         available_at_ns: int,
         cycle_runtime_ns: int,
         climate_day: date,
+        model_version: str = "",
     ) -> None:
         if variable not in NBP_QUANTILE_VARIABLES:
             raise ValueError(
@@ -248,7 +262,15 @@ class ForecastQuantileState:
                 f"{climate_day.isoformat()} -- every variable of one cycle "
                 f"must target the SAME climate day",
             )
+        existing_version = self._model_version_by_cycle.get(cycle_runtime_ns)
+        if existing_version is not None and existing_version != model_version:
+            raise ValueError(
+                f"cycle {cycle_runtime_ns} already recorded model_version "
+                f"{existing_version!r}; {variable!r} carries {model_version!r} "
+                "-- every variable of one cycle must target the SAME NBM version",
+            )
         self._climate_day_by_cycle[cycle_runtime_ns] = climate_day
+        self._model_version_by_cycle[cycle_runtime_ns] = model_version
         cell = self._by_cycle.setdefault(cycle_runtime_ns, {})
         cell[variable] = (value_f, available_at_ns)
 
@@ -268,6 +290,7 @@ class ForecastQuantileState:
             available_at_ns=vintage,
             cycle_runtime_ns=cycle_runtime_ns,
             climate_day=self._climate_day_by_cycle[cycle_runtime_ns],
+            model_version=self._model_version_by_cycle[cycle_runtime_ns],
         )
 
     def is_complete(self, cycle_runtime_ns: int) -> bool:

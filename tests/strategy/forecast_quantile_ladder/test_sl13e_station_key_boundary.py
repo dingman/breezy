@@ -117,8 +117,6 @@ async def test_the_real_nbm_actor_feeds_the_composed_quantile_actor(
         latch=QuantileLadderLatch(),
         calibration_artefact_path=artefact_path,
         calibration_artefact_sha256=artefact_sha,
-        bounds_artefact_path=artefact_path,
-        bounds_artefact_sha256=artefact_sha,
         now_ns_fn=lambda: _NOW_NS,
     )
 

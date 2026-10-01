@@ -301,8 +301,6 @@ def test_shadow_only_propagates_to_every_composed_strategy(tmp_path: Path) -> No
             latch=QuantileLadderLatch(),
             calibration_artefact_path=artefact_path,
             calibration_artefact_sha256=artefact_sha,
-            bounds_artefact_path=artefact_path,
-            bounds_artefact_sha256=artefact_sha,
             now_ns_fn=lambda: _NOW_NS,
             shadow_only=shadow_only,
         )

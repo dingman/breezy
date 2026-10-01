@@ -180,8 +180,6 @@ def test_d_plus_1_yes_and_no_instruments_are_resolved_for_lax_and_mia(
         latch=QuantileLadderLatch(),
         calibration_artefact_path=artefact_path,
         calibration_artefact_sha256=artefact_sha,
-        bounds_artefact_path=artefact_path,
-        bounds_artefact_sha256=artefact_sha,
         now_ns_fn=lambda: _NOW_NS,
     )
 
@@ -250,8 +248,6 @@ def test_zero_d_plus_1_instruments_never_substitutes_today_and_never_crashes(
         latch=QuantileLadderLatch(),
         calibration_artefact_path=artefact_path,
         calibration_artefact_sha256=artefact_sha,
-        bounds_artefact_path=artefact_path,
-        bounds_artefact_sha256=artefact_sha,
         now_ns_fn=lambda: _NOW_NS,
     )
 
