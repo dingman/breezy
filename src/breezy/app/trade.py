@@ -46,6 +46,10 @@ from breezy.persistence.family_manifest import (
     FamilyManifestError,
     load_family_manifest,
 )
+from breezy.persistence.live_orders_gate import (
+    LiveOrdersGateRefusedError,
+    live_orders_authorized,
+)
 from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
@@ -749,6 +753,39 @@ def run(
                 # the probe (whose `is_fee_verified` the holder forwards to)
                 # cannot be built until AFTER them, below.
                 fq_fee_verified_holder = _FeeVerifiedHolder()
+                # FQ-S5 (plan D3): the enable path is a two-key gate. This is
+                # the ONE place in the whole fq branch that computes a
+                # non-literal `shadow_only` -- see the AST guard in
+                # `tests/unit/test_shadow_only_false_is_only_the_gate_output
+                # .py`, which permits exactly this expression and nowhere
+                # else. The repo root is the process CWD, the same
+                # convention `_FAMILIES_DIR` above already assumes (the
+                # supervisor always sets `cwd=str(repo_root)` before
+                # spawning this process).
+                repo_root = Path.cwd()
+                try:
+                    live_orders = live_orders_authorized(
+                        manifest, repo_root, permit_present=sending_permit is not None,
+                    )
+                except LiveOrdersGateRefusedError as exc:
+                    _boot_logger.info(
+                        "fq_live_orders enabled=False family_id=%s ruling=%s reason=%s",
+                        manifest.family_id,
+                        manifest.live_orders_ruling,
+                        exc.reason,
+                    )
+                    raise SettingsError(
+                        f"fq live-orders gate refused for {manifest.family_id}: {exc}"
+                    ) from exc
+                _boot_logger.info(
+                    "fq_live_orders enabled=%s family_id=%s ruling=%s reason=%s "
+                    "calibration_sha256=%s",
+                    live_orders.enabled,
+                    manifest.family_id,
+                    manifest.live_orders_ruling or "none",
+                    live_orders.reason,
+                    manifest.density_artefact_sha256,
+                )
                 try:
                     forecast_strategies, quantile_actor = build_forecast_quantile_ladder_strategies(
                         catalog_root=catalog_root,
@@ -768,6 +805,7 @@ def run(
                         submit_veto=submit_veto,
                         fee_verified=fq_fee_verified_holder.is_fee_verified,
                         required_fee_coefficient=float(manifest.taker_fee_coefficient),
+                        shadow_only=not live_orders.enabled,
                     )
                 except (
                     NoTradableForecastInstrumentsError,

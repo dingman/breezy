@@ -163,6 +163,7 @@ def build_forecast_quantile_ladder_strategies(
     fee_verified: Callable[[int], bool] | None = None,
     required_fee_coefficient: float | None = None,
     now_ns_fn: Callable[[], int] = time.time_ns,
+    shadow_only: bool = True,
 ) -> tuple[tuple[ForecastQuantileLadderStrategy, ...], ForecastQuantileStateActor]:
     """One ``ForecastQuantileLadderStrategy`` per supported station.
 
@@ -178,6 +179,12 @@ def build_forecast_quantile_ladder_strategies(
     ``order_submission_permit`` HERE, before any instrument resolution or
     strategy construction (reuses ``Phase0PermitForbiddenError``, never a
     second error type for the same invariant).
+
+    ``shadow_only`` (FQ-S5, plan D3) is forwarded verbatim into every
+    composed station's ``ForecastQuantileLadderConfig``. Defaults ``True``
+    (fail closed): the caller (``app/trade.py``) is the ONLY place a
+    non-``True`` value may originate, and only as the direct output of
+    ``persistence.live_orders_gate.live_orders_authorized(...).enabled``.
     """
     if phase0_permit_guard and order_submission_permit is not None:
         raise Phase0PermitForbiddenError(
@@ -259,6 +266,7 @@ def build_forecast_quantile_ladder_strategies(
             "calibration_artefact_sha256": calibration_artefact_sha256,
             "strategy_id": _COMPONENT_ID_PREFIX,
             "order_id_tag": station,
+            "shadow_only": shadow_only,
         }
         if required_fee_coefficient is not None:
             config_kwargs["required_fee_coefficient"] = required_fee_coefficient

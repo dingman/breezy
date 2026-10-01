@@ -78,6 +78,15 @@ _ARTEFACT_PAYLOAD = {
 def _write_forecast_quantile_ladder_manifest(
     families_dir: Path, *, family_id: str, stations: tuple[str, ...],
 ) -> None:
+    # FQ-S5 (plan `FQ_GO_LIVE_PLAN_2026-10-01.md` D3/item 10): artefact
+    # paths must be RELATIVE and stay inside `deploy/families` -- the same
+    # shape every committed manifest already uses, and the only shape
+    # `_assert_artefact_path_contained` accepts. `families_dir` is always
+    # `<repo_root>/deploy/families` here (this fixture's own convention,
+    # matching production's `_FAMILIES_DIR`), so a path relative to
+    # `families_dir`'s own grandparent reads back correctly once the test
+    # also `monkeypatch.chdir`s to that same root.
+    repo_root = families_dir.parent.parent
     artefacts_dir = families_dir / "artefacts"
     artefacts_dir.mkdir(parents=True, exist_ok=True)
     artefact_path = artefacts_dir / f"{family_id}_density.json"
@@ -96,10 +105,10 @@ def _write_forecast_quantile_ladder_manifest(
         "trial_id_prefix": f"forecast_quantile_ladder/trial/{family_id}/",
         "d0_climate_day": "2026-09-19",
         "taker_fee_coefficient": "0.06",
-        "boundary_artefact_path": str(boundary_path),
+        "boundary_artefact_path": str(boundary_path.relative_to(repo_root)),
         "boundary_inputs_sha256": boundary_sha,
         "composition_kind": "forecast_quantile_ladder",
-        "density_artefact_path": str(artefact_path),
+        "density_artefact_path": str(artefact_path.relative_to(repo_root)),
         "density_artefact_sha256": artefact_sha,
         "stations": list(stations),
         "status": "REGISTERED",
