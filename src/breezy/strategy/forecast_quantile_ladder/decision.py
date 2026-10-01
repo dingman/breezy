@@ -40,16 +40,20 @@ from typing import Final, Literal
 
 from breezy.ingest.gaps import local_standard_date
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
+    CalibrationArtefactUnknownVersionError,
+    LiveCalibration,
+)
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.forecast_quantile_ladder.margin import forecast_margin
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
-from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung, apply_emos, build_cdf
+from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung
 from breezy.strategy.ladder_ev.scoring import ev_net, ev_net_no
 from breezy.strategy.weather_common.costs import DepthAwareTradeCost, venue_fee_prob
 
 __all__ = [
+    "CALIBRATION_VERSION_UNAVAILABLE",
     "QTY",
     "VECTOR_DAY_MISMATCH",
     "AskSideMismatchError",
@@ -76,6 +80,13 @@ QTY: Literal[1] = 1
 #: with this named reason rather than silently scored, exactly like every
 #: other non-trial verdict in this module.
 VECTOR_DAY_MISMATCH: Final[str] = "vector_day_mismatch"
+
+#: SL-13 S2 (finding F3/plan D2): the visible vector's own NBM version era
+#: has no entry in the calibration artefact (`LiveCalibration.resolve`
+#: raises `CalibrationArtefactUnknownVersionError`). Never latched, never
+#: counted as a trial -- the live path refuses to pool or substitute a
+#: different version's draws (mispricing).
+CALIBRATION_VERSION_UNAVAILABLE: Final[str] = "calibration_version_unavailable"
 
 
 class AskSideMismatchError(ValueError):
@@ -210,7 +221,8 @@ def evaluate(
     slippage_floor_prob: float,
     h_hours: float,
     cfg: LadderEvConfig,
-    artefact: CalibrationArtefact,
+    calibration: LiveCalibration,
+    latitude_deg: float,
     bounds_provider: BoundsProvider,
     latch: QuantileLadderLatch,
 ) -> Decision:
@@ -253,6 +265,13 @@ def evaluate(
     if vector.climate_day != climate_day:
         return Refuse(reason=VECTOR_DAY_MISMATCH)
 
+    try:
+        resolved = calibration.resolve(
+            vector.model_version, latitude_deg=latitude_deg, climate_day=climate_day,
+        )
+    except CalibrationArtefactUnknownVersionError:
+        return Refuse(reason=CALIBRATION_VERSION_UNAVAILABLE)
+
     percentiles = Percentiles(
         q10=vector.q10,
         q25=vector.q25,
@@ -262,9 +281,9 @@ def evaluate(
         mean=vector.mean,
         sd=vector.sd,
     )
-    base_cdf = build_cdf(artefact.cdf_method, percentiles)
-    cdf = apply_emos(base_cdf, percentiles, artefact.emos)
-    bounds = bounds_provider(cdf=cdf, ladder=ladder, rung_id=rung_id)
+    bounds = bounds_provider(
+        percentiles=percentiles, draws=resolved.draws, ladder=ladder, rung_id=rung_id,
+    )
     p_hat, p_lower, p_upper = bounds.p_hat, bounds.p_lower, bounds.p_upper
 
     # V1 is qty 1 at a single quoted price -- no ladder walk, so the

@@ -15,7 +15,6 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,7 +29,7 @@ from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.composition import family_halt_submit_veto
 from breezy.strategy.current_rung_hold.trial_day_latch import open_trial_day_latch
 from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
 from breezy.strategy.forecast_quantile_ladder.decision import Take
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
@@ -42,7 +41,15 @@ from breezy.strategy.forecast_quantile_ladder.strategy import (
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
-from breezy.strategy.ladder_ev.quantile_density import CdfMethod, EmosParams, Rung, rung_probabilities
+from breezy.strategy.ladder_ev.location_correction import CorrectionForm
+from breezy.strategy.ladder_ev.quantile_density import (
+    CdfMethod,
+    EmosParams,
+    Percentiles,
+    Rung,
+    build_cdf,
+    rung_probabilities,
+)
 from tests.unit.test_current_rung_hold_strategy import _instrument
 
 STATION = "LAX"
@@ -67,15 +74,24 @@ def _send_enabled_config() -> ForecastQuantileLadderConfig:
     )
 
 
-def _artefact() -> CalibrationArtefact:
-    return CalibrationArtefact(
-        sha256="a" * 64, cdf_method=CdfMethod.NORMAL, emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
+def _artefact() -> LiveCalibration:
+    identity = EmosParams(a=0.0, gamma=0.0, delta=1.0)
+    return LiveCalibration(
+        sha256="a" * 64,
+        cdf_method=CdfMethod.NORMAL,
+        correction_form=CorrectionForm.NONE,
+        linear_coefficients=None,
+        month_offsets={},
+        point_by_version={"": identity},
+        draws_by_version={"": (identity,)},
     )
 
 
 def _bounds_provider(
-    *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str,
+    *, percentiles: Percentiles, draws: Sequence[EmosParams], ladder: Sequence[Rung], rung_id: str,
 ) -> RungBounds:
+    del draws
+    cdf = build_cdf(CdfMethod.NORMAL, percentiles)
     p_hat = rung_probabilities(cdf, ladder)[rung_id]
     return RungBounds(p_hat=p_hat, p_lower=max(0.0, p_hat - 0.03), p_upper=min(1.0, p_hat + 0.03))
 
@@ -105,7 +121,7 @@ def _build_registered(
     strategy = ForecastQuantileLadderStrategy(
         config if config is not None else _config(),
         quantile_actor=quantile_actor,
-        artefact=_artefact(),
+        calibration=_artefact(),
         ladder_cfg=LadderEvConfig(),
         bounds_provider=_bounds_provider,
         order_submission_permit=order_submission_permit,

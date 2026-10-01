@@ -312,14 +312,23 @@ CLEAN: Final[tuple[str, ...]] = (
 #: "lower the ceiling to N" so a ceiling can never go stale.
 CEILINGS: Final[dict[str, int]] = {
     "src/breezy/analysis": 13,
-    "scripts/analysis": 364,
+    # SL-13 S2 (plan FQ_GO_LIVE_PLAN_2026-10-01.md §3 S2): the live
+    # `BoundsProvider` Protocol and `ForecastQuantileLadderStrategy`
+    # constructor changed shape (percentiles+draws, never a bare `cdf`
+    # callable; `calibration=`, never `artefact=`) to resolve EMOS
+    # parameters per NBM version instead of a flat, pooled artefact
+    # (finding F3). `scripts/analysis/nbp_shadow_parity.py`/
+    # `nbp_shadow_parity_pure.py` (S4) still call the OLD shape pending
+    # their own migration slice, S4b ("S4b needs S2" -- plan §4) --
+    # +4 here, +3 in `tests/unit` below, both temporary.
+    "scripts/analysis": 368,
     "scripts/archive": 8,
     "scripts/venue": 23,
     "tests/contract": 11,
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1466,
+    "tests/unit": 1469,
 }
 
 
