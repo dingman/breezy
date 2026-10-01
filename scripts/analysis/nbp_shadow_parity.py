@@ -42,6 +42,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
 
+import msgspec
+
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import BookOrder, CustomData, OrderBookDepth10
@@ -58,6 +60,7 @@ from breezy.domain.forecast_point import ForecastPoint
 from breezy.domain.weather_bucket_facts import WeatherFactsUnavailableError, read_weather_bucket_facts
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.ingest.nbm_quantile_parse import NbpQuantilePoint, max_column_lst_climate_day
+from breezy.persistence.family_manifest import load_family_manifest
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition
 from breezy.runtime.backtest_harness import BreezyBacktestConfig, build_backtest_engine
 from breezy.runtime.settings import SettingsError, load_quote_tape_settings
@@ -108,6 +111,7 @@ _QUERY_PAD_BEFORE = timedelta(days=2)
 _QUERY_PAD_AFTER = timedelta(days=3)
 _NBP_CYCLE_FILE = re.compile(r"nbp_(\d{4})(\d{2})(\d{2})_\d{2}z\.parquet\Z")
 _NO_LEG_DIR_SUFFIX = "^no"
+_FAMILY_MANIFEST_NAME: Final[str] = "pm_us_crh_fq_v1.json"
 
 __all__ = [
     "run_batch_parity",
@@ -289,6 +293,14 @@ def run_live_parity(
     ``evaluate_snapshot`` records the shadow decision, so a ``Take`` remains
     observable without reaching ``submit_order``.
     """
+    # A station with no LST offset cannot be served. The manifest allowlist
+    # may name cities this tape does not; an empty intersection is no decisions,
+    # not an actor that refuses to construct.
+    stations = tuple(
+        station for station in stations if station in std_utc_offset_hours_by_station
+    )
+    if not stations:
+        return ()
     instrument_ids = [str(instrument.id) for instrument in instruments]
     market_data = [
         _depth_clocked_at_decision_instant(depth) for depth in market_data
@@ -332,11 +344,16 @@ def run_live_parity(
     # injected sink instead. This harness's OWN records list is its
     # observability surface, never a strategy attribute.
     shadow_records: list[ShadowDecisionLogLine] = []
+    # A-6 has no slippage term. The explicit argument wins over
+    # LadderEvConfig's 0.01 default, which the strategy reads at evaluate.
+    applied_ladder_cfg = msgspec.structs.replace(
+        ladder_cfg, slippage_floor_prob=slippage_floor_prob,
+    )
     strategy = ForecastQuantileLadderStrategy(
         strategy_config,
         quantile_actor=quantile_actor,
         calibration=calibration,
-        ladder_cfg=ladder_cfg,
+        ladder_cfg=applied_ladder_cfg,
         bounds_provider=bounds_provider,
         latch=latch,
         order_submission_permit=permit,
@@ -581,12 +598,19 @@ def _parity_report_payload(
     return payload
 
 
+def manifest_stations(repo_root: Path) -> tuple[str, ...]:
+    """Stations ``pm_us_crh_fq_v1`` trades, read from the manifest, in file order."""
+    manifest = load_family_manifest(repo_root / "deploy" / "families" / _FAMILY_MANIFEST_NAME)
+    return manifest.stations
+
+
 def _load_catalog_inputs(
     catalog_root: Path,
     *,
     start: date,
     end: date,
     catalog: Any = None,
+    stations: Sequence[str] | None = None,
 ) -> tuple[
     tuple[BinaryOption, ...],
     tuple[OrderBookDepth10, ...],
@@ -608,6 +632,7 @@ def _load_catalog_inputs(
     """
     if catalog is None:
         catalog = ParquetDataCatalog(str(catalog_root))
+    allowed = None if stations is None else frozenset(stations)
     start_ts, end_ts = _tape_query_bounds(start, end)
     instrument_ids = _instrument_ids_in_window(catalog_root, start=start, end=end)
     queried: list[Any] = []
@@ -644,6 +669,8 @@ def _load_catalog_inputs(
             continue
         seen_ids.add(instrument_key)
         if not (start <= facts.climate_day <= end):
+            continue
+        if allowed is not None and facts.settlement_station not in allowed:
             continue
         kept.append(instrument)
         side = _trusted_side(leg_of(instrument.id))
@@ -702,17 +729,18 @@ def _load_catalog_inputs(
         )
 
     registry = default_registry()
-    stations = sorted({station for station, _day in ladder_by_key})
+    present_stations = sorted({station for station, _day in ladder_by_key})
     std_offsets = {
         station: registry.climate_day_window("polymarket_us", station).std_utc_offset_hours
-        for station in stations
+        for station in present_stations
     }
     latitude_deg_by_station = {
         station: registry.enrichment_coordinates("polymarket_us", station).lat
-        for station in stations
+        for station in present_stations
     }
     quantile_station_keys = {
-        station: registry.settlement_site("polymarket_us", station).icao for station in stations
+        station: registry.settlement_site("polymarket_us", station).icao
+        for station in present_stations
     }
     return (
         tuple(kept),
@@ -790,6 +818,16 @@ def vacuity_guard_failures(
     return tuple(failures)
 
 
+def production_slippage_floor_prob() -> float:
+    """Floor the deployed composition subtracts.
+
+    ``build_forecast_quantile_ladder_strategies`` builds ``LadderEvConfig()``
+    when the caller passes no ladder config. Both replay legs pass this
+    value explicitly, so a change to that default moves the harness with it.
+    """
+    return LadderEvConfig().slippage_floor_prob
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
@@ -817,6 +855,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # a single combined run. Counts are summed; days' identity keys are disjoint.
         nbp_rows = _load_nbp_rows(args.nbp_derived_root, start=args.start_date, end=args.end_date)
         forecast_points = _forecast_points(nbp_rows)
+        allowed_stations = manifest_stations(Path(__file__).resolve().parents[2])
         day_reports: list[ParityReport] = []
         censuses: list[dict[str, int]] = []
         for day in _inclusive_days(args.start_date, args.end_date):
@@ -829,7 +868,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 latitude_deg_by_station,
                 quantile_station_keys,
             ) = _load_catalog_inputs(
-                quote_settings.catalog_root, start=day, end=day,
+                quote_settings.catalog_root,
+                start=day,
+                end=day,
+                stations=allowed_stations,
             )
             if not std_offsets:
                 continue
@@ -839,6 +881,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _depth_clocked_at_decision_instant(depth) for depth in market_data
             )
             gc.collect()
+            active_stations = tuple(
+                station for station in allowed_stations if station in std_offsets
+            )
             live = run_live_parity(
                 instruments=instruments,
                 market_data=market_data,
@@ -848,9 +893,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ladder_cfg=LadderEvConfig(),
                 bounds_provider=bounds_provider,
                 fee_coefficient=0.0695,
-                slippage_floor_prob=0.0,
+                slippage_floor_prob=production_slippage_floor_prob(),
                 std_utc_offset_hours_by_station=std_offsets,
-                stations=tuple(std_offsets),
+                stations=active_stations,
                 quantile_station_keys=quantile_station_keys,
             )
             batch = run_batch_parity(
@@ -861,10 +906,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ladder_cfg=LadderEvConfig(),
                 bounds_provider=bounds_provider,
                 fee_coefficient=0.0695,
-                slippage_floor_prob=0.0,
+                slippage_floor_prob=production_slippage_floor_prob(),
                 std_utc_offset_hours_by_station=std_offsets,
                 latitude_deg_by_station=latitude_deg_by_station,
                 quantile_station_keys=quantile_station_keys,
+                stations=allowed_stations,
             )
             day_reports.append(diff_decision_keys(live, batch))
             censuses.append(dict(no_depth_census(depth_rows)))

@@ -933,6 +933,7 @@ def run_batch_parity(
     std_utc_offset_hours_by_station: Mapping[str, float],
     latitude_deg_by_station: Mapping[str, float],
     quantile_station_keys: Mapping[str, str] | None = None,
+    stations: Sequence[str] | None = None,
 ) -> tuple[DecisionKey, ...]:
     """The batch path's own driver loop: one evaluation per depth snapshot
     with a genuine (non-null) ask, on that row's own side, latched across
@@ -953,7 +954,17 @@ def run_batch_parity(
     study as A-5-complete.
     """
     station_key_map = quantile_station_keys if quantile_station_keys is not None else {}
-    ordered = sorted(depth_snapshots, key=lambda row: row.ts_ns)
+    allowed = None if stations is None else frozenset(stations)
+    # Drop non-manifest rows before the pre-freeze assert and before the
+    # ladder lookup, so a foreign station cannot fail the study or KeyError.
+    ordered = sorted(
+        (
+            row
+            for row in depth_snapshots
+            if allowed is None or _row_context(row)[0] in allowed
+        ),
+        key=lambda row: row.ts_ns,
+    )
 
     states_by_station: dict[str, ForecastQuantileState] = {}
     for nbp_row in nbp_rows:
