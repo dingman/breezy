@@ -1,0 +1,33 @@
+{
+  "n_batch": 720597,
+  "n_batch_no_NotDPlus1": 0,
+  "n_batch_no_NotExecutable": 0,
+  "n_batch_no_Refuse": 0,
+  "n_batch_no_Take": 0,
+  "n_batch_only": 0,
+  "n_batch_yes_NotDPlus1": 423522,
+  "n_batch_yes_NotExecutable": 101131,
+  "n_batch_yes_Refuse": 195937,
+  "n_batch_yes_Take": 7,
+  "n_live": 720597,
+  "n_live_no_NotDPlus1": 0,
+  "n_live_no_NotExecutable": 0,
+  "n_live_no_Refuse": 0,
+  "n_live_no_Take": 0,
+  "n_live_only": 0,
+  "n_live_yes_NotDPlus1": 423522,
+  "n_live_yes_NotExecutable": 101131,
+  "n_live_yes_Refuse": 195937,
+  "n_live_yes_Take": 7,
+  "n_matched": 720597,
+  "n_mismatches": 0,
+  "n_numeric_mismatches": 0,
+  "no_depth_days_by_station": {
+    "LAX": 0,
+    "MDW": 0,
+    "MIA": 0,
+    "SFO": 0
+  },
+  "no_side_unexercisable_in_window": true,
+  "vacuity_guard_failures": []
+}
