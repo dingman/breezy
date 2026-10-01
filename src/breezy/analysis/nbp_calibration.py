@@ -80,6 +80,11 @@ from scipy.optimize import minimize, minimize_scalar
 from scipy.special import ndtr
 
 from breezy.analysis.brier_decomposition import bin_by_edges, resolution_difference
+from breezy.strategy.ladder_ev.location_correction import (
+    CorrectionForm,
+    correction_prediction_f,
+    emos_params_from_draw_entry as _emos_params_from_draw_entry,
+)
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
@@ -1332,15 +1337,6 @@ def fit_calibration(
 # ---------------------------------------------------------------------------
 
 
-class CorrectionForm(Enum):
-    """The closed set of G2.0 correction forms (plan S4.1, R3-07). No other
-    form may be introduced after S0."""
-
-    NONE = "none"
-    MONTH_OFFSET = "month_offset"
-    LINEAR_DAYLENGTH = "linear_lst_day_length"
-
-
 class InvalidCorrectionFormError(ValueError):
     """A correction form outside :class:`CorrectionForm`'s closed set."""
 
@@ -1367,16 +1363,15 @@ def apply_correction_form(
     """Applies ``form`` to one residual, chosen on validation only (plan S4.1)."""
     if form is CorrectionForm.NONE:
         return residual_f
-    if form is CorrectionForm.MONTH_OFFSET:
-        if month_offsets is None or month not in month_offsets:
-            raise ValueError(f"CorrectionForm.MONTH_OFFSET needs an offset for month {month}")
-        return residual_f - month_offsets[month]
-    if form is CorrectionForm.LINEAR_DAYLENGTH:
-        if linear_coefficients is None:
-            raise ValueError("CorrectionForm.LINEAR_DAYLENGTH needs (slope, intercept)")
-        slope, intercept = linear_coefficients
-        return residual_f - (slope * day_length_hours + intercept)
-    raise InvalidCorrectionFormError(f"unhandled CorrectionForm {form!r}")  # pragma: no cover
+    if form is not CorrectionForm.MONTH_OFFSET and form is not CorrectionForm.LINEAR_DAYLENGTH:
+        raise InvalidCorrectionFormError(f"unhandled CorrectionForm {form!r}")  # pragma: no cover
+    return residual_f - correction_prediction_f(
+        form,
+        month=month,
+        day_length_hours=day_length_hours,
+        month_offsets=month_offsets,
+        linear_coefficients=linear_coefficients,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1426,16 +1421,27 @@ def _fit_linear_daylength(rows: Sequence[CorrectionFitRow]) -> tuple[float, floa
 
 
 def _correction_prediction(selection: CorrectionSelection, row: CorrectionFitRow) -> float:
-    if selection.form is CorrectionForm.NONE:
+    if selection.form is CorrectionForm.MONTH_OFFSET and row.month not in selection.month_offsets:
+        # Unseen months contribute no correction. ``apply_correction_form``
+        # refuses a missing month instead; that stricter check stays there.
         return 0.0
-    if selection.form is CorrectionForm.MONTH_OFFSET:
-        return selection.month_offsets.get(row.month, 0.0)
-    if selection.form is CorrectionForm.LINEAR_DAYLENGTH:
-        if selection.linear_coefficients is None:
-            raise ValueError("linear correction selection lacks coefficients")
-        slope, intercept = selection.linear_coefficients
-        return slope * row.day_length_hours + intercept
-    raise InvalidCorrectionFormError(f"unhandled CorrectionForm {selection.form!r}")  # pragma: no cover
+    if selection.form is CorrectionForm.LINEAR_DAYLENGTH and selection.linear_coefficients is None:
+        raise ValueError("linear correction selection lacks coefficients")
+    if (
+        selection.form is not CorrectionForm.NONE
+        and selection.form is not CorrectionForm.MONTH_OFFSET
+        and selection.form is not CorrectionForm.LINEAR_DAYLENGTH
+    ):
+        raise InvalidCorrectionFormError(  # pragma: no cover
+            f"unhandled CorrectionForm {selection.form!r}"
+        )
+    return correction_prediction_f(
+        selection.form,
+        month=row.month,
+        day_length_hours=row.day_length_hours,
+        month_offsets=selection.month_offsets,
+        linear_coefficients=selection.linear_coefficients,
+    )
 
 
 def _score_correction(selection: CorrectionSelection, rows: Sequence[CorrectionFitRow]) -> float:
@@ -2335,24 +2341,12 @@ def rung_bounds_from_calibration(
 
 
 def emos_params_from_draw_entry(entry: Sequence[float], *, fallback_delta: float) -> EmosParams:
-    """Parse one ``emos_draws_by_version`` JSON entry into :class:`EmosParams`
-    (SL-8b review item 3).
+    """Parse one ``emos_draws_by_version`` JSON entry into :class:`EmosParams`.
 
-    Accepts BOTH shapes: a 3-element ``[a, gamma, delta]`` entry (the
-    current schema -- each draw carries its OWN resampled delta) and a
-    2-element ``[a, gamma]`` entry (the pre-SL-8b schema, whose draws all
-    shared the artefact's single top-level ``delta``) -- ``fallback_delta``
-    (the artefact's own ``delta`` field) supplies the missing third value
-    for the old shape, so an artefact written before this schema change
-    still parses. Any other length is refused.
+    Delegates to
+    :func:`breezy.strategy.ladder_ev.location_correction.emos_params_from_draw_entry`.
     """
-    if len(entry) == 3:
-        a, gamma, delta = entry
-        return EmosParams(a=float(a), gamma=float(gamma), delta=float(delta))
-    if len(entry) == 2:
-        a, gamma = entry
-        return EmosParams(a=float(a), gamma=float(gamma), delta=float(fallback_delta))
-    raise ValueError(f"a draw entry must have 2 or 3 elements, got {len(entry)}: {entry!r}")
+    return _emos_params_from_draw_entry(entry, fallback_delta=fallback_delta)
 
 
 @dataclass(frozen=True, slots=True)
