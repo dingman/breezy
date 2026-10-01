@@ -152,6 +152,7 @@ from breezy.persistence.archive_cache import (  # noqa: E402
 )
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition  # noqa: E402
 from breezy.registry.sites import default_registry  # noqa: E402
+from breezy.strategy.ladder_ev.location_correction import daylight_hours  # noqa: E402
 from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
     CdfMethod,
     EmosParams,
@@ -1356,15 +1357,7 @@ def _daylight_hours(station: str, day: dt.date) -> float:
         raise UnknownStationError(
             f"unknown station {station!r}: no latitude registered in sites.toml"
         ) from exc
-    latitude = math.radians(latitude_deg)
-    year_days = 366 if day.replace(month=12, day=31).timetuple().tm_yday == 366 else 365
-    declination = math.radians(
-        23.44 * math.sin((2.0 * math.pi / year_days) * (day.timetuple().tm_yday - 80))
-    )
-    cos_hour_angle = -math.tan(latitude) * math.tan(declination)
-    cos_hour_angle = min(1.0, max(-1.0, cos_hour_angle))
-    hour_angle = math.acos(cos_hour_angle)
-    return (24.0 / math.pi) * hour_angle
+    return daylight_hours(latitude_deg, day)
 
 
 def _tercile_edges(values: Sequence[float]) -> tuple[float, float]:
