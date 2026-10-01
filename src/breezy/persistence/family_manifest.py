@@ -149,8 +149,24 @@ _STRING_FIELDS: Final[tuple[str, ...]] = (
     "taker_fee_coefficient",
 )
 _OPTIONAL_KEYS: Final[frozenset[str]] = frozenset(
-    {"exit_rule", "terminal_climate_day", "no_leg_exit"}
+    {"exit_rule", "terminal_climate_day", "no_leg_exit", "live_orders_ruling"}
 )
+
+#: FQ-S5 (plan `FQ_GO_LIVE_PLAN_2026-10-01.md` D3): the operator-ruling
+#: reference a REGISTERED manifest may declare to request real orders. The
+#: declaration alone grants nothing -- `persistence/live_orders_gate.py`
+#: holds the second, code-committed, unforgeable half (an allowlisted
+#: `(family_id, ruling_id, ruling_sha256)` triple), the same split
+#: `exit_gate.py` already uses for `exit_rule`.
+_LIVE_ORDERS_RULING_RE: Final[re.Pattern[str]] = re.compile(r"\ARULING_[A-Za-z0-9_.-]{1,120}\Z")
+
+#: FQ-S5 item 10 (path containment, LOW/SEC): every manifest-declared
+#: artefact path must stay inside this subtree, relative to the manifest's
+#: OWN parent directory (never the process CWD -- a manifest loaded from
+#: any directory is validated against ITS OWN containing directory, the
+#: same convention `app/trade.py`'s `_FAMILIES_DIR` establishes for the
+#: production load site).
+_ARTEFACT_PATH_SUBTREE: Final[str] = "deploy/families"
 
 #: Deliberately NARROWER than ``Decimal``'s own grammar. ``Decimal`` accepts
 #: ``" 0.0695 "``, ``6.95E-2``, ``NaN``, ``Infinity``, ``+0.06`` and
@@ -237,6 +253,33 @@ class FamilyManifest:
     #: FU-1d: declares this family's armed ``exit_rule`` also covers a
     #: NO-leg position. See the module docstring's ``no_leg_exit`` section.
     no_leg_exit: bool = False
+    #: FQ-S5 (plan D3): the operator-ruling id this REGISTERED manifest
+    #: cites, or ``None`` when absent. See ``_LIVE_ORDERS_RULING_RE`` above
+    #: and ``persistence/live_orders_gate.py``.
+    live_orders_ruling: str | None = None
+
+
+def _assert_artefact_path_contained(path: Path, *, field: str, raw_value: str) -> None:
+    """FQ-S5 item 10: `raw_value` (one of the two artefact-path fields) must
+    be relative, carry no ``..`` component, and resolve to stay inside
+    `_ARTEFACT_PATH_SUBTREE` of `path`'s own parent directory.
+
+    `Path.resolve()` is used (not a string check) so a symlinked path
+    component inside the subtree that points OUTSIDE it is still caught --
+    the ``..``/absolute checks alone cannot see through a symlink.
+    """
+    candidate = Path(raw_value)
+    if candidate.is_absolute():
+        raise FamilyManifestValidationError(f"{path}: {field} must be a relative path")
+    if any(part == ".." for part in candidate.parts):
+        raise FamilyManifestValidationError(f"{path}: {field} must not contain a '..' component")
+    manifest_dir = path.resolve().parent
+    allowed_root = (manifest_dir / _ARTEFACT_PATH_SUBTREE).resolve()
+    resolved = (manifest_dir / candidate).resolve()
+    if not resolved.is_relative_to(allowed_root):
+        raise FamilyManifestValidationError(
+            f"{path}: {field} {raw_value!r} escapes {_ARTEFACT_PATH_SUBTREE}"
+        )
 
 
 def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyManifest:
@@ -298,6 +341,9 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             f"{path}: boundary_inputs_sha256 is the unpinned all-zero placeholder; "
             "pass allow_draft=True to load anyway"
         )
+    _assert_artefact_path_contained(
+        path, field="boundary_artefact_path", raw_value=payload["boundary_artefact_path"]
+    )
 
     composition_kind = payload["composition_kind"]
     if composition_kind not in _COMPOSITION_KINDS:
@@ -315,6 +361,9 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             f"{path}: density_artefact_sha256 is the unpinned all-zero placeholder; "
             "pass allow_draft=True to load anyway"
         )
+    _assert_artefact_path_contained(
+        path, field="density_artefact_path", raw_value=payload["density_artefact_path"]
+    )
 
     stations_raw = payload["stations"]
     if (
@@ -376,6 +425,20 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             "declaration is incoherent without an armed exit_rule to extend"
         )
 
+    live_orders_ruling = payload.get("live_orders_ruling")
+    if live_orders_ruling is not None:
+        if not isinstance(live_orders_ruling, str) or not _LIVE_ORDERS_RULING_RE.match(
+            live_orders_ruling
+        ):
+            raise FamilyManifestValidationError(
+                f"{path}: live_orders_ruling must match {_LIVE_ORDERS_RULING_RE.pattern!r}"
+            )
+        if status != "REGISTERED":
+            raise FamilyManifestValidationError(
+                f"{path}: live_orders_ruling may only be declared on a REGISTERED manifest "
+                f"(status was {status!r})"
+            )
+
     return FamilyManifest(
         family_id=payload["family_id"],
         venue=payload["venue"],
@@ -393,6 +456,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         exit_rule=exit_rule,
         terminal_climate_day=terminal_climate_day,
         no_leg_exit=no_leg_exit,
+        live_orders_ruling=live_orders_ruling,
     )
 
 
@@ -421,6 +485,7 @@ def _field_getters() -> dict[str, Callable[[FamilyManifest], object]]:
         "exit_rule": lambda manifest: manifest.exit_rule,
         "terminal_climate_day": lambda manifest: manifest.terminal_climate_day,
         "no_leg_exit": lambda manifest: True if manifest.no_leg_exit else None,
+        "live_orders_ruling": lambda manifest: manifest.live_orders_ruling,
     }
 
 

@@ -709,3 +709,29 @@ async def test_a_refused_order_leaves_the_daily_counter_unchanged(
         assert composition.spent() == seeded
     finally:
         composition.close()
+
+
+# ---------------------------------------------------------------------------
+# FQ-S5 (plan `FQ_GO_LIVE_PLAN_2026-10-01.md` §3 S5, test 10): the new
+# live-orders enable path touches neither operator-reserved control, by the
+# SAME layer-A AST scan this file already imports -- extended to the new
+# module rather than re-implemented.
+# ---------------------------------------------------------------------------
+
+_FQ_S5_NEW_MODULES: Final[tuple[str, ...]] = (
+    "src/breezy/persistence/live_orders_gate.py",
+    "src/breezy/persistence/family_manifest.py",
+    "src/breezy/app/trade.py",
+    "src/breezy/strategy/forecast_quantile_ladder/composition.py",
+)
+
+
+def test_fq_live_orders_gate_touches_no_operator_control() -> None:
+    for relative_path in _FQ_S5_NEW_MODULES:
+        path = REPO_ROOT / relative_path
+        source = path.read_text(encoding="utf-8")
+        assignments = find_control_assignments(relative_path, source)
+        assert assignments == [], (
+            f"{relative_path} assigns an operator-reserved control: {assignments}"
+        )
+        assert "operator.env" not in source, f"{relative_path} mentions operator.env"
