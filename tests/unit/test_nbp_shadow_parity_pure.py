@@ -8,23 +8,26 @@ for that boundary's own pin.
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import pytest
 
 from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import NBP_QUANTILE_VARIABLES
+from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
+    Percentiles,
     Rung,
+    build_cdf,
     rung_probabilities,
 )
 from scripts.analysis.nbp_shadow_parity_pure import (
     MIN_PRE_FREEZE_DAYS,
     PRE_FREEZE_END,
+    BatchCalibration,
     DecisionKey,
     DepthSnapshotRow,
     InsufficientPreFreezeDaysError,
@@ -43,6 +46,7 @@ from scripts.analysis.nbp_shadow_parity_pure import (
 
 STATION = "KMIA"
 STD_UTC_OFFSET_HOURS = -5.0
+LATITUDE_DEG = 25.8
 CLIMATE_DAY = dt.date(2026, 9, 2)
 EVAL_DAY = dt.date(2026, 9, 1)  # climate_day's D-1, in station LST
 LADDER = (Rung(rung_id="i1", lo=None, hi=None),)
@@ -50,6 +54,8 @@ LADDER_BY_KEY = {(STATION, CLIMATE_DAY): LADDER}
 FEE_COEFFICIENT = 0.0695
 SLIPPAGE_FLOOR_PROB = 0.0
 STD_OFFSET_BY_STATION = {STATION: STD_UTC_OFFSET_HOURS}
+LATITUDE_DEG_BY_STATION = {STATION: LATITUDE_DEG}
+MODEL_VERSION = "5.0"
 
 
 def _ns(y: int, m: int, d: int, hh: int, mm: int = 0) -> int:
@@ -81,10 +87,12 @@ def _nbp_rows() -> tuple[NbpQuantileRow, ...]:
             station=STATION,
             variable=variable,
             cycle_runtime_ns=_CYCLE_NS,
+            valid_start_ns=_CYCLE_NS,
+            valid_end_ns=_CYCLE_NS + 24 * 3_600_000_000_000,
             value_f=value,
             available_at_ns=_AVAILABLE_AT_NS,
             climate_day=CLIMATE_DAY,
-            header_model_version="5.0",
+            header_model_version=MODEL_VERSION,
         )
         for variable, value in _PERCENTILES.items()
     )
@@ -99,17 +107,23 @@ def _depth_snapshot(*, ts_ns: int = NOW_NS, price: float = 0.10) -> DepthSnapsho
     )
 
 
-def _artefact() -> CalibrationArtefact:
-    return CalibrationArtefact(
-        sha256="a" * 64,
+def _calibration() -> BatchCalibration:
+    identity = EmosParams(a=0.0, gamma=0.0, delta=1.0)
+    return BatchCalibration(
         cdf_method=CdfMethod.NORMAL,
-        emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
+        correction_form=CorrectionForm.NONE,
+        linear_coefficients=None,
+        month_offsets={},
+        point_by_version={f"v{MODEL_VERSION}": identity},
+        draws_by_version={f"v{MODEL_VERSION}": (identity,)},
     )
 
 
 def _bounds_provider(
-    *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str,
+    *, percentiles: Percentiles, draws: Sequence[EmosParams], ladder: Sequence[Rung], rung_id: str,
 ) -> RungBounds:
+    del draws
+    cdf = build_cdf(CdfMethod.NORMAL, percentiles)
     p_hat = rung_probabilities(cdf, ladder)[rung_id]
     return RungBounds(p_hat=p_hat, p_lower=max(0.0, p_hat - 0.03), p_upper=min(1.0, p_hat + 0.03))
 
@@ -119,12 +133,13 @@ def _run(depth_snapshots: tuple[DepthSnapshotRow, ...]) -> tuple[DecisionKey, ..
         depth_snapshots=depth_snapshots,
         nbp_rows=_nbp_rows(),
         ladder_by_key=LADDER_BY_KEY,
-        artefact=_artefact(),
+        calibration=_calibration(),
         ladder_cfg=LadderEvConfig(),
         bounds_provider=_bounds_provider,
         fee_coefficient=FEE_COEFFICIENT,
         slippage_floor_prob=SLIPPAGE_FLOOR_PROB,
         std_utc_offset_hours_by_station=STD_OFFSET_BY_STATION,
+        latitude_deg_by_station=LATITUDE_DEG_BY_STATION,
     )
 
 

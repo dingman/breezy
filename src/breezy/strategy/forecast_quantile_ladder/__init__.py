@@ -9,9 +9,7 @@ from __future__ import annotations
 
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider, RungBounds
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
-    CalibrationArtefact,
     CalibrationArtefactPinMismatchError,
-    load_calibration_artefact,
 )
 from breezy.strategy.forecast_quantile_ladder.config import (
     AllowShortNotPermittedError,
@@ -38,7 +36,6 @@ __all__ = [
     "AllowShortNotPermittedError",
     "AskSideMismatchError",
     "BoundsProvider",
-    "CalibrationArtefact",
     "CalibrationArtefactPinMismatchError",
     "ForecastQuantileLadderConfig",
     "ForecastQuantileLadderStrategy",
@@ -53,5 +50,4 @@ __all__ = [
     "UnpinnedCalibrationArtefactError",
     "evaluate",
     "forecast_margin",
-    "load_calibration_artefact",
 ]

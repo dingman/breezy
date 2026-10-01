@@ -303,7 +303,7 @@ def test_a_non_converged_fit_status_artefact_fails_closed_with_a_clean_config_er
 ) -> None:
     """SL-8b2: an artefact whose own `fit_status` is not `"OK"` must refuse
     to boot exactly like a bad sha pin, malformed JSON, or a schema-missing
-    key -- `load_bounds_artefact_draws` raises `BoundsArtefactPinMismatchError`,
+    key -- `load_live_calibration` raises `CalibrationArtefactPinMismatchError`,
     already in `app/trade.py`'s clean `EXIT_CONFIG_ERROR` tuple."""
     families_dir = tmp_path / "deploy" / "families"
     artefacts_dir = families_dir / "artefacts"

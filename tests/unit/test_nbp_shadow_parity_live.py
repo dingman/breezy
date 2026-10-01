@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -37,17 +37,20 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.domain.forecast_point import ForecastPoint
 from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import NBP_QUANTILE_VARIABLES
+from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
+    Percentiles,
     Rung,
 )
 from scripts.analysis.nbp_shadow_parity import run_live_parity
 from scripts.analysis.nbp_shadow_parity_pure import (
+    BatchCalibration,
     DecisionKey,
     DepthSnapshotRow,
     NbpQuantileRow,
@@ -81,6 +84,11 @@ LADDER_BY_KEY = {(STATION, CLIMATE_DAY): LADDER}
 FEE_COEFFICIENT = 0.0695
 SLIPPAGE_FLOOR_PROB = 0.0
 STD_OFFSET_BY_STATION = {STATION: STD_UTC_OFFSET_HOURS}
+#: MIA's real latitude (sites.toml) -- used only so the shared
+#: `location_correction.daylight_hours` primitive gets a plausible input;
+#: `CorrectionForm.NONE` (both calibration fixtures above) makes the actual
+#: correction amount 0.0 regardless.
+LATITUDE_DEG_BY_STATION = {STATION: 25.8}
 
 _INSTRUMENT_SYMBOL = f"{STATION.lower()}-{CLIMATE_DAY.isoformat()}-80_81"
 _INSTRUMENT_ID = InstrumentId(Symbol(_INSTRUMENT_SYMBOL), POLYMARKET_US_VENUE)
@@ -191,6 +199,17 @@ def _depth_frame(
     )
 
 
+#: The RAW NBM header value (never "v"-prefixed) -- `ForecastPoint.
+#: model_version`/`DerivedNbpRow.header_model_version` both carry this raw
+#: form; `ForecastQuantileStateActor.on_data` (live) and `run_batch_parity`
+#: (batch) each independently prefix "v" to get the resolution ERA
+#: ("header wins", plan D2). Kept as ONE constant here so both legs'
+#: fixtures stay in sync by construction, never two independently-typed
+#: literals that could silently drift.
+_MODEL_VERSION = "5.0"
+_ERA = f"v{_MODEL_VERSION}"
+
+
 def _forecast_points() -> tuple[ForecastPoint, ...]:
     points = []
     for variable, value in _PERCENTILES.items():
@@ -198,7 +217,7 @@ def _forecast_points() -> tuple[ForecastPoint, ...]:
             ForecastPoint(
                 station=STATION,
                 model="NBM_NBP",
-                model_version="v5.0",
+                model_version=_MODEL_VERSION,
                 variable=variable,
                 cycle_runtime_ns=_CYCLE_NS,
                 valid_start_ns=_CYCLE_NS,
@@ -219,27 +238,46 @@ def _nbp_rows() -> tuple[NbpQuantileRow, ...]:
             station=STATION,
             variable=variable,
             cycle_runtime_ns=_CYCLE_NS,
+            valid_start_ns=_CYCLE_NS,
+            valid_end_ns=_CYCLE_NS + 24 * 3_600_000_000_000,
             value_f=value,
             available_at_ns=_AVAILABLE_AT_NS,
             climate_day=CLIMATE_DAY,
-            header_model_version="5.0",
+            header_model_version=_MODEL_VERSION,
         )
         for variable, value in _PERCENTILES.items()
     )
 
 
-def _artefact() -> CalibrationArtefact:
-    return CalibrationArtefact(
+def _live_calibration() -> LiveCalibration:
+    identity = EmosParams(a=0.0, gamma=0.0, delta=1.0)
+    return LiveCalibration(
         sha256="a" * 64,
         cdf_method=CdfMethod.NORMAL,
-        emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
+        correction_form=CorrectionForm.NONE,
+        linear_coefficients=None,
+        month_offsets={},
+        point_by_version={_ERA: identity},
+        draws_by_version={_ERA: (identity,)},
+    )
+
+
+def _batch_calibration() -> BatchCalibration:
+    live = _live_calibration()
+    return BatchCalibration(
+        cdf_method=live.cdf_method,
+        correction_form=live.correction_form,
+        linear_coefficients=live.linear_coefficients,
+        month_offsets=live.month_offsets,
+        point_by_version=live.point_by_version,
+        draws_by_version=live.draws_by_version,
     )
 
 
 def _bounds_provider(
-    *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str,
+    *, percentiles: Percentiles, draws: Sequence[EmosParams], ladder: Sequence[Rung], rung_id: str,
 ) -> RungBounds:
-    del cdf, ladder, rung_id
+    del percentiles, draws, ladder, rung_id
     p_hat = 0.50
     return RungBounds(p_hat=p_hat, p_lower=0.90, p_upper=0.10)
 
@@ -250,7 +288,7 @@ def _run_live(depths: Sequence[OrderBookDepth10]) -> tuple[DecisionKey, ...]:
         market_data=depths,
         forecast_points=_forecast_points(),
         ladder_by_key=LADDER_BY_KEY,
-        artefact=_artefact(),
+        calibration=_live_calibration(),
         ladder_cfg=LadderEvConfig(slippage_floor_prob=SLIPPAGE_FLOOR_PROB),
         bounds_provider=_bounds_provider,
         fee_coefficient=FEE_COEFFICIENT,
@@ -265,12 +303,13 @@ def _run_batch(rows: Sequence[DepthSnapshotRow]) -> tuple[DecisionKey, ...]:
         depth_snapshots=rows,
         nbp_rows=_nbp_rows(),
         ladder_by_key=LADDER_BY_KEY,
-        artefact=_artefact(),
+        calibration=_batch_calibration(),
         ladder_cfg=LadderEvConfig(),
         bounds_provider=_bounds_provider,
         fee_coefficient=FEE_COEFFICIENT,
         slippage_floor_prob=SLIPPAGE_FLOOR_PROB,
         std_utc_offset_hours_by_station=STD_OFFSET_BY_STATION,
+        latitude_deg_by_station=LATITUDE_DEG_BY_STATION,
     )
 
 

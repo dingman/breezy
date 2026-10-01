@@ -12,13 +12,14 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Callable, Sequence
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
 from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.forecast_quantile_ladder.decision import (
+    CALIBRATION_VERSION_UNAVAILABLE,
     AskSideMismatchError,
     Decision,
     NotDPlus1,
@@ -31,10 +32,12 @@ from breezy.strategy.forecast_quantile_ladder.decision import (
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
+from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 from breezy.strategy.ladder_ev.quantile_density import (
     CdfMethod,
     EmosParams,
     Rung,
+    build_cdf,
     rung_probabilities,
 )
 from breezy.strategy.weather_common.costs import venue_fee_prob
@@ -43,7 +46,9 @@ _DAY = dt.date(2026, 10, 1)
 _STATION = "KMIA"
 _KMIA_OFFSET = -5.0
 _KLAX_OFFSET = -8.0
+_KMIA_LAT = 25.7617
 _INSTRUMENT = "KMIA-2026-10-01-i1.POLY_US"
+_ERA = "v1"
 
 _LADDER = (
     Rung("lt", None, 77),
@@ -65,7 +70,11 @@ def _ns(y: int, m: int, d: int, h: int = 0, mi: int = 0) -> int:
 
 
 def _vector(
-    *, mean: float = 80.0, sd: float = 2.5, climate_day: dt.date = _DAY,
+    *,
+    mean: float = 80.0,
+    sd: float = 2.5,
+    climate_day: dt.date = _DAY,
+    model_version: str = _ERA,
 ) -> ForecastQuantileVector:
     return ForecastQuantileVector(
         q10=mean - 3.2,
@@ -78,14 +87,25 @@ def _vector(
         available_at_ns=1_000,
         cycle_runtime_ns=500,
         climate_day=climate_day,
+        model_version=model_version,
     )
 
 
-def _artefact() -> CalibrationArtefact:
-    return CalibrationArtefact(
+def _artefact() -> LiveCalibration:
+    """A ``LiveCalibration`` with an identity EMOS transform
+    (``a=0, gamma=0, delta=1``) under the ONE era this suite's vectors carry
+    (``_ERA``) -- see ``quantile_density.apply_emos``'s own docstring for why
+    that leaves the base CDF unchanged, so this suite's hand-computed
+    expectations stay comparable to the pre-S2 flat-artefact goldens."""
+    identity = EmosParams(a=0.0, gamma=0.0, delta=1.0)
+    return LiveCalibration(
         sha256="a" * 64,
         cdf_method=CdfMethod.NORMAL,
-        emos=EmosParams(a=0.0, gamma=0.0, delta=1.0),
+        correction_form=CorrectionForm.NONE,
+        linear_coefficients=None,
+        month_offsets={},
+        point_by_version={_ERA: identity},
+        draws_by_version={_ERA: (identity,)},
     )
 
 
@@ -95,8 +115,14 @@ def _fixed_haircut_bounds(haircut: float = 0.03) -> Callable[..., RungBounds]:
     computes one (item 4)."""
 
     def _provider(
-        *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str
+        *,
+        percentiles: Any,
+        draws: Sequence[EmosParams],
+        ladder: Sequence[Rung],
+        rung_id: str,
     ) -> RungBounds:
+        del draws
+        cdf = build_cdf(CdfMethod.NORMAL, percentiles)
         p_hat = rung_probabilities(cdf, ladder)[rung_id]
         return RungBounds(
             p_hat=p_hat,
@@ -116,7 +142,7 @@ def _no_ask(price: float, *, instrument_id: str = _INSTRUMENT + ".NO") -> SidedA
 
 
 _DEFAULT_VECTOR = _vector()
-_DEFAULT_ARTEFACT = _artefact()
+_DEFAULT_CALIBRATION = _artefact()
 _DEFAULT_LADDER_CFG = LadderEvConfig()
 _DEFAULT_BOUNDS = _fixed_haircut_bounds()
 
@@ -137,7 +163,8 @@ def _run(
     slippage_floor_prob: float = 0.01,
     h_hours: float = 6.0,
     cfg: LadderEvConfig = _DEFAULT_LADDER_CFG,
-    artefact: CalibrationArtefact = _DEFAULT_ARTEFACT,
+    calibration: LiveCalibration = _DEFAULT_CALIBRATION,
+    latitude_deg: float = _KMIA_LAT,
     bounds_provider: Callable[..., RungBounds] = _DEFAULT_BOUNDS,
     latch: QuantileLadderLatch | None = None,
 ) -> Decision:
@@ -160,7 +187,8 @@ def _run(
         slippage_floor_prob=slippage_floor_prob,
         h_hours=h_hours,
         cfg=cfg,
-        artefact=artefact,
+        calibration=calibration,
+        latitude_deg=latitude_deg,
         bounds_provider=bounds_provider,
         latch=latch if latch is not None else QuantileLadderLatch(),
     )
@@ -498,14 +526,18 @@ def test_decisions_depend_only_on_the_supplied_bounds() -> None:
     itself."""
 
     def generous(
-        *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str
+        *, percentiles: Any, draws: Sequence[EmosParams], ladder: Sequence[Rung], rung_id: str
     ) -> RungBounds:
+        del draws
+        cdf = build_cdf(CdfMethod.NORMAL, percentiles)
         p_hat = rung_probabilities(cdf, ladder)[rung_id]
         return RungBounds(p_hat=p_hat, p_lower=min(1.0, p_hat + 0.5), p_upper=1.0)
 
     def stingy(
-        *, cdf: Callable[[float], float], ladder: Sequence[Rung], rung_id: str
+        *, percentiles: Any, draws: Sequence[EmosParams], ladder: Sequence[Rung], rung_id: str
     ) -> RungBounds:
+        del draws
+        cdf = build_cdf(CdfMethod.NORMAL, percentiles)
         p_hat = rung_probabilities(cdf, ladder)[rung_id]
         return RungBounds(p_hat=p_hat, p_lower=max(0.0, p_hat - 0.5), p_upper=1.0)
 
@@ -518,6 +550,26 @@ def test_decisions_depend_only_on_the_supplied_bounds() -> None:
 
 def test_calibration_artefact_has_no_haircut_fields() -> None:
     """Item 4: the haircut fields are removed from the artefact entirely."""
-    artefact = _artefact()
-    assert not hasattr(artefact, "p_lower_haircut")
-    assert not hasattr(artefact, "p_upper_haircut")
+    calibration = _artefact()
+    assert not hasattr(calibration, "p_lower_haircut")
+    assert not hasattr(calibration, "p_upper_haircut")
+
+
+# ---------------------------------------------------------------------------
+# SL-13 S2: an unknown calibration-version era refuses closed, never latches
+# ---------------------------------------------------------------------------
+
+
+def test_an_unknown_calibration_version_refuses_with_the_named_reason() -> None:
+    result = _run(ask=_yes_ask(0.10), vector=_vector(model_version="v99"))
+
+    assert isinstance(result, Refuse)
+    assert result.reason == CALIBRATION_VERSION_UNAVAILABLE
+
+
+def test_an_unknown_calibration_version_never_latches() -> None:
+    latch = QuantileLadderLatch()
+
+    _run(ask=_yes_ask(0.10), vector=_vector(model_version="v99"), latch=latch)
+
+    assert latch.is_latched(station=_STATION, climate_day=_DAY, rung_id="i1", side="yes") is False

@@ -15,10 +15,15 @@ Ruling `docs/evidence/RULING_forecast_nbp_reopen_2026-09-29.md` §12 A-5
   or ``weather_common.costs.venue_fee_prob`` -- review item 1, SL-13p2: a
   shared scoring call would make A-5 a vacuous self-comparison even though
   the live/batch entry points differ). Only genuinely low-level, side-free
-  math primitives are shared: ``quantile_density`` (``build_cdf``,
-  ``apply_emos``, ``Percentiles``, ``Rung``) and the ``bounds``/``latch``
-  Protocols both paths are independently WIRED to (not the scoring logic
-  itself). NO import of the strategy or actor classes either. Pinned by
+  math primitives are shared: ``quantile_density`` (``Percentiles``,
+  ``Rung``, ``EmosParams``, ``CdfMethod``), the shared ``location_correction``
+  module (``daylight_hours``,
+  ``correction_prediction_f`` -- FQ-S4b, plan §3 S4b), and the
+  ``bounds``/``latch`` Protocols both paths are independently WIRED to (not
+  the scoring logic itself). NO import of the strategy or actor classes
+  either, and NO import of ``calibration_artefact.LiveCalibration``/
+  ``.resolve`` -- :class:`BatchCalibration`/:func:`resolve_batch_calibration`
+  below reimplement that per-version resolution independently. Pinned by
   ``tests/unit/test_nbp_shadow_parity_contract.py``.
 
 Parity = decision-key set equality, with mismatches = 0 (§12 A-5). This
@@ -39,7 +44,6 @@ from breezy.adapters.polymarket_us.safety import PERMIT_TTL_NS
 from breezy.ingest.gaps import local_standard_date
 from breezy.runtime.trade_supervisor_core import LAUNCH_UTC
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.forecast_state import (
@@ -47,13 +51,21 @@ from breezy.strategy.ladder_ev.forecast_state import (
     ForecastQuantileState,
     ForecastQuantileVector,
 )
-from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung, apply_emos, build_cdf
+from breezy.strategy.ladder_ev.location_correction import (
+    CorrectionForm,
+    correction_prediction_f,
+    daylight_hours,
+)
+from breezy.strategy.ladder_ev.quantile_density import CdfMethod, EmosParams, Percentiles, Rung
 
 __all__ = [
     "MIN_PRE_FREEZE_DAYS",
     "NUMERIC_FIELD_TOLERANCE",
+    "OPPOSITE_SIDE_LATCHED",
     "PRE_FREEZE_END",
     "PRE_FREEZE_START",
+    "BatchCalibration",
+    "BatchCalibrationUnknownVersionError",
     "BatchSnapshotInput",
     "DecisionKey",
     "DepthSnapshotRow",
@@ -61,6 +73,7 @@ __all__ = [
     "NbpQuantileRow",
     "ParityReport",
     "PostFreezeTapeRefusedError",
+    "ResolvedBatchCalibration",
     "UnparsableRungInstrumentIdError",
     "assert_minimum_pre_freeze_days",
     "assert_pre_freeze_tape_day",
@@ -73,6 +86,7 @@ __all__ = [
     "parse_rung_instrument_id",
     "permit_covers",
     "permit_window_for_day",
+    "resolve_batch_calibration",
     "run_batch_parity",
 ]
 
@@ -421,6 +435,112 @@ _QTY: Final = 1
 #: an artefact of two paths spelling the same refusal differently.
 _VECTOR_DAY_MISMATCH: Final[str] = "vector_day_mismatch"
 
+#: Same reason string `decision.py`'s `CALIBRATION_VERSION_UNAVAILABLE`
+#: constant carries (FQ-S4b, plan §3 S4b) -- textually identical, not
+#: imported. Checked immediately after `_VECTOR_DAY_MISMATCH`, mirroring
+#: `decision.evaluate`'s own check order (that function's docstring: "A
+#: later slice that adds a scoring refusal must insert it after (8)").
+_CALIBRATION_VERSION_UNAVAILABLE: Final[str] = "calibration_version_unavailable"
+
+#: D10 / S10, mirrored independently (plan §3 S4: "The batch path mirrors
+#: D10's `opposite_side_latched` independently"). Textually identical to
+#: `decision.OPPOSITE_SIDE_LATCHED`, never imported.
+OPPOSITE_SIDE_LATCHED: Final[str] = "opposite_side_latched"
+
+_OPPOSITE: Final[dict[Literal["yes", "no"], Literal["yes", "no"]]] = {
+    "yes": "no",
+    "no": "yes",
+}
+
+
+# ---------------------------------------------------------------------------
+# FQ-S4b: the batch path's OWN per-version calibration resolution --
+# independently reimplemented from `calibration_artefact.LiveCalibration`/
+# `.resolve` (never imported, never called), sharing only the low-level,
+# side-free `location_correction` primitives (plan §3 S4b, review item 1).
+# ---------------------------------------------------------------------------
+
+
+class BatchCalibrationUnknownVersionError(KeyError):
+    """Mirrors `calibration_artefact.CalibrationArtefactUnknownVersionError`
+    (never imported): raised by :func:`resolve_batch_calibration` when
+    ``era`` names an NBM version this calibration carries no parameters/
+    draws for. The batch path's own :func:`_evaluate_independently` turns
+    this into ``Refuse(_CALIBRATION_VERSION_UNAVAILABLE)``, never an
+    uncaught exception."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BatchCalibration:
+    """Independent mirror of `calibration_artefact.LiveCalibration`'s SHAPE
+    (never imported -- review item 1, SL-13p2/S4b): the batch path's own
+    per-version EMOS point/draws plus the shared location-correction
+    configuration. The CLI orchestrator (``nbp_shadow_parity.py``)
+    constructs ONE of these per run, from the SAME sha-pinned fields
+    ``calibration_artefact.load_live_calibration`` already validated for the
+    live leg -- loading/parsing (the sha pin, the schema, the fail-closed
+    checks) is shared, read ONCE; only the RESOLUTION math below is
+    independently written.
+    """
+
+    cdf_method: CdfMethod
+    correction_form: CorrectionForm
+    linear_coefficients: tuple[float, float] | None
+    month_offsets: Mapping[int, float]
+    point_by_version: Mapping[str, EmosParams]
+    draws_by_version: Mapping[str, tuple[EmosParams, ...]]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ResolvedBatchCalibration:
+    """One ``(era, latitude_deg, climate_day)`` resolution -- the batch
+    path's own mirror of `calibration_artefact.ResolvedCalibration`."""
+
+    cdf_method: CdfMethod
+    point: EmosParams
+    draws: tuple[EmosParams, ...]
+    correction_f: float
+
+
+def resolve_batch_calibration(
+    calibration: BatchCalibration, era: str, *, latitude_deg: float, climate_day: date,
+) -> ResolvedBatchCalibration:
+    """The batch path's OWN per-version resolution (review item 1, S4b):
+    reimplements `calibration_artefact.LiveCalibration.resolve` directly
+    from the plan text, never calling it. Shares only the low-level,
+    side-free `location_correction` primitives (`daylight_hours`,
+    `correction_prediction_f`), per the module docstring.
+
+    Raises :class:`BatchCalibrationUnknownVersionError` when ``era`` is not
+    a version this calibration carries parameters for -- never pools or
+    substitutes a different version's draws (finding F3).
+    """
+    point = calibration.point_by_version.get(era)
+    draws = calibration.draws_by_version.get(era)
+    if point is None or not draws:
+        raise BatchCalibrationUnknownVersionError(
+            f"{era!r} is not a version this calibration carries parameters "
+            f"for ({sorted(calibration.point_by_version)!r})",
+        )
+    day_length_hours = daylight_hours(latitude_deg, climate_day)
+    correction_f = correction_prediction_f(
+        calibration.correction_form,
+        month=climate_day.month,
+        day_length_hours=day_length_hours,
+        month_offsets=calibration.month_offsets,
+        linear_coefficients=calibration.linear_coefficients,
+    )
+    corrected_point = EmosParams(a=point.a + correction_f, gamma=point.gamma, delta=point.delta)
+    corrected_draws = tuple(
+        EmosParams(a=draw.a + correction_f, gamma=draw.gamma, delta=draw.delta) for draw in draws
+    )
+    return ResolvedBatchCalibration(
+        cdf_method=calibration.cdf_method,
+        point=corrected_point,
+        draws=corrected_draws,
+        correction_f=correction_f,
+    )
+
 
 class AskSideMismatchError(ValueError):
     """Raised when a :class:`SidedAsk` was quoted from the wrong side's
@@ -530,7 +650,8 @@ def _evaluate_independently(
     slippage_floor_prob: float,
     h_hours: float,
     cfg: LadderEvConfig,
-    artefact: CalibrationArtefact,
+    calibration: BatchCalibration,
+    latitude_deg: float,
     bounds_provider: BoundsProvider,
     latch: QuantileLadderLatch,
 ) -> Decision:
@@ -550,7 +671,9 @@ def _evaluate_independently(
     gates mirror `decision.evaluate` exactly (so a live-vs-batch
     `DecisionKey` compares like for like) -- only the ARITHMETIC (fee,
     margin, net) and the control-flow that computes it are independently
-    written, never shared.
+    written, never shared. FQ-S4b adds the opposite-side latch check (D10 /
+    S10) and the per-version calibration resolution (S2), at the SAME
+    position `decision.evaluate` places them.
     """
     if ask.side != side:
         raise AskSideMismatchError(
@@ -573,11 +696,26 @@ def _evaluate_independently(
     if latch.is_latched(station=station, climate_day=climate_day, rung_id=rung_id, side=side):
         return Refuse(reason="already_latched")
 
+    # Precedence, pinned: own-side latch (above) then this opposite-side
+    # check, then forecast_unavailable/vector_day_mismatch/calibration
+    # resolution -- mirrors `decision.evaluate`'s own check order exactly.
+    if latch.is_latched(
+        station=station, climate_day=climate_day, rung_id=rung_id, side=_OPPOSITE[side],
+    ):
+        return Refuse(reason=OPPOSITE_SIDE_LATCHED)
+
     if vector is None:
         return Refuse(reason="forecast_unavailable")
 
     if vector.climate_day != climate_day:
         return Refuse(reason=_VECTOR_DAY_MISMATCH)
+
+    try:
+        resolved = resolve_batch_calibration(
+            calibration, vector.model_version, latitude_deg=latitude_deg, climate_day=climate_day,
+        )
+    except BatchCalibrationUnknownVersionError:
+        return Refuse(reason=_CALIBRATION_VERSION_UNAVAILABLE)
 
     percentiles = Percentiles(
         q10=vector.q10,
@@ -588,9 +726,16 @@ def _evaluate_independently(
         mean=vector.mean,
         sd=vector.sd,
     )
-    base_cdf = build_cdf(artefact.cdf_method, percentiles)
-    cdf = apply_emos(base_cdf, percentiles, artefact.emos)
-    bounds = bounds_provider(cdf=cdf, ladder=ladder, rung_id=rung_id)
+    # `resolved.point` is deliberately never read here (ruling A-6, mirrored
+    # from `decision.evaluate`): only `resolved.draws` carries statistical
+    # uncertainty into the injected `BoundsProvider`, which derives `p_hat`
+    # as the MEAN of the per-draw rung probabilities. `point` is kept on
+    # `ResolvedBatchCalibration` only for a future live/batch parity check,
+    # mirroring `calibration_artefact.ResolvedCalibration.point`'s own
+    # docstring.
+    bounds = bounds_provider(
+        percentiles=percentiles, draws=resolved.draws, ladder=ladder, rung_id=rung_id,
+    )
     p_hat, p_lower, p_upper = bounds.p_hat, bounds.p_lower, bounds.p_upper
 
     fee = _fee_prob(price=ask.price, fee_coefficient=fee_coefficient)
@@ -675,11 +820,19 @@ class NbpQuantileRow:
     """One derived NBP quantile/summary row -- the fields
     :meth:`ForecastQuantileState.push` needs, decoupled from
     ``breezy.persistence.nbp_derived_store.DerivedNbpRow`` (that module is a
-    backfill-store reader/writer, out of scope for this pure path)."""
+    backfill-store reader/writer, out of scope for this pure path).
+
+    ``valid_start_ns``/``valid_end_ns`` (FQ-S4b, plan §3 S4b) are the row's
+    OWN MAX-column validity window -- carried through so the live leg's
+    ``ForecastPoint`` (``nbp_shadow_parity.py``) is built from this row's
+    REAL window, never a placeholder repeating ``cycle_runtime_ns``.
+    """
 
     station: str
     variable: str
     cycle_runtime_ns: int
+    valid_start_ns: int
+    valid_end_ns: int
     value_f: float | None
     available_at_ns: int
     climate_day: date
@@ -699,6 +852,7 @@ class BatchSnapshotInput:
     fee_coefficient: float
     slippage_floor_prob: float
     vector: ForecastQuantileVector | None
+    latitude_deg: float
 
 
 def _row_context(row: DepthSnapshotRow) -> tuple[str, date, str, Literal["yes", "no"]]:
@@ -712,7 +866,7 @@ def evaluate_batch_snapshot(
     inp: BatchSnapshotInput,
     *,
     cfg: LadderEvConfig,
-    artefact: CalibrationArtefact,
+    calibration: BatchCalibration,
     bounds_provider: BoundsProvider,
     latch: QuantileLadderLatch,
 ) -> Decision:
@@ -739,7 +893,8 @@ def evaluate_batch_snapshot(
         slippage_floor_prob=inp.slippage_floor_prob,
         h_hours=h_hours,
         cfg=cfg,
-        artefact=artefact,
+        calibration=calibration,
+        latitude_deg=inp.latitude_deg,
         bounds_provider=bounds_provider,
         latch=latch,
     )
@@ -770,12 +925,13 @@ def run_batch_parity(
     depth_snapshots: Sequence[DepthSnapshotRow],
     nbp_rows: Sequence[NbpQuantileRow],
     ladder_by_key: Mapping[tuple[str, date], Sequence[Rung]],
-    artefact: CalibrationArtefact,
+    calibration: BatchCalibration,
     ladder_cfg: LadderEvConfig,
     bounds_provider: BoundsProvider,
     fee_coefficient: float,
     slippage_floor_prob: float,
     std_utc_offset_hours_by_station: Mapping[str, float],
+    latitude_deg_by_station: Mapping[str, float],
     quantile_station_keys: Mapping[str, str] | None = None,
 ) -> tuple[DecisionKey, ...]:
     """The batch path's own driver loop: one evaluation per depth snapshot
@@ -804,12 +960,17 @@ def run_batch_parity(
         if nbp_row.variable not in NBP_QUANTILE_VARIABLES:
             continue
         state = states_by_station.setdefault(nbp_row.station, ForecastQuantileState())
+        # "header wins" convention (plan D2, SL-13 S2) -- the SAME
+        # transformation `ForecastQuantileStateActor.on_data` applies to a
+        # live `ForecastPoint.model_version`, reimplemented here so the
+        # batch path resolves calibration per the SAME NBM version era.
         state.push(
             variable=nbp_row.variable,
             value_f=nbp_row.value_f,
             available_at_ns=nbp_row.available_at_ns,
             cycle_runtime_ns=nbp_row.cycle_runtime_ns,
             climate_day=nbp_row.climate_day,
+            model_version=f"v{nbp_row.header_model_version}",
         )
 
     for row in ordered:
@@ -837,11 +998,12 @@ def run_batch_parity(
             fee_coefficient=fee_coefficient,
             slippage_floor_prob=slippage_floor_prob,
             vector=None if vector is None else vector.value_at(row.ts_ns),
+            latitude_deg=latitude_deg_by_station[station],
         )
         decision = evaluate_batch_snapshot(
             snapshot_input,
             cfg=ladder_cfg,
-            artefact=artefact,
+            calibration=calibration,
             bounds_provider=bounds_provider,
             latch=latch,
         )

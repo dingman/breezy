@@ -64,7 +64,7 @@ from breezy.registry.sites import default_registry
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.strategy.depth10 import best_order
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
-from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
+from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
 from breezy.strategy.forecast_quantile_ladder.decision import (
     Decision,
@@ -137,7 +137,7 @@ class ForecastQuantileLadderStrategy(Strategy):
         config: ForecastQuantileLadderConfig,
         *,
         quantile_actor: ForecastQuantileStateActor,
-        artefact: CalibrationArtefact,
+        calibration: LiveCalibration,
         ladder_cfg: LadderEvConfig,
         bounds_provider: BoundsProvider,
         latch: SupportsQuantileLatch | None = None,
@@ -154,7 +154,7 @@ class ForecastQuantileLadderStrategy(Strategy):
     ) -> None:
         super().__init__(config)
         self._quantile_actor = quantile_actor
-        self._artefact = artefact
+        self._calibration = calibration
         self._ladder_cfg = ladder_cfg
         self._bounds_provider = bounds_provider
         self._latch = latch if latch is not None else QuantileLadderLatch()
@@ -225,6 +225,18 @@ class ForecastQuantileLadderStrategy(Strategy):
         #: :meth:`on_start` (mirrors ``ContinuousRungHoldStrategy``'s own
         #: ``_std_utc_offset_hours_by_station``).
         self._std_utc_offset_hours: dict[str, float] = {}
+        #: ``station -> latitude_deg``, populated once at :meth:`on_start`
+        #: via ``registry.enrichment_coordinates`` (SL-13 S2, plan D2) -- the
+        #: SAME coordinate source ``scripts/analysis/nbp_skill_study.py``'s
+        #: own ``_daylight_hours``/``_station_latitudes`` use, never a second
+        #: lookup table. :meth:`evaluate_snapshot` falls back to ``0.0`` when
+        #: a station is absent (e.g. a test driving ``evaluate_snapshot``
+        #: directly without first calling :meth:`on_start`) -- harmless
+        #: whenever the resolved calibration's own ``correction_form`` is
+        #: ``NONE`` (the latitude is unused), and never reachable in a real
+        #: boot, where :meth:`on_start` always populates every configured
+        #: station before any tick is evaluated.
+        self._latitude_deg_by_station: dict[str, float] = {}
 
     def on_start(self) -> None:
         """Resolve YES/NO instrument ids per rung and subscribe (SL-13).
@@ -256,6 +268,10 @@ class ForecastQuantileLadderStrategy(Strategy):
         registry = default_registry()
         self._std_utc_offset_hours = {
             station: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
+            for station in self.config.stations
+        }
+        self._latitude_deg_by_station = {
+            station: registry.enrichment_coordinates(_VENUE, station).lat
             for station in self.config.stations
         }
         subscribed = self._subscribe_ids(self._instrument_ids)
@@ -470,6 +486,11 @@ class ForecastQuantileLadderStrategy(Strategy):
         vector: ForecastQuantileVector | None = self._quantile_actor.state_for(
             actor_station,
         ).value_at(now_ns)
+        # `on_start` always populates this for every configured station
+        # (SL-13 S2); `0.0` is a harmless placeholder for a direct
+        # `evaluate_snapshot` call that skipped `on_start` (e.g. a unit
+        # test) -- see `_latitude_deg_by_station`'s own docstring.
+        latitude_deg = self._latitude_deg_by_station.get(station, 0.0)
         decision = evaluate(
             now_ns=now_ns,
             std_utc_offset_hours=std_utc_offset_hours,
@@ -485,7 +506,8 @@ class ForecastQuantileLadderStrategy(Strategy):
             slippage_floor_prob=slippage_floor_prob,
             h_hours=h_hours,
             cfg=self._ladder_cfg,
-            artefact=self._artefact,
+            calibration=self._calibration,
+            latitude_deg=latitude_deg,
             bounds_provider=self._bounds_provider,
             # `decision.evaluate` (SL-12, unmodified) types `latch` nominally
             # as `QuantileLadderLatch`; SL-13 widens THIS class's own
