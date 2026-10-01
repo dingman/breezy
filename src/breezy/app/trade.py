@@ -409,7 +409,7 @@ def _build_fee_drift_probe(
                 "probe not registered"
             )
             return None
-        resolve_slug = lambda: slug  # noqa: E731 - pin the eagerly-resolved slug
+        resolve_slug = lambda: slug  # pin the eagerly-resolved slug
 
     node_holder: dict[str, Any] = {}
     client_holder: dict[str, PolymarketUSHttpClient] = {}

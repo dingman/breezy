@@ -152,7 +152,7 @@ from breezy.persistence.archive_cache import (  # noqa: E402
 )
 from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition  # noqa: E402
 from breezy.registry.sites import default_registry  # noqa: E402
-from breezy.strategy.ladder_ev.location_correction import daylight_hours  # noqa: E402
+from breezy.strategy.ladder_ev.location_correction import daylight_hours
 from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
     CdfMethod,
     EmosParams,

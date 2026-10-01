@@ -15,8 +15,6 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-import pytest
-
 import breezy.persistence.family_manifest as family_manifest_module
 import breezy.runtime.trade_supervisor_core as trade_supervisor_core_module
 from breezy.persistence.family_manifest import load_family_manifest

@@ -45,10 +45,10 @@ from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 from breezy.strategy.ladder_ev.quantile_density import CdfMethod, EmosParams, Percentiles, Rung
 from scripts.analysis.nbp_shadow_parity import run_live_parity
 from scripts.analysis.nbp_shadow_parity_pure import (
+    OPPOSITE_SIDE_LATCHED,
     BatchCalibration,
     DepthSnapshotRow,
     NbpQuantileRow,
-    OPPOSITE_SIDE_LATCHED,
     diff_decision_keys,
     no_depth_census,
     run_batch_parity,
@@ -193,7 +193,12 @@ def _depth_frame(
     )
 
 
-def _forecast_points(*, climate_day: dt.date, cycle_ns: int, available_at_ns: int) -> tuple[ForecastPoint, ...]:
+def _forecast_points(
+    *,
+    climate_day: dt.date,
+    cycle_ns: int,
+    available_at_ns: int,
+) -> tuple[ForecastPoint, ...]:
     return tuple(
         ForecastPoint(
             station=STATION,
@@ -213,7 +218,12 @@ def _forecast_points(*, climate_day: dt.date, cycle_ns: int, available_at_ns: in
     )
 
 
-def _nbp_rows(*, climate_day: dt.date, cycle_ns: int, available_at_ns: int) -> tuple[NbpQuantileRow, ...]:
+def _nbp_rows(
+    *,
+    climate_day: dt.date,
+    cycle_ns: int,
+    available_at_ns: int,
+) -> tuple[NbpQuantileRow, ...]:
     return tuple(
         NbpQuantileRow(
             station=STATION,

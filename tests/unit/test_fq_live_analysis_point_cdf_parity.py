@@ -62,7 +62,7 @@ from breezy.strategy.ladder_ev.quantile_density import (
     build_cdf,
     rung_probabilities,
 )
-from scripts.analysis.nbp_skill_study import calibrated_m2_rung_probabilities  # noqa: E402
+from scripts.analysis.nbp_skill_study import calibrated_m2_rung_probabilities
 
 _VENUE = "polymarket_us"
 
