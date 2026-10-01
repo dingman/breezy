@@ -34,7 +34,7 @@ _EXPECTED_REMOVED_CONTINUOUS = "Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1"
 #: `test_the_installed_unit_names_a_REGISTERED_family` additionally resolves
 #: it against deploy/families/ -- a unit naming an unregistered or DRAFT
 #: family must fail here, not at 16:50Z launch.
-_EXPECTED_SENDING_FAMILY_ID = "pm_us_crh_v4"
+_EXPECTED_SENDING_FAMILY_ID = "pm_us_crh_fq_v1"
 _EXPECTED_REPLACEMENT_ADDED = (
     f"Environment=BREEZY_SENDING_FAMILY_ID={_EXPECTED_SENDING_FAMILY_ID}"
 )
