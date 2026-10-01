@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,11 @@ def test_permit_absent_stays_shadow_with_a_clean_ruling(tmp_path: Path) -> None:
 
     assert decision.enabled is False
     assert decision.reason == "permit_absent"
+    # Security review (dae1b13b, item required-before-go-live): the boot
+    # log's `ruling_sha256=` field must carry the VERIFIED sha even in the
+    # permit_absent state -- the ruling itself was already proven clean by
+    # the time this reason is reached, only the permit is missing.
+    assert decision.ruling_sha256 == _RULING_SHA256
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +211,64 @@ def test_all_good_enables_live_orders(tmp_path: Path) -> None:
 
     assert decision.enabled is True
     assert decision.reason == "ok"
+    # Security review (dae1b13b): the `fq_live_orders` boot log's
+    # `ruling_sha256=` field logs the SHA when the gate is enabled.
+    assert decision.ruling_sha256 == _RULING_SHA256
+
+
+# ---------------------------------------------------------------------------
+# Security review required-change: `ruling_sha256=<sha|none>` on the boot
+# log line -- the sha when the gate is enabled, `none` when refused.
+# ---------------------------------------------------------------------------
+
+
+def test_ruling_sha256_is_none_when_no_ruling_is_declared(tmp_path: Path) -> None:
+    """`app/trade.py` logs `manifest.live_orders_ruling or "none"` for
+    `ruling=`, and would do the same for `ruling_sha256=` if the decision
+    carried one here -- it must not: nothing was ever verified."""
+    manifest = _manifest(tmp_path)
+
+    decision = live_orders_authorized(manifest, tmp_path, permit_present=True)
+
+    assert decision.reason == "no_ruling"
+    assert decision.ruling_sha256 is None
+
+
+@pytest.mark.parametrize(
+    "build_manifest",
+    [
+        lambda tmp_path: _manifest(
+            tmp_path, live_orders_ruling="RULING_some_other_decision_2026-10-01"
+        ),
+    ],
+)
+def test_a_refused_gate_never_exposes_a_ruling_sha256(
+    tmp_path: Path, build_manifest: Any
+) -> None:
+    """`app/trade.py`'s `except LiveOrdersGateRefusedError` branch hardcodes
+    `ruling_sha256=none` on the boot log line -- correct only because the
+    exception itself never carries a verified sha for ANY refusing reason
+    (not_allowlisted, ruling_missing, ruling_outside_evidence,
+    ruling_sha_mismatch alike: none of them completed verification)."""
+    manifest = build_manifest(tmp_path)
+
+    with pytest.raises(LiveOrdersGateRefusedError) as excinfo:
+        live_orders_authorized(manifest, tmp_path, permit_present=True)
+
+    assert not hasattr(excinfo.value, "ruling_sha256")
+
+
+def test_the_fq_live_orders_boot_log_line_carries_ruling_sha256() -> None:
+    """Pins the actual `app/trade.py` log call shapes -- the refusal branch
+    hardcodes the literal `ruling_sha256=none` (nothing was ever verified at
+    that point), and the success branch logs the gate's own
+    `live_orders.ruling_sha256 or "none"` (the sha when enabled or
+    permit_absent, `"none"` only for `no_ruling`)."""
+    source = (_REPO_ROOT / "src" / "breezy" / "app" / "trade.py").read_text(encoding="utf-8")
+
+    assert re.search(r"fq_live_orders enabled=False.{0,120}ruling_sha256=none", source, re.DOTALL)
+    assert "live_orders.ruling_sha256 or \"none\"" in source
+    assert re.search(r"fq_live_orders enabled=%s.{0,160}ruling_sha256=%s", source, re.DOTALL)
 
 
 def test_shadow_only_propagates_to_every_composed_strategy(tmp_path: Path) -> None:
