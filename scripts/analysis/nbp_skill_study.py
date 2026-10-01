@@ -2153,8 +2153,15 @@ def run_validate_gates_from_rows(
     }
 
 
-def write_validate_evidence_note(payload: Mapping[str, object], *, date: dt.date) -> Path:
-    path = DEFAULT_VALIDATE_EVIDENCE_DIR / f"NBP_S2_VALIDATE_RESULT_{date.isoformat()}.md"
+def write_validate_evidence_note(
+    payload: Mapping[str, object],
+    *,
+    date: dt.date,
+    evidence_dir: Path,
+) -> Path:
+    # Required. A repo-path default let tests overwrite docs/evidence and unlink
+    # the committed note. The CLI passes DEFAULT_VALIDATE_EVIDENCE_DIR itself.
+    path = evidence_dir / f"NBP_S2_VALIDATE_RESULT_{date.isoformat()}.md"
     gates = payload.get("gates", {})
     artefact = payload.get("artefact")
     artefact_sha256 = artefact.get("sha256") if isinstance(artefact, Mapping) else None
@@ -2355,7 +2362,11 @@ def main(argv: list[str] | None = None) -> int:
                 comparator_events=comparator_events,
             )
             payload["validate_gates"] = gate_payload
-            evidence_note = write_validate_evidence_note(gate_payload, date=dt.date.today())
+            evidence_note = write_validate_evidence_note(
+                gate_payload,
+                date=dt.date.today(),
+                evidence_dir=DEFAULT_VALIDATE_EVIDENCE_DIR,
+            )
             payload["validate_evidence_note"] = str(evidence_note)
     print(f"nbp_skill_study: stage=validate splits={DEFAULT_SPLITS!r}")
     print(json.dumps(payload, indent=2, sort_keys=True))
