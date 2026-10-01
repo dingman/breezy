@@ -1,22 +1,21 @@
-"""FQ-S8 RED suite -- registration artefacts (plan
-`FQ_GO_LIVE_PLAN_2026-10-01.md` D5, S8): the committed byte-copy of the
-selected calibration candidate, the sentinel boundary artefact, and the
-REGISTERED `pm_us_crh_fq_v1.json` manifest carrying `live_orders_ruling`.
+"""FQ-S8 registration artefacts (plan `FQ_GO_LIVE_PLAN_2026-10-01.md` D5, S8):
+the committed byte-copy of the selected calibration candidate, the sentinel
+boundary artefact, and the REGISTERED `pm_us_crh_fq_v1.json` manifest
+carrying `live_orders_ruling`.
 
-Scope note (parallel-build): S2 (the live calibration consumer rewrite that
-reads the real `NbpCalibrationArtefact` JSON shape) is NOT in this
-worktree's base. These tests therefore pin BYTES and SHAS and drive the
-S5 manifest/gate contracts only -- they never ask the OLD
-`calibration_artefact.load_calibration_artefact` to parse the real
-artefact's body (it still expects a flat ``emos`` key the real artefact
-does not have, plan finding F1, and would raise a bare ``KeyError``). The
-one place this suite DOES call that loader is the tamper test, where the
-sha check raises before any parsing is attempted.
+S2 has landed. These tests pin bytes and shas, drive the S5 manifest/gate
+contracts, and parse the registered artefact with ``load_live_calibration``
+(the real ``NbpCalibrationArtefact`` schema). Every fail-closed condition,
+including a sha mismatch, raises ``CalibrationArtefactPinMismatchError``.
+``LiveCalibration`` keeps ``correction_form`` and ``linear_coefficients``;
+``recalibration`` is not retained -- the loader refuses any value other than
+``"none"``, and the positive test asserts that payload key directly.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,8 +29,9 @@ from breezy.persistence.gs_boundary_artefact import (
 from breezy.persistence.live_orders_gate import live_orders_authorized
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import (
     CalibrationArtefactPinMismatchError,
-    load_calibration_artefact,
+    load_live_calibration,
 )
+from breezy.strategy.ladder_ev.location_correction import CorrectionForm
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / "pm_us_crh_fq_v1.json"
@@ -136,7 +136,6 @@ def test_live_orders_gate_stays_shadow_with_no_permit() -> None:
 
 # ---------------------------------------------------------------------------
 # A tampered artefact byte refuses -- sha check fires before any parsing
-# (never routed through the still-broken, pre-S2 emos parser)
 # ---------------------------------------------------------------------------
 
 
@@ -146,27 +145,48 @@ def test_a_tampered_calibration_artefact_byte_refuses_the_sha_pin(tmp_path: Path
     tampered.write_bytes(_CALIBRATION_ARTEFACT_PATH.read_bytes() + b"\n")
 
     with pytest.raises(CalibrationArtefactPinMismatchError):
-        load_calibration_artefact(str(tampered), expected_sha256=manifest.density_artefact_sha256)
+        load_live_calibration(str(tampered), expected_sha256=manifest.density_artefact_sha256)
 
 
-def test_the_untampered_byte_copy_passes_its_own_sha_check(tmp_path: Path) -> None:
+def test_the_untampered_byte_copy_passes_its_own_sha_check() -> None:
     """Control for the tamper test above: the SAME loader call, same pin,
-    unmodified bytes, raises nothing at the sha-check stage. (It is not
-    asserted to return successfully here -- the old loader's `payload["emos"]`
-    parse still fails on the real artefact's actual schema, plan finding F1,
-    fixed by S2, not this slice.)"""
+    unmodified bytes. A pin mismatch or any other fail-closed condition
+    raises ``CalibrationArtefactPinMismatchError``; this copy must not."""
     manifest = load_family_manifest(_MANIFEST_PATH)
     try:
-        load_calibration_artefact(
-            str(_CALIBRATION_ARTEFACT_PATH), expected_sha256=manifest.density_artefact_sha256
+        load_live_calibration(
+            str(_CALIBRATION_ARTEFACT_PATH),
+            expected_sha256=manifest.density_artefact_sha256,
         )
-    except CalibrationArtefactPinMismatchError:
-        pytest.fail("the untampered, correctly-pinned byte copy must pass its own sha check")
-    except KeyError as exc:
-        assert str(exc) == "'emos'", (
-            "expected the KNOWN, pre-S2 F1 failure mode (missing flat 'emos' key) "
-            f"past a clean sha check -- got a different KeyError: {exc!r}"
+    except CalibrationArtefactPinMismatchError as exc:
+        pytest.fail(
+            "the untampered, correctly-pinned byte copy must pass its own sha check "
+            f"and parse: {exc}"
         )
+
+
+def test_registered_density_artefact_parses_with_its_pinned_sha() -> None:
+    """The manifest pin loads. Versions and per-version draws are non-empty,
+    the correction is the linear day-length form, and payload recalibration
+    is ``none`` (not a ``LiveCalibration`` field -- the loader only checks it)."""
+    manifest = load_family_manifest(_MANIFEST_PATH)
+    artefact_path = _REPO_ROOT / manifest.density_artefact_path
+    calibration = load_live_calibration(
+        str(artefact_path),
+        expected_sha256=manifest.density_artefact_sha256,
+    )
+
+    versions = calibration.point_by_version
+    assert versions
+    assert set(versions) == set(calibration.draws_by_version)
+    for version, draws in calibration.draws_by_version.items():
+        assert len(draws) > 0, version
+
+    assert calibration.correction_form is CorrectionForm.LINEAR_DAYLENGTH
+    assert calibration.linear_coefficients == pytest.approx((-0.398, 4.28), rel=1e-2)
+
+    payload = json.loads(artefact_path.read_text(encoding="utf-8"))
+    assert payload["recalibration"] == "none"
 
 
 # ---------------------------------------------------------------------------
