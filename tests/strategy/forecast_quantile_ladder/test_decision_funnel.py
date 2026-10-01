@@ -364,8 +364,6 @@ def test_build_wires_decision_counts_as_the_shadow_decision_sink(
         latch=QuantileLadderLatch(),
         calibration_artefact_path=artefact_path,
         calibration_artefact_sha256=artefact_sha,
-        bounds_artefact_path=artefact_path,
-        bounds_artefact_sha256=artefact_sha,
         now_ns_fn=lambda: _WIRING_NOW_NS,
         decision_counts=counts,
     )
@@ -396,8 +394,6 @@ def test_build_with_no_decision_counts_leaves_the_sink_none(
         latch=QuantileLadderLatch(),
         calibration_artefact_path=artefact_path,
         calibration_artefact_sha256=artefact_sha,
-        bounds_artefact_path=artefact_path,
-        bounds_artefact_sha256=artefact_sha,
         now_ns_fn=lambda: _WIRING_NOW_NS,
     )
 
