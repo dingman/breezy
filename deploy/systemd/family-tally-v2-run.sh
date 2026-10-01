@@ -130,6 +130,13 @@ say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
+# S7: this composition has no family_tally_v2. Exit 0 before the marker
+# gate and before the analysis script, draft or registered.
+FAMILY_KIND=$(manifest_field "$FAMILIES_DIR/$FAMILY.json" composition_kind)
+if [ "$FAMILY_KIND" = "forecast_quantile_ladder" ]; then
+  say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- composition_kind=forecast_quantile_ladder has no family_tally_v2"
+  exit 0
+fi
 # Structural-dead pin is pm_us_crh_v2 only -- never attached to kalshi_crh_v1.
 # v2 is not the KILL clock. Its retired unit files are orphans (plan D-E);
 # this id only selects the v2 launch-window gate below.

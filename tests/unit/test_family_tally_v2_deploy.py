@@ -169,7 +169,25 @@ def test_wrapper_rejects_missing_family_id(tmp_path: Path) -> None:
         assert valid_id in result.stderr
 
 
-@pytest.mark.parametrize("family_id", sorted(_valid_family_ids()))
+def _families_with_a_tally_tool() -> list[str]:
+    """Families the wrapper still hands to family_tally_v2.
+
+    forecast_quantile_ladder has no such tool (S7). That id stays a valid
+    family id, and its skip is
+    ``test_a_forecast_quantile_ladder_family_skips_without_invoking_the_tally``.
+    """
+    kept: list[str] = []
+    for family_id in sorted(_valid_family_ids()):
+        payload = json.loads(
+            (_FAMILIES_DIR / f"{family_id}.json").read_text(encoding="utf-8")
+        )
+        if payload.get("composition_kind") == "forecast_quantile_ladder":
+            continue
+        kept.append(family_id)
+    return kept
+
+
+@pytest.mark.parametrize("family_id", _families_with_a_tally_tool())
 def test_wrapper_passes_family_id_through_unmodified(tmp_path: Path, family_id: str) -> None:
     capture = tmp_path / "argv_capture.txt"
     stub = tmp_path / "stub_python.sh"
@@ -219,6 +237,30 @@ esac
     as_of_arg = argv_lines[argv_lines.index("--as-of") + 1]
     assert len(as_of_arg) == len("2026-09-04")
     assert as_of_arg.count("-") == 2
+
+
+def test_a_forecast_quantile_ladder_family_skips_without_invoking_the_tally(
+    tmp_path: Path,
+) -> None:
+    """S7: forecast_quantile_ladder has no family_tally_v2. The unit prints
+    the composition skip and exits 0, and the analysis script is not run."""
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+    result = _run_wrapper(["pm_us_crh_fq_v1"], tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stderr
+    log_text = (tmp_path / "derived" / "family_tally_v2.log").read_text(encoding="utf-8")
+    assert (
+        "FAMILY TALLY V2 (pm_us_crh_fq_v1) SKIPPED -- "
+        "composition_kind=forecast_quantile_ladder has no family_tally_v2"
+    ) in log_text
+    assert not capture.exists()
 
 
 def test_wrapper_never_lists_a_boundary_artefact_json_as_a_valid_family_id(

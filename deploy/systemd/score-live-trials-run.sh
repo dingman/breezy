@@ -149,7 +149,7 @@ CJSON_CHAMPION="$OUT/covered_listed_station_days_champion_$STAMP.json"
 # so yesterday's file is not consumed and no new file is written.
 SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
 resolve_sending_family_manifest() {
-  local show id path status
+  local show id path status kind
   show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG") || true
   # `systemctl show --property=Environment` prints `Environment=K=V K=V`
   # (one or more lines). Strip the property name, then split assignments.
@@ -171,6 +171,14 @@ resolve_sending_family_manifest() {
     say "SCORE LIVE TRIALS SKIPPED -- no manifest for sending family $id"
     return 1
   fi
+  # S7: this composition has no score_live_trials. Return 2 before the
+  # REGISTERED gate so a draft manifest skips the same way a registered one
+  # will. The caller exits 0; every other refusal stays exit 1.
+  kind=$(manifest_field "$path" composition_kind)
+  if [ "$kind" = "forecast_quantile_ladder" ]; then
+    say "SCORE LIVE TRIALS SKIPPED -- composition_kind=forecast_quantile_ladder has no score_live_trials"
+    return 2
+  fi
   status=$(manifest_field "$path" status)
   if [ "$status" != "REGISTERED" ]; then
     say "SCORE LIVE TRIALS SKIPPED -- sending family $id status=${status:-absent} is not REGISTERED"
@@ -181,7 +189,13 @@ resolve_sending_family_manifest() {
   say "covered-listed champion counter family=$id manifest=$path"
   return 0
 }
-if ! resolve_sending_family_manifest; then
+resolve_sending_family_manifest
+resolve_rc=$?
+if [ "$resolve_rc" -eq 2 ]; then
+  rm -f "$CJSON" "$CJSON_CHAMPION"
+  exit 0
+fi
+if [ "$resolve_rc" -ne 0 ]; then
   rm -f "$CJSON" "$CJSON_CHAMPION"
   exit 1
 fi

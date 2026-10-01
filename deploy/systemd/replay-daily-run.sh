@@ -123,7 +123,7 @@ manifest_field() {
 # fires -- never silently folded into the ordinary skip path.
 SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
 resolve_family_manifest() {
-  local show id path status
+  local show id path status kind
   if ! show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG"); then
     say "REPLAY DAILY FAILED -- systemctl show failed, see $LOG"
     return 2
@@ -146,6 +146,14 @@ resolve_family_manifest() {
     say "REPLAY DAILY SKIPPED -- no manifest for sending family $id"
     return 1
   fi
+  # S7: this composition has no replay_daily_runner. Return 3 (2 is the
+  # systemctl failure) before the REGISTERED gate, and do not call the
+  # skip recorder -- that recorder is replay_daily_runner.py.
+  kind=$(manifest_field "$path" composition_kind)
+  if [ "$kind" = "forecast_quantile_ladder" ]; then
+    say "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder has no replay_daily_runner"
+    return 3
+  fi
   status=$(manifest_field "$path" status)
   if [ "$status" != "REGISTERED" ]; then
     say "REPLAY DAILY SKIPPED -- sending family $id status=${status:-absent} is not REGISTERED"
@@ -160,6 +168,8 @@ if [ "$resolve_rc" -eq 2 ]; then
   # INFRA failure (systemctl itself) -- loud, non-zero, no skip record: a
   # skip means "we know nothing is armed"; this means we DON'T know.
   exit 1
+elif [ "$resolve_rc" -eq 3 ]; then
+  exit 0
 elif [ "$resolve_rc" -ne 0 ]; then
   if report_skip NO_ARMED_FAMILY; then
     exit 0
