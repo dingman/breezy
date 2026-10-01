@@ -3,11 +3,11 @@
   "venue": "polymarket_us",
   "trial_id_prefix": "forecast_quantile_ladder/trial/pm_us_crh_fq_v1/",
   "d0_climate_day": "2099-01-01",
-  "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_fq_v1.json",
-  "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
+  "boundary_inputs_sha256": "f4b5d9df270599f55684e6ef4cb18fc440594cb23b92ecdf8bbec3dec1adc02f",
   "composition_kind": "forecast_quantile_ladder",
-  "density_artefact_path": "deploy/families/artefacts/not_yet_calibrated_forecast_density.json",
-  "density_artefact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "density_artefact_path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+  "density_artefact_sha256": "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e",
   "stations": [
     "LAX",
     "MDW",
@@ -15,5 +15,6 @@
     "SFO"
   ],
   "taker_fee_coefficient": "0.0695",
-  "status": "DRAFT_NOT_REGISTERED"
+  "status": "REGISTERED",
+  "live_orders_ruling": "RULING_operator_fq_live_real_orders_2026-10-01"
 }

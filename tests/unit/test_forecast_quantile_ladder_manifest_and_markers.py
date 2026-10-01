@@ -1,7 +1,7 @@
 """SL-13 -- ``forecast_quantile_ladder`` composition_kind wiring: the
 manifest exact-set widening (L-12), the supervisor marker-map widening, the
-committed DRAFT manifest's own refusal properties, and the exec client's
-byte-identity pin.
+committed manifest's own loadable properties (FQ-S8: REGISTERED, carrying
+the operator ruling), and the exec client's byte-identity pin.
 
 Mirrors ``tests/unit/test_wp11b_active_family_registry.py``'s
 ``test_forecast_ladder_composition_kind_deliberately_refuses_to_boot`` for
@@ -19,13 +19,12 @@ import pytest
 
 import breezy.persistence.family_manifest as family_manifest_module
 import breezy.runtime.trade_supervisor_core as trade_supervisor_core_module
-from breezy.persistence.family_manifest import (
-    UnregisteredFamilyManifestError,
-    load_family_manifest,
-)
+from breezy.persistence.family_manifest import load_family_manifest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DRAFT_MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / "pm_us_crh_fq_v1.json"
+_MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / "pm_us_crh_fq_v1.json"
+#: FQ-S8: the operator ruling the committed, REGISTERED manifest declares.
+_LIVE_ORDERS_RULING_ID = "RULING_operator_fq_live_real_orders_2026-10-01"
 
 #: Pinned at SL-13 authorship time. `client.py` is a NO-SEND execution-egress
 #: module (`adapters/polymarket_us/exec/client.py`) SL-13 must leave
@@ -83,22 +82,28 @@ def test_strategy_subscribed_in_recognises_the_new_marker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The committed DRAFT manifest itself
+# The committed manifest itself (FQ-S8: deliberate fixture state change --
+# DRAFT_NOT_REGISTERED -> REGISTERED, carrying the operator ruling). The
+# generic DRAFT refusal this used to cover stays exercised above, against a
+# synthetic fixture (`test_forecast_quantile_ladder_is_accepted_as_a_
+# composition_kind`), independent of this one committed manifest's status.
 # ---------------------------------------------------------------------------
 
 
-def test_pm_us_crh_fq_v1_is_committed_and_draft() -> None:
-    assert _DRAFT_MANIFEST_PATH.exists()
+def test_pm_us_crh_fq_v1_is_registered_with_the_operator_ruling() -> None:
+    assert _MANIFEST_PATH.exists()
 
-    with pytest.raises(UnregisteredFamilyManifestError):
-        load_family_manifest(_DRAFT_MANIFEST_PATH)
+    manifest = load_family_manifest(_MANIFEST_PATH)
+
+    assert manifest.status == "REGISTERED"
+    assert manifest.live_orders_ruling == _LIVE_ORDERS_RULING_ID
 
 
-def test_pm_us_crh_fq_v1_loads_with_allow_draft_and_names_the_right_composition_kind() -> None:
-    manifest = load_family_manifest(_DRAFT_MANIFEST_PATH, allow_draft=True)
+def test_pm_us_crh_fq_v1_loads_and_names_the_right_composition_kind() -> None:
+    manifest = load_family_manifest(_MANIFEST_PATH)
 
     assert manifest.composition_kind == "forecast_quantile_ladder"
-    assert manifest.status == "DRAFT_NOT_REGISTERED"
+    assert manifest.status == "REGISTERED"
     assert manifest.family_id == "pm_us_crh_fq_v1"
 
 
