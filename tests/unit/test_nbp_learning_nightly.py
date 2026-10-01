@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import logging
+import math
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -350,3 +352,123 @@ def test_alerts_go_through_the_sender() -> None:
 
     assert len(sink.payloads) == 1
     assert sink.payloads[0].event == nbp_learning_nightly.NBP_DRIFT_ALERT_EVENT
+
+
+def _std_normal_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _mid_rung_probability(*, mu: float, sigma: float, center_f: int) -> float:
+    """P(tmax in [center, center+1]) under N(mu, sigma), with the 0.5°F continuity correction."""
+    upper = _std_normal_cdf((center_f + 1.5 - mu) / sigma)
+    lower = _std_normal_cdf((center_f - 0.5 - mu) / sigma)
+    return upper - lower
+
+
+def _scoring_artefact() -> calib.NbpCalibrationArtefact:
+    return calib.NbpCalibrationArtefact(
+        schema_version=calib.ARTEFACT_SCHEMA_VERSION,
+        cdf_method="normal",
+        recalibration="none",
+        correction_form="none",
+        delta=1.0,
+        kappa=0.0,
+        emos_params_by_version={"v5.0": (1.5, 0.0)},
+        emos_draws_by_version={"v5.0": ((1.5, 0.0, 1.0),)},
+        n_min=60,
+        sigma_d=0.1,
+        rung_probability_bounds={"mid": (0.3, 0.2, 0.4)},
+        fit_status=calib.FIT_STATUS_OK,
+    )
+
+
+def test_known_non_half_probabilities_match_hand_computed_brier_and_reliability() -> None:
+    """Identity-scale EMOS with a=1.5 must not collapse to the 0.5 placeholder."""
+    percentiles = nbp_learning_nightly.Percentiles(
+        q10=68.0, q25=70.0, q50=72.0, q75=74.0, q90=76.0, mean=72.0, sd=2.0
+    )
+    artefact = _scoring_artefact()
+    rows = tuple(
+        nbp_learning_nightly.score_learning_row(
+            station="LAX",
+            climate_day=dt.date(2026, 6, day),
+            cli_tmax_f=cli,
+            percentiles=percentiles,
+            version="v5.0",
+            txn_mean_f=70.0,
+            xnd_sd_f=2.0,
+            artefact=artefact,
+            day_length_hours=12.0,
+        )
+        for day, cli in ((1, 72.0), (2, 80.0))
+    )
+
+    center_f = 72
+    p_m2 = _mid_rung_probability(mu=72.0 + 1.5, sigma=2.0, center_f=center_f)
+    p_m1 = _mid_rung_probability(mu=70.0, sigma=2.0, center_f=center_f)
+    assert p_m2 != pytest.approx(0.5)
+    assert p_m1 != pytest.approx(0.5)
+    assert [row.p_m2 for row in rows] == pytest.approx([p_m2, p_m2])
+    assert [row.p_m1 for row in rows] == pytest.approx([p_m1, p_m1])
+    assert [row.outcome for row in rows] == [True, False]
+    assert rows[0].residual_f == pytest.approx(72.0 - (72.0 + 1.5))
+
+    metrics = nbp_learning_nightly.rolling_metrics(rows)
+    brier_m2 = ((p_m2 - 1.0) ** 2 + (p_m2 - 0.0) ** 2) / 2.0
+    brier_m1 = ((p_m1 - 1.0) ** 2 + (p_m1 - 0.0) ** 2) / 2.0
+    reliability = (p_m2 - 0.5) ** 2
+    assert metrics.n == 2
+    assert metrics.brier_m2 == pytest.approx(brier_m2)
+    assert metrics.brier_m1 == pytest.approx(brier_m1)
+    assert metrics.reliability == pytest.approx(reliability)
+    assert metrics.bss_vs_m1 == pytest.approx(1.0 - brier_m2 / brier_m1)
+
+
+def test_month_at_or_above_plan_n_is_tested_without_an_explicit_month_flag() -> None:
+    rows = tuple(
+        _row(dt.date(2026, 3, day), residual_f=1.25)
+        for day in range(1, 16)
+        for _copy in range(4)
+    )
+
+    report = nbp_learning_nightly.residual_by_month(rows)
+
+    assert len(rows) == 60
+    assert [(item.month, item.n, item.status) for item in report] == [
+        ("2026-03", 60, "TESTED")
+    ]
+
+    short_dates = tuple(
+        _row(dt.date(2026, 4, day), residual_f=1.0)
+        for day in range(1, 15)
+        for _copy in range(5)
+    )
+    short = nbp_learning_nightly.residual_by_month(short_dates)
+    assert short[0].n == 70
+    assert short[0].status == "UNTESTED"
+
+
+def test_missing_calibration_artefact_fails_loudly_and_skips_placeholder_metrics(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="breezy.runtime.health")
+
+    code = nbp_learning_nightly.main(
+        [
+            "--nbp-derived-root",
+            (tmp_path / "nbp").as_posix(),
+            "--settlement-truth",
+            (tmp_path / "missing.parquet").as_posix(),
+            "--learning-rows-jsonl",
+            (tmp_path / "missing.jsonl").as_posix(),
+        ],
+        env={},
+    )
+
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "NBP_ROLLING_METRICS" not in captured.out
+    assert "NBP_RESIDUAL_MONTH" not in captured.out
+    assert "nbp_nightly_missing_calibration_artefact" in caplog.text
