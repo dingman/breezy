@@ -33,7 +33,6 @@ from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderType, Tim
 from nautilus_trader.model.events import OrderDenied, OrderExpired, OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
-    ClientOrderId,
     InstrumentId,
     Symbol,
     TradeId,

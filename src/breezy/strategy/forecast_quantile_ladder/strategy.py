@@ -396,7 +396,7 @@ class ForecastQuantileLadderStrategy(Strategy):
             callback=self._on_d1_readiness_timer,
         )
 
-    def _on_d1_readiness_timer(self, event: object) -> None:  # noqa: ARG002 - Nautilus TimeEvent
+    def _on_d1_readiness_timer(self, event: object) -> None:  # Nautilus TimeEvent
         self._d1_attempts += 1
         ids = self._d1_resolver() if self._d1_resolver is not None else ()
         subscribed = self._subscribe_ids(ids)

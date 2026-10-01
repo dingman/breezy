@@ -54,7 +54,10 @@ _FQ_VALID: dict[str, Any] = dict(
 
 def _manifest(tmp_path: Path, **overrides: Any) -> Any:
     payload = dict(_FQ_VALID, **overrides)
-    return load_family_manifest(_write(tmp_path, payload), allow_draft=payload.get("status") != "REGISTERED")
+    return load_family_manifest(
+        _write(tmp_path, payload),
+        allow_draft=payload.get("status") != "REGISTERED",
+    )
 
 
 def _seed_real_ruling(repo_root: Path, *, corrupt: bool = False) -> Path:
@@ -281,10 +284,10 @@ def test_shadow_only_propagates_to_every_composed_strategy(tmp_path: Path) -> No
     from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
     from tests.strategy.forecast_quantile_ladder.test_sl13c_d_plus_1_resolution import (
-        _NOW_NS,
         _BOOT_DAY,
         _D_PLUS_1,
         _LAX,
+        _NOW_NS,
         _artefact_files,
         _no_instrument,
         _yes_instrument,

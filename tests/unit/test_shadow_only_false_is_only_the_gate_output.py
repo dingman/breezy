@@ -63,9 +63,7 @@ def _shadow_only_assignments(node: ast.AST) -> list[ast.expr]:
         values.append(node.value)
     elif isinstance(node, ast.Assign):
         for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "shadow_only":
-                values.append(node.value)
-            elif (
+            if isinstance(target, ast.Name) and target.id == "shadow_only" or (
                 isinstance(target, ast.Subscript)
                 and isinstance(target.slice, ast.Constant)
                 and target.slice.value == "shadow_only"
