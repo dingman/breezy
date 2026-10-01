@@ -778,6 +778,28 @@ def test_the_counter_json_carries_the_champion_manifest_sha256(tmp_path: Path) -
     assert body["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
 
 
+def test_a_forecast_quantile_ladder_sending_family_skips_without_crh_tooling(
+    tmp_path: Path,
+) -> None:
+    """S7: forecast_quantile_ladder has no score_live_trials. The unit
+    prints the composition skip and exits 0, and neither the counter nor
+    the scorer runs against that manifest."""
+    stub, argv_log = _make_stub(tmp_path)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1"
+    )
+    result = _run_wrapper(tmp_path, stub_python=stub, systemctl_stub=systemctl)
+    assert result.returncode == 0, result.stderr
+    log_text = (tmp_path / "derived" / "score_live_trials.log").read_text(encoding="utf-8")
+    assert (
+        "SCORE LIVE TRIALS SKIPPED -- composition_kind=forecast_quantile_ladder "
+        "has no score_live_trials"
+    ) in log_text
+    assert _counter_lines(argv_log) == []
+    assert _scorer_calls(argv_log) == []
+    assert not _marker_path(tmp_path).exists()
+
+
 def test_the_counter_refuses_when_the_sending_family_id_is_absent_or_unregistered(
     tmp_path: Path,
 ) -> None:

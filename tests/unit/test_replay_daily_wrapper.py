@@ -135,6 +135,29 @@ def test_systemctl_failure_exits_nonzero_never_a_benign_skip(tmp_path: Path) -> 
     assert not argv_log.exists() or "REPORT_SKIP" not in argv_log.read_text()
 
 
+def test_a_forecast_quantile_ladder_sending_family_skips_without_replay_tooling(
+    tmp_path: Path,
+) -> None:
+    """S7: forecast_quantile_ladder has no replay_daily_runner. The unit
+    prints the composition skip and exits 0 without invoking the census,
+    the runner, or the skip recorder."""
+    python_stub, argv_log = _python_stub(tmp_path)
+    systemctl_stub = _systemctl_stub(
+        tmp_path,
+        environment_line="Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1",
+    )
+    result = _run_wrapper(
+        tmp_path, python_stub=python_stub, systemctl_stub=systemctl_stub,
+    )
+    assert result.returncode == 0, result.stderr
+    log_text = (tmp_path / "derived" / "replay_daily.log").read_text(encoding="utf-8")
+    assert (
+        "REPLAY DAILY SKIPPED -- composition_kind=forecast_quantile_ladder "
+        "has no replay_daily_runner"
+    ) in log_text
+    assert not argv_log.exists() or argv_log.read_text(encoding="utf-8").strip() == ""
+
+
 def test_no_armed_family_exits_zero_and_records_a_skip(tmp_path: Path) -> None:
     python_stub, argv_log = _python_stub(tmp_path)
     systemctl_stub = _systemctl_stub(tmp_path, environment_line="")
