@@ -34,7 +34,7 @@ import argparse
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
 
@@ -49,7 +49,8 @@ from breezy.adapters.polymarket_us.symbology import leg_of, sibling_instrument_i
 from breezy.domain.forecast_point import ForecastPoint
 from breezy.domain.weather_bucket_facts import WeatherFactsUnavailableError, read_weather_bucket_facts
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
-from breezy.persistence.nbp_derived_store import read_partition
+from breezy.ingest.nbm_quantile_parse import NbpQuantilePoint, max_column_lst_climate_day
+from breezy.persistence.nbp_derived_store import DerivedNbpRow, read_partition
 from breezy.runtime.backtest_harness import BreezyBacktestConfig, build_backtest_engine
 from breezy.runtime.settings import SettingsError, load_quote_tape_settings
 from breezy.registry.sites import default_registry
@@ -77,9 +78,11 @@ from scripts.analysis.nbp_shadow_parity_pure import (
     DecisionKey,
     DepthSnapshotRow,
     NbpQuantileRow,
+    ParityReport,
     PostFreezeTapeRefusedError,
     assert_pre_freeze_tape_day,
     diff_decision_keys,
+    no_depth_census,
     nominal_permit_expiry_upper_bound,
     run_batch_parity,
 )
@@ -337,23 +340,79 @@ def _point_bounds_provider(
     return RungBounds(p_hat=p_hat, p_lower=p_hat, p_upper=p_hat)
 
 
+def _std_offset_hours_by_icao() -> dict[str, float]:
+    """ICAO -> fixed standard-time offset, from the polymarket_us registry."""
+    registry = default_registry()
+    offsets: dict[str, float] = {}
+    for venue, city in registry.pairs():
+        if venue != "polymarket_us":
+            continue
+        site = registry.settlement_site(venue, city)
+        offsets[site.icao] = registry.climate_day_window(venue, city).std_utc_offset_hours
+    return offsets
+
+
 def _load_nbp_rows(root: Path, *, start: date, end: date) -> tuple[NbpQuantileRow, ...]:
-    rows: list[NbpQuantileRow] = []
+    """Nearest MAX column per (station, variable, cycle), then LST climate day.
+
+    Same nearest rule as ``nbm_quantile_actor._nearest_per_station_variable``
+    (smallest ``valid_start_ns``); the cycle is part of the key because this
+    loader spans cycles. ``climate_day`` comes from
+    ``max_column_lst_climate_day``, not the UTC date of ``valid_start_ns``.
+    A cycle is kept only when that nearest column's climate day is inside
+    ``[start, end]``. A later lead is never substituted.
+    """
+    nearest: dict[tuple[str, str, int], DerivedNbpRow] = {}
     for path in sorted(root.rglob("*.parquet")):
         for row in read_partition(path):
-            climate_day = datetime.fromtimestamp(row.valid_start_ns / 1_000_000_000, tz=UTC).date()
-            if start <= climate_day <= end:
-                rows.append(
-                    NbpQuantileRow(
-                        station=row.station,
-                        variable=row.variable,
-                        cycle_runtime_ns=row.cycle_runtime_ns,
-                        value_f=row.value_f,
-                        available_at_ns=row.available_at_ns,
-                        climate_day=climate_day,
-                    ),
-                )
-    return tuple(rows)
+            key = (row.station, row.variable, row.cycle_runtime_ns)
+            current = nearest.get(key)
+            if current is None or row.valid_start_ns < current.valid_start_ns:
+                nearest[key] = row
+    offsets = _std_offset_hours_by_icao()
+    loaded: list[NbpQuantileRow] = []
+    for row in nearest.values():
+        offset = offsets.get(row.station)
+        if offset is None:
+            raise ValueError(
+                f"no polymarket_us std_utc_offset_hours for NBP station {row.station!r}",
+            )
+        point = NbpQuantilePoint(
+            station=row.station,
+            model_version=row.header_model_version,
+            cycle_runtime_ns=row.cycle_runtime_ns,
+            variable=row.variable,
+            valid_start_ns=row.valid_start_ns,
+            valid_end_ns=row.valid_end_ns,
+            value_f=row.value_f,
+            absence_reason=row.absence_reason,
+        )
+        climate_day = max_column_lst_climate_day(point, std_utc_offset_hours=offset)
+        if not (start <= climate_day <= end):
+            continue
+        loaded.append(
+            NbpQuantileRow(
+                station=row.station,
+                variable=row.variable,
+                cycle_runtime_ns=row.cycle_runtime_ns,
+                value_f=row.value_f,
+                available_at_ns=row.available_at_ns,
+                climate_day=climate_day,
+                header_model_version=row.header_model_version,
+            ),
+        )
+    return tuple(loaded)
+
+
+def _parity_report_payload(
+    report: ParityReport, depth_rows: Sequence[DepthSnapshotRow],
+) -> dict[str, object]:
+    """On-disk report: mismatch counts, per-(side, kind) counts, NO-depth census."""
+    payload: dict[str, object] = {}
+    for key, value in report.to_counts_dict().items():
+        payload[key] = value
+    payload["no_depth_days_by_station"] = no_depth_census(depth_rows)
+    return payload
 
 
 def _load_catalog_inputs(
@@ -528,7 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             quantile_station_keys=quantile_station_keys,
         )
         report = diff_decision_keys(live, batch)
-        _write_report(args.output, report.to_counts_dict())
+        _write_report(args.output, _parity_report_payload(report, depth_rows))
     except (
         BoundsArtefactPinMismatchError,
         CalibrationArtefactPinMismatchError,

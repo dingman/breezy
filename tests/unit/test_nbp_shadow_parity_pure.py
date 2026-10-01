@@ -84,6 +84,7 @@ def _nbp_rows() -> tuple[NbpQuantileRow, ...]:
             value_f=value,
             available_at_ns=_AVAILABLE_AT_NS,
             climate_day=CLIMATE_DAY,
+            header_model_version="5.0",
         )
         for variable, value in _PERCENTILES.items()
     )
@@ -213,6 +214,14 @@ def test_the_report_carries_mismatch_counts_only() -> None:
 
     counts = report.to_counts_dict()
 
+    # S4a widens this exact set with the closed per-(path, side, kind) counts.
+    # Equality stays; the comparison is not relaxed to a subset.
+    side_kind_keys = {
+        f"n_{path}_{side}_{kind}"
+        for path in ("live", "batch")
+        for side in ("yes", "no")
+        for kind in ("NotDPlus1", "NotExecutable", "Refuse", "Take")
+    }
     assert set(counts) == {
         "n_live",
         "n_batch",
@@ -221,7 +230,8 @@ def test_the_report_carries_mismatch_counts_only() -> None:
         "n_batch_only",
         "n_numeric_mismatches",
         "n_mismatches",
-    }
+    } | side_kind_keys
+    assert all(counts[key] == 0 for key in side_kind_keys)
     forbidden_substrings = ("ev", "pnl", "p&l", "outcome", "settle", "profit", "loss")
     for field_name in counts:
         lowered = field_name.lower()
