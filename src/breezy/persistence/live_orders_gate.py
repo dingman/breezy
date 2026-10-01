@@ -14,13 +14,29 @@ review, a commit -- not a data edit.
 
 The allowlist entry is a 3-tuple `(family_id, ruling_id, ruling_sha256)`.
 `live_orders_authorized` additionally re-hashes the ruling file named by
-`ruling_id` (resolved under `docs/evidence/` relative to the caller's
-`repo_root`, with symlink-safe path containment) and compares it to the
-pinned sha256 -- a later edit to the committed ruling file, even
+`ruling_id` (resolved under `deploy/families/rulings/` relative to the
+caller's `repo_root`, with symlink-safe path containment) and compares it to
+the pinned sha256 -- a later edit to the committed ruling file, even
 whitespace-only, fails the gate closed. Neither this module nor its caller
 reads, assigns, or logs an operator-reserved control (max daily budget, max
 per position); `permit_present` is a plain bool the caller derives from its
 own `OrderSubmissionPermit`/`None` state.
+
+Deviation from plan `FQ_GO_LIVE_PLAN_2026-10-01.md` D3/S5 (coordinator
+decision, this change): D3 states the ruling resolves under
+`docs/evidence/`. `tests/unit/test_probe_containment.py::
+test_no_module_under_src_reads_docs_evidence` enforces a repo-wide
+containment contract -- no module under `src/` may carry `docs/evidence` as
+a runtime value, docstring citations exempted -- and this module's own
+allowlist-driven resolution is exactly that violation, not an exempt
+citation. Rather than widen that containment test's allowlist (which the
+coordinator ruled out), the ruling's live copy moves to
+`deploy/families/rulings/`, alongside the family manifests and artefacts
+this module already reasons about path-containment for. A byte-identical
+copy of the committed `docs/evidence/<ruling>.md` lives there (verified by
+`tests/unit/test_live_orders_ruling_deploy_copy_matches_evidence.py`); the
+allowlist's pinned sha256 is unchanged, since both copies are byte-for-byte
+identical.
 
 `shadow_only=False` is permitted ONLY when `live_orders_authorized(...)
 .enabled` is `True` -- see `app/trade.py`'s fq branch and the AST guard in
@@ -67,8 +83,10 @@ _LIVE_ORDERS_ALLOWLIST: Final[frozenset[tuple[str, str, str]]] = frozenset(
     }
 )
 
-#: Where a ruling file must live, relative to `repo_root`.
-_EVIDENCE_SUBTREE: Final[str] = "docs/evidence"
+#: Where a ruling file must live, relative to `repo_root`. NOT `docs/evidence`
+#: -- see the module docstring's "Deviation from plan" note: `src/` may never
+#: carry that path as a runtime value, so the live copy lives here instead.
+_RULINGS_SUBTREE: Final[str] = "deploy/families/rulings"
 
 #: Every reason OTHER than these two refuses boot (EXIT_CONFIG_ERROR) at the
 #: caller -- `no_ruling` means nothing was ever declared (stay shadow,
@@ -116,9 +134,9 @@ def live_orders_authorized(
 
     Checks, in order: (1) a ruling is declared at all; (2) the
     `(family_id, ruling_id)` pair is allowlisted; (3) the ruling file's path
-    stays inside `repo_root/docs/evidence` even through a symlink; (4) the
-    file exists; (5) its sha256 matches the allowlisted pin; (6) a live
-    order-submission permit exists. Raises `LiveOrdersGateRefusedError` for
+    stays inside `repo_root/deploy/families/rulings` even through a symlink;
+    (4) the file exists; (5) its sha256 matches the allowlisted pin; (6) a
+    live order-submission permit exists. Raises `LiveOrdersGateRefusedError` for
     every failure except "no ruling declared" and "permit absent", which
     return a `LiveOrdersDecision(enabled=False, ...)` instead -- both are
     ordinary shadow-mode states, never a configuration error.
@@ -143,12 +161,12 @@ def live_orders_authorized(
         )
     _, _, expected_sha256 = match
 
-    evidence_dir = (repo_root / _EVIDENCE_SUBTREE).resolve()
-    ruling_path = (repo_root / _EVIDENCE_SUBTREE / f"{ruling_id}.md").resolve()
-    if not ruling_path.is_relative_to(evidence_dir):
+    rulings_dir = (repo_root / _RULINGS_SUBTREE).resolve()
+    ruling_path = (repo_root / _RULINGS_SUBTREE / f"{ruling_id}.md").resolve()
+    if not ruling_path.is_relative_to(rulings_dir):
         raise LiveOrdersGateRefusedError(
             "ruling_outside_evidence",
-            f"ruling path for {ruling_id!r} escapes {_EVIDENCE_SUBTREE}",
+            f"ruling path for {ruling_id!r} escapes {_RULINGS_SUBTREE}",
         )
     if not ruling_path.is_file():
         raise LiveOrdersGateRefusedError(

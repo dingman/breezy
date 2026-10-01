@@ -3678,6 +3678,22 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # constructs no client, and `request_fingerprint` is a pure hashing
         # helper over literal bytes -- no socket, no transport.
         "tests/unit/test_polymarket_us_permit_issuance.py",
+        # FQ-S6 (plan `FQ_GO_LIVE_PLAN_2026-10-01.md` S6 items 1 and 5/6): two
+        # added. `test_fq_no_leg_reconciliation_parity.py` imports
+        # `exec.endpoints` (`PORTFOLIO_POSITIONS_PATH`) to drive an
+        # fq-composed NO Take through the REAL exec client, reusing the SAME
+        # `_FakeSender`/`_PrivateReadStub` doubles and `_build_client` rig the
+        # CRH NO-side suites already use. `test_fq_caps_and_ambiguous_
+        # 2026_10_01.py` imports `exec.submit_chain` (`latched_refusal_
+        # reason`) to assert the AMBIGUOUS-latch denial text, and drives the
+        # shared `_build_accept_fill_rig` with `_FakeOrderSender`/a local
+        # `_FakeOrderSender` subclass. WIDENED, not relaxed (L-6/L-12): the
+        # comparison is still `==`; neither module carries any of
+        # `SOCKET_RESTORING_MARKERS`, and neither constructs a client with a
+        # real transport -- both stub the sender, exactly like every sibling
+        # exec suite in this set.
+        "tests/unit/test_fq_caps_and_ambiguous_2026_10_01.py",
+        "tests/unit/test_fq_no_leg_reconciliation_parity.py",
     }
 
 

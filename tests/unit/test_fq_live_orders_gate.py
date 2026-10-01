@@ -43,7 +43,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _RULING_ID = "RULING_operator_fq_live_real_orders_2026-10-01"
 _RULING_SHA256 = "11c69d132a70d8e328d3720314336aa6f2cf176d52fd25d5f2e20a7189711c1f"
 _FAMILY_ID = "pm_us_crh_fq_v1"
-_REAL_RULING_PATH = _REPO_ROOT / "docs" / "evidence" / f"{_RULING_ID}.md"
+_DEPLOY_RULING_PATH = _REPO_ROOT / "deploy" / "families" / "rulings" / f"{_RULING_ID}.md"
 
 _FQ_VALID: dict[str, Any] = dict(
     _VALID,
@@ -58,14 +58,16 @@ def _manifest(tmp_path: Path, **overrides: Any) -> Any:
 
 
 def _seed_real_ruling(repo_root: Path, *, corrupt: bool = False) -> Path:
-    """Copy the real committed ruling file under `repo_root/docs/evidence/`,
+    """Copy the real committed ruling file under
+    `repo_root/deploy/families/rulings/` (the gate's live-copy location --
+    see `live_orders_gate`'s "Deviation from plan" docstring note),
     optionally with one appended byte (RED test 5: a single-byte tamper)."""
-    evidence_dir = repo_root / "docs" / "evidence"
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    raw = _REAL_RULING_PATH.read_bytes()
+    rulings_dir = repo_root / "deploy" / "families" / "rulings"
+    rulings_dir.mkdir(parents=True, exist_ok=True)
+    raw = _DEPLOY_RULING_PATH.read_bytes()
     if corrupt:
         raw = raw + b"\n"
-    path = evidence_dir / f"{_RULING_ID}.md"
+    path = rulings_dir / f"{_RULING_ID}.md"
     path.write_bytes(raw)
     return path
 
@@ -166,11 +168,11 @@ def test_a_ruling_file_symlinked_outside_evidence_refuses(tmp_path: Path) -> Non
     manifest = _manifest(tmp_path, live_orders_ruling=_RULING_ID)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "payload.md").write_bytes(_REAL_RULING_PATH.read_bytes())
+    (outside / "payload.md").write_bytes(_DEPLOY_RULING_PATH.read_bytes())
 
-    evidence_dir = tmp_path / "docs" / "evidence"
-    evidence_dir.mkdir(parents=True)
-    (evidence_dir / f"{_RULING_ID}.md").symlink_to(outside / "payload.md")
+    rulings_dir = tmp_path / "deploy" / "families" / "rulings"
+    rulings_dir.mkdir(parents=True)
+    (rulings_dir / f"{_RULING_ID}.md").symlink_to(outside / "payload.md")
 
     with pytest.raises(LiveOrdersGateRefusedError) as excinfo:
         live_orders_authorized(manifest, tmp_path, permit_present=True)
