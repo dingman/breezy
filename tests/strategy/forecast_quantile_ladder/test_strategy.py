@@ -73,7 +73,7 @@ def _build(
     *,
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
-    fee_verified: Callable[[], bool] | None = None,
+    fee_verified: Callable[[int], bool] | None = None,
     shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
 ) -> ForecastQuantileLadderStrategy:
     quantile_actor = ForecastQuantileStateActor(
@@ -88,7 +88,7 @@ def _build(
         clock=clock,
     )
     quantile_actor.start()
-    return ForecastQuantileLadderStrategy(
+    strategy = ForecastQuantileLadderStrategy(
         _config(),
         quantile_actor=quantile_actor,
         artefact=_artefact(),
@@ -99,6 +99,17 @@ def _build(
         fee_verified=fee_verified,
         shadow_decision_sink=shadow_decision_sink,
     )
+    # FQ-S6: `try_submit` now reads `self.clock.timestamp_ns()` for the
+    # (now_ns) -> bool fee-verified shape (matches `ContinuousRungHoldStrategy`,
+    # finding F6) -- the strategy itself must be registered with a real clock,
+    # never only the shared `quantile_actor`.
+    strategy.register_base(
+        portfolio=TestComponentStubs.portfolio(),
+        msgbus=TestComponentStubs.msgbus(),
+        cache=TestComponentStubs.cache(),
+        clock=clock,
+    )
+    return strategy
 
 
 def test_construction_succeeds_with_no_permit_shadow_only() -> None:
@@ -213,7 +224,7 @@ def test_try_submit_honours_the_family_halt_veto() -> None:
 
 
 def test_try_submit_honours_an_unverified_fee_coefficient() -> None:
-    strategy = _build(order_submission_permit=_open_permit(), fee_verified=lambda: False)
+    strategy = _build(order_submission_permit=_open_permit(), fee_verified=lambda _now_ns: False)
 
     assert strategy.try_submit(_take()) == "fee_unverified"
 

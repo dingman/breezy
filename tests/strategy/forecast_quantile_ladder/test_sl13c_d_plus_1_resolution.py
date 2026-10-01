@@ -50,7 +50,6 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.strategy.current_rung_hold.composition import resolve_station_instrument_ids
 from breezy.strategy.forecast_quantile_ladder.composition import (
-    NoTradableForecastInstrumentsError,
     build_forecast_quantile_ladder_strategies,
 )
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
@@ -225,27 +224,41 @@ def test_d_plus_1_yes_and_no_instruments_are_resolved_for_lax_and_mia(
         )
 
 
-def test_zero_d_plus_1_instruments_refuses_cleanly_never_substitutes_today(
+def test_zero_d_plus_1_instruments_never_substitutes_today_and_never_crashes(
     tmp_path: Path,
 ) -> None:
-    """The venue has only listed TODAY's markets -- D+1 has not opened yet."""
+    """The venue has only listed TODAY's markets -- D+1 has not opened yet.
+
+    FQ-S6 (plan §3 S6, peer review disposition 2) replaces the old boot-time
+    ``NoTradableForecastInstrumentsError`` crash with a bounded, alerted
+    readiness poll: composition itself no longer raises on an all-zero
+    resolution -- it still builds ONE strategy for the station, with empty
+    candidate ids and a live ``d1_resolver`` closure, so `on_start` arms the
+    native readiness timer (``test_sl13_s6_wiring.py`` covers that poll in
+    full). ``NoTradableForecastInstrumentsError`` itself stays importable
+    (see its own docstring) -- only this call site's expectation changes.
+    """
     root = tmp_path / "catalog_today_only"
     catalog = ParquetDataCatalog(str(root))
     yes = _yes_instrument(station=_LAX, climate_day=_BOOT_DAY)
     catalog.write_data([yes, _no_instrument(yes)])
     artefact_path, artefact_sha = _artefact_files(tmp_path)
 
-    with pytest.raises(NoTradableForecastInstrumentsError):
-        build_forecast_quantile_ladder_strategies(
-            catalog_root=root,
-            today_by_station={_LAX: _BOOT_DAY},
-            latch=QuantileLadderLatch(),
-            calibration_artefact_path=artefact_path,
-            calibration_artefact_sha256=artefact_sha,
-            bounds_artefact_path=artefact_path,
-            bounds_artefact_sha256=artefact_sha,
-            now_ns_fn=lambda: _NOW_NS,
-        )
+    strategies, _quantile_actor = build_forecast_quantile_ladder_strategies(
+        catalog_root=root,
+        today_by_station={_LAX: _BOOT_DAY},
+        latch=QuantileLadderLatch(),
+        calibration_artefact_path=artefact_path,
+        calibration_artefact_sha256=artefact_sha,
+        bounds_artefact_path=artefact_path,
+        bounds_artefact_sha256=artefact_sha,
+        now_ns_fn=lambda: _NOW_NS,
+    )
+
+    assert len(strategies) == 1
+    strategy = strategies[0]
+    assert strategy.config.stations == (_LAX,)
+    assert strategy._instrument_ids == ()  # white-box check
 
 
 def test_resolve_station_instrument_ids_called_directly_with_todays_day_is_unchanged(

@@ -35,8 +35,8 @@ stays untouched, byte-for-byte, by this file either way.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from datetime import date
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import (
     TYPE_CHECKING,
@@ -50,12 +50,18 @@ from typing import (
 )
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.events import OrderDenied, OrderExpired, OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from breezy.adapters.polymarket_us.symbology import leg_of, sibling_instrument_id
+from breezy.adapters.polymarket_us.symbology import (
+    instrument_id_to_slug,
+    leg_of,
+    sibling_instrument_id,
+)
 from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
 from breezy.registry.sites import default_registry
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.strategy.depth10 import best_order
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import CalibrationArtefact
@@ -137,10 +143,14 @@ class ForecastQuantileLadderStrategy(Strategy):
         latch: SupportsQuantileLatch | None = None,
         order_submission_permit: SupportsExpiresAtNs | None = None,
         submit_veto: Callable[[], str | None] | None = None,
-        fee_verified: Callable[[], bool] | None = None,
+        fee_verified: Callable[[int], bool] | None = None,
         instrument_ids: Sequence[str | InstrumentId] = (),
         quantile_station_keys: Mapping[str, str] | None = None,
         shadow_decision_sink: Callable[[ShadowDecisionLogLine], None] | None = None,
+        d1_resolver: Callable[[], tuple[str, ...]] | None = None,
+        d1_readiness_state: MutableMapping[str, bool | None] | None = None,
+        d1_poll_interval_min: int = 5,
+        d1_poll_window_min: int = 60,
     ) -> None:
         super().__init__(config)
         self._quantile_actor = quantile_actor
@@ -152,6 +162,25 @@ class ForecastQuantileLadderStrategy(Strategy):
         self._submit_veto = submit_veto
         self._fee_verified = fee_verified
         self._shadow_decision_sink = shadow_decision_sink
+        #: SL-13/S6 item 2 (D+1 readiness poll): re-resolves candidate YES
+        #: ids from the catalog on a native timer when NONE were present at
+        #: `on_start` -- `None` (every pre-S6 caller) disables the poll
+        #: entirely, preserving the old "subscribe whatever is in the cache
+        #: now, nothing else" behaviour.
+        self._d1_resolver = d1_resolver
+        #: Shared, mutable, ACROSS every station's composed strategy
+        #: instance in this boot (`composition.py` builds and injects ONE
+        #: dict) -- `station -> None` (pending) | `True` (subscribed) |
+        #: `False` (window expired, still zero). `None` default means this
+        #: strategy tracks itself alone (a single-station world).
+        self._d1_readiness_state: MutableMapping[str, bool | None] = (
+            d1_readiness_state if d1_readiness_state is not None else {}
+        )
+        self._d1_poll_interval_min = d1_poll_interval_min
+        self._d1_poll_window_min = d1_poll_window_min
+        self._d1_attempts = 0
+        self._d1_max_attempts = max(1, d1_poll_window_min // d1_poll_interval_min)
+        self._d1_timer_name: str | None = None
         #: SL-13e: maps a `self.config.stations` city token to whatever key
         #: `quantile_actor` was actually constructed with (composition.py
         #: builds it ICAO-keyed, to match what `NbmQuantileActor` really
@@ -229,10 +258,34 @@ class ForecastQuantileLadderStrategy(Strategy):
             station: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
             for station in self.config.stations
         }
-        for raw_id in self._instrument_ids:
+        subscribed = self._subscribe_ids(self._instrument_ids)
+        if subscribed >= 1:
+            self._on_subscribed(subscribed)
+            return
+        if self._d1_resolver is None:
+            # Pre-S6 behaviour, unchanged: no readiness poll configured, so
+            # a zero-id boot stays silent (B4: never emit the marker on
+            # zero) and never retries.
+            return
+        self._arm_d1_readiness_timer()
+
+    def _subscribe_ids(self, ids: Sequence[str | InstrumentId]) -> int:
+        """Resolve+subscribe every YES id of ``ids`` already in ``self.cache``.
+
+        Extracted from the original ``on_start`` body (SL-13) so the D+1
+        readiness poll (S6 item 2) can re-run the EXACT same resolution
+        logic on each timer fire, never a second implementation. Returns the
+        count of rungs newly subscribed (0 means nothing new was found).
+        """
+        subscribed_count = 0
+        for raw_id in ids:
             instrument_id = (
                 InstrumentId.from_str(raw_id) if isinstance(raw_id, str) else raw_id
             )
+            if str(instrument_id) in self._instrument_context:
+                # Already subscribed on an earlier call (e.g. a previous
+                # readiness-poll fire) -- never a duplicate subscription.
+                continue
             instrument = self.cache.instrument(instrument_id)
             if instrument is None:
                 self.log.warning(
@@ -289,7 +342,99 @@ class ForecastQuantileLadderStrategy(Strategy):
             self.subscribe_quote_ticks(no_instrument_id)
             self.subscribe_order_book_depth(no_instrument_id)
             self.log.info(f"{_CLASS_NAME} subscribed {instrument_id}")
-        self.log.info(f"{_CLASS_NAME} subscribed")
+            subscribed_count += 1
+        return subscribed_count
+
+    def _on_subscribed(self, count: int) -> None:
+        """B4 (finding F7): the final marker is emitted ONLY here, on an
+        actual, non-zero subscription -- never unconditionally.
+        """
+        self.log.info(f"{_CLASS_NAME} subscribed n={count}")
+        station = self.config.stations[0]
+        self._d1_readiness_state[station] = True
+
+    # -- S6 item 2: D+1 readiness poll ---------------------------------------
+
+    def _arm_d1_readiness_timer(self) -> None:
+        """Native, Nautilus ``Clock.set_timer`` poll -- no adapter patch.
+
+        Re-resolves ``self._d1_resolver()`` every
+        ``self._d1_poll_interval_min`` minutes, for
+        ``self._d1_poll_window_min`` minutes total. A market listed after
+        this boot's own instrument-provider discovery cannot be loaded
+        mid-run (the Polymarket.us data client implements no
+        ``_request_instrument``) -- this poll closes the catalog-vs-cache
+        LAG only, never that gap.
+        """
+        station = self.config.stations[0]
+        self._d1_readiness_state.setdefault(station, None)
+        self._d1_attempts = 0
+        start_time = self.clock.utc_now()
+        interval = timedelta(minutes=self._d1_poll_interval_min)
+        self._d1_timer_name = f"fq-d1-readiness-{station}"
+        self.clock.set_timer(
+            name=self._d1_timer_name,
+            interval=interval,
+            start_time=start_time,
+            stop_time=start_time + timedelta(minutes=self._d1_poll_window_min),
+            callback=self._on_d1_readiness_timer,
+        )
+
+    def _on_d1_readiness_timer(self, event: object) -> None:  # noqa: ARG002 - Nautilus TimeEvent
+        self._d1_attempts += 1
+        ids = self._d1_resolver() if self._d1_resolver is not None else ()
+        subscribed = self._subscribe_ids(ids)
+        if subscribed >= 1:
+            if self._d1_timer_name is not None and self._d1_timer_name in self.clock.timer_names:
+                self.clock.cancel_timer(self._d1_timer_name)
+            self._on_subscribed(subscribed)
+            return
+        if self._d1_attempts < self._d1_max_attempts:
+            return
+        self._on_d1_window_expired()
+
+    def _on_d1_window_expired(self) -> None:
+        """Window exhausted with still-zero ids for THIS station.
+
+        Terminal (CRITICAL alert) only once every OTHER tracked station has
+        ALSO already failed (or there are no others -- a single-station
+        boot); otherwise this station alone logs WARN, because the family
+        as a whole may still subscribe elsewhere.
+        """
+        station = self.config.stations[0]
+        self._d1_readiness_state[station] = False
+        others = [value for key, value in self._d1_readiness_state.items() if key != station]
+        if any(value is not False for value in others):
+            self.log.warning(f"FQ_D1_NOT_READY station={station}")
+            return
+        stations = sorted(self._d1_readiness_state)
+        self.log.error(
+            f"FQ_D1_NOT_READY_TERMINAL stations={stations} "
+            f"window_min={self._d1_poll_window_min}",
+        )
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity="CRITICAL",
+                event="FQ_D1_NOT_READY",
+                site="forecast_quantile_ladder",
+                detail=f"stations={stations}",
+            ),
+        )
+
+    def current_yes_instrument_slug(self) -> str | None:
+        """The first currently-resolved YES rung's market slug, else ``None``.
+
+        S6: feeds the fee-drift probe's lazy ``slug_fn`` (``app/trade.py``)
+        -- never ``self.config.instrument_ids`` (there is no such field;
+        candidate ids are constructor-only state, S4-infra), and never a
+        snapshot taken only at construction time, so a D+1 readiness-poll
+        subscription that resolves AFTER boot is still picked up on the
+        probe's NEXT fetch.
+        """
+        for yes_id, _no_id in self.rung_instruments.values():
+            return instrument_id_to_slug(InstrumentId.from_str(yes_id))
+        return None
 
     def _permit_covers(self, now_ns: int) -> bool:
         permit = self._order_submission_permit
@@ -429,7 +574,7 @@ class ForecastQuantileLadderStrategy(Strategy):
             veto_reason = self._submit_veto()
             if veto_reason is not None:
                 return veto_reason
-        if self._fee_verified is not None and not self._fee_verified():
+        if self._fee_verified is not None and not self._fee_verified(self.clock.timestamp_ns()):
             return "fee_unverified"
         return None
 
@@ -585,3 +730,68 @@ class ForecastQuantileLadderStrategy(Strategy):
         )
         if isinstance(decision, Take):
             self._maybe_submit(decision, limit_price=ask_price)
+
+    # -- S6: order-event alerts (never logs an operator-reserved cap) -------
+
+    def _emit_order_alert(
+        self,
+        event_name: str,
+        *,
+        instrument_id: object,
+        client_order_id: object,
+        reason: str | None,
+        severity: Literal["INFO", "WARN", "CRITICAL"],
+    ) -> None:
+        order = self.cache.order(client_order_id) if client_order_id is not None else None
+        side = order.side.name if order is not None else "unknown"
+        reason_text = reason if reason is not None else "none"
+        detail = (
+            f"instrument={instrument_id} side={side} "
+            f"client_order_id={client_order_id} reason={reason_text}"
+        )
+        self.log.info(f"{event_name} {detail}")
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=severity,
+                event=event_name,
+                site=_CLASS_NAME,
+                detail=detail,
+            ),
+        )
+
+    def on_order_filled(self, event: OrderFilled) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_FILLED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=None,
+            severity="INFO",
+        )
+
+    def on_order_denied(self, event: OrderDenied) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_DENIED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=event.reason,
+            severity="WARN",
+        )
+
+    def on_order_rejected(self, event: OrderRejected) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_REJECTED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=event.reason,
+            severity="WARN",
+        )
+
+    def on_order_expired(self, event: OrderExpired) -> None:
+        self._emit_order_alert(
+            "FQ_ORDER_EXPIRED",
+            instrument_id=event.instrument_id,
+            client_order_id=event.client_order_id,
+            reason=None,
+            severity="WARN",
+        )

@@ -531,9 +531,21 @@ class NbmQuantileActor(Actor):
             raise
         self.counters.update(drops)
         data_type = nbm_forecast_point_data_type()
-        for point in _nearest_per_station_variable(points):
+        nearest = _nearest_per_station_variable(points)
+        model_version = nearest[0].model_version if nearest else "unknown"
+        for point in nearest:
             forecast_point = _to_forecast_point(
                 point, lag_ns=lag_ns, ingested_at_ns=result.fetched_at_ns
             )
             self.publish_data(data_type, forecast_point)
             self.published_count += 1
+        # FQ-S6 (finding F8): the ONE positive log line proving this feed is
+        # alive -- `_publish` previously logged failures only. Once per
+        # cycle, after every point in it has been published.
+        logger.info(
+            "NBM_NBP_PUBLISHED cycle_ns=%d stations=%d points=%d model_version=%s",
+            cycle_ns,
+            len(self._stations),
+            len(nearest),
+            model_version,
+        )
