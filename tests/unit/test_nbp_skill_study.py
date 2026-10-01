@@ -1239,7 +1239,7 @@ def _fit_with_versions(*versions: str) -> calib.CalibrationFit:
     )
 
 
-def test_g21_g22_g23_report_all_and_out_of_sample_with_labels() -> None:
+def test_g21_g22_g23_report_all_and_out_of_sample_with_labels(tmp_path: Path) -> None:
     """Coordinator correction (SL-8d item 2b): G2.1/G2.2/G2.3 are reported
     TWICE -- once over ALL validate rows (labelled in-sample, since by plan
     design a version's own validation rows both fit and score it: "Scoring
@@ -1276,11 +1276,14 @@ def test_g21_g22_g23_report_all_and_out_of_sample_with_labels() -> None:
     assert result["gates"]["G2.3_out_of_sample"]["statistics"]["sample_label"] == "out-of-sample"
     assert result["gates"]["G2.1_out_of_sample"]["statistics"]["sample_label"] == "out-of-sample"
 
-    note = nbp_skill_study.write_validate_evidence_note(result, date=dt.date(2026, 9, 30))
+    note = nbp_skill_study.write_validate_evidence_note(
+        result, date=dt.date(2026, 9, 30), evidence_dir=tmp_path
+    )
     note_text = note.read_text(encoding="utf-8")
     assert in_sample_label in note_text
     assert "out-of-sample" in note_text
     assert "G2.2_out_of_sample" in note_text
+    assert note.parent == tmp_path
     note.unlink()
 
 
@@ -1386,7 +1389,9 @@ def test_validation_power_metadata_and_shrinkage_weights_are_emitted(tmp_path: P
     assert result["power"]["n_min_range_status"] == "OK"
     assert result["shrinkage_weights"] == {"v4.3": pytest.approx(8.0 / 38.0)}
 
-    note = nbp_skill_study.write_validate_evidence_note(result, date=dt.date(2026, 9, 30))
+    note = nbp_skill_study.write_validate_evidence_note(
+        result, date=dt.date(2026, 9, 30), evidence_dir=tmp_path
+    )
     note_text = note.read_text(encoding="utf-8")
     assert "sigma_d" in note_text
     assert "sigma_d_ci" in note_text
@@ -1394,7 +1399,40 @@ def test_validation_power_metadata_and_shrinkage_weights_are_emitted(tmp_path: P
     assert "n_min_range" in note_text
     assert "n_min_range_status" in note_text
     assert "shrinkage_weights" in note_text
+    assert note.parent == tmp_path
     note.unlink()
+
+
+def test_validate_runner_does_not_modify_repo_docs_evidence(tmp_path: Path) -> None:
+    """The validate runner and evidence-note writer must not touch the repo tree.
+
+    Snapshot is names plus mtime_ns and size, so an overwrite of the committed
+    note or a new NBP_S2_VALIDATE_RESULT_*.md fails even if the name survives.
+    """
+    evidence_root = _REPO_ROOT / "docs" / "evidence"
+
+    def snapshot() -> tuple[tuple[str, int, int], ...]:
+        recorded: list[tuple[str, int, int]] = []
+        for path in sorted(evidence_root.iterdir(), key=lambda item: item.name):
+            st = path.stat()
+            recorded.append((path.name, st.st_mtime_ns, st.st_size))
+        return tuple(recorded)
+
+    before = snapshot()
+    nbp_skill_study.run_validate(
+        nbp_derived_root=tmp_path / "nbp",
+        settlement_truth_parquet=tmp_path / "missing.parquet",
+        archive_root=tmp_path / "archive",
+    )
+    note = nbp_skill_study.write_validate_evidence_note(
+        {"fit_status": "OK", "gates": {}},
+        date=dt.date(2026, 9, 30),
+        evidence_dir=tmp_path,
+    )
+
+    assert note == tmp_path / "NBP_S2_VALIDATE_RESULT_2026-09-30.md"
+    assert note.is_file()
+    assert snapshot() == before
 
 
 def test_validation_power_metadata_bootstrap_is_deterministic_and_flags_straddle() -> None:
