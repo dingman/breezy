@@ -222,6 +222,7 @@ def _nbp_rows() -> tuple[NbpQuantileRow, ...]:
             value_f=value,
             available_at_ns=_AVAILABLE_AT_NS,
             climate_day=CLIMATE_DAY,
+            header_model_version="5.0",
         )
         for variable, value in _PERCENTILES.items()
     )

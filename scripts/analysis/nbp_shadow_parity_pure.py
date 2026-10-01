@@ -68,6 +68,7 @@ __all__ = [
     "diff_decision_keys",
     "evaluate_batch_snapshot",
     "hours_to_settlement",
+    "no_depth_census",
     "nominal_permit_expiry_upper_bound",
     "parse_rung_instrument_id",
     "permit_covers",
@@ -231,6 +232,26 @@ class DecisionKey:
         return self.action
 
 
+_COUNT_SIDES: Final[tuple[Literal["yes", "no"], ...]] = ("yes", "no")
+_COUNT_KINDS: Final[tuple[str, ...]] = ("NotDPlus1", "NotExecutable", "Refuse", "Take")
+
+
+def _side_kind_counts(path: str, keys: Iterable[DecisionKey]) -> dict[str, int]:
+    """Closed per-(side, kind) counts for one path. Missing buckets stay 0."""
+    counts = {
+        f"n_{path}_{side}_{kind}": 0 for side in _COUNT_SIDES for kind in _COUNT_KINDS
+    }
+    for key in keys:
+        name = f"n_{path}_{key.side}_{key.kind}"
+        if name not in counts:
+            raise ValueError(
+                f"decision kind {key.kind!r} on side {key.side!r} is outside "
+                "the closed parity count set",
+            )
+        counts[name] += 1
+    return counts
+
+
 def decision_key_from(
     decision: Decision,
     *,
@@ -317,6 +338,7 @@ class ParityReport:
     n_matched: int
     live_only: tuple[DecisionKey, ...]
     batch_only: tuple[DecisionKey, ...]
+    side_kind_counts: Mapping[str, int]
     numeric_mismatches: tuple[tuple[DecisionKey, DecisionKey], ...] = ()
 
     @property
@@ -336,8 +358,12 @@ class ParityReport:
         return len(self.numeric_mismatches)
 
     def to_counts_dict(self) -> dict[str, int]:
-        """Mismatch COUNTS only -- no key detail, no ev/p&l/outcome field."""
-        return {
+        """Mismatch COUNTS only -- no key detail, no ev/p&l/outcome field.
+
+        Also the closed per-(path, side, kind) counts. Still counts: no key
+        detail and no scored field.
+        """
+        counts = {
             "n_live": self.n_live,
             "n_batch": self.n_batch,
             "n_matched": self.n_matched,
@@ -346,6 +372,8 @@ class ParityReport:
             "n_numeric_mismatches": self.n_numeric_mismatches,
             "n_mismatches": self.n_mismatches,
         }
+        counts.update(self.side_kind_counts)
+        return counts
 
 
 def diff_decision_keys(
@@ -362,6 +390,8 @@ def diff_decision_keys(
         for key in sorted(matched)
         if not _numeric_fields_equal(live_by_key[key], batch_by_key[key])
     )
+    side_kind_counts = _side_kind_counts("live", live_by_key.values())
+    side_kind_counts.update(_side_kind_counts("batch", batch_by_key.values()))
     return ParityReport(
         n_live=len(live_set),
         n_batch=len(batch_set),
@@ -370,6 +400,7 @@ def diff_decision_keys(
         batch_only=tuple(
             sorted((batch_by_key[key] for key in batch_set - live_set), key=_sort_key),
         ),
+        side_kind_counts=side_kind_counts,
         numeric_mismatches=numeric_mismatches,
     )
 
@@ -652,6 +683,7 @@ class NbpQuantileRow:
     value_f: float | None
     available_at_ns: int
     climate_day: date
+    header_model_version: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -713,6 +745,26 @@ def evaluate_batch_snapshot(
     )
 
 
+def no_depth_census(depth_snapshots: Sequence[DepthSnapshotRow]) -> dict[str, int]:
+    """Days with at least one NO-leg depth row, per station on the tape.
+
+    Every station that appears (YES or NO) is present. The value is the
+    number of distinct climate days carrying a ``side="no"`` row, so a
+    YES-only station is 0. Counts only: never a price, a size, or an outcome.
+    """
+    no_days: dict[str, set[date]] = {}
+    stations: set[str] = set()
+    for row in depth_snapshots:
+        station, climate_day, _rung_id, side = _row_context(row)
+        stations.add(station)
+        if side == "no":
+            no_days.setdefault(station, set()).add(climate_day)
+    return {
+        station: len(no_days[station]) if station in no_days else 0
+        for station in sorted(stations)
+    }
+
+
 def run_batch_parity(
     *,
     depth_snapshots: Sequence[DepthSnapshotRow],
@@ -726,16 +778,14 @@ def run_batch_parity(
     std_utc_offset_hours_by_station: Mapping[str, float],
     quantile_station_keys: Mapping[str, str] | None = None,
 ) -> tuple[DecisionKey, ...]:
-    """The batch path's own driver loop: one YES-side evaluation per depth
-    snapshot with a genuine (non-null) ask, latched across the whole run.
+    """The batch path's own driver loop: one evaluation per depth snapshot
+    with a genuine (non-null) ask, on that row's own side, latched across
+    the whole run.
 
-    V1 scope (stated, not hidden): evaluates ``side="yes"`` only. Every
-    ``instrument_id`` on the tape is that rung's YES market (matching
-    :func:`parse_rung_instrument_id`'s own convention and every
-    ``SidedAsk(side="yes", ...)`` fixture in
-    ``tests/strategy/forecast_quantile_ladder/test_strategy.py``); a NO-side
-    harness needs the sibling NO instrument's bid, which is a distinct data
-    seam this slice does not build (see the SL-13p return notes).
+    A NO-leg depth row (``side="no"``, ask quoted from the native NO
+    instrument) is evaluated as NO. The live harness stamps that side from
+    the instrument leg before calling this function. ``side`` defaults to
+    ``"yes"`` only when the caller did not set it.
 
     Every ``climate_day`` seen must be inside the sealed pre-freeze window
     (:func:`assert_pre_freeze_tape_day`) -- enforced unconditionally, on
