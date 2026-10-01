@@ -32,6 +32,25 @@ def test_latching_marks_exactly_that_key() -> None:
     assert latch.is_latched(station="KSFO", climate_day=_day(), rung_id="i0", side="yes") is False
 
 
+def test_is_latched_is_side_keyed() -> None:
+    """S10 pin: ``is_latched`` keys on side. YES and NO of one rung are two
+    keys; latching one does not latch the other. No semantic change — the
+    key was already ``(station, climate_day, rung_id, side)``."""
+    from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
+
+    latch = QuantileLadderLatch()
+    day = _day()
+    latch.latch(station="KMIA", climate_day=day, rung_id="i0", side="yes")
+
+    assert latch.is_latched(station="KMIA", climate_day=day, rung_id="i0", side="yes") is True
+    assert latch.is_latched(station="KMIA", climate_day=day, rung_id="i0", side="no") is False
+
+    latch.latch(station="KMIA", climate_day=day, rung_id="i0", side="no")
+
+    assert latch.is_latched(station="KMIA", climate_day=day, rung_id="i0", side="no") is True
+    assert latch.is_latched(station="KMIA", climate_day=day, rung_id="i0", side="yes") is True
+
+
 def test_a_new_cycle_never_re_opens_an_already_latched_rung() -> None:
     """A later, distinct call to ``latch`` for the same key is idempotent."""
     from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
