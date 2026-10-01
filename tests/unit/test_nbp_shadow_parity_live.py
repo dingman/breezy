@@ -562,6 +562,33 @@ def test_an_injected_no_side_divergence_is_detected() -> None:
     assert report.batch_only[0].side == "no"
 
 
+def test_main_writes_an_exit_2_exception_to_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    output = tmp_path / "report.json"
+
+    code = live_module.main(
+        [
+            "--start-date",
+            "2026-09-25",
+            "--end-date",
+            "2026-09-26",
+            "--nbp-derived-root",
+            str(tmp_path / "nbp"),
+            "--calibration-artefact",
+            str(tmp_path / "unused.json"),
+            "--calibration-sha256",
+            "a" * 64,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert code == 2
+    assert not output.exists()
+    err = capsys.readouterr().err
+    assert "PostFreezeTapeRefusedError: " in err
+    assert "2026-09-26 is outside the sealed pre-freeze A-5 window" in err
+
+
 def test_main_refuses_a_date_after_the_pre_freeze_cutoff(tmp_path: Path) -> None:
     output = tmp_path / "report.json"
 

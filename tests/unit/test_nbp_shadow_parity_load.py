@@ -226,6 +226,52 @@ def test_side_kind_counts_cover_both_paths() -> None:
     assert live_kind_total == counts["n_live"] == 3
 
 
+def test_both_legs_of_one_bucket_register_a_single_ladder_rung(tmp_path: Path) -> None:
+    """A YES instrument and its NO sibling share one partition rung.
+
+    Registering the NO leg again duplicates the rung. The first bounds
+    evaluation then raises ValueError (incomplete partition) and ``main``
+    exits 2. The live strategy already skips a bare NO id for this reason.
+    """
+    from nautilus_trader.model.identifiers import InstrumentId
+
+    yes_name = "tc-temp-miahigh-2026-09-14-gte80lt81f.POLYMARKET_US"
+    no_name = "tc-temp-miahigh-2026-09-14-gte80lt81f^no.POLYMARKET_US"
+    option_root = tmp_path / "data" / "binary_option"
+    for name in (yes_name, no_name):
+        (option_root / name).mkdir(parents=True)
+
+    class _Instrument:
+        def __init__(self, name: str) -> None:
+            self.id = InstrumentId.from_str(name)
+            self.info = {
+                "weather_facts_status": "KNOWN",
+                "settlement_station": "MIA",
+                "climate_date": "2026-09-14",
+                "measure": "high",
+                "strike_lower_f": 80,
+                "strike_upper_f": 81,
+            }
+
+    class _Catalog:
+        def query(self, data_cls: type, **kwargs: object) -> list[object]:
+            del kwargs
+            if data_cls.__name__ == "BinaryOption":
+                return [_Instrument(yes_name), _Instrument(no_name)]
+            return []
+
+    _instruments, _depths, _rows, ladder_by_key, *_rest = live_module._load_catalog_inputs(
+        tmp_path,
+        start=dt.date(2026, 9, 14),
+        end=dt.date(2026, 9, 14),
+        catalog=_Catalog(),
+        stations=("MIA",),
+    )
+
+    ladder = ladder_by_key[("MIA", dt.date(2026, 9, 14))]
+    assert [rung.rung_id for rung in ladder] == ["80_81"]
+
+
 def test_loader_passes_date_and_instrument_bounds_to_the_catalog(tmp_path: Path) -> None:
     """The depth query must not be catalog-wide: ids and a ts window, both set."""
     from nautilus_trader.model.data import OrderBookDepth10

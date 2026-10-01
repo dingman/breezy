@@ -36,6 +36,7 @@ import argparse
 import gc
 import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -684,9 +685,12 @@ def _load_catalog_inputs(
         if side == "yes":
             no_id = sibling_instrument_id(instrument.id)
             facts_by_id[str(no_id)] = (facts.settlement_station, facts.climate_day, rung_id, "no")
-        ladder_by_key.setdefault((facts.settlement_station, facts.climate_day), []).append(
-            Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f),
-        )
+        # Both legs carry the same strike. The live strategy registers the
+        # rung from the YES id only; appending the NO copy twice makes the
+        # partition incomplete and the batch leg raises ValueError.
+        bucket = ladder_by_key.setdefault((facts.settlement_station, facts.climate_day), [])
+        if all(existing.rung_id != rung_id for existing in bucket):
+            bucket.append(Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f))
 
     depth_ids = [str(instrument.id) for instrument in kept]
     if depth_ids:
@@ -936,7 +940,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         PostFreezeTapeRefusedError,
         SettingsError,
         ValueError,
-    ):
+    ) as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     return 1 if report.n_mismatches else 0
 
