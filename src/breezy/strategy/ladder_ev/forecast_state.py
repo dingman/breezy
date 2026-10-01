@@ -270,6 +270,16 @@ class ForecastQuantileState:
             climate_day=self._climate_day_by_cycle[cycle_runtime_ns],
         )
 
+    def is_complete(self, cycle_runtime_ns: int) -> bool:
+        """``True`` once all 7 NBP variables have been pushed for this cycle.
+
+        FQ-S6 feed-proof seam (plan §3 S6, finding F8): lets a caller (the
+        publishing Actor) log a ONE-TIME positive line the moment a cycle's
+        vector becomes evaluable, without reaching into
+        :meth:`_complete_vector_for` directly.
+        """
+        return self._complete_vector_for(cycle_runtime_ns) is not None
+
     def value_at(self, now_ns: int) -> ForecastQuantileVector | None:
         """Latest COMPLETE, visible vector at ``now_ns``, or ``None``.
 

@@ -158,6 +158,10 @@ class ForecastQuantileStateActor(Actor):
             station: ForecastQuantileState() for station in stations
         }
         self.counters: Counter[str] = Counter()
+        #: FQ-S6 (finding F8): logs `FQ_VECTOR_COMPLETE` ONCE per (station,
+        #: cycle) the moment that cycle's 7-variable vector first becomes
+        #: evaluable -- never re-logged for the same cycle on a later push.
+        self._logged_complete_cycles: set[tuple[str, int]] = set()
 
     def state_for(self, station: str) -> ForecastQuantileState:
         """The in-memory store for `station`. Raises for a station not served."""
@@ -201,3 +205,13 @@ class ForecastQuantileStateActor(Actor):
             climate_day=climate_day,
         )
         self.counters["pushed"] += 1
+        cycle_key = (data.station, data.cycle_runtime_ns)
+        if cycle_key not in self._logged_complete_cycles and state.is_complete(
+            data.cycle_runtime_ns,
+        ):
+            self._logged_complete_cycles.add(cycle_key)
+            self.log.info(
+                f"FQ_VECTOR_COMPLETE station={data.station} "
+                f"cycle_ns={data.cycle_runtime_ns} climate_day={climate_day.isoformat()} "
+                f"era=v{data.model_version}",
+            )

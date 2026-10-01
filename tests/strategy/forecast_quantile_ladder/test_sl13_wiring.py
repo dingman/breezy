@@ -86,7 +86,7 @@ def _build_registered(
     instruments: tuple[BinaryOption, ...] = (),
     order_submission_permit: SupportsExpiresAtNs | None = None,
     submit_veto: Callable[[], str | None] | None = None,
-    fee_verified: Callable[[], bool] | None = None,
+    fee_verified: Callable[[int], bool] | None = None,
 ) -> ForecastQuantileLadderStrategy:
     quantile_actor = ForecastQuantileStateActor(
         stations=(STATION,), std_utc_offset_hours={STATION: -8.0},

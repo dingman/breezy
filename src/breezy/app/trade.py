@@ -95,6 +95,7 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
     PersistentQuantileLadderLatch,
 )
+from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
 
 _VENUE = "polymarket_us"
 
@@ -282,6 +283,24 @@ def _representative_fee_drift_slug(strategies: Sequence[Strategy]) -> str | None
     return None
 
 
+def _fq_representative_slug(
+    strategies: Sequence[ForecastQuantileLadderStrategy],
+) -> str | None:
+    """S6's ``slug_fn`` for the ``forecast_quantile_ladder`` fee probe.
+
+    Unlike :func:`_representative_fee_drift_slug` (which reads the FROZEN
+    ``strategy.config.instrument_ids`` -- fixed at construction time), this
+    reads each strategy's LIVE ``current_yes_instrument_slug()``, which
+    reflects whatever the D+1 readiness poll has subscribed so far. Called
+    on every fetch (never cached), so a late subscription is picked up.
+    """
+    for strategy in strategies:
+        slug = strategy.current_yes_instrument_slug()
+        if slug is not None:
+            return slug
+    return None
+
+
 class _FeeVerifiedHolder:
     """EDGE-1 (AM-4): a single, late-bound mutable slot over
     ``FeeDriftProbeActor.is_fee_verified``.
@@ -315,11 +334,25 @@ def _build_fee_drift_probe(
     strategies: Sequence[Strategy],
     family_halt_latch: TrialDayLatch,
     registered_fee_coefficient: Decimal,
+    slug_fn: Callable[[], str | None] | None = None,
 ) -> tuple[FeeDriftProbeActor, Callable[[Any], None]] | None:
     """Build AUD-12b's fee-drift probe for ``continuous_rung_hold`` only.
 
+    ``slug_fn`` (FQ-S6, finding F6): an optional LAZY slug resolver, called
+    on every fetch rather than once at build time. ``forecast_quantile_ladder``
+    passes a closure over its composed strategies' own LIVE ``rung_instruments``
+    (``ForecastQuantileLadderStrategy.current_yes_instrument_slug``) because a
+    D+1 readiness-poll subscription can resolve AFTER this probe is built --
+    an eager, once-only slug (the ``continuous_rung_hold`` default below)
+    would never see it. When ``slug_fn`` is omitted (every pre-S6 caller,
+    i.e. ``continuous_rung_hold``), behaviour is BYTE-IDENTICAL to before:
+    the slug is resolved once, here, from ``strategies``, and ``None``
+    permanently disables the probe (returns ``None``, logged).
+
     Returns ``None`` (no probe registered) when no composed strategy
-    resolved any tradable instrument -- logged, never a crashed boot.
+    resolved any tradable instrument AND no ``slug_fn`` was given -- logged,
+    never a crashed boot. A caller that passes ``slug_fn`` always gets a
+    probe back (it may simply read UNKNOWN until a slug resolves).
 
     ``registered_fee_coefficient`` is the SENDING family's own
     ``FamilyManifest.taker_fee_coefficient`` (the caller's already-loaded
@@ -358,12 +391,18 @@ def _build_fee_drift_probe(
       (reconnect, slow handshake) must not leave the probe UNKNOWN for the
       rest of the process's life.
     """
-    slug = _representative_fee_drift_slug(strategies)
-    if slug is None:
-        _boot_logger.warning(
-            "fee_drift_probe: no instrument resolved for any composed station; probe not registered"
-        )
-        return None
+    resolve_slug: Callable[[], str | None]
+    if slug_fn is not None:
+        resolve_slug = slug_fn
+    else:
+        slug = _representative_fee_drift_slug(strategies)
+        if slug is None:
+            _boot_logger.warning(
+                "fee_drift_probe: no instrument resolved for any composed station; "
+                "probe not registered"
+            )
+            return None
+        resolve_slug = lambda: slug  # noqa: E731 - pin the eagerly-resolved slug
 
     node_holder: dict[str, Any] = {}
     client_holder: dict[str, PolymarketUSHttpClient] = {}
@@ -395,6 +434,11 @@ def _build_fee_drift_probe(
         return resolved
 
     async def _wire_fee_fetcher() -> Decimal:
+        slug = resolve_slug()
+        if slug is None:
+            raise WireFeeCoefficientError(
+                "fee_drift_probe: no instrument resolved for any composed station yet"
+            )
         client = client_holder.get("client")
         if client is None:
             client = _try_resolve_client()
@@ -406,7 +450,7 @@ def _build_fee_drift_probe(
 
     def _set_family_halted(wire_fee: Decimal) -> None:
         evidence_sha256 = hashlib.sha256(
-            f"fee_drift_probe:slug={slug}:wire={wire_fee}".encode()
+            f"fee_drift_probe:slug={resolve_slug()}:wire={wire_fee}".encode()
         ).hexdigest()
         family_halt_latch.record_policy_halt(
             reason=_FEE_DRIFT_HALT_REASON,
@@ -699,6 +743,12 @@ def run(
                 nbm_actor = NbmQuantileActor(
                     NbmQuantileActorConfig(station_icaos=station_icaos),
                 )
+                # S6 (finding F6): the same EDGE-1 pattern as the
+                # `continuous_rung_hold` branch above -- the composed
+                # strategies need the read-side callable AT CONSTRUCTION, but
+                # the probe (whose `is_fee_verified` the holder forwards to)
+                # cannot be built until AFTER them, below.
+                fq_fee_verified_holder = _FeeVerifiedHolder()
                 try:
                     forecast_strategies, quantile_actor = build_forecast_quantile_ladder_strategies(
                         catalog_root=catalog_root,
@@ -716,6 +766,7 @@ def run(
                         order_submission_permit=sending_permit,
                         phase0_permit_guard=sending_permit is None,
                         submit_veto=submit_veto,
+                        fee_verified=fq_fee_verified_holder.is_fee_verified,
                         required_fee_coefficient=float(manifest.taker_fee_coefficient),
                     )
                 except (
@@ -741,6 +792,24 @@ def run(
                     ) from exc
                 strategies.extend(forecast_strategies)
                 extra_actors.extend([quantile_actor, nbm_actor])
+                # S6 (finding F6): built AFTER the strategies exist, over a
+                # LAZY `slug_fn` -- a D+1 readiness-poll subscription that
+                # resolves after `build()` is still picked up on the probe's
+                # next fetch (see `_build_fee_drift_probe`'s own docstring).
+                def _fq_slug_fn(
+                    fqs: tuple[ForecastQuantileLadderStrategy, ...] = forecast_strategies,
+                ) -> str | None:
+                    return _fq_representative_slug(fqs)
+
+                fq_built_probe = _build_fee_drift_probe(
+                    strategies=forecast_strategies,
+                    family_halt_latch=forecast_halt_latch,
+                    registered_fee_coefficient=manifest.taker_fee_coefficient,
+                    slug_fn=_fq_slug_fn,
+                )
+                if fq_built_probe is not None:
+                    fee_drift_actor, fee_drift_resolve_client = fq_built_probe
+                    fq_fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
             elif manifest.composition_kind == "forecast_ladder":
                 # WP-14 has not landed: the strategy this composition_kind
                 # names does not exist yet. Refuse to boot rather than

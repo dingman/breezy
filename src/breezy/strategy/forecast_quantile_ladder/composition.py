@@ -60,9 +60,23 @@ __all__ = [
 _VENUE: Final[str] = "polymarket_us"
 _COMPONENT_ID_PREFIX: Final[str] = "FORECAST-QUANTILE-LADDER"
 
+#: S6 item 2 (D+1 readiness poll, plan §3 S6): build-side constants for the
+#: native `Clock.set_timer` re-resolution poll each composed strategy arms
+#: at `on_start` when it resolved zero ids at boot.
+D1_POLL_INTERVAL_MIN: Final[int] = 5
+D1_POLL_WINDOW_MIN: Final[int] = 60
+
 
 class NoTradableForecastInstrumentsError(RuntimeError):
-    """Every composed station resolved zero catalog instruments today."""
+    """Kept for import compatibility (pre-S6 callers, `app/trade.py`'s own
+    except tuple). No longer raised by :func:`build_forecast_quantile_ladder_strategies`
+    itself -- S6 item 2 (plan §3 S6, peer review disposition 2) replaces the
+    boot-time crash on an all-zero D+1 resolution with a bounded, alerted,
+    per-strategy readiness poll (`ForecastQuantileLadderStrategy._arm_d1_readiness_timer`).
+    A caller that still wants the OLD fail-fast behaviour may catch a zero
+    resolution itself; this class remains importable so that call sites and
+    exception tuples written against it do not need an edit.
+    """
 
 
 def strategy_component_id(station: str) -> str:
@@ -146,7 +160,7 @@ def build_forecast_quantile_ladder_strategies(
     order_submission_permit: SupportsExpiresAtNs | None = None,
     phase0_permit_guard: bool = True,
     submit_veto: Callable[[], str | None] | None = None,
-    fee_verified: Callable[[], bool] | None = None,
+    fee_verified: Callable[[int], bool] | None = None,
     required_fee_coefficient: float | None = None,
     now_ns_fn: Callable[[], int] = time.time_ns,
 ) -> tuple[tuple[ForecastQuantileLadderStrategy, ...], ForecastQuantileStateActor]:
@@ -179,17 +193,12 @@ def build_forecast_quantile_ladder_strategies(
     # same-day callers (which still pass `today_by_station` unmodified).
     d_plus_1_by_station = _d_plus_1_climate_days(today_by_station, now_ns=now_ns_fn())
     resolved = resolve_station_instrument_ids(catalog_root, d_plus_1_by_station)
-    if all(len(ids) == 0 for ids in resolved.values()):
-        # Never falls back to today's instruments -- a venue that has not
-        # yet listed tomorrow's markets (or listed them under a DIFFERENT
-        # climate day than this station's own LST predicts) refuses
-        # cleanly here, the SAME clean EXIT_CONFIG_ERROR path (via
-        # `app/trade.py`'s `SettingsError` re-raise) every other
-        # artefact-load failure in this family already uses.
-        raise NoTradableForecastInstrumentsError(
-            "build_forecast_quantile_ladder_strategies: zero D+1 catalog "
-            f"instruments resolved for {sorted(d_plus_1_by_station.items())}",
-        )
+    # S6 item 2 (plan §3 S6, peer review disposition 2): never raises on an
+    # all-zero resolution any more -- a venue that has not yet listed
+    # tomorrow's markets is a BOUNDED, alerted readiness-poll wait
+    # (`ForecastQuantileLadderStrategy._arm_d1_readiness_timer`), not a
+    # boot crash. `NoTradableForecastInstrumentsError` is kept importable
+    # (see its own docstring) but is never raised from here.
 
     artefact = load_calibration_artefact(
         calibration_artefact_path, expected_sha256=calibration_artefact_sha256,
@@ -224,11 +233,26 @@ def build_forecast_quantile_ladder_strategies(
         std_utc_offset_hours=std_utc_offset_hours_by_icao,
     )
 
+    # S6 item 2: ONE shared mutable readiness map across every composed
+    # strategy in this boot (`station -> None` pending | `True` subscribed |
+    # `False` window-expired) -- lets a LATE straggler strategy's own
+    # terminal check see whether every OTHER station has already failed too
+    # before deciding WARN (some other station is still live/pending) vs.
+    # CRITICAL (every station has failed).
+    d1_readiness_state: dict[str, bool | None] = dict.fromkeys(today_by_station)
+
+    def _d1_resolver_for(station: str) -> Callable[[], tuple[str, ...]]:
+        def _resolve() -> tuple[str, ...]:
+            day = _d_plus_1_climate_days((station,), now_ns=now_ns_fn())
+            return tuple(
+                str(iid) for iid in resolve_station_instrument_ids(catalog_root, day)[station]
+            )
+
+        return _resolve
+
     strategies: list[ForecastQuantileLadderStrategy] = []
     for station in today_by_station:
         instrument_ids = resolved[station]
-        if not instrument_ids:
-            continue
         config_kwargs: dict[str, object] = {
             "stations": (station,),
             "calibration_artefact_path": calibration_artefact_path,
@@ -257,6 +281,10 @@ def build_forecast_quantile_ladder_strategies(
                 fee_verified=fee_verified,
                 instrument_ids=tuple(str(iid) for iid in instrument_ids),
                 quantile_station_keys={station: icao_by_station[station]},
+                d1_resolver=_d1_resolver_for(station),
+                d1_readiness_state=d1_readiness_state,
+                d1_poll_interval_min=D1_POLL_INTERVAL_MIN,
+                d1_poll_window_min=D1_POLL_WINDOW_MIN,
             ),
         )
     return tuple(strategies), quantile_actor
