@@ -172,6 +172,14 @@ def test_boot_loads_manifest_from_registry_dir_not_module_constant() -> None:
 def _write_forecast_ladder_manifest(
     families_dir: Path, *, family_id: str, trial_suffix: str
 ) -> None:
+    # FQ-S5 (plan `FQ_GO_LIVE_PLAN_2026-10-01.md` D3/item 10): artefact
+    # paths must be RELATIVE and stay inside `deploy/families` --
+    # `_assert_artefact_path_contained` (`persistence/family_manifest.py`)
+    # refuses an absolute path outright. `families_dir` is always
+    # `<root>/deploy/families` by this module's own convention, so a path
+    # relative to its grandparent reads back correctly once the caller also
+    # `monkeypatch.chdir`s to that same root.
+    repo_root = families_dir.parent.parent
     artefacts_dir = families_dir / "artefacts"
     artefacts_dir.mkdir(parents=True, exist_ok=True)
     density_path = artefacts_dir / f"{family_id}_density.json"
@@ -189,10 +197,10 @@ def _write_forecast_ladder_manifest(
         "trial_id_prefix": f"forecast_ladder_edge/trial/{trial_suffix}/",
         "d0_climate_day": "2026-09-19",
         "taker_fee_coefficient": "0.06",
-        "boundary_artefact_path": str(boundary_path),
+        "boundary_artefact_path": str(boundary_path.relative_to(repo_root)),
         "boundary_inputs_sha256": boundary_sha,
         "composition_kind": "forecast_ladder",
-        "density_artefact_path": str(density_path),
+        "density_artefact_path": str(density_path.relative_to(repo_root)),
         "density_artefact_sha256": density_sha,
         "stations": ["SFO"],
         "status": "REGISTERED",
@@ -211,6 +219,9 @@ def _write_continuous_promotion_manifest(
     ``_write_forecast_ladder_manifest``'s, this composition_kind actually
     boots, so it can prove data-driven promotion rather than a shared
     refusal path."""
+    # FQ-S5: see `_write_forecast_ladder_manifest`'s own comment -- artefact
+    # paths must be relative and contained under `deploy/families`.
+    repo_root = families_dir.parent.parent
     artefacts_dir = families_dir / "artefacts"
     artefacts_dir.mkdir(parents=True, exist_ok=True)
     density_path = artefacts_dir / f"{family_id}_density.json"
@@ -228,10 +239,10 @@ def _write_continuous_promotion_manifest(
         "trial_id_prefix": f"continuous_rung_hold/trial/{trial_suffix}/",
         "d0_climate_day": "2026-09-19",
         "taker_fee_coefficient": "0.06",
-        "boundary_artefact_path": str(boundary_path),
+        "boundary_artefact_path": str(boundary_path.relative_to(repo_root)),
         "boundary_inputs_sha256": boundary_sha,
         "composition_kind": "continuous_rung_hold",
-        "density_artefact_path": str(density_path),
+        "density_artefact_path": str(density_path.relative_to(repo_root)),
         "density_artefact_sha256": density_sha,
         "stations": list(stations),
         "status": "REGISTERED",
