@@ -1,4 +1,9 @@
-"""AUD-17: the two operator caps deny an order through the live v4 composition.
+"""AUD-17: the two operator caps deny an order through the live composition.
+
+The proof covers the family the shipped supervisor unit names
+(``BREEZY_SENDING_FAMILY_ID``) plus explicit v4 (``pm_us_crh_v4``,
+``continuous_rung_hold``). v4 stays a case because rollback to v4 is the
+documented runbook path.
 
 Coverage determination (17a). None of the mechanism suites build
 ``deploy/families/pm_us_crh_v4.json`` and assert a cap denial on its entry
@@ -27,15 +32,17 @@ local helper and rule A6 fired. The assertion was rewritten into the bare
 comparison the scan already pins as clean. Reason-equality is KEPT. The
 scan was not amended to allow the helper.
 
-The shipped v4 manifest declares no exit rule, so an exit-tagged sell is
-denied at the exit-registration gate, before ``authorize_order_cost``. That
-is the composition's behaviour. The order still leaves no booking and does
-not debit the daily counter. A hand-written manifest is not used.
+Neither shipped manifest this proof loads declares an exit rule, so an
+exit-tagged sell is denied at the exit-registration gate, before
+``authorize_order_cost``. That is the composition's behaviour. The order
+still leaves no booking and does not debit the daily counter. A
+hand-written manifest is not used.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from decimal import Decimal
@@ -89,6 +96,9 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     open_trial_day_latch,
 )
+from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
+    FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
+)
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.polymarket_us_exec_shapes import TS_EVENT_TEXT, build_instrument
 from tests.unit.test_operator_control_assignment_scan import find_control_assignments
@@ -101,10 +111,15 @@ from tests.unit.test_polymarket_us_submit_order_chain import (
 )
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
-_V4_MANIFEST: Final[Path] = REPO_ROOT / "deploy" / "families" / "pm_us_crh_v4.json"
 _SUPERVISOR_UNIT: Final[Path] = (
     REPO_ROOT / "deploy" / "systemd" / "breezy-trade-supervisor.service"
 )
+_SENDING_FAMILY_LINE: Final[re.Pattern[str]] = re.compile(
+    r"^Environment=BREEZY_SENDING_FAMILY_ID=(\S+)\s*$",
+    re.MULTILINE,
+)
+# Explicit rollback case. Not read from the unit: the unit names the live family.
+_V4_FAMILY_ID: Final[str] = "pm_us_crh_v4"
 
 TRADER_ID: Final[TraderId] = TraderId("BREEZY-AUD17-001")
 STRATEGY_ID: Final[StrategyId] = StrategyId("WEATHER-001")
@@ -221,7 +236,7 @@ class _ReadStub:
 
 
 class _Composition:
-    """The v4 dispatch ``app/trade.py`` performs, plus the exec client it wires."""
+    """One live dispatch ``app/trade.py`` performs, plus the exec client it wires."""
 
     def __init__(
         self,
@@ -303,17 +318,59 @@ class _Composition:
             return store.get(f"{BUDGET_EXHAUSTED_KEY_PREFIX}{day}")
 
 
-def _compose(tmp_path: Path, *, permit: Any) -> _Composition:
-    """Load the shipped v4 manifest and take the continuous-rung-hold branch."""
-    unit = _SUPERVISOR_UNIT.read_text(encoding="utf-8")
-    assert "BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4" in unit
-    manifest = load_family_manifest(_V4_MANIFEST)
-    assert manifest.family_id == "pm_us_crh_v4"
-    assert manifest.composition_kind == "continuous_rung_hold"
-    # The same branch ``app/trade.py`` takes for this composition_kind.
-    # ``current_rung_hold`` and ``forecast_ladder`` are the other arms; v4
-    # is not either of them. Strategies are not built: the cap binds at the
-    # exec client, and sizing is out of scope.
+def _unit_named_family_id(unit_text: str) -> str:
+    matches = _SENDING_FAMILY_LINE.findall(unit_text)
+    assert len(matches) == 1, matches
+    family_id = matches[0]
+    assert isinstance(family_id, str)
+    return family_id
+
+
+def _composition_family_ids() -> tuple[str, ...]:
+    """Explicit v4, then the family the shipped unit names when it differs."""
+    named = _unit_named_family_id(_SUPERVISOR_UNIT.read_text(encoding="utf-8"))
+    if named == _V4_FAMILY_ID:
+        return (_V4_FAMILY_ID,)
+    return (_V4_FAMILY_ID, named)
+
+
+def _family_manifest_path(family_id: str) -> Path:
+    return REPO_ROOT / "deploy" / "families" / f"{family_id}.json"
+
+
+def _compose(tmp_path: Path, *, permit: Any, family_id: str) -> _Composition:
+    """Load one shipped REGISTERED manifest and wire its composition_kind.
+
+    The exec client is built once, outside either family branch, by
+    ``trade_cli.run`` (``app/trade.py`` 915-928). The branch only supplies
+    the latch, ``submit_veto`` and ``exit_manifest`` that call receives.
+    ``continuous_rung_hold`` mirrors ``app/trade.py`` 624-628, 650 and 659.
+    ``forecast_quantile_ladder`` mirrors ``app/trade.py`` 730-734
+    (``forecast_halt_latch``), 743 and 744. Strategies are not built: the
+    cap binds at the exec client, and sizing is out of scope.
+    """
+    unit_text = _SUPERVISOR_UNIT.read_text(encoding="utf-8")
+    named_family_id = _unit_named_family_id(unit_text)
+    if family_id == named_family_id:
+        assert f"BREEZY_SENDING_FAMILY_ID={family_id}" in unit_text
+    manifest = load_family_manifest(_family_manifest_path(family_id))
+    assert manifest.family_id == family_id
+    assert manifest.status == "REGISTERED"
+    if family_id == _V4_FAMILY_ID:
+        assert manifest.composition_kind == "continuous_rung_hold"
+    # ``current_rung_hold`` and ``forecast_ladder`` are the other arms;
+    # neither family this proof loads is either of them.
+    if manifest.composition_kind == "continuous_rung_hold":
+        # app/trade.py:624-628, 650, 659.
+        halt_key_prefix = CONTINUOUS_TRIAL_KEY_PREFIX
+    elif manifest.composition_kind == "forecast_quantile_ladder":
+        # app/trade.py:730-734 (forecast_halt_latch), 743, 744.
+        halt_key_prefix = FORECAST_QUANTILE_TRIAL_KEY_PREFIX
+    else:
+        raise AssertionError(
+            f"{family_id}: composition_kind {manifest.composition_kind!r} "
+            "is not a live branch this proof mirrors"
+        )
     exit_manifest = manifest
 
     loop = asyncio.get_running_loop()
@@ -339,7 +396,9 @@ def _compose(tmp_path: Path, *, permit: Any) -> _Composition:
     latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
     latch = latch_cm.__enter__()
     family_halt_latch = open_trial_day_latch(
-        latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX, family_id="pm_us_crh_v4",
+        latch,
+        key_prefix=halt_key_prefix,
+        family_id=manifest.family_id,
     )
     submit_veto = family_halt_submit_veto(family_halt_latch)
     assert submit_veto() is None
@@ -434,15 +493,24 @@ async def _connected(composition: _Composition) -> None:
     await composition.client._connect()
 
 
+@pytest.fixture(params=_composition_family_ids())
+def family_id(request: pytest.FixtureRequest) -> str:
+    """Parametrize the composition: explicit v4, then the unit-named family."""
+    chosen = request.param
+    assert isinstance(chosen, str)
+    return chosen
+
+
 @pytest.mark.asyncio
 async def test_the_live_composition_admits_an_order_when_both_controls_are_generous(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     try:
         with _controls(daily=_GENEROUS, position=_GENEROUS):
             await _connected(composition)
@@ -463,10 +531,11 @@ async def test_every_order_is_refused_when_neither_control_is_set(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
     case: str,
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     daily = _GENEROUS if case == "daily_only" else None
     position = _GENEROUS if case == "position_only" else None
     try:
@@ -498,6 +567,7 @@ async def test_a_cost_above_the_per_position_ceiling_is_denied_by_that_ceiling_s
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     """Exact-message pin plus the differential on the same permit and order.
 
@@ -508,7 +578,7 @@ async def test_a_cost_above_the_per_position_ceiling_is_denied_by_that_ceiling_s
     """
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     command = composition.entry()
     try:
         with _controls(daily=_GENEROUS, position=_BELOW_ORDER_COST):
@@ -537,10 +607,11 @@ async def test_an_order_past_the_daily_budget_raises_daily_budget_exhausted_and_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     try:
         with _controls(daily=_GENEROUS, position=_GENEROUS):
             await _connected(composition)
@@ -567,10 +638,11 @@ async def test_an_order_past_the_permit_session_notional_raises_session_notional
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch, session_notional=_SESSION_TOO_SMALL)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     try:
         with _controls(daily=_GENEROUS, position=_GENEROUS):
             await _connected(composition)
@@ -591,16 +663,19 @@ async def test_an_exit_tagged_sell_skips_the_daily_budget_and_leaves_no_booking(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
-    """Shipped v4 declares no exit rule, so the order never reaches the ledger.
+    """The shipped manifest declares no exit rule, so the order never reaches the ledger.
 
     No booking, no debit, no POST. The denial names the exit-registration
-    gate, which is how this composition skips the daily budget.
+    gate, which is how this composition skips the daily budget. Holds for
+    the unit-named family and for v4.
     """
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
-    manifest = load_family_manifest(_V4_MANIFEST)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
+    manifest = load_family_manifest(_family_manifest_path(family_id))
+    assert manifest.family_id == family_id
     assert manifest.exit_rule is None
     try:
         with _controls(daily=_GENEROUS, position=_GENEROUS):
@@ -622,10 +697,11 @@ async def test_an_untagged_sell_never_reaches_the_exit_side_skip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     try:
         with _controls(daily=_GENEROUS, position=_GENEROUS):
             await _connected(composition)
@@ -646,10 +722,11 @@ async def test_a_cost_exactly_at_the_per_position_ceiling_is_admitted_through_th
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     try:
         with _controls(daily=_GENEROUS, position=_ORDER_PRICE):
             await _connected(composition)
@@ -667,10 +744,11 @@ async def test_spend_exactly_at_the_daily_budget_is_admitted_through_the_composi
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     try:
         with _controls(daily=_ORDER_PRICE, position=_GENEROUS):
             await _connected(composition)
@@ -688,10 +766,11 @@ async def test_a_refused_order_leaves_the_daily_counter_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
+    family_id: str,
 ) -> None:
     enable_operator_gate(monkeypatch)
     permit = issue_live_trading_permit(clock=LiveClock())
-    composition = _compose(tmp_path, permit=permit)
+    composition = _compose(tmp_path, permit=permit, family_id=family_id)
     seeded = Decimal(_SEEDED_SPENT)
     try:
         with _controls(daily=_GENEROUS, position=_BELOW_ORDER_COST):
