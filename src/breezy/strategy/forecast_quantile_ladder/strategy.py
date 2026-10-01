@@ -62,6 +62,7 @@ from breezy.adapters.polymarket_us.symbology import (
 from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
 from breezy.registry.sites import default_registry
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.strategy.current_rung_hold.composition import bucket_station_instrument_ids
 from breezy.strategy.depth10 import best_order
 from breezy.strategy.forecast_quantile_ladder.bounds import BoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import LiveCalibration
@@ -241,9 +242,11 @@ class ForecastQuantileLadderStrategy(Strategy):
     def on_start(self) -> None:
         """Resolve YES/NO instrument ids per rung and subscribe (SL-13).
 
-        For each configured id already present in ``self.cache`` (the node's
+        Candidates are the configured catalog ids unioned with this station's
+        D+1 YES ids bucketed from ``self.cache.instruments()`` (the node's
         instrument provider populates the cache before any strategy starts,
-        exactly as ``ContinuousRungHoldStrategy.on_start`` relies on): skip a
+        exactly as ``ContinuousRungHoldStrategy.on_start`` relies on). For each
+        id already present in ``self.cache``: skip a
         non-HIGH measure, skip a station outside ``self.config.stations``,
         skip a bare NO id (its YES sibling resolves it below, via
         :func:`~breezy.adapters.polymarket_us.symbology.sibling_instrument_id`
@@ -285,19 +288,40 @@ class ForecastQuantileLadderStrategy(Strategy):
             return
         self._arm_d1_readiness_timer()
 
+    def _d1_candidate_ids(self, catalog_ids: Sequence[str | InstrumentId]) -> tuple[str, ...]:
+        """Catalog ids union this station's D+1 YES ids from ``self.cache``.
+
+        First-seen order: catalog ids, then cache ids the catalog did not
+        already name. The cache day is ``_d_plus_1_climate_days`` on the
+        strategy clock -- the same rule composition uses -- so today's markets
+        never enter the union. De-duplicated on the id string.
+        """
+        # Lazy: ``composition`` imports this module at load time.
+        from breezy.strategy.forecast_quantile_ladder.composition import _d_plus_1_climate_days
+
+        seen: dict[str, None] = {}
+        for raw_id in catalog_ids:
+            seen.setdefault(str(raw_id), None)
+        days = _d_plus_1_climate_days(self.config.stations, now_ns=self.clock.timestamp_ns())
+        bucketed = bucket_station_instrument_ids(self.cache.instruments(), days)
+        for station in self.config.stations:
+            for instrument_id in bucketed[station]:
+                seen.setdefault(str(instrument_id), None)
+        return tuple(seen)
+
     def _subscribe_ids(self, ids: Sequence[str | InstrumentId]) -> int:
         """Resolve+subscribe every YES id of ``ids`` already in ``self.cache``.
 
         Extracted from the original ``on_start`` body (SL-13) so the D+1
         readiness poll (S6 item 2) can re-run the EXACT same resolution
-        logic on each timer fire, never a second implementation. Returns the
+        logic on each timer fire, never a second implementation. Candidates
+        are :meth:`_d1_candidate_ids` (catalog union cache). An id already
+        in ``_instrument_context`` is never subscribed again. Returns the
         count of rungs newly subscribed (0 means nothing new was found).
         """
         subscribed_count = 0
-        for raw_id in ids:
-            instrument_id = (
-                InstrumentId.from_str(raw_id) if isinstance(raw_id, str) else raw_id
-            )
+        for raw_id in self._d1_candidate_ids(ids):
+            instrument_id = InstrumentId.from_str(raw_id)
             if str(instrument_id) in self._instrument_context:
                 # Already subscribed on an earlier call (e.g. a previous
                 # readiness-poll fire) -- never a duplicate subscription.

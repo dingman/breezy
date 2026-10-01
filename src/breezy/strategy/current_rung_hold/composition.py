@@ -338,6 +338,19 @@ def resolve_station_instrument_ids(
     return _bucket_station_instrument_ids(_read_catalog_instruments(catalog_root), today_by_station)
 
 
+def bucket_station_instrument_ids(
+    instruments: Sequence[object],
+    today_by_station: Mapping[str, dt.date],
+) -> dict[str, tuple[InstrumentId, ...]]:
+    """Bucket an already-loaded instrument sequence with the catalog rule.
+
+    ``instruments`` is a catalog read or ``Strategy.cache.instruments()``.
+    Station, climate day, ``Measure.HIGH`` and the YES leg are filtered the
+    same way, including the station-pairing check. First-seen order is kept.
+    """
+    return _bucket_station_instrument_ids(instruments, today_by_station)
+
+
 def _read_catalog_instruments(catalog_root: Path) -> list[object]:
     raw = ParquetDataCatalog(str(catalog_root)).instruments()
     return list(raw) if raw is not None else []
