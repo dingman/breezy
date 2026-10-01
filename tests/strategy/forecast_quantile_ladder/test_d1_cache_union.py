@@ -25,6 +25,7 @@ from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
+from breezy.strategy.current_rung_hold.composition import InstrumentStationMismatchError
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
     MEASURE_KEY,
@@ -272,3 +273,75 @@ def test_an_id_in_the_catalog_and_the_cache_is_subscribed_once() -> None:
     _assert_subscribed(
         strategy, msgbus, yes_ids=(yes_a.id, yes_b.id), lines=read(),
     )
+
+
+_MISMATCH = "lax id re-parses to MIA"
+
+
+def _raise_station_mismatch(*_args: object, **_kwargs: object) -> None:
+    raise InstrumentStationMismatchError(_MISMATCH)
+
+
+def test_on_start_bucket_mismatch_fails_closed_and_arms_the_timer(monkeypatch: object) -> None:
+    """A symbology mismatch in the cache scan must not escape on_start.
+
+    L-16: the handler logs the station and the exception, subscribes nothing,
+    and still arms the readiness poll.
+    """
+    yes_a = _yes("lax-d1-80-81", station=_STATION, climate_day=_D1, lower_f=80, upper_f=81)
+    read = capture_nautilus_logs()
+    strategy, msgbus, state = _build(
+        instruments=(_no(yes_a), yes_a),
+        initial_ids=(),
+        hide_scan=False,
+        d1_resolver=lambda: (),
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "breezy.strategy.forecast_quantile_ladder.strategy.bucket_station_instrument_ids",
+        _raise_station_mismatch,
+    )
+
+    strategy.start()
+
+    blob = "\n".join(read())
+    assert strategy.rung_instruments == {}
+    assert strategy._instrument_context == {}
+    assert _quote_symbols(msgbus) == set()
+    assert "subscribed n=" not in blob
+    assert state.get(_STATION) is None
+    assert strategy._d1_timer_name == f"fq-d1-readiness-{_STATION}"
+    assert strategy._d1_timer_name in strategy.clock.timer_names
+    assert f"station={_STATION}" in blob
+    assert "InstrumentStationMismatchError" in blob
+    assert _MISMATCH in blob
+
+
+def test_readiness_timer_bucket_mismatch_counts_the_attempt(monkeypatch: object) -> None:
+    """The same mismatch inside the timer callback is counted, not fatal."""
+    yes_a = _yes("lax-d1-80-81", station=_STATION, climate_day=_D1, lower_f=80, upper_f=81)
+    read = capture_nautilus_logs()
+    strategy, msgbus, state = _build(
+        instruments=(_no(yes_a), yes_a),
+        initial_ids=(),
+        hide_scan=False,
+        d1_resolver=lambda: (),
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "breezy.strategy.forecast_quantile_ladder.strategy.bucket_station_instrument_ids",
+        _raise_station_mismatch,
+    )
+    strategy.start()
+    assert strategy._d1_attempts == 0
+
+    strategy._on_d1_readiness_timer(object())
+
+    blob = "\n".join(read())
+    assert strategy._d1_attempts == 1
+    assert strategy.rung_instruments == {}
+    assert strategy._instrument_context == {}
+    assert _quote_symbols(msgbus) == set()
+    assert state.get(_STATION) is None
+    assert strategy._d1_timer_name in strategy.clock.timer_names
+    assert f"station={_STATION}" in blob
+    assert "InstrumentStationMismatchError" in blob
+    assert _MISMATCH in blob

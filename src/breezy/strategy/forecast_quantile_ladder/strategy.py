@@ -277,7 +277,15 @@ class ForecastQuantileLadderStrategy(Strategy):
             station: registry.enrichment_coordinates(_VENUE, station).lat
             for station in self.config.stations
         }
-        subscribed = self._subscribe_ids(self._instrument_ids)
+        try:
+            subscribed = self._subscribe_ids(self._instrument_ids)
+        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
+            station = self.config.stations[0]
+            self.log.error(
+                f"{_CLASS_NAME}: D+1 subscribe failed station={station} "
+                f"{type(exc).__name__}: {exc}",
+            )
+            subscribed = 0
         if subscribed >= 1:
             self._on_subscribed(subscribed)
             return
@@ -354,22 +362,12 @@ class ForecastQuantileLadderStrategy(Strategy):
             climate_day_key = facts.climate_day.isoformat()
             rung_id = f"{facts.lower_f if facts.lower_f is not None else 'lt'}_" \
                 f"{facts.upper_f if facts.upper_f is not None else 'gte'}"
-            self.rung_instruments[(facts.settlement_station, climate_day_key, rung_id)] = (
-                str(instrument_id),
-                str(no_instrument_id),
-            )
-            self.rung_ladders.setdefault((facts.settlement_station, climate_day_key), []).append(
-                Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f),
-            )
-            self._instrument_context[str(instrument_id)] = (
-                facts.settlement_station, climate_day_key, rung_id, "yes",
-            )
-            self._instrument_context[str(no_instrument_id)] = (
-                facts.settlement_station, climate_day_key, rung_id, "no",
-            )
-            self.rung_expiration_ns[(facts.settlement_station, climate_day_key)] = (
-                instrument.expiration_ns
-            )
+            rung = Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f)
+            rung_key = (facts.settlement_station, climate_day_key, rung_id)
+            # Subscribe before any rung state is recorded. A raise here leaves
+            # subscriptions already made on earlier rungs intact and writes no
+            # `_instrument_context` entry for a rung whose subscribe did not
+            # finish (L-16: no half-registered rung).
             self.subscribe_quote_ticks(instrument_id)
             self.subscribe_order_book_depth(instrument_id)
             # SL-13 item 2: the NO leg's OWN book -- never synthesised from
@@ -381,6 +379,19 @@ class ForecastQuantileLadderStrategy(Strategy):
             # never here.
             self.subscribe_quote_ticks(no_instrument_id)
             self.subscribe_order_book_depth(no_instrument_id)
+            self.rung_instruments[rung_key] = (str(instrument_id), str(no_instrument_id))
+            self.rung_ladders.setdefault((facts.settlement_station, climate_day_key), []).append(
+                rung,
+            )
+            self._instrument_context[str(instrument_id)] = (
+                facts.settlement_station, climate_day_key, rung_id, "yes",
+            )
+            self._instrument_context[str(no_instrument_id)] = (
+                facts.settlement_station, climate_day_key, rung_id, "no",
+            )
+            self.rung_expiration_ns[(facts.settlement_station, climate_day_key)] = (
+                instrument.expiration_ns
+            )
             self.log.info(f"{_CLASS_NAME} subscribed {instrument_id}")
             subscribed_count += 1
         return subscribed_count
@@ -423,7 +434,15 @@ class ForecastQuantileLadderStrategy(Strategy):
     def _on_d1_readiness_timer(self, event: object) -> None:  # Nautilus TimeEvent
         self._d1_attempts += 1
         ids = self._d1_resolver() if self._d1_resolver is not None else ()
-        subscribed = self._subscribe_ids(ids)
+        try:
+            subscribed = self._subscribe_ids(ids)
+        except Exception as exc:  # noqa: BLE001 - L-16: a handler must never raise
+            station = self.config.stations[0]
+            self.log.error(
+                f"{_CLASS_NAME}: D+1 subscribe failed station={station} "
+                f"{type(exc).__name__}: {exc}",
+            )
+            subscribed = 0
         if subscribed >= 1:
             if self._d1_timer_name is not None and self._d1_timer_name in self.clock.timer_names:
                 self.clock.cancel_timer(self._d1_timer_name)
