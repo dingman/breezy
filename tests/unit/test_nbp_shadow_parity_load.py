@@ -224,3 +224,98 @@ def test_side_kind_counts_cover_both_paths() -> None:
         for kind in ("NotDPlus1", "NotExecutable", "Refuse", "Take")
     )
     assert live_kind_total == counts["n_live"] == 3
+
+
+def test_loader_passes_date_and_instrument_bounds_to_the_catalog(tmp_path: Path) -> None:
+    """The depth query must not be catalog-wide: ids and a ts window, both set."""
+    from nautilus_trader.model.data import OrderBookDepth10
+    from nautilus_trader.model.identifiers import InstrumentId
+    from nautilus_trader.model.instruments import BinaryOption
+
+    in_window = "tc-temp-laxhigh-2026-09-01-gte80lt81f.POLYMARKET_US"
+    also_in_window = "tc-temp-miahigh-2026-09-01-lt80f^no.POLYMARKET_US"
+    out_of_window = "tc-temp-laxhigh-2026-09-08-gte80lt81f.POLYMARKET_US"
+    option_root = tmp_path / "data" / "binary_option"
+    for name in (in_window, also_in_window, out_of_window):
+        (option_root / name).mkdir(parents=True)
+
+    class _Instrument:
+        def __init__(self) -> None:
+            self.id = InstrumentId.from_str(in_window)
+            self.info = {
+                "weather_facts_status": "KNOWN",
+                "settlement_station": "LAX",
+                "climate_date": "2026-09-01",
+                "measure": "high",
+                "strike_lower_f": 80,
+                "strike_upper_f": 81,
+            }
+
+    instrument = _Instrument()
+
+    class _RecordingCatalog:
+        def __init__(self) -> None:
+            self.queries: list[dict[str, object]] = []
+
+        def query(self, data_cls: type, **kwargs: object) -> list[object]:
+            self.queries.append({"data_cls": data_cls, **kwargs})
+            identifiers = kwargs.get("identifiers")
+            if (
+                data_cls is BinaryOption
+                and isinstance(identifiers, list)
+                and in_window in identifiers
+            ):
+                return [instrument]
+            return []
+
+    catalog = _RecordingCatalog()
+    loaded = live_module._load_catalog_inputs(
+        tmp_path,
+        start=dt.date(2026, 9, 1),
+        end=dt.date(2026, 9, 1),
+        catalog=catalog,
+    )
+
+    binary = [query for query in catalog.queries if query["data_cls"] is BinaryOption]
+    depth = [query for query in catalog.queries if query["data_cls"] is OrderBookDepth10]
+    assert len(binary) == 1
+    binary_ids = binary[0]["identifiers"]
+    assert isinstance(binary_ids, list)
+    assert set(binary_ids) == {in_window, also_in_window}
+    assert out_of_window not in binary_ids
+    start_ts, end_ts = live_module._tape_query_bounds(dt.date(2026, 9, 1), dt.date(2026, 9, 1))
+    assert binary[0]["start"] == start_ts
+    assert binary[0]["end"] == end_ts
+    assert start_ts == dt.datetime(2026, 8, 30, tzinfo=dt.UTC)
+    assert end_ts == dt.datetime(2026, 9, 4, tzinfo=dt.UTC)
+    assert len(depth) == 1
+    assert depth[0]["identifiers"] == [in_window]
+    assert depth[0]["start"] == start_ts
+    assert depth[0]["end"] == end_ts
+    assert loaded[4]["LAX"] == -8.0
+
+
+def test_per_day_reports_sum_without_dropping_a_mismatch() -> None:
+    from scripts.analysis.nbp_shadow_parity_pure import DecisionKey, diff_decision_keys
+
+    def key(day: int, action: str) -> DecisionKey:
+        return DecisionKey(
+            station="KLAX",
+            climate_day=dt.date(2026, 9, day),
+            rung_id="i1",
+            instrument_id=f"KLAX-2026-09-0{day}.POLY_US",
+            side="yes",
+            action=action,
+            reason=None,
+            ts_ns=day,
+        )
+
+    first = diff_decision_keys((key(1, "Take"),), (key(1, "Take"),))
+    second = diff_decision_keys((key(2, "Refuse"),), (key(2, "Take"),))
+    merged = live_module._merge_parity_reports((first, second))
+    assert merged.n_live == 2
+    assert merged.n_batch == 2
+    assert merged.n_matched == 1
+    assert merged.n_mismatches == 2
+    assert merged.to_counts_dict()["n_live_yes_Take"] == 1
+    assert merged.to_counts_dict()["n_live_yes_Refuse"] == 1

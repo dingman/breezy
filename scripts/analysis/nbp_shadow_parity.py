@@ -31,12 +31,14 @@ value captured once before the run) -- see :class:`_NowBox`.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, SupportsFloat, SupportsIndex, SupportsInt, cast
 
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.model.currencies import USD
@@ -45,7 +47,11 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Money
 
-from breezy.adapters.polymarket_us.symbology import leg_of, sibling_instrument_id
+from breezy.adapters.polymarket_us.symbology import (
+    leg_of,
+    parse_weather_slug,
+    sibling_instrument_id,
+)
 from breezy.domain.forecast_point import ForecastPoint
 from breezy.domain.weather_bucket_facts import WeatherFactsUnavailableError, read_weather_bucket_facts
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
@@ -91,6 +97,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _Side = Literal["yes", "no"]
 _IntLike = str | bytes | bytearray | SupportsInt | SupportsIndex
 _FloatLike = str | bytes | bytearray | SupportsFloat | SupportsIndex
+
+# Measured on this quote-tape catalog: depth filenames sit in [-14.2h, +43.8h]
+# of the slug climate date, instrument files in [-14.0h, +32.1h]. The pad is
+# wider than both, so the ts_init bound keeps every row the climate-day
+# predicate already keeps. Nautilus names the filter `identifiers`.
+_QUERY_PAD_BEFORE = timedelta(days=2)
+_QUERY_PAD_AFTER = timedelta(days=3)
+_NBP_CYCLE_FILE = re.compile(r"nbp_(\d{4})(\d{2})(\d{2})_\d{2}z\.parquet\Z")
+_NO_LEG_DIR_SUFFIX = "^no"
 
 __all__ = [
     "run_batch_parity",
@@ -354,6 +369,8 @@ def _load_nbp_rows(root: Path, *, start: date, end: date) -> tuple[NbpQuantileRo
     """
     nearest: dict[tuple[str, str, int], DerivedNbpRow] = {}
     for path in sorted(root.rglob("*.parquet")):
+        if not _nbp_cycle_file_in_window(path, start=start, end=end):
+            continue
         for row in read_partition(path):
             key = (row.station, row.variable, row.cycle_runtime_ns)
             current = nearest.get(key)
@@ -396,6 +413,131 @@ def _load_nbp_rows(root: Path, *, start: date, end: date) -> tuple[NbpQuantileRo
     return tuple(loaded)
 
 
+def _nbp_cycle_file_in_window(path: Path, *, start: date, end: date) -> bool:
+    """Cycle files outside this pad cannot yield an LST D+1 day inside [start, end].
+
+    ``max_column_lst_climate_day`` is the cycle's local date plus one, not a
+    later lead. US standard offsets are negative, so the cycle instant falls
+    on the climate day or the day before. A name that is not a cycle file is
+    read, not skipped.
+    """
+    match = _NBP_CYCLE_FILE.search(path.name)
+    if match is None:
+        return True
+    cycle_day = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    return (start - timedelta(days=3)) <= cycle_day <= (end + timedelta(days=1))
+
+
+def _inclusive_days(start: date, end: date) -> tuple[date, ...]:
+    days: list[date] = []
+    day = start
+    while day <= end:
+        days.append(day)
+        day += timedelta(days=1)
+    return tuple(days)
+
+
+def _tape_query_bounds(start: date, end: date) -> tuple[datetime, datetime]:
+    """Inclusive ts_init window covering every file of these climate days."""
+    start_ts = datetime(start.year, start.month, start.day, tzinfo=timezone.utc) - _QUERY_PAD_BEFORE
+    end_ts = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + _QUERY_PAD_AFTER
+    return start_ts, end_ts
+
+
+def _climate_day_from_catalog_id(name: str) -> date | None:
+    """Slug climate date embedded in a catalog instrument-id directory name."""
+    symbol = name.split(".", 1)[0]
+    if symbol.endswith(_NO_LEG_DIR_SUFFIX):
+        symbol = symbol[: -len(_NO_LEG_DIR_SUFFIX)]
+    parsed = parse_weather_slug(symbol)
+    if parsed is None:
+        return None
+    return date.fromisoformat(parsed.climate_date)
+
+
+def _binary_option_root(catalog_root: Path) -> Path:
+    return catalog_root / "data" / "binary_option"
+
+
+def _instrument_ids_in_window(catalog_root: Path, *, start: date, end: date) -> tuple[str, ...]:
+    """Per-instrument directory names whose slug climate date is in [start, end]."""
+    root = _binary_option_root(catalog_root)
+    if not root.is_dir():
+        return ()
+    chosen: list[str] = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        climate_day = _climate_day_from_catalog_id(entry.name)
+        if climate_day is not None and start <= climate_day <= end:
+            chosen.append(entry.name)
+    chosen.sort()
+    return tuple(chosen)
+
+
+def _loose_binary_option_files(catalog_root: Path) -> tuple[str, ...]:
+    """Top-level instrument parquet not partitioned into an id directory.
+
+    Early Aug 30-31 captures live only in these files. They are tiny; the
+    climate-day predicate still drops rows outside [start, end].
+    """
+    root = _binary_option_root(catalog_root)
+    if not root.is_dir():
+        return ()
+    return tuple(
+        sorted(str(entry) for entry in root.iterdir() if entry.is_file() and entry.suffix == ".parquet"),
+    )
+
+
+def _merge_parity_reports(reports: Sequence[ParityReport]) -> ParityReport:
+    """Sum per-day reports. Identity keys include climate_day, so days are disjoint."""
+    if not reports:
+        return diff_decision_keys((), ())
+    side_counts: dict[str, int] = {}
+    for report in reports:
+        for key, value in report.side_kind_counts.items():
+            side_counts[key] = side_counts.get(key, 0) + value
+    return ParityReport(
+        n_live=sum(report.n_live for report in reports),
+        n_batch=sum(report.n_batch for report in reports),
+        n_matched=sum(report.n_matched for report in reports),
+        live_only=tuple(key for report in reports for key in report.live_only),
+        batch_only=tuple(key for report in reports for key in report.batch_only),
+        side_kind_counts=side_counts,
+        numeric_mismatches=tuple(
+            pair for report in reports for pair in report.numeric_mismatches
+        ),
+    )
+
+
+def _merge_no_depth_census(parts: Sequence[Mapping[str, int]]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for part in parts:
+        for station, count in part.items():
+            totals[station] = totals.get(station, 0) + count
+    return {station: totals[station] for station in sorted(totals)}
+
+
+def _forecast_points(nbp_rows: Sequence[NbpQuantileRow]) -> tuple[ForecastPoint, ...]:
+    return tuple(
+        ForecastPoint(
+            station=row.station,
+            model="NBM_NBP",
+            model_version=row.header_model_version,
+            variable=row.variable,
+            cycle_runtime_ns=row.cycle_runtime_ns,
+            valid_start_ns=row.valid_start_ns,
+            valid_end_ns=row.valid_end_ns,
+            value_f=row.value_f,
+            issuance_seq=0,
+            measured_publication_lag_ns=max(0, row.available_at_ns - row.cycle_runtime_ns),
+            available_at_ns=row.available_at_ns,
+            ingested_at_ns=row.available_at_ns,
+        )
+        for row in nbp_rows
+    )
+
+
 def _parity_report_payload(
     report: ParityReport, depth_rows: Sequence[DepthSnapshotRow],
 ) -> dict[str, object]:
@@ -408,7 +550,11 @@ def _parity_report_payload(
 
 
 def _load_catalog_inputs(
-    catalog_root: Path, *, start: date, end: date,
+    catalog_root: Path,
+    *,
+    start: date,
+    end: date,
+    catalog: Any = None,
 ) -> tuple[
     tuple[BinaryOption, ...],
     tuple[OrderBookDepth10, ...],
@@ -418,19 +564,59 @@ def _load_catalog_inputs(
     dict[str, float],
     dict[str, str],
 ]:
-    catalog = ParquetDataCatalog(str(catalog_root))
-    instruments = tuple(catalog.query(data_cls=BinaryOption))
-    depths = tuple(catalog.query(data_cls=OrderBookDepth10))
+    """Load one climate-day window.
+
+    Instrument ids come from the slug date in the catalog directory name
+    (the same date ``Instrument.info`` records). ``catalog.query`` is then
+    called with those ids and a ts_init pad around the window, so Nautilus
+    opens only those partitions. A second instrument query reads the few
+    unpartitioned binary-option files (Aug 30-31). Rows whose facts
+    climate day is outside ``[start, end]`` are still dropped — the same
+    predicate as before.
+    """
+    if catalog is None:
+        catalog = ParquetDataCatalog(str(catalog_root))
+    start_ts, end_ts = _tape_query_bounds(start, end)
+    instrument_ids = _instrument_ids_in_window(catalog_root, start=start, end=end)
+    queried: list[Any] = []
+    if instrument_ids:
+        queried.extend(
+            catalog.query(
+                data_cls=BinaryOption,
+                identifiers=list(instrument_ids),
+                start=start_ts,
+                end=end_ts,
+            ),
+        )
+    loose_files = _loose_binary_option_files(catalog_root)
+    if loose_files:
+        queried.extend(
+            catalog.query(
+                data_cls=BinaryOption,
+                files=list(loose_files),
+                start=start_ts,
+                end=end_ts,
+            ),
+        )
     facts_by_id: dict[str, tuple[str, date, str, _Side]] = {}
     ladder_by_key: dict[tuple[str, date], list[Rung]] = {}
-    for instrument in instruments:
+    seen_ids: set[str] = set()
+    kept: list[BinaryOption] = []
+    for instrument in queried:
+        instrument_key = str(instrument.id)
+        if instrument_key in seen_ids:
+            continue
         try:
             facts = read_weather_bucket_facts(instrument.info)
         except WeatherFactsUnavailableError:
             continue
+        seen_ids.add(instrument_key)
+        if not (start <= facts.climate_day <= end):
+            continue
+        kept.append(instrument)
         side = _trusted_side(leg_of(instrument.id))
         rung_id = _rung_id_from_bounds(facts.lower_f, facts.upper_f)
-        facts_by_id[str(instrument.id)] = (
+        facts_by_id[instrument_key] = (
             facts.settlement_station,
             facts.climate_day,
             rung_id,
@@ -443,6 +629,21 @@ def _load_catalog_inputs(
             Rung(rung_id=rung_id, lo=facts.lower_f, hi=facts.upper_f),
         )
 
+    depth_ids = [str(instrument.id) for instrument in kept]
+    if depth_ids:
+        depths = tuple(
+            cast(
+                list[OrderBookDepth10],
+                catalog.query(
+                    data_cls=OrderBookDepth10,
+                    identifiers=depth_ids,
+                    start=start_ts,
+                    end=end_ts,
+                ),
+            ),
+        )
+    else:
+        depths = ()
     filtered_depths: list[OrderBookDepth10] = []
     batch_rows: list[DepthSnapshotRow] = []
     for depth in sorted(depths, key=lambda item: item.ts_event):
@@ -482,7 +683,7 @@ def _load_catalog_inputs(
         station: registry.settlement_site("polymarket_us", station).icao for station in stations
     }
     return (
-        instruments,
+        tuple(kept),
         tuple(filtered_depths),
         tuple(batch_rows),
         {key: tuple(value) for key, value in ladder_by_key.items()},
@@ -577,65 +778,65 @@ def main(argv: Sequence[str] | None = None) -> int:
         # one `ArtefactBoundsProvider` instance, injected into both paths.
         bounds_provider = ArtefactBoundsProvider(cdf_method=live_calibration.cdf_method)
         quote_settings = load_quote_tape_settings()
-        (
-            instruments,
-            market_data,
-            depth_rows,
-            ladder_by_key,
-            std_offsets,
-            latitude_deg_by_station,
-            quantile_station_keys,
-        ) = _load_catalog_inputs(
-            quote_settings.catalog_root, start=args.start_date, end=args.end_date,
-        )
+        # One climate day at a time. A 7-day Depth10 materialisation is millions
+        # of OrderBookDepth10 objects (past 6G). Latch keys include climate_day,
+        # so a fresh latch per day matches one shared latch. Each day still sees
+        # the whole window's NBP rows, so value_at's latest-visible vector matches
+        # a single combined run. Counts are summed; days' identity keys are disjoint.
         nbp_rows = _load_nbp_rows(args.nbp_derived_root, start=args.start_date, end=args.end_date)
-        live = run_live_parity(
-            instruments=instruments,
-            market_data=market_data,
-            forecast_points=tuple(
-                ForecastPoint(
-                    station=row.station,
-                    model="NBM_NBP",
-                    model_version=row.header_model_version,
-                    variable=row.variable,
-                    cycle_runtime_ns=row.cycle_runtime_ns,
-                    valid_start_ns=row.valid_start_ns,
-                    valid_end_ns=row.valid_end_ns,
-                    value_f=row.value_f,
-                    issuance_seq=0,
-                    measured_publication_lag_ns=max(0, row.available_at_ns - row.cycle_runtime_ns),
-                    available_at_ns=row.available_at_ns,
-                    ingested_at_ns=row.available_at_ns,
-                )
-                for row in nbp_rows
-            ),
-            ladder_by_key=ladder_by_key,
-            calibration=live_calibration,
-            ladder_cfg=LadderEvConfig(),
-            bounds_provider=bounds_provider,
-            fee_coefficient=0.0695,
-            slippage_floor_prob=0.0,
-            std_utc_offset_hours_by_station=std_offsets,
-            stations=tuple(std_offsets),
-            quantile_station_keys=quantile_station_keys,
-        )
-        batch = run_batch_parity(
-            depth_snapshots=depth_rows,
-            nbp_rows=nbp_rows,
-            ladder_by_key=ladder_by_key,
-            calibration=batch_calibration,
-            ladder_cfg=LadderEvConfig(),
-            bounds_provider=bounds_provider,
-            fee_coefficient=0.0695,
-            slippage_floor_prob=0.0,
-            std_utc_offset_hours_by_station=std_offsets,
-            latitude_deg_by_station=latitude_deg_by_station,
-            quantile_station_keys=quantile_station_keys,
-        )
-        report = diff_decision_keys(live, batch)
-        no_depth_by_station = no_depth_census(depth_rows)
+        forecast_points = _forecast_points(nbp_rows)
+        day_reports: list[ParityReport] = []
+        censuses: list[dict[str, int]] = []
+        for day in _inclusive_days(args.start_date, args.end_date):
+            (
+                instruments,
+                market_data,
+                depth_rows,
+                ladder_by_key,
+                std_offsets,
+                latitude_deg_by_station,
+                quantile_station_keys,
+            ) = _load_catalog_inputs(
+                quote_settings.catalog_root, start=day, end=day,
+            )
+            if not std_offsets:
+                continue
+            live = run_live_parity(
+                instruments=instruments,
+                market_data=market_data,
+                forecast_points=forecast_points,
+                ladder_by_key=ladder_by_key,
+                calibration=live_calibration,
+                ladder_cfg=LadderEvConfig(),
+                bounds_provider=bounds_provider,
+                fee_coefficient=0.0695,
+                slippage_floor_prob=0.0,
+                std_utc_offset_hours_by_station=std_offsets,
+                stations=tuple(std_offsets),
+                quantile_station_keys=quantile_station_keys,
+            )
+            batch = run_batch_parity(
+                depth_snapshots=depth_rows,
+                nbp_rows=nbp_rows,
+                ladder_by_key=ladder_by_key,
+                calibration=batch_calibration,
+                ladder_cfg=LadderEvConfig(),
+                bounds_provider=bounds_provider,
+                fee_coefficient=0.0695,
+                slippage_floor_prob=0.0,
+                std_utc_offset_hours_by_station=std_offsets,
+                latitude_deg_by_station=latitude_deg_by_station,
+                quantile_station_keys=quantile_station_keys,
+            )
+            day_reports.append(diff_decision_keys(live, batch))
+            censuses.append(dict(no_depth_census(depth_rows)))
+            del instruments, market_data, depth_rows, live, batch
+            gc.collect()
+        report = _merge_parity_reports(day_reports)
+        no_depth_by_station = _merge_no_depth_census(censuses)
         no_side_unexercisable_in_window = not any(no_depth_by_station.values())
-        payload = _parity_report_payload(report, depth_rows)
+        payload = _parity_report_payload(report, ())
+        payload["no_depth_days_by_station"] = no_depth_by_station
         payload["no_side_unexercisable_in_window"] = no_side_unexercisable_in_window
         guard_failures = vacuity_guard_failures(
             report.side_kind_counts,
