@@ -769,7 +769,8 @@ def run(
                     )
                 except LiveOrdersGateRefusedError as exc:
                     _boot_logger.info(
-                        "fq_live_orders enabled=False family_id=%s ruling=%s reason=%s",
+                        "fq_live_orders enabled=False family_id=%s ruling=%s reason=%s "
+                        "ruling_sha256=none",
                         manifest.family_id,
                         manifest.live_orders_ruling,
                         exc.reason,
@@ -779,11 +780,12 @@ def run(
                     ) from exc
                 _boot_logger.info(
                     "fq_live_orders enabled=%s family_id=%s ruling=%s reason=%s "
-                    "calibration_sha256=%s",
+                    "ruling_sha256=%s calibration_sha256=%s",
                     live_orders.enabled,
                     manifest.family_id,
                     manifest.live_orders_ruling or "none",
                     live_orders.reason,
+                    live_orders.ruling_sha256 or "none",
                     manifest.density_artefact_sha256,
                 )
                 try:

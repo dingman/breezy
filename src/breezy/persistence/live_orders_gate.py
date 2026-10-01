@@ -93,10 +93,20 @@ class LiveOrdersDecision:
     """`enabled=True` iff a composed fq strategy may run with
     `shadow_only=False`. `reason` is always one of the two non-refusing
     members of `LiveOrdersReason` -- every refusing reason is raised as
-    `LiveOrdersGateRefusedError` instead of being returned."""
+    `LiveOrdersGateRefusedError` instead of being returned.
+
+    `ruling_sha256` is the allowlist-pinned sha256 (already verified to
+    equal the on-disk ruling file's own sha256) when a ruling was declared
+    and matched -- `reason in ("ok", "permit_absent")` -- and `None` for
+    `reason == "no_ruling"` (nothing was ever verified). The caller logs it
+    verbatim on the `fq_live_orders` boot line (plan `FQ_GO_LIVE_PLAN_2026
+    -10-01.md` §3 S5), the security reviewer's required field alongside
+    `calibration_sha256`.
+    """
 
     enabled: bool
     reason: LiveOrdersReason
+    ruling_sha256: str | None = None
 
 
 def live_orders_authorized(
@@ -154,6 +164,8 @@ def live_orders_authorized(
         )
 
     if not permit_present:
-        return LiveOrdersDecision(enabled=False, reason="permit_absent")
+        return LiveOrdersDecision(
+            enabled=False, reason="permit_absent", ruling_sha256=expected_sha256
+        )
 
-    return LiveOrdersDecision(enabled=True, reason="ok")
+    return LiveOrdersDecision(enabled=True, reason="ok", ruling_sha256=expected_sha256)
