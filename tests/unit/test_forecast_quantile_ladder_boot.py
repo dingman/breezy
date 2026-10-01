@@ -23,6 +23,7 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from breezy.app.trade import run
 from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, SENDING_FAMILY_ID_VAR, TRADE_CATALOG_ROOT_VAR
 from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_OK
+from breezy.strategy.forecast_quantile_ladder.decision_funnel import FqDecisionFunnelActor
 from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
 from breezy.ingest.nbm_quantile_actor import NbmQuantileActor
@@ -150,6 +151,9 @@ def test_forecast_quantile_ladder_composes_real_strategies_and_actors(
     assert forecast_strategies
     assert any(isinstance(a, ForecastQuantileStateActor) for a in node.trader.actors)
     assert any(isinstance(a, NbmQuantileActor) for a in node.trader.actors)
+    # FQ-S11: the decision-funnel aggregator is composed and registered on
+    # every real boot, never only when a station happens to resolve a Take.
+    assert any(isinstance(a, FqDecisionFunnelActor) for a in node.trader.actors)
 
 
 def _write_manifest_pointing_at(

@@ -380,7 +380,9 @@ def test_ticks_before_and_inside_the_permit_window_get_different_outcomes() -> N
     permit.expires_at_ns = inside + 1
     strategy.on_order_book_depth(_depth(INTERIOR_ID, asks=(("0.10", 5),), ts_event=inside))
 
-    assert [d["kind"] for d in records] == ["NotExecutable", "Take"]
+    # FQ-S11: a Take that reaches `_maybe_submit` with a clear guard chain
+    # now also records its `try_submit` outcome through the same sink.
+    assert [d["kind"] for d in records] == ["NotExecutable", "Take", "TrySubmit"]
 
 
 def test_a_d0_instrument_is_refused_never_taken() -> None:

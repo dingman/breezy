@@ -38,6 +38,7 @@ from breezy.strategy.current_rung_hold.continuous_strategy import Phase0PermitFo
 from breezy.strategy.forecast_quantile_ladder.artefact_bounds import ArtefactBoundsProvider
 from breezy.strategy.forecast_quantile_ladder.calibration_artefact import load_live_calibration
 from breezy.strategy.forecast_quantile_ladder.config import ForecastQuantileLadderConfig
+from breezy.strategy.forecast_quantile_ladder.decision_funnel import FqDecisionCounts
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import SupportsQuantileLatch
 from breezy.strategy.forecast_quantile_ladder.strategy import (
     ForecastQuantileLadderStrategy,
@@ -127,6 +128,7 @@ def build_forecast_quantile_ladder_strategies(
     required_fee_coefficient: float | None = None,
     now_ns_fn: Callable[[], int] = time.time_ns,
     shadow_only: bool = True,
+    decision_counts: FqDecisionCounts | None = None,
 ) -> tuple[tuple[ForecastQuantileLadderStrategy, ...], ForecastQuantileStateActor]:
     """One ``ForecastQuantileLadderStrategy`` per supported station.
 
@@ -148,6 +150,15 @@ def build_forecast_quantile_ladder_strategies(
     (fail closed): the caller (``app/trade.py``) is the ONLY place a
     non-``True`` value may originate, and only as the direct output of
     ``persistence.live_orders_gate.live_orders_authorized(...).enabled``.
+
+    FQ-S11: ``decision_counts``, when given, is wired as EVERY composed
+    strategy's ``shadow_decision_sink`` -- ONE shared in-process
+    :class:`~breezy.strategy.forecast_quantile_ladder.decision_funnel.FqDecisionCounts`
+    aggregator, never one per station. The caller owns the
+    :class:`~breezy.strategy.forecast_quantile_ladder.decision_funnel.FqDecisionFunnelActor`
+    that reads it (never built here -- composing a Nautilus ``Actor`` is a
+    caller/``app.trade`` concern, mirroring how ``quantile_actor`` itself is
+    returned rather than registered by this function).
     """
     if phase0_permit_guard and order_submission_permit is not None:
         raise Phase0PermitForbiddenError(
@@ -248,6 +259,9 @@ def build_forecast_quantile_ladder_strategies(
                 d1_readiness_state=d1_readiness_state,
                 d1_poll_interval_min=D1_POLL_INTERVAL_MIN,
                 d1_poll_window_min=D1_POLL_WINDOW_MIN,
+                shadow_decision_sink=(
+                    decision_counts.record_line if decision_counts is not None else None
+                ),
             ),
         )
     return tuple(strategies), quantile_actor

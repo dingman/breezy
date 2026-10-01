@@ -50,6 +50,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Final, Literal
 
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import (
     MAX_ALERT_DETAIL_CHARS,
@@ -812,6 +813,183 @@ def _emit(sink: AlertSink, *, detail: str) -> None:
     emit_alert(sink, AlertPayload(severity="INFO", event=_EVENT, site=_SITE, detail=detail))
 
 
+# ---------------------------------------------------------------------------
+# FQ-S11: `forecast_quantile_ladder` decision-funnel branch.
+#
+# Dispatch is on the FAMILY'S OWN manifest `composition_kind`
+# (`_resolve_composition_kind_safe`), never a CLI flag -- the same family id
+# already supplied for `halt_enforced` attribution resolves which digest
+# shape to render, so an operator never has to know or pass the composition
+# kind separately. Reads ONE JSONL file written by
+# `breezy.strategy.forecast_quantile_ladder.decision_funnel.
+# FqDecisionFunnelActor` -- cumulative per-day counts, so only the LAST row
+# is needed. No strategy/decision module is imported here: this digest only
+# groups and sums whatever `(station, side, kind, reason, count)` rows the
+# live aggregator already wrote, so a brand-new reason string (added by a
+# sibling slice, never backported here) is rendered automatically, never
+# dropped and never a crash -- the SAME open-vocabulary stance
+# `FqDecisionCounts` itself takes.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_FAMILIES_DIR = Path("deploy/families")
+_FQ_COMPOSITION_KIND = "forecast_quantile_ladder"
+_POSITIVE_CONTROL_PREFIX = "[POSITIVE CONTROL]"
+
+
+class FqDecisionTapeEmptyError(ValueError):
+    """The fq funnel JSONL file exists but carries zero rows."""
+
+
+@dataclass(frozen=True, slots=True)
+class FqFunnelReport:
+    boot_day: str
+    by_station_side: dict[tuple[str, str], dict[str, int]]
+    takes: int
+    orders_submitted: int
+
+
+def fq_funnel_for_day(rows: Iterable[Mapping[str, object]]) -> FqFunnelReport:
+    """Aggregate one fq decision-funnel JSONL file into per-(station, side)
+    counts by ``kind``/``reason``, plus ``takes`` and ``orders_submitted``
+    totals.
+
+    Each row is a CUMULATIVE snapshot of the day so far (``FqDecisionCounts``
+    is never reset mid-day) -- only the LAST row is read, so a missed flush
+    never loses counts the way a delta-row scheme would.
+    """
+    last: Mapping[str, object] | None = None
+    for row in rows:
+        last = row
+    if last is None:
+        raise FqDecisionTapeEmptyError("fq_funnel_for_day: the tape has zero rows")
+    raw_counts = last.get("counts")
+    counts = raw_counts if isinstance(raw_counts, list) else []
+    by_station_side: dict[tuple[str, str], Counter[str]] = {}
+    takes = 0
+    orders_submitted = 0
+    for entry in counts:
+        if not isinstance(entry, Mapping):
+            continue
+        station = str(entry.get("station") or "")
+        side = str(entry.get("side") or "")
+        kind = str(entry.get("kind") or "")
+        reason = str(entry.get("reason") or "")
+        raw_count = entry.get("count")
+        count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) else 0
+        key = f"{kind}:{reason}" if reason else kind
+        by_station_side.setdefault((station, side), Counter())[key] += count
+        if kind == "Take":
+            takes += count
+        if kind == "TrySubmit" and reason == "submitted":
+            orders_submitted += count
+    return FqFunnelReport(
+        boot_day=str(last.get("boot_day") or ""),
+        by_station_side={key: dict(counter) for key, counter in by_station_side.items()},
+        takes=takes,
+        orders_submitted=orders_submitted,
+    )
+
+
+def format_fq_digest_detail(
+    report: FqFunnelReport, *, climate_day: str, halt: FamilyHaltStatus | None = None,
+) -> str:
+    """One alert line, closed-key: ``station``/``side``/``kind``/``reason``/
+    ``count`` tokens only -- never a price, an EV, or an operator cap."""
+    parts = [
+        (
+            f"fq day={climate_day} boot_day={report.boot_day} "
+            f"takes={report.takes} orders={report.orders_submitted}"
+        )
+    ]
+    if halt is not None:
+        parts.append(f"halt={halt.value}")
+    for station, side in sorted(report.by_station_side):
+        station_side_counts = report.by_station_side[(station, side)]
+        tally = ",".join(
+            f"{token}:{count}" for token, count in sorted(station_side_counts.items())
+        )
+        parts.append(f"{station}/{side}={tally}")
+    detail = " ".join(parts)
+    return detail[:MAX_ALERT_DETAIL_CHARS]
+
+
+def _fq_artefact(
+    report: FqFunnelReport, *, climate_day: str, halt: FamilyHaltStatus,
+) -> dict[str, object]:
+    return {
+        "climate_day": climate_day,
+        "boot_day": report.boot_day,
+        "takes": report.takes,
+        "orders_submitted": report.orders_submitted,
+        "by_station_side": {
+            f"{station}|{side}": counts
+            for (station, side), counts in report.by_station_side.items()
+        },
+        "halt_enforced": halt.value,
+        "halt_reason": halt.reason,
+    }
+
+
+def _fq_tape_path(args: argparse.Namespace, climate_day: str) -> Path:
+    if args.tape:
+        return _resolve_readable_path(Path(args.tape))
+    return _resolve_readable_path(_DEFAULT_TAPE_DIR / f"fq_funnel_{climate_day}.jsonl")
+
+
+def _resolve_composition_kind_safe(
+    args: argparse.Namespace, source_env: Mapping[str, str],
+) -> str | None:
+    """Best-effort manifest read: ``None`` on ANY failure (no family id, no
+    manifest file, a DRAFT manifest, malformed JSON) -- the digest always
+    falls back to the pre-existing offer-tape shape rather than crash on a
+    manifest it cannot read. Mirrors ``_resolve_halt_status_safe``'s own
+    containment stance."""
+    family_id = args.family_id or source_env.get(SENDING_FAMILY_ID_VAR)
+    if not family_id:
+        return None
+    families_dir = Path(args.families_dir) if args.families_dir else _DEFAULT_FAMILIES_DIR
+    manifest_path = families_dir / f"{family_id}.json"
+    try:
+        manifest = load_family_manifest(manifest_path, allow_draft=True)
+    except (FamilyManifestError, OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+        logger.debug(
+            "decision_funnel_daily_digest: manifest read failed for %s (%s: %s); "
+            "defaulting to the offer-tape digest",
+            family_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return manifest.composition_kind
+
+
+def _main_fq(args: argparse.Namespace, source_env: Mapping[str, str], sink: AlertSink) -> int:
+    """The fq decision-funnel digest body -- selected by
+    :func:`_resolve_composition_kind_safe`. Mirrors ``main``'s own
+    missing-tape/unreadable-tape/halt-enforced shape, over the fq
+    aggregator's JSONL rows rather than the offer-tape ones."""
+    if args.climate_day:
+        climate_day = args.climate_day
+    else:
+        climate_day = default_climate_day(dt.datetime.now(dt.UTC)).isoformat()
+    tape = _fq_tape_path(args, climate_day)
+    output_dir = Path(args.output_dir) if args.output_dir else _DEFAULT_OUTPUT_DIR
+    halt = _resolve_halt_status_safe(args, source_env)
+    if not tape.is_file():
+        _emit(sink, detail=f"fq {_missing_tape_detail(climate_day, halt)}")
+        _write_json_artefact(output_dir, climate_day, _missing_tape_artefact(climate_day, halt))
+        return 0
+    try:
+        report = fq_funnel_for_day(_iter_jsonl(tape))
+    except (FqDecisionTapeEmptyError, json.JSONDecodeError, ValueError, TypeError):
+        _emit(sink, detail=f"fq decision tape unreadable for {climate_day}")
+        return 1
+    _emit(sink, detail=format_fq_digest_detail(report, climate_day=climate_day, halt=halt))
+    artefact = _fq_artefact(report, climate_day=climate_day, halt=halt)
+    _write_json_artefact(output_dir, climate_day, artefact)
+    return 0
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--climate-day", default=None)
@@ -827,6 +1005,17 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--family-id", default=None, help="sending family id for halt attribution")
+    parser.add_argument(
+        "--families-dir",
+        default=None,
+        help="deploy/families override, for the fq composition_kind dispatch read (tests only)",
+    )
+    parser.add_argument(
+        "--positive-control",
+        action="store_true",
+        help="emit a synthetic [POSITIVE CONTROL] digest through alerts.env and exit; "
+        "no tape is read",
+    )
     return parser.parse_args(argv)
 
 
@@ -859,6 +1048,22 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     args = _parse_args(argv)
     source_env = os.environ if env is None else env
     sink = resolve_alert_sink(env)
+    if args.positive_control:
+        # S11: proves the alert pipeline end to end (alerts.env -> sink)
+        # without reading any tape -- the runbook's own gate (plan §5 step
+        # 3b): "If ... the positive control does not reach the webhook,
+        # stop." Never dispatches on composition_kind: a positive control is
+        # a pipeline check, not a funnel read.
+        family_id = args.family_id or source_env.get(SENDING_FAMILY_ID_VAR) or "unset"
+        _emit(
+            sink,
+            detail=f"{_POSITIVE_CONTROL_PREFIX} fq decision-funnel digest alert pipeline "
+            f"check family_id={family_id}",
+        )
+        return 0
+    composition_kind = _resolve_composition_kind_safe(args, source_env)
+    if composition_kind == _FQ_COMPOSITION_KIND:
+        return _main_fq(args, source_env, sink)
     if args.climate_day:
         climate_day = args.climate_day
     else:

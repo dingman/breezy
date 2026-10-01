@@ -14,9 +14,11 @@ import sqlite3
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from breezy.runtime.health import AlertPayload
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import hold_submit_intent_process_lock
 from breezy.strategy.current_rung_hold.trial_day_latch import LEGACY_FAMILY_HALT_KEY
@@ -1337,3 +1339,244 @@ def test_digest_reports_family_source_legacy_and_unknown_without_or_with_invalid
     assert no_family.value == "unknown"
     assert no_family.value != "no"
     assert no_family.reason == "no family id"
+
+
+# ---------------------------------------------------------------------------
+# FQ-S11: the `forecast_quantile_ladder` decision-funnel branch.
+# ---------------------------------------------------------------------------
+
+
+def _fq_detail(sink: _Sink, index: int = 0) -> str:
+    """``sink.payloads`` is ``list[object]`` by design (``_DIGEST`` is
+    loaded dynamically via ``importlib``, so its own ``AlertPayload`` is not
+    statically the same symbol at this call site) -- cast once here rather
+    than repeat an ``# type: ignore`` at every call site."""
+    return cast("AlertPayload", sink.payloads[index]).detail
+
+
+def _fq_row(station: str, side: str, kind: str, reason: str, count: int) -> dict[str, object]:
+    return {"station": station, "side": side, "kind": kind, "reason": reason, "count": count}
+
+
+def _fq_tape_line(
+    *, boot_day: str, ts_ns: int, final: bool, counts: list[dict[str, object]],
+) -> str:
+    return json.dumps({"ts_ns": ts_ns, "boot_day": boot_day, "final": final, "counts": counts})
+
+
+def test_fq_funnel_for_day_groups_every_taxonomy_reason_per_station_and_side() -> None:
+    rows = [
+        _fq_tape_line(
+            boot_day="2026-10-01",
+            ts_ns=1,
+            final=False,
+            counts=[_fq_row("LAX", "yes", "Refuse", "below_margin", 3)],
+        ),
+        _fq_tape_line(
+            boot_day="2026-10-01",
+            ts_ns=2,
+            final=True,
+            counts=[
+                _fq_row("LAX", "yes", "Refuse", "below_margin", 5),
+                _fq_row("LAX", "no", "Refuse", "opposite_side_latched", 2),
+                _fq_row("MIA", "yes", "Take", "", 1),
+                _fq_row("MIA", "yes", "TrySubmit", "submitted", 1),
+                _fq_row("MIA", "no", "TrySubmit", "fee_unverified", 4),
+            ],
+        ),
+    ]
+
+    report = _DIGEST.fq_funnel_for_day(json.loads(line) for line in rows)
+
+    # Only the LAST (cumulative) row is read -- the first row's counts never
+    # double up with the second's.
+    assert report.by_station_side[("LAX", "yes")] == {"Refuse:below_margin": 5}
+    assert report.by_station_side[("LAX", "no")] == {"Refuse:opposite_side_latched": 2}
+    assert report.by_station_side[("MIA", "yes")] == {"Take": 1, "TrySubmit:submitted": 1}
+    assert report.by_station_side[("MIA", "no")] == {"TrySubmit:fee_unverified": 4}
+    assert report.takes == 1
+    assert report.orders_submitted == 1
+    assert report.boot_day == "2026-10-01"
+
+
+def test_fq_funnel_for_day_raises_on_zero_rows() -> None:
+    with pytest.raises(_DIGEST.FqDecisionTapeEmptyError):
+        _DIGEST.fq_funnel_for_day(iter(()))
+
+
+def test_format_fq_digest_detail_never_carries_a_price_pnl_or_cap_token() -> None:
+    report = _DIGEST.fq_funnel_for_day(
+        json.loads(line)
+        for line in [
+            _fq_tape_line(
+                boot_day="2026-10-01",
+                ts_ns=1,
+                final=True,
+                counts=[
+                    _fq_row("LAX", "yes", "Take", "", 1),
+                    _fq_row("LAX", "yes", "TrySubmit", "submitted", 1),
+                ],
+            )
+        ]
+    )
+
+    detail = _DIGEST.format_fq_digest_detail(report, climate_day="2026-10-01")
+
+    forbidden = ("price", "ev_net", "p_hat", "p_lower", "p_upper", "budget", "max_per_position")
+    lowered = detail.lower()
+    for token in forbidden:
+        assert token not in lowered
+    assert "takes=1" in detail
+    assert "orders=1" in detail
+
+
+_FQ_MANIFEST_BASE: dict[str, object] = {
+    "venue": "polymarket_us",
+    "trial_id_prefix": "forecast_quantile_ladder/trial/pm_us_crh_fq_test/",
+    "d0_climate_day": "2026-09-19",
+    "taker_fee_coefficient": "0.0695",
+    "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
+    "boundary_inputs_sha256": "a" * 64,
+    "composition_kind": "forecast_quantile_ladder",
+    "density_artefact_path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1.json",
+    "density_artefact_sha256": "b" * 64,
+    "stations": ["LAX"],
+    "status": "DRAFT_NOT_REGISTERED",
+}
+
+
+def _write_fq_manifest(families_dir: Path, *, family_id: str) -> None:
+    families_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(_FQ_MANIFEST_BASE)
+    payload["family_id"] = family_id
+    (families_dir / f"{family_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_resolve_composition_kind_reads_the_family_manifest(tmp_path: Path) -> None:
+    families_dir = tmp_path / "families"
+    _write_fq_manifest(families_dir, family_id="pm_us_crh_fq_test")
+    args = _DIGEST._parse_args(
+        ["--family-id", "pm_us_crh_fq_test", "--families-dir", str(families_dir)]
+    )
+
+    kind = _DIGEST._resolve_composition_kind_safe(args, {})
+
+    assert kind == "forecast_quantile_ladder"
+
+
+def test_resolve_composition_kind_is_none_on_a_missing_manifest(tmp_path: Path) -> None:
+    args = _DIGEST._parse_args(
+        ["--family-id", "pm_us_crh_v4", "--families-dir", str(tmp_path / "nope")]
+    )
+
+    kind = _DIGEST._resolve_composition_kind_safe(args, {})
+
+    assert kind is None
+
+
+def test_main_dispatches_to_the_fq_branch_when_the_manifest_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    families_dir = tmp_path / "families"
+    _write_fq_manifest(families_dir, family_id="pm_us_crh_fq_test")
+    tape = tmp_path / "fq_funnel_2026-10-01.jsonl"
+    tape.write_text(
+        _fq_tape_line(
+            boot_day="2026-10-01",
+            ts_ns=1,
+            final=True,
+            counts=[_fq_row("LAX", "yes", "Take", "", 2)],
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--family-id", "pm_us_crh_fq_test",
+            "--families-dir", str(families_dir),
+            "--tape", str(tape),
+            "--climate-day", "2026-10-01",
+            "--output-dir", str(out),
+        ],
+        env={},
+    )
+
+    assert code == 0
+    assert len(sink.payloads) == 1
+    detail = _fq_detail(sink)
+    assert detail.startswith("fq ")
+    assert "takes=2" in detail
+    artefact = json.loads((out / "decision_funnel_2026-10-01.json").read_text(encoding="utf-8"))
+    assert artefact["takes"] == 2
+
+
+def test_main_fq_branch_missing_tape_is_a_named_info_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    families_dir = tmp_path / "families"
+    _write_fq_manifest(families_dir, family_id="pm_us_crh_fq_test")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--family-id", "pm_us_crh_fq_test",
+            "--families-dir", str(families_dir),
+            "--tape", str(tmp_path / "fq_funnel_2026-10-01.jsonl"),
+            "--climate-day", "2026-10-01",
+            "--output-dir", str(out),
+        ],
+        env={},
+    )
+
+    assert code == 0
+    detail = _fq_detail(sink)
+    assert "fq " in detail
+    assert "no decision tape found for 2026-10-01" in detail
+
+
+def test_main_defaults_to_the_offer_tape_branch_without_a_families_dir_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No manifest resolvable (crh's own real deployment shape) -- byte-
+    identical to the pre-S11 digest, proving S11 never changed the default
+    (non-fq) behaviour."""
+    tape = tmp_path / "offer_tape_2026-09-20.jsonl"
+    tape.write_text(json.dumps(_row(source="quote", observed_at_ns=7)) + "\n", encoding="utf-8")
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+    out = tmp_path / "out"
+
+    code = _DIGEST.main(
+        [
+            "--tape", str(tape),
+            "--climate-day", "2026-09-20",
+            "--stations", "MIA",
+            "--output-dir", str(out),
+            "--families-dir", str(tmp_path / "nope"),
+        ],
+        env={},
+    )
+
+    assert code == 0
+    assert "e=1" in _fq_detail(sink)
+
+
+def test_positive_control_emits_a_marked_digest_and_reads_no_tape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _Sink()
+    monkeypatch.setattr(_DIGEST, "resolve_alert_sink", lambda env=None: sink)
+
+    code = _DIGEST.main(["--positive-control", "--family-id", "pm_us_crh_fq_v1"], env={})
+
+    assert code == 0
+    assert len(sink.payloads) == 1
+    detail = _fq_detail(sink)
+    assert detail.startswith("[POSITIVE CONTROL]")
+    assert "pm_us_crh_fq_v1" in detail
