@@ -861,19 +861,31 @@ def _compose_family(
 ) -> _FamilyComposition:
     """Dispatch composition by ``composition_kind``; unknown and unimplemented
     kinds refuse the boot with a ``SettingsError`` (clean EXIT_CONFIG_ERROR)."""
-    common: dict[str, Any] = {
-        "manifest": manifest,
-        "catalog_root": catalog_root,
-        "today_by_station": today_by_station,
-        "latch": latch,
-        "sending_permit": sending_permit,
-    }
     if manifest.composition_kind == "current_rung_hold":
-        return _compose_current_rung_hold(**common)
+        return _compose_current_rung_hold(
+            manifest=manifest,
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            latch=latch,
+            sending_permit=sending_permit,
+        )
     if manifest.composition_kind == "continuous_rung_hold":
-        return _compose_continuous_rung_hold(**common)
+        return _compose_continuous_rung_hold(
+            manifest=manifest,
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            latch=latch,
+            sending_permit=sending_permit,
+        )
     if manifest.composition_kind == "forecast_quantile_ladder":
-        return _compose_forecast_quantile_ladder(settings=settings, **common)
+        return _compose_forecast_quantile_ladder(
+            manifest=manifest,
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            latch=latch,
+            sending_permit=sending_permit,
+            settings=settings,
+        )
     if manifest.composition_kind == "forecast_ladder":
         # WP-14 has not landed: the strategy this composition_kind
         # names does not exist yet. Refuse to boot rather than
