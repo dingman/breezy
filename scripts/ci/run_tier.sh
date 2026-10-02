@@ -5,7 +5,11 @@
 # default addopts already applies the same exclusion. Tiers never replace
 # the post-merge full gate.
 #
-# Usage: scripts/ci/run_tier.sh T1|T2|T3|T4 [pytest args...]
+# Usage: scripts/ci/run_tier.sh T1|T2|T3|T4 [--lanes N] [pytest args...]
+#
+# T1 --lanes N (N > 1, opt-in; default 1 is the unchanged serial run) hands
+# off to run_t1_lanes.sh: concurrent file lanes plus a serial lane, with an
+# exact-partition proof against --collect-only before anything runs.
 set -euo pipefail
 
 EXCL='not live and not venue_live and not real_money'
@@ -21,8 +25,40 @@ fi
 tier="$1"
 shift
 
+lanes=1
+rest=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lanes)
+      [[ $# -ge 2 ]] || { echo "error: --lanes needs a value" >&2; exit 2; }
+      lanes="$2"
+      shift 2
+      ;;
+    --lanes=*)
+      lanes="${1#--lanes=}"
+      shift
+      ;;
+    *)
+      rest+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- ${rest[@]+"${rest[@]}"}
+if ! [[ "$lanes" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --lanes must be a positive integer (got '$lanes')" >&2
+  exit 2
+fi
+if [[ "$lanes" -gt 1 && "$tier" != "T1" ]]; then
+  echo "error: --lanes is only supported for T1" >&2
+  exit 2
+fi
+
 case "$tier" in
   T1)
+    if [[ "$lanes" -gt 1 ]]; then
+      exec "$REPO_ROOT/scripts/ci/run_t1_lanes.sh" "$lanes" "$EXCL and not contract and not heavy" "$@"
+    fi
     exec "$WRAPPER" -m "$EXCL and not contract and not heavy" tests/unit tests/strategy "$@"
     ;;
   T2)
