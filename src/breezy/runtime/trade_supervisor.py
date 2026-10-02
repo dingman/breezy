@@ -68,32 +68,35 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.runtime.trade_supervisor_core import (
     _PERMIT_FAIL_SELF_CHECK_RESULTS,
-    _RELAUNCH_POLL_INTERVAL_S,
+    _RELAUNCH_POLL_INTERVAL_S,  # noqa: F401 - re-exported: moved/used via this module's namespace
     _SCHEDULE_POLL_INTERVAL_S,
-    _SELF_CHECK_PASS_RESULTS,
+    _SELF_CHECK_PASS_RESULTS,  # noqa: F401 - re-exported: moved/used via this module's namespace
     BOOT_RETRY_READINESS_TIMEOUT,
     CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
-    MIDDAY_READINESS_RECHECK_TIMEOUT,
+    MIDDAY_READINESS_RECHECK_TIMEOUT,  # noqa: F401 - re-exported: moved/used via this module's namespace
     MIN_RELAUNCH_GAP,
     NODE_ARGV_ANCHOR,
     PERMIT_EXPIRY_CEILING_NS_ENV_VAR,
-    PERMIT_ISSUED_MARKER,
+    PERMIT_ISSUED_MARKER,  # noqa: F401 - re-exported: moved/used via this module's namespace
     PERMIT_NOT_REQUESTED_MARKER,
     RELAUNCH_CUTOFF_UTC,
-    SELF_CHECK_ALERT_DETAIL,
+    SELF_CHECK_ALERT_DETAIL,  # noqa: F401 - re-exported: moved/used via this module's namespace
     SELF_CHECK_ESCALATION_STORE_KEY,
-    SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS,
+    SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS,  # noqa: F401 - re-exported: moved/used via this module's namespace
     SELF_CHECK_UTC,
     SELF_CHECK_WINDOW_END_UTC,
     STOP_PRIOR_UTC,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
+    AlertSpec,
     ContinuousFamilyCheck,
     DaySchedulerState,
     EscalationLoadOutcome,
     LaunchAction,
+    MiddayDeadAction,
+    MiddayRecheckAction,
     PermitAlertAction,
     PermitAlertDecision,
     PermitCapability,
@@ -111,24 +114,34 @@ from breezy.runtime.trade_supervisor_core import (
     continuous_family_startup_evidence_key,
     decide_boot_retry,
     decide_launch_action,
-    decide_midday_relaunch,
+    decide_midday_dead_child,
+    decide_midday_recheck,
+    decide_midday_relaunch,  # noqa: F401 - re-exported: moved/used via this module's namespace
     decide_permit_alert,
     decide_relaunch,
     decide_stop_prior_action,
     decode_self_check_escalation_state,
+    derive_self_check_facts,
     encode_self_check_escalation_state,
-    escalated_self_check_severity,
+    escalated_self_check_severity,  # noqa: F401 - re-exported: moved/used via this module's namespace
     initial_scheduler_state,
     latch_log_facts,
+    latch_midday_log_facts,
     launch_time_ns,
     mark_phase_fired,
+    midday_boot_retry_dispatch_due,
     midday_budget_live,
-    midday_watch_window_end,
+    midday_handler_reads_log,
+    midday_recheck_pending,
+    midday_watch_idle,
+    midday_watch_window_end,  # noqa: F401 - re-exported: moved/used via this module's namespace
     next_due,
     parse_permit_expiry_ns,
     permit_capability_valid,
-    permit_expiry_valid,
+    permit_expiry_valid,  # noqa: F401 - re-exported: moved/used via this module's namespace
     permit_watch_window,
+    phase_exception_marks_fired,
+    phase_poll_interval_s,
     readiness_observed,
     record_adoption_log_unreadable_poll,
     record_boot_retry_attempt,
@@ -160,6 +173,9 @@ from breezy.runtime.trade_supervisor_core import (
     seed_permit_alert,
     self_check,
     self_check_gap_hours,
+    self_check_load_alert,
+    self_check_log_fields,
+    self_check_result_alert,
     strategy_subscribed_in,
     zero_instruments_refusal_in,
 )
@@ -1853,16 +1869,11 @@ def _do_midday_watch(
     ``BOOT_RETRY_WINDOW_CLOSED_NEVER_READY`` CRITICAL closes it at 01:00Z
     (r5 ruling 3) -- never ``CEILING_UNKNOWN``.
     """
-    if (
-        state.boot_zero_instruments_seen
-        and not state.readiness_observed
-        and state.first_boot_permit_expires_at_ns is None
-        and not state.boot_retry_nontransient_alert_sent
-        and not state.boot_retry_exhausted_alert_sent
-        and (
-            tracked_pid is None
-            or (owned(tracked_pid, process_alive=ports.process_alive) and node_log is not None)
-        )
+    if midday_boot_retry_dispatch_due(
+        state=state,
+        tracked_pid=tracked_pid,
+        node_log=node_log,
+        is_owned=lambda pid: owned(pid, process_alive=ports.process_alive),
     ):
         return _do_boot_retry(
             ports=ports,
@@ -1882,53 +1893,25 @@ def _do_midday_watch(
         process_alive=ports.process_alive,
     ):
         state = _warn_boot_retry_unknown_log_fallback_once(state, now)
-    # [AM-5] Once boot-retry has permanently terminated (either terminal
-    # CRITICAL already sent), no permit was ever observed by construction --
-    # falling through to the ordinary body below would re-derive and page
-    # `MIDDAY_RELAUNCH_CEILING_UNKNOWN` for the SAME already-alerted
-    # condition. Return unchanged instead: this spawns nothing either way.
-    if state.boot_retry_nontransient_alert_sent or state.boot_retry_exhausted_alert_sent:
+    # [AM-5] Boot-retry permanently terminated, mid-day budget already
+    # alerted, or nothing tracked / no log: return unchanged, no read.
+    if midday_watch_idle(state=state, tracked_pid=tracked_pid, node_log=node_log):
         return tracked_pid, node_log, state
-    if state.midday_alert_sent:
-        return tracked_pid, node_log, state
-    if tracked_pid is None or node_log is None:
+    if tracked_pid is None or node_log is None:  # type narrowing only; idle above is exhaustive
         return tracked_pid, node_log, state
 
     log_text = ports.read_log_new(node_log)
-    if strategy_subscribed_in(log_text):
-        state = record_strategy_subscribed_seen(state, now)
-    permit_expiry_ns = parse_permit_expiry_ns(log_text)
-    if permit_expiry_ns is not None:
-        state = record_permit_issued_seen(state, now, permit_expiry_ns)
-        # [A-1] Distinct, day-level anchor -- see DaySchedulerState's own
-        # docstring for why this is never merged with the per-child latch
-        # just above.
-        state = record_first_boot_permit_seen(state, now, permit_expiry_ns)
-    live_cause = classify_exit1_cause(log_text)
-    if live_cause is not RelaunchCause.UNKNOWN:
-        state = record_midday_cause_seen(state, now, live_cause)
-    # [FU-1, 2026-09-25] Same drain-safe placement as the three latches just
-    # above: B1's own `_do_permit_watch` skips its `latch_log_facts` call on
-    # every poll where THIS handler was the one dispatched
-    # (`handler_read_log`), so a `PERMIT_NOT_REQUESTED_MARKER` line in this
-    # delta is otherwise gone before B1 next gets a chance at it --
-    # misclassifying a pure-shadow-mode child as `ABSENT`/`LAPSED` instead
-    # of `NOT_REQUIRED`.
-    if PERMIT_NOT_REQUESTED_MARKER in log_text:
-        state = record_orders_not_requested_seen(state, now)
+    state, live_cause = latch_midday_log_facts(state=state, now=now, log_text=log_text)
 
     if ports.process_alive(tracked_pid):
-        relaunched_at = state.last_midday_relaunch_attempt_at
-        if relaunched_at is not None and not state.midday_readiness_recheck_done:
+        if midday_recheck_pending(state):
             holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
-            ready = readiness_observed(
-                holds_intent_lock=(holder == tracked_pid),
-                permit_issued=state.permit_issued_seen_expires_at_ns is not None,
-                strategy_subscribed=state.strategy_subscribed_seen,
+            verdict = decide_midday_recheck(
+                state=state, now=now, holds_intent_lock=(holder == tracked_pid)
             )
-            if ready:
+            if verdict is MiddayRecheckAction.READY:
                 return tracked_pid, node_log, record_midday_readiness_recheck_done(state, now)
-            if (now - relaunched_at) > MIDDAY_READINESS_RECHECK_TIMEOUT:
+            if verdict is MiddayRecheckAction.NOT_READY_TIMEOUT:
                 log_decision(
                     "midday_relaunched_child_not_ready", phase="midday_watch", pid=tracked_pid
                 )
@@ -1942,23 +1925,21 @@ def _do_midday_watch(
                 return tracked_pid, node_log, record_midday_readiness_recheck_done(state, now)
         return tracked_pid, node_log, state
 
-    cause = state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
-
-    # [A-1, 2026-09-25] Fail-closed gate, checked FIRST and unconditionally --
-    # independent of the budget/window decision below. A mid-day relaunch
-    # without a known first-boot anchor would mint a fresh, unbounded
-    # +PERMIT_TTL_NS permit (the exact defect A-1 closes), so this never
-    # reaches `decide_midday_relaunch`/`ports.spawn` at all. Accepted failure
-    # surface (ruling doc): if the FIRST child dies between writing its
-    # permit line and the next poll, this anchor stays `None` and every
-    # mid-day relaunch for the rest of the day is declined here.
-    if state.first_boot_permit_expires_at_ns is None:
+    # [A-1, 2026-09-25] The fail-closed ceiling gate is decided FIRST and
+    # unconditionally by `decide_midday_dead_child`: a mid-day relaunch
+    # without a known first-boot anchor would mint a fresh, unbounded permit,
+    # so that case never reaches `ports.spawn`.
+    dead = decide_midday_dead_child(state=state, now=now, live_cause=live_cause)
+    if dead.action in (
+        MiddayDeadAction.CEILING_UNKNOWN_FIRST,
+        MiddayDeadAction.CEILING_UNKNOWN_REPEAT,
+    ):
         log_decision(
             "midday_relaunch_declined",
             phase="midday_watch",
             reason="first-boot permit expiry unknown",
         )
-        if not state.midday_ceiling_unknown_alert_sent:
+        if dead.action is MiddayDeadAction.CEILING_UNKNOWN_FIRST:
             log_decision("midday_relaunch_ceiling_unknown", phase="midday_watch", pid=tracked_pid)
             alert(
                 ports.alert_sink,
@@ -1970,16 +1951,9 @@ def _do_midday_watch(
             state = seed_permit_alert(state, now)  # [B1/D5]
         return tracked_pid, node_log, state
 
-    decision = decide_midday_relaunch(
-        now=now,
-        window_end=midday_watch_window_end(state.day),
-        attempts_so_far=state.midday_relaunch_attempts,
-        last_attempt_at=state.last_midday_relaunch_attempt_at,
-        cause=cause,
-    )
-    if not decision.should_relaunch:
-        log_decision("midday_relaunch_declined", phase="midday_watch", reason=decision.reason)
-        if decision.reason == "attempt budget exhausted":
+    if dead.action is not MiddayDeadAction.RELAUNCH:
+        log_decision("midday_relaunch_declined", phase="midday_watch", reason=dead.reason or "")
+        if dead.action is MiddayDeadAction.EXHAUSTED:
             log_decision("midday_relaunch_exhausted", phase="midday_watch", pid=tracked_pid)
             alert(
                 ports.alert_sink,
@@ -1998,7 +1972,7 @@ def _do_midday_watch(
     # [A-1] Cap the relaunched child's permit at the day's first-boot expiry
     # -- a copy of the environment, never a mutation of `os.environ` itself
     # (which `_do_launch`'s own 16:50Z daily-boot spawn still forwards
-    # as-is, with no ceiling).
+    # as-is, with no ceiling). `RELAUNCH` implies the anchor is known.
     child_env = dict(os.environ)
     child_env[PERMIT_EXPIRY_CEILING_NS_ENV_VAR] = str(state.first_boot_permit_expires_at_ns)
     proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=child_env, log_path=new_log)
@@ -2285,6 +2259,11 @@ def _contain_permit_watch_failure(
     return tracked_pid, node_log, state
 
 
+def _emit_alert_spec(sink: AlertSink, spec: AlertSpec) -> None:
+    """Emit a decided :class:`AlertSpec` through the shared sink."""
+    alert(sink, event=spec.event, severity=spec.severity, detail=spec.detail)
+
+
 def _load_self_check_escalation(
     store_path: Path,
 ) -> tuple[SelfCheckEscalationState, EscalationLoadOutcome]:
@@ -2360,68 +2339,8 @@ def _do_self_check(
     log_text = ports.read_log_new(node_log) if node_log is not None else ""
     child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
 
-    strategy_subscribed_live = strategy_subscribed_in(log_text)
-    permit_issued_live = PERMIT_ISSUED_MARKER in log_text
-    live_permit_expiry_ns = parse_permit_expiry_ns(log_text)
-    now_ns = int(now.timestamp() * 1e9)
-    if state is not None:
-        if strategy_subscribed_live and not state.strategy_subscribed_seen:
-            state = record_strategy_subscribed_seen(state, now)
-        strategy_subscribed = state.strategy_subscribed_seen
-        if live_permit_expiry_ns is not None and state.permit_issued_seen_expires_at_ns is None:
-            state = record_permit_issued_seen(state, now, live_permit_expiry_ns)
-        if live_permit_expiry_ns is not None:
-            # [A-1] Distinct, day-level anchor -- idempotent, so calling it
-            # unconditionally (whenever a permit-issued line is observed)
-            # is safe even when the per-child latch above was skipped.
-            state = record_first_boot_permit_seen(state, now, live_permit_expiry_ns)
-        # [FU-1, 2026-09-25] `_do_self_check` has no `handler_read_log` flag
-        # of its own, but reads through the identical shared, offset-
-        # draining `IncrementalLogReader` as `_do_relaunch_check` and
-        # `_do_midday_watch` -- so a delta it drains can lose these two
-        # facts the exact same way, and neither was previously latched
-        # here. Both are idempotent first-seen-wins latches, same as the
-        # strategy/permit latches just above.
-        live_cause = classify_exit1_cause(log_text)
-        if live_cause is not RelaunchCause.UNKNOWN:
-            state = record_midday_cause_seen(state, now, live_cause)
-        if PERMIT_NOT_REQUESTED_MARKER in log_text:
-            state = record_orders_not_requested_seen(state, now)
-        # [FU-17, r4->r5 ruling 6] Same drain-safe placement as the two
-        # latches just above -- this handler's own read can be the first (or
-        # only) one to see the marker.
-        if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
-            state = record_boot_zero_instruments_seen(state, now)
-        latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
-        permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
-        if latched_permit_expiry_ns is not None:
-            expiry_valid = latched_permit_expiry_ns > now_ns
-        else:
-            expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
-        # [A-1 follow-up, 2026-09-25] Distinguish a permit whose expiry
-        # equals the day's first-boot ceiling anchor -- A-1's clamp working
-        # as designed, never a genuine refusal. ``relaunch_attempts > 0`` is
-        # the only observable signal separating "this child's own permit IS
-        # the anchor's source" (the never-relaunched original boot, where
-        # the values trivially match) from "this child's permit was CLAMPED
-        # to a pre-existing anchor" -- a clamped permit's log line is
-        # byte-identical in shape to a fresh one (ruling doc §2/§4).
-        observed_expiry_ns = (
-            latched_permit_expiry_ns
-            if latched_permit_expiry_ns is not None
-            else live_permit_expiry_ns
-        )
-        permit_expiry_at_daily_ceiling = (
-            observed_expiry_ns is not None
-            and state.first_boot_permit_expires_at_ns is not None
-            and observed_expiry_ns == state.first_boot_permit_expires_at_ns
-            and state.relaunch_attempts > 0
-        )
-    else:
-        strategy_subscribed = strategy_subscribed_live
-        permit_issued = permit_issued_live
-        expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
-        permit_expiry_at_daily_ceiling = False
+    facts = derive_self_check_facts(state=state, log_text=log_text, now=now)
+    state = facts.state
 
     continuous_check: ContinuousFamilyCheck | None = None
     continuous_family_halt_source: str | None = None
@@ -2441,12 +2360,12 @@ def _do_self_check(
         child_alive=child_alive,
         flock_holder_count=holder_count,
         flock_held_by_tracked_pid=(tracked_pid is not None and holder == tracked_pid),
-        permit_issued=permit_issued,
-        permit_expiry_valid=expiry_valid,
-        strategy_subscribed=strategy_subscribed,
+        permit_issued=facts.permit_issued,
+        permit_expiry_valid=facts.permit_expiry_valid,
+        strategy_subscribed=facts.strategy_subscribed,
         log_available=node_log is not None,
         continuous_check=continuous_check,
-        permit_expiry_at_daily_ceiling=permit_expiry_at_daily_ceiling,
+        permit_expiry_at_daily_ceiling=facts.permit_expiry_at_daily_ceiling,
     )
     # [B1/D5] A permit-specific FAIL seeds B1's own heartbeat timer so its
     # first CRITICAL for the SAME underlying fault waits for the heartbeat
@@ -2465,66 +2384,31 @@ def _do_self_check(
         last_self_check_utc=escalation_state.last_self_check_utc, now_utc=now
     )
 
-    log_fields: dict[str, int | str] = {"result": result.value}
-    if continuous_check is not None:
-        log_fields.update(
-            continuous_phase0_clean=continuous_check.phase0_clean,
-            continuous_startup_evidence_valid=continuous_check.startup_evidence_valid,
-            continuous_family_not_halted=continuous_check.family_not_halted,
-            continuous_family_halt_source=continuous_family_halt_source or "unknown",
-        )
-    if load_outcome is EscalationLoadOutcome.ABSENT:
-        # The only outcome permitted to be silent -- the count is known
-        # (zero), just never previously observed.
-        log_fields["escalation_state"] = "absent"
-    if gap_hours is not None and gap_hours > SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS:
-        log_fields["self_check_gap_hours"] = int(gap_hours)
-    log_decision("self_check", **log_fields)
+    log_decision(
+        "self_check",
+        **self_check_log_fields(
+            result=result,
+            continuous_check=continuous_check,
+            continuous_family_halt_source=continuous_family_halt_source,
+            load_outcome=load_outcome,
+            gap_hours=gap_hours,
+        ),
+    )
 
-    if load_outcome is EscalationLoadOutcome.CORRUPT:
-        alert(
-            ports.alert_sink,
-            event="TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_CORRUPT",
-            severity="WARN",
-            detail=AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT,
-        )
-    elif load_outcome is EscalationLoadOutcome.UNAVAILABLE:
-        alert(
-            ports.alert_sink,
-            event="TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STORE_UNAVAILABLE",
-            severity="WARN",
-            detail=AlertDetail.SELF_CHECK_ESCALATION_STORE_UNAVAILABLE,
-        )
+    load_alert = self_check_load_alert(load_outcome)
+    if load_alert is not None:
+        _emit_alert_spec(ports.alert_sink, load_alert)
 
     new_escalation_state = record_self_check_result(
         escalation_state, result.value, now_utc=now_utc_iso
     )
-    count_known = load_outcome in (EscalationLoadOutcome.ABSENT, EscalationLoadOutcome.PRESENT)
-    severity = escalated_self_check_severity(
-        result_is_fail=result not in _SELF_CHECK_PASS_RESULTS,
+    result_alert = self_check_result_alert(
+        result=result,
+        load_outcome=load_outcome,
         consecutive_failures=new_escalation_state.consecutive_failures,
-        count_known=count_known,
     )
-    if severity == "CRITICAL":
-        if count_known:
-            detail = SELF_CHECK_ALERT_DETAIL[result]
-        elif load_outcome is EscalationLoadOutcome.CORRUPT:
-            detail = AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT
-        else:
-            detail = AlertDetail.SELF_CHECK_ESCALATION_STORE_UNAVAILABLE
-        alert(
-            ports.alert_sink,
-            event="TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED",
-            severity="CRITICAL",
-            detail=detail,
-        )
-    elif severity == "WARN":
-        alert(
-            ports.alert_sink,
-            event="TRADE_SUPERVISOR_SELF_CHECK_FAIL",
-            severity="WARN",
-            detail=SELF_CHECK_ALERT_DETAIL[result],
-        )
+    if result_alert is not None:
+        _emit_alert_spec(ports.alert_sink, result_alert)
 
     try:
         with SqliteStateStore(store_path) as store:
@@ -2671,6 +2555,82 @@ def _dispatch_permit_watch(
         return tracked_pid, node_log, state
 
 
+def _run_phase(
+    *,
+    phase: Phase,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    repo_root: Path,
+    node_bin: Path,
+    log_dir: Path,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """Dispatch one due (non-``NONE``) phase to its handler and thread the
+    ``(tracked_pid, node_log, state)`` triple through. May raise: the loop
+    contains it per phase."""
+    if phase is Phase.STOP_PRIOR:
+        tracked_pid = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=tracked_pid)
+        return tracked_pid, node_log, mark_phase_fired(state, phase, now)
+    if phase is Phase.LAUNCH:
+        tracked_pid, node_log, state, done = _do_launch(
+            ports=ports,
+            state=state,
+            now=now,
+            store_path=store_path,
+            repo_root=repo_root,
+            node_bin=node_bin,
+            log_dir=log_dir,
+        )
+        if done:
+            state = mark_phase_fired(state, phase, now)
+        return tracked_pid, node_log, state
+    if phase is Phase.RELAUNCH_CHECK:
+        return _do_relaunch_check(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+            repo_root=repo_root,
+            node_bin=node_bin,
+            log_dir=log_dir,
+        )
+    if phase is Phase.SELF_CHECK:
+        tracked_pid, node_log, new_state = _do_self_check(
+            ports=ports,
+            now=now,
+            store_path=store_path,
+            log_dir=log_dir,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            state=state,
+        )
+        if new_state is not None:
+            state = new_state
+        return tracked_pid, node_log, mark_phase_fired(state, phase, now)
+    if phase is Phase.MIDDAY_WATCH:
+        return _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=now,
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+            repo_root=repo_root,
+            node_bin=node_bin,
+            log_dir=log_dir,
+        )
+    # Defensive: a future new `Phase` must never silently fall through into
+    # `_do_self_check` (the original bug this dispatch fixed) -- named and
+    # dropped instead.
+    log_decision("phase_unhandled", phase=phase.value)
+    return tracked_pid, node_log, state
+
+
 def _run_forever(
     *,
     store_path: Path,
@@ -2749,75 +2709,28 @@ def _run_forever(
                 sleep(_SCHEDULE_POLL_INTERVAL_S)
                 continue
 
-            permit_watch_handler_read_log = False
+            # [B1/D6] Captured BEFORE the dispatch: mirrors `_do_midday_watch`'s
+            # own early-return guard exactly, so B1 drains the log itself only
+            # when this dispatch did not (an early return means no read).
+            permit_watch_handler_read_log = (
+                phase is Phase.MIDDAY_WATCH
+                and midday_handler_reads_log(
+                    state=state, tracked_pid=tracked_pid, node_log=node_log
+                )
+            )
             try:
-                if phase is Phase.STOP_PRIOR:
-                    tracked_pid = _do_stop_prior(
-                        ports=active_ports, store_path=store_path, tracked_pid=tracked_pid
-                    )
-                    state = mark_phase_fired(state, phase, now)
-                elif phase is Phase.LAUNCH:
-                    tracked_pid, node_log, state, done = _do_launch(
-                        ports=active_ports,
-                        state=state,
-                        now=now,
-                        store_path=store_path,
-                        repo_root=repo_root,
-                        node_bin=node_bin,
-                        log_dir=log_dir,
-                    )
-                    if done:
-                        state = mark_phase_fired(state, phase, now)
-                elif phase is Phase.RELAUNCH_CHECK:
-                    tracked_pid, node_log, state = _do_relaunch_check(
-                        ports=active_ports,
-                        state=state,
-                        now=now,
-                        tracked_pid=tracked_pid,
-                        node_log=node_log,
-                        store_path=store_path,
-                        repo_root=repo_root,
-                        node_bin=node_bin,
-                        log_dir=log_dir,
-                    )
-                elif phase is Phase.SELF_CHECK:
-                    tracked_pid, node_log, new_state = _do_self_check(
-                        ports=active_ports,
-                        now=now,
-                        store_path=store_path,
-                        log_dir=log_dir,
-                        tracked_pid=tracked_pid,
-                        node_log=node_log,
-                        state=state,
-                    )
-                    if new_state is not None:
-                        state = new_state
-                    state = mark_phase_fired(state, phase, now)
-                elif phase is Phase.MIDDAY_WATCH:
-                    # [B1/D6] Captured BEFORE the call: mirrors
-                    # `_do_midday_watch`'s own early-return guard exactly, so
-                    # B1 drains the log itself only when this dispatch did
-                    # not (an early return means no read happened).
-                    permit_watch_handler_read_log = not (
-                        state.midday_alert_sent or tracked_pid is None or node_log is None
-                    )
-                    tracked_pid, node_log, state = _do_midday_watch(
-                        ports=active_ports,
-                        state=state,
-                        now=now,
-                        tracked_pid=tracked_pid,
-                        node_log=node_log,
-                        store_path=store_path,
-                        repo_root=repo_root,
-                        node_bin=node_bin,
-                        log_dir=log_dir,
-                    )
-                else:
-                    # Defensive: a future third new `Phase` must never
-                    # silently fall through into `_do_self_check` (the
-                    # original bug this dispatch fixed) -- named and
-                    # dropped instead.
-                    log_decision("phase_unhandled", phase=phase.value)
+                tracked_pid, node_log, state = _run_phase(
+                    phase=phase,
+                    ports=active_ports,
+                    state=state,
+                    now=now,
+                    tracked_pid=tracked_pid,
+                    node_log=node_log,
+                    store_path=store_path,
+                    repo_root=repo_root,
+                    node_bin=node_bin,
+                    log_dir=log_dir,
+                )
             except Exception as exc:  # noqa: BLE001 -- deliberate: one failing
                 # phase must never end the supervisor (see the coordinator's
                 # loop-wiring requirement). Named by TYPE only below, never
@@ -2833,7 +2746,7 @@ def _run_forever(
                     severity="CRITICAL",
                     detail=AlertDetail.PHASE_EXCEPTION_CONTAINED,
                 )
-                if phase is not Phase.RELAUNCH_CHECK:
+                if phase_exception_marks_fired(phase):
                     state = mark_phase_fired(state, phase, now)
 
             # [B1] Runs after EVERY dispatched phase (Architecture step 3) --
@@ -2857,11 +2770,7 @@ def _run_forever(
             # readiness or the 17:00 UTC cutoff. Tighter for RELAUNCH_CHECK
             # (the child may become ready or fail within seconds) than the
             # general schedule poll.
-            sleep(
-                _RELAUNCH_POLL_INTERVAL_S
-                if phase is Phase.RELAUNCH_CHECK
-                else _SCHEDULE_POLL_INTERVAL_S
-            )
+            sleep(phase_poll_interval_s(phase))
     except KeyboardInterrupt:
         log_decision("supervisor_interrupted")
         return
