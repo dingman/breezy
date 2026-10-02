@@ -18,8 +18,10 @@ SRC_DIR: Final[Path] = REPO_ROOT / "src"
 DEAD_STRATEGY_PREFIXES: Final[tuple[str, ...]] = (
     "breezy.strategy.calibration_mean_reversion",
     "breezy.strategy.cli_settlement_print_lock",
+    "breezy.strategy.forecast_edge",
     "breezy.strategy.forecast_mispricing",
     "breezy.strategy.forecast_revision",
+    "breezy.strategy.resting_ladder",
     "breezy.strategy.running_extreme_lock",
 )
 

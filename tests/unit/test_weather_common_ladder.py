@@ -1,12 +1,11 @@
 """Unit tests for `breezy.strategy.weather_common.ladder`.
 
-BL-25 D2. The visible-ask-ladder walk was PRIVATE to
-`running_extreme_lock.decision` (`_vwap_ask_for_quantity`) while
-`cli_settlement_print_lock`, `RiskManager.evaluate_order` and the offline
-gate classifier each needed the same arithmetic. This module is that one
-walk, and these tests pin the padding/exhaustion semantics every caller now
-depends on -- see `test_weather_common_costs.py` for the cost built on top of
-it and `test_weather_common_risk.py` for the size clip.
+BL-25 D2. The visible-ask-ladder walk was once PRIVATE to a strategy module
+while `RiskManager.evaluate_order` and other callers needed the same
+arithmetic. This module is that one walk, and these tests pin the
+padding/exhaustion semantics every caller now depends on -- see
+`test_weather_common_costs.py` for the cost built on top of it and
+`test_weather_common_risk.py` for the size clip.
 """
 
 from __future__ import annotations
@@ -156,21 +155,6 @@ def test_available_ask_depth_falls_back_to_top_of_book_size() -> None:
 def test_available_ask_depth_of_an_empty_book_is_zero_never_unbounded() -> None:
     assert available_ask_depth(_quote(ask=None, ask_size=None)) == 0.0
     assert available_ask_depth(_quote(ask=0.90, ask_size=None)) == 0.0
-
-
-# ---------------------------------------------------------------------------
-# DRY: the strategy that owned this arithmetic first now delegates to it
-# ---------------------------------------------------------------------------
-
-
-def test_running_extreme_lock_delegates_to_the_shared_walk() -> None:
-    from breezy.strategy.running_extreme_lock.decision import _vwap_ask_for_quantity
-
-    walked = _vwap_ask_for_quantity(THIN_TOP_LADDER, 25.0)
-    shared = walk_ask_ladder(THIN_TOP_LADDER, 25.0)
-
-    assert shared is not None
-    assert walked == (shared.vwap_price, shared.filled_quantity)
 
 
 # ---------------------------------------------------------------------------

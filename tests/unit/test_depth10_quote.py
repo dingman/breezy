@@ -12,7 +12,6 @@ side arrives on ``MarketQuote`` as ``None``, which the type already expresses.
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 from typing import Any
@@ -35,14 +34,6 @@ from breezy.strategy.depth10 import best_order, market_quote_from_depth
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW = REPO_ROOT / "docs" / "evidence" / "venue" / "polymarket_us" / "raw"
 TS_INIT = 1_787_617_213_000_000_000
-
-DEPTH_QUOTE_CONSUMERS = (
-    "src/breezy/strategy/forecast_mispricing/strategy.py",
-    "src/breezy/strategy/calibration_mean_reversion/strategy.py",
-    "src/breezy/strategy/forecast_revision/strategy.py",
-    "src/breezy/strategy/running_extreme_lock/strategy.py",
-)
-
 
 def _load_raw(name: str) -> dict[str, Any]:
     payload: dict[str, Any] = json.loads((RAW / name).read_text(encoding="utf-8"))
@@ -216,32 +207,3 @@ def test_best_order_keeps_a_real_thin_level() -> None:
     assert best is not None
     assert float(best.price) == pytest.approx(0.33)
     assert float(best.size) == pytest.approx(1.0)
-
-
-# ---------------------------------------------------------------------------
-# Seam: every MarketQuote-from-depth consumer uses the shared factory
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("path", DEPTH_QUOTE_CONSUMERS)
-def test_depth_consumers_build_market_quote_through_the_shared_factory(path: str) -> None:
-    """Do not re-paste the skip-if-zero loop; one conversion, four call sites."""
-    source = Path(REPO_ROOT / path).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "market_quote_from_depth"
-    ]
-    assert calls, f"{path} never calls market_quote_from_depth"
-
-    indexed = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Subscript)
-        and isinstance(node.value, ast.Attribute)
-        and node.value.attr in {"bids", "asks"}
-    ]
-    assert indexed == [], f"{path} still indexes depth.bids/asks directly: {indexed}"

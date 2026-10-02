@@ -30,13 +30,9 @@ from pathlib import Path
 
 import pytest
 
-#: Every module of every weather strategy package, plus the shared layer.
-WEATHER_STRATEGY_DIRS = (
-    "src/breezy/strategy/weather_common",
-    "src/breezy/strategy/forecast_mispricing",
-    "src/breezy/strategy/calibration_mean_reversion",
-    "src/breezy/strategy/forecast_revision",
-)
+#: Every module of the shared weather layer. (BC-3 removed the dead weather
+#: strategy packages that used to be listed alongside it.)
+WEATHER_STRATEGY_DIRS = ("src/breezy/strategy/weather_common",)
 
 #: Fabricated-clock fingerprints from the bundles: identifiers a strategy must
 #: not define, call, or read.

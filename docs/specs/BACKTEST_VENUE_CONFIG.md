@@ -117,7 +117,7 @@ is `reduce_only`. The engine's own settlement leg never passes through the
 screen: `check_instrument_expiration` adds its order to the cache directly and
 publishes no `OrderInitialized` (`backtest/engine.pyx:5952-5966`).
 
-A strategy is still free to keep its own guard, and `resting_ladder` does; what
+A strategy is still free to keep its own guard, and the removed `resting_ladder` did (git tag `bc3-pre-removal-2026-10-02`); what
 changed is that forgetting one is no longer silent.
 
 `BETTING` is the tempting wrong answer and is definitively wrong.

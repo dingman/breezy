@@ -14,9 +14,6 @@ import datetime as dt
 import pytest
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
-from breezy.strategy.calibration_mean_reversion.config import CalibrationMeanReversionConfig
-from breezy.strategy.forecast_mispricing.config import ForecastMispricingConfig
-from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
 from breezy.strategy.weather_common import risk as risk_module
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.freshness import SignalFreshness, SignalKind
@@ -874,17 +871,6 @@ def test_bare_risk_limits_forbid_shorting() -> None:
     assert RiskLimits().allow_short is False
 
 
-def test_no_strategy_config_default_permits_shorting() -> None:
-    """All three strategy configs, at their defaults, off the same rule.
-
-    Asserted on the config OBJECTS rather than on source text: a default that
-    flips back to `True` fails here regardless of how it is spelled.
-    """
-    assert CalibrationMeanReversionConfig(instrument_ids=()).allow_short is False
-    assert ForecastMispricingConfig(instrument_ids=()).allow_short is False
-    assert ForecastRevisionConfig(instrument_ids=()).allow_short is False
-
-
 # ---------------------------------------------------------------------------
 # `exclusive_conflict` is UNTOUCHED by the close-only fix -- characterization
 # ---------------------------------------------------------------------------
@@ -1123,25 +1109,14 @@ def test_forecast_age_above_the_limit_still_refuses_as_stale_forecast_not_future
 
 
 # ---------------------------------------------------------------------------
-# C2 -- `stale_observation_hours` fail-closed default, and no shipped config
-# declares one (the missing half of the `allow_short` discipline, applied to
-# the new field: see `test_bare_risk_limits_forbid_shorting` /
-# `test_no_strategy_config_default_permits_shorting` above).
+# C2 -- `stale_observation_hours` fail-closed default (the missing half of the
+# `allow_short` discipline, applied to the new field: see
+# `test_bare_risk_limits_forbid_shorting` above).
 # ---------------------------------------------------------------------------
 
 
 def test_bare_risk_limits_defaults_stale_observation_hours_to_none() -> None:
     assert RiskLimits().stale_observation_hours is None
-
-
-def test_no_strategy_config_declares_a_stale_observation_hours_default() -> None:
-    """No shipped strategy is observation-driven yet (see the plan's blast
-    radius): none of the three configs should carry this field at all, so a
-    future strategy that silently starts is impossible to miss here.
-    """
-    assert not hasattr(CalibrationMeanReversionConfig(instrument_ids=()), "stale_observation_hours")
-    assert not hasattr(ForecastMispricingConfig(instrument_ids=()), "stale_observation_hours")
-    assert not hasattr(ForecastRevisionConfig(instrument_ids=()), "stale_observation_hours")
 
 
 # ---------------------------------------------------------------------------

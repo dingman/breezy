@@ -35,12 +35,13 @@ from nautilus_trader.common.component import is_matching_py
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 
-#: Every Nautilus-facing weather strategy module that subscribes to the feed.
-STRATEGY_MODULES = (
-    "src/breezy/strategy/forecast_mispricing/strategy.py",
-    "src/breezy/strategy/calibration_mean_reversion/strategy.py",
-    "src/breezy/strategy/forecast_revision/strategy.py",
-)
+#: Every Nautilus-facing weather strategy module that subscribes to the shared
+#: ``nws_climate_day_data_type`` feed. BC-3 removed the five dead weather
+#: strategy shells that used to be listed here; the live families subscribe to
+#: other data types (``station_observation_data_type`` etc.) and are out of
+#: this contract's shape. ``harness_probe`` is the shipped strategy that still
+#: uses the shared factory + client id.
+STRATEGY_MODULES = ("src/breezy/strategy/harness_probe.py",)
 
 #: The topics the bundles used, kept here so the regression stays named.
 BUNDLE_TOPICS = ("NWSForecastUpdate*", "NWSObservation*")
@@ -64,6 +65,13 @@ def test_publisher_topic_does_not_match_the_bundles_topics() -> None:
         assert not is_matching_py(publisher, bundle_topic), (
             f"{bundle_topic!r} unexpectedly matches {publisher!r}"
         )
+
+
+def test_the_strategy_module_list_is_not_vacuous() -> None:
+    """The parametrized scans below must have real files to scan."""
+    assert STRATEGY_MODULES
+    for path in STRATEGY_MODULES:
+        assert Path(path).is_file(), f"{path} does not exist"
 
 
 def test_shared_factory_topic_matches_the_publisher() -> None:
