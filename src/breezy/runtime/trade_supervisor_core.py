@@ -22,10 +22,13 @@ import datetime as dt
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Schedule -- UTC only.
@@ -1848,3 +1851,351 @@ def seed_permit_alert(state: DaySchedulerState, now_utc: dt.datetime) -> DaySche
     (see :func:`decide_permit_alert`'s docstring)."""
     effective = _for_day(state, _trading_day(now_utc))
     return replace(effective, permit_alert_last_sent_at=now_utc)
+
+
+# ---------------------------------------------------------------------------
+# [R3.2] Supervisor decisions lifted out of the I/O shells. Every function
+# below is pure: values in, values out -- no clock read, no port call. The
+# shells (`trade_supervisor._do_self_check`, `_do_midday_watch`,
+# `_run_forever`) resolve the I/O and apply the returned decision.
+# ---------------------------------------------------------------------------
+
+#: Bounded poll interval for the main schedule loop -- an early return or a
+#: backwards clock step is always re-evaluated within this many seconds,
+#: never a single unbounded sleep.
+_SCHEDULE_POLL_INTERVAL_S: Final[float] = 60.0
+
+#: [D1] Pacing interval after a RELAUNCH_CHECK dispatch specifically -- a
+#: TIGHTER interval than the general schedule poll (the child may become
+#: ready or fail within seconds of being spawned), but every dispatch, not
+#: just a NONE result, must be followed by SOME bounded sleep: without
+#: this a live RELAUNCH_CHECK window (launched but not yet ready) is a
+#: zero-delay busy loop -- pegs a core, hammers /proc/locks and the log.
+_RELAUNCH_POLL_INTERVAL_S: Final[float] = 15.0
+
+#: Self-check results that are a PASS of some kind -- never alerted on.
+_SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
+    {SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN}
+)
+
+#: [B1/D5] The self-check FAIL results that are specifically about the
+#: permit -- these seed B1's own heartbeat (see ``_do_self_check``'s call to
+#: ``seed_permit_alert``), distinct from a not-ready/multi-holder FAIL.
+_PERMIT_FAIL_SELF_CHECK_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
+    {
+        SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT,
+        SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING,
+    }
+)
+
+
+def phase_poll_interval_s(phase: Phase) -> float:
+    """[D1] The bounded sleep after a dispatched (non-``NONE``) phase:
+    tighter for RELAUNCH_CHECK than for every other phase."""
+    return _RELAUNCH_POLL_INTERVAL_S if phase is Phase.RELAUNCH_CHECK else _SCHEDULE_POLL_INTERVAL_S
+
+
+def phase_exception_marks_fired(phase: Phase) -> bool:
+    """A contained phase exception latches the phase as fired -- except
+    RELAUNCH_CHECK, which stays due so the next poll retries it."""
+    return phase is not Phase.RELAUNCH_CHECK
+
+
+def midday_handler_reads_log(
+    *, state: DaySchedulerState, tracked_pid: int | None, node_log: Path | None
+) -> bool:
+    """[B1/D6] Mirrors the mid-day handler's own early-return guard
+    (``midday_alert_sent`` latched, or nothing tracked / no log): B1 drains
+    the log itself only when the mid-day dispatch did not."""
+    return not (state.midday_alert_sent or tracked_pid is None or node_log is None)
+
+
+@dataclass(frozen=True, slots=True)
+class SelfCheckFacts:
+    """The log-derived inputs of :func:`self_check` plus the state with
+    every first-seen latch applied (``None`` iff no state was supplied)."""
+
+    state: DaySchedulerState | None
+    strategy_subscribed: bool
+    permit_issued: bool
+    permit_expiry_valid: bool
+    permit_expiry_at_daily_ceiling: bool
+
+
+def derive_self_check_facts(
+    *, state: DaySchedulerState | None, log_text: str, now: dt.datetime
+) -> SelfCheckFacts:
+    """Latch-and-derive step of the 17:05 self-check.
+
+    With no ``state``: log-only facts (the original behaviour). With
+    ``state``: every drain-safe first-seen latch is applied, and the
+    sticky/latched values are OR'd with this call's live log delta
+    ([fix 2026-09-05], [fix 2026-09-06], [A-1], [FU-1], [FU-17])."""
+    strategy_subscribed_live = strategy_subscribed_in(log_text)
+    permit_issued_live = PERMIT_ISSUED_MARKER in log_text
+    live_permit_expiry_ns = parse_permit_expiry_ns(log_text)
+    now_ns = int(now.timestamp() * 1e9)
+    if state is None:
+        return SelfCheckFacts(
+            state=None,
+            strategy_subscribed=strategy_subscribed_live,
+            permit_issued=permit_issued_live,
+            permit_expiry_valid=permit_expiry_valid(log_text, now_ns=now_ns),
+            permit_expiry_at_daily_ceiling=False,
+        )
+    if strategy_subscribed_live and not state.strategy_subscribed_seen:
+        state = record_strategy_subscribed_seen(state, now)
+    strategy_subscribed = state.strategy_subscribed_seen
+    if live_permit_expiry_ns is not None and state.permit_issued_seen_expires_at_ns is None:
+        state = record_permit_issued_seen(state, now, live_permit_expiry_ns)
+    if live_permit_expiry_ns is not None:
+        # [A-1] Distinct, day-level anchor -- idempotent.
+        state = record_first_boot_permit_seen(state, now, live_permit_expiry_ns)
+    live_cause = classify_exit1_cause(log_text)
+    if live_cause is not RelaunchCause.UNKNOWN:
+        state = record_midday_cause_seen(state, now, live_cause)
+    if PERMIT_NOT_REQUESTED_MARKER in log_text:
+        state = record_orders_not_requested_seen(state, now)
+    if zero_instruments_refusal_in(log_text) and not state.boot_zero_instruments_seen:
+        state = record_boot_zero_instruments_seen(state, now)
+    latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
+    permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
+    if latched_permit_expiry_ns is not None:
+        expiry_valid = latched_permit_expiry_ns > now_ns
+    else:
+        expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
+    # [A-1 follow-up] A permit whose expiry equals the day's first-boot
+    # ceiling anchor on a relaunched child is the clamp working, not a
+    # refusal.
+    observed_expiry_ns = (
+        latched_permit_expiry_ns if latched_permit_expiry_ns is not None else live_permit_expiry_ns
+    )
+    at_ceiling = (
+        observed_expiry_ns is not None
+        and state.first_boot_permit_expires_at_ns is not None
+        and observed_expiry_ns == state.first_boot_permit_expires_at_ns
+        and state.relaunch_attempts > 0
+    )
+    return SelfCheckFacts(
+        state=state,
+        strategy_subscribed=strategy_subscribed,
+        permit_issued=permit_issued,
+        permit_expiry_valid=expiry_valid,
+        permit_expiry_at_daily_ceiling=at_ceiling,
+    )
+
+
+def self_check_log_fields(
+    *,
+    result: SelfCheckResult,
+    continuous_check: ContinuousFamilyCheck | None,
+    continuous_family_halt_source: str | None,
+    load_outcome: EscalationLoadOutcome,
+    gap_hours: float | None,
+) -> dict[str, int | str]:
+    """The fields of the single ``self_check`` decision-log line."""
+    fields: dict[str, int | str] = {"result": result.value}
+    if continuous_check is not None:
+        fields.update(
+            continuous_phase0_clean=continuous_check.phase0_clean,
+            continuous_startup_evidence_valid=continuous_check.startup_evidence_valid,
+            continuous_family_not_halted=continuous_check.family_not_halted,
+            continuous_family_halt_source=continuous_family_halt_source or "unknown",
+        )
+    if load_outcome is EscalationLoadOutcome.ABSENT:
+        # The only outcome permitted to be silent.
+        fields["escalation_state"] = "absent"
+    if gap_hours is not None and gap_hours > SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS:
+        fields["self_check_gap_hours"] = int(gap_hours)
+    return fields
+
+
+@dataclass(frozen=True, slots=True)
+class AlertSpec:
+    """A decided alert: the shell emits it through the sink as-is."""
+
+    event: str
+    severity: str
+    detail: AlertDetail
+
+
+def self_check_load_alert(load_outcome: EscalationLoadOutcome) -> AlertSpec | None:
+    """The WARN owed for a corrupt/unavailable escalation record."""
+    if load_outcome is EscalationLoadOutcome.CORRUPT:
+        return AlertSpec(
+            "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_CORRUPT",
+            "WARN",
+            AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT,
+        )
+    if load_outcome is EscalationLoadOutcome.UNAVAILABLE:
+        return AlertSpec(
+            "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STORE_UNAVAILABLE",
+            "WARN",
+            AlertDetail.SELF_CHECK_ESCALATION_STORE_UNAVAILABLE,
+        )
+    return None
+
+
+def self_check_result_alert(
+    *,
+    result: SelfCheckResult,
+    load_outcome: EscalationLoadOutcome,
+    consecutive_failures: int,
+) -> AlertSpec | None:
+    """[AUD-14b] The repeat-failure escalation: ``None`` on a PASS, WARN on
+    a known first failure, CRITICAL on a repeat or an unknown count."""
+    count_known = load_outcome in (EscalationLoadOutcome.ABSENT, EscalationLoadOutcome.PRESENT)
+    severity = escalated_self_check_severity(
+        result_is_fail=result not in _SELF_CHECK_PASS_RESULTS,
+        consecutive_failures=consecutive_failures,
+        count_known=count_known,
+    )
+    if severity == "CRITICAL":
+        if count_known:
+            detail = SELF_CHECK_ALERT_DETAIL[result]
+        elif load_outcome is EscalationLoadOutcome.CORRUPT:
+            detail = AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT
+        else:
+            detail = AlertDetail.SELF_CHECK_ESCALATION_STORE_UNAVAILABLE
+        return AlertSpec("TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED", "CRITICAL", detail)
+    if severity == "WARN":
+        return AlertSpec(
+            "TRADE_SUPERVISOR_SELF_CHECK_FAIL", "WARN", SELF_CHECK_ALERT_DETAIL[result]
+        )
+    return None
+
+
+def midday_boot_retry_dispatch_due(
+    *,
+    state: DaySchedulerState,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    is_owned: Callable[[int], bool],
+) -> bool:
+    """[FU-17, AC16] True when the mid-day handler must hand off to boot
+    retry: a zero-instrument boot day with no readiness or permit ever
+    observed, neither terminal boot-retry alert sent, and either no tracked
+    child or one this supervisor owns with a KNOWN log. ``is_owned`` is
+    consulted last, and only for a tracked pid."""
+    return (
+        state.boot_zero_instruments_seen
+        and not state.readiness_observed
+        and state.first_boot_permit_expires_at_ns is None
+        and not state.boot_retry_nontransient_alert_sent
+        and not state.boot_retry_exhausted_alert_sent
+        and (tracked_pid is None or (is_owned(tracked_pid) and node_log is not None))
+    )
+
+
+def midday_watch_idle(
+    *, state: DaySchedulerState, tracked_pid: int | None, node_log: Path | None
+) -> bool:
+    """True when the mid-day body must return its inputs unchanged without
+    reading the log: boot-retry permanently terminated [AM-5], the mid-day
+    budget already alerted, or nothing tracked / no log."""
+    return (
+        state.boot_retry_nontransient_alert_sent
+        or state.boot_retry_exhausted_alert_sent
+        or state.midday_alert_sent
+        or tracked_pid is None
+        or node_log is None
+    )
+
+
+def latch_midday_log_facts(
+    *, state: DaySchedulerState, now: dt.datetime, log_text: str
+) -> tuple[DaySchedulerState, RelaunchCause]:
+    """Drain-safe per-poll latches of the mid-day watch (alive OR dead):
+    strategy-subscribed, permit-issued (per-child and day-level [A-1]),
+    first non-UNKNOWN exit cause, and the permit-not-requested marker
+    [FU-1]. Returns the new state and this delta's live exit cause."""
+    if strategy_subscribed_in(log_text):
+        state = record_strategy_subscribed_seen(state, now)
+    permit_expiry_ns = parse_permit_expiry_ns(log_text)
+    if permit_expiry_ns is not None:
+        state = record_permit_issued_seen(state, now, permit_expiry_ns)
+        state = record_first_boot_permit_seen(state, now, permit_expiry_ns)
+    live_cause = classify_exit1_cause(log_text)
+    if live_cause is not RelaunchCause.UNKNOWN:
+        state = record_midday_cause_seen(state, now, live_cause)
+    if PERMIT_NOT_REQUESTED_MARKER in log_text:
+        state = record_orders_not_requested_seen(state, now)
+    return state, live_cause
+
+
+def midday_recheck_pending(state: DaySchedulerState) -> bool:
+    """True when a post-relaunch readiness recheck (and its flock probe) is
+    still owed for the current mid-day-relaunched child."""
+    return (
+        state.last_midday_relaunch_attempt_at is not None
+        and not state.midday_readiness_recheck_done
+    )
+
+
+class MiddayRecheckAction(str, Enum):
+    READY = "ready"
+    NOT_READY_TIMEOUT = "not_ready_timeout"
+    WAIT = "wait"
+
+
+def decide_midday_recheck(
+    *, state: DaySchedulerState, now: dt.datetime, holds_intent_lock: bool
+) -> MiddayRecheckAction:
+    """Bounded post-relaunch readiness recheck verdict. Only meaningful
+    while :func:`midday_recheck_pending` is true."""
+    relaunched_at = state.last_midday_relaunch_attempt_at
+    if readiness_observed(
+        holds_intent_lock=holds_intent_lock,
+        permit_issued=state.permit_issued_seen_expires_at_ns is not None,
+        strategy_subscribed=state.strategy_subscribed_seen,
+    ):
+        return MiddayRecheckAction.READY
+    if relaunched_at is not None and (now - relaunched_at) > MIDDAY_READINESS_RECHECK_TIMEOUT:
+        return MiddayRecheckAction.NOT_READY_TIMEOUT
+    return MiddayRecheckAction.WAIT
+
+
+class MiddayDeadAction(str, Enum):
+    CEILING_UNKNOWN_FIRST = "ceiling_unknown_first"
+    CEILING_UNKNOWN_REPEAT = "ceiling_unknown_repeat"
+    DECLINED = "declined"
+    EXHAUSTED = "exhausted"
+    RELAUNCH = "relaunch"
+
+
+@dataclass(frozen=True, slots=True)
+class MiddayDeadDecision:
+    action: MiddayDeadAction
+    #: The decline reason (``DECLINED``/``EXHAUSTED``); ``None`` otherwise.
+    reason: str | None = None
+
+
+#: The decline reason that means the mid-day relaunch budget is spent.
+MIDDAY_BUDGET_EXHAUSTED_REASON: Final[str] = "attempt budget exhausted"
+
+
+def decide_midday_dead_child(
+    *, state: DaySchedulerState, now: dt.datetime, live_cause: RelaunchCause
+) -> MiddayDeadDecision:
+    """What the mid-day watch does about a dead tracked child.
+
+    [A-1] The fail-closed ceiling gate is checked FIRST and
+    unconditionally: with no first-boot permit anchor a relaunch would mint
+    a fresh unbounded permit, so it never reaches the budget decision."""
+    if state.first_boot_permit_expires_at_ns is None:
+        if state.midday_ceiling_unknown_alert_sent:
+            return MiddayDeadDecision(MiddayDeadAction.CEILING_UNKNOWN_REPEAT)
+        return MiddayDeadDecision(MiddayDeadAction.CEILING_UNKNOWN_FIRST)
+    cause = state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
+    decision = decide_midday_relaunch(
+        now=now,
+        window_end=midday_watch_window_end(state.day),
+        attempts_so_far=state.midday_relaunch_attempts,
+        last_attempt_at=state.last_midday_relaunch_attempt_at,
+        cause=cause,
+    )
+    if decision.should_relaunch:
+        return MiddayDeadDecision(MiddayDeadAction.RELAUNCH)
+    if decision.reason == MIDDAY_BUDGET_EXHAUSTED_REASON:
+        return MiddayDeadDecision(MiddayDeadAction.EXHAUSTED, decision.reason)
+    return MiddayDeadDecision(MiddayDeadAction.DECLINED, decision.reason)

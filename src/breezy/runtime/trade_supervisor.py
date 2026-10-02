@@ -67,6 +67,10 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
+    _PERMIT_FAIL_SELF_CHECK_RESULTS,
+    _RELAUNCH_POLL_INTERVAL_S,
+    _SCHEDULE_POLL_INTERVAL_S,
+    _SELF_CHECK_PASS_RESULTS,
     BOOT_RETRY_READINESS_TIMEOUT,
     CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     LAUNCH_UTC,
@@ -96,7 +100,6 @@ from breezy.runtime.trade_supervisor_core import (
     Phase,
     RelaunchCause,
     SelfCheckEscalationState,
-    SelfCheckResult,
     StopPriorAction,
     _trading_day,
     assert_no_live_node_before_intent_probe,
@@ -174,19 +177,6 @@ SUPERVISOR_LOCK_FILENAME: Final[str] = "trade-supervisor.lock"
 _SIGTERM_WAIT_S: Final[float] = 10.0
 _SIGTERM_POLL_ATTEMPTS: Final[int] = 20
 _SIGTERM_POLL_INTERVAL_S: Final[float] = 0.5
-
-#: Bounded poll interval for the main schedule loop -- an early return or a
-#: backwards clock step is always re-evaluated within this many seconds,
-#: never a single unbounded sleep.
-_SCHEDULE_POLL_INTERVAL_S: Final[float] = 60.0
-
-#: [D1] Pacing interval after a RELAUNCH_CHECK dispatch specifically -- a
-#: TIGHTER interval than the general schedule poll (the child may become
-#: ready or fail within seconds of being spawned), but every dispatch, not
-#: just a NONE result, must be followed by SOME bounded sleep: without
-#: this a live RELAUNCH_CHECK window (launched but not yet ready) is a
-#: zero-delay busy loop -- pegs a core, hammers /proc/locks and the log.
-_RELAUNCH_POLL_INTERVAL_S: Final[float] = 15.0
 
 #: The real ``/proc/locks`` path. A parameter (not a hardcoded literal)
 #: everywhere it is read, so tests can point at a synthetic file with real
@@ -2293,22 +2283,6 @@ def _contain_permit_watch_failure(
             return tracked_pid, node_log, state
         state = record_permit_alert_sent(state, now, capability=PermitCapability.WATCH_FAILED)
     return tracked_pid, node_log, state
-
-
-#: Self-check results that are a PASS of some kind -- never alerted on.
-_SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
-    {SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN}
-)
-
-#: [B1/D5] The self-check FAIL results that are specifically about the
-#: permit -- these seed B1's own heartbeat (see ``_do_self_check``'s call to
-#: ``seed_permit_alert``), distinct from a not-ready/multi-holder FAIL.
-_PERMIT_FAIL_SELF_CHECK_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
-    {
-        SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT,
-        SelfCheckResult.FAIL_SHADOW_MODE_PERMIT_EXPIRED_AT_DAILY_CEILING,
-    }
-)
 
 
 def _load_self_check_escalation(
