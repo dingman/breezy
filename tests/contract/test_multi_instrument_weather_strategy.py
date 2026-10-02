@@ -4,7 +4,7 @@
 single instrument. Everything a real weather strategy does is
 multi-instrument: a ladder of mutually exclusive temperature buckets on one
 city, of which exactly one settles at 1. This module runs
-``breezy.strategy.strike_ladder.BreezyStrikeLadder`` over a three-strike
+``tests.support.multi_strike_ladder_strategy.BreezyStrikeLadder`` over a three-strike
 fabricated tape (``tests/support/synthetic_multi_strike_tape.py``) and asserts
 the facts that a single-instrument proof cannot reach.
 
@@ -57,7 +57,7 @@ from breezy.runtime.backtest_harness import (
     SettlementInvariantError,
     run_backtest,
 )
-from breezy.strategy.strike_ladder import BreezyStrikeLadder, BreezyStrikeLadderConfig
+from tests.support.multi_strike_ladder_strategy import BreezyStrikeLadder, BreezyStrikeLadderConfig
 from tests.support.synthetic_multi_strike_tape import SyntheticStrikeTape, synthetic_strike_tape
 from tests.unit.test_persistence_catalog import make_climate_day
 
@@ -202,7 +202,7 @@ def test_contract_does_not_hand_type_bucket_bounds() -> None:
 
 
 def test_strategy_does_not_hand_type_bucket_bounds() -> None:
-    source = Path("src/breezy/strategy/strike_ladder.py").read_text(encoding="utf-8")
+    source = Path("tests/support/multi_strike_ladder_strategy.py").read_text(encoding="utf-8")
 
     assert "_" + "BUCKETS" not in source
     assert "OPEN" + "_BOUND_F" not in source

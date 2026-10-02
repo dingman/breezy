@@ -1,6 +1,7 @@
 """`BreezyStrikeLadder` -- a weather-conditioned, MULTI-INSTRUMENT strategy.
 
-Written as an acceptance exercise for the backtest harness. Unlike
+Written as an acceptance exercise for the backtest harness (TEST-ONLY: re-hosted
+from src/breezy/strategy at BC-3 C2; tag bc3-pre-removal-2026-10-02). Unlike
 ``breezy.strategy.harness_probe`` -- one instrument, one MARKET BUY, no
 decision -- this strategy holds positions on SEVERAL strikes of the same city
 at once, and every one of those positions is chosen from an observed
@@ -120,7 +121,7 @@ class BreezyStrikeLadderConfig(StrategyConfig, frozen=True):
     require_final: bool = True
 
 
-class BreezyStrikeLadder(Strategy):
+class BreezyStrikeLadder(Strategy):  # type: ignore[misc]  # compiled Cython Strategy erases to Any
     """Buys several temperature buckets at once, from one observation."""
 
     def __init__(self, config: BreezyStrikeLadderConfig) -> None:
