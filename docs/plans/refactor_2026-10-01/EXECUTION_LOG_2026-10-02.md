@@ -27,8 +27,8 @@ Coordinator: Claude main session, working in the worktree `emdash-refactor-y4qj4
 | R2.3 tape-instrument seam | `46ccba7d` | Codex | AST-identical moved definitions (reviewer); `whole_tape_paper_replay` dry-run output identical; census old-vs-new: see below | DONE |
 | R2.2 PREREG admission → `breezy.analysis` | `89dc3ef1` + `a8165cfe` | Codex (stopped on quota; WIP edited the ruling-frozen `live_family_tally.py`, discarded), Grok (402 mid-task), then Claude tdd-guide | Claude found and restored a dropped `mode=ro`; AST-identical; trading-bot-architect **APPROVE**; `_TAKEN_REASON` single-sourced | DONE |
 | R3.3 quote-tape ingest split | `77170029` | Codex (rejected: the core imported the CLI back), then Grok redo | no core → cli import (AST pin); 10 retargeted monkeypatches red when pointed back; CLI 2,441 → 547 lines | DONE |
-| R3.6 `nws_actor` health extraction | — | — | **DEFERRED**: depends on R1.5. Without R1.5 an ingest sibling module would add a second runtime-health debt row | DEFERRED |
-| R3.1, R3.2a/b, R3.4 | — | — | **HELD** by plan §3.0: requires the FQ live proof plus one clean trading day (FQ d0 is today) | HELD |
+| R3.6 `nws_actor` health extraction | `62778b4a` (live) | Claude tdd-guide | done on day 2 after R1.5b (see Day 2 evening) | DONE |
+| R3.1, R3.2a/b, R3.4 | `6e99a7ae` (live) | Claude tdd-guide | hold lifted by the operator; see Day 2 evening | DONE (R3.2 loads at the 01:00Z supervisor restart) |
 | R3.5, Appendix A (R1.2), BC-* | — | — | out of scope by plan (deferred / conditional / need rulings) | — |
 
 ## Gates (full suite, MEASURED)
@@ -84,3 +84,22 @@ A census rerun was judged redundant. Replay-daily and score-live-trials skip by 
 **Tooling traps recorded.**
 - `python -m importlinter.cli` is a no-op.
 - `lint-imports` reads `pyproject.toml` from the current directory.
+
+## Day 2 evening (2026-10-02, 17:00–20:10Z): holds lifted, Part 3 executed
+
+The operator overrode the plan's §3.0 hold ("do it now. there is no reason to wait.") and later set a standing rule: activate merged code immediately unless there is a concrete technical reason not to.
+
+| Live tip | What | Gate | Activation |
+|---|---|---|---|
+| `806a8942` | EMIT-HEALTH-CRITICAL (3 consecutive `_emit_health` failures → one bounded off-loop CRITICAL) | green | nws-ingest restart 19:03Z: all actors RUNNING, snapshots refreshed with identical key sets, 0 failure lines |
+| `62778b4a` | **R3.6**: `ingest/nws_health.py` takes over `emit_health`, `alert_conditions` and `_emit_all`; thin delegators remain on the actor (2,524 → 2,184 lines) | 1 failed (CT-13, flaky: does not import the diff, passes 3/3 alone; logged as CT13-FLAKE), 14,454 passed | nws-ingest restart 19:35Z: the 5 snapshots refreshed with identical key sets and schema, 0 failure lines, NRestarts 0 |
+| `6e99a7ae` | **R3.1** (`trade.run` halt-latch preamble plus typed per-kind builders; boot logs byte-identical in 6 scenarios; SL-13p2 parity 0/720,597), **R3.2a/b** (supervisor decisions moved into pure core functions plus 71 tests; shells thinned), **R3.4** (`continuous_helpers.py` and `continuous_no_side.py`; moved definitions AST-identical; flag-retarget proven red by mutation; operator-controls importer pin widened with a declaration) | one combined gate on the exact tip: 14,526 passed, 17m50s | Node hand-relaunched 20:05Z (`relaunch_node.py` mirrors `_do_midday_watch`: env copied from the supervisor, A-1 permit ceiling, open-intent probe after stop). All 4 boot lines present; permit within ceiling; supervisor `permit_watch_adopted_live_node` at 20:05:55Z. The **supervisor restart for R3.2 waits for 01:00Z**: `next_due` dispatches MIDDAY_WATCH only when `launch_done and readiness_observed`, and a mid-session restart resets both |
+
+**Reviews.** R3.1: APPROVE, follow-up applied (typed dispatch, proven by a mypy mutation). R3.2: APPROVE. R3.4: APPROVE. All by trading-bot-architect, independent of the implementers (Claude tdd-guide agents; Grok was at 402).
+
+**Defect found during activation (not caused by the refactor): AMBIG-LATCH-CLEAR.**
+1. At 16:50Z an FQ IOC miss (MDW) latched the exec client's in-memory AMBIGUOUS refusal.
+2. At 16:52:54Z the resolver retired the durable intent as a terminal zero-fill but never cleared `_trading_refusals`.
+3. The node refused every take until the 20:05Z relaunch; one take was denied, at 17:38Z.
+
+The fix is tracked in PROGRESS.

@@ -77,10 +77,11 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 ### REFACTOR Rev 2.1 (executed 2026-10-02; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`)
 | ID | Open work (exact) |
 |---|---|
-| R3.1 / R3.2a / R3.2b / R3.4 | HELD (plan §3.0): start only after the FQ live proof plus one clean trading day. CT-1/2/4/7/8/12/13 are merged and strengthened (CT-12 drives the exec-client `submit_veto` and `try_submit`) |
-| NWS-INGEST-RESTART | Target 2026-10-03 morning (after FQ d0 closes). R1.5b (health I/O injected into `nws_actor`; debt row paid, 4 → 2 with R1.6) is merged at d6914fca but NOT yet loaded. nws-ingest has been running since 2026-09-28 15:21Z, so a restart deploys 37 files of ingest/persistence changes. Deferred past FQ d0. After the restart: two poll cycles with no "health emission failed" line, `breezy-check-alerts`, and the boot egress-status line |
-| R3.6 | After NWS-INGEST-RESTART is clean: C3 of `R1_5b` design (move `_alert_conditions`/`_emit_health` to `ingest/nws_health.py`; `ts_init` nudge stays) |
-| EMIT-HEALTH-CRITICAL | MERGED 806a8942, loads with NWS-INGEST-RESTART: after 3 consecutive `_emit_health` failures, one CRITICAL `health_emission_failing` reaches the composed sink off-loop (bounded), plus the log marker `NWS_HEALTH_EMISSION_FAILING`; renotify 24 h. Post-restart check: grep the marker is absent |
+| R3.2 SUPERVISOR-RESTART | R3.2 is merged at 6e99a7ae but not loaded. Restart the supervisor at or after 01:00Z on 10-03, because an earlier restart leaves `launch_done=False`, so `next_due` never dispatches MIDDAY_WATCH. Verify that the node pid is unchanged and that the adoption line appears |
+| AMBIG-LATCH-CLEAR | DEFECT: a resolver zero-fill retirement leaves the AMBIGUOUS `_trading_refusals` entry, so the node refuses every take until a restart (10-02 16:52Z–20:05Z). Fix is on `fix/ambiguous-latch-clear`; needs review, gate, merge and a node restart |
+| SUP-RESTART-ANYTIME | Proposed: adopting a live, ready node marks `launch_done`/`readiness_observed`, so the supervisor can deploy at any time. Needs a plan and peer review |
+| CRH-MIXIN-TYPES | R3.4's `NoSideShadowMixin` uses `self: Any`. Add a TYPE_CHECKING Protocol so NO-side arming is type-checked again |
+| CT13-FLAKE | CT-13 crash-readopt failed once under 4 concurrent gates (no verified flock holder). It passes alone 3/3. Harden the wait or the `/proc/locks` read |
 
 ### Comment backlog (R0.1)
 - Queue live-file comment/docstring fixes for the next real edit of each file: `websocket.py:61-63` wrong `retry.py` lines; `operator_controls.py:267` non-existent `RiskLimits` and `:271-275` stale ledger persistence wording; `signing.py` / `write_transport.py:6` stale cage docstrings; `exec/client.py:660` cites `risk.py:139` but the flag is at `:224`.
