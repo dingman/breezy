@@ -74,6 +74,14 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | AUD-10b | C12 met at 10G peak; cause = conversion of 16 cache-miss instances (`ANALYSIS_replay_10g_2026-09-28.md`); Stage 0 + R3-5 before drop-in removal, run after ING-2-AMEND2 proves out |
 | R3 blockers (only if R3V-b says viable) | (1) MECHANISM_ONLY validity = AUD-11+AUD-12 landing; (2) `UNDERPOWERED_NOT_REGISTERED` not in `_ACTIVE_STATUSES`; (3) no post-freeze filter in `_completed_on_whole_days`. Real f so far 2/5 (Wilson .12–.77); f_req 0.625 |
 
+### REFACTOR Rev 2.1 (executed 2026-10-02; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`)
+| ID | Open work (exact) |
+|---|---|
+| R3.1 / R3.2a / R3.2b / R3.4 | HELD (plan §3.0): start only after the FQ live proof plus one clean trading day. CT-1/2/4/7/8/12/13 are merged and strengthened (CT-12 drives the exec-client `submit_veto` and `try_submit`) |
+| R3.6 | DEFERRED: needs R1.5, which was dropped (the payoff would move the webhook alert sink into `registry`). Re-plan only with a ruling on where alert egress lives |
+| T1 budget | T1 measured at 12.0–12.8 min serial (target ≤ 10). Next lever: sharding (§4.1) or the session-scoped AST parse cache (§4.6) |
+| SUB-MARKER-DEAD | `ContinuousRungHoldStrategy subscribed` in `COMPOSITION_KIND_SUBSCRIBED_MARKERS` is emitted by no source; resolve inside R3.2/R3.4 |
+
 ### Comment backlog (R0.1)
 - Queue live-file comment/docstring fixes for the next real edit of each file: `websocket.py:61-63` wrong `retry.py` lines; `operator_controls.py:267` non-existent `RiskLimits` and `:271-275` stale ledger persistence wording; `signing.py` / `write_transport.py:6` stale cage docstrings; `exec/client.py:660` cites `risk.py:139` but the flag is at `:224`.
 
