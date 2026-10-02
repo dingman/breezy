@@ -3694,6 +3694,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # exec suite in this set.
         "tests/unit/test_fq_caps_and_ambiguous_2026_10_01.py",
         "tests/unit/test_fq_no_leg_reconciliation_parity.py",
+        # CT-1 (refactor characterization pin): `test_ct01_ambiguous_public_
+        # port.py` imports `exec.submit_chain` and drives the exec client
+        # through its PUBLIC `submit_order` path to pin the AMBIGUOUS refusal.
+        # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+        # module carries no `SOCKET_RESTORING_MARKERS` (only `asyncio`), and
+        # its sender is a `_YieldOnceOrderSender` subclass of the shared
+        # `_FakeOrderSender` double, exactly like every sibling exec suite in
+        # this set, so no socket is ever opened.
+        "tests/unit/test_ct01_ambiguous_public_port.py",
     }
 
 
