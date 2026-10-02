@@ -22,6 +22,7 @@ Two layers:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -44,6 +45,16 @@ _SUMMARY_RE: Final[re.Pattern[str]] = re.compile(
     r"^Found (?P<errors>\d+) errors? in (?P<files>\d+) files?\b"
 )
 _SUCCESS_RE: Final[re.Pattern[str]] = re.compile(r"^Success: no issues found\b")
+
+#: Stripped from the mypy child. ``FORCE_COLOR`` is what mypy 2.3.1 honours;
+#: the other two are removed so a parent colour override cannot leak through.
+#: ``MYPY_FORCE_COLOR=0`` is set below because mypy reads it ahead of
+#: ``FORCE_COLOR`` (``mypy.util.should_force_color``).
+_COLOR_ENV_DROPPED: Final[tuple[str, ...]] = (
+    "FORCE_COLOR",
+    "CLICOLOR_FORCE",
+    "PY_COLORS",
+)
 
 
 class MypyReportParseError(RuntimeError):
@@ -103,6 +114,20 @@ def parse_mypy_report(output: str) -> dict[str, int]:
             f"reports {summary_files} -- the run is not trustworthy"
         )
     return per_file
+
+
+def _mypy_subprocess_env() -> dict[str, str]:
+    """Copy the parent env with colour forced off for the mypy child.
+
+    A coloured ``Found N errors in M files`` line does not match the summary
+    regex, so the ratchet would treat a real run as unparseable.
+    """
+    env = os.environ.copy()
+    for name in _COLOR_ENV_DROPPED:
+        env.pop(name, None)
+    env["NO_COLOR"] = "1"
+    env["MYPY_FORCE_COLOR"] = "0"
+    return env
 
 
 def _matching_entry(path: str, entries: Sequence[str]) -> str | None:
@@ -209,6 +234,22 @@ def test_a_summary_mismatch_raises_parse_error() -> None:
 
     with pytest.raises(MypyReportParseError):
         parse_mypy_report(output)
+
+
+def test_mypy_child_env_drops_force_colour_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
+    monkeypatch.setenv("PY_COLORS", "1")
+    monkeypatch.setenv("MYPY_FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    env = _mypy_subprocess_env()
+
+    assert "FORCE_COLOR" not in env
+    assert "CLICOLOR_FORCE" not in env
+    assert "PY_COLORS" not in env
+    assert env["NO_COLOR"] == "1"
+    assert env["MYPY_FORCE_COLOR"] == "0"
 
 
 def test_a_run_with_no_summary_line_raises_parse_error() -> None:
@@ -329,12 +370,14 @@ def mypy_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, int]:
 
     Never a subset of paths -- following imports changes the counts (plan,
     "Mechanism"). `--cache-dir` is per-worktree so parallel worktrees never
-    share (or corrupt) each other's mypy cache.
+    share (or corrupt) each other's mypy cache. Colour is forced off in the
+    child so a parent ``FORCE_COLOR`` cannot wrap the summary line.
     """
     cache_dir = tmp_path_factory.mktemp("mypy-ratchet-cache")
     result = subprocess.run(
         [sys.executable, "-m", "mypy", "--cache-dir", str(cache_dir)],
         cwd=_REPO_ROOT,
+        env=_mypy_subprocess_env(),
         capture_output=True,
         text=True,
         check=False,
