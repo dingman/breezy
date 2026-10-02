@@ -81,7 +81,7 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
         "adapters",
         "ingest",
         "persistence | registry | normalize",
-        "features | settlement",
+        "settlement",
         "domain",
     ]
     assert set(layers["ignore_imports"]) == {
@@ -129,7 +129,6 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
         "breezy.persistence",
         "breezy.registry",
         "breezy.normalize",
-        "breezy.features",
         "breezy.settlement",
         "breezy.domain",
     ]
