@@ -91,7 +91,7 @@ from current_rung_hold_paper_replay import (  # type: ignore[attr-defined]
 from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.persistence.funcs import urisafe_identifier
-from run_weather_strategy_backtests import WEATHER_VENUE, _capture_instruments_by_id
+from tape_instruments import WEATHER_VENUE, _capture_instruments_by_id  # type: ignore[import-not-found]
 from weather_strategy_backtest_lib import select_book_backed_instrument_ids
 from whole_tape_paper_replay import _corrupt_instance_station_days
 

@@ -312,7 +312,7 @@ CLEAN: Final[tuple[str, ...]] = (
 #: "lower the ceiling to N" so a ceiling can never go stale.
 CEILINGS: Final[dict[str, int]] = {
     "src/breezy/analysis": 13,
-    "scripts/analysis": 364,
+    "scripts/analysis": 362,
     "scripts/archive": 8,
     "scripts/venue": 23,
     "tests/contract": 11,
