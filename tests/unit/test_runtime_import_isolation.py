@@ -135,7 +135,16 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
 #: entry that needs the escape hatch -- but the mechanism must exist so a
 #: future deliberate exclusion is a one-line, commented, test-asserted
 #: decision rather than a silent omission.
-STAGE0_EXCLUDED_ENTRY_MODULES: Final[frozenset[str]] = frozenset()
+STAGE0_EXCLUDED_ENTRY_MODULES: Final[frozenset[str]] = frozenset(
+    {
+        # R2.3 library module extracted from run_weather_strategy_backtests. It
+        # is not importable standalone as `scripts.analysis.tape_instruments`:
+        # it does a bare `from weather_strategy_backtest_lib import ...` that
+        # resolves only after the runner's `sys.path.insert(0, <scripts/analysis>)`
+        # (the runner, already in the tuple, covers its import isolation).
+        "scripts.analysis.tape_instruments",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
