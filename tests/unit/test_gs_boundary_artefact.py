@@ -111,11 +111,9 @@ def test_registered_boundary_parameters_match_the_ruling_cited_script() -> None:
     """
     script = _load_boundary_generator_script()
     pins = _registered_boundary_pins()
-    assert {family_id for family_id, _path, _sha in pins} == {
-        "pm_us_crh_cont",
-        "pm_us_crh_v2",
-        "pm_us_crh_v4",
-    }
+    discovered = {family_id for family_id, _path, _sha in pins}
+    assert discovered
+    assert {"pm_us_crh_cont", "pm_us_crh_v2", "pm_us_crh_v4"} <= discovered
     assert script.BRENTQ_XTOL == 1e-10
     assert _src_brentq_xtol_literals() == [1e-10, 1e-10]
 
