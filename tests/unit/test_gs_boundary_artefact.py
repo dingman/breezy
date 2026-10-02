@@ -7,13 +7,18 @@ artefact".
 
 from __future__ import annotations
 
+import ast
 import copy
+import importlib.util
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 
+import breezy.persistence.gs_boundary_artefact as artefact_mod
 from breezy.persistence.gs_boundary_artefact import (
     ALPHA_ONE_SIDED,
     I_MAX,
@@ -25,6 +30,8 @@ from breezy.persistence.gs_boundary_artefact import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ARTEFACT_PATH = _REPO_ROOT / "deploy" / "families" / "gs_boundary_pm_us_crh_v2.json"
+_FAMILIES_DIR = _REPO_ROOT / "deploy" / "families"
+_SCRIPT_PATH = _REPO_ROOT / "scripts" / "analysis" / "crh_group_sequential_boundaries.py"
 _PINNED_SHA = "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c"
 
 
@@ -39,9 +46,107 @@ def _write(tmp_path: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
+def _load_boundary_generator_script() -> ModuleType:
+    module_name = "breezy_test_crh_group_sequential_boundaries_parity"
+    spec = importlib.util.spec_from_file_location(module_name, _SCRIPT_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+    return module
+
+
+def _registered_boundary_pins() -> list[tuple[str, Path, str]]:
+    pins: list[tuple[str, Path, str]] = []
+    for path in sorted(_FAMILIES_DIR.glob("*.json")):
+        payload = json.loads(path.read_text())
+        if payload.get("status") != "REGISTERED":
+            continue
+        artefact_rel = payload.get("boundary_artefact_path")
+        if not isinstance(artefact_rel, str) or "not_applicable_boundary" in artefact_rel:
+            continue
+        sha = payload.get("boundary_inputs_sha256")
+        assert isinstance(sha, str)
+        artefact_path = _REPO_ROOT / artefact_rel
+        assert artefact_path.exists()
+        pins.append((payload["family_id"], artefact_path, sha))
+    return pins
+
+
+def _src_brentq_xtol_literals() -> list[float]:
+    assert artefact_mod.__file__ is not None
+    tree = ast.parse(Path(artefact_mod.__file__).read_text())
+    xtols: list[float] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id != "brentq":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "xtol":
+                value = ast.literal_eval(keyword.value)
+                assert isinstance(value, float)
+                xtols.append(value)
+    return xtols
+
+
 @pytest.fixture(scope="module")
 def artefact() -> BoundaryArtefact:
     return load_boundary_artefact(_ARTEFACT_PATH, expected_sha256=_PINNED_SHA)
+
+
+def test_registered_boundary_parameters_match_the_ruling_cited_script() -> None:
+    """R2.1 parity pin: registered CRH manifests reuse one applicable boundary
+    artefact. The script exposes `BRENTQ_XTOL`; the src implementation still
+    carries the same `1e-10` as two brentq `xtol` literals, so this test pins
+    both forms without editing the frozen script or the src solver.
+    """
+    script = _load_boundary_generator_script()
+    pins = _registered_boundary_pins()
+    discovered = {family_id for family_id, _path, _sha in pins}
+    assert discovered
+    assert {"pm_us_crh_cont", "pm_us_crh_v2", "pm_us_crh_v4"} <= discovered
+    assert script.BRENTQ_XTOL == 1e-10
+    assert _src_brentq_xtol_literals() == [1e-10, 1e-10]
+
+    checked: set[tuple[Path, str]] = set()
+    for _family_id, artefact_path, expected_sha in pins:
+        if (artefact_path, expected_sha) in checked:
+            continue
+        checked.add((artefact_path, expected_sha))
+        loaded = load_boundary_artefact(artefact_path, expected_sha256=expected_sha)
+        generated = script.build_output(
+            loaded.alpha_one_sided,
+            loaded.spending.n_max,
+            loaded.spending.look_step,
+        )
+        assert generated["spending_id"] == loaded.spending.spending_id
+        assert generated["inputs_sha256"] == expected_sha
+        assert generated["i_max"] == loaded.i_max
+        script_rows = generated["reference_table"]
+        assert len(script_rows) == len(loaded.reference_rows)
+        history: list[float] = []
+        for idx, script_row in enumerate(script_rows):
+            row = loaded.reference_rows[idx]
+            history.append(row.t_k)
+            assert script_row["look_k"] == row.look_k
+            assert script_row["n_k"] == row.n_k
+            assert script_row["t_k"] == row.t_k
+            assert script_row["alpha_spent_eff"] == row.alpha_spent_eff
+            assert script_row["alpha_spent_fut"] == row.alpha_spent_fut
+            src_b_eff, src_b_fut = loaded.boundary_for(
+                history, is_terminal=idx == len(script_rows) - 1
+            )
+            assert src_b_eff == pytest.approx(script_row["b_eff"], abs=1e-6)
+            assert src_b_fut == pytest.approx(script_row["b_fut"], abs=1e-6)
 
 
 def test_the_committed_pm_us_artefact_loads_and_pins_correctly(
