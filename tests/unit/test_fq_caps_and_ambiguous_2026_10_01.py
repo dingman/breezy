@@ -195,8 +195,6 @@ async def test_fq_order_resolved_ambiguous_then_the_next_take_is_latch_refused(
     assert denials[0].reason == submit_chain.latched_refusal_reason(
         "create-order outcome is AMBIGUOUS; latch stays open and the booking is held",
     )
-
-
 # ---------------------------------------------------------------------------
 # 2026-10-02 incident: the AMBIGUOUS refusal outlived its own retired intent.
 #
@@ -239,21 +237,35 @@ def _denial_reasons(order_events: list[Any]) -> list[str]:
     return [event.reason for event in order_events if isinstance(event, OrderDenied)]
 
 
-def _set_get_evidence(client: object, order_id: str, slug: str, *, state: str, cum: float,
-                      positions: dict[str, Any], eof: bool = True,
-                      avg_px: str | None = None) -> None:
+def _set_get_evidence(
+    client: object,
+    order_id: str,
+    slug: str,
+    *,
+    state: str,
+    cum: float,
+    positions: dict[str, Any],
+    eof: bool = True,
+    avg_px: str | None = None,
+) -> None:
     from tests.unit.test_current_rung_hold_ambiguous_resolver import _order_get_body
 
     payloads = client._private_read._payloads  # type: ignore[attr-defined]
     payloads[f"/v1/order/{order_id}"] = _order_get_body(
-        order_id, slug=slug, state=state, cum_quantity=cum, avg_px=avg_px,
+        order_id,
+        slug=slug,
+        state=state,
+        cum_quantity=cum,
+        avg_px=avg_px,
     )
     payloads["/v1/portfolio/positions"] = {"positions": positions, "eof": eof}
 
 
 @pytest.mark.asyncio
 async def test_terminal_zero_fill_retirement_clears_ambiguous_refusal_and_a_take_reaches_sender(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
 ) -> None:
     from tests.unit.test_current_rung_hold_ambiguous_resolver import (
         _arm_one_ambiguous_intent,
@@ -286,7 +298,9 @@ async def test_terminal_zero_fill_retirement_clears_ambiguous_refusal_and_a_take
 
 @pytest.mark.asyncio
 async def test_terminal_zero_fill_retirement_keeps_an_unrelated_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
 ) -> None:
     from tests.unit.test_current_rung_hold_ambiguous_resolver import (
         _arm_one_ambiguous_intent,
@@ -311,7 +325,9 @@ async def test_terminal_zero_fill_retirement_keeps_an_unrelated_refusal(
 
 @pytest.mark.asyncio
 async def test_an_incomplete_positions_read_neither_retires_nor_clears_the_ambiguous_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
 ) -> None:
     from tests.unit.test_current_rung_hold_ambiguous_resolver import (
         _arm_one_ambiguous_intent,
@@ -326,7 +342,13 @@ async def test_an_incomplete_positions_read_neither_retires_nor_clears_the_ambig
     ):
         client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
         _set_get_evidence(
-            client, order_id, slug, state="ORDER_STATE_CANCELED", cum=0, positions={}, eof=False,
+            client,
+            order_id,
+            slug,
+            state="ORDER_STATE_CANCELED",
+            cum=0,
+            positions={},
+            eof=False,
         )
         await _run_resolver_passes(client, count=2)
 
@@ -337,7 +359,9 @@ async def test_an_incomplete_positions_read_neither_retires_nor_clears_the_ambig
 
 @pytest.mark.asyncio
 async def test_a_non_terminal_get_neither_retires_nor_clears_the_ambiguous_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
 ) -> None:
     from tests.unit.test_current_rung_hold_ambiguous_resolver import (
         _arm_one_ambiguous_intent,
@@ -361,7 +385,9 @@ async def test_a_non_terminal_get_neither_retires_nor_clears_the_ambiguous_refus
 
 @pytest.mark.asyncio
 async def test_a_fill_terminal_retirement_does_not_clear_the_ambiguous_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
 ) -> None:
     from tests.unit.test_current_rung_hold_ambiguous_resolver import (
         _arm_one_ambiguous_intent,
@@ -376,8 +402,13 @@ async def test_a_fill_terminal_retirement_does_not_clear_the_ambiguous_refusal(
     ):
         client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
         _set_get_evidence(
-            client, order_id, slug, state="ORDER_STATE_FILLED", cum=1,
-            positions={slug: {"netPosition": "1"}}, avg_px="0.40",
+            client,
+            order_id,
+            slug,
+            state="ORDER_STATE_FILLED",
+            cum=1,
+            positions={slug: {"netPosition": "1"}},
+            avg_px="0.40",
         )
         await _run_resolver_passes(client, count=1)
 
@@ -386,4 +417,114 @@ async def test_a_fill_terminal_retirement_does_not_clear_the_ambiguous_refusal(
         assert current.retirement_reason is not None
         assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
         assert _AMBIGUOUS_REASON in client.trading_refusals
+        await client._disconnect()
+
+
+async def _armed_zero_fill_rig(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, Any]:
+    """The resolver rig with terminal zero-fill evidence already wired in.
+
+    Returns ``(client, latch_cm)``; the caller MUST keep ``latch_cm``
+    referenced (dropping it GCs the generator and releases the flock).
+    """
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import _arm_one_ambiguous_intent
+    from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+
+    enable_operator_gate(monkeypatch, order_count="3")
+    client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
+    _set_get_evidence(client, order_id, slug, state="ORDER_STATE_CANCELED", cum=0, positions={})
+    return client, _latch_cm
+
+
+@pytest.mark.asyncio
+async def test_a_permit_restore_raise_keeps_the_ambiguous_refusal_and_logs_the_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from breezy.adapters.polymarket_us import safety
+    from breezy.adapters.polymarket_us.exec import client as client_module
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import _run_exactly_one_pass
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, _latch_cm = await _armed_zero_fill_rig(tmp_path, monkeypatch)
+
+        def _raise(**_kwargs: Any) -> bool:
+            raise safety.LiveTradingPermissionError("simulated restore failure")
+
+        monkeypatch.setattr(client_module, "restore_live_trading_budget", _raise)
+        await _run_exactly_one_pass(client)
+
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        assert client.resolver_error_count == 1
+        captured = capfd.readouterr()
+        assert "LiveTradingPermissionError" in captured.out + captured.err
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_ledger_true_up_raise_keeps_the_ambiguous_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import _run_exactly_one_pass
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, _latch_cm = await _armed_zero_fill_rig(tmp_path, monkeypatch)
+
+        def _raise(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("simulated true-up failure")
+
+        monkeypatch.setattr(type(client._ledger), "true_up_booking", _raise)
+        await _run_exactly_one_pass(client)
+
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        assert client.resolver_error_count == 1
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_latch_read_after_retire_keeps_the_ambiguous_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from breezy.runtime.submit_intent import SubmitIntentCorrupt
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import _run_exactly_one_pass
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, _latch_cm = await _armed_zero_fill_rig(tmp_path, monkeypatch)
+        real_retire = client._retire
+        real_current_open = client._latch.current_open
+        retired = {"done": False}
+
+        def _retire_then_poison(*args: Any, **kwargs: Any) -> None:
+            real_retire(*args, **kwargs)
+            retired["done"] = True
+
+        def _current_open() -> Any:
+            if retired["done"]:
+                raise SubmitIntentCorrupt()
+            return real_current_open()
+
+        monkeypatch.setattr(client, "_retire", _retire_then_poison)
+        monkeypatch.setattr(client._latch, "current_open", _current_open)
+        await _run_exactly_one_pass(client)
+
+        assert retired["done"] is True
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        assert client.resolver_error_count == 1
         await client._disconnect()

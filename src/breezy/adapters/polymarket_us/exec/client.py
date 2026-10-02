@@ -3049,27 +3049,6 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             f"resolver: retired intent {context.intent_id} "
             "(STATUS_REPORT_ZERO_FILL_TERMINAL)"
         )
-        # 2026-10-02: the instrument-unscoped AMBIGUOUS refusal `_refuse`
-        # appended at create time has no subject left once THIS terminal
-        # zero-fill (GET-confirmed, EOF-complete empty trade join) retires
-        # the intent; left in place it denied every later order for the
-        # session. Inline (not a helper) so E0-NOSEND-RESOLVER's permitted
-        # callee set is unchanged. Cleared only while the durable latch
-        # holds no other open intent; every other reason stays. New list,
-        # no in-place mutation.
-        if self._latch.current_open() is None:
-            kept_refusals = [
-                refusal
-                for refusal in self._trading_refusals
-                if refusal.reason != submit_chain.AMBIGUOUS_REASON
-            ]
-            if len(kept_refusals) != len(self._trading_refusals):
-                self._trading_refusals = kept_refusals
-                self._log.info(
-                    f"resolver: cleared the AMBIGUOUS trading refusal "
-                    f"({submit_chain.AMBIGUOUS_REASON!r}) on retirement of "
-                    f"intent {context.intent_id}"
-                )
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
             # Same-process only (Resolution E): on restart the ledger died
@@ -3107,6 +3086,30 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             venue_order_id=submit_chain.venue_order_id(context.venue_order_id),
             ts_event=now_ns,
         )
+        # 2026-10-02: the instrument-unscoped AMBIGUOUS refusal `_refuse`
+        # appended at create time has no subject left once THIS terminal
+        # zero-fill (GET-confirmed, EOF-complete empty trade join) has
+        # retired the intent AND trued up the booking AND restored the
+        # permit slot. It is therefore the LAST step: any raise above (the
+        # resolver catches it, counts it, and the next pass takes the
+        # `current is None` early return) leaves the refusal in place, the
+        # conservative direction. Inline (not a helper) so
+        # E0-NOSEND-RESOLVER's permitted callee set is unchanged. Cleared
+        # only while the durable latch holds no other open intent; every
+        # other reason stays. New list, no in-place mutation.
+        if self._latch.current_open() is None:
+            kept_refusals = [
+                refusal
+                for refusal in self._trading_refusals
+                if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            ]
+            if len(kept_refusals) != len(self._trading_refusals):
+                self._trading_refusals = kept_refusals
+                self._log.info(
+                    f"resolver: cleared the AMBIGUOUS trading refusal "
+                    f"({submit_chain.AMBIGUOUS_REASON!r}) on retirement of "
+                    f"intent {context.intent_id}"
+                )
 
     def _resolve_accept_fill(
         self,

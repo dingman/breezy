@@ -32,7 +32,8 @@ _LIVE_ORDERS_RULING_ID = "RULING_operator_fq_live_real_orders_2026-10-01"
 _EXEC_CLIENT_PATH = (
     _REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "exec" / "client.py"
 )
-_EXEC_CLIENT_SHA256 = "1cd746dd238a90865d08105c3613842e4f3628d853fb4b888ed2957bae5f9954"
+# re-pinned 2026-10-02: AMBIG-LATCH-CLEAR (resolver zero-fill clears AMBIGUOUS refusal), reviewer-approved  # noqa: E501
+_EXEC_CLIENT_SHA256 = "76784ce814797bfb5480487ff0dad47cbe9c0b1727aef9ad1c7461cc33aa68a4"
 
 
 # ---------------------------------------------------------------------------
