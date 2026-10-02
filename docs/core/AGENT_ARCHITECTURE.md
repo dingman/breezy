@@ -40,7 +40,7 @@ The two decisive evidence findings that shaped everything:
 5. **In/out/tools**: In — skills #3/#4/#5, adapters/_template/, bundled adapter as structural reference.
    Out — Python under src/breezy/ + tests. Tools: Read/Write/Edit/Bash/Grep/Glob. Deps: nautilus_trader, pyiem,
    polymarket_us SDK.
-6. **Failure modes/safeguards**: silent Nautilus behavior drift ⇒ **pin `~=1.231` + contract tests asserting each
+6. **Failure modes/safeguards**: silent Nautilus behavior drift ⇒ **exact pin `==1.231.0` + contract tests asserting each
    documented gotcha** (rev. H2 — cheapest durability control in the design); scope creep into trading ⇒
    prediction-market-reviewer gate; self-approval ⇒ prohibited, independent review mandatory.
 7. **Verdict**: REQUIRED NOW (seams b/d are unblocked today).
@@ -81,7 +81,7 @@ The two decisive evidence findings that shaped everything:
    coroutines, factory/TradingNode wiring, `@customdataclass`, ParquetDataCatalog, BacktestDataConfig, test_kit,
    env-var credential convention, and the reconnect/watchdog recipe (mirroring the bundled adapter's 60s MARKET /
    300s USER idle-timeout pattern). **Boundaries**: no venue facts, no weather domain.
-   Carries a "verified against nautilus-trader 1.231.x" banner; version-volatile gotchas are backed by contract tests (rev. M3).
+   Carries a "verified against nautilus-trader 1.231.0" banner; version-volatile gotchas are backed by contract tests (rev. M3).
 3. **Why not existing**: zero Nautilus coverage anywhere in the roster. Not code — it is knowledge that prevents
    reinvention of things Nautilus already provides, which is the project's stated prime directive.
 4. **Evidence**: §C. Highest-leverage artifact in the design: it is what stops an implementer rebuilding the
@@ -169,6 +169,6 @@ Critical property: **if credentials slip for weeks, Stages 0–1 still deliver t
    capital ceiling. Findings log = extracted facts only, never secrets/signatures/raw bodies.
 2. Signed-request unit-test suite (known-vector, clock-skew boundary, canonical-string construction) as a HARD GATE
    before any exec-client signing code is accepted.
-3. Exact version pins (`pyiem`, `pynws`, `metar`, `polymarket_us`, `nautilus-trader~=1.231`) + sanity-bounds
+3. Exact version pins (`pyiem`, `pynws`, `metar`, `polymarket_us`, `nautilus-trader==1.231.0`) + sanity-bounds
    validation on parser output + pre-commit guard against credential-shaped strings in `.claude/`.
 4. #1 never holds live credentials; TLS never disabled; sha256(raw_text) verified before settlement use.

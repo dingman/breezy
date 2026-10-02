@@ -7,7 +7,7 @@ after OPS-1: 40 `breezy-*` entries in `~/.config/systemd/user` are symlinks
 into this directory, 0 are host-local regular files; `breezy.slice.d/memory.conf`
 is a symlink to this repo; 18 active timers; 3 services running; TEMPORARY
 drop-ins `breezy-quote-tape-ingest.service.d/zz-memory-containment-TEMPORARY.conf`
-and `breezy-replay-daily.service.d/zz-c2-time-v-TEMPORARY.conf` are host-local
+and `breezy-replay-daily.service.d/zz-memory-containment-TEMPORARY.conf` are host-local
 by design and removed when their item closes). The cutover in §3 is run by the coordinator, with eyes on
 it, because it briefly stops the one data stream Breezy cannot re-acquire.
 

@@ -502,6 +502,10 @@ pkill -f 'breezy-trade$'
 kill $(pgrep -f 'breezy-trade$')
 ```
 
+**L-26 note:** do not use this as the normal way to keep the node down or
+schedule a relaunch. Anything that must outlive the operator shell must be
+started through the host supervisor path described in L-26.
+
 The supervisor does not automatically relaunch a killed node (only crashes trigger bounded relaunch).
 A manual restart is needed: `systemctl --user restart breezy-trade-supervisor.service` at the next
 desired window, or before 17:00Z if you want to keep the day's permit active.

@@ -408,10 +408,9 @@ def local_standard_date(now_ns: int, std_utc_offset_hours: float) -> dt.date:
 def most_recent_completed_climate_day(now_ns: int, std_utc_offset_hours: float) -> dt.date:
     """The last climate day that has definitely ended, as of `now_ns`.
 
-    The single extracted copy of
-    ``NwsIngestActor._most_recent_completed_climate_day`` -- that method
-    should call this rather than re-implementing the arithmetic, so there is
-    exactly one copy in the repo (not built here; a separate wiring item).
+    Shared with ``NwsIngestActor`` so the gap planner and the live ingest actor
+    compute the same completed-day boundary from the same local-standard clock
+    rule.
     """
     return local_standard_date(now_ns, std_utc_offset_hours) - dt.timedelta(days=1)
 

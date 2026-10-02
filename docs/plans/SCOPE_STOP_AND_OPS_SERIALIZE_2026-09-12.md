@@ -194,8 +194,9 @@ operator-reserved, never printed here), enforced by the native `RiskEngine.max_n
 per slug with `bypass=False` (`node_config.py:565-622`) and the 8-gate `_submit_order` chokepoint
 (`exec/client.py:2647-2716`); the **trial-day latch is durable** and halts the family on the 2nd
 genuine fill with a no-await veto (`trial_day_latch.py:469-527`; `exec/client.py:2679-2691`); the
-**spend ledger is in-memory by documented design** (`operator_controls.py:252-265`), so the durable
-per-day bound is *latch × per-position cap*, **not** the daily budget. Carried risks: audit **B3**
+**spend ledger is process-local but re-seeded at boot from durable fills**
+(`operator_controls.py:307-333`; `exec/client.py:2214-2268`), while AMBIGUOUS/no-fill spend remains
+process-local. Carried risks: audit **B3**
 (v3 has never been fill-replayed), **B2** (the next fill is likely residual again), **B4** (no alert
 reaches a human; `health.py:495-511` resolves every CRITICAL to the logging sink). **Rollback after
 a fill: none** — a fill is not reversible; the family halt is the only stop.

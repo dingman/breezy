@@ -19,7 +19,8 @@ OPEN items only. Rationale L-5; pre-shrink copy in `docs/core/archive/`.
 Two reserved controls: **maximum daily budget** and **maximum per POSITION**.
 They live ONLY in the operator's gitignored `operator.env`, present by NAME in
 the supervisor/node env, enforced per grant by `DailySpendLedger.authorize_order_cost`
-(`operator_controls.py:301`; in-memory per process BY DESIGN, `:252-265`). The three
+(`operator_controls.py:348`; process-local, re-seeded at boot from durable fills via
+`exec/client.py:2214`, with AMBIGUOUS/no-fill spend still process-local). The three
 session ceilings derive from the two caps at permit mint (`safety.py:552-608`).
 Everything else is build-side.
 
@@ -29,7 +30,7 @@ Everything else is build-side.
 - **G-01 prelim→final revision POWERED FAIL** on MDW/NYC/SFO; interior-bucket strategies dead. `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 - **Lock strategies DEAD (L-9); K1 DEAD at ask ≥2c.** Rev5 `pm_us_crh_fc_v1` (NBS point forecast) CLOSED 09-20 (`RULING_forecast_edge_programme_closes_2026-09-20.md`); `pm_us_crh_cont` NOT displaced. Probabilistic NBM-NBP family: plan CONVERGED 09-29 (`docs/plans/FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md`), built S1–S4-infra + SL-9/SL-15. **PM.us confirmatory leg INFEASIBLE 09-30 → §6 node 4** (validate n_min 592, range [552, 645] > 520; `RULING_nbp_pmus_leg_infeasible_node4_2026-09-30.md`). Holdout sealed; the weather-only S2 still runs at n_min; L + S4-infra carried as K-2 assets.
 - **Price history is forward-only; a forecast archive is a CALIBRATION set.** Venue surface = 5 cities × daily HIGH. BL-6 (no NO-side instrument) is SUPERSEDED by the 09-14 operator ruling: NO-side hunting is a requirement (NO-1).
-- **NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT** (`pm_us_crh_cont`, PREREG v3 BINDING, d0 2026-09-12; `pm_us_crh_v2` still REGISTERED). Demonstrated edge NONE; admissible n = 0 after 10 live days; 10 orders, 9 fills as of 09-24 (9 durable exec-fill-store records, exact match against real-event log lines net of inferred/relaunch noise; order 1, 09-05, had no fill — AMBIGUOUS no-response, operator-cleared; `ORDER1_NO_ORDERSUBMITTED_2026-09-26.md`). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
+- **NO FAMILY HAS A PROVEN EDGE; CURRENT SENDING FAMILY IS UNDER LIVE MEASUREMENT** (`pm_us_crh_fq_v1`, S9 activation merged 60290e9d, d0 2026-10-02; `pm_us_crh_cont`/`pm_us_crh_v2` are prior registered families, not the current sender). Demonstrated edge NONE; admissible n = 0 after 10 live days; 10 orders, 9 fills as of 09-24 (9 durable exec-fill-store records, exact match against real-event log lines net of inferred/relaunch noise; order 1, 09-05, had no fill — AMBIGUOUS no-response, operator-cleared; `ORDER1_NO_ORDERSUBMITTED_2026-09-26.md`). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
 - **Readiness audit 2026-09-12** (`docs/evidence/READINESS_AUDIT_2026-09-12.md`): the KILL-clock counter read 0/15 for 09-05..09-11 BY MECHANISM (any-overlap rule + feed-wide gap fan-out; L-38), not by outage; the create-path accept-fill branch has never fired live; v3 has never been fill-replayed; alerts reach nobody.
 
 ---
@@ -73,6 +74,9 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | AUD-10b | C12 met at 10G peak; cause = conversion of 16 cache-miss instances (`ANALYSIS_replay_10g_2026-09-28.md`); Stage 0 + R3-5 before drop-in removal, run after ING-2-AMEND2 proves out |
 | R3 blockers (only if R3V-b says viable) | (1) MECHANISM_ONLY validity = AUD-11+AUD-12 landing; (2) `UNDERPOWERED_NOT_REGISTERED` not in `_ACTIVE_STATUSES`; (3) no post-freeze filter in `_completed_on_whole_days`. Real f so far 2/5 (Wilson .12–.77); f_req 0.625 |
 
+### Comment backlog (R0.1)
+- Queue live-file comment/docstring fixes for the next real edit of each file: `websocket.py:61-63` wrong `retry.py` lines; `operator_controls.py:267` non-existent `RiskLimits` and `:271-275` stale ledger persistence wording; `signing.py` / `write_transport.py:6` stale cage docstrings; `exec/client.py:660` cites `risk.py:139` but the flag is at `:224`.
+
 ### WATCH / GATED (no build owed; re-open only on the named trigger)
 - **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).
 - **Evidence floor:** AUD-06b (CONFIRMED unit-qty edge + new family), CF-13 (live CCA/CCB), CF-14b (1-of-N stage-3 failure).
@@ -83,7 +87,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 
 **Host 09-28:** reboot 15:21Z killed node + 15:20Z study; node respawned 16:50:22Z (permit ttl 10 h); A1 halt SET (`source=legacy_attributed`); tape advancing.
 
-**FQ go-live 10-01:** `pm_us_crh_fq_v1.json` REGISTERED (slice S8) with `live_orders_ruling=RULING_operator_fq_live_real_orders_2026-10-01`, density artefact sha-pinned to the committed byte copy `9c0b6d6e…923a5e`, boundary artefact pinned to the `not_applicable_boundary.json` sentinel; `d0_climate_day` and activation (S9) still pending `docs/plans/FQ_GO_LIVE_PLAN_2026-10-01.md` §4/§5.
+**FQ go-live:** `pm_us_crh_fq_v1.json` REGISTERED (S8) with `live_orders_ruling=RULING_operator_fq_live_real_orders_2026-10-01`, density artefact sha-pinned to the committed byte copy, boundary artefact pinned to the `not_applicable_boundary.json` sentinel; S9 activation merged 60290e9d and the supervisor sends `pm_us_crh_fq_v1` for d0 2026-10-02 (`docs/plans/FQ_GO_LIVE_PLAN_2026-10-01.md` §4/§5).
 
 ---
 
