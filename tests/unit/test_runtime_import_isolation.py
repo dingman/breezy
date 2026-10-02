@@ -123,6 +123,10 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # SL-15: the NBP learning nightly imports `breezy.runtime.health` for alert
     # delivery, so it is a covered Stage 0 entry rather than an exclusion.
     "scripts.analysis.nbp_learning_nightly",
+    # R1.6: `quote_tape_gaps` moved from `breezy.persistence` to
+    # `breezy.runtime`, so `structural_dead_stop` now imports `breezy.runtime`
+    # and source (c) picks it up; tracked, not excluded.
+    "scripts.analysis.structural_dead_stop",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

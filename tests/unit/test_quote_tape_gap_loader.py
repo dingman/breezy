@@ -9,7 +9,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 from breezy.adapters.polymarket_us.tape_records import QuoteTapeGap
-from breezy.persistence.quote_tape_gaps import (
+from breezy.runtime.quote_tape_gaps import (
     GapPartitionKey,
     UnpartitionedQuoteTapeGapReadError,
     load_partitioned_quote_tape_gaps,

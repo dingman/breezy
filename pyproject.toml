@@ -104,8 +104,6 @@ ignore_imports = [
     "breezy.adapters.polymarket_us.factories -> breezy.runtime.settings",
     # Current inspected debt from the NWS ingest runtime cycle.
     "breezy.ingest.nws_actor -> breezy.runtime.health",
-    # Current inspected debt from quote-tape persistence using venue tape records.
-    "breezy.persistence.quote_tape_gaps -> breezy.adapters.polymarket_us.tape_records",
 ]
 
 [[tool.importlinter.contracts]]
