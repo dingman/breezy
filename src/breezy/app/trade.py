@@ -23,6 +23,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, TextIO
@@ -57,11 +58,13 @@ from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissi
 from breezy.runtime.settings import (
     ORDERS_ENABLED_VAR,
     SENDING_FAMILY_ID_VAR,
+    BreezyTradeSettings,
     SettingsError,
     load_trade_settings,
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
+    SubmitIntentLatch,
     SubmitIntentLockError,
     SubmitIntentLockHeld,
     open_submit_intent_latch,
@@ -483,6 +486,410 @@ def _build_fee_drift_probe(
     return actor, _resolve_client
 
 
+@dataclass(frozen=True)
+class _FamilyComposition:
+    """What one ``composition_kind`` builder hands back to ``run``.
+
+    FQ and OMS NETTING: no ``external_order_claims`` is carried here or
+    anywhere in the builders (C12) -- FQ fills reconcile under EXTERNAL at
+    the next boot.
+    """
+
+    strategies: list[Strategy]
+    submit_veto: Callable[[], str | None] | None = None
+    exit_manifest: FamilyManifest | None = None
+    fee_drift_actor: FeeDriftProbeActor | None = None
+    fee_drift_resolve_client: Callable[[Any], None] | None = None
+    extra_actors: tuple[Any, ...] = ()
+
+
+def _open_halt_latch_preamble(
+    latch: SubmitIntentLatch,
+    *,
+    family_id: str,
+    key_prefix: str,
+    alert_on_unattributable_legacy: bool,
+) -> tuple[TrialDayLatch, Callable[[], str | None]]:
+    """The shared halt-latch preamble: bind a ``TrialDayLatch`` over the SAME
+    store/flock ``latch`` already holds (never a second open), log the
+    ``family_halt_state`` line, optionally alert on an unattributable legacy
+    halt, and return the latch with its ``family_halt_submit_veto``.
+
+    ``key_prefix`` is the family's own durable namespace. Only the
+    continuous family alerts on ``legacy == "halts_all"``; the FQ family
+    never has, and that is preserved (``alert_on_unattributable_legacy``).
+    """
+    halt_latch = open_trial_day_latch(latch, key_prefix=key_prefix, family_id=family_id)
+    halt_state = halt_latch.family_halt_state()
+    _boot_logger.info(
+        "family_halt_state family_id=%s halted=%s source=%s legacy=%s",
+        family_id,
+        halt_state.halted,
+        halt_state.source,
+        halt_state.legacy,
+    )
+    if alert_on_unattributable_legacy and halt_state.legacy == "halts_all":
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity="CRITICAL",
+                event="LEGACY_FAMILY_HALT_UNATTRIBUTABLE",
+                site="breezy-trade",
+                detail=(
+                    f"family_id={family_id} source={halt_state.source} legacy={halt_state.legacy}"
+                ),
+            ),
+        )
+    return halt_latch, family_halt_submit_veto(halt_latch)
+
+
+def _compose_current_rung_hold(
+    *,
+    manifest: FamilyManifest,
+    catalog_root: Path,
+    today_by_station: dict[str, dt.date],
+    latch: SubmitIntentLatch,
+    sending_permit: OrderSubmissionPermit | None,
+) -> _FamilyComposition:
+    """Boot-time composition for ``current_rung_hold`` (moved verbatim from ``run``)."""
+    strategies: list[Strategy] = []
+    factory = make_trial_day_latch_factory(latch, family_id=manifest.family_id)
+    strategies.extend(
+        build_current_rung_hold_strategies(
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            trial_day_latch_factory=factory,
+            order_submission_permit=sending_permit,
+            # The family's REGISTERED cost basis, read off the
+            # manifest `run` loaded -- never an environment
+            # variable and never a constant here. A different
+            # theta is a different estimand, so it can only
+            # arrive as a different, committed, sha-changed,
+            # REGISTERED family.
+            required_fee_coefficient=manifest.taker_fee_coefficient,
+        )
+    )
+    return _FamilyComposition(strategies=strategies)
+
+
+def _compose_continuous_rung_hold(
+    *,
+    manifest: FamilyManifest,
+    catalog_root: Path,
+    today_by_station: dict[str, dt.date],
+    latch: SubmitIntentLatch,
+    sending_permit: OrderSubmissionPermit | None,
+) -> _FamilyComposition:
+    """Boot-time composition for ``continuous_rung_hold`` (moved from ``run``)."""
+    strategies: list[Strategy] = []
+    fee_drift_actor: FeeDriftProbeActor | None = None
+    fee_drift_resolve_client: Callable[[Any], None] | None = None
+    cont_factory = make_trial_day_latch_factory(
+        latch,
+        key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        family_id=manifest.family_id,
+    )
+    # Item 4 (slice 4 review): the exec client's `_submit_order`
+    # consults an injected `submit_veto: Callable[[], str |
+    # None]` kwarg (`adapters/polymarket_us/exec/client.py`),
+    # evaluated synchronously immediately before the permit
+    # spend. `family_halt_submit_veto` wraps a `TrialDayLatch`
+    # bound to the SAME shared store/flock `cont_factory` above
+    # binds (`open_trial_day_latch` is a plain constructor over
+    # `latch.shared_state_binding()`, never a second open), so
+    # every veto call is a synchronous, read-only
+    # `is_family_halted()` under the intent latch this process
+    # already holds for its lifetime -- no fresh open, no await.
+    family_halt_latch, submit_veto = _open_halt_latch_preamble(
+        latch,
+        family_id=manifest.family_id,
+        key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        alert_on_unattributable_legacy=True,
+    )
+    # Review finding A(1)/A(2): the sending family's own
+    # manifest (loaded once, in `run`), threaded into BOTH the
+    # position monitor (which evaluates an exit and refuses
+    # with `family_not_exit_registered` when the manifest
+    # declares no `exit_rule`) and the exec client (which
+    # denies with the same manifest-gate reason if anything
+    # ever reached it). One load, one object, passed to both --
+    # never two independent reads of the same file.
+    exit_manifest = manifest
+    # EDGE-1 (AM-4): created BEFORE strategy composition -- the
+    # composed strategies need the read-side callable at
+    # construction, but the probe (whose `is_fee_verified` the
+    # holder will forward to) is not built until after them, a
+    # few lines below. Binding happens once the probe exists.
+    fee_verified_holder = _FeeVerifiedHolder()
+    strategies.extend(
+        build_continuous_rung_hold_strategies(
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            trial_day_latch_factory=cont_factory,
+            order_submission_permit=sending_permit,
+            # phase1_sending_permit routes a non-None permit
+            # ONLY when phase0_shadow is False (a
+            # function-level guarantee -- see its docstring),
+            # so lifting the guard is exactly and only
+            # conditioned on that permit being present.
+            phase0_permit_guard=sending_permit is None,
+            exit_manifest=exit_manifest,
+            # See `_compose_current_rung_hold`: the theta every station
+            # prices against comes from THIS family's manifest.
+            required_fee_coefficient=manifest.taker_fee_coefficient,
+            # EDGE-1: the live composition root is the ONE
+            # caller that ever passes a non-None check (paper
+            # replay's ContinuousRungHoldBacktestStrategy never
+            # exposes this parameter at all).
+            fee_verified_check=fee_verified_holder.is_fee_verified,
+        )
+    )
+    # AUD-12b: unattended fee-schedule drift probe, this
+    # composition_kind only (§9: "runs alongside the existing
+    # strategy Actors", never folded into their own on_start).
+    built_probe = _build_fee_drift_probe(
+        strategies=strategies,
+        family_halt_latch=family_halt_latch,
+        # The sending family's own registered theta -- see the
+        # `_compose_current_rung_hold`'s `required_fee_coefficient` comment;
+        # never a constant, never an environment variable.
+        registered_fee_coefficient=manifest.taker_fee_coefficient,
+    )
+    if built_probe is not None:
+        fee_drift_actor, fee_drift_resolve_client = built_probe
+        # EDGE-1 (AM-4): bound only once the probe exists. When
+        # `built_probe` is `None` (AM-3: no instrument resolved
+        # for any composed station), the holder stays unbound
+        # for the rest of this process's life, which reads as
+        # permanently unverified -- safe, since nothing is
+        # tradable either way.
+        fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
+    return _FamilyComposition(
+        strategies=strategies,
+        submit_veto=submit_veto,
+        exit_manifest=exit_manifest,
+        fee_drift_actor=fee_drift_actor,
+        fee_drift_resolve_client=fee_drift_resolve_client,
+    )
+
+
+def _compose_forecast_quantile_ladder(
+    *,
+    manifest: FamilyManifest,
+    catalog_root: Path,
+    today_by_station: dict[str, dt.date],
+    latch: SubmitIntentLatch,
+    sending_permit: OrderSubmissionPermit | None,
+    settings: BreezyTradeSettings,
+) -> _FamilyComposition:
+    """Boot-time composition for ``forecast_quantile_ladder`` (moved from ``run``)."""
+    strategies: list[Strategy] = []
+    extra_actors: list[Any] = []
+    fee_drift_actor: FeeDriftProbeActor | None = None
+    fee_drift_resolve_client: Callable[[Any], None] | None = None
+    # SL-13 (plan `FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29
+    # .md` §7 row SL-13, hypothesis H-FC-NBP-EV-2026-09): this
+    # branch is REACHABLE from a production boot. The manifest
+    # naming this composition_kind (`deploy/families/pm_us_crh_fq_v1
+    # .json`) is REGISTERED, so `load_family_manifest`
+    # accepts it. Orders are still shadow-only unless the FQ-S5
+    # two-key live-orders gate below passes. Promoting a future
+    # manifest is a manifest + env act, never a source edit --
+    # exactly WP-11b's own cardinality-1 promotion contract.
+    #
+    # Same persistent-latch/halt-veto/permit-guard shape as the
+    # `_compose_continuous_rung_hold`, reusing its own
+    # `open_trial_day_latch`/`family_halt_submit_veto` machinery
+    # unchanged -- only the key_prefix (this family's OWN durable
+    # namespace) and the latch ADAPTER (`PersistentQuantileLadderLatch`,
+    # matching `ForecastQuantileLadderStrategy`'s plain
+    # constructor-value `latch`, never a per-station factory --
+    # see `forecast_quantile_ladder.composition`'s docstring)
+    # differ.
+    forecast_halt_latch, submit_veto = _open_halt_latch_preamble(
+        latch,
+        family_id=manifest.family_id,
+        key_prefix=FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
+        alert_on_unattributable_legacy=False,
+    )
+    exit_manifest = manifest
+    registry = default_registry()
+    station_icaos = tuple(
+        registry.settlement_site(_VENUE, station).icao for station in today_by_station
+    )
+    nbm_actor = NbmQuantileActor(
+        NbmQuantileActorConfig(station_icaos=station_icaos),
+    )
+    # S6 (finding F6): the same EDGE-1 pattern as the
+    # `_compose_continuous_rung_hold` -- the composed
+    # strategies need the read-side callable AT CONSTRUCTION, but
+    # the probe (whose `is_fee_verified` the holder forwards to)
+    # cannot be built until AFTER them, below.
+    fq_fee_verified_holder = _FeeVerifiedHolder()
+    # FQ-S5 (plan D3): the enable path is a two-key gate. This is
+    # the ONE place in the whole fq branch that computes a
+    # non-literal `shadow_only` -- see the AST guard in
+    # `tests/unit/test_shadow_only_false_is_only_the_gate_output
+    # .py`, which permits exactly this expression and nowhere
+    # else. The repo root is the process CWD, the same
+    # convention `_FAMILIES_DIR` above already assumes (the
+    # supervisor always sets `cwd=str(repo_root)` before
+    # spawning this process).
+    repo_root = Path.cwd()
+    try:
+        live_orders = live_orders_authorized(
+            manifest,
+            repo_root,
+            permit_present=sending_permit is not None,
+        )
+    except LiveOrdersGateRefusedError as exc:
+        _boot_logger.info(
+            "fq_live_orders enabled=False family_id=%s ruling=%s reason=%s ruling_sha256=none",
+            manifest.family_id,
+            manifest.live_orders_ruling,
+            exc.reason,
+        )
+        raise SettingsError(f"fq live-orders gate refused for {manifest.family_id}: {exc}") from exc
+    _boot_logger.info(
+        "fq_live_orders enabled=%s family_id=%s ruling=%s reason=%s "
+        "ruling_sha256=%s calibration_sha256=%s",
+        live_orders.enabled,
+        manifest.family_id,
+        manifest.live_orders_ruling or "none",
+        live_orders.reason,
+        live_orders.ruling_sha256 or "none",
+        manifest.density_artefact_sha256,
+    )
+    # FQ-S11: ONE shared in-process decision-funnel aggregator for
+    # this boot, flushed every 15 minutes (plus once at on_stop) to
+    # the SAME sibling `decisions/` directory
+    # `current_rung_hold.composition._decisions_dir` already uses
+    # -- a sibling of the quote-tape catalog root, never nested
+    # under it. Built here (never inside `build_forecast_
+    # quantile_ladder_strategies`, which returns constructed
+    # objects only, same convention as `quantile_actor`) and
+    # registered via `extra_actors` below.
+    fq_decision_counts = FqDecisionCounts()
+    fq_funnel_actor = FqDecisionFunnelActor(
+        output_dir=catalog_root.parent / "decisions",
+        counts=fq_decision_counts,
+    )
+    try:
+        forecast_strategies, quantile_actor = build_forecast_quantile_ladder_strategies(
+            catalog_root=catalog_root,
+            today_by_station=today_by_station,
+            latch=PersistentQuantileLadderLatch(forecast_halt_latch),
+            # A single sha-pinned density artefact serves both the
+            # per-version point calibration and the per-version
+            # bootstrap-draw bounds -- ONE loader
+            # (`calibration_artefact.load_live_calibration`), one
+            # manifest pin, `density_artefact_path`/
+            # `density_artefact_sha256` (SL-13 S2).
+            calibration_artefact_path=str(manifest.density_artefact_path),
+            calibration_artefact_sha256=manifest.density_artefact_sha256,
+            order_submission_permit=sending_permit,
+            phase0_permit_guard=sending_permit is None,
+            submit_veto=submit_veto,
+            fee_verified=fq_fee_verified_holder.is_fee_verified,
+            required_fee_coefficient=float(manifest.taker_fee_coefficient),
+            shadow_only=not live_orders.enabled,
+            decision_counts=fq_decision_counts,
+        )
+    except (
+        NoTradableForecastInstrumentsError,
+        # Review item 1 (SL-13 fix-first; SL-13 S2 item 8): every
+        # artefact-load failure mode -- a bad sha pin, malformed
+        # JSON, or a schema-missing key/wrong-shaped value in an
+        # otherwise-parseable payload (including an unknown or
+        # 3-element bootstrap-draw shape) -- must fail this ONE
+        # composition_kind closed, the same clean EXIT_CONFIG_ERROR
+        # path `NoTradableForecastInstrumentsError` already uses,
+        # never an unhandled crash. `load_live_calibration` itself
+        # already wraps every malformed-payload condition into
+        # `CalibrationArtefactPinMismatchError` -- a missing
+        # artefact FILE (`FileNotFoundError`) is already an
+        # `OSError`, already in the outer `except` tuple below --
+        # not repeated here.
+        CalibrationArtefactPinMismatchError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ) as exc:
+        raise SettingsError(
+            f"forecast_quantile_ladder composition failed for "
+            f"{settings.sending_family_id}: {type(exc).__name__}: {exc}"
+        ) from exc
+    strategies.extend(forecast_strategies)
+    extra_actors.extend([quantile_actor, nbm_actor, fq_funnel_actor])
+
+    # S6 (finding F6): built AFTER the strategies exist, over a
+    # LAZY `slug_fn` -- a D+1 readiness-poll subscription that
+    # resolves after `build()` is still picked up on the probe's
+    # next fetch (see `_build_fee_drift_probe`'s own docstring).
+    def _fq_slug_fn(
+        fqs: tuple[ForecastQuantileLadderStrategy, ...] = forecast_strategies,
+    ) -> str | None:
+        return _fq_representative_slug(fqs)
+
+    fq_built_probe = _build_fee_drift_probe(
+        strategies=forecast_strategies,
+        family_halt_latch=forecast_halt_latch,
+        registered_fee_coefficient=manifest.taker_fee_coefficient,
+        slug_fn=_fq_slug_fn,
+    )
+    if fq_built_probe is not None:
+        fee_drift_actor, fee_drift_resolve_client = fq_built_probe
+        fq_fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
+    return _FamilyComposition(
+        strategies=strategies,
+        submit_veto=submit_veto,
+        exit_manifest=exit_manifest,
+        fee_drift_actor=fee_drift_actor,
+        fee_drift_resolve_client=fee_drift_resolve_client,
+        extra_actors=tuple(extra_actors),
+    )
+
+
+def _compose_family(
+    manifest: FamilyManifest,
+    *,
+    settings: BreezyTradeSettings,
+    catalog_root: Path,
+    today_by_station: dict[str, dt.date],
+    latch: SubmitIntentLatch,
+    sending_permit: OrderSubmissionPermit | None,
+) -> _FamilyComposition:
+    """Dispatch composition by ``composition_kind``; unknown and unimplemented
+    kinds refuse the boot with a ``SettingsError`` (clean EXIT_CONFIG_ERROR)."""
+    common: dict[str, Any] = {
+        "manifest": manifest,
+        "catalog_root": catalog_root,
+        "today_by_station": today_by_station,
+        "latch": latch,
+        "sending_permit": sending_permit,
+    }
+    if manifest.composition_kind == "current_rung_hold":
+        return _compose_current_rung_hold(**common)
+    if manifest.composition_kind == "continuous_rung_hold":
+        return _compose_continuous_rung_hold(**common)
+    if manifest.composition_kind == "forecast_quantile_ladder":
+        return _compose_forecast_quantile_ladder(settings=settings, **common)
+    if manifest.composition_kind == "forecast_ladder":
+        # WP-14 has not landed: the strategy this composition_kind
+        # names does not exist yet. Refuse to boot rather than
+        # silently compose nothing -- an operator who points
+        # sending_family_id at a forecast_ladder manifest today
+        # gets a clean, logged configuration error, not a
+        # zero-strategy node quietly doing nothing.
+        raise SettingsError(
+            f"composition_kind=forecast_ladder ({settings.sending_family_id}) "
+            "cannot boot yet: ForecastLadderStrategy is not implemented"
+        )
+    raise SettingsError(
+        f"{settings.sending_family_id}: unknown composition_kind {manifest.composition_kind!r}"
+    )
+
+
 def run(
     *,
     env: Mapping[str, str] | None = None,
@@ -575,317 +982,20 @@ def run(
                 permit=order_submission_permit,
                 phase0_shadow=settings.phase0_shadow,
             )
-            strategies: list[Strategy] = []
-            submit_veto: Callable[[], str | None] | None = None
-            exit_manifest: FamilyManifest | None = None
-            fee_drift_actor: FeeDriftProbeActor | None = None
-            fee_drift_resolve_client: Callable[[Any], None] | None = None
-            #: SL-13: the `forecast_quantile_ladder` branch below is the only
-            #: one that ever populates this -- every other composition_kind
-            #: (including `fee_drift_actor` above) passes its own Actor(s)
-            #: through the `extra_actors` tuple at the `trade_cli.run` call
-            #: site unchanged, never through this list.
-            extra_actors: list[Any] = []
-
-            if manifest.composition_kind == "current_rung_hold":
-                factory = make_trial_day_latch_factory(latch, family_id=manifest.family_id)
-                strategies.extend(
-                    build_current_rung_hold_strategies(
-                        catalog_root=catalog_root,
-                        today_by_station=today_by_station,
-                        trial_day_latch_factory=factory,
-                        order_submission_permit=sending_permit,
-                        # The family's REGISTERED cost basis, read off the
-                        # manifest loaded above -- never an environment
-                        # variable and never a constant here. A different
-                        # theta is a different estimand, so it can only
-                        # arrive as a different, committed, sha-changed,
-                        # REGISTERED family.
-                        required_fee_coefficient=manifest.taker_fee_coefficient,
-                    )
-                )
-            elif manifest.composition_kind == "continuous_rung_hold":
-                cont_factory = make_trial_day_latch_factory(
-                    latch,
-                    key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
-                    family_id=manifest.family_id,
-                )
-                # Item 4 (slice 4 review): the exec client's `_submit_order`
-                # consults an injected `submit_veto: Callable[[], str |
-                # None]` kwarg (`adapters/polymarket_us/exec/client.py`),
-                # evaluated synchronously immediately before the permit
-                # spend. `family_halt_submit_veto` wraps a `TrialDayLatch`
-                # bound to the SAME shared store/flock `cont_factory` above
-                # binds (`open_trial_day_latch` is a plain constructor over
-                # `latch.shared_state_binding()`, never a second open), so
-                # every veto call is a synchronous, read-only
-                # `is_family_halted()` under the intent latch this process
-                # already holds for its lifetime -- no fresh open, no await.
-                family_halt_latch = open_trial_day_latch(
-                    latch,
-                    key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
-                    family_id=manifest.family_id,
-                )
-                halt_state = family_halt_latch.family_halt_state()
-                _boot_logger.info(
-                    "family_halt_state family_id=%s halted=%s source=%s legacy=%s",
-                    manifest.family_id,
-                    halt_state.halted,
-                    halt_state.source,
-                    halt_state.legacy,
-                )
-                if halt_state.legacy == "halts_all":
-                    emit_alert(
-                        resolve_alert_sink(),
-                        AlertPayload(
-                            severity="CRITICAL",
-                            event="LEGACY_FAMILY_HALT_UNATTRIBUTABLE",
-                            site="breezy-trade",
-                            detail=(
-                                f"family_id={manifest.family_id} source={halt_state.source} "
-                                f"legacy={halt_state.legacy}"
-                            ),
-                        ),
-                    )
-                submit_veto = family_halt_submit_veto(family_halt_latch)
-                # Review finding A(1)/A(2): the sending family's own
-                # manifest (loaded once, above), threaded into BOTH the
-                # position monitor (which evaluates an exit and refuses
-                # with `family_not_exit_registered` when the manifest
-                # declares no `exit_rule`) and the exec client (which
-                # denies with the same manifest-gate reason if anything
-                # ever reached it). One load, one object, passed to both --
-                # never two independent reads of the same file.
-                exit_manifest = manifest
-                # EDGE-1 (AM-4): created BEFORE strategy composition -- the
-                # composed strategies need the read-side callable at
-                # construction, but the probe (whose `is_fee_verified` the
-                # holder will forward to) is not built until after them, a
-                # few lines below. Binding happens once the probe exists.
-                fee_verified_holder = _FeeVerifiedHolder()
-                strategies.extend(
-                    build_continuous_rung_hold_strategies(
-                        catalog_root=catalog_root,
-                        today_by_station=today_by_station,
-                        trial_day_latch_factory=cont_factory,
-                        order_submission_permit=sending_permit,
-                        # phase1_sending_permit routes a non-None permit
-                        # ONLY when phase0_shadow is False (a
-                        # function-level guarantee -- see its docstring),
-                        # so lifting the guard is exactly and only
-                        # conditioned on that permit being present.
-                        phase0_permit_guard=sending_permit is None,
-                        exit_manifest=exit_manifest,
-                        # See the v2 branch above: the theta every station
-                        # prices against comes from THIS family's manifest.
-                        required_fee_coefficient=manifest.taker_fee_coefficient,
-                        # EDGE-1: the live composition root is the ONE
-                        # caller that ever passes a non-None check (paper
-                        # replay's ContinuousRungHoldBacktestStrategy never
-                        # exposes this parameter at all).
-                        fee_verified_check=fee_verified_holder.is_fee_verified,
-                    )
-                )
-                # AUD-12b: unattended fee-schedule drift probe, this
-                # composition_kind only (§9: "runs alongside the existing
-                # strategy Actors", never folded into their own on_start).
-                built_probe = _build_fee_drift_probe(
-                    strategies=strategies,
-                    family_halt_latch=family_halt_latch,
-                    # The sending family's own registered theta -- see the
-                    # v2 branch's `required_fee_coefficient` comment above;
-                    # never a constant, never an environment variable.
-                    registered_fee_coefficient=manifest.taker_fee_coefficient,
-                )
-                if built_probe is not None:
-                    fee_drift_actor, fee_drift_resolve_client = built_probe
-                    # EDGE-1 (AM-4): bound only once the probe exists. When
-                    # `built_probe` is `None` (AM-3: no instrument resolved
-                    # for any composed station), the holder stays unbound
-                    # for the rest of this process's life, which reads as
-                    # permanently unverified -- safe, since nothing is
-                    # tradable either way.
-                    fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
-            elif manifest.composition_kind == "forecast_quantile_ladder":
-                # SL-13 (plan `FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29
-                # .md` §7 row SL-13, hypothesis H-FC-NBP-EV-2026-09): shadow-only
-                # wiring -- every manifest naming this composition_kind stays
-                # `DRAFT_NOT_REGISTERED` (see `deploy/families/pm_us_crh_fq_v1
-                # .json`), which `load_family_manifest` above refuses without
-                # `allow_draft=True` (never passed here), so this branch is
-                # unreachable from a production boot today. Kept real and
-                # tested (never a stub) so promoting a future REGISTERED
-                # manifest is a manifest + env act, never a source edit --
-                # exactly WP-11b's own cardinality-1 promotion contract.
-                #
-                # Same persistent-latch/halt-veto/permit-guard shape as the
-                # `continuous_rung_hold` branch above, reusing its own
-                # `open_trial_day_latch`/`family_halt_submit_veto` machinery
-                # unchanged -- only the key_prefix (this family's OWN durable
-                # namespace) and the latch ADAPTER (`PersistentQuantileLadderLatch`,
-                # matching `ForecastQuantileLadderStrategy`'s plain
-                # constructor-value `latch`, never a per-station factory --
-                # see `forecast_quantile_ladder.composition`'s docstring)
-                # differ.
-                forecast_halt_latch = open_trial_day_latch(
-                    latch,
-                    key_prefix=FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
-                    family_id=manifest.family_id,
-                )
-                halt_state = forecast_halt_latch.family_halt_state()
-                _boot_logger.info(
-                    "family_halt_state family_id=%s halted=%s source=%s legacy=%s",
-                    manifest.family_id,
-                    halt_state.halted,
-                    halt_state.source,
-                    halt_state.legacy,
-                )
-                submit_veto = family_halt_submit_veto(forecast_halt_latch)
-                exit_manifest = manifest
-                registry = default_registry()
-                station_icaos = tuple(
-                    registry.settlement_site(_VENUE, station).icao
-                    for station in today_by_station
-                )
-                nbm_actor = NbmQuantileActor(
-                    NbmQuantileActorConfig(station_icaos=station_icaos),
-                )
-                # S6 (finding F6): the same EDGE-1 pattern as the
-                # `continuous_rung_hold` branch above -- the composed
-                # strategies need the read-side callable AT CONSTRUCTION, but
-                # the probe (whose `is_fee_verified` the holder forwards to)
-                # cannot be built until AFTER them, below.
-                fq_fee_verified_holder = _FeeVerifiedHolder()
-                # FQ-S5 (plan D3): the enable path is a two-key gate. This is
-                # the ONE place in the whole fq branch that computes a
-                # non-literal `shadow_only` -- see the AST guard in
-                # `tests/unit/test_shadow_only_false_is_only_the_gate_output
-                # .py`, which permits exactly this expression and nowhere
-                # else. The repo root is the process CWD, the same
-                # convention `_FAMILIES_DIR` above already assumes (the
-                # supervisor always sets `cwd=str(repo_root)` before
-                # spawning this process).
-                repo_root = Path.cwd()
-                try:
-                    live_orders = live_orders_authorized(
-                        manifest, repo_root, permit_present=sending_permit is not None,
-                    )
-                except LiveOrdersGateRefusedError as exc:
-                    _boot_logger.info(
-                        "fq_live_orders enabled=False family_id=%s ruling=%s reason=%s "
-                        "ruling_sha256=none",
-                        manifest.family_id,
-                        manifest.live_orders_ruling,
-                        exc.reason,
-                    )
-                    raise SettingsError(
-                        f"fq live-orders gate refused for {manifest.family_id}: {exc}"
-                    ) from exc
-                _boot_logger.info(
-                    "fq_live_orders enabled=%s family_id=%s ruling=%s reason=%s "
-                    "ruling_sha256=%s calibration_sha256=%s",
-                    live_orders.enabled,
-                    manifest.family_id,
-                    manifest.live_orders_ruling or "none",
-                    live_orders.reason,
-                    live_orders.ruling_sha256 or "none",
-                    manifest.density_artefact_sha256,
-                )
-                # FQ-S11: ONE shared in-process decision-funnel aggregator for
-                # this boot, flushed every 15 minutes (plus once at on_stop) to
-                # the SAME sibling `decisions/` directory
-                # `current_rung_hold.composition._decisions_dir` already uses
-                # -- a sibling of the quote-tape catalog root, never nested
-                # under it. Built here (never inside `build_forecast_
-                # quantile_ladder_strategies`, which returns constructed
-                # objects only, same convention as `quantile_actor`) and
-                # registered via `extra_actors` below.
-                fq_decision_counts = FqDecisionCounts()
-                fq_funnel_actor = FqDecisionFunnelActor(
-                    output_dir=catalog_root.parent / "decisions",
-                    counts=fq_decision_counts,
-                )
-                try:
-                    forecast_strategies, quantile_actor = build_forecast_quantile_ladder_strategies(
-                        catalog_root=catalog_root,
-                        today_by_station=today_by_station,
-                        latch=PersistentQuantileLadderLatch(forecast_halt_latch),
-                        # A single sha-pinned density artefact serves both the
-                        # per-version point calibration and the per-version
-                        # bootstrap-draw bounds -- ONE loader
-                        # (`calibration_artefact.load_live_calibration`), one
-                        # manifest pin, `density_artefact_path`/
-                        # `density_artefact_sha256` (SL-13 S2).
-                        calibration_artefact_path=str(manifest.density_artefact_path),
-                        calibration_artefact_sha256=manifest.density_artefact_sha256,
-                        order_submission_permit=sending_permit,
-                        phase0_permit_guard=sending_permit is None,
-                        submit_veto=submit_veto,
-                        fee_verified=fq_fee_verified_holder.is_fee_verified,
-                        required_fee_coefficient=float(manifest.taker_fee_coefficient),
-                        shadow_only=not live_orders.enabled,
-                        decision_counts=fq_decision_counts,
-                    )
-                except (
-                    NoTradableForecastInstrumentsError,
-                    # Review item 1 (SL-13 fix-first; SL-13 S2 item 8): every
-                    # artefact-load failure mode -- a bad sha pin, malformed
-                    # JSON, or a schema-missing key/wrong-shaped value in an
-                    # otherwise-parseable payload (including an unknown or
-                    # 3-element bootstrap-draw shape) -- must fail this ONE
-                    # composition_kind closed, the same clean EXIT_CONFIG_ERROR
-                    # path `NoTradableForecastInstrumentsError` already uses,
-                    # never an unhandled crash. `load_live_calibration` itself
-                    # already wraps every malformed-payload condition into
-                    # `CalibrationArtefactPinMismatchError` -- a missing
-                    # artefact FILE (`FileNotFoundError`) is already an
-                    # `OSError`, already in the outer `except` tuple below --
-                    # not repeated here.
-                    CalibrationArtefactPinMismatchError,
-                    json.JSONDecodeError,
-                    KeyError,
-                    TypeError,
-                ) as exc:
-                    raise SettingsError(
-                        f"forecast_quantile_ladder composition failed for "
-                        f"{settings.sending_family_id}: {type(exc).__name__}: {exc}"
-                    ) from exc
-                strategies.extend(forecast_strategies)
-                extra_actors.extend([quantile_actor, nbm_actor, fq_funnel_actor])
-                # S6 (finding F6): built AFTER the strategies exist, over a
-                # LAZY `slug_fn` -- a D+1 readiness-poll subscription that
-                # resolves after `build()` is still picked up on the probe's
-                # next fetch (see `_build_fee_drift_probe`'s own docstring).
-                def _fq_slug_fn(
-                    fqs: tuple[ForecastQuantileLadderStrategy, ...] = forecast_strategies,
-                ) -> str | None:
-                    return _fq_representative_slug(fqs)
-
-                fq_built_probe = _build_fee_drift_probe(
-                    strategies=forecast_strategies,
-                    family_halt_latch=forecast_halt_latch,
-                    registered_fee_coefficient=manifest.taker_fee_coefficient,
-                    slug_fn=_fq_slug_fn,
-                )
-                if fq_built_probe is not None:
-                    fee_drift_actor, fee_drift_resolve_client = fq_built_probe
-                    fq_fee_verified_holder.bind(fee_drift_actor.is_fee_verified)
-            elif manifest.composition_kind == "forecast_ladder":
-                # WP-14 has not landed: the strategy this composition_kind
-                # names does not exist yet. Refuse to boot rather than
-                # silently compose nothing -- an operator who points
-                # sending_family_id at a forecast_ladder manifest today
-                # gets a clean, logged configuration error, not a
-                # zero-strategy node quietly doing nothing.
-                raise SettingsError(
-                    f"composition_kind=forecast_ladder ({settings.sending_family_id}) "
-                    "cannot boot yet: ForecastLadderStrategy is not implemented"
-                )
-            else:
-                raise SettingsError(
-                    f"{settings.sending_family_id}: unknown composition_kind "
-                    f"{manifest.composition_kind!r}"
-                )
+            composition = _compose_family(
+                manifest,
+                settings=settings,
+                catalog_root=catalog_root,
+                today_by_station=today_by_station,
+                latch=latch,
+                sending_permit=sending_permit,
+            )
+            strategies = composition.strategies
+            submit_veto = composition.submit_veto
+            exit_manifest = composition.exit_manifest
+            fee_drift_actor = composition.fee_drift_actor
+            fee_drift_resolve_client = composition.fee_drift_resolve_client
+            extra_actors = composition.extra_actors
 
             composed = tuple(strategies)
             _boot_logger.info(
