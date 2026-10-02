@@ -191,11 +191,10 @@ from pathlib import Path
 from typing import Any, Final
 
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import InstrumentClose, OrderBookDepth10, QuoteTick
-from nautilus_trader.model.enums import InstrumentCloseType
+from nautilus_trader.model.data import InstrumentClose
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.instruments import BinaryOption, Instrument
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Money
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.trading.strategy import Strategy
@@ -213,9 +212,22 @@ from weather_strategy_backtest_lib import (
     first_blocking_gate,
     hours_from_now_until,
     latest_publication_at_or_before,
-    select_book_backed_instrument_ids,
-    select_tradable_instrument_ids,
     settlement_prices_for_scenario,
+)
+# Compatibility re-export block: some names below are unused here but are kept
+# for importers and ruling citations; do not remove in a lint cleanup.
+from tape_instruments import (  # type: ignore[import-not-found]
+    CLIMATE_DAY,
+    DEFAULT_WEATHER_CATALOG_ROOT,
+    WEATHER_VENUE,  # noqa: F401
+    TapeInstrument,
+    _ONE_SECOND_NS,
+    _capture_instruments_by_id,  # noqa: F401
+    _convert_live_capture,
+    _load_climate_day_records,
+    _select_capture_instruments,
+    _select_tape_instruments,
+    _synthesize_close,
 )
 
 from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
@@ -224,8 +236,6 @@ from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
 # why the public promotion could not be made in this change.
 from breezy.adapters.polymarket_us.fees import _fee_coefficient
 from breezy.domain.nws_climate_day import NwsClimateDay
-from breezy.domain.weather_bucket_facts import WeatherBucketFacts, read_weather_bucket_facts
-from breezy.persistence.catalog import open_station_catalog, read_climate_days
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import (
     BreezyBacktestConfig,
@@ -240,7 +250,6 @@ from breezy.runtime.point_in_time_guard import (
     LookAheadRecordError,
     assert_available_before_decision,
 )
-from breezy.runtime.quote_tape_ingest_cli import default_convert
 from breezy.strategy.calibration_mean_reversion import (
     CalibrationMeanReversionConfig,
     CalibrationMeanReversionStrategy,
@@ -346,14 +355,10 @@ SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK: Final[float] = 0.01
 DEFAULT_QUOTE_CATALOG_PATH: Final[Path] = Path(
     "/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us",
 )
-DEFAULT_WEATHER_CATALOG_ROOT: Final[Path] = Path("/home/jon/.local/share/breezy/catalog")
 DEFAULT_OUTPUT_DIR: Final[Path] = Path(
     "/home/jon/.local/share/breezy/derived/strategy-backtests",
 )
-WEATHER_VENUE: Final[str] = "polymarket_us"
-CLIMATE_DAY: Final[dt.date] = dt.date(2026, 8, 30)
 STARTING_BALANCE_USD: Final[int] = 10_000
-_ONE_SECOND_NS: Final[int] = 1_000_000_000
 
 #: ASSUMED. Breezy ingests no forecast data (see module docstring); this is a
 #: fixed, explicit stand-in, deliberately different from both the real
@@ -520,33 +525,6 @@ class _SequenceForecastSource:
 
 
 @dataclass(frozen=True, slots=True)
-class TapeInstrument:
-    """One tradable instrument plus the REAL data selected for it.
-
-    `closes` is empty by default: `_select_tape_instruments`'s source tape
-    carries ZERO real `InstrumentClose` records (module docstring), so that
-    path leaves it empty and synthesizes a close separately via
-    `_synthesize_close`. `_select_capture_instruments` populates it from the
-    capture's OWN recorded closes -- never synthesized -- so a paper-replay
-    caller can feed them straight into `market_data`.
-    """
-
-    instrument: BinaryOption
-    facts: WeatherBucketFacts
-    depths: list[OrderBookDepth10]
-    quotes: list[QuoteTick]
-    closes: list[InstrumentClose] = field(default_factory=list)
-
-    @property
-    def last_market_data_ts_init(self) -> int:
-        return int(
-            max(
-                [d.ts_init for d in self.depths] + [q.ts_init for q in self.quotes],
-            ),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class FillSummary:
     side: str
     quantity: float
@@ -674,79 +652,6 @@ class RunResult:
             "return_on_starting_balance_pct": self.return_on_starting_balance_pct,
             "return_on_capital_deployed_pct": self.return_on_capital_deployed_pct,
         }
-
-
-def _select_tape_instruments(
-    catalog: ParquetDataCatalog,
-    *,
-    climate_day: dt.date = CLIMATE_DAY,
-) -> list[TapeInstrument]:
-    """Every `climate_day` instrument on the tape with REAL depth AND quote
-    coverage.
-
-    Narrows to `climate_day` FIRST via `_capture_instruments_by_id` -- the
-    same single id-discovery-and-filter seam `_select_capture_instruments`
-    uses -- so `order_book_depth10`/`quote_ticks` (I/O) are only ever called
-    for in-scope ids, never for the many other-day instruments recorded on
-    the same shared tape (AUD-11: this used to read every captured
-    instrument's full depth/quote lists before narrowing, OOMing on the
-    production catalog). The pure selection rule itself is
-    `weather_strategy_backtest_lib.select_tradable_instrument_ids`, unit
-    tested against fabricated counts.
-    """
-    by_id = _capture_instruments_by_id(catalog, climate_day=climate_day)
-    depth_counts: dict[str, int] = {}
-    quote_counts: dict[str, int] = {}
-    depths_by_id: dict[str, list[OrderBookDepth10]] = {}
-    quotes_by_id: dict[str, list[QuoteTick]] = {}
-    for instrument_id in by_id:
-        depths = catalog.order_book_depth10(instrument_ids=[instrument_id])
-        quotes = catalog.quote_ticks(instrument_ids=[instrument_id])
-        depth_counts[instrument_id] = len(depths)
-        quote_counts[instrument_id] = len(quotes)
-        depths_by_id[instrument_id] = depths
-        quotes_by_id[instrument_id] = quotes
-
-    tradable_ids = set(select_tradable_instrument_ids(depth_counts, quote_counts))
-
-    result: list[TapeInstrument] = []
-    for instrument_id in sorted(tradable_ids):
-        instrument = by_id[instrument_id]
-        if not isinstance(instrument, BinaryOption):
-            raise TypeError(
-                f"{instrument_id} is a {type(instrument).__name__}, not a "
-                f"BinaryOption; every Breezy weather instrument on this venue "
-                f"is a BinaryOption",
-            )
-        facts = read_weather_bucket_facts(instrument.info)
-        result.append(
-            TapeInstrument(
-                instrument=instrument,
-                facts=facts,
-                depths=depths_by_id[instrument_id],
-                quotes=quotes_by_id[instrument_id],
-            ),
-        )
-    return result
-
-
-def _synthesize_close(tape_instrument: TapeInstrument) -> InstrumentClose:
-    """One CONSTRUCTED `CONTRACT_EXPIRED` close, strictly after the real tape.
-
-    See the module docstring: the real tape carries ZERO `InstrumentClose`
-    records, and `run_backtest` requires exactly one per instrument.
-    `close_price` is cosmetic -- the engine settles from `settlement_prices`
-    only.
-    """
-    ts = tape_instrument.last_market_data_ts_init + _ONE_SECOND_NS
-    instrument = tape_instrument.instrument
-    return InstrumentClose(
-        instrument.id,
-        instrument.make_price(0.5),
-        InstrumentCloseType.CONTRACT_EXPIRED,
-        ts,
-        ts,
-    )
 
 
 def _climate_day_for_message(records: Sequence[NwsClimateDay]) -> dt.date:
@@ -1273,186 +1178,6 @@ def _forecast_sources_and_overrides(
 # What is genuinely absent, and therefore authored here: the CHOICE of target
 # catalog (the capture root is read-only evidence, so every converted row goes
 # to a SEPARATE work root), the climate-day filter, and the s8.5 record.
-
-
-def _convert_live_capture(
-    *,
-    quote_catalog: Path,
-    instance_id: str,
-    subdirectory: str,
-    work_catalog: Path,
-) -> ParquetDataCatalog:
-    """Convert one live-recorder run into a SEPARATE work catalog, natively.
-
-    `other_catalog` is mandatory here, not incidental: the capture root is
-    evidence and is never written to. `convert_stream_to_data` writes parquet
-    into whichever catalog it is handed, and it SKIPS (with a bare `print`, no
-    exception -- `parquet.py:2680`) any file whose computed name already
-    exists, so a re-run against a populated work root is a silent partial
-    no-op. The work root is therefore required to be empty or absent.
-    """
-    if work_catalog.resolve() == quote_catalog.resolve() or quote_catalog.resolve() in (
-        work_catalog.resolve().parents
-    ):
-        raise ValueError(
-            f"--work-catalog {work_catalog} is inside the capture root {quote_catalog}. "
-            "The capture is read-only evidence; converted rows must go somewhere else.",
-        )
-    if work_catalog.exists() and any(work_catalog.iterdir()):
-        raise ValueError(
-            f"--work-catalog {work_catalog} is not empty. `convert_stream_to_data` "
-            "silently SKIPS a write whose filename already exists (parquet.py:2680, a "
-            "bare print), so converting into a populated root can produce a partial "
-            "tape with no error. Point it at a fresh directory.",
-        )
-    work_catalog.mkdir(parents=True, exist_ok=True)
-    source = ParquetDataCatalog(str(quote_catalog))
-    work = ParquetDataCatalog(str(work_catalog))
-    # `default_convert` is native `convert_stream_to_data` for every type
-    # EXCEPT instrument definitions (`BinaryOption`): the recorder re-emits a
-    # definition carrying its ORIGINAL `ts_init` on every discovery cycle, so
-    # more than one `binary_option_*.feather` under an instance produces
-    # overlapping intervals that the native per-file converter refuses
-    # forever (`parquet.py:2690`). `default_convert` already solved this
-    # row-wise for the ingest timer (`quote_tape_ingest_cli.py`); reused here
-    # verbatim via its `target=` parameter rather than re-implemented, so
-    # this is the same dispatch, writing into the SEPARATE work catalog.
-    for data_cls in (BinaryOption, InstrumentClose, QuoteTick, OrderBookDepth10):
-        default_convert(source, instance_id, data_cls, subdirectory, target=work)
-    return work
-
-
-def _capture_instruments_by_id(
-    catalog: object,
-    *,
-    climate_day: dt.date,
-    station: str | None = None,
-) -> dict[str, Instrument]:
-    """Every RECORDED instrument for `climate_day` (and `station`, when
-    given), de-duplicated on `id`.
-
-    `catalog.instruments()` returns one row per RECORDED definition, and the
-    recorder re-publishes definitions on every discovery cycle, so the same
-    `InstrumentId` appears many times. De-duplicated on `id`, keeping the
-    first, so an instrument is counted once.
-
-    THE single instrument-discovery seam: `_select_capture_instruments`
-    below and the paper-replay driver's warm-up discovery
-    (`_replay_station_day_instrument_ids`, `current_rung_hold_paper_
-    replay.py`) both call this -- never their own `catalog.instruments()`
-    loop -- so there is exactly one id-discovery-and-filter implementation,
-    and exactly one place that touches `catalog.instruments()` for this
-    purpose (AUD-09b review fix: the driver used to duplicate this loop and
-    touch the catalog directly, bypassing every test that patches `_select_
-    capture_instruments`).
-    """
-    by_id: dict[str, Instrument] = {}
-    for instrument in catalog.instruments():  # type: ignore[attr-defined]
-        by_id.setdefault(instrument.id.value, instrument)
-
-    return {
-        instrument_id: instrument
-        for instrument_id, instrument in by_id.items()
-        if (
-            read_weather_bucket_facts(instrument.info).applies_to(station, climate_day)
-            if station is not None
-            else read_weather_bucket_facts(instrument.info).climate_day == climate_day
-        )
-    }
-
-
-def _select_capture_instruments(
-    catalog: ParquetDataCatalog,
-    *,
-    climate_day: dt.date,
-    station: str | None = None,
-    start: int | None = None,
-    end: int | None = None,
-) -> list[TapeInstrument]:
-    """Every captured instrument for `climate_day` that carries ORDER-BOOK depth.
-
-    Depth-only, via `select_book_backed_instrument_ids` -- see that function
-    for why the quote-AND-depth rule is the wrong one for an asks-only book,
-    and why relaxing it here is not a relaxation of anything the forecast
-    strategies rely on.
-
-    Instrument discovery (dedup + `climate_day`/`station` filtering) is
-    `_capture_instruments_by_id` -- see that function for why.
-    """
-    by_id = _capture_instruments_by_id(catalog, climate_day=climate_day, station=station)
-    facts_by_id: dict[str, WeatherBucketFacts] = {
-        instrument_id: read_weather_bucket_facts(instrument.info)
-        for instrument_id, instrument in by_id.items()
-    }
-
-    depth_counts: dict[str, int] = {}
-    depths_by_id: dict[str, list[OrderBookDepth10]] = {}
-    quotes_by_id: dict[str, list[QuoteTick]] = {}
-    closes_by_id: dict[str, list[InstrumentClose]] = {}
-    for instrument_id in facts_by_id:
-        depths = catalog.order_book_depth10(
-            instrument_ids=[instrument_id],
-            start=start,
-            end=end,
-        )
-        depths_by_id[instrument_id] = depths
-        depth_counts[instrument_id] = len(depths)
-        quotes_by_id[instrument_id] = catalog.quote_ticks(
-            instrument_ids=[instrument_id],
-            start=start,
-            end=end,
-        )
-        # The capture's OWN recorded closes for this instrument, converted by
-        # `_convert_live_capture` alongside the quotes/depths above -- never
-        # synthesized here (unlike `_select_tape_instruments`).
-        closes_by_id[instrument_id] = catalog.instrument_closes(
-            instrument_ids=[instrument_id],
-        )
-
-    result: list[TapeInstrument] = []
-    for instrument_id in select_book_backed_instrument_ids(depth_counts):
-        instrument = by_id[instrument_id]
-        if not isinstance(instrument, BinaryOption):
-            raise TypeError(
-                f"{instrument_id} is a {type(instrument).__name__}, not a BinaryOption",
-            )
-        result.append(
-            TapeInstrument(
-                instrument=instrument,
-                facts=facts_by_id[instrument_id],
-                depths=depths_by_id[instrument_id],
-                quotes=quotes_by_id[instrument_id],
-                closes=closes_by_id[instrument_id],
-            ),
-        )
-    return result
-
-
-def _load_climate_day_records(
-    weather_catalog_root: Path,
-    *,
-    stations: Sequence[str],
-    climate_day: dt.date,
-) -> list[NwsClimateDay]:
-    """Every non-superseded `NwsClimateDay` for `climate_day`, at its REAL ts_init.
-
-    NOT restamped. The default branch does not feed these records to the
-    engine at all: their real retrieval timestamps fall outside that tape's
-    decision window. A live capture that spans the morning final prints feeds
-    this same list, at these timestamps, because those prints land inside its
-    window. Sorted by `ts_init` for readability only -- `BacktestEngine.add_data`
-    sorts by `ts_init` itself (`backtest/engine.pyx:903`), and `ts_event` is
-    never read on the replay path.
-    """
-    records: list[NwsClimateDay] = []
-    for station in stations:
-        station_catalog = open_station_catalog(weather_catalog_root, WEATHER_VENUE, station)
-        records.extend(
-            record
-            for record in read_climate_days(station_catalog)
-            if record.climate_day == climate_day and not record.is_superseded
-        )
-    return sorted(records, key=lambda r: r.ts_init)
 
 
 def _settled_readings(records: Sequence[NwsClimateDay]) -> dict[str, int]:

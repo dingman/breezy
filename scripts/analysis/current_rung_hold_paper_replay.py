@@ -66,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from archive_correction_probe import wilson_interval
 from argv_digest import argv_sha256
-from run_weather_strategy_backtests import (
+from tape_instruments import (  # type: ignore[import-not-found]
     WEATHER_VENUE,
     TapeInstrument,
     _capture_instruments_by_id,
