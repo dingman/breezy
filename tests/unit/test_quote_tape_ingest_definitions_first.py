@@ -33,6 +33,7 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 import breezy
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+import breezy.runtime.quote_tape_ingest_core as ingest_core_module
 from breezy.runtime.quote_tape_ingest_cli import (
     DEFAULT_LIVE_GRACE_MINUTES,
     EXIT_OK,
@@ -378,7 +379,7 @@ class TestOpenDefinitionsFileStaysSkippedAcrossBothPasses:
             newest_calls.append(1)
             return real_newest(*args, **kwargs)
 
-        monkeypatch.setattr(ingest_cli_module, "_newest_started_instance_id", spy_newest)
+        monkeypatch.setattr(ingest_core_module, "_newest_started_instance_id", spy_newest)
 
         calls: list[tuple[str, type]] = []
 
@@ -418,7 +419,7 @@ class TestNewestInstanceIsComputedOverAllIdsNotTheSelection:
             seen_newest.append(kwargs.get("newest_instance_id"))
             return real_open_files(*args, **kwargs)
 
-        monkeypatch.setattr(ingest_cli_module, "_open_files_for_instance", spy_open_files)
+        monkeypatch.setattr(ingest_core_module, "_open_files_for_instance", spy_open_files)
 
         results = ingest_cli_module.run_ingest_definitions_first(
             tmp_path,
@@ -475,7 +476,7 @@ class TestDefinitionPassScansOnlyInstancesNeedingDefinitions:
             scans.append(args[1] if len(args) > 1 else kwargs["instance_id"])
             return real_scan(*args, **kwargs)
 
-        monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", spy_scan)
+        monkeypatch.setattr(ingest_core_module, "scan_instance_memoized", spy_scan)
 
         calls: list[tuple[str, type]] = []
         _touch_fresh(grace_tick_path)
@@ -694,7 +695,7 @@ class TestRunRoutesThroughDefinitionsFirst:
             called.append((args, kwargs))
             return ()
 
-        monkeypatch.setattr(ingest_cli_module, "run_ingest_definitions_first", spy)
+        monkeypatch.setattr(ingest_core_module, "run_ingest_definitions_first", spy)
 
         out, err = io.StringIO(), io.StringIO()
         code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)

@@ -52,6 +52,7 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+import breezy.runtime.quote_tape_ingest_core as ingest_core_module
 from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.runtime.quote_tape_ingest_cli import (
@@ -900,7 +901,7 @@ class TestNonInstrumentTypesKeepTheSingleNativeCall:
         ) -> None:
             native_calls.append(data_cls)
 
-        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", spy)
+        monkeypatch.setattr(ingest_core_module, "_convert_stream_natively", spy)
 
         run_ingest(
             tmp_path,
@@ -930,7 +931,7 @@ class TestNonInstrumentTypesKeepTheSingleNativeCall:
         ) -> None:
             raise ValueError("would create non-disjoint intervals")
 
-        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", boom)
+        monkeypatch.setattr(ingest_core_module, "_convert_stream_natively", boom)
 
         results = run_ingest(
             tmp_path,
@@ -1513,7 +1514,7 @@ class TestANoneOrEmptyPostTransformTableIsAHardFailure:
     ) -> None:
         instance_dir, quote_path = self._mixed_instance(tmp_path)
         monkeypatch.setattr(
-            ingest_cli_module, "read_feather_coalesced", lambda fs, path, **kw: None
+            ingest_core_module, "read_feather_coalesced", lambda fs, path, **kw: None
         )
 
         results = run_ingest(
@@ -1824,7 +1825,7 @@ class TestExitCodeReflectsAHardConversionFailure:
         stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
         os.utime(quote_path, (stamp, stamp))
         monkeypatch.setattr(
-            ingest_cli_module, "read_feather_coalesced", lambda fs, path, **kw: None
+            ingest_core_module, "read_feather_coalesced", lambda fs, path, **kw: None
         )
 
         out, err = io.StringIO(), io.StringIO()
@@ -1868,9 +1869,9 @@ class TestExitCodeReflectsAHardConversionFailure:
                 raise ValueError("would create non-disjoint intervals")
             return real_native(catalog, instance_id, data_cls, subdirectory, **kwargs)
 
-        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", flaky_native)
+        monkeypatch.setattr(ingest_core_module, "_convert_stream_natively", flaky_native)
         monkeypatch.setattr(
-            ingest_cli_module, "_extend_table_chunked", lambda *a, **kw: (0, False)
+            ingest_core_module, "_extend_table_chunked", lambda *a, **kw: (0, False)
         )
         # Deterministic "dead instance" regardless of the sandbox's own
         # systemctl/dbus availability (default_service_active_probe fails
@@ -1878,7 +1879,7 @@ class TestExitCodeReflectsAHardConversionFailure:
         # file could still be treated as the live newest-instance file and
         # routed through the per-file path instead of the whole-instance
         # `ingest_instance`/EXTEND path this test targets.
-        monkeypatch.setattr(ingest_cli_module, "default_service_active_probe", lambda unit: False)
+        monkeypatch.setattr(ingest_core_module, "default_service_active_probe", lambda unit: False)
 
         out, err = io.StringIO(), io.StringIO()
         code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
@@ -1948,7 +1949,7 @@ class TestAMissingPreflightReportIsNeverSilent:
                 report, files=tuple(f for f in report.files if f.path != quote_path)
             )
 
-        monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", _drop_quote_report)
+        monkeypatch.setattr(ingest_core_module, "scan_instance_memoized", _drop_quote_report)
 
         with caplog.at_level(logging.WARNING, logger="breezy.runtime.quote_tape_ingest_cli"):
             results = run_ingest(

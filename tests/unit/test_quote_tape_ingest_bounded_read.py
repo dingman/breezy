@@ -34,6 +34,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog, _timestamps_to_filename
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
+import breezy.runtime.quote_tape_ingest_core as ingest_core_module
 from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.persistence.feather_read import COALESCE_ROWS, BatchCoalescer, read_feather_coalesced
 from breezy.runtime.quote_tape_ingest_cli import (
@@ -606,7 +607,9 @@ def test_extend_chunked_never_exceeds_the_bound_and_dedupe_window_is_local(
         return real_write(write_target, data_cls, objects)
 
     monkeypatch.setattr(ParquetDataCatalog, "query", spy_query)
-    monkeypatch.setattr("breezy.runtime.quote_tape_ingest_cli.write_fresh_capture_rows", spy_write)
+    monkeypatch.setattr(
+        "breezy.runtime.quote_tape_ingest_core.write_fresh_capture_rows", spy_write
+    )
 
     written, streamed_any = _extend_table_chunked(
         catalog, catalog, InstrumentStatus, table, chunk_rows=5
@@ -679,9 +682,7 @@ def test_extend_chunked_all_equal_ts_init_collapses_to_one_chunk(
         calls.append(len(objects))
         return real_write(write_target, data_cls, objects)
 
-    import breezy.runtime.quote_tape_ingest_cli as cli_module
-
-    monkeypatch.setattr(cli_module, "write_fresh_capture_rows", counting_write)
+    monkeypatch.setattr(ingest_core_module, "write_fresh_capture_rows", counting_write)
 
     written, streamed_any = _extend_table_chunked(
         catalog, catalog, InstrumentStatus, table, chunk_rows=3
@@ -752,7 +753,7 @@ def test_extend_chunked_crash_then_rerun_is_idempotent(tmp_path: Path) -> None:
         return real_write(write_target, data_cls, objects)
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(cli_module, "write_fresh_capture_rows", crashing_write)
+        mp.setattr(ingest_core_module, "write_fresh_capture_rows", crashing_write)
         with pytest.raises(RuntimeError, match="simulated crash"):
             _extend_table_chunked(catalog, catalog, InstrumentStatus, table, chunk_rows=3)
 
@@ -835,7 +836,7 @@ def test_extend_overlapping_stream_routes_through_extend_table_chunked(
         calls.append(len(table))
         return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
 
-    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+    monkeypatch.setattr(ingest_core_module, "_extend_table_chunked", spy_chunked)
 
     outcome = _extend_overlapping_stream(catalog, "instance-1", InstrumentStatus, "live")
 
@@ -871,7 +872,7 @@ def test_per_file_extend_fallback_routes_through_extend_table_chunked(
         calls.append(len(table))
         return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
 
-    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+    monkeypatch.setattr(ingest_core_module, "_extend_table_chunked", spy_chunked)
 
     _result, converted, _open = _convert_one_tick_type_per_file(
         fixture.catalog,
@@ -912,7 +913,7 @@ def _patch_zero_row_file(
             return 0, False
         return real_chunked(catalog_arg, write_target, data_cls, table, **kwargs)
 
-    monkeypatch.setattr(cli_module, "_extend_table_chunked", spy_chunked)
+    monkeypatch.setattr(ingest_core_module, "_extend_table_chunked", spy_chunked)
 
 
 def test_extend_overlapping_stream_zero_row_file_fails_like_the_fast_path(
