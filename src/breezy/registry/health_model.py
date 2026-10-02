@@ -22,7 +22,9 @@ in :mod:`breezy.runtime.health`. This module must never import any of it.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, Protocol
 
 __all__ = [
@@ -39,7 +41,9 @@ __all__ = [
     "AlertConditionKey",
     "AlertPayload",
     "AlertSink",
+    "AlertTracker",
     "GapSummary",
+    "HealthIO",
     "HealthSnapshot",
     "SiteHealth",
 ]
@@ -290,3 +294,30 @@ class AlertCondition:
     event: str
     detail: str
     renotify_muted: bool = False
+
+
+class AlertTracker(Protocol):
+    """The transition/dedupe half of ``runtime.health.AlertState`` the NWS
+    ingest actor depends on: one ``evaluate`` per cycle, on the loop thread."""
+
+    def evaluate(
+        self, conditions: Sequence[AlertCondition], *, now_ns: int
+    ) -> tuple[AlertPayload, ...]: ...
+
+
+class HealthIO(Protocol):
+    """The health I/O surface injected into the NWS ingest actor.
+
+    Satisfied by the :mod:`breezy.runtime.health` MODULE itself (composition
+    assigns the module), so ``ingest`` never imports ``runtime``. Parameter
+    names copy ``runtime.health`` exactly. Every call stays late-bound on the
+    injected object, so a test can monkeypatch the module attribute.
+    """
+
+    def emit_alert(self, sink: AlertSink, payload: AlertPayload) -> None: ...
+
+    def write_snapshot_atomic(self, path: Path, snapshot: HealthSnapshot) -> None: ...
+
+    def resolve_alert_sink(self, env: Mapping[str, str] | None = None) -> AlertSink: ...
+
+    def new_alert_state(self) -> AlertTracker: ...

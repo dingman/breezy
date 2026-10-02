@@ -126,7 +126,7 @@ async def test_a_clean_parse_resets_the_streak_and_clears_the_condition(
     assert actor._unreadable_field_streak == 0
 
     recorder = ConditionRecorder()
-    actor._alert_state = recorder  # type: ignore[assignment]
+    actor._alert_state = recorder
     await actor.reconcile_and_report()
 
     # `AlertState.evaluate` never fires on a true->false transition (see its

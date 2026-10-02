@@ -99,6 +99,7 @@ __all__ = [
     "alert_egress_configured",
     "emit_alert",
     "log_alert_egress_status",
+    "new_alert_state",
     "resolve_alert_sink",
     "write_snapshot_atomic",
 ]
@@ -599,3 +600,8 @@ class AlertState:
             site=condition.key.site,
             detail=condition.detail,
         )
+
+
+def new_alert_state() -> AlertState:
+    """A fresh, cold-start :class:`AlertState` (the ``HealthIO`` factory seam)."""
+    return AlertState()

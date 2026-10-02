@@ -41,7 +41,7 @@ MOVED_NAMES: Final[tuple[str, ...]] = (
     "AlertCondition",
 )
 
-#: ``__all__`` of ``runtime.health`` before the move (must be unchanged).
+#: ``__all__`` of ``runtime.health``: the pre-move set plus C2's ``new_alert_state``.
 EXPECTED_HEALTH_ALL: Final[frozenset[str]] = frozenset(
     {
         "ALERT_EGRESS_UNCONFIGURED_EVENT",
@@ -65,6 +65,7 @@ EXPECTED_HEALTH_ALL: Final[frozenset[str]] = frozenset(
         "alert_egress_configured",
         "emit_alert",
         "log_alert_egress_status",
+        "new_alert_state",
         "resolve_alert_sink",
         "write_snapshot_atomic",
     }
@@ -96,7 +97,7 @@ GOLDEN_SNAPSHOT_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 ALLOWED_MODEL_IMPORTS: Final[frozenset[str]] = frozenset(
-    {"__future__", "dataclasses", "typing", "collections", "collections.abc"}
+    {"__future__", "dataclasses", "typing", "collections", "collections.abc", "pathlib"}
 )
 
 ALLOWED_BREEZY_MODULES: Final[frozenset[str]] = frozenset(
@@ -109,7 +110,7 @@ def test_runtime_health_reexports_the_identical_object(name: str) -> None:
     assert getattr(health, name) is getattr(health_model, name)
 
 
-def test_runtime_health_all_is_unchanged() -> None:
+def test_runtime_health_all_is_the_pre_move_set_plus_new_alert_state() -> None:
     assert frozenset(health.__all__) == EXPECTED_HEALTH_ALL
 
 

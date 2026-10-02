@@ -87,7 +87,6 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
     assert set(layers["ignore_imports"]) == {
         "breezy.adapters.polymarket_us.config -> breezy.runtime.settings",
         "breezy.adapters.polymarket_us.factories -> breezy.runtime.settings",
-        "breezy.ingest.nws_actor -> breezy.runtime.health",
     }
 
     assert forbidden["type"] == "forbidden"

@@ -203,7 +203,7 @@ async def test_alert_dispatch_only_ever_runs_under_the_in_flight_guard(
             observed.append(actor.poll_in_flight)
             return super().evaluate(conditions, now_ns=now_ns)
 
-    actor._alert_state = Probe()  # type: ignore[assignment]
+    actor._alert_state = Probe()
     actor.network_allowed = lambda: False  # type: ignore[method-assign]
 
     await actor.poll_once()
@@ -237,7 +237,7 @@ async def test_a_swallowed_reconcile_failure_raises_a_critical_ledger_alert(
     sink = RecordingSink()
     actor.alert_sink = sink
     recorder = ConditionRecorder()
-    actor._alert_state = recorder  # type: ignore[assignment]
+    actor._alert_state = recorder
 
     await actor.reconcile_and_report()
 
@@ -290,7 +290,7 @@ async def test_the_ledger_alert_reaches_the_sink_and_clears_on_recovery(
     )
     monkeypatch.setattr(gaps_module, "site_entries", lambda *_a, **_k: ())
     recorder = ConditionRecorder()
-    actor._alert_state = recorder  # type: ignore[assignment]
+    actor._alert_state = recorder
 
     await actor.reconcile_and_report()
 
@@ -388,7 +388,7 @@ async def test_a_stalled_alert_dispatch_surfaces_as_task_death(
         def emit(self, payload: Any) -> None:
             released.wait(30)
 
-    actor._alert_state = StalledTracker()  # type: ignore[assignment]
+    actor._alert_state = StalledTracker()
     actor.alert_sink = StalledSink()
 
     try:
@@ -411,7 +411,7 @@ async def test_an_ordinary_observability_failure_is_still_swallowed(
         def evaluate(self, conditions: Sequence[Any], *, now_ns: int) -> tuple[Any, ...]:
             raise ValueError("sink exploded")
 
-    actor._alert_state = RaisingTracker()  # type: ignore[assignment]
+    actor._alert_state = RaisingTracker()
     actor.network_allowed = lambda: False  # type: ignore[method-assign]
 
     await actor.poll_once()  # must not raise
@@ -595,7 +595,7 @@ async def test_the_alert_state_mutation_runs_on_the_event_loop_thread(
         def emit(self, payload: Any) -> None:
             emitted_on.append(threading.get_ident())
 
-    actor._alert_state = ThreadProbe()  # type: ignore[assignment]
+    actor._alert_state = ThreadProbe()
     actor.alert_sink = ThreadRecordingSink()
 
     await actor.reconcile_and_report()
@@ -637,7 +637,7 @@ async def test_a_sink_failure_after_the_split_still_never_changes_the_count(
         def emit(self, payload: Any) -> None:
             raise ssl.SSLError("certificate verify failed")
 
-    actor._alert_state = Tracker()  # type: ignore[assignment]
+    actor._alert_state = Tracker()
     actor.alert_sink = ExplodingSink()
 
     await actor.reconcile_and_report()  # must not raise

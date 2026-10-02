@@ -54,10 +54,7 @@ from breezy.ingest import gaps
 from breezy.ingest.gaps import GapState, TamperedGapLedgerError
 from breezy.ingest.gate import GateReason, GateState
 from breezy.ingest.nws_actor import NwsIngestActor
-from breezy.runtime.health import (
-    POST_SETTLEMENT_REVISION,
-    AlertPayload,
-)
+from breezy.registry.health_model import POST_SETTLEMENT_REVISION, AlertPayload
 from tests.integration.test_runtime_restart_resume import (
     ThreadRecordingStore,
     process_cycle,

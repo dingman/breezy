@@ -41,6 +41,7 @@ from breezy.ingest.nws_actor import NwsIngestActor
 from breezy.ingest.shared_state import SharedIngestState
 from breezy.persistence.catalog import FilesystemProbe, probe_filesystem
 from breezy.registry.sites import SiteRegistry, default_registry, load_registry
+from breezy.runtime import health as health_module
 from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
 from breezy.runtime.health import (
     AlertSink,
@@ -463,6 +464,9 @@ def build_ingest_actors(runtime: BreezyIngestRuntime) -> tuple[NwsIngestActor, .
         # and the alerts exist in production at all. Left unset, the Actor
         # writes no file and lazily resolves its own private sink.
         actor.alert_sink = runtime.alert_sink
+        # `ingest` may not import `runtime`, so the actor receives the health
+        # I/O module by injection; a live `on_start` refuses an actor without it.
+        actor.health_io = health_module
         if snapshot_dir is not None:
             actor.health_snapshot_path = site_snapshot_path(snapshot_dir, venue, city)
         actors.append(actor)

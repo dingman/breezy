@@ -93,6 +93,7 @@ layers = [
     "runtime",
     "adapters",
     "ingest",
+    # `registry.health_model` hosts the health data types `ingest` needs (layer + import weight).
     "persistence | registry | normalize",
     "features | settlement",
     "domain",
@@ -102,8 +103,6 @@ ignore_imports = [
     # Current inspected debt from the Polymarket.us read-path slice.
     "breezy.adapters.polymarket_us.config -> breezy.runtime.settings",
     "breezy.adapters.polymarket_us.factories -> breezy.runtime.settings",
-    # Current inspected debt from the NWS ingest runtime cycle.
-    "breezy.ingest.nws_actor -> breezy.runtime.health",
 ]
 
 [[tool.importlinter.contracts]]

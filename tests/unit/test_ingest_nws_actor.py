@@ -73,6 +73,7 @@ from breezy.persistence.catalog import (
     read_raw_products,
 )
 from breezy.registry.sites import SiteRegistry, default_registry
+from breezy.runtime import health as health_module
 
 VENUE = "polymarket_us"
 CITY = "NYC"
@@ -272,6 +273,9 @@ def build_actor(shared: SharedIngestState, **config_overrides: Any) -> NwsIngest
     kwargs.update(config_overrides)
     instance = NwsIngestActor(config=NwsIngestActorConfig(**kwargs), shared=shared)
     instance.sleep_between_product_fetches = _no_product_fetch_sleep
+    # `ingest` cannot import `runtime`; composition injects the health I/O.
+    instance.health_io = health_module
+    instance.alert_sink = health_module.LoggingAlertSink()
     instance.register_base(
         portfolio=TestComponentStubs.portfolio(),
         msgbus=TestComponentStubs.msgbus(),

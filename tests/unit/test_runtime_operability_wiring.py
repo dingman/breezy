@@ -467,7 +467,7 @@ async def test_a_slow_alert_sink_does_not_stall_the_event_loop(
         _register(actor)
         tracker = SlowTracker(block_s=0.0)
         slow_sink = SlowSink(block_s=0.5)
-        actor._alert_state = tracker  # type: ignore[assignment]
+        actor._alert_state = tracker
         actor.alert_sink = slow_sink
 
         ticks = 0
@@ -505,7 +505,7 @@ async def test_an_alert_sink_failure_still_never_reaches_the_poll_path(
     try:
         actor = actors[0]
         _register(actor)
-        actor._alert_state = RaisingTracker()  # type: ignore[assignment]
+        actor._alert_state = RaisingTracker()
 
         await actor.reconcile_and_report()  # must not raise
     finally:
@@ -524,7 +524,7 @@ async def test_a_raising_alert_sink_still_never_reaches_the_poll_path(
     try:
         actor = actors[0]
         _register(actor)
-        actor._alert_state = SlowTracker(block_s=0.0)  # type: ignore[assignment]
+        actor._alert_state = SlowTracker(block_s=0.0)
         actor.alert_sink = RaisingSink()
 
         await actor.reconcile_and_report()  # must not raise
