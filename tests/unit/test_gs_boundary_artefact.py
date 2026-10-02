@@ -103,6 +103,7 @@ def artefact() -> BoundaryArtefact:
     return load_boundary_artefact(_ARTEFACT_PATH, expected_sha256=_PINNED_SHA)
 
 
+@pytest.mark.heavy
 def test_registered_boundary_parameters_match_the_ruling_cited_script() -> None:
     """R2.1 parity pin: registered CRH manifests reuse one applicable boundary
     artefact. The script exposes `BRENTQ_XTOL`; the src implementation still

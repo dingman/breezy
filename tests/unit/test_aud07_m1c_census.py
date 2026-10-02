@@ -213,6 +213,7 @@ def _copy_canonical_cal_b(src: Path, dest: Path) -> tuple[Path, Path]:
     return cells, stress
 
 
+@pytest.mark.heavy
 def test_derive_pin_refuses_missing_cells(
     tmp_path: Path, canonical_cal_b_dir: Path,
 ) -> None:
@@ -227,6 +228,7 @@ def test_derive_pin_refuses_missing_cells(
         run_derive_pin(in_dir=in_dir, out_census=tmp_path / "c.json", out_pin=tmp_path / "p.json")
 
 
+@pytest.mark.heavy
 def test_derive_pin_refuses_mixed_code_shas(
     tmp_path: Path, canonical_cal_b_dir: Path,
 ) -> None:
@@ -246,6 +248,7 @@ def test_derive_pin_refuses_mixed_code_shas(
         run_derive_pin(in_dir=in_dir, out_census=tmp_path / "c.json", out_pin=tmp_path / "p.json")
 
 
+@pytest.mark.heavy
 def test_derive_pin_refuses_missing_stress_row(
     tmp_path: Path, canonical_cal_b_dir: Path,
 ) -> None:
