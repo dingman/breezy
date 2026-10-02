@@ -25,6 +25,7 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.nws_raw_product import RAW_PRODUCT_SCHEMA_VERSION, NwsRawProduct, sha256_text
 from breezy.persistence import catalog as catalog_module
+from breezy.persistence import filesystem_probe as filesystem_probe_module
 from breezy.persistence.catalog import (
     WRITER_LOCK_FILENAME,
     CatalogPathError,
@@ -947,7 +948,7 @@ def _write_mountinfo(
 ) -> None:
     fake = tmp_path / "mountinfo"
     fake.write_text(_mountinfo(*entries))
-    monkeypatch.setattr(catalog_module, "_MOUNTINFO_PATH", fake)
+    monkeypatch.setattr(filesystem_probe_module, "_MOUNTINFO_PATH", fake)
 
 
 def test_probe_filesystem_reports_local_for_an_ordinary_temp_dir(tmp_path: Path) -> None:
@@ -1040,7 +1041,7 @@ def test_probe_filesystem_is_undetermined_when_mountinfo_is_unreadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-Linux, or a container without /proc: honest 'unknown', never 'local'."""
-    monkeypatch.setattr(catalog_module, "_MOUNTINFO_PATH", tmp_path / "absent")
+    monkeypatch.setattr(filesystem_probe_module, "_MOUNTINFO_PATH", tmp_path / "absent")
 
     probe = probe_filesystem(tmp_path)
 
@@ -1070,7 +1071,7 @@ def test_probe_filesystem_ignores_malformed_mountinfo_lines(
         "21 1 0:1 / /somewhere rw shared:1 -\n"  # separator present, no fs type after it
         f"21 1 0:1 / {tmp_path.resolve()} rw - ext4 src rw\n"
     )
-    monkeypatch.setattr(catalog_module, "_MOUNTINFO_PATH", fake)
+    monkeypatch.setattr(filesystem_probe_module, "_MOUNTINFO_PATH", fake)
 
     assert probe_filesystem(tmp_path).locality is FilesystemLocality.LOCAL
 
@@ -1135,7 +1136,7 @@ def test_the_filesystem_assertion_is_never_an_implicit_side_effect(
     Import-time (or hot-path) filesystem probing is hostile to tests and tooling,
     so an absent mount table must not disturb ordinary operation.
     """
-    monkeypatch.setattr(catalog_module, "_MOUNTINFO_PATH", tmp_path / "absent")
+    monkeypatch.setattr(filesystem_probe_module, "_MOUNTINFO_PATH", tmp_path / "absent")
 
     catalog = open_station_catalog(tmp_path / "nws", "polymarket_us", "NYC")
 
