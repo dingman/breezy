@@ -40,7 +40,7 @@ from current_rung_hold_paper_replay import (
     read_asos_rows,
     run_one_precision_arm,
 )
-from run_weather_strategy_backtests import (
+from tape_instruments import (  # type: ignore[import-not-found]
     DEFAULT_WEATHER_CATALOG_ROOT,
     WEATHER_VENUE,
     TapeInstrument,
