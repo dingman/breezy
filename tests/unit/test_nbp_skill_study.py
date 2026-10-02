@@ -48,6 +48,7 @@ from breezy.strategy.ladder_ev.quantile_density import (  # noqa: E402
 from breezy.strategy.weather_common.probability import ForecastErrorModel  # noqa: E402
 
 
+@pytest.mark.heavy
 def test_default_stage_is_validate_and_never_needs_authorization() -> None:
     assert nbp_skill_study.main([]) == 0
 

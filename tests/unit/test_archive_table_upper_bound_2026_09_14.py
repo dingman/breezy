@@ -234,6 +234,7 @@ def test_p_hold_upper_is_derived_from_the_same_raw_wilson_float_as_the_lower_bou
     assert expected_upper >= expected_lower
 
 
+@pytest.mark.heavy
 def test_regenerating_the_frozen_table_upper_bound_is_byte_identical_modulo_timestamp(
     generator: ModuleType,
 ) -> None:

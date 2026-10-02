@@ -52,7 +52,7 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 from breezy.persistence.feather_read import COALESCE_ROWS, read_feather_coalesced
 
-pytestmark = pytest.mark.memory
+pytestmark = [pytest.mark.memory, pytest.mark.heavy]
 
 _IID = InstrumentId.from_str("EUR/USD.SIM")
 

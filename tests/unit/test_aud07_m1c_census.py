@@ -102,6 +102,7 @@ def test_derive_eps_pin_dt_min_only_ever_lowered_by_the_stress_set(tmp_path: Pat
 _TINY_REPS = 1
 
 
+@pytest.mark.heavy
 def test_chunked_census_plus_derive_pin_equals_the_all_in_one_result(tmp_path: Path) -> None:
     """Chunked (one `run_census_chunk` call per cell, many files) must
     produce the SAME derived eps_pin/census as all-in-one (one wide

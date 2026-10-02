@@ -77,6 +77,7 @@ def _strip_timestamp(source: str) -> str:
     return _TIMESTAMP_LINE_RE.sub("Generated at (UTC): <stripped>", source)
 
 
+@pytest.mark.heavy
 def test_regenerating_the_frozen_table_is_byte_identical_modulo_timestamp(
     generator: ModuleType,
 ) -> None:
