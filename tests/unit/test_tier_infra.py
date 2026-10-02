@@ -20,6 +20,15 @@ _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 _EXCL = "not live and not venue_live and not real_money"
 _NODEID = re.compile(r"^tests/.+\.py::")
 
+#: Six concurrent full-suite collections get the host killed. Two workers
+#: is the cap (the six buckets then run in three waves).
+_COLLECT_MAX_WORKERS = 2
+
+#: Floors sit under the measured collection (14,9xx node ids). Without them
+#: an empty ``--collect-only`` parse is a vacuous partition and the check passes.
+_MIN_COLLECTED_TOTAL = 10_000
+_MIN_T1_BUCKET = 5_000
+
 #: Files whose tests carry ``pytest.mark.heavy`` (R0.9). A file not listed
 #: here must not carry the mark. Membership is by file, not by individual test.
 HEAVY_ALLOWLIST: tuple[str, ...] = (
@@ -225,8 +234,12 @@ def test_tier_buckets_partition_the_collected_suite() -> None:
         name, args = item
         return name, _collect(args, base / name)
 
-    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+    with ThreadPoolExecutor(max_workers=_COLLECT_MAX_WORKERS) as pool:
         collected = dict(pool.map(_one, specs.items()))
+    # Empty sets partition each other. Refuse that before the partition report.
+    assert collected["total"]
+    assert len(collected["total"]) >= _MIN_COLLECTED_TOTAL, len(collected["total"])
+    assert len(collected["T1"]) >= _MIN_T1_BUCKET, len(collected["T1"])
     heavy_outside = {
         node_id for node_id in collected["heavy"] if not node_id.startswith("tests/integration/")
     }
