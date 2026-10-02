@@ -177,9 +177,9 @@ _EXCLUDED_FILLS_ARTEFACT_NAME = "excluded_fills.jsonl"
 #: both `scored_trials` and `excluded_fills.jsonl`.
 _UNRESOLVED_TAKES_ARTEFACT_NAME = "unresolved_takes.jsonl"
 
-#: The one non-refusal `TrialDayRecord.reason` value (mirrors
-#: `fill_time_count.py`'s own `_TAKEN_REASON`).
-_TAKEN_REASON = "taken"
+# The one non-refusal `TrialDayRecord.reason` value. Single source shared
+# with `prereg_admission` (R2.2 review M2); never redefine it locally.
+from breezy.analysis.fill_time_count import _TAKEN_REASON
 
 #: Duplicated literal (never imported, C10): identical to
 #: `breezy.runtime.submit_intent.CURRENT_INTENT_KEY`. This module reads the

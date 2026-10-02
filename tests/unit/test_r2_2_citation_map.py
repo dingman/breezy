@@ -52,3 +52,16 @@ def test_r2_2_citation_map_symbols_resolve() -> None:
         assert sep and line_text.isdigit(), f"bad location {new_location} ({cite})"
         source_line = (REPO_ROOT / rel).read_text().splitlines()[int(line_text) - 1]
         assert symbol in source_line, f"{new_location} does not name {symbol} ({cite})"
+
+
+def test_taken_reason_has_single_source_across_admission_split() -> None:
+    """The scorer script and prereg_admission share ONE `_TAKEN_REASON` object."""
+    if str(_ANALYSIS_SCRIPTS) not in sys.path:
+        sys.path.insert(0, _ANALYSIS_SCRIPTS.as_posix())
+    fill_time_count = importlib.import_module("breezy.analysis.fill_time_count")
+    prereg_admission = importlib.import_module("breezy.analysis.prereg_admission")
+    score_live_trials = importlib.import_module("score_live_trials")
+    assert score_live_trials._TAKEN_REASON is fill_time_count._TAKEN_REASON
+    assert prereg_admission._TAKEN_REASON is fill_time_count._TAKEN_REASON
+    source = (_ANALYSIS_SCRIPTS / "score_live_trials.py").read_text()
+    assert "\n_TAKEN_REASON =" not in source
