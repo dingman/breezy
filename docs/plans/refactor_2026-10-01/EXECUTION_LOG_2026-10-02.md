@@ -46,5 +46,41 @@ Baseline was 25m03s (S6). The plan projected ~17.3 min after R0.8.
 ## Findings surfaced (not fixed; tracked in PROGRESS)
 - `python -m importlinter.cli lint-imports` is a **no-op**. Some implementers' "lint green" claims used it. The coordinator re-ran the real console script: 7 kept, 0 broken.
 - `test_mypy_ratchet.py` failed under `FORCE_COLOR=1`. Fixed in `8f6575c5`, which runs mypy with colour disabled.
-- `ContinuousRungHoldStrategy subscribed` in the supervisor's `COMPOSITION_KIND_SUBSCRIBED_MARKERS` is emitted by no source (the subclass inherits the parent's line). It looks like a dead marker. Not pinned or changed (R3.2/R3.4 scope).
+- ~~SUB-MARKER-DEAD~~: struck on day 2 (the claim was wrong; see below).
 - `scripts/analysis/tape_instruments.py` relies on the scripts-dir `sys.path` convention, so it is on `STAGE0_EXCLUDED_ENTRY_MODULES`. Its runtime import is covered through the runner.
+
+## Day 2 (2026-10-02, 14:00–17:00Z): open items worked
+
+Merged to live, in order, each with a pre-merge full gate on the exact tip and a fast-forward-only merge:
+
+| Live tip | What | Gate |
+|---|---|---|
+| `e0c89f23` | **Family-tally FQ skip.** Pre-existing defect: since b58bb4c8, score-live-trials skips for a `forecast_quantile_ladder` sender, so the v2/v4 tallies failed daily at 17:20Z with OnFailure alerts. The wrapper now skips by design (red shown) | 14,982 passed |
+| `d6914fca` | **R1.5b**, the redesigned R1.5. Pure types move to `registry/health_model.py`. All egress stays in `runtime.health`. The actor gets the health module injected as a `HealthIO` Protocol, with a fail-closed boot guard (`health_io`, `alert_sink`). The debt row is paid. Zero safety-scan edits. Planner: code-architect. Reviews: architect and security, both APPROVE-WITH-CHANGES, changes applied | 15,015 passed |
+| `d26ef211` | **BC-5** (`features/` removed); **BC-3 C2** (`strike_ladder` re-hosted as `tests/support/multi_strike_ladder_strategy.py`); **BC-4** (NBS chain + `archive_records` removed; `archived_selection` kept as PARKED; WP12 egress scan re-homed; IEM host is now a pure ban) | 14,939 passed |
+| `a15fefd2` | **BC-3 C3a/C3b/C4**: runner deleted, lib trimmed, 5 shells + `forecast_edge` + `resting_ladder` + 3 `weather_common` modules removed. **T1 speedups**: heavy re-marks, waits removed, `run_tier.sh --lanes N` with an exact-partition proof | 14,443 passed, 17m03s |
+
+**BC plan.** Planner, then trading-bot-architect review (APPROVE-WITH-CHANGES, B1 and M1–M6 applied). Citation anchor: tag `bc3-pre-removal-2026-10-02` → 763527b6 (pushed).
+
+**C3a timer proof (B1).** It is satisfied by construction:
+- the consumer scripts are byte-unchanged;
+- `tape_instruments` changed only in its docstring;
+- every surviving lib definition is AST-identical;
+- no code references a removed name;
+- all 5 consumers import cleanly.
+
+A census rerun was judged redundant. Replay-daily and score-live-trials skip by design while FQ sends.
+
+**Stale bytecode in the primary tree.** After the merges, five orphan strategy directories (importable namespace packages) and the removed modules' `.pyc` files were deleted (review M6).
+
+**T1:** 12m16s → **9m34s serial / 6m32s with 3 lanes** (target ≤ 10 min met).
+
+**Struck.** SUB-MARKER-DEAD was wrong. `ContinuousRungHoldStrategy` is not a subclass and emits its own marker (`continuous_strategy.py:875`), which is seen in the 09-20 node log. The only unemitted row, `forecast_ladder`, is intentionally pre-wired.
+
+**Dropped by plan clause.** Appendix A (R1.2) was dropped when BC-4 removed `nbm_forecast_actor`.
+
+**Deferred.** The nws-ingest restart that loads R1.5b waits until after FQ d0. The restart would deploy 37 files of changes made since 09-28.
+
+**Tooling traps recorded.**
+- `python -m importlinter.cli` is a no-op.
+- `lint-imports` reads `pyproject.toml` from the current directory.
