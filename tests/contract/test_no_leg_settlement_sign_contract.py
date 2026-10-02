@@ -24,6 +24,8 @@ from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, leg_of
 from breezy.settlement.exit_guard import settlement_price_for_leg
 
+pytestmark = pytest.mark.contract
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW = REPO_ROOT / "docs" / "evidence" / "venue" / "polymarket_us" / "raw"
 TS_INIT = 1_787_617_213_000_000_000

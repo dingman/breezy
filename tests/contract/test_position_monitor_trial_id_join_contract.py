@@ -57,6 +57,8 @@ from tests.unit.test_current_rung_hold_strategy import (
     _instrument,
 )
 
+pytestmark = pytest.mark.contract
+
 _MINUTE_NS = 60_000_000_000
 
 

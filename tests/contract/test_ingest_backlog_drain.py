@@ -79,6 +79,8 @@ from tests.unit.test_ingest_nws_actor import (
     discovery_payload,
 )
 
+pytestmark = pytest.mark.contract
+
 # ---------------------------------------------------------------------------
 # Synthetic backlog products
 # ---------------------------------------------------------------------------

@@ -23,6 +23,8 @@ from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import open_trial_day_latch
 
+pytestmark = pytest.mark.contract
+
 _REPO_SRC = Path(__file__).resolve().parents[2] / "src"
 
 

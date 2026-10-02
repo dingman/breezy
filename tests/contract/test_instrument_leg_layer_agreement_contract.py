@@ -29,6 +29,8 @@ from breezy.domain.instrument_leg import (
     symbol_of_instrument_id,
 )
 
+pytestmark = pytest.mark.contract
+
 _SLUGS = (
     "tc-temp-nychigh-2026-08-25-lt79f",
     "instrument-0",  # legacy bare id used throughout the existing test suite

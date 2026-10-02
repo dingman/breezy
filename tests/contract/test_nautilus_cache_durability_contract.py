@@ -60,6 +60,8 @@ from nautilus_trader.common.config import DatabaseConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.system.kernel import NautilusKernel
 
+pytestmark = pytest.mark.contract
+
 PINNED_NAUTILUS_VERSION = "1.231.0"
 
 # The exact config Breezy deploys (`breezy.runtime.node_config`). Restated

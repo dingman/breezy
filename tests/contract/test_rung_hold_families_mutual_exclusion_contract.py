@@ -43,6 +43,8 @@ from breezy.runtime.settings import (
 )
 from breezy.strategy.current_rung_hold.composition import phase1_sending_permit
 
+pytestmark = pytest.mark.contract
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FAMILIES_DIR = _REPO_ROOT / "deploy" / "families"
 

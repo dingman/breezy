@@ -15,6 +15,8 @@ from types import ModuleType
 import pyarrow.parquet as pq
 import pytest
 
+pytestmark = pytest.mark.contract
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WHOLE_TAPE = _REPO_ROOT / "scripts" / "analysis" / "whole_tape_paper_replay.py"
 

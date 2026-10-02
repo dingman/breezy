@@ -52,6 +52,8 @@ import pytest
 
 from breezy.strategy.weather_common.forecast_source import ForecastSource
 
+pytestmark = pytest.mark.contract
+
 STATION = "NYC"
 DEADLINE = dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC)
 PUBLISHED_AT = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.UTC)

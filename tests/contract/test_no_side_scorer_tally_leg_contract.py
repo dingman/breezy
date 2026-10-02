@@ -20,6 +20,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.persistence.scored_trial_store import (
@@ -28,6 +30,8 @@ from breezy.persistence.scored_trial_store import (
     write_scored_trials,
 )
 from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial, score_trial
+
+pytestmark = pytest.mark.contract
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
