@@ -7,8 +7,9 @@ test subclass overrides of the ``_emit_*`` seams) is unaffected.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any, Final
+from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 from nautilus_trader.model.identifiers import InstrumentId
 
@@ -35,11 +36,61 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 from breezy.strategy.weather_common.running_extreme import RunningMax
 
-#: ``self`` is annotated ``Any`` on the mixin methods: they run only on
-#: ``ContinuousRungHoldStrategy`` (the sole subclass), whose attributes they
-#: use, and a precise annotation would need an import cycle plus a mypy-
-#: illegal self-type. Method bodies are otherwise unchanged by the R3.4 move.
-_Host = Any
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nautilus_trader.common.component import Logger
+
+    from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+    from breezy.strategy.current_rung_hold.offer_tape import OfferTape
+    from breezy.strategy.current_rung_hold.resting_decider import ShadowRestTickResult
+    from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
+
+
+class _NoSideHost(Protocol):
+    """The exact host surface the mixin's methods use (R3.4 follow-up).
+
+    ``ContinuousRungHoldStrategy`` is the sole host. The mixin methods annotate
+    ``self: _NoSideHost`` so mypy checks every ``self.`` access against the
+    host's real types. Typing-only: nothing here exists on the host at runtime.
+    Under ``from __future__ import annotations`` the annotation is never
+    evaluated, so no import of the strategy module (a cycle) is needed.
+    """
+
+    log: Logger
+    offer_tape: OfferTape
+    no_takes: int
+    last_no_take_shadow: str | None
+    last_no_refuse: str | None
+    _latch: TrialDayLatch | None
+    _no_refuse_notice: set[tuple[str, str, str]]
+    _no_shadow_notice: dict[tuple[str, str, str], int]
+    _decision_ask_by_station_day: dict[tuple[str, str], Decimal]
+
+    def _evaluate_shadow_rest(
+        self,
+        *,
+        station: str,
+        climate_day_key: str,
+        leg: Literal["YES", "NO"],
+        best_ask: Decimal | None,
+        p_bound: Decimal | None,
+        staleness_ns: int | None,
+        cell_legal: bool,
+        sibling_leg_filled: bool,
+        fee_schedule_mismatch: bool = False,
+    ) -> ShadowRestTickResult: ...
+
+    def _station_day_existing_legs(
+        self, station_day: tuple[str, str]
+    ) -> tuple[tuple[str, ...], Mapping[str, DurableFillRecord]]: ...
+
+    def _record_rearm_decision(self, summary: str) -> None: ...
+    def _maybe_submit(self, instrument_id: str, decision: Take) -> None: ...
+    def _submission_armed(self) -> bool: ...
+    def _record_no_take_shadow(self, summary: str) -> None: ...
+    def _emit_no_take_shadow(self, summary: str) -> None: ...
+    def _record_no_refuse(self, summary: str) -> None: ...
+    def _emit_no_refuse(self, summary: str) -> None: ...
+
 
 #: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
 #: and gated every tick. FLIPPED to `False` by this commit (S5 Track C,
@@ -80,7 +131,7 @@ class NoSideShadowMixin:
     last_no_refuse: str | None
 
     def _evaluate_no_side_shadow(
-        self: _Host,
+        self: _NoSideHost,
         *,
         station: str,
         climate_day_key: str,
@@ -407,7 +458,7 @@ class NoSideShadowMixin:
         if not self._submission_armed():
             self._latch.clear_inflight(station, climate_day_key, key_instrument_id=no_iid)
 
-    def _record_no_take_shadow(self: _Host, summary: str) -> None:
+    def _record_no_take_shadow(self: _NoSideHost, summary: str) -> None:
         """Mirrors `_record_rearm_decision` -- stores the ONE summary line
         on `self.last_no_take_shadow` (asserted by presence, L-27) and
         emits it via the overridable seam below. Stable grep token
@@ -416,15 +467,15 @@ class NoSideShadowMixin:
         self.last_no_take_shadow = summary
         self._emit_no_take_shadow(summary)
 
-    def _emit_no_take_shadow(self: _Host, summary: str) -> None:
+    def _emit_no_take_shadow(self: _NoSideHost, summary: str) -> None:
         self.log.info(summary)
 
-    def _record_no_refuse(self: _Host, summary: str) -> None:
+    def _record_no_refuse(self: _NoSideHost, summary: str) -> None:
         """Mirrors `_record_no_take_shadow` above for the refusal line,
         stable grep token `no_refuse:`.
         """
         self.last_no_refuse = summary
         self._emit_no_refuse(summary)
 
-    def _emit_no_refuse(self: _Host, summary: str) -> None:
+    def _emit_no_refuse(self: _NoSideHost, summary: str) -> None:
         self.log.info(summary)
