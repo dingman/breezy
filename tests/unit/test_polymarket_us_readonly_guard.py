@@ -2325,6 +2325,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # to key its own day-budget-exhausted read; no money accessor, no
         # operator value.
         "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
+        # R3.4 (pure move, no new reader): the NO-side shadow evaluator that
+        # holds the day-budget-exhausted read moved out of
+        # `continuous_strategy.py` into this sibling; same `utc_day_for_ns`
+        # import, no money accessor, no operator value.
+        "src/breezy/strategy/current_rung_hold/continuous_no_side.py",
         # WIDENED (AUD-04, 2026-09-21), not relaxed (L-6/L-12): the comparison
         # is still `==`; old -> new added exactly this one path. The offline
         # portfolio ROI report imports ONE pure symbol,

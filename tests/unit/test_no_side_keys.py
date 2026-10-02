@@ -56,7 +56,10 @@ _FIRST_ORDER_ALLOWED_FUNCTIONS = frozenset({"_submit_order", "_reconcile_no_side
 #: strategy is a THIRD legitimate writer of the first-order key, at arm
 #: time (`_evaluate_no_side_shadow`), additive to the two client sites
 #: above -- never a relaxation, every other module/function stays refused.
-_STRATEGY_MODULE_PATH = "src/breezy/strategy/current_rung_hold/continuous_strategy.py"
+#: R3.4: the evaluator moved (unchanged) from `continuous_strategy.py` to
+#: `continuous_no_side.py`; `continuous_strategy.py` no longer writes the key
+#: and is therefore no longer allowed to.
+_STRATEGY_MODULE_PATH = "src/breezy/strategy/current_rung_hold/continuous_no_side.py"
 _STRATEGY_ALLOWED_FUNCTIONS = frozenset({"_evaluate_no_side_shadow"})
 
 _KEY_VALUES: Mapping[str, str] = {

@@ -33,7 +33,7 @@ from breezy.adapters.polymarket_us.exec.no_side_keys import (
     NO_SIDE_POSITION_SHAPE_CAPTURED_KEY,
 )
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
-from breezy.strategy.current_rung_hold import continuous_strategy as cs
+from breezy.strategy.current_rung_hold import continuous_no_side as cs_no_side
 from breezy.strategy.current_rung_hold.decision import Take
 from tests.unit.test_continuous_rung_hold_fill_wiring import _fill
 from tests.unit.test_continuous_rung_hold_no_side_shadow_2026_09_14 import _NO_ASK_CLEARS_BID
@@ -89,7 +89,7 @@ def test_flag_true_keeps_shadow_behaviour_byte_identical(
     """With the flag forced ``True`` (S5 flip: the default is now
     ``False`` -- this proves the S3b shadow-only code path is still fully
     reachable and byte-identical, never removed by the flip)."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", True)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", True)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -110,7 +110,7 @@ def test_a_no_take_arms_consumes_and_submits_on_the_no_instrument(
     no_interior_instrument: BinaryOption,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -150,7 +150,7 @@ def test_a_no_order_prices_itself_at_the_no_ask(
 ) -> None:
     """E2-4: the submitted order's price is the NO decision's price
     (``1 - YES_bid``), never the YES ask."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -186,7 +186,7 @@ def test_a_second_no_take_is_refused_while_the_first_order_is_pending(
     `no_refuse:` line), even after a simulated relaunch that only reads
     the durable key back (a fresh ``TrialDayLatch`` open over the same
     store)."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -308,7 +308,7 @@ def test_a_two_call_synchronous_burst_leaves_exactly_one_no_take_submitted(
     FIRST writes `NO_SIDE_FIRST_LIVE_ORDER_KEY` and submits; the SECOND
     (a different rung/day, so it clears every earlier gate on its own
     merits) observes `pending=True` and WAITs silently."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -361,7 +361,7 @@ def test_a_refused_submit_still_leaves_the_key_set_and_no_order(
     submission permit at all -- `_submission_armed()` False) leaves the
     key SET and does not submit -- "pending with no order" fails closed,
     it is never cleared by this method."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -393,7 +393,7 @@ def test_the_key_persists_across_a_simulated_relaunch_and_blocks_further_arming(
 ) -> None:
     """(c) A fresh `TrialDayLatch`/strategy opened over the SAME store
     (a simulated relaunch) reads the durable key back and stays blocked."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     first = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),
@@ -451,7 +451,7 @@ def test_the_yes_path_is_untouched_by_the_strategy_side_key_write(
     reaches `Take`) still arms/submits normally with the flag `False` and
     the strategy-side key write present in the module -- the YES arm
     block (:1020-1041) is byte-unchanged by this commit."""
-    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", False)
+    monkeypatch.setattr(cs_no_side, "NO_SIDE_SHADOW_ONLY", False)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),

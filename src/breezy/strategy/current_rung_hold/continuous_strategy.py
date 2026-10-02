@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack
-from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -35,11 +34,6 @@ from breezy.adapters.polymarket_us.errors import (
 )
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
-from breezy.adapters.polymarket_us.exec.no_side_keys import (
-    NO_SIDE_FIRST_LIVE_ORDER_KEY,
-    first_live_order_payload,
-    is_no_side_pending,
-)
 from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.adapters.polymarket_us.symbology import (
@@ -61,6 +55,27 @@ from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.strategy.current_rung_hold import exit_wiring
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.continuous_helpers import (
+    _NS_PER_HOUR,
+    _NS_PER_MINUTE,
+    _NS_PER_SECOND,
+    _ONE,
+    Source,
+    Trigger,
+    _AskSnapshot,
+    _EligibleSetup,
+    _per_contract_reconciled_fee,
+    _snapshot_from_quote,
+    _startup_evidence_summary,
+)
+from breezy.strategy.current_rung_hold.continuous_no_side import (
+    _NO_REFUSE_DAY_BUDGET_EXHAUSTED,
+    _NO_REFUSE_INTENT_OPEN,
+    _NO_REFUSE_TRIAL_DAY_CONSUMED,
+    NO_SIDE_SHADOW_ONLY,
+    NO_SIDE_SHADOW_REFUSAL_REASONS,
+    NoSideShadowMixin,
+)
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take, no_leg_executable
 from breezy.strategy.current_rung_hold.diagnostics_summary import (
     DiagnosticsSummarySink,
@@ -102,7 +117,6 @@ from breezy.strategy.current_rung_hold.tick_eval import (
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     SIBLING_LEG_TRADED_REASON,
-    STATION_DAY_ADMISSION_REASON,
     TAKEN_FROM_FILL_WALK_REASON,
     Refusal,
     TrialDayLatch,
@@ -132,21 +146,26 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "NO_SIDE_SHADOW_ONLY",
     "NO_SIDE_SHADOW_REFUSAL_REASONS",
+    # R3.4: names moved to ``continuous_helpers`` / ``continuous_no_side``,
+    # re-exported here so every pre-move import and monkeypatch path resolves.
+    "_NO_REFUSE_DAY_BUDGET_EXHAUSTED",
+    "_NO_REFUSE_INTENT_OPEN",
+    "_NO_REFUSE_TRIAL_DAY_CONSUMED",
+    "_NS_PER_HOUR",
+    "_NS_PER_MINUTE",
+    "_NS_PER_SECOND",
+    "_ONE",
     "ContinuousRungHoldStrategy",
     "Phase0PermitForbiddenError",
+    "Source",
+    "Trigger",
+    "_AskSnapshot",
+    "_EligibleSetup",
+    "_per_contract_reconciled_fee",
+    "_snapshot_from_quote",
+    "_startup_evidence_summary",
 ]
 
-_NS_PER_MINUTE: Final[int] = 60_000_000_000
-#: GAP fix 2026-09-15: for the `take:` log line's `staleness_s=` field only.
-_NS_PER_SECOND: Final[int] = 1_000_000_000
-#: F-4 (STALL_FOLLOWUPS_F1_F4_2026-09-24.md): the `open_intent_wait:` log
-#: line's own re-log cadence while the SAME intent_id persists.
-_NS_PER_HOUR: Final[int] = 60 * _NS_PER_MINUTE
-#: GAP fix 2026-09-15: `NO_ask = 1 - bid`, for the NO-side offer-tape row's
-#: `ask` field ONLY when `no_decision` is a `Refuse` that never reached a
-#: `Take.limit_price` -- mirrors `decision.py`'s own inversion exactly,
-#: recomputed here purely for logging (never for a decision).
-_ONE: Final[Decimal] = Decimal(1)
 #: F-1a hardening (silent-failure-hunter finding, 2026-09-25): the
 #: diagnostic reason `_hunt_no_only`'s containment handler records on every
 #: exception it catches -- a NEW key (not a `REFUSAL_REASONS` member; there
@@ -166,34 +185,6 @@ _SHADOW_REST_DECIDER_ERROR_RESULT: Final[ShadowRestTickResult] = ShadowRestTickR
     price_secondary=None,
     reason="decider_error",
     fill_event=False,
-)
-#: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
-#: and gated every tick. FLIPPED to `False` by this commit (S5 Track C,
-#: the tail commit of `NO_SIDE_S5_EXEC_2026-09-14.md` §5) -- exit criteria
-#: (a)-(d) are MET (preview+book capture, the X3 ruling sign-off at
-#: 8c954ef, the S6b citation, and the first-order-protocol keys/CLI/RED
-#: tests landing before this flip; PREREG amendment §8). Criterion (e),
-#: the position-shape ruling, stays OPEN by design and is contained by
-#: the bounded first-order protocol (`NO_SIDE_FIRST_ORDER_PENDING_REASON`)
-#: until the first NO fill's venue position payload is captured and
-#: ruled on.
-NO_SIDE_SHADOW_ONLY: Final[bool] = False
-#: Closed-set reasons for a `no_refuse:` shadow-gate log line (S3b, S4).
-#: Deliberately disjoint from `decision.REFUSAL_REASONS` -- these are the
-#: LATCH-layer gates run only after the NO leg's own `Take` already cleared
-#: `evaluate_decision`, never a decision-layer refusal (those are silent,
-#: matching the YES path's existing behaviour).
-_NO_REFUSE_INTENT_OPEN: Final[str] = "intent_open"
-_NO_REFUSE_DAY_BUDGET_EXHAUSTED: Final[str] = "day_budget_exhausted"
-_NO_REFUSE_TRIAL_DAY_CONSUMED: Final[str] = "trial_day_consumed"
-NO_SIDE_SHADOW_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
-    {
-        _NO_REFUSE_INTENT_OPEN,
-        SIBLING_LEG_TRADED_REASON,
-        STATION_DAY_ADMISSION_REASON,
-        _NO_REFUSE_DAY_BUDGET_EXHAUSTED,
-        _NO_REFUSE_TRIAL_DAY_CONSUMED,
-    }
 )
 #: Resolution B (plan rev 6.1): the account-wide OPEN-intent WAIT diagnostic.
 #: Not a refusal -- reported through `diagnostics`/`diagnostics_alerter`
@@ -283,127 +274,6 @@ _STARTUP_EVIDENCE_MAX_AGE_NS: Final[int] = _STARTUP_EVIDENCE_MAX_AGE_SECS * 1_00
 _REARM_EVIDENCE_MAX_AGE_SECS: Final[int] = 180
 _REARM_EVIDENCE_MAX_AGE_NS: Final[int] = _REARM_EVIDENCE_MAX_AGE_SECS * 1_000_000_000
 
-Trigger = Literal["quote_tick", "on_data", "depth"]
-Source = Literal["quote", "depth"]
-
-
-@dataclass(frozen=True, slots=True)
-class _AskSnapshot:
-    """The minimal ask-side view `_hunt_tick` needs, from either a `QuoteTick`
-    or a `OrderBookDepth10` ask level (Phase 0b). `tick_eval.py` stays typed
-    on primitives only -- this is the one construction seam that lets
-    `_hunt_tick` treat the two sources identically.
-    """
-
-    instrument_id: InstrumentId
-    #: F-1b (plan STALL_FOLLOWUPS_F1_F4_2026-09-24.md, Rev 3.1): optional --
-    #: `None` when a Depth10 frame carries a real bid but no real ask (the
-    #: cheapest NO population, `on_order_book_depth`). `size` is `0` in that
-    #: case. `_snapshot_from_quote` always sets a real `ask` (a `QuoteTick`
-    #: cannot exist without both sides), so the QuoteTick path is unaffected.
-    ask: Decimal | None
-    size: int
-    ts_event: int
-    source: Source
-    #: S3b (plan NO_SIDE_EDGE_2026-09-14 S3): the YES bid side of the SAME
-    #: frame, additive -- every existing construction site gains these two
-    #: fields below; a caller that omits them (there are none left in this
-    #: module) would get `None`, which `evaluate_both_sides` already treats
-    #: as a missing bid (NO refuses `not_executable`).
-    bid: Decimal | None = None
-    bid_size: Decimal | None = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _EligibleSetup:
-    """The three per-tick facts the YES path and the NO-only hunt (F-1a)
-    both need, derived identically from the same snapshot -- extracted (A1,
-    plan ``STALL_FOLLOWUPS_F1_F4_2026-09-24.md``) so `_hunt_no_only` can
-    share them with `_hunt_tick`'s YES path without duplicating the calls.
-    """
-
-    width_code: int
-    m_code: int
-    fee_coefficient: Decimal | None
-    staleness_ns: int | None
-
-
-def _snapshot_from_quote(tick: QuoteTick) -> _AskSnapshot:
-    return _AskSnapshot(
-        instrument_id=tick.instrument_id,
-        ask=tick.ask_price.as_decimal(),
-        size=int(tick.ask_size),
-        ts_event=tick.ts_event,
-        source="quote",
-        bid=tick.bid_price.as_decimal(),
-        bid_size=tick.bid_size.as_decimal(),
-    )
-
-
-def _startup_evidence_summary(
-    evidence: dict[str, object] | None,
-    *,
-    now_ns: int,
-    decisions: Mapping[str, str],
-) -> str:
-    """AC-13/N2 (R-8, 2026-09-12): a pure, unit-tested renderer for the
-    never-arm walk's ONE INFO summary line, emitted on ALL FIVE
-    `_run_never_arm_walk` return paths (L-30: observability by presence of
-    a line, never by the absence of a halt error). Accepts ``evidence is
-    None`` (the evidence-missing return path). ``decisions`` maps each
-    candidate instrument id already evaluated (in this call) to one of
-    ``"present-flat" | "absent-flat" | "LONG" | "UNKNOWN"``; it may be
-    empty when the walk halted before any per-slug decision was made
-    (family halt, evidence-missing, fill-walk-unreadable).
-    """
-    if evidence is None:
-        return (
-            f"continuous_rung_hold startup_evidence: evidence=absent decisions={dict(decisions)!r}"
-        )
-    eof_complete = evidence.get("eof_complete")
-    position_read_refused = evidence.get("position_read_refused")
-    fill_walk_complete = evidence.get("fill_walk_complete")
-    positions = evidence.get("positions")
-    page_slug_count = len(positions) if isinstance(positions, list) else None
-    ts = evidence.get("ts_ns")
-    age_secs: float | None = None
-    if isinstance(ts, int) and not isinstance(ts, bool):
-        age_secs = (now_ns - ts) / 1_000_000_000
-    return (
-        "continuous_rung_hold startup_evidence: "
-        f"eof_complete={eof_complete!r} "
-        f"position_read_refused={position_read_refused!r} "
-        f"fill_walk_complete={fill_walk_complete!r} "
-        f"page_slug_count={page_slug_count!r} "
-        f"age_secs={age_secs!r} "
-        f"decisions={dict(decisions)!r}"
-    )
-
-
-def _per_contract_reconciled_fee(record: DurableFillRecord) -> Decimal | None:
-    """The per-contract fee a `DurableFillRecord` supports, when known.
-
-    ONE shared derivation for both `TrialDayRecord.fee` call sites (companion
-    ruling to option B, domain review of a9fd0fb): `ContinuousRungHoldStrategy
-    ._recorded_fee_for` (create-path fill, `_consume_or_flag_duplicate`) and
-    `_consume_trial_from_fill_record` (the boot never-arm walk's fill-record
-    join). The boot walk re-adopts open positions through this join on every
-    16:50Z reboot, so a fee derivation that only ran on the create path would
-    re-impose the unknown-fee refusal on any later rung of that station-day
-    after every restart -- this function makes both sites agree byte-for-byte.
-
-    `None` unless `record` is `fee_reconciled` and carries a positive
-    `cumulative_qty` -- an unreconciled or zero-qty record leaves `q`
-    UNKNOWN, and `station_day_admission` must keep refusing rather than
-    guess (never relaxed by this helper). Deliberately NEVER
-    `event.commission`: the resolver path emits a synthetic `Money(0)`
-    there, indistinguishable from a genuine zero fee (PREREG v3
-    fee-unreconciled-residual ruling).
-    """
-    if not record.fee_reconciled or record.cumulative_qty <= 0:
-        return None
-    return record.cumulative_fee / record.cumulative_qty
-
 
 class Phase0PermitForbiddenError(RuntimeError):
     """A non-None `order_submission_permit` was given in Phase 0.
@@ -415,7 +285,7 @@ class Phase0PermitForbiddenError(RuntimeError):
     """
 
 
-class ContinuousRungHoldStrategy(Strategy):
+class ContinuousRungHoldStrategy(NoSideShadowMixin, Strategy):
     """Hunt every eligible in-window snapshot; Phase 0 never submits."""
 
     def __init__(
@@ -2439,356 +2309,6 @@ class ContinuousRungHoldStrategy(Strategy):
         self._maybe_submit(iid, decision)
         if not self._submission_armed():
             self._latch.clear_inflight(station, climate_day_key, key_instrument_id=iid)
-
-    def _evaluate_no_side_shadow(
-        self,
-        *,
-        station: str,
-        climate_day_key: str,
-        station_day: tuple[str, str],
-        yes_instrument_id: InstrumentId,
-        no_decision: Decision,
-        now_ns: int,
-        bid_size: Decimal | None,
-        bid: Decimal | None = None,
-        hour_lst: int = 0,
-        width_code: int = 0,
-        m_code: int = 0,
-        fee_coefficient: Decimal | None = None,
-        staleness_ns: int | None = None,
-        running_max: RunningMax | None = None,
-    ) -> None:
-        """S3b (plan NO_SIDE_EDGE_2026-09-14 S3/S4): the NO leg's Take,
-        gated but NEVER armed, consumed, or submitted (`NO_SIDE_SHADOW_ONLY`).
-
-        GAP fix 2026-09-15 (offer-tape postmortem observability): the eight
-        keyword-only parameters from ``bid`` onward are ADDITIVE, each
-        defaulted so the two direct unit-test call sites
-        (``tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py``)
-        keep working unedited -- they carry no decision-affecting weight,
-        only the offer-tape row's own postmortem fields (mirroring the YES
-        side's row in ``_hunt_tick``). Pure observability (L-34/D3): nothing
-        below changes because of them.
-
-        Runs the S4 gates in the fixed order the plan names, refusing at
-        the FIRST that fires (closed-set reason, `NO_SIDE_SHADOW_REFUSAL_
-        REASONS`) and logging once per instrument-day:
-
-        (a) the account-wide submit-intent latch -- this closes the
-            in-flight sibling race: an OPEN intent (a genuine in-flight
-            order, or a crash-left singleton no resolver has cleared yet)
-            must refuse a NO shadow evaluation exactly like `_hunt_tick`'s
-            own `is_intent_open()` check already refuses the YES arm path.
-            (In THIS call frame that check already ran, synchronously,
-            before `_hunt_tick` ever reached `evaluate_both_sides` -- this
-            is defence in depth against a future reordering, not dead
-            code by intent.)
-        (b) `refuse_if_sibling_leg_traded` for the YES sibling of this NO
-            instrument (a same-slug YES fill forbids the NO leg, S4/§3).
-        (c) `station_day_admission` (R3-7), enumerating BOTH legs of every
-            rung on this station-day -- the caller obligation the S4
-            review named, since `station_day_admission` never scans the
-            store itself.
-        (d) the existing day-budget stop and the per-instrument-day
-            `is_consumed` check, keyed on the NO instrument id.
-
-        `TrialDayLatch` (S1/S4, frozen for this slice) has no public
-        accessor for its store/key-prefix -- `refuse_if_sibling_leg_traded`
-        and `station_day_admission` are pure functions over exactly those,
-        by design (S4's own docstrings: neither needs the flock). Reading
-        the two private fields here is the narrowest bridge that avoids
-        touching `trial_day_latch.py`.
-
-        Safety review finding 1 (2026-09-14, commit f2d33f4): both gate
-        functions, and the shared `_key` builder underneath them, now
-        accept EITHER the bare symbol or the DOTTED `str(InstrumentId)`
-        form and normalise to one canonical (dotted) key -- so this method
-        passes the SAME dotted `iid`/`no_iid` convention every OTHER
-        `key_instrument_id` in this module already uses (`iid =
-        str(snapshot.instrument_id)`), rather than a bare form that would
-        have matched nothing a real fill ever writes.
-
-        Safety review finding 2: `existing_instrument_ids` (for `station_
-        day_admission`) is the union of every rung resolved in `self._facts`
-        for this station-day (today's ladder) AND every instrument with a
-        durable venue fill on record (`TrialDayLatch.iter_fill_records`,
-        the SAME primitive `_run_never_arm_walk` already uses) that joins
-        to this station-day -- a rung filled earlier and since dropped from
-        `self._facts` (a mid-day relaunch) still contributes its `q`.
-        """
-        no_instrument_id = sibling_instrument_id(yes_instrument_id)
-        no_iid = str(no_instrument_id)
-
-        def _append_no_offer_tape(*, decision_label: str, admission_reason: str | None) -> None:
-            """GAP fix 2026-09-15: ONE offer-tape row per branch this method
-            can return from -- pure side effect, never read back by this
-            method or anything it calls, so it cannot change which branch
-            fires (L-34/D3).
-            """
-            ask_str: str | None
-            if isinstance(no_decision, Take):
-                ask_str = str(no_decision.limit_price)
-                reason = "taken"
-            else:
-                # M1 review finding (commit 309dab6): `None`, not `""` -- a
-                # NO row with no bid has no `1 - bid` ask to report at all,
-                # matching `OfferTapeRecord.ask`'s `str | None` contract.
-                ask_str = None if bid is None else str(_ONE - bid)
-                reason = no_decision.reason
-            row_p_bound = no_decision.p_bound
-            row_break_even = no_decision.break_even
-            row_size = 0 if bid_size is None else int(bid_size)
-            # RESTING_BID_HUNT Rev 2 §6 (shadow stage): the NO leg's ask is
-            # the caller's own `1 - bid` complement -- the SAME pure
-            # `compute_p_star` the YES leg uses, fed the complement price,
-            # never a leg-conditional branch inside the decider itself.
-            no_best_ask = None if bid is None else _ONE - bid
-            shadow_no_sibling_filled = admission_reason == SIBLING_LEG_TRADED_REASON
-            shadow_no_cell_legal = not (
-                isinstance(no_decision, Refuse) and no_decision.reason == "illegal_cell"
-            )
-            shadow_no_fee_schedule_mismatch = (
-                isinstance(no_decision, Refuse) and no_decision.reason == "fee_schedule_mismatch"
-            )
-            shadow_no_result = self._evaluate_shadow_rest(
-                station=station,
-                climate_day_key=climate_day_key,
-                leg="NO",
-                best_ask=no_best_ask,
-                p_bound=row_p_bound,
-                staleness_ns=staleness_ns,
-                cell_legal=shadow_no_cell_legal,
-                sibling_leg_filled=shadow_no_sibling_filled,
-                fee_schedule_mismatch=shadow_no_fee_schedule_mismatch,
-            )
-            self.offer_tape.append(
-                OfferTapeRecord(
-                    station=station,
-                    climate_day=climate_day_key,
-                    instrument_id=no_iid,
-                    ask=ask_str,
-                    size=row_size,
-                    reason=reason,
-                    ts_event=now_ns,
-                    hour_lst=hour_lst,
-                    width_code=width_code,
-                    m_code=m_code,
-                    trigger="no_side_shadow",
-                    quote_age_ns=None,
-                    minutes_since_window_open=max(0, hour_lst - _WINDOW_START_HOUR_LST) * 60,
-                    prior_eligible_snaps=0,
-                    illegal_cell=False,
-                    source="no_side_shadow",
-                    side="NO",
-                    p_bound=row_p_bound,
-                    break_even=row_break_even,
-                    running_max_lower=(
-                        None if running_max is None else Decimal(running_max.lower_f)
-                    ),
-                    running_max_upper=(
-                        None if running_max is None else Decimal(running_max.upper_f)
-                    ),
-                    running_max_exact=running_max is not None and running_max.exact_f is not None,
-                    staleness_ns=staleness_ns,
-                    fee_coefficient=fee_coefficient,
-                    shadow_rest_state=shadow_no_result.state,
-                    shadow_rest_price=shadow_no_result.price,
-                    shadow_rest_margin=shadow_no_result.margin,
-                    shadow_rest_reason=shadow_no_result.reason,
-                    shadow_fill_event=shadow_no_result.fill_event,
-                    observed_at_ns=(
-                        None if running_max is None else running_max.source_observed_at_ns
-                    ),
-                    admission_reason=admission_reason,
-                    decision=decision_label,
-                )
-            )
-
-        if not isinstance(no_decision, Take):
-            _append_no_offer_tape(decision_label="refuse", admission_reason=None)
-            return
-        assert self._latch is not None
-        notice_key = (station_day[0], station_day[1], no_iid)
-
-        def _refuse_once(reason: str) -> None:
-            if notice_key in self._no_refuse_notice:
-                return
-            self._no_refuse_notice.add(notice_key)
-            self._record_no_refuse(f"no_refuse: reason={reason}")
-
-        if self._latch.is_intent_open():
-            _refuse_once(_NO_REFUSE_INTENT_OPEN)
-            _append_no_offer_tape(decision_label="refuse", admission_reason=_NO_REFUSE_INTENT_OPEN)
-            return
-
-        store = self._latch._store
-        prefix = self._latch._key_prefix
-        # NO-SIDE S5 (E3-2/E3-5): the bounded first-order containment
-        # window, checked IMMEDIATELY after `is_intent_open` and BEFORE any
-        # side effect below (mirroring `is_intent_open`'s own pre-filter
-        # precedent). This does NOT refuse the evaluation itself -- the
-        # hunt stays observable while pending (E3-5): every gate below
-        # still runs, and only the terminal shadow log's `pending=` field
-        # reflects the containment state. Submission (this method's
-        # `NO_SIDE_SHADOW_ONLY` scope has none yet) is the thing the
-        # closed-set reason `no_side_first_order_pending`
-        # (`LATCH_GATE_REFUSAL_REASONS`) will gate once §5 flips the flag.
-        pending = is_no_side_pending(store)
-
-        sibling_refusal = refuse_if_sibling_leg_traded(
-            store,
-            prefix,
-            station,
-            climate_day_key,
-            no_iid,
-        )
-        if sibling_refusal is not None:
-            _refuse_once(sibling_refusal.reason)
-            _append_no_offer_tape(decision_label="refuse", admission_reason=sibling_refusal.reason)
-            return
-
-        existing_ids, pending_fills = self._station_day_existing_legs(station_day)
-        admission_refusal = station_day_admission(
-            store,
-            prefix,
-            station,
-            climate_day_key,
-            "no",
-            no_decision.break_even,
-            existing_instrument_ids=existing_ids,
-            pending_fills=pending_fills,
-        )
-        if admission_refusal is not None:
-            _refuse_once(admission_refusal.reason)
-            _append_no_offer_tape(
-                decision_label="refuse",
-                admission_reason=admission_refusal.reason,
-            )
-            return
-
-        utc_day = utc_day_for_ns(now_ns).isoformat()
-        if self._latch.is_day_budget_exhausted(utc_day):
-            _refuse_once(_NO_REFUSE_DAY_BUDGET_EXHAUSTED)
-            _append_no_offer_tape(
-                decision_label="refuse",
-                admission_reason=_NO_REFUSE_DAY_BUDGET_EXHAUSTED,
-            )
-            return
-        if self._latch.is_consumed(station, climate_day_key, key_instrument_id=no_iid):
-            _refuse_once(_NO_REFUSE_TRIAL_DAY_CONSUMED)
-            _append_no_offer_tape(
-                decision_label="refuse",
-                admission_reason=_NO_REFUSE_TRIAL_DAY_CONSUMED,
-            )
-            return
-
-        # GAP fix 2026-09-15: every gate above has cleared -- this snapshot
-        # is a genuinely ADMITTED NO candidate (would arm, or already has,
-        # depending on `pending`/`NO_SIDE_SHADOW_ONLY` below). ONE row per
-        # finalized evaluation, never per WAIT tick -- this line runs
-        # exactly once per `_evaluate_no_side_shadow` call that reaches it.
-        _append_no_offer_tape(decision_label="take", admission_reason="admitted")
-
-        minute_bucket = now_ns // _NS_PER_MINUTE
-        # E3-5: the hunt stays observable while pending -- log every minute,
-        # even for a take that would have submitted, BEFORE the flag/pending
-        # branch below decides whether it actually arms.
-        if self._no_shadow_notice.get(notice_key) != minute_bucket:
-            self._no_shadow_notice[notice_key] = minute_bucket
-            # FU-2: mirrors the YES `take:` line's own `R=[...]`/staleness
-            # fields (`:2298-2304`) -- rendered `None` when `running_max`/
-            # `staleness_ns` are absent (the two direct-call-site unit tests
-            # never supply them), never a `NoneType` crash on `.lower_f`.
-            no_r_bounds = (
-                "None" if running_max is None else f"[{running_max.lower_f},{running_max.upper_f}]"
-            )
-            no_obs_ts_ns = None if running_max is None else running_max.source_observed_at_ns
-            no_staleness_s = None if staleness_ns is None else staleness_ns / _NS_PER_SECOND
-            self._record_no_take_shadow(
-                f"no_take_shadow: station={station} instrument={no_iid} "
-                f"no_ask={no_decision.limit_price} p_miss_lower={no_decision.p_bound} "
-                f"be={no_decision.break_even} bid_size={bid_size} "
-                f"pending={1 if pending else 0} "
-                f"R={no_r_bounds} obs_ts_ns={no_obs_ts_ns} staleness_s={no_staleness_s}"
-            )
-
-        if NO_SIDE_SHADOW_ONLY:
-            # S3b (frozen behaviour): never arm, consume, or submit.
-            return
-
-        # NO-SIDE S5 tail (§5 plan): the flag is False -- arm the NO take
-        # exactly like the YES arm block (:1020-1041), keyed on `no_iid`,
-        # UNLESS the bounded first-order protocol (E2-1/E3-2) is pending.
-        # E3-2/E3-5 (pinned by test_no_side_first_order_pending_2026_09_14.py):
-        # this is a silent WAIT, never a `no_refuse:` -- `NO_SIDE_FIRST_
-        # ORDER_PENDING_REASON` lives in `LATCH_GATE_REFUSAL_REASONS` for
-        # the client-side denial path, not for a `Refusal`/`_refuse_once`
-        # this method would raise.
-        if pending:
-            return
-        # SAFETY (adjudicated placement, strategy-side, mirrors client.py's
-        # SAFETY C1 comment at `_submit_order`): this write and the arm
-        # block below run with NO `await` between the `pending` read above
-        # and here -- `Strategy.on_quote_tick`/`on_data` are plain
-        # synchronous methods, so two stations' ticks handled back-to-back
-        # in one process cannot interleave: whichever call reaches this
-        # line first WRITES the key and COMMITs (`SqliteStateStore.set`
-        # commits before returning) before it ever yields control, so the
-        # second call's OWN `pending = is_no_side_pending(store)` read,
-        # taken at the top of its own invocation of this method, observes
-        # `True` and returns above -- never reaching this line. The key is
-        # NEVER cleared by this method: if `_maybe_submit` below goes on to
-        # refuse (permit exhausted, budget cap, latch already armed by a
-        # true concurrent submit_order path), the key stays SET -- "pending
-        # with no order" fails closed exactly like `client.py`'s own C1
-        # WAIT (no money moved, but no further NO arm is granted either).
-        store.set(
-            NO_SIDE_FIRST_LIVE_ORDER_KEY,
-            first_live_order_payload(no_iid, now_ns),
-        )
-        self._decision_ask_by_station_day[(station, climate_day_key)] = no_decision.limit_price
-        # F-2 (A4): mirrors `self.takes += 1` at the YES tail (:2069) --
-        # counted here, at the SAME point the latch goes IN_FLIGHT for the
-        # NO leg, unconditionally (even under Phase 0/gate-closed, exactly
-        # like `takes`). `HaltDetector.observe(takes=self.takes)` stays
-        # UNCHANGED (no cited rule makes it NO-aware) -- see the dedicated
-        # test.
-        self.no_takes += 1
-        self._latch.set_inflight(station, climate_day_key, key_instrument_id=no_iid)
-        self._latch.record_attempt(
-            station,
-            climate_day_key,
-            ts_ns=now_ns,
-            key_instrument_id=no_iid,
-        )
-        self._record_rearm_decision(
-            f"rearm: {station}/{climate_day_key} NO armed instrument={no_iid}"
-        )
-        self._maybe_submit(no_iid, no_decision)
-        if not self._submission_armed():
-            self._latch.clear_inflight(station, climate_day_key, key_instrument_id=no_iid)
-
-    def _record_no_take_shadow(self, summary: str) -> None:
-        """Mirrors `_record_rearm_decision` -- stores the ONE summary line
-        on `self.last_no_take_shadow` (asserted by presence, L-27) and
-        emits it via the overridable seam below. Stable grep token
-        `no_take_shadow:`.
-        """
-        self.last_no_take_shadow = summary
-        self._emit_no_take_shadow(summary)
-
-    def _emit_no_take_shadow(self, summary: str) -> None:
-        self.log.info(summary)
-
-    def _record_no_refuse(self, summary: str) -> None:
-        """Mirrors `_record_no_take_shadow` above for the refusal line,
-        stable grep token `no_refuse:`.
-        """
-        self.last_no_refuse = summary
-        self._emit_no_refuse(summary)
-
-    def _emit_no_refuse(self, summary: str) -> None:
-        self.log.info(summary)
 
     def _emit_take_log(self, summary: str) -> None:
         """GAP fix 2026-09-15 (brief item 4): overridable seam for the
