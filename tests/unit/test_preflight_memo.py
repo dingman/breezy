@@ -12,6 +12,7 @@ import pytest
 from nautilus_trader.model.data import QuoteTick
 
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+import breezy.runtime.quote_tape_ingest_core as ingest_core_module
 from breezy.persistence import feather_preflight, preflight_memo
 from breezy.persistence.feather_preflight import (
     FeatherFileReport,
@@ -381,7 +382,7 @@ def test_run_ingest_passes_open_files_to_memoized_scan_and_outcomes_unchanged(
             ),
         )
 
-    monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", spy_scan)
+    monkeypatch.setattr(ingest_core_module, "scan_instance_memoized", spy_scan)
 
     results = run_ingest(
         tmp_path,
@@ -397,7 +398,7 @@ def test_run_ingest_passes_open_files_to_memoized_scan_and_outcomes_unchanged(
 def test_deadline_line_carries_rss_peak_mb_integer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(ingest_cli_module, "run_ingest_definitions_first", lambda *a, **k: ())
+    monkeypatch.setattr(ingest_core_module, "run_ingest_definitions_first", lambda *a, **k: ())
     monkeypatch.setattr(
         ingest_cli_module.resource,
         "getrusage",

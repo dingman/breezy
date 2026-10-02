@@ -29,6 +29,7 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+import breezy.runtime.quote_tape_ingest_core as ingest_core_module
 from breezy.persistence.feather_preflight import inspect_feather_file
 from breezy.runtime.ingest_deadline import (
     DEFAULT_DEADLINE_SECONDS,
@@ -626,7 +627,7 @@ class TestCLIDeadlineLine:
         def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
             raise ValueError("boom -- not the non-disjoint refusal text")
 
-        monkeypatch.setattr(ingest_cli_module, "_convert_stream_natively", boom)
+        monkeypatch.setattr(ingest_core_module, "_convert_stream_natively", boom)
         import io
 
         out_buf, err_buf = io.StringIO(), io.StringIO()
@@ -909,7 +910,7 @@ class TestPerFileBreadcrumbSurvivesAKillThenTheNextRunConverts:
 
         attempt = instance_dir / f"{ATTEMPT_PREFIX}quote_tick"
         raised = {"count": 0}
-        real_read = ingest_cli_module.read_feather_coalesced  # type: ignore[attr-defined]
+        real_read = ingest_cli_module.read_feather_coalesced
 
         def flaky_read(fs, path, *a, **kw):  # type: ignore[no-untyped-def]
             if raised["count"] == 0:
@@ -919,7 +920,7 @@ class TestPerFileBreadcrumbSurvivesAKillThenTheNextRunConverts:
 
         # Run 1: a hard kill mid-conversion leaves the breadcrumb, no marker.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(ingest_cli_module, "read_feather_coalesced", flaky_read)
+            mp.setattr(ingest_core_module, "read_feather_coalesced", flaky_read)
             deadline = RunDeadline(budget_ns=1_000_000_000_000)
             with pytest.raises(KeyboardInterrupt):
                 run_ingest(
@@ -1143,14 +1144,14 @@ class TestPerFileLazyGateTiming:
         assert deadline.admitted == 1
 
         read_calls: list[Path] = []
-        real_read = ingest_cli_module.read_feather_coalesced  # type: ignore[attr-defined]
+        real_read = ingest_cli_module.read_feather_coalesced
 
         def counting_read(fs, path, *a, **kw):  # type: ignore[no-untyped-def]
             read_calls.append(Path(path))
             return real_read(fs, path, *a, **kw)
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(ingest_cli_module, "read_feather_coalesced", counting_read)
+            mp.setattr(ingest_core_module, "read_feather_coalesced", counting_read)
             result, converted, _is_open = ingest_cli_module._convert_one_tick_type_per_file(
                 catalog, instance_dir, INSTANCE, QuoteTick, frozenset(), reports_by_path,
                 instance_is_dead=False, dry_run=False, deadline=deadline,
@@ -1215,7 +1216,7 @@ class TestScanTimeCountsAgainstTheBudget:
                 catalog_root, instance_id, subdirectory, open_files=open_files
             )
 
-        monkeypatch.setattr(ingest_cli_module, "scan_instance_memoized", slow_scan_instance)
+        monkeypatch.setattr(ingest_core_module, "scan_instance_memoized", slow_scan_instance)
 
         results = run_ingest(
             tmp_path,

@@ -319,7 +319,7 @@ CEILINGS: Final[dict[str, int]] = {
     "tests/integration": 1,
     "tests/strategy": 6,
     "tests/support": 2,
-    "tests/unit": 1466,
+    "tests/unit": 1451,
 }
 
 

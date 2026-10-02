@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 from nautilus_trader.model.data import QuoteTick
 
-import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
+import breezy.runtime.quote_tape_ingest_core as ingest_core_module
 from breezy.runtime.ingest_deferral_streak import (
     STATE_FILENAME,
     DeferralStreakState,
@@ -391,7 +391,7 @@ def _seed_failing_instance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     )
     stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
     os.utime(quote_path, (stamp, stamp))
-    monkeypatch.setattr(ingest_cli_module, "read_feather_coalesced", lambda fs, path, **kw: None)
+    monkeypatch.setattr(ingest_core_module, "read_feather_coalesced", lambda fs, path, **kw: None)
 
 
 class TestExitPrecedenceWithAConversionFailure:
@@ -400,7 +400,7 @@ class TestExitPrecedenceWithAConversionFailure:
     ) -> None:
         _seed_failing_instance(tmp_path, monkeypatch)
         _seed_almost_due_streak(tmp_path, runs_since_alert=5)
-        monkeypatch.setattr(ingest_cli_module, "_count_pending_deferral_units", lambda *a, **kw: 3)
+        monkeypatch.setattr(ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: 3)
 
         code, _out, _err = _run_cli(
             ["--catalog", str(tmp_path), "--service-unit", _INACTIVE_SERVICE_UNIT],
@@ -415,7 +415,7 @@ class TestExitPrecedenceWithAConversionFailure:
     ) -> None:
         _seed_failing_instance(tmp_path, monkeypatch)
         _seed_almost_due_streak(tmp_path, runs_since_alert=15)  # one more run is due
-        monkeypatch.setattr(ingest_cli_module, "_count_pending_deferral_units", lambda *a, **kw: 2)
+        monkeypatch.setattr(ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: 2)
 
         code, out, _err = _run_cli(
             ["--catalog", str(tmp_path), "--service-unit", _INACTIVE_SERVICE_UNIT],
@@ -433,7 +433,7 @@ class TestExitPrecedenceWithAConversionFailure:
     ) -> None:
         _seed_failing_instance(tmp_path, monkeypatch)
         _seed_almost_due_streak(tmp_path, runs_since_alert=5)
-        monkeypatch.setattr(ingest_cli_module, "_count_pending_deferral_units", lambda *a, **kw: 1)
+        monkeypatch.setattr(ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: 1)
 
         code, out, _err = _run_cli(
             ["--catalog", str(tmp_path), "--service-unit", _INACTIVE_SERVICE_UNIT],
@@ -449,7 +449,7 @@ class TestExitPrecedenceWithAConversionFailure:
     ) -> None:
         _seed_failing_instance(tmp_path, monkeypatch)
         _seed_almost_due_streak(tmp_path, runs_since_alert=15)
-        monkeypatch.setattr(ingest_cli_module, "_count_pending_deferral_units", lambda *a, **kw: 0)
+        monkeypatch.setattr(ingest_core_module, "_count_pending_deferral_units", lambda *a, **kw: 0)
 
         code, out, _err = _run_cli(
             ["--catalog", str(tmp_path), "--service-unit", _INACTIVE_SERVICE_UNIT],
