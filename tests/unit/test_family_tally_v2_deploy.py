@@ -288,14 +288,28 @@ def test_wrapper_families_dir_override_replaces_the_enumerated_manifest_set(
     only_family_dir = tmp_path / "only_family"
     only_family_dir.mkdir()
     (only_family_dir / "solo_family.json").write_text(
-        json.dumps({"family_id": "solo_family"})
+        json.dumps(
+            {
+                "family_id": "solo_family",
+                "composition_kind": "continuous_rung_hold",
+                "status": "REGISTERED",
+                "venue": "kalshi",
+            }
+        )
+    )
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=solo_family"
     )
 
     stub = tmp_path / "stub_python.sh"
     stub.write_text("#!/usr/bin/env bash\nexit 0\n")
     stub.chmod(0o755)
     accepted = _run_wrapper(
-        ["solo_family"], tmp_path, stub_python=stub, families_dir=only_family_dir
+        ["solo_family"],
+        tmp_path,
+        stub_python=stub,
+        families_dir=only_family_dir,
+        systemctl_stub=systemctl,
     )
     assert accepted.returncode == 0, accepted.stderr
 
@@ -321,6 +335,107 @@ def test_wrapper_exits_nonzero_and_never_invokes_the_tally_when_marker_absent(
 
     assert result.returncode != 0
     assert not capture.exists()
+
+
+def test_wrapper_skips_without_marker_when_sending_family_is_forecast_quantile_ladder(
+    tmp_path: Path,
+) -> None:
+    stub = tmp_path / "stub_python.sh"
+    capture = tmp_path / "argv_capture.txt"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_fq_v1"
+    )
+
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        create_marker=False,
+        systemctl_stub=systemctl,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = (tmp_path / "derived" / "family_tally_v2.log").read_text(encoding="utf-8")
+    assert (
+        "FAMILY TALLY V2 (pm_us_crh_v2) SKIPPED -- sending family "
+        "pm_us_crh_fq_v1 is forecast_quantile_ladder; no score-live-trials "
+        "run by design"
+    ) in log_text
+    assert not capture.exists()
+
+
+def test_wrapper_still_fails_without_marker_when_sending_family_is_not_forecast_quantile_ladder(
+    tmp_path: Path,
+) -> None:
+    stub = tmp_path / "stub_python.sh"
+    capture = tmp_path / "argv_capture.txt"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4"
+    )
+
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        create_marker=False,
+        systemctl_stub=systemctl,
+    )
+
+    assert result.returncode == 1
+    log_text = (tmp_path / "derived" / "family_tally_v2.log").read_text(encoding="utf-8")
+    assert (
+        "FAMILY TALLY V2 (pm_us_crh_v2) SKIPPED -- "
+        "no score-live-trials success marker for "
+    ) in log_text
+    assert not capture.exists()
+
+
+def test_wrapper_uses_the_configured_manifest_dir_for_fq_sender_detection(
+    tmp_path: Path,
+) -> None:
+    families_dir = tmp_path / "families"
+    families_dir.mkdir()
+    (families_dir / "local_tally.json").write_text(
+        json.dumps(
+            {
+                "family_id": "local_tally",
+                "composition_kind": "continuous_rung_hold",
+                "status": "REGISTERED",
+                "venue": "polymarket_us",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (families_dir / "local_sender.json").write_text(
+        json.dumps(
+            {
+                "family_id": "local_sender",
+                "composition_kind": "forecast_quantile_ladder",
+                "status": "DRAFT_NOT_REGISTERED",
+                "venue": "polymarket_us",
+            }
+        ),
+        encoding="utf-8",
+    )
+    systemctl = _systemctl_stub(
+        tmp_path, "Environment=BREEZY_SENDING_FAMILY_ID=local_sender"
+    )
+
+    result = _run_wrapper(
+        ["local_tally"],
+        tmp_path,
+        create_marker=False,
+        families_dir=families_dir,
+        systemctl_stub=systemctl,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log_text = (tmp_path / "derived" / "family_tally_v2.log").read_text(encoding="utf-8")
+    assert "sending family local_sender is forecast_quantile_ladder" in log_text
 
 
 def test_wrapper_invokes_the_tally_when_marker_present(tmp_path: Path) -> None:

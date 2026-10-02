@@ -66,7 +66,7 @@ manifest_field() {
 # literal. BREEZY_SYSTEMCTL is a test seam; production leaves it unset.
 SYSTEMCTL="${BREEZY_SYSTEMCTL:-systemctl}"
 resolve_champion_manifest() {
-  local show id path status
+  local show id path status kind
   show=$("$SYSTEMCTL" --user show breezy-trade-supervisor.service --property=Environment 2>>"$LOG") || true
   id=$(printf '%s\n' "$show" | sed -n 's/^Environment=//p' | tr ' ' '\n' | sed -n 's/^BREEZY_SENDING_FAMILY_ID=//p' | head -n1)
   id=${id%\"}
@@ -85,6 +85,14 @@ resolve_champion_manifest() {
   if [ ! -f "$path" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no manifest for sending family $id"
     return 1
+  fi
+  # S7: score-live-trials-run.sh deliberately does not write the success
+  # marker when the sending family is forecast_quantile_ladder. This wrapper
+  # resolves the same sending manifest and skips before the marker gate.
+  kind=$(manifest_field "$path" composition_kind)
+  if [ "$kind" = "forecast_quantile_ladder" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- sending family $id is forecast_quantile_ladder; no score-live-trials run by design"
+    return 2
   fi
   status=$(manifest_field "$path" status)
   if [ "$status" != "REGISTERED" ]; then
@@ -136,6 +144,14 @@ FAMILY_KIND=$(manifest_field "$FAMILIES_DIR/$FAMILY.json" composition_kind)
 if [ "$FAMILY_KIND" = "forecast_quantile_ladder" ]; then
   say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- composition_kind=forecast_quantile_ladder has no family_tally_v2"
   exit 0
+fi
+resolve_champion_manifest
+resolve_rc=$?
+if [ "$resolve_rc" -eq 2 ]; then
+  exit 0
+fi
+if [ "$resolve_rc" -ne 0 ]; then
+  exit 1
 fi
 # Structural-dead pin is pm_us_crh_v2 only -- never attached to kalshi_crh_v1.
 # v2 is not the KILL clock. Its retired unit files are orphans (plan D-E);
@@ -252,11 +268,9 @@ if [ "$FAMILY_STATUS" = "REGISTERED" ] && [ "$FAMILY_VENUE" = "polymarket_us" ];
     exit 1
   fi
 
-  # Same manifest the counter was resolved from. Fail closed if its d0
-  # or sha cannot be read. Do not delete $CJSON -- the producer owns it.
-  if ! resolve_champion_manifest; then
-    exit 1
-  fi
+  # Same manifest the counter was resolved from before the marker gate.
+  # Fail closed if its d0 or sha cannot be read. Do not delete $CJSON -- the
+  # producer owns it.
   if [ ! -r "$CHAMPION_MANIFEST" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- champion manifest unreadable"
     exit 1
