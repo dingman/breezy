@@ -171,6 +171,7 @@ def test_a_mixed_side_qty1_station_day_can_carry_variance_above_one_quarter() ->
     assert math.isclose(draw.variance, 1.0, rel_tol=0.0, abs_tol=1e-12)
 
 
+@pytest.mark.heavy
 def test_the_sim_null_has_mean_s_near_zero_and_unit_var_s_on_mixed_days() -> None:
     """L-41: the sampler quotes exactly at the true cell probability (no
     separate noise term), so the neutral-input harness reproduces the
@@ -192,6 +193,7 @@ def test_the_sim_null_has_mean_s_near_zero_and_unit_var_s_on_mixed_days() -> Non
     assert result.loss_stop_count == 0
 
 
+@pytest.mark.heavy
 def test_the_all_yes_qty1_control_passes_the_m2_gate_under_the_live_rule() -> None:
     """Harness positive control (test 7): the all_yes k=1 q_max=1 cell is
     the SAME-side case L-40's pre-amendment text already validated
@@ -287,6 +289,7 @@ _METADATA_KEYS = {
 }
 
 
+@pytest.mark.heavy
 def test_refined_run_equals_the_fine_grid_run_field_for_field_and_exercises_both_paths() -> None:
     """Test 17. One mixed and one 16-look cell, ~200 reps: the refined
     result must equal a pure fine-grid run field for field (excluding

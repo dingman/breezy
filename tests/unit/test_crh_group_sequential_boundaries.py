@@ -152,6 +152,7 @@ def test_boundary_for_accepts_a_tie_in_information_fraction_as_zero_increment():
         gs.boundary_for([0.5, 0.4], 0.025, is_terminal=False)
 
 
+@pytest.mark.heavy
 def test_boundary_for_on_equal_t_grid_reproduces_reference_table_to_1e_minus_6(
     default_reference_table: list[gs.LookRow],
 ) -> None:

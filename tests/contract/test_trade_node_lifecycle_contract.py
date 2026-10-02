@@ -136,6 +136,7 @@ def _node() -> Iterator[TradingNode]:
         loop.close()
 
 
+@pytest.mark.heavy
 def test_the_trade_node_reaches_running_and_stops_cleanly() -> None:
     """The whole increment, in one run: START -> RUNNING -> STOPPED -> DISPOSED.
 

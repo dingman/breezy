@@ -463,6 +463,7 @@ def test_select_kappa_by_lovo_crps_refuses_a_holdout_tagged_row() -> None:
         calib.select_kappa_by_lovo_crps(rows_by_version, method=CdfMethod.NORMAL, delta=1.0, grid=_SMALL_KAPPA_GRID)
 
 
+@pytest.mark.heavy
 def test_skew_normal_cdf_gives_a_different_kappa_curve_than_normal() -> None:
     # Asymmetric percentiles -- NORMAL ignores the shape (mean/sd only);
     # SKEW_NORMAL fits through it, so the two methods' CDFs genuinely differ.

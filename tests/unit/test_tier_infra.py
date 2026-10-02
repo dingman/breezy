@@ -20,9 +20,21 @@ _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 _EXCL = "not live and not venue_live and not real_money"
 _NODEID = re.compile(r"^tests/.+\.py::")
 
-#: Empty until a later step marks real heavy tests. A file not listed here
-#: must not carry ``pytest.mark.heavy``.
-HEAVY_ALLOWLIST: tuple[str, ...] = ()
+#: Files whose tests carry ``pytest.mark.heavy`` (R0.9). A file not listed
+#: here must not carry the mark. Membership is by file, not by individual test.
+HEAVY_ALLOWLIST: tuple[str, ...] = (
+    "tests/contract/test_boot_halt_alert_contract.py",
+    "tests/contract/test_trade_node_lifecycle_contract.py",
+    "tests/unit/test_archive_table_upper_bound_2026_09_14.py",
+    "tests/unit/test_aud07_live_rule_crossing_sim.py",
+    "tests/unit/test_aud07_m1c_census.py",
+    "tests/unit/test_crh_group_sequential_boundaries.py",
+    "tests/unit/test_current_rung_hold_archive_table.py",
+    "tests/unit/test_gs_boundary_artefact.py",
+    "tests/unit/test_nbp_calibration.py",
+    "tests/unit/test_nbp_skill_study.py",
+    "tests/unit/test_quote_tape_ingest_bounded_rss.py",
+)
 
 #: Guard and safety scans that stay in the fast tier forever. Names are the
 #: repo-relative paths of those modules; none of them may join the allowlist.

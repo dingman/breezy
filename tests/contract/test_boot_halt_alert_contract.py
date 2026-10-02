@@ -362,6 +362,7 @@ def _boot_halt_details(sink: _RecordingAlertSink) -> list[str]:
     return [payload.detail for payload in sink.payloads if payload.event == _BOOT_HALT_EVENT]
 
 
+@pytest.mark.heavy
 def test_a_real_node_that_reaches_running_then_sigterm_emits_no_boot_halt_alert(
     alert_sink: _RecordingAlertSink,
 ) -> None:

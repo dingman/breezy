@@ -323,6 +323,7 @@ def test_invalid_json_is_refused(tmp_path: Path) -> None:
 # --- boundary_for / alpha_spent / remaining_alpha ---------------------------
 
 
+@pytest.mark.heavy
 def test_solver_reproduces_the_16_row_reference_fixture_to_1e_9(
     artefact: BoundaryArtefact,
 ) -> None:
