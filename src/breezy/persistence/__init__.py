@@ -1,8 +1,9 @@
 """Parquet catalog persistence for domain records, plus filesystem safety.
 
 Re-exports :mod:`breezy.persistence.catalog`'s already-curated public
-surface (the module owns its own ``__all__``); no separate judgement pass
-was needed here since ``persistence`` currently has a single submodule.
+surface (that module owns its own ``__all__``). This package is not a
+single submodule: the other modules are imported directly, not through
+this facade.
 """
 
 from breezy.persistence.catalog import (
