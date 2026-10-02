@@ -324,7 +324,13 @@ def test_the_real_write_outcome_satisfies_the_routing_protocol() -> None:
 # `persistence.catalog`'s exceptions have no common root -- they descend from
 # ValueError, RuntimeError and Exception separately -- so `__subclasses__()`
 # cannot walk them. The taxonomy is therefore "every exception class DEFINED in
-# that module", which catches a new one however it is based.
+# the catalog write path and reachable from catalog's namespace", which catches
+# a new one however it is based. The write path spans two modules since R1.4
+# moved the filesystem probe out: `breezy.persistence.filesystem_probe` DEFINES
+# `WriterLockFilesystemError` and `catalog` re-exports it, so the module filter
+# admits both defining modules.
+
+CATALOG_WRITE_PATH_MODULES = ("breezy.persistence.catalog", "breezy.persistence.filesystem_probe")
 
 
 def catalog_error_taxonomy() -> set[type[BaseException]]:
@@ -337,7 +343,7 @@ def catalog_error_taxonomy() -> set[type[BaseException]]:
         for obj in vars(catalog).values()
         if inspect.isclass(obj)
         and issubclass(obj, BaseException)
-        and obj.__module__ == catalog.__name__
+        and obj.__module__ in CATALOG_WRITE_PATH_MODULES
     }
 
 
@@ -368,6 +374,7 @@ def test_the_catalog_taxonomy_walk_actually_finds_the_hierarchy() -> None:
     assert len(taxonomy) >= 6
     assert catalog.ConcurrentWriterError in taxonomy
     assert catalog.WriterLockError in taxonomy
+    assert catalog.WriterLockFilesystemError in taxonomy
 
 
 def test_the_catalog_enumeration_detects_a_removed_route() -> None:
