@@ -115,6 +115,9 @@ def _run_wrapper(
         )
     finally:
         if lock_holder is not None:
+            # The wrapper has already returned; the holder only existed to
+            # keep the flock taken, so end it instead of awaiting its sleep.
+            lock_holder.terminate()
             lock_holder.wait(timeout=10)
 
 

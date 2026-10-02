@@ -40,6 +40,7 @@ from nautilus_trader.config import InstrumentProviderConfig, LiveDataEngineConfi
 from nautilus_trader.live.data_engine import LiveDataEngine
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us import data as data_module
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.data import PolymarketUSDataClient, build_data_client
 from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
@@ -48,6 +49,10 @@ from tests.unit.test_polymarket_us_quote_tape_gap import ControllableFeed, FakeP
 
 CLIENT_NAME = "POLYMARKET_US"
 SLUGS = (SLUG, "tc-temp-miahigh-2026-08-31-gte91lt92f", "tc-temp-mdwhigh-2026-08-31-gte92lt93f")
+
+# The production drain deadline is 5 s of real clock; the alert tests only need
+# the deadline to elapse, so they patch the constant the code reads at call time.
+_SHORT_DRAIN_SECS = 0.2
 
 
 def build_live_client(
@@ -177,6 +182,7 @@ def test_the_instruments_really_are_in_the_cache_after_connect(
 
 def test_an_instrument_that_never_reaches_the_cache_still_alerts(
     engine_loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The alert must keep its teeth. This is the condition it exists for.
 
@@ -186,6 +192,7 @@ def test_an_instrument_that_never_reaches_the_cache_still_alerts(
     writer silently drops that instrument's quotes
     (``persistence/writer.py:212-232``) and the tape is short with no error.
     """
+    monkeypatch.setattr(data_module, "INSTRUMENT_CACHE_DRAIN_TIMEOUT_SECS", _SHORT_DRAIN_SECS)
     client, engine, _feed = build_live_client(engine_loop, SLUGS)
     ghost = "tc-temp-laxhigh-2026-08-31-gte80lt81f"
 
@@ -208,6 +215,7 @@ def test_an_instrument_that_never_reaches_the_cache_still_alerts(
 
 def test_waiting_for_the_engine_is_bounded_and_does_not_hang(
     engine_loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stalled engine must not stall the recorder's connect path.
 
@@ -215,6 +223,7 @@ def test_waiting_for_the_engine_is_bounded_and_does_not_hang(
     instruments never arrive. The check must give up on a deadline and report,
     not block the client's ``_connect`` forever.
     """
+    monkeypatch.setattr(data_module, "INSTRUMENT_CACHE_DRAIN_TIMEOUT_SECS", _SHORT_DRAIN_SECS)
     client, engine, _feed = build_live_client(engine_loop, SLUGS)
 
     async def scenario() -> None:
