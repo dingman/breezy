@@ -68,9 +68,7 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.runtime.trade_supervisor_core import (
     _PERMIT_FAIL_SELF_CHECK_RESULTS,
-    _RELAUNCH_POLL_INTERVAL_S,  # noqa: F401 - re-exported: moved/used via this module's namespace
     _SCHEDULE_POLL_INTERVAL_S,
-    _SELF_CHECK_PASS_RESULTS,  # noqa: F401 - re-exported: moved/used via this module's namespace
     BOOT_RETRY_READINESS_TIMEOUT,
     CONTINUOUS_LEGACY_FAMILY_HALT_KEY,
     LAUNCH_UTC,
@@ -178,6 +176,12 @@ from breezy.runtime.trade_supervisor_core import (
     self_check_result_alert,
     strategy_subscribed_in,
     zero_instruments_refusal_in,
+)
+from breezy.runtime.trade_supervisor_core import (
+    _RELAUNCH_POLL_INTERVAL_S as _RELAUNCH_POLL_INTERVAL_S,  # noqa: PLC0414 - explicit re-export for mypy
+)
+from breezy.runtime.trade_supervisor_core import (
+    _SELF_CHECK_PASS_RESULTS as _SELF_CHECK_PASS_RESULTS,  # noqa: PLC0414 - explicit re-export for mypy
 )
 
 logger = logging.getLogger(__name__)
