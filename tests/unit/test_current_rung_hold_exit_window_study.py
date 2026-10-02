@@ -1216,12 +1216,17 @@ class TestAud04V1FallsBackToTotalLevel:
         monkeypatch.setattr(study_mod, "reconcile_with_aud04_per_trial", _spy_per_trial)
         monkeypatch.setattr(study_mod, "reconcile_with_aud04", _spy_total)
 
+        sleeps: list[float] = []
         code = study_mod.main(
-            _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report), now_ns=now_ns,
+            _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report),
+            now_ns=now_ns,
+            sleep=sleeps.append,
         )
 
         assert code == 0
         assert calls == ["per_trial"]
+        # 1 initial attempt + 3 retries; the waits pin the production backoff.
+        assert sleeps == [5.0, 15.0, 45.0]
 
     def test_main_dispatches_to_the_total_level_path_when_trial_rows_is_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1249,12 +1254,17 @@ class TestAud04V1FallsBackToTotalLevel:
         monkeypatch.setattr(study_mod, "reconcile_with_aud04_per_trial", _spy_per_trial)
         monkeypatch.setattr(study_mod, "reconcile_with_aud04", _spy_total)
 
+        sleeps: list[float] = []
         code = study_mod.main(
-            _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report), now_ns=now_ns,
+            _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report),
+            now_ns=now_ns,
+            sleep=sleeps.append,
         )
 
         assert code == 0
         assert calls == ["total"]
+        # 1 initial attempt + 3 retries; the waits pin the production backoff.
+        assert sleeps == [5.0, 15.0, 45.0]
 
 
 class TestAud04ReconciliationReadiness:
@@ -2167,9 +2177,15 @@ def test_main_degrades_to_skipped_on_a_corrupt_aud04_artefact_and_still_writes_o
     aud04_report = tmp_path / "PRIVATE_portfolio_roi_corrupt.json"
     aud04_report.write_text("{ not valid json")
 
-    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report))
+    sleeps: list[float] = []
+    code = study_mod.main(
+        _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report),
+        sleep=sleeps.append,
+    )
 
     assert code == 0  # the failed station is a missing input, never a crash
+    # 1 initial attempt + 3 retries; the waits pin the production backoff.
+    assert sleeps == [5.0, 15.0, 45.0]
     report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
     assert report.exists()
     payload = json.loads(report.read_text(encoding="utf-8"))
@@ -2189,9 +2205,15 @@ def test_main_degrades_to_skipped_on_a_malformed_aud04_artefact_and_still_writes
     payload["realised_pnl_after_fees_total"] = 0.61  # must be a decimal-shaped STR
     aud04_report.write_text(json.dumps(payload))
 
-    code = study_mod.main(_study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report))
+    sleeps: list[float] = []
+    code = study_mod.main(
+        _study_argv(tmp_path, cache_dir=cache_dir, aud04_report=aud04_report),
+        sleep=sleeps.append,
+    )
 
     assert code == 0
+    # 1 initial attempt + 3 retries; the waits pin the production backoff.
+    assert sleeps == [5.0, 15.0, 45.0]
     report = tmp_path / "out" / "synthetic-fetch" / "exit_window_study.json"
     assert report.exists()
     written = json.loads(report.read_text(encoding="utf-8"))
