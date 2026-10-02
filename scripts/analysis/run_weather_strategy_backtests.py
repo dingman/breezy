@@ -214,13 +214,15 @@ from weather_strategy_backtest_lib import (
     latest_publication_at_or_before,
     settlement_prices_for_scenario,
 )
+# Compatibility re-export block: some names below are unused here but are kept
+# for importers and ruling citations; do not remove in a lint cleanup.
 from tape_instruments import (  # type: ignore[import-not-found]
     CLIMATE_DAY,
     DEFAULT_WEATHER_CATALOG_ROOT,
-    WEATHER_VENUE,
+    WEATHER_VENUE,  # noqa: F401
     TapeInstrument,
     _ONE_SECOND_NS,
-    _capture_instruments_by_id,
+    _capture_instruments_by_id,  # noqa: F401
     _convert_live_capture,
     _load_climate_day_records,
     _select_capture_instruments,
