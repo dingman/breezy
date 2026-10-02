@@ -194,6 +194,7 @@ from breezy.persistence.catalog import (
 from breezy.registry.health_model import (
     FINAL_OVERDUE,
     GAP_RETENTION_WARNING,
+    HEALTH_EMISSION_FAILING,
     POLL_STALE,
     POST_SETTLEMENT_REVISION,
     SCHEMA_VERSION,
@@ -357,6 +358,20 @@ STALENESS_BLOCK_INTERVALS: Final[int] = 12
 #: keep in sync, and a five-minute site and an hourly site get proportionate
 #: patience without either being configured separately.
 SITE_BLOCKED_ALERT_INTERVALS: Final[int] = 4
+
+#: Consecutive `_emit_health` failures before the actor escalates directly to
+#: the alert sink. `reconcile_and_report` swallows each failure (containment),
+#: but a persistently failing emission path loses every alert and snapshot --
+#: the 2026-09-20 "detector without delivery" class. 3 polls x the default
+#: 300 s cadence = 15 min of persistent failure, long enough to ride out one
+#: transient write error, short enough for an operator to act the same hour.
+HEALTH_EMISSION_FAILURE_ESCALATION_THRESHOLD: Final[int] = 3
+#: Re-escalate at most this often while failure persists. Mirrors
+#: `runtime.health.DEFAULT_RENOTIFY_AFTER_NS` (24 h), which `ingest` may not
+#: import.
+HEALTH_EMISSION_RENOTIFY_AFTER_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
+#: Greppable marker on the CRITICAL escalation and its recovery log line.
+HEALTH_EMISSION_FAILING_MARKER: Final[str] = "NWS_HEALTH_EMISSION_FAILING"
 
 #: The Actor owns the retry window; the gate only records its outcome
 #: (`record_transient_failure(final_window_elapsed=...)`, mirroring the
@@ -554,6 +569,10 @@ class NwsIngestActor(Actor):
         self.observability_io_timeout_s: float = DEFAULT_OBSERVABILITY_IO_TIMEOUT_S
 
         self._alert_state: AlertTracker | None = None
+        #: Consecutive `_emit_health` failures; reset on the first success.
+        self._emit_health_failures = 0
+        #: `now_ns` of the last escalation while failure persists, else `None`.
+        self._emit_health_escalated_at_ns: int | None = None
         #: Mutual exclusion for `poll_once`; see that method's docstring.
         self._poll_in_flight = False
         #: Set by `reconcile_and_report` when `gaps.reconcile` raised, cleared
@@ -1784,6 +1803,7 @@ class NwsIngestActor(Actor):
 
         try:
             await self._emit_health(now_ns, entries=entries, revisions=revisions)
+            self._note_health_emission_success()
         except TimeoutError:
             # NOT swallowed, and the one exception to this method's containment
             # rule. Every other failure here is a defect in our own
@@ -1802,6 +1822,63 @@ class NwsIngestActor(Actor):
                 "health emission failed for %s/%s -- swallowed so the poll continues",
                 self._venue,
                 self._city,
+            )
+            self._note_health_emission_failure(now_ns)
+
+    def _note_health_emission_success(self) -> None:
+        """Reset the failure streak; log recovery once if it had escalated."""
+        escalated = self._emit_health_escalated_at_ns is not None
+        self._emit_health_failures = 0
+        self._emit_health_escalated_at_ns = None
+        if escalated:
+            logger.warning(
+                "%s recovered: health emission succeeded again for %s/%s",
+                HEALTH_EMISSION_FAILING_MARKER,
+                self._venue,
+                self._city,
+            )
+
+    def _note_health_emission_failure(self, now_ns: int) -> None:
+        """Count a failure; escalate at the threshold, at most once per renotify window.
+
+        Delivered straight to `self.alert_sink` -- NOT via `health_io` or
+        `_emit_health`, whose failure is the condition being reported. Never
+        raises: a failing sink is logged (type only) and swallowed.
+        """
+        self._emit_health_failures += 1
+        if self._emit_health_failures < HEALTH_EMISSION_FAILURE_ESCALATION_THRESHOLD:
+            return
+        last = self._emit_health_escalated_at_ns
+        if last is not None and now_ns - last < HEALTH_EMISSION_RENOTIFY_AFTER_NS:
+            return
+        self._emit_health_escalated_at_ns = now_ns
+        site = f"{self._venue}/{self._city}"
+        logger.critical(
+            "%s: health emission failed %d consecutive polls for %s -- alerts and "
+            "snapshots are being lost",
+            HEALTH_EMISSION_FAILING_MARKER,
+            self._emit_health_failures,
+            site,
+        )
+        try:
+            if self.alert_sink is None:
+                return
+            self.alert_sink.emit(
+                AlertPayload(
+                    severity="CRITICAL",
+                    event=HEALTH_EMISSION_FAILING,
+                    site=site,
+                    detail=(
+                        f"{self._emit_health_failures} consecutive health-emission "
+                        "failures; alerts and snapshots are not being delivered"
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.error(
+                "health-emission escalation sink failed for %s exception_type=%s",
+                site,
+                type(exc).__name__,
             )
 
     async def _emit_health(

@@ -31,6 +31,7 @@ __all__ = [
     "ALLOWED_ALERT_PAYLOAD_KEYS",
     "FINAL_OVERDUE",
     "GAP_RETENTION_WARNING",
+    "HEALTH_EMISSION_FAILING",
     "MAX_ALERT_DETAIL_CHARS",
     "POLL_STALE",
     "POST_SETTLEMENT_REVISION",
@@ -78,6 +79,10 @@ UA_TRAP_LATCHED: Final[str] = "ua_trap_latched"
 SITE_BLOCKED: Final[str] = "site_blocked"
 FINAL_OVERDUE: Final[str] = "final_overdue"
 GAP_RETENTION_WARNING: Final[str] = "gap_retention_warning"
+#: Raised by the NWS ingest actor ITSELF, straight to the sink, after
+#: consecutive health-emission failures. Not an `AlertState` condition: the
+#: emission path (`health_io` / `AlertState`) is the thing that is failing.
+HEALTH_EMISSION_FAILING: Final[str] = "health_emission_failing"
 POLL_STALE: Final[str] = "poll_stale"
 POST_SETTLEMENT_REVISION: Final[str] = "post_settlement_revision"
 
