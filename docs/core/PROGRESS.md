@@ -74,10 +74,9 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | AUD-10b | C12 met at 10G peak; cause = conversion of 16 cache-miss instances (`ANALYSIS_replay_10g_2026-09-28.md`); Stage 0 + R3-5 before drop-in removal, run after ING-2-AMEND2 proves out |
 | R3 blockers (only if R3V-b says viable) | (1) MECHANISM_ONLY validity = AUD-11+AUD-12 landing; (2) `UNDERPOWERED_NOT_REGISTERED` not in `_ACTIVE_STATUSES`; (3) no post-freeze filter in `_completed_on_whole_days`. Real f so far 2/5 (Wilson .12–.77); f_req 0.625 |
 
-### REFACTOR Rev 2.1 (executed 2026-10-02; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`)
+### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| R3.2 SUPERVISOR-RESTART | R3.2 is merged at 6e99a7ae but not loaded. Restart the supervisor at or after 01:00Z on 10-03, because an earlier restart leaves `launch_done=False`, so `next_due` never dispatches MIDDAY_WATCH. Verify that the node pid is unchanged and that the adoption line appears |
 | AMBIG-LATCH-RESUME | AMBIG-LATCH-CLEAR (3eb4a108) leaves the exec client DEGRADED after the clear, so health reads DEGRADED while it trades and a later refusal will not re-alert. The native `resume()` (DEGRADED→RESUMING→RUNNING) cannot be called from the resolver without widening E0-NOSEND-RESOLVER's callee allowlist; call it from outside the resolver instead |
 | SUP-RESTART-ANYTIME | Proposed: adopting a live, ready node marks `launch_done`/`readiness_observed`, so the supervisor can deploy at any time. Needs a plan and peer review |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |

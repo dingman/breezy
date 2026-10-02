@@ -103,3 +103,21 @@ The operator overrode the plan's §3.0 hold ("do it now. there is no reason to w
 3. The node refused every take until the 20:05Z relaunch; one take was denied, at 17:38Z.
 
 The fix is tracked in PROGRESS.
+
+## Close-out (2026-10-02, 20:15–22:10Z)
+- **AMBIG-LATCH-CLEAR, merged `3eb4a108`.**
+  - The resolver's terminal zero-fill retirement now clears the AMBIGUOUS refusal. It does so only as the last step, after retire, true-up and permit restore succeed.
+  - The exec-client sha pin was re-pinned after reviewer approval.
+  - Reviews: prediction-market-reviewer APPROVE; silent-failure-hunter found 2 MEDIUM issues, both applied.
+  - Gate: 14,534 passed. Live via a node relaunch at 20:55Z.
+  - DEGRADED-resume is a follow-up. Calling it from the resolver would widen E0-NOSEND-RESOLVER.
+- **CRH-MIXIN-TYPES, merged `d8e8fd92`.**
+  - `NoSideShadowMixin` methods now type `self` against the `_NoSideHost` Protocol. A typo mutation is caught as `attr-defined`, and the method bodies are AST-identical.
+  - Gate: 14,534 passed.
+  - It is typing-only (no runtime behaviour change), so it was not restarted and loads at the next spawn.
+- **CT13-FLAKE.** 0/100 reproductions under capped load. It is moved to a watch item, with the hypothesis recorded in PROGRESS.
+- **R3.2 activated.** The supervisor was restarted at 22:07:32Z, moved up from 01:00Z after an impact assessment.
+  - The cost was losing MIDDAY_WATCH auto-relaunch until 01:00Z. `next_due` gates it on `launch_done and readiness_observed`. The permit watch still runs, so a dead node is still detected.
+  - That cost was covered by a coordinator node-liveness watch (hand relaunch with the A-1 ceiling) until 01:00Z.
+  - The node pid is unchanged (1223483). `permit_watch_adopted_live_node` appeared at 22:07:33Z, and no alert followed.
+- **Plan status: COMPLETE.** Every Rev 2.1 step is merged and loaded in its consumer, except the explicit drops and deferrals (R1.5 → R1.5b, Appendix A dropped with BC-4, and R3.5 / conditional items out of scope by plan).
