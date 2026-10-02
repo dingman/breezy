@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 import replay_sufficiency_census as census_module
-from run_weather_strategy_backtests import _select_capture_instruments
+from tape_instruments import _select_capture_instruments
 
 from breezy.analysis.instance_span_cache import (
     SPAN_ALGO_VERSION,

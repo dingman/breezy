@@ -43,10 +43,10 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 
 def _load_runner_module() -> ModuleType:
-    path = Path("scripts/analysis/run_weather_strategy_backtests.py")
+    path = Path("scripts/analysis/tape_instruments.py")
     sys.path.insert(0, path.parent.as_posix())
     spec = importlib.util.spec_from_file_location(
-        "run_weather_strategy_backtests_convert_live_capture", path
+        "tape_instruments_convert_live_capture", path
     )
     assert spec is not None
     assert spec.loader is not None

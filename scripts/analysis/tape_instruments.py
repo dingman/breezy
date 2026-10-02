@@ -1,19 +1,10 @@
 """Tape-instrument selection helpers for analysis scripts.
 
-This module owns the Nautilus-typed tape seam used by paper replay and the
-weather-strategy backtest runner. It deliberately imports none of the dead
-weather strategy packages:
-
-* ``breezy.strategy.calibration_mean_reversion``
-* ``breezy.strategy.cli_settlement_print_lock``
-* ``breezy.strategy.forecast_mispricing``
-* ``breezy.strategy.forecast_revision``
-* ``breezy.strategy.running_extreme_lock``
-
-Last remaining coupling: ``weather_strategy_backtest_lib.first_blocking_gate``
-has function-scope imports from ``cli_settlement_print_lock``. This module uses
-only that helper module's strategy-free selection functions, so importing the
-tape seam does not reach the dead shell.
+This module owns the Nautilus-typed tape seam used by paper replay, whole-tape
+replay and the replay-sufficiency census. It imports none of the removed
+weather strategy packages (BC-3; they resolve at git tag
+``bc3-pre-removal-2026-10-02``), and it uses only the strategy-free selection
+functions of ``weather_strategy_backtest_lib``.
 """
 
 from __future__ import annotations

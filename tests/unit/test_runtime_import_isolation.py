@@ -93,7 +93,6 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.analysis.replay_daily_runner",
     "scripts.archive.iem_mos_freshness_check",
     "scripts.analysis.weather_strategy_backtest_lib",
-    "scripts.analysis.run_weather_strategy_backtests",
     "scripts.analysis.asos_cache_freshness_check",
     # `breezy-clear-family-halt` / `breezy-set-family-halt` (`breezy.strategy.
     # current_rung_hold.{clear,set}_family_halt_cli`) are `[project.scripts]`
@@ -137,11 +136,12 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
 #: decision rather than a silent omission.
 STAGE0_EXCLUDED_ENTRY_MODULES: Final[frozenset[str]] = frozenset(
     {
-        # R2.3 library module extracted from run_weather_strategy_backtests. It
-        # is not importable standalone as `scripts.analysis.tape_instruments`:
-        # it does a bare `from weather_strategy_backtest_lib import ...` that
-        # resolves only after the runner's `sys.path.insert(0, <scripts/analysis>)`
-        # (the runner, already in the tuple, covers its import isolation).
+        # Tape seam module. It is not importable standalone as
+        # `scripts.analysis.tape_instruments`: it does a bare
+        # `from weather_strategy_backtest_lib import ...` that resolves only
+        # after a `sys.path.insert(0, <scripts/analysis>)`. Its import isolation
+        # is covered through `current_rung_hold_paper_replay` (in the tuple
+        # above) and by `test_tape_instruments_import_isolation.py`.
         "scripts.analysis.tape_instruments",
     }
 )

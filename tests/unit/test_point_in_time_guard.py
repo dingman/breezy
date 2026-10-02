@@ -91,7 +91,7 @@ def test_known_tape_retrieval_after_the_last_decision_instant_is_refused() -> No
         assert_available_before_decision(
             [late],
             decision_ts_init_ns=decision_ns,
-            context="run_weather_strategy_backtests.main default branch",
+            context="paper_replay.main default branch",
         )
     assert caught.value.offending_records == (late,)
     assert len(caught.value.offending_records) == 1
