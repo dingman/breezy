@@ -74,9 +74,10 @@ Step 1 -- classify each ``*.py`` file under ``src/`` and ``scripts/`` as
        comments or docstrings are untouched -- C6 reads names, not strings.
 
 A file that is not venue-touching is exempt from the write-verb rules. That
-exemption is deliberate and load-bearing: ``src/breezy/runtime/health.py``
-legitimately does ``self._client.post(url, json=...)`` to an
-operator-configured alert webhook, which is not a venue egress path. A
+exemption is deliberate and load-bearing: ``src/breezy/registry/health_model.py``
+(re-exported by ``src/breezy/runtime/health.py``) legitimately does
+``self._client.post(url, json=...)`` to an operator-configured alert webhook,
+which is not a venue egress path. A
 blanket repo-wide ban on the token ``POST`` would either fail on that, on
 the constant ``POST_SETTLEMENT_REVISION``, or on prose in docstrings --
 and a barrier that must be silenced is a barrier that will be silenced.
@@ -983,10 +984,26 @@ def test_b4_does_not_fire_on_a_non_venue_module_that_posts_to_an_operator_webhoo
 
 
 def test_b4_actually_covers_the_shipped_health_module_as_a_non_venue_file() -> None:
-    """Guards the exemption itself: health.py must still be non-venue-touching."""
-    path = REPO_ROOT / "src" / "breezy" / "runtime" / "health.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    assert is_venue_touching("src/breezy/runtime/health.py", tree) is False
+    """Guards the exemption itself.
+
+    The shim and the defining module must both stay non-venue-touching, and
+    the defining module must still be the one that posts. A scan that only
+    looks at the re-export would pass after the `.post` moved.
+    """
+    shim = REPO_ROOT / "src" / "breezy" / "runtime" / "health.py"
+    shim_tree = ast.parse(shim.read_text(encoding="utf-8"), filename=str(shim))
+    assert is_venue_touching("src/breezy/runtime/health.py", shim_tree) is False
+
+    defining = REPO_ROOT / "src" / "breezy" / "registry" / "health_model.py"
+    source = defining.read_text(encoding="utf-8")
+    defining_tree = ast.parse(source, filename=str(defining))
+    rel = "src/breezy/registry/health_model.py"
+    assert is_venue_touching(rel, defining_tree) is False
+    assert find_write_egress_violations(rel, source) == []
+    assert any(
+        isinstance(node, ast.Attribute) and node.attr == "post"
+        for node in ast.walk(defining_tree)
+    ), "health_model.py no longer posts; the webhook exemption is hollow"
 
 
 def test_b4_scan_covers_both_src_and_scripts() -> None:

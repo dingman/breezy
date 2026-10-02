@@ -53,11 +53,11 @@ subsequent poll logs a single ``ERROR`` line carrying the stable
 ``STALE_CYCLE_ALERT_MARKER`` -- a plain, greppable constant the deployed
 alert pipeline (``deploy/systemd``) can match on, deliberately not routed
 through ``breezy.runtime.health`` (this module is ``ingest`` and must never
-import ``strategy``/``runtime``; ``nws_actor.py``'s own use of that module is
-an explicitly waived, inspected exception -- ``pyproject.toml``'s
-``breezy.ingest.nws_actor -> breezy.runtime.health`` row -- not a precedent
-to extend). ``DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS`` is a conservative
-margin over the floor, not a measured census value: no arrival-variance
+import ``strategy``/``runtime``). ``nws_actor`` reaches the same alert types
+through ``breezy.registry.health_model``, which sits below ``ingest``; that
+is not a precedent for importing ``runtime`` from here.
+``DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS`` is a conservative margin
+over the floor, not a measured census value: no arrival-variance
 census exists yet for NBP specifically (the SL-15 nightly freshness
 heartbeat is the future home for a measured one).
 

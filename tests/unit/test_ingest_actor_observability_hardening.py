@@ -48,6 +48,7 @@ import pytest
 from breezy.ingest import nws_actor as nws_actor_module
 from breezy.ingest.nws_actor import NwsIngestActor
 from breezy.ingest.shared_state import SharedIngestState
+from breezy.registry import health_model
 from breezy.registry.sites import default_registry
 from breezy.runtime import health as health_module
 from tests.unit.test_ingest_nws_actor import (
@@ -214,6 +215,38 @@ async def test_alert_dispatch_only_ever_runs_under_the_in_flight_guard(
     )
 
 
+@pytest.mark.asyncio
+async def test_alert_state_evaluate_runs_on_the_loop_thread(
+    actor: NwsIngestActor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`AlertState.evaluate` is the read-modify-write. `_emit_health` calls
+    it on the loop thread, then moves only `emit_alert` through `_bounded_io`.
+
+    The spy records the thread of the real method. Moving `evaluate` into
+    the executor (the pre-confinement bug) makes this ident differ from the
+    caller of `poll_once`.
+    """
+    _stub_reconcile(monkeypatch, actor)
+    caller = threading.get_ident()
+    seen: list[int] = []
+    real = health_model.AlertState.evaluate
+
+    def _spy(self: Any, conditions: Sequence[Any], *, now_ns: int) -> tuple[Any, ...]:
+        seen.append(threading.get_ident())
+        return real(self, conditions, now_ns=now_ns)
+
+    monkeypatch.setattr(health_model.AlertState, "evaluate", _spy)
+    actor.network_allowed = lambda: False  # type: ignore[method-assign]
+
+    await actor.poll_once()
+
+    assert seen, "poll_once never reached AlertState.evaluate"
+    assert seen == [caller], (
+        "AlertState.evaluate left the loop thread; it is not thread-safe "
+        f"(caller={caller}, seen={seen})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Finding 2 -- a swallowed reconcile failure must page, not go quiet
 # ---------------------------------------------------------------------------
@@ -353,7 +386,9 @@ async def test_a_stalled_snapshot_write_surfaces_as_task_death(
     def _stalled(path: Path, snapshot: Any) -> None:
         released.wait(30)
 
-    monkeypatch.setattr(health_module, "write_snapshot_atomic", _stalled)
+    # The actor looks the writer up on ``health_model`` at call time. The
+    # ``runtime.health`` re-export is a different module dict.
+    monkeypatch.setattr(health_model, "write_snapshot_atomic", _stalled)
 
     try:
         with pytest.raises(TimeoutError):

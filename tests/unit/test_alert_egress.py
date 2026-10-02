@@ -295,7 +295,7 @@ def test_unset_webhook_is_exactly_todays_behaviour_bare_logging_sink(
     """Unconfigured stays byte-for-byte what it is today: log only."""
     import socket as socket_module
 
-    from breezy.runtime import health as health_module
+    from breezy.registry import health_model
 
     def _no_client(*args: object, **kwargs: object) -> object:
         raise AssertionError("no webhook client may be constructed when unset")
@@ -303,7 +303,9 @@ def test_unset_webhook_is_exactly_todays_behaviour_bare_logging_sink(
     def _no_socket(*args: object, **kwargs: object) -> object:
         raise AssertionError("no socket may be opened when the webhook is unset")
 
-    monkeypatch.setattr(health_module, "_build_webhook_client", _no_client)
+    # The builder is looked up in the defining module, not on the
+    # ``runtime.health`` re-export. Patching the re-export would not trip.
+    monkeypatch.setattr(health_model, "_build_webhook_client", _no_client)
     monkeypatch.setattr(socket_module, "socket", _no_socket)
 
     sink = resolve_alert_sink({})

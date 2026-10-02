@@ -810,8 +810,16 @@ def test_health_module_still_imports_nothing_from_breezy_ingest() -> None:
     is a plain `str | None` precisely so this stays true -- importing
     `gaps.py` here would invert the layering the `GapSummary` seam exists to
     prevent.
+
+    The check parses the defining module (`breezy.registry.health_model`),
+    not the `runtime.health` re-export. The shim imports nothing from
+    `breezy.ingest` even if the implementation does.
     """
-    tree = ast.parse(Path(health_module.__file__).read_text())
+    assert health_module.AlertState.__module__ == "breezy.registry.health_model"
+    defining = (
+        Path(health_module.__file__).resolve().parents[1] / "registry" / "health_model.py"
+    )
+    tree = ast.parse(defining.read_text())
     imported: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -819,6 +827,12 @@ def test_health_module_still_imports_nothing_from_breezy_ingest() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.append(node.module)
 
-    assert not [name for name in imported if name.startswith("breezy.ingest")], (
-        f"health.py grew an import from breezy.ingest: {imported}"
+    def _under(prefix: str) -> list[str]:
+        return [name for name in imported if name == prefix or name.startswith(prefix + ".")]
+
+    assert not _under("breezy.ingest"), (
+        f"health_model.py grew an import from breezy.ingest: {imported}"
+    )
+    assert not _under("breezy.runtime"), (
+        f"health_model.py grew an import from breezy.runtime: {imported}"
     )

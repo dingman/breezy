@@ -1873,6 +1873,7 @@ BANNED_EXEC_TRANSPORT_MODULES = frozenset(
         "breezy.ingest.nws_observation_transport",
         "breezy.ingest.nws_observations",
         "breezy.ingest.probe_transport",
+        "breezy.registry.health_model",
         "breezy.runtime.health",
     }
 )
@@ -2839,6 +2840,8 @@ def test_the_coroutine_inventory_rule_detects_a_new_name() -> None:
         "from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool",
         "from breezy.adapters.polymarket_us.transport import NautilusHttpTransport",
         "from breezy.runtime.health import WebhookAlertSink",
+        "from breezy.registry.health_model import WebhookAlertSink",
+        "from breezy.registry.health_model import resolve_alert_sink",
         "from breezy.ingest.http import something",
     ],
 )

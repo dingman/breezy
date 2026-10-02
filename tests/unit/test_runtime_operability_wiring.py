@@ -273,8 +273,12 @@ class TestSharedAlertSink:
         # rather than the shared `ssl` module keeps the assertion scoped to
         # this module: `breezy.ingest.http` legitimately builds its own TLS
         # context for the NWS transport during runtime construction.
-        monkeypatch.setattr(health, "_build_webhook_client", _forbidden_client)
-        monkeypatch.setattr(health, "WebhookAlertSink", _forbidden_sink)
+        # Looked up in the defining module. The ``runtime.health`` names are
+        # re-exports; patching them would not stop construction.
+        from breezy.registry import health_model
+
+        monkeypatch.setattr(health_model, "_build_webhook_client", _forbidden_client)
+        monkeypatch.setattr(health_model, "WebhookAlertSink", _forbidden_sink)
 
         settings = _settings(tmp_path)
         with _runtime(settings) as rt:

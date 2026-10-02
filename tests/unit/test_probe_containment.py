@@ -288,10 +288,18 @@ def test_a_module_under_scripts_probes_would_also_classify_as_venue_touching() -
 
 
 def test_the_classifier_still_exempts_the_operator_webhook_module() -> None:
-    """Widening the classifier must not start firing on `runtime/health.py`."""
-    source = (SRC_ROOT / "runtime" / "health.py").read_text(encoding="utf-8")
-    tree = ast.parse(source, filename="src/breezy/runtime/health.py")
-    assert is_venue_touching("src/breezy/runtime/health.py", tree) is False
+    """Widening the classifier must not start firing on the webhook owner.
+
+    The `.post` lives in `registry/health_model.py`. The `runtime/health.py`
+    shim re-exports it and must stay non-venue-touching too.
+    """
+    for rel in (
+        "src/breezy/runtime/health.py",
+        "src/breezy/registry/health_model.py",
+    ):
+        source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=rel)
+        assert is_venue_touching(rel, tree) is False, rel
 
 
 # ==========================================================================
@@ -474,7 +482,8 @@ def _breezy_import_closure(rel: str) -> set[str]:
 def test_exactly_one_module_in_the_probe_import_closure_speaks_httpx(rel: str) -> None:
     """The probe cannot inherit a second, softer transport through a dependency.
 
-    Scoped to the CLOSURE rather than all of ``src/``: ``runtime/health.py``
+    Scoped to the CLOSURE rather than all of ``src/``:
+    ``registry/health_model.py`` (re-exported by ``runtime/health.py``)
     legitimately holds an ``httpx.Client`` for the operator alert webhook, and
     banning it repo-wide would be a barrier that has to be silenced. What
     matters is that no such client is reachable from a probe.

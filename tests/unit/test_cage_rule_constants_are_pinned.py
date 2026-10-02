@@ -390,6 +390,7 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "breezy.ingest.nws_observation_transport",
                 "breezy.ingest.nws_observations",
                 "breezy.ingest.probe_transport",
+                "breezy.registry.health_model",
                 "breezy.runtime.health",
             }
         ),
@@ -404,6 +405,7 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "breezy.ingest.nws_observation_transport",
                 "breezy.ingest.nws_observations",
                 "breezy.ingest.probe_transport",
+                "breezy.registry.health_model",
                 "breezy.runtime.health",
                 "breezy.runtime.quote_tape_cli",
             }
