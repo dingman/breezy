@@ -178,49 +178,80 @@ def test_stress_chunk_resume_skips_when_already_done(tmp_path: Path) -> None:
         run_stress_chunk(out_path=out_path, code_sha="b" * 40)
 
 
-def test_derive_pin_refuses_missing_cells(tmp_path: Path) -> None:
-    in_dir = tmp_path / "cal_b"
-    in_dir.mkdir()
+@pytest.fixture(scope="module")
+def canonical_cal_b_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One real 49-cell census plus its stress row, written by
+    `run_census_chunk` / `run_stress_chunk` (L-42: never stub
+    `run_census_cell`). The three derive-pin refusal tests copy this
+    JSONL into their own directory and derive the negative case; the
+    chunk-vs-all-in-one test keeps its own second pass."""
+    out_dir = tmp_path_factory.mktemp("canonical_cal_b")
     code_sha = "a" * 40
     n_cells = len(M1C_GRID)
-    # Only cells 0..(n_cells-2): cell n_cells-1 is missing.
+    if n_cells != 49:
+        raise AssertionError(f"derive-pin coverage is pinned at 49 cells, got {n_cells}")
+    cells_path = out_dir / "cell_all.jsonl"
     run_census_chunk(
-        0, n_cells - 1, out_path=in_dir / "cell_all.jsonl",
-        reps_per_cell=_TINY_REPS, code_sha=code_sha,
+        0, n_cells, out_path=cells_path, reps_per_cell=_TINY_REPS, code_sha=code_sha,
     )
-    run_stress_chunk(out_path=in_dir / "stress.jsonl", code_sha=code_sha, in_dir=in_dir)
+    run_stress_chunk(out_path=out_dir / "stress.jsonl", code_sha=code_sha, in_dir=out_dir)
+    n_rows = len(cells_path.read_text(encoding="utf-8").splitlines())
+    if n_rows != n_cells:
+        raise AssertionError(f"real writer produced {n_rows} cell rows, expected {n_cells}")
+    return out_dir
+
+
+def _copy_canonical_cal_b(src: Path, dest: Path) -> tuple[Path, Path]:
+    """Byte-copy the real writer's JSONL. Callers then derive a negative
+    case from the copy and must not mutate `src` (module-scoped)."""
+    dest.mkdir()
+    cells = dest / "cell_all.jsonl"
+    stress = dest / "stress.jsonl"
+    cells.write_bytes((src / "cell_all.jsonl").read_bytes())
+    stress.write_bytes((src / "stress.jsonl").read_bytes())
+    return cells, stress
+
+
+def test_derive_pin_refuses_missing_cells(
+    tmp_path: Path, canonical_cal_b_dir: Path,
+) -> None:
+    in_dir = tmp_path / "cal_b"
+    cells, _stress = _copy_canonical_cal_b(canonical_cal_b_dir, in_dir)
+    # Truncate the real 49-cell file to 48: cell 48 is missing.
+    lines = cells.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 49
+    cells.write_text("\n".join(lines[:48]) + "\n", encoding="utf-8")
 
     with pytest.raises(MergeCoverageError, match="missing"):
         run_derive_pin(in_dir=in_dir, out_census=tmp_path / "c.json", out_pin=tmp_path / "p.json")
 
 
-def test_derive_pin_refuses_mixed_code_shas(tmp_path: Path) -> None:
+def test_derive_pin_refuses_mixed_code_shas(
+    tmp_path: Path, canonical_cal_b_dir: Path,
+) -> None:
     in_dir = tmp_path / "cal_b"
-    in_dir.mkdir()
-    n_cells = len(M1C_GRID)
+    cells, _stress = _copy_canonical_cal_b(canonical_cal_b_dir, in_dir)
+    # Keep the real writer's cells 0..47, then one extra cell at sha "b"
+    # through the same writer (not a hand-edited row).
+    lines = cells.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 49
+    cells.write_text("\n".join(lines[:48]) + "\n", encoding="utf-8")
     run_census_chunk(
-        0, n_cells - 1, out_path=in_dir / "cell_a.jsonl",
-        reps_per_cell=_TINY_REPS, code_sha="a" * 40,
-    )
-    run_census_chunk(
-        n_cells - 1, n_cells, out_path=in_dir / "cell_b.jsonl",
+        48, 49, out_path=in_dir / "cell_b.jsonl",
         reps_per_cell=_TINY_REPS, code_sha="b" * 40,
     )
-    run_stress_chunk(out_path=in_dir / "stress.jsonl", code_sha="a" * 40, in_dir=in_dir)
 
     with pytest.raises(MergeStageError, match="code_sha"):
         run_derive_pin(in_dir=in_dir, out_census=tmp_path / "c.json", out_pin=tmp_path / "p.json")
 
 
-def test_derive_pin_refuses_missing_stress_row(tmp_path: Path) -> None:
+def test_derive_pin_refuses_missing_stress_row(
+    tmp_path: Path, canonical_cal_b_dir: Path,
+) -> None:
     in_dir = tmp_path / "cal_b"
-    in_dir.mkdir()
-    n_cells = len(M1C_GRID)
-    run_census_chunk(
-        0, n_cells, out_path=in_dir / "cell_all.jsonl",
-        reps_per_cell=_TINY_REPS, code_sha="a" * 40,
-    )
-    # No stress row written at all.
+    _cells, stress = _copy_canonical_cal_b(canonical_cal_b_dir, in_dir)
+    stress.unlink()
+
     with pytest.raises(MergeCoverageError, match="stress"):
         run_derive_pin(in_dir=in_dir, out_census=tmp_path / "c.json", out_pin=tmp_path / "p.json")
 
