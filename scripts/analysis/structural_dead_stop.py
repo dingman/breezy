@@ -67,7 +67,7 @@ from settlement_alignment_study import load_sites
 from breezy.adapters.polymarket_us.tape_records import QuoteTapeGap, resolved_gaps_by_seq
 from breezy.normalize.climate_day import standard_time_zone
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
-from breezy.persistence.quote_tape_gaps import load_partitioned_quote_tape_gaps
+from breezy.runtime.quote_tape_gaps import load_partitioned_quote_tape_gaps
 
 __all__ = [
     "MIN_STRUCTURAL_DEAD_STATION_DAYS",
