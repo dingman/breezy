@@ -12,7 +12,11 @@ current maximum `ts_init` must come back as `existing_max + 1` on both the
 the `+ 1` makes the nudged stamp equal the existing interval, and the real
 writer then skips the batch.
 
-Red mutation: in `_persist_batch`, `existing_max_ts_init + 1` loses the `+ 1`.
+A second test nudges two products of ONE climate day and pins their
+`revision_seq` at 1 then 2.
+
+Red mutations in `_persist_batch`: `existing_max_ts_init + 1` loses the `+ 1`;
+or the `seq_by_day` increment is removed.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import datetime as dt
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 import respx
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
@@ -35,15 +40,20 @@ from tests.contract.test_ingest_backlog_drain import (
     backlog_day,
     mock_synthetic_discovery,
     mock_synthetic_product,
+    synthetic_entry,
+    synthetic_product_payload,
+    synthetic_product_url,
     synthetic_uuid,
 )
 from tests.unit.test_ingest_nws_actor import (
     ALL_SITES,
     CITY,
+    DISCOVERY_URL,
     VENUE,
     FakeClock,
     _local_probe,
     build_actor,
+    discovery_payload,
     durable_store_pair,
 )
 
@@ -134,6 +144,7 @@ async def test_colliding_or_preceding_ts_init_persists_as_existing_max_plus_one(
     catalog = _catalog(tmp_path)
     preceded = _one_climate_day(read_climate_days(catalog), day_b)
     assert int(preceded.ts_init) == existing_max + 1
+    assert preceded.revision_seq == 1
     assert int(preceded.ts_init) != precede_stamp
     assert int(_one_raw(read_raw_products(catalog), day_b).ts_init) == existing_max + 1
 
@@ -144,5 +155,44 @@ async def test_colliding_or_preceding_ts_init_persists_as_existing_max_plus_one(
     catalog = _catalog(tmp_path)
     collided = _one_climate_day(read_climate_days(catalog), day_c)
     assert int(collided.ts_init) == collide_stamp + 1
+    assert collided.revision_seq == 1
     assert int(collided.ts_init) != collide_stamp
     assert int(_one_raw(read_raw_products(catalog), day_c).ts_init) == collide_stamp + 1
+
+
+async def _poll_labelled(actor: NwsIngestActor, day: dt.date, label: str) -> None:
+    """One poll whose single product is a distinct uuid for the SAME climate day."""
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(DISCOVERY_URL).mock(
+            return_value=httpx.Response(
+                200, json=discovery_payload(synthetic_entry(day, label=label))
+            )
+        )
+        mock.get(synthetic_product_url(day, label=label)).mock(
+            return_value=httpx.Response(200, json=synthetic_product_payload(day, label=label))
+        )
+        await actor.poll_once()
+
+
+@pytest.mark.asyncio
+async def test_nudged_second_product_of_one_climate_day_gets_revision_seq_two(
+    wired_actor: tuple[NwsIngestActor, FakeClock],
+    tmp_path: Path,
+) -> None:
+    """Two products of one climate day, the second fetched at a stamp that
+    precedes the catalog maximum: nudged AND counted as revision 2."""
+    actor, clock = wired_actor
+    day = backlog_day(3)
+
+    actor.on_start()
+    await _poll_labelled(actor, day, "first")
+    first_stamp = clock.now
+    clock.now = first_stamp - 1
+    await _poll_labelled(actor, day, "second")
+
+    rows = sorted(
+        (r for r in read_climate_days(_catalog(tmp_path)) if r.climate_day == day),
+        key=lambda r: r.revision_seq,
+    )
+    assert [r.revision_seq for r in rows] == [1, 2]
+    assert [int(r.ts_init) for r in rows] == [first_stamp, first_stamp + 1]

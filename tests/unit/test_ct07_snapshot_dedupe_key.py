@@ -8,8 +8,12 @@ real `OfferTape.append` writer.
 Two quotes that share `ts_event` and ask but differ in size are both
 recorded. A third quote with the same triple as the second is not.
 
-Red mutation: drop `size` from `dedupe_key` in `_hunt_tick`. The second
-quote then collapses onto the first and the tape keeps a single YES row.
+A fourth quote differs from the third only in ask; a fifth differs from the
+fourth only in `ts_event`. Both are kept.
+
+Red mutations in `_hunt_tick`'s `dedupe_key`: drop `size` (the second quote
+collapses onto the first), drop `snapshot.ask` (the fourth collapses onto the
+third), or drop `snapshot.ts_event` (the fifth collapses onto the fourth).
 """
 
 from __future__ import annotations
@@ -50,10 +54,15 @@ def test_size_distinguishes_snapshot_dedupe_and_identical_triples_collapse(
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.80", size=25, ts_event=WINDOW_OPEN_NS))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.80", size=25, ts_event=WINDOW_OPEN_NS))
 
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.81", size=25, ts_event=WINDOW_OPEN_NS))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.81", size=25, ts_event=WINDOW_OPEN_NS + 1))
+
     yes = [record for record in strategy.offer_tape.records() if record.side == "YES"]
-    assert [(record.ts_event, record.size) for record in yes] == [
-        (WINDOW_OPEN_NS, 10),
-        (WINDOW_OPEN_NS, 25),
+    assert [(record.ts_event, record.ask, record.size) for record in yes] == [
+        (WINDOW_OPEN_NS, "0.8", 10),
+        (WINDOW_OPEN_NS, "0.8", 25),
+        (WINDOW_OPEN_NS, "0.81", 25),
+        (WINDOW_OPEN_NS + 1, "0.81", 25),
     ]
     assert {record.reason for record in yes} == {"edge_below_break_even"}
     assert tape.sidecar_errors == 0

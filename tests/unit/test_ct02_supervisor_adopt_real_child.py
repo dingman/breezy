@@ -13,7 +13,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -91,8 +92,26 @@ def _wait_until_holder(
     raise AssertionError("real child never became the /proc/locks holder")
 
 
-def test_boot_shell_adopts_real_flock_holder_and_does_not_spawn(tmp_path: Path) -> None:
-    """``_do_launch`` adopts the pid that holds the intent flock.
+@dataclass
+class _Rig:
+    store_path: Path
+    lock_path: Path
+    ready: Path
+    marker: Path
+    log_dir: Path
+    node_bin: Path
+    stderr_path: Path
+    holder: subprocess.Popen[bytes]
+    spawned: list[subprocess.Popen[bytes]]
+    sink: _RecordingAlertSink
+    ports: SupervisorPorts
+
+
+def _build_rig(
+    tmp_path: Path,
+    find_node_pid: Callable[[subprocess.Popen[bytes]], int],
+) -> _Rig:
+    """Real flock-holding child + ports whose discovery is ``find_node_pid(holder)``.
 
     A second node (``node_bin``) touches ``marker`` only if spawn runs.
     """
@@ -153,7 +172,7 @@ def test_boot_shell_adopts_real_flock_holder_and_does_not_spawn(tmp_path: Path) 
 
     sink = _RecordingAlertSink()
     ports = SupervisorPorts(
-        find_node_pid=lambda: holder.pid,
+        find_node_pid=lambda: find_node_pid(holder),
         resolve_intent_lock_holder=_holder_pid,
         intent_lock_free=intent_lock_is_free,
         count_intent_lock_holders=_holder_count,
@@ -165,32 +184,102 @@ def test_boot_shell_adopts_real_flock_holder_and_does_not_spawn(tmp_path: Path) 
         alert_sink=sink,
         find_adopted_log=lambda _log_dir, _pid: None,
     )
+    return _Rig(
+        store_path=store_path,
+        lock_path=lock_path,
+        ready=ready,
+        marker=marker,
+        log_dir=log_dir,
+        node_bin=node_bin,
+        stderr_path=stderr_path,
+        holder=holder,
+        spawned=spawned,
+        sink=sink,
+        ports=ports,
+    )
+
+
+def _launch(rig: _Rig, tmp_path: Path) -> tuple[int | None, bool]:
+    pid, _log_path, _state, done = _do_launch(
+        ports=rig.ports,
+        state=initial_scheduler_state(_DAY),
+        now=_utc(16, 50),
+        store_path=rig.store_path,
+        repo_root=tmp_path,
+        node_bin=rig.node_bin,
+        log_dir=rig.log_dir,
+    )
+    return pid, done
+
+
+def _cleanup(rig: _Rig) -> None:
+    for proc in rig.spawned:
+        _reap(proc)
+    _reap(rig.holder)
+    _SPAWNED_CHILDREN.clear()
+    _SUPERVISOR_SPAWNED.clear()
+
+
+def test_boot_shell_adopts_real_flock_holder_and_does_not_spawn(tmp_path: Path) -> None:
+    """``_do_launch`` adopts the pid that holds the intent flock."""
+    rig = _build_rig(tmp_path, lambda holder: holder.pid)
     try:
-        _wait_until_holder(holder, ready, lock_path, stderr_path)
-        assert intent_lock_is_free(lock_path) is False
-        pid, _log_path, _state, done = _do_launch(
-            ports=ports,
-            state=initial_scheduler_state(_DAY),
-            now=_utc(16, 50),
-            store_path=store_path,
-            repo_root=tmp_path,
-            node_bin=node_bin,
-            log_dir=log_dir,
-        )
+        _wait_until_holder(rig.holder, rig.ready, rig.lock_path, rig.stderr_path)
+        assert intent_lock_is_free(rig.lock_path) is False
+        pid, done = _launch(rig, tmp_path)
         assert done is True
-        assert pid == holder.pid
-        assert spawned == []
-        assert not marker.exists()
+        assert pid == rig.holder.pid
+        assert rig.spawned == []
+        assert not rig.marker.exists()
         assert all(
             payload.detail != AlertDetail.LAUNCH_BLOCKED_LOCK_HELD.value
-            for payload in sink.payloads
+            for payload in rig.sink.payloads
         )
     finally:
-        for proc in spawned:
+        _cleanup(rig)
+
+
+def test_boot_shell_refuses_live_pid_that_does_not_hold_the_flock(tmp_path: Path) -> None:
+    """Discovery returns a live pid that is NOT the flock holder.
+
+    Characterized behaviour: no adoption (the pid is never returned as the
+    node), no spawn (the flock is held, so a second node would collide), and
+    a LAUNCH_BLOCKED_LOCK_HELD alert fires. A live pid from ``pgrep`` alone
+    is never trusted as the holder.
+    """
+    bystander_box: list[subprocess.Popen[bytes]] = []
+
+    def _bystander(holder: subprocess.Popen[bytes]) -> int:
+        if not bystander_box:
+            bystander_box.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        assert bystander_box[0].pid != holder.pid
+        return bystander_box[0].pid
+
+    rig = _build_rig(tmp_path, _bystander)
+    try:
+        _wait_until_holder(rig.holder, rig.ready, rig.lock_path, rig.stderr_path)
+        pid, done = _launch(rig, tmp_path)
+        assert bystander_box
+        assert process_is_alive(bystander_box[0].pid)
+        assert done is True
+        assert pid is None
+        assert rig.spawned == []
+        assert not rig.marker.exists()
+        assert [payload.detail for payload in rig.sink.payloads] == [
+            AlertDetail.LAUNCH_BLOCKED_LOCK_HELD.value
+        ]
+    finally:
+        for proc in bystander_box:
             _reap(proc)
-        _reap(holder)
-        _SPAWNED_CHILDREN.clear()
-        _SUPERVISOR_SPAWNED.clear()
+        _cleanup(rig)
 
 
 def _holder_pid(lock_path: Path) -> int | None:

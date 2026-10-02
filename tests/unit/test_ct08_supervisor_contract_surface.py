@@ -7,7 +7,8 @@ test):
 * log-marker strings parsed as API (``trade_supervisor_core`` markers)
 * the permit-ceiling env-var literal, ``app.trade._resolve_permit_expiry_ceiling_ns``,
   and ``_do_midday_watch`` injecting that one key into the child env
-* subscribe-marker class names
+* subscribe-marker class names, plus the marker parsed from a line the REAL
+  strategy emits (captured Nautilus log), not the core constant
 * ``spawn_node`` argv/env byte-pin (recording ``Popen``; no process, no
   ``preexec_fn`` call)
 * FQ halt clearing (L-48): real ``set_family_halt`` -> ``_do_self_check``
@@ -91,6 +92,14 @@ from breezy.strategy.current_rung_hold.set_family_halt_cli import (
 from breezy.strategy.current_rung_hold.set_family_halt_cli import (
     set_family_halt,
 )
+from tests.strategy.forecast_quantile_ladder.test_d1_cache_union import (
+    _D1,
+    _STATION,
+    _build,
+    _no,
+    _yes,
+)
+from tests.support.nautilus_log_capture import capture_nautilus_logs
 from tests.unit.test_trade_supervisor import (
     _DAY,
     _FAR_FUTURE_EXPIRES_AT_NS,
@@ -200,6 +209,34 @@ def test_subscribe_marker_class_names() -> None:
     }
     assert strategy_subscribed_in("ForecastQuantileLadderStrategy subscribed") is True
     assert strategy_subscribed_in("not a subscribe line") is False
+
+
+def test_subscribe_marker_is_parsed_from_the_real_fq_strategy_log_line() -> None:
+    """The supervisor's FQ marker matches what ``ForecastQuantileLadderStrategy``
+    actually logs on a real subscription, so renaming the strategy's
+    ``subscribed`` f-string (or the class constant) cannot pass unnoticed."""
+    yes = _yes("lax-d1-80-81", station=_STATION, climate_day=_D1, lower_f=80, upper_f=81)
+    read = capture_nautilus_logs()
+    strategy, _msgbus, _state = _build(
+        instruments=(_no(yes), yes),
+        initial_ids=(),
+        hide_scan=False,
+        d1_resolver=lambda: (),
+    )
+
+    strategy.start()
+
+    lines = read()
+    marker = COMPOSITION_KIND_SUBSCRIBED_MARKERS["forecast_quantile_ladder"]
+    assert any(marker in line for line in lines)
+    assert strategy_subscribed_in("\n".join(lines)) is True
+    # No other composition kind's marker is what made the parser say yes.
+    others = [
+        value
+        for kind, value in COMPOSITION_KIND_SUBSCRIBED_MARKERS.items()
+        if kind != "forecast_quantile_ladder"
+    ]
+    assert not any(other in line for line in lines for other in others)
 
 
 def test_permit_ceiling_literal_is_what_trade_reads(monkeypatch: pytest.MonkeyPatch) -> None:

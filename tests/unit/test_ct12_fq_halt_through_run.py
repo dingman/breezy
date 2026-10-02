@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 from breezy.app.trade import run
 from breezy.runtime.settings import (
     LIVE_OBSERVATIONS_VAR,
@@ -32,6 +33,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.runtime.trade_cli import EXIT_OK
 from breezy.strategy.current_rung_hold.trial_day_latch import open_trial_day_latch
+from breezy.strategy.forecast_quantile_ladder.decision import Take
 from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
     PersistentQuantileLadderLatch,
@@ -56,9 +58,25 @@ _SEEDED_STATION = "LAX"
 _STATIONS = ("LAX", "MDW", "MIA", "SFO")
 
 
+_A_TAKE = Take(
+    instrument_id="X.POLYMARKET_US",
+    station=_SEEDED_STATION,
+    climate_day=_SEEDED_DAY,
+    side="yes",
+    rung_id=_SEEDED_RUNG,
+    qty=1,
+    ev_net=0.1,
+    p_hat=0.5,
+    p_lower=0.4,
+    p_upper=0.6,
+)
+
+
 @dataclass(frozen=True)
 class _BootObservation:
     veto: str | None
+    exec_client_veto: str | None
+    try_submit_refusal: str | None
     fees: tuple[float, ...]
     allow_short: tuple[bool, ...]
     prefix_row_visible: bool
@@ -119,9 +137,25 @@ class _ProbeNode(RecordingNode):
             assert strategy._submit_veto is not None
             vetoes.append(strategy._submit_veto())
         assert len(set(vetoes)) == 1
+        # The callable `run` hands the exec client (the chokepoint at the
+        # venue boundary), not just the one the strategies were given.
+        exec_veto = self.config.exec_clients[POLYMARKET_US_CLIENT_NAME].submit_veto
+        assert callable(exec_veto)
+        # Test-local stand-in permit so `try_submit` reaches the veto guard
+        # (Phase 0 hands the strategies no permit); no real permit is touched.
+        # The fee guard is disabled (the unregistered strategy has no
+        # clock), so the family-halt veto is the only guard that can refuse.
+        refusals = set()
+        for strategy in strategies:
+            strategy._order_submission_permit = object()  # type: ignore[assignment]
+            strategy._fee_verified = None
+            refusals.add(strategy.try_submit(_A_TAKE))
+        assert len(refusals) == 1
         latch = strategies[0]._latch
         self.observation = _BootObservation(
             veto=vetoes[0],
+            exec_client_veto=exec_veto(),
+            try_submit_refusal=refusals.pop(),
             fees=tuple(strategy.config.required_fee_coefficient for strategy in strategies),
             allow_short=tuple(strategy.config.allow_short for strategy in strategies),
             prefix_row_visible=latch.is_latched(
@@ -189,6 +223,8 @@ def test_ct12_halted_twin_submit_veto_refuses(
     )
 
     assert observed.veto == "family_halt"
+    assert observed.exec_client_veto == "family_halt"
+    assert observed.try_submit_refusal == "family_halt"
     _assert_manifest_fee_and_prefix(observed)
 
 
@@ -206,4 +242,6 @@ def test_ct12_unhalted_twin_submit_veto_permits(
     )
 
     assert observed.veto is None
+    assert observed.exec_client_veto is None
+    assert observed.try_submit_refusal is None
     _assert_manifest_fee_and_prefix(observed)

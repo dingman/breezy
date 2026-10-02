@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
+    DailySpendLedger,
 )
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.submit_intent import SubmitIntentState
@@ -88,6 +90,8 @@ async def test_ct01_with_id_empty_executions_refuses_the_second_public_submit(
         body=json.dumps({"id": "ord-ct1-ambiguous", "executions": []}).encode(),
     )
     rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    ledger = DailySpendLedger()
+    rig.client._ledger = ledger
     first = _fq_submit_order(rig)
     second = _fq_submit_order(rig, price="0.64")
 
@@ -102,6 +106,7 @@ async def test_ct01_with_id_empty_executions_refuses_the_second_public_submit(
         rig.client.submit_order(first)
         rig.client.submit_order(second)
         await _drain_scheduled_submits()
+        now_ns = rig.clock.timestamp_ns()
         await rig.client._disconnect()
 
     assert len(sender.calls) == 1
@@ -109,6 +114,10 @@ async def test_ct01_with_id_empty_executions_refuses_the_second_public_submit(
     assert len(denials) == 1
     assert denials[0].client_order_id == second.order.client_order_id
     assert denials[0].reason == submit_chain.OPEN_INTENT_WAIT_REASON
+
+    # The AMBIGUOUS booking is held, not released: today's spend is non-zero
+    # (the refused second submit never reached the ledger).
+    assert ledger.spent_today_usd(now_ns=now_ns) > Decimal(0)
 
     current = rig.submit_intent_latch.current()
     assert current is not None
