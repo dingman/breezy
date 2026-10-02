@@ -95,7 +95,7 @@ layers = [
     "ingest",
     # `registry.health_model` hosts the health data types `ingest` needs (layer + import weight).
     "persistence | registry | normalize",
-    "features | settlement",
+    "settlement",
     "domain",
 ]
 exhaustive = true
@@ -156,7 +156,7 @@ type = "forbidden"
 source_modules = [
     "breezy.app", "breezy.strategy", "breezy.runtime", "breezy.adapters",
     "breezy.ingest", "breezy.persistence", "breezy.registry", "breezy.normalize",
-    "breezy.features", "breezy.settlement", "breezy.domain",
+    "breezy.settlement", "breezy.domain",
 ]
 forbidden_modules = ["breezy.analysis"]
 

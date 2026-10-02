@@ -380,7 +380,7 @@ Type-checks your strategy code under strict mode. If you read a config field, us
 lint-imports
 ```
 
-Enforces the layer contract defined in `pyproject.toml`: `app > analysis > strategy > runtime > adapters > ingest > persistence|registry|normalize > features|settlement > domain`. Strategy code may import only downward through those layers. If you need something from a higher layer, the architecture contract blocks it — that's a signal to refactor.
+Enforces the layer contract defined in `pyproject.toml`: `app > analysis > strategy > runtime > adapters > ingest > persistence|registry|normalize > settlement > domain`. Strategy code may import only downward through those layers. If you need something from a higher layer, the architecture contract blocks it — that's a signal to refactor.
 
 ---
 
