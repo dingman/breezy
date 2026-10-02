@@ -10,6 +10,8 @@ consecutive failures escalate through the alert sink DIRECTLY -- never through
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -215,3 +217,80 @@ async def test_escalation_does_not_go_through_health_io(actor: NwsIngestActor) -
     for _ in range(THRESHOLD):
         await actor.reconcile_and_report()
     assert len(_sink(actor).payloads) == 1
+
+
+class ThreadRecordingSink:
+    def __init__(self) -> None:
+        self.thread_ids: list[int] = []
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.thread_ids.append(threading.get_ident())
+
+
+class SlowSink:
+    def emit(self, payload: AlertPayload) -> None:
+        time.sleep(0.5)
+
+
+@pytest.mark.asyncio
+async def test_sink_emit_runs_off_the_loop_thread(actor: NwsIngestActor) -> None:
+    sink = ThreadRecordingSink()
+    actor.alert_sink = sink
+    _set_emission(actor, failing=True)
+    for _ in range(THRESHOLD):
+        await actor.reconcile_and_report()
+    assert len(sink.thread_ids) == 1
+    assert sink.thread_ids[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_sink_is_bounded_and_does_not_escape(
+    actor: NwsIngestActor, caplog: pytest.LogCaptureFixture
+) -> None:
+    actor.alert_sink = SlowSink()
+    actor.observability_io_timeout_s = 0.05
+    _set_emission(actor, failing=True)
+    with caplog.at_level(logging.INFO, logger=ACTOR_LOGGER):
+        for _ in range(THRESHOLD - 1):
+            await actor.reconcile_and_report()
+        started = time.monotonic()
+        await actor.reconcile_and_report()  # must not raise
+        elapsed = time.monotonic() - started
+        # Still counted as escalated: the next failure must not hot-loop.
+        await actor.reconcile_and_report()
+    assert elapsed < 0.4
+    assert any("TimeoutError" in r.getMessage() for r in caplog.records)
+    assert len(_marker_records(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_sink_logs_a_dropped_escalation(
+    actor: NwsIngestActor, caplog: pytest.LogCaptureFixture
+) -> None:
+    actor.alert_sink = None
+    _set_emission(actor, failing=True)
+    with caplog.at_level(logging.WARNING, logger=ACTOR_LOGGER):
+        for _ in range(THRESHOLD):
+            await actor.reconcile_and_report()
+    assert any("no alert sink" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_sink_failure_logs_type_only_never_the_message(
+    actor: NwsIngestActor, caplog: pytest.LogCaptureFixture
+) -> None:
+    class UrlLeakingSink:
+        def emit(self, payload: AlertPayload) -> None:
+            raise OSError("https://hooks.example/SECRET-TOKEN")
+
+    actor.alert_sink = UrlLeakingSink()
+    _set_emission(actor, failing=True)
+    with caplog.at_level(logging.INFO, logger=ACTOR_LOGGER):
+        for _ in range(THRESHOLD):
+            await actor.reconcile_and_report()
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "OSError" in text
+    assert "SECRET-TOKEN" not in text
+    assert all(
+        "SECRET-TOKEN" not in str(r.exc_info) for r in caplog.records if r.exc_info and MARKER in r.getMessage()
+    )

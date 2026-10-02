@@ -1823,7 +1823,7 @@ class NwsIngestActor(Actor):
                 self._venue,
                 self._city,
             )
-            self._note_health_emission_failure(now_ns)
+            await self._note_health_emission_failure(now_ns)
 
     def _note_health_emission_success(self) -> None:
         """Reset the failure streak; log recovery once if it had escalated."""
@@ -1838,12 +1838,14 @@ class NwsIngestActor(Actor):
                 self._city,
             )
 
-    def _note_health_emission_failure(self, now_ns: int) -> None:
+    async def _note_health_emission_failure(self, now_ns: int) -> None:
         """Count a failure; escalate at the threshold, at most once per renotify window.
 
         Delivered straight to `self.alert_sink` -- NOT via `health_io` or
         `_emit_health`, whose failure is the condition being reported. Never
-        raises: a failing sink is logged (type only) and swallowed.
+        raises: a failing sink is logged (type only) and swallowed. The sink
+        call is a blocking POST for a webhook sink, so it runs off the loop
+        under `_bounded_io`, exactly like the normal `_emit_all` dispatch.
         """
         self._emit_health_failures += 1
         if self._emit_health_failures < HEALTH_EMISSION_FAILURE_ESCALATION_THRESHOLD:
@@ -1860,21 +1862,29 @@ class NwsIngestActor(Actor):
             self._emit_health_failures,
             site,
         )
-        try:
-            if self.alert_sink is None:
-                return
-            self.alert_sink.emit(
-                AlertPayload(
-                    severity="CRITICAL",
-                    event=HEALTH_EMISSION_FAILING,
-                    site=site,
-                    detail=(
-                        f"{self._emit_health_failures} consecutive health-emission "
-                        "failures; alerts and snapshots are not being delivered"
-                    ),
-                )
+        sink = self.alert_sink
+        if sink is None:
+            logger.warning(
+                "%s: escalation dropped for %s (no alert sink wired)",
+                HEALTH_EMISSION_FAILING_MARKER,
+                site,
             )
-        except Exception as exc:
+            return
+        payload = AlertPayload(
+            severity="CRITICAL",
+            event=HEALTH_EMISSION_FAILING,
+            site=site,
+            detail=(
+                f"{self._emit_health_failures} consecutive health-emission "
+                "failures; alerts and snapshots are not being delivered"
+            ),
+        )
+        try:
+            await self._bounded_io(lambda: sink.emit(payload))
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # noqa: BLE001 - as wide as runtime.health.emit_alert.
+            # Type only: httpx/ssl messages embed the webhook URL (a credential).
             logger.error(
                 "health-emission escalation sink failed for %s exception_type=%s",
                 site,
