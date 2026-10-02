@@ -71,20 +71,10 @@ def test_archive_forbidden_contract_is_explicitly_indirect_strict() -> None:
     )
     assert "allow_indirect_imports = false" in pyproject
     assert "breezy.persistence.archive_catalog" in pyproject
-    assert "breezy.ingest.archive_records" in pyproject
 
 
 SETTLEMENT_HOST: Final[str] = "api.weather.gov"
 IEM_HOST: Final[str] = "mesonet.agron.iastate.edu"
-
-#: WP-12c. The ONE module in `src/` allowed to name the IEM host: the forecast
-#: FALLBACK transport, which carries its own named, paced, distinct
-#: `allowed_hosts` and is never the live primary (NBM direct is).
-#: An exact set, not a prefix -- a second module naming the host fails here.
-IEM_HOST_ALLOWED_MODULES: Final[frozenset[str]] = frozenset(
-    {"src/breezy/ingest/iem_mos_fallback_transport.py"}
-)
-
 
 def is_settlement_module(rel_path: str, source: str) -> bool:
     """A settlement module: it lives in `settlement/` or it names the NWS origin."""
@@ -119,9 +109,7 @@ def _src_entries() -> list[tuple[str, str]]:
 def test_settlement_transport_hosts_stay_nws_only() -> None:
     """Separation mutant: moving IEM retrieval into a SETTLEMENT module.
 
-    Settlement transports stay NWS-only. The forecast fallback is a named,
-    paced, distinct `allowed_hosts` in `ingest/iem_mos_fallback_transport.py`
-    (WP-12c) and is NOT a settlement surface.
+    Settlement transports stay NWS-only.
     """
     assert DEFAULT_ALLOWED_HOSTS == frozenset({SETTLEMENT_HOST})
 
@@ -146,10 +134,10 @@ def test_the_settlement_host_rule_still_bites() -> None:
     assert find_iem_host_in_settlement_modules([("src/breezy/ingest/ok.py", "X = 1\n")]) == []
 
 
-def test_only_the_named_fallback_module_may_name_the_iem_host() -> None:
-    """The re-scoping is not a blanket permit: the allowance is one exact path."""
-    namers = {
-        rel_path for rel_path, source in _src_entries() if IEM_HOST in source
-    }
+def test_no_src_module_names_the_iem_host() -> None:
+    """A pure ban: the IEM fallback transport is removed, so no `src/` module
+    may name the IEM host. A reintroduction must be a deliberate, reviewed
+    change to this test."""
+    namers = sorted(rel_path for rel_path, source in _src_entries() if IEM_HOST in source)
 
-    assert namers == IEM_HOST_ALLOWED_MODULES
+    assert namers == []

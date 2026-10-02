@@ -140,7 +140,6 @@ forbidden_modules = [
     "breezy.persistence.archive_catalog",
     "breezy.persistence.archive_cache",
     "breezy.persistence.archive_request",
-    "breezy.ingest.archive_records",
     # SL-4 (FORECAST_NBP_PROBABILISTIC_FAMILY_Rev3_2026-09-29.md §7 row 4,
     # L-12): the derived NBP-backfill store. Live code sees calibration only
     # through the sha-pinned manifest artefact (plan §3.2 item 9); this store
@@ -311,7 +310,6 @@ disallow_subclassing_any = false
 module = [
     "breezy.ingest.nws_actor",
     "breezy.ingest.nws_observation_actor",
-    "breezy.ingest.nbm_forecast_actor",
     "breezy.ingest.nbm_quantile_actor",
 ]
 disallow_subclassing_any = false

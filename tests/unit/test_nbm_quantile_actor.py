@@ -456,7 +456,7 @@ def test_with_no_running_loop_nothing_is_armed_and_no_transport_is_built() -> No
 # ---------------------------------------------------------------------------
 # Execution-egress firewall (SL-11 review, HIGH): this ingest Actor must
 # never become an execution-egress surface -- mirrors
-# test_nbm_forecast_actor.py's own WP12_MODULES guard.
+# the WP-12 egress guard (re-homed here when the NBS actor was removed).
 # ---------------------------------------------------------------------------
 
 SL11_MODULES = ("src/breezy/ingest/nbm_quantile_actor.py",)
@@ -466,6 +466,36 @@ def test_no_sl11_module_is_an_execution_egress_surface() -> None:
     from tests.unit.test_execution_egress_firewall_guard import find_execution_egress_modules
 
     offenders = [v for v in find_execution_egress_modules() if v.path in SL11_MODULES]
+
+    assert offenders == [], "\n".join(str(v) for v in offenders)
+
+
+#: Re-homed from the removed `test_nbm_forecast_actor.py` (WP12_MODULES): the
+#: surviving forecast-ingest and subscriber modules stay outside the
+#: execution-egress surface. Literal paths, so a rename cannot silently empty
+#: the scan.
+WP12_MODULES = (
+    "src/breezy/ingest/nbm_quantile_actor.py",
+    "src/breezy/ingest/nbm_quantile_parse.py",
+    "src/breezy/ingest/nbm_quantile_transport.py",
+    "src/breezy/ingest/nbm_forecast_data_type.py",
+    "src/breezy/strategy/ladder_ev/forecast_subscriber.py",
+)
+
+
+def test_every_wp12_module_path_exists() -> None:
+    """Non-vacuity: the scan below is only meaningful if each path is real."""
+    from tests.unit.test_execution_egress_firewall_guard import REPO_ROOT as _ROOT
+
+    missing = [path for path in WP12_MODULES if not (_ROOT / path).is_file()]
+
+    assert missing == []
+
+
+def test_no_wp12_module_is_an_execution_egress_surface() -> None:
+    from tests.unit.test_execution_egress_firewall_guard import find_execution_egress_modules
+
+    offenders = [v for v in find_execution_egress_modules() if v.path in WP12_MODULES]
 
     assert offenders == [], "\n".join(str(v) for v in offenders)
 
