@@ -174,6 +174,8 @@ FIVE INVARIANTS, EACH WITH ITS OWN VERIFIED CITATION
    fixed, not a disconnect/reconnect cycle within one running process
    (``self._trading_refusals``, appended-only). Only a full process
    RESTART re-derives the refusal set from scratch, by reconciling again.
+   Sole carve-out: resolver-retired terminal zero-fill clears the AMBIGUOUS
+   refusal only (2026-10-02).
    Pinned by
    ``tests/unit/test_polymarket_us_exec_client.py::test_a_latched_refusal_persists_across_a_reconnect_after_the_condition_clears``.
 2. **Native PnL and native cash are NON-AUTHORITATIVE while a position is
@@ -3047,6 +3049,27 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             f"resolver: retired intent {context.intent_id} "
             "(STATUS_REPORT_ZERO_FILL_TERMINAL)"
         )
+        # 2026-10-02: the instrument-unscoped AMBIGUOUS refusal `_refuse`
+        # appended at create time has no subject left once THIS terminal
+        # zero-fill (GET-confirmed, EOF-complete empty trade join) retires
+        # the intent; left in place it denied every later order for the
+        # session. Inline (not a helper) so E0-NOSEND-RESOLVER's permitted
+        # callee set is unchanged. Cleared only while the durable latch
+        # holds no other open intent; every other reason stays. New list,
+        # no in-place mutation.
+        if self._latch.current_open() is None:
+            kept_refusals = [
+                refusal
+                for refusal in self._trading_refusals
+                if refusal.reason != submit_chain.AMBIGUOUS_REASON
+            ]
+            if len(kept_refusals) != len(self._trading_refusals):
+                self._trading_refusals = kept_refusals
+                self._log.info(
+                    f"resolver: cleared the AMBIGUOUS trading refusal "
+                    f"({submit_chain.AMBIGUOUS_REASON!r}) on retirement of "
+                    f"intent {context.intent_id}"
+                )
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
             # Same-process only (Resolution E): on restart the ledger died

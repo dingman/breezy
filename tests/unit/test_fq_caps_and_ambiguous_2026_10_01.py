@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 from nautilus_trader.core.uuid import UUID4
@@ -194,3 +195,195 @@ async def test_fq_order_resolved_ambiguous_then_the_next_take_is_latch_refused(
     assert denials[0].reason == submit_chain.latched_refusal_reason(
         "create-order outcome is AMBIGUOUS; latch stays open and the booking is held",
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-02 incident: the AMBIGUOUS refusal outlived its own retired intent.
+#
+# The automated resolver's terminal ZERO-FILL path retires the durable intent
+# and trues the booking to zero, but the instrument-unscoped AMBIGUOUS entry
+# `_refuse` appended at create time stayed in `_trading_refusals`, so every
+# later `_submit_order` was denied for the rest of the session. These pins
+# drive the REAL resolver pass (the rig lives in the resolver test module).
+# ---------------------------------------------------------------------------
+
+_AMBIGUOUS_REASON = submit_chain.AMBIGUOUS_REASON
+_UNRELATED_REFUSAL = "unrelated latched refusal for the clear-scope pin"
+
+
+async def _take(client: object, ordinal: int) -> SubmitOrder:
+    """One more take on the resolver rig's own strategy and instrument.
+
+    ``ordinal`` seeds the factory's client-order-id counter past the id the
+    rig's own first take already used, so the cache never sees a duplicate.
+    """
+    from nautilus_trader.common.component import LiveClock
+    from nautilus_trader.common.factories import OrderFactory
+
+    from tests.unit.test_current_rung_hold_pre_arm_race import (
+        STRATEGY_ID,
+        _submit_command,
+    )
+    from tests.unit.test_current_rung_hold_pre_arm_race import (
+        TRADER_ID as RACE_TRADER_ID,
+    )
+
+    factory = OrderFactory(trader_id=RACE_TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())
+    factory.set_client_order_id_count(ordinal)
+    command = _submit_command(client, factory, "")  # type: ignore[arg-type]
+    client._cache.add_order(command.order, position_id=None)  # type: ignore[attr-defined]
+    return command
+
+
+def _denial_reasons(order_events: list[Any]) -> list[str]:
+    return [event.reason for event in order_events if isinstance(event, OrderDenied)]
+
+
+def _set_get_evidence(client: object, order_id: str, slug: str, *, state: str, cum: float,
+                      positions: dict[str, Any], eof: bool = True,
+                      avg_px: str | None = None) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import _order_get_body
+
+    payloads = client._private_read._payloads  # type: ignore[attr-defined]
+    payloads[f"/v1/order/{order_id}"] = _order_get_body(
+        order_id, slug=slug, state=state, cum_quantity=cum, avg_px=avg_px,
+    )
+    payloads["/v1/portfolio/positions"] = {"positions": positions, "eof": eof}
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_fill_retirement_clears_ambiguous_refusal_and_a_take_reaches_sender(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import (
+        _arm_one_ambiguous_intent,
+        _run_resolver_passes,
+    )
+    from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+
+    enable_operator_gate(monkeypatch, order_count="3")
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(tmp_path)
+        sender = client._order_sender
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        await client._submit_order(await _take(client, 10))
+        assert len(sender.calls) == 1, "a second take is latch-refused while the intent is open"
+        assert len(_denial_reasons(order_events)) == 1
+
+        _set_get_evidence(client, order_id, slug, state="ORDER_STATE_CANCELED", cum=0, positions={})
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch.current_open() is None
+        assert _AMBIGUOUS_REASON not in client.trading_refusals
+        await client._submit_order(await _take(client, 20))
+        assert len(sender.calls) == 2, "a take after the clear must reach the sender"
+        assert len(_denial_reasons(order_events)) == 1, "no further denial after the clear"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_fill_retirement_keeps_an_unrelated_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import (
+        _arm_one_ambiguous_intent,
+        _run_resolver_passes,
+    )
+    from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+
+    enable_operator_gate(monkeypatch, order_count="3")
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
+        client._refuse(_UNRELATED_REFUSAL)
+        _set_get_evidence(client, order_id, slug, state="ORDER_STATE_CANCELED", cum=0, positions={})
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch.current_open() is None
+        assert _UNRELATED_REFUSAL in client.trading_refusals
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_positions_read_neither_retires_nor_clears_the_ambiguous_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import (
+        _arm_one_ambiguous_intent,
+        _run_resolver_passes,
+    )
+    from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+
+    enable_operator_gate(monkeypatch, order_count="3")
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
+        _set_get_evidence(
+            client, order_id, slug, state="ORDER_STATE_CANCELED", cum=0, positions={}, eof=False,
+        )
+        await _run_resolver_passes(client, count=2)
+
+        assert client._latch.current_open() is not None
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_non_terminal_get_neither_retires_nor_clears_the_ambiguous_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import (
+        _arm_one_ambiguous_intent,
+        _run_resolver_passes,
+    )
+    from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+
+    enable_operator_gate(monkeypatch, order_count="3")
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
+        _set_get_evidence(client, order_id, slug, state="ORDER_STATE_NEW", cum=0, positions={})
+        await _run_resolver_passes(client, count=2)
+
+        assert client._latch.current_open() is not None
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_fill_terminal_retirement_does_not_clear_the_ambiguous_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_canonical_verified: None,  # noqa: F811
+) -> None:
+    from tests.unit.test_current_rung_hold_ambiguous_resolver import (
+        _arm_one_ambiguous_intent,
+        _run_resolver_passes,
+    )
+    from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+
+    enable_operator_gate(monkeypatch, order_count="3")
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        client, order_id, slug, _latch_cm, _events = await _arm_one_ambiguous_intent(tmp_path)
+        _set_get_evidence(
+            client, order_id, slug, state="ORDER_STATE_FILLED", cum=1,
+            positions={slug: {"netPosition": "1"}}, avg_px="0.40",
+        )
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+        assert _AMBIGUOUS_REASON in client.trading_refusals
+        await client._disconnect()
