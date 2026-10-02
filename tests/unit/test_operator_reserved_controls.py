@@ -731,7 +731,9 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     ``utc_day_for_ns`` to compute the UTC day for the strategy's own
     ``TrialDayLatch.is_day_budget_exhausted`` read -- it reads no control
     value either, only the day boundary the exec client's marker key already
-    uses.
+    uses. R3.4 (2026-10-02) split the NO-side shadow evaluator into
+    ``continuous_no_side.py``; the same pure ``utc_day_for_ns`` read now lives
+    in both files and reads no control value.
     Seventh, declared 2026-09-21 (AUD-04, portfolio ROI report): the OFFLINE,
     read-only `scripts/analysis/portfolio_roi_report.py` imports ONE pure
     symbol, `_round_cost_up_to_cent`, to quantise `cost + fee` per ledger fill
@@ -761,6 +763,7 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         "src/breezy/adapters/polymarket_us/factories.py",
         "src/breezy/adapters/polymarket_us/safety.py",
         "src/breezy/runtime/order_enablement.py",
+        "src/breezy/strategy/current_rung_hold/continuous_no_side.py",
         "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
     ]
 
