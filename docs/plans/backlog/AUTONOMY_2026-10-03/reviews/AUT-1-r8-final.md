@@ -24,3 +24,4 @@ The §3.15 AST closure boundary needs to be pinned down:
 - **E-9 (adopted 2026-10-03):** any multi-command oneshot bounds each command and sums the bounds (ARCH-ERRATA E-9). Binding build item.
 - **AST allowlist (coordinator ruling, 2026-10-03, from AUT-6 r9 review):** the non-writer closure check is an allowlist of named read-only calls, not a denylist. See reviews/AUT-6-r9-merged.md AC6.
 - **E-7a (adopted 2026-10-03):** universal bwrap through the shared wrapper and table; WAL reads via the snapshot helper; AST check is a lint. See ARCH-ERRATA E-7a. Binding build item.
+- **E-7c (2026-10-03):** the shared bwrap wrapper provides a private `--tmpfs /tmp` with TMPDIR; see ARCH-ERRATA E-7c. Binding build item.

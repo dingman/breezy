@@ -15,3 +15,4 @@ The items below are binding on the WP briefs.
 - **WARN frequency:** a WARN with k<3 fires once per UTC day.
 - **Double page:** a parity mismatch double-pages, through #16 and through AUT-4's ALERT. Either state that this is intended or dedupe on the closure sha.
 - **Producer-live marker:** the marker latches on the first `eval_offline` verdict, including ERROR. Note this.
+- **E-7c (2026-10-03):** the shared bwrap wrapper provides a private `--tmpfs /tmp` with TMPDIR; see ARCH-ERRATA E-7c. Binding build item.

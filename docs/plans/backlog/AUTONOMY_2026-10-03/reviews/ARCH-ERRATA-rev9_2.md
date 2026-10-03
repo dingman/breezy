@@ -199,3 +199,68 @@ Coordinator ruling, 2026-10-03, from the AUT-6 r11 review.
   - Those readers rely on the fingerprint-stable retry alone. Their results are **advisory**, consistent with E-8's "node-up reads are advisory": a result never counts toward H and never authorises a widening.
   - E-7a rule 3's "intent-flock step applies to the exec store" means the AUT-5 pre-launch pass only.
 - **AUT-5 r7.** Binding build item: add the parameters and a test for each mode.
+
+## E-7b: venue-adapter import closure for offline replay children (coordinator ruling, 2026-10-03, AUT-4 r7 O-1)
+
+AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `breezy.adapters.polymarket_us.symbology`.
+
+**(a) Required first:** WP1 measures the replay closure. Pure symbology and slug helpers move into an adapter-free module, with delegating shims, following the AUT-6 AF1 precedent. The closure test then passes with no exception.
+
+**(b) Permitted only if the WP1 measurement shows the replay needs non-exec adapter modules** (for example, instrument definitions consumed by the native `BacktestEngine`):
+- grant a named E-7a rule-2 exception on the `eval-offline` row only;
+- scope it to the measured non-exec modules;
+- guard it with `test_eval_offline_closure_has_no_adapter_exec_module` (no `breezy.adapters.polymarket_us.exec*` module, no exec client and no HTTP or WS client in the closure).
+
+**Rejected:** narrowing the E-7 rule generally. This is consistent with the AUT-6 AF1 ruling.
+
+## E-7c: scratch space under the shared bwrap wrapper (coordinator, 2026-10-03, from the AUT-4 r7 MLE review)
+
+- The rule-1 invocation `--ro-bind / /` leaves `/tmp` read-only. Nautilus, pyarrow and `tempfile` scratch writes therefore fail.
+- The shared wrapper always adds `--tmpfs /tmp` and sets `TMPDIR=/tmp` for every row. This scratch space is private, discarded at exit, and never a write path for durable state.
+- Test: `test_bwrap_wrapper_provides_private_tmp` must confirm all of the following:
+  - a write under `/tmp` succeeds;
+  - the file is not visible on the host;
+  - the state paths still return EROFS.
+- Applies to every plan as a binding build item.
+
+## E-11: SELF_HEAL is realised natively by systemd (coordinator, 2026-10-03, from AUT-6 r14/r15)
+
+- **Adopted text.** The exact replacement text is the eight items ER-1..ER-8 in `AUT-6-drift-health_plan_r15.md` §ERRATA-REQUEST, as amended in r15 (ER-1, ER-5, plus the consequential ER-2, ER-3, ER-7, ER-8). Both blind reviewers voted ADOPT: TBA 96 and SFH 95.
+- **Substance.**
+  - SELF_HEAL is systemd's own `Type=notify` + `WatchdogSec` + `Restart=` on watchdog + `StartLimit*` + `OnFailure=`.
+  - A member sends `WATCHDOG=1` only while its liveness counter advances.
+  - No autonomy module issues a `systemctl` restart, start or stop.
+  - The AUT-6 notifier pages any state it cannot prove is a pending restart.
+  - The recorder's incident-backed `StartLimitIntervalSec=0` is a recorded exception. It is bounded by restart backoff, gets a per-kill page via `OnFailure=`, and gets one storm page after 3 kills in a trading day.
+  - The launch-window deferral is journaled and alerts WARN once per deferred stall.
+- **Dedupe.** E-11 is the single vehicle for the ARCH §4.5/§4.6 SELF_HEAL wording. AUT-1's ER-8 is reduced to recorder-unit-only text.
+- **Consumption.** AUT-6 r15, and AUT-1 r10 (recorder side: X-1..X-7 in `reviews/AUT-6-r14-merged.md`).
+
+## E-12: AUT-1 native-first capture (coordinator, 2026-10-03, from AUT-1 r9–r12)
+
+- **Adopted text.** ER-1..ER-10 of `AUT-1-data-capture_plan_r12.md` §ERRATA-REQUEST, exactly as written there. Verdicts:
+  - ER-1..ER-7 and ER-10: ADOPT, or AMEND with the amendment already applied.
+  - ER-7 includes the per-type and per-write size-delta checks.
+  - ER-8 is REDUCED to recorder-unit-only text. The ping source runs from process start; there is a journal cross-check (leg W); E-11 is the vehicle for SELF_HEAL.
+  - ER-9 is AMENDED. Its final clause reads: "…recorder and feed stall observations (the recorder's process-level heal is systemd's own watchdog, per §4.6 as amended by E-11; AUT-6 pages and does not restart)".
+- **Substance.**
+  - C1 is realised by a native `StreamingFeatherWriter` owned by the capture actor (option B), behind a catch-all wrapper.
+  - The record types are `@customdataclass` types. No record type has an `instrument_id` field.
+  - `ForecastPoint` is streamed natively, and records reference it by `(station, cycle_ns, available_at_ns)`.
+  - Frames are referenced in the recorder tape. A Take-path record copies its frame.
+  - The payload store, the JSONL writer, FrameClock and the custom watch/watchdog are removed.
+  - Loss is bounded at about 61 s (60 s heartbeat plus 1 s flush) and is counted against `SHADOW_DECISION`.
+- **Consumption.** AUT-1 r12. AUT-6 r15 build item 7 is consistent.
+
+## E-13: E-7c tmpfs size and the E-7b(a) symbology waiver (coordinator, 2026-10-03, from AUT-4 r9–r11)
+
+- **Adopted text.** ER-1 and ER-2 from `AUT-4-evaluation_plan_r11.md`. Both reviewers voted ADOPT.
+- **ER-1 (E-7c).** The shared wrapper passes `--size` before `--tmpfs /tmp`.
+  - A row that sets an explicit per-row `tmpfs_size_bytes` gets that size; AUT-4's rows set it explicitly.
+  - Any other row gets the wrapper's default cap, so other plans' rows never break.
+  - A malformed value fails closed, and a named test covers it.
+- **ER-2 (E-7b(a)).** The symbology move is waived when the WP1 measurement shows it buys nothing, because the closure still reaches symbology via `fees`, `parsing` and `symbology`. The waiver:
+  - applies to the eval-offline row only;
+  - requires the WP1 measurement and the (b) guard tests to be green;
+  - never reaches `order_enablement` or `exec*`;
+  - does not waive (b)'s "needs" condition.

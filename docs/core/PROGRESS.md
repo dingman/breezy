@@ -61,8 +61,8 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 `/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
 | # | ID | Work | Needs | Status |
 |---|---|---|---|---|
-| 1 | AUT-1-R9 | PLAN native-first AUT-1 r9 (`reviews/AUT-1-native-pressure-test.md`) | — | OPEN |
-| 2 | AUT-NATIVE | PLAN Nautilus-native pressure test of AUT-2..7; reopen failures | — | OPEN |
+| 1 | AUT-1-R9 | PLAN native-first AUT-1 → r12 READY (E-12) | — | DONE |
+| 2 | AUT-NATIVE | PLAN native pressure test; AUT-6 → r15, AUT-4 → r11 READY (E-11, E-13) | — | DONE |
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper | 1,2 | OPEN |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | OPEN |
@@ -76,12 +76,12 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | 13 | AUT-3 | BUILD retraining; only once AUT-4 shows an edge or a new source exists | 10 | GATED |
 Area closes only at an independent score of 3 after its live proof; scores now 2,1,0,2,1,2,2 (AUT-1..7).
 
-### BUILD
+### BUILD (`BP` = `docs/plans/backlog/BACKLOG_PLANS_2026-10-03`; build items in `BP/reviews/<ID>-r<N>-final.md`)
 | ID | Sev | Open work (exact) | Source |
 |---|---|---|---|
-| CF-12-STAGE | LOW | `backlog/stage-cf12-w2-2026-09-29` @4b0b4f6 (Wave 2: 185 unused ignores removed, Codex, AST-verified; ratchet rejects mypy exit 2) — gate armed `breezy-gate-stage-cf12` 08:50Z (waits for AUD-07) → log `~/.cache/breezy-gate/stage-cf12.log`; EXIT=0 ⇒ ff-merge + push | CF-12 |
-| CF-12-W3 | LOW | 314 `import-not-found` (bare sibling-script imports): config-only `mypy_path` fix NOT viable (exit 2, duplicate module `x` vs `scripts.analysis.x`) → design pass (normalize qualified imports or invocation) | CF-12 trial 09-29 |
-| DEFER-STREAK-LOAD | LOW | `ingest_deferral_streak.load_state` (:190-195) accepts non-str `first_deferred_utc` from disk unchecked | CF-12 triage 09-29 |
+| CF-12-STAGE | LOW | READY plan `BP/CF-12-STAGE_plan_r1.md` (regenerate 185 ignores on HEAD; before W3) | CF-12 |
+| CF-12-W3 | LOW | READY plan `BP/CF-12-W3_plan_r4.md`, after CF-12-STAGE | CF-12 trial 09-29 |
+| DEFER-STREAK-LOAD | LOW | READY plan `BP/DEFER-STREAK-LOAD_plan_r2.md` | CF-12 triage 09-29 |
 
 ### RUN / ANALYSE
 | ID | Open work (exact) |
@@ -93,8 +93,8 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### REFACTOR Rev 2.1 — COMPLETE 2026-10-02 (all steps live; log `docs/plans/refactor_2026-10-01/EXECUTION_LOG_2026-10-02.md`); open follow-ups
 | ID | Open work (exact) |
 |---|---|
-| AMBIG-LATCH-RESUME | AMBIG-LATCH-CLEAR (3eb4a108) leaves the exec client DEGRADED after the clear, so health reads DEGRADED while it trades and a later refusal will not re-alert. The native `resume()` (DEGRADED→RESUMING→RUNNING) cannot be called from the resolver without widening E0-NOSEND-RESOLVER's callee allowlist; call it from outside the resolver instead |
-| SUP-RESTART-ANYTIME | Proposed: adopting a live, ready node marks `launch_done`/`readiness_observed`, so the supervisor can deploy at any time. Needs a plan and peer review |
+| AMBIG-LATCH-RESUME | READY plan `BP/AMBIG-LATCH-RESUME_plan_r6.md` (two-phase merge; supersedes L-36 no-id clause) |
+| SUP-RESTART-ANYTIME | READY plan `BP/SUP-RESTART-ANYTIME_plan_r4.md` |
 | CT13-FLAKE (watch) | 1 failure under 4 concurrent gates; 0/100 reproduction under load, 0 misses in 500k `/proc/locks` reads. Hypothesis: a transient read returns None, so adoption fails closed. On a 2nd occurrence, add a `locks_path` fault-injection test |
 
 ### Comment backlog (R0.1)
@@ -103,7 +103,7 @@ Area closes only at an independent score of 3 after its live proof; scores now 2
 ### WATCH / GATED (no build owed; re-open only on the named trigger)
 - **A1 floor (operator act):** EDGE-2-LIVE, EDGE-2-LAG, R-7-IMPL (first create-path `R7_POSITION_REPORTING_LAG`).
 - **Evidence floor:** AUD-06b (CONFIRMED unit-qty edge + new family), CF-13 (live CCA/CCB), CF-14b (1-of-N stage-3 failure).
-- **Trigger watches:** EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration).
+- **Trigger watches:** AMBIG-SIGN-TABLE (extend the no-id manual sign table if `SELL_SHORT` or any unobserved manual shape appears); EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration).
 - **Rules:** HALT-FSM = accepted cosmetic (Nautilus swallows it; fail-safe; whitelist `InvalidStateTrigger STOPPED->START_COMPLETED` in greps); T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
 
 

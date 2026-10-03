@@ -20,3 +20,5 @@ The following are binding on the WP briefs.
 Consume E-7a once it is adopted: universal bwrap, and the AST check demoted to a lint.
 - **E-7a (adopted 2026-10-03):** universal bwrap through the shared wrapper and table; WAL reads via the snapshot helper; AST check is a lint. See ARCH-ERRATA E-7a. Binding build item.
 - **E-8a (2026-10-03):** `exec_snapshot` gains `cache_dir` and `take_flock` parameters. Only the 16:45 pass flocks; node-up reads are advisory. Binding build item, with a test per mode.
+- **AUT-NATIVE (2026-10-03):** native pressure test PASS; two §2 rejection rows owed (reviews/AUT-NATIVE-pressure-test-2026-10-03.md).
+- **E-7c (2026-10-03):** the shared bwrap wrapper provides a private `--tmpfs /tmp` with TMPDIR; see ARCH-ERRATA E-7c. Binding build item.

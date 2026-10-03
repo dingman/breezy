@@ -1,0 +1,1360 @@
+# AUT-1 — Data capture: area plan, round 9 (native-first rewrite on frozen ARCH Rev 9.2)
+
+## 0. Header
+
+| Field | Value |
+|---|---|
+| ID | AUT-1, delivered as **AUT-1a** (Wave 1: offline units, the custom data types, the recorder watchdog) and **AUT-1b** (after AUT-5a merges: strategy hooks, guard, the composition hunk, node-local detectors), per ARCH Rev 9.2 §5.1 (P1-7) |
+| Title | Data capture: every decision, order, fill, mark and settlement for every family, joinable on one `decision_id`, persisted through Nautilus's own streaming writer, reconciled daily against independent sources, with native process-level stall detection and self-heal |
+| Round | **r9 (2026-10-03).** r1–r8 are unchanged. Inputs: r8 (`docs/plans/backlog/AUTONOMY_2026-10-03/AUT-1-data-capture_plan_r8.md`, sha256 `bd7f4d8c8929eb0e…`), the r8 final review (`docs/plans/backlog/AUTONOMY_2026-10-03/reviews/AUT-1-r8-final.md`), and the **Nautilus-native pressure test** (`docs/plans/backlog/AUTONOMY_2026-10-03/reviews/AUT-1-native-pressure-test.md`, sha256 `ffba3f2e258c54b8…`). Its disposition table is a **coordinator ruling**: r9 follows it row by row (§R9). r8's §R3–§R8 history is not repeated; r8 stays the record of those rounds. |
+| ARCH consumed | **FROZEN Rev 9.2**: `docs/plans/backlog/AUTONOMY_2026-10-03/reviews/snapshots/ARCH_rev9_2.md`, sha256 `1b288d0e0172b233b791d875845e8002824a52d4a2e7819685ec0f2057572f42` (re-hashed 2026-10-03). Binding errata: `docs/plans/backlog/AUTONOMY_2026-10-03/reviews/ARCH-ERRATA-rev9_2.md` (re-read at the end of drafting: sha256 `148ab3eb00691a55…`), E-1…E-10, E-7a, **E-7b, E-7c** (both adopted while r9 was being written), E-8a. Where a native substitution conflicts with the frozen C1 text, r9 does **not** reinterpret ARCH: it files the exact replacement text in §ERRATA-REQUEST and blocks the affected WPs on adoption (§4 gate G-ERR). Per E-3, Rev 9.2 change tags are written `R9.2-Z1…Z9`. |
+| Code baseline | `feat/data-capture-and-risk` @ `f45f5a65`. Breezy citations were read through codegraph (`projectPath=/home/jon/breezy`) or `sed` on the named file. Nautilus citations are `nautilus_trader 1.231.0` under `/home/jon/breezy/.venv/lib/python3.13/site-packages/nautilus_trader/`, read with `/usr/bin/grep -rn` after a positive control (`live/node.py:39 class TradingNode` found; memory note `grep-tool-is-blind-under-venv`). Below, `NT/` abbreviates that directory. |
+| Paths | Repo-root-relative for code, tests and deploy files (repo `/home/jon/breezy`). Runtime paths written `derived/…`, `evidence/…`, `health/…` are under `/home/jon/.local/share/breezy/` (ext4, `findmnt` 2026-10-03). `<capture_root>` is `/home/jon/.local/share/breezy/derived/capture_stream/polymarket_us/`, the trade node's **own** streaming root, never under the quote-tape root `/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us/`. `<decisions_dir>` is `/home/jon/.local/share/breezy/catalog/quote_tape/decisions/` (`src/breezy/app/trade.py:774`, unchanged; AUT-1 now writes only `settlement_*.jsonl` there). |
+| Current score | 2 |
+| Target | 3 |
+| Upstream | ARCH-0 (`src/breezy/persistence/autonomy/` schemas, C4 writer, C6 Protocols, `NODE_PLUGINS`, `RefusingPlugin`, `VetoReason`, `pins.py`, `test_autonomy_files_have_one_writer`); AUT-5a (`ResolvedFamily`, `RegistryWatchActor.drill_active`, the `entry_veto` slot, sole owner of `src/breezy/app/trade.py` in Wave 1); AUT-6 (`deliver_with_proof`, the node `AlertOutbox` (claim order per E-1), unit health, the node-liveness detector, the shared bwrap wrapper `deploy/systemd/breezy-autonomy-bwrap` and `AUTONOMY_BWRAP_TABLE` (E-7a)); AUT-5 (the E-8 snapshot helper with the E-8a API); AUT-2 (canary producer) |
+| Downstream | AUT-2, AUT-3, AUT-4 and AUT-6 consume C1 through the r9 reader projection (§3.9). **Four READY plans cite r8 internals that r9 removes**; §5.3 lists each citation and the brief amendment it needs. |
+
+---
+
+## 1. Goal state
+
+### 1.1 README `AUT-1` score-3 criterion (verbatim; the plan's own scope)
+
+> **Score-3 criterion.**
+> - What must be captured, durably, for every family: every decision (including refusals and their reasons), intent, order, fill, cancel, position mark, settlement, the depth snapshot at decision time, and the forecast or model inputs with artefact sha.
+> - Every record is schema-versioned and joinable on one decision id.
+> - A daily completeness audit runs automatically and alerts on any gap.
+> - A recorder hang or an empty feed is detected and self-healed with no human action.
+>
+> **Live proof:** 7 consecutive UTC days with 100% join completeness for every live fill, from decision to settlement, plus at least one detected and self-healed recorder or feed stall (an injected one is acceptable if no natural stall occurs).
+
+The README live-proof window rule binds it (verbatim):
+
+> A day counts toward any N-day live-proof window only if it has at least one real fill, or a clearly tagged synthetic canary fill that traverses the production path. Zero-fill days do not count, and the window extends. Every window also needs at least 5 real fills, and canary fills never count toward that or any statistic.
+
+**r9's reading of "durably" (coordinator ruling, pressure-test row "fsync durability").** A record is durable once Nautilus's `StreamingFeatherWriter` has flushed it. The writer:
+- flushes at most every `flush_interval_ms` (default 1000, `NT/persistence/writer.py:159`);
+- flushes only when a later write arrives (`check_flush` is called from `write`, `:278`, `:578-586`);
+- never fsyncs (`flush` calls `stream.flush()` only, `:588-594`).
+
+r9 accepts this. A node crash can lose the unflushed tail. The loss is **bounded**: a 60 s heartbeat forces a flush, so the tail is at most about 61 s (§3.4.4). It is also **counted**: the daily audit checks it against an independent denominator, the node log's `SHADOW_DECISION` lines (§3.11, leg R5). A lost Take-path record still fails its fill's join, so the live-proof criterion is never relaxed. Only the mechanism that makes the loss visible changes.
+
+### 1.2 ARCH Rev 9.2 §10 "Area plan obligations", AUT-1 (verbatim)
+
+> **AUT-1:** the `CaptureAdapter` call sites per composable kind; measured C1 volume per day; the `EntryVeto` record writer; the node-local observations behind `feed_stale`, `recorder_stale`, `capture_gap` (source, period, clear condition); the recorder and feed stall observations, naming each unit AUT-6 may restart; the daily join audit with offline intent linkage (P1-3); the payload store and volume (P1-4); the settlement writer (P1-6); `capture_epoch_start`; with AUT-4, the live-vs-batch parity take divergence (38 vs 35); the `Exit` id function and record (P1-8); the `capture_untagged` refusal (P1-9); restarts only via AUT-6 (P1-10, P1-12); `quote_ref` payloads and `wall_ns` (U8, U9).
+
+| Obligation | r9 section | Slice | Errata |
+|---|---|---|---|
+| `CaptureAdapter` call sites per kind | §3.5 | 1a (adapter), 1b (hooks) | — |
+| Measured C1 volume | §3.2 | 1a WP0 | — |
+| `EntryVeto` writer | §3.5.3 CS-2, §3.6 | 1b | — |
+| `feed_stale`, `recorder_stale`, `capture_gap` | §3.7 | 1b | — |
+| Stall observations; units AUT-6 may restart | §3.10 | 1a | ER-8 |
+| Daily join audit with offline intent linkage | §3.11 (leg I) | 1a | — |
+| Payload store and volume (P1-4) | **replaced** by frame and forecast references plus the Take-path frame copy (§3.3) | 1a | ER-3, ER-10 |
+| Settlement writer | §3.12 | 1a | — |
+| `capture_epoch_start` | §3.4.5 | 1a library, 1b write | — |
+| 38-vs-35 parity divergence (with AUT-4) | §3.14 | 1a WP6 | — |
+| `Exit` id function and record (P1-8) | §3.4.1, §3.6.2 | 1a, 1b | — |
+| `capture_untagged` refusal (P1-9) | §3.6.2 | 1a, 1b | — |
+| Restarts only via AUT-6 (P1-10, P1-12) | §3.10: AUT-1 calls no restart; the recorder's process-level heal is systemd's own `Restart=` on a native watchdog | 1a | ER-8 |
+| `quote_ref` payloads and `wall_ns` (U8, U9) | §3.3 (quote frame reference), §3.4.1 (`wall_ns`) | 1a, 1b | ER-4 |
+
+### 1.3 Facts
+
+r8 §1.3 holds unchanged at `f45f5a65`, and r9 relies on these of its rows:
+- quote is published before depth for one frame, with a shared `ts_event` (`src/breezy/adapters/polymarket_us/data.py:1590`, `:1599`);
+- FQ evaluates on both triggers and drops `source` (`src/breezy/strategy/forecast_quantile_ladder/strategy.py:740-757`);
+- `evaluate` latches before any capture code (`decision.py:357`);
+- one handler call evaluates exactly one decision;
+- the four exit tags (`src/breezy/persistence/exit_tags.py:42-45`);
+- `intent_fingerprint` is a pure sha256 over `str()` of six order attributes (`src/breezy/adapters/polymarket_us/exec/submit_chain.py:242-253`);
+- the funnel flushes every 15 min (`decision_funnel.py:47`);
+- the `submit_order` call sites;
+- the `extend_dedupe:` formats;
+- the 38-vs-35 divergence;
+- the AUT-6 restart rules of ARCH §4.5.
+
+New in r9 (read 2026-10-03):
+
+| Fact | Evidence | Used in |
+|---|---|---|
+| `Refuse`, `NotExecutable` and `NotDPlus1` carry only `reason`. `Take` carries `p_hat`, `p_lower`, `p_upper` and `ev_net`. The margin is `forecast_margin(h_hours, cfg)`, computed inside `evaluate`. | `src/breezy/strategy/forecast_quantile_ladder/decision.py:129-172`, `:353-355` | §3.5.2 (numeric inputs on refusals) |
+| `SHADOW_DECISION` is emitted once per `evaluate_snapshot`, with no capture dependency. | `strategy.py:564-581` | independent denominator (§3.11 R1, R2, R5) |
+| The trade node config sets no `streaming`, no `instance_id` and no `DataEngineConfig`. Its exec-client config holds a lambda (`state_store_opener`) and runtime objects (`submit_intent_latch`, `live_trading_permit`, `submit_veto`). | `src/breezy/runtime/node_config.py:945-972` | §3.4.2 (V-2) |
+| The recorder already streams natively, with `include_types` (`QuoteTick`, `OrderBookDepth10`, `TradeTick`, …) and daily `SCHEDULED_DATES` rotation. | `src/breezy/runtime/node_config.py:282-295`, `:400-403`, `:606-614` | frame references (§3.3) |
+| The recorder samples feed health on the event loop every `_feed_watch_interval_secs`. | `src/breezy/adapters/polymarket_us/data.py:1947-1960` (`_watch_feed` → `sample_feed_health`) | §3.10 (ping site) |
+| The NBP actor already logs `NBM_NBP_STALE_CYCLE` on **every** poll past a cycle's deadline, on its existing timer. | `src/breezy/ingest/nbm_quantile_actor.py:142`, `:336-338`, `:415`, `:425-449` | §3.7.2 |
+| The recorder unit is `Type=simple`, `Restart=always`, `NotifyAccess=none`, `WatchdogUSec=0`. ExecStart runs python directly, so the main PID is the interpreter. | `systemctl --user show breezy-quote-tape.service` (2026-10-03) | §3.10 |
+| The shared venv has no sd_notify library. | `ls .venv/lib/python3.13/site-packages` (no `systemd`, no `sdnotify`) | §3.10 (stdlib datagram; L-51 forbids installs) |
+| Venue credentials in the trade config are env-var **names** only. | `src/breezy/adapters/polymarket_us/credentials.py:34-44` | §3.4.2 (config-dump hygiene) |
+| On this host, a `Restart=always` crash is journaled as `98e32220…` (process exit), `d9b373ed…` (unit failed) and `5eb03494…` (scheduled restart), all under the invocation id. `Result` describes only the current invocation. | AUT-6 r13 §0 facts (journal JSON, 7 days) | §3.10.3 (heal confirmation from the journal) |
+
+---
+
+## 2. L-1 null hypothesis and reuse (every remaining custom component, with Nautilus 1.231.0 evidence)
+
+"Native" means a Nautilus class or extension point used as shipped. "V-n" marks a verify-first premise that WP0 pins with mutation evidence (L-33) before any slice relies on it (L-47).
+
+### 2.1 What Nautilus already provides, and r9 reuses
+
+| Need | Nautilus capability (file:line) | Verdict |
+|---|---|---|
+| Durable per-decision record | `@customdataclass` (`NT/model/custom.py:31-163`). It builds `to_dict`/`from_dict`/`to_arrow`/`from_arrow` and **registers** the type with `register_serializable_type` and `register_arrow` at decoration time (`:160-161`). Field types are limited to `str`, `bool`, `float`, `int`, `bytes`, `ndarray`, `dict` and `InstrumentId` (`:244-276`); anything else raises `TypeError` at decoration. | **Reuse.** Five record types (§3.4.1). No `Optional` field: null is the empty string for `str` and 0 for `int` (§3.4.1 encoding rule). |
+| Publishing a record | `Actor.publish_data(data_type, data)` publishes on the custom-data topic (`NT/common/actor.pyx:2813-2830`). | **Reuse.** |
+| Persisting it | `StreamingConfig` (`NT/persistence/config.py:28-73`). `NautilusKernel._setup_streaming` builds a `StreamingFeatherWriter` at `{catalog_path}/{environment}/{instance_id}` and subscribes it to `"*"` (`NT/system/kernel.py:508-509`, `:587-604`). `include_types` filters before any work (`NT/persistence/writer.py:193-195`). A custom type without `instrument_id` gets one regular `custom_<snake>_<ts>.feather` file (`:240-249`, `:457-471`). | **Reuse** on `<capture_root>`, the trade node's own root (§3.4.2), gated on V-2..V-5. |
+| Order intent and the `decision_id` carrier | `Order.tags` (`NT/model/orders/base.pyx:218`); `OrderFactory.limit(..., tags=...)` (`NT/common/factories.pyx:246-309`). `OrderInitialized` has a registered Arrow schema carrying `tags`, `client_order_id`, `instrument_id`, `order_side`, `quantity`, `price` and `time_in_force` (`NT/serialization/arrow/schema.py:192-229`; registration `NT/serialization/arrow/serializer.py:468-473`). | **Reuse native.** The streamed `OrderInitialized` replaces r8's `OrderLink`. It is both the link (tag → `client_order_id`) and the intent (the `intent_fingerprint` inputs). V-6 pins the `str()` forms. |
+| Fills | `OrderFilled` has a registered Arrow schema (`serializer.py:476-481`). `DurableFillRecord` stays the authoritative fill census (`src/breezy/adapters/polymarket_us/exec/client.py:949-976`). | **Reuse native**, streamed. The exec store stays the independent census. |
+| Position marks | Every `PositionEvent` subclass is registered (`serializer.py:508-514`). | **Reuse native.** The reader projects C1 `PositionMark` with the venue leg sign (L-44; §3.9). |
+| Per-instrument freshness | `Cache.quote_tick(instrument_id)` (`NT/cache/cache.pyx:3204`). `DataEngine._handle_quote_tick` adds the tick to the cache (`NT/data/engine.pyx:2716`) **before** it publishes (`:2725-2728`). | **Reuse.** Replaces r8's `FrameClock` stamp. V-7 covers the gap: Depth10 is published without a cache write (`:2691-2696`), and the trade node does not set `emit_quotes_from_book_depths` (`NT/data/config.py:71`, default `False`). So a one-sided book that yields no `QuoteTick` leaves the cache stale (§3.7.1). |
+| Order and position event delivery to a capture actor | the `events.order.*` wildcard (the RiskEngine subscribes the same pattern, `NT/risk/engine.pyx:189`); `Actor.msgbus.subscribe` | **Reuse native.** |
+| Config encoding for the stream's `config.json` | `register_config_encoding(type_, encoder)` (`NT/common/config.py:223-225`). `msgspec_encoding_hook` consults it (`:172-174`) before raising `TypeError` (`:176`). | **Reuse native**, if V-2 needs it (§3.4.2). |
+| Process liveness and restart of the recorder | systemd `WatchdogSec=` + `sd_notify("WATCHDOG=1")` + `Restart=` (host systemd 259). The recorder unit already has `Restart=always`. | **Reuse native** (pressure-test row "recorder alive but not capturing"). Replaces r8's heartbeat file, `breezy-capture-watch` and `breezy-capture-watchdog`. V-8..V-10. |
+| Funnel counts and refusal reasons | `SHADOW_DECISION` lines (`strategy.py:564-581`); `FqDecisionFunnelActor` (`decision_funnel.py`, `app/trade.py:773`) | **Reuse**, read-only, as the independent denominator. |
+| Fill and order census, intent linkage | `DurableFillRecord`; `FILL_*`, `VENUE_ORDER_ID_KEY_PREFIX`, `RESOLVER_CONTEXT_KEY_PREFIX` (`client.py:404-454`); `intent_fingerprint` | **Reuse**, read-only, through the E-8 snapshot helper with `take_flock=False` (E-7a rule 3, E-8a). |
+| Settlement truth | `read_climate_day_including_corrections` (`src/breezy/persistence/catalog.py:637`) | **Reuse**, inside the settlement unit. |
+| Alerts and delivery proof | AUT-6 `deliver_with_proof`; the node `AlertOutbox` | **Consume.** |
+
+### 2.2 Custom components that remain (one L-1 row each)
+
+| Component | Null hypothesis tested | Evidence that the gap is real | Verdict |
+|---|---|---|---|
+| **`DecisionRecord` numeric inputs on refusals**: `p_hat`, `p_lower`, `p_upper`, `ev_net`, `margin`, `ask_px`, the forecast reference, `artefact_sha256` | "The decision object or the shadow line already carries them." | `Refuse`, `NotExecutable` and `NotDPlus1` carry only `reason` (`decision.py:129-150`). The shadow line is built from `decision_log_fields(decision)` (`decision.py:178`). Nautilus has no notion of a strategy decision. | **Extend minimally.** Additive keyword fields on `Refuse`, set where `evaluate` already computed them (§3.5.2). The record is a `@customdataclass`. |
+| **Record of cancel, deny, reject, expire, submit and accept** (`OrderEventRecord`) | "The native stream writes every order event." | Only `OrderInitialized` and `OrderFilled` are registered with `register_arrow` (`serializer.py:468-481`). `OrderDenied` has a schema in `NAUTILUS_ARROW_SCHEMA` (`schema.py:242-252`) but is never registered, so the writer hits `Can't find writer for cls` and returns (`writer.py:250-253`). | **Small msgbus subscriber.** It republishes exactly the event classes **absent from `list_schemas()`** as one `@customdataclass` (§3.6.3). The set is computed at boot from `list_schemas()`, so it holds by construction and never double-writes. |
+| **Settlement record** | "A live node sees settlement." | The node has no settlement event for venue weather markets; settlement truth is the NWS CLI, read offline. | **Custom offline unit** reusing `read_climate_day_including_corrections`, unchanged from r8 (§3.12). |
+| **NBP silent-feed check and hang reset** | "The NBP actor's timer already detects absence." | `_check_stale_cycle` logs `NBM_NBP_STALE_CYCLE` (`nbm_quantile_actor.py:425-449`), but it raises no delivered alert and exposes no veto input. `_submit` drops the `Future` (`:348-353`), so a hung poll is never reset. | **Extend the existing timer** (§3.7.2): no new timer, no new actor. |
+| **Completeness audit** | "Nautilus or an existing Breezy job reconciles capture against an independent source." | No such job exists; the funnel counts are aggregates. | **Custom daily unit**, with `SHADOW_DECISION` as the independent denominator (§3.11). |
+| **`decision_id` and `eval_seq`** (`compute_decision_id`, `EvalSeqCounter`) | "Nautilus provides a decision identity." | C1 defines the id; Nautilus has none. | **Pure functions** (§3.4.1). r8's `FrameClock` is deleted; only its pure `EvalSeqCounter` survives, moved into `capture_ids.py`. |
+| **`CaptureGuardedStrategy`** (the `capture_untagged` refusal, P1-9) | "The RiskEngine can refuse an untagged order." | The RiskEngine is immutable and checks no tags; Breezy cannot configure a tag rule into it. | **Extend by subclassing**: a `Strategy.submit_order` override that calls `super()`, the same purpose as r8. Its `OrderLink` fsync is removed (§3.6.2). |
+| **`capture_epoch_start`** | "Kernel or supervisor records hold the first capture boot." | They hold no capture identity. | **New, minimal** (§3.4.5), unchanged from r8. |
+| **Take-path frame copy** (`FrameCopy`) | "The recorder tape always holds the decision's frame." | The recorder is a separate process with its own WebSocket connections and its own gaps (`QuoteTapeGap`, `node_config.py:289-295`). The node cannot observe the tape at decision time, and a Take-path frame missing from the tape cannot be recovered later. | **Copy only on the Take path** (§3.3.2), at most about 10 a day. Refusal records carry references only. This is r9's reading of "copy only when the tape lacks it" (§R9 row 3, flagged for the coordinator). |
+| **Recorder watchdog gate**: a pure classifier plus stdlib `sd_notify` | "systemd alone detects a live-but-not-capturing recorder." | `Restart=always` sees only a process exit; a zombie with a live loop keeps running (memory note `recorder-hangs-disconnected`). The gate decides **whether to ping**; systemd decides when to kill and restart. | **Minimal** (§3.10.1). |
+| **Recorder stop hook** (`ExecStopPost=`) | "systemd alerts on a watchdog kill." | systemd logs it, but nothing delivers it with proof (ARCH §4.6). | **Minimal** one-shot command in the recorder unit (§3.10.2). |
+| **Adapter-free `intent_fingerprint` and exec-store key prefixes** (`src/breezy/domain/exec_intent.py`) | "The wrapped audit can import them from the adapter." | E-7a makes every AUT-1 unit wrapped, and wrapped units have no import path to the venue adapters (E-7 rule 2; E-7b rejects narrowing it). `intent_fingerprint` lives in `exec/submit_chain.py:242-253`. The key prefixes live in `exec/client.py:404-454`, which is byte-pinned by `test_exec_client_is_byte_identical_to_its_pre_sl13_sha256`. | **Move, AF1/E-7b(a) precedent.** `intent_fingerprint` moves byte-identically into the domain module, and `submit_chain.py` re-exports it as a delegating shim (V-15 first proves that `submit_chain.py` is not byte-pinned). The key prefixes are restated in the domain module, and `tests/unit/autonomy/test_exec_intent_parity.py::test_exec_key_prefixes_equal_client_constants` (a test-only import of `client.py`) pins them equal. `client.py` stays byte-identical. |
+
+---
+
+## §R9 Disposition (`reviews/AUT-1-native-pressure-test.md`, coordinator ruling)
+
+| # | r8 component | Pressure-test disposition | r9 outcome | Where |
+|---|---|---|---|---|
+| 1 | Refusal reason per decision | Reuse `SHADOW_DECISION` and the funnel | **Reused** as the audit's independent denominator (R1, R2, R3, R5). The `DecisionRecord` still carries `reason` (C1). | §3.11 |
+| 2 | Custom JSONL `CaptureWriter`: fsync, short-write recovery, tail check, byte cap, failure journal, `.INCOMPLETE` markers | `@customdataclass DecisionRecord` via `publish_data`, plus `StreamingConfig` on the trade node's own root | **Removed.** Replaced by five `@customdataclass` types (§3.4.1), one publish wrapper (§3.4.3) and `StreamingConfig(catalog_path=<capture_root>)` (§3.4.2). Gone with it: `capture_writer.py`, the tail check, the `partial_line`/`torn_tail` classes (replaced by Arrow stream truncation), the 64 MiB cap, the `incomplete/` journal and the markers. | §3.4 |
+| 3 | Payload store: `derived/capture_payloads/…`, `PayloadStore`, the `AsyncPayloadWriter` thread, the pending map, `payload_status`, collision handling | References: `(instrument_id, ts_event)` into the recorder's `order_book_depths`, and `(station, cycle_ns)` for forecasts. Copy only when the tape lacks the frame. | **Removed.** Records carry `frame_kind`, `instrument`, `frame_ts_event`, `forecast_station` and `forecast_cycle_ns`. **Copy rule:** the node cannot see the tape at decision time (§2.2). It therefore copies the frame (`FrameCopy`) for **Take-path records only**, where a miss would break a fill's join irrecoverably. Refusals never copy; an unresolved refusal reference is counted (leg R6). **Flagged:** this narrows "only when the tape lacks it". The coordinator may rule instead that Takes never copy either, which would make the live-proof join depend on recorder coverage (WP0 V-11 measures that coverage). | §3.3 |
+| 4 | Custom `OrderLink`, `LifecycleEvent` and `PositionMark` writers; the lifecycle actor's per-event records | Native streaming plus `Order.tags` | **Removed.** `OrderInitialized`, `OrderFilled` and every `PositionEvent` are streamed natively through `include_types`. The C1 logical records are reader projections (§3.9). | §3.4.2, §3.9 |
+| 5 | Cancel/deny | Small msgbus subscriber | **Kept**, generalised by construction to every order-event class absent from `list_schemas()`. | §3.6.3 |
+| 6 | Settlement writer | Custom record reusing the corrections reader | **Kept** unchanged (r8 §3.9). | §3.12 |
+| 7 | Recorder heartbeat file, `breezy-capture-watch`, `breezy-capture-watchdog`, `capture_watch/v1`, `restart_request`, the heal handshake through AUT-6 | systemd `WatchdogSec` + `sd_notify`, sent only while the counters advance, with `Restart=on-watchdog` | **Removed.** The recorder pings only while its own counters and on-disk bytes advance (§3.10.1). `WatchdogSec=600` triggers the kill, and the existing `Restart=always` (a superset of `on-watchdog`) restarts it. A stop hook delivers the CRITICAL and writes the stall record (§3.10.2). The audit confirms the heal and sends `CAPTURE_HEALED_<sha>` (§3.11.6). The watchdog's other duties move into the audit and live-proof units, which check each other daily, plus AUT-6's unit health (§3.11.5). Needs ER-8. | §3.10 |
+| 8 | NBP feed silent | A check on the existing actor timer | **Kept and moved** onto `NbmQuantileActor.on_cycle_timer`, beside the hang reset. | §3.7.2 |
+| 9 | `FrameClock` | `Cache.quote_tick(iid).ts_init`; verify that the cache is populated before the handler runs | **Removed.** Freshness reads the cache. Its pure `EvalSeqCounter` stays in `capture_ids.py`, because C1's `eval_seq` needs it. V-7 covers the quote path and records the depth-only gap. | §3.7.1 |
+| 10 | fsync on Take-path records | Accept the ~1 s flush with no fsync; count the loss in the audit | **Accepted.** A 60 s heartbeat bounds the unflushed tail; leg R5 counts every lost record against `SHADOW_DECISION`. | §1.1, §3.4.4, §3.11 |
+
+Components the pressure test does not name are kept, minus their r8 coupling to the removed writer:
+- the guard (§3.6.2);
+- the on-change rule (C1, L-29);
+- `decision_id` and `eval_seq`;
+- the epoch;
+- the 38-vs-35 attribution;
+- the heal-alert linkage, now carried by the audit;
+- the weekly drill, now with no AUT-5b dependency (§3.10.4).
+
+**r8-final binding items, re-applied to r9:**
+
+| Item | r9 status |
+|---|---|
+| MEDIUM §3.15 AST closure boundary: AUT-1 path globs only; cross-unit write modules imported only through named read-only functions; a non-literal `open` mode or `os.open` flags fail closed; reason values are constants; state whether a `capture_gap` refusal cites payloads | **Applies** to the smaller module set (§3.15). On the last point: a `capture_gap` refusal record cites the triggering frame **by reference** and never carries a `FrameCopy`. It is not a Take-path record that reached the order path (§3.3.2). |
+| LOW heal age-out (`heal_alert_unabandoned_count`; a loud line for unmarked heals older than `today−30`) | **Applies**, now in the audit (§3.11.6). |
+| LOW `on_stop` fact drain | **Moot**: the payload thread and its fact queue are removed. It is replaced by a binding item with a test: the capture actor's `on_stop` publishes its final heartbeat inside `try/except` before the writer closes (§3.6.3). |
+| LOW stale wording; align `recorder_liveness` with `recorder_stale` | **Applies**: the only detector name is `recorder_stale` (§3.7.4). WP briefs re-grep for "r8" and "r7". |
+| LOW `test_payload_collision_is_critical` on the caller side | **Moot**: there is no payload store. |
+| LOW the watch-actor closure belongs to AUT-5; `node_observations.py` is AUT-1's node-side non-writer | **Applies** (§3.15). |
+| E-9 multi-command oneshots | **Applies**: no AUT-1 oneshot has more than one start command. The recorder unit gains `ExecStopPost=`, bounded by `timeout -k` within `TimeoutStopSec` (§3.10.2). |
+| The AST check is an allowlist, not a denylist (AUT-6 r9 AC6 ruling) | **Applies** (§3.15). |
+| E-7a universal bwrap; WAL reads via the snapshot helper; the AST check is a lint | **Applies** (§3.13, §3.15). |
+| E-7c (added to `reviews/AUT-1-r8-final.md` during r9): the shared wrapper provides a private `--tmpfs /tmp` with `TMPDIR` | **Applies.** pyarrow and the reader's scratch writes use it (§3.13). |
+| **New in r9 (not raised by any reviewer): the venue-adapter import-closure rule under E-7a/E-7b** | r8's audit imported `intent_fingerprint` from `src/breezy/adapters/polymarket_us/exec/submit_chain.py` and the key prefixes from the byte-pinned `exec/client.py`. r8's WP6 reruns `scripts/analysis/nbp_shadow_parity.py`, which imports `breezy.adapters.polymarket_us.symbology`; per AUT-6 r13 §0 fact (20), that pulls in 33 adapter modules. Once every AUT-1 unit is wrapped, both break the closure rule. r9's fix: `src/breezy/domain/exec_intent.py` (§2.2, §3.1, WP0 V-15, WP5) and the E-7b(a) dependency for WP6 (§3.14). |
+
+---
+
+## 3. Design
+
+### 3.0 Slices (ARCH §5.1)
+
+| Slice | Contents | Starts | Depends on |
+|---|---|---|---|
+| **AUT-1a** | WP0 premises; WP1 record types, ids, stream reader and projection; WP2 FQ adapter and guard library; WP3 recorder watchdog gate, stop hook and unit edits; WP4 NBP timer check and hang reset (built in Wave 1, **merged with WP8**); WP5 settlement, audit and live-proof; WP6 parity attribution | Wave 1, against ARCH-0 stubs | ARCH-0; AUT-6 (`deliver_with_proof`, the wrapper); errata adoption for WP1 and WP5 (G-ERR) |
+| **AUT-1b** | WP7 FQ hooks and the re-base on the guard; WP8 capture actor, node-local detectors, epoch, `StreamingConfig` wiring and the composition hunk; WP9 weekly drill | After AUT-5a merges | AUT-5a; AUT-6 (outbox, node-liveness detector) |
+
+### 3.1 Module map (layering: app > analysis > strategy > runtime > adapters > ingest > persistence|registry|normalize > settlement > domain)
+
+| Module | Layer | New/edit | Purpose | Slice |
+|---|---|---|---|---|
+| `src/breezy/persistence/autonomy/capture_records.py` | persistence | new | the five `@customdataclass` types (§3.4.1), `NULL_STR = ""`, `capture_data_types()` | 1a |
+| `src/breezy/persistence/autonomy/capture_ids.py` | persistence | new | `compute_decision_id`, `compute_exit_decision_id`, `compute_orphan_decision_id`, `EvalSeqCounter` (pure; moved from r8's `frame_clock.py`), `frame_ref_of`, `forecast_ref_of` | 1a |
+| `src/breezy/persistence/autonomy/capture_on_change.py` | persistence | new | `OnChangeFilter` (pure, shared by the node and audit R2), unchanged from r8 | 1a |
+| `src/breezy/persistence/autonomy/capture_publish.py` | persistence | new | `CapturePublisher`: the one catch-all publish wrapper, its counters and `health` (§3.4.3) | 1a |
+| `src/breezy/persistence/autonomy/capture_stream.py` | persistence | new | `capture_streaming_config(root) -> StreamingConfig`, `CAPTURE_INCLUDE_TYPES`, `open_canary_writer(root, cache, clock)` (§5.2) | 1a |
+| `src/breezy/persistence/autonomy/capture_reader.py` | persistence | new | `read_capture_stream(boot_dir)`; `project_c1(...)` (views of `DecisionRecord`, `OrderLink`, `LifecycleEvent`, `PositionMark`, `DetectorEvent`); `join_fills_to_decisions`; `resolve_frame_ref`; `resolve_forecast_ref` (§3.9) | 1a |
+| `src/breezy/persistence/autonomy/capture_alerts.py` | persistence | new | `CAPTURE_ALERT_EVENTS`, `CAPTURE_EVENT_RE`, `heal_alert_event(sha)`, `abandoned_alert_event(sha)` (the r8 §3.13 rules) | 1a |
+| `src/breezy/persistence/autonomy/capture_epoch.py` | persistence | new | `write_epoch_once`, `read_epoch` (unchanged from r8) | 1a |
+| `src/breezy/persistence/autonomy/capture_schedule.py` | persistence | new | `LAUNCH_WINDOW_UTC`, `launch_window_guard` (unchanged from r8; ARCH-0's equivalent wins if one exists) | 1a |
+| `src/breezy/persistence/exit_tags.py` | persistence | edit | `DECISION_ID_TAG_PREFIX` (L-12) | 1a |
+| `src/breezy/strategy/autonomy_capture/guarded_strategy.py` | strategy | new | `CaptureGuardedStrategy(Strategy)` | 1a (library) |
+| `src/breezy/strategy/autonomy_capture/capture_actor.py` | strategy | new | `CaptureActor(Actor)`: order-event subscriber, 60 s heartbeat timer, detectors, epoch write | 1b |
+| `src/breezy/strategy/autonomy_capture/node_observations.py` | strategy | new | NODE_LOCAL detectors `capture_writer_health`, `md_feed_freshness` and `recorder_stale` (non-writer) | 1b |
+| `src/breezy/strategy/forecast_quantile_ladder/capture_adapter.py`, `plugin.py` | strategy | new | `FqCaptureAdapter` (C6), `CaptureContext`; FQ's `NODE_PLUGINS` entry | 1a |
+| `src/breezy/strategy/forecast_quantile_ladder/decision.py` | strategy | edit | additive keyword fields on `Refuse` (§3.5.2); `decision_log_fields` output byte-identical | 1b (WP7) |
+| `src/breezy/strategy/forecast_quantile_ladder/strategy.py` | strategy | edit | the base class; CS-0..CS-5 (§3.5.3) | 1b |
+| `src/breezy/domain/exec_intent.py` | domain | new | `intent_fingerprint` (moved byte-identically) and the exec-store key prefixes the audit reads; no adapter import | 1a (WP5) |
+| `src/breezy/adapters/polymarket_us/exec/submit_chain.py` | adapters | edit | `intent_fingerprint` becomes a re-export of `breezy.domain.exec_intent.intent_fingerprint` (delegating shim; `client.py` is untouched) | 1a (WP5) |
+| `src/breezy/ingest/nbm_quantile_actor.py` | ingest | edit | retain the `Future`; the hang reset; `missed_cycles(now_ns)`; the stale-cycle alert offer; the heal record (§3.7.2) | 1a (built), merged with WP8 |
+| `src/breezy/ingest/records.py` | ingest | edit | the public alias `climate_day_end_ns` (r8, for leg S) | 1a |
+| `src/breezy/adapters/polymarket_us/recorder_watchdog.py` | adapters | new | `RecorderSample`; `classify_recorder_sample(...)` (pure); `sd_notify(message) -> bool` (stdlib `AF_UNIX` datagram) | 1a |
+| `src/breezy/adapters/polymarket_us/{config,data}.py` | adapters | edit | opt-in `watchdog_notify: bool = False` on the data-client config; one call in `sample_feed_health` | 1a |
+| `src/breezy/runtime/node_config.py` | runtime | edit | `build_quote_tape_node_config` sets `watchdog_notify=True`. `build_trade_node_config(..., capture_stream_root: Path \| None = None)` adds the `StreamingConfig` only when the root is given (§3.4.2). | 1a (recorder), 1b (trade) |
+| `src/breezy/runtime/capture_recorder_hook_cli.py` | runtime | new | the `ExecStopPost=` hook (§3.10.2) | 1a |
+| `src/breezy/runtime/capture_stall_drill_cli.py` | runtime | new | the weekly SIGSTOP drill and its guard (§3.10.4) | 1b (WP9) |
+| `src/breezy/analysis/capture_settlement{,_cli}.py` | analysis | new | the settlement writer (r8 §3.9) | 1a |
+| `src/breezy/analysis/capture_audit{,_cli}.py`, `capture_node_log.py`, `capture_heal.py` | analysis | new | the daily audit, the streaming node-log parser, heal confirmation and heal-alert retries | 1a |
+| `src/breezy/analysis/capture_live_proof{,_cli}.py` | analysis | new | the 7-day roll-up | 1a |
+| `src/breezy/analysis/capture_parity_attribution.py` | analysis | new | the 38-vs-35 attribution (r8 §3.12) | 1a |
+| `src/breezy/app/trade.py` | app | one hunk, after AUT-5a | pass `capture_stream_root`; construct the identity, publisher, adapter and `CaptureActor` in `_compose_forecast_quantile_ladder`; pass the outbox offer into `NbmQuantileActor` | 1b |
+| `deploy/systemd/breezy-quote-tape.service` | deploy | edit | `WatchdogSec=600`, `NotifyAccess=main`, `WatchdogSignal=SIGTERM`, `ExecStopPost=` (§3.10.2) | 1a |
+| `deploy/systemd/breezy-capture-{settlement,audit,live-proof,stall-drill,stall-drill-guard}.{service,timer}` | deploy | new | §3.13 | 1a/1b |
+
+**Deleted from r8's map (never built):**
+- modules: `capture_writer.py`, `capture_payloads.py`, `capture_watch_state.py`, `frame_clock.py` (its counter moves to `capture_ids.py`), `lifecycle_actor.py` (replaced by `capture_actor.py`), `src/breezy/runtime/capture_watch{,_cli}.py`, `src/breezy/runtime/capture_watchdog{,_cli}.py`;
+- units: `breezy-capture-watch` and `breezy-capture-watchdog`.
+
+Entry points are `/home/jon/breezy/.venv/bin/python3 -m <module>`. There is no console script, because adding one needs a reinstall into the shared venv (L-51).
+
+### 3.2 Volume (obligation "measured C1 volume")
+
+r8's measurements stand: 973,921 FQ evaluations over 7 h on 10-02/03 gave 59 on-change records, and UTC day 10-01 had 3,288,397 evaluations, 2 Takes and 2 TrySubmits.
+
+| Stream table (`<capture_root>/live/<instance_id>/`) | Rows per day (projection) |
+|---|---|
+| `custom_decision_record_*` | ≈ 250 on-change, plus every Take and TrySubmit |
+| `custom_frame_copy_*` | ≤ the Take-path records, ≈ 3–10 |
+| `custom_order_event_record_*` | ≈ 5 per order × 2–5 orders |
+| `custom_detector_event_*` | < 50 (transitions) |
+| `custom_capture_heartbeat_*` | 1,440 (one per 60 s) |
+| `order_initialized_*`, `order_filled_*`, `position_*` (native) | ≈ 20 |
+
+That is under 2,000 rows and 2 MB a day. WP0 re-measures one full UTC day. There is no byte cap: the native writer has none, and adding one would create a second failure mode. Above 20,000 rows a day, the volume is revisited in a reviewed commit before WP8 activates.
+
+**Bus cost.** The kernel subscribes the writer to `"*"` (`kernel.py:604`), so every bus message (several million frames a day) reaches `writer.write`. The method returns at the `include_types` check (`writer.py:186-195`), after one `CustomData` isinstance test and one list membership test. WP0 V-4 measures the per-message overhead at recorded frame rates. Above 2 µs p99 per message, WP8 takes the fallback path (§3.4.2, option B).
+
+### 3.3 Frame and forecast references (replaces the payload store; ER-3, ER-4)
+
+#### 3.3.1 References
+
+- **Frame reference:** `frame_kind ∈ {"depth10", "quote", ""}`, `instrument` (str) and `frame_ts_event` (int).
+  - A depth-triggered decision cites `("depth10", iid, depth.ts_event)`.
+  - A quote-triggered decision cites `("quote", iid, tick.ts_event)`. U8's reason stands: the quote arrives before its depth (`data.py:1590`, `:1599`).
+  - `Exit` cites `("", instrument, 0)`.
+- **Resolution** (`capture_reader.resolve_frame_ref`) tries these in order:
+  1. a `FrameCopy` in the same boot's stream with the same `decision_id`;
+  2. the recorder catalog: the `order_book_depths` row (or the `quote_tick` row) for `instrument` with `ts_event == frame_ts_event` (`node_config.py:289-295` streams both, and the ingest converts them);
+  3. otherwise, `UNRESOLVED`.
+- **Forecast reference:** `forecast_station` (str) and `forecast_cycle_ns` (int), the `(station, cycle_ns)` of the `ForecastQuantileVector` that `evaluate` used (`src/breezy/strategy/ladder_ev/forecast_state.py:282-294`). `resolve_forecast_ref` reads the NBP store that the ingest persisted. WP0 V-12 pins the store path and reader, and proves on 3 retained Takes that the resolved vector's fields equal the vector FQ held. If V-12 fails, the forecast vector is copied into `FrameCopy.forecast_body` on the Take path only, and the plan returns to review for refusals.
+- **Artefact:** `artefact_sha256` and `manifest_sha256`, unchanged from C1.
+
+#### 3.3.2 The Take-path copy (`FrameCopy`)
+
+- **When.** It is written for `Take`, `TrySubmit`, `EntryVeto` and `Exit`, the records whose loss breaks a fill's join. There is one `FrameCopy` per distinct `decision_id`, published **before** the Take's `DecisionRecord`. A reader that sees the Take therefore sees its copy, subject to the shared flush.
+- **Body.** `frame_body` (dict → Arrow string) is the canonical JSON of the triggering frame: the Depth10 levels with size > 0 (`ts_init` excluded), or `{ask, bid, ts_event}` for a quote (C1 U8's quote content).
+- **Refusals never copy.** A refusal with an unresolved reference is counted per day (leg R6); it is not a fill-join failure. A `capture_gap` refusal (§3.6.2) is a guard record on an order that never reached the venue. It is not a Take-path record, so it cites by reference.
+- **Tape corroboration (leg B).** When the tape also holds the frame, the audit requires the copy to equal it: top of book for a quote, all levels for depth. A mismatch is `frame_copy_mismatch` FAIL. WP0 V-11 measures the tape's coverage of node frames over 14 days, and that sets how a tape miss on a copied Take is reported: INFO if coverage is below 99.9%, WARNING otherwise.
+
+### 3.4 Records and persistence
+
+#### 3.4.1 Record types (`capture_records.py`)
+
+All five types are `@customdataclass` (`NT/model/custom.py:31`). `ts_event` and `ts_init` are the decorator's own fields. `ts_init` is the wall clock at publish, which is C1's `ts_ns` (ER-4).
+
+**Encoding rule:**
+- `str` for decimals and nullable strings, with `NULL_STR = ""` meaning null;
+- `int` for nanoseconds and counters, with 0 meaning null only where stated;
+- `bool` for `drill`.
+
+No field is named `instrument_id`. A field with that name makes the writer route the type to a per-instrument file and **silently drop** it whenever `cache.instrument(...)` returns None (`writer.py:210-239`). The field is called `instrument`, and the reader projects it to C1's `instrument_id` (ER-4).
+
+| Type | Fields (besides `ts_event`, `ts_init`) | `ts_event` |
+|---|---|---|
+| `DecisionRecord` | `schema`, `decision_id`, `family_id`, `node_boot_id`, `build_sha`, `registry_seq: int`, `drill: bool`, `source` (`live`\|`canary`), `kind` (`Take`\|`Refuse`\|`NotExecutable`\|`NotDPlus1`\|`TrySubmit`\|`EntryVeto`\|`Exit`), `reason`, `eval_ns: int`, `eval_seq: int`, `wall_ns: int`, `station`, `climate_day` (ISO), `rung_id`, `side`, `instrument`, `ask_px`, `frame_kind`, `frame_ts_event: int`, `p_hat`, `p_hat_raw`, `p_lower`, `p_upper`, `ev_net`, `margin`, `forecast_station`, `forecast_cycle_ns: int`, `artefact_sha256`, `manifest_sha256` | `eval_ns` |
+| `FrameCopy` | `schema`, `decision_id`, `frame_kind`, `instrument`, `frame_ts_event: int`, `frame_body: dict`, `forecast_body: dict` (empty unless V-12 fails) | `frame_ts_event` |
+| `OrderEventRecord` | `schema`, `decision_id` (from the order's tags; otherwise the exit or orphan id), `event_type` (class name), `client_order_id`, `venue_order_id_sha256`, `reason`, `node_boot_id`, `drill: bool`, `source` | the event's `ts_event` |
+| `DetectorEvent` | `schema`, `detector`, `observation_sha256`, `state` (`AGREE`\|`DISAGREE`\|`UNKNOWN`), `node_boot_id`, `drill: bool`, `source` | publish time |
+| `CaptureHeartbeat` | `schema`, `node_boot_id`, `seq: int` (monotone per boot), `records_published: int` (cumulative per boot, all types), `publish_failures: int`, `health_ok: bool` | publish time |
+
+- **Schema values:** `capture_decision/v2`, `capture_frame_copy/v1`, `capture_order_event/v1`, `capture_detector_event/v2`, `capture_heartbeat/v1`. The v2 bumps mark the storage change from r8's JSONL `v1` design, which was never shipped. The exact-set rule (ARCH §3 common rules) is pinned by `test_capture_record_field_sets_are_exact`.
+- **Ids.** `decision_id`, `eval_seq` and the id-bearing rules for TrySubmit, EntryVeto and Refuse are r8 §3.3.1, unchanged:
+  - `compute_decision_id(family_id, manifest_sha256, artefact_sha256, station, climate_day, rung_id, side, eval_ns, eval_seq)`;
+  - `EvalSeqCounter.next(instrument_id, ts_event)` counts per frame across the quote and depth handler calls (R-10), with r8's 4-entry retention and `EVAL_SEQ_REORDER_BASE = 1_000_000`;
+  - `compute_exit_decision_id` hashes the four exit tag values only (P1-8).
+- **Payload hygiene (ARCH §3).** No custom record carries an absolute path, an env value, an account id or a raw venue order id; it carries `venue_order_id_sha256` only. The native `OrderFilled` rows do carry a raw `venue_order_id`; ER-6 states that exemption.
+
+#### 3.4.2 The streaming configuration (gated on V-2..V-5)
+
+**Option A (the ruled primary).**
+- `build_trade_node_config(..., capture_stream_root=<capture_root>)` adds:
+  - `StreamingConfig(catalog_path=str(<capture_root>), include_types=CAPTURE_INCLUDE_TYPES, rotation_mode=RotationMode.SCHEDULED_DATES, rotation_interval=1 day, rotation_time=00:00, rotation_timezone="UTC")`;
+  - with the same rotation constants as the recorder (`node_config.py:400-403`).
+- The default stays `None`, so the 41 existing callers and their contract tests (`test_native_order_cap_wiring` and the rest) are unchanged.
+- `CAPTURE_INCLUDE_TYPES = [DecisionRecord, FrameCopy, OrderEventRecord, DetectorEvent, CaptureHeartbeat, OrderInitialized, OrderFilled, *PositionEvent.__subclasses__()]`.
+- **Why V-1 holds by construction.**
+  - The list references the classes, so building the config imports `capture_records.py`.
+  - That import runs `@customdataclass`, which registers each schema **before the kernel exists**.
+  - `list_schemas()` returns the live global dict (`serializer.py:85-86`), and the writer captures that dict at construction (`writer.py:129`).
+  - WP0 pins this with a test.
+
+**Root.**
+- `<capture_root>` is a new 0700 directory under `derived/`, and the writer path is `<capture_root>/live/<instance_id>/` (`kernel.py:589`).
+- It is never under `/home/jon/.local/share/breezy/catalog/quote_tape/`. So the quote-tape ingest, the recorder's disk monitor and its retention never see it (`test_capture_root_is_disjoint_from_quote_tape_root`).
+
+**V-2: the boot-time config dump.**
+- `_setup_streaming` writes `self._config.json()` into the stream directory (`kernel.py:606-611`).
+- `msgspec_encoding_hook` raises `TypeError` for any unregistered type (`NT/common/config.py:176`).
+- The trade exec-client config holds a lambda and runtime objects (`node_config.py:945-953`). **Option A as it stands would therefore raise inside `NautilusKernel.__init__` and fail the node boot.**
+- WP0 test `test_trade_config_json_encodes` reproduces this RED on the production `build_trade_node_config` output.
+- GREEN uses the native `register_config_encoding` (`NT/common/config.py:223`) for exactly the types the RED run names. Each is encoded as `"<unserialisable:{type qualname}>"`, never as the object's state.
+- The test also scans the produced JSON against the `AlertPayload` forbidden-content list (`registry/health_model.py:217-235`). Venue credentials appear only as env-var names (`credentials.py:37-39`).
+
+**V-3: writer exceptions reach the publisher.**
+- `MessageBus.publish` calls each handler with no try/except (`NT/common/component.pyx:2832-2834`), and `serialize_batch` sits outside the writer's try block (`writer.py:259` vs `:264-288`).
+- A serialisation failure of a native `OrderFilled` would therefore unwind into the execution engine's publish and skip later subscribers.
+- WP0 test `test_streamed_native_event_serialisation_never_raises` serialises every included native type from recorded FQ events, including tags, NO-leg instruments and resolver fills.
+- It also characterises handler order: `test_kernel_writer_runs_before_strategy_handlers_at_equal_priority`.
+
+**Option B (pre-declared fallback: same format, same root, same reader).**
+- `CaptureActor` constructs its own native `StreamingFeatherWriter(path=<capture_root>/live/<instance_id>, cache=self.cache, clock=self.clock, include_types=CAPTURE_INCLUDE_TYPES, rotation…)`.
+- It subscribes **a catch-all wrapper** around `writer.write` to exactly `data.*` for the five custom types, `events.order.*` and `events.position.*`.
+- There is no `"*"` subscription and no config dump. A writer exception is counted (`health.ok=False`) instead of unwinding.
+- `on_stop` calls `writer.close()` inside try/except.
+
+**Decision rule (WP0, binding).**
+- Option A ships iff all three hold: V-2 is GREEN with only `register_config_encoding`; V-3 shows no failing native serialisation; V-4 is under 2 µs p99 per message.
+- Otherwise, option B ships.
+- WP0's evidence file states which. ER-1 covers both: it names `StreamingConfig` "or a writer instance owned by the capture actor".
+
+#### 3.4.3 The publish wrapper (`CapturePublisher`)
+
+- `publish(record) -> bool` wraps `self._actor.publish_data(DataType(type(record)), record)` in `try/except Exception`. It never raises into a Nautilus handler (L-16).
+- **On an exception:**
+  - `publish_failures += 1` and `health.ok = False`;
+  - log `CAPTURE_PUBLISH_FAILED family=<id> type=<t> cause=<exc class>`;
+  - offer CRITICAL `CAPTURE_PUBLISH_FAILED` through the outbox, deduplicated per cause per 300 s with the suppressed counts logged (the r8 H8 rule);
+  - return False.
+- **On success:** `records_published += 1`, return True.
+- **Positive control.** `health.ok` is cleared only when a `CaptureHeartbeat` publishes successfully on the 60 s tick **and** the stream bytes have grown (§3.4.4).
+
+#### 3.4.4 Bounded loss, made visible
+
+- **Forced flush.** The writer flushes only inside `write` (`writer.py:278`). The 60 s `CaptureHeartbeat` is a write, so every earlier record is flushed within 60 s plus `flush_interval_ms`. The unflushed tail at a crash is therefore at most about 61 s.
+- **Bytes-landing check (in node).**
+  - On each 60 s tick, the capture actor sums `st_size` over the regular files in its own `<capture_root>/live/<instance_id>/` (`lstat`, ≤ 12 files).
+  - If `records_published` rose over the last `STREAM_BYTES_FLAT_S = 180` s while the byte total did not, it publishes `DetectorEvent(capture_writer_health, DISAGREE)` with `obs.cause=stream_bytes_flat` and sets `health.ok=False`, which is the `capture_gap` veto.
+  - This is the only in-process signal for the writer's swallowed write errors (`writer.py:285-288`).
+  - A hung filesystem that blocks the `lstat` is the r8 §3.3.3 case. AUT-6's node-liveness detector (log mtime plus tape advance) catches it from outside, and `test_aut6_node_liveness_detector_covers_log_mtime_and_tape_advance` gates WP8.
+- **Counted loss (audit leg R5).** For each boot, the last flushed `CaptureHeartbeat` gives `records_published` at its `seq`.
+  - The records present up to that heartbeat must equal that count exactly. A shortfall is `stream_record_lost` FAIL.
+  - Some records come after the last heartbeat, are missing from the stream, but appear as `SHADOW_DECISION` lines. If their boot has ended and its log lacks the disposal line (a crash), they are `lost_in_flush_window`: counted, reported in the metric `records_lost_in_flush_window`, and INFO.
+  - They still fail leg D if they were a filled order's Take-path records.
+
+#### 3.4.5 `capture_epoch_start`
+
+Unchanged from r8 §3.3.5:
+- the file is `evidence/capture/epoch/<family_id>.json`, opened `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0444;
+- `CaptureActor.on_start` writes it on the first boot of a build that composes the family with capture;
+- the audit runs the `epoch_missing`, `epoch_rewritten` and `epoch_unlogged` checks.
+
+### 3.5 `CaptureAdapter` and the FQ call sites (obligation 1)
+
+#### 3.5.1 Kinds
+
+Unchanged from r8 §3.4. Only `forecast_quantile_ladder` has full plug-ins. The CRH kinds carry `RefusingPlugin` and are refused at `_compose_family`, so their send sites are declared unreachable (§3.6.5).
+
+#### 3.5.2 Numeric decision inputs on refusals
+
+- **New fields.** WP7 adds **keyword-only fields with `None` defaults** to `Refuse` in `decision.py`: `p_hat`, `p_lower`, `p_upper`, `ev_net` and `margin`.
+  - `evaluate` sets each one at every refusal site that comes after its computation. For example, at `below_margin` (`:353-355`), `forecast_margin` and the probabilities are already in hand.
+  - `NotExecutable` and `NotDPlus1` return before any of them is computed, so their records carry `NULL_STR`.
+- **The shadow line stays byte-identical.** `decision_log_fields` is not changed, so the R1/R2 parsers and the funnel are unaffected. `test_shadow_line_bytes_unchanged_by_refuse_input_fields` checks this over a fixture of every refusal reason.
+- `test_refuse_input_fields_equal_the_values_evaluate_compared` asserts that, for `below_margin`, the recorded `ev_net` and `margin` reproduce the refusal (`ev_net ≤ margin`).
+- Every existing `tests/strategy/forecast_quantile_ladder/*` test stays green unedited.
+
+#### 3.5.3 FQ call sites (AUT-1b)
+
+| # | Site | Change |
+|---|---|---|
+| CS-0 | `_safe_evaluate` (`strategy.py:740-757`) | pass `trigger=source`, `depth` and `quote` into `_evaluate_instrument_update` |
+| CS-1 | `_evaluate_instrument_update` (`:759-819`) → `_evaluate_with_capture(...)` | Read the vector once and run `evaluate`. Emit the shadow line as today. Then take `eval_seq = counter.next(instrument_id, ts_event)` for **every** evaluation, and call `OnChangeFilter.admit(key, kind, reason, eval_ns)`. Only if it is admitted, build and publish the `DecisionRecord` (a Take publishes its `FrameCopy` first). Return `(decision, decision_id)`. `evaluate_snapshot` keeps its signature, and production never takes its `capture_ctx=None` branch (`test_production_trigger_paths_pass_capture_ctx`). |
+| CS-2 | `_maybe_submit`, `_emit_decision_outcome` (`:646-709`) | If `decision_id is None` (the Take's publish failed), refuse with `capture_gap` before `try_submit`. `_emit_decision_outcome` takes `now_ns` once, for both the line and the record's `wall_ns`. It publishes one of: `TrySubmit`; `EntryVeto` for a refusal in the closed `VetoReason` set (**the `EntryVeto` writer**, on-change per key); or `Refuse(instrument_vanished_after_trysubmit)` with the Take's id. |
+| CS-3 | `order_factory.limit(...)` (`:680-688`) | `tags=list(self._capture_adapter.order_tags(decision_id))`; `self.submit_order(order)` goes through the guard |
+| CS-4 | `on_order_book_depth`, `on_quote_tick` (`:713-738`) | pass the frame through to `_safe_evaluate`. **No stamp**: r8's `FrameClock` is deleted, and freshness comes from the cache (§3.7.1). |
+| CS-5 | `shadow_only=True` (`:659-665`) | CS-1 already captured the Take; no order |
+
+**Pinned timestamps** (C1 U9, R9.2-Z9, unchanged):
+- Every record's `eval_ns` is the handler's frame `ts_event`.
+- A TrySubmit, a post-Take `EntryVeto` or a `Refuse` copies the Take's `eval_ns` and `eval_seq`, and carries its own `wall_ns`, equal to its shadow line's `now_ns` (`:701`).
+
+### 3.6 Node-side order path
+
+#### 3.6.1 Construction (C8)
+
+`CaptureGuardedStrategy.__init__(self, config, *, capture_publisher: CapturePublisher, alert_outbox: AlertOutbox, …)`. Both arguments are keyword-only, non-Optional and type-checked, so the boot fails closed (`test_capture_guarded_strategy_without_publisher_refuses_construction`).
+
+#### 3.6.2 `submit_order` (P1-8, P1-9)
+
+1. **Exit.** If all four exit tags are present, publish `DecisionRecord(kind="Exit")` and its `FrameCopy`, then call `super()`.
+   - The `Exit` id comes from the four tags; `frame_kind=""` and `frame_ts_event=0`. The `FrameCopy` holds the order's price only.
+   - If a tag is missing or a publish fails, still call `super()`, publish `DetectorEvent(… exit_capture_gap)` and raise a CRITICAL.
+2. **Untagged SELL.** Publish `DetectorEvent(… untagged_sell)`, raise a CRITICAL, then call `super()`. The reader assigns the orphan id (`compute_orphan_decision_id`) to the native `OrderInitialized` that has no tag, so the audit fails the fill as `untagged_order` (D12).
+3. **BUY tag check.** A BUY needs exactly one `breezy:decision_id=` tag of 32 lowercase hex characters. Otherwise:
+   - refuse with `capture_untagged` and do not call `super()`, so the order never reaches the cache;
+   - log `CAPTURE_REFUSED reason=capture_untagged` and raise a CRITICAL;
+   - publish `EntryVeto` if the tag names a Take of this boot, else `DetectorEvent(… untagged_buy)` (r8 R-4).
+4. **Health.** If `capture_publisher.health.ok` is False, refuse with `capture_gap` (same logging and record).
+5. Call `super().submit_order(...)`. r8's step 5, the fsynced `OrderLink`, is gone: Nautilus publishes `OrderInitialized` itself.
+
+`submit_order_list` runs steps 1–4 for each order and refuses the whole list if any BUY fails. r8's tests are unchanged.
+
+#### 3.6.3 `CaptureActor` (replaces r8's lifecycle actor)
+
+- **`on_start`:**
+  - call `write_epoch_once`;
+  - compute `UNSTREAMED_ORDER_EVENTS = {cls for cls in OrderEvent subclasses if cls not in list_schemas()}` once (`test_unstreamed_set_is_computed_from_list_schemas`). On 1.231.0 it contains `OrderDenied`, `OrderCanceled`, `OrderRejected`, `OrderExpired`, `OrderSubmitted`, `OrderAccepted` and the rest, and never `OrderInitialized` or `OrderFilled`;
+  - `msgbus.subscribe("events.order.*", self._on_order_event)`;
+  - `clock.set_timer("aut1-capture-tick", 60 s)`.
+
+  There is no `subscribe_*` command and no data-topic subscription (L-45).
+- **`_on_order_event`** (catch-all):
+  - If `type(event) in UNSTREAMED_ORDER_EVENTS`, publish an `OrderEventRecord`. Its `decision_id` comes from `self.cache.order(event.client_order_id).tags`: the entry tag, the exit id or the orphan id. `OrderAccepted` supplies `venue_order_id_sha256`.
+  - Every other event returns at once, because the native stream already has it (`test_order_event_record_never_duplicates_a_streamed_type`).
+- **The 60 s tick** (catch-all): publish a `CaptureHeartbeat`, run the bytes-landing check (§3.4.4), evaluate the detectors, and publish `DetectorEvent`s on transitions.
+- **`on_stop`:** publish one final `CaptureHeartbeat` inside try/except, before the kernel disposes of the writer (Nautilus stops actors before `dispose`). Under option B, it then closes its own writer. Test: `test_capture_actor_on_stop_publishes_final_heartbeat_exception_safe` (the r8-final LOW, re-targeted).
+
+#### 3.6.4 Hot path (C6, W9)
+
+- There is no fsync on the event loop.
+- CS-1's admitted path costs a dict lookup, one sha256 and one or two `publish_data` calls into an in-memory Arrow batch. A Take adds one `FrameCopy`.
+- r8's `CAPTURE_TAKE_TO_SUBMIT_P99_BUDGET_MS` and `CAPTURE_REFUSAL_PATH_P99_BUDGET_MS` become one budget, `CAPTURE_PATH_P99_BUDGET_MS = 5`. WP7 measures it over 1,000 synthetic Takes and 10,000 refusals, and a result above it blocks the merge.
+- `test_guarded_submit_latency_independent_of_webhook` is unchanged.
+
+#### 3.6.5 Every send path is guarded or unreachable (D4)
+
+Unchanged from r8 §3.5.3: `test_every_strategy_submit_site_is_guarded_or_unreachable`, `_UNREACHABLE_SEND_SITES` with its companion tests, and `test_no_indirect_send_helper_under_strategy`.
+
+### 3.7 Node-local observations (obligation 4; AUT-1b)
+
+Every observation here is a C6 `Detector(kind=NODE_LOCAL)` with action `ENTRY_VETO`, called by AUT-5a's `entry_veto(instrument_id)` slot. Each one:
+- auto-clears;
+- publishes a `DetectorEvent` per transition (CS-2 is the sole writer of slot-refusal `EntryVeto`s);
+- starts in veto until its first good observation;
+- vetoes at call time when its last evaluation is older than `WATCH_TICK_STALE_S` (180 s).
+
+`test_try_submit_reachable_only_from_frame_handlers` (r8 D14) still pins that every veto query happens while a fresh frame is being handled.
+
+#### 3.7.1 `feed_stale` from market data (`md_feed_freshness`)
+
+| Source | Period | Trigger | Clear |
+|---|---|---|---|
+| `self.cache.quote_tick(i).ts_init` (`cache.pyx:3204`) | call time; 60 s tick | **Per instrument (veto):** a cached quote exists and `now − ts_init > MD_SILENCE_S`, with the r8 WP0-derived formula. A **missing** quote never vetoes, for two reasons: a one-sided Depth10 book produces no `QuoteTick` (V-7), and on the two frame paths the triggering frame is fresh by construction. The per-instrument rule is therefore defence in depth behind the D14 test. **Venue-wide (observation only):** among instruments with a cached quote, if the stale fraction exceeds `MD_SILENT_FRACTION_MAX = 0.5`, publish `DetectorEvent(md_feed_freshness, DISAGREE)` with `obs.cause=venue_silent` and offer WARNING `CAPTURE_VENUE_SILENT`. Instruments with no cached quote are counted as `quote_absent` in the observation. | a newer quote; the fraction back at or under the limit |
+
+#### 3.7.2 `feed_stale` from NBP: the silent-feed check on the existing timer (AUT-1a, ingest)
+
+All of this runs inside `NbmQuantileActor.on_cycle_timer` (`nbm_quantile_actor.py:336-338`). There is no new timer.
+
+- **Hang reset.**
+  - `_submit` keeps the `Future` it gets back (`:348`).
+  - On the timer, a future still not done after `NBP_POLL_HANG_S` is cancelled. The threshold is at least 2 × the `BulletinFetcher` timeout pinned in WP0, default 600 s.
+  - The actor then sets `counters["poll_hang_reset"] += 1`, logs `NBM_NBP_POLL_RESET cycle_ns=<n>`, and submits a fresh `poll_once()`.
+- **Silent-feed check.**
+  - `missed_cycles(now_ns)` counts the configured cycles (`(1, 13, 19)`, `:122`) after the newest complete cycle whose `cycle_ns + stale_deadline` has passed.
+  - This is the same deadline `_check_stale_cycle` already logs as `NBM_NBP_STALE_CYCLE` (`:142`, `:425-449`).
+  - On the first timer fire past a cycle's deadline, the actor offers CRITICAL `NBP_CYCLE_MISSED` through `alert_offer`, once per cycle.
+  - `alert_offer` is keyword-only, `Callable[[str, str, str], bool] | None = None`. It is duck-typed, so ingest never imports the runtime outbox.
+- **Veto.** FQ's NODE_LOCAL `nbp_feed_freshness` reads `missed_cycles(now)` at call time.
+  - `≥ 2` missed cycles, or no complete vector for a subscribed station, gives the `feed_stale` veto.
+  - Exactly 1 gives an alert only.
+  - It clears on a newer complete cycle.
+- **Heal record.** A reset followed by `FQ_VECTOR_COMPLETE` for that cycle:
+  - writes the write-once record `evidence/capture/heal/<date>/<ts_ns>_node_nbm_quantile_actor.json` (`decided_by:"nbm_quantile_actor"`, `observation_sha256`, `alert`);
+  - then offers INFO `CAPTURE_HEALED_<observation_sha256>`.
+
+  If `alert_offer` is absent or returns False, the actor logs CRITICAL `NBM_NBP_HEAL_ALERT_UNDELIVERABLE` and writes `alert="undeliverable"`. The audit re-sends it (§3.11.6).
+- **Merge** with WP8 only. The r8 r6-T2 rationale stands: the outbox wiring rides in the same composition hunk.
+
+#### 3.7.3 `capture_gap`
+
+| Source | Period | Trigger | Clear |
+|---|---|---|---|
+| `CapturePublisher.health` | each publish; 60 s tick; call time | any publish exception, or `stream_bytes_flat` (§3.4.4), since the last positive control | the next heartbeat published with stream bytes grown |
+
+#### 3.7.4 `recorder_stale`
+
+| Source | Period | Trigger | Clear |
+|---|---|---|---|
+| `health/recorder_watchdog/polymarket_us.json` (`recorder_watchdog/v1`; only the stop hook writes it, §3.10.2), single read (`O_NOFOLLOW`, 4 KiB, exact key set) | 60 s tick | `watchdog_kills_trading_day ≥ RECORDER_WATCHDOG_STORM_KILLS = 3` **and** `last_watchdog_kill_ns` younger than `RECORDER_STALE_CLEAR_S = 1800`; or the file exists but is unparseable | 1800 s with no further watchdog kill. That is longer than one full gate horizon (the maximum `STREAM_SILENCE_S`) plus `WatchdogSec`, so a recorder that was still broken would have been killed again inside the window. A missing file means no kill has ever happened, so it does not veto. |
+
+An **inactive** recorder (a crash loop that systemd has given up on) is handled by AUT-6's failed-unit path, which alerts and runs its `try-restart` of a failed allowlisted unit. It is not a node veto, because Take-path capture does not depend on the tape (§3.3.2).
+
+### 3.8 Numbering note
+
+r8's §3.8 (recorder and feed stall observations) is replaced by §3.10. The number is kept free so that r8 cross-references do not silently point at new content.
+
+### 3.9 Reader and the C1 projection (`capture_reader.py`)
+
+**`read_capture_stream(boot_dir) -> CaptureStream`**
+- Opens each `*.feather` file under `<capture_root>/live/<instance_id>/` with `pyarrow.ipc.open_stream`, under the `O_NOFOLLOW` single-read rule.
+- Decodes through the registered `from_arrow` decoders. The table name and the file name's `ts` identify the type.
+- A truncated final batch is `stream_torn_tail`: INFO while the boot is running, counted by R5 once the boot has ended.
+
+**`project_c1(stream) -> C1View`** yields the **C1 logical records**, so downstream readers keep C1's names:
+- `DecisionRecord`:
+  - `instrument` becomes `instrument_id`, and `ts_init` becomes `ts_ns`;
+  - the frame reference is exposed as the `depth_ref`/`quote_ref` **strings** `"depth10:<instrument_id>@<ts_event>"` / `"quote:<instrument_id>@<ts_event>"`;
+  - the forecast reference is exposed as `forecast_input_ref = "nbp:<station>@<cycle_ns>"` (ER-4).
+- `OrderLink`, from each native `OrderInitialized`:
+  - the tag's `decision_id`, `client_order_id`, and the five `str()` fingerprint fields;
+  - `venue_order_id_sha256` from the `OrderEventRecord(OrderAccepted)`, or the sha256 of `OrderFilled.venue_order_id`.
+- `LifecycleEvent`, from `OrderFilled` and the `OrderEventRecord`s.
+- `PositionMark`, from the native `PositionEvent`s:
+  - with the venue leg sign applied (a NO holding counts as short YES; L-44, memory `venue-nets-no-holding-as-short-yes`);
+  - with `reconciliation_source="node_belief"`.
+- `DetectorEvent`, as stored.
+
+**Joins and resolvers.**
+- `join_fills_to_decisions(c1_views, fills)` is pure; AUT-2 consumes it.
+- `resolve_frame_ref` and `resolve_forecast_ref` are described in §3.3.1.
+- Readers read `eval_ns` and `eval_seq` as stored and never re-derive them (the r8 L1 contract).
+
+**Compatibility for AUT-3, AUT-4 and AUT-6.** Code that read a payload by its content address must call `resolve_frame_ref` or `resolve_forecast_ref` instead (§5.3).
+
+### 3.10 Recorder and feed stall: native watchdog (obligation 5; AUT-1a; ER-8)
+
+#### 3.10.1 The ping gate (recorder process)
+
+- **Opt-in.** `PolymarketUSDataClientConfig.watchdog_notify: bool = False`. Only `build_quote_tape_node_config` sets it to True (`test_trade_node_config_never_sets_watchdog_notify`).
+- **Sampling.** `_watch_feed` calls `sample_feed_health` (`data.py:1960`) every `_feed_watch_interval_secs`, **on the event loop** (`:1947-1958`). Each call:
+  - appends one `RecorderSample{now_ns, phase, discovered_slugs, subscribed, quotes_published, depths_published, trades_published, is_tape_gap_open, safe_mode, stream_bytes}`, where `stream_bytes` is the `lstat` byte total under the recorder's own `<catalog_root>/live/<recorder_instance_id>/`;
+  - if `watchdog_notify` is set, calls `classify_recorder_sample(history, now)`;
+  - on `OK`, sends `sd_notify("WATCHDOG=1")`;
+  - on anything else, sends nothing and logs `RECORDER_WATCHDOG_WITHHELD cause=<c>` at most hourly.
+- **`classify_recorder_sample`** is pure: r8 §3.8.2's rules, moved into the recorder process. It returns `OK` unless one of these holds:
+
+  | Cause | Rule |
+  |---|---|
+  | `discovering_overrun` | `DISCOVERING` for longer than `empty_discovery_retry_secs + 300` |
+  | `safe_mode_overrun` | `SAFE_MODE` for longer than 300 s |
+  | `stream_stalled` | `STREAMING` with `discovered_slugs > 0`, and counters and bytes both unchanged across `STREAM_SILENCE_S(h)` |
+  | `writer_stall` | ≥ 1 event published and bytes flat across `WRITER_STALL_S`, outside `FLUSH_MARGIN_S` |
+
+  The thresholds keep r8's WP0 derivations (D8). A legitimate empty listing is `OK`.
+- **A hung loop** (the zombie class) stops `_watch_feed` itself. No ping is sent, so systemd sees the hang with no classifier involved.
+- **`sd_notify`** is stdlib only: `socket(AF_UNIX, SOCK_DGRAM)` and `sendto($NOTIFY_SOCKET)`, handling the abstract-namespace `@` prefix. It returns False when `NOTIFY_SOCKET` is unset and never raises (`test_sd_notify_without_socket_is_false_never_raises`).
+
+#### 3.10.2 Unit settings and the stop hook
+
+**Unit settings.** `deploy/systemd/breezy-quote-tape.service` (edit, reviewed commit) gains:
+
+| Setting | Why |
+|---|---|
+| `WatchdogSec=600` | r8's "two bad probes ≥ 5 min apart" |
+| `NotifyAccess=main` | python is the main PID (§1.3) |
+| `WatchdogSignal=SIGTERM` | Nautilus stops cleanly and flushes the tape. A frozen process escalates to SIGKILL after `TimeoutStopSec`. |
+| the existing `Restart=always` | restarts the unit after a watchdog result |
+| `ExecStopPost=/usr/bin/timeout -k 2 25 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-quote-tape.stop-hook /home/jon/breezy/.venv/bin/python3 -m breezy.runtime.capture_recorder_hook_cli` | the stop hook, below |
+
+**The stop hook** (`capture_recorder_hook_cli`) reads systemd's `$SERVICE_RESULT`, `$EXIT_CODE` and `$EXIT_STATUS`. On `SERVICE_RESULT=watchdog` it:
+1. writes the write-once stall record `evidence/capture/stall/<date>/<ts_ns>_recorder_watchdog.json` (`{unit, cause:"watchdog", result, detected_ns, observation_sha256}`);
+2. counts the trading-day records (trading day [16:45Z, next 16:45Z), ARCH §4.5) and atomically rewrites `health/recorder_watchdog/polymarket_us.json` (`{schema:"recorder_watchdog/v1", watchdog_kills_trading_day, last_watchdog_kill_ns, trading_date}`) under its own flock, `health/recorder_watchdog/hook.lock`;
+3. sends CRITICAL `RECORDER_WATCHDOG_KILL` through `deliver_with_proof`. From the third kill in a trading day onwards it sends CRITICAL `RECORDER_WATCHDOG_STORM` instead.
+
+On any other result, the hook exits 0 and does nothing. That includes the daily 09:00Z rotate's clean `try-restart` (`Result=success`).
+
+- **Bound.** The `timeout -k 2 25` bound runs inside the stop phase, so the hook delays the restart by at most 27 s.
+- **Sandbox.** The hook runs through the E-7a shared wrapper under its own table row, `breezy-quote-tape.stop-hook`. That row binds only `evidence/capture/stall/`, `health/recorder_watchdog/` and `evidence/alerts/`. The recorder's own `ExecStart` is not wrapped (the E-7a rule 5 residual).
+
+#### 3.10.3 Heal confirmation
+
+The audit confirms heals (§3.11.6); there is no polling watch. A watchdog kill at time `t` counts as **healed** when all three hold:
+- the journal shows a new invocation of `breezy-quote-tape.service` started after `t`;
+- that invocation's `live/<instance>/` directory grew for at least 15 min;
+- no further watchdog kill came within 30 min of the restart.
+
+These checks use the journal fields AUT-6 r13 already parses (`USER_INVOCATION_ID`, `UNIT_RESULT`; AUT-6 r13 §0 facts). On a confirmed heal, the audit:
+- writes `evidence/capture/heal/<date>/<ts_ns>_audit_breezy-quote-tape.json` (`decided_by:"systemd_watchdog"`, with the stall record's `observation_sha256`);
+- sends INFO `CAPTURE_HEALED_<observation_sha256>`.
+
+#### 3.10.4 Weekly injected stall drill (WP9)
+
+1. **Drill.** `breezy-capture-stall-drill` runs Sundays at 12:30Z (WP0 confirms the slot has few takes). It refuses unless the recorder is active with an instance older than 1 h, there has been no watchdog kill in the last 24 h, and it is within 10 min of the slot. It then:
+   - writes `evidence/capture/drill/<date>.json` (`injected=true`);
+   - runs the literal argv `["systemctl","--user","kill","--signal=SIGSTOP","breezy-quote-tape.service"]`.
+2. **Expected chain.**
+   - The recorder's loop freezes, so the pings stop.
+   - systemd's watchdog fires at about 12:40 and sends SIGTERM plus SIGCONT (V-10).
+   - `Restart=always` brings up a new instance.
+   - The stop hook records the kill and alerts.
+   - The next audit confirms the heal and marks it `injected=true` from the drill file.
+3. **Guard.** `breezy-capture-stall-drill-guard` runs at 13:15Z. It runs the literal SIGCONT argv unconditionally. If no watchdog stall record exists after the drill timestamp, it raises CRITICAL `CAPTURE_DRILL_NOT_HEALED`.
+4. **Skipped-drill alarm** (r8 H9, kept). Three consecutive refusals raise CRITICAL `CAPTURE_DRILL_SKIPPED`.
+
+**r9 removes r8's AUT-6 SELF_HEAL precondition** for the drill, because the healer is now systemd, not AUT-6 (ER-8).
+
+#### 3.10.5 Units AUT-6 may restart (obligation)
+
+- **AUT-1 requests no AUT-6 restart.**
+- `breezy-quote-tape.service` and `breezy-nws-ingest.service` stay in `SELF_HEAL_RESTARTABLE_UNITS`, but only for AUT-6's own **failed-unit** path.
+- AUT-6 must not `try-restart` an active recorder because of a stall. systemd's watchdog is the single decision source.
+- NWS-ingest freshness belongs to AUT-6's observation-feed detector (README AUT-6: "data freshness (tape, NBP and observation feeds)"). r8's duplicate alert is dropped.
+
+### 3.11 Daily completeness audit (obligation 6; AUT-1a)
+
+#### 3.11.1 Unit and inputs
+
+**Schedule.** `breezy-capture-audit` runs at 13:50Z for D = yesterday, without `Persistent`. On each run it also:
+- backfills any of the last 8 days that has no audit file;
+- re-audits any of the last 8 days that is still `INCONCLUSIVE` (both r8 rules).
+
+It runs under the E-7a wrapper.
+
+**Inputs**, all read-only:
+- the capture stream for every boot overlapping D−1..D+1;
+- `settlement_*.jsonl`;
+- the epoch files;
+- the exec store, read through the **E-8 snapshot helper with `take_flock=False`** (E-7a rule 3, E-8a). The result is advisory and never counts toward H;
+- the node logs, the funnel files, the ingest and supervisor journals (r8's literal `journalctl` argvs) and the recorder catalog;
+- the recorder unit's journal (`journalctl --user -u breezy-quote-tape.service -o json --since … --until …`, 30 s timeout);
+- `systemctl --user show -p WatchdogUSec -p NotifyAccess breezy-quote-tape.service`.
+
+**Import closure.** The audit, settlement, live-proof, hook and drill entry points import no `breezy.adapters.*` module. Leg I uses `breezy.domain.exec_intent` (§2.2). This is pinned by `tests/unit/autonomy/test_capture_unit_closures_have_no_venue_adapter_module`, which uses AUT-6 r12's static module-level walk with its positive control.
+
+**Fail-loud** (C2, D15). Any of the following makes the day `ERROR`, never `NO_INPUT`:
+- every item on r8's list:
+  - an exec-store snapshot failure;
+  - an unknown key prefix;
+  - an unreadable or unparseable node log;
+  - a boot without a log;
+  - a journal failure;
+  - an epoch error;
+  - a positive-control failure;
+- `stream_unreadable`: a feather file that fails to open;
+- `recorder_watchdog_unarmed`: `WatchdogUSec=0`, or `NotifyAccess` other than `main`.
+
+r8's boot census (H5) and boot-ended rule (D6) are unchanged, with one addition: every `<capture_root>/live/<instance_id>/` directory overlapping D is a census member.
+
+#### 3.11.2 Legs per fill
+
+Only fills with `ts_event ≥ epoch_start_ns` are audited.
+
+| Leg | Pass condition |
+|---|---|
+| L | Exactly one `decision_id` tag across the native `OrderInitialized` rows for `client_order_id`. A conflict is `link_conflict`. A SELL with no tag gets the orphan id → `untagged_order` FAIL. |
+| D | Entry: a `Take` and a `TrySubmit(submitted)` with that id, and the id recomputes from the Take. Exit: an `Exit` whose id recomputes from the four tag values (`test_every_exit_fill_joins`). |
+| B | All of: the Take-path `FrameCopy` exists; it equals the tape frame whenever the tape holds one (otherwise `frame_copy_mismatch` FAIL); the forecast reference resolves (V-12); `artefact_sha256` resolves; every non-`Exit` record has a non-empty `frame_kind`. |
+| I | `intent_fingerprint`, recomputed from the projected `OrderLink` (the `OrderInitialized` fields), matches `fill_by_fingerprint/<day>:<fp>`, using the r8 `<day>` derivation (V-6). |
+| E | A native `OrderFilled` with the same `trade_id`, or a resolver context naming the `client_order_id`. |
+| P | A projected `PositionMark` with `ts ≥ fill.ts_event`, or a tape mark, or `fill_via_resolver`. |
+| S | A `SettlementRecord`. This is r8's leg S unchanged, including its definition of "ended" as the end of the climate day in local standard time. |
+
+#### 3.11.3 Reconciliation legs per day
+
+| Leg | Pass condition |
+|---|---|
+| R1 | r8 R1, unchanged: a bijection between the `SHADOW_DECISION` Take/TrySubmit lines and the records; veto lines checked through the on-change replay; guard `EntryVeto`s matched to `CAPTURE_REFUSED` lines. **One exception:** lines inside a boot's `lost_in_flush_window` (§3.4.4) are counted, not FAIL. |
+| R2 | r8 R2, unchanged: replay every `SHADOW_DECISION` line through the same `OnChangeFilter` and `EvalSeqCounter`, and require equality with the boot's on-change `DecisionRecord` sequence. The same flush-window exception applies to the tail. |
+| R3 | r8 R3, unchanged (funnel counts). |
+| R4 | Writer failure markers in the node log: `Failed to serialize`, `Can't find writer for cls` or `CAPTURE_PUBLISH_FAILED` → FAIL. Their absence proves nothing (L-30). |
+| **R5** | **Counted stream loss** (§3.4.4). Per boot, the records present up to the last flushed heartbeat must equal its `records_published`. A shortfall is `stream_record_lost` FAIL. The `lost_in_flush_window` count is reported. |
+| **R6** | **Reference resolution.** Reports `refusal_frame_ref_resolved_frac`, the fraction of on-change refusal frame references that resolve against the tape. Below the WP0-measured baseline minus 1 percentage point, it raises CRITICAL `CAPTURE_REFUSAL_REFS_UNRESOLVED` but does not FAIL the day, because refusals do not enter a fill's join (§R9 row 3). |
+| **R7** | **Stream continuity.** For each boot overlapping D, no gap longer than `STREAM_GAP_FAIL_S = 180` between consecutive `CaptureHeartbeat`s while the boot ran; otherwise `stream_gap` FAIL. This is the positive control for the writer as a whole. |
+| O | r8's order census, reading `OrderInitialized` in place of `OrderLink`. Every exec-store order, resolver context and `OrderSubmitted`/`OrderDenied` log line names a streamed `OrderInitialized`. Each `TrySubmit(submitted)` is `linked`, `refused_after_trysubmit` or `never_submitted`; anything else is `trysubmit_unlinked`. |
+| F | r8's fill census, unchanged. |
+| T | r8's tape-ingest leg, unchanged. Frame references depend on the tape, so the tape's own health stays audited. |
+| N | r8's NBP census, plus a check that each `NBP_CYCLE_MISSED` offer in the log has a delivery record. |
+
+The node-log and funnel positive control (D13) is unchanged.
+
+#### 3.11.4 Day status, verdicts and outputs
+
+- **Day status** (`PASS`, `INCONCLUSIVE`, `NO_INPUT`, `PRE_CAPTURE`/`PARTIAL_EPOCH`, `ERROR`, `FAIL`) and the **C4 verdicts** (`capture_join_completeness`, `capture_tape_ingest`, `capture_nbp_census`) are unchanged from r8 §3.10.
+- **New metrics:** the metric tuple gains `records_lost_in_flush_window`, `refusal_frame_ref_resolved_frac`, `leg_R5_pass`, `leg_R6_pass` and `leg_R7_pass`. They are proposed to AUT-5 for pre-registration (§5.2).
+- **Outputs:**
+  - `evidence/capture/audit/<family>/<D>.json` (write-once per run, mode 0444, schema `capture_audit/v2`);
+  - the verdicts;
+  - CRITICAL `CAPTURE_JOIN_GAP`, `CAPTURE_TAPE_INGEST`, `CAPTURE_NBP_CENSUS` and `CAPTURE_AUDIT_ERROR`, through `deliver_with_proof`;
+  - `OnSuccess=breezy-capture-live-proof.service`.
+
+#### 3.11.5 Duties moved from r8's watchdog
+
+The audit and the live-proof unit now check each other daily.
+
+| Unit | Checks on each run | Alert on failure |
+|---|---|---|
+| Audit | a settlement record exists for every traded station-day older than 48 h | `CAPTURE_SETTLEMENT_MISSING` |
+| Audit | no day is still `INCONCLUSIVE` 8 days after it ended | `CAPTURE_AUDIT_STUCK_INCONCLUSIVE` |
+| Audit | the newest live-proof roll-up is younger than 26 h | `CAPTURE_LIVE_PROOF_STALE` |
+| Live-proof | an audit verdict younger than 26 h exists | `CAPTURE_AUDIT_DEADMAN` |
+| Live-proof | an audit file exists for every elapsed day in the last 8 | `CAPTURE_AUDIT_FILE_MISSING` |
+
+Each check runs in its own `try` (r8 H7 isolation). If both units are dead, AUT-6's unit health (inactive timers, failed units) and its off-host canary page (§5.1).
+
+#### 3.11.6 Heal confirmation and heal-alert delivery
+
+These are r8 §3.14's rules, now carried by the audit.
+
+- **Confirm.** The audit confirms recorder watchdog heals (§3.10.3).
+- **Re-send.** The audit lists every heal record from the last `HEAL_ALERT_RETRY_DAYS = 8` dates: its own and the NBP actor's, including `alert="undeliverable"`. For each one without a `delivered=true` match, it re-sends `CAPTURE_HEALED_<sha>` through `deliver_with_proof` with `attempt_kind="retry"`. A node record is re-sent only once it is older than 600 s.
+- **Abandon.** Daily, for heal dates in `[today−30, today−8]`, the audit follows r8 X1's order:
+  1. if a delivered record exists, write the marker;
+  2. otherwise send CRITICAL `CAPTURE_HEAL_ALERT_ABANDONED_<sha>`;
+  3. write the marker only after a `delivered=true` proof.
+- **Age-out** (r8-final LOW). An unmarked heal older than `today−30` produces a loud `CAPTURE_HEAL_UNABANDONED heal=<sha>` log line and the roll-up field `heal_alert_unabandoned_count`.
+- **Cadence.** Retries are daily now, down from r8's per-probe and hourly cadence. Only the evidentiary `HEALED` alert waits; the CRITICAL detection alert (`RECORDER_WATCHDOG_KILL`) is sent immediately by the stop hook.
+- **Exit status.** Any failed delivery makes the audit exit 1 after its writes (r8 L2), so `OnFailure=` fires.
+
+### 3.12 Settlement writer (C1 P1-6)
+
+Unchanged from r8 §3.9:
+- `breezy-capture-settlement` runs at 13:35Z, without `Persistent`, under its own lock;
+- it scans `[today−7, today−1]`;
+- it appends `SettlementRecord{station, climate_day, settlement_tmax_f, basis, raw_sha256}` to `<decisions_dir>/settlement_<climate_day>.jsonl`, once per `raw_sha256`, with a venue-owned `basis`;
+- an error raises `CAPTURE_SETTLEMENT_ERROR`, and a failed delivery exits 1.
+
+New in r9: it runs under the E-7a wrapper, with its bind set to `<decisions_dir>` and `evidence/alerts/`. Under the same-bind rule, its temp file sits in `<decisions_dir>`.
+
+### 3.13 Units, timers, memory and locks
+
+**Programme rules:**
+- Every oneshot uses `TimeoutStartSec`, never `RuntimeMaxSec`.
+- No unit's [start, start + `flock -w` + `TimeoutStartSec`] meets [16:30Z, 17:10Z) (ARCH §5.2).
+- Every AUT-1 unit, including each `OnFailure=` target, runs through `deploy/systemd/breezy-autonomy-bwrap` with an `AUTONOMY_BWRAP_TABLE` row (E-7a rule 1).
+- Lock order: `timeout -k` → `flock -w` → wrapper.
+
+| Unit | `OnCalendar` (UTC) | Lock, `flock -w` | Memory | `TimeoutStartSec` | Latest end | bwrap binds |
+|---|---|---|---|---|---|---|
+| `breezy-capture-settlement` | `*-*-* 13:35:00` | own, 30 s | `MemoryMax=256M` | 300 | 13:40:30 | `<decisions_dir>`, `evidence/alerts/` |
+| `breezy-capture-audit` | `*-*-* 13:50:00` | `breezy-studies.lock`, 600 s, `breezy-studies.slice` | `MemoryHigh=768M`, `MemoryMax=1G` | 1500 | 14:25 | `evidence/capture/audit/`, `evidence/capture/heal/`, `evidence/capture/heal_alert_abandoned/`, `derived/verdicts/`, `evidence/alerts/`, its E-8 cache dir |
+| `breezy-capture-live-proof` | `OnSuccess=` of the audit, plus a fallback timer `*-*-* 14:35:00` | own, 30 s | `MemoryMax=256M` | 300 | 14:40:30 | `evidence/capture/live_proof/`, `evidence/alerts/` |
+| `breezy-capture-stall-drill` | `Sun *-*-* 12:30:00` | own, 30 s | `MemoryMax=64M` | 60 | 12:31:30 | `evidence/capture/drill/`, `health/capture-stall-drill/`, `evidence/alerts/` (plus the user-bus socket if V-9 requires it) |
+| `breezy-capture-stall-drill-guard` | `Sun *-*-* 13:15:00` | none | `MemoryMax=64M` | 30 | 13:15:30 | `evidence/alerts/` (plus the user-bus socket if V-9 requires it) |
+| Recorder stop hook | `ExecStopPost=` of `breezy-quote-tape.service` (event-driven) | own `health/recorder_watchdog/hook.lock`, 5 s | inherits the recorder's | bounded by `timeout -k 2 25`, inside `TimeoutStopSec` | — | `evidence/capture/stall/`, `health/recorder_watchdog/`, `evidence/alerts/` |
+
+- **Launch window.** The stop hook is event-driven, so a watchdog kill inside [16:30Z, 17:10Z) runs it there. The recorder is not a launch-path unit and holds no trading state, and its existing `Restart=always` already fires inside the window today. ER-8 states the exemption.
+- **Calendar tests** (`tests/unit/test_capture_units.py`):
+  - `::test_no_unit_overlaps_launch_window`
+  - `::test_oneshot_units_use_timeout_start_sec_not_runtime_max_sec`
+  - `::test_no_capture_timer_is_persistent`
+  - `::test_cli_defers_inside_launch_window` (one case per timer CLI)
+  - `::test_every_capture_unit_and_onfailure_target_runs_through_bwrap_wrapper` (E-7a)
+  - `::test_recorder_unit_watchdog_config_exact`: `WatchdogSec=600`, `NotifyAccess=main`, `WatchdogSignal=SIGTERM`, `Restart=always`, and one `ExecStopPost=` through the wrapper with `timeout -k`.
+- **Memory.**
+  - The own-lock units add ≤ 640M (256 + 256 + 64 + 64) to the ≤ 4G own-lock budget (ARCH §5.2, V14). r8's watch and watchdog (384M) are gone.
+  - Inside the trade node under option A, the writer holds one Arrow stream per included table: about 12 small buffers, flushed each second.
+  - WP0 V-4 measures RSS with streaming on and off on a replayed day. Above +50 MB, the volume is revisited.
+- **Common unit settings:**
+  - `OnFailure=breezy-study-failed@%n.service` (AUT-6's migrated notifier);
+  - `EnvironmentFile=-%h/.config/breezy/alerts.env`, re-bound read-only inside the wrapper's `--tmpfs ~/.config`. Under the E-7 credential rule, the `~/.config/breezy` venue credentials are never visible;
+  - `UMask=0077`;
+  - the exact interpreter;
+  - E-7c: the wrapper's private `--tmpfs /tmp` and `TMPDIR=/tmp` cover pyarrow and `tempfile` scratch writes. No durable AUT-1 state is ever written under `/tmp`.
+
+### 3.14 The 38-vs-35 divergence (with AUT-4; WP6)
+
+Unchanged from r8 §3.12, except that its rerun runs under the E-7a wrapper. **E-7b dependency:** `scripts/analysis/nbp_shadow_parity.py` imports `breezy.adapters.polymarket_us.symbology`. WP6 therefore runs only after AUT-4's E-7b(a) move of the pure symbology helpers into an adapter-free module, and WP6's closure test (`test_parity_attribution_closure_has_no_venue_adapter_module`) must pass. If E-7b(a) is not delivered, WP6 needs its own coordinator ruling: E-7b(b) is scoped to AUT-4's `eval-offline` row only, and r9 does not stretch it.
+
+### 3.15 Read-only closures and the one-writer property (E-7, E-7a, r8-final MEDIUM)
+
+**Wrapper first** (E-7a rule 1). Every AUT-1 unit and the stop hook run under the shared wrapper, and their write scope is their table row (§3.13). Two things are never wrapped (the E-7a rule 5 residual): the node, and the recorder's `ExecStart`.
+
+**AST lint** (E-7a rule 4: a lint, not a READY criterion). `tests/unit/autonomy/test_capture_read_only_closure.py::test_aut1_closures_follow_write_authority_allowlist` walks **only** the AUT-1 globs:
+- `src/breezy/persistence/autonomy/capture_*`
+- `src/breezy/strategy/autonomy_capture/`
+- `src/breezy/strategy/forecast_quantile_ladder/{capture_adapter,plugin}.py`
+- `src/breezy/adapters/polymarket_us/recorder_watchdog.py`
+- `src/breezy/runtime/capture_*`
+- `src/breezy/analysis/capture_*`
+
+Other owners' modules are judged under their own tables. The lint's rules:
+- It is an **allowlist** (the AUT-6 r9 AC6 ruling). `AUT1_WRITE_AUTHORITY` lists each module's permitted write sites, subprocess argvs and SQLite opens. Any call not on its row fails. That includes a write-mode `open`/`os.open`, a **non-literal** mode or flags (which fail closed), `sqlite3.connect`, `subprocess`, `os.system`, `ctypes` and `importlib`.
+- A non-writer may import a cross-unit write module **only through named read-only functions** listed in the table.
+- Every `reason=` passed to a capture record or a refusal must be a module-level constant; a non-constant fails.
+- It is non-vacuous, with a minimum number of judged call sites per entry point, and has positive controls: a planted write in a scratch module must fail.
+
+| Unit / closure | Modules | Write rows | Allowed argv | SQLite |
+|---|---|---|---|---|
+| Trade node capture | `capture_publish.py`, `capture_stream.py`, `capture_epoch.py`, `capture_actor.py`, `guarded_strategy.py` | the stream under `<capture_root>/live/<instance_id>/` (through the native writer only); `evidence/capture/epoch/` | none | none |
+| Recorder process | `recorder_watchdog.py` | none (a datagram to `$NOTIFY_SOCKET`) | none | none |
+| Recorder stop hook | `capture_recorder_hook_cli.py` | `evidence/capture/stall/`; `health/recorder_watchdog/` | none | none |
+| `breezy-capture-settlement` | `capture_settlement{,_cli}.py` | `<decisions_dir>/settlement_*.jsonl` | none | none |
+| `breezy-capture-audit` | `capture_audit{,_cli}.py`, `capture_heal.py` | `evidence/capture/audit/`; `evidence/capture/heal/` (audit records); `evidence/capture/heal_alert_abandoned/`; its verdicts | the literal `journalctl` argvs (ingest, supervisor, recorder) and the read-only `systemctl --user show` argv | the E-8 snapshot copy only (`take_flock=False`) |
+| `breezy-capture-live-proof` | `capture_live_proof{,_cli}.py` | `evidence/capture/live_proof/` | none | none |
+| Drill and guard | `capture_stall_drill_cli.py` | `evidence/capture/drill/`; `health/capture-stall-drill/` | the two literal SIGSTOP/SIGCONT argvs | none |
+| Parity attribution | `capture_parity_attribution.py` | its record | the literal rerun argv | none |
+
+**Non-writers:**
+- `capture_records.py`, `capture_ids.py`, `capture_on_change.py`, `capture_alerts.py`, `capture_reader.py`, `capture_schedule.py`;
+- `node_observations.py`, the node-side watch closure (the registry watch actor's closure is AUT-5's);
+- `capture_adapter.py`, `plugin.py`, `capture_node_log.py`.
+
+**One writer** (E-7 rule 4). Each stream directory has exactly one writer: the `StreamingFeatherWriter` of the boot named by `<instance_id>`, owned by the kernel (or, under option B, by the actor). Each `instance_id` is fresh per boot, so no two processes share a file. ER-6 replaces C1's "serialised by the submit-intent flock" with this rule. `test_autonomy_files_have_one_writer` gains AUT-1's rows.
+
+### 3.16 Alert catalogue
+
+Every row goes through `deliver_with_proof`; node rows go through `AlertOutbox.offer`. The event-string rules are r8 §3.13's:
+- bare tokens, with qualifiers in `detail`;
+- a closed tuple;
+- `CAPTURE_EVENT_RE = ^[A-Z0-9_]{1,96}$`, checked after upper-casing any hex;
+- `<sha>` suffixes of 64 lowercase hex characters.
+
+| Event | Severity | Sender | Repeat rule |
+|---|---|---|---|
+| `CAPTURE_PUBLISH_FAILED` | CRITICAL | node publisher | first per cause per 300 s; suppressed counts logged |
+| `CAPTURE_REFUSED` (`capture_untagged`, `capture_gap`); guard causes `exit_capture_gap`, `untagged_sell`, `untagged_buy`, `capture_order_list_refused` | CRITICAL | guard | per event |
+| `CAPTURE_VENUE_SILENT` | WARNING | node `md_feed_freshness` | on the transition, then hourly while it holds |
+| `NBP_CYCLE_MISSED` | CRITICAL | NBP actor | once per cycle |
+| `CAPTURE_EPOCH_UNREADABLE` | CRITICAL | capture actor | once per boot |
+| `CAPTURE_HEALED_<sha>` | INFO | NBP actor; audit | once per heal; the audit re-sends daily until delivered |
+| `CAPTURE_HEAL_ALERT_ABANDONED_<sha>` | CRITICAL | audit | per heal still unmatched after 8 days, until delivered; the marker is written after proof |
+| `RECORDER_WATCHDOG_KILL`, `RECORDER_WATCHDOG_STORM` | CRITICAL | recorder stop hook | per kill; the storm form from the third kill in a trading day |
+| `CAPTURE_JOIN_GAP`, `CAPTURE_TAPE_INGEST`, `CAPTURE_NBP_CENSUS`, `CAPTURE_AUDIT_ERROR`, `CAPTURE_REFUSAL_REFS_UNRESOLVED`, `CAPTURE_SETTLEMENT_MISSING`, `CAPTURE_AUDIT_STUCK_INCONCLUSIVE`, `CAPTURE_LIVE_PROOF_STALE` | CRITICAL | audit | per audited day; a failed delivery exits 1 |
+| `CAPTURE_AUDIT_DEADMAN`, `CAPTURE_AUDIT_FILE_MISSING` | CRITICAL | live-proof | per run; a failed delivery exits 1 |
+| `CAPTURE_SETTLEMENT_ERROR` | CRITICAL | settlement | per failing station-day |
+| `CAPTURE_DRILL_NOT_HEALED`, `CAPTURE_DRILL_SKIPPED` | CRITICAL | drill guard; drill | per drill slot; the guard exits 1 after SIGCONT if a delivery fails |
+
+**Removed with r8's watch and watchdog:**
+- `RECORDER_HUNG`, `RECORDER_STALLED`, `RECORDER_WRITER_STALL`, `RECORDER_UNHEALED` and `RECORDER_INACTIVE`. These are replaced by the watchdog kill, or by AUT-6's failed-unit alert.
+- `RECORDER_HEARTBEAT_NEVER_SEEN` and `RECORDER_BYTES_STALE_AWAITING_HEARTBEAT`.
+- `NWS_INGEST_HUNG` and `NWS_GATE_NOT_OPEN`, now covered by AUT-6's feed freshness.
+- `CAPTURE_WATCHDOG_*`, `CAPTURE_WATCH_STALE`, `CAPTURE_WRITE_FAILED`, `CAPTURE_BYTE_CAP` and `CAPTURE_PAYLOAD_COLLISION`.
+
+---
+
+## 4. Work packages
+
+**Gate for every WP:**
+
+```
+scripts/ci/run_tests_no_egress.sh; echo EXIT=$?          # full gate, exact interpreter; read EXIT (L-43)
+cd <tree root> && lint-imports                            # console script; must print "N kept, 0 broken"
+scripts/ci/run_tests_no_egress.sh tests/unit/test_mypy_ratchet.py
+```
+
+**Environment rules:**
+- In a worktree, set `PYTHONPATH=<worktree>/src`.
+- Never run `uv`, `pip`, `uv run` or `git stash`.
+- Unit-launched gates use `-p LimitNOFILE=524288`.
+
+**Tests that must stay green unedited:**
+- `test_exec_client_is_byte_identical_to_its_pre_sl13_sha256`
+- `test_execution_egress_firewall_guard`
+- `test_operator_control_assignment_scan`
+- `test_shadow_only_false_is_only_the_gate_output`
+- `test_live_orders_ruling_deploy_copy_matches_evidence`
+- `test_native_order_cap_wiring`
+- `test_risk_engine_ordering_enforcement`
+- `tests/unit/test_probe_containment.py::test_pyproject_addopts_deselect_the_probe_markers`
+- every existing `tests/strategy/forecast_quantile_ladder/*` test
+- `tests/unit/test_quote_tape_recorder.py` and `tests/unit/test_quote_tape_storage_hygiene.py`
+
+**G-ERR (errata gate):**
+- WP1, WP5 and WP8 do not merge until the coordinator adopts ER-1…ER-7 and ER-10, or rules otherwise.
+- WP3's watchdog activation (step 2) waits on ER-8.
+- WP0, WP2, WP4 and WP6 are unaffected.
+
+**Binding in every WP brief:**
+- `reviews/AUT-1-r8-final.md`'s items, as re-applied in §R9;
+- ARCH errata E-1…E-10, E-7a, E-7b, E-7c and E-8a;
+- the final items of any r9 review.
+
+### AUT-1a
+
+#### AUT-1.WP0: premises and measurements (characterisation; mutation evidence per L-33)
+
+**Files.**
+- `tests/unit/test_aut1_l1_nautilus_premises.py` (new)
+- `docs/evidence/AUT1_WP0_premises_<date>.md` (new)
+- Scratch systemd units only, named `claude-aut1wp0-*` under `~/.config/systemd/user/`, then removed and `daemon-reload`ed afterwards (the AUT-6 r9 precedent). No `breezy-*` unit is touched.
+
+**Verify-first premises.** Each one is a characterisation test that fails against a recorded mutation.
+
+| # | Premise | Test / measurement | If it fails |
+|---|---|---|---|
+| V-1 | **Every `@customdataclass` schema is registered before the first write.** | `::test_capture_types_registered_before_kernel_writer_exists`: build `CAPTURE_INCLUDE_TYPES` in a fresh interpreter and assert that each class is in `list_schemas()` before any `StreamingFeatherWriter` is built. Mutation: define a type after the writer is constructed, and show the `KeyError` at `writer.py:460` propagating into the publisher. | Reorder the imports; the test stays as the guard. |
+| V-1b | The decorator rejects `Optional` and `Decimal` fields. | `::test_customdataclass_rejects_optional_and_decimal_fields` (`custom.py:259-265`) | None (it pins the §3.4.1 encoding rule). |
+| V-2 | The production trade config's `json()` encodes, with no secret in it. | `::test_trade_config_json_encodes`: RED on the current config (`TypeError`), GREEN after `register_config_encoding`, plus the forbidden-content scan. | Option B. |
+| V-3 | No included native type fails to serialise; handler order is as expected. | `::test_streamed_native_event_serialisation_never_raises` over recorded FQ `OrderInitialized`/`OrderFilled`/`Position*` events; `::test_kernel_writer_runs_before_strategy_handlers_at_equal_priority`; `::test_msgbus_handler_exception_unwinds_into_publisher` (`component.pyx:2832-2834`) | Option B. |
+| V-4 | Option A's bus overhead and RSS are acceptable. | Replay one recorded day of frames through a node with and without streaming. Per-message p99 must be ≤ 2 µs, and the RSS delta ≤ 50 MB. | Option B. |
+| V-5 | A custom type with no `instrument_id` writes one regular file and is never silently dropped. | `::test_custom_type_without_instrument_id_writes_regular_file`. Mutation: add `instrument_id: InstrumentId`, with the instrument absent from the cache → zero rows (`writer.py:230-239`). | — |
+| V-6 | The streamed `OrderInitialized` string forms recompute `intent_fingerprint`. | `::test_order_initialized_stream_fields_recompute_intent_fingerprint`, against a real `LimitOrder` (YES and NO leg) | The reader maps the enum strings, and the evidence file names the map. |
+| V-7 | **The cache is populated before the strategy handler runs.** | `::test_quote_tick_cached_before_on_quote_tick` (`engine.pyx:2716` < `:2728`); `::test_depth_frame_is_not_cached_before_on_order_book_depth` (`:2691-2696`). Measurement: over 14 tape days, the fraction of FQ depth-triggered evaluations whose instrument has no cached quote. | The depth-only fraction is recorded, and §3.7.1's "missing never vetoes" rule stands. |
+| V-8 | **`sd_notify` reaches systemd from the recorder's main PID with `NotifyAccess=main`; a withheld ping triggers the watchdog; `SERVICE_RESULT=watchdog` reaches `ExecStopPost`.** | A scratch `Type=simple` python unit with `WatchdogSec=20`: ping, then stop pinging. Assert `Result=watchdog`, that the hook sees `SERVICE_RESULT=watchdog`, and that `Restart=always` restarts the unit. | The plan returns to review. |
+| V-9 | **`sd_notify` and user-bus clients work under the E-7a bwrap wrapper.** | The same scratch unit, with `ExecStart` running through `bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid --new-session --die-with-parent`: (a) a datagram `sendto($NOTIFY_SOCKET)` across the read-only bind is accepted with `NotifyAccess=all` (negative control: with `=main` the main PID is bwrap's, so the datagram must be refused); (b) `systemctl --user show` and `journalctl --user` (the audit and drill argvs) work across the read-only bind; (c) if `AF_UNIX` connect fails with `EROFS`, retry with a `--bind` of the socket inode only. | The recorder stays unwrapped (it already is). The audit and drill rows gain the socket bind, and the evidence file states which. |
+| V-10 | systemd 259 sends SIGCONT after the watchdog signal to a SIGSTOPped main process. | A scratch unit, SIGSTOPped, with `WatchdogSec=20` and `WatchdogSignal=SIGTERM` | The drill guard sends SIGCONT at +90 s instead of at 13:15Z. |
+| V-11 | Tape coverage of node frames. | Over 14 days, the fraction of logged Take and on-change refusal `(instrument_id, ts_event)` pairs that are present in the recorder catalog | Sets the strictness of legs B and R6. |
+| V-12 | `(station, cycle_ns)` resolves to the exact vector FQ used. | Pin the NBP store path and reader; check equality on 3 retained Takes. | Take-path `FrameCopy.forecast_body`. |
+| V-13 | `_watch_feed`'s cadence; `sample_feed_health` runs on the event loop. | Read `_feed_watch_interval_secs`; `::test_sample_feed_health_runs_on_loop_thread` | Adjust the ping period. |
+| V-14 | The `fill_by_fingerprint` `<day>` derivation; the supervisor spawn lines; one `SHADOW_DECISION` per evaluation; the Nautilus disposal-line text. | r8 WP0 items 8, 10, 11 and 12, unchanged | As r8. |
+| V-15 | Every wrapped AUT-1 entry point's closure is free of venue-adapter modules; `submit_chain.py` is not byte-pinned. | Use AUT-6 r12's static module-level walk (with its positive control) over the planned post-move imports of the audit, settlement, live-proof, hook and drill. Grep `tests/` for any sha pin on `exec/submit_chain.py`. | If `submit_chain.py` is pinned, `intent_fingerprint` is re-implemented in `exec_intent.py`, and a parity test over 1,000 random orders pins it equal to the adapter's; the pin is never edited. |
+
+**Measured**, as one studies-flock job outside 01:00–04:30Z under `MemoryMax=4G`:
+- the full-UTC-day stream volume (§3.2);
+- r8's D8 silence and writer-stall statistics, for the gate thresholds;
+- the drill slot;
+- V-4, V-7 and V-11.
+
+**GREEN.** All pass on 1.231.0. The evidence file states every constant and **the option A/B decision**.
+
+**Activation.** None.
+
+#### AUT-1.WP1: record types, ids, publisher, stream config, reader
+
+**Files.**
+- `src/breezy/persistence/autonomy/capture_{records,ids,on_change,publish,stream,reader,alerts,epoch,schedule}.py` (new)
+- `src/breezy/persistence/exit_tags.py` (edit)
+
+**RED first** (`tests/unit/autonomy/`):
+- `test_capture_records.py`: `::test_capture_record_field_sets_are_exact`, `::test_no_capture_record_field_is_named_instrument_id`, `::test_null_encoding_is_empty_string_and_zero`, `::test_records_round_trip_through_registered_arrow`, `::test_schema_strings_are_versioned`
+- `test_capture_ids.py`: r8's id tests (`::test_decision_id_recomputes_from_stored_record`, `::test_decision_id_unique_per_take`, `::test_exit_decision_id_uses_only_the_four_exit_tag_values`, …), plus `::test_same_frame_quote_and_depth_get_distinct_ids`, `::test_eval_seq_counter_is_bounded_per_instrument`, `::test_nonmonotone_ts_event_never_repeats_an_ordinal`
+- `test_capture_on_change.py`: r8's four tests
+- `test_capture_publish.py`: `::test_publish_exception_never_raises_and_sets_health_not_ok`, `::test_publish_failure_offers_critical_deduped_per_cause_per_300s`, `::test_health_clears_only_on_heartbeat_with_bytes_growth`
+- `test_capture_stream.py`: `::test_capture_root_is_disjoint_from_quote_tape_root`, `::test_include_types_exact`, `::test_rotation_matches_recorder_constants`, `::test_canary_writer_root_is_capture_root_canary`
+- `test_capture_reader.py`: `::test_projection_yields_c1_record_names_and_fields`, `::test_order_link_projected_from_order_initialized_tags`, `::test_position_mark_projection_applies_no_leg_sign`, `::test_frame_ref_resolution_order_copy_then_tape`, `::test_truncated_final_batch_is_stream_torn_tail`, `::test_join_exposes_stored_eval_seq_never_recomputed`, `::test_reader_refuses_symlinks`
+- `test_capture_alerts.py`, `test_capture_epoch.py`, `test_capture_schedule.py`: r8's tests
+- `test_capture_read_only_closure.py`: `::test_aut1_closures_follow_write_authority_allowlist`, `::test_non_literal_open_mode_fails_closed`, `::test_reason_values_are_constants`, `::test_lint_has_positive_control`
+- `test_autonomy_payload_hygiene_scan` and `test_autonomy_files_have_one_writer`, widened with AUT-1's rows (L-12)
+
+**GREEN.** All pass, `lint-imports` is clean, and neither `capture_ids` nor `capture_on_change` imports Nautilus.
+
+**Activation.** Library only.
+
+#### AUT-1.WP2: FQ adapter, plugin entry, guard library
+
+**Files.** `src/breezy/strategy/forecast_quantile_ladder/{capture_adapter,plugin}.py` and `src/breezy/strategy/autonomy_capture/guarded_strategy.py` (new).
+
+**RED first:**
+- r8's adapter and guard tests, re-targeted to the publisher;
+- `::test_link_write_failure_refuses_buy_capture_gap` becomes `::test_publisher_health_not_ok_refuses_buy_capture_gap`;
+- new: `::test_take_publishes_frame_copy_before_decision_record`, `::test_refusal_never_publishes_frame_copy`, `::test_capture_gap_refusal_cites_frame_by_reference_only` (the r8-final MEDIUM question);
+- `::test_every_full_plugin_kind_strategy_subclasses_capture_guard` stays RED-pending-WP7. This is recorded in the WP's evidence; the test is not `xfail`ed.
+
+**GREEN / Activation.** As r8 WP2: library only.
+
+#### AUT-1.WP3: recorder watchdog gate, stop hook, unit edit
+
+**Files.**
+- `src/breezy/adapters/polymarket_us/recorder_watchdog.py` (new)
+- `src/breezy/adapters/polymarket_us/{config,data}.py` and `src/breezy/runtime/node_config.py` (edit)
+- `src/breezy/runtime/capture_recorder_hook_cli.py` (new)
+- `deploy/systemd/breezy-quote-tape.service` (edit)
+- the `AUTONOMY_BWRAP_TABLE` row `breezy-quote-tape.stop-hook`
+
+**RED first:**
+- `tests/unit/test_recorder_watchdog.py`: `::test_ok_streaming_pings`, `::test_empty_listing_within_budget_pings`, `::test_discovering_overrun_withholds`, `::test_safe_mode_overrun_withholds`, `::test_frozen_counters_and_bytes_withhold_after_stream_silence`, `::test_one_event_flat_bytes_over_writer_stall_withholds`, `::test_event_inside_flush_margin_still_pings`, `::test_quiet_hours_use_wp0_multiplier`, `::test_midnight_rotation_is_not_writer_stall`, `::test_sd_notify_without_socket_is_false_never_raises`, `::test_sd_notify_abstract_namespace_socket`, `::test_withheld_line_logged_at_most_hourly`, `::test_trade_node_config_never_sets_watchdog_notify`
+- `tests/unit/test_capture_recorder_hook.py`: `::test_watchdog_result_writes_stall_record_and_state_and_alerts`, `::test_success_result_is_a_no_op` (the 09:00Z rotate), `::test_third_kill_in_trading_day_alerts_storm`, `::test_trading_day_boundary_is_1645z`, `::test_failed_delivery_exits_nonzero_after_writes`, `::test_hook_takes_its_own_lock`
+- `tests/unit/test_capture_units.py::test_recorder_unit_watchdog_config_exact`
+- `tests/unit/autonomy/test_capture_alert_contract.py`: r8's verbatim-event tests, with `RECORDER_WATCHDOG_KILL` and `RECORDER_WATCHDOG_STORM` added
+
+**GREEN.** All pass, and `tests/unit/test_quote_tape_recorder.py` and `test_quote_tape_storage_hygiene.py` are unedited.
+
+**Activation: two steps.** The technical reason: enabling `WatchdogSec` before the pinging code is live would kill a healthy recorder every 10 min.
+1. **Code on merge.** The gate code goes live at the next 09:00Z rotate. While `NotifyAccess=none`, systemd ignores the pings. Check the gate's hourly `RECORDER_WATCHDOG_WITHHELD`/OK summary for one full day: there must be zero withheld pings outside the 09:00–09:45Z listing hole.
+2. **Watchdog after ER-8.** `daemon-reload` with the edited unit; the change takes effect at the next 09:00Z rotate. Then confirm `systemctl --user show -p WatchdogUSec,NotifyAccess`, and confirm the stop hook was a no-op on that rotate (`Result=success`).
+
+#### AUT-1.WP4: NBP silent-feed check and hang reset (on the existing timer)
+
+**Files.** `src/breezy/ingest/nbm_quantile_actor.py`.
+
+**RED first:**
+- `tests/unit/test_nbm_quantile_actor.py`: `::test_submit_retains_future`, `::test_poll_hang_is_cancelled_and_reset_after_threshold`, `::test_missed_cycles_counts_from_stale_deadline`, `::test_first_fire_past_deadline_offers_nbp_cycle_missed_once_per_cycle`, `::test_check_runs_on_existing_cycle_timer_no_new_timer`, `::test_poll_reset_followed_by_vector_complete_writes_write_once_heal_record`, `::test_nbp_heal_with_absent_alert_offer_logs_critical_and_writes_undeliverable`, `::test_actor_without_alert_offer_constructs_unchanged`
+- FQ side: `tests/strategy/forecast_quantile_ladder/test_aut1_nbp_freshness.py`, r8's five tests, now reading `missed_cycles`
+
+**GREEN.** All pass, and the existing actor tests are unedited.
+
+**Merge and activation.** Merged only in WP8's train (r8 r6-T2), so it activates at WP8's LAUNCH.
+
+#### AUT-1.WP5: settlement, audit, node-log parser, heal, live-proof
+
+**Files.**
+- `src/breezy/analysis/capture_{settlement,settlement_cli,audit,audit_cli,node_log,heal,live_proof,live_proof_cli}.py` (new)
+- `src/breezy/domain/exec_intent.py` (new); `src/breezy/adapters/polymarket_us/exec/submit_chain.py` (re-export shim, per V-15)
+- the three units and the live-proof fallback timer
+- their `AUTONOMY_BWRAP_TABLE` rows
+
+**RED first.** r8 WP5's tests carry over, re-targeted to the stream reader: settlement, join, intent linkage, epoch, R1–R4, positive control, orders, census, fail-loud, D10, tape, NBP, canary/drill/family and provenance. Where r9 removed a test's subject (the payload store, the `.INCOMPLETE` marker, `partial_line`), its r9 counterpart replaces it: `::test_failed_to_serialize_log_line_fails_r4` and `::test_stream_torn_tail_after_boot_end_is_counted`. New tests:
+- **R5:** `::test_records_short_of_last_heartbeat_count_fail_stream_record_lost`, `::test_tail_after_last_heartbeat_of_crashed_boot_is_lost_in_flush_window_counted`, `::test_lost_take_path_record_still_fails_leg_d`
+- **R6:** `::test_refusal_ref_resolution_fraction_reported_and_alerted_below_baseline`
+- **R7:** `::test_heartbeat_gap_over_180s_fails_stream_gap`
+- **B:** `::test_frame_copy_mismatch_with_tape_fails`, `::test_forecast_ref_resolves_to_vector`
+- **closure (E-7/E-7a/E-7b):** `tests/unit/autonomy/test_capture_unit_closures_have_no_venue_adapter_module`; `tests/unit/autonomy/test_exec_intent_parity.py::test_exec_key_prefixes_equal_client_constants`, `::test_intent_fingerprint_shim_is_the_domain_function`; and `test_exec_client_is_byte_identical_to_its_pre_sl13_sha256`, unedited
+- **fail-loud:** `::test_recorder_watchdog_unarmed_is_error`, `::test_unreadable_stream_file_is_error`, `::test_exec_store_read_uses_snapshot_helper_without_flock` (E-8a)
+- **heal:** `::test_watchdog_kill_followed_by_streaming_instance_is_healed`, `::test_kill_followed_by_second_kill_within_30min_is_not_healed`, `::test_drill_heal_marked_injected`, `::test_heal_alert_resent_daily_until_delivered`, `::test_abandoned_marker_written_only_after_delivered_true_proof`, `::test_unmarked_heal_older_than_30_days_counts_unabandoned`
+- **moved watchdog duties:** `::test_audit_alerts_settlement_missing_after_48h`, `::test_audit_alerts_stuck_inconclusive_after_8_days`, `::test_audit_alerts_live_proof_stale`, `::test_live_proof_alerts_audit_deadman_and_missing_files`, `::test_each_moved_check_isolated`
+- **live-proof:** r8's roll-up tests, plus `::test_watchdog_heal_with_delivered_alert_satisfies_stall_leg`
+
+**Runtime evidence.** One run against two real retained logs (about 2.4 GB) under `MemoryMax=1G`. If it takes longer than 15 min, the WP returns to review.
+
+**Activation.** On merge, after G-ERR and AUT-6's notifier test:
+1. Link and `enable --now` the settlement and audit timers.
+2. Start each unit once by hand, outside [15:55Z, 17:10Z).
+
+Days before the epoch are `PRE_CAPTURE` by rule.
+
+#### AUT-1.WP6: 38-vs-35 attribution (with AUT-4)
+
+As r8 WP6, run under the E-7a wrapper.
+
+### AUT-1b (after AUT-5a merges)
+
+#### AUT-1.WP7: FQ hooks, `Refuse` input fields, re-base on the guard, path benchmark
+
+**Files.**
+- `src/breezy/strategy/forecast_quantile_ladder/strategy.py` (CS-0..CS-5; the base class)
+- `src/breezy/strategy/forecast_quantile_ladder/decision.py` (the additive `Refuse` fields)
+
+**RED first:**
+- `tests/strategy/forecast_quantile_ladder/test_aut1_capture_hooks.py`: r8's plumbing, Take-capture and outcome-record tests, re-targeted to the publisher, minus `::test_frame_clock_stamped_before_evaluation`. New: `::test_refuse_carries_p_hat_margin_and_ev_net_when_computed`, `::test_not_executable_and_not_dplus1_carry_null_inputs`, `::test_shadow_line_bytes_unchanged_by_refuse_input_fields`, `::test_refuse_input_fields_equal_the_values_evaluate_compared`, `::test_decision_record_carries_frame_and_forecast_refs`.
+- `tests/unit/autonomy/test_capture_submit_sites.py`: r8's five tests.
+- `::test_every_full_plugin_kind_strategy_subclasses_capture_guard` turns GREEN.
+
+**Benchmark.** `docs/evidence/AUT1_WP7_capture_path_<date>.md` records p50/p99/p99.9 from CS-1 to `super().submit_order`, over 1,000 Takes and 10,000 refusals. The budget is `CAPTURE_PATH_P99_BUDGET_MS = 5`, which is never raised; a result above it blocks the merge.
+
+**GREEN.** All pass, plus every existing FQ test and `tests/unit/test_forecast_quantile_ladder_boot.py`, unedited.
+
+**Activation.** Through WP8's LAUNCH.
+
+#### AUT-1.WP8: capture actor, detectors, epoch, streaming wiring, composition hunk
+
+**Files.**
+- `src/breezy/strategy/autonomy_capture/{capture_actor,node_observations}.py` (new)
+- `src/breezy/runtime/node_config.py` (`capture_stream_root`, plus the `register_config_encoding` calls under option A)
+- `src/breezy/strategy/forecast_quantile_ladder/composition.py` (edit)
+- `src/breezy/app/trade.py` (one hunk, rebased after AUT-5a)
+
+**RED first** (`tests/unit/autonomy/test_capture_actor.py` unless named):
+- **order events:** `::test_unstreamed_set_is_computed_from_list_schemas`, `::test_order_denied_and_canceled_published_as_order_event_record`, `::test_order_event_record_never_duplicates_a_streamed_type`, `::test_order_event_decision_id_from_cache_order_tags`, `::test_handler_never_raises_into_publisher`
+- **stream:** `::test_heartbeat_every_60s_forces_flush`, `::test_stream_bytes_flat_sets_capture_gap`, `::test_capture_actor_on_stop_publishes_final_heartbeat_exception_safe`, `::test_capture_actor_issues_no_venue_or_data_subscription`, `::test_epoch_written_at_first_capture_boot_and_logged`
+- **detectors:** `::test_capture_gap_vetoes_at_boot_until_positive_control`, `::test_observation_older_than_3_ticks_vetoes_at_call_time`, `::test_stale_cached_quote_vetoes_missing_quote_never_vetoes`, `::test_venue_silent_counts_quote_absent_separately_no_veto`, `::test_recorder_stale_vetoes_on_storm_until_1800s_quiet`, `::test_missing_recorder_watchdog_file_never_vetoes`, `::test_unparseable_recorder_watchdog_file_vetoes`, `::test_slot_refusal_entryveto_written_once_by_cs2_not_by_detector`
+- `tests/unit/test_forecast_quantile_ladder_boot.py`: `::test_fq_composition_registers_capture_actor_and_detectors`, `::test_fq_compose_without_capture_publisher_fails_boot` (production default factory, L-55), `::test_fq_composition_wires_alert_offer_into_nbm_quantile_actor`, and either `::test_trade_node_config_streams_to_capture_root_only` (option A) or `::test_capture_actor_owns_native_writer_on_capture_root` (option B)
+- `tests/unit/autonomy/test_capture_dependencies.py::test_aut6_node_liveness_detector_covers_log_mtime_and_tape_advance` (r8; must be GREEN before merge)
+
+**GREEN.** All pass, and `test_shadow_only_false_is_only_the_gate_output` is unedited.
+
+**Activation.** At the next supervisor STOP/LAUNCH (16:40/16:50Z).
+- **Technical reason:** the hunk changes the boot and order path, LAUNCH re-runs every boot gate, and a hand relaunch is refused after AUT-5a.
+- **Preconditions:** WP3 step 1 is live, WP5 is active, and WP4 is in the same train.
+- The first LAUNCH writes `capture_epoch_start`.
+- **Post-launch check:** `<capture_root>/live/<instance_id>/custom_capture_heartbeat_*.feather` is growing within 2 min of `TradingNode ... RUNNING`.
+
+#### AUT-1.WP9: weekly injected recorder stall drill
+
+**Files.** `src/breezy/runtime/capture_stall_drill_cli.py`; the drill and guard units; their table rows.
+
+**RED first** (`tests/unit/test_capture_stall_drill.py`): `::test_drill_refuses_when_recorder_not_active_or_young_or_outside_window`, `::test_drill_refuses_after_recent_watchdog_kill`, `::test_drill_argv_is_literal_sigstop_on_recorder_only`, `::test_guard_argv_is_literal_sigcont_on_recorder_only`, `::test_guard_alerts_not_healed_without_stall_record_after_drill`, `::test_three_consecutive_refusals_raise_drill_skipped`, `::test_drill_run_resets_refusal_count`, `::test_drill_failed_delivery_exits_nonzero`, `::test_drill_guard_failed_delivery_exits_nonzero_after_sigcont`, `::test_drill_has_no_aut6_self_heal_precondition`.
+
+**Activation.** Link and enable on merge, once WP3 step 2 is live.
+
+---
+
+## 5. Association
+
+### 5.1 Consumed
+
+| From | Contract | Interface |
+|---|---|---|
+| ARCH-0 | C1 (as amended by §ERRATA-REQUEST), C4, C5, C6, §3, §4.5 | Schemas; the verdict writer; the `CaptureAdapter`/`Detector` Protocols; `NODE_PLUGINS`; `RefusingPlugin`; `VetoReason` (`capture_gap`, `feed_stale`, `recorder_stale`, `capture_untagged`); `pins.py` (`WATCH_TICK_STALE_S`, `SELF_HEAL_RESTARTABLE_UNITS`); `test_autonomy_files_have_one_writer` |
+| AUT-5a | C5 | `ResolvedFamily`, `drill_active` and the `entry_veto` slot; ownership of `try_submit` and `src/breezy/app/trade.py` until merged |
+| AUT-5 | E-8, E-8a | The snapshot helper, with `take_flock=False` for the audit |
+| AUT-6 | §4.6, C6, E-7a | **Consumed as is:** `deliver_with_proof`; `AlertOutbox.offer`; the shared wrapper and table; the node-liveness detector (gates WP8); unit health for the AUT-1 timers and the recorder (inactive/failed); the observation-feed freshness detector (NWS ingest). **Requested change:** AUT-6's SELF_HEAL does not `try-restart` an active recorder for a stall, because systemd's watchdog is the single decision source; the failed-unit path is unchanged. **Withdrawn:** the r8 detector `aut1.recorder_stall` and its `capture_watch/v1` input. |
+| AUT-2 | §5.3, Z14 | The canary producer. It now publishes the same `@customdataclass` records through `open_canary_writer` (§5.2). |
+| AUT-4 | §10 | Joint owner of the 38-vs-35 fixes on the batch side |
+
+### 5.2 Provided
+
+| To | Contract | Interface |
+|---|---|---|
+| AUT-2 | C1 | **Records:** the `project_c1` views (`DecisionRecord`, `OrderLink`, `LifecycleEvent`, `PositionMark`), `join_fills_to_decisions`, `settlement_<date>.jsonl`, the epoch files and the exit ids. **Canary:** `open_canary_writer(root, cache, clock)` returns a native `StreamingFeatherWriter` on `<capture_root>/canary/<instance>/` with `CAPTURE_INCLUDE_TYPES`. **Contract:** read `eval_ns` and `eval_seq` as stored. |
+| AUT-3 | C1 | `DecisionRecord` views; `resolve_forecast_ref(forecast_input_ref)` |
+| AUT-4 | C1, C4 | `DecisionRecord` views, with `depth_ref`/`quote_ref` as **reference strings**; `resolve_frame_ref`; the `capture_tape_ingest` verdicts; the parity record |
+| AUT-6 | C1, C6 | `DetectorEvent` views; the NODE_LOCAL detectors; `recorder_watchdog/v1` (read-only); the `RECORDER_WATCHDOG_KILL`/`STORM` alerts; the HEALTH verdicts |
+| AUT-5 | C4 | HEALTH `capture_join_completeness`, `capture_tape_ingest` and `capture_nbp_census`. Proposed rows: `capture_join_completeness FAIL → DEMOTE` (RECOVERABLE_INFRA); the others → ALERT. r8's proposed `aut1.recorder_stall → SELF_HEAL` is **withdrawn**. |
+
+### 5.3 Downstream impact (READY plans that cite r8 internals; grep 2026-10-03)
+
+| Plan | Citation | r9 replacement | Action |
+|---|---|---|---|
+| AUT-2 r7 | `OrderLink` (13), `capture_epoch_start` (16), `PositionMark` (1) | `project_c1` keeps all three names and their fields; the epoch is unchanged | None beyond reading through `project_c1`. The canary producer uses `open_canary_writer` (brief amendment). |
+| AUT-3 r6 | `derived/capture_payloads/forecast_input/<sha256>.json` (`AUT-3-retraining_plan_r6.md:68`), `forecast_input_sha256` | `forecast_input_ref` and `resolve_forecast_ref` | **Brief amendment** to AUT-3's forecast-by-digest row |
+| AUT-4 r6 | `depth_ref` (6), `quote_ref` (5), `LifecycleEvent` (4), `forecast_input_sha256` (3) | Reference strings and the resolvers; `LifecycleEvent` via `project_c1` | **Brief amendment:** payload reads go through the resolvers |
+| AUT-6 r13 | `derived/capture_payloads/depth10/` and `capture_<family_id>_<date>.jsonl` (`AUT-6-drift-health_plan_r13.md:454`); `OrderLink`/`LifecycleEvent`/`depth_ref` (`:1249`) | `read_capture_stream` + `project_c1`; `resolve_frame_ref` | **Brief amendment**, plus §5.1's SELF_HEAL request |
+| AUT-5 r7 | `capture_join*`, `capture_untagged`, `capture_gap`, `CAPTURE_INCOMPLETE` | Names unchanged | None |
+
+The coordinator decides whether these amendments are brief-level or need plan revisions. r9 keeps every C1 **logical** name so that they can stay brief-level.
+
+### 5.4 Execution order
+
+```
+ARCH-0 ─► WP0 ─┬─► WP1 (G-ERR) ─► WP2 (library) ─────────┐
+               ├─► WP3 step 1 ─► [ER-8] ─► WP3 step 2 ───┤
+               ├─► WP4 (built; merges with WP8)          ├─► [AUT-5a merged] ─► WP7 ─► WP8 (+WP4) ─► LAUNCH (epoch)
+               ├─► WP5 (needs WP1; G-ERR) ───────────────┤
+               └─► WP6 (evidence)                        ┘
+WP3 step 2 ─► WP9 drill live (no AUT-5b dependency)
+```
+
+- **Parallel in Wave 1:** WP0 alongside AUT-5a and AUT-6. After WP0: WP1, WP3, WP4, WP6 and WP5's pure core.
+- **File ownership:** as r8, minus `on_order_book_depth`'s stamp. AUT-1 also owns the additive `Refuse` fields in `decision.py`.
+
+---
+
+## 6. Live-proof protocol
+
+**Artefacts:**
+1. `evidence/capture/audit/<family>/<D>.json`, plus a `capture_join_completeness` verdict per day.
+2. At least one heal record under `evidence/capture/heal/<date>/`, of either kind:
+   - a **recorder watchdog heal** (`decided_by:"systemd_watchdog"`), paired with its stall record under `evidence/capture/stall/` and the journal's `UNIT_RESULT=watchdog` entry;
+   - an **NBP poll-reset heal** (`decided_by:"nbm_quantile_actor"`).
+3. A `delivered=true` record whose `event` is `CAPTURE_HEALED_<observation_sha256>` for that heal, dated between the heal's date and the heal's date + `HEAL_ALERT_RETRY_DAYS`.
+4. `evidence/capture/live_proof/live_proof_<family_id>_<asof>.json` with `status=PROVEN`.
+
+**Qualifying days** (r8 §6, unchanged):
+- A day with ≥ 1 real fill qualifies if its live audit is `PASS`.
+- A canary-only day qualifies but adds 0 real fills.
+- FAIL, ERROR or a stale INCONCLUSIVE breaks the run.
+- PRE_CAPTURE and PARTIAL_EPOCH days never count.
+- The window needs 7 qualifying days and ≥ 5 real fills.
+
+A day with `lost_in_flush_window > 0` still qualifies if every fill's legs pass, because the loss is counted and visible (§1.1).
+
+**Accrual ETA:**
+- **Join leg:** as r8. If AUT-1a merges by about 10-10 and AUT-5a by about 10-13, WP8 activates at the 10-14 LAUNCH. The earliest window closes about 10-23; the planning ETA is 10-30.
+- **Stall leg:** **no longer depends on AUT-5b.** It is met by the first Sunday drill after WP3 step 2 (ER-8 adoption plus one 09:00Z rotate), or by any natural watchdog or NBP heal that comes first.
+- **PROVEN** = max(join window, first confirmed heal with a delivered alert). With ER-8 adopted by about 10-10, that is about **10-30**, well before the 2027-01-25 KILL.
+
+**Evidence class:** "machinery proven, edge unproven". This is a census, not a statistical test.
+
+---
+
+## 7. Score-3 verification checklist (independent scorer)
+
+| Criterion | Exact check |
+|---|---|
+| (a) Unattended | 1. `systemctl --user list-timers 'breezy-capture-*'` lists settlement, audit, live-proof (fallback), drill and guard. 2. `systemctl --user show breezy-quote-tape.service -p WatchdogUSec -p NotifyAccess -p Restart -p ExecStopPost` shows `10min`, `main`, `always` and the hook. 3. `git -C /home/jon/breezy log --since=<start> --until=<end> -- src/breezy/persistence/autonomy/capture_* src/breezy/strategy/autonomy_capture/ src/breezy/runtime/capture_* src/breezy/analysis/capture_* src/breezy/adapters/polymarket_us/recorder_watchdog.py deploy/systemd/breezy-capture-* deploy/systemd/breezy-quote-tape.service` is empty. 4. `scripts/ci/run_tests_no_egress.sh tests/unit/test_capture_units.py` passes. |
+| (b) Family-agnostic | `scripts/ci/run_tests_no_egress.sh tests/unit/autonomy/test_capture_guard_family_agnostic.py tests/unit/autonomy/test_capture_submit_sites.py tests/unit/test_capture_audit.py::test_unknown_family_fill_is_enumerated_by_construction tests/unit/autonomy/test_capture_actor.py::test_unstreamed_set_is_computed_from_list_schemas` passes, and ARCH-0's `test_family_plugin_exact_set` passes. |
+| (c) Fails closed | These pass: `test_untagged_buy_refused_capture_untagged`, `test_refused_order_never_reaches_cache`, `test_publisher_health_not_ok_refuses_buy_capture_gap`, `test_stream_bytes_flat_sets_capture_gap`, `test_capture_guarded_strategy_without_publisher_refuses_construction`, `test_unparseable_recorder_watchdog_file_vetoes`, `test_recorder_watchdog_unarmed_is_error`, `test_heartbeat_gap_over_180s_fails_stream_gap`, `test_records_short_of_last_heartbeat_count_fail_stream_record_lost`. |
+| (d) Detected and alerted with delivery | **Gate:** every event in `CAPTURE_ALERT_EVENTS` (§3.16) has a test asserting the outbox or `deliver_with_proof` call, and passes verbatim through the real AUT-6 API (`test_capture_alert_contract.py`). **Live:** `evidence/alerts/<date>/*_d.json` holds `"delivered": true` records whose `event` is `RECORDER_WATCHDOG_KILL` (the drill) and `CAPTURE_HEALED_<sha>` for the counted heal. |
+| (e) RED→GREEN | Per WP: the RED output naming §4's tests, the GREEN output and the merge SHA. `scripts/ci/run_tests_no_egress.sh; echo EXIT=$?` gives `EXIT=0`, and `lint-imports` prints "N kept, 0 broken". |
+| (f) Live proof | 1. `jq .status /home/jon/.local/share/breezy/evidence/capture/live_proof/live_proof_pm_us_crh_fq_v1_<asof>.json` is `"PROVEN"`. 2. For each listed date, the newest audit file has `day_status=="PASS"`, `legs.R1/R2/R5/R7/O/F/I.pass` true and `fills_total == fills_joined`. 3. The verdict is `capture_join_completeness, outcome=PASS`. 4. `ls evidence/capture/heal/*/` shows ≥ 1 file that is not in `heal_alert_undelivered`. |
+| Spot check, independent of AUT-1's code | For 3 random fills in the window: 1. `sqlite3 'file:/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite?mode=ro' "select value from state where key='exec/polymarket_us/fill/<voi>'"` gives a `clientOrderId`. 2. Reading `<capture_root>/live/*/order_initialized_*.feather` with `pyarrow.ipc` finds that `client_order_id` with a `breezy:decision_id=<id>` tag. 3. `custom_decision_record_*.feather` has a `Take` with that id, whose `eval_ns` appears as `'now_ns': <eval_ns>` in a `SHADOW_DECISION … 'kind': 'Take'` node-log line. 4. Its `FrameCopy` top equals the recorder catalog's Depth10 or quote at `(instrument, frame_ts_event)`. 5. `intent_fingerprint` over the `OrderInitialized` fields matches a `fill_by_fingerprint/` key. |
+
+---
+
+## 8. Risks and failure modes
+
+| Risk | Mitigation |
+|---|---|
+| **Option A crashes the trade node at boot** through the `config.json` dump (`kernel.py:606-611`, `config.py:176`) | V-2 is RED today by construction. It goes GREEN only through `register_config_encoding`; otherwise option B ships. WP8's boot test runs the production factory (L-55). |
+| **A writer serialisation error unwinds into the exec engine** (`component.pyx:2832-2834`, `writer.py:259`) | V-3 proves that every included native type serialises from real events; otherwise option B ships, and its wrapper catches the error. The custom types are published only through `CapturePublisher`'s try/except. |
+| The writer silently drops a custom type through per-instrument routing (`writer.py:230-239`) | No field is named `instrument_id`, pinned by `test_no_capture_record_field_is_named_instrument_id` and V-5. |
+| The writer swallows write errors (`writer.py:285-288`) | The in-node bytes-landing check sets `capture_gap`; R4 fails the day on the log marker; R5 counts against the heartbeat; R7 catches a dead stream. |
+| Records lost at a crash (no fsync) | Accepted by ruling. The loss is bounded at about 61 s by the heartbeat flush and counted by R5 against `SHADOW_DECISION`. A lost Take-path record still fails its fill, so the window breaks honestly. |
+| A Take's frame is absent from the tape | The Take-path `FrameCopy` (§3.3.2). Refusal references are counted (R6). |
+| A depth-only instrument looks stale to `Cache.quote_tick` (V-7) | A missing quote never vetoes. The frame-trigger D14 test keeps the per-instrument rule unreachable in production, and `quote_absent` is reported separately. |
+| **systemd restarts the recorder outside AUT-6's cap and launch-window deferral** | ER-8 states this, with the reasons: the recorder holds no trading state, is not on the launch path, and already restarts without limit under `Restart=always`. The stop hook counts kills per trading day and raises `RECORDER_WATCHDOG_STORM` from the third. A storm also sets `recorder_stale` (§3.7.4). |
+| False watchdog kills (quiet listings, the 09:00–09:45Z hole) | The gate's r8-derived rules keep pinging through legitimate `DISCOVERING`, empty listings and quiet hours. Activation step 1 runs a full day with the watchdog off and requires zero withheld pings outside the hole. |
+| A frozen recorder loses its unflushed tape at the kill | `WatchdogSignal=SIGTERM` lets Nautilus close cleanly once SIGCONT arrives (V-10). A truly hung loop is SIGKILLed after `TimeoutStopSec` and loses at most its 10 s flush, the r8 risk unchanged. |
+| `sd_notify` is blocked under bwrap (a read-only bind on the socket inode) | The recorder is unwrapped (E-7a rule 5). V-9 tests the wrapped form, for any future wrapped notifier and for the audit's and drill's user-bus clients. |
+| The stop hook hangs and delays the restart | `timeout -k 2 25`, inside `TimeoutStopSec`. |
+| Downstream READY plans read removed paths | §5.3 lists every citation, `project_c1` preserves the C1 logical names, and the coordinator schedules the brief amendments. |
+| Two restart deciders for the recorder | AUT-6 is asked not to `try-restart` an active recorder for a stall (§5.1). |
+| Memory on the 30 GiB host (G29, L-29, L-49, L-53) | The node holds only O(subscribed instruments) for `EvalSeqCounter`. V-4 measures the writer. Unit caps follow §3.13, and heavy jobs run one at a time outside 01:00–04:30Z. |
+| The shared venv (L-51) | No new dependency (`sd_notify` is stdlib), no console script, the exact interpreter. |
+| Concurrent agents (L-43, L-50) | Disjoint ownership, one writer per file, a full gate per merge, and per-agent scratchpads. |
+| Statistical capacity | This is a census; each window needs ≥ 5 real fills. |
+| The KILL date, 2027-01-25 | The stall leg no longer waits on AUT-5b. If TERMINAL fires first there is no sender, and AUT-1 stays at "machinery proven, window paused". |
+| A wrapped AUT-1 unit imports a venue adapter (E-7 rule 2) | `breezy.domain.exec_intent` plus the closure test (V-15, WP5); WP6 waits on E-7b(a). |
+| The ARCH errata are not adopted | G-ERR blocks WP1, WP5 and WP8, and ER-8 blocks WP3 step 2. r9 never ships against the unamended C1 text. |
+
+---
+
+## 9. Binding-constraint compliance
+
+- **Nautilus immutability:** only native extension points are used:
+  - `@customdataclass` and `publish_data`;
+  - `StreamingConfig`, or a `StreamingFeatherWriter` instance;
+  - `register_config_encoding`;
+  - `Order.tags`;
+  - a `Strategy` subclass that calls `super()`;
+  - `Actor` msgbus subscriptions and timers;
+  - `Cache` reads.
+
+  Nothing under `nautilus_trader` is touched.
+- **Operator caps:** never read, assigned, defaulted or logged. `test_autonomy_never_reads_or_writes_operator_controls` is extended to AUT-1's paths (L-39).
+- **`allow_short`:** untouched; every entry stays a BUY.
+- **NO-SEND firewall:**
+  - the exec client is unedited and byte-pinned;
+  - no new egress: alerts use `alerts.env` only;
+  - no AUT-1 unit holds a venue credential (the E-7 `--tmpfs ~/.config`);
+  - the trade-config dump carries env-var names only (the V-2 scan).
+- **Master enablement and permit:** AUT-1 only adds refusals and never touches permit authority. `test_autonomy_never_touches_enablement_permit_or_firewall` is widened to AUT-1's packages.
+- **PREREG via ruling:** no statistical semantics change; AUT-1 produces census verdicts only.
+- **Coordinator decisions** (as r8 §9):
+  - HOLDOUT: AUT-1 never reads the holdout or the forward window;
+  - ALPHA: HEALTH censuses charge no α;
+  - ROLLBACK-FAILURE: no `cause_code`, no HALT write.
+- **ARCH errata:**
+  - E-1: AUT-6 implements the claim order; AUT-1 only offers.
+  - E-2, E-4, E-5, E-6 and E-10: do not touch AUT-1.
+  - E-3: governs tag reading.
+  - E-7: no directive counts as a control; the node is never wrapped; the one-writer property rests on the wrapper, the lint and the stated residual.
+  - E-7a: every AUT-1 unit and the stop hook are wrapped (§3.13); exec-store WAL reads use the snapshot helper; the AST check is a lint.
+  - E-7b: no AUT-1 unit is a replay child. WP6's parity rerun depends on E-7b(a) and does not borrow E-7b(b) (§3.14). The audit's adapter imports are removed through `breezy.domain.exec_intent` (§2.2).
+  - E-7c: the wrapper's private `/tmp`; a binding build item (§3.13).
+  - E-8 and E-8a: the audit uses the helper with `take_flock=False`, and its result is advisory and never counts toward H.
+  - E-9: no AUT-1 oneshot has more than one start command; the stop hook is bounded by `timeout -k`.
+- **Launch window:** no AUT-1 timer fires in [16:30Z, 17:10Z). ER-8 covers the event-driven stop hook.
+- **Safety tests never weakened:**
+  - every §4 "unedited" test stays green;
+  - widenings follow L-12;
+  - nothing is deleted, relaxed or `xfail`ed;
+  - r8 tests whose subject r9 removes are simply never built (r8 was never implemented), and §4 names their r9 counterparts.
+
+---
+
+## 10. Self-score
+
+**r9 claims 88.** The r8 lineage scored 95, but r9 is a structural rewrite on new premises, so it is scored on its own evidence.
+
+| Axis | Max | Score | Note |
+|---|---|---|---|
+| Fidelity | 20 | 17 | Follows the pressure-test ruling row by row and carries the README criterion, the r8-final items and the errata. −3: ten errata requests are pending; the Take-path copy is a flagged narrowed reading of the ruling (§R9 row 3); WP0 decides option A vs B, not this plan. |
+| Correctness | 20 | 18 | Every Nautilus claim cites a 1.231.0 file:line. That includes two findings that break the ruled design as written: the boot-time `config.json` `TypeError` and the unguarded handler unwind. Each has a RED test and a pre-declared fallback. −2: fourteen V-premises remain, three of them load-bearing (V-2, V-3, V-8). |
+| Specificity | 15 | 14 | Record fields, encodings, paths, units, binds and test names are exact. |
+| Acceptance | 20 | 18 | Every criterion maps to a command or a path, and the stall leg no longer depends on AUT-5b. −2: AUT-2/3/4/6 need brief amendments before they consume r9. |
+| Autonomy-safety | 15 | 13 | Restrictive only; exits never refused; loss counted; a storm alert. −2: the recorder self-heals outside AUT-6's cap and outside the launch-window deferral. ER-8 states and bounds this rather than hiding it. |
+| Reuse | 10 | 8 | Removed: the writer, the payload store, the watch, the watchdog, the link, lifecycle and mark writers, and `FrameClock`. Still custom: settlement, audit, publisher, guard, epoch, gate, hook, the order-event subscriber and `FrameCopy`. |
+| **Total** | 100 | **88** | |
+
+---
+
+## 11. Contradictions and residual readings against frozen ARCH Rev 9.2
+
+**Open contradictions:** the ten items in §ERRATA-REQUEST. r9 does not reinterpret ARCH; the affected WPs wait (G-ERR).
+
+**Residual readings carried from r8, unchanged:**
+- R-1: the CRH `_maybe_submit` tag site is unreachable today.
+- R-2: one common `source` field, plus `reconciliation_source=node_belief`.
+- R-3: `DetectorEvent` has exactly its C1 fields.
+- R-4: an untagged BUY with no known Take produces a `DetectorEvent`.
+- R-5: `classification="HUNG"` with a sub-state cause. Now moot: AUT-1 sends no restart request.
+- R-7: the quote frame's content is `ask`, `bid`, `ts_event`.
+- R-8: the E-1 claim order.
+- R-9: no restart request for an active but stale ingest.
+- R-10: `eval_seq` is counted per frame, across both handler calls.
+- R-11: the heal sha rides in `event`.
+
+**Retired:**
+- R-6: subsumed by `frame_kind`, which always holds exactly one value.
+- R-12: there are no asynchronous payloads, so there is no `payload_pending`.
+
+---
+
+## §ERRATA-REQUEST (exact replacement text for the frozen ARCH Rev 9.2; filed for the coordinator, not self-adopted)
+
+Each item quotes the frozen text from `reviews/snapshots/ARCH_rev9_2.md` and gives its replacement. The rationale is the cited Nautilus evidence and the coordinator ruling in `reviews/AUT-1-native-pressure-test.md`.
+
+### ER-1. C1, "Rejected" bullet (`ARCH_rev9_2.md:166`)
+
+**Frozen:**
+> **Rejected:** `StreamingConfig` on the trade node (memory and flush risk); reopened only by L-1 proof.
+
+**Replace with:**
+> **Adopted (L-1 proof: `reviews/AUT-1-native-pressure-test.md`; AUT-1 r9 §2):** C1 records are `@customdataclass` types published with `publish_data` and persisted by Nautilus's `StreamingFeatherWriter`, either through `StreamingConfig` on the trade node or through a writer instance owned by the capture actor (AUT-1 WP0 decides, on the boot-time config-dump, serialisation and bus-cost evidence). The root is the trade node's own `derived/capture_stream/<venue>/`, never the quote-tape root, with `include_types` restricted to the C1 types and `OrderInitialized`, `OrderFilled` and every `PositionEvent`. Memory and bus cost are measured before activation. The flush is about 1 s with no fsync; the loss is bounded by a 60 s heartbeat and counted by the daily audit against the node log's `SHADOW_DECISION` lines.
+
+### ER-2. C1, "Storage" paragraph (`ARCH_rev9_2.md:147-149`)
+
+**Frozen:**
+> A daily file `decisions/capture_<family_id>_<YYYY-MM-DD>.jsonl`, following the `OfferTape` and `FqDecisionFunnelActor` convention (`crh/composition.py:568-602`; `app/trade.py:763-775`); the existing retention unit compresses it. Its only writer is the node, serialised by the submit-intent flock (G6).
+
+**Replace with:**
+> Native Arrow stream files under `derived/capture_stream/<venue>/live/<instance_id>/`, one table per record type, rotated daily at 00:00 UTC (`SCHEDULED_DATES`, the recorder's constants). Each directory has exactly one writer, the `StreamingFeatherWriter` of the boot named by `<instance_id>`, which is fresh per boot; no flock is needed or taken. Retention archives and never deletes. C2–C6 consumers read C1 through AUT-1's reader projection, which keeps the C1 record names and fields below.
+
+### ER-3. C1, "Payload store (P1-4)" bullet (`ARCH_rev9_2.md:152-156`)
+
+**Frozen:**
+> `depth_ref`, `quote_ref` and `forecast_input_sha256` name write-once, content-addressed payloads at `derived/capture_payloads/{depth10,quote,forecast_input}/<sha256>.json` (quote: `ask`, `bid`, `ts_event`; U8) (0444, schema `payload/v1`, `mkstemp` + `os.link`, so an existing name is never replaced). The node writes a payload only with the C1 record citing it (write-on-change, L-29); a missing payload marks the record `capture_gap`. AUT-1 measures the volume; retention archives payloads with the daily file and never drops one a C3 lineage cites.
+
+**Replace with:**
+> **Frame and forecast references (P1-4, amended).** A `DecisionRecord` references its triggering frame as `(frame_kind ∈ {depth10, quote}, instrument_id, ts_event)`, resolved against the recorder catalog's `order_book_depths` or `quote_tick` rows, and its forecast as `(station, cycle_ns)`, resolved against the NBP store. For `Take`, `TrySubmit`, `EntryVeto` and `Exit` records the node also streams a `FrameCopy` of the frame (quote: `ask`, `bid`, `ts_event`; U8), because the node cannot observe the tape at decision time and a Take-path frame cannot be recovered later. A Take-path record whose reference resolves to neither its copy nor the tape is `capture_gap`. A refusal reference that does not resolve is counted by the daily audit and alerted below the measured baseline. Retention never drops a stream file or a tape partition that a C3 lineage cites.
+
+### ER-4. C1, `DecisionRecord` row (`ARCH_rev9_2.md:135`)
+
+**Frozen** (the fields after `side`):
+> `instrument_id`; `ask_px`; `depth_ref` (sha256 of the Depth10 payload, L-35) or `quote_ref` (sha256 of the quote payload; U8); `p_hat`, `p_hat_raw` (pre-recalibration, P3-3), `p_lower`, `p_upper` (the kind's YES-leg values, as FQ computes them, `fq/decision.py:331,349`), `ev_net`; `forecast_input_sha256`; `artefact_sha256`; `manifest_sha256`
+
+**Replace with:**
+> `instrument_id` (stored as `instrument`, because a stored `instrument_id` field makes the native writer route by instrument and drop rows for uncached instruments); `ask_px`; `depth_ref` or `quote_ref` (the reference string `<kind>:<instrument_id>@<ts_event>`; U8); `p_hat`, `p_hat_raw` (pre-recalibration, P3-3), `p_lower`, `p_upper` (the kind's YES-leg values, as FQ computes them), `ev_net` and `margin`, recorded on refusals wherever the kind computed them before refusing; `forecast_input_ref` (`nbp:<station>@<cycle_ns>`); `artefact_sha256`; `manifest_sha256`. The common `ts_ns` is the record's native `ts_init`. Nullable values are the empty string (str) or 0 (int), because `@customdataclass` admits no `Optional` field.
+
+### ER-5. C1, `OrderLink`, `LifecycleEvent` and `PositionMark` rows (`ARCH_rev9_2.md:136-138`)
+
+**Frozen Writer column:** "node `on_order_*`" / "node" / "node or position monitor".
+
+**Replace the Writer column with:**
+- **`OrderLink`:** projected by AUT-1's reader from the natively streamed `OrderInitialized`. Its `tags` carry the `decision_id`, and its fields are the G33 fingerprint inputs. `venue_order_id_sha256` comes from `OrderAccepted`/`OrderFilled`.
+- **`LifecycleEvent`:** projected from the natively streamed `OrderFilled`, and from AUT-1's `OrderEventRecord`, which the capture actor publishes for exactly the order-event classes that have no registered Arrow schema.
+- **`PositionMark`:** projected from the natively streamed `PositionEvent`s with the venue leg sign applied, or written by the position monitor.
+
+### ER-6. §3 common rules: atomic writes and payload hygiene (`ARCH_rev9_2.md:93-95`, `:109-111`)
+
+**Add** after "Writes are atomic (`mkstemp` + `os.replace`; `runtime/health.py:322,330`), append-only, named by content hash or `now_ns`.":
+> Exception: C1 stream files are written by Nautilus's `StreamingFeatherWriter` (append-only Arrow IPC, flushed, not fsynced); readers treat a truncated final batch as a torn tail and the audit counts it.
+
+**Add** after "venue order ids appear only as `sha256`.":
+> Exception: natively streamed Nautilus event tables (`OrderFilled`, and the kernel's `config.json` when `StreamingConfig` is used) in the 0700 C1 stream root carry Nautilus's own fields, including the raw `venue_order_id`. They are never alerts or verdicts and are never copied into one; AUT-1's custom records carry only `venue_order_id_sha256`.
+
+### ER-7. C1, "No silent cap" and "Failure behaviour" (`ARCH_rev9_2.md:162-163`, `:174-175`)
+
+**Frozen:**
+> A write failure or byte cap increments a counter, raises a CRITICAL alert and marks the day `CAPTURE_INCOMPLETE`.
+
+> A write error raises a CRITICAL alert and makes the day inadmissible for AUT-4.
+
+**Replace with:**
+> A publish exception increments a counter, sets the node-local `capture_gap` veto and raises a CRITICAL alert through the node outbox. A write error inside the native writer, which logs and does not raise, is detected in the node by stream bytes not growing while records are published (`capture_gap`), and the next day by the audit (the writer's failure log line, the heartbeat-count reconciliation and the heartbeat continuity check), which raises a CRITICAL and marks the day `CAPTURE_INCOMPLETE`, inadmissible for AUT-4. There is no byte cap.
+
+### ER-8. §4.6 "Action executors", §4.5 `SELF_HEAL_*` rows, §5.2 launch-window deferral (`ARCH_rev9_2.md:964-968`, `:938-939`, `:1072-1075`)
+
+**Add** to §4.6, after "the **only** autonomy caller of the restart site (AUT-1 supplies recorder and feed observations and names their units).":
+> Exception: the quote-tape recorder's process-level self-heal is systemd's own: `WatchdogSec` on `breezy-quote-tape.service`, fed by `sd_notify` only while the recorder's counters and on-disk bytes advance, with the unit's existing `Restart=always`. This is not an autonomy restart call site, is not counted against `SELF_HEAL_MAX_RESTARTS_PER_UNIT_PER_DAY`, does not wait for the policy ruling, and is not deferred out of [16:30Z, 17:10Z), because the recorder holds no trading state and is not a launch-path unit. Its `ExecStopPost` hook counts watchdog kills per trading day, delivers a CRITICAL for each through `deliver_with_proof` (a storm CRITICAL from the third), and feeds the node-local `recorder_stale` veto. AUT-6 does not `try-restart` an active recorder for a stall; its failed-unit path is unchanged.
+
+### ER-9. §5 area table, AUT-1 "Owns" (`ARCH_rev9_2.md:1032`)
+
+**Frozen:**
+> `CaptureAdapter` per kind, the `decision_id` tag, link and lifecycle writers, `DetectorEvent`, the payload store, the settlement writer, the completeness audit, recorder and feed stall observations (AUT-6 restarts)
+
+**Replace with:**
+> `CaptureAdapter` per kind, the `decision_id` tag, the C1 custom data types, stream configuration and reader projection (link, lifecycle and mark records are native events projected by the reader), `DetectorEvent`, the Take-path frame copy, the settlement writer, the completeness audit, recorder and feed stall observations (the recorder's process-level heal is systemd's watchdog, §4.6; AUT-6 restarts failed units)
+
+### ER-10. §10 obligations, AUT-1 (`ARCH_rev9_2.md:1201-1203`)
+
+**Frozen** (the parts that change):
+> … the payload store and volume (P1-4); … restarts only via AUT-6 (P1-10, P1-12); `quote_ref` payloads and `wall_ns` (U8, U9).
+
+**Replace with:**
+> … frame and forecast references, the Take-path frame copy and stream volume (P1-4 as amended); … no AUT-1 restart call site (P1-10, P1-12), with the recorder watchdog exception of §4.6; `quote_ref` frame references and `wall_ns` (U8, U9).
+
+### C1 text left unchanged
+
+- the `decision_id` definition;
+- the `eval_ns`, `eval_seq` and `wall_ns` semantics;
+- the `breezy:decision_id=` tag;
+- exit ids (P1-8);
+- `SettlementRecord` and its own file (P1-6);
+- the on-change rule (L-29);
+- invariants (i)–(iii);
+- `capture_untagged` (P1-9);
+- the offline intent linkage (P1-3), with the `OrderLink` fields now taken from `OrderInitialized`.
