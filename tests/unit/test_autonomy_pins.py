@@ -11,6 +11,7 @@ import ast
 import datetime as dt
 import hashlib
 import subprocess
+import sys
 from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
@@ -19,9 +20,11 @@ from typing import Any, Final
 
 import pytest
 
-from breezy.persistence.autonomy import pins
+from breezy.persistence.autonomy import closure_manifest, pins
+from breezy.persistence.autonomy.closure import closure_from_grimp, closure_sha256
 from tests.support.entry_points import REPO_ROOT
 
+PKG: Final[str] = "breezy.persistence.autonomy"
 PINS_PATH: Final[Path] = Path(pins.__file__)
 PINS_REL: Final[str] = "src/breezy/persistence/autonomy/pins.py"
 BASE_REF: Final[str] = "origin/feat/data-capture-and-risk"
@@ -539,3 +542,201 @@ def test_seed_coverage_check_has_teeth() -> None:
 def test_every_seed_id_has_a_committed_manifest() -> None:
     for family, _ in pins.BOOTSTRAP_SEED:
         assert (REPO_ROOT / "deploy" / "families" / f"{family}.json").is_file(), family
+
+
+# --- Seam 3b: code-identity pins and the closure manifest (ARCH 4.3; AC 25) ----------------
+
+_MANIFEST_PATH: Final[Path] = Path(closure_manifest.__file__)
+
+
+def _unpinned_components(
+    manifest: Mapping[str, tuple[str, ...]],
+    pinned: frozenset[str],
+    *,
+    src_root: Path,
+) -> list[str]:
+    """Components whose current closure hash is in no pin set (a reviewed pin is then due)."""
+    return sorted(
+        c for c in manifest if closure_sha256(c, src_root=src_root, modules=manifest) not in pinned
+    )
+
+
+def _all_pinned() -> frozenset[str]:
+    return (
+        pins.ENGINE_SOURCE_SHA256
+        | frozenset(pins.PRODUCER_SOURCE_SHA256.values())
+        | pins.REVOKED_SOURCE_SHA256
+    )
+
+
+def test_code_identity_pins_cover_import_closure() -> None:
+    src = REPO_ROOT / "src"
+    assert _unpinned_components(closure_manifest.CLOSURE_MODULES, _all_pinned(), src_root=src) == []
+    # No pin may be both live and revoked.
+    assert pins.ENGINE_SOURCE_SHA256 & pins.REVOKED_SOURCE_SHA256 == frozenset()
+    assert set(pins.PRODUCER_SOURCE_SHA256.values()) & pins.REVOKED_SOURCE_SHA256 == frozenset()
+
+
+def test_pin_coverage_check_has_teeth(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "__init__.py").write_bytes(b"")
+    (root / "pkg" / "entry.py").write_bytes(b"X = 1\n")
+    manifest = {"pkg.entry": ("pkg", "pkg.entry")}
+    digest = closure_sha256("pkg.entry", src_root=root, modules=manifest)
+    assert _unpinned_components(manifest, frozenset(), src_root=root) == ["pkg.entry"]
+    assert _unpinned_components(manifest, frozenset({digest}), src_root=root) == []
+    (root / "pkg" / "entry.py").write_bytes(b"X = 2\n")  # an edit forces a reviewed pin
+    assert _unpinned_components(manifest, frozenset({digest}), src_root=root) == ["pkg.entry"]
+
+
+def _pin_set_from_source(source: str, name: str) -> frozenset[str]:
+    for node in ast.parse(source).body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and isinstance(node.value, ast.Call)
+        ):
+            args = node.value.args
+            return frozenset(str(x) for x in ast.literal_eval(args[0])) if args else frozenset()
+    raise BaseUnavailable(f"{name} not found at base")
+
+
+def _base_engine_pins(repo: Path, *, base_ref: str = BASE_REF) -> frozenset[str]:
+    _git_ok(repo, "rev-parse", "--verify", base_ref)
+    if _git_ok(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise BaseUnavailable("shallow repository: the merge-base is not trustworthy")
+    base = _git_ok(repo, "merge-base", "HEAD", base_ref)
+    if _git_ok(repo, "ls-tree", base, "--", PINS_REL) == "":
+        return frozenset()
+    return _pin_set_from_source(_git_ok(repo, "show", f"{base}:{PINS_REL}"), "ENGINE_SOURCE_SHA256")
+
+
+def _dropped_without_revocation(
+    base: frozenset[str], current: frozenset[str], revoked: frozenset[str]
+) -> list[str]:
+    return sorted(base - current - revoked)
+
+
+def test_engine_pin_history_retained() -> None:
+    base = _base_engine_pins(REPO_ROOT)
+    assert (
+        _dropped_without_revocation(base, pins.ENGINE_SOURCE_SHA256, pins.REVOKED_SOURCE_SHA256)
+        == []
+    )
+
+
+def test_engine_pin_removal_is_only_allowed_by_revocation() -> None:
+    a, b = "a" * 64, "b" * 64
+    assert _dropped_without_revocation(frozenset({a, b}), frozenset({a, b}), frozenset()) == []
+    assert _dropped_without_revocation(frozenset({a}), frozenset({a, b}), frozenset()) == []
+    assert _dropped_without_revocation(frozenset({a, b}), frozenset({a}), frozenset()) == [b]
+    assert _dropped_without_revocation(frozenset({a, b}), frozenset({a}), frozenset({b})) == []
+
+
+def test_engine_pin_base_reads_the_base_commit_and_fails_never_skips(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    _make_repo(repo, with_pins=None)
+    assert _base_engine_pins(repo) == frozenset()  # absent at base reads as empty
+    target = repo / PINS_REL
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "ENGINE_SOURCE_SHA256: Final[frozenset[str]] = frozenset({'" + "a" * 64 + "'})\n"
+    )
+    _git(repo, "add", PINS_REL)
+    assert _git(repo, "commit", "-qm", "pins").returncode == 0
+    _git(repo, "update-ref", "refs/remotes/origin/feat/data-capture-and-risk", "HEAD")
+    (repo / "README").write_text("z")
+    _git(repo, "add", "README")
+    assert _git(repo, "commit", "-qm", "three").returncode == 0
+    assert _base_engine_pins(repo) == frozenset({"a" * 64})
+    with pytest.raises(BaseUnavailable):
+        _base_engine_pins(repo, base_ref="origin/does-not-exist")
+
+
+def _manifest_drift(manifest: Mapping[str, tuple[str, ...]]) -> list[str]:
+    return sorted(c for c, mods in manifest.items() if closure_from_grimp(c) != tuple(mods))
+
+
+def test_closure_manifest_equals_grimp_closure() -> None:
+    assert _manifest_drift(closure_manifest.CLOSURE_MODULES) == []
+    # Positive controls: a stale list and a list that drops an import are both drift.
+    live = closure_from_grimp(f"{PKG}.plugin")
+    assert _manifest_drift({f"{PKG}.plugin": live}) == []
+    assert _manifest_drift({f"{PKG}.plugin": live[:-1]}) == [f"{PKG}.plugin"]
+    assert _manifest_drift({f"{PKG}.plugin": (*live, f"{PKG}.single_read")}) == [f"{PKG}.plugin"]
+
+
+def _load_regen() -> Any:
+    from scripts.ci import regen_closure_manifest
+
+    return regen_closure_manifest
+
+
+def test_regen_output_is_literal_and_reproducible() -> None:
+    regen = _load_regen()
+    sample = {
+        "zeta.entry": ("zeta", "zeta.entry"),
+        "alpha.entry": ("alpha.b", "alpha", "alpha.entry"),
+        "empty.entry": (),
+    }
+    first = regen.render_manifest(sample)
+    assert regen.render_manifest(dict(reversed(list(sample.items())))) == first
+    # Literal: the module is a docstring, imports and ONE annotated MappingProxyType literal.
+    tree = ast.parse(first)
+    assigns = [n for n in tree.body if isinstance(n, ast.AnnAssign)]
+    assert len(assigns) == 1
+    value = assigns[0].value
+    assert isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+    assert value.func.id == "MappingProxyType"
+    parsed = ast.literal_eval(value.args[0])
+    assert parsed == {
+        "alpha.entry": ("alpha", "alpha.b", "alpha.entry"),  # sorted
+        "empty.entry": (),
+        "zeta.entry": ("zeta", "zeta.entry"),
+    }
+    assert list(parsed) == sorted(parsed)  # keys sorted
+    assert not any(isinstance(n, ast.FunctionDef | ast.ClassDef) for n in tree.body)
+
+
+def test_regen_output_is_ruff_format_stable() -> None:
+    regen = _load_regen()
+    text = regen.render_manifest({"a.entry": ("a", "a.entry"), "b.entry": ()})
+    done = subprocess.run(
+        [str(Path(sys.executable).parent / "ruff"), "format", "--stdin-filename", "m.py", "-"],
+        input=text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == text
+
+
+def test_committed_manifest_is_exactly_the_regen_output() -> None:
+    regen = _load_regen()
+    committed = _MANIFEST_PATH.read_text(encoding="utf-8")
+    assert regen.render_manifest(closure_manifest.CLOSURE_MODULES) == committed
+    # Reproducible from the graph: regenerating from the manifest's own entries changes nothing.
+    assert regen.regenerate(list(closure_manifest.CLOSURE_MODULES)) == committed
+
+
+def test_closure_manifest_module_imports_only_typing_and_mappingproxytype() -> None:
+    tree = ast.parse(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    imported = {(n.module or "") for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)} | {
+        a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names
+    }
+    assert imported <= {"types", "typing"}
+
+
+def test_regen_check_mode_exits_nonzero_on_drift(tmp_path: Path) -> None:
+    regen = _load_regen()
+    stale = tmp_path / "closure_manifest.py"
+    stale.write_text("# stale\n", encoding="utf-8")
+    assert regen.main(["--check", "--target", str(stale)]) == 1
+    fresh = tmp_path / "fresh.py"
+    fresh.write_text(regen.render_manifest({}), encoding="utf-8")
+    assert regen.main(["--check", "--target", str(fresh)]) == 0
+    assert regen.main(["--target", str(stale)]) == 0  # write mode rewrites
+    assert stale.read_text(encoding="utf-8") == regen.render_manifest({})
