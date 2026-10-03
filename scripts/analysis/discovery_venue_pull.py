@@ -143,8 +143,23 @@ class FollowState:
     cursors: Mapping[Path, FileCursor] = field(default_factory=dict)
 
 
+#: A node's INITIAL discovery summary is written within moments of its spawn,
+#: so a log whose FILENAME stamp is more than this far before ``since_ns``
+#: cannot hold today's trigger. Generous on purpose: it only has to exclude
+#: the multi-hundred-MB historical logs, never a plausible same-day launch.
+HISTORICAL_STAMP_SLACK_NS: Final[int] = 60 * 60 * 1_000_000_000
+
+
+def _is_historical(path: Path, since_ns: int) -> bool:
+    """True when ``path``'s filename stamp predates ``since_ns`` by more than
+    :data:`HISTORICAL_STAMP_SLACK_NS` (F3: the stamp, never mtime -- a
+    long-lived log's mtime is as fresh as today's)."""
+    stamp = datetime.strptime(file_stamp(path), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    return int(stamp.timestamp() * 1_000_000_000) < since_ns - HISTORICAL_STAMP_SLACK_NS
+
+
 def poll_node_logs_once(
-    log_dir: Path, state: FollowState
+    log_dir: Path, state: FollowState, *, since_ns: int | None = None
 ) -> tuple[FollowState, tuple[NodeLogRecord, ...], frozenset[Path]]:
     """One poll: read newly appended, COMPLETE lines from every
     ``NODE_LOG_GLOB`` file under ``log_dir``.
@@ -154,6 +169,12 @@ def poll_node_logs_once(
     unconsumed partial text -- so nothing is re-read from disk). A file
     whose size shrank since the last poll is TRUNCATED: its cursor resets to
     a fresh read from byte 0 and the path is reported in the third element.
+
+    O1: with ``since_ns`` given, a not-yet-followed file whose filename stamp
+    is historical (see :func:`_is_historical`) is seeded at EOF instead of
+    read from byte 0 -- the multi-GB node history is never pulled through a
+    256M cgroup -- and is then followed from EOF like any other file. Reads
+    are streamed line by line, so memory is bounded by the longest line.
     """
     new_cursors: dict[Path, FileCursor] = {}
     records: list[NodeLogRecord] = []
@@ -164,36 +185,40 @@ def poll_node_logs_once(
         except OSError:
             continue
         prior = state.cursors.get(path)
+        if prior is None and since_ns is not None and _is_historical(path, since_ns):
+            new_cursors[path] = FileCursor(offset=size, tail="")
+            continue
         offset = prior.offset if prior is not None else 0
-        tail = prior.tail if prior is not None else ""
+        carry = prior.tail if prior is not None else ""
         if size < offset:
             truncated.add(path)
             offset = 0
-            tail = ""
+            carry = ""
+        consumed = 0
         with open(path, "rb") as fh:
             fh.seek(offset)
-            new_bytes = fh.read()
-        text = tail + new_bytes.decode("utf-8", errors="replace")
-        last_newline = text.rfind("\n")
-        if last_newline == -1:
-            new_cursors[path] = FileCursor(offset=offset + len(new_bytes), tail=text)
-            continue
-        complete, remainder = text[: last_newline + 1], text[last_newline + 1 :]
-        new_cursors[path] = FileCursor(offset=offset + len(new_bytes), tail=remainder)
-        for raw_line in complete.splitlines():
-            stripped = ANSI_RE.sub("", raw_line)
-            match = LINE_RE.match(stripped)
-            if match is None:
-                continue
-            records.append(
-                NodeLogRecord(
-                    source=path,
-                    ts_ns=parse_ts_ns(match.group("ts")),
-                    level=match.group("level"),
-                    component=match.group("component"),
-                    message=match.group("message"),
-                )
-            )
+            for raw in fh:
+                consumed += len(raw)
+                text = carry + raw.decode("utf-8", errors="replace")
+                if not raw.endswith(b"\n"):
+                    carry = text
+                    break
+                carry = ""
+                for raw_line in text.splitlines():
+                    stripped = ANSI_RE.sub("", raw_line)
+                    match = LINE_RE.match(stripped)
+                    if match is None:
+                        continue
+                    records.append(
+                        NodeLogRecord(
+                            source=path,
+                            ts_ns=parse_ts_ns(match.group("ts")),
+                            level=match.group("level"),
+                            component=match.group("component"),
+                            message=match.group("message"),
+                        )
+                    )
+        new_cursors[path] = FileCursor(offset=offset + consumed, tail=carry)
     return FollowState(cursors=new_cursors), tuple(records), frozenset(truncated)
 
 
@@ -283,7 +308,7 @@ async def run_discovery_pull(
     triggered_ts_ns: int | None = None
     trigger_source: Path | None = None
     while True:
-        state, records, _truncated = poll_node_logs_once(log_dir, state)
+        state, records, _truncated = poll_node_logs_once(log_dir, state, since_ns=since_ns)
         trigger = find_initial_trigger(records, since_ns=since_ns)
         if trigger is not None:
             triggered_ts_ns = trigger.ts_ns

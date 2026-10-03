@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -306,3 +306,117 @@ def test_cli_computes_node_active_and_gets_missing_slugs(
     by_slug_lookup = payload["by_slug_lookup"]
     assert by_slug_lookup[slug_missing_from_venue]["slug"] == slug_missing_from_venue
     assert slug_in_venue not in by_slug_lookup
+
+
+# ---------------------------------------------------------------------------
+# O1: the first poll must not read the node's historical logs
+# ---------------------------------------------------------------------------
+
+_SINCE_NS = int(datetime(2026, 10, 3, 16, 35, tzinfo=UTC).timestamp() * 1_000_000_000)
+_OLD_LOG_BYTES = 64 * 1024 * 1024
+
+
+class _CountingFile:
+    """Delegating binary-file proxy that counts bytes handed to the reader."""
+
+    def __init__(self, inner: Any, sink: dict[str, int], name: str) -> None:
+        self._inner = inner
+        self._sink = sink
+        self._name = name
+
+    def __enter__(self) -> Self:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._inner.__exit__(*exc)
+
+    def _count(self, data: bytes) -> bytes:
+        self._sink[self._name] = self._sink.get(self._name, 0) + len(data)
+        return data
+
+    def seek(self, *args: Any) -> int:
+        return int(self._inner.seek(*args))
+
+    def read(self, *args: Any) -> bytes:
+        return self._count(self._inner.read(*args))
+
+    def readline(self, *args: Any) -> bytes:
+        return self._count(self._inner.readline(*args))
+
+    def __iter__(self) -> Any:
+        for chunk in self._inner:
+            yield self._count(chunk)
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    import builtins
+
+    import scripts.analysis.discovery_venue_pull as module
+
+    sink: dict[str, int] = {}
+    real_open = builtins.open
+
+    def counting_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(file, mode, *args, **kwargs)
+        if "b" not in mode:
+            return handle
+        return _CountingFile(handle, sink, Path(file).name)
+
+    monkeypatch.setattr(module, "open", counting_open, raising=False)
+    return sink
+
+
+def _plant_logs(tmp_path: Path, *, old_summary_ts: str) -> tuple[Path, Path]:
+    old = tmp_path / "breezy-trade-20261002T205521Z.log"
+    with open(old, "wb") as fh:
+        fh.write((_summary_plain(old_summary_ts, "initial") + "\n").encode())
+        fh.truncate(_OLD_LOG_BYTES)  # sparse: stands in for a ~1 GB historical log
+    today = tmp_path / "breezy-trade-20261003T165045Z.log"
+    today.write_text(
+        _summary_plain("2026-10-03T16:50:49.000000000", "initial") + "\n", encoding="utf-8"
+    )
+    return old, today
+
+
+def test_first_poll_reads_no_bytes_from_a_historical_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old, today = _plant_logs(tmp_path, old_summary_ts="2026-10-02T20:55:25.000000000")
+    sink = _count_reads(monkeypatch)
+
+    _state, records, _truncated = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
+
+    trigger = find_initial_trigger(records, since_ns=_SINCE_NS)
+    assert trigger is not None
+    assert trigger.source == today
+    assert sink.get(old.name, 0) == 0
+    assert sink[today.name] > 0
+
+
+def test_stale_summary_in_a_historical_log_is_never_paired_with_todays_launch(
+    tmp_path: Path,
+) -> None:
+    # A historical (yesterday-stamped) file whose summary line CLAIMS today's
+    # window must still be ignored; only today's launch file can pair.
+    old, today = _plant_logs(tmp_path, old_summary_ts="2026-10-03T16:40:00.000000000")
+
+    _state, records, _truncated = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
+
+    assert old not in {r.source for r in records}
+    trigger = find_initial_trigger(records, since_ns=_SINCE_NS)
+    assert trigger is not None
+    assert trigger.source == today
+
+
+def test_historical_log_is_still_followed_from_eof_on_later_polls(tmp_path: Path) -> None:
+    old, _today = _plant_logs(tmp_path, old_summary_ts="2026-10-02T20:55:25.000000000")
+    state, _records, _truncated = poll_node_logs_once(tmp_path, FollowState(), since_ns=_SINCE_NS)
+
+    appended = _plain_line("2026-10-03T16:55:00.000000000", "INFO", "X.Y", "later line")
+    with open(old, "ab") as fh:
+        fh.write(("\n" + appended + "\n").encode())
+
+    _state, records, _truncated = poll_node_logs_once(tmp_path, state, since_ns=_SINCE_NS)
+
+    assert [r.message for r in records if r.source == old] == ["later line"]
