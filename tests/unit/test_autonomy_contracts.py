@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import ast
+import json
+import os
+import shutil
+import subprocess
 import tomllib
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Final
 
-from tests.support.entry_points import PYPROJECT_PATH, SRC_DIR
+import pytest
+
+from tests.support.entry_points import PYPROJECT_PATH, REPO_ROOT, SRC_DIR
+from tests.support.host_python import resolve_breezy_python, resolve_sibling_entrypoint
 
 AUTONOMY_DIR: Final[Path] = SRC_DIR / "breezy" / "persistence" / "autonomy"
 AUTONOMY_PACKAGE: Final[str] = "breezy.persistence.autonomy"
+#: Core modules exempt from contract (b). Empty at ARCH-0 (AC 2).
+NAUTILUS_PERMITTED: Final[frozenset[str]] = frozenset()
+#: Core modules that may reach pyarrow, hence absent from contract (c) (AC 1).
+PYARROW_REACHING: Final[frozenset[str]] = frozenset(
+    f"{AUTONOMY_PACKAGE}.{m}"
+    for m in ("label_schema", "family_bytes", "registry_store", "replay", "resolver")
+)
 
 
 def _contracts() -> list[dict[str, Any]]:
@@ -59,3 +74,140 @@ def test_contracts_b_and_c_list_existing_modules_only_never_the_package() -> Non
         for m in ("label_schema", "family_bytes", "registry_store", "replay", "resolver")
     }
     assert {f"{AUTONOMY_PACKAGE}.canonical", f"{AUTONOMY_PACKAGE}.wire"} <= set(b["source_modules"])
+
+
+def _existing_modules() -> set[str]:
+    return {
+        f"{AUTONOMY_PACKAGE}.{p.stem}" for p in AUTONOMY_DIR.glob("*.py") if p.stem != "__init__"
+    }
+
+
+def _contract_sources() -> tuple[set[str], set[str]]:
+    """(b)'s and (c)'s ``source_modules``, told apart by what they forbid."""
+    by_forbidden = {
+        tuple(sorted(c["forbidden_modules"])): set(c["source_modules"])
+        for c in _contracts()
+        if c["source_modules"] != [AUTONOMY_PACKAGE]
+    }
+    return by_forbidden[("breezy.domain", "nautilus_trader")], by_forbidden[("pyarrow",)]
+
+
+def _classification_errors(
+    existing: Collection[str], contract_b: Collection[str], permitted: Collection[str]
+) -> set[str]:
+    """Modules that sit in neither of the two sets, or in both."""
+    return {m for m in existing if (m in contract_b) == (m in permitted)}
+
+
+def test_every_autonomy_module_is_classified() -> None:
+    contract_b, contract_c = _contract_sources()
+    existing = _existing_modules()
+    assert _classification_errors(existing, contract_b, NAUTILUS_PERMITTED) == set()
+    assert contract_b - contract_c == PYARROW_REACHING & existing
+
+
+def test_classification_scan_catches_a_planted_unclassified_module() -> None:
+    contract_b, _ = _contract_sources()
+    planted = f"{AUTONOMY_PACKAGE}.zz_planted"
+    existing = _existing_modules() | {planted}
+    assert _classification_errors(existing, contract_b, NAUTILUS_PERMITTED) == {planted}
+    # In both sets is as wrong as in neither.
+    both = _classification_errors(existing, contract_b | {planted}, {planted})
+    assert both == {planted}
+
+
+def test_single_read_is_named_in_contracts_b_and_c() -> None:
+    contract_b, contract_c = _contract_sources()
+    name = f"{AUTONOMY_PACKAGE}.single_read"
+    assert name in contract_b
+    assert name in contract_c
+
+
+_RUNTIME_PROBE: Final[str] = (
+    "import importlib, json, sys; importlib.import_module(sys.argv[1]); "
+    "print(json.dumps(sorted(sys.modules)))"
+)
+
+
+def _modules_loaded_by(module: str) -> list[str]:
+    env = {**os.environ, "PYTHONPATH": str(SRC_DIR)}
+    result = subprocess.run(
+        [resolve_breezy_python(), "-c", _RUNTIME_PROBE, module],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+        cwd=REPO_ROOT,
+    )
+    loaded: list[str] = json.loads(result.stdout.splitlines()[-1])
+    return loaded
+
+
+@pytest.mark.parametrize("module", sorted(_existing_modules()))
+def test_autonomy_core_modules_nautilus_free_at_runtime(module: str) -> None:
+    loaded = _modules_loaded_by(module)
+    nautilus = [m for m in loaded if m.split(".")[0] == "nautilus_trader"]
+    domain = [m for m in loaded if m == "breezy.domain" or m.startswith("breezy.domain.")]
+    assert nautilus == []
+    assert domain == []
+    if module not in PYARROW_REACHING:
+        assert [m for m in loaded if m.split(".")[0] == "pyarrow"] == []
+
+
+def test_runtime_probe_sees_a_known_heavy_import() -> None:
+    """Positive control: the probe really reports loaded modules."""
+    loaded = _modules_loaded_by("breezy.domain.instrument_leg")
+    assert any(m.split(".")[0] == "nautilus_trader" for m in loaded)
+
+
+_PLANTED_PYARROW: Final[str] = (
+    "\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    import pyarrow\n"
+)
+
+
+def _emit_contract_c_only() -> str:
+    _, contract_c = _contract_sources()
+    sources = ", ".join(json.dumps(m) for m in sorted(contract_c))
+    return (
+        "[tool.importlinter]\n"
+        'root_packages = ["breezy"]\n'
+        "include_external_packages = true\n\n"
+        "[[tool.importlinter.contracts]]\n"
+        'name = "planted-control copy of contract (c)"\n'
+        'type = "forbidden"\n'
+        f"source_modules = [{sources}]\n"
+        'forbidden_modules = ["pyarrow"]\n'
+        "allow_indirect_imports = false\n"
+    )
+
+
+def _lint_copy(workdir: Path) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "PYTHONPATH": str(workdir / "src")}
+    return subprocess.run(
+        [str(resolve_sibling_entrypoint("lint-imports"))],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+@pytest.mark.heavy
+@pytest.mark.parametrize("module", ["canonical"])
+def test_contract_c_refuses_planted_pyarrow_reach(module: str, tmp_path: Path) -> None:
+    shutil.copytree(SRC_DIR, tmp_path / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    (tmp_path / "pyproject.toml").write_text(_emit_contract_c_only(), encoding="utf-8")
+
+    clean = _lint_copy(tmp_path)
+    clean_output = clean.stdout + clean.stderr
+    assert clean.returncode == 0, clean_output
+    assert "1 kept" in clean_output
+    assert "BROKEN" not in clean_output
+
+    target = tmp_path / "src" / "breezy" / "persistence" / "autonomy" / f"{module}.py"
+    target.write_text(target.read_text(encoding="utf-8") + _PLANTED_PYARROW, encoding="utf-8")
+    planted = _lint_copy(tmp_path)
+    planted_output = planted.stdout + planted.stderr
+    assert planted.returncode != 0, planted_output
+    assert "BROKEN" in planted_output

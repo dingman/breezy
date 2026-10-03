@@ -226,6 +226,7 @@ type = "forbidden"
 source_modules = [
     "breezy.persistence.autonomy.canonical",
     "breezy.persistence.autonomy.wire",
+    "breezy.persistence.autonomy.single_read",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -238,6 +239,7 @@ type = "forbidden"
 source_modules = [
     "breezy.persistence.autonomy.canonical",
     "breezy.persistence.autonomy.wire",
+    "breezy.persistence.autonomy.single_read",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false
