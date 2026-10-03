@@ -293,6 +293,11 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
     if path.parent.exists():
         assert_prereg_directory_eligible(path.parent)
     raw = path.read_bytes()
+    return parse_family_manifest(raw, path=path, allow_draft=allow_draft)
+
+
+def parse_family_manifest(raw: bytes, *, path: Path, allow_draft: bool = False) -> FamilyManifest:
+    """Strictly validate the raw bytes of one family manifest."""
     manifest_sha256 = hashlib.sha256(raw).hexdigest()
     try:
         payload = json.loads(raw.decode("utf-8"))
