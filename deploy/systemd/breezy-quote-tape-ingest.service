@@ -52,7 +52,7 @@ UMask=0077
 OOMScoreAdjust=500
 
 # SP-1/I2d (2026-09-12): deprioritised against the shared nightly studies.
-# This unit fires `*:0/15` and still runs INSIDE the protected window P --
+# This unit fires every 15 min (minus the 16:30-17:00Z ticks, O-1) and still runs INSIDE the protected window P --
 # unlike the three heavy studies, it is deliberately NOT behind the studies
 # flock (T6/L-20: starving conversion would recreate "the catalog you query
 # is not the tape you capture"), so G2 is NOT met by this change -- it still
@@ -89,7 +89,12 @@ ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-q
 # Mirrors breezy-k1-daily.service and breezy-offer-gate-daily.service: for
 # Type=oneshot this bounds the whole run. A conversion pass over a full
 # day's tape is a bounded local disk operation, not a network wait.
-TimeoutStartSec=1800
+# O-1 (coordinator ruling O1-R1): 780 = `--deadline-seconds 600` + the
+# documented 180 s startup/tail allowance (was 1800). The measured 3-day max
+# runtime is 649 s (09:00Z rotation backlog). The bound is what lets the
+# frequent timer's last pre-window run (16:15Z) die before the 16:30Z launch
+# window opens: 16:15 + 780 s + 90 s default TimeoutStopSec = 16:29:30Z.
+TimeoutStartSec=780
 
 # No Restart=. A missed ingest pass is not an incident: the feather tape it
 # reads keeps accumulating on disk regardless, and the next scheduled pass

@@ -12,13 +12,22 @@ Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.p
 # already-marked instances.
 Unit=breezy-quote-tape-ingest.service
 
-# Every 15 minutes. Now that intact, already-rotated files convert without
+# Every 15 minutes EXCEPT the 16:30, 16:45 and 17:00 UTC ticks, which are
+# excluded for the node's 16:50Z LAUNCH (ARCH section 5.2 window
+# 16:30-17:10Z; coordinator O-1, ruling O1-R1). The last pre-window run
+# starts 16:15Z and is bounded by breezy-quote-tape-ingest.service's
+# TimeoutStartSec=780 + the default 90 s TimeoutStopSec = 16:29:30Z, dead
+# before the window opens; ticks resume at 17:15Z. Pinned by
+# tests/unit/test_quote_tape_ingest_launch_window.py. Now that intact, already-rotated files convert without
 # waiting for the WHOLE instance to go quiet (BL-24), a short interval turns
 # "reaches data/ up to a day late" into "reaches data/ within one rotation
 # cycle" -- the six-hourly timer alone is what left an active instance's
 # closed files sitting unconverted for hours. Installed and enabled build-side
 # (operator controls are the two budget caps only); see deploy/systemd/README.md.
-OnCalendar=*:0/15
+OnCalendar=*-*-* 00..15:0/15:00 UTC
+OnCalendar=*-*-* 16:00,15:00 UTC
+OnCalendar=*-*-* 17:15,30,45:00 UTC
+OnCalendar=*-*-* 18..23:0/15:00 UTC
 
 # A run missed because the host was down fires as soon as the timer is next
 # active, instead of silently waiting for the next tick.

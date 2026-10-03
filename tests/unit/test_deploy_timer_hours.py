@@ -21,9 +21,12 @@ _TIMERS_DIR = _REPO_ROOT / "deploy" / "systemd"
 #: the whole hour field and splitting it separately.
 _ON_CALENDAR_RE = re.compile(r"^OnCalendar=.*\s([\d,]+):(\d{2}):\d{2}\s+UTC\s*$")
 
-#: A sub-hourly step timer (`OnCalendar=*:0/15`, GL-14/BL-24's frequent
-#: ingest timer).
-_PERIODIC_RE = re.compile(r"^OnCalendar=\*:0/\d+\s*$")
+#: A sub-hourly step line: `OnCalendar=*:0/15` (GL-14/BL-24's frequent
+#: ingest timer) or its O-1 multi-line form `OnCalendar=*-*-* 00..15:0/15:00
+#: UTC` / `... 16:00,15:00 UTC` / `... 17:15,30,45:00 UTC` (hour list or range,
+#: minute step or list), which carves the 16:30-17:10Z launch window out.
+_PERIODIC_RE = re.compile(r"^OnCalendar=(?:\*|\*-\*-\*\s+[\d.,]+):[\d/,]+(?::00)?(?:\s+UTC)?\s*$")
+_STEP_MINUTES_RE = re.compile(r":0/\d+")
 
 _UNIT_RE = re.compile(r"^Unit=(.+)$")
 
@@ -54,15 +57,21 @@ def _is_periodic(timer_path: Path, all_timers: Sequence[Path]) -> bool:
     assertion -- a periodic timer introduced without an existing owner of
     its target service must be reviewed, not silently waved through.
     """
-    lines = timer_path.read_text().splitlines()
-    if not any(_PERIODIC_RE.match(line.strip()) for line in lines):
+    lines = [
+        line.strip()
+        for line in timer_path.read_text().splitlines()
+        if line.strip().startswith("OnCalendar=")
+    ]
+    # Every OnCalendar line must be sub-hourly-shaped, and at least one must
+    # be a `0/N` step (an hour list alone, e.g. `00,06,12,18:15:00`, is not).
+    if not lines or not all(_PERIODIC_RE.match(line) for line in lines):
+        return False
+    if not any(_STEP_MINUTES_RE.search(line) for line in lines):
         return False
     unit = _timer_unit(timer_path)
     if unit is None:
         return False
-    return any(
-        other != timer_path and _timer_unit(other) == unit for other in all_timers
-    )
+    return any(other != timer_path and _timer_unit(other) == unit for other in all_timers)
 
 
 def _clock_ticks(timer_path: Path) -> tuple[tuple[str, str], ...]:

@@ -28,7 +28,6 @@ _TIMEOUT_START_SEC_RE = re.compile(r"^TimeoutStartSec=(\d+)$")
 _OOM_SCORE_ADJUST_RE = re.compile(r"^OOMScoreAdjust=(-?\d+)$")
 
 _EARLY_WARNING_MARGIN_SECONDS = 900
-_TIMEOUT_MARGIN_SECONDS = 300
 
 
 def _unit_text() -> str:
@@ -70,7 +69,9 @@ def test_deadline_seconds_is_within_the_approved_band() -> None:
 
 
 def test_deadline_seconds_leaves_the_timeout_margin() -> None:
-    assert _exec_start_deadline_seconds() <= _timeout_start_sec() - _TIMEOUT_MARGIN_SECONDS
+    assert (
+        _exec_start_deadline_seconds() <= _timeout_start_sec() - STARTUP_AND_TAIL_ALLOWANCE_SECONDS
+    )
 
 
 def test_deadline_plus_allowance_stays_under_the_early_warning_margin() -> None:
@@ -78,8 +79,10 @@ def test_deadline_plus_allowance_stays_under_the_early_warning_margin() -> None:
     assert total <= _EARLY_WARNING_MARGIN_SECONDS
 
 
-def test_timeout_start_sec_is_unchanged_at_1800() -> None:
-    assert _timeout_start_sec() == 1800
+def test_timeout_start_sec_is_pinned_at_780() -> None:
+    # O-1: --deadline-seconds 600 + the 180 s tail; keeps the last pre-window
+    # run (16:15Z) dead before the 16:30Z launch window opens.
+    assert _timeout_start_sec() == 780
 
 
 def test_memory_directives_are_unchanged() -> None:
