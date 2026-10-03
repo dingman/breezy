@@ -37,6 +37,7 @@ HEAVY_ALLOWLIST: tuple[str, ...] = (
     "tests/unit/test_archive_table_upper_bound_2026_09_14.py",
     "tests/unit/test_aud07_live_rule_crossing_sim.py",
     "tests/unit/test_aud07_m1c_census.py",
+    "tests/unit/test_autonomy_contract_c_planted.py",
     "tests/unit/test_crh_group_sequential_boundaries.py",
     "tests/unit/test_current_rung_hold_archive_table.py",
     "tests/unit/test_gs_boundary_artefact.py",
