@@ -1,0 +1,6 @@
+
+## Archived 2026-10-03 (closed rows)
+| CF-12 W0+W1 | 1792e8c | Gate green 09-29 01:55Z, pushed. In-gate ratchet `tests/unit/test_mypy_ratchet.py`; runtime+strategy now CLEAN (16 errors, triage all-unreachable); CI mypy advisory. Plan `docs/plans/CF-12_MYPY_BURNDOWN_Rev2_2026-09-29.md` |
+**Closed 09-28 by ruling:** EDGE-2-REFACTOR, `max_simultaneous_positions` (dbd91d9), FU-8b/NOTIFIER (live), ING-2 residual alert (exit 4 → OnFailure), whole-tape regen, G-16/G-17, PREREG v2 residue, CF-1, CF-8, PF-1, GL-4P, AUD04-FRESH, EDGE-6, TRADE-ROW-DRIFT, SUP-ADOPT-LOG-GLOB (AUD-12a closed by its 09-27 ruling; LADDER_EV stage 2 PARKED). AUD-18 stays the R3 evidence producer (only (b) closed). PROBE-CLASSIFIER-DRIFT rides MULTIPAGE step 2.
+**Host 09-28:** reboot 15:21Z killed node + 15:20Z study; node respawned 16:50:22Z (permit ttl 10 h); A1 halt SET (`source=legacy_attributed`); tape advancing.
+**FQ go-live:** `pm_us_crh_fq_v1.json` REGISTERED (S8) with `live_orders_ruling=RULING_operator_fq_live_real_orders_2026-10-01`, density artefact sha-pinned to the committed byte copy, boundary artefact pinned to the `not_applicable_boundary.json` sentinel; S9 activation merged 60290e9d and the supervisor sends `pm_us_crh_fq_v1` for d0 2026-10-02 (`docs/plans/FQ_GO_LIVE_PLAN_2026-10-01.md` §4/§5).

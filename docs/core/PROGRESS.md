@@ -56,10 +56,25 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | AUD-07 gate | 97c4325 | `--stage 80k` refused while `20k/DEFERRED` non-empty (repo copy; the pinned a40d433 copy drives the drain) |
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
-| CF-12 W0+W1 | 1792e8c | Gate green 09-29 01:55Z, pushed. In-gate ratchet `tests/unit/test_mypy_ratchet.py`; runtime+strategy now CLEAN (16 errors, triage all-unreachable); CI mypy advisory. Plan `docs/plans/CF-12_MYPY_BURNDOWN_Rev2_2026-09-29.md` |
 
-### AUTONOMY (operator objective 2026-10-03; `docs/evidence/RULING_operator_full_autonomy_2026-10-03.md`)
-Backlog and plans: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`. ARCH Rev 9.2 is FROZEN, with errata E-1 to E-10, E-7a and E-8a. All 7 plans READY (2 blind reviewers, ≥95, 0 CRIT/HIGH). None is executed, and the scores are unchanged (capture 2, labeling 1, retraining 0, eval 2, promotion 1, drift 2, rollback 2). An area closes only at an independently scored 3 after its live proof. Next: build in dependency order, carrying each `reviews/*-final.md` item.
+### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
+`/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
+| # | ID | Work | Needs | Status |
+|---|---|---|---|---|
+| 1 | AUT-1-R9 | PLAN native-first AUT-1 r9 (`reviews/AUT-1-native-pressure-test.md`) | — | OPEN |
+| 2 | AUT-NATIVE | PLAN Nautilus-native pressure test of AUT-2..7; reopen failures | — | OPEN |
+| 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
+| 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper | 1,2 | OPEN |
+| 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | OPEN |
+| 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | OPEN |
+| 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | OPEN |
+| 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
+| 9 | AUT-2 | BUILD labels (2a then 2b) | 3,8 | OPEN |
+| 10 | AUT-4 | BUILD eval (4a move, live sequential, offline) | 9 | OPEN |
+| 11 | AUT-5b | BUILD policy ruling + drill clauses; PROMOTE stays off | 10 | OPEN |
+| 12 | AUT-7 | BUILD 7a gate drill, 7b live drill | 11 | OPEN |
+| 13 | AUT-3 | BUILD retraining; only once AUT-4 shows an edge or a new source exists | 10 | GATED |
+Area closes only at an independent score of 3 after its live proof; scores now 2,1,0,2,1,2,2 (AUT-1..7).
 
 ### BUILD
 | ID | Sev | Open work (exact) | Source |
@@ -91,11 +106,6 @@ Backlog and plans: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`. ARCH Rev 
 - **Trigger watches:** EDGE-2-MULTIPAGE step 2 (`traversed N pages` or ≥80 activities); HUNT-1 (`RULING_HUNT-1…:34-38`); AUD-02 A0 close ≥09-30; PATH-B-SOURCE-GATE + AUD-12/RA-3 (dormant, flip only by own ruling); THIN-BOOK-REFUSAL = fill-rate evidence only; CF-2/CF-7 attach to any METAR station-selection plan; RA-11a on R2/R3/R4; SP-5b = step 0 of any R3 re-plan (before registration).
 - **Rules:** HALT-FSM = accepted cosmetic (Nautilus swallows it; fail-safe; whitelist `InvalidStateTrigger STOPPED->START_COMPLETED` in greps); T-9 = per-family PREREG exit policy, no blind flatten; CF-4 accepted.
 
-**Closed 09-28 by ruling:** EDGE-2-REFACTOR, `max_simultaneous_positions` (dbd91d9), FU-8b/NOTIFIER (live), ING-2 residual alert (exit 4 → OnFailure), whole-tape regen, G-16/G-17, PREREG v2 residue, CF-1, CF-8, PF-1, GL-4P, AUD04-FRESH, EDGE-6, TRADE-ROW-DRIFT, SUP-ADOPT-LOG-GLOB (AUD-12a closed by its 09-27 ruling; LADDER_EV stage 2 PARKED). AUD-18 stays the R3 evidence producer (only (b) closed). PROBE-CLASSIFIER-DRIFT rides MULTIPAGE step 2.
-
-**Host 09-28:** reboot 15:21Z killed node + 15:20Z study; node respawned 16:50:22Z (permit ttl 10 h); A1 halt SET (`source=legacy_attributed`); tape advancing.
-
-**FQ go-live:** `pm_us_crh_fq_v1.json` REGISTERED (S8) with `live_orders_ruling=RULING_operator_fq_live_real_orders_2026-10-01`, density artefact sha-pinned to the committed byte copy, boundary artefact pinned to the `not_applicable_boundary.json` sentinel; S9 activation merged 60290e9d and the supervisor sends `pm_us_crh_fq_v1` for d0 2026-10-02 (`docs/plans/FQ_GO_LIVE_PLAN_2026-10-01.md` §4/§5).
 
 ---
 

@@ -220,6 +220,6 @@ Shared contracts, defined once in the umbrella architecture (`AUTONOMY_ARCHITECT
 
 **Planning status (2026-10-03):** six area plans are READY; AUT-1 is REOPENED for a native-first r9. That is the *planning* bar: two blind reviewers, the lower score at least 95, and zero CRITICAL or HIGH findings. **No area has been executed, and every area's 0–3 score is unchanged.** An area reaches 3 only after its plan is built and its live proof has run, and an independent scorer assigns the 3.
 
-**Build order:** follow the dependency graph above. Every WP brief must carry, as binding, the area's `reviews/<area>-final.md` build items and the ARCH errata E-1 to E-10, E-7a and E-8a.
+**Build order:** the binding, priority-ordered queue is the `AUTONOMY QUEUE` table in `docs/core/PROGRESS.md`. `/execute-backlog` reads it and takes the first row that is not DONE or GATED and whose prerequisites are DONE. It follows the dependency graph above. Every WP brief must carry, as binding, the area's `reviews/<area>-final.md` build items and the ARCH errata E-1 to E-10, E-7a and E-8a.
 
 **Evidence class:** machinery proven, edge unproven. `promote_enabled=false` until n_min ≤ n_cap.
