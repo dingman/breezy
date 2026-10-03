@@ -208,6 +208,40 @@ source_modules = [
 forbidden_modules = ["breezy.analysis.hypothesis_ledger"]
 allow_indirect_imports = false
 
+# ARCH-0 seam A (V16, V22, V23). Contracts (b) and (c) name MODULES ONLY, never the
+# package: import-linter treats a package source as including every descendant, and
+# `label_schema`, `family_bytes`, `registry_store`, `replay` and `resolver` legitimately
+# reach pyarrow. Import-linter refuses an absent source module, so these lists hold only
+# modules that exist; each seam appends the modules it lands.
+[[tool.importlinter.contracts]]
+name = "ARCH-0 autonomy (a): the autonomy persistence package never imports adapters"
+type = "forbidden"
+source_modules = ["breezy.persistence.autonomy"]
+forbidden_modules = ["breezy.adapters"]
+allow_indirect_imports = false
+
+[[tool.importlinter.contracts]]
+name = "ARCH-0 autonomy (b): autonomy core modules never reach Nautilus or the domain package"
+type = "forbidden"
+source_modules = [
+    "breezy.persistence.autonomy.canonical",
+    "breezy.persistence.autonomy.wire",
+]
+forbidden_modules = ["nautilus_trader", "breezy.domain"]
+allow_indirect_imports = false
+
+[[tool.importlinter.contracts]]
+name = "ARCH-0 autonomy (c): autonomy core modules outside PYARROW_REACHING never reach pyarrow"
+type = "forbidden"
+# Contract (b)'s list minus PYARROW_REACHING = {label_schema, family_bytes, registry_store,
+# replay, resolver}.
+source_modules = [
+    "breezy.persistence.autonomy.canonical",
+    "breezy.persistence.autonomy.wire",
+]
+forbidden_modules = ["pyarrow"]
+allow_indirect_imports = false
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
