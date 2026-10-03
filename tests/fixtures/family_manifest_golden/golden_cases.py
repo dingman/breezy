@@ -118,8 +118,9 @@ def _canonical(manifest: object) -> dict[str, object]:
     return {f.name: convert(getattr(manifest, f.name)) for f in dataclasses.fields(manifest)}
 
 
-def _scrub(message: str, path: Path) -> str:
-    return message.replace(str(path), "<PATH>").replace(str(path.parent), "<DIR>")
+def _scrub(message: str, path: Path, tmp: Path) -> str:
+    scrubbed = message.replace(str(path), "<PATH>").replace(str(path.parent), "<DIR>")
+    return scrubbed.replace(str(tmp), "<TMP>")
 
 
 def run_case(case_id: str, tmp: Path) -> dict[str, object]:
@@ -129,7 +130,7 @@ def run_case(case_id: str, tmp: Path) -> dict[str, object]:
     try:
         manifest = load_family_manifest(path, allow_draft=allow_draft)
     except Exception as exc:  # noqa: BLE001 - characterisation records every refusal
-        return {"raises": type(exc).__name__, "message": _scrub(str(exc), path)}
+        return {"raises": type(exc).__name__, "message": _scrub(str(exc), path, tmp)}
     dump = json.dumps(_canonical(manifest), sort_keys=True, separators=(",", ":"))
     return {"parsed": json.loads(dump), "sha256": hashlib.sha256(dump.encode()).hexdigest()}
 

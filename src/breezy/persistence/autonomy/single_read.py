@@ -4,7 +4,9 @@ Every operation is anchored on a directory fd and uses ``O_NOFOLLOW``; no path i
 resolved twice. ``write_once`` publishes with ``os.link`` only (no rename fallback),
 so an existing destination is never replaced. ``replace_atomic`` is the one
 sanctioned overwrite. Refusals raise :class:`SingleReadRefused` with a closed
-:class:`SingleReadReason`.
+:class:`SingleReadReason`; ``write_once`` returns only ``WRITTEN`` or
+``EXISTS_EQUAL`` and raises ``EXISTS_DIFFERENT`` for every other occupied
+destination.
 
 The writability refusal is a mode-bit check, never a probe, so it does not depend
 on the uid the process runs as (V30).
@@ -33,6 +35,20 @@ _LINK_UNSUPPORTED_ERRNOS: Final[frozenset[int]] = frozenset(
 )
 _READ_CHUNK: Final[int] = 65536
 _DEFAULT_DIR_MODE: Final[int] = 0o700
+_PERMISSION_BITS: Final[int] = 0o777
+_ROOT_LABEL: Final[str] = "<root>"
+
+__all__ = [
+    "ReadPolicy",
+    "SingleReadReason",
+    "SingleReadRefused",
+    "WriteOutcome",
+    "open_root",
+    "read_once_at",
+    "replace_atomic",
+    "walk_dirs",
+    "write_once",
+]
 
 
 class ReadPolicy(StrEnum):
@@ -54,15 +70,20 @@ class SingleReadReason(StrEnum):
     DIR_NOT_WRITABLE = "dir_not_writable"
     LINK_UNSUPPORTED = "link_unsupported"
     IO = "io"
+    EXISTS_DIFFERENT = "exists_different"
+    INVALID_MODE = "invalid_mode"
 
 
 class WriteOutcome(StrEnum):
+    """Successful ``write_once`` results; every other occupied destination raises."""
+
     WRITTEN = "written"
     EXISTS_EQUAL = "exists_equal"
-    EXISTS_DIFFERENT = "exists_different"
 
 
 class SingleReadRefused(Exception):
+    """A single-read or link-write refusal; ``reason`` is machine-readable."""
+
     def __init__(self, reason: SingleReadReason, detail: str = "") -> None:
         super().__init__(f"{reason.value}: {detail}" if detail else reason.value)
         self.reason = reason
@@ -78,18 +99,27 @@ def _io(exc: OSError, what: str) -> SingleReadRefused:
     return SingleReadRefused(SingleReadReason.IO, f"{what}: {os.strerror(exc.errno or 0)}")
 
 
-def _open_dir_at(dirfd: int | None, name: str) -> int:
-    """Open one directory without following a final symlink; classify the refusal."""
+def _refuse_mode(mode: int) -> None:
+    if mode & ~_PERMISSION_BITS:
+        raise SingleReadRefused(SingleReadReason.INVALID_MODE, oct(mode))
+
+
+def _open_dir_at(dirfd: int | None, name: str, label: str | None = None) -> int:
+    """Open one directory without following a final symlink; classify the refusal.
+
+    ``label`` replaces ``name`` in refusal details (used to keep the root path out).
+    """
+    shown = name if label is None else label
     try:
         if dirfd is None:
             return os.open(name, _DIR_FLAGS)
         return os.open(name, _DIR_FLAGS, dir_fd=dirfd)
     except FileNotFoundError as exc:
-        raise SingleReadRefused(SingleReadReason.NOT_FOUND, name) from exc
+        raise SingleReadRefused(SingleReadReason.NOT_FOUND, shown) from exc
     except OSError as exc:
         if exc.errno not in (errno.ELOOP, errno.ENOTDIR):
-            raise _io(exc, name) from exc
-        raise SingleReadRefused(_why_not_directory(dirfd, name), name) from exc
+            raise _io(exc, shown) from exc
+        raise SingleReadRefused(_why_not_directory(dirfd, name), shown) from exc
 
 
 def _why_not_directory(dirfd: int | None, name: str) -> SingleReadReason:
@@ -111,10 +141,14 @@ def _require_owned_dir(fd: int, name: str) -> None:
 
 
 def open_root(root: Path) -> int:
-    """Open the data root as a directory fd (caller closes)."""
-    fd = _open_dir_at(None, os.fspath(root))
+    """Open the data root as a directory fd (caller closes).
+
+    The ancestors of ``root`` are trusted: only the final component is opened with
+    ``O_NOFOLLOW`` and ownership-checked. Refusal details say ``<root>``, never the path.
+    """
+    fd = _open_dir_at(None, os.fspath(root), _ROOT_LABEL)
     try:
-        _require_owned_dir(fd, os.fspath(root))
+        _require_owned_dir(fd, _ROOT_LABEL)
     except BaseException:
         os.close(fd)
         raise
@@ -200,6 +234,7 @@ def _split(path: Path, root: Path) -> tuple[tuple[str, ...], str]:
         raise SingleReadRefused(SingleReadReason.INVALID_NAME, "path is outside the root") from exc
     if not parts:
         raise SingleReadRefused(SingleReadReason.INVALID_NAME, "path is the root")
+    _refuse_name(parts[-1])
     return parts[:-1], parts[-1]
 
 
@@ -208,21 +243,41 @@ def _require_writable_dir(dirfd: int) -> None:
         raise SingleReadRefused(SingleReadReason.DIR_NOT_WRITABLE)
 
 
-def _compare_existing(dirfd: int, name: str, data: bytes) -> WriteOutcome | None:
-    """``None`` when the destination is absent; otherwise EQUAL or DIFFERENT (fail-closed)."""
+def _compare_existing(dirfd: int, name: str, data: bytes) -> bool | None:
+    """``None`` when absent, ``True`` when equal; raises ``EXISTS_DIFFERENT`` otherwise.
+
+    Different bytes (including a larger file), a symlink or a non-regular destination
+    become ``EXISTS_DIFFERENT``; ``WRONG_OWNER`` and ``IO`` propagate as themselves.
+    """
     try:
         existing = read_once_at(dirfd, name, max_bytes=len(data), policy=ReadPolicy.REPO)
     except SingleReadRefused as exc:
         if exc.reason is SingleReadReason.NOT_FOUND:
             return None
-        if exc.reason is SingleReadReason.IO:
-            raise
-        return WriteOutcome.EXISTS_DIFFERENT
-    return WriteOutcome.EXISTS_EQUAL if existing == data else WriteOutcome.EXISTS_DIFFERENT
+        if exc.reason in (
+            SingleReadReason.SYMLINK,
+            SingleReadReason.NOT_REGULAR,
+            SingleReadReason.OVERSIZE,  # larger than ``data`` is simply different content
+        ):
+            raise SingleReadRefused(SingleReadReason.EXISTS_DIFFERENT, name) from exc
+        raise
+    if existing != data:
+        raise SingleReadRefused(SingleReadReason.EXISTS_DIFFERENT, name)
+    return True
+
+
+def _cleanup_temp(dirfd: int, temp: str, primary: BaseException) -> None:
+    """Failure-path unlink: a cleanup error is attached to ``primary``, never raised."""
+    try:
+        os.unlink(temp, dir_fd=dirfd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        primary.add_note(f"cleanup of {temp} failed: {os.strerror(exc.errno or 0)}")
 
 
 def _write_temp(dirfd: int, data: bytes, mode: int) -> str:
-    """Create, fill and fsync a ``.tmp.<16 hex>`` file; always cleans up after itself on error."""
+    """Create, fill and fsync a ``.tmp.<16 hex>`` file; on any failure no temp or fd remains."""
     temp = f"{_TEMP_PREFIX}{secrets.token_hex(_TEMP_TOKEN_BYTES)}"
     fd = os.open(temp, _TEMP_FLAGS, _TEMP_CREATE_MODE, dir_fd=dirfd)
     try:
@@ -231,33 +286,65 @@ def _write_temp(dirfd: int, data: bytes, mode: int) -> str:
         while view:
             view = view[os.write(fd, view) :]
         os.fsync(fd)
-    except BaseException:
-        os.close(fd)
-        _unlink_quietly(dirfd, temp)
+        closing, fd = fd, -1
+        os.close(closing)
+    except BaseException as primary:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                primary.add_note(f"close of {temp} failed: {os.strerror(exc.errno or 0)}")
+        _cleanup_temp(dirfd, temp, primary)
         raise
-    os.close(fd)
     return temp
 
 
-def _unlink_quietly(dirfd: int, name: str) -> None:
+def _finish(dirfd: int, temp: str, *, sync_dir: bool) -> None:
+    """Success-path tail: unlink the temp, then fsync the directory (both always attempted).
+
+    The first failure is raised as ``IO``. After a successful link the destination
+    already exists, so a retry returns ``EXISTS_EQUAL``.
+    """
+    errors: list[SingleReadRefused] = []
     try:
-        os.unlink(name, dir_fd=dirfd)
+        os.unlink(temp, dir_fd=dirfd)
     except FileNotFoundError:
         pass
+    except OSError as exc:
+        errors.append(_io(exc, "temp unlink"))
+    if sync_dir:
+        try:
+            os.fsync(dirfd)
+        except OSError as exc:
+            errors.append(_io(exc, "directory fsync"))
+    if errors:
+        for extra in errors[1:]:
+            errors[0].add_note(str(extra))
+        raise errors[0]
 
 
-def write_once(path: Path, data: bytes, *, root: Path, mode: int) -> WriteOutcome:
-    """Publish ``data`` at ``path`` only if nothing is there (``os.link``, no rename)."""
+def _open_parent(path: Path, root: Path) -> tuple[int, str]:
     parent_rel, name = _split(path, root)
     rootfd = open_root(root)
     try:
-        dirfd = walk_dirs(rootfd, parent_rel, create=False)
+        return walk_dirs(rootfd, parent_rel, create=False), name
     finally:
         os.close(rootfd)
+
+
+def write_once(path: Path, data: bytes, *, root: Path, mode: int) -> WriteOutcome:
+    """Publish ``data`` at ``path`` only if nothing is there (``os.link``, no rename).
+
+    Returns ``WRITTEN`` or ``EXISTS_EQUAL``. Different bytes, a symlink, FIFO,
+    directory or any other non-regular destination raise ``EXISTS_DIFFERENT``. If the
+    final directory fsync fails after a successful link, ``IO`` is raised; a retry then
+    returns ``EXISTS_EQUAL``.
+    """
+    _refuse_mode(mode)
+    dirfd, name = _open_parent(path, root)
     try:
-        existing = _compare_existing(dirfd, name, data)
-        if existing is not None:
-            return existing
+        if _compare_existing(dirfd, name, data):
+            return WriteOutcome.EXISTS_EQUAL
         _require_writable_dir(dirfd)
         return _publish_by_link(dirfd, name, data, mode)
     finally:
@@ -270,35 +357,37 @@ def _publish_by_link(dirfd: int, name: str, data: bytes, mode: int) -> WriteOutc
     except OSError as exc:
         raise _io(exc, name) from exc
     try:
+        outcome = _link_temp(dirfd, temp, name, data)
+    except BaseException as primary:
+        _cleanup_temp(dirfd, temp, primary)
+        raise
+    _finish(dirfd, temp, sync_dir=outcome is WriteOutcome.WRITTEN)
+    return outcome
+
+
+def _link_temp(dirfd: int, temp: str, name: str, data: bytes) -> WriteOutcome:
+    try:
         os.link(temp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
-    except FileExistsError:
-        return _compare_existing(dirfd, name, data) or WriteOutcome.EXISTS_DIFFERENT
+    except FileExistsError as exc:
+        if _compare_existing(dirfd, name, data):  # the winner's bytes equal ours
+            return WriteOutcome.EXISTS_EQUAL
+        raise SingleReadRefused(SingleReadReason.EXISTS_DIFFERENT, name) from exc
     except OSError as exc:
         if exc.errno in _LINK_UNSUPPORTED_ERRNOS:
             raise SingleReadRefused(SingleReadReason.LINK_UNSUPPORTED, name) from exc
         raise _io(exc, name) from exc
-    finally:
-        _unlink_quietly(dirfd, temp)
-        _fsync_dir(dirfd)
     return WriteOutcome.WRITTEN
 
 
-def _fsync_dir(dirfd: int) -> None:
-    try:
-        os.fsync(dirfd)
-    except OSError as exc:
-        raise _io(exc, "directory fsync") from exc
-
-
 def replace_atomic(path: Path, data: bytes, *, root: Path, mode: int) -> None:
-    """Atomically replace (or create) ``path`` with ``data`` via a same-directory temp."""
-    parent_rel, name = _split(path, root)
-    _refuse_name(name)
-    rootfd = open_root(root)
-    try:
-        dirfd = walk_dirs(rootfd, parent_rel, create=False)
-    finally:
-        os.close(rootfd)
+    """Atomically replace (or create) ``path`` with ``data`` via a same-directory temp.
+
+    There is no outcome to report: success returns ``None`` and every refusal raises.
+    A failure after the replace (temp unlink or directory fsync) raises ``IO`` with the
+    new bytes already in place.
+    """
+    _refuse_mode(mode)
+    dirfd, name = _open_parent(path, root)
     try:
         _require_writable_dir(dirfd)
         try:
@@ -308,9 +397,9 @@ def replace_atomic(path: Path, data: bytes, *, root: Path, mode: int) -> None:
         try:
             os.replace(temp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
         except OSError as exc:
-            raise _io(exc, name) from exc
-        finally:
-            _unlink_quietly(dirfd, temp)
-            _fsync_dir(dirfd)
+            refusal = _io(exc, name)
+            _cleanup_temp(dirfd, temp, refusal)
+            raise refusal from exc
+        _finish(dirfd, temp, sync_dir=True)
     finally:
         os.close(dirfd)

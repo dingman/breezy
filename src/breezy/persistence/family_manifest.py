@@ -96,6 +96,7 @@ __all__ = [
     "UnpinnedDensityArtefactError",
     "UnregisteredFamilyManifestError",
     "load_family_manifest",
+    "parse_family_manifest",
 ]
 
 ManifestStatus = Literal["DRAFT_NOT_REGISTERED", "REGISTERED"]

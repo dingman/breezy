@@ -36,6 +36,7 @@ def test_live_path_modules_import_set_pinned(module: ModuleType) -> None:
 
 
 def test_parse_family_manifest_signature() -> None:
+    assert "parse_family_manifest" in family_manifest.__all__
     sig = inspect.signature(family_manifest.parse_family_manifest)
     params = sig.parameters
     assert list(params) == ["raw", "path", "allow_draft"]

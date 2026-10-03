@@ -37,6 +37,8 @@ ACCEPTED_SCHEMAS: Final[frozenset[str]] = frozenset(
 
 
 class WireRefusalReason(StrEnum):
+    """Closed set of reasons a wire record is refused."""
+
     MALFORMED_JSON = "malformed_json"
     NOT_AN_OBJECT = "not_an_object"
     DUPLICATE_KEY = "duplicate_key"
@@ -105,6 +107,7 @@ def require_exact_keys(
     required: Collection[str],
     optional: Collection[str] = (),
 ) -> None:
+    """Refuse a missing required key or any key outside required and optional."""
     missing = sorted(set(required) - obj.keys())
     if missing:
         raise WireRefused(WireRefusalReason.MISSING_KEY, ",".join(missing))
@@ -120,6 +123,7 @@ def _get(obj: Mapping[str, object], key: str) -> object:
 
 
 def require_str(obj: Mapping[str, object], key: str) -> str:
+    """The value at ``key`` when it is a ``str``."""
     value = _get(obj, key)
     if not isinstance(value, str):
         raise WireRefused(WireRefusalReason.WRONG_TYPE, key)
@@ -127,6 +131,7 @@ def require_str(obj: Mapping[str, object], key: str) -> str:
 
 
 def require_int(obj: Mapping[str, object], key: str) -> int:
+    """The value at ``key`` when it is an ``int`` (a ``bool`` is refused as BOOL_AS_INT)."""
     value = _get(obj, key)
     if isinstance(value, bool):
         raise WireRefused(WireRefusalReason.BOOL_AS_INT, key)
@@ -136,6 +141,7 @@ def require_int(obj: Mapping[str, object], key: str) -> int:
 
 
 def require_bool(obj: Mapping[str, object], key: str) -> bool:
+    """The value at ``key`` when it is a ``bool``."""
     value = _get(obj, key)
     if not isinstance(value, bool):
         raise WireRefused(WireRefusalReason.WRONG_TYPE, key)
@@ -143,6 +149,7 @@ def require_bool(obj: Mapping[str, object], key: str) -> bool:
 
 
 def require_ns(obj: Mapping[str, object], key: str) -> int:
+    """A non-negative ``int`` nanosecond value at ``key``."""
     value = require_int(obj, key)
     if value < 0:
         raise WireRefused(WireRefusalReason.BAD_VALUE, key)
@@ -150,6 +157,7 @@ def require_ns(obj: Mapping[str, object], key: str) -> int:
 
 
 def require_sha256(obj: Mapping[str, object], key: str) -> str:
+    """A lowercase 64-hex digest string at ``key``."""
     value = require_str(obj, key)
     if SHA256_RE.fullmatch(value) is None:
         raise WireRefused(WireRefusalReason.BAD_VALUE, key)
@@ -157,6 +165,7 @@ def require_sha256(obj: Mapping[str, object], key: str) -> str:
 
 
 def require_enum(obj: Mapping[str, object], key: str, *, allowed: Collection[str]) -> str:
+    """A ``str`` at ``key`` that is a member of ``allowed``."""
     value = require_str(obj, key)
     if value not in allowed:
         raise WireRefused(WireRefusalReason.BAD_VALUE, key)

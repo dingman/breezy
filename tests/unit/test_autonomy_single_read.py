@@ -9,7 +9,8 @@ import errno
 import os
 import re
 import stat
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -124,11 +125,29 @@ def test_read_returns_bytes(root: Path) -> None:
     assert _read(root, "f", policy=ReadPolicy.STRICT) == b"hello"
 
 
+def _run_with_deadline(call: Callable[[], object], seconds: float = 5.0) -> BaseException | None:
+    """Run ``call`` in a thread; fail the test (instead of hanging) past the deadline."""
+    outcome: list[BaseException | None] = []
+
+    def target() -> None:
+        try:
+            call()
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "call blocked past the deadline"
+    return outcome[0]
+
+
 def test_read_refuses_fifo_without_blocking(root: Path) -> None:
     os.mkfifo(root / "pipe", 0o600)
-    with pytest.raises(SingleReadRefused) as exc_info:
-        _read(root, "pipe", policy=ReadPolicy.STRICT)
-    assert _reason(exc_info) is SingleReadReason.NOT_REGULAR
+    error = _run_with_deadline(lambda: _read(root, "pipe", policy=ReadPolicy.STRICT))
+    assert isinstance(error, SingleReadRefused)
+    assert error.reason is SingleReadReason.NOT_REGULAR
 
 
 def test_read_refuses_symlink(root: Path) -> None:
@@ -217,6 +236,178 @@ def test_read_uses_one_fd(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert closed == opened
 
 
+# ---------------------------------------------------------------- ownership and error hygiene
+
+
+def _foreign_euid(monkeypatch: pytest.MonkeyPatch) -> None:
+    other_uid = os.geteuid() + 1
+    monkeypatch.setattr(os, "geteuid", lambda: other_uid)
+
+
+def test_open_root_refuses_a_foreign_owner_without_leaking_the_path(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _foreign_euid(monkeypatch)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        open_root(root)
+    assert _reason(exc_info) is SingleReadReason.WRONG_OWNER
+    assert str(root) not in str(exc_info.value)
+    assert exc_info.value.detail == "<root>"
+
+
+def test_open_root_missing_root_detail_is_constant(tmp_path: Path) -> None:
+    with pytest.raises(SingleReadRefused) as exc_info:
+        open_root(tmp_path / "absent")
+    assert _reason(exc_info) is SingleReadReason.NOT_FOUND
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_walk_dirs_refuses_a_foreign_owner(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (root / "d").mkdir(mode=0o700)
+    rootfd = open_root(root)
+    try:
+        _foreign_euid(monkeypatch)
+        with pytest.raises(SingleReadRefused) as exc_info:
+            walk_dirs(rootfd, ("d",), create=False)
+    finally:
+        os.close(rootfd)
+    assert _reason(exc_info) is SingleReadReason.WRONG_OWNER
+
+
+def _fd_count() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_refusals_do_not_leak_fds(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (root / "f").write_bytes(b"old")
+    (root / "f").chmod(0o666)
+    before = _fd_count()
+    for _ in range(5):
+        with pytest.raises(SingleReadRefused):
+            write_once(root / "f", b"new", root=root, mode=0o600)
+        with pytest.raises(SingleReadRefused):
+            write_once(root / "missing" / "f", b"new", root=root, mode=0o600)
+        with pytest.raises(SingleReadRefused):
+            write_once(root / "..", b"new", root=root, mode=0o600)
+        with pytest.raises(SingleReadRefused):
+            _read(root, "f", policy=ReadPolicy.STRICT)
+        with pytest.raises(SingleReadRefused):
+            open_root(root / "f")
+    assert _fd_count() == before
+
+
+def test_write_temp_failure_leaves_no_temp_and_no_fd(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fsync = os.fsync
+
+    def failing_fsync(fd: int) -> None:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "boom")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    before = _fd_count()
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.IO
+    with pytest.raises(SingleReadRefused):
+        replace_atomic(root / "f", b"x", root=root, mode=0o600)
+    assert os.listdir(root) == []
+    assert _fd_count() == before
+
+
+def test_write_temp_failing_close_does_not_leak_the_temp(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_close = os.close
+    state = {"armed": True}
+
+    # Fail the close of the temp fd only (the first close made after the write).
+    seen: list[int] = []
+    real_open = os.open
+
+    def spy_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT:
+            seen.append(fd)
+        return fd
+
+    def close(fd: int) -> None:
+        real_close(fd)
+        if seen and fd == seen[0] and state["armed"]:
+            state["armed"] = False
+            raise OSError(errno.EIO, "close failed")
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    monkeypatch.undo()
+    assert _reason(exc_info) is SingleReadReason.IO
+    assert os.listdir(root) == []
+
+
+def test_cleanup_failure_never_masks_the_primary_refusal(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing_link(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.EPERM, "no link")
+
+    def failing_unlink(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.EIO, "no unlink")
+
+    monkeypatch.setattr(os, "link", failing_link)
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.LINK_UNSUPPORTED
+
+
+def test_dir_fsync_failure_after_link_raises_io_and_retry_is_exists_equal(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fsync = os.fsync
+
+    def dir_fsync_fails(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "dir fsync")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", dir_fsync_fails)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.IO
+    assert (root / "f").read_bytes() == b"x"
+    assert _temps(root) == []
+    monkeypatch.undo()
+    assert write_once(root / "f", b"x", root=root, mode=0o600) is WriteOutcome.EXISTS_EQUAL
+
+
+def test_unlink_failure_does_not_skip_the_dir_fsync(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_unlink, real_fsync = os.unlink, os.fsync
+    dir_fsyncs: list[int] = []
+
+    def failing_unlink(name: str, **kwargs: Any) -> None:
+        raise OSError(errno.EIO, "no unlink")
+
+    def spy_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            dir_fsyncs.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    with pytest.raises(SingleReadRefused):
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    assert dir_fsyncs, "directory fsync was skipped after an unlink failure"
+    for leftover in _temps(root):
+        (root / leftover).unlink()
+
+
 # ---------------------------------------------------------------- write_once
 
 
@@ -265,19 +456,21 @@ def test_write_once_exists_equal_creates_no_temp(
     assert os.listdir(sub) == ["f"]
 
 
-def test_write_once_different_bytes_is_exists_different_and_untouched(root: Path) -> None:
+def test_write_once_different_bytes_raises_exists_different_and_untouched(root: Path) -> None:
     write_once(root / "f", b"old", root=root, mode=0o600)
-    outcome = write_once(root / "f", b"new", root=root, mode=0o600)
-    assert outcome is WriteOutcome.EXISTS_DIFFERENT
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"new", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.EXISTS_DIFFERENT
     assert (root / "f").read_bytes() == b"old"
     assert _temps(root) == []
 
 
-def test_write_once_symlink_at_destination_with_equal_bytes_is_different(root: Path) -> None:
+def test_write_once_symlink_at_destination_with_equal_bytes_raises_different(root: Path) -> None:
     (root / "target").write_bytes(b"same")
     (root / "f").symlink_to(root / "target")
-    outcome = write_once(root / "f", b"same", root=root, mode=0o600)
-    assert outcome is WriteOutcome.EXISTS_DIFFERENT
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"same", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.EXISTS_DIFFERENT
     assert (root / "f").is_symlink()
     assert _temps(root) == []
 
@@ -361,9 +554,96 @@ def test_write_once_eexist_race_recompares(root: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(os, "link", racing_link)
     assert write_once(root / "f", b"winner", root=root, mode=0o600) is WriteOutcome.EXISTS_EQUAL
     (root / "f").unlink()
-    assert write_once(root / "f", b"loser", root=root, mode=0o600) is WriteOutcome.EXISTS_DIFFERENT
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"loser", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.EXISTS_DIFFERENT
     assert (root / "f").read_bytes() == b"winner"
     assert _temps(root) == []
+
+
+def test_write_once_vanished_winner_raises_exists_different(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def vanishing_link(src: str, dst: str, **kwargs: Any) -> None:
+        raise FileExistsError(errno.EEXIST, "raced")  # the winner is already gone
+
+    monkeypatch.setattr(os, "link", vanishing_link)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.EXISTS_DIFFERENT
+    assert _temps(root) == []
+
+
+def _make_fifo(path: Path) -> None:
+    os.mkfifo(path, 0o600)
+
+
+def _make_dir(path: Path) -> None:
+    path.mkdir(mode=0o700)
+
+
+def _make_dangling_symlink(path: Path) -> None:
+    path.symlink_to(path.parent / "nowhere")
+
+
+@pytest.mark.parametrize("make", [_make_fifo, _make_dir, _make_dangling_symlink])
+def test_write_once_non_regular_destination_raises_exists_different(
+    root: Path, make: Callable[[Path], None]
+) -> None:
+    make(root / "f")
+    error = _run_with_deadline(lambda: write_once(root / "f", b"x", root=root, mode=0o600))
+    assert isinstance(error, SingleReadRefused)
+    assert error.reason is SingleReadReason.EXISTS_DIFFERENT
+    assert _temps(root) == []
+
+
+def test_write_once_wrong_owner_destination_propagates_wrong_owner(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / "f").write_bytes(b"x")
+    real_geteuid = os.geteuid
+    calls = {"n": 0}
+
+    def euid() -> int:
+        calls["n"] += 1
+        return real_geteuid() if calls["n"] <= 1 else real_geteuid() + 1  # root passes, file fails
+
+    monkeypatch.setattr(os, "geteuid", euid)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.WRONG_OWNER
+    assert _temps(root) == []
+
+
+def test_write_once_larger_existing_file_raises_exists_different(root: Path) -> None:
+    (root / "f").write_bytes(b"x" * 50)
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"short", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.EXISTS_DIFFERENT
+    assert (root / "f").read_bytes() == b"x" * 50
+    assert _temps(root) == []
+
+
+@pytest.mark.parametrize("name", ["..", ".", "a\x00b"])
+def test_write_and_replace_refuse_invalid_final_name(root: Path, name: str) -> None:
+    target = root / name if name != ".." else root / ".."
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(target, b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.INVALID_NAME
+    with pytest.raises(SingleReadRefused) as exc_info:
+        replace_atomic(target, b"x", root=root, mode=0o600)
+    assert _reason(exc_info) is SingleReadReason.INVALID_NAME
+
+
+@pytest.mark.parametrize("mode", [0o4600, 0o2600, 0o1600])
+def test_write_once_and_replace_refuse_special_mode_bits(root: Path, mode: int) -> None:
+    with pytest.raises(SingleReadRefused) as exc_info:
+        write_once(root / "f", b"x", root=root, mode=mode)
+    assert _reason(exc_info) is SingleReadReason.INVALID_MODE
+    with pytest.raises(SingleReadRefused) as exc_info:
+        replace_atomic(root / "f", b"x", root=root, mode=mode)
+    assert _reason(exc_info) is SingleReadReason.INVALID_MODE
+    assert os.listdir(root) == []
 
 
 def test_write_once_refuses_path_outside_root(tmp_path: Path, root: Path) -> None:

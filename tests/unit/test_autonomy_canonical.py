@@ -51,9 +51,12 @@ def test_decimal_str_refuses_adjusted_beyond_18(raw: str) -> None:
         decimal_str(Decimal(raw))
 
 
-@pytest.mark.parametrize("raw", ["1E+18", "1E-18"])
-def test_decimal_str_accepts_adjusted_at_18(raw: str) -> None:
-    assert decimal_str(Decimal(raw)) == format(Decimal(raw).normalize(), "f")
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("1E+18", "1000000000000000000"), ("1E-18", "0.000000000000000001")],
+)
+def test_decimal_str_accepts_adjusted_at_18(raw: str, expected: str) -> None:
+    assert decimal_str(Decimal(raw)) == expected
 
 
 def test_decimal_str_refuses_non_decimal() -> None:
