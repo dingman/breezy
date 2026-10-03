@@ -157,6 +157,9 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
         "tests/unit/test_autonomy_cross_area.py::test_watchdog_unit_config_declares_notify_watchdog_restart_startlimit_and_notifyaccess_all",
         "tests/unit/test_autonomy_cross_area.py::test_watchdog_units_are_literal_and_exclude_trade_supervisor_engine",
         "tests/unit/test_autonomy_cross_area.py::test_window_cap_below_n_min_is_inconclusive",
+        "tests/unit/test_autonomy_demand.py::test_bad_demand_file_vetoes_venue[reader]",
+        "tests/unit/test_autonomy_demand.py::test_producer_demand_flood_cannot_exhaust_integrity_slot",
+        "tests/unit/test_autonomy_demand.py::test_producer_demand_write_is_restrictive_only[writer_api]",
         "tests/unit/test_autonomy_envelope.py::test_autonomy_alert_egress_not_widened",
         "tests/unit/test_autonomy_envelope.py::test_autonomy_never_imports_order_path",
         "tests/unit/test_autonomy_envelope.py::test_autonomy_never_reads_or_writes_operator_controls",
@@ -178,7 +181,6 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
         "tests/unit/test_launch_window_table.py::test_launch_path_units_end_before_next_fixed_point[existing_units]",
         "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[existing_units]",
         "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[known_overlap_breezy-discovery-pull]",
-        "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[known_overlap_breezy-quote-tape-ingest-frequent]",
     }
 )
 
@@ -204,7 +206,6 @@ ENVELOPE_PENDING_NAMES: Final[frozenset[str]] = frozenset(
         "test_infra_cause_never_retires",
         "test_lineage_policy_allowlist_is_literal_only",
         "test_mint_unlimited_by_k_max_but_one_per_day",
-        "test_producer_demand_flood_cannot_exhaust_integrity_slot",
         "test_registry_cas_and_idempotent_replay",
         "test_registry_hash_chain_and_triggers",
         "test_registry_hwm_refuses_regression",

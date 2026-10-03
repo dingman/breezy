@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
@@ -13,6 +15,17 @@ import pyarrow.parquet as pq
 import pytest
 
 from breezy.persistence.autonomy.canonical import canonical_json
+from breezy.persistence.autonomy.drill_marker import (
+    MAX_MARKER_BYTES,
+    DrillDetector,
+    DrillMarker,
+    DrillStep,
+    MarkerAbsent,
+    MarkerError,
+    MarkerErrorReason,
+    read_marker,
+    read_marker_at,
+)
 from breezy.persistence.autonomy.label_schema import (
     LABEL_SCHEMA_ID,
     LABEL_V1_ARROW_SCHEMA,
@@ -30,6 +43,8 @@ from breezy.persistence.autonomy.lineage import (
     model_class_of,
     root_model_class,
 )
+from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
+from breezy.persistence.autonomy.single_read import open_root
 from breezy.persistence.autonomy.wire import (
     WireRefusalReason,
     WireRefused,
@@ -406,3 +421,269 @@ def test_label_schema_survives_a_parquet_roundtrip() -> None:
     pq.write_table(table, sink)
     sink.seek(0)
     assert pq.read_table(sink).schema.equals(LABEL_V1_ARROW_SCHEMA)
+
+
+# --- drill_marker/v1 (5b) --------------------------------------------------------------------
+
+MARKER_KEYS = frozenset(
+    {
+        "schema", "registry_root", "venue", "episode_id", "child_id", "detector", "step",
+        "window_start_ns", "window_end_ns", "abort_record_sha256", "drill_clause_sha256", "ts_ns",
+    }
+)  # fmt: skip
+WINDOW_START_NS = CREATED_NS
+WINDOW_END_NS = CREATED_NS + 30 * 60 * 10**9
+
+
+def marker_wire(**overrides: Any) -> dict[str, Any]:
+    wire: dict[str, Any] = {
+        "schema": "drill_marker/v1",
+        "registry_root": "/home/jon/.local/share/breezy",
+        "venue": "polymarket_us",
+        "episode_id": "ep_2026_10_05",
+        "child_id": "pm_us_crh_fq_v1_d0001",
+        "detector": "DRILL_INJECT",
+        "step": "demote",
+        "window_start_ns": WINDOW_START_NS,
+        "window_end_ns": WINDOW_END_NS,
+        "abort_record_sha256": None,
+        "drill_clause_sha256": SHA_D,
+        "ts_ns": WINDOW_START_NS,
+    }
+    wire.update(overrides)
+    return wire
+
+
+def place_marker(root: Path, data: bytes, *, dir_mode: int = 0o700, file_mode: int = 0o600) -> Path:
+    folder = root / "registry" / "drill"
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(dir_mode)
+    path = folder / "marker.json"
+    path.write_bytes(data)
+    path.chmod(file_mode)
+    return path
+
+
+def read_at(root: Path) -> DrillMarker | MarkerAbsent | MarkerError:
+    rootfd = open_root(root)
+    try:
+        return read_marker_at(rootfd)
+    finally:
+        os.close(rootfd)
+
+
+def test_drill_marker_exact_set_and_absent_vs_dir_missing(tmp_path: Path) -> None:
+    # exact set: the 12 keys of AUT-7 r5, and nothing else
+    marker = DrillMarker.from_wire(marker_wire())
+    assert set(marker.to_wire()) == MARKER_KEYS
+    assert marker.to_wire() == marker_wire()
+    assert marker.detector is DrillDetector.DRILL_INJECT and marker.step is DrillStep.DEMOTE
+
+    # ENOENT on the directory is an error; ENOENT on the marker is the clean "absent"
+    assert read_at(tmp_path) == MarkerError(MarkerErrorReason.DIR_MISSING, "not_found")
+    assert read_marker(AutonomyPaths(tmp_path)) == MarkerError(
+        MarkerErrorReason.DIR_MISSING, "not_found"
+    )
+    (tmp_path / "registry" / "drill").mkdir(parents=True, mode=0o700)
+    (tmp_path / "registry" / "drill").chmod(0o700)
+    assert read_at(tmp_path) == MarkerAbsent()
+    assert read_marker(AutonomyPaths(tmp_path)) == MarkerAbsent()
+
+    # a present marker reads back as the record
+    place_marker(tmp_path, canonical_json(marker_wire()))
+    assert read_at(tmp_path) == marker
+    assert read_marker(AutonomyPaths(tmp_path)) == marker
+
+
+def test_drill_marker_golden_bytes() -> None:
+    raw = canonical_json(DrillMarker.from_wire(marker_wire()).to_wire())
+    assert raw == (
+        b'{"abort_record_sha256":null,"child_id":"pm_us_crh_fq_v1_d0001",'
+        b'"detector":"DRILL_INJECT","drill_clause_sha256":"' + SHA_D.encode() + b'",'
+        b'"episode_id":"ep_2026_10_05","registry_root":"/home/jon/.local/share/breezy",'
+        b'"schema":"drill_marker/v1","step":"demote","ts_ns":1791100800000000000,'
+        b'"venue":"polymarket_us","window_end_ns":1791102600000000000,'
+        b'"window_start_ns":1791100800000000000}'
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "valid"),
+    [
+        ({}, True),  # demote pairs with DRILL_INJECT
+        ({"detector": "DRILL_INJECT_HALT", "step": "halt"}, True),
+        (
+            {"detector": "DRILL_INJECT_HALT", "step": "abort_halt", "abort_record_sha256": SHA_A},
+            True,
+        ),
+        ({"detector": "DRILL_INJECT", "step": "halt"}, False),
+        ({"detector": "DRILL_INJECT_HALT", "step": "demote"}, False),
+        ({"detector": "DRILL_INJECT", "step": "abort_halt", "abort_record_sha256": SHA_A}, False),
+        ({"detector": "DRILL_INJECT_HALT", "step": "abort_halt"}, False),  # abort needs its record
+        ({"abort_record_sha256": SHA_A}, False),  # a non-abort step has none
+        ({"detector": "DRILL_OTHER"}, False),
+        ({"step": "rollback"}, False),
+    ],
+)
+def test_drill_marker_detector_step_and_abort_record_pairing(
+    overrides: dict[str, Any], valid: bool
+) -> None:
+    if valid:
+        assert DrillMarker.from_wire(marker_wire(**overrides)).to_wire() == marker_wire(**overrides)
+    else:
+        with pytest.raises(WireRefused) as caught:
+            DrillMarker.from_wire(marker_wire(**overrides))
+        assert caught.value.reason is WireRefusalReason.BAD_VALUE
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"schema": "drill_marker/v2"}, WireRefusalReason.BAD_VALUE),
+        ({"venue": "Poly US"}, WireRefusalReason.BAD_VALUE),
+        ({"child_id": "../x"}, WireRefusalReason.BAD_VALUE),
+        ({"episode_id": ""}, WireRefusalReason.BAD_VALUE),
+        ({"registry_root": "relative/path"}, WireRefusalReason.BAD_VALUE),
+        ({"registry_root": "/a\x00b"}, WireRefusalReason.BAD_VALUE),
+        ({"registry_root": 7}, WireRefusalReason.WRONG_TYPE),
+        ({"drill_clause_sha256": "zz"}, WireRefusalReason.BAD_VALUE),
+        ({"drill_clause_sha256": None}, WireRefusalReason.WRONG_TYPE),
+        ({"ts_ns": True}, WireRefusalReason.BOOL_AS_INT),
+        ({"ts_ns": -1}, WireRefusalReason.BAD_VALUE),
+        ({"window_start_ns": "1"}, WireRefusalReason.WRONG_TYPE),
+        ({"window_end_ns": WINDOW_START_NS}, WireRefusalReason.BAD_VALUE),  # empty window
+        ({"window_end_ns": WINDOW_START_NS - 1}, WireRefusalReason.BAD_VALUE),
+    ],
+)
+def test_drill_marker_refuses_inexact_values(
+    overrides: dict[str, Any], reason: WireRefusalReason
+) -> None:
+    with pytest.raises(WireRefused) as caught:
+        DrillMarker.from_wire(marker_wire(**overrides))
+    assert caught.value.reason is reason
+
+
+def test_drill_marker_refuses_missing_unknown_and_float_keys() -> None:
+    wire = marker_wire()
+    del wire["ts_ns"]
+    with pytest.raises(WireRefused) as missing:
+        DrillMarker.from_wire(wire)
+    assert missing.value.reason is WireRefusalReason.MISSING_KEY
+    with pytest.raises(WireRefused) as unknown:
+        DrillMarker.from_wire(marker_wire(extra=1))
+    assert unknown.value.reason is WireRefusalReason.UNKNOWN_KEY
+    with pytest.raises(WireRefused) as float_token:
+        parse_json_exact(canonical_json(marker_wire()).replace(b'"ts_ns":1', b'"ts_ns":1.0e0', 1))
+    assert float_token.value.reason is WireRefusalReason.FLOAT_TOKEN
+
+
+def test_drill_marker_other_detectors_marker_parses_and_is_left_to_the_detector(
+    tmp_path: Path,
+) -> None:
+    other = marker_wire(detector="DRILL_INJECT_HALT", step="halt")
+    place_marker(tmp_path, canonical_json(other))
+    result = read_at(tmp_path)
+    assert isinstance(result, DrillMarker) and result.detector is DrillDetector.DRILL_INJECT_HALT
+
+
+def test_drill_marker_registry_root_keys_the_marker_to_its_root(tmp_path: Path) -> None:
+    place_marker(tmp_path, canonical_json(marker_wire(registry_root=str(tmp_path))))
+    prod = read_marker(AutonomyPaths(tmp_path))
+    shadow = read_marker(ShadowPaths(tmp_path))
+    assert isinstance(prod, DrillMarker) and prod.registry_root == str(tmp_path)
+    assert shadow == prod  # the reader reports the bytes; the detector compares the root
+
+
+def _marker_is_a_symlink(root: Path) -> None:
+    target = root / "elsewhere.json"
+    target.write_bytes(canonical_json(marker_wire()))
+    folder = root / "registry" / "drill"
+    folder.mkdir(parents=True)
+    folder.chmod(0o700)
+    os.symlink(target, folder / "marker.json")
+
+
+def _marker_oversize(root: Path) -> None:
+    place_marker(root, b" " * (MAX_MARKER_BYTES + 1))
+
+
+def _marker_unparseable(root: Path) -> None:
+    place_marker(root, b"{nope")
+
+
+def _marker_group_writable(root: Path) -> None:
+    place_marker(root, canonical_json(marker_wire()), file_mode=0o660)
+
+
+def _marker_is_a_directory(root: Path) -> None:
+    (root / "registry" / "drill" / "marker.json").mkdir(parents=True)
+    (root / "registry" / "drill").chmod(0o700)
+
+
+def _marker_unknown_key(root: Path) -> None:
+    place_marker(root, canonical_json(marker_wire(extra=1)))
+
+
+def _dir_too_open(root: Path) -> None:
+    place_marker(root, canonical_json(marker_wire()), dir_mode=0o755)
+
+
+def _dir_group_writable(root: Path) -> None:
+    place_marker(root, canonical_json(marker_wire()), dir_mode=0o770)
+
+
+def _dir_is_a_symlink(root: Path) -> None:
+    real = root / "real_drill"
+    real.mkdir(mode=0o700)
+    (root / "registry").mkdir()
+    os.symlink(real, root / "registry" / "drill")
+
+
+def _dir_is_a_file(root: Path) -> None:
+    (root / "registry").mkdir()
+    (root / "registry" / "drill").write_bytes(b"x")
+
+
+MARKER_ERRORS = {
+    "marker_symlink": (_marker_is_a_symlink, MarkerErrorReason.FILE_UNSAFE, "symlink"),
+    "marker_oversize": (_marker_oversize, MarkerErrorReason.FILE_UNSAFE, "oversize"),
+    "marker_group_writable": (
+        _marker_group_writable,
+        MarkerErrorReason.FILE_UNSAFE,
+        "mode_too_open",
+    ),
+    "marker_is_a_directory": (_marker_is_a_directory, MarkerErrorReason.FILE_UNSAFE, "not_regular"),
+    "marker_unparseable": (_marker_unparseable, MarkerErrorReason.INVALID, "malformed_json"),
+    "marker_unknown_key": (_marker_unknown_key, MarkerErrorReason.INVALID, "unknown_key"),
+    "dir_mode_0755": (_dir_too_open, MarkerErrorReason.DIR_UNSAFE, "dir_mode"),
+    "dir_mode_0770": (_dir_group_writable, MarkerErrorReason.DIR_UNSAFE, "dir_mode"),
+    "dir_symlink": (_dir_is_a_symlink, MarkerErrorReason.DIR_UNSAFE, "symlink"),
+    "dir_is_a_file": (_dir_is_a_file, MarkerErrorReason.DIR_UNSAFE, "not_directory"),
+}
+
+
+@pytest.mark.parametrize("fault", sorted(MARKER_ERRORS))
+def test_drill_marker_every_unsafe_or_unreadable_state_is_an_error_never_absent(
+    tmp_path: Path, fault: str
+) -> None:
+    build, reason, detail = MARKER_ERRORS[fault]
+    build(tmp_path)
+    assert read_at(tmp_path) == MarkerError(reason, detail), fault
+
+
+def test_drill_marker_missing_root_is_an_error_not_absent(tmp_path: Path) -> None:
+    result = read_marker(AutonomyPaths(tmp_path / "no_such_root"))
+    assert result == MarkerError(MarkerErrorReason.DIR_MISSING, "not_found")
+
+
+def test_drill_marker_layout_matches_the_paths_builder(tmp_path: Path) -> None:
+    from breezy.persistence.autonomy import drill_marker
+
+    expected = AutonomyPaths(tmp_path).drill_marker()
+    built = tmp_path.joinpath(*drill_marker.MARKER_DIR_PARTS, drill_marker.MARKER_NAME)
+    assert built == expected
+
+
+def test_drill_marker_error_text_never_carries_a_path(tmp_path: Path) -> None:
+    _marker_is_a_symlink(tmp_path)
+    assert str(tmp_path) not in repr(read_at(tmp_path))

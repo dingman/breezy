@@ -238,6 +238,9 @@ source_modules = [
     "breezy.persistence.autonomy.verdict",
     "breezy.persistence.autonomy.lineage",
     "breezy.persistence.autonomy.label_schema",
+    "breezy.persistence.autonomy.rollback_journal",
+    "breezy.persistence.autonomy.demand",
+    "breezy.persistence.autonomy.drill_marker",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -261,6 +264,9 @@ source_modules = [
     "breezy.persistence.autonomy.entry_guard",
     "breezy.persistence.autonomy.verdict",
     "breezy.persistence.autonomy.lineage",
+    "breezy.persistence.autonomy.rollback_journal",
+    "breezy.persistence.autonomy.demand",
+    "breezy.persistence.autonomy.drill_marker",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false

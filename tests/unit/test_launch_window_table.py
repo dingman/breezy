@@ -13,9 +13,9 @@ Two contracts:
   and that bound is strictly before the next supervisor fixed point (STOP 16:40, pre-launch
   16:45, LAUNCH 16:50, window close 17:00, release 17:10).
 
-Two deployed timers overlap today (``KNOWN_OVERLAP_TIMERS``). They are carried as strict-xfail
-parameters owned by AUT-6 O-1, not exempted: ``[existing_units]`` still checks every other timer,
-and each carried parameter fails strict the moment its timer stops overlapping. Drop-ins under
+One deployed timer overlaps today (``KNOWN_OVERLAP_TIMERS``). It is carried as a strict-xfail
+parameter owned by AUT-6 O-1, not exempted: ``[existing_units]`` still checks every other timer,
+and the carried parameter fails strict the moment its timer stops overlapping. Drop-ins under
 ``<unit>.service.d`` and ``<unit>.timer.d`` are applied; an unparseable drop-in fails closed.
 
 The OnCalendar parser understands only the forms the repo uses (``*-*-* HH[,HH]:MM[:SS] UTC`` and
@@ -392,17 +392,15 @@ def deployed_launch_path_violations(directory: Path, units: frozenset[str]) -> l
 #: Deployed timers that overlap the window today. Each is carried as a strict-xfail parameter of
 #: ``test_no_unit_overlaps_launch_window`` (owner AUT-6:O-1, a ledger row each), not exempted: the
 #: parameter asserts the timer does not overlap, so it XPASSes, fails strict, and forces its row and
-#: parameter out in the commit that fixes the deploy unit. Both are findings for the coordinator.
+#: parameter out in the commit that fixes the deploy unit. It is a finding for the coordinator.
 #:
-#: * ``breezy-quote-tape-ingest-frequent`` (R13 / AUT-6 r15 O-1) fires ``*:0/15``, so at 16:30,
-#:   16:45 and 17:00, and ``TimeoutStartSec=1800`` keeps a run alive past 17:00. It is not an ARCH
-#:   section 5.2 row and cannot be one (it ends after the next fixed point).
 #: * ``breezy-discovery-pull`` fires at 16:52 by design under its own "light-job exemption", but
 #:   ``TimeoutStartSec=1800`` runs it to about 17:22 and ARCH section 5.2 lists no such row.
-KNOWN_OVERLAP_TIMERS: Final[tuple[str, ...]] = (
-    "breezy-quote-tape-ingest-frequent",
-    "breezy-discovery-pull",
-)
+#:
+#: ``breezy-quote-tape-ingest-frequent`` left this set when the O-1 deploy change (72eddbf6) removed
+#: its 16:30, 16:45 and 17:00 firings and bounded ``TimeoutStartSec`` to 780; it is now checked by
+#: ``[existing_units]`` like every other timer.
+KNOWN_OVERLAP_TIMERS: Final[tuple[str, ...]] = ("breezy-discovery-pull",)
 KNOWN_OVERLAP_PARAM_PREFIX: Final = "known_overlap_"
 
 
@@ -415,13 +413,6 @@ KNOWN_OVERLAP_PARAM_PREFIX: Final = "known_overlap_"
     "unit_set",
     [
         "existing_units",
-        pytest.param(
-            "known_overlap_breezy-quote-tape-ingest-frequent",
-            id="known_overlap_breezy-quote-tape-ingest-frequent",
-            marks=pytest.mark.xfail(
-                strict=True, raises=OwnerPending, reason="AUT-6:O-1; blocks none"
-            ),
-        ),
         pytest.param(
             "known_overlap_breezy-discovery-pull",
             id="known_overlap_breezy-discovery-pull",
@@ -634,14 +625,14 @@ def test_the_launch_path_table_matches_the_arch_firings() -> None:
     ].ends_after_s == hms("16:41:15")
 
 
-def test_the_r13_ingest_unit_has_an_effective_timeout_of_1800() -> None:
-    assert "breezy-quote-tape-ingest-frequent" in KNOWN_OVERLAP_TIMERS
+def test_the_ingest_unit_has_an_effective_timeout_of_780_and_is_not_carried() -> None:
+    assert "breezy-quote-tape-ingest-frequent" not in KNOWN_OVERLAP_TIMERS
     spec = parse_service(
         "breezy-quote-tape-ingest.service",
         (DEPLOYED_DIR / "breezy-quote-tape-ingest.service").read_text(encoding="utf-8"),
         DEPLOYED_DIR,
     )
-    assert spec.timeout_start_s == 1800  # R13: the effective TimeoutStartSec
+    assert spec.timeout_start_s == 780  # O-1 (72eddbf6): the effective TimeoutStartSec
     assert spec.service_type == "oneshot"
 
 
