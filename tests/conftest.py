@@ -36,6 +36,8 @@ from typing import Any, Protocol, cast
 
 import pytest
 
+pytest_plugins = ("tests.support.bwrap_host_phase",)
+
 _BLOCKED_MESSAGE = (
     "Network access is disabled in this test suite. "
     "If this test genuinely needs a real socket, mark it with "
@@ -88,6 +90,15 @@ OS_EGRESS_BLOCK_COMMAND = (
 #: :func:`pytest_sessionstart` below is now the enforcement point, and a
 #: constant owned by the thing that enforces it cannot drift from it.
 OS_EGRESS_BLOCK_ENV_VAR = "BREEZY_TEST_OS_EGRESS_BLOCK"
+BWRAP_HOST_PHASE_ENV_VAR = "BREEZY_BWRAP_HOST_PHASE"
+_BWRAP_HOST_PHASE_VALUE = os.environ.get(BWRAP_HOST_PHASE_ENV_VAR)
+_BWRAP_HOST_PHASE_ENV: dict[str, str] = {}
+if _BWRAP_HOST_PHASE_VALUE is not None:
+    _BWRAP_HOST_PHASE_ENV[BWRAP_HOST_PHASE_ENV_VAR] = _BWRAP_HOST_PHASE_VALUE
+if "PYTEST_PLUGINS" in os.environ:
+    _BWRAP_HOST_PHASE_ENV["PYTEST_PLUGINS"] = os.environ["PYTEST_PLUGINS"]
+if "PYTEST_ADDOPTS" in os.environ:
+    _BWRAP_HOST_PHASE_ENV["PYTEST_ADDOPTS"] = os.environ["PYTEST_ADDOPTS"]
 
 #: Repo-relative path of the launcher that applies the OS-level block (N5).
 EGRESS_BLOCK_LAUNCHER = "scripts/ci/run_tests_no_egress.sh"
@@ -273,6 +284,8 @@ def pytest_configure(config: pytest.Config) -> None:
         f"{_REAL_MONEY_ENV_VAR}=1 plus operator approval; deselected by default",
     )
     _install_pyo3_network_client_block()
+    if _bwrap_host_phase_requested():
+        return
     # Pin Nautilus's process-global Rust logger BEFORE any test can construct a
     # BacktestEngine. The first init wins and cannot be repeated
     # ($NT/common/component.pyx:1253-1367); a later capfd redirect does not
@@ -289,11 +302,24 @@ class _CanaryOutcomeLike(Protocol):
     def blocked(self) -> bool: ...
 
 
+class _Phase2AdmissionLike(Protocol):
+    @property
+    def admitted(self) -> bool: ...
+
+    @property
+    def reason(self) -> str: ...
+
+
+def _bwrap_host_phase_requested() -> bool:
+    return _BWRAP_HOST_PHASE_VALUE == "1"
+
+
 def execution_egress_abort_reason(
     *,
     egress_modules: Sequence[object],
     attested: bool,
     outcome: _CanaryOutcomeLike | None,
+    bwrap_host_phase: _Phase2AdmissionLike | None = None,
 ) -> str | None:
     """Barrier N2's rule: return why the session must stop, or ``None``.
 
@@ -309,6 +335,18 @@ def execution_egress_abort_reason(
     """
     if not egress_modules:
         return None
+    if bwrap_host_phase is not None:
+        if attested:
+            return (
+                f"{EXECUTION_EGRESS_ABORT_MARKER}: phase 1 attestation and phase 2 "
+                "are mutually exclusive"
+            )
+        if bwrap_host_phase.admitted:
+            return None
+        return (
+            f"{EXECUTION_EGRESS_ABORT_MARKER}: bwrap_host phase not admitted: "
+            f"{bwrap_host_phase.reason}"
+        )
     listing = "\n".join(str(module) for module in egress_modules)
     if not attested:
         return (
@@ -348,11 +386,42 @@ def _execution_egress_abort_reason_for_this_session() -> str | None:
     if not egress_modules:
         return None
     attested = os_egress_block_attested()
-    outcome = probe_real_egress_canary() if attested else None
+    bwrap_host_phase = None
+    if _bwrap_host_phase_requested():
+        from tests.support.bwrap_host_phase import (
+            Phase2ImportBlocker,
+            module_name_for_path,
+            phase2_admission,
+            phase2_evidence,
+        )
+
+        blocker = sys.meta_path[0] if sys.meta_path else None
+        if type(blocker) is Phase2ImportBlocker:
+            blocker.refuse(
+                name
+                for violation in egress_modules
+                for name in [module_name_for_path(str(violation.path))]
+                if name is not None
+            )
+        evidence = phase2_evidence()
+        bwrap_host_phase = phase2_admission(
+            environ=_BWRAP_HOST_PHASE_ENV,
+            meta_path=sys.meta_path,
+            modules=sys.modules,
+            egress_paths=[str(violation.path) for violation in egress_modules],
+            early_witness=evidence.early_witness,
+            positional_args=evidence.positional_args,
+            widening_options=evidence.widening_options,
+            ignore_collect_active=evidence.ignore_collect_active,
+        )
+    outcome = (
+        None if bwrap_host_phase is not None else probe_real_egress_canary() if attested else None
+    )
     return execution_egress_abort_reason(
         egress_modules=egress_modules,
         attested=attested,
         outcome=outcome,
+        bwrap_host_phase=bwrap_host_phase,
     )
 
 
