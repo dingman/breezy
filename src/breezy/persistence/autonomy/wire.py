@@ -183,3 +183,92 @@ def require_decimal_str(obj: Mapping[str, object], key: str) -> Decimal:
     if canonical != text:
         raise WireRefused(WireRefusalReason.BAD_VALUE, key)
     return value
+
+
+def require_list(obj: Mapping[str, object], key: str) -> list[object]:
+    """The value at ``key`` when it is a JSON array."""
+    value = _get(obj, key)
+    if not isinstance(value, list):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, key)
+    return value
+
+
+def require_object(obj: Mapping[str, object], key: str) -> dict[str, object]:
+    """The value at ``key`` when it is a JSON object."""
+    value = _get(obj, key)
+    if not isinstance(value, dict):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, key)
+    return value
+
+
+def as_object(value: object, field: str) -> dict[str, object]:
+    """``value`` when it is a JSON object (an array element, for example)."""
+    if not isinstance(value, dict):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+    return value
+
+
+def is_null(obj: Mapping[str, object], key: str) -> bool:
+    """True when ``key`` is present and ``null``; an absent key is refused as MISSING_KEY."""
+    return _get(obj, key) is None
+
+
+def optional_sha256(obj: Mapping[str, object], key: str) -> str | None:
+    """``None`` for a JSON null, else a lowercase 64-hex digest."""
+    return None if is_null(obj, key) else require_sha256(obj, key)
+
+
+def optional_decimal_str(obj: Mapping[str, object], key: str) -> Decimal | None:
+    """``None`` for a JSON null, else a canonical decimal string."""
+    return None if is_null(obj, key) else require_decimal_str(obj, key)
+
+
+def optional_int(obj: Mapping[str, object], key: str) -> int | None:
+    """``None`` for a JSON null, else a non-negative ``int``."""
+    return None if is_null(obj, key) else require_ns(obj, key)
+
+
+def optional_str(obj: Mapping[str, object], key: str) -> str | None:
+    """``None`` for a JSON null, else a ``str``."""
+    return None if is_null(obj, key) else require_str(obj, key)
+
+
+def check_int(value: object, field: str, *, minimum: int = 0) -> int:
+    """A constructed ``int`` (``bool`` refused) of at least ``minimum``."""
+    if isinstance(value, bool):
+        raise WireRefused(WireRefusalReason.BOOL_AS_INT, field)
+    if not isinstance(value, int):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+    if value < minimum:
+        raise WireRefused(WireRefusalReason.BAD_VALUE, field)
+    return value
+
+
+def check_decimal(value: object, field: str) -> Decimal:
+    """A constructed finite ``Decimal`` that has a canonical string form."""
+    if not isinstance(value, Decimal):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+    try:
+        decimal_str(value)
+    except CanonicalTypeError as exc:
+        raise WireRefused(WireRefusalReason.BAD_VALUE, field) from exc
+    return value
+
+
+def check_match(value: object, pattern: re.Pattern[str], field: str) -> str:
+    """A constructed ``str`` that fully matches ``pattern``."""
+    if not isinstance(value, str):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+    if pattern.fullmatch(value) is None:
+        raise WireRefused(WireRefusalReason.BAD_VALUE, field)
+    return value
+
+
+def check_sha256(value: object, field: str) -> str:
+    """A constructed lowercase 64-hex digest."""
+    return check_match(value, SHA256_RE, field)
+
+
+def decimal_wire(value: Decimal | None) -> str | None:
+    """The canonical string of ``value`` (``None`` stays ``None``)."""
+    return None if value is None else decimal_str(value)
