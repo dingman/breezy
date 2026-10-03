@@ -1,0 +1,6 @@
+{
+  "schema": "breezy_density_artefact_v1",
+  "applicable": false,
+  "reason": "forecast_quantile_ladder (SL-13, hypothesis H-FC-NBP-EV-2026-09) needs a real sha-pinned bootstrap-EMOS calibration artefact (breezy.analysis.nbp_calibration.write_artefact's NbpCalibrationArtefact JSON shape) before it can REGISTER; this sentinel is the committed density_artefact_path placeholder for pm_us_crh_fq_v1.json, a DRAFT_NOT_REGISTERED manifest, until that artefact is fitted and committed.",
+  "generated_by": "SL-13 (2026-09-29)"
+}

@@ -1,0 +1,20 @@
+{
+  "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+  "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+  "composition_kind": "continuous_rung_hold",
+  "d0_climate_day": "2026-09-20",
+  "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+  "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+  "family_id": "pm_us_crh_v4",
+  "live_orders_ruling": "not-a-ruling",
+  "stations": [
+    "LAX",
+    "MDW",
+    "MIA",
+    "SFO"
+  ],
+  "status": "REGISTERED",
+  "taker_fee_coefficient": "0.0695",
+  "trial_id_prefix": "continuous_rung_hold/trial/",
+  "venue": "polymarket_us"
+}

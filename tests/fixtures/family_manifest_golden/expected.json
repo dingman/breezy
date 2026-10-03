@@ -1,0 +1,887 @@
+{
+  "cases": {
+    "invalid/bad_d0_date.json[allow_draft=False]": {
+      "message": "<PATH>: d0_climate_day '2026-02-30' is not a real ISO-8601 date",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/bad_d0_date.json[allow_draft=True]": {
+      "message": "<PATH>: d0_climate_day '2026-02-30' is not a real ISO-8601 date",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/bad_status.json[allow_draft=False]": {
+      "message": "<PATH>: status 'PENDING' not one of ['DRAFT_NOT_REGISTERED', 'REGISTERED']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/bad_status.json[allow_draft=True]": {
+      "message": "<PATH>: status 'PENDING' not one of ['DRAFT_NOT_REGISTERED', 'REGISTERED']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/bad_utf8.json[allow_draft=False]": {
+      "message": "<PATH>: not valid JSON: 'utf-8' codec can't decode byte 0xff in position 15: invalid start byte",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/bad_utf8.json[allow_draft=True]": {
+      "message": "<PATH>: not valid JSON: 'utf-8' codec can't decode byte 0xff in position 15: invalid start byte",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_path_absolute.json[allow_draft=False]": {
+      "message": "<PATH>: boundary_artefact_path must be a relative path",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_path_absolute.json[allow_draft=True]": {
+      "message": "<PATH>: boundary_artefact_path must be a relative path",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_path_dotdot.json[allow_draft=False]": {
+      "message": "<PATH>: boundary_artefact_path must not contain a '..' component",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_path_dotdot.json[allow_draft=True]": {
+      "message": "<PATH>: boundary_artefact_path must not contain a '..' component",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_sha_malformed.json[allow_draft=False]": {
+      "message": "<PATH>: boundary_inputs_sha256 must be 64 lowercase hex characters",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_sha_malformed.json[allow_draft=True]": {
+      "message": "<PATH>: boundary_inputs_sha256 must be 64 lowercase hex characters",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/boundary_sha_unpinned.json[allow_draft=False]": {
+      "message": "<PATH>: boundary_inputs_sha256 is the unpinned all-zero placeholder; pass allow_draft=True to load anyway",
+      "raises": "UnpinnedBoundaryArtefactError"
+    },
+    "invalid/boundary_sha_unpinned.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "5fa77752c531ca036c5b5dcfc3670dc6f25fdf98d97469e59f2ce1e9ee40a12e",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "dc29fb89e5086a2b80e8714d97f02ea7d88ca26555aadb3811162501c39ab743"
+    },
+    "invalid/composition_bad.json[allow_draft=False]": {
+      "message": "<PATH>: composition_kind 'martingale' not one of ['continuous_rung_hold', 'current_rung_hold', 'forecast_ladder', 'forecast_quantile_ladder']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/composition_bad.json[allow_draft=True]": {
+      "message": "<PATH>: composition_kind 'martingale' not one of ['continuous_rung_hold', 'current_rung_hold', 'forecast_ladder', 'forecast_quantile_ladder']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_path_absolute.json[allow_draft=False]": {
+      "message": "<PATH>: density_artefact_path must be a relative path",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_path_absolute.json[allow_draft=True]": {
+      "message": "<PATH>: density_artefact_path must be a relative path",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_path_dotdot.json[allow_draft=False]": {
+      "message": "<PATH>: density_artefact_path must not contain a '..' component",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_path_dotdot.json[allow_draft=True]": {
+      "message": "<PATH>: density_artefact_path must not contain a '..' component",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_sha_malformed.json[allow_draft=False]": {
+      "message": "<PATH>: density_artefact_sha256 must be 64 lowercase hex characters",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_sha_malformed.json[allow_draft=True]": {
+      "message": "<PATH>: density_artefact_sha256 must be 64 lowercase hex characters",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/density_sha_unpinned.json[allow_draft=False]": {
+      "message": "<PATH>: density_artefact_sha256 is the unpinned all-zero placeholder; pass allow_draft=True to load anyway",
+      "raises": "UnpinnedDensityArtefactError"
+    },
+    "invalid/density_sha_unpinned.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "b7b2d895436d2e823a2b78f066bbca648de15ed9f08f18dc1ab603cfc04dddcf",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "e65c92eaba00dd3eecc68a10ca85e246eabbcfb2433c62807e63c00981c4d1cf"
+    },
+    "invalid/draft_status_real_shas.json[allow_draft=False]": {
+      "message": "<PATH>: family is DRAFT_NOT_REGISTERED; pass allow_draft=True to load anyway",
+      "raises": "UnregisteredFamilyManifestError"
+    },
+    "invalid/draft_status_real_shas.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "c0ca1c02915ccf84f58a6cdb8acf4fd7edffa6db56bf2ff29c7263f8f3529f4e",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "DRAFT_NOT_REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "169a74404dfa7465dbf8175cbe04cdb428be10af55b2f07ad92fce2895372ebc"
+    },
+    "invalid/exit_rule_empty.json[allow_draft=False]": {
+      "message": "<PATH>: exit_rule must be a non-empty string when present",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/exit_rule_empty.json[allow_draft=True]": {
+      "message": "<PATH>: exit_rule must be a non-empty string when present",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/exit_rule_non_string.json[allow_draft=False]": {
+      "message": "<PATH>: exit_rule must be a non-empty string when present",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/exit_rule_non_string.json[allow_draft=True]": {
+      "message": "<PATH>: exit_rule must be a non-empty string when present",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/json_array.json[allow_draft=False]": {
+      "message": "<PATH>: manifest must be a JSON object",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/json_array.json[allow_draft=True]": {
+      "message": "<PATH>: manifest must be a JSON object",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/missing_key.json[allow_draft=False]": {
+      "message": "<PATH>: missing required key(s): ['venue']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/missing_key.json[allow_draft=True]": {
+      "message": "<PATH>: missing required key(s): ['venue']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/no_leg_exit_false.json[allow_draft=False]": {
+      "message": "<PATH>: no_leg_exit must be the literal JSON `true` when present (got False); omit the key instead of writing `false`",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/no_leg_exit_false.json[allow_draft=True]": {
+      "message": "<PATH>: no_leg_exit must be the literal JSON `true` when present (got False); omit the key instead of writing `false`",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/no_leg_exit_integer_one.json[allow_draft=False]": {
+      "message": "<PATH>: no_leg_exit must be the literal JSON `true` when present (got 1); omit the key instead of writing `false`",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/no_leg_exit_integer_one.json[allow_draft=True]": {
+      "message": "<PATH>: no_leg_exit must be the literal JSON `true` when present (got 1); omit the key instead of writing `false`",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/no_leg_exit_without_exit_rule.json[allow_draft=False]": {
+      "message": "<PATH>: no_leg_exit is true but exit_rule is absent; a NO-leg exit declaration is incoherent without an armed exit_rule to extend",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/no_leg_exit_without_exit_rule.json[allow_draft=True]": {
+      "message": "<PATH>: no_leg_exit is true but exit_rule is absent; a NO-leg exit declaration is incoherent without an armed exit_rule to extend",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/non_string_field.json[allow_draft=False]": {
+      "message": "<PATH>: 'venue' must be a string",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/non_string_field.json[allow_draft=True]": {
+      "message": "<PATH>: 'venue' must be a string",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/not_json.json[allow_draft=False]": {
+      "message": "<PATH>: not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/not_json.json[allow_draft=True]": {
+      "message": "<PATH>: not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/ruling_bad_pattern.json[allow_draft=False]": {
+      "message": "<PATH>: live_orders_ruling must match '\\\\ARULING_[A-Za-z0-9_.-]{1,120}\\\\Z'",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/ruling_bad_pattern.json[allow_draft=True]": {
+      "message": "<PATH>: live_orders_ruling must match '\\\\ARULING_[A-Za-z0-9_.-]{1,120}\\\\Z'",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/ruling_non_string.json[allow_draft=False]": {
+      "message": "<PATH>: live_orders_ruling must match '\\\\ARULING_[A-Za-z0-9_.-]{1,120}\\\\Z'",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/ruling_non_string.json[allow_draft=True]": {
+      "message": "<PATH>: live_orders_ruling must match '\\\\ARULING_[A-Za-z0-9_.-]{1,120}\\\\Z'",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/ruling_on_draft.json[allow_draft=False]": {
+      "message": "<PATH>: family is DRAFT_NOT_REGISTERED; pass allow_draft=True to load anyway",
+      "raises": "UnregisteredFamilyManifestError"
+    },
+    "invalid/ruling_on_draft.json[allow_draft=True]": {
+      "message": "<PATH>: live_orders_ruling may only be declared on a REGISTERED manifest (status was 'DRAFT_NOT_REGISTERED')",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/stations_empty.json[allow_draft=False]": {
+      "message": "<PATH>: stations must be a non-empty list of strings",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/stations_empty.json[allow_draft=True]": {
+      "message": "<PATH>: stations must be a non-empty list of strings",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/stations_non_string.json[allow_draft=False]": {
+      "message": "<PATH>: stations must be a non-empty list of strings",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/stations_non_string.json[allow_draft=True]": {
+      "message": "<PATH>: stations must be a non-empty list of strings",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/stations_not_list.json[allow_draft=False]": {
+      "message": "<PATH>: stations must be a non-empty list of strings",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/stations_not_list.json[allow_draft=True]": {
+      "message": "<PATH>: stations must be a non-empty list of strings",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/terminal_bad_date.json[allow_draft=False]": {
+      "message": "<PATH>: terminal_climate_day '2026-13-01' is not a real ISO-8601 date",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/terminal_bad_date.json[allow_draft=True]": {
+      "message": "<PATH>: terminal_climate_day '2026-13-01' is not a real ISO-8601 date",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/terminal_non_string.json[allow_draft=False]": {
+      "message": "<PATH>: terminal_climate_day must be a string when present",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/terminal_non_string.json[allow_draft=True]": {
+      "message": "<PATH>: terminal_climate_day must be a string when present",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/terminal_precedes_d0.json[allow_draft=False]": {
+      "message": "<PATH>: terminal_climate_day '2026-09-19' precedes d0_climate_day '2026-09-20', which would make the family's scope empty",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/terminal_precedes_d0.json[allow_draft=True]": {
+      "message": "<PATH>: terminal_climate_day '2026-09-19' precedes d0_climate_day '2026-09-20', which would make the family's scope empty",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/theta_exponent.json[allow_draft=False]": {
+      "message": "<PATH>: taker_fee_coefficient '6.95E-2' must be a plain decimal fraction matching '\\\\A0\\\\.\\\\d{1,6}\\\\Z' (e.g. \"0.0695\")",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/theta_exponent.json[allow_draft=True]": {
+      "message": "<PATH>: taker_fee_coefficient '6.95E-2' must be a plain decimal fraction matching '\\\\A0\\\\.\\\\d{1,6}\\\\Z' (e.g. \"0.0695\")",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/theta_zero.json[allow_draft=False]": {
+      "message": "<PATH>: taker_fee_coefficient '0.0' must be strictly between 0 and 1",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/theta_zero.json[allow_draft=True]": {
+      "message": "<PATH>: taker_fee_coefficient '0.0' must be strictly between 0 and 1",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/unknown_key.json[allow_draft=False]": {
+      "message": "<PATH>: unknown key(s): ['surprise']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "invalid/unknown_key.json[allow_draft=True]": {
+      "message": "<PATH>: unknown key(s): ['surprise']",
+      "raises": "FamilyManifestValidationError"
+    },
+    "manifests/kalshi_crh_v1.json[allow_draft=False]": {
+      "message": "<PATH>: family is DRAFT_NOT_REGISTERED; pass allow_draft=True to load anyway",
+      "raises": "UnregisteredFamilyManifestError"
+    },
+    "manifests/kalshi_crh_v1.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_kalshi_crh_v1.json",
+        "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "composition_kind": "current_rung_hold",
+        "d0_climate_day": "2099-01-01",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "exit_rule": null,
+        "family_id": "kalshi_crh_v1",
+        "live_orders_ruling": null,
+        "manifest_sha256": "57ade863a56d535c808751d4cba74bb7130c3b50ee862386a8c3cb587f42adc0",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "DRAFT_NOT_REGISTERED",
+        "taker_fee_coefficient": "0.06",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "kalshi:current_rung_hold/trial/",
+        "venue": "kalshi"
+      },
+      "sha256": "3029699cff3df07d8474234b24b950b895ca0b9b01c1e70ff9354b8d4b6a3834"
+    },
+    "manifests/pm_us_crh_cont.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-12",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_cont",
+        "live_orders_ruling": null,
+        "manifest_sha256": "1e2f22d6e1c2d1d650903f4a46c07f3dc70d7c9657fd3ac35c9f7715cf5426b1",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.06",
+        "terminal_climate_day": "2026-09-19",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "4b618840f3340957727b0217df16c63e41741f28d2ef6f4f5a73e78c12ebc0d7"
+    },
+    "manifests/pm_us_crh_cont.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-12",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_cont",
+        "live_orders_ruling": null,
+        "manifest_sha256": "1e2f22d6e1c2d1d650903f4a46c07f3dc70d7c9657fd3ac35c9f7715cf5426b1",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.06",
+        "terminal_climate_day": "2026-09-19",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "4b618840f3340957727b0217df16c63e41741f28d2ef6f4f5a73e78c12ebc0d7"
+    },
+    "manifests/pm_us_crh_exit_v4.json[allow_draft=False]": {
+      "message": "<PATH>: family is DRAFT_NOT_REGISTERED; pass allow_draft=True to load anyway",
+      "raises": "UnregisteredFamilyManifestError"
+    },
+    "manifests/pm_us_crh_exit_v4.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "composition_kind": "current_rung_hold",
+        "d0_climate_day": "2099-01-01",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_exit_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "67ff9fd450d09a3dbb8524fc119d79e24376e955aab36d1780a9aa7b39c8494c",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "DRAFT_NOT_REGISTERED",
+        "taker_fee_coefficient": "0.06",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "current_rung_hold_exit_v4/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "6c482ffed037d004e99fe73b756ab567fc1496f4771f1d199de94c70c612d49c"
+    },
+    "manifests/pm_us_crh_fq_v1.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
+        "boundary_inputs_sha256": "f4b5d9df270599f55684e6ef4cb18fc440594cb23b92ecdf8bbec3dec1adc02f",
+        "composition_kind": "forecast_quantile_ladder",
+        "d0_climate_day": "2026-10-02",
+        "density_artefact_path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+        "density_artefact_sha256": "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_fq_v1",
+        "live_orders_ruling": "RULING_operator_fq_live_real_orders_2026-10-01",
+        "manifest_sha256": "8e1217fd2037ca4ea070c3f15a081168c591ad450ab347ed7319ede2f524b9d0",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "forecast_quantile_ladder/trial/pm_us_crh_fq_v1/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "7460af9006f5b78b628fd99507d5c5ff4914d9e13285ef61668c7b76ff4f801f"
+    },
+    "manifests/pm_us_crh_fq_v1.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
+        "boundary_inputs_sha256": "f4b5d9df270599f55684e6ef4cb18fc440594cb23b92ecdf8bbec3dec1adc02f",
+        "composition_kind": "forecast_quantile_ladder",
+        "d0_climate_day": "2026-10-02",
+        "density_artefact_path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+        "density_artefact_sha256": "9c0b6d6e66a587c1b4e14e5f95ff5cedb3c7195f62f8ad4238191fdd75923a5e",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_fq_v1",
+        "live_orders_ruling": "RULING_operator_fq_live_real_orders_2026-10-01",
+        "manifest_sha256": "8e1217fd2037ca4ea070c3f15a081168c591ad450ab347ed7319ede2f524b9d0",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "forecast_quantile_ladder/trial/pm_us_crh_fq_v1/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "7460af9006f5b78b628fd99507d5c5ff4914d9e13285ef61668c7b76ff4f801f"
+    },
+    "manifests/pm_us_crh_v2.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "current_rung_hold",
+        "d0_climate_day": "2026-09-05",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v2",
+        "live_orders_ruling": null,
+        "manifest_sha256": "077e5c1c4eef4aa475cf7c1e8405b027d4415e89c78bd8226e195e48a0443449",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.06",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "current_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "28741f6dea1948926bf64dae5c936a205d1073b35da6304281a6678e46c00403"
+    },
+    "manifests/pm_us_crh_v2.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "current_rung_hold",
+        "d0_climate_day": "2026-09-05",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v2",
+        "live_orders_ruling": null,
+        "manifest_sha256": "077e5c1c4eef4aa475cf7c1e8405b027d4415e89c78bd8226e195e48a0443449",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.06",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "current_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "28741f6dea1948926bf64dae5c936a205d1073b35da6304281a6678e46c00403"
+    },
+    "manifests/pm_us_crh_v4.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "2bdfc28a2a69e48d6a23f9ed468c18a7729903af68c80cc75582ae2ddc998d94",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "e01cac482002988a77ca711a874b0b516019e075c6e56316a11423a4356134ac"
+    },
+    "manifests/pm_us_crh_v4.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "2bdfc28a2a69e48d6a23f9ed468c18a7729903af68c80cc75582ae2ddc998d94",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "e01cac482002988a77ca711a874b0b516019e075c6e56316a11423a4356134ac"
+    },
+    "tmp/mechanism_marker[allow_draft=False]": {
+      "message": "<DIR> carries mechanism_test_only=true and cannot be read as a PREREG, family-manifest, or tally input",
+      "raises": "MechanismTestIneligibleError"
+    },
+    "tmp/mechanism_marker[allow_draft=True]": {
+      "message": "<DIR> carries mechanism_test_only=true and cannot be read as a PREREG, family-manifest, or tally input",
+      "raises": "MechanismTestIneligibleError"
+    },
+    "tmp/missing_file_existing_parent[allow_draft=False]": {
+      "message": "[Errno 2] No such file or directory: '<PATH>'",
+      "raises": "FileNotFoundError"
+    },
+    "tmp/missing_file_existing_parent[allow_draft=True]": {
+      "message": "[Errno 2] No such file or directory: '<PATH>'",
+      "raises": "FileNotFoundError"
+    },
+    "tmp/missing_parent[allow_draft=False]": {
+      "message": "[Errno 2] No such file or directory: '<PATH>'",
+      "raises": "FileNotFoundError"
+    },
+    "tmp/missing_parent[allow_draft=True]": {
+      "message": "[Errno 2] No such file or directory: '<PATH>'",
+      "raises": "FileNotFoundError"
+    },
+    "tmp/parent_is_file[allow_draft=False]": {
+      "message": "<DIR> is not a directory; refusing it as a PREREG or tally input",
+      "raises": "MechanismTestIneligibleError"
+    },
+    "tmp/parent_is_file[allow_draft=True]": {
+      "message": "<DIR> is not a directory; refusing it as a PREREG or tally input",
+      "raises": "MechanismTestIneligibleError"
+    },
+    "tmp/symlink_escape_boundary[allow_draft=False]": {
+      "message": "<PATH>: boundary_artefact_path 'deploy/families/link/x.json' escapes deploy/families",
+      "raises": "FamilyManifestValidationError"
+    },
+    "tmp/symlink_escape_boundary[allow_draft=True]": {
+      "message": "<PATH>: boundary_artefact_path 'deploy/families/link/x.json' escapes deploy/families",
+      "raises": "FamilyManifestValidationError"
+    },
+    "tmp/symlink_escape_density[allow_draft=False]": {
+      "message": "<PATH>: density_artefact_path 'deploy/families/link/x.json' escapes deploy/families",
+      "raises": "FamilyManifestValidationError"
+    },
+    "tmp/symlink_escape_density[allow_draft=True]": {
+      "message": "<PATH>: density_artefact_path 'deploy/families/link/x.json' escapes deploy/families",
+      "raises": "FamilyManifestValidationError"
+    },
+    "valid_variants/exit_rule_and_no_leg_exit.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": "intraday_v1",
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "370f8a79d776c44231ba8f42e4e0b62df10a007dc7eafe708870a59f2bea953a",
+        "no_leg_exit": true,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "64c53ffd61a5eb99662e87be9b9417e5ca6c62824a4c5fc1485a5f7a828d91f5"
+    },
+    "valid_variants/exit_rule_and_no_leg_exit.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": "intraday_v1",
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "370f8a79d776c44231ba8f42e4e0b62df10a007dc7eafe708870a59f2bea953a",
+        "no_leg_exit": true,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "64c53ffd61a5eb99662e87be9b9417e5ca6c62824a4c5fc1485a5f7a828d91f5"
+    },
+    "valid_variants/registered_with_ruling.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": "RULING_demo_2026-10-01",
+        "manifest_sha256": "336749ee51e1761572b18d4d770860eb4224a0fdc65bd83b94bb12fe1f013a69",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "65ca4bb1091d923bca5f8366cf7c5c1bd728f5720561d701e90a066e5a1d9bb4"
+    },
+    "valid_variants/registered_with_ruling.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": "RULING_demo_2026-10-01",
+        "manifest_sha256": "336749ee51e1761572b18d4d770860eb4224a0fdc65bd83b94bb12fe1f013a69",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": null,
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "65ca4bb1091d923bca5f8366cf7c5c1bd728f5720561d701e90a066e5a1d9bb4"
+    },
+    "valid_variants/terminal_after_d0.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "bc41ac9a2b0c9463f445c01b1c54cae004787b2549b89084645b56bb07f97039",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": "2026-12-31",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "fade891632c2a0ec1f2a8b073f5110af365fc3df72c17500394fdeb54c639873"
+    },
+    "valid_variants/terminal_after_d0.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "bc41ac9a2b0c9463f445c01b1c54cae004787b2549b89084645b56bb07f97039",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": "2026-12-31",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "fade891632c2a0ec1f2a8b073f5110af365fc3df72c17500394fdeb54c639873"
+    },
+    "valid_variants/terminal_equals_d0.json[allow_draft=False]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "6f591f75f35d4f2866af5a5fe5744f2f3423648390dabeb452df69ad53b986a4",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": "2026-09-20",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "0b066462c1d8eecb2c7bbb4a92f2d231ee8e54afee8c67b4eec764e186eb0011"
+    },
+    "valid_variants/terminal_equals_d0.json[allow_draft=True]": {
+      "parsed": {
+        "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+        "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
+        "composition_kind": "continuous_rung_hold",
+        "d0_climate_day": "2026-09-20",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
+        "exit_rule": null,
+        "family_id": "pm_us_crh_v4",
+        "live_orders_ruling": null,
+        "manifest_sha256": "6f591f75f35d4f2866af5a5fe5744f2f3423648390dabeb452df69ad53b986a4",
+        "no_leg_exit": false,
+        "stations": [
+          "LAX",
+          "MDW",
+          "MIA",
+          "SFO"
+        ],
+        "status": "REGISTERED",
+        "taker_fee_coefficient": "0.0695",
+        "terminal_climate_day": "2026-09-20",
+        "trial_id_prefix": "continuous_rung_hold/trial/",
+        "venue": "polymarket_us"
+      },
+      "sha256": "0b066462c1d8eecb2c7bbb4a92f2d231ee8e54afee8c67b4eec764e186eb0011"
+    }
+  }
+}
