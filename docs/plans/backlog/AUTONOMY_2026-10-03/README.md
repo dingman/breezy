@@ -209,6 +209,7 @@ Shared contracts, defined once in the umbrella architecture (`AUTONOMY_ARCHITECT
 | ID | Plan | Reviewers | Final | Status |
 |---|---|---|---|---|
 | ARCH | [AUTONOMY_ARCHITECTURE.md](AUTONOMY_ARCHITECTURE.md) **FROZEN Rev 9.2** sha `1b288d0e…` (+ [errata](reviews/ARCH-ERRATA-rev9_2.md)) | architect 97 · trading-bot-architect 96 · security-reviewer 96 | 96 | FROZEN (12 review rounds) |
+| ARCH-0 | seam A [r5](ARCH-0-seamA_plan_r5.md) (persistence core, 27 seams) · seam B [r5](ARCH-0-seamB_plan_r5.md) (sandbox wrapper + gate phase 2 + E-8 helper, 7 seams) | architect · security-reviewer (both seams APPROVE r4; r5 text-verified) | — | **READY, awaiting operator approval** (rulings in [reviews/ARCH-0-r1-merged.md](reviews/ARCH-0-r1-merged.md); errata E-7d, E-7e, E-14 filed) |
 | AUT-1 | [r12](AUT-1-data-capture_plan_r12.md) sha `a2ae906a…` | trading-bot-architect 97 · silent-failure-hunter 96 | 96 | **READY** (native-first, 12 rounds; replaces r8; build items in reviews/AUT-1-r12-final.md; errata E-12) |
 | AUT-2 | [r7](AUT-2-outcome-labeling_plan_r7.md) sha `d935e0f2…` | prediction-market-reviewer 96 · silent-failure-hunter 95 | 95 | **READY** (7 rounds; binding build items in reviews/AUT-2-r7-final.md) |
 | AUT-3 | [r6](AUT-3-retraining_plan_r6.md) sha `688dab87…` | mle-reviewer 96 · prediction-market-reviewer 95 | 95 | **READY** (6 rounds; build-time MEDIUM: guard `Persistent=true` catch-up firings against the launch window and blackout) |
