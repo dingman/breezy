@@ -1,0 +1,16 @@
+# AUT-7 r4 (final round): merged (coordinator). security-reviewer 93, architect 90 (1 HIGH). Final 90. Polish to r5.
+- **G1 [arch H-1]**: Adopt errata E-5 (restorative RESUME after a failed drill close; see `reviews/ARCH-ERRATA-rev9_2.md`).
+  - Add §3.6.6 step 4.
+  - Add a K-20 risk entry with the outage bound and the ETA effect.
+  - Add `test_drill_close_target_failure_after_1700_exit_path` and `test_restorative_resume_never_for_child_or_after_genuine_fault`.
+- **G2 [sec 1]**: E9 also fails when any accepted non-DRILL DEMOTE/HALT-mapped FAIL, or an exec-store halt, names F since its DRILL_PROMOTE. Add `test_drill_close_refused_when_genuine_fail_follows_drill_halt`.
+- **G3 [arch M-1]**: E9 wording: "passes iff the class is DRILL, or ROLLBACK_FAILED with `trigger_cause_class=DRILL`; otherwise G's sha ≠ F's". Add a RED test.
+- **G4 [sec 2]**: Every intraday pass first unlinks a marker whose step row is already committed or whose window has expired, journals it, and then evaluates. Test it.
+- **G5 [sec 3]**: Add gate G-13: the newest `registry_composed` line for the incumbent at its last LAUNCH carries the row's artefact sha. WP6 depends on WP3 being live.
+- **G6 [sec 4]**: The 16:45 pass mirrors the exec store first, and G-1 and E8 read the fresh mirror (errata E-2). G-12 includes the E3/E7 live-orders ruling check on the child.
+- **G7 [arch M-2]**: State the effect of an abandoned episode on n and the KILL clock in K-15 and §3.6.7, and hand it to AUT-4's `eta_date`.
+- **G8 [arch L-1–L-4]: smaller items.**
+  - G-2 uses a strict ">" evaluated at write time, with the window boundary pinned in a test.
+  - Correct G-7: STOP is at 16:40.
+  - State the A-4 mint-starvation bound.
+  - Clarify that §3.3.3's INCONCLUSIVE case applies only to branch (a).

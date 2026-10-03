@@ -52,13 +52,14 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | ING-2-AMEND2 | 9730f1e | 09-29 ~09:45Z post-rotation ingest: `extend_dedupe:` shows `custom_depth_truncation:<n>/0` + `flat_root=none`, deferred_instances=0, ≤600 s, cgroup `memory.peak` ≤2G (measured directly, never from RSS) → remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. `flat_root=custom_depth_truncation` WARN = native flat write happened → open structural fix |
 | BL-10 | fdf28aa | Boot clean PROVEN 09-28 16:50Z (0 FATAL, permit issued ttl 10 h). Owed: first create-path order shows no permit refusal (none possible while A1 halt SET). Also fixes a real budget leak (raising `build_order_body` spent permit budget) |
 | FAILURE-KIND-DURABLE | bdba573 | Next node spawn; a restart with an OPEN AMBIGUOUS intent names the durable kind (not `none`) in the stale CRITICAL |
-| RA-9f-A | 16f403d | DONE live 18:25Z: ledger line 4 `H-OFFWINDOW-T4-2026-09 UNDERPOWERED_NOT_REGISTERED` freeze 16f403d; duplicate refused, bytes unchanged. Backup in session scratchpad |
 | RECON-MIA-0913 | 97c4325 | 09-29 15:20Z exit study: per-trial reconciliation `matched=True` with `n_fee_unverified_excluded=1` |
 | AUD-07 gate | 97c4325 | `--stage 80k` refused while `20k/DEFERRED` non-empty (repo copy; the pinned a40d433 copy drives the drain) |
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
-| CF-11 | merged, gate green | `src/` formatted (104 files); `exec/client.py` left unformatted (formatting surfaces 6 noqa-sensitive findings) |
 | CF-12 W0+W1 | 1792e8c | Gate green 09-29 01:55Z, pushed. In-gate ratchet `tests/unit/test_mypy_ratchet.py`; runtime+strategy now CLEAN (16 errors, triage all-unreachable); CI mypy advisory. Plan `docs/plans/CF-12_MYPY_BURNDOWN_Rev2_2026-09-29.md` |
+
+### AUTONOMY (operator objective 2026-10-03; `docs/evidence/RULING_operator_full_autonomy_2026-10-03.md`)
+Backlog and plans: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`. ARCH Rev 9.2 is FROZEN, with errata E-1 to E-10, E-7a and E-8a. All 7 plans READY (2 blind reviewers, ≥95, 0 CRIT/HIGH). None is executed, and the scores are unchanged (capture 2, labeling 1, retraining 0, eval 2, promotion 1, drift 2, rollback 2). An area closes only at an independently scored 3 after its live proof. Next: build in dependency order, carrying each `reviews/*-final.md` item.
 
 ### BUILD
 | ID | Sev | Open work (exact) | Source |
