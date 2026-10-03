@@ -1815,3 +1815,51 @@ bypassed entirely while the override is set.
 
 **Rollback:** remove the `Environment=` line, `daemon-reload`; the
 recorder returns to the derived cadence at its next rotation.
+
+## `breezy-autonomy-bwrap` — the shared sandbox wrapper (ARCH-0 seam B, WP-B2b-2)
+
+`deploy/systemd/breezy-autonomy-bwrap ROW CMD [ARGS...]` runs `CMD` under
+`/usr/bin/bwrap` with the sandbox shape of table row `ROW`
+(`src/breezy/runtime/autonomy_sandbox/table.py`, `AUTONOMY_BWRAP_TABLE`). It is a
+stdlib-only script (`#!/home/jon/breezy/.venv/bin/python3 -I`) that only calls
+`breezy.runtime.autonomy_sandbox.bwrap.main`. **This section documents the file; no unit
+is installed or wrapped by it yet** (the seam B rows run only as transient
+`systemd-run --unit=<row>` units).
+
+**Unit line shape** (the unit-file lint, `unit_lint.lint_units`, enforces it):
+
+```
+ExecStart=/usr/bin/timeout -k <K> <T> [/usr/bin/flock -w <N> <path>] \
+    /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap <row> <cmd> [args...]
+```
+
+No `+`/`!` prefix, no `ExecStartPost=`, `OnFailure=breezy-autonomy-failed@%n.service`
+(never `breezy-study-failed@`), `NotifyAccess=all` on `E7A_R2_NOTIFY` rows and one
+`LoadCredential=` per credential on `E7A_R2_RECONCILE` rows. `ExecStartPre=` lines are only,
+in this order: `timeout -k 1 4` `install -d`/`chmod` lines; iff the row has `studies_lock`,
+exactly `-/usr/bin/timeout -k 1 4 /usr/bin/touch %t/breezy-studies.lock` (`touch`, never
+`install`: it replaces the inode); iff the row has `bus_reads`, last, exactly
+`-/usr/bin/timeout -k 2 <B+3> .../breezy-autonomy-bwrap --bus-snapshot <row>` (the `-` is
+required: a failed pre step must not skip `ExecStart`). Every pre line's `T + K` must be below
+`TimeoutStartSec`; `unit_lint.start_phase_bound_s(unit_path)` sums them for the E-9 owners.
+
+**Exit codes.** `64` bad `ROW` syntax or no command; `78` configuration refused (invalid table,
+unknown row, calling cgroup not a unit the row lists, bind or `/run` re-bind integrity, malformed
+`tmpfs_size_bytes`); `127` command or `bwrap` missing; `126` command present but not runnable.
+stderr carries a reason code, never a path. Fallback to an unwrapped exec exists only for
+`NOTIFIER_FALLBACK_ROWS` (empty), only after every check above, behind a 2 s preflight, and sets
+`BREEZY_AUTONOMY_SANDBOX_DEGRADED`.
+
+**Argv** (exact order, one `bwrap` exec, no shell): `--unshare-user --disable-userns
+--assert-userns-disabled --unshare-pid`; `--ro-bind / /`; `--tmpfs /run`; `--dev /dev`;
+`--proc /proc` (omitted on `host_proc` rows); `--size N --tmpfs /tmp` (`N` = the row's
+`tmpfs_size_bytes`, else 256 MiB); `--tmpfs <home>` then ro re-binds of the repo, the interpreter
+prefix (if under home), the data root (and the fixture base on `E7_FIXTURE_ROOT` rows); the
+per-row `/run` re-binds; `--remount-ro /run`; config `--ro-bind-fd`; data `--bind-fd`;
+`--remount-ro <home>`; `--new-session --die-with-parent`; `--chdir`; the fixed `--setenv`s and
+`--unsetenv BREEZY_AUTONOMY_SANDBOX_DEGRADED`, then each `credential_env` item; `--`; the command.
+
+**The unit check is integrity against misconfiguration, not an authorisation boundary:** any
+process that can run the wrapper from inside a listed unit's cgroup already runs as that unit.
+The wrapper never creates a bind source (a missing studies lock is exit 78; the unit's `touch`
+pre line creates it). The bus-snapshot handoff (`--bus-snapshot`) lands in WP-B2c.

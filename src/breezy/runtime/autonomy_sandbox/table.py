@@ -32,10 +32,17 @@ DEFAULT_BIND_BASE: Final = "data_root"
 ALTERNATE_BIND_BASES: Final[Mapping[str, str]] = MappingProxyType(
     {"aut4_fixture": ".local/share/breezy-autonomy-fixture"}
 )
+#: ``--size`` for ``--tmpfs /tmp`` on a row that sets no ``tmpfs_size_bytes`` (E-13 ER-1),
+#: and the largest value any row may set. A malformed value fails closed (exit 78).
+DEFAULT_TMPFS_SIZE_BYTES: Final = 256 * 1024**2
+MAX_TMPFS_SIZE_BYTES: Final = 16 * 1024**3
 NOTIFIER_FALLBACK_ROWS: Final[frozenset[str]] = frozenset()
 AUTONOMY_OWNED_UNITS: Final[frozenset[str]] = frozenset()
 #: unit -> its E-7a rule-5 citation. Empty in seam B; filled by AUT-1.
 UNWRAPPED_RESIDUAL_UNITS: Final[Mapping[str, str]] = MappingProxyType({})
+#: unit -> owning-plan citation. Row units that are NOT autonomy-owned and only have their
+#: wrapper lines linted (B6-R4). Empty in seam B; AUT-1 adds the recorder in its own commit.
+WRAPPER_LINE_ONLY_UNITS: Final[Mapping[str, str]] = MappingProxyType({})
 
 #: ``credential_env`` keys are applied by ``--setenv`` AFTER the fixed
 #: environment, so a table edit could otherwise override it (B5-R4).
@@ -251,8 +258,10 @@ def _check_identity(key: str, row: BwrapRow) -> None:
         if type(getattr(row, flag)) is not bool:
             raise _fail(row.name, f"{flag} must be a bool")
     size = row.tmpfs_size_bytes
-    if size is not None and (type(size) is not int or size <= 0):
-        raise _fail(row.name, "tmpfs_size_bytes must be a positive int or None")
+    if size is not None and (type(size) is not int or not 0 < size <= MAX_TMPFS_SIZE_BYTES):
+        raise _fail(
+            row.name, "tmpfs_size_bytes must be an int in (0, MAX_TMPFS_SIZE_BYTES] or None"
+        )
 
 
 def _check_labels(row: BwrapRow) -> None:
@@ -404,11 +413,28 @@ def _check_residual(
             raise TableError(f"residual unit {unit!r} needs an E-7a rule-5 citation")
 
 
+def _check_line_only(
+    table: Mapping[str, BwrapRow],
+    owned_units: frozenset[str],
+    residual_units: Mapping[str, str],
+    line_only_units: Mapping[str, str],
+) -> None:
+    row_units = frozenset(unit for row in table.values() for unit in row.units)
+    for unit, citation in line_only_units.items():
+        if unit not in row_units:
+            raise TableError(f"wrapper-line-only unit {unit!r} must be listed by a row")
+        if unit in owned_units or unit in residual_units:
+            raise TableError(f"wrapper-line-only unit {unit!r} must not be owned or residual")
+        if not isinstance(citation, str) or not citation:
+            raise TableError(f"wrapper-line-only unit {unit!r} needs an owning-plan citation")
+
+
 def validate_table(
     table: Mapping[str, BwrapRow] = AUTONOMY_BWRAP_TABLE,
     *,
     owned_units: frozenset[str] = AUTONOMY_OWNED_UNITS,
     residual_units: Mapping[str, str] = UNWRAPPED_RESIDUAL_UNITS,
+    wrapper_line_only_units: Mapping[str, str] = WRAPPER_LINE_ONLY_UNITS,
 ) -> None:
     """Raise ``TableError`` on the first rule the table breaks; return ``None`` if sound."""
     if not table:
@@ -420,3 +446,4 @@ def validate_table(
         _check_binds(row)
         _check_bus(row)
     _check_residual(table, owned_units, residual_units)
+    _check_line_only(table, owned_units, residual_units, wrapper_line_only_units)

@@ -141,7 +141,7 @@ def forbidden_dirs(roots: SandboxRoots) -> frozenset[Ident]:
     return frozenset(idents)
 
 
-def _base_path(row: BwrapRow, roots: SandboxRoots) -> Path:
+def bind_base_path(row: BwrapRow, roots: SandboxRoots) -> Path:
     if row.bind_base == DEFAULT_BIND_BASE:
         return roots.data_root
     if row.bind_base not in ALTERNATE_BIND_BASES:
@@ -186,7 +186,7 @@ def _open_data_binds(
 ) -> tuple[OpenedBind, ...]:
     if not row.binds:
         return ()
-    base_path = _base_path(row, roots)
+    base_path = bind_base_path(row, roots)
     base = _walk_registered(stack, base_path, "dir")
     opened: list[OpenedBind] = []
     for rel in row.binds:

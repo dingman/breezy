@@ -10,7 +10,8 @@ before any of them may load and must keep working when they are broken.
 ``breezy.runtime``: importing any submodule runs it first, so an eager import
 here would put every submodule's dependencies on the wrapper's own path.
 
-Modules landed so far (WP-B2b-1): ``table`` (rows and ``validate_table``),
-``binds`` (nofollow walks and fd-opened bind sources) and ``run_mounts`` (the
-exact per-row ``/run`` re-bind set). The wrapper never creates a bind source.
+Modules landed so far: ``table`` (rows and ``validate_table``), ``binds`` (nofollow
+walks and fd-opened bind sources), ``run_mounts`` (the exact per-row ``/run`` re-bind
+set), ``bwrap`` (argv builder and the wrapper's ``main``) and ``unit_lint`` (the
+unit-file lint). The wrapper never creates a bind source.
 """

@@ -27,6 +27,7 @@ from breezy.runtime.autonomy_sandbox.table import (
     NOTIFIER_FALLBACK_ROWS,
     RUN_TRANSIENT_SHOW_ARGV,
     UNWRAPPED_RESIDUAL_UNITS,
+    WRAPPER_LINE_ONLY_UNITS,
     BusRead,
     BwrapRow,
     PositiveProbe,
@@ -599,3 +600,28 @@ def test_unwrapped_residual_units_disjoint_and_cited() -> None:
 def test_module_exposes_no_state_changing_bus_verbs() -> None:
     allowed = table_module.BUS_READ_VERBS
     assert allowed == frozenset({"show", "list-units", "list-timers"})
+
+
+# ------------------------------------------------------- wrapper-line-only units
+
+
+def test_wrapper_line_only_units_subset_of_row_units_and_disjoint() -> None:
+    assert WRAPPER_LINE_ONLY_UNITS == {}
+    table = AUTONOMY_BWRAP_TABLE
+    row_unit = next(iter(next(iter(table.values())).units))
+    cite = MappingProxyType({row_unit: "AUT-1 r12 stop hook"})
+    validate_table(table, wrapper_line_only_units=cite)
+    with pytest.raises(TableError):
+        validate_table(
+            table, wrapper_line_only_units=MappingProxyType({"breezy-x.service": "AUT-1"})
+        )
+    with pytest.raises(TableError):
+        validate_table(table, owned_units=frozenset({row_unit}), wrapper_line_only_units=cite)
+    with pytest.raises(TableError):
+        validate_table(
+            table,
+            residual_units=MappingProxyType({row_unit: "E-7a rule 5"}),
+            wrapper_line_only_units=cite,
+        )
+    with pytest.raises(TableError):
+        validate_table(table, wrapper_line_only_units=MappingProxyType({row_unit: ""}))
