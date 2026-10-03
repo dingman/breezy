@@ -206,7 +206,8 @@ def test_owner_placeholder_ledger_matches_markers() -> None:
     for row in OWNER_PLACEHOLDERS:
         file_part, _, _ = row.node_id.partition("::")
         assert (REPO_ROOT / file_part).is_file(), f"ledger row names a missing file: {row.node_id}"
-        assert row.owner and row.owner_symbol and row.blocks_kinds
+        assert row.owner and row.owner_symbol
+        assert row.blocks_kinds <= FLOOR_KIND_VOCABULARY, row.node_id
 
 
 def test_marker_scan_finds_the_decorator_form() -> None:

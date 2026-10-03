@@ -29,6 +29,8 @@ from breezy.persistence.autonomy.veto import VetoReason, compose_entry_vetoes
 from breezy.persistence.family_manifest import _COMPOSITION_KINDS
 from breezy.strategy.autonomy import node_plugins
 from breezy.strategy.autonomy.node_plugins import NODE_PLUGINS
+from tests.support.autonomy_owner import OwnerPending
+from tests.support.autonomy_owner_stub import await_owner
 
 #: ARCH C5 "Entry-veto contract" reasons (AUTONOMY_ARCHITECTURE.md:642-662), one literal copy.
 ARCH_VETO_REASONS: frozenset[str] = frozenset(
@@ -246,3 +248,37 @@ def test_plugin_package_inits_hold_no_import_nodes(module: ModuleType) -> None:
     init = Path(inspect.getfile(module)).parent / "__init__.py"
     tree = ast.parse(init.read_text(encoding="utf-8"))
     assert [n for n in ast.walk(tree) if isinstance(n, ast.Import | ast.ImportFrom)] == []
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param(
+            "capture",
+            id="capture",
+            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-1; blocks none"),
+        ),
+        pytest.param(
+            "scorer",
+            id="scorer",
+            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none"),
+        ),
+        pytest.param(
+            "evaluator",
+            id="evaluator",
+            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-4; blocks none"),
+        ),
+        pytest.param(
+            "detectors",
+            id="detectors",
+            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-6; blocks none"),
+        ),
+        pytest.param(
+            "refitter",
+            id="refitter",
+            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-3; blocks none"),
+        ),
+    ],
+)
+def test_every_non_retired_manifest_resolves_to_full_plugins(kind: str) -> None:
+    await_owner(f"test_every_non_retired_manifest_resolves_to_full_plugins[{kind}]")
