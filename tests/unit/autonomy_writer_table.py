@@ -86,6 +86,10 @@ class WriteSiteRule(NamedTuple):
     module: str
     function: str | None
     reason: str
+    #: A transitional row names who retires it and what replaces it (ruling A4-R4); a permanent
+    #: row leaves both empty.
+    owner: str = ""
+    closing: str = ""
 
 
 _SINGLE_READ: Final = "breezy.persistence.autonomy.single_read"
@@ -99,11 +103,16 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(_SINGLE_READ, "_write_temp", "write_once and replace_atomic temp file"),
     WriteSiteRule(_SINGLE_READ, "_finish", "write_once and replace_atomic temp cleanup"),
     WriteSiteRule(_SINGLE_READ, "_cleanup_temp", "write_once and replace_atomic temp cleanup"),
-    WriteSiteRule(_SINGLE_READ, "_publish_by_link", "write_once hard-link publish"),
     WriteSiteRule(_SINGLE_READ, "_link_temp", "write_once hard-link publish"),
-    # Transitional: walk_dirs(create=True) creates directories itself until ensure_dir lands and
-    # absorbs it. Remove this row in the commit that lands ensure_dir.
-    WriteSiteRule(_SINGLE_READ, "walk_dirs", "create=True mkdir; superseded by ensure_dir"),
+    # Transitional: walk_dirs(create=True) creates directories itself until ensure_dir lands.
+    # test_walk_dirs_mkdir_row_retired (strict xfail, owner 6d) forces this row's removal.
+    WriteSiteRule(
+        _SINGLE_READ,
+        "walk_dirs",
+        "create=True mkdir; superseded by ensure_dir",
+        owner="ARCH-0 6d",
+        closing="replace by single_read.ensure_dir",
+    ),
     WriteSiteRule(
         "breezy.persistence.autonomy.registry_store",
         None,

@@ -8,6 +8,14 @@ changing this file needs a reviewer to see it.
 The rows are the ``[blocks]`` annotations of ARCH-0 seam A plan r5 (carried-stub table; the AUT-5
 WP4 and AUT-7 rows are the r4 annotations that r5 keeps "unchanged"). Keys are the stub's name
 plus its literal params, without the file part. A test with no key here is not floor-protected.
+
+Reading notes (ruling A4-R7):
+
+* Plan r5 l.780 annotates the AUT-5 WP4 row "[ROOT_ADMIT; ACTIVATE]". It is read as two groups
+  split at the semicolon: the verdict, intraday and root-admit tests before it block ROOT_ADMIT,
+  and the attest, journaling, archive and holdout tests after it block ACTIVATE.
+* The three ``test_demand_archive_*`` tests of that row are unnamed in the plan, so they have no key
+  here and are not floor-protected until the plan names them.
 """
 
 from __future__ import annotations

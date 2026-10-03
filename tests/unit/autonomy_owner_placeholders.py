@@ -360,4 +360,29 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         [],
         "tests/unit/test_drawdown_producer.py::test_drawdown_gates_on_labels_consumable",
     ),
+    OwnerRow(
+        "tests/unit/test_autonomy_files_one_writer.py::test_walk_dirs_mkdir_row_retired",
+        "ARCH-0-seamA:6d",
+        "breezy.persistence.autonomy.single_read:ensure_dir",
+        frozenset(),
+    ),
+    # Carried deploy findings (ruling A4-R5). The "symbol" is the cleared deploy unit; it never
+    # resolves as a Python module, so the staleness test cannot fire, and the real staleness signal
+    # is the strict XPASS of the parameter itself once the timer stops overlapping.
+    *(
+        OwnerRow(
+            "tests/unit/test_launch_window_table.py::"
+            f"test_no_unit_overlaps_launch_window[known_overlap_{timer}]",
+            "AUT-6:O-1",
+            f"deploy.systemd:{timer}.timer_clear_of_launch_window",
+            frozenset(),
+        )
+        for timer in ("breezy-quote-tape-ingest-frequent", "breezy-discovery-pull")
+    ),
+    OwnerRow(
+        "tests/unit/test_autonomy_owner_placeholders.py::test_envelope_pending_names_empty",
+        "ARCH-0-seamA:8d",
+        "tests.unit.autonomy_envelope_manifest:ENVELOPE_PENDING_NAMES_CLEARED",
+        frozenset(),
+    ),
 )

@@ -51,15 +51,23 @@ def relative_path(path: Path) -> str:
     return path.resolve().relative_to(REPO_ROOT).as_posix()
 
 
-def autonomy_source_files() -> list[Path]:
-    """Every autonomy-owned Python source: any ``autonomy`` package under ``src/breezy`` plus any
-    ``*autonomy*.py`` module or script (operator CLIs and cut-over scripts land under ``scripts/``).
+def autonomy_source_files(
+    src_root: Path = _BREEZY_SRC, scripts_root: Path = SCRIPTS_DIR
+) -> list[Path]:
+    """Every autonomy-owned Python source (ruling A6-R2).
+
+    A file under ``src/breezy`` is judged when any directory above it has a name starting with
+    ``autonomy`` (``autonomy``, ``autonomy_capture``, ``autonomy_refit`` ...), or when its own name
+    contains ``autonomy``. Scripts and operator CLIs are judged when their name contains
+    ``autonomy``. The roots are parameters so a planted tree can exercise the predicate.
     """
     found = {
-        p for p in _BREEZY_SRC.rglob("*.py") if "autonomy" in p.relative_to(_BREEZY_SRC).parts[:-1]
+        p
+        for p in src_root.rglob("*.py")
+        if any(part.startswith("autonomy") for part in p.relative_to(src_root).parts[:-1])
+        or "autonomy" in p.name
     }
-    found |= {p for p in _BREEZY_SRC.rglob("*autonomy*.py")}
-    found |= {p for p in SCRIPTS_DIR.rglob("*autonomy*.py")}
+    found |= {p for p in scripts_root.rglob("*autonomy*.py")}
     return sorted(found)
 
 

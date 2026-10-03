@@ -25,7 +25,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -648,18 +648,18 @@ def _group_by_file(node_ids: Iterable[str]) -> dict[str, set[str]]:
     return grouped
 
 
+def _nested_env() -> dict[str, str]:
+    drop = {
+        "PYTEST_ADDOPTS",
+        "BREEZY_GATE_COLLECT_ONLY_CLAIM",
+        "BREEZY_GATE_COLLECT_ONLY_CONFIRM_FILE",
+    }
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
 def collect_node_ids(files: Sequence[str]) -> set[str]:
     """One ``--collect-only`` subprocess over ``files`` in the already-sandboxed interpreter."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k
-        not in {
-            "PYTEST_ADDOPTS",
-            "BREEZY_GATE_COLLECT_ONLY_CLAIM",
-            "BREEZY_GATE_COLLECT_ONLY_CONFIRM_FILE",
-        }
-    }
+    env = _nested_env()
     proc = subprocess.run(
         [
             sys.executable,
@@ -690,8 +690,8 @@ def collect_node_ids(files: Sequence[str]) -> set[str]:
     return ids
 
 
-def uncollected(manifest_ids: Iterable[str], collected: set[str]) -> list[str]:
-    return sorted(set(manifest_ids) - collected)
+def uncollected(manifest_ids: Iterable[str], collected: Collection[str]) -> list[str]:
+    return sorted(set(manifest_ids) - set(collected))
 
 
 def defined_test_names() -> set[str]:
@@ -708,6 +708,81 @@ def stale_pending(pending: Iterable[str], defined: set[str]) -> list[str]:
     return sorted(set(pending) & defined)
 
 
+_RUN_COUNT_RE: Final = re.compile(
+    r"(\d+) (passed|failed|xfailed|xpassed|skipped|deselected|errors?|warnings?)\b"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RunOutcome:
+    returncode: int
+    counts: Mapping[str, int]
+    tail: str
+
+
+def parse_run_summary(text: str) -> dict[str, int]:
+    """Outcome counts from a pytest summary line (``3 passed, 1 skipped in 0.1s``)."""
+    counts: dict[str, int] = {}
+    for line in reversed(text.splitlines()):
+        found = _RUN_COUNT_RE.findall(line)
+        if found and " in " in line:
+            for number, word in found:
+                counts[word.rstrip("s") if word.startswith("error") else word] = int(number)
+            return counts
+    return counts
+
+
+def run_node_ids(targets: Sequence[str], *, cwd: Path = REPO_ROOT) -> RunOutcome:
+    """Run ``targets`` in a nested pytest and report what actually happened to each test.
+
+    This is the authority on skips: a module ``pytestmark``, a conftest
+    ``pytest_collection_modifyitems`` skip, ``skipif`` and an imperative ``pytest.skip`` all show up
+    as ``skipped`` here, and a ``-m`` deselection shows up as ``deselected``.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:randomly", "-p", "no:cacheprovider", *targets],
+        cwd=cwd,
+        env=_nested_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    text = proc.stdout + proc.stderr
+    return RunOutcome(proc.returncode, parse_run_summary(text), text[-1500:])
+
+
+def outcome_problems(outcome: RunOutcome, expected: int) -> list[str]:
+    counts = outcome.counts
+    problems = [
+        f"{word}: {counts[word]}"
+        for word in ("skipped", "deselected", "failed", "xpassed", "error")
+        if counts.get(word)
+    ]
+    ran = counts.get("passed", 0) + counts.get("xfailed", 0)
+    if ran != expected:
+        problems.append(f"ran {ran} of {expected} (passed + xfailed)")
+    if outcome.returncode != 0:
+        problems.append(f"exit code {outcome.returncode}")
+    return problems
+
+
+@functools.cache
+def manifest_files() -> tuple[str, ...]:
+    return tuple(sorted(_group_by_file(ENVELOPE_NODE_IDS)))
+
+
+@functools.cache
+def manifest_collected() -> frozenset[str]:
+    """The single collect-only run, shared by every test that needs the collected manifest ids."""
+    return frozenset(collect_node_ids(manifest_files()))
+
+
+@functools.cache
+def manifest_run() -> RunOutcome:
+    """The single nested run of every manifest node id, shared by the tests that read it."""
+    return run_node_ids(sorted(ENVELOPE_NODE_IDS))
+
+
 def test_every_envelope_node_id_collected_and_unskipped() -> None:
     by_file = _group_by_file(ENVELOPE_NODE_IDS)
     assert len(ENVELOPE_NODE_IDS) >= 19
@@ -717,7 +792,9 @@ def test_every_envelope_node_id_collected_and_unskipped() -> None:
         assert file_part in sources, f"manifest names a missing file: {file_part}"
         problems += skip_problems(file_part, sources[file_part], frozenset(names))
     assert problems == []
-    assert uncollected(ENVELOPE_NODE_IDS, collect_node_ids(sorted(by_file))) == []
+    assert uncollected(ENVELOPE_NODE_IDS, manifest_collected()) == []
+    outcome = manifest_run()
+    assert outcome_problems(outcome, len(ENVELOPE_NODE_IDS)) == [], outcome.tail
     stale = stale_pending(ENVELOPE_PENDING_NAMES, defined_test_names())
     assert stale == [], f"landed tests still listed as pending: {stale}"
 
@@ -776,7 +853,7 @@ def test_an_envelope_id_that_is_not_collected_is_reported() -> None:
 
 def test_a_deselected_or_misnamed_envelope_id_is_not_collected_for_real() -> None:
     real = sorted(ENVELOPE_NODE_IDS)[:1]
-    collected = collect_node_ids([real[0].split("::")[0]])
+    collected = manifest_collected()
     assert uncollected(real, collected) == []
     assert uncollected([real[0] + "_typo"], collected) == [real[0] + "_typo"]
 
@@ -888,3 +965,106 @@ def test_the_floor_cites_only_known_kinds_and_is_immutable() -> None:
         "SUPERSEDE",
         "HWM_RESET",
     } <= (FLOOR_KIND_VOCABULARY)
+
+
+# ---------------------------------------------------------------------------
+# Nested-run skip authority (ruling A4-R6c): module pytestmark and conftest skips
+# ---------------------------------------------------------------------------
+
+
+def _planted_run(tmp_path: Path, test_source: str, conftest: str = "") -> RunOutcome:
+    (tmp_path / "test_planted_envelope.py").write_text(test_source, encoding="utf-8")
+    if conftest:
+        (tmp_path / "conftest.py").write_text(conftest, encoding="utf-8")
+    return run_node_ids(["test_planted_envelope.py"], cwd=tmp_path)
+
+
+def test_the_nested_run_reports_a_module_level_pytestmark_skip(tmp_path: Path) -> None:
+    source = "import pytest\npytestmark = pytest.mark.skip(reason='r')\ndef test_a() -> None: ...\n"
+    outcome = _planted_run(tmp_path, source)
+    assert outcome.counts.get("skipped") == 1
+    assert outcome_problems(outcome, 1)
+
+
+def test_the_nested_run_reports_a_conftest_collection_modifyitems_skip(tmp_path: Path) -> None:
+    conftest = (
+        "import pytest\n"
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    for item in items:\n"
+        "        item.add_marker(pytest.mark.skip(reason='conftest'))\n"
+    )
+    outcome = _planted_run(tmp_path, "def test_a() -> None: ...\n", conftest)
+    assert outcome.counts.get("skipped") == 1
+    assert outcome_problems(outcome, 1)
+
+
+def test_the_nested_run_reports_a_deselected_test(tmp_path: Path) -> None:
+    conftest = (
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    config.hook.pytest_deselected(items=items)\n"
+        "    items[:] = []\n"
+    )
+    outcome = _planted_run(tmp_path, "def test_a() -> None: ...\n", conftest)
+    assert outcome.counts.get("deselected") == 1
+    assert outcome_problems(outcome, 1)
+
+
+def test_the_nested_run_accepts_passing_and_owner_xfailed_tests(tmp_path: Path) -> None:
+    source = (
+        "import pytest\n"
+        "from tests.support.autonomy_owner import OwnerPending\n"
+        "def test_a() -> None: ...\n"
+        "@pytest.mark.xfail(strict=True, raises=OwnerPending)\n"
+        "def test_b() -> None:\n    raise OwnerPending\n"
+    )
+    (tmp_path / "conftest.py").write_text(
+        f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n", encoding="utf-8"
+    )
+    outcome = _planted_run(
+        tmp_path, source, f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n"
+    )
+    assert outcome.counts == {"passed": 1, "xfailed": 1}
+    assert outcome_problems(outcome, 2) == []
+
+
+def test_the_run_summary_parser_reads_counts_and_ignores_other_lines() -> None:
+    text = "noise 5 passed in the middle\n3 passed, 2 xfailed, 1 skipped in 0.50s\n"
+    assert parse_run_summary(text) == {"passed": 3, "xfailed": 2, "skipped": 1}
+    assert parse_run_summary("no summary here") == {}
+
+
+# ---------------------------------------------------------------------------
+# Pending names empty (A4-R6a) and floor keys carried (A4-R6b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="ARCH-0-seamA:8d; blocks none")
+def test_envelope_pending_names_empty() -> None:
+    """Carried to the last ARCH-0 seam: raises while any section 4.7 name is still pending.
+
+    It XPASSes (strict failure) the moment ``ENVELOPE_PENDING_NAMES`` is empty, which forces that
+    owner to delete this stub, its marker and its ledger row, and to assert emptiness for real.
+    """
+    if ENVELOPE_PENDING_NAMES:
+        raise OwnerPending(f"{len(ENVELOPE_PENDING_NAMES)} envelope names are still pending")
+
+
+def floor_keys_without_a_row(
+    rows: Iterable[OwnerRow], floor: Mapping[str, frozenset[str]]
+) -> list[str]:
+    carried = {row.node_id.split("::", 1)[1] for row in rows if "::" in row.node_id}
+    return sorted(set(floor) - carried)
+
+
+def test_every_floor_key_has_a_ledger_row() -> None:
+    assert floor_keys_without_a_row(OWNER_PLACEHOLDERS, BLOCKS_KINDS_FLOOR) == []
+    assert len(OWNER_PLACEHOLDERS) >= len(BLOCKS_KINDS_FLOOR)
+
+
+def test_a_floor_key_with_no_ledger_row_is_reported() -> None:
+    floor = {"test_resume_admission_reads_policy_block_bounds": frozenset({"RESUME"})}
+    assert floor_keys_without_a_row([], floor) == [
+        "test_resume_admission_reads_policy_block_bounds"
+    ]
+    row = _ROW._replace(node_id="tests/unit/x.py::test_resume_admission_reads_policy_block_bounds")
+    assert floor_keys_without_a_row([row], floor) == []

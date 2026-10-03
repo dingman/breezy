@@ -17,22 +17,22 @@ one-argument ``replace`` ...), and the dataframe and array writers.
 
 from __future__ import annotations
 
-import ast
-import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
 import pytest
 
+from tests.support.autonomy_owner import OwnerPending
+from tests.support.autonomy_owner_stub import await_owner
 from tests.support.autonomy_scan import (
     Finding,
     autonomy_source_files,
     module_name,
     relative_path,
     scan_files,
-    walk_with_scope,
 )
+from tests.support.autonomy_write_scan import find_write_sites
 from tests.support.entry_points import REPO_ROOT, SRC_DIR
 from tests.unit.autonomy_writer_table import (
     AUTONOMY_FILE_WRITERS,
@@ -47,161 +47,6 @@ MIN_JUDGED_FILES: Final = 14
 MIN_SINGLE_READ_SITES: Final = 6
 
 _LIVE_ORDERS_GATE: Final[Path] = SRC_DIR / "breezy" / "persistence" / "live_orders_gate.py"
-
-_OS_MUTATORS: Final = frozenset(
-    {
-        "link", "symlink", "replace", "rename", "renames", "mkdir", "makedirs", "unlink", "remove",
-        "rmdir", "removedirs", "truncate", "ftruncate", "write", "writev", "chmod", "fchmod",
-        "chown", "fchown", "utime", "mkfifo", "mknod",
-    }
-)  # fmt: skip
-_SHUTIL_MUTATORS: Final = frozenset(
-    {"copy", "copy2", "copyfile", "copyfileobj", "copytree", "move", "rmtree", "make_archive",
-     "unpack_archive", "chown"}
-)  # fmt: skip
-_TEMPFILE_CREATORS: Final = frozenset(
-    {"mkstemp", "mkdtemp", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile",
-     "TemporaryDirectory"}
-)  # fmt: skip
-#: Path methods that mutate regardless of arguments. ``replace`` is handled separately because
-#: ``str.replace`` exists: ``Path.replace`` takes one argument, ``str.replace`` two or three.
-_PATH_MUTATORS: Final = frozenset(
-    {"write_text", "write_bytes", "touch", "mkdir", "unlink", "rmdir", "rename", "symlink_to",
-     "hardlink_to", "chmod", "lchmod"}
-)  # fmt: skip
-_DATA_WRITERS: Final = frozenset(
-    {"to_csv", "to_parquet", "to_json", "to_feather", "write_table", "write_feather",
-     "write_dataset", "save", "savez", "savez_compressed", "savetxt"}
-)  # fmt: skip
-_WRITE_OS_FLAGS: Final = frozenset(
-    {"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC", "O_EXCL", "O_TMPFILE"}
-)
-_MODE_STRING_RE: Final = re.compile(r"\A[rwxabt+U]{1,4}\Z")
-_MAX_ALIAS_DEPTH: Final = 8
-
-
-def _module_constants(tree: ast.Module) -> dict[str, ast.expr]:
-    constants: dict[str, ast.expr] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    constants[target.id] = node.value
-        elif (
-            isinstance(node, ast.AnnAssign)
-            and node.value is not None
-            and isinstance(node.target, ast.Name)
-        ):
-            constants[node.target.id] = node.value
-    return constants
-
-
-def _os_flags(
-    expr: ast.expr, constants: dict[str, ast.expr], depth: int = 0
-) -> tuple[set[str], bool]:
-    """``os.O_*`` names an ``os.open`` flag expression uses, and whether any part is opaque."""
-    if depth > _MAX_ALIAS_DEPTH:
-        return set(), True
-    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.BitOr):
-        left, left_opaque = _os_flags(expr.left, constants, depth + 1)
-        right, right_opaque = _os_flags(expr.right, constants, depth + 1)
-        return left | right, left_opaque or right_opaque
-    if isinstance(expr, ast.Attribute) and expr.attr.startswith("O_"):
-        return {expr.attr}, False
-    if isinstance(expr, ast.Name):
-        if expr.id in constants:
-            return _os_flags(constants[expr.id], constants, depth + 1)
-        if expr.id.startswith("O_"):
-            return {expr.id}, False
-    if isinstance(expr, ast.Constant) and expr.value == 0:
-        return set(), False  # O_RDONLY
-    return set(), True
-
-
-def _open_mode_writes(call: ast.Call) -> str | None:
-    """A reason when an ``open``-named call may write, else None."""
-    candidates: list[ast.expr] = [kw.value for kw in call.keywords if kw.arg == "mode"]
-    positional = call.args[:2]
-    for arg in positional:
-        if (
-            isinstance(arg, ast.Constant)
-            and isinstance(arg.value, str)
-            and _MODE_STRING_RE.match(arg.value)
-            and any(ch in arg.value for ch in "wax+")
-        ):
-            return f"open mode {arg.value!r}"
-    for value in candidates:
-        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
-            return "open mode is not a literal"
-        if any(ch in value.value for ch in "wax+"):
-            return f"open mode {value.value!r}"
-    func = call.func
-    if (
-        isinstance(func, ast.Name)
-        and len(call.args) >= 2
-        and not isinstance(call.args[1], ast.Constant)
-    ):
-        return "open mode is not a literal"
-    return None
-
-
-def _call_reason(
-    call: ast.Call, constants: dict[str, ast.expr], os_names: dict[str, str]
-) -> str | None:
-    func = call.func
-    receiver = (
-        func.value.id
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-        else ""
-    )
-    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-    if isinstance(func, ast.Name) and name in os_names:
-        receiver, name = "os", os_names[name]  # from os import X [as Y]
-    if name == "open" and receiver != "os":
-        return _open_mode_writes(call)
-    if receiver == "os":
-        if name == "open":
-            flag_arg = call.args[1] if len(call.args) > 1 else None
-            flag_kw = next((kw.value for kw in call.keywords if kw.arg == "flags"), None)
-            flags_expr = flag_arg or flag_kw
-            if flags_expr is None:
-                return None
-            names, opaque = _os_flags(flags_expr, constants)
-            if names & _WRITE_OS_FLAGS:
-                return f"os.open flags {sorted(names & _WRITE_OS_FLAGS)}"
-            return "os.open flags are not statically resolvable" if opaque else None
-        return f"os.{name}" if name in _OS_MUTATORS else None
-    if receiver == "shutil" and name in _SHUTIL_MUTATORS:
-        return f"shutil.{name}"
-    if receiver == "tempfile" and name in _TEMPFILE_CREATORS:
-        return f"tempfile.{name}"
-    if isinstance(func, ast.Attribute):
-        if name in _PATH_MUTATORS:
-            return f".{name}()"
-        if name == "replace" and len(call.args) == 1 and not call.keywords:
-            return ".replace(target)"
-        if name in _DATA_WRITERS:
-            return f".{name}()"
-    return None
-
-
-def find_write_sites(path: str, source: str) -> list[Finding]:
-    """Every filesystem write site in ``source`` (unfiltered by any allowlist)."""
-    tree = ast.parse(source, filename=path)
-    constants = _module_constants(tree)
-    os_names = {
-        alias.asname or alias.name: alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "os"
-        for alias in node.names
-    }
-    findings: list[Finding] = []
-    for node, scope in walk_with_scope(tree):
-        if isinstance(node, ast.Call):
-            reason = _call_reason(node, constants, os_names)
-            if reason is not None:
-                findings.append(Finding(path, node.lineno, "write_site", reason, scope))
-    return findings
 
 
 def _rule_allows(rule: WriteSiteRule, module: str, scope: str) -> bool:
@@ -227,11 +72,11 @@ def judged_files() -> list[Path]:
     return sorted({*autonomy_source_files(), _LIVE_ORDERS_GATE})
 
 
-def scan_real_tree() -> list[Finding]:
+def scan_real_tree(rules: Sequence[WriteSiteRule] = WRITE_SITE_ALLOWLIST) -> list[Finding]:
     return scan_files(
         judged_files(),
         lambda path, source: unallowed_write_sites(
-            path, source, module=module_name(REPO_ROOT / path)
+            path, source, module=module_name(REPO_ROOT / path), rules=rules
         ),
     )
 
@@ -302,6 +147,39 @@ _PLANTED_WRITES: Final[dict[str, str]] = {
     "path_unlink": "def f(p):\n    p.unlink()\n",
     "path_replace_one_arg": "def f(p, q):\n    p.replace(q)\n",
     "dataframe_to_parquet": "def f(df):\n    df.to_parquet('x')\n",
+    # Ruling A4-R2: the reviewer's MISSED table, one planted control each.
+    "import_os_as_o": "import os as o\ndef f(a, b):\n    o.replace(a, b)\n",
+    "import_shutil_as_sh": "import shutil as sh\ndef f(a, b):\n    sh.copy(a, b)\n",
+    "from_shutil_import_copy": "from shutil import copy\ndef f(a, b):\n    copy(a, b)\n",
+    "from_tempfile_import_mkstemp": "from tempfile import mkstemp\ndef f():\n    mkstemp()\n",
+    "from_pyarrow_parquet_write_table": (
+        "from pyarrow.parquet import write_table\ndef f(t, p):\n    write_table(t, p)\n"
+    ),
+    "pyarrow_submodule_alias": (
+        "import pyarrow.parquet as pq\ndef f(t, p):\n    pq.write_table(t, p)\n"
+    ),
+    "getattr_on_os": "import os\ndef f(a, b):\n    getattr(os, 'replace')(a, b)\n",
+    "dunder_import": "def f(a, b):\n    __import__('os').replace(a, b)\n",
+    "importlib_import_module": (
+        "import importlib\ndef f(a, b):\n    importlib.import_module('os').replace(a, b)\n"
+    ),
+    "reference_not_call": "import os\nW = os.replace\n",
+    "star_import": "from os import *\n",
+    "os_fdopen_write": "import os\ndef f(fd):\n    os.fdopen(fd, 'w')\n",
+    "os_fdopen_non_literal": "import os\ndef f(fd, m):\n    os.fdopen(fd, m)\n",
+    "os_pwrite": "import os\ndef f(fd):\n    os.pwrite(fd, b'x', 0)\n",
+    "os_copy_file_range": "import os\ndef f(a, b):\n    os.copy_file_range(a, b, 1)\n",
+    "os_truncate": "import os\ndef f(p):\n    os.truncate(p, 0)\n",
+    "sqlite3_connect": "import sqlite3\ndef f(p):\n    sqlite3.connect(p)\n",
+    "logging_file_handler": "import logging\ndef f(p):\n    logging.FileHandler(p)\n",
+    "logging_rotating_handler": (
+        "from logging.handlers import RotatingFileHandler\ndef f(p):\n    RotatingFileHandler(p)\n"
+    ),
+    "subprocess_run": "import subprocess\ndef f():\n    subprocess.run(['cp', 'a', 'b'])\n",
+    "open_with_kwargs": "def f(p, kw):\n    open(p, **kw)\n",
+    "path_open_non_literal_mode": "from pathlib import Path\ndef f(p, m):\n    Path(p).open(m)\n",
+    "builtins_open_write": "import builtins\ndef f(p):\n    builtins.open(p, 'w')\n",
+    "numpy_save_alias": "import numpy as np\ndef f(a):\n    np.save('x', a)\n",
 }
 
 
@@ -385,10 +263,15 @@ def test_only_the_named_live_orders_gate_function_is_exempt() -> None:
 
 
 def test_allowlist_rows_for_code_that_has_not_landed_are_accepted_while_absent() -> None:
+    """Uses a planted rules tuple, so it stays green when ``registry_store`` lands (seam 6e)."""
+    rows = (
+        *WRITE_SITE_ALLOWLIST,
+        WriteSiteRule("breezy.persistence.autonomy.never_landed", None, "planted absent module"),
+        WriteSiteRule("breezy.persistence.autonomy.single_read", "never_landed_fn", "planted"),
+    )
+    assert scan_real_tree(rules=rows) == []
     landed = {module_name(path) for path in judged_files()}
-    absent = [rule for rule in WRITE_SITE_ALLOWLIST if rule.module not in landed]
-    assert absent, "expected registry_store (seam 6e) to be absent at seam 4a"
-    assert scan_real_tree() == []
+    assert "breezy.persistence.autonomy.never_landed" not in landed
 
 
 # ---------------------------------------------------------------------------
@@ -410,3 +293,45 @@ def test_exemptions_are_narrow_and_unique() -> None:
     assert all(rule.reason for rule in WRITE_SITE_ALLOWLIST)
     named_exemption = [r for r in WRITE_SITE_ALLOWLIST if r.module.endswith("live_orders_gate")]
     assert [(r.function) for r in named_exemption] == ["_verify_ruling_file"]
+
+
+# ---------------------------------------------------------------------------
+# Judged-file predicate (ruling A4-R1) and transitional rows (ruling A4-R4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_judged_predicate_reaches_autonomy_prefixed_packages(tmp_path: Path) -> None:
+    src = tmp_path / "src" / "breezy"
+    planted = [
+        src / "strategy" / "autonomy_capture" / "w.py",
+        src / "analysis" / "autonomy_refit" / "w.py",
+        src / "persistence" / "autonomy" / "w.py",
+    ]
+    unjudged = src / "strategy" / "other_pkg" / "w.py"
+    for path in [*planted, unjudged]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("import os\ndef f(a, b):\n    os.replace(a, b)\n", encoding="utf-8")
+    judged = autonomy_source_files(src, tmp_path / "scripts")
+    assert judged == sorted(planted)
+    for path in judged:
+        sites = unallowed_write_sites(
+            str(path), path.read_text(encoding="utf-8"), module="breezy.planted"
+        )
+        assert [site.detail for site in sites] == ["os.replace"]
+
+
+def test_transitional_rows_name_an_owner_and_a_closing_condition() -> None:
+    transitional = [rule for rule in WRITE_SITE_ALLOWLIST if rule.owner or rule.closing]
+    assert [(r.function, r.owner, r.closing) for r in transitional] == [
+        ("walk_dirs", "ARCH-0 6d", "replace by single_read.ensure_dir")
+    ]
+    assert all(rule.owner and rule.closing for rule in transitional)
+
+
+def test_the_publish_by_link_helper_needs_no_allowlist_row() -> None:
+    assert all(rule.function != "_publish_by_link" for rule in WRITE_SITE_ALLOWLIST)
+
+
+@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="ARCH-0-seamA:6d; blocks none")
+def test_walk_dirs_mkdir_row_retired() -> None:
+    await_owner("test_walk_dirs_mkdir_row_retired")

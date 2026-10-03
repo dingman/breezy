@@ -176,6 +176,8 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
         "tests/unit/test_entry_guard.py::test_rung_net_position_veto_crosses_legs_and_families[double]",
         "tests/unit/test_launch_window_table.py::test_launch_path_units_end_before_next_fixed_point[existing_units]",
         "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[existing_units]",
+        "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[known_overlap_breezy-discovery-pull]",
+        "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[known_overlap_breezy-quote-tape-ingest-frequent]",
     }
 )
 

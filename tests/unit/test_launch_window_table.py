@@ -13,9 +13,10 @@ Two contracts:
   and that bound is strictly before the next supervisor fixed point (STOP 16:40, pre-launch
   16:45, LAUNCH 16:50, window close 17:00, release 17:10).
 
-``KNOWN_WINDOW_OVERLAPS`` records the two deployed units that overlap today. The set is pinned by
-equality, so a new overlapping unit fails and a fixed one must delete its row. They are findings
-for the coordinator, not accepted state: see each row.
+Two deployed timers overlap today (``KNOWN_OVERLAP_TIMERS``). They are carried as strict-xfail
+parameters owned by AUT-6 O-1, not exempted: ``[existing_units]`` still checks every other timer,
+and each carried parameter fails strict the moment its timer stops overlapping. Drop-ins under
+``<unit>.service.d`` and ``<unit>.timer.d`` are applied; an unparseable drop-in fails closed.
 
 The OnCalendar parser understands only the forms the repo uses (``*-*-* HH[,HH]:MM[:SS] UTC`` and
 ``*:MM[/step]``) and refuses anything else, so an unsupported schedule fails the gate instead of
@@ -31,6 +32,7 @@ from typing import Final, NamedTuple
 
 import pytest
 
+from tests.support.autonomy_owner import OwnerPending
 from tests.support.entry_points import DEPLOY_SYSTEMD_DIR
 
 _DAY_S: Final = 24 * 3600
@@ -226,15 +228,40 @@ def parse_duration_s(value: str) -> float:
     return total
 
 
-def _directives(text: str) -> dict[str, list[str]]:
+def _directives(text: str, *, strict: bool = False) -> dict[str, list[str]]:
+    """``key -> values`` of a unit text. ``strict`` (drop-ins) refuses what it cannot parse."""
     found: dict[str, list[str]] = {}
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith(("#", ";", "[")) or "=" not in line:
+        if not line or line.startswith(("#", ";", "[")):
+            continue
+        if strict and ("=" not in line or line.endswith("\\")):
+            raise UnsupportedUnitSyntax(f"drop-in line {line[:40]!r}")
+        if "=" not in line:
             continue
         key, _, value = line.partition("=")
         found.setdefault(key.strip(), []).append(value.strip())
     return found
+
+
+def merged_directives(text: str, dropin_dir: Path) -> dict[str, list[str]]:
+    """The unit's directives with ``<dropin_dir>/*.conf`` applied in name order.
+
+    An empty assignment resets the key (systemd list semantics); any later value replaces or extends
+    it. A drop-in this module cannot parse raises, so an override is never silently ignored.
+    """
+    merged = _directives(text)
+    if dropin_dir.is_dir():
+        for conf in sorted(dropin_dir.glob("*.conf")):
+            for key, values in _directives(conf.read_text(encoding="utf-8"), strict=True).items():
+                merged.setdefault(key, [])
+                for value in values:
+                    if value == "":
+                        merged[key] = []
+                    else:
+                        merged[key].append(value)
+        merged = {k: v for k, v in merged.items() if v}
+    return merged
 
 
 class UnitSpec(NamedTuple):
@@ -261,7 +288,7 @@ def _flock_wait_s(service_text: str, directory: Path) -> int:
 
 
 def parse_service(name: str, text: str, directory: Path) -> UnitSpec:
-    found = _directives(text)
+    found = merged_directives(text, directory / f"{name}.d")
     service_type = found.get("Type", ["simple"])[-1]
     commands = sum(
         len(found.get(key, [])) for key in ("ExecStartPre", "ExecStart", "ExecStartPost")
@@ -286,6 +313,7 @@ def parse_service(name: str, text: str, directory: Path) -> UnitSpec:
 
 
 class Firing(NamedTuple):
+    timer: str
     unit: str
     slot_s: int
     worst_end_s: float
@@ -300,7 +328,9 @@ def firings(directory: Path) -> list[Firing]:
     """Every firing of every timer-driven unit under ``directory``, with its worst-case end."""
     found: list[Firing] = []
     for timer in sorted(directory.glob("*.timer")):
-        timer_directives = _directives(timer.read_text(encoding="utf-8"))
+        timer_directives = merged_directives(
+            timer.read_text(encoding="utf-8"), directory / f"{timer.name}.d"
+        )
         service_path = directory / _timer_target(timer.name, timer_directives)
         if not service_path.is_file():
             raise UnsupportedUnitSyntax(f"{timer.name} targets a unit with no file")
@@ -319,20 +349,29 @@ def firings(directory: Path) -> list[Firing]:
         for expression in timer_directives.get("OnCalendar", []):
             for slot in parse_on_calendar(expression):
                 end = slot + accuracy + delay + spec.flock_wait_s + bound + spec.timeout_stop_s
-                found.append(Firing(spec.name, slot, end))
+                found.append(Firing(timer.stem, spec.name, slot, end))
         if not timer_directives.get("OnCalendar"):
             raise UnsupportedUnitSyntax(f"{timer.name} has no OnCalendar")
     return found
 
 
 def window_overlaps(
-    directory: Path, *, launch_path_units: frozenset[str] = frozenset()
+    directory: Path,
+    *,
+    launch_path_units: frozenset[str] = frozenset(),
+    only_timer: str | None = None,
+    skip_timers: frozenset[str] = frozenset(),
 ) -> list[Firing]:
-    """Firings that meet ``[16:30Z, 17:10Z)``, excluding launch-path units (the table's job)."""
+    """Firings that meet ``[16:30Z, 17:10Z)``, excluding launch-path units (the table's job).
+
+    ``only_timer`` restricts the result to one timer; ``skip_timers`` drops carried timers.
+    """
     return [
         f
         for f in firings(directory)
         if f.unit not in launch_path_units
+        and f.timer not in skip_timers
+        and (only_timer is None or f.timer == only_timer)
         and f.slot_s < WINDOW_END_S
         and f.worst_end_s > WINDOW_START_S
     ]
@@ -350,23 +389,21 @@ def deployed_launch_path_violations(directory: Path, units: frozenset[str]) -> l
     return late
 
 
-#: Deployed units that overlap the window today, with the reason each stands. Every row is a finding
-#: for the coordinator; the owner removes the row in the commit that fixes the unit.
-KNOWN_WINDOW_OVERLAPS: Final[Mapping[str, str]] = {
-    "breezy-quote-tape-ingest.service": (
-        "R13 / AUT-6 r15 O-1: breezy-quote-tape-ingest-frequent.timer fires *:0/15, so at "
-        "16:30, 16:45 and 17:00, and TimeoutStartSec=1800 keeps a run alive past 17:00; the unit "
-        "is not an ARCH section 5.2 row and cannot be one (it ends after the next fixed point). "
-        "Fix: reschedule or bound it. Owner: ARCH-0 coordinator with ING-2 (a deploy change, "
-        "not seam 4a)."
-    ),
-    "breezy-discovery-pull.service": (
-        "breezy-discovery-pull.timer fires at 16:52, inside the window, by design under the "
-        "'light-job exemption' (its own timer comment), but TimeoutStartSec=1800 runs to about "
-        "17:22 and ARCH section 5.2 lists no such row. Fix: list it as a bounded row or "
-        "reschedule it. Owner: ARCH-0 coordinator (a deploy change, not seam 4a)."
-    ),
-}
+#: Deployed timers that overlap the window today. Each is carried as a strict-xfail parameter of
+#: ``test_no_unit_overlaps_launch_window`` (owner AUT-6:O-1, a ledger row each), not exempted: the
+#: parameter asserts the timer does not overlap, so it XPASSes, fails strict, and forces its row and
+#: parameter out in the commit that fixes the deploy unit. Both are findings for the coordinator.
+#:
+#: * ``breezy-quote-tape-ingest-frequent`` (R13 / AUT-6 r15 O-1) fires ``*:0/15``, so at 16:30,
+#:   16:45 and 17:00, and ``TimeoutStartSec=1800`` keeps a run alive past 17:00. It is not an ARCH
+#:   section 5.2 row and cannot be one (it ends after the next fixed point).
+#: * ``breezy-discovery-pull`` fires at 16:52 by design under its own "light-job exemption", but
+#:   ``TimeoutStartSec=1800`` runs it to about 17:22 and ARCH section 5.2 lists no such row.
+KNOWN_OVERLAP_TIMERS: Final[tuple[str, ...]] = (
+    "breezy-quote-tape-ingest-frequent",
+    "breezy-discovery-pull",
+)
+KNOWN_OVERLAP_PARAM_PREFIX: Final = "known_overlap_"
 
 
 # ---------------------------------------------------------------------------
@@ -374,16 +411,45 @@ KNOWN_WINDOW_OVERLAPS: Final[Mapping[str, str]] = {
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("unit_set", ["existing_units"])
+@pytest.mark.parametrize(
+    "unit_set",
+    [
+        "existing_units",
+        pytest.param(
+            "known_overlap_breezy-quote-tape-ingest-frequent",
+            id="known_overlap_breezy-quote-tape-ingest-frequent",
+            marks=pytest.mark.xfail(
+                strict=True, raises=OwnerPending, reason="AUT-6:O-1; blocks none"
+            ),
+        ),
+        pytest.param(
+            "known_overlap_breezy-discovery-pull",
+            id="known_overlap_breezy-discovery-pull",
+            marks=pytest.mark.xfail(
+                strict=True, raises=OwnerPending, reason="AUT-6:O-1; blocks none"
+            ),
+        ),
+    ],
+)
 def test_no_unit_overlaps_launch_window(unit_set: str) -> None:
+    if unit_set.startswith(KNOWN_OVERLAP_PARAM_PREFIX):
+        timer = unit_set.removeprefix(KNOWN_OVERLAP_PARAM_PREFIX)
+        assert timer in KNOWN_OVERLAP_TIMERS
+        found = window_overlaps(DEPLOYED_DIR, only_timer=timer)
+        if found:  # carried: an overlap raises OwnerPending; no overlap XPASSes and fails strict
+            raise OwnerPending(
+                f"{timer} overlaps: {[(fmt(f.slot_s), fmt(f.worst_end_s)) for f in found]}"
+            )
+        return
     assert unit_set == "existing_units"
-    found = window_overlaps(DEPLOYED_DIR, launch_path_units=DEPLOYED_LAUNCH_PATH_UNITS)
-    overlapping = {f.unit for f in found}
-    assert overlapping == set(KNOWN_WINDOW_OVERLAPS), (
-        "units overlapping the 16:30Z-17:10Z window changed: "
-        f"{sorted(overlapping ^ set(KNOWN_WINDOW_OVERLAPS))}; firings: "
-        f"{[(f.unit, fmt(f.slot_s), fmt(f.worst_end_s)) for f in found]}"
+    found = window_overlaps(
+        DEPLOYED_DIR,
+        launch_path_units=DEPLOYED_LAUNCH_PATH_UNITS,
+        skip_timers=frozenset(KNOWN_OVERLAP_TIMERS),
     )
+    assert found == [], [(f.timer, fmt(f.slot_s), fmt(f.worst_end_s)) for f in found]
+    all_timers = {f.timer for f in firings(DEPLOYED_DIR)}
+    assert set(KNOWN_OVERLAP_TIMERS) <= all_timers
     assert len(firings(DEPLOYED_DIR)) >= MIN_DEPLOYED_FIRINGS
 
 
@@ -568,8 +634,8 @@ def test_the_launch_path_table_matches_the_arch_firings() -> None:
     ].ends_after_s == hms("16:41:15")
 
 
-def test_known_overlaps_name_the_r13_ingest_unit() -> None:
-    assert "breezy-quote-tape-ingest.service" in KNOWN_WINDOW_OVERLAPS
+def test_the_r13_ingest_unit_has_an_effective_timeout_of_1800() -> None:
+    assert "breezy-quote-tape-ingest-frequent" in KNOWN_OVERLAP_TIMERS
     spec = parse_service(
         "breezy-quote-tape-ingest.service",
         (DEPLOYED_DIR / "breezy-quote-tape-ingest.service").read_text(encoding="utf-8"),
@@ -577,3 +643,59 @@ def test_known_overlaps_name_the_r13_ingest_unit() -> None:
     )
     assert spec.timeout_start_s == 1800  # R13: the effective TimeoutStartSec
     assert spec.service_type == "oneshot"
+
+
+def test_one_overlap_does_not_hide_another(tmp_path: Path) -> None:
+    _write_unit(
+        tmp_path, "first", calendar="*-*-* 16:40:00 UTC", service=_ONESHOT.format(timeout=60)
+    )
+    _write_unit(
+        tmp_path, "second", calendar="*-*-* 16:50:00 UTC", service=_ONESHOT.format(timeout=60)
+    )
+    assert {f.timer for f in window_overlaps(tmp_path)} == {"first", "second"}
+    assert {f.timer for f in window_overlaps(tmp_path, skip_timers=frozenset({"first"}))} == {
+        "second"
+    }
+    assert {f.timer for f in window_overlaps(tmp_path, only_timer="first")} == {"first"}
+
+
+def _dropin(directory: Path, unit_file: str, text: str, name: str = "override.conf") -> None:
+    folder = directory / f"{unit_file}.d"
+    folder.mkdir(exist_ok=True)
+    (folder / name).write_text(text, encoding="utf-8")
+
+
+def test_a_service_dropin_that_raises_timeout_start_sec_is_applied(tmp_path: Path) -> None:
+    _write_unit(tmp_path, "u", calendar="*-*-* 16:00:00 UTC", service=_ONESHOT.format(timeout=60))
+    assert window_overlaps(tmp_path) == []
+    _dropin(tmp_path, "u.service", "[Service]\nTimeoutStartSec=3000\n")
+    assert [f.timer for f in window_overlaps(tmp_path)] == ["u"]
+
+
+def test_a_service_dropin_that_makes_the_unit_a_daemon_is_applied(tmp_path: Path) -> None:
+    _write_unit(tmp_path, "u", calendar="*-*-* 09:00:00 UTC", service=_ONESHOT.format(timeout=60))
+    _dropin(tmp_path, "u.service", "[Service]\nType=simple\nTimeoutStartSec=\n")
+    assert [f.timer for f in window_overlaps(tmp_path)] == ["u"]  # unbounded daemon
+
+
+def test_a_timer_dropin_that_adds_an_oncalendar_slot_is_applied(tmp_path: Path) -> None:
+    _write_unit(tmp_path, "u", calendar="*-*-* 09:00:00 UTC", service=_ONESHOT.format(timeout=60))
+    _dropin(tmp_path, "u.timer", "[Timer]\nOnCalendar=*-*-* 16:45:00 UTC\n")
+    assert [f.slot_s for f in window_overlaps(tmp_path)] == [hms("16:45")]
+
+
+def test_a_timer_dropin_that_resets_oncalendar_replaces_the_schedule(tmp_path: Path) -> None:
+    _write_unit(tmp_path, "u", calendar="*-*-* 16:45:00 UTC", service=_ONESHOT.format(timeout=60))
+    assert window_overlaps(tmp_path)
+    _dropin(tmp_path, "u.timer", "[Timer]\nOnCalendar=\nOnCalendar=*-*-* 09:00:00 UTC\n")
+    assert window_overlaps(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "text", ["[Service]\nthis is not a directive\n", "[Service]\nExecStart=a \\\n b\n"]
+)
+def test_an_unparseable_dropin_fails_closed(tmp_path: Path, text: str) -> None:
+    _write_unit(tmp_path, "u", calendar="*-*-* 09:00:00 UTC", service=_ONESHOT.format(timeout=60))
+    _dropin(tmp_path, "u.service", text)
+    with pytest.raises(UnsupportedUnitSyntax):
+        firings(tmp_path)

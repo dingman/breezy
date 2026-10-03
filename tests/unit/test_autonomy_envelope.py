@@ -904,3 +904,23 @@ def test_judged_sets_are_nested_and_repo_relative() -> None:
     assert core <= autonomy
     assert all(path.startswith(("src/", "scripts/")) for path in autonomy)
     assert "src/breezy/persistence/autonomy/single_read.py" in core
+
+
+def test_envelope_scans_judge_autonomy_prefixed_packages(tmp_path: Path) -> None:
+    """Ruling A4-R1: the shared predicate reaches ``autonomy_*`` packages for every scan."""
+    src = tmp_path / "src" / "breezy"
+    planted = [
+        src / "strategy" / "autonomy_capture" / "w.py",
+        src / "analysis" / "autonomy_refit" / "w.py",
+    ]
+    for path in planted:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "import dataclasses\nX = dataclasses.asdict\nimport urllib.request\n", "utf-8"
+        )
+    judged = autonomy_source_files(src, tmp_path / "scripts")
+    assert judged == sorted(planted)
+    for path in judged:
+        text = path.read_text(encoding="utf-8")
+        assert _scan_asdict(str(path), text)
+        assert _scan_alert_egress(str(path), text)
