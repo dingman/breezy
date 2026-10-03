@@ -5,7 +5,7 @@ needs, so the docker, snapd and system-bus sockets stay hidden. In this order:
 
 (a) ``resolves_dns``: the ``/etc/resolv.conf`` target, if it lies under ``/run/``
     (fd bind);
-(b) ``E7A_R2_NOTIFY``: ``$NOTIFY_SOCKET`` under ``/run/user/<uid>/systemd/`` (path bind);
+(b) ``E7A_R2_NOTIFY``: ``$NOTIFY_SOCKET`` exactly ``/run/user/<uid>/systemd/notify`` (path bind);
 (c) ``E7_STUDIES_LOCK``: ``/run/user/<uid>/breezy-studies.lock``, a regular file owned
     by the uid with ``st_nlink == 1`` (fd bind);
 (d) ``E7A_R2_RECONCILE``: ``$CREDENTIALS_DIRECTORY`` (fd bind).
@@ -90,8 +90,7 @@ def _notify(roots: SandboxRoots, environ: Mapping[str, str]) -> RunRebind:
     value = environ.get(NOTIFY_SOCKET_VAR, "")
     if not value:
         raise RunMountError("notify_missing")
-    allowed = f"{roots.run_user}/systemd/"
-    if not value.startswith(allowed) or os.path.normpath(value) != value:
+    if not value.startswith("/") or value != f"{roots.run_user}/systemd/notify":
         raise RunMountError("notify_path")
     codes = {"*": "notify_socket"}
     walked = _walk(value, "socket", codes)
@@ -148,7 +147,7 @@ def _credentials(
     for st in entries.values():
         if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != CREDENTIAL_FILE_MODE:
             raise RunMountError("credentials_file")
-        if st.st_uid != roots.uid:
+        if st.st_uid != roots.uid or st.st_nlink != 1:
             raise RunMountError("credentials_file")
     return RunRebind("credentials", dest=expected, fd=walked.fd)
 

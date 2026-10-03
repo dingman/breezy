@@ -39,13 +39,33 @@ UNWRAPPED_RESIDUAL_UNITS: Final[Mapping[str, str]] = MappingProxyType({})
 
 #: ``credential_env`` keys are applied by ``--setenv`` AFTER the fixed
 #: environment, so a table edit could otherwise override it (B5-R4).
-CREDENTIAL_ENV_DENIED_EXACT: Final[frozenset[str]] = frozenset({"PATH", "HOME", "TMPDIR"})
+CREDENTIAL_ENV_DENIED_EXACT: Final[frozenset[str]] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "GLIBC_TUNABLES",
+        "GCONV_PATH",
+        "LOCPATH",
+        "NOTIFY_SOCKET",
+        "CREDENTIALS_DIRECTORY",
+        "BASH_ENV",
+        "NODE_OPTIONS",
+    }
+)
 CREDENTIAL_ENV_DENIED_PREFIXES: Final[tuple[str, ...]] = (
     "XDG_",
     "LD_",
     "PYTHON",
     "BREEZY_AUTONOMY_",
+    "SSL_CERT_",
 )
+#: A bus read may never name a property carrying a unit's environment or credentials (B6-R3).
+_SECRET_PROPERTY_MARKERS: Final[tuple[str, ...]] = ("Environment", "Credential")
+_PROPERTY_OPTION_PREFIX: Final = "--property="
+
+#: The only home-relative config paths a row may bind read-only (B6-R2).
+CONFIG_RO_ALLOWLIST: Final[frozenset[str]] = frozenset({".config/systemd/user"})
 
 SYSTEMCTL: Final = "/usr/bin/systemctl"
 #: The read verbs of the bus-snapshot grammar. ``kill``/``start``/``stop``/
@@ -289,8 +309,13 @@ def _check_binds(row: BwrapRow) -> None:
             shorter = min(len(one), len(other))
             if one[:shorter] == other[:shorter]:
                 raise _fail(row.name, "binds must be distinct and not nested")
-    for rel in (*row.config_ro_binds, *row.config_ro_dirs):
+    config = (*row.config_ro_binds, *row.config_ro_dirs)
+    for rel in config:
         _rel_parts(row.name, rel, "config bind")
+    if config and "E7_CONFIG_DIR" not in row.exceptions:
+        raise _fail(row.name, "config binds require the E7_CONFIG_DIR exception")
+    if any(rel not in CONFIG_RO_ALLOWLIST for rel in config):
+        raise _fail(row.name, "config bind is not on the CONFIG_RO_ALLOWLIST allowlist")
     for rel, probe in row.positive_probe.items():
         if rel not in row.binds or probe.kind not in POSITIVE_PROBE_KINDS:
             raise _fail(row.name, "positive_probe needs a bound path and a known kind")
@@ -316,9 +341,19 @@ def _check_bus_read(row: str, read: BusRead) -> None:
             index += 1
             if index >= len(tokens) or not _PROPERTY_RE.fullmatch(tokens[index]):
                 raise _fail(row, f"bus read {read.name!r}: -p takes exactly one property token")
+            _check_property_names(row, read.name, tokens[index])
         elif not _is_bare_option(token):
             raise _fail(row, f"bus read {read.name!r}: option {token!r} is not in the grammar")
+        elif token.startswith(_PROPERTY_OPTION_PREFIX):
+            _check_property_names(row, read.name, token[len(_PROPERTY_OPTION_PREFIX) :])
         index += 1
+
+
+def _check_property_names(row: str, name: str, value: str) -> None:
+    if any(marker in value for marker in _SECRET_PROPERTY_MARKERS):
+        raise _fail(
+            row, f"bus read {name!r}: Environment/Credential properties are refused (B6-R3)"
+        )
 
 
 def _is_bare_option(token: str) -> bool:

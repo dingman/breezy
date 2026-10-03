@@ -198,21 +198,51 @@ def test_notify_socket_dotdot_escape_is_refused(roots: SandboxRoots) -> None:
     _refused(_row(**NOTIFY_ROW), roots, "notify_path", {"NOTIFY_SOCKET": escape})
 
 
+@pytest.mark.parametrize("name", ["private", "notify2", "notify.sock"])
+def test_notify_socket_sibling_name_is_refused(roots: SandboxRoots, name: str) -> None:
+    sibling = roots.run_user / "systemd" / name
+    old = os.getcwd()
+    os.chdir(roots.run_user / "systemd")
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(name)
+    finally:
+        os.chdir(old)
+    try:
+        _refused(_row(**NOTIFY_ROW), roots, "notify_path", {"NOTIFY_SOCKET": str(sibling)})
+    finally:
+        sock.close()
+
+
+def test_notify_socket_private_refused(roots: SandboxRoots) -> None:
+    old = os.getcwd()
+    os.chdir(roots.run_user / "systemd")
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind("private")
+    finally:
+        os.chdir(old)
+    try:
+        value = f"{roots.run_user}/systemd/private"
+        _refused(_row(**NOTIFY_ROW), roots, "notify_path", {"NOTIFY_SOCKET": value})
+    finally:
+        sock.close()
+
+
 def test_notify_path_that_is_not_a_socket_or_is_a_symlink_is_refused(
     roots: SandboxRoots, notify_socket: Path
 ) -> None:
-    plain = roots.run_user / "systemd" / "plain"
-    plain.write_text("x")
-    _refused(_row(**NOTIFY_ROW), roots, "notify_socket", {"NOTIFY_SOCKET": str(plain)})
-    link = roots.run_user / "systemd" / "link"
-    link.symlink_to(notify_socket)
-    _refused(_row(**NOTIFY_ROW), roots, "notify_socket", {"NOTIFY_SOCKET": str(link)})
-    _refused(
-        _row(**NOTIFY_ROW),
-        roots,
-        "notify_socket",
-        {"NOTIFY_SOCKET": str(roots.run_user / "systemd" / "absent")},
-    )
+    other = roots.run_user / "systemd" / "other-socket"
+    other.write_text("x")
+    environ = {"NOTIFY_SOCKET": str(notify_socket)}
+    notify_socket.unlink()
+    notify_socket.write_text("x")
+    _refused(_row(**NOTIFY_ROW), roots, "notify_socket", environ)
+    notify_socket.unlink()
+    notify_socket.symlink_to(other)
+    _refused(_row(**NOTIFY_ROW), roots, "notify_socket", environ)
+    notify_socket.unlink()
+    _refused(_row(**NOTIFY_ROW), roots, "notify_socket", environ)
 
 
 def test_notify_socket_owned_by_someone_else_is_refused(
@@ -408,6 +438,16 @@ def test_credentials_dir_mode_owner_and_contents_are_exact(roots: SandboxRoots) 
     (directory / SECRET).unlink()
     directory.chmod(0o500)
     _refused(row, roots, "credentials_contents", env, unit=LEAF)
+
+
+@pytest.mark.usefixtures("_unlock")
+def test_credential_file_with_extra_hardlink_is_refused(roots: SandboxRoots) -> None:
+    directory = _make_creds(roots)
+    os.link(directory / SECRET, roots.run_user / "second-name")
+    assert os.stat(directory / SECRET).st_nlink == 2
+    _refused(
+        _cred_row(), roots, "credentials_file", {"CREDENTIALS_DIRECTORY": str(directory)}, unit=LEAF
+    )
 
 
 @pytest.mark.usefixtures("_unlock")

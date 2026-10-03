@@ -170,14 +170,24 @@ def _refuse_nested(walked: Walked, earlier: list[Walked]) -> None:
             raise BindIntegrityError("nested")
 
 
+def _refuse_unsafe_owner_or_mode(walked: Walked, roots: SandboxRoots) -> None:
+    if walked.st.st_uid != roots.uid:
+        raise BindIntegrityError("owner")
+    if walked.st.st_mode & _UNSAFE_WRITE_BITS:
+        raise BindIntegrityError("writable")
+
+
 def _open_data_binds(
-    stack: ExitStack, row: BwrapRow, roots: SandboxRoots, forbidden: frozenset[Ident]
+    stack: ExitStack,
+    row: BwrapRow,
+    roots: SandboxRoots,
+    forbidden: frozenset[Ident],
+    earlier: list[Walked],
 ) -> tuple[OpenedBind, ...]:
     if not row.binds:
         return ()
     base_path = _base_path(row, roots)
     base = _walk_registered(stack, base_path, "dir")
-    earlier: list[Walked] = []
     opened: list[OpenedBind] = []
     for rel in row.binds:
         path = f"{base_path}/{rel}"
@@ -185,6 +195,7 @@ def _open_data_binds(
         if walked.st.st_dev != base.st.st_dev:
             raise BindIntegrityError("wrong_device")
         _refuse_forbidden(walked, len(base.chain), forbidden)
+        _refuse_unsafe_owner_or_mode(walked, roots)
         _refuse_nested(walked, earlier)
         earlier.append(walked)
         opened.append(OpenedBind(rel, path, walked.fd, walked.st.st_dev, walked.st.st_ino))
@@ -198,16 +209,16 @@ def _open_config(
     roots: SandboxRoots,
     home: Walked,
     forbidden: frozenset[Ident],
+    earlier: list[Walked],
 ) -> tuple[OpenedBind, ...]:
     opened: list[OpenedBind] = []
     for rel in rels:
         path = f"{roots.home}/{rel}"
         walked = _walk_registered(stack, path, kind)
         _refuse_forbidden(walked, len(home.chain), forbidden)
-        if walked.st.st_uid != roots.uid:
-            raise BindIntegrityError("owner")
-        if walked.st.st_mode & _UNSAFE_WRITE_BITS:
-            raise BindIntegrityError("writable")
+        _refuse_unsafe_owner_or_mode(walked, roots)
+        _refuse_nested(walked, earlier)
+        earlier.append(walked)
         opened.append(OpenedBind(rel, path, walked.fd, walked.st.st_dev, walked.st.st_ino))
     return tuple(opened)
 
@@ -221,11 +232,14 @@ def open_validated_binds(row: BwrapRow, roots: SandboxRoots) -> Iterator[OpenedB
     """
     with ExitStack() as stack:
         forbidden = forbidden_dirs(roots)
-        data = _open_data_binds(stack, row, roots, forbidden)
+        earlier: list[Walked] = []
+        data = _open_data_binds(stack, row, roots, forbidden, earlier)
         files: tuple[OpenedBind, ...] = ()
         dirs: tuple[OpenedBind, ...] = ()
         if row.config_ro_binds or row.config_ro_dirs:
             home = _walk_registered(stack, roots.home, "dir")
-            files = _open_config(stack, row.config_ro_binds, "file", roots, home, forbidden)
-            dirs = _open_config(stack, row.config_ro_dirs, "dir", roots, home, forbidden)
+            files = _open_config(
+                stack, row.config_ro_binds, "file", roots, home, forbidden, earlier
+            )
+            dirs = _open_config(stack, row.config_ro_dirs, "dir", roots, home, forbidden, earlier)
         yield OpenedBinds(binds=data, config_files=files, config_dirs=dirs)

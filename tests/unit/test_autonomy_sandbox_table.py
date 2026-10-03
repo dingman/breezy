@@ -20,6 +20,7 @@ from breezy.runtime.autonomy_sandbox.table import (
     ALTERNATE_BIND_BASES,
     AUTONOMY_BWRAP_TABLE,
     AUTONOMY_OWNED_UNITS,
+    CONFIG_RO_ALLOWLIST,
     CREDENTIAL_ENV_DENIED_EXACT,
     CREDENTIAL_ENV_DENIED_PREFIXES,
     KNOWN_EXCEPTIONS,
@@ -148,8 +149,27 @@ def test_constants_have_the_seam_b_values() -> None:
     assert NOTIFIER_FALLBACK_ROWS == frozenset()
     assert AUTONOMY_OWNED_UNITS == frozenset()
     assert dict(UNWRAPPED_RESIDUAL_UNITS) == {}
-    assert CREDENTIAL_ENV_DENIED_EXACT == frozenset({"PATH", "HOME", "TMPDIR"})
-    assert CREDENTIAL_ENV_DENIED_PREFIXES == ("XDG_", "LD_", "PYTHON", "BREEZY_AUTONOMY_")
+    assert CREDENTIAL_ENV_DENIED_EXACT == frozenset(
+        {
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "GLIBC_TUNABLES",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NOTIFY_SOCKET",
+            "CREDENTIALS_DIRECTORY",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+        }
+    )
+    assert CREDENTIAL_ENV_DENIED_PREFIXES == (
+        "XDG_",
+        "LD_",
+        "PYTHON",
+        "BREEZY_AUTONOMY_",
+        "SSL_CERT_",
+    )
     assert RUN_TRANSIENT_SHOW_ARGV == (
         SYSTEMCTL,
         "--user",
@@ -367,6 +387,15 @@ def test_credential_env_key_shape(key: str) -> None:
         "PYTHON",
         "BREEZY_AUTONOMY_BWRAP_ROW",
         "BREEZY_AUTONOMY_SANDBOX_DEGRADED",
+        "GLIBC_TUNABLES",
+        "GCONV_PATH",
+        "LOCPATH",
+        "NOTIFY_SOCKET",
+        "CREDENTIALS_DIRECTORY",
+        "BASH_ENV",
+        "NODE_OPTIONS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
     ],
 )
 def test_credential_env_key_denylist(key: str) -> None:
@@ -376,6 +405,48 @@ def test_credential_env_key_denylist(key: str) -> None:
 @pytest.mark.parametrize("key", [SECRET_ENV, "PATHS", "HOME_DIR", "XDG", "LDX", "BREEZY_OTHER"])
 def test_credential_env_key_outside_denylist_is_valid(key: str) -> None:
     validate_table(_table(_credential_row({key: SECRET_NAME})))
+
+
+# ------------------------------------------------- B6-R3 bus properties, B6-R2 config
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ("-p", "Environment", "--", "breezy-x.service"),
+        ("-p", "Id,LoadCredential", "--", "breezy-x.service"),
+        ("-p", "EnvironmentFiles", "--", "breezy-x.service"),
+        ("--property=Id,LoadCredential", "--", "breezy-x.service"),
+        ("--property=PassEnvironment", "--", "breezy-x.service"),
+        ("-p", "SetCredential", "--", "breezy-x.service"),
+    ],
+)
+def test_bus_read_environment_and_credential_properties_refused(tail: tuple[str, ...]) -> None:
+    _invalid(_with(bus_reads=(_read(*tail),)))
+
+
+def test_config_ro_allowlist_is_exact() -> None:
+    assert frozenset({".config/systemd/user"}) == CONFIG_RO_ALLOWLIST
+
+
+def _config_row(**changes: Any) -> BwrapRow:
+    return _with(exceptions=_row().exceptions | {"E7_CONFIG_DIR"}, **changes)
+
+
+def test_config_dir_on_allowlist_with_label_is_valid() -> None:
+    validate_table(_table(_config_row(config_ro_dirs=(".config/systemd/user",))))
+    validate_table(_table(_config_row(config_ro_binds=(".config/systemd/user",))))
+
+
+@pytest.mark.parametrize("field", ["config_ro_binds", "config_ro_dirs"])
+def test_config_entry_without_the_label_refused(field: str) -> None:
+    _invalid(_with(**{field: (".config/systemd/user",)}), match="E7_CONFIG_DIR")
+
+
+@pytest.mark.parametrize("field", ["config_ro_binds", "config_ro_dirs"])
+@pytest.mark.parametrize("rel", [".ssh", ".config/systemd", ".config/systemd/user/x", ".config"])
+def test_config_entry_off_the_allowlist_refused(field: str, rel: str) -> None:
+    _invalid(_config_row(**{field: (rel,)}), match="allowlist")
 
 
 # --------------------------------------------------------- exception label biconditionals

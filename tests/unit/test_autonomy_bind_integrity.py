@@ -49,6 +49,9 @@ def _roots(tmp_path: Path, **changes: Any) -> SandboxRoots:
 def roots(tmp_path: Path) -> SandboxRoots:
     for rel in ("state/inner", "registry", "cache/a", "cache/b", "cache/a2"):
         (_roots(tmp_path).data_root / rel).mkdir(parents=True)
+    # The host umask may be 002; data binds must not be group-writable (B6-R2).
+    for path in _roots(tmp_path).data_root.rglob("*"):
+        path.chmod(0o755)
     return _roots(tmp_path)
 
 
@@ -286,7 +289,8 @@ def test_sibling_binds_are_accepted(roots: SandboxRoots, pair: tuple[str, str]) 
 
 
 def test_nested_binds_are_refused_in_either_order(roots: SandboxRoots) -> None:
-    (roots.data_root / "cache" / "a" / "deep").mkdir()
+    (roots.data_root / "cache" / "a" / "deep").mkdir(mode=0o755)
+    (roots.data_root / "cache" / "a" / "deep").chmod(0o755)
     _refused(roots, _row("cache/a", "cache/a/deep"), "nested")
     _refused(roots, _row("cache/a/deep", "cache/a"), "nested")
 
@@ -306,6 +310,7 @@ def test_fixture_root_row_resolves_against_the_alternate_base(
 ) -> None:
     fixture = roots.home / ".local" / "share" / "breezy-autonomy-fixture"
     (fixture / "cache" / "only-here").mkdir(parents=True)
+    (fixture / "cache" / "only-here").chmod(0o755)
     row = _row("cache/only-here", bind_base="aut4_fixture", exceptions=FIXTURE_LABEL)
     with open_validated_binds(row, roots) as opened:
         assert opened.binds[0].path == str(fixture / "cache" / "only-here")
@@ -376,3 +381,57 @@ def test_config_owned_by_someone_else_or_group_writable_is_refused(
 
 def test_config_cannot_alias_state(roots: SandboxRoots) -> None:
     _refused(roots, _row(config_ro_dirs=(".local/share/breezy/state",)), "forbidden")
+
+
+def test_config_vs_config_and_config_vs_data_nesting_refused(
+    roots: SandboxRoots, config_files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (config_files / "dir" / "inner").mkdir()
+    config_files.chmod(0o755)
+    _refused(
+        roots,
+        _row(config_ro_dirs=(".config/breezy-x", ".config/breezy-x/dir")),
+        "nested",
+    )
+    _refused(
+        roots,
+        _row(config_ro_dirs=(".config/breezy-x/dir", ".config/breezy-x")),
+        "nested",
+    )
+    _refused(
+        roots,
+        _row(config_ro_dirs=(".config/breezy-x/dir", ".config/breezy-x/dir")),
+        "nested",
+    )
+    # Ancestors of the data root are forbidden for config, which would mask the nested
+    # check on a fixture base under ``.local/share``; neutralise it to reach the check.
+    monkeypatch.setattr(binds_module, "forbidden_dirs", lambda _roots: frozenset())
+    fixture = roots.home / ".local" / "share" / "breezy-autonomy-fixture" / "cache"
+    (fixture / "a" / "deep").mkdir(parents=True)
+    for path in (fixture, fixture / "a", fixture / "a" / "deep"):
+        path.chmod(0o755)
+    rel = ".local/share/breezy-autonomy-fixture/cache/a"
+    alt = {"bind_base": "aut4_fixture", "exceptions": FIXTURE_LABEL}
+    _refused(roots, _row("cache/a", config_ro_dirs=(rel,), **alt), "nested")
+    _refused(roots, _row("cache/a", config_ro_dirs=(f"{rel}/deep",), **alt), "nested")
+    _refused(roots, _row("cache/a/deep", config_ro_dirs=(rel,), **alt), "nested")
+
+
+def test_sibling_config_and_data_are_accepted(roots: SandboxRoots, config_files: Path) -> None:
+    row = _row("cache/a", config_ro_dirs=(".config/breezy-x/dir",))
+    with open_validated_binds(row, roots) as opened:
+        assert len(opened.binds) == 1 and len(opened.config_dirs) == 1
+
+
+def test_data_bind_owned_by_someone_else_is_refused(roots: SandboxRoots) -> None:
+    _refused(dataclasses.replace(roots, uid=os.getuid() + 1), _row("cache/a"), "owner")
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777])
+def test_data_bind_group_or_world_writable_is_refused(roots: SandboxRoots, mode: int) -> None:
+    target = roots.data_root / "cache" / "a"
+    target.chmod(mode)
+    try:
+        _refused(roots, _row("cache/a"), "writable")
+    finally:
+        target.chmod(0o755)
