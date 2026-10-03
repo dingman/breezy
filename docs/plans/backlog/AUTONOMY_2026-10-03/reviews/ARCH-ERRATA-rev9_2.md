@@ -426,3 +426,8 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **Consumption.** ARCH-0 seam A (`paths.root_record`, `family_bytes.write_root_copy`, the resolver, `pins.BOOTSTRAPPED_ROOT_MANIFEST_SHA256`, `single_read` `DIR_NOT_WRITABLE`); AUT-5a bootstrap and the pre-bootstrap pins commit; AUT-7 r5 root reads; AUT-3 refit destinations. Fail-closed until filed: BOOTSTRAP refuses and nothing goes live.
 
 **Plan amendments recorded with E-14.** The complete list of ARCH and consumer-plan text that ARCH-0 seam A amends is `ARCH-0-seamA_plan_r5.md` §ERRATA-REQUEST (b) items 1–46, as modified by that plan's "Coordinator amendments to r5" (A6-R1, A6-R2). Consumer plans read those items as binding alongside this erratum.
+
+## E-15 (coordinator, 2026-10-03; from the ARCH-0 seam B WP-B2b-2 security review): per-row network namespace
+- **Finding.** The autonomy bwrap argv shares the host net namespace on every row. That leaves abstract AF_UNIX sockets (dbus, X), which `/run` masking cannot hide, and all egress reachable from every wrapped unit.
+- **Ruling.** ARCH-0 seam B adds `--unshare-ipc/-uts/-cgroup-try` (B6-R8) but does not decide network policy. Each consumer plan that adds a row (AUT-1, AUT-2, AUT-5a, AUT-6) must state, per row, whether it needs network egress. Rows that need none get `--unshare-net` through a new required row field. AF_UNIX path sockets such as NOTIFY_SOCKET stay reachable through their binds. The field and its argv emission land in the first consumer WP that adds a non-egress row.
+- **Fail-closed reading.** Until a row declares the field, a reviewer treats a missing declaration as a review blocker for that row.
