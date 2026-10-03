@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Final, Self
 
 from breezy.persistence.autonomy.canonical import CanonicalTypeError, canonical_json
@@ -66,7 +67,7 @@ LINEAGE_SCHEMA: Final = "lineage/v1"
 ROOT_SCHEMA: Final = "root/v1"
 REFIT_RUN_SCHEMA: Final = "refit_run/v1"
 FIT_STATUS_OK: Final = "OK"
-NO_CHANGE_REASON: Final = "below_delta"
+NO_CHANGE_REASONS: Final = frozenset({"below_delta", "existing_sha"})
 #: ARCH C3 ``leakage_assertions``: these three are always present and always passed.
 REQUIRED_LEAKAGE_ASSERTIONS: Final = (
     "no_sealed_holdout_rows_in_train",
@@ -75,9 +76,9 @@ REQUIRED_LEAKAGE_ASSERTIONS: Final = (
 )
 
 _UTC_RE: Final = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z", re.ASCII)
-_GIT_SHA_RE: Final = re.compile(r"\A[0-9a-f]{7,64}\Z", re.ASCII)
+_GIT_SHA_RE: Final = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z", re.ASCII)
 _NAME_RE: Final = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
-_REASON_RE: Final = re.compile(r"\A[a-z0-9_]{1,64}\Z", re.ASCII)
+_REASON_RE: Final = re.compile(r"\A[a-z0-9_]{1,64}(?::[0-9a-f]{64})?\Z", re.ASCII)
 _RUN_ID_RE: Final = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z", re.ASCII)
 _SOURCE_RE: Final = re.compile(r"\A[a-z0-9_.:-]{1,64}\Z", re.ASCII)
 _NS_PER_S: Final = 10**9
@@ -202,14 +203,33 @@ def _check_leakage(assertions: object) -> tuple[LeakageAssertion, ...]:
     return assertions
 
 
-def _check_params(params: object) -> Mapping[str, Any]:
+def _freeze(value: object) -> object:
+    """A detached, immutable copy: mappings become read-only proxies, lists become tuples."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {k: _thaw(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(v) for v in value]
+    return value
+
+
+def _frozen_params(params: object) -> Mapping[str, Any]:
     if not isinstance(params, Mapping):
         raise WireRefused(WireRefusalReason.WRONG_TYPE, "params")
     try:
-        canonical_json(params)
+        canonical_json(_thaw(params))
     except CanonicalTypeError:
         raise _bad("params") from None
-    return params
+    frozen = _freeze(params)
+    assert isinstance(frozen, Mapping)
+    return frozen
 
 
 _LINEAGE_KEYS: Final = (
@@ -257,13 +277,15 @@ class Lineage:
         check_match(self.code_git_sha, _GIT_SHA_RE, "code_git_sha")
         check_match(self.build_sha, _GIT_SHA_RE, "build_sha")
         check_sha256(self.producer_code_sha, "producer_code_sha")
-        _check_params(self.params)
+        object.__setattr__(self, "params", _frozen_params(self.params))  # frozen on construction
         check_int(self.seed, "seed", minimum=-(2**63))
         if not _check_windows(self.data_windows):
             raise _bad("data_windows")
         self._check_own_outcome()
         _utc(self.train_end_exclusive_utc, "train_end_exclusive_utc")
         forward = _utc(self.forward_eval_start_utc, "forward_eval_start_utc")
+        if self.train_end_exclusive_utc > forward:
+            raise _bad("train_end_exclusive_utc")
         created = check_int(self.created_at_ns, "created_at_ns")
         if _instant_to_ns(forward) < created:
             raise _bad("forward_eval_start_utc")
@@ -292,6 +314,8 @@ class Lineage:
                 raise _bad("own_outcome_label_set_sha256")
         elif ablation is None or ablation == self.artefact_sha256:
             raise _bad("ablation_artefact_sha256")
+        elif self.own_outcome_gate_decisions_changed is None:
+            raise _bad("own_outcome_gate_decisions_changed")  # null exactly with the label set
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -303,7 +327,7 @@ class Lineage:
             "code_git_sha": self.code_git_sha,
             "build_sha": self.build_sha,
             "producer_code_sha": self.producer_code_sha,
-            "params": dict(self.params),
+            "params": _thaw(self.params),
             "seed": self.seed,
             "fit_status": FIT_STATUS_OK,
             "data_windows": [w.to_wire() for w in self.data_windows],
@@ -462,7 +486,7 @@ class RefitRun:
             check_sha256(self.artefact_sha256, "artefact_sha256")
         if self.reason is not None:
             check_match(self.reason, _REASON_RE, "reason")
-        if self.outcome is RefitOutcome.NO_CHANGE and self.reason != NO_CHANGE_REASON:
+        if self.outcome is RefitOutcome.NO_CHANGE and self.reason not in NO_CHANGE_REASONS:
             raise _bad("reason")  # there is no NO_CHANGE(k_max_reached)
         if self.outcome is RefitOutcome.NOT_FITTABLE and self.reason is None:
             raise _bad("reason")

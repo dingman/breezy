@@ -17,12 +17,17 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from itertools import pairwise
 from typing import Final, Self
 
-from breezy.persistence.autonomy.canonical import canonical_json, sha256_hex
+from breezy.persistence.autonomy.canonical import (
+    CanonicalTypeError,
+    canonical_json,
+    decimal_str,
+    sha256_hex,
+)
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths, family_component
 from breezy.persistence.autonomy.pins import MAX_VERDICT_VALIDITY_H
 from breezy.persistence.autonomy.single_read import (
@@ -49,7 +54,6 @@ from breezy.persistence.autonomy.wire import (
     optional_sha256,
     optional_str,
     parse_json_exact,
-    require_decimal_str,
     require_enum,
     require_exact_keys,
     require_list,
@@ -85,6 +89,12 @@ _EPOCH: Final = date(1970, 1, 1)
 _DETECTOR_RE: Final = re.compile(r"\A[a-z0-9_]+(?:[.:][a-z0-9_]+)*\Z", re.ASCII)
 _NAME_RE: Final = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 _ROLE_RE: Final = re.compile(r"\A[a-z0-9_]{1,64}\Z", re.ASCII)
+#: A5-R2: a text metric value (closed charset, at most 128 characters).
+_METRIC_TEXT_RE: Final = re.compile(r"\A[A-Za-z0-9_:.()=,-]{1,128}\Z", re.ASCII)
+
+#: A5-R2: a metric is a decimal, a text string, a bool or null. Text that is itself a canonical
+#: decimal string is refused so that one wire value has one Python type.
+MetricValue = Decimal | str | bool | None
 
 
 class VerdictKind(StrEnum):
@@ -189,7 +199,10 @@ def _strictly_increasing(values: list[object], field: str) -> None:
 
 @dataclass(frozen=True, kw_only=True)
 class Verdict:
-    """``verdict/v1`` (ARCH C4). ``inputs``, ``assumptions`` and ``metrics`` are held sorted."""
+    """``verdict/v1`` (ARCH C4). ``metrics``, ``assumptions`` and ``inputs`` are held sorted.
+
+    ``inputs`` are ordered and unique by ``(path_role, sha256)`` (A5-R3): a role may repeat.
+    """
 
     kind: VerdictKind
     subject_family_id: str
@@ -199,7 +212,7 @@ class Verdict:
     produced_at_ns: int
     valid_until_ns: int
     producer_code_sha: str
-    metrics: tuple[tuple[str, Decimal], ...] = ()
+    metrics: tuple[tuple[str, MetricValue], ...] = ()
     inputs: tuple[VerdictInput, ...] = ()
     assumptions: tuple[Assumption, ...] = ()
     subject_artefact_sha256: str | None = None
@@ -254,21 +267,21 @@ class Verdict:
                     raise _bad(field)
         if self.kind is not VerdictKind.LIVE_SEQUENTIAL and self.family_prereg_sha256 is not None:
             raise _bad("family_prereg_sha256")
-        if (
-            self.policy_ruling_sha256 is None
-            and Assumption.NO_POLICY_RULING not in self.assumptions
-        ):
-            raise _bad("policy_ruling_sha256")
+        no_ruling = Assumption.NO_POLICY_RULING in self.assumptions
+        if (self.policy_ruling_sha256 is None) != no_ruling:
+            raise _bad("policy_ruling_sha256")  # null exactly with no_policy_ruling
+        if self.valid_until_ns < self.produced_at_ns:
+            raise _bad("valid_until_ns")
 
     def _check_collections(self) -> None:
         for name, value in self.metrics:
             check_match(name, _NAME_RE, "metrics")
-            check_decimal(value, "metrics")
+            _check_metric_value(value)
         _strictly_increasing([name for name, _ in self.metrics], "metrics")
         for item in self.inputs:
             if not isinstance(item, VerdictInput):
                 raise WireRefused(WireRefusalReason.WRONG_TYPE, "inputs")
-        _strictly_increasing([item.path_role for item in self.inputs], "inputs")
+        _strictly_increasing([(item.path_role, item.sha256) for item in self.inputs], "inputs")
         for assumption in self.assumptions:
             if not isinstance(assumption, Assumption):
                 raise WireRefused(WireRefusalReason.WRONG_TYPE, "assumptions")
@@ -288,7 +301,7 @@ class Verdict:
             "outcome": self.outcome.value,
             "detector": self.detector,
             "declared_action_class": self.declared_action_class.value,
-            "metrics": {name: decimal_wire(value) for name, value in self.metrics},
+            "metrics": {name: _metric_wire(value) for name, value in self.metrics},
             "n": self.n,
             "n_min": self.n_min,
             "power": decimal_wire(self.power),
@@ -339,7 +352,7 @@ class Verdict:
                 require_enum(obj, "declared_action_class", allowed=[a.value for a in ActionClass])
             ),
             metrics=tuple(
-                sorted((name, require_decimal_str(metrics_obj, name)) for name in metrics_obj)
+                sorted((name, _metric_from_wire(metrics_obj[name])) for name in metrics_obj)
             ),
             n=optional_int(obj, "n"),
             n_min=optional_int(obj, "n_min"),
@@ -377,6 +390,39 @@ def _assumptions_from_wire(obj: Mapping[str, object]) -> tuple[Assumption, ...]:
         except ValueError:
             raise _bad("assumptions") from None
     return tuple(out)
+
+
+def _is_canonical_decimal(text: str) -> bool:
+    try:
+        return decimal_str(Decimal(text)) == text
+    except (InvalidOperation, CanonicalTypeError):
+        return False
+
+
+def _check_metric_value(value: object) -> None:
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, Decimal):
+        check_decimal(value, "metrics")
+        return
+    check_match(value, _METRIC_TEXT_RE, "metrics")
+    if _is_canonical_decimal(str(value)):
+        raise _bad("metrics")
+
+
+def _metric_wire(value: MetricValue) -> object:
+    return decimal_wire(value) if isinstance(value, Decimal) else value
+
+
+def _metric_from_wire(value: object) -> MetricValue:
+    if value is None or isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, "metrics")
+    if _is_canonical_decimal(value):
+        return Decimal(value)
+    _check_metric_value(value)
+    return value
 
 
 def _same_body_modulo_produced_at(existing: Verdict, incoming: Verdict) -> bool:

@@ -197,7 +197,7 @@ def test_inputs_and_assumptions_must_be_canonically_ordered_and_unique() -> None
     with pytest.raises(WireRefused):
         make(inputs=(VerdictInput("z", SHA_A), VerdictInput("a", SHA_A)))
     with pytest.raises(WireRefused):
-        make(inputs=(VerdictInput("a", SHA_A), VerdictInput("a", SHA_B)))
+        make(inputs=(VerdictInput("a", SHA_B), VerdictInput("a", SHA_A)))  # same role, unsorted
     with pytest.raises(WireRefused):
         make(assumptions=(Assumption.DRILL, Assumption.DRILL))
     with pytest.raises(WireRefused):
@@ -393,3 +393,90 @@ def test_refusal_messages_carry_no_path(tmp_path: Path) -> None:
     with pytest.raises(VerdictUnreadable) as info:
         read_verdict(paths, FAMILY, "2026-10-05", SHA_A)
     assert str(tmp_path) not in str(info.value)
+
+
+# --- A5-R2 metrics values, A5-R3 inputs, A5-R5 verdict LOW items -------------------------------
+
+
+def test_metric_values_admit_decimal_text_bool_and_null() -> None:
+    verdict = make(
+        metrics=(
+            ("cause_class", "RECOVERABLE_INFRA"),
+            ("day_status", "NO_INPUT"),
+            ("exec_snapshot_advisory", True),
+            ("join_ratio", Decimal("0.98")),
+            ("reason", "INCONCLUSIVE(calibration_buckets_below_min)"),
+            ("statistic", None),
+        )
+    )
+    wire = verdict.to_wire()
+    assert wire["metrics"] == {
+        "cause_class": "RECOVERABLE_INFRA",
+        "day_status": "NO_INPUT",
+        "exec_snapshot_advisory": True,
+        "join_ratio": "0.98",
+        "reason": "INCONCLUSIVE(calibration_buckets_below_min)",
+        "statistic": None,
+    }
+    assert Verdict.from_wire(parse_json_exact(canonical_json(wire))) == verdict
+
+
+def test_metric_text_golden_with_day_status_no_input() -> None:
+    verdict = make(metrics=(("day_status", "NO_INPUT"),))
+    # Independently derived: sha256 of the literal body (sorted keys, compact separators).
+    assert verdict.verdict_id == "e94075769c3ad70cd1f9f43d961b633df3b7184451522b189afe6dea08d35590"
+
+
+@pytest.mark.parametrize(
+    "bad", ["has space", "a/b", "é", "x" * 129, "semi;colon", "", "tab\t", "/home/x"]
+)
+def test_metric_text_outside_the_charset_or_length_is_refused(bad: str) -> None:
+    with pytest.raises(WireRefused):
+        make(metrics=(("m", bad),))
+    wire = make().to_wire()
+    wire["metrics"] = {"m": bad}
+    with pytest.raises(WireRefused):
+        Verdict.from_wire(wire)
+
+
+def test_metric_text_at_the_length_limit_and_every_charset_member_is_admitted() -> None:
+    assert make(metrics=(("m", "a" * 128),))
+    assert make(metrics=(("m", "AZaz09_:.()=,-"),))
+
+
+def test_metric_values_refuse_ints_floats_and_decimal_shaped_text() -> None:
+    for bad in (3, 0.5, ["x"], {"x": 1}, "12", "0.5"):  # "12" must be a Decimal, not text
+        with pytest.raises(WireRefused):
+            make(metrics=(("m", bad),))
+    wire = make().to_wire()
+    wire["metrics"] = {"m": 3}
+    with pytest.raises(WireRefused):
+        Verdict.from_wire(wire)
+    with pytest.raises(WireRefused):
+        parse_json_exact('{"schema":"verdict/v1","metrics":{"m":0.5}}')
+
+
+def test_two_refit_run_inputs_are_admitted_and_exact_duplicates_refused() -> None:
+    two = make(
+        inputs=(
+            VerdictInput("refit_run", SHA_A),
+            VerdictInput("refit_run", SHA_B),
+            VerdictInput("tape_snapshot", SHA_A),
+        )
+    )
+    assert Verdict.from_wire(parse_json_exact(canonical_json(two.to_wire()))) == two
+    with pytest.raises(WireRefused):
+        make(inputs=(VerdictInput("refit_run", SHA_A), VerdictInput("refit_run", SHA_A)))
+    with pytest.raises(WireRefused):
+        make(inputs=(VerdictInput("refit_run", SHA_B), VerdictInput("refit_run", SHA_A)))
+
+
+def test_valid_until_before_produced_at_is_refused() -> None:
+    with pytest.raises(WireRefused):
+        make(valid_until_ns=PRODUCED - 1)
+    assert make(valid_until_ns=PRODUCED)
+
+
+def test_a_policy_ruling_with_the_no_policy_ruling_assumption_is_refused() -> None:
+    with pytest.raises(WireRefused):
+        make(policy_ruling_sha256=SHA_D, assumptions=(Assumption.NO_POLICY_RULING,))

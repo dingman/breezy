@@ -687,3 +687,65 @@ def test_drill_marker_layout_matches_the_paths_builder(tmp_path: Path) -> None:
 def test_drill_marker_error_text_never_carries_a_path(tmp_path: Path) -> None:
     _marker_is_a_symlink(tmp_path)
     assert str(tmp_path) not in repr(read_at(tmp_path))
+
+
+# --- A5-R4 / A5-R5 lineage and refit_run items --------------------------------------------------
+
+
+@pytest.mark.parametrize("reason", ["below_delta", "existing_sha"])
+def test_refit_run_no_change_takes_below_delta_or_existing_sha(reason: str) -> None:
+    run = refit_run(outcome=RefitOutcome.NO_CHANGE, artefact_sha256=None, reason=reason)
+    assert RefitRun.from_wire(parse_json_exact(canonical_json(run.to_wire()))) == run
+
+
+def test_refit_run_reason_regex_admits_a_sha_suffix_and_refuses_others() -> None:
+    sha_reason = f"engine_refused:{SHA_A}"
+    assert refit_run(outcome=RefitOutcome.REFUSED, artefact_sha256=None, reason=sha_reason)
+    for bad in (f"engine_refused:{SHA_A[:-1]}", f"engine_refused:{'A' * 64}", "a:b", ":" + SHA_A):
+        with pytest.raises(WireRefused):
+            refit_run(outcome=RefitOutcome.REFUSED, artefact_sha256=None, reason=bad)
+    with pytest.raises(WireRefused):  # NO_CHANGE stays a closed set
+        refit_run(outcome=RefitOutcome.NO_CHANGE, artefact_sha256=None, reason=sha_reason)
+
+
+@pytest.mark.parametrize("field", ["build_sha", "code_git_sha"])
+@pytest.mark.parametrize("bad", ["abc1234", "0" * 39, "0" * 41, "0" * 63, "G" * 40])
+def test_lineage_git_shas_must_be_full_length(field: str, bad: str) -> None:
+    with pytest.raises(WireRefused):
+        lineage(**{field: bad})
+    assert lineage(**{field: "0" * 40})
+    assert lineage(**{field: "0" * 64})
+
+
+def test_lineage_train_end_must_not_follow_forward_eval_start() -> None:
+    with pytest.raises(WireRefused):
+        lineage(train_end_exclusive_utc="2026-10-04T08:00:01Z")
+    assert lineage(train_end_exclusive_utc="2026-10-04T08:00:00Z")
+
+
+def test_lineage_own_outcome_gate_count_and_label_set_are_null_together() -> None:
+    both = {
+        "own_outcome_label_set_sha256": SHA_C,
+        "ablation_artefact_sha256": SHA_D,
+        "own_outcome_max_abs_delta_p": Decimal("0.1"),
+        "own_outcome_gate_decisions_changed": 1,
+    }
+    assert lineage(**both)
+    with pytest.raises(WireRefused):
+        lineage(**{**both, "own_outcome_gate_decisions_changed": None})
+    with pytest.raises(WireRefused):
+        lineage(own_outcome_gate_decisions_changed=1)
+
+
+def test_lineage_params_are_frozen_and_detached_from_the_callers_dict() -> None:
+    source: dict[str, Any] = {"alpha": "0.5", "nested": {"k": [1, 2]}}
+    value = lineage(params=source)
+    source["alpha"] = "9"
+    source["nested"]["k"].append(3)
+    assert value.to_wire()["params"] == {"alpha": "0.5", "nested": {"k": [1, 2]}}
+    with pytest.raises(TypeError):
+        value.params["alpha"] = "9"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        value.params["nested"]["k"] = ()
+    again = Lineage.from_wire(parse_json_exact(canonical_json(value.to_wire())))
+    assert again == value
