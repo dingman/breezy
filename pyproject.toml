@@ -233,6 +233,8 @@ source_modules = [
     "breezy.persistence.autonomy.plugin",
     "breezy.persistence.autonomy.closure_manifest",
     "breezy.persistence.autonomy.closure",
+    "breezy.persistence.autonomy.net_position",
+    "breezy.persistence.autonomy.entry_guard",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -252,6 +254,8 @@ source_modules = [
     "breezy.persistence.autonomy.plugin",
     "breezy.persistence.autonomy.closure_manifest",
     "breezy.persistence.autonomy.closure",
+    "breezy.persistence.autonomy.net_position",
+    "breezy.persistence.autonomy.entry_guard",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false
