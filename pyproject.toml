@@ -292,6 +292,18 @@ source_modules = [
     "breezy.persistence.autonomy.registry_schema",
 ]
 forbidden_modules = ["pyarrow"]
+
+[[tool.importlinter.contracts]]
+name = "ARCH-0 seam B: the autonomy sandbox package is stdlib-only"
+type = "forbidden"
+# The wrapper runs before any of these may load and must keep working when they
+# are broken (plan r5 B-R8, erratum E-7e). Indirect chains are refused too.
+source_modules = ["breezy.runtime.autonomy_sandbox"]
+forbidden_modules = [
+    "nautilus_trader",
+    "breezy.adapters",
+    "breezy.strategy",
+]
 allow_indirect_imports = false
 
 [tool.ruff]
