@@ -43,21 +43,19 @@ is actually light.
 from __future__ import annotations
 
 import ast
-import re
 import subprocess
 import sys
-import tomllib
-from pathlib import Path
 from typing import Final
 
 import pytest
 
-REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
-SRC_DIR: Final[Path] = REPO_ROOT / "src"
-RUNTIME_INIT_PATH: Final[Path] = SRC_DIR / "breezy" / "runtime" / "__init__.py"
-PYPROJECT_PATH: Final[Path] = REPO_ROOT / "pyproject.toml"
-DEPLOY_SYSTEMD_DIR: Final[Path] = REPO_ROOT / "deploy" / "systemd"
-SCRIPTS_DIR: Final[Path] = REPO_ROOT / "scripts"
+from tests.support.entry_points import (
+    REPO_ROOT,
+    RUNTIME_INIT_PATH,
+    _entry_modules_from_pyproject_scripts,
+    _entry_modules_from_scripts_importing,
+    _entry_modules_from_systemd,
+)
 
 #: The Stage 0 entry set (D-2 + R3-2), reproduced here so T9 is
 #: self-documenting: every `[project.scripts]` entry (`pyproject.toml:306-381`,
@@ -155,66 +153,6 @@ STAGE0_EXCLUDED_ENTRY_MODULES: Final[frozenset[str]] = frozenset(
 # ---------------------------------------------------------------------------
 
 
-def _entry_modules_from_pyproject_scripts() -> set[str]:
-    """(a) Every `[project.scripts]` target module, `pyproject.toml:306-381`."""
-    data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
-    scripts = data["project"]["scripts"]
-    return {target.split(":", 1)[0] for target in scripts.values()}
-
-
-def _entry_modules_from_systemd() -> set[str]:
-    """(b) Every Python module named in a `deploy/systemd/**` `ExecStart=`
-    line (`-m module` and bare `path/to/module.py` forms), plus every `-m
-    breezy.<mod>` invocation found inside a `deploy/systemd/*.sh` wrapper
-    script (an `ExecStart=` line that only names the wrapper can't show
-    this -- the module lives one hop down, inside the script).
-    """
-    exec_start_re = re.compile(r"^ExecStart=(.*)$", re.MULTILINE)
-    module_flag_re = re.compile(r"(?:^|\s)-m\s+([A-Za-z_][\w.]*)")
-    py_path_re = re.compile(r"(?:^|/)(scripts/[\w/]+)\.py\b")
-    wrapper_module_re = re.compile(r"(?:^|\s)-m\s+(breezy\.[\w.]*)")
-
-    modules: set[str] = set()
-    for service_path in sorted(DEPLOY_SYSTEMD_DIR.rglob("*.service")):
-        text = service_path.read_text(encoding="utf-8")
-        for exec_line in exec_start_re.finditer(text):
-            line = exec_line.group(1)
-            modules.update(module_flag_re.findall(line))
-            modules.update(m.replace("/", ".") for m in py_path_re.findall(line))
-
-    for sh_path in sorted(DEPLOY_SYSTEMD_DIR.rglob("*.sh")):
-        text = sh_path.read_text(encoding="utf-8")
-        modules.update(wrapper_module_re.findall(text))
-
-    return modules
-
-
-def _entry_modules_from_scripts_importing_runtime() -> set[str]:
-    """(c) Every `scripts/**/*.py` that actually imports `breezy.runtime`
-    (an `Import`/`ImportFrom` AST node, so a comment-only mention such as
-    `scripts/archive/backup_irreplaceable_data.py` is excluded).
-    """
-    modules: set[str] = set()
-    for script_path in sorted(SCRIPTS_DIR.rglob("*.py")):
-        tree = ast.parse(script_path.read_text(encoding="utf-8"), filename=str(script_path))
-        imports_runtime = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                if any(
-                    alias.name == "breezy.runtime" or alias.name.startswith("breezy.runtime.")
-                    for alias in node.names
-                ):
-                    imports_runtime = True
-            elif isinstance(node, ast.ImportFrom) and node.module and (
-                node.module == "breezy.runtime" or node.module.startswith("breezy.runtime.")
-            ):
-                imports_runtime = True
-        if imports_runtime:
-            rel = script_path.relative_to(REPO_ROOT)
-            modules.add(".".join(rel.with_suffix("").parts))
-    return modules
-
-
 def test_entry_module_list_covers_every_entry_point() -> None:
     """Never RED at HEAD once green -- this is the drift guard. RED proof
     (both confirmed by hand for this fix): (1) deleting any single entry
@@ -228,7 +166,7 @@ def test_entry_module_list_covers_every_entry_point() -> None:
     required = (
         _entry_modules_from_pyproject_scripts()
         | _entry_modules_from_systemd()
-        | _entry_modules_from_scripts_importing_runtime()
+        | _entry_modules_from_scripts_importing("breezy.runtime")
     )
     tracked = set(STAGE0_ENTRY_MODULES)
 

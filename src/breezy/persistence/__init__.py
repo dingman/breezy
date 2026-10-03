@@ -1,53 +1,13 @@
-"""Parquet catalog persistence for domain records, plus filesystem safety.
+"""Persistence package namespace.
 
-Re-exports :mod:`breezy.persistence.catalog`'s already-curated public
-surface (that module owns its own ``__all__``). This package is not a
-single submodule: the other modules are imported directly, not through
-this facade.
+This package intentionally has no import-time facade. Import concrete
+submodules such as :mod:`breezy.persistence.catalog` directly so package import
+cannot carry catalog or Arrow registration side effects.
+
+Verified safe. One entry, `breezy.runtime.quote_tape_preflight_cli`, registers
+54 instead of 60 Nautilus arrow schemas once the facade is gone; its read path
+(`feather_preflight` -> `feather_read`) uses only `pyarrow` and `fsspec` and
+never decodes through Nautilus's `ArrowSerializer`, so no registration it lost
+is used. Every other entry's `_SCHEMAS` key set and `register_arrow`
+reachability is unchanged.
 """
-
-from breezy.persistence.catalog import (
-    NETWORK_FILESYSTEM_TYPES,
-    WRITER_LOCK_FILENAME,
-    CatalogPathError,
-    CatalogWriteError,
-    ConcurrentWriterError,
-    FilesystemLocality,
-    FilesystemProbe,
-    NonMonotonicWriteError,
-    WriteOutcome,
-    WriterLockError,
-    WriterLockFilesystemError,
-    assert_writer_lock_filesystem_supported,
-    open_station_catalog,
-    probe_filesystem,
-    read_climate_day_as_of_settlement,
-    read_climate_day_including_corrections,
-    read_climate_days,
-    read_raw_products,
-    station_catalog_path,
-    write_records,
-)
-
-__all__ = [
-    "NETWORK_FILESYSTEM_TYPES",
-    "WRITER_LOCK_FILENAME",
-    "CatalogPathError",
-    "CatalogWriteError",
-    "ConcurrentWriterError",
-    "FilesystemLocality",
-    "FilesystemProbe",
-    "NonMonotonicWriteError",
-    "WriteOutcome",
-    "WriterLockError",
-    "WriterLockFilesystemError",
-    "assert_writer_lock_filesystem_supported",
-    "open_station_catalog",
-    "probe_filesystem",
-    "read_climate_day_as_of_settlement",
-    "read_climate_day_including_corrections",
-    "read_climate_days",
-    "read_raw_products",
-    "station_catalog_path",
-    "write_records",
-]
