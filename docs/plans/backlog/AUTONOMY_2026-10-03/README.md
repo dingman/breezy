@@ -209,7 +209,7 @@ Shared contracts, defined once in the umbrella architecture (`AUTONOMY_ARCHITECT
 | ID | Plan | Reviewers | Final | Status |
 |---|---|---|---|---|
 | ARCH | [AUTONOMY_ARCHITECTURE.md](AUTONOMY_ARCHITECTURE.md) **FROZEN Rev 9.2** sha `1b288d0e…` (+ [errata](reviews/ARCH-ERRATA-rev9_2.md)) | architect 97 · trading-bot-architect 96 · security-reviewer 96 | 96 | FROZEN (12 review rounds) |
-| AUT-1 | [r8](AUT-1-data-capture_plan_r8.md) sha `bd7f4d8c…` | trading-bot-architect 95 · silent-failure-hunter 95 | 95 | **READY** (8 rounds; binding build items in reviews/AUT-1-r8-final.md) |
+| AUT-1 | [r8](AUT-1-data-capture_plan_r8.md) sha `bd7f4d8c…` | trading-bot-architect 95 · silent-failure-hunter 95 | 95 | **REOPENED 2026-10-03**: Nautilus-native pressure test refuted §2 'nothing to reuse' (reviews/AUT-1-native-pressure-test.md); native-first r9 owed |
 | AUT-2 | [r7](AUT-2-outcome-labeling_plan_r7.md) sha `d935e0f2…` | prediction-market-reviewer 96 · silent-failure-hunter 95 | 95 | **READY** (7 rounds; binding build items in reviews/AUT-2-r7-final.md) |
 | AUT-3 | [r6](AUT-3-retraining_plan_r6.md) sha `688dab87…` | mle-reviewer 96 · prediction-market-reviewer 95 | 95 | **READY** (6 rounds; build-time MEDIUM: guard `Persistent=true` catch-up firings against the launch window and blackout) |
 | AUT-4 | [r6](AUT-4-evaluation_plan_r6.md) sha `f0055105…` | prediction-market-reviewer 95 · mle-reviewer 95 | 95 | **READY** (6 rounds) |
@@ -218,7 +218,7 @@ Shared contracts, defined once in the umbrella architecture (`AUTONOMY_ARCHITECT
 | AUT-7 | [r5](AUT-7-rollback_plan_r5.md) sha `ef779849…` | security-reviewer 95 · architect 95 | 95 | **READY** (5 rounds; binding build items in reviews/AUT-7-r5-final.md) |
 | AUT-7b | live PROMOTE/DEMOTE/RESUME/ROLLBACK drill (ARCH §5.3) | planned inside AUT-7 r5 §3.6.5 | — | PLANNED (READY with AUT-7); execution pending |
 
-**Planning status (2026-10-03):** all seven area plans are READY. That is the *planning* bar: two blind reviewers, the lower score at least 95, and zero CRITICAL or HIGH findings. **No area has been executed, and every area's 0–3 score is unchanged.** An area reaches 3 only after its plan is built and its live proof has run, and an independent scorer assigns the 3.
+**Planning status (2026-10-03):** six area plans are READY; AUT-1 is REOPENED for a native-first r9. That is the *planning* bar: two blind reviewers, the lower score at least 95, and zero CRITICAL or HIGH findings. **No area has been executed, and every area's 0–3 score is unchanged.** An area reaches 3 only after its plan is built and its live proof has run, and an independent scorer assigns the 3.
 
 **Build order:** follow the dependency graph above. Every WP brief must carry, as binding, the area's `reviews/<area>-final.md` build items and the ARCH errata E-1 to E-10, E-7a and E-8a.
 
