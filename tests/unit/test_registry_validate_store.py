@@ -1,9 +1,10 @@
 """ARCH-0 seam 7c: the store-side ``validate`` rules (d0, trial prefix, the E-5 per-day cap).
 
-The plan names these ``[store]`` tests because the store enforces them on append. Until seam 7d
-wires ``validate`` into ``RegistryStore.append`` (ruling A6e-R2) they are pinned at ``validate``
-itself, the function the store will call. The first →CHAMPION row of a family binds its manifest's
-``d0_climate_day`` and ``trial_id_prefix`` (U1); ROLLBACK, RESUME and ROOT_ADMIT are exempt.
+The plan names these ``[store]`` tests because the store enforces them on append. They are pinned
+at ``validate`` itself, the function ``RegistryStore.append`` calls since seam 7d (ruling A6e-R2;
+``test_registry_store_wiring`` pins the call). The first →CHAMPION row of a family binds its
+manifest's ``d0_climate_day`` and ``trial_id_prefix`` (U1); ROLLBACK, RESUME and ROOT_ADMIT are
+exempt.
 """
 
 from __future__ import annotations
@@ -202,17 +203,19 @@ def test_root_admit_exempt_from_d0_rule() -> None:
 
 
 def test_rollback_and_a_repeat_promote_of_a_former_champion_are_exempt() -> None:
-    later = at(DAY, "18:00")  # CHILD has superseded INCUMBENT, a former CHAMPION
+    later = at(
+        DAY, "18:00"
+    )  # CHILD has superseded INCUMBENT, a former CHAMPION (a day of dwell on)
     never = Manifests(banned=frozenset({INCUMBENT, CHILD}))
     rollback = probe(
         second_child_chain(), later, Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT,
         frm=State.CHALLENGER,
-        effective_launch_date=DAY, manifest_sha256=INC_MAN, manifests=never,
+        effective_launch_date=THIRD_DAY, manifest_sha256=INC_MAN, manifests=never,
     )  # fmt: skip
     repromote = probe(
         second_child_chain(), later, Kind.PROMOTE, State.CHAMPION, family=INCUMBENT,
         frm=State.CHALLENGER,
-        effective_launch_date=DAY, manifest_sha256=INC_MAN, manifests=never,
+        effective_launch_date=THIRD_DAY, manifest_sha256=INC_MAN, manifests=never,
     )  # fmt: skip
 
     assert (rollback, repromote) == (None, None)

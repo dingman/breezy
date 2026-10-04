@@ -78,6 +78,9 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   (the class of its standing DEMOTE or HALT, a ROLLBACK_FAILED one resolved to its
   ``trigger_cause_class``) and ``standing_cause_code`` the ``cause_code`` of that row; both are
   ``None`` while the family is not HALTED.
+* A MINT whose ``artefact_sha256`` equals one already bound to another family of its lineage is a
+  no-new-lineage (drill) MINT (C3 Y2) and charges no ``mints`` (Z3, seam 7d). ``last_attest_ns``
+  and ``superseded_ns`` give ``validate`` the ATTEST cadence and the rollback target age.
 * ``halted_since_ns`` is the effective instant of the row that moved the family into HALTED and is
   ``None`` once it leaves HALTED (AUT-6 r15 #30).
 
@@ -171,6 +174,8 @@ class PairView:
     incoming_family_id: str
     #: The head first, then its partners in chain order.
     member_transition_ids: tuple[str, ...]
+    #: ``(family_id, to_state)`` of each member, in the same order: what the pair does at LAUNCH.
+    member_effects: tuple[tuple[str, State], ...] = ()
     effective_launch_date: str
     launch_ns: int
     #: The first ACTIVATE that fell inside the window, if any.
@@ -202,6 +207,9 @@ class FamilyView:
     #: The class a RESUME is charged to and the ``cause_code`` of the standing halt row.
     standing_cause_class: CauseClass | None = None
     standing_cause_code: CauseCode | None = None
+    #: The instant of the latest ATTEST and of the SUPERSEDE that left CHAMPION (7d).
+    last_attest_ns: int | None = None
+    superseded_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -421,6 +429,7 @@ def _pair_views(
                 head_kind=head.row.kind,
                 incoming_family_id=head.row.family_id,
                 member_transition_ids=tuple(rows[i].transition_id for i in head.members),
+                member_effects=tuple((rows[i].family_id, rows[i].to_state) for i in head.members),
                 effective_launch_date=date_text,
                 launch_ns=head.launch_ns,
                 activate_transition_id=(
@@ -475,6 +484,8 @@ class _Accumulator:
         self.manifest_sha: dict[str, str] = {}
         self.artefact_sha: dict[str, str] = {}
         self.standing_code: dict[str, CauseCode | None] = {}
+        self.attest_ns: dict[str, int] = {}
+        self.superseded_ns: dict[str, int] = {}
         self.target_ineligible: set[str] = set()
         self.drill_children: set[str] = set()
         self.frozen_lineages: set[str] = set()
@@ -505,6 +516,7 @@ class _Accumulator:
         elif kind is Kind.SUPERSEDE:
             if family not in self.drill_children:
                 self.rollback_eligible.add(family)
+                self.superseded_ns[family] = instant
             self._close_episode(family, instant)
             self._note_superseded(row)
         elif kind is Kind.DISPLACED:
@@ -513,7 +525,10 @@ class _Accumulator:
             self.drill_children.add(family)
             self.book.charge(family, "drill_admits", instant)
         elif kind is Kind.MINT:
-            self.book.charge(family, "mints", instant)
+            if not self._reuses_artefact(row):  # a no-new-lineage (drill) MINT is not counted
+                self.book.charge(family, "mints", instant)
+        elif kind is Kind.ATTEST:
+            self.attest_ns[family] = instant
         elif kind in (Kind.DEMOTE, Kind.HALT):
             self._halt(instant, row)
         elif kind is Kind.RESUME:
@@ -537,6 +552,15 @@ class _Accumulator:
                 k_life=row.k_life,
                 alpha_k=row.alpha_k,
             )
+
+    def _reuses_artefact(self, row: TransitionRow) -> bool:
+        """Whether the MINT binds an artefact a sibling of its lineage is already bound to (Y2)."""
+        root = self.lineage_of.get(row.family_id)
+        return row.artefact_sha256 is not None and any(
+            sha == row.artefact_sha256 and self.lineage_of.get(other) == root
+            for other, sha in self.artefact_sha.items()
+            if other != row.family_id
+        )
 
     def _take_champion(self, instant: int, row: TransitionRow) -> None:
         family = row.family_id
@@ -636,6 +660,8 @@ class _Accumulator:
                 standing_cause_code=(
                     self.standing_code.get(family) if state is State.HALTED else None
                 ),
+                last_attest_ns=self.attest_ns.get(family),
+                superseded_ns=self.superseded_ns.get(family),
             )
         return MappingProxyType(views)
 

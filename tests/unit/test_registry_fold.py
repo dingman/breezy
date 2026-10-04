@@ -235,6 +235,7 @@ def test_pair_is_pending_before_launch_and_changes_no_state() -> None:
         head_kind=Kind.PROMOTE,
         incoming_family_id=CHILD,
         member_transition_ids=(head.transition_id, tail.transition_id),
+        member_effects=((CHILD, State.CHAMPION), (INCUMBENT, State.CHALLENGER)),
         effective_launch_date=DAY,
         launch_ns=LAUNCH,
         activate_transition_id=None,
@@ -706,8 +707,17 @@ def test_transitions_module_imports_only_schemas_and_fold() -> None:
 
 
 def test_validate_module_imports_only_pins_schemas_fold_and_verdict() -> None:
-    """``validate`` must not import ``transitions`` (a cycle) or ``registry_shape`` (which does)."""
-    assert _internal_imports("validate.py") == {"schemas", "pins", "fold", "verdict"}
+    """``validate`` must not import ``transitions`` (a cycle) or ``registry_shape`` (which does).
+
+    Seam 7d adds ``validate_ii`` (its rules) and ``fold_tallies`` (the ``carried_counters`` shape).
+    """
+    assert _internal_imports("validate.py") == {
+        "schemas", "pins", "fold", "verdict", "validate_ii", "fold_tallies",
+    }  # fmt: skip
+    # ``validate_ii`` holds the check context and never imports ``validate`` (an import cycle).
+    assert _internal_imports("validate_ii.py") == {
+        "schemas", "pins", "fold", "fold_tallies", "verdict",
+    }  # fmt: skip
 
 
 # --- rows_admissible -----------------------------------------------------------------------

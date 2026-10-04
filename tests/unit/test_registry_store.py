@@ -48,6 +48,7 @@ from breezy.persistence.autonomy.schemas import (
     DecidedBy,
     FoldInvalidReason,
     Kind,
+    ManifestFacts,
     RefusalReason,
     StagePolicy,
     State,
@@ -164,6 +165,74 @@ def put_bootstrap(store: RegistryStore, **kw: Any) -> rs.AppendResult:
         [bootstrap(**kw)], expected_prior_seq=kw.get("expected", 0), mode=WriterMode.BOOTSTRAP,
         now_ns=NOW,
     )  # fmt: skip
+
+
+SHA_A = "d" * 64
+
+
+def seed_retired(
+    family: str = "pm_us_crh_v4", *, expected: int = 0, ts: int = NOW
+) -> TransitionRow:
+    """A BOOTSTRAP seed row that is RETIRED: a second genesis row that adds no sender (E-6, 7d)."""
+    return mk(Kind.BOOTSTRAP, State.RETIRED, family=family, expected=expected, ts=ts)
+
+
+def child_row(
+    kind: Kind, frm: State | None, to: State, *, fps: int, seq: int, **over: Any
+) -> TransitionRow:
+    """CHILD's row at chain position ``seq + 1`` (``seq`` rows are stored), bound to ``SHA_A``."""
+    return mk(
+        kind, to, frm=frm, family=CHILD, fps=fps, expected=seq, ts=NOW + seq * SEC,
+        artefact_sha256=SHA_A, **over,
+    )  # fmt: skip
+
+
+SHA_M = "e" * 64
+COMPOSITION = "forecast_quantile_ladder"
+
+
+def pair_rows() -> tuple[TransitionRow, TransitionRow]:
+    """A pending drill pair: CHILD's DRILL_PROMOTE head (seq 4) and FAMILY's SUPERSEDE (seq 5)."""
+    head = child_row(
+        Kind.DRILL_PROMOTE, State.CHALLENGER, State.CHAMPION, fps=3, seq=3,
+        effective_launch_date=LAUNCH_DAY, manifest_sha256=SHA_M, drill=True,
+    )  # fmt: skip
+    tail = mk(
+        Kind.SUPERSEDE, State.CHALLENGER, frm=State.CHAMPION, fps=1, expected=3, ts=NOW + 3 * SEC,
+        paired_transition_id=head.transition_id, effective_launch_date=LAUNCH_DAY,
+    )  # fmt: skip
+    return head, tail
+
+
+def _facts(family_id: str, manifest_sha256: str) -> ManifestFacts:
+    return ManifestFacts(
+        family_id=family_id, manifest_sha256=manifest_sha256, d0_climate_day=LAUNCH_DAY,
+        trial_id_prefix=f"{COMPOSITION}/trial/{family_id}/", composition_kind=COMPOSITION,
+    )  # fmt: skip
+
+
+def drill_child_store(store: RegistryStore, *, with_pair: bool = True) -> None:
+    """FAMILY CHAMPION; CHILD drill-admitted (CHALLENGER); optionally a pending DRILL_PROMOTE pair.
+
+    No shipped-stage write can make a CHALLENGER or a pair (nominations, DRILL_ADMIT and the pair
+    kinds are not admitted), so the fixture opens the stage for its own setup rows only; the
+    writes the tests make afterwards use the shipped stage. Three rows without the pair, five with.
+    """
+    store._manifests = _facts
+    boot = mk(Kind.BOOTSTRAP, State.CHAMPION, artefact_sha256=SHA_A)
+    store.append([boot], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
+    head, tail = pair_rows()
+    batches = [
+        [child_row(Kind.MINT, None, State.SHADOW, fps=0, seq=1)],
+        [child_row(Kind.DRILL_ADMIT, State.SHADOW, State.CHALLENGER, fps=2, seq=2)],
+    ]
+    if with_pair:
+        batches.append([head, tail])
+    for seq, batch in enumerate(batches, start=1):
+        store._append(
+            batch, expected_prior_seq=min(3, seq), mode=WriterMode.DAILY,
+            now_ns=batch[-1].ts_ns, stage=OPEN_STAGE, _fixture_stage=True,
+        )  # fmt: skip
 
 
 def raw(store: RegistryStore) -> sqlite3.Connection:
@@ -471,14 +540,14 @@ def test_registry_cas_and_idempotent_replay(
     assert "replay" in caplog.text
     assert len(stored(store)) == 1
     # A stale writer (CAS 0 while the head is 1) is refused and writes nothing.
-    stale = mk(Kind.BOOTSTRAP, State.CHAMPION, family=CHILD, expected=0)
+    stale = mk(Kind.MINT, State.SHADOW, family=CHILD, expected=0)
     with pytest.raises(CasMismatch) as info:
-        store.append([stale], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
+        store.append([stale], expected_prior_seq=0, mode=WriterMode.DAILY, now_ns=NOW)
     assert info.value.reason is RefusalReason.ENGINE_INCONSISTENCY
     ok = replace(stale, expected_prior_seq=1)
     result = store.append(
         [replace(ok, transition_id=ok.computed_transition_id())], expected_prior_seq=1,
-        mode=WriterMode.BOOTSTRAP, now_ns=NOW + SEC,
+        mode=WriterMode.DAILY, now_ns=NOW + SEC,
     )  # fmt: skip
     assert result.head_venue_seq == 2
 
@@ -549,7 +618,7 @@ def test_partial_replay_refused(store: RegistryStore) -> None:
 def test_store_multirow_append_is_atomic(
     store: RegistryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    a, b = bootstrap(), bootstrap(CHILD)
+    a, b = bootstrap(), seed_retired()
     real = rs._to_db
     calls: list[int] = []
 
@@ -910,9 +979,11 @@ def test_row_ts_skew_and_monotonicity_refused(store: RegistryStore) -> None:
             )
         assert info.value.reason is RefusalReason.CLOCK_INVALID
     low = bootstrap(ts=NOW - limit)
-    high = bootstrap(CHILD, ts=NOW, expected=1)  # exactly now_ns is allowed
+    high = mk(
+        Kind.MINT, State.SHADOW, family=CHILD, ts=NOW, expected=1
+    )  # exactly now_ns is allowed
     store.append([low], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
-    store.append([high], expected_prior_seq=1, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
+    store.append([high], expected_prior_seq=1, mode=WriterMode.DAILY, now_ns=NOW)
     behind = mk(Kind.DEMOTE, State.HALTED, frm=State.CHAMPION, fps=1, expected=2, ts=NOW - SEC)
     with pytest.raises(ClockRefused) as info:
         store.append([behind], expected_prior_seq=2, mode=WriterMode.INTRADAY, now_ns=NOW)
@@ -1061,29 +1132,54 @@ def test_restrictive_rows_consult_no_manifest_policy_or_stage_flag(
 
     monkeypatch.setattr(rs, "read_manifest_facts", boom)
     monkeypatch.setattr(store, "_manifests", boom)
+    real_validate = transitions.validate
+    judged: list[tuple[Kind, ...]] = []
+
+    def spy(prior: Any, rows: Any, **kwargs: Any) -> Any:
+        judged.append(tuple(row.kind for row in rows))
+        assert kwargs["manifests"] is boom  # the store hands over its (here booby-trapped) reader
+        return real_validate(prior, rows, **kwargs)
+
+    monkeypatch.setattr(transitions, "validate", spy)
     result = store.append(
         [demote()], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC
     )
     assert result.rows[0].kind is Kind.DEMOTE
+    assert judged == [(Kind.DEMOTE,)]  # validate ran, and still read no manifest
     assert stage_policy.STAGE.enabled_widening_kinds == frozenset()  # no flag was needed
 
 
 def test_every_restrictive_kind_is_appendable_with_the_shipped_stage(store: RegistryStore) -> None:
-    put_bootstrap(store)
-    shapes = (
-        (Kind.DEMOTE, State.CHAMPION, State.HALTED),
-        (Kind.HALT, State.CHAMPION, State.HALTED),
-        (Kind.SWAP_CANCEL, State.CHALLENGER, State.CHALLENGER),
-        (Kind.TARGET_INELIGIBLE, State.CHALLENGER, State.CHALLENGER),
+    """DEMOTE, HALT, SWAP_CANCEL and TARGET_INELIGIBLE each append at ``stage_policy.STAGE``.
+
+    ``validate`` (7d) judges them against real states: the CHALLENGER the last two need exists
+    only through the fixture's open stage; the writes under test use the shipped one.
+    """
+    drill_child_store(store)  # seq 1-5 on VENUE
+    head, _tail = pair_rows()
+    shapes: tuple[tuple[Kind, int, dict[str, Any]], ...] = (
+        (Kind.TARGET_INELIGIBLE, 4, {"cause_code": CauseCode.TARGET_INTEGRITY}),
+        (Kind.SWAP_CANCEL, 6, {"voids_transition_ids": (head.transition_id,)}),
     )
-    assert {kind for kind, _f, _t in shapes} == transitions.RESTRICTIVE_KINDS
-    for index, (kind, frm, to) in enumerate(shapes, start=1):
-        row = mk(kind, to, frm=frm, fps=index, expected=index, ts=NOW + index * SEC)
+    for seq, (kind, fps, extra) in enumerate(shapes, start=5):
+        row = child_row(kind, State.CHALLENGER, State.CHALLENGER, fps=fps, seq=seq, **extra)
         result = store.append(
-            [row], expected_prior_seq=index, mode=WriterMode.INTRADAY, now_ns=NOW + index * SEC
+            [row], expected_prior_seq=seq, mode=WriterMode.INTRADAY, now_ns=row.ts_ns
         )
-        assert result.head_venue_seq == index + 1
-    assert len(stored(store)) == 5
+        assert result.head_venue_seq == seq + 1
+    demote_row = mk(
+        Kind.DEMOTE, State.HALTED, frm=State.CHAMPION, fps=5, expected=7, ts=NOW + 7 * SEC
+    )
+    store.append([demote_row], expected_prior_seq=7, mode=WriterMode.INTRADAY, now_ns=NOW + 7 * SEC)
+    other = mk(Kind.BOOTSTRAP, State.CHAMPION, venue=OTHER_VENUE)  # a CHAMPION to HALT
+    store.append([other], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
+    halt = mk(
+        Kind.HALT, State.HALTED, frm=State.CHAMPION, fps=1, expected=1, ts=NOW + SEC,
+        venue=OTHER_VENUE,
+    )  # fmt: skip
+    store.append([halt], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    appended = {r[3] for r in stored(store)}
+    assert {k.value for k in transitions.RESTRICTIVE_KINDS} <= appended
 
 
 def test_a_dataless_directory_listing_shows_only_the_database(store: RegistryStore) -> None:
@@ -1105,10 +1201,14 @@ def test_a_submitted_transition_id_must_equal_the_computed_id(store: RegistrySto
 
 
 def _swap_cancel(voids: tuple[str, ...]) -> TransitionRow:
-    return mk(
-        Kind.SWAP_CANCEL, State.CHALLENGER, frm=State.CHALLENGER, fps=1, expected=1,
-        ts=NOW + SEC, voids_transition_ids=voids,
-    )  # fmt: skip
+    return child_row(
+        Kind.SWAP_CANCEL,
+        State.CHALLENGER,
+        State.CHALLENGER,
+        fps=4,
+        seq=5,
+        voids_transition_ids=voids,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1124,19 +1224,27 @@ def _swap_cancel(voids: tuple[str, ...]) -> TransitionRow:
             demote_with(halt_cause_class=CauseClass.RECOVERABLE_INFRA),
             id="halt_cause_class",
         ),
-        pytest.param(_swap_cancel((SHA_P,)), _swap_cancel((SHA_B,)), id="voids_transition_ids"),
+        pytest.param(
+            _swap_cancel((pair_rows()[0].transition_id,)),
+            _swap_cancel((pair_rows()[0].transition_id, SHA_B)),
+            id="voids_transition_ids",
+        ),
     ],
 )
 def test_replay_differing_in_a_semantic_column_is_refused(
     store: RegistryStore, first: TransitionRow, second: TransitionRow
 ) -> None:
-    put_bootstrap(store)
+    if first.kind is Kind.SWAP_CANCEL:
+        drill_child_store(store)  # a cancel needs a CHALLENGER to name (7d)
+    else:
+        put_bootstrap(store)
+    seq, now = first.expected_prior_seq, first.ts_ns
     assert first.transition_id == second.transition_id  # the Y9 id does not cover the column
-    store.append([first], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    store.append([first], expected_prior_seq=seq, mode=WriterMode.INTRADAY, now_ns=now)
     with pytest.raises(rs.ReplayMismatch) as info:
-        store.append([second], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+        store.append([second], expected_prior_seq=seq, mode=WriterMode.INTRADAY, now_ns=now)
     assert isinstance(info.value, RegistryRefused)
-    assert len(stored(store)) == 2
+    assert len(stored(store)) == seq + 1
 
 
 def test_replay_ignores_only_the_excluded_columns(store: RegistryStore) -> None:
@@ -1336,6 +1444,17 @@ def _trigger(name: str, store: RegistryStore, monkeypatch: pytest.MonkeyPatch) -
     if name == "FoldRefused":
         orphan = mk(Kind.DEMOTE, State.HALTED, frm=State.CHAMPION, family=CHILD, expected=1, ts=ts)
         return _raised(lambda: store.append([orphan], **kwargs))
+    if name == "ValidateRefused":
+        stray = mk(
+            Kind.ATTEST,
+            State.CHAMPION,
+            frm=State.CHAMPION,
+            fps=1,
+            expected=1,
+            ts=ts,
+            attest_valid_until_ns=ts + 9 * 3_600 * SEC,
+        )  # beyond the validity ceiling
+        return _raised(lambda: store.append([stray], **kwargs))
     if name == "ChainRefused":
         return _raised(lambda: store.append([demote(fps=9)], **kwargs))
     if name == "StoreBusy":
@@ -1375,6 +1494,7 @@ _REFUSAL_REASONS: Final = {
     "CasMismatch": RefusalReason.ENGINE_INCONSISTENCY,
     "ClockRefused": RefusalReason.CLOCK_INVALID,
     "FoldRefused": RefusalReason.FAMILY_NOT_INTRODUCED,
+    "ValidateRefused": RefusalReason.ENGINE_INCONSISTENCY,
     "ChainRefused": RefusalReason.CHAIN_BROKEN,
     "StoreBusy": RefusalReason.REGISTRY_UNREADABLE,
     "StoreDrifted": RefusalReason.REGISTRY_UNREADABLE,

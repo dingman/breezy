@@ -2,9 +2,10 @@
 
 ``validate(prior, rows, ...)`` is pure: it judges a batch of new rows against the fold of the rows
 already written and returns the first refusal, or ``None``. It is the one home of every
-fold-decidable C5 rule; seam 7d adds the rest (Z3, introducers, mint, ATTEST, SWAP_CANCEL, single
-sender, HWM_RESET floors). ``transitions`` re-exports ``validate``; the code lives here so that
-``transitions`` stays under its size cap.
+fold-decidable C5 rule; seam 7d's rules (Z3, introducers, mint, ROLLBACK, ATTEST, SWAP_CANCEL,
+single sender, HWM_RESET floors) live in ``validate_ii`` and are wired into the same walk.
+``transitions`` re-exports ``validate``; the code lives here so that ``transitions`` stays under its
+size cap.
 
 Rules built here, each named by a ``Rule`` that ``first_refusal`` reports:
 
@@ -55,21 +56,25 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
 * The d0 ordering reads the manifests of earlier CHILD families that have been CHAMPION, never the
   root's (a root's d0 is committed, Z1); a manifest that cannot be read refuses.
 
-Restrictive rows (DEMOTE, HALT, SWAP_CANCEL, TARGET_INELIGIBLE, ATTEST) are refused only by the
-rules that cannot fail open: the generic ``from_state`` rule, E-19a and the DRILL-class rules.
+Restrictive rows (DEMOTE, HALT, SWAP_CANCEL, TARGET_INELIGIBLE) are refused only by the rules that
+cannot fail open: the generic ``from_state`` rule, E-19a, the DRILL-class rules and (7d) the
+SWAP_CANCEL subset rule; they never reach ``manifests`` and no single-sender rule judges a batch
+made of them alone. ATTEST is judged by its own validity and cadence rules.
 
 Pure: no I/O, no clock beyond the arguments.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
 from breezy.persistence.autonomy import pins
+from breezy.persistence.autonomy import validate_ii as ii
 from breezy.persistence.autonomy.fold import FamilyView, FoldResult, Origin, PairStatus, schedule_ns
+from breezy.persistence.autonomy.fold_tallies import Carried, parse_carried
 from breezy.persistence.autonomy.schemas import (
     CauseClass,
     CauseCode,
@@ -83,10 +88,11 @@ from breezy.persistence.autonomy.schemas import (
 )
 from breezy.persistence.autonomy.verdict import Verdict, VerdictKind, VerdictOutcome
 
-__all__ = ["Refusal", "Rule", "first_refusal", "validate"]
+__all__ = ["Refusal", "Rule", "RuleII", "first_refusal", "validate"]
 
-_HOUR_NS: Final = 3_600 * 10**9
-_DAY_NS: Final = 24 * _HOUR_NS
+RuleII = ii.RuleII
+_HOUR_NS: Final = ii.HOUR_NS
+_DAY_NS: Final = ii.DAY_NS
 _DRILL_WINDOW_NS: Final = 30 * _DAY_NS  # DRILL_BUDGET_PER_VENUE_30D
 _MODEL_RESUME_WINDOW_NS: Final = 14 * _DAY_NS  # MAX_RECOVERABLE_RESUMES_PER_LINEAGE_14D
 _INFRA_RESUME_WINDOW_NS: Final = 7 * _DAY_NS  # MAX_INFRA_RESUMES_PER_VENUE_7D
@@ -95,7 +101,7 @@ _RESUMABLE: Final = frozenset(
     {CauseClass.RECOVERABLE_MODEL, CauseClass.RECOVERABLE_INFRA, CauseClass.DRILL}
 )
 _HALT_KINDS: Final = frozenset({Kind.DEMOTE, Kind.HALT})
-_FAIL: Final = RefusalReason.ENGINE_INCONSISTENCY
+_FAIL: Final = ii.FAIL
 
 
 class Rule(StrEnum):
@@ -136,43 +142,20 @@ class Refusal:
     """The first refusal of a batch: the closed reason, the rule and the row's batch index."""
 
     reason: RefusalReason
-    rule: Rule
+    rule: Rule | RuleII
     row_index: int
 
 
 _Hit = tuple[Rule, RefusalReason]
+_AnyHit = tuple[Rule | RuleII, RefusalReason]
 
 
-@dataclass(frozen=True, slots=True)
-class _Ctx:
-    prior: FoldResult
-    manifests: ManifestFactsReader
-    verdicts: Mapping[str, Verdict] | None
-    earlier: tuple[TransitionRow, ...]
-    #: The fold's state of each family, advanced by the immediate rows earlier in the batch.
-    states: Mapping[str, State]
-
-
-_Check = Callable[[_Ctx, TransitionRow], _Hit | None]
-
-
-def _effective_ns(row: TransitionRow) -> int:
-    if row.effective_launch_date is None:
-        return row.ts_ns
-    return schedule_ns(row.effective_launch_date, pins.SCHEDULE_LAUNCH_UTC)
-
-
-def _recent(instants: Iterable[int], at: int, window_ns: int) -> int:
-    return sum(1 for instant in instants if instant > at - window_ns)
-
-
-def _venue_instants(prior: FoldResult, counter: str) -> Iterator[int]:
-    for view in prior.lineages.values():
-        yield from getattr(view.tallies, counter)
-
-
-def _is_restore(row: TransitionRow) -> bool:
-    return row.kind is Kind.RESUME and row.cause_code is CauseCode.DRILL_CLOSE_RESTORE
+_Ctx = ii.Ctx
+_Check = Callable[[_Ctx, TransitionRow], _AnyHit | None]
+_effective_ns = ii.effective_ns
+_recent = ii.recent
+_venue_instants = ii.venue_instants
+_is_restore = ii.is_restore
 
 
 def _resume_class(prior: FoldResult, row: TransitionRow) -> CauseClass | None:
@@ -493,14 +476,52 @@ def _artefact_binding(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
 
 
 _CHECKS: Final[Mapping[Kind, tuple[_Check, ...]]] = {
-    Kind.PROMOTE: (_infeasible_alpha, _first_champion_identity, _demoted_clear),
+    Kind.BOOTSTRAP: (ii.bootstrap,),
+    Kind.MINT: (ii.mint_rate,),
+    Kind.PROMOTE: (
+        _infeasible_alpha,
+        ii.terminal_frozen,
+        ii.sender_cap,
+        _first_champion_identity,
+        _demoted_clear,
+    ),
     Kind.DRILL_ADMIT: (_drill_entry, _drill_budget),
-    Kind.DRILL_PROMOTE: (_drill_entry, _drill_budget, _first_champion_identity, _demoted_clear),
-    Kind.ROLLBACK: (_rollback_drill_column, _demoted_clear, _drill_budget),
+    Kind.DRILL_PROMOTE: (
+        _drill_entry,
+        _drill_budget,
+        ii.terminal_frozen,
+        _first_champion_identity,
+        _demoted_clear,
+    ),
+    Kind.ROLLBACK: (
+        _rollback_drill_column,
+        ii.terminal_frozen,
+        ii.rollback,
+        ii.sender_cap,
+        _demoted_clear,
+        _drill_budget,
+    ),
+    Kind.ROOT_ADMIT: (ii.root_admit, ii.terminal_frozen, ii.sender_cap),
     Kind.DEMOTE: (_launch_window_cause, _drill_class_halt, _drill_budget),
     Kind.HALT: (_launch_window_cause, _drill_class_halt, _drill_budget),
-    Kind.RESUME: (_resume, _drill_budget),
+    Kind.RESUME: (_resume, ii.sender_cap, _drill_budget),
+    Kind.SWAP_CANCEL: (ii.swap_cancel,),
+    Kind.ATTEST: (ii.attest,),
+    Kind.HWM_RESET: (ii.hwm_floors,),
 }
+
+
+def _as_carried(export: Carried | str | None) -> Carried | None:
+    return parse_carried(export) if isinstance(export, str) else export
+
+
+def _pending_root_state(row: TransitionRow, ctx: _Ctx) -> bool:
+    """A dated root introducer is SHADOW until its pair takes effect (the fold's pending root)."""
+    return (
+        row.effective_launch_date is not None
+        and row.family_id not in ctx.prior.families
+        and row.family_id not in ctx.known
+    )
 
 
 def first_refusal(
@@ -509,19 +530,34 @@ def first_refusal(
     *,
     manifests: ManifestFactsReader,
     verdicts: Mapping[str, Verdict] | None = None,
+    export_counters: Carried | str | None = None,
 ) -> Refusal | None:
-    """The first rule a batch breaks against ``prior``, in row order, or ``None``."""
+    """The first rule a batch breaks against ``prior``, in row order, or ``None``.
+
+    A batch that is not restrictive-only must also leave at most one sender, now and at every
+    LAUNCH it or the pending pairs reach (Z3 single sender).
+    """
     earlier: list[TransitionRow] = []
     states = dict(prior.states)
+    known: set[str] = set()
+    export = _as_carried(export_counters)
+    guard_senders = not ii.restrictive_only(rows)
     for index, row in enumerate(rows):
-        ctx = _Ctx(prior, manifests, verdicts, tuple(earlier), states)
-        for check in (_from_state, *_CHECKS.get(row.kind, ()), _artefact_binding):
+        ctx = _Ctx(prior, manifests, verdicts, tuple(earlier), states, frozenset(known), export)
+        for check in (ii.introduction, _from_state, *_CHECKS.get(row.kind, ()), _artefact_binding):
             hit = check(ctx, row)
             if hit is not None:
                 return Refusal(hit[1], hit[0], index)
         earlier.append(row)
         if row.effective_launch_date is None:  # an immediate row moves its family now
             states[row.family_id] = row.to_state
+        elif _pending_root_state(row, ctx):
+            states[row.family_id] = State.SHADOW
+        known.add(row.family_id)
+        if guard_senders and ii.senders_after_row(states):
+            return Refusal(_FAIL, RuleII.SINGLE_SENDER, index)
+    if guard_senders and ii.single_sender_at_launch(prior, rows, states):
+        return Refusal(_FAIL, RuleII.SINGLE_SENDER, len(rows) - 1)
     return None
 
 
@@ -533,14 +569,19 @@ def validate(
     now_ns: int,
     stage: StageView,
     manifests: ManifestFactsReader,
-    export_counters: object | None = None,
+    export_counters: Carried | str | None = None,
     verdicts: Mapping[str, Verdict] | None = None,
 ) -> RefusalReason | None:
     """The closed reason of the first refusal of ``rows`` against ``prior``, else ``None``.
 
-    ``mode``, ``now_ns``, ``stage`` and ``export_counters`` are the plan's signature (AC 10.9);
-    seam 7d reads them (Z3, mint rate, HWM_RESET floors). ``verdicts`` maps verdict ids to the
-    verdicts the caller resolved, for the Y8 clear.
+    ``mode``, ``now_ns`` and ``stage`` are the plan's signature (AC 10.9) and do not change a
+    verdict: every rule reads the rows' own instants and the fold, and the stage gate is
+    ``rows_admissible``'s. ``export_counters`` is the newest export's counters, as a parsed
+    ``Carried`` or the canonical JSON text of the ``carried_counters`` shape; an HWM_RESET row is
+    refused without it (B9). ``verdicts`` maps verdict ids to the verdicts the caller resolved,
+    for the Y8 clear.
     """
-    refusal = first_refusal(prior, rows, manifests=manifests, verdicts=verdicts)
+    refusal = first_refusal(
+        prior, rows, manifests=manifests, verdicts=verdicts, export_counters=export_counters
+    )
     return None if refusal is None else refusal.reason

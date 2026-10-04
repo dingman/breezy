@@ -80,7 +80,7 @@ def test_an_introducing_row_has_no_from_state_and_a_known_family_cannot_be_intro
                 lineage_root_family_id=INCUMBENT)  # fmt: skip
     assert new is None
     wrong = probe(champion_chain(), LAUNCH, Kind.MINT, State.SHADOW, family=OTHER, frm=State.SHADOW)
-    assert rule_of(wrong) == "from_state_mismatch"
+    assert rule_of(wrong) == "family_not_introduced"  # 7d: an unknown family must enter from ∅
     again = probe(champion_chain(), LAUNCH, Kind.MINT, State.SHADOW, family=CHILD, frm=None)
     assert rule_of(again) == "from_state_mismatch"
 
@@ -213,7 +213,8 @@ def test_family_artefact_binding_immutable() -> None:
     for other, rule in (("3" * 64, "artefact_binding_immutable"), (INC_ART, None), (None, None)):
         refused = probe(
             champion_chain(), LAUNCH, Kind.ATTEST, State.CHAMPION, family=INCUMBENT,
-            frm=State.CHAMPION, artefact_sha256=other,
+            frm=State.CHAMPION, artefact_sha256=other, ts=LAUNCH,
+            attest_valid_until_ns=LAUNCH + 3_600 * 10**9,
         )  # fmt: skip
         assert rule_of(refused) == rule
         if rule:

@@ -24,10 +24,12 @@ Choices ARCH leaves open, fixed here:
   DEMOTE, HALT, SWAP_CANCEL, TARGET_INELIGIBLE and ``drill_close_restore`` RESUME;
   ``trigger_cause_class`` only on a ``rollback_failed`` HALT.
 
-Step 9 of AC 10 (``transitions.validate``) lands with seams 7c and 7d. Until then the store checks
-what is structural: the verified hash chain (including each ``family_prior_seq`` and Y9 id) and
-that the extended chain folds. Restrictive rows never wait on anything that can fail open: no
-manifest, policy, journal or export read gates them.
+Step 9 of AC 10: the verified hash chain (including each ``family_prior_seq`` and Y9 id) and the
+fold of the extended chain, then ``transitions.validate`` over ``fold(prior)`` with the store's
+bound manifest-facts reader (seam 7d; ruling A6e-R2). Restrictive rows never wait on anything that
+can fail open: ``validate`` reads no manifest for them and no policy, journal or export read gates
+them. An HWM_RESET is not yet admitted (``RuleSetPending``), so the export floor (B9) is not read
+here.
 """
 
 from __future__ import annotations
@@ -96,6 +98,7 @@ __all__ = [
     "StoreBusy",
     "StoreDrifted",
     "StoreUnavailable",
+    "ValidateRefused",
     "WideningNotEnabled",
     "check_row_shape",
 ]
@@ -207,6 +210,10 @@ class ClockRefused(RegistryRefused):
 
 class FoldRefused(RegistryRefused):
     """The extended chain does not fold."""
+
+
+class ValidateRefused(RegistryRefused):
+    """``transitions.validate`` refused the batch; ``reason`` is its closed reason (AC 10.9)."""
 
 
 class ChainRefused(RegistryRefused):
@@ -322,7 +329,7 @@ class RegistryStore:
     """The one writer of one registry root's ``registry.sqlite``.
 
     ``repo_root`` is supplied by the caller and bound, with ``paths``, into the manifest-facts
-    reader that ``transitions.validate`` will take (seams 7c, 7d); it is never derived from the
+    reader that ``transitions.validate`` takes (AC 10 step 9); it is never derived from the
     interpreter's location or the working directory.
     """
 
@@ -528,10 +535,29 @@ class RegistryStore:
             raise CasMismatch(f"head venue_seq {head} is not the expected prior seq")
         _check_clock(batch, prior, now_ns)
         extended = _verify_structure(prior, batch, venue, now_ns)
+        self._validate(prior, batch, mode, now_ns, stage)
         for row in extended:
             conn.execute(_INSERT_ROW, _to_db(row))
         written = [_from_db(r) for r in conn.execute(_SELECT_AFTER, (venue, head))]
         return AppendResult(tuple(written), head + len(written), False)
+
+    def _validate(
+        self,
+        prior: Sequence[TransitionRow],
+        batch: Sequence[TransitionRow],
+        mode: WriterMode,
+        now_ns: int,
+        stage: StageView,
+    ) -> None:
+        """AC 10 step 9: the semantic rules, against the fold of the rows already written."""
+        folded = fold(prior, batch[0].venue, now_ns)
+        if isinstance(folded, FoldInvalid):
+            raise FoldRefused(folded.reason.value, reason=_FOLD_REFUSALS[folded.reason])
+        reason = transitions.validate(
+            folded, batch, mode=mode, now_ns=now_ns, stage=stage, manifests=self._manifests
+        )
+        if reason is not None:
+            raise ValidateRefused(reason.value, reason=reason)
 
 
 #: Columns a replay may differ in: the position, the clock, the writer's identity and the hashes.

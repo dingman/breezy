@@ -120,7 +120,7 @@ def test_resume_refused_for_a_class_that_never_resumes(cls: CauseClass | None, r
 def test_resume_refused_for_a_family_that_is_not_halted() -> None:
     # a row whose from_state is not the fold's state is refused first (A7c-R2) ...
     assert rule_of(resume(champion_chain())) == "from_state_mismatch"
-    assert rule_of(resume(Chain())) == "from_state_mismatch"
+    assert rule_of(resume(Chain())) == "family_not_introduced"  # 7d: nothing to resume is unknown
     # ... and one that names the fold's own state still finds nothing to resume
     assert rule_of(resume(champion_chain(), frm=State.CHAMPION)) == "resume_not_halted"
 
@@ -191,27 +191,39 @@ def test_infra_resume_budget_is_three_per_venue_in_seven_days() -> None:
 def test_a_second_resume_in_one_batch_sees_the_first() -> None:
     chain = champion_chain()
     halt_incumbent(chain, CauseClass.RECOVERABLE_MODEL)
-    chain.add(  # a sibling of the same lineage, halted for the same class
-        Kind.HALT, State.HALTED, family=CHILD, frm=State.CHAMPION, ts=HALT_TS + 1,
-        halt_cause_class=CauseClass.RECOVERABLE_MODEL, cause_code=CauseCode.VERDICT_FAIL,
-    )  # fmt: skip
     exhaust(chain, {INCUMBENT: {"model_resumes": (RESUME_TS - DAY_NS,)}})
     prior = run(chain, RESUME_TS)
+    # one family cannot be halted twice at once (7d: a second sender): resume, halt again, resume
     rows = [
         chain.add(
             Kind.RESUME,
             State.CHAMPION,
-            family=family,
+            family=INCUMBENT,
             frm=State.HALTED,
             ts=RESUME_TS,
             cause_verdict_ids=CITED,
-        )
-        for family in (INCUMBENT, CHILD)
+        ),
+        chain.add(
+            Kind.HALT,
+            State.HALTED,
+            family=INCUMBENT,
+            frm=State.CHAMPION,
+            halt_cause_class=CauseClass.RECOVERABLE_MODEL,
+            cause_code=CauseCode.VERDICT_FAIL,
+        ),
+        chain.add(
+            Kind.RESUME,
+            State.CHAMPION,
+            family=INCUMBENT,
+            frm=State.HALTED,
+            ts=RESUME_TS,
+            cause_verdict_ids=CITED,
+        ),
     ]
 
     assert tm.first_refusal(prior, rows[:1], manifests=no_facts) is None
     refused = tm.first_refusal(prior, rows, manifests=no_facts)
-    assert refused is not None and (refused.rule.value, refused.row_index) == ("resume_budget", 1)
+    assert refused is not None and (refused.rule.value, refused.row_index) == ("resume_budget", 2)
 
 
 def test_drill_resume_never_charges_model_budget() -> None:

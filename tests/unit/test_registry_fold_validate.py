@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Final
 import pytest
 
 import breezy.persistence.autonomy.transitions as tm
-from breezy.persistence.autonomy.fold import FoldResult
+from breezy.persistence.autonomy.fold import HEAD_KINDS, FoldResult
 from breezy.persistence.autonomy.schemas import (
     CauseClass,
     CauseCode,
@@ -141,10 +141,35 @@ def probe(
     verdicts: dict[str, Verdict] | None = None,
     **extra: Any,
 ) -> Refusal | None:
-    """Fold the chain as it stands, append the candidate and ask about it alone."""
+    """Fold the chain as it stands, append the candidate and ask about it.
+
+    A dated →CHAMPION head is asked about with the partner that moves the current sender out at
+    the same LAUNCH (a pair is one transaction; a lone head would leave two senders at LAUNCH, 7d).
+    """
     prior = run(chain, now)
     row = chain.add(kind, to, family=family, frm=frm, **extra)
-    return tm.first_refusal(prior, [row], manifests=manifests, verdicts=verdicts)
+    rows = [row, *_launch_partner(chain, prior, row)]
+    return tm.first_refusal(prior, rows, manifests=manifests, verdicts=verdicts)
+
+
+def _launch_partner(chain: Chain, prior: FoldResult, head: TransitionRow) -> list[TransitionRow]:
+    is_head = head.kind in HEAD_KINDS and head.to_state is State.CHAMPION
+    if not (is_head and head.effective_launch_date and prior.senders):
+        return []
+    sender = prior.senders[0]
+    if sender == head.family_id:
+        return []
+    state = prior.states[sender]
+    partner = Kind.SUPERSEDE if state is State.CHAMPION else Kind.DISPLACED
+    tail = chain.add(
+        partner,
+        State.CHALLENGER,
+        family=sender,
+        frm=state,
+        paired_transition_id=head.transition_id,
+        effective_launch_date=head.effective_launch_date,
+    )
+    return [tail]
 
 
 def resume(
@@ -693,17 +718,40 @@ def test_a_cited_verdict_the_caller_did_not_resolve_refuses() -> None:
     assert rule_of(refused) == "demoted_not_cleared"
 
 
+ROLLBACK_DAY: Final = "2026-10-12"
+ROLLBACK_CAUSE_NS: Final = at(NEXT_DAY, "16:46")
+
+
+def demoted_target_chain() -> Chain:
+    """INCUMBENT: superseded at DAY's LAUNCH (rollback-eligible), then the incoming of a rollback
+    pair that a SWAP_CANCEL pair_cause_incoming voided before its LAUNCH: eligible AND demoted."""
+    chain, _head, _tail = activated_pair()
+    back = chain.add(
+        Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
+        effective_launch_date=NEXT_DAY, ts=at(DAY, "20:00"),
+    )  # fmt: skip
+    chain.add(
+        Kind.SUPERSEDE, State.CHALLENGER, family=CHILD, frm=State.CHAMPION,
+        paired_transition_id=back.transition_id, effective_launch_date=NEXT_DAY,
+        ts=at(DAY, "20:00"),
+    )  # fmt: skip
+    chain.activate(back, ts=at(NEXT_DAY, "16:45"))
+    cancel(chain, back, ts=ROLLBACK_CAUSE_NS, cause=CauseCode.PAIR_CAUSE_INCOMING, family=INCUMBENT)
+    return chain
+
+
 def test_the_clear_also_gates_a_rollback_target() -> None:
-    def rollback_child(verdicts: list[Verdict]) -> Refusal | None:
+    def rollback_target(verdicts: list[Verdict]) -> Refusal | None:
         return probe(
-            demoted_child_chain(), LATE, Kind.ROLLBACK, State.CHAMPION, family=CHILD,
-            frm=State.CHALLENGER, effective_launch_date=NEXT_DAY,
+            demoted_target_chain(), at(NEXT_DAY, "20:00"), Kind.ROLLBACK, State.CHAMPION,
+            family=INCUMBENT, frm=State.CHALLENGER, effective_launch_date=ROLLBACK_DAY,
             cause_verdict_ids=tuple(v.verdict_id for v in verdicts),
             verdicts={v.verdict_id: v for v in verdicts},
         )  # fmt: skip
 
-    assert rule_of(rollback_child([])) == "demoted_not_cleared"
-    assert rollback_child([forward_shadow(produced_at_ns=CAUSE_NS + SEC)]) is None
+    assert rule_of(rollback_target([])) == "demoted_not_cleared"
+    cleared = forward_shadow(produced_at_ns=ROLLBACK_CAUSE_NS + SEC, family=INCUMBENT)
+    assert rollback_target([cleared]) is None
 
 
 # --- restrictive writes are always permitted ----------------------------------------------------
@@ -746,6 +794,11 @@ def test_restrictive_rows_are_not_refused_by_budgets_or_freezes(
     chain = champion_chain()
     chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
     family = CHILD if frm is State.CHALLENGER else INCUMBENT  # each in the state its row names
+    if kind is Kind.SWAP_CANCEL:  # 7d: a cancel voids a member of a pending pair
+        head, _tail = chain.promote_pair(day=DAY)
+        extra = {"voids_transition_ids": (head.transition_id,)}
+    if kind is Kind.ATTEST:  # 7d: the validity is within ATTEST_VERDICT_VALIDITY_H of ts_ns
+        extra = {"ts": RESUME_TS, "attest_valid_until_ns": RESUME_TS + HOUR_NS}
     freeze_venue(chain)
     spent = RESUME_TS - HOUR_NS
     exhaust(

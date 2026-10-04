@@ -206,6 +206,10 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
         "tests/unit/test_registry_store.py::test_registry_cas_and_idempotent_replay",
         "tests/unit/test_registry_store.py::test_registry_hash_chain_and_triggers",
         "tests/unit/test_registry_store.py::test_registry_transition_table_is_exact",
+        "tests/unit/test_registry_store_wiring.py::test_bootstrap_seed_genesis_only",
+        "tests/unit/test_registry_validate_ii.py::test_damping_ceilings[counting_rule]",
+        "tests/unit/test_registry_validate_ii.py::test_mint_unlimited_by_k_max_but_one_per_day",
+        "tests/unit/test_registry_validate_ii.py::test_root_admit_only_when_venue_has_no_sender[validate]",
         "tests/unit/test_registry_validate_store.py::test_child_d0_and_trial_prefix_pinned[store]",
         "tests/unit/test_launch_window_table.py::test_launch_path_units_end_before_next_fixed_point[existing_units]",
         "tests/unit/test_launch_window_table.py::test_no_unit_overlaps_launch_window[existing_units]",
@@ -215,13 +219,11 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
 
 ENVELOPE_PENDING_NAMES: Final[frozenset[str]] = frozenset(
     {
-        "test_bootstrap_seed_genesis_only",
         "test_candidate_cap_and_mint_rate",
         "test_child_manifest_equals_committed_root_except_allowlist",
         "test_exit_gate_stays_code_only",
         "test_family_source_registry_requires_bootstrap",
         "test_lineage_policy_allowlist_is_literal_only",
-        "test_mint_unlimited_by_k_max_but_one_per_day",
         "test_registry_paths_refuse_symlinks",
         "test_resolver_binds_bytes_to_row",
         "test_resume_not_subject_to_d0_rule",
