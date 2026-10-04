@@ -6,7 +6,9 @@ E-8 snapshot (``take_flock=False``, advisory), the node logs (one ``scan_node_lo
 with the W2 sinks, S2-R6), the journals through ``capture_audit_host`` and the recorder catalog. An
 unreadable or untrusted input raises ``AuditInputError`` with a cause of the closed set. The catalog
 is read with ``pyarrow.dataset`` (column-projected, ``to_batches()`` only, S2-R7) and loaded EAGERLY
-here; ``write_scan_cache`` is this module's only write (the audit's E-8 cache directory). Signatures
+here. ``scan_node_log`` raises ``NodeLogSinkFailed`` (the node-log package must not import the
+audit), and ``gather_inputs`` maps it to ``AuditInputError("node_log_sink_failed")``.
+``write_scan_cache`` is this module's only write (the audit's E-8 cache directory). Signatures
 are pinned by ``tests/unit/test_capture_audit_stubs.py`` and must not change.
 """
 

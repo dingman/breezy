@@ -36,7 +36,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
-from breezy.analysis.capture_audit_model import AuditInputError
 from breezy.analysis.capture_node_log_decisions import (
     DISPOSED_TEXT,
     EVALUATION_KINDS,
@@ -101,7 +100,7 @@ from breezy.analysis.capture_node_log_markers import (
     OrderDeniedLine,
     OrderSubmittedLine,
 )
-from breezy.analysis.capture_node_log_sinks import LogSink
+from breezy.analysis.capture_node_log_sinks import LogSink, NodeLogSinkFailed
 from breezy.analysis.capture_node_log_spawns import (
     LOG_STAMP_MAX_LAG_S,
     NO_SPAWN_EVENTS,
@@ -172,6 +171,7 @@ __all__ = [
     "NodeLogEvent",
     "NodeLogListing",
     "NodeLogScan",
+    "NodeLogSinkFailed",
     "NodeLogUnreadable",
     "OrderDeniedLine",
     "OrderFilledLine",
@@ -317,7 +317,7 @@ def _feed(sinks: Sequence[LogSink], event: NodeLogEvent) -> None:
         try:
             sink.feed(event)
         except Exception as exc:
-            raise AuditInputError("node_log_sink_failed", type(exc).__name__) from exc
+            raise NodeLogSinkFailed(type(exc).__name__) from exc
 
 
 def _absorb(
@@ -376,7 +376,7 @@ def scan_node_log(
     ``sinks`` (S2-R1) are online consumers: each is fed EVERY event, in file order and uncapped,
     before the scan's own accounting, so the audit's replay and marker reducers run in this one pass
     (``entry_lines`` is capped). A sink that raises aborts the scan with
-    ``AuditInputError("node_log_sink_failed")``; no later event is fed to any sink."""
+    ``NodeLogSinkFailed``; no later event is fed to any sink."""
     unknown = keep_kinds - _KNOWN_KINDS
     if unknown:
         raise ValueError(f"unknown decision kinds: {sorted(unknown)}")

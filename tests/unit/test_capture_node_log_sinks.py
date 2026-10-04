@@ -4,13 +4,14 @@ Marker lines are REAL retained lines unless the fixture says CONSTRUCTED or PINN
 ``tests/support/capture_node_log_fixtures.py``).
 """
 
+import ast
 import datetime as dt
 from pathlib import Path
 
 import pytest
 
 from breezy.analysis import capture_node_log as nl
-from breezy.analysis.capture_audit_model import AuditInputError
+from breezy.analysis.capture_node_log_sinks import NodeLogSinkFailed
 from tests.support.capture_node_log_fixtures import (
     CONSTRUCTED_CAPTURE_REFUSED,
     CONSTRUCTED_CAPTURE_REFUSED_ALERT_UNDELIVERED,
@@ -235,7 +236,7 @@ def test_sinks_are_fed_before_the_event_is_absorbed(
 def test_a_raising_sink_aborts_the_scan_with_node_log_sink_failed(tmp_path: Path) -> None:
     path = write_log(tmp_path / "n.log", REAL_TAKE, REAL_TAKE, REAL_TAKE)
     rec = _Recorder(raise_at=2)
-    with pytest.raises(AuditInputError) as caught:
+    with pytest.raises(NodeLogSinkFailed) as caught:
         nl.scan_node_log(path, sinks=(rec,))
     assert caught.value.cause == "node_log_sink_failed"
     assert isinstance(caught.value.__cause__, RuntimeError)
@@ -245,7 +246,7 @@ def test_a_raising_sink_aborts_the_scan_with_node_log_sink_failed(tmp_path: Path
 def test_a_raising_sink_does_not_hide_behind_a_later_sink(tmp_path: Path) -> None:
     path = write_log(tmp_path / "n.log", REAL_TAKE)
     later = _Recorder()
-    with pytest.raises(AuditInputError):
+    with pytest.raises(NodeLogSinkFailed):
         nl.scan_node_log(path, sinks=(_Recorder(raise_at=1), later))
     assert later.events == []
 
@@ -258,3 +259,26 @@ def test_scan_without_sinks_is_unchanged(tmp_path: Path) -> None:
 def test_an_unreadable_log_still_raises_node_log_unreadable_with_sinks(tmp_path: Path) -> None:
     with pytest.raises(nl.NodeLogUnreadable):
         nl.scan_node_log(tmp_path / "absent.log", sinks=(_Recorder(),))
+
+
+def test_node_log_sink_failed_carries_the_cause_the_audit_maps() -> None:
+    assert NodeLogSinkFailed.cause == "node_log_sink_failed"
+
+
+def test_no_node_log_module_imports_an_audit_module() -> None:
+    """Layering (S2-R1): the node-log package sits BELOW the audit; only the audit imports it."""
+    root = Path(nl.__file__).parent
+    modules = sorted(root.glob("capture_node_log*.py"))
+    assert len(modules) >= 5  # positive control: the glob really finds the package
+    offenders: list[str] = []
+    for path in modules:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+                if isinstance(node, ast.ImportFrom)
+                else []
+            )
+            offenders += [f"{path.name}: {n}" for n in names if "capture_audit" in n]
+    assert offenders == []

@@ -189,7 +189,11 @@ def test_an_audit_result_refuses_an_unregistered_metric_name() -> None:
     [
         ("EntryVeto", VetoReason.CAPTURE_GAP.value, True),
         ("EntryVeto", VetoReason.CAPTURE_UNTAGGED.value, True),
-        ("EntryVeto", VetoReason.PERMIT_LAPSED.value, True),
+        # FQ own VetoReason EntryVetos go through the adapter OnChangeFilter: not guard vetoes.
+        ("EntryVeto", VetoReason.PERMIT_LAPSED.value, False),
+        ("EntryVeto", VetoReason.FEED_STALE.value, False),
+        ("EntryVeto", "family_halt", False),
+        ("EntryVeto", "phase0_permit_absent", False),
         ("EntryVeto", "below_margin", False),
         ("Refuse", VetoReason.CAPTURE_GAP.value, False),
         ("Take", "", False),
@@ -389,3 +393,24 @@ def test_from_wire_refuses_an_unregistered_metric() -> None:
 def test_from_wire_refuses_a_non_mapping_document() -> None:
     with pytest.raises(wire.AuditWireError):
         wire.audit_from_wire([])  # type: ignore[arg-type]
+
+
+def test_guard_veto_reasons_are_the_capture_guards_own_refusal_reasons() -> None:
+    """Derived from ``guarded_strategy`` (the reasons its ``_refuse_one`` writes directly, which
+    never pass through the adapter's filter), and disjoint from FQ's own submit-guard reasons."""
+    from breezy.strategy.autonomy_capture import guarded_strategy as guard
+
+    enum_values = {r.value for r in VetoReason}
+    guard_reasons = {
+        value
+        for name, value in vars(guard).items()
+        if name.startswith("REASON_") and isinstance(value, str) and value in enum_values
+    }
+    assert guard_reasons == model.GUARD_VETO_REASONS == {"capture_gap", "capture_untagged"}
+    fq_own = {
+        guard.REASON_PHASE0_PERMIT_ABSENT,
+        guard.REASON_FEE_UNVERIFIED,
+        guard.REASON_FAMILY_HALT,
+        guard.REASON_INSTRUMENT_VANISHED,
+    }
+    assert not guard_reasons & fq_own

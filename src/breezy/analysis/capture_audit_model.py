@@ -26,6 +26,7 @@ __all__ = [
     "BACKFILL_DAYS",
     "ERROR_CAUSES",
     "FLUSH_WINDOW_S",
+    "GUARD_VETO_REASONS",
     "LIVE_PROOF_MAX_AGE_H",
     "LIVE_PROOF_NAME_RE",
     "METRIC_NAMES",
@@ -250,15 +251,24 @@ class AuditResult:
             raise ValueError(f"unregistered metric names: {unknown}")
 
 
-#: Guard ``EntryVeto`` reasons are the guard's own ``VetoReason`` vocabulary.
-_GUARD_VETO_REASONS: Final[frozenset[str]] = frozenset(reason.value for reason in VetoReason)
+#: The reasons ``CaptureGuardedStrategy._refuse_one`` writes DIRECTLY (its ``REASON_CAPTURE_*``
+#: constants, aliases of these ``VetoReason`` members). FQ's own ``VetoReason`` EntryVetos go
+#: through ``FqCaptureAdapter.follow_up`` and the node's ``OnChangeFilter``, so they are not here.
+#: ``tests/unit/test_capture_audit_model.py`` derives this set from ``guarded_strategy`` and pins
+#: equality (the module is not imported here: it pulls Nautilus).
+GUARD_VETO_REASONS: Final[frozenset[str]] = frozenset(
+    {VetoReason.CAPTURE_GAP.value, VetoReason.CAPTURE_UNTAGGED.value}
+)
 _ENTRY_VETO: Final[str] = "EntryVeto"
 
 
 def is_guard_entry_veto(kind: str, reason: str) -> bool:
-    """Whether a decision record or log line is a GUARD ``EntryVeto`` (B7, S2-R5).
+    """Whether a decision record or log line is a CAPTURE-GUARD ``EntryVeto`` (B7, S2-R5).
 
-    Guard vetoes are issued by ``CaptureGuardedStrategy`` / the family guard, matched to
-    ``CAPTURE_REFUSED`` lines in R1, and EXCLUDED from the R2 on-change replay on both sides. One
+    Guard vetoes are the capture guard's own refusals (``capture_gap``, ``capture_untagged``),
+    written directly by ``CaptureGuardedStrategy._refuse_one``, matched to ``CAPTURE_REFUSED``
+    lines in R1, and EXCLUDED from the R2 on-change replay on both sides. FQ's own ``VetoReason``
+    EntryVetos DO enter the node's ``OnChangeFilter`` (``FqCaptureAdapter.follow_up``), so they are
+    not guard vetoes and stay in the replay. One
     predicate, so R1, R2 and the fill legs never disagree about what a guard veto is."""
-    return kind == _ENTRY_VETO and reason in _GUARD_VETO_REASONS
+    return kind == _ENTRY_VETO and reason in GUARD_VETO_REASONS
