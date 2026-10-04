@@ -39,7 +39,7 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.strategy.current_rung_hold.family_id_arg import (
     FamilyIdArgError,
-    resolve_continuous_family_arg,
+    resolve_haltable_family_arg,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
@@ -122,7 +122,7 @@ def clear_family_halt(
 
     if args.family_id is not None:
         try:
-            resolve_continuous_family_arg(args.family_id, args.families_dir)
+            resolve_haltable_family_arg(args.family_id, args.families_dir)
         except FamilyIdArgError as exc:
             print(f"breezy-clear-family-halt: {exc}; refused", file=err)
             return EXIT_REFUSED

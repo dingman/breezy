@@ -121,7 +121,7 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.strategy.current_rung_hold.family_id_arg import (
     FamilyIdArgError,
-    resolve_continuous_family_arg,
+    resolve_haltable_family_arg,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
@@ -388,7 +388,7 @@ def set_family_halt(
     if not args.status and (args.reason is None or args.evidence_path is None):
         parser.error("--reason and --evidence-path are required unless --status is given")
     try:
-        resolve_continuous_family_arg(args.family_id, args.families_dir)
+        resolve_haltable_family_arg(args.family_id, args.families_dir)
     except FamilyIdArgError as exc:
         print(f"breezy-set-family-halt: {exc}; refused", file=err)
         return EXIT_REFUSED

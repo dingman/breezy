@@ -382,7 +382,7 @@ def test_spawn_node_argv_and_env_byte_pin(
 def _fq_manifest_for_halt_writer(families_dir: Path) -> None:
     """Copy the real FQ manifest and flip only ``composition_kind``.
 
-    ``resolve_continuous_family_arg`` refuses ``forecast_quantile_ladder``,
+    ``resolve_haltable_family_arg`` formerly refused ``forecast_quantile_ladder``,
     so the real writer body would never run against the checked-in file.
     """
     source = _REPO_ROOT / "deploy" / "families" / f"{_FQ_FAMILY_ID}.json"
