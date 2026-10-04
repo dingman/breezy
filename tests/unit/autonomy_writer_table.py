@@ -34,6 +34,7 @@ WRITE_MECHANISMS: Final[frozenset[str]] = frozenset(
         "write_once",  # single_read.write_once
         "write_root_copy",  # family_bytes.write_root_copy (6d)
         "write_monotone",  # hwm.write_monotone, under the intent flock (7e)
+        "native_stream_writer",  # AUT-1: one boot's StreamingFeatherWriter (E-7 rule 4)
     }
 )
 
@@ -71,6 +72,18 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "the node (boot and ticks) and the L1 cut-over, through hwm.write_monotone under the "
         "intent flock; the reset CLI is the only bypass",
         "write_monotone",
+    ),
+    # AUT-1 WP1 part B (L-12): the capture stream and the epoch file. Plan r12 sections 3.4.2, 3.15.
+    FileWriter(
+        "derived/capture_stream/<venue>/<source>/<instance_id>/<table>_<ts_ns>.feather",
+        "the boot's one native StreamingFeatherWriter, owned by CaptureStreamWriter (a fresh "
+        "instance_id per boot, so no two processes share a directory)",
+        "native_stream_writer",
+    ),
+    FileWriter(
+        "evidence/capture/epoch/<family_id>.json",
+        "the first composing boot, through capture_epoch.write_epoch_once",
+        "write_once",
     ),
 )
 

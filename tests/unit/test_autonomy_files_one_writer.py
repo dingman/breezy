@@ -34,6 +34,7 @@ from tests.support.autonomy_scan import (
 )
 from tests.support.autonomy_write_scan import find_write_sites
 from tests.support.autonomy_write_sites import scan_write_sites
+from tests.support.capture_closure_lint import aut1_files
 from tests.support.entry_points import REPO_ROOT, SRC_DIR
 from tests.unit.autonomy_writer_table import (
     AUTONOMY_FILE_WRITERS,
@@ -70,7 +71,7 @@ def unallowed_write_sites(
 
 
 def judged_files() -> list[Path]:
-    return sorted({*autonomy_source_files(), _LIVE_ORDERS_GATE})
+    return sorted({*autonomy_source_files(), *aut1_files(), _LIVE_ORDERS_GATE})
 
 
 def scan_real_tree(rules: Sequence[WriteSiteRule] = WRITE_SITE_ALLOWLIST) -> list[Finding]:
@@ -90,6 +91,28 @@ def scan_real_tree(rules: Sequence[WriteSiteRule] = WRITE_SITE_ALLOWLIST) -> lis
 def test_autonomy_files_have_one_writer() -> None:
     findings = scan_real_tree()
     assert findings == [], [(f.path, f.lineno, f.scope, f.detail) for f in findings]
+
+
+def test_the_scan_also_judges_the_aut1_modules_outside_autonomy_packages() -> None:
+    """AUT-1 WP1 part B (L-12): ``analysis/capture_*`` is not an ``autonomy`` path, so the AUT-1
+    globs widen the judged set; a planted write there would fail the real-tree gate."""
+    judged = {relative_path(p) for p in judged_files()}
+    assert "src/breezy/analysis/capture_forecast_ref.py" in judged
+    assert "src/breezy/persistence/autonomy/capture_reader.py" in judged
+    planted = unallowed_write_sites(
+        "src/breezy/analysis/capture_planted.py",
+        "def f(p):\n    open(p, 'w').close()\n",
+        module="breezy.analysis.capture_planted",
+    )
+    assert [site.detail for site in planted] == ["open mode 'w'"]
+
+
+def test_the_aut1_file_writer_rows_name_one_writer_per_path() -> None:
+    rows = {row.path: row for row in AUTONOMY_FILE_WRITERS}
+    stream = rows["derived/capture_stream/<venue>/<source>/<instance_id>/<table>_<ts_ns>.feather"]
+    assert stream.mechanism == "native_stream_writer"
+    assert "CaptureStreamWriter" in stream.writers
+    assert rows["evidence/capture/epoch/<family_id>.json"].mechanism == "write_once"
 
 
 def test_the_scan_judges_enough_files_and_sees_single_read_write_sites() -> None:
@@ -283,7 +306,7 @@ def test_allowlist_rows_for_code_that_has_not_landed_are_accepted_while_absent()
 def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None:
     assert {row.mechanism for row in AUTONOMY_FILE_WRITERS} <= WRITE_MECHANISMS
     paths = [row.path for row in AUTONOMY_FILE_WRITERS]
-    assert len(paths) == len(set(paths)) == 8
+    assert len(paths) == len(set(paths)) == 10
 
 
 def test_exemptions_are_narrow_and_unique() -> None:

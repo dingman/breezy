@@ -39,6 +39,7 @@ from tests.support.autonomy_scan import (
     scan_files,
     walk_with_scope,
 )
+from tests.support.capture_closure_lint import aut1_files
 from tests.support.entry_points import REPO_ROOT, SCRIPTS_DIR, SRC_DIR
 
 #: Sizes at seam 4a: 16 autonomy modules, 12 of them in the core.
@@ -454,6 +455,10 @@ _HYGIENE_ABSOLUTE_ALLOWLIST: Final[dict[tuple[str, str], str]] = {
     ("src/breezy/runtime/autonomy_sandbox/wal_snapshot.py", "/proc/self/fd"): (
         "kernel path to reach the verified snap-dir fd for recovery (B10-R4 L-1), not a host path"
     ),
+    ("src/breezy/persistence/autonomy/capture_reader.py", "/proc/self/fd"): (
+        "kernel path naming the O_NOFOLLOW-verified entry fd, so the feather preflight scanner "
+        "reads the same inode (AUT-1 WP1 part B), not a host path"
+    ),
 }
 
 
@@ -494,7 +499,10 @@ _PLANTED_HYGIENE: Final[dict[str, str]] = {
 
 
 def test_autonomy_payload_hygiene_scan() -> None:
-    _assert_clean(autonomy_source_files(), _scan_payload_hygiene, minimum=MIN_AUTONOMY_FILES)
+    """Widened with the AUT-1 globs (L-12): ``analysis/capture_*`` is not an autonomy path."""
+    judged = sorted({*autonomy_source_files(), *aut1_files()})
+    assert "src/breezy/analysis/capture_forecast_ref.py" in {relative_path(p) for p in judged}
+    _assert_clean(judged, _scan_payload_hygiene, minimum=MIN_AUTONOMY_FILES)
 
 
 def test_payload_hygiene_scan_fires_on_every_planted_form() -> None:
@@ -530,6 +538,20 @@ def test_hygiene_allowlist_exempts_proc_self_fd_in_wal_snapshot_only() -> None:
 def test_hygiene_scan_flags_any_other_absolute_literal_in_wal_snapshot() -> None:
     for literal in ("/proc/self/fd/3", "/proc/self", "/tmp/x", "/home/jon/x", "/proc/self/fdx"):
         assert len(_scan_payload_hygiene(_WAL_FILE, f'_P = "{literal}"\n')) == 1, literal
+
+
+_READER_FILE: Final = "src/breezy/persistence/autonomy/capture_reader.py"
+
+
+def test_hygiene_allowlist_exempts_proc_self_fd_in_capture_reader_only() -> None:
+    assert _scan_payload_hygiene(_READER_FILE, '_P = "/proc/self/fd"\n') == []
+    other = "src/breezy/persistence/autonomy/capture_stream.py"
+    assert len(_scan_payload_hygiene(other, '_P = "/proc/self/fd"\n')) == 1
+
+
+def test_hygiene_scan_flags_any_other_absolute_literal_in_capture_reader() -> None:
+    for literal in ("/proc/self/fd/3", "/proc/self", "/tmp/x", "/home/jon/x", "/proc/self/fdx"):
+        assert len(_scan_payload_hygiene(_READER_FILE, f'_P = "{literal}"\n')) == 1, literal
 
 
 def test_payload_hygiene_scan_ignores_enum_only_messages() -> None:

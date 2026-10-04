@@ -250,3 +250,35 @@ def test_module_exports_are_pinned() -> None:
         "compute_exit_decision_id",
         "compute_orphan_decision_id",
     }
+
+
+# -- WP1 part B: reference strings (plan r12 sections 3.3.1 and 3.9) ------------------------------
+
+
+def test_frame_ref_strings_are_the_c1_forms() -> None:
+    assert capture_ids.frame_ref_of("depth10", "tc-x.POLYMARKET_US", 42) == (
+        "depth10:tc-x.POLYMARKET_US@42"
+    )
+    assert capture_ids.frame_ref_of("quote", "tc-x^no.POLYMARKET_US", 7) == (
+        "quote:tc-x^no.POLYMARKET_US@7"
+    )
+    # Exit cites ("", instrument, 0): no frame, so no reference string.
+    assert capture_ids.frame_ref_of("", "tc-x.POLYMARKET_US", 0) == ""
+
+
+def test_frame_ref_round_trips_and_refuses_malformed() -> None:
+    ref = capture_ids.frame_ref_of("depth10", "tc-x.POLYMARKET_US", 42)
+    assert capture_ids.parse_frame_ref(ref) == ("depth10", "tc-x.POLYMARKET_US", 42)
+    assert capture_ids.parse_frame_ref("") is None
+    for bad in ("depth10", "depth10:x", "bogus:x@1", "depth10:x@notanint", "quote:@5"):
+        assert capture_ids.parse_frame_ref(bad) is None, bad
+
+
+def test_forecast_ref_string_carries_available_at_ns_and_round_trips() -> None:
+    ref = capture_ids.forecast_ref_of("KLAX", 100, 102)
+    assert ref == "nbp:KLAX@100@102"
+    assert capture_ids.parse_forecast_ref(ref) == ("KLAX", 100, 102)
+    assert capture_ids.forecast_ref_of("", 0, 0) == ""
+    assert capture_ids.parse_forecast_ref("") is None
+    for bad in ("nbp:KLAX@100", "nbp:KLAX@a@b", "xyz:KLAX@1@2", "nbp:@1@2"):
+        assert capture_ids.parse_forecast_ref(bad) is None, bad

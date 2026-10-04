@@ -5,7 +5,10 @@ Nautilus-free, so the node writer and the daily audit's replay share one definit
 uses a record's own stored fields and never re-derives ``eval_ns`` or ``eval_seq``.
 
 A frame reference is ``(frame_kind, instrument, frame_ts_event)`` (ER-3) and carries no hash, so
-r8's payload-ref helpers (``depth_ref_of`` and friends) do not exist here.
+r8's payload-ref helpers (``depth_ref_of`` and friends) do not exist here. The two string forms the
+C1 projection exposes (plan r12 section 3.9) are built and parsed here, pure, so the writer side
+and every reader share one definition: ``"<depth10|quote>:<instrument_id>@<ts_event>"`` and
+``"nbp:<station>@<cycle_ns>@<available_at_ns>"``.
 """
 
 import hashlib
@@ -20,12 +23,19 @@ __all__ = [
     "compute_decision_id",
     "compute_exit_decision_id",
     "compute_orphan_decision_id",
+    "forecast_ref_of",
+    "frame_ref_of",
+    "parse_forecast_ref",
+    "parse_frame_ref",
 ]
 
 DECISION_ID_HEX_LEN: Final[int] = 32
 _SEPARATOR: Final[str] = "|"
 _EXIT_DOMAIN: Final[str] = "exit/v1"
 _ORPHAN_DOMAIN: Final[str] = "orphan/v1"
+_REF_KINDS: Final[frozenset[str]] = frozenset({"depth10", "quote"})
+_FORECAST_REF_PREFIX: Final[str] = "nbp:"
+_AT: Final[str] = "@"
 
 #: ``EvalSeqCounter`` keeps this many most-recent ``ts_event`` values per instrument (r8 H2).
 EVAL_SEQ_RETAINED_TS: Final[int] = 4
@@ -80,6 +90,39 @@ def compute_exit_decision_id(
 def compute_orphan_decision_id(family_id: str, client_order_id: str) -> str:
     """The id of an untagged order's link (D12); no ``DecisionRecord`` ever carries it."""
     return _digest(_SEPARATOR.join((_ORPHAN_DOMAIN, family_id, client_order_id)))
+
+
+def frame_ref_of(frame_kind: str, instrument: str, frame_ts_event: int) -> str:
+    """The C1 ``depth_ref`` / ``quote_ref`` string; ``""`` for no frame (an Exit's ``""`` kind)."""
+    if frame_kind not in _REF_KINDS:
+        return ""
+    return f"{frame_kind}:{instrument}{_AT}{frame_ts_event}"
+
+
+def parse_frame_ref(ref: str) -> tuple[str, str, int] | None:
+    """Inverse of :func:`frame_ref_of`; ``None`` for the empty or any malformed reference."""
+    kind, colon, rest = ref.partition(":")
+    instrument, at, ts_text = rest.rpartition(_AT)
+    if kind not in _REF_KINDS or not colon or not at or not instrument:
+        return None
+    return (kind, instrument, int(ts_text)) if ts_text.isdecimal() else None
+
+
+def forecast_ref_of(station: str, cycle_ns: int, available_at_ns: int) -> str:
+    """The C1 ``forecast_input_ref``, or ``""`` when no forecast was cited (empty station)."""
+    if not station:
+        return ""
+    return f"{_FORECAST_REF_PREFIX}{station}{_AT}{cycle_ns}{_AT}{available_at_ns}"
+
+
+def parse_forecast_ref(ref: str) -> tuple[str, int, int] | None:
+    """Inverse of :func:`forecast_ref_of`; ``None`` for the empty or any malformed reference."""
+    if not ref.startswith(_FORECAST_REF_PREFIX):
+        return None
+    parts = ref.removeprefix(_FORECAST_REF_PREFIX).split(_AT)
+    if len(parts) != 3 or not parts[0] or not (parts[1].isdecimal() and parts[2].isdecimal()):
+        return None
+    return parts[0], int(parts[1]), int(parts[2])
 
 
 class EvalSeqCounter:

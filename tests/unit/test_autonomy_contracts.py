@@ -21,9 +21,12 @@ AUTONOMY_PACKAGE: Final[str] = "breezy.persistence.autonomy"
 #: Core modules exempt from contract (b). Empty at ARCH-0 (AC 2); AUT-1 WP1 appends the three
 #: capture modules that exist to persist Nautilus custom data (the ``@customdataclass`` records,
 #: the native ``StreamingFeatherWriter`` wrapper, and the publisher that builds the heartbeat
-#: record). Every other AUT-1 module is Nautilus-free and sits in contracts (b) and (c).
+#: record), and part B appends the reader that decodes the stream through Nautilus's registered
+#: Arrow decoders and enum parsers. Every other AUT-1 module is Nautilus-free and sits in contracts
+#: (b) and (c).
 NAUTILUS_PERMITTED: Final[frozenset[str]] = frozenset(
-    f"{AUTONOMY_PACKAGE}.{m}" for m in ("capture_records", "capture_stream", "capture_publish")
+    f"{AUTONOMY_PACKAGE}.{m}"
+    for m in ("capture_records", "capture_stream", "capture_publish", "capture_reader")
 )
 #: Core modules that may reach pyarrow, hence absent from contract (c) (AC 1).
 PYARROW_REACHING: Final[frozenset[str]] = frozenset(
