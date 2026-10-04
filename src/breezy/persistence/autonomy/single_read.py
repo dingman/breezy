@@ -208,13 +208,21 @@ def _is_absent(parent: int, name: str) -> bool:
     return False
 
 
+def _fsync_dir(dirfd: int, what: str) -> None:
+    try:
+        os.fsync(dirfd)
+    except OSError as exc:
+        raise _io(exc, what) from exc
+
+
 def ensure_dir(rootfd: int, rel: Sequence[str], *, mode: int = _DEFAULT_DIR_MODE) -> int:
     """``walk_dirs`` that creates each missing component: the one directory creator (A4-R4).
 
     Existing components are only walked, so their modes are left alone and a path of
     existing directories succeeds even through read-only ones. A missing component in a
     parent without the owner-write bit is refused ``DIR_NOT_WRITABLE`` (a mode-bit check,
-    V30), never created. Returns an fd the caller closes.
+    V30), never created. The parent is fsynced after each ``mkdir`` it performed (A6d-A2 L1).
+    Returns an fd the caller closes.
     """
     _refuse_mode(mode)
     for component in rel:
@@ -230,6 +238,8 @@ def ensure_dir(rootfd: int, rel: Sequence[str], *, mode: int = _DEFAULT_DIR_MODE
                     pass  # a concurrent creator won; the walk below validates it
                 except OSError as exc:
                     raise _io(exc, component) from exc
+                else:
+                    _fsync_dir(current, "directory fsync")
             child = _descend(current, component)
             os.close(current)
             current = child

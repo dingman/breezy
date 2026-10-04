@@ -122,6 +122,50 @@ def test_ensure_dir_creates_nested_directories_with_mode_0700(root: Path) -> Non
     assert stat.S_IMODE((root / "x" / "y").stat().st_mode) == 0o700
 
 
+def test_ensure_dir_honours_a_non_default_mode(root: Path) -> None:
+    rootfd = open_root(root)
+    try:
+        os.close(ensure_dir(rootfd, ("x", "y"), mode=0o750))
+    finally:
+        os.close(rootfd)
+    assert stat.S_IMODE((root / "x").stat().st_mode) == 0o750
+    assert stat.S_IMODE((root / "x" / "y").stat().st_mode) == 0o750
+
+
+def test_ensure_dir_fsyncs_the_parent_of_each_created_directory(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / "old").mkdir(mode=0o700)
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd: int) -> None:
+        synced.append(os.fstat(fd).st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    rootfd = open_root(root)
+    try:
+        os.close(ensure_dir(rootfd, ("old", "new1", "new2")))
+    finally:
+        os.close(rootfd)
+    assert synced == [(root / "old").stat().st_ino, (root / "old" / "new1").stat().st_ino]
+
+
+def test_ensure_dir_does_not_fsync_when_nothing_is_created(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / "a").mkdir(mode=0o700)
+    synced: list[int] = []
+    monkeypatch.setattr(os, "fsync", synced.append)
+    rootfd = open_root(root)
+    try:
+        os.close(ensure_dir(rootfd, ("a",)))
+    finally:
+        os.close(rootfd)
+    assert synced == []
+
+
 def test_ensure_dir_is_idempotent_and_keeps_existing_modes(root: Path) -> None:
     (root / "x").mkdir(mode=0o750)
     (root / "x").chmod(0o750)

@@ -1,8 +1,8 @@
 """Family bytes: E-14 root copies and the manifest-facts reader (ARCH-0 AC 21, AC 28).
 
 ``write_root_copy`` lays down the content-addressed copy of a root's artefact and its per-family
-``root/v1`` record, both write-once and 0444, through ``single_read`` only (this module performs no
-filesystem mutation of its own):
+``root/v1`` record, both write-once (``O_TMPFILE``: no named temp file) and 0444,
+through ``single_read`` only (this module performs no filesystem mutation of its own):
 
 * ``derived/artefacts/<kind>:density_table/<sha>/artefact.json``
 * ``derived/artefacts/<kind>:density_table/<sha>/roots/<family_id>.json``
@@ -47,7 +47,7 @@ from breezy.persistence.autonomy.single_read import (
     open_root,
     read_once_at,
     walk_dirs,
-    write_once,
+    write_once_tmpfile,
 )
 from breezy.persistence.autonomy.wire import WireRefusalReason, WireRefused
 from breezy.persistence.family_manifest import FamilyManifestError, parse_family_manifest
@@ -92,7 +92,7 @@ def _wrong_type(field: str) -> WireRefused:
 def _publish(paths: AutonomyPaths | ShadowPaths, path: Path, data: bytes, subject: str) -> bool:
     """Write-once ``data`` at ``path``; ``True`` when it was newly written."""
     try:
-        outcome = write_once(path, data, root=paths.root, mode=_ROOT_COPY_MODE)
+        outcome = write_once_tmpfile(path, data, root=paths.root, mode=_ROOT_COPY_MODE)
     except SingleReadRefused as exc:
         if exc.reason is SingleReadReason.EXISTS_DIFFERENT:
             raise RootCopyIntegrity(subject) from exc

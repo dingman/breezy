@@ -337,11 +337,13 @@ def test_a_root_never_falls_back_to_a_registry_copy_after_a_repo_mismatch(
 
 
 def test_the_reader_never_raises_on_an_unreadable_source(repo: Path, data_root: Path) -> None:
-    families = repo / "deploy" / "families"
-    (families / f"{FAMILY}.json").chmod(0)
+    path = repo / "deploy" / "families" / f"{FAMILY}.json"
+    sha = _manifest_sha(path)  # the real sha: only the unreadable file stands in the way
+    assert _facts(repo, data_root, FAMILY, sha) is not None  # control
+    path.chmod(0)
     if os.geteuid() == 0:  # pragma: no cover - root reads anything
         pytest.skip("mode bits do not bind root")
-    assert _facts(repo, data_root, FAMILY, "a" * 64) is None
+    assert _facts(repo, data_root, FAMILY, sha) is None
 
 
 # ------------------------------------------------------------------------ module hygiene
@@ -366,3 +368,26 @@ def test_family_bytes_passes_no_draft_flag_and_writes_only_through_single_read()
         and isinstance(n.func.value, ast.Name)
     }
     assert called.isdisjoint(banned)
+
+
+# ------------------------------------------------------------- A6d-A2 L2: no named temp file
+
+
+def test_root_copy_never_shows_a_tmp_name(data_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        opened.append(os.fsdecode(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+    paths = AutonomyPaths(data_root)
+    _copy(paths)
+    _copy(paths)  # EXISTS_EQUAL rerun
+    with pytest.raises(RootCopyIntegrity):
+        _copy(paths, record=_record(manifest_sha="b" * 64))
+    assert not [name for name in opened if os.path.basename(name).startswith(".tmp.")]
+    sha_dir = paths.artefact_dir(root_model_class(KIND), ARTEFACT_SHA)
+    for directory in (sha_dir, sha_dir / "roots"):
+        assert not [p.name for p in directory.iterdir() if p.name.startswith(".tmp.")]
