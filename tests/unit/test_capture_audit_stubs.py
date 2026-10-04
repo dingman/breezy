@@ -410,7 +410,10 @@ def test_the_stage_3_constants_have_their_frozen_values(module: str) -> None:
 
 def test_the_stage_3_stub_modules_are_all_stubs_until_a_stream_lands_them() -> None:
     assert set(_STAGE3_STUBS) <= set(EXPECTED)
-    assert set(_STAGE3_STUBS) - REAL_MODULES == set(_STAGE3_STUBS)  # none is landed yet
+    # S1 and S2 land their own modules (S3-R28); S3-R54: exactly those, and only stage-3 modules
+    landed = set(_STAGE3_STUBS) & REAL_MODULES
+    assert landed == (S1_REAL | S2_REAL)
+    assert (S1_REAL | S2_REAL) <= set(_STAGE3_STUBS)
 
 
 def test_the_real_modules_union_is_the_four_lines() -> None:

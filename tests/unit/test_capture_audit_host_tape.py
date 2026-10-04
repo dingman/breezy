@@ -393,6 +393,7 @@ def test_without_an_audit_row_in_the_table_there_is_no_snapshot(
 ) -> None:
     root = w3.make_root(tmp_path)
     monkeypatch.setattr(host, "_BUS_OUTCOMES", {})
+    monkeypatch.setattr(host, "AUTONOMY_BWRAP_TABLE", {})  # stage 3 ships the real audit row
     with pytest.raises(AuditInputError) as info:
         host.read_recorder_props(root, now_ns=w3.NOW_NS)
     assert (info.value.cause, info.value.detail) == ("bus_snapshot_missing", "no_audit_row")

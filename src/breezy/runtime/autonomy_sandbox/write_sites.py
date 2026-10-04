@@ -84,6 +84,7 @@ WRAPPER_CODE_FILES: Final[tuple[str, ...]] = (
     f"{_PACKAGE}/run_mounts.py",
     f"{_PACKAGE}/self_probe.py",
     f"{_PACKAGE}/selftest_cli.py",
+    f"{_PACKAGE}/studies_lock.py",
     f"{_PACKAGE}/table.py",
     f"{_PACKAGE}/unit_lint.py",
     f"{_PACKAGE}/wal_snapshot.py",
