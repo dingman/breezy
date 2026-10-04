@@ -34,6 +34,7 @@ from breezy.ingest.gaps import local_standard_date
 from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.strategy.ladder_ev.forecast_state import (
+    NBP_QUANTILE_MODEL,
     NBP_QUANTILE_VARIABLES,
     ForecastQuantileState,
     ForecastState,
@@ -48,9 +49,6 @@ __all__ = [
 
 #: The one forecast variable the ladder_ev decider consumes today.
 FORECAST_SUBSCRIBER_VARIABLE: str = "TXN"
-
-#: The one forecast model the quantile-vector decider consumes (SL-12).
-NBP_QUANTILE_MODEL: str = "NBM_NBP"
 
 
 class ForecastStateActor(Actor):
@@ -195,7 +193,8 @@ class ForecastQuantileStateActor(Actor):
             self.counters[f"absent_{data.absence_reason}"] += 1
             return
         climate_day = local_standard_date(
-            data.valid_end_ns, self._std_utc_offset_hours[data.station],
+            data.valid_end_ns,
+            self._std_utc_offset_hours[data.station],
         )
         state.push(
             variable=data.variable,

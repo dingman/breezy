@@ -25,14 +25,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from breezy.ingest.gaps import local_standard_date
+from breezy.normalize.climate_day import local_standard_date
 from breezy.persistence.autonomy.capture_reader import CaptureStream
 from breezy.strategy.ladder_ev.forecast_state import (
+    NBP_QUANTILE_MODEL,
     NBP_QUANTILE_VARIABLES,
     ForecastQuantileState,
     ForecastQuantileVector,
 )
-from breezy.strategy.ladder_ev.forecast_subscriber import NBP_QUANTILE_MODEL
 
 __all__ = [
     "NBP_QUANTILE_MODEL",

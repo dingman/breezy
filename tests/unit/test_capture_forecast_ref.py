@@ -223,3 +223,25 @@ def test_the_model_constant_is_the_one_fq_filters_on() -> None:
     ]
     assert "NBP_QUANTILE_MODEL" not in defined
     assert capture_forecast_ref.NBP_QUANTILE_MODEL == forecast_subscriber.NBP_QUANTILE_MODEL
+
+
+def test_the_forecast_ref_module_import_closure_is_free_of_ingest_runtime_and_the_actor() -> None:
+    """S2-R26: the audit CLI imports this module at module level, so its closure stays pure."""
+    import subprocess
+    import sys
+
+    src = str(Path(capture_forecast_ref.__file__).parents[2])
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {src!r})\n"  # -I ignores PYTHONPATH
+        "import breezy.analysis.capture_forecast_ref\n"
+        "banned = ('httpx', 'breezy.ingest', 'breezy.runtime', 'nautilus_trader.common.actor')\n"
+        "bad = sorted(m for m in sys.modules if m in banned"
+        " or any(m.startswith(b + '.') for b in banned))\n"
+        "print(bad)\n"
+        "raise SystemExit(1 if bad else 0)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stdout + done.stderr

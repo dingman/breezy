@@ -115,7 +115,10 @@ from enum import Enum
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo
 
-from breezy.normalize.climate_day import standard_time_zone
+# Re-exported (explicit alias for mypy): the pure home is ``breezy.normalize.climate_day``.
+from breezy.normalize.climate_day import (
+    local_standard_date as local_standard_date,  # noqa: PLC0414
+)
 
 logger = logging.getLogger(__name__)
 
@@ -387,22 +390,6 @@ class _ObservedSummary:
 # ---------------------------------------------------------------------------
 # Pure clock helpers -- the ONE copy of each derivation.
 # ---------------------------------------------------------------------------
-
-
-def local_standard_date(now_ns: int, std_utc_offset_hours: float) -> dt.date:
-    """The calendar date `now_ns` falls on in fixed local-standard time.
-
-    Never DST-aware -- see the module docstring's two-clocks note. Matches
-    ``NwsIngestActor._most_recent_completed_climate_day``'s own conversion
-    byte-for-byte (floor division on whole seconds, not float division), so
-    this and that function agree on every instant, including ones exactly on
-    a second boundary.
-    """
-    local = dt.datetime.fromtimestamp(
-        now_ns // _NS_PER_SECOND,
-        tz=standard_time_zone(std_utc_offset_hours),
-    )
-    return local.date()
 
 
 def most_recent_completed_climate_day(now_ns: int, std_utc_offset_hours: float) -> dt.date:

@@ -29,6 +29,7 @@ __all__ = [
     "FORECAST_OK",
     "FORECAST_STALE",
     "FORECAST_UNAVAILABLE",
+    "NBP_QUANTILE_MODEL",
     "NBP_QUANTILE_VARIABLES",
     "ForecastQuantileState",
     "ForecastQuantileVector",
@@ -42,6 +43,9 @@ __all__ = [
 FORECAST_OK: Final[str] = "ok"
 FORECAST_UNAVAILABLE: Final[str] = "forecast_unavailable"
 FORECAST_STALE: Final[str] = "forecast_stale"
+
+#: The one forecast model the quantile-vector decider consumes (SL-12).
+NBP_QUANTILE_MODEL: Final[str] = "NBM_NBP"
 
 
 @dataclass(frozen=True, slots=True)

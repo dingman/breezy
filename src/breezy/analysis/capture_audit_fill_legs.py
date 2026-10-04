@@ -73,6 +73,7 @@ from breezy.analysis.capture_audit_model import (
     TapeMark,
     is_guard_entry_veto,
 )
+from breezy.analysis.capture_forecast_ref import ForecastRefStatus, resolve_forecast_ref
 from breezy.domain.exec_intent import intent_fingerprint, utc_day_for_ns
 from breezy.domain.instrument_leg import (
     leg_of_symbol,
@@ -373,11 +374,6 @@ def _forecast_findings(ctx: AuditContext, boot: BootEvidence, take: DecisionView
     offset = offset_of(ctx.inp, station)
     if offset is None:
         return [fail(Leg.B, "std_offset_unknown", ident, station)]
-    # Imported here, not at module level: the forecast reference module reaches the
-    # ``breezy.ingest`` package, whose eager ``__init__`` loads the HTTP client. The audit entry
-    # point's import closure stays free of it; the leg itself makes no network call.
-    from breezy.analysis.capture_forecast_ref import ForecastRefStatus, resolve_forecast_ref
-
     resolution = resolve_forecast_ref(
         ctx.streams.get(boot), station, cycle_ns, available_at_ns, std_utc_offset_hours=offset
     )

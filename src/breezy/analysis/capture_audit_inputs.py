@@ -614,7 +614,9 @@ def _settle_boots(
 def _check_epoch(
     epoch: EpochRecord | None, boots: Sequence[BootEvidence], firsts: Sequence[int], day: dt.date
 ) -> None:
-    streams = bool(boots) and any(b.summary.row_counts.get("capture_heartbeat") for b in boots)
+    streams = bool(boots) and any(
+        b.summary.row_counts.get("custom_capture_heartbeat") for b in boots
+    )
     if epoch is None:
         if streams or firsts:
             raise AuditInputError("epoch_missing", "capture_files_without_epoch")
