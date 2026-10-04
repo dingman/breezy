@@ -339,7 +339,8 @@ def _check_binds(row: BwrapRow) -> None:
             raise _fail(row.name, "positive_probe needs a bound path and a known kind")
 
 
-def _check_bus_read(row: str, read: BusRead) -> None:
+def validate_bus_read(row: str, read: BusRead) -> None:
+    """Raise ``TableError`` unless ``read`` fits the AC-9.1 grammar (also run at spawn time)."""
     argv = read.argv
     if not isinstance(argv, tuple) or not all(isinstance(token, str) for token in argv):
         raise _fail(row, f"bus read {read.name!r}: argv must be a tuple of strings")
@@ -396,7 +397,7 @@ def _check_bus(row: BwrapRow) -> None:
     if len(set(names)) != len(names):
         raise _fail(row.name, "bus read names must be unique")
     for read in row.bus_reads:
-        _check_bus_read(row.name, read)
+        validate_bus_read(row.name, read)
     budget, bind = row.bus_snapshot_budget_s, row.bus_snapshot_bind
     low, high = BUS_SNAPSHOT_BUDGET_RANGE_S
     if not row.bus_reads:

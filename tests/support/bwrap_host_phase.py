@@ -19,12 +19,13 @@ REFUSAL_PREFIX: Final[str] = "[breezy] phase-2 not admitted"
 BWRAP_HOST_TEST_FILES: Final[frozenset[str]] = frozenset(
     {
         "tests/integration/test_autonomy_sandbox_namespace.py",
+        "tests/integration/test_bus_handoff_namespace.py",
         "tests/integration/test_bwrap_host_phase_witness.py",
     }
 )
-#: 3 witness tests + the 24 namespace tests of WP-B2b-3. Each WP that adds a
-#: real-namespace test widens this in the same commit (L-12).
-BWRAP_HOST_EXPECTED_TESTS: Final[int] = 27
+#: 3 witness tests + the 24 namespace tests of WP-B2b-3 + the 2 bus-handoff tests of
+#: WP-B2c. Each WP that adds a real-namespace test widens this in the same commit (L-12).
+BWRAP_HOST_EXPECTED_TESTS: Final[int] = 29
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _BASE_REFUSED: Final[frozenset[str]] = frozenset({"nautilus_trader", "breezy.adapters"})

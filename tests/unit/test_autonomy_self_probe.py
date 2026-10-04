@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import stat
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import redirect_stdout
@@ -32,6 +33,11 @@ from typing import Any
 import pytest
 
 from breezy.runtime.autonomy_sandbox import selftest_cli
+from breezy.runtime.autonomy_sandbox.bus_handoff import (
+    BusReadResult,
+    BusSnapshot,
+    BusSnapshotError,
+)
 from breezy.runtime.autonomy_sandbox.bwrap import DEGRADED_VAR, ROW_VAR, _home_rebinds
 from breezy.runtime.autonomy_sandbox.self_probe import (
     FIXED_REASON_CODES,
@@ -687,7 +693,7 @@ def test_selftest_without_a_row_env_is_env_row(
     assert (code, report["failures"]) == (3, ["env_row"])
 
 
-@pytest.mark.parametrize("flag", ["--bus-snapshot", "--exec-snapshot", "--bogus"])
+@pytest.mark.parametrize("flag", ["--exec-snapshot", "--bogus"])
 def test_selftest_modes_not_yet_landed_are_usage_errors(
     world: World, run_cli: Callable[..., tuple[int, dict[str, Any]]], flag: str
 ) -> None:
@@ -709,3 +715,94 @@ def test_selftest_proc_checks_are_reported_only_when_asked(
     _, asked = run_cli(["--proc-checks"], proc_checks=collect)
     assert asked["proc_checks"] == {"kill": "ESRCH"}
     assert calls == [ROW]
+
+
+# --- --bus-snapshot (WP-B2c, V17/V21) ----------------------------------------------
+
+
+def _bus_snapshot(reads: dict[str, int]) -> BusSnapshot:
+    return BusSnapshot(
+        invocation_id="0" * 32,
+        unit=f"{ROW}.service",
+        ts_ns=1,
+        budget_s=10,
+        reads=tuple(
+            BusReadResult(
+                name=name, argv=(), rc=rc, timed_out=False, skipped=False, oversize=False, stdout=""
+            )
+            for name, rc in reads.items()
+        ),
+    )
+
+
+def test_selftest_bus_snapshot_reports_the_reads_and_the_failing_in_row_systemctl(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    seen: list[str] = []
+
+    def reader(row: BwrapRow, **kwargs: Any) -> BusSnapshot:
+        seen.append(row.name)
+        return _bus_snapshot({"self_show": 0})
+
+    code, report = run_cli(["--bus-snapshot"], bus_reader=reader, systemctl=lambda row: "failed")
+    assert code == 0 and seen == [ROW]
+    assert report["bus_snapshot"] == {"self_show": {"rc": 0}}
+    assert report["in_row_systemctl"] == "failed"
+
+
+def test_selftest_bus_snapshot_missing_is_reported_by_code_not_raised(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    def reader(row: BwrapRow, **kwargs: Any) -> BusSnapshot:
+        raise BusSnapshotError("bus_snapshot_missing")
+
+    code, report = run_cli(["--bus-snapshot"], bus_reader=reader, systemctl=lambda row: "failed")
+    assert code == 0 and report["bus_snapshot"] == "bus_snapshot_missing"
+
+
+def test_selftest_bus_snapshot_stale_is_reported_by_code(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    def reader(row: BwrapRow, **kwargs: Any) -> BusSnapshot:
+        raise BusSnapshotError("bus_snapshot_stale")
+
+    _, report = run_cli(["--bus-snapshot"], bus_reader=reader, systemctl=lambda row: "failed")
+    assert report["bus_snapshot"] == "bus_snapshot_stale"
+
+
+def test_selftest_bus_snapshot_on_a_row_without_bus_reads_is_skipped(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    def reader(row: BwrapRow, **kwargs: Any) -> BusSnapshot:
+        raise AssertionError("a row without bus reads has nothing to read")
+
+    sandboxed.environ[ROW_VAR] = "breezy-autonomy-selftest-notify"
+    _, report = run_cli(["--bus-snapshot"], bus_reader=reader, systemctl=lambda row: "failed")
+    assert report["bus_snapshot"] == "not_a_bus_row"
+
+
+def test_selftest_default_systemctl_probe_fails_without_a_user_bus(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> Any:
+        calls.append(argv)
+        return type("Done", (), {"returncode": 1})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    row = world.table[ROW]
+    assert selftest_cli.in_row_systemctl(row) == "failed"
+    ((argv,),) = [(c,) for c in calls]
+    assert argv[:3] == ["/usr/bin/systemctl", "--user", "show"] and argv[-2:] == [
+        "--",
+        f"{ROW}.service",
+    ]
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kwargs: (_ for _ in ()).throw(FileNotFoundError("x")),
+    )
+    assert selftest_cli.in_row_systemctl(row) == "failed"
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: type("D", (), {"returncode": 0})())
+    assert selftest_cli.in_row_systemctl(row) == "ok"

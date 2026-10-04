@@ -183,13 +183,14 @@ def _open_data_binds(
     roots: SandboxRoots,
     forbidden: frozenset[Ident],
     earlier: list[Walked],
+    rels: tuple[str, ...],
 ) -> tuple[OpenedBind, ...]:
-    if not row.binds:
+    if not rels:
         return ()
     base_path = bind_base_path(row, roots)
     base = _walk_registered(stack, base_path, "dir")
     opened: list[OpenedBind] = []
-    for rel in row.binds:
+    for rel in rels:
         path = f"{base_path}/{rel}"
         walked = _walk_registered(stack, path, "dir")
         if walked.st.st_dev != base.st.st_dev:
@@ -224,8 +225,13 @@ def _open_config(
 
 
 @contextmanager
-def open_validated_binds(row: BwrapRow, roots: SandboxRoots) -> Iterator[OpenedBinds]:
+def open_validated_binds(
+    row: BwrapRow, roots: SandboxRoots, *, only: str | None = None
+) -> Iterator[OpenedBinds]:
     """Open every bind and config source of ``row`` by nofollow walk; close them on exit.
+
+    ``only`` restricts it to that one data bind (no config sources): the ``--bus-snapshot`` mode
+    opens just its snapshot bind. It must be one of ``row.binds``.
 
     Raises ``BindIntegrityError`` (exit 78) on any violation, closing whatever it
     had already opened. Creates nothing.
@@ -233,10 +239,13 @@ def open_validated_binds(row: BwrapRow, roots: SandboxRoots) -> Iterator[OpenedB
     with ExitStack() as stack:
         forbidden = forbidden_dirs(roots)
         earlier: list[Walked] = []
-        data = _open_data_binds(stack, row, roots, forbidden, earlier)
+        if only is not None and only not in row.binds:
+            raise BindIntegrityError("not_a_bind")
+        rels = row.binds if only is None else (only,)
+        data = _open_data_binds(stack, row, roots, forbidden, earlier, rels)
         files: tuple[OpenedBind, ...] = ()
         dirs: tuple[OpenedBind, ...] = ()
-        if row.config_ro_binds or row.config_ro_dirs:
+        if only is None and (row.config_ro_binds or row.config_ro_dirs):
             home = _walk_registered(stack, roots.home, "dir")
             files = _open_config(
                 stack, row.config_ro_binds, "file", roots, home, forbidden, earlier

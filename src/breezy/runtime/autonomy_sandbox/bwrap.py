@@ -14,8 +14,12 @@ exec exists only for ``NOTIFIER_FALLBACK_ROWS`` (empty in seam B), only after ev
 ``BREEZY_AUTONOMY_SANDBOX_DEGRADED``.
 
 The unit check is integrity against misconfiguration, not an authorisation
-boundary. The wrapper never creates a bind source. The ``--bus-snapshot`` mode
-lands in WP-B2c; until then ``--bus-snapshot`` is not a row and exits 64.
+boundary. The wrapper never creates a bind source.
+
+``breezy-autonomy-bwrap --bus-snapshot ROW`` (WP-B2c) is the one other mode: it runs
+unsandboxed in ``ExecStartPre``, passes the same syntax (64), table, row and cgroup unit
+checks (78) and then hands the bind to ``bus_handoff.write_bus_snapshot``. It never reaches
+``os.execv``.
 """
 
 from __future__ import annotations
@@ -68,6 +72,7 @@ PREFLIGHT_TIMEOUT_S: Final = 2
 PREFLIGHT_COMMAND: Final = "/bin/true"
 DEGRADED_VAR: Final = "BREEZY_AUTONOMY_SANDBOX_DEGRADED"
 ROW_VAR: Final = "BREEZY_AUTONOMY_BWRAP_ROW"
+BUS_SNAPSHOT_FLAG: Final = "--bus-snapshot"
 CREDENTIALS_DIRECTORY_VAR: Final = "CREDENTIALS_DIRECTORY"
 DEFAULT_PATH: Final = "/usr/bin:/bin"
 _CGROUP_V2_PREFIX: Final = "0::"
@@ -83,6 +88,7 @@ _NAMESPACE_FLAGS: Final = (
 )
 
 Execv = Callable[[str, list[str]], object]
+SnapshotWriter = Callable[..., int]
 
 
 class WrapperError(Exception):
@@ -285,12 +291,16 @@ def _preflight_failure(argv: list[str], passed: list[int]) -> str | None:
 
 
 def _exec_degraded(
+    row: BwrapRow,
     resolved: str,
     command: Sequence[str],
     reason: str,
     env: MutableMapping[str, str],
     execv: Execv,
 ) -> int:
+    # B7-R1: the row variable is what the self-probe checks first (``env_row``); without it a
+    # genuine notifier-fallback run would report ``env_row`` instead of ``degraded``.
+    env[ROW_VAR] = row.name
     env[DEGRADED_VAR] = reason
     execv(resolved, list(command))
     return 0
@@ -311,7 +321,7 @@ def _exec_wrapped(
 ) -> int:
     if not _bwrap_present(bwrap_path):
         if degradable:
-            return _exec_degraded(resolved, command, "bwrap_missing", env, execv)
+            return _exec_degraded(row, resolved, command, "bwrap_missing", env, execv)
         raise WrapperError("bwrap_missing", EX_NOTFOUND)
     passed = _passed_fds(opened, rebinds)
 
@@ -330,7 +340,7 @@ def _exec_wrapped(
     if degradable:
         reason = _preflight_failure(argv_for((PREFLIGHT_COMMAND,)), passed)
         if reason is not None:
-            return _exec_degraded(resolved, command, reason, env, execv)
+            return _exec_degraded(row, resolved, command, reason, env, execv)
     argv = argv_for(command)
     for fd in passed:
         os.set_inheritable(fd, True)
@@ -359,6 +369,36 @@ def _read_unit(cgroup_path: Path, row: BwrapRow) -> str:
     return leaf
 
 
+def _run_bus_snapshot(
+    argv: Sequence[str],
+    *,
+    roots: SandboxRoots | None,
+    table: Mapping[str, BwrapRow],
+    cgroup_path: Path,
+    env: MutableMapping[str, str],
+    snapshot: SnapshotWriter | None,
+) -> int:
+    """``--bus-snapshot ROW``: every check passes before the writer is reached; no ``execv``."""
+    if len(argv) != 2 or not ROW_NAME_RE.fullmatch(argv[1]):
+        raise WrapperError("usage", EX_USAGE)
+    try:
+        validate_table(table)
+    except TableError:
+        raise WrapperError("table_invalid") from None
+    row = table.get(argv[1])
+    if row is None:
+        raise WrapperError("unknown_row")
+    if not row.bus_reads:
+        raise WrapperError("not_a_bus_row")
+    leaf = _read_unit(cgroup_path, row)
+    use_roots = roots if roots is not None else default_roots()
+    if snapshot is None:
+        from breezy.runtime.autonomy_sandbox import bus_handoff
+
+        snapshot = bus_handoff.write_bus_snapshot
+    return snapshot(row, roots=use_roots, environ=env, unit=leaf)
+
+
 def _run(
     argv: Sequence[str],
     *,
@@ -369,7 +409,12 @@ def _run(
     execv: Execv,
     env: MutableMapping[str, str],
     fallback_rows: frozenset[str],
+    snapshot: SnapshotWriter | None = None,
 ) -> int:
+    if argv and argv[0] == BUS_SNAPSHOT_FLAG:
+        return _run_bus_snapshot(
+            argv, roots=roots, table=table, cgroup_path=cgroup_path, env=env, snapshot=snapshot
+        )
     if len(argv) < 2 or not ROW_NAME_RE.fullmatch(argv[0]):
         raise WrapperError("usage", EX_USAGE)
     name, command = argv[0], list(argv[1:])
@@ -412,12 +457,15 @@ def main(
     execv: Execv = os.execv,
     environ: MutableMapping[str, str] | None = None,
     fallback_rows: frozenset[str] = NOTIFIER_FALLBACK_ROWS,
+    snapshot: SnapshotWriter | None = None,
 ) -> int:
-    """Run the wrapper for ``argv`` (``ROW CMD [ARGS...]``); return the process exit status.
+    """Run the wrapper for ``argv`` (``ROW CMD [ARGS...]`` or ``--bus-snapshot ROW``).
+
+    Returns the process exit status.
 
     Real ``execv`` never returns. Everything injectable here exists so a test can run every
     refusal without a sandbox: ``roots``, ``table``, ``cgroup_path``, ``bwrap_path``,
-    ``execv``, ``environ`` and ``fallback_rows``.
+    ``execv``, ``environ``, ``fallback_rows`` and ``snapshot`` (the ``--bus-snapshot`` writer).
     """
     env = os.environ if environ is None else environ
     try:
@@ -430,6 +478,7 @@ def main(
             execv=execv,
             env=env,
             fallback_rows=fallback_rows,
+            snapshot=snapshot,
         )
     except BindIntegrityError as exc:
         status, code = exc.exit_status, exc.code

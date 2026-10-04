@@ -12,6 +12,7 @@ here would put every submodule's dependencies on the wrapper's own path.
 
 Modules landed so far: ``table`` (rows and ``validate_table``), ``binds`` (nofollow
 walks and fd-opened bind sources), ``run_mounts`` (the exact per-row ``/run`` re-bind
-set), ``bwrap`` (argv builder and the wrapper's ``main``) and ``unit_lint`` (the
-unit-file lint). The wrapper never creates a bind source.
+set), ``bwrap`` (argv builder and the wrapper's ``main``), ``unit_lint`` (the
+unit-file lint), ``self_probe``/``selftest_cli`` and ``bus_handoff`` (the bus snapshot
+handoff). The wrapper never creates a bind source.
 """

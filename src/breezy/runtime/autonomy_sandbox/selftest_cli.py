@@ -9,8 +9,11 @@ line count, the answer to signalling another host process (``ESRCH``: it is outs
 the pid namespace) and to reading its ``environ`` (``EACCES``), and the inode of the
 re-bound studies lock, so the operator can compare them with the host's own view.
 
-``--bus-snapshot`` (WP-B2c) and ``--exec-snapshot`` (WP-B3) are not landed yet and are
-usage errors (64). Output carries names and counts only, never a path.
+``--bus-snapshot`` (WP-B2c, V17/V21) reads the handed-over bus snapshot and reports, per
+read, its exit status (or ``bus_snapshot_missing`` / ``bus_snapshot_stale`` when there is no
+usable snapshot), plus ``in_row_systemctl`` (``failed``: the sandbox has no user bus).
+``--exec-snapshot`` (WP-B3) is not landed yet and is a usage error (64). Output carries names
+and counts only, never a path.
 """
 
 from __future__ import annotations
@@ -18,11 +21,18 @@ from __future__ import annotations
 import errno
 import json
 import os
+import subprocess
 import sys
 from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
+from breezy.runtime.autonomy_sandbox.bus_handoff import (
+    BusSnapshot,
+    BusSnapshotError,
+    bus_env,
+    read_bus_snapshot,
+)
 from breezy.runtime.autonomy_sandbox.bwrap import ROW_VAR, default_roots
 from breezy.runtime.autonomy_sandbox.run_mounts import STUDIES_LOCK_NAME
 from breezy.runtime.autonomy_sandbox.self_probe import (
@@ -41,8 +51,12 @@ EX_OK: Final = 0
 EX_INTEGRITY: Final = 3
 EX_USAGE: Final = 64
 PROC_CHECKS_FLAG: Final = "--proc-checks"
+BUS_SNAPSHOT_FLAG: Final = "--bus-snapshot"
+IN_ROW_SYSTEMCTL_TIMEOUT_S: Final = 10
 
 ProcChecks = Callable[[BwrapRow, SandboxRoots, ProbeFs], dict[str, Any]]
+BusReader = Callable[..., BusSnapshot]
+SystemctlProbe = Callable[[BwrapRow], str]
 
 
 def _errno_name(action: Callable[[], object]) -> str:
@@ -88,6 +102,55 @@ def collect_proc_checks(row: BwrapRow, roots: SandboxRoots, fs: ProbeFs) -> dict
     return checks
 
 
+def in_row_systemctl(row: BwrapRow) -> str:
+    """``failed`` when ``systemctl --user`` cannot reach a bus from inside the row, else ``ok``.
+
+    A read-only ``show`` of the row's own unit; the sandbox has no user bus, so ``failed`` is
+    the expected answer (V17).
+    """
+    argv = [
+        "/usr/bin/systemctl",
+        "--user",
+        "show",
+        "-p",
+        "Id",
+        "--",
+        f"{row.name}.service",
+    ]
+    try:
+        done = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=bus_env(os.getuid()),
+            timeout=IN_ROW_SYSTEMCTL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "failed"
+    return "ok" if done.returncode == 0 else "failed"
+
+
+def collect_bus_snapshot(
+    row: BwrapRow,
+    environ: Mapping[str, str],
+    roots: SandboxRoots,
+    reader: BusReader,
+    systemctl: SystemctlProbe,
+) -> dict[str, Any]:
+    """The V17/V21 observations: each read's status, or why there is no snapshot."""
+    if not row.bus_reads:
+        return {"bus_snapshot": "not_a_bus_row"}
+    try:
+        snapshot = reader(row, environ=environ, roots=roots)
+    except BusSnapshotError as exc:
+        report: Any = exc.code
+    else:
+        report = {r.name: {"rc": r.rc} for r in snapshot.reads}
+    return {"bus_snapshot": report, "in_row_systemctl": systemctl(row)}
+
+
 def main(
     argv: Sequence[str],
     *,
@@ -97,12 +160,15 @@ def main(
     table: Mapping[str, BwrapRow] = AUTONOMY_BWRAP_TABLE,
     fallback_rows: Collection[str] = NOTIFIER_FALLBACK_ROWS,
     proc_checks: ProcChecks = collect_proc_checks,
+    bus_reader: BusReader = read_bus_snapshot,
+    systemctl: SystemctlProbe = in_row_systemctl,
 ) -> int:
     """Print the probe report for the row named by the sandbox environment; return the exit code."""
     args = list(argv)
     want_proc_checks = PROC_CHECKS_FLAG in args
-    if [a for a in args if a != PROC_CHECKS_FLAG]:
-        sys.stderr.write("selftest_cli: usage: selftest_cli [--proc-checks]\n")
+    want_bus_snapshot = BUS_SNAPSHOT_FLAG in args
+    if [a for a in args if a not in (PROC_CHECKS_FLAG, BUS_SNAPSHOT_FLAG)]:
+        sys.stderr.write("selftest_cli: usage: selftest_cli [--proc-checks] [--bus-snapshot]\n")
         return EX_USAGE
     env = os.environ if environ is None else environ
     use_roots = roots if roots is not None else default_roots()
@@ -125,6 +191,8 @@ def main(
     }
     if want_proc_checks and row_name is not None and row_name in table:
         report["proc_checks"] = proc_checks(table[row_name], use_roots, fs)
+    if want_bus_snapshot and row_name is not None and row_name in table:
+        report.update(collect_bus_snapshot(table[row_name], env, use_roots, bus_reader, systemctl))
     sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
     return EX_OK if result.ok else EX_INTEGRITY
 

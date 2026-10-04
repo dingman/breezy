@@ -31,6 +31,7 @@ from breezy.runtime.autonomy_sandbox.bwrap import (
     main,
 )
 from breezy.runtime.autonomy_sandbox.run_mounts import RunRebind
+from breezy.runtime.autonomy_sandbox.self_probe import run_self_probe
 from breezy.runtime.autonomy_sandbox.table import (
     AUTONOMY_BWRAP_TABLE,
     DEFAULT_TMPFS_SIZE_BYTES,
@@ -562,7 +563,6 @@ def test_main_closes_every_fd_it_opened_after_exec_returns(
         ["breezy-autonomy-selftest"],
         ["breezy-autonomy-selftest\n", "/usr/bin/true"],
         ["--", "/usr/bin/true"],
-        ["--bus-snapshot", "breezy-autonomy-selftest"],
         ["Breezy-Upper", "/usr/bin/true"],
         ["breezy-", "/usr/bin/true"],
         ["breezy-x;rm", "/usr/bin/true"],
@@ -572,7 +572,6 @@ def test_main_closes_every_fd_it_opened_after_exec_returns(
         "no-command",
         "newline-row",
         "dashdash-row",
-        "bus-mode-not-yet",
         "upper",
         "bare",
         "semi",
@@ -848,6 +847,41 @@ def test_fallback_row_degrades_on_preflight_failure_with_reason(
     ((path, argv),) = spy.calls
     assert path == "/usr/bin/true" and argv == ["/usr/bin/true", "arg"]
     assert environ["BREEZY_AUTONOMY_SANDBOX_DEGRADED"] == reason
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason"),
+    [(3, "preflight_rc_3"), (subprocess.TimeoutExpired("bwrap", 2), "preflight_timeout")],
+)
+def test_degraded_exec_also_sets_the_row_env_so_the_probe_reports_degraded(
+    outcome: int | BaseException,
+    reason: str,
+    world: SandboxRoots,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B7-R1: a notifier-fallback run must report ``degraded``, never ``env_row``."""
+    status, _, _, environ = _fallback_run(world, tmp_path, monkeypatch, outcome)
+    assert status == 0
+    assert environ["BREEZY_AUTONOMY_BWRAP_ROW"] == "breezy-autonomy-selftest"
+    assert environ["BREEZY_AUTONOMY_SANDBOX_DEGRADED"] == reason
+    result = run_self_probe(
+        "breezy-autonomy-selftest",
+        roots=world,
+        environ=environ,
+        fallback_rows=FALLBACK_ROWS,
+        table=_table(_plain_row()),
+    )
+    assert (result.ok, result.degraded, result.failures) == (False, True, ())
+
+
+def test_degraded_exec_for_a_missing_bwrap_also_sets_the_row_env(
+    world: SandboxRoots, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, _, environ = _fallback_run(
+        world, tmp_path, monkeypatch, 0, bwrap_path=tmp_path / "no-bwrap"
+    )
+    assert environ["BREEZY_AUTONOMY_BWRAP_ROW"] == "breezy-autonomy-selftest"
 
 
 def test_fallback_row_degrades_when_bwrap_is_missing_without_preflight(

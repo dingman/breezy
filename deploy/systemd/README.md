@@ -1862,4 +1862,27 @@ per-row `/run` re-binds; `--remount-ro /run`; config `--ro-bind-fd`; data `--bin
 **The unit check is integrity against misconfiguration, not an authorisation boundary:** any
 process that can run the wrapper from inside a listed unit's cgroup already runs as that unit.
 The wrapper never creates a bind source (a missing studies lock is exit 78; the unit's `touch`
-pre line creates it). The bus-snapshot handoff (`--bus-snapshot`) lands in WP-B2c.
+pre line creates it).
+
+**Bus snapshot handoff (`breezy-autonomy-bwrap --bus-snapshot ROW`).** A sandbox has no user bus
+(`--tmpfs /run`), so a row that needs `systemctl --user` reads declares them as `bus_reads` and
+they are handed over: the mode runs **unsandboxed** in the `ExecStartPre=-/usr/bin/timeout -k 2 <B+3> ...
+--bus-snapshot <row>` line, makes only the read verbs `show`, `list-units` and `list-timers`
+(never `kill`, `start`, `stop`, `restart`, `try-restart` or `systemd-run`; each argv is re-validated
+at spawn time, after `{instance}` substitution; `-p`/`--property` may not name `Environment` or
+`Credential`), and writes `<bind>/.bus_snapshot/<INVOCATION_ID>.json` (`bus_snapshot/v1`). It passes the
+same syntax (64), table, row and cgroup unit checks (78) as a wrapped run, never reaches `execv`, and
+exits `0` once written (a failed, timed-out or skipped read is recorded, not an exit status), `78` on a
+config or directory-discipline refusal (nothing written, nothing swept) and `73` on a write failure.
+Each read runs in its own process group with `min(10 s, deadline - now - 1 s)`; a hung read's group is
+`SIGKILL`ed, so the mode's wall time stays at or below the row's `bus_snapshot_budget_s`. The directory
+is made `0700` with `mkdirat`, opened `O_NOFOLLOW` and `fstat`-checked (directory, own uid, no
+group/other bits, the bind's device, not a forbidden inode); a symlink planted by the sandbox is refused.
+After the write, under a non-blocking `flock`, files named `<32 hex>.json` that are regular and older than
+24 h are removed. Inside the sandbox `read_bus_snapshot(row, environ=...)` opens the file nofollow, reads
+it once, unlinks it and returns the reads; a missing or stale/forged file raises `BusSnapshotError`
+(`bus_snapshot_missing` / `bus_snapshot_stale`), never an empty snapshot. Consumers map a whole-snapshot
+failure to UNKNOWN (health) or CRITICAL (failed@, daily). stderr carries a reason code, never a path.
+`python -I -m breezy.runtime.autonomy_sandbox.selftest_cli --bus-snapshot` prints each read's `rc`
+and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer `timeout` it prints
+`"bus_snapshot": "bus_snapshot_missing"` (V21).

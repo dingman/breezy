@@ -2,8 +2,8 @@
 
 ``SHARED_WRITE_SITES`` is the exact set of (module, function, call) write sites
 owned by the shared sandbox modules listed in ``SHARED_WRITE_MODULES`` (the
-self-probe in WP-B2b-3; ``bus_handoff`` and ``wal_snapshot`` add theirs in their own
-WPs, in the same commit as the code). A consumer's read-only-closure lint (AUT-6
+self-probe in WP-B2b-3 and ``bus_handoff`` in WP-B2c; ``wal_snapshot`` adds its own in
+WP-B3, in the same commit as the code). A consumer's read-only-closure lint (AUT-6
 ruling AC6) may admit these sites and no others, and only where every snapshot
 call passes ``cache_dir=`` a module-level ``Final`` constant of the caller
 (``tests/support/autonomy_write_sites.cache_dir_is_own_module_constant``).
@@ -32,15 +32,28 @@ class WriteSite:
 
 
 #: Package modules whose write sites are shared with consumers (module file stems).
-SHARED_WRITE_MODULES: Final[tuple[str, ...]] = ("self_probe",)
+SHARED_WRITE_MODULES: Final[tuple[str, ...]] = ("self_probe", "bus_handoff")
 
 #: The self-probe's sites: the ``O_TMPFILE`` negative/positive opens (no directory entry), and
-#: the subdir positive's create and unlink inside an existing ``.bwrap_probe/``.
+#: the subdir positive's create and unlink inside an existing ``.bwrap_probe/``. The bus
+#: handoff's sites: the ``.bus_snapshot`` ``mkdirat``, the ``O_EXCL`` snapshot create (open,
+#: write, fsync and the unlink of a partial file), the sweep unlink, the in-sandbox
+#: read-and-unlink, and the process-group kill of a hung read. Its ``Popen`` is an injected
+#: parameter (default ``subprocess.Popen``), so a call-site scan cannot see it; its argv set is
+#: pinned by ``table.validate_bus_read`` at table build and again at spawn.
 SHARED_WRITE_SITES: Final[frozenset[WriteSite]] = frozenset(
     {
         WriteSite("self_probe", "_tmpfile_outcome", "os.open"),
         WriteSite("self_probe", "_subdir_positive", "os.open"),
         WriteSite("self_probe", "_subdir_positive", "os.unlink"),
+        WriteSite("bus_handoff", "_open_snapshot_dir", "os.mkdir"),
+        WriteSite("bus_handoff", "_create_snapshot", "os.open"),
+        WriteSite("bus_handoff", "_create_snapshot", "os.write"),
+        WriteSite("bus_handoff", "_create_snapshot", "os.fsync"),
+        WriteSite("bus_handoff", "_create_snapshot", "os.unlink"),
+        WriteSite("bus_handoff", "_sweep", "os.unlink"),
+        WriteSite("bus_handoff", "_consume", "os.unlink"),
+        WriteSite("bus_handoff", "_kill_group", "os.killpg"),
     }
 )
 
@@ -51,6 +64,7 @@ WRAPPER_CODE_FILES: Final[tuple[str, ...]] = (
     "deploy/systemd/breezy-autonomy-bwrap",
     f"{_PACKAGE}/__init__.py",
     f"{_PACKAGE}/binds.py",
+    f"{_PACKAGE}/bus_handoff.py",
     f"{_PACKAGE}/bwrap.py",
     f"{_PACKAGE}/run_mounts.py",
     f"{_PACKAGE}/self_probe.py",
