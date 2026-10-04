@@ -670,3 +670,26 @@ Key paths:
   - The F6 retirement and re-calibration trigger owner is the AUT-5a row owner (coordinator).
   - F12's tests and F13's actor module are planned inside their own rows: PLAN first, then the peer loop.
   - The F12/F13 Needs, as derived, are accepted.
+
+## Round-3 convergence rulings (coordinator, 2026-10-04; binding; these supersede any conflicting r3 text)
+- **FQ-R29 (B1), parity is a continuation gate only.** CONFLICT-1 is deleted.
+  - §6.5(d) is deleted, so the resume bar is (a)–(c) only.
+  - New §6.9, "Parity continuation gate": the metric, the look at n v2 live fills, the threshold, and v2-only rows. Its ONLY action is a DEMOTE through the AUT-5a engine; the F6 option is dropped.
+  - F9 Acceptance, §6.2 and the §9 "shadow optimism" row are edited to match.
+  - F5 adds the test `test_design_json_pins_parity_look_metric_threshold`.
+- **FQ-R30 (B2), start order.**
+  - F3 and M1 can start now.
+  - F6 starts after the AUT-5 r8 RC-7 note is filed by F1.
+  - F7a starts after the AUT-4 r12 delta is filed by F1, and that delta pins stats-only.
+  - F2 is GATED on row 5 WP5 stage 3 being merged.
+- **FQ-R31 (B3), the stale veto fails closed regardless of alert delivery.** Past `STALE_VETO_H` the veto applies even if the alert sink is down, and the delivery failure is recorded. The test becomes `test_stale_veto_applies_even_when_alert_undelivered`.
+- **FQ-R32 (B4), no alert flood.**
+  - UNKNOWN sends a CRITICAL on entry, then re-alerts once per climate day.
+  - It alerts on every probe only while the family's live-orders gate is enabled and no halt row exists.
+  - Test: `test_unknown_alert_rate_limited_when_halted_or_disabled`.
+- **FQ-R33 (B5), registry pins and F3.**
+  - F3 merges BEFORE the reviewed pins commit, which is the first AUT bootstrap.
+  - F3 checks `pins.py` first: if `BOOTSTRAPPED_ROOT_MANIFEST_SHA256` is non-empty, F3 STOPs, and the terminal day goes only through a new family_id.
+  - F3 adds `test_clear_fq_requires_audit_record_and_is_cli_only`, and `tests/unit/test_clear_family_halt_cli.py` joins its files.
+  - Fix the M1 binning citation.
+- **Peer loop closed.** Three rounds are done (r1 → r2 → r3, plus the convergence check), and every blocking item is ruled. r3 plus FQ-R13..R33 is the build spec. F1 continues as the errata and plan-delta PLAN row.
