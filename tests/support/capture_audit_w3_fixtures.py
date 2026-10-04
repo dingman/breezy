@@ -334,6 +334,7 @@ def audit_row(*, budget_s: int = 10) -> BwrapRow:
         binds=(SNAP_BIND, "cache/capture_audit"),
         entry_modules=("breezy.analysis.capture_audit_cli",),
         resolves_dns=True,
+        network="egress",
         bus_reads=reads,
         bus_snapshot_bind=SNAP_BIND,
         bus_snapshot_budget_s=budget_s,

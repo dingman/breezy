@@ -77,12 +77,15 @@ def test_shipped_table_validates() -> None:
     validate_table()
 
 
-def test_shipped_table_has_exactly_the_three_seam_b_rows_and_the_aut1_stop_hook_row() -> None:
+def test_shipped_table_has_exactly_the_seam_b_stop_hook_and_capture_rows() -> None:
     assert set(AUTONOMY_BWRAP_TABLE) == {
         "breezy-autonomy-selftest",
         "breezy-autonomy-selftest-notify",
         "breezy-autonomy-selftest-proc",
         "breezy-quote-tape.stop-hook",
+        "breezy-capture-settlement",
+        "breezy-capture-audit",
+        "breezy-capture-live-proof",
     }
     assert all(name == row.name for name, row in AUTONOMY_BWRAP_TABLE.items())
 

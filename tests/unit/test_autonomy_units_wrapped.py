@@ -38,6 +38,7 @@ PLAIN = BwrapRow(
     binds=("cache/t1",),
     entry_modules=("x",),
     resolves_dns=False,
+    network="none",
 )
 FAILED = BwrapRow(
     name="breezy-autonomy-failed",
@@ -46,6 +47,7 @@ FAILED = BwrapRow(
     binds=("cache/failed",),
     entry_modules=("x",),
     resolves_dns=False,
+    network="none",
 )
 RECON = BwrapRow(
     name="breezy-autonomy-recon",
@@ -54,6 +56,7 @@ RECON = BwrapRow(
     binds=("cache/recon",),
     entry_modules=("x",),
     resolves_dns=True,
+    network="egress",
     exceptions=frozenset({"E7A_R2_RECONCILE"}),
     credential_names=("polymarket_us_secret_key",),
     credential_env=MappingProxyType({"POLYMARKET_US_SECRET_KEY_FILE": "polymarket_us_secret_key"}),
@@ -65,6 +68,7 @@ RECORDER = BwrapRow(
     binds=("cache/rec",),
     entry_modules=("x",),
     resolves_dns=False,
+    network="none",
 )
 TPL = BwrapRow(
     name="breezy-tpl",
@@ -73,6 +77,7 @@ TPL = BwrapRow(
     binds=("cache/tpl",),
     entry_modules=("x",),
     resolves_dns=False,
+    network="none",
 )
 TABLE: Mapping[str, BwrapRow] = MappingProxyType(
     {row.name: row for row in (*AUTONOMY_BWRAP_TABLE.values(), PLAIN, FAILED, RECON, RECORDER, TPL)}
@@ -732,6 +737,7 @@ LABEL = BwrapRow(
     binds=("cache/label",),
     entry_modules=("x",),
     resolves_dns=False,
+    network="none",
 )
 LABEL_TABLE: Mapping[str, BwrapRow] = MappingProxyType({**TABLE, LABEL.name: LABEL})
 

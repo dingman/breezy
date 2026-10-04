@@ -9,8 +9,15 @@ read is cached, so a snapshot error surfaces later as that day's ERROR (``PRE_CA
 Then ``launch_window_guard``: a run whose worst case (``flock -w 600`` plus
 ``TimeoutStartSec=1500``) would meet [16:30Z, 17:10Z) defers (exit 0, no work).
 
+Then the unit's studies lock is taken IN PROCESS (``studies_lock.acquire_studies_lock``, wait <=
+``FLOCK_WAIT_S``; S3-R13/R14), not by ``flock -w`` in front of the wrapper, so the wait cannot age
+the snapshot. A missing, refused or timed-out lock exits 1 with no writes (``OnFailure=`` pages).
+The clock and ``today`` are then RE-READ (S3-R26): the wait may be 600 s.
+
 ``DEADLINE`` is set ONCE here, before any family runs, and ``run_audit`` only reads it (S3-R41):
-every family sees the same absolute instant. The duties that belong to the run rather than to a
+every family sees the same absolute instant, ``min(lock_acquired + AUDIT_WORK_BUDGET_S,
+exec_start + AUDIT_EXEC_TIMEOUT_S - AUDIT_MARGIN_S)`` (S3-R48), so a long wait cannot carry the
+run past the ExecStart ``timeout -k 5 1470``. The duties that belong to the run rather than to a
 family (the missing-settlement check) run once, after the family loop, inside the same deadline.
 
 Families are enumerated by construction: every ``evidence/capture/epoch/<family>.json`` plus each
@@ -22,6 +29,7 @@ and ``OnFailure=`` fires.
 
 import argparse
 import datetime as dt
+import os
 import re
 import sys
 import time
@@ -34,16 +42,25 @@ from breezy.analysis.capture_audit import run_audit, run_once_duties
 from breezy.analysis.capture_audit_host import read_recorder_props
 from breezy.analysis.capture_audit_inputs import DEADLINE
 from breezy.analysis.capture_audit_io import list_names
-from breezy.analysis.capture_audit_model import AUDIT_WORK_BUDGET_S, AuditInputError
+from breezy.analysis.capture_audit_model import (
+    AUDIT_EXEC_TIMEOUT_S,
+    AUDIT_MARGIN_S,
+    AUDIT_WORK_BUDGET_S,
+    AuditInputError,
+)
 from breezy.analysis.capture_settlement import AlertOffer
 from breezy.persistence.autonomy.capture_epoch import epoch_relative_path
 from breezy.persistence.autonomy.capture_schedule import launch_window_guard
 from breezy.persistence.autonomy.paths import FAMILY_RE, default_data_root
+from breezy.runtime.autonomy_sandbox.bwrap import default_roots
+from breezy.runtime.autonomy_sandbox.run_mounts import STUDIES_LOCK_NAME
+from breezy.runtime.autonomy_sandbox.studies_lock import StudiesLockError, acquire_studies_lock
 
 __all__ = ["FLOCK_WAIT_S", "TIMEOUT_START_S", "families_by_construction", "main"]
 
 FLOCK_WAIT_S: Final[int] = 600
 TIMEOUT_START_S: Final[int] = 1500
+LOCK_POLL_S: Final[float] = 0.5
 _NS: Final[int] = 10**9
 _EPOCH_FILE_RE: Final[re.Pattern[str]] = re.compile(r"\A(?P<family>[a-z0-9_]{1,64})\.json\Z")
 
@@ -73,7 +90,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _main(argv: Sequence[str] | None, *, offer: AlertOffer, clock: Callable[[], int]) -> int:
+def _default_lock() -> int:
+    """Take the real host studies lock (the file the wrapper re-binds); never called by a test."""
+    path = default_roots().run_user / STUDIES_LOCK_NAME
+    return acquire_studies_lock(path, wait_s=FLOCK_WAIT_S, poll_s=LOCK_POLL_S)
+
+
+def _main(
+    argv: Sequence[str] | None,
+    *,
+    offer: AlertOffer,
+    clock: Callable[[], int],
+    lock: Callable[[], int],
+) -> int:
+    exec_start = capture_audit_inputs.MONOTONIC()  # the ExecStart ``timeout`` starts here
     parser = _parser()
     args = parser.parse_args(argv)
     bad = [f for f in args.families if FAMILY_RE.fullmatch(f) is None]
@@ -88,10 +118,33 @@ def _main(argv: Sequence[str] | None, *, offer: AlertOffer, clock: Callable[[], 
     if not launch_window_guard(now_ns, FLOCK_WAIT_S, TIMEOUT_START_S):
         sys.stderr.write("capture audit deferred: the run would meet the launch window\n")
         return 0
-    today = dt.datetime.fromtimestamp(now_ns // _NS, tz=dt.UTC).date()
-    token = DEADLINE.set(capture_audit_inputs.MONOTONIC() + AUDIT_WORK_BUDGET_S)  # once (S3-R41)
     try:
-        return _run_families(data_root, args.families, today, now_ns, offer)
+        lock_fd = lock()
+    except StudiesLockError as exc:
+        sys.stderr.write(f"capture audit: {exc.code}\n")
+        return 1
+    try:
+        return _run_locked(data_root, args.families, exec_start, clock, offer)
+    finally:
+        os.close(lock_fd)
+
+
+def _run_locked(
+    data_root: Path,
+    explicit: Sequence[str],
+    exec_start: float,
+    clock: Callable[[], int],
+    offer: AlertOffer,
+) -> int:
+    now_ns = clock()  # S3-R26: the lock wait may have been 600 s
+    today = dt.datetime.fromtimestamp(now_ns // _NS, tz=dt.UTC).date()
+    deadline = min(
+        capture_audit_inputs.MONOTONIC() + AUDIT_WORK_BUDGET_S,
+        exec_start + AUDIT_EXEC_TIMEOUT_S - AUDIT_MARGIN_S,
+    )
+    token = DEADLINE.set(deadline)  # once (S3-R41)
+    try:
+        return _run_families(data_root, explicit, today, now_ns, offer)
     finally:
         DEADLINE.reset(token)
 
@@ -110,7 +163,7 @@ def _run_families(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the audit; the return value is the process exit code."""
-    return _main(argv, offer=_undeliverable_offer, clock=time.time_ns)
+    return _main(argv, offer=_undeliverable_offer, clock=time.time_ns, lock=_default_lock)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,11 @@ exit 78); every rule has a failing fixture in ``test_autonomy_sandbox_table.py``
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 #: The seven exception labels a row may carry (E-7e(e)). There is no user-bus
 #: label and no bus-action label: the user bus is never reachable in a sandbox.
@@ -108,6 +108,11 @@ BUS_BUDGET_BASE_S: Final = 2
 BUS_BUDGET_PER_READ_S: Final = 1.5
 BUS_SNAPSHOT_BIND_PREFIX: Final = "cache/"
 POSITIVE_PROBE_KINDS: Final[frozenset[str]] = frozenset({"tmpfile", "subdir"})
+#: The two values of ``BwrapRow.network`` (E-15). The wrapper adds ``--unshare-net`` unless the
+#: value is exactly ``NETWORK_EGRESS``, so a malformed value never keeps a network (S3-R10).
+NETWORK_NONE: Final = "none"
+NETWORK_EGRESS: Final = "egress"
+NETWORK_VALUES: Final[frozenset[str]] = frozenset({NETWORK_NONE, NETWORK_EGRESS})
 
 ROW_NAME_RE: Final = re.compile(r"breezy-[a-z0-9-]+(@[a-z0-9-]*)?([.#][a-z0-9-]+)?")
 UNIT_ENTRY_RE: Final = re.compile(r"breezy-[a-z0-9-]+(\.service|@)")
@@ -159,7 +164,10 @@ class SandboxRoots:
 
 @dataclass(frozen=True, slots=True)
 class BwrapRow:
-    """One wrapped unit's sandbox shape. ``resolves_dns`` is required (no default)."""
+    """One wrapped unit's sandbox shape. ``resolves_dns`` and ``network`` are required (no default).
+
+    ``network="none"`` unshares the network namespace; ``"egress"`` keeps the host network.
+    """
 
     name: str
     owner_plan: str
@@ -167,6 +175,7 @@ class BwrapRow:
     binds: tuple[str, ...]
     entry_modules: tuple[str, ...]
     resolves_dns: bool
+    network: Literal["none", "egress"]
     bind_base: str = DEFAULT_BIND_BASE
     host_proc: bool = False
     studies_lock: bool = False
@@ -199,6 +208,86 @@ def _selftest_row(suffix: str, **flags: Any) -> BwrapRow:
     )
 
 
+_CAPTURE_SNAPSHOT_BIND: Final = "cache/capture_audit_bus"
+_CAPTURE_AUDIT_NAME: Final = "breezy-capture-audit"
+#: The audit row's two bus reads (``capture_audit_host.AUDIT_BUS_READS``, pinned equal by a test:
+#: this package is stdlib-only and may not import the analysis layer).
+_CAPTURE_AUDIT_BUS_READS: Final[tuple[BusRead, ...]] = (
+    BusRead(
+        "recorder_show",
+        (
+            SYSTEMCTL,
+            "--user",
+            "show",
+            "-p",
+            "WatchdogUSec,NotifyAccess,Type",
+            "--",
+            "breezy-quote-tape.service",
+        ),
+    ),
+    BusRead(
+        "ingest_show",
+        (
+            SYSTEMCTL,
+            "--user",
+            "show",
+            "-p",
+            "ExecMainExitTimestamp",
+            "--",
+            "breezy-quote-tape-ingest.service",
+        ),
+    ),
+)
+
+
+def _capture_row(name: str, binds: tuple[str, ...], entry: str, **flags: Any) -> BwrapRow:
+    """An AUT-1 capture row: no DNS, no network (E-15). Alerts leave through the AUT-6 spool."""
+    return BwrapRow(
+        name=name,
+        owner_plan="AUT-1",
+        units=frozenset({f"{name}{_SERVICE_SUFFIX}"}),
+        binds=binds,
+        entry_modules=(entry,),
+        resolves_dns=False,
+        network="none",
+        **flags,
+    )
+
+
+#: AUT-1 WP5 stage 3 (design r3 section 1, "Rows"). The settlement catalog base stays read-only
+#: under the data-root re-bind; the only write bind is the decisions directory. None of the three
+#: binds ``evidence/alerts`` before stage 4.
+_CAPTURE_ROWS: Final[tuple[BwrapRow, ...]] = (
+    _capture_row(
+        "breezy-capture-settlement",
+        ("catalog/quote_tape/decisions",),
+        "breezy.analysis.capture_settlement_cli",
+    ),
+    _capture_row(
+        _CAPTURE_AUDIT_NAME,
+        (
+            "evidence/capture/audit",
+            "evidence/capture/heal",
+            "evidence/capture/heal_alert_abandoned",
+            "derived/verdicts",
+            "cache/capture_audit",
+            _CAPTURE_SNAPSHOT_BIND,
+        ),
+        "breezy.analysis.capture_audit_cli",
+        studies_lock=True,
+        exceptions=frozenset({"E7_STUDIES_LOCK"}),
+        bus_reads=_CAPTURE_AUDIT_BUS_READS,
+        bus_snapshot_bind=_CAPTURE_SNAPSHOT_BIND,
+        bus_snapshot_budget_s=10,
+    ),
+    _capture_row(
+        "breezy-capture-live-proof",
+        ("evidence/capture/live_proof",),
+        "breezy.analysis.capture_live_proof_cli",
+    ),
+)
+
+
 #: The seam B rows. They run only as transient ``systemd-run --unit=<name>`` units.
 AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
     {
@@ -207,6 +296,7 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
             _selftest_row(
                 "",
                 resolves_dns=True,
+                network="egress",
                 bus_reads=(
                     BusRead(
                         "self_show",
@@ -227,11 +317,13 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
             _selftest_row(
                 "-notify",
                 resolves_dns=False,
+                network="egress",
                 exceptions=frozenset({"E7A_R2_NOTIFY"}),
             ),
             _selftest_row(
                 "-proc",
                 resolves_dns=False,
+                network="egress",
                 host_proc=True,
                 studies_lock=True,
                 exceptions=frozenset({"E7A_R2_PROC", "E7_STUDIES_LOCK"}),
@@ -247,7 +339,9 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
                 binds=("evidence/capture/stall", "health/recorder_watchdog"),
                 entry_modules=("breezy.runtime.capture_recorder_hook_cli",),
                 resolves_dns=False,
+                network="none",
             ),
+            *_CAPTURE_ROWS,
         )
     }
 )
@@ -289,6 +383,20 @@ def _check_identity(key: str, row: BwrapRow) -> None:
         raise _fail(
             row.name, "tmpfs_size_bytes must be an int in (0, MAX_TMPFS_SIZE_BYTES] or None"
         )
+
+
+def _check_network(row: BwrapRow, fallback_rows: Collection[str]) -> None:
+    """E-15, in this order: a ``str``, one of the two values, no DNS and no fallback on ``none``."""
+    if type(row.network) is not str:
+        raise _fail(row.name, "network must be a str")
+    if row.network not in NETWORK_VALUES:
+        raise _fail(row.name, "network must be exactly 'none' or 'egress'")
+    if row.network != NETWORK_NONE:
+        return
+    if row.resolves_dns:
+        raise _fail(row.name, "network 'none' cannot resolve DNS (resolves_dns)")
+    if row.notifier_fallback or row.name in fallback_rows:
+        raise _fail(row.name, "network 'none' is refused on a notifier fallback row")
 
 
 def _check_labels(row: BwrapRow) -> None:
@@ -498,6 +606,7 @@ def validate_table(
     owned_units: frozenset[str] = AUTONOMY_OWNED_UNITS,
     residual_units: Mapping[str, str] = UNWRAPPED_RESIDUAL_UNITS,
     wrapper_line_only_units: Mapping[str, str] | None = None,
+    fallback_rows: Collection[str] = NOTIFIER_FALLBACK_ROWS,
 ) -> None:
     """Raise ``TableError`` on the first rule the table breaks; return ``None`` if sound."""
     if not table:
@@ -505,6 +614,7 @@ def validate_table(
     wrapper_line_only_units = effective_line_only_units(table, wrapper_line_only_units)
     for key, row in table.items():
         _check_identity(key, row)
+        _check_network(row, fallback_rows)
         _check_labels(row)
         _check_credentials(row)
         _check_binds(row)

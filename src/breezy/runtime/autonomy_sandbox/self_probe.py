@@ -66,6 +66,8 @@ FIXED_REASON_CODES: Final[frozenset[str]] = frozenset(
         "run_not_readonly",
         "tmp_not_private",
         "pid_ns",
+        "net_reachable",
+        "net_iface_visible",
     }
 )
 CREDENTIAL_PATHS: Final[tuple[str, ...]] = (
@@ -95,6 +97,26 @@ _BIND_LABEL_UNSAFE: Final = re.compile(r"[^a-z0-9_]")
 _MOUNT_ESCAPE: Final = re.compile(r"\\([0-7]{3})")
 _PROBE_CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _PROBE_FILE_MODE: Final = 0o600
+#: E-15 network check on ``none`` rows (S3-R34). A ``SOCK_DGRAM`` connect to a TEST-NET-2 address
+#: sends no packet even when isolation is broken; inside a fresh netns it fails ``ENETUNREACH``.
+PROBE_CONNECT_HOST: Final = "198.51.100.7"
+PROBE_CONNECT_PORT: Final = 80
+PROBE_CONNECT_TIMEOUT_S: Final = 2.0
+_LOOPBACK: Final = "lo"
+_NET_DEV_HEADER_LINES: Final = 2
+
+
+def udp_connect_errno(host: str, port: int) -> int:
+    """``0`` if a ``SOCK_DGRAM`` connect to ``host:port`` succeeds, else the ``errno`` it raised."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(PROBE_CONNECT_TIMEOUT_S)
+        sock.connect((host, port))
+    except OSError as exc:
+        return exc.errno or errno.EIO
+    finally:
+        sock.close()
+    return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +129,7 @@ class ProbeFs:
     proc: Path = Path("/proc")
     mountinfo: Path = Path("/proc/self/mountinfo")
     getpid: Callable[[], int] = os.getpid
+    connect_errno: Callable[[str, int], int] = udp_connect_errno
 
 
 DEFAULT_FS: Final = ProbeFs()
@@ -453,6 +476,32 @@ def _pid_ns_failures(row: BwrapRow, fs: ProbeFs) -> list[str]:
     return [] if comm == BWRAP_INIT_COMM else ["pid_ns"]
 
 
+def _interfaces(fs: ProbeFs) -> list[str]:
+    """The interface names in ``/proc/net/dev`` (the reader's own netns); ``[]`` if unreadable."""
+    try:
+        text = (fs.proc / "net" / "dev").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = text.splitlines()[_NET_DEV_HEADER_LINES:]
+    return sorted(line.partition(":")[0].strip() for line in lines if ":" in line)
+
+
+def _net_failures(row: BwrapRow, fs: ProbeFs, facts: dict[str, Any]) -> list[str]:
+    """E-15: a ``none`` row must see no route out and only ``lo``. Every row records its ifaces."""
+    interfaces = _interfaces(fs)
+    facts["net_ifaces"] = interfaces
+    if row.network != "none":
+        return []
+    failures: list[str] = []
+    result = fs.connect_errno(PROBE_CONNECT_HOST, PROBE_CONNECT_PORT)
+    facts["net_connect_errno"] = errno.errorcode.get(result, str(result)) if result else "connected"
+    if result != errno.ENETUNREACH:
+        failures.append("net_reachable")
+    if interfaces != [_LOOPBACK]:
+        failures.append("net_iface_visible")
+    return failures
+
+
 def _unique(codes: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(codes))
 
@@ -487,6 +536,7 @@ def run_self_probe(
     failures += _run_failures(row, use_roots, env, fs)
     failures += _tmp_failures(fs, facts)
     failures += _pid_ns_failures(row, fs)
+    failures += _net_failures(row, fs, facts)
     codes = _unique(failures)
     return SelfProbeResult(not codes, False, codes, MappingProxyType(facts))
 

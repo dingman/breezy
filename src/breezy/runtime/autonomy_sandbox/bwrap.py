@@ -54,6 +54,7 @@ from breezy.runtime.autonomy_sandbox.table import (
     DEFAULT_BIND_BASE,
     DEFAULT_TMPFS_SIZE_BYTES,
     MAX_TMPFS_SIZE_BYTES,
+    NETWORK_EGRESS,
     NOTIFIER_FALLBACK_ROWS,
     ROW_NAME_RE,
     SANDBOX_UNSET_EXACT,
@@ -238,7 +239,10 @@ def build_bwrap_argv(
 ) -> list[str]:
     """The exact AC-1.3 argv for ``row`` (argv[0] is ``bwrap_path``). Pure; opens nothing."""
     home = str(roots.home)
-    argv = [bwrap_path, *_NAMESPACE_FLAGS, "--ro-bind", "/", "/", "--tmpfs", "/run"]
+    argv = [bwrap_path, *_NAMESPACE_FLAGS]
+    if row.network != NETWORK_EGRESS:  # E-15: fail closed on anything but exactly "egress"
+        argv.append("--unshare-net")
+    argv += ["--ro-bind", "/", "/", "--tmpfs", "/run"]
     argv += ["--dev", "/dev"]
     if not row.host_proc:
         argv += ["--proc", "/proc"]

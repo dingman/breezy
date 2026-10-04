@@ -1,0 +1,11 @@
+# TEST FIXTURE ONLY (AUT-1 WP5 stage 3, D1/D12). Not Persistent: a missed day is the next day's
+# audit (it covers yesterday only) and the dead-man checks page.
+[Unit]
+Description=13:50 UTC trigger for the Breezy AUT-1 capture audit
+
+[Timer]
+Unit=breezy-capture-audit.service
+OnCalendar=*-*-* 13:50:00 UTC
+
+[Install]
+WantedBy=timers.target
