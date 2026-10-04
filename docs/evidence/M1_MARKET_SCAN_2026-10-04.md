@@ -49,6 +49,6 @@ Does Polymarket.us misprice weather rungs systematically, independent of any mod
 
 ## Decision
 - **Promote nothing; trade nothing.**
-- **Re-run** with the same pre-registered windows and bins once truth extends; each added month of tape roughly halves the needed edge size only every ~4×.
+- **Re-run** with the same pre-registered windows and bins once truth extends. The MDE shrinks as 1/√days, so halving it needs about 4× the days (~100+).
 - **The D_17Z YES 0.3–0.4 cell** is a hypothesis to freeze before forward days (FQ-R14), never a trade rule.
 - **The reliable-loser cells are a filter input for any v2 take rule.** No YES take at an ask below 0.10 unless the model is independently validated there.
