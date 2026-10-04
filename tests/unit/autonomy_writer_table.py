@@ -107,6 +107,37 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "outputs of an immutable rotated log, replaced atomically; never read as evidence",
         "replace_atomic",
     ),
+    # AUT-1 WP5 stage 3a (design r3 D5-D8, S3-R16, S3-R35): the stage-3 writers. The rows name the
+    # one writer of each path; the code lands with S1, S2 and 3c, which add their write-site rows.
+    FileWriter(
+        "evidence/capture/heal/<kill_date>/<kill_ts_ns>_audit_breezy-quote-tape.json",
+        "breezy-capture-audit (analysis.capture_heal_io), write-once, mode 0444: the recorder's "
+        "watchdog heal, taken at first write (a rerun is a no-op)",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/capture/heal_alert_abandoned/<heal_sha|gap_key>.json",
+        "breezy-capture-audit (analysis.capture_heal_io), write-once, written only after a "
+        "delivered=true record of the abandon alert",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/capture/live_proof/live_proof_<family>_<asof>.json",
+        "breezy-capture-live-proof (analysis.capture_live_proof_cli), replaced atomically at 0444",
+        "replace_atomic",
+    ),
+    FileWriter(
+        "evidence/capture/live_proof/sent/<asof>/<event>_<family>.json",
+        "breezy-capture-live-proof (analysis.capture_live_proof_cli), write-once, written only "
+        "after accepted=True: the per-asof dedupe of the dead-man alerts",
+        "write_once",
+    ),
+    FileWriter(
+        "derived/verdicts/health/<family>/** (capture family verdicts only)",
+        "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "
+        "derived/verdicts and nothing else there (design S3-R16, S3-R35)",
+        "write_once",
+    ),
 )
 
 

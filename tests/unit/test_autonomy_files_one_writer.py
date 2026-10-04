@@ -306,7 +306,7 @@ def test_allowlist_rows_for_code_that_has_not_landed_are_accepted_while_absent()
 def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None:
     assert {row.mechanism for row in AUTONOMY_FILE_WRITERS} <= WRITE_MECHANISMS
     paths = [row.path for row in AUTONOMY_FILE_WRITERS]
-    assert len(paths) == len(set(paths)) == 13
+    assert len(paths) == len(set(paths)) == 18
 
 
 def test_exemptions_are_narrow_and_unique() -> None:
