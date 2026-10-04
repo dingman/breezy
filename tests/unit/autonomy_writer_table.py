@@ -120,6 +120,6 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(
         "breezy.persistence.live_orders_gate",
         "_verify_ruling_file",
-        "the one named exemption: a move-only extraction (AC 7; not yet landed)",
+        "the one named exemption: a move-only extraction (AC 7; landed in seam 8a)",
     ),
 )
