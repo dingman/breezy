@@ -61,6 +61,7 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
         "run_heal_duty": "(data_root: Path, *, now_ns: int, heal_deadline: float) -> int",
     },
     f"{_AN}.capture_live_proof": {
+        "newest_audit_by_day": "(names: Sequence[str]) -> dict[dt.date, str]",
         "build_live_proof": (
             "(data_root: Path, family_id: str, asof: dt.date) -> Mapping[str, Any]"
         ),
@@ -69,6 +70,7 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
         "main": "(argv: Sequence[str] | None=None) -> int",
     },
     f"{_AN}.capture_aut6_contract": {
+        "read_notifier_proofs": ("(data_root: Path, day: dt.date) -> tuple[NotifierProof, ...]"),
         "delivered_events": ("(data_root: Path, first: dt.date, last: dt.date) -> frozenset[str]"),
     },
 }
@@ -226,7 +228,9 @@ W2_REAL: Final[frozenset[str]] = frozenset(
 #: union only.
 S1_REAL: Final[frozenset[str]] = frozenset()
 #: (keep the two lines above and below apart: they are one-line edits owned by different streams)
-S2_REAL: Final[frozenset[str]] = frozenset()
+S2_REAL: Final[frozenset[str]] = frozenset(
+    {f"{_AN}.capture_aut6_contract", f"{_AN}.capture_live_proof", f"{_AN}.capture_live_proof_cli"}
+)
 REAL_MODULES: Final[frozenset[str]] = (
     frozenset({f"{_AN}.capture_audit_fill_legs"}) | W2_REAL | S1_REAL | S2_REAL
 )

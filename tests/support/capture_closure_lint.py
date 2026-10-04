@@ -40,6 +40,7 @@ from tests.support.entry_points import SRC_DIR
 
 __all__ = [
     "ALLOWED_ARGV_SLOTS",
+    "ALLOWED_SUBPROCESS_KWARGS",
     "AUT1_GLOBS",
     "AUT1_WRITE_AUTHORITY",
     "REASON_COPY_SITES",
@@ -323,6 +324,67 @@ def _literal_first_arg(call: ast.Call) -> str | None:
     return None
 
 
+#: The only keywords an argv-matched ``subprocess`` call may pass (D10, S3-R15): the two stdio
+#: slots, each with a ``STDIO_CONSTANT_REFERENCES`` value. Anything else (``shell``, ``env``,
+#: ``cwd``, ``executable``, ``stdin``, ``input``, ``close_fds``, ``preexec_fn``,
+#: ``start_new_session``, a ``**`` splat) changes what runs and is refused.
+ALLOWED_SUBPROCESS_KWARGS: Final[frozenset[str]] = frozenset({"stdout", "stderr"})
+_SUBPROCESS_CALLS: Final[frozenset[str]] = frozenset({"run", "Popen"})
+
+
+def _dotted_reference(expr: ast.expr) -> str:
+    """``subprocess.PIPE`` for that attribute chain, else an empty string."""
+    if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+        return f"{expr.value.id}.{expr.attr}"
+    return ""
+
+
+def _is_subprocess_attribute_call(call: ast.Call) -> bool:
+    """``subprocess.run(...)`` / ``subprocess.Popen(...)`` written as an attribute of the literal
+    name ``subprocess``: an alias (``sp.run``) or a ``from`` import (``Popen(...)``) is refused."""
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "subprocess"
+        and func.attr in _SUBPROCESS_CALLS
+    )
+
+
+def _argv_call_admitted(call: ast.Call, argvs: Iterable[tuple[str, ...]]) -> bool:
+    """D10: an argv-matched call is admitted only when it is an attribute call of
+    ``subprocess.run`` or ``subprocess.Popen``, passes exactly one positional argument (a list or
+    tuple with no starred element), no ``*`` or ``**`` splat, and only ALLOWED_SUBPROCESS_KWARGS
+    keywords whose values are the stdio constants; and its argv matches a row."""
+    if not _is_subprocess_attribute_call(call) or len(call.args) != 1:
+        return False
+    first = call.args[0]
+    if not isinstance(first, ast.List | ast.Tuple):
+        return False
+    if any(isinstance(element, ast.Starred) for element in first.elts):
+        return False
+    for keyword in call.keywords:
+        if keyword.arg not in ALLOWED_SUBPROCESS_KWARGS:  # ``None`` is a ``**`` splat
+            return False
+        if _dotted_reference(keyword.value) not in STDIO_CONSTANT_REFERENCES:
+            return False
+    return any(_argv_matches(call, argv) for argv in argvs)
+
+
+def _admitted_call_positions(
+    tree: ast.AST, argvs: Iterable[tuple[str, ...]]
+) -> list[tuple[int, int]]:
+    """``(lineno, col_offset)`` of every admitted argv-matched call, one entry per call node: a call
+    is judged on its own, never by its line, so a second call on the same line is not admitted by
+    the first (S3-R36)."""
+    rows = tuple(argvs)
+    positions: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _argv_call_admitted(node, rows):
+            positions.add((node.lineno, node.col_offset))
+    return sorted(positions)
+
+
 def _calls_at(tree: ast.AST) -> dict[int, list[ast.Call]]:
     by_line: dict[int, list[ast.Call]] = {}
     for node in ast.walk(tree):
@@ -331,24 +393,49 @@ def _calls_at(tree: ast.AST) -> dict[int, list[ast.Call]]:
     return by_line
 
 
+def _is_subprocess_site(detail: str) -> bool:
+    return detail not in STDIO_CONSTANT_REFERENCES and (
+        detail.startswith("subprocess.") or detail == "subprocess"
+    )
+
+
+def _subprocess_findings(
+    path: str, tree: ast.Module, sites: list[Finding], row: AuthorityRow
+) -> list[Finding]:
+    """The subprocess sites of one file that no admitted call accounts for. An admitted call is
+    exactly one site (its ``subprocess.<fn>`` reference) at its own position; every other
+    ``subprocess`` site, on whatever line, is a finding."""
+    admitted_per_line: dict[int, int] = {}
+    for line, _col in _admitted_call_positions(tree, row.argvs):
+        admitted_per_line[line] = admitted_per_line.get(line, 0) + 1
+    by_line: dict[int, list[Finding]] = {}
+    for site in sites:
+        by_line.setdefault(site.lineno, []).append(site)
+    out: list[Finding] = []
+    for line, found in sorted(by_line.items()):
+        for site in found[admitted_per_line.get(line, 0) :]:
+            out.append(Finding(path, site.lineno, "aut1_write_authority", site.detail, site.scope))
+    return out
+
+
 def _site_findings(path: str, tree: ast.Module, source: str, row: AuthorityRow) -> list[Finding]:
     calls = _calls_at(tree)
     out: list[Finding] = []
+    subprocess_sites: list[Finding] = []
     for site in find_write_sites(path, source):
         detail = site.detail
         if detail in STDIO_CONSTANT_REFERENCES:
             continue
-        if detail.startswith("subprocess.") or detail == "subprocess":
-            if any(_argv_matches(c, a) for c in calls.get(site.lineno, []) for a in row.argvs):
-                continue
+        if _is_subprocess_site(detail):
+            subprocess_sites.append(site)
         elif detail == "sqlite3.connect":
             literals = {_literal_first_arg(c) for c in calls.get(site.lineno, [])}
             if any(lit in row.sqlite for lit in literals if lit is not None):
                 continue
-        elif _in_scope(site.scope, row.writes):
-            continue
-        out.append(Finding(path, site.lineno, "aut1_write_authority", detail, site.scope))
-    return out
+            out.append(Finding(path, site.lineno, "aut1_write_authority", detail, site.scope))
+        elif not _in_scope(site.scope, row.writes):
+            out.append(Finding(path, site.lineno, "aut1_write_authority", detail, site.scope))
+    return [*out, *_subprocess_findings(path, tree, subprocess_sites, row)]
 
 
 def _alias_for_os(tree: ast.Module) -> set[str]:

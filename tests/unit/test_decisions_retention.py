@@ -411,3 +411,33 @@ class TestSkipsOnLockContention:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+
+
+class TestSettlementAndFunnelFilesAreNeverCompressed:
+    """AUT-1 WP5 stage 3 (S2): the audit and the settlement writer read ``settlement_<day>.jsonl``
+    and ``fq_funnel_<day>.jsonl`` as plain files in the same directory this job compresses. Their
+    readers do not open ``.gz``, so a compressed one would be a missing input (r12 section 3.12)."""
+
+    _NAMES = (
+        "settlement_2026-09-01.jsonl",
+        "fq_funnel_2026-09-01.jsonl",
+        "settlement_2026-09-01.jsonl.gz",
+        "fq_funnel_2026-09-01.jsonl.gz",
+        ".capture_settlement.lock",
+    )
+
+    def test_retention_never_compresses_settlement_or_funnel_files(self, tmp_path: Path) -> None:
+        for name in self._NAMES:
+            _touch_with_mtime(tmp_path / name, age_hours=24 * 400)
+        control = tmp_path / "offer_tape_2026-09-01.jsonl"
+        _touch_with_mtime(control, age_hours=24 * 400)
+
+        outcome = run_retention(tmp_path, now=_NOW)
+
+        assert outcome.gzipped == ("offer_tape_2026-09-01.jsonl",)  # the control IS compressed
+        assert outcome.failed == ()
+        pruned = prune_old_gz_files(tmp_path, older_than_days=90, now=_NOW)
+        assert pruned == ("offer_tape_2026-09-01.jsonl.gz",)  # and only the control is pruned
+        for name in self._NAMES:
+            assert (tmp_path / name).read_text() == "line1\nline2\n", name
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted(self._NAMES)

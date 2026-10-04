@@ -88,7 +88,7 @@ class EmptyTape:
 
 def make_stream_summary(**over: Any) -> StreamSummary:
     heartbeat = HeartbeatSummary(
-        ts_ns=_DAY_START_NS + 3600 * NS, seq=1, final=True, written_by_type={}
+        ts_ns=_DAY_START_NS + 3600 * NS, seq=1, final=True, written_by_type={}, write_drops=0
     )
     fields: dict[str, Any] = {
         # The real table names (S2-R25): no decision was written, and the heartbeat table holds the
