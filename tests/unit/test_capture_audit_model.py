@@ -109,6 +109,7 @@ def test_error_causes_are_the_closed_design_set_plus_the_review_additions() -> N
             "node_log_sink_failed",
             "tape_unreadable",
             "settlement_unreadable",
+            "entry_lines_capped",
         }
     )
 

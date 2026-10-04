@@ -52,14 +52,29 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
     },
 }
 
-#: W3 is built (stage 2b): its pinned signatures must still hold, in the module that now defines
-#: each name (``RecorderCatalogTape``, ``read_exec_view`` and ``write_scan_cache`` moved to
+#: W3 is built (stage 2b): the EXACT public surface of each module that now defines a W3 name, so
+#: neither a new public function nor a changed signature slips in unreviewed (S2-R42). The names
+#: ``RecorderCatalogTape``, ``read_exec_view`` and ``write_scan_cache`` moved to
 #: ``capture_audit_tape`` / ``_exec_view`` / ``_cache`` to keep every module under 800 lines; the
-#: inputs module re-exports them).
+#: inputs module re-exports them (``W3_REEXPORTED``).
 W3_PINNED: Final[dict[str, dict[str, str]]] = {
     f"{_AN}.capture_audit_inputs": {
+        "boot_census": (
+            "(data_root: Path, day: dt.date, *, supervisor_journal: str) -> tuple[str, ...]"
+        ),
+        "gather_inputs": (
+            "(data_root: Path, family_id: str, day: dt.date, *, now_ns: int) -> AuditInputs"
+        ),
+        "list_names": "(root: Path, rel: Sequence[str]) -> list[str]",
+    },
+    f"{_AN}.capture_audit_tape": {
+        "catalog_instruments": "(catalog_root: Path, day: dt.date) -> frozenset[str]",
         "RecorderCatalogTape.__init__": (
             "(self, catalog_root: Path, day: dt.date, instruments: frozenset[str]) -> None"
+        ),
+        "RecorderCatalogTape.instruments": "(self) -> frozenset[str]",
+        "RecorderCatalogTape.active_instruments": (
+            "(self, start_ns: int, end_ns: int) -> frozenset[str]"
         ),
         "RecorderCatalogTape.lookup": (
             "(self, frame_kind: str, instrument_id: str, ts_event: int) -> Mapping[str, Any] | None"
@@ -73,16 +88,23 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
         "RecorderCatalogTape.best_ask_at": (
             "(self, instrument_id: str, ts_ns: int) -> float | None"
         ),
-        "boot_census": (
-            "(data_root: Path, day: dt.date, *, supervisor_journal: str) -> tuple[str, ...]"
-        ),
+    },
+    f"{_AN}.capture_audit_exec_view": {
         "read_exec_view": "(data_root: Path) -> ExecView",
-        "gather_inputs": (
-            "(data_root: Path, family_id: str, day: dt.date, *, now_ns: int) -> AuditInputs"
-        ),
+    },
+    f"{_AN}.capture_audit_cache": {
+        "cache_dir_parts": "() -> tuple[str, ...]",
+        "encode_result": "(result: LogResult, key: str) -> bytes",
+        "ensure_cache_dir": "(data_root: Path) -> None",
+        "log_key": "(path: Path) -> str",
+        "read_scan_cache": "(data_root: Path, key: str) -> LogResult | None",
+        "reducer_source_hash": "() -> str",
+        "reducer_source_hash_of": "(source_dir: Path) -> str",
         "write_scan_cache": "(data_root: Path, key: str, body: bytes) -> None",
     },
     f"{_AN}.capture_audit_host": {
+        "journal_slot": "(epoch_s: int) -> str",
+        "parse_recorder_journal": "(text: str) -> tuple[RecorderJournalEntry, ...]",
         "run_journal": (
             "(template: Sequence[str], since: str, until: str, *, "
             "timeout_s: float=JOURNAL_TIMEOUT_S) -> str"
@@ -95,6 +117,10 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
         "days_to_audit": (
             "(today: dt.date, audited: Mapping[dt.date, DayStatus]) -> tuple[dt.date, ...]"
         ),
+        "error_cause_set": "(result: AuditResult) -> frozenset[str]",
+        "error_result": (
+            "(day: dt.date, family_id: str, cause: str, *, pre_capture: bool) -> AuditResult"
+        ),
         "write_audit_file": "(data_root: Path, result: AuditResult, *, ts_ns: int) -> None",
         "run_audit": (
             "(data_root: Path, family_id: str, today: dt.date, *, now_ns: int, "
@@ -102,8 +128,34 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
         ),
     },
     f"{_AN}.capture_audit_cli": {
+        "families_by_construction": (
+            "(data_root: Path, explicit: Sequence[str]) -> tuple[str, ...]"
+        ),
         "main": "(argv: Sequence[str] | None=None) -> int",
     },
+}
+
+#: Names the inputs module still exports although another module defines them.
+W3_REEXPORTED: Final[tuple[str, ...]] = (
+    "RecorderCatalogTape",
+    "read_exec_view",
+    "write_scan_cache",
+)
+
+#: ``min_calls`` floors a builder raised in ``AUT1_WRITE_AUTHORITY``; a floor may be raised, never
+#: lowered. Every other pinned module stays at exactly 1 (S2-R42).
+RAISED_FLOORS: Final[dict[str, int]] = {
+    f"{_AN}.capture_audit_fill_legs": 150,
+    f"{_AN}.capture_audit_replay": 160,
+    f"{_AN}.capture_audit_log_markers": 13,
+    f"{_AN}.capture_audit_stream_legs": 110,
+    f"{_AN}.capture_audit_inputs": 250,
+    f"{_AN}.capture_audit_tape": 80,
+    f"{_AN}.capture_audit_exec_view": 65,
+    f"{_AN}.capture_audit_cache": 70,
+    f"{_AN}.capture_audit_host": 70,
+    f"{_AN}.capture_audit": 150,
+    f"{_AN}.capture_audit_cli": 22,
 }
 
 
@@ -205,11 +257,14 @@ def test_the_stage_2b_modules_are_not_modules_of_the_stage_2a_model() -> None:
         assert all(m in shared for m in stubs), (name, stubs)
 
 
-def test_each_stub_module_has_an_authority_row_with_no_write_scope_for_w1_and_w2() -> None:
+def test_each_pinned_module_has_an_authority_row_with_its_floor() -> None:
     rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
-    for module in EXPECTED:
+    for module in {*EXPECTED, *W3_PINNED}:
         assert module in rows, module
-        assert rows[module].min_calls >= 1, module
+        if module in RAISED_FLOORS:
+            assert rows[module].min_calls >= RAISED_FLOORS[module], module
+        else:
+            assert rows[module].min_calls == 1, module
     for module in (
         f"{_AN}.capture_audit_fill_legs",
         f"{_AN}.capture_audit_replay",
@@ -225,20 +280,25 @@ def test_each_stub_module_has_an_authority_row_with_no_write_scope_for_w1_and_w2
     assert f"{_AN}.capture_node_log_sinks" in rows
 
 
-_W3_HOME: Final[dict[str, str]] = {
-    "RecorderCatalogTape": f"{_AN}.capture_audit_tape",
-    "read_exec_view": f"{_AN}.capture_audit_exec_view",
-    "write_scan_cache": f"{_AN}.capture_audit_cache",
-}
+def _public(module: str) -> dict[str, str]:
+    """The public surface: every top-level and method definition not starting with an underscore
+    (``__init__`` counts)."""
+    return {
+        name: _signature(node)
+        for name, node in _defs(module).items()
+        if not name.rpartition(".")[2].startswith("_") or name.endswith(".__init__")
+    }
 
 
 @pytest.mark.parametrize("module", sorted(W3_PINNED))
-def test_the_built_w3_modules_keep_every_pinned_signature(module: str) -> None:
-    for name, signature in W3_PINNED[module].items():
-        owner = name.split(".")[0]
-        home = _W3_HOME.get(owner, module)
-        assert _signature(_defs(home)[name]) == signature, name
-        assert hasattr(importlib.import_module(module), owner), (module, owner)
+def test_the_built_w3_modules_expose_exactly_the_pinned_surface(module: str) -> None:
+    assert _public(module) == W3_PINNED[module]
+
+
+def test_the_inputs_module_still_exports_the_names_that_moved_out_of_it() -> None:
+    inputs = importlib.import_module(f"{_AN}.capture_audit_inputs")
+    for name in W3_REEXPORTED:
+        assert hasattr(inputs, name), name
 
 
 @pytest.mark.parametrize("module", sorted(W2_REAL))

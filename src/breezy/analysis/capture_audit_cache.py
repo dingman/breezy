@@ -9,9 +9,15 @@ byte).
 ``write_scan_cache`` is the audit's only cache write; ``ensure_cache_dir`` creates the directory the
 exec-store snapshot also uses. Entries are JSON through a closed registry of dataclasses (never
 pickle), written ``0600`` by atomic replace.
+
+Trust (S2-R29). The cache is UNAUTHENTICATED: it is trusted as same-uid data, like every other file
+under the data root. Each entry embeds its own key and a read compares it, so an entry copied or
+renamed under another key is a miss. The key also covers the reducer code (S2-R28): a sha256 over
+the source bytes of the node-log reducer modules, so a changed reducer never reads an old result.
 """
 
 import datetime as dt
+import functools
 import hashlib
 import json
 import os
@@ -61,6 +67,7 @@ __all__ = [
     "ensure_cache_dir",
     "log_key",
     "read_scan_cache",
+    "reducer_source_hash",
     "write_scan_cache",
 ]
 
@@ -145,12 +152,13 @@ class LogResult:
     markers: Mapping[tuple[str, dt.date], LogMarkers]
 
 
-def encode_result(result: LogResult) -> bytes:
+def encode_result(result: LogResult, key: str) -> bytes:
     def keyed(items: Mapping[tuple[str, dt.date], Any]) -> list[Any]:
         return [[iid, day.isoformat(), _enc(value)] for (iid, day), value in items.items()]
 
     body = {
         "v": CODEC_VERSION,
+        "key": key,
         "scan": _enc(result.scan),
         "replay": keyed(result.replay),
         "markers": keyed(result.markers),
@@ -158,11 +166,12 @@ def encode_result(result: LogResult) -> bytes:
     return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
-def _decode_result(raw: bytes) -> LogResult | None:
-    """The cached result, or ``None`` for anything not exactly this codec's output (a miss)."""
+def _decode_result(raw: bytes, key: str) -> LogResult | None:
+    """The cached result, or ``None`` for anything not exactly this codec's output for ``key`` (a
+    miss)."""
     try:
         body = json.loads(raw)
-        if body.get("v") != CODEC_VERSION:
+        if body.get("v") != CODEC_VERSION or body.get("key") != key:
             return None
         scan = _dec(body["scan"])
 
@@ -170,7 +179,7 @@ def _decode_result(raw: bytes) -> LogResult | None:
             return {(iid, dt.date.fromisoformat(day)): _dec(v) for iid, day, v in items}
 
         replay, markers = keyed(body["replay"]), keyed(body["markers"])
-    except (ValueError, KeyError, TypeError, AttributeError):
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError, OverflowError):
         return None
     ok = (
         isinstance(scan, NodeLogScan)
@@ -180,13 +189,39 @@ def _decode_result(raw: bytes) -> LogResult | None:
     return LogResult(scan, replay, markers) if ok else None
 
 
+_REDUCER_GLOBS: Final[tuple[str, ...]] = (
+    "capture_node_log*.py",
+    "capture_audit_replay.py",
+    "capture_audit_log_markers.py",
+    "capture_audit_cache.py",
+)
+
+
+def reducer_source_hash_of(source_dir: Path) -> str:
+    """sha256 over the (name, bytes) of every reducer module in ``source_dir``, in name order."""
+    names = sorted({p.name for pattern in _REDUCER_GLOBS for p in source_dir.glob(pattern)})
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(hashlib.sha256((source_dir / name).read_bytes()).digest())
+    return digest.hexdigest()
+
+
+@functools.cache
+def reducer_source_hash() -> str:
+    """The reducer modules' source hash, computed once per process (S2-R28)."""
+    return reducer_source_hash_of(Path(__file__).resolve().parent)
+
+
 def log_key(path: Path) -> str:
-    """``sha256(codec | name | size | mtime_ns | sha256(first 64 KiB))``: a log that grew, was
-    touched or was replaced is a different key."""
+    """``sha256(codec | reducer-source | name | size | mtime_ns | sha256(first 64 KiB))``: a log
+    that grew, was touched or was replaced, or a reducer that changed, is a different key."""
     stat, name = path.stat(), path.name
     with path.open("rb") as handle:
         head = hashlib.sha256(handle.read(_HEAD_BYTES)).hexdigest()
-    text = f"{CODEC_VERSION}|{name}|{stat.st_size}|{stat.st_mtime_ns}|{head}"
+    text = (
+        f"{CODEC_VERSION}|{reducer_source_hash()}|{name}|{stat.st_size}|{stat.st_mtime_ns}|{head}"
+    )
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -212,7 +247,12 @@ def write_scan_cache(data_root: Path, key: str, body: bytes) -> None:
 
 
 def read_scan_cache(data_root: Path, key: str) -> LogResult | None:
-    rootfd = open_root(data_root)
+    """The cached result for ``key``, or ``None``: every refusal, unreadable or undecodable entry is
+    a miss (S2-R30), because the cache is an optimisation, never evidence."""
+    try:
+        rootfd = open_root(data_root)
+    except SingleReadRefused:
+        return None
     try:
         dirfd = walk_dirs(rootfd, cache_dir_parts())
     except SingleReadRefused:
@@ -227,4 +267,4 @@ def read_scan_cache(data_root: Path, key: str) -> LogResult | None:
         return None
     finally:
         os.close(dirfd)
-    return _decode_result(raw)
+    return _decode_result(raw, key)

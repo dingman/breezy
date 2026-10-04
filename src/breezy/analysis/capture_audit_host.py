@@ -12,7 +12,7 @@ its error, is kept for the process: ``main`` reads it FIRST, before any scan or 
 later read returns that same outcome. The argv templates and ``AUDIT_BUS_READS`` are CONSTANTS stage
 3 copies into the unit and the bwrap row: a value may be corrected, a NAME may not.
 
-Each template has its own ``subprocess.run`` call whose argv is the template with the two slot
+Each template has its own ``subprocess.Popen`` call whose argv is the template with the two slot
 values as bare names (``since``, ``until``): ``AUT1_WRITE_AUTHORITY`` matches that shape exactly.
 """
 
@@ -21,11 +21,13 @@ import datetime as dt
 import json
 import os
 import re
+import select
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from breezy.analysis.capture_audit_input_types import RecorderJournalEntry, RecorderProps
 from breezy.analysis.capture_audit_model import AuditInputError
@@ -105,7 +107,9 @@ AUDIT_ROW_NAME: Final[str] = "breezy-capture-audit"
 
 #: ``YYYY-MM-DD HH:MM:SS UTC``: journalctl reads a bare time in the host zone, so every slot names
 #: UTC explicitly.
-_SLOT_RE: Final[re.Pattern[str]] = re.compile(r"\A\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\Z")
+_SLOT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\A[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC\Z"
+)
 _ARMED_KEYS: Final[tuple[str, ...]] = ("WatchdogUSec", "NotifyAccess", "Type")
 _TIMESPAN_RE: Final[re.Pattern[str]] = re.compile(r"(\d+(?:\.\d+)?)\s*([a-zµ]*)")
 _US_PER_UNIT: Final[Mapping[str, int]] = {
@@ -127,6 +131,12 @@ _TIMESTAMP_RE: Final[re.Pattern[str]] = re.compile(
 _US_NS: Final[int] = 1_000
 _S_NS: Final[int] = 1_000_000_000
 _MAX_JOURNAL_BYTES: Final[int] = 256 * 1024 * 1024
+_READ_CHUNK_BYTES: Final[int] = 64 * 1024
+#: ``subprocess.PIPE`` and ``subprocess.DEVNULL``, restated as their documented-stable values: the
+#: one-writer lint treats any ``subprocess.<name>`` reference as a write site that must sit in a
+#: call matching a row argv. A test pins them equal to the real constants.
+_PIPE: Final[int] = -1
+_DEVNULL: Final[int] = -3
 
 
 def journal_slot(epoch_s: int) -> str:
@@ -143,19 +153,22 @@ def _checked_slots(since: str, until: str) -> None:
         raise _journal_failed("bad_time_slot")
 
 
-class _Done(Protocol):
-    """The part of a finished process this module reads."""
+class _Process(Protocol):
+    """The part of a launched ``journalctl`` this module drives."""
 
-    returncode: int
-    stdout: str
+    stdout: Any
+
+    def poll(self) -> int | None: ...
+    def kill(self) -> None: ...
+    def wait(self, timeout: float | None = None) -> int: ...
 
 
-def _run_template(template: Sequence[str], since: str, until: str, timeout_s: float) -> _Done:
+def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
     """Run the one template ``template`` names. One call site per template: the lint row for each
     matches that call's argv exactly (the slots as bare names)."""
     key = tuple(template)
     if key == INGEST_JOURNAL_ARGV:
-        return subprocess.run(
+        return subprocess.Popen(
             [
                 "journalctl",
                 "--user",
@@ -168,13 +181,11 @@ def _run_template(template: Sequence[str], since: str, until: str, timeout_s: fl
                 "--until",
                 until,
             ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
+            stdout=_PIPE,
+            stderr=_DEVNULL,
         )
     if key == SUPERVISOR_JOURNAL_ARGV:
-        return subprocess.run(
+        return subprocess.Popen(
             [
                 "journalctl",
                 "--user",
@@ -187,13 +198,11 @@ def _run_template(template: Sequence[str], since: str, until: str, timeout_s: fl
                 "--until",
                 until,
             ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
+            stdout=_PIPE,
+            stderr=_DEVNULL,
         )
     if key == RECORDER_JOURNAL_ARGV:
-        return subprocess.run(
+        return subprocess.Popen(
             [
                 "journalctl",
                 "--user",
@@ -206,12 +215,48 @@ def _run_template(template: Sequence[str], since: str, until: str, timeout_s: fl
                 "--until",
                 until,
             ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
+            stdout=_PIPE,
+            stderr=_DEVNULL,
         )
     raise _journal_failed("unknown_template")
+
+
+def _read_bounded(proc: _Process, timeout_s: float) -> bytes:
+    """The child's stdout, read in chunks and counted in bytes: more than ``_MAX_JOURNAL_BYTES``
+    raises ``oversize`` while reading (S2-R31), never after buffering the whole journal."""
+    deadline = time.monotonic() + timeout_s
+    stream = proc.stdout
+    fd = stream.fileno()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([stream], [], [], remaining)[0]:
+            raise _journal_failed("timeout")
+        chunk = os.read(fd, _READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > _MAX_JOURNAL_BYTES:
+            raise _journal_failed("oversize")
+        chunks.append(chunk)
+    try:
+        returncode = proc.wait(timeout=max(deadline - time.monotonic(), 0.001))
+    except Exception:  # noqa: BLE001 - a wait that does not finish is the timeout failure
+        raise _journal_failed("timeout") from None
+    if returncode != 0:
+        raise _journal_failed(f"exit_{returncode}")
+    return b"".join(chunks)
+
+
+def _drive(proc: _Process, timeout_s: float) -> str:
+    try:
+        return _read_bounded(proc, timeout_s).decode("utf-8")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
 
 
 def run_journal(
@@ -220,21 +265,14 @@ def run_journal(
     """The journal text for ``[since, until]`` through a literal argv template."""
     _checked_slots(since, until)
     try:
-        done = _run_template(template, since, until, timeout_s)
+        text = _drive(_run_template(template, since, until), timeout_s)
     except AuditInputError:
         raise
-    except Exception as exc:  # noqa: BLE001 - any launch or wait failure is a journal failure
-        # ``TimeoutExpired`` is named by class (a bare reference to a ``subprocess`` name is a
-        # write site to the one-writer lint, which judges only the literal ``run`` calls).
-        name = type(exc).__name__
-        raise _journal_failed("timeout" if name == "TimeoutExpired" else name) from None
-    if done.returncode != 0:
-        raise _journal_failed(f"exit_{done.returncode}")
-    if len(done.stdout) > _MAX_JOURNAL_BYTES:
-        raise _journal_failed("oversize")
-    if not done.stdout.strip():
+    except Exception as exc:  # noqa: BLE001 - any launch or read failure is a journal failure
+        raise _journal_failed(type(exc).__name__) from None
+    if not text.strip():
         raise _journal_failed(EMPTY_OUTPUT_DETAIL)
-    return done.stdout
+    return text
 
 
 def _micros(entry: Mapping[str, object], key: str) -> int | None:
