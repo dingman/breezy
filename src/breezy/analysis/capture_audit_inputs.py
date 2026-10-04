@@ -62,7 +62,6 @@ from breezy.analysis.capture_audit_input_types import (
     HeartbeatSummary,
     IngestLine,
     LogMarkers,
-    NotifierProof,
     ReplayResult,
     StallRecord,
     StreamSummary,
@@ -72,6 +71,7 @@ from breezy.analysis.capture_audit_log_markers import MarkerParser
 from breezy.analysis.capture_audit_model import AuditInputError
 from breezy.analysis.capture_audit_replay import BootReplay
 from breezy.analysis.capture_audit_tape import RecorderCatalogTape, catalog_instruments
+from breezy.analysis.capture_aut6_contract import read_notifier_proofs
 from breezy.analysis.capture_node_log import iter_node_log, scan_node_log
 from breezy.analysis.capture_node_log_decisions import InstanceIdLine
 from breezy.analysis.capture_node_log_io import NodeLogUnreadable
@@ -97,7 +97,7 @@ from breezy.persistence.autonomy.capture_reader import (
 )
 from breezy.persistence.autonomy.capture_records import SOURCES
 from breezy.persistence.autonomy.capture_stream import capture_root
-from breezy.persistence.autonomy.single_read import ReadPolicy, SingleReadRefused
+from breezy.persistence.autonomy.single_read import SingleReadRefused
 from breezy.registry.sites import default_registry
 from breezy.runtime.capture_recorder_hook_cli import STALL_RELATIVE, STALL_SUFFIX
 
@@ -120,7 +120,6 @@ VENUE: Final[str] = "polymarket_us"
 LOGS_DIR: Final[str] = "logs"
 TAPE_REL: Final[tuple[str, ...]] = ("catalog", "quote_tape", VENUE)
 DECISIONS_REL: Final[tuple[str, ...]] = ("catalog", "quote_tape", "decisions")
-NOTIFY_REL: Final[tuple[str, ...]] = ("evidence", "alerts", "notify")
 _NS: Final[int] = 1_000_000_000
 _DAY_NS: Final[int] = 86_400 * _NS
 _HEAD_EVENTS: Final[int] = 5_000
@@ -133,9 +132,6 @@ _NBP_LAG_S: Final[int] = 3 * 3600
 _SETTLEMENT_DAYS_BACK: Final[int] = 2
 _SETTLEMENT_DAYS_FORWARD: Final[int] = 2
 _LOG_NAME_RE: Final[re.Pattern[str]] = re.compile(r"\Abreezy-trade-(\d{8}T\d{6}Z)\.log\Z")
-_NOTIFY_NAME_RE: Final[re.Pattern[str]] = re.compile(
-    r"\A(?P<unit>.+)__(?P<inv>[0-9a-f]{32})\.delivered\.json\Z"
-)
 _STALL_NAME_RE: Final[re.Pattern[str]] = re.compile(
     r"\A(?P<ns>\d+)_(?P<inv>[0-9a-f]{32})" + re.escape(STALL_SUFFIX) + r"\Z"
 )
@@ -339,7 +335,13 @@ def _summary_of(stream: CaptureStream) -> StreamSummary:
     return StreamSummary(
         row_counts=_row_counts(stream),
         heartbeats=tuple(
-            HeartbeatSummary(int(h.ts_event), int(h.seq), bool(h.final), dict(h.written_by_type))
+            HeartbeatSummary(
+                int(h.ts_event),
+                int(h.seq),
+                bool(h.final),
+                dict(h.written_by_type),
+                int(h.write_drops),
+            )
             for h in stream.heartbeats
         ),
         torn_tail_count=len(stream.torn_tails),
@@ -467,25 +469,6 @@ def _stall_records(data_root: Path, day: dt.date) -> tuple[StallRecord, ...]:
             except (SingleReadRefused, ValueError, KeyError, TypeError):
                 raise AuditInputError("capture_projection_failed", "stall_record") from None
     return tuple(sorted(found, key=lambda s: (s.ts_ns, s.invocation_id)))
-
-
-def _notifier_proofs(data_root: Path, day: dt.date) -> tuple[NotifierProof, ...]:
-    found: list[NotifierProof] = []
-    for offset in (0, 1):
-        stamp = (day + dt.timedelta(days=offset)).isoformat()
-        rel = (*NOTIFY_REL, stamp)
-        for name in list_names(data_root, rel):
-            match = _NOTIFY_NAME_RE.fullmatch(name)
-            if match is None:
-                continue
-            delivered = False
-            try:
-                body = json.loads(read_file(data_root, rel, name, ReadPolicy.REPO) or b"")
-                delivered = isinstance(body, dict) and body.get("delivered") is True
-            except (SingleReadRefused, ValueError):
-                delivered = False  # an unreadable marker proves no delivery
-            found.append(NotifierProof(match["unit"], match["inv"], delivered, stamp))
-    return tuple(sorted(found, key=lambda p: (p.date, p.unit, p.invocation_id)))
 
 
 # -- the journals --------------------------------------------------------------------------------
@@ -704,7 +687,7 @@ def gather_inputs(data_root: Path, family_id: str, day: dt.date, *, now_ns: int)
         recorder_journal=recorder,
         recorder_props=props,
         stall_records=_stall_records(data_root, day),
-        notifier_proofs=_notifier_proofs(data_root, day),
+        notifier_proofs=read_notifier_proofs(data_root, day),
         now_ns=now_ns,
         funnel=_funnel_rows(data_root, boot_days),
         resolver_live=any(

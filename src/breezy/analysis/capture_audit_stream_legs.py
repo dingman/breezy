@@ -10,8 +10,8 @@ Conventions this module fixes where the plan leaves them open (each pinned by a 
 * **R7** counts the leading gap (boot start to the first heartbeat) and, for a boot with no final
   heartbeat, the trailing gap (last heartbeat to the boot's last log line) as well as the gaps
   between consecutive heartbeats; only a gap that overlaps the audited UTC day counts.
-* **R5** reads ``write_drops`` from the boot's own heartbeats through the lazy stream handle (the
-  reduced ``HeartbeatSummary`` does not carry it).
+* **R5** reads ``write_drops`` from the newest reduced ``HeartbeatSummary`` (S3-R20); it never
+  calls the lazy stream handle, which only leg B reads.
 * **leg N** reads DELIVERY evidence, never the log alone (stage 2a known limit: a wired offer logs
   nothing). A missed cycle's delivery proof is a ``NotifierProof`` with ``unit ==
   NBP_MISSED_PROOF_UNIT`` and ``invocation_id == str(cycle_ns)``, pending AUT-6's final format
@@ -28,7 +28,6 @@ from breezy.analysis.capture_audit_input_types import AuditInputs, BootEvidence,
 from breezy.analysis.capture_audit_model import (
     PC_MIN_OVERLAP_S,
     STREAM_GAP_FAIL_S,
-    AuditInputError,
     Finding,
     Leg,
     LegOutcome,
@@ -37,6 +36,7 @@ from breezy.analysis.capture_audit_model import (
     WatchdogGap,
 )
 from breezy.analysis.capture_audit_replay import _decision_loss, _only, _rollup
+from breezy.analysis.capture_aut6_contract import NBP_MISSED_PROOF_UNIT
 from breezy.analysis.capture_node_log import (
     FqVectorCompleteLine,
     NbpCycleMissedLine,
@@ -62,7 +62,6 @@ _NS_PER_DAY: Final[int] = 86_400 * _NS
 RECORDER_UNIT: Final[str] = "breezy-quote-tape.service"
 #: ``NBP_CYCLE_MISSED`` is offered once the cycle's publication deadline (cycle + 3 h) has passed.
 NBP_DEADLINE_S: Final[int] = 3 * 3600
-NBP_MISSED_PROOF_UNIT: Final[str] = "NBP_CYCLE_MISSED"
 #: ``class_to_filename(CaptureHeartbeat)``: the table the writer counts and the reader keys by.
 #: The analysis layer may not import Nautilus, so the tests pin this literal to that function.
 HEARTBEAT_TABLE: Final[str] = "custom_capture_heartbeat"
@@ -166,15 +165,6 @@ def _r5_tables(boot: BootEvidence, last: HeartbeatSummary) -> list[Finding]:
     return findings
 
 
-def _write_drops(boot: BootEvidence) -> int:
-    """``write_drops`` of the boot's newest heartbeat, read through the lazy stream handle."""
-    try:
-        beats = boot.stream().heartbeats
-    except Exception as exc:
-        raise AuditInputError("stream_unreadable", type(exc).__name__) from exc
-    return int(max(beats, key=lambda beat: (beat.ts_event, beat.seq)).write_drops) if beats else 0
-
-
 def leg_r5(inp: AuditInputs) -> LegResult:
     """Counted stream loss per boot and table."""
     findings: list[Finding] = []
@@ -184,15 +174,14 @@ def leg_r5(inp: AuditInputs) -> LegResult:
         if last is None:
             continue
         findings.extend(_r5_tables(boot, last))
-        drops = _write_drops(boot)
-        if drops:
+        if last.write_drops:
             findings.append(
                 Finding(
                     Leg.R5,
                     LegOutcome.FAIL,
                     "stream_write_dropped",
                     boot.instance_id,
-                    f"write_drops={drops}",
+                    f"write_drops={last.write_drops}",
                 )
             )
         if boot.scan is not None:

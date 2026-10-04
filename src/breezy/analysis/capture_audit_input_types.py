@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
+from breezy.analysis.capture_aut6_contract import NotifierProof
 from breezy.analysis.capture_node_log import LogSink, MarkerEvent, NodeLogScan
 from breezy.analysis.capture_settlement import SettlementRecord
 from breezy.persistence.autonomy.capture_epoch import EpochRecord
@@ -105,6 +106,9 @@ class HeartbeatSummary:
     seq: int
     final: bool
     written_by_type: Mapping[str, int]
+    #: The heartbeat's counted write drops (GM2). Required: R5 reads it from here, so a summary
+    #: built without it must fail loudly rather than read as zero drops (S3-R20).
+    write_drops: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,16 +275,6 @@ class StallRecord:
     ts_ns: int
     day: str
     heal_sha256: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class NotifierProof:
-    """AUT-6's ``evidence/alerts/notify/<date>/<unit>__<InvocationID>.delivered.json`` marker."""
-
-    unit: str
-    invocation_id: str
-    delivered: bool
-    date: str
 
 
 @dataclass(frozen=True, slots=True)

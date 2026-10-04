@@ -5,6 +5,7 @@ plan r12 section 4 WP5 and r8 WP5 verbatim. The replay, R1-R3 and the marker sin
 ``test_capture_audit_recon_legs.py`` (split for the 800-line rule, the WP0-R10 precedent).
 """
 
+import dataclasses
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,8 @@ from typing import Any
 import pytest
 from nautilus_trader.persistence.funcs import class_to_filename
 
+from breezy.analysis import capture_audit_cache as cache_module
+from breezy.analysis import capture_audit_inputs as inputs_module
 from breezy.analysis.capture_audit_input_types import (
     FunnelRow,
     HeartbeatSummary,
@@ -25,7 +28,6 @@ from breezy.analysis.capture_audit_input_types import (
 from breezy.analysis.capture_audit_model import (
     PC_MIN_OVERLAP_S,
     STREAM_GAP_FAIL_S,
-    AuditInputError,
     LegOutcome,
 )
 from breezy.analysis.capture_audit_stream_legs import (
@@ -141,8 +143,10 @@ def test_stream_torn_tail_after_boot_end_is_counted() -> None:
 # ================================================================================================
 
 
-def beat(ts_s: int, seq: int, written: dict[str, int], *, final: bool = False) -> HeartbeatSummary:
-    return HeartbeatSummary(T + ts_s * NS, seq, final, written)
+def beat(
+    ts_s: int, seq: int, written: dict[str, int], *, final: bool = False, drops: int = 0
+) -> HeartbeatSummary:
+    return HeartbeatSummary(T + ts_s * NS, seq, final, written, drops)
 
 
 def r5_boot(rows: dict[str, int], beats: tuple[HeartbeatSummary, ...], **over: Any) -> Any:
@@ -223,23 +227,53 @@ def test_tail_after_last_heartbeat_of_crashed_boot_is_lost_in_flush_window_count
 
 
 def test_nonzero_write_drops_fails_stream_write_dropped() -> None:
-    """GM2: ``write_drops`` is in the boot's own heartbeat rows (the reduced summary omits it)."""
+    """GM2: ``write_drops`` rides on the reduced heartbeat summary (S3-R20); R5 reads it there."""
+    boot = r5_boot({HB_TABLE: 3}, (beat(0, 3, {HB_TABLE: 2}, final=True, drops=2),))
+    result = leg_r5(make_inputs(boots=(boot,)))
+    assert failing(result) == ["stream_write_dropped"]
+    assert result.findings[0].detail == "write_drops=2"
+
+
+def test_r5_reads_summary_without_stream_read() -> None:
+    """The lazy stream handle is for leg B only: R5 never calls it (S3-R20)."""
+
+    def spy() -> CaptureStream:
+        raise AssertionError("leg R5 must not read the stream")
+
+    drops = r5_boot({HB_TABLE: 3}, (beat(0, 3, {HB_TABLE: 2}, final=True, drops=1),), stream=spy)
+    assert failing(leg_r5(make_inputs(boots=(drops,)))) == ["stream_write_dropped"]
+    clean = r5_boot({HB_TABLE: 3}, (beat(0, 3, {HB_TABLE: 2}, final=True),), stream=spy)
+    assert leg_r5(make_inputs(boots=(clean,))).outcome == LegOutcome.PASS
+
+
+def test_r5_counts_only_the_newest_heartbeats_write_drops() -> None:
+    older = beat(0, 2, {HB_TABLE: 1}, drops=5)
+    newest = beat(10, 3, {HB_TABLE: 2}, final=True, drops=0)
+    boot = r5_boot({HB_TABLE: 3}, (older, newest))
+    assert leg_r5(make_inputs(boots=(boot,))).outcome == LegOutcome.PASS
+
+
+def test_heartbeat_summary_requires_write_drops() -> None:
+    field = next(f for f in dataclasses.fields(HeartbeatSummary) if f.name == "write_drops")
+    assert field.default is dataclasses.MISSING
+    assert field.default_factory is dataclasses.MISSING
+    with pytest.raises(TypeError):
+        HeartbeatSummary(T, 1, True, {})  # type: ignore[call-arg]
+
+
+def test_the_summary_is_filled_from_the_streams_heartbeat_rows() -> None:
     row = make_record(
         CaptureHeartbeat, ts_event=T, ts_init=T, seq=3, final=True, write_drops=2, write_failures=0
     )
-    stream = CaptureStream(INSTANCE_ID, "live", heartbeats=(row,))
-    boot = r5_boot({HB_TABLE: 3}, (beat(0, 3, {HB_TABLE: 2}, final=True),), stream=lambda: stream)
-    assert failing(leg_r5(make_inputs(boots=(boot,)))) == ["stream_write_dropped"]
+    summary = inputs_module._summary_of(CaptureStream(INSTANCE_ID, "live", heartbeats=(row,)))
+    assert [(h.seq, h.write_drops) for h in summary.heartbeats] == [(3, 2)]
 
 
-def test_an_unreadable_stream_raises_stream_unreadable() -> None:
-    def broken() -> CaptureStream:
-        raise OSError("gone")
-
-    boot = r5_boot({HB_TABLE: 3}, (beat(0, 3, {HB_TABLE: 2}, final=True),), stream=broken)
-    with pytest.raises(AuditInputError) as error:
-        leg_r5(make_inputs(boots=(boot,)))
-    assert error.value.cause == "stream_unreadable"
+def test_summaries_not_in_cache_types() -> None:
+    """The per-log cache holds log reductions only; a summary is rebuilt from the stream every run,
+    so adding one to the codec would be a needless version bump (S3-R20)."""
+    names = set(cache_module._CACHE_TYPES)
+    assert not names & {"HeartbeatSummary", "StreamSummary"}
 
 
 # ================================================================================================

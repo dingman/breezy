@@ -369,3 +369,100 @@ def test_each_enumerated_copy_site_really_holds_the_attribute_read(
     ]
     assert reads, f"{module}:{scope} holds no reason=<name>.reason read"
     assert lint_files([path]) == []
+
+
+# -- D10: an argv-matched subprocess call is admitted only in its plain form (S3-R15, S3-R36) ----
+
+_PLAIN_CALL: Final = "subprocess.run(['journalctl', '--user']{extra})"
+
+
+def _argv_lint(call: str, *, prefix: str = "import subprocess\n") -> list[Finding]:
+    return _lint(f"{prefix}def f(rest, opts):\n    return {call}\n", row=_ARGV_ROW)
+
+
+def test_the_plain_argv_call_is_admitted() -> None:
+    """Control for every refusal below: the same call without the extra is admitted."""
+    assert _argv_lint(_PLAIN_CALL.format(extra="")) == []
+    both = ", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL"
+    assert _argv_lint(_PLAIN_CALL.format(extra=both)) == []
+    assert _argv_lint("subprocess.Popen(['journalctl', '--user'], stdout=subprocess.PIPE)") == []
+
+
+def test_the_allowed_keyword_set_is_the_two_stdio_slots() -> None:
+    from tests.support.capture_closure_lint import ALLOWED_SUBPROCESS_KWARGS
+
+    assert ALLOWED_SUBPROCESS_KWARGS == {"stdout", "stderr"}
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "shell=True",
+        "env={}",
+        "executable='/bin/sh'",
+        "cwd='/'",
+        "stdin=subprocess.PIPE",
+        "input=b''",
+        "close_fds=False",
+        "preexec_fn=None",
+        "start_new_session=True",
+    ],
+)
+def test_argv_call_refuses_kwarg(keyword: str) -> None:
+    findings = _argv_lint(_PLAIN_CALL.format(extra=f", {keyword}"))
+    assert _rules(findings) == {"aut1_write_authority"}, keyword
+
+
+@pytest.mark.parametrize(
+    "stdio", ["open('journal.bin', 'rb')", "rest", "None", "subprocess.STDOUT"]
+)
+def test_argv_call_refuses_a_stdio_keyword_that_is_not_a_stdio_constant(stdio: str) -> None:
+    assert _argv_lint(_PLAIN_CALL.format(extra=f", stdout={stdio}"))
+
+
+def test_argv_call_refuses_second_positional() -> None:
+    assert _argv_lint(_PLAIN_CALL.format(extra=", 4096"))
+
+
+def test_argv_call_refuses_starred_element() -> None:
+    assert _argv_lint("subprocess.run(['journalctl', '--user', *rest])")
+    assert _argv_lint("subprocess.run([*rest])")
+
+
+def test_argv_call_refuses_splat() -> None:
+    assert _argv_lint(_PLAIN_CALL.format(extra=", *rest"))
+    assert _argv_lint(_PLAIN_CALL.format(extra=", **opts"))
+    assert _argv_lint("subprocess.run(*rest)")
+
+
+def test_from_subprocess_import_popen_refused() -> None:
+    source = "from subprocess import Popen\ndef f():\n    return Popen(['journalctl', '--user'])\n"
+    assert _rules(_lint(source, row=_ARGV_ROW)) == {"aut1_write_authority"}
+
+
+def test_an_aliased_subprocess_module_is_refused() -> None:
+    call = "sp.run(['journalctl', '--user'])"
+    assert _argv_lint(call, prefix="import subprocess as sp\n")
+
+
+def test_two_subprocess_calls_on_one_line_matched_by_position() -> None:
+    """The admitted call must not launder an unlisted one that shares its line (S3-R36)."""
+    both = "(subprocess.run(['journalctl', '--user']), subprocess.run(['rm', '-rf', 'x']))"
+    findings = _argv_lint(both)
+    assert len(findings) == 1 and findings[0].rule == "aut1_write_authority"
+    two_good = (
+        "(subprocess.run(['journalctl', '--user']), subprocess.run(['journalctl', '--user']))"
+    )
+    assert _argv_lint(two_good) == []
+    reference = "(subprocess.run(['journalctl', '--user']), subprocess.run)"
+    assert len(_argv_lint(reference)) == 1
+
+
+def test_existing_journal_templates_still_admitted() -> None:
+    """Guard: the three real journal ``Popen`` sites keep passing (the rows are the real ones)."""
+    from tests.support.capture_closure_lint import AUT1_WRITE_AUTHORITY, aut1_files
+
+    host = next(p for p in aut1_files() if p.name == "capture_audit_host.py")
+    rows = [r for r in AUT1_WRITE_AUTHORITY if r.module.endswith("capture_audit_host")]
+    assert rows and len(rows[0].argvs) == 3
+    assert lint_files([host]) == []
