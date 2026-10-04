@@ -212,6 +212,34 @@ def test_production_home_mount_args_hide_real_home() -> None:
     assert set(seen["credentials"].values()) == {"ENOENT"}, seen
 
 
+def test_production_venv_interpreter_executes_in_the_sandbox() -> None:
+    """B11: the venv ``python3`` (a symlink chain through the home) runs under the real roots.
+
+    The production roots hide the passwd home behind a tmpfs and re-bind only the repo, the
+    python prefix and the data root. The venv's interpreter and its ``pyvenv.cfg`` home reach
+    the prefix through a symlink that lies outside those binds, so the wrapper must recreate
+    it. The venv is this process's own (a worktree has none of its own).
+    """
+    venv = Path(sys.prefix)
+    assert venv.name == ".venv" and (venv / "pyvenv.cfg").is_file(), venv
+    roots = dataclasses.replace(default_roots(), repo_root=venv.parent)
+    assert roots.data_root.is_dir(), "the production data root must exist (plan V1)"
+    assert venv.is_relative_to(roots.home), "the venv must lie under the home the sandbox hides"
+    row = dataclasses.replace(
+        AUTONOMY_BWRAP_TABLE[ROW],
+        name=PROD_ROW,
+        units=frozenset({f"{PROD_ROW}.service"}),
+        binds=(),
+        bus_reads=(),
+        bus_snapshot_bind=None,
+        bus_snapshot_budget_s=None,
+    )
+    command = [str(venv / "bin" / "python3"), "-I", "-c", "import sys; print(sys.prefix)"]
+    result = run_in_row(PROD_ROW, command, roots, table={PROD_ROW: row})
+    assert result.returncode == 0, f"rc={result.returncode}\n{result.stderr}"
+    assert result.stdout.strip() == str(venv)
+
+
 def test_bwrap_ssh_aws_gnupg_netrc_enoent(roots: SandboxRoots) -> None:
     for rel in (".config/breezy", ".ssh", ".aws", ".gnupg"):
         (roots.home / rel).mkdir(parents=True)

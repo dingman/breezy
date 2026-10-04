@@ -39,6 +39,10 @@ from breezy.runtime.autonomy_sandbox.binds import (
     bind_base_path,
     open_validated_binds,
 )
+from breezy.runtime.autonomy_sandbox.interp_links import (
+    InterpreterLinkError,
+    interpreter_symlinks,
+)
 from breezy.runtime.autonomy_sandbox.run_mounts import (
     RunRebind,
     close_run_rebinds,
@@ -169,6 +173,15 @@ def _chdir(row: BwrapRow, roots: SandboxRoots, cwd: str) -> str:
     return "/"
 
 
+def _interpreter_links(roots: SandboxRoots) -> list[str]:
+    """``--symlink`` for each interpreter hop under the hidden home (B11-R1); never a bind."""
+    try:
+        hops = interpreter_symlinks(roots)
+    except InterpreterLinkError:
+        raise WrapperError("interpreter_link") from None
+    return [arg for link, target in hops for arg in ("--symlink", target, link)]
+
+
 def _credential_setenv(row: BwrapRow, environ: Mapping[str, str]) -> list[str]:
     if not row.credential_env:
         return []
@@ -221,6 +234,7 @@ def build_bwrap_argv(
     argv += ["--size", str(_tmpfs_size(row)), "--tmpfs", "/tmp", "--tmpfs", home]
     for path in _home_rebinds(row, roots):
         argv += ["--ro-bind", str(path), str(path)]
+    argv += _interpreter_links(roots)
     for rebind in rebinds:
         argv += _rebind_args(rebind)
     argv += ["--remount-ro", "/run"]

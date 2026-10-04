@@ -80,6 +80,7 @@ WRAPPER_CODE_FILES: Final[tuple[str, ...]] = (
     f"{_PACKAGE}/binds.py",
     f"{_PACKAGE}/bus_handoff.py",
     f"{_PACKAGE}/bwrap.py",
+    f"{_PACKAGE}/interp_links.py",
     f"{_PACKAGE}/run_mounts.py",
     f"{_PACKAGE}/self_probe.py",
     f"{_PACKAGE}/selftest_cli.py",
