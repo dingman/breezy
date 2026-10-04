@@ -36,6 +36,7 @@ from breezy.persistence.autonomy.capture_reader import C1View, CaptureStream
 __all__ = [
     "DAY",
     "FAMILY_ID",
+    "GOOD_INGEST",
     "INSTANCE_ID",
     "INSTRUMENT_ID",
     "NS",
@@ -56,6 +57,11 @@ _DAY_START_NS: Final[int] = (
     int(dt.datetime(DAY.year, DAY.month, DAY.day, tzinfo=dt.UTC).timestamp()) * NS
 )
 _SHA: Final[str] = "ab" * 32
+#: One ``extend_dedupe:`` line in the strict grammar of the ingest leg (T).
+GOOD_INGEST: Final[str] = (
+    "extend_dedupe: chunks=3 filtered=3 unfiltered=0 "
+    "by_type=custom_depth_truncation:3/0,quote_tick:3/0 flat_root=none"
+)
 
 
 class EmptyTape:
@@ -82,10 +88,12 @@ class EmptyTape:
 
 def make_stream_summary(**over: Any) -> StreamSummary:
     heartbeat = HeartbeatSummary(
-        ts_ns=_DAY_START_NS + 3600 * NS, seq=1, final=True, written_by_type={"DecisionRecord": 1}
+        ts_ns=_DAY_START_NS + 3600 * NS, seq=1, final=True, written_by_type={}
     )
     fields: dict[str, Any] = {
-        "row_counts": {"DecisionRecord": 1, "CaptureHeartbeat": 1},
+        # The real table names (S2-R25): no decision was written, and the heartbeat table holds the
+        # final heartbeat that its own snapshot does not yet count.
+        "row_counts": {"custom_capture_heartbeat": 1},
         "heartbeats": (heartbeat,),
         "torn_tail_count": 0,
         "unrecognised_file_count": 0,
@@ -97,10 +105,10 @@ def make_stream_summary(**over: Any) -> StreamSummary:
 
 def make_replay(**over: Any) -> ReplayResult:
     fields: dict[str, Any] = {
-        "admitted_total": 1,
-        "admitted_by_kind": {"Take": 1},
-        "evaluations": 1,
-        "eval_seq_final": 1,
+        "admitted_total": 0,
+        "admitted_by_kind": {},
+        "evaluations": 0,
+        "eval_seq_final": 0,
     }
     fields.update(over)
     return ReplayResult(**fields)

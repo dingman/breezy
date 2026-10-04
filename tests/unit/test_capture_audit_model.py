@@ -85,7 +85,7 @@ def test_live_proof_name_pattern_matches_the_documented_file_name() -> None:
     assert model.LIVE_PROOF_NAME_RE.fullmatch("live_proof_x_notadate.json") is None
 
 
-def test_error_causes_are_the_closed_design_set_plus_the_two_review_additions() -> None:
+def test_error_causes_are_the_closed_design_set_plus_the_review_additions() -> None:
     assert model.ERROR_CAUSES == frozenset(
         {
             "exec_snapshot_failed",
@@ -108,6 +108,7 @@ def test_error_causes_are_the_closed_design_set_plus_the_two_review_additions() 
             "funnel_missing",
             "node_log_sink_failed",
             "tape_unreadable",
+            "settlement_unreadable",
         }
     )
 

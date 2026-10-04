@@ -24,6 +24,7 @@ from typing import Any, Final
 
 from breezy.analysis.capture_audit_input_types import LogMarkers, ReplayResult
 from breezy.analysis.capture_audit_model import AUDIT_CACHE_DIR
+from breezy.analysis.capture_audit_replay import BootDayReplay
 from breezy.analysis.capture_node_log import NodeLogScan
 from breezy.analysis.capture_node_log_decisions import (
     DecisionLine,
@@ -65,7 +66,7 @@ __all__ = [
 
 #: The cache entry format. Any change to a cached type or the codec bumps it, so an old entry is a
 #: miss rather than a wrong answer.
-CODEC_VERSION: Final[str] = "scan-cache/1"
+CODEC_VERSION: Final[str] = "scan-cache/2"
 CACHE_PREFIX: Final[str] = "scan_"
 CACHE_FILE_MODE: Final[int] = 0o600
 _HEAD_BYTES: Final[int] = 65_536
@@ -83,6 +84,7 @@ _CACHE_TYPES: Final[Mapping[str, type]] = MappingProxyType(
             WriterFailureLine,
             UnparseableLine,
             ReplayResult,
+            BootDayReplay,
             LogMarkers,
             CaptureRefusedLine,
             OrderSubmittedLine,

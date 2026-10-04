@@ -435,7 +435,7 @@ def _break_settlement(root: Path) -> None:
         (_break_stream_file, "stream_unreadable"),
         (_break_funnel, "funnel_missing"),
         (_break_tape, "tape_unreadable"),
-        (_break_settlement, "capture_projection_failed"),
+        (_break_settlement, "settlement_unreadable"),
     ],
     ids=lambda v: getattr(v, "__name__", v),
 )
