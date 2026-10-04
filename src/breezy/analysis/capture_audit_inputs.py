@@ -474,10 +474,7 @@ def _settlements(data_root: Path, day: dt.date) -> tuple[SettlementRecord, ...]:
         except FileNotFoundError:
             continue
         except (SettlementFileCorrupt, SingleReadRefused) as exc:
-            # No closed cause names an unreadable settlement file; the stage-2c review adds one.
-            raise AuditInputError(
-                "capture_projection_failed", f"settlement:{type(exc).__name__}"
-            ) from None
+            raise AuditInputError("settlement_unreadable", type(exc).__name__) from None
     return tuple(found)
 
 

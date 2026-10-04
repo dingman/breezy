@@ -312,14 +312,17 @@ def audit_day(inp: AuditInputs) -> AuditResult:
 # -- scheduling ----------------------------------------------------------------------------------
 
 
+_RE_AUDITED: Final[frozenset[DayStatus]] = frozenset({DayStatus.INCONCLUSIVE, DayStatus.ERROR})
+
+
 def days_to_audit(today: dt.date, audited: Mapping[dt.date, DayStatus]) -> tuple[dt.date, ...]:
-    """The days one run audits, in order: yesterday, then each INCONCLUSIVE day of the last
-    ``BACKFILL_DAYS`` (oldest first), then each of those days with no audit file (oldest first)."""
+    """The days one run audits, in order: yesterday, then each INCONCLUSIVE or ERROR day of the last
+    ``BACKFILL_DAYS`` (oldest first), then each of those days with no audit file (oldest first).
+    ERROR is not terminal (S2-R23): its cause may be gone, so the next run audits the day again;
+    PASS, FAIL, NO_INPUT and PRE_CAPTURE are final."""
     yesterday = today - dt.timedelta(days=1)
     window = [today - dt.timedelta(days=back) for back in range(BACKFILL_DAYS, 0, -1)]
-    inconclusive = [
-        d for d in window if d != yesterday and audited.get(d) is DayStatus.INCONCLUSIVE
-    ]
+    inconclusive = [d for d in window if d != yesterday and audited.get(d) in _RE_AUDITED]
     missing = [d for d in window if d != yesterday and d not in audited]
     return (yesterday, *inconclusive, *missing)
 

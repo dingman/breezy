@@ -103,6 +103,19 @@ def _iso(ns: int) -> str:
     return f"{moment:%Y-%m-%dT%H:%M:%S}.{ns % NS:09d}Z"
 
 
+#: The ``now_ns`` and log time stamp of the recorded Take line in ``REAL_TAKE``.
+_REAL_TAKE_NOW_NS: Final[int] = 1790972432790092624
+_REAL_TAKE_LOG_NS: Final[int] = 1790972432924873907
+
+
+def day_take(hour: int = 17, minute: int = 5) -> str:
+    """``REAL_TAKE`` re-timed onto the audited day D (its real line is stamped the day before), so
+    the log line, the Take's own clock and the day of the reducer's output all agree (S2-R25)."""
+    at = day_ns(DAY, hour, minute)
+    line = REAL_TAKE.replace(_iso(_REAL_TAKE_LOG_NS), _iso(at))
+    return line.replace(str(_REAL_TAKE_NOW_NS), str(at - (_REAL_TAKE_LOG_NS - _REAL_TAKE_NOW_NS)))
+
+
 def node_log_lines(
     instance_id: str = INSTANCE,
     *,
@@ -455,7 +468,7 @@ def full_world(tmp_path: Path, monkeypatch: Any, **kw: Any) -> Path:
     """A complete, consistent D=2026-10-03 world: one boot with log, stream, epoch, fill, tape."""
     root = make_root(tmp_path)
     install(monkeypatch, root, **kw)
-    write_node_log(root, decisions=[REAL_TAKE])
+    write_node_log(root, decisions=[day_take()])
     write_stream(root)
     write_epoch(root, epoch_ns=day_ns(DAY - dt.timedelta(days=1), 16, 50))
     write_exec_store(root, standard_exec_rows())

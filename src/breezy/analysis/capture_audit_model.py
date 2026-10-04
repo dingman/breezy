@@ -144,6 +144,8 @@ ERROR_CAUSES: Final[frozenset[str]] = frozenset(
         # S2-R1: a node-log sink raised mid-scan. S2-R7: the eager tape index could not be read.
         "node_log_sink_failed",
         "tape_unreadable",
+        # S2-R22: a settlement file could not be read; never folded into a projection failure.
+        "settlement_unreadable",
     }
 )
 

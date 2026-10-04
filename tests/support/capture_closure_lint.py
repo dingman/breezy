@@ -39,6 +39,7 @@ from tests.support.autonomy_write_scan import find_write_sites
 from tests.support.entry_points import SRC_DIR
 
 __all__ = [
+    "ALLOWED_ARGV_SLOTS",
     "AUT1_GLOBS",
     "AUT1_WRITE_AUTHORITY",
     "REASON_COPY_SITES",
@@ -249,20 +250,28 @@ def _in_scope(scope: str, allowed: Iterable[str]) -> bool:
 
 
 _SLOT_RE: Final[re.Pattern[str]] = re.compile(r"\{(?P<name>[a-z_]+)\}")
+#: The closed set of slot names an argv row may carry (design S2-R21): the two journal time slots.
+#: A name outside it matches nothing, so a free-form or path-carrying slot is refused.
+ALLOWED_ARGV_SLOTS: Final[frozenset[str]] = frozenset({"since", "until"})
 
 
 def _argv_matches(call: ast.Call, argv: tuple[str, ...]) -> bool:
     """A subprocess call matches a row argv when its first argument is a list or tuple of the same
     length whose every element is that row's literal string, or, where the row holds a ``{slot}``
-    token, a bare ``Name`` called ``slot`` (a value the module validates before the call). A
-    literal argv with no slot is matched exactly, as before."""
+    token, a bare ``Name`` called ``slot`` (a value the module validates before the call). Every
+    slot must be one of ``ALLOWED_ARGV_SLOTS`` and stand directly after its own ``--<slot>`` flag
+    (S2-R21); otherwise the row matches nothing. A literal argv with no slot is matched exactly, as
+    before."""
     first = call.args[0] if call.args else None
     if not isinstance(first, ast.List | ast.Tuple) or len(first.elts) != len(argv):
         return False
-    for element, want in zip(first.elts, argv, strict=True):
+    for index, (element, want) in enumerate(zip(first.elts, argv, strict=True)):
         slot = _SLOT_RE.fullmatch(want)
         if slot is not None:
-            if not (isinstance(element, ast.Name) and element.id == slot["name"]):
+            name = slot["name"]
+            if name not in ALLOWED_ARGV_SLOTS or index == 0 or argv[index - 1] != f"--{name}":
+                return False
+            if not (isinstance(element, ast.Name) and element.id == name):
                 return False
         elif not (isinstance(element, ast.Constant) and element.value == want):
             return False

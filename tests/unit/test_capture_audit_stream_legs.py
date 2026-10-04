@@ -63,6 +63,7 @@ from tests.support.capture_audit_fixtures import (
     EmptyTape,
     make_boot,
     make_inputs,
+    make_replay,
     make_stream_summary,
 )
 from tests.support.capture_audit_recon_fixtures import (
@@ -567,7 +568,10 @@ def pc_boot(**over: Any) -> Any:
         "started_ns": T,
         "last_line_ts_ns": T + 4 * 3600 * NS,
         "overlap_s": 4 * 3600,
-        "replay": make_boot().replay,
+        # A boot that logged one admitted Take (the default replay admits nothing, S2-R25).
+        "replay": make_replay(
+            admitted_total=1, admitted_by_kind={"Take": 1}, evaluations=1, eval_seq_final=0
+        ),
     }
     fields.update(over)
     return make_boot(**fields)

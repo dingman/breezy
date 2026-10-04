@@ -128,7 +128,21 @@ def test_no_input_day_has_no_fills_resolvers_or_takes(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize(
     "inp_over",
     [
-        pytest.param({"boots": (fx.make_boot(),)}, id="take_line"),
+        pytest.param(
+            {
+                "boots": (
+                    fx.make_boot(
+                        replay=fx.make_replay(
+                            admitted_total=1,
+                            admitted_by_kind={"Take": 1},
+                            evaluations=1,
+                            eval_seq_final=0,
+                        )
+                    ),
+                )
+            },
+            id="take_line",
+        ),
         pytest.param({"exec": fx.make_exec_view()}, id="resolver_context"),
     ],
 )
