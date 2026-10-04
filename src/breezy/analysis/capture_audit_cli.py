@@ -63,7 +63,7 @@ from breezy.runtime.autonomy_sandbox.bwrap import default_roots
 from breezy.runtime.autonomy_sandbox.run_mounts import STUDIES_LOCK_NAME
 from breezy.runtime.autonomy_sandbox.studies_lock import StudiesLockError, acquire_studies_lock
 
-__all__ = ["FLOCK_WAIT_S", "TIMEOUT_START_S", "OfferHealSender", "families_by_construction", "main"]
+__all__ = ["FLOCK_WAIT_S", "TIMEOUT_START_S", "families_by_construction", "main"]
 
 _LOGGER: Final = logging.getLogger(__name__)
 FLOCK_WAIT_S: Final[int] = 600
@@ -79,7 +79,7 @@ def _undeliverable_offer(event: str, severity: str, detail: str) -> bool:
     return False
 
 
-class OfferHealSender:
+class _OfferHealSender:
     """The ``HealSender`` over the alert ``offer``: the severity comes from ``severity_for`` and
     ``attempt_kind`` rides in ``detail`` (the stage-4 shim: AUT-6's outbox takes it natively)."""
 
@@ -181,7 +181,7 @@ def _run_heal(data_root: Path, now_ns: int, deadline: float, offer: AlertOffer) 
             data_root,
             now_ns=now_ns,
             heal_deadline=heal_deadline,
-            sender=OfferHealSender(offer),
+            sender=_OfferHealSender(offer),
         )
     except Exception:
         _LOGGER.exception("capture audit: the heal duty raised")

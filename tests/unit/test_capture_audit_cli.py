@@ -592,14 +592,16 @@ def test_heal_never_runs_when_the_lock_is_refused(
 def test_the_heal_sender_puts_severity_and_attempt_kind_through_the_offer() -> None:
     """The stage-4 shim: ``attempt_kind`` rides in ``detail`` until AUT-6's outbox takes it."""
     offers = Offers()
-    sender = cli.OfferHealSender(offers)
+    sender = cli._OfferHealSender(offers)
     assert sender.send("CAPTURE_HEALED_" + "ab" * 32, "heal=x", "retry") is True
     assert sender.send("CAPTURE_WATCHDOG_EVIDENCE_GAP", "gap=y", "alert") is True
     assert offers.calls == [
         ("CAPTURE_HEALED_" + "ab" * 32, "INFO", "heal=x attempt_kind=retry"),
         ("CAPTURE_WATCHDOG_EVIDENCE_GAP", "CRITICAL", "gap=y attempt_kind=alert"),
     ]
-    assert cli.OfferHealSender(Offers(accept=False)).send("CAPTURE_JOIN_GAP", "d", "alert") is False
+    assert (
+        cli._OfferHealSender(Offers(accept=False)).send("CAPTURE_JOIN_GAP", "d", "alert") is False
+    )
 
 
 def test_the_cli_imports_no_venue_adapter_and_makes_no_network_call() -> None:

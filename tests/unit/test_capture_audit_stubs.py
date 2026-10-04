@@ -221,7 +221,13 @@ RAISED_FLOORS: Final[dict[str, int]] = {
     f"{_AN}.capture_audit_cache": 70,
     f"{_AN}.capture_audit_host": 70,
     f"{_AN}.capture_audit": 150,
-    f"{_AN}.capture_audit_cli": 22,
+    f"{_AN}.capture_audit_cli": 54,
+    # stage 3 (3c): the floors measured after the streams merged and heal was wired
+    f"{_AN}.capture_heal": 48,
+    f"{_AN}.capture_heal_io": 194,
+    f"{_AN}.capture_live_proof": 100,
+    f"{_AN}.capture_live_proof_cli": 91,
+    f"{_AN}.capture_aut6_contract": 33,
 }
 
 
@@ -421,6 +427,7 @@ def test_the_real_modules_union_is_the_four_lines() -> None:
         frozenset({f"{_AN}.capture_audit_fill_legs"}) | W2_REAL | S1_REAL | S2_REAL
     )
     assert S1_REAL.isdisjoint(S2_REAL)
+    assert set(_STAGE3_STUBS) == S1_REAL | S2_REAL  # 3c: every stage-3 module is landed
     lines = Path(__file__).read_text(encoding="utf-8").splitlines()
     owned = [i for i, text in enumerate(lines) if text.startswith(("S1_REAL:", "S2_REAL:"))]
     assert len(owned) == 2 and owned[1] - owned[0] >= 2  # separate, non-adjacent lines (S3-R43)
@@ -445,21 +452,22 @@ def test_list_names_lives_in_capture_audit_io_and_inputs_re_exports_it() -> None
     assert not hasattr(inputs, "_read_file")  # renamed ``read_file``, now in the io module
 
 
-def test_the_stage_3_stub_rows_hold_the_reviewed_scopes() -> None:
+def test_the_stage_3_rows_hold_the_reviewed_scopes() -> None:
+    """3c narrowed the 3a ``"*"`` scopes to the S1 and S2 reports (S3-R31)."""
     rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
-    for name in ("capture_heal", "capture_heal_io", "capture_live_proof", "capture_live_proof_cli"):
-        assert rows[f"{_AN}.{name}"].writes == ("*",), name
-    for name in ("capture_aut6_contract", "capture_audit_io"):
+    heal_io = rows[f"{_AN}.capture_heal_io"]
+    assert (heal_io.writes, heal_io.write_imports) == (
+        ("_publish",),
+        frozenset({"write_once", "ensure_dir"}),
+    )
+    proof_cli = rows[f"{_AN}.capture_live_proof_cli"]
+    assert not proof_cli.writes
+    assert proof_cli.write_imports == frozenset({"write_once", "replace_atomic", "ensure_dir"})
+    for name in ("capture_heal", "capture_live_proof", "capture_aut6_contract", "capture_audit_io"):
         row = rows[f"{_AN}.{name}"]
         assert not row.writes and not row.write_imports and not row.argvs, name
 
 
-@pytest.mark.xfail(
-    strict=True, reason="S3-R31: the heal and live-proof rows are narrowed by 3c, not before"
-)
 def test_heal_and_live_proof_write_rows_are_narrowed() -> None:
-    """XFAILs (strict) while the rows hold ``"*"``; 3c narrows every row and removes the marker.
-    A strict xfail that starts passing fails the suite, so it cannot be forgotten."""
-    rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
-    for name in ("capture_heal", "capture_heal_io", "capture_live_proof", "capture_live_proof_cli"):
-        assert "*" not in rows[f"{_AN}.{name}"].writes, name
+    """S3-R31: the strict xfail is gone; no ``"*"`` write scope is left on any stage-3 row."""
+    assert [row.module for row in AUT1_WRITE_AUTHORITY if "*" in row.writes] == []
