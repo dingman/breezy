@@ -3,6 +3,7 @@
 Shared helpers live in ``aut1_premises_support`` (WP0-R10).
 """
 
+import ast
 import hashlib
 from pathlib import Path
 from typing import Final
@@ -64,39 +65,59 @@ def test_aut1_entry_point_closures_are_free_of_venue_adapter_modules(entry: str)
     assert "breezy.strategy.current_rung_hold" not in closure
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "V-15 FAILS on this tree: capture_forecast_ref.py -> strategy.ladder_ev.forecast_state "
-        "pulls 33 adapter modules and the current_rung_hold __init__: ladder_ev/__init__ -> "
-        "ladder_ev.decision -> current_rung_hold.decision -> current_rung_hold/__init__ -> "
-        "trial_day_latch -> adapters.polymarket_us.symbology. Returns to review; remove this "
-        "marker only when the closure is clean."
-    ),
-)
 def test_forecast_state_closure_is_adapter_free() -> None:
-    """V-15, the planned ``capture_forecast_ref.py`` dependency. Strict xfail records the plan
-    premise failing today: the closure of ``breezy.strategy.ladder_ev.forecast_state`` contains
-    adapter modules. It flips to XPASS (a failure) the moment WP5 cleans it, forcing the marker off.
+    """V-15, the planned ``capture_forecast_ref.py`` dependency: the closure of
+    ``breezy.strategy.ladder_ev.forecast_state`` contains no venue-adapter module. This was a
+    strict xfail (33 adapter modules via the ``ladder_ev`` facade) until WP1's first commit
+    stripped the facade (WP0-R6); the marker was removed in that commit.
+
+    MUTATION (red): restoring the ``ladder_ev.decision`` import in ``ladder_ev/__init__.py``
+    brings back the 33 adapter modules.
     """
     closure = static_module_closure("breezy.strategy.ladder_ev.forecast_state")
     assert _adapter_modules(closure) == []
 
 
-def test_forecast_state_closure_reaches_adapters_through_ladder_ev_init() -> None:
-    """V-15 evidence for the xfail above: the adapter edge is the ``ladder_ev`` package
-    ``__init__`` (``ladder_ev.decision`` -> ``current_rung_hold`` package -> ``trial_day_latch``
-    -> ``adapters.polymarket_us.symbology``), not ``forecast_state`` itself.
+def test_ladder_ev_package_init_has_no_imports() -> None:
+    """V-15 / WP0-R6 (AUT-1 WP1). ``strategy/ladder_ev/__init__.py`` is its docstring plus
+    ``__all__: list[str] = []`` (mirroring ``strategy/__init__.py``): no import statement other
+    than ``from __future__``. The AST walk is the lint, because grimp has no edge for a package's
+    implicit ``__init__``; a facade re-export would drag ``ladder_ev.decision`` ->
+    ``current_rung_hold`` -> ``trial_day_latch`` -> the venue adapters into every submodule's
+    closure.
 
-    MUTATION (red): asserting ``forecast_state``'s own imports contain an adapter module fails.
+    MUTATION (red): restoring the ``ladder_ev.decision`` import in ``__init__`` fails both asserts.
     """
-    closure = static_module_closure("breezy.strategy.ladder_ev.forecast_state")
-    assert len(_adapter_modules(closure)) == 33
-    assert "breezy.strategy.current_rung_hold" in closure
-    own = {m for m in _module_level_imports("breezy.strategy.ladder_ev.forecast_state")}
+    init = SRC_DIR / "breezy" / "strategy" / "ladder_ev" / "__init__.py"
+    tree = ast.parse(init.read_text(encoding="utf-8"))
+    imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        or (isinstance(node, ast.ImportFrom) and node.module != "__future__")
+    ]
+    assert imports == []
+    assert [
+        m
+        for m in _module_level_imports("breezy.strategy.ladder_ev")
+        if m != "__future__" and not m.startswith("__future__.")
+    ] == []
+
+
+def test_forecast_state_closure_no_longer_reaches_adapters_through_ladder_ev_init() -> None:
+    """V-15 successor of the pre-WP0-R6 evidence test (which pinned 33 adapter modules reached
+    through the ``ladder_ev`` package ``__init__``). Now neither the package ``__init__`` nor
+    ``forecast_state`` reaches an adapter module or the ``current_rung_hold`` package.
+
+    MUTATION (red): restoring the ``ladder_ev.decision`` import in ``__init__`` puts 33 adapter
+    modules and ``current_rung_hold`` back into both closures.
+    """
+    for entry in ("breezy.strategy.ladder_ev", "breezy.strategy.ladder_ev.forecast_state"):
+        closure = static_module_closure(entry)
+        assert _adapter_modules(closure) == [], entry
+        assert "breezy.strategy.current_rung_hold" not in closure, entry
+    own = _module_level_imports("breezy.strategy.ladder_ev.forecast_state")
     assert not [m for m in own if m.startswith("breezy.adapters")]
-    init_closure = static_module_closure("breezy.strategy.ladder_ev")
-    assert _adapter_modules(init_closure) == _adapter_modules(closure)
 
 
 def test_submit_chain_is_not_byte_pinned_in_tests() -> None:
