@@ -452,3 +452,37 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - refuse a nonzero `alpha_k` on an infeasible nomination (AUT-4 r11:567);
   - refuse a ROLLBACK whose `drill` column disagrees with an open episode.
 - **Open (pre-Kalshi):** lineage counters are venue-independent (ARCH:413), but the fold runs per venue. The consumer of `K_LIFETIME` and α must merge lineages across venue folds before a second venue goes live.
+
+### Build-time rulings (seam A 7c ARCH review)
+- **A7c-R1 (HIGH-1).** The E-5 drill-close restore is subject to `RESUME_COOLDOWN_H` (AUT-7 r5:409, :866; ARCH:487). The cooldown delays the restore to the next eligible pass; it does not strand the venue. The exemption is removed and the test flipped.
+- **A7c-R2 (HIGH-2).**
+  - A DRILL-class DEMOTE/HALT is refused unless the family is CHAMPION with no standing non-DRILL cause.
+  - A `ROLLBACK_FAILED` row whose trigger class is DRILL counts as DRILL-class.
+  - A generic rule, landing in 7c: every row's `from_state` must equal the fold's current state for its family (∅ for an introducing row). This closes the V12 "first cause wins" laundering, where a model-halted family is re-halted as DRILL to obtain a budget-free restore.
+- **A7c-R3 (HIGH-3).** Seam 7d scope adds the fold-decidable ROLLBACK rules:
+  - target `rollback_eligible`, not `target_ineligible`, not `terminal_frozen`;
+  - `ROLLBACK_TARGET_MAX_AGE_D`;
+  - `MAX_ROLLBACKS_PER_VENUE_30D`;
+  - `terminal_frozen` refuses PROMOTE.
+  
+  Plan l.189: `validate` implements every fold-decidable C5 rule.
+- **A7c-R4 (MED-1).** E-5 binds to the actual failed close:
+  - the latest drill episode is closed;
+  - the family's `halted_since_ns >= episode.end_ns`;
+  - the family is the incumbent that the episode's DRILL_PROMOTE superseded (the root, per AUT-7 r5:242).
+- **A7c-R5 (MED-2).**
+  - A family's artefact binding is immutable (ARCH:367): the fold binds the introducing row's sha.
+  - `validate` refuses a row carrying a different non-null sha.
+  - `test_family_artefact_binding_immutable` lands in 7c, superseding A6e-R1's 7d placement.
+- **A7c-R6 (MED-3), obligation for AUT-5/AUT-7.** A `validate` refusal of a DRILL-class restrictive row must not enter the Y19 retry/demand-file path, which would veto the venue. The drill aborts instead (AUT-7 r5:400-403).
+- **A7c-R7 (MED-4).** `_drill_entry` checks that the incumbent is not `demoted_for_cause` (ARCH:475, :477, W2).
+- **A7c-R8 (LOW).**
+  - Docs say "integrity freeze" and note that the engine owns the live exec-store halt check.
+  - When `verdicts` is supplied, RESUME requires each cited verdict to be a PASS produced after `halted_since_ns`.
+  - A HALTED family with `halted_since_ns is None` is refused, never exempt from the cooldown.
+  - `lint-imports` and the pyarrow-free contracts are verified after `transitions` gains the `validate`→`verdict` edge.
+- **A7c-A1 (accepted).**
+  - Private window lengths, pinned by boundary tests.
+  - d0 ordering skips the root, safe while root d0 ≤ child launch.
+  - Uncited RESUME refused.
+- **A7c-A2 (accepted deviation).** The generic `from_state` rule has exactly one exemption. A post-launch SWAP_CANCEL in [LAUNCH, 17:00) may name an effective pair's incoming family as CHALLENGER while the fold already shows it CHAMPION. Without this exemption, the E-19a alternative path, which must stay open, would be refused. It is pinned by `test_the_swap_cancel_alternative_is_accepted_in_the_launch_window`.
