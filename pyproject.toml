@@ -239,6 +239,7 @@ source_modules = [
     "breezy.persistence.autonomy.lineage",
     "breezy.persistence.autonomy.family_bytes",
     "breezy.persistence.autonomy.registry_store",
+    "breezy.persistence.autonomy.registry_export",
     "breezy.persistence.autonomy.label_schema",
     "breezy.persistence.autonomy.rollback_journal",
     "breezy.persistence.autonomy.schemas",
@@ -249,6 +250,7 @@ source_modules = [
     "breezy.persistence.autonomy.registry_shape",
     "breezy.persistence.autonomy.demand",
     "breezy.persistence.autonomy.drill_marker",
+    "breezy.persistence.autonomy.hwm",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -257,7 +259,8 @@ allow_indirect_imports = false
 name = "ARCH-0 autonomy (c): autonomy core modules outside PYARROW_REACHING never reach pyarrow"
 type = "forbidden"
 # Contract (b)'s list minus PYARROW_REACHING = {label_schema, family_bytes, registry_store,
-# replay, resolver}.
+# registry_export, replay, resolver}. `registry_export` (6f) reads the store's DDL constants and
+# row decoder, so it reaches pyarrow through `registry_store` and is absent from this list.
 source_modules = [
     "breezy.persistence.autonomy.canonical",
     "breezy.persistence.autonomy.wire",
@@ -281,6 +284,7 @@ source_modules = [
     "breezy.persistence.autonomy.registry_shape",
     "breezy.persistence.autonomy.demand",
     "breezy.persistence.autonomy.drill_marker",
+    "breezy.persistence.autonomy.hwm",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false

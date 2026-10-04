@@ -23,7 +23,14 @@ NAUTILUS_PERMITTED: Final[frozenset[str]] = frozenset()
 #: Core modules that may reach pyarrow, hence absent from contract (c) (AC 1).
 PYARROW_REACHING: Final[frozenset[str]] = frozenset(
     f"{AUTONOMY_PACKAGE}.{m}"
-    for m in ("label_schema", "family_bytes", "registry_store", "replay", "resolver")
+    for m in (
+        "label_schema",
+        "family_bytes",
+        "registry_store",
+        "registry_export",
+        "replay",
+        "resolver",
+    )
 )
 
 
@@ -70,7 +77,14 @@ def test_contracts_b_and_c_list_existing_modules_only_never_the_package() -> Non
     c = by_forbidden[("pyarrow",)]
     assert set(c["source_modules"]) == set(b["source_modules"]) - {
         f"{AUTONOMY_PACKAGE}.{m}"
-        for m in ("label_schema", "family_bytes", "registry_store", "replay", "resolver")
+        for m in (
+            "label_schema",
+            "family_bytes",
+            "registry_store",
+            "registry_export",
+            "replay",
+            "resolver",
+        )
     }
     assert {f"{AUTONOMY_PACKAGE}.canonical", f"{AUTONOMY_PACKAGE}.wire"} <= set(b["source_modules"])
 

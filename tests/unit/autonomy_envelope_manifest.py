@@ -178,6 +178,9 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
         "tests/unit/test_autonomy_verdict.py::test_differing_body_same_id_refused",
         "tests/unit/test_entry_guard.py::test_entry_guard_unreadable_index_vetoes",
         "tests/unit/test_entry_guard.py::test_rung_net_position_veto_crosses_legs_and_families[double]",
+        "tests/unit/test_registry_export.py::test_registry_readonly_open_engine_stopped",
+        "tests/unit/test_registry_hwm.py::test_autonomy_exec_keys_disjoint_from_halt_prefixes",
+        "tests/unit/test_registry_hwm.py::test_registry_hwm_refuses_regression",
         "tests/unit/test_registry_store.py::test_registry_cas_and_idempotent_replay",
         "tests/unit/test_registry_store.py::test_registry_hash_chain_and_triggers",
         "tests/unit/test_registry_store.py::test_registry_transition_table_is_exact",
@@ -189,7 +192,6 @@ ENVELOPE_NODE_IDS: Final[frozenset[str]] = frozenset(
 
 ENVELOPE_PENDING_NAMES: Final[frozenset[str]] = frozenset(
     {
-        "test_autonomy_exec_keys_disjoint_from_halt_prefixes",
         "test_bootstrap_seed_genesis_only",
         "test_candidate_cap_and_mint_rate",
         "test_child_d0_and_trial_prefix_pinned",
@@ -209,9 +211,7 @@ ENVELOPE_PENDING_NAMES: Final[frozenset[str]] = frozenset(
         "test_infra_cause_never_retires",
         "test_lineage_policy_allowlist_is_literal_only",
         "test_mint_unlimited_by_k_max_but_one_per_day",
-        "test_registry_hwm_refuses_regression",
         "test_registry_paths_refuse_symlinks",
-        "test_registry_readonly_open_engine_stopped",
         "test_resolver_binds_bytes_to_row",
         "test_resume_not_subject_to_d0_rule",
         "test_resume_refused_while_swap_pending",

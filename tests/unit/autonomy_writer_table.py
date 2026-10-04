@@ -112,6 +112,12 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
         "owns registry.sqlite under registry/engine.lock (seam 6e)",
     ),
     WriteSiteRule(
+        "breezy.persistence.autonomy.registry_export",
+        "RegistryReader._connect",
+        "the reader's one sqlite3.connect: mode=ro, query_only; export files are written only "
+        "through single_read.write_once_tmpfile, so write_export holds no site (seam 6f)",
+    ),
+    WriteSiteRule(
         "breezy.persistence.live_orders_gate",
         "_verify_ruling_file",
         "the one named exemption: a move-only extraction (AC 7; not yet landed)",
