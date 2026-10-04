@@ -271,3 +271,94 @@ Method deviation, ruled up front: transient `systemd-run --user --unit=claude-au
   - **(L3)** `FollowUp.__post_init__` validates `reason` against the closed set: `VetoReason` values plus the `REASON_*` constants.
   - **(L4)** `REASON_COPY_SITES` pins the receiver name too (`decision`, `outcome`), not only the function. A planted control uses another name at the same site.
   - **WP7 note:** test the linkage between a tag and the Take record it refers to. Today the guard checks tag format only, per §3.6.2.
+- **WP4-R3 (python review of a77a8f85, REQUEST_CHANGES; no HIGH).**
+  - **(M1)** The heal record is written through seam A's `single_read.write_once` (dir-fd anchored, temp + link, no overwrite, nofollow). Do not hand-roll the open. Before writing, check that `evidence_root` resolves under the data root. Test: a symlinked heal day-dir is refused.
+  - **(M2)** `_record_heal` and the offer run via `loop.run_in_executor`. No filesystem I/O happens on the live node's event loop.
+  - **(M3, ruled)** Without `alert_offer`, a missed cycle logs CRITICAL once. That is the intended visibility fallback (WP4-R2), so it stays. "Unchanged" means construction and the timer set are unchanged, not that logging is.
+  - **(L4)** Mark the cycle alerted before the offer, so an undelivered alert is counted (`cycle_missed_undelivered`) and not retried, consistent with §3.7.2 once-per-cycle. Bound `_missed_alerted` to a rolling 8-day window.
+  - **(L5)** Docstring note: `_pending_heal` keeps the first hang, and later resets are absorbed.
+  - **(L6)** Add the test that `_poll_in_flight` is cleared before the re-submitted poll runs.
+  - **(L8)** Add the symlinked heal-dir test (covered by M1).
+- **WP5-R1 (WP5-A STOP on X1, resolved).**
+  - `tests/unit/autonomy/test_exec_intent_parity.py` must import `exec.client` and `exec.submit_chain` (plan-named tests), which brings it inside X1's `==` set.
+  - **Authorised:** one X1 row, "WIDENED, not relaxed", per the guard's precedent. The file has no `SOCKET_RESTORING_MARKERS`, builds no client and opens no socket.
+  - **Rejected:** loading the modules by `importlib` string to avoid the scan; that routes around the guard.
+- **WP4-R3 applied (2608599c).**
+  - RED: 3 new tests.
+  - Mutations: M1 and M2 both killed by the loop-thread/`write_once` spy. The symlink test is backed by `ensure_dir` independently.
+  - Accepted: `evidence_root` must be absolute and symlink-free, and `write_once` confines writes to it.
+  - Watch item: `_drain_slow` yields real time because the heal runs in a thread executor, which is a flake risk under load.
+  - WP4 stays unmerged until WP8's train.
+- **WP5-R2 (WP5-B settlement, 7f6c4caa).**
+  - **Result.** 35 tests. 16 of 17 mutants killed; the survivor is equivalent. A real-data dry run read 5 stations × 7 days into a scratch directory and created nothing in the catalog.
+  - **Accepted deviations.**
+    - A sixth record field, `ts_ns` (= the catalog `retrieved_at_ns`). Readers take the greatest `ts_ns`, as in r8.
+    - The lock is an in-process flock at `<decisions_dir>/.capture_settlement.lock`, because only `<decisions_dir>` is bound. The unit's `flock -w 30` stays in front of it.
+    - A preliminary or empty day is "pending": nothing is written and no alert is raised, because the audit's 48 h check is the backstop.
+    - A day is rewritten through `single_read.replace_atomic`, preserving the existing bytes.
+  - **Stage-3 obligations.**
+    - The settlement sandbox row adds a read-only bind of the catalog base (`catalog/<venue>`). r12 §3.12's bind list omitted it. No network egress.
+    - The settlement unit gets `MemoryMax=512M`; the measured peak RSS was about 299 MB, against r12's 256M. Amend §3.13.
+    - The closure test must confirm the CLI imports no `breezy.adapters.*` module through `open_station_catalog`.
+    - WP8 injects the real AUT-6 outbox. Until then the default offer logs to stderr and returns False, so an error exits 1.
+- **WP5-R3 (WP5-C node-log parser, 95006b3f).**
+  - **Result.** 50 tests, 10 of 10 mutations killed.
+  - **Real-log run.** Run under `MemoryMax=1G` and the studies flock. Input was 2.3 GB / 6.65M lines; it took 274 s with peak RSS 17.7 MB. It found 0 unparseable lines, 9 of 9 Take/TrySubmit pairs, and 9 of 9 real launch events matched.
+  - **Accepted deviations.**
+    - The spawn-to-log match is bounded: from 30 s before to 300 s after (`LOG_STAMP_EARLY_SLACK_S`, `LOG_STAMP_MAX_LAG_S`). Without a bound, a deleted log could be hidden by borrowing a later one.
+    - Hand-launched or adopted logs with no event are reported as `unmatched_logs` and are not an error.
+    - A torn tail is always reported.
+    - An unknown decision `kind` is counted as unparseable, so the run fails loud.
+    - r12 line 86 premise text is updated per WP0-R7.
+  - **Stage-2 obligations.**
+    - The audit parses the `CAPTURE_REFUSED`, `OrderSubmitted`/`OrderDenied` and `NBP_CYCLE_MISSED` lines.
+    - Older-build logs (e.g. `20261002T200526Z`) contain byte-identical duplicate `SHADOW_DECISION` lines, so R2's replay must tolerate or count them.
+- **WP5 stage-1 integration.**
+  - Branch `backlog/aut1-wp5a-2026-10-04` at 69edfc5c, made by cherry-picking WP5-B and WP5-C onto WP5-A with no conflicts. Both `AUT1_WRITE_AUTHORITY` rows are verified.
+  - Under the full gate plus SEC and python review.
+- **WP5-R4: SEC and python review of the stage-1 integration (b797c911..69edfc5c).**
+  - **Verdicts.** Both REQUEST_CHANGES. The live path (the exec_intent move) is CLEAN: identical object, client sha unchanged, X1 legitimate. All findings are adopted.
+  - **Parser crash and fail-open fixes.**
+    - **(SEC H1)** `_decision_fields` also catches `TypeError` and `OverflowError`, so the line counts as unparseable and the parse never aborts. Test per probe: `{[]: 1}`, `{{1}: 2}`.
+    - **(SEC H2 + py L8 + SEC M3)** A supervisor timestamp that fails `strptime` counts as `bad_fields`. A log filename whose stamp fails `strptime` is reported by `list_node_logs` as an `invalid_log_name` finding and skipped. Neither raises.
+    - **(py M2 + SEC L7)** Failure vs decision is decided by whether the message starts with `SHADOW_DECISION `. A writer-failure marker anywhere else always counts. This fixes the R4 fail-open.
+    - **(py M1)** `last_line_ts_ns` is taken from the last timestamped line only. Test: a traceback tail.
+    - **(SEC M5)** An overlong line also scans its drained remainder for markers. Every overlong line is counted as `line_too_long`.
+    - **(SEC L6)** `entries`, `fills` and `instance_ids` are capped like the other lists, with exact totals.
+    - **(SEC L8)** A timestamped `DISPOSED` line that fails `_LINE_RE` is counted.
+  - **Spawn matching.** SEC M4 is adopted over py L9's "accepted bound", because it is stricter.
+    - Per-kind windows: pre-spawn events (`relaunching`, `midday_relaunching`) take a stamp in [ts, ts+lag]. Post-spawn events (`launched`, `boot_retry_launched`) take one in [ts−30 s, ts+5 s].
+    - Pick the nearest unused stamp, not the first.
+    - A leftover log inside any event's window is a warning finding.
+    - Events are sorted by `(ts, line_no)`.
+    - Docstring: a raising relaunch spawn (`trade_supervisor.py:1380`) reads as `node_log_missing`, which is correct.
+  - **Duplicates (py M3).**
+    - `DecisionLine.digest` is blake2b-8 of the raw line. Byte-identical repeats are tracked per `log_ts_ns`, so memory is bounded.
+    - Expose `duplicate_decision_count`, `evaluation_count_deduped` and `dedupe_decisions(iter)`.
+    - Whether a duplicate is a FAIL or a tolerated count is the audit's ruling, not the parser's.
+  - **Two-pass contract (py M4).** `scan_node_log` takes `keep_kinds: frozenset[str]`, so R1/R2 get every decision kind in one pass.
+  - **Settlement.**
+    - **(py M5)** A final record with null `tmax` raises `SettlementTruthMissing(SettlementError)` → `CAPTURE_SETTLEMENT_ERROR`.
+    - **(SEC L9 + py L13, L14)** Validate `open_root(decisions_dir)` before taking the lock. `main` catches a missing dir and `UnknownVenueBasis` and reports them. `--venue choices=sorted(VENUE_BASIS)`. `_parse_existing` type-checks fields and rejects duplicate keys.
+  - **Size (py M6).** Split `capture_node_log.py` into a facade plus `_io`, `_decisions` and `_spawns`. Public names are unchanged.
+  - **Hygiene (py L7, L10, L11).** Export the cause and kind constants and `InstanceIdLine`. No `assert` in production code. `scan_node_log` counts move to a dataclass.
+  - **Settlement import closure (SEC INFO).** Importing `nautilus_trader.*` via `persistence.catalog` is accepted. The stage-3 sandbox row's interpreter and venv bind must cover it, which it does because the venv is bound. There are no `breezy.adapters.*` imports.
+- **WP5-R4 applied (1c4c7f5a).**
+  - RED: 38 tests. All 11 mutations killed.
+  - Real-log run: 274 s, peak RSS 20 MB.
+  - Modules are each ≤ 684 lines.
+  - No edits to live strategy/app/runtime.
+  - **Accepted:**
+    - the pre-spawn window gets 1 s of early tolerance (`PRE_SPAWN_EARLY_S`), because both stamps truncate to whole seconds;
+    - the duplicate digest is over the message, per `now_ns`, because the twins differ in their log timestamp.
+  - **Process slip:** the agent ran `ruff format src` again. The stray files, including the exec client, were restored and I re-verified the sha. This is the third occurrence; the memory note already covers it.
+- **OPEN (live-relevance check).** About 49% of `SHADOW_DECISION` lines in the live build are byte-identical twins, about 100 µs apart. A read-only investigation is running to decide whether this is a logging artefact or a double evaluation. Until it reports, stage-2 R2/R3 dedupe through `dedupe_decisions`, and the audit counts duplicates without failing on them.
+- **WP5-R5 (duplicate decision lines: diagnosed as double evaluation, benign today).**
+  - **Cause.** Each FQ rung subscribes to quote ticks AND order-book depth (`strategy.py:371-372`, `:380-381`). `on_quote_tick` (`:731`) and `on_order_book_depth` (`:713`) both evaluate the same frame (same `ts_event`). Logging is single-sink, so this is not a logging artefact.
+  - **Safety.** Takes, submits and fills are NOT duplicated: in 10-03 there are 7 Take, 7 TrySubmit, 7 `OrderInitialized` and 7 unique client order ids. The second evaluation of a Take refuses on `already_latched`. The latch is the protection that holds today.
+  - **Cost.** The FQ decision funnel (`shadow_decision_sink`, `:578-580`) and every refusal rate counted from it are inflated about 2× for Refuse reasons.
+  - **Ruling.**
+    - (1) The WP0-R7b premise stands as "one decision line per evaluation". There are simply two evaluations per frame.
+    - (2) The AUT-1 audit dedupes per `(message, now_ns)` via `dedupe_decisions` for R2/R3, and reports the duplicate count as INFO, not FAIL.
+    - (3) Fix owner is AUT-1 WP7, which edits the live FQ strategy anyway (hooks, re-base on the guard). Evaluate once per frame: depth is the required trigger, so drop the quote-tick evaluation or dedupe on `(instrument, ts_event)`. TDD, re-baseline the funnel counts, and merge outside the launch window.
+    - (4) AUT-1 WP6 / AUT-4 (the 38-vs-35 attribution) must account for the ~2× refusal inflation in any funnel-derived count.
