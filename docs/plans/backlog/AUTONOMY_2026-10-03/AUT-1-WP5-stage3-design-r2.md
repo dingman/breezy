@@ -533,3 +533,43 @@ Key paths:
   - Add the mutants M-SEV2 (ABANDONED → INFO, and an unknown event not raising), M-ANSI and M-STALECLOCK.
   - `test_delivery_send_accepts_prefixed_events` asserts `failed == 0` and that `offer` was called. F8's wording is corrected: the `KeyError` is caught and counted as a failure.
   - RC-2 addendum: a forced edit over +6 lines pulls the file split forward. The limit is never relaxed.
+
+## Round-3 convergence resolution (coordinator, 2026-10-04; ARCH and python REQUEST_CHANGES on doc-level contradictions only, convergent; binding)
+- **S3-R41, the deadline carrier** (amends S3-R24 and S3-R25).
+  - `_main` sets the single ContextVar `DEADLINE` once. `run_audit` takes NO deadline parameter and only reads `DEADLINE`. The forced edit at `test_capture_audit.py:571` drives `DEADLINE` directly.
+  - Heal receives a local bound, `heal_deadline = min(MONOTONIC() + HEAL_BUDGET_S, DEADLINE.get())`, passed into `run_heal_duty`. Heal never writes `DEADLINE`. A `ScanDeadline` raised inside heal, or a run past `heal_deadline`, is a duty FAILURE: exit 1.
+  - Once-per-run duties, such as `_check_settlements` (currently `capture_audit.py:679`), move into `_main`. `_main` owns their `_Delivery`, and their `failed` count is folded into the exit code.
+  - The family loop runs to `DEADLINE − DUTY_RESERVE_S (60)`, so the once-per-run duties keep their own reserve. A duty that hits `DEADLINE` is a failure.
+- **S3-R42, the heal budget.**
+  - `HEAL_BUDGET_S = 180`, frozen in 3a.
+  - A pin test checks `HEAL_JOURNAL_DAYS × JOURNAL_TIMEOUT_S (90) + 30 ≤ HEAL_BUDGET_S ≤ AUDIT_EXEC_TIMEOUT_S − 60 − 600`.
+  - 3a owns `AUDIT_EXEC_TIMEOUT_S = 1475`.
+- **S3-R43, the stub pin union** (amends S3-R28). 3a writes `REAL_MODULES = frozenset({fill_legs}) | W2_REAL | S1_REAL | S2_REAL` now. Each stream adds its own modules to its own line. 3c only verifies.
+- **S3-R44, the `capture_audit_io` surface** (amends S3-R30).
+  - 3a moves `list_names` from `W3_PINNED[inputs]` to a new `W3_PINNED[capture_audit_io] = {list_names, read_file}`.
+  - `list_names` is added to `W3_REEXPORTED`.
+  - A new `AuthorityRow("breezy.analysis.capture_audit_io", min_calls=…)`.
+  - `capture_audit_inputs.py` and `test_capture_audit_stubs.py` join 3a's EDIT set.
+  - 3a measures `inputs` `ast.Call` sites before and after. The `RAISED_FLOORS` 250 is never lowered; if a move would breach it, STOP.
+- **S3-R45, E-9 restated.**
+  - Rule: the pre-lines' T+K (via `start_phase_bound_s`, M35) plus ExecStart's own K+T must be ≤ `TimeoutStartSec`.
+  - Audit: pre lines 5 + 5 + 10 = 20, ExecStart `timeout -k 5 1475`. Latest end is 14:16:00 (it is 14:16:05 under the merged lint's per-command re-arm reading). Live-proof `OnSuccess` ends by 14:21:05 to 14:21:10. Recompute the other units the same way.
+  - Tests pin `TimeoutStartSec`, the `timeout` value, the pre-line sum and their relation.
+  - AC11 and M-840 use 1475. The `1500−600−60 = 840` pin stays; the effective budget is the `min()`.
+- **S3-R46, zero-family runs** (amends AC5 and V5).
+  - A run with no family still runs heal; only the per-family work and the settlement duty are skipped.
+  - It exits 0 only if the lock and the journal are readable.
+  - No heal write happens without a stall record.
+  - V5 runs in a quiet window.
+- **S3-R47, deletions and additions to the test and mutant lists.**
+  - DELETE: `test_heal_below_floor_defers_without_failure`, M-FLOOR, AC15's deferral clause, and every "after the family loop" or "defers below the floor" wording.
+  - ADD tests:
+    - `test_heal_overrun_exits_one` (3c);
+    - `test_heal_runs_before_family_loop`;
+    - `test_heal_runs_with_zero_families`;
+    - `test_n_families_one_settlement_missing`;
+    - `test_clock_reread_after_lock`;
+    - `test_zero_size_feather_is_not_growth`.
+  - ADD mutants: M-SILENT, M-HEALLAST, M-ZEROFAM, M-ONCE.
+  - Rename `test_gap_sent_first_run…`, because a gap is first sent on the run AFTER the audit that recorded it.
+- **Convergence.** Three rounds have run, and all remaining items are doc-level and convergent. Next, a code-architect consolidates r2 plus S3-R24..R47 into a single build spec, r3, with no new decisions. Building follows r3.
