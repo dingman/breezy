@@ -53,8 +53,8 @@ _NS_PER_SECOND: Final[int] = 1_000_000_000
 
 
 def utc_day_for_ns(now_ns: int) -> date:
-    """The UTC calendar day containing ``now_ns``: a restated copy of the adapter's
-    ``operator_controls.utc_day_for_ns`` (V-15; the adapter module cannot be imported here).
+    """The UTC calendar day containing ``now_ns``: a restated copy of
+    the adapter's own UTC-day helper (V-15; the adapter module cannot be imported here).
 
     The audit's leg I derives the ``fill_by_fingerprint/<day>:<fp>`` key with this, from the
     intent's ``created_ns`` (``exec/client.py`` passes ``intent_created_ns``), and the day index
