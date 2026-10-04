@@ -247,3 +247,79 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - **Not adopted:** `--clearenv`, because consumer units pass config via `Environment=`.
   - **Deferred:** `--unshare-net`. Network policy is per consumer row; see erratum E-15.
 - **B6-R9 (LOW).** The wrapper's `main` maps any unexpected exception to reason `internal`, exit 78, with no traceback or path.
+
+### Build-time rulings (seam A 4a review, 98c8458c)
+- **A4-R1 (HIGH).** The judged-file set uses A6-R2's "a component starting with `autonomy`" under `src/breezy/`, not an exact component match.
+- **A4-R2 (HIGH).** The one-writer scan resolves aliases for every tracked writer module. It flags attribute references (not only calls), `getattr`/`__import__`/star imports, `os.write`/`pwrite`/`fdopen` (non-read mode), `copy_file_range`, `sqlite3.connect`, `logging.FileHandler`, and `subprocess`. It fails closed on `open(**kw)` and non-literal `Path.open` modes. `json`/`pickle.dump` to a passed fp stays out of scope: the opener is the write site.
+- **A4-R3.** The one-writer gate must not go red when `registry_store` lands (6e).
+- **A4-R4.** `ensure_dir` is owned by seam 6d. The transitional `walk_dirs` `os.mkdir` row carries owner 6d and a strict-xfail retirement stub.
+- **A4-R5.** Known launch-window overlaps are strict-xfail params owned by `coordinator O-1`, per plan r1 l.384 and AUT-6 r15 O-1. They are not a green exemption. The overlapping units are `breezy-quote-tape-ingest-frequent` (`*:0/15`, `TimeoutStartSec=1800`) and `breezy-discovery-pull` (16:52, 1800 s). Drop-ins are read. The coordinator owns the reschedule as a separate deploy change.
+- **A4-R6.** A strict-xfail `test_envelope_pending_names_empty` is owned by 8d. Every `BLOCKS_KINDS_FLOOR` key needs a ledger row.
+- **A4-R7 (LOW).** Drop the `_publish_by_link` row. Add a floor header note. Share one collect-only run.
+
+### Build-time rulings (seam B2b-3 build)
+- **B7-R1.** AC-2 step order stays as written: env-row check, then the degraded check. The wrapper's degraded exec (`_exec_degraded`) also sets `BREEZY_AUTONOMY_BWRAP_ROW=<row>`, so a genuine notifier-fallback run reports `degraded` rather than `env_row`. This change lands in WP-B2c. It is dormant until then, while `NOTIFIER_FALLBACK_ROWS` is empty.
+- **B7-A1 (accepted deviations).**
+  - `self_probe_plan` lives in `self_probe.py`.
+  - The probe derives its `/run` allowlist itself, because `CREDENTIALS_DIRECTORY` is unset in the sandbox (B6-R8).
+  - The phase-2 harness passes `PYTHONPATH` via `/usr/bin/env` inside the sandbox, because B6-R8 strips `PYTHON*` from the wrapper environment. Consumer phase-2 tests do the same.
+  - The registry-count test sums the per-file collect counts and still requires equality.
+  - V12 (real notify delivery) stays manual, because `socket` is a denied import in phase 2.
+
+### Coordinator O-1 (launch-window overlaps found by seam A 4a)
+- **O1-R1.** `breezy-quote-tape-ingest-frequent.timer` drops its 16:30, 16:45 and 17:00 firings, and `breezy-quote-tape-ingest.service` sets `TimeoutStartSec=780` (the 600 s deadline plus the 180 s tail). The 16:15 worst case is 16:15 + 780 + 90 = 16:28. Neither the node launch nor KILL coverage reads the ingest catalog, so a 60-minute catalog lag is free. Its 4a `known_overlap` param flips to pass.
+- **O1-R2.** `breezy-discovery-pull` (16:52, AUD-02 evidence) has been failing on timeout since 10-02. The cause is inferred as a byte-0 read of about 2.5 GB of node logs in a 256M cgroup, and it is being fixed TDD-first. Its launch-window status stays a strict-xfail owned by O-1 until a separate decision on adding a launch-path row to the ARCH §5.2 table. That decision also has to reconcile the window-end readings: 17:00 (E-V6), 17:05 SELF_CHECK, or 17:10.
+
+### Build-time rulings (seam A 5a ARCH review, 52d2e5e0)
+- **A5-R1 (M-1).** The WP-5 STOP condition ("a non-integer JSON number in C4") means a JSON *float* only. ARCH non-integer quantities (`power`, `mde`, `eta_to_verdict_days`, `alpha_spent`, `alpha_k`, decimal `metrics`, `runtime_s`, `own_outcome_max_abs_delta_p`) are canonical `decimal_str` strings (prec-38). That is the only encoding consistent with AC 5's no-float parse. Producers AUT-3, AUT-4, AUT-5 and AUT-6 write strings and never floats.
+- **A5-R2 (H-1).** A verdict `metrics` value is one of:
+  - a canonical decimal string;
+  - a text string (closed character set `[A-Za-z0-9_:.()=,-]`, ≤ 128 characters);
+  - a bool;
+  - null.
+  Names remain sorted and unique. This covers `day_status=NO_INPUT`, `unknown_reason`, `cause_class`, `exec_snapshot_advisory`, `nomination_transition_id`, a null `statistic`, and `INCONCLUSIVE(...)` reasons.
+- **A5-R3 (H-2).** Verdict `inputs` are ordered and unique by `(path_role, sha256)`. Several inputs may share a role, for example one `refit_run` per model class, or several `tape_snapshot` inputs.
+- **A5-R4 (H-3).** Lineage reasons:
+  - `NO_CHANGE` reasons form the closed set {`below_delta`, `existing_sha`}.
+  - The reason regex is `\A[a-z0-9_]{1,64}(:[0-9a-f]{64})?\Z`, which admits `engine_refused:<sha256>`.
+- **A5-R5 (LOW).** The following are adopted:
+  - full-length shas only;
+  - structural `train_end_exclusive_utc <= forward_eval_start_utc`;
+  - refuse `valid_until_ns < produced_at_ns`;
+  - `own_outcome_gate_decisions_changed` is null exactly when `own_outcome_label_set_sha256` is null;
+  - `params` frozen on construction;
+  - refuse a non-null `policy_ruling_sha256` combined with the `no_policy_ruling` assumption.
+- **A5-R6.** Plan r5 l.671 is read with the dependency list at l.823: `lineage` may import `wire`, `canonical`, `single_read`, `paths` and `pins`.
+
+### Build-time rulings (seam A 5b ARCH/security review, 3081a8fa)
+- **A5b-R1 (H1).** Demand slots are counted per writer class.
+  - The engine's (family, reason) slot counts only engine-written files.
+  - A producer's slot counts only producer files.
+  - A standing producer `integrity_floor` file never blocks an engine write.
+- **A5b-R2 (M1).** The engine is never refused for count. An engine write past `DEMAND_FILES_MAX` is made anyway; the resulting venue veto is the restrictive outcome. Producers keep `SLOTS_FULL`.
+- **A5b-R3 (M2).** Demand writers are not serialised: AUT-5 r7:1272 has no lock, and the producer runs under its own lock. The invariant is "every interleaving ends restrictive", pinned by a two-writer interleaving test.
+- **A5b-R4 (M3).** The AUT-6 r15 AC1 `O_TMPFILE` publish requirement is an ARCH-0 obligation, because ARCH-0 owns the only `registry/demand/` writer.
+  - `single_read` gains an `O_TMPFILE` + `linkat` + directory-fsync publish path.
+  - On an unsupported filesystem it refuses with a distinct reason; the caller maps that to CRITICAL / exit 3.
+  - Demand writes use this path.
+  - The reader's `.tmp.` listing exception is withdrawn (r15:2076). Any non-conforming name in `registry/demand/` is a venue veto.
+- **A5b-R5 (LOW, all adopted).**
+  - A `stops(family_id)` helper that honours `venue_veto`.
+  - Journal `head_matches(chain, head)`, plus docstrings stating that empty-vs-external-head is a mismatch and that restrictive writes are never gated on a journal append.
+  - Drill marker read returns the raw-bytes sha256, and `fstat` errors become `MarkerError`.
+  - The demand writer refuses early when the listing is over cap.
+  - The plan's File-plan dependency cells (l.667, 673, 674) are read with the real imports (`canonical`, `paths`).
+
+### Build-time rulings (seam A 6a ARCH review, 534f8661)
+- **A6a-R1 (H1).** `family_prior_seq` and `expected_prior_seq` are required, with no default. The chain walk tracks the last `venue_seq` per family. It raises `ChainBroken` when `family_prior_seq` does not equal the family's previous `venue_seq` (0 on the family's first row), per ARCH l.417.
+  - **Why:** a wrong value would let a legitimate repeat ATTEST, RESUME or HALT collide on its Y9 id. The store would then silently log it as a no-op.
+- **A6a-R2 (M1).** The chain walk refuses a row whose stored `transition_id` differs from `computed_transition_id()`.
+- **A6a-R3 (M2).** Literal hex goldens freeze `canonical_row` and the Y9 preimage encoding. The self-referential golden is replaced.
+- **A6a-R4 (M3).** Duplicate `cause_verdict_ids` or `voids_transition_ids` are refused with `BAD_VALUE`.
+- **A6a-R5 (LOW).**
+  - `policy_ruling_id` and `policy_ruling_sha256` are both empty or both non-empty. An empty pair is valid for C5, per AUT-5 r7:207; ruling A5-R5 governs C4 only.
+  - A malformed `evidence_journal_heads` pair raises `WireRefused`.
+  - `hwm_from` and `hwm_to` are documented as holding `export_seq`, unless the ARCH W4 or AUT-5a text says otherwise. The implementer verifies this and cites the source.
+  - `compute_transition_id` validates its inputs.
+  - The pattern-equality test also compares flags.
+- **A6a-A1.** `transition_id` lives in `schemas`, and 6b re-exports it under the plan's name `transitions.transition_id`. The local pattern copies in `schemas` follow the plan's import list. Their comment must state that the copies exist because of that list, not because of a contract: `paths` is reachable transitively.
