@@ -115,13 +115,16 @@ def _replace(row: BwrapRow, **changes: Any) -> BwrapRow:
 def test_argv_starts_with_bwrap_then_userns_flags_and_unshare_pid() -> None:
     argv = _argv()
     assert argv[0] == BWRAP_PATH == "/usr/bin/bwrap"
-    assert argv[1:5] == [
+    assert argv[1:8] == [
         "--unshare-user",
         "--disable-userns",
         "--assert-userns-disabled",
         "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
     ]
-    assert argv[5:8] == ["--ro-bind", "/", "/"]
+    assert argv[8:11] == ["--ro-bind", "/", "/"]
 
 
 @pytest.mark.parametrize("row", ALL_ROWS, ids=lambda row: row.name)
@@ -141,6 +144,9 @@ def test_extra_namespace_flags_exact_set() -> None:
         "--disable-userns",
         "--assert-userns-disabled",
         "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
     }
 
 
@@ -305,7 +311,7 @@ def test_credential_env_emitted_as_setenv_after_fixed_env() -> None:
         rebinds=(RunRebind("credentials", dest=cred_dir, fd=70),),
         environ={"CREDENTIALS_DIRECTORY": cred_dir},
     )
-    unset = _at(argv, "--unsetenv", "BREEZY_AUTONOMY_SANDBOX_DEGRADED")
+    unset = _at(argv, "--unsetenv", "CREDENTIALS_DIRECTORY")
     assert argv[unset + 2 : unset + 9] == [
         "--setenv",
         "A_VAR",
@@ -901,3 +907,81 @@ def test_wrapper_script_only_calls_main_with_argv_tail() -> None:
     assert [ast.unparse(node) for node in calls] == ["sys.exit(main(sys.argv[1:]))"]
     imports = [ast.unparse(n) for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
     assert imports == ["import sys", "from breezy.runtime.autonomy_sandbox.bwrap import main"]
+
+
+# ------------------------------------------------- B6-R8: namespaces and environment
+
+
+def _unset_names(argv: list[str]) -> set[str]:
+    return {argv[i + 1] for i, token in enumerate(argv) if token == "--unsetenv"}
+
+
+def test_argv_unshares_ipc_uts_cgroup_after_pid_and_never_net_or_clearenv() -> None:
+    argv = _argv()
+    pid = argv.index("--unshare-pid")
+    assert argv[pid + 1 : pid + 4] == ["--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"]
+    assert "--unshare-net" not in argv and "--clearenv" not in argv
+
+
+HOSTILE_ENV = {
+    "NOTIFY_SOCKET": "/run/user/1000/systemd/notify",
+    "LD_PRELOAD": "/x.so",
+    "LD_LIBRARY_PATH": "/x",
+    "PYTHONSTARTUP": "/s.py",
+    "PYTHONPATH": "/p",
+    "CREDENTIALS_DIRECTORY": "/run/user/1000/credentials/u",
+    "SSL_CERT_FILE": "/c.pem",
+    "GLIBC_TUNABLES": "g",
+    "BASH_ENV": "/b",
+    "PATH": "/usr/bin",
+    "HOME": "/home/u",
+    "KEEP_ME": "1",
+}
+
+
+def test_non_notify_row_unsets_every_hostile_environ_name_present() -> None:
+    argv = _argv(SELFTEST, environ=HOSTILE_ENV)
+    assert _unset_names(argv) == {
+        "BREEZY_AUTONOMY_SANDBOX_DEGRADED",
+        "NOTIFY_SOCKET",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "CREDENTIALS_DIRECTORY",
+        "SSL_CERT_FILE",
+        "GLIBC_TUNABLES",
+        "BASH_ENV",
+    }
+    assert argv.index("--unsetenv") < argv.index("--")
+
+
+def test_notify_row_keeps_notify_socket_but_unsets_the_rest() -> None:
+    names = _unset_names(_argv(NOTIFY, environ=HOSTILE_ENV))
+    assert "NOTIFY_SOCKET" not in names
+    assert {"LD_PRELOAD", "PYTHONSTARTUP", "CREDENTIALS_DIRECTORY"} <= names
+
+
+def test_absent_names_are_not_unset() -> None:
+    assert _unset_names(_argv(SELFTEST, environ={"PATH": "/usr/bin"})) == {
+        "BREEZY_AUTONOMY_SANDBOX_DEGRADED"
+    }
+
+
+# ---------------------------------------------------------- B6-R9: internal errors
+
+
+def test_unexpected_exception_prints_internal_and_exits_78(
+    world: SandboxRoots,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(*_: object, **__: object) -> None:
+        raise RuntimeError("/secret/path leaked")
+
+    monkeypatch.setattr(bwrap, "validate_table", boom)
+    status, spy = _run(["breezy-autonomy-selftest", "/usr/bin/true"], world, tmp_path)
+    err = capsys.readouterr().err
+    assert status == 78 and not spy.calls
+    assert "internal" in err and "/secret" not in err and "Traceback" not in err

@@ -57,7 +57,20 @@ BUS_SNAPSHOT_OUTER_MARGIN_S: Final = 3
 _SERVICE: Final = ".service"
 _TEMPLATE_SUFFIX: Final = "@.service"
 _EXEC_PREFIX_CHARS: Final = "@-:+!|"
-_FORBIDDEN_PREFIX_CHARS: Final = "+!"
+_FORBIDDEN_EXEC_KEYS: Final = ("ExecStop", "ExecReload", "ExecCondition")
+_ALL_EXEC_KEYS: Final = frozenset(
+    {
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecStop",
+        "ExecStopPost",
+        "ExecReload",
+        "ExecCondition",
+    }
+)
+_SERVICE_DROPIN_DIR: Final = ".service.d"
+_TOP_LEVEL_DROPIN_DIR: Final = "service.d"
 _DURATION_RE: Final = re.compile(r"\d+(?:\.\d+)?[smhd]?")
 _FLOCK_FLAGS: Final = frozenset({"-n", "-x", "-s"})
 _FORM1_COMMANDS: Final = {"/usr/bin/install": "-d", "/usr/bin/chmod": None}
@@ -228,9 +241,12 @@ def start_phase_bound_s(unit_path: Path) -> int:
 
 
 def _entry(unit_name: str) -> str:
-    """The row-``units`` spelling of a unit file name (``name@.service`` -> ``name@``)."""
-    if unit_name.endswith(_TEMPLATE_SUFFIX):
-        return unit_name[: -len(_SERVICE)]
+    """The row-``units`` spelling of a unit file name.
+
+    ``name@.service`` and the instance file ``name@x.service`` both give ``name@`` (B6-R6).
+    """
+    if "@" in unit_name and unit_name.endswith(_SERVICE):
+        return unit_name.split("@", 1)[0] + "@"
     return unit_name
 
 
@@ -297,13 +313,15 @@ def _check_exec_line(
 ) -> list[LintError]:
     if wrapper_lines_only and WRAPPER_PATH not in line:
         return []
+    errors: list[LintError] = []
+    if ";" in line:
+        errors.append(_err(unit, "exec_semicolon", "an Exec line may not contain ';' (B6-R5)"))
     try:
         prefix, tokens = _split(line)
     except ValueError:
-        return [_err(unit, "not_wrapped", "an Exec line could not be parsed")]
-    errors: list[LintError] = []
-    if any(char in _FORBIDDEN_PREFIX_CHARS for char in prefix):
-        errors.append(_err(unit, "exec_prefix", "a wrapped line may not carry a + or ! prefix"))
+        return errors + [_err(unit, "not_wrapped", "an Exec line could not be parsed")]
+    if prefix:
+        errors.append(_err(unit, "exec_prefix", "ExecStart/ExecStopPost allow no prefix (B6-R7)"))
     return errors + _check_wrapped_tokens(unit, tokens, rows)
 
 
@@ -340,12 +358,24 @@ def _classify_pre(line: str) -> str:
     return "install" if _is_form1(tokens, line) else "other"
 
 
+def _pre_hygiene_errors(unit: str, lines: Sequence[str], exact: set[str]) -> list[LintError]:
+    """``;`` anywhere is red; a prefix character is red unless the line is an exact ``-`` form."""
+    errors: list[LintError] = []
+    for line in lines:
+        if ";" in line:
+            errors.append(_err(unit, "exec_semicolon", "an Exec line may not contain ';' (B6-R5)"))
+        if line[:1] in _EXEC_PREFIX_CHARS and " ".join(line.split()) not in exact:
+            errors.append(_err(unit, "exec_prefix", "ExecStartPre allows only the exact - forms"))
+    return errors
+
+
 def _check_pre_lines(
     unit: str, lines: Sequence[str], rows: Sequence[BwrapRow], start_s: float | None
 ) -> list[LintError]:
     errors: list[LintError] = []
     kinds = [_classify_pre(line) for line in lines]
     wanted_snapshots = [" ".join(_snapshot_line(r).split()) for r in rows if r.bus_reads]
+    errors += _pre_hygiene_errors(unit, lines, {TOUCH_LINE, *wanted_snapshots})
     for kind in kinds:
         if kind == "other":
             errors.append(_err(unit, "pre_form", "ExecStartPre is not a permitted form"))
@@ -453,6 +483,9 @@ def _lint_full(
         errors += _check_exec_line(unit, line, rows_by_name, wrapper_lines_only=False)
     if file.values("Service", "ExecStartPost"):
         errors.append(_err(unit, "execstartpost", "an owned unit may not carry ExecStartPost="))
+    for key in _FORBIDDEN_EXEC_KEYS:
+        if file.values("Service", key):
+            errors.append(_err(unit, "exec_directive_forbidden", f"{key}= is not allowed"))
     errors += _check_onfailure(unit, file, scope_entries)
     errors += _check_row_directives(unit, file, own_rows)
     start_s = _timeout_start_s_checked(file, unit, errors)
@@ -478,6 +511,8 @@ def _lint_wrapper_lines_only(
     own_rows = [row for row in rows_by_name.values() if _lists(row, unit)]
     wanted = [" ".join(_snapshot_line(r).split()) for r in own_rows if r.bus_reads]
     for line in file.values("Service", "ExecStartPre"):
+        if WRAPPER_PATH in line and ";" in line:
+            errors.append(_err(unit, "exec_semicolon", "an Exec line may not contain ';' (B6-R5)"))
         if WRAPPER_PATH in line and " ".join(line.split()) not in wanted:
             errors.append(
                 _err(unit, "pre_snapshot", "the bus-snapshot pre line is not the exact form")
@@ -514,6 +549,7 @@ def lint_units(
         errors += _lint_one(
             unit_dir, unit, table, (owned, residual, line_only), row_entries, scope_entries
         )
+    errors += _dropin_exec_errors(unit_dir, scope_entries | line_only)
     for unit in sorted(owned_units):
         if not _unit_text_files(unit_dir, _file_name(unit)):
             errors.append(_err(unit, "owned_no_file", "an owned unit has no unit file"))
@@ -523,6 +559,41 @@ def lint_units(
                 _err(timer.name, "timer_names_wrapper", "a timer may not name the wrapper")
             )
     return tuple(errors)
+
+
+def _dropin_applies(dirname: str, scope_entries: frozenset[str]) -> bool:
+    """Does systemd apply this ``*.service.d`` directory to an in-scope unit? (B6-R6)"""
+    if dirname == _TOP_LEVEL_DROPIN_DIR:
+        return True
+    if not dirname.endswith(_SERVICE_DROPIN_DIR):
+        return False
+    name = dirname[: -len(".d")]
+    if _entry(name) in scope_entries:
+        return True
+    stem = name[: -len(_SERVICE)]
+    if not stem.endswith("-"):
+        return False
+    return any(_file_name(entry).startswith(stem) for entry in scope_entries)
+
+
+def _dropin_exec_errors(unit_dir: Path, scope_entries: frozenset[str]) -> list[LintError]:
+    """Any ``Exec*`` directive in an in-scope drop-in is an error: drop-ins may not run code."""
+    errors: list[LintError] = []
+    candidates = [*unit_dir.glob(f"*{_SERVICE_DROPIN_DIR}"), unit_dir / _TOP_LEVEL_DROPIN_DIR]
+    for directory in sorted(candidates):
+        if not directory.is_dir() or not _dropin_applies(directory.name, scope_entries):
+            continue
+        for conf in sorted(directory.glob("*.conf")):
+            keys = {key for _, key, _ in parse_unit(conf.read_text()).entries}
+            if keys & _ALL_EXEC_KEYS:
+                errors.append(
+                    _err(
+                        f"{directory.name}/{conf.name}",
+                        "drop_in_exec",
+                        "a drop-in on an in-scope unit may not set or reset Exec directives",
+                    )
+                )
+    return errors
 
 
 def _lint_one(

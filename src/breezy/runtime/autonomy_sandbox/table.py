@@ -67,6 +67,15 @@ CREDENTIAL_ENV_DENIED_PREFIXES: Final[tuple[str, ...]] = (
     "BREEZY_AUTONOMY_",
     "SSL_CERT_",
 )
+#: Host environment names the wrapper unsets inside the sandbox when present (B6-R8). PATH,
+#: HOME and TMPDIR are denied as ``credential_env`` keys but must stay usable, so they are not
+#: unset. ``NOTIFY_SOCKET`` is kept only on ``E7A_R2_NOTIFY`` rows.
+SANDBOX_UNSET_EXACT: Final[frozenset[str]] = CREDENTIAL_ENV_DENIED_EXACT - {
+    "PATH",
+    "HOME",
+    "TMPDIR",
+}
+SANDBOX_UNSET_PREFIXES: Final[tuple[str, ...]] = ("SSL_CERT_", "LD_", "PYTHON")
 #: A bus read may never name a property carrying a unit's environment or credentials (B6-R3).
 _SECRET_PROPERTY_MARKERS: Final[tuple[str, ...]] = ("Environment", "Credential")
 _PROPERTY_OPTION_PREFIX: Final = "--property="

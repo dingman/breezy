@@ -48,6 +48,8 @@ from breezy.runtime.autonomy_sandbox.table import (
     MAX_TMPFS_SIZE_BYTES,
     NOTIFIER_FALLBACK_ROWS,
     ROW_NAME_RE,
+    SANDBOX_UNSET_EXACT,
+    SANDBOX_UNSET_PREFIXES,
     BwrapRow,
     SandboxRoots,
     TableError,
@@ -75,6 +77,9 @@ _NAMESPACE_FLAGS: Final = (
     "--disable-userns",
     "--assert-userns-disabled",
     "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--unshare-cgroup-try",
 )
 
 Execv = Callable[[str, list[str]], object]
@@ -170,6 +175,18 @@ def _credential_setenv(row: BwrapRow, environ: Mapping[str, str]) -> list[str]:
     return args
 
 
+def _hostile_unsets(row: BwrapRow, environ: Mapping[str, str]) -> list[str]:
+    """``--unsetenv`` for each denylisted host name present (B6-R8); notify rows keep the socket."""
+    keep = {"NOTIFY_SOCKET"} if "E7A_R2_NOTIFY" in row.exceptions else set()
+    names = sorted(
+        name
+        for name in environ
+        if name not in keep
+        and (name in SANDBOX_UNSET_EXACT or name.startswith(SANDBOX_UNSET_PREFIXES))
+    )
+    return [arg for name in names for arg in ("--unsetenv", name)]
+
+
 def _rebind_args(rebind: RunRebind) -> list[str]:
     if rebind.fd is not None:
         return ["--ro-bind-fd", str(rebind.fd), rebind.dest]
@@ -209,6 +226,7 @@ def build_bwrap_argv(
     argv += ["--chdir", _chdir(row, roots, cwd)]
     argv += ["--setenv", "TMPDIR", "/tmp", "--setenv", "XDG_CACHE_HOME", "/tmp/.cache"]
     argv += ["--setenv", ROW_VAR, row.name, "--unsetenv", DEGRADED_VAR]
+    argv += _hostile_unsets(row, environ)
     argv += _credential_setenv(row, environ)
     return [*argv, "--", *command]
 
@@ -417,5 +435,7 @@ def main(
         status, code = exc.exit_status, exc.code
     except WrapperError as exc:
         status, code = exc.exit_status, exc.code
+    except Exception:  # noqa: BLE001 - the reason code is the whole report, never a traceback
+        status, code = EX_CONFIG, "internal"
     sys.stderr.write(f"{PROGRAM}: refused: {code}\n")
     return status

@@ -66,8 +66,16 @@ RECORDER = BwrapRow(
     entry_modules=("x",),
     resolves_dns=False,
 )
+TPL = BwrapRow(
+    name="breezy-tpl",
+    owner_plan="T",
+    units=frozenset({"breezy-tpl@"}),
+    binds=("cache/tpl",),
+    entry_modules=("x",),
+    resolves_dns=False,
+)
 TABLE: Mapping[str, BwrapRow] = MappingProxyType(
-    {row.name: row for row in (*AUTONOMY_BWRAP_TABLE.values(), PLAIN, FAILED, RECON, RECORDER)}
+    {row.name: row for row in (*AUTONOMY_BWRAP_TABLE.values(), PLAIN, FAILED, RECON, RECORDER, TPL)}
 )
 TOUCH = "-/usr/bin/timeout -k 1 4 /usr/bin/touch %t/breezy-studies.lock"
 INSTALL = "/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/cache"
@@ -177,18 +185,21 @@ def test_every_autonomy_unit_execs_through_wrapper(
     assert "not_wrapped" in _rules(_lint(tmp_path, {**GOOD_FILES, **files}))
 
 
-def test_wrapped_execstoppost_and_clean_dropin_reset_are_accepted(tmp_path: Path) -> None:
+def test_wrapped_execstoppost_is_accepted_but_any_dropin_exec_is_drop_in_exec(
+    tmp_path: Path,
+) -> None:
     files = {
         **GOOD_FILES,
         "breezy-autonomy-t1.service": _unit(
             _exec("breezy-autonomy-t1"),
             stop_post=[_exec("breezy-autonomy-t1", cmd="/usr/bin/false")],
         ),
-        "breezy-autonomy-t1.service.d/reset.conf": "[Service]\nExecStart=\nExecStart="
-        + _exec("breezy-autonomy-t1")
-        + "\n",
     }
     assert _lint(tmp_path, files) == ()
+    files["breezy-autonomy-t1.service.d/reset.conf"] = (
+        "[Service]\nExecStart=\nExecStart=" + _exec("breezy-autonomy-t1") + "\n"
+    )
+    assert "drop_in_exec" in _rules(_lint(tmp_path, files))
 
 
 def test_dropin_directory_for_a_template_unit_is_in_scope(tmp_path: Path) -> None:
@@ -269,8 +280,139 @@ def test_wrapped_lines_have_no_plus_or_bang_prefix(tmp_path: Path, prefix: str) 
     assert "exec_prefix" in _rules(_lint(tmp_path, files))
 
 
-def test_dash_prefix_on_a_wrapped_line_is_allowed(tmp_path: Path) -> None:
-    files = {**GOOD_FILES, "breezy-autonomy-t1.service": _unit("-" + _exec("breezy-autonomy-t1"))}
+@pytest.mark.parametrize("prefix", ["@", "-", ":", "|", "+", "!", "-:", "@-"])
+@pytest.mark.parametrize("where", ["exec_start", "stop_post"])
+def test_execstart_and_execstoppost_allow_no_prefix_character_at_all(
+    tmp_path: Path, prefix: str, where: str
+) -> None:
+    line = prefix + _exec("breezy-autonomy-t1")
+    text = (
+        _unit(line)
+        if where == "exec_start"
+        else _unit(_exec("breezy-autonomy-t1"), stop_post=[line])
+    )
+    files = {**GOOD_FILES, "breezy-autonomy-t1.service": text}
+    assert "exec_prefix" in _rules(_lint(tmp_path, files))
+
+
+@pytest.mark.parametrize("prefix", ["@", ":", "|", "+", "!", "-:", "@-"])
+def test_execstartpre_forbids_every_prefix_but_the_exact_dash_forms(
+    tmp_path: Path, prefix: str
+) -> None:
+    for index, line in enumerate((INSTALL, TOUCH.removeprefix("-"), SNAPSHOT.removeprefix("-"))):
+        row = (
+            "breezy-autonomy-selftest-proc" if line.endswith("lock") else "breezy-autonomy-selftest"
+        )
+        files = _selftest_files([prefix + line], row=row)
+        assert "exec_prefix" in _rules(_lint(tmp_path / f"{index}", files)), line
+    assert "exec_prefix" in _rules(
+        _lint(tmp_path / "dash", _selftest_files(["-" + INSTALL, SNAPSHOT]))
+    )
+
+
+@pytest.mark.parametrize("key", ["ExecStop", "ExecReload", "ExecCondition"])
+def test_other_exec_directives_are_forbidden_on_fully_linted_units(
+    tmp_path: Path, key: str
+) -> None:
+    text = _unit(_exec("breezy-autonomy-t1"), service_lines=[f"{key}=/usr/bin/true"])
+    errors = _lint(tmp_path, {**GOOD_FILES, "breezy-autonomy-t1.service": text})
+    assert "exec_directive_forbidden" in _rules(errors)
+
+
+# ----------------------------------------------------- B6-R5: semicolons
+
+
+@pytest.mark.parametrize("tail", [" ; /bin/evil", " ;/bin/evil", " \\; /bin/evil", " a;b"])
+def test_semicolon_in_a_wrapped_exec_line_is_red(tmp_path: Path, tail: str) -> None:
+    unit = "breezy-autonomy-t1"
+    for index, text in enumerate(
+        (
+            _unit(_exec(unit, cmd="/bin/true" + tail)),
+            _unit(_exec(unit), stop_post=[_exec(unit, cmd="/bin/true" + tail)]),
+        )
+    ):
+        errors = _lint(tmp_path / f"{index}", {**GOOD_FILES, "breezy-autonomy-t1.service": text})
+        assert "exec_semicolon" in _rules(errors)
+
+
+def test_semicolon_in_an_execstartpre_line_is_red(tmp_path: Path) -> None:
+    evil = "/usr/bin/timeout -k 1 4 /usr/bin/install -d x ; /bin/evil"
+    assert "exec_semicolon" in _rules(_lint(tmp_path, _selftest_files([evil, SNAPSHOT])))
+    chmod = "/usr/bin/timeout -k 1 4 /usr/bin/chmod 0700 x ;/bin/evil"
+    assert "exec_semicolon" in _rules(_lint(tmp_path / "b", _selftest_files([chmod, SNAPSHOT])))
+    snap = SNAPSHOT + " ; /bin/evil"
+    assert "exec_semicolon" in _rules(_lint(tmp_path / "c", _selftest_files([snap])))
+
+
+def test_semicolon_in_a_line_only_wrapper_line_is_red(tmp_path: Path) -> None:
+    text = _unit(_exec("breezy-recorder", cmd="/bin/true ; /bin/evil"))
+    files = {**GOOD_FILES, "breezy-recorder.service": text}
+    errors = _lint(tmp_path, files, wrapper_line_only_units=LINE_ONLY_RECORDER)
+    assert "exec_semicolon" in _rules(errors)
+
+
+def test_semicolon_in_a_line_only_wrapper_execstartpre_is_red(tmp_path: Path) -> None:
+    pre = _exec("breezy-recorder", cmd="/bin/true ; /bin/evil")
+    text = _unit(_exec("breezy-recorder"), pre=[pre])
+    files = {**GOOD_FILES, "breezy-recorder.service": text}
+    errors = _lint(tmp_path, files, wrapper_line_only_units=LINE_ONLY_RECORDER)
+    assert "exec_semicolon" in _rules(errors)
+
+
+LINE_ONLY_RECORDER = MappingProxyType({"breezy-recorder.service": "AUT-1 r12 stop hook"})
+
+
+# ----------------------------------------------- B6-R6: instances and drop-ins
+
+
+def test_instance_file_of_a_listed_template_gets_the_full_lint(tmp_path: Path) -> None:
+    files = {**GOOD_FILES, "breezy-tpl@a.service": _unit("/bin/evil")}
+    errors = _lint(tmp_path, files)
+    assert "not_wrapped" in _rules(errors)
+    assert any(error.unit == "breezy-tpl@a.service" for error in errors)
+    good = _unit(_exec("breezy-tpl"))
+    assert _lint(tmp_path / "ok", {**GOOD_FILES, "breezy-tpl@a.service": good}) == ()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "breezy-tpl@a.service.d/o.conf",
+        "breezy-tpl@.service.d/o.conf",
+        "breezy-.service.d/o.conf",
+        "breezy-autonomy-.service.d/o.conf",
+        "service.d/o.conf",
+        "breezy-autonomy-t1.service.d/o.conf",
+    ],
+)
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[Service]\nExecStart=/bin/evil\n",
+        "[Service]\nExecStart=\n",
+        "[Service]\nExecStartPre=/bin/evil\n",
+        "[Service]\nExecStartPost=/bin/evil\n",
+        "[Service]\nExecStop=/bin/evil\n",
+        "[Service]\nExecStopPost=/bin/evil\n",
+        "[Service]\nExecReload=/bin/evil\n",
+        "[Service]\nExecCondition=/bin/evil\n",
+    ],
+)
+def test_any_exec_directive_in_an_in_scope_dropin_is_drop_in_exec(
+    tmp_path: Path, path: str, body: str
+) -> None:
+    errors = _lint(tmp_path, {**GOOD_FILES, path: body})
+    assert "drop_in_exec" in _rules(errors)
+
+
+def test_dropins_that_reach_no_in_scope_unit_or_set_no_exec_are_ignored(tmp_path: Path) -> None:
+    files = {
+        **GOOD_FILES,
+        "breezy-other.service.d/o.conf": "[Service]\nExecStart=/bin/true\n",
+        "zzz-.service.d/o.conf": "[Service]\nExecStart=/bin/true\n",
+        "breezy-.service.d/env.conf": "[Service]\nEnvironment=A=1\n",
+        "breezy-autonomy-t1.service.d/mem.conf": "[Service]\nMemoryMax=1G\n",
+    }
     assert _lint(tmp_path, files) == ()
 
 
