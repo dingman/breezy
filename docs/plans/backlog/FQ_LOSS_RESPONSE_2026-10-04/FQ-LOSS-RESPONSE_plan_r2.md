@@ -424,3 +424,63 @@ Key paths:
 - `/home/jon/breezy/src/breezy/analysis/capture_settlement.py`
 - `/home/jon/breezy/docs/evidence/RULING_holdout_freeze_and_forward_window_2026-10-03.md`
 - `/home/jon/breezy/docs/core/{PROGRESS,LESSONS}.md`
+
+---
+
+## Round-2 peer review resolution (coordinator, 2026-10-04; domain, ARCH and SEC all REQUEST_CHANGES; binding on r3)
+- **FQ-R13, RC-4 REJECTED (all three reviewers agree).** Adopt `fad3e819`/`6b3ce675` as merged: set AND clear both accept FQ, and the FQ set proceeds with open positions. Clearing is human-only through the CLI, with its audit record. Terminality belongs to the manifest and the AUT-5 registry, never to the halt row.
+  - Replace `test_clear_still_refuses_fq` with `test_clear_fq_requires_audit_record_and_is_cli_only`.
+  - F3 shrinks to two items: the v1 manifest `terminal_climate_day` (tally closure ONLY, not a send stop) and `test_fq_family_halt_key_matches_trade_preamble`.
+  - S0-3 checks the halt row only.
+- **FQ-R14, the M1 market scan becomes the PRIMARY winner-search path (domain finding).**
+  - Why: at ≤1 take/day the honest e-process confirms only an ROI edge of about 50% or more before KILL. Shadow adds no n, because it evaluates the same Takes.
+  - The model-free scan covers all rungs × sides × days. It is the n-rich lever.
+  - M1 is promoted from a diagnostic to the head of W3. Its cells carry SPA/Bonferroni multiplicity control. Its data NEVER doubles as nomination evidence: nomination uses forward days after a freeze.
+  - F5's N record states the n-starvation outcome and pre-registers this fallback.
+- **FQ-R15, statistics fixes.**
+  - Pin an ask floor and Y_max in the design JSON, and normalise the CS range so the KILL side has usable λ.
+  - Define the filtration: λ_t uses only settled days, and the denominator is fixed at decision time.
+  - γ_t is heavy-tailed, ∝ 1/(t·log²(t+1)) normalised, or uses per-epoch budgets. α_t is frozen at test start, using R at that moment. The e-LOND stream runs per lineage, with no pooling.
+  - The resume-bar combination is min(e_a, e_b).
+  - The calibration guard needs a minimum sample size, and blocks on "insufficient".
+  - δ_h is a pinned design effect with a rationale, and N is reported as a function of δ_h and of the take-rate interval.
+  - Under H1, outcomes are generated from δ_h at the sampled asks. Residuals are used only for ρ̂ and variance.
+  - `nomination_feasible` means MC power ≥ 0.8 within the window, so an infeasible nomination burns no K slot.
+- **FQ-R16, shadow realism.** Apply a pre-registered haircut to `ask_exec` (one tick, or a miss rate). Pin θ and the rounding by day, failing closed on drift. Shadow/live parity is a resume GATE. NO-side Takes with an empty YES bid are ineligible.
+- **FQ-R17, the F6 bridge.**
+  - **Integrity.** The artefact digest is recomputable from its inputs: the C2 high-water mark and the truth sha. Check owner, mode and mtime, and enforce a monotonic `as_of` held in memory.
+  - **Timing.** The probe runs on an actor timer and caches its verdict. The veto reads the cache only. Any exception means UNKNOWN (`test_probe_exception_is_unknown_not_pass`).
+  - **Composition.** The composed veto evaluates both parts on every call and returns the halt reason first. The same callable reaches both the strategy and the exec client (wiring test).
+  - **Floor.** Time-uniform (−c·√t), with a stated horizon. The window starts at the arming-ruling timestamp.
+  - **Stale veto.** It needs a delivered alert. The lag window between fill and label is bounded only by the operator caps; state that without naming them.
+  - **Ordering.** F6 Needs F1 only.
+  - **RC-7 (new).** An AUT-5 ownership carve-out for the composed veto in `_compose_forecast_quantile_ladder`, plus an AUT-5 r8 note that WP5 rebases over it.
+  - **Retirement.** On the first accepted non-inert `live.drawdown` PASS, with a named re-calibration trigger owner.
+  - The firewall and exec-pin guards are in its focused gate.
+- **FQ-R18, F2 truth.**
+  - Reuse `IEM_ALLOWED_HOSTS` and the `iem_mos_probe_transport` pattern.
+  - Writes are flock + tmp + atomic rename.
+  - Validate that the body parses to a CLI product. A parse-failing or coverage-regressing body never replaces a valid revision (`test_bad_body_never_becomes_latest`).
+  - Record the body sha, and cross-check against the catalog CLI finals with a disagreement flag.
+  - The single-writer claim is scoped to AFOS CLI URLs, and the legacy writers are made cache-read-only for those paths.
+  - No timer-bearing commit auto-enables. Units are parked until the gate reads EXIT=0.
+- **FQ-R19, queue edges.**
+  - Split F7 into F7a (WP1+WP2, Needs F1) and F7b (e-process, e-LOND, `evidence_row`, FqEvaluator; Needs E-15, F4, F7a). Prefer an AUT-4 r12 delta that moves only `analysis/stats/*`. If WP1 stays, it runs strictly serially with AUT-5a WP5/WP6.
+  - Row 10 Needs += F7a. Row 9 Needs += F4.
+  - F4 adds WP8. If the label peak exceeds 4G, WP6 holds until AUT-6.
+  - E-15 and E-16 are filed by F1 only.
+  - `5@WP5s3` is a literal status string.
+- **FQ-R20, RC amendments.**
+  - **RC-1:** do not redefine `n_min_eff`. Add `test_kind`, `eta_ns` and `window_end`, with `n_min_eff=null` for `e_process`. Scope `test_nominee_single_look_never_reopened` to `fixed_n`.
+  - **RC-3:** `evidence_row/v1` is an in-memory typed adapter, with `source` set from the store the row came from. Every consumer has its own untagged and unknown-tag tests and a single-loader contract test. `ref_ts < take_ts` is enforced at load.
+  - **RC-5:** the AUT-5 r8 delta covers every `fq_v1` reference (19 in AUT-5, 28 in AUT-7). F9 arms v2 through registry ROOT_ADMIT/RESUME.
+  - **RC-6:** `variant_spec` carries FQ-manifest-expressible parameters only. Cross-family variants go through new-family registration.
+- **FQ-R21, the end state.**
+  - Add the row that enables PROMOTE (AUT-5 L2 `WIDENING_KINDS`).
+  - Add the row for a new-source ingest actor plus node wiring.
+  - §10 becomes conditional on those rows, and says so.
+- **FQ-R22, F8 details.**
+  - Assert that the boot day equals the decision day.
+  - CRPS tuning replicates live CLI latency, uses nested out-of-fold, and states its season window.
+  - The surprise gate defaults OFF, with its take-rate cost pre-registered.
+  - Post-respawn checks: the permit is UNEXPIRED, the `fq_live_orders enabled=` line, and the halt `--status`.
