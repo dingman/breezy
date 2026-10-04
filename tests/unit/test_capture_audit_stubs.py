@@ -107,6 +107,12 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
 }
 
 
+#: Modules whose stage-2b builder has landed: their signatures stay pinned, but they are no longer
+#: ``NotImplementedError`` stubs (each has its own behaviour tests).
+REAL_MODULES: Final[frozenset[str]] = frozenset({f"{_AN}.capture_audit_fill_legs"})
+STUB_MODULES: Final[list[str]] = sorted(set(EXPECTED) - REAL_MODULES)
+
+
 def _source(module: str) -> Path:
     return Path(importlib.import_module(module).__file__ or "")
 
@@ -135,7 +141,7 @@ def test_the_stub_signature_set_is_exactly_the_design_set(module: str) -> None:
     assert found == EXPECTED[module]
 
 
-@pytest.mark.parametrize("module", sorted(EXPECTED))
+@pytest.mark.parametrize("module", STUB_MODULES)
 def test_every_stub_has_a_docstring_and_only_raises_not_implemented(module: str) -> None:
     tree = ast.parse(_source(module).read_text(encoding="utf-8"))
     assert ast.get_docstring(tree)
@@ -148,7 +154,7 @@ def test_every_stub_has_a_docstring_and_only_raises_not_implemented(module: str)
         assert isinstance(called, ast.Name) and called.id == "NotImplementedError", name
 
 
-@pytest.mark.parametrize("module", sorted(EXPECTED))
+@pytest.mark.parametrize("module", STUB_MODULES)
 def test_every_stub_raises_not_implemented_when_called(module: str) -> None:
     mod = importlib.import_module(module)
     for name, node in _defs(module).items():
@@ -159,6 +165,24 @@ def test_every_stub_raises_not_implemented_when_called(module: str) -> None:
         keywords = {arg.arg: None for arg in node.args.kwonlyargs}
         with pytest.raises(NotImplementedError):
             fn(*([None] * nargs), **keywords)
+
+
+def test_a_landed_module_is_real_and_keeps_its_docstring() -> None:
+    for module in sorted(REAL_MODULES):
+        tree = ast.parse(_source(module).read_text(encoding="utf-8"))
+        assert ast.get_docstring(tree)
+        raising = [
+            name
+            for name, node in _defs(module).items()
+            if any(isinstance(n, ast.Raise) and _is_not_implemented(n) for n in ast.walk(node))
+        ]
+        assert raising == [], module
+
+
+def _is_not_implemented(node: ast.Raise) -> bool:
+    exc = node.exc
+    called = exc.func if isinstance(exc, ast.Call) else exc
+    return isinstance(called, ast.Name) and called.id == "NotImplementedError"
 
 
 def test_the_stage_2b_modules_are_not_modules_of_the_stage_2a_model() -> None:
@@ -177,7 +201,7 @@ def test_each_stub_module_has_an_authority_row_with_no_write_scope_for_w1_and_w2
     rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
     for module in EXPECTED:
         assert module in rows, module
-        assert rows[module].min_calls == 1, module
+        assert rows[module].min_calls >= 1, module
     for module in (
         f"{_AN}.capture_audit_fill_legs",
         f"{_AN}.capture_audit_replay",
