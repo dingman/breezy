@@ -18,8 +18,13 @@ from tests.support.host_python import resolve_breezy_python
 
 AUTONOMY_DIR: Final[Path] = SRC_DIR / "breezy" / "persistence" / "autonomy"
 AUTONOMY_PACKAGE: Final[str] = "breezy.persistence.autonomy"
-#: Core modules exempt from contract (b). Empty at ARCH-0 (AC 2).
-NAUTILUS_PERMITTED: Final[frozenset[str]] = frozenset()
+#: Core modules exempt from contract (b). Empty at ARCH-0 (AC 2); AUT-1 WP1 appends the three
+#: capture modules that exist to persist Nautilus custom data (the ``@customdataclass`` records,
+#: the native ``StreamingFeatherWriter`` wrapper, and the publisher that builds the heartbeat
+#: record). Every other AUT-1 module is Nautilus-free and sits in contracts (b) and (c).
+NAUTILUS_PERMITTED: Final[frozenset[str]] = frozenset(
+    f"{AUTONOMY_PACKAGE}.{m}" for m in ("capture_records", "capture_stream", "capture_publish")
+)
 #: Core modules that may reach pyarrow, hence absent from contract (c) (AC 1).
 PYARROW_REACHING: Final[frozenset[str]] = frozenset(
     f"{AUTONOMY_PACKAGE}.{m}"
@@ -125,7 +130,7 @@ def test_classification_scan_catches_a_planted_unclassified_module() -> None:
     existing = _existing_modules() | {planted}
     assert _classification_errors(existing, contract_b, NAUTILUS_PERMITTED) == {planted}
     # In both sets is as wrong as in neither.
-    both = _classification_errors(existing, contract_b | {planted}, {planted})
+    both = _classification_errors(existing, contract_b | {planted}, NAUTILUS_PERMITTED | {planted})
     assert both == {planted}
 
 
@@ -161,6 +166,10 @@ def test_autonomy_core_modules_nautilus_free_at_runtime(module: str) -> None:
     loaded = _modules_loaded_by(module)
     nautilus = [m for m in loaded if m.split(".")[0] == "nautilus_trader"]
     domain = [m for m in loaded if m == "breezy.domain" or m.startswith("breezy.domain.")]
+    if module in NAUTILUS_PERMITTED:
+        # a permitted module really does reach Nautilus (keeps the list honest)
+        assert nautilus != []
+        return
     assert nautilus == []
     assert domain == []
     if module not in PYARROW_REACHING:

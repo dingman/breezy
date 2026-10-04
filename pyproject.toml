@@ -257,6 +257,11 @@ source_modules = [
     "breezy.persistence.autonomy.drill_marker",
     "breezy.persistence.autonomy.hwm",
     "breezy.persistence.autonomy.replay",
+    "breezy.persistence.autonomy.capture_ids",
+    "breezy.persistence.autonomy.capture_on_change",
+    "breezy.persistence.autonomy.capture_alerts",
+    "breezy.persistence.autonomy.capture_schedule",
+    "breezy.persistence.autonomy.capture_epoch",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -297,6 +302,11 @@ source_modules = [
     "breezy.persistence.autonomy.hwm",
     "breezy.persistence.autonomy.registry_export",
     "breezy.persistence.autonomy.registry_schema",
+    "breezy.persistence.autonomy.capture_ids",
+    "breezy.persistence.autonomy.capture_on_change",
+    "breezy.persistence.autonomy.capture_alerts",
+    "breezy.persistence.autonomy.capture_schedule",
+    "breezy.persistence.autonomy.capture_epoch",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false

@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Final
 
 __all__ = [
+    "DECISION_ID_TAG_PREFIX",
     "EXIT_CLIENT_ORDER_ID_TAG_PREFIX",
     "EXIT_FAMILY_TAG_PREFIX",
     "EXIT_POSITION_TAG_PREFIX",
@@ -43,3 +44,9 @@ EXIT_RULE_TAG_PREFIX: Final[str] = "exit_rule="
 EXIT_POSITION_TAG_PREFIX: Final[str] = "exit_position_id="
 EXIT_FAMILY_TAG_PREFIX: Final[str] = "exit_family_id="
 EXIT_CLIENT_ORDER_ID_TAG_PREFIX: Final[str] = "exit_client_order_id="
+
+#: AUT-1 (ARCH C1, L-12 widening of ``__all__``): the native ``Order.tags`` carrier for an ENTRY
+#: order's ``decision_id``, defined beside the exit prefixes so the strategy-layer writer and any
+#: adapters-layer reader share one definition. An exit order carries the four prefixes above
+#: instead of this one.
+DECISION_ID_TAG_PREFIX: Final[str] = "breezy:decision_id="
