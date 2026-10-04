@@ -288,14 +288,174 @@ def test_producer_demand_flood_cannot_exhaust_integrity_slot(
         )
         assert result.outcome is DemandOutcome.WRITTEN
     assert len(names(tmp_path)) == DEMAND_FILES_MAX
-    with pytest.raises(DemandRefused) as full:
-        write_engine_demand(paths, engine_rec(family_id=ordered[-1]), fold_family_ids=families)
+    with pytest.raises(DemandRefused) as full:  # producers keep SLOTS_FULL at the maximum
+        write_producer_demand(
+            paths,
+            producer_rec(family_id=ordered[-1], verdict_id=SHA_B),
+            fold_family_ids=families,
+        )
     assert full.value.reason is DemandRefusalReason.SLOTS_FULL
-    assert len(names(tmp_path)) == DEMAND_FILES_MAX  # never past the maximum
+    assert len(names(tmp_path)) == DEMAND_FILES_MAX
+    assert scan_demands(paths, VENUE, fold_family_ids=families).venue_veto is False
 
+    # A5b-R2: the engine is never refused for count. Its 65th file is written, and the resulting
+    # venue veto is the restrictive outcome.
+    result = write_engine_demand(paths, engine_rec(family_id=ordered[-1]), fold_family_ids=families)
+    assert result.outcome is DemandOutcome.WRITTEN
+    assert len(names(tmp_path)) == DEMAND_FILES_MAX + 1
     scan = scan_demands(paths, VENUE, fold_family_ids=families)
-    assert scan.venue_veto is False  # the flood never reached the venue-wide veto
-    assert len(scan.demands) == DEMAND_FILES_MAX
+    assert scan.venue_veto is True and scan.veto_reason is DemandVetoReason.TOO_MANY_FILES
+    assert scan.stops("any_family_at_all") is True
+
+
+def test_engine_write_is_not_blocked_by_a_standing_producer_integrity_file(tmp_path: Path) -> None:
+    """A5b-R1 (H1): slots are counted per writer class."""
+    paths = AutonomyPaths(tmp_path)
+    write_producer_demand(paths, producer_rec(), fold_family_ids=FOLD)
+    result = write_engine_demand(paths, engine_rec(), fold_family_ids=FOLD)
+    assert result.outcome is DemandOutcome.WRITTEN
+    assert len(names(tmp_path)) == 2
+    # and the reverse: a standing engine file does not occupy the producer's slot
+    again = write_producer_demand(
+        paths, producer_rec(family_id=OTHER, verdict_id=SHA_B), fold_family_ids=FOLD
+    )
+    other = write_engine_demand(paths, engine_rec(family_id=OTHER), fold_family_ids=FOLD)
+    assert (again.outcome, other.outcome) == (DemandOutcome.WRITTEN, DemandOutcome.WRITTEN)
+    # within a class the slot still holds
+    repeat = write_engine_demand(paths, engine_rec(ts_ns=TS + 5), fold_family_ids=FOLD)
+    assert repeat.outcome is DemandOutcome.SLOT_OCCUPIED
+
+
+def test_every_writer_interleaving_ends_restrictive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A5b-R3 (M2): writers are not serialised, so a stale listing may let two files stand.
+
+    Whatever the interleaving, the family is still stopped; a stale count past the maximum ends in
+    the venue-wide veto, which is also restrictive.
+    """
+    paths = AutonomyPaths(tmp_path)
+    write_engine_demand(paths, engine_rec(), fold_family_ids=FOLD)
+    monkeypatch.setattr(demand, "_standing", lambda *_a, **_k: ([], []))  # stale: sees nothing
+    stale = write_producer_demand(paths, producer_rec(), fold_family_ids=FOLD)
+    assert stale.outcome is DemandOutcome.WRITTEN
+    monkeypatch.undo()
+    scan = scan_demands(paths, VENUE, fold_family_ids=FOLD)
+    assert scan.venue_veto is False and len(scan.demands) == 2
+    assert scan.stops(FAMILY) is True and scan.stops(OTHER) is False
+
+    # a stale view at the cap: the 65th file is written and the venue is vetoed
+    for index in range(DEMAND_FILES_MAX - 2):
+        put(tmp_path, engine_rec(family_id=OTHER, ts_ns=TS + 100 + index))
+    monkeypatch.setattr(demand, "_standing", lambda *_a, **_k: ([], []))
+    write_producer_demand(
+        paths, producer_rec(family_id=OTHER, verdict_id=SHA_B), fold_family_ids=FOLD
+    )
+    monkeypatch.undo()
+    scan = scan_demands(paths, VENUE, fold_family_ids=FOLD)
+    assert scan.venue_veto is True
+    assert scan.stops(FAMILY) is True and scan.stops(OTHER) is True
+
+
+def test_over_cap_listing_refuses_early_without_reading_any_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for index in range(DEMAND_FILES_MAX + 1):
+        put(tmp_path, engine_rec(ts_ns=TS + index))
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("a file was read although the listing is over cap")
+
+    monkeypatch.setattr(demand, "_read_one", boom)
+    with pytest.raises(DemandRefused) as caught:
+        write_producer_demand(AutonomyPaths(tmp_path), producer_rec(), fold_family_ids=FOLD)
+    assert caught.value.reason is DemandRefusalReason.SLOTS_FULL
+    # the engine writes nothing more: the venue is already vetoed, which is restrictive
+    result = write_engine_demand(
+        AutonomyPaths(tmp_path), engine_rec(ts_ns=TS + 999), fold_family_ids=FOLD
+    )
+    assert result.outcome is DemandOutcome.SLOT_OCCUPIED
+    assert len(names(tmp_path)) == DEMAND_FILES_MAX + 1
+
+
+def test_scan_stops_honours_the_venue_veto_and_per_family_demands(tmp_path: Path) -> None:
+    paths = AutonomyPaths(tmp_path)
+    assert scan_demands(paths, VENUE, fold_family_ids=FOLD).stops(FAMILY) is False
+    put(tmp_path, engine_rec())
+    clean = scan_demands(paths, VENUE, fold_family_ids=FOLD)
+    assert clean.stops(FAMILY) is True and clean.stops(OTHER) is False
+    _raw(tmp_path, "junk.json", b"{")
+    vetoed = scan_demands(paths, VENUE, fold_family_ids=FOLD)
+    assert vetoed.stops(FAMILY) is True and vetoed.stops(OTHER) is True
+    assert vetoed.stops("unknown_family") is True
+
+
+def test_demand_publish_never_exposes_a_named_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A5b-R4: the writer publishes through O_TMPFILE, so no ``.tmp.`` name is ever visible."""
+    from breezy.persistence.autonomy import single_read
+
+    seen: list[list[str]] = []
+
+    class Proxy:
+        def __getattr__(self, name: str) -> object:
+            real = getattr(os, name)
+            if name not in ("write", "link"):
+                return real
+
+            def spy(*a: object, **k: object) -> object:
+                seen.append(names(tmp_path))
+                return real(*a, **k)
+
+            return spy
+
+    monkeypatch.setattr(single_read, "os", Proxy())
+    write_producer_demand(AutonomyPaths(tmp_path), producer_rec(), fold_family_ids=FOLD)
+    assert seen and all(listing == [] for listing in seen)
+    assert names(tmp_path) == [producer_rec().filename()]
+
+
+@pytest.mark.parametrize("unsupported", ["open", "proc"])
+def test_unsupported_o_tmpfile_is_refused_with_its_own_reason_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported: str
+) -> None:
+    import errno
+
+    from breezy.persistence.autonomy import single_read
+
+    class Proxy:
+        def __getattr__(self, name: str) -> object:
+            real = getattr(os, name)
+            if unsupported == "open" and name == "open":
+
+                def refusing(path: object, flags: int, *a: object, **k: object) -> int:
+                    if flags & os.O_TMPFILE == os.O_TMPFILE:
+                        raise OSError(errno.EOPNOTSUPP, "no tmpfile")
+                    return real(path, flags, *a, **k)  # type: ignore[no-any-return]
+
+                return refusing
+            if unsupported == "proc" and name == "link":
+
+                def no_proc(*_a: object, **_k: object) -> None:
+                    raise FileNotFoundError(errno.ENOENT, "no /proc")
+
+                return no_proc
+            return real
+
+    monkeypatch.setattr(single_read, "os", Proxy())
+    with pytest.raises(DemandRefused) as caught:
+        write_engine_demand(AutonomyPaths(tmp_path), engine_rec(), fold_family_ids=FOLD)
+    assert caught.value.reason is DemandRefusalReason.TMPFILE_UNSUPPORTED
+    assert names(tmp_path) == []
+
+
+def test_a_stray_tmp_name_in_the_demand_directory_vetoes_the_venue(tmp_path: Path) -> None:
+    """A5b-R4: the reader's ``.tmp.`` exception is withdrawn; any non-conforming name vetoes."""
+    put(tmp_path, engine_rec())
+    (demand_dir(tmp_path) / ".tmp.0123456789abcdef").write_bytes(b"{")
+    scan = scan_demands(AutonomyPaths(tmp_path), VENUE, fold_family_ids=FOLD)
+    assert scan.venue_veto is True and scan.veto_reason is DemandVetoReason.BAD_FILE
 
 
 @pytest.mark.parametrize("case", [pytest.param("writer_api", id="writer_api")])
@@ -380,15 +540,6 @@ def test_scan_returns_valid_demands_in_name_order(tmp_path: Path) -> None:
     assert scan.venue_veto is False
     assert [d.family_id for d in scan.demands] == sorted([OTHER, FAMILY])
     assert scan.demands == tuple(sorted(scan.demands, key=lambda d: d.filename()))
-
-
-def test_scan_ignores_only_the_write_once_temp_name(tmp_path: Path) -> None:
-    put(tmp_path, engine_rec())
-    (demand_dir(tmp_path) / ".tmp.0123456789abcdef").write_bytes(b"{")
-    assert scan_demands(AutonomyPaths(tmp_path), VENUE, fold_family_ids=FOLD).venue_veto is False
-    (demand_dir(tmp_path) / ".tmp.0123456789abcdeg").write_bytes(b"{")  # not the pinned pattern
-    scan = scan_demands(AutonomyPaths(tmp_path), VENUE, fold_family_ids=FOLD)
-    assert scan.venue_veto is True
 
 
 def test_scan_never_returns_demands_of_another_venue_directory(tmp_path: Path) -> None:

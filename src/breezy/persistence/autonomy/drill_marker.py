@@ -21,10 +21,11 @@ import os
 import re
 import stat
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Final, Self
 
+from breezy.persistence.autonomy.canonical import sha256_hex
 from breezy.persistence.autonomy.paths import (
     AutonomyPaths,
     ShadowPaths,
@@ -119,19 +120,21 @@ class DrillMarker:
     abort_record_sha256: str | None
     drill_clause_sha256: str
     ts_ns: int
+    #: sha256 of the exact bytes the read returned (never a wire key; ignored by equality).
+    raw_sha256: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         check_match(self.registry_root, _ROOT_RE, "registry_root")
         venue_component(self.venue)
         family_component(self.child_id)
         check_match(self.episode_id, _EPISODE_RE, "episode_id")
-        for field, enum in (("detector", DrillDetector), ("step", DrillStep)):
-            if not isinstance(getattr(self, field), enum):
-                raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+        for name, enum in (("detector", DrillDetector), ("step", DrillStep)):
+            if not isinstance(getattr(self, name), enum):
+                raise WireRefused(WireRefusalReason.WRONG_TYPE, name)
         if _STEP_DETECTOR[self.step] is not self.detector:
             raise _bad("detector")
-        for field in ("window_start_ns", "window_end_ns", "ts_ns"):
-            check_int(getattr(self, field), field)
+        for name in ("window_start_ns", "window_end_ns", "ts_ns"):
+            check_int(getattr(self, name), name)
         if self.window_end_ns <= self.window_start_ns:
             raise _bad("window_end_ns")
         check_sha256(self.drill_clause_sha256, "drill_clause_sha256")
@@ -209,8 +212,14 @@ def read_marker_at(rootfd: int) -> DrillMarker | MarkerAbsent | MarkerError:
         dirfd = walk_dirs(rootfd, MARKER_DIR_PARTS, create=False)
     except SingleReadRefused as exc:
         return _dir_error(exc)
+    except OSError:
+        return MarkerError(MarkerErrorReason.DIR_UNSAFE, "io")
     try:
-        if stat.S_IMODE(os.fstat(dirfd).st_mode) != _DIR_MODE:
+        try:
+            dir_mode = stat.S_IMODE(os.fstat(dirfd).st_mode)
+        except OSError:
+            return MarkerError(MarkerErrorReason.DIR_UNSAFE, "io")
+        if dir_mode != _DIR_MODE:
             return MarkerError(MarkerErrorReason.DIR_UNSAFE, "dir_mode")
         try:
             raw = read_once_at(
@@ -223,9 +232,10 @@ def read_marker_at(rootfd: int) -> DrillMarker | MarkerAbsent | MarkerError:
     finally:
         os.close(dirfd)
     try:
-        return DrillMarker.from_wire(parse_json_exact(raw))
+        marker = DrillMarker.from_wire(parse_json_exact(raw))
     except WireRefused as exc:
         return MarkerError(MarkerErrorReason.INVALID, exc.reason.value)
+    return replace(marker, raw_sha256=sha256_hex(raw))
 
 
 def read_marker(paths: AutonomyPaths | ShadowPaths) -> DrillMarker | MarkerAbsent | MarkerError:

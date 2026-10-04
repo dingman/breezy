@@ -3,7 +3,7 @@
 A demand file can only stop entries (ARCH C5 Z11), so it needs no authentication, and this module
 exposes no way to lift one: there is no archive, rename or delete here (the engine's archive is
 AUT-5 WP4). Files live at ``registry/demand/<venue>/``, mode 0444, written once through
-``single_read.write_once``:
+``single_read.write_once_tmpfile``:
 
 * engine files ``<family_id>_<ts_ns>_engine.json``;
 * producer files ``<family_id>_<reason>_<verdict_id>_<producer>.json``, only for ids in
@@ -11,16 +11,24 @@ AUT-5 WP4). Files live at ``registry/demand/<venue>/``, mode 0444, written once 
 
 Writer rules: exact-set ``demand/v1``; at most ``DEMAND_FILE_MAX_BYTES``; ``family_id`` in the
 venue fold and ``reason`` in ``DEMAND_REASONS`` (a file failing either would veto every family on
-the venue, so none is written); one unarchived file per ``(family, reason)`` for every writer; a
-producer re-run of the same ``verdict_id`` writes nothing; a producer file whose reason is not
-``integrity_floor`` is written only while fewer than
-``DEMAND_FILES_MAX - DEMAND_INTEGRITY_RESERVED`` files stand, so the reserved slots stay free for
-engine and ``integrity_floor`` files; and no write takes the venue past ``DEMAND_FILES_MAX``.
+the venue, so none is written); one unarchived file per ``(family, reason)`` *per writer class*
+(engine files and producer files never occupy each other's slot; A5b-R1); a producer re-run of the
+same ``verdict_id`` writes nothing; a producer file whose reason is not ``integrity_floor`` is
+written only while fewer than ``DEMAND_FILES_MAX - DEMAND_INTEGRITY_RESERVED`` files stand, and no
+producer file takes the venue past ``DEMAND_FILES_MAX`` (``SLOTS_FULL``). The engine is never
+refused for count (A5b-R2): its write past the maximum is made, and the resulting venue veto is the
+restrictive outcome. Files are published through ``single_read.write_once_tmpfile`` (``O_TMPFILE``,
+no visible temporary name; A5b-R4); a filesystem without it is refused (``TMPFILE_UNSUPPORTED``).
 
 Reader: a bad file, an unreadable directory or more than ``DEMAND_FILES_MAX`` files is a venue-wide
-veto. A missing directory is no demand. Names and details are closed codes, never paths. The writer
-check-then-write is not atomic across processes; the writers (one engine, one producer unit) are
-serialised by their callers.
+veto. A missing directory is no demand. Any name in the directory that is not a conforming demand
+file, a ``.tmp.`` name included, is a veto (A5b-R4). Names and details are closed codes, never
+paths.
+
+Writers are not serialised (A5b-R3; AUT-5 r7 has no lock, the producer runs under its own). A stale
+listing can let two files stand or the count pass the maximum; every such interleaving still ends
+restrictive (the family stays stopped, or the venue is vetoed), pinned by
+``test_every_writer_interleaving_ends_restrictive``.
 """
 
 from __future__ import annotations
@@ -54,7 +62,7 @@ from breezy.persistence.autonomy.single_read import (
     open_root,
     read_once_at,
     walk_dirs,
-    write_once,
+    write_once_tmpfile,
 )
 from breezy.persistence.autonomy.wire import (
     WireRefusalReason,
@@ -90,7 +98,6 @@ INTEGRITY_REASON: Final = "integrity_floor"
 _DEMAND_PARTS: Final = ("registry", "demand")
 _WRITER_RE: Final = re.compile(r"\A[a-z0-9_]{1,32}(?:\.[a-z0-9_]{1,32}){0,3}\Z", re.ASCII)
 _REASON_RE: Final = re.compile(r"\A[a-z0-9_]{1,48}\Z", re.ASCII)
-_TEMP_NAME_RE: Final = re.compile(r"\A\.tmp\.[0-9a-f]{16}\Z", re.ASCII)
 _KEYS: Final = ("schema", "venue", "family_id", "reason", "writer", "verdict_id", "ts_ns")
 
 
@@ -165,6 +172,7 @@ class DemandRefusalReason(StrEnum):
     #: The venue holds ``DEMAND_FILES_MAX`` files; a further one would veto the venue.
     SLOTS_FULL = "slots_full"
     DIRECTORY_UNREADABLE = "directory_unreadable"
+    TMPFILE_UNSUPPORTED = "tmpfile_unsupported"
     WRITE_FAILED = "write_failed"
 
 
@@ -196,6 +204,10 @@ class DemandScan:
     demands: tuple[DemandRecord, ...]
     venue_veto: bool
     veto_reason: DemandVetoReason | None
+
+    def stops(self, family_id: str) -> bool:
+        """True when entries for ``family_id`` must be vetoed: a venue veto, or a demand for it."""
+        return self.venue_veto or any(d.family_id == family_id for d in self.demands)
 
 
 def _veto(reason: DemandVetoReason) -> DemandScan:
@@ -230,8 +242,8 @@ def _bytes_of(record: DemandRecord) -> bytes:
 
 
 def _listing(dirfd: int) -> list[str]:
-    """Every name that counts: the pinned ``write_once`` temp pattern is not a demand."""
-    return sorted(n for n in os.listdir(dirfd) if not _TEMP_NAME_RE.fullmatch(n))
+    """Every name in the directory: a name that is not a demand file is itself a bad file."""
+    return sorted(os.listdir(dirfd))
 
 
 def scan_demands(
@@ -306,6 +318,8 @@ def _standing(
         raise DemandRefused(DemandRefusalReason.WRITE_FAILED, exc.reason.value) from exc
     try:
         names = _listing(dirfd)
+        if len(names) > DEMAND_FILES_MAX:  # over cap: refuse early, read nothing
+            return names, []
         parsed = (_read_one(dirfd, name, venue) for name in names)
         return names, [record for record in parsed if record is not None]
     except OSError as exc:
@@ -325,20 +339,31 @@ def _write(
     _check_writable(record, fold_family_ids, data)
     names, records = _standing(paths, record.venue)
     name = record.filename()
+    if len(names) > DEMAND_FILES_MAX:  # the venue is already vetoed
+        if producer:
+            raise DemandRefused(DemandRefusalReason.SLOTS_FULL)
+        return DemandWrite(DemandOutcome.SLOT_OCCUPIED, name)
     if producer and name in names:
         return DemandWrite(DemandOutcome.ALREADY_PRESENT, name)
-    if any(r.family_id == record.family_id and r.reason == record.reason for r in records):
+    if any(
+        r.family_id == record.family_id
+        and r.reason == record.reason
+        and (r.writer == ENGINE_WRITER) is (record.writer == ENGINE_WRITER)
+        for r in records
+    ):
         return DemandWrite(DemandOutcome.SLOT_OCCUPIED, name)
     if producer and record.reason != INTEGRITY_REASON:
         if len(names) >= DEMAND_FILES_MAX - DEMAND_INTEGRITY_RESERVED:
             raise DemandRefused(DemandRefusalReason.PRODUCER_CAP)
-    elif len(names) >= DEMAND_FILES_MAX:
+    elif producer and len(names) >= DEMAND_FILES_MAX:
         raise DemandRefused(DemandRefusalReason.SLOTS_FULL)
     try:
-        outcome = write_once(
+        outcome = write_once_tmpfile(
             paths.demand_dir(record.venue) / name, data, root=paths.root, mode=DEMAND_FILE_MODE
         )
     except SingleReadRefused as exc:
+        if exc.reason is SingleReadReason.TMPFILE_UNSUPPORTED:
+            raise DemandRefused(DemandRefusalReason.TMPFILE_UNSUPPORTED) from exc
         raise DemandRefused(DemandRefusalReason.WRITE_FAILED, exc.reason.value) from exc
     if outcome is WriteOutcome.EXISTS_EQUAL:
         return DemandWrite(DemandOutcome.ALREADY_PRESENT, name)

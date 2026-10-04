@@ -31,6 +31,7 @@ from breezy.persistence.autonomy.rollback_journal import (
     JournalUnverified,
     JournalUnverifiedReason,
     append_journal,
+    head_matches,
     read_journal_chain,
 )
 from breezy.persistence.autonomy.wire import WireRefusalReason, WireRefused
@@ -416,3 +417,20 @@ def test_entry_refuses_inexact_wire(wire: dict[str, Any], reason: WireRefusalRea
     with pytest.raises(WireRefused) as caught:
         JournalEntry.from_wire(wire)
     assert caught.value.reason is reason
+
+
+def test_head_matches_compares_the_chain_head_and_an_empty_chain_never_matches(
+    tmp_path: Path,
+) -> None:
+    """A5b-R5: empty-vs-external-head is a mismatch; an unverified chain never matches."""
+    paths = AutonomyPaths(tmp_path)
+    ghost = JournalHead(seq=1, sha256="a" * 64)
+    assert head_matches(read_journal_chain(paths, KIND, VENUE), ghost) is False  # empty chain
+    first = append(tmp_path, 1)
+    second = append(tmp_path, 2)
+    chain = read_journal_chain(paths, KIND, VENUE)
+    assert head_matches(chain, second) is True
+    assert head_matches(chain, first) is False  # a stale head
+    assert head_matches(chain, JournalHead(seq=2, sha256="b" * 64)) is False
+    broken = JournalUnverified(reason=JournalUnverifiedReason.LINK_BROKEN, seq=2)
+    assert head_matches(broken, second) is False

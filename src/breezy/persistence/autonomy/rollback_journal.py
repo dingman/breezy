@@ -10,8 +10,13 @@ step; this module returns ``JournalHead(seq, sha256)`` for it.
 Kinds are bare names. ``JOURNAL_KINDS`` is empty at ARCH-0, so every kind is refused until its
 owner registers it in a reviewed change. ``read_journal_chain`` returns the entries or
 ``JournalUnverified`` and never raises on a damaged chain. A missing journal directory is an empty
-chain. Refusals carry closed codes, never paths. This module imports no pyarrow-reaching module
-(``schemas`` imports it).
+chain. Refusals carry closed codes, never paths.
+
+Two contracts for consumers (A5b-R5). An empty chain compared with an external head is a
+*mismatch*, never a pass (``head_matches``). Restrictive writes (DEMOTE, HALT, SWAP_CANCEL and their
+demand files) are never gated on a journal append: a refused or failed append must not stop one.
+
+This module imports no pyarrow-reaching module (``schemas`` imports it).
 """
 
 from __future__ import annotations
@@ -68,6 +73,7 @@ __all__ = [
     "JournalUnverified",
     "JournalUnverifiedReason",
     "append_journal",
+    "head_matches",
     "read_journal_chain",
 ]
 
@@ -273,6 +279,17 @@ def read_journal_chain(
             os.close(dirfd)
     finally:
         os.close(rootfd)
+
+
+def head_matches(chain: tuple[JournalEntry, ...] | JournalUnverified, head: JournalHead) -> bool:
+    """True only for a verified, non-empty chain whose newest entry is exactly ``head``.
+
+    An empty chain against an external head is a mismatch (the export names a head the journal
+    lacks), and so is an unverified chain.
+    """
+    if isinstance(chain, JournalUnverified) or not chain:
+        return False
+    return chain[-1].head() == head
 
 
 def _publish(paths: AutonomyPaths | ShadowPaths, entry: JournalEntry, data: bytes) -> WriteOutcome:

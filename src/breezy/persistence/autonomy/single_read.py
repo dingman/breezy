@@ -33,6 +33,11 @@ _GROUP_OTHER_WRITE: Final[int] = stat.S_IWGRP | stat.S_IWOTH
 _LINK_UNSUPPORTED_ERRNOS: Final[frozenset[int]] = frozenset(
     {errno.EPERM, errno.EXDEV, errno.EOPNOTSUPP, errno.EMLINK}
 )
+_TMPFILE_FLAGS: Final[int] = os.O_TMPFILE | os.O_WRONLY | os.O_CLOEXEC
+_TMPFILE_UNSUPPORTED_ERRNOS: Final[frozenset[int]] = frozenset(
+    {errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL}
+)
+_PROC_SELF_FD: Final = "/proc/self/fd"
 _READ_CHUNK: Final[int] = 65536
 _DEFAULT_DIR_MODE: Final[int] = 0o700
 _PERMISSION_BITS: Final[int] = 0o777
@@ -48,6 +53,7 @@ __all__ = [
     "replace_atomic",
     "walk_dirs",
     "write_once",
+    "write_once_tmpfile",
 ]
 
 
@@ -72,6 +78,7 @@ class SingleReadReason(StrEnum):
     IO = "io"
     EXISTS_DIFFERENT = "exists_different"
     INVALID_MODE = "invalid_mode"
+    TMPFILE_UNSUPPORTED = "tmpfile_unsupported"
 
 
 class WriteOutcome(StrEnum):
@@ -401,5 +408,61 @@ def replace_atomic(path: Path, data: bytes, *, root: Path, mode: int) -> None:
             _cleanup_temp(dirfd, temp, refusal)
             raise refusal from exc
         _finish(dirfd, temp, sync_dir=True)
+    finally:
+        os.close(dirfd)
+
+
+def write_once_tmpfile(path: Path, data: bytes, *, root: Path, mode: int) -> WriteOutcome:
+    """``write_once`` with no visible temporary name (AUT-6 r15 AC1; ruling A5b-R4).
+
+    The bytes are written to an unnamed ``O_TMPFILE`` inode, fsynced, and linked into place through
+    ``/proc/self/fd``; the directory is then fsynced. ``EXISTS_EQUAL`` / ``EXISTS_DIFFERENT``
+    follow ``write_once``. A filesystem without ``O_TMPFILE``, or a missing ``/proc/self/fd``,
+    raises ``TMPFILE_UNSUPPORTED`` and writes nothing; there is deliberately no named-temp fallback.
+    """
+    _refuse_mode(mode)
+    dirfd, name = _open_parent(path, root)
+    try:
+        if _compare_existing(dirfd, name, data):
+            return WriteOutcome.EXISTS_EQUAL
+        _require_writable_dir(dirfd)
+        try:
+            fd = os.open(".", _TMPFILE_FLAGS, _TEMP_CREATE_MODE, dir_fd=dirfd)
+        except OSError as exc:
+            if exc.errno in _TMPFILE_UNSUPPORTED_ERRNOS:
+                raise SingleReadRefused(SingleReadReason.TMPFILE_UNSUPPORTED, name) from exc
+            raise _io(exc, name) from exc
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+            try:
+                os.link(
+                    f"{_PROC_SELF_FD}/{fd}",
+                    name,
+                    dst_dir_fd=dirfd,
+                    follow_symlinks=True,
+                )
+            except FileExistsError as exc:
+                if _compare_existing(dirfd, name, data):  # the winner's bytes equal ours
+                    return WriteOutcome.EXISTS_EQUAL
+                raise SingleReadRefused(SingleReadReason.EXISTS_DIFFERENT, name) from exc
+            except FileNotFoundError as exc:  # no /proc/self/fd entry to link from
+                raise SingleReadRefused(SingleReadReason.TMPFILE_UNSUPPORTED, name) from exc
+            except OSError as exc:
+                if exc.errno in _LINK_UNSUPPORTED_ERRNOS:
+                    raise SingleReadRefused(SingleReadReason.LINK_UNSUPPORTED, name) from exc
+                raise _io(exc, name) from exc
+        except OSError as exc:
+            raise _io(exc, name) from exc
+        finally:
+            os.close(fd)
+        try:
+            os.fsync(dirfd)
+        except OSError as exc:
+            raise _io(exc, "directory fsync") from exc
+        return WriteOutcome.WRITTEN
     finally:
         os.close(dirfd)

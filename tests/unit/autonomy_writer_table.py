@@ -97,6 +97,9 @@ _SINGLE_READ: Final = "breezy.persistence.autonomy.single_read"
 WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(_SINGLE_READ, "write_once", "the one write-once publisher (AC 7)"),
     WriteSiteRule(_SINGLE_READ, "replace_atomic", "the one atomic replacer (AC 7)"),
+    WriteSiteRule(
+        _SINGLE_READ, "write_once_tmpfile", "the O_TMPFILE write-once publisher (A5b-R4)"
+    ),
     WriteSiteRule(_SINGLE_READ, "ensure_dir", "the one directory creator (not yet landed)"),
     # Private helpers of the three entries above. They hold the actual os.open / os.link /
     # os.replace / os.unlink calls and are named so a new helper needs a reviewed row.
