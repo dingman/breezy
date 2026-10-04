@@ -641,3 +641,34 @@ Both reviewers confirm the resolver never yields permit semantics. `ResolvedFami
   - The module still sets the journal mode with `PRAGMA journal_mode=DELETE`.
   - It then verifies the snapshot's on-disk header: bytes 18 and 19 must both be 1, meaning not WAL format. The existing `-wal`/`-shm` absence check stays.
   - The B3 focused gate gains `tests/unit/test_polymarket_us_readonly_guard.py` and `tests/unit/test_polymarket_us_write_transport.py`.
+
+### Post-merge rulings (seam B V-steps on the primary tree, b2c8895a)
+- **V1** was done: `install -d -m 0700` of the cache dirs.
+- **V2 FAILED:** `bwrap: execvp /home/jon/breezy/.venv/bin/python3: No such file or directory`.
+  - The venv interpreter chain (`python` → `~/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu`, a symlink, → `cpython-3.13.13-…`) and the `pyvenv.cfg` `home` both go through a symlink under home that the sandbox never recreates. Only the resolved `python_prefix` is bound.
+  - The phase-2 harness never execs the production interpreter path, so no test caught it.
+  - No live impact: no unit consumes the wrapper yet.
+- **B11-R1.** Recreate each interpreter/`home` symlink hop under home with bwrap `--symlink` (never a bind).
+  - A pure hop derivation that fails closed when a target is outside `python_prefix`, on a loop, or past 8 hops.
+  - Add a phase-2 namespace test that execs the production venv interpreter through the `default_roots()` argv.
+  - V2–V21 re-run after the merge.
+- **B12 (security review of f91e1e1f, REQUEST_CHANGES; no escape found).** All findings are adopted.
+  - **B12-R1 (M1).** In the walk, only EINVAL means "not a link". Every other errno raises `InterpreterLinkError`. A start path that vanishes while `.venv` exists also refuses.
+  - **B12-R2 (M2).**
+    - Compare against resolved `home` and resolved `data_root`.
+    - Refuse a hop that equals `home`, or that is an ancestor of any bound root.
+  - **B12-R3 (M3).** Parse `pyvenv.cfg` the way CPython does: strip, lowercase keys, last `home` wins. If `pyvenv.cfg` exists but yields no absolute home, refuse.
+  - **B12-R4 (L4, L5).**
+    - Build the exclusion list from `_home_rebinds` plus every `opened.*` destination.
+    - Emit a LINK path only if it lies under `roots.python_prefix.parent`; refuse otherwise.
+  - **B12-R5 (L6).** Derive the hops once in `_exec_wrapped` and pass them to both `argv_for` calls.
+  - **B12-R6 (tests).**
+    - Add an exactly-8-hops pass case.
+    - Add not-emitted cases: a hop outside home, under `data_root`, and under the prefix.
+    - Add `..` cases, in a target and in `home`.
+    - Add bad-cfg cases: relative, duplicate, uppercase, garbage.
+    - Add a non-EINVAL errno case and a symlinked home/ancestor case.
+    - Assert ordering against the remount-ro entries.
+    - Rename the namespace test to `test_production_roots_argv_execs_the_venv_interpreter`.
+    - The end-to-end proof through the wrapper `main` is real-host V2 after merge.
+  - **Accepted availability change.** `interpreter_link` refuses before preflight, even for degradable notifier rows. This is fail-closed by design, and the notifier never runs unwrapped on it.
