@@ -40,7 +40,7 @@ from breezy.analysis.capture_audit_model import (
     DayStatus,
 )
 from breezy.analysis.capture_audit_wire import audit_from_wire
-from breezy.analysis.capture_aut6_contract import delivered_events, read_notifier_proofs
+from breezy.analysis.capture_aut6_contract import delivered_events_by_day, read_notifier_proofs
 from breezy.analysis.capture_heal import HEAL_ALERT_RETRY_DAYS  # S3-R53: the one source
 from breezy.persistence.autonomy.capture_alerts import heal_alert_event
 from breezy.persistence.autonomy.paths import family_component
@@ -243,9 +243,22 @@ def _stall_leg(data_root: Path, heal: _Heal) -> bool:
     return marker and _has_stall_record(data_root, heal)
 
 
-def _alert_delivered(data_root: Path, heal: _Heal) -> bool:
-    last = heal.date + dt.timedelta(days=HEAL_ALERT_RETRY_DAYS)
-    return heal_alert_event(heal.sha) in delivered_events(data_root, heal.date, last)
+def _alert_delivered(ledger: Mapping[dt.date, frozenset[str]], heal: _Heal) -> bool:
+    """The heal alert has a delivered record dated the heal day to ``+HEAL_ALERT_RETRY_DAYS``."""
+    event = heal_alert_event(heal.sha)
+    return any(
+        event in ledger.get(heal.date + dt.timedelta(days=offset), frozenset())
+        for offset in range(HEAL_ALERT_RETRY_DAYS + 1)
+    )
+
+
+def _ledger(data_root: Path, heals: Sequence[_Heal]) -> Mapping[dt.date, frozenset[str]]:
+    """The delivery ledger over every heal's window, read once."""
+    if not heals:
+        return {}
+    first = min(h.date for h in heals)
+    last = max(h.date for h in heals) + dt.timedelta(days=HEAL_ALERT_RETRY_DAYS)
+    return delivered_events_by_day(data_root, first, last)
 
 
 # -- the document ------------------------------------------------------------------------------
@@ -268,8 +281,10 @@ def _heal_verdict(
     still lacking a delivered alert (``heal_alert_undelivered``)."""
     qualifying: dict[str, Any] | None = None
     undelivered: list[dict[str, Any]] = []
-    for heal in _read_heals(data_root, asof):
-        if _alert_delivered(data_root, heal):
+    heals = _read_heals(data_root, asof)
+    ledger = _ledger(data_root, heals)
+    for heal in heals:
+        if _alert_delivered(ledger, heal):
             if _stall_leg(data_root, heal):
                 qualifying = _heal_summary(heal)
             continue

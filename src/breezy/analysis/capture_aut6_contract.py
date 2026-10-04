@@ -35,6 +35,7 @@ __all__ = [
     "NOTIFY_REL",
     "NotifierProof",
     "delivered_events",
+    "delivered_events_by_day",
     "read_notifier_proofs",
 ]
 
@@ -98,7 +99,7 @@ def read_notifier_proofs(data_root: Path, day: dt.date) -> tuple[NotifierProof, 
     for offset in (0, 1):
         stamp = (day + dt.timedelta(days=offset)).isoformat()
         rel = (*NOTIFY_REL, stamp)
-        for name in list_names(data_root, rel):
+        for name in _names(data_root, rel):
             unit_match = NOTIFIER_MARKER_RE.fullmatch(name)
             if unit_match is not None:
                 unit, key = unit_match["unit"], unit_match["inv"]
@@ -110,13 +111,17 @@ def read_notifier_proofs(data_root: Path, day: dt.date) -> tuple[NotifierProof, 
     return tuple(sorted(found, key=lambda p: (p.date, p.unit, p.invocation_id)))
 
 
-def delivered_events(data_root: Path, first: dt.date, last: dt.date) -> frozenset[str]:
-    """The events with a ``delivered`` record under ``evidence/alerts/<date>/`` for the dates
-    ``first`` to ``last`` inclusive; a missing or unreadable record is not delivered."""
-    events: set[str] = set()
+def delivered_events_by_day(
+    data_root: Path, first: dt.date, last: dt.date
+) -> dict[dt.date, frozenset[str]]:
+    """The events with a ``delivered`` record under ``evidence/alerts/<date>/``, per date, for the
+    dates ``first`` to ``last`` inclusive; a missing or unreadable record is not delivered. One
+    read of the ledger serves any number of per-window questions."""
+    by_day: dict[dt.date, frozenset[str]] = {}
     day = first
     while day <= last:
         rel = (*ALERTS_REL, day.isoformat())
+        events: set[str] = set()
         for name in _names(data_root, rel):
             if DELIVERY_RECORD_NAME_RE.fullmatch(name) is None:
                 continue
@@ -126,5 +131,12 @@ def delivered_events(data_root: Path, first: dt.date, last: dt.date) -> frozense
             event = body.get("event")
             if _delivered(body) and isinstance(event, str) and event:
                 events.add(event)
+        by_day[day] = frozenset(events)
         day += dt.timedelta(days=1)
-    return frozenset(events)
+    return by_day
+
+
+def delivered_events(data_root: Path, first: dt.date, last: dt.date) -> frozenset[str]:
+    """The events with a ``delivered`` record under ``evidence/alerts/<date>/`` for the dates
+    ``first`` to ``last`` inclusive; a missing or unreadable record is not delivered."""
+    return frozenset().union(*delivered_events_by_day(data_root, first, last).values())

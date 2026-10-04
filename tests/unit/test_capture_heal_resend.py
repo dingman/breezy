@@ -149,10 +149,31 @@ def test_unmarked_heal_older_than_30d_counts_unabandoned(
     assert "heal_alert_unabandoned_count=1 gap_alert_unabandoned_count=0" in caplog.text
 
 
-def test_ledger_missing_or_unreadable_is_not_delivered(
+def test_ledger_missing_or_unreadable_is_not_delivered(world: World) -> None:
+    """MUTATION M-LEDGER: an unreadable ledger FILE is not delivered (the rule lives inside
+    ``delivered_events``), so it fails closed toward a re-send and counts no failure."""
+    event = heal(world, 2)
+    day = _date(NOW)
+    record = world.put(
+        f"evidence/alerts/{day}/{NOW}_heal_d.json",
+        {"schema": "alert_delivery/v1", "event": event, "delivered": True},
+    )
+    record.chmod(0)
+    sender = Sender()
+
+    try:
+        failures = world.run(sender)
+    finally:
+        record.chmod(0o600)
+
+    assert failures == 0 and sender.events("retry") == [event]
+
+
+def test_a_ledger_reader_that_raises_a_refusal_is_one_failure(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """MUTATION M-LEDGER: an unreadable ledger fails closed toward a re-send."""
+    """S3-R56: a ``SingleReadRefused`` (or OSError, ValueError, TypeError) RAISED by
+    ``delivered_events`` is a duty failure; only an unreadable file is silently not delivered."""
     event = heal(world, 2)
 
     def unreadable(*_a: Any) -> frozenset[str]:
@@ -163,7 +184,7 @@ def test_ledger_missing_or_unreadable_is_not_delivered(
 
     failures = world.run(sender)
 
-    assert failures == 0 and sender.events("retry") == [event]
+    assert failures == 1 and sender.events("retry") == [event]
 
 
 def test_a_ledger_reader_that_raises_is_one_failure_and_the_rest_of_heal_still_runs(
@@ -315,3 +336,42 @@ def test_the_dump_of_a_marker_is_json(world: World) -> None:
         (world.root / f"evidence/capture/heal_alert_abandoned/{SHA_A}.json").read_text()
     )
     assert body["key"] == SHA_A and body["proof"] == "delivered"
+
+
+# -- S3-R57: listing failures and invalid date names -------------------------------------------
+
+
+def test_a_failing_abandoned_marker_listing_is_one_failure_not_a_raise(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3-R57: ``list_names(ABANDONED_REL)`` sits inside the resend phase's guard."""
+    heal(world, 2)
+    real: Any = vars(heal_io)["list_names"]
+
+    def listing(root: Path, rel: tuple[str, ...]) -> list[str]:
+        if tuple(rel) == tuple(heal_io.ABANDONED_REL):
+            raise OSError("marker directory unreadable")
+        names: list[str] = real(root, rel)
+        return names
+
+    monkeypatch.setattr(heal_io, "list_names", listing)
+
+    assert world.run(Sender()) == 1
+
+
+def test_an_invalid_date_directory_is_skipped_with_a_log_not_the_whole_listing(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """S3-R57: ``2026-13-45`` passes the date shape but is no date; the other heals re-send."""
+    event = heal(world, 2)
+    world.put(
+        f"evidence/capture/heal/2026-13-45/{NOW}_audit_breezy-quote-tape.json",
+        {"observation_sha256": SHA_B},
+    )
+    sender = Sender()
+
+    with caplog.at_level("INFO"):
+        failures = world.run(sender)
+
+    assert failures == 0 and sender.events("retry") == [event]
+    assert "2026-13-45" in caplog.text

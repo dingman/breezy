@@ -529,3 +529,29 @@ def test_a_malformed_heal_record_is_ignored_not_fatal(tmp_path: Path) -> None:
     doc = proof(tmp_path)
     assert doc["status"] == "PROVEN"
     assert doc["heal_alert_undelivered"] == []
+
+
+def test_the_delivery_ledger_is_read_once_per_call_however_many_heals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3-R57: the roll-up reads the ledger once, not once per heal."""
+    from breezy.analysis import capture_aut6_contract as contract
+
+    put_heal(tmp_path, day(5), kind="nbp", name="a.json")
+    put_heal(tmp_path, day(6), kind="nbp", sha="cd" * 32, name="b.json")
+    put_heal(tmp_path, day(7), kind="nbp", sha="ef" * 32, name="c.json")
+    reads: list[str] = []
+    real: Any = vars(contract)["read_file"]
+
+    def counting(root: Path, rel: tuple[str, ...], name: str, *a: Any) -> Any:
+        if rel[:2] == ("evidence", "alerts") and "notify" not in rel:
+            reads.append(name)
+        return real(root, rel, name, *a)
+
+    put_delivery(tmp_path, day(6), heal_alert_event("cd" * 32))
+    monkeypatch.setattr(contract, "read_file", counting)
+
+    doc = proof(tmp_path)
+
+    assert doc["heal_alert_undelivered_count"] == 2
+    assert len(reads) == 1

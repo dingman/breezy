@@ -337,3 +337,16 @@ def test_the_closure_probe_is_not_vacuous() -> None:
     """Positive control: the same probe flags a program that does load an adapter."""
     code = "import sys, breezy.adapters.polymarket_us.recorder_watchdog\n" + _BAD
     assert _probe(code) != "[]"
+
+
+def test_read_notifier_proofs_survives_an_unreadable_notify_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3-R57: the listing goes through the guarded ``_names`` helper, as the docstring says."""
+
+    def refusing(*_a: Any) -> list[str]:
+        raise OSError("notify directory unreadable")
+
+    monkeypatch.setattr(contract, "list_names", refusing)
+
+    assert contract.read_notifier_proofs(tmp_path, DAY) == ()

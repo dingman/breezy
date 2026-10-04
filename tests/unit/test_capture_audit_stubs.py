@@ -84,6 +84,10 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
     f"{_AN}.capture_aut6_contract": {
         "read_notifier_proofs": ("(data_root: Path, day: dt.date) -> tuple[NotifierProof, ...]"),
         "delivered_events": ("(data_root: Path, first: dt.date, last: dt.date) -> frozenset[str]"),
+        # S3-R57: the one-read per-date form the live-proof roll-up shares with delivered_events
+        "delivered_events_by_day": (
+            "(data_root: Path, first: dt.date, last: dt.date) -> dict[dt.date, frozenset[str]]"
+        ),
     },
 }
 

@@ -310,6 +310,11 @@ def _heal_items(run: _Run, fresh: frozenset[str]) -> list[_Item]:
     for date_name in list_names(run.data_root, HEAL_REL):
         if _DATE_RE.fullmatch(date_name) is None:
             continue
+        try:
+            day = dt.date.fromisoformat(date_name)
+        except ValueError:
+            _LOGGER.warning("capture heal: heal directory %s is not a date, skipped", date_name)
+            continue
         rel = (*HEAL_REL, date_name)
         for name in list_names(run.data_root, rel):
             match = _HEAL_NAME_RE.fullmatch(name)
@@ -328,7 +333,7 @@ def _heal_items(run: _Run, fresh: frozenset[str]) -> list[_Item]:
             items.append(
                 _Item(
                     key=sha,
-                    day=dt.date.fromisoformat(date_name),
+                    day=day,
                     event=heal_alert_event(sha),
                     detail=f"heal={sha} date={date_name}",
                     marker=f"{sha}.json",
@@ -451,7 +456,11 @@ def _process(run: _Run, item: _Item, markers: set[str]) -> None:
 
 
 def _resend_phase(run: _Run, fresh: frozenset[str]) -> None:
-    markers = set(list_names(run.data_root, ABANDONED_REL))
+    try:
+        markers = set(list_names(run.data_root, ABANDONED_REL))
+    except _UNREADABLE as exc:
+        run.fail("abandoned marker listing", exc)
+        return
     for heals in (True, False):
         try:
             items = _heal_items(run, fresh) if heals else _gap_items(run)
@@ -463,14 +472,13 @@ def _resend_phase(run: _Run, fresh: frozenset[str]) -> None:
 
 
 def _delivered(run: _Run) -> frozenset[str]:
-    """The delivered events of the last ``HEAL_ABANDON_DAYS + 1`` days. An unreadable ledger is not
-    delivered, so it fails closed toward a re-send; any other exception from the reader is a duty
-    failure (S3-R52), and the rest of the heal work still runs on the same fail-closed footing."""
+    """The delivered events of the last ``HEAL_ABANDON_DAYS + 1`` days. An unreadable ledger FILE is
+    not delivered: that fail-closed rule lives inside ``delivered_events`` (S3-R56). Every exception
+    it RAISES is one duty failure (S3-R52), and the rest of the heal work still runs, failing closed
+    toward a re-send."""
     first = run.today - dt.timedelta(days=HEAL_ABANDON_DAYS + 1)
     try:
         return delivered_events(run.data_root, first, run.today)
-    except _UNREADABLE as exc:
-        _LOGGER.error("capture heal: delivery ledger unreadable (%s)", type(exc).__name__)
     except Exception as exc:  # noqa: BLE001 - the duty never raises: a reader bug is one failure
         run.fail("delivery ledger", exc)
     return frozenset()
