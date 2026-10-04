@@ -333,6 +333,16 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     #: api-reference_websocket_markets_2026-08-25.md:29-31,114-138``.
     subscribe_trades: bool = False
 
+    #: Opt-in to the systemd watchdog pinger (AUT-1 r12 section 3.10.1). OFF by default: only
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` sets it, so the live trade
+    #: node never creates a pinger and never sends a notification.
+    watchdog_notify: bool = False
+
+    #: The recorder's own streaming directory, ``<catalog_root>/live/<instance_id>``, whose
+    #: ``*.feather`` byte total is the pinger's ``stream_bytes``. Set only with
+    #: ``watchdog_notify`` (the adapter reads no environment and knows no catalog root).
+    watchdog_stream_dir: str | None = None
+
     #: Shard market-data connections at ``cap // 2`` slugs instead of ``cap``
     #: when :attr:`subscribe_trades` is on, so every slug's paired TRADE
     #: subscription always has room under the venue's SHARED per-connection
@@ -402,6 +412,10 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
         if not isinstance(self.subscribe_trades, bool):
             raise SettingsError(
                 f"subscribe_trades must be a bool, was {type(self.subscribe_trades).__name__}"
+            )
+        if not isinstance(self.watchdog_notify, bool):
+            raise SettingsError(
+                f"watchdog_notify must be a bool, was {type(self.watchdog_notify).__name__}"
             )
         if not isinstance(self.trade_shard_halving, bool):
             raise SettingsError(

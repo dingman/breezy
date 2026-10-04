@@ -77,11 +77,12 @@ def test_shipped_table_validates() -> None:
     validate_table()
 
 
-def test_shipped_table_has_exactly_the_three_seam_b_rows() -> None:
+def test_shipped_table_has_exactly_the_three_seam_b_rows_and_the_aut1_stop_hook_row() -> None:
     assert set(AUTONOMY_BWRAP_TABLE) == {
         "breezy-autonomy-selftest",
         "breezy-autonomy-selftest-notify",
         "breezy-autonomy-selftest-proc",
+        "breezy-quote-tape.stop-hook",
     }
     assert all(name == row.name for name, row in AUTONOMY_BWRAP_TABLE.items())
 
@@ -124,7 +125,8 @@ def test_selftest_proc_row_shape() -> None:
 
 def test_every_shipped_row_matches_its_own_unit_name() -> None:
     for name, row in AUTONOMY_BWRAP_TABLE.items():
-        assert unit_matches_row(row, f"{name}.service")
+        # A ``unit.label`` row (the AUT-1 stop hook) names its unit by the stem before the dot.
+        assert unit_matches_row(row, f"{name.split('.', 1)[0]}.service")
 
 
 # -------------------------------------------------------------- module constants
@@ -669,7 +671,7 @@ def test_module_exposes_no_state_changing_bus_verbs() -> None:
 
 
 def test_wrapper_line_only_units_subset_of_row_units_and_disjoint() -> None:
-    assert WRAPPER_LINE_ONLY_UNITS == {}
+    assert set(WRAPPER_LINE_ONLY_UNITS) == {"breezy-quote-tape.service"}
     table = AUTONOMY_BWRAP_TABLE
     row_unit = next(iter(next(iter(table.values())).units))
     cite = MappingProxyType({row_unit: "AUT-1 r12 stop hook"})

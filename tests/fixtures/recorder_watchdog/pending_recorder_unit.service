@@ -1,0 +1,192 @@
+# TEST FIXTURE ONLY (AUT-1 r12 GL1): the step-2 recorder unit text, read by
+# tests/unit/test_recorder_watchdog.py::test_classifier_timing_constants_equal_unit_file.
+# It is never linked into the user manager and no daemon-reload can make it live.
+[Unit]
+# G-14. Reboot-durable supervision for the ONE irreplaceable data stream.
+# Polymarket.us price history is forward-only: an hour not recorded is an hour
+# that can never be obtained. Until this unit is installed the recorder is a
+# PPID-1 orphan in a /tmp session scratchpad with no unit at all -- it does not
+# survive a reboot, and /tmp reaping would delete its supervisor scripts.
+#
+# Conventions below MIRROR breezy-nws-ingest.service, with the restart-policy
+# divergence documented in deploy/systemd/README.md: this unit discriminates
+# failure class by exit code and never rate-limits capture off the air.
+Description=Breezy Polymarket.us quote-tape recorder (user scope)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/docs/core/RUNBOOK_NWS_COLLECTION.md
+After=network-online.target
+Wants=network-online.target
+# Discriminate failure class by EXIT CODE, not by attempt count.
+#
+# 2026-09-09 evidence: the venue markets websocket dropped at 16:00:17Z
+# (quote-tape gap #156 opened 16:00:20Z). The client's fail-fast correctly
+# shut the node down (status=1/FAILURE -- FATAL market-data fault, not a
+# config error). systemd then restarted at RestartSec=30 until
+# StartLimitBurst=20 was exhausted, logged "Start request repeated too
+# quickly" at 17:28:05Z, and gave up permanently. Capture stayed dead until
+# a manual reset-failed + start at 00:09Z on 09-10 -- 6.7 hours of
+# irreplaceable tape lost, after the venue itself had recovered.
+#
+# The old numbers were internally inconsistent. "20 attempts per hour" at
+# RestartSec=30 is 20 * 30s = 600s of wall clock -- ten MINUTES, not an
+# hour. Any venue outage longer than ~10 minutes parked the recorder, which
+# is exactly the "leave the tape dead until an operator noticed" outcome
+# the comment said it existed to prevent. The NWS unit's 3/300s is even
+# tighter (~15 s at RestartSec=5); that is defensible there because NWS
+# climate records are re-fetchable. Polymarket.us price history is not.
+#
+# Exit 2 = configuration/environment error (quote_tape_cli.py:109, :270-272).
+# Restarting cannot change the env; RestartPreventExitStatus=2 fails closed
+# immediately and leaves the unit failed for `systemctl status`.
+# Exit 1 = runtime / FATAL market-data fault (quote_tape_cli.py:108,
+# :145-174) -- retry indefinitely. StartLimitIntervalSec=0 disables the
+# start-rate limiter that made 09-09 permanent (systemd.unit(5): interval 0
+# disables rate limiting). Backoff (RestartSteps / RestartMaxDelaySec,
+# added in systemd 254; this host is 259) replaces a 30s hammer so a
+# multi-hour outage does not spin a hot loop; the first retry stays 30s so
+# a blip is still recovered at the old latency.
+StartLimitIntervalSec=0
+
+# AUT-1 r12 section 3.10.2 (WP3 step 2): the per-kill page is AUT-6's notifier (X-4).
+OnFailure=breezy-autonomy-failed@%n.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling, so this unit's OOM decision is never left to the
+# host-wide OOM killer choosing arbitrarily among every process on a 31 GB
+# box. Measured incident (2026-09-03 22:31 UTC,
+# tests/unit/test_polymarket_us_connect_fail_fast.py:3-4): the recorder was
+# killed with no MemoryHigh=/MemoryMax= configured at all -- zero per-cgroup
+# accounting, so it competed on equal footing with everything else on the
+# host. Measured steady state right after: MemoryCurrent ~= 1.10 GB,
+# MemoryPeak ~= 1.14 GB after 28 minutes uptime (30+ subscribed instruments).
+# MemoryHigh=2G gives the kernel a throttling signal (reclaim/backoff) at
+# roughly 1.8x the measured peak -- enough headroom that ordinary operation
+# is never throttled, but low enough to bite before the host itself is under
+# memory pressure. MemoryMax=3G is the hard ceiling this cgroup's own kill
+# fires at: still under a tenth of the 31 GB host, so a leak here is this
+# unit's cgroup OOM-killing ITSELF, not the host's global OOM killer picking
+# among unrelated processes to save the box. Restart=always (below) recovers
+# from that kill exactly like any other exit.
+MemoryHigh=2G
+MemoryMax=3G
+# Mirrors the NWS unit. The tape is not a secret but it is strategy-inferable
+# (which markets Breezy watches, and from when); the recorder already creates
+# its root 0700 via `prepare_quote_tape_root`.
+UMask=0077
+
+# Exactly the file both supervisor loops source
+# (tape_supervisor.sh:17, tape_supervisor_k1.sh:27 -- `. /home/jon/.config/breezy/polymarket.env`).
+# Supplies POLYMARKET_US_{KEY_ID,SECRET_KEY_FILE,API_BASE,GATEWAY_BASE,WS_URL,
+# MARKET_SLUGS,USER_AGENT}. Note BREEZY_USER_AGENT is NOT used by this role:
+# the venue user agent is POLYMARKET_US_USER_AGENT, owned by
+# `polymarket_us.factories.config_from_env`, never by runtime/settings.py
+# (src/breezy/runtime/settings.py:12-16).
+EnvironmentFile=/home/jon/.config/breezy/polymarket.env
+
+# AUD-08b: ONLY the alert webhook (the repo's alert-egress convention), so the
+# recorder's BREEZY_SIGHTING_SIDECAR_BROKEN alert (raised after
+# SIGHTING_SINK_FAILURE_ALERT_CYCLES consecutive failed sidecar appends)
+# reaches a human rather than the journal. Optional ("-"): absent means the
+# alert degrades to a log line and never fails the recorder.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+# The one variable the supervisors export on top of that env file
+# (tape_supervisor.sh:18; tape_supervisor_k1.sh:9+28). Required with NO
+# default and must be absolute -- src/breezy/runtime/settings.py:557-576.
+Environment=BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG=/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us
+
+# EDGE-6 6d (docs/plans/backlog/EDGE_2026-09-27/EDGE-6_ops_reliability_
+# plan_r2_2026-09-27.md section 2.4/4): an OPTIONAL operator override of the
+# adapter's native discovery-reload cadence
+# (data.py:1202-1204 -- an explicit `instrument_reload_interval_mins` wins
+# outright over the derived cadence). 15 minutes bounds the recorder's
+# capture lag on a newly-listed D+1 market to that window, versus the
+# ~5h13m lag measured under the derived cadence (which targets exact venue
+# boundaries, not a fixed poll). Recorder-only, on PURPOSE:
+# `breezy-trade-supervisor.service` also loads polymarket.env, and the live
+# node's cadence must not change, so this goes here as `Environment=`,
+# NEVER in polymarket.env (shared with the supervisor) -- see AM-3 in the
+# plan's r2 final amendment, and `test_trade_supervisor_unit_does_not_set_
+# discovery_reload_interval` in `tests/unit/test_quote_tape_unit_env.py`.
+Environment=POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS=15
+
+# Byte-identical to what the supervisors launch (tape_supervisor.sh:21-22,
+# tape_supervisor_k1.sh:31-32) and to the running recorder's
+# /proc/<pid>/cmdline. The explicit interpreter form is kept rather than the
+# NWS unit's bare console script so the cutover changes supervision ONLY.
+ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-quote-tape
+
+Restart=always
+# Exit 2 is a CONFIGURATION error -- missing/malformed env, unreadable key
+# file, bad catalog path (quote_tape_cli.py:52-61, :109, :270-272). The
+# process environment is fixed for this unit's lifetime, so a restart
+# cannot fix it; restarting would only hot-loop and hide the fault behind
+# a "restarting" status. Same discrimination as
+# breezy-trade-supervisor.service, and the recorder's 0/1/2 contract
+# matches that sibling (trade_supervisor_core.py:74-76).
+RestartPreventExitStatus=2
+# First retry stays 30s -- the supervisors' poll cadence this unit
+# replaced, and the recovery latency of a short blip. Then exponential
+# backoff: RestartSec=30, RestartSteps=4, RestartMaxDelaySec=480 produces
+# 30s, 60s, 120s, 240s, 480s, 480s, ... (ratio (480/30)^(1/4) = 2). A
+# multi-hour venue outage therefore retries forever at 8 min, not 120
+# times an hour.
+RestartSec=30
+RestartSteps=4
+RestartMaxDelaySec=480
+
+# SIGTERM is the signal the recorder's CLEAN-shutdown path actually handles.
+# Proven: NautilusKernel._setup_loop registers SIGTERM/SIGINT/SIGABRT on the
+# event loop for every non-BACKTEST environment
+# (.venv/.../nautilus_trader/system/kernel.py:558-572, reached from :284-287),
+# and a clean stop is what runs StreamingFeatherWriter.close(), which appends
+# the Arrow end-of-stream marker
+# (tests/contract/test_quote_tape_unclean_shutdown.py:220-235).
+# This is the whole ballgame: SIGKILL instead leaves a mid-message tail, and
+# ParquetDataCatalog._read_feather_file then returns ZERO rows in total
+# silence (same file, :166-187). Never stop this unit with SIGKILL.
+KillSignal=SIGTERM
+
+# Generous on purpose. The writer flushes only every 10s
+# (QUOTE_TAPE_FLUSH_INTERVAL_MS, src/breezy/runtime/node_config.py:292), and a
+# Nautilus graceful stop then disconnects clients and disposes the kernel.
+# When TimeoutStopSec expires systemd escalates to SIGKILL, which is exactly
+# the silent-zero-rows failure above -- so this must never be the binding
+# constraint. The default 90s is replaced with 120s for headroom.
+TimeoutStopSec=120
+
+# AUT-1 r12 section 3.10.2: the watchdog is armed at READY=1; SIGTERM lets Nautilus flush.
+# TimeoutStartSec is the base budget: the listing hole is carried by EXTEND_TIMEOUT_USEC.
+WatchdogSec=600
+WatchdogSignal=SIGTERM
+TimeoutStartSec=180
+
+# Evidence-only stop hook (X-4): the `-` keeps any hook outcome from changing Result.
+ExecStopPost=-/usr/bin/timeout -k 2 10 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-quote-tape.stop-hook /home/jon/breezy/.venv/bin/python3 -m breezy.runtime.capture_recorder_hook_cli
+
+# journald, matching the NWS unit -- deliberately NOT the supervisors'
+# append-to-a-file-in-/tmp. journald is reboot-durable, rotated, and queryable
+# per-unit (`journalctl --user -u breezy-quote-tape`); the /tmp log is exactly
+# the thing G-14 exists to remove. The recorder's own diagnostics already
+# reach stdout/stderr through `breezy.runtime.logging_bridge`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-quote-tape
+
+# NO SuccessExitStatus. The exit contract must reach `systemctl status`:
+#   0 = clean shutdown, 1 = FATAL market-data fault (fail-closed; commit
+#   79b9b44 exists precisely so a dead feed is not reported as success),
+#   2 = configuration/environment error.
+# Code 1 also covers an INITIAL connect failure (the data client's own
+# `_connect` raising, not just a later feed loss): PolymarketUSDataClient
+# latches the same fatal fault and requests the same native shutdown in
+# that case too, so a dead venue socket at start-up no longer leaves the
+# node "RUNNING" with zero quotes for RestartSec to never trigger on.
+# See src/breezy/runtime/quote_tape_cli.py:52-61 and :145-174.
+
+[Install]
+WantedBy=default.target

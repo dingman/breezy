@@ -65,7 +65,7 @@ from typing import Any, Final, Protocol, cast, runtime_checkable
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
-from nautilus_trader.common.enums import LogColor
+from nautilus_trader.common.enums import ComponentState, LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.data import Data
 from nautilus_trader.data.messages import (
@@ -101,6 +101,15 @@ from breezy.adapters.polymarket_us.parsing import (
     parse_trade_tick,
     venue_market_state,
     venue_settlement_method,
+)
+from breezy.adapters.polymarket_us.recorder_watchdog import (
+    PHASE_CONNECTING,
+    PHASE_DISCOVERING,
+    PHASE_SAFE_MODE,
+    PHASE_STREAMING,
+    RecorderSample,
+    RecorderWatchdogPinger,
+    stream_bytes_total,
 )
 from breezy.adapters.polymarket_us.symbology import (
     POLYMARKET_US_VENUE,
@@ -197,6 +206,19 @@ ONE_SIDED_BOOK_SUMMARY_EVERY: Final[int] = 1000
 
 #: How often the safe-mode watchdog samples the socket's degraded flag.
 DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
+
+#: Client states that mean a stop has begun (AUT-1 r12 section 3.10.1; WP0 part c): the
+#: watchdog pinger sends no start-timeout extension in any of them.
+_STOPPING_STATES: Final[frozenset[ComponentState]] = frozenset(
+    {
+        ComponentState.STOPPING,
+        ComponentState.STOPPED,
+        ComponentState.DISPOSING,
+        ComponentState.DISPOSED,
+        ComponentState.FAULTING,
+        ComponentState.FAULTED,
+    }
+)
 
 #: Diagnostics retained for the most recent frames only. An unbounded list
 #: here leaked ~1 GB/h on the live node (2026-09-05); the only reader wants
@@ -759,6 +781,17 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._feed_watchdog: asyncio.Task[None] | None = None
         self._update_instruments_task: asyncio.Task[None] | None = None
         self._safe_mode: bool = False
+        # AUT-1 r12 section 3.10.1 (EM6): read-only watchdog state. Written only by the
+        # lifecycle below; read by `_recorder_sample`. None of it changes any behaviour.
+        self._phase: str = PHASE_DISCOVERING
+        self._phase_started_ns: int = self._clock.timestamp_ns()
+        self._safe_mode_since_ns: int = 0
+        self._last_discovery_reload_ns: int = 0
+        self._last_scheduled_reload_delay_secs: float = 0.0
+        self._discovery_attempt_inflight_since_ns: int = 0
+        self._watchdog_pinger: RecorderWatchdogPinger | None = None
+        self._watchdog_pinger_task: asyncio.Task[None] | None = None
+        self._disconnecting: bool = False
         # Bounds the native shutdown request in `sample_feed_health`. That
         # method is public and callable on a cadence, so without a ceiling a
         # dead feed would spray `ShutdownSystem` commands at the kernel -- and
@@ -778,6 +811,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._dropped_frames: int = 0
         self._frames_missing_routing_key: int = 0
         self._quotes_published: int = 0
+        self._depths_published: int = 0
         self._frame_diagnostics: deque[FrameDiagnostic] = deque(maxlen=FRAME_DIAGNOSTICS_CAPACITY)
         # Tape-gap accounting. `None` for "never sampled yet", so the very
         # first sample cannot be mistaken for a transition. When the feed
@@ -831,6 +865,46 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     def is_safe_mode(self) -> bool:
         """True once the markets feed was lost and will not come back."""
         return self._safe_mode
+
+    @property
+    def watchdog_phase(self) -> str:
+        """DISCOVERING, CONNECTING, STREAMING or SAFE_MODE (AUT-1 r12 section 3.10.1)."""
+        return PHASE_SAFE_MODE if self._safe_mode else self._phase
+
+    @property
+    def watchdog_phase_started_ns(self) -> int:
+        return self._safe_mode_since_ns if self._safe_mode else self._phase_started_ns
+
+    @property
+    def depths_published(self) -> int:
+        """Order-book depths handed to the data engine, the twin of :attr:`quotes_published`."""
+        return self._depths_published
+
+    @property
+    def discovered_slug_count(self) -> int:
+        return len(self._provider_active_slugs())
+
+    @property
+    def subscribed_slug_count(self) -> int:
+        return len(self._quote_subscribed_slugs | self._depth_subscribed_slugs)
+
+    @property
+    def feed_watch_alive(self) -> bool:
+        return self._feed_watchdog is not None and not self._feed_watchdog.done()
+
+    @property
+    def last_discovery_reload_ns(self) -> int:
+        """Clock ns of the last completed discovery (0 before the reload loop starts)."""
+        return self._last_discovery_reload_ns
+
+    @property
+    def last_scheduled_reload_delay_secs(self) -> float:
+        return self._last_scheduled_reload_delay_secs
+
+    @property
+    def discovery_attempt_inflight_since_ns(self) -> int:
+        """Non-zero only while a connect-time discovery attempt is in flight (GM1)."""
+        return self._discovery_attempt_inflight_since_ns
 
     @property
     def silent_subscription_alerts(self) -> int:
@@ -1085,7 +1159,11 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         while True:
             attempt += 1
             try:
-                await self._instrument_provider.initialize()
+                self._discovery_attempt_inflight_since_ns = self._clock.timestamp_ns()
+                try:
+                    await self._instrument_provider.initialize()
+                finally:
+                    self._discovery_attempt_inflight_since_ns = 0
                 return
             except EmptyClimateListingError:
                 elapsed_secs = (self._clock.timestamp_ns() - started_ns) / 1_000_000_000.0
@@ -1099,16 +1177,22 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                 await asyncio.sleep(DISCOVERY_RELOAD_FLOOR_SECS)
 
     async def _connect(self) -> None:
+        # AUT-1 r12 section 3.10.1: the pinger is the FIRST statement, so discovery (which can
+        # wait an hour in the listing hole) is covered by start-timeout extension.
+        self._ensure_watchdog_pinger()
         self._safe_mode = False
+        self._set_phase(PHASE_DISCOVERING)
         try:
             self._log.info("Initializing instruments...")
             await self._initialize_instruments_for_connect()
+            self._set_phase(PHASE_CONNECTING)
             self._send_all_instruments_to_data_engine()
             await self._alert_on_missing_cache_after_push(self._provider_active_slugs())
 
             await self._feed.connect()
 
             await self._reconcile_discovered_subscriptions(cycle="initial")
+            self._mark_streaming_ready()
 
             self._update_instruments_task = self.create_task(
                 self._update_instruments(),
@@ -1137,7 +1221,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             # WHOLE body above -- an unwrapped `initialize()` (empty-listing
             # exhaustion or any other discovery failure) swallowed the exact
             # same way, into the exact same zombie.
-            self._safe_mode = True
+            self._enter_safe_mode()
             self._set_connected(False)
             reason = (
                 "Polymarket.us markets client failed to connect (feed "
@@ -1147,9 +1231,87 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             return
 
     async def _disconnect(self) -> None:
+        self._disconnecting = True
+        await self._cancel_watchdog_pinger()
         await self._cancel_update_instruments()
         await self._cancel_feed_watchdog()
         await self._feed.close()
+
+    # -- AUT-1 r12 section 3.10.1: the recorder's watchdog pinger -----------
+
+    def _set_phase(self, phase: str) -> None:
+        self._phase = phase
+        self._phase_started_ns = self._clock.timestamp_ns()
+
+    def _enter_safe_mode(self) -> None:
+        if not self._safe_mode:
+            self._safe_mode_since_ns = self._clock.timestamp_ns()
+        self._safe_mode = True
+
+    def _watchdog_stop_begun(self) -> bool:
+        """True once this client is being stopped: extension must end (WP0 part c)."""
+        return self._disconnecting or self.state in _STOPPING_STATES
+
+    def _recorder_sample(self) -> RecorderSample:
+        directory = self._venue_config.watchdog_stream_dir
+        return RecorderSample(
+            now_ns=self._clock.timestamp_ns(),
+            phase=self.watchdog_phase,
+            phase_started_ns=self.watchdog_phase_started_ns,
+            discovered_slugs=self.discovered_slug_count,
+            subscribed_count=self.subscribed_slug_count,
+            quotes_published=self._quotes_published,
+            depths_published=self._depths_published,
+            trades_published=self._trades_published,
+            is_tape_gap_open=self.is_tape_gap_open,
+            safe_mode=self._safe_mode,
+            feed_watch_alive=self.feed_watch_alive,
+            last_discovery_reload_ns=self._last_discovery_reload_ns,
+            last_scheduled_reload_delay_secs=self._last_scheduled_reload_delay_secs,
+            discovery_attempt_inflight_since_ns=self._discovery_attempt_inflight_since_ns,
+            stream_bytes=stream_bytes_total(directory) if directory else 0,
+        )
+
+    def _ensure_watchdog_pinger(self) -> None:
+        """Create the pinger task once; a re-entered `_connect` reuses the running one."""
+        if not self._venue_config.watchdog_notify:
+            return
+        task = self._watchdog_pinger_task
+        if task is not None and not task.done():
+            return
+        pinger = self._watchdog_pinger
+        if pinger is None:
+            pinger = RecorderWatchdogPinger(
+                read_sample=self._recorder_sample,
+                clock_ns=self._clock.timestamp_ns,
+                logger=self._log,
+                interval_s=self._feed_watch_interval_secs,
+                stop_begun=self._watchdog_stop_begun,
+                discovery_retry_secs=self._venue_config.empty_discovery_retry_secs,
+            )
+            self._watchdog_pinger = pinger
+        new_task = self._loop.create_task(pinger.run(), name="polymarket-us-watchdog-pinger")
+        new_task.add_done_callback(pinger.on_task_done)
+        self._watchdog_pinger_task = new_task
+
+    def _mark_streaming_ready(self) -> None:
+        """The feed is connected and subscribed to the current listing: STREAMING and READY=1."""
+        self._set_phase(PHASE_STREAMING)
+        if self._watchdog_pinger is not None:
+            self._watchdog_pinger.mark_ready()
+
+    async def _cancel_watchdog_pinger(self) -> None:
+        task = self._watchdog_pinger_task
+        self._watchdog_pinger_task = None
+        if task is None or task.done():
+            return
+        current = asyncio.current_task()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            if current is not None and current.cancelling() > 0:
+                raise
 
     async def _cancel_update_instruments(self) -> None:
         task = self._update_instruments_task
@@ -1246,9 +1408,14 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                 self._log.debug(
                     f"Scheduled task 'update_instruments' to run in {delay_secs:.0f} seconds"
                 )
+                self._last_scheduled_reload_delay_secs = delay_secs
+                if self._last_discovery_reload_ns == 0:
+                    # The connect-time discovery is the baseline for the first reload.
+                    self._last_discovery_reload_ns = self._clock.timestamp_ns()
                 await asyncio.sleep(delay_secs)
                 try:
                     await self._run_one_reload_cycle()
+                    self._last_discovery_reload_ns = self._clock.timestamp_ns()
                 except Exception as exc:  # noqa: BLE001 - deliberate: see below
                     # `asyncio.CancelledError` derives from `BaseException`, so
                     # cancellation still propagates to the handler below and
@@ -1597,6 +1764,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             )
             if depth is not None:
                 self._handle_data(depth)
+                self._depths_published += 1
                 published += 1
                 published += self._note_depth_truncation(payload, depth, ts_init)
 
@@ -1992,7 +2160,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         if not self._feed.is_fatally_degraded:
             return True
 
-        self._safe_mode = True
+        self._enter_safe_mode()
         self._set_connected(False)
         reason = (
             "Polymarket.us markets feed lost and not recoverable; "

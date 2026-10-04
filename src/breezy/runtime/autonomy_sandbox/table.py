@@ -41,8 +41,11 @@ AUTONOMY_OWNED_UNITS: Final[frozenset[str]] = frozenset()
 #: unit -> its E-7a rule-5 citation. Empty in seam B; filled by AUT-1.
 UNWRAPPED_RESIDUAL_UNITS: Final[Mapping[str, str]] = MappingProxyType({})
 #: unit -> owning-plan citation. Row units that are NOT autonomy-owned and only have their
-#: wrapper lines linted (B6-R4). Empty in seam B; AUT-1 adds the recorder in its own commit.
-WRAPPER_LINE_ONLY_UNITS: Final[Mapping[str, str]] = MappingProxyType({})
+#: wrapper lines linted (B6-R4). Empty in seam B; AUT-1 adds the recorder (its stop hook only:
+#: the recorder's own ``ExecStart`` stays unwrapped, the E-7a rule-5 residual).
+WRAPPER_LINE_ONLY_UNITS: Final[Mapping[str, str]] = MappingProxyType(
+    {"breezy-quote-tape.service": "AUT-1 r12 section 3.10.2 (evidence-only stop hook)"}
+)
 
 #: ``credential_env`` keys are applied by ``--setenv`` AFTER the fixed
 #: environment, so a table edit could otherwise override it (B5-R4).
@@ -232,6 +235,18 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
                 host_proc=True,
                 studies_lock=True,
                 exceptions=frozenset({"E7A_R2_PROC", "E7_STUDIES_LOCK"}),
+            ),
+            # AUT-1 r12 section 3.10.2: the recorder's evidence-only stop hook. It binds only
+            # the stall-record and health directories, reads SERVICE_RESULT / INVOCATION_ID from
+            # the ExecStopPost environment, and needs neither the bus (no in-row systemctl,
+            # WP0-R1), nor DNS, nor any credential.
+            BwrapRow(
+                name="breezy-quote-tape.stop-hook",
+                owner_plan="AUT-1",
+                units=frozenset({"breezy-quote-tape.service"}),
+                binds=("evidence/capture/stall", "health/recorder_watchdog"),
+                entry_modules=("breezy.runtime.capture_recorder_hook_cli",),
+                resolves_dns=False,
             ),
         )
     }
@@ -460,16 +475,34 @@ def _check_line_only(
             raise TableError(f"wrapper-line-only unit {unit!r} needs an owning-plan citation")
 
 
+def effective_line_only_units(
+    table: Mapping[str, BwrapRow], wrapper_line_only_units: Mapping[str, str] | None
+) -> Mapping[str, str]:
+    """The line-only map to apply. An explicit map is used as given (and strictly validated).
+
+    ``None`` means "the shipped map": ``WRAPPER_LINE_ONLY_UNITS`` restricted to the units that
+    ``table`` lists, so a table that omits the shipped row (a test fixture, a subset) is judged
+    on its own rows and not refused for a unit it never mentions.
+    """
+    if wrapper_line_only_units is not None:
+        return wrapper_line_only_units
+    row_units = frozenset(unit for row in table.values() for unit in row.units)
+    return MappingProxyType(
+        {unit: cite for unit, cite in WRAPPER_LINE_ONLY_UNITS.items() if unit in row_units}
+    )
+
+
 def validate_table(
     table: Mapping[str, BwrapRow] = AUTONOMY_BWRAP_TABLE,
     *,
     owned_units: frozenset[str] = AUTONOMY_OWNED_UNITS,
     residual_units: Mapping[str, str] = UNWRAPPED_RESIDUAL_UNITS,
-    wrapper_line_only_units: Mapping[str, str] = WRAPPER_LINE_ONLY_UNITS,
+    wrapper_line_only_units: Mapping[str, str] | None = None,
 ) -> None:
     """Raise ``TableError`` on the first rule the table breaks; return ``None`` if sound."""
     if not table:
         raise TableError("the table has no rows")
+    wrapper_line_only_units = effective_line_only_units(table, wrapper_line_only_units)
     for key, row in table.items():
         _check_identity(key, row)
         _check_labels(row)

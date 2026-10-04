@@ -39,8 +39,8 @@ from breezy.runtime.autonomy_sandbox.table import (
     AUTONOMY_OWNED_UNITS,
     ROW_NAME_RE,
     UNWRAPPED_RESIDUAL_UNITS,
-    WRAPPER_LINE_ONLY_UNITS,
     BwrapRow,
+    effective_line_only_units,
     validate_table,
 )
 
@@ -548,9 +548,10 @@ def lint_units(
     *,
     owned_units: frozenset[str] = AUTONOMY_OWNED_UNITS,
     residual_units: Mapping[str, str] = UNWRAPPED_RESIDUAL_UNITS,
-    wrapper_line_only_units: Mapping[str, str] = WRAPPER_LINE_ONLY_UNITS,
+    wrapper_line_only_units: Mapping[str, str] | None = None,
 ) -> tuple[LintError, ...]:
     """Lint every in-scope unit under ``unit_dir`` against ``table``; ``()`` means clean."""
+    wrapper_line_only_units = effective_line_only_units(table, wrapper_line_only_units)
     validate_table(
         table,
         owned_units=owned_units,

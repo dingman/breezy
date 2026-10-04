@@ -52,6 +52,7 @@ Deployment values are never hardcoded here: every one comes from settings.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import stat
@@ -85,6 +86,15 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.config import StreamingConfig
 from nautilus_trader.persistence.writer import RotationMode
 
+from breezy.adapters.polymarket_us.recorder_watchdog import (
+    CONNECT_BUDGET_S,
+    DISCOVERING_GRACE_S,
+    ROTATE_MARGIN_S,
+    START_EXTEND_S,
+    STOP_HOOK_BOUND_S,
+    UNIT_TIMEOUT_START_SEC,
+    UNIT_TIMEOUT_STOP_SEC,
+)
 from breezy.adapters.polymarket_us.tape_records import (
     DepthTruncation,
     QuoteTapeGap,
@@ -348,6 +358,42 @@ QUOTE_TAPE_CACHE_CAPACITY: int = 1
 #: immediately) -- only this ONE process's config is widened.
 QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS: float = 3600.0
 
+
+def recorder_max_start_s(
+    base_start_s: float,
+    *,
+    discovery_retry_s: float = QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS,
+    discovering_grace_s: float = DISCOVERING_GRACE_S,
+    connect_budget_s: float = CONNECT_BUDGET_S,
+    extend_s: float = START_EXTEND_S,
+) -> int:
+    """The longest a recorder start can run under `EXTEND_TIMEOUT_USEC` (AUT-1 r12 GH1).
+
+    Base start (process start to `_connect`) + the discovering window (retry budget + grace) +
+    the connecting budget + the last extension's tail. 4500 s at a base of 180 s.
+    """
+    return math.ceil(
+        base_start_s + discovery_retry_s + discovering_grace_s + connect_budget_s + extend_s
+    )
+
+
+def rotate_timeout_start_s(
+    max_start_s: float,
+    *,
+    member_stop_s: float = UNIT_TIMEOUT_STOP_SEC,
+    hook_bound_s: float = STOP_HOOK_BOUND_S,
+    margin_s: float = ROTATE_MARGIN_S,
+) -> int:
+    """The rotate unit's `TimeoutStartSec`: stop + hook + max start + margin, to whole minutes."""
+    total = member_stop_s + hook_bound_s + max_start_s + margin_s
+    return math.ceil(total / 60) * 60
+
+
+#: AUT-1 r12 GH1: ONE constant for the recorder's longest start and ONE for the rotate bound.
+#: Every unit-file literal and every cross-plan reader derives from these two names.
+QUOTE_TAPE_MAX_START_SECS: int = recorder_max_start_s(UNIT_TIMEOUT_START_SEC)
+QUOTE_TAPE_ROTATE_TIMEOUT_START_SECS: int = rotate_timeout_start_s(QUOTE_TAPE_MAX_START_SECS)
+
 #: GL-12: native `timeout_connection` (`system/config.py:85,127`, default
 #: 60.0) for the quote-tape node ONLY. Must exceed
 #: :data:`QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS` -- otherwise
@@ -579,6 +625,12 @@ def build_quote_tape_node_config(
         # sidecar persistently broken. Injected here because the adapter may
         # not import the runtime alert path.
         sighting_failure_alert_path=SIGHTING_SIDECAR_BROKEN_ALERT_PATH,
+        # AUT-1 r12 section 3.10.1, quote-tape ONLY: opt in to the systemd watchdog pinger.
+        # Under today's `Type=simple` every notification is a no-op; the trade node never
+        # sets this. The stream dir is the kernel's `<catalog>/live/<instance_id>` (the byte
+        # total the gate watches).
+        watchdog_notify=True,
+        watchdog_stream_dir=str(settings.catalog_root / "live" / instance_id.value),
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
