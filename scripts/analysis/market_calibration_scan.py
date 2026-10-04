@@ -49,7 +49,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from statistics import NormalDist, median
@@ -490,6 +490,23 @@ class Cell:
     se: float
     mde_bonferroni_80: float
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "window": self.window,
+            "side": self.side,
+            "ask_bin": self.ask_bin,
+            "n": self.n,
+            "n_days": self.n_days,
+            "mean_excess": self.mean_excess,
+            "ci95_lo": self.ci95_lo,
+            "ci95_hi": self.ci95_hi,
+            "p_one_sided": self.p_one_sided,
+            "p_bonferroni": self.p_bonferroni,
+            "t_stat": self.t_stat,
+            "se": self.se,
+            "mde_bonferroni_80": self.mde_bonferroni_80,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ZeroVarianceCell:
@@ -499,6 +516,16 @@ class ZeroVarianceCell:
     n: int
     n_days: int
     mean_excess: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "window": self.window,
+            "side": self.side,
+            "ask_bin": self.ask_bin,
+            "n": self.n,
+            "n_days": self.n_days,
+            "mean_excess": self.mean_excess,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,8 +787,8 @@ def build_report(
         report.update(
             n_days=scan.n_days,
             untested_cells=scan.untested_cells,
-            cells=[asdict(c) for c in scan.cells],
-            zero_variance_cells=[asdict(c) for c in scan.zero_variance_cells],
+            cells=[c.to_dict() for c in scan.cells],
+            zero_variance_cells=[c.to_dict() for c in scan.zero_variance_cells],
             multiplicity=scan.multiplicity,
             conclusion=_conclusion(scan),
         )
