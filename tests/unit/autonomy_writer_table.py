@@ -10,7 +10,7 @@ Module-level rows and function-level rows differ on purpose. ``registry_store`` 
 and journal and is allowed as a whole module. ``single_read`` is allowed only inside the named
 functions (and the private helpers they call), so a new write path in that module still fails.
 
-Entries for code that has not landed (``ensure_dir``, ``registry_store``,
+Entries for code that has not landed (``registry_store``,
 ``live_orders_gate._verify_ruling_file``) are accepted while absent: an allowlist row matching no
 site never fails the scan. They are named now so the owner who lands the code does not have to widen
 the gate to ship it.
@@ -100,22 +100,13 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(
         _SINGLE_READ, "write_once_tmpfile", "the O_TMPFILE write-once publisher (A5b-R4)"
     ),
-    WriteSiteRule(_SINGLE_READ, "ensure_dir", "the one directory creator (not yet landed)"),
+    WriteSiteRule(_SINGLE_READ, "ensure_dir", "the one directory creator (A4-R4)"),
     # Private helpers of the three entries above. They hold the actual os.open / os.link /
     # os.replace / os.unlink calls and are named so a new helper needs a reviewed row.
     WriteSiteRule(_SINGLE_READ, "_write_temp", "write_once and replace_atomic temp file"),
     WriteSiteRule(_SINGLE_READ, "_finish", "write_once and replace_atomic temp cleanup"),
     WriteSiteRule(_SINGLE_READ, "_cleanup_temp", "write_once and replace_atomic temp cleanup"),
     WriteSiteRule(_SINGLE_READ, "_link_temp", "write_once hard-link publish"),
-    # Transitional: walk_dirs(create=True) creates directories itself until ensure_dir lands.
-    # test_walk_dirs_mkdir_row_retired (strict xfail, owner 6d) forces this row's removal.
-    WriteSiteRule(
-        _SINGLE_READ,
-        "walk_dirs",
-        "create=True mkdir; superseded by ensure_dir",
-        owner="ARCH-0 6d",
-        closing="replace by single_read.ensure_dir",
-    ),
     WriteSiteRule(
         "breezy.persistence.autonomy.registry_store",
         None,

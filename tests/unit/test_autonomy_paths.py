@@ -53,6 +53,7 @@ CASES: tuple[tuple[str, tuple[Any, ...]], ...] = (
     _case("verdict_file", ("pm_us_crh_fq_v1", DAY, SHA)),
     _case("artefact_dir", ("forecast_quantile_ladder:density_table", SHA)),
     _case("artefact_file", ("forecast_quantile_ladder:density_table", SHA)),
+    _case("root_record", ("forecast_quantile_ladder:density_table", SHA, "pm_us_crh_fq_v1")),
 )
 
 
@@ -194,6 +195,9 @@ def test_storage_layout_matches_plan() -> None:
     assert p.verdict_file("fam_1", DAY, SHA) == ROOT / f"derived/verdicts/fam_1/{DAY}/{SHA}.json"
     mc = "forecast_quantile_ladder:density_table"
     assert p.artefact_file(mc, SHA) == ROOT / f"derived/artefacts/{mc}/{SHA}/artefact.json"
+    assert (
+        p.root_record(mc, SHA, "fam_1") == ROOT / f"derived/artefacts/{mc}/{SHA}/roots/fam_1.json"
+    )
 
 
 def test_family_component_accepted_by_both_existing_id_patterns() -> None:

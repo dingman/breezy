@@ -4,7 +4,7 @@
 so a recompute of the same slot from the same inputs dedupes. ``valid_until_ns`` is slot-anchored
 and stays in the body. A second write under an existing id is a no-op when the stored body differs
 only in ``produced_at_ns`` and ``VerdictIdCollision`` otherwise. Every write is
-``single_read.write_once`` (0600); the date directories are made by ``single_read.walk_dirs``.
+``single_read.write_once`` (0600); the date directories are made by ``single_read.ensure_dir``.
 
 Every non-integer number is a canonical decimal string (``canonical.decimal_str``). Refusals carry
 enums, never paths.
@@ -35,6 +35,7 @@ from breezy.persistence.autonomy.single_read import (
     SingleReadReason,
     SingleReadRefused,
     WriteOutcome,
+    ensure_dir,
     open_root,
     read_once_at,
     walk_dirs,
@@ -433,7 +434,7 @@ def _read_stored(paths: AutonomyPaths | ShadowPaths, family_id: str, day: str, v
     path = paths.verdict_file(family_id, day, vid)
     rootfd = open_root(paths.root)
     try:
-        dirfd = walk_dirs(rootfd, path.parent.relative_to(paths.root).parts, create=False)
+        dirfd = walk_dirs(rootfd, path.parent.relative_to(paths.root).parts)
         try:
             return read_once_at(
                 dirfd, path.name, max_bytes=MAX_VERDICT_BYTES, policy=ReadPolicy.STRICT
@@ -447,7 +448,7 @@ def _read_stored(paths: AutonomyPaths | ShadowPaths, family_id: str, day: str, v
 def _ensure_dirs(paths: AutonomyPaths | ShadowPaths, parent_rel: tuple[str, ...]) -> None:
     rootfd = open_root(paths.root)
     try:
-        os.close(walk_dirs(rootfd, parent_rel, create=True))
+        os.close(ensure_dir(rootfd, parent_rel))
     finally:
         os.close(rootfd)
 

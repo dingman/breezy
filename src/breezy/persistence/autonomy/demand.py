@@ -59,6 +59,7 @@ from breezy.persistence.autonomy.single_read import (
     SingleReadReason,
     SingleReadRefused,
     WriteOutcome,
+    ensure_dir,
     open_root,
     read_once_at,
     walk_dirs,
@@ -263,7 +264,7 @@ def scan_demands(
         return _scan_refused(exc)
     try:
         try:
-            dirfd = walk_dirs(rootfd, (*_DEMAND_PARTS, venue), create=False)
+            dirfd = walk_dirs(rootfd, (*_DEMAND_PARTS, venue))
         except SingleReadRefused as exc:
             return _scan_refused(exc)
         try:
@@ -311,7 +312,7 @@ def _standing(
     try:
         rootfd = open_root(paths.root)
         try:
-            dirfd = walk_dirs(rootfd, (*_DEMAND_PARTS, venue), create=True)
+            dirfd = ensure_dir(rootfd, (*_DEMAND_PARTS, venue))
         finally:
             os.close(rootfd)
     except SingleReadRefused as exc:

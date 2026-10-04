@@ -209,7 +209,7 @@ def _dir_error(exc: SingleReadRefused) -> MarkerError:
 def read_marker_at(rootfd: int) -> DrillMarker | MarkerAbsent | MarkerError:
     """Read the marker under the registry root ``rootfd`` (the caller opens and closes it)."""
     try:
-        dirfd = walk_dirs(rootfd, MARKER_DIR_PARTS, create=False)
+        dirfd = walk_dirs(rootfd, MARKER_DIR_PARTS)
     except SingleReadRefused as exc:
         return _dir_error(exc)
     except OSError:

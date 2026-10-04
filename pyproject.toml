@@ -237,6 +237,7 @@ source_modules = [
     "breezy.persistence.autonomy.entry_guard",
     "breezy.persistence.autonomy.verdict",
     "breezy.persistence.autonomy.lineage",
+    "breezy.persistence.autonomy.family_bytes",
     "breezy.persistence.autonomy.label_schema",
     "breezy.persistence.autonomy.rollback_journal",
     "breezy.persistence.autonomy.schemas",

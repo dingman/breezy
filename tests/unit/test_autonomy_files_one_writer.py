@@ -23,8 +23,6 @@ from typing import Final
 
 import pytest
 
-from tests.support.autonomy_owner import OwnerPending
-from tests.support.autonomy_owner_stub import await_owner
 from tests.support.autonomy_scan import (
     Finding,
     autonomy_source_files,
@@ -322,9 +320,7 @@ def test_the_judged_predicate_reaches_autonomy_prefixed_packages(tmp_path: Path)
 
 def test_transitional_rows_name_an_owner_and_a_closing_condition() -> None:
     transitional = [rule for rule in WRITE_SITE_ALLOWLIST if rule.owner or rule.closing]
-    assert [(r.function, r.owner, r.closing) for r in transitional] == [
-        ("walk_dirs", "ARCH-0 6d", "replace by single_read.ensure_dir")
-    ]
+    assert transitional == []  # the walk_dirs row retired with ensure_dir (ruling A4-R4, seam 6d)
     assert all(rule.owner and rule.closing for rule in transitional)
 
 
@@ -332,6 +328,39 @@ def test_the_publish_by_link_helper_needs_no_allowlist_row() -> None:
     assert all(rule.function != "_publish_by_link" for rule in WRITE_SITE_ALLOWLIST)
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="ARCH-0-seamA:6d; blocks none")
 def test_walk_dirs_mkdir_row_retired() -> None:
-    await_owner("test_walk_dirs_mkdir_row_retired")
+    from breezy.persistence.autonomy import single_read
+
+    assert callable(single_read.ensure_dir)
+    assert all(rule.function != "walk_dirs" for rule in WRITE_SITE_ALLOWLIST)
+    path = SRC_DIR / "breezy" / "persistence" / "autonomy" / "single_read.py"
+    sites = unallowed_write_sites(
+        str(path),
+        path.read_text(encoding="utf-8"),
+        module="breezy.persistence.autonomy.single_read",
+    )
+    assert sites == []
+    assert _called_names(path, "walk_dirs").isdisjoint({"mkdir", "makedirs"})
+
+
+def test_a_mkdir_in_walk_dirs_would_be_flagged_without_its_row() -> None:
+    planted = "import os\ndef walk_dirs(fd, rel):\n    os.mkdir(rel, 0o700, dir_fd=fd)\n"
+    sites = unallowed_write_sites(
+        "planted.py", planted, module="breezy.persistence.autonomy.single_read"
+    )
+    assert [site.detail for site in sites] == ["os.mkdir"]
+
+
+def _called_names(path: Path, function: str) -> set[str]:
+    import ast
+
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.FunctionDef) and node.name == function:
+            return {
+                call.func.attr
+                if isinstance(call.func, ast.Attribute)
+                else getattr(call.func, "id", "")
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+            }
+    raise AssertionError(function)

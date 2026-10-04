@@ -43,6 +43,7 @@ from breezy.persistence.autonomy.single_read import (
     SingleReadReason,
     SingleReadRefused,
     WriteOutcome,
+    ensure_dir,
     open_root,
     read_once_at,
     walk_dirs,
@@ -263,7 +264,7 @@ def read_journal_chain(
         return JournalUnverified(JournalUnverifiedReason.DIRECTORY_UNREADABLE, None)
     try:
         try:
-            dirfd = walk_dirs(rootfd, (*_JOURNAL_PARTS, venue, kind), create=False)
+            dirfd = walk_dirs(rootfd, (*_JOURNAL_PARTS, venue, kind))
         except SingleReadRefused as exc:
             if exc.reason is SingleReadReason.NOT_FOUND:
                 return ()
@@ -297,7 +298,7 @@ def _publish(paths: AutonomyPaths | ShadowPaths, entry: JournalEntry, data: byte
     try:
         rootfd = open_root(paths.root)
         try:
-            os.close(walk_dirs(rootfd, path.parent.relative_to(paths.root).parts, create=True))
+            os.close(ensure_dir(rootfd, path.parent.relative_to(paths.root).parts))
         finally:
             os.close(rootfd)
         return write_once(path, data, root=paths.root, mode=JOURNAL_FILE_MODE)

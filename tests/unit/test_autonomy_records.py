@@ -749,3 +749,143 @@ def test_lineage_params_are_frozen_and_detached_from_the_callers_dict() -> None:
         value.params["nested"]["k"] = ()
     again = Lineage.from_wire(parse_json_exact(canonical_json(value.to_wire())))
     assert again == value
+
+
+# --- 6d: E-14 root copies ---------------------------------------------------------------------
+
+DENSITY_RAW = b'{"placeholder":"not_applicable_density"}\n'
+DENSITY_SHA = hashlib.sha256(DENSITY_RAW).hexdigest()
+CONT_KIND = "continuous_rung_hold"
+ROOT_FAMILIES = ("pm_us_crh_v4", "pm_us_crh_cont")
+
+
+def _root_record(family_id: str, manifest_sha: str = SHA_A) -> RootRecord:
+    return RootRecord(
+        family_id=family_id,
+        manifest_sha256=manifest_sha,
+        artefact_sha256=DENSITY_SHA,
+        committed_path=f"deploy/families/{family_id}.json",
+    )
+
+
+@pytest.fixture
+def registry_root(tmp_path: Path) -> Any:
+    data_root = tmp_path / "registry"
+    data_root.mkdir(mode=0o700)
+    yield data_root
+    for directory in [data_root, *data_root.rglob("*")]:
+        if directory.is_dir() and not directory.is_symlink():
+            directory.chmod(0o700)
+
+
+def _sha_dir(paths: AutonomyPaths) -> Path:
+    return paths.artefact_dir(root_model_class(CONT_KIND), DENSITY_SHA)
+
+
+def test_two_roots_sharing_sha_write_identical_artefact_json(registry_root: Path) -> None:
+    from breezy.persistence.autonomy.family_bytes import RootCopyResult, write_root_copy
+
+    paths = AutonomyPaths(registry_root)
+    first = write_root_copy(
+        paths,
+        record=_root_record("pm_us_crh_v4", SHA_A),
+        artefact_raw=DENSITY_RAW,
+        composition_kind=CONT_KIND,
+    )
+    artefact = _sha_dir(paths) / "artefact.json"
+    first_bytes = artefact.read_bytes()
+    second = write_root_copy(
+        paths,
+        record=_root_record("pm_us_crh_cont", SHA_B),
+        artefact_raw=DENSITY_RAW,
+        composition_kind=CONT_KIND,
+    )
+    assert first is RootCopyResult.WRITTEN
+    assert second is RootCopyResult.WRITTEN  # its own roots/<family>.json is new
+    assert artefact.read_bytes() == first_bytes == DENSITY_RAW
+    roots = {p.name: p.read_bytes() for p in (_sha_dir(paths) / "roots").iterdir()}
+    assert set(roots) == {f"{family}.json" for family in ROOT_FAMILIES}
+    assert roots["pm_us_crh_v4.json"] == canonical_json(_root_record("pm_us_crh_v4").to_wire())
+    assert roots["pm_us_crh_cont.json"] == canonical_json(
+        _root_record("pm_us_crh_cont", SHA_B).to_wire()
+    )
+    assert os.stat(artefact).st_mode & 0o777 == 0o444
+
+
+def test_root_copy_exists_different_is_integrity(registry_root: Path) -> None:
+    from breezy.persistence.autonomy.family_bytes import RootCopyIntegrity, write_root_copy
+
+    paths = AutonomyPaths(registry_root)
+    write_root_copy(
+        paths,
+        record=_root_record("pm_us_crh_v4", SHA_A),
+        artefact_raw=DENSITY_RAW,
+        composition_kind=CONT_KIND,
+    )
+    before = {p: p.read_bytes() for p in _sha_dir(paths).rglob("*") if p.is_file()}
+    # Same family, different manifest sha: roots/<family>.json differs.
+    with pytest.raises(RootCopyIntegrity):
+        write_root_copy(
+            paths,
+            record=_root_record("pm_us_crh_v4", SHA_B),
+            artefact_raw=DENSITY_RAW,
+            composition_kind=CONT_KIND,
+        )
+    # artefact.json differs from the content-addressed bytes already in the directory.
+    (_sha_dir(paths) / "artefact.json").chmod(0o644)
+    (_sha_dir(paths) / "artefact.json").write_bytes(b"tampered")
+    with pytest.raises(RootCopyIntegrity):
+        write_root_copy(
+            paths,
+            record=_root_record("pm_us_crh_cont", SHA_B),
+            artefact_raw=DENSITY_RAW,
+            composition_kind=CONT_KIND,
+        )
+    after = {p: p.read_bytes() for p in _sha_dir(paths).rglob("*") if p.is_file()}
+    assert after[_sha_dir(paths) / "artefact.json"] == b"tampered"
+    assert after.keys() == before.keys()  # the refused second root left no new file
+
+
+def test_root_copy_rerun_after_chmod_0500_is_exists_equal(registry_root: Path) -> None:
+    from breezy.persistence.autonomy.family_bytes import RootCopyResult, write_root_copy
+
+    paths = AutonomyPaths(registry_root)
+    kwargs: dict[str, Any] = {
+        "record": _root_record("pm_us_crh_v4"),
+        "artefact_raw": DENSITY_RAW,
+        "composition_kind": CONT_KIND,
+    }
+    assert write_root_copy(paths, **kwargs) is RootCopyResult.WRITTEN
+    _sha_dir(paths).joinpath("roots").chmod(0o500)
+    _sha_dir(paths).chmod(0o500)
+    leftovers = sorted(p.name for p in _sha_dir(paths).rglob("*"))
+    assert write_root_copy(paths, **kwargs) is RootCopyResult.EXISTS_EQUAL
+    assert sorted(p.name for p in _sha_dir(paths).rglob("*")) == leftovers
+
+
+def test_refit_into_root_sha_dir_fails_closed(registry_root: Path) -> None:
+    from breezy.persistence.autonomy.family_bytes import write_root_copy
+    from breezy.persistence.autonomy.single_read import (
+        SingleReadReason,
+        SingleReadRefused,
+        write_once,
+    )
+
+    paths = AutonomyPaths(registry_root)
+    write_root_copy(
+        paths,
+        record=_root_record("pm_us_crh_v4"),
+        artefact_raw=DENSITY_RAW,
+        composition_kind=CONT_KIND,
+    )
+    sha_dir = _sha_dir(paths)
+    (sha_dir / "roots").chmod(0o500)
+    sha_dir.chmod(0o500)
+    for name in ("lineage.json", "refit_run.json"):  # what an AUT-3 refit would add
+        with pytest.raises(SingleReadRefused) as caught:
+            write_once(sha_dir / name, b"{}", root=registry_root, mode=0o444)
+        assert caught.value.reason is SingleReadReason.DIR_NOT_WRITABLE
+    with pytest.raises(SingleReadRefused) as caught:  # a new root record in the sealed roots/
+        write_once(sha_dir / "roots" / "other.json", b"{}", root=registry_root, mode=0o444)
+    assert caught.value.reason is SingleReadReason.DIR_NOT_WRITABLE
+    assert sorted(p.name for p in sha_dir.iterdir()) == ["artefact.json", "roots"]

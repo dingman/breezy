@@ -48,6 +48,7 @@ __all__ = [
     "SingleReadReason",
     "SingleReadRefused",
     "WriteOutcome",
+    "ensure_dir",
     "open_root",
     "read_once_at",
     "replace_atomic",
@@ -162,30 +163,76 @@ def open_root(root: Path) -> int:
     return fd
 
 
-def walk_dirs(
-    rootfd: int, rel: Sequence[str], *, create: bool, mode: int = _DEFAULT_DIR_MODE
-) -> int:
-    """One ``openat`` per component; returns an fd the caller closes.
+def _descend(parent: int, name: str) -> int:
+    """Open the child directory ``name`` of ``parent`` and check its ownership.
+
+    ``parent`` stays open (the caller closes it); on a refusal the child is closed.
+    """
+    child = _open_dir_at(parent, name)
+    try:
+        _require_owned_dir(child, name)
+    except BaseException:
+        os.close(child)
+        raise
+    return child
+
+
+def walk_dirs(rootfd: int, rel: Sequence[str]) -> int:
+    """One ``openat`` per component; returns an fd the caller closes. Never creates.
 
     An empty ``rel`` returns a duplicate of ``rootfd``. Every component must be a
-    directory owned by the effective uid and never a symlink.
+    directory owned by the effective uid and never a symlink. Creation is
+    :func:`ensure_dir`'s alone (ruling A4-R4).
     """
     for component in rel:
         _refuse_name(component)
     current = os.dup(rootfd)
     try:
         for component in rel:
-            if create:
+            child = _descend(current, component)
+            os.close(current)
+            current = child
+    except BaseException:
+        os.close(current)
+        raise
+    return current
+
+
+def _is_absent(parent: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False  # let the open classify it
+    return False
+
+
+def ensure_dir(rootfd: int, rel: Sequence[str], *, mode: int = _DEFAULT_DIR_MODE) -> int:
+    """``walk_dirs`` that creates each missing component: the one directory creator (A4-R4).
+
+    Existing components are only walked, so their modes are left alone and a path of
+    existing directories succeeds even through read-only ones. A missing component in a
+    parent without the owner-write bit is refused ``DIR_NOT_WRITABLE`` (a mode-bit check,
+    V30), never created. Returns an fd the caller closes.
+    """
+    _refuse_mode(mode)
+    for component in rel:
+        _refuse_name(component)
+    current = os.dup(rootfd)
+    try:
+        for component in rel:
+            if _is_absent(current, component):
+                _require_writable_dir(current)
                 try:
                     os.mkdir(component, mode, dir_fd=current)
                 except FileExistsError:
-                    pass
+                    pass  # a concurrent creator won; the walk below validates it
                 except OSError as exc:
                     raise _io(exc, component) from exc
-            child = _open_dir_at(current, component)
+            child = _descend(current, component)
             os.close(current)
             current = child
-            _require_owned_dir(current, component)
     except BaseException:
         os.close(current)
         raise
@@ -334,7 +381,7 @@ def _open_parent(path: Path, root: Path) -> tuple[int, str]:
     parent_rel, name = _split(path, root)
     rootfd = open_root(root)
     try:
-        return walk_dirs(rootfd, parent_rel, create=False), name
+        return walk_dirs(rootfd, parent_rel), name
     finally:
         os.close(rootfd)
 

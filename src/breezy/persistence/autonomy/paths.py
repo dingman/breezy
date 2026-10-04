@@ -6,7 +6,7 @@ unrelated classes: a role check reads the class-level ``is_shadow`` attribute an
 never uses ``isinstance``. The two share one layout, defined once in a private
 base. Each component is validated against an ``re.ASCII`` ``\\A...\\Z`` pattern
 (or ``date.fromisoformat`` with a round trip) before it is joined, so a builder
-can never yield a path that escapes the root. ``root_record`` lands in seam 6d.
+can never yield a path that escapes the root.
 
 Builders only compute paths. All I/O goes through ``single_read``'s openat walk.
 """
@@ -183,6 +183,10 @@ class _Layout:
 
     def artefact_file(self, model_class: str, sha: str) -> Path:
         return self.artefact_dir(model_class, sha) / "artefact.json"
+
+    def root_record(self, model_class: str, sha: str, family_id: str) -> Path:
+        """E-14: one ``root/v1`` record per family, beside the shared ``artefact.json``."""
+        return self.artefact_dir(model_class, sha) / "roots" / f"{family_component(family_id)}.json"
 
 
 class AutonomyPaths(_Layout):

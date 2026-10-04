@@ -360,12 +360,6 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         [],
         "tests/unit/test_drawdown_producer.py::test_drawdown_gates_on_labels_consumable",
     ),
-    OwnerRow(
-        "tests/unit/test_autonomy_files_one_writer.py::test_walk_dirs_mkdir_row_retired",
-        "ARCH-0-seamA:6d",
-        "breezy.persistence.autonomy.single_read:ensure_dir",
-        frozenset(),
-    ),
     # Carried deploy finding (ruling A4-R5). The "symbol" is the cleared deploy unit; it never
     # resolves as a Python module, so the staleness test cannot fire, and the real staleness signal
     # is the strict XPASS of the parameter itself once the timer stops overlapping.

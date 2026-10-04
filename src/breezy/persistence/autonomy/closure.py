@@ -43,7 +43,7 @@ class ClosureUnavailable(Exception):
 
 
 def _read_in(rootfd: int, directory: list[str], filename: str) -> bytes:
-    dirfd = walk_dirs(rootfd, directory, create=False)
+    dirfd = walk_dirs(rootfd, directory)
     try:
         return read_once_at(dirfd, filename, max_bytes=_MODULE_MAX_BYTES, policy=ReadPolicy.REPO)
     finally:

@@ -21,6 +21,7 @@ from breezy.persistence.autonomy.single_read import (
     SingleReadReason,
     SingleReadRefused,
     WriteOutcome,
+    ensure_dir,
     open_root,
     read_once_at,
     replace_atomic,
@@ -71,38 +72,178 @@ def test_walk_refuses_symlinked_intermediate_dir(tmp_path: Path, root: Path) -> 
     rootfd = open_root(root)
     try:
         with pytest.raises(SingleReadRefused) as exc_info:
-            walk_dirs(rootfd, ("a", "b"), create=False)
+            walk_dirs(rootfd, ("a", "b"))
     finally:
         os.close(rootfd)
     assert _reason(exc_info) is SingleReadReason.SYMLINK
 
 
-def test_walk_returns_fd_for_nested_directory_and_creates_on_request(root: Path) -> None:
+def test_walk_returns_fd_for_a_nested_directory_and_never_creates(root: Path) -> None:
+    (root / "x" / "y").mkdir(parents=True, mode=0o700)
     rootfd = open_root(root)
     try:
         with pytest.raises(SingleReadRefused) as exc_info:
-            walk_dirs(rootfd, ("x", "y"), create=False)
+            walk_dirs(rootfd, ("x", "z"))
         assert _reason(exc_info) is SingleReadReason.NOT_FOUND
-        fd = walk_dirs(rootfd, ("x", "y"), create=True)
+        assert not (root / "x" / "z").exists()
+        fd = walk_dirs(rootfd, ("x", "y"))
         try:
             assert stat.S_ISDIR(os.fstat(fd).st_mode)
         finally:
             os.close(fd)
     finally:
         os.close(rootfd)
+
+
+def test_walk_dirs_has_no_create_parameter(root: Path) -> None:
+    rootfd = open_root(root)
+    try:
+        with pytest.raises(TypeError):
+            walk_dirs(rootfd, ("x",), create=True)  # type: ignore[call-arg]
+    finally:
+        os.close(rootfd)
+    assert not (root / "x").exists()
+
+
+# ---------------------------------------------------------------- ensure_dir (ruling A4-R4)
+
+
+def test_ensure_dir_creates_nested_directories_with_mode_0700(root: Path) -> None:
+    rootfd = open_root(root)
+    try:
+        fd = ensure_dir(rootfd, ("x", "y"))
+        try:
+            assert stat.S_ISDIR(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(rootfd)
+    assert stat.S_IMODE((root / "x").stat().st_mode) == 0o700
     assert stat.S_IMODE((root / "x" / "y").stat().st_mode) == 0o700
 
 
+def test_ensure_dir_is_idempotent_and_keeps_existing_modes(root: Path) -> None:
+    (root / "x").mkdir(mode=0o750)
+    (root / "x").chmod(0o750)
+    rootfd = open_root(root)
+    try:
+        for _ in range(2):
+            os.close(ensure_dir(rootfd, ("x", "y")))
+    finally:
+        os.close(rootfd)
+    assert stat.S_IMODE((root / "x").stat().st_mode) == 0o750
+    assert (root / "x" / "y").is_dir()
+
+
+def test_ensure_dir_with_no_components_returns_the_root(root: Path) -> None:
+    rootfd = open_root(root)
+    try:
+        fd = ensure_dir(rootfd, ())
+        try:
+            assert os.fstat(fd).st_ino == os.fstat(rootfd).st_ino
+        finally:
+            os.close(fd)
+    finally:
+        os.close(rootfd)
+
+
 @pytest.mark.parametrize("component", ["", ".", "..", "a\x00b", "a/b"])
-def test_walk_refuses_invalid_components(root: Path, component: str) -> None:
+def test_ensure_dir_refuses_invalid_components_before_creating_anything(
+    root: Path, component: str
+) -> None:
     rootfd = open_root(root)
     try:
         with pytest.raises(SingleReadRefused) as exc_info:
-            walk_dirs(rootfd, ("ok", component), create=True)
+            ensure_dir(rootfd, ("ok", component))
     finally:
         os.close(rootfd)
     assert _reason(exc_info) is SingleReadReason.INVALID_NAME
     assert not (root / "ok").exists()
+
+
+@pytest.mark.parametrize("mode", [0o1700, 0o4755, -1, 0o10000])
+def test_ensure_dir_refuses_bits_outside_the_permission_mask(root: Path, mode: int) -> None:
+    rootfd = open_root(root)
+    try:
+        with pytest.raises(SingleReadRefused) as exc_info:
+            ensure_dir(rootfd, ("x",), mode=mode)
+    finally:
+        os.close(rootfd)
+    assert _reason(exc_info) is SingleReadReason.INVALID_MODE
+    assert not (root / "x").exists()
+
+
+def test_ensure_dir_refuses_a_symlinked_component(tmp_path: Path, root: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "a").symlink_to(elsewhere)
+    rootfd = open_root(root)
+    try:
+        with pytest.raises(SingleReadRefused) as exc_info:
+            ensure_dir(rootfd, ("a", "b"))
+    finally:
+        os.close(rootfd)
+    assert _reason(exc_info) is SingleReadReason.SYMLINK
+    assert not (elsewhere / "b").exists()
+
+
+def test_ensure_dir_refuses_a_regular_file_component(root: Path) -> None:
+    (root / "f").write_bytes(b"x")
+    rootfd = open_root(root)
+    try:
+        with pytest.raises(SingleReadRefused) as exc_info:
+            ensure_dir(rootfd, ("f", "g"))
+    finally:
+        os.close(rootfd)
+    assert _reason(exc_info) is SingleReadReason.NOT_DIRECTORY
+
+
+def test_ensure_dir_refuses_to_create_inside_a_read_only_directory(root: Path) -> None:
+    (root / "sealed").mkdir(mode=0o700)
+    (root / "sealed").chmod(0o500)
+    rootfd = open_root(root)
+    try:
+        with pytest.raises(SingleReadRefused) as exc_info:
+            ensure_dir(rootfd, ("sealed", "child"))
+    finally:
+        os.close(rootfd)
+    assert _reason(exc_info) is SingleReadReason.DIR_NOT_WRITABLE
+    assert not (root / "sealed" / "child").exists()
+
+
+def test_ensure_dir_accepts_an_existing_path_through_read_only_directories(root: Path) -> None:
+    (root / "sealed" / "child").mkdir(parents=True, mode=0o700)
+    (root / "sealed").chmod(0o500)
+    rootfd = open_root(root)
+    try:
+        os.close(ensure_dir(rootfd, ("sealed", "child")))
+    finally:
+        os.close(rootfd)
+
+
+def test_ensure_dir_refuses_a_foreign_owner(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (root / "d").mkdir(mode=0o700)
+    rootfd = open_root(root)
+    try:
+        _foreign_euid(monkeypatch)
+        with pytest.raises(SingleReadRefused) as exc_info:
+            ensure_dir(rootfd, ("d",))
+    finally:
+        os.close(rootfd)
+    assert _reason(exc_info) is SingleReadReason.WRONG_OWNER
+
+
+def test_ensure_dir_closes_every_descriptor_on_failure(root: Path) -> None:
+    (root / "a" / "b" / "c").mkdir(parents=True, mode=0o700)
+    (root / "a" / "b" / "c" / "f").write_bytes(b"x")
+    rootfd = open_root(root)
+    before = _fd_count()
+    try:
+        with pytest.raises(SingleReadRefused):
+            ensure_dir(rootfd, ("a", "b", "c", "f", "d"))
+    finally:
+        os.close(rootfd)
+    assert _fd_count() == before - 1
 
 
 def test_walk_refuses_a_regular_file_component(root: Path) -> None:
@@ -110,7 +251,7 @@ def test_walk_refuses_a_regular_file_component(root: Path) -> None:
     rootfd = open_root(root)
     try:
         with pytest.raises(SingleReadRefused) as exc_info:
-            walk_dirs(rootfd, ("f",), create=False)
+            walk_dirs(rootfd, ("f",))
     finally:
         os.close(rootfd)
     assert _reason(exc_info) is SingleReadReason.NOT_DIRECTORY
@@ -268,7 +409,7 @@ def test_walk_dirs_refuses_a_foreign_owner(root: Path, monkeypatch: pytest.Monke
     try:
         _foreign_euid(monkeypatch)
         with pytest.raises(SingleReadRefused) as exc_info:
-            walk_dirs(rootfd, ("d",), create=False)
+            walk_dirs(rootfd, ("d",))
     finally:
         os.close(rootfd)
     assert _reason(exc_info) is SingleReadReason.WRONG_OWNER
