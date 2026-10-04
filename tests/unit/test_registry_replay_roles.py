@@ -36,6 +36,7 @@ from breezy.persistence.autonomy.verdict import (
 from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, Chain, at
 from tests.unit.test_registry_replay import (
     ART_SHA,
+    CHILD_ART_SHA,
     KIND,
     OFFLINE,
     World,
@@ -54,7 +55,9 @@ def world(tmp_path: Path) -> World:
     return World(tmp_path)
 
 
-def fail_of(family: str, *, artefact: str | None = ART_SHA, minute: int = 0) -> Verdict:
+def fail_of(family: str, *, artefact: str | None = "own", minute: int = 0) -> Verdict:
+    if artefact == "own":  # the verdict names the subject family's own bound artefact
+        artefact = CHILD_ART_SHA if family == CHILD else ART_SHA
     return _verdict(
         VerdictKind.LIVE_SEQUENTIAL,
         outcome=VerdictOutcome.FAIL,
@@ -211,7 +214,8 @@ def test_a_root_admit_carries_the_fee_pass(world: World) -> None:
 
 def drill_episode(world: World, *, close: bool = True) -> Chain:
     """A drill child is promoted over INCUMBENT at DAY and the drill closes at NEXT_DAY."""
-    chain = start(world)
+    world.pin_child_to_root_artefact()
+    chain = start(world, child_art=ART_SHA)
     chain.add(
         Kind.DRILL_ADMIT, State.CHALLENGER, family=CHILD, frm=State.SHADOW,
         manifest_sha256=world.child_sha, artefact_sha256=ART_SHA,

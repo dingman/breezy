@@ -73,6 +73,8 @@ from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, SHA_B, VENUE, C
 from tests.unit.test_registry_replay import (
     ART_SHA,
     ARTEFACT,
+    CHILD_ART_SHA,
+    CHILD_ARTEFACT,
     KIND,
     World,
     _sha,
@@ -407,14 +409,14 @@ def test_root_named_like_child_is_not_routed_as_child(world: World) -> None:
     raw = world.child_raw
     (world.repo / "deploy" / "families" / f"{CHILD}.json").write_bytes(raw)
     record = RootRecord(
-        family_id=CHILD, manifest_sha256=_sha(raw), artefact_sha256=ART_SHA,
+        family_id=CHILD, manifest_sha256=_sha(raw), artefact_sha256=CHILD_ART_SHA,
         committed_path=f"deploy/families/{CHILD}.json",
     )  # fmt: skip
-    write_root_copy(world.paths, record=record, artefact_raw=ARTEFACT, composition_kind=KIND)
+    write_root_copy(world.paths, record=record, artefact_raw=CHILD_ARTEFACT, composition_kind=KIND)
     chain = Chain()
     chain.add(
         Kind.BOOTSTRAP, State.CHAMPION, family=CHILD, manifest_sha256=_sha(raw),
-        artefact_sha256=ART_SHA,
+        artefact_sha256=CHILD_ART_SHA,
     )  # fmt: skip
     forged = forge(chain)
     asked: list[str] = []

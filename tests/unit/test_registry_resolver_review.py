@@ -7,6 +7,7 @@ R5 (the budget op count) in ``test_registry_resolver``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 from pathlib import Path
 from typing import Any, Final
@@ -18,8 +19,10 @@ import breezy.persistence.autonomy.family_bytes as family_bytes_mod
 import breezy.persistence.autonomy.replay as replay_mod
 import breezy.persistence.autonomy.resolver as resolver_mod
 from breezy.persistence.autonomy.byte_binding import ByteBindingFailure, verify_bound_bytes
+from breezy.persistence.autonomy.family_bytes import write_root_copy
 from breezy.persistence.autonomy.fold import Origin, fold
 from breezy.persistence.autonomy.fold_pairs import PairStatus
+from breezy.persistence.autonomy.lineage import RootRecord, model_class_of
 from breezy.persistence.autonomy.registry_export import RegistryReader
 from breezy.persistence.autonomy.resolver import (
     FAMILY_SOURCE_ENV,
@@ -50,19 +53,24 @@ from tests.unit.registry_resolver_world import (
     refusal_of,
     replay_stubbed,
     resolve,
+    resolved,
     rewrite,
     root_chain,
     root_file,
     serving,
 )
-from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, VENUE, at
+from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, VENUE, Chain, at
 from tests.unit.test_registry_replay import (
-    ART_SHA,
+    CHILD_ART_SHA,
+    CHILD_ARTEFACT,
     FORWARD,
+    KIND,
     OFFLINE,
     World,
+    _sha,
     full_chain,
     nominate,
+    promote_pair,
     start,
 )
 from tests.unit.test_registry_resolver_child import new_child, run_child
@@ -107,7 +115,7 @@ def test_verify_bound_bytes_checks_the_root_sha_it_is_given(world: World) -> Non
     row = chain.rows[1]  # the MINT: carries the child's manifest and artefact
     args: dict[str, Any] = {
         "venue": VENUE, "family_id": CHILD, "manifest_sha256": world.child_sha,
-        "artefact_sha256": ART_SHA, "paths": world.paths, "repo_root": world.repo,
+        "artefact_sha256": CHILD_ART_SHA, "paths": world.paths, "repo_root": world.repo,
         "origin": Origin.CHILD,
     }  # fmt: skip
     assert row.family_id == CHILD
@@ -294,3 +302,93 @@ def test_no_resolver_test_patches_the_chain_read_step() -> None:
         if p.name != Path(__file__).name and needle in p.read_text(encoding="utf-8")
     ]  # fmt: skip
     assert offenders == []
+
+
+# --- A8c-R4 / E-24: a family's density pin is its bound artefact ---
+
+OTHER: Final = b'{"density":"other"}\n'
+OTHER_SHA: Final = hashlib.sha256(OTHER).hexdigest()
+RECAL: Final = b'{"recalibration":"affine"}\n'
+RECAL_SHA: Final = hashlib.sha256(RECAL).hexdigest()
+
+
+def root_file_path() -> str:
+    return f"deploy/families/{INCUMBENT}.json"
+
+
+def _put_at(world: World, component: str, raw: bytes, sha: str) -> None:
+    target = world.paths.artefact_file(model_class_of(KIND, component), sha)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    target.chmod(0o444)
+
+
+def _repin(world: World, sha: str) -> None:
+    """Rewrite the child's registry manifest so it pins ``sha`` (and name it in the world)."""
+    raw = world.child_raw.replace(CHILD_ART_SHA.encode(), sha.encode())
+    assert raw != world.child_raw
+    path = world.data / "registry" / "families" / f"{CHILD}.json"
+    path.chmod(0o644)
+    world.child_raw, world.child_sha = raw, _sha(raw)
+    world.put_child_manifest()
+
+
+def _child_chain(world: World, *, child_art: str) -> Any:
+    chain = start(world, child_art=child_art)
+    nominate(chain)
+    promote_pair(chain, world=world)
+    forged = forge(chain)
+    export_all(world, forged)
+    return forged
+
+
+@pytest.mark.parametrize("who", ["root", "child"])
+def test_resolver_refuses_density_pin_not_bound_artefact(world: World, who: str) -> None:
+    """E-24: the manifest's ``density_artefact_sha256`` must equal the bound artefact, whatever
+    the origin. The bound artefact is real, stored and attested; only the pin disagrees."""
+    if who == "root":
+        record = RootRecord(INCUMBENT, world.root_sha, CHILD_ART_SHA, root_file_path())
+        write_root_copy(
+            world.paths, record=record, artefact_raw=CHILD_ARTEFACT, composition_kind=KIND
+        )
+        chain = Chain()
+        chain.add(
+            Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT,
+            manifest_sha256=world.root_sha, artefact_sha256=CHILD_ART_SHA,
+        )  # fmt: skip
+        forged = forge(chain)
+        with serving(forged):
+            got = resolve(world, hwm_of(forged), now=NOW_EARLY)
+    else:
+        _put_at(world, "density_table", OTHER, OTHER_SHA)
+        _repin(world, OTHER_SHA)  # the manifest pins OTHER; the rows bind CHILD_ART_SHA
+        forged = _child_chain(world, child_art=CHILD_ART_SHA)
+        got = run_child(world, forged, stub=True)
+    assert refusal_of(got).reason is RefusalReason.ARTEFACT_SHA_MISMATCH
+
+
+def test_density_repin_within_family_refused_by_resolver(world: World) -> None:
+    """MINT(M1, A) then PROMOTE(M2 pinning B), both artefacts stored: the family is bound to A, so
+    the later manifest cannot move its pin. It must not resolve."""
+    _put_at(world, "density_table", OTHER, OTHER_SHA)
+    chain = start(world)  # the MINT carries M1, which pins the child's own artefact A
+    nominate(chain)
+    _repin(world, OTHER_SHA)  # M2 pins B; the PROMOTE head carries M2
+    promote_pair(chain, world=world)
+    forged = forge(chain)
+    export_all(world, forged)
+    refused = refusal_of(run_child(world, forged, stub=True))
+    assert refused.reason is RefusalReason.ARTEFACT_SHA_MISMATCH
+
+
+def test_rung_recalibration_child_pin_equals_bound_resolves(world: World) -> None:
+    """The positive control: a child whose artefact is a ``rung_recalibration`` refit and whose
+    manifest pins exactly that sha resolves."""
+    _put_at(world, "rung_recalibration", RECAL, RECAL_SHA)
+    _repin(world, RECAL_SHA)
+    forged = _child_chain(world, child_art=RECAL_SHA)
+    got = resolved(run_child(world, forged, stub=True))
+    assert got.family_id == CHILD
+    assert got.family_bytes.artefact_sha256 == RECAL_SHA
+    assert got.family_bytes.manifest.density_artefact_sha256 == RECAL_SHA
+    assert "rung_recalibration" in got.family_bytes.artefact_store_relpath

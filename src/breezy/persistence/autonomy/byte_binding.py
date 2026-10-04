@@ -358,6 +358,8 @@ def verify_bound_bytes(
     if isinstance(artefact, RefusalReason):
         return ByteBindingFailure(artefact)
     model_class, artefact_raw = artefact
+    if manifest.density_artefact_sha256 != asha:  # E-24: the density pin is the bound artefact
+        return ByteBindingFailure(RefusalReason.ARTEFACT_SHA_MISMATCH)
     if origin is Origin.ROOT:
         problem = _root_record_problem(paths, model_class, family, msha, asha)
         if problem is not None:

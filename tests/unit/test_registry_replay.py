@@ -66,8 +66,17 @@ from tests.unit.test_registry_fold_tallies import carried, reset
 
 KIND: Final = "forecast_quantile_ladder"
 ROOT_SOURCE: Final = REPO_ROOT / "deploy" / "families" / f"{INCUMBENT}.json"
-ARTEFACT: Final = b'{"density":"world"}\n'
+#: The root's real density artefact: the bytes at its manifest's ``density_artefact_path`` (E-24:
+#: a family's density pin is its bound artefact, so the pinned sha ``9c0b...`` is ``ART_SHA``).
+ROOT_ARTEFACT_PATH: Final = (
+    "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json"
+)
+ARTEFACT: Final = (REPO_ROOT / ROOT_ARTEFACT_PATH).read_bytes()
 ART_SHA: Final = hashlib.sha256(ARTEFACT).hexdigest()
+#: A child keeps a synthetic artefact; its manifest pins it (path and sha) as its own.
+CHILD_ARTEFACT: Final = b'{"density":"child"}\n'
+CHILD_ART_SHA: Final = hashlib.sha256(CHILD_ARTEFACT).hexdigest()
+CHILD_ARTEFACT_PATH: Final = "deploy/families/artefacts/child_density.json"
 HOUR_NS: Final = 3_600 * 10**9
 REPLAY_SOURCE: Final = SRC_DIR / "breezy" / "persistence" / "autonomy" / "replay.py"
 
@@ -81,7 +90,7 @@ def _verdict(
     *,
     outcome: VerdictOutcome = VerdictOutcome.PASS,
     family: str = CHILD,
-    artefact: str | None = ART_SHA,
+    artefact: str | None = CHILD_ART_SHA,
     produced: int = at("2026-10-09", "11:00"),
 ) -> Verdict:
     return Verdict(
@@ -110,10 +119,13 @@ class World:
         self.data.mkdir(mode=0o700)
         self.paths = AutonomyPaths(self.data)
         child = self.root_raw.replace(INCUMBENT.encode(), CHILD.encode())
-        self.child_raw = child.replace(b'"2026-10-02"', b'"2026-10-20"')
+        child = child.replace(b'"2026-10-02"', b'"2026-10-20"')
+        child = child.replace(ART_SHA.encode(), CHILD_ART_SHA.encode())
+        self.child_raw = child.replace(ROOT_ARTEFACT_PATH.encode(), CHILD_ARTEFACT_PATH.encode())
         self.child_sha = _sha(self.child_raw)
         self.put_child_manifest()
         self.put_artefact(ARTEFACT)
+        self.put_artefact(CHILD_ARTEFACT, sha=CHILD_ART_SHA)
         for verdict in (OFFLINE, FORWARD):
             write_verdict(self.paths, verdict)
 
@@ -123,6 +135,15 @@ class World:
         target = directory / f"{CHILD}.json"
         target.write_bytes(self.child_raw)
         target.chmod(0o444)
+
+    def pin_child_to_root_artefact(self) -> None:
+        """A drill child shares its incumbent's artefact (``validate``), so its manifest pins it."""
+        raw = self.child_raw.replace(CHILD_ART_SHA.encode(), ART_SHA.encode())
+        raw = raw.replace(CHILD_ARTEFACT_PATH.encode(), ROOT_ARTEFACT_PATH.encode())
+        target = self.data / "registry" / "families" / f"{CHILD}.json"
+        target.chmod(0o644)
+        self.child_raw, self.child_sha = raw, _sha(raw)
+        self.put_child_manifest()
 
     def put_artefact(self, raw: bytes, *, sha: str = ART_SHA) -> Path:
         target = self.paths.artefact_file(root_model_class(KIND), sha)
@@ -153,16 +174,17 @@ def seal(chain: Chain) -> VerifiedVenueChain:
     return verify_venue_chain(sealed, VENUE)
 
 
-def start(world: World, *, art: str = ART_SHA) -> Chain:
-    """The root CHAMPION and a MINTed child, both bound to the world's files."""
+def start(world: World, *, art: str = ART_SHA, child_art: str = CHILD_ART_SHA) -> Chain:
+    """The root CHAMPION and a MINTed child, each bound to its own artefact in the store."""
     chain = Chain()
     chain.add(
         Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT,
         manifest_sha256=world.root_sha, artefact_sha256=art,
     )  # fmt: skip
     chain.add(
-        Kind.MINT, State.SHADOW, family=CHILD, manifest_sha256=world.child_sha, artefact_sha256=art
-    )
+        Kind.MINT, State.SHADOW, family=CHILD, manifest_sha256=world.child_sha,
+        artefact_sha256=child_art,
+    )  # fmt: skip
     return chain
 
 
@@ -670,7 +692,8 @@ def test_artefact_reads_are_memoised_by_model_class_and_sha(
 
     monkeypatch.setattr(replay_mod, "_read_artefact", counting)
     assert isinstance(world.replay(full_chain(world)), ReplayOk)
-    assert len(calls) == len(set(calls)) == len(pins.MODEL_CLASS_COMPONENTS)
+    # the root's and the child's artefact, each probed under every component once
+    assert len(calls) == len(set(calls)) == 2 * len(pins.MODEL_CLASS_COMPONENTS)
 
 
 def test_the_artefact_read_cap_is_a_pin() -> None:
