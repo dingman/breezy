@@ -2,7 +2,7 @@
 
 Bounds below are an independent literal copy of ARCH 4.5 as amended by E-11
 (AUTONOMY_ARCHITECTURE.md:903-940; reviews/ARCH-ERRATA-rev9_2.md E-11, E-14).
-The Kind-set check (`test_enabled_widening_kinds_subset_of_widening_kinds`) is seam 6b.
+The Kind-set check (`test_enabled_widening_kinds_subset_of_widening_kinds`) landed with seam 6b.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ import pytest
 
 from breezy.persistence.autonomy import closure_manifest, pins
 from breezy.persistence.autonomy.closure import closure_from_grimp, closure_sha256
+from breezy.persistence.autonomy.schemas import Kind
+from breezy.persistence.autonomy.transitions import WIDENING_KINDS
 from tests.support.entry_points import REPO_ROOT
 
 PKG: Final[str] = "breezy.persistence.autonomy"
@@ -291,6 +293,19 @@ def test_attest_cadence_has_no_expiry_gap(facet: str) -> None:
 
 def test_request_ttl_covers_two_schedule_polls() -> None:
     assert pins.RELAUNCH_REQUEST_TTL_S >= 2 * SCHEDULE_POLL_S
+
+
+def _enabled_outside_widening(enabled: frozenset[str]) -> frozenset[str]:
+    """Members of ``enabled`` that are not the value of a ``WIDENING_KINDS`` kind."""
+    return enabled - {kind.value for kind in WIDENING_KINDS}
+
+
+def test_enabled_widening_kinds_subset_of_widening_kinds() -> None:
+    assert _enabled_outside_widening(pins.ENABLED_WIDENING_KINDS) == frozenset()
+    assert pins.ENABLED_WIDENING_KINDS <= {kind.value for kind in Kind}
+    # positive controls: a restrictive kind, a neutral kind and a misspelling are all outside
+    for planted in ("DEMOTE", "HWM_RESET", "promote", "NOT_A_KIND"):
+        assert _enabled_outside_widening(frozenset({"RESUME", planted})) == {planted}
 
 
 def test_root_admit_ceiling_committed_false() -> None:
