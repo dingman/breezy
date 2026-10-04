@@ -701,7 +701,13 @@ def test_transition_id_is_the_schemas_function() -> None:
 
 
 def test_transitions_module_imports_only_schemas_and_fold() -> None:
-    assert _internal_imports("transitions.py") == {"schemas", "fold"}
+    """``validate`` is the one added import: the sibling module ``transitions`` re-exports (7c)."""
+    assert _internal_imports("transitions.py") == {"schemas", "fold", "validate"}
+
+
+def test_validate_module_imports_only_pins_schemas_fold_and_verdict() -> None:
+    """``validate`` must not import ``transitions`` (a cycle) or ``registry_shape`` (which does)."""
+    assert _internal_imports("validate.py") == {"schemas", "pins", "fold", "verdict"}
 
 
 # --- rows_admissible -----------------------------------------------------------------------

@@ -17,7 +17,9 @@
 * drill episodes ``[DRILL_PROMOTE effective, closing partner or RETIRE effective)`` (Z2);
 * ``FamilyView.origin`` (root or child, from the introducing row) and ``halted_since_ns``;
 * the ARCH C5 counters as ``LineageTallies`` (one per lineage) and ``VenueTallies``, charged when a
-  change takes effect, with ``HWM_RESET`` ``carried_counters`` applied as floors.
+  change takes effect, with ``HWM_RESET`` ``carried_counters`` applied as floors;
+* the facts ``validate`` reads of a family (seam 7c): the shas it is bound to and the cause it
+  stands halted for.
 
 Row order and effective time. Immediate rows (no ``effective_launch_date``) apply at their
 ``ts_ns`` and only once ``ts_ns <= now_ns``; the members of an effective pair apply at LAUNCH.
@@ -69,6 +71,12 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   and ``terminal_frozen`` true freezes the lineage. A malformed object is
   ``FoldInvalid(carried_counters_malformed)``, whatever the clock. A carried lineage with no
   families left keeps its tallies.
+* ``manifest_sha256`` and ``artefact_sha256`` of a family are the values of the latest applied row
+  that carries each (seam 7c; the binding ``validate`` compares a drill child or a restorative
+  RESUME against). ``standing_cause_class`` is the class a RESUME of a HALTED family is charged to
+  (the class of its standing DEMOTE or HALT, a ROLLBACK_FAILED one resolved to its
+  ``trigger_cause_class``) and ``standing_cause_code`` the ``cause_code`` of that row; both are
+  ``None`` while the family is not HALTED.
 * ``halted_since_ns`` is the effective instant of the row that moved the family into HALTED and is
   ``None`` once it leaves HALTED (AUT-6 r15 #30).
 
@@ -118,6 +126,7 @@ __all__ = [
     "PairView",
     "VenueTallies",
     "fold",
+    "schedule_ns",
 ]
 
 #: ``→CHAMPION`` kinds that open a pending pair when they carry ``effective_launch_date``.
@@ -186,6 +195,12 @@ class FamilyView:
     champion_epoch_start_ns: int | None = None
     #: The instant of the row that made the family HALTED; ``None`` while it is not HALTED.
     halted_since_ns: int | None = None
+    #: The shas of the latest applied row that carries each; ``None`` before any row does.
+    manifest_sha256: str | None = None
+    artefact_sha256: str | None = None
+    #: The class a RESUME is charged to and the ``cause_code`` of the standing halt row.
+    standing_cause_class: CauseClass | None = None
+    standing_cause_code: CauseCode | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -261,6 +276,11 @@ def _day_start_ns(iso_day: str) -> int:
     return days * _SECONDS_PER_DAY * _NS_PER_S
 
 
+def schedule_ns(iso_day: str, hhmm: str) -> int:
+    """Epoch nanoseconds of ``hhmm`` UTC on ``iso_day`` (the schedule pins are ``"HH:MM"``)."""
+    return _day_start_ns(iso_day) + _hhmm_ns(hhmm)
+
+
 def _is_head_shape(row: TransitionRow) -> bool:
     return row.kind in HEAD_KINDS and row.to_state is State.CHAMPION
 
@@ -297,7 +317,7 @@ def _collect_heads(rows: Sequence[TransitionRow]) -> dict[str, _Head]:
     heads: dict[str, _Head] = {}
     for index, row in enumerate(rows):
         if _is_head(row) and row.effective_launch_date is not None:
-            launch = _day_start_ns(row.effective_launch_date) + _hhmm_ns(pins.SCHEDULE_LAUNCH_UTC)
+            launch = schedule_ns(row.effective_launch_date, pins.SCHEDULE_LAUNCH_UTC)
             heads[row.transition_id] = _Head(index, row, launch, [index])
     return heads
 
@@ -448,6 +468,9 @@ class _Accumulator:
         self.demoted_ns: dict[str, int] = {}
         self.epoch_start: dict[str, int] = {}
         self.halted_since: dict[str, int] = {}
+        self.manifest_sha: dict[str, str] = {}
+        self.artefact_sha: dict[str, str] = {}
+        self.standing_code: dict[str, CauseCode | None] = {}
         self.target_ineligible: set[str] = set()
         self.drill_children: set[str] = set()
         self.frozen_lineages: set[str] = set()
@@ -459,6 +482,10 @@ class _Accumulator:
 
     def apply(self, instant: int, row: TransitionRow) -> None:
         family = row.family_id
+        if row.manifest_sha256 is not None:
+            self.manifest_sha[family] = row.manifest_sha256
+        if row.artefact_sha256 is not None:
+            self.artefact_sha[family] = row.artefact_sha256
         if row.from_state is not row.to_state:
             self.states[family] = row.to_state
             if row.to_state is State.HALTED:
@@ -554,6 +581,7 @@ class _Accumulator:
         self.rollback_eligible.discard(family)
         self._mark_cause(family, instant)
         cls = row.halt_cause_class
+        self.standing_code[family] = row.cause_code
         self.standing_class[family] = (
             row.trigger_cause_class if cls is CauseClass.ROLLBACK_FAILED else cls
         )
@@ -590,6 +618,14 @@ class _Accumulator:
                 demoted_cause_ns=self.demoted_ns.get(family),
                 champion_epoch_start_ns=self.epoch_start.get(family),
                 halted_since_ns=self.halted_since.get(family),
+                manifest_sha256=self.manifest_sha.get(family),
+                artefact_sha256=self.artefact_sha.get(family),
+                standing_cause_class=(
+                    self.standing_class.get(family) if state is State.HALTED else None
+                ),
+                standing_cause_code=(
+                    self.standing_code.get(family) if state is State.HALTED else None
+                ),
             )
         return MappingProxyType(views)
 

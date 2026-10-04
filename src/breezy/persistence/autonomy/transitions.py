@@ -16,7 +16,8 @@ Choices ARCH leaves open, fixed here:
   (A6b-R4, E-16 b: a family unknown to the fold is introduced from the empty state).
 * ``PAIR_KINDS`` are the kinds that can belong to one logical sender change: the four heads, the
   two partners and ACTIVATE.
-* ``validate`` (seams 7c, 7d) is not here; it adds its own imports.
+* ``validate`` (seams 7c, 7d) lives in ``validate`` and is re-exported here, with ``first_refusal``,
+  ``Refusal`` and ``Rule``; this module keeps the closed tables so that it stays under its size cap.
 
 Pure; nothing here reads a clock or the filesystem.
 """
@@ -38,6 +39,7 @@ from breezy.persistence.autonomy.schemas import (
     WriterMode,
     compute_transition_id,
 )
+from breezy.persistence.autonomy.validate import Refusal, Rule, first_refusal, validate
 
 __all__ = [
     "ALLOWED",
@@ -45,10 +47,14 @@ __all__ = [
     "PAIR_KINDS",
     "RESTRICTIVE_KINDS",
     "WIDENING_KINDS",
+    "Refusal",
+    "Rule",
+    "first_refusal",
     "is_widening",
     "is_widening_row",
     "rows_admissible",
     "transition_id",
+    "validate",
 ]
 
 #: The Y9 idempotency id, under the plan's name (ruling A6a-A1; the function lives in ``schemas``).
