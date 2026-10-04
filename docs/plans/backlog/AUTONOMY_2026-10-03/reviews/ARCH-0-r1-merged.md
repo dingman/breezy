@@ -357,3 +357,43 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
     - (M1) Before 8b is built, confirm it needs only `read_manifest_facts`; otherwise `verify_family_bytes` moves into 8b.
     - (M2) 8c reads root manifests repo-only (E-14 3a), with a test; the engine never writes a registry copy of a root.
     - (L3) The path-based PREREG guard after an fd read is accepted. It is same-uid only, per ARCH:408.
+
+### Build-time rulings (seam A 6e build)
+- **A6e-R1.** `test_family_artefact_binding_immutable` moves to seam 7d (validate II), which owns the binding rule. It stays a pending envelope name until then.
+- **A6e-R2.** Until 7c/7d wire `transitions.validate` into `append`, the store applies only structural checks:
+  - the chain verifies;
+  - the extension verifies;
+  - the extended chain folds;
+  - the row shape conforms to E-16(a).
+
+  A guard test therefore forbids any module outside `persistence/autonomy` from importing `registry_store` until 7d lands. This follows the fold-consumer guard pattern, and 7d removes the guard.
+- **A6e-R3.** 6f puts `RegistryReader`, `write_export` and `newest_export` in a sibling module, `registry_export.py`, because `registry_store.py` is already at 728 lines against an 800-line cap. The one-writer table names the export writer row in that module.
+- **A6e-A1 (accepted).** Accepted build choices:
+  - The store does not take `engine.lock` (AUT-5a owns it); `BEGIN IMMEDIATE` plus a 5 s busy timeout serialises writers.
+  - Refusals the closed `RefusalReason` set cannot name map to `engine_inconsistency`, which fails closed.
+  - Id lists are stored comma-joined as hex.
+  - `trigger_cause_class` is checked only as allowed-on, not required-on. 7c/7d may tighten this.
+- **A6e reviews (database + ARCH, 3f022a8a): REQUEST_CHANGES. Merged rulings follow.**
+  - **A6e-R4 (HIGH).**
+    - `_check_batch` refuses any row whose `transition_id` differs from `computed_transition_id()`.
+    - A replay compares every stored column against the batch, except `seq`, `venue_seq`, `ts_ns`, `invocation_id`, `expected_prior_seq` and the two chain hashes. A mismatch raises `ReplayMismatch`.
+    - The Y9 "logged no-op" applies only when the bodies match (erratum E-17a). A stale-fold retry must never be reported as committed.
+  - **A6e-R5 (HIGH, reproduced by probe).** The insert guard refuses an existing `transition_id`. This closes the `INSERT OR REPLACE` delete on a connection without `recursive_triggers`. It is tested on a default connection at head+1. Same-uid `DROP TRIGGER` remains the ARCH l.408 residual.
+  - **A6e-R6.** The writer uses `synchronous=EXTRA` (3) and reads it back. In DELETE journal mode, FULL does not fsync the directory after the journal unlink, so a committed HALT could roll back after a power cut (erratum E-17b amends Y5/AUT-5 §3.2). The two reviews disagreed here; the ARCH reviewer's reading matches SQLite's documented semantics.
+  - **A6e-R7.** Every failure escaping `append` is a `RegistryRefused` subclass. `ChainBroken` maps to `ChainRefused(chain_broken)`. `WireRefused`, `ValueError` and `TypeError` map to `RowRefused`.
+  - **A6e-R8.**
+    - CAS runs before the clock check (amending plan AC 10 order 7→8).
+    - The engine's retry contract is `isinstance(CasMismatch)`, which is documented and tested.
+    - `StoreUnavailable` splits into `StoreBusy` (retryable, Y19 60 s) and `StoreDrifted` (not retryable). Drifted covers schema drift, a foreign database, an integrity error and an I/O error.
+  - **A6e-R9.** Row skew is one-sided: `ts_ns <= now_ns`. A future-stamped head could otherwise delay a committed HALT by up to 300 s (erratum E-17c).
+  - **A6e-R10.** Column rules:
+    - `halt_cause_class` is allowed only on DEMOTE/HALT. Required-on is left to 7c/7d.
+    - `voids_transition_ids` is required and non-empty on SWAP_CANCEL. A cancel without a target is malformed, not merely restrictive; its refusal routes to the Z11 demand path.
+    - The `cause_code` value set is validated per kind: `drill_close_restore` only on RESUME, `target_integrity` on TARGET_INELIGIBLE.
+  - **A6e-R11 (LOW).**
+    - The schema comparison ignores `sqlite_stat*`.
+    - `ROLLBACK` in `finally` is suppressed so that `close()` always runs and the original error survives.
+    - `_open` re-checks the 0600 file mode and 0700 directory mode on every open.
+    - The transition-table test asserts the refusal message.
+    - The vacuous closed-reason test is replaced by a test that triggers each refusal.
+  - **A6e-A2 (fail-closed, as specified).** Schema drift, a non-verifying stored chain, or a stored head lacking `effective_launch_date` refuses every later append on that venue, restrictive writes included. Readers refuse the same database, so the node is vetoed. Y19 plus the Z11 demand file is the clearing path. No bypass exists, by design. The engine never mixes restrictive and widening rows in one batch (plan 10.5).

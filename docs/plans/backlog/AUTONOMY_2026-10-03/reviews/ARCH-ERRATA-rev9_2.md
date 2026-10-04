@@ -437,3 +437,9 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **(b) Root introduction.** The ALLOWED table (ARCH:468, :479) gains `ROOT_ADMIT: (∅, CHAMPION)` for a family unknown to the fold (plan r5:200, ruling A4-R6). A pending introducing ROOT_ADMIT shows the family as SHADOW until its pair takes effect.
 - **(c) Pending-head integrity.** A PROMOTE, DRILL_PROMOTE, ROLLBACK or ROOT_ADMIT row with `to_state=CHAMPION` and a null `effective_launch_date` makes the fold return `FoldInvalid(head_missing_launch_date)`. This value is added to the closed `FoldInvalidReason` set.
 - **(d) Widening is decided per row.** WIDENING is decided per row, not per kind: a PROMOTE widens only toward CHAMPION (AUT-5 r7:166). Stage gating therefore never refuses a SHADOW→CHALLENGER nomination.
+
+## E-17 (coordinator, 2026-10-04; from the ARCH-0 seam A 6e database and ARCH reviews): registry store write semantics
+- **(a) Y9 replay compares bodies.** A row whose `transition_id` exists is a logged no-op only if its stored body equals the submitted one on every semantic column. The excluded columns are `seq`, `venue_seq`, `ts_ns`, `invocation_id`, `expected_prior_seq` and the chain hashes. A mismatch is refused as `ReplayMismatch`. A submitted `transition_id` must equal the id computed from the row.
+- **(b) Durability.** The registry writer uses `PRAGMA synchronous=EXTRA`, not FULL. In DELETE journal mode only EXTRA fsyncs the directory after the commit-point journal unlink. This amends ARCH Y5 and AUT-5 r7 §3.2.
+- **(c) Clock.** A row's `ts_ns` must not exceed the writer's clock. The old symmetric ±300 s skew window becomes one-sided, so that the fold's `ts_ns <= now_ns` application can never delay a committed restrictive row.
+- **(d) Write order.** CAS on `expected_prior_seq` runs before the clock check. A stale writer then sees `CasMismatch` and takes the ARCH l.530 re-read/retry path, rather than `clock_before_head`.
