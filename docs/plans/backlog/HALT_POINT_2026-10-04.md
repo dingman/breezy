@@ -18,6 +18,7 @@ At the operator's direction, all in-flight sub-agents have finished and developm
 - **AUT-1a WP5 stage 2c** `2be63d85`; **ARCH-0 seam A 8c/8d** `3ce51adf`; **V10/PROGRESS** `afb225d0`; **stage 3a** `af898d59`.
 - **WP5 stage 3** (S1 heal, S2 live-proof, S3, 3c integration, review fixes S3-R55..R57), `d407ff3b`. Full gate EXIT=0.
 - **FQ halt CLI widening** `ce0c07bb` and `04eaa013`: the CLI accepts the FQ family and halts with open positions.
+- **M1 market-calibration scan** `fc442601` (with review fixes and the asdict-guard fix). Full gate EXIT=0.
 - **Docs:**
   - FQ loss triage `f057cecd`.
   - FQ loss-response plan r3 and rulings FQ-R23..R33: `3651f11f`, `8b87b112`.
@@ -29,7 +30,6 @@ At the operator's direction, all in-flight sub-agents have finished and developm
 
 | Branch / worktree | State | Why parked | Resume action |
 |---|---|---|---|
-| `backlog/fq-m1-scan-2026-10-04` / `~/breezy-fq-m1` | M1 market-scan script. Review fixes applied; real-data v2 VALID (evidence committed). | See §5: the full gate's resolution is recorded there at halt. | If not merged at halt: re-run the full gate in that worktree; ff-merge on EXIT=0. |
 | `backlog/fq-f3-v1-terminal-2026-10-04` / `~/breezy-fq-f3` | F3: v1 `terminal_climate_day=2026-10-05` plus halt-key and clear-path tests. Focused gate green. | **Full gate EXIT=1, 73 registry tests.** The registry fixtures derive child manifests from the v1 root. `terminal_climate_day` is not in the ARCH §4.2 child allowlist, so every child (d0 2026-10-20) inherits terminal 10-05, which `family_manifest.py:407` refuses. | Needs a ruling in the F1 r2 round. Under FQ-R35, v1 is seeded RETIRED and v2 is the root. Options: (a) move the registry test fixtures to a v2-shaped root; (b) put v1's tally cutoff in tally config instead of the manifest; (c) an erratum adding `terminal_climate_day` to the child allowlist (touches frozen §4.2; least preferred). **Not urgent:** F3 closes v1's tally only, and the 10-05 halt uses the already-merged CLI. |
 | `backlog/aut1-wp4-2026-10-04` / `~/breezy-aut1-wp4` | AUT-1 WP4, built. | Held for WP8 by plan. | Unchanged. |
 | `~/breezy-gate-a` | Detached gate snapshot. | Gate scratch. | May be removed. |
@@ -45,7 +45,7 @@ At the operator's direction, all in-flight sub-agents have finished and developm
 
 | Row | State |
 |---|---|
-| F0 Step-0 diagnostics + M1 | M1 DONE as evidence (VALID, no surviving cell, median MDE 19.8¢; cheap YES at an ask < 0.10 is a reliable loser). Code merge per §3. |
+| F0 Step-0 diagnostics + M1 | M1 DONE `fc442601` (VALID, no surviving cell, median MDE 19.8¢; cheap YES at an ask < 0.10 is a reliable loser). |
 | F1 PLAN | Draft plus round-1 rulings committed; **r2 pending**. |
 | F2 IEM truth fetch | READY to start: its gate, the WP5 stage-3 merge, is met (`d407ff3b`). |
 | F3 v1 terminal day | PARKED (§3). |
@@ -70,6 +70,6 @@ At the operator's direction, all in-flight sub-agents have finished and developm
 
 1. `git status`, `git worktree list`, and `systemctl --user list-timers | grep fq`.
 2. Read the 10-05 halt result files (§1). Apply the backstop if either shows FAIL.
-3. Read the M1 merge status (§3), then run F2. F2 needs no further ruling.
+3. Run F2. F2 needs no further ruling.
 4. Draft F1 r2, including the F3 conflict, and run the round-2 review.
 5. Check that Grok (`~/.claude/bin/grok-check.sh`) and Codex are available before dispatch (delegation order per CLAUDE.md).
