@@ -83,7 +83,7 @@ New in r9 (read 2026-10-03):
 | Fact | Evidence | Used in |
 |---|---|---|
 | `Refuse`, `NotExecutable` and `NotDPlus1` carry only `reason`. `Take` carries `p_hat`, `p_lower`, `p_upper` and `ev_net`. The margin is `forecast_margin(h_hours, cfg)`, computed inside `evaluate`. | `src/breezy/strategy/forecast_quantile_ladder/decision.py:129-172`, `:353-355` | §3.5.2 (numeric inputs on refusals) |
-| `SHADOW_DECISION` is emitted once per `evaluate_snapshot`, with no capture dependency. | `strategy.py:564-581` | independent denominator (§3.11 R1, R2, R5) |
+| Each evaluation emits exactly one decision-class `SHADOW_DECISION` line (`NotExecutable`, `NotDPlus1`, `Refuse` or `Take`), with no capture dependency. A Take adds exactly one `kind="TrySubmit"` line, and only when `shadow_only=False` (WP0-R7 b). So evaluations = total lines − TrySubmit lines. | `strategy.py:564-581`, `:630-701` | independent denominator (§3.11 R1, R2, R3, R5) |
 | The trade node config sets no `streaming`, no `instance_id` and no `DataEngineConfig`. Its exec-client config holds a lambda (`state_store_opener`) and runtime objects (`submit_intent_latch`, `live_trading_permit`, `submit_veto`). | `src/breezy/runtime/node_config.py:945-972` | §3.4.2 (V-2) |
 | The recorder already streams natively, with `include_types` (`QuoteTick`, `OrderBookDepth10`, `TradeTick`, …) and daily `SCHEDULED_DATES` rotation. | `src/breezy/runtime/node_config.py:282-295`, `:400-403`, `:606-614` | frame references (§3.3) |
 | The recorder samples feed health on the event loop every `_feed_watch_interval_secs`. | `src/breezy/adapters/polymarket_us/data.py:1947-1960` (`_watch_feed` → `sample_feed_health`) | §3.10 (ping site) |

@@ -180,11 +180,13 @@ def _build_fq_strategy(
     return strategy
 
 
-def test_every_evaluation_emits_one_shadow_decision_line() -> None:
-    """V-14 item 12 (``strategy.py:535-581``). Each ``evaluate_snapshot`` call hands exactly ONE
-    record to the shadow sink and goes through ``_emit_shadow_decision``, the only writer of the
-    ``SHADOW_DECISION`` log text, for each non-Take ``Decision`` variant reached with the real
-    ``evaluate`` (no permit, not D+1, no forecast). FINDING: a ``Take`` that reaches
+def test_every_evaluation_emits_one_decision_class_line_and_a_take_adds_one_trysubmit_line() -> (
+    None
+):
+    """V-14 item 12 (``strategy.py:535-581``; WP0-R7 b). Each ``evaluate_snapshot`` call hands
+    exactly ONE record to the shadow sink and goes through ``_emit_shadow_decision``, the only
+    writer of the ``SHADOW_DECISION`` log text, for each non-Take ``Decision`` variant reached with
+    the real ``evaluate`` (no permit, not D+1, no forecast). FINDING: a ``Take`` that reaches
     ``_maybe_submit`` with ``shadow_only=False`` emits a SECOND record (``kind=TrySubmit``), so the
     line count per Take evaluation is 2, not 1. The ``Take`` branch of ``_shadow_log_line`` is
     covered by ``test_strategy.py``.
