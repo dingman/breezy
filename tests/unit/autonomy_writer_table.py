@@ -35,6 +35,7 @@ WRITE_MECHANISMS: Final[frozenset[str]] = frozenset(
         "write_root_copy",  # family_bytes.write_root_copy (6d)
         "write_monotone",  # hwm.write_monotone, under the intent flock (7e)
         "native_stream_writer",  # AUT-1: one boot's StreamingFeatherWriter (E-7 rule 4)
+        "replace_atomic",  # single_read.replace_atomic, under the owning unit's own lock
     }
 )
 
@@ -84,6 +85,13 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "evidence/capture/epoch/<family_id>.json",
         "the first composing boot, through capture_epoch.write_epoch_once",
         "write_once",
+    ),
+    # AUT-1 WP5-B (plan r12 section 3.12): the settlement unit is the only writer.
+    FileWriter(
+        "<decisions_dir>/settlement_<climate_day>.jsonl",
+        "breezy-capture-settlement (analysis.capture_settlement), rewritten whole through "
+        "single_read.replace_atomic under .capture_settlement.lock; the node never writes it",
+        "replace_atomic",
     ),
 )
 
@@ -138,6 +146,13 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(_HOOK, "_write_once", "stop hook: atomic write-once stall record (link)"),
     WriteSiteRule(_HOOK, "_atomic_replace", "stop hook: health file temp + rename"),
     WriteSiteRule(_HOOK, "_acquire_lock", "stop hook: the per-directory flock file"),
+    # AUT-1 WP5-B: the settlement writer's own lock file (the only write site in the module; the
+    # data file goes through single_read.replace_atomic).
+    WriteSiteRule(
+        "breezy.analysis.capture_settlement",
+        "_acquire_lock",
+        "settlement unit: its own flock file in <decisions_dir>",
+    ),
     WriteSiteRule(
         "breezy.persistence.live_orders_gate",
         "_verify_ruling_file",
