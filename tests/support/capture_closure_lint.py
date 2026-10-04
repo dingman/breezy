@@ -166,6 +166,8 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
         writes=("_open_child_dir", "_write_once", "_atomic_replace", "_acquire_lock"),
         min_calls=80,
     ),
+    # WP5-C: the streaming node-log parser. A reader: no write site, no subprocess, no sqlite.
+    AuthorityRow("breezy.analysis.capture_node_log", min_calls=150),
 )
 
 
