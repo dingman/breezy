@@ -12,13 +12,14 @@ parsed and refuses a file whose bytes differ, so a hand edit cannot pass as an e
 
 Choices ARCH leaves open, fixed here:
 
-* The caller chooses which rows an export carries (all rows or the rows since the last export). The
-  file is only required to be self-consistent: one venue, contiguous ``venue_seq``, and a trailer
-  whose ``venue_seq`` and ``chain_head`` are the last row's. An export with no rows is legal.
+* Every export carries the venue's full history (A6f-R2, erratum E-18a): ``venue_seq`` 1 through the
+  trailer row, contiguous and hash-linked from the venue genesis, and a trailer whose
+  ``venue_seq`` and ``chain_head`` are the last row's. Both ``write_export`` and ``newest_export``
+  enforce it. A corrupt export blocks ``newest_export`` by design (A6f-R3, E-18b).
 * A ``_hwm<k>`` name must carry a trailer with ``export_seq == k``; a daily name carries any.
-* Two candidate files with one ``export_seq`` are ambiguous and refuse; so does any candidate that
-  does not read, parse or agree with its name. One bad candidate is never skipped in favour of an
-  older good one.
+* Two candidate files with one ``export_seq`` (any repeat) are ambiguous and refuse; so does any
+  candidate that does not read, parse or agree with its name. One bad candidate is never skipped
+  in favour of an older good one.
 * A stored row that does not decode is ``schema_mismatch``: the data no longer fits the schema.
 """
 
@@ -33,16 +34,17 @@ from typing import ClassVar, Final, NamedTuple
 
 from breezy.persistence.autonomy import single_read
 from breezy.persistence.autonomy.canonical import canonical_json
+from breezy.persistence.autonomy.chain import genesis
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
-from breezy.persistence.autonomy.registry_store import (
-    _SELECT_MASTER,
+from breezy.persistence.autonomy.registry_schema import (
     APPLICATION_ID,
     COLUMNS,
     DDL_OBJECTS,
     SCHEMA_ID,
+    SELECT_MASTER,
     USER_VERSION,
-    StoreDrifted,
-    _from_db,
+    RowDecodeError,
+    row_from_record,
 )
 from breezy.persistence.autonomy.schemas import (
     ExportTrailer,
@@ -160,11 +162,12 @@ class RegistryReader:
             conn.execute(_BEGIN)
             _check_identity(conn)
             return tuple(
-                _from_db(record) for record in conn.execute(_SELECT_AFTER, (venue, after_seq))
+                row_from_record(record)
+                for record in conn.execute(_SELECT_AFTER, (venue, after_seq))
             )
         except RegistryUnreadable:
             raise
-        except StoreDrifted as exc:
+        except RowDecodeError as exc:
             raise RegistryUnreadable(UnreadableReason.SCHEMA_MISMATCH, str(exc)) from exc
         except (sqlite3.Error, OSError) as exc:
             raise RegistryUnreadable(unreadable_reason(exc), type(exc).__name__) from exc
@@ -172,6 +175,12 @@ class RegistryReader:
             _close(conn)
 
     def _connect(self) -> sqlite3.Connection:
+        """Open the database ``mode=ro`` with ``query_only`` and ``trusted_schema=OFF``.
+
+        Residual (ARCH l.408): the path is checked with ``lstat`` and opened by name, so a same-uid
+        process that replaces a parent directory with a symlink between the two is not caught.
+        Every Breezy process shares one uid and this module does not defend against that actor.
+        """
         info = os.lstat(self._db)
         if not stat.S_ISREG(info.st_mode):
             raise OSError("the registry database is not a regular file")
@@ -194,7 +203,7 @@ def _check_identity(conn: sqlite3.Connection) -> None:
     """Refuse a database whose identity or any owned object differs from the DDL constants."""
     app_id = conn.execute(_PRAGMA_APPLICATION_ID).fetchone()[0]
     version = conn.execute(_PRAGMA_USER_VERSION).fetchone()[0]
-    objects = {tuple(row) for row in conn.execute(_SELECT_MASTER)}
+    objects = {tuple(row) for row in conn.execute(SELECT_MASTER)}
     if app_id != APPLICATION_ID or version != USER_VERSION or objects != set(DDL_OBJECTS):
         raise RegistryUnreadable(UnreadableReason.SCHEMA_MISMATCH, "identity or objects differ")
     if [row[0] for row in conn.execute(_SELECT_META)] != [SCHEMA_ID]:
@@ -219,20 +228,26 @@ class ExportRefused(Exception):
 
 
 def _inconsistency(trailer: ExportTrailer, rows: tuple[TransitionRow, ...]) -> str | None:
-    """Why ``rows`` and ``trailer`` are not one export, or ``None``."""
-    previous: int | None = None
-    for row in rows:
+    """Why ``rows`` and ``trailer`` are not one full-history export, or ``None`` (A6f-R2, E-18a).
+
+    The rows are the venue's chain from genesis: ``venue_seq`` 1.., contiguous, each row's
+    ``prev_transition_hash`` the previous ``transition_hash`` (the first row's, the venue genesis),
+    ending at the trailer's ``venue_seq`` and ``chain_head``.
+    """
+    if not rows:
+        return "an export carries every row from venue_seq 1; none given"
+    prev_hash = genesis(trailer.venue)
+    for expected, row in enumerate(rows, start=1):
         if row.venue != trailer.venue:
             return "a row belongs to another venue"
         if row.venue_seq is None or row.transition_hash is None or row.seq is None:
             return "a row is not sealed"
-        if previous is not None and row.venue_seq != previous + 1:
-            return "venue_seq is not contiguous"
-        previous = row.venue_seq
-    if rows and (rows[-1].venue_seq, rows[-1].transition_hash) != (
-        trailer.venue_seq,
-        trailer.chain_head,
-    ):
+        if row.venue_seq != expected:
+            return "venue_seq does not run contiguously from 1"
+        if row.prev_transition_hash != prev_hash:
+            return "a row's prev_transition_hash is not the previous transition_hash"
+        prev_hash = row.transition_hash
+    if (rows[-1].venue_seq, rows[-1].transition_hash) != (trailer.venue_seq, trailer.chain_head):
         return "the trailer is not the last row"
     return None
 
@@ -395,12 +410,15 @@ def _newest_in(dirfd: int, venue: str) -> ExportRead | ExportUnreadable | Export
     if isinstance(candidates, ExportUnreadable):
         return candidates
     newest: ExportRead | None = None
+    seen: set[int] = set()
     for candidate in candidates:
         read = _read_candidate(dirfd, candidate, venue)
         if isinstance(read, ExportUnreadable):
             return read
-        if newest is not None and read.trailer.export_seq == newest.trailer.export_seq:
-            return ExportUnreadable(f"two exports share export_seq {read.trailer.export_seq}")
-        if newest is None or read.trailer.export_seq > newest.trailer.export_seq:
+        export_seq = read.trailer.export_seq
+        if export_seq in seen:  # any repeat, not only a repeat of the running maximum (A6f-R1)
+            return ExportUnreadable(f"two exports share export_seq {export_seq}")
+        seen.add(export_seq)
+        if newest is None or export_seq > newest.trailer.export_seq:
             newest = read
     return ExportAbsent() if newest is None else newest

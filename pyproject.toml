@@ -240,6 +240,7 @@ source_modules = [
     "breezy.persistence.autonomy.family_bytes",
     "breezy.persistence.autonomy.registry_store",
     "breezy.persistence.autonomy.registry_export",
+    "breezy.persistence.autonomy.registry_schema",
     "breezy.persistence.autonomy.label_schema",
     "breezy.persistence.autonomy.rollback_journal",
     "breezy.persistence.autonomy.schemas",
@@ -259,8 +260,8 @@ allow_indirect_imports = false
 name = "ARCH-0 autonomy (c): autonomy core modules outside PYARROW_REACHING never reach pyarrow"
 type = "forbidden"
 # Contract (b)'s list minus PYARROW_REACHING = {label_schema, family_bytes, registry_store,
-# registry_export, replay, resolver}. `registry_export` (6f) reads the store's DDL constants and
-# row decoder, so it reaches pyarrow through `registry_store` and is absent from this list.
+# replay, resolver}. `registry_export` and `registry_schema` (6f, A6f-R4) are pyarrow-free: the
+# reader takes its DDL constants and row decoder from `registry_schema`, never `registry_store`.
 source_modules = [
     "breezy.persistence.autonomy.canonical",
     "breezy.persistence.autonomy.wire",
@@ -285,6 +286,8 @@ source_modules = [
     "breezy.persistence.autonomy.demand",
     "breezy.persistence.autonomy.drill_marker",
     "breezy.persistence.autonomy.hwm",
+    "breezy.persistence.autonomy.registry_export",
+    "breezy.persistence.autonomy.registry_schema",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false

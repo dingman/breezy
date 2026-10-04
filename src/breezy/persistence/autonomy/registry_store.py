@@ -48,6 +48,17 @@ from breezy.persistence.autonomy.chain import ChainBroken
 from breezy.persistence.autonomy.family_bytes import read_manifest_facts
 from breezy.persistence.autonomy.fold import FoldInvalid, fold
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
+from breezy.persistence.autonomy.registry_schema import (
+    APPLICATION_ID,
+    COLUMNS,
+    DDL_OBJECTS,
+    SCHEMA_ID,
+    SELECT_MASTER,
+    SELECT_ROWS,
+    USER_VERSION,
+    RowDecodeError,
+    row_from_record,
+)
 from breezy.persistence.autonomy.registry_shape import is_nomination, shape_problem
 from breezy.persistence.autonomy.schemas import (
     FoldInvalidReason,
@@ -59,7 +70,7 @@ from breezy.persistence.autonomy.schemas import (
     WriterMode,
     check_venue,
 )
-from breezy.persistence.autonomy.wire import WireRefused, parse_json_exact
+from breezy.persistence.autonomy.wire import WireRefused
 
 __all__ = [
     "APPLICATION_ID",
@@ -91,105 +102,11 @@ __all__ = [
 
 _LOG = logging.getLogger(__name__)
 
-SCHEMA_ID: Final = "registry/v1"
-USER_VERSION: Final = 1
-APPLICATION_ID: Final = 0x42524759
 FILE_MODE: Final = 0o600
 DIR_MODE: Final = 0o700
 WRITER_BUSY_TIMEOUT_S: Final = 5.0
 _REGISTRY_DIR: Final = ("registry",)
 _NS_PER_S: Final = 10**9
-
-#: The ``transitions`` columns, in table order (AUT-5 r7 3.2).
-COLUMNS: Final[tuple[str, ...]] = (
-    "seq", "venue", "venue_seq", "transition_id", "family_id", "family_prior_seq",
-    "paired_transition_id", "from_state", "to_state", "kind", "cause_verdict_ids", "cause_code",
-    "halt_cause_class", "trigger_cause_class", "voids_transition_ids", "manifest_sha256",
-    "artefact_sha256", "lineage_root_family_id", "attest_valid_until_ns", "k_life", "alpha_k",
-    "n_min_eff", "n_cap", "nomination_feasible", "hwm_from", "hwm_to", "carried_counters", "drill",
-    "drill_clause_sha256", "policy_ruling_id", "policy_ruling_sha256", "decided_by",
-    "invocation_id", "engine_code_sha", "expected_prior_seq", "effective_launch_date", "ts_ns",
-    "prev_transition_hash", "transition_hash",
-)  # fmt: skip
-
-_TABLE_DDL: Final = """CREATE TABLE transitions (
-    seq INTEGER PRIMARY KEY,
-    venue TEXT NOT NULL,
-    venue_seq INTEGER NOT NULL,
-    transition_id TEXT NOT NULL,
-    family_id TEXT NOT NULL,
-    family_prior_seq INTEGER NOT NULL,
-    paired_transition_id TEXT,
-    from_state TEXT,
-    to_state TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    cause_verdict_ids TEXT NOT NULL,
-    cause_code TEXT,
-    halt_cause_class TEXT,
-    trigger_cause_class TEXT,
-    voids_transition_ids TEXT,
-    manifest_sha256 TEXT,
-    artefact_sha256 TEXT,
-    lineage_root_family_id TEXT,
-    attest_valid_until_ns INTEGER,
-    k_life INTEGER,
-    alpha_k TEXT,
-    n_min_eff INTEGER,
-    n_cap INTEGER,
-    nomination_feasible INTEGER CHECK (nomination_feasible IN (0, 1)),
-    hwm_from INTEGER,
-    hwm_to INTEGER,
-    carried_counters TEXT,
-    drill INTEGER NOT NULL CHECK (drill IN (0, 1)),
-    drill_clause_sha256 TEXT,
-    policy_ruling_id TEXT NOT NULL,
-    policy_ruling_sha256 TEXT NOT NULL,
-    decided_by TEXT NOT NULL,
-    invocation_id TEXT NOT NULL,
-    engine_code_sha TEXT NOT NULL,
-    expected_prior_seq INTEGER NOT NULL,
-    effective_launch_date TEXT,
-    ts_ns INTEGER NOT NULL,
-    prev_transition_hash TEXT NOT NULL,
-    transition_hash TEXT NOT NULL,
-    UNIQUE (venue, venue_seq),
-    UNIQUE (transition_id)
-)"""
-_NO_UPDATE_DDL: Final = """CREATE TRIGGER transitions_no_update BEFORE UPDATE ON transitions
-BEGIN
-    SELECT RAISE(ABORT, 'append-only');
-END"""
-_NO_DELETE_DDL: Final = """CREATE TRIGGER transitions_no_delete BEFORE DELETE ON transitions
-BEGIN
-    SELECT RAISE(ABORT, 'append-only');
-END"""
-#: V11: ``COALESCE`` makes the first row of a venue demand ``venue_seq = 1``; without it the
-#: comparison is NULL and a genesis at any number would pass.
-_INSERT_GUARD_DDL: Final = """CREATE TRIGGER transitions_insert_guard BEFORE INSERT ON transitions
-BEGIN
-    SELECT RAISE(ABORT, 'seq exists')
-    WHERE NEW.seq IS NOT NULL AND EXISTS (SELECT 1 FROM transitions WHERE seq = NEW.seq);
-    SELECT RAISE(ABORT, 'transition_id exists')
-    WHERE EXISTS (SELECT 1 FROM transitions WHERE transition_id = NEW.transition_id);
-    SELECT RAISE(ABORT, 'venue_seq duplicate')
-    WHERE EXISTS (
-        SELECT 1 FROM transitions WHERE venue = NEW.venue AND venue_seq = NEW.venue_seq
-    );
-    SELECT RAISE(ABORT, 'venue_seq gap')
-    WHERE NEW.venue_seq <> COALESCE(
-        (SELECT MAX(venue_seq) FROM transitions WHERE venue = NEW.venue), 0
-    ) + 1;
-END"""
-_META_DDL: Final = "CREATE TABLE meta (schema TEXT NOT NULL)"
-
-#: ``(sqlite_master type, name, sql)`` for every object the store owns, in creation order.
-DDL_OBJECTS: Final[tuple[tuple[str, str, str], ...]] = (
-    ("table", "transitions", _TABLE_DDL),
-    ("trigger", "transitions_no_update", _NO_UPDATE_DDL),
-    ("trigger", "transitions_no_delete", _NO_DELETE_DDL),
-    ("trigger", "transitions_insert_guard", _INSERT_GUARD_DDL),
-    ("table", "meta", _META_DDL),
-)
 
 _SET_APPLICATION_ID: Final = f"PRAGMA application_id = {APPLICATION_ID}"
 _SET_USER_VERSION: Final = f"PRAGMA user_version = {USER_VERSION}"
@@ -209,22 +126,15 @@ _INSERT_ROW: Final = (
     f"INSERT INTO transitions ({', '.join(_INSERT_COLUMNS)}) "
     f"VALUES ({', '.join('?' for _ in _INSERT_COLUMNS)})"
 )
-_SELECT_ROWS: Final = f"SELECT {', '.join(COLUMNS)} FROM transitions"
+_SELECT_ROWS: Final = SELECT_ROWS
 _SELECT_VENUE: Final = f"{_SELECT_ROWS} WHERE venue = ? ORDER BY venue_seq"
 _SELECT_AFTER: Final = f"{_SELECT_ROWS} WHERE venue = ? AND venue_seq > ? ORDER BY venue_seq"
 _SELECT_BY_ID: Final = f"{_SELECT_ROWS} WHERE transition_id = ?"
 _SELECT_HEAD_SEQ: Final = "SELECT COALESCE(MAX(venue_seq), 0) FROM transitions WHERE venue = ?"
-_SELECT_MASTER: Final = (
-    "SELECT type, name, sql FROM sqlite_master "
-    "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_stat%' ESCAPE '\\'"
-)
 _SELECT_META: Final = "SELECT schema FROM meta"
 _COUNT_MASTER: Final = "SELECT COUNT(*) FROM sqlite_master"
 _PRAGMA_APPLICATION_ID: Final = "PRAGMA application_id"
 _PRAGMA_USER_VERSION: Final = "PRAGMA user_version"
-
-_ID_LIST_COLUMNS: Final = ("cause_verdict_ids", "voids_transition_ids")
-_BOOL_COLUMNS: Final = ("drill", "nomination_feasible")
 
 
 # --- refusals -------------------------------------------------------------------------------------
@@ -365,14 +275,6 @@ def _encode_ids(ids: tuple[str, ...] | None) -> str | None:
     return None if ids is None else ",".join(ids)
 
 
-def _decode_ids(text: object) -> list[str] | None:
-    if text is None:
-        return None
-    if not isinstance(text, str):
-        raise StoreDrifted("id list column is not text")
-    return text.split(",") if text else []
-
-
 def _to_db(row: TransitionRow) -> tuple[object, ...]:
     wire = row.to_wire()
     wire["cause_verdict_ids"] = _encode_ids(row.cause_verdict_ids)
@@ -382,19 +284,10 @@ def _to_db(row: TransitionRow) -> tuple[object, ...]:
 
 
 def _from_db(record: Sequence[object]) -> TransitionRow:
-    obj: dict[str, object] = dict(zip(COLUMNS, record, strict=True))
-    for name in _ID_LIST_COLUMNS:
-        obj[name] = _decode_ids(obj[name])
-    for name in _BOOL_COLUMNS:
-        if obj[name] is not None:
-            obj[name] = obj[name] == 1
-    counters = obj["carried_counters"]
     try:
-        if counters is not None:
-            obj["carried_counters"] = parse_json_exact(str(counters))
-        return TransitionRow.from_wire(obj)
-    except WireRefused as exc:
-        raise StoreDrifted(f"stored row does not decode: {exc.reason.value}") from exc
+        return row_from_record(record)
+    except RowDecodeError as exc:
+        raise StoreDrifted(f"stored row does not decode: {exc}") from exc
 
 
 def _seal(
@@ -539,7 +432,7 @@ class RegistryStore:
         app_id = conn.execute(_PRAGMA_APPLICATION_ID).fetchone()[0]
         version = conn.execute(_PRAGMA_USER_VERSION).fetchone()[0]
         meta = [row[0] for row in conn.execute(_SELECT_META)]
-        objects = {tuple(row) for row in conn.execute(_SELECT_MASTER)}
+        objects = {tuple(row) for row in conn.execute(SELECT_MASTER)}
         if (
             app_id != APPLICATION_ID
             or version != USER_VERSION

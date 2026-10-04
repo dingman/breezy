@@ -22,6 +22,7 @@ import pytest
 import breezy.persistence.autonomy.registry_export as rx
 import breezy.persistence.autonomy.registry_store as rs
 from breezy.persistence.autonomy import chain, rollback_journal
+from breezy.persistence.autonomy.hwm import HwmPresent, hwm_check, next_hwm
 from breezy.persistence.autonomy.paths import VENUE_RE, AutonomyPaths, ShadowPaths
 from breezy.persistence.autonomy.registry_export import (
     ExportAbsent,
@@ -432,10 +433,13 @@ def test_write_export_carries_the_reset_variant_name(
     assert target.exists()
 
 
-def test_write_export_may_carry_no_rows(paths: AutonomyPaths, export_dir: Path) -> None:
+def test_write_export_refuses_an_export_with_no_rows(
+    paths: AutonomyPaths, export_dir: Path
+) -> None:
     trailer = ExportTrailer(venue=VENUE, venue_seq=2, chain_head="a" * 64, export_seq=3)
-    write_export(paths, day=DAY, trailer=trailer, rows=())
-    assert newest_export(paths, VENUE) == ExportRead(trailer, ())
+    with pytest.raises(ExportRefused):
+        write_export(paths, day=DAY, trailer=trailer, rows=())
+    assert list(export_dir.iterdir()) == []
 
 
 def _swap_venue(row: TransitionRow) -> TransitionRow:
@@ -801,13 +805,153 @@ def test_the_trailer_carries_journal_heads_that_match_the_journal(
     assert not rollback_journal.head_matches(journal, moved)
 
 
-def test_export_seq_is_what_hwm_check_reads_as_newest(
+def test_newest_export_seq_feeds_hwm_check(
     paths: AutonomyPaths, export_dir: Path, stored_rows: tuple[TransitionRow, ...]
 ) -> None:
-    assert newest_export(paths, VENUE) == ExportAbsent()  # no export means newest_export_seq 0
+    verified = chain.verify_venue_chain(stored_rows, VENUE)
+
+    def refusal(export_seq: int, newest_seq: int) -> RefusalReason | None:
+        hwm = next_hwm(verified, export_seq=export_seq)
+        return hwm_check(verified, HwmPresent(hwm=hwm), newest_export_seq=newest_seq)
+
+    assert newest_export(paths, VENUE) == ExportAbsent()  # no export: newest_export_seq is 0
+    assert refusal(0, 0) is None
+    assert refusal(1, 0) is RefusalReason.HWM_REGRESSED
     put_export(paths, stored_rows, 4)
     newest = newest_export(paths, VENUE)
-    assert isinstance(newest, ExportRead) and newest.trailer.export_seq == 4
+    assert isinstance(newest, ExportRead)
+    assert refusal(4, newest.trailer.export_seq) is None
+    assert refusal(5, newest.trailer.export_seq) is RefusalReason.HWM_REGRESSED
+
+
+# --- A6f-R1: a repeat of any export_seq refuses --------------------------------------------------
+
+
+def test_a_lower_duplicate_export_seq_after_the_maximum_is_ambiguous(
+    paths: AutonomyPaths, export_dir: Path, stored_rows: tuple[TransitionRow, ...]
+) -> None:
+    # Name order is 12-01, 12-02, 12-03: seq 3, then the maximum 5, then a repeat of 3.
+    put_export(paths, stored_rows, 3, day="2026-12-01")
+    put_export(paths, stored_rows, 5, day="2026-12-02")
+    put_export(paths, stored_rows, 3, day="2026-12-03")
+    result = newest_export(paths, VENUE)
+    assert isinstance(result, ExportUnreadable)
+    assert "share export_seq 3" in result.detail
+
+
+# --- A6f-R2: every export is the venue's full history from venue_seq 1 -------------------------
+
+
+def _suffix_only(rows: tuple[TransitionRow, ...]) -> tuple[TransitionRow, ...]:
+    return rows[1:]
+
+
+def _first_row_is_five(rows: tuple[TransitionRow, ...]) -> tuple[TransitionRow, ...]:
+    return (dataclasses.replace(rows[0], venue_seq=5),)
+
+
+def _broken_prev_hash(rows: tuple[TransitionRow, ...]) -> tuple[TransitionRow, ...]:
+    return (rows[0], dataclasses.replace(rows[1], prev_transition_hash="e" * 64))
+
+
+def _first_prev_is_not_genesis(rows: tuple[TransitionRow, ...]) -> tuple[TransitionRow, ...]:
+    return (dataclasses.replace(rows[0], prev_transition_hash="e" * 64), rows[1])
+
+
+_HISTORY_BREAKS: Final[dict[str, Any]] = {
+    "suffix_only": _suffix_only,
+    "first_row_other_than_1": _first_row_is_five,
+    "broken_prev_hash": _broken_prev_hash,
+    "first_prev_is_not_genesis": _first_prev_is_not_genesis,
+}
+
+
+@pytest.mark.parametrize("case", sorted(_HISTORY_BREAKS))
+def test_write_export_refuses_anything_but_the_full_linked_history(
+    case: str, paths: AutonomyPaths, export_dir: Path, stored_rows: tuple[TransitionRow, ...]
+) -> None:
+    rows = _HISTORY_BREAKS[case](stored_rows)
+    with pytest.raises(ExportRefused):
+        write_export(paths, day=DAY, trailer=trailer_for(rows, 1), rows=rows)
+    assert list(export_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("case", sorted(_HISTORY_BREAKS))
+def test_newest_export_refuses_anything_but_the_full_linked_history(
+    case: str, paths: AutonomyPaths, export_dir: Path, stored_rows: tuple[TransitionRow, ...]
+) -> None:
+    rows = _HISTORY_BREAKS[case](stored_rows)
+    plant(export_dir / f"registry_{VENUE}_{DAY}.jsonl", rx._render(trailer_for(rows, 1), rows))
+    result = newest_export(paths, VENUE)
+    assert isinstance(result, ExportUnreadable), case
+
+
+# --- A6f-R5 L1: a real hot journal --------------------------------------------------------------
+
+_HOT_WRITER: Final = """
+import sqlite3, sys, time
+conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+conn.execute("PRAGMA journal_mode = DELETE")
+conn.execute("PRAGMA cache_size = 1")
+conn.execute("BEGIN IMMEDIATE")
+columns = (
+    "venue, venue_seq, transition_id, family_id, family_prior_seq, to_state, kind,"
+    " cause_verdict_ids, drill, policy_ruling_id, policy_ruling_sha256, decided_by,"
+    " invocation_id, engine_code_sha, expected_prior_seq, ts_ns, prev_transition_hash,"
+    " transition_hash"
+)
+for n in range(1, 9):
+    conn.execute(
+        f"INSERT INTO transitions ({columns}) VALUES ('zz', ?, ?, 'f', 0, 'CHAMPION', 'BOOTSTRAP',"
+        " ?, 0, 'r', 's', 'engine', 'i', 'e', 0, 1, 'p', 'h')",
+        (n, f"{n:064x}", "ab" * 400_000),
+    )
+print("READY", flush=True)
+time.sleep(120)
+"""
+
+
+def test_a_writer_killed_mid_commit_leaves_a_hot_journal_the_reader_names(
+    paths: AutonomyPaths, store: RegistryStore, stored_rows: tuple[TransitionRow, ...]
+) -> None:
+    import signal
+    import subprocess
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", _HOT_WRITER, str(store._db)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        child.send_signal(signal.SIGKILL)  # after BEGIN and the INSERTs, before COMMIT
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+    journal = store._db.with_name(store._db.name + "-journal")
+    assert journal.exists() and journal.stat().st_size > 0
+    before = (store._db.read_bytes(), journal.read_bytes())
+    assert reason_of(lambda: reader(paths).read_venue_rows(VENUE)) is UnreadableReason.HOT_JOURNAL
+    assert (store._db.read_bytes(), journal.read_bytes()) == before  # the reader repaired nothing
+    # The engine's next read-write open rolls the journal back; the reader then sees the old rows.
+    conn = store._open()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+    assert not journal.exists()
+    assert reader(paths).read_venue_rows(VENUE) == stored_rows
+
+
+# --- A6f-R5 L5: the documented residual -----------------------------------------------------
+
+
+def test_connect_documents_the_same_uid_parent_symlink_residual() -> None:
+    doc = RegistryReader._connect.__doc__ or ""
+    assert "symlink" in doc and "l.408" in doc
 
 
 # --- module hygiene -------------------------------------------------------------------------------
