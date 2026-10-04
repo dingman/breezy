@@ -397,3 +397,15 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
     - The transition-table test asserts the refusal message.
     - The vacuous closed-reason test is replaced by a test that triggers each refusal.
   - **A6e-A2 (fail-closed, as specified).** Schema drift, a non-verifying stored chain, or a stored head lacking `effective_launch_date` refuses every later append on that venue, restrictive writes included. Readers refuse the same database, so the node is vetoed. Y19 plus the Z11 demand file is the clearing path. No bypass exists, by design. The engine never mixes restrictive and widening rows in one batch (plan 10.5).
+
+### Build-time rulings (seam A 6f/7e ARCH review, 26447421)
+- **A6f-R1 (M1).** `newest_export` refuses any repeated `export_seq` across all candidates, not only a repeat of the running maximum.
+- **A6f-R2 (M2).** Every export carries every row of its venue from genesis (`venue_seq` 1) to the trailer, contiguous and hash-linked: `prev_transition_hash` equals the previous `transition_hash`. `write_export` and `newest_export` both enforce this. AUT-5 r7 B9 counter floors and reset-CLI step 2 fold a single file (erratum E-18a). The 64 MiB cap is far above the projected size.
+- **A6f-R3 (M3).** A corrupt or tampered export blocks `newest_export` by design (fail closed). The clearing path is erratum E-18b: an AUT-5a-owned incident procedure.
+- **A6f-R4 (L2).** `COLUMNS`, the DDL objects, the identity constants, the master-select statement and the row decoder move into a new pyarrow-free module, `registry_schema.py`, under public names. `registry_store` and `registry_export` import from it. `registry_export` leaves `PYARROW_REACHING` and joins contract (c).
+- **A6f-R5 (L1, L3, L5).**
+  - A real hot-journal integration test.
+  - The misnamed HWM test either calls `hwm_check` or is renamed.
+  - The `_connect` docstring records the same-uid parent-symlink residual (ARCH l.408).
+- **A7e-R1 (L4).** The `HwmAbsent(` construction ban resolves import aliases, with a planted alias control.
+- **A7e-A1.** The HWM "genesis head" written at the AUT-5a cut-over is the BOOTSTRAP row at `venue_seq` 1. A `venue_seq` of 0 is unconstructible. The unversioned exact-key HWM wire format is accepted, because any shape change decodes as `HwmUnreadable` (fail closed).

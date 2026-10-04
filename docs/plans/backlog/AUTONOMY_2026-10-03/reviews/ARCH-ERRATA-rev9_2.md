@@ -443,3 +443,14 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **(b) Durability.** The registry writer uses `PRAGMA synchronous=EXTRA`, not FULL. In DELETE journal mode only EXTRA fsyncs the directory after the commit-point journal unlink. This amends ARCH Y5 and AUT-5 r7 §3.2.
 - **(c) Clock.** A row's `ts_ns` must not exceed the writer's clock. The old symmetric ±300 s skew window becomes one-sided, so that the fold's `ts_ns <= now_ns` application can never delay a committed restrictive row.
 - **(d) Write order.** CAS on `expected_prior_seq` runs before the clock check. A stale writer then sees `CasMismatch` and takes the ARCH l.530 re-read/retry path, rather than `clock_before_head`.
+
+## E-18 (coordinator, 2026-10-04; from the ARCH-0 seam A 6f/7e ARCH review): registry exports
+- **(a) Full-history exports.** Every daily and `_hwm<k>` export carries all rows of its venue from `venue_seq` 1 through the trailer row, contiguous and hash-linked. The "rows since the previous export" reading (ARCH l.437, AUT-5 r7:173) is withdrawn. The reasons:
+  - AUT-5 r7:154 (B9) folds the newest export for counter floors.
+  - Reset-CLI step 2 compares against "rows in that export".
+  - Both need the full history in one file.
+- **(b) Corrupt-export incident path.** A candidate under `evidence/registry/` that does not read as a valid export makes `newest_export` refuse. That blocks the resolver, the watch actor and reset-CLI step 1, by design. Exports stay append-only in normal operation. The only clearing path is an AUT-5a-owned incident procedure, which runs in this order:
+  1. File an incident report naming the file, its sha256 and the cause.
+  2. Move the file into a quarantine directory outside `evidence/registry/` (never delete it).
+  3. Run the HWM reset CLI.
+  AUT-5a owns the procedure, its CLI and its test.
