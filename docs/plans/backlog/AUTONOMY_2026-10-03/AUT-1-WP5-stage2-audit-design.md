@@ -234,3 +234,60 @@ ARCH scored correctness 7, fit 7, tests 6, risk 6, minimality 7, feasibility 6. 
 - **Corrections ordered.**
   - The node-log package owns `NodeLogSinkFailed`; S2-R1 forbids it importing the audit model.
   - `is_guard_entry_veto` means the capture guard's own refusal reasons. The FQ `VetoReason` EntryVetos enter the filter through `follow_up`.
+
+## Stage 2b, W1 (1293985f)
+- **Result.** RED: 115 tests. All mutants are killed; 3 needed added tests.
+- **Accepted deviations.**
+  - A new `capture_audit_fill_support.py` keeps both modules ≤ 800 lines; it has its own authority row.
+  - The stage-2a stub pin moves from `min_calls == 1` to `>= 1`, consistent with S2-R15: builders raise their own floors.
+  - Leg I's day is the intent day (`link.ts_ns`).
+  - The R6 threshold is `R6_BASELINE` itself.
+  - The climate-day end is re-implemented and parity-pinned.
+  - Guard constants are pinned locally.
+- **Requirements on W3 (forwarded).**
+  - `TapeIndex.lookup` returns rows in the WP2-R4 frame-body shape.
+  - `std_offsets` is keyed by both the city code and the ICAO id.
+  - A `BootEvidence.stream()` failure maps to `capture_projection_failed` / `stream_unreadable` in orchestration.
+
+## Stage 2b, W2 (3c5d1aa7)
+- **Oracle.** 12 seeds were run through the real `FqCaptureAdapter` and `EvalSeqCounter`: twins, follow-ups, guard refusals and non-monotone frames. All 7 mutations were killed.
+- **RED was weak.** Code was written before tests. The mutation table is the evidence (accepted, same precedent as earlier).
+- **Accepted deviations.**
+  - The tests are split into two files, for size.
+  - `BootDayReplay` carries a bounded hash chain plus a 61 s tail. R2 compares it against the stream's records.
+  - `MarkerParser` caps each kind at 50k per boot-day; overflow → `node_log_sink_failed`.
+  - The heartbeat table name is a pinned literal, because `analysis` may not import Nautilus.
+- **S2-R18, R1/R3 input.**
+  - R1/R3 read `scan.entry_lines` (Take and TrySubmit only), which are tens per day.
+  - A truncated list (`entry_total > len(entry_lines)`) is ERROR, never a silent pass. Fail-closed is accepted.
+  - 2c pins this with a test.
+- **S2-R19, AUT-6 contract (leg N).** A missed-cycle delivery proof is `NotifierProof(unit="NBP_CYCLE_MISSED", invocation_id=str(cycle_ns))`. AUT-6 must match it, or the constant changes in the same commit as AUT-6's format.
+- **S2-R20, follow-up.** Add `write_drops` to `HeartbeatSummary`, so R5 avoids a full stream read. This is a 2c or later item, not blocking.
+- **2c notes.**
+  - The stage-2a default fixture is inconsistent: `admitted_total=1` with no decisions. W3's PASS fixtures must be internally consistent.
+  - Expect conflicts in `test_capture_audit_stubs.py` and `capture_closure_lint.py`.
+
+## Stage 2b, W3 (d9360e66)
+- **Result.** Focused gate `phase1 rc=0 phase2 rc=0`; lint-imports 11 kept / 0 broken; exec client sha unchanged. All 6 mutants killed. The cache-key mutant needed the fixture padded past 64 KiB, because the key hashes only the first 64 KiB.
+- **New modules (accepted, size split):** `capture_audit_cache.py`, `capture_audit_exec_view.py`, `capture_audit_tape.py`.
+- **Accepted rows:** a one-writer row for `capture_audit_host._run_template`; an X1 "WIDENED, not relaxed" row for `tests/support/capture_audit_w3_fixtures.py` (no `SOCKET_RESTORING_MARKERS`).
+- **Deferred to stage 3 (accepted):** the audit row, and the bus-snapshot bind.
+- **Pending e2e:** `tests/unit/autonomy/pending_s2c_capture_audit_e2e.py` is RED until it runs against the real W1/W2 code. 2c activates it.
+
+## Stage 2c rulings (coordinator, 2026-10-04; binding)
+- **S2-R21, closure lint.** W3 extended the shared closure lint (`tests/support/capture_closure_lint.py`) to accept slot-templated argvs. This is accepted ONLY as a strict extension:
+  - every slot must resolve to a value drawn from a closed, pinned set;
+  - a template that has a free-form slot, or a slot that could carry a path outside the existing allowlist, is refused;
+  - every pre-existing lint test passes unchanged;
+  - a mutation (any slot admitted) turns a test red.
+  The security review checks this explicitly.
+- **S2-R22, settlement cause.** A settlement read failure gets its own cause, `settlement_unreadable`. It must not reuse `capture_projection_failed`. Add the cause to the closed set, and extend the exact-set test. This is an extension, not a weakening.
+- **S2-R23, ERROR days.**
+  - ERROR is not terminal. A day whose verdict is ERROR is re-audited on the next run.
+  - Only PASS and FAIL are cached under the cache key.
+  - A test pins both halves.
+  - If the design body or plan r12 says ERROR is terminal, STOP and cite the line instead.
+- **S2-R24, subscribed set.**
+  - If plan r12 §3.11–§3.16 names a source for the subscribed-instrument set, use that source.
+  - Deriving the set from tape activity is accepted only if the plan names no source. In that case, note the deviation here.
+- **S2-R25, PASS fixtures.** Every PASS fixture is internally consistent. For example, `admitted_total` equals the number of admitted decisions, which replaces the stage-2a default. One test asserts that each PASS fixture audits to PASS through the real legs.
