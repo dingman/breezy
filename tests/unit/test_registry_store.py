@@ -1013,7 +1013,13 @@ def test_a_stale_writer_gets_cas_mismatch_not_clock_before_head(store: RegistryS
     put_bootstrap(store)
     stale = demote(ts=NOW + SEC)  # prepared against head 1
     winner = mk(
-        Kind.ATTEST, State.CHAMPION, frm=State.CHAMPION, fps=1, expected=1, ts=NOW + 9 * SEC
+        Kind.ATTEST,
+        State.CHAMPION,
+        frm=State.CHAMPION,
+        fps=1,
+        expected=1,
+        ts=NOW + 9 * SEC,
+        attest_valid_until_ns=NOW + 10 * SEC,
     )
     store.append([winner], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + 9 * SEC)
     with pytest.raises(CasMismatch) as info:
@@ -1132,7 +1138,7 @@ def test_restrictive_rows_consult_no_manifest_policy_or_stage_flag(
 
     monkeypatch.setattr(rs, "read_manifest_facts", boom)
     monkeypatch.setattr(store, "_manifests", boom)
-    real_validate = transitions.validate
+    real_validate = transitions.first_refusal
     judged: list[tuple[Kind, ...]] = []
 
     def spy(prior: Any, rows: Any, **kwargs: Any) -> Any:
@@ -1140,7 +1146,7 @@ def test_restrictive_rows_consult_no_manifest_policy_or_stage_flag(
         assert kwargs["manifests"] is boom  # the store hands over its (here booby-trapped) reader
         return real_validate(prior, rows, **kwargs)
 
-    monkeypatch.setattr(transitions, "validate", spy)
+    monkeypatch.setattr(transitions, "first_refusal", spy)
     result = store.append(
         [demote()], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC
     )

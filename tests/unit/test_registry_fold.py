@@ -553,7 +553,9 @@ def test_fold_over_a_verified_chain_matches_the_unsealed_rows() -> None:
 
 
 def test_fold_module_imports_only_schemas_pins_and_its_tallies() -> None:
-    assert _internal_imports("fold.py") == {"schemas", "pins", "fold_tallies"}
+    """Seam 7d (A7d-R4) moved the pair handling and its ``pins`` reads to ``fold_pairs``."""
+    assert _internal_imports("fold.py") == {"schemas", "fold_pairs", "fold_tallies"}
+    assert _internal_imports("fold_pairs.py") == {"schemas", "pins"}
 
 
 def test_fold_tallies_imports_only_schemas_and_the_wire_helpers() -> None:

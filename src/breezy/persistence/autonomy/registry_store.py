@@ -213,7 +213,16 @@ class FoldRefused(RegistryRefused):
 
 
 class ValidateRefused(RegistryRefused):
-    """``transitions.validate`` refused the batch; ``reason`` is its closed reason (AC 10.9)."""
+    """``transitions.validate`` refused the batch (AC 10.9).
+
+    ``reason`` is its closed reason, ``rule`` the precise rule and ``row_index`` the batch row: a
+    deterministic refusal the engine must not retry (A7d-R2).
+    """
+
+    def __init__(self, detail: str, *, refusal: transitions.Refusal) -> None:
+        self.rule = refusal.rule
+        self.row_index = refusal.row_index
+        super().__init__(detail, reason=refusal.reason)
 
 
 class ChainRefused(RegistryRefused):
@@ -535,7 +544,7 @@ class RegistryStore:
             raise CasMismatch(f"head venue_seq {head} is not the expected prior seq")
         _check_clock(batch, prior, now_ns)
         extended = _verify_structure(prior, batch, venue, now_ns)
-        self._validate(prior, batch, mode, now_ns, stage)
+        self._validate(prior, batch, now_ns)
         for row in extended:
             conn.execute(_INSERT_ROW, _to_db(row))
         written = [_from_db(r) for r in conn.execute(_SELECT_AFTER, (venue, head))]
@@ -545,19 +554,17 @@ class RegistryStore:
         self,
         prior: Sequence[TransitionRow],
         batch: Sequence[TransitionRow],
-        mode: WriterMode,
         now_ns: int,
-        stage: StageView,
     ) -> None:
         """AC 10 step 9: the semantic rules, against the fold of the rows already written."""
         folded = fold(prior, batch[0].venue, now_ns)
         if isinstance(folded, FoldInvalid):
             raise FoldRefused(folded.reason.value, reason=_FOLD_REFUSALS[folded.reason])
-        reason = transitions.validate(
-            folded, batch, mode=mode, now_ns=now_ns, stage=stage, manifests=self._manifests
-        )
-        if reason is not None:
-            raise ValidateRefused(reason.value, reason=reason)
+        refusal = transitions.first_refusal(folded, batch, manifests=self._manifests)
+        if refusal is not None:
+            raise ValidateRefused(
+                f"{refusal.rule.value} at row {refusal.row_index}", refusal=refusal
+            )
 
 
 #: Columns a replay may differ in: the position, the clock, the writer's identity and the hashes.

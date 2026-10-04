@@ -54,7 +54,9 @@ from typing import Final
 
 from breezy.persistence.autonomy import pins
 from breezy.persistence.autonomy.fold import (
+    HEAD_KINDS,
     INTRODUCING_KINDS,
+    PARTNER_KINDS,
     FamilyView,
     FoldResult,
     PairStatus,
@@ -236,7 +238,9 @@ def _reuses_artefact(ctx: Ctx, row: TransitionRow, before: Sequence[TransitionRo
     batch = (
         e.artefact_sha256
         for e in before
-        if e.lineage_root_family_id == root and e.kind in INTRODUCING_KINDS
+        if e.lineage_root_family_id == root
+        and e.kind in INTRODUCING_KINDS
+        and e.effective_launch_date is None  # a pending ROOT_ADMIT is not applied (as in fold)
     )
     return sha in {*held, *batch}
 
@@ -324,14 +328,19 @@ def _rollback_target(view: FamilyView | None, at: int) -> Hit | None:
 
 
 def rollback(ctx: Ctx, row: TransitionRow) -> Hit | None:
-    """A7c-R3: the fold-decidable ROLLBACK rules; a drill ROLLBACK is exempt from dwell and cap."""
+    """A7c-R3, A7d-R1: the fold-decidable ROLLBACK rules.
+
+    Every ROLLBACK keeps the dwell; a drill ROLLBACK is exempt only from the rollback budget.
+    """
     at = effective_ns(row)
     hit = _rollback_target(ctx.prior.families.get(row.family_id), at)
-    if hit is not None or row.drill:
+    if hit is not None:
         return hit
     anchor = _dwell_anchor(ctx.prior)
     if anchor is not None and at - anchor < pins.ROLLBACK_MIN_DWELL_H * HOUR_NS:
         return RuleII.ROLLBACK_DWELL, FAIL
+    if row.drill:
+        return None
     used = recent(venue_instants(ctx.prior, "rollbacks"), at, _ROLLBACK_WINDOW_NS)
     used += _pending_heads(ctx, (Kind.ROLLBACK,), at, _ROLLBACK_WINDOW_NS)
     used += sum(1 for e in ctx.earlier if e.kind is Kind.ROLLBACK and not e.drill)
@@ -346,7 +355,8 @@ def rollback(ctx: Ctx, row: TransitionRow) -> Hit | None:
 def attest(ctx: Ctx, row: TransitionRow) -> Hit | None:
     """Z4 validity ceiling and the W1 cadence (the first ATTEST of an epoch is exempt)."""
     until = row.attest_valid_until_ns
-    if until is None or until > row.ts_ns + pins.ATTEST_VERDICT_VALIDITY_H * HOUR_NS:
+    ceiling = row.ts_ns + pins.ATTEST_VERDICT_VALIDITY_H * HOUR_NS
+    if until is None or until <= row.ts_ns or until > ceiling:
         return RuleII.ATTEST_VALIDITY, FAIL
     view = ctx.prior.families.get(row.family_id)
     last = None if view is None else view.last_attest_ns
@@ -363,11 +373,19 @@ def attest(ctx: Ctx, row: TransitionRow) -> Hit | None:
 
 
 def _cancellable(ctx: Ctx, ts_ns: int) -> set[str]:
+    """The members a cancel stamped ``ts_ns`` voids, exactly as ``fold`` decides (A7d-R2).
+
+    A member of a non-voided pair when ``ts_ns`` is before its LAUNCH, or when the pair was
+    activated and ``ts_ns`` is before the launch-window end. The stamp, not the commit time,
+    decides: a cancel stamped 16:49:59 and committed at 16:50:01 voids an ACTIVATEd pair.
+    """
     ids = {e.transition_id for e in ctx.earlier if e.effective_launch_date is not None}
     for pair in ctx.prior.pairs:
+        if pair.status is PairStatus.VOIDED:
+            continue
         window_end = schedule_ns(pair.effective_launch_date, pins.SCHEDULE_LAUNCH_WINDOW_END_UTC)
-        took_effect = pair.status is PairStatus.EFFECTIVE and pair.launch_ns <= ts_ns < window_end
-        if pair.status is PairStatus.PENDING or took_effect:
+        activated = pair.activate_transition_id is not None
+        if ts_ns < pair.launch_ns or (activated and ts_ns < window_end):
             ids.update(pair.member_transition_ids)
     return ids
 
@@ -446,14 +464,24 @@ def _launch_effects(
             pair.member_transition_ids
         ):
             effects.setdefault(pair.launch_ns, []).extend(pair.member_effects)
+    launches = {
+        pair.head_transition_id: pair.launch_ns
+        for pair in prior.pairs
+        if pair.status is PairStatus.PENDING
+    }
+    launches.update(
+        (row.transition_id, schedule_ns(row.effective_launch_date, pins.SCHEDULE_LAUNCH_UTC))
+        for row in rows
+        if row.kind in HEAD_KINDS and row.to_state is State.CHAMPION and row.effective_launch_date
+    )
     for row in rows:
-        if (
-            row.effective_launch_date is not None
-            and row.kind in (Kind.PROMOTE, Kind.DRILL_PROMOTE, Kind.ROLLBACK, Kind.ROOT_ADMIT,
-                             Kind.SUPERSEDE, Kind.DISPLACED)
-            and row.transition_id not in voided
-        ):  # fmt: skip
-            launch = schedule_ns(row.effective_launch_date, pins.SCHEDULE_LAUNCH_UTC)
+        if row.transition_id in voided:
+            continue
+        # a head takes effect at its own LAUNCH, a partner at the LAUNCH of the head it cites
+        # (as fold does), and a partner citing no head never takes effect
+        key = row.transition_id if row.kind in HEAD_KINDS else row.paired_transition_id
+        launch = launches.get(key or "")
+        if launch is not None and (row.kind in HEAD_KINDS or row.kind in PARTNER_KINDS):
             effects.setdefault(launch, []).append((row.family_id, row.to_state))
     return effects
 

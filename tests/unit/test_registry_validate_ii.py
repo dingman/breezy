@@ -318,7 +318,6 @@ def test_mint_unlimited_by_k_max_but_one_per_day() -> None:
 
     first = NOW
     third = "pm_us_crh_fq_v1_r0003"
-    assert mint(minted_once(first), first + HOUR_NS, family=third) is not None
     refused = mint(minted_once(first), first + HOUR_NS, family=third)
     assert refused is not None
     assert (refused.rule.value, refused.row_index) == ("mint_rate", 0)
@@ -454,14 +453,15 @@ def test_damping_ceilings(facet: str) -> None:
     def spent_before(instant: int) -> tuple[int, ...]:
         return tuple(instant - (n + 1) * HOUR_NS for n in range(cap))
 
-    drill = open_episode_chain()  # drill-episode rows count only against the drill budget
-    close_launch = at(NEXT_DAY, "16:50")
-    exhaust(drill, sender_changes=spent_before(close_launch))
-    closing = probe(
-        drill, at(DAY, "20:00"), Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT,
-        frm=State.CHALLENGER, effective_launch_date=NEXT_DAY, drill=True,
-    )  # fmt: skip
-    assert closing is None
+    drill = champion_chain()  # drill-episode rows count only against the drill budget
+    drill.add(
+        Kind.DRILL_ADMIT, State.CHALLENGER, family=CHILD, frm=State.SHADOW, artefact_sha256=INC_ART
+    )
+    exhaust(drill, sender_changes=spent_before(LAUNCH))
+    assert ask_promote(drill, Kind.DRILL_PROMOTE) is None  # a DRILL_PROMOTE is no sender change
+    control = nominated(champion_chain())
+    exhaust(control, sender_changes=spent_before(LAUNCH))
+    assert rule_of(ask_promote(control)) == "sender_change_daily_cap"  # the same chain, a PROMOTE
 
     failed = _failed_close_chain()
     exhaust(failed, sender_changes=spent_before(RESTORE_TS))
@@ -608,15 +608,41 @@ def test_rollback_budget_sums_every_lineages_slice_over_thirty_days() -> None:
     assert refused is not None and refused.rule.value == "rollback_budget"
 
 
-def test_a_drill_rollback_is_exempt_from_dwell_and_the_rollback_budget() -> None:
-    cap = pins.MAX_ROLLBACKS_PER_VENUE_30D
-    chain = open_episode_chain()  # CHILD took over at DAY's LAUNCH; the close is a day later
-    exhaust(chain, {INCUMBENT: {"rollbacks": (LAUNCH,) * cap}}, sender_changes=(LAUNCH,))
-    closing = probe(
+def drill_close(chain: Chain) -> Any:
+    return probe(
         chain, at(DAY, "20:00"), Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT,
         frm=State.CHALLENGER, effective_launch_date=NEXT_DAY, drill=True,
     )  # fmt: skip
-    assert closing is None  # W3: the drill's closing ROLLBACK is admitted
+
+
+def test_a_drill_rollback_is_exempt_from_the_rollback_budget_only() -> None:
+    """A7d-R1: ``MAX_ROLLBACKS_PER_VENUE_30D`` counts no drill ROLLBACK; the dwell still binds."""
+    cap = pins.MAX_ROLLBACKS_PER_VENUE_30D
+    close = at(NEXT_DAY, "16:50")
+    chain = open_episode_chain()  # CHILD took over at DAY's LAUNCH, 24 h before the close
+    exhaust(chain, {INCUMBENT: {"rollbacks": (LAUNCH,) * cap}})
+    assert drill_close(chain) is None  # W3: the closing ROLLBACK is admitted
+
+    spent = promoted_chain()  # control: the same spent budget refuses a non-drill ROLLBACK
+    launch = at(THIRD_DAY, "16:50")
+    exhaust(spent, {INCUMBENT: {"rollbacks": (launch - 5 * DAY_NS,) * cap}})
+    refused = ask_rollback(spent)
+    assert refused is not None and refused.rule.value == "rollback_budget"
+    assert close - LAUNCH == pins.ROLLBACK_MIN_DWELL_H * HOUR_NS  # the drill sits at exactly 24 h
+
+
+def test_dwell_refuses_a_drill_rollback() -> None:
+    """A7d-R1 (ARCH:913, AUT-7 r5:185): a drill ROLLBACK keeps ``ROLLBACK_MIN_DWELL_H``."""
+    close = at(NEXT_DAY, "16:50")
+    inside = open_episode_chain()
+    exhaust(inside, sender_changes=(close - pins.ROLLBACK_MIN_DWELL_H * HOUR_NS + 1,))
+    refused = drill_close(inside)
+    assert refused is not None
+    assert (refused.rule.value, refused.row_index) == ("rollback_dwell", 0)
+
+    exactly = open_episode_chain()
+    exhaust(exactly, sender_changes=(close - pins.ROLLBACK_MIN_DWELL_H * HOUR_NS,))
+    assert drill_close(exactly) is None
 
 
 # --- ATTEST (Y3, W1, Z4) -------------------------------------------------------------------------
@@ -745,11 +771,18 @@ def test_swap_cancel_may_void_a_pair_written_earlier_in_the_same_batch() -> None
     chain = champion_chain()
     chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
     prior = run(chain, NOW)
-    head, tail = chain.promote_pair(day=DAY)
+    head = chain.add(
+        Kind.PROMOTE, State.CHAMPION, family=CHILD, frm=State.CHALLENGER,
+        effective_launch_date=DAY, manifest_sha256=CHILD_MAN, artefact_sha256=INC_ART,
+    )  # fmt: skip
+    tail = chain.add(
+        Kind.SUPERSEDE, State.CHALLENGER, family=INCUMBENT, frm=State.CHAMPION,
+        paired_transition_id=head.transition_id, effective_launch_date=DAY,
+    )  # fmt: skip
     cancel_row = cancel(chain, head, ts=NOW + SEC)
     batch = [head, tail, cancel_row]
     refused = tm.first_refusal(prior, batch, manifests=facts_for_child)
-    assert refused is None or refused.rule.value != "swap_cancel_voids_not_pending"
+    assert refused is None  # the whole pair-and-cancel batch is one valid transaction
     lone = tm.first_refusal(prior, [cancel_row], manifests=facts_for_child)
     assert lone is not None and lone.rule.value == "swap_cancel_voids_not_pending"
 
@@ -956,118 +989,225 @@ def _plain_row(kind: Kind, to: State, *, family: str, frm: State | None = None, 
 # --- restrictive batches never add a sender: the reachability the exemption rests on -------------
 
 
-def _scenarios() -> list[tuple[str, Chain, int]]:
-    pending, _h, _t = _pair_chain(activate=True)
-    window, _h2, _t2 = _pair_chain(activate=True)
-    after, _h3, _t3 = _pair_chain(activate=True)
-    unactivated, _h4, _t4 = _pair_chain(activate=False)
-    return [
-        ("pending", pending, at(DAY, "16:46")),
-        ("launch_window", window, at(DAY, "16:55")),
-        ("after_window", after, at(DAY, "17:30")),
-        ("lapsed", unactivated, at(DAY, "17:30")),
-    ]
-
-
-def _pair_chain(*, activate: bool) -> tuple[Chain, TransitionRow, TransitionRow]:
-    chain, head, tail = _seeded()
-    if activate:
-        chain.activate(head, ts=at(DAY, "16:45"))
-    return chain, head, tail
-
-
-def _seeded() -> tuple[Chain, TransitionRow, TransitionRow]:
+def _promote_scenario() -> Chain:
     chain = Chain()
     chain.seed()
-    head, tail = chain.promote_pair(day=DAY)
-    return chain, head, tail
+    head, _tail = chain.promote_pair(day=DAY)
+    chain.activate(head, ts=at(DAY, "16:45"))
+    return chain
 
 
-@pytest.mark.parametrize("name", ["pending", "launch_window", "after_window", "lapsed"])
+def _displaced_scenario() -> Chain:
+    chain = Chain()
+    chain.seed()
+    chain.add(
+        Kind.HALT, State.HALTED, family=INCUMBENT, frm=State.CHAMPION,
+        halt_cause_class=CauseClass.RECOVERABLE_MODEL, cause_code=CauseCode.VERDICT_FAIL,
+    )  # fmt: skip
+    head, _tail = chain.promote_pair(day=DAY, partner=Kind.DISPLACED)
+    chain.activate(head, ts=at(DAY, "16:45"))
+    return chain
+
+
+def _rollback_scenario() -> Chain:
+    chain = promoted_chain()  # CHILD took over at DAY; INCUMBENT is a rollback target
+    head = chain.add(
+        Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
+        effective_launch_date=NEXT_DAY, ts=at(DAY, "20:00"),
+    )  # fmt: skip
+    chain.add(
+        Kind.SUPERSEDE, State.CHALLENGER, family=CHILD, frm=State.CHAMPION,
+        paired_transition_id=head.transition_id, effective_launch_date=NEXT_DAY,
+        ts=at(DAY, "20:00"),
+    )  # fmt: skip
+    chain.activate(head, ts=at(NEXT_DAY, "16:45"))
+    return chain
+
+
+def _drill_scenario() -> Chain:
+    chain = open_episode_chain()
+    return chain
+
+
+def _root_admit_scenario() -> Chain:
+    chain = venue_only(Chain())
+    head = chain.add(
+        Kind.ROOT_ADMIT, State.CHAMPION, family=OTHER, effective_launch_date=DAY,
+        manifest_sha256=INC_MAN, ts=at(PRIOR_DAY, "20:00"),
+    )  # fmt: skip
+    chain.activate(head, ts=at(DAY, "16:45"))
+    return chain
+
+
+def _second_pair_scenario() -> Chain:
+    """A promote pair that took effect, then a ROLLBACK pair written inside the launch window."""
+    chain = promoted_chain()
+    head = chain.add(
+        Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
+        effective_launch_date=NEXT_DAY, ts=at(DAY, "16:54"),
+    )  # fmt: skip
+    chain.add(
+        Kind.SUPERSEDE, State.CHALLENGER, family=CHILD, frm=State.CHAMPION,
+        paired_transition_id=head.transition_id, effective_launch_date=NEXT_DAY,
+        ts=at(DAY, "16:54"),
+    )  # fmt: skip
+    return chain
+
+
+#: name -> (builder, the instants at which restrictive batches are asked about)
+SCENARIOS: Final = {
+    "promote": (_promote_scenario, (at(DAY, "16:46"), at(DAY, "16:55"), at(DAY, "17:30"))),
+    "displaced": (_displaced_scenario, (at(DAY, "16:46"), at(DAY, "16:55"), at(DAY, "17:30"))),
+    "rollback": (_rollback_scenario, (at(NEXT_DAY, "16:46"), at(NEXT_DAY, "16:55"))),
+    "drill": (_drill_scenario, (at(DAY, "16:46"), at(DAY, "16:55"), at(DAY, "17:30"))),
+    "root_admit": (_root_admit_scenario, (at(DAY, "16:46"), at(DAY, "16:55"), at(DAY, "17:30"))),
+    "second_pair_in_window": (_second_pair_scenario, (at(DAY, "16:55"), at(DAY, "16:58"))),
+    "lapsed": (lambda: _unactivated(), (at(DAY, "17:30"),)),
+}
+FOLD_INSTANTS: Final = (
+    LAUNCH - 1, LAUNCH, at(DAY, "16:59"), at(DAY, "17:30"), at(NEXT_DAY, "16:49"),
+    at(NEXT_DAY, "16:50"), at(NEXT_DAY, "16:55"), at(NEXT_DAY, "18:00"),
+)  # fmt: skip
+
+
+def _unactivated() -> Chain:
+    chain = Chain()
+    chain.seed()
+    chain.promote_pair(day=DAY)
+    return chain
+
+
+def _restrictive_candidates(chain: Chain, *, full: bool) -> list[dict[str, Any]]:
+    """Every restrictive row shape ``ALLOWED`` admits, for every family and pair member."""
+    families = sorted({r.family_id for r in chain.rows})
+    voids = [
+        r.transition_id
+        for r in chain.rows
+        if r.effective_launch_date and r.kind is not Kind.ACTIVATE
+    ]
+    halts: list[dict[str, Any]] = [
+        {"halt_cause_class": cls, "cause_code": CauseCode.VERDICT_FAIL}
+        for cls in (CauseClass if full else (CauseClass.RECOVERABLE_MODEL,))
+        if cls is not CauseClass.ROLLBACK_FAILED
+    ]
+    halts += [
+        {
+            "halt_cause_class": CauseClass.ROLLBACK_FAILED, "cause_code": CauseCode.ROLLBACK_FAILED,
+            "trigger_cause_class": trigger,
+        }
+        for trigger in ((CauseClass.RECOVERABLE_MODEL, CauseClass.DRILL) if full else ())
+    ]  # fmt: skip
+    codes = (
+        tuple(CauseCode) if full else (CauseCode.PAIR_CAUSE_INCOMING, CauseCode.PAIR_CAUSE_OUTGOING)
+    )
+    out: list[dict[str, Any]] = []
+    for family in families:
+        for kind in (Kind.DEMOTE, Kind.HALT):
+            out += [
+                {"kind": kind, "to": State.HALTED, "family": family, "frm": State.CHAMPION, **h}
+                for h in halts
+            ]
+        for code in codes:
+            for void in (*voids, *([tuple(voids)] if full else [])):
+                ids = void if isinstance(void, tuple) else (void,)
+                out.append(
+                    {
+                        "kind": Kind.SWAP_CANCEL, "to": State.CHALLENGER, "family": family,
+                        "frm": State.CHALLENGER, "cause_code": code, "voids_transition_ids": ids,
+                    }
+                )  # fmt: skip
+            out.append(
+                {
+                    "kind": Kind.TARGET_INELIGIBLE, "to": State.CHALLENGER, "family": family,
+                    "frm": State.CHALLENGER, "cause_code": code,
+                }
+            )  # fmt: skip
+    return [c for c in out if (c["frm"], c["to"]) in tm.ALLOWED[c["kind"]]]
+
+
+def _clone(chain: Chain) -> Chain:
+    scratch = Chain()
+    scratch.rows = list(chain.rows)
+    scratch._ts = chain._ts
+    scratch._last_seq = dict(chain._last_seq)
+    return scratch
+
+
+def test_the_restrictive_set_is_the_transitions_set() -> None:
+    from breezy.persistence.autonomy import validate_ii
+
+    assert validate_ii._RESTRICTIVE == tm.RESTRICTIVE_KINDS
+
+
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_a_restrictive_batch_that_validate_accepts_never_leaves_two_senders(name: str) -> None:
     """The exemption's premise: with E-19a no accepted restrictive batch yields two senders.
 
-    Every restrictive row of each family (and every pair of them), in every phase of an ordinary
-    pair, is asked of ``validate``; each accepted batch is folded at every interesting instant.
+    In every pair kind (PROMOTE with SUPERSEDE, DISPLACED, ROLLBACK, DRILL_PROMOTE, ROOT_ADMIT),
+    a second pair written inside the launch window and a lapsed pair, every restrictive row (each
+    cause class and code, each family, each pair member) is asked of ``validate`` alone; pairs of
+    representative rows are asked as one batch. Each accepted batch is folded at every interesting
+    instant and must hold at most one sender.
     """
-    scenario = {n: (c, ts) for n, c, ts in _scenarios()}[name]
-    chain, now = scenario
-    prior = run(chain, now)
-    head = next(r for r in chain.rows if r.kind is Kind.PROMOTE and r.effective_launch_date)
-    candidates: list[dict[str, Any]] = []
-    halting = {
-        "halt_cause_class": CauseClass.RECOVERABLE_MODEL,
-        "cause_code": CauseCode.VERDICT_FAIL,
-    }
-    for family in (INCUMBENT, CHILD):
-        for kind in (Kind.DEMOTE, Kind.HALT):
-            for state in (State.CHAMPION, State.HALTED, State.CHALLENGER):
-                candidates.append(
-                    {"kind": kind, "to": State.HALTED, "family": family, "frm": state, **halting}
-                )
-        for cause in (CauseCode.PAIR_CAUSE_INCOMING, CauseCode.PAIR_CAUSE_OUTGOING):
-            candidates.append(
-                {
-                    "kind": Kind.SWAP_CANCEL, "to": State.CHALLENGER, "family": family,
-                    "frm": State.CHALLENGER, "cause_code": cause,
-                    "voids_transition_ids": (head.transition_id,),
-                }
-            )  # fmt: skip
-        candidates.append(
-            {
-                "kind": Kind.TARGET_INELIGIBLE, "to": State.CHALLENGER, "family": family,
-                "frm": State.CHALLENGER, "cause_code": CauseCode.TARGET_INTEGRITY,
-            }
-        )  # fmt: skip
-    # only shapes the store's ``ALLOWED`` table admits ever reach ``validate``
-    candidates = [c for c in candidates if (c["frm"], c["to"]) in tm.ALLOWED[c["kind"]]]
-
+    build, nows = SCENARIOS[name]
     accepted = 0
-    for first in candidates:
-        for second in (None, *candidates):
-            scratch = Chain()
-            scratch.rows = list(chain.rows)
-            scratch._ts = chain._ts
-            scratch._last_seq = dict(chain._last_seq)
-            batch = [scratch.add(ts=now, **first)]
-            if second is not None:
-                batch.append(scratch.add(ts=now, **second))
-            if tm.first_refusal(prior, batch, manifests=no_facts) is not None:
+    for now in nows:
+        chain = build()
+        prior = run(chain, now)
+        singles = _restrictive_candidates(chain, full=True)
+        reps = _restrictive_candidates(chain, full=False)
+        batches = [[c] for c in singles] + [[a, b] for a in reps for b in reps]
+        for spec in batches:
+            scratch = _clone(chain)
+            rows = [scratch.add(ts=now, **c) for c in spec]
+            if tm.first_refusal(prior, rows, manifests=no_facts) is not None:
                 continue
             accepted += 1
-            for instant in (
-                now,
-                LAUNCH - 1,
-                LAUNCH,
-                at(DAY, "16:59"),
-                at(DAY, "17:30"),
-                at(NEXT_DAY, "18:00"),
-            ):
+            for instant in (now, *FOLD_INSTANTS):
                 result = run(scratch, instant)
-                assert len(result.senders) <= 1, (name, first, second, instant, result.states)
+                assert len(result.senders) <= 1, (name, now, spec, instant, dict(result.states))
     assert accepted > 0  # the matrix is not vacuous
 
 
 # --- the walk's other duties ---------------------------------------------------------------------
 
 
-def test_validate_reads_no_manifest_for_a_restrictive_or_neutral_row() -> None:
-    def boom(family_id: str, manifest_sha256: str) -> Any:
-        raise AssertionError("a restrictive or neutral row must not read manifests")
+RESTRICTIVE_SHAPES: Final[dict[Kind, tuple[State, State, dict[str, Any]]]] = {
+    Kind.DEMOTE: (State.CHAMPION, State.HALTED, {"halt_cause_class": CauseClass.RECOVERABLE_MODEL}),
+    Kind.HALT: (State.CHAMPION, State.HALTED, {"halt_cause_class": CauseClass.RECOVERABLE_MODEL}),
+    Kind.SWAP_CANCEL: (State.CHALLENGER, State.CHALLENGER, {}),
+    Kind.TARGET_INELIGIBLE: (
+        State.CHALLENGER, State.CHALLENGER, {"cause_code": CauseCode.TARGET_INTEGRITY},
+    ),
+    Kind.ATTEST: (State.CHAMPION, State.CHAMPION, {}),
+}  # fmt: skip
 
-    chain = champion_chain()
-    prior = run(chain, NOW)
-    rows = [
-        chain.add(
-            Kind.DEMOTE,
-            State.HALTED,
-            family=INCUMBENT,
-            frm=State.CHAMPION,
-            halt_cause_class=CauseClass.RECOVERABLE_MODEL,
-            cause_code=CauseCode.VERDICT_FAIL,
-        ),
-    ]
-    assert tm.first_refusal(prior, rows, manifests=boom) is None
+
+@pytest.mark.parametrize("kind", sorted(RESTRICTIVE_SHAPES, key=str))
+def test_validate_reads_no_manifest_for_a_restrictive_row_or_attest(kind: Kind) -> None:
+    def boom(family_id: str, manifest_sha256: str) -> Any:
+        raise AssertionError(f"a {kind.value} row must not read manifests")
+
+    assert {k for k in RESTRICTIVE_SHAPES if k is not Kind.ATTEST} == tm.RESTRICTIVE_KINDS
+    frm, to, shape_extra = RESTRICTIVE_SHAPES[kind]
+    extra = dict(shape_extra)
+    chain, head, _tail = activated_pair()
+    family = INCUMBENT if frm is State.CHAMPION else CHILD
+    if kind is Kind.SWAP_CANCEL:
+        extra = {"voids_transition_ids": (head.transition_id,)}
+    if kind is Kind.ATTEST:
+        extra = {"attest_valid_until_ns": at(DAY, "16:46") + HOUR_NS}
+    refused = probe(
+        chain, at(DAY, "16:46"), kind, to, family=family, frm=frm, ts=at(DAY, "16:46"),
+        manifests=boom, **extra,
+    )  # fmt: skip
+    assert refused is None  # judged, accepted, and the booby-trapped reader never ran
+
+
+def test_a_neutral_row_reads_no_manifest_either() -> None:
+    def boom(family_id: str, manifest_sha256: str) -> Any:
+        raise AssertionError("a MINT must not read manifests")
+
     fresh = champion_chain()
     base = run(fresh, NOW)
     mint_row = fresh.add(Kind.MINT, State.SHADOW, family=OTHER, artefact_sha256=SECOND_ART)
@@ -1078,3 +1218,104 @@ def test_every_rule_ii_name_is_unique_and_wired() -> None:
     names = [r.value for r in tm.RuleII]
     assert len(names) == len(set(names)) == len(tm.RuleII)
     assert not set(names) & {r.value for r in tm.Rule}  # a refusal names exactly one rule
+
+
+# --- A7d-R2: the cancel window mirrors the fold's ----------------------------------------------
+
+
+def test_a_cancel_stamped_before_launch_and_committed_after_it_is_accepted() -> None:
+    """16:49:59 is before LAUNCH: the fold voids the ACTIVATEd pair, so validate must accept."""
+    stamped = at(DAY, "16:49", 59 * SEC)
+    committed = at(DAY, "16:50", SEC)
+    chain, head, _tail = activated_pair()
+    assert run(chain, committed).pairs[0].status.value == "effective"
+    accepted = probe(
+        chain, committed, Kind.SWAP_CANCEL, State.CHALLENGER, family=CHILD, frm=State.CHALLENGER,
+        ts=stamped, voids_transition_ids=(head.transition_id,),
+        cause_code=CauseCode.PRELAUNCH_PRECHECK_FAILED,
+    )  # fmt: skip
+    assert accepted is None
+    # and the fold agrees that the cancel voids the pair
+    assert run(chain, committed).pairs[0].status.value == "voided"
+
+
+def test_a_cancel_of_an_unactivated_pair_follows_the_fold_too() -> None:
+    chain = Chain()
+    chain.seed()
+    head, _tail = chain.promote_pair(day=DAY)  # never activated: lapses at LAUNCH
+    committed = at(DAY, "16:50", SEC)
+
+    def ask(ts: int) -> Any:
+        scratch = _clone(chain)
+        return probe(
+            scratch, committed, Kind.SWAP_CANCEL, State.CHALLENGER, family=CHILD,
+            frm=State.CHALLENGER, ts=ts, voids_transition_ids=(head.transition_id,),
+            cause_code=CauseCode.PRELAUNCH_PRECHECK_FAILED,
+        )  # fmt: skip
+
+    assert ask(at(DAY, "16:49", 59 * SEC)) is None  # before LAUNCH: voids any non-voided pair
+    refused = ask(at(DAY, "16:50", SEC))  # after LAUNCH, never activated: nothing to void
+    assert refused is not None and refused.rule.value == "swap_cancel_voids_not_pending"
+
+
+# --- A7d-R3 -------------------------------------------------------------------------------------
+
+
+def test_the_launch_projection_applies_a_partner_at_its_heads_launch() -> None:
+    """L1: the fold applies a partner at the LAUNCH of the head it cites, whatever its own date."""
+    chain = nominated(champion_chain())
+    prior = run(chain, NOW)
+    head = chain.add(
+        Kind.PROMOTE, State.CHAMPION, family=CHILD, frm=State.CHALLENGER,
+        effective_launch_date=DAY, manifest_sha256=CHILD_MAN, artefact_sha256=INC_ART,
+    )  # fmt: skip
+    partner = chain.add(
+        Kind.SUPERSEDE, State.CHALLENGER, family=INCUMBENT, frm=State.CHAMPION,
+        paired_transition_id=head.transition_id, effective_launch_date=NEXT_DAY,
+    )  # fmt: skip
+    assert tm.first_refusal(prior, [head, partner], manifests=facts_for_child) is None
+    chain.activate(head, ts=at(DAY, "16:45"))
+    assert len(run(chain, at(DAY, "18:00")).senders) == 1  # the fold agrees
+
+
+def test_an_orphan_partner_never_takes_effect_in_the_projection() -> None:
+    chain = nominated(champion_chain())
+    prior = run(chain, NOW)
+    orphan = chain.add(
+        Kind.SUPERSEDE, State.CHALLENGER, family=INCUMBENT, frm=State.CHAMPION,
+        paired_transition_id="d" * 64, effective_launch_date=DAY,
+    )  # fmt: skip
+    other = chain.add(
+        Kind.ATTEST, State.CHAMPION, family=INCUMBENT, frm=State.CHAMPION, ts=NOW,
+        attest_valid_until_ns=NOW + HOUR_NS,
+    )  # fmt: skip
+    assert tm.first_refusal(prior, [orphan, other], manifests=no_facts) is None
+
+
+def test_only_an_immediate_introducer_makes_an_artefact_held_for_the_mint_exemption() -> None:
+    """L2: a pending ROOT_ADMIT is not applied, so its artefact exempts nothing (as in the fold)."""
+    chain = venue_only(Chain())
+    prior = run(chain, NOW)
+    root = chain.add(
+        Kind.ROOT_ADMIT, State.CHAMPION, family=OTHER, effective_launch_date=DAY,
+        manifest_sha256=INC_MAN, artefact_sha256=SECOND_ART,
+    )  # fmt: skip
+    first = chain.add(
+        Kind.MINT, State.SHADOW, family="pm_us_crh_x", ts=NOW, artefact_sha256=SECOND_ART,
+        lineage_root_family_id=OTHER,
+    )  # fmt: skip
+    second = chain.add(
+        Kind.MINT, State.SHADOW, family="pm_us_crh_y", ts=NOW, artefact_sha256="8" * 64,
+        lineage_root_family_id=OTHER,
+    )  # fmt: skip
+    refused = tm.first_refusal(prior, [root, first, second], manifests=no_facts)
+    assert refused is not None and (refused.rule.value, refused.row_index) == ("mint_rate", 2)
+
+
+def test_an_attest_that_is_already_expired_is_refused() -> None:
+    """L3: ``attest_valid_until_ns`` must lie after ``ts_ns``."""
+    for until, ok in ((ATTEST_AT - 1, False), (ATTEST_AT, False), (ATTEST_AT + 1, True)):
+        refused = attest(champion_chain(), ATTEST_AT, until)
+        assert (refused is None) is ok, until
+        if not ok:
+            assert refused is not None and refused.rule.value == "attest_validity"

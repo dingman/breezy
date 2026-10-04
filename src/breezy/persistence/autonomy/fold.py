@@ -91,12 +91,25 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 
-from breezy.persistence.autonomy import pins
+from breezy.persistence.autonomy.fold_pairs import (
+    ACTIVATE_KIND,
+    HEAD_KINDS,
+    PARTNER_KINDS,
+    Head,
+    PairStatus,
+    PairView,
+    attach_members,
+    collect_heads,
+    events,
+    is_head_shape,
+    pair_views,
+    schedule_ns,
+    void_pairs,
+)
 from breezy.persistence.autonomy.fold_tallies import (
     Carried,
     LineageTallies,
@@ -133,22 +146,11 @@ __all__ = [
     "schedule_ns",
 ]
 
-#: ``→CHAMPION`` kinds that open a pending pair when they carry ``effective_launch_date``.
-HEAD_KINDS: Final[frozenset[Kind]] = frozenset(
-    {Kind.PROMOTE, Kind.DRILL_PROMOTE, Kind.ROLLBACK, Kind.ROOT_ADMIT}
-)
-#: The atomic partners of a head; each cites its head's ``transition_id``.
-PARTNER_KINDS: Final[frozenset[Kind]] = frozenset({Kind.SUPERSEDE, Kind.DISPLACED})
-ACTIVATE_KIND: Final = Kind.ACTIVATE
 #: The only kinds that may be a family's first row.
 INTRODUCING_KINDS: Final[frozenset[Kind]] = frozenset({Kind.BOOTSTRAP, Kind.ROOT_ADMIT, Kind.MINT})
 
 _SENDER_STATES: Final[frozenset[State]] = frozenset({State.CHAMPION, State.HALTED})
 _ROOT_KINDS: Final[frozenset[Kind]] = frozenset({Kind.BOOTSTRAP, Kind.ROOT_ADMIT})
-
-_NS_PER_S: Final = 10**9
-_SECONDS_PER_DAY: Final = 86_400
-_UNIX_EPOCH_ORDINAL: Final = date(1970, 1, 1).toordinal()
 
 
 class Origin(StrEnum):
@@ -156,32 +158,6 @@ class Origin(StrEnum):
 
     ROOT = "root"
     CHILD = "child"
-
-
-class PairStatus(StrEnum):
-    PENDING = "pending"
-    EFFECTIVE = "effective"
-    LAPSED = "lapsed"
-    VOIDED = "voided"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PairView:
-    """One pending-pair group and what became of it at ``now_ns``."""
-
-    head_transition_id: str
-    head_kind: Kind
-    incoming_family_id: str
-    #: The head first, then its partners in chain order.
-    member_transition_ids: tuple[str, ...]
-    #: ``(family_id, to_state)`` of each member, in the same order: what the pair does at LAUNCH.
-    member_effects: tuple[tuple[str, State], ...] = ()
-    effective_launch_date: str
-    launch_ns: int
-    #: The first ACTIVATE that fell inside the window, if any.
-    activate_transition_id: str | None
-    status: PairStatus
-    voided_by_transition_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -265,41 +241,6 @@ class FoldInvalid:
     reason: FoldInvalidReason
 
 
-@dataclass(slots=True)
-class _Head:
-    """Private working record; never escapes ``fold``."""
-
-    index: int
-    row: TransitionRow
-    launch_ns: int
-    members: list[int]
-    activate: TransitionRow | None = None
-    voided_by: TransitionRow | None = None
-
-
-def _hhmm_ns(hhmm: str) -> int:
-    hours, minutes = hhmm.split(":")
-    return (int(hours) * 3_600 + int(minutes) * 60) * _NS_PER_S
-
-
-def _day_start_ns(iso_day: str) -> int:
-    days = date.fromisoformat(iso_day).toordinal() - _UNIX_EPOCH_ORDINAL
-    return days * _SECONDS_PER_DAY * _NS_PER_S
-
-
-def schedule_ns(iso_day: str, hhmm: str) -> int:
-    """Epoch nanoseconds of ``hhmm`` UTC on ``iso_day`` (the schedule pins are ``"HH:MM"``)."""
-    return _day_start_ns(iso_day) + _hhmm_ns(hhmm)
-
-
-def _is_head_shape(row: TransitionRow) -> bool:
-    return row.kind in HEAD_KINDS and row.to_state is State.CHAMPION
-
-
-def _is_head(row: TransitionRow) -> bool:
-    return _is_head_shape(row) and row.effective_launch_date is not None
-
-
 def _check_inputs(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> None:
     try:
         check_venue(venue)
@@ -322,126 +263,6 @@ def _head_venue_seq(rows: tuple[TransitionRow, ...]) -> int:
     if last is None:
         raise ValueError("fold needs sealed rows: the last row has no venue_seq")
     return last
-
-
-def _collect_heads(rows: Sequence[TransitionRow]) -> dict[str, _Head]:
-    heads: dict[str, _Head] = {}
-    for index, row in enumerate(rows):
-        if _is_head(row) and row.effective_launch_date is not None:
-            launch = schedule_ns(row.effective_launch_date, pins.SCHEDULE_LAUNCH_UTC)
-            heads[row.transition_id] = _Head(index, row, launch, [index])
-    return heads
-
-
-def _attach_members(rows: Sequence[TransitionRow], heads: dict[str, _Head]) -> set[int]:
-    """Attach partners and the first in-window ACTIVATE to their heads.
-
-    Returns the chain positions of rows that are partners of no head: they never take effect.
-    """
-    orphans: set[int] = set()
-    for index, row in enumerate(rows):
-        head = heads.get(row.paired_transition_id or "")
-        if head is not None and head.index >= index:
-            head = None  # a row cannot cite a head that follows it
-        if row.kind in PARTNER_KINDS:
-            if head is None:
-                orphans.add(index)
-            else:
-                head.members.append(index)
-        elif (
-            row.kind is ACTIVATE_KIND
-            and head is not None
-            and head.activate is None
-            and _in_activate_window(row, head)
-        ):
-            head.activate = row
-    return orphans
-
-
-def _in_activate_window(row: TransitionRow, head: _Head) -> bool:
-    if row.family_id != head.row.family_id or head.row.effective_launch_date is None:
-        return False
-    day = _day_start_ns(head.row.effective_launch_date)
-    return day + _hhmm_ns(pins.SCHEDULE_STOP_UTC) <= row.ts_ns < head.launch_ns
-
-
-def _cancel_voids(cancel: TransitionRow, head: _Head) -> bool:
-    """Whether ``cancel`` voids ``head``'s pair.
-
-    Before LAUNCH always; from LAUNCH to the launch-window end only a pair that took effect (Z8).
-    """
-    if cancel.ts_ns < head.launch_ns:
-        return True
-    day = _day_start_ns(head.row.effective_launch_date or "")
-    window_end = day + _hhmm_ns(pins.SCHEDULE_LAUNCH_WINDOW_END_UTC)
-    return head.activate is not None and cancel.ts_ns < window_end
-
-
-def _void_pairs(rows: Sequence[TransitionRow], heads: dict[str, _Head], now_ns: int) -> None:
-    """Record on each head the first SWAP_CANCEL (chain order, ``ts_ns <= now_ns``) voiding it."""
-    members = {rows[i].transition_id: (head, i) for head in heads.values() for i in head.members}
-    for index, row in enumerate(rows):
-        if row.kind is not Kind.SWAP_CANCEL or row.ts_ns > now_ns:
-            continue
-        for cited in row.voids_transition_ids or ():
-            found = members.get(cited)
-            if found is None:
-                continue
-            head, member_index = found
-            if member_index < index and head.voided_by is None and _cancel_voids(row, head):
-                head.voided_by = row
-
-
-def _pair_status(head: _Head, now_ns: int) -> PairStatus:
-    if head.voided_by is not None:
-        return PairStatus.VOIDED
-    if now_ns < head.launch_ns:
-        return PairStatus.PENDING
-    return PairStatus.EFFECTIVE if head.activate is not None else PairStatus.LAPSED
-
-
-def _events(
-    rows: Sequence[TransitionRow], heads: dict[str, _Head], orphans: set[int], now_ns: int
-) -> list[tuple[int, int, TransitionRow]]:
-    """``(instant, chain position, row)`` for every row that can change the fold."""
-    pair_members = {i for head in heads.values() for i in head.members}
-    out: list[tuple[int, int, TransitionRow]] = []
-    for index, row in enumerate(rows):
-        if index in orphans or index in pair_members:
-            continue
-        if row.ts_ns <= now_ns:  # a row written after the clock has not happened yet
-            out.append((row.ts_ns, index, row))
-    for head in heads.values():
-        if _pair_status(head, now_ns) is PairStatus.EFFECTIVE:
-            out.extend((head.launch_ns, i, rows[i]) for i in head.members)
-    return sorted(out, key=lambda event: (event[0], event[1]))
-
-
-def _pair_views(
-    rows: Sequence[TransitionRow], heads: dict[str, _Head], now_ns: int
-) -> tuple[PairView, ...]:
-    views: list[PairView] = []
-    for head in sorted(heads.values(), key=lambda h: h.index):
-        date_text = head.row.effective_launch_date or ""
-        views.append(
-            PairView(
-                head_transition_id=head.row.transition_id,
-                head_kind=head.row.kind,
-                incoming_family_id=head.row.family_id,
-                member_transition_ids=tuple(rows[i].transition_id for i in head.members),
-                member_effects=tuple((rows[i].family_id, rows[i].to_state) for i in head.members),
-                effective_launch_date=date_text,
-                launch_ns=head.launch_ns,
-                activate_transition_id=(
-                    None if head.activate is None else head.activate.transition_id
-                ),
-                status=_pair_status(head, now_ns),
-                voided_by_transition_id=(
-                    None if head.voided_by is None else head.voided_by.transition_id
-                ),
-            )
-        )
-    return tuple(views)
 
 
 @dataclass(slots=True)
@@ -511,7 +332,7 @@ class _Accumulator:
             self.epoch_start[family] = instant
             self.demoted.discard(family)
         kind = row.kind
-        if _is_head_shape(row):
+        if is_head_shape(row):
             self._take_champion(instant, row)
         elif kind is Kind.SUPERSEDE:
             if family not in self.drill_children:
@@ -714,7 +535,7 @@ def _introduction(row: TransitionRow) -> tuple[Origin, str] | FoldInvalidReason:
 
 
 def _scan_rows(
-    rows: Sequence[TransitionRow], heads: dict[str, _Head]
+    rows: Sequence[TransitionRow], heads: dict[str, Head]
 ) -> tuple[Mapping[str, str], Mapping[str, Origin], dict[str, Carried], set[str]] | FoldInvalid:
     """The lineage and origin of every family, parsed ``carried_counters`` and pending roots."""
     lineage_of: dict[str, str] = {}
@@ -729,7 +550,7 @@ def _scan_rows(
             origin_of[row.family_id], lineage_of[row.family_id] = intro
             if row.transition_id in heads:  # a pending root: SHADOW until its pair takes effect
                 pending_roots.add(row.family_id)
-        if _is_head_shape(row) and row.effective_launch_date is None:
+        if is_head_shape(row) and row.effective_launch_date is None:
             return FoldInvalid(FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE)
         if row.kind is Kind.HWM_RESET and row.carried_counters is not None:
             parsed = parse_carried(row.carried_counters)
@@ -751,23 +572,23 @@ def fold(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> FoldResult |
     ordered = tuple(rows)
     _check_inputs(ordered, venue, now_ns)
     head_venue_seq = _head_venue_seq(ordered)
-    heads = _collect_heads(ordered)
-    orphans = _attach_members(ordered, heads)
-    _void_pairs(ordered, heads, now_ns)
+    heads = collect_heads(ordered)
+    orphans = attach_members(ordered, heads)
+    void_pairs(ordered, heads, now_ns)
     scanned = _scan_rows(ordered, heads)
     if isinstance(scanned, FoldInvalid):
         return scanned
     lineage_of, origin_of, carried, pending_roots = scanned
     acc = _Accumulator(lineage_of, origin_of, carried)
     acc.states.update((family, State.SHADOW) for family in pending_roots)
-    for instant, _index, row in _events(ordered, heads, orphans, now_ns):
+    for instant, _index, row in events(ordered, heads, orphans, now_ns):
         acc.apply(instant, row)
     return FoldResult(
         venue=venue,
         now_ns=now_ns,
         head_venue_seq=head_venue_seq,
         states=MappingProxyType(acc.states),
-        pairs=_pair_views(ordered, heads, now_ns),
+        pairs=pair_views(ordered, heads, now_ns),
         families=acc.family_views(),
         integrity_frozen=acc.integrity_frozen,
         drill_episodes=acc.drill_episodes(),
