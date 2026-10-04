@@ -29,6 +29,7 @@ The lint is non-vacuous: each row names the minimum number of call sites its fil
 """
 
 import ast
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -128,6 +129,14 @@ class AuthorityRow(NamedTuple):
     min_calls: int = 1
 
 
+def _journal_argv(unit: str, output: str) -> tuple[str, ...]:
+    """A ``journalctl`` row argv: the unit and format are literal, the time slots are bare names."""
+    return (
+        "journalctl", "--user", "-u", unit, "-o", output,
+        "--since", "{since}", "--until", "{until}",
+    )  # fmt: skip
+
+
 def _core(name: str, **kw: Any) -> AuthorityRow:
     return AuthorityRow(f"{_PERSISTENCE}.{name}", **kw)
 
@@ -187,20 +196,34 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
     AuthorityRow("breezy.analysis.capture_audit_replay", min_calls=1),
     AuthorityRow("breezy.analysis.capture_audit_log_markers", min_calls=1),
     AuthorityRow("breezy.analysis.capture_audit_stream_legs", min_calls=1),
-    # -- W3: I/O and orchestration. The audit file goes through ``single_read.write_once``; the
-    # E-8 cache through ``replace_atomic``. W3 narrows these and adds any literal ``argvs``. --
+    # -- W3: I/O and orchestration (stage 2b). The audit file goes through
+    # ``single_read.write_once``; the per-log reducer cache through ``replace_atomic``
+    # (``capture_audit_cache``, the only cache write). The host module runs ``journalctl``: one call
+    # per template, its time slots the bare names ``since`` and ``until`` (a ``{slot}`` token in a
+    # row matches exactly that). --
     AuthorityRow(
         "breezy.analysis.capture_audit",
         write_imports=frozenset({"write_once", "ensure_dir"}),
-        min_calls=1,
+        min_calls=150,
     ),
+    AuthorityRow("breezy.analysis.capture_audit_inputs", min_calls=250),
     AuthorityRow(
-        "breezy.analysis.capture_audit_inputs",
+        "breezy.analysis.capture_audit_cache",
         write_imports=frozenset({"replace_atomic", "ensure_dir"}),
-        min_calls=1,
+        min_calls=70,
     ),
-    AuthorityRow("breezy.analysis.capture_audit_host", min_calls=1),
-    AuthorityRow("breezy.analysis.capture_audit_cli", min_calls=1),
+    AuthorityRow("breezy.analysis.capture_audit_exec_view", min_calls=65),
+    AuthorityRow("breezy.analysis.capture_audit_tape", min_calls=80),
+    AuthorityRow(
+        "breezy.analysis.capture_audit_host",
+        argvs=(
+            _journal_argv("breezy-quote-tape-ingest", "cat"),
+            _journal_argv("breezy-trade-supervisor", "cat"),
+            _journal_argv("breezy-quote-tape.service", "json"),
+        ),
+        min_calls=70,
+    ),
+    AuthorityRow("breezy.analysis.capture_audit_cli", min_calls=22),
 )
 
 
@@ -224,13 +247,25 @@ def _in_scope(scope: str, allowed: Iterable[str]) -> bool:
     return any(a == "*" or scope == a or scope.startswith(f"{a}.") for a in allowed)
 
 
-def _literal_argv(call: ast.Call) -> tuple[str, ...] | None:
+_SLOT_RE: Final[re.Pattern[str]] = re.compile(r"\{(?P<name>[a-z_]+)\}")
+
+
+def _argv_matches(call: ast.Call, argv: tuple[str, ...]) -> bool:
+    """A subprocess call matches a row argv when its first argument is a list or tuple of the same
+    length whose every element is that row's literal string, or, where the row holds a ``{slot}``
+    token, a bare ``Name`` called ``slot`` (a value the module validates before the call). A
+    literal argv with no slot is matched exactly, as before."""
     first = call.args[0] if call.args else None
-    if isinstance(first, ast.List | ast.Tuple) and all(
-        isinstance(e, ast.Constant) and isinstance(e.value, str) for e in first.elts
-    ):
-        return tuple(str(e.value) for e in first.elts if isinstance(e, ast.Constant))
-    return None
+    if not isinstance(first, ast.List | ast.Tuple) or len(first.elts) != len(argv):
+        return False
+    for element, want in zip(first.elts, argv, strict=True):
+        slot = _SLOT_RE.fullmatch(want)
+        if slot is not None:
+            if not (isinstance(element, ast.Name) and element.id == slot["name"]):
+                return False
+        elif not (isinstance(element, ast.Constant) and element.value == want):
+            return False
+    return True
 
 
 def _literal_first_arg(call: ast.Call) -> str | None:
@@ -254,8 +289,7 @@ def _site_findings(path: str, tree: ast.Module, source: str, row: AuthorityRow) 
     for site in find_write_sites(path, source):
         detail = site.detail
         if detail.startswith("subprocess.") or detail == "subprocess":
-            argvs = {_literal_argv(c) for c in calls.get(site.lineno, [])}
-            if any(argv in row.argvs for argv in argvs if argv is not None):
+            if any(_argv_matches(c, a) for c in calls.get(site.lineno, []) for a in row.argvs):
                 continue
         elif detail == "sqlite3.connect":
             literals = {_literal_first_arg(c) for c in calls.get(site.lineno, [])}

@@ -172,4 +172,11 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
         "_verify_ruling_file",
         "the one named exemption: a move-only extraction (AC 7; landed in seam 8a)",
     ),
+    # AUT-1 WP5 stage 2b W3: the audit's three read-only ``journalctl`` calls (one per template; the
+    # closure lint pins each argv, its time slots the validated names ``since`` and ``until``).
+    WriteSiteRule(
+        "breezy.analysis.capture_audit_host",
+        "_run_template",
+        "audit unit: the three literal journalctl argvs, read-only (closure lint row argvs)",
+    ),
 )

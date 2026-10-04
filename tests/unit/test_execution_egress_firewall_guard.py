@@ -227,7 +227,6 @@ _EGRESS_FUNCTION_NAMES = frozenset(
 )
 
 
-
 #: X1 -- roots scanned for the exec-test marker ban.
 TEST_SCAN_ROOTS = ("tests",)
 
@@ -1136,7 +1135,6 @@ def test_n5_the_same_probe_is_not_blocked_without_the_sandbox() -> None:
         probe_socket.close()
 
 
-
 # ==========================================================================
 # X1-X3 -- the detectors (single implementations; the proofs above run these)
 # ==========================================================================
@@ -1156,9 +1154,7 @@ def _marker_names(tree: ast.AST) -> set[str]:
             continue
         receiver = node.value
         receiver_name = (
-            receiver.attr
-            if isinstance(receiver, ast.Attribute)
-            else getattr(receiver, "id", "")
+            receiver.attr if isinstance(receiver, ast.Attribute) else getattr(receiver, "id", "")
         )
         if receiver_name == "mark":
             names.add(node.attr)
@@ -1226,9 +1222,7 @@ def find_banned_native_constructs(path: str, source: str) -> list[Violation]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if BANNED_NATIVE_MODULE_SUBSTRING in alias.name:
-                    found.append(
-                        Violation(path, node.lineno, "X2", f"imports {alias.name}")
-                    )
+                    found.append(Violation(path, node.lineno, "X2", f"imports {alias.name}"))
         elif isinstance(node, ast.ImportFrom):
             if node.module and BANNED_NATIVE_MODULE_SUBSTRING in node.module:
                 found.append(Violation(path, node.lineno, "X2", f"imports {node.module}"))
@@ -1332,9 +1326,7 @@ def find_exec_direction_violations(path: str, source: str) -> list[Violation]:
     found: list[Violation] = []
     for token in sorted(BANNED_EXEC_DIRECTION_TOKENS):
         if token in source or any(token in value for value in constants):
-            found.append(
-                Violation(path, 0, "X3", f"carries the banned direction token {token!r}")
-            )
+            found.append(Violation(path, 0, "X3", f"carries the banned direction token {token!r}"))
     for node in ast.walk(tree):
         is_complement_sub = (
             isinstance(node, ast.BinOp)
@@ -1361,6 +1353,7 @@ def scan_exec_direction_vocabulary(
         for path, src in iter_python_sources(roots)
         for v in find_exec_direction_violations(path, src)
     ]
+
 
 # ==========================================================================
 # X1 -- no exec test may carry a marker that restores the real pyo3 clients
@@ -1401,12 +1394,7 @@ _PLANTED_EXEC_TEST_WITHOUT_MARKER = (
 #: A marked test that does NOT touch the exec package -- the shipped suite has
 #: these (the ``live`` weather tests), and X1 must not touch them.
 _PLANTED_MARKED_TEST_OUTSIDE_THE_EXEC_PACKAGE = (
-    "import pytest\n"
-    "\n"
-    "\n"
-    "@pytest.mark.live\n"
-    "def test_weather():\n"
-    "    assert True\n"
+    "import pytest\n\n\n@pytest.mark.live\ndef test_weather():\n    assert True\n"
 )
 
 
@@ -3050,8 +3038,7 @@ def test_submit_veto_sits_after_is_latched_and_before_the_permit_spend_no_await_
         and _dotted_callee(n.func) == "assert_live_order_submission_permitted"
     ]
     assert is_latched_lines and veto_lines and permit_spend_lines, (
-        "all three must be present in the shipped _submit_order for this pin "
-        "to prove anything"
+        "all three must be present in the shipped _submit_order for this pin to prove anything"
     )
     assert max(is_latched_lines) < min(veto_lines) < min(permit_spend_lines)
 
@@ -3152,10 +3139,10 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "self._latch.is_latched",
             # Item 4 (slice 4 review): the family-halt chokepoint veto.
             "self._submit_veto",
-        # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
-        # context. Inert sync callee -- writes only to the already-open
-        # local store and a process-local dict; reaches no network.
-        "self._note_ambiguous_open",
+            # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
+            # context. Inert sync callee -- writes only to the already-open
+            # local store and a process-local dict; reaches no network.
+            "self._note_ambiguous_open",
             "self._write_signer.sign_headers",
             "self._order_sender.post_order",
             "submit_chain.latched_refusal_reason",
@@ -3618,7 +3605,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # (a pure key function, no client is constructed); `test_capture_reader.py`
     # imports `intent_fingerprint` only, to compare the reader's recomputed
     # fingerprint against the real function. None opens a socket.
+    #
+    # Old -> new (AUT-1 WP5 stage 2b W3): added
+    # `tests/support/capture_audit_w3_fixtures.py`. WIDENED, not relaxed
+    # (L-6/L-12): the comparison is still `==` and the module carries no
+    # `SOCKET_RESTORING_MARKERS`. It imports `exec.client` only for
+    # `DurableFillRecord` (to build the L-42 durable-fill fixtures and prove
+    # the real decoder reads them) and the exec key-prefix constants; nothing
+    # is constructed and no socket is opened.
     assert exec_importing_test_modules() == {
+        "tests/support/capture_audit_w3_fixtures.py",
         "tests/unit/autonomy/test_capture_reader.py",
         "tests/unit/test_aut1_wp0_closure_premises.py",
         "tests/unit/test_aut1_wp0_order_cache_premises.py",
