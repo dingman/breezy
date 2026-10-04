@@ -120,6 +120,7 @@ from breezy.runtime.submit_intent import (
     open_submit_intent_latch,
 )
 from breezy.strategy.current_rung_hold.family_id_arg import (
+    KINDS_WITH_EXIT_PATH,
     FamilyIdArgError,
     resolve_haltable_family_arg,
 )
@@ -196,6 +197,7 @@ class PositionCheckResult:
     source: str
     verdict: str
     token: str
+    open_count: int = 0
 
 
 class _ObservedSink:
@@ -302,8 +304,11 @@ def check_pre_set_position(
             VERDICT_UNKNOWN,
             "LIVE_PAGE_REJECTED:slug_entry_invalid",
         )
-    if any(net != 0 for net in positions.values()):
-        return PositionCheckResult(SOURCE_LIVE, VERDICT_OPEN, "non_zero_net_position")
+    open_count = sum(1 for net in positions.values() if net != 0)
+    if open_count:
+        return PositionCheckResult(
+            SOURCE_LIVE, VERDICT_OPEN, "non_zero_net_position", open_count=open_count
+        )
     return PositionCheckResult(SOURCE_LIVE, VERDICT_FLAT, "eof_page_all_zero")
 
 
@@ -388,7 +393,7 @@ def set_family_halt(
     if not args.status and (args.reason is None or args.evidence_path is None):
         parser.error("--reason and --evidence-path are required unless --status is given")
     try:
-        resolve_haltable_family_arg(args.family_id, args.families_dir)
+        manifest = resolve_haltable_family_arg(args.family_id, args.families_dir)
     except FamilyIdArgError as exc:
         print(f"breezy-set-family-halt: {exc}; refused", file=err)
         return EXIT_REFUSED
@@ -461,6 +466,8 @@ def set_family_halt(
 
     store = SqliteStateStore(store_path)
     check: PositionCheckResult | None = None
+    has_exit_path = manifest.composition_kind in KINDS_WITH_EXIT_PATH
+    halt_reason = args.reason
     try:
         try:
             with open_submit_intent_latch(store, store_path) as intent_latch:
@@ -481,7 +488,11 @@ def set_family_halt(
                     else (lambda: _default_live_positions_reader(source))
                 )
                 check = check_pre_set_position(positions_reader=reader)
-                if check.verdict == VERDICT_OPEN:
+                if check.verdict == VERDICT_OPEN and not has_exit_path:
+                    # FQ-H1: no exit path exists to strand, so open positions
+                    # do not block the halt; the count is recorded instead.
+                    halt_reason = f"{args.reason} [open_positions_at_halt={check.open_count}]"
+                elif check.verdict == VERDICT_OPEN:
                     print(
                         "breezy-set-family-halt: refused, pre-set open-position check "
                         f"source={check.source} verdict={check.verdict} reason={check.token}",
@@ -489,7 +500,7 @@ def set_family_halt(
                     )
                     print(f"breezy-set-family-halt: {_NEXT_OPEN_POSITION}", file=err)
                     return EXIT_REFUSED
-                if check.verdict != VERDICT_FLAT:
+                elif check.verdict != VERDICT_FLAT:
                     print(
                         "breezy-set-family-halt: refused, pre-set open-position check "
                         f"source={check.source} verdict={check.verdict} reason={check.token}",
@@ -501,7 +512,7 @@ def set_family_halt(
                 assert evidence_sha256 is not None  # narrows for mypy; set above, non-status path
                 now_ns = time.time_ns()
                 trial_latch.record_policy_halt(
-                    reason=args.reason,
+                    reason=halt_reason,
                     evidence_sha256=evidence_sha256,
                     ts_ns=now_ns,
                 )
@@ -568,7 +579,8 @@ def set_family_halt(
             file=err,
         )
     print(
-        f"breezy-set-family-halt: halted, position_check_source={check.source}",
+        f"breezy-set-family-halt: halted, position_check_source={check.source} "
+        f"open_positions={check.open_count}",
         file=out,
     )
     return EXIT_OK

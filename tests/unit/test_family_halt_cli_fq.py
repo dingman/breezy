@@ -22,7 +22,10 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.clear_family_halt_cli import main as clear_main
 from breezy.strategy.current_rung_hold.composition import family_halt_submit_veto
-from breezy.strategy.current_rung_hold.family_id_arg import HALTABLE_COMPOSITION_KINDS
+from breezy.strategy.current_rung_hold.family_id_arg import (
+    HALTABLE_COMPOSITION_KINDS,
+    KINDS_WITH_EXIT_PATH,
+)
 from breezy.strategy.current_rung_hold.set_family_halt_cli import main as set_main
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     family_halt_key,
@@ -53,8 +56,24 @@ def _flat() -> dict[str, Any]:
     return {"positions": {}, "eof": True}
 
 
+def _open_reader(count: int = 5) -> Callable[[], dict[str, Any]]:
+    def _reader() -> dict[str, Any]:
+        slugs = (f"KSFO-2026-10-05-HIGH-{70 + i}" for i in range(count))
+        return {"positions": {slug: {"netPosition": "1"} for slug in slugs}, "eof": True}
+
+    return _reader
+
+
+def _failing_reader() -> dict[str, Any]:
+    raise ConnectionError("no route to venue")
+
+
 def _set(
-    tmp_path: Path, store_path: Path, family_id: str = FQ_FAMILY_ID, *extra: str
+    tmp_path: Path,
+    store_path: Path,
+    family_id: str = FQ_FAMILY_ID,
+    *extra: str,
+    reader: Callable[[], dict[str, Any]] = _flat,
 ) -> tuple[int, str]:
     err = io.StringIO()
     code = set_main(
@@ -66,7 +85,7 @@ def _set(
         env=_env(store_path),
         stdout=io.StringIO(),
         stderr=err,
-        positions_reader=_flat,
+        positions_reader=reader,
         proc_root=Path(tempfile.mkdtemp()),
     )
     return code, err.getvalue()
@@ -168,3 +187,53 @@ def test_the_accepted_composition_kinds_are_pinned_exactly() -> None:
     assert HALTABLE_COMPOSITION_KINDS == frozenset(
         {"continuous_rung_hold", "forecast_quantile_ladder"}
     )
+
+
+CONTINUOUS_FAMILY_ID = "pm_us_crh_v4"
+
+
+def test_fq_set_proceeds_with_open_positions_and_the_veto_refuses(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.db"
+    SqliteStateStore(store_path).close()
+
+    code, err = _set(tmp_path, store_path, reader=_open_reader(5))
+
+    assert code == EXIT_OK, err
+    assert _fq_try_submit(store_path) == "family_halt"
+    store = SqliteStateStore(store_path)
+    raw = store.get(family_halt_key(FQ_FAMILY_ID))
+    store.close()
+    assert raw is not None
+    assert "open_positions_at_halt=5" in json.loads(raw)["detail"]
+
+
+def test_continuous_set_with_open_positions_is_still_refused(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.db"
+    SqliteStateStore(store_path).close()
+
+    code, err = _set(tmp_path, store_path, CONTINUOUS_FAMILY_ID, reader=_open_reader(5))
+
+    assert code == EXIT_REFUSED
+    assert "verdict=OPEN" in err
+    store = SqliteStateStore(store_path)
+    assert store.get(family_halt_key(CONTINUOUS_FAMILY_ID)) is None
+    store.close()
+
+
+def test_a_failed_positions_get_refuses_for_both_kinds(tmp_path: Path) -> None:
+    for family_id in (FQ_FAMILY_ID, CONTINUOUS_FAMILY_ID):
+        store_path = tmp_path / f"{family_id}.db"
+        SqliteStateStore(store_path).close()
+
+        code, err = _set(tmp_path, store_path, family_id, reader=_failing_reader)
+
+        assert code == EXIT_REFUSED, family_id
+        assert "LIVE_GET_FAILED:ConnectionError" in err
+        store = SqliteStateStore(store_path)
+        assert store.get(family_halt_key(family_id)) is None
+        store.close()
+
+
+def test_kinds_with_exit_path_is_pinned_exactly_and_within_the_haltable_kinds() -> None:
+    assert KINDS_WITH_EXIT_PATH == frozenset({"continuous_rung_hold"})
+    assert KINDS_WITH_EXIT_PATH <= HALTABLE_COMPOSITION_KINDS

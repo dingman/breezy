@@ -20,6 +20,14 @@ HALTABLE_COMPOSITION_KINDS: Final[frozenset[str]] = frozenset(
     {"continuous_rung_hold", "forecast_quantile_ladder"}
 )
 
+#: The haltable kinds whose strategy has an automated EXIT path
+#: (``exit_wiring.submit_exit``), which the family halt also vetoes. Only these
+#: kinds can have a position stranded by a halt, so only these keep the
+#: pre-set open-position refusal. ``forecast_quantile_ladder`` buys IOC qty 1
+#: and holds to settlement: no SELL, no exit seam. An explicit pin, never
+#: derived from a heuristic.
+KINDS_WITH_EXIT_PATH: Final[frozenset[str]] = frozenset({"continuous_rung_hold"})
+
 
 class FamilyIdArgError(ValueError):
     """Raised when a CLI family id is syntactically or semantically invalid."""
