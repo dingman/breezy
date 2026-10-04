@@ -183,16 +183,19 @@ def _read_family_file(
 
 
 def _manifest_source(
-    family_id: str, paths: AutonomyPaths | ShadowPaths, repo_root: Path
+    family_id: str, paths: AutonomyPaths | ShadowPaths, repo_root: Path, *, repo_only: bool
 ) -> tuple[bytes, Path] | None:
     """The committed root manifest if the repo has one, else the registry copy (a child).
 
     A repo file that exists is the only source: a mismatch is never retried against the
-    registry (E-14 rule 3a), so a drifted committed root cannot be papered over.
+    registry (E-14 rule 3a), so a drifted committed root cannot be papered over. With
+    ``repo_only`` (a root: E-14 3a, A6d-A2 M2) the registry copy is never consulted at all.
     """
     raw = _read_family_file(repo_root, _COMMITTED_PARTS, family_id, ReadPolicy.REPO)
     if raw is not None:
         return raw, repo_root.joinpath(*_COMMITTED_PARTS, f"{family_id}.json")
+    if repo_only:
+        return None
     raw = _read_family_file(paths.root, _REGISTRY_PARTS, family_id, ReadPolicy.STRICT)
     if raw is not None:
         return raw, paths.family_file(family_id)
@@ -205,10 +208,13 @@ def read_manifest_facts(
     *,
     paths: AutonomyPaths | ShadowPaths,
     repo_root: Path,
+    repo_only: bool = False,
 ) -> ManifestFacts | None:
     """The facts ``transitions.validate`` needs for ``family_id`` at ``manifest_sha256``.
 
     Bind ``paths`` and ``repo_root`` (``functools.partial``) to obtain a ``ManifestFactsReader``.
+    ``repo_only`` is for a root: its manifest is the committed repo file or nothing, never a
+    registry copy (E-14 rule 3a; the replay passes it for every family a root introduced).
     ``None`` for anything unreadable: a malformed id or sha, a missing, symlinked or oddly-owned
     source, bytes whose sha256 differs, a draft or invalid manifest, a PREREG-ineligible
     directory, or a manifest that names another family. Never raises for those.
@@ -216,7 +222,7 @@ def read_manifest_facts(
     try:
         family = family_component(family_id)
         sha = sha_component(manifest_sha256, "manifest_sha256")
-        source = _manifest_source(family, paths, repo_root)
+        source = _manifest_source(family, paths, repo_root, repo_only=repo_only)
         if source is None:
             return None
         raw, path = source

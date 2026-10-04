@@ -256,6 +256,7 @@ source_modules = [
     "breezy.persistence.autonomy.demand",
     "breezy.persistence.autonomy.drill_marker",
     "breezy.persistence.autonomy.hwm",
+    "breezy.persistence.autonomy.replay",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
