@@ -240,3 +240,34 @@ Method deviation, ruled up front: transient `systemd-run --user --unit=claude-au
 - **Noted, no action**
   - **(SEC L9)** X1 was red at base `3c44087d` (the gate WP0 failure). This is already recorded.
   - **(py L8)** Split `capture_reader` views and joins before the next growth (currently 737 lines).
+
+## WP2 (062dad8f) and the WP1+WP3 integration
+- **Integration failures.** Gate WP1 on 26571a46 (WP1 rebased onto the merged WP3 step 1) ended `phase1 rc=1`. Six tests failed, all from WP3 modules meeting WP1's scans for the first time:
+  - two closure-lint tests;
+  - `test_every_envelope_node_id_collected_and_unskipped`;
+  - `test_static_walk_positive_and_negative_controls`;
+  - two `test_autonomy_files_one_writer` tests.
+- **WP2-R1 (pending-WP7 test).** Accepted: `tests/unit/autonomy/pending_wp7_capture_guard_subclass.py` is not collected by default, and run by path it fails. There is no xfail and no skip.
+  - WP7 obligation: rename it into the collected file, and it must turn GREEN in WP7's own merge.
+  - The evidence file records it.
+- **WP2-R2 (`reason=` lint workaround REJECTED).** Routing a copied reason through a field dict to dodge the constant rule is laundering.
+  - Fix: narrow the lint. A `reason=` keyword whose value is an attribute read (`<name>.reason`) from a value typed as a capture decision/refusal object is accepted only at enumerated (file, function) sites. Each site has a test, with planted controls showing that an arbitrary expression is still flagged.
+  - Then pass `reason=` directly.
+- **WP2-R3 (accepted).**
+  - `CaptureIdentity` lives in `guarded_strategy.py`.
+  - The adapter has `capture` and `follow_up` and publishes, per CS-1.
+  - `FqNodePlugin` is not in `NODE_PLUGINS`; registering it is WP7/WP8.
+  - The exit exemption is SELL-only.
+  - Each refused order list produces one detector event.
+  - Guard CRITICALs use event `CAPTURE_REFUSED` with the cause in `detail` (§3.16).
+  - Forecast station is `ctx.station`.
+- **WP2-R4 (frame body shape is now binding for WP5 leg B).**
+  - Depth: `{ts_event, bids:[[px,sz]], asks:[[px,sz]]}`, with zero-size pad levels dropped.
+  - Quote: `{ask, bid, ts_event}`.
+- **WP2-R5 (WP3 rows in `AUT1_WRITE_AUTHORITY`).** The `capture_recorder_hook_cli` scopes `_open_child_dir`, `_write_once`, `_atomic_replace` and `_acquire_lock` are confirmed against WP3-R3. Those are the hook's only write sites, and they are reviewed.
+- **WP2-R6: SEC and python review of 26571a46..232d06bc. APPROVE; all mediums and lows adopted before merge.**
+  - **(M1) Exits are never refused.** The exit and untagged-SELL branch of `_admit` is wrapped in `try/except Exception`. On failure it counts, logs a constant cause, and admits the order. BUY stays fail-closed. Test: a raising `make_record` or `canonical_json` on an exit still submits.
+  - **(M2) §3.6.5 send-path test.** Calling `close_position` / `close_all_positions` on an untagged BUY that closes a short must be refused by the guard. This pins the Nautilus 1.231.0 `cpdef` dispatch at `strategy.pyx:1416`. `modify_order` is covered as well.
+  - **(L3)** `FollowUp.__post_init__` validates `reason` against the closed set: `VetoReason` values plus the `REASON_*` constants.
+  - **(L4)** `REASON_COPY_SITES` pins the receiver name too (`decision`, `outcome`), not only the function. A planted control uses another name at the same site.
+  - **WP7 note:** test the linkage between a tag and the Take record it refers to. Today the guard checks tag format only, per §3.6.2.
