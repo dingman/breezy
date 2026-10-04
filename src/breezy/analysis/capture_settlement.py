@@ -12,7 +12,10 @@ connection; the catalog is opened read-only and never created.
   ``retrieved_at_ns``, so the order is deterministic and survives a re-run).
 * ``basis`` is venue-owned (``VENUE_BASIS``). An unknown venue is refused, never defaulted.
 * Only a final record with a ``tmax_f`` is settlement truth. A preliminary or an empty day is
-  *pending*: it is not written and not an error (the audit's 48 h check is the backstop).
+  *pending*: it is not written and not an error (the audit's 48 h check is the backstop). A FINAL
+  record with no ``tmax_f`` is ``SettlementTruthMissing``: an error, never silently pending.
+* The decisions dir is validated (``open_root``) before the lock is taken, so a missing or
+  symlinked directory is refused without creating a lock file through it.
 * One writer: this module owns ``settlement_*.jsonl``. A file is rewritten whole, existing bytes
   first, through ``single_read.replace_atomic`` (a temp file in ``<decisions_dir>``, which is the
   unit's bind), under the module's own lock ``<decisions_dir>/.capture_settlement.lock``.
@@ -63,6 +66,7 @@ __all__ = [
     "SettlementRecord",
     "SettlementRunResult",
     "SettlementSite",
+    "SettlementTruthMissing",
     "StationDayError",
     "UnknownVenueBasis",
     "read_catalog_day",
@@ -110,6 +114,10 @@ class SettlementFileCorrupt(SettlementError):
 
 class SettlementLockBusy(SettlementError):
     """Another run holds the settlement lock."""
+
+
+class SettlementTruthMissing(SettlementError):
+    """A FINAL climate record carries no ``tmax_f``: the truth the audit waits for is not there."""
 
 
 class UnknownVenueBasis(SettlementError):
@@ -223,18 +231,39 @@ def settlement_lock(decisions_dir: Path) -> Iterator[None]:
         os.close(fd)
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise SettlementFileCorrupt("duplicate key")
+    return dict(pairs)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _record_from(body: object) -> SettlementRecord:
+    if not isinstance(body, dict) or tuple(body) != _RECORD_KEYS:
+        raise SettlementFileCorrupt("unexpected keys")
+    texts = (body["station"], body["climate_day"], body["basis"], body["raw_sha256"])
+    if not all(isinstance(t, str) for t in texts):
+        raise SettlementFileCorrupt("wrong field type")
+    if not (_is_int(body["settlement_tmax_f"]) and _is_int(body["ts_ns"])):
+        raise SettlementFileCorrupt("wrong field type")
+    return SettlementRecord(**body)
+
+
 def _parse_existing(raw: bytes) -> tuple[SettlementRecord, ...]:
     if raw and not raw.endswith(b"\n"):
         raise SettlementFileCorrupt("no trailing newline")
     records: list[SettlementRecord] = []
+    seen: set[tuple[str, str, str]] = set()
     for line in raw.decode("utf-8", errors="strict").splitlines():
-        body: Any = json.loads(line)
-        if not isinstance(body, dict) or tuple(body) != _RECORD_KEYS:
-            raise SettlementFileCorrupt("unexpected keys")
-        try:
-            records.append(SettlementRecord(**body))
-        except TypeError as exc:  # pragma: no cover - keys already checked
-            raise SettlementFileCorrupt("unexpected fields") from exc
+        record = _record_from(json.loads(line, object_pairs_hook=_no_duplicate_keys))
+        if record.key() in seen:
+            raise SettlementFileCorrupt("duplicate record")
+        seen.add(record.key())
+        records.append(record)
     return tuple(records)
 
 
@@ -259,8 +288,10 @@ def _read_existing(decisions_dir: Path, day: str) -> tuple[bytes, tuple[Settleme
 def _record_for(
     record: NwsClimateDay | None, site: SettlementSite, day: dt.date, basis: str
 ) -> SettlementRecord | None:
-    if record is None or not record.is_final or record.tmax_f is None:
+    if record is None or not record.is_final:
         return None
+    if record.tmax_f is None:
+        raise SettlementTruthMissing(site.cli_location)
     return SettlementRecord(
         station=site.cli_location,
         climate_day=day.isoformat(),
@@ -363,6 +394,7 @@ def run_settlement(
     basis = basis_by_venue.get(venue)
     if basis is None:
         raise UnknownVenueBasis(venue)
+    os.close(open_root(decisions_dir))  # refuse a missing or symlinked dir before any lock file
     tally = _Tally()
     with settlement_lock(decisions_dir):
         for day in scan_days(today):

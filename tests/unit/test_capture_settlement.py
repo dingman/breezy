@@ -22,6 +22,7 @@ import pytest
 from breezy.analysis import capture_settlement as cs
 from breezy.analysis import capture_settlement_cli as cli
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
+from breezy.persistence.autonomy.single_read import SingleReadReason, SingleReadRefused
 from breezy.persistence.catalog import open_station_catalog, write_records
 from tests.support.capture_closure_lint import AUT1_WRITE_AUTHORITY, aut1_files, lint_files
 from tests.unit.autonomy_writer_table import AUTONOMY_FILE_WRITERS
@@ -216,15 +217,31 @@ def test_a_venue_with_no_basis_is_refused_not_defaulted(tmp_path: Path) -> None:
         _run(tmp_path, basis_by_venue={"kalshi": "TWC"})
 
 
-def test_non_final_and_null_tmax_records_are_pending_not_written(tmp_path: Path) -> None:
+def test_non_final_records_are_pending_not_written(tmp_path: Path) -> None:
     base = tmp_path / "catalog"
     day = TODAY - dt.timedelta(days=1)
     _seed(base, "NYC", _climate_day("NYC", day, is_final=False))
-    _seed(base, "MDW", _climate_day("MDW", day, tmax=None, tmax_flag="M"))
+    (base / VENUE / "MDW").mkdir(parents=True)
     result, offers, decisions = _run(tmp_path)
-    assert result.appended == 0 and result.pending == 2 + 2 * 6
+    assert result.appended == 0 and result.pending == 2 * 7
     assert not list(decisions.glob("settlement_*.jsonl"))
     assert offers.calls == [] and result.exit_code == 0
+
+
+def test_a_final_record_with_null_tmax_is_settlement_truth_missing_error(tmp_path: Path) -> None:
+    """WP5-R4 (py M5): a FINAL product with no tmax is not pending, it is missing truth."""
+    day = TODAY - dt.timedelta(days=1)
+    _seed(tmp_path / "catalog", "MDW", _climate_day("MDW", day, tmax=None, tmax_flag="M"))
+    result, offers, decisions = _run(tmp_path, sites=(cs.SettlementSite("MDW", "MDW"),))
+    assert issubclass(cs.SettlementTruthMissing, cs.SettlementError)
+    assert [e.cause for e in result.errors] == ["SettlementTruthMissing"]
+    assert result.errors[0].climate_day == day.isoformat() and result.exit_code == 1
+    assert [c[0] for c in offers.calls] == [ERROR_EVENT]
+    assert (
+        offers.calls[0][2]
+        == f"station=MDW climate_day={day.isoformat()} cause=SettlementTruthMissing"
+    )
+    assert not list(decisions.glob("settlement_*.jsonl"))
 
 
 def test_a_station_day_with_no_record_is_pending_without_alert(tmp_path: Path) -> None:
@@ -544,3 +561,124 @@ def test_the_cli_never_writes_outside_the_decisions_dir(tmp_path: Path) -> None:
     cli.main(_argv(tmp_path), offer=Offers(), clock=_clock(13, 35), sites=SITES)
     after = sorted(str(p.relative_to(tmp_path)) for p in (tmp_path / "catalog").rglob("*"))
     assert snapshot == after
+
+
+# -- WP5-R4: root validated before the lock, parse validation, CLI reporting ----------------------
+
+
+def test_a_missing_decisions_dir_is_refused_before_any_lock_is_taken(tmp_path: Path) -> None:
+    with pytest.raises(SingleReadRefused) as info:
+        cs.run_settlement(
+            venue=VENUE,
+            today=TODAY,
+            decisions_dir=tmp_path / "absent",
+            catalog_base=tmp_path / "catalog",
+            sites=SITES,
+            offer=Offers(),
+        )
+    assert info.value.reason is SingleReadReason.NOT_FOUND
+
+
+def test_a_symlinked_decisions_dir_is_refused_and_no_lock_file_is_created_through_it(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    with pytest.raises(SingleReadRefused):
+        cs.run_settlement(
+            venue=VENUE,
+            today=TODAY,
+            decisions_dir=link,
+            catalog_base=tmp_path / "catalog",
+            sites=SITES,
+            offer=Offers(),
+        )
+    assert not (real / cs.LOCK_FILE).exists()
+
+
+def test_cli_reports_a_missing_decisions_dir_and_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["--decisions-dir", str(tmp_path / "absent"), "--catalog-base", str(tmp_path / "c")]
+    code = cli.main(argv, offer=Offers(), clock=_clock(13, 35), sites=SITES)
+    err = capsys.readouterr().err
+    assert code == 1 and "decisions dir" in err and "Traceback" not in err
+    assert str(tmp_path) not in err
+
+
+def test_cli_reports_an_unknown_venue_basis_and_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cs, "VENUE_BASIS", {})
+    monkeypatch.setattr(cli, "run_settlement", _raise_unknown_basis)
+    code = cli.main(_argv(tmp_path), offer=Offers(), clock=_clock(13, 35), sites=SITES)
+    assert code == 1 and "no settlement basis" in capsys.readouterr().err
+
+
+def _raise_unknown_basis(**_kw: Any) -> None:
+    raise cs.UnknownVenueBasis("x")
+
+
+def test_cli_venue_choices_come_from_the_basis_table(tmp_path: Path) -> None:
+    argv = ["--venue", "kalshi", "--decisions-dir", str(tmp_path), "--catalog-base", str(tmp_path)]
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv, offer=Offers(), clock=_clock(13, 35), sites=SITES)
+    assert exc.value.code == 2
+
+
+def _corrupt_run(tmp_path: Path, content: str) -> tuple[cs.SettlementRunResult, Path, bytes]:
+    _seed_window(tmp_path / "catalog", cities=("NYC",))
+    decisions = tmp_path / "decisions"
+    decisions.mkdir(mode=0o700)
+    day = TODAY - dt.timedelta(days=1)
+    _file(decisions, day).write_text(content)
+    _file(decisions, day).chmod(0o600)
+    before = _file(decisions, day).read_bytes()
+    result, _, _ = _run(tmp_path, sites=(cs.SettlementSite("NYC", "NYC"),))
+    return result, _file(decisions, day), before
+
+
+def _row(**over: Any) -> str:
+    body: dict[str, Any] = {
+        "station": "NYC",
+        "climate_day": (TODAY - dt.timedelta(days=1)).isoformat(),
+        "settlement_tmax_f": 84,
+        "basis": "NWS_CLI",
+        "raw_sha256": _sha("old"),
+        "ts_ns": 1,
+    }
+    body.update(over)
+    return json.dumps(body, separators=(",", ":")) + "\n"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _row(settlement_tmax_f="84"),
+        _row(settlement_tmax_f=True),
+        _row(ts_ns=1.5),
+        _row(station=7),
+        _row(raw_sha256=None),
+        _row() + _row(),  # the same (station, day, sha) key twice
+        (
+            '{"station":"NYC","station":"MDW","climate_day":"2026-10-03","settlement_tmax_f":84,'
+            '"basis":"NWS_CLI","raw_sha256":"a","ts_ns":1}\n'
+        ),  # a duplicate JSON key
+    ],
+)
+def test_existing_file_with_wrong_types_or_duplicates_is_corrupt_and_untouched(
+    tmp_path: Path, content: str
+) -> None:
+    result, path, before = _corrupt_run(tmp_path, content)
+    assert path.read_bytes() == before
+    assert "SettlementFileCorrupt" in {e.cause for e in result.errors}
+    assert result.exit_code == 1
+
+
+def test_a_clean_existing_row_still_parses_and_is_not_rewritten(tmp_path: Path) -> None:
+    result, path, before = _corrupt_run(
+        tmp_path, _row(raw_sha256=_sha("NYC" + str(TODAY - dt.timedelta(days=1))))
+    )
+    assert path.read_bytes() == before and result.already_present >= 1

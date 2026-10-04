@@ -10,82 +10,29 @@ import logging
 import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Final
 
 import pytest
 
 from breezy.analysis import capture_node_log as nl
-
-_ANSI_ON: Final[str] = "\x1b[1m"
-_ANSI_OFF: Final[str] = "\x1b[0m"
-
-# --- REAL lines: breezy-trade-20261002T200526Z.log (ANSI as written by Nautilus) ---------------
-REAL_TAKE: Final[str] = (
-    f"{_ANSI_ON}2026-10-02T20:20:32.924873907Z{_ANSI_OFF} [INFO] "
-    "BREEZY-L001.FORECAST-QUANTILE-LADDER: SHADOW_DECISION {'now_ns': 1790972432790092624, "
-    "'station': 'LAX', 'climate_day': datetime.date(2026, 10, 3), 'rung_id': '93_94', "
-    "'side': 'yes', 'instrument_id': 'tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US', "
-    "'kind': 'Take', 'qty': 1, 'ev_net': 0.06568776856525851, 'p_hat': 0.2538513678202191, "
-    f"'p_lower': 0.2345490185652585, 'p_upper': 0.27614249327505075}}{_ANSI_OFF}"
+from tests.support.capture_node_log_fixtures import (
+    ANSI_OFF,
+    ANSI_ON,
+    NS,
+    REAL_DISPOSED_NODE,
+    REAL_DISPOSED_STRATEGY,
+    REAL_INSTANCE_ID,
+    REAL_ORDER_FILLED,
+    REAL_PLAIN_LINE,
+    REAL_REFUSE,
+    REAL_SUP_LAUNCHED,
+    REAL_SUP_RELAUNCHING,
+    REAL_TAKE,
+    REAL_TRY_SUBMIT,
+    events_of,
+    node_log_path,
+    spawn_event,
+    write_log,
 )
-REAL_TRY_SUBMIT: Final[str] = (
-    f"{_ANSI_ON}2026-10-02T20:20:32.924972237Z{_ANSI_OFF} [INFO] "
-    "BREEZY-L001.FORECAST-QUANTILE-LADDER: SHADOW_DECISION {'now_ns': 1790972432924965987, "
-    "'station': 'LAX', 'climate_day': datetime.date(2026, 10, 3), 'rung_id': '93_94', "
-    "'side': 'yes', 'instrument_id': 'tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US', "
-    f"'kind': 'TrySubmit', 'reason': 'submitted'}}{_ANSI_OFF}"
-)
-REAL_REFUSE: Final[str] = (
-    f"{_ANSI_ON}2026-10-02T20:05:32.018121135Z{_ANSI_OFF} [INFO] "
-    "BREEZY-L001.FORECAST-QUANTILE-LADDER: SHADOW_DECISION {'now_ns': 1790971531951257557, "
-    "'station': 'MDW', 'climate_day': datetime.date(2026, 10, 3), 'rung_id': 'lt_63', "
-    "'side': 'yes', 'instrument_id': 'tc-temp-mdwhigh-2026-10-03-lt64f.POLYMARKET_US', "
-    f"'kind': 'Refuse', 'reason': 'forecast_unavailable'}}{_ANSI_OFF}"
-)
-REAL_ORDER_FILLED: Final[str] = (
-    f"{_ANSI_ON}2026-10-02T20:20:33.123853693Z{_ANSI_OFF} [INFO] "
-    "BREEZY-L001.FORECAST-QUANTILE-LADDER: <--[EVT] OrderFilled("
-    "instrument_id=tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US, "
-    "client_order_id=O-20261002-202032-L001-LAX-1, venue_order_id=CVW455HKJYGE, "
-    "account_id=POLYMARKET_US-MAIN, trade_id=CVWEANWH8YHR, "
-    "position_id=tc-temp-laxhigh-2026-10-03-gte93lt94f.POLYMARKET_US-FORECAST-QUANTILE-LADDER-LAX, "
-    "order_side=BUY, order_type=LIMIT, last_qty=1.00, last_px=0.15 USD, commission=0.01 USD, "
-    f"liquidity_side=TAKER, ts_event=1790972433034078620){_ANSI_OFF}"
-)
-REAL_INSTANCE_ID: Final[str] = (
-    f"{_ANSI_ON}2026-10-02T20:05:30.434292449Z{_ANSI_OFF} [INFO] "
-    f"BREEZY-L001.TradingNode: instance_id: 01cea9fc-cf7d-4efa-b132-cbbaf5d0bde4{_ANSI_OFF}"
-)
-# The ANSI-stripped disposal lines of the same log (lines 70915 and 70928).
-REAL_DISPOSED_STRATEGY: Final[str] = (
-    "2026-10-02T20:55:21.478676119Z [INFO] BREEZY-L001.FORECAST-QUANTILE-LADDER: DISPOSED"
-)
-REAL_DISPOSED_NODE: Final[str] = (
-    "2026-10-02T20:55:21.494523448Z [INFO] BREEZY-L001.TradingNode: DISPOSED"
-)
-REAL_PLAIN_LINE: Final[str] = (
-    "2026-10-02T20:55:21.494375108Z [INFO] BREEZY-L001.MessageBus: Closed message bus"
-)
-
-# --- REAL supervisor lines (breezy-trade-supervisor.log) ----------------------------------------
-REAL_SUP_LAUNCHED: Final[str] = (
-    "2026-10-03T16:50:45Z INFO breezy.runtime.trade_supervisor launched pid=529436"
-)
-REAL_SUP_RELAUNCHING: Final[str] = (
-    "2026-09-18T16:51:20Z INFO breezy.runtime.trade_supervisor relaunching attempt=1"
-)
-
-_NS: Final[int] = 1_000_000_000
-
-
-def _write(path: Path, *lines: str, tail: str = "\n") -> Path:
-    path.write_bytes(("\n".join(lines) + tail).encode("utf-8"))
-    return path
-
-
-def _events(path: Path) -> list[object]:
-    return list(nl.iter_node_log(path))
-
 
 # ------------------------------------------------------------------------------------------
 # (a) decision lines
@@ -93,8 +40,8 @@ def _events(path: Path) -> list[object]:
 
 
 def test_parses_shadow_decision_take_and_trysubmit_lines_with_date_repr(tmp_path: Path) -> None:
-    path = _write(tmp_path / "n.log", REAL_TAKE, REAL_TRY_SUBMIT, REAL_REFUSE)
-    take, try_submit, refuse = _events(path)
+    path = write_log(tmp_path / "n.log", REAL_TAKE, REAL_TRY_SUBMIT, REAL_REFUSE)
+    take, try_submit, refuse = events_of(path)
     assert isinstance(take, nl.DecisionLine) and take.kind == "Take"
     assert take.climate_day == dt.date(2026, 10, 3)
     assert take.now_ns == 1790972432790092624
@@ -105,7 +52,7 @@ def test_parses_shadow_decision_take_and_trysubmit_lines_with_date_repr(tmp_path
     assert take.reason is None and take.line_no == 1
     assert (
         take.log_ts_ns
-        == int(dt.datetime(2026, 10, 2, 20, 20, 32, tzinfo=dt.UTC).timestamp()) * _NS + 924873907
+        == int(dt.datetime(2026, 10, 2, 20, 20, 32, tzinfo=dt.UTC).timestamp()) * NS + 924873907
     )
     assert isinstance(try_submit, nl.DecisionLine) and try_submit.kind == "TrySubmit"
     assert try_submit.reason == "submitted" and try_submit.take is None
@@ -113,8 +60,8 @@ def test_parses_shadow_decision_take_and_trysubmit_lines_with_date_repr(tmp_path
 
 
 def test_decision_line_parses_without_ansi_too(tmp_path: Path) -> None:
-    plain = REAL_REFUSE.replace(_ANSI_ON, "").replace(_ANSI_OFF, "")
-    (event,) = _events(_write(tmp_path / "n.log", plain))
+    plain = REAL_REFUSE.replace(ANSI_ON, "").replace(ANSI_OFF, "")
+    (event,) = events_of(write_log(tmp_path / "n.log", plain))
     assert isinstance(event, nl.DecisionLine) and event.kind == "Refuse"
 
 
@@ -123,7 +70,7 @@ def test_each_decision_kind_is_classified_by_kind(tmp_path: Path) -> None:
         REAL_REFUSE.replace("'Refuse'", f"'{kind}'")
         for kind in ("NotExecutable", "NotDPlus1", "Refuse")
     ]
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", *lines, REAL_TAKE, REAL_TRY_SUBMIT))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", *lines, REAL_TAKE, REAL_TRY_SUBMIT))
     assert dict(scan.kind_counts) == {
         "NotExecutable": 1,
         "NotDPlus1": 1,
@@ -137,14 +84,14 @@ def test_each_decision_kind_is_classified_by_kind(tmp_path: Path) -> None:
 def test_evaluation_count_is_total_minus_trysubmit(tmp_path: Path) -> None:
     """WP0-R7 R3: a Take adds one TrySubmit line, so evaluations = total - TrySubmit."""
     scan = nl.scan_node_log(
-        _write(tmp_path / "n.log", REAL_REFUSE, REAL_REFUSE, REAL_TAKE, REAL_TRY_SUBMIT)
+        write_log(tmp_path / "n.log", REAL_REFUSE, REAL_REFUSE, REAL_TAKE, REAL_TRY_SUBMIT)
     )
     assert scan.decision_line_count == 4
     assert scan.evaluation_count == 3
 
 
 def test_evaluation_count_when_shadow_only_has_no_trysubmit(tmp_path: Path) -> None:
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", REAL_REFUSE, REAL_TAKE))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", REAL_REFUSE, REAL_TAKE))
     assert scan.evaluation_count == scan.decision_line_count == 2
 
 
@@ -231,7 +178,7 @@ def test_malformed_shadow_decision_line_is_reported_never_skipped(
     tmp_path: Path, mutate: object, cause: str | None
 ) -> None:
     bad = mutate(REAL_TAKE)  # type: ignore[operator]
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", REAL_REFUSE, bad, REAL_REFUSE))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", REAL_REFUSE, bad, REAL_REFUSE))
     assert scan.unparseable_total == 1
     (report,) = scan.unparseable
     assert report.marker == "SHADOW_DECISION" and report.line_no == 2
@@ -245,12 +192,12 @@ def test_malformed_shadow_decision_line_is_reported_never_skipped(
 
 
 def test_reads_instance_id_line(tmp_path: Path) -> None:
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", REAL_PLAIN_LINE, REAL_INSTANCE_ID))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", REAL_PLAIN_LINE, REAL_INSTANCE_ID))
     assert scan.instance_ids == ("01cea9fc-cf7d-4efa-b132-cbbaf5d0bde4",)
 
 
 def test_parses_orderfilled_client_and_venue_ids(tmp_path: Path) -> None:
-    (fill,) = _events(_write(tmp_path / "n.log", REAL_ORDER_FILLED))
+    (fill,) = events_of(write_log(tmp_path / "n.log", REAL_ORDER_FILLED))
     assert isinstance(fill, nl.OrderFilledLine)
     assert fill.client_order_id == "O-20261002-202032-L001-LAX-1"
     assert fill.venue_order_id == "CVW455HKJYGE"
@@ -261,7 +208,7 @@ def test_parses_orderfilled_client_and_venue_ids(tmp_path: Path) -> None:
 
 def test_malformed_orderfilled_line_is_reported(tmp_path: Path) -> None:
     bad = REAL_ORDER_FILLED.replace("venue_order_id=CVW455HKJYGE, ", "")
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", bad))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", bad))
     assert scan.unparseable_total == 1 and scan.fills == ()
     assert scan.unparseable[0].marker == "OrderFilled"
 
@@ -276,9 +223,11 @@ def test_disposal_line_text_matches_the_recorded_line() -> None:
 
 
 def test_boot_is_disposed_only_by_the_trading_node_disposal_line(tmp_path: Path) -> None:
-    components_only = nl.scan_node_log(_write(tmp_path / "a.log", REAL_DISPOSED_STRATEGY))
+    components_only = nl.scan_node_log(write_log(tmp_path / "a.log", REAL_DISPOSED_STRATEGY))
     assert components_only.node_disposed is False and components_only.disposed_count == 1
-    ended = nl.scan_node_log(_write(tmp_path / "b.log", REAL_DISPOSED_STRATEGY, REAL_DISPOSED_NODE))
+    ended = nl.scan_node_log(
+        write_log(tmp_path / "b.log", REAL_DISPOSED_STRATEGY, REAL_DISPOSED_NODE)
+    )
     assert ended.node_disposed is True and ended.disposed_count == 2
 
 
@@ -288,8 +237,8 @@ def test_disposing_transient_state_is_not_a_disposal_line() -> None:
 
 
 def test_scan_reports_last_log_line_timestamp(tmp_path: Path) -> None:
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", REAL_INSTANCE_ID, REAL_DISPOSED_NODE))
-    expected = int(dt.datetime(2026, 10, 2, 20, 55, 21, tzinfo=dt.UTC).timestamp()) * _NS
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", REAL_INSTANCE_ID, REAL_DISPOSED_NODE))
+    expected = int(dt.datetime(2026, 10, 2, 20, 55, 21, tzinfo=dt.UTC).timestamp()) * NS
     assert scan.last_line_ts_ns == expected + 494523448
     assert scan.line_count == 2
 
@@ -317,7 +266,7 @@ def test_failed_to_serialize_log_line_fails_r4(tmp_path: Path) -> None:
     log.info("CAPTURE_PUBLISH_FAILED_SUPPRESSED family=fq cause=OSError count=3 window_s=300")
     log.info("an unrelated line")
     lines = [ln for ln in read() if "BREEZY-TEST-WRITER" in ln]
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", *lines))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", *lines))
     assert [f.marker for f in scan.writer_failures] == [
         nl.MARKER_FAILED_TO_SERIALIZE,
         nl.MARKER_MISSING_WRITER,
@@ -329,14 +278,14 @@ def test_failed_to_serialize_log_line_fails_r4(tmp_path: Path) -> None:
 
 
 def test_log_without_failure_markers_has_none(tmp_path: Path) -> None:
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", REAL_PLAIN_LINE, REAL_REFUSE))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", REAL_PLAIN_LINE, REAL_REFUSE))
     assert not scan.has_writer_failure and scan.writer_failures == ()
 
 
 def test_writer_failure_storm_is_counted_exactly_but_stored_bounded(tmp_path: Path) -> None:
     line = "2026-10-02T20:00:00.000000001Z [ERROR] BREEZY-L001.W: Failed to serialize cls=<c>"
     n = nl.MAX_STORED_REPORTS + 50
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", *([line] * n)))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", *([line] * n)))
     assert scan.writer_failure_total == n
     assert len(scan.writer_failures) == nl.MAX_STORED_REPORTS
     assert scan.has_writer_failure
@@ -351,7 +300,7 @@ def test_unparseable_marker_line_is_counted_never_skipped_silently(tmp_path: Pat
     torn_mid = REAL_TAKE[:90] + REAL_REFUSE  # CONSTRUCTED: two writes interleaved
     garbage = "2026-10-02T20:00:00.000000000Z [INFO] X: SHADOW_DECISION {not a dict"  # CONSTRUCTED
     inst = "2026-10-02T20:00:00.000000000Z [INFO] X.TradingNode: instance_id: "  # CONSTRUCTED
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", torn_mid, garbage, inst, REAL_REFUSE))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", torn_mid, garbage, inst, REAL_REFUSE))
     assert scan.unparseable_total == 3
     assert [u.line_no for u in scan.unparseable] == [1, 2, 3]
     assert scan.decision_line_count == 1
@@ -377,7 +326,7 @@ def test_stream_torn_tail_after_boot_end_is_counted(tmp_path: Path) -> None:
 
 
 def test_complete_but_unterminated_last_line_is_still_torn_tail(tmp_path: Path) -> None:
-    scan = nl.scan_node_log(_write(tmp_path / "n.log", REAL_REFUSE, tail=""))
+    scan = nl.scan_node_log(write_log(tmp_path / "n.log", REAL_REFUSE, tail=""))
     assert scan.unparseable_total == 1 and scan.decision_line_count == 0
     assert scan.unparseable[0].cause == nl.CAUSE_TORN_TAIL
 
@@ -403,7 +352,7 @@ def test_unreadable_node_log_is_error(tmp_path: Path) -> None:
         nl.scan_node_log(tmp_path / "absent.log")
     with pytest.raises(nl.NodeLogUnreadable):
         nl.scan_node_log(tmp_path)  # a directory
-    locked = _write(tmp_path / "locked.log", REAL_REFUSE)
+    locked = write_log(tmp_path / "locked.log", REAL_REFUSE)
     locked.chmod(0)
     try:
         with pytest.raises(nl.NodeLogUnreadable):
@@ -552,24 +501,17 @@ def test_trade_supervisor_has_exactly_four_spawn_calls_each_paired_with_its_even
     }
 
 
-def _ev(ts: str, event: str, **kw: int) -> nl.SpawnEvent:
-    when = dt.datetime.fromisoformat(ts).replace(tzinfo=dt.UTC)
-    return nl.SpawnEvent(
-        line_no=1, ts=when, event=event, pid=kw.get("pid"), attempt=kw.get("attempt")
-    )
-
-
-def _log(name: str) -> Path:
-    return Path("/logs") / f"breezy-trade-{name}.log"
-
-
 def test_spawn_events_match_logs_one_to_one_in_time_order() -> None:
     events = [
-        _ev("2026-10-03T16:50:45", "launched", pid=11),
-        _ev("2026-10-03T17:05:00", "relaunching", attempt=1),
-        _ev("2026-10-03T19:00:10", "boot_retry_launched", pid=12),
+        spawn_event("2026-10-03T16:50:45", "launched", pid=11),
+        spawn_event("2026-10-03T17:05:00", "relaunching", attempt=1),
+        spawn_event("2026-10-03T19:00:10", "boot_retry_launched", pid=12),
     ]
-    logs = [_log("20261003T165045Z"), _log("20261003T170500Z"), _log("20261003T190009Z")]
+    logs = [
+        node_log_path("20261003T165045Z"),
+        node_log_path("20261003T170500Z"),
+        node_log_path("20261003T190009Z"),
+    ]
     census = nl.match_spawns_to_logs(events, logs)
     assert [m.log_path for m in census.matches] == logs
     assert census.missing == () and census.unmatched_logs == ()
@@ -578,22 +520,24 @@ def test_spawn_events_match_logs_one_to_one_in_time_order() -> None:
 def test_pid_is_never_the_join_key() -> None:
     """Two spawns with the SAME pid still take two different logs (pid reuse, ruling WP0-R7)."""
     events = [
-        _ev("2026-10-03T16:50:45", "launched", pid=5),
-        _ev("2026-10-03T17:05:00", "boot_retry_launched", pid=5),
+        spawn_event("2026-10-03T16:50:45", "launched", pid=5),
+        spawn_event("2026-10-03T17:05:00", "boot_retry_launched", pid=5),
     ]
-    census = nl.match_spawns_to_logs(events, [_log("20261003T165045Z"), _log("20261003T170500Z")])
+    census = nl.match_spawns_to_logs(
+        events, [node_log_path("20261003T165045Z"), node_log_path("20261003T170500Z")]
+    )
     assert [m.log_path for m in census.matches] == [
-        _log("20261003T165045Z"),
-        _log("20261003T170500Z"),
+        node_log_path("20261003T165045Z"),
+        node_log_path("20261003T170500Z"),
     ]
 
 
 def test_spawn_without_log_is_error_node_log_missing() -> None:
     events = [
-        _ev("2026-10-03T16:50:45", "launched", pid=1),
-        _ev("2026-10-04T16:50:45", "launched", pid=2),
+        spawn_event("2026-10-03T16:50:45", "launched", pid=1),
+        spawn_event("2026-10-04T16:50:45", "launched", pid=2),
     ]
-    census = nl.match_spawns_to_logs(events, [_log("20261003T165045Z")])
+    census = nl.match_spawns_to_logs(events, [node_log_path("20261003T165045Z")])
     assert [m.event.pid for m in census.missing] == [2]
     assert census.missing[0].cause == nl.CAUSE_NODE_LOG_MISSING
     assert census.matches[1].log_path is None
@@ -601,42 +545,42 @@ def test_spawn_without_log_is_error_node_log_missing() -> None:
 
 def test_one_log_cannot_satisfy_two_events() -> None:
     events = [
-        _ev("2026-10-03T16:50:45", "launched", pid=1),
-        _ev("2026-10-03T16:50:50", "relaunching", attempt=1),
+        spawn_event("2026-10-03T16:50:45", "launched", pid=1),
+        spawn_event("2026-10-03T16:50:50", "relaunching", attempt=1),
     ]
-    census = nl.match_spawns_to_logs(events, [_log("20261003T165045Z")])
+    census = nl.match_spawns_to_logs(events, [node_log_path("20261003T165045Z")])
     assert [m.event.event for m in census.missing] == ["relaunching"]
 
 
 def test_hand_launched_log_without_an_event_is_unmatched_not_an_error() -> None:
-    events = [_ev("2026-10-03T16:50:45", "launched", pid=1)]
-    hand = _log("20261003T200526Z")
-    census = nl.match_spawns_to_logs(events, [_log("20261003T165045Z"), hand])
+    events = [spawn_event("2026-10-03T16:50:45", "launched", pid=1)]
+    hand = node_log_path("20261003T200526Z")
+    census = nl.match_spawns_to_logs(events, [node_log_path("20261003T165045Z"), hand])
     assert census.missing == () and census.unmatched_logs == (hand,)
 
 
 def test_event_far_from_any_later_log_does_not_take_a_distant_next_day_log() -> None:
-    events = [_ev("2026-10-03T16:50:45", "launched", pid=1)]
-    census = nl.match_spawns_to_logs(events, [_log("20261004T165045Z")])
+    events = [spawn_event("2026-10-03T16:50:45", "launched", pid=1)]
+    census = nl.match_spawns_to_logs(events, [node_log_path("20261004T165045Z")])
     assert [m.event.pid for m in census.missing] == [1]
-    assert census.unmatched_logs == (_log("20261004T165045Z"),)
+    assert census.unmatched_logs == (node_log_path("20261004T165045Z"),)
 
 
 def test_pre_spawn_event_matches_the_log_stamped_a_moment_later() -> None:
-    events = [_ev("2026-09-18T16:51:20", "relaunching", attempt=1)]
-    census = nl.match_spawns_to_logs(events, [_log("20260918T165121Z")])
+    events = [spawn_event("2026-09-18T16:51:20", "relaunching", attempt=1)]
+    census = nl.match_spawns_to_logs(events, [node_log_path("20260918T165121Z")])
     assert census.missing == ()
 
 
 def test_unsorted_inputs_are_matched_in_time_order() -> None:
-    later = _ev("2026-10-03T19:00:00", "boot_retry_launched", pid=2)
-    earlier = _ev("2026-10-03T16:50:45", "launched", pid=1)
+    later = spawn_event("2026-10-03T19:00:00", "boot_retry_launched", pid=2)
+    earlier = spawn_event("2026-10-03T16:50:45", "launched", pid=1)
     census = nl.match_spawns_to_logs(
-        [later, earlier], [_log("20261003T190000Z"), _log("20261003T165045Z")]
+        [later, earlier], [node_log_path("20261003T190000Z"), node_log_path("20261003T165045Z")]
     )
     assert [(m.event.pid, m.log_path) for m in census.matches] == [
-        (1, _log("20261003T165045Z")),
-        (2, _log("20261003T190000Z")),
+        (1, node_log_path("20261003T165045Z")),
+        (2, node_log_path("20261003T190000Z")),
     ]
 
 
@@ -650,21 +594,23 @@ def test_list_node_logs_ignores_supervisor_logs_and_sorts_by_stamp(tmp_path: Pat
         "quote_tape_20260901.log",
     ):
         (tmp_path / name).write_text("x")
-    assert [p.name for p in nl.list_node_logs(tmp_path)] == [
+    listing = nl.list_node_logs(tmp_path)
+    assert [p.name for p in listing.paths] == [
         "breezy-trade-20261001T165011Z.log",
         "breezy-trade-20261003T165045Z.log",
     ]
+    assert listing.findings == ()
 
 
 def test_boot_count_matches_by_instance_id_not_time_window(tmp_path: Path) -> None:
     """WP0-R5: two starts 41.2 s apart are two boots; a repeated instance_id line is one boot."""
     first = nl.scan_node_log(
-        _write(tmp_path / "a.log", REAL_INSTANCE_ID, REAL_INSTANCE_ID, REAL_REFUSE)
+        write_log(tmp_path / "a.log", REAL_INSTANCE_ID, REAL_INSTANCE_ID, REAL_REFUSE)
     )
     second_line = REAL_INSTANCE_ID.replace("01cea9fc", "02cea9fc").replace(
         "20:05:30.434292449", "20:06:11.634292449"
     )
-    second = nl.scan_node_log(_write(tmp_path / "b.log", second_line))
+    second = nl.scan_node_log(write_log(tmp_path / "b.log", second_line))
     assert nl.distinct_boot_ids([first, second]) == (
         "01cea9fc-cf7d-4efa-b132-cbbaf5d0bde4",
         "02cea9fc-cf7d-4efa-b132-cbbaf5d0bde4",
