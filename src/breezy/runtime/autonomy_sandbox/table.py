@@ -99,7 +99,10 @@ RUN_TRANSIENT_SHOW_ARGV: Final[tuple[str, ...]] = (
     "run-*.service",
 )
 INSTANCE_TOKEN: Final = "{instance}"
-BUS_SNAPSHOT_BUDGET_RANGE_S: Final = (1, 25)
+BUS_SNAPSHOT_BUDGET_RANGE_S: Final = (5, 25)
+#: A budget must also cover 2 s of setup plus 1.5 s per read (B9-R5).
+BUS_BUDGET_BASE_S: Final = 2
+BUS_BUDGET_PER_READ_S: Final = 1.5
 BUS_SNAPSHOT_BIND_PREFIX: Final = "cache/"
 POSITIVE_PROBE_KINDS: Final[frozenset[str]] = frozenset({"tmpfile", "subdir"})
 
@@ -350,22 +353,34 @@ def validate_bus_read(row: str, read: BusRead) -> None:
         raise _fail(
             row, f"bus read {read.name!r}: only systemctl --user show/list-units/list-timers"
         )
-    tokens, index = argv[3:], 0
+    tokens, index, has_property = argv[3:], 0, False
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
+            _require_show_property(row, read.name, argv[2], has_property)
             _check_unit_tokens(row, read.name, tokens[index + 1 :])
             return
         if token == "-p":
             index += 1
+            has_property = True
             if index >= len(tokens) or not _PROPERTY_RE.fullmatch(tokens[index]):
                 raise _fail(row, f"bus read {read.name!r}: -p takes exactly one property token")
             _check_property_names(row, read.name, tokens[index])
         elif not _is_bare_option(token):
             raise _fail(row, f"bus read {read.name!r}: option {token!r} is not in the grammar")
         elif token.startswith(_PROPERTY_OPTION_PREFIX):
+            has_property = True
             _check_property_names(row, read.name, token[len(_PROPERTY_OPTION_PREFIX) :])
         index += 1
+    _require_show_property(row, read.name, argv[2], has_property)
+    if argv[2] == "show":
+        raise _fail(row, f"bus read {read.name!r}: show needs '--' followed by unit tokens")
+
+
+def _require_show_property(row: str, name: str, verb: str, has_property: bool) -> None:
+    """B9-R1: an unbounded ``show`` would dump ``Environment=`` and the credential properties."""
+    if verb == "show" and not has_property:
+        raise _fail(row, f"bus read {name!r}: show needs a -p/--property list")
 
 
 def _check_property_names(row: str, name: str, value: str) -> None:
@@ -408,6 +423,12 @@ def _check_bus(row: BwrapRow) -> None:
         raise _fail(row.name, "bus_snapshot_bind must be one of the binds, under cache/")
     if type(budget) is not int or not low <= budget <= high:
         raise _fail(row.name, f"bus_snapshot_budget_s must be an int in [{low}, {high}]")
+    needed = BUS_BUDGET_BASE_S + BUS_BUDGET_PER_READ_S * len(row.bus_reads)
+    if budget < needed:
+        raise _fail(
+            row.name,
+            f"bus_snapshot_budget_s {budget} is below {needed} for {len(row.bus_reads)} reads",
+        )
 
 
 def _check_residual(

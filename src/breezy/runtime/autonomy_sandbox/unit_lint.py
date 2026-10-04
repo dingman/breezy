@@ -54,6 +54,7 @@ AUTONOMY_PREFIX: Final = "breezy-autonomy-"
 STUDY_FAILED_NOTIFIER: Final = "breezy-study-failed@"
 BUS_SNAPSHOT_KILL_AFTER_S: Final = 2
 BUS_SNAPSHOT_OUTER_MARGIN_S: Final = 3
+BUS_TIMEOUT_START_SLACK_S: Final = 10
 _SERVICE: Final = ".service"
 _TEMPLATE_SUFFIX: Final = "@.service"
 _EXEC_PREFIX_CHARS: Final = "@-:+!|"
@@ -490,7 +491,25 @@ def _lint_full(
     errors += _check_row_directives(unit, file, own_rows)
     start_s = _timeout_start_s_checked(file, unit, errors)
     errors += _check_pre_lines(unit, file.values("Service", "ExecStartPre"), own_rows, start_s)
+    errors += _check_bus_start_timeout(unit, own_rows, start_s)
     return errors
+
+
+def _check_bus_start_timeout(
+    unit: str, rows: Sequence[BwrapRow], start_s: float | None
+) -> list[LintError]:
+    """B9-R3: a bus row's ``TimeoutStartSec`` must be at least ``budget_s + 10``."""
+    if start_s is None:
+        return []
+    return [
+        _err(
+            unit,
+            "pre_bound",
+            f"TimeoutStartSec {start_s:g} s is below bus budget {row.bus_snapshot_budget_s} + 10",
+        )
+        for row in rows
+        if row.bus_reads and start_s < (row.bus_snapshot_budget_s or 0) + BUS_TIMEOUT_START_SLACK_S
+    ]
 
 
 def _timeout_start_s_checked(file: UnitFile, unit: str, errors: list[LintError]) -> float | None:

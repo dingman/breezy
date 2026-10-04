@@ -41,14 +41,18 @@ STDOUT = b"Id=breezy-autonomy-selftest.service\nActiveState=active\n"
 class _StubProc:
     """What ``Popen(...)`` returns for the unsandboxed writer: one canned systemctl answer."""
 
-    pid = 1
+    pid = 4242
     returncode = 0
 
     def __init__(self, argv: list[str], **kwargs: Any) -> None:
         self.args = argv
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, STDOUT)
+        os.close(write_fd)
+        self.stdout = os.fdopen(read_fd, "rb")
 
-    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
-        return STDOUT, b""
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
 
 
 @pytest.fixture

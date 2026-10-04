@@ -38,7 +38,8 @@ SHARED_WRITE_MODULES: Final[tuple[str, ...]] = ("self_probe", "bus_handoff")
 #: the subdir positive's create and unlink inside an existing ``.bwrap_probe/``. The bus
 #: handoff's sites: the ``.bus_snapshot`` ``mkdirat``, the ``O_EXCL`` snapshot create (open,
 #: write, fsync and the unlink of a partial file), the sweep unlink, the in-sandbox
-#: read-and-unlink, and the process-group kill of a hung read. Its ``Popen`` is an injected
+#: read-and-unlink, the process-group kill of a hung read (with its own-group guard) and the
+#: read-deadline exception. Its ``Popen`` is an injected
 #: parameter (default ``subprocess.Popen``), so a call-site scan cannot see it; its argv set is
 #: pinned by ``table.validate_bus_read`` at table build and again at spawn.
 SHARED_WRITE_SITES: Final[frozenset[WriteSite]] = frozenset(
@@ -54,6 +55,8 @@ SHARED_WRITE_SITES: Final[frozenset[WriteSite]] = frozenset(
         WriteSite("bus_handoff", "_sweep", "os.unlink"),
         WriteSite("bus_handoff", "_consume", "os.unlink"),
         WriteSite("bus_handoff", "_kill_group", "os.killpg"),
+        WriteSite("bus_handoff", "_kill_group", "os.getpgrp"),
+        WriteSite("bus_handoff", "_read_stdout", "subprocess.TimeoutExpired"),
     }
 )
 

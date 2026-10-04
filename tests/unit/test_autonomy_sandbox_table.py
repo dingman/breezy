@@ -200,7 +200,6 @@ def test_no_bus_action_or_user_bus_surface() -> None:
         (SYSTEMCTL, "--user", "show", "-p", "Id,ActiveState", "--", "breezy-x.service"),
         (SYSTEMCTL, "--user", "show", "--property=Id,Result", "--", "breezy-x@y_z.service"),
         (SYSTEMCTL, "--user", "show", "-p", "Id", "--value", "--", "{instance}"),
-        (SYSTEMCTL, "--user", "show", "--", "breezy-*"),
         (SYSTEMCTL, "--user", "list-units", "--failed", "--all", "--plain", "--no-legend"),
         (SYSTEMCTL, "--user", "list-units", "--state=failed", "--type=service", "--no-pager"),
         (SYSTEMCTL, "--user", "list-timers", "--all", "--", "breezy-*.timer"),
@@ -209,6 +208,46 @@ def test_no_bus_action_or_user_bus_surface() -> None:
 )
 def test_bus_read_valid_grammar_accepted(argv: tuple[str, ...]) -> None:
     validate_table(_table(_with(bus_reads=(BusRead("r", argv),))))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ("--", "breezy-*"),
+        ("--", "breezy-x.service"),
+        ("--value", "--", "breezy-x.service"),
+        ("--all", "--plain", "--", "breezy-x.service"),
+        ("-p", "Id"),
+        ("--property=Id",),
+        ("-p", "Id", "--value"),
+        (),
+    ],
+    ids=[
+        "glob",
+        "unit",
+        "value-only",
+        "bare-options",
+        "p-no-units",
+        "prop-no-units",
+        "p-value",
+        "bare",
+    ],
+)
+def test_show_requires_a_property_and_double_dash_units(tail: tuple[str, ...]) -> None:
+    """B9-R1: an unbounded ``show`` would dump ``Environment=`` and the credentials."""
+    _invalid(_with(bus_reads=(_read(*tail),)), match="show")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ("-p", "Id", "--", "breezy-x.service"),
+        ("--property=Id,Result", "--", "breezy-x.service"),
+        ("--value", "-p", "Id", "--", "breezy-x.service"),
+    ],
+)
+def test_show_with_a_property_and_units_is_accepted(tail: tuple[str, ...]) -> None:
+    validate_table(_table(_with(bus_reads=(_read(*tail),))))
 
 
 @pytest.mark.parametrize(
@@ -310,14 +349,38 @@ def test_bus_snapshot_bind_absent_when_no_reads() -> None:
     _invalid(_plain(bus_snapshot_budget_s=10))
 
 
-@pytest.mark.parametrize("budget", [0, -1, 26, 100, None, True, "10", 10.0])
+@pytest.mark.parametrize("budget", [0, -1, 1, 2, 3, 4, 26, 100, None, True, "10", 10.0])
 def test_bus_snapshot_budget_range_and_required_with_reads(budget: Any) -> None:
     _invalid(_with(bus_snapshot_budget_s=budget))
 
 
-@pytest.mark.parametrize("budget", [1, 10, 25])
+@pytest.mark.parametrize("budget", [5, 10, 25])
 def test_bus_snapshot_budget_bounds_accepted(budget: int) -> None:
+    """B9-R5: the floor is 5 s (a budget of 1 s would skip every read)."""
     validate_table(_table(_with(bus_snapshot_budget_s=budget)))
+
+
+def _reads(count: int) -> tuple[BusRead, ...]:
+    return tuple(
+        BusRead(f"r{i}", (SYSTEMCTL, "--user", "show", "-p", "Id", "--", "breezy-x.service"))
+        for i in range(count)
+    )
+
+
+@pytest.mark.parametrize(
+    ("count", "budget"),
+    [(1, 5), (2, 5), (3, 7), (4, 8), (4, 25), (10, 17), (10, 25)],
+)
+def test_budget_covers_two_seconds_plus_one_and_a_half_per_read(count: int, budget: int) -> None:
+    validate_table(_table(_with(bus_reads=_reads(count), bus_snapshot_budget_s=budget)))
+
+
+@pytest.mark.parametrize(
+    ("count", "budget"),
+    [(3, 5), (3, 6), (4, 7), (5, 9), (10, 16), (15, 24), (16, 25)],
+)
+def test_budget_below_two_plus_one_and_a_half_per_read_is_refused(count: int, budget: int) -> None:
+    _invalid(_with(bus_reads=_reads(count), bus_snapshot_budget_s=budget), match="budget")
 
 
 # ------------------------------------------------------------------ credential_env

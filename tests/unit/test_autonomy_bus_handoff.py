@@ -15,11 +15,12 @@ import fcntl
 import inspect
 import json
 import os
+import select
 import signal
 import stat
 import subprocess
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -27,8 +28,10 @@ from typing import Any
 import pytest
 
 from breezy.runtime.autonomy_sandbox import bus_handoff, bwrap
+from breezy.runtime.autonomy_sandbox.binds import forbidden_dirs
 from breezy.runtime.autonomy_sandbox.bus_handoff import (
     BUS_ENV_PATH,
+    BusSnapshot,
     BusSnapshotError,
     read_bus_snapshot,
     write_bus_snapshot,
@@ -81,40 +84,74 @@ def _env(**extra: str) -> dict[str, str]:
     return {"INVOCATION_ID": INVOCATION, **extra}
 
 
+class Sim:
+    """Simulated waiting: with a fake clock, a ``select`` that finds nothing advances it."""
+
+    def __init__(self) -> None:
+        self.clock: Clock | None = None
+        self.select_timeouts: list[float | None] = []
+        self.procs: list[FakeProc] = []
+
+
+SIM = Sim()
+_REAL_SELECT = select.select
+
+
+def _fake_select(
+    rlist: list[Any], wlist: list[Any], xlist: list[Any], timeout: float | None = None
+) -> tuple[list[Any], list[Any], list[Any]]:
+    SIM.select_timeouts.append(timeout)
+    ready = _REAL_SELECT(rlist, wlist, xlist, 0)
+    if ready[0]:
+        return ready
+    if SIM.clock is None:
+        return _REAL_SELECT(rlist, wlist, xlist, timeout)
+    assert timeout is not None
+    SIM.clock.advance(timeout)
+    return ([], [], [])
+
+
+@pytest.fixture(autouse=True)
+def _simulated_waiting(monkeypatch: pytest.MonkeyPatch) -> Iterator[Sim]:
+    SIM.clock, SIM.select_timeouts, SIM.procs = None, [], []
+    monkeypatch.setattr(select, "select", _fake_select)
+    yield SIM
+    for proc in SIM.procs:
+        proc.close()
+    SIM.clock = None
+
+
 class FakeProc:
-    """A ``Popen`` stand-in: ``communicate`` answers per the scripted outcome."""
+    """A ``Popen`` stand-in with a real pipe: ``done`` is at EOF, ``hang`` never writes."""
 
     def __init__(
         self,
         argv: list[str],
         kwargs: dict[str, Any],
         outcome: tuple[Any, ...],
-        clock: Clock,
     ) -> None:
-        self.args, self.kwargs, self.outcome, self.clock = argv, kwargs, outcome, clock
+        self.args, self.kwargs, self.outcome = argv, kwargs, outcome
         self.pid = 4242
         self.returncode: int | None = None
-        self.stdout = None
-        self.timeouts: list[float | None] = []
-
-    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
-        self.timeouts.append(timeout)
-        kind = self.outcome[0]
-        if kind == "hang" and len(self.timeouts) == 1:
-            assert timeout is not None
-            self.clock.advance(timeout)
-            raise subprocess.TimeoutExpired(self.args, timeout)
-        if kind == "hang":
-            self.returncode = -9
-            return b"", b""
-        self.returncode = self.outcome[1]
-        return self.outcome[2], b""
-
-    def kill(self) -> None:  # pragma: no cover - must not be used; the group is killed
-        raise AssertionError("kill the process group, not the pid")
+        self.waits: list[float | None] = []
+        read_fd, write_fd = os.pipe()
+        self._write_fd: int | None = write_fd
+        if outcome[0] == "done":
+            os.write(write_fd, outcome[2])
+            os.close(write_fd)
+            self._write_fd = None
+        self.stdout = os.fdopen(read_fd, "rb")
 
     def wait(self, timeout: float | None = None) -> int:
-        return self.returncode or 0
+        self.waits.append(timeout)
+        self.returncode = self.outcome[1] if self.outcome[0] == "done" else -9
+        return self.returncode
+
+    def close(self) -> None:
+        if self._write_fd is not None:
+            os.close(self._write_fd)
+            self._write_fd = None
+        self.stdout.close()
 
 
 class Clock:
@@ -140,8 +177,10 @@ class Runner:
     def __call__(self, argv: list[str], **kwargs: Any) -> FakeProc:
         self.calls.append((list(argv), kwargs))
         index = min(len(self.calls) - 1, len(self.outcomes) - 1)
-        proc = FakeProc(list(argv), kwargs, self.outcomes[index], self.clock)
+        proc = FakeProc(list(argv), kwargs, self.outcomes[index])
         self.procs.append(proc)
+        SIM.procs.append(proc)
+        SIM.clock = self.clock
         return proc
 
 
@@ -157,7 +196,8 @@ def _row(*reads: BusRead, budget: int = 10) -> BwrapRow:
 
 
 def _read(name: str, *tail: str) -> BusRead:
-    return BusRead(name, (SYSTEMCTL, "--user", "show", "-p", "Id", *tail))
+    units = tail or ("--", "breezy-x.service")
+    return BusRead(name, (SYSTEMCTL, "--user", "show", "-p", "Id", *units))
 
 
 def _write(
@@ -221,20 +261,33 @@ def test_write_records_every_read_and_returns_zero(world: SandboxRoots) -> None:
     assert stat.S_IMODE(os.lstat(_snap(world)).st_mode) == 0o700
 
 
-def test_write_oversize_stdout_is_recorded_empty(world: SandboxRoots) -> None:
-    clock = Clock()
-    big = b"x" * (4 * 1024 * 1024 + 1)
-    assert _write(world, runner=Runner(clock, ("done", 0, big)), clock=clock) == 0
+def _head(size: int) -> Callable[..., Any]:
+    def spawn(argv: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(["/usr/bin/head", "-c", str(size), "/dev/zero"], **kwargs)
+
+    return spawn
+
+
+def test_write_oversize_stdout_is_recorded_empty_and_the_group_killed(
+    world: SandboxRoots,
+) -> None:
+    began = time.monotonic()
+    assert _write(world, runner=_head(40 * 1024 * 1024), clock=time.monotonic) == 0
+    assert time.monotonic() - began < 8  # cut off at the cap, not read to the end
+    (read,) = _written(world)["reads"]
+    assert read["oversize"] is True and read["stdout"] == ""
+
+
+def test_write_one_byte_over_the_limit_is_oversize(world: SandboxRoots) -> None:
+    assert _write(world, runner=_head(4 * 1024 * 1024 + 1), clock=time.monotonic) == 0
     (read,) = _written(world)["reads"]
     assert read["oversize"] is True and read["stdout"] == ""
 
 
 def test_write_exact_limit_stdout_is_kept(world: SandboxRoots) -> None:
-    clock = Clock()
-    edge = b"y" * (4 * 1024 * 1024)
-    assert _write(world, runner=Runner(clock, ("done", 0, edge)), clock=clock) == 0
+    assert _write(world, runner=_head(4 * 1024 * 1024), clock=time.monotonic) == 0
     (read,) = _written(world)["reads"]
-    assert read["oversize"] is False and len(read["stdout"]) == len(edge)
+    assert read["oversize"] is False and len(read["stdout"]) == 4 * 1024 * 1024
 
 
 def test_write_failed_read_is_recorded_and_exit_stays_zero(world: SandboxRoots) -> None:
@@ -299,7 +352,8 @@ def test_bus_snapshot_each_read_gets_at_most_ten_seconds_and_a_second_of_margin(
     clock = Clock()
     runner = Runner(clock, ("done", 0, b""))
     assert _write(world, _row(_read("a"), budget=25), runner=runner, clock=clock) == 0
-    assert runner.procs[0].timeouts == [10.0]
+    assert SIM.select_timeouts[0] == 10.0
+    SIM.select_timeouts.clear()
     clock2 = Clock()
     runner2 = Runner(clock2, ("done", 0, b""))
     assert (
@@ -312,7 +366,7 @@ def test_bus_snapshot_each_read_gets_at_most_ten_seconds_and_a_second_of_margin(
         )
         == 0
     )
-    assert runner2.procs[0].timeouts == [4.0]
+    assert SIM.select_timeouts[0] == 4.0
 
 
 def test_bus_snapshot_read_with_under_half_a_second_left_is_skipped(world: SandboxRoots) -> None:
@@ -330,7 +384,8 @@ def test_bus_snapshot_hung_read_kills_process_group(
     runner = Runner(clock, ("hang",))
     assert _write(world, _row(_read("a"), budget=5), runner=runner, clock=clock) == 0
     assert killpg == [(4242, signal.SIGKILL)]
-    assert runner.procs[0].timeouts == [4.0, 1.0]  # the read, then a 1 s drain
+    assert SIM.select_timeouts == [4.0]  # the read; then a 1 s drain of the killed leader
+    assert runner.procs[0].waits == [1.0]
     (read,) = _written(world)["reads"]
     assert read["timed_out"] is True
 
@@ -816,7 +871,7 @@ def _doc(**changes: Any) -> dict[str, Any]:
         "schema": "bus_snapshot/v1",
         "invocation_id": INVOCATION,
         "unit": UNIT,
-        "ts_ns": 1,
+        "ts_ns": time.time_ns(),
         "budget_s": 10,
         "reads": [
             {
@@ -1022,3 +1077,254 @@ def test_snapshot_directory_and_names_are_the_planned_constants() -> None:
     assert bus_handoff.MAX_STDOUT_BYTES == 4 * 1024 * 1024
     assert bus_handoff.BUS_READ_TIMEOUT_S == 10
     assert bus_handoff.SWEEP_AGE_S == 24 * 3600
+
+
+# ------------------------------------------------------------------ B9 rulings
+
+
+def test_bus_snapshot_deadline_clock_starts_at_entry_to_write(
+    world: SandboxRoots, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B9-R3: time spent opening the bind and directory is charged to the budget."""
+    clock = Clock()
+    real = forbidden_dirs
+
+    def slow_setup(roots: SandboxRoots) -> Any:
+        clock.advance(8.0)  # a slow bind walk / directory check
+        return real(roots)
+
+    monkeypatch.setattr(bus_handoff, "forbidden_dirs", slow_setup)
+    runner = Runner(clock, ("done", 0, b""))
+    assert _write(world, _row(_read("a"), budget=10), runner=runner, clock=clock) == 0
+    assert SIM.select_timeouts[0] == 1.0  # 10 - 8 - 1 margin, not 9
+
+
+def _ts_doc(world: SandboxRoots, ts_ns: int) -> Path:
+    return _plant(world, _doc(ts_ns=ts_ns))
+
+
+def _read_at(world: SandboxRoots, now_ns: int) -> BusSnapshot:
+    return read_bus_snapshot(ROW, environ=_env(), roots=world, now_ns=lambda: now_ns)
+
+
+NOW_NS = 1_700_000_000 * 1_000_000_000
+SEC = 1_000_000_000
+
+
+@pytest.mark.parametrize(
+    "ts_ns",
+    [
+        NOW_NS - (10 + 60) * SEC - 1,
+        NOW_NS - 3600 * SEC,
+        NOW_NS + 5 * SEC + 1,
+        NOW_NS + 3600 * SEC,
+        0,
+        -1,
+    ],
+    ids=["just-too-old", "hour-old", "just-future", "hour-future", "zero", "negative"],
+)
+def test_read_bus_snapshot_ts_outside_bounds_is_stale_and_consumed(
+    world: SandboxRoots, ts_ns: int
+) -> None:
+    path = _ts_doc(world, ts_ns)
+    with pytest.raises(BusSnapshotError) as info:
+        _read_at(world, NOW_NS)
+    assert info.value.code == "bus_snapshot_stale"
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "ts_ns",
+    [NOW_NS - (10 + 60) * SEC, NOW_NS - SEC, NOW_NS, NOW_NS + 5 * SEC],
+    ids=["oldest", "past", "now", "newest"],
+)
+def test_read_bus_snapshot_ts_inside_bounds_is_accepted(world: SandboxRoots, ts_ns: int) -> None:
+    _ts_doc(world, ts_ns)
+    assert _read_at(world, NOW_NS).ts_ns == ts_ns
+
+
+def test_read_bus_snapshot_ts_window_uses_the_rows_budget_not_the_documents(
+    world: SandboxRoots,
+) -> None:
+    _plant(world, _doc(ts_ns=NOW_NS - 3600 * SEC, budget_s=10_000))
+    with pytest.raises(BusSnapshotError) as info:
+        _read_at(world, NOW_NS)
+    assert info.value.code == "bus_snapshot_stale"
+
+
+def test_read_bus_snapshot_fifo_is_missing_and_never_blocks(world: SandboxRoots) -> None:
+    snap = _snap(world)
+    snap.mkdir(mode=0o700)
+    fifo = snap / f"{INVOCATION}.json"
+    os.mkfifo(fifo)
+    with pytest.raises(BusSnapshotError) as info:
+        read_bus_snapshot(ROW, environ=_env(), roots=world)
+    assert info.value.code == "bus_snapshot_missing"
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+
+def test_read_bus_snapshot_document_cap_is_exact_and_read_in_chunks(
+    world: SandboxRoots, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc = json.dumps(_doc())
+    size = len(doc.encode())
+    monkeypatch.setattr(bus_handoff, "_READ_CHUNK", 64)  # many chunks, same answer
+    monkeypatch.setattr(bus_handoff, "MAX_DOCUMENT_BYTES", size)
+    _plant(world, doc)
+    assert read_bus_snapshot(ROW, environ=_env(), roots=world).invocation_id == INVOCATION
+    monkeypatch.setattr(bus_handoff, "MAX_DOCUMENT_BYTES", size - 1)
+    path = _plant(world, doc)
+    with pytest.raises(BusSnapshotError) as info:
+        read_bus_snapshot(ROW, environ=_env(), roots=world)
+    assert info.value.code == "bus_snapshot_stale"
+    assert path.exists()  # refused before it was consumed: the cap stops the read
+
+
+def _read_with(**changes: Any) -> dict[str, Any]:
+    read = dict(_doc()["reads"][0])
+    read.update(changes)
+    return read
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _read_with(rc=True),
+        _read_with(rc="0"),
+        _read_with(rc=0.0),
+        _read_with(argv=[1, 2]),
+        _read_with(argv="systemctl"),
+        _read_with(argv=["ok", None]),
+        _read_with(timed_out=1),
+        _read_with(skipped="no"),
+        _read_with(oversize=None),
+        _read_with(stdout=5),
+        _read_with(name=7),
+        _read_with(extra="x"),
+        {k: v for k, v in _read_with().items() if k != "stdout"},
+        [],
+        "self_show",
+    ],
+    ids=[
+        "bool-rc",
+        "str-rc",
+        "float-rc",
+        "int-argv",
+        "str-argv",
+        "none-in-argv",
+        "int-flag",
+        "str-flag",
+        "none-flag",
+        "int-stdout",
+        "int-name",
+        "extra-key",
+        "missing-key",
+        "list-read",
+        "str-read",
+    ],
+)
+def test_read_bus_snapshot_parse_read_is_type_strict(world: SandboxRoots, raw: Any) -> None:
+    _plant(world, _doc(reads=[raw]))
+    with pytest.raises(BusSnapshotError) as info:
+        read_bus_snapshot(ROW, environ=_env(), roots=world)
+    assert info.value.code == "bus_snapshot_stale"
+
+
+@pytest.mark.parametrize("field", ["ts_ns", "budget_s"])
+def test_read_bus_snapshot_bool_or_float_numbers_are_stale(world: SandboxRoots, field: str) -> None:
+    for bad in (True, 1.5, "1"):
+        _plant(world, _doc(**{field: bad}))
+        with pytest.raises(BusSnapshotError) as info:
+            read_bus_snapshot(ROW, environ=_env(), roots=world)
+        assert info.value.code == "bus_snapshot_stale"
+
+
+def test_read_bus_snapshot_hardlinked_snapshot_is_consumed_without_touching_the_other_link(
+    world: SandboxRoots, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(_doc()))
+    snap = _snap(world)
+    snap.mkdir(mode=0o700)
+    os.link(outside, snap / f"{INVOCATION}.json")
+    assert read_bus_snapshot(ROW, environ=_env(), roots=world).invocation_id == INVOCATION
+    assert not (snap / f"{INVOCATION}.json").exists()
+    assert json.loads(outside.read_text())["invocation_id"] == INVOCATION  # intact
+
+
+def test_bus_snapshot_sweep_unlinks_a_hardlinked_entry_without_touching_the_other_link(
+    world: SandboxRoots, tmp_path: Path
+) -> None:
+    outside = tmp_path / "precious.txt"
+    outside.write_text("precious")
+    snap = _snap(world)
+    snap.mkdir(mode=0o700)
+    linked = snap / _hex_name("a")
+    os.link(outside, linked)
+    _age(outside, OLD_AGE_S)
+    assert _write(world) == 0
+    assert not linked.exists()
+    assert outside.read_text() == "precious" and os.stat(outside).st_nlink == 1
+
+
+def test_bus_snapshot_sweep_counts_skips_and_emits_one_reason_code(
+    world: SandboxRoots, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B9-R6: skipped sweep entries are counted and reported once; the exit stays 0."""
+    snap = _snap(world)
+    snap.mkdir(mode=0o700)
+    stuck = [snap / _hex_name("a"), snap / _hex_name("b")]
+    for path in stuck:
+        path.write_text("x")
+        _age(path, OLD_AGE_S)
+    real_unlink = os.unlink
+
+    def refuse(path: Any, *args: Any, **kwargs: Any) -> None:
+        if str(path) in {p.name for p in stuck}:
+            raise PermissionError(errno.EACCES, "no")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    assert _write(world) == 0
+    err = capsys.readouterr().err
+    assert err.count("sweep_skipped=") == 1 and "sweep_skipped=2" in err
+    assert "/" not in err.replace("breezy-autonomy-bwrap", "")
+    assert (snap / f"{INVOCATION}.json").is_file()
+
+
+def test_bus_snapshot_clean_sweep_is_silent(
+    world: SandboxRoots, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _write(world) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("pid", [0, 1, -1, -4242, "own-group"], ids=str)
+def test_kill_group_refuses_pid_le_1_and_our_own_group(
+    pid: Any, killpg: list[tuple[int, int]]
+) -> None:
+    bus_handoff._kill_group(os.getpgrp() if pid == "own-group" else pid)
+    assert killpg == []
+
+
+def test_kill_group_kills_an_ordinary_group(killpg: list[tuple[int, int]]) -> None:
+    bus_handoff._kill_group(4242)
+    assert killpg == [(4242, signal.SIGKILL)]
+
+
+def test_writer_caps_the_total_document_size(
+    world: SandboxRoots, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bus_handoff, "MAX_DOCUMENT_BYTES", 2000)
+    clock = Clock()
+    big = b"z" * 1500
+    row = _row(_read("a"), _read("b"), budget=20)
+    assert _write(world, row, runner=Runner(clock, ("done", 0, big)), clock=clock) == 0
+    path = _snap(world) / f"{INVOCATION}.json"
+    assert path.stat().st_size <= 2000
+    reads = _written(world)["reads"]
+    assert all(r["oversize"] is True and r["stdout"] == "" for r in reads)
+    assert [r.name for r in read_bus_snapshot(row, environ=_env(), roots=world).reads] == [
+        "a",
+        "b",
+    ]

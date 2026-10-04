@@ -30,6 +30,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -84,6 +85,11 @@ _PRIVATE_FILE_MODE: Final = 0o600
 _GROUP_OTHER_BITS: Final = 0o077
 _CREATE_FLAGS: Final = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _READ_CHUNK: Final = 1 << 20
+_STDOUT_CHUNK: Final = 1 << 16
+_TS_PAST_SLACK_S: Final = 60
+_TS_FUTURE_SLACK_S: Final = 5
+_NS_PER_S: Final = 1_000_000_000
+_MIN_WAIT_S: Final = 0.1
 _READ_KEYS: Final = frozenset({"name", "argv", "rc", "timed_out", "skipped", "oversize", "stdout"})
 
 Popen = Callable[..., Any]
@@ -219,6 +225,8 @@ def _open_snapshot_dir(bind: OpenedBind, roots: SandboxRoots) -> int:
 
 
 def _kill_group(pid: int) -> None:
+    if pid <= 1 or pid == os.getpgrp():
+        return  # never signal init, "every process" (<= 0) or our own group (B9-R6)
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -226,22 +234,61 @@ def _kill_group(pid: int) -> None:
 
 
 def _drain(proc: Any) -> None:
-    """Reap the killed group's leader and empty its pipe, for at most ``DRAIN_TIMEOUT_S``."""
+    """Reap the killed group's leader, for at most ``DRAIN_TIMEOUT_S``."""
     try:
-        proc.communicate(timeout=DRAIN_TIMEOUT_S)
+        proc.wait(timeout=DRAIN_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         pass  # the group is SIGKILLed; the pipe is closed by the caller either way
 
 
 def _result(
-    read: BusRead, rc: int, stdout: bytes, *, timed_out: bool = False, skipped: bool = False
+    read: BusRead,
+    rc: int,
+    stdout: bytes,
+    *,
+    timed_out: bool = False,
+    skipped: bool = False,
+    oversize: bool = False,
 ) -> BusReadResult:
-    oversize = len(stdout) > MAX_STDOUT_BYTES
     text = "" if oversize else stdout.decode("utf-8", errors="replace")
     return BusReadResult(read.name, read.argv, rc, timed_out, skipped, oversize, text)
 
 
-def _one_read(read: BusRead, allowance: float, popen: Popen, env: dict[str, str]) -> BusReadResult:
+def _read_stdout(proc: Any, deadline: float, clock: Callable[[], float]) -> tuple[bytes, bool]:
+    """Read ``proc.stdout`` to EOF in chunks; ``(data, oversize)``, cut off past the cap.
+
+    Raises ``subprocess.TimeoutExpired`` when ``deadline`` passes first.
+    """
+    fd = proc.stdout.fileno()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(proc.args, 0)
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise subprocess.TimeoutExpired(proc.args, remaining)
+        chunk = os.read(fd, _STDOUT_CHUNK)
+        if not chunk:
+            return b"".join(chunks), False
+        total += len(chunk)
+        if total > MAX_STDOUT_BYTES:
+            return b"", True
+        chunks.append(chunk)
+
+
+def _killed_rc(proc: Any) -> int:
+    return proc.returncode if isinstance(proc.returncode, int) else -signal.SIGKILL
+
+
+def _one_read(
+    read: BusRead,
+    allowance: float,
+    popen: Popen,
+    env: dict[str, str],
+    clock: Callable[[], float],
+) -> BusReadResult:
     try:
         proc = popen(
             list(read.argv),
@@ -254,24 +301,32 @@ def _one_read(read: BusRead, allowance: float, popen: Popen, env: dict[str, str]
         )
     except OSError:
         return _result(read, SPAWN_FAILED_RC, b"")
+    deadline = clock() + allowance
     try:
         try:
-            out, _ = proc.communicate(timeout=allowance)
+            out, oversize = _read_stdout(proc, deadline, clock)
+            if oversize:
+                _kill_group(proc.pid)
+                _drain(proc)
+                return _result(read, _killed_rc(proc), b"", oversize=True)
+            rc = proc.wait(timeout=max(deadline - clock(), _MIN_WAIT_S))
         except subprocess.TimeoutExpired:
             _kill_group(proc.pid)
             _drain(proc)
-            rc = proc.returncode if isinstance(proc.returncode, int) else -signal.SIGKILL
-            return _result(read, rc, b"", timed_out=True)
-        return _result(read, proc.returncode, bytes(out or b""))
+            return _result(read, _killed_rc(proc), b"", timed_out=True)
+        return _result(read, rc, out)
     finally:
         if getattr(proc, "stdout", None) is not None:
             proc.stdout.close()
 
 
 def _run_reads(
-    reads: tuple[BusRead, ...], budget: int, popen: Popen, clock: Callable[[], float], uid: int
+    reads: tuple[BusRead, ...],
+    deadline: float,
+    popen: Popen,
+    clock: Callable[[], float],
+    uid: int,
 ) -> list[BusReadResult]:
-    deadline = clock() + budget
     env = bus_env(uid)
     results: list[BusReadResult] = []
     for read in reads:
@@ -279,7 +334,7 @@ def _run_reads(
         if allowance < MIN_READ_S:
             results.append(_result(read, SKIPPED_RC, b"", skipped=True))
         else:
-            results.append(_one_read(read, allowance, popen, env))
+            results.append(_one_read(read, allowance, popen, env, clock))
     return results
 
 
@@ -303,7 +358,14 @@ def _document(invocation: str, unit: str, budget: int, results: list[BusReadResu
             for r in results
         ],
     }
-    return json.dumps(doc, sort_keys=True).encode("utf-8")
+    data = json.dumps(doc, sort_keys=True).encode("utf-8")
+    if len(data) <= MAX_DOCUMENT_BYTES:
+        return data
+    # Too large for the reader's cap: keep every read's status, drop every stdout (B9-R6).
+    blanked = [
+        BusReadResult(r.name, r.argv, r.rc, r.timed_out, r.skipped, True, "") for r in results
+    ]
+    return _document(invocation, unit, budget, blanked)
 
 
 def _create_snapshot(dir_fd: int, invocation: str, data: bytes) -> None:
@@ -336,6 +398,7 @@ def _sweep(dir_fd: int, wall: Callable[[], float]) -> None:
     cutoff = wall() - SWEEP_AGE_S
     with os.scandir(dir_fd) as entries:
         names = [entry.name for entry in entries]
+    skipped = 0
     for name in names:
         if not _SNAPSHOT_NAME_RE.fullmatch(name):
             continue
@@ -344,7 +407,9 @@ def _sweep(dir_fd: int, wall: Callable[[], float]) -> None:
             if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
                 os.unlink(name, dir_fd=dir_fd)
         except OSError:
-            continue  # raced with another remover, or not ours to delete: leave it
+            skipped += 1  # raced with another remover, or not ours to delete: leave it
+    if skipped:
+        sys.stderr.write(f"{_PROGRAM}: sweep_skipped={skipped}\n")
 
 
 def _write(
@@ -357,13 +422,14 @@ def _write(
     clock: Callable[[], float],
     wall: Callable[[], float],
 ) -> None:
+    deadline_base = clock()  # B9-R3: the budget covers setup too, not just the reads
     invocation = _invocation_id(environ)
     bind_rel, budget, reads = _snapshot_plan(row, unit)
     with open_validated_binds(row, roots, only=bind_rel) as opened:
         (bind,) = opened.binds
         dir_fd = _open_snapshot_dir(bind, roots)
         try:
-            results = _run_reads(reads, budget, popen, clock, roots.uid)
+            results = _run_reads(reads, deadline_base + budget, popen, clock, roots.uid)
             _create_snapshot(dir_fd, invocation, _document(invocation, unit, budget, results))
             _sweep(dir_fd, wall)
         finally:
@@ -474,7 +540,13 @@ def _parse_read(raw: object) -> BusReadResult:
     return BusReadResult(raw["name"], tuple(argv), raw["rc"], *flags, stdout)
 
 
-def _parse(data: bytes, row: BwrapRow, invocation: str) -> BusSnapshot:
+def _ts_in_bounds(ts_ns: int, row: BwrapRow, now_ns: int) -> bool:
+    """B9-R2: ``[now - (budget + 60 s), now + 5 s]``, the budget being the row's own."""
+    window_s = (row.bus_snapshot_budget_s or 0) + _TS_PAST_SLACK_S
+    return now_ns - window_s * _NS_PER_S <= ts_ns <= now_ns + _TS_FUTURE_SLACK_S * _NS_PER_S
+
+
+def _parse(data: bytes, row: BwrapRow, invocation: str, now_ns: int) -> BusSnapshot:
     try:
         doc = json.loads(data)
     except ValueError:
@@ -491,6 +563,8 @@ def _parse(data: bytes, row: BwrapRow, invocation: str) -> BusSnapshot:
         or not isinstance(reads, list)
     ):
         raise BusSnapshotError(STALE)
+    if not _ts_in_bounds(doc["ts_ns"], row, now_ns):
+        raise BusSnapshotError(STALE)
     parsed = tuple(_parse_read(raw) for raw in reads)
     if [r.name for r in parsed] != [read.name for read in row.bus_reads]:
         raise BusSnapshotError(STALE)
@@ -502,6 +576,7 @@ def read_bus_snapshot(
     *,
     environ: Mapping[str, str],
     roots: SandboxRoots | None = None,
+    now_ns: Callable[[], int] = time.time_ns,
 ) -> BusSnapshot:
     """The handed-over snapshot of this invocation, consumed; never an empty snapshot.
 
@@ -526,4 +601,4 @@ def read_bus_snapshot(
         data = _consume(bind.fd, invocation)
     finally:
         os.close(bind.fd)
-    return _parse(data, row, invocation)
+    return _parse(data, row, invocation, now_ns())

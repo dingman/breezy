@@ -633,7 +633,7 @@ def test_execstartpre_bound_below_timeoutstartsec(tmp_path: Path) -> None:
     assert "pre_bound" in _rules(
         _lint(tmp_path / "eq", _selftest_files([INSTALL, SNAPSHOT], timeout="15"))
     )
-    assert _lint(tmp_path / "ok", _selftest_files([INSTALL, SNAPSHOT], timeout="16")) == ()
+    assert _lint(tmp_path / "ok", _selftest_files([INSTALL, SNAPSHOT], timeout="20")) == ()
     assert "pre_bound" in _rules(
         _lint(tmp_path / "five", _selftest_files(two + [SNAPSHOT], timeout="5"))
     )
@@ -644,6 +644,27 @@ def test_execstartpre_bound_below_timeoutstartsec(tmp_path: Path) -> None:
     assert "pre_bound" in _rules(
         _lint(tmp_path / "us", _selftest_files([SNAPSHOT], timeout="15000000us"))
     )
+
+
+@pytest.mark.parametrize(
+    ("timeout", "ok"),
+    [
+        ("19", False),
+        ("19s", False),
+        ("19999ms", False),
+        ("20", True),
+        ("20s", True),
+        ("1min", True),
+    ],
+)
+def test_bus_rows_need_timeoutstartsec_of_budget_plus_ten(
+    tmp_path: Path, timeout: str, ok: bool
+) -> None:
+    """B9-R3: the selftest row's budget is 10 s, so ``TimeoutStartSec`` must be >= 20 s."""
+    errors = _lint(tmp_path, _selftest_files([SNAPSHOT], timeout=timeout))
+    assert (errors == ()) is ok
+    if not ok:
+        assert "pre_bound" in _rules(errors)
 
 
 def test_missing_timeoutstartsec_uses_the_systemd_default(tmp_path: Path) -> None:
