@@ -244,6 +244,7 @@ source_modules = [
     "breezy.persistence.autonomy.chain",
     "breezy.persistence.autonomy.fold",
     "breezy.persistence.autonomy.transitions",
+    "breezy.persistence.autonomy.stage_policy",
     "breezy.persistence.autonomy.demand",
     "breezy.persistence.autonomy.drill_marker",
 ]
@@ -274,6 +275,7 @@ source_modules = [
     "breezy.persistence.autonomy.chain",
     "breezy.persistence.autonomy.fold",
     "breezy.persistence.autonomy.transitions",
+    "breezy.persistence.autonomy.stage_policy",
     "breezy.persistence.autonomy.demand",
     "breezy.persistence.autonomy.drill_marker",
 ]

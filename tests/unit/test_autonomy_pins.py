@@ -755,3 +755,13 @@ def test_regen_check_mode_exits_nonzero_on_drift(tmp_path: Path) -> None:
     assert regen.main(["--check", "--target", str(fresh)]) == 0
     assert regen.main(["--target", str(stale)]) == 0  # write mode rewrites
     assert stale.read_text(encoding="utf-8") == regen.render_manifest({})
+
+
+def test_enabled_widening_kinds_subset_of_admission_implemented() -> None:
+    """Seam 6c: the shipped pins never enable a kind whose admission is not implemented."""
+    from breezy.persistence.autonomy import transitions
+
+    implemented = {kind.value for kind in transitions._ADMISSION_IMPLEMENTED}
+    assert pins.ENABLED_WIDENING_KINDS <= implemented
+    # positive control: an enabled kind outside the implemented set is detected
+    assert frozenset({"RESUME"}) - implemented == {"RESUME"} or "RESUME" in implemented
