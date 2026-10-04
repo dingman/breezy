@@ -3275,6 +3275,11 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     `DurableFillRecord` from `exec.client` to build fixtures for the offline
     walked-VWAP-vs-realised-fill measurement script -- see the row comment
     at the assertion below for the full justification.
+
+    AUT-1 WP0/WP1 part B adds three: the closure and order-cache premise tests
+    and `test_capture_reader.py`. WIDENED, not relaxed, on the same terms: the
+    comparison is still `==`, none carries `SOCKET_RESTORING_MARKERS`, and none
+    opens a socket -- see the row comment at the assertion below.
     """
     # CRH step 8 wiring adds one: `test_current_rung_hold_order_submission_
     # wiring.py` imports `PolymarketUSExecutionClient` to drive the real
@@ -3592,7 +3597,26 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # pytest mark at all -- none of `SOCKET_RESTORING_MARKERS` appears in it
     # -- constructs no client and opens no socket (the exec state store is
     # opened read-only via `fill_time_count._open_readonly`).
+    #
+    # Old -> new (this row, AUT-1 WP0/WP1 part B): added
+    # `tests/unit/test_aut1_wp0_closure_premises.py`,
+    # `tests/unit/test_aut1_wp0_order_cache_premises.py` and
+    # `tests/unit/autonomy/test_capture_reader.py`. WIDENED, not relaxed
+    # (L-6/L-12): the comparison is still `==`, and none of the three carries
+    # any of `SOCKET_RESTORING_MARKERS` (checked with this module's own
+    # `find_exec_test_marker_violations` and `_marker_names`: empty for each).
+    # The closure premises import `exec.submit_chain` for the V-15 static
+    # import-closure walk (they read the module graph, nothing is constructed);
+    # the order-cache premises import `exec.submit_chain.intent_fingerprint`
+    # (V-6) and `exec.client.FILL_BY_FINGERPRINT_KEY_PREFIX` /
+    # `PolymarketUSExecutionClient` for the fill-index day-key derivation
+    # (a pure key function, no client is constructed); `test_capture_reader.py`
+    # imports `intent_fingerprint` only, to compare the reader's recomputed
+    # fingerprint against the real function. None opens a socket.
     assert exec_importing_test_modules() == {
+        "tests/unit/autonomy/test_capture_reader.py",
+        "tests/unit/test_aut1_wp0_closure_premises.py",
+        "tests/unit/test_aut1_wp0_order_cache_premises.py",
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
