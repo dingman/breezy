@@ -292,8 +292,16 @@ def test_an_arbitrary_expression_is_still_flagged_even_at_an_enumerated_site(
     assert _rules(_site_lint(f"reason={expression}")) == {"aut1_reason_constant"}
 
 
-@pytest.mark.parametrize(("module", "scope"), sorted(REASON_COPY_SITES))
-def test_each_enumerated_copy_site_really_holds_the_attribute_read(module: str, scope: str) -> None:
+def test_the_receiver_name_is_pinned_at_each_site() -> None:
+    """WP2-R6 L4. MUTATION: dropping the receiver from the site key admits ``other.reason``."""
+    assert _rules(_site_lint("reason=other.reason")) == {"aut1_reason_constant"}
+    assert _site_lint("reason=outcome.reason") == []
+
+
+@pytest.mark.parametrize(("module", "scope", "receiver"), sorted(REASON_COPY_SITES))
+def test_each_enumerated_copy_site_really_holds_the_attribute_read(
+    module: str, scope: str, receiver: str
+) -> None:
     """Non-vacuous: the site exists in the real file and carries a ``reason=<name>.reason``
     keyword in that function, so a stale row (renamed function) fails here."""
     import ast
@@ -312,6 +320,8 @@ def test_each_enumerated_copy_site_really_holds_the_attribute_read(module: str, 
         if keyword.arg == "reason"
         and isinstance(keyword.value, ast.Attribute)
         and keyword.value.attr == "reason"
+        and isinstance(keyword.value.value, ast.Name)
+        and keyword.value.value.id == receiver
     ]
     assert reads, f"{module}:{scope} holds no reason=<name>.reason read"
     assert lint_files([path]) == []

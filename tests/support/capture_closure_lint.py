@@ -91,17 +91,19 @@ REASON_SINKS: Final[frozenset[str]] = frozenset(
         "TrySubmit",
     }
 )
-#: ``(module, qualified function)`` sites where a sink may take ``reason=<name>.reason``: a reason
-#: copied from a decision or follow-up object whose own constants are defined elsewhere (WP2-R2).
+#: ``(module, qualified function, receiver)`` sites where a sink may take
+#: ``reason=<receiver>.reason``: a reason copied from a
+#: decision or follow-up object whose own constants are defined elsewhere (WP2-R2).
 #: Every other expression, and the same attribute read anywhere else, stays a finding. Each site has
 #: a test in ``test_capture_read_only_closure.py`` that proves the read is really there.
-REASON_COPY_SITES: Final[frozenset[tuple[str, str]]] = frozenset(
+REASON_COPY_SITES: Final[frozenset[tuple[str, str, str]]] = frozenset(
     {
         (
             "breezy.strategy.forecast_quantile_ladder.capture_adapter",
             "FqCaptureAdapter.decision_record",
+            "decision",
         ),
-        ("breezy.strategy.autonomy_capture.guarded_strategy", "decision_follow_up"),
+        ("breezy.strategy.autonomy_capture.guarded_strategy", "decision_follow_up", "outcome"),
     }
 )
 _REASON_SINK_SUFFIXES: Final[tuple[str, ...]] = ("Record", "Refuse", "Refused", "Veto")
@@ -361,16 +363,19 @@ def _is_reason_sink(call: ast.Call) -> bool:
     return name in REASON_SINKS or name.endswith(_REASON_SINK_SUFFIXES)
 
 
-def _is_reason_copy(value: ast.expr) -> bool:
-    return (
+def _reason_copy_receiver(value: ast.expr) -> str | None:
+    """The receiver name of ``<name>.reason``, else ``None``."""
+    if (
         isinstance(value, ast.Attribute)
         and value.attr == "reason"
         and isinstance(value.value, ast.Name)
-    )
+    ):
+        return value.value.id
+    return None
 
 
 def _reason_findings(
-    path: str, tree: ast.Module, module: str, copy_sites: frozenset[tuple[str, str]]
+    path: str, tree: ast.Module, module: str, copy_sites: frozenset[tuple[str, str, str]]
 ) -> list[Finding]:
     constants = _module_constants(tree)
     out: list[Finding] = []
@@ -380,7 +385,7 @@ def _reason_findings(
         for keyword in node.keywords:
             if keyword.arg != "reason" or _is_constant_reference(keyword.value, constants):
                 continue
-            if _is_reason_copy(keyword.value) and (module, scope) in copy_sites:
+            if (module, scope, _reason_copy_receiver(keyword.value) or "") in copy_sites:
                 continue
             out.append(_finding(path, keyword.value, "aut1_reason_constant", "reason=", scope))
     return out
@@ -396,7 +401,7 @@ def lint_source(
     *,
     module: str,
     authority: Iterable[AuthorityRow] = AUT1_WRITE_AUTHORITY,
-    copy_sites: frozenset[tuple[str, str]] = REASON_COPY_SITES,
+    copy_sites: frozenset[tuple[str, str, str]] = REASON_COPY_SITES,
 ) -> list[Finding]:
     """Every violation of the allowlist in ``source``, a file of ``module``. Pure."""
     tree = ast.parse(source, filename=path)

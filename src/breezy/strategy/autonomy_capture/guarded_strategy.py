@@ -26,7 +26,7 @@ This module is family-agnostic: it imports nothing from any composition kind's p
 
 import re
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, fields
 from typing import Any, Final, Protocol
 
@@ -75,6 +75,13 @@ KNOWN_TAKES_CAP: Final[int] = 4096
 REASON_CAPTURE_UNTAGGED: Final[str] = VetoReason.CAPTURE_UNTAGGED.value
 REASON_CAPTURE_GAP: Final[str] = VetoReason.CAPTURE_GAP.value
 REASON_EXIT: Final[str] = "exit"
+#: FQ's own ``try_submit`` / post-Take outcomes, which a follow-up record may carry.
+REASON_SUBMITTED: Final[str] = "submitted"
+REASON_INSTRUMENT_VANISHED: Final[str] = "instrument_vanished_after_trysubmit"
+REASON_PHASE0_PERMIT_ABSENT: Final[str] = "phase0_permit_absent"
+REASON_FEE_UNVERIFIED: Final[str] = "fee_unverified"
+REASON_FAMILY_HALT: Final[str] = "family_halt"
+CAUSE_EXIT_GUARD_ERROR: Final[str] = "exit_guard_error"
 
 DETECTOR_CAPTURE_WRITER_HEALTH: Final[str] = "capture_writer_health"
 STATE_DISAGREE: Final[str] = "DISAGREE"
@@ -99,6 +106,11 @@ _FOLLOW_UP_NULLED: Final[tuple[str, ...]] = (
     "p_upper",
     "ev_net",
     "margin",
+)
+#: ``VetoReason`` values plus every ``REASON_*`` constant above (WP2-R6 L3).
+_FOLLOW_UP_REASONS: Final[frozenset[str]] = frozenset(
+    {member.value for member in VetoReason}
+    | {value for name, value in globals().items() if name.startswith("REASON_")}
 )
 _FOLLOW_UP_OWN_FIELDS: Final[frozenset[str]] = frozenset({"kind", "reason", "wall_ns"})
 _ORDER_REF_HEX_LEN: Final[int] = 16
@@ -143,6 +155,10 @@ class FollowUp:
     kind: str
     reason: str
     wall_ns: int
+
+    def __post_init__(self) -> None:
+        if self.reason not in _FOLLOW_UP_REASONS:
+            raise ValueError(f"reason {self.reason!r} is not in the closed follow-up reason set")
 
 
 def decision_follow_up(take: Any, outcome: FollowUp) -> DecisionRecord:
@@ -227,6 +243,7 @@ class CaptureGuardedStrategy(Strategy):
         self._capture_identity = capture_identity
         self._known_takes: OrderedDict[str, Any] = OrderedDict()
         self.guard_alert_drops = 0
+        self.guard_exit_errors = 0
 
     # -- hooks ---------------------------------------------------------------------------------
 
@@ -278,10 +295,8 @@ class CaptureGuardedStrategy(Strategy):
             self._refuse(refusals, is_list=is_list)
             return False
         for plan in plans:
-            if plan.role == _ROLE_EXIT:
-                self._capture_exit(plan)
-            elif plan.role == _ROLE_SELL:
-                self._flag(plan, CAUSE_UNTAGGED_SELL)
+            if plan.role != _ROLE_BUY:
+                self._capture_sell_side(plan)
         if not any(plan.role in (_ROLE_BUY, _ROLE_EXIT) for plan in plans):
             return True
         if self._capture_publisher.flush_for_submit():
@@ -291,8 +306,23 @@ class CaptureGuardedStrategy(Strategy):
             self._refuse([(plan, REASON_CAPTURE_GAP) for plan in buys], is_list=is_list)
             return False
         exit_plan = next(plan for plan in plans if plan.role == _ROLE_EXIT)
-        self._flag(exit_plan, CAUSE_EXIT_CAPTURE_GAP)  # an exit is never refused
+        self._guard_exit(lambda: self._flag(exit_plan, CAUSE_EXIT_CAPTURE_GAP))
         return True
+
+    def _capture_sell_side(self, plan: _Plan) -> None:
+        """Exit and untagged-SELL capture. NEVER raises: a SELL reduces risk, so a capture error is
+        counted and logged and the order still goes (WP2-R6 M1). BUYs stay fail-closed."""
+        if plan.role == _ROLE_EXIT:
+            self._guard_exit(lambda: self._capture_exit(plan))
+        else:
+            self._guard_exit(lambda: self._flag(plan, CAUSE_UNTAGGED_SELL))
+
+    def _guard_exit(self, action: Callable[[], None]) -> None:
+        try:
+            action()
+        except Exception:  # noqa: BLE001 - an exit is never refused on a capture error
+            self.guard_exit_errors += 1
+            self.log.error(f"CAPTURE_GUARD_ERROR cause={CAUSE_EXIT_GUARD_ERROR}")
 
     @staticmethod
     def _classify(order: Any) -> _Plan:

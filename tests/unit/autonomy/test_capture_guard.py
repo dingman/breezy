@@ -551,3 +551,166 @@ def test_an_outbox_that_raises_never_breaks_the_refusal() -> None:
     h.strategy.submit_order(h.order(tags=None))
     assert h.commands == []
     assert h.strategy.guard_alert_drops == 1
+
+
+# -- WP2-R6 M1: an exit is never refused on a capture error ------------------------------------
+
+
+def test_an_exit_is_submitted_even_when_building_its_record_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MUTATION: removing the exit-branch ``try/except`` lets the error escape and refuses it."""
+    from breezy.strategy.autonomy_capture import guarded_strategy
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("record builder broke")
+
+    h = registered_guard()
+    monkeypatch.setattr(guarded_strategy, "make_record", boom)
+    order = h.order(side=OrderSide.SELL, tags=_exit_tags())
+
+    h.strategy.submit_order(order)
+
+    assert len(h.commands) == 1 and h.in_cache(order)
+    assert h.strategy.guard_exit_errors == 1
+
+
+def test_an_untagged_sell_is_submitted_even_when_canonical_json_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from breezy.strategy.autonomy_capture import guarded_strategy
+
+    def boom(_value: object) -> bytes:
+        raise ValueError("no canonical form")
+
+    h = registered_guard()
+    monkeypatch.setattr(guarded_strategy, "canonical_json", boom)
+    h.strategy.submit_order(h.order(side=OrderSide.SELL, tags=None))
+    assert len(h.commands) == 1
+    assert h.strategy.guard_exit_errors == 1
+
+
+def test_a_buy_stays_fail_closed_when_the_guard_itself_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrap is exit-only: a BUY whose refusal record cannot be built is still refused."""
+    from breezy.strategy.autonomy_capture import guarded_strategy
+
+    def boom(_value: object) -> bytes:
+        raise ValueError("no canonical form")
+
+    h = registered_guard()
+    monkeypatch.setattr(guarded_strategy, "canonical_json", boom)
+    order = h.order(tags=None)
+    with pytest.raises(ValueError, match="canonical"):
+        h.strategy.submit_order(order)
+    assert h.commands == [] and not h.in_cache(order)
+
+
+# -- WP2-R6 M2: the Nautilus close paths dispatch through the guard (section 3.6.5) ------------
+
+
+def _short_position(h: GuardHarness) -> Any:
+    from decimal import Decimal
+
+    from nautilus_trader.core.uuid import UUID4
+    from nautilus_trader.model.currencies import USD
+    from nautilus_trader.model.enums import LiquiditySide, OmsType, OrderType
+    from nautilus_trader.model.events import OrderFilled
+    from nautilus_trader.model.identifiers import (
+        AccountId,
+        ClientOrderId,
+        PositionId,
+        TradeId,
+        VenueOrderId,
+    )
+    from nautilus_trader.model.objects import Money, Price, Quantity
+    from nautilus_trader.model.position import Position
+
+    from tests.unit.aut1_premises_support import _instrument
+
+    instrument = _instrument(YES_ID)
+    h.strategy.cache.add_instrument(instrument)
+    fill = OrderFilled(
+        h.strategy.trader_id,
+        h.strategy.id,
+        YES_ID,
+        ClientOrderId("O-SHORT-1"),
+        VenueOrderId("V-1"),
+        AccountId("POLYMARKET_US-MAIN"),
+        TradeId("T-1"),
+        PositionId("P-1"),
+        OrderSide.SELL,
+        OrderType.LIMIT,
+        Quantity.from_str("1.00"),
+        Price.from_str("0.15"),
+        USD,
+        Money(Decimal("0.01"), USD),
+        LiquiditySide.TAKER,
+        UUID4(),
+        NOW_NS,
+        NOW_NS,
+    )
+    position = Position(instrument, fill)
+    h.strategy.cache.add_position(position, OmsType.NETTING)
+    return position
+
+
+def test_close_position_on_a_short_is_an_untagged_buy_refused_by_the_guard() -> None:
+    """Pins the 1.231.0 ``cpdef`` dispatch (``strategy.pyx:1416``): ``close_position`` calls the
+    PYTHON ``submit_order`` override, so a closing BUY with no decision tag is refused.
+
+    MUTATION: if the base dispatched past the override, a command would be routed."""
+    h = registered_guard()
+    position = _short_position(h)
+
+    h.strategy.close_position(position)
+
+    assert h.commands == []
+    assert [e for e, _, _ in h.outbox.offers if e == "CAPTURE_REFUSED"]
+    assert h.stream.written_of(DetectorEvent)
+
+
+def test_close_all_positions_on_a_short_is_refused_by_the_guard() -> None:
+    h = registered_guard()
+    _short_position(h)
+    h.strategy.close_all_positions(YES_ID)
+    assert h.commands == []
+    assert [e for e, _, _ in h.outbox.offers if e == "CAPTURE_REFUSED"]
+
+
+def test_a_tagged_close_position_passes_the_guard_as_the_positive_control() -> None:
+    h = registered_guard()
+    position = _short_position(h)
+    h.strategy.close_position(position, tags=_tag())
+    assert len(h.commands) == 1
+
+
+def test_modify_order_creates_no_order_and_is_not_a_send_path() -> None:
+    """``modify_order`` only routes a ModifyOrder for an existing order: the cache gains no order
+    and no BUY reaches the risk engine through it."""
+    h = registered_guard()
+    _with_take(h)
+    order = h.order(tags=_tag())
+    h.strategy.submit_order(order)
+    orders_before = len(h.strategy.cache.orders())
+    commands_before = len(h.commands)
+
+    h.strategy.modify_order(order, price=order.price.__class__.from_str("0.16"))
+
+    assert len(h.strategy.cache.orders()) == orders_before
+    assert [type(c).__name__ for c in h.commands[commands_before:]] in ([], ["ModifyOrder"])
+
+
+# -- WP2-R6 L3: a follow-up reason is a member of the closed set -------------------------------
+
+
+def test_follow_up_reason_must_be_in_the_closed_set() -> None:
+    """MUTATION: dropping the check admits any string as a stored reason."""
+    from breezy.strategy.autonomy_capture.guarded_strategy import FollowUp
+
+    for reason in ("capture_gap", "capture_untagged", "registry_halted", "submitted"):
+        assert FollowUp(kind="EntryVeto", reason=reason, wall_ns=1).reason == reason
+    for reason in ("", "made up", "Capture_Gap"):
+        with pytest.raises(ValueError, match="reason"):
+            FollowUp(kind="EntryVeto", reason=reason, wall_ns=1)
