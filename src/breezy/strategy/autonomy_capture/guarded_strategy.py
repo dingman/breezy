@@ -65,6 +65,7 @@ __all__ = [
     "AlertOutbox",
     "CaptureGuardedStrategy",
     "CaptureIdentity",
+    "FollowUp",
     "decision_follow_up",
 ]
 
@@ -99,6 +100,8 @@ _FOLLOW_UP_NULLED: Final[tuple[str, ...]] = (
     "ev_net",
     "margin",
 )
+_FOLLOW_UP_OWN_FIELDS: Final[frozenset[str]] = frozenset({"kind", "reason", "wall_ns"})
+_ORDER_REF_HEX_LEN: Final[int] = 16
 _ROLE_EXIT: Final = "exit"
 _ROLE_SELL: Final = "untagged_sell"
 _ROLE_BUY: Final = "buy"
@@ -132,17 +135,35 @@ class CaptureIdentity:
             raise ValueError(f"source must be one of {SOURCES}, was {self.source!r}")
 
 
-def decision_follow_up(take: Any, *, kind: str, reason: str, wall_ns: int) -> DecisionRecord:
-    """A record that continues a Take: same id, key, clock and frame reference, its own ``kind``,
-    ``reason`` and ``wall_ns``, and no probabilities. Pure.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FollowUp:
+    """How a Take continues: the ``kind`` (TrySubmit, EntryVeto, Refuse), its ``reason`` and its own
+    ``wall_ns``. Every caller passes a constant reason."""
 
-    The reason is a value copied from the caller (a constant at every caller), so it is carried in
-    the field dict rather than as a ``reason=`` keyword.
+    kind: str
+    reason: str
+    wall_ns: int
+
+
+def decision_follow_up(take: Any, outcome: FollowUp) -> DecisionRecord:
+    """A record that continues a Take: same id, key, clock and frame reference, the outcome's own
+    ``kind``, ``reason`` and ``wall_ns``, and no probabilities. Pure.
+
+    The ``reason=`` read below is an enumerated copy site of the closure lint (WP2-R2).
     """
-    carried: dict[str, Any] = {f.name: getattr(take, f.name) for f in fields(take)}
+    carried: dict[str, Any] = {
+        f.name: getattr(take, f.name) for f in fields(take) if f.name not in _FOLLOW_UP_OWN_FIELDS
+    }
     carried.update({name: NULL_STR for name in _FOLLOW_UP_NULLED})
-    carried.update({"kind": kind, "reason": reason, "wall_ns": wall_ns})
-    return make_record(DecisionRecord, ts_event=take.eval_ns, ts_init=wall_ns, **carried)
+    return make_record(
+        DecisionRecord,
+        ts_event=take.eval_ns,
+        ts_init=outcome.wall_ns,
+        kind=outcome.kind,
+        reason=outcome.reason,
+        wall_ns=outcome.wall_ns,
+        **carried,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +175,12 @@ class _Plan:
     @property
     def client_order_id(self) -> str:
         return str(self.order.client_order_id)
+
+    @property
+    def order_ref(self) -> str:
+        """A short digest that correlates a log or alert line with the order without printing its
+        id (ARCH payload hygiene: no order id in a logged or alerted payload)."""
+        return sha256_hex(self.client_order_id.encode("utf-8"))[:_ORDER_REF_HEX_LEN]
 
     @property
     def decision_tag_values(self) -> tuple[str, ...]:
@@ -297,13 +324,13 @@ class CaptureGuardedStrategy(Strategy):
             self._flag(first, CAUSE_ORDER_LIST_REFUSED)
 
     def _refuse_one(self, plan: _Plan, reason: str) -> None:
-        self.log.error(f"{REFUSED_EVENT} reason={reason} client_order_id={plan.client_order_id}")
+        self.log.error(f"{REFUSED_EVENT} reason={reason} order_ref={plan.order_ref}")
         self._offer(reason, plan)
         take = self._known_take(plan)
         if take is not None:
             now = self.clock.timestamp_ns()
             self._capture_publisher.write(
-                decision_follow_up(take, kind="EntryVeto", reason=reason, wall_ns=now)
+                decision_follow_up(take, FollowUp(kind="EntryVeto", reason=reason, wall_ns=now))
             )
             return
         cause = CAUSE_UNTAGGED_BUY if reason == REASON_CAPTURE_UNTAGGED else reason
@@ -424,8 +451,7 @@ class CaptureGuardedStrategy(Strategy):
 
     def _offer(self, cause: str, plan: _Plan) -> None:
         detail = (
-            f"cause={cause} family={self._capture_identity.family_id} "
-            f"client_order_id={plan.client_order_id}"
+            f"cause={cause} family={self._capture_identity.family_id} order_ref={plan.order_ref}"
         )
         try:
             accepted = self._capture_outbox.offer(

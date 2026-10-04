@@ -40,6 +40,7 @@ from tests.support.entry_points import SRC_DIR
 __all__ = [
     "AUT1_GLOBS",
     "AUT1_WRITE_AUTHORITY",
+    "REASON_COPY_SITES",
     "REASON_SINKS",
     "WRITE_MODULE_FUNCTIONS",
     "AuthorityRow",
@@ -88,6 +89,19 @@ REASON_SINKS: Final[frozenset[str]] = frozenset(
         "NotExecutable",
         "NotDPlus1",
         "TrySubmit",
+    }
+)
+#: ``(module, qualified function)`` sites where a sink may take ``reason=<name>.reason``: a reason
+#: copied from a decision or follow-up object whose own constants are defined elsewhere (WP2-R2).
+#: Every other expression, and the same attribute read anywhere else, stays a finding. Each site has
+#: a test in ``test_capture_read_only_closure.py`` that proves the read is really there.
+REASON_COPY_SITES: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        (
+            "breezy.strategy.forecast_quantile_ladder.capture_adapter",
+            "FqCaptureAdapter.decision_record",
+        ),
+        ("breezy.strategy.autonomy_capture.guarded_strategy", "decision_follow_up"),
     }
 )
 _REASON_SINK_SUFFIXES: Final[tuple[str, ...]] = ("Record", "Refuse", "Refused", "Veto")
@@ -347,15 +361,28 @@ def _is_reason_sink(call: ast.Call) -> bool:
     return name in REASON_SINKS or name.endswith(_REASON_SINK_SUFFIXES)
 
 
-def _reason_findings(path: str, tree: ast.Module) -> list[Finding]:
+def _is_reason_copy(value: ast.expr) -> bool:
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == "reason"
+        and isinstance(value.value, ast.Name)
+    )
+
+
+def _reason_findings(
+    path: str, tree: ast.Module, module: str, copy_sites: frozenset[tuple[str, str]]
+) -> list[Finding]:
     constants = _module_constants(tree)
     out: list[Finding] = []
     for node, scope in walk_with_scope(tree):
         if not isinstance(node, ast.Call) or not _is_reason_sink(node):
             continue
         for keyword in node.keywords:
-            if keyword.arg == "reason" and not _is_constant_reference(keyword.value, constants):
-                out.append(_finding(path, keyword.value, "aut1_reason_constant", "reason=", scope))
+            if keyword.arg != "reason" or _is_constant_reference(keyword.value, constants):
+                continue
+            if _is_reason_copy(keyword.value) and (module, scope) in copy_sites:
+                continue
+            out.append(_finding(path, keyword.value, "aut1_reason_constant", "reason=", scope))
     return out
 
 
@@ -369,6 +396,7 @@ def lint_source(
     *,
     module: str,
     authority: Iterable[AuthorityRow] = AUT1_WRITE_AUTHORITY,
+    copy_sites: frozenset[tuple[str, str]] = REASON_COPY_SITES,
 ) -> list[Finding]:
     """Every violation of the allowlist in ``source``, a file of ``module``. Pure."""
     tree = ast.parse(source, filename=path)
@@ -381,7 +409,7 @@ def lint_source(
         *_forbidden_findings(path, tree),
         *_dynamic_findings(path, tree),
         *_import_findings(path, tree, row),
-        *_reason_findings(path, tree),
+        *_reason_findings(path, tree, module, copy_sites),
     ]
     if _call_count(tree) < row.min_calls:
         findings.append(

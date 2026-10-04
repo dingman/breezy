@@ -14,11 +14,13 @@ from tests.support.autonomy_scan import Finding
 from tests.support.capture_closure_lint import (
     AUT1_GLOBS,
     AUT1_WRITE_AUTHORITY,
+    REASON_COPY_SITES,
     WRITE_MODULE_FUNCTIONS,
     AuthorityRow,
     aut1_files,
     lint_files,
     lint_source,
+    module_of,
 )
 
 _PLANTED_MODULE: Final = "breezy.persistence.autonomy.capture_planted"
@@ -241,3 +243,75 @@ def test_a_planted_scratch_module_on_disk_fails_the_file_walk(tmp_path: Path) ->
         authority=(_EMPTY_ROW,),
     )
     assert _rules(granted) == {"aut1_write_authority"}
+
+
+# -- WP2-R2: ``reason=<name>.reason`` is admitted only at enumerated copy sites -----------------
+
+_SITE_MODULE: Final = "breezy.strategy.autonomy_capture.guarded_strategy"
+_SITE_PATH: Final = "src/breezy/strategy/autonomy_capture/guarded_strategy.py"
+_SITE_SCOPE: Final = "decision_follow_up"
+_SITE_ROW: Final = AuthorityRow(_SITE_MODULE, min_calls=0)
+
+
+def _site_lint(body: str, *, function: str = _SITE_SCOPE) -> list[Finding]:
+    source = f"def {function}(take, outcome):\n    return make_record(DecisionRecord, {body})\n"
+    return lint_source(_SITE_PATH, source, module=_SITE_MODULE, authority=(_SITE_ROW,))
+
+
+def test_a_reason_attribute_read_is_accepted_at_an_enumerated_site() -> None:
+    assert _site_lint("reason=outcome.reason") == []
+
+
+def test_the_same_attribute_read_is_flagged_anywhere_else() -> None:
+    """MUTATION: dropping the (module, function) check admits ``x.reason`` everywhere."""
+    assert _rules(_site_lint("reason=outcome.reason", function="other")) == {"aut1_reason_constant"}
+    assert _rules(_lint("def f(e):\n    make_record(DecisionRecord, reason=e.reason)\n")) == {
+        "aut1_reason_constant"
+    }
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "'inline'",
+        "outcome",
+        "compute(outcome)",
+        "outcome.reason.upper()",
+        "outcome.a.reason",
+        "outcome.other",
+        "outcome.REASON_X.lower",
+        "outcome['reason']",
+        "outcome.reason or 'x'",
+        "f'{outcome.reason}'",
+    ],
+)
+def test_an_arbitrary_expression_is_still_flagged_even_at_an_enumerated_site(
+    expression: str,
+) -> None:
+    """MUTATION: accepting any attribute (or any expression) at a site fails these controls."""
+    assert _rules(_site_lint(f"reason={expression}")) == {"aut1_reason_constant"}
+
+
+@pytest.mark.parametrize(("module", "scope"), sorted(REASON_COPY_SITES))
+def test_each_enumerated_copy_site_really_holds_the_attribute_read(module: str, scope: str) -> None:
+    """Non-vacuous: the site exists in the real file and carries a ``reason=<name>.reason``
+    keyword in that function, so a stale row (renamed function) fails here."""
+    import ast
+
+    from tests.support.autonomy_scan import walk_with_scope
+    from tests.support.entry_points import SRC_DIR
+
+    path = SRC_DIR.joinpath(*module.split(".")).with_suffix(".py")
+    assert module_of(path) == module
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    reads = [
+        keyword
+        for node, where in walk_with_scope(tree)
+        if where == scope and isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "reason"
+        and isinstance(keyword.value, ast.Attribute)
+        and keyword.value.attr == "reason"
+    ]
+    assert reads, f"{module}:{scope} holds no reason=<name>.reason read"
+    assert lint_files([path]) == []

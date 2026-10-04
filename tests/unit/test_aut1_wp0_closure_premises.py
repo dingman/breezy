@@ -36,8 +36,8 @@ CLEAN_PLANNED_DEPENDENCIES: Final[tuple[str, ...]] = (
 
 def test_static_walk_positive_and_negative_controls() -> None:
     """V-15 controls. The walk agrees with a fresh-process ``sys.modules`` import on adapter
-    membership for a clean module and for a module known to reach the adapters (33 modules,
-    AUT-6 r12 fact 18), so a zero is a measurement.
+    membership for a clean module and for a module known to reach the adapters (34 modules: AUT-6
+    r12 fact 18's 33 plus ``recorder_watchdog``), so a zero is a measurement.
 
     MUTATION (red): making ``_module_level_imports`` ignore ``ImportFrom`` drops the adapter
     count of ``trade_supervisor`` to 0 and fails the positive control.
@@ -47,7 +47,9 @@ def test_static_walk_positive_and_negative_controls() -> None:
     assert _adapter_modules(static_module_closure(clean)) == []
     assert [m for m in _fresh_process_modules(clean) if m.startswith("breezy.adapters")] == []
     walked = _adapter_modules(static_module_closure(dirty))
-    assert len(walked) == 33
+    # 34 since AUT-1 WP3 step 1 added ``adapters.polymarket_us.recorder_watchdog``, which
+    # ``data.py`` and ``node_config.py`` import. The exact-count and fresh-process equality stand.
+    assert len(walked) == 34
     imported = sorted(m for m in _fresh_process_modules(dirty) if m.startswith("breezy.adapters"))
     assert walked == imported
 

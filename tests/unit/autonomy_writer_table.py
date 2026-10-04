@@ -105,6 +105,7 @@ class WriteSiteRule(NamedTuple):
 
 
 _SINGLE_READ: Final = "breezy.persistence.autonomy.single_read"
+_HOOK: Final = "breezy.runtime.capture_recorder_hook_cli"
 
 WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(_SINGLE_READ, "write_once", "the one write-once publisher (AC 7)"),
@@ -130,6 +131,13 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
         "the reader's one sqlite3.connect: mode=ro, query_only; export files are written only "
         "through single_read.write_once_tmpfile, so write_export holds no site (seam 6f)",
     ),
+    # AUT-1 WP3 step 1 (plan r12 section 3.15 "Recorder stop hook"): the evidence-only hook is the
+    # one writer of evidence/capture/stall/ and health/recorder_watchdog/. These are its four
+    # write scopes, reviewed in WP3-R3 and confirmed in WP2-R5; a new write path needs a new row.
+    WriteSiteRule(_HOOK, "_open_child_dir", "stop hook: 0700 day directory under a dir fd"),
+    WriteSiteRule(_HOOK, "_write_once", "stop hook: atomic write-once stall record (link)"),
+    WriteSiteRule(_HOOK, "_atomic_replace", "stop hook: health file temp + rename"),
+    WriteSiteRule(_HOOK, "_acquire_lock", "stop hook: the per-directory flock file"),
     WriteSiteRule(
         "breezy.persistence.live_orders_gate",
         "_verify_ruling_file",

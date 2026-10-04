@@ -40,6 +40,7 @@ from breezy.persistence.autonomy.capture_records import (
 from breezy.persistence.exit_tags import DECISION_ID_TAG_PREFIX
 from breezy.strategy.autonomy_capture.guarded_strategy import (
     CaptureIdentity,
+    FollowUp,
     decision_follow_up,
 )
 from breezy.strategy.forecast_quantile_ladder.decision import (
@@ -142,7 +143,6 @@ class FqCaptureAdapter:
             "drill": ident.drill,
             "source": ident.source,
             "kind": kind,
-            "reason": REASON_TAKE if isinstance(decision, Take) else decision.reason,
             "eval_ns": ctx.eval_ns,
             "eval_seq": ctx.eval_seq,
             "wall_ns": ctx.wall_ns,
@@ -170,7 +170,23 @@ class FqCaptureAdapter:
             ctx.eval_ns,
             ctx.eval_seq,
         )
-        return make_record(DecisionRecord, ts_event=ctx.eval_ns, ts_init=ctx.wall_ns, **fields)
+        # The two ``reason=`` keywords below: a constant for a Take, and the refusal's own reason
+        # read off the decision (an enumerated copy site of the closure lint, WP2-R2).
+        if isinstance(decision, Take):
+            return make_record(
+                DecisionRecord,
+                ts_event=ctx.eval_ns,
+                ts_init=ctx.wall_ns,
+                reason=REASON_TAKE,
+                **fields,
+            )
+        return make_record(
+            DecisionRecord,
+            ts_event=ctx.eval_ns,
+            ts_init=ctx.wall_ns,
+            reason=decision.reason,
+            **fields,
+        )
 
     @staticmethod
     def _inputs(decision: Decision) -> dict[str, str]:
@@ -240,7 +256,7 @@ class FqCaptureAdapter:
         """Publish a ``TrySubmit`` / ``EntryVeto`` / ``Refuse`` that continues a Take. It shares the
         Take's id and frame copy, so no copy is published. On-change per key."""
         try:
-            record = decision_follow_up(take, kind=kind, reason=reason, wall_ns=wall_ns)
+            record = decision_follow_up(take, FollowUp(kind=kind, reason=reason, wall_ns=wall_ns))
             key = (take.station, take.climate_day, take.rung_id, take.side)
             if not self._on_change.admit(key, kind, reason, take.eval_ns):
                 return True
