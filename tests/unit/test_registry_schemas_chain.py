@@ -686,6 +686,7 @@ def test_fold_invalid_reason_set() -> None:
         "family_introduced_by_other_kind",
         "root_lineage_mismatch",
         "head_missing_launch_date",  # E-16 (c)
+        "carried_counters_malformed",  # A7b-R1 (E-20 requested)
     }
 
 

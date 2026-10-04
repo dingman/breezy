@@ -14,7 +14,10 @@
   state, no flag, no episode;
 * per-family flags: ``rollback_eligible``, ``demoted_for_cause``, ``target_ineligible`` and
   ``drill_child``; the lineage ``terminal_frozen`` freeze (Y10); the venue INTEGRITY freeze;
-* drill episodes ``[DRILL_PROMOTE effective, closing partner or RETIRE effective)`` (Z2).
+* drill episodes ``[DRILL_PROMOTE effective, closing partner or RETIRE effective)`` (Z2);
+* ``FamilyView.origin`` (root or child, from the introducing row) and ``halted_since_ns``;
+* the ARCH C5 counters as ``LineageTallies`` (one per lineage) and ``VenueTallies``, charged when a
+  change takes effect, with ``HWM_RESET`` ``carried_counters`` applied as floors.
 
 Row order and effective time. Immediate rows (no ``effective_launch_date``) apply at their
 ``ts_ns`` and only once ``ts_ns <= now_ns``; the members of an effective pair apply at LAUNCH.
@@ -44,8 +47,27 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
 * A drill episode ends at the first SUPERSEDE or DISPLACED of its child that takes effect, or at the
   child's RETIRE.
 * A lineage is named by the introducing row's ``lineage_root_family_id``, else the family itself.
-
-Not here (seam 7b): tallies, ``FamilyView`` origins and the root-lineage check.
+  A BOOTSTRAP or ROOT_ADMIT that names another family as its lineage root is ``FoldInvalid``
+  (``root_lineage_mismatch``, E-14); an absent column on a root kind means its own lineage.
+* Charging (tallies). A row is charged at its effective instant, so a pending, lapsed or voided
+  pair charges nothing. ``nominations`` is the largest ``k_life`` of a feasible SHADOW to CHALLENGER
+  PROMOTE, ``infeasible_nominations`` counts the infeasible ones and ``alpha_spent`` is the exact
+  sum of ``alpha_k``. ``mints`` and ``promotions`` hold effective instants (a PROMOTE head only;
+  ROOT_ADMIT, RESUME and the partners are no promotion). A ROLLBACK head that takes effect while a
+  drill episode is open is a ``drill_rollbacks`` charge, else ``rollbacks``. DRILL_ADMIT,
+  a DRILL_PROMOTE head and a DEMOTE or HALT of class DRILL charge ``drill_admits``,
+  ``drill_promotes``, ``drill_demotes`` and ``drill_halts``. A RESUME is charged to the class of the
+  family's standing DEMOTE or HALT (a ROLLBACK_FAILED one to its ``trigger_cause_class``):
+  RECOVERABLE_INFRA to ``VenueTallies.infra_resumes``, DRILL to ``drill_resumes``, RECOVERABLE_MODEL
+  to nothing (C5 lists no counter for it) and a RESUME with cause ``drill_close_restore`` only to
+  ``drill_close_restores``. ATTEST, SWAP_CANCEL, TARGET_INELIGIBLE and HWM_RESET charge nothing.
+* ``carried_counters`` (shape: ``fold_tallies``, which ARCH leaves open) is applied at the reset row
+  as floors: each counter becomes the larger of its fold so far and the carried value, and
+  ``terminal_frozen`` true freezes the lineage. A malformed object is
+  ``FoldInvalid(carried_counters_malformed)``, whatever the clock. A carried lineage with no
+  families left keeps its tallies.
+* ``halted_since_ns`` is the effective instant of the row that moved the family into HALTED and is
+  ``None`` once it leaves HALTED (AUT-6 r15 #30).
 
 Pure: no I/O, no wall clock (the clock is the ``now_ns`` argument), no mutation of the input.
 """
@@ -60,6 +82,13 @@ from types import MappingProxyType
 from typing import Final
 
 from breezy.persistence.autonomy import pins
+from breezy.persistence.autonomy.fold_tallies import (
+    Carried,
+    LineageTallies,
+    TallyBook,
+    VenueTallies,
+    parse_carried,
+)
 from breezy.persistence.autonomy.schemas import (
     CauseClass,
     CauseCode,
@@ -79,8 +108,12 @@ __all__ = [
     "FamilyView",
     "FoldInvalid",
     "FoldResult",
+    "LineageTallies",
+    "LineageView",
+    "Origin",
     "PairStatus",
     "PairView",
+    "VenueTallies",
     "fold",
 ]
 
@@ -95,10 +128,18 @@ ACTIVATE_KIND: Final = Kind.ACTIVATE
 INTRODUCING_KINDS: Final[frozenset[Kind]] = frozenset({Kind.BOOTSTRAP, Kind.ROOT_ADMIT, Kind.MINT})
 
 _SENDER_STATES: Final[frozenset[State]] = frozenset({State.CHAMPION, State.HALTED})
+_ROOT_KINDS: Final[frozenset[Kind]] = frozenset({Kind.BOOTSTRAP, Kind.ROOT_ADMIT})
 
 _NS_PER_S: Final = 10**9
 _SECONDS_PER_DAY: Final = 86_400
 _UNIX_EPOCH_ORDINAL: Final = date(1970, 1, 1).toordinal()
+
+
+class Origin(StrEnum):
+    """How a family entered the chain: a root (BOOTSTRAP, ROOT_ADMIT) or a MINT child."""
+
+    ROOT = "root"
+    CHILD = "child"
 
 
 class PairStatus(StrEnum):
@@ -130,6 +171,7 @@ class FamilyView:
     family_id: str
     state: State
     lineage_root_family_id: str
+    origin: Origin
     rollback_eligible: bool = False
     demoted_for_cause: bool = False
     target_ineligible: bool = False
@@ -139,6 +181,16 @@ class FamilyView:
     demoted_cause_ns: int | None = None
     #: When the current champion epoch opened; ``None`` for a family that never was CHAMPION.
     champion_epoch_start_ns: int | None = None
+    #: The instant of the row that made the family HALTED; ``None`` while it is not HALTED.
+    halted_since_ns: int | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LineageView:
+    root_family_id: str
+    #: The families of the lineage that the fold has applied, by name.
+    family_ids: tuple[str, ...]
+    tallies: LineageTallies
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -163,6 +215,9 @@ class FoldResult:
     families: Mapping[str, FamilyView]
     integrity_frozen: bool
     drill_episodes: tuple[DrillEpisode, ...]
+    #: One view per lineage root, by root name (including a carried root with no family left).
+    lineages: Mapping[str, LineageView]
+    venue_tallies: VenueTallies
 
     @property
     def senders(self) -> tuple[str, ...]:
@@ -364,26 +419,49 @@ class _OpenEpisode:
     end_ns: int | None = None
 
 
+def _is_nomination(row: TransitionRow) -> bool:
+    return (
+        row.kind is Kind.PROMOTE
+        and row.from_state is State.SHADOW
+        and row.to_state is State.CHALLENGER
+    )
+
+
 class _Accumulator:
     """The mutable working state of one ``fold`` call; never escapes it."""
 
-    def __init__(self, lineage_of: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        lineage_of: Mapping[str, str],
+        origin_of: Mapping[str, Origin],
+        carried: Mapping[str, Carried],
+    ) -> None:
         self.states: dict[str, State] = {}
         self.lineage_of = lineage_of
+        self.origin_of = origin_of
+        self.carried = carried
         self.rollback_eligible: set[str] = set()
         self.demoted: set[str] = set()
         self.demoted_ns: dict[str, int] = {}
         self.epoch_start: dict[str, int] = {}
+        self.halted_since: dict[str, int] = {}
         self.target_ineligible: set[str] = set()
         self.drill_children: set[str] = set()
         self.frozen_lineages: set[str] = set()
         self.integrity_frozen = False
         self.episodes: list[_OpenEpisode] = []
+        self.book = TallyBook(lineage_of)
+        #: The class a RESUME of the family is charged to: that of its standing DEMOTE or HALT.
+        self.standing_class: dict[str, CauseClass | None] = {}
 
     def apply(self, instant: int, row: TransitionRow) -> None:
         family = row.family_id
         if row.from_state is not row.to_state:
             self.states[family] = row.to_state
+            if row.to_state is State.HALTED:
+                self.halted_since[family] = instant
+            else:
+                self.halted_since.pop(family, None)
         if row.to_state is State.CHAMPION and row.from_state is not State.CHAMPION:
             self.epoch_start[family] = instant
             self.demoted.discard(family)
@@ -398,8 +476,13 @@ class _Accumulator:
             self._close_episode(family, instant)
         elif kind is Kind.DRILL_ADMIT:
             self.drill_children.add(family)
+            self.book.bump(family, "drill_admits")
+        elif kind is Kind.MINT:
+            self.book.mint(family, instant)
         elif kind in (Kind.DEMOTE, Kind.HALT):
             self._halt(instant, row)
+        elif kind is Kind.RESUME:
+            self._charge_resume(row)
         elif kind is Kind.RETIRE:
             self._close_episode(family, instant)
             if row.cause_code is CauseCode.MODEL_BUDGET_EXHAUSTED:
@@ -409,12 +492,43 @@ class _Accumulator:
                 self._mark_cause(family, instant)
         elif kind is Kind.TARGET_INELIGIBLE:
             self.target_ineligible.add(family)
+        elif kind is Kind.HWM_RESET:
+            self._apply_floors(row)
+        if _is_nomination(row):
+            self.book.nomination(
+                family,
+                feasible=row.nomination_feasible,
+                k_life=row.k_life,
+                alpha_k=row.alpha_k,
+            )
 
     def _take_champion(self, instant: int, row: TransitionRow) -> None:
-        self.rollback_eligible.discard(row.family_id)
-        if row.kind is Kind.DRILL_PROMOTE:
-            self.drill_children.add(row.family_id)
-            self.episodes.append(_OpenEpisode(row.family_id, instant, row.transition_id))
+        family = row.family_id
+        self.rollback_eligible.discard(family)
+        if row.kind is Kind.PROMOTE:
+            self.book.promotion(family, instant)
+        elif row.kind is Kind.DRILL_PROMOTE:
+            self.drill_children.add(family)
+            self.episodes.append(_OpenEpisode(family, instant, row.transition_id))
+            self.book.bump(family, "drill_promotes")
+        elif row.kind is Kind.ROLLBACK:
+            drill = any(episode.end_ns is None for episode in self.episodes)
+            self.book.bump(family, "drill_rollbacks" if drill else "rollbacks")
+
+    def _charge_resume(self, row: TransitionRow) -> None:
+        """Charge a RESUME to the budget of its own cause class (Z3, Z10, E-5)."""
+        cls = self.standing_class.pop(row.family_id, None)
+        if row.cause_code is CauseCode.DRILL_CLOSE_RESTORE:
+            self.book.bump_venue("drill_close_restores")
+        elif cls is CauseClass.RECOVERABLE_INFRA:
+            self.book.bump_venue("infra_resumes")
+        elif cls is CauseClass.DRILL:
+            self.book.bump(row.family_id, "drill_resumes")
+
+    def _apply_floors(self, row: TransitionRow) -> None:
+        carried = self.carried.get(row.transition_id)
+        if carried is not None:
+            self.frozen_lineages |= self.book.apply_carried(carried)
 
     def _mark_cause(self, family: str, instant: int) -> None:
         self.demoted.add(family)
@@ -422,14 +536,18 @@ class _Accumulator:
 
     def _halt(self, instant: int, row: TransitionRow) -> None:
         """A failed rollback (ROLLBACK_FAILED) matches neither freeze: it halts its family only."""
-        self.rollback_eligible.discard(row.family_id)
-        self._mark_cause(row.family_id, instant)
-        if row.halt_cause_class is CauseClass.TERMINAL:
-            self._freeze_lineage(row.family_id)
-        if (
-            row.halt_cause_class is CauseClass.INTEGRITY
-            or row.cause_code is CauseCode.INFRA_BUDGET_EXHAUSTED
-        ):
+        family = row.family_id
+        self.rollback_eligible.discard(family)
+        self._mark_cause(family, instant)
+        cls = row.halt_cause_class
+        self.standing_class[family] = (
+            row.trigger_cause_class if cls is CauseClass.ROLLBACK_FAILED else cls
+        )
+        if cls is CauseClass.DRILL:
+            self.book.bump(family, "drill_halts" if row.kind is Kind.HALT else "drill_demotes")
+        if cls is CauseClass.TERMINAL:
+            self._freeze_lineage(family)
+        if cls is CauseClass.INTEGRITY or row.cause_code is CauseCode.INFRA_BUDGET_EXHAUSTED:
             self.integrity_frozen = True
 
     def _freeze_lineage(self, family: str) -> None:
@@ -448,6 +566,7 @@ class _Accumulator:
                 family_id=family,
                 state=state,
                 lineage_root_family_id=lineage,
+                origin=self.origin_of[family],
                 rollback_eligible=family in self.rollback_eligible,
                 demoted_for_cause=family in self.demoted,
                 target_ineligible=family in self.target_ineligible,
@@ -455,8 +574,24 @@ class _Accumulator:
                 drill_child=family in self.drill_children,
                 demoted_cause_ns=self.demoted_ns.get(family),
                 champion_epoch_start_ns=self.epoch_start.get(family),
+                halted_since_ns=self.halted_since.get(family),
             )
         return MappingProxyType(views)
+
+    def lineage_views(self) -> Mapping[str, LineageView]:
+        roots = {self.lineage_of.get(f, f) for f in self.states} | self.book.roots()
+        return MappingProxyType(
+            {
+                root: LineageView(
+                    root_family_id=root,
+                    family_ids=tuple(
+                        sorted(f for f in self.states if self.lineage_of.get(f, f) == root)
+                    ),
+                    tallies=self.book.lineage(root, terminal_frozen=root in self.frozen_lineages),
+                )
+                for root in sorted(roots)
+            }
+        )
 
     def drill_episodes(self) -> tuple[DrillEpisode, ...]:
         return tuple(
@@ -470,13 +605,51 @@ class _Accumulator:
         )
 
 
+def _introduction(row: TransitionRow) -> tuple[Origin, str] | FoldInvalidReason:
+    """The origin and lineage root a family's first row gives it, or why the chain is invalid."""
+    if row.kind is Kind.MINT:
+        return Origin.CHILD, row.lineage_root_family_id or row.family_id
+    if row.kind in _ROOT_KINDS:
+        if row.lineage_root_family_id not in (None, row.family_id):
+            return FoldInvalidReason.ROOT_LINEAGE_MISMATCH
+        return Origin.ROOT, row.family_id
+    return FoldInvalidReason.FAMILY_INTRODUCED_BY_OTHER_KIND
+
+
+def _scan_rows(
+    rows: Sequence[TransitionRow], heads: dict[str, _Head]
+) -> tuple[Mapping[str, str], Mapping[str, Origin], dict[str, Carried], set[str]] | FoldInvalid:
+    """The lineage and origin of every family, parsed ``carried_counters`` and pending roots."""
+    lineage_of: dict[str, str] = {}
+    origin_of: dict[str, Origin] = {}
+    carried: dict[str, Carried] = {}
+    pending_roots: set[str] = set()
+    for row in rows:
+        if row.family_id not in lineage_of:
+            intro = _introduction(row)
+            if isinstance(intro, FoldInvalidReason):
+                return FoldInvalid(intro)
+            origin_of[row.family_id], lineage_of[row.family_id] = intro
+            if row.transition_id in heads:  # a pending root: SHADOW until its pair takes effect
+                pending_roots.add(row.family_id)
+        if _is_head_shape(row) and row.effective_launch_date is None:
+            return FoldInvalid(FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE)
+        if row.kind is Kind.HWM_RESET and row.carried_counters is not None:
+            parsed = parse_carried(row.carried_counters)
+            if parsed is None:
+                return FoldInvalid(FoldInvalidReason.CARRIED_COUNTERS_MALFORMED)
+            carried[row.transition_id] = parsed
+    return lineage_of, origin_of, carried, pending_roots
+
+
 def fold(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> FoldResult | FoldInvalid:
     """Fold one venue's rows (chain order) into family states, flags and pair views at ``now_ns``.
 
     ``ValueError`` for another venue's row, a bad clock or an unsealed last row; ``TypeError`` for
     a non-row.
-    ``FoldInvalid`` for a family whose first row is not BOOTSTRAP, ROOT_ADMIT or MINT, and for a
-    →CHAMPION head row with no ``effective_launch_date`` (E-16 c).
+    ``FoldInvalid`` for a family whose first row is not BOOTSTRAP, ROOT_ADMIT or MINT, a root kind
+    that names a foreign lineage root, a →CHAMPION head row with no ``effective_launch_date``
+    (E-16 c) and a ``carried_counters`` object of the wrong shape.
     """
     ordered = tuple(rows)
     _check_inputs(ordered, venue, now_ns)
@@ -484,18 +657,11 @@ def fold(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> FoldResult |
     heads = _collect_heads(ordered)
     orphans = _attach_members(ordered, heads)
     _void_pairs(ordered, heads, now_ns)
-    lineage_of: dict[str, str] = {}
-    pending_roots: set[str] = set()
-    for row in ordered:
-        if row.family_id not in lineage_of:
-            if row.kind not in INTRODUCING_KINDS:
-                return FoldInvalid(FoldInvalidReason.FAMILY_INTRODUCED_BY_OTHER_KIND)
-            lineage_of[row.family_id] = row.lineage_root_family_id or row.family_id
-            if row.transition_id in heads:  # a pending root: SHADOW until its pair takes effect
-                pending_roots.add(row.family_id)
-        if _is_head_shape(row) and row.effective_launch_date is None:
-            return FoldInvalid(FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE)
-    acc = _Accumulator(lineage_of)
+    scanned = _scan_rows(ordered, heads)
+    if isinstance(scanned, FoldInvalid):
+        return scanned
+    lineage_of, origin_of, carried, pending_roots = scanned
+    acc = _Accumulator(lineage_of, origin_of, carried)
     acc.states.update((family, State.SHADOW) for family in pending_roots)
     for instant, _index, row in _events(ordered, heads, orphans, now_ns):
         acc.apply(instant, row)
@@ -508,4 +674,6 @@ def fold(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> FoldResult |
         families=acc.family_views(),
         integrity_frozen=acc.integrity_frozen,
         drill_episodes=acc.drill_episodes(),
+        lineages=acc.lineage_views(),
+        venue_tallies=acc.book.venue(),
     )

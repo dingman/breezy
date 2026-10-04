@@ -547,8 +547,12 @@ def test_fold_over_a_verified_chain_matches_the_unsealed_rows() -> None:
     assert fold(verified.rows, VENUE, LAUNCH) == run(chain, LAUNCH)
 
 
-def test_fold_module_imports_only_schemas_and_pins() -> None:
-    assert _internal_imports("fold.py") == {"schemas", "pins"}
+def test_fold_module_imports_only_schemas_pins_and_its_tallies() -> None:
+    assert _internal_imports("fold.py") == {"schemas", "pins", "fold_tallies"}
+
+
+def test_fold_tallies_imports_only_schemas_and_the_wire_helpers() -> None:
+    assert _internal_imports("fold_tallies.py") == {"schemas", "wire"}
 
 
 def test_fold_hardcodes_the_pins_schedule_not_literals() -> None:

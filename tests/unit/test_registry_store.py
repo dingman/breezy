@@ -124,6 +124,8 @@ def mk(
         "ts_ns": ts,
         **fill(kind, frm, to),
     }
+    if kind in (Kind.BOOTSTRAP, Kind.ROOT_ADMIT):
+        base["lineage_root_family_id"] = family  # a root names itself (E-14; fold 7b)
     base.update(over)
     draft = TransitionRow(**base)
     return replace(draft, transition_id=draft.computed_transition_id())

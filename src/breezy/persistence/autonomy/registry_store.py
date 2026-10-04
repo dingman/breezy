@@ -245,6 +245,7 @@ _FOLD_REFUSALS: Final[Mapping[FoldInvalidReason, RefusalReason]] = MappingProxyT
         FoldInvalidReason.FAMILY_INTRODUCED_BY_OTHER_KIND: RefusalReason.FAMILY_NOT_INTRODUCED,
         FoldInvalidReason.ROOT_LINEAGE_MISMATCH: RefusalReason.ROOT_LINEAGE_MISMATCH,
         FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE: RefusalReason.ENGINE_INCONSISTENCY,
+        FoldInvalidReason.CARRIED_COUNTERS_MALFORMED: RefusalReason.ENGINE_INCONSISTENCY,
     }
 )
 
