@@ -291,3 +291,81 @@ ARCH scored correctness 7, fit 7, tests 6, risk 6, minimality 7, feasibility 6. 
   - If plan r12 §3.11–§3.16 names a source for the subscribed-instrument set, use that source.
   - Deriving the set from tape activity is accepted only if the plan names no source. In that case, note the deviation here.
 - **S2-R25, PASS fixtures.** Every PASS fixture is internally consistent. For example, `admitted_total` equals the number of admitted decisions, which replaces the stage-2a default. One test asserts that each PASS fixture audits to PASS through the real legs.
+
+## Stage 2c outcome (8497ca47, b8efcc84, 8224bf57)
+- **Done.** S2-R18 and S2-R21..R25 are done.
+- **S2-R21 tightening.** The lint had accepted any slot name. Slots are now restricted to `ALLOWED_ARGV_SLOTS = {since, until}`, and each slot must follow its own flag. Two mutations pin this.
+- **S2-R23 meaning.** There is no day-level verdict cache. ERROR days re-audit together with INCONCLUSIVE ones, and a scan that errors writes no cache entry.
+- **S2-R24.** Plan r12 names no source for the subscribed set. Tape-derived `active_instruments` stands. r8 line 574 says the audit cannot observe subscriptions.
+- **Seam found by the real-host run.** `BootDayReplay` was not cacheable: the write failed silently with `TypeError`, so every run re-scanned every log. It is now registered, and the codec is `scan-cache/2`.
+- **Runtime evidence** (2026-10-02, 4 logs plus the real tape, `MemoryMax=1G`, bwrap overlay):
+  - cold run 317.5 s / 650 MB; warm run 6.8 s / 710 MB;
+  - real CLI exit 1, because the undelivered `CAPTURE_LIVE_PROOF_STALE` alert is by design;
+  - verdict PRE_CAPTURE, since WP8 is not deployed.
+  - The R2 `duplicate_decision_lines` result is the known FQ double evaluation (WP5-R5, fixed in WP7).
+- **S2-R26, REJECTED deviation: a lazy import used to dodge the audit CLI's httpx closure test.**
+  - The test keeps the audit's import closure free of the HTTP client. A function-level import still loads httpx at run time, which is laundering, the same class as the rejected WP5-A option 2.
+  - Fix: `capture_forecast_ref` must not reach `breezy.ingest` or `forecast_subscriber`.
+    - Move `local_standard_date` to `breezy.normalize.climate_day`, which `gaps` already imports. Re-export it from `gaps`.
+    - Move `NBP_QUANTILE_MODEL` to `strategy/ladder_ev/forecast_state.py`. Re-import it in `forecast_subscriber`.
+    - Restore the module-level import in `capture_audit_fill_legs`.
+  - Add a closure test: `capture_forecast_ref` loads neither `httpx`, nor `breezy.ingest`, nor `nautilus_trader.common.actor`.
+- **S2-R27.** `_check_epoch` reads the row key `"capture_heartbeat"`; the real key is `"custom_capture_heartbeat"`. Fix it, with a test.
+
+## Stage 2c review rulings (security review: APPROVE, 1 MEDIUM-pair and 6 LOW; binding)
+- **S2-R28, cache key covers the reducer code.** The key gains a sha256 over the source bytes of the reducer modules: `capture_node_log*`, `capture_audit_replay`, `capture_audit_log_markers` and `capture_audit_cache`. The hash is computed once per process. We use a source hash rather than a hand-bumped constant, because hand bumps drift. A test shows that a changed reducer source changes `log_key`.
+- **S2-R29, entries bind their key.** The body embeds its key, and a read compares it; a mismatch is a miss. The docstring says the cache is unauthenticated, trusted as same-uid data.
+- **S2-R30, cache-read failures are misses.**
+  - `RecursionError` and `OverflowError` are cache misses.
+  - `open_root` refusals inside `read_scan_cache` are misses too.
+- **S2-R31, the journal cap is enforced while reading.** The journal read stops at `_MAX_JOURNAL_BYTES` bytes, counted in bytes, and an oversize journal raises `journal_failed("oversize")` without buffering the whole journal. A test pins this.
+- **S2-R32, slot digits are ASCII.** `_SLOT_RE` uses `[0-9]`.
+- **S2-R33, firewall guard reformat reverted.** Revert the incidental ruff reformat of `test_execution_egress_firewall_guard.py`. The only diff against `cab72b46` must be the single WIDENED X1 row.
+- **Noted only.** The closure lint ignores kwargs such as `shell=` and `env=`. That predates this stage, and is a stage-3 lint hardening item.
+
+## Stage 2c review rulings (python review of the W1 legs: REQUEST_CHANGES; binding)
+- **S2-R34 (HIGH), leg B no-lookahead.**
+  - Add `available_at_ns <= take.eval_ns` for the forecast reference, and `frame ts_event <= take.eval_ns` for the frame reference.
+  - New causes: `forecast_ref_lookahead` and `frame_ref_lookahead`. Add them to the closed set, with RED tests.
+  - We use `<=` rather than `<`: a reference available at the evaluation instant was in hand when the decision was made.
+- **S2-R35, leg P after 23:00Z.**
+  - First check the tape-mark definition in r8 and r12 and cite the lines.
+  - A fill whose next hourly mark falls on D+1 uses D+1's 00:00Z tape mark when the tape has it.
+  - When the tape does not have it, the outcome is INCONCLUSIVE, and the day is re-audited. It is never FAIL.
+- **S2-R36, leg F.**
+  - A truncated scan makes leg F INCONCLUSIVE, with cause `exec_fill_census_truncated`. It is no longer an INFO-only PASS.
+  - With no boot scan at all, leg F is also INCONCLUSIVE, with cause `node_scan_missing`.
+- **S2-R37, leg S station matching.** Match on the same city-or-ICAO key set that `offset_of` uses, through one shared normaliser, with a KLAX-versus-LAX test.
+- **S2-R38.** `test_capture_audit_fill_legs.py` is 1233 lines. Split it by leg group so each file is ≤ 800 lines.
+- **S2-R39, LOW items.**
+  - Leg D exit detection uses leg semantics, because a NO entry arrives as SELL or BUY_SHORT, so the cause is labelled correctly.
+  - `_frames_equal` requires the minimal frame-shape keys.
+  - `tape_marks`:
+    - nets only fills with `ts <= mark hour`;
+    - an unknown side is a per-fill FAIL, not a whole-day ERROR;
+    - a fractional quantity is an explicit FAIL, never a truncation.
+  - `leg_r6` with zero refusals: verify that the metric's consumers tolerate the missing key. If any does not, emit the metric as null.
+  - A `fill_by_day` entry dropped for a cross-day stamp now emits an INFO finding.
+
+## Stage 2c review rulings (python review of replay and orchestration: REQUEST_CHANGES; binding)
+- **S2-R40 (HIGH), `_guard_findings` day cut.**
+  - Filter guard records and detector events by `_day_of(record.wall_ns) == day`, the same rule `_actual_records` uses.
+  - Add a RED test for a boot that straddles midnight, with one guard EntryVeto on each side. It must give no false FAIL for D or D+1.
+- **S2-R41, R2 flush-window anchor.**
+  - The tail floor is the boot's last log line (`scan.last_line_ts_ns`), not its last decision line.
+  - Add a test: a boot that logs for hours after its last decision and loses a record just before that decision. The loss is FAIL `stream_record_lost`, not INFO.
+- **S2-R42, stub-pin strength restored.**
+  - The authority-row check loops over `{*EXPECTED, *W3_PINNED}`.
+  - `min_calls == 1` stays wherever no builder raised a floor.
+  - The exact-set assertion `found == pinned` is reinstated for the W3 modules.
+  - This reverses a weakening introduced at integration.
+- **S2-R43.** Split every test file over 800 lines: `test_capture_audit.py`, `test_capture_audit_fill_legs.py` (see S2-R38) and `test_capture_audit_inputs.py`.
+- **S2-R44, re-audit fairness.**
+  - Days never audited are ordered BEFORE ERROR re-audits. A missing day must never age out.
+  - `CAPTURE_AUDIT_ERROR` is sent once per (day, cause set). First check whether the outbox dedupes, and cite where. Re-send only when the cause set changes.
+  - Rewriting the HEALTH verdict for the day is fine.
+- **S2-R45, PRE_CAPTURE masking.** ERROR wins over the PRE_CAPTURE mask whenever ANY errored leg has a cause outside `HOST_STATE_CAUSES`, not only the first errored leg. Add a test with a host-state ERROR first and a data ERROR second.
+- **S2-R46, LOW items.**
+  - `_r3_boot` checks the cap before the `last_ts is None` early return.
+  - `entry_lines_capped` joins `ERROR_CAUSES`, and the exact-set test is extended.
+  - R2 day bucketing: both sides use the same clock for the day cut. Pick `wall_ns`, matching the streams, or prove the log ts equals `wall_ns`. Add a test with a record within 1 ms of midnight.
