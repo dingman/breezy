@@ -730,3 +730,23 @@ Key paths:
 - `/home/jon/breezy/src/breezy/runtime/autonomy_sandbox/{table,bwrap,self_probe}.py`
 - `/home/jon/breezy/tests/support/capture_closure_lint.py`
 - `/home/jon/breezy/tests/unit/test_capture_audit_stubs.py`
+
+## Build rulings during 3a (coordinator, 2026-10-04)
+- **S3-R51.** 3a's edit list is extended by exactly three files, because the r3 rulings themselves force these edits:
+  - **`tests/unit/test_autonomy_envelope.py`.** Add one hygiene allowlist entry, `(capture_audit_host.py, "/usr/bin/journalctl")`. The absolute argv[0] is required by S3-R15. This is a narrow, justified widening, not a relaxation.
+  - **`tests/unit/test_autonomy_files_one_writer.py`.** The writer-table pin goes from 13 to 18, for the five new rows.
+  - **`tests/unit/test_capture_audit_duties.py`.** The duty-isolation tests are re-targeted at `run_once_duties` (S3-R41), with stronger exit-code assertions.
+- **3a editorial choices, accepted.** The stub signatures are `plan_heals`, `run_heal_duty(data_root, *, now_ns, heal_deadline) -> int`, `build_live_proof`, `main` and `delivered_events`. S1 and S2 may revise them in `EXPECTED` within their own modules.
+
+## S1 outcome (4eee88e3) and rulings (coordinator, 2026-10-04)
+- **Result.** All 17 S1 mutants are killed. The focused gate fails only on the stub-pin test, which the out-of-list patch `s1_outlist.patch` fixes (`landed ⊆ S1_REAL ∪ S2_REAL`). 3c applies that patch.
+- **ACCEPTED.**
+  - The public API: `run_heal_duty(..., sender: HealSender)` and the revised `plan_heals` surface.
+  - The gap scan window is [today−31, today−1], so a gap can reach the 30-day age-out.
+  - A gap alert is retired by evidence (a stall record plus a delivered notifier marker) or by an abandon marker. It is not retired by a ledger hit, because the bare `CAPTURE_WATCHDOG_EVIDENCE_GAP` event carries no per-gap identity. This follows plan §3.10.3.
+  - An abandon marker is written on the next run.
+  - An unreadable stall record counts as one failure, and no heal is written for it.
+- **S3-R52, REJECTED: S1 deviation 7.** The heal duty must never raise. An exception from `delivered_events`, of any kind, is counted as a duty failure. 3c applies this, with a test where the ledger reader raises: the result is exit 1 and the other heal work still runs.
+- **The 3c lint narrowing:**
+  - `capture_heal`: no writes, `min_calls=48`.
+  - `capture_heal_io`: `writes=("_publish",)`, `write_imports={write_once, ensure_dir}`, `min_calls=193`.
