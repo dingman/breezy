@@ -313,3 +313,46 @@ G2-A ∥ G2-C ∥ G2-D ∥ G2-E. G2-B runs after G2-A's rules are frozen.
 - `/home/jon/breezy/deploy/families/pm_us_crh_fq_v1.json`
 - `/home/jon/breezy/deploy/systemd/`
 - `/home/jon/breezy/docs/plans/backlog/AUTONOMY_2026-10-03/`
+
+---
+
+## Round-1 peer review resolution (coordinator, 2026-10-04; domain, ARCH and SEC all REQUEST_CHANGES; binding on r2)
+- **FQ-R1, no parallel machinery.** The scorecard is built as an early slice of AUT-2: `analysis/labeling/fq_scorer.py`, `ForecastQuantileLadderScorer` on C2 `label/v1`. Evaluation is built as an early slice of AUT-4: `FqEvaluator`, which reuses `forecast_conditional_scoring.py`. Reports are thin readers over C2. `portfolio_roi` follows AUT-2's gating rule (`test_gated_unlabelled_fq_publishes_no_roi_figure`).
+- **FQ-R2, queue order.** The AUTONOMY queue's Needs column is kept intact. AUT-1a WP5 stage 3 finishes first. True prerequisites go in as new rows with explicit Needs: R-B, the truth fetch, the interim stop bridge and the FQ v2 repair.
+- **FQ-R3, interim stop.**
+  - It is an in-node probe modelled on fee-drift (`app/trade.py:461-473`). It reads a pinned, fresh scorecard artefact, and checks sha, schema, an `as_of` age bound and the truth-coverage field.
+  - It acts through an entry-only veto. FQ has no exit path, so nothing is stranded.
+  - It sets only. A test at the attribute and call level forbids any reference to a clear method.
+  - Stale or missing input (UNKNOWN_STALE) sends a repeated CRITICAL alert, and beyond a pre-registered bound it vetoes entries (fail-closed, per L-38).
+  - Label it a TEMPORARY BRIDGE. It retires when AUT-5a's `entry_veto` and drawdown producer land.
+  - Halt clearing stays human-only. No timer or agent may clear a halt.
+- **FQ-R4, the repaired strategy is a new family.** It is registered as `pm_us_crh_fq_v2`, and v1 gets `terminal_climate_day`. Pre-repair and post-repair rows never share an α sequence. The latch and trial_id grammar stay unchanged, and occupancy is a separate read.
+- **FQ-R5, P&L and truth sources.**
+  - Realised P&L comes from venue settlement events in the exec store, reconciled per station against official truth.
+  - The truth FETCH is a separate unit: public GET to `mesonet.agron.iastate.edu` only, with no venue credential, only `alerts.env`, `MemoryMax`, `RuntimeMaxSec` and `OnFailure=`.
+  - It is the single writer of the cache. The dataset script stays offline.
+  - The plan does not claim sandbox containment for user units.
+- **FQ-R6, shadow at the executable ask as primary evidence.**
+  - What counts: shadow decisions at the observed executable ask, a depth-checked qty-1 taker, net of fee.
+  - What it decides: SCREENING and the RESUME decision. Live real-order trials then validate fill realism and execution.
+  - This needs a written PREREG v2 amendment, filed as a ruling under `docs/evidence/` through the peer loop. It supersedes "shadow never feeds a verdict" for screening and resume only.
+  - Every line carries a mandatory `source` field: shadow, backtest or live. Every reader fails closed when the field is absent.
+- **FQ-R7, statistics for a standing loop.**
+  - Use anytime-valid e-processes: a betting confidence sequence on per-fill martingale differences, with BE_i = ask + fee.
+  - Combine them with online FDR control across hypotheses (e-LOND or alpha-investing), replacing the fixed Bonferroni split.
+  - Screening spends no α. α is charged per nomination.
+  - The L-40 amendment (i)/(ii) applies.
+  - Bootstrap by calendar day.
+  - N is computed from holdout residuals, never chosen arbitrarily.
+  - The resume bar has three conditions, all required: shadow net P&L lower bound > 0 at the executable ask, BSS on TAKES (not only on all decisions), and the calibration guard.
+  - Repairs tuned on the 5 losing station-days are data-dependent and need a fresh sample.
+- **FQ-R8, diagnose before repairing.** Step 0 adds a check of the MIA p̂ = 0.6368, repeated across 3 days and rungs: is the predictive spread collapsed, or is p produced by integer-quantile geometry? A LEAK or INPUT_DEFECT verdict blocks W2. The ceiling idea is dropped unless it is model-intrinsic and registered as an α-spending variant. Report per-rung-position PIT.
+- **FQ-R9, new measurement.** W1 gains a model-free market calibration scan: ask bin against realised outcome, by side, across all rungs, from the tape plus truth. It tests longshot bias and cheap NO.
+- **FQ-R10, the search loop includes new weather information.** It admits new US weather sources, through a scheduled AUT-3 refit. The search grammar adds execution mode, horizon and observation conditioning. The AUT-3 gate is not weakened: a screen PASS feeds AUT-4 nomination, never retraining directly. The plan ends in a standing loop with no fixed horizon: AUT-S generation → AUT-4 nomination → capped live trial → AUT-5 promotion/demotion.
+- **FQ-R11, dropped items.** Drop 1g/1h (the position-monitor seed, which is infeasible and redundant) and 1i (the decision-log fields, which contradict AUT-1 r12). The NO-side work adds leg-sign reconciliation tests through the real writer. One rung per station-day is recorded as a RISK LIMIT, using max-net-edge at one snapshot, not as a repair.
+- **FQ-R12, corrections and requirements.**
+  - The supervisor reads no manifests. The node loads them at boot, so a manifest change needs a node respawn.
+  - The harness is `backtest()`/`BacktestEngine`, not `BacktestNode`.
+  - The screen states which days are usable: replay-sufficient tape is scarce. Rejection is conservative, rejecting only when the upper bound is below 0. Add a SPA or reality-check multiplicity control.
+  - Every new timer names its install, `daemon-reload` and enable owner.
+  - Each node respawn is followed by a `--status` check of the halt.
