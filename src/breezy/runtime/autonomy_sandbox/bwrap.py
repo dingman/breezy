@@ -173,12 +173,22 @@ def _chdir(row: BwrapRow, roots: SandboxRoots, cwd: str) -> str:
     return "/"
 
 
-def _interpreter_links(roots: SandboxRoots) -> list[str]:
-    """``--symlink`` for each interpreter hop under the hidden home (B11-R1); never a bind."""
+def interpreter_hops(
+    row: BwrapRow, roots: SandboxRoots, opened: OpenedBinds
+) -> tuple[tuple[str, str], ...]:
+    """The interpreter symlink hops (B11-R1, B12-R4): excluded are every path the argv binds."""
+    bound = [
+        *_home_rebinds(row, roots),
+        *(Path(f.path) for f in (*opened.config_files, *opened.config_dirs, *opened.binds)),
+    ]
     try:
-        hops = interpreter_symlinks(roots)
+        return interpreter_symlinks(roots, bound)
     except InterpreterLinkError:
         raise WrapperError("interpreter_link") from None
+
+
+def _symlink_args(hops: tuple[tuple[str, str], ...]) -> list[str]:
+    """``--symlink`` for each hop; never a bind."""
     return [arg for link, target in hops for arg in ("--symlink", target, link)]
 
 
@@ -224,6 +234,7 @@ def build_bwrap_argv(
     environ: Mapping[str, str],
     cwd: str,
     bwrap_path: str = BWRAP_PATH,
+    hops: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
     """The exact AC-1.3 argv for ``row`` (argv[0] is ``bwrap_path``). Pure; opens nothing."""
     home = str(roots.home)
@@ -234,7 +245,7 @@ def build_bwrap_argv(
     argv += ["--size", str(_tmpfs_size(row)), "--tmpfs", "/tmp", "--tmpfs", home]
     for path in _home_rebinds(row, roots):
         argv += ["--ro-bind", str(path), str(path)]
-    argv += _interpreter_links(roots)
+    argv += _symlink_args(hops if hops is not None else interpreter_hops(row, roots, opened))
     for rebind in rebinds:
         argv += _rebind_args(rebind)
     argv += ["--remount-ro", "/run"]
@@ -337,6 +348,7 @@ def _exec_wrapped(
         if degradable:
             return _exec_degraded(row, resolved, command, "bwrap_missing", env, execv)
         raise WrapperError("bwrap_missing", EX_NOTFOUND)
+    hops = interpreter_hops(row, roots, opened)
     passed = _passed_fds(opened, rebinds)
 
     def argv_for(cmd: Sequence[str]) -> list[str]:
@@ -349,6 +361,7 @@ def _exec_wrapped(
             environ=env,
             cwd=_cwd(),
             bwrap_path=bwrap_path,
+            hops=hops,
         )
 
     if degradable:

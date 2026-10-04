@@ -180,3 +180,194 @@ def test_argv_refuses_when_a_hop_leaves_the_prefix(tree: Tree) -> None:
     with pytest.raises(WrapperError) as caught:
         _argv(tree.roots)
     assert caught.value.code == "interpreter_link"
+
+
+# ------------------------------------------------------------------ B12 (R1..R6)
+
+
+def _cfg(tree: Tree, text: str) -> None:
+    (tree.repo / ".venv" / "bin" / "python3").write_text("")
+    (tree.repo / ".venv" / "pyvenv.cfg").write_text(text)
+
+
+def test_chain_of_exactly_the_hop_limit_is_accepted(tree: Tree) -> None:
+    previous = tree.prefix
+    for index in range(MAX_HOPS):
+        hop = tree.uv / f"hop{index}"
+        hop.symlink_to(previous)
+        previous = hop
+    _cfg(tree, f"home = {previous / 'bin'}\n")
+    assert len(interpreter_symlinks(tree.roots)) == MAX_HOPS
+
+
+def test_hop_outside_the_home_is_not_emitted(tree: Tree) -> None:
+    outside = tree.home.parent / "outside-link"
+    outside.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {outside / 'bin'}\n")
+    assert interpreter_symlinks(tree.roots) == ()
+
+
+def test_hop_under_the_data_root_is_not_emitted(tree: Tree) -> None:
+    link = tree.roots.data_root / "py"
+    link.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {link / 'bin'}\n")
+    assert interpreter_symlinks(tree.roots) == ()
+
+
+def test_hop_under_the_prefix_is_not_emitted(tree: Tree) -> None:
+    (tree.prefix / "bin2").symlink_to("bin")
+    _cfg(tree, f"home = {tree.prefix / 'bin2'}\n")
+    assert interpreter_symlinks(tree.roots) == ()
+
+
+def test_dotdot_in_a_link_target_keeps_the_exact_text(tree: Tree) -> None:
+    link = tree.uv / "cpython-3.13-linux"
+    link.symlink_to("../python/cpython-3.13.13-linux")
+    _cfg(tree, f"home = {link / 'bin'}\n")
+    assert interpreter_symlinks(tree.roots) == ((str(link), "../python/cpython-3.13.13-linux"),)
+
+
+def test_dotdot_in_the_pyvenv_home_is_resolved(tree: Tree) -> None:
+    link = tree.uv / "cpython-3.13-linux"
+    link.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {tree.uv}/../python/cpython-3.13-linux/bin\n")
+    assert interpreter_symlinks(tree.roots) == ((str(link), str(tree.prefix)),)
+
+
+@pytest.mark.parametrize(
+    "text", ["home = bin\n", "garbage\n", "", "home =\n", "home = /ok\nhome = rel\n"]
+)
+def test_pyvenv_cfg_without_an_absolute_home_is_refused(tree: Tree, text: str) -> None:
+    _cfg(tree, text)
+    with pytest.raises(InterpreterLinkError):
+        interpreter_symlinks(tree.roots)
+
+
+def test_pyvenv_cfg_follows_cpython_case_and_last_home_wins(tree: Tree) -> None:
+    link = tree.uv / "cpython-3.13-linux"
+    link.symlink_to(tree.prefix)
+    _cfg(tree, f"home = relative\n  HOME  =  {link / 'bin'}  \n")
+    assert interpreter_symlinks(tree.roots) == ((str(link), str(tree.prefix)),)
+
+
+def test_a_start_path_that_vanished_with_the_venv_present_is_refused(tree: Tree) -> None:
+    (tree.repo / ".venv" / "pyvenv.cfg").write_text(f"home = {tree.prefix / 'bin'}\n")
+    with pytest.raises(InterpreterLinkError):
+        interpreter_symlinks(tree.roots)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_an_unreadable_directory_is_refused_not_treated_as_a_plain_path(tree: Tree) -> None:
+    locked = tree.uv / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)
+    try:
+        _cfg(tree, f"home = {locked / 'x'}\n")
+        with pytest.raises(InterpreterLinkError):
+            interpreter_symlinks(tree.roots)
+    finally:
+        locked.chmod(0o700)
+
+
+def test_a_hop_equal_to_the_home_is_refused(tree: Tree) -> None:
+    linked_home = tree.home.parent / "linked-home"
+    linked_home.symlink_to(tree.home)
+    roots = SandboxRoots(
+        home=linked_home,
+        data_root=linked_home / ".local" / "share" / "breezy",
+        repo_root=linked_home / "repo",
+        python_prefix=tree.prefix,
+        uid=os.getuid(),
+        run_user=Path("/run/user/1000"),
+    )
+    with pytest.raises(InterpreterLinkError):
+        interpreter_symlinks(roots)
+
+
+def test_a_symlinked_home_does_not_drop_hops_reached_by_the_real_path(tree: Tree) -> None:
+    link = tree.uv / "cpython-3.13-linux"
+    link.symlink_to(tree.prefix)
+    tree.venv(link)
+    linked_home = tree.home.parent / "linked-home"
+    linked_home.symlink_to(tree.home)
+    roots = SandboxRoots(
+        home=linked_home,
+        data_root=tree.roots.data_root,
+        repo_root=tree.repo,
+        python_prefix=tree.prefix,
+        uid=os.getuid(),
+        run_user=Path("/run/user/1000"),
+    )
+    assert interpreter_symlinks(roots) == ((str(link), str(tree.prefix)),)
+
+
+def test_a_symlinked_ancestor_of_a_bound_root_is_refused(tree: Tree) -> None:
+    real = tree.home / "real_local"
+    (tree.home / ".local").rename(real)
+    (tree.home / ".local").symlink_to(real)
+    tree.venv(tree.uv / ".." / "python" / "cpython-3.13.13-linux")
+    with pytest.raises(InterpreterLinkError):
+        interpreter_symlinks(tree.roots)
+
+
+def test_a_link_outside_the_prefix_parent_is_refused(tree: Tree) -> None:
+    other = tree.home / "other"
+    other.mkdir()
+    link = other / "py"
+    link.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {link / 'bin'}\n")
+    with pytest.raises(InterpreterLinkError):
+        interpreter_symlinks(tree.roots)
+
+
+def test_symlinks_precede_every_remount_ro(tree: Tree) -> None:
+    (tree.uv / "cpython-3.13-linux").symlink_to(tree.prefix)
+    tree.venv(tree.uv / "cpython-3.13-linux")
+    argv = _argv(tree.roots)
+    assert argv.index("--symlink") < argv.index("--remount-ro")
+
+
+def test_a_hop_under_an_opened_bind_destination_is_not_emitted(tree: Tree) -> None:
+    from breezy.runtime.autonomy_sandbox.binds import OpenedBind
+
+    bind_dir = tree.home / "bound"
+    bind_dir.mkdir()
+    link = bind_dir / "py"
+    link.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {link / 'bin'}\n")
+    opened = OpenedBinds(
+        binds=(OpenedBind("bound", str(bind_dir), 100, 1, 100),), config_files=(), config_dirs=()
+    )
+    from breezy.runtime.autonomy_sandbox.bwrap import interpreter_hops
+
+    assert interpreter_hops(SELFTEST, tree.roots, opened) == ()
+
+
+def _roots_with(tree: Tree, **changes: Path) -> SandboxRoots:
+    fields = {
+        "home": tree.home,
+        "data_root": tree.roots.data_root,
+        "repo_root": tree.repo,
+        "python_prefix": tree.prefix,
+        **changes,
+    }
+    return SandboxRoots(uid=os.getuid(), run_user=Path("/run/user/1000"), **fields)
+
+
+def test_a_hop_equal_to_the_home_is_refused_on_that_rule_alone(tree: Tree) -> None:
+    """The link is under the prefix's parent and resolves into the prefix: only R2 refuses it."""
+    home_link = tree.uv / "home-link"
+    home_link.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {home_link / 'bin'}\n")
+    with pytest.raises(InterpreterLinkError, match="bound_ancestor"):
+        interpreter_symlinks(_roots_with(tree, home=home_link))
+
+
+def test_a_hop_that_is_an_ancestor_of_a_bound_root_is_refused_on_that_rule_alone(
+    tree: Tree,
+) -> None:
+    ancestor = tree.uv / "ancestor-link"
+    ancestor.symlink_to(tree.prefix)
+    _cfg(tree, f"home = {ancestor / 'bin'}\n")
+    with pytest.raises(InterpreterLinkError, match="bound_ancestor"):
+        interpreter_symlinks(_roots_with(tree, data_root=ancestor / "data"))

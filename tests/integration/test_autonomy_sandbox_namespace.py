@@ -212,7 +212,7 @@ def test_production_home_mount_args_hide_real_home() -> None:
     assert set(seen["credentials"].values()) == {"ENOENT"}, seen
 
 
-def test_production_venv_interpreter_executes_in_the_sandbox() -> None:
+def test_production_roots_argv_execs_the_venv_interpreter() -> None:
     """B11: the venv ``python3`` (a symlink chain through the home) runs under the real roots.
 
     The production roots hide the passwd home behind a tmpfs and re-bind only the repo, the
