@@ -9,7 +9,7 @@ recompute of leg D need. A host failure inside it propagates (the host maps it t
   ``ts_event >= epoch_start_ns``; an earlier fill is ``unattributed`` and runs no leg.
 * ``leg_o``: r8's order census, reading ``OrderInitialized``, with the ``TrySubmit`` classification
   (``linked`` / ``refused_after_trysubmit`` / ``never_submitted``, else ``trysubmit_unlinked``).
-* ``leg_f``: r8's fill census.
+* ``leg_f``: r8's fill census. A truncated or absent node-log scan leaves it pending (S2-R36).
 * ``leg_r6``: the resolved fraction of the refusal records' frame references; never fails a day.
 * ``tape_marks``: r8's hourly Depth10 best ask for every held base slug (corroboration for leg P).
 
@@ -24,7 +24,10 @@ Choices the plan leaves open, each pinned by a test:
 * ``registry_seq == 0`` once the resolver is live (``AuditInputs.resolver_live``) fails leg D.
 * Leg I keys ``fill_by_fingerprint`` on the UTC day of the intent, taken from the link's
   ``ts_ns`` (``record_fill`` derives it from ``intent_created_ns``), never the fill's own day.
-* Station lookups in ``std_offsets`` accept the city code (``LAX``) or the ICAO id (``KLAX``).
+* Station lookups in ``std_offsets``, and leg S's settlement match, accept the city code (``LAX``)
+  or the ICAO id (``KLAX``) through one normaliser (S2-R37).
+* Leg B refuses a reference from after the take's evaluation (S2-R34); leg P fills after 23:00Z
+  look to D+1's 00:00Z tape mark (S2-R35).
 * The R6 threshold is ``R6_BASELINE`` itself (0.923 is already the WP0-R9 baseline less 1 pp).
 
 Non-writer, no ``breezy.adapters`` import.
@@ -50,12 +53,15 @@ from breezy.analysis.capture_audit_fill_support import (
     build_index,
     climate_day_end_ns,
     fail,
+    fill_defect,
     fill_event,
     in_day,
     info,
     leg_result,
     make_finding,
     offset_of,
+    same_station,
+    signed_fill,
     skipped,
     utc_day,
     yes_instrument,
@@ -65,7 +71,6 @@ from breezy.analysis.capture_audit_model import (
     R6_BASELINE,
     SETTLEMENT_ALERT_H,
     SETTLEMENT_PENDING_H,
-    AuditInputError,
     FillAudit,
     Finding,
     Leg,
@@ -75,10 +80,6 @@ from breezy.analysis.capture_audit_model import (
 )
 from breezy.analysis.capture_forecast_ref import ForecastRefStatus, resolve_forecast_ref
 from breezy.domain.exec_intent import intent_fingerprint, utc_day_for_ns
-from breezy.domain.instrument_leg import (
-    leg_of_symbol,
-    symbol_of_instrument_id,
-)
 from breezy.persistence.autonomy.capture_ids import (
     compute_decision_id,
     compute_exit_decision_id,
@@ -94,7 +95,7 @@ from breezy.persistence.autonomy.capture_reader import (
     join_fills_to_decisions,
     resolve_frame_ref,
 )
-from breezy.persistence.autonomy.net_position import LegFill, UnknownSide, net_signed_qty
+from breezy.persistence.autonomy.net_position import LegFill, net_signed_qty
 from breezy.persistence.exit_tags import (
     EXIT_CLIENT_ORDER_ID_TAG_PREFIX,
     EXIT_FAMILY_TAG_PREFIX,
@@ -115,10 +116,15 @@ _KIND_EXIT: Final[str] = "Exit"
 _KIND_REFUSE: Final[str] = "Refuse"
 _REFUSAL_KINDS: Final[frozenset[str]] = frozenset({_KIND_REFUSE, "NotExecutable", "NotDPlus1"})
 _SELL: Final[str] = "SELL"
+_LAST_MARK_HOUR: Final[int] = 23
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
 _ORDER_DAY_RE: Final[re.Pattern[str]] = re.compile(r"^O-(\d{8})-")
 _METRIC_R6_FRACTION: Final[str] = "refusal_frame_ref_resolved_frac"
 _FRAME_LEVEL_KEYS: Final[frozenset[str]] = frozenset({"bids", "asks"})
+_FRAME_SHAPE: Final[Mapping[str, frozenset[str]]] = {
+    "depth10": frozenset({"ts_event", "bids", "asks"}),
+    "quote": frozenset({"ask", "bid", "ts_event"}),
+}
 
 # -- audit_fills -----------------------------------------------------------------------------
 
@@ -357,10 +363,12 @@ def _frame_findings(ctx: AuditContext, boot: BootEvidence, take: DecisionView) -
     if resolved.source is not FrameSource.COPY:
         return [fail(Leg.B, "frame_copy_missing", ident)]
     parsed = parse_frame_ref(ref)
+    if parsed is not None and parsed[2] > take.eval_ns:
+        return [fail(Leg.B, "frame_ref_lookahead", ident, ref)]  # S2-R34: no frame from the future
     row = ctx.inp.tape.lookup(*parsed) if parsed is not None else None
     if row is None:
         return [info(Leg.B, "tape_frame_absent", ident, ref)]
-    if not _frames_equal(resolved.body, row):
+    if parsed is None or not _frames_equal(parsed[0], resolved.body, row):
         return [fail(Leg.B, "frame_copy_mismatch", ident, ref)]
     return []
 
@@ -371,6 +379,8 @@ def _forecast_findings(ctx: AuditContext, boot: BootEvidence, take: DecisionView
     if parsed is None:
         return [fail(Leg.B, "forecast_ref_missing", ident)]
     station, cycle_ns, available_at_ns = parsed
+    if available_at_ns > take.eval_ns:  # S2-R34: in hand at the evaluation instant is allowed
+        return [fail(Leg.B, "forecast_ref_lookahead", ident, take.forecast_input_ref)]
     offset = offset_of(ctx.inp, station)
     if offset is None:
         return [fail(Leg.B, "std_offset_unknown", ident, station)]
@@ -398,9 +408,13 @@ def _levels(levels: Any) -> tuple[tuple[Decimal, Decimal], ...] | None:
     return tuple(pair for pair in pairs if pair[1] > 0)
 
 
-def _frames_equal(copy_body: Mapping[str, Any] | None, row: Mapping[str, Any]) -> bool:
-    """Every key of the copy's body equals the tape row's value (extra row columns are ignored)."""
-    if not isinstance(copy_body, Mapping) or not copy_body:
+def _frames_equal(kind: str, copy_body: Mapping[str, Any] | None, row: Mapping[str, Any]) -> bool:
+    """The copy holds its kind's minimal frame keys and each equals the tape row's value (extra
+    row columns are ignored)."""
+    if (
+        not isinstance(copy_body, Mapping)
+        or not _FRAME_SHAPE.get(kind, frozenset()) <= copy_body.keys()
+    ):
         return False
     for key, want in copy_body.items():
         if key not in row:
@@ -463,7 +477,14 @@ def _leg_e(ctx: AuditContext, fill: ExecFill) -> tuple[LegResult, bool]:
 
 
 def _leg_p(ctx: AuditContext, fill: ExecFill, via_resolver: bool) -> LegResult:
-    """A node position mark at or after the fill, a tape mark, or ``fill_via_resolver``."""
+    """A node position mark at or after the fill, a tape mark, or ``fill_via_resolver``.
+
+    A fill after the last whole-hour mark of D (23:00Z) is marked by D+1's 00:00Z tape mark; until
+    the tape holds it the leg is pending (the day is re-audited), never failed (S2-R35)."""
+    ident = fill.client_order_id
+    defect = fill_defect(fill)
+    if defect is not None:
+        return leg_result(Leg.P, [fail(Leg.P, defect, ident)])
     if via_resolver:
         return leg_result(Leg.P, [])
     if any(ts >= fill.ts_event for ts in ctx.index.mark_ts.get(fill.instrument_id, ())):
@@ -477,7 +498,13 @@ def _leg_p(ctx: AuditContext, fill: ExecFill, via_resolver: bool) -> LegResult:
         for m in ctx.tape_marks()
     ):
         return leg_result(Leg.P, [])
-    return leg_result(Leg.P, [fail(Leg.P, "no_position_mark", fill.client_order_id)])
+    if fill.ts_event > day_start + _LAST_MARK_HOUR * HOUR_NS:
+        if ctx.inp.tape.best_ask_at(yes, day_start + 24 * HOUR_NS) is not None:
+            return leg_result(Leg.P, [])
+        return leg_result(
+            Leg.P, [make_finding(Leg.P, PENDING, "tape_mark_next_day_pending", ident)]
+        )
+    return leg_result(Leg.P, [fail(Leg.P, "no_position_mark", ident)])
 
 
 # -- leg S -----------------------------------------------------------------------------------
@@ -490,7 +517,7 @@ def _leg_s(ctx: AuditContext, fill: ExecFill, link: OrderLinkView | None) -> Leg
     record = next((d for _, d in records if d.kind == _KIND_TAKE), records[0][1])
     subject = f"{record.station}:{record.climate_day}"
     if any(
-        s.station == record.station and s.climate_day == record.climate_day
+        same_station(s.station, record.station) and s.climate_day == record.climate_day
         for s in ctx.inp.settlements
     ):
         return leg_result(Leg.S, [])
@@ -625,9 +652,16 @@ def leg_f(inp: AuditInputs) -> LegResult:
         fail(Leg.F, "fill_by_day_mismatch", sha, "in_index" if sha in indexed else "in_scan")
         for sha in sorted(indexed ^ set(day_fills))
     ]
+    findings.extend(
+        info(Leg.F, "fill_by_day_entry_cross_day", sha)
+        for sha in sorted(set(inp.exec.fill_by_day.get(day.isoformat(), ())) - indexed)
+        if sha in by_sha
+    )
     scanned = [b.scan for b in inp.boots if b.scan is not None]
     if scanned:
         findings.extend(_node_fill_findings(inp, scanned, day_fills))
+    else:  # S2-R36: no node-log fills to cross-check, so the census cannot pass
+        findings.append(make_finding(Leg.F, PENDING, "node_scan_missing", inp.family_id))
     return leg_result(Leg.F, findings)
 
 
@@ -649,7 +683,8 @@ def _node_fill_findings(
                     fail(Leg.F, "node_fill_without_exec_fill", node_fill.client_order_id)
                 )
     if truncated:
-        return [*findings, info(Leg.F, "node_fills_truncated", inp.family_id)]
+        pending = make_finding(Leg.F, PENDING, "exec_fill_census_truncated", inp.family_id)
+        return [*findings, pending]
     resolver_coids = {r.client_order_id for r in inp.exec.resolvers}
     findings.extend(
         fail(Leg.F, "exec_fill_unexplained", f.client_order_id)
@@ -693,18 +728,6 @@ def leg_r6(inp: AuditInputs) -> LegResult:
 # -- tape marks ------------------------------------------------------------------------------
 
 
-def _signed_fill(fill: ExecFill) -> LegFill:
-    try:
-        return LegFill(
-            leg=leg_of_symbol(symbol_of_instrument_id(fill.instrument_id)),
-            side=fill.order_side,  # type: ignore[arg-type]
-            qty=Decimal(fill.cumulative_qty),
-            ts_event_ns=fill.ts_event,
-        )
-    except InvalidOperation as exc:
-        raise AuditInputError("exec_record_undecodable", "fill quantity unusable") from exc
-
-
 def tape_marks(inp: AuditInputs) -> tuple[TapeMark, ...]:
     """The catalog Depth10 best ask at each whole UTC hour of D for every held base slug.
 
@@ -713,16 +736,14 @@ def tape_marks(inp: AuditInputs) -> tuple[TapeMark, ...]:
     day_start = int(dt.datetime.combine(inp.day, dt.time(0), tzinfo=dt.UTC).timestamp()) * NS
     by_slug: dict[str, list[LegFill]] = defaultdict(list)
     for fill in sorted(inp.exec.fills, key=lambda f: f.ts_event):
-        by_slug[yes_instrument(fill.instrument_id)].append(_signed_fill(fill))
+        if fill_defect(fill) is None:  # a defective fill fails leg P by itself; it is never netted
+            by_slug[yes_instrument(fill.instrument_id)].append(signed_fill(fill))
     marks: list[TapeMark] = []
     for instrument in sorted(by_slug):
         for hour in range(24):
             hour_ns = day_start + hour * HOUR_NS
-            try:
-                net = net_signed_qty(f for f in by_slug[instrument] if f.ts_event_ns <= hour_ns)
-            except UnknownSide as exc:
-                raise AuditInputError("exec_record_undecodable", "fill side unusable") from exc
+            net = net_signed_qty(f for f in by_slug[instrument] if f.ts_event_ns <= hour_ns)
             if net != 0:
                 ask = inp.tape.best_ask_at(instrument, hour_ns)
-                marks.append(TapeMark(instrument, hour, ask, int(net.to_integral_value())))
+                marks.append(TapeMark(instrument, hour, ask, int(net)))
     return tuple(marks)
