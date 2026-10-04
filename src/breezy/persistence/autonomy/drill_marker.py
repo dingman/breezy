@@ -21,7 +21,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final, Self
 
@@ -160,7 +160,7 @@ class DrillMarker:
         }
 
     @classmethod
-    def from_wire(cls, obj: Mapping[str, object]) -> Self:
+    def from_wire(cls, obj: Mapping[str, object], *, raw_sha256: str | None = None) -> Self:
         require_exact_keys(obj, required=_KEYS)
         require_enum(obj, "schema", allowed=(DRILL_MARKER_SCHEMA,))
         return cls(
@@ -177,6 +177,7 @@ class DrillMarker:
             abort_record_sha256=optional_sha256(obj, "abort_record_sha256"),
             drill_clause_sha256=require_sha256(obj, "drill_clause_sha256"),
             ts_ns=require_ns(obj, "ts_ns"),
+            raw_sha256=raw_sha256,
         )
 
 
@@ -232,10 +233,9 @@ def read_marker_at(rootfd: int) -> DrillMarker | MarkerAbsent | MarkerError:
     finally:
         os.close(dirfd)
     try:
-        marker = DrillMarker.from_wire(parse_json_exact(raw))
+        return DrillMarker.from_wire(parse_json_exact(raw), raw_sha256=sha256_hex(raw))
     except WireRefused as exc:
         return MarkerError(MarkerErrorReason.INVALID, exc.reason.value)
-    return replace(marker, raw_sha256=sha256_hex(raw))
 
 
 def read_marker(paths: AutonomyPaths | ShadowPaths) -> DrillMarker | MarkerAbsent | MarkerError:

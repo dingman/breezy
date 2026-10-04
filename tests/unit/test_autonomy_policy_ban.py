@@ -51,16 +51,8 @@ class ExemptionRow(NamedTuple):
     reason: str
 
 
-#: A consumer adds its row in its own commit (ERRATA (b) items 42-44). The one row at 6c is a
-#: core module that predates the ban; it is flagged to the coordinator as a deviation.
-POLICY_BAN_EXEMPTIONS: Final[tuple[ExemptionRow, ...]] = (
-    ExemptionRow(
-        f"{AUTONOMY}/drill_marker.py",
-        "dataclasses.replace",
-        "read_marker_at stamps raw_sha256 on the DrillMarker it just parsed (seam 5b); the "
-        "object is a DrillMarker, never a StagePolicy",
-    ),
-)
+#: Empty at ARCH-0. A consumer adds its row in its own commit (ERRATA (b) items 42-44).
+POLICY_BAN_EXEMPTIONS: Final[tuple[ExemptionRow, ...]] = ()
 
 
 class AllowRow(NamedTuple):
@@ -618,3 +610,8 @@ def test_dynamic_import_is_banned_only_inside_autonomy_scope() -> None:
     source = "import importlib.metadata\nx = importlib.metadata.version('breezy')\n"
     assert _scan(OUTSIDE, source) == []
     assert [f.rule for f in _scan(CONSUMER, source)] == ["policy-construction"]
+
+
+def test_the_exemption_set_is_empty_at_arch0() -> None:
+    """The plan ships no reviewed exemption; a consumer adds its row in its own commit."""
+    assert POLICY_BAN_EXEMPTIONS == ()
