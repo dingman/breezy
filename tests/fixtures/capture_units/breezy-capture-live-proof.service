@@ -1,0 +1,18 @@
+# TEST FIXTURE ONLY (AUT-1 WP5 stage 3, D1/D12): never linked into the user manager.
+# Started by the audit's OnSuccess=; the 14:35 timer is the fallback.
+[Unit]
+Description=Breezy AUT-1 live-proof roll-up (user scope, sandboxed)
+OnFailure=breezy-autonomy-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+MemoryMax=256M
+TimeoutStartSec=300
+TimeoutStopSec=5
+ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/evidence/capture/live_proof
+ExecStart=/usr/bin/timeout -k 5 290 /usr/bin/flock -w 30 %t/breezy-capture-live-proof.lock /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-capture-live-proof /home/jon/breezy/.venv/bin/python3 -I -m breezy.analysis.capture_live_proof_cli
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-capture-live-proof

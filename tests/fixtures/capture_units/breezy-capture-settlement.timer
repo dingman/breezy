@@ -1,0 +1,10 @@
+# TEST FIXTURE ONLY (AUT-1 WP5 stage 3, D1/D12).
+[Unit]
+Description=13:35 UTC trigger for the Breezy AUT-1 settlement writer
+
+[Timer]
+Unit=breezy-capture-settlement.service
+OnCalendar=*-*-* 13:35:00 UTC
+
+[Install]
+WantedBy=timers.target

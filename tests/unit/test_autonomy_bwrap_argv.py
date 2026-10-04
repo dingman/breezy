@@ -148,6 +148,7 @@ def test_extra_namespace_flags_exact_set() -> None:
         "--unshare-ipc",
         "--unshare-uts",
         "--unshare-cgroup-try",
+        "--unshare-net",  # E-15: every network="none" row
     }
 
 

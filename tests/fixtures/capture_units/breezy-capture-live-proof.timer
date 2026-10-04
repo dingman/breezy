@@ -1,0 +1,10 @@
+# TEST FIXTURE ONLY (AUT-1 WP5 stage 3, D1/D12): the fallback for a day the audit unit never ran.
+[Unit]
+Description=14:35 UTC fallback trigger for the Breezy AUT-1 live-proof roll-up
+
+[Timer]
+Unit=breezy-capture-live-proof.service
+OnCalendar=*-*-* 14:35:00 UTC
+
+[Install]
+WantedBy=timers.target

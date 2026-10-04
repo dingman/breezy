@@ -34,7 +34,7 @@ def test_row_shape() -> None:
     assert row.units == frozenset({UNIT})
     assert row.binds == ("evidence/capture/stall", "health/recorder_watchdog")
     assert row.entry_modules == ("breezy.runtime.capture_recorder_hook_cli",)
-    assert row.resolves_dns is False
+    assert row.resolves_dns is False and row.network == "none"
     assert row.bus_reads == () and row.bus_snapshot_bind is None
     assert row.exceptions == frozenset()
     assert row.credential_names == () and not row.host_proc and not row.studies_lock

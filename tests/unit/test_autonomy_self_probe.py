@@ -569,6 +569,8 @@ def test_reason_codes_vocabulary_exact_and_pathless() -> None:
             "run_not_readonly",
             "tmp_not_private",
             "pid_ns",
+            "net_reachable",
+            "net_iface_visible",
         }
     )
     assert all("/" not in code and code == code.lower() for code in FIXED_REASON_CODES)
