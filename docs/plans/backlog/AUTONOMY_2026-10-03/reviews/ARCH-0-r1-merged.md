@@ -552,3 +552,92 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - (8c, item 7) The resolver checks HWM_RESET carried counters against the newest export (B9). Replay's prior-fold floor is necessary but not sufficient.
   - (8c/AUT-5/AUT-6) Every replay caller also calls `rows_admissible`. The replay docstring says so.
 - **8a merged 2026-10-04 05:02Z (cb37ca69, outside 16:30–17:10Z).** It was full-gated green together with seam B in gate A12 (phase1 rc=0, phase2 rc=0, no failures). The security review found live behaviour identical. Per AC 30 it activates at the node's next 16:50Z LAUNCH. No mid-day restart, for two reasons: the plan designates the 16:50Z relaunch as the activation evidence, and the change has no live behavioural effect. 8c merges only after a boot line timestamped after 2026-10-04 16:50Z.
+
+### Build-time rulings (seam B WP-B2c security review, 692f2bda): APPROVE with findings
+- **B9-R1 (M1).** A `show` bus read must carry at least one `-p`/`--property` and a `--` followed by unit tokens. An unbounded `show` would dump `Environment=` and the credential properties.
+- **B9-R2 (M2).**
+  - The reader refuses a snapshot whose `ts_ns` lies outside `[now − (budget_s + 60 s), now + 5 s]`, with `bus_snapshot_stale`.
+  - The snapshot is not authentic against its own row, because the row can write its own bind. Consumers must never treat it as a cross-trust attestation.
+- **B9-R3 (M3).** The deadline clock starts at entry to `_write`. Bus rows require `TimeoutStartSec ≥ budget_s + 10`, checked by the unit lint.
+- **B9-R4 (M4).** Add tests for:
+  - the reader's FIFO guard (`mkfifo`);
+  - the `MAX_DOCUMENT_BYTES` cap;
+  - `_parse_read` type strictness (bool rc, non-str argv, extra keys);
+  - hardlinked snapshot and sweep entries;
+  - `ts_ns` bounds.
+- **B9-R5 (budget floor).**
+  - `BUS_SNAPSHOT_BUDGET_RANGE_S` becomes `(5, 25)`.
+  - `_check_bus` requires `budget_s ≥ 2 + 1.5 × len(bus_reads)`.
+- **B9-R6 (LOW).**
+  - The sweep counts skips and emits one `sweep_skipped=N` reason code; exit stays 0.
+  - A `pid ≤ 1` or `pid == os.getpgrp()` refuses the kill.
+  - The writer caps the total document size and reads stdout in chunks, cut off past `MAX_STDOUT_BYTES`.
+- **Notes for consumers.**
+  - `RUN_TRANSIENT_SHOW_ARGV` carries `ExecStart` command lines, so consumers must not log the snapshot.
+  - The degraded state is not attested. Revisit when `NOTIFIER_FALLBACK_ROWS` becomes non-empty; until then a forged one gives `degraded_forged`, which fails closed.
+
+### Build-time rulings (seam B WP-B3 security review, 31c796d2)
+Live store never written: confirmed. Blocked past deadline: possible before these fixes.
+- **B10-R1 (HIGH, H-1).** The intent flock is released inside the helper on every path, success or failure, before anything is yielded to the caller. A test asserts that `_is_held(lock) is False` inside the `with` body for every failure reason: DEADLINE, FINGERPRINT_UNSTABLE, COPY_ERROR and the others.
+- **B10-R2 (M-1).** The copy loop checks the monotonic deadline after every chunk and aborts with DEADLINE. A truly uninterruptible read of a local regular file is accepted as a hardware-fault residual and documented. `release_deadline_ns` is validated to be no later than today's `pins.SCHEDULE_LAUNCH_UTC` instant minus 120 s (L-2), derived from `pins`, never a literal.
+- **B10-R3 (M-2).** The fingerprint also digests database page 1, which includes the file-change counter. The remaining same-tick residual applies only to `take_flock=False` (advisory) results, and is documented.
+- **B10-R4 (LOW).**
+  - (L-1) Recovery connects through `/proc/self/fd/N/<name>`, not `realpath`. The hygiene-scan allowlist adds that literal for `wal_snapshot` only, with a control.
+  - (L-3) `--exec-snapshot` is capped at 50.
+  - (L-4) Add a `builtins.open` spy and an `mmap` spy to the source-never-written test.
+
+### Build-time rulings (seam A 8c, 1d32a415: ARCH REQUEST_CHANGES, SEC APPROVE)
+Both reviewers confirm the resolver never yields permit semantics. `ResolvedFamily` has no permit or `enabled` field, and `_root_gate` hard-codes `permit_present=False`.
+- **A8c-R1 (ARCH M1, a child is judged against unpinned root bytes).** `_child_problem` requires `sha256(root_raw) == view.families[root].manifest_sha256`. Otherwise it returns `manifest_sha_mismatch`. Add a test: an edited root file plus a matching child is refused.
+- **A8c-R2 (ARCH M2 + SEC M1, consumer guard).** Do both:
+  - (a) Invert the AST guard to scan all of `src/` and `scripts/`, with an importer allowlist of `breezy.persistence.autonomy.*` (and tests). Resolve `level>0` imports against the module path. Flag `autonomy.resolver` attribute access on an imported `autonomy` package. Planted controls: relative import, package-attribute access, `app/` importer.
+  - (b) Add an import-linter forbidden contract named `AUT-1 resolver consumers (removed by AUT-5a)`, outside the `ARCH-0 autonomy (` prefix so B8-R2's count stays 3. It has sources app/strategy/runtime/adapters, forbids `breezy.persistence.autonomy.resolver`, and sets `allow_indirect_imports = false`.
+  - AUT-5a amends both when it lands the sanctioned consumer.
+- **A8c-R3 (SEC M2 + ARCH L2, never raises).**
+  - `WireRefused` from `check_venue` → `registry_unreadable`, detail `venue_malformed`.
+  - `OSError`/`RuntimeError` from `_verify_ruling_file` → `ruling_refused`, detail `ruling_missing`.
+  - `SKIP_SHADOW` `NotImplementedError` stays (8d); the docstring is narrowed to say so.
+  - Test each case.
+- **A8c-R4 (SEC M3, manifest density vs bound artefact).** Verify first. If no admissible chain can make `manifest.density_artefact_sha256` differ from the bound artefact sha (for a non-sentinel kind), assert equality with reason `artefact_sha_mismatch` (or the nearest existing closed reason) and add a test. If a legitimate path exists (for example an allowlisted manifest update), STOP and report it with the path; do not improvise.
+- **A8c-R5 (ARCH M3 + budget; reconciles ARCH "tighten" vs SEC "loosen").**
+  - Patch `RegistryReader.read_venue_rows`, never `_read_chain`, in the budget test and in `registry_resolver_world.serving`, so step 2 always runs.
+  - The 5 s wall-clock bound stays, because this host is memory-pressured.
+  - Regression detection uses a deterministic op count (fold invocations for 2k rows, pinned exactly) rather than a tighter clock.
+- **A8c-R6 (LOW, adopt now).**
+  - (ARCH L3) The d0/prefix rule skips heads the fold reports VOIDED or LAPSED.
+  - (ARCH L4 / SEC L3) The resolver takes a `busy_timeout_ms` kwarg with default pin `RESOLVE_BUSY_TIMEOUT_MS = 2000`.
+  - (ARCH L5) Test `""` → `UNSET`.
+  - (ARCH L6) Fix the B9 test docstring to read "necessary, not sufficient".
+  - (ARCH item 7) Add the real-run halves to `test_two_senders…` and `test_a_reset_below_the_newest_export…`.
+  - (ARCH L7) `replay` passes a memoised read into `family_bytes.probe_artefact`; a single `_UNREADABLE` tuple.
+  - Docstrings: `entries_allowed` is NOT a trade permit (SEC); the export race self-heals on retry (SEC L4).
+- **A8c-R7 (split, both reviewers).** Make a move-only `byte_binding.py` holding `FamilyBytes`, `ByteBindingFailure`, `verify_*`, the allowlist, `manifest_equal_modulo_allowlist`, `probe_artefact` and `read_artefact`, so `registry_store` no longer pulls in `live_orders_gate`. Land it as its own commit before the R1–R6 fixes.
+- **Accepted / carried.**
+  - ARCH L1 / SEC L1: the lineage reason mapping is fail-closed and noted for AUT-5 WP9.
+  - SEC L5: the path-based PREREG eligibility check is a guard only.
+  - AUT-5a binding note: a `read_family_source` ValueError = refuse boot, never fall back to UNSET; the node re-verifies `artefact_raw` by sha on load; log resolve duration at LAUNCH (E-23).
+- **A8c-R4 resolved (architect adjudication after the implementer's STOP).**
+  - **Finding.** The STOP path (MINT M1/A → PROMOTE M2/B) is not legitimate:
+    - an FQ artefact is complete and never composed (AUT-3 r6:85, :90);
+    - a family is bound to one artefact (ARCH:366-367);
+    - a new density means a new child (AUT-3 r6:85);
+    - the §4.2 allowlist applies only between a child and its root.
+  - **8c (blocker).** `byte_binding.verify_bound_bytes` refuses `manifest.density_artefact_sha256 != bound artefact sha` → `artefact_sha_mismatch`. It applies to every kind; sentinel roots bind the sentinel file, so the check still holds.
+    - Fixtures: the replay/resolver world uses the real FQ artefact bytes at the root manifest's `density_artefact_path` (sha `9c0b…`). Child fixtures pin their own artefact sha.
+    - Tests: density pin ≠ bound (root and child); repin within a family refused; `rung_recalibration` child positive control.
+  - **8d obligation (store half, before any MINT writer).**
+    - `ManifestFacts` gains `density_artefact_sha256`.
+    - `Rule.MANIFEST_DENSITY_NOT_BOUND` on BOOTSTRAP/MINT → `artefact_sha_mismatch`.
+    - `Rule.MANIFEST_BINDING_IMMUTABLE` → `manifest_sha_mismatch`.
+    - `fold.py:322` becomes `setdefault`; the Rule exact-set test is updated.
+    - The engine writes the family file before its MINT row.
+  - **AUT-5a obligation.**
+    - The node loads its artefact from the store by row sha (`artefact_store_relpath`), not from `manifest.density_artefact_*`.
+    - It re-asserts equality at composition → CRITICAL `registry_boot_load_failed`.
+    - The BOOTSTRAP CLI checks the manifest pin against the artefact (ARCH:260).
+  - Erratum E-24.
+- **B10-R5 (gate B7, 3d64e3ae).** `wal_snapshot.py` names `exec_polymarket_us.sqlite`, so the firewall classifies it as venue-touching (C5). Rule V1 then rejects the `("delete",)` journal-mode comparison at :493.
+  - The firewall is correct and stays untouched. The literal is not relocated to dodge it, and the module is not made to look non-venue.
+  - The module still sets the journal mode with `PRAGMA journal_mode=DELETE`.
+  - It then verifies the snapshot's on-disk header: bytes 18 and 19 must both be 1, meaning not WAL format. The existing `-wal`/`-shm` absence check stays.
+  - The B3 focused gate gains `tests/unit/test_polymarket_us_readonly_guard.py` and `tests/unit/test_polymarket_us_write_transport.py`.

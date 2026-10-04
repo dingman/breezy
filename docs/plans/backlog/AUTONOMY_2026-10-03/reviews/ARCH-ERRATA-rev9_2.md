@@ -491,3 +491,14 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **(b) ROOT_ADMIT** (ARCH:479). A ROOT_ADMIT cites the DRIFT `fee_schedule` PASS, plus any root-admission verdicts that AUT-5 names.
 - **(c) Lookup.** Replay and `validate` resolve each cited verdict in its subject family's verdict directory. The search is bounded to three places: the row's family, the batch partner, and the prior fold's senders. Every other verdict kind keeps the rule "PASS, subject = the row's family".
 - **(d) Model class.** An artefact's model class is found by probing the closed set `pins.MODEL_CLASS_COMPONENTS` and requiring exactly one match. This replaces the assumption that every artefact lives under `<kind>:density_table` (AUT-3 r6:90 `rung_recalibration`).
+
+## E-23 (coordinator, 2026-10-04; from the ARCH-0 seam A 8c ARCH and SEC reviews): resolve budget
+- **Bound.** The resolve budget is a 2,000-row chain (about one year at 6 rows/day) in 5 s or less. This replaces "10k rows in 2 s". Measured: 1.35 s.
+- **Growth.** Replay is quadratic: it re-folds `rows[:index]` for each batch (replay.py:493). The cost is roughly 1.35·(n/2000)² s, which reaches `ENGINE_LOCK_MAX_HOLD_S` at about 6.6k rows.
+- **Backlog obligation.** Replay must fold incrementally, carrying the fold forward batch to batch, before the chain reaches 3,000 rows (about 16 months).
+- **AUT-5a.** It logs resolve duration at every LAUNCH and relaunch.
+
+## E-24 (coordinator, 2026-10-04; from the A8c-R4 adjudication): a family's manifest is immutable and its density pin is its artefact
+- **Manifest sha.** A family's `manifest_sha256` is the one on its introducing row. A later row may carry only that same sha. This supersedes the "latest manifest sha" fold behaviour (fold.py:321-322).
+- **Density pin.** The manifest's `density_artefact_sha256` equals the family's bound artefact sha, for every kind. Sentinel roots bind the sentinel file.
+- **New density.** A new density is a new child family, minted. ARCH:367 was silent on manifest immutability; this erratum closes that gap.
