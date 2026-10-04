@@ -191,7 +191,8 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
     # A Protocol module: it holds no call site by construction.
     AuthorityRow("breezy.analysis.capture_node_log_sinks", min_calls=0),
     # -- W1: fill legs (no writes) --
-    AuthorityRow("breezy.analysis.capture_audit_fill_legs", min_calls=1),
+    AuthorityRow("breezy.analysis.capture_audit_fill_legs", min_calls=150),
+    AuthorityRow("breezy.analysis.capture_audit_fill_support", min_calls=25),
     # -- W2: reconciliation (no writes) --
     AuthorityRow("breezy.analysis.capture_audit_replay", min_calls=1),
     AuthorityRow("breezy.analysis.capture_audit_log_markers", min_calls=1),
