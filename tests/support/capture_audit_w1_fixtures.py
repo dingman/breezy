@@ -14,6 +14,7 @@ from collections.abc import Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any, Final
 
+from breezy.analysis.capture_audit_fill_legs import audit_fills
 from breezy.analysis.capture_audit_input_types import (
     AuditInputs,
     BootEvidence,
@@ -22,6 +23,9 @@ from breezy.analysis.capture_audit_input_types import (
     LogMarkers,
     ResolverContext,
 )
+from breezy.analysis.capture_audit_model import FillAudit, Leg, LegOutcome, LegResult
+from breezy.analysis.capture_node_log import NodeLogScan
+from breezy.analysis.capture_node_log_decisions import OrderFilledLine
 from breezy.analysis.capture_node_log_markers import OrderDeniedLine, OrderSubmittedLine
 from breezy.analysis.capture_settlement import SettlementRecord
 from breezy.domain.exec_intent import intent_fingerprint
@@ -63,15 +67,22 @@ __all__ = [
     "TRADE_ID",
     "VSHA",
     "DictTape",
+    "causes_of",
     "decision_view",
     "entry_day",
     "exit_day",
+    "failing_of",
+    "leg_of",
     "link_view",
     "markers_with",
+    "node_fill",
+    "one_fill",
     "replace_boot",
     "replace_c1",
     "resolver",
+    "scan_with",
     "with_decisions",
+    "with_links",
 ]
 
 DAY_START_NS: Final[int] = (
@@ -259,7 +270,43 @@ def _copy(decision_id: str, kind: str, body: Mapping[str, Any]) -> Any:
     )
 
 
+def node_fill(coid: str = COID, ts: int = FILL_TS) -> OrderFilledLine:
+    return OrderFilledLine(1, ts, INSTRUMENT, coid, "venue-raw", TRADE_ID, ts)
+
+
+def scan_with(*fills: OrderFilledLine, total: int | None = None) -> NodeLogScan:
+    """A node-log scan holding exactly ``fills`` (``total`` overrides the fill count)."""
+    kwargs: dict[str, Any] = {
+        name: 0
+        for name in (
+            "line_count",
+            "decision_line_count",
+            "entry_total",
+            "instance_id_total",
+            "disposed_count",
+            "fill_total",
+            "writer_failure_total",
+            "unparseable_total",
+            "duplicate_decision_count",
+            "duplicate_evaluation_count",
+        )
+    }
+    return NodeLogScan(
+        **{**kwargs, "fill_total": len(fills) if total is None else total},
+        kind_counts={},
+        entry_lines=(),
+        instance_ids=(),
+        node_disposed=True,
+        fills=tuple(fills),
+        writer_failures=(),
+        unparseable=(),
+        marker_counts={},
+        last_line_ts_ns=None,
+    )
+
+
 def _boot(c1: C1View, stream: CaptureStream, **over: Any) -> BootEvidence:
+    over.setdefault("scan", scan_with(node_fill()))
     return make_boot(c1=c1, stream=lambda: stream, **over)
 
 
@@ -398,3 +445,27 @@ def markers_with(submitted: Iterable[str] = (), denied: Iterable[str] = ()) -> L
 
 def resolver(coid: str = COID, *, created_ns: int = FILL_TS) -> ResolverContext:
     return ResolverContext("intent-1", coid, INSTRUMENT, created_ns)
+
+
+def one_fill(inp: AuditInputs) -> FillAudit:
+    """The single ``FillAudit`` of a one-fill day."""
+    fills = audit_fills(inp)
+    assert len(fills) == 1
+    return fills[0]
+
+
+def leg_of(fill: FillAudit, leg: Leg) -> LegResult:
+    (found,) = [r for r in fill.legs if r.leg is leg]
+    return found
+
+
+def causes_of(result: LegResult) -> set[str]:
+    return {f.cause for f in result.findings}
+
+
+def failing_of(result: LegResult) -> set[str]:
+    return {f.cause for f in result.findings if f.outcome is LegOutcome.FAIL}
+
+
+def with_links(inp: AuditInputs, *links: Any) -> AuditInputs:
+    return replace_c1(inp, order_links=tuple(links))

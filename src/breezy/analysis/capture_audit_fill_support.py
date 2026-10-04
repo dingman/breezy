@@ -10,6 +10,7 @@ import datetime as dt
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Final
 
 from breezy.analysis.capture_audit_input_types import AuditInputs, BootEvidence, ExecFill
@@ -23,13 +24,14 @@ from breezy.analysis.capture_audit_model import (
 )
 from breezy.domain.climate_day import standard_time_zone
 from breezy.domain.exec_intent import utc_day_for_ns
-from breezy.domain.instrument_leg import base_symbol_of
+from breezy.domain.instrument_leg import base_symbol_of, leg_of_symbol, symbol_of_instrument_id
 from breezy.persistence.autonomy.capture_reader import (
     C1View,
     CaptureStream,
     DecisionView,
     LifecycleEventView,
 )
+from breezy.persistence.autonomy.net_position import LegFill
 
 __all__ = [
     "FAIL",
@@ -46,13 +48,17 @@ __all__ = [
     "build_index",
     "climate_day_end_ns",
     "fail",
+    "fill_defect",
     "fill_event",
     "in_day",
     "info",
     "leg_result",
     "make_finding",
     "offset_of",
+    "same_station",
+    "signed_fill",
     "skipped",
+    "station_key",
     "utc_day",
     "yes_instrument",
 ]
@@ -60,6 +66,8 @@ __all__ = [
 NS: Final[int] = 1_000_000_000
 HOUR_NS: Final[int] = 3600 * NS
 FILLED: Final[str] = "FILLED"
+_ICAO_LEN: Final[int] = 4
+_SIDES: Final[frozenset[str]] = frozenset({"BUY", "SELL"})
 _EPOCH: Final[dt.datetime] = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
 
 FAIL, PASS, PENDING, INFO, SKIPPED = (
@@ -114,12 +122,49 @@ def in_day(ts_ns: int, day: dt.date) -> bool:
         return False
 
 
+def station_key(station: str) -> str:
+    """The city-code form of a station named by city code (``LAX``) or ICAO id (``KLAX``)."""
+    return station[1:] if len(station) == _ICAO_LEN and station.startswith("K") else station
+
+
+def same_station(a: str, b: str) -> bool:
+    """Two station names denote one station: the one matcher legs B and S both use."""
+    return station_key(a) == station_key(b)
+
+
 def offset_of(inp: AuditInputs, station: str) -> float | None:
     """The fixed standard-time offset of a station keyed by city code or ICAO id."""
-    for key in (station, f"K{station}", station.removeprefix("K")):
-        if key in inp.std_offsets:
-            return float(inp.std_offsets[key])
+    key = station_key(station)
+    for candidate in (station, key, f"K{key}"):
+        if candidate in inp.std_offsets:
+            return float(inp.std_offsets[candidate])
     return None
+
+
+def fill_defect(fill: ExecFill) -> str | None:
+    """The per-fill cause for a fill no position can be netted from, else None.
+
+    An unknown side or a fractional quantity fails that fill (never a whole-day ERROR, never a
+    truncation). A quantity that is not a finite decimal at all is an undecodable exec record."""
+    if fill.order_side not in _SIDES:
+        return "fill_side_unknown"
+    try:
+        qty = Decimal(fill.cumulative_qty)
+    except InvalidOperation as exc:
+        raise AuditInputError("exec_record_undecodable", "fill quantity unusable") from exc
+    if not qty.is_finite():
+        raise AuditInputError("exec_record_undecodable", "fill quantity unusable")
+    return "fill_qty_fractional" if qty != qty.to_integral_value() else None
+
+
+def signed_fill(fill: ExecFill) -> LegFill:
+    """The netting input of a fill that has no ``fill_defect``."""
+    return LegFill(
+        leg=leg_of_symbol(symbol_of_instrument_id(fill.instrument_id)),
+        side=fill.order_side,  # type: ignore[arg-type]
+        qty=Decimal(fill.cumulative_qty),
+        ts_event_ns=fill.ts_event,
+    )
 
 
 def climate_day_end_ns(climate_day: dt.date, std_utc_offset_hours: float) -> int:
