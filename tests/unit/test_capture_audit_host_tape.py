@@ -238,6 +238,64 @@ def test_a_malformed_recorder_journal_is_journal_failed(text: str) -> None:
     assert info.value.cause == "journal_failed"
 
 
+# -- S3-R1 / S3-R33: the invocation id of a UNIT_RESULT line --------------------------------------
+
+_HEAL_FIXTURES = Path(__file__).parents[1] / "fixtures" / "capture_heal"
+
+
+def _real_line(name: str) -> str:
+    return (_HEAL_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def test_unit_result_user_invocation_id_is_read() -> None:
+    text = json.dumps(
+        {"__REALTIME_TIMESTAMP": "5", "UNIT_RESULT": "watchdog", "USER_INVOCATION_ID": "ef" * 16}
+    )
+    (got,) = host.parse_recorder_journal(text)
+    assert got.invocation_id == "ef" * 16
+
+
+def test_user_invocation_id_wins_over_the_fallbacks() -> None:
+    text = json.dumps(
+        {
+            "__REALTIME_TIMESTAMP": "5",
+            "UNIT_RESULT": "watchdog",
+            "USER_INVOCATION_ID": "ef" * 16,
+            "INVOCATION_ID": "ab" * 16,
+            "_SYSTEMD_INVOCATION_ID": "cd" * 16,
+        }
+    )
+    assert host.parse_recorder_journal(text)[0].invocation_id == "ef" * 16
+
+
+def test_empty_invocation_id_is_journal_failed() -> None:
+    text = json.dumps({"__REALTIME_TIMESTAMP": "5", "UNIT_RESULT": "watchdog", "MESSAGE": "x"})
+    with pytest.raises(AuditInputError) as info:
+        host.parse_recorder_journal(text)
+    assert info.value.cause == "journal_failed"
+    blank = json.dumps({"__REALTIME_TIMESTAMP": "5", "UNIT_RESULT": "x", "USER_INVOCATION_ID": ""})
+    with pytest.raises(AuditInputError):
+        host.parse_recorder_journal(blank)
+
+
+def test_real_timeout_kill_line_parses() -> None:
+    """The recorder's real 2026-09-05 ``UNIT_RESULT=timeout`` line, copied verbatim."""
+    (got,) = host.parse_recorder_journal(_real_line("unit_result_real_timeout.json"))
+    assert got.unit_result == "timeout"
+    assert got.invocation_id == "20f02ed53de4413e811bc884c422a395"
+    assert got.ts_ns == 1788582858022946 * 1000
+
+
+def test_real_watchdog_kill_line_parses() -> None:
+    """A real ``UNIT_RESULT=watchdog`` line from another unit (the recorder has none yet, F7)."""
+    (got,) = host.parse_recorder_journal(_real_line("unit_result_real_watchdog.json"))
+    raw = json.loads(_real_line("unit_result_real_watchdog.json"))
+    assert raw["USER_UNIT"] != "breezy-quote-tape.service"  # another unit's line
+    assert got.unit_result == "watchdog"
+    assert got.invocation_id == raw["USER_INVOCATION_ID"] != ""
+    assert got.ts_ns == int(raw["__REALTIME_TIMESTAMP"]) * 1000
+
+
 # -- the bus snapshot (S2-R8) ------------------------------------------------------------------
 
 

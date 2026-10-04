@@ -302,7 +302,11 @@ def parse_recorder_journal(text: str) -> tuple[RecorderJournalEntry, ...]:
             continue
         if ts_ns is None:
             raise _journal_failed("missing_timestamp")
-        invocation = _text(entry, "INVOCATION_ID", "_SYSTEMD_INVOCATION_ID")
+        # S3-R1: systemd's own ``UNIT_RESULT`` line carries ``USER_INVOCATION_ID`` (a unit's stdout
+        # lines carry ``_SYSTEMD_INVOCATION_ID``); an entry with no id cannot be matched.
+        invocation = _text(entry, "USER_INVOCATION_ID", "INVOCATION_ID", "_SYSTEMD_INVOCATION_ID")
+        if not invocation:
+            raise _journal_failed("missing_invocation_id")
         found.append(RecorderJournalEntry(ts_ns, invocation, result, _text(entry, "MESSAGE")))
     return tuple(sorted(found, key=lambda e: (e.ts_ns, e.invocation_id)))
 
