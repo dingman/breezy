@@ -19,9 +19,10 @@ from typing import Any, Final
 
 import pytest
 
+import breezy.persistence.autonomy.registry_shape as shape
 import breezy.persistence.autonomy.registry_store as rs
 from breezy.persistence.autonomy import chain, pins, stage_policy, transitions
-from breezy.persistence.autonomy.chain import ChainBroken, verify_venue_chain
+from breezy.persistence.autonomy.chain import verify_venue_chain
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
 from breezy.persistence.autonomy.registry_store import (
     AdmissionPending,
@@ -53,6 +54,7 @@ from breezy.persistence.autonomy.schemas import (
     TransitionRow,
     WriterMode,
 )
+from breezy.persistence.autonomy.wire import WireRefusalReason, WireRefused
 from tests.support.autonomy_policy_scan import find_predicate_reads
 from tests.support.entry_points import SRC_DIR
 
@@ -71,8 +73,8 @@ OPEN_STAGE = StagePolicy(
     enabled_widening_kinds=frozenset(Kind), admission_implemented=frozenset(Kind)
 )
 
-_LINEAGE = rs._LINEAGE_REQUIRED
-_PAIR_CITING = rs._PAIR_CITING
+_LINEAGE = shape.LINEAGE_REQUIRED
+_PAIR_CITING = shape.PAIR_CITING
 
 
 def fill(kind: Kind, frm: State | None, to: State) -> dict[str, Any]:
@@ -137,6 +139,15 @@ def demote(*, fps: int = 1, expected: int = 1, ts: int = NOW + SEC) -> Transitio
 
 def with_columns(row: TransitionRow, **columns: Any) -> TransitionRow:
     return replace(row, **columns)
+
+
+def demote_with(**columns: Any) -> TransitionRow:
+    return with_columns_id(demote(), **columns)
+
+
+def with_columns_id(row: TransitionRow, **columns: Any) -> TransitionRow:
+    changed = replace(row, **columns)
+    return replace(changed, transition_id=changed.computed_transition_id())
 
 
 @pytest.fixture
@@ -361,11 +372,11 @@ def test_registry_transition_table_is_exact(store: RegistryStore) -> None:
                     check_row_shape(row)
                     accepted += 1
                 else:
-                    with pytest.raises(RowRefused):
+                    with pytest.raises(RowRefused, match="transition pair not allowed"):
                         check_row_shape(row)
     assert accepted == sum(len(pairs) for pairs in transitions.ALLOWED.values())
     # And the store itself writes nothing for a refused pair.
-    with pytest.raises(RowRefused):
+    with pytest.raises(RowRefused, match="transition pair not allowed"):
         store.append(
             [mk(Kind.DEMOTE, State.CHAMPION, frm=State.CHAMPION)], expected_prior_seq=0,
             mode=WriterMode.INTRADAY, now_ns=NOW,
@@ -380,7 +391,7 @@ def test_registry_transition_table_is_exact(store: RegistryStore) -> None:
 def test_nomination_columns_required_and_read_by_k_check(case: str, store: RegistryStore) -> None:
     nomination = mk(Kind.PROMOTE, State.CHALLENGER, frm=State.SHADOW, family=CHILD)
     check_row_shape(nomination)
-    for field in rs._NOMINATION_FIELDS:
+    for field in shape.NOMINATION_FIELDS:
         with pytest.raises(RowRefused):
             check_row_shape(with_columns(nomination, **{field: None}))
     elsewhere = mk(Kind.PROMOTE, State.CHAMPION, frm=State.CHALLENGER, family=CHILD)
@@ -605,20 +616,31 @@ def test_trigger_refuses_an_existing_seq(store: RegistryStore) -> None:
 
 
 def test_insert_or_replace_refused(store: RegistryStore) -> None:
-    """Under the writer's pragmas REPLACE fires the DELETE trigger; without them the BEFORE INSERT
-    guard still refuses a duplicate venue_seq."""
+    """A6e-R5: on a default connection (no recursive_triggers) REPLACE used to delete the original
+    row when the same transition_id arrived at head+1; the insert guard now refuses it."""
     put_bootstrap(store)
     replace_sql = rs._INSERT_ROW.replace("INSERT INTO", "INSERT OR REPLACE INTO")
     colliding_id = sealed_copy(store, venue_seq=2)  # same transition_id, next venue_seq
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        raw_insert(store, colliding_id, replace_sql)
-    conn = raw(store)  # default connection: REPLACE would bypass the DELETE trigger
+    conn = raw(store)  # recursive_triggers OFF, the SQLite default
     try:
+        assert conn.execute("PRAGMA recursive_triggers").fetchone() == (0,)
+        with pytest.raises(sqlite3.IntegrityError, match="transition_id exists"):
+            conn.execute(replace_sql, rs._to_db(colliding_id))
         with pytest.raises(sqlite3.IntegrityError, match="venue_seq duplicate"):
-            conn.execute(replace_sql, rs._to_db(sealed_copy(store, venue_seq=1)))
+            conn.execute(
+                replace_sql, rs._to_db(sealed_copy(store, venue_seq=1, transition_id=SHA_P))
+            )
     finally:
         conn.close()
-    assert [r[2] for r in stored(store)] == [1]
+    with pytest.raises(sqlite3.IntegrityError, match="transition_id exists"):
+        raw_insert(store, colliding_id, replace_sql)  # and under the writer's pragmas
+    assert [r[2] for r in stored(store)] == [1]  # the original row survived
+
+
+def test_plain_insert_of_an_existing_transition_id_is_refused(store: RegistryStore) -> None:
+    put_bootstrap(store)
+    with pytest.raises(sqlite3.IntegrityError, match="transition_id exists"):
+        raw_insert(store, sealed_copy(store, venue_seq=2))
 
 
 def test_on_conflict_do_update_refused(store: RegistryStore) -> None:
@@ -627,16 +649,16 @@ def test_on_conflict_do_update_refused(store: RegistryStore) -> None:
     row = sealed_copy(store, venue_seq=2)
     for conn in (store._open(), raw(store)):
         try:
-            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(upsert, rs._to_db(row))
         finally:
             conn.close()
-    assert stored(store)[0][2] == 1 and len(stored(store)) == 1
-
-
-# ---------------------------------------------------------------------------------------------
-# Writer connection and SQL hygiene
-# ---------------------------------------------------------------------------------------------
+    conn = raw(store)
+    try:
+        assert conn.execute("SELECT family_id FROM transitions").fetchall() == [(FAMILY,)]
+    finally:
+        conn.close()
+    assert len(stored(store)) == 1
 
 
 def test_writer_pragmas_read_back(store: RegistryStore, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -644,7 +666,7 @@ def test_writer_pragmas_read_back(store: RegistryStore, monkeypatch: pytest.Monk
     try:
         assert conn.isolation_level is None
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("delete",)
-        assert conn.execute("PRAGMA synchronous").fetchone() == (2,)
+        assert conn.execute("PRAGMA synchronous").fetchone() == (3,)  # A6e-R6: EXTRA
         assert conn.execute("PRAGMA recursive_triggers").fetchone() == (1,)
         assert conn.execute("PRAGMA trusted_schema").fetchone() == (0,)
         conn.execute("BEGIN IMMEDIATE")
@@ -652,7 +674,7 @@ def test_writer_pragmas_read_back(store: RegistryStore, monkeypatch: pytest.Monk
         conn.execute("ROLLBACK")
     finally:
         conn.close()
-    wrong = (("PRAGMA synchronous = FULL", "PRAGMA synchronous", 1),)
+    wrong = (("PRAGMA synchronous = EXTRA", "PRAGMA synchronous", 1),)
     monkeypatch.setattr(rs, "_WRITER_PRAGMAS", wrong)
     with pytest.raises(StoreUnavailable):
         store._open()
@@ -665,9 +687,10 @@ def test_a_second_writer_waits_then_is_refused_as_unavailable(
     holder = store._open()
     holder.execute("BEGIN IMMEDIATE")
     try:
-        with pytest.raises(StoreUnavailable) as info:
+        with pytest.raises(rs.StoreBusy) as info:
             put_bootstrap(store)
         assert info.value.reason is RefusalReason.REGISTRY_UNREADABLE
+        assert not isinstance(info.value, rs.StoreDrifted)
     finally:
         holder.execute("ROLLBACK")
         holder.close()
@@ -877,42 +900,62 @@ def test_append_requires_concrete_mode(store: RegistryStore) -> None:
 def test_row_ts_skew_and_monotonicity_refused(store: RegistryStore) -> None:
     limit = pins.ROW_TS_MAX_SKEW_S * SEC
     assert limit == 300 * SEC
-    for ts in (NOW + limit + 1, NOW - limit - 1):
+    # A6e-R9: a row stamped after the writer's clock is refused; so is one far in the past.
+    for ts in (NOW + 1, NOW - limit - 1):
         with pytest.raises(ClockRefused) as info:
             store.append(
                 [bootstrap(ts=ts)], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW
             )
         assert info.value.reason is RefusalReason.CLOCK_INVALID
-    # Exactly the skew, either side of now_ns, is allowed (and stays monotone).
     low = bootstrap(ts=NOW - limit)
-    high = bootstrap(CHILD, ts=NOW + limit, expected=1)
+    high = bootstrap(CHILD, ts=NOW, expected=1)  # exactly now_ns is allowed
     store.append([low], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
     store.append([high], expected_prior_seq=1, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
-    # Within the skew of now_ns, a row still may not precede the chain head.
-    behind = mk(Kind.DEMOTE, State.HALTED, frm=State.CHAMPION, fps=1, expected=2, ts=NOW)
+    behind = mk(Kind.DEMOTE, State.HALTED, frm=State.CHAMPION, fps=1, expected=2, ts=NOW - SEC)
     with pytest.raises(ClockRefused) as info:
         store.append([behind], expected_prior_seq=2, mode=WriterMode.INTRADAY, now_ns=NOW)
     assert info.value.reason is RefusalReason.CLOCK_BEFORE_HEAD
     assert len(stored(store)) == 2
 
 
+def test_a_future_stamped_row_is_refused_with_clock_invalid(store: RegistryStore) -> None:
+    with pytest.raises(ClockRefused) as info:
+        store.append(
+            [bootstrap(ts=NOW + 1)], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW
+        )
+    assert info.value.reason is RefusalReason.CLOCK_INVALID
+    assert stored(store) == []
+
+
 def test_a_batch_must_be_monotone_within_itself(store: RegistryStore) -> None:
     a = bootstrap(ts=NOW + 2 * SEC)
     b = bootstrap(CHILD, ts=NOW + SEC)
-    with pytest.raises(ClockRefused):
-        store.append([a, b], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
+    with pytest.raises(ClockRefused) as info:
+        store.append([a, b], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW + 2 * SEC)
+    assert info.value.reason is RefusalReason.CLOCK_BEFORE_HEAD
 
 
-# ---------------------------------------------------------------------------------------------
-# Structural verification and batch refusals
-# ---------------------------------------------------------------------------------------------
-
-
-def test_a_wrong_family_prior_seq_is_refused_as_chain_broken(store: RegistryStore) -> None:
+def test_a_stale_writer_gets_cas_mismatch_not_clock_before_head(store: RegistryStore) -> None:
+    """A6e-R8 / E-17 d: CAS runs before the clock check (the retry path is CasMismatch)."""
     put_bootstrap(store)
-    wrong = demote(fps=7)
-    with pytest.raises(ChainBroken) as info:
-        store.append([wrong], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    stale = demote(ts=NOW + SEC)  # prepared against head 1
+    winner = mk(
+        Kind.ATTEST, State.CHAMPION, frm=State.CHAMPION, fps=1, expected=1, ts=NOW + 9 * SEC
+    )
+    store.append([winner], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + 9 * SEC)
+    with pytest.raises(CasMismatch) as info:
+        store.append([stale], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + 9 * SEC)
+    assert isinstance(info.value, RegistryRefused)
+    assert info.value.reason is RefusalReason.ENGINE_INCONSISTENCY
+
+
+def test_a_wrong_family_prior_seq_is_refused_as_chain_refused(store: RegistryStore) -> None:
+    put_bootstrap(store)
+    with pytest.raises(rs.ChainRefused) as info:
+        store.append(
+            [demote(fps=7)], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC
+        )
+    assert isinstance(info.value, RegistryRefused)
     assert info.value.reason is RefusalReason.CHAIN_BROKEN
     assert len(stored(store)) == 1
 
@@ -927,13 +970,35 @@ def test_a_stored_chain_that_does_not_verify_blocks_further_appends(store: Regis
         transition_hash=SHA_B,
     )
     raw_insert(store, forged)
-    with pytest.raises(ChainBroken) as info:
+    with pytest.raises(rs.ChainRefused) as info:
         store.append(
             [demote(expected=2)], expected_prior_seq=2, mode=WriterMode.INTRADAY, now_ns=NOW + SEC
         )
     assert info.value.reason is RefusalReason.CHAIN_BROKEN
     assert "hash" in info.value.detail
     assert len(stored(store)) == 2
+
+
+def test_no_bare_chain_broken_wire_or_value_error_escapes_append(
+    store: RegistryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put_bootstrap(store)
+    for name, error in (
+        ("_seal", WireRefused(WireRefusalReason.BAD_VALUE, "x")),
+        ("fold", ValueError("x")),
+        ("_check_clock", TypeError("x")),
+    ):
+
+        def boom(*_a: object, _e: Exception = error, **_k: object) -> None:
+            raise _e
+
+        monkeypatch.setattr(rs, name, boom)
+        with pytest.raises(RowRefused):
+            store.append(
+                [demote()], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC
+            )
+        monkeypatch.undo()
+    assert len(stored(store)) == 1
 
 
 def test_a_family_first_written_by_a_non_introducing_kind_is_refused(store: RegistryStore) -> None:
@@ -977,16 +1042,6 @@ def test_batch_refusals(store: RegistryStore) -> None:
         with pytest.raises(RowRefused):
             store.append(rows, expected_prior_seq=expected, mode=WriterMode.BOOTSTRAP, now_ns=now)
     assert stored(store) == []
-
-
-def test_every_refusal_carries_a_closed_reason(store: RegistryStore) -> None:
-    classes = [
-        c for c in vars(rs).values() if isinstance(c, type) and issubclass(c, RegistryRefused)
-    ]
-    assert len(classes) >= 14
-    for cls in classes:
-        assert isinstance(cls.reason, RefusalReason)
-        assert cls("x").reason in set(RefusalReason)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1033,3 +1088,312 @@ def test_a_dataless_directory_listing_shows_only_the_database(store: RegistrySto
     put_bootstrap(store)
     names = sorted(p.name for p in store._db.parent.iterdir())
     assert names == ["registry.sqlite"]  # DELETE journal mode leaves no sidecar at rest
+
+
+# ---------------------------------------------------------------------------------------------
+# A6e-R4 / E-17 a: the Y9 no-op applies only when the bodies match
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_submitted_transition_id_must_equal_the_computed_id(store: RegistryStore) -> None:
+    forged = replace(bootstrap(), transition_id=SHA_P)
+    with pytest.raises(RowRefused, match="transition_id"):
+        store.append([forged], expected_prior_seq=0, mode=WriterMode.BOOTSTRAP, now_ns=NOW)
+    assert stored(store) == []
+
+
+def _swap_cancel(voids: tuple[str, ...]) -> TransitionRow:
+    return mk(
+        Kind.SWAP_CANCEL, State.CHALLENGER, frm=State.CHALLENGER, fps=1, expected=1,
+        ts=NOW + SEC, voids_transition_ids=voids,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        pytest.param(
+            demote_with(cause_code=CauseCode.VERDICT_FAIL),
+            demote_with(cause_code=CauseCode.EXEC_STORE_HALT_MIRROR),
+            id="cause_code",
+        ),
+        pytest.param(
+            demote_with(halt_cause_class=CauseClass.RECOVERABLE_MODEL),
+            demote_with(halt_cause_class=CauseClass.RECOVERABLE_INFRA),
+            id="halt_cause_class",
+        ),
+        pytest.param(_swap_cancel((SHA_P,)), _swap_cancel((SHA_B,)), id="voids_transition_ids"),
+    ],
+)
+def test_replay_differing_in_a_semantic_column_is_refused(
+    store: RegistryStore, first: TransitionRow, second: TransitionRow
+) -> None:
+    put_bootstrap(store)
+    assert first.transition_id == second.transition_id  # the Y9 id does not cover the column
+    store.append([first], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    with pytest.raises(rs.ReplayMismatch) as info:
+        store.append([second], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    assert isinstance(info.value, RegistryRefused)
+    assert len(stored(store)) == 2
+
+
+def test_replay_ignores_only_the_excluded_columns(store: RegistryStore) -> None:
+    put_bootstrap(store)
+    first = demote_with(cause_code=CauseCode.VERDICT_FAIL)
+    store.append([first], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    retry = replace(
+        first, ts_ns=NOW + 2 * SEC, invocation_id=INVOCATION.replace("1", "2"), expected_prior_seq=1
+    )
+    again = store.append(
+        [retry], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + 3 * SEC
+    )
+    assert again.replayed is True and again.rows[0].ts_ns == NOW + SEC  # the stored row, unchanged
+
+
+# ---------------------------------------------------------------------------------------------
+# A6e-R8: busy vs drifted
+# ---------------------------------------------------------------------------------------------
+
+
+def test_drift_is_not_busy_and_busy_is_not_drift(store: RegistryStore) -> None:
+    conn = raw(store)
+    conn.execute("DROP TRIGGER transitions_no_delete")
+    conn.commit()
+    conn.close()
+    with pytest.raises(rs.StoreDrifted) as info:
+        put_bootstrap(store)
+    assert not isinstance(info.value, rs.StoreBusy)
+    assert info.value.reason is RefusalReason.REGISTRY_UNREADABLE
+    assert issubclass(rs.StoreBusy, StoreUnavailable) and issubclass(
+        rs.StoreDrifted, StoreUnavailable
+    )
+
+
+def test_a_missing_or_foreign_database_is_drifted_not_busy(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    with pytest.raises(rs.StoreDrifted):
+        put_bootstrap(RegistryStore(AutonomyPaths(root), repo_root=tmp_path / "repo"))
+
+
+# ---------------------------------------------------------------------------------------------
+# A6e-R10: column rules
+# ---------------------------------------------------------------------------------------------
+
+
+def test_halt_cause_class_belongs_to_demote_and_halt_only() -> None:
+    check_row_shape(demote_with(halt_cause_class=CauseClass.RECOVERABLE_INFRA))
+    attest = mk(Kind.ATTEST, State.CHAMPION, frm=State.CHAMPION)
+    with pytest.raises(RowRefused, match="halt_cause_class"):
+        check_row_shape(with_columns(attest, halt_cause_class=CauseClass.DRILL))
+
+
+def test_swap_cancel_needs_a_non_empty_void_list() -> None:
+    check_row_shape(_swap_cancel((SHA_P,)))
+    for bad in ((), None):
+        with pytest.raises(RowRefused, match="voids_transition_ids"):
+            check_row_shape(with_columns(_swap_cancel((SHA_P,)), voids_transition_ids=bad))
+
+
+def test_cause_code_values_are_validated_per_kind() -> None:
+    with pytest.raises(RowRefused, match="cause_code"):
+        check_row_shape(demote_with(cause_code=CauseCode.DRILL_CLOSE_RESTORE))
+    with pytest.raises(RowRefused, match="cause_code"):
+        check_row_shape(demote_with(cause_code=CauseCode.TARGET_INTEGRITY))
+    ineligible = mk(
+        Kind.TARGET_INELIGIBLE, State.CHALLENGER, frm=State.CHALLENGER,
+        cause_code=CauseCode.TARGET_INTEGRITY,
+    )  # fmt: skip
+    check_row_shape(ineligible)
+    with pytest.raises(RowRefused, match="cause_code"):
+        check_row_shape(with_columns(ineligible, cause_code=CauseCode.DRILL_CLOSE_RESTORE))
+
+
+# ---------------------------------------------------------------------------------------------
+# A6e-R11
+# ---------------------------------------------------------------------------------------------
+
+
+def test_sqlite_stat_tables_do_not_refuse_writes(store: RegistryStore) -> None:
+    put_bootstrap(store)
+    conn = raw(store)
+    conn.execute("ANALYZE")
+    conn.commit()
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    conn.close()
+    assert "sqlite_stat1" in names
+    store.append([demote()], expected_prior_seq=1, mode=WriterMode.INTRADAY, now_ns=NOW + SEC)
+    assert len(stored(store)) == 2
+
+
+class _RollbackBoom:
+    """A connection proxy whose ROLLBACK raises; records close()."""
+
+    def __init__(self, inner: sqlite3.Connection) -> None:
+        self._inner = inner
+        self.closed = False
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._inner.in_transaction
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        if sql == "ROLLBACK":
+            raise sqlite3.OperationalError("injected rollback failure")
+        return self._inner.execute(sql, *args)
+
+    def close(self) -> None:
+        self.closed = True
+        self._inner.close()
+
+
+def test_a_failing_rollback_still_closes_and_the_original_error_survives(
+    store: RegistryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxies: list[_RollbackBoom] = []
+    real_open = store._open
+
+    def open_proxy() -> Any:
+        proxies.append(_RollbackBoom(real_open()))
+        return proxies[-1]
+
+    def explode(_row: TransitionRow) -> tuple[object, ...]:
+        raise RuntimeError("original failure")
+
+    monkeypatch.setattr(store, "_open", open_proxy)
+    monkeypatch.setattr(rs, "_to_db", explode)
+    with pytest.raises(RuntimeError, match="original failure"):
+        put_bootstrap(store)
+    assert proxies[0].closed
+
+
+def test_open_rechecks_file_and_directory_modes(store: RegistryStore) -> None:
+    os.chmod(store._db, 0o644)
+    with pytest.raises(rs.StoreDrifted):
+        put_bootstrap(store)
+    os.chmod(store._db, 0o600)
+    os.chmod(store._db.parent, 0o755)
+    try:
+        with pytest.raises(rs.StoreDrifted):
+            put_bootstrap(store)
+    finally:
+        os.chmod(store._db.parent, 0o700)
+    assert put_bootstrap(store).replayed is False
+
+
+def _trigger(name: str, store: RegistryStore, monkeypatch: pytest.MonkeyPatch) -> RegistryRefused:
+    """Provoke the named refusal through the public path and return what was raised."""
+    put_bootstrap(store)
+    ts = NOW + SEC
+    batch: list[TransitionRow] = [demote()]
+    kwargs: dict[str, Any] = {"expected_prior_seq": 1, "mode": WriterMode.INTRADAY, "now_ns": ts}
+    if name == "StageNotCanonical":
+        return _raised(
+            lambda: store._append(batch, stage=StagePolicy(frozenset(), frozenset()), **kwargs)
+        )
+    if name in {"WideningNotEnabled", "AdmissionPending"}:
+        head = mk(Kind.ROLLBACK, State.CHAMPION, frm=State.CHALLENGER, fps=1, expected=1,
+                  ts=ts, effective_launch_date=LAUNCH_DAY)  # fmt: skip
+        stage = StagePolicy(
+            frozenset({Kind.ROLLBACK}) if name == "AdmissionPending" else frozenset(), frozenset()
+        )
+        return _raised(
+            lambda: store._append(
+                [head], stage=stage, _fixture_stage=True, **{**kwargs, "mode": WriterMode.DAILY}
+            )
+        )
+    if name == "NominationRequiresPolicy":
+        nom = mk(Kind.PROMOTE, State.CHALLENGER, frm=State.SHADOW, family=CHILD, expected=1, ts=ts)
+        return _raised(lambda: store.append([nom], **{**kwargs, "mode": WriterMode.DAILY}))
+    if name == "RuleSetPending":
+        reset = mk(Kind.HWM_RESET, State.CHAMPION, frm=State.CHAMPION, fps=1, expected=1, ts=ts)
+        return _raised(lambda: store.append([reset], **{**kwargs, "mode": WriterMode.OPERATOR_CLI}))
+    if name == "PartialReplay":
+        store.append(batch, **kwargs)
+        other = mk(Kind.ATTEST, State.CHAMPION, frm=State.CHAMPION, fps=2, expected=1, ts=ts)
+        return _raised(lambda: store.append([*batch, other], **kwargs))
+    if name == "ReplayMismatch":
+        store.append([demote_with(cause_code=CauseCode.VERDICT_FAIL)], **kwargs)
+        return _raised(
+            lambda: store.append(
+                [demote_with(cause_code=CauseCode.EXEC_STORE_HALT_MIRROR)], **kwargs
+            )
+        )
+    if name == "KindRefused":
+        return _raised(lambda: store.append(batch, **{**kwargs, "mode": WriterMode.BOOTSTRAP}))
+    if name == "ModeNotConcrete":
+        return _raised(lambda: store.append(batch, **{**kwargs, "mode": "INTRADAY"}))
+    if name == "RowRefused":
+        return _raised(lambda: store.append([], **kwargs))
+    if name == "CasMismatch":
+        return _raised(
+            lambda: store.append([demote(expected=0)], **{**kwargs, "expected_prior_seq": 0})
+        )
+    if name == "ClockRefused":
+        return _raised(lambda: store.append(batch, **{**kwargs, "now_ns": NOW}))
+    if name == "FoldRefused":
+        orphan = mk(Kind.DEMOTE, State.HALTED, frm=State.CHAMPION, family=CHILD, expected=1, ts=ts)
+        return _raised(lambda: store.append([orphan], **kwargs))
+    if name == "ChainRefused":
+        return _raised(lambda: store.append([demote(fps=9)], **kwargs))
+    if name == "StoreBusy":
+        monkeypatch.setattr(rs, "WRITER_BUSY_TIMEOUT_S", 0.05)
+        holder = store._open()
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            return _raised(lambda: store.append(batch, **kwargs))
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+    assert name == "StoreDrifted", name
+    conn = raw(store)
+    conn.execute("DROP TRIGGER transitions_no_update")
+    conn.commit()
+    conn.close()
+    return _raised(lambda: store.append(batch, **kwargs))
+
+
+def _raised(call: Any) -> RegistryRefused:
+    with pytest.raises(RegistryRefused) as info:
+        call()
+    return info.value
+
+
+_REFUSAL_REASONS: Final = {
+    "StageNotCanonical": RefusalReason.STAGE_NOT_CANONICAL,
+    "WideningNotEnabled": RefusalReason.WIDENING_KIND_NOT_ENABLED,
+    "AdmissionPending": RefusalReason.ADMISSION_PENDING,
+    "NominationRequiresPolicy": RefusalReason.ADMISSION_PENDING,
+    "RuleSetPending": RefusalReason.ADMISSION_PENDING,
+    "PartialReplay": RefusalReason.ENGINE_INCONSISTENCY,
+    "ReplayMismatch": RefusalReason.ENGINE_INCONSISTENCY,
+    "KindRefused": RefusalReason.ENGINE_INCONSISTENCY,
+    "ModeNotConcrete": RefusalReason.ENGINE_INCONSISTENCY,
+    "RowRefused": RefusalReason.ENGINE_INCONSISTENCY,
+    "CasMismatch": RefusalReason.ENGINE_INCONSISTENCY,
+    "ClockRefused": RefusalReason.CLOCK_INVALID,
+    "FoldRefused": RefusalReason.FAMILY_NOT_INTRODUCED,
+    "ChainRefused": RefusalReason.CHAIN_BROKEN,
+    "StoreBusy": RefusalReason.REGISTRY_UNREADABLE,
+    "StoreDrifted": RefusalReason.REGISTRY_UNREADABLE,
+}
+
+
+def test_every_refusal_class_is_raised_with_its_closed_reason() -> None:
+    """The table covers every concrete refusal class (``StoreUnavailable`` is only their base)."""
+    classes = {
+        n for n, c in vars(rs).items()
+        if isinstance(c, type)
+        and issubclass(c, RegistryRefused)
+        and c not in {RegistryRefused, StoreUnavailable}
+    }  # fmt: skip
+    assert classes == set(_REFUSAL_REASONS)
+
+
+@pytest.mark.parametrize("name", sorted(_REFUSAL_REASONS))
+def test_each_refusal_is_triggered_and_carries_its_reason(
+    name: str, store: RegistryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = _trigger(name, store, monkeypatch)
+    assert type(error).__name__ == name
+    assert error.reason is _REFUSAL_REASONS[name]

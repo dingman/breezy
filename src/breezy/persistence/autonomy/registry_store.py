@@ -44,17 +44,17 @@ from types import MappingProxyType
 from typing import Final
 
 from breezy.persistence.autonomy import chain, pins, single_read, stage_policy, transitions
+from breezy.persistence.autonomy.chain import ChainBroken
 from breezy.persistence.autonomy.family_bytes import read_manifest_facts
 from breezy.persistence.autonomy.fold import FoldInvalid, fold
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
+from breezy.persistence.autonomy.registry_shape import is_nomination, shape_problem
 from breezy.persistence.autonomy.schemas import (
-    CauseCode,
     FoldInvalidReason,
     Kind,
     ManifestFactsReader,
     RefusalReason,
     StageView,
-    State,
     TransitionRow,
     WriterMode,
     check_venue,
@@ -70,6 +70,7 @@ __all__ = [
     "AdmissionPending",
     "AppendResult",
     "CasMismatch",
+    "ChainRefused",
     "ClockRefused",
     "KindRefused",
     "ModeNotConcrete",
@@ -77,9 +78,12 @@ __all__ = [
     "PartialReplay",
     "RegistryRefused",
     "RegistryStore",
+    "ReplayMismatch",
     "RowRefused",
     "RuleSetPending",
     "StageNotCanonical",
+    "StoreBusy",
+    "StoreDrifted",
     "StoreUnavailable",
     "WideningNotEnabled",
     "check_row_shape",
@@ -165,6 +169,8 @@ _INSERT_GUARD_DDL: Final = """CREATE TRIGGER transitions_insert_guard BEFORE INS
 BEGIN
     SELECT RAISE(ABORT, 'seq exists')
     WHERE NEW.seq IS NOT NULL AND EXISTS (SELECT 1 FROM transitions WHERE seq = NEW.seq);
+    SELECT RAISE(ABORT, 'transition_id exists')
+    WHERE EXISTS (SELECT 1 FROM transitions WHERE transition_id = NEW.transition_id);
     SELECT RAISE(ABORT, 'venue_seq duplicate')
     WHERE EXISTS (
         SELECT 1 FROM transitions WHERE venue = NEW.venue AND venue_seq = NEW.venue_seq
@@ -194,7 +200,7 @@ _ROLLBACK: Final = "ROLLBACK"
 #: ``(set, read back, expected)``: each writer pragma is read back, never assumed.
 _WRITER_PRAGMAS: Final[tuple[tuple[str, str, object], ...]] = (
     ("PRAGMA journal_mode = DELETE", "PRAGMA journal_mode", "delete"),
-    ("PRAGMA synchronous = FULL", "PRAGMA synchronous", 2),
+    ("PRAGMA synchronous = EXTRA", "PRAGMA synchronous", 3),
     ("PRAGMA recursive_triggers = ON", "PRAGMA recursive_triggers", 1),
     ("PRAGMA trusted_schema = OFF", "PRAGMA trusted_schema", 0),
 )
@@ -208,7 +214,10 @@ _SELECT_VENUE: Final = f"{_SELECT_ROWS} WHERE venue = ? ORDER BY venue_seq"
 _SELECT_AFTER: Final = f"{_SELECT_ROWS} WHERE venue = ? AND venue_seq > ? ORDER BY venue_seq"
 _SELECT_BY_ID: Final = f"{_SELECT_ROWS} WHERE transition_id = ?"
 _SELECT_HEAD_SEQ: Final = "SELECT COALESCE(MAX(venue_seq), 0) FROM transitions WHERE venue = ?"
-_SELECT_MASTER: Final = "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+_SELECT_MASTER: Final = (
+    "SELECT type, name, sql FROM sqlite_master "
+    "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_stat%' ESCAPE '\\'"
+)
 _SELECT_META: Final = "SELECT schema FROM meta"
 _COUNT_MASTER: Final = "SELECT COUNT(*) FROM sqlite_master"
 _PRAGMA_APPLICATION_ID: Final = "PRAGMA application_id"
@@ -256,6 +265,10 @@ class PartialReplay(RegistryRefused):
     """Some, not all, of a batch's transition ids are already stored."""
 
 
+class ReplayMismatch(RegistryRefused):
+    """A stored row has the submitted ``transition_id`` but a different body (E-17 a)."""
+
+
 class KindRefused(RegistryRefused):
     """The kind is outside ``KIND_MASK[mode]``."""
 
@@ -269,11 +282,15 @@ class RowRefused(RegistryRefused):
 
 
 class CasMismatch(RegistryRefused):
-    """``max(venue_seq)`` is not the ``expected_prior_seq`` the writer asserted."""
+    """``max(venue_seq)`` is not the ``expected_prior_seq`` the writer asserted.
+
+    The engine's retry contract is ``isinstance(error, CasMismatch)``: re-read the head, rebuild the
+    batch, append again (ARCH l.530). CAS runs before the clock check so a stale writer sees this.
+    """
 
 
 class ClockRefused(RegistryRefused):
-    """``ClockRefused`` carries ``clock_invalid`` (skew) or ``clock_before_head`` (monotonicity)."""
+    """``clock_invalid`` (outside ``[now - skew, now]``) or ``clock_before_head`` (E-17 c)."""
 
     reason = RefusalReason.CLOCK_INVALID
 
@@ -282,10 +299,35 @@ class FoldRefused(RegistryRefused):
     """The extended chain does not fold."""
 
 
+class ChainRefused(RegistryRefused):
+    """A stored or extended chain does not verify (the wrapped ``ChainBroken``)."""
+
+    reason = RefusalReason.CHAIN_BROKEN
+
+
 class StoreUnavailable(RegistryRefused):
-    """The database is missing, busy, foreign, drifted or unreadable: nothing was written."""
+    """Base of ``StoreBusy`` and ``StoreDrifted``: nothing was written."""
 
     reason = RefusalReason.REGISTRY_UNREADABLE
+
+
+class StoreBusy(StoreUnavailable):
+    """Another writer holds the database (SQLITE_BUSY or LOCKED); retryable (Y19, 60 s)."""
+
+
+class StoreDrifted(StoreUnavailable):
+    """Schema drift, a foreign or missing database, bad modes, an integrity or I/O error."""
+
+
+_BUSY_CODES: Final = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+
+def _unavailable(exc: sqlite3.Error, what: str) -> StoreUnavailable:
+    code = getattr(exc, "sqlite_errorcode", None)
+    detail = f"{what}: {type(exc).__name__}"
+    if isinstance(code, int) and code & 0xFF in _BUSY_CODES:
+        return StoreBusy(detail)
+    return StoreDrifted(detail)
 
 
 _FOLD_REFUSALS: Final[Mapping[FoldInvalidReason, RefusalReason]] = MappingProxyType(
@@ -308,68 +350,10 @@ class AppendResult:
 
 # --- column rules ---------------------------------------------------------------------------------
 
-_LINEAGE_REQUIRED: Final = frozenset(
-    {
-        Kind.BOOTSTRAP, Kind.MINT, Kind.PROMOTE, Kind.DRILL_PROMOTE, Kind.ROLLBACK,
-        Kind.ROOT_ADMIT, Kind.ACTIVATE,
-    }
-)  # fmt: skip
-_CAUSE_CODE_KINDS: Final = frozenset(
-    {Kind.DEMOTE, Kind.HALT, Kind.SWAP_CANCEL, Kind.TARGET_INELIGIBLE}
-)
-_PAIR_CITING: Final = frozenset({Kind.SUPERSEDE, Kind.DISPLACED, Kind.ACTIVATE})
-_NOMINATION_FIELDS: Final = ("k_life", "alpha_k", "n_min_eff", "n_cap", "nomination_feasible")
-
-
-def _is_nomination(row: TransitionRow) -> bool:
-    return (
-        row.kind is Kind.PROMOTE
-        and row.from_state is State.SHADOW
-        and row.to_state is State.CHALLENGER
-    )
-
-
-def _cause_code_allowed(row: TransitionRow) -> bool:
-    if row.cause_code is None or row.kind in _CAUSE_CODE_KINDS:
-        return True
-    return row.kind is Kind.RESUME and row.cause_code is CauseCode.DRILL_CLOSE_RESTORE
-
-
-def _shape_problem(row: TransitionRow) -> str | None:
-    """The first column rule ``row`` breaks, or ``None``."""
-    kind = row.kind
-    if (row.from_state, row.to_state) not in transitions.ALLOWED[kind]:
-        return "transition pair not allowed for kind"
-    if kind in _LINEAGE_REQUIRED and row.lineage_root_family_id is None:
-        return "lineage_root_family_id required"
-    present = {name for name in _NOMINATION_FIELDS if getattr(row, name) is not None}
-    if present != (set(_NOMINATION_FIELDS) if _is_nomination(row) else set()):
-        return "nomination columns required on a nomination and null elsewhere"
-    if (row.paired_transition_id is not None) != (kind in _PAIR_CITING):
-        return "paired_transition_id belongs to SUPERSEDE, DISPLACED and ACTIVATE only"
-    if (row.attest_valid_until_ns is not None) != (kind is Kind.ATTEST):
-        return "attest_valid_until_ns belongs to ATTEST only"
-    hwm_present = {
-        row.hwm_from is not None,
-        row.hwm_to is not None,
-        row.carried_counters is not None,
-    }
-    if hwm_present != ({True} if kind is Kind.HWM_RESET else {False}):
-        return "hwm_from, hwm_to and carried_counters belong to HWM_RESET only"
-    if (row.voids_transition_ids is not None) != (kind is Kind.SWAP_CANCEL):
-        return "voids_transition_ids belongs to SWAP_CANCEL only"
-    if not _cause_code_allowed(row):
-        return "cause_code not allowed for kind"
-    if row.trigger_cause_class is not None and not (
-        kind is Kind.HALT and row.cause_code is CauseCode.ROLLBACK_FAILED
-    ):
-        return "trigger_cause_class belongs to a rollback_failed HALT only"
-    return None
-
 
 def check_row_shape(row: TransitionRow) -> None:
     """Raise ``RowRefused`` unless ``row`` obeys the AUT-5 r7 3.2 / E-16 column rules."""
-    problem = _shape_problem(row)
+    problem = shape_problem(row)
     if problem is not None:
         raise RowRefused(f"{row.kind.value}: {problem}")
 
@@ -385,7 +369,7 @@ def _decode_ids(text: object) -> list[str] | None:
     if text is None:
         return None
     if not isinstance(text, str):
-        raise StoreUnavailable("id list column is not text")
+        raise StoreDrifted("id list column is not text")
     return text.split(",") if text else []
 
 
@@ -410,7 +394,7 @@ def _from_db(record: Sequence[object]) -> TransitionRow:
             obj["carried_counters"] = parse_json_exact(str(counters))
         return TransitionRow.from_wire(obj)
     except WireRefused as exc:
-        raise StoreUnavailable(f"stored row does not decode: {exc.reason.value}") from exc
+        raise StoreDrifted(f"stored row does not decode: {exc.reason.value}") from exc
 
 
 def _seal(
@@ -472,22 +456,20 @@ class RegistryStore:
             store._check_schema(conn)
             conn.execute(_COMMIT)
         except sqlite3.Error as exc:
-            raise StoreUnavailable(f"initialise failed: {type(exc).__name__}") from exc
+            raise _unavailable(exc, "initialise failed") from exc
         finally:
-            if conn.in_transaction:
-                conn.execute(_ROLLBACK)
-            conn.close()
+            _release(conn, committed=False)
         return store
 
     def _create_file(self) -> None:
         try:
             rootfd = single_read.open_root(self._paths.root)
         except single_read.SingleReadRefused as exc:
-            raise StoreUnavailable(f"data root: {exc.reason.value}") from exc
+            raise StoreDrifted(f"data root: {exc.reason.value}") from exc
         try:
             dirfd = single_read.ensure_dir(rootfd, _REGISTRY_DIR, mode=DIR_MODE)
         except single_read.SingleReadRefused as exc:
-            raise StoreUnavailable(f"registry directory: {exc.reason.value}") from exc
+            raise StoreDrifted(f"registry directory: {exc.reason.value}") from exc
         finally:
             os.close(rootfd)
         try:
@@ -503,7 +485,7 @@ class RegistryStore:
                 os.close(fd)
             os.fsync(dirfd)
         except OSError as exc:
-            raise StoreUnavailable(f"database file: {type(exc).__name__}") from exc
+            raise StoreDrifted(f"database file: {type(exc).__name__}") from exc
         finally:
             os.close(dirfd)
 
@@ -511,17 +493,20 @@ class RegistryStore:
         """A writer connection to an existing file: pragmas set and read back, autocommit off."""
         try:
             info = os.lstat(self._db)
+            directory = os.lstat(self._db.parent)
         except OSError as exc:
-            raise StoreUnavailable(f"database file: {type(exc).__name__}") from exc
+            raise StoreDrifted(f"database file: {type(exc).__name__}") from exc
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-            raise StoreUnavailable("database file is not a regular file owned by this user")
+            raise StoreDrifted("database file is not a regular file owned by this user")
+        if stat.S_IMODE(info.st_mode) != FILE_MODE or stat.S_IMODE(directory.st_mode) != DIR_MODE:
+            raise StoreDrifted("database file or directory mode is not 0600/0700")
         uri = f"{self._db.as_uri()}?mode=rw"
         try:
             conn = sqlite3.connect(
                 uri, uri=True, timeout=WRITER_BUSY_TIMEOUT_S, isolation_level=None
             )
         except sqlite3.Error as exc:
-            raise StoreUnavailable(f"open failed: {type(exc).__name__}") from exc
+            raise _unavailable(exc, "open failed") from exc
         try:
             self._apply_pragmas(conn)
         except BaseException:
@@ -536,9 +521,9 @@ class RegistryStore:
                 conn.execute(setter)
                 got = conn.execute(readback).fetchone()[0]
                 if got != expected:
-                    raise StoreUnavailable(f"pragma not applied: {readback}")
+                    raise StoreDrifted(f"pragma not applied: {readback}")
         except sqlite3.Error as exc:
-            raise StoreUnavailable(f"pragma failed: {type(exc).__name__}") from exc
+            raise _unavailable(exc, "pragma failed") from exc
 
     @staticmethod
     def _install_schema(conn: sqlite3.Connection) -> None:
@@ -561,7 +546,7 @@ class RegistryStore:
             or meta != [SCHEMA_ID]
             or objects != set(DDL_OBJECTS)
         ):
-            raise StoreUnavailable("registry schema differs from the DDL constants")
+            raise StoreDrifted("registry schema differs from the DDL constants")
 
     # --- append -----------------------------------------------------------------------------
 
@@ -595,7 +580,10 @@ class RegistryStore:
     ) -> AppendResult:
         if stage is not stage_policy.STAGE and not _fixture_stage:
             raise StageNotCanonical("the stage is not stage_policy.STAGE")
-        batch = _check_batch(rows, expected_prior_seq, now_ns)
+        try:
+            batch = _check_batch(rows, expected_prior_seq, now_ns)
+        except (WireRefused, ValueError, TypeError) as exc:
+            raise RowRefused(f"malformed batch: {type(exc).__name__}") from exc
         conn = self._open()
         committed = False
         try:
@@ -607,11 +595,13 @@ class RegistryStore:
             committed = True
             return result
         except sqlite3.Error as exc:
-            raise StoreUnavailable(f"write failed: {type(exc).__name__}") from exc
+            raise _unavailable(exc, "write failed") from exc
+        except ChainBroken as exc:
+            raise ChainRefused(f"venue_seq {exc.venue_seq}: {exc.detail}") from exc
+        except (WireRefused, ValueError, TypeError) as exc:
+            raise RowRefused(f"row refused: {type(exc).__name__}") from exc
         finally:
-            if not committed and conn.in_transaction:
-                conn.execute(_ROLLBACK)
-            conn.close()
+            _release(conn, committed=committed)
 
     def _append_in_transaction(
         self,
@@ -624,6 +614,9 @@ class RegistryStore:
     ) -> AppendResult:
         self._check_schema(conn)
         stored = [_read_by_id(conn, row.transition_id) for row in batch]
+        for submitted, existing in zip(batch, stored, strict=True):
+            if existing is not None and _replay_body(existing) != _replay_body(submitted):
+                raise ReplayMismatch("a stored row has this transition_id and another body")
         if all(row is not None for row in stored):
             _LOG.info("registry append is a replay: %d rows already stored", len(batch))
             replayed = tuple(row for row in stored if row is not None)
@@ -636,15 +629,39 @@ class RegistryStore:
         _check_mask_and_admission(batch, mode, stage)
         venue = batch[0].venue
         prior = [_from_db(r) for r in conn.execute(_SELECT_VENUE, (venue,))]
-        _check_clock(batch, prior, now_ns)
         head = conn.execute(_SELECT_HEAD_SEQ, (venue,)).fetchone()[0]
-        if head != expected_prior_seq:
+        if head != expected_prior_seq:  # before the clock: a stale writer retries (E-17 d)
             raise CasMismatch(f"head venue_seq {head} is not the expected prior seq")
+        _check_clock(batch, prior, now_ns)
         extended = _verify_structure(prior, batch, venue, now_ns)
         for row in extended:
             conn.execute(_INSERT_ROW, _to_db(row))
         written = [_from_db(r) for r in conn.execute(_SELECT_AFTER, (venue, head))]
         return AppendResult(tuple(written), head + len(written), False)
+
+
+#: Columns a replay may differ in: the position, the clock, the writer's identity and the hashes.
+_REPLAY_IGNORED: Final = frozenset(
+    {
+        "seq", "venue_seq", "ts_ns", "invocation_id", "expected_prior_seq",
+        "prev_transition_hash", "transition_hash",
+    }
+)  # fmt: skip
+
+
+def _replay_body(row: TransitionRow) -> dict[str, object]:
+    return {k: v for k, v in row.to_wire().items() if k not in _REPLAY_IGNORED}
+
+
+def _release(conn: sqlite3.Connection, *, committed: bool) -> None:
+    """Roll back an open transaction and close; a failing ROLLBACK must not mask the real error."""
+    try:
+        if not committed and conn.in_transaction:
+            conn.execute(_ROLLBACK)
+    except sqlite3.Error:
+        _LOG.warning("registry rollback failed; closing the connection")
+    finally:
+        conn.close()
 
 
 def _read_by_id(conn: sqlite3.Connection, transition_id: str) -> TransitionRow | None:
@@ -673,6 +690,8 @@ def _check_batch(
         chain_columns = (row.seq, row.venue_seq, row.prev_transition_hash, row.transition_hash)
         if any(value is not None for value in chain_columns):
             raise RowRefused("rows arrive unsealed: the store assigns the chain columns")
+        if row.transition_id != row.computed_transition_id():
+            raise RowRefused("transition_id is not the id computed from the row")
         if row.expected_prior_seq != expected_prior_seq:
             raise RowRefused("a row's expected_prior_seq is not the batch's")
         check_row_shape(row)
@@ -693,7 +712,7 @@ def _check_mask_and_admission(
     if admission.reason is RefusalReason.ADMISSION_PENDING:
         raise AdmissionPending(batch[admission.admitted].kind.value)
     for row in batch:
-        if _is_nomination(row):
+        if is_nomination(row):
             raise NominationRequiresPolicy("nomination k-checks are not implemented")
         if row.kind is Kind.HWM_RESET:
             raise RuleSetPending("HWM_RESET admission is not implemented")
@@ -702,12 +721,12 @@ def _check_mask_and_admission(
 def _check_clock(
     batch: Sequence[TransitionRow], prior: Sequence[TransitionRow], now_ns: int
 ) -> None:
-    """AC 10 step 7: every ts within the skew of ``now_ns`` and monotone over the head."""
-    limit = pins.ROW_TS_MAX_SKEW_S * _NS_PER_S
+    """AC 10 step 7: ``now - skew <= ts <= now`` (E-17 c) and monotone over the head."""
+    floor = now_ns - pins.ROW_TS_MAX_SKEW_S * _NS_PER_S
     previous = prior[-1].ts_ns if prior else 0
     for row in batch:
-        if abs(row.ts_ns - now_ns) > limit:
-            raise ClockRefused("row ts_ns is outside the allowed skew from now_ns")
+        if not floor <= row.ts_ns <= now_ns:
+            raise ClockRefused("row ts_ns is after now_ns or older than the allowed skew")
         if row.ts_ns < previous:
             raise ClockRefused(
                 "row ts_ns precedes the head", reason=RefusalReason.CLOCK_BEFORE_HEAD
