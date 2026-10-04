@@ -108,8 +108,16 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
 
 
 #: Modules whose stage-2b builder has landed: their signatures stay pinned, but they are no longer
-#: ``NotImplementedError`` stubs (each has its own behaviour tests).
-REAL_MODULES: Final[frozenset[str]] = frozenset({f"{_AN}.capture_audit_fill_legs"})
+#: ``NotImplementedError`` stubs (each has its own behaviour tests). W2 landed the reconciliation
+#: modules (design S2-R15).
+W2_REAL: Final[frozenset[str]] = frozenset(
+    {
+        f"{_AN}.capture_audit_replay",
+        f"{_AN}.capture_audit_log_markers",
+        f"{_AN}.capture_audit_stream_legs",
+    }
+)
+REAL_MODULES: Final[frozenset[str]] = frozenset({f"{_AN}.capture_audit_fill_legs"}) | W2_REAL
 STUB_MODULES: Final[list[str]] = sorted(set(EXPECTED) - REAL_MODULES)
 
 
@@ -231,3 +239,15 @@ def test_the_built_w3_modules_keep_every_pinned_signature(module: str) -> None:
         home = _W3_HOME.get(owner, module)
         assert _signature(_defs(home)[name]) == signature, name
         assert hasattr(importlib.import_module(module), owner), (module, owner)
+
+
+@pytest.mark.parametrize("module", sorted(W2_REAL))
+def test_the_w2_modules_are_real_implementations(module: str) -> None:
+    """A W2 module keeps its docstring and its pinned signatures but no function body is a stub."""
+    tree = ast.parse(_source(module).read_text(encoding="utf-8"))
+    assert ast.get_docstring(tree)
+    for name, node in _defs(module).items():
+        body = node.body[1:] if ast.get_docstring(node) else node.body
+        raises = [n for n in body if isinstance(n, ast.Raise)]
+        assert not (len(body) == 1 and raises), f"{name} is still a stub"
+    assert "NotImplementedError" not in _source(module).read_text(encoding="utf-8")
