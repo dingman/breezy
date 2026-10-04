@@ -16,8 +16,10 @@ parser's drift handling (already RED-tested in `test_nbm_quantile_parse.py`).
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
+import json
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -535,3 +537,357 @@ async def test_a_bulletin_drift_is_latched_but_never_silent(
     fired = await harness.fire_due_timers(NOW_NS + 2 * 900 * NS)
     assert fired >= 2
     assert len(harness.fetcher.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# AUT-1 WP4: silent-feed check and hang reset, on the EXISTING cycle timer
+# (plan r12 §3.7.2). Appended; nothing above is edited.
+# ---------------------------------------------------------------------------
+
+HANG_S = 600
+DEADLINE_NS = DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS * NS
+HEAL_UNIT = "in-node:nbm_quantile_actor"
+
+
+class HangFirstFetcher(RecordingFetcher):
+    """The first request never returns (a hung socket); later ones answer normally."""
+
+    async def fetch_nbp_bulletin(
+        self, *, cycle_date: dt.date, cycle_hour: int
+    ) -> NbmQuantileFetchResult:
+        if not self.calls:
+            self.calls.append((cycle_date, cycle_hour, self.clock()))
+            await asyncio.Event().wait()
+        return await super().fetch_nbp_bulletin(cycle_date=cycle_date, cycle_hour=cycle_hour)
+
+
+class OfferRecorder:
+    def __init__(self, result: bool = True) -> None:
+        self.result = result
+        self.calls: list[tuple[str, str, str]] = []
+
+    def __call__(self, event: str, severity: str, detail: str) -> bool:
+        self.calls.append((event, severity, detail))
+        return self.result
+
+
+def build_aut1(
+    *,
+    fetcher_cls: type[RecordingFetcher] = RecordingFetcher,
+    now_ns: int = NOW_NS,
+    raises: BaseException | None = None,
+    **actor_kwargs: Any,
+) -> Harness:
+    clock = TestClock()
+    clock.set_time(now_ns)
+    fetchers: list[RecordingFetcher] = []
+
+    def factory(clock_fn: Callable[[], int]) -> RecordingFetcher:
+        fetcher = fetcher_cls(
+            clock_fn, texts=(FIXTURE_13Z,), last_modifieds=(LAST_MODIFIED,), raises=raises
+        )
+        fetchers.append(fetcher)
+        return fetcher
+
+    actor = NbmQuantileActor(
+        NbmQuantileActorConfig(station_icaos=STATIONS),
+        transport_factory=factory,
+        **actor_kwargs,
+    )
+    msgbus = TestComponentStubs.msgbus()
+    actor.register_base(
+        portfolio=TestComponentStubs.portfolio(),
+        msgbus=msgbus,
+        cache=TestComponentStubs.cache(),
+        clock=clock,
+    )
+    harness = Harness(actor=actor, clock=clock, fetchers=fetchers)
+    msgbus.subscribe(topic=TOPIC, handler=harness.published.append)
+    return harness
+
+
+async def _settle_loop() -> None:
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+async def _hang_then_reset(harness: Harness) -> None:
+    """Start with a hung first poll, then fire the timer past the hang threshold."""
+    harness.actor.start()
+    await _settle_loop()
+    harness.clock.set_time(NOW_NS + HANG_S * NS)
+    harness.actor.on_cycle_timer(event=object())
+    await harness.drain()
+
+
+def _heal_files(root: Path) -> list[Path]:
+    return sorted((root / "evidence" / "capture" / "heal").glob("*/*.json"))
+
+
+@pytest.mark.asyncio
+async def test_submit_retains_future() -> None:
+    harness = build_aut1(fetcher_cls=HangFirstFetcher)
+    harness.actor.start()
+    await _settle_loop()
+
+    future = harness.actor.poll_future
+    assert future is not None
+    assert not future.done(), "a hung poll's future is retained while it is not done"
+
+
+@pytest.mark.asyncio
+async def test_a_completed_poll_leaves_no_hung_future_to_reset() -> None:
+    harness = build_aut1()
+    harness.actor.start()
+    await harness.drain()
+    harness.clock.set_time(NOW_NS + 10 * HANG_S * NS)
+    harness.actor.on_cycle_timer(event=object())
+    await harness.drain()
+
+    assert harness.actor.counters["poll_hang_reset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_hang_is_cancelled_and_reset_after_threshold(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = build_aut1(fetcher_cls=HangFirstFetcher, evidence_root=tmp_path)
+    harness.actor.start()
+    await _settle_loop()
+    hung = harness.actor.poll_future
+    assert hung is not None
+
+    harness.clock.set_time(NOW_NS + HANG_S * NS - 1)
+    harness.actor.on_cycle_timer(event=object())
+    await _settle_loop()
+    assert harness.actor.counters["poll_hang_reset"] == 0, "one ns under the threshold"
+    assert not hung.cancelled()
+
+    harness.clock.set_time(NOW_NS + HANG_S * NS)
+    with caplog.at_level(logging.INFO):
+        harness.actor.on_cycle_timer(event=object())
+        await harness.drain()
+
+    assert hung.cancelled()
+    assert harness.actor.counters["poll_hang_reset"] == 1
+    assert f"NBM_NBP_POLL_RESET cycle_ns={CYCLE_NS}" in caplog.text
+    assert len(harness.fetcher.calls) == 2, "a fresh poll_once() was submitted"
+    assert len(harness.published) > 0
+    assert harness.actor.counters["task_death"] == 0
+
+
+def test_the_hang_threshold_is_the_plan_default() -> None:
+    from breezy.ingest import nbm_quantile_actor as module
+
+    assert module.NBP_POLL_HANG_S == HANG_S
+
+
+@pytest.mark.asyncio
+async def test_missed_cycles_counts_from_stale_deadline() -> None:
+    harness = build_aut1(now_ns=NOW_NS)
+    harness.actor.start()
+    await harness.drain()  # the 13Z cycle (CYCLE_NS) is complete
+    actor = harness.actor
+    cycle_19z = CYCLE_NS + 6 * 3600 * NS
+    cycle_01z = CYCLE_NS + 12 * 3600 * NS
+
+    assert actor.missed_cycles(cycle_19z + DEADLINE_NS - 1) == 0
+    assert actor.missed_cycles(cycle_19z + DEADLINE_NS) == 1
+    assert actor.missed_cycles(cycle_01z + DEADLINE_NS - 1) == 1
+    assert actor.missed_cycles(cycle_01z + DEADLINE_NS) == 2
+
+
+@pytest.mark.asyncio
+async def test_missed_cycles_clears_on_a_newer_complete_cycle() -> None:
+    harness = build_aut1(now_ns=NOW_NS)
+    harness.actor.start()
+    await harness.drain()
+    cycle_19z = CYCLE_NS + 6 * 3600 * NS
+    now = cycle_19z + DEADLINE_NS
+    assert harness.actor.missed_cycles(now) == 1
+
+    harness.clock.set_time(cycle_19z + 3900 * NS)  # 19Z becomes fetchable
+    harness.fetcher._last_modifieds = (_rfc2822(cycle_19z + LAG_NS),)
+    harness.fetcher._texts = (FIXTURE_13Z,)
+    harness.actor.on_cycle_timer(event=object())
+    await harness.drain()
+
+    assert harness.actor.missed_cycles(now) == 0
+
+
+@pytest.mark.asyncio
+async def test_first_fire_past_deadline_offers_nbp_cycle_missed_once_per_cycle() -> None:
+    offer = OfferRecorder()
+    start = CYCLE_NS + DEADLINE_NS + 60 * NS
+    harness = build_aut1(now_ns=start, raises=TransportError("down"), alert_offer=offer)
+    harness.actor.start()
+    await harness.drain()
+    assert offer.calls == [], "on_start is not a timer fire"
+
+    await harness.fire_due_timers(start + 900 * NS)
+    assert [(e, s) for e, s, _ in offer.calls] == [("NBP_CYCLE_MISSED", "CRITICAL")]
+    first_detail = offer.calls[0][2]
+    assert str(CYCLE_NS) in first_detail
+
+    await harness.fire_due_timers(start + 3 * 900 * NS)
+    assert len(offer.calls) == 1, "once per cycle, never per fire"
+
+    cycle_19z = CYCLE_NS + 6 * 3600 * NS
+    await harness.fire_due_timers(cycle_19z + DEADLINE_NS + 900 * NS)
+    assert len(offer.calls) == 2
+    assert offer.calls[1][2] != first_detail
+    await harness.fire_due_timers(cycle_19z + DEADLINE_NS + 5 * 900 * NS)
+    assert len(offer.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_check_runs_on_existing_cycle_timer_no_new_timer() -> None:
+    import ast
+
+    from breezy.ingest import nbm_quantile_actor as module
+
+    start = CYCLE_NS + DEADLINE_NS + 60 * NS
+    harness = build_aut1(
+        fetcher_cls=HangFirstFetcher,
+        now_ns=start,
+        alert_offer=OfferRecorder(),
+        evidence_root=Path("/nonexistent-never-written"),
+    )
+    harness.actor.start()
+    await _settle_loop()
+    assert harness.clock.timer_names == ["nbm-quantile-cycle"]
+    harness.clock.set_time(start + HANG_S * NS)
+    harness.actor.on_cycle_timer(event=object())
+    await _settle_loop()
+    assert harness.clock.timer_names == ["nbm-quantile-cycle"]
+
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    timer_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"set_timer", "set_time_alert"}
+    ]
+    assert len(timer_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_reset_followed_by_vector_complete_writes_write_once_heal_record(
+    tmp_path: Path,
+) -> None:
+    offer = OfferRecorder()
+    harness = build_aut1(fetcher_cls=HangFirstFetcher, alert_offer=offer, evidence_root=tmp_path)
+    await _hang_then_reset(harness)
+
+    (record_path,) = _heal_files(tmp_path)
+    healed_ns = NOW_NS + HANG_S * NS
+    assert record_path.parent.name == "2026-09-28"
+    assert record_path.name == f"{healed_ns}_node_nbm_quantile_actor.json"
+    assert record_path.stat().st_mode & 0o777 == 0o444
+    body = json.loads(record_path.read_text(encoding="utf-8"))
+    sha = body.pop("observation_sha256")
+    assert body == {
+        "unit": HEAL_UNIT,
+        "cause": "poll_hang",
+        "detected_ns": healed_ns,
+        "action": "poll_reset",
+        "healed_ns": healed_ns,
+        "injected": False,
+        "decided_by": "nbm_quantile_actor",
+        "alert": "offered",
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert sha == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert [(e, s) for e, s, _ in offer.calls] == [(f"CAPTURE_HEALED_{sha}", "INFO")]
+
+
+@pytest.mark.asyncio
+async def test_heal_record_is_write_once_and_never_overwritten(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    healed_ns = NOW_NS + HANG_S * NS
+    target = (
+        tmp_path
+        / "evidence"
+        / "capture"
+        / "heal"
+        / "2026-09-28"
+        / f"{healed_ns}_node_nbm_quantile_actor.json"
+    )
+    target.parent.mkdir(parents=True)
+    target.write_text("SENTINEL", encoding="utf-8")
+    harness = build_aut1(
+        fetcher_cls=HangFirstFetcher, alert_offer=OfferRecorder(), evidence_root=tmp_path
+    )
+    with caplog.at_level(logging.INFO):
+        await _hang_then_reset(harness)
+
+    assert target.read_text(encoding="utf-8") == "SENTINEL"
+    assert harness.actor.counters["task_death"] == 0
+    assert len(harness.published) > 0, "a heal-record failure never blocks the publish"
+
+
+@pytest.mark.asyncio
+async def test_no_heal_record_without_a_reset(tmp_path: Path) -> None:
+    offer = OfferRecorder()
+    harness = build_aut1(alert_offer=offer, evidence_root=tmp_path)
+    harness.actor.start()
+    await harness.drain()
+
+    assert _heal_files(tmp_path) == []
+    assert offer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_nbp_heal_with_absent_alert_offer_logs_critical_and_writes_undeliverable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = build_aut1(fetcher_cls=HangFirstFetcher, evidence_root=tmp_path)
+    with caplog.at_level(logging.CRITICAL):
+        await _hang_then_reset(harness)
+
+    (record_path,) = _heal_files(tmp_path)
+    body = json.loads(record_path.read_text(encoding="utf-8"))
+    assert body["alert"] == "undeliverable"
+    assert (
+        f"NBM_NBP_HEAL_ALERT_UNDELIVERABLE observation_sha256={body['observation_sha256']}"
+        in caplog.text
+    )
+
+
+@pytest.mark.asyncio
+async def test_alert_offer_returning_false_logs_critical_record_already_written(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = build_aut1(
+        fetcher_cls=HangFirstFetcher, alert_offer=OfferRecorder(False), evidence_root=tmp_path
+    )
+    with caplog.at_level(logging.CRITICAL):
+        await _hang_then_reset(harness)
+
+    (record_path,) = _heal_files(tmp_path)
+    body = json.loads(record_path.read_text(encoding="utf-8"))
+    assert body["alert"] == "offered", "the write-once record precedes the offer"
+    assert "NBM_NBP_HEAL_ALERT_UNDELIVERABLE" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_actor_without_alert_offer_constructs_unchanged() -> None:
+    import inspect
+
+    params = inspect.signature(NbmQuantileActor.__init__).parameters
+    assert params["alert_offer"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["alert_offer"].default is None
+    assert params["evidence_root"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["evidence_root"].default is None
+
+    # The pre-WP4 construction still works and a missed cycle only counts, never raises.
+    start = CYCLE_NS + DEADLINE_NS + 60 * NS
+    harness = build(raises=TransportError("down"), now_ns=start)
+    harness.actor.start()
+    await harness.drain()
+    await harness.fire_due_timers(start + 900 * NS)
+
+    assert harness.actor.counters["task_death"] == 0
+    assert harness.actor.counters["cycle_missed_unoffered"] == 1

@@ -73,12 +73,14 @@ import asyncio
 import concurrent.futures
 import datetime as dt
 import logging
+import os
 import re
 import threading
 from collections import Counter
 from collections.abc import Callable
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Final, Protocol
 
 from nautilus_trader.common.actor import Actor
@@ -97,6 +99,8 @@ from breezy.ingest.nbm_quantile_transport import (
     NbmQuantileFetchResult,
     build_nbm_quantile_transport,
 )
+from breezy.persistence.autonomy.canonical import canonical_json, sha256_hex
+from breezy.persistence.autonomy.paths import default_data_root
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +109,7 @@ __all__ = [
     "DEFAULT_NBM_QUANTILE_CYCLE_HOURS",
     "DEFAULT_NBM_QUANTILE_STALE_DEADLINE_SECONDS",
     "DEFAULT_NBM_QUANTILE_TIMER_INTERVAL_SECONDS",
+    "NBP_POLL_HANG_S",
     "STALE_CYCLE_ALERT_MARKER",
     "BulletinFetcher",
     "NbmQuantileActor",
@@ -149,6 +154,29 @@ STALE_CYCLE_ALERT_MARKER: Final[str] = "NBM_NBP_STALE_CYCLE"
 #: (module docstring: that log line is shared by every kind of Actor bug and
 #: is not, on its own, a signal an alert matcher can act on).
 BULLETIN_DRIFT_ALERT_MARKER: Final[str] = "NBM_NBP_BULLETIN_DRIFT"
+
+#: AUT-1 WP4 (plan r12 §3.7.2): a poll still not done this long after it was
+#: submitted is cancelled and re-submitted on the next cycle-timer fire. At
+#: least twice the transport's own 60 s read timeout (plus its 5 s connect),
+#: so only a genuinely hung socket ever reaches it.
+NBP_POLL_HANG_S: Final[int] = 600
+
+#: Stable markers for the heal/hang paths (greppable, never interpolated).
+POLL_RESET_MARKER: Final[str] = "NBM_NBP_POLL_RESET"
+HEAL_UNDELIVERABLE_MARKER: Final[str] = "NBM_NBP_HEAL_ALERT_UNDELIVERABLE"
+
+#: Alert events and heal-record constants (plan r12 §3.16).
+_CYCLE_MISSED_EVENT: Final[str] = "NBP_CYCLE_MISSED"
+_HEALED_EVENT_PREFIX: Final[str] = "CAPTURE_HEALED_"
+_HEAL_UNIT: Final[str] = "in-node:nbm_quantile_actor"
+_HEAL_WRITER_ID: Final[str] = "nbm_quantile_actor"
+_HEAL_RECORD_MODE: Final[int] = 0o444
+_HEAL_DIR_MODE: Final[int] = 0o700
+_NS_PER_DAY: Final[int] = 24 * _SECONDS_PER_HOUR * _NS_PER_SECOND
+
+#: Duck-typed outbox seam: ``(event, severity, detail) -> delivered``. Ingest
+#: never imports the runtime outbox (layering); the composition root wires it.
+AlertOffer = Callable[[str, str, str], bool]
 
 
 class BulletinFetcher(Protocol):
@@ -248,6 +276,8 @@ class NbmQuantileActor(Actor):
         config: NbmQuantileActorConfig,
         *,
         transport_factory: TransportFactory = build_nbm_quantile_transport,
+        alert_offer: AlertOffer | None = None,
+        evidence_root: Path | None = None,
     ) -> None:
         super().__init__(config)
         self._config = config
@@ -264,6 +294,17 @@ class NbmQuantileActor(Actor):
         #: Cycle runtimes already fetched, so a cycle costs exactly one request.
         self._fetched_cycles: set[int] = set()
 
+        #: AUT-1 WP4. `_poll_future` is the OLDEST poll not yet done (a later
+        #: overlapped no-op poll never masks a hung one).
+        self._alert_offer = alert_offer
+        self._evidence_root = evidence_root
+        self._poll_future: concurrent.futures.Future[None] | None = None
+        self._poll_submitted_ns = 0
+        self._newest_complete_ns: int | None = None
+        self._baseline_cycle_ns: int | None = None
+        self._missed_alerted: set[int] = set()
+        self._pending_heal: tuple[int, int] | None = None  # (cycle_ns, detected_ns)
+
         self._inflight = 0
         self._inflight_lock = threading.Lock()
         self.counters: Counter[str] = Counter()
@@ -276,6 +317,11 @@ class NbmQuantileActor(Actor):
         """Submitted coroutines not yet fully supervised (tests drain on this)."""
         with self._inflight_lock:
             return self._inflight
+
+    @property
+    def poll_future(self) -> concurrent.futures.Future[None] | None:
+        """The oldest submitted poll that is not yet done (retained for the hang reset)."""
+        return self._poll_future
 
     @property
     def poll_timer_armed(self) -> bool:
@@ -296,6 +342,7 @@ class NbmQuantileActor(Actor):
             logger.info("no running event loop: no NBM quantile polling armed")
             return
         self._transport = self._transport_factory(self.clock.timestamp_ns)
+        self._baseline_cycle_ns = self.latest_available_cycle_ns(self.clock.timestamp_ns())
         self._submit(self.poll_once())
         self._arm_timer()
 
@@ -334,7 +381,18 @@ class NbmQuantileActor(Actor):
     # -- the cross-thread bridge (L-16) -------------------------------------
 
     def on_cycle_timer(self, event: object) -> None:
-        """Timer callback: submit and return. Never raises (a `LiveClock` would swallow it)."""
+        """Timer callback: checks, submit, return. Never raises (a `LiveClock` would swallow it).
+
+        The hang reset and the silent-feed alert ride THIS timer (AUT-1 WP4):
+        there is no second timer.
+        """
+        try:
+            now_ns = self.clock.timestamp_ns()
+            self._reset_hung_poll(now_ns)
+            self._offer_missed_cycle_alerts(now_ns)
+        except Exception:
+            self.counters["timer_check_failed"] += 1
+            logger.critical("NBM_NBP_TIMER_CHECK_FAILED", exc_info=True)
         self._submit(self.poll_once())
 
     def _submit(self, coro: Any) -> None:
@@ -351,6 +409,139 @@ class NbmQuantileActor(Actor):
             self._settle()
             return
         future.add_done_callback(self._on_poll_done)
+        retained = self._poll_future
+        if retained is None or retained.done():
+            self._poll_future = future
+            self._poll_submitted_ns = self.clock.timestamp_ns()
+
+    # -- AUT-1 WP4: hang reset, silent-feed check, heal record --------------
+
+    def _reset_hung_poll(self, now_ns: int) -> None:
+        """Cancel a poll not done `NBP_POLL_HANG_S` after submission; the caller re-submits."""
+        future = self._poll_future
+        if future is None or future.done():
+            return
+        if now_ns - self._poll_submitted_ns < NBP_POLL_HANG_S * _NS_PER_SECOND:
+            return
+        future.cancel()
+        self._poll_future = None
+        self.counters["poll_hang_reset"] += 1
+        cycle_ns = self.latest_available_cycle_ns(now_ns)
+        logger.error("%s cycle_ns=%s", POLL_RESET_MARKER, cycle_ns)
+        if cycle_ns is not None and self._pending_heal is None:
+            self._pending_heal = (cycle_ns, now_ns)
+
+    def _cycles_in(self, after_ns: int, through_ns: int) -> list[int]:
+        """Configured cycle instants `c` with `after_ns < c <= through_ns`, ascending."""
+        hour_ns = _SECONDS_PER_HOUR * _NS_PER_SECOND
+        found: list[int] = []
+        day_ns_start = after_ns - after_ns % _NS_PER_DAY
+        while day_ns_start <= through_ns:
+            for hour in self._cycle_hours:
+                candidate = day_ns_start + hour * hour_ns
+                if after_ns < candidate <= through_ns:
+                    found.append(candidate)
+            day_ns_start += _NS_PER_DAY
+        return found
+
+    def missed_cycles_list(self, now_ns: int) -> tuple[int, ...]:
+        """Configured cycles after the newest complete one whose deadline has passed.
+
+        "Complete" = published without a parse drift. With nothing complete
+        yet the count starts at the cycle that was current at boot, so a
+        drifted or never-arrived cycle counts once its `stale_deadline` passes.
+        """
+        after_ns = self._newest_complete_ns
+        if after_ns is None:
+            if self._baseline_cycle_ns is None:
+                self._baseline_cycle_ns = self.latest_available_cycle_ns(now_ns)
+            if self._baseline_cycle_ns is None:
+                return ()
+            after_ns = self._baseline_cycle_ns - 1
+        return tuple(self._cycles_in(after_ns, now_ns - self._stale_deadline_ns))
+
+    def missed_cycles(self, now_ns: int) -> int:
+        """How many cycles are missed at `now_ns` (read by FQ's `nbp_feed_freshness`)."""
+        return len(self.missed_cycles_list(now_ns))
+
+    def _offer_missed_cycle_alerts(self, now_ns: int) -> None:
+        """CRITICAL `NBP_CYCLE_MISSED`, once per cycle, on the first fire past its deadline."""
+        for cycle_ns in self.missed_cycles_list(now_ns):
+            if cycle_ns in self._missed_alerted:
+                continue
+            self._missed_alerted.add(cycle_ns)
+            self.counters["cycle_missed_alert"] += 1
+            detail = f"cycle_ns={cycle_ns} now_ns={now_ns} model={NBM_NBP_MODEL}"
+            if self._alert_offer is None:
+                self.counters["cycle_missed_unoffered"] += 1
+                logger.critical("%s %s (no alert_offer wired)", _CYCLE_MISSED_EVENT, detail)
+            elif not self._offer(_CYCLE_MISSED_EVENT, "CRITICAL", detail):
+                self.counters["cycle_missed_undelivered"] += 1
+
+    def _offer(self, event: str, severity: str, detail: str) -> bool:
+        offer = self._alert_offer
+        if offer is None:
+            return False
+        try:
+            return bool(offer(event, severity, detail))
+        except Exception:
+            logger.critical("NBM_NBP_ALERT_OFFER_RAISED event=%s", event, exc_info=True)
+            return False
+
+    def _on_cycle_complete(self, cycle_ns: int) -> None:
+        """A cycle was published: it is the newest complete one; close any open heal."""
+        if self._newest_complete_ns is None or cycle_ns > self._newest_complete_ns:
+            self._newest_complete_ns = cycle_ns
+        pending = self._pending_heal
+        if pending is None or cycle_ns < pending[0]:
+            return
+        self._pending_heal = None
+        try:
+            self._record_heal(detected_ns=pending[1], healed_ns=self.clock.timestamp_ns())
+        except Exception:
+            self.counters["heal_record_failed"] += 1
+            logger.critical("NBM_NBP_HEAL_RECORD_FAILED", exc_info=True)
+
+    def _heal_dir(self, healed_ns: int) -> Path:
+        root = self._evidence_root if self._evidence_root is not None else default_data_root()
+        day = dt.datetime.fromtimestamp(healed_ns / _NS_PER_SECOND, tz=dt.UTC).date()
+        return root / "evidence" / "capture" / "heal" / day.isoformat()
+
+    def _record_heal(self, *, detected_ns: int, healed_ns: int) -> None:
+        """Write the write-once heal record, THEN offer the INFO alert (plan r12 §3.7.2)."""
+        fields: dict[str, object] = {
+            "unit": _HEAL_UNIT,
+            "cause": "poll_hang",
+            "detected_ns": detected_ns,
+            "action": "poll_reset",
+            "healed_ns": healed_ns,
+            "injected": False,
+            "decided_by": _HEAL_WRITER_ID,
+            "alert": "offered" if self._alert_offer is not None else "undeliverable",
+        }
+        observation_sha256 = sha256_hex(canonical_json(fields))
+        record = {**fields, "observation_sha256": observation_sha256}
+        directory = self._heal_dir(healed_ns)
+        directory.mkdir(mode=_HEAL_DIR_MODE, parents=True, exist_ok=True)
+        path = directory / f"{healed_ns}_node_{_HEAL_WRITER_ID}.json"
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _HEAL_RECORD_MODE)
+        except FileExistsError:
+            self.counters["heal_record_exists"] += 1
+            logger.critical("NBM_NBP_HEAL_RECORD_EXISTS path=%s (never overwritten)", path)
+            return
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(canonical_json(record) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.counters["heal_recorded"] += 1
+        event = f"{_HEALED_EVENT_PREFIX}{observation_sha256}"
+        detail = f"cause=poll_hang action=poll_reset healed_ns={healed_ns}"
+        if not self._offer(event, "INFO", detail):
+            self.counters["heal_alert_undeliverable"] += 1
+            logger.critical(
+                "%s observation_sha256=%s", HEAL_UNDELIVERABLE_MARKER, observation_sha256
+            )
 
     def _settle(self) -> None:
         with self._inflight_lock:
@@ -468,6 +659,7 @@ class NbmQuantileActor(Actor):
             return
         self._fetched_cycles.add(cycle_ns)
         self._publish(result, lag_ns, cycle_ns=cycle_ns)
+        self._on_cycle_complete(cycle_ns)
 
     def _measured_lag_ns(self, result: NbmQuantileFetchResult, cycle_ns: int) -> int | None:
         """The MEASURED publication lag, or `None` when it cannot be trusted.
