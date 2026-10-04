@@ -323,3 +323,37 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - `compute_transition_id` validates its inputs.
   - The pattern-equality test also compares flags.
 - **A6a-A1.** `transition_id` lives in `schemas`, and 6b re-exports it under the plan's name `transitions.transition_id`. The local pattern copies in `schemas` follow the plan's import list. Their comment must state that the copies exist because of that list, not because of a contract: `paths` is reachable transitively.
+
+### Build-time rulings (seam A 6b ARCH review, 15428bfa)
+- **A6b-R1 (HIGH).** Widening is decided per row. A PROMOTE widens only when `to_state is CHAMPION`. A SHADOW→CHALLENGER nomination is not widening (AUT-5 r7:166, ARCH:942). Without this, AUT-4 forward shadow cannot start before L2, against the ARCH:1058 wave order. `rows_admissible` uses `is_widening_row`. `WIDENING_KINDS` stays the kind set used for the pins subset check.
+- **A6b-R2 (MED-1).** A PROMOTE, DRILL_PROMOTE, ROLLBACK or ROOT_ADMIT row whose `to_state` is CHAMPION but which has no `effective_launch_date` folds to `FoldInvalid(head_missing_launch_date)`. Per ARCH:476-479 these rows are always pending until LAUNCH. Erratum E-16 adds this reason to the fold's closed set.
+- **A6b-R3 (MED-2).** ACTIVATE cites its pair through `paired_transition_id`, which holds the transition id of the →CHAMPION head. Erratum E-16 amends ARCH l.418 so that `paired_transition_id` is also non-null on ACTIVATE. 6e's column rules follow E-16.
+- **A6b-R4 (item 6).** `ALLOWED[ROOT_ADMIT]` includes `(None, CHAMPION)`, per A4-R6 and plan r5:200. Erratum E-16 records it against ARCH:468/479.
+- **A6b-R5 (item 9).** `test_family_introduced_by_other_kind_is_invalid` moves from 7b to 6b. The fold must be total.
+- **A6b-R6 (MED-3, LOW).**
+  - Fix the ROLLBACK-pair test timestamps and assert the HALTED champion.
+  - Rename the ALLOWED-table test to "ARCH + A4-R6".
+  - Fold consumers are blocked by a guard test until 7a lands SWAP_CANCEL voiding: nothing outside `persistence/autonomy` may import `fold` until then.
+  - Add a planted positive control for the `[fold]` scan and a monkeypatched-pins window test.
+  - Never apply immediate rows with `ts_ns > now_ns`.
+  - Make `head_venue_seq` the sealed `rows[-1].venue_seq`.
+  - Label the invalid-chain RESUME test as an invalid-chain pin.
+  - Document RETIRE as neutral.
+
+### Build-time notes (seam A 6d build, b96c0d50)
+- **A6d-A1.** Accepted under review:
+  - `write_root_copy` takes the keyword `composition_kind`.
+  - `read_manifest_facts(family_id, sha, *, paths, repo_root)` is bound with `functools.partial` in 6e.
+  - `FamilyBytes`, `ByteBindingFailure` and `verify_family_bytes` are deferred to 8c, where their tests live.
+  - The 0500 seal belongs to AUT-5a.
+- **AUT-5a obligation.** The autonomy manifest reader never passes `allow_draft`, so a DRAFT family manifest reads as absent. Any family AUT-5a bootstraps, including `pm_us_crh_fq_v1` if it is still DRAFT, must first be committed as REGISTERED.
+- **A6d-A2 (security review: APPROVE).**
+  - Correction to A6d-A1: `deploy/families/pm_us_crh_fq_v1.json` is already REGISTERED (ad76d2f2). The AUT-5a obligation binds only for a DRAFT seed.
+  - Adopted now:
+    - (L1) `ensure_dir` fsyncs the parent after `mkdir`.
+    - (L2) `write_root_copy` publishes via `write_once_tmpfile`, so no named temp file is left in `<sha>/`.
+    - (L4) the unreadable-source test uses the real manifest sha, and `ensure_dir` gets a non-default-mode test.
+  - Carried:
+    - (M1) Before 8b is built, confirm it needs only `read_manifest_facts`; otherwise `verify_family_bytes` moves into 8b.
+    - (M2) 8c reads root manifests repo-only (E-14 3a), with a test; the engine never writes a registry copy of a root.
+    - (L3) The path-based PREREG guard after an fd read is accepted. It is same-uid only, per ARCH:408.
