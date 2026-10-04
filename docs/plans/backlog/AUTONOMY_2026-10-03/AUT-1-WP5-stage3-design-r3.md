@@ -778,3 +778,18 @@ Key paths:
   - Deleting `test_an_unreadable_stream_raises_stream_unreadable` is an orphan removal: S3-R20 removed R5's stream read. 3c must show that a test of the gatherer's `stream_unreadable` still exists.
 - **S3-R53, single-source constants.** `HEAL_ALERT_RETRY_DAYS` has a single source in `capture_heal`, and `capture_live_proof` imports it; the local copy is deleted. The `heal_alert_unabandoned_count` and `gap_alert_unabandoned_count` from S1's duty stay as logged counts. Surfacing them in live proof is deferred to the stage-4 dashboard, because no consumer needs them before AUT-6.
 - **S3-R54, the stub-pin reconciliation.** The S1 and S2 out-of-list patches edit the same assertion. 3c writes one assertion holding both directions: `landed == (S1_REAL | S2_REAL)` and `(S1_REAL | S2_REAL) <= set(_STAGE3_STUBS)`.
+
+## Stage-3 code review rulings (SEC APPROVE; python REQUEST_CHANGES; coordinator, 2026-10-04)
+- **S3-R55 (HIGH).** `tests/unit/test_capture_audit.py` has reached 862 lines, past the 800-line limit, and it is not an RC-2 file. Move the `_no_real_heal` and `_no_lock` helpers into `tests/support/`, and split the `_main`/CLI tests into their own file, so the file ends at or under 800 lines. Nothing in it is weakened.
+- **S3-R56 (MED), S3-R52 strict reading.**
+  - `_delivered` counts EVERY exception raised by `delivered_events` as one duty failure, including `SingleReadRefused`, `OSError`, `ValueError` and `TypeError`.
+  - The fail-closed "unreadable ledger file means not delivered" rule of S3-R9 lives INSIDE `delivered_events`: it returns no event for an unreadable file. It is not implemented by swallowing exceptions in the duty.
+  - Re-target the M-LEDGER test: an unreadable file is not delivered and counts 0 failures, while a raised exception counts 1.
+- **S3-R57 (LOW items, all fixed now).**
+  - `list_names(ABANDONED_REL)` moves inside `_resend_phase`'s `try`, and a failure there is counted.
+  - A date name that passes `_DATE_RE` but is invalid, such as `2026-13-45`, is skipped with a log line instead of dropping the whole listing.
+  - `read_notifier_proofs` uses the guarded `_names` helper, as its docstring states.
+  - `build_live_proof` reads the delivery ledger once per call, instead of once per heal.
+- **Stage-4 checklist additions (from the SEC review's LOW items).**
+  - Before AUT-6 delivers `detail` verbatim, gap-alert `detail` fields are restricted: `invocation_id` to `[0-9a-f]{32}`, and `cause` to the fixed set.
+  - WP3 step 2 includes a host V-step for the recorder stop-hook row under `--unshare-net`.
