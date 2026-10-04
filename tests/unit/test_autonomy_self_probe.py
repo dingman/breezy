@@ -806,3 +806,87 @@ def test_selftest_default_systemctl_probe_fails_without_a_user_bus(
     assert selftest_cli.in_row_systemctl(row) == "failed"
     monkeypatch.setattr(subprocess, "run", lambda argv, **kw: type("D", (), {"returncode": 0})())
     assert selftest_cli.in_row_systemctl(row) == "ok"
+
+
+# --- --exec-snapshot N (WP-B3, V10) ------------------------------------------------
+
+EXEC_DB = "exec_polymarket_us.sqlite"
+
+
+def _exec_store(world: World, *, create: bool = True) -> Path:
+    """A scratch exec store under the world's data root; the cache bind's parent is 0700."""
+    (world.roots.data_root / "cache").chmod(0o700)
+    db = world.roots.data_root / "state" / EXEC_DB
+    if create:
+        import sqlite3
+
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE t(v TEXT)")
+        conn.execute("INSERT INTO t VALUES ('a')")
+        conn.commit()
+        conn.close()
+    return db
+
+
+def test_selftest_exec_snapshot_runs_n_advisory_snapshots_and_prints_counts(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    _exec_store(sandboxed)
+    state = sandboxed.roots.data_root / "state"
+    listing = sorted(os.listdir(state))
+    code, report = run_cli(["--exec-snapshot", "3"])
+    assert code == 0
+    assert report["snap"] == {"ok": 3, "unstable": 0, "failed": {}}
+    assert sorted(os.listdir(state)) == listing
+    assert os.listdir(sandboxed.roots.data_root / BIND) == []
+
+
+def test_selftest_exec_snapshot_counts_failures_by_reason_and_leaks_no_path(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]], capsys: Any
+) -> None:
+    _exec_store(sandboxed, create=False)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = selftest_cli.main(
+            ["--exec-snapshot", "2"],
+            roots=sandboxed.roots,
+            environ=sandboxed.environ,
+            fs=sandboxed.fs,
+        )
+    report = json.loads(out.getvalue())
+    assert code == 0
+    assert report["snap"] == {"ok": 0, "unstable": 0, "failed": {"source_invalid": 2}}
+    assert str(sandboxed.roots.data_root) not in out.getvalue()
+
+
+def test_selftest_exec_snapshot_uses_the_injected_runner_with_the_count(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    seen: list[tuple[int, Path]] = []
+
+    def runner(count: int, roots: SandboxRoots) -> dict[str, Any]:
+        seen.append((count, roots.data_root))
+        return {"ok": count, "unstable": 0, "failed": {}}
+
+    code, report = run_cli(["--exec-snapshot", "20"], exec_snapshots=runner)
+    assert code == 0 and seen == [(20, sandboxed.roots.data_root)]
+    assert report["snap"]["ok"] == 20
+
+
+@pytest.mark.parametrize("count", ["0", "-1", "x", "3.5", "", "1001", "٣"])
+def test_selftest_exec_snapshot_rejects_a_bad_count_with_usage(
+    world: World, run_cli: Callable[..., tuple[int, dict[str, Any]]], count: str
+) -> None:
+    code, report = run_cli(["--exec-snapshot", count])
+    assert (code, report) == (64, {})
+
+
+def test_selftest_exec_snapshot_is_not_reported_unless_asked(
+    sandboxed: World, run_cli: Callable[..., tuple[int, dict[str, Any]]]
+) -> None:
+    _, plain = run_cli([])
+    assert "snap" not in plain
+
+
+def test_selftest_exec_snapshot_bind_is_the_selftest_rows_cache_bind() -> None:
+    assert selftest_cli.EXEC_SNAPSHOT_BIND in AUTONOMY_BWRAP_TABLE[ROW].binds

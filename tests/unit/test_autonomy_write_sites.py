@@ -313,3 +313,37 @@ def test_module_exports_are_final_constants() -> None:
         and "Final" in ast.unparse(node.annotation)
     }
     assert {"SHARED_WRITE_SITES", "SHARED_WRITE_MODULES", "WRAPPER_CODE_FILES"} <= final
+
+
+# --- wal_snapshot's own sites (WP-B3) ----------------------------------------------
+
+
+def test_wal_snapshot_is_a_shared_write_module_with_sites() -> None:
+    assert "wal_snapshot" in SHARED_WRITE_MODULES
+    own = {site for site in SHARED_WRITE_SITES if site.module == "wal_snapshot"}
+    assert own, "the cache copy writes; an empty set means a blind scan"
+    assert {s.function for s in own} >= {
+        "_make_snap_dir",
+        "_create_copy",
+        "_recover",
+        "_remove_tree",
+    }
+
+
+def test_wal_snapshot_never_writes_through_its_source_readers_or_the_ro_connection() -> None:
+    """Fingerprinting, the source opens and the read-only connection are not write sites."""
+    functions = {s.function for s in SHARED_WRITE_SITES if s.module == "wal_snapshot"}
+    assert functions.isdisjoint(
+        {
+            "_fingerprint",
+            "_open_source",
+            "_open_source_dir",
+            "_acquire_intent_lock",
+            "_open_cache_dir",
+            "connect_snapshot_readonly",
+            "exec_store_paths",
+        }
+    )
+    assert ("wal_snapshot", "_recover", "sqlite3.connect") in {
+        (s.module, s.function, s.call) for s in SHARED_WRITE_SITES
+    }
