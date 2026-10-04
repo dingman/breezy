@@ -52,13 +52,25 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
     },
     # -- AUT-1 WP5 stage 3a (design r3 section 3): the stage-3 stubs. S1 (heal), S2 (live proof,
     # AUT-6 contract) fill them in parallel; a signature change is a deliberate edit of this table.
+    # S1 landed the heal modules (design r3 section 6): the real public surface, pinned exactly.
     f"{_AN}.capture_heal": {
+        "instance_lines": "(text: str) -> tuple[InstanceLine, ...]",
         "plan_heals": (
-            "(kills: Sequence[RecorderJournalEntry], now_ns: int) -> tuple[Mapping[str, Any], ...]"
+            "(kills: Sequence[RecorderJournalEntry], lines: Sequence[InstanceLine], "
+            "stall_sha: Mapping[str, str], evidence: Mapping[str, InstanceEvidence], "
+            "now_ns: int) -> tuple[HealPlan, ...]"
         ),
+        "heal_body": "(plan: HealPlan, *, injected: bool) -> dict[str, Any]",
+        "heal_record_matches": "(body: Mapping[str, Any], plan: HealPlan) -> bool",
+        "gap_key": "(invocation_id: str) -> str",
+        "alert_phase": "(age_days: int) -> str",
+        "node_record_resendable": "(record_ns: int, now_ns: int) -> bool",
     },
     f"{_AN}.capture_heal_io": {
-        "run_heal_duty": "(data_root: Path, *, now_ns: int, heal_deadline: float) -> int",
+        "HealSender.send": "(self, event: str, detail: str, attempt_kind: str) -> bool",
+        "run_heal_duty": (
+            "(data_root: Path, *, now_ns: int, heal_deadline: float, sender: HealSender) -> int"
+        ),
     },
     f"{_AN}.capture_live_proof": {
         "newest_audit_by_day": "(names: Sequence[str]) -> dict[dt.date, str]",
@@ -226,7 +238,7 @@ W2_REAL: Final[frozenset[str]] = frozenset(
 #: Stage-3 stream S1 (heal) and S2 (live proof, AUT-6 contract) each add their modules to THEIR OWN
 #: line below and to no other (S3-R28, S3-R43), so the two merge without a conflict. 3c verifies the
 #: union only.
-S1_REAL: Final[frozenset[str]] = frozenset()
+S1_REAL: Final[frozenset[str]] = frozenset({f"{_AN}.capture_heal", f"{_AN}.capture_heal_io"})
 #: (keep the two lines above and below apart: they are one-line edits owned by different streams)
 S2_REAL: Final[frozenset[str]] = frozenset(
     {f"{_AN}.capture_aut6_contract", f"{_AN}.capture_live_proof", f"{_AN}.capture_live_proof_cli"}
