@@ -148,6 +148,15 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
     _core("capture_schedule", min_calls=4),
     _core("capture_reader", min_calls=90),
     AuthorityRow("breezy.analysis.capture_forecast_ref", min_calls=6),
+    # AUT-1 WP5-B: the settlement writer. Its one write site is its own lock; the data file goes
+    # through single_read.replace_atomic. The CLI is a non-writer.
+    AuthorityRow(
+        "breezy.analysis.capture_settlement",
+        writes=("_acquire_lock",),
+        write_imports=frozenset({"replace_atomic"}),
+        min_calls=40,
+    ),
+    AuthorityRow("breezy.analysis.capture_settlement_cli", min_calls=15),
     AuthorityRow("breezy.strategy.autonomy_capture.guarded_strategy", min_calls=80),
     AuthorityRow("breezy.strategy.forecast_quantile_ladder.capture_adapter", min_calls=45),
     AuthorityRow("breezy.strategy.forecast_quantile_ladder.plugin", min_calls=8),
