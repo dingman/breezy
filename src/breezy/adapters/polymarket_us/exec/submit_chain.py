@@ -41,6 +41,7 @@ from breezy.adapters.polymarket_us.leg_prices import (
 from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
 from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.domain.exec_intent import intent_fingerprint as intent_fingerprint  # noqa: PLC0414
 from breezy.persistence.exit_gate import family_declares_exit_rule, family_declares_no_leg_exit
 from breezy.persistence.family_manifest import FamilyManifest
 
@@ -237,20 +238,6 @@ def order_quantity_decimal(order: object) -> Decimal:
 
 def order_notional_usd(order: object) -> Decimal:
     return order_price_decimal(order) * order_quantity_decimal(order)
-
-
-def intent_fingerprint(order: object) -> str:
-    payload = "\n".join(
-        (
-            str(getattr(order, "instrument_id", "")),
-            str(getattr(order, "side", "")),
-            str(getattr(order, "quantity", "")),
-            str(getattr(order, "price", "")),
-            str(getattr(order, "time_in_force", "")),
-            str(getattr(order, "client_order_id", "")),
-        )
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 _FINGERPRINT_VERSION: Final[bytes] = b"breezy.exec.request-fingerprint.v1"

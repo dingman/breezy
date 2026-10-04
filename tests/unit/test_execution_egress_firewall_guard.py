@@ -3262,6 +3262,11 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     function over an int and a byte string, so the suite never opens a
     socket and never constructs a client.
 
+    AUT-1 WP5-A adds one: `tests/unit/autonomy/test_exec_intent_parity.py`
+    imports `exec.client` and `exec.submit_chain` solely to pin the adapter-free
+    `domain.exec_intent` key prefixes and `intent_fingerprint` equal to them. It
+    carries no `SOCKET_RESTORING_MARKERS`; WIDENED, not relaxed.
+
     R-OP-SEQ adds one more: `test_polymarket_us_write_sequence.py` imports
     `ORDER_BODY_KEYS` from `exec.submit_chain` to derive the positive-control
     GTC body key set (`CONTROL_ORDER_BODY_KEYS`) from the live IOC constant,
@@ -3727,6 +3732,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         # `_FakeOrderSender` double, exactly like every sibling exec suite in
         # this set, so no socket is ever opened.
         "tests/unit/test_ct01_ambiguous_public_port.py",
+        # AUT-1 WP5-A (V-15, ruling WP5-R1): `tests/unit/autonomy/
+        # test_exec_intent_parity.py` imports `exec.client` (the key-prefix
+        # constants) and `exec.submit_chain` (`intent_fingerprint`) to run the
+        # plan-named `test_exec_key_prefixes_equal_client_constants` and
+        # `test_intent_fingerprint_shim_is_the_domain_function` parity tests
+        # that pin `breezy.domain.exec_intent` equal to the adapter. WIDENED,
+        # not relaxed (L-6/L-12): the comparison is still `==`; the module
+        # carries no `SOCKET_RESTORING_MARKERS`, constructs no client, and
+        # only reads plain string constants and a pure hashing function.
+        "tests/unit/autonomy/test_exec_intent_parity.py",
     }
 
 
