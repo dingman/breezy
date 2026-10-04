@@ -496,3 +496,89 @@ Retargeted: 26 lines. Kept: 2 lines.
 - `/home/jon/breezy/src/breezy/persistence/autonomy/{pins.py,transitions.py,verdict.py,registry_shape.py,validate.py,fold.py,fold_tallies.py}`
 - `/home/jon/breezy/src/breezy/app/trade.py`
 - `/home/jon/breezy/deploy/families/pm_us_crh_fq_v1.json`
+---
+
+## Peer-review round 1 rulings (coordinator, 2026-10-04 ~21:45Z)
+
+**Reviews.**
+- Architect: REQUEST_CHANGES.
+- Security: CONDITIONAL, 3 HIGH, no CRITICAL.
+- Statistics (prediction-market-reviewer): SOUND-WITH-CAVEATS.
+
+**Status.** This draft is NOT filed. An r2 must incorporate FQ-R34..R44 below, and must pass a round-2 review (architect, security, stats) before E-25/E-26 are appended to `ARCH-ERRATA-rev9_2.md`.
+
+**Rulings**
+
+- **FQ-R34, CONFLICT-3: REJECT the halt-narrowing erratum.** Architect and security agree. v1's halt is cleared only under ARCH W15 (`:720-723`), through the existing audited `breezy-clear-family-halt`, and only after:
+  - the fold shows v1 RETIRED and `terminal_frozen`;
+  - no env source names v1.
+
+  Verify-first: list every uncleared non-fee `policy_halt` on polymarket_us.
+
+- **FQ-R35, CONFLICT-5 / DEP-9 / GAP-12: arm v2 by the env and manifest-ruling route, as v1 was armed on 10-01.**
+  - Add a one-line erratum: `BOOTSTRAP_SEED` CHAMPION is "the venue's sending FQ root at bootstrap" (v2), and v1 is seeded RETIRED. No bootstrap has run; `BOOTSTRAPPED_ROOT_MANIFEST_SHA256` is empty.
+  - L1-R is REJECTED: it trips the same ledger gate and the ARCH-0 r5 note `:916`.
+  - GAP-12 is dropped.
+  - F9 Needs = {F8, shadow resume-bar PASS, F6, RC-5 ruling}.
+  - The DEP-9 ledger gate is unweakened; it gates L2 widening only.
+  - This amends RC-5's "through registry ROOT_ADMIT".
+  - Every widening act is its own reviewed commit (security, item 6).
+  - Before bootstrap, a parity FAIL actuates through the F6 composed veto (refuse). After the registry is live it actuates by DEMOTE.
+  - Verify: a mirrored halt on a family seeded RETIRED produces no RETIRED→HALTED transition.
+
+- **FQ-R36, CONFLICT-6 / RC-7: ACCEPT**, with a one-line erratum. The carve-out wording is "before row 7 merges" (F13 is legal later). F6 must add these tests:
+  - the composed veto is an OR (add-only; it refuses wherever the old one refused);
+  - `test_composed_veto_is_single_object_shared`;
+  - a missing, stale or raising loss-stop input refuses, and the halt branch runs first;
+  - `test_stale_veto_fails_closed_with_alert_sink_down`;
+  - a diff-scope guard.
+
+- **FQ-R37, evidence_row: AMEND.**
+  - `load_evidence_rows` derives the path from `store_kind`.
+  - The constructor is token-guarded, and `dataclasses.replace`, `copy` and `object.__setattr__` are forbidden. Test: `test_evidence_row_cannot_be_forged_via_replace_or_pickle`.
+  - Backtest-tagged input can never yield PASS; the evaluator enforces this. Test: `test_backtest_only_input_never_yields_pass`.
+  - OPEN-1: the policy loader refuses an FQ lineage with `test_kind=fixed_n`. Non-FQ replay FS is unchanged and is moot (`pins.py:23`).
+
+- **FQ-R38, GAP-13 (new, architect): a CHALLENGER never accrues shadow n**, because the node runs only the CHAMPION.
+  - F12 is GATED until F5 rules a forward-only shadow source for non-champions.
+  - The owner of `_ADMISSION_IMPLEMENTED` is WP1b (ARCH-0 r5 `:909-916`), not F12.
+
+- **FQ-R39, statistics (mandatory before F7b merges):**
+  - **Y_d denominator.** It is either pinned before the day, or the e-process uses per-take factors 1+λ(h/BE−1) with λ fixed at the start of the day. Add a Monte Carlo case where the take count depends on intraday information.
+  - **e_b** is constructed as a betting e-process, not derived from the CS.
+  - **α_kill** is pinned separately.
+  - **FDR scope.** Rule 5 states that FDR is controlled per lineage, the cross-lineage rate is not, and it names the null that PASS rejects (edge > 0 versus the ask, not versus the champion).
+  - **Infeasible nominations** are capped per lineage.
+  - **Parity.** It uses a fill-conditioned null, and the look date is stated against the KILL date.
+  - **F5's N record is restated:** 50% power at about 50% ROI, and 80% power at about 60–80% ROI, with n ≤ 100 before 2027-01-25.
+
+- **FQ-R40, CONFLICT-2: AMEND E-26.**
+  - `variant_spec` carries its variation in the artefact only.
+  - Nominating a child whose manifest differs from its root outside the §4.2 allowlist is refused. Test: `test_variant_spec_nonallowlisted_diff_nomination_refused`.
+  - An M1 survivor needs a manifest-schema extension or a new family.
+
+- **FQ-R41, LAYER-1 / DEDUP-1: ACCEPT. DEDUP-2: AMEND.**
+  - r12's `nomination.py` text adds `elond`, with an `is`-identity single-definition test.
+  - FqEvaluator replaces the `RefusingPlugin` entry in the existing `analysis/autonomy/offline_plugins.py`. No new `analysis/plugins.py` is created; re-check F4 and FQ-R25.
+  - Check `analysis/brier_decomposition.py` before building any reliability code.
+
+- **FQ-R42, WP1s: AMEND.**
+  - The wrappers re-export the moved names for the five script importers, and `test_script_wrappers_delegate` covers them.
+  - The WP states that the `family_tally_v2` timer runs the wrapper at its next firing.
+
+- **FQ-R43, verify-firsts (blocking):**
+  - Verdict-id golden fixtures; the new keys change the identity.
+  - Any Σα ≤ α_total check is scoped to `halving_v1`.
+  - R counts only CHAMPION-making PROMOTEs. CONFIRMED (`fold.py:386-401`).
+  - `$STATE/derived/verdicts/` is empty.
+  - `test_c3_writer_only_writer_of_new_classes` is a call-site AST check, not a name-only check.
+
+- **FQ-R44, F6 retirement (security #5).** Retirement needs all three:
+  - N consecutive EVALUATED non-inert `live.drawdown` PASS days (N pinned in the policy block) plus a minimum fill count;
+  - a fresh producer verdict (`test_bridge_retirement_blocked_when_drawdown_producer_stale`);
+  - a reviewed human commit. Nothing auto-retires.
+
+**Honest critical path.** The statistics review shows the live e-process confirms only edges of about 50–80% ROI before the KILL date, so F9 by the forward bar alone is unlikely to arrive quickly. Winner search depends on:
+- M1 re-runs as truth data grows;
+- new US weather sources (F13);
+- the F5 shadow bar.
