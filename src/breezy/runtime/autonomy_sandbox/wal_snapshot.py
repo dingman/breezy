@@ -32,7 +32,9 @@ Steps (each pinned by a test in ``tests/unit/test_wal_snapshot.py``):
 5. Re-fingerprint: a difference removes the copy and retries, up to ``copy_attempts``, then
    ``FINGERPRINT_UNSTABLE``. Check the deadline (``DEADLINE``), then release the intent flock.
 6. Recover the copy read-write under the real cache path: ``PRAGMA quick_check`` must be
-   ``ok`` (``QUICK_CHECK``), ``journal_mode=DELETE`` leaves a single file, no ``-wal``/``-shm``.
+   ``ok`` (``QUICK_CHECK``), ``journal_mode=DELETE`` is set and the on-disk header must then
+   say not-WAL (bytes 18 and 19 both 1; the pragma's reply is never trusted), with no
+   ``-wal``/``-shm``.
 7. Yield ``WalSnapshot`` or ``SnapshotReadFailure``; an expected failure never raises.
    ``finally`` removes the snapshot directory and releases both flocks.
 
@@ -78,6 +80,8 @@ _PAGE_SIZE_OFFSET: Final = 16
 _MIN_PAGE_SIZE: Final = 512
 _MAX_PAGE_SIZE: Final = 65536
 _PROC_FD: Final = "/proc/self/fd"
+_FORMAT_OFFSET: Final = 18
+_NOT_WAL_FORMAT: Final = bytes([1, 1])  # 2/2 means WAL
 _LAUNCH_FLOOR_MARGIN_NS: Final = 120 * 1_000_000_000
 _COPY_CHUNK = 1 << 20  # module-level so a test can shrink it
 _PRIVATE_DIR_MODE: Final = 0o700
@@ -478,6 +482,17 @@ def _stable_copy(
     raise _Fail(SnapshotFailureReason.FINGERPRINT_UNSTABLE)
 
 
+def _header_format(snap_fd: int, db_name: str) -> bytes:
+    """Database header bytes 18 and 19 (the write and read format versions), via the snap dir fd."""
+    fd = os.open(db_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=snap_fd)
+    try:
+        with open(fd, "rb", buffering=0, closefd=False) as handle:
+            handle.seek(_FORMAT_OFFSET)
+            return handle.read(2)
+    finally:
+        os.close(fd)
+
+
 def _recover(snap_fd: int, db_name: str) -> None:
     """Open the copy read-write, check it, leave a single rollback-journal file.
 
@@ -490,12 +505,13 @@ def _recover(snap_fd: int, db_name: str) -> None:
         try:
             if conn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
                 raise _Fail(SnapshotFailureReason.QUICK_CHECK)
-            if conn.execute("PRAGMA journal_mode=DELETE").fetchone() != ("delete",):
-                raise _Fail(SnapshotFailureReason.QUICK_CHECK)
+            conn.execute("PRAGMA journal_mode=DELETE")
         finally:
             conn.close()
     except sqlite3.Error:
         raise _Fail(SnapshotFailureReason.QUICK_CHECK) from None
+    if _header_format(snap_fd, db_name) != _NOT_WAL_FORMAT:
+        raise _Fail(SnapshotFailureReason.QUICK_CHECK)
     if {db_name + "-wal", db_name + "-shm"} & set(os.listdir(snap_fd)):
         raise _Fail(SnapshotFailureReason.COPY_ERROR)
 

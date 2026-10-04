@@ -1219,3 +1219,43 @@ def test_recovery_connects_through_proc_self_fd(
     rw = [path for path in seen if not path.startswith("file:")]
     assert len(rw) == 1 and re.fullmatch(r"/proc/self/fd/\d+/" + EXEC_STORE_FILENAME, rw[0]), rw
     conn.close()
+
+
+class _NoJournalConversion:
+    """A connection whose ``journal_mode=DELETE`` pragma answers 'delete' but changes nothing."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *args: Any) -> Any:
+        if "journal_mode=DELETE" in sql:
+            return self._conn.execute("SELECT 'delete'")
+        return self._conn.execute(sql, *args)
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def test_snapshot_whose_header_still_says_wal_is_refused(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B10-R5: recovery verifies the on-disk header (bytes 18 and 19 == 1), not the pragma reply."""
+    conn = _writer(store.db)
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3, "connect", lambda *a, **k: _NoJournalConversion(real_connect(*a, **k))
+    )
+    failure = _failure(store)
+    assert failure.reason is REASON.QUICK_CHECK
+    assert os.listdir(store.cache) == []
+    conn.close()
+
+
+def test_recovered_snapshot_header_is_not_wal_format(store: Store) -> None:
+    conn = _writer(store.db)
+    with _take(store) as snap:
+        assert isinstance(snap, WalSnapshot)
+        header = snap.path.read_bytes()[:20]
+    assert header[18:20] == bytes([1, 1])
+    assert store.db.read_bytes()[18:20] == bytes([2, 2])
+    conn.close()
