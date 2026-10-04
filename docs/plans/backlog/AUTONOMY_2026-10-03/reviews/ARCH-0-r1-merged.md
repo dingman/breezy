@@ -672,3 +672,15 @@ Both reviewers confirm the resolver never yields permit semantics. `ResolvedFami
     - Rename the namespace test to `test_production_roots_argv_execs_the_venv_interpreter`.
     - The end-to-end proof through the wrapper `main` is real-host V2 after merge.
   - **Accepted availability change.** `interpreter_link` refuses before preflight, even for degradable notifier rows. This is fail-closed by design, and the notifier never runs unwrapped on it.
+- **B11 outcome (merged 97027e1e; gate B11 EXIT=0, 34 phase-2 tests).**
+  - V2 then failed with `negative_unverifiable`. The cause: `~/.local/share/breezy/registry` did not exist, and the `negative_registry` probe lstats it and fails closed (correct).
+  - **V1 now provisions it.** The amended V1 is `install -d -m 0700 .../cache .../cache/autonomy_selftest .../registry`. The 0700 mode matches seam A's `ensure_dir`/plan r5:153, and the store later only walks an existing dir.
+  - **V2 PASS:** `ok:true`, home listing `[".local","breezy"]`, tmp 262144 KiB.
+  - **AUT-5 BOOTSTRAP obligation.** Treat a pre-existing empty `registry/` at 0700 as normal.
+- **Seam B real-host V-steps (primary tree 97027e1e, 2026-10-04).**
+  - V0–V9 and V11–V21 PASS; V19 recorded = 3; V10 is pending node-up.
+  - **V9** uses the r1:361 definition: the p95 delta of wrapped `/bin/true` vs bare `systemd-run` was about 48 ms, against the 50 ms budget. That is a PASS with about 2 ms of margin. Raw wrapped p95 was 51 ms.
+    - Follow-up: if any later sandbox change pushes the delta past 50 ms, apply the r1 `-IS` shebang fallback rather than relaxing the budget.
+  - **V4** needs a syntactically valid unknown row (`breezy-autonomy-nosuch` → 78). A malformed row → 64 `usage` (correct).
+  - **V13** measured on tmpfs only; ext4 data root not measured.
+  - The wrapper creates `.bus_snapshot` at 0700 itself.
