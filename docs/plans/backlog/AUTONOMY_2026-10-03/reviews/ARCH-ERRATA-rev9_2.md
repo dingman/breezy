@@ -482,3 +482,12 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **Carried counters.** `carried_counters` (E-20 shape) uses the same keys and types. Lists merge by sorted multiset union, ints by max, bools by OR.
 - **Windows.** Each window is evaluated by `validate` (7c/7d) as the length of the in-window slice.
 - **Supersedes.** Plan r5:214-221 (int counters) is superseded.
+
+## E-22 (coordinator, 2026-10-04; from the ARCH-0 seam A 8b ARCH review): what ROLLBACK and ROOT_ADMIT cite
+- **(a) ROLLBACK** (ARCH:478, AUT-7 r5:192, :234). A ROLLBACK from the outgoing family F to the target G cites:
+  - F's halting causes: FAIL verdicts whose subject is F and whose artefact is F's bound sha;
+  - the AUT-6 DRIFT `fee_schedule` PASS for the champion.
+  F's causes may be absent only when F's standing halt carries no verdict (an exec-store mirror, or a `rollback_failed` HALT).
+- **(b) ROOT_ADMIT** (ARCH:479). A ROOT_ADMIT cites the DRIFT `fee_schedule` PASS, plus any root-admission verdicts that AUT-5 names.
+- **(c) Lookup.** Replay and `validate` resolve each cited verdict in its subject family's verdict directory. The search is bounded to three places: the row's family, the batch partner, and the prior fold's senders. Every other verdict kind keeps the rule "PASS, subject = the row's family".
+- **(d) Model class.** An artefact's model class is found by probing the closed set `pins.MODEL_CLASS_COMPONENTS` and requiring exactly one match. This replaces the assumption that every artefact lives under `<kind>:density_table` (AUT-3 r6:90 `rung_recalibration`).

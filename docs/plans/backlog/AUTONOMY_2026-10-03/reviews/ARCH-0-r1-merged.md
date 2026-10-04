@@ -527,3 +527,28 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
 - **Activation:** 8a merges outside 16:30–17:10Z. It goes live at the node's next 16:50Z LAUNCH (AC 30). 8c merges only after a boot line timestamped after that relaunch.
 - **B8-R3 follow-up (gate B5).** Every checkout or rebase under this host's umask 0002 rewrites the wrapper as 0775. The rebased seam B full gate failed only `test_wrapper_script_is_mode_0755_…`. Every other test passed (phase 2: 27/27). The wrapper was chmod'ed 0755, its test file was re-run green, and seam B was merged. The primary-tree copy was chmod'ed 0755 after the merge.
 - **WP-B3 obligation (binding).** Install the wrapper with `install -m 0755` to a location outside the git checkout, and point the units at that copy. The repo file's mode then never decides the deployed mode. The V-steps verify the installed copy's mode and owner.
+
+### Build-time rulings (seam A 8b ARCH review)
+- **A8b-R1 (H1).** ROLLBACK and ROOT_ADMIT citations are judged by role, per erratum E-22.
+  - Each cited verdict is resolved in its *subject* family's directory. The search is limited to three places: the row's family, its batch partner (F, the outgoing family), and the prior fold's senders.
+  - F's halting causes must be FAIL verdicts whose subject is F and whose artefact is F's bound sha.
+  - The fee verdict must be a DRIFT `fee_schedule` PASS for the champion.
+  - An empty citation list is allowed only when F's standing halt carries no verdict (an exec-store mirror, or a `rollback_failed` HALT).
+  - Tests must cover ROLLBACK and ROOT_ADMIT, the live drill's closing ROLLBACK to `fq_v1`, DRILL_PROMOTE citing nothing, and the E-5 restore citing nothing.
+- **A8b-R2 (H2).** Replay finds an artefact's model class by probing a closed, pinned set of model-class components and requiring exactly one match.
+  - The set is `pins.MODEL_CLASS_COMPONENTS`, which includes `density_table` and `rung_recalibration`.
+  - Zero matches or more than one match gives `ARTEFACT_UNREADABLE`.
+  - Tests must include a non-`density_table` child.
+- **A8b-R3 (M1).** The store folds at `batch[0].ts_ns`, not `now_ns`, so that its judgement is deterministic and replayable. Add a store/replay parity test, including a multi-row transaction and a row stamped before LAUNCH but committed after it.
+- **A8b-R4 (M3).** Add a timing test: replay of a 2,000-row chain (≈ one year) completes within a pinned bound on this host. If the quadratic re-fold misses the bound, replay folds incrementally.
+- **A8b-R5 (LOW).**
+  - (L1) Report a prefix FoldInvalid at the first row of the previous batch, and document this.
+  - (L2) Add a docstring to the FoldInvalid mapping tests, and make the shadow-paths assertion exact.
+  - (L3) Memoise artefact reads by `(model_class, sha)`. `ARTEFACT_MAX_BYTES` moves to `pins`.
+  - (L4) The store's manifest reader binds `repo_only` for roots too, for parity.
+  - (L5) The fd-relative `os.listdir` is accepted.
+- **Obligations.**
+  - (AUT-5a, M2) The engine passes resolved verdicts to `append`, so that the A7c-R8 RESUME check runs at write time as it does in replay.
+  - (8c, item 7) The resolver checks HWM_RESET carried counters against the newest export (B9). Replay's prior-fold floor is necessary but not sufficient.
+  - (8c/AUT-5/AUT-6) Every replay caller also calls `rows_admissible`. The replay docstring says so.
+- **8a merged 2026-10-04 05:02Z (cb37ca69, outside 16:30–17:10Z).** It was full-gated green together with seam B in gate A12 (phase1 rc=0, phase2 rc=0, no failures). The security review found live behaviour identical. Per AC 30 it activates at the node's next 16:50Z LAUNCH. No mid-day restart, for two reasons: the plan designates the 16:50Z relaunch as the activation evidence, and the change has no live behavioural effect. 8c merges only after a boot line timestamped after 2026-10-04 16:50Z.
