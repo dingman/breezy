@@ -646,6 +646,13 @@ def test_delivery_send_unknown_event_is_a_failed_delivery_not_a_crash() -> None:
     assert delivery.failed == 1 and offers.calls == []
 
 
+@pytest.fixture(autouse=True)
+def _no_real_heal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S3-R18: ``_main`` runs the heal duty, which reads the real recorder journal; here it is a
+    no-op (the heal wiring is tested in ``test_capture_audit_cli.py``)."""
+    monkeypatch.setattr(cli, "run_heal_duty", lambda *a, **k: 0)
+
+
 def _no_lock() -> int:
     """S3-R13: _main takes the studies lock by injection; a unit test never takes the real one."""
     return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)

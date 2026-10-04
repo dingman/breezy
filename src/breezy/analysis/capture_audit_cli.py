@@ -14,6 +14,9 @@ Then the unit's studies lock is taken IN PROCESS (``studies_lock.acquire_studies
 the snapshot. A missing, refused or timed-out lock exits 1 with no writes (``OnFailure=`` pages).
 The clock and ``today`` are then RE-READ (S3-R26): the wait may be 600 s.
 
+Once ``DEADLINE`` is set, heal runs first, before the family loop and even with no family
+(S3-R25, S3-R46), under ``min(now + HEAL_BUDGET_S, DEADLINE)``; its failures fold into the exit.
+
 ``DEADLINE`` is set ONCE here, before any family runs, and ``run_audit`` only reads it (S3-R41):
 every family sees the same absolute instant, ``min(lock_acquired + AUDIT_WORK_BUDGET_S,
 exec_start + AUDIT_EXEC_TIMEOUT_S - AUDIT_MARGIN_S)`` (S3-R48), so a long wait cannot carry the
@@ -29,6 +32,7 @@ and ``OnFailure=`` fires.
 
 import argparse
 import datetime as dt
+import logging
 import os
 import re
 import sys
@@ -48,7 +52,10 @@ from breezy.analysis.capture_audit_model import (
     AUDIT_WORK_BUDGET_S,
     AuditInputError,
 )
+from breezy.analysis.capture_heal import HEAL_BUDGET_S
+from breezy.analysis.capture_heal_io import run_heal_duty
 from breezy.analysis.capture_settlement import AlertOffer
+from breezy.persistence.autonomy.capture_alerts import severity_for
 from breezy.persistence.autonomy.capture_epoch import epoch_relative_path
 from breezy.persistence.autonomy.capture_schedule import launch_window_guard
 from breezy.persistence.autonomy.paths import FAMILY_RE, default_data_root
@@ -56,8 +63,9 @@ from breezy.runtime.autonomy_sandbox.bwrap import default_roots
 from breezy.runtime.autonomy_sandbox.run_mounts import STUDIES_LOCK_NAME
 from breezy.runtime.autonomy_sandbox.studies_lock import StudiesLockError, acquire_studies_lock
 
-__all__ = ["FLOCK_WAIT_S", "TIMEOUT_START_S", "families_by_construction", "main"]
+__all__ = ["FLOCK_WAIT_S", "TIMEOUT_START_S", "OfferHealSender", "families_by_construction", "main"]
 
+_LOGGER: Final = logging.getLogger(__name__)
 FLOCK_WAIT_S: Final[int] = 600
 TIMEOUT_START_S: Final[int] = 1500
 LOCK_POLL_S: Final[float] = 0.5
@@ -69,6 +77,19 @@ def _undeliverable_offer(event: str, severity: str, detail: str) -> bool:
     sys.stderr.write(f"{severity} {event} {detail} (undelivered: no outbox wired)\n")
     sys.stderr.flush()
     return False
+
+
+class OfferHealSender:
+    """The ``HealSender`` over the alert ``offer``: the severity comes from ``severity_for`` and
+    ``attempt_kind`` rides in ``detail`` (the stage-4 shim: AUT-6's outbox takes it natively)."""
+
+    def __init__(self, offer: AlertOffer) -> None:
+        self._offer = offer
+
+    def send(self, event: str, detail: str, attempt_kind: str) -> bool:
+        return bool(
+            self._offer(event, severity_for(event), f"{detail} attempt_kind={attempt_kind}")
+        )
 
 
 def families_by_construction(data_root: Path, explicit: Sequence[str]) -> tuple[str, ...]:
@@ -144,21 +165,44 @@ def _run_locked(
     )
     token = DEADLINE.set(deadline)  # once (S3-R41)
     try:
-        return _run_families(data_root, explicit, today, now_ns, offer)
+        heal_failures = _run_heal(data_root, now_ns, deadline, offer)
+        return _run_families(data_root, explicit, today, now_ns, offer, heal_failures)
     finally:
         DEADLINE.reset(token)
 
 
+def _run_heal(data_root: Path, now_ns: int, deadline: float, offer: AlertOffer) -> int:
+    """Heal runs first, before the family loop and with zero families (S3-R25, S3-R46), under its
+    own budget capped by ``DEADLINE``; heal never writes ``DEADLINE``. An overrun is a failure
+    (S3-R41), and so is a raise: the family audits still run, and the exit code carries it."""
+    heal_deadline = min(capture_audit_inputs.MONOTONIC() + HEAL_BUDGET_S, deadline)
+    try:
+        return run_heal_duty(
+            data_root,
+            now_ns=now_ns,
+            heal_deadline=heal_deadline,
+            sender=OfferHealSender(offer),
+        )
+    except Exception:
+        _LOGGER.exception("capture audit: the heal duty raised")
+        return 1
+
+
 def _run_families(
-    data_root: Path, explicit: Sequence[str], today: dt.date, now_ns: int, offer: AlertOffer
+    data_root: Path,
+    explicit: Sequence[str],
+    today: dt.date,
+    now_ns: int,
+    offer: AlertOffer,
+    heal_failures: int,
 ) -> int:
     families = families_by_construction(data_root, explicit)
     if not families:
         sys.stderr.write("capture audit: no family to audit (no epoch file, no --family-id)\n")
-        return 0
+        return 1 if heal_failures else 0
     codes = [run_audit(data_root, f, today, now_ns=now_ns, offer=offer) for f in families]
     once_failures = run_once_duties(data_root, today, now_ns=now_ns, offer=offer)
-    return 1 if any(codes) or once_failures else 0
+    return 1 if heal_failures or any(codes) or once_failures else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

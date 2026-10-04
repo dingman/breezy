@@ -19,7 +19,9 @@ from breezy.analysis import capture_audit as audit
 from breezy.analysis import capture_audit_cli as cli
 from breezy.analysis import capture_audit_host as host
 from breezy.analysis import capture_audit_inputs as inputs
+from breezy.analysis import capture_heal_io as heal_io
 from breezy.analysis.capture_audit_model import (
+    AuditInputError,
     DayStatus,
 )
 from breezy.analysis.capture_node_log import scan_node_log
@@ -41,6 +43,20 @@ from tests.support.capture_audit_w3_fixtures import leg_result, stub_legs
 DAY = fx.DAY
 NS = w3.NS
 TODAY = DAY + dt.timedelta(days=1)
+
+
+@pytest.fixture(autouse=True)
+def heal_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """The heal duty reads the real recorder journal, so every test here stubs it (a no-op that
+    records its call). The 3c tests replace it, or restore the real duty over a fake journal."""
+    calls: list[dict[str, Any]] = []
+
+    def quiet(data_root: Path, **kw: Any) -> int:
+        calls.append({"data_root": data_root, **kw})
+        return 0
+
+    monkeypatch.setattr(cli, "run_heal_duty", quiet)
+    return calls
 
 
 # -- the entry point (S2-R8) -------------------------------------------------------------------
@@ -439,6 +455,151 @@ def test_zero_families_still_take_the_lock_and_exit_zero(
     lock = FakeLock()
     assert _main(_argv(root), offer=Offers(), clock=lambda: w3.NOW_NS, lock=lock) == 0
     assert lock.calls == 1 and lock.fd_closed()
+
+
+# -- heal wiring (S3-R18, S3-R25, S3-R41, S3-R46, S3-R47) -----------------------------------------
+
+_QUIET_JOURNAL = (
+    '{"MESSAGE":"x","__REALTIME_TIMESTAMP":"1"}\n'  # one entry, no UNIT_RESULT: no kill
+)
+
+
+def _real_heal(monkeypatch: pytest.MonkeyPatch, journal: Any = None) -> list[tuple[str, str]]:
+    """Restore the real heal duty over a fake journal (never ``journalctl``). Returns the reads."""
+    reads: list[tuple[str, str]] = []
+
+    def fake_journal(_template: object, since: str, until: str, **_kw: object) -> str:
+        reads.append((since, until))
+        if journal is not None:
+            raise journal
+        return _QUIET_JOURNAL
+
+    monkeypatch.setattr(cli, "run_heal_duty", heal_io.run_heal_duty)
+    monkeypatch.setattr(heal_io, "run_journal", fake_journal)
+    monkeypatch.setattr(heal_io, "delivered_events", lambda *_a: frozenset())
+    return reads
+
+
+def _files(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+
+
+def test_heal_runs_before_family_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heal_calls: list[dict[str, Any]]
+) -> None:
+    """MUTATION M-HEALLAST: heal after the family loop starves behind a long family run (K8)."""
+    root, _ = _recording_world(tmp_path, monkeypatch)
+    events: list[str] = []
+
+    def heal(data_root: Path, **kw: Any) -> int:
+        events.append("heal")
+        heal_calls.append(kw)
+        return 0
+
+    def family(root_: Path, fam: str, today: dt.date, **kw: Any) -> int:
+        events.append(f"family:{fam}")
+        return 0
+
+    monkeypatch.setattr(cli, "run_heal_duty", heal)
+    monkeypatch.setattr(cli, "run_audit", family)
+    argv = _argv(root, "--family-id", "fam_a", "--family-id", "fam_b")
+    code = _main(argv, offer=Offers(), clock=lambda: w3.NOW_NS)
+    assert code == 0 and events == ["heal", "family:fam_a", "family:fam_b"]
+    assert [c["now_ns"] for c in heal_calls] == [w3.NOW_NS]
+
+
+def test_heal_budget_is_the_min_of_its_own_budget_and_the_run_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heal_calls: list[dict[str, Any]]
+) -> None:
+    """``heal_deadline = min(MONOTONIC() + HEAL_BUDGET_S, DEADLINE)`` (S3-R25, S3-R41)."""
+    mono = Mono(100.0)
+    for work_budget, expected in ((840, 280.0), (100, 200.0)):  # DEADLINE 940 / 200
+        root, _ = _recording_world(tmp_path / f"b{work_budget}", monkeypatch)
+        monkeypatch.setattr(inputs, "MONOTONIC", mono)
+        monkeypatch.setattr(cli, "AUDIT_WORK_BUDGET_S", work_budget)
+        heal_calls.clear()
+        _main(_argv(root, "--family-id", w3.FAMILY), offer=Offers(), clock=lambda: w3.NOW_NS)
+        assert [c["heal_deadline"] for c in heal_calls] == [expected], work_budget
+
+
+def test_heal_runs_with_zero_families(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MUTATION M-ZEROFAM: with no family the run still heals, and writes nothing without a stall
+    record. It exits 0 only because the lock and the journal were readable (S3-R46)."""
+    root = w3.make_root(tmp_path)
+    w3.install(monkeypatch, root)
+    reads = _real_heal(monkeypatch)
+    before = _files(root)
+    lock = FakeLock()
+    assert _main(_argv(root), offer=Offers(), clock=lambda: w3.NOW_NS, lock=lock) == 0
+    assert len(reads) == 3 and lock.calls == 1  # HEAL_JOURNAL_DAYS reads
+    assert [n for n in _files(root) if n not in before] == []  # no heal write, no other write
+
+
+def test_zero_families_with_an_unreadable_journal_exit_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = w3.make_root(tmp_path)
+    w3.install(monkeypatch, root)
+    _real_heal(monkeypatch, journal=AuditInputError("journal_failed", "TimeoutExpired"))
+    assert _main(_argv(root), offer=Offers(), clock=lambda: w3.NOW_NS) == 1
+
+
+def test_heal_overrun_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION M-SILENT: a heal that runs past its deadline is a duty FAILURE, never a quiet 0.
+
+    The work budget is zero, so ``DEADLINE`` has passed when heal starts; the families still run."""
+    root, seen = _recording_world(tmp_path, monkeypatch)
+    reads = _real_heal(monkeypatch)
+    monkeypatch.setattr(cli, "AUDIT_WORK_BUDGET_S", 0)
+    monkeypatch.setattr(cli, "run_once_duties", lambda *a, **k: 0)  # isolate the heal outcome
+    code = _main(_argv(root, "--family-id", w3.FAMILY), offer=Offers(), clock=lambda: w3.NOW_NS)
+    assert code == 1 and reads == [] and len(seen) == 1
+
+
+def test_a_failing_heal_duty_is_folded_into_the_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, seen = _recording_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "run_heal_duty", lambda *a, **k: 1)
+    code = _main(_argv(root, "--family-id", w3.FAMILY), offer=Offers(), clock=lambda: w3.NOW_NS)
+    assert code == 1 and len(seen) == 1  # the family audit still ran
+
+
+def test_a_heal_duty_that_raises_is_a_failure_and_the_families_still_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, seen = _recording_world(tmp_path, monkeypatch)
+
+    def boom(*a: Any, **k: Any) -> int:
+        raise RuntimeError("heal bug")
+
+    monkeypatch.setattr(cli, "run_heal_duty", boom)
+    code = _main(_argv(root, "--family-id", w3.FAMILY), offer=Offers(), clock=lambda: w3.NOW_NS)
+    assert code == 1 and len(seen) == 1 and inputs.DEADLINE.get() is None
+
+
+def test_heal_never_runs_when_the_lock_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heal_calls: list[dict[str, Any]]
+) -> None:
+    root, _ = _recording_world(tmp_path, monkeypatch)
+    lock = FakeLock(error=StudiesLockTimeout())
+    assert _main(_argv(root), offer=Offers(), clock=lambda: w3.NOW_NS, lock=lock) == 1
+    assert heal_calls == []
+
+
+def test_the_heal_sender_puts_severity_and_attempt_kind_through_the_offer() -> None:
+    """The stage-4 shim: ``attempt_kind`` rides in ``detail`` until AUT-6's outbox takes it."""
+    offers = Offers()
+    sender = cli.OfferHealSender(offers)
+    assert sender.send("CAPTURE_HEALED_" + "ab" * 32, "heal=x", "retry") is True
+    assert sender.send("CAPTURE_WATCHDOG_EVIDENCE_GAP", "gap=y", "alert") is True
+    assert offers.calls == [
+        ("CAPTURE_HEALED_" + "ab" * 32, "INFO", "heal=x attempt_kind=retry"),
+        ("CAPTURE_WATCHDOG_EVIDENCE_GAP", "CRITICAL", "gap=y attempt_kind=alert"),
+    ]
+    assert cli.OfferHealSender(Offers(accept=False)).send("CAPTURE_JOIN_GAP", "d", "alert") is False
 
 
 def test_the_cli_imports_no_venue_adapter_and_makes_no_network_call() -> None:
