@@ -21,14 +21,13 @@ import pytest
 
 import breezy.persistence.autonomy.resolver as resolver_mod
 from breezy.persistence.autonomy import pins
-from breezy.persistence.autonomy.family_bytes import (
+from breezy.persistence.autonomy.byte_binding import (
     ByteBindingFailure,
     FamilyBytes,
-    read_manifest_facts,
     verify_bound_bytes,
     verify_family_bytes,
-    write_root_copy,
 )
+from breezy.persistence.autonomy.family_bytes import read_manifest_facts, write_root_copy
 from breezy.persistence.autonomy.fold import Origin
 from breezy.persistence.autonomy.hwm import HwmAbsent
 from breezy.persistence.autonomy.lineage import RootRecord, root_model_class

@@ -57,18 +57,18 @@ from pathlib import Path
 from typing import Final, Literal
 
 from breezy.persistence.autonomy import pins, stage_policy, transitions
+from breezy.persistence.autonomy.byte_binding import (
+    ByteBindingFailure,
+    FamilyBytes,
+    manifest_equal_modulo_allowlist,
+    verify_bound_bytes,
+)
 from breezy.persistence.autonomy.chain import (
     ChainBroken,
     VerifiedVenueChain,
     canonical_row,
     verify_against_export,
     verify_venue_chain,
-)
-from breezy.persistence.autonomy.family_bytes import (
-    ByteBindingFailure,
-    FamilyBytes,
-    manifest_equal_modulo_allowlist,
-    verify_bound_bytes,
 )
 from breezy.persistence.autonomy.fold import FamilyView, FoldInvalid, FoldResult, Origin, fold
 from breezy.persistence.autonomy.fold_tallies import parse_carried

@@ -7,7 +7,7 @@ from typing import Final
 
 import pytest
 
-from breezy.persistence.autonomy.family_bytes import (
+from breezy.persistence.autonomy.byte_binding import (
     CHILD_MANIFEST_ALLOWLIST,
 )
 from tests.support.entry_points import SRC_DIR

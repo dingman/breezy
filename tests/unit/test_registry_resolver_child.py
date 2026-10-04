@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 import breezy.persistence.autonomy.resolver as resolver_mod
-from breezy.persistence.autonomy.family_bytes import (
+from breezy.persistence.autonomy.byte_binding import (
     CHILD_MANIFEST_ALLOWLIST,
     ByteBindingFailure,
     FamilyBytes,

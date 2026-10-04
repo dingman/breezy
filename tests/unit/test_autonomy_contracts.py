@@ -40,6 +40,7 @@ PYARROW_REACHING: Final[frozenset[str]] = frozenset(
     for m in (
         "label_schema",
         "family_bytes",
+        "byte_binding",
         "registry_store",
         "replay",
         "resolver",
@@ -95,6 +96,8 @@ def test_contracts_b_and_c_list_existing_modules_only_never_the_package() -> Non
         for m in (
             "label_schema",
             "family_bytes",
+            "byte_binding",
+            "byte_binding",
             "registry_store",
             "replay",
             "resolver",

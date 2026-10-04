@@ -71,8 +71,9 @@ from pathlib import Path
 from typing import ClassVar, Final
 
 from breezy.persistence.autonomy import pins, transitions
+from breezy.persistence.autonomy.byte_binding import read_artefact
 from breezy.persistence.autonomy.chain import VerifiedVenueChain
-from breezy.persistence.autonomy.family_bytes import read_artefact, read_manifest_facts, roots_of
+from breezy.persistence.autonomy.family_bytes import read_manifest_facts, roots_of
 from breezy.persistence.autonomy.fold import FoldInvalid, FoldResult, fold
 from breezy.persistence.autonomy.fold_pairs import PARTNER_KINDS, is_head
 from breezy.persistence.autonomy.lineage import model_class_of
