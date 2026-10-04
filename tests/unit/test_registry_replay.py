@@ -22,6 +22,7 @@ from typing import Any, Final
 import pytest
 
 import breezy.persistence.autonomy.replay as replay_mod
+from breezy.persistence.autonomy import pins
 from breezy.persistence.autonomy.chain import (
     VerifiedVenueChain,
     genesis,
@@ -264,6 +265,11 @@ def test_a_child_manifest_is_read_from_the_registry_copy_and_refused_without_it(
 def test_replay_maps_fold_invalid_to_replay_invalid(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A prefix the fold rejects is ``replay_invalid``, at the first row of the previous batch.
+
+    Every natural ``FoldInvalid`` is caught by ``validate`` first, so the fold is made to fail for
+    the three rows before the pair batch to pin the mapping (A8b-R5 L1).
+    """
     chain = full_chain(world)
     real = fold
     refusal = FoldInvalid(FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE)
@@ -275,12 +281,16 @@ def test_replay_maps_fold_invalid_to_replay_invalid(
     result = world.replay(chain)
     assert isinstance(result, ReplayInvalid) and result.reason is RefusalReason.REPLAY_INVALID
     assert result.rule == FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE.value
-    assert result.venue_seq == 3  # the last row folded before the batch that could not start
+    assert result.venue_seq == 3  # the first row of the batch before the one that could not start
 
 
 def test_replay_maps_a_fold_invalid_full_chain_to_replay_invalid(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A whole chain the fold rejects after every batch validated is ``replay_invalid`` at the head.
+
+    ``validate`` catches the natural cases, so only the final fold of all six rows is made to fail.
+    """
     chain = full_chain(world)
     real = fold
     refusal = FoldInvalid(FoldInvalidReason.ROOT_LINEAGE_MISMATCH)
@@ -593,7 +603,7 @@ def test_shadow_paths_replay_reads_the_shadow_root(world: World, tmp_path: Path)
     shadow_root.mkdir(mode=0o700)
     shadow = ShadowPaths(shadow_root)
     result = replay_full(seal(full_chain(world)), paths=shadow, repo_root=world.repo)
-    assert isinstance(result, ReplayArtefactMismatch | ReplayCauseUnresolved)  # nothing is there
+    assert result == ReplayArtefactMismatch(1, ArtefactFailure.ARTEFACT_UNREADABLE)
 
 
 # --- shape ----------------------------------------------------------------------------------------
@@ -645,3 +655,24 @@ def test_results_are_closed_and_carry_their_refusal_reason() -> None:
     for cls, reason in reasons.items():
         assert cls.reason is reason  # type: ignore[attr-defined]
     assert not hasattr(ReplayOk, "reason")
+
+
+def test_artefact_reads_are_memoised_by_model_class_and_sha(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two rows bind one artefact; each (model class, sha) pair is read once (A8b-R5 L3)."""
+    calls: list[tuple[str, str]] = []
+    real = replay_mod._read_artefact
+
+    def counting(paths: Any, model_class: str, sha: str) -> bytes | None:
+        calls.append((model_class, sha))
+        return real(paths, model_class, sha)
+
+    monkeypatch.setattr(replay_mod, "_read_artefact", counting)
+    assert isinstance(world.replay(full_chain(world)), ReplayOk)
+    assert len(calls) == len(set(calls)) == len(pins.MODEL_CLASS_COMPONENTS)
+
+
+def test_the_artefact_read_cap_is_a_pin() -> None:
+    assert pins.ARTEFACT_MAX_BYTES == 64 * 1024 * 1024
+    assert not hasattr(replay_mod, "ARTEFACT_MAX_BYTES")

@@ -89,6 +89,13 @@ DRAWDOWN_INERT_ALERT_MIN_FILLS: Final = 10  # AC 25
 
 # --- Roots (E-14 rules 2 and 7).
 ROOT_ARTEFACT_COMPONENT: Final = "density_table"
+# The closed set of model-class components an artefact may live under (A8b-R2; E-22 d). A model
+# class is "<composition_kind>:<component>". The two components are AUT-3 r6 section 3.1's table
+# (`forecast_quantile_ladder:density_table` and `:rung_recalibration`); the root component is the
+# first. Replay probes exactly these and requires one match.
+MODEL_CLASS_COMPONENTS: Final = ("density_table", "rung_recalibration")
+# Cap on one artefact.json read by the replay (A8b-R5 L3).
+ARTEFACT_MAX_BYTES: Final = 67_108_864  # 64 MiB
 # Empty until the reviewed pins commit that precedes the first bootstrap (rows are append-only).
 BOOTSTRAPPED_ROOT_MANIFEST_SHA256: Final[MappingProxyType[str, str]] = MappingProxyType({})
 

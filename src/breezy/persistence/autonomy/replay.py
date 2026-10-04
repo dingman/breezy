@@ -29,16 +29,30 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
 * A cause verdict must be a PASS for every cited kind. A PROMOTE to CHALLENGER must cite an
   OFFLINE_CHALLENGER verdict, a PROMOTE to CHAMPION both an OFFLINE_CHALLENGER and a FORWARD_SHADOW
   verdict (ARCH C5 "Allowed transitions"); no other kind is constrained.
-* A PROMOTE, ROLLBACK, ROOT_ADMIT or RESUME cites at least one verdict. A DRILL_PROMOTE (a drill
-  clause, not a verdict, authorises it) and the restorative RESUME (E-5) may cite none; whatever
-  they cite resolves like any other.
+* A PROMOTE or RESUME cites at least one verdict. A DRILL_PROMOTE (a drill clause, not a verdict,
+  authorises it) and the restorative RESUME (E-5) may cite none; whatever they cite resolves like
+  any other.
+* A ROLLBACK and a ROOT_ADMIT are judged by role (A8b-R1; E-22). Each cited verdict resolves in its
+  subject's directory, searched in three places only: the row's family, its batch partner (the
+  outgoing family F) and the prior fold's senders. The roles are the halting causes of F (FAIL
+  verdicts whose subject is F and whose artefact is F's bound sha) and the AUT-6 DRIFT
+  ``fee_schedule`` PASS for the champion. A ROLLBACK needs the fee PASS, and F's causes unless F's
+  standing halt carries no verdict (an exec-store mirror, a ``rollback_failed`` HALT) or F is not
+  halted (the drill's abort close); it may then cite nothing. A ROOT_ADMIT needs the fee PASS.
 * ``subject_artefact_sha256`` equals the row's ``artefact_sha256`` (else the sha the family was
   bound to). A verdict kind that always names an artefact (OFFLINE_CHALLENGER, FORWARD_SHADOW) must
   carry it; a HEALTH, DRIFT or RECONCILIATION verdict may carry none.
 * A root's manifest (the family a BOOTSTRAP or ROOT_ADMIT introduced) is read from the repo only,
   never from a registry copy (E-14 rule 3a; A6d-A2 M2). The artefact lives at
-  ``derived/artefacts/<composition_kind>:density_table/<sha>/artefact.json``, the kind read from
-  that manifest, and is read STRICT with a 64 MiB cap.
+  ``derived/artefacts/<composition_kind>:<component>/<sha>/artefact.json``, the kind read from that
+  manifest. The component is found by probing ``pins.MODEL_CLASS_COMPONENTS`` and requiring
+  exactly one component with a readable file (zero or several: ``ARTEFACT_UNREADABLE``, A8b-R2).
+  Reads are STRICT, capped by ``pins.ARTEFACT_MAX_BYTES`` and memoised by ``(model_class, sha)``.
+* A ``FoldInvalid`` of the rows before a batch is reported at the first row of the previous batch,
+  the batch whose rows first made the prefix unfoldable or the earliest that can be named (A8b-R5).
+* Every caller must also run ``transitions.rows_admissible`` on the chain (resolver step 5): replay
+  judges the rules, not the stage gate. A HWM_RESET's carried counters are floored here only by
+  the prior fold; the resolver (8c) also checks them against the newest export (B9).
 * ``verify_family_bytes`` is not needed here: the resolver's own byte binding (8c) still runs after
   replay, on the champion alone.
 
@@ -56,9 +70,9 @@ from hashlib import sha256
 from pathlib import Path
 from typing import ClassVar, Final
 
-from breezy.persistence.autonomy import transitions
+from breezy.persistence.autonomy import pins, transitions
 from breezy.persistence.autonomy.chain import VerifiedVenueChain
-from breezy.persistence.autonomy.family_bytes import read_manifest_facts
+from breezy.persistence.autonomy.family_bytes import read_manifest_facts, roots_of
 from breezy.persistence.autonomy.fold import FoldInvalid, FoldResult, fold
 from breezy.persistence.autonomy.fold_pairs import PARTNER_KINDS, is_head
 from breezy.persistence.autonomy.fold_tallies import (
@@ -68,7 +82,7 @@ from breezy.persistence.autonomy.fold_tallies import (
     Carried,
     CarriedLineage,
 )
-from breezy.persistence.autonomy.lineage import root_model_class
+from breezy.persistence.autonomy.lineage import model_class_of
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths, family_component
 from breezy.persistence.autonomy.schemas import (
     CauseCode,
@@ -104,11 +118,14 @@ __all__ = [
     "replay_full",
 ]
 
-ARTEFACT_MAX_BYTES: Final = 64 * 1024 * 1024
 _ARTEFACT_NAME: Final = "artefact.json"
 _VERDICT_PARTS: Final = ("derived", "verdicts")
 _DAY_RE: Final = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z", re.ASCII)
-_ROOT_KINDS: Final = frozenset({Kind.BOOTSTRAP, Kind.ROOT_ADMIT})
+#: Kinds judged by role (E-22) rather than "a PASS of the row's family".
+_ROLE_KINDS: Final = frozenset({Kind.ROLLBACK, Kind.ROOT_ADMIT})
+_FEE_DETECTOR: Final = "fee_schedule"
+#: Standing halts whose cause is no verdict: an exec-store mirror and a failed rollback (E-22 a).
+_VERDICTLESS_HALTS: Final = frozenset({CauseCode.EXEC_STORE_HALT_MIRROR, CauseCode.ROLLBACK_FAILED})
 #: The kinds whose ``cause_verdict_ids`` the replay resolves (AUT-5 r7 section 3.2).
 _CITING_KINDS: Final = frozenset(
     {Kind.PROMOTE, Kind.DRILL_PROMOTE, Kind.ROLLBACK, Kind.RESUME, Kind.ROOT_ADMIT}
@@ -122,6 +139,7 @@ class CauseFailure(StrEnum):
     NOT_FOUND = "not_found"
     KIND_MISMATCH = "kind_mismatch"
     NOT_PASS = "not_pass"
+    ROLE_MISMATCH = "role_mismatch"
     SUBJECT_ARTEFACT_MISMATCH = "subject_artefact_mismatch"
 
 
@@ -200,14 +218,6 @@ class _Facts:
                 repo_only=family_id in self._roots,
             )
         return self._memo[key]
-
-
-def _roots_of(rows: Sequence[TransitionRow]) -> frozenset[str]:
-    """The families whose introducing row is a BOOTSTRAP or ROOT_ADMIT."""
-    first: dict[str, Kind] = {}
-    for row in rows:
-        first.setdefault(row.family_id, row.kind)
-    return frozenset(family for family, kind in first.items() if kind in _ROOT_KINDS)
 
 
 def _batch_end(rows: Sequence[TransitionRow], start: int) -> int:
@@ -322,6 +332,81 @@ def _resolve_causes(
     return found, None
 
 
+def _is_fee(verdict: Verdict) -> bool:
+    return verdict.kind is VerdictKind.DRIFT and verdict.detector == _FEE_DETECTOR
+
+
+def _lookup(walk: _Walk, places: Sequence[str], verdict_id: str) -> Verdict | None:
+    """The verdict with this id in the first of ``places`` that holds it (E-22 c)."""
+    cached = walk.verdicts.get(verdict_id)
+    if cached is not None and cached.subject_family_id in places:
+        return cached
+    for family in places:
+        found = _find_verdict(walk.paths, family, verdict_id)
+        if found is not None:
+            walk.verdicts[verdict_id] = found
+            return found
+    return None
+
+
+def _resolve_roles(
+    walk: _Walk,
+    prior: FoldResult,
+    batch: Sequence[TransitionRow],
+    row: TransitionRow,
+    expected: str | None,
+) -> tuple[Mapping[str, Verdict], ReplayCauseUnresolved | None]:
+    """A ROLLBACK's or ROOT_ADMIT's citations, judged by role (A8b-R1; E-22 a, b, c)."""
+    seq = row.venue_seq or 0
+    partners = [
+        r.family_id
+        for r in batch
+        if r.kind in PARTNER_KINDS and r.paired_transition_id == row.transition_id
+    ]
+    outgoing = partners[0] if partners else (prior.senders[0] if prior.senders else None)
+    places = tuple(dict.fromkeys([row.family_id, *partners, *prior.senders]))
+    view = None if outgoing is None else prior.families.get(outgoing)
+    needs_cause = (
+        row.kind is Kind.ROLLBACK
+        and view is not None
+        and view.state is State.HALTED
+        and view.standing_cause_code not in _VERDICTLESS_HALTS
+    )
+    if not row.cause_verdict_ids:
+        if row.kind is Kind.ROLLBACK and not needs_cause:
+            return {}, None
+        return {}, ReplayCauseUnresolved(seq, CauseFailure.NOT_CITED)
+    found: dict[str, Verdict] = {}
+    fees = causes = 0
+    for verdict_id in row.cause_verdict_ids:
+        verdict = _lookup(walk, places, verdict_id)
+        if verdict is None:
+            return {}, ReplayCauseUnresolved(seq, CauseFailure.NOT_FOUND, verdict_id)
+        failure: CauseFailure | None
+        if _is_fee(verdict):
+            fees += 1
+            failure = None if verdict.outcome is VerdictOutcome.PASS else CauseFailure.NOT_PASS
+        elif row.kind is Kind.ROLLBACK:
+            causes += 1
+            is_cause = (
+                verdict.outcome is VerdictOutcome.FAIL
+                and verdict.subject_family_id == outgoing
+                and view is not None
+                and verdict.subject_artefact_sha256 == view.artefact_sha256
+            )
+            failure = None if is_cause else CauseFailure.ROLE_MISMATCH
+        else:  # a root-admission verdict AUT-5 names: PASS, subject the row's family
+            failure = _fits(verdict, row, expected)
+            if verdict.subject_family_id != row.family_id:
+                failure = CauseFailure.ROLE_MISMATCH
+        if failure is not None:
+            return {}, ReplayCauseUnresolved(seq, failure, verdict_id)
+        found[verdict_id] = verdict
+    if fees == 0 or (needs_cause and causes == 0):
+        return {}, ReplayCauseUnresolved(seq, CauseFailure.KIND_MISMATCH)
+    return found, None
+
+
 def _read_artefact(paths: AutonomyPaths | ShadowPaths, model_class: str, sha: str) -> bytes | None:
     """The artefact's bytes, or ``None`` for anything but a clean STRICT read."""
     parts = paths.artefact_dir(model_class, sha).relative_to(paths.root).parts
@@ -333,7 +418,7 @@ def _read_artefact(paths: AutonomyPaths | ShadowPaths, model_class: str, sha: st
         dirfd = walk_dirs(rootfd, parts)
         try:
             return read_once_at(
-                dirfd, _ARTEFACT_NAME, max_bytes=ARTEFACT_MAX_BYTES, policy=ReadPolicy.STRICT
+                dirfd, _ARTEFACT_NAME, max_bytes=pins.ARTEFACT_MAX_BYTES, policy=ReadPolicy.STRICT
             )
         finally:
             os.close(dirfd)
@@ -343,17 +428,30 @@ def _read_artefact(paths: AutonomyPaths | ShadowPaths, model_class: str, sha: st
         os.close(rootfd)
 
 
-def _artefact_failure(
-    row: TransitionRow, facts: _Facts, paths: AutonomyPaths | ShadowPaths
-) -> ArtefactFailure | None:
+def _probe_artefact(walk: _Walk, kind: str, sha: str) -> bytes | None:
+    """The one artefact under ``<kind>:<component>/<sha>``; ``None`` for none or several."""
+    found: list[bytes] = []
+    for component in pins.MODEL_CLASS_COMPONENTS:
+        model_class = model_class_of(kind, component)
+        if (model_class, sha) not in walk.reads:
+            walk.reads[(model_class, sha)] = _read_artefact(walk.paths, model_class, sha)
+        raw = walk.reads[(model_class, sha)]
+        if raw is not None:
+            found.append(raw)
+    return found[0] if len(found) == 1 else None
+
+
+def _artefact_failure(walk: _Walk, row: TransitionRow) -> ArtefactFailure | None:
     sha = row.artefact_sha256
     if sha is None:
         return None
-    manifest = None if row.manifest_sha256 is None else facts(row.family_id, row.manifest_sha256)
+    manifest = (
+        None if row.manifest_sha256 is None else walk.facts(row.family_id, row.manifest_sha256)
+    )
     if manifest is None:
         return ArtefactFailure.MANIFEST_UNREADABLE
     try:
-        raw = _read_artefact(paths, root_model_class(manifest.composition_kind), sha)
+        raw = _probe_artefact(walk, manifest.composition_kind, sha)
     except ValueError:  # a composition kind that is no path component: nothing to read
         return ArtefactFailure.MANIFEST_UNREADABLE
     if raw is None:
@@ -372,6 +470,7 @@ class _Walk:
     facts: _Facts
     verdicts: dict[str, Verdict]
     bound: dict[str, str]
+    reads: dict[tuple[str, str], bytes | None]
 
 
 def _validate_batch(
@@ -382,7 +481,10 @@ def _validate_batch(
         if row.kind not in _CITING_KINDS:
             continue
         expected = row.artefact_sha256 or walk.bound.get(row.family_id)
-        found, failure = _resolve_causes(row, walk.paths, expected, walk.verdicts)
+        if row.kind in _ROLE_KINDS:
+            found, failure = _resolve_roles(walk, prior, batch, row, expected)
+        else:
+            found, failure = _resolve_causes(row, walk.paths, expected, walk.verdicts)
         if failure is not None:
             return failure
         resolved.update(found)
@@ -401,7 +503,7 @@ def _check_artefacts(walk: _Walk, batch: Sequence[TransitionRow]) -> ReplayArtef
     for row in batch:
         if row.artefact_sha256 is None:
             continue
-        failure = _artefact_failure(row, walk.facts, walk.paths)
+        failure = _artefact_failure(walk, row)
         if failure is not None:
             return ReplayArtefactMismatch(row.venue_seq or 0, failure)
         walk.bound.setdefault(row.family_id, row.artefact_sha256)
@@ -418,21 +520,22 @@ def _replay_full(
     walk = _Walk(
         venue=chain.venue,
         paths=paths,
-        facts=_Facts(paths, repo_root, _roots_of(rows)),
+        facts=_Facts(paths, repo_root, roots_of(rows)),
         verdicts={},
         bound={},
+        reads={},
     )
-    index = 0
+    index = previous = 0
     while index < len(rows):
         end = _batch_end(rows, index)
         batch = rows[index:end]
         prior = fold(rows[:index], chain.venue, batch[0].ts_ns)
-        if isinstance(prior, FoldInvalid):
-            return ReplayInvalid(rows[index - 1].venue_seq or 0, prior.reason.value)
+        if isinstance(prior, FoldInvalid):  # reported at the first row of the previous batch
+            return ReplayInvalid(rows[previous].venue_seq or 0, prior.reason.value)
         failure = _validate_batch(walk, prior, batch) or _check_artefacts(walk, batch)
         if failure is not None:
             return failure
-        index = end
+        previous, index = index, end
     if rows and isinstance(whole := fold(rows, chain.venue, rows[-1].ts_ns), FoldInvalid):
         return ReplayInvalid(rows[-1].venue_seq or 0, whole.reason.value)
     return ReplayOk(chain.head_venue_seq, chain.head_hash)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Collection, Iterable
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
@@ -37,7 +38,7 @@ from breezy.persistence.autonomy.paths import (
     family_component,
     sha_component,
 )
-from breezy.persistence.autonomy.schemas import ManifestFacts
+from breezy.persistence.autonomy.schemas import Kind, ManifestFacts, TransitionRow
 from breezy.persistence.autonomy.single_read import (
     ReadPolicy,
     SingleReadReason,
@@ -57,6 +58,7 @@ __all__ = [
     "RootCopyIntegrity",
     "RootCopyResult",
     "read_manifest_facts",
+    "roots_of",
     "write_root_copy",
 ]
 
@@ -83,6 +85,14 @@ class RootCopyIntegrity(Exception):
     def __init__(self, subject: str) -> None:
         super().__init__(subject)
         self.subject = subject
+
+
+def roots_of(rows: Iterable[TransitionRow]) -> frozenset[str]:
+    """The families a BOOTSTRAP or ROOT_ADMIT introduced: their manifests are repo-only."""
+    first: dict[str, Kind] = {}
+    for row in rows:
+        first.setdefault(row.family_id, row.kind)
+    return frozenset(f for f, k in first.items() if k in (Kind.BOOTSTRAP, Kind.ROOT_ADMIT))
 
 
 def _wrong_type(field: str) -> WireRefused:
@@ -209,12 +219,14 @@ def read_manifest_facts(
     paths: AutonomyPaths | ShadowPaths,
     repo_root: Path,
     repo_only: bool = False,
+    roots: Collection[str] = (),
 ) -> ManifestFacts | None:
     """The facts ``transitions.validate`` needs for ``family_id`` at ``manifest_sha256``.
 
     Bind ``paths`` and ``repo_root`` (``functools.partial``) to obtain a ``ManifestFactsReader``.
     ``repo_only`` is for a root: its manifest is the committed repo file or nothing, never a
     registry copy (E-14 rule 3a; the replay passes it for every family a root introduced).
+    ``roots`` (the store binds a live set of them) makes any family named in it ``repo_only``.
     ``None`` for anything unreadable: a malformed id or sha, a missing, symlinked or oddly-owned
     source, bytes whose sha256 differs, a draft or invalid manifest, a PREREG-ineligible
     directory, or a manifest that names another family. Never raises for those.
@@ -222,7 +234,7 @@ def read_manifest_facts(
     try:
         family = family_component(family_id)
         sha = sha_component(manifest_sha256, "manifest_sha256")
-        source = _manifest_source(family, paths, repo_root, repo_only=repo_only)
+        source = _manifest_source(family, paths, repo_root, repo_only=repo_only or family in roots)
         if source is None:
             return None
         raw, path = source

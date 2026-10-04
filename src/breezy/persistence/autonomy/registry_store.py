@@ -47,7 +47,7 @@ from typing import Final
 
 from breezy.persistence.autonomy import chain, pins, single_read, stage_policy, transitions
 from breezy.persistence.autonomy.chain import ChainBroken
-from breezy.persistence.autonomy.family_bytes import read_manifest_facts
+from breezy.persistence.autonomy.family_bytes import read_manifest_facts, roots_of
 from breezy.persistence.autonomy.fold import FoldInvalid, fold
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
 from breezy.persistence.autonomy.registry_schema import (
@@ -349,8 +349,11 @@ class RegistryStore:
             raise ValueError("repo_root must be an absolute Path")
         self._paths = paths
         self._db = paths.registry_db()
+        #: The families a BOOTSTRAP or ROOT_ADMIT introduced, refreshed per append: their
+        #: manifests are read repo-only (E-14 rule 3a), as the replay reads them (A8b-R5 L4).
+        self._roots: set[str] = set()
         self._manifests: ManifestFactsReader = functools.partial(
-            read_manifest_facts, paths=paths, repo_root=repo_root
+            read_manifest_facts, paths=paths, repo_root=repo_root, roots=self._roots
         )
 
     @classmethod
@@ -556,8 +559,15 @@ class RegistryStore:
         batch: Sequence[TransitionRow],
         now_ns: int,
     ) -> None:
-        """AC 10 step 9: the semantic rules, against the fold of the rows already written."""
-        folded = fold(prior, batch[0].venue, now_ns)
+        """AC 10 step 9: the semantic rules, against the fold of the rows already written.
+
+        The prior rows fold at the batch's first ``ts_ns``, the stamp, not at ``now_ns``: a row
+        stamped 16:49:59 and committed after LAUNCH is judged against a pair not yet in effect, so
+        the store and ``replay_full`` give one answer (A8b-R3). ``now_ns`` still bounds the stamp.
+        """
+        self._roots.clear()
+        self._roots.update(roots_of((*prior, *batch)))
+        folded = fold(prior, batch[0].venue, batch[0].ts_ns)
         if isinstance(folded, FoldInvalid):
             raise FoldRefused(folded.reason.value, reason=_FOLD_REFUSALS[folded.reason])
         refusal = transitions.first_refusal(folded, batch, manifests=self._manifests)
