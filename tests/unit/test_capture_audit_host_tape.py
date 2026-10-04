@@ -1,0 +1,403 @@
+"""AUT-1 WP5 stage 2b W3: the journals, the bus snapshot and the recorder catalog as a TapeIndex.
+
+``journalctl`` is a fake at ``subprocess.run`` (argv and timeout are asserted). The bus snapshot is
+a document in seam B's real shape read by the real ``read_bus_snapshot``. The tape is tiny REAL
+Parquet in the recorder's layout.
+"""
+
+import ast
+import datetime as dt
+import json
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from breezy.analysis import capture_audit_host as host
+from breezy.analysis import capture_audit_tape as tape_mod
+from breezy.analysis.capture_audit_input_types import TapeIndex
+from breezy.analysis.capture_audit_model import AuditInputError
+from breezy.analysis.capture_audit_tape import RecorderCatalogTape, catalog_instruments
+from tests.support import capture_audit_w3_fixtures as w3
+
+NS = w3.NS
+DAY = w3.DAY
+SINCE, UNTIL = "2026-10-03 00:00:00 UTC", "2026-10-04 00:00:00 UTC"
+TEMPLATES = [host.INGEST_JOURNAL_ARGV, host.SUPERVISOR_JOURNAL_ARGV, host.RECORDER_JOURNAL_ARGV]
+
+
+class Done:
+    def __init__(self, stdout: str = "x\n", returncode: int = 0) -> None:
+        self.stdout, self.returncode = stdout, returncode
+
+
+def _patch_run(
+    monkeypatch: pytest.MonkeyPatch, result: Any
+) -> list[tuple[list[str], dict[str, Any]]]:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(argv: list[str], **kw: Any) -> Any:
+        calls.append((argv, kw))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+# -- the journals ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("template", TEMPLATES, ids=["ingest", "supervisor", "recorder"])
+def test_run_journal_runs_the_template_with_only_the_two_slots_substituted(
+    monkeypatch: pytest.MonkeyPatch, template: tuple[str, ...]
+) -> None:
+    calls = _patch_run(monkeypatch, Done("line\n"))
+    assert host.run_journal(template, SINCE, UNTIL) == "line\n"
+    ((argv, kw),) = calls
+    assert argv == [SINCE if t == "{since}" else UNTIL if t == "{until}" else t for t in template]
+    assert kw["timeout"] == 30.0 and kw["check"] is False and "shell" not in kw
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "yesterday",
+        "2026-10-03",
+        "2026-10-03 00:00:00",
+        "2026-10-03 00:00:00 UTC; rm -rf /",
+        "$(id)",
+        "-1d",
+        "2026-10-03 00:00:00 UTC\n--vacuum-time=1s",
+    ],
+)
+def test_a_time_slot_outside_the_grammar_runs_nothing(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    calls = _patch_run(monkeypatch, Done())
+    for since, until in ((bad, UNTIL), (SINCE, bad)):
+        with pytest.raises(AuditInputError) as info:
+            host.run_journal(host.INGEST_JOURNAL_ARGV, since, until)
+        assert (info.value.cause, info.value.detail) == ("journal_failed", "bad_time_slot")
+    assert calls == []
+
+
+def test_an_unknown_template_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _patch_run(monkeypatch, Done())
+    with pytest.raises(AuditInputError) as info:
+        host.run_journal(("journalctl", "--rotate"), SINCE, UNTIL)
+    assert info.value.detail == "unknown_template" and calls == []
+
+
+def test_journalctl_nonzero_timeout_or_empty_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    cases = {
+        "exit_1": Done("out", 1),
+        "timeout": subprocess.TimeoutExpired("journalctl", 30),
+        "FileNotFoundError": FileNotFoundError("journalctl"),
+        host.EMPTY_OUTPUT_DETAIL: Done("  \n"),
+    }
+    for detail, result in cases.items():
+        _patch_run(monkeypatch, result)
+        with pytest.raises(AuditInputError) as info:
+            host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL)
+        assert (info.value.cause, info.value.detail) == ("journal_failed", detail)
+
+
+def test_journal_slot_is_the_one_accepted_shape() -> None:
+    assert host.journal_slot(0) == "1970-01-01 00:00:00 UTC"
+    assert host._SLOT_RE.fullmatch(host.journal_slot(1791046250))
+
+
+def test_the_recorder_journal_keeps_unit_result_entries_in_time_order() -> None:
+    def entry(ts_us: int, **f: Any) -> str:
+        return json.dumps({"__REALTIME_TIMESTAMP": str(ts_us), **f})
+
+    text = "\n".join(
+        [
+            entry(3_000_000, UNIT_RESULT="watchdog", INVOCATION_ID="ab" * 16, MESSAGE="killed"),
+            entry(1_000_000, MESSAGE="Started"),
+            entry(2_000_000, UNIT_RESULT="success", _SYSTEMD_INVOCATION_ID="cd" * 16),
+            "",
+        ]
+    )
+    got = host.parse_recorder_journal(text)
+    assert [(e.ts_ns, e.unit_result, e.invocation_id) for e in got] == [
+        (2_000_000_000, "success", "cd" * 16),
+        (3_000_000_000, "watchdog", "ab" * 16),
+    ]
+    assert got[1].message == "killed"
+
+
+@pytest.mark.parametrize("text", ["{torn", "[1]", '{"UNIT_RESULT": "watchdog"}'])
+def test_a_malformed_recorder_journal_is_journal_failed(text: str) -> None:
+    with pytest.raises(AuditInputError) as info:
+        host.parse_recorder_journal(text)
+    assert info.value.cause == "journal_failed"
+
+
+# -- the bus snapshot (S2-R8) ------------------------------------------------------------------
+
+
+def _bus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **plant: Any) -> Path:
+    root = w3.make_root(tmp_path)
+    w3.install(monkeypatch, root, snapshot=False)
+    w3.plant_snapshot(root, **plant)
+    return root
+
+
+def test_audit_bus_reads_has_exactly_two_reads() -> None:
+    assert host.AUDIT_BUS_READS == (
+        ("-p", "WatchdogUSec,NotifyAccess,Type", "--", "breezy-quote-tape.service"),
+        ("-p", "ExecMainExitTimestamp", "--", "breezy-quote-tape-ingest.service"),
+    )
+    assert len(host.AUDIT_BUS_READ_NAMES) == 2 and host.AUDIT_BUS_READ_NAMES[1] == "ingest_show"
+
+
+def test_the_recorder_props_and_the_ingest_exit_come_from_one_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bus(tmp_path, monkeypatch)
+    props = host.read_recorder_props(root, now_ns=w3.NOW_NS)
+    assert (props.watchdog_usec, props.notify_access, props.type) == (600_000_000, "all", "notify")
+    exit_ns = host.read_ingest_exit_ns(root, now_ns=w3.NOW_NS)  # the file was consumed: cached
+    assert exit_ns == int(dt.datetime(2026, 10, 4, 9, 7, 22, tzinfo=dt.UTC).timestamp()) * NS
+    assert not list((root / w3.SNAP_BIND / ".bus_snapshot").iterdir())
+
+
+def test_a_second_read_returns_the_first_outcome_not_a_second_file_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bus(tmp_path, monkeypatch)
+    consumed: list[int] = []
+    real = host._consume_snapshot
+    monkeypatch.setattr(host, "_consume_snapshot", w3.wrapping(consumed, real))
+    for _ in range(3):
+        host.read_recorder_props(root, now_ns=w3.NOW_NS)
+    assert consumed == [1]
+
+
+def test_a_missing_snapshot_is_bus_snapshot_missing_and_stays_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = w3.make_root(tmp_path)
+    w3.install(monkeypatch, root, snapshot=False)
+    for _ in range(2):
+        with pytest.raises(AuditInputError) as info:
+            host.read_recorder_props(root, now_ns=w3.NOW_NS)
+        assert info.value.cause == "bus_snapshot_missing"
+    w3.plant_snapshot(root)  # too late: the outcome of the first read stands for the run
+    with pytest.raises(AuditInputError):
+        host.read_ingest_exit_ns(root, now_ns=w3.NOW_NS)
+
+
+@pytest.mark.parametrize("age_s", [-6, 71, 3600])
+def test_an_aged_or_future_snapshot_is_bus_snapshot_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age_s: int
+) -> None:
+    """The window is ``[now - (budget + 60 s), now + 5 s]`` of seam B's own rule."""
+    root = _bus(tmp_path, monkeypatch, ts_ns=w3.NOW_NS - age_s * NS)
+    with pytest.raises(AuditInputError) as info:
+        host.read_recorder_props(root, now_ns=w3.NOW_NS)
+    assert info.value.cause == "bus_snapshot_stale"
+
+
+def test_a_snapshot_just_inside_the_window_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bus(tmp_path, monkeypatch, ts_ns=w3.NOW_NS - 69 * NS)
+    assert host.read_recorder_props(root, now_ns=w3.NOW_NS).type == "notify"
+
+
+def test_a_failed_read_inside_the_snapshot_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bus(tmp_path, monkeypatch, rc=1)
+    with pytest.raises(AuditInputError) as info:
+        host.read_recorder_props(root, now_ns=w3.NOW_NS)
+    assert info.value.cause == "bus_snapshot_missing"
+
+
+def test_without_an_audit_row_in_the_table_there_is_no_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = w3.make_root(tmp_path)
+    monkeypatch.setattr(host, "_BUS_OUTCOMES", {})
+    with pytest.raises(AuditInputError) as info:
+        host.read_recorder_props(root, now_ns=w3.NOW_NS)
+    assert (info.value.cause, info.value.detail) == ("bus_snapshot_missing", "no_audit_row")
+
+
+@pytest.mark.parametrize(
+    ("text", "usec"),
+    [
+        ("0", 0),
+        ("", 0),
+        ("infinity", 0),
+        ("10min", 600_000_000),
+        ("1min 30s", 90_000_000),
+        ("500ms", 500_000),
+        ("1h", 3_600_000_000),
+        ("2s", 2_000_000),
+    ],
+)
+def test_watchdog_timespans_parse(text: str, usec: int) -> None:
+    assert host._timespan_us(text) == usec
+
+
+def test_an_unparseable_property_is_stale() -> None:
+    with pytest.raises(AuditInputError) as info:
+        host._timespan_us("soon")
+    assert info.value.cause == "bus_snapshot_stale"
+    with pytest.raises(AuditInputError) as info:
+        host._timestamp_ns("Fri 2026-10-02 09:07:22 CEST")
+    assert info.value.cause == "bus_snapshot_stale"
+
+
+def test_a_snapshot_missing_a_property_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bus(tmp_path, monkeypatch, recorder="Type=notify\n")
+    with pytest.raises(AuditInputError) as info:
+        host.read_recorder_props(root, now_ns=w3.NOW_NS)
+    assert info.value.cause == "bus_snapshot_stale"
+
+
+def test_a_never_exited_ingest_unit_has_no_exit_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bus(tmp_path, monkeypatch, ingest="ExecMainExitTimestamp=\n")
+    assert host.read_ingest_exit_ns(root, now_ns=w3.NOW_NS) is None
+
+
+# -- the recorder catalog as a TapeIndex -------------------------------------------------------
+
+
+def _tape(tmp_path: Path, **kw: Any) -> tuple[Path, RecorderCatalogTape]:
+    root = w3.make_root(tmp_path)
+    w3.write_tape(root, **kw)
+    base = root / "catalog" / "quote_tape" / w3.VENUE
+    return base, RecorderCatalogTape(base, DAY, catalog_instruments(base, DAY))
+
+
+T0 = w3.day_ns(DAY, 17, 0)
+
+
+def test_lookup_returns_the_wp2_r4_frame_body_shape_for_a_quote(tmp_path: Path) -> None:
+    _, tape = _tape(tmp_path, quotes=[(T0, "0.01", "0.15"), (T0 + NS, "0.02", "0.16")])
+    assert tape.lookup("quote", w3.INSTRUMENT, T0) == {"ask": "0.15", "bid": "0.01", "ts_event": T0}
+    assert tape.lookup("quote", w3.INSTRUMENT, T0 + 5) is None
+    assert tape.lookup("quote", "other.POLYMARKET_US", T0) is None
+
+
+def test_lookup_returns_the_wp2_r4_frame_body_shape_for_depth10_dropping_empty_levels(
+    tmp_path: Path,
+) -> None:
+    _, tape = _tape(tmp_path, depths=[(T0, [("0.15", "10.00"), ("0.20", "250.50")])])
+    assert tape.lookup("depth10", w3.INSTRUMENT, T0) == {
+        "ts_event": T0,
+        "bids": [],
+        "asks": [["0.15", "10.00"], ["0.20", "250.50"]],
+    }
+    assert set(tape.lookup("depth10", w3.INSTRUMENT, T0) or {}) == {"ts_event", "bids", "asks"}
+
+
+def test_an_unknown_frame_kind_finds_nothing(tmp_path: Path) -> None:
+    _, tape = _tape(tmp_path, quotes=[(T0, "0.01", "0.15")])
+    assert tape.lookup("trade", w3.INSTRUMENT, T0) is None
+
+
+def test_best_ask_is_the_lowest_populated_ask_of_the_latest_row_at_or_before(
+    tmp_path: Path,
+) -> None:
+    _, tape = _tape(
+        tmp_path,
+        depths=[(T0, [("0.30", "1.00")]), (T0 + 10 * NS, [("0.25", "5.00"), ("0.40", "2.00")])],
+    )
+    assert tape.best_ask_at(w3.INSTRUMENT, T0 - 1) is None
+    assert tape.best_ask_at(w3.INSTRUMENT, T0 + 5 * NS) == 0.30
+    assert tape.best_ask_at(w3.INSTRUMENT, T0 + 99 * NS) == 0.25
+    assert tape.best_ask_at("other", T0) is None
+
+
+def test_rows_are_returned_for_a_half_open_window_in_the_frame_shape(tmp_path: Path) -> None:
+    _, tape = _tape(tmp_path, quotes=[(T0 + i * NS, "0.01", "0.15") for i in range(5)])
+    rows = list(tape.quote_rows(w3.INSTRUMENT, T0 + NS, T0 + 3 * NS))
+    assert [r["ts_event"] for r in rows] == [T0 + NS, T0 + 2 * NS]
+    assert list(tape.depth_rows(w3.INSTRUMENT, T0, T0 + 9 * NS)) == []
+    assert list(tape.quote_rows("other", T0, T0 + NS)) == []
+
+
+def test_the_tape_satisfies_the_tape_index_protocol(tmp_path: Path) -> None:
+    _, tape = _tape(tmp_path, quotes=[(T0, "0.01", "0.15")])
+    assert isinstance(tape, TapeIndex)
+
+
+def test_instruments_and_activity_are_indexed_eagerly(tmp_path: Path) -> None:
+    other = "tc-temp-mdwhigh-2026-10-04-gte60lt61f.POLYMARKET_US"
+    root = w3.make_root(tmp_path)
+    w3.write_tape(root, quotes=[(T0, "0.01", "0.15")])
+    w3.write_tape(root, other, depths=[(T0 + 600 * NS, [("0.5", "1.00")])])
+    base = root / "catalog" / "quote_tape" / w3.VENUE
+    found = catalog_instruments(base, DAY)
+    assert found == {w3.INSTRUMENT, other}
+    tape = RecorderCatalogTape(base, DAY, found)
+    assert tape.instruments == found
+    assert tape.active_instruments(T0, T0 + NS) == {w3.INSTRUMENT}
+    assert tape.active_instruments(T0, T0 + 3600 * NS) == found
+    assert tape.active_instruments(T0 + 7200 * NS, T0 + 8000 * NS) == frozenset()
+
+
+def test_an_instrument_outside_the_requested_set_is_not_loaded(tmp_path: Path) -> None:
+    base, _ = _tape(tmp_path, quotes=[(T0, "0.01", "0.15")])
+    tape = RecorderCatalogTape(base, DAY, frozenset())
+    assert tape.instruments == frozenset() and tape.lookup("quote", w3.INSTRUMENT, T0) is None
+
+
+def test_rows_outside_the_day_plus_the_flush_window_are_not_indexed(tmp_path: Path) -> None:
+    far = w3.day_ns(DAY + dt.timedelta(days=2), 1)
+    _, tape = _tape(tmp_path, quotes=[(T0, "0.01", "0.15"), (far, "0.01", "0.15")])
+    assert tape.lookup("quote", w3.INSTRUMENT, far) is None
+    assert tape.lookup("quote", w3.INSTRUMENT, T0) is not None
+
+
+def test_no_catalog_files_for_the_day_is_an_empty_tape_not_an_error(tmp_path: Path) -> None:
+    root = w3.make_root(tmp_path)
+    base = root / "catalog" / "quote_tape" / w3.VENUE
+    assert catalog_instruments(base, DAY) == frozenset()
+    assert RecorderCatalogTape(base, DAY, frozenset()).instruments == frozenset()
+
+
+def test_an_unreadable_parquet_file_is_tape_unreadable_at_construction(tmp_path: Path) -> None:
+    root = w3.make_root(tmp_path)
+    w3.write_tape(root, quotes=[(T0, "0.01", "0.15")])
+    base = root / "catalog" / "quote_tape" / w3.VENUE
+    next(base.rglob("*.parquet")).write_bytes(b"PAR1 not parquet")
+    with pytest.raises(AuditInputError) as info:
+        RecorderCatalogTape(base, DAY, catalog_instruments(base, DAY))
+    assert info.value.cause == "tape_unreadable"
+
+
+def test_a_file_that_breaks_after_the_index_is_tape_unreadable_on_read(tmp_path: Path) -> None:
+    base, tape = _tape(tmp_path, quotes=[(T0, "0.01", "0.15")])
+    next(base.rglob("*.parquet")).write_bytes(b"gone bad")
+    with pytest.raises(AuditInputError) as info:
+        list(tape.quote_rows(w3.INSTRUMENT, T0, T0 + NS))
+    assert info.value.cause == "tape_unreadable"
+
+
+def test_the_tape_never_materialises_a_whole_table() -> None:
+    tree = ast.parse(Path(tape_mod.__file__).read_text())
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert "to_table" not in attrs and "to_batches" in attrs
+    source = Path(tape_mod.__file__).read_text()
+    for flag in (
+        "batch_size=_BATCH_ROWS",
+        "batch_readahead=1",
+        "fragment_readahead=1",
+        "use_threads=False",
+    ):
+        assert flag in source
+    assert tape_mod._BATCH_ROWS == 65_536

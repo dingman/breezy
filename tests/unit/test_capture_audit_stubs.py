@@ -50,7 +50,13 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
         "leg_n": f"({_INP}) -> LegResult",
         "positive_control": f"({_INP}) -> LegResult",
     },
-    # -- W3: I/O and orchestration -------------------------------------------------------------
+}
+
+#: W3 is built (stage 2b): its pinned signatures must still hold, in the module that now defines
+#: each name (``RecorderCatalogTape``, ``read_exec_view`` and ``write_scan_cache`` moved to
+#: ``capture_audit_tape`` / ``_exec_view`` / ``_cache`` to keep every module under 800 lines; the
+#: inputs module re-exports them).
+W3_PINNED: Final[dict[str, dict[str, str]]] = {
     f"{_AN}.capture_audit_inputs": {
         "RecorderCatalogTape.__init__": (
             "(self, catalog_root: Path, day: dt.date, instruments: frozenset[str]) -> None"
@@ -185,3 +191,19 @@ def test_each_stub_module_has_an_authority_row_with_no_write_scope_for_w1_and_w2
     assert f"{_AN}.capture_audit_wire" in rows
     assert f"{_AN}.capture_node_log_markers" in rows
     assert f"{_AN}.capture_node_log_sinks" in rows
+
+
+_W3_HOME: Final[dict[str, str]] = {
+    "RecorderCatalogTape": f"{_AN}.capture_audit_tape",
+    "read_exec_view": f"{_AN}.capture_audit_exec_view",
+    "write_scan_cache": f"{_AN}.capture_audit_cache",
+}
+
+
+@pytest.mark.parametrize("module", sorted(W3_PINNED))
+def test_the_built_w3_modules_keep_every_pinned_signature(module: str) -> None:
+    for name, signature in W3_PINNED[module].items():
+        owner = name.split(".")[0]
+        home = _W3_HOME.get(owner, module)
+        assert _signature(_defs(home)[name]) == signature, name
+        assert hasattr(importlib.import_module(module), owner), (module, owner)
