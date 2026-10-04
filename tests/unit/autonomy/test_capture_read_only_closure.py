@@ -103,6 +103,15 @@ _PLANTED_VIOLATIONS: Final[dict[str, str]] = {
     "ctypes_from": "from ctypes import CDLL\n",
     "importlib_call": "import importlib\ndef f():\n    importlib.import_module('os')\n",
     "dunder_import": "def f():\n    __import__('os')\n",
+    "eval_call": "def f(x):\n    return eval(x)\n",
+    "exec_call": "def f(x):\n    exec(x)\n",
+    "compile_call": "def f(x):\n    return compile(x, 'f', 'exec')\n",
+    "sys_modules": "import sys\ndef f():\n    return sys.modules\n",
+    "sys_modules_alias": "import sys as s\ndef f():\n    return s.modules\n",
+    "open_alias": "opener = open\n",
+    "open_alias_in_function": "def f():\n    g = open\n    return g\n",
+    "open_passed_as_argument": "def f(p):\n    return list(map(open, p))\n",
+    "builtins_open_reference": "import builtins\ndef f(p):\n    return builtins.open(p, 'rb')\n",
 }
 
 
@@ -119,6 +128,17 @@ def test_non_literal_open_mode_fails_closed() -> None:
     assert _lint("def f(p, m):\n    from pathlib import Path\n    Path(p).open(m)\n")
     # A literal read mode is not a write site.
     assert _lint("def f(p):\n    return open(p, 'rb')\n") == []
+
+
+def test_the_new_forbidden_forms_do_not_flag_lookalikes() -> None:
+    clean = (
+        "import re\n"
+        "PATTERN = re.compile('x')\n"
+        "def f(p, mod):\n"
+        "    mod.compile(p)\n"
+        "    return open(p, 'rb')\n"
+    )
+    assert _lint(clean) == []
 
 
 def test_a_write_is_allowed_only_inside_the_rows_named_scope() -> None:

@@ -5,7 +5,8 @@ wrapper DIRECTLY (R-A: custom records never cross the message bus) and never rai
 failed write sets ``health.ok=False``, logs ``CAPTURE_PUBLISH_FAILED``, and offers a CRITICAL of the
 same name through the node outbox, deduplicated per cause per ``FAILURE_DEDUPE_S`` with the
 suppressed counts logged (r8 H8). ``flush_for_submit`` is the guard's synchronous flush before
-``super().submit_order`` (EM4) and is False after any dropped write since the previous call.
+``super().submit_order`` (EM4) and is False after any dropped write since the previous call or
+while health is down.
 
 The stream, the alert offer, the log sink and the clock are all injected, so this module imports no
 runtime, strategy or adapter code. It imports ``capture_records`` (for the heartbeat), so it reaches
@@ -41,6 +42,8 @@ PUBLISH_FAILED_EVENT: Final[str] = "CAPTURE_PUBLISH_FAILED"
 _NS: Final[int] = 10**9
 _FAMILY_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9_.-]{1,96}\Z")
 _FALLBACK_CAUSE: Final[str] = "write_failed"
+#: A flush failure dedupes under this cause, never under a stale ``health.cause`` (py M6).
+_FLUSH_CAUSE: Final[str] = "flush"
 
 #: ``(event, severity, detail) -> accepted``: the node outbox's ``offer``, duck-typed.
 AlertOffer = Callable[[str, str, str], bool]
@@ -121,6 +124,9 @@ class CapturePublisher:
         try:
             written = self._stream.write(record)
             cause = "" if written else (self._stream.health.cause or _FALLBACK_CAUSE)
+            if not written:
+                # A stream that returns False without marking health must still veto (SEC M2).
+                self._stream.health.mark_failed(cause)
         except Exception as exc:  # noqa: BLE001 - L-16: nothing escapes into a handler
             written = False
             cause = type(exc).__name__
@@ -130,19 +136,21 @@ class CapturePublisher:
         return written
 
     def flush_for_submit(self) -> bool:
-        """The guard's synchronous flush (EM4). False on a flush failure, and False once after any
-        judged write dropped since the previous call (r11 GM2); the drop counter is then reset."""
+        """The guard's synchronous flush (EM4). False on a flush failure, False once after any
+        judged write dropped since the previous call (r11 GM2), and False for as long as the
+        standing veto holds (``health.ok``): a drop of ANY table marks health, and only
+        ``positive_control`` clears it, so a later Take is refused too (WP1-R3, SEC M1)."""
         try:
             flushed = self._stream.flush()
-            cause = self._stream.health.cause or "flush_failed"
-        except Exception as exc:  # noqa: BLE001 - L-16
+            drops = self._stream.consume_drops_since_submit_flush()
+        except Exception:  # noqa: BLE001 - L-16: an exception is a refusal, never a raise
             flushed = False
-            cause = type(exc).__name__
-            self._stream.health.mark_failed(cause)
-        drops = self._stream.consume_drops_since_submit_flush()
+            drops = 0
         if not flushed:
-            self._on_failure("flush", cause)
-        return flushed and drops == 0
+            if self._stream.health.ok:
+                self._stream.health.mark_failed(_FLUSH_CAUSE)
+            self._on_failure(_FLUSH_CAUSE, _FLUSH_CAUSE)
+        return flushed and drops == 0 and self._stream.health.ok
 
     def positive_control(
         self, *, heartbeat_written: bool, flush_ok: bool, per_type_passed: bool
@@ -194,9 +202,8 @@ class CapturePublisher:
             )
 
     def _on_failure(self, record_type: str, cause: str) -> None:
-        self._log_error(
-            f"CAPTURE_PUBLISH_FAILED family={self._family_id} type={record_type} cause={cause}"
-        )
+        """Log and offer only when a failure OPENS its cause's window; later failures inside the
+        window are counted, and the count is logged when the window closes (py M5)."""
         now = self._now_ns()
         window = self._windows.get(cause)
         if window is not None and not self._expired(window, now):
@@ -205,6 +212,9 @@ class CapturePublisher:
         if window is not None:
             self._close_window(cause)
         self._windows[cause] = _Window(start_ns=now)
+        self._log_error(
+            f"CAPTURE_PUBLISH_FAILED family={self._family_id} type={record_type} cause={cause}"
+        )
         self._offer(record_type, cause)
 
     def _offer(self, record_type: str, cause: str) -> None:

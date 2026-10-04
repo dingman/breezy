@@ -3,6 +3,7 @@
 
 import datetime as dt
 import os
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -403,3 +404,38 @@ def _register_exploding() -> None:
 
 
 _register_exploding()
+
+
+# -- WP1-R3 (SEC M3): the instance directory is fresh or empty and 0700 ----------------
+
+
+def _try_open(tmp_path: Path) -> CaptureStreamWriter:
+    stream = CaptureStreamWriter(root=tmp_path, instance_id="inst-1")
+    stream.open(TestComponentStubs.cache(), _clock_at(T10))
+    return stream
+
+
+def test_open_creates_a_fresh_0700_instance_directory(tmp_path: Path) -> None:
+    stream = _try_open(tmp_path)
+    assert stream.health.ok is True
+    assert stat.S_IMODE(stream.stream_dir.stat().st_mode) == 0o700
+
+
+def test_open_accepts_an_existing_empty_0700_directory(tmp_path: Path) -> None:
+    (tmp_path / "live" / "inst-1").mkdir(parents=True, mode=0o700)
+    assert _try_open(tmp_path).health.ok is True
+
+
+@pytest.mark.parametrize("case", ["non_empty", "mode_0755", "mode_0770"])
+def test_open_refuses_a_used_or_open_instance_directory(tmp_path: Path, case: str) -> None:
+    """MUTATION (red): the tolerant ``ensure_dir`` alone lets a pre-populated dir be reused."""
+    directory = tmp_path / "live" / "inst-1"
+    directory.mkdir(parents=True, mode=0o700)
+    if case == "non_empty":
+        (directory / "custom_decision_record_1.feather").write_bytes(b"x")
+    else:
+        directory.chmod(0o755 if case == "mode_0755" else 0o770)
+    stream = CaptureStreamWriter(root=tmp_path, instance_id="inst-1")
+    assert stream.open(TestComponentStubs.cache(), _clock_at(T10)) is False
+    assert stream.health.ok is False and stream.health.cause == "open_failed"
+    assert stream.write(_decision(1)) is False  # never opened a writer

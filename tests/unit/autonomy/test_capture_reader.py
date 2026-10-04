@@ -18,6 +18,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.events import PositionOpened
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.position import Position
+from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 from breezy.adapters.polymarket_us.exec.submit_chain import intent_fingerprint
 from breezy.adapters.polymarket_us.symbology import no_leg_instrument_id
@@ -605,3 +606,80 @@ def test_an_empty_file_is_not_a_torn_tail_and_yields_no_rows(tmp_path: Path) -> 
     (boot_dir(tmp_path) / "custom_frame_copy_5.feather").write_bytes(b"")
     got = _read(tmp_path)
     assert got.frame_copies == () and got.torn_tails == ()
+
+
+# -- WP1-R3 (py M7, SEC L4): one content failure type -----------------------------------
+
+
+def test_the_order_filled_rows_stay_out_of_the_stream_repr() -> None:
+    """SEC L5: a raw ``venue_order_id`` must not reach a log line through ``repr(stream)``."""
+    row = {"client_order_id": "O-1", "venue_order_id": "RAW-VENUE-ID-123"}
+    stream = capture_reader.CaptureStream(instance_id="i", source="live", order_filled=(row,))
+    assert "RAW-VENUE-ID-123" not in repr(stream)
+
+
+def test_a_decoder_failure_is_a_projection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = open_stream(tmp_path)
+    write_all(stream, [decision(1)])
+    stream.close()
+
+    def boom(*_a: Any) -> list[Any]:
+        raise RuntimeError("decoder blew up")
+
+    monkeypatch.setattr(ArrowSerializer, "deserialize", boom)
+    with pytest.raises(capture_reader.CaptureProjectionError):
+        _read(tmp_path)
+
+
+def test_schema_drift_is_a_projection_error(tmp_path: Path) -> None:
+    """A file named for ``custom_decision_record`` whose Arrow schema is something else."""
+    import pyarrow as pa
+
+    directory = tmp_path / "live" / "inst-1"
+    directory.mkdir(parents=True, mode=0o700)
+    table = pa.table({"unrelated": [1, 2, 3]})
+    target = str(directory / "custom_decision_record_5.feather")
+    with pa.OSFile(target, "wb") as sink, pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    with pytest.raises(capture_reader.CaptureProjectionError):
+        _read(tmp_path)
+
+
+def test_an_attribute_error_in_projection_is_a_projection_error() -> None:
+    stream = capture_reader.CaptureStream(instance_id="i", source="live", decisions=(object(),))
+    with pytest.raises(capture_reader.CaptureProjectionError):
+        project_c1(stream)
+
+
+def test_an_index_error_in_projection_is_a_projection_error() -> None:
+    row = {
+        "client_order_id": "O-1",
+        "trade_id": "T",
+        "last_qty": "1",
+        "last_px": "0.1",
+        "commission": "",  # no number to split off
+        "venue_order_id": "V",
+        "ts_event": 1,
+    }
+    stream = capture_reader.CaptureStream(instance_id="i", source="live", order_filled=(row,))
+    with pytest.raises(capture_reader.CaptureProjectionError):
+        project_c1(stream)
+
+
+def test_an_invalid_operation_in_projection_is_a_projection_error() -> None:
+    row = {"instrument_id": YES_INSTRUMENT, "signed_qty": "abc", "last_px": 0.1, "ts_event": 1}
+    stream = capture_reader.CaptureStream(
+        instance_id="i", source="live", position_events=(("position_opened", row),)
+    )
+    with pytest.raises(capture_reader.CaptureProjectionError):
+        project_c1(stream)
+
+
+def test_a_missing_column_in_a_native_row_is_a_projection_error() -> None:
+    stream = capture_reader.CaptureStream(
+        instance_id="i", source="live", position_events=(("position_opened", {}),)
+    )
+    with pytest.raises(capture_reader.CaptureProjectionError):
+        project_c1(stream)

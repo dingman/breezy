@@ -1,6 +1,7 @@
 """AUT-1 WP1 part A: ``capture_epoch_start`` (r8 section 3.3.5, unchanged by r12 section 3.4.5)."""
 
 import json
+import logging
 import os
 import stat
 from collections.abc import Callable
@@ -185,3 +186,56 @@ def test_family_id_is_validated_as_a_path_component(data_root: Path) -> None:
     for bad in ("", "../x", "a/b", "A B"):
         with pytest.raises(Exception, match=r"."):
             write_epoch_once(data_root, family_id=bad, node_boot_id="b", build_sha="s", now_ns=1)
+
+
+# -- WP1-R3 (py H1): an epoch alert is never silent -------------------------------------
+
+
+def _unreadable_root(root: Path) -> None:
+    path = _epoch_file(root)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"garbage")
+    path.chmod(0o444)
+
+
+def _write(root: Path, offer: Callable[..., bool] | None) -> object:
+    return write_epoch_once(
+        root, family_id=FAMILY, node_boot_id="b", build_sha="s", now_ns=5, alert_offer=offer
+    )
+
+
+def test_an_undeliverable_epoch_alert_is_logged_counted_and_reported(
+    data_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """MUTATION (red): a silent ``_offer`` leaves no ERROR line, a zero count and ``delivered``."""
+
+    def boom(*_a: str) -> bool:
+        raise RuntimeError("outbox down")
+
+    def refuses(*_a: str) -> bool:
+        return False
+
+    _unreadable_root(data_root)
+    for offer in (None, boom, refuses):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="breezy.persistence.autonomy.capture_epoch"):
+            outcome = _write(data_root, offer)
+        assert outcome.status is EpochStatus.UNREADABLE  # type: ignore[attr-defined]
+        assert outcome.delivered is False  # type: ignore[attr-defined]
+        assert outcome.alert_drops == 1  # type: ignore[attr-defined]
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "CAPTURE_EPOCH_UNREADABLE" in errors[0].getMessage()
+        assert f"family={FAMILY}" in errors[0].getMessage()
+
+
+def test_a_delivered_epoch_alert_and_a_healthy_epoch_report_delivered(data_root: Path) -> None:
+    sink: list[tuple[str, str, str]] = []
+    healthy = _write(data_root, _recorder(sink))
+    assert (healthy.delivered, healthy.alert_drops) == (True, 0)  # type: ignore[attr-defined]
+    data2 = data_root.parent / "data2"
+    data2.mkdir(mode=0o700)
+    _unreadable_root(data2)
+    alerted = _write(data2, _recorder(sink))
+    assert alerted.status is EpochStatus.UNREADABLE  # type: ignore[attr-defined]
+    assert (alerted.delivered, alerted.alert_drops) == (True, 0)  # type: ignore[attr-defined]

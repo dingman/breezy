@@ -80,6 +80,7 @@ ROTATION_TIMEZONE: Final[str] = "UTC"
 
 #: The native writer's dedupe window (``writer.py`` ``_seen_event_ids_maxlen``).
 _DEDUPE_WINDOW: Final[int] = 10_000
+_INSTANCE_DIR_MODE: Final[int] = 0o700
 _INSTANCE_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _FILE_RE: Final[re.Pattern[str]] = re.compile(r"\A(?P<table>.+)_\d+\.feather\Z")
 
@@ -150,13 +151,23 @@ class CaptureStreamWriter:
 
     def open(self, cache: Cache, clock: Clock) -> bool:
         """Create the private stream directory and the native writer. False (never raises) on
-        failure, with ``health`` down; a later ``write`` then returns False."""
+        failure, with ``health`` down; a later ``write`` then returns False.
+
+        The instance directory must be newly created, or existing, EMPTY and mode 0700: a boot
+        never reuses another boot's files (E-7 rule 4, one writer per directory). Any other state
+        refuses with ``open_failed``. The trust boundary is the same uid: a process of this uid can
+        always write the directory, so this guards against reuse and accident, not against it.
+        """
         try:
             rootfd = open_root(self._root)
             try:
-                os.close(ensure_dir(rootfd, (self._source, self._instance_id)))
+                dirfd = ensure_dir(rootfd, (self._source, self._instance_id))
             finally:
                 os.close(rootfd)
+            try:
+                _require_fresh_directory(dirfd)
+            finally:
+                os.close(dirfd)
             self._writer = StreamingFeatherWriter(
                 path=str(self.stream_dir),
                 cache=cache,
@@ -227,7 +238,11 @@ class CaptureStreamWriter:
 
     def _already_seen(self, obj: object) -> bool:
         """Mirror of the native dedupe: inserts on exactly the writer's condition (a ``UUID4``
-        ``id``), with the same bound, so a repeat is skipped by both."""
+        ``id``), with the same bound, so a repeat is skipped by both.
+
+        Called BEFORE the native write, on purpose: the native writer inserts the id before its own
+        write too, so an event whose write then drops is never retried by either (a counted drop,
+        not a second attempt) and the mirror stays exact."""
         event_id = getattr(obj, "id", None)
         if not isinstance(event_id, UUID4):
             return False
@@ -258,6 +273,15 @@ class CaptureStreamWriter:
             table = match.group("table")
             sizes[table] = sizes.get(table, 0) + info.st_size
         return sizes
+
+
+def _require_fresh_directory(dirfd: int) -> None:
+    """Raise unless the directory is empty and exactly mode 0700."""
+    if stat.S_IMODE(os.fstat(dirfd).st_mode) != _INSTANCE_DIR_MODE:
+        raise PermissionError("instance directory is not mode 0700")
+    with os.scandir(dirfd) as entries:
+        if next(entries, None) is not None:
+            raise FileExistsError("instance directory is not empty")
 
 
 def _file_pair(writer: StreamingFeatherWriter, table: str) -> tuple[int, Any] | None:

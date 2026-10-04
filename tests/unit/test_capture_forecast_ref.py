@@ -5,6 +5,7 @@ consumes. The resolver rebuilds the vector from the boot's STREAMED points, writ
 ``CaptureStreamWriter`` and read back from disk, and must equal what FQ held at the decision.
 """
 
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from breezy.analysis import capture_forecast_ref
 from breezy.analysis.capture_forecast_ref import ForecastRefStatus, resolve_forecast_ref
 from breezy.domain.forecast_point import ForecastPoint
 from breezy.persistence.autonomy.capture_reader import read_capture_stream
+from breezy.strategy.ladder_ev import forecast_subscriber
 from breezy.strategy.ladder_ev.forecast_subscriber import ForecastQuantileStateActor
 from tests.unit.capture_reader_support import (
     HOUR_NS,
@@ -171,3 +173,53 @@ def test_module_exports_are_pinned() -> None:
     assert {"ForecastRefStatus", "ForecastRefResolution", "resolve_forecast_ref"} <= set(
         capture_forecast_ref.__all__
     )
+
+
+@pytest.mark.parametrize("case", ["foreign_model", "foreign_variable", "unserved_station"])
+def test_foreign_model_and_foreign_variable_points_are_skipped_as_fq_skips_them(
+    tmp_path: Path, case: str
+) -> None:
+    """py H2: the real actor is the oracle for each filter the mirror copies. The noise point is
+    pushed AFTER the real cycle and would change (or break) the vector if it were not skipped.
+
+    MUTATION (red, M5): deleting the model filter overwrites ``TXN_Q10`` from a foreign model.
+    """
+    noise = {
+        "foreign_model": forecast_point("TXN_Q10", 1.0, model="NBM_NBS"),
+        "foreign_variable": forecast_point("TMP", 3.0),
+        "unserved_station": forecast_point("TXN_Q10", 1.0, station="KSFO"),
+    }[case]
+    points = [*full_cycle(), noise]
+    fq = _fq_state()
+    for point in points:
+        fq.on_data(point)
+    held = fq.state_for(STATION).value_at(V0)
+    assert held is not None and held.q10 == 70.0
+    counters = fq.counters
+    assert (
+        counters[
+            {
+                "foreign_model": "foreign_model",
+                "foreign_variable": "foreign_variable",
+                "unserved_station": "unknown_station",
+            }[case]
+        ]
+        == 1
+    )
+    resolved = _resolve(_stream_of(tmp_path, points), V0)
+    assert resolved.status is ForecastRefStatus.RESOLVED
+    assert resolved.vector == held
+
+
+def test_the_model_constant_is_the_one_fq_filters_on() -> None:
+    """No second copy of the literal: the module re-exports the subscriber's own constant."""
+    tree = ast.parse(Path(capture_forecast_ref.__file__).read_text(encoding="utf-8"))
+    defined = [
+        t.id
+        for node in tree.body
+        if isinstance(node, ast.Assign | ast.AnnAssign)
+        for t in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+        if isinstance(t, ast.Name)
+    ]
+    assert "NBP_QUANTILE_MODEL" not in defined
+    assert capture_forecast_ref.NBP_QUANTILE_MODEL == forecast_subscriber.NBP_QUANTILE_MODEL

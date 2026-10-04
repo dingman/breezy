@@ -38,6 +38,8 @@ class FakeStream:
         self.written: list[Any] = []
         self.raise_on_write: Exception | None = None
         self.write_ok = True
+        self.mark_on_false = True
+        self.raise_on_consume: Exception | None = None
         self.write_cause = "write_dropped:custom_decision_record"
         self.flush_ok = True
         self.raise_on_flush: Exception | None = None
@@ -48,7 +50,8 @@ class FakeStream:
         if self.raise_on_write is not None:
             raise self.raise_on_write
         if not self.write_ok:
-            self.health.mark_failed(self.write_cause)
+            if self.mark_on_false:
+                self.health.mark_failed(self.write_cause)
             return False
         self.written.append(obj)
         return True
@@ -60,6 +63,8 @@ class FakeStream:
         return self.flush_ok
 
     def consume_drops_since_submit_flush(self) -> int:
+        if self.raise_on_consume is not None:
+            raise self.raise_on_consume
         drops, self.pending_drops = self.pending_drops, 0
         return drops
 
@@ -234,9 +239,12 @@ def test_flush_for_submit_with_a_real_stream_sees_a_real_drop(tmp_path: Path) ->
     stream.native_writer._writers["custom_decision_record"] = _Raising()
     assert publisher.write(_record()) is False
     assert publisher.flush_for_submit() is False
-    # the drop was consumed; the standing veto is the guard's separate ``health.ok`` check (step 4)
-    assert publisher.flush_for_submit() is True
+    # WP1-R3 (SEC M1): the drop was consumed, but the standing veto now refuses every later submit
+    # flush until ``positive_control`` clears the health.
     assert publisher.health.ok is False
+    assert publisher.flush_for_submit() is False
+    assert publisher.positive_control(heartbeat_written=True, flush_ok=True, per_type_passed=True)
+    assert publisher.flush_for_submit() is True
     stream.close()
 
 
@@ -331,3 +339,69 @@ def _cache() -> Any:
 def test_publisher_requires_a_family_id(bad: str) -> None:
     with pytest.raises(ValueError):
         CapturePublisher(FakeStream(), family_id=bad)
+
+
+# -- WP1-R3 ---------------------------------------------------------------------------------------
+
+
+def test_flush_for_submit_requires_health_ok_until_positive_control_clears_it() -> None:
+    """SEC M1: a non-Take drop marks health; a LATER Take must still be refused.
+
+    MUTATION (red): returning ``flushed and drops == 0`` lets the later Take through.
+    """
+    h = Harness()
+    h.stream.health.mark_failed("write_dropped:custom_frame_copy")  # a non-Take drop, long ago
+    assert h.publisher.flush_for_submit() is False
+    assert h.publisher.flush_for_submit() is False  # drops were consumed; the veto still stands
+    assert h.publisher.positive_control(heartbeat_written=True, flush_ok=True, per_type_passed=True)
+    assert h.publisher.flush_for_submit() is True
+
+
+def test_a_raising_drop_counter_is_a_false_never_a_raise() -> None:
+    h = Harness()
+    h.stream.raise_on_consume = RuntimeError("counter broke")
+    assert h.publisher.flush_for_submit() is False
+    assert h.stream.health.ok is False
+
+
+def test_a_false_write_that_did_not_mark_health_is_marked_by_the_publisher() -> None:
+    """SEC M2: ``StreamLike.write`` returning False without marking must still veto.
+
+    MUTATION (red): leaving health to the stream leaves ``health.ok`` True here.
+    """
+    h = Harness()
+    h.stream.write_ok = False
+    h.stream.mark_on_false = False
+    assert h.stream.health.ok is True
+    assert h.publisher.write(_record()) is False
+    assert h.stream.health.ok is False
+    assert h.stream.health.cause == "write_failed"
+
+
+def test_publish_failed_is_logged_once_per_window_and_the_suppressed_count_when_it_closes() -> None:
+    """py M5: only the failure that OPENS a window logs; the close logs the suppressed count."""
+    h = Harness()
+    h.stream.raise_on_write = RuntimeError("a")
+    for _ in range(4):
+        h.publisher.write(_record())
+    failed = [line for line in h.logs if line.startswith("CAPTURE_PUBLISH_FAILED family")]
+    assert len(failed) == 1
+    h.clock.now += FAILURE_DEDUPE_S * NS
+    h.publisher.on_tick()
+    assert [line for line in h.logs if "SUPPRESSED" in line] == [
+        f"CAPTURE_PUBLISH_FAILED_SUPPRESSED family={FAMILY} cause=RuntimeError count=3 window_s=300"
+    ]
+
+
+def test_a_flush_failure_dedupes_under_its_own_cause_never_a_stale_health_cause() -> None:
+    """py M6: a stale ``health.cause`` must not name (or swallow) a flush failure."""
+    h = Harness()
+    h.stream.health.mark_failed("write_dropped:custom_decision_record")  # stale, unrelated cause
+    h.stream.flush_ok = False
+    assert h.publisher.flush_for_submit() is False
+    assert h.publisher.flush_for_submit() is False
+    flush_offers = [d for _, _, d in h.offers if "type=flush" in d]
+    assert len(flush_offers) == 1 and "cause=flush" in flush_offers[0]
+    h.stream.write_ok = False  # a real write failure keeps its own window and offer
+    h.publisher.write(_record())
+    assert len(h.offers) == 2

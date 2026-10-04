@@ -14,6 +14,8 @@ Judged, per file:
   with a literal first argument listed on the row;
 * ``os.system``, ``os.popen``, ``os.exec*``, ``os.spawn*``, ``os.posix_spawn*``, ``ctypes`` and
   ``cffi``: never allowed;
+* ``eval``, ``exec``, ``compile``, ``sys.modules``, any reference to the builtin ``open`` that is
+  not a direct call (an alias, an argument) and any ``builtins.open``: never allowed (WP1-R3);
 * a name imported from a cross-unit write module (``WRITE_MODULE_FUNCTIONS``): only when the row
   lists it in ``write_imports``. A non-writer therefore reaches such a module only through the
   read-only names it does not list here;
@@ -233,6 +235,43 @@ def _forbidden_findings(path: str, tree: ast.Module) -> list[Finding]:
     return out
 
 
+_FORBIDDEN_BUILTIN_CALLS: Final[frozenset[str]] = frozenset({"eval", "exec", "compile"})
+
+
+def _module_aliases(tree: ast.Module, module: str) -> set[str]:
+    names = {module}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.asname for a in node.names if a.name == module and a.asname)
+    return names
+
+
+def _dynamic_findings(path: str, tree: ast.Module) -> list[Finding]:
+    """``eval`` / ``exec`` / ``compile``, ``sys.modules`` and the builtin ``open`` as a value."""
+    out: list[Finding] = []
+    sys_names = _module_aliases(tree, "sys")
+    builtins_names = _module_aliases(tree, "builtins")
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in _FORBIDDEN_BUILTIN_CALLS:
+                out.append(_finding(path, node, "aut1_forbidden", node.id))
+            elif node.id == "open" and id(node) not in called:
+                out.append(_finding(path, node, "aut1_forbidden", "open as a value"))
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in sys_names and node.attr == "modules":
+                out.append(_finding(path, node, "aut1_forbidden", "sys.modules"))
+            elif node.value.id in builtins_names and node.attr == "open":
+                out.append(_finding(path, node, "aut1_forbidden", "builtins.open"))
+        elif isinstance(node, ast.ImportFrom) and node.module in {"sys", "builtins"}:
+            out.extend(
+                _finding(path, node, "aut1_forbidden", f"from {node.module} import {a.name}")
+                for a in node.names
+                if (node.module, a.name) in {("sys", "modules"), ("builtins", "open")}
+            )
+    return out
+
+
 def _forbidden_os_name(name: str) -> bool:
     return name in _FORBIDDEN_OS or name.startswith(_FORBIDDEN_OS_PREFIXES)
 
@@ -331,6 +370,7 @@ def lint_source(
     findings = [
         *_site_findings(path, tree, source, row),
         *_forbidden_findings(path, tree),
+        *_dynamic_findings(path, tree),
         *_import_findings(path, tree, row),
         *_reason_findings(path, tree),
     ]

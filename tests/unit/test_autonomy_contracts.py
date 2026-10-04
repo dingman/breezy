@@ -28,6 +28,12 @@ NAUTILUS_PERMITTED: Final[frozenset[str]] = frozenset(
     f"{AUTONOMY_PACKAGE}.{m}"
     for m in ("capture_records", "capture_stream", "capture_publish", "capture_reader")
 )
+#: ``NAUTILUS_PERMITTED`` modules that import ``breezy.domain`` by design (``ForecastPoint``, the
+#: leg helpers), and the one that imports pyarrow directly (the stream reader). The rest must not.
+DOMAIN_PERMITTED: Final[frozenset[str]] = frozenset(
+    f"{AUTONOMY_PACKAGE}.{m}" for m in ("capture_stream", "capture_reader")
+)
+PYARROW_DIRECT_PERMITTED: Final[frozenset[str]] = frozenset({f"{AUTONOMY_PACKAGE}.capture_reader"})
 #: Core modules that may reach pyarrow, hence absent from contract (c) (AC 1).
 PYARROW_REACHING: Final[frozenset[str]] = frozenset(
     f"{AUTONOMY_PACKAGE}.{m}"
@@ -164,6 +170,18 @@ def _modules_loaded_by(module: str) -> list[str]:
     return loaded
 
 
+def _direct_imports(module: str) -> set[str]:
+    """Top-level package names a module imports in its own source."""
+    path = AUTONOMY_DIR / f"{module.rsplit('.', 1)[1]}.py"
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            found.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            found.add(node.module.split(".")[0])
+    return found
+
+
 @pytest.mark.parametrize("module", sorted(_existing_modules()))
 def test_autonomy_core_modules_nautilus_free_at_runtime(module: str) -> None:
     loaded = _modules_loaded_by(module)
@@ -172,6 +190,12 @@ def test_autonomy_core_modules_nautilus_free_at_runtime(module: str) -> None:
     if module in NAUTILUS_PERMITTED:
         # a permitted module really does reach Nautilus (keeps the list honest)
         assert nautilus != []
+        # WP1-R3 (SEC L8): only the nautilus-free assertion is skipped. Domain stays bounded to the
+        # modules that import it by design, and a direct pyarrow import to the one decoder.
+        if module not in DOMAIN_PERMITTED:
+            assert domain == []
+        if module not in PYARROW_DIRECT_PERMITTED:
+            assert "pyarrow" not in _direct_imports(module)
         return
     assert nautilus == []
     assert domain == []

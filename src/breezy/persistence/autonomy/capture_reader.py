@@ -22,6 +22,10 @@ Rules this module keeps:
   ``intent_fingerprint`` hashes ``str(enum)`` (``'1'`` / ``'2'`` on Nautilus 1.231.0). The names are
   mapped back through ``order_side_from_str`` / ``time_in_force_from_str`` and ``str()``, and the
   price is read from the ``options`` JSON (the ``price`` column is null).
+* **One content failure type.** Decoder, schema-drift and bad-row failures all raise
+  ``CaptureProjectionError``; filesystem trust refusals (a symlink, a foreign owner, a missing
+  directory) stay ``SingleReadRefused``.
+* **Linux-only.** Entries are scanned through ``/proc/self/fd``.
 * **No raw venue order id, no path in any message.**
 """
 
@@ -32,7 +36,7 @@ import os
 import re
 import stat
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -165,7 +169,8 @@ class CaptureStream:
     heartbeats: tuple[Any, ...] = ()
     forecast_points: tuple[ForecastPoint, ...] = ()
     order_initialized: tuple[NativeRow, ...] = ()
-    order_filled: tuple[NativeRow, ...] = ()
+    #: ``repr=False``: a native fill row carries the RAW venue order id (SEC L5).
+    order_filled: tuple[NativeRow, ...] = field(default=(), repr=False)
     #: ``(table, row)`` for every native ``Position*`` event, in stream order per table.
     position_events: tuple[tuple[str, NativeRow], ...] = ()
     torn_tails: tuple[TornTail, ...] = ()
@@ -221,6 +226,8 @@ def _scan_file(dirfd: int, name: str) -> tuple[Any, pa.Table | None]:
     fd = _open_entry(dirfd, name)
     try:
         result = salvage_feather_file(Path(f"{_FD_PATH}/{fd}"))
+    except pa.ArrowException as exc:
+        raise CaptureProjectionError("a stream file is not an Arrow stream") from exc
     finally:
         os.close(fd)
     if result.report.status is FeatherStatus.UNREADABLE:
@@ -229,10 +236,13 @@ def _scan_file(dirfd: int, name: str) -> tuple[Any, pa.Table | None]:
 
 
 def _decode(table_name: str, table: pa.Table) -> list[Any]:
-    cls = _CUSTOM_BY_TABLE.get(table_name)
-    if cls is not None:
-        return list(ArrowSerializer.deserialize(cls, table))
-    return list(table.to_pylist())
+    try:
+        cls = _CUSTOM_BY_TABLE.get(table_name)
+        if cls is not None:
+            return list(ArrowSerializer.deserialize(cls, table))
+        return list(table.to_pylist())
+    except Exception as exc:
+        raise CaptureProjectionError("a stream table cannot be decoded") from exc
 
 
 @dataclass(slots=True)
@@ -626,15 +636,21 @@ def _position_marks(stream: CaptureStream) -> tuple[PositionMarkView, ...]:
 def project_c1(stream: CaptureStream, *, family_id: str = "") -> C1View:
     """The C1 logical records of one boot. ``family_id`` seeds the orphan id of an untagged order;
     when empty it is the first non-empty ``family_id`` among the stream's own decisions."""
-    family = family_id or next((d.family_id for d in stream.decisions if d.family_id), "")
-    return C1View(
-        family_id=family,
-        decisions=tuple(_decision_view(d) for d in stream.decisions),
-        order_links=_order_links(stream, family),
-        lifecycle_events=_lifecycle_events(stream),
-        position_marks=_position_marks(stream),
-        detector_events=tuple(stream.detector_events),
-    )
+    try:
+        family = family_id or next((d.family_id for d in stream.decisions if d.family_id), "")
+        return C1View(
+            family_id=family,
+            decisions=tuple(_decision_view(d) for d in stream.decisions),
+            order_links=_order_links(stream, family),
+            lifecycle_events=_lifecycle_events(stream),
+            position_marks=_position_marks(stream),
+            detector_events=tuple(stream.detector_events),
+        )
+    except CaptureProjectionError:
+        raise
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        # ``decimal.InvalidOperation`` is an ArithmeticError. One failure type for any bad row.
+        raise CaptureProjectionError("a stored row cannot be projected") from exc
 
 
 # -- joins and resolvers -----------------------------------------------------------------------

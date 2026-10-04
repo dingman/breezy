@@ -32,6 +32,7 @@ from breezy.strategy.ladder_ev.forecast_state import (
     ForecastQuantileState,
     ForecastQuantileVector,
 )
+from breezy.strategy.ladder_ev.forecast_subscriber import NBP_QUANTILE_MODEL
 
 __all__ = [
     "NBP_QUANTILE_MODEL",
@@ -43,8 +44,6 @@ __all__ = [
     "resolve_forecast_ref",
 ]
 
-#: The model FQ's quantile subscriber filters on (``forecast_subscriber.NBP_QUANTILE_MODEL``).
-NBP_QUANTILE_MODEL: Final[str] = "NBM_NBP"
 REASON_NO_POINTS: Final[str] = "no_points"
 REASON_INCOMPLETE_VECTOR: Final[str] = "incomplete_vector"
 REASON_VINTAGE_MISMATCH: Final[str] = "vintage_mismatch"

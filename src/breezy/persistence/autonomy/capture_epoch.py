@@ -12,6 +12,7 @@ so there is no veto.
 """
 
 import json
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ EPOCH_FILE_MODE: Final[int] = 0o444
 _EPOCH_DIR: Final[tuple[str, ...]] = ("evidence", "capture", "epoch")
 _MAX_EPOCH_BYTES: Final[int] = 4096
 _CRITICAL: Final[str] = "CRITICAL"
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 #: ``(event, severity, detail) -> delivered`` (the node outbox's ``offer``, duck-typed).
 AlertOffer = Callable[[str, str, str], bool]
@@ -77,10 +79,16 @@ class EpochRecord:
 
 @dataclass(frozen=True)
 class EpochOutcome:
-    """``epoch_start_ns`` is the file's value, or 0 when the status is ``UNREADABLE``."""
+    """``epoch_start_ns`` is the file's value, or 0 when the status is ``UNREADABLE``.
+
+    ``delivered`` is False when an alert was needed and the outbox did not accept it (no offer
+    wired, an offer that raised, or one that returned False); ``alert_drops`` counts those.
+    """
 
     status: EpochStatus
     epoch_start_ns: int
+    delivered: bool = True
+    alert_drops: int = 0
 
 
 def epoch_relative_path(family_id: str) -> tuple[str, ...]:
@@ -155,13 +163,22 @@ def _publish(data_root: Path, family_id: str, body: dict[str, object]) -> bool:
     return outcome is WriteOutcome.WRITTEN
 
 
-def _offer(offer: AlertOffer | None, detail: str) -> None:
-    if offer is None:
-        return
-    try:
-        offer(EPOCH_ALERT_EVENT, _CRITICAL, detail)
-    except Exception:  # noqa: BLE001 - an alert transport failure is never a capture veto
-        return
+def _offer(offer: AlertOffer | None, family_id: str, cause: str) -> EpochOutcome:
+    """The UNREADABLE outcome, after one ERROR log and one offer. Never silent, never raises: the
+    epoch matters only to the audit, so an undeliverable alert is counted and reported, not a
+    veto."""
+    _LOGGER.error("%s family=%s cause=%s", EPOCH_ALERT_EVENT, family_id, cause)
+    accepted = False
+    if offer is not None:
+        try:
+            accepted = bool(
+                offer(EPOCH_ALERT_EVENT, _CRITICAL, f"family={family_id} cause={cause}")
+            )
+        except Exception:  # noqa: BLE001 - an alert transport failure is never a capture veto
+            accepted = False
+    return EpochOutcome(
+        EpochStatus.UNREADABLE, 0, delivered=accepted, alert_drops=int(not accepted)
+    )
 
 
 def write_epoch_once(
@@ -195,10 +212,8 @@ def write_epoch_once(
         )
         written = read_epoch(data_root, family_id)
     except (EpochUnreadable, SingleReadRefused, OSError) as exc:
-        _offer(alert_offer, f"family={family_id} cause={type(exc).__name__}")
-        return EpochOutcome(EpochStatus.UNREADABLE, 0)
+        return _offer(alert_offer, family_id, type(exc).__name__)
     if written is None:
-        _offer(alert_offer, f"family={family_id} cause=absent_after_write")
-        return EpochOutcome(EpochStatus.UNREADABLE, 0)
+        return _offer(alert_offer, family_id, "absent_after_write")
     status = EpochStatus.WRITTEN if created else EpochStatus.VERIFIED
     return EpochOutcome(status, written.epoch_start_ns)
