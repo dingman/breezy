@@ -249,6 +249,12 @@ def _in_scope(scope: str, allowed: Iterable[str]) -> bool:
     return any(a == "*" or scope == a or scope.startswith(f"{a}.") for a in allowed)
 
 
+#: The two ``subprocess`` stdio constants. A bare reference to either is an integer, not a write;
+#: the ``subprocess.run`` / ``Popen`` call that receives it is still judged against the row argvs
+#: (S2-R47). Nothing else under ``subprocess.`` is exempt.
+STDIO_CONSTANT_REFERENCES: Final[frozenset[str]] = frozenset(
+    {"subprocess.PIPE", "subprocess.DEVNULL"}
+)
 _SLOT_RE: Final[re.Pattern[str]] = re.compile(r"\{(?P<name>[a-z_]+)\}")
 #: The closed set of slot names an argv row may carry (design S2-R21): the two journal time slots.
 #: A name outside it matches nothing, so a free-form or path-carrying slot is refused.
@@ -298,6 +304,8 @@ def _site_findings(path: str, tree: ast.Module, source: str, row: AuthorityRow) 
     out: list[Finding] = []
     for site in find_write_sites(path, source):
         detail = site.detail
+        if detail in STDIO_CONSTANT_REFERENCES:
+            continue
         if detail.startswith("subprocess.") or detail == "subprocess":
             if any(_argv_matches(c, a) for c in calls.get(site.lineno, []) for a in row.argvs):
                 continue

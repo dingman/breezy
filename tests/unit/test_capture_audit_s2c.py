@@ -24,6 +24,7 @@ from breezy.analysis.capture_audit_model import (
 )
 from breezy.analysis.capture_audit_replay import BootReplay, leg_r1, leg_r3
 from tests.support import capture_audit_fixtures as fx
+from tests.support import capture_audit_w1_fixtures as w1
 from tests.support import capture_audit_w3_fixtures as w3
 from tests.support.capture_audit_recon_fixtures import (
     T,
@@ -201,10 +202,44 @@ def test_each_pass_fixture_audits_to_pass_through_the_real_legs(name: str) -> No
 
 
 @pytest.mark.parametrize("name", sorted(PASS_FIXTURES))
-def test_a_pass_fixture_replay_counts_exactly_its_decisions(name: str) -> None:
+def test_a_pass_fixture_replay_counts_exactly_its_replayed_decisions(name: str) -> None:
+    """``Exit`` records have no log line, so R2 never replays them (``_REPLAYED_KINDS``)."""
     (boot,) = PASS_FIXTURES[name]().boots
-    assert boot.replay.admitted_total == len(boot.c1.decisions) > 0
+    replayed = [d for d in boot.c1.decisions if d.kind in ("Take", "TrySubmit")]
+    assert boot.replay.admitted_total == len(replayed)
     assert sum(boot.replay.admitted_by_kind.values()) == boot.replay.admitted_total
+
+
+def test_the_entry_fixture_replays_its_decisions_and_the_exit_fixture_holds_its_exit() -> None:
+    (entry,) = PASS_FIXTURES["entry_day"]().boots
+    assert entry.replay.admitted_total == len(entry.c1.decisions) == 2
+    (exit_boot,) = PASS_FIXTURES["exit_day"]().boots
+    assert [d.kind for d in exit_boot.c1.decisions] == ["Exit"]
+    assert exit_boot.replay.admitted_total == 0
+
+
+@pytest.mark.parametrize("name", sorted(PASS_FIXTURES))
+def test_a_pass_fixture_scan_agrees_with_its_records_and_funnel(name: str) -> None:
+    inp = PASS_FIXTURES[name]()
+    (boot,) = inp.boots
+    assert boot.scan is not None and boot.scan.entry_total == len(boot.scan.entry_lines)
+    expected = [d.kind for d in boot.c1.decisions if d.kind in ("Take", "TrySubmit")]
+    assert [line.kind for line in boot.scan.entry_lines] == expected
+    (row,) = inp.funnel
+    assert sum(item.count for item in row.counts) == len(expected)
+
+
+def test_a_pass_fixture_missing_its_exit_record_in_the_stream_no_longer_passes() -> None:
+    inp = PASS_FIXTURES["exit_day"]()
+    gutted = w1.replace_c1(inp, decisions=())
+    result = audit.audit_day(gutted)
+    assert (result.status, result.cause) == (DayStatus.FAIL, "D:exit_record_missing")
+
+
+def test_the_entry_fixture_with_its_trysubmit_record_dropped_fails_r2() -> None:
+    inp = PASS_FIXTURES["entry_day"]()
+    gutted = w1.replace_c1(inp, decisions=inp.boots[0].c1.decisions[:1])
+    assert audit.audit_day(gutted).status == DayStatus.FAIL
 
 
 def test_the_default_replay_fixture_admits_nothing_because_the_default_boot_logs_nothing() -> None:

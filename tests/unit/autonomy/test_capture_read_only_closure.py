@@ -15,6 +15,7 @@ from tests.support.capture_closure_lint import (
     AUT1_GLOBS,
     AUT1_WRITE_AUTHORITY,
     REASON_COPY_SITES,
+    STDIO_CONSTANT_REFERENCES,
     WRITE_MODULE_FUNCTIONS,
     AuthorityRow,
     aut1_files,
@@ -166,6 +167,49 @@ def test_subprocess_and_sqlite_need_a_literal_argument_on_the_row() -> None:
     sql_row = AuthorityRow(_PLANTED_MODULE, sqlite=("file:x?mode=ro",), min_calls=0)
     assert _lint(conn, row=sql_row) == []
     assert _lint(conn)
+
+
+_ARGV_ROW: Final = AuthorityRow(_PLANTED_MODULE, argvs=(("journalctl", "--user"),), min_calls=0)
+
+
+def test_only_the_two_stdio_constants_are_exempt_references() -> None:
+    assert STDIO_CONSTANT_REFERENCES == {"subprocess.PIPE", "subprocess.DEVNULL"}
+
+
+def test_stdio_constants_are_accepted_inside_a_row_matched_popen() -> None:
+    source = (
+        "import subprocess\n"
+        "def f():\n"
+        "    return subprocess.Popen(['journalctl', '--user'],"
+        " stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)\n"
+    )
+    assert _lint(source, row=_ARGV_ROW) == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "subprocess.run(['rm', '-rf', 'x'], stdout=subprocess.PIPE)",
+        "subprocess.Popen(['rm', 'x'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)",
+        "subprocess.run(['journalctl', '--user'])",
+        "os.write(1, b'x')",
+        "os.replace('a', 'b')",
+    ],
+)
+def test_stdio_constants_do_not_exempt_other_subprocess_or_os_writes(call: str) -> None:
+    source = f"import os\nimport subprocess\ndef unlisted():\n    return {call}\n"
+    row = AuthorityRow(_PLANTED_MODULE, argvs=(("journalctl", "--user"),), min_calls=0)
+    findings = _lint(source, row=row)
+    if "journalctl" in call:  # the row's own argv is judged as before: allowed
+        assert findings == []
+    else:
+        assert _rules(findings) == {"aut1_write_authority"}
+
+
+def test_a_stdio_constant_does_not_launder_an_unlisted_subprocess_run() -> None:
+    source = "import subprocess\ndef f():\n    subprocess.run(['x'], stdout=subprocess.PIPE)\n"
+    details = {f.detail for f in _lint(source, row=_ARGV_ROW)}
+    assert "subprocess.run" in details and "subprocess.PIPE" not in details
 
 
 def test_a_non_writer_cannot_import_a_cross_unit_write_function() -> None:

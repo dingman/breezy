@@ -118,10 +118,6 @@ def test_run_journal_runs_the_template_with_only_the_two_slots_substituted(
     assert procs[0].closed
 
 
-def test_the_restated_subprocess_constants_equal_the_real_ones() -> None:
-    assert host._PIPE == subprocess.PIPE and host._DEVNULL == subprocess.DEVNULL
-
-
 @pytest.mark.parametrize(
     "bad",
     [

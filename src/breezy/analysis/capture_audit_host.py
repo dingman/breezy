@@ -132,11 +132,6 @@ _US_NS: Final[int] = 1_000
 _S_NS: Final[int] = 1_000_000_000
 _MAX_JOURNAL_BYTES: Final[int] = 256 * 1024 * 1024
 _READ_CHUNK_BYTES: Final[int] = 64 * 1024
-#: ``subprocess.PIPE`` and ``subprocess.DEVNULL``, restated as their documented-stable values: the
-#: one-writer lint treats any ``subprocess.<name>`` reference as a write site that must sit in a
-#: call matching a row argv. A test pins them equal to the real constants.
-_PIPE: Final[int] = -1
-_DEVNULL: Final[int] = -3
 
 
 def journal_slot(epoch_s: int) -> str:
@@ -181,8 +176,8 @@ def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
                 "--until",
                 until,
             ],
-            stdout=_PIPE,
-            stderr=_DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
     if key == SUPERVISOR_JOURNAL_ARGV:
         return subprocess.Popen(
@@ -198,8 +193,8 @@ def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
                 "--until",
                 until,
             ],
-            stdout=_PIPE,
-            stderr=_DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
     if key == RECORDER_JOURNAL_ARGV:
         return subprocess.Popen(
@@ -215,8 +210,8 @@ def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
                 "--until",
                 until,
             ],
-            stdout=_PIPE,
-            stderr=_DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
     raise _journal_failed("unknown_template")
 
