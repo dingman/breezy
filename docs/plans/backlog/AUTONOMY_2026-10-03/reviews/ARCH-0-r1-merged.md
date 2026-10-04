@@ -425,3 +425,30 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - Delete the vacuous asserts at test:129 and test:326, and the duplicate at test:178.
   - Document that `senders` is data only: consumers must not take `senders[0]` before the resolver check.
   - `halted_since_ns` (AUT-6 #30) moves to 7b.
+
+### Build-time rulings (seam A 7b ARCH review, 027dc6d9)
+- **A7b-R1 (HIGH, H1).** Windowed counters are sorted tuples of effective instants (ns), per erratum E-21, with the reviewer's recommended shape:
+  - **LineageTallies:**
+    - `nomination_instants` (new).
+    - `rollbacks` and the six `drill_*` counters become tuples.
+    - `model_resumes` (new): RECOVERABLE_MODEL resumes, including a ROLLBACK_FAILED halt whose trigger class is RECOVERABLE_MODEL.
+    - `nominations`, `infeasible_nominations`, `alpha_spent` and `terminal_frozen` stay lifetime scalars.
+  - **VenueTallies:**
+    - `infra_resumes` and `drill_close_restores` become tuples.
+    - `sender_changes` (new): every Z3 logical change.
+  - **Use:** budgets are in-window slice lengths, evaluated in 7c/7d. Venue caps sum the slices across lineages.
+  - **Rationale:** plan r5:214-221 (ints) is superseded. An int carried across HWM_RESET can only lock a budget or refund it.
+- **A7b-R2 (M2).** `carried_counters` merges as follows:
+  - lists by sorted multiset union, keeping each instant at its higher multiplicity;
+  - ints by max;
+  - bools by OR.
+  
+  The 7d B9 check is "export ⊆ carried" as multisets.
+- **A7b-R3 (M1).** An introducing row (MINT, BOOTSTRAP or ROOT_ADMIT) with a null `lineage_root_family_id` is `FoldInvalid(root_lineage_mismatch)`, per E-14 rule 3. The two default-to-own-lineage tests are inverted.
+- **A7b-R4 (LOW).**
+  - Add `promotions == ()` assertions to the nomination tests.
+  - Rename the vacuous α test, or give it a nonzero `alpha_k` on an infeasible row.
+- **7c obligations:**
+  - refuse a nonzero `alpha_k` on an infeasible nomination (AUT-4 r11:567);
+  - refuse a ROLLBACK whose `drill` column disagrees with an open episode.
+- **Open (pre-Kalshi):** lineage counters are venue-independent (ARCH:413), but the fold runs per venue. The consumer of `K_LIFETIME` and α must merge lineages across venue folds before a second venue goes live.

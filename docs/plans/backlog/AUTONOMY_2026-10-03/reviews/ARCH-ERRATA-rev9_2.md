@@ -459,3 +459,26 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **(a) Y8 in the post-launch window.** From LAUNCH to the launch-window end (17:00), a cause on the incoming family of an activated pair is written only as SWAP_CANCEL `pair_cause_incoming`. That voids the pair and restores the incumbent. `validate` refuses a DEMOTE or HALT of that incoming family in this window. A HALTED child plus a CHAMPION incumbent would otherwise be two senders, and a single-sender check would then refuse a restrictive batch.
 - **(b) `demoted_for_cause` is per champion epoch.** It holds only for causes inside the family's current champion epoch, and RESUME opens a new epoch (AUT-7 r5:105-109). ARCH:493's "never cleared" is read at epoch scope. The Y8 FORWARD_SHADOW PASS clear stays a `validate` rule.
 - **(c) OPEN: clearing the INTEGRITY freeze.** W15 (ARCH:720-723) and AUT-6 r15:505 describe an incident clear "through the registry CLI on the C5 API", but no C5 transition kind can carry it, and HWM_RESET must not widen. Until AUT-6 files the row kind and its fold semantics, a venue INTEGRITY freeze is permanent (fail closed). AUT-6 owns this; it blocks no ARCH-0 seam.
+
+## E-20 (coordinator, 2026-10-04; from the ARCH-0 seam A 7b build): malformed carried counters
+- `FoldInvalidReason` gains `carried_counters_malformed`. An HWM_RESET row whose `carried_counters` does not parse to the exact shape makes the fold return this reason. Ignoring the carry instead would silently refund budget.
+- The exact shape is:
+  - top level: `{"lineages": {<root>: <13 tally fields>}, "venue": {...}}`;
+  - exact keys;
+  - `alpha_spent` as a canonical decimal string;
+  - timestamp lists sorted.
+- The store maps the reason to `engine_inconsistency`.
+
+## E-21 (coordinator, 2026-10-04; from the ARCH-0 seam A 7b ARCH review): windowed tallies carry instants
+- **Change.** Every windowed counter in ARCH C5, AUT-5 r7:108 and :484, and E-5 becomes a sorted tuple of effective instants (ns), not an int. This covers:
+  - 30D rollbacks;
+  - 7D infra resumes;
+  - 30D drill counters;
+  - 14D RECOVERABLE_MODEL resumes per lineage;
+  - per-day drill-close restores;
+  - the forward-window nomination slot;
+  - Z3 sender changes, which also give the `ROLLBACK_MIN_DWELL_H` anchor.
+- **Unchanged.** Lifetime quantities stay scalars: `nominations`, `infeasible_nominations`, `alpha_spent` and `terminal_frozen`.
+- **Carried counters.** `carried_counters` (E-20 shape) uses the same keys and types. Lists merge by sorted multiset union, ints by max, bools by OR.
+- **Windows.** Each window is evaluated by `validate` (7c/7d) as the length of the in-window slice.
+- **Supersedes.** Plan r5:214-221 (int counters) is superseded.
