@@ -7,6 +7,7 @@ SQLite store shared with R-7's submit-intent flock, since `TrialDayLatch`
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 from decimal import Decimal
@@ -574,3 +575,88 @@ def test_clear_relative_evidence_path_is_refused(
 
     assert excinfo.value.code == 2
     assert "must be an absolute path" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# FQ loss response F3: clearing the FQ halt is evidenced, audited and CLI-only
+# ---------------------------------------------------------------------------
+
+_FQ_ID = "pm_us_crh_fq_v1"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+#: The only modules allowed to define or reference `clear_family_halt`: the
+#: latch that owns the method and the operator CLI that is its sole caller.
+_CLEAR_ALLOWED_FILES = frozenset(
+    {
+        "src/breezy/strategy/current_rung_hold/trial_day_latch.py",
+        "src/breezy/strategy/current_rung_hold/clear_family_halt_cli.py",
+    }
+)
+
+
+def _refs_clear_family_halt(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "clear_family_halt":
+            return True
+        if isinstance(node, ast.Name) and node.id == "clear_family_halt":
+            return True
+        if isinstance(node, ast.alias) and node.name == "clear_family_halt":
+            return True
+        if isinstance(node, ast.FunctionDef) and node.name == "clear_family_halt":
+            return True
+    return False
+
+
+def test_clear_fq_requires_audit_record_and_is_cli_only(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.db"
+    _seed_halt(store_path, family_id=_FQ_ID)
+    evidence = _evidence(tmp_path)
+    reason = "FQ halt cleared after reviewed evidence of the loss response"
+
+    # --reason and --evidence-path are both mandatory to clear.
+    for argv in (
+        ["--family-id", _FQ_ID, "--evidence-path", str(evidence)],
+        ["--family-id", _FQ_ID, "--reason", reason],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(argv, env=_env(store_path), stdout=io.StringIO(), stderr=io.StringIO())
+        assert exc.value.code == 2
+    check = SqliteStateStore(store_path)
+    assert check.get(family_halt_key(_FQ_ID)) not in (None, b"cleared")
+    check.close()
+
+    # The audit record is written BEFORE the halt row is overwritten.
+    writes: list[str] = []
+    real_set = SqliteStateStore.set
+
+    def _recording_set(self: SqliteStateStore, key: str, value: bytes) -> None:
+        writes.append(key)
+        real_set(self, key, value)
+
+    with patch.object(SqliteStateStore, "set", _recording_set):
+        code = _run(
+            ["--family-id", _FQ_ID, "--reason", reason, "--evidence-path", str(evidence)],
+            store_path,
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+    assert code == EXIT_OK
+    audit_key = _audit_key(CLEAR_TS_NS, _FQ_ID)
+    halt_key = family_halt_key(_FQ_ID)
+    assert audit_key in writes and halt_key in writes
+    assert writes.index(audit_key) < writes.index(halt_key)
+    store = SqliteStateStore(store_path)
+    audit = json.loads((store.get(audit_key) or b"{}").decode("utf-8"))
+    store.close()
+    assert audit["reason"] == reason
+    assert len(audit["evidenceSha256"]) == 64
+
+    # CLI-only: no module other than the latch and the CLI references it.
+    offenders = []
+    for root in ("src", "scripts"):
+        for path in sorted((_REPO_ROOT / root).rglob("*.py")):
+            rel = path.relative_to(_REPO_ROOT).as_posix()
+            if rel in _CLEAR_ALLOWED_FILES:
+                continue
+            if _refs_clear_family_halt(ast.parse(path.read_text(encoding="utf-8"))):
+                offenders.append(rel)
+    assert offenders == []

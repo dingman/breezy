@@ -3,6 +3,7 @@
   "venue": "polymarket_us",
   "trial_id_prefix": "forecast_quantile_ladder/trial/pm_us_crh_fq_v1/",
   "d0_climate_day": "2026-10-02",
+  "terminal_climate_day": "2026-10-05",
   "boundary_artefact_path": "deploy/families/artefacts/not_applicable_boundary.json",
   "boundary_inputs_sha256": "f4b5d9df270599f55684e6ef4cb18fc440594cb23b92ecdf8bbec3dec1adc02f",
   "composition_kind": "forecast_quantile_ladder",

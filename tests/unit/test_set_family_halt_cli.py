@@ -1411,3 +1411,66 @@ def test_relative_evidence_path_is_refused(
     assert excinfo.value.code == 2
     assert "must be an absolute path" in capsys.readouterr().err
     assert not _is_halted(store_path)
+
+
+# ---------------------------------------------------------------------------
+# FQ loss response F3: v1 terminal climate day + the halt key the FQ node reads
+# ---------------------------------------------------------------------------
+
+_FQ_V1_FAMILY_ID = "pm_us_crh_fq_v1"
+_FQ_V1_TERMINAL_DAY = "2026-10-05"
+
+
+def test_v1_manifest_terminal_day_parses() -> None:
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    manifest = load_family_manifest(REPO_ROOT / "deploy" / "families" / "pm_us_crh_fq_v1.json")
+
+    assert manifest.family_id == _FQ_V1_FAMILY_ID
+    assert manifest.terminal_climate_day == _FQ_V1_TERMINAL_DAY
+    assert manifest.d0_climate_day <= _FQ_V1_TERMINAL_DAY
+
+
+def test_fq_family_halt_key_matches_trade_preamble(tmp_path: Path) -> None:
+    from breezy.app.trade import _open_halt_latch_preamble
+    from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
+        FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
+    )
+
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+    fq_key = family_halt_key(_FQ_V1_FAMILY_ID)
+
+    # The halt is written through the real record_policy_halt (the CLI's writer).
+    code = _run(
+        [
+            "--family-id", _FQ_V1_FAMILY_ID,
+            "--reason", REASON,
+            "--evidence-path", str(_evidence_path(tmp_path)),
+        ],
+        store_path,
+    )
+    assert code == EXIT_OK
+
+    # The --status path reads the same row.
+    status_out = io.StringIO()
+    status_code = _run(
+        ["--family-id", _FQ_V1_FAMILY_ID, "--status"], store_path, stdout=status_out,
+    )
+    assert status_code == EXIT_OK
+    assert "halted=True" in status_out.getvalue()
+
+    # The halt row sits at exactly the key trade.py's FQ composition reads, and the
+    # preamble trade.py runs (not a re-implementation) sees it and vetoes.
+    store = SqliteStateStore(store_path)
+    assert store.get(fq_key) is not None
+    with open_submit_intent_latch(store, store_path) as intent_latch:
+        halt_latch, veto = _open_halt_latch_preamble(
+            intent_latch,
+            family_id=_FQ_V1_FAMILY_ID,
+            key_prefix=FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
+            alert_on_unattributable_legacy=False,
+        )
+        assert halt_latch.is_family_halted() is True
+        assert veto() == "family_halt"
+    store.close()
