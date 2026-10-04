@@ -41,6 +41,7 @@ from breezy.analysis.capture_audit_model import (
 )
 from breezy.analysis.capture_audit_wire import audit_from_wire
 from breezy.analysis.capture_aut6_contract import delivered_events, read_notifier_proofs
+from breezy.analysis.capture_heal import HEAL_ALERT_RETRY_DAYS  # S3-R53: the one source
 from breezy.persistence.autonomy.capture_alerts import heal_alert_event
 from breezy.persistence.autonomy.paths import family_component
 from breezy.persistence.autonomy.single_read import SingleReadRefused
@@ -61,9 +62,6 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 LIVE_PROOF_SCHEMA: Final[str] = "live_proof/v1"
 QUALIFYING_DAYS: Final[int] = 7
 MIN_REAL_FILLS: Final[int] = 5
-#: A heal's ``CAPTURE_HEALED_<sha>`` may be delivered up to this many days after the heal date
-#: (plan section 3.11.6, ``HEAL_ALERT_RETRY_DAYS``).
-HEAL_ALERT_RETRY_DAYS: Final[int] = 8
 #: How far back the roll-up looks for audited days and heal records.
 LOOKBACK_DAYS: Final[int] = 30
 WATCHDOG_DECIDER: Final[str] = "systemd_watchdog"

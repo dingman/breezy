@@ -8,6 +8,7 @@ the offer was accepted), and a failed delivery exits 1. The alert offer and the 
 files are real.
 """
 
+import ast
 import datetime as dt
 import json
 import os
@@ -370,6 +371,27 @@ def test_capture_live_proof_cli_sys_modules_closure(tmp_path: Path) -> None:
         f"c._main(['--data-root', {str(tmp_path)!r}, '--family-id=fam_x'],\n"
         "        offer=lambda e, s, d: True, clock=lambda: 1_792_000_000_000_000_000)\n"
     ) + _BAD
+    assert _probe(code) == "[]"
+
+
+def test_heal_alert_retry_days_has_one_source_in_capture_heal() -> None:
+    """S3-R53 (mutation: a local copy in the live-proof module drifts from the re-send window)."""
+    from breezy.analysis import capture_heal, capture_live_proof
+
+    tree = ast.parse(Path(capture_live_proof.__file__).read_text(encoding="utf-8"))
+    local = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign | ast.Assign)
+        and "HEAL_ALERT_RETRY_DAYS" in ast.unparse(node).split("=")[0]
+    ]
+    assert local == []
+    assert capture_live_proof.HEAL_ALERT_RETRY_DAYS == capture_heal.HEAL_ALERT_RETRY_DAYS == 8
+
+
+def test_the_live_proof_memory_closure_stays_free_of_nautilus_with_the_heal_constants() -> None:
+    """S3-R53: importing the heal constants must not load Nautilus (``MemoryMax=256M``)."""
+    code = "import sys\nimport breezy.analysis.capture_live_proof\n" + _BAD
     assert _probe(code) == "[]"
 
 

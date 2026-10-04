@@ -17,14 +17,17 @@ A kill with no stall record gets no heal: leg W carries it (S3-R46). The two bud
 FROZEN by 3a: S3 pins them against the unit budget (S3-R42, S3-R49).
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
-from breezy.analysis.capture_audit_input_types import RecorderJournalEntry
+if TYPE_CHECKING:  # annotations only: the input types load Nautilus; live proof imports this
+    from breezy.analysis.capture_audit_input_types import RecorderJournalEntry
 
 __all__ = [
     "HEAL_ABANDON_DAYS",
