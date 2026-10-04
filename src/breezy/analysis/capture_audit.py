@@ -13,7 +13,8 @@
 
 ``days_to_audit`` orders a run: yesterday, then INCONCLUSIVE re-audits, then the days never audited
 oldest-first (a missing day never ages out of the 8-day window), then ERROR re-audits (S2-R44).
-``run_audit`` checks the work deadline on a monotonic clock; a day it does not reach gets NO file
+The CLI sets the work deadline once; ``run_audit`` checks it on a monotonic clock and stops
+starting days ``DUTY_RESERVE_S`` before it. A day it does not reach gets NO file
 and is listed in ``audit_deferred_days``, which never causes exit 1. A day is written only after
 every input of it was read and every leg ran, so a partial day cannot exist. ``write_audit_file``
 publishes through ``single_read.write_once`` at 0444.
@@ -51,8 +52,8 @@ from breezy.analysis.capture_audit_inputs import (
 )
 from breezy.analysis.capture_audit_model import (
     AUDIT_DIR_REL,
-    AUDIT_WORK_BUDGET_S,
     BACKFILL_DAYS,
+    DUTY_RESERVE_S,
     LIVE_PROOF_MAX_AGE_H,
     LIVE_PROOF_NAME_RE,
     METRIC_NAMES,
@@ -116,6 +117,7 @@ __all__ = [
     "days_to_audit",
     "error_result",
     "run_audit",
+    "run_once_duties",
     "write_audit_file",
 ]
 
@@ -650,6 +652,13 @@ def _publish(
     run.errors += result.status is DayStatus.ERROR
 
 
+def _deadline_within(seconds: float) -> bool:
+    """True when ``DEADLINE`` (set once by the CLI, S3-R41) is set and no more than ``seconds``
+    away. ``seconds=0`` asks whether the deadline itself has been reached."""
+    deadline = DEADLINE.get()
+    return deadline is not None and capture_audit_inputs.MONOTONIC() >= deadline - seconds
+
+
 def _run_days(
     data_root: Path,
     family_id: str,
@@ -660,6 +669,9 @@ def _run_days(
     prior_errors: Mapping[dt.date, frozenset[str]],
 ) -> None:
     for index, day in enumerate(days):
+        if _deadline_within(DUTY_RESERVE_S):
+            run.deferred.extend(days[index:])  # the last seconds belong to the once-per-run duties
+            return
         try:
             result = _audit_one(data_root, family_id, day, now_ns)
         except ScanDeadline:
@@ -680,7 +692,6 @@ def _run_duties(
     data_root: Path, family_id: str, today: dt.date, now_ns: int, delivery: _Delivery, run: _Run
 ) -> None:
     duties: tuple[tuple[str, Callable[[], None]], ...] = (
-        ("settlement_missing", lambda: _check_settlements(data_root, today, now_ns, delivery)),
         ("stuck_inconclusive", lambda: _check_stuck(data_root, family_id, today, delivery)),
         ("live_proof_stale", lambda: _check_live_proof(data_root, family_id, now_ns, delivery)),
     )
@@ -695,21 +706,18 @@ def _run_duties(
 def run_audit(
     data_root: Path, family_id: str, today: dt.date, *, now_ns: int, offer: AlertOffer
 ) -> int:
-    """The whole run; returns the exit code."""
-    token = DEADLINE.set(capture_audit_inputs.MONOTONIC() + AUDIT_WORK_BUDGET_S)
+    """One family's run; returns the exit code. It only READS ``DEADLINE``: the CLI sets it once
+    for the whole run and no family ever re-arms it (S3-R41)."""
     delivery, run = _Delivery(offer), _Run()
-    try:
-        prior = _audited_results(data_root, family_id)
-        statuses = {day: result.status for day, result in prior.items()}
-        prior_errors = {
-            day: error_cause_set(result)
-            for day, result in prior.items()
-            if result.status is DayStatus.ERROR
-        }
-        days = days_to_audit(today, statuses)
-        _run_days(data_root, family_id, days, now_ns, delivery, run, prior_errors)
-    finally:
-        DEADLINE.reset(token)
+    prior = _audited_results(data_root, family_id)
+    statuses = {day: result.status for day, result in prior.items()}
+    prior_errors = {
+        day: error_cause_set(result)
+        for day, result in prior.items()
+        if result.status is DayStatus.ERROR
+    }
+    days = days_to_audit(today, statuses)
+    _run_days(data_root, family_id, days, now_ns, delivery, run, prior_errors)
     _run_duties(data_root, family_id, today, now_ns, delivery, run)
     sys.stderr.write(
         f"capture audit: errors={run.errors} deliveries_failed={delivery.failed} "
@@ -718,3 +726,20 @@ def run_audit(
     )
     failed = run.errors or delivery.failed or run.failed or run.duty_failures
     return 1 if failed else 0
+
+
+def run_once_duties(data_root: Path, today: dt.date, *, now_ns: int, offer: AlertOffer) -> int:
+    """The duties that belong to the run, not to a family (S3-R41): today the missing-settlement
+    check, so N families send it once. Returns the number of failures (a duty that raised or that
+    found ``DEADLINE`` already reached, plus every failed delivery); the CLI folds it into its exit
+    code."""
+    delivery = _Delivery(offer)
+    failures = 0
+    try:
+        if _deadline_within(0):
+            raise ScanDeadline
+        _check_settlements(data_root, today, now_ns, delivery)
+    except Exception:
+        _LOGGER.exception("capture audit: duty settlement_missing failed")
+        failures += 1
+    return failures + delivery.failed

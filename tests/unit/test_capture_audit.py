@@ -7,6 +7,7 @@ seam, moved duties and entry point. Files are real, under ``tmp_path``.
 
 import dataclasses
 import datetime as dt
+import inspect
 import json
 import logging
 import stat
@@ -17,6 +18,7 @@ from typing import Any
 import pytest
 
 from breezy.analysis import capture_audit as audit
+from breezy.analysis import capture_audit_cli as cli
 from breezy.analysis import capture_audit_inputs as inputs
 from breezy.analysis.capture_audit_input_types import (
     ExecView,
@@ -25,6 +27,7 @@ from breezy.analysis.capture_audit_input_types import (
 )
 from breezy.analysis.capture_audit_model import (
     AUDIT_WORK_BUDGET_S,
+    DUTY_RESERVE_S,
     METRIC_NAMES,
     AuditInputError,
     AuditResult,
@@ -551,9 +554,10 @@ def test_a_day_the_deadline_stops_is_deferred_without_a_file_and_does_not_fail_t
     assert "errors=0" in err
 
 
-def test_the_run_sets_the_work_deadline_from_the_monotonic_clock(
+def test_run_audit_reads_the_deadline_it_never_sets_or_resets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """S3-R41: ``_main`` owns ``DEADLINE``; ``run_audit`` only reads it, and takes no parameter."""
     seen: list[float | None] = []
     root = w3.make_root(tmp_path)
     stub_legs(monkeypatch)
@@ -567,9 +571,60 @@ def test_the_run_sets_the_work_deadline_from_the_monotonic_clock(
         return real(*a, **k)
 
     monkeypatch.setattr(audit, "gather_inputs", spying)
-    _run(root, Offers())
-    assert set(seen) == {1000.0 + AUDIT_WORK_BUDGET_S} and asked
-    assert inputs.DEADLINE.get() is None  # reset after the run
+    token = inputs.DEADLINE.set(5000.0)
+    try:
+        _run(root, Offers())
+        assert inputs.DEADLINE.get() == 5000.0  # not reset by the run
+    finally:
+        inputs.DEADLINE.reset(token)
+    assert set(seen) == {5000.0} and asked
+    assert "deadline" not in inspect.signature(audit.run_audit).parameters
+
+
+def test_run_audit_without_a_deadline_is_unlimited_and_leaves_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = w3.make_root(tmp_path)
+    stub_legs(monkeypatch)
+    _quiet_duties(monkeypatch)
+    asked = _fake_gather(monkeypatch)
+    assert _run(root, Offers()) == 0 and asked
+    assert inputs.DEADLINE.get() is None
+
+
+def test_the_day_loop_stops_at_the_duty_reserve_before_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """S3-R41: the family loop runs to ``DEADLINE - DUTY_RESERVE_S``; the rest is deferred (no
+    file, no failure)."""
+    root = w3.make_root(tmp_path)
+    stub_legs(monkeypatch)
+    _quiet_duties(monkeypatch)
+    asked = _fake_gather(monkeypatch)
+    monkeypatch.setattr(inputs, "MONOTONIC", lambda: 1000.0 - DUTY_RESERVE_S)
+    token = inputs.DEADLINE.set(1000.0)
+    try:
+        assert _run(root, Offers()) == 0
+    finally:
+        inputs.DEADLINE.reset(token)
+    assert asked == [] and not _audit_dir(root).exists()
+    assert "audit_deferred_days=['" in capsys.readouterr().err
+
+
+def test_the_day_loop_runs_while_before_the_duty_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = w3.make_root(tmp_path)
+    stub_legs(monkeypatch)
+    _quiet_duties(monkeypatch)
+    asked = _fake_gather(monkeypatch)
+    monkeypatch.setattr(inputs, "MONOTONIC", lambda: 1000.0 - DUTY_RESERVE_S - 0.5)
+    token = inputs.DEADLINE.set(1000.0)
+    try:
+        assert _run(root, Offers()) == 0
+    finally:
+        inputs.DEADLINE.reset(token)
+    assert asked
 
 
 def test_delivery_send_accepts_prefixed_events() -> None:
@@ -588,6 +643,94 @@ def test_delivery_send_unknown_event_is_a_failed_delivery_not_a_crash() -> None:
     delivery = audit._Delivery(offers)
     delivery.send("NOT_AN_EVENT", "x")
     assert delivery.failed == 1 and offers.calls == []
+
+
+def _cli_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = w3.make_root(tmp_path)
+    w3.install(monkeypatch, root)
+    stub_legs(monkeypatch)
+    _fake_gather(monkeypatch)
+    return root
+
+
+_THREE: tuple[str, ...] = ("--family-id", "fam_a", "--family-id", "fam_b", "--family-id", "fam_c")
+
+
+def test_every_family_sees_one_absolute_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTATION M-REARM: ``DEADLINE.set(MONOTONIC() + 840)`` per family. The clock advances on
+    every read, so a per-family re-arm would give each family a different instant."""
+    root = _cli_world(tmp_path, monkeypatch)
+    _quiet_duties(monkeypatch)
+    ticks = iter(range(1000, 100_000))
+    monkeypatch.setattr(inputs, "MONOTONIC", lambda: float(next(ticks)))
+    seen: list[float | None] = []
+    real: Any = vars(audit)["gather_inputs"]
+
+    def spying(*a: Any, **k: Any) -> Any:
+        seen.append(inputs.DEADLINE.get())
+        return real(*a, **k)
+
+    monkeypatch.setattr(audit, "gather_inputs", spying)
+    argv = ["--data-root", str(root), *_THREE]
+    cli._main(argv, offer=Offers(), clock=lambda: w3.NOW_NS)
+    assert len(seen) >= 3 and None not in seen
+    assert len(set(seen)) == 1
+    assert inputs.DEADLINE.get() is None  # the CLI releases it
+
+
+def test_n_families_one_settlement_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MUTATION M-ONCE: the settlement duty once per family (N sends of one alert)."""
+    root = _cli_world(tmp_path, monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(audit, "_check_settlements", lambda *a, **k: calls.append("settle"))
+    monkeypatch.setattr(audit, "_check_stuck", lambda *a, **k: calls.append("stuck"))
+    monkeypatch.setattr(audit, "_check_live_proof", lambda *a, **k: calls.append("proof"))
+    argv = ["--data-root", str(root), *_THREE]
+    assert cli._main(argv, offer=Offers(), clock=lambda: w3.NOW_NS) == 0
+    assert calls.count("settle") == 1
+    assert calls.count("stuck") == 3 and calls.count("proof") == 3  # per-family duties stay
+
+
+def test_the_once_per_run_duty_failure_and_failed_delivery_fold_into_the_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _cli_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(audit, "_check_stuck", lambda *a, **k: None)
+    monkeypatch.setattr(audit, "_check_live_proof", lambda *a, **k: None)
+    argv = ["--data-root", str(root), "--family-id", "fam_a"]
+
+    def raising(*a: Any, **k: Any) -> None:
+        raise RuntimeError("settlement read failed")
+
+    monkeypatch.setattr(audit, "_check_settlements", raising)
+    assert cli._main(argv, offer=Offers(), clock=lambda: w3.NOW_NS) == 1
+
+    def sending(data_root: Path, today: dt.date, now_ns: int, delivery: Any) -> None:
+        delivery.send("CAPTURE_SETTLEMENT_MISSING", "station=LAX climate_day=2026-10-01")
+
+    monkeypatch.setattr(audit, "_check_settlements", sending)
+    offers = Offers(accept=False)
+    assert cli._main(argv, offer=offers, clock=lambda: w3.NOW_NS) == 1
+    assert offers.events.count("CAPTURE_SETTLEMENT_MISSING") == 1
+    assert cli._main(argv, offer=Offers(), clock=lambda: w3.NOW_NS) == 0
+
+
+def test_a_once_per_run_duty_that_reaches_the_deadline_is_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _cli_world(tmp_path, monkeypatch)
+    ran: list[str] = []
+    monkeypatch.setattr(audit, "_check_stuck", lambda *a, **k: None)
+    monkeypatch.setattr(audit, "_check_live_proof", lambda *a, **k: None)
+    monkeypatch.setattr(audit, "_check_settlements", lambda *a, **k: ran.append("settle"))
+    clock = iter([1000.0])  # arms DEADLINE at 1840; every later read is far past it
+    monkeypatch.setattr(inputs, "MONOTONIC", lambda: next(clock, 10_000.0))
+    monkeypatch.setattr(cli, "run_audit", lambda *a, **k: 0)
+    argv = ["--data-root", str(root), "--family-id", "fam_a"]
+    assert cli._main(argv, offer=Offers(), clock=lambda: w3.NOW_NS) == 1
+    assert ran == []
 
 
 def test_the_budget_is_the_unit_timeout_less_the_lock_wait_and_a_margin() -> None:

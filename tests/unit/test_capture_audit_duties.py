@@ -155,7 +155,9 @@ def test_a_missing_live_proof_is_stale(tmp_path: Path) -> None:
 
 
 def test_each_moved_check_isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """MUTATION: a moved check that is not isolated. A raising check must not stop the others."""
+    """MUTATION: a moved check that is not isolated. A raising check must not stop the others. The
+    settlement check is a once-per-run duty (S3-R41): ``run_once_duties`` runs it, ``run_audit`` the
+    two per-family checks."""
     root = w3.make_root(tmp_path)
     stub_legs(monkeypatch)
     _fake_gather(monkeypatch)
@@ -168,8 +170,10 @@ def test_each_moved_check_isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(audit, "_check_settlements", broken)
     monkeypatch.setattr(audit, "_check_stuck", lambda *a, **k: ran.append("stuck"))
     monkeypatch.setattr(audit, "_check_live_proof", lambda *a, **k: ran.append("live_proof"))
-    assert _run(root, Offers()) == 1  # a failed duty fails the run, loudly, after all of them ran
-    assert ran == ["settlement", "stuck", "live_proof"]
+    assert _run(root, Offers()) == 0  # the per-family duties are not the settlement check
+    once = audit.run_once_duties(root, TODAY, now_ns=w3.NOW_NS, offer=Offers())
+    assert once == 1  # a failed duty fails the run, loudly, after all of them ran
+    assert ran == ["stuck", "live_proof", "settlement"]
 
 
 @pytest.mark.parametrize("breaker", ["_check_settlements", "_check_stuck", "_check_live_proof"])
@@ -188,5 +192,7 @@ def test_each_duty_failure_leaves_the_other_two_running(
                 raise RuntimeError("boom")
 
         monkeypatch.setattr(audit, name, duty)
-    _run(root, Offers())
+    per_family = _run(root, Offers())
+    once = audit.run_once_duties(root, TODAY, now_ns=w3.NOW_NS, offer=Offers())
     assert ran == {"_check_settlements", "_check_stuck", "_check_live_proof"}
+    assert (per_family, once) == ((0, 1) if breaker == "_check_settlements" else (1, 0))

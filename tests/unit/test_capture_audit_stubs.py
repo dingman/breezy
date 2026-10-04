@@ -167,6 +167,11 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
             "(day: dt.date, family_id: str, cause: str, *, pre_capture: bool) -> AuditResult"
         ),
         "write_audit_file": "(data_root: Path, result: AuditResult, *, ts_ns: int) -> None",
+        # S3-R41: the once-per-run duties, run by the CLI inside its one DEADLINE; returns the
+        # number of failures (failed duties plus failed deliveries).
+        "run_once_duties": (
+            "(data_root: Path, today: dt.date, *, now_ns: int, offer: AlertOffer) -> int"
+        ),
         "run_audit": (
             "(data_root: Path, family_id: str, today: dt.date, *, now_ns: int, "
             "offer: AlertOffer) -> int"

@@ -9,10 +9,15 @@ read is cached, so a snapshot error surfaces later as that day's ERROR (``PRE_CA
 Then ``launch_window_guard``: a run whose worst case (``flock -w 600`` plus
 ``TimeoutStartSec=1500``) would meet [16:30Z, 17:10Z) defers (exit 0, no work).
 
+``DEADLINE`` is set ONCE here, before any family runs, and ``run_audit`` only reads it (S3-R41):
+every family sees the same absolute instant. The duties that belong to the run rather than to a
+family (the missing-settlement check) run once, after the family loop, inside the same deadline.
+
 Families are enumerated by construction: every ``evidence/capture/epoch/<family>.json`` plus each
-``--family-id`` given. The exit code is 1 on any ERROR day, failed day or failed delivery, decided
-after every write (``run_audit``). The default alert offer reports every alert undelivered (AUT-6's
-outbox is not wired, C9), so an audit that has something to say exits 1 and ``OnFailure=`` fires.
+``--family-id`` given. The exit code is 1 on any ERROR day, failed day, failed delivery or failed
+once-per-run duty, decided after every write (``run_audit``). The default alert offer reports every
+alert undelivered (AUT-6's outbox is not wired, C9), so an audit that has something to say exits 1
+and ``OnFailure=`` fires.
 """
 
 import argparse
@@ -24,10 +29,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final
 
-from breezy.analysis.capture_audit import run_audit
+from breezy.analysis import capture_audit_inputs
+from breezy.analysis.capture_audit import run_audit, run_once_duties
 from breezy.analysis.capture_audit_host import read_recorder_props
-from breezy.analysis.capture_audit_inputs import list_names
-from breezy.analysis.capture_audit_model import AuditInputError
+from breezy.analysis.capture_audit_inputs import DEADLINE
+from breezy.analysis.capture_audit_io import list_names
+from breezy.analysis.capture_audit_model import AUDIT_WORK_BUDGET_S, AuditInputError
 from breezy.analysis.capture_settlement import AlertOffer
 from breezy.persistence.autonomy.capture_epoch import epoch_relative_path
 from breezy.persistence.autonomy.capture_schedule import launch_window_guard
@@ -82,12 +89,23 @@ def _main(argv: Sequence[str] | None, *, offer: AlertOffer, clock: Callable[[], 
         sys.stderr.write("capture audit deferred: the run would meet the launch window\n")
         return 0
     today = dt.datetime.fromtimestamp(now_ns // _NS, tz=dt.UTC).date()
-    families = families_by_construction(data_root, args.families)
+    token = DEADLINE.set(capture_audit_inputs.MONOTONIC() + AUDIT_WORK_BUDGET_S)  # once (S3-R41)
+    try:
+        return _run_families(data_root, args.families, today, now_ns, offer)
+    finally:
+        DEADLINE.reset(token)
+
+
+def _run_families(
+    data_root: Path, explicit: Sequence[str], today: dt.date, now_ns: int, offer: AlertOffer
+) -> int:
+    families = families_by_construction(data_root, explicit)
     if not families:
         sys.stderr.write("capture audit: no family to audit (no epoch file, no --family-id)\n")
         return 0
     codes = [run_audit(data_root, f, today, now_ns=now_ns, offer=offer) for f in families]
-    return 1 if any(codes) else 0
+    once_failures = run_once_duties(data_root, today, now_ns=now_ns, offer=offer)
+    return 1 if any(codes) or once_failures else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
