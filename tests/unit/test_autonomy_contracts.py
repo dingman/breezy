@@ -239,9 +239,13 @@ def test_resolver_consumers_contract_forbids_every_live_package_strictly() -> No
 def test_contract_lists_are_final_at_the_last_seam_a_module() -> None:
     """8d: the resolver (sending and shadow) is the last seam A module. Contract (b) names every
     autonomy module, (c) every one but the pyarrow-reaching ones, and the resolver is in (b)
-    only. The AUT-1 consumer contract is untouched (it names the resolver as forbidden)."""
+    only. AUT-1's ``NAUTILUS_PERMITTED`` capture modules persist Nautilus custom data, so they are
+    exempt from contract (b) and absent from (c) too. The AUT-1 consumer contract is untouched
+    (it names the resolver as forbidden)."""
     contract_b, contract_c = _contract_sources()
-    existing = _existing_modules()
+    existing = _existing_modules() - NAUTILUS_PERMITTED
+    assert NAUTILUS_PERMITTED.isdisjoint(contract_b)
+    assert NAUTILUS_PERMITTED.isdisjoint(contract_c)
     resolver = f"{AUTONOMY_PACKAGE}.resolver"
     assert contract_b == existing
     assert contract_c == existing - PYARROW_REACHING
