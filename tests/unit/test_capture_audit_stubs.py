@@ -50,6 +50,43 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
         "leg_n": f"({_INP}) -> LegResult",
         "positive_control": f"({_INP}) -> LegResult",
     },
+    # -- AUT-1 WP5 stage 3a (design r3 section 3): the stage-3 stubs. S1 (heal), S2 (live proof,
+    # AUT-6 contract) fill them in parallel; a signature change is a deliberate edit of this table.
+    f"{_AN}.capture_heal": {
+        "plan_heals": (
+            "(kills: Sequence[RecorderJournalEntry], now_ns: int) -> tuple[Mapping[str, Any], ...]"
+        ),
+    },
+    f"{_AN}.capture_heal_io": {
+        "run_heal_duty": "(data_root: Path, *, now_ns: int, heal_deadline: float) -> int",
+    },
+    f"{_AN}.capture_live_proof": {
+        "build_live_proof": (
+            "(data_root: Path, family_id: str, asof: dt.date) -> Mapping[str, Any]"
+        ),
+    },
+    f"{_AN}.capture_live_proof_cli": {
+        "main": "(argv: Sequence[str] | None=None) -> int",
+    },
+    f"{_AN}.capture_aut6_contract": {
+        "delivered_events": ("(data_root: Path, first: dt.date, last: dt.date) -> frozenset[str]"),
+    },
+}
+
+#: The frozen constants of the stage-3 stub modules (design S3-R29, S3-R42, S3-R30), by module.
+#: ``HEAL_BUDGET_S`` and ``HEAL_JOURNAL_DAYS`` are read by S3 and pinned against the unit budget.
+EXPECTED_CONSTANTS: Final[dict[str, dict[str, object]]] = {
+    f"{_AN}.capture_heal": {"HEAL_BUDGET_S": 180, "HEAL_JOURNAL_DAYS": 3},
+    f"{_AN}.capture_aut6_contract": {
+        "DELIVERY_SCHEMA": "alert_delivery/v1",
+        "NOTIFIER_MARKER_PATTERN": r"\A(?P<unit>.+)__(?P<inv>[0-9a-f]{32})\.delivered\.json\Z",
+        "NBP_MISSED_MARKER_PATTERN": (
+            r"\ANBP_CYCLE_MISSED__(?P<cycle_ns>\d{1,20})\.delivered\.json\Z"
+        ),
+        "DELIVERY_RECORD_NAME_PATTERN": (
+            r"\A(?P<ts_ns>\d{1,20})_(?P<writer>[a-z0-9_]{1,64})_d\.json\Z"
+        ),
+    },
 }
 
 #: W3 is built (stage 2b): the EXACT public surface of each module that now defines a W3 name, so
@@ -65,7 +102,15 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
         "gather_inputs": (
             "(data_root: Path, family_id: str, day: dt.date, *, now_ns: int) -> AuditInputs"
         ),
+    },
+    # S3-R44: the two single-read helpers moved out of the inputs module (which re-exports
+    # ``list_names``) so the AUT-6 contract module can read without importing ``inputs``.
+    f"{_AN}.capture_audit_io": {
         "list_names": "(root: Path, rel: Sequence[str]) -> list[str]",
+        "read_file": (
+            "(root: Path, rel: Sequence[str], name: str, "
+            "policy: ReadPolicy=ReadPolicy.STRICT) -> bytes | None"
+        ),
     },
     f"{_AN}.capture_audit_tape": {
         "catalog_instruments": "(catalog_root: Path, day: dt.date) -> frozenset[str]",
@@ -138,6 +183,7 @@ W3_PINNED: Final[dict[str, dict[str, str]]] = {
 #: Names the inputs module still exports although another module defines them.
 W3_REEXPORTED: Final[tuple[str, ...]] = (
     "RecorderCatalogTape",
+    "list_names",
     "read_exec_view",
     "write_scan_cache",
 )
@@ -150,6 +196,7 @@ RAISED_FLOORS: Final[dict[str, int]] = {
     f"{_AN}.capture_audit_log_markers": 13,
     f"{_AN}.capture_audit_stream_legs": 110,
     f"{_AN}.capture_audit_inputs": 250,
+    f"{_AN}.capture_audit_io": 10,
     f"{_AN}.capture_audit_tape": 80,
     f"{_AN}.capture_audit_exec_view": 65,
     f"{_AN}.capture_audit_cache": 70,
@@ -169,7 +216,15 @@ W2_REAL: Final[frozenset[str]] = frozenset(
         f"{_AN}.capture_audit_stream_legs",
     }
 )
-REAL_MODULES: Final[frozenset[str]] = frozenset({f"{_AN}.capture_audit_fill_legs"}) | W2_REAL
+#: Stage-3 stream S1 (heal) and S2 (live proof, AUT-6 contract) each add their modules to THEIR OWN
+#: line below and to no other (S3-R28, S3-R43), so the two merge without a conflict. 3c verifies the
+#: union only.
+S1_REAL: Final[frozenset[str]] = frozenset()
+#: (keep the two lines above and below apart: they are one-line edits owned by different streams)
+S2_REAL: Final[frozenset[str]] = frozenset()
+REAL_MODULES: Final[frozenset[str]] = (
+    frozenset({f"{_AN}.capture_audit_fill_legs"}) | W2_REAL | S1_REAL | S2_REAL
+)
 STUB_MODULES: Final[list[str]] = sorted(set(EXPECTED) - REAL_MODULES)
 
 
@@ -311,3 +366,76 @@ def test_the_w2_modules_are_real_implementations(module: str) -> None:
         raises = [n for n in body if isinstance(n, ast.Raise)]
         assert not (len(body) == 1 and raises), f"{name} is still a stub"
     assert "NotImplementedError" not in _source(module).read_text(encoding="utf-8")
+
+
+# -- stage 3a (design r3 section 4, S3-R29, S3-R31, S3-R42, S3-R43, S3-R44) -----------------------
+
+_STAGE3_STUBS: Final[tuple[str, ...]] = (
+    f"{_AN}.capture_heal",
+    f"{_AN}.capture_heal_io",
+    f"{_AN}.capture_live_proof",
+    f"{_AN}.capture_live_proof_cli",
+    f"{_AN}.capture_aut6_contract",
+)
+
+
+@pytest.mark.parametrize("module", sorted(EXPECTED_CONSTANTS))
+def test_the_stage_3_constants_have_their_frozen_values(module: str) -> None:
+    mod = importlib.import_module(module)
+    for name, want in EXPECTED_CONSTANTS[module].items():
+        got = getattr(mod, name)
+        assert (got.pattern if hasattr(got, "pattern") else got) == want, name
+
+
+def test_the_stage_3_stub_modules_are_all_stubs_until_a_stream_lands_them() -> None:
+    assert set(_STAGE3_STUBS) <= set(EXPECTED)
+    assert set(_STAGE3_STUBS) - REAL_MODULES == set(_STAGE3_STUBS)  # none is landed yet
+
+
+def test_the_real_modules_union_is_the_four_lines() -> None:
+    assert REAL_MODULES == (
+        frozenset({f"{_AN}.capture_audit_fill_legs"}) | W2_REAL | S1_REAL | S2_REAL
+    )
+    assert S1_REAL.isdisjoint(S2_REAL)
+    lines = Path(__file__).read_text(encoding="utf-8").splitlines()
+    owned = [i for i, text in enumerate(lines) if text.startswith(("S1_REAL:", "S2_REAL:"))]
+    assert len(owned) == 2 and owned[1] - owned[0] >= 2  # separate, non-adjacent lines (S3-R43)
+
+
+def test_heal_budget_fits_the_journal_reads_and_the_audit_work_budget() -> None:
+    """S3-R42/R49: ``HEAL_JOURNAL_DAYS x JOURNAL_TIMEOUT_S + 30 <= HEAL_BUDGET_S <=
+    AUDIT_EXEC_TIMEOUT_S - 60 - 600``: 3 x 30 + 30 = 120 <= 180 <= 810."""
+    from breezy.analysis.capture_audit_host import JOURNAL_TIMEOUT_S
+    from breezy.analysis.capture_audit_model import AUDIT_EXEC_TIMEOUT_S
+    from breezy.analysis.capture_heal import HEAL_BUDGET_S, HEAL_JOURNAL_DAYS
+
+    assert HEAL_JOURNAL_DAYS * JOURNAL_TIMEOUT_S + 30 <= HEAL_BUDGET_S
+    assert HEAL_BUDGET_S <= AUDIT_EXEC_TIMEOUT_S - 60 - 600 == 810
+
+
+def test_list_names_lives_in_capture_audit_io_and_inputs_re_exports_it() -> None:
+    io = importlib.import_module(f"{_AN}.capture_audit_io")
+    inputs = importlib.import_module(f"{_AN}.capture_audit_inputs")
+    assert inputs.list_names is io.list_names
+    assert "list_names" not in {name for name in _defs(f"{_AN}.capture_audit_inputs")}
+    assert not hasattr(inputs, "_read_file")  # renamed ``read_file``, now in the io module
+
+
+def test_the_stage_3_stub_rows_hold_the_reviewed_scopes() -> None:
+    rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
+    for name in ("capture_heal", "capture_heal_io", "capture_live_proof", "capture_live_proof_cli"):
+        assert rows[f"{_AN}.{name}"].writes == ("*",), name
+    for name in ("capture_aut6_contract", "capture_audit_io"):
+        row = rows[f"{_AN}.{name}"]
+        assert not row.writes and not row.write_imports and not row.argvs, name
+
+
+@pytest.mark.xfail(
+    strict=True, reason="S3-R31: the heal and live-proof rows are narrowed by 3c, not before"
+)
+def test_heal_and_live_proof_write_rows_are_narrowed() -> None:
+    """XFAILs (strict) while the rows hold ``"*"``; 3c narrows every row and removes the marker.
+    A strict xfail that starts passing fails the suite, so it cannot be forgotten."""
+    rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
+    for name in ("capture_heal", "capture_heal_io", "capture_live_proof", "capture_live_proof_cli"):
+        assert "*" not in rows[f"{_AN}.{name}"].writes, name

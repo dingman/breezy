@@ -74,6 +74,8 @@ def test_constants_have_the_design_values() -> None:
     assert model.LIVE_PROOF_MAX_AGE_H == 26
     assert model.PC_MIN_OVERLAP_S == 1200
     assert model.AUDIT_WORK_BUDGET_S == 840 == 1500 - 600 - 60
+    assert model.AUDIT_EXEC_TIMEOUT_S == 1470  # S3-R50: the audit ExecStart ``timeout -k 5 1470``
+    assert model.AUDIT_MARGIN_S == 60 and model.DUTY_RESERVE_S == 60  # S3-R41
     assert model.AUDIT_DIR_REL == "evidence/capture/audit"
     assert model.AUDIT_CACHE_DIR == "cache/capture_audit"
 
@@ -416,3 +418,10 @@ def test_guard_veto_reasons_are_the_capture_guards_own_refusal_reasons() -> None
         guard.REASON_INSTRUMENT_VANISHED,
     }
     assert not guard_reasons & fq_own
+
+
+def test_exec_timeout_fits_the_unit_budget_with_the_lint_pre_line_bound() -> None:
+    """S3-R48/R50: pre lines 5 + 5 + 15, the ExecStart ``timeout -k 5 1470`` -> 25 + 5 + 1470 =
+    1500, exactly ``TimeoutStartSec``."""
+    pre_line_bound_s, kill_after_s, start_timeout_s = 25, 5, 1500
+    assert pre_line_bound_s + kill_after_s + model.AUDIT_EXEC_TIMEOUT_S == start_timeout_s

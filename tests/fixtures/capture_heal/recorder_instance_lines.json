@@ -1,0 +1,7 @@
+{
+  "source": "real node-log lines (trade node boot 2026-09-04); line 2 is the use_instance_id decoy",
+  "lines": [
+    "\u001b[1m2026-09-04T17:23:25.313491984Z\u001b[0m [INFO] BREEZY-L001.TradingNode: instance_id: b3336cb3-3a2e-46f9-a528-ee8064ba1c5c\u001b[0m",
+    "\u001b[1m2026-09-04T17:23:25.320324043Z\u001b[0m \u001b[94m[INFO] BREEZY-L001.MessageBus: config.use_instance_id=False\u001b[0m"
+  ]
+}

@@ -1,0 +1,1 @@
+{"action":"poll_reset","alert":"offered","cause":"poll_hang","decided_by":"nbm_quantile_actor","detected_ns":1791100000000000000,"healed_ns":1791100300000000000,"injected":false,"observation_sha256":"11869036d6ea40412c16fd9ec6476110c9b1d6b5c1c7d62b8fe3a3011d306ee4","unit":"in-node:nbm_quantile_actor"}

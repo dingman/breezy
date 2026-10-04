@@ -226,6 +226,38 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
         min_calls=70,
     ),
     AuthorityRow("breezy.analysis.capture_audit_cli", min_calls=22),
+    # -- AUT-1 WP5 stage 3a (design r3 section 6, S3-R31, S3-R44). The two single-read helpers moved
+    # out of the inputs module: a pure reader. --
+    AuthorityRow("breezy.analysis.capture_audit_io", min_calls=10),
+    # -- Stage-3 stubs. The heal and live-proof rows are PROVISIONAL: every write scope is ``"*"``
+    # at ``min_calls=1`` until S1 and S2 land and 3c narrows each row to its reviewed functions and
+    # raises its floor; ``test_heal_and_live_proof_write_rows_are_narrowed`` (strict xfail) turns
+    # green then (S3-R31). The AUT-6 contract module only reads. --
+    AuthorityRow(
+        "breezy.analysis.capture_heal",
+        writes=("*",),
+        write_imports=frozenset({"write_once", "ensure_dir"}),
+        min_calls=1,
+    ),
+    AuthorityRow(
+        "breezy.analysis.capture_heal_io",
+        writes=("*",),
+        write_imports=frozenset({"write_once", "ensure_dir"}),
+        min_calls=1,
+    ),
+    AuthorityRow(
+        "breezy.analysis.capture_live_proof",
+        writes=("*",),
+        write_imports=frozenset({"write_once", "replace_atomic", "ensure_dir"}),
+        min_calls=1,
+    ),
+    AuthorityRow(
+        "breezy.analysis.capture_live_proof_cli",
+        writes=("*",),
+        write_imports=frozenset({"write_once", "replace_atomic", "ensure_dir"}),
+        min_calls=1,
+    ),
+    AuthorityRow("breezy.analysis.capture_aut6_contract", min_calls=1),
 )
 
 

@@ -27,7 +27,6 @@ Layout below the data root: ``logs/`` (node logs), ``derived/capture_stream/poly
 import datetime as dt
 import json
 import logging
-import os
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -68,6 +67,7 @@ from breezy.analysis.capture_audit_input_types import (
     StallRecord,
     StreamSummary,
 )
+from breezy.analysis.capture_audit_io import list_names, read_file
 from breezy.analysis.capture_audit_log_markers import MarkerParser
 from breezy.analysis.capture_audit_model import AuditInputError
 from breezy.analysis.capture_audit_replay import BootReplay
@@ -97,14 +97,7 @@ from breezy.persistence.autonomy.capture_reader import (
 )
 from breezy.persistence.autonomy.capture_records import SOURCES
 from breezy.persistence.autonomy.capture_stream import capture_root
-from breezy.persistence.autonomy.single_read import (
-    ReadPolicy,
-    SingleReadReason,
-    SingleReadRefused,
-    open_root,
-    read_once_at,
-    walk_dirs,
-)
+from breezy.persistence.autonomy.single_read import ReadPolicy, SingleReadRefused
 from breezy.registry.sites import default_registry
 from breezy.runtime.capture_recorder_hook_cli import STALL_RELATIVE, STALL_SUFFIX
 
@@ -131,7 +124,6 @@ NOTIFY_REL: Final[tuple[str, ...]] = ("evidence", "alerts", "notify")
 _NS: Final[int] = 1_000_000_000
 _DAY_NS: Final[int] = 86_400 * _NS
 _HEAD_EVENTS: Final[int] = 5_000
-_MAX_FILE_BYTES: Final[int] = 64 * 1024 * 1024
 _DEADLINE_CHECK_EVERY: Final[int] = 65_536
 _ROTATION_HOUR_UTC: Final[int] = 9
 #: The NBP model cycle hours (``ingest.nbm_quantile_actor.DEFAULT_NBM_QUANTILE_CYCLE_HOURS``),
@@ -174,52 +166,6 @@ class _DeadlineSink:
         self._events += 1
         if self._events % _DEADLINE_CHECK_EVERY == 0:
             _check_deadline()
-
-
-# -- single-read helpers -------------------------------------------------------------------------
-
-
-def _read_file(
-    root: Path, rel: Sequence[str], name: str, policy: ReadPolicy = ReadPolicy.STRICT
-) -> bytes | None:
-    """``name`` below ``root/rel`` through the ``O_NOFOLLOW`` walk, or ``None`` when absent. Any
-    other refusal (a symlink, a foreign owner, an oversize file) is raised."""
-    rootfd = open_root(root)
-    try:
-        try:
-            dirfd = walk_dirs(rootfd, rel)
-        except SingleReadRefused as exc:
-            if exc.reason is SingleReadReason.NOT_FOUND:
-                return None
-            raise
-    finally:
-        os.close(rootfd)
-    try:
-        return read_once_at(dirfd, name, max_bytes=_MAX_FILE_BYTES, policy=policy)
-    except SingleReadRefused as exc:
-        if exc.reason is SingleReadReason.NOT_FOUND:
-            return None
-        raise
-    finally:
-        os.close(dirfd)
-
-
-def list_names(root: Path, rel: Sequence[str]) -> list[str]:
-    """The entry names of ``root/rel`` (empty when it is absent), through the nofollow walk."""
-    rootfd = open_root(root)
-    try:
-        try:
-            dirfd = walk_dirs(rootfd, rel)
-        except SingleReadRefused as exc:
-            if exc.reason is SingleReadReason.NOT_FOUND:
-                return []
-            raise
-    finally:
-        os.close(rootfd)
-    try:
-        return sorted(os.listdir(dirfd))
-    finally:
-        os.close(dirfd)
 
 
 def _day_bounds_ns(day: dt.date) -> tuple[int, int]:
@@ -438,7 +384,7 @@ def _funnel_rows(data_root: Path, boot_days: Iterable[dt.date]) -> tuple[FunnelR
     rows: list[FunnelRow] = []
     for boot_day in sorted(set(boot_days)):
         try:
-            raw = _read_file(data_root, DECISIONS_REL, f"fq_funnel_{boot_day.isoformat()}.jsonl")
+            raw = read_file(data_root, DECISIONS_REL, f"fq_funnel_{boot_day.isoformat()}.jsonl")
         except SingleReadRefused as exc:
             raise AuditInputError("funnel_missing", exc.reason.value) from None
         if raw is None:
@@ -513,7 +459,7 @@ def _stall_records(data_root: Path, day: dt.date) -> tuple[StallRecord, ...]:
             if match is None:
                 continue
             try:
-                raw = _read_file(data_root, rel, name)
+                raw = read_file(data_root, rel, name)
                 body = json.loads(raw or b"")
                 found.append(
                     StallRecord(str(body["invocation_id"]), int(body["detected_ns"]), stamp)
@@ -534,7 +480,7 @@ def _notifier_proofs(data_root: Path, day: dt.date) -> tuple[NotifierProof, ...]
                 continue
             delivered = False
             try:
-                body = json.loads(_read_file(data_root, rel, name, ReadPolicy.REPO) or b"")
+                body = json.loads(read_file(data_root, rel, name, ReadPolicy.REPO) or b"")
                 delivered = isinstance(body, dict) and body.get("delivered") is True
             except (SingleReadRefused, ValueError):
                 delivered = False  # an unreadable marker proves no delivery

@@ -21,9 +21,12 @@ from breezy.persistence.autonomy.veto import VetoReason
 __all__ = [
     "AUDIT_CACHE_DIR",
     "AUDIT_DIR_REL",
+    "AUDIT_EXEC_TIMEOUT_S",
+    "AUDIT_MARGIN_S",
     "AUDIT_SCHEMA",
     "AUDIT_WORK_BUDGET_S",
     "BACKFILL_DAYS",
+    "DUTY_RESERVE_S",
     "ERROR_CAUSES",
     "FLUSH_WINDOW_S",
     "GUARD_VETO_REASONS",
@@ -74,6 +77,16 @@ PC_MIN_OVERLAP_S: Final[int] = 1200
 #: 1500 s unit timeout, less the 600 s ``flock -w`` wait (E-7e(f)), less a 60 s margin; measured
 #: from process start.
 AUDIT_WORK_BUDGET_S: Final[int] = 1500 - 600 - 60
+#: The audit ExecStart's ``timeout -k 5 1470`` (S3-R48, S3-R50): the lint's pre-line bound 25, the
+#: kill-after 5 and this value sum to ``TimeoutStartSec`` 1500. The in-process deadline derives from
+#: it: ``min(lock_acquired + AUDIT_WORK_BUDGET_S,
+#: exec_start + AUDIT_EXEC_TIMEOUT_S - AUDIT_MARGIN_S)``.
+AUDIT_EXEC_TIMEOUT_S: Final[int] = 1470
+#: The margin kept before the ExecStart ``timeout`` (S3-R41).
+AUDIT_MARGIN_S: Final[int] = 60
+#: The last seconds of the work budget kept for the once-per-run duties: the family loop stops
+#: starting days ``DUTY_RESERVE_S`` before ``DEADLINE`` (S3-R41).
+DUTY_RESERVE_S: Final[int] = 60
 
 MetricValue = int | float | str
 
