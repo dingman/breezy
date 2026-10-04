@@ -22,7 +22,7 @@ import breezy.persistence.autonomy.chain as chain_mod
 import breezy.persistence.autonomy.schemas as schemas_mod
 from breezy.persistence import live_orders_gate
 from breezy.persistence.autonomy import paths, pins
-from breezy.persistence.autonomy.canonical import canonical_json, sha256_hex
+from breezy.persistence.autonomy.canonical import sha256_hex
 from breezy.persistence.autonomy.chain import (
     ChainBroken,
     VerifiedVenueChain,
@@ -87,33 +87,32 @@ def _row(**over: Any) -> TransitionRow:
     return TransitionRow(**base)
 
 
+def _with_id(row: TransitionRow) -> TransitionRow:
+    return replace(row, transition_id=row.computed_transition_id())
+
+
 def _sealed_chain(n: int, venue: str = VENUE) -> list[TransitionRow]:
-    """``n`` rows linked from the venue genesis, ids distinct, ts increasing."""
+    """``n`` rows of one family linked from the venue genesis, ts increasing."""
     rows: list[TransitionRow] = []
     prev = genesis(venue)
     for i in range(1, n + 1):
-        unsealed = _row(
-            venue=venue,
-            family_prior_seq=max(i - 1, 0),
-            transition_id=sha256_hex(f"id-{venue}-{i}".encode()),
-            ts_ns=T0 + i,
-            expected_prior_seq=i - 1,
+        unsealed = _with_id(
+            _row(venue=venue, family_prior_seq=i - 1, ts_ns=T0 + i, expected_prior_seq=i - 1)
         )
-        sealed = replace(
-            unsealed, seq=i, venue_seq=i, prev_transition_hash=prev, transition_hash=None
-        )
+        sealed = replace(unsealed, seq=i, venue_seq=i, prev_transition_hash=prev)
         sealed = replace(sealed, transition_hash=transition_hash(sealed, prev))
         rows.append(sealed)
         prev = sealed.transition_hash or ""
     return rows
 
 
-def _rehash(rows: list[TransitionRow]) -> list[TransitionRow]:
-    """Recompute every link so only the deliberately broken property remains."""
+def _rehash(rows: list[TransitionRow], *, fix_ids: bool = True) -> list[TransitionRow]:
+    """Recompute every link (and id) so only the deliberately broken property remains."""
     out: list[TransitionRow] = []
     prev = genesis(rows[0].venue)
     for row in rows:
-        fixed = replace(row, prev_transition_hash=prev, transition_hash=None)
+        fixed = _with_id(row) if fix_ids else row
+        fixed = replace(fixed, prev_transition_hash=prev, transition_hash=None)
         fixed = replace(fixed, transition_hash=transition_hash(fixed, prev))
         out.append(fixed)
         prev = fixed.transition_hash or ""
@@ -155,7 +154,7 @@ def test_canonical_row_excludes_seq_and_both_hash_columns() -> None:
 
 def test_canonical_row_covers_every_other_column() -> None:
     """Changing any one remaining column changes the bytes (nothing is silently unhashed)."""
-    base = _sealed_chain(1)[0]
+    base = replace(_sealed_chain(1)[0], policy_ruling_id="RULING_y", policy_ruling_sha256=SHA_B)
     reference = canonical_row(base)
     variants: dict[str, Any] = {
         "family_id": "other_family",
@@ -228,7 +227,7 @@ def test_transition_id_excludes_expected_prior_seq() -> None:
     ],
 )
 def test_transition_id_includes_each_y9_field(field: str, value: Any) -> None:
-    base = _row()
+    base = _row(policy_ruling_id="RULING_y", policy_ruling_sha256=SHA_B)
     assert replace(base, **{field: value}).computed_transition_id() != base.computed_transition_id()
 
 
@@ -239,7 +238,9 @@ def test_transition_id_sorts_cause_verdict_ids() -> None:
 
 
 def test_compute_transition_id_matches_row_method_and_is_hex() -> None:
-    row = _row(cause_verdict_ids=(SHA_B, SHA_A), policy_ruling_sha256=SHA_A)
+    row = _row(
+        cause_verdict_ids=(SHA_B, SHA_A), policy_ruling_id="RULING_x", policy_ruling_sha256=SHA_A
+    )
     direct = compute_transition_id(
         venue=row.venue,
         family_id=row.family_id,
@@ -295,10 +296,34 @@ def _decreasing_ts(rows: list[TransitionRow]) -> list[TransitionRow]:
     return [rows[0], replace(rows[1], ts_ns=rows[0].ts_ns - 1), rows[2]]
 
 
+def _wrong_family_prior_seq(rows: list[TransitionRow]) -> list[TransitionRow]:
+    return [rows[0], rows[1], replace(rows[2], family_prior_seq=0)]
+
+
+def _family_prior_seq_skips_a_row(rows: list[TransitionRow]) -> list[TransitionRow]:
+    return [rows[0], replace(rows[1], family_prior_seq=5), rows[2]]
+
+
 @pytest.mark.parametrize(
     "corrupt",
-    [_gap, _starts_at_two, _renumbered, _foreign_venue, _decreasing_ts],
-    ids=["gap", "starts_at_two", "renumbered", "foreign_venue", "decreasing_ts"],
+    [
+        _gap,
+        _starts_at_two,
+        _renumbered,
+        _foreign_venue,
+        _decreasing_ts,
+        _wrong_family_prior_seq,
+        _family_prior_seq_skips_a_row,
+    ],
+    ids=[
+        "gap",
+        "starts_at_two",
+        "renumbered",
+        "foreign_venue",
+        "decreasing_ts",
+        "wrong_family_prior_seq",
+        "family_prior_seq_skips_a_row",
+    ],
 )
 def test_verify_venue_chain_requires_contiguous_seq_single_venue_monotone_ts(
     corrupt: Any,
@@ -308,6 +333,33 @@ def test_verify_venue_chain_requires_contiguous_seq_single_venue_monotone_ts(
     with pytest.raises(ChainBroken) as caught:
         verify_venue_chain(broken, VENUE)
     assert caught.value.reason is RefusalReason.CHAIN_BROKEN
+
+
+def test_chain_tracks_family_prior_seq_per_family() -> None:
+    """A second family's first row names 0, not the venue's previous row (ARCH l.417)."""
+    first = _with_id(_row(ts_ns=T0 + 1))
+    other = _with_id(
+        _row(family_id="pm_us_crh_v4", family_prior_seq=0, ts_ns=T0 + 2, expected_prior_seq=1)
+    )
+    again = _with_id(_row(family_prior_seq=1, ts_ns=T0 + 3, expected_prior_seq=2))
+    rows = _rehash([first, other, again])
+    rows = [replace(r, seq=i + 1, venue_seq=i + 1) for i, r in enumerate(rows)]
+    rows = _rehash(rows)
+    assert verify_venue_chain(rows, VENUE).head_venue_seq == 3
+    wrong = _rehash([first, other, replace(again, family_prior_seq=2)])
+    wrong = _rehash([replace(r, seq=i + 1, venue_seq=i + 1) for i, r in enumerate(wrong)])
+    with pytest.raises(ChainBroken) as caught:
+        verify_venue_chain(wrong, VENUE)
+    assert caught.value.venue_seq == 3
+
+
+def test_verify_venue_chain_refuses_a_stored_transition_id_that_is_not_the_computed_one() -> None:
+    rows = _sealed_chain(3)
+    rows[1] = replace(rows[1], transition_id=SHA_A)
+    rows = _rehash(rows, fix_ids=False)  # links and hashes are consistent; only the id lies
+    with pytest.raises(ChainBroken) as caught:
+        verify_venue_chain(rows, VENUE)
+    assert caught.value.venue_seq == 2
 
 
 def test_verify_venue_chain_allows_equal_timestamps() -> None:
@@ -521,6 +573,10 @@ def test_transition_row_refuses_a_float_quantity() -> None:
         ("policy_ruling_sha256", "abc", WireRefusalReason.BAD_VALUE),
         ("effective_launch_date", "2026-13-40", WireRefusalReason.BAD_VALUE),
         ("effective_launch_date", "2026-1-5", WireRefusalReason.BAD_VALUE),
+        ("cause_verdict_ids", (SHA_A, SHA_A), WireRefusalReason.BAD_VALUE),
+        ("voids_transition_ids", (SHA_B, SHA_B), WireRefusalReason.BAD_VALUE),
+        ("policy_ruling_id", "RULING_x", WireRefusalReason.BAD_VALUE),
+        ("policy_ruling_sha256", SHA_A, WireRefusalReason.BAD_VALUE),
         ("carried_counters", "{not json", WireRefusalReason.MALFORMED_JSON),
         ("carried_counters", '{"a": 1}', WireRefusalReason.BAD_VALUE),  # not canonical bytes
         ("carried_counters", '{"a":1.5}', WireRefusalReason.FLOAT_TOKEN),
@@ -532,6 +588,34 @@ def test_transition_row_construction_refuses_bad_domain(
     with pytest.raises(WireRefused) as caught:
         _row(**{field: value})
     assert caught.value.reason is reason
+
+
+@pytest.mark.parametrize("name", ["family_prior_seq", "expected_prior_seq"])
+def test_prior_seq_columns_are_required_with_no_default(name: str) -> None:
+    base: dict[str, Any] = {
+        "venue": VENUE,
+        "family_id": FAMILY,
+        "to_state": State.CHAMPION,
+        "kind": Kind.BOOTSTRAP,
+        "transition_id": SHA_A,
+        "decided_by": DecidedBy.ENGINE,
+        "invocation_id": INVOCATION,
+        "engine_code_sha": SHA_B,
+        "ts_ns": T0,
+        "family_prior_seq": 0,
+        "expected_prior_seq": 0,
+    }
+    TransitionRow(**base)
+    del base[name]
+    with pytest.raises(TypeError):
+        TransitionRow(**base)
+
+
+def test_policy_ruling_pair_is_both_empty_or_both_set() -> None:
+    assert _row().policy_ruling_id == ""  # the C5 fallback pair
+    assert (
+        _row(policy_ruling_id="RULING_x", policy_ruling_sha256=SHA_A).policy_ruling_sha256 == SHA_A
+    )
 
 
 def test_transition_row_is_frozen_and_slotted() -> None:
@@ -611,9 +695,9 @@ def test_live_orders_refusal_mirrors_live_orders_reason() -> None:
 
 
 def test_local_patterns_equal_paths_patterns() -> None:
-    assert schemas_mod.VENUE_RE.pattern == paths.VENUE_RE.pattern
-    assert schemas_mod.FAMILY_RE.pattern == paths.FAMILY_RE.pattern
-    assert schemas_mod.JOURNAL_KIND_RE.pattern == paths.JOURNAL_KIND_RE.pattern
+    for name in ("VENUE_RE", "FAMILY_RE", "JOURNAL_KIND_RE"):
+        local, original = getattr(schemas_mod, name), getattr(paths, name)
+        assert (local.pattern, local.flags) == (original.pattern, original.flags), name
 
 
 # --- ExportTrailer ---------------------------------------------------------------------------
@@ -686,6 +770,48 @@ def test_export_trailer_from_wire_refuses_bad_values(
     with pytest.raises(WireRefused) as caught:
         ExportTrailer.from_wire(wire)
     assert caught.value.reason is reason
+
+
+@pytest.mark.parametrize(
+    "heads",
+    [
+        (("probe",),),
+        (5,),
+        ("ab",),
+        (("probe", "x"),),
+        (("probe", JournalHead(1, SHA_A), "extra"),),
+        "ab",
+        [("probe", JournalHead(1, SHA_A))],
+        None,
+    ],
+    ids=[
+        "short_pair",
+        "int",
+        "two_char_str",
+        "head_not_a_head",
+        "long_pair",
+        "str",
+        "list",
+        "none",
+    ],
+)
+def test_export_trailer_refuses_a_malformed_journal_heads_value(heads: Any) -> None:
+    with pytest.raises(WireRefused):
+        ExportTrailer(
+            venue=VENUE, venue_seq=1, chain_head=SHA_A, export_seq=0, evidence_journal_heads=heads
+        )
+
+
+def test_export_trailer_refuses_duplicate_journal_kinds() -> None:
+    pair = ("probe", JournalHead(1, SHA_A))
+    with pytest.raises(WireRefused):
+        ExportTrailer(
+            venue=VENUE,
+            venue_seq=1,
+            chain_head=SHA_A,
+            export_seq=0,
+            evidence_journal_heads=(pair, pair),
+        )
 
 
 def test_export_trailer_from_wire_refuses_unknown_and_missing_keys() -> None:
@@ -880,15 +1006,72 @@ def test_chain_exports_the_planned_surface() -> None:
         assert hasattr(chain_mod, name), name
 
 
-def test_canonical_json_of_a_row_is_stable_bytes() -> None:
-    """A golden: the canonical row of a fixed row never silently changes."""
+#: Hex digests derived outside the code under test (plain ``json`` and ``hashlib`` over a
+#: hand-written dict), so a silent change to the encoding fails here.
+GOLDEN_GENESIS = "a32f391f69df2eb0835a5ea79b0bfb22bb3930a5a228cc6c18b7adbc17b86f27"
+GOLDEN_CANONICAL_ROW_SHA256 = "6ecb8cd363662d68f5dbbd9660191fa29372819d4445122c9e57ac71a503829f"
+GOLDEN_TRANSITION_ID = "c6d5306f8e0dd3c1571ef7b882626982fc08f7705283d116e2fbfce200577dd9"
+
+
+def test_genesis_golden() -> None:
+    assert genesis(VENUE) == GOLDEN_GENESIS
+
+
+def test_canonical_row_golden_digest() -> None:
     row = replace(_row(), seq=1, venue_seq=1, prev_transition_hash=genesis(VENUE))
-    digest = sha256_hex(canonical_row(row))
-    assert digest == sha256_hex(canonical_json(_without_chain_columns(row.to_wire())))
-    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert sha256_hex(canonical_row(row)) == GOLDEN_CANONICAL_ROW_SHA256
 
 
-def _without_chain_columns(wire: dict[str, object]) -> dict[str, object]:
-    return {
-        k: v for k, v in wire.items() if k not in {"seq", "prev_transition_hash", "transition_hash"}
+def test_compute_transition_id_golden() -> None:
+    assert (
+        compute_transition_id(
+            venue=VENUE,
+            family_id=FAMILY,
+            family_prior_seq=0,
+            from_state=None,
+            to_state=State.CHAMPION,
+            kind=Kind.BOOTSTRAP,
+            cause_verdict_ids=(SHA_B, SHA_A),
+            paired_transition_id=None,
+            policy_ruling_sha256="",
+        )
+        == GOLDEN_TRANSITION_ID
+    )
+
+
+def _id_args(**over: Any) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "venue": VENUE,
+        "family_id": FAMILY,
+        "family_prior_seq": 0,
+        "from_state": None,
+        "to_state": State.CHAMPION,
+        "kind": Kind.BOOTSTRAP,
+        "cause_verdict_ids": (),
+        "paired_transition_id": None,
+        "policy_ruling_sha256": "",
     }
+    args.update(over)
+    return args
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"venue": "Bad Venue"},
+        {"family_id": "../x"},
+        {"family_prior_seq": True},
+        {"family_prior_seq": -1},
+        {"from_state": "SHADOW"},
+        {"to_state": "CHAMPION"},
+        {"kind": "MINT"},
+        {"cause_verdict_ids": "abc"},
+        {"cause_verdict_ids": ("nope",)},
+        {"cause_verdict_ids": (SHA_A, SHA_A)},
+        {"paired_transition_id": "x"},
+        {"policy_ruling_sha256": "abc"},
+    ],
+)
+def test_compute_transition_id_validates_its_inputs(over: dict[str, Any]) -> None:
+    with pytest.raises(WireRefused):
+        compute_transition_id(**_id_args(**over))

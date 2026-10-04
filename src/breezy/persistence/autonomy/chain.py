@@ -6,13 +6,15 @@ column except ``seq`` (a global order only) and the two hash columns, so ``venue
 ``venue_seq`` are covered.
 
 ``verify_venue_chain`` raises ``ChainBroken`` (reason ``chain_broken``) unless ``venue_seq`` runs
-contiguously from 1, every row is the one venue, ``ts_ns`` never decreases and every link hashes.
+contiguously from 1, every row is the one venue, ``ts_ns`` never decreases, each
+``family_prior_seq`` is the family's previous ``venue_seq`` (0 on its first row), each stored
+``transition_id`` is the computed Y9 id and every link hashes.
 A verified chain is immutable; ``verify_extension`` returns a longer one. Pure: no I/O, no clock.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -85,9 +87,16 @@ def transition_hash(row: TransitionRow, prev_transition_hash: str) -> str:
 
 
 def _walk(
-    rows: Iterable[TransitionRow], venue: str, *, start_seq: int, prev_hash: str, prev_ts: int
+    rows: Iterable[TransitionRow],
+    venue: str,
+    *,
+    start_seq: int,
+    prev_hash: str,
+    prev_ts: int,
+    family_last: Mapping[str, int] | None = None,
 ) -> tuple[tuple[TransitionRow, ...], str]:
     out: list[TransitionRow] = []
+    last_by_family = dict(family_last or {})
     expected = start_seq
     for row in rows:
         if not isinstance(row, TransitionRow):
@@ -98,11 +107,16 @@ def _walk(
             raise ChainBroken(expected, "venue_seq not contiguous")
         if row.ts_ns < prev_ts:
             raise ChainBroken(expected, "ts_ns decreases")
+        if row.family_prior_seq != last_by_family.get(row.family_id, 0):
+            raise ChainBroken(expected, "family_prior_seq is not the family's previous venue_seq")
+        if row.transition_id != row.computed_transition_id():
+            raise ChainBroken(expected, "transition_id is not the computed id")
         if row.prev_transition_hash != prev_hash:
             raise ChainBroken(expected, "prev link broken")
         if row.transition_hash is None or row.transition_hash != transition_hash(row, prev_hash):
             raise ChainBroken(expected, "row hash mismatch")
         out.append(row)
+        last_by_family[row.family_id] = expected
         prev_hash, prev_ts, expected = row.transition_hash, row.ts_ns, expected + 1
     return tuple(out), prev_hash
 
@@ -124,6 +138,7 @@ def verify_extension(
         start_seq=chain.head_venue_seq + 1,
         prev_hash=chain.head_hash,
         prev_ts=prev_ts,
+        family_last={r.family_id: r.venue_seq or 0 for r in chain.rows},
     )
     return VerifiedVenueChain(venue=chain.venue, rows=chain.rows + added, head_hash=head)
 

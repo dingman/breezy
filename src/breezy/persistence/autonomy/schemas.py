@@ -64,8 +64,10 @@ __all__ = [
     "compute_transition_id",
 ]
 
-#: Kept equal to ``paths.VENUE_RE``, ``paths.FAMILY_RE`` and ``paths.JOURNAL_KIND_RE``
-#: (test-asserted; not imported: layering).
+#: Local copies of ``paths.VENUE_RE``, ``paths.FAMILY_RE`` and ``paths.JOURNAL_KIND_RE``. They exist
+#: because the plan's import list for this module is wire, canonical and rollback_journal only, not
+#: because a contract forbids ``paths`` (it is reachable transitively). A test asserts that pattern
+#: and flags equal the originals.
 VENUE_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z0-9_]{1,32}\Z", re.ASCII)
 FAMILY_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z0-9_]{1,64}\Z", re.ASCII)
 JOURNAL_KIND_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z0-9_]{1,48}\Z", re.ASCII)
@@ -249,7 +251,10 @@ def _opt_sha(value: object, field: str) -> str | None:
 def _sha_tuple(value: object, field: str) -> tuple[str, ...]:
     if not isinstance(value, tuple):
         raise _bad(WireRefusalReason.WRONG_TYPE, field)
-    return tuple(check_sha256(v, field) for v in value)
+    ids = tuple(check_sha256(v, field) for v in value)
+    if len(set(ids)) != len(ids):
+        raise _bad(WireRefusalReason.BAD_VALUE, field)
+    return ids
 
 
 def _iso_date(value: object, field: str) -> str:
@@ -281,6 +286,13 @@ def _check_counters(value: object) -> str | None:
     return value
 
 
+def _check_ruling_sha(value: object) -> str:
+    """A 64-hex digest, or ``""`` (the C5 fallback with no policy ruling)."""
+    if value == "":
+        return ""
+    return check_sha256(value, "policy_ruling_sha256")
+
+
 def compute_transition_id(
     *,
     venue: str,
@@ -298,6 +310,17 @@ def compute_transition_id(
     The venue-wide ``expected_prior_seq`` is excluded so a crash-and-retry reproduces the id, while
     a later repeat of the same transition for the same family has a new ``family_prior_seq``.
     """
+    check_match(venue, VENUE_RE, "venue")
+    check_match(family_id, FAMILY_RE, "family_id")
+    check_int(family_prior_seq, "family_prior_seq")
+    _opt_enum(from_state, State, "from_state")
+    _is_enum(to_state, State, "to_state")
+    _is_enum(kind, Kind, "kind")
+    if isinstance(cause_verdict_ids, str):
+        raise _bad(WireRefusalReason.WRONG_TYPE, "cause_verdict_ids")
+    verdict_ids = _sha_tuple(tuple(cause_verdict_ids), "cause_verdict_ids")
+    _opt_sha(paired_transition_id, "paired_transition_id")
+    _check_ruling_sha(policy_ruling_sha256)
     preimage = {
         "venue": venue,
         "family_id": family_id,
@@ -305,7 +328,7 @@ def compute_transition_id(
         "from_state": None if from_state is None else from_state.value,
         "to_state": to_state.value,
         "kind": kind.value,
-        "cause_verdict_ids": sorted(cause_verdict_ids),
+        "cause_verdict_ids": sorted(verdict_ids),
         "paired_transition_id": paired_transition_id,
         "policy_ruling_sha256": policy_ruling_sha256,
     }
@@ -337,9 +360,10 @@ class TransitionRow:
     invocation_id: str
     engine_code_sha: str
     ts_ns: int
+    family_prior_seq: int
+    expected_prior_seq: int
     seq: int | None = None
     venue_seq: int | None = None
-    family_prior_seq: int = 0
     paired_transition_id: str | None = None
     from_state: State | None = None
     cause_verdict_ids: tuple[str, ...] = ()
@@ -356,6 +380,8 @@ class TransitionRow:
     n_min_eff: int | None = None
     n_cap: int | None = None
     nomination_feasible: bool | None = None
+    #: Hold ``export_seq`` values (before and after the reset). ARCH l.425/l.490 and AUT-5 r7
+    #: l.480-487 name the columns but not the seq; ruling A6a-R5 fixes this reading.
     hwm_from: int | None = None
     hwm_to: int | None = None
     #: Canonical-JSON text (an immutable, byte-stable form); the object shape belongs to the fold.
@@ -364,7 +390,6 @@ class TransitionRow:
     drill_clause_sha256: str | None = None
     policy_ruling_id: str = ""
     policy_ruling_sha256: str = ""
-    expected_prior_seq: int = 0
     effective_launch_date: str | None = None
     prev_transition_hash: str | None = None
     transition_hash: str | None = None
@@ -376,8 +401,9 @@ class TransitionRow:
         check_match(self.invocation_id, _UUID_RE, "invocation_id")
         check_sha256(self.engine_code_sha, "engine_code_sha")
         check_match(self.policy_ruling_id, _RULING_ID_RE, "policy_ruling_id")
-        if self.policy_ruling_sha256 != "":
-            check_sha256(self.policy_ruling_sha256, "policy_ruling_sha256")
+        _check_ruling_sha(self.policy_ruling_sha256)
+        if (self.policy_ruling_id == "") != (self.policy_ruling_sha256 == ""):
+            raise _bad(WireRefusalReason.BAD_VALUE, "policy_ruling_id")
         _is_enum(self.to_state, State, "to_state")
         _is_enum(self.kind, Kind, "kind")
         _is_enum(self.decided_by, DecidedBy, "decided_by")
@@ -508,7 +534,12 @@ class ExportTrailer:
         check_sha256(self.chain_head, "chain_head")
         check_int(self.export_seq, "export_seq")
         kinds: set[str] = set()
-        for pair in self.evidence_journal_heads:
+        heads = self.evidence_journal_heads
+        if not isinstance(heads, tuple):
+            raise _bad(WireRefusalReason.WRONG_TYPE, "evidence_journal_heads")
+        for pair in heads:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise _bad(WireRefusalReason.WRONG_TYPE, "evidence_journal_heads")
             kind, head = pair
             check_match(kind, JOURNAL_KIND_RE, "evidence_journal_heads")
             if kind in kinds or not isinstance(head, JournalHead):
