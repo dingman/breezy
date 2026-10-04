@@ -454,3 +454,8 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
   2. Move the file into a quarantine directory outside `evidence/registry/` (never delete it).
   3. Run the HWM reset CLI.
   AUT-5a owns the procedure, its CLI and its test.
+
+## E-19 (coordinator, 2026-10-04; from the ARCH-0 seam A 7a ARCH review): fold flag scoping and the post-launch cause path
+- **(a) Y8 in the post-launch window.** From LAUNCH to the launch-window end (17:00), a cause on the incoming family of an activated pair is written only as SWAP_CANCEL `pair_cause_incoming`. That voids the pair and restores the incumbent. `validate` refuses a DEMOTE or HALT of that incoming family in this window. A HALTED child plus a CHAMPION incumbent would otherwise be two senders, and a single-sender check would then refuse a restrictive batch.
+- **(b) `demoted_for_cause` is per champion epoch.** It holds only for causes inside the family's current champion epoch, and RESUME opens a new epoch (AUT-7 r5:105-109). ARCH:493's "never cleared" is read at epoch scope. The Y8 FORWARD_SHADOW PASS clear stays a `validate` rule.
+- **(c) OPEN: clearing the INTEGRITY freeze.** W15 (ARCH:720-723) and AUT-6 r15:505 describe an incident clear "through the registry CLI on the C5 API", but no C5 transition kind can carry it, and HWM_RESET must not widen. Until AUT-6 files the row kind and its fold semantics, a venue INTEGRITY freeze is permanent (fail closed). AUT-6 owns this; it blocks no ARCH-0 seam.

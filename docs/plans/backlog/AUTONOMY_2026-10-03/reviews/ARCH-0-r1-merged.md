@@ -409,3 +409,19 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - The `_connect` docstring records the same-uid parent-symlink residual (ARCH l.408).
 - **A7e-R1 (L4).** The `HwmAbsent(` construction ban resolves import aliases, with a planted alias control.
 - **A7e-A1.** The HWM "genesis head" written at the AUT-5a cut-over is the BOOTSTRAP row at `venue_seq` 1. A `venue_seq` of 0 is unconstructible. The unversioned exact-key HWM wire format is accepted, because any shape change decodes as `HwmUnreadable` (fail closed).
+
+### Build-time rulings (seam A 7a ARCH review, 3d2523c0)
+- **A7a-R1 (MED-1).** `drill_child` is set when a DRILL_ADMIT row applies, per AUT-7 r5:109; DRILL_ADMIT is immediate. The episode still starts when DRILL_PROMOTE takes effect. A child whose pair lapsed or was voided stays `drill_child`, and this is tested.
+- **A7a-R2 (MED-2).** Y8 extends to the post-launch window [LAUNCH, launch-window end), per erratum E-19a. Within that window, a cause on the incoming family of an activated pair is written only as a SWAP_CANCEL with `pair_cause_incoming`, never as a DEMOTE or HALT of the incoming family. 7c `validate` refuses such a DEMOTE or HALT. The restrictive path stays available through the SWAP_CANCEL. 7a adds a fold test that pins the result of the forbidden sequence (two senders) as an invalid-chain pin.
+- **A7a-R3 (MED-3).** `demoted_for_cause` is scoped per champion epoch, per AUT-7 r5:105-109 and erratum E-19b:
+  - The fold exposes `demoted_cause_ns` (the latest cause instant) and `champion_epoch_start_ns`.
+  - `demoted_for_cause` is true iff a cause falls inside the current champion epoch.
+  - RESUME opens a new epoch.
+  - The Y8 FORWARD_SHADOW clear is evaluated by `validate` over verdicts.
+  - Without this, `fq_v1` would become permanently ineligible for drills and ROLLBACK after any recoverable DEMOTE+RESUME, including the E-5 restore.
+- **A7a-R4 (MED-4).** No transition kind can clear the venue INTEGRITY freeze. Until erratum E-19c is resolved by AUT-6 (the W15 owner), the freeze is permanent: a known, fail-closed spec gap.
+- **A7a-R5 (LOW).**
+  - Replace the vacuous lapsed-flag loop with a lapsed DRILL_PROMOTE+SUPERSEDE pair.
+  - Delete the vacuous asserts at test:129 and test:326, and the duplicate at test:178.
+  - Document that `senders` is data only: consumers must not take `senders[0]` before the resolver check.
+  - `halted_since_ns` (AUT-6 #30) moves to 7b.
