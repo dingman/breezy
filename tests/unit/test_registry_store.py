@@ -58,6 +58,12 @@ from breezy.persistence.autonomy.schemas import (
 from breezy.persistence.autonomy.wire import WireRefusalReason, WireRefused
 from tests.support.autonomy_policy_scan import find_predicate_reads
 from tests.support.entry_points import SRC_DIR
+from tests.unit.registry_manifest_density import (
+    default_manifest,
+    density_facts,
+    density_of,
+    introducer_columns,
+)
 
 VENUE = "polymarket_us"
 OTHER_VENUE = "kalshi"
@@ -76,6 +82,17 @@ OPEN_STAGE = StagePolicy(
 
 _LINEAGE = shape.LINEAGE_REQUIRED
 _PAIR_CITING = shape.PAIR_CITING
+
+
+@pytest.fixture(autouse=True)
+def _manifests_pin_their_rows_artefact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store reads a manifest at every BOOTSTRAP and MINT (E-24); here a row's manifest is a
+    registered fixture whose density pin is that row's artefact."""
+
+    def reader(family_id: str, manifest_sha256: str, **_bound: object) -> ManifestFacts | None:
+        return density_facts(family_id, manifest_sha256, d0=LAUNCH_DAY, composition=COMPOSITION)
+
+    monkeypatch.setattr(rs, "read_manifest_facts", reader)
 
 
 def fill(kind: Kind, frm: State | None, to: State) -> dict[str, Any]:
@@ -128,6 +145,8 @@ def mk(
     if kind in (Kind.BOOTSTRAP, Kind.ROOT_ADMIT):
         base["lineage_root_family_id"] = family  # a root names itself (E-14; fold 7b)
     base.update(over)
+    if kind in (Kind.BOOTSTRAP, Kind.MINT):  # E-24: the manifest pins the row's artefact
+        base.update(introducer_columns(family, base))
     draft = TransitionRow(**base)
     return replace(draft, transition_id=draft.computed_transition_id())
 
@@ -187,7 +206,6 @@ def child_row(
     )  # fmt: skip
 
 
-SHA_M = "e" * 64
 COMPOSITION = "forecast_quantile_ladder"
 
 
@@ -195,7 +213,8 @@ def pair_rows() -> tuple[TransitionRow, TransitionRow]:
     """A pending drill pair: CHILD's DRILL_PROMOTE head (seq 4) and FAMILY's SUPERSEDE (seq 5)."""
     head = child_row(
         Kind.DRILL_PROMOTE, State.CHALLENGER, State.CHAMPION, fps=3, seq=3,
-        effective_launch_date=LAUNCH_DAY, manifest_sha256=SHA_M, drill=True,
+        effective_launch_date=LAUNCH_DAY, drill=True,
+        manifest_sha256=default_manifest(CHILD, SHA_A),
     )  # fmt: skip
     tail = mk(
         Kind.SUPERSEDE, State.CHALLENGER, frm=State.CHAMPION, fps=1, expected=3, ts=NOW + 3 * SEC,
@@ -208,6 +227,7 @@ def _facts(family_id: str, manifest_sha256: str) -> ManifestFacts:
     return ManifestFacts(
         family_id=family_id, manifest_sha256=manifest_sha256, d0_climate_day=LAUNCH_DAY,
         trial_id_prefix=f"{COMPOSITION}/trial/{family_id}/", composition_kind=COMPOSITION,
+        density_artefact_sha256=density_of(manifest_sha256),
     )  # fmt: skip
 
 

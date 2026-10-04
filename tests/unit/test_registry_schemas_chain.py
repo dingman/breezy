@@ -862,6 +862,7 @@ def test_manifest_facts_validates_and_is_frozen() -> None:
         d0_climate_day="2026-10-05",
         trial_id_prefix="current_rung_hold/trial/x/",
         composition_kind="current_rung_hold",
+        density_artefact_sha256=SHA_A,
     )
     with pytest.raises(FrozenInstanceError):
         facts.family_id = "x"  # type: ignore[misc]
@@ -872,6 +873,7 @@ def test_manifest_facts_validates_and_is_frozen() -> None:
             d0_climate_day="2026-10-05",
             trial_id_prefix="p/",
             composition_kind="current_rung_hold",
+            density_artefact_sha256=SHA_A,
         )
     with pytest.raises(WireRefused):
         ManifestFacts(
@@ -880,6 +882,19 @@ def test_manifest_facts_validates_and_is_frozen() -> None:
             d0_climate_day="20261005",
             trial_id_prefix="p/",
             composition_kind="current_rung_hold",
+            density_artefact_sha256=SHA_A,
+        )
+
+
+def test_manifest_facts_density_pin_is_a_sha() -> None:
+    with pytest.raises(WireRefused):
+        ManifestFacts(
+            family_id=FAMILY,
+            manifest_sha256=SHA_A,
+            d0_climate_day="2026-10-05",
+            trial_id_prefix="p/",
+            composition_kind="current_rung_hold",
+            density_artefact_sha256="short",
         )
 
 

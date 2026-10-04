@@ -38,6 +38,7 @@ from breezy.persistence.autonomy.verdict import (
     VerdictKind,
     VerdictOutcome,
 )
+from tests.unit.registry_manifest_density import density_facts, density_of
 from tests.unit.test_registry_fold import (
     CHILD,
     DAY,
@@ -71,7 +72,11 @@ DRILL_CAUSE: Final[dict[str, Any]] = {
 
 
 def no_facts(family_id: str, manifest_sha256: str) -> ManifestFacts | None:
-    return None
+    """No readable manifest, except an introducing row's own (E-24 pins its density: the facts
+    carry a far-future d0 and the family's own prefix, so no d0 or prefix rule can fire on them)."""
+    return density_facts(
+        family_id, manifest_sha256, d0="9999-12-31", composition="forecast_quantile_ladder"
+    )
 
 
 def facts_for_child(family_id: str, manifest_sha256: str) -> ManifestFacts | None:
@@ -79,6 +84,7 @@ def facts_for_child(family_id: str, manifest_sha256: str) -> ManifestFacts | Non
         family_id=family_id, manifest_sha256=manifest_sha256, d0_climate_day=NEXT_DAY,
         trial_id_prefix=f"forecast_quantile_ladder/trial/{family_id}/",
         composition_kind="forecast_quantile_ladder",
+        density_artefact_sha256=density_of(manifest_sha256),
     )  # fmt: skip
 
 

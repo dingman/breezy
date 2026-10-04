@@ -361,7 +361,10 @@ def test_resolver_refuses_density_pin_not_bound_artefact(world: World, who: str)
             manifest_sha256=world.root_sha, artefact_sha256=CHILD_ART_SHA,
         )  # fmt: skip
         forged = forge(chain)
-        with serving(forged):
+        with serving(forged):  # the real replay already refuses the BOOTSTRAP (E-24 store half)
+            real = resolve(world, hwm_of(forged), now=NOW_EARLY)
+        assert refusal_of(real).reason is RefusalReason.REPLAY_INVALID
+        with serving(forged), replay_stubbed():  # isolate the resolver's own bind
             got = resolve(world, hwm_of(forged), now=NOW_EARLY)
     else:
         _put_at(world, "density_table", OTHER, OTHER_SHA)
@@ -373,7 +376,13 @@ def test_resolver_refuses_density_pin_not_bound_artefact(world: World, who: str)
 
 def test_density_repin_within_family_refused_by_resolver(world: World) -> None:
     """MINT(M1, A) then PROMOTE(M2 pinning B), both artefacts stored: the family is bound to A, so
-    the later manifest cannot move its pin. It must not resolve."""
+    the later manifest cannot move its pin. It must not resolve.
+
+    The registry holds one file per family and it is now M2's, so the real replay cannot read the
+    MINT's manifest M1 (an artefact failure). With the replay stubbed the fold still binds the
+    family to its introducing manifest M1 (E-24), so the resolver's own byte bind refuses the
+    file. The rule that refuses the later PROMOTE itself is pinned in
+    ``test_registry_manifest_binding``."""
     _put_at(world, "density_table", OTHER, OTHER_SHA)
     chain = start(world)  # the MINT carries M1, which pins the child's own artefact A
     nominate(chain)
@@ -381,8 +390,10 @@ def test_density_repin_within_family_refused_by_resolver(world: World) -> None:
     promote_pair(chain, world=world)
     forged = forge(chain)
     export_all(world, forged)
+    real = refusal_of(run_child(world, forged))
+    assert real.reason is RefusalReason.REPLAY_ARTEFACT_MISMATCH
     refused = refusal_of(run_child(world, forged, stub=True))
-    assert refused.reason is RefusalReason.ARTEFACT_SHA_MISMATCH
+    assert refused.reason is RefusalReason.MANIFEST_SHA_MISMATCH
 
 
 def test_rung_recalibration_child_pin_equals_bound_resolves(world: World) -> None:

@@ -79,6 +79,7 @@ from breezy.persistence.autonomy.schemas import (
     CauseClass,
     CauseCode,
     Kind,
+    ManifestFacts,
     ManifestFactsReader,
     RefusalReason,
     StageView,
@@ -123,6 +124,8 @@ class Rule(StrEnum):
     RESUME_NO_HALT_INSTANT = "resume_no_halt_instant"
     FROM_STATE_MISMATCH = "from_state_mismatch"
     ARTEFACT_BINDING_IMMUTABLE = "artefact_binding_immutable"
+    MANIFEST_DENSITY_NOT_BOUND = "manifest_density_not_bound"
+    MANIFEST_BINDING_IMMUTABLE = "manifest_binding_immutable"
     RESTORE_NOT_THE_INCUMBENT = "restore_not_the_incumbent"
     RESUME_COOLDOWN = "resume_cooldown"
     RESUME_BUDGET = "resume_budget"
@@ -475,9 +478,46 @@ def _artefact_binding(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
     return None
 
 
+def _manifest_density_bound(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
+    """E-24: an introducing row's manifest pins, as its density, the artefact the row binds.
+
+    A new density is a new child family, so a family's manifest never names another artefact.
+    Fails closed: a missing or unreadable manifest is ``manifest_unreadable`` (the engine writes
+    the family file before its MINT row). A sentinel root binds the sentinel file, so it holds too.
+    """
+    facts = (
+        None if row.manifest_sha256 is None else ctx.manifests(row.family_id, row.manifest_sha256)
+    )
+    if facts is None:
+        return Rule.MANIFEST_DENSITY_NOT_BOUND, RefusalReason.MANIFEST_UNREADABLE
+    if facts.density_artefact_sha256 != row.artefact_sha256:
+        return Rule.MANIFEST_DENSITY_NOT_BOUND, RefusalReason.ARTEFACT_SHA_MISMATCH
+    return None
+
+
+def _manifest_binding(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
+    """E-24: a family's manifest sha is its introducing row's, for good (the artefact's twin)."""
+    if row.manifest_sha256 is None:
+        return None
+    family = ctx.prior.families.get(row.family_id)
+    bound = None if family is None else family.manifest_sha256
+    if bound is None:  # introduced by an earlier row of this very batch
+        bound = next(
+            (
+                e.manifest_sha256
+                for e in ctx.earlier
+                if e.family_id == row.family_id and e.manifest_sha256 is not None
+            ),
+            None,
+        )
+    if bound is not None and row.manifest_sha256 != bound:
+        return Rule.MANIFEST_BINDING_IMMUTABLE, RefusalReason.MANIFEST_SHA_MISMATCH
+    return None
+
+
 _CHECKS: Final[Mapping[Kind, tuple[_Check, ...]]] = {
-    Kind.BOOTSTRAP: (ii.bootstrap,),
-    Kind.MINT: (ii.mint_rate,),
+    Kind.BOOTSTRAP: (ii.bootstrap, _manifest_density_bound),
+    Kind.MINT: (ii.mint_rate, _manifest_density_bound),
     Kind.PROMOTE: (
         _infeasible_alpha,
         ii.terminal_frozen,
@@ -524,6 +564,22 @@ def _pending_root_state(row: TransitionRow, ctx: _Ctx) -> bool:
     )
 
 
+def _memoised(reader: ManifestFactsReader) -> ManifestFactsReader:
+    """``reader`` that reads each (family, sha) once per batch; an unreadable one is asked again."""
+    seen: dict[tuple[str, str], ManifestFacts] = {}
+
+    def read(family_id: str, manifest_sha256: str) -> ManifestFacts | None:
+        key = (family_id, manifest_sha256)
+        if key not in seen:
+            facts = reader(family_id, manifest_sha256)
+            if facts is None:
+                return None
+            seen[key] = facts
+        return seen[key]
+
+    return read
+
+
 def first_refusal(
     prior: FoldResult,
     rows: Sequence[TransitionRow],
@@ -537,6 +593,7 @@ def first_refusal(
     A batch that is not restrictive-only must also leave at most one sender, now and at every
     LAUNCH it or the pending pairs reach (Z3 single sender).
     """
+    manifests = _memoised(manifests)
     earlier: list[TransitionRow] = []
     states = dict(prior.states)
     known: set[str] = set()
@@ -544,7 +601,14 @@ def first_refusal(
     guard_senders = not ii.restrictive_only(rows)
     for index, row in enumerate(rows):
         ctx = _Ctx(prior, manifests, verdicts, tuple(earlier), states, frozenset(known), export)
-        for check in (ii.introduction, _from_state, *_CHECKS.get(row.kind, ()), _artefact_binding):
+        checks = (
+            ii.introduction,
+            _from_state,
+            *_CHECKS.get(row.kind, ()),
+            _artefact_binding,
+            _manifest_binding,
+        )
+        for check in checks:
             hit = check(ctx, row)
             if hit is not None:
                 return Refusal(hit[1], hit[0], index)

@@ -51,12 +51,16 @@ from breezy.persistence.autonomy.transitions import (
 )
 from tests.support.entry_points import SRC_DIR
 from tests.unit.autonomy_blocks_kinds_floor import FLOOR_KIND_VOCABULARY
+from tests.unit.registry_manifest_density import introducer_columns
 
 VENUE = "polymarket_us"
 INCUMBENT = "pm_us_crh_fq_v1"
 CHILD = "pm_us_crh_fq_v1_r0001"
 OTHER = "pm_us_crh_v4"
 SHA_B = "b" * 64
+#: The manifest an introducing row of these families carries unless a test names one (the same
+#: shas the validate tests cite when they bind a later row, E-24).
+DEFAULT_MANIFEST: Final = {INCUMBENT: "1" * 64, CHILD: "2" * 64}
 INVOCATION = "00000000-0000-4000-8000-000000000001"
 DAY = "2026-10-10"
 SEC = 10**9
@@ -114,6 +118,8 @@ class Chain:
         elif kind is Kind.MINT:
             base["lineage_root_family_id"] = INCUMBENT
         base.update(extra)
+        if kind in (Kind.BOOTSTRAP, Kind.MINT):  # E-24: the manifest pins the row's artefact
+            base.update(introducer_columns(family, base, DEFAULT_MANIFEST.get(family)))
         draft = TransitionRow(**base)
         row = replace(draft, transition_id=draft.computed_transition_id())
         self.rows.append(row)

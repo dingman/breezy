@@ -278,6 +278,7 @@ RECAL_SHA: Final = hashlib.sha256(RECAL).hexdigest()
 
 def recal_chain(world: World) -> Chain:
     """A MINT whose artefact is a ``rung_recalibration`` refit, not a ``density_table``."""
+    world.pin_child_artefact(RECAL_SHA)  # E-24: the child's manifest pins the artefact it binds
     chain = Chain()
     chain.add(
         Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT,

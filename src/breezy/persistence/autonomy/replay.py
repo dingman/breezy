@@ -458,20 +458,33 @@ def _validate_batch(
     )
     if refusal is None:
         return None
+    if refusal.rule is transitions.Rule.MANIFEST_DENSITY_NOT_BOUND:
+        # The density rule reads the manifest that locates the artefact: when that manifest or the
+        # artefact is untrustworthy, that is the (more specific) artefact failure (E-24).
+        problem = _artefact_problem(walk, batch)
+        if problem is not None:
+            return problem
     return ReplayInvalid(
         batch[refusal.row_index].venue_seq or 0, refusal.rule.value, refusal.reason
     )
 
 
-def _check_artefacts(walk: _Walk, batch: Sequence[TransitionRow]) -> ReplayArtefactMismatch | None:
+def _artefact_problem(walk: _Walk, batch: Sequence[TransitionRow]) -> ReplayArtefactMismatch | None:
+    """The first row of ``batch`` whose artefact or the manifest locating it cannot be trusted."""
     for row in batch:
         if row.artefact_sha256 is None:
             continue
         failure = _artefact_failure(walk, row)
         if failure is not None:
             return ReplayArtefactMismatch(row.venue_seq or 0, failure)
-        walk.bound.setdefault(row.family_id, row.artefact_sha256)
     return None
+
+
+def _bind_artefacts(walk: _Walk, batch: Sequence[TransitionRow]) -> None:
+    """A family's artefact is its first row's: later rows of the chain are cited against it."""
+    for row in batch:
+        if row.artefact_sha256 is not None:
+            walk.bound.setdefault(row.family_id, row.artefact_sha256)
 
 
 def _replay_full(
@@ -496,9 +509,10 @@ def _replay_full(
         prior = fold(rows[:index], chain.venue, batch[0].ts_ns)
         if isinstance(prior, FoldInvalid):  # reported at the first row of the previous batch
             return ReplayInvalid(rows[previous].venue_seq or 0, prior.reason.value)
-        failure = _validate_batch(walk, prior, batch) or _check_artefacts(walk, batch)
+        failure = _validate_batch(walk, prior, batch) or _artefact_problem(walk, batch)
         if failure is not None:
             return failure
+        _bind_artefacts(walk, batch)
         previous, index = index, end
     if rows and isinstance(whole := fold(rows, chain.venue, rows[-1].ts_ns), FoldInvalid):
         return ReplayInvalid(rows[-1].venue_seq or 0, whole.reason.value)

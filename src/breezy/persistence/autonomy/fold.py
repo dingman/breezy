@@ -319,7 +319,7 @@ class _Accumulator:
     def apply(self, instant: int, row: TransitionRow) -> None:
         family = row.family_id
         if row.manifest_sha256 is not None:
-            self.manifest_sha[family] = row.manifest_sha256
+            self.manifest_sha.setdefault(family, row.manifest_sha256)  # immutable (E-24)
         if row.artefact_sha256 is not None:
             self.artefact_sha.setdefault(family, row.artefact_sha256)  # immutable (A7c-R5)
         if row.from_state is not row.to_state:

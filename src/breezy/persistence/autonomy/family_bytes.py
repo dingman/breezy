@@ -256,6 +256,7 @@ def read_manifest_facts(
             d0_climate_day=manifest.d0_climate_day,
             trial_id_prefix=manifest.trial_id_prefix,
             composition_kind=manifest.composition_kind,
+            density_artefact_sha256=manifest.density_artefact_sha256,
         )
     except _UNREADABLE:
         return None

@@ -26,6 +26,7 @@ from breezy.persistence.autonomy.schemas import (
     WriterMode,
 )
 from breezy.persistence.autonomy.transitions import Rule
+from tests.unit.registry_manifest_density import density_of
 from tests.unit.test_registry_store import (
     CHILD,
     COMPOSITION,
@@ -35,6 +36,7 @@ from tests.unit.test_registry_store import (
     OTHER_VENUE,
     SEC,
     SHA_A,
+    _manifests_pin_their_rows_artefact,  # noqa: F401  (an autouse fixture, shared)
     drill_child_store,
     mk,
     pair_rows,
@@ -177,6 +179,7 @@ def test_a_validate_refusal_rolls_the_batch_back_with_validates_closed_reason(
         return ManifestFacts(
             family_id=family_id, manifest_sha256=manifest_sha256, d0_climate_day="2026-12-01",
             trial_id_prefix=f"{COMPOSITION}/trial/somebody_else/", composition_kind=COMPOSITION,
+            density_artefact_sha256=density_of(manifest_sha256),
         )  # fmt: skip
 
     drill_child_store(store, with_pair=False)  # FAMILY CHAMPION; CHILD a drill-admitted CHALLENGER
@@ -204,6 +207,7 @@ def _facts_ok(family_id: str, manifest_sha256: str) -> ManifestFacts:
     return ManifestFacts(
         family_id=family_id, manifest_sha256=manifest_sha256, d0_climate_day="2026-12-01",
         trial_id_prefix=f"{COMPOSITION}/trial/{family_id}/", composition_kind=COMPOSITION,
+        density_artefact_sha256=density_of(manifest_sha256),
     )  # fmt: skip
 
 

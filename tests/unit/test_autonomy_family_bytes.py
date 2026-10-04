@@ -201,6 +201,9 @@ def test_a_committed_root_manifest_yields_its_facts(repo: Path, data_root: Path)
         d0_climate_day="2026-09-20",
         trial_id_prefix="continuous_rung_hold/trial/",
         composition_kind="continuous_rung_hold",
+        density_artefact_sha256=(  # the sentinel density file's sha: a sentinel root pins it
+            "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65"
+        ),
     )
 
 

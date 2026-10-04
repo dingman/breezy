@@ -644,10 +644,13 @@ class ManifestFacts:
     d0_climate_day: str
     trial_id_prefix: str
     composition_kind: str
+    #: The manifest's density pin; E-24: it equals the family's bound artefact, for every kind.
+    density_artefact_sha256: str
 
     def __post_init__(self) -> None:
         check_match(self.family_id, FAMILY_RE, "family_id")
         check_sha256(self.manifest_sha256, "manifest_sha256")
+        check_sha256(self.density_artefact_sha256, "density_artefact_sha256")
         _iso_date(self.d0_climate_day, "d0_climate_day")
         check_match(self.trial_id_prefix, _PREFIX_RE, "trial_id_prefix")
         check_match(self.composition_kind, _COMPOSITION_RE, "composition_kind")

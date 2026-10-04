@@ -52,7 +52,14 @@ from breezy.persistence.autonomy.wire import WireRefused
 from tests.support.autonomy_write_scan import find_write_sites
 from tests.support.entry_points import SRC_DIR
 from tests.unit.test_autonomy_files_one_writer import unallowed_write_sites
-from tests.unit.test_registry_store import NOW, SEC, VENUE, bootstrap, demote
+from tests.unit.test_registry_store import (
+    NOW,
+    SEC,
+    VENUE,
+    _manifests_pin_their_rows_artefact,  # noqa: F401  (an autouse fixture, shared)
+    bootstrap,
+    demote,
+)
 
 MODULE_PATH: Final = SRC_DIR / "breezy" / "persistence" / "autonomy" / "registry_export.py"
 DAY: Final = "2026-12-01"

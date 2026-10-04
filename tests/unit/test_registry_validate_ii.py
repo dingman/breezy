@@ -70,6 +70,7 @@ THIRD_DAY: Final = "2026-10-12"
 SIXTH_DAY: Final = "2026-10-15"
 NOW: Final = at(DAY, "16:00")
 SECOND_ART: Final = "5" * 64
+OTHER_MAN: Final = "6" * 64
 K_MAX: Final = pins.MAX_NOMINATIONS_PER_LINEAGE_LIFETIME
 SEED_RETIRED: Final = "pm_us_crh_v4"
 
@@ -428,7 +429,7 @@ def test_damping_ceilings(facet: str) -> None:
     def spent() -> Chain:  # a probe appends its row: one chain per question
         chain = champion_chain()
         chain.add(Kind.MINT, State.SHADOW, family=OTHER, ts=at(PRIOR_DAY, "13:00"),
-                  artefact_sha256=SECOND_ART)  # fmt: skip
+                  artefact_sha256=SECOND_ART, manifest_sha256=OTHER_MAN)  # fmt: skip
         exhaust(chain, sender_changes=full)
         return chain
 
@@ -489,7 +490,7 @@ def test_a_pending_pair_is_a_reservation_against_the_daily_cap() -> None:
     def second_head(spent: int) -> Any:
         chain = champion_chain()
         chain.add(Kind.MINT, State.SHADOW, family=OTHER, ts=at(PRIOR_DAY, "13:00"),
-                  artefact_sha256=SECOND_ART)  # fmt: skip
+                  artefact_sha256=SECOND_ART, manifest_sha256=OTHER_MAN)  # fmt: skip
         chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
         chain.add(Kind.PROMOTE, State.CHALLENGER, family=OTHER, frm=State.SHADOW)
         chain.promote_pair(day=DAY)  # CHILD over INCUMBENT, pending: one reservation
@@ -498,7 +499,7 @@ def test_a_pending_pair_is_a_reservation_against_the_daily_cap() -> None:
         assert prior.pairs[0].status.value == "pending"
         head = chain.add(
             Kind.PROMOTE, State.CHAMPION, family=OTHER, frm=State.CHALLENGER,
-            effective_launch_date=DAY, manifest_sha256=CHILD_MAN, artefact_sha256=SECOND_ART,
+            effective_launch_date=DAY, manifest_sha256=OTHER_MAN, artefact_sha256=SECOND_ART,
         )  # fmt: skip
         return tm.first_refusal(prior, [head], manifests=facts_for_child)
 
@@ -1204,14 +1205,20 @@ def test_validate_reads_no_manifest_for_a_restrictive_row_or_attest(kind: Kind) 
     assert refused is None  # judged, accepted, and the booby-trapped reader never ran
 
 
-def test_a_neutral_row_reads_no_manifest_either() -> None:
-    def boom(family_id: str, manifest_sha256: str) -> Any:
-        raise AssertionError("a MINT must not read manifests")
+def test_a_mint_reads_only_its_own_manifest_once() -> None:
+    """E-24: a MINT reads exactly one manifest (its own, for the density pin) and never another
+    family's (the d0 reads are the first-champion rule's, not the neutral rows')."""
+    reads: list[tuple[str, str]] = []
+
+    def recording(family_id: str, manifest_sha256: str) -> Any:
+        reads.append((family_id, manifest_sha256))
+        return no_facts(family_id, manifest_sha256)
 
     fresh = champion_chain()
     base = run(fresh, NOW)
     mint_row = fresh.add(Kind.MINT, State.SHADOW, family=OTHER, artefact_sha256=SECOND_ART)
-    assert tm.first_refusal(base, [mint_row], manifests=boom) is None
+    assert tm.first_refusal(base, [mint_row], manifests=recording) is None
+    assert reads == [(OTHER, mint_row.manifest_sha256)]
 
 
 def test_every_rule_ii_name_is_unique_and_wired() -> None:

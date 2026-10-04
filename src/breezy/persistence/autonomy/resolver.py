@@ -42,8 +42,8 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
 
 * The authorising row is the family's latest row of a →CHAMPION kind (BOOTSTRAP, ROOT_ADMIT,
   PROMOTE, DRILL_PROMOTE, ROLLBACK, RESUME) whose effective instant is the start of the family's
-  current champion epoch in the fold. The bound manifest sha is the fold's latest for the family
-  and the artefact sha the introducing row's (``FamilyView``).
+  current champion epoch in the fold. Both bound shas are the introducing row's (E-24;
+  ``FamilyView``).
 * An export that is being written while a resolve reads it is refused (``export_unreadable`` or
   ``export_prefix_mismatch``) and self-heals: the next resolve, after the writer finished, reads
   the whole file. The refusal is fail-closed and never cached.

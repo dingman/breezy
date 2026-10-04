@@ -138,8 +138,12 @@ class World:
 
     def pin_child_to_root_artefact(self) -> None:
         """A drill child shares its incumbent's artefact (``validate``), so its manifest pins it."""
-        raw = self.child_raw.replace(CHILD_ART_SHA.encode(), ART_SHA.encode())
-        raw = raw.replace(CHILD_ARTEFACT_PATH.encode(), ROOT_ARTEFACT_PATH.encode())
+        self.pin_child_artefact(ART_SHA, ROOT_ARTEFACT_PATH)
+
+    def pin_child_artefact(self, sha: str, path: str = CHILD_ARTEFACT_PATH) -> None:
+        """The child's manifest pins ``sha`` as its density (E-24: its MINT binds the same)."""
+        raw = self.child_raw.replace(CHILD_ART_SHA.encode(), sha.encode())
+        raw = raw.replace(CHILD_ARTEFACT_PATH.encode(), path.encode())
         target = self.data / "registry" / "families" / f"{CHILD}.json"
         target.chmod(0o644)
         self.child_raw, self.child_sha = raw, _sha(raw)

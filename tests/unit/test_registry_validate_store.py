@@ -20,6 +20,7 @@ from breezy.persistence.autonomy.schemas import (
     RefusalReason,
     State,
 )
+from tests.unit.registry_manifest_density import density_of
 from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, Chain, at, run
 from tests.unit.test_registry_fold_effects import NEXT_DAY
 from tests.unit.test_registry_fold_validate import (
@@ -61,6 +62,7 @@ class Manifests:
         self.table[(family, sha)] = ManifestFacts(
             family_id=family, manifest_sha256=sha, d0_climate_day=d0,
             trial_id_prefix=prefix or f"{kind}/trial/{family}/", composition_kind=kind,
+            density_artefact_sha256=density_of(sha),
         )  # fmt: skip
 
     def __call__(self, family_id: str, manifest_sha256: str) -> ManifestFacts | None:
@@ -128,6 +130,7 @@ def test_first_champion_row_needs_readable_manifest_facts_for_its_own_sha() -> N
     mismatched.table[(CHILD, CHILD_MAN)] = ManifestFacts(
         family_id=INCUMBENT, manifest_sha256=CHILD_MAN, d0_climate_day=DAY,
         trial_id_prefix=f"{KIND}/trial/{INCUMBENT}/", composition_kind=KIND,
+        density_artefact_sha256=density_of(CHILD_MAN),
     )  # fmt: skip
     wrong_family = first_promote(mismatched)
     assert (

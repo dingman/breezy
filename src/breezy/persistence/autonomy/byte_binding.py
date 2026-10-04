@@ -12,7 +12,8 @@ the single-read rule and answers ``FamilyBytes`` or ``ByteBindingFailure``:
   ``pins.MODEL_CLASS_COMPONENTS`` (exactly one match, A8b-R2).
 
 Choices ARCH leaves open, fixed here: ``verify_bound_bytes`` is the keyword form (the resolver binds
-the fold's latest manifest sha and the introducing artefact sha, which no single row carries);
+the family's introducing manifest sha (E-24) and the introducing artefact sha, which no single
+row carries);
 ``verify_family_bytes(row, ...)`` is its thin wrapper over one row's columns.
 
 Split out of ``family_bytes`` (A8c-R7) so the store, which needs only the manifest-facts reader,
