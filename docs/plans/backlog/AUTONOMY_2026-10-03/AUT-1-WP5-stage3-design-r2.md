@@ -469,3 +469,67 @@ Key paths:
 - **RC-2 ACCEPTED.** Files over 800 lines at base take only their forced lines, at most +6, and no new tests. Splitting `test_autonomy_bwrap_argv.py`, `test_autonomy_self_probe.py` and `test_autonomy_units_wrapped.py` is a follow-up.
 - **New reason codes ACCEPTED.** `net_reachable` and `net_iface_visible` are filed as an erratum to the E-7e(d) vocabulary. The R-4 carve-out covers `self_probe.py` and `studies_lock.py`, with SEC review mandatory.
 - **F10, leg N cannot see a decimal NBP marker.** This is a merged-code defect. It fails closed today, and S2 fixes it through D11.
+
+## Round-2 peer review resolution (coordinator, 2026-10-04; SEC APPROVE, ARCH and python REQUEST_CHANGES; binding, amends r2)
+
+### Run structure (replaces r2's D2 steps 3–5, the S3-R8 placement and the heal floor and reserve)
+- **S3-R24, one deadline owner.**
+  - `_main` owns a single `DEADLINE` token in float monotonic seconds. It covers heal, the family loop and the duties.
+  - The `run_audit(..., deadline_s: float)` seam is renamed from `deadline_ns`, and `run_audit` never sets or resets `DEADLINE`.
+  - Duties that do not depend on the family, such as `_check_settlements` / `CAPTURE_SETTLEMENT_MISSING`, run ONCE per run, inside the deadline.
+  - Add a test: N families give one `SETTLEMENT_MISSING` send.
+- **S3-R25, heal runs first.**
+  - Heal runs BEFORE the family loop, after the lock is taken. It runs even with ZERO families: the family-enumeration early return moves after heal.
+  - Heal has its own time box, `HEAL_BUDGET_S`, inside the run deadline. Exceeding it is a duty FAILURE (exit 1, paging through `OnFailure=`), never a silent deferral.
+  - `HEAL_FLOOR_S`, `HEAL_RESERVE_S`, M-FLOOR and the deferral concept are deleted.
+  - This removes both starvation and the lost-kill window.
+- **S3-R26, fresh clock after the lock.** Re-read the clock and `today` after the lock is acquired. That fresh clock drives heal's 1800 s and 600 s boundaries, audit-file `ts_ns`, and `today`. The snapshot keeps its own `now`. Add a test with an injected clock that advances during the wait, and the mutant M-STALECLOCK.
+- **S3-R27, E-9 corrected.**
+  - For a oneshot unit, `TimeoutStartSec` covers the ExecStartPre lines. The audit's pre lines bound to 5 + 5 + 10 = 20 s, so ExecStart is `timeout -k 5 1475`, giving 20 + 1475 + 5 ≤ 1500.
+  - The in-process bound is `exec_start + 1475 − 60`. `AUDIT_WORK_BUDGET_S` stays, with its existing pin. Document that `min(...)` makes the effective budget smaller.
+  - Recompute the E-9 table and the latest ends with this rule for every unit. Tests pin BOTH literals, `TimeoutStartSec` and the `timeout` value, and their relation.
+
+### Streams and ownership
+- **S3-R28, stub pins per stream.** 3a adds empty `S1_REAL` and `S2_REAL` sets to `test_capture_audit_stubs.py`, on separate, non-adjacent lines, following the `W2_REAL` precedent. Each stream edits only its own line. 3c unions them into `REAL_MODULES`.
+- **S3-R29, heal constants.** 3a freezes `HEAL_BUDGET_S` and `HEAL_JOURNAL_DAYS` in `capture_heal.py`, and S3 may read them. The time-box check lives in `run_heal_duty` (S1); 3c only calls it.
+- **S3-R30, D11 extraction.**
+  - 3a moves `list_names` and `_read_file` (as the public `read_file`) out of `capture_audit_inputs.py` into a new `src/breezy/analysis/capture_audit_io.py`.
+  - `inputs` re-exports `list_names`, so its pinned surface stays unchanged.
+  - The contract module imports `capture_audit_io`, `single_read` and the input types, and never imports `inputs`. A test pins that there is no import cycle.
+  - S1 reads `list_names` from `capture_audit_io`.
+- **S3-R31, write-scope gate.** 3a adds a strict-xfail test that fails while any `AUT1_WRITE_AUTHORITY` row for the heal or live-proof modules still holds `"*"`. 3c narrows the rows and removes the xfail.
+
+### Heal correctness
+- **S3-R32, growth (HIGH).**
+  - Growth is measured only over non-dot entries: `*.feather` files of size > 0, plus the data subdirectories.
+  - `.preflight-memo-v1.json`, `.salvaged-*`, `.converted-*` and every other dot-file are excluded.
+  - Add `test_preflight_memo_and_salvage_markers_are_not_growth`, plus the mutant M-DOT.
+- **S3-R33, real fixtures.**
+  - F7 is corrected: the host journal holds 44 real `UNIT_RESULT=watchdog` lines, for other units. None is for the recorder.
+  - The S3-R1 fixture is one real watchdog line, taken verbatim from another unit. Keep the real `timeout` line as well. Drop the "derived" variant.
+  - The instance matcher reuses `_INSTANCE_MSG_RE`'s character set from `capture_node_log_decisions.py:97`.
+
+### Security build conditions (all ACCEPTED)
+- **S3-R34, probe connect.** The self-probe connect uses `SOCK_DGRAM` to the literal `198.51.100.7:80`, with a short timeout. UDP sends no packet even if isolation is broken. AC7 names the `-proc` and audit rows as the V3 cases.
+- **S3-R35, settlement writes (RC-1).** Add a runtime test through the `replace` seam (`capture_settlement.py:405`). Every target must match `settlement_\d{4}-\d{2}-\d{2}\.jsonl`, the old bytes must be a prefix of the new bytes, and the only `O_CREAT` must be `LOCK_FILE`. Add a mutant.
+  - Also add a test that the audit and live-proof write only capture-family verdicts into `derived/verdicts`.
+- **S3-R36, lint by call position.** D10 matches calls by `(lineno, col_offset)`, not by line. Add a mutation test for two subprocess calls on one line.
+- **S3-R37, closure tests.** Add a `sys.modules` subprocess closure test (no `breezy.adapters*`, `httpx`, `requests`, `aiohttp` or `urllib3`) for each of: `capture_live_proof_cli`, `capture_heal_io`, `capture_aut6_contract` and `studies_lock`.
+- **S3-R38, lock helper.**
+  - `acquire_studies_lock` also requires `st_nlink == 1`. Its fd is `O_CLOEXEC` and is never passed to a child process.
+  - Validate `network` by type (`str`) before the DNS and fallback checks.
+  - Mutants: nlink, and a non-str network value.
+
+### Stage 4 and tests
+- **S3-R39, the stage-4 checklist gains:**
+  - (a) Precondition: AUT-6's spool-sender unit is live and draining.
+  - (b) Precondition: the AUT-6 marker-shape erratum is merged before the real ledger (item 7 moves ahead of item 6).
+  - (c) Provision `evidence/alerts`.
+  - (d) Add AUT-6's outbox module to `WRITE_MODULE_FUNCTIONS`, and grant `write_imports` to the three CLIs.
+  - (e) One-writer rows for the spool: AUT-1 writes outbox entries, AUT-6 writes `_d.json`.
+  - (f) Re-run host V3 and V4 after the alerts bind.
+  - (g) Register the audit unit in AUT-6's `IN_PROCESS_STUDIES_LOCK_UNITS` if that list is linted.
+- **S3-R40, mutation and test fixes.**
+  - Add the mutants M-SEV2 (ABANDONED → INFO, and an unknown event not raising), M-ANSI and M-STALECLOCK.
+  - `test_delivery_send_accepts_prefixed_events` asserts `failed == 0` and that `offer` was called. F8's wording is corrected: the `KeyError` is caught and counted as a failure.
+  - RC-2 addendum: a forced edit over +6 lines pulls the file split forward. The limit is never relaxed.
