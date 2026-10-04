@@ -174,10 +174,14 @@ def test_a_ruling_file_failure_in_the_lineage_gate_is_ruling_missing(
     )
 
 
-def test_the_shadow_step_set_stays_the_one_documented_raise() -> None:
+def test_the_resolver_never_raises_for_bad_input_and_documents_the_shadow_step_set() -> None:
+    """8d removed the one documented raise: the docstring names no exception, the shadow step set
+    instead (and no ``NotImplementedError`` is left in the module)."""
     doc = inspect.getdoc(resolver_mod) or ""
-    assert "never raises" in doc and "8d" in doc
-    assert "except" in doc.split("never raises", 1)[1].split("\n\n", 1)[0]
+    assert "never raises" in doc
+    assert "except" not in doc.split("never raises", 1)[1].split("\n\n", 1)[0]
+    assert "{0, 2, 3, 5, 6, 7, 8}" in doc
+    assert "NotImplementedError" not in inspect.getsource(resolver_mod)
 
 
 # --- A8c-R6 ---

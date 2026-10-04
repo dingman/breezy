@@ -42,6 +42,7 @@ from breezy.persistence.autonomy.resolver import (
     HwmMode,
     ResolvedFamily,
     ResolverRefusal,
+    ShadowResolution,
     read_family_source,
     resolve_sending_family,
 )
@@ -466,11 +467,11 @@ def test_resolve_private_rejects_skip_hwm_on_production_paths(
     )
     assert refusal_of(shadow_enforce).reason is RefusalReason.PATHS_ROLE_MISMATCH
     assert isinstance(resolve(world, hwm_of(rooted), now=NOW_EARLY), ResolvedFamily)  # control
-    with pytest.raises(NotImplementedError):  # the shadow step set is seam 8d
-        resolve(
-            world, HwmAbsent(), now=NOW_EARLY, hwm_mode=HwmMode.SKIP_SHADOW,
-            paths=ShadowPaths(tmp_path / "shadow"),
-        )  # fmt: skip
+    shadow_root = ShadowPaths(world.data)  # the same files read as a shadow root: the pair agrees
+    assert isinstance(
+        resolve(world, HwmAbsent(), now=NOW_EARLY, hwm_mode=HwmMode.SKIP_SHADOW, paths=shadow_root),
+        ShadowResolution,
+    )
 
 
 def test_the_public_entry_refuses_shadow_paths_before_anything_is_read(tmp_path: Path) -> None:

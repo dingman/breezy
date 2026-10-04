@@ -234,3 +234,15 @@ def test_resolver_consumers_contract_forbids_every_live_package_strictly() -> No
     assert contract["allow_indirect_imports"] is False
     assert not AUT1_CONTRACT_NAME.startswith("ARCH-0 autonomy (")
     assert len(_contracts()) == 3
+
+
+def test_contract_lists_are_final_at_the_last_seam_a_module() -> None:
+    """8d: the resolver (sending and shadow) is the last seam A module. Contract (b) names every
+    autonomy module, (c) every one but the pyarrow-reaching ones, and the resolver is in (b)
+    only. The AUT-1 consumer contract is untouched (it names the resolver as forbidden)."""
+    contract_b, contract_c = _contract_sources()
+    existing = _existing_modules()
+    resolver = f"{AUTONOMY_PACKAGE}.resolver"
+    assert contract_b == existing
+    assert contract_c == existing - PYARROW_REACHING
+    assert resolver in contract_b and resolver not in contract_c

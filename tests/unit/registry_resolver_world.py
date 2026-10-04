@@ -30,6 +30,7 @@ from breezy.persistence.autonomy.resolver import (
     HwmMode,
     ResolvedFamily,
     ResolverRefusal,
+    ShadowResolution,
     _resolve,
 )
 from breezy.persistence.autonomy.schemas import ExportTrailer, Kind, StagePolicy, State
@@ -47,7 +48,7 @@ ENGINE_PINS: Final = frozenset({SHA_B})
 NOW_EARLY: Final = at("2026-10-09", "13:00")
 POLICY_OK: Final = LineagePolicyDecision(authorized=True, reason="ok", ruling_sha256="a" * 64)
 
-Result = ResolvedFamily | ResolverRefusal
+Result = ResolvedFamily | ShadowResolution | ResolverRefusal
 Gate = Callable[..., LineagePolicyDecision]
 
 

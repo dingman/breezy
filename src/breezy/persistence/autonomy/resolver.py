@@ -1,11 +1,15 @@
-"""The sending resolver (ARCH-0 seam A 8c; AC 17, AC 19).
+"""The sending and shadow resolvers (ARCH-0 seam A 8c and 8d; AC 17, AC 18, AC 19).
 
 ``resolve_sending_family(*, venue, paths, repo_root, now_ns, hwm)`` answers one question: which
 family may send for ``venue`` now, and on what bytes. It returns a ``ResolvedFamily`` or a
 ``ResolverRefusal``; it never raises for a bad venue, registry, export, manifest, artefact or ruling
-file, and a refusal names a closed reason (and at most a closed detail), never a path. The one
-exception is the shadow step set of seam 8d: ``_resolve`` in ``SKIP_SHADOW`` mode raises
-``NotImplementedError`` (it is unreachable from the public entry).
+file, and a refusal names a closed reason (and at most a closed detail), never a path.
+
+``resolve_shadow_family(*, venue, paths, repo_root, now_ns)`` is the same question on a
+``ShadowPaths`` root: it ignores the node high-water mark and runs the explicit step set
+{0, 2, 3, 5, 6, 7, 8} (A5-R7). Step 4 is skipped; steps 9 to 12 do not run, because a
+``ShadowResolution`` carries no bytes, no manifest, no ruling and no HWM, and so cannot send.
+Nothing may call it outside ``SHADOW_CALL_SITES`` (empty until AUT-5a).
 
 Step 1 (a shadow ``paths`` is refused as ``paths_role_mismatch``) is coded here, in the public
 entry, and is not part of ``_resolve``. ``_resolve`` runs steps 0 and 2 to 12 of AC 17:
@@ -51,8 +55,8 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   is ``root_not_lineage_allowlisted`` (the gate cannot say whether the ruling or the root is the
   unknown part, so both read as the latter).
 * ``registry_seq`` is the head ``venue_seq`` the resolve verified.
-* The shadow step set belongs to seam 8d; ``_resolve`` in ``SKIP_SHADOW`` mode raises
-  ``NotImplementedError`` after the role check.
+* ``_trace`` (a test seam) is told each step number as it starts; the shadow step set is pinned by
+  a test that reads it.
 """
 
 from __future__ import annotations
@@ -80,7 +84,13 @@ from breezy.persistence.autonomy.chain import (
 from breezy.persistence.autonomy.fold import FamilyView, FoldInvalid, FoldResult, Origin, fold
 from breezy.persistence.autonomy.fold_pairs import PairStatus, PairView
 from breezy.persistence.autonomy.fold_tallies import parse_carried
-from breezy.persistence.autonomy.hwm import Hwm, HwmReading, hwm_check, next_hwm
+from breezy.persistence.autonomy.hwm import (
+    Hwm,
+    HwmReading,
+    hwm_check,
+    hwm_reading_from_bytes,
+    next_hwm,
+)
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
 from breezy.persistence.autonomy.registry_export import (
     ExportAbsent,
@@ -113,15 +123,22 @@ from breezy.persistence.live_orders_gate import (
 
 __all__ = [
     "RESOLVE_BUSY_TIMEOUT_MS",
+    "SHADOW_CALL_SITES",
     "FamilySource",
     "HwmMode",
     "ResolvedFamily",
     "ResolverRefusal",
     "SendingState",
+    "ShadowResolution",
     "manifest_equal_modulo_allowlist",
     "read_family_source",
     "resolve_sending_family",
+    "resolve_shadow_family",
 ]
+
+#: The modules that may call ``resolve_shadow_family``. Empty: AUT-5a adds the supervisor and the
+#: watch actor in the same commit that wires them (binding note 7; test-asserted by an AST scan).
+SHADOW_CALL_SITES: Final[frozenset[str]] = frozenset()
 
 FAMILY_SOURCE_ENV: Final = "BREEZY_FAMILY_SOURCE"
 #: How long the resolve waits for a registry writer (A8c-R6); the watch loop's is shorter.
@@ -196,6 +213,27 @@ class ResolvedFamily:
     export_check: ExportCheck
     verified_export_seq: int
     hwm: Hwm
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ShadowResolution:
+    """The family a shadow resolve found sending, and nothing it could send with (AC 18).
+
+    A separate dataclass with no shared base: no bytes, no manifest, no ruling, no HWM and no
+    ``entries_allowed``. It is only ever logged.
+    """
+
+    family_id: str
+    state: SendingState
+    registry_seq: int
+    chain_head: str
+
+
+StepTrace = Callable[[int], None]
+
+
+def _no_trace(_step: int) -> None:
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,22 +340,28 @@ def _verify_registry(
     stage: StageView,
     hwm_mode: HwmMode,
     busy_timeout_ms: int,
+    note: StepTrace,
 ) -> _Verified | ResolverRefusal:
-    """Steps 2 to 8: the verified chain, its fold and the one family that sends."""
+    """Steps 2 to 7: the verified chain, its fold and the one family that sends."""
+    note(2)
     chain = _read_chain(venue, paths, now_ns, busy_timeout_ms)
     if isinstance(chain, ResolverRefusal):
         return chain
+    note(3)
     exports = _read_exports(venue, paths, chain, now_ns)
     if isinstance(exports, ResolverRefusal):
         return exports
     export_check, export_seq, export = exports
     if hwm_mode is HwmMode.ENFORCE:
+        note(4)
         problem = hwm_check(chain, hwm, newest_export_seq=export_seq)
         if problem is not None:
             return _refuse(problem)
+    note(5)
     admissible = transitions.rows_admissible(chain.rows, stage=stage)
     if admissible.reason is not None:
         return _refuse(admissible.reason)
+    note(6)
     replayed = replay_full(chain, paths=paths, repo_root=repo_root)
     if not isinstance(replayed, ReplayOk):
         return _refuse(replayed.reason)
@@ -327,6 +371,7 @@ def _verify_registry(
     view = fold(chain.rows, venue, now_ns)
     if isinstance(view, FoldInvalid):
         return _refuse(RefusalReason.REPLAY_INVALID)
+    note(7)
     senders = view.senders
     if len(senders) > 1:
         return _refuse(RefusalReason.ENGINE_INCONSISTENCY)
@@ -442,12 +487,12 @@ def _bind_sender(
     lineage_gate: LineageGate,
     engine_pins: frozenset[str],
     revoked: frozenset[str],
+    authorising: TransitionRow,
+    state: SendingState,
+    note: StepTrace,
 ) -> ResolvedFamily | ResolverRefusal:
-    """Steps 8 to 12: the sender's bytes, gate, routing and engine pins."""
+    """Steps 9 to 12: the sender's bytes, gate, routing and engine pins."""
     family = ok.family
-    authorising = _authorising_row(ok.chain, family)
-    if authorising is None:
-        return _refuse(RefusalReason.ENGINE_INCONSISTENCY)
     root_view = ok.view.families.get(family.lineage_root_family_id)
     root_sha = None if root_view is None else root_view.manifest_sha256
     if family.origin is Origin.CHILD and root_sha is None:
@@ -467,22 +512,23 @@ def _bind_sender(
         return _refuse(bound.reason)
     manifest = bound.manifest
     if family.origin is Origin.ROOT:
+        note(9)
         refusal = _root_gate(manifest, repo_root)
     else:
+        note(10)
         refusal = _child_gate(manifest, family.lineage_root_family_id, repo_root, lineage_gate)
         problem = _first_champion_problem(ok.chain, manifest, ok.view.pairs)
         if refusal is None and problem is not None:
             refusal = _refuse(problem)
     if refusal is not None:
         return refusal
+    note(11)
     if not _is_routed(manifest):
         return _refuse(RefusalReason.KIND_NOT_LIVE_GATE_ROUTED)
     engine = _engine_problem(authorising, engine_pins, revoked)
     if engine is not None:
         return _refuse(engine)
-    state = _sending_state(family)
-    if state is None:
-        return _refuse(RefusalReason.ENGINE_INCONSISTENCY)
+    note(12)
     return ResolvedFamily(
         family_id=family.family_id,
         state=state,
@@ -515,14 +561,18 @@ def _resolve(
     _fixture_stage: bool = False,
     _engine_pins: frozenset[str] | None = None,
     _revoked_pins: frozenset[str] | None = None,
-) -> ResolvedFamily | ResolverRefusal:
-    """Steps 0 and 2 to 12 (step 1 is the public entry's). The ``_`` parameters are test seams."""
+    _trace: StepTrace | None = None,
+) -> ResolvedFamily | ShadowResolution | ResolverRefusal:
+    """Steps 0 and 2 to 12 (step 1 is the public entry's); a shadow mode stops after step 8.
+
+    The ``_`` parameters are test seams.
+    """
+    note = _no_trace if _trace is None else _trace
+    note(0)
     if stage is not stage_policy.STAGE and not _fixture_stage:
         return _refuse(RefusalReason.STAGE_NOT_CANONICAL)
     if (hwm_mode is HwmMode.SKIP_SHADOW) != paths.is_shadow:
         return _refuse(RefusalReason.PATHS_ROLE_MISMATCH)
-    if hwm_mode is HwmMode.SKIP_SHADOW:
-        raise NotImplementedError("the shadow step set is seam 8d")
     try:
         venue = check_venue(venue)
     except WireRefused:
@@ -536,9 +586,22 @@ def _resolve(
         stage=stage,
         hwm_mode=hwm_mode,
         busy_timeout_ms=busy_timeout_ms,
+        note=note,
     )
     if isinstance(verified, ResolverRefusal):
         return verified
+    note(8)
+    authorising = _authorising_row(verified.chain, verified.family)
+    state = _sending_state(verified.family)
+    if authorising is None or state is None:
+        return _refuse(RefusalReason.ENGINE_INCONSISTENCY)
+    if hwm_mode is HwmMode.SKIP_SHADOW:
+        return ShadowResolution(
+            family_id=verified.family.family_id,
+            state=state,
+            registry_seq=verified.chain.head_venue_seq,
+            chain_head=verified.chain.head_hash,
+        )
     return _bind_sender(
         verified,
         venue=venue,
@@ -547,6 +610,9 @@ def _resolve(
         lineage_gate=lineage_gate,
         engine_pins=pins.ENGINE_SOURCE_SHA256 if _engine_pins is None else _engine_pins,
         revoked=pins.REVOKED_SOURCE_SHA256 if _revoked_pins is None else _revoked_pins,
+        authorising=authorising,
+        state=state,
+        note=note,
     )
 
 
@@ -565,7 +631,7 @@ def resolve_sending_family(
     """
     if paths.is_shadow:
         return _refuse(RefusalReason.PATHS_ROLE_MISMATCH)
-    return _resolve(
+    resolved = _resolve(
         venue=venue,
         paths=paths,
         repo_root=repo_root,
@@ -576,3 +642,38 @@ def resolve_sending_family(
         hwm_mode=HwmMode.ENFORCE,
         busy_timeout_ms=busy_timeout_ms,
     )
+    if isinstance(resolved, ShadowResolution):  # unreachable: ENFORCE never yields one; fail closed
+        return _refuse(RefusalReason.PATHS_ROLE_MISMATCH)
+    return resolved
+
+
+def resolve_shadow_family(
+    *,
+    venue: str,
+    paths: AutonomyPaths | ShadowPaths,
+    repo_root: Path,
+    now_ns: int,
+    busy_timeout_ms: int = RESOLVE_BUSY_TIMEOUT_MS,
+) -> ShadowResolution | ResolverRefusal:
+    """The family the shadow registry would let send, without the HWM and without its bytes.
+
+    A production ``paths`` is refused as ``paths_role_mismatch`` (the attribute is read, never an
+    ``isinstance``). The step set is {0, 2, 3, 5, 6, 7, 8} (module docstring). The result is only
+    ever logged: it carries nothing a sender could use.
+    """
+    if not paths.is_shadow:
+        return _refuse(RefusalReason.PATHS_ROLE_MISMATCH)
+    resolved = _resolve(
+        venue=venue,
+        paths=paths,
+        repo_root=repo_root,
+        now_ns=now_ns,
+        hwm=hwm_reading_from_bytes(None),
+        stage=stage_policy.STAGE,
+        lineage_gate=lineage_policy_authorized,
+        hwm_mode=HwmMode.SKIP_SHADOW,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    if isinstance(resolved, ResolvedFamily):  # unreachable: SKIP_SHADOW never yields one
+        return _refuse(RefusalReason.PATHS_ROLE_MISMATCH)
+    return resolved
