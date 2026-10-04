@@ -574,7 +574,7 @@ def test_import_order_is_schemas_then_transitions_then_stage_policy() -> None:
     assert stage not in graph[schemas]
     assert trans not in graph[schemas]
     importers = {name for name, deps in graph.items() if stage in deps}
-    assert importers == {pre + "registry_store"}  # 6e; the resolver (8c) joins it later
+    assert importers == {pre + "registry_store", pre + "resolver"}  # 6e; the resolver joined (8c)
 
 
 def test_cycle_detector_sees_a_planted_cycle_and_a_planted_back_edge() -> None:

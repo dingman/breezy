@@ -81,7 +81,7 @@ from breezy.persistence.autonomy.schemas import (
 )
 from breezy.persistence.autonomy.verdict import Verdict
 
-__all__ = ["DAY_NS", "HOUR_NS", "Ctx", "RuleII", "hwm_floor_problem"]
+__all__ = ["DAY_NS", "HOUR_NS", "Ctx", "RuleII", "carried_of", "hwm_floor_problem"]
 
 HOUR_NS: Final = 3_600 * 10**9
 DAY_NS: Final = 24 * HOUR_NS
@@ -413,6 +413,21 @@ def _lineage_below(export: CarriedLineage, carried: CarriedLineage | None) -> bo
         or (export.terminal_frozen and not carried.terminal_frozen)
         or any(not _multiset_below(export.instants[n], carried.instants[n]) for n in TUPLE_COUNTERS)
     )
+
+
+def carried_of(prior: FoldResult) -> Carried:
+    """The fold's own counters in the ``carried_counters`` shape: the floor a reset must cover."""
+    lineages = {
+        root: CarriedLineage(
+            ints={name: getattr(view.tallies, name) for name in INT_COUNTERS},
+            alpha_spent=view.tallies.alpha_spent,
+            instants={name: getattr(view.tallies, name) for name in TUPLE_COUNTERS},
+            terminal_frozen=view.tallies.terminal_frozen,
+        )
+        for root, view in prior.lineages.items()
+    }
+    venue = {name: getattr(prior.venue_tallies, name) for name in VENUE_COUNTERS}
+    return Carried(lineages, venue)
 
 
 def hwm_floor_problem(export: Carried, carried: Carried) -> str | None:

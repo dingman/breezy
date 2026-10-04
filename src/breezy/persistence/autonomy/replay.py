@@ -72,16 +72,9 @@ from typing import ClassVar, Final
 
 from breezy.persistence.autonomy import pins, transitions
 from breezy.persistence.autonomy.chain import VerifiedVenueChain
-from breezy.persistence.autonomy.family_bytes import read_manifest_facts, roots_of
+from breezy.persistence.autonomy.family_bytes import read_artefact, read_manifest_facts, roots_of
 from breezy.persistence.autonomy.fold import FoldInvalid, FoldResult, fold
 from breezy.persistence.autonomy.fold_pairs import PARTNER_KINDS, is_head
-from breezy.persistence.autonomy.fold_tallies import (
-    INT_COUNTERS,
-    TUPLE_COUNTERS,
-    VENUE_COUNTERS,
-    Carried,
-    CarriedLineage,
-)
 from breezy.persistence.autonomy.lineage import model_class_of
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths, family_component
 from breezy.persistence.autonomy.schemas import (
@@ -93,12 +86,11 @@ from breezy.persistence.autonomy.schemas import (
     TransitionRow,
 )
 from breezy.persistence.autonomy.single_read import (
-    ReadPolicy,
     SingleReadRefused,
     open_root,
-    read_once_at,
     walk_dirs,
 )
+from breezy.persistence.autonomy.validate_ii import carried_of
 from breezy.persistence.autonomy.verdict import (
     Verdict,
     VerdictKind,
@@ -233,21 +225,6 @@ def _batch_end(rows: Sequence[TransitionRow], start: int) -> int:
     ):
         end += 1
     return end
-
-
-def _carried_of(prior: FoldResult) -> Carried:
-    """The fold's own counters in the ``carried_counters`` shape: the floor a reset must cover."""
-    lineages = {
-        root: CarriedLineage(
-            ints={name: getattr(view.tallies, name) for name in INT_COUNTERS},
-            alpha_spent=view.tallies.alpha_spent,
-            instants={name: getattr(view.tallies, name) for name in TUPLE_COUNTERS},
-            terminal_frozen=view.tallies.terminal_frozen,
-        )
-        for root, view in prior.lineages.items()
-    }
-    venue = {name: getattr(prior.venue_tallies, name) for name in VENUE_COUNTERS}
-    return Carried(lineages, venue)
 
 
 def _find_verdict(
@@ -409,23 +386,7 @@ def _resolve_roles(
 
 def _read_artefact(paths: AutonomyPaths | ShadowPaths, model_class: str, sha: str) -> bytes | None:
     """The artefact's bytes, or ``None`` for anything but a clean STRICT read."""
-    parts = paths.artefact_dir(model_class, sha).relative_to(paths.root).parts
-    try:
-        rootfd = open_root(paths.root)
-    except SingleReadRefused:
-        return None
-    try:
-        dirfd = walk_dirs(rootfd, parts)
-        try:
-            return read_once_at(
-                dirfd, _ARTEFACT_NAME, max_bytes=pins.ARTEFACT_MAX_BYTES, policy=ReadPolicy.STRICT
-            )
-        finally:
-            os.close(dirfd)
-    except SingleReadRefused:
-        return None
-    finally:
-        os.close(rootfd)
+    return read_artefact(paths, model_class, sha)
 
 
 def _probe_artefact(walk: _Walk, kind: str, sha: str) -> bytes | None:
@@ -488,7 +449,7 @@ def _validate_batch(
         if failure is not None:
             return failure
         resolved.update(found)
-    export = _carried_of(prior) if any(r.kind is Kind.HWM_RESET for r in batch) else None
+    export = carried_of(prior) if any(r.kind is Kind.HWM_RESET for r in batch) else None
     refusal = transitions.first_refusal(
         prior, batch, manifests=walk.facts, export_counters=export, verdicts=resolved
     )

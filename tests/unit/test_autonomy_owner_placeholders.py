@@ -269,7 +269,7 @@ def test_marker_scan_reports_a_param_without_a_literal_id_so_it_cannot_match_a_r
 _ROW: Final = OwnerRow(
     "tests/unit/planted.py::test_carried",
     "AUT-5:WP1",
-    "breezy.persistence.autonomy.resolver:resolve_sending_family",
+    "breezy.persistence.autonomy.nomination:check_k_nomination",
     frozenset({"PROMOTE"}),
 )
 
