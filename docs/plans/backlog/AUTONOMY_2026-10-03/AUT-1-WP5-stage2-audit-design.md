@@ -369,3 +369,22 @@ ARCH scored correctness 7, fit 7, tests 6, risk 6, minimality 7, feasibility 6. 
   - `_r3_boot` checks the cap before the `last_ts is None` early return.
   - `entry_lines_capped` joins `ERROR_CAUSES`, and the exact-set test is extended.
   - R2 day bucketing: both sides use the same clock for the day cut. Pick `wall_ns`, matching the streams, or prove the log ts equals `wall_ns`. Add a test with a record within 1 ms of midnight.
+
+## Stage 2c review-fix outcome (fix B 541a8426, fix A 9e45eb60 → 11472df5)
+- **Fix B.** S2-R28..R33 and S2-R40..R46 are done, with a mutation for each. R46's shared clock is the line's `now_ns`, already pinned equal to `eval_ns` / `wall_ns`. R44 dedupe is done in the audit, because no outbox dedupes.
+- **Fix A.** S2-R34..R38 are done. On S2-R39, two pushbacks are ACCEPTED:
+  - leg D: the exec store records Breezy's own side, opens BUY and closes SELL (`exec/reports.py:773-800`), so no change;
+  - the new causes are finding causes, not `ERROR_CAUSES`, so the model is untouched.
+  The `tape_marks` hour filter and the R6 metric were already right; both are now pinned.
+- **S2-R47, REJECTED deviation (fix B, S2-R31).**
+  - `capture_audit_host.py` restates `subprocess.PIPE` and `DEVNULL` as the literals -1 and -3, so the one-writer and closure lints don't see them. That is the same laundering class as S2-R26.
+  - Use `subprocess.PIPE` and `subprocess.DEVNULL`.
+  - Make the lints accept them honestly. Either the lint treats these two stdio constants as non-write references (pinned by a test that `subprocess.run` / `Popen` / `os.*` writes are still caught), or `_run_template`'s row explicitly admits them (WIDENED, not relaxed).
+  - Delete the pin test of the literal values.
+- **S2-R48, PASS fixtures under S2-R36.**
+  - The s2c PASS fixtures (`pass_entry_day`, `pass_exit_day`) must carry a node scan consistent with R1–R3: its decisions, a matching funnel row, and the exit fixture's Exit record present in both the replay and the stream.
+  - Leg F's no-scan pending stays. Fix the fixtures, never the leg.
+- **S2-R47/R48 outcome (5770d198, rebased to 389fb2b2).**
+  - The closure lint exempts exactly the two bare stdio-constant references (`STDIO_CONSTANT_REFERENCES`). Unlisted `subprocess.run`, `Popen`, `os.write` and `os.replace` are still caught, and a laundering test is pinned.
+  - The PASS fixtures derive their scan, replay and funnel from their own records.
+  - **Accepted correction.** R2 does not replay Exit lines (`_REPLAYED_KINDS`). The exit fixture's Exit record therefore lives in the stream only, and its loss is caught by leg D (`exit_record_missing`).
