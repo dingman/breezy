@@ -118,7 +118,11 @@ class Chain:
         elif kind is Kind.MINT:
             base["lineage_root_family_id"] = INCUMBENT
         base.update(extra)
-        if kind in (Kind.BOOTSTRAP, Kind.MINT):  # E-24: the manifest pins the row's artefact
+        if kind in (
+            Kind.BOOTSTRAP,
+            Kind.ROOT_ADMIT,
+            Kind.MINT,
+        ):  # E-24: the manifest pins the row's artefact
             base.update(introducer_columns(family, base, DEFAULT_MANIFEST.get(family)))
         draft = TransitionRow(**base)
         row = replace(draft, transition_id=draft.computed_transition_id())

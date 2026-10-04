@@ -33,8 +33,19 @@ def default_manifest(family: str, artefact: str) -> str:
 
 
 def bind(manifest_sha256: str, artefact_sha256: str) -> None:
-    """Record that the manifest at ``manifest_sha256`` pins ``artefact_sha256`` as its density."""
-    _ARTEFACT_OF[manifest_sha256] = artefact_sha256
+    """Record that the manifest at ``manifest_sha256`` pins ``artefact_sha256`` as its density.
+
+    A sha already bound to another artefact is a fixture bug (a family's pin never moves), so it
+    raises instead of silently overwriting.
+    """
+    bound = _ARTEFACT_OF.setdefault(manifest_sha256, artefact_sha256)
+    if bound != artefact_sha256:
+        raise ValueError(f"manifest {manifest_sha256[:8]} is already bound to another artefact")
+
+
+def reset() -> None:
+    """Forget every registered manifest (each test starts empty)."""
+    _ARTEFACT_OF.clear()
 
 
 def density_of(manifest_sha256: str) -> str:
@@ -48,12 +59,19 @@ def introducer_columns(
 ) -> dict[str, Any]:
     """``manifest_sha256`` and ``artefact_sha256`` for a BOOTSTRAP or MINT row, registered.
 
-    A column a test names is kept; a missing one is defaulted so the manifest pins the artefact.
+    A column a test names is kept; a missing one is defaulted so the manifest pins the artefact
+    (a manifest already registered keeps the artefact it pins).
     """
-    artefact = given.get("artefact_sha256") or default_artefact(family)
-    manifest = (
-        given.get("manifest_sha256") or manifest_default or default_manifest(family, artefact)
-    )
+    manifest = given.get("manifest_sha256")
+    artefact = given.get("artefact_sha256")
+    if not artefact:  # a test that names only a manifest takes the artefact that manifest pins
+        artefact = _ARTEFACT_OF.get(manifest or "") or default_artefact(family)
+    if not manifest:  # the family's conventional sha, unless it already pins another artefact
+        free = (
+            manifest_default is not None
+            and _ARTEFACT_OF.get(manifest_default, artefact) == artefact
+        )
+        manifest = (manifest_default or "") if free else default_manifest(family, artefact)
     bind(manifest, artefact)
     return {"manifest_sha256": manifest, "artefact_sha256": artefact}
 

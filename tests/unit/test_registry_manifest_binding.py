@@ -17,6 +17,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
+import pytest
+
 import breezy.persistence.autonomy.transitions as tm
 from breezy.persistence.autonomy.family_bytes import read_manifest_facts
 from breezy.persistence.autonomy.fold import fold
@@ -132,18 +134,64 @@ def test_a_batch_reads_one_manifest_once_across_the_rules_that_need_it() -> None
     assert reader.reads == [(OTHER, OTHER_MAN)]  # type: ignore[attr-defined]
 
 
-def test_the_density_rule_covers_bootstrap_and_only_the_introducing_kinds() -> None:
-    boot = Chain()
-    row = boot.add(
-        Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT,
-        manifest_sha256=INC_MAN, artefact_sha256=INC_ART,
+INTRODUCERS: Final = [
+    (Kind.BOOTSTRAP, State.CHAMPION, {}),
+    (Kind.ROOT_ADMIT, State.CHAMPION, {"effective_launch_date": "2026-10-10"}),
+    (Kind.MINT, State.SHADOW, {}),
+]
+
+
+def _introducer(kind: Kind, to: State, extra: dict[str, Any]) -> tuple[Any, Any, Reader]:
+    """The empty-chain prior (a MINT's lineage root is INCUMBENT, so it gets a champion first)."""
+    chain = champion_chain() if kind is Kind.MINT else Chain()
+    prior = run(chain, NOW)
+    family = OTHER if kind is Kind.MINT else INCUMBENT
+    row = chain.add(
+        kind, to, family=family, manifest_sha256=INC_MAN if family == INCUMBENT else OTHER_MAN,
+        artefact_sha256=INC_ART if family == INCUMBENT else OTHER_ART, **extra,
     )  # fmt: skip
-    prior = run(Chain(), NOW)
-    assert refused(pinning({(INCUMBENT, INC_MAN): INC_ART}), prior, [row]) is None
-    assert refused(pinning({(INCUMBENT, INC_MAN): OTHER_ART}), prior, [row]) == (
+    assert row.manifest_sha256 is not None and row.artefact_sha256 is not None
+    return prior, row, pinning({(family, row.manifest_sha256): row.artefact_sha256})
+
+
+@pytest.mark.parametrize(("kind", "to", "extra"), INTRODUCERS, ids=lambda v: str(v)[:20])
+def test_the_density_rule_covers_every_introducing_kind(
+    kind: Kind, to: State, extra: dict[str, Any]
+) -> None:
+    prior, row, honest = _introducer(kind, to, extra)
+    assert refused(honest, prior, [row]) is None  # control: the pin is the row's artefact
+    wrong = pinning({(row.family_id, row.manifest_sha256): "9" * 64})
+    assert refused(wrong, prior, [row]) == (
         "manifest_density_not_bound", RefusalReason.ARTEFACT_SHA_MISMATCH,
     )  # fmt: skip
-    # a later row of the family is not an introducer: it reads no manifest for the density pin
+    unnamed = replace(row, manifest_sha256=None)  # an introducer names a manifest, always
+    assert refused(honest, prior, [unnamed]) == (
+        "manifest_density_not_bound", RefusalReason.MANIFEST_UNREADABLE,
+    )  # fmt: skip
+
+
+def test_a_root_admit_without_a_manifest_cannot_be_rescued_by_a_later_promote() -> None:
+    """The later row would be the first to pin a manifest: the introducer is refused first."""
+    chain = Chain()
+    prior = run(chain, NOW)
+    admit = chain.add(
+        Kind.ROOT_ADMIT, State.CHAMPION, family=INCUMBENT, effective_launch_date="2026-10-10",
+        artefact_sha256=INC_ART,
+    )  # fmt: skip
+    admit = replace(admit, manifest_sha256=None)
+    promote = replace(
+        chain.add(Kind.PROMOTE, State.CHAMPION, family=INCUMBENT, frm=State.CHAMPION),
+        manifest_sha256=INC_MAN,
+    )
+    reader = pinning({(INCUMBENT, INC_MAN): INC_ART})
+    got = tm.first_refusal(prior, [admit, promote], manifests=reader)
+    assert got is not None and got.row_index == 0
+    assert (got.rule.value, got.reason) == (
+        "manifest_density_not_bound", RefusalReason.MANIFEST_UNREADABLE,
+    )  # fmt: skip
+
+
+def test_a_row_of_a_known_family_reads_no_manifest_for_the_density_pin() -> None:
     chain = champion_chain()
     prior = run(chain, NOW)
     demote = chain.add(
@@ -172,11 +220,7 @@ def test_sentinel_root_bootstrap_density_equals_artefact(tmp_path: Path) -> None
         manifest_sha256=sha, artefact_sha256=SENTINEL_SHA,
     )  # fmt: skip
     assert not isinstance(prior, tuple) and refused(reader, prior, [bound]) is None  # control
-    chain = Chain()
-    wrong = chain.add(
-        Kind.BOOTSTRAP, State.RETIRED, family="pm_us_crh_v4",
-        manifest_sha256=sha, artefact_sha256=ART_SHA,
-    )  # fmt: skip
+    wrong = replace(bound, artefact_sha256=ART_SHA)  # the same manifest, another artefact
     assert refused(reader, prior, [wrong]) == (
         "manifest_density_not_bound", RefusalReason.ARTEFACT_SHA_MISMATCH,
     )  # fmt: skip
@@ -314,3 +358,20 @@ def test_the_validate_rule_set_is_exact() -> None:
         "demoted_not_cleared",
         "launch_window_cause",
     }
+
+
+def test_the_density_fixture_refuses_a_conflicting_rebind() -> None:
+    """A manifest sha pins one artefact for the whole test (A8d-R2)."""
+    from tests.unit import registry_manifest_density as fixture
+
+    fixture.bind("a1" * 32, "b1" * 32)
+    fixture.bind("a1" * 32, "b1" * 32)  # the same pair again is fine
+    with pytest.raises(ValueError):
+        fixture.bind("a1" * 32, "c1" * 32)
+
+
+def test_the_density_fixture_registry_starts_empty_each_test() -> None:
+    from tests.unit import registry_manifest_density as fixture
+
+    fixture.bind("a2" * 32, "b2" * 32)
+    assert fixture.density_of("a1" * 32) == "f" * 64  # the previous test's binding is gone

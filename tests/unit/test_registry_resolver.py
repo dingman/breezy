@@ -461,7 +461,7 @@ def test_resolve_private_rejects_skip_hwm_on_production_paths(
     """AC 17.0: the hwm mode and the paths role must agree, in both directions."""
     skip = resolve(world, HwmAbsent(), now=NOW_EARLY, hwm_mode=HwmMode.SKIP_SHADOW)
     assert refusal_of(skip).reason is RefusalReason.PATHS_ROLE_MISMATCH
-    assert not ShadowPaths(tmp_path / "shadow").is_shadow is False  # a shadow root is shadow
+    assert ShadowPaths(tmp_path / "shadow").is_shadow  # a shadow root is shadow
     shadow_enforce = resolve(
         world, HwmAbsent(), now=NOW_EARLY, paths=ShadowPaths(tmp_path / "shadow")
     )

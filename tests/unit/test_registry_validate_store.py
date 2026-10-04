@@ -52,23 +52,32 @@ class Manifests:
     """A manifest reader over a table; other keys read as ``None``; ``banned`` is never read."""
 
     def __init__(self, banned: frozenset[str] = frozenset()) -> None:
-        self.table: dict[tuple[str, str], ManifestFacts | None] = {}
+        #: Facts, or the (family, sha, d0, prefix, kind) to build them at read time: the density pin
+        #: is whatever the (later built) introducing row registered for that manifest.
+        self.table: dict[tuple[str, str], Any] = {}
         self.banned = banned
         self.reads: list[str] = []
 
     def add(
         self, family: str, sha: str, d0: str, *, prefix: str | None = None, kind: str = KIND
     ) -> None:
-        self.table[(family, sha)] = ManifestFacts(
-            family_id=family, manifest_sha256=sha, d0_climate_day=d0,
-            trial_id_prefix=prefix or f"{kind}/trial/{family}/", composition_kind=kind,
-            density_artefact_sha256=density_of(sha),
-        )  # fmt: skip
+        self.table[(family, sha)] = (family, sha, d0, prefix or f"{kind}/trial/{family}/", kind)
 
     def __call__(self, family_id: str, manifest_sha256: str) -> ManifestFacts | None:
         assert family_id not in self.banned, f"the d0 rule read {family_id}"
         self.reads.append(family_id)
-        return self.table.get((family_id, manifest_sha256))
+        entry = self.table.get((family_id, manifest_sha256))
+        if not isinstance(entry, tuple):
+            return entry
+        family, sha, d0, prefix, kind = entry
+        return ManifestFacts(
+            family_id=family,
+            manifest_sha256=sha,
+            d0_climate_day=d0,
+            trial_id_prefix=prefix,
+            composition_kind=kind,
+            density_artefact_sha256=density_of(sha),
+        )
 
 
 def nominated() -> Chain:
@@ -193,16 +202,20 @@ def test_d0_rule_ignores_an_earlier_child_that_never_took_effect() -> None:
 
 
 def test_root_admit_exempt_from_d0_rule() -> None:
+    """A ROOT_ADMIT reads only its own manifest (the E-24 density pin), never for d0: a d0 far in
+    the past would breach the rule if it applied, and no other family's manifest is read."""
     chain = Chain()
-    never = Manifests(banned=frozenset({INCUMBENT, CHILD, SECOND}))
+    reader = Manifests(banned=frozenset({CHILD, SECOND}))
+    reader.add(INCUMBENT, INC_MAN, "2000-01-01")
 
     refused = probe(
         chain, NOW, Kind.ROOT_ADMIT, State.CHAMPION, family=INCUMBENT, frm=None,
-        effective_launch_date=DAY, manifest_sha256=INC_MAN, manifests=never,
+        effective_launch_date=DAY, manifest_sha256=INC_MAN, artefact_sha256=INC_ART,
+        manifests=reader,
     )  # fmt: skip
 
     assert refused is None
-    assert never.reads == []
+    assert reader.reads == [INCUMBENT]
 
 
 def test_rollback_and_a_repeat_promote_of_a_former_champion_are_exempt() -> None:

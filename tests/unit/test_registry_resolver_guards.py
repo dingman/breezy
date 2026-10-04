@@ -217,3 +217,58 @@ def test_exit_gate_stays_code_only() -> None:
         assert "exit_gate" not in path.read_text(encoding="utf-8"), path.name
     assert "exit_rule" not in CHILD_MANIFEST_ALLOWLIST
     assert "no_leg_exit" not in CHILD_MANIFEST_ALLOWLIST
+
+
+# --- A8d-R3 (SEC 2): inside the autonomy package too, an import-node allowlist ---
+
+#: The autonomy modules that may import the resolver. Empty: its only consumers are AUT-5a's
+#: (outside the package) and the tests.
+AUTONOMY_RESOLVER_IMPORTERS: Final[frozenset[str]] = frozenset()
+
+
+def _import_nodes_naming_resolver(source: str, module: str) -> list[int]:
+    """Lines of the Import and ImportFrom nodes of ``source`` that name the resolver."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            if any(a.name == RESOLVER_MODULE for a in node.names):
+                lines.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom):
+            target = _absolute(node, module, is_package=False)
+            if target == RESOLVER_MODULE or (
+                target == AUTONOMY_PACKAGE and any(a.name == "resolver" for a in node.names)
+            ):
+                lines.append(node.lineno)
+    return lines
+
+
+def test_no_autonomy_module_imports_the_resolver_outside_the_allowlist() -> None:
+    judged, hits = 0, []
+    for path in sorted(AUTONOMY_SRC.glob("*.py")):
+        module = _module_of(path)
+        if module == RESOLVER_MODULE or module in AUTONOMY_RESOLVER_IMPORTERS:
+            continue
+        judged += 1
+        hits += [
+            f"{path.name}:{n}"
+            for n in _import_nodes_naming_resolver(path.read_text(encoding="utf-8"), module)
+        ]
+    assert judged > 30  # not vacuous
+    assert hits == []
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "import breezy.persistence.autonomy.resolver\n",
+        "from breezy.persistence.autonomy.resolver import resolve_sending_family\n",
+        "from breezy.persistence.autonomy import resolver\n",
+        "from . import resolver\n",
+        "from .resolver import ResolvedFamily\n",
+    ],
+)
+def test_the_autonomy_import_scan_fires_on_each_form(planted: str) -> None:
+    assert _import_nodes_naming_resolver(planted, "breezy.persistence.autonomy.replay")
+    assert not _import_nodes_naming_resolver(
+        "from breezy.persistence.autonomy import chain\n", "breezy.persistence.autonomy.replay"
+    )

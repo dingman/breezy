@@ -497,6 +497,7 @@ def _bind_sender(
     root_sha = None if root_view is None else root_view.manifest_sha256
     if family.origin is Origin.CHILD and root_sha is None:
         return _refuse(RefusalReason.CHILD_ROOT_MISMATCH)  # no root bound: no yardstick (A8c-R1)
+    note(9 if family.origin is Origin.ROOT else 10)
     bound = verify_bound_bytes(
         venue=venue,
         family_id=family.family_id,
@@ -512,10 +513,8 @@ def _bind_sender(
         return _refuse(bound.reason)
     manifest = bound.manifest
     if family.origin is Origin.ROOT:
-        note(9)
         refusal = _root_gate(manifest, repo_root)
     else:
-        note(10)
         refusal = _child_gate(manifest, family.lineage_root_family_id, repo_root, lineage_gate)
         problem = _first_champion_problem(ok.chain, manifest, ok.view.pairs)
         if refusal is None and problem is not None:

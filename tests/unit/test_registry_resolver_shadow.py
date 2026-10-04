@@ -39,6 +39,7 @@ from tests.unit.registry_resolver_world import (
     forge,
     hwm_of,
     populate,
+    replay_stubbed,
     resolve,
     root_chain,
     serving,
@@ -156,12 +157,8 @@ def test_shadow_runs_no_byte_binding_gate_or_hwm_step(
 
 
 def test_shadow_refusals_are_the_sending_refusals_of_the_same_steps(world: World) -> None:
-    """A shadow resolve refuses on the chain's own faults: empty, a clock before the head."""
-    empty = shadow(world)
-    assert refusal_of(empty).reason in {
-        RefusalReason.REGISTRY_UNREADABLE,
-        RefusalReason.EMPTY_CHAIN,
-    }
+    """A shadow resolve refuses on the chain's own faults: no registry, a clock before the head."""
+    assert refusal_of(shadow(world)).reason is RefusalReason.REGISTRY_UNREADABLE
     chain = populate(world, root_chain(world))
     early = refusal_of(shadow(world, now=chain.rows[-1].ts_ns - 301 * 10**9))
     assert early.reason is RefusalReason.CLOCK_BEFORE_HEAD
@@ -170,12 +167,15 @@ def test_shadow_refusals_are_the_sending_refusals_of_the_same_steps(world: World
 
 
 def test_shadow_with_no_champion_refuses_no_sender(world: World) -> None:
+    """A valid chain (the root, then its RETIRE) that leaves nobody sending."""
     chain = root_chain(world)
     chain.add(Kind.RETIRE, State.RETIRED, family=INCUMBENT, frm=State.CHAMPION)
     forged = forge(chain)
-    with serving(forged):
+    with serving(forged), replay_stubbed():  # isolate step 7, as the sending twin does
         got = shadow(world)
-    assert refusal_of(got).reason in {RefusalReason.NO_SENDER, RefusalReason.REPLAY_INVALID}
+    assert refusal_of(got).reason is RefusalReason.NO_SENDER
+    with serving(forged):
+        assert isinstance(shadow(world), ResolverRefusal)  # real replay: still never a champion
 
 
 def test_paths_role_mismatch_both_directions(world: World, tmp_path: Path) -> None:

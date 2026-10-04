@@ -53,6 +53,10 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
 * Every caller must also run ``transitions.rows_admissible`` on the chain (resolver step 5): replay
   judges the rules, not the stage gate. A HWM_RESET's carried counters are floored here only by
   the prior fold; the resolver (8c) also checks them against the newest export (B9).
+* When ``validate`` refuses a BOOTSTRAP, ROOT_ADMIT or MINT for its density pin (E-24) and the
+  artefact or the manifest that locates it is itself untrustworthy, the result is the artefact
+  failure (``ReplayArtefactMismatch``), not ``ReplayInvalid``: both are the same unreadable
+  manifest, and the artefact reason is the more specific (A8d deviation 6).
 * ``verify_family_bytes`` is not needed here: the resolver's own byte binding (8c) still runs after
   replay, on the champion alone.
 

@@ -481,10 +481,16 @@ def _artefact_binding(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
 def _manifest_density_bound(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
     """E-24: an introducing row's manifest pins, as its density, the artefact the row binds.
 
+    Every row that introduces a family (BOOTSTRAP, ROOT_ADMIT, MINT: unknown to the fold and to the
+    earlier rows of the batch) must name a manifest, so a later row is never the first to pin one
+    (A8d-R1).
+
     A new density is a new child family, so a family's manifest never names another artefact.
     Fails closed: a missing or unreadable manifest is ``manifest_unreadable`` (the engine writes
     the family file before its MINT row). A sentinel root binds the sentinel file, so it holds too.
     """
+    if row.family_id in ctx.prior.families or row.family_id in ctx.known:
+        return None
     facts = (
         None if row.manifest_sha256 is None else ctx.manifests(row.family_id, row.manifest_sha256)
     )
@@ -516,8 +522,8 @@ def _manifest_binding(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
 
 
 _CHECKS: Final[Mapping[Kind, tuple[_Check, ...]]] = {
-    Kind.BOOTSTRAP: (ii.bootstrap, _manifest_density_bound),
-    Kind.MINT: (ii.mint_rate, _manifest_density_bound),
+    Kind.BOOTSTRAP: (ii.bootstrap,),
+    Kind.MINT: (ii.mint_rate,),
     Kind.PROMOTE: (
         _infeasible_alpha,
         ii.terminal_frozen,
@@ -605,6 +611,7 @@ def first_refusal(
             ii.introduction,
             _from_state,
             *_CHECKS.get(row.kind, ()),
+            _manifest_density_bound,
             _artefact_binding,
             _manifest_binding,
         )

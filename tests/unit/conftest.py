@@ -153,3 +153,13 @@ def iter_captured_market_payloads(
     for path in sorted(directory.glob("*.json")):
         walk(json.loads(path.read_text(encoding="utf-8")))
     return found
+
+
+@pytest.fixture(autouse=True)
+def _forget_registered_manifests() -> Iterator[None]:
+    """E-24 fixtures register each introducing manifest's density pin; no test sees another's."""
+    from tests.unit import registry_manifest_density
+
+    registry_manifest_density.reset()
+    yield
+    registry_manifest_density.reset()

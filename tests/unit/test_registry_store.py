@@ -3,6 +3,10 @@
 Reader, exports and ``newest_export`` are seam 6f. ``test_family_artefact_binding_immutable`` is
 not here: its subject is unspecified and its code (a ``validate`` rule) lands in seams 7c and 7d, so
 the placement STOP rule applies (reported to the coordinator).
+
+The store's manifest reader is a fixture here (E-24: each introducing row's manifest pins that
+row's artefact). The repo-only and roots behaviour of the real reader is proven by the replay and
+parity tests, not by this file.
 """
 
 from __future__ import annotations
@@ -145,7 +149,11 @@ def mk(
     if kind in (Kind.BOOTSTRAP, Kind.ROOT_ADMIT):
         base["lineage_root_family_id"] = family  # a root names itself (E-14; fold 7b)
     base.update(over)
-    if kind in (Kind.BOOTSTRAP, Kind.MINT):  # E-24: the manifest pins the row's artefact
+    if kind in (
+        Kind.BOOTSTRAP,
+        Kind.ROOT_ADMIT,
+        Kind.MINT,
+    ):  # E-24: the manifest pins the row's artefact
         base.update(introducer_columns(family, base))
     draft = TransitionRow(**base)
     return replace(draft, transition_id=draft.computed_transition_id())

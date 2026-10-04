@@ -81,7 +81,7 @@ def reason_of(refusal: Any) -> RefusalReason | None:
 
 def venue_only(chain: Chain) -> Chain:
     """A chain whose only family is RETIRED: the venue has no sender."""
-    chain.add(Kind.BOOTSTRAP, State.RETIRED, family=INCUMBENT)
+    chain.add(Kind.BOOTSTRAP, State.RETIRED, family=INCUMBENT, artefact_sha256=INC_ART)
     return chain
 
 
@@ -202,7 +202,7 @@ def test_bootstrap_only_seed_families_in_their_seed_state(family: str, to: State
 def root_admit(chain: Chain, **extra: Any) -> Any:
     return probe(
         chain, NOW, Kind.ROOT_ADMIT, State.CHAMPION, family=OTHER, frm=None,
-        effective_launch_date=DAY, manifest_sha256=INC_MAN, **extra,
+        effective_launch_date=DAY, manifest_sha256=OTHER_MAN, **extra,
     )  # fmt: skip
 
 
@@ -1221,10 +1221,37 @@ def test_a_mint_reads_only_its_own_manifest_once() -> None:
     assert reads == [(OTHER, mint_row.manifest_sha256)]
 
 
+RULE_II_NAMES: Final = frozenset(
+    {
+        "family_not_introduced",
+        "root_lineage_mismatch",
+        "bootstrap_not_genesis",
+        "bootstrap_not_seed",
+        "root_admit_venue_has_sender",
+        "lineage_terminal_frozen",
+        "mint_rate",
+        "sender_change_daily_cap",
+        "rollback_target_not_eligible",
+        "rollback_target_ineligible",
+        "rollback_target_too_old",
+        "rollback_dwell",
+        "rollback_budget",
+        "attest_validity",
+        "attest_cadence",
+        "swap_cancel_voids_not_pending",
+        "hwm_export_missing",
+        "hwm_counters_malformed",
+        "hwm_carried_below_export",
+        "single_sender",
+    }
+)
+
+
 def test_every_rule_ii_name_is_unique_and_wired() -> None:
     names = [r.value for r in tm.RuleII]
     assert len(names) == len(set(names)) == len(tm.RuleII)
     assert not set(names) & {r.value for r in tm.Rule}  # a refusal names exactly one rule
+    assert set(names) == RULE_II_NAMES
 
 
 # --- A7d-R2: the cancel window mirrors the fold's ----------------------------------------------
@@ -1305,7 +1332,7 @@ def test_only_an_immediate_introducer_makes_an_artefact_held_for_the_mint_exempt
     prior = run(chain, NOW)
     root = chain.add(
         Kind.ROOT_ADMIT, State.CHAMPION, family=OTHER, effective_launch_date=DAY,
-        manifest_sha256=INC_MAN, artefact_sha256=SECOND_ART,
+        manifest_sha256=OTHER_MAN, artefact_sha256=SECOND_ART,
     )  # fmt: skip
     first = chain.add(
         Kind.MINT, State.SHADOW, family="pm_us_crh_x", ts=NOW, artefact_sha256=SECOND_ART,
