@@ -714,3 +714,20 @@ All six implementer deviations are accepted:
   - After BOOTSTRAP, any git edit to `deploy/families/<root>.json` permanently prevents that root from sending. Re-binding the same family_id is refused (`MANIFEST_BINDING_IMMUTABLE`), so the only remedy is a new root family id.
   - AUT-5a obligation: the engine writes the family file before its MINT row. 8d proves only the store half.
   - Split trigger: when `resolver.py` exceeds about 750 lines, move steps 9–11 to `autonomy/resolver_bind.py`.
+
+## V10 recorded (2026-10-04 17:12Z, node up)
+- **Node.** Instance `806b2f70`, booted 16:50:12Z; permit issued 16:50:13Z with a 36000 s TTL.
+- **Command.** `systemd-run --user --wait --pipe --collect --unit=breezy-autonomy-selftest -p TimeoutStartSec=120 deploy/systemd/breezy-autonomy-bwrap breezy-autonomy-selftest .venv/bin/python3 -I -m breezy.runtime.autonomy_sandbox.selftest_cli --exec-snapshot 20`
+- **Result.**
+  - `"ok": true` and `"snap": {"ok": 20, "unstable": 0, "failed": {}}`;
+  - `home_listing [".local","breezy"]`, `tmp_size_kib` 262144;
+  - runtime 469 ms, peak memory 12.7 MB.
+- **State directory.**
+  - `find state -name 'snap.*'` returns 0, both before and after.
+  - The store, WAL and SHM mtimes show only the node's own writes.
+- **V10 PASS.** Seam B's V-steps are all PASS: V0–V21.
+
+## A8d-R5 (2026-10-04, rebase onto AUT-1)
+- **What happened.** The full gate on the rebased 8c/8d (`2f11d95e`) went red in one test: `test_contract_lists_are_final_at_the_last_seam_a_module` asserted `contract_b == every autonomy module`.
+- **Why.** That test predates AUT-1. AUT-1 WP1's `NAUTILUS_PERMITTED` capture modules are exempt from (b) by ruling, and are already pinned by the classification test and the planted-module test.
+- **Fix.** Compare (b) and (c) against `existing - NAUTILUS_PERMITTED`, and add an assertion that `NAUTILUS_PERMITTED` is disjoint from both. Every other assertion is kept. This reconciles two rulings; it is not a weakening.

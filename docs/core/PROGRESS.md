@@ -64,8 +64,8 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | 1 | AUT-1-R9 | PLAN native-first AUT-1 → r12 READY (E-12) | — | DONE |
 | 2 | AUT-NATIVE | PLAN native pressure test; AUT-6 → r15, AUT-4 → r11 READY (E-11, E-13) | — | DONE |
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
-| 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | PLANNED (awaiting approval) |
-| 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | OPEN |
+| 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
+| 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 step 1, WP5 stages 1–2c merged (2be63d85); WP4 built and held for WP8; next WP5 stage 3 (heal, live_proof, units); WP3 step 2 waits on AUT-6, WP6 on AUT-4 |
 | 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | OPEN |
 | 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | OPEN |
 | 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
