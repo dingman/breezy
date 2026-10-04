@@ -101,6 +101,18 @@ EXPECTED: Final[dict[str, dict[str, str]]] = {
 }
 
 
+#: Stage 2b W2 replaced these stubs with the real reconciliation code; their signatures stay pinned
+#: by the first test below, and the stub-only tests skip them (design S2-R15).
+W2_REAL: Final[frozenset[str]] = frozenset(
+    {
+        f"{_AN}.capture_audit_replay",
+        f"{_AN}.capture_audit_log_markers",
+        f"{_AN}.capture_audit_stream_legs",
+    }
+)
+_STUBS: Final[list[str]] = sorted(set(EXPECTED) - W2_REAL)
+
+
 def _source(module: str) -> Path:
     return Path(importlib.import_module(module).__file__ or "")
 
@@ -129,7 +141,7 @@ def test_the_stub_signature_set_is_exactly_the_design_set(module: str) -> None:
     assert found == EXPECTED[module]
 
 
-@pytest.mark.parametrize("module", sorted(EXPECTED))
+@pytest.mark.parametrize("module", _STUBS)
 def test_every_stub_has_a_docstring_and_only_raises_not_implemented(module: str) -> None:
     tree = ast.parse(_source(module).read_text(encoding="utf-8"))
     assert ast.get_docstring(tree)
@@ -142,7 +154,7 @@ def test_every_stub_has_a_docstring_and_only_raises_not_implemented(module: str)
         assert isinstance(called, ast.Name) and called.id == "NotImplementedError", name
 
 
-@pytest.mark.parametrize("module", sorted(EXPECTED))
+@pytest.mark.parametrize("module", _STUBS)
 def test_every_stub_raises_not_implemented_when_called(module: str) -> None:
     mod = importlib.import_module(module)
     for name, node in _defs(module).items():
@@ -171,7 +183,7 @@ def test_each_stub_module_has_an_authority_row_with_no_write_scope_for_w1_and_w2
     rows = {row.module: row for row in AUT1_WRITE_AUTHORITY}
     for module in EXPECTED:
         assert module in rows, module
-        assert rows[module].min_calls == 1, module
+        assert rows[module].min_calls >= 1, module
     for module in (
         f"{_AN}.capture_audit_fill_legs",
         f"{_AN}.capture_audit_replay",
@@ -185,3 +197,15 @@ def test_each_stub_module_has_an_authority_row_with_no_write_scope_for_w1_and_w2
     assert f"{_AN}.capture_audit_wire" in rows
     assert f"{_AN}.capture_node_log_markers" in rows
     assert f"{_AN}.capture_node_log_sinks" in rows
+
+
+@pytest.mark.parametrize("module", sorted(W2_REAL))
+def test_the_w2_modules_are_real_implementations(module: str) -> None:
+    """A W2 module keeps its docstring and its pinned signatures but no function body is a stub."""
+    tree = ast.parse(_source(module).read_text(encoding="utf-8"))
+    assert ast.get_docstring(tree)
+    for name, node in _defs(module).items():
+        body = node.body[1:] if ast.get_docstring(node) else node.body
+        raises = [n for n in body if isinstance(n, ast.Raise)]
+        assert not (len(body) == 1 and raises), f"{name} is still a stub"
+    assert "NotImplementedError" not in _source(module).read_text(encoding="utf-8")

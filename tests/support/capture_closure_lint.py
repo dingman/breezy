@@ -184,9 +184,9 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
     # -- W1: fill legs (no writes) --
     AuthorityRow("breezy.analysis.capture_audit_fill_legs", min_calls=1),
     # -- W2: reconciliation (no writes) --
-    AuthorityRow("breezy.analysis.capture_audit_replay", min_calls=1),
-    AuthorityRow("breezy.analysis.capture_audit_log_markers", min_calls=1),
-    AuthorityRow("breezy.analysis.capture_audit_stream_legs", min_calls=1),
+    AuthorityRow("breezy.analysis.capture_audit_replay", min_calls=160),
+    AuthorityRow("breezy.analysis.capture_audit_log_markers", min_calls=13),
+    AuthorityRow("breezy.analysis.capture_audit_stream_legs", min_calls=110),
     # -- W3: I/O and orchestration. The audit file goes through ``single_read.write_once``; the
     # E-8 cache through ``replace_atomic``. W3 narrows these and adds any literal ``argvs``. --
     AuthorityRow(
