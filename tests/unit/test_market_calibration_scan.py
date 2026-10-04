@@ -115,8 +115,8 @@ def _truth_file(
 def _collect(
     scan: ModuleType, root: Path, truth_rows: list[tuple[str, dt.date, int]], tmp: Path
 ) -> Any:
-    truth, last = scan.load_truth(_truth_file(tmp / "truth.csv", truth_rows))
-    return scan.collect(root, truth, last)
+    loaded = scan.load_truth_checked(_truth_file(tmp / "truth.csv", truth_rows))
+    return scan.collect(root, loaded.rows, loaded.last_day, truth_invalid=loaded.invalid_counts)
 
 
 def test_scan_scopes_windows_by_date_and_hour(scan: ModuleType, tmp_path: Path) -> None:
@@ -216,10 +216,10 @@ def test_scan_bootstrap_by_calendar_day(scan: ModuleType) -> None:
         obs += _obs(scan, dt.date(2026, 9, 1 + i), "0.45", hit=i % 2 == 0, n=40)
     result = scan.build_scan(obs, min_n=30, min_days=5, resamples=2000, seed=7)
     (cell,) = result.cells
-    assert cell["n"] == 240 and cell["n_days"] == 6
+    assert cell.n == 240 and cell.n_days == 6
     # A per-row bootstrap of 240 rows would give a CI half-width near 0.06; whole-day resampling
     # of six day-means in {+0.5, -0.5} is an order of magnitude wider.
-    assert cell["ci95_hi"] - cell["ci95_lo"] > 0.4
+    assert cell.ci95_hi - cell.ci95_lo > 0.4
     # Deterministic under the pinned seed.
     again = scan.build_scan(obs, min_n=30, min_days=5, resamples=2000, seed=7)
     assert again.cells == result.cells
@@ -309,7 +309,9 @@ def test_multiplicity_reported(scan: ModuleType) -> None:
         obs += _obs(scan, day, "0.45", hit=i % 2 == 0, n=10)
         obs += _obs(scan, day, "0.25", hit=i % 3 == 0, n=10)
         obs += [
-            scan.Observation("LAX", day, "D_17Z", f"n{k}", "NO", Decimal("0.75"), 1, 2, k % 2 == 0)
+            scan.Observation(
+                "LAX", day, "D_17Z", f"n{k}", "NO", Decimal("0.75"), 1, 2, k < 3 + i % 4
+            )
             for k in range(10)
         ]
     result = scan.build_scan(obs, min_n=30, min_days=5, resamples=500, seed=3)
@@ -319,7 +321,7 @@ def test_multiplicity_reported(scan: ModuleType) -> None:
     assert 0.0 < mult["reality_check_p"] <= 1.0 and 0.0 < mult["spa_p"] <= 1.0
     assert set(mult["best_cell_by_t"]) == {"window", "side", "ask_bin"}
     for cell in result.cells:
-        assert cell["p_bonferroni"] == pytest.approx(min(1.0, cell["p_one_sided"] * 3))
+        assert cell.p_bonferroni == pytest.approx(min(1.0, cell.p_one_sided * 3))
 
 
 def test_out_dir_refuses_live_data_root(scan: ModuleType) -> None:
@@ -347,7 +349,8 @@ def test_spa_small_for_overwhelming_edge_and_large_for_noise(scan: ModuleType) -
     days = [dt.date(2026, 9, 1) + dt.timedelta(days=i) for i in range(20)]
     edge, noise = [], []
     for day in days:
-        edge += _obs(scan, day, "0.45", hit=True, n=4)  # hits every time at 0.45: huge edge
+        # Hits ~90% at 0.45 (not 100%: a constant cell has se == 0 and is excluded): huge edge.
+        edge += _obs(scan, day, "0.45", hit=True, n=3) + _obs(scan, day, "0.45", day.day % 3 != 0)
         for i in range(4):
             noise += [
                 scan.Observation(
@@ -359,3 +362,280 @@ def test_spa_small_for_overwhelming_edge_and_large_for_noise(scan: ModuleType) -
     assert strong.multiplicity["reality_check_p"] < 0.05
     null_only = scan.build_scan(noise, min_n=30, min_days=5, resamples=2000, seed=5)
     assert null_only.multiplicity["spa_p"] > 0.05
+
+
+# ---------------------------------------------------------------------------------------------
+# M1 review fixes
+# ---------------------------------------------------------------------------------------------
+
+
+def _report(scan: ModuleType, got: Any) -> Any:
+    return scan.build_report(got, scan.build_scan(got.observations, min_n=1, min_days=1))
+
+
+def test_degenerate_ask_is_invalid_not_skipped(scan: ModuleType, tmp_path: Path) -> None:
+    for tag, asks, bids in (
+        ("one", [("1.00", "5")], [("0.40", "5")]),  # YES ask exactly 1
+        ("zero", [("0.50", "5")], [("1.00", "5")]),  # NO ask = 1 - 1.00 = exactly 0
+        ("zero_yes", [("0.00", "5")], [("0.40", "5")]),  # YES ask exactly 0
+    ):
+        slug = _slug("lax", _DAY, "gte72lt73")
+        _write(tmp_path / tag, [_depth(slug, _ns(_DAY, 17, 5), asks, bids)])
+        got = _collect(scan, tmp_path / tag, [("LAX", _DAY, 72)], tmp_path)
+        assert got.invalid_counts.get("degenerate_ask", 0) >= 1, tag
+        report = scan.build_report(got, None)
+        assert report["status"] == "INVALID", tag
+        assert any("degenerate_ask" in r for r in report["invalid_reasons"]), tag
+
+
+def test_unrecognised_directory_is_invalid_but_non_high_is_not(
+    scan: ModuleType, tmp_path: Path
+) -> None:
+    slug = _slug("lax", _DAY, "gte72lt73")
+    _write(tmp_path / "cat", [_depth(slug, _ns(_DAY, 17, 5), [("0.31", "5")], [("0.2", "5")])])
+    base = tmp_path / "cat" / "data" / "order_book_depths"
+    (base / (_slug("lax", _DAY, "gte60lt61").replace("high", "low") + ".POLYMARKET_US")).mkdir()
+    ok = _collect(scan, tmp_path / "cat", [("LAX", _DAY, 72)], tmp_path)
+    assert ok.non_high_directories == 1
+    assert not ok.invalid_counts
+    assert scan.build_report(ok, None)["status"] == "VALID"
+    (base / "tc-temp-garbage.POLYMARKET_US").mkdir()
+    (base / "tc-temp-laxhigh-2026-09-10-gte72lt73lt90f.POLYMARKET_US").mkdir()  # unobserved family
+    bad = _collect(scan, tmp_path / "cat", [("LAX", _DAY, 72)], tmp_path)
+    assert bad.invalid_counts["unrecognised_directory"] == 2
+    assert scan.build_report(bad, None)["status"] == "INVALID"
+
+
+def test_window_without_depth_row_is_counted_not_invalid(scan: ModuleType, tmp_path: Path) -> None:
+    slug = _slug("lax", _DAY, "gte72lt73")
+    _write(tmp_path / "cat", [_depth(slug, _ns(_DAY, 17, 5), [("0.31", "5")], [("0.2", "5")])])
+    got = _collect(scan, tmp_path / "cat", [("LAX", _DAY, 72)], tmp_path)
+    assert got.windows_without_depth == 2  # D-1_18Z and D_12Z have no row
+    report = _report(scan, got)
+    assert report["status"] == "VALID"
+    assert report["windows_without_depth"] == 2
+
+
+def _raw_truth(path: Path, rows: list[dict[str, str]]) -> Path:
+    fields = ["station", "climate_day", "status", "is_final", "tmax_f", "issued_at_utc"]
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _truth_row(tmax: int, issued: str) -> dict[str, str]:
+    return {
+        "station": "LAX",
+        "climate_day": _DAY.isoformat(),
+        "status": "FINAL",
+        "is_final": "True",
+        "tmax_f": str(tmax),
+        "issued_at_utc": issued,
+    }
+
+
+def _one_rung_catalog(tmp_path: Path) -> Path:
+    slug = _slug("lax", _DAY, "gte72lt73")
+    _write(tmp_path / "cat", [_depth(slug, _ns(_DAY, 17, 5), [("0.31", "5")], [("0.2", "5")])])
+    return tmp_path / "cat"
+
+
+def test_conflicting_final_truth_rows_are_invalid(scan: ModuleType, tmp_path: Path) -> None:
+    path = _raw_truth(
+        tmp_path / "t.csv",
+        [
+            _truth_row(72, "2026-09-11T12:00:00+00:00"),
+            _truth_row(75, "2026-09-11T13:00:00+00:00"),
+        ],
+    )
+    loaded = scan.load_truth_checked(path)
+    assert loaded.invalid_counts == {"conflicting_truth_rows": 1}
+    got = scan.collect(
+        _one_rung_catalog(tmp_path),
+        loaded.rows,
+        loaded.last_day,
+        truth_invalid=loaded.invalid_counts,
+    )
+    assert scan.build_report(got, None)["status"] == "INVALID"
+    same = _raw_truth(
+        tmp_path / "same.csv",
+        [
+            _truth_row(72, "2026-09-11T12:00:00+00:00"),
+            _truth_row(72, "2026-09-11T13:00:00+00:00"),
+        ],
+    )
+    assert not scan.load_truth_checked(same).invalid_counts
+
+
+def test_naive_issued_at_is_invalid(scan: ModuleType, tmp_path: Path) -> None:
+    path = _raw_truth(tmp_path / "t.csv", [_truth_row(72, "2026-09-11T12:00:00")])
+    loaded = scan.load_truth_checked(path)
+    assert loaded.invalid_counts == {"naive_issued_at_utc": 1}
+    assert loaded.rows == {}
+    got = scan.collect(
+        _one_rung_catalog(tmp_path),
+        loaded.rows,
+        loaded.last_day,
+        truth_invalid=loaded.invalid_counts,
+    )
+    report = scan.build_report(got, None)
+    assert report["status"] == "INVALID"
+    assert any("naive_issued_at_utc" in r for r in report["invalid_reasons"])
+
+
+def test_fee_is_the_live_take_rule_fee_on_a_grid(scan: ModuleType) -> None:
+    from breezy.analysis.hypothesis_ledger import EVIDENCED_FEE_THETA
+    from breezy.strategy.current_rung_hold.decision import fee_on_ask
+
+    assert Decimal(str(EVIDENCED_FEE_THETA)) == scan.THETA
+    grid = [Decimal(i) / Decimal(200) for i in range(1, 200)]
+    assert all(scan.venue_fee(a) == fee_on_ask(a, scan.THETA) for a in grid)
+
+
+def test_rung_spec_comes_from_the_symbology_parser(scan: ModuleType) -> None:
+    from breezy.adapters.polymarket_us import symbology
+
+    for bucket in ("gte72lt73", "lt62", "gte90"):
+        name = _slug("sfo", _DAY, bucket) + ".POLYMARKET_US"
+        weather = symbology.parse_weather_slug(name.removesuffix(".POLYMARKET_US"))
+        assert weather is not None
+        want = symbology.slug_closed_interval(weather.bounds)
+        got = scan.parse_slug(name)
+        assert (got.lower, got.upper) == want
+    tree = ast.parse(_SCRIPT.read_text())
+    assert not any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "compile"
+        for n in ast.walk(tree)
+    ), "the scan must not carry a local slug regex"
+
+
+def test_zero_variance_cells_are_excluded_and_listed(scan: ModuleType) -> None:
+    obs = []
+    for i in range(8):
+        day = dt.date(2026, 9, 1 + i)
+        obs += _obs(scan, day, "0.45", hit=True, n=5)  # identical every day: se == 0
+        obs += _obs(scan, day, "0.25", hit=i % 2 == 0, n=5)
+        obs += [
+            scan.Observation(
+                "LAX", day, "D_17Z", f"n{k}", "NO", Decimal("0.75"), 1, 2, (i + k) % 3 > 0
+            )
+            for k in range(5)
+        ]
+    result = scan.build_scan(obs, min_n=30, min_days=5, resamples=500, seed=3)
+    assert [(c.side, c.ask_bin) for c in result.zero_variance_cells] == [("YES", "0.4-0.5")]
+    assert all(c.ask_bin != "0.4-0.5" for c in result.cells)
+    assert result.multiplicity["best_cell_by_t"]["ask_bin"] != "0.4-0.5"
+    assert result.multiplicity["spa_p"] > 0.05 and result.multiplicity["reality_check_p"] > 0.05
+    assert result.multiplicity["tested_cells"] == 3  # K stays conservative: every tested cell
+
+
+def test_no_payoff_is_not_outcome_end_to_end(scan: ModuleType, tmp_path: Path) -> None:
+    hit_slug = _slug("lax", _DAY, "gte72lt73")  # tmax 72 is inside -> YES wins, NO loses
+    miss_slug = _slug("lax", _DAY, "gte80lt81")  # tmax 72 is outside -> YES loses, NO wins
+    rows = [
+        _depth(s, _ns(_DAY, 17, 5), [("0.40", "5")], [("0.30", "5")]) for s in (hit_slug, miss_slug)
+    ]
+    _write(tmp_path / "cat", rows)
+    got = _collect(scan, tmp_path / "cat", [("LAX", _DAY, 72)], tmp_path)
+    hits = {(o.rung.split("-")[-1], o.side): o.hit for o in got.observations}
+    assert hits == {
+        ("gte72lt73f", "YES"): True,
+        ("gte72lt73f", "NO"): False,
+        ("gte80lt81f", "YES"): False,
+        ("gte80lt81f", "NO"): True,
+    }
+    no_win = next(o for o in got.observations if o.side == "NO" and o.hit)
+    result = scan.build_scan(_spread(scan, no_win, 20), min_n=30, min_days=5, resamples=200)
+    assert [c.side for c in [*result.cells, *result.zero_variance_cells]] == ["NO"]
+    # A winning NO bought at 0.70 pays 1 - 0.70 - fee; an inverted payoff would give -0.70 - fee.
+    cell = [*result.cells, *result.zero_variance_cells][0]
+    assert cell.mean_excess == pytest.approx(1 - 0.70 - float(scan.venue_fee(Decimal("0.70"))))
+
+
+def _spread(scan: ModuleType, template: Any, days: int) -> list[Any]:
+    return [
+        scan.Observation(
+            template.station,
+            dt.date(2026, 9, 1) + dt.timedelta(days=i),
+            template.window,
+            f"{template.rung}{k}",
+            template.side,
+            template.ask,
+            template.ref_ts_ns,
+            template.settled_ns,
+            template.hit,
+        )
+        for i in range(days)
+        for k in range(2)
+    ]
+
+
+def test_spa_detects_a_positive_cell_among_null_cells(scan: ModuleType) -> None:
+    rng = random.Random(3)
+    days = [dt.date(2026, 9, 1) + dt.timedelta(days=i) for i in range(30)]
+    obs = []
+    for day in days:
+        # Strong positive edge with some day-to-day variance.
+        obs += _obs(scan, day, "0.45", hit=True, n=3) + _obs(scan, day, "0.45", day.day % 3 != 0)
+        for bin_ask, p in (("0.25", 0.25), ("0.65", 0.65), ("0.85", 0.85)):
+            obs += [
+                scan.Observation(
+                    "LAX",
+                    day,
+                    "D_17Z",
+                    f"{bin_ask}{k}",
+                    "NO",
+                    Decimal(bin_ask),
+                    1,
+                    2,
+                    rng.random() < p + 0.02,
+                )
+                for k in range(3)
+            ]
+    mult = scan.build_scan(obs, min_n=30, min_days=5, resamples=2000, seed=9).multiplicity
+    assert mult["spa_p"] < 0.05 and mult["reality_check_p"] < 0.05
+    negative = [
+        scan.Observation("LAX", d, "D_17Z", f"x{k}", "YES", Decimal("0.45"), 1, 2, False)
+        for d in days
+        for k in range(3)
+    ]
+    nulls = [o for o in obs if o.side == "NO"]
+    flipped = scan.build_scan(negative + nulls, min_n=30, min_days=5, resamples=2000, seed=9)
+    assert flipped.multiplicity["spa_p"] > 0.05  # a strongly NEGATIVE cell is not an edge
+
+
+def test_mde_is_reported_per_cell_and_in_the_conclusion(scan: ModuleType) -> None:
+    from statistics import NormalDist, median
+
+    obs = []
+    for i in range(8):
+        day = dt.date(2026, 9, 1 + i)
+        obs += _obs(scan, day, "0.45", hit=i % 2 == 0, n=10)
+        obs += _obs(scan, day, "0.25", hit=i % 3 == 0, n=10)
+    result = scan.build_scan(obs, min_n=30, min_days=5, resamples=500, seed=3)
+    k = result.multiplicity["tested_cells"]
+    z = NormalDist().inv_cdf(1 - 0.05 / (2 * k))
+    for cell in result.cells:
+        assert cell.mde_bonferroni_80 == pytest.approx((z + 0.84) * cell.se)
+    med = median(c.mde_bonferroni_80 for c in result.cells)
+    assert result.multiplicity["median_cell_mde_80"] == pytest.approx(med)
+    assert result.multiplicity["pooled_mde_80"] > 0
+    got = scan.Collected(tuple(obs), 8, 8, 8, 8, dt.date(2026, 9, 8), (), 0, 0, 0, {}, 0)
+    conclusion = scan.build_report(got, result)["conclusion"]
+    assert f"{med * 100:.1f}" in conclusion
+    assert "NOT evidence of no edge" in conclusion
+    assert "pooled" in conclusion
+
+
+def test_orchestrators_are_short_and_flat() -> None:
+    tree = ast.parse(_SCRIPT.read_text())
+    wanted = {"collect", "build_scan", "build_report"}
+    seen = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            seen.add(node.name)
+            assert node.end_lineno is not None
+            assert node.end_lineno - node.lineno + 1 < 50, node.name
+    assert seen == wanted
