@@ -200,3 +200,19 @@ def test_the_default_replay_fixture_admits_nothing_because_the_default_boot_logs
     assert boot.replay == ReplayResult(
         admitted_total=0, admitted_by_kind={}, evaluations=0, eval_seq_final=0
     )
+
+
+# -- S2-R27: the epoch check reads the REAL heartbeat table name ----------------------------
+
+
+def test_a_boot_with_a_streamed_heartbeat_and_no_epoch_record_is_epoch_missing() -> None:
+    boot = fx.make_boot(summary=fx.make_stream_summary())
+    assert boot.summary.row_counts == {"custom_capture_heartbeat": 1}
+    with pytest.raises(AuditInputError) as info:
+        inputs._check_epoch(None, [boot], [], DAY)
+    assert info.value.cause == "epoch_missing"
+
+
+def test_a_boot_with_no_heartbeat_rows_and_no_epoch_record_is_fine() -> None:
+    boot = fx.make_boot(summary=fx.make_stream_summary(row_counts={}, heartbeats=()))
+    inputs._check_epoch(None, [boot], [], DAY)
