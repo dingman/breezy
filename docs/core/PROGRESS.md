@@ -57,6 +57,10 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
 
+### HALT POINT 2026-10-04 ~22:30Z (operator: halt development)
+Resume from `docs/plans/backlog/HALT_POINT_2026-10-04.md`. FQ v1 halt timers fire 16:40Z 10-05; check `ops/fq_halt_*.result`.
+FQ loss-response queue (plan r3 + FQ-R34..R44): M1 evidence DONE; F1 r2 pending; F2 READY; F3 PARKED (registry child-manifest conflict).
+
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
 `/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
 | # | ID | Work | Needs | Status |
@@ -65,7 +69,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | 2 | AUT-NATIVE | PLAN native pressure test; AUT-6 → r15, AUT-4 → r11 READY (E-11, E-13) | — | DONE |
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
-| 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 step 1, WP5 stages 1–2c merged (2be63d85); WP4 built and held for WP8; next WP5 stage 3 (heal, live_proof, units); WP3 step 2 waits on AUT-6, WP6 on AUT-4 |
+| 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
 | 6 | AUT-6 | BUILD drift/health, delivery proof (parallel with 5) | 4 | OPEN |
 | 7 | AUT-5a | BUILD store wiring + demotion engine; owns `app/trade.py` | 4,6 | OPEN |
 | 8 | AUT-1b | BUILD node DecisionRecord wiring | 5,7 | OPEN |
