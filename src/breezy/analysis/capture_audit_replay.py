@@ -91,7 +91,7 @@ _Entry = tuple[str, str, str, str, str, str, int, int]
 CAUSE_CAPTURE_MISSING: Final[str] = "capture_missing"
 CAUSE_CAPTURE_UNEXPLAINED: Final[str] = "capture_unexplained"
 CAUSE_VETO_UNANCHORED: Final[str] = "veto_line_unanchored"
-CAUSE_ENTRY_LINES_CAPPED: Final[str] = "entry_lines_capped"
+CAUSE_ENTRY_LINES_CAPPED: Final[str] = "entry_lines_capped"  # an ERROR cause (S2-R46)
 CAUSE_GUARD_VETO_UNMATCHED: Final[str] = "guard_veto_without_capture_refused"
 CAUSE_CAPTURE_REFUSED_UNMATCHED: Final[str] = "capture_refused_without_veto_record"
 CAUSE_R2_MISMATCH: Final[str] = "r2_sequence_mismatch"
@@ -103,9 +103,14 @@ CAUSE_LOST_IN_FLUSH_WINDOW: Final[str] = "lost_in_flush_window"
 CAUSE_FUNNEL_MISMATCH: Final[str] = "funnel_count_mismatch"
 
 
+_MIN_EPOCH_S: Final[int] = 0
+_MAX_EPOCH_S: Final[int] = 253_402_300_799  # 9999-12-31T23:59:59Z
+
+
 def _day_of(ns: int) -> dt.date:
-    """The UTC day of an epoch-ns instant (total: no instant raises)."""
-    return dt.datetime.fromtimestamp(ns // _NS, dt.UTC).date()
+    """The UTC day of an epoch-ns instant (total: an out-of-range instant is clamped, never
+    raises)."""
+    return dt.datetime.fromtimestamp(min(max(ns // _NS, _MIN_EPOCH_S), _MAX_EPOCH_S), dt.UTC).date()
 
 
 def _day_bounds(day: dt.date) -> tuple[int, int]:
@@ -159,14 +164,16 @@ class BootDayReplay(ReplayResult):
 
     ``chain_digest`` covers every admitted entry of the boot-day (``admitted_total`` of them) in log
     order. ``base_count`` and ``base_digest`` are the chain just before the entries within
-    ``FLUSH_WINDOW_S`` of the boot's last log line; ``tail`` holds one ``(count, digest)`` per such
-    entry. A stream that stops at any tail count is a legitimate flush-window loss; anywhere else
-    it is a mismatch."""
+    ``FLUSH_WINDOW_S`` of the boot's last decision line; ``tail`` holds one ``(count, digest,
+    log_ts_ns)`` per such entry. The comparison narrows the window to the boot's last LOG line
+    (S2-R41), which is never earlier, so a stored tail always covers it. A stream that stops at a
+    tail count inside that window is a legitimate flush-window loss; anywhere else it is a
+    mismatch."""
 
     chain_digest: str = ""
     base_count: int = 0
     base_digest: str = ""
-    tail: tuple[tuple[int, str], ...] = ()
+    tail: tuple[tuple[int, str, int], ...] = ()
 
 
 @dataclass(slots=True)
@@ -199,7 +206,7 @@ class _BootState:
 
 def _feed_decision(state: _BootState, line: DecisionLine) -> None:
     state.last_ts_ns = max(state.last_ts_ns, line.log_ts_ns)
-    acc = state.days.setdefault(_day_of(line.log_ts_ns), _DayAcc())
+    acc = state.days.setdefault(_day_of(line.now_ns), _DayAcc())  # the stream's clock (S2-R46)
     if state.tracker.is_duplicate(line):
         acc.duplicates += 1  # counted, never dropped: the node evaluated twice (S2-R4)
     key: _Key = (line.station, line.climate_day.isoformat(), line.rung_id, line.side)
@@ -269,7 +276,7 @@ def _day_result(state: _BootState, acc: _DayAcc) -> BootDayReplay:
         chain_digest=acc.digest.hex(),
         base_count=base_count,
         base_digest=base_digest.hex(),
-        tail=tuple((count, digest.hex()) for count, digest, _ in tail),
+        tail=tuple((count, digest.hex(), ts) for count, digest, ts in tail),
     )
 
 
@@ -298,14 +305,22 @@ class BootReplay(LogSink):
 # -- the stream side of R2 ------------------------------------------------------------------------
 
 
+def _decision_clock(kind: str, eval_ns: int, wall_ns: int) -> int:
+    """The instant a record's day is cut on: the line's own ``now_ns`` (S2-R46). An evaluation
+    line's ``now_ns`` is the record's ``eval_ns``; a follow-up line's is its ``wall_ns`` (U9)."""
+    return eval_ns if kind in EVALUATION_KINDS else wall_ns
+
+
 def _stream_entries(boot: BootEvidence, day: dt.date) -> list[_Entry]:
     """The boot's on-change ``DecisionRecord`` sequence for ``day``, in file order, guard
-    ``EntryVeto`` records excluded (the other half of S2-R5)."""
+    ``EntryVeto`` records excluded (the other half of S2-R5). The replay and this cut share one
+    clock, the log line's ``now_ns``, so a decision within a millisecond of midnight lands on the
+    same day on both sides (S2-R46)."""
     entries: list[_Entry] = []
     for record in boot.c1.decisions:
         if record.kind not in _REPLAYED_KINDS or is_guard_entry_veto(record.kind, record.reason):
             continue
-        if _day_of(record.wall_ns) != day:
+        if _day_of(_decision_clock(record.kind, record.eval_ns, record.wall_ns)) != day:
             continue
         entries.append(
             (
@@ -350,20 +365,48 @@ def _reconcile_counts(replay: ReplayResult, entries: list[_Entry]) -> _Reconcili
     return _Reconciliation(verdict, detail=f"replay={replay.admitted_total} stream={present}")
 
 
+def _flush_window(
+    boot: BootEvidence, replay: BootDayReplay
+) -> tuple[int, str, tuple[tuple[int, str], ...]]:
+    """``(base_count, base_digest, tail)`` for the window ending at the boot's last LOG line, not
+    its last decision line (S2-R41): a boot that logged for hours after its last decision flushed
+    everything older long before. The stored tail was cut at the last decision line, which is never
+    later than the last log line, so it covers every entry the narrower window can hold."""
+    last_ts = _last_line_ts(boot)
+    base_count, base_digest = replay.base_count, replay.base_digest
+    if last_ts is None:
+        return base_count, base_digest, tuple((count, digest) for count, digest, _ in replay.tail)
+    floor = last_ts - FLUSH_WINDOW_S * _NS
+    window = []
+    for count, digest, ts in replay.tail:
+        if ts < floor:
+            base_count, base_digest = count, digest
+        else:
+            window.append((count, digest))
+    return base_count, base_digest, tuple(window)
+
+
+def _last_line_ts(boot: BootEvidence) -> int | None:
+    if boot.last_line_ts_ns is not None:
+        return boot.last_line_ts_ns
+    return None if boot.scan is None else boot.scan.last_line_ts_ns
+
+
 def _reconcile(boot: BootEvidence, day: dt.date) -> _Reconciliation:
     replay = boot.replay
     entries = _stream_entries(boot, day)
     if not isinstance(replay, BootDayReplay):
         return _reconcile_counts(replay, entries)
     total, present = replay.admitted_total, len(entries)
-    known = {replay.base_count: replay.base_digest, **dict(replay.tail)}
+    base_count, base_digest, window = _flush_window(boot, replay)
+    known = {base_count: base_digest, **dict(window)}
     digests = _prefix_digests(entries, {total, present, *known})
     detail = f"replay={total} stream={present}"
     if present >= total:
         if digests[total] != replay.chain_digest:
             return _Reconciliation("mismatch", detail=detail)
         return _Reconciliation("ok" if present == total else "extra", detail=detail)
-    if present < replay.base_count or known.get(present) != digests[present]:
+    if present < base_count or known.get(present) != digests[present]:
         return _Reconciliation("lost", detail=detail)  # short, and not by the flush-window tail
     return _Reconciliation("ok", lost_in_window=total - present, detail=detail)
 
@@ -533,7 +576,7 @@ def _r1_boot(boot: BootEvidence, scan: NodeLogScan, day: dt.date) -> tuple[list[
             )
             for _ in range(max(extra, 0))
         )
-    findings.extend(_guard_findings(boot))
+    findings.extend(_guard_findings(boot, day))
     return findings, lost_in_window
 
 
@@ -542,15 +585,20 @@ def _label(key: _R1Key) -> str:
     return f"{station}/{rung_id}/{side} {kind}:{reason}@{when}"
 
 
-def _guard_findings(boot: BootEvidence) -> list[Finding]:
+def _guard_findings(boot: BootEvidence, day: dt.date) -> list[Finding]:
     """Guard ``EntryVeto`` records are matched one-to-one with ``CAPTURE_REFUSED`` lines (by
     reason). A record without a line always fails; a line without a record is tolerated only up to
-    the boot's detector events (a refusal with no known Take writes a detector instead)."""
+    the boot's detector events (a refusal with no known Take writes a detector instead). Records and
+    detector events are cut to ``day`` by the same rule ``_actual_records`` uses (S2-R40); the
+    marker lines are already partitioned by day, so a boot across midnight never charges one
+    day's refusal to the next."""
     records: Counter[str] = Counter(
         record.reason
         for record in boot.c1.decisions
         if is_guard_entry_veto(record.kind, record.reason)
+        and _day_of(_record_time(record.kind, record.eval_ns, record.wall_ns)) == day
     )
+    detectors = sum(1 for event in boot.c1.detector_events if _day_of(event.ts_event) == day)
     lines: Counter[str] = Counter(
         refused.reason for refused in _only(boot.markers.capture_refused, CaptureRefusedLine)
     )
@@ -562,7 +610,7 @@ def _guard_findings(boot: BootEvidence) -> list[Finding]:
     surplus = sum(max(lines[reason] - records.get(reason, 0), 0) for reason in lines)
     findings.extend(
         Finding(Leg.R1, LegOutcome.FAIL, CAUSE_CAPTURE_REFUSED_UNMATCHED, boot.instance_id, "")
-        for _ in range(max(surplus - len(boot.c1.detector_events), 0))
+        for _ in range(max(surplus - detectors, 0))
     )
     return findings
 
@@ -603,11 +651,11 @@ def _funnel_counts(row: FunnelRow) -> Counter[_FunnelKey]:
 
 
 def _r3_boot(inp: AuditInputs, boot: BootEvidence, scan: NodeLogScan) -> list[Finding]:
+    if scan.entry_total > len(scan.entry_lines):
+        return [Finding(Leg.R3, LegOutcome.ERROR, CAUSE_ENTRY_LINES_CAPPED, boot.instance_id)]
     last_ts = boot.last_line_ts_ns if boot.last_line_ts_ns is not None else scan.last_line_ts_ns
     if last_ts is None:
         return []
-    if scan.entry_total > len(scan.entry_lines):
-        return [Finding(Leg.R3, LegOutcome.ERROR, CAUSE_ENTRY_LINES_CAPPED, boot.instance_id)]
     race_ns = _FUNNEL_RACE_S * _NS
     stamps = [line.log_ts_ns for line in scan.entry_lines]
     eligible = [

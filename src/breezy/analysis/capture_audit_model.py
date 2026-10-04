@@ -146,6 +146,8 @@ ERROR_CAUSES: Final[frozenset[str]] = frozenset(
         "tape_unreadable",
         # S2-R22: a settlement file could not be read; never folded into a projection failure.
         "settlement_unreadable",
+        # S2-R46: R1 and R3 refuse a boot whose entry lines were capped (an unbounded scan).
+        "entry_lines_capped",
     }
 )
 

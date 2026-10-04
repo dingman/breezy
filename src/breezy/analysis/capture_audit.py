@@ -11,12 +11,18 @@
 7. ``NO_INPUT`` (no fills, resolver contexts or Take lines);
 8. ``PASS``.
 
-``days_to_audit`` orders a run: yesterday, then INCONCLUSIVE re-audits, then the backfill
-oldest-first (a day never ages out of the 8-day window). ``run_audit`` checks the work deadline on a
-monotonic clock; a day it does not reach gets NO file and is listed in ``audit_deferred_days``,
-which never causes exit 1. A day is written only after every input of it was read and every leg
-ran, so a partial day cannot exist. ``write_audit_file`` publishes through
-``single_read.write_once`` at 0444.
+``days_to_audit`` orders a run: yesterday, then INCONCLUSIVE re-audits, then the days never audited
+oldest-first (a missing day never ages out of the 8-day window), then ERROR re-audits (S2-R44).
+``run_audit`` checks the work deadline on a monotonic clock; a day it does not reach gets NO file
+and is listed in ``audit_deferred_days``, which never causes exit 1. A day is written only after
+every input of it was read and every leg ran, so a partial day cannot exist. ``write_audit_file``
+publishes through ``single_read.write_once`` at 0444.
+
+``CAPTURE_AUDIT_ERROR`` is sent once per (day, cause set) (S2-R44). No outbox in this repo dedupes
+(the alert offer is an injected callable; the default one is undeliverable, AUT-6 is not wired), so
+the audit does: a day whose newest audit file is already an ERROR with the same cause set sends
+nothing again, and a changed cause set sends. A re-audited ERROR day still counts toward the exit
+code, so the unit stays loud.
 
 Only a ``health.capture_join`` HEALTH verdict is written (S2-R12); a refused verdict write is INFO.
 The three duties moved from the retired watchdog (§3.11.5) each run in their own ``try``. The exit
@@ -167,6 +173,16 @@ def _first_cause(legs: Sequence[LegResult], outcome: LegOutcome) -> str:
     return ""
 
 
+def _error_causes(legs: Sequence[LegResult]) -> list[str]:
+    """Every ERROR cause of ``legs``, in order (a leg with no ERROR finding names itself)."""
+    causes: list[str] = []
+    for leg in legs:
+        causes.extend(f.cause for f in leg.findings if f.outcome is LegOutcome.ERROR)
+        if not any(f.outcome is LegOutcome.ERROR for f in leg.findings):
+            causes.append(leg.leg.value)
+    return causes
+
+
 def _all_legs(fills: Sequence[FillAudit], legs: Sequence[LegResult]) -> list[LegResult]:
     return [*legs, *(leg for fill in fills for leg in fill.legs)]
 
@@ -184,10 +200,9 @@ def _status(
     """The S2-R9 table. Pure: the same inputs and legs always give the same row."""
     every = _all_legs(fills, legs)
     errored = [leg for leg in every if leg.outcome is LegOutcome.ERROR]
-    if errored:
-        cause = _first_cause(errored, LegOutcome.ERROR)
-        if cause not in HOST_STATE_CAUSES:
-            return DayStatus.ERROR, cause
+    data_cause = next((c for c in _error_causes(errored) if c not in HOST_STATE_CAUSES), None)
+    if data_cause is not None:  # ANY non-host-state ERROR beats the PRE_CAPTURE mask (S2-R45)
+        return DayStatus.ERROR, data_cause
     if _is_pre_capture(_epoch_day(inp), inp.day):
         return DayStatus.PRE_CAPTURE, ""
     if errored:
@@ -312,19 +327,20 @@ def audit_day(inp: AuditInputs) -> AuditResult:
 # -- scheduling ----------------------------------------------------------------------------------
 
 
-_RE_AUDITED: Final[frozenset[DayStatus]] = frozenset({DayStatus.INCONCLUSIVE, DayStatus.ERROR})
-
-
 def days_to_audit(today: dt.date, audited: Mapping[dt.date, DayStatus]) -> tuple[dt.date, ...]:
-    """The days one run audits, in order: yesterday, then each INCONCLUSIVE or ERROR day of the last
-    ``BACKFILL_DAYS`` (oldest first), then each of those days with no audit file (oldest first).
-    ERROR is not terminal (S2-R23): its cause may be gone, so the next run audits the day again;
-    PASS, FAIL, NO_INPUT and PRE_CAPTURE are final."""
+    """The days one run audits, in order: yesterday, then each INCONCLUSIVE day of the last
+    ``BACKFILL_DAYS`` (oldest first), then each day with no audit file (oldest first), then each
+    ERROR day (oldest first). ERROR is not terminal (S2-R23): its cause may be gone, so the next
+    run audits the day again, but only after the days never audited, so a missing day cannot age out
+    behind a persistent ERROR (S2-R44). PASS, FAIL, NO_INPUT and PRE_CAPTURE are final."""
     yesterday = today - dt.timedelta(days=1)
     window = [today - dt.timedelta(days=back) for back in range(BACKFILL_DAYS, 0, -1)]
-    inconclusive = [d for d in window if d != yesterday and audited.get(d) in _RE_AUDITED]
+    inconclusive = [
+        d for d in window if d != yesterday and audited.get(d) is DayStatus.INCONCLUSIVE
+    ]
     missing = [d for d in window if d != yesterday and d not in audited]
-    return (yesterday, *inconclusive, *missing)
+    errored = [d for d in window if d != yesterday and audited.get(d) is DayStatus.ERROR]
+    return (yesterday, *inconclusive, *missing, *errored)
 
 
 # -- the audit files -----------------------------------------------------------------------------
@@ -392,18 +408,23 @@ def _list_dir(data_root: Path, rel: Sequence[str]) -> tuple[int | None, list[str
 
 def _audited_statuses(data_root: Path, family_id: str) -> dict[dt.date, DayStatus]:
     """The status of each day's NEWEST audit file; an unreadable file counts as no audit."""
+    return {day: result.status for day, result in _audited_results(data_root, family_id).items()}
+
+
+def _audited_results(data_root: Path, family_id: str) -> dict[dt.date, AuditResult]:
+    """Each day's NEWEST audit file as a result; an unreadable file counts as no audit."""
     rel = _audit_dir(family_id)
     dirfd, names = _list_dir(data_root, rel)
     if dirfd is None:
         return {}
-    found: dict[dt.date, DayStatus] = {}
+    found: dict[dt.date, AuditResult] = {}
     try:
         for day, name in _newest_by_day(names).items():
             try:
                 raw = read_once_at(
                     dirfd, name, max_bytes=_MAX_AUDIT_BYTES, policy=ReadPolicy.STRICT
                 )
-                found[day] = audit_from_wire(json.loads(raw)).status
+                found[day] = audit_from_wire(json.loads(raw))
             except (SingleReadRefused, ValueError, KeyError, TypeError) as exc:
                 _LOGGER.warning("capture audit: unreadable audit file (%s)", type(exc).__name__)
     finally:
@@ -482,11 +503,22 @@ def _failed_leg_ids(result: AuditResult, legs: Sequence[Leg]) -> list[str]:
     return sorted(ids)
 
 
-def _alert_for(result: AuditResult, delivery: _Delivery) -> None:
-    """The CRITICAL alerts of one day (§3.11.4): all through the one delivery seam."""
+def error_cause_set(result: AuditResult) -> frozenset[str]:
+    """Every cause that makes ``result`` an ERROR day: its own and its errored legs' (S2-R44)."""
+    own = {result.cause} if result.cause else set()
+    return frozenset(own | set(_error_causes(_all_legs(result.fills, result.legs))))
+
+
+def _alert_for(
+    result: AuditResult, delivery: _Delivery, prior_error: frozenset[str] | None = None
+) -> None:
+    """The CRITICAL alerts of one day (§3.11.4): all through the one delivery seam.
+    ``prior_error`` is the cause set of the day's previous audit file when that was an ERROR: the
+    same cause set is not sent again (S2-R44)."""
     head = f"day={result.day.isoformat()} family={result.family_id}"
     if result.status is DayStatus.ERROR:
-        delivery.send("CAPTURE_AUDIT_ERROR", f"{head} cause={result.cause}")
+        if prior_error != error_cause_set(result):
+            delivery.send("CAPTURE_AUDIT_ERROR", f"{head} cause={result.cause}")
         return
     if result.status is DayStatus.PRE_CAPTURE:
         return
@@ -605,11 +637,16 @@ def _audit_one(data_root: Path, family_id: str, day: dt.date, now_ns: int) -> Au
 
 
 def _publish(
-    data_root: Path, result: AuditResult, now_ns: int, delivery: _Delivery, run: _Run
+    data_root: Path,
+    result: AuditResult,
+    now_ns: int,
+    delivery: _Delivery,
+    run: _Run,
+    prior_error: frozenset[str] | None = None,
 ) -> None:
     write_audit_file(data_root, result, ts_ns=now_ns)
     _write_health_verdict(data_root, result, now_ns)
-    _alert_for(result, delivery)
+    _alert_for(result, delivery, prior_error)
     run.errors += result.status is DayStatus.ERROR
 
 
@@ -620,6 +657,7 @@ def _run_days(
     now_ns: int,
     delivery: _Delivery,
     run: _Run,
+    prior_errors: Mapping[dt.date, frozenset[str]],
 ) -> None:
     for index, day in enumerate(days):
         try:
@@ -632,7 +670,7 @@ def _run_days(
             run.failed.append(day)
             continue
         try:
-            _publish(data_root, result, now_ns, delivery, run)
+            _publish(data_root, result, now_ns, delivery, run, prior_errors.get(day))
         except Exception:
             _LOGGER.exception("capture audit: day %s could not be written", day)
             run.failed.append(day)
@@ -661,8 +699,15 @@ def run_audit(
     token = DEADLINE.set(capture_audit_inputs.MONOTONIC() + AUDIT_WORK_BUDGET_S)
     delivery, run = _Delivery(offer), _Run()
     try:
-        days = days_to_audit(today, _audited_statuses(data_root, family_id))
-        _run_days(data_root, family_id, days, now_ns, delivery, run)
+        prior = _audited_results(data_root, family_id)
+        statuses = {day: result.status for day, result in prior.items()}
+        prior_errors = {
+            day: error_cause_set(result)
+            for day, result in prior.items()
+            if result.status is DayStatus.ERROR
+        }
+        days = days_to_audit(today, statuses)
+        _run_days(data_root, family_id, days, now_ns, delivery, run, prior_errors)
     finally:
         DEADLINE.reset(token)
     _run_duties(data_root, family_id, today, now_ns, delivery, run)

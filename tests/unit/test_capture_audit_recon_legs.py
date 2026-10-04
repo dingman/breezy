@@ -13,6 +13,7 @@ admitted records and their ``eval_seq`` exactly (design S2-R4).
 import datetime as dt
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -615,3 +616,146 @@ def test_unparseable_marker_line_is_error_node_log_unparseable(tmp_path: Path) -
     bad = f"{log_ts(T)} [INFO] X: CAPTURE_EPOCH_START family=f"
     analysis = analyse(tmp_path, [bad])
     assert analysis.scan.unparseable_total == 1 and not analysis.markers
+
+
+# ================================================================================================
+# Stage 2c review: S2-R40 (guard day cut), S2-R41 (flush window), S2-R46 (day clock)
+# ================================================================================================
+
+_MIDNIGHT = DAY_END_NS
+
+
+def _straddling_boot(
+    tmp_path: Path, *, detector_day_offset_ns: int | None = None
+) -> tuple[Any, Any]:
+    """A boot across midnight with one capture-guard refusal on each side: the log lines, and a
+    guard ``EntryVeto`` record for each."""
+    lines = [
+        instance_line(_MIDNIGHT - 60 * NS),
+        refused_text(_MIDNIGHT - 5 * NS, "capture_gap"),
+        refused_text(_MIDNIGHT + 5 * NS, "capture_gap"),
+    ]
+    records = [
+        dv("EntryVeto", "capture_gap", eval_ns=_MIDNIGHT - 5 * NS, wall_ns=_MIDNIGHT - 5 * NS),
+        dv("EntryVeto", "capture_gap", eval_ns=_MIDNIGHT + 5 * NS, wall_ns=_MIDNIGHT + 5 * NS),
+    ]
+    return analyse(tmp_path, lines), records
+
+
+@pytest.mark.parametrize("day", [DAY, DAY + dt.timedelta(days=1)], ids=["day_d", "day_d_plus_1"])
+def test_a_boot_across_midnight_has_no_false_guard_fail_on_either_day(
+    tmp_path: Path, day: dt.date
+) -> None:
+    """S2-R40. MUTATION: ``_guard_findings`` counts every record of the boot instead of the day's.
+    Each day's refusal line is matched by that day's record only."""
+    analysis, records = _straddling_boot(tmp_path)
+    boot = boot_for(analysis, records, day=day)
+    assert failing(leg_r1(inputs_for(boot, day=day))) == []
+
+
+def test_a_guard_record_on_the_other_day_does_not_hide_a_missing_refusal_line(
+    tmp_path: Path,
+) -> None:
+    """S2-R40: day D's record has no line of D, so it fails even though D+1 holds a line."""
+    lines = [instance_line(_MIDNIGHT - 60 * NS), refused_text(_MIDNIGHT + 5 * NS, "capture_gap")]
+    records = [
+        dv("EntryVeto", "capture_gap", eval_ns=_MIDNIGHT - 5 * NS, wall_ns=_MIDNIGHT - 5 * NS)
+    ]
+    analysis = analyse(tmp_path, lines)
+    boot = boot_for(analysis, records, day=DAY)
+    assert failing(leg_r1(inputs_for(boot, day=DAY))) == ["guard_veto_without_capture_refused"]
+
+
+def test_a_detector_event_of_the_next_day_does_not_excuse_a_refusal_line_of_this_day(
+    tmp_path: Path,
+) -> None:
+    """S2-R40: a refusal with no known Take writes a detector event instead of a record; only the
+    day's own events count against the day's surplus lines."""
+    analysis = analyse(
+        tmp_path,
+        [instance_line(_MIDNIGHT - 60 * NS), refused_text(_MIDNIGHT - 5 * NS, "capture_gap")],
+    )
+    other_day = SimpleNamespace(ts_event=_MIDNIGHT + 5 * NS)
+    same_day = SimpleNamespace(ts_event=_MIDNIGHT - 4 * NS)
+    wrong = boot_for(analysis, [], day=DAY, detector_events=(other_day,))
+    assert failing(leg_r1(inputs_for(wrong, day=DAY))) == ["capture_refused_without_veto_record"]
+    right = boot_for(analysis, [], day=DAY, detector_events=(same_day,))
+    assert failing(leg_r1(inputs_for(right, day=DAY))) == []
+
+
+def test_a_record_lost_just_before_the_last_decision_of_a_boot_that_kept_logging_is_a_fail(
+    tmp_path: Path,
+) -> None:
+    """S2-R41. MUTATION: the tail floor anchored at the last DECISION line. The boot logged for
+    three more hours, so the flush window is long over: the missing record is FAIL, not INFO."""
+    lines = [
+        instance_line(T - NS),
+        refuse_line(0, "a"),
+        refuse_line(10 * NS, "b"),
+        refuse_line(20 * NS, "c"),
+        refused_text(T + 3 * 3600 * NS, "capture_gap"),  # the boot's last log line
+    ]
+    analysis = analyse(tmp_path, lines)
+    assert analysis.scan.last_line_ts_ns == T + 3 * 3600 * NS
+    present = [refuse_view(0, "a"), refuse_view(10 * NS, "b")]  # "c" lost
+    result = leg_r2(inputs_for(boot_for(analysis, present)))
+    assert failing(result) == ["stream_record_lost"]
+    assert result.metrics["records_lost_in_flush_window"] == 0
+
+
+def test_the_same_loss_is_flush_window_info_when_the_boot_stopped_with_that_decision(
+    tmp_path: Path,
+) -> None:
+    lines = [
+        instance_line(T - NS),
+        refuse_line(0, "a"),
+        refuse_line(10 * NS, "b"),
+        refuse_line(20 * NS, "c"),
+    ]
+    analysis = analyse(tmp_path, lines)
+    present = [refuse_view(0, "a"), refuse_view(10 * NS, "b")]
+    result = leg_r2(inputs_for(boot_for(analysis, present)))
+    assert failing(result) == []
+    assert result.metrics["records_lost_in_flush_window"] == 1
+
+
+def test_a_decision_a_millisecond_from_midnight_is_bucketed_the_same_on_both_sides(
+    tmp_path: Path,
+) -> None:
+    """S2-R46. MUTATION: cut the stream on ``wall_ns`` while the replay cuts on the line clock. The
+    record's ``wall_ns`` is 2 ms after its frame clock, which crosses midnight."""
+    line_ns = _MIDNIGHT - MS
+    lines = [
+        instance_line(line_ns - 60 * NS),
+        decision_text(line_ns, Refuse(reason="below_margin"), now_ns=line_ns),
+    ]
+    record = dv("Refuse", "below_margin", eval_ns=line_ns, wall_ns=line_ns + 2 * MS)
+    analysis = analyse(tmp_path, lines)
+    assert (INSTANCE_ID, DAY) in analysis.replay
+    assert failing(leg_r2(inputs_for(boot_for(analysis, [record])))) == []
+    next_day = DAY + dt.timedelta(days=1)
+    assert (
+        failing(leg_r2(inputs_for(boot_for(analysis, [record], day=next_day), day=next_day))) == []
+    )
+
+
+def test_a_follow_up_a_millisecond_after_midnight_lands_on_the_next_day_on_both_sides(
+    tmp_path: Path,
+) -> None:
+    """S2-R46: a TrySubmit line's ``now_ns`` is the record's ``wall_ns`` (U9), so a follow-up logged
+    just after midnight belongs to D+1 although its Take (and its ``eval_ns``) is on D."""
+    take_ns, sub_ns = _MIDNIGHT - 5 * MS, _MIDNIGHT + MS
+    lines = [
+        instance_line(take_ns - 60 * NS),
+        decision_text(take_ns, take_for(), now_ns=take_ns),
+        try_submit_text(sub_ns, "submitted"),
+    ]
+    analysis = analyse(tmp_path, lines)
+    next_day = DAY + dt.timedelta(days=1)
+    views = [
+        dv("Take", "take", eval_ns=take_ns, wall_ns=take_ns),
+        dv("TrySubmit", "submitted", eval_ns=take_ns, wall_ns=sub_ns),
+    ]
+    for day, mine in ((DAY, views[:1]), (next_day, views[1:])):
+        boot = boot_for(analysis, mine, day=day)
+        assert failing(leg_r2(inputs_for(boot, day=day))) == [], day

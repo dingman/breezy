@@ -1,14 +1,20 @@
 """AUT-1 WP5 stage 2b W3: the journals, the bus snapshot and the recorder catalog as a TapeIndex.
 
-``journalctl`` is a fake at ``subprocess.run`` (argv and timeout are asserted). The bus snapshot is
-a document in seam B's real shape read by the real ``read_bus_snapshot``. The tape is tiny REAL
-Parquet in the recorder's layout.
+``journalctl`` is a fake at ``subprocess.Popen`` whose stdout is a real pipe (argv is asserted).
+The bus snapshot is a document in seam B's real shape read by the real
+``read_bus_snapshot``. The tape is tiny REAL Parquet in the recorder's layout.
 """
 
 import ast
 import datetime as dt
+import fcntl
+import inspect
 import json
+import os
+import struct
 import subprocess
+import termios
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -27,24 +33,73 @@ SINCE, UNTIL = "2026-10-03 00:00:00 UTC", "2026-10-04 00:00:00 UTC"
 TEMPLATES = [host.INGEST_JOURNAL_ARGV, host.SUPERVISOR_JOURNAL_ARGV, host.RECORDER_JOURNAL_ARGV]
 
 
-class Done:
-    def __init__(self, stdout: str = "x\n", returncode: int = 0) -> None:
-        self.stdout, self.returncode = stdout, returncode
+class FakeProc:
+    """A launched ``journalctl``: stdout is a REAL pipe, so the bounded read is the production one.
+
+    ``hang`` keeps the write end open (a child that never finishes). ``close`` is recorded, not
+    performed, so a test can still ask the pipe how much was left unread."""
+
+    def __init__(self, data: bytes = b"x\n", returncode: int = 0, *, hang: bool = False) -> None:
+        read_fd, self._write_fd = os.pipe()
+        os.write(self._write_fd, data)
+        if not hang:
+            os.close(self._write_fd)
+        self.stdout = self
+        self._read_fd, self._returncode, self._hang = read_fd, returncode, hang
+        self.killed = self.closed = False
+
+    def fileno(self) -> int:
+        return self._read_fd
+
+    def close(self) -> None:
+        self.closed = True
+
+    def unread(self) -> int:
+        packed = fcntl.ioctl(self._read_fd, termios.FIONREAD, b"\0\0\0\0")
+        return int(struct.unpack("i", packed)[0])
+
+    def poll(self) -> int | None:
+        return None if self._hang and not self.killed else self._returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._returncode
+
+    def release(self) -> None:
+        os.close(self._read_fd)
+        if self._hang:
+            os.close(self._write_fd)
+
+
+@pytest.fixture
+def procs() -> Iterator[list[FakeProc]]:
+    made: list[FakeProc] = []
+    yield made
+    for proc in made:
+        proc.release()
 
 
 def _patch_run(
-    monkeypatch: pytest.MonkeyPatch, result: Any
+    monkeypatch: pytest.MonkeyPatch, result: Any, made: list[FakeProc]
 ) -> list[tuple[list[str], dict[str, Any]]]:
     calls: list[tuple[list[str], dict[str, Any]]] = []
 
-    def run(argv: list[str], **kw: Any) -> Any:
+    def popen(argv: list[str], **kw: Any) -> Any:
         calls.append((argv, kw))
         if isinstance(result, Exception):
             raise result
-        return result
+        proc = FakeProc(*result[:2], hang=len(result) > 2 and result[2])
+        made.append(proc)
+        return proc
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     return calls
+
+
+def _ok(text: str = "x\n") -> tuple[bytes, int]:
+    return text.encode(), 0
 
 
 # -- the journals ------------------------------------------------------------------------------
@@ -52,13 +107,19 @@ def _patch_run(
 
 @pytest.mark.parametrize("template", TEMPLATES, ids=["ingest", "supervisor", "recorder"])
 def test_run_journal_runs_the_template_with_only_the_two_slots_substituted(
-    monkeypatch: pytest.MonkeyPatch, template: tuple[str, ...]
+    monkeypatch: pytest.MonkeyPatch, template: tuple[str, ...], procs: list[FakeProc]
 ) -> None:
-    calls = _patch_run(monkeypatch, Done("line\n"))
+    calls = _patch_run(monkeypatch, _ok("line\n"), procs)
     assert host.run_journal(template, SINCE, UNTIL) == "line\n"
     ((argv, kw),) = calls
     assert argv == [SINCE if t == "{since}" else UNTIL if t == "{until}" else t for t in template]
-    assert kw["timeout"] == 30.0 and kw["check"] is False and "shell" not in kw
+    assert kw == {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
+    assert inspect.signature(host.run_journal).parameters["timeout_s"].default == 30.0
+    assert procs[0].closed
+
+
+def test_the_restated_subprocess_constants_equal_the_real_ones() -> None:
+    assert host._PIPE == subprocess.PIPE and host._DEVNULL == subprocess.DEVNULL
 
 
 @pytest.mark.parametrize(
@@ -72,12 +133,15 @@ def test_run_journal_runs_the_template_with_only_the_two_slots_substituted(
         "$(id)",
         "-1d",
         "2026-10-03 00:00:00 UTC\n--vacuum-time=1s",
+        # S2-R32: non-ASCII decimal digits are not time-slot digits.
+        "\u0662\u0660\u0662\u0666-10-03 00:00:00 UTC",
+        "2026-10-03 \uff10\uff10:00:00 UTC",
     ],
 )
 def test_a_time_slot_outside_the_grammar_runs_nothing(
-    monkeypatch: pytest.MonkeyPatch, bad: str
+    monkeypatch: pytest.MonkeyPatch, bad: str, procs: list[FakeProc]
 ) -> None:
-    calls = _patch_run(monkeypatch, Done())
+    calls = _patch_run(monkeypatch, _ok(), procs)
     for since, until in ((bad, UNTIL), (SINCE, bad)):
         with pytest.raises(AuditInputError) as info:
             host.run_journal(host.INGEST_JOURNAL_ARGV, since, until)
@@ -85,25 +149,65 @@ def test_a_time_slot_outside_the_grammar_runs_nothing(
     assert calls == []
 
 
-def test_an_unknown_template_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _patch_run(monkeypatch, Done())
+def test_an_unknown_template_is_refused(
+    monkeypatch: pytest.MonkeyPatch, procs: list[FakeProc]
+) -> None:
+    calls = _patch_run(monkeypatch, _ok(), procs)
     with pytest.raises(AuditInputError) as info:
         host.run_journal(("journalctl", "--rotate"), SINCE, UNTIL)
     assert info.value.detail == "unknown_template" and calls == []
 
 
-def test_journalctl_nonzero_timeout_or_empty_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    cases = {
-        "exit_1": Done("out", 1),
-        "timeout": subprocess.TimeoutExpired("journalctl", 30),
+def test_journalctl_nonzero_timeout_or_empty_is_error(
+    monkeypatch: pytest.MonkeyPatch, procs: list[FakeProc]
+) -> None:
+    cases: dict[str, Any] = {
+        "exit_1": (b"out", 1),
+        "timeout": (b"partial", 0, True),
         "FileNotFoundError": FileNotFoundError("journalctl"),
-        host.EMPTY_OUTPUT_DETAIL: Done("  \n"),
+        host.EMPTY_OUTPUT_DETAIL: (b"  \n", 0),
     }
     for detail, result in cases.items():
-        _patch_run(monkeypatch, result)
+        _patch_run(monkeypatch, result, procs)
         with pytest.raises(AuditInputError) as info:
-            host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL)
+            host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL, timeout_s=0.05)
         assert (info.value.cause, info.value.detail) == ("journal_failed", detail)
+
+
+def test_a_child_that_never_finishes_is_killed_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, procs: list[FakeProc]
+) -> None:
+    _patch_run(monkeypatch, (b"partial", 0, True), procs)
+    with pytest.raises(AuditInputError) as info:
+        host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL, timeout_s=0.05)
+    assert info.value.detail == "timeout" and procs[0].killed and procs[0].closed
+
+
+def test_an_oversize_journal_stops_the_read_without_buffering_it_all(
+    monkeypatch: pytest.MonkeyPatch, procs: list[FakeProc]
+) -> None:
+    """S2-R31: the cap is enforced WHILE reading. With a 10-byte cap and 8-byte chunks the read
+    stops at the second chunk; most of the 200 bytes the child wrote are never read."""
+    monkeypatch.setattr(host, "_MAX_JOURNAL_BYTES", 10)
+    monkeypatch.setattr(host, "_READ_CHUNK_BYTES", 8)
+    _patch_run(monkeypatch, (b"a" * 200, 0, True), procs)
+    with pytest.raises(AuditInputError) as info:
+        host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL)
+    assert (info.value.cause, info.value.detail) == ("journal_failed", "oversize")
+    assert procs[0].unread() == 200 - 16 and procs[0].killed
+
+
+def test_the_journal_cap_counts_bytes_not_characters(
+    monkeypatch: pytest.MonkeyPatch, procs: list[FakeProc]
+) -> None:
+    monkeypatch.setattr(host, "_MAX_JOURNAL_BYTES", 10)
+    text = "\u00e9" * 6  # six characters, twelve bytes
+    _patch_run(monkeypatch, _ok(text), procs)
+    with pytest.raises(AuditInputError) as info:
+        host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL)
+    assert info.value.detail == "oversize"
+    _patch_run(monkeypatch, _ok("\u00e9" * 5), procs)  # exactly ten bytes: within the cap
+    assert host.run_journal(host.INGEST_JOURNAL_ARGV, SINCE, UNTIL) == "\u00e9" * 5
 
 
 def test_journal_slot_is_the_one_accepted_shape() -> None:

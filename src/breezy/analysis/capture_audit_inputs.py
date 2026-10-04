@@ -362,7 +362,7 @@ def _scan_log(data_root: Path, path: Path) -> LogResult:
     result = _scan_one(path)
     if result.scan.node_disposed:
         try:
-            write_scan_cache(data_root, key, encode_result(result))
+            write_scan_cache(data_root, key, encode_result(result, key))
         except (OSError, SingleReadRefused, TypeError, ValueError) as exc:
             _LOGGER.warning("capture audit: scan cache write failed (%s)", type(exc).__name__)
     return result
