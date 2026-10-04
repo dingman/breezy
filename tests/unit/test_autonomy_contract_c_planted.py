@@ -49,7 +49,7 @@ def _lint_copy(workdir: Path) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.heavy
-@pytest.mark.parametrize("module", ["canonical"])
+@pytest.mark.parametrize("module", ["canonical", "schemas"])
 def test_contract_c_refuses_planted_pyarrow_reach(module: str, tmp_path: Path) -> None:
     shutil.copytree(SRC_DIR, tmp_path / "src", ignore=shutil.ignore_patterns("__pycache__"))
     (tmp_path / "pyproject.toml").write_text(_emit_contract_c_only(), encoding="utf-8")
