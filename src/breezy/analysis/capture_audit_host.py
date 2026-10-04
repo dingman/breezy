@@ -60,7 +60,7 @@ JOURNAL_TIMEOUT_S: Final[float] = 30.0
 EMPTY_OUTPUT_DETAIL: Final[str] = "empty_output"
 #: Literal templates; ``{since}`` and ``{until}`` are the only substituted slots.
 INGEST_JOURNAL_ARGV: Final[tuple[str, ...]] = (
-    "journalctl",
+    "/usr/bin/journalctl",
     "--user",
     "-u",
     "breezy-quote-tape-ingest",
@@ -72,7 +72,7 @@ INGEST_JOURNAL_ARGV: Final[tuple[str, ...]] = (
     "{until}",
 )
 SUPERVISOR_JOURNAL_ARGV: Final[tuple[str, ...]] = (
-    "journalctl",
+    "/usr/bin/journalctl",
     "--user",
     "-u",
     "breezy-trade-supervisor",
@@ -84,7 +84,7 @@ SUPERVISOR_JOURNAL_ARGV: Final[tuple[str, ...]] = (
     "{until}",
 )
 RECORDER_JOURNAL_ARGV: Final[tuple[str, ...]] = (
-    "journalctl",
+    "/usr/bin/journalctl",
     "--user",
     "-u",
     "breezy-quote-tape.service",
@@ -165,7 +165,7 @@ def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
     if key == INGEST_JOURNAL_ARGV:
         return subprocess.Popen(
             [
-                "journalctl",
+                "/usr/bin/journalctl",
                 "--user",
                 "-u",
                 "breezy-quote-tape-ingest",
@@ -182,7 +182,7 @@ def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
     if key == SUPERVISOR_JOURNAL_ARGV:
         return subprocess.Popen(
             [
-                "journalctl",
+                "/usr/bin/journalctl",
                 "--user",
                 "-u",
                 "breezy-trade-supervisor",
@@ -199,7 +199,7 @@ def _run_template(template: Sequence[str], since: str, until: str) -> _Process:
     if key == RECORDER_JOURNAL_ARGV:
         return subprocess.Popen(
             [
-                "journalctl",
+                "/usr/bin/journalctl",
                 "--user",
                 "-u",
                 "breezy-quote-tape.service",

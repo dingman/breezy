@@ -296,6 +296,16 @@ def test_real_watchdog_kill_line_parses() -> None:
     assert got.ts_ns == int(raw["__REALTIME_TIMESTAMP"]) * 1000
 
 
+def test_journal_argv0_is_absolute() -> None:
+    """S3-R15: a bare ``journalctl`` is resolved through ``PATH``; the templates and the launched
+    argvs name the binary by its absolute path."""
+    for template in TEMPLATES:
+        assert template[0] == "/usr/bin/journalctl"
+    source = Path(host.__file__).read_text(encoding="utf-8")
+    assert '"journalctl"' not in source
+    assert source.count('"/usr/bin/journalctl"') == 6
+
+
 # -- the bus snapshot (S2-R8) ------------------------------------------------------------------
 
 

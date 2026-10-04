@@ -133,7 +133,7 @@ class AuthorityRow(NamedTuple):
 def _journal_argv(unit: str, output: str) -> tuple[str, ...]:
     """A ``journalctl`` row argv: the unit and format are literal, the time slots are bare names."""
     return (
-        "journalctl", "--user", "-u", unit, "-o", output,
+        "/usr/bin/journalctl", "--user", "-u", unit, "-o", output,
         "--since", "{since}", "--until", "{until}",
     )  # fmt: skip
 

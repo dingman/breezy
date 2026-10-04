@@ -455,6 +455,10 @@ _HYGIENE_ABSOLUTE_ALLOWLIST: Final[dict[tuple[str, str], str]] = {
     ("src/breezy/runtime/autonomy_sandbox/wal_snapshot.py", "/proc/self/fd"): (
         "kernel path to reach the verified snap-dir fd for recovery (B10-R4 L-1), not a host path"
     ),
+    ("src/breezy/analysis/capture_audit_host.py", "/usr/bin/journalctl"): (
+        "the absolute argv[0] of the audit's read-only journal reads, so PATH never picks the "
+        "binary (AUT-1 WP5 stage 3a, S3-R15); the closure lint pins each argv"
+    ),
     ("src/breezy/persistence/autonomy/capture_reader.py", "/proc/self/fd"): (
         "kernel path naming the O_NOFOLLOW-verified entry fd, so the feather preflight scanner "
         "reads the same inode (AUT-1 WP1 part B), not a host path"
