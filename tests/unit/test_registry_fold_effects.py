@@ -120,13 +120,12 @@ def test_swap_cancel_listing_a_partner_voids_the_whole_pair() -> None:
     ids=["empty", "none", "unknown_id"],
 )
 def test_swap_cancel_listing_no_pair_member_voids_nothing(voids: tuple[str, ...] | None) -> None:
-    chain, head, _tail = activated_pair()
-    row = chain.add(
+    chain, _head, _tail = activated_pair()
+    chain.add(
         Kind.SWAP_CANCEL, State.CHALLENGER, family=CHILD, frm=State.CHALLENGER,
         ts=at(DAY, "16:46"), cause_code=CauseCode.ENGINE_INCONSISTENCY,
         voids_transition_ids=voids,
     )  # fmt: skip
-    assert row.transition_id != head.transition_id
 
     result = run(chain, LATE)
 
@@ -175,7 +174,6 @@ def test_post_launch_swap_cancel_voids_pair_only_before_1700(cancel_ts: int, voi
     result = run(chain, at(DAY, "23:00"))
 
     assert (result.pairs[0].status is PairStatus.VOIDED) is voided
-    assert result.pairs[0].status in {PairStatus.VOIDED, PairStatus.EFFECTIVE}
     sender = INCUMBENT if voided else CHILD
     assert result.states[sender] is State.CHAMPION
 
@@ -274,6 +272,25 @@ def test_demote_during_pending_swap_outgoing() -> None:
     assert view(later, INCUMBENT).demoted_for_cause
 
 
+def test_invalid_chain_pin_demote_of_incoming_in_launch_window_then_cancel_gives_two_senders() -> (
+    None
+):
+    """Pins a chain 7c refuses (A7a-R2, E-19a): a DEMOTE of the incoming family inside
+    [LAUNCH, window end), then a SWAP_CANCEL voiding its pair. The fold's result is two senders."""
+    chain, head, _tail = activated_pair()
+    chain.add(
+        Kind.DEMOTE, State.HALTED, family=CHILD, frm=State.CHAMPION, ts=at(DAY, "16:55"),
+        halt_cause_class=CauseClass.RECOVERABLE_MODEL, cause_code=CauseCode.VERDICT_FAIL,
+    )  # fmt: skip
+    cancel(chain, head, ts=at(DAY, "16:56"), cause=CauseCode.PAIR_CAUSE_INCOMING)
+
+    result = run(chain, LATE)
+
+    assert result.pairs[0].status is PairStatus.VOIDED
+    assert result.states == {INCUMBENT: State.CHAMPION, CHILD: State.HALTED}
+    assert result.senders == (INCUMBENT, CHILD)
+
+
 def test_unactivated_pair_lapses_at_launch() -> None:
     """New beyond 6b: a lapsed DISPLACED pair leaves the incumbent HALTED, with no effect at all."""
     chain, head, tail = seeded_pair(partner=Kind.DISPLACED)
@@ -287,9 +304,9 @@ def test_unactivated_pair_lapses_at_launch() -> None:
     ]  # fmt: skip
     assert after.pairs[0].member_transition_ids == (head.transition_id, tail.transition_id)
     assert after.senders == (INCUMBENT,)
-    for family in (INCUMBENT, CHILD):
-        flags = view(after, family)
-        assert not (flags.rollback_eligible or flags.target_ineligible or flags.drill_child)
+    assert not any(
+        v.rollback_eligible or v.target_ineligible or v.drill_child for v in after.families.values()
+    )
     assert view(after, INCUMBENT).demoted_for_cause  # only its own HALT, nothing from the pair
     assert not view(after, CHILD).demoted_for_cause
     assert after.drill_episodes == ()
@@ -310,20 +327,37 @@ def test_a_lapsed_supersede_pair_charges_no_eligibility_and_a_later_pair_still_w
     assert view(end, INCUMBENT).rollback_eligible
 
 
-def test_a_lapsed_or_voided_drill_promote_starts_no_episode() -> None:
+@pytest.mark.parametrize("fate", [PairStatus.LAPSED, PairStatus.VOIDED])
+def test_a_lapsed_or_voided_drill_promote_starts_no_episode_but_the_child_stays_a_drill_child(
+    fate: PairStatus,
+) -> None:
+    chain = drill_chain(admit=True)
+    head, _tail = chain.drill_pair(DAY)
+    if fate is PairStatus.VOIDED:
+        chain.activate(head, ts=at(DAY, "16:45"))
+        cancel(chain, head, ts=at(DAY, "16:50", SEC))
+
+    result = run(chain, LATE)
+
+    assert result.pairs[0].status is fate
+    assert result.drill_episodes == ()  # the episode starts only when DRILL_PROMOTE takes effect
+    assert view(result, CHILD).drill_child  # DRILL_ADMIT applied (A7a-R1)
+    assert not view(result, INCUMBENT).rollback_eligible  # the SUPERSEDE never took effect
+    assert result.states == {INCUMBENT: State.CHAMPION, CHILD: State.CHALLENGER}
+
+
+def test_a_child_without_drill_admit_or_effective_drill_promote_is_no_drill_child() -> None:
     chain = drill_chain()
-    lapsed_head, _ = chain.drill_pair(DAY)
-    voided_head, _ = chain.drill_pair(NEXT_DAY)
-    chain.activate(voided_head, ts=at(NEXT_DAY, "16:45"))
-    cancel(chain, voided_head, ts=at(NEXT_DAY, "16:50", SEC))
+    chain.drill_pair(DAY)
 
-    result = run(chain, NEXT_LATE)
+    assert not view(run(chain, LATE), CHILD).drill_child
 
-    assert [p.status for p in result.pairs] == [PairStatus.LAPSED, PairStatus.VOIDED]
-    assert result.drill_episodes == ()
-    assert not view(result, CHILD).drill_child
-    assert not view(result, INCUMBENT).rollback_eligible
-    assert lapsed_head.transition_id != voided_head.transition_id
+
+def test_drill_admit_marks_the_child_when_it_applies() -> None:
+    chain = drill_chain(admit=True)
+
+    assert not view(run(chain, LATE), INCUMBENT).drill_child
+    assert view(run(chain, LATE), CHILD).drill_child
 
 
 # --- restrictive rows apply at their own timestamp ------------------------------------------
@@ -584,17 +618,77 @@ def test_demoting_the_new_champion_leaves_the_rollback_target_eligible() -> None
     assert result.senders == (CHILD,)
 
 
-def test_demoted_for_cause_is_sticky_across_a_resume() -> None:
+def test_demote_then_resume_clears_demoted_for_cause_and_opens_a_new_epoch() -> None:
     chain = lineage_chain()
-    halted_champion(
+    cause = halted_champion(
         chain, halt_cause_class=CauseClass.RECOVERABLE_MODEL, cause_code=CauseCode.VERDICT_FAIL
     )
-    chain.add(Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED)
+    halted = run(chain, LATE)
+    resume = chain.add(Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED)
 
     result = run(chain, LATE)
 
+    assert view(halted, INCUMBENT).demoted_for_cause
     assert result.states[INCUMBENT] is State.CHAMPION
-    assert view(result, INCUMBENT).demoted_for_cause
+    assert not view(result, INCUMBENT).demoted_for_cause
+    assert view(result, INCUMBENT).demoted_cause_ns == cause.ts_ns  # the latest cause survives
+    assert view(result, INCUMBENT).champion_epoch_start_ns == resume.ts_ns
+
+
+def test_a_cause_inside_the_current_epoch_keeps_the_flag() -> None:
+    chain = lineage_chain()
+    halted_champion(chain, halt_cause_class=CauseClass.RECOVERABLE_MODEL)
+    resume = chain.add(Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED)
+    second = halted_champion(chain, halt_cause_class=CauseClass.RECOVERABLE_MODEL)
+
+    family_view = view(run(chain, LATE), INCUMBENT)
+
+    assert family_view.demoted_for_cause
+    assert family_view.demoted_cause_ns == second.ts_ns
+    assert family_view.champion_epoch_start_ns == resume.ts_ns
+
+
+def test_the_e5_restore_leaves_the_incumbent_free_of_demoted_for_cause() -> None:
+    """E-5: the incumbent halts, then a restorative RESUME returns it (drill close restore)."""
+    chain = lineage_chain()
+    halted_champion(chain, halt_cause_class=CauseClass.DRILL, cause_code=CauseCode.VERDICT_FAIL)
+    chain.add(
+        Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED,
+        cause_code=CauseCode.DRILL_CLOSE_RESTORE,
+    )  # fmt: skip
+
+    family_view = view(run(chain, LATE), INCUMBENT)
+
+    assert family_view.state is State.CHAMPION
+    assert not family_view.demoted_for_cause
+
+
+def test_epochs_open_on_every_entry_to_champion_and_not_on_a_same_state_row() -> None:
+    chain, head, _tail = activated_pair()
+    boot = chain.rows[0]
+
+    result = run(chain, LATE)
+    chain.add(
+        Kind.ATTEST, State.CHAMPION, family=CHILD, frm=State.CHAMPION, ts=at(DAY, "17:30"),
+        attest_valid_until_ns=at(DAY, "19:00"),
+    )  # fmt: skip
+    attested = run(chain, at(DAY, "18:30"))
+
+    assert view(result, INCUMBENT).champion_epoch_start_ns == boot.ts_ns  # BOOTSTRAP opens one
+    assert view(result, CHILD).champion_epoch_start_ns == LAUNCH  # a pair head opens at LAUNCH
+    assert view(attested, CHILD).champion_epoch_start_ns == LAUNCH  # ATTEST does not
+    assert head.family_id == CHILD
+
+
+def test_a_challenger_cause_with_no_epoch_stays_flagged_until_it_becomes_champion() -> None:
+    chain, head, _tail = activated_pair()
+    cancel(chain, head, ts=at(DAY, "16:46"), cause=CauseCode.PAIR_CAUSE_INCOMING)
+
+    family_view = view(run(chain, LATE), CHILD)
+
+    assert family_view.demoted_for_cause
+    assert family_view.champion_epoch_start_ns is None
+    assert family_view.demoted_cause_ns == at(DAY, "16:46")
 
 
 def test_senders_are_the_champion_and_halted_families_in_name_order() -> None:
@@ -636,9 +730,14 @@ class DrillChain(Chain):
         return head
 
 
-def drill_chain() -> DrillChain:
+def drill_chain(*, admit: bool = False) -> DrillChain:
     chain = DrillChain()
-    chain.seed()
+    if not admit:
+        chain.seed()
+        return chain
+    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT)
+    chain.add(Kind.MINT, State.SHADOW, family=CHILD)
+    chain.add(Kind.DRILL_ADMIT, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
     return chain
 
 
@@ -735,7 +834,8 @@ def test_drill_supersede_makes_the_incumbent_eligible_but_never_the_drill_child(
     assert view(during, INCUMBENT).rollback_eligible  # the closing ROLLBACK is admissible
     assert not view(during, CHILD).rollback_eligible
     assert not view(after, CHILD).rollback_eligible  # superseded by the close: still no target
-    assert view(after, CHILD).demoted_for_cause
+    assert not view(after, CHILD).demoted_for_cause  # its RESUME opened a new epoch
+    assert view(after, CHILD).demoted_cause_ns == at(DAY, "20:00")
 
 
 def test_a_normal_promotion_does_not_flag_a_drill_child() -> None:

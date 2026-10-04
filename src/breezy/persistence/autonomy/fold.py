@@ -26,15 +26,21 @@ SWAP_CANCEL and TARGET_INELIGIBLE still set their flags. ``from_state`` consiste
 Choices ARCH leaves open, fixed here (each pinned by a test):
 
 * A SWAP_CANCEL that lists any member of a pair voids the whole pair: a pair is atomic.
-* ``demoted_for_cause`` is set by a DEMOTE or HALT, and by a SWAP_CANCEL with cause
-  ``pair_cause_incoming`` on its own family. The fold never clears it (a fresh FORWARD_SHADOW PASS
-  that post-dates the cause is a ``validate`` rule over verdicts).
+* ``demoted_for_cause`` is scoped to a champion epoch (A7a-R3, E-19b). A cause is a DEMOTE or HALT,
+  or a SWAP_CANCEL with cause ``pair_cause_incoming`` on its own family. An epoch opens, at the
+  row's effective instant, on every applied row whose ``to_state`` is CHAMPION and whose
+  ``from_state`` is not: BOOTSTRAP, ROOT_ADMIT, the head of an effective pair and RESUME. A
+  same-state row (ATTEST, HWM_RESET) opens none. The flag is true iff a cause was applied after
+  the epoch opened (chain order at equal instants); a family that was never champion has no epoch,
+  so any cause counts. ``demoted_cause_ns`` is the latest cause instant, kept after the flag
+  clears. The FORWARD_SHADOW PASS clear of Y8 is a ``validate`` rule over verdicts.
 * ``terminal_frozen`` follows a DEMOTE or HALT of class TERMINAL, or a RETIRE with cause
   ``model_budget_exhausted``. The INTEGRITY freeze follows class INTEGRITY or cause
   ``infra_budget_exhausted``. Class ROLLBACK_FAILED never freezes. Neither freeze is cleared by the
   fold: ARCH gives no autonomous clear (W15).
 * A SUPERSEDE makes its family ``rollback_eligible`` unless that family is a drill child (a family
-  whose DRILL_PROMOTE took effect). Becoming CHAMPION again clears it.
+  whose DRILL_ADMIT or DRILL_PROMOTE applied; a child whose pair lapsed or was voided stays one).
+  Becoming CHAMPION again clears it.
 * A drill episode ends at the first SUPERSEDE or DISPLACED of its child that takes effect, or at the
   child's RETIRE.
 * A lineage is named by the introducing row's ``lineage_root_family_id``, else the family itself.
@@ -129,6 +135,10 @@ class FamilyView:
     target_ineligible: bool = False
     terminal_frozen: bool = False
     drill_child: bool = False
+    #: The latest cause instant (DEMOTE, HALT or an incoming-cause SWAP_CANCEL), even once cleared.
+    demoted_cause_ns: int | None = None
+    #: When the current champion epoch opened; ``None`` for a family that never was CHAMPION.
+    champion_epoch_start_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -156,7 +166,11 @@ class FoldResult:
 
     @property
     def senders(self) -> tuple[str, ...]:
-        """The families in {CHAMPION, HALTED}, by name: ARCH allows at most one per venue."""
+        """The families in {CHAMPION, HALTED}, by name: ARCH allows at most one per venue.
+
+        Data only. A consumer must not take ``senders[0]`` as the champion before the resolver's
+        own checks: a chain that ``validate`` refuses can still list two senders here.
+        """
         return tuple(sorted(f for f, st in self.states.items() if st in _SENDER_STATES))
 
 
@@ -358,6 +372,8 @@ class _Accumulator:
         self.lineage_of = lineage_of
         self.rollback_eligible: set[str] = set()
         self.demoted: set[str] = set()
+        self.demoted_ns: dict[str, int] = {}
+        self.epoch_start: dict[str, int] = {}
         self.target_ineligible: set[str] = set()
         self.drill_children: set[str] = set()
         self.frozen_lineages: set[str] = set()
@@ -368,6 +384,9 @@ class _Accumulator:
         family = row.family_id
         if row.from_state is not row.to_state:
             self.states[family] = row.to_state
+        if row.to_state is State.CHAMPION and row.from_state is not State.CHAMPION:
+            self.epoch_start[family] = instant
+            self.demoted.discard(family)
         kind = row.kind
         if _is_head_shape(row):
             self._take_champion(instant, row)
@@ -377,15 +396,17 @@ class _Accumulator:
             self._close_episode(family, instant)
         elif kind is Kind.DISPLACED:
             self._close_episode(family, instant)
+        elif kind is Kind.DRILL_ADMIT:
+            self.drill_children.add(family)
         elif kind in (Kind.DEMOTE, Kind.HALT):
-            self._halt(row)
+            self._halt(instant, row)
         elif kind is Kind.RETIRE:
             self._close_episode(family, instant)
             if row.cause_code is CauseCode.MODEL_BUDGET_EXHAUSTED:
                 self._freeze_lineage(family)
         elif kind is Kind.SWAP_CANCEL:
             if row.cause_code is CauseCode.PAIR_CAUSE_INCOMING:
-                self.demoted.add(family)
+                self._mark_cause(family, instant)
         elif kind is Kind.TARGET_INELIGIBLE:
             self.target_ineligible.add(family)
 
@@ -395,10 +416,14 @@ class _Accumulator:
             self.drill_children.add(row.family_id)
             self.episodes.append(_OpenEpisode(row.family_id, instant, row.transition_id))
 
-    def _halt(self, row: TransitionRow) -> None:
+    def _mark_cause(self, family: str, instant: int) -> None:
+        self.demoted.add(family)
+        self.demoted_ns[family] = instant
+
+    def _halt(self, instant: int, row: TransitionRow) -> None:
         """A failed rollback (ROLLBACK_FAILED) matches neither freeze: it halts its family only."""
         self.rollback_eligible.discard(row.family_id)
-        self.demoted.add(row.family_id)
+        self._mark_cause(row.family_id, instant)
         if row.halt_cause_class is CauseClass.TERMINAL:
             self._freeze_lineage(row.family_id)
         if (
@@ -428,6 +453,8 @@ class _Accumulator:
                 target_ineligible=family in self.target_ineligible,
                 terminal_frozen=lineage in self.frozen_lineages,
                 drill_child=family in self.drill_children,
+                demoted_cause_ns=self.demoted_ns.get(family),
+                champion_epoch_start_ns=self.epoch_start.get(family),
             )
         return MappingProxyType(views)
 
