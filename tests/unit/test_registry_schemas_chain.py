@@ -671,13 +671,17 @@ def test_refusal_reason_set_is_exactly_the_plan() -> None:
     }  # fmt: skip
 
 
-def test_unreadable_reason_set_is_exactly_the_reader_table() -> None:
+def test_unreadable_reason_set_is_exactly_the_reader_table_and_the_resolver_venue_detail() -> None:
+    """The reader's table, plus ``venue_malformed``: the resolver's own detail for a venue that is
+    no well-formed id (A8c-R3). The reader never gives it (its error map is pinned in
+    ``test_the_error_map_reaches_every_reason_a_sqlite_code_can_give``)."""
     assert _values(UnreadableReason) == {
         "busy",
         "hot_journal",
         "schema_mismatch",
         "io",
         "sqlite_error",
+        "venue_malformed",
     }
 
 

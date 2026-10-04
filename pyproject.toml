@@ -208,6 +208,21 @@ source_modules = [
 forbidden_modules = ["breezy.analysis.hypothesis_ledger"]
 allow_indirect_imports = false
 
+# A8c-R2b: the sending resolver has no sanctioned consumer until AUT-5a. This contract is named
+# outside the `ARCH-0 autonomy (` prefix so B8-R2's count of three stays; AUT-5a amends it (and the
+# AST guard in tests/unit/test_registry_resolver_guards.py) when it lands the consumer.
+[[tool.importlinter.contracts]]
+name = "AUT-1 resolver consumers (removed by AUT-5a)"
+type = "forbidden"
+source_modules = [
+    "breezy.app",
+    "breezy.strategy",
+    "breezy.runtime",
+    "breezy.adapters",
+]
+forbidden_modules = ["breezy.persistence.autonomy.resolver"]
+allow_indirect_imports = false
+
 # ARCH-0 seam A (V16, V22, V23). Contracts (b) and (c) name MODULES ONLY, never the
 # package: import-linter treats a package source as including every descendant, and
 # `label_schema`, `family_bytes`, `byte_binding`, `registry_store`, `replay` and `resolver` legitimately

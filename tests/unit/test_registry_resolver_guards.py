@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 from typing import Final
 
 import pytest
@@ -10,63 +11,149 @@ import pytest
 from breezy.persistence.autonomy.byte_binding import (
     CHILD_MANIFEST_ALLOWLIST,
 )
-from tests.support.entry_points import SRC_DIR
+from tests.support.entry_points import REPO_ROOT, SRC_DIR
 
 AUTONOMY_SRC: Final = SRC_DIR / "breezy" / "persistence" / "autonomy"
 RESOLVER_SOURCE: Final = AUTONOMY_SRC / "resolver.py"
 
 
-# --- guards: nothing outside the resolver reaches it, and nothing reaches the private gate ---
+# --- guards: nothing outside the autonomy package reaches the resolver (A8c-R2a) ---
 
 RESOLVER_MODULE: Final = "breezy.persistence.autonomy.resolver"
-LIVE_PACKAGES: Final = ("strategy", "runtime", "adapters")
+AUTONOMY_PACKAGE: Final = "breezy.persistence.autonomy"
+PERSISTENCE_PACKAGE: Final = "breezy.persistence"
+SCAN_ROOTS: Final = (SRC_DIR, REPO_ROOT / "scripts")
 
 
-def _imports_resolver(source: str) -> list[int]:
-    """Line numbers where ``source`` imports the resolver module (any import form, or a dynamic
-    import of its dotted name)."""
+def _module_of(path: Path) -> str:
+    """The dotted module of ``path`` under ``src/``; a script is ``scripts.<stem path>``."""
+    if path.is_relative_to(SRC_DIR):
+        parts = path.relative_to(SRC_DIR).with_suffix("").parts
+    else:
+        parts = ("scripts", *path.relative_to(REPO_ROOT / "scripts").with_suffix("").parts)
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+def _absolute(node: ast.ImportFrom, module: str, *, is_package: bool) -> str | None:
+    """The dotted module an ``ImportFrom`` names, with a relative level resolved against
+    ``module`` (``None`` when the level climbs out of the tree)."""
+    if node.level == 0:
+        return node.module
+    base = module.split(".") if is_package else module.split(".")[:-1]
+    climb = node.level - 1
+    if climb > len(base):
+        return None
+    anchor = base[: len(base) - climb]
+    return ".".join([*anchor, *([node.module] if node.module else [])])
+
+
+def _imports_resolver(source: str, module: str = "", *, is_package: bool = False) -> list[int]:
+    """Line numbers where ``source`` (the module ``module``) reaches the resolver: any import form
+    (relative levels resolved), a dynamic import of its dotted name, or an attribute access
+    ``autonomy.resolver`` on an imported ``autonomy`` package."""
     lines: list[int] = []
-    for node in ast.walk(ast.parse(source)):
+    package_names: set[str] = set()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            lines += [node.lineno for a in node.names if a.name == RESOLVER_MODULE]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            hit = node.module == RESOLVER_MODULE or (
-                node.module == "breezy.persistence.autonomy"
-                and any(a.name == "resolver" for a in node.names)
-            )
-            if hit:
+            for alias in node.names:
+                if alias.name == RESOLVER_MODULE:
+                    lines.append(node.lineno)
+                if alias.name == AUTONOMY_PACKAGE and alias.asname:
+                    package_names.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom):
+            target = _absolute(node, module, is_package=is_package)
+            if target is None:
+                continue
+            if target == RESOLVER_MODULE:
                 lines.append(node.lineno)
+            for alias in node.names:
+                if target == AUTONOMY_PACKAGE and alias.name == "resolver":
+                    lines.append(node.lineno)
+                if target == PERSISTENCE_PACKAGE and alias.name == "autonomy":
+                    package_names.add(alias.asname or alias.name)
         elif isinstance(node, ast.Constant) and node.value == RESOLVER_MODULE:
             lines.append(node.lineno)
-    return lines
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute) and node.attr == "resolver"):
+            continue
+        dotted = ast.unparse(node.value)
+        if dotted in package_names or dotted == AUTONOMY_PACKAGE:
+            lines.append(node.lineno)
+    return sorted(set(lines))
 
 
-def test_no_live_process_imports_the_resolver_until_aut_5a() -> None:
-    """AUT-5a removes this guard. Until then no strategy, runtime or adapters module (the live
-    processes' code) may import ``resolver``, so the live path is byte-for-byte unchanged."""
+def _is_sanctioned(module: str) -> bool:
+    """Only the autonomy package itself may name the resolver (AUT-5a amends this)."""
+    return module.startswith(f"{AUTONOMY_PACKAGE}.")
+
+
+def test_nothing_outside_the_autonomy_package_imports_the_resolver_until_aut_5a() -> None:
+    """AUT-5a amends this guard. Until then no module of ``src/`` or ``scripts/`` outside
+    ``breezy.persistence.autonomy`` may reach ``resolver`` (strategy, runtime, adapters, app,
+    persistence siblings and scripts alike), so the live path is byte-for-byte unchanged."""
     judged = 0
     hits: list[str] = []
-    for package in LIVE_PACKAGES:
-        for path in sorted((SRC_DIR / "breezy" / package).rglob("*.py")):
+    for base in SCAN_ROOTS:
+        for path in sorted(base.rglob("*.py")):
+            module = _module_of(path)
+            if _is_sanctioned(module):
+                continue
             judged += 1
-            hits += [f"{path}:{n}" for n in _imports_resolver(path.read_text(encoding="utf-8"))]
-    assert judged > 50  # not vacuous
+            source = path.read_text(encoding="utf-8")
+            hits += [
+                f"{path}:{n}"
+                for n in _imports_resolver(source, module, is_package=path.name == "__init__.py")
+            ]
+    assert judged > 300  # not vacuous: every non-autonomy module of src/ and scripts/
     assert hits == []
 
 
 @pytest.mark.parametrize(
-    "planted",
+    ("planted", "module"),
     [
-        "import breezy.persistence.autonomy.resolver\n",
-        "from breezy.persistence.autonomy.resolver import resolve_sending_family\n",
-        "from breezy.persistence.autonomy import resolver\n",
-        "import importlib\nimportlib.import_module('breezy.persistence.autonomy.resolver')\n",
+        ("import breezy.persistence.autonomy.resolver\n", "breezy.strategy.x"),
+        (
+            "from breezy.persistence.autonomy.resolver import resolve_sending_family\n",
+            "breezy.runtime.x",
+        ),
+        ("from breezy.persistence.autonomy import resolver\n", "breezy.adapters.x"),
+        (
+            "import importlib\nimportlib.import_module('breezy.persistence.autonomy.resolver')\n",
+            "breezy.strategy.x",
+        ),
+        ("from ..persistence.autonomy import resolver\n", "breezy.app.x"),
+        ("from ..persistence.autonomy.resolver import resolve_sending_family\n", "breezy.app.x"),
+        ("from .autonomy import resolver\n", "breezy.persistence.sibling"),
+        ("from breezy.persistence import autonomy\nautonomy.resolver.x\n", "breezy.app.x"),
+        (
+            "import breezy.persistence.autonomy as aut\nprint(aut.resolver)\n",
+            "breezy.app.x",
+        ),
+        ("import breezy.persistence.autonomy\nbreezy.persistence.autonomy.resolver\n", "scripts.x"),
     ],
-    ids=["import", "from-module", "from-package", "dynamic"],
-)
-def test_the_resolver_guard_fires_on_every_import_form(planted: str) -> None:
-    assert _imports_resolver(planted)
-    assert _imports_resolver("from breezy.persistence.autonomy import replay\n") == []
+    ids=[
+        "import", "from-module", "from-package", "dynamic", "relative-package",
+        "relative-module", "relative-sibling", "attribute", "aliased-attribute", "dotted-attribute",
+    ],
+)  # fmt: skip
+def test_the_resolver_guard_fires_on_every_import_form(planted: str, module: str) -> None:
+    assert _imports_resolver(planted, module)
+    assert not _is_sanctioned(module)
+    assert _imports_resolver("from breezy.persistence.autonomy import replay\n", module) == []
+    assert _imports_resolver("from ..persistence.autonomy import replay\n", module) == []
+
+
+def test_the_resolver_guard_exempts_only_the_autonomy_package() -> None:
+    assert _is_sanctioned("breezy.persistence.autonomy.replay")
+    assert _is_sanctioned("breezy.persistence.autonomy.resolver")
+    assert not _is_sanctioned("breezy.persistence.autonomy")  # the package init is no importer
+    for outsider in ("breezy.app.trade", "breezy.persistence.family_manifest", "scripts.ops.x"):
+        assert not _is_sanctioned(outsider)
+    # a relative import inside the package resolves to the resolver and is sanctioned by module
+    inside = "breezy.persistence.autonomy.replay"
+    assert _imports_resolver("from . import resolver\n", inside)
+    assert _is_sanctioned(inside)
 
 
 def test_nothing_outside_live_orders_gate_references_the_private_lineage_gate() -> None:

@@ -33,6 +33,7 @@ from breezy.persistence.autonomy import pins
 from breezy.persistence.autonomy.family_bytes import (
     _COMMITTED_PARTS,
     _REGISTRY_PARTS,
+    _UNREADABLE,
     _read_family_file,
 )
 from breezy.persistence.autonomy.fold import Origin
@@ -231,16 +232,25 @@ def _load_manifest(
         if hashlib.sha256(raw).hexdigest() != sha:
             return RefusalReason.MANIFEST_SHA_MISMATCH
         manifest = parse_family_manifest(raw, path=base.joinpath(*parts, f"{family}.json"))
-    except (SingleReadRefused, FamilyManifestError, ValueError, OSError) as exc:
+    except _UNREADABLE as exc:
         return _refusal_of(exc)
     source: ManifestSource = "deploy" if root_origin else "registry"
     return raw, manifest, source
 
 
 def _child_problem(
-    manifest: FamilyManifest, family: str, *, repo_root: Path, expected_root: str | None
+    manifest: FamilyManifest,
+    family: str,
+    *,
+    repo_root: Path,
+    expected_root: str | None,
+    root_manifest_sha256: str | None,
 ) -> RefusalReason | None:
-    """A child's id must be ``<root>_rNNNN`` and its manifest equal the committed root's."""
+    """A child's id must be ``<root>_rNNNN`` and its manifest equal the committed root's.
+
+    The committed root bytes must hash to ``root_manifest_sha256`` (the sha the fold bound the root
+    to, A8c-R1) when the caller names one: a root file edited after the bind is never a yardstick.
+    """
     matched = CHILD_FAMILY_ID_RE.match(family)
     if matched is None or (expected_root is not None and matched.group("root") != expected_root):
         return RefusalReason.CHILD_ROOT_MISMATCH
@@ -249,10 +259,14 @@ def _child_problem(
         root_raw = _read_family_file(repo_root, _COMMITTED_PARTS, root_id, ReadPolicy.REPO)
         if root_raw is None:
             return RefusalReason.MANIFEST_UNREADABLE
+        if root_manifest_sha256 is not None and hashlib.sha256(root_raw).hexdigest() != (
+            root_manifest_sha256
+        ):
+            return RefusalReason.MANIFEST_SHA_MISMATCH
         root = parse_family_manifest(
             root_raw, path=repo_root.joinpath(*_COMMITTED_PARTS, f"{root_id}.json")
         )
-    except (SingleReadRefused, FamilyManifestError, ValueError, OSError) as exc:
+    except _UNREADABLE as exc:
         return _refusal_of(exc)
     if manifest_equal_modulo_allowlist(manifest, root):
         return RefusalReason.CHILD_NOT_EQUAL_ROOT
@@ -305,11 +319,14 @@ def verify_bound_bytes(
     repo_root: Path,
     origin: Origin,
     expected_root: str | None = None,
+    expected_root_manifest_sha256: str | None = None,
 ) -> FamilyBytes | ByteBindingFailure:
     """Bind a family's manifest and artefact bytes to the shas its rows name (see module doc).
 
     ``expected_root`` is the lineage root the fold names for a child; a regex root that differs is
-    ``child_root_mismatch``. Never raises for an unreadable or mismatched file.
+    ``child_root_mismatch``. ``expected_root_manifest_sha256`` is the sha the fold bound that root
+    to: a committed root file that hashes otherwise is ``manifest_sha_mismatch`` (A8c-R1; the
+    resolver always passes it). Never raises for an unreadable or mismatched file.
     """
     try:
         family = family_component(family_id)
@@ -324,7 +341,13 @@ def verify_bound_bytes(
     if manifest.family_id != family or manifest.venue != venue:
         return ByteBindingFailure(RefusalReason.MANIFEST_IDENTITY_MISMATCH)
     if origin is Origin.CHILD:
-        problem = _child_problem(manifest, family, repo_root=repo_root, expected_root=expected_root)
+        problem = _child_problem(
+            manifest,
+            family,
+            repo_root=repo_root,
+            expected_root=expected_root,
+            root_manifest_sha256=expected_root_manifest_sha256,
+        )
         if problem is not None:
             return ByteBindingFailure(problem)
     try:

@@ -210,3 +210,27 @@ def test_runtime_probe_sees_a_known_heavy_import() -> None:
     """Positive control: the probe really reports loaded modules."""
     loaded = _modules_loaded_by("breezy.domain.instrument_leg")
     assert any(m.split(".")[0] == "nautilus_trader" for m in loaded)
+
+
+AUT1_CONTRACT_NAME: Final[str] = "AUT-1 resolver consumers (removed by AUT-5a)"
+
+
+def test_resolver_consumers_contract_forbids_every_live_package_strictly() -> None:
+    """A8c-R2b: the import-linter half of the resolver consumer guard. Its name sits outside the
+    ``ARCH-0 autonomy (`` prefix, so B8-R2's count of three is untouched. AUT-5a amends it."""
+    data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+    contracts = data["tool"]["importlinter"]["contracts"]
+    named = [c for c in contracts if c["name"] == AUT1_CONTRACT_NAME]
+    assert len(named) == 1
+    contract = named[0]
+    assert contract["type"] == "forbidden"
+    assert set(contract["source_modules"]) == {
+        "breezy.app",
+        "breezy.strategy",
+        "breezy.runtime",
+        "breezy.adapters",
+    }
+    assert contract["forbidden_modules"] == [f"{AUTONOMY_PACKAGE}.resolver"]
+    assert contract["allow_indirect_imports"] is False
+    assert not AUT1_CONTRACT_NAME.startswith("ARCH-0 autonomy (")
+    assert len(_contracts()) == 3

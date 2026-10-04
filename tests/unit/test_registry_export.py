@@ -302,7 +302,11 @@ def test_reader_maps_every_sqlite_error(case: str) -> None:
 def test_the_error_map_reaches_every_reason_a_sqlite_code_can_give() -> None:
     """``schema_mismatch`` is never a result code: the foreign-DDL tests cover it."""
     mapped = {reason for _code, reason in _ERROR_MAP.values()}
-    assert mapped == set(UnreadableReason) - {UnreadableReason.SCHEMA_MISMATCH}
+    # schema_mismatch is the reader's own check; venue_malformed is the resolver's (A8c-R3)
+    assert mapped == set(UnreadableReason) - {
+        UnreadableReason.SCHEMA_MISMATCH,
+        UnreadableReason.VENUE_MALFORMED,
+    }
 
 
 def test_errors_with_no_result_code_and_os_errors_map_to_their_reasons() -> None:

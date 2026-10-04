@@ -18,6 +18,7 @@ from typing import Any, Final
 
 import pytest
 
+import breezy.persistence.autonomy.replay as replay_mod
 import breezy.persistence.autonomy.resolver as resolver_mod
 from breezy.persistence.autonomy import stage_policy
 from breezy.persistence.autonomy.chain import (
@@ -36,7 +37,6 @@ from breezy.persistence.autonomy.hwm import (
 )
 from breezy.persistence.autonomy.paths import ShadowPaths
 from breezy.persistence.autonomy.registry_export import ExportRead
-from breezy.persistence.autonomy.replay import ReplayOk
 from breezy.persistence.autonomy.resolver import (
     FamilySource,
     HwmMode,
@@ -71,7 +71,7 @@ from tests.unit.registry_resolver_world import (
 from tests.unit.test_registry_export import put_export
 from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, VENUE, Chain, at
 from tests.unit.test_registry_fold_tallies import carried, reset
-from tests.unit.test_registry_replay import ART_SHA, World, full_chain, seal
+from tests.unit.test_registry_replay import ART_SHA, World, full_chain, nominate, seal, start
 from tests.unit.test_registry_replay_parity import year_chain
 
 RESOLVER_SOURCE: Final = SRC_DIR / "breezy" / "persistence" / "autonomy" / "resolver.py"
@@ -300,8 +300,12 @@ def _sealed_with_seq(chain: Chain) -> VerifiedVenueChain:
 
 
 def test_the_export_floor_covers_every_reset_after_the_newest_export() -> None:
-    """B9 / E-21, independent of replay's prior-fold floor (the module docstring says why the two
-    agree on a verified chain): a reset written after the export must cover the export's counters.
+    """B9 / E-21: the resolver's export floor is necessary, not sufficient. It is checked here
+    in isolation from replay's prior-fold floor (the module docstring says why the two agree on a
+    verified chain); the real-run halves are in
+    ``test_a_reset_below_the_newest_export_is_refused_by_the_resolver``.
+
+    A reset written after the export must cover the export's counters.
     """
     chain = Chain()
     chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT)
@@ -513,39 +517,28 @@ def test_a_replay_refusal_gives_no_champion_with_its_closed_reason(
 # --- step 7: one sender --------------------------------------------------------------------------
 
 
-def test_two_senders_is_engine_inconsistency(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_two_senders_is_engine_inconsistency(world: World) -> None:
     """Replay and ``validate`` both refuse two senders, so a chain that reaches step 7 with two is
-    an engine inconsistency. The chain is forged in memory and replay is stubbed to isolate it."""
+    an engine inconsistency. The chain is forged in memory: the real run is refused by replay
+    (``replay_invalid``), the stubbed run reaches the resolver's own step 7."""
     chain = root_chain(world)
     chain.add(Kind.BOOTSTRAP, State.CHAMPION, family="pm_us_crh_v4", artefact_sha256=ART_SHA)
-    forged = seal(chain)
-    monkeypatch.setattr(resolver_mod, "_read_chain", lambda *_a: forged)
-    monkeypatch.setattr(
-        resolver_mod, "replay_full", lambda c, **_k: ReplayOk(c.head_venue_seq, c.head_hash)
-    )
-    refused = refusal_of(resolve(world, hwm_of(forged), now=NOW_EARLY))
-    assert refused.reason is RefusalReason.ENGINE_INCONSISTENCY
+    forged = forge(chain)
+    with serving(forged):
+        real = refusal_of(resolve(world, hwm_of(forged), now=NOW_EARLY))
+    assert real.reason is RefusalReason.REPLAY_INVALID
+    with serving(forged), replay_stubbed():
+        stubbed = refusal_of(resolve(world, hwm_of(forged), now=NOW_EARLY))
+    assert stubbed.reason is RefusalReason.ENGINE_INCONSISTENCY
 
 
 def test_no_sender_when_nobody_is_champion_or_halted(world: World) -> None:
     chain = root_chain(world)
     chain.add(Kind.RETIRE, State.RETIRED, family=INCUMBENT, frm=State.CHAMPION)
-    forged = seal(chain)
-    refused = _stubbed(world, forged)
+    forged = forge(chain)
+    with serving(forged), replay_stubbed():
+        refused = refusal_of(resolve(world, hwm_of(forged), now=NOW_EARLY))
     assert refused.reason is RefusalReason.NO_SENDER
-
-
-def _stubbed(world: World, forged: VerifiedVenueChain) -> ResolverRefusal:
-    """Resolve ``forged`` with the chain read and the replay stubbed out."""
-    mp = pytest.MonkeyPatch()
-    try:
-        mp.setattr(resolver_mod, "_read_chain", lambda *_a: forged)
-        mp.setattr(
-            resolver_mod, "replay_full", lambda c, **_k: ReplayOk(c.head_venue_seq, c.head_hash)
-        )
-        return refusal_of(resolve(world, hwm_of(forged), now=NOW_EARLY))
-    finally:
-        mp.undo()
 
 
 # --- the closed refusal set, read-only, budget ---
@@ -639,18 +632,36 @@ BUDGET_ROWS: Final = 2_000
 BUDGET_S: Final = 5.0
 
 
-def test_resolver_under_budget(world: World) -> None:
+#: Fold invocations of one resolve of ``BUDGET_ROWS`` rows, pinned exactly (A8c-R5): replay folds
+#: the prefix once per batch (every row of ``year_chain`` is its own batch: ``BUDGET_ROWS`` folds),
+#: then once over the whole chain, and the resolver folds the head once (no HWM_RESET, so no B9
+#: export fold). A regression in the replay's cost shows here deterministically, where a tighter
+#: clock bound would flake on this memory-pressured host.
+BUDGET_FOLD_CALLS: Final = BUDGET_ROWS + 2
+
+
+def test_resolver_under_budget(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
     chain = forge(year_chain(world))
     assert chain.head_venue_seq == BUDGET_ROWS
     export_all(world, chain)
     now = chain.rows[-1].ts_ns + HOUR_NS
+    calls = {"fold": 0}
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        calls["fold"] += 1
+        return real_fold(*args, **kwargs)
+
+    real_fold = fold
+    monkeypatch.setattr(resolver_mod, "fold", counted)
+    monkeypatch.setattr(replay_mod, "fold", counted)
     started = time.monotonic()
-    with serving(chain):
+    with serving(chain):  # RegistryReader.read_venue_rows is patched, so step 2 runs for real
         got = resolved(resolve(world, hwm_of(chain, 1), now=now))
     elapsed = time.monotonic() - started
-    print(f"resolve of {BUDGET_ROWS} rows: {elapsed:.2f}s")
+    print(f"resolve of {BUDGET_ROWS} rows: {elapsed:.2f}s, {calls['fold']} folds")
     assert got.registry_seq == BUDGET_ROWS
     assert elapsed < BUDGET_S
+    assert calls["fold"] == BUDGET_FOLD_CALLS
 
 
 @pytest.mark.parametrize("facet", ["resolver"])
@@ -680,24 +691,20 @@ def test_a_reset_below_the_newest_export_is_refused_by_the_resolver(world: World
     """B9 / E-21 at the resolver: an HWM_RESET written after the newest export must carry the
     export's counters. Replay is stubbed (its prior-fold floor would refuse the same row), so only
     the resolver's own export floor can; the control carries exactly the export's counters."""
-    chain = Chain()
-    chain.add(
-        Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT, manifest_sha256=world.root_sha,
-        artefact_sha256=ART_SHA,
-    )  # fmt: skip
-    chain.add(Kind.MINT, State.SHADOW, family=CHILD)
-    chain.add(
-        Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW,
-        lineage_root_family_id=INCUMBENT, k_life=1, alpha_k=Decimal("0.01"),
-        n_min_eff=403, n_cap=480, nomination_feasible=True,
-    )  # fmt: skip
+    chain = start(world)  # the root CHAMPION and a MINTed child, bound to real files
+    nominate(chain)  # cites the world's offline verdict, so replay can resolve its cause
     reset_row = reset(chain, carried({}))
     low = forge(chain)
     put_export(world.paths, low.rows[:3], 1)  # the export holds the first three rows only
+    with serving(low):  # the real run: replay's own prior-fold floor refuses the same row first
+        real = refusal_of(resolve(world, hwm_of(low, 1), now=NOW_EARLY))
+    assert real.reason is RefusalReason.REPLAY_INVALID
     with serving(low), replay_stubbed():
         refused = refusal_of(resolve(world, hwm_of(low, 1), now=NOW_EARLY))
     assert refused.reason is RefusalReason.REPLAY_INVALID
     chain.rows[3] = dataclasses.replace(reset_row, carried_counters=_floor(chain.rows[:3]))
     covered = forge(chain)
     with serving(covered), replay_stubbed():
+        assert isinstance(resolve(world, hwm_of(covered, 1), now=NOW_EARLY), ResolvedFamily)
+    with serving(covered):  # the real control: replay admits a reset that covers the export
         assert isinstance(resolve(world, hwm_of(covered, 1), now=NOW_EARLY), ResolvedFamily)

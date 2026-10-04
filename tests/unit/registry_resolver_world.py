@@ -24,6 +24,7 @@ from breezy.persistence.autonomy.chain import VerifiedVenueChain, verify_venue_c
 from breezy.persistence.autonomy.family_bytes import write_root_copy
 from breezy.persistence.autonomy.hwm import HwmPresent, HwmReading, next_hwm
 from breezy.persistence.autonomy.lineage import RootRecord
+from breezy.persistence.autonomy.registry_export import RegistryReader
 from breezy.persistence.autonomy.replay import ReplayOk
 from breezy.persistence.autonomy.resolver import (
     HwmMode,
@@ -137,13 +138,15 @@ def forge(chain: Chain) -> VerifiedVenueChain:
 
 @contextmanager
 def serving(chain: VerifiedVenueChain) -> Iterator[None]:
-    """Make the resolver read ``chain`` instead of the database.
+    """Make the reader return ``chain``'s rows instead of the database's.
 
     The real store refuses a nomination (``NominationRequiresPolicy``) and an HWM_RESET until their
-    owners land, so a chain with either can only be forged. Everything after the read is real.
+    owners land, so a chain with either can only be forged. Only ``RegistryReader.read_venue_rows``
+    is patched (A8c-R5), so the clock check, the chain verification and everything after the read
+    are real and step 2 always runs.
     """
     patch = pytest.MonkeyPatch()
-    patch.setattr(resolver_mod, "_read_chain", lambda *_args: chain)
+    patch.setattr(RegistryReader, "read_venue_rows", lambda _self, *_args, **_kw: chain.rows)
     try:
         yield
     finally:

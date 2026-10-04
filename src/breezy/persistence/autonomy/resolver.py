@@ -2,8 +2,10 @@
 
 ``resolve_sending_family(*, venue, paths, repo_root, now_ns, hwm)`` answers one question: which
 family may send for ``venue`` now, and on what bytes. It returns a ``ResolvedFamily`` or a
-``ResolverRefusal``; it never raises for a bad registry, export, manifest or artefact, and a
-refusal names a closed reason (and at most a closed detail), never a path.
+``ResolverRefusal``; it never raises for a bad venue, registry, export, manifest, artefact or ruling
+file, and a refusal names a closed reason (and at most a closed detail), never a path. The one
+exception is the shadow step set of seam 8d: ``_resolve`` in ``SKIP_SHADOW`` mode raises
+``NotImplementedError`` (it is unreachable from the public entry).
 
 Step 1 (a shadow ``paths`` is refused as ``paths_role_mismatch``) is coded here, in the public
 entry, and is not part of ``_resolve``. ``_resolve`` runs steps 0 and 2 to 12 of AC 17:
@@ -38,6 +40,11 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   PROMOTE, DRILL_PROMOTE, ROLLBACK, RESUME) whose effective instant is the start of the family's
   current champion epoch in the fold. The bound manifest sha is the fold's latest for the family
   and the artefact sha the introducing row's (``FamilyView``).
+* An export that is being written while a resolve reads it is refused (``export_unreadable`` or
+  ``export_prefix_mismatch``) and self-heals: the next resolve, after the writer finished, reads
+  the whole file. The refusal is fail-closed and never cached.
+* The registry is read with ``RESOLVE_BUSY_TIMEOUT_MS`` (a keyword of the public entry), longer
+  than the watch loop's, because a resolve is a launch step that may wait for a writer.
 * The B9 export check covers the HWM_RESET rows written after the newest export. Folding the export
   at its own head instant makes it a floor no honest reset can be under.
 * A child whose manifest declares no ruling is ``ruling_not_policy``; a root the gate does not know
@@ -71,6 +78,7 @@ from breezy.persistence.autonomy.chain import (
     verify_venue_chain,
 )
 from breezy.persistence.autonomy.fold import FamilyView, FoldInvalid, FoldResult, Origin, fold
+from breezy.persistence.autonomy.fold_pairs import PairStatus, PairView
 from breezy.persistence.autonomy.fold_tallies import parse_carried
 from breezy.persistence.autonomy.hwm import Hwm, HwmReading, hwm_check, next_hwm
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths
@@ -94,6 +102,7 @@ from breezy.persistence.autonomy.schemas import (
     check_venue,
 )
 from breezy.persistence.autonomy.validate_ii import carried_of, effective_ns, hwm_floor_problem
+from breezy.persistence.autonomy.wire import WireRefused
 from breezy.persistence.family_manifest import FamilyManifest
 from breezy.persistence.live_orders_gate import (
     LineagePolicyDecision,
@@ -103,6 +112,7 @@ from breezy.persistence.live_orders_gate import (
 )
 
 __all__ = [
+    "RESOLVE_BUSY_TIMEOUT_MS",
     "FamilySource",
     "HwmMode",
     "ResolvedFamily",
@@ -114,6 +124,8 @@ __all__ = [
 ]
 
 FAMILY_SOURCE_ENV: Final = "BREEZY_FAMILY_SOURCE"
+#: How long the resolve waits for a registry writer (A8c-R6); the watch loop's is shorter.
+RESOLVE_BUSY_TIMEOUT_MS: Final = 2000
 _NS_PER_S: Final = 10**9
 _NS_PER_H: Final = 3600 * _NS_PER_S
 #: The kinds that can make a family CHAMPION: the rows an authorising row is chosen among.
@@ -168,7 +180,9 @@ class ResolvedFamily:
     """The one family that may send, with the bytes it stands on (ARCH C5 pickup fields).
 
     There is no ``enabled`` or permit field: the order-submission permit is none of the
-    registry's business. ``entries_allowed`` is ``False`` for a HALTED family (exits stay live).
+    registry's business. ``entries_allowed`` is ``False`` for a HALTED family (exits stay live); it
+    is NOT a trade permit: ``True`` says only that the registry would let this family enter, and
+    the permit, the caps and every other gate still decide whether an order is sent.
     """
 
     family_id: str
@@ -205,15 +219,13 @@ def _refuse(
 
 
 def _read_chain(
-    venue: str, paths: AutonomyPaths | ShadowPaths, now_ns: object
+    venue: str, paths: AutonomyPaths | ShadowPaths, now_ns: object, busy_timeout_ms: int
 ) -> VerifiedVenueChain | ResolverRefusal:
     """Step 2: the venue's chain verified from genesis, and a usable clock against its head."""
     if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns <= 0:
         return _refuse(RefusalReason.CLOCK_INVALID)
     try:
-        rows = RegistryReader(paths, busy_timeout_ms=pins.WATCH_BUSY_TIMEOUT_MS).read_venue_rows(
-            venue
-        )
+        rows = RegistryReader(paths, busy_timeout_ms=busy_timeout_ms).read_venue_rows(venue)
     except RegistryUnreadable as exc:
         return _refuse(RefusalReason.REGISTRY_UNREADABLE, exc.reason)
     try:
@@ -289,9 +301,10 @@ def _verify_registry(
     hwm: HwmReading,
     stage: StageView,
     hwm_mode: HwmMode,
+    busy_timeout_ms: int,
 ) -> _Verified | ResolverRefusal:
     """Steps 2 to 8: the verified chain, its fold and the one family that sends."""
-    chain = _read_chain(venue, paths, now_ns)
+    chain = _read_chain(venue, paths, now_ns, busy_timeout_ms)
     if isinstance(chain, ResolverRefusal):
         return chain
     exports = _read_exports(venue, paths, chain, now_ns)
@@ -347,6 +360,8 @@ def _root_gate(manifest: FamilyManifest, repo_root: Path) -> ResolverRefusal | N
         decision = live_orders_authorized(manifest, repo_root, permit_present=False)
     except LiveOrdersGateRefusedError as exc:
         return _refuse(RefusalReason.RULING_REFUSED, LiveOrdersRefusal(exc.reason))
+    except (OSError, RuntimeError):  # an unreadable ruling file is a missing ruling (A8c-R3)
+        return _refuse(RefusalReason.RULING_REFUSED, LiveOrdersRefusal.RULING_MISSING)
     if decision.reason == "permit_absent":
         return None
     if decision.reason == "no_ruling":
@@ -364,24 +379,31 @@ def _child_gate(
         if exc.reason == "not_allowlisted":
             return _refuse(RefusalReason.ROOT_NOT_LINEAGE_ALLOWLISTED)
         return _refuse(RefusalReason.RULING_REFUSED, LiveOrdersRefusal(exc.reason))
+    except (OSError, RuntimeError):  # an unreadable ruling file is a missing ruling (A8c-R3)
+        return _refuse(RefusalReason.RULING_REFUSED, LiveOrdersRefusal.RULING_MISSING)
     if not decision.authorized:
         return _refuse(RefusalReason.RULING_NOT_POLICY)
     return None
 
 
 def _first_champion_problem(
-    chain: VerifiedVenueChain, manifest: FamilyManifest
+    chain: VerifiedVenueChain, manifest: FamilyManifest, pairs: tuple[PairView, ...]
 ) -> RefusalReason | None:
     """d0 and the trial prefix bind a family's first →CHAMPION head only (U1).
 
     A family whose champion epoch a ROLLBACK or RESUME opened is judged by the head that made it
-    CHAMPION the first time, so neither rule applies to the later rows.
+    CHAMPION the first time, so neither rule applies to the later rows. A head whose pair the fold
+    reports VOIDED or LAPSED never made the family CHAMPION and is skipped (A8c-R6).
     """
+    dead = {
+        p.head_transition_id for p in pairs if p.status in (PairStatus.VOIDED, PairStatus.LAPSED)
+    }
     for row in chain.rows:
         if (
             row.family_id == manifest.family_id
             and row.kind in _HEAD_KINDS
             and row.to_state is State.CHAMPION
+            and row.transition_id not in dead
         ):
             if manifest.trial_id_prefix != f"{manifest.composition_kind}/trial/{row.family_id}/":
                 return RefusalReason.TRIAL_PREFIX_MISMATCH
@@ -426,6 +448,10 @@ def _bind_sender(
     authorising = _authorising_row(ok.chain, family)
     if authorising is None:
         return _refuse(RefusalReason.ENGINE_INCONSISTENCY)
+    root_view = ok.view.families.get(family.lineage_root_family_id)
+    root_sha = None if root_view is None else root_view.manifest_sha256
+    if family.origin is Origin.CHILD and root_sha is None:
+        return _refuse(RefusalReason.CHILD_ROOT_MISMATCH)  # no root bound: no yardstick (A8c-R1)
     bound = verify_bound_bytes(
         venue=venue,
         family_id=family.family_id,
@@ -435,6 +461,7 @@ def _bind_sender(
         repo_root=repo_root,
         origin=family.origin,
         expected_root=family.lineage_root_family_id,
+        expected_root_manifest_sha256=root_sha if family.origin is Origin.CHILD else None,
     )
     if isinstance(bound, ByteBindingFailure):
         return _refuse(bound.reason)
@@ -443,7 +470,7 @@ def _bind_sender(
         refusal = _root_gate(manifest, repo_root)
     else:
         refusal = _child_gate(manifest, family.lineage_root_family_id, repo_root, lineage_gate)
-        problem = _first_champion_problem(ok.chain, manifest)
+        problem = _first_champion_problem(ok.chain, manifest, ok.view.pairs)
         if refusal is None and problem is not None:
             refusal = _refuse(problem)
     if refusal is not None:
@@ -484,6 +511,7 @@ def _resolve(
     stage: StageView,
     lineage_gate: LineageGate,
     hwm_mode: HwmMode,
+    busy_timeout_ms: int = RESOLVE_BUSY_TIMEOUT_MS,
     _fixture_stage: bool = False,
     _engine_pins: frozenset[str] | None = None,
     _revoked_pins: frozenset[str] | None = None,
@@ -495,7 +523,10 @@ def _resolve(
         return _refuse(RefusalReason.PATHS_ROLE_MISMATCH)
     if hwm_mode is HwmMode.SKIP_SHADOW:
         raise NotImplementedError("the shadow step set is seam 8d")
-    venue = check_venue(venue)
+    try:
+        venue = check_venue(venue)
+    except WireRefused:
+        return _refuse(RefusalReason.REGISTRY_UNREADABLE, UnreadableReason.VENUE_MALFORMED)
     verified = _verify_registry(
         venue=venue,
         paths=paths,
@@ -504,6 +535,7 @@ def _resolve(
         hwm=hwm,
         stage=stage,
         hwm_mode=hwm_mode,
+        busy_timeout_ms=busy_timeout_ms,
     )
     if isinstance(verified, ResolverRefusal):
         return verified
@@ -525,6 +557,7 @@ def resolve_sending_family(
     repo_root: Path,
     now_ns: int,
     hwm: HwmReading,
+    busy_timeout_ms: int = RESOLVE_BUSY_TIMEOUT_MS,
 ) -> ResolvedFamily | ResolverRefusal:
     """The family that may send for ``venue`` at ``now_ns``, or why none may (module docstring).
 
@@ -541,4 +574,5 @@ def resolve_sending_family(
         stage=stage_policy.STAGE,
         lineage_gate=lineage_policy_authorized,
         hwm_mode=HwmMode.ENFORCE,
+        busy_timeout_ms=busy_timeout_ms,
     )

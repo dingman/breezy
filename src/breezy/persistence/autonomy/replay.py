@@ -70,13 +70,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import ClassVar, Final
 
-from breezy.persistence.autonomy import pins, transitions
-from breezy.persistence.autonomy.byte_binding import read_artefact
+from breezy.persistence.autonomy import transitions
+from breezy.persistence.autonomy.byte_binding import probe_artefact, read_artefact
 from breezy.persistence.autonomy.chain import VerifiedVenueChain
 from breezy.persistence.autonomy.family_bytes import read_manifest_facts, roots_of
 from breezy.persistence.autonomy.fold import FoldInvalid, FoldResult, fold
 from breezy.persistence.autonomy.fold_pairs import PARTNER_KINDS, is_head
-from breezy.persistence.autonomy.lineage import model_class_of
 from breezy.persistence.autonomy.paths import AutonomyPaths, ShadowPaths, family_component
 from breezy.persistence.autonomy.schemas import (
     CauseCode,
@@ -391,16 +390,19 @@ def _read_artefact(paths: AutonomyPaths | ShadowPaths, model_class: str, sha: st
 
 
 def _probe_artefact(walk: _Walk, kind: str, sha: str) -> bytes | None:
-    """The one artefact under ``<kind>:<component>/<sha>``; ``None`` for none or several."""
-    found: list[bytes] = []
-    for component in pins.MODEL_CLASS_COMPONENTS:
-        model_class = model_class_of(kind, component)
-        if (model_class, sha) not in walk.reads:
-            walk.reads[(model_class, sha)] = _read_artefact(walk.paths, model_class, sha)
-        raw = walk.reads[(model_class, sha)]
-        if raw is not None:
-            found.append(raw)
-    return found[0] if len(found) == 1 else None
+    """The one artefact under ``<kind>:<component>/<sha>``; ``None`` for none or several.
+
+    ``byte_binding.probe_artefact`` decides; the read it is given is memoised per replay (A8c-R6).
+    """
+
+    def read(model_class: str, digest: str) -> bytes | None:
+        key = (model_class, digest)
+        if key not in walk.reads:
+            walk.reads[key] = _read_artefact(walk.paths, model_class, digest)
+        return walk.reads[key]
+
+    found = probe_artefact(kind, sha, read=read)
+    return None if found is None else found[1]
 
 
 def _artefact_failure(walk: _Walk, row: TransitionRow) -> ArtefactFailure | None:

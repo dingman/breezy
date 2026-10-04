@@ -202,6 +202,7 @@ class UnreadableReason(StrEnum):
     SCHEMA_MISMATCH = "schema_mismatch"
     IO = "io"
     SQLITE_ERROR = "sqlite_error"
+    VENUE_MALFORMED = "venue_malformed"  # the resolver was asked about no well-formed venue
 
 
 class LiveOrdersRefusal(StrEnum):

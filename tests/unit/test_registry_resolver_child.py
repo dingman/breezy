@@ -263,7 +263,7 @@ def test_rollback_to_earlier_child_passes_d0_rule(world: World, promoted: Any) -
     """The d0 and prefix rule is the first →CHAMPION head's alone: a family whose champion epoch a
     later ROLLBACK opened is judged by that old head, never by the rollback's date."""
     manifest = parse_family_manifest(world.child_raw, path=root_file(world))
-    assert resolver_mod._first_champion_problem(promoted, manifest) is None
+    assert resolver_mod._first_champion_problem(promoted, manifest, ()) is None
     # the same child, but a rollback date long after its d0 appended to the chain: still none
     later = full_chain(world)
     later.add(
@@ -271,10 +271,10 @@ def test_rollback_to_earlier_child_passes_d0_rule(world: World, promoted: Any) -
         ts=at("2026-12-01", "16:40"), effective_launch_date="2026-12-02",
     )  # fmt: skip
     rolled = forge(later)
-    assert resolver_mod._first_champion_problem(rolled, manifest) is None
+    assert resolver_mod._first_champion_problem(rolled, manifest, ()) is None
     # control: the rule does bind the head (a d0 before its date is a breach)
     early = dataclasses.replace(manifest, d0_climate_day="2026-10-09")
-    assert resolver_mod._first_champion_problem(rolled, early) is RefusalReason.D0_BREACH
+    assert resolver_mod._first_champion_problem(rolled, early, ()) is RefusalReason.D0_BREACH
 
 
 # --- the lineage gate ---
