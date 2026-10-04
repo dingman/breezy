@@ -462,15 +462,18 @@ def _resend_phase(run: _Run, fresh: frozenset[str]) -> None:
             _process(run, item, markers)
 
 
-def _delivered(data_root: Path, today: dt.date) -> frozenset[str]:
-    """The delivered events of the last ``HEAL_ABANDON_DAYS + 1`` days; an unreadable ledger is not
-    delivered, so it fails closed toward a re-send."""
-    first = today - dt.timedelta(days=HEAL_ABANDON_DAYS + 1)
+def _delivered(run: _Run) -> frozenset[str]:
+    """The delivered events of the last ``HEAL_ABANDON_DAYS + 1`` days. An unreadable ledger is not
+    delivered, so it fails closed toward a re-send; any other exception from the reader is a duty
+    failure (S3-R52), and the rest of the heal work still runs on the same fail-closed footing."""
+    first = run.today - dt.timedelta(days=HEAL_ABANDON_DAYS + 1)
     try:
-        return delivered_events(data_root, first, today)
+        return delivered_events(run.data_root, first, run.today)
     except _UNREADABLE as exc:
         _LOGGER.error("capture heal: delivery ledger unreadable (%s)", type(exc).__name__)
-        return frozenset()
+    except Exception as exc:  # noqa: BLE001 - the duty never raises: a reader bug is one failure
+        run.fail("delivery ledger", exc)
+    return frozenset()
 
 
 def run_heal_duty(data_root: Path, *, now_ns: int, heal_deadline: float, sender: HealSender) -> int:
@@ -478,7 +481,7 @@ def run_heal_duty(data_root: Path, *, now_ns: int, heal_deadline: float, sender:
     instant: running past it (or the run's ``DEADLINE``), as a ``ScanDeadline``, is a failure."""
     run = _Run(data_root, now_ns, heal_deadline, sender, frozenset())
     try:
-        run.delivered = _delivered(data_root, run.today)
+        run.delivered = _delivered(run)
         fresh: frozenset[str] = frozenset()
         try:
             fresh = _heal_phase(run)

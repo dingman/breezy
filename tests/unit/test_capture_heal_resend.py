@@ -166,6 +166,24 @@ def test_ledger_missing_or_unreadable_is_not_delivered(
     assert failures == 0 and sender.events("retry") == [event]
 
 
+def test_a_ledger_reader_that_raises_is_one_failure_and_the_rest_of_heal_still_runs(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3-R52: the heal duty never raises. Any exception from ``delivered_events`` is counted as a
+    duty failure; the re-send work still runs, failing closed toward a re-send."""
+    event = heal(world, 2)
+
+    def broken(*_a: Any) -> frozenset[str]:
+        raise RuntimeError("ledger reader bug")
+
+    monkeypatch.setattr(heal_io, "delivered_events", broken)
+    sender = Sender()
+
+    failures = world.run(sender)
+
+    assert failures == 1 and sender.events("retry") == [event]
+
+
 def test_a_heal_record_without_a_sha_is_a_failure(world: World) -> None:
     world.put(f"evidence/capture/heal/{_date(NOW)}/{NOW}_audit_breezy-quote-tape.json", {"x": 1})
 
