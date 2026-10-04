@@ -486,3 +486,44 @@ The architect verified pins.py and veto.py (seam A 3a) against ARCH §4.5, C5 an
   - d0 ordering skips the root, safe while root d0 ≤ child launch.
   - Uncited RESUME refused.
 - **A7c-A2 (accepted deviation).** The generic `from_state` rule has exactly one exemption. A post-launch SWAP_CANCEL in [LAUNCH, 17:00) may name an effective pair's incoming family as CHALLENGER while the fold already shows it CHAMPION. Without this exemption, the E-19a alternative path, which must stay open, would be refused. It is pinned by `test_the_swap_cancel_alternative_is_accepted_in_the_launch_window`.
+
+### Integration rulings (seam B rebased onto seam A gates)
+- **B8-R1.** The seam A judged-file predicate (A6-R2/A4-R1, "a component starting with `autonomy`") excludes exactly the package `breezy.runtime.autonomy_sandbox`, through one explicit, reasoned exclusion row with a planted control test. That package is ARCH-0 seam B's own runtime. It is governed by seam B's gates:
+  - the stdlib-only import contract;
+  - `WRAPPER_CODE_FILES` / `SHARED_WRITE_SITES` (`test_autonomy_write_sites`);
+  - the unit lint;
+  - the security reviews.
+  
+  It legitimately `execv`s bwrap and names host paths (`/run/user/<uid>`, `/usr/bin/bwrap`). No other `autonomy*` package is exempt, so AUT-1's `autonomy_capture` and AUT-3's `autonomy_refit` stay judged.
+- **B8-R2.** `test_three_arch0_contracts_are_strict_forbidden` counts the seam A contracts by their exact `ARCH-0 autonomy (` name prefix. Seam B's stdlib-only contract is pinned by seam B's own test.
+- **B8-R3.** The wrapper `deploy/systemd/breezy-autonomy-bwrap` must be exactly 0755 on disk. A checkout under umask 002 yields 0775, which is group-writable, and the test correctly fails. The worktree file is chmod'ed 0755. **Obligation for B3/install:** the install step sets 0755 explicitly, and the V-steps verify it on the primary tree. The test is not relaxed.
+
+### Build-time rulings (seam A 7d ARCH review, 66d5e113)
+- **A7d-R1 (M1).** Drill ROLLBACKs are subject to `ROLLBACK_MIN_DWELL_H` (ARCH:913, AUT-7 r5:185). They are exempt only from the rollback budget (ARCH:943). The affected drill fixtures are re-planted, and the misnamed exemption test is fixed to exercise the rule.
+- **A7d-R2 (M2).**
+  - `_cancellable` mirrors the fold's `_cancel_voids` exactly. A member of a non-voided pair is cancellable if `ts < launch`, or if the pair was activated and `ts < window_end`.
+  - `ValidateRefused` carries the `Refusal` rule and `row_index`, so the engine can tell a deterministic validate refusal from a retryable one.
+  - **Obligation (AUT-5), extending A7c-R6:** a deterministic `validate` refusal of a restrictive row never enters the Y19 retry/demand path. The engine records it and takes the next restrictive alternative instead.
+- **A7d-R3 (LOW).**
+  - (L1) The launch projection applies batch partners at their head's LAUNCH, as the fold does.
+  - (L2) Only immediate introducers count as "held" for the MINT exemption.
+  - (L3) An ATTEST with `until <= ts` is refused.
+  - (L4) The manifest-isolation test is parametrized over every restrictive kind and ATTEST.
+  - (L4) The weak assertion at :752 is fixed, and the duplicate at :321 removed.
+  - (L4) A test asserts `_RESTRICTIVE == transitions.RESTRICTIVE_KINDS`.
+  - (L4) The restrictive single-sender probe is extended with DISPLACED, ROLLBACK, DRILL_PROMOTE and ROOT_ADMIT pairs, a second pair written in the launch window, and every restrictive cause class.
+  - (L5) An AST guard confines `_append(..., _fixture_stage=True)` to `tests/`.
+- **A7d-R4 (L6).** `fold.py` is at 776/800 lines. Pair handling moves to a sibling `fold_pairs.py` before any further fold growth. This is done in this fix pass, as a behaviour-preserving move.
+- **Carried obligations.**
+  - (AUT-5) When `RuleSetPending` is lifted for HWM_RESET, `_validate` passes `export_counters`.
+  - (AUT-5) The ROOT_ADMIT cooldown after TERMINAL, and the `MIN_DAYS_BETWEEN_PROMOTES` M-rate, are owned by the engine. Both are inert in v1.
+  - A same-artefact MINT with a different manifest is free. This is accepted (ARCH:255-257) and noted.
+
+### Seam A 8a security review (5904ca6d): APPROVE, live behaviour identical
+- The extraction is statement-equivalent. The call order is unchanged. The new `lineage_policy_authorized` is inert: its allowlist is empty, it has no caller, and it can never return `authorized=True`. The only import added is `re`. The FQ tests are unmodified.
+- **Carried to 8c:**
+  - (L1) An AST test asserts that nothing in `src/` outside `live_orders_gate` references `_lineage_policy_authorized`. The resolver calls only the public function.
+  - (L2) When AUT-5 WP9 adds the first lineage allowlist row, its review confirms that the root id does not itself match `CHILD_FAMILY_ID_RE`.
+- **Activation:** 8a merges outside 16:30–17:10Z. It goes live at the node's next 16:50Z LAUNCH (AC 30). 8c merges only after a boot line timestamped after that relaunch.
+- **B8-R3 follow-up (gate B5).** Every checkout or rebase under this host's umask 0002 rewrites the wrapper as 0775. The rebased seam B full gate failed only `test_wrapper_script_is_mode_0755_…`. Every other test passed (phase 2: 27/27). The wrapper was chmod'ed 0755, its test file was re-run green, and seam B was merged. The primary-tree copy was chmod'ed 0755 after the merge.
+- **WP-B3 obligation (binding).** Install the wrapper with `install -m 0755` to a location outside the git checkout, and point the units at that copy. The repo file's mode then never decides the deployed mode. The V-steps verify the installed copy's mode and owner.
