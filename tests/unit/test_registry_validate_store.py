@@ -12,9 +12,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
-import breezy.persistence.autonomy.transitions as tm
 from breezy.persistence.autonomy.schemas import (
-    CauseCode,
     Kind,
     ManifestFacts,
     ManifestFactsReader,
@@ -204,14 +202,16 @@ def test_root_admit_exempt_from_d0_rule() -> None:
 
 
 def test_rollback_and_a_repeat_promote_of_a_former_champion_are_exempt() -> None:
-    chain = champion_chain()  # INCUMBENT has been CHAMPION since its BOOTSTRAP
+    later = at(DAY, "18:00")  # CHILD has superseded INCUMBENT, a former CHAMPION
     never = Manifests(banned=frozenset({INCUMBENT, CHILD}))
     rollback = probe(
-        chain, NOW, Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
+        second_child_chain(), later, Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT,
+        frm=State.CHALLENGER,
         effective_launch_date=DAY, manifest_sha256=INC_MAN, manifests=never,
     )  # fmt: skip
     repromote = probe(
-        chain, NOW, Kind.PROMOTE, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
+        second_child_chain(), later, Kind.PROMOTE, State.CHAMPION, family=INCUMBENT,
+        frm=State.CHALLENGER,
         effective_launch_date=DAY, manifest_sha256=INC_MAN, manifests=never,
     )  # fmt: skip
 
@@ -240,31 +240,6 @@ def test_drill_close_restore_at_most_one_per_venue_per_day() -> None:
     assert with_restores(day_ago + 1) is not None
     assert with_restores(day_ago) is None
     assert with_restores() is None
-
-
-def test_a_second_restore_in_one_batch_is_refused() -> None:
-    chain = failed_close_chain()
-    prior = run(chain, RESTORE_TS)
-    rows = [
-        chain.add(
-            Kind.RESUME,
-            State.CHAMPION,
-            family=INCUMBENT,
-            frm=State.HALTED,
-            ts=RESTORE_TS,
-            cause_code=CauseCode.DRILL_CLOSE_RESTORE,
-            manifest_sha256=INC_MAN,
-            artefact_sha256=INC_ART,
-        )
-        for _ in range(2)
-    ]
-
-    refused = tm.first_refusal(prior, rows, manifests=Manifests())
-
-    assert refused is not None and (refused.rule.value, refused.row_index) == (
-        "restore_daily_cap",
-        1,
-    )
 
 
 def test_drill_close_restore_refused_for_drill_child() -> None:

@@ -763,7 +763,7 @@ def test_drill_flag_spans_promote_to_rollback() -> None:
     (episode,) = result.drill_episodes
     assert episode == DrillEpisode(
         family_id=CHILD, start_ns=LAUNCH, end_ns=NEXT_LAUNCH,
-        drill_promote_transition_id=head.transition_id,
+        drill_promote_transition_id=head.transition_id, superseded_family_id=INCUMBENT,
     )  # fmt: skip
     assert closing.family_id == INCUMBENT
     assert not episode.contains(LAUNCH - ONE_NS)

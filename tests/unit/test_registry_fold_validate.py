@@ -148,11 +148,16 @@ def probe(
 
 
 def resume(
-    chain: Chain, *, now: int = RESUME_TS, ts: int | None = None, **extra: Any
+    chain: Chain,
+    *,
+    now: int = RESUME_TS,
+    ts: int | None = None,
+    frm: State = State.HALTED,
+    **extra: Any,
 ) -> Refusal | None:
     extra.setdefault("cause_verdict_ids", CITED)
     return probe(
-        chain, now, Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED,
+        chain, now, Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=frm,
         ts=RESUME_TS if ts is None else ts, **extra,
     )  # fmt: skip
 
@@ -169,7 +174,7 @@ def rule_of(refusal: Refusal | None) -> str | None:
 
 # --- E-5: the restorative RESUME after a failed drill close ------------------------------------
 
-RESTORE_TS: Final = at("2026-10-12", "16:45")
+RESTORE_TS: Final = at("2026-10-13", "16:45")  # C+2: the first pass past the cooldown
 RESTORE: Final[dict[str, Any]] = {
     "cause_code": CauseCode.DRILL_CLOSE_RESTORE,
     "manifest_sha256": INC_MAN,
@@ -216,7 +221,7 @@ def restore(
 # --- FamilyView facts validate reads ------------------------------------------------------------
 
 
-def test_family_view_binds_the_latest_applied_shas() -> None:
+def test_family_view_binds_the_introducing_artefact_and_the_latest_manifest() -> None:
     chain = champion_chain()
     chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)  # carries no sha
     chain.add(Kind.ATTEST, State.CHAMPION, family=INCUMBENT, frm=State.CHAMPION)
@@ -228,7 +233,7 @@ def test_family_view_binds_the_latest_applied_shas() -> None:
     result = run(chain, LAUNCH)
 
     assert result.families[INCUMBENT].manifest_sha256 == INC_MAN
-    assert result.families[INCUMBENT].artefact_sha256 == rebound
+    assert result.families[INCUMBENT].artefact_sha256 == INC_ART  # A7c-R5: the introducing row's
     assert result.families[CHILD].manifest_sha256 == CHILD_MAN
     assert result.families[CHILD].artefact_sha256 == INC_ART
 
@@ -288,8 +293,16 @@ DRILL_ENTRY: Final = [
 ]
 
 
+def admitted(chain: Chain) -> None:
+    """The child is a CHALLENGER before a DRILL_PROMOTE (the rows' ``from_state`` are checked)."""
+    chain.add(
+        Kind.DRILL_ADMIT, State.CHALLENGER, family=CHILD, frm=State.SHADOW, artefact_sha256=INC_ART
+    )
+
+
 def drill_row(chain: Chain, kind: Kind, frm: State, to: State, **extra: Any) -> Refusal | None:
     if kind is Kind.DRILL_PROMOTE:  # a first →CHAMPION row: its manifest facts must read (U1)
+        admitted(chain)
         extra.setdefault("effective_launch_date", DAY)
         extra.setdefault("manifest_sha256", CHILD_MAN)
     return probe(chain, LAUNCH, kind, to, family=CHILD, frm=frm, manifests=facts_for_child, **extra)
@@ -323,7 +336,7 @@ def test_drill_refused_without_exactly_one_sender() -> None:
 
 
 @pytest.mark.parametrize(("kind", "frm", "to"), DRILL_ENTRY, ids=["admit", "promote"])
-def test_drill_row_refused_while_non_drill_cause_stands(kind: Kind, frm: State, to: State) -> None:
+def test_drill_row_refused_while_integrity_freeze_stands(kind: Kind, frm: State, to: State) -> None:
     chain = champion_chain()
     freeze_venue(chain)
 
@@ -381,6 +394,8 @@ DRILL_EFFECTIVE: Final = {c: DRILL_BUDGET_NOW for c in DRILL_ROWS} | {"drill_pro
 
 def drill_candidate(chain: Chain, counter: str) -> Refusal | None:
     kind, to, frm, extra = DRILL_ROWS[counter]
+    if kind is Kind.DRILL_PROMOTE:
+        admitted(chain)
     family = INCUMBENT if counter in ("drill_demotes", "drill_halts") else CHILD
     return probe(
         chain, DRILL_BUDGET_NOW, kind, to, family=family, frm=frm, ts=DRILL_BUDGET_NOW,
@@ -417,10 +432,11 @@ def test_drill_budget_is_a_venue_cap_summed_across_lineages() -> None:
 
 def test_a_second_drill_row_in_one_batch_is_refused() -> None:
     chain = champion_chain()
+    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=OTHER)  # a second family to halt
     prior = run(chain, LAUNCH)
     rows = [
         chain.add(Kind.DEMOTE, State.HALTED, family=INCUMBENT, frm=State.CHAMPION, **DRILL_CAUSE),
-        chain.add(Kind.HALT, State.HALTED, family=INCUMBENT, frm=State.CHAMPION, **DRILL_CAUSE),
+        chain.add(Kind.HALT, State.HALTED, family=OTHER, frm=State.CHAMPION, **DRILL_CAUSE),
     ]
     assert tm.first_refusal(prior, rows[:1], manifests=no_facts) is None
     both = tm.first_refusal(prior, rows, manifests=no_facts)
@@ -428,7 +444,7 @@ def test_a_second_drill_row_in_one_batch_is_refused() -> None:
 
     twice = [
         rows[0],
-        chain.add(Kind.DEMOTE, State.HALTED, family=INCUMBENT, frm=State.CHAMPION, **DRILL_CAUSE),
+        chain.add(Kind.DEMOTE, State.HALTED, family=OTHER, frm=State.CHAMPION, **DRILL_CAUSE),
     ]
     refused = tm.first_refusal(prior, twice, manifests=no_facts)
     assert refused is not None and (refused.rule.value, refused.row_index) == ("drill_budget", 1)
@@ -489,9 +505,18 @@ def open_episode_chain() -> DrillChain:
     return chain
 
 
-def rollback(chain: Chain, now: int, *, drill: bool) -> Refusal | None:
+def superseded_chain() -> DrillChain:
+    """INCUMBENT superseded by CHILD in an ordinary (non-drill) pair that has taken effect."""
+    chain = champion_chain()
+    chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
+    head, _tail = chain.promote_pair(day=DAY)
+    chain.activate(head, ts=at(DAY, "16:45"))
+    return chain
+
+
+def rollback(chain: Chain, now: int, *, drill: bool, family: str = INCUMBENT) -> Refusal | None:
     return probe(
-        chain, now, Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
+        chain, now, Kind.ROLLBACK, State.CHAMPION, family=family, frm=State.CHALLENGER,
         effective_launch_date=NEXT_DAY, drill=drill,
     )  # fmt: skip
 
@@ -501,15 +526,15 @@ def test_rollback_drill_column_must_match_an_open_episode() -> None:
     assert rollback(open_episode_chain(), during, drill=True) is None
     assert rule_of(rollback(open_episode_chain(), during, drill=False)) == "rollback_drill_column"
 
-    no_episode = champion_chain()
-    assert rollback(no_episode, during, drill=False) is None
-    assert rule_of(rollback(champion_chain(), during, drill=True)) == "rollback_drill_column"
+    assert rollback(superseded_chain(), during, drill=False) is None
+    assert rule_of(rollback(superseded_chain(), during, drill=True)) == "rollback_drill_column"
 
 
 def test_rollback_drill_column_after_the_episode_closed() -> None:
     chain = failed_close_chain(halt=lambda _c: None)
     after = at(NEXT_DAY, "18:00")  # the closing ROLLBACK took effect at 16:50
-    assert rule_of(rollback(chain, after, drill=True)) == "rollback_drill_column"
+    refused = rollback(chain, after, drill=True, family=CHILD)  # the child the close superseded
+    assert rule_of(refused) == "rollback_drill_column"
 
 
 def test_a_drill_rollback_is_capped_by_the_drill_budget() -> None:
@@ -550,6 +575,7 @@ LATE: Final = at(DAY, "18:00")
 
 def window_demote(kind: Kind, ts: int, *, family: str = CHILD) -> Refusal | None:
     chain, _head, _tail = activated_pair()
+    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=OTHER)  # an unrelated sender
     return probe(
         chain, LATE, kind, State.HALTED, family=family, frm=State.CHAMPION, ts=ts,
         halt_cause_class=CauseClass.RECOVERABLE_MODEL, cause_code=CauseCode.VERDICT_FAIL,
@@ -571,12 +597,12 @@ def test_launch_window_is_half_open_from_launch_to_window_end() -> None:
 
 
 def test_launch_window_rule_binds_only_the_incoming_family_of_an_activated_pair() -> None:
-    assert window_demote(Kind.DEMOTE, at(DAY, "16:55"), family=INCUMBENT) is None
+    assert window_demote(Kind.DEMOTE, at(DAY, "16:55"), family=OTHER) is None
 
     chain, head, _tail = activated_pair()
     cancel(chain, head, ts=at(DAY, "16:46"))  # voided before LAUNCH: no pair took effect
     voided = probe(
-        chain, LATE, Kind.DEMOTE, State.HALTED, family=CHILD, frm=State.CHAMPION,
+        chain, LATE, Kind.DEMOTE, State.HALTED, family=CHILD, frm=State.CHALLENGER,
         ts=at(DAY, "16:55"), halt_cause_class=CauseClass.RECOVERABLE_MODEL,
         cause_code=CauseCode.VERDICT_FAIL,
     )  # fmt: skip
@@ -718,6 +744,8 @@ def test_restrictive_rows_are_not_refused_by_budgets_or_freezes(
     kind: Kind, frm: State, to: State, extra: dict[str, Any]
 ) -> None:
     chain = champion_chain()
+    chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
+    family = CHILD if frm is State.CHALLENGER else INCUMBENT  # each in the state its row names
     freeze_venue(chain)
     spent = RESUME_TS - HOUR_NS
     exhaust(
@@ -732,7 +760,7 @@ def test_restrictive_rows_are_not_refused_by_budgets_or_freezes(
         infra_resumes=(spent, spent, spent),
     )
 
-    assert probe(chain, RESUME_TS, kind, to, family=INCUMBENT, frm=frm, **extra) is None
+    assert probe(chain, RESUME_TS, kind, to, family=family, frm=frm, **extra) is None
 
 
 def test_validate_does_not_mutate_its_inputs() -> None:

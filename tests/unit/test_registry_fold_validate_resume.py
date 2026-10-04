@@ -118,8 +118,11 @@ def test_resume_refused_for_a_class_that_never_resumes(cls: CauseClass | None, r
 
 
 def test_resume_refused_for_a_family_that_is_not_halted() -> None:
-    assert rule_of(resume(champion_chain())) == "resume_not_halted"
-    assert rule_of(resume(Chain())) == "resume_not_halted"
+    # a row whose from_state is not the fold's state is refused first (A7c-R2) ...
+    assert rule_of(resume(champion_chain())) == "from_state_mismatch"
+    assert rule_of(resume(Chain())) == "from_state_mismatch"
+    # ... and one that names the fold's own state still finds nothing to resume
+    assert rule_of(resume(champion_chain(), frm=State.CHAMPION)) == "resume_not_halted"
 
 
 def test_resume_refused_inside_the_cooldown() -> None:
@@ -188,18 +191,22 @@ def test_infra_resume_budget_is_three_per_venue_in_seven_days() -> None:
 def test_a_second_resume_in_one_batch_sees_the_first() -> None:
     chain = champion_chain()
     halt_incumbent(chain, CauseClass.RECOVERABLE_MODEL)
+    chain.add(  # a sibling of the same lineage, halted for the same class
+        Kind.HALT, State.HALTED, family=CHILD, frm=State.CHAMPION, ts=HALT_TS + 1,
+        halt_cause_class=CauseClass.RECOVERABLE_MODEL, cause_code=CauseCode.VERDICT_FAIL,
+    )  # fmt: skip
     exhaust(chain, {INCUMBENT: {"model_resumes": (RESUME_TS - DAY_NS,)}})
     prior = run(chain, RESUME_TS)
     rows = [
         chain.add(
             Kind.RESUME,
             State.CHAMPION,
-            family=INCUMBENT,
+            family=family,
             frm=State.HALTED,
             ts=RESUME_TS,
             cause_verdict_ids=CITED,
         )
-        for _ in range(2)
+        for family in (INCUMBENT, CHILD)
     ]
 
     assert tm.first_refusal(prior, rows[:1], manifests=no_facts) is None
@@ -232,7 +239,7 @@ def test_drill_close_restore_accepts_the_failed_close() -> None:
 
 
 def test_drill_close_restore_charges_no_drill_or_production_budget() -> None:
-    """Every budget exhausted and the cooldown unmet: the restore is still admitted (E-5)."""
+    """Every budget exhausted: the restore waits for the cooldown, then is admitted (A7c-R1)."""
     spent = RESTORE_TS - HOUR_NS
     chain = failed_close_chain()
     exhaust(
@@ -247,12 +254,12 @@ def test_drill_close_restore_charges_no_drill_or_production_budget() -> None:
         infra_resumes=(spent, spent, spent),
     )
     soon = at(NEXT_DAY, "17:10")  # 15 minutes after the failed close: inside the cooldown
-    assert restore(chain, ts=soon) is None
+    assert rule_of(restore(failed_close_chain(), ts=soon)) == "resume_cooldown"
+    almost = at(NEXT_DAY, "16:55") + 24 * HOUR_NS - 1
+    assert rule_of(restore(failed_close_chain(), ts=almost)) == "resume_cooldown"
 
-    ordinary = failed_close_chain()
-    assert (
-        rule_of(resume(ordinary, now=soon, ts=soon, cause_verdict_ids=CITED)) == "resume_cooldown"
-    )
+    soon = RESTORE_TS  # C+2 16:45: the halt (C 16:55) is more than 24 h old
+    assert restore(chain, ts=soon) is None
 
     after = run(chain, soon)  # the probe appended the restore
     assert after.venue_tallies.drill_close_restores == (soon,)

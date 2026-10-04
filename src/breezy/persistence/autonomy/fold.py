@@ -71,9 +71,10 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   and ``terminal_frozen`` true freezes the lineage. A malformed object is
   ``FoldInvalid(carried_counters_malformed)``, whatever the clock. A carried lineage with no
   families left keeps its tallies.
-* ``manifest_sha256`` and ``artefact_sha256`` of a family are the values of the latest applied row
-  that carries each (seam 7c; the binding ``validate`` compares a drill child or a restorative
-  RESUME against). ``standing_cause_class`` is the class a RESUME of a HALTED family is charged to
+* ``manifest_sha256`` of a family is that of the latest applied row that carries one; its
+  ``artefact_sha256`` is the introducing row's and never changes (A7c-R5, ARCH:367). ``validate``
+  compares a drill child or a restorative RESUME against them and refuses a rebinding row.
+  ``standing_cause_class`` is the class a RESUME of a HALTED family is charged to
   (the class of its standing DEMOTE or HALT, a ROLLBACK_FAILED one resolved to its
   ``trigger_cause_class``) and ``standing_cause_code`` the ``cause_code`` of that row; both are
   ``None`` while the family is not HALTED.
@@ -217,6 +218,8 @@ class DrillEpisode:
     start_ns: int
     end_ns: int | None
     drill_promote_transition_id: str
+    #: The incumbent the DRILL_PROMOTE superseded (A7c-R4); ``None`` until its partner applies.
+    superseded_family_id: str | None = None
 
     def contains(self, ts_ns: int) -> bool:
         return self.start_ns <= ts_ns and (self.end_ns is None or ts_ns < self.end_ns)
@@ -440,6 +443,7 @@ class _OpenEpisode:
     start_ns: int
     transition_id: str
     end_ns: int | None = None
+    superseded: str | None = None
 
 
 def _is_nomination(row: TransitionRow) -> bool:
@@ -485,7 +489,7 @@ class _Accumulator:
         if row.manifest_sha256 is not None:
             self.manifest_sha[family] = row.manifest_sha256
         if row.artefact_sha256 is not None:
-            self.artefact_sha[family] = row.artefact_sha256
+            self.artefact_sha.setdefault(family, row.artefact_sha256)  # immutable (A7c-R5)
         if row.from_state is not row.to_state:
             self.states[family] = row.to_state
             if row.to_state is State.HALTED:
@@ -502,6 +506,7 @@ class _Accumulator:
             if family not in self.drill_children:
                 self.rollback_eligible.add(family)
             self._close_episode(family, instant)
+            self._note_superseded(row)
         elif kind is Kind.DISPLACED:
             self._close_episode(family, instant)
         elif kind is Kind.DRILL_ADMIT:
@@ -596,6 +601,11 @@ class _Accumulator:
     def _freeze_lineage(self, family: str) -> None:
         self.frozen_lineages.add(self.lineage_of.get(family, family))
 
+    def _note_superseded(self, row: TransitionRow) -> None:
+        for episode in self.episodes:
+            if episode.transition_id == row.paired_transition_id:
+                episode.superseded = row.family_id
+
     def _close_episode(self, family: str, instant: int) -> None:
         for episode in self.episodes:
             if episode.family_id == family and episode.end_ns is None:
@@ -651,6 +661,7 @@ class _Accumulator:
                 start_ns=e.start_ns,
                 end_ns=e.end_ns,
                 drill_promote_transition_id=e.transition_id,
+                superseded_family_id=e.superseded,
             )
             for e in self.episodes
         )

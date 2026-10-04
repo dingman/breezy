@@ -9,19 +9,27 @@ sender, HWM_RESET floors). ``transitions`` re-exports ``validate``; the code liv
 Rules built here, each named by a ``Rule`` that ``first_refusal`` reports:
 
 * drill (W2, V12, V15): a DRILL_ADMIT or DRILL_PROMOTE needs exactly one sender, CHAMPION and not
-  HALTED, with no exec-store halt standing, and an ``artefact_sha256`` equal to the incumbent's; a
-  DRILL-class DEMOTE or HALT is refused while an exec-store halt stands; every drill counter is
-  capped at ``pins.DRILL_BUDGET_PER_VENUE_30D`` in a 30 day window;
+  HALTED and not ``demoted_for_cause`` (R7), with no integrity freeze standing, and an
+  ``artefact_sha256`` equal to the incumbent's; a DRILL-class DEMOTE or HALT (a ROLLBACK_FAILED
+  one under trigger DRILL included) is refused unless the family is CHAMPION with no standing
+  cause (R2); every drill counter is capped at ``pins.DRILL_BUDGET_PER_VENUE_30D`` in a 30 day
+  window;
 * a ROLLBACK's ``drill`` column equals whether a drill episode is open (A7b);
 * a nomination that is infeasible carries no α (AUT-4 r11:567; A7b);
-* RESUME (Y8, Z10, W2, V12): the family is HALTED and no pair is pending, no exec-store halt
-  stands, the row cites cause verdicts, the cooldown has passed, the standing cause class is
+* every row's ``from_state`` equals the fold's state of its family, ∅ for an introducer (A7c-R2),
+  and no row rebinds a family's artefact sha (A7c-R5);
+* RESUME (Y8, Z10, W2, V12): the family is HALTED with a halt instant, no pair is pending and no
+  integrity freeze stands (the engine owns the live exec-store halt check), the row cites cause
+  verdicts (each a PASS produced after the halt when the caller resolves them, A7c-R8), the
+  cooldown has passed, the standing cause class is
   RECOVERABLE_MODEL, RECOVERABLE_INFRA or DRILL (a ROLLBACK_FAILED halt counts as its
   ``trigger_cause_class``) and that class's own budget has room;
 * E-5: a RESUME with cause ``drill_close_restore`` is the restorative RESUME of the incumbent after
-  a failed drill close; it charges and needs no cooldown or budget, and is refused for a drill
-  child, after any other cause, while an exec-store halt stands, when its shas differ from the
-  family's, and past ``pins.DRILL_CLOSE_RESTORES_PER_VENUE_PER_DAY`` in a rolling day;
+  a failed drill close; it charges no budget but keeps the cooldown (A7c-R1), and is refused for a
+  drill child, after any other cause, outside the latest closed drill episode or for any family
+  but the incumbent that episode superseded (A7c-R4), while an integrity freeze stands, when its
+  shas differ from the family's, and past ``pins.DRILL_CLOSE_RESTORES_PER_VENUE_PER_DAY`` in a
+  rolling day;
 * d0 and ``trial_id_prefix`` at a family's first →CHAMPION row (PROMOTE, DRILL_PROMOTE; ROLLBACK,
   RESUME and ROOT_ADMIT are exempt, U1): the manifest facts must read and match the row, the prefix
   must equal ``f"{composition_kind}/trial/{child}/"``, ``d0_climate_day`` must be at least the
@@ -40,15 +48,15 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   pending DRILL_PROMOTE pairs and the earlier rows of the same batch. A venue cap sums the slices
   across lineages. The window lengths follow the names of their pins: 14, 7 and 30 days and one
   rolling 24 hours (``pins`` holds the caps, not the window lengths).
-* A restorative RESUME is exempt from the cooldown: the 16:45Z pass writes it less than 24 h after
-  a 16:50Z failed close, and a cooldown would strand the venue (E-5 rationale).
+* The restorative RESUME keeps ``RESUME_COOLDOWN_H``: the cooldown delays it to the next eligible
+  pass and strands nothing (A7c-R1).
 * Not decidable from the fold and left to the replay and the engine: that a cited verdict PASSes and
   that the §4.4 preconditions hold. A RESUME that cites no verdict is refused.
 * The d0 ordering reads the manifests of earlier CHILD families that have been CHAMPION, never the
   root's (a root's d0 is committed, Z1); a manifest that cannot be read refuses.
 
-Restrictive rows (DEMOTE, HALT, SWAP_CANCEL, TARGET_INELIGIBLE, ATTEST) are refused only by the two
-rules that cannot fail open: E-19a and the DRILL-class rules.
+Restrictive rows (DEMOTE, HALT, SWAP_CANCEL, TARGET_INELIGIBLE, ATTEST) are refused only by the
+rules that cannot fail open: the generic ``from_state`` rule, E-19a and the DRILL-class rules.
 
 Pure: no I/O, no clock beyond the arguments.
 """
@@ -105,6 +113,11 @@ class Rule(StrEnum):
     RESUME_EXEC_HALT = "resume_exec_halt"
     RESUME_CLASS = "resume_class"
     RESUME_UNCITED = "resume_uncited"
+    RESUME_VERDICT_NOT_PASS = "resume_verdict_not_pass"
+    RESUME_NO_HALT_INSTANT = "resume_no_halt_instant"
+    FROM_STATE_MISMATCH = "from_state_mismatch"
+    ARTEFACT_BINDING_IMMUTABLE = "artefact_binding_immutable"
+    RESTORE_NOT_THE_INCUMBENT = "restore_not_the_incumbent"
     RESUME_COOLDOWN = "resume_cooldown"
     RESUME_BUDGET = "resume_budget"
     RESTORE_NOT_FAILED_DRILL_CLOSE = "restore_not_failed_drill_close"
@@ -134,8 +147,10 @@ _Hit = tuple[Rule, RefusalReason]
 class _Ctx:
     prior: FoldResult
     manifests: ManifestFactsReader
-    verdicts: Mapping[str, Verdict]
+    verdicts: Mapping[str, Verdict] | None
     earlier: tuple[TransitionRow, ...]
+    #: The fold's state of each family, advanced by the immediate rows earlier in the batch.
+    states: Mapping[str, State]
 
 
 _Check = Callable[[_Ctx, TransitionRow], _Hit | None]
@@ -207,7 +222,7 @@ def _drill_entry(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
     incumbent = senders[0]
     if incumbent.state is State.HALTED:
         return Rule.DRILL_OVER_HALTED_INCUMBENT, _FAIL
-    if prior.integrity_frozen:
+    if prior.integrity_frozen or incumbent.demoted_for_cause:
         return Rule.DRILL_CAUSE_STANDS, _FAIL
     if row.artefact_sha256 is None or row.artefact_sha256 != incumbent.artefact_sha256:
         return Rule.DRILL_ARTEFACT_NOT_CHAMPION, _FAIL
@@ -215,8 +230,19 @@ def _drill_entry(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
 
 
 def _drill_class_halt(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
-    """V12: a DRILL-class DEMOTE or HALT is refused while an exec-store halt stands."""
-    if row.halt_cause_class is CauseClass.DRILL and ctx.prior.integrity_frozen:
+    """V12, A7c-R2: a DRILL-class halt needs a CHAMPION with no standing cause (first cause wins).
+
+    A ROLLBACK_FAILED halt under trigger DRILL is DRILL-class too.
+    """
+    drill_class = row.halt_cause_class is CauseClass.DRILL or (
+        row.halt_cause_class is CauseClass.ROLLBACK_FAILED
+        and row.trigger_cause_class is CauseClass.DRILL
+    )
+    if not drill_class:
+        return None
+    family = ctx.prior.families.get(row.family_id)
+    standing = ctx.prior.integrity_frozen or family is None or family.demoted_for_cause
+    if standing or ctx.states.get(row.family_id) is not State.CHAMPION:
         return Rule.DRILL_CAUSE_STANDS, _FAIL
     return None
 
@@ -290,21 +316,49 @@ def _restore(ctx: _Ctx, row: TransitionRow, family: FamilyView) -> _Hit | None:
     prior = ctx.prior
     if family.drill_child:
         return Rule.RESTORE_DRILL_CHILD, _FAIL
+    episode = max(prior.drill_episodes, key=lambda e: e.start_ns, default=None)
     failed_close = (
         family.standing_cause_code is CauseCode.ROLLBACK_FAILED
         and family.standing_cause_class is CauseClass.DRILL
-        and bool(prior.drill_episodes)
+        and episode is not None
+        and episode.end_ns is not None
+        and family.halted_since_ns is not None
+        and family.halted_since_ns >= episode.end_ns
     )
     if not failed_close:
         return Rule.RESTORE_NOT_FAILED_DRILL_CLOSE, _FAIL
+    if episode is not None and episode.superseded_family_id != family.family_id:
+        return Rule.RESTORE_NOT_THE_INCUMBENT, _FAIL
+    if _in_cooldown(row, family):
+        return Rule.RESUME_COOLDOWN, _FAIL
     shas = (row.artefact_sha256, row.manifest_sha256)
     if None in shas or shas != (family.artefact_sha256, family.manifest_sha256):
         return Rule.RESTORE_SHA_MISMATCH, _FAIL
     used = _recent(prior.venue_tallies.drill_close_restores, row.ts_ns, _RESTORE_WINDOW_NS)
-    used += sum(1 for e in ctx.earlier if _is_restore(e))
     if used >= pins.DRILL_CLOSE_RESTORES_PER_VENUE_PER_DAY:
         return Rule.RESTORE_DAILY_CAP, _FAIL
     return None
+
+
+def _in_cooldown(row: TransitionRow, family: FamilyView) -> bool:
+    since = family.halted_since_ns
+    return since is not None and row.ts_ns - since < pins.RESUME_COOLDOWN_H * _HOUR_NS
+
+
+def _verdicts_pass_after_halt(ctx: _Ctx, row: TransitionRow, family: FamilyView) -> bool:
+    """A8: with resolved verdicts, each cited one is a PASS produced after the halt."""
+    if ctx.verdicts is None:
+        return True  # the replay (8b) resolves them
+    since = family.halted_since_ns or 0
+    for verdict_id in row.cause_verdict_ids:
+        verdict = ctx.verdicts.get(verdict_id)
+        if (
+            verdict is None
+            or verdict.outcome is not VerdictOutcome.PASS
+            or verdict.produced_at_ns <= since
+        ):
+            return False
+    return True
 
 
 def _resume(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
@@ -316,6 +370,8 @@ def _resume(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
         return Rule.RESUME_PAIR_PENDING, _FAIL
     if prior.integrity_frozen:
         return Rule.RESUME_EXEC_HALT, _FAIL
+    if family.halted_since_ns is None:
+        return Rule.RESUME_NO_HALT_INSTANT, _FAIL  # never exempt from the cooldown
     if _is_restore(row):
         return _restore(ctx, row, family)
     cls = family.standing_cause_class
@@ -323,10 +379,10 @@ def _resume(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
         return Rule.RESUME_CLASS, _FAIL
     if not row.cause_verdict_ids:
         return Rule.RESUME_UNCITED, _FAIL
-    if family.halted_since_ns is not None and (
-        row.ts_ns - family.halted_since_ns < pins.RESUME_COOLDOWN_H * _HOUR_NS
-    ):
+    if _in_cooldown(row, family):
         return Rule.RESUME_COOLDOWN, _FAIL
+    if not _verdicts_pass_after_halt(ctx, row, family):
+        return Rule.RESUME_VERDICT_NOT_PASS, _FAIL
     return _resume_budget(ctx, row, cls, family.lineage_root_family_id)
 
 
@@ -391,7 +447,7 @@ def _demoted_clear(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
         return None
     cause_ns = family.demoted_cause_ns or 0
     for verdict_id in row.cause_verdict_ids:
-        verdict = ctx.verdicts.get(verdict_id)
+        verdict = (ctx.verdicts or {}).get(verdict_id)
         if (
             verdict is not None
             and verdict.kind is VerdictKind.FORWARD_SHADOW
@@ -401,6 +457,39 @@ def _demoted_clear(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
         ):
             return None
     return Rule.DEMOTED_NOT_CLEARED, _FAIL
+
+
+def _from_state(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
+    """A7c-R2: ``from_state`` is the fold's state of the family, ∅ for an introducer."""
+    state = ctx.states.get(row.family_id)
+    if row.from_state is state or _is_retroactive_cancel(ctx, row, state):
+        return None
+    return Rule.FROM_STATE_MISMATCH, _FAIL
+
+
+def _is_retroactive_cancel(ctx: _Ctx, row: TransitionRow, state: State | None) -> bool:
+    """A post-launch SWAP_CANCEL names the incoming family as CHALLENGER: voiding undoes the swap.
+
+    That path stays open (E-19a), so the cancel is judged against the pre-launch state.
+    """
+    return (
+        row.kind is Kind.SWAP_CANCEL
+        and row.from_state is State.CHALLENGER
+        and state is State.CHAMPION
+        and any(
+            p.status is PairStatus.EFFECTIVE and p.incoming_family_id == row.family_id
+            for p in ctx.prior.pairs
+        )
+    )
+
+
+def _artefact_binding(ctx: _Ctx, row: TransitionRow) -> _Hit | None:
+    """A7c-R5 (ARCH:367): a family's artefact sha is its introducing row's, for good."""
+    family = ctx.prior.families.get(row.family_id)
+    bound = None if family is None else family.artefact_sha256
+    if bound is not None and row.artefact_sha256 not in (None, bound):
+        return Rule.ARTEFACT_BINDING_IMMUTABLE, RefusalReason.ARTEFACT_SHA_MISMATCH
+    return None
 
 
 _CHECKS: Final[Mapping[Kind, tuple[_Check, ...]]] = {
@@ -423,13 +512,16 @@ def first_refusal(
 ) -> Refusal | None:
     """The first rule a batch breaks against ``prior``, in row order, or ``None``."""
     earlier: list[TransitionRow] = []
+    states = dict(prior.states)
     for index, row in enumerate(rows):
-        ctx = _Ctx(prior, manifests, verdicts or {}, tuple(earlier))
-        for check in _CHECKS.get(row.kind, ()):
+        ctx = _Ctx(prior, manifests, verdicts, tuple(earlier), states)
+        for check in (_from_state, *_CHECKS.get(row.kind, ()), _artefact_binding):
             hit = check(ctx, row)
             if hit is not None:
                 return Refusal(hit[1], hit[0], index)
         earlier.append(row)
+        if row.effective_launch_date is None:  # an immediate row moves its family now
+            states[row.family_id] = row.to_state
     return None
 
 
