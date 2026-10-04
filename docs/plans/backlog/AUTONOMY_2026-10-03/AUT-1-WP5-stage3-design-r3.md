@@ -750,3 +750,31 @@ Key paths:
 - **The 3c lint narrowing:**
   - `capture_heal`: no writes, `min_calls=48`.
   - `capture_heal_io`: `writes=("_publish",)`, `write_imports={write_once, ensure_dir}`, `min_calls=193`.
+
+## S3 outcome (65a5a3c0) and rulings (coordinator, 2026-10-04)
+- **Result.**
+  - Every S3 mutant is killed, including the phase-2 count bump (+1) and an unregistered file.
+  - Phase 2 is 36 tests, with the lock tests run under real bwrap.
+  - The focused gate is green with `s3_outlist.patch` applied. Without it, exactly the 7 named failures appear. 3c applies the patch, which covers:
+    - the host_tape no-row test;
+    - the `lock=` keyword on the `test_capture_audit.py` `_main` calls, which also restores the mypy ratchet;
+    - `write_sites.WRAPPER_CODE_FILES` gaining `studies_lock.py`.
+- **ACCEPTED.**
+  - The `O_NONBLOCK` added to the lock open, which stops a FIFO swap from hanging the run.
+  - The rename of a test whose name had become false.
+  - The fixture `audit_row` uses `network="egress"`, because it has `resolves_dns=True`.
+  - The bus-read literals in the rows, pinned equal to `AUDIT_BUS_READS`.
+  - `_main(lock=…)` is a required keyword.
+- **Accepted on mutation evidence.** The unit-fixture tests had no separate RED run. The units/budget mutants (M-PERSIST, M-RUNTIMEMAX, M-STOP, M-840, M-BIND) all kill them.
+
+## S2 outcome (a8e35b7f) and rulings (coordinator, 2026-10-04)
+- **Result.**
+  - All S2 mutants are killed except M-STAR, which is equivalent: `_argv_matches` already refuses a starred element. That is ACCEPTED as defence in depth.
+  - The only gate failure is the stub-pin test, which the out-of-list patch covers.
+- **ACCEPTED.**
+  - `NotifierProof` moves to `capture_aut6_contract`, with a re-export, because the input types load Nautilus (about 260 MiB). The live-proof closure is now about 20 MiB, under the unit's `MemoryMax=256M`, and is pinned.
+  - The D10 per-line call counting.
+  - The missing-day rule: a missing day is pending within `BACKFILL_DAYS` and breaks the run after it.
+  - Deleting `test_an_unreadable_stream_raises_stream_unreadable` is an orphan removal: S3-R20 removed R5's stream read. 3c must show that a test of the gatherer's `stream_unreadable` still exists.
+- **S3-R53, single-source constants.** `HEAL_ALERT_RETRY_DAYS` has a single source in `capture_heal`, and `capture_live_proof` imports it; the local copy is deleted. The `heal_alert_unabandoned_count` and `gap_alert_unabandoned_count` from S1's duty stay as logged counts. Surfacing them in live proof is deferred to the stage-4 dashboard, because no consumer needs them before AUT-6.
+- **S3-R54, the stub-pin reconciliation.** The S1 and S2 out-of-list patches edit the same assertion. 3c writes one assertion holding both directions: `landed == (S1_REAL | S2_REAL)` and `(S1_REAL | S2_REAL) <= set(_STAGE3_STUBS)`.
