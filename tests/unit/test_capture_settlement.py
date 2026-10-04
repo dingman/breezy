@@ -682,3 +682,48 @@ def test_a_clean_existing_row_still_parses_and_is_not_rewritten(tmp_path: Path) 
         tmp_path, _row(raw_sha256=_sha("NYC" + str(TODAY - dt.timedelta(days=1))))
     )
     assert path.read_bytes() == before and result.already_present >= 1
+
+
+# -- read_settlement_day (AUT-1 WP5 stage 2a: the audit's public reader, S2-R14) ------------
+
+
+def test_read_settlement_day_returns_the_written_records(tmp_path: Path) -> None:
+    _seed_window(tmp_path / "catalog")
+    _, _, decisions = _run(tmp_path)
+    day = TODAY - dt.timedelta(days=1)
+    records = cs.read_settlement_day(decisions, day)
+    assert sorted(r.station for r in records) == ["MDW", "NYC"]
+    assert all(
+        isinstance(r, cs.SettlementRecord) and r.climate_day == day.isoformat() for r in records
+    )
+    assert records == cs.read_settlement_day(decisions, day.isoformat())
+
+
+def test_read_settlement_day_of_a_missing_file_is_empty(tmp_path: Path) -> None:
+    decisions = tmp_path / "decisions"
+    decisions.mkdir(mode=0o700)
+    assert cs.read_settlement_day(decisions, TODAY) == ()
+
+
+def test_read_settlement_day_raises_on_a_corrupt_file_and_leaves_it(tmp_path: Path) -> None:
+    decisions = tmp_path / "decisions"
+    decisions.mkdir(mode=0o700)
+    _file(decisions, TODAY).write_text("not json\n")
+    _file(decisions, TODAY).chmod(0o600)
+    with pytest.raises(cs.SettlementFileCorrupt):
+        cs.read_settlement_day(decisions, TODAY)
+    assert _file(decisions, TODAY).read_text() == "not json\n"
+
+
+def test_read_settlement_day_refuses_a_symlinked_file(tmp_path: Path) -> None:
+    decisions = tmp_path / "decisions"
+    decisions.mkdir(mode=0o700)
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("")
+    _file(decisions, TODAY).symlink_to(target)
+    with pytest.raises(SingleReadRefused):
+        cs.read_settlement_day(decisions, TODAY)
+
+
+def test_read_settlement_day_is_a_public_name() -> None:
+    assert "read_settlement_day" in cs.__all__

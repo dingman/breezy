@@ -93,6 +93,20 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "single_read.replace_atomic under .capture_settlement.lock; the node never writes it",
         "replace_atomic",
     ),
+    # AUT-1 WP5 stage 2a (plan r12 sections 3.11.4, 3.13): the daily audit unit is the only writer
+    # of its per-day audit files and of its own E-8 cache directory.
+    FileWriter(
+        "evidence/capture/audit/<family>/<D>[_<ts_ns>].json",
+        "breezy-capture-audit (analysis.capture_audit.write_audit_file), write-once, mode 0444; a "
+        "re-audit writes a new <ts_ns> name and the newest wins",
+        "write_once",
+    ),
+    FileWriter(
+        "cache/capture_audit/<key>",
+        "breezy-capture-audit (analysis.capture_audit_inputs.write_scan_cache): per-log reducer "
+        "outputs of an immutable rotated log, replaced atomically; never read as evidence",
+        "replace_atomic",
+    ),
 )
 
 

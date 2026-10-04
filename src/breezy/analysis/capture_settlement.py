@@ -70,6 +70,7 @@ __all__ = [
     "StationDayError",
     "UnknownVenueBasis",
     "read_catalog_day",
+    "read_settlement_day",
     "run_settlement",
     "scan_days",
     "settlement_file_name",
@@ -267,7 +268,9 @@ def _parse_existing(raw: bytes) -> tuple[SettlementRecord, ...]:
     return tuple(records)
 
 
-def _read_existing(decisions_dir: Path, day: str) -> tuple[bytes, tuple[SettlementRecord, ...]]:
+def _read_existing(
+    decisions_dir: Path, day: dt.date | str
+) -> tuple[bytes, tuple[SettlementRecord, ...]]:
     rootfd = open_root(decisions_dir)
     try:
         raw = read_once_at(
@@ -283,6 +286,17 @@ def _read_existing(decisions_dir: Path, day: str) -> tuple[bytes, tuple[Settleme
         return raw, _parse_existing(raw)
     except (ValueError, UnicodeDecodeError) as exc:
         raise SettlementFileCorrupt(type(exc).__name__) from exc
+
+
+def read_settlement_day(
+    decisions_dir: Path, climate_day: dt.date | str
+) -> tuple[SettlementRecord, ...]:
+    """The records of ``settlement_<climate_day>.jsonl``, in file order; ``()`` if it is absent.
+
+    The audit's reader (leg S): a single strict read, no lock, no write. ``SettlementFileCorrupt``
+    on a malformed file; ``SingleReadRefused`` for a symlink, a non-regular file or an oversize
+    file, exactly as the writer reads it."""
+    return _read_existing(decisions_dir, climate_day)[1]
 
 
 def _record_for(

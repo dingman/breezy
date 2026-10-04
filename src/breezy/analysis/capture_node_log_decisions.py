@@ -1,9 +1,10 @@
 """AUT-1 node-log line classification (plan r12 section 3.11; build rulings WP0-R7, WP5-R4).
 
 Turns one node-log line into an event: a ``SHADOW_DECISION`` line (classified by ``kind``), an
-``OrderFilled`` line, the ``TradingNode: instance_id:`` line, a ``<component>: DISPOSED`` line, or a
-writer-failure line. A line that carries a marker but does not parse is returned as an
-``UnparseableLine``, never dropped.
+``OrderFilled`` line, the ``TradingNode: instance_id:`` line, a ``<component>: DISPOSED`` line, a
+writer-failure line, or one of the seven marker lines of ``capture_node_log_markers`` (S2-R2). A
+line that carries a marker but does not parse is returned as an ``UnparseableLine``, never
+dropped.
 
 Failure vs decision (WP5-R4, py M2): a line is a decision line iff its LOG MESSAGE starts with
 ``SHADOW_DECISION ``. Otherwise a writer-failure marker anywhere in the line always counts, so a
@@ -35,6 +36,12 @@ from breezy.analysis.capture_node_log_io import (
     UnparseableLine,
     ts_ns,
     unparseable,
+)
+from breezy.analysis.capture_node_log_markers import (
+    MARKER_TOKEN_PATTERN,
+    MarkerEvent,
+    classify_marker_message,
+    marker_name_for_token,
 )
 
 __all__ = [
@@ -78,11 +85,11 @@ MARKER_CAPTURE_PUBLISH_FAILED: Final[str] = "capture_publish_failed"
 
 _MARKER_RE: Final[re.Pattern[bytes]] = re.compile(
     rb"SHADOW_DECISION|instance_id: |DISPOSED|<--\[EVT\] OrderFilled\(|Failed to serialize"
-    rb"|Can't find writer for cls|CAPTURE_PUBLISH_FAILED"
+    rb"|Can't find writer for cls|CAPTURE_PUBLISH_FAILED|" + MARKER_TOKEN_PATTERN
 )
 _LINE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?:\x1b\[1m)?(?P<ts>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z)(?:\x1b\[0m)?"
-    r" \[(?P<level>[A-Z]+)\] (?P<comp>\S+): (?P<msg>.*?)(?:\x1b\[0m)?$"
+    r" (?:\x1b\[[0-9;]*m)?\[(?P<level>[A-Z]+)\] (?P<comp>\S+): (?P<msg>.*?)(?:\x1b\[0m)?$"
 )
 _ANSI_END_RE: Final[re.Pattern[str]] = re.compile(r"(?:\x1b\[[0-9;]*m)+$")
 _DATE_REPR_RE: Final[re.Pattern[str]] = re.compile(r"datetime\.date\((\d+), (\d+), (\d+)\)")
@@ -185,6 +192,7 @@ NodeLogEvent = (
     | InstanceIdLine
     | DisposedLine
     | WriterFailureLine
+    | MarkerEvent
     | UnparseableLine
 )
 
@@ -332,7 +340,7 @@ def _classify_grammatical(
         return _parse_filled(line_no, raw, ts, msg)
     if msg == DISPOSED_TEXT:
         return DisposedLine(line_no, ts, comp)
-    return None
+    return classify_marker_message(line_no, raw, ts, msg)
 
 
 def _classify_ungrammatical(line_no: int, raw: bytes, token: bytes) -> NodeLogEvent | None:
@@ -344,8 +352,11 @@ def _classify_ungrammatical(line_no: int, raw: bytes, token: bytes) -> NodeLogEv
         return unparseable(line_no, "SHADOW_DECISION", CAUSE_NO_MATCH, raw)
     if token == b"instance_id: ":
         return unparseable(line_no, "instance_id", CAUSE_NO_MATCH, raw)
-    if token.startswith(b"<--"):
+    if token.startswith(b"<--[EVT] OrderFilled("):
         return unparseable(line_no, "OrderFilled", CAUSE_NO_MATCH, raw)
+    marker = marker_name_for_token(token)
+    if marker is not None:
+        return unparseable(line_no, marker, CAUSE_NO_MATCH, raw)
     text = _ANSI_END_RE.sub("", raw.decode("utf-8", "replace"))
     if token == DISPOSED_TEXT.encode() and ts_ns(raw) is not None and text.endswith(DISPOSED_TEXT):
         return unparseable(line_no, DISPOSED_TEXT, CAUSE_NO_MATCH, raw)  # timestamped, malformed

@@ -171,6 +171,36 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
     AuthorityRow("breezy.analysis.capture_node_log_io", min_calls=25),
     AuthorityRow("breezy.analysis.capture_node_log_decisions", min_calls=90),
     AuthorityRow("breezy.analysis.capture_node_log_spawns", min_calls=60),
+    # AUT-1 WP5 stage 2a (design S2-R3, S2-R15): the shared audit model, the node-log marker events
+    # and sink protocol, and the stage-2b stubs. Each stub row sits at ``min_calls=1`` until its
+    # builder raises the floor; W1 and W2 rows declare no writes. Only W3 edits its own write
+    # scopes (below).
+    AuthorityRow("breezy.analysis.capture_audit_model", min_calls=15),
+    AuthorityRow("breezy.analysis.capture_audit_input_types", min_calls=20),
+    AuthorityRow("breezy.analysis.capture_audit_wire", min_calls=90),
+    AuthorityRow("breezy.analysis.capture_node_log_markers", min_calls=30),
+    # A Protocol module: it holds no call site by construction.
+    AuthorityRow("breezy.analysis.capture_node_log_sinks", min_calls=0),
+    # -- W1: fill legs (no writes) --
+    AuthorityRow("breezy.analysis.capture_audit_fill_legs", min_calls=1),
+    # -- W2: reconciliation (no writes) --
+    AuthorityRow("breezy.analysis.capture_audit_replay", min_calls=1),
+    AuthorityRow("breezy.analysis.capture_audit_log_markers", min_calls=1),
+    AuthorityRow("breezy.analysis.capture_audit_stream_legs", min_calls=1),
+    # -- W3: I/O and orchestration. The audit file goes through ``single_read.write_once``; the
+    # E-8 cache through ``replace_atomic``. W3 narrows these and adds any literal ``argvs``. --
+    AuthorityRow(
+        "breezy.analysis.capture_audit",
+        write_imports=frozenset({"write_once", "ensure_dir"}),
+        min_calls=1,
+    ),
+    AuthorityRow(
+        "breezy.analysis.capture_audit_inputs",
+        write_imports=frozenset({"replace_atomic", "ensure_dir"}),
+        min_calls=1,
+    ),
+    AuthorityRow("breezy.analysis.capture_audit_host", min_calls=1),
+    AuthorityRow("breezy.analysis.capture_audit_cli", min_calls=1),
 )
 
 

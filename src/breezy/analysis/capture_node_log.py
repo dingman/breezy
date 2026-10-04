@@ -30,12 +30,13 @@ Non-writer: stdlib only, no ``breezy.adapters`` import.
 """
 
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
+from breezy.analysis.capture_audit_model import AuditInputError
 from breezy.analysis.capture_node_log_decisions import (
     DISPOSED_TEXT,
     EVALUATION_KINDS,
@@ -82,6 +83,25 @@ from breezy.analysis.capture_node_log_io import (
     ts_ns,
     unparseable,
 )
+from breezy.analysis.capture_node_log_markers import (
+    MARKER_CAPTURE_EPOCH_START,
+    MARKER_CAPTURE_REFUSED,
+    MARKER_FQ_VECTOR_COMPLETE,
+    MARKER_NBP_CYCLE_MISSED,
+    MARKER_NBP_PUBLISHED,
+    MARKER_ORDER_DENIED,
+    MARKER_ORDER_SUBMITTED,
+    MAX_MARKER_TEXT_CHARS,
+    CaptureEpochStartLine,
+    CaptureRefusedLine,
+    FqVectorCompleteLine,
+    MarkerEvent,
+    NbpCycleMissedLine,
+    NbpPublishedLine,
+    OrderDeniedLine,
+    OrderSubmittedLine,
+)
+from breezy.analysis.capture_node_log_sinks import LogSink
 from breezy.analysis.capture_node_log_spawns import (
     LOG_STAMP_MAX_LAG_S,
     NO_SPAWN_EVENTS,
@@ -117,10 +137,18 @@ __all__ = [
     "KIND_TAKE",
     "KIND_TRY_SUBMIT",
     "LOG_STAMP_MAX_LAG_S",
+    "MARKER_CAPTURE_EPOCH_START",
     "MARKER_CAPTURE_PUBLISH_FAILED",
+    "MARKER_CAPTURE_REFUSED",
     "MARKER_FAILED_TO_SERIALIZE",
+    "MARKER_FQ_VECTOR_COMPLETE",
     "MARKER_MISSING_WRITER",
+    "MARKER_NBP_CYCLE_MISSED",
+    "MARKER_NBP_PUBLISHED",
+    "MARKER_ORDER_DENIED",
+    "MARKER_ORDER_SUBMITTED",
     "MAX_LINE_BYTES",
+    "MAX_MARKER_TEXT_CHARS",
     "MAX_STORED_REPORTS",
     "NO_SPAWN_EVENTS",
     "POST_SPAWN_EARLY_S",
@@ -128,17 +156,26 @@ __all__ = [
     "PRE_SPAWN_EARLY_S",
     "PRE_SPAWN_EVENTS",
     "SPAWN_EVENTS",
+    "CaptureEpochStartLine",
+    "CaptureRefusedLine",
     "DecisionLine",
     "DisposedLine",
     "DuplicateTracker",
     "EntryPairing",
+    "FqVectorCompleteLine",
     "InstanceIdLine",
     "LogFinding",
+    "LogSink",
+    "MarkerEvent",
+    "NbpCycleMissedLine",
+    "NbpPublishedLine",
     "NodeLogEvent",
     "NodeLogListing",
     "NodeLogScan",
     "NodeLogUnreadable",
+    "OrderDeniedLine",
     "OrderFilledLine",
+    "OrderSubmittedLine",
     "SpawnCensus",
     "SpawnEvent",
     "SpawnMatch",
@@ -210,6 +247,8 @@ class NodeLogScan:
     writer_failure_total: int
     unparseable: tuple[UnparseableLine, ...]
     unparseable_total: int
+    #: Marker lines seen, by marker name (``capture_node_log_markers``); exact, never capped.
+    marker_counts: Mapping[str, int]
     #: Byte-identical repeats within a tick (all kinds; evaluation kinds only).
     duplicate_decision_count: int
     duplicate_evaluation_count: int
@@ -262,6 +301,25 @@ class _Stored:
     bad: list[UnparseableLine]
 
 
+_MARKER_NAMES: Final[Mapping[type, str]] = {
+    CaptureRefusedLine: MARKER_CAPTURE_REFUSED,
+    OrderSubmittedLine: MARKER_ORDER_SUBMITTED,
+    OrderDeniedLine: MARKER_ORDER_DENIED,
+    NbpPublishedLine: MARKER_NBP_PUBLISHED,
+    FqVectorCompleteLine: MARKER_FQ_VECTOR_COMPLETE,
+    NbpCycleMissedLine: MARKER_NBP_CYCLE_MISSED,
+    CaptureEpochStartLine: MARKER_CAPTURE_EPOCH_START,
+}
+
+
+def _feed(sinks: Sequence[LogSink], event: NodeLogEvent) -> None:
+    for sink in sinks:
+        try:
+            sink.feed(event)
+        except Exception as exc:
+            raise AuditInputError("node_log_sink_failed", type(exc).__name__) from exc
+
+
 def _absorb(
     event: NodeLogEvent,
     keep: frozenset[str],
@@ -269,9 +327,12 @@ def _absorb(
     stored: _Stored,
     kinds: Counter[str],
     tracker: DuplicateTracker,
+    markers: Counter[str],
 ) -> None:
     cap = MAX_STORED_REPORTS
-    if isinstance(event, DecisionLine):
+    if isinstance(event, MarkerEvent):
+        markers[_MARKER_NAMES[type(event)]] += 1
+    elif isinstance(event, DecisionLine):
         kinds[event.kind] += 1
         if tracker.is_duplicate(event):
             counts.duplicates += 1
@@ -301,12 +362,21 @@ def _absorb(
             stored.bad.append(event)
 
 
-def scan_node_log(path: Path, *, keep_kinds: frozenset[str] = DEFAULT_KEEP_KINDS) -> NodeLogScan:
+def scan_node_log(
+    path: Path,
+    *,
+    keep_kinds: frozenset[str] = DEFAULT_KEEP_KINDS,
+    sinks: Sequence[LogSink] = (),
+) -> NodeLogScan:
     """One streaming pass over a node log. Raises ``NodeLogUnreadable``.
 
     ``keep_kinds`` names the decision kinds retained in ``entry_lines`` (every kind is always
-    counted), so R1 and R2 get what they need in a single pass; ``ValueError`` for an unknown
-    kind."""
+    counted); ``ValueError`` for an unknown kind.
+
+    ``sinks`` (S2-R1) are online consumers: each is fed EVERY event, in file order and uncapped,
+    before the scan's own accounting, so the audit's replay and marker reducers run in this one pass
+    (``entry_lines`` is capped). A sink that raises aborts the scan with
+    ``AuditInputError("node_log_sink_failed")``; no later event is fed to any sink."""
     unknown = keep_kinds - _KNOWN_KINDS
     if unknown:
         raise ValueError(f"unknown decision kinds: {sorted(unknown)}")
@@ -314,13 +384,15 @@ def scan_node_log(path: Path, *, keep_kinds: frozenset[str] = DEFAULT_KEEP_KINDS
     counts = _Counts()
     stored = _Stored([], {}, [], [], [])
     tracker = DuplicateTracker()
+    markers: Counter[str] = Counter()
     last_head = b""
     for rl in read_lines(path):
         counts.line_count = rl.line_no
         if ts_matches(rl.raw[:_HEAD_BYTES]):
             last_head = rl.raw[:_HEAD_BYTES]
         for event in _events_for(rl):
-            _absorb(event, keep_kinds, counts, stored, kinds, tracker)
+            _feed(sinks, event)
+            _absorb(event, keep_kinds, counts, stored, kinds, tracker, markers)
     return NodeLogScan(
         line_count=counts.line_count,
         decision_line_count=sum(kinds.values()),
@@ -337,6 +409,7 @@ def scan_node_log(path: Path, *, keep_kinds: frozenset[str] = DEFAULT_KEEP_KINDS
         writer_failure_total=counts.failures,
         unparseable=tuple(stored.bad),
         unparseable_total=counts.bad,
+        marker_counts=MappingProxyType(dict(markers)),
         duplicate_decision_count=counts.duplicates,
         duplicate_evaluation_count=counts.duplicate_evaluations,
         last_line_ts_ns=ts_ns(last_head) if last_head else None,
