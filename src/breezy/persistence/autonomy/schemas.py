@@ -219,6 +219,7 @@ class LiveOrdersRefusal(StrEnum):
 class FoldInvalidReason(StrEnum):
     FAMILY_INTRODUCED_BY_OTHER_KIND = "family_introduced_by_other_kind"
     ROOT_LINEAGE_MISMATCH = "root_lineage_mismatch"
+    HEAD_MISSING_LAUNCH_DATE = "head_missing_launch_date"  # E-16 (c)
 
 
 def check_venue(value: object) -> str:

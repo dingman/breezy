@@ -18,7 +18,7 @@ from typing import Any, Final
 import pytest
 
 import breezy.persistence.autonomy.transitions as transitions_mod
-from breezy.persistence.autonomy import schemas
+from breezy.persistence.autonomy import pins, schemas
 from breezy.persistence.autonomy.chain import genesis, transition_hash, verify_venue_chain
 from breezy.persistence.autonomy.fold import (
     FoldInvalid,
@@ -45,6 +45,7 @@ from breezy.persistence.autonomy.transitions import (
     RESTRICTIVE_KINDS,
     WIDENING_KINDS,
     is_widening,
+    is_widening_row,
     rows_admissible,
     transition_id,
 )
@@ -104,6 +105,7 @@ class Chain:
             "invocation_id": INVOCATION,
             "engine_code_sha": SHA_B,
             "expected_prior_seq": len(self.rows),
+            "venue_seq": len(self.rows) + 1,
             "ts_ns": ts,
             "transition_id": "a" * 64,
         }
@@ -321,20 +323,23 @@ def test_partner_naming_no_head_never_takes_effect() -> None:
 def test_rollback_pair_with_activate_in_one_transaction() -> None:
     chain = Chain()
     chain.seed()
-    chain.add(Kind.PROMOTE, State.CHAMPION, family=CHILD, frm=State.CHALLENGER,
-              effective_launch_date=PRIOR_DAY)  # fmt: skip
-    # incumbent is the rollback target: CHALLENGER after the earlier supersede, here set directly
+    first = chain.add(Kind.PROMOTE, State.CHAMPION, family=CHILD, frm=State.CHALLENGER,
+                      effective_launch_date=PRIOR_DAY)  # fmt: skip
     chain.add(Kind.SUPERSEDE, State.CHALLENGER, family=INCUMBENT, frm=State.CHAMPION,
-              paired_transition_id=chain.rows[-1].transition_id,
+              paired_transition_id=first.transition_id,
               effective_launch_date=PRIOR_DAY)  # fmt: skip
-    chain.activate(chain.rows[-2], ts=at(PRIOR_DAY, "16:45"))
+    chain.activate(first, ts=at(PRIOR_DAY, "16:45"))
     assert run(chain, at(DAY, "00:00")).states[CHILD] is State.CHAMPION
-    chain.add(Kind.DEMOTE, State.HALTED, family=CHILD, frm=State.CHAMPION)
+    chain.add(Kind.DEMOTE, State.HALTED, family=CHILD, frm=State.CHAMPION, ts=at(DAY, "10:00"))
     back = chain.add(Kind.ROLLBACK, State.CHAMPION, family=INCUMBENT, frm=State.CHALLENGER,
-                     effective_launch_date=DAY)  # fmt: skip
+                     effective_launch_date=DAY, ts=at(DAY, "16:45", 0))  # fmt: skip
     chain.add(Kind.DISPLACED, State.CHALLENGER, family=CHILD, frm=State.HALTED,
-              paired_transition_id=back.transition_id, effective_launch_date=DAY)  # fmt: skip
-    chain.activate(back, ts=at(DAY, "16:45"))
+              paired_transition_id=back.transition_id, effective_launch_date=DAY,
+              ts=at(DAY, "16:45", 1))  # fmt: skip
+    chain.activate(back, ts=at(DAY, "16:45", 2))
+    before = run(chain, at(DAY, "16:44"))
+    assert before.states[CHILD] is State.HALTED
+    assert before.states[INCUMBENT] is State.CHALLENGER
     result = run(chain, LAUNCH)
     assert result.states[INCUMBENT] is State.CHAMPION
     assert result.states[CHILD] is State.CHALLENGER
@@ -364,7 +369,8 @@ def test_lapsed_root_admit_leaves_the_family_in_shadow() -> None:
 
 
 def test_rows_apply_by_effective_instant_not_chain_position() -> None:
-    """A RESUME written after a pending DISPLACED pair, but before LAUNCH, applies first."""
+    """Invalid-chain pin: ``validate`` refuses a RESUME while a pair is pending (7c). Were one
+    written, it applies at its own instant, before the pair's LAUNCH, not by chain position."""
     chain = Chain()
     chain.seed()
     chain.add(Kind.HALT, State.HALTED, family=INCUMBENT, frm=State.CHAMPION)
@@ -402,8 +408,69 @@ def test_family_introduced_by_other_kind_is_invalid(kind: Kind, frm: State, to: 
 @pytest.mark.parametrize("kind", [Kind.BOOTSTRAP, Kind.MINT, Kind.ROOT_ADMIT])
 def test_introducing_kinds_are_accepted(kind: Kind) -> None:
     chain = Chain()
-    chain.add(kind, State.SHADOW if kind is Kind.MINT else State.CHAMPION, family=INCUMBENT)
+    to = State.SHADOW if kind is Kind.MINT else State.CHAMPION
+    date_ = DAY if kind is Kind.ROOT_ADMIT else None
+    chain.add(kind, to, family=INCUMBENT, effective_launch_date=date_)
     assert isinstance(fold(chain.rows, VENUE, LAUNCH), FoldResult)
+
+
+@pytest.mark.parametrize(
+    ("kind", "frm"),
+    [
+        (Kind.PROMOTE, State.CHALLENGER),
+        (Kind.DRILL_PROMOTE, State.CHALLENGER),
+        (Kind.ROLLBACK, State.CHALLENGER),
+        (Kind.ROOT_ADMIT, None),
+    ],
+)
+def test_head_without_launch_date_is_invalid(kind: Kind, frm: State | None) -> None:
+    """A6b-R2 / E-16 (c): a ->CHAMPION head is always pending until LAUNCH."""
+    chain = Chain()
+    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT)
+    if frm is not None:
+        chain.add(Kind.MINT, State.SHADOW, family=CHILD)
+        chain.add(Kind.PROMOTE, State.CHALLENGER, family=CHILD, frm=State.SHADOW)
+    chain.add(kind, State.CHAMPION, family=CHILD, frm=frm)
+    assert fold(chain.rows, VENUE, LAUNCH) == FoldInvalid(
+        FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE
+    )
+
+
+def test_immediate_rows_after_the_clock_are_not_applied() -> None:
+    """LOW-4: a row written after ``now_ns`` has not happened yet."""
+    chain = Chain()
+    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT, ts=at(DAY, "10:00"))
+    chain.add(Kind.DEMOTE, State.HALTED, family=INCUMBENT, frm=State.CHAMPION, ts=at(DAY, "11:00"))
+    assert run(chain, at(DAY, "10:30")).states[INCUMBENT] is State.CHAMPION
+    assert run(chain, at(DAY, "11:00")).states[INCUMBENT] is State.HALTED
+
+
+def test_head_venue_seq_is_the_sealed_last_venue_seq() -> None:
+    chain = Chain()
+    chain.seed()
+    sealed = [replace(r, venue_seq=r.venue_seq + 10) for r in chain.rows if r.venue_seq]
+    assert fold(sealed, VENUE, LAUNCH).head_venue_seq == 13  # type: ignore[union-attr]
+
+
+def test_fold_refuses_unsealed_rows() -> None:
+    """LOW-5: ``head_venue_seq`` needs sealed rows; an unsealed last row raises ``ValueError``."""
+    chain = Chain()
+    chain.seed()
+    unsealed = [*chain.rows[:-1], replace(chain.rows[-1], venue_seq=None)]
+    with pytest.raises(ValueError, match="venue_seq"):
+        fold(unsealed, VENUE, LAUNCH)
+
+
+def test_activate_window_follows_the_pins_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The window is read from ``pins`` at call time: moving STOP and LAUNCH moves the window."""
+    monkeypatch.setattr(pins, "SCHEDULE_STOP_UTC", "16:30")
+    monkeypatch.setattr(pins, "SCHEDULE_LAUNCH_UTC", "16:55")
+    chain, head, _tail = seeded_pair()
+    chain.activate(head, ts=at(DAY, "16:35"))
+    shifted = at(DAY, "16:55")
+    assert run(chain, shifted - 1).pairs[0].status is PairStatus.PENDING
+    assert run(chain, shifted).pairs[0].status is PairStatus.EFFECTIVE
+    assert run(chain, shifted).pairs[0].launch_ns == shifted
 
 
 # --- input contract, purity, immutability --------------------------------------------------
@@ -553,7 +620,7 @@ EXPECTED_WIDENING: Final = {
 }  # fmt: skip
 
 
-def test_allowed_is_the_arch_table_exactly() -> None:
+def test_allowed_is_the_arch_plus_a4_r6_table_exactly() -> None:
     assert {k: set(v) for k, v in ALLOWED.items()} == EXPECTED_ALLOWED
     assert all(isinstance(v, frozenset) for v in ALLOWED.values())
 
@@ -682,11 +749,30 @@ def test_enabling_one_kind_does_not_admit_another() -> None:
     assert result == AdmissibilityResult(1, RefusalReason.WIDENING_KIND_NOT_ENABLED)
 
 
-def test_rows_admissible_gates_every_row_of_a_widening_kind_including_nominations() -> None:
+def test_a_nomination_is_admitted_at_an_empty_stage() -> None:
+    """A6b-R1: SHADOW to CHALLENGER sends nothing, so no stage flag gates it."""
     chain = Chain()
-    chain.add(Kind.PROMOTE, _CH, family=CHILD, frm=_S)  # a SHADOW to CHALLENGER nomination
+    chain.add(Kind.PROMOTE, _CH, family=CHILD, frm=_S)
+    assert rows_admissible(chain.rows, stage=_stage(set(), set())) == AdmissibilityResult(1, None)
+
+
+def test_a_promotion_to_champion_is_gated_and_follows_the_nomination() -> None:
+    chain = Chain()
+    chain.add(Kind.PROMOTE, _CH, family=CHILD, frm=_S)
+    chain.add(Kind.PROMOTE, _CP, family=CHILD, frm=_CH, effective_launch_date=DAY)
     result = rows_admissible(chain.rows, stage=_stage(set(), set()))
-    assert result == AdmissibilityResult(0, RefusalReason.WIDENING_KIND_NOT_ENABLED)
+    assert result == AdmissibilityResult(1, RefusalReason.WIDENING_KIND_NOT_ENABLED)
+
+
+def test_is_widening_row_decides_promote_by_target_state_only() -> None:
+    chain = Chain()
+    nomination = chain.add(Kind.PROMOTE, _CH, family=CHILD, frm=_S)
+    promotion = chain.add(Kind.PROMOTE, _CP, family=CHILD, frm=_CH, effective_launch_date=DAY)
+    admit = chain.add(Kind.DRILL_ADMIT, _CH, family=OTHER, frm=_S)
+    assert not is_widening_row(nomination)
+    assert is_widening_row(promotion)
+    assert is_widening_row(admit)  # only PROMOTE is split by target state (A6b-R1)
+    assert is_widening(Kind.PROMOTE)  # the kind set stays whole for the pins subset check
 
 
 class _ListStage:
@@ -713,20 +799,38 @@ def test_rows_admissible_result_invariant_reason_none_iff_all_admitted() -> None
             assert 0 <= res.admitted <= len(rows)
 
 
+_STAGE_NAMES: Final = frozenset({
+    "enabled_widening_kinds", "admission_implemented", "ENABLED_WIDENING_KINDS",
+    "_ADMISSION_IMPLEMENTED", "rows_admissible", "is_widening_row", "WIDENING_KINDS", "StageView",
+    "StagePolicy",
+})  # fmt: skip
+
+
+def _stage_names_in(source: str) -> set[str]:
+    tree = ast.parse(source)
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    names |= {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
+    return names & _STAGE_NAMES
+
+
 @pytest.mark.parametrize("case", ["transitions", "fold"])
 def test_admissibility_predicate_shared(case: str) -> None:
     """One predicate: ``rows_admissible`` equals an oracle; ``fold`` never compares stage sets."""
     if case == "fold":
-        tree = ast.parse((AUTONOMY_DIR / "fold.py").read_text(encoding="utf-8"))
-        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-        names |= {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
-        assert not names & {
-            "enabled_widening_kinds", "admission_implemented", "ENABLED_WIDENING_KINDS",
-            "_ADMISSION_IMPLEMENTED", "rows_admissible", "WIDENING_KINDS", "StageView",
-            "StagePolicy",
-        }  # fmt: skip
+        source = (AUTONOMY_DIR / "fold.py").read_text(encoding="utf-8")
+        assert _stage_names_in(source) == set()
+        for planted in (
+            "def f(stage):\n    return stage.enabled_widening_kinds\n",
+            "from breezy.persistence.autonomy.transitions import rows_admissible\n",
+            "from breezy.persistence.autonomy.schemas import StagePolicy\n",
+            "x = ENABLED_WIDENING_KINDS\n",
+        ):
+            assert _stage_names_in(planted), planted  # positive control
         return
+    chain = Chain()
+    chain.add(Kind.PROMOTE, _CH, family=CHILD, frm=_S)
+    assert rows_admissible(chain.rows, stage=_stage(set(), set())).reason is None
     kinds = list(Kind)
     enabled = {Kind.RESUME, Kind.PROMOTE, Kind.ACTIVATE}
     implemented = {Kind.RESUME, Kind.ACTIVATE}
@@ -734,7 +838,9 @@ def test_admissibility_predicate_shared(case: str) -> None:
         rows = _rows(*batch)
         expected: AdmissibilityResult = AdmissibilityResult(len(rows), None)
         for i, row in enumerate(rows):
-            if row.kind not in EXPECTED_WIDENING:
+            if row.kind not in EXPECTED_WIDENING or (
+                row.kind is Kind.PROMOTE and row.to_state is not _CP
+            ):
                 continue
             if row.kind not in enabled:
                 expected = AdmissibilityResult(i, RefusalReason.WIDENING_KIND_NOT_ENABLED)

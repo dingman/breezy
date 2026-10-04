@@ -8,10 +8,12 @@ actor all call it.
 
 Choices ARCH leaves open, fixed here:
 
-* Widening is decided by kind, not by row. PROMOTE is widening whether it nominates (SHADOW to
-  CHALLENGER) or promotes, DRILL_ADMIT likewise; the stricter reading fails closed.
+* Widening is decided per row (A6b-R1, E-16 d): a PROMOTE widens only toward CHAMPION.
+  ``WIDENING_KINDS`` stays the kind set the pins subset check reads.
+* RETIRE is neutral: it is in neither ``WIDENING_KINDS`` nor ``RESTRICTIVE_KINDS``, so no stage
+  flag gates it and no restrictive-write rule applies to it.
 * ``ALLOWED[ROOT_ADMIT]`` holds ``(SHADOW, CHAMPION)`` (the ARCH table) and ``(None, CHAMPION)``
-  (the AC 13 rule that a family unknown to the fold is introduced from the empty state).
+  (A6b-R4, E-16 b: a family unknown to the fold is introduced from the empty state).
 * ``PAIR_KINDS`` are the kinds that can belong to one logical sender change: the four heads, the
   two partners and ACTIVATE.
 * ``validate`` (seams 7c, 7d) is not here; it adds its own imports.
@@ -44,6 +46,7 @@ __all__ = [
     "RESTRICTIVE_KINDS",
     "WIDENING_KINDS",
     "is_widening",
+    "is_widening_row",
     "rows_admissible",
     "transition_id",
 ]
@@ -162,6 +165,17 @@ def is_widening(kind: Kind) -> bool:
     return kind in WIDENING_KINDS
 
 
+def is_widening_row(row: TransitionRow) -> bool:
+    """True when ``row`` is one a stage flag gates (A6b-R1; AUT-5 r7:166).
+
+    Widening is decided per row: a PROMOTE widens only toward CHAMPION, so a SHADOW to CHALLENGER
+    nomination is never gated. Every other widening kind is gated whatever its states.
+    """
+    if row.kind is Kind.PROMOTE:
+        return row.to_state is State.CHAMPION
+    return is_widening(row.kind)
+
+
 def rows_admissible(rows: Sequence[TransitionRow], *, stage: StageView) -> AdmissibilityResult:
     """Walk ``rows`` in chain order and stop at the first refused widening row.
 
@@ -173,7 +187,7 @@ def rows_admissible(rows: Sequence[TransitionRow], *, stage: StageView) -> Admis
     enabled = frozenset(stage.enabled_widening_kinds)
     implemented = frozenset(stage.admission_implemented)
     for position, row in enumerate(rows):
-        if not is_widening(row.kind):
+        if not is_widening_row(row):
             continue
         if row.kind not in enabled:
             return AdmissibilityResult(position, RefusalReason.WIDENING_KIND_NOT_ENABLED)

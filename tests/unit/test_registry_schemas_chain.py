@@ -685,6 +685,7 @@ def test_fold_invalid_reason_set() -> None:
     assert _values(FoldInvalidReason) == {
         "family_introduced_by_other_kind",
         "root_lineage_mismatch",
+        "head_missing_launch_date",  # E-16 (c)
     }
 
 

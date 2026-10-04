@@ -11,13 +11,15 @@ fold", Y8).
 * the lapse: at LAUNCH on D a pair takes effect only with such an ACTIVATE, else it never does.
 
 Row order and effective time. Immediate rows (no ``effective_launch_date``) apply at their
-``ts_ns``; the members of an effective pair apply at LAUNCH. Rows apply in ``(instant, chain
-position)`` order. A row whose ``from_state == to_state`` (ATTEST, HWM_RESET, ACTIVATE,
-SWAP_CANCEL, TARGET_INELIGIBLE) never changes a state. ``from_state`` consistency is ``validate``'s
-to refuse (seams 7c, 7d); the fold applies ``to_state``.
+``ts_ns`` and only once ``ts_ns <= now_ns``; the members of an effective pair apply at LAUNCH.
+Rows apply in ``(instant, chain position)`` order. A row whose ``from_state == to_state``
+(ATTEST, HWM_RESET, ACTIVATE, SWAP_CANCEL, TARGET_INELIGIBLE) never changes a state.
+``from_state`` consistency is ``validate``'s to refuse (seams 7c, 7d); the fold applies
+``to_state``.
 
 Not here (seam 7a/7b): SWAP_CANCEL voiding, ``demoted_for_cause``, freezes, tallies, drill episodes,
-``FamilyView`` origins and the root-lineage check. Until 7a lands nothing consumes this fold.
+``FamilyView`` origins and the root-lineage check. Until 7a lands nothing outside the
+package may import this fold (``test_no_module_outside_autonomy_imports_fold``).
 
 Pure: no I/O, no wall clock (the clock is the ``now_ns`` argument), no mutation of the input.
 """
@@ -93,7 +95,7 @@ class PairView:
 class FoldResult:
     venue: str
     now_ns: int
-    #: Rows folded (the chain's head ``venue_seq`` when given a whole chain).
+    #: The last row's sealed ``venue_seq`` (0 for no rows).
     head_venue_seq: int
     states: Mapping[str, State]
     pairs: tuple[PairView, ...]
@@ -127,12 +129,12 @@ def _day_start_ns(iso_day: str) -> int:
     return days * _SECONDS_PER_DAY * _NS_PER_S
 
 
+def _is_head_shape(row: TransitionRow) -> bool:
+    return row.kind in HEAD_KINDS and row.to_state is State.CHAMPION
+
+
 def _is_head(row: TransitionRow) -> bool:
-    return (
-        row.kind in HEAD_KINDS
-        and row.to_state is State.CHAMPION
-        and row.effective_launch_date is not None
-    )
+    return _is_head_shape(row) and row.effective_launch_date is not None
 
 
 def _check_inputs(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> None:
@@ -147,6 +149,16 @@ def _check_inputs(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> Non
             raise TypeError("fold takes TransitionRow values only")
         if row.venue != venue:
             raise ValueError(f"row of venue {row.venue!r} in the chain of venue {venue!r}")
+
+
+def _head_venue_seq(rows: tuple[TransitionRow, ...]) -> int:
+    """The sealed ``venue_seq`` of the last row (0 for no rows); an unsealed last row is refused."""
+    if not rows:
+        return 0
+    last = rows[-1].venue_seq
+    if last is None:
+        raise ValueError("fold needs sealed rows: the last row has no venue_seq")
+    return last
 
 
 def _collect_heads(rows: Sequence[TransitionRow]) -> dict[str, _Head]:
@@ -205,7 +217,8 @@ def _events(
     for index, row in enumerate(rows):
         if index in orphans or index in pair_members or row.from_state is row.to_state:
             continue
-        out.append((row.ts_ns, index, row))
+        if row.ts_ns <= now_ns:  # a row written after the clock has not happened yet
+            out.append((row.ts_ns, index, row))
     for head in heads.values():
         if _pair_status(head, now_ns) is PairStatus.EFFECTIVE:
             out.extend((head.launch_ns, i, rows[i]) for i in head.members)
@@ -238,29 +251,33 @@ def _pair_views(
 def fold(rows: Sequence[TransitionRow], venue: str, now_ns: int) -> FoldResult | FoldInvalid:
     """Fold one venue's rows (chain order) into family states and pair views at ``now_ns``.
 
-    ``ValueError`` for another venue's row or a bad clock, ``TypeError`` for a non-row.
-    ``FoldInvalid`` for a family whose first row is not BOOTSTRAP, ROOT_ADMIT or MINT.
+    ``ValueError`` for another venue's row, a bad clock or an unsealed last row; ``TypeError`` for
+    a non-row.
+    ``FoldInvalid`` for a family whose first row is not BOOTSTRAP, ROOT_ADMIT or MINT, and for a
+    →CHAMPION head row with no ``effective_launch_date`` (E-16 c).
     """
     ordered = tuple(rows)
     _check_inputs(ordered, venue, now_ns)
+    head_venue_seq = _head_venue_seq(ordered)
     heads = _collect_heads(ordered)
     orphans = _attach_members(ordered, heads)
     states: dict[str, State] = {}
     seen: set[str] = set()
     for row in ordered:
-        if row.family_id in seen:
-            continue
-        if row.kind not in INTRODUCING_KINDS:
-            return FoldInvalid(FoldInvalidReason.FAMILY_INTRODUCED_BY_OTHER_KIND)
-        seen.add(row.family_id)
-        if row.transition_id in heads:  # a pending root: SHADOW until its pair takes effect
-            states[row.family_id] = State.SHADOW
+        if row.family_id not in seen:
+            if row.kind not in INTRODUCING_KINDS:
+                return FoldInvalid(FoldInvalidReason.FAMILY_INTRODUCED_BY_OTHER_KIND)
+            seen.add(row.family_id)
+            if row.transition_id in heads:  # a pending root: SHADOW until its pair takes effect
+                states[row.family_id] = State.SHADOW
+        if _is_head_shape(row) and row.effective_launch_date is None:
+            return FoldInvalid(FoldInvalidReason.HEAD_MISSING_LAUNCH_DATE)
     for _instant, _index, row in _events(ordered, heads, orphans, now_ns):
         states[row.family_id] = row.to_state
     return FoldResult(
         venue=venue,
         now_ns=now_ns,
-        head_venue_seq=len(ordered),
+        head_venue_seq=head_venue_seq,
         states=MappingProxyType(states),
         pairs=_pair_views(ordered, heads, now_ns),
     )
