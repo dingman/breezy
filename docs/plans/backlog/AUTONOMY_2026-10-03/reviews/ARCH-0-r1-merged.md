@@ -684,3 +684,33 @@ Both reviewers confirm the resolver never yields permit semantics. `ResolvedFami
   - **V4** needs a syntactically valid unknown row (`breezy-autonomy-nosuch` → 78). A malformed row → 64 `usage` (correct).
   - **V13** measured on tmpfs only; ext4 data root not measured.
   - The wrapper creates `.bus_snapshot` at 0700 itself.
+
+### Build-time rulings (seam A 8d, 620f41d4 + fac86312: ARCH and SEC both REQUEST_CHANGES, no HIGH)
+All six implementer deviations are accepted:
+- step 8 before byte binding;
+- the replay `ReplayArtefactMismatch` precedence;
+- the `_trace` seam on private `_resolve` only;
+- the shadow-raise test retired;
+- the `Rule` exact-set test;
+- a replaced manifest refusing.
+
+- **A8d-R1 (ARCH M1 + SEC 1, E-24 scope).**
+  - `_manifest_density_bound` runs on every row that introduces a family (unknown to the fold and to earlier rows in the batch), whatever its kind. ROOT_ADMIT is included; `INTRODUCING_KINDS` is {BOOTSTRAP, ROOT_ADMIT, MINT}.
+  - Every introducing row must carry a non-None `manifest_sha256`. Otherwise it refuses `manifest_unreadable`, so a later PROMOTE can never be the first to pin a manifest.
+  - Tests: a ROOT_ADMIT density mismatch; a ROOT_ADMIT with no manifest followed by a PROMOTE that pins one.
+  - Rename or extend `test_the_density_rule_covers_bootstrap_and_only_the_introducing_kinds` to cover all three kinds.
+- **A8d-R2 (ARCH M2, fixture hygiene).**
+  - `registry_manifest_density.bind()` raises when a sha is already bound to a different artefact.
+  - An autouse fixture clears `_ARTEFACT_OF` per test.
+  - The `test_registry_store.py` docstring states that repo-only/roots behaviour is proven by the replay/parity tests, not by this file.
+- **A8d-R3 (LOW, adopt now).**
+  - Move the `_trace` notes 9/10 before `verify_bound_bytes`.
+  - Add a replay.py docstring bullet on the refusal precedence.
+  - Add a `RuleII` exact-set assertion.
+  - Pin a single reason in `test_registry_resolver_shadow.py:161`/`:178`, using a valid no-sender chain.
+  - Fix the double negation at `test_registry_resolver.py:464`.
+  - SEC 2: add an AST import-node scan so that no module outside the importer allowlist imports `resolver` at all.
+- **A8d-R4 (ARCH M3, carried to AUT-5a and the runbook).**
+  - After BOOTSTRAP, any git edit to `deploy/families/<root>.json` permanently prevents that root from sending. Re-binding the same family_id is refused (`MANIFEST_BINDING_IMMUTABLE`), so the only remedy is a new root family id.
+  - AUT-5a obligation: the engine writes the family file before its MINT row. 8d proves only the store half.
+  - Split trigger: when `resolver.py` exceeds about 750 lines, move steps 9–11 to `autonomy/resolver_bind.py`.
