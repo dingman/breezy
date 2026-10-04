@@ -10,10 +10,9 @@ Module-level rows and function-level rows differ on purpose. ``registry_store`` 
 and journal and is allowed as a whole module. ``single_read`` is allowed only inside the named
 functions (and the private helpers they call), so a new write path in that module still fails.
 
-Entries for code that has not landed (``registry_store``,
-``live_orders_gate._verify_ruling_file``) are accepted while absent: an allowlist row matching no
-site never fails the scan. They are named now so the owner who lands the code does not have to widen
-the gate to ship it.
+Entries for code that has not landed (``live_orders_gate._verify_ruling_file``) are accepted while
+absent: an allowlist row matching no site never fails the scan. They are named now so the owner
+who lands the code does not have to widen the gate to ship it.
 """
 
 from __future__ import annotations
@@ -110,7 +109,7 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
     WriteSiteRule(
         "breezy.persistence.autonomy.registry_store",
         None,
-        "owns registry.sqlite under registry/engine.lock (seam 6e; not yet landed)",
+        "owns registry.sqlite under registry/engine.lock (seam 6e)",
     ),
     WriteSiteRule(
         "breezy.persistence.live_orders_gate",
