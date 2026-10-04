@@ -261,3 +261,53 @@ def test_recorder_sample_reads_every_field_through_the_accessors(
     assert snapshot.events == 0 and snapshot.safe_mode is False
     assert snapshot.feed_watch_alive is False
     assert snapshot.is_tape_gap_open is False
+
+
+def test_stream_bytes_total_skips_an_entry_whose_stat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3-R3 (py L2): one file removed between scandir and stat skips that entry only."""
+    import os
+
+    (tmp_path / "a.feather").write_bytes(b"a" * 10)
+    (tmp_path / "gone.feather").write_bytes(b"b" * 20)
+    (tmp_path / "c.feather").write_bytes(b"c" * 30)
+    real_scandir = os.scandir
+
+    class _Entry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self._entry = entry
+            self.name = entry.name
+
+        def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+            if self.name == "gone.feather":
+                raise FileNotFoundError(self.name)
+            return self._entry.stat(follow_symlinks=follow_symlinks)
+
+    class _Scan:
+        def __init__(self, path: Path) -> None:
+            self._inner = real_scandir(path)
+
+        def __enter__(self) -> list[_Entry]:
+            return [_Entry(e) for e in self._inner.__enter__()]
+
+        def __exit__(self, *exc: object) -> None:
+            self._inner.__exit__(*exc)
+
+    monkeypatch.setattr("breezy.adapters.polymarket_us.recorder_watchdog.os.scandir", _Scan)
+    assert stream_bytes_total(tmp_path) == 40
+
+
+def test_config_rejects_watchdog_notify_without_a_stream_dir() -> None:
+    from msgspec.structs import replace
+
+    from breezy.runtime.settings import SettingsError
+    from tests.unit.test_quote_tape_recorder import make_data_client_config
+
+    base = make_data_client_config()
+    assert base.watchdog_notify is False
+    for bad in (None, "", 5):
+        with pytest.raises(SettingsError, match="watchdog_stream_dir"):
+            replace(base, watchdog_notify=True, watchdog_stream_dir=bad)
+    ok = replace(base, watchdog_notify=True, watchdog_stream_dir="/tmp/x/live/abc")
+    assert ok.watchdog_notify is True

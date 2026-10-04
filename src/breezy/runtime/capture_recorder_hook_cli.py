@@ -69,30 +69,48 @@ def trading_day_bounds_ns(detected_ns: int) -> tuple[str, int, int]:
     return start.date().isoformat(), int(start.timestamp()) * _NS, int(end.timestamp()) * _NS
 
 
-def _open_dir(path: Path, *, create: bool) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_dir(path: Path) -> int:
+    return os.open(path, _DIR_FLAGS)
+
+
+def _open_child_dir(parent_fd: int, name: str) -> int:
+    """Create ``name`` under ``parent_fd`` (``mkdir`` with ``dir_fd``), then open it nofollow."""
     try:
-        return os.open(path, flags)
-    except FileNotFoundError:
-        if not create:
-            raise
-    path.mkdir(mode=_DIR_MODE, exist_ok=True)
-    return os.open(path, flags)
+        os.mkdir(name, _DIR_MODE, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
 
 
 def _write_once(dir_fd: int, name: str, payload: bytes) -> bool:
-    """``O_EXCL`` create. ``False`` when the record already exists (write-once held)."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    """Atomic write-once: temp file, ``os.link`` to the final name, unlink the temp.
+
+    ``False`` when the record already exists (``EEXIST``). A crash leaves either no record or a
+    complete one, never a partial file under the final name.
+    """
+    tmp = f".{name}.{os.getpid()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(tmp, flags, _FILE_MODE, dir_fd=dir_fd)
     try:
-        fd = os.open(name, flags, _FILE_MODE, dir_fd=dir_fd)
-    except FileExistsError:
-        return False
-    try:
-        os.write(fd, payload)
-        os.fsync(fd)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        os.fsync(dir_fd)
+        return True
     finally:
-        os.close(fd)
-    return True
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _atomic_replace(dir_fd: int, name: str, payload: bytes) -> None:
@@ -105,6 +123,7 @@ def _atomic_replace(dir_fd: int, name: str, payload: bytes) -> None:
     finally:
         os.close(fd)
     os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
 
 
 def _acquire_lock(dir_fd: int, timeout_s: float, sleep: Callable[[float], None]) -> int:
@@ -190,9 +209,9 @@ def record_watchdog_kill(
     stall_root = data_root / STALL_RELATIVE
     day = datetime.fromtimestamp(now_ns / _NS, tz=UTC).date().isoformat()
     try:
-        root_fd = _open_dir(stall_root, create=False)
+        root_fd = _open_dir(stall_root)
         try:
-            day_fd = _open_dir(stall_root / day, create=True)
+            day_fd = _open_child_dir(root_fd, day)
         finally:
             os.close(root_fd)
         try:
@@ -221,7 +240,7 @@ def _rewrite_health(
     lock_timeout_s: float,
     sleep: Callable[[float], None],
 ) -> None:
-    health_fd = _open_dir(data_root / HEALTH_RELATIVE, create=False)
+    health_fd = _open_dir(data_root / HEALTH_RELATIVE)
     try:
         lock_fd = _acquire_lock(health_fd, lock_timeout_s, sleep)
         try:
@@ -242,7 +261,12 @@ def _rewrite_health(
 
 
 def _log_failure(cause: str, invocation_id: str) -> None:
-    ident = invocation_id if invocation_id else "unknown"
+    if not invocation_id:
+        ident = "unknown"
+    elif _INVOCATION_ID_RE.fullmatch(invocation_id):
+        ident = invocation_id
+    else:
+        ident = "invalid"
     sys.stderr.write(f"ERROR RECORDER_HOOK_FAILED cause={cause} invocation_id={ident}\n")
     sys.stderr.flush()
 

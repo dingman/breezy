@@ -6,7 +6,7 @@ import asyncio
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -101,6 +101,66 @@ class ListLogger:
         return [m for _, m in self.lines if m.startswith(prefix)]
 
 
+SLUG = "tc-temp-nychigh-2026-08-25-lt79f"
+
+
+class ControllableFeed:
+    """A minimal markets-feed double: connect, subscribe and close succeed."""
+
+    def __init__(self, handler: Any) -> None:
+        self.handler = handler
+        self._connected = False
+        self._subscriptions: dict[str, str] = {}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def is_degraded(self) -> bool:
+        return False
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        return False
+
+    @property
+    def silent_subscriptions(self) -> tuple[Any, ...]:
+        return ()
+
+    @property
+    def subscriptions(self) -> Mapping[str, str]:
+        return dict(self._subscriptions)
+
+    async def connect(self) -> None:
+        self._connected = True
+
+    async def close(self) -> None:
+        self._connected = False
+
+    async def subscribe_market_data(self, market_slugs: Sequence[str]) -> None:
+        for slug in market_slugs:
+            self._subscriptions[slug] = "req-1"
+
+    async def unsubscribe(self, request_id: str) -> None:
+        return
+
+
+async def wait_for(predicate: Callable[[], bool], *, timeout_s: float = 5.0) -> None:
+    """Poll ``predicate`` on the running loop until true; fail at the deadline."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition not reached before the deadline")
+        await asyncio.sleep(0.002)
+
+
+def run_until(
+    loop: asyncio.AbstractEventLoop, predicate: Callable[[], bool], *, timeout_s: float = 5.0
+) -> None:
+    loop.run_until_complete(wait_for(predicate, timeout_s=timeout_s))
+
+
 class NotifyReceiver:
     """A bound AF_UNIX datagram socket standing in for systemd's ``$NOTIFY_SOCKET``.
 
@@ -129,11 +189,14 @@ class NotifyReceiver:
             with self._lock:
                 self._messages.append(data.decode())
 
-    def take(self) -> list[str]:
-        time.sleep(0.05)
+    @property
+    def messages(self) -> list[str]:
+        """Every datagram received so far, in order (a copy)."""
         with self._lock:
-            out, self._messages = self._messages, []
-        return out
+            return list(self._messages)
+
+    def count(self, prefix: str) -> int:
+        return sum(1 for m in self.messages if m.startswith(prefix))
 
     def close(self) -> None:
         self._stop.set()
@@ -150,10 +213,6 @@ def notify_socket(path: Path) -> Iterator[NotifyReceiver]:
         receiver.close()
 
 
-def drain(receiver: NotifyReceiver) -> list[str]:
-    return receiver.take()
-
-
 def build_watchdog_client(
     loop: asyncio.AbstractEventLoop,
     provider: Any,
@@ -165,9 +224,6 @@ def build_watchdog_client(
     clock: LiveClock | None = None,
     feed_factory: Any | None = None,
 ) -> PolymarketUSDataClient:
-    from tests.unit.test_polymarket_us_data import SLUG
-    from tests.unit.test_polymarket_us_quote_tape_gap import ControllableFeed
-
     clock = clock if clock is not None else LiveClock()
     msgbus: MessageBus = TestComponentStubs.msgbus()
     cache = TestComponentStubs.cache()
@@ -185,7 +241,9 @@ def build_watchdog_client(
             user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
             empty_discovery_retry_secs=empty_discovery_retry_secs,
             watchdog_notify=watchdog_notify,
-            watchdog_stream_dir=stream_dir,
+            watchdog_stream_dir=stream_dir
+            if stream_dir is not None or not watchdog_notify
+            else "/nonexistent/aut1-wp3/live/test",
         ),
         msgbus=msgbus,
         cache=cache,

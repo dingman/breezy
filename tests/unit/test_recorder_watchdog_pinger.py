@@ -23,18 +23,20 @@ from breezy.adapters.polymarket_us.recorder_watchdog import (
 )
 from tests.support.recorder_watchdog import (
     NS,
+    SLUG,
     ListLogger,
     build_watchdog_client,
-    drain,
     notify_socket,
+    run_until,
     sample,
     utc_ns,
+    wait_for,
 )
 from tests.unit.test_polymarket_us_connect_fail_fast import (
     ConnectFailsFeed,
     _InitializeStubProvider,
 )
-from tests.unit.test_polymarket_us_data import SLUG, make_instrument
+from tests.unit.test_polymarket_us_data import make_instrument
 from tests.unit.test_polymarket_us_quote_tape_gap import FakeProvider
 
 MORNING = utc_ns(8, 0, 0)
@@ -64,12 +66,14 @@ def _notify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         yield server
 
 
-def _pump(loop: asyncio.AbstractEventLoop, seconds: float = 0.1) -> None:
-    loop.run_until_complete(asyncio.sleep(seconds))
-
-
 def _disconnect(loop: asyncio.AbstractEventLoop, client: Any) -> None:
     loop.run_until_complete(client._disconnect())
+
+
+def _ticks_after(loop: asyncio.AbstractEventLoop, client: Any, extra: int) -> None:
+    """Run until the client's pinger has completed ``extra`` more ticks."""
+    target = client._watchdog_pinger.ticks + extra
+    run_until(loop, lambda: client._watchdog_pinger.ticks >= target)
 
 
 # ------------------------------------------------------------------ the pinger in _connect
@@ -95,6 +99,26 @@ def test_pinger_task_created_first_in_connect(loop: asyncio.AbstractEventLoop) -
         _disconnect(loop, client)
 
 
+def test_a_raising_pinger_constructor_still_connects(
+    loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3-R3 (SEC M1): the watchdog can never fail connect (Nautilus would swallow it)."""
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("pinger constructor broke")
+
+    monkeypatch.setattr("breezy.adapters.polymarket_us.data.RecorderWatchdogPinger", boom)
+    client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
+    loop.run_until_complete(client._connect())
+    try:
+        assert client.is_safe_mode is False
+        assert client.watchdog_phase == "STREAMING"
+        assert client._watchdog_pinger_task is None
+        assert client.subscribed_slug_count == 1
+    finally:
+        _disconnect(loop, client)
+
+
 def test_pinger_runs_while_initialize_retries_empty_listing(
     loop: asyncio.AbstractEventLoop,
     notify: Any,
@@ -110,7 +134,8 @@ def test_pinger_runs_while_initialize_retries_empty_listing(
     monkeypatch.setattr("breezy.adapters.polymarket_us.data.asyncio.sleep", fast_sleep)
     loop.run_until_complete(client._connect())
     try:
-        messages = drain(notify)
+        run_until(loop, lambda: "READY=1" in notify.messages)
+        messages = notify.messages
         extends = [m for m in messages if m.startswith("EXTEND_TIMEOUT_USEC=")]
         assert provider.initialize_calls == 4
         assert len(extends) >= 2, messages  # extended during the retries, before READY
@@ -125,9 +150,9 @@ def test_quiet_feed_start_sends_ready_without_any_counter_advance(
     client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop)
+        run_until(loop, lambda: "WATCHDOG=1" in notify.messages)
         assert client.quotes_published == 0 and client.depths_published == 0
-        assert drain(notify).count("READY=1") == 1
+        assert notify.count("READY=1") == 1
     finally:
         _disconnect(loop, client)
 
@@ -136,22 +161,19 @@ def test_ready_not_sent_before_subscribe_and_sent_once(
     loop: asyncio.AbstractEventLoop, notify: Any
 ) -> None:
     client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
-    order: list[str] = []
+    before_subscribe: list[str] = []
     original = client._feed.subscribe_market_data
 
     async def spy(slugs: Any) -> None:
-        order.extend(drain(notify))
-        order.append("subscribed")
+        before_subscribe.extend(notify.messages)
         await original(slugs)
 
     client._feed.subscribe_market_data = spy  # type: ignore[assignment,method-assign]
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop)
-        order.extend(drain(notify))
-        assert "READY=1" not in order[: order.index("subscribed")]
-        assert order.count("READY=1") == 1
-        assert order.index("READY=1") > order.index("subscribed")
+        run_until(loop, lambda: "WATCHDOG=1" in notify.messages)
+        assert "READY=1" not in before_subscribe
+        assert notify.count("READY=1") == 1
     finally:
         _disconnect(loop, client)
 
@@ -162,8 +184,8 @@ def test_connect_failure_never_sends_ready(loop: asyncio.AbstractEventLoop, noti
     )
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop)
-        assert "READY=1" not in drain(notify)
+        _ticks_after(loop, client, 3)
+        assert "READY=1" not in notify.messages
         assert client.is_safe_mode is True
         assert client._watchdog_pinger is not None and not client._watchdog_pinger.is_ready
     finally:
@@ -174,9 +196,8 @@ def test_watchdog_sent_only_after_ready(loop: asyncio.AbstractEventLoop, notify:
     client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop, 0.2)
-        messages = drain(notify)
-        assert "WATCHDOG=1" in messages
+        run_until(loop, lambda: "WATCHDOG=1" in notify.messages)
+        messages = notify.messages
         assert messages.index("READY=1") < messages.index("WATCHDOG=1")
         assert not [m for m in messages[messages.index("READY=1") :] if m.startswith("EXTEND")]
     finally:
@@ -206,7 +227,7 @@ def test_pinger_task_strongly_referenced_and_cleared_on_disconnect(
     loop.run_until_complete(client._connect())
     task = client._watchdog_pinger_task
     assert task is not None
-    _pump(loop)
+    _ticks_after(loop, client, 2)
     assert not task.done()
     _disconnect(loop, client)
     assert client._watchdog_pinger_task is None
@@ -219,10 +240,21 @@ def test_ready_sent_once_across_reconnects(loop: asyncio.AbstractEventLoop, noti
     _disconnect(loop, client)
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop)
-        assert drain(notify).count("READY=1") == 1
+        _ticks_after(loop, client, 3)
+        assert notify.count("READY=1") == 1
     finally:
         _disconnect(loop, client)
+
+
+def _hold_discovery(client: Any) -> dict[str, bool]:
+    state = {"extending": True}
+
+    async def hold() -> None:
+        while state["extending"]:
+            await asyncio.sleep(0.005)
+
+    client._initialize_instruments_for_connect = hold
+    return state
 
 
 def test_pinger_stops_extending_once_stop_begins(
@@ -232,37 +264,54 @@ def test_pinger_stops_extending_once_stop_begins(
     while its process ignores SIGTERM sat in ``stop-sigterm`` for minutes."""
     provider = _InitializeStubProvider([make_instrument(SLUG)], empty_times=10_000)
     client = build_watchdog_client(loop, provider, empty_discovery_retry_secs=600.0)
-    state = {"extending": True}
-
-    async def hold_discovery() -> None:
-        while state["extending"]:
-            await asyncio.sleep(0.01)
-
-    client._initialize_instruments_for_connect = hold_discovery  # type: ignore[method-assign]
+    state = _hold_discovery(client)
     connect = loop.create_task(client._connect())
     try:
-        _pump(loop, 0.15)
-        before = [m for m in drain(notify) if m.startswith("EXTEND_TIMEOUT_USEC=")]
-        assert before, "the pinger extends the start while discovery is legitimately waiting"
+        run_until(loop, lambda: notify.count("EXTEND_TIMEOUT_USEC=") > 0)
         client._disconnecting = True  # `_disconnect` has begun (or the component is STOPPING)
-        drain(notify)
-        _pump(loop, 0.15)
-        assert [m for m in drain(notify) if m.startswith("EXTEND")] == []
+        _ticks_after(loop, client, 2)  # anything already in flight has landed
+        settled = notify.count("EXTEND")
+        _ticks_after(loop, client, 6)
+        assert notify.count("EXTEND") == settled
     finally:
         state["extending"] = False
-        loop.run_until_complete(asyncio.wait({connect}, timeout=2))
+        loop.run_until_complete(asyncio.wait({connect}, timeout=5))
+        _disconnect(loop, client)
+
+
+def test_reconnect_resets_the_stop_flag_and_extends_before_ready(
+    loop: asyncio.AbstractEventLoop, notify: Any
+) -> None:
+    """WP3-R3 (SEC L2): a disconnect before READY then a reconnect must extend again."""
+    provider = _InitializeStubProvider([make_instrument(SLUG)], empty_times=10_000)
+    client = build_watchdog_client(loop, provider, empty_discovery_retry_secs=600.0)
+    first = _hold_discovery(client)
+    connect = loop.create_task(client._connect())
+    run_until(loop, lambda: notify.count("EXTEND_TIMEOUT_USEC=") > 0)
+    first["extending"] = False
+    loop.run_until_complete(asyncio.wait({connect}, timeout=5))
+    _disconnect(loop, client)
+    assert client._disconnecting is True
+    seen = notify.count("EXTEND_TIMEOUT_USEC=")
+    second = _hold_discovery(client)
+    connect = loop.create_task(client._connect())
+    try:
+        run_until(loop, lambda: client._disconnecting is False)
+        run_until(loop, lambda: notify.count("EXTEND_TIMEOUT_USEC=") > seen)
+    finally:
+        second["extending"] = False
+        loop.run_until_complete(asyncio.wait({connect}, timeout=5))
         _disconnect(loop, client)
 
 
 def test_stop_begun_also_follows_the_component_state(loop: asyncio.AbstractEventLoop) -> None:
     from nautilus_trader.common.enums import ComponentState
 
-    client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
-    assert client._watchdog_stop_begun() is False
-    assert client.state != ComponentState.STOPPING
-    stopping = {ComponentState.STOPPING, ComponentState.STOPPED, ComponentState.DISPOSED}
     from breezy.adapters.polymarket_us import data
 
+    client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
+    assert client._watchdog_stop_begun() is False
+    stopping = {ComponentState.STOPPING, ComponentState.STOPPED, ComponentState.DISPOSED}
     assert stopping <= data._STOPPING_STATES
     assert ComponentState.RUNNING not in data._STOPPING_STATES
     assert ComponentState.STARTING not in data._STOPPING_STATES
@@ -274,9 +323,8 @@ def test_no_notify_without_the_opt_in_flag(loop: asyncio.AbstractEventLoop, noti
     )
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop, 0.1)
         assert client._watchdog_pinger is None and client._watchdog_pinger_task is None
-        assert drain(notify) == []
+        assert notify.messages == []
     finally:
         _disconnect(loop, client)
 
@@ -289,7 +337,7 @@ def test_type_simple_every_notify_is_a_noop_and_never_raises(
     client = build_watchdog_client(loop, FakeProvider([make_instrument(SLUG)]))
     loop.run_until_complete(client._connect())
     try:
-        _pump(loop, 0.1)
+        _ticks_after(loop, client, 3)
         pinger = client._watchdog_pinger
         assert pinger is not None and pinger.is_ready
         assert pinger.sample_failures == 0
@@ -365,9 +413,9 @@ def test_sample_exception_never_ends_the_pinger(loop: asyncio.AbstractEventLoop)
 
     pinger = _bare(flaky)
     task = loop.create_task(pinger.run())
-    loop.run_until_complete(asyncio.sleep(0.1))
+    run_until(loop, lambda: calls["n"] > 5)
     assert not task.done()
-    assert calls["n"] > 5 and pinger.sample_failures == 3
+    assert pinger.sample_failures == 3
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         loop.run_until_complete(task)
@@ -382,7 +430,7 @@ def test_pinger_death_logs_recorder_pinger_died(loop: asyncio.AbstractEventLoop)
 
     task = loop.create_task(dies())
     task.add_done_callback(pinger.on_task_done)
-    loop.run_until_complete(asyncio.sleep(0.01))
+    run_until(loop, lambda: bool(log.lines))
     assert log.messages("RECORDER_PINGER_DIED") == ["RECORDER_PINGER_DIED cause=RuntimeError"]
     # Cancellation is the only normal ending and is silent.
     quiet = ListLogger()
@@ -390,7 +438,8 @@ def test_pinger_death_logs_recorder_pinger_died(loop: asyncio.AbstractEventLoop)
     sleeper = loop.create_task(asyncio.sleep(10))
     sleeper.add_done_callback(other.on_task_done)
     sleeper.cancel()
-    loop.run_until_complete(asyncio.sleep(0.01))
+    run_until(loop, sleeper.done)
+    loop.run_until_complete(asyncio.sleep(0))  # let the done-callback run
     assert quiet.messages("RECORDER_PINGER_DIED") == []
 
 
@@ -413,7 +462,7 @@ def test_pinger_runs_on_the_loop_thread(loop: asyncio.AbstractEventLoop) -> None
 
     async def drive() -> int:
         task = asyncio.get_running_loop().create_task(pinger.run())
-        await asyncio.sleep(0.05)
+        await wait_for(lambda: len(threads) > 3)
         task.cancel()
         return threading.get_ident()
 
@@ -434,7 +483,7 @@ def test_gate_boot_line_reports_a_boolean_only(loop: asyncio.AbstractEventLoop) 
 
     async def drive() -> None:
         task = asyncio.get_running_loop().create_task(pinger.run())
-        await asyncio.sleep(0.02)
+        await wait_for(lambda: bool(log.lines))
         task.cancel()
 
     loop.run_until_complete(drive())

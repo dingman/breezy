@@ -347,7 +347,7 @@ def sd_notify(message: str, *, environ: Mapping[str, str] | None = None) -> bool
     """
     env = os.environ if environ is None else environ
     address = env.get(NOTIFY_SOCKET_ENV)
-    if not address:
+    if not address or address[0] not in ("/", "@"):
         return False
     target = "\0" + address[1:] if address.startswith("@") else address
     try:
@@ -371,7 +371,10 @@ def stream_bytes_total(directory: str | os.PathLike[str]) -> int:
             for entry in entries:
                 if entry.name.startswith(".") or not entry.name.endswith(".feather"):
                     continue
-                info = entry.stat(follow_symlinks=False)
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # a rotation removed it between scandir and stat: skip this entry
                 if stat.S_ISREG(info.st_mode):
                     total += info.st_size
     except FileNotFoundError:
@@ -438,6 +441,7 @@ class RecorderWatchdogPinger:
         self._deferral_logged = False
         self._withheld_logged_ns: dict[str, int] = {}
         self.sample_failures = 0
+        self.ticks = 0
         self.last_verdict: str | None = None
         self.last_action: str = ACTION_NONE
 
@@ -477,6 +481,7 @@ class RecorderWatchdogPinger:
 
     def tick(self) -> str:
         """One sample, classification and send. Exception-safe (EM2); returns the verdict."""
+        self.ticks += 1
         now_ns = self._clock_ns()
         if self._started_ns is None:
             self._started_ns = now_ns

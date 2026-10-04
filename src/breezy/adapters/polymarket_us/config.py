@@ -417,6 +417,13 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
             raise SettingsError(
                 f"watchdog_notify must be a bool, was {type(self.watchdog_notify).__name__}"
             )
+        if self.watchdog_notify and not (
+            isinstance(self.watchdog_stream_dir, str) and self.watchdog_stream_dir
+        ):
+            raise SettingsError(
+                "watchdog_notify requires a non-empty str watchdog_stream_dir (the byte total "
+                "the gate watches); without it the gate would read zero forever"
+            )
         if not isinstance(self.trade_shard_halving, bool):
             raise SettingsError(
                 f"trade_shard_halving must be a bool, was {type(self.trade_shard_halving).__name__}"

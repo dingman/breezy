@@ -107,6 +107,7 @@ from breezy.adapters.polymarket_us.recorder_watchdog import (
     PHASE_DISCOVERING,
     PHASE_SAFE_MODE,
     PHASE_STREAMING,
+    RECORDER_PINGER_DIED,
     RecorderSample,
     RecorderWatchdogPinger,
     stream_bytes_total,
@@ -1179,7 +1180,14 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     async def _connect(self) -> None:
         # AUT-1 r12 section 3.10.1: the pinger is the FIRST statement, so discovery (which can
         # wait an hour in the listing hole) is covered by start-timeout extension.
-        self._ensure_watchdog_pinger()
+        # A reconnect after a disconnect must not inherit the stop flag (WP3-R3).
+        self._disconnecting = False
+        # The watchdog can never fail connect: Nautilus swallows connect errors and a failed
+        # `_connect` would leave a zombie recorder (WP3-R3, SEC M1).
+        try:
+            self._ensure_watchdog_pinger()
+        except Exception as exc:  # noqa: BLE001 - see above
+            self._log.error(f"{RECORDER_PINGER_DIED} cause={type(exc).__name__}")
         self._safe_mode = False
         self._set_phase(PHASE_DISCOVERING)
         try:

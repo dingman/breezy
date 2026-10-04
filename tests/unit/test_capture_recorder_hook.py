@@ -233,3 +233,61 @@ def test_hook_module_imports_no_alert_sender() -> None:
     assert not [m for m in imported if "alert" in m or m.startswith("breezy.runtime.health")]
     assert not [m for m in imported if m.startswith("breezy.adapters")]
     assert "RECORDER_WATCHDOG_KILL" not in Path(hook.__file__).read_text()
+
+
+# ------------------------------------------------------------------- WP3-R3 hardening
+
+
+def test_stall_record_is_published_by_link_and_leaves_no_temp(root: Path) -> None:
+    now = utc_ns(10, 0, 0, day=5)
+    hook.run_hook(WATCHDOG_ENV, data_root=root, now_ns=now)
+    (record_path,) = _records(root)
+    assert sorted(p.name for p in record_path.parent.iterdir()) == [record_path.name]
+    assert record_path.stat().st_nlink == 1  # the temp name was unlinked
+
+
+def test_an_existing_record_is_never_replaced_and_leaves_no_temp(root: Path) -> None:
+    now = utc_ns(10, 0, 0, day=5)
+    day = root / "evidence" / "capture" / "stall" / "2026-10-05"
+    day.mkdir()
+    final = day / f"{now}_{INVOCATION}_recorder_watchdog.json"
+    final.write_text("original")
+    hook.run_hook(WATCHDOG_ENV, data_root=root, now_ns=now)
+    assert final.read_text() == "original"
+    assert [p.name for p in day.iterdir()] == [final.name]
+
+
+def test_failure_log_prints_only_a_valid_invocation_id(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evil = "x\nFAKE LOG LINE" + "a" * 20
+    hook.run_hook({"SERVICE_RESULT": "watchdog", "INVOCATION_ID": evil}, data_root=root)
+    err = capsys.readouterr().err
+    assert "invocation_id=invalid" in err and "FAKE" not in err and err.count("\n") == 1
+
+
+def test_day_directory_symlink_is_refused(root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    stall = root / "evidence" / "capture" / "stall"
+    elsewhere = root / "elsewhere"
+    elsewhere.mkdir()
+    (stall / "2026-10-05").symlink_to(elsewhere)
+    assert hook.run_hook(WATCHDOG_ENV, data_root=root, now_ns=utc_ns(10, 0, 0, day=5)) == 0
+    assert "RECORDER_HOOK_FAILED cause=write_error_" in capsys.readouterr().err
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_health_rename_is_followed_by_a_directory_fsync(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    kinds: list[bool] = []
+    real = os.fsync
+
+    def spy(fd: int) -> None:
+        kinds.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    hook.run_hook(WATCHDOG_ENV, data_root=root, now_ns=utc_ns(10, 0, 0, day=5))
+    assert kinds[-1] is True  # the last fsync is the health directory, after the rename

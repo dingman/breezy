@@ -592,3 +592,28 @@ def test_wp0_constants_are_pinned() -> None:
         rw.DISCOVERY_ATTEMPT_BUDGET_S,
     ) == (900, 1, 120, 30, 180)
     assert rw.RECORDER_WATCHDOG_STORM_KILLS == 3
+
+
+# ------------------------------------------------ WP3-R3: flush-margin boundary, notify socket
+
+
+def _margin_verdict(event_age_s: int) -> str:
+    """One event published ``event_age_s`` before now, bytes flat across 200 s."""
+    history = series(
+        MORNING, 200, events_at=lambda t: 1 if t <= event_age_s else 0, bytes_at=lambda t: 4000
+    )
+    return _classify(history, MORNING)
+
+
+def test_event_exactly_at_the_flush_margin_is_a_writer_stall() -> None:
+    assert rw.FLUSH_MARGIN_S == 30
+    assert _margin_verdict(30) == CAUSE_WRITER_STALL
+
+
+def test_event_just_inside_the_flush_margin_still_pings() -> None:
+    assert _margin_verdict(29) == "OK"
+
+
+def test_sd_notify_refuses_a_socket_address_that_is_neither_path_nor_abstract() -> None:
+    for bad in ("relative/notify", "vsock:2:1234", "notify"):
+        assert sd_notify("READY=1", environ={"NOTIFY_SOCKET": bad}) is False
