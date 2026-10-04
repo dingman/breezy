@@ -292,6 +292,7 @@ source_modules = [
     "breezy.persistence.autonomy.registry_schema",
 ]
 forbidden_modules = ["pyarrow"]
+allow_indirect_imports = false
 
 [[tool.importlinter.contracts]]
 name = "ARCH-0 seam B: the autonomy sandbox package is stdlib-only"

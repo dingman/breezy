@@ -31,6 +31,15 @@ __all__ = [
 _BREEZY_SRC: Final[Path] = SRC_DIR / "breezy"
 _CORE_DIR: Final[Path] = _BREEZY_SRC / "persistence" / "autonomy"
 
+# Ruling B8-R1: ARCH-0 seam B's own runtime. It legitimately execv's bwrap and names host paths, and
+# is governed by seam B's gates (stdlib-only contract, WRAPPER_CODE_FILES / SHARED_WRITE_SITES via
+# test_autonomy_write_sites, the unit lint, security review). Exact package only: no other
+# ``autonomy*`` package (autonomy_capture, autonomy_refit ...) is exempt.
+SANDBOX_EXCLUSION: Final[tuple[str, ...]] = ("runtime", "autonomy_sandbox")
+SANDBOX_EXCLUSION_REASON: Final[str] = (
+    "ARCH-0 seam B's own runtime, judged by seam B's gates (B8-R1)"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Finding:
@@ -64,11 +73,19 @@ def autonomy_source_files(
     found = {
         p
         for p in src_root.rglob("*.py")
-        if any(part.startswith("autonomy") for part in p.relative_to(src_root).parts[:-1])
-        or "autonomy" in p.name
+        if (
+            any(part.startswith("autonomy") for part in p.relative_to(src_root).parts[:-1])
+            or "autonomy" in p.name
+        )
+        and not _is_sandbox_file(p.relative_to(src_root))
     }
     found |= {p for p in scripts_root.rglob("*autonomy*.py")}
     return sorted(found)
+
+
+def _is_sandbox_file(relative: Path) -> bool:
+    """True for a file inside exactly ``runtime/autonomy_sandbox`` (the B8-R1 exclusion row)."""
+    return relative.parts[: len(SANDBOX_EXCLUSION)] == SANDBOX_EXCLUSION
 
 
 def core_source_files() -> list[Path]:

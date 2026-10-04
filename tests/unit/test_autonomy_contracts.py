@@ -36,7 +36,9 @@ PYARROW_REACHING: Final[frozenset[str]] = frozenset(
 def _contracts() -> list[dict[str, Any]]:
     data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
     contracts: list[dict[str, Any]] = data["tool"]["importlinter"]["contracts"]
-    return [c for c in contracts if "autonomy" in c["name"].lower() and "ARCH-0" in c["name"]]
+    # B8-R2: seam A's contracts by their exact name prefix; seam B's stdlib-only contract is pinned
+    # by seam B's own test.
+    return [c for c in contracts if c["name"].startswith("ARCH-0 autonomy (")]
 
 
 def test_autonomy_init_has_no_import_nodes() -> None:

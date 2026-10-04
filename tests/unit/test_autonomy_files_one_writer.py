@@ -23,7 +23,9 @@ from typing import Final
 
 import pytest
 
+from breezy.runtime.autonomy_sandbox.write_sites import SHARED_WRITE_SITES
 from tests.support.autonomy_scan import (
+    SANDBOX_EXCLUSION_REASON,
     Finding,
     autonomy_source_files,
     module_name,
@@ -31,6 +33,7 @@ from tests.support.autonomy_scan import (
     scan_files,
 )
 from tests.support.autonomy_write_scan import find_write_sites
+from tests.support.autonomy_write_sites import scan_write_sites
 from tests.support.entry_points import REPO_ROOT, SRC_DIR
 from tests.unit.autonomy_writer_table import (
     AUTONOMY_FILE_WRITERS,
@@ -316,6 +319,34 @@ def test_the_judged_predicate_reaches_autonomy_prefixed_packages(tmp_path: Path)
             str(path), path.read_text(encoding="utf-8"), module="breezy.planted"
         )
         assert [site.detail for site in sites] == ["os.replace"]
+
+
+def test_the_judged_predicate_excludes_only_the_seam_b_sandbox_package(tmp_path: Path) -> None:
+    """Ruling B8-R1: one reasoned exclusion row; siblings stay judged."""
+    assert SANDBOX_EXCLUSION_REASON
+    src = tmp_path / "src" / "breezy"
+    sandbox = src / "runtime" / "autonomy_sandbox" / "w.py"
+    siblings = [
+        src / "strategy" / "autonomy_capture" / "w.py",
+        src / "runtime" / "autonomy_other" / "w.py",
+        src / "analysis" / "autonomy_sandbox" / "w.py",
+    ]
+    for path in [sandbox, *siblings]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("import os\n", encoding="utf-8")
+    assert autonomy_source_files(src, tmp_path / "scripts") == sorted(siblings)
+
+
+def test_a_planted_write_site_in_the_sandbox_is_caught_by_seam_b_own_gate() -> None:
+    """Ruling B8-R1: the excluded package is still policed, by ``test_autonomy_write_sites``."""
+    module = "self_probe"
+    source = (SRC_DIR / "breezy" / "runtime" / "autonomy_sandbox" / f"{module}.py").read_text(
+        encoding="utf-8"
+    )
+    planted = source + "\n\ndef _planted(a, b):\n    os.replace(a, b)\n"
+    assert scan_write_sites(module, source) <= set(SHARED_WRITE_SITES)
+    assert scan_write_sites(module, planted) != scan_write_sites(module, source)
+    assert not scan_write_sites(module, planted) <= set(SHARED_WRITE_SITES)
 
 
 def test_transitional_rows_name_an_owner_and_a_closing_condition() -> None:
