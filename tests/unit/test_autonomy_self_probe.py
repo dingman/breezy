@@ -873,7 +873,7 @@ def test_selftest_exec_snapshot_uses_the_injected_runner_with_the_count(
     assert report["snap"]["ok"] == 20
 
 
-@pytest.mark.parametrize("count", ["0", "-1", "x", "3.5", "", "1001", "٣"])
+@pytest.mark.parametrize("count", ["0", "-1", "x", "3.5", "", "51", "1001", "٣"])
 def test_selftest_exec_snapshot_rejects_a_bad_count_with_usage(
     world: World, run_cli: Callable[..., tuple[int, dict[str, Any]]], count: str
 ) -> None:

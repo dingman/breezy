@@ -451,6 +451,9 @@ _HYGIENE_ABSOLUTE_ALLOWLIST: Final[dict[tuple[str, str], str]] = {
     ("src/breezy/persistence/autonomy/single_read.py", "/proc/self/fd"): (
         "kernel path for the O_TMPFILE linkat, not a host path"
     ),
+    ("src/breezy/runtime/autonomy_sandbox/wal_snapshot.py", "/proc/self/fd"): (
+        "kernel path to reach the verified snap-dir fd for recovery (B10-R4 L-1), not a host path"
+    ),
 }
 
 
@@ -513,6 +516,20 @@ def test_hygiene_scan_flags_proc_self_fd_in_any_other_autonomy_file() -> None:
 def test_hygiene_scan_flags_any_other_absolute_literal_in_single_read() -> None:
     for literal in ("/proc/self/fd/3", "/proc/self", "/tmp/x", "/home/jon/x", "/proc/self/fdx"):
         assert len(_scan_payload_hygiene(_TMPFILE_FILE, f'_P = "{literal}"\n')) == 1, literal
+
+
+_WAL_FILE: Final = "src/breezy/runtime/autonomy_sandbox/wal_snapshot.py"
+
+
+def test_hygiene_allowlist_exempts_proc_self_fd_in_wal_snapshot_only() -> None:
+    assert _scan_payload_hygiene(_WAL_FILE, '_P = "/proc/self/fd"\n') == []
+    other = "src/breezy/runtime/autonomy_sandbox/selftest_cli.py"
+    assert len(_scan_payload_hygiene(other, '_P = "/proc/self/fd"\n')) == 1
+
+
+def test_hygiene_scan_flags_any_other_absolute_literal_in_wal_snapshot() -> None:
+    for literal in ("/proc/self/fd/3", "/proc/self", "/tmp/x", "/home/jon/x", "/proc/self/fdx"):
+        assert len(_scan_payload_hygiene(_WAL_FILE, f'_P = "{literal}"\n')) == 1, literal
 
 
 def test_payload_hygiene_scan_ignores_enum_only_messages() -> None:

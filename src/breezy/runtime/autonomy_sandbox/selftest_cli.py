@@ -12,7 +12,7 @@ re-bound studies lock, so the operator can compare them with the host's own view
 ``--bus-snapshot`` (WP-B2c, V17/V21) reads the handed-over bus snapshot and reports, per
 read, its exit status (or ``bus_snapshot_missing`` / ``bus_snapshot_stale`` when there is no
 usable snapshot), plus ``in_row_systemctl`` (``failed``: the sandbox has no user bus).
-``--exec-snapshot N`` (WP-B3, V10) takes N advisory snapshots (1..1000, ``take_flock=False``) of
+``--exec-snapshot N`` (WP-B3, V10) takes N advisory snapshots (1..50, ``take_flock=False``) of
 the execution store into the row's ``cache/autonomy_selftest`` bind and reports the counts
 as ``snap``: ``ok``, ``unstable`` and ``failed`` (a count per other failure reason). A bare
 flag or a bad count is a usage error (64). Output carries names and counts only, never a path.
@@ -62,7 +62,7 @@ BUS_SNAPSHOT_FLAG: Final = "--bus-snapshot"
 EXEC_SNAPSHOT_FLAG: Final = "--exec-snapshot"
 #: The selftest row's cache bind (``table.AUTONOMY_BWRAP_TABLE``): where the snapshots land.
 EXEC_SNAPSHOT_BIND: Final = "cache/autonomy_selftest"
-MAX_EXEC_SNAPSHOTS: Final = 1000
+MAX_EXEC_SNAPSHOTS: Final = 50
 IN_ROW_SYSTEMCTL_TIMEOUT_S: Final = 10
 
 ProcChecks = Callable[[BwrapRow, SandboxRoots, ProbeFs], dict[str, Any]]

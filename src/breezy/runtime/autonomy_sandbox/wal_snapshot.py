@@ -42,6 +42,7 @@ through the last re-fingerprint. Stdlib only.
 
 from __future__ import annotations
 
+import datetime as dt
 import errno
 import fcntl
 import hashlib
@@ -72,7 +73,13 @@ _SUFFIX: Final = {"db": "", "wal": "-wal", "journal": "-journal"}
 _ROLES: Final = tuple(_SUFFIX)  # the copy order: db, -wal, -journal
 _HEAD_BYTES: Final = {"db": 100, "wal": 32, "journal": 512}
 _WAL_TAIL_BYTES: Final = 4096
-_COPY_CHUNK: Final = 1 << 20
+_DEFAULT_PAGE_SIZE: Final = 4096
+_PAGE_SIZE_OFFSET: Final = 16
+_MIN_PAGE_SIZE: Final = 512
+_MAX_PAGE_SIZE: Final = 65536
+_PROC_FD: Final = "/proc/self/fd"
+_LAUNCH_FLOOR_MARGIN_NS: Final = 120 * 1_000_000_000
+_COPY_CHUNK = 1 << 20  # module-level so a test can shrink it
 _PRIVATE_DIR_MODE: Final = 0o700
 _PRIVATE_FILE_MODE: Final = 0o600
 #: Read-only opens spell their flags inline (``os.O_RDONLY | ...``) so the AC6 scan sees
@@ -106,6 +113,7 @@ class FileFingerprint:
     mtime_ns: int | None
     head_sha256: str | None
     tail_sha256: str | None
+    page1_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,16 +226,26 @@ def _digest(handle: io.FileIO, offset: int, length: int) -> str:
     return hashlib.sha256(handle.read(length)).hexdigest()
 
 
+def _page_one_digest(handle: io.FileIO) -> str:
+    """sha256 of database page 1 (it holds the file-change counter, B10-R3)."""
+    handle.seek(_PAGE_SIZE_OFFSET)
+    raw = int.from_bytes(handle.read(2), "big")
+    size = _MAX_PAGE_SIZE if raw == 1 else raw
+    valid = _MIN_PAGE_SIZE <= size <= _MAX_PAGE_SIZE and size & (size - 1) == 0
+    return _digest(handle, 0, size if valid else _DEFAULT_PAGE_SIZE)
+
+
 def _fingerprint(src_fd: int, db_name: str, role: str) -> FileFingerprint:
     fd = _open_source(src_fd, db_name + _SUFFIX[role])
     if fd is None:
         if role == "db":
             raise _Fail(SnapshotFailureReason.SOURCE_INVALID)
-        return FileFingerprint(role, False, None, None, None, None, None)
+        return FileFingerprint(role, False, None, None, None, None, None, None)
     try:
         st = os.fstat(fd)
         with open(fd, "rb", buffering=0, closefd=False) as handle:
             head = _digest(handle, 0, _HEAD_BYTES[role])
+            page1 = _page_one_digest(handle) if role == "db" else None
             tail = (
                 _digest(handle, max(0, st.st_size - _WAL_TAIL_BYTES), _WAL_TAIL_BYTES)
                 if role == "wal"
@@ -235,7 +253,7 @@ def _fingerprint(src_fd: int, db_name: str, role: str) -> FileFingerprint:
             )
     finally:
         os.close(fd)
-    return FileFingerprint(role, True, st.st_ino, st.st_size, st.st_mtime_ns, head, tail)
+    return FileFingerprint(role, True, st.st_ino, st.st_size, st.st_mtime_ns, head, tail, page1)
 
 
 def _fingerprints(src_fd: int, db_name: str) -> tuple[FileFingerprint, ...]:
@@ -324,12 +342,15 @@ def _make_snap_dir(cache_fd: int) -> tuple[str, int]:
         raise
 
 
-def _create_copy(src: int, snap_fd: int, name: str, size: int) -> None:
+def _create_copy(
+    src: int, snap_fd: int, name: str, size: int, check_deadline: Callable[[], None]
+) -> None:
     """Copy ``size`` bytes of ``src`` into a new 0600 file ``name`` (``O_EXCL``, fd-relative)."""
     dst = os.open(name, _CREATE_FLAGS, _PRIVATE_FILE_MODE, dir_fd=snap_fd)
     try:
         remaining = size
         while remaining > 0:
+            check_deadline()  # B10-R2: abort between chunks, never after a long copy
             chunk = os.read(src, min(_COPY_CHUNK, remaining))
             if not chunk:
                 break  # the file shrank: the re-fingerprint will see it
@@ -342,7 +363,11 @@ def _create_copy(src: int, snap_fd: int, name: str, size: int) -> None:
 
 
 def _copy_files(
-    src_fd: int, snap_fd: int, db_name: str, fingerprints: tuple[FileFingerprint, ...]
+    src_fd: int,
+    snap_fd: int,
+    db_name: str,
+    fingerprints: tuple[FileFingerprint, ...],
+    check_deadline: Callable[[], None],
 ) -> None:
     """Copy each present file, in fingerprint order (db, -wal, -journal); never ``-shm``."""
     for fp in fingerprints:
@@ -356,7 +381,7 @@ def _copy_files(
             st = os.fstat(src)
             if st.st_ino != fp.inode:
                 raise _Retry
-            _create_copy(src, snap_fd, name, st.st_size)
+            _create_copy(src, snap_fd, name, st.st_size, check_deadline)
         finally:
             os.close(src)
 
@@ -367,11 +392,12 @@ def _copy_attempt(
     src_fd: int,
     db_name: str,
     first: tuple[FileFingerprint, ...],
+    check_deadline: Callable[[], None],
 ) -> str | None:
     name, snap_fd = _make_snap_dir(cache_fd)
     stack.callback(_remove_tree, cache_fd, name)
     try:
-        _copy_files(src_fd, snap_fd, db_name, first)
+        _copy_files(src_fd, snap_fd, db_name, first, check_deadline)
     except _Retry:
         _remove_tree(cache_fd, name)
         return None
@@ -441,7 +467,9 @@ def _stable_copy(
             params.sleep(QUIESCENCE_NS / _NS_PER_S)
             _check_deadline(params)
             first = _fingerprints(src_fd, db_name)
-        name = _copy_attempt(stack, cache_fd, src_fd, db_name, first)
+        name = _copy_attempt(
+            stack, cache_fd, src_fd, db_name, first, lambda: _check_deadline(params)
+        )
         if name is None:
             continue
         if _fingerprints(src_fd, db_name) == first:
@@ -450,11 +478,13 @@ def _stable_copy(
     raise _Fail(SnapshotFailureReason.FINGERPRINT_UNSTABLE)
 
 
-def _recover(cache_real: Path, snap_name: str, db_name: str) -> Path:
-    """Open the copy read-write, check it, leave a single rollback-journal file."""
-    path = cache_real / snap_name / db_name
-    if not Path(os.path.realpath(path)).is_relative_to(cache_real):
-        raise _Fail(SnapshotFailureReason.COPY_ERROR)
+def _recover(snap_fd: int, db_name: str) -> None:
+    """Open the copy read-write, check it, leave a single rollback-journal file.
+
+    The connection goes through ``/proc/self/fd/<snap_fd>``: ``snap_fd`` is the verified
+    nofollow ``snap.*`` directory, so a path swap after the copy cannot redirect it (B10-R4).
+    """
+    path = Path(_PROC_FD) / str(snap_fd) / db_name
     try:
         conn = sqlite3.connect(path, isolation_level=None)
         try:
@@ -466,22 +496,30 @@ def _recover(cache_real: Path, snap_name: str, db_name: str) -> Path:
             conn.close()
     except sqlite3.Error:
         raise _Fail(SnapshotFailureReason.QUICK_CHECK) from None
-    if {db_name + "-wal", db_name + "-shm"} & set(os.listdir(path.parent)):
+    if {db_name + "-wal", db_name + "-shm"} & set(os.listdir(snap_fd)):
         raise _Fail(SnapshotFailureReason.COPY_ERROR)
-    return path
 
 
-def _run(stack: ExitStack, params: _Params, attempts: _Attempts) -> WalSnapshot:
+def _run(
+    stack: ExitStack, lock_stack: ExitStack, params: _Params, attempts: _Attempts
+) -> WalSnapshot:
     db_name = params.db_path.name
     src_fd = _open_source_dir(stack, params.db_path)
     cache_fd = _open_cache_dir(stack, params.cache_dir)
     _sweep(cache_fd)
-    held = _acquire_intent_lock(stack, src_fd, db_name, params) if params.take_flock else None
+    held = _acquire_intent_lock(lock_stack, src_fd, db_name, params) if params.take_flock else None
     name, fingerprints = _stable_copy(stack, params, attempts, src_fd, cache_fd, db_name)
     _check_deadline(params)
     if held is not None:
         held.release()
-    path = _recover(Path(os.path.realpath(params.cache_dir)), name, db_name)
+    snap_fd = os.open(
+        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=cache_fd
+    )
+    try:
+        _recover(snap_fd, db_name)
+    finally:
+        os.close(snap_fd)
+    path = Path(os.path.realpath(params.cache_dir)) / name / db_name
     return WalSnapshot(
         path=path,
         fingerprints=fingerprints,
@@ -490,6 +528,23 @@ def _run(stack: ExitStack, params: _Params, attempts: _Attempts) -> WalSnapshot:
         attempts=attempts.count,
         taken_at_ns=params.clock_ns(),
     )
+
+
+def _launch_floor_ns(now_ns: int) -> int:
+    """Today's launch instant (from the schedule pins) minus 120 s, in epoch ns."""
+    from breezy.persistence.autonomy import pins  # lazy: stdlib-only module, imported on use
+
+    hour, minute = (int(part) for part in pins.SCHEDULE_LAUNCH_UTC.split(":"))
+    day = dt.datetime.fromtimestamp(now_ns // _NS_PER_S, dt.UTC).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    return int(day.timestamp()) * _NS_PER_S - _LAUNCH_FLOOR_MARGIN_NS
+
+
+def _validate_release_deadline(deadline_ns: int, now_ns: int) -> None:
+    """B10-R2 (L-2): a release deadline must leave the launch-time intent check clear."""
+    if deadline_ns > _launch_floor_ns(now_ns):
+        raise ValueError("release_deadline_ns must not be later than launch minus 120 s")
 
 
 @contextmanager
@@ -509,6 +564,8 @@ def wal_snapshot(
     """Yield a recovered read-only-openable copy of ``db_path``, or why there is none."""
     if take_flock and release_deadline_ns is None:
         raise ValueError("take_flock=True requires release_deadline_ns")
+    if release_deadline_ns is not None:
+        _validate_release_deadline(release_deadline_ns, clock_ns())
     params = _Params(
         Path(db_path),
         Path(cache_dir),
@@ -524,14 +581,17 @@ def wal_snapshot(
     attempts = _Attempts()
     with ExitStack() as stack:
         outcome: WalSnapshot | SnapshotReadFailure
-        try:
-            outcome = _run(stack, params, attempts)
-        except _Fail as fail:
-            outcome = SnapshotReadFailure(fail.reason, not take_flock, attempts.count)
-        except OSError:
-            outcome = SnapshotReadFailure(
-                SnapshotFailureReason.COPY_ERROR, not take_flock, attempts.count
-            )
+        # The intent flock lives on its own stack, closed before anything is yielded: a caller
+        # holding the outcome never holds the flock (B10-R1, H-1), success or failure.
+        with ExitStack() as lock_stack:
+            try:
+                outcome = _run(stack, lock_stack, params, attempts)
+            except _Fail as fail:
+                outcome = SnapshotReadFailure(fail.reason, not take_flock, attempts.count)
+            except OSError:
+                outcome = SnapshotReadFailure(
+                    SnapshotFailureReason.COPY_ERROR, not take_flock, attempts.count
+                )
         yield outcome
 
 

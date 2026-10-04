@@ -14,10 +14,12 @@ module-level ``_copy_files`` / ``_recover`` / ``_fingerprint`` functions, so a c
 from __future__ import annotations
 
 import ast
+import builtins
 import datetime as dt
 import errno
 import fcntl
 import inspect
+import mmap
 import os
 import re
 import signal
@@ -180,6 +182,22 @@ def _rewrite_same_tick(path: Path, offset: int) -> None:
     assert path.stat().st_size == st.st_size and path.stat().st_mtime_ns == st.st_mtime_ns
 
 
+def _launch_ns() -> int:
+    hour, minute = (int(part) for part in pins.SCHEDULE_LAUNCH_UTC.split(":"))
+    launch = dt.datetime(2026, 10, 1, hour, minute, tzinfo=dt.UTC)
+    return int(launch.timestamp()) * 10**9
+
+
+#: 16:00 on the launch day: before the deadline floor (launch minus 120 s), so a valid
+#: ``release_deadline_ns`` is in the future and the helper's own launch-day derivation matches.
+_T0 = _launch_ns() - 50 * 60 * 10**9
+
+
+def _locked() -> dict[str, Any]:
+    """take_flock=True kwargs: a deadline derived from ``pins`` and a clock before it."""
+    return {"release_deadline_ns": _launch_ns() - 120 * 10**9, "clock_ns": lambda: _T0}
+
+
 def _age(store: Store) -> None:
     for path in (store.db, store.sidecar("-wal"), store.sidecar("-journal")):
         if path.exists():
@@ -250,13 +268,11 @@ def test_exec_snapshot_reads_the_store_under_data_root(store: Store) -> None:
 
 def test_exec_snapshot_derives_the_lock_beside_the_db_when_taking_the_flock(store: Store) -> None:
     conn = _writer(store.db)
-    deadline = _FIXED_TIME_NS + 10**12
     with exec_snapshot(
         cache_dir=store.cache,
         take_flock=True,
         data_root=store.root,
-        release_deadline_ns=deadline,
-        clock_ns=lambda: _FIXED_TIME_NS,
+        **_locked(),
     ) as snap:
         assert isinstance(snap, WalSnapshot)
         assert snap.took_flock is True and snap.advisory is False
@@ -298,9 +314,8 @@ def test_helper_holds_no_launch_time_literal() -> None:
         if not isinstance(node, ast.Constant) or id(node) in docstrings:
             continue
         assert not (isinstance(node.value, str) and clock_like.search(node.value)), node.value
-        assert node.value not in {1645, 1648, 1650, 16, 48, 50, 60, 120}, node.value
-    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    assert not {"pins", "LAUNCH_UTC"} & names
+        assert node.value not in {1645, 1648, 1650}, node.value
+    assert "pins.SCHEDULE_LAUNCH_UTC" in ast.unparse(tree)  # the launch instant comes from pins
 
 
 # --- recovery and content ----------------------------------------------------------
@@ -389,7 +404,7 @@ def test_copy_order_db_wal_journal(store: Store, open_spy: list[Any]) -> None:
 def test_copies_are_dir_fd_relative(store: Store, open_spy: list[Any]) -> None:
     conn = _writer(store.db)
     store.sidecar("-journal").write_bytes(b"\0" * 600)
-    with _take(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62) as snap:
+    with _take(store, take_flock=True, lock_path=store.lock, **_locked()) as snap:
         assert isinstance(snap, WalSnapshot)
     absolute = [str(c[0]) for c in open_spy if c[2] is None and str(c[0]) != "/"]
     assert absolute == [], absolute
@@ -420,6 +435,16 @@ def test_source_is_never_opened_for_writing_or_changed(
         return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(sqlite3, "connect", spying_connect)
+    builtin_opens: list[tuple[Any, str]] = []
+    real_builtin_open = builtins.open
+
+    def spying_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        builtin_opens.append((file, mode))
+        return real_builtin_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", spying_open)
+    mmaps: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(mmap, "mmap", lambda *a, **k: mmaps.append(a))
     store.state.chmod(0o555)
     try:
         for flock in (False, True):
@@ -427,7 +452,7 @@ def test_source_is_never_opened_for_writing_or_changed(
                 store,
                 take_flock=flock,
                 lock_path=store.lock if flock else None,
-                release_deadline_ns=2**62,
+                **_locked(),
             ) as snap:
                 assert isinstance(snap, WalSnapshot)
     finally:
@@ -436,6 +461,9 @@ def test_source_is_never_opened_for_writing_or_changed(
     assert writes == []
     assert all(c[3] != source_ino or c[1] & 3 == os.O_RDONLY for c in open_spy)
     assert not [path for path in connects if str(store.state) in path]
+    assert [mode for _, mode in builtin_opens if mode != "rb"] == [], builtin_opens
+    assert not [f for f, _ in builtin_opens if isinstance(f, str | Path) and "state" in str(f)]
+    assert mmaps == []
     assert sorted(os.listdir(store.state)) == listing
     assert {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in sources} == before
     conn.close()
@@ -483,6 +511,7 @@ def test_change_after_the_first_copy_is_retried_and_the_new_row_is_seen(
     ("role", "where"),
     [
         pytest.param("db", lambda size: 24, id="db_change_counter_bytes_24_to_27"),
+        pytest.param("db", lambda size: 2000, id="db_page1_body"),
         pytest.param("-wal", lambda size: 8, id="wal_header_salt"),
         pytest.param("-wal", lambda size: size - 100, id="wal_tail_digest"),
     ],
@@ -560,7 +589,7 @@ def test_take_flock_true_holds_flock_on_readonly_fd(
     conn = _writer(store.db)
     held_during_copy: list[bool] = []
     _after_copy(monkeypatch, lambda: held_during_copy.append(_is_held(store.lock)))
-    with _take(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62) as snap:
+    with _take(store, take_flock=True, lock_path=store.lock, **_locked()) as snap:
         assert isinstance(snap, WalSnapshot)
         assert snap.took_flock is True and snap.advisory is False
     assert held_during_copy == [True]
@@ -585,7 +614,7 @@ def test_flock_is_held_at_every_fingerprint_through_the_last(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(ws, "_fingerprint", spy)
-    with _take(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62) as snap:
+    with _take(store, take_flock=True, lock_path=store.lock, **_locked()) as snap:
         assert isinstance(snap, WalSnapshot) and snap.advisory is False
     assert held and all(held)
     conn.close()
@@ -595,11 +624,9 @@ def test_advisory_false_only_with_flock_through_last_fingerprint(store: Store) -
     conn = _writer(store.db)
     plain, _ = _result(store)
     assert plain.advisory is True and plain.took_flock is False
-    locked, _ = _result(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62)
+    locked, _ = _result(store, take_flock=True, lock_path=store.lock, **_locked())
     assert locked.advisory is False and locked.took_flock is True
-    refused = _failure(
-        store, take_flock=True, lock_path=store.state / "other.lock", release_deadline_ns=2**62
-    )
+    refused = _failure(store, take_flock=True, lock_path=store.state / "other.lock", **_locked())
     assert refused.advisory is False
     store.cache.chmod(0o755)
     assert _failure(store).advisory is True
@@ -617,7 +644,7 @@ def test_flock_released_before_quick_check(store: Store, monkeypatch: pytest.Mon
         return original(*args, **kwargs)
 
     monkeypatch.setattr(ws, "_recover", spy)
-    outcome, _ = _result(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62)
+    outcome, _ = _result(store, take_flock=True, lock_path=store.lock, **_locked())
     assert isinstance(outcome, WalSnapshot) and seen == [False]
     conn.close()
 
@@ -626,7 +653,7 @@ def test_take_flock_true_requires_lock_path_beside_db(store: Store) -> None:
     other = store.root / "elsewhere.lock"
     other.write_bytes(b"")
     for bad in (other, None, store.state / "x.intent.lock"):
-        failure = _failure(store, take_flock=True, lock_path=bad, release_deadline_ns=2**62)
+        failure = _failure(store, take_flock=True, lock_path=bad, **_locked())
         assert failure.reason is REASON.LOCK_PATH_INVALID, bad
     assert not (store.state / "x.intent.lock").exists()
 
@@ -652,7 +679,7 @@ def test_take_flock_false_never_opens_lock_path(store: Store, open_spy: list[Any
 def test_lock_file_missing_fails_closed_and_is_not_created(store: Store) -> None:
     _writer(store.db).close()
     store.lock.unlink()
-    failure = _failure(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62)
+    failure = _failure(store, take_flock=True, lock_path=store.lock, **_locked())
     assert failure.reason is REASON.LOCK_FILE_MISSING
     assert not store.lock.exists() and os.listdir(store.cache) == []
 
@@ -663,7 +690,7 @@ def test_lock_that_is_a_symlink_or_directory_is_invalid(store: Store, tmp_path: 
     target.write_bytes(b"")
     store.lock.unlink()
     store.lock.symlink_to(target)
-    kw = {"take_flock": True, "lock_path": store.lock, "release_deadline_ns": 2**62}
+    kw = {"take_flock": True, "lock_path": store.lock, **_locked()}
     assert _failure(store, **kw).reason is REASON.LOCK_PATH_INVALID
     store.lock.unlink()
     store.lock.mkdir()
@@ -673,7 +700,7 @@ def test_lock_that_is_a_symlink_or_directory_is_invalid(store: Store, tmp_path: 
 def test_unreadable_lock_file_is_lock_error(store: Store) -> None:
     _writer(store.db).close()
     store.lock.chmod(0)
-    failure = _failure(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62)
+    failure = _failure(store, take_flock=True, lock_path=store.lock, **_locked())
     assert failure.reason is REASON.LOCK_ERROR
 
 
@@ -687,8 +714,7 @@ def test_lock_held_after_three_attempts_is_lock_held(store: Store) -> None:
             store,
             take_flock=True,
             lock_path=store.lock,
-            release_deadline_ns=2**62,
-            clock_ns=lambda: _FIXED_TIME_NS,
+            **_locked(),
             sleep=sleeps.append,
         )
     finally:
@@ -711,7 +737,7 @@ def test_flock_error_other_than_contention_is_lock_error(
         raise OSError(errno.ENOLCK, "no locks")
 
     monkeypatch.setattr(fcntl, "flock", boom)
-    failure = _failure(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62)
+    failure = _failure(store, take_flock=True, lock_path=store.lock, **_locked())
     assert failure.reason is REASON.LOCK_ERROR
 
 
@@ -732,7 +758,7 @@ def test_take_flock_true_hold_bounded_node_lock_fails_fast_not_blocks(
             outcomes.append(("held", time.monotonic() - started))
 
     _after_copy(monkeypatch, node_boot_attempt)
-    with _take(store, take_flock=True, lock_path=store.lock, release_deadline_ns=2**62) as snap:
+    with _take(store, take_flock=True, lock_path=store.lock, **_locked()) as snap:
         assert isinstance(snap, WalSnapshot)
     assert [name for name, _ in outcomes] == ["held"] and outcomes[0][1] < 1.0
     node_boot_attempt()
@@ -792,8 +818,8 @@ def test_deadline_already_past_never_copies(store: Store, open_spy: list[Any]) -
     conn = _writer(store.db)
     failure = _failure(
         store,
-        release_deadline_ns=_FIXED_TIME_NS - 1,
-        clock_ns=lambda: _FIXED_TIME_NS,
+        release_deadline_ns=_T0 - 1,
+        clock_ns=lambda: _T0,
     )
     assert failure.reason is REASON.DEADLINE
     assert not [c for c in open_spy if c[1] & os.O_EXCL]
@@ -1009,4 +1035,187 @@ def test_module_declares_no_shell_or_network_imports() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("breezy")
     }
-    assert internal <= {"breezy.runtime.autonomy_sandbox.binds"}
+    assert internal <= {
+        "breezy.runtime.autonomy_sandbox.binds",
+        "breezy.persistence.autonomy",  # the lazy ``pins`` import for the deadline floor
+    }
+
+
+# --- B10 rulings (WP-B3 security review) ------------------------------------------
+
+
+_HOLDERS: list[int] = []
+
+
+def _scenario_deadline(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    now = [_T0]
+    _after_copy(mp, lambda: now.__setitem__(0, _launch_ns()))
+    return {"clock_ns": lambda: now[0], "release_deadline_ns": _launch_ns() - 120 * 10**9}
+
+
+def _scenario_unstable(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+
+    def grow() -> None:
+        store.db.write_bytes(store.db.read_bytes() + b"\0")
+
+    _after_copy(mp, grow)
+    return {**_locked(), "sleep": lambda _s: None}
+
+
+def _scenario_copy_error(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    def enospc(fd: int, data: Any) -> int:
+        raise OSError(errno.ENOSPC, "no space")
+
+    mp.setattr(os, "write", enospc)
+    return _locked()
+
+
+def _scenario_quick_check(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    store.db.unlink()
+    for suffix in ("-wal", "-shm"):
+        store.sidecar(suffix).unlink(missing_ok=True)
+    conn = sqlite3.connect(store.db, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+    for index in range(400):
+        conn.execute("INSERT INTO t(v) VALUES (?)", (f"row{index}" + "y" * 100,))
+    conn.close()
+    with store.db.open("r+b") as handle:
+        handle.seek(4096 * 2)
+        handle.write(b"\xff" * 2048)
+    return _locked()
+
+
+def _scenario_source_invalid(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    for suffix in ("", "-wal", "-shm"):
+        store.sidecar(suffix).unlink(missing_ok=True)
+    return _locked()
+
+
+def _scenario_cache_mode(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    store.cache.chmod(0o755)
+    return _locked()
+
+
+def _scenario_cache_busy(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    holder = os.open(store.cache, os.O_RDONLY | os.O_DIRECTORY)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    _HOLDERS.append(holder)
+    return _locked()
+
+
+def _scenario_lock_path(store: Store, mp: pytest.MonkeyPatch) -> dict[str, Any]:
+    return {**_locked(), "lock_path": store.state / "other.lock"}
+
+
+@pytest.mark.parametrize(
+    ("scenario", "reason"),
+    [
+        (_scenario_deadline, REASON.DEADLINE),
+        (_scenario_unstable, REASON.FINGERPRINT_UNSTABLE),
+        (_scenario_copy_error, REASON.COPY_ERROR),
+        (_scenario_quick_check, REASON.QUICK_CHECK),
+        (_scenario_source_invalid, REASON.SOURCE_INVALID),
+        (_scenario_cache_mode, REASON.CACHE_DIR_MODE),
+        (_scenario_cache_busy, REASON.CACHE_BUSY),
+        (_scenario_lock_path, REASON.LOCK_PATH_INVALID),
+    ],
+    ids=lambda v: getattr(v, "__name__", None) or str(v),
+)
+def test_intent_flock_is_released_before_a_failure_is_yielded(
+    store: Store, monkeypatch: pytest.MonkeyPatch, scenario: Any, reason: Any
+) -> None:
+    """B10-R1 (H-1): inside the ``with`` body the intent flock is already free, for every reason
+    reachable with the lock file present (LOCK_HELD, LOCK_ERROR and LOCK_FILE_MISSING have no
+    free lock to observe: another holder, an unreadable file, no file)."""
+    conn = _writer(store.db)
+    try:
+        kwargs = {"take_flock": True, "lock_path": store.lock, **scenario(store, monkeypatch)}
+        with _take(store, **kwargs) as outcome:
+            assert isinstance(outcome, SnapshotReadFailure) and outcome.reason is reason, outcome
+            assert outcome.advisory is False
+            assert _is_held(store.lock) is False
+    finally:
+        while _HOLDERS:
+            os.close(_HOLDERS.pop())
+        conn.close()
+
+
+def test_intent_flock_is_free_inside_the_with_body_after_success(store: Store) -> None:
+    conn = _writer(store.db)
+    with _take(store, take_flock=True, lock_path=store.lock, **_locked()) as snap:
+        assert isinstance(snap, WalSnapshot)
+        assert _is_held(store.lock) is False
+    conn.close()
+
+
+def test_copy_loop_checks_the_deadline_after_every_chunk(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B10-R2 (M-1): a deadline passing mid-copy aborts before the remaining chunks are read."""
+    conn = _writer(store.db, rows=40)
+    monkeypatch.setattr(ws, "_COPY_CHUNK", 1024)
+    reads: list[int] = []
+    real_read = os.read
+
+    def counting_read(fd: int, n: int) -> bytes:
+        reads.append(n)
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "read", counting_read)
+    deadline = _launch_ns() - 120 * 10**9
+    clock = lambda: deadline + 1 if len(reads) >= 2 else _T0
+    failure = _failure(
+        store, take_flock=True, lock_path=store.lock, release_deadline_ns=deadline, clock_ns=clock
+    )
+    assert failure.reason is REASON.DEADLINE
+    assert len(reads) <= 3, len(reads)
+    assert _is_held(store.lock) is False
+    conn.close()
+
+
+def test_release_deadline_later_than_launch_minus_120s_is_refused(store: Store) -> None:
+    """B10-R2 (L-2): the deadline is validated against the pins launch instant minus 120 s."""
+    floor = _launch_ns() - 120 * 10**9
+    for deadline in (floor + 1, _launch_ns(), _launch_ns() + 10**9):
+        with (
+            pytest.raises(ValueError, match="release_deadline_ns"),
+            _take(store, release_deadline_ns=deadline, clock_ns=lambda: _T0),
+        ):
+            pass
+    _writer(store.db).close()
+    outcome, _ = _result(store, release_deadline_ns=floor, clock_ns=lambda: _T0)
+    assert isinstance(outcome, WalSnapshot)
+
+
+def test_release_deadline_floor_follows_the_pins_schedule(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _writer(store.db).close()
+    deadline = _launch_ns() - 120 * 10**9  # valid under the real 16:50
+    monkeypatch.setattr(pins, "SCHEDULE_LAUNCH_UTC", "16:30")
+    with (
+        pytest.raises(ValueError, match="release_deadline_ns"),
+        _take(store, release_deadline_ns=deadline, clock_ns=lambda: _T0),
+    ):
+        pass
+
+
+def test_recovery_connects_through_proc_self_fd(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B10-R4 (L-1): the read-write recovery connection is opened via the snap dir's fd."""
+    conn = _writer(store.db)
+    seen: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spying_connect(*args: Any, **kwargs: Any) -> Any:
+        seen.append(str(args[0]))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spying_connect)
+    outcome, values = _result(store)
+    assert isinstance(outcome, WalSnapshot) and len(values) == 5
+    rw = [path for path in seen if not path.startswith("file:")]
+    assert len(rw) == 1 and re.fullmatch(r"/proc/self/fd/\d+/" + EXEC_STORE_FILENAME, rw[0]), rw
+    conn.close()

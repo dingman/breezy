@@ -12,17 +12,18 @@ This file is a member of ``BWRAP_HOST_TEST_FILES``; its test count is part of
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sqlite3
 import sys
 import textwrap
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from breezy.persistence.autonomy import pins
 from breezy.runtime.autonomy_sandbox.table import SandboxRoots
 from tests.support.bwrap_harness import (
     CHILD_ROOTS_PRELUDE,
@@ -85,6 +86,9 @@ cache = roots.data_root / "cache" / "autonomy_selftest"
 state = roots.data_root / "state"
 before = sorted(os.listdir(state))
 kwargs = json.loads(sys.argv[2])
+clock0 = kwargs.pop("clock0", None)
+if clock0 is not None:
+    kwargs["clock_ns"] = lambda: clock0
 with exec_snapshot(cache_dir=cache, data_root=roots.data_root, **kwargs) as snap:
     if isinstance(snap, WalSnapshot):
         conn = connect_snapshot_readonly(snap)
@@ -147,7 +151,14 @@ def test_take_flock_true_under_bwrap_readonly_lock(roots: SandboxRoots) -> None:
     conn = _wal_db_with_sidecars(roots)
     lock = roots.data_root / "state" / LOCK_NAME
     before = (lock.stat().st_ino, lock.stat().st_mtime_ns, lock.stat().st_size)
-    report = _snapshot(roots, take_flock=True, release_deadline_ns=time.time_ns() + 60 * 10**9)
+    hour, minute = (int(part) for part in pins.SCHEDULE_LAUNCH_UTC.split(":"))
+    launch_ns = int(dt.datetime(2026, 10, 1, hour, minute, tzinfo=dt.UTC).timestamp()) * 10**9
+    report = _snapshot(
+        roots,
+        take_flock=True,
+        release_deadline_ns=launch_ns - 120 * 10**9,
+        clock0=launch_ns - 50 * 60 * 10**9,
+    )
     conn.close()
     assert report["kind"] == "snapshot", report
     assert report["took_flock"] is True and report["advisory"] is False
