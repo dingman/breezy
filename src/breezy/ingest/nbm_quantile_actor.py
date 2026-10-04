@@ -101,6 +101,13 @@ from breezy.ingest.nbm_quantile_transport import (
 )
 from breezy.persistence.autonomy.canonical import canonical_json, sha256_hex
 from breezy.persistence.autonomy.paths import default_data_root
+from breezy.persistence.autonomy.single_read import (
+    SingleReadRefused,
+    WriteOutcome,
+    ensure_dir,
+    open_root,
+    write_once,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +180,8 @@ _HEAL_WRITER_ID: Final[str] = "nbm_quantile_actor"
 _HEAL_RECORD_MODE: Final[int] = 0o444
 _HEAL_DIR_MODE: Final[int] = 0o700
 _NS_PER_DAY: Final[int] = 24 * _SECONDS_PER_HOUR * _NS_PER_SECOND
+#: `_missed_alerted` keeps a rolling window this long (WP4-R3 L4).
+_MISSED_ALERT_WINDOW_NS: Final[int] = 8 * _NS_PER_DAY
 
 #: Duck-typed outbox seam: ``(event, severity, detail) -> delivered``. Ingest
 #: never imports the runtime outbox (layering); the composition root wires it.
@@ -303,7 +312,9 @@ class NbmQuantileActor(Actor):
         self._newest_complete_ns: int | None = None
         self._baseline_cycle_ns: int | None = None
         self._missed_alerted: set[int] = set()
-        self._pending_heal: tuple[int, int] | None = None  # (cycle_ns, detected_ns)
+        #: (cycle_ns, detected_ns) of the FIRST hang awaiting its heal; later resets
+        #: while one is pending are absorbed into it (one heal per outage, WP4-R3 L5).
+        self._pending_heal: tuple[int, int] | None = None
 
         self._inflight = 0
         self._inflight_lock = threading.Lock()
@@ -466,8 +477,10 @@ class NbmQuantileActor(Actor):
 
     def _offer_missed_cycle_alerts(self, now_ns: int) -> None:
         """CRITICAL `NBP_CYCLE_MISSED`, once per cycle, on the first fire past its deadline."""
+        floor_ns = now_ns - _MISSED_ALERT_WINDOW_NS
+        self._missed_alerted = {c for c in self._missed_alerted if c >= floor_ns}
         for cycle_ns in self.missed_cycles_list(now_ns):
-            if cycle_ns in self._missed_alerted:
+            if cycle_ns < floor_ns or cycle_ns in self._missed_alerted:
                 continue
             self._missed_alerted.add(cycle_ns)
             self.counters["cycle_missed_alert"] += 1
@@ -488,27 +501,42 @@ class NbmQuantileActor(Actor):
             logger.critical("NBM_NBP_ALERT_OFFER_RAISED event=%s", event, exc_info=True)
             return False
 
-    def _on_cycle_complete(self, cycle_ns: int) -> None:
-        """A cycle was published: it is the newest complete one; close any open heal."""
+    def _on_cycle_complete(self, cycle_ns: int) -> tuple[int, int] | None:
+        """A cycle was published: it is the newest complete one.
+
+        Returns the heal to record (detected_ns pair) when this closes a pending
+        hang, else None. Pure in-memory: the caller does the I/O off the loop.
+        """
         if self._newest_complete_ns is None or cycle_ns > self._newest_complete_ns:
             self._newest_complete_ns = cycle_ns
         pending = self._pending_heal
         if pending is None or cycle_ns < pending[0]:
-            return
+            return None
         self._pending_heal = None
+        return pending
+
+    async def _heal_off_loop(self, pending: tuple[int, int]) -> None:
+        """Record the heal and offer its alert in the default executor, never on the loop."""
+        loop = asyncio.get_running_loop()
+        healed_ns = self.clock.timestamp_ns()
         try:
-            self._record_heal(detected_ns=pending[1], healed_ns=self.clock.timestamp_ns())
+            await loop.run_in_executor(None, self._record_heal, pending[1], healed_ns)
         except Exception:
             self.counters["heal_record_failed"] += 1
             logger.critical("NBM_NBP_HEAL_RECORD_FAILED", exc_info=True)
 
-    def _heal_dir(self, healed_ns: int) -> Path:
+    def _heal_root(self) -> Path:
         root = self._evidence_root if self._evidence_root is not None else default_data_root()
-        day = dt.datetime.fromtimestamp(healed_ns / _NS_PER_SECOND, tz=dt.UTC).date()
-        return root / "evidence" / "capture" / "heal" / day.isoformat()
+        if not root.is_absolute() or root.resolve() != root:
+            raise ValueError(f"heal evidence root must be an absolute, symlink-free path: {root}")
+        return root
 
-    def _record_heal(self, *, detected_ns: int, healed_ns: int) -> None:
-        """Write the write-once heal record, THEN offer the INFO alert (plan r12 §3.7.2)."""
+    def _record_heal(self, detected_ns: int, healed_ns: int) -> None:
+        """Write the write-once heal record, THEN offer the INFO alert (plan r12 §3.7.2).
+
+        Runs in an executor thread. The write goes through seam A's `write_once`
+        (dir-fd anchored, nofollow, link-published, never overwritten).
+        """
         fields: dict[str, object] = {
             "unit": _HEAL_UNIT,
             "cause": "poll_hang",
@@ -520,20 +548,25 @@ class NbmQuantileActor(Actor):
             "alert": "offered" if self._alert_offer is not None else "undeliverable",
         }
         observation_sha256 = sha256_hex(canonical_json(fields))
-        record = {**fields, "observation_sha256": observation_sha256}
-        directory = self._heal_dir(healed_ns)
-        directory.mkdir(mode=_HEAL_DIR_MODE, parents=True, exist_ok=True)
-        path = directory / f"{healed_ns}_node_{_HEAL_WRITER_ID}.json"
+        data = canonical_json({**fields, "observation_sha256": observation_sha256}) + b"\n"
+        root = self._heal_root()
+        day = dt.datetime.fromtimestamp(healed_ns / _NS_PER_SECOND, tz=dt.UTC).date().isoformat()
+        rel = ("evidence", "capture", "heal", day)
+        path = root.joinpath(*rel, f"{healed_ns}_node_{_HEAL_WRITER_ID}.json")
+        rootfd = open_root(root)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _HEAL_RECORD_MODE)
-        except FileExistsError:
+            os.close(ensure_dir(rootfd, rel, mode=_HEAL_DIR_MODE))
+        finally:
+            os.close(rootfd)
+        try:
+            outcome = write_once(path, data, root=root, mode=_HEAL_RECORD_MODE)
+        except SingleReadRefused as exc:
             self.counters["heal_record_exists"] += 1
-            logger.critical("NBM_NBP_HEAL_RECORD_EXISTS path=%s (never overwritten)", path)
+            logger.critical("NBM_NBP_HEAL_RECORD_REFUSED reason=%s (never overwritten)", exc)
             return
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(canonical_json(record) + b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        if outcome is not WriteOutcome.WRITTEN:
+            self.counters["heal_record_exists"] += 1
+            return
         self.counters["heal_recorded"] += 1
         event = f"{_HEALED_EVENT_PREFIX}{observation_sha256}"
         detail = f"cause=poll_hang action=poll_reset healed_ns={healed_ns}"
@@ -659,7 +692,9 @@ class NbmQuantileActor(Actor):
             return
         self._fetched_cycles.add(cycle_ns)
         self._publish(result, lag_ns, cycle_ns=cycle_ns)
-        self._on_cycle_complete(cycle_ns)
+        pending_heal = self._on_cycle_complete(cycle_ns)
+        if pending_heal is not None:
+            await self._heal_off_loop(pending_heal)
 
     def _measured_lag_ns(self, result: NbmQuantileFetchResult, cycle_ns: int) -> int | None:
         """The MEASURED publication lag, or `None` when it cannot be trusted.

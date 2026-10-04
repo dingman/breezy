@@ -611,13 +611,22 @@ async def _settle_loop() -> None:
         await asyncio.sleep(0)
 
 
+async def _drain_slow(harness: Harness) -> None:
+    """Like `Harness.drain`, but yields real time: the heal runs in an executor thread."""
+    for _ in range(2_000):
+        if harness.actor.inflight == 0:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("actor still has work in flight")
+
+
 async def _hang_then_reset(harness: Harness) -> None:
     """Start with a hung first poll, then fire the timer past the hang threshold."""
     harness.actor.start()
     await _settle_loop()
     harness.clock.set_time(NOW_NS + HANG_S * NS)
     harness.actor.on_cycle_timer(event=object())
-    await harness.drain()
+    await _drain_slow(harness)
 
 
 def _heal_files(root: Path) -> list[Path]:
@@ -666,7 +675,7 @@ async def test_poll_hang_is_cancelled_and_reset_after_threshold(
     harness.clock.set_time(NOW_NS + HANG_S * NS)
     with caplog.at_level(logging.INFO):
         harness.actor.on_cycle_timer(event=object())
-        await harness.drain()
+        await _drain_slow(harness)
 
     assert hung.cancelled()
     assert harness.actor.counters["poll_hang_reset"] == 1
@@ -891,3 +900,88 @@ async def test_actor_without_alert_offer_constructs_unchanged() -> None:
 
     assert harness.actor.counters["task_death"] == 0
     assert harness.actor.counters["cycle_missed_unoffered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# AUT-1 WP4-R3 (python review): heal write via single_read.write_once, off the loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heal_record_through_a_symlinked_day_dir_is_refused(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    heal_parent = tmp_path / "evidence" / "capture" / "heal"
+    heal_parent.mkdir(parents=True)
+    (heal_parent / "2026-09-28").symlink_to(elsewhere, target_is_directory=True)
+    offer = OfferRecorder()
+    harness = build_aut1(fetcher_cls=HangFirstFetcher, alert_offer=offer, evidence_root=tmp_path)
+    with caplog.at_level(logging.CRITICAL):
+        await _hang_then_reset(harness)
+
+    assert list(elsewhere.iterdir()) == [], "nothing is written through the symlink"
+    assert offer.calls == []
+    assert harness.actor.counters["heal_record_failed"] == 1
+    assert len(harness.published) > 0
+
+
+@pytest.mark.asyncio
+async def test_heal_write_and_offer_run_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from breezy.ingest import nbm_quantile_actor as module
+    from breezy.persistence.autonomy import single_read
+
+    loop_thread = threading.get_ident()
+    seen: dict[str, int] = {}
+    real_write_once = single_read.write_once
+
+    def spy_write_once(*args: Any, **kwargs: Any) -> Any:
+        seen["write"] = threading.get_ident()
+        return real_write_once(*args, **kwargs)
+
+    monkeypatch.setattr(module, "write_once", spy_write_once)
+
+    class ThreadOffer(OfferRecorder):
+        def __call__(self, event: str, severity: str, detail: str) -> bool:
+            seen["offer"] = threading.get_ident()
+            return super().__call__(event, severity, detail)
+
+    harness = build_aut1(
+        fetcher_cls=HangFirstFetcher, alert_offer=ThreadOffer(), evidence_root=tmp_path
+    )
+    await _hang_then_reset(harness)
+
+    assert set(seen) == {"write", "offer"}
+    assert seen["write"] != loop_thread
+    assert seen["offer"] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_poll_in_flight_is_cleared_before_the_resubmitted_poll_runs(tmp_path: Path) -> None:
+    harness = build_aut1(fetcher_cls=HangFirstFetcher, evidence_root=tmp_path)
+    await _hang_then_reset(harness)
+
+    assert harness.actor.counters["poll_overlapped"] == 0
+    assert len(harness.fetcher.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_missed_alerted_is_bounded_to_a_rolling_eight_days() -> None:
+    offer = OfferRecorder()
+    start = CYCLE_NS + DEADLINE_NS + 60 * NS
+    harness = build_aut1(now_ns=start, raises=TransportError("down"), alert_offer=offer)
+    harness.actor.start()
+    await harness.drain()
+    harness.actor._offer_missed_cycle_alerts(start)
+    assert harness.actor._missed_alerted == {CYCLE_NS}
+
+    later = start + 9 * 24 * 3600 * NS
+    harness.actor._offer_missed_cycle_alerts(later)
+
+    assert CYCLE_NS not in harness.actor._missed_alerted
+    assert all(c >= later - 8 * 24 * 3600 * NS for c in harness.actor._missed_alerted)
