@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -700,10 +701,12 @@ def test_bwrap_host_expected_tests_equals_collected_count() -> None:
     result = _run_child(["--collect-only", "-q", *sorted(phase.BWRAP_HOST_TEST_FILES)])
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
-    assert (
-        f"{phase.BWRAP_HOST_EXPECTED_TESTS} tests collected" in combined
-        or f": {phase.BWRAP_HOST_EXPECTED_TESTS}" in combined
-    )
+    per_file = {
+        match.group(1): int(match.group(2))
+        for match in re.finditer(r"^(tests/\S+\.py): (\d+)$", combined, flags=re.MULTILINE)
+    }
+    assert set(per_file) == set(phase.BWRAP_HOST_TEST_FILES), combined
+    assert sum(per_file.values()) == phase.BWRAP_HOST_EXPECTED_TESTS, per_file
 
 
 def test_conftest_marker_set_unchanged_by_plugin() -> None:
