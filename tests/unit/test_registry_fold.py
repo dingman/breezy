@@ -109,6 +109,10 @@ class Chain:
             "ts_ns": ts,
             "transition_id": "a" * 64,
         }
+        if kind in (Kind.BOOTSTRAP, Kind.ROOT_ADMIT):  # a root names itself (E-14; A7b-R3)
+            base["lineage_root_family_id"] = family
+        elif kind is Kind.MINT:
+            base["lineage_root_family_id"] = INCUMBENT
         base.update(extra)
         draft = TransitionRow(**base)
         row = replace(draft, transition_id=draft.computed_transition_id())

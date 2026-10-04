@@ -1,7 +1,8 @@
 """ARCH-0 seam 7b: ``HWM_RESET`` ``carried_counters`` are floors (Z17, B9).
 
 A reset appends the counters of the rows it dropped, and the fold applies them as floors so that no
-budget is refunded: a counter becomes the larger of its fold so far and the carried value. The
+budget is refunded: an int becomes the larger of its fold so far and the carried value, a bool is
+ORed, and a list of instants is merged by sorted multiset union (A7b-R2, E-21). The
 shape of the object is the fold's to define (``fold_tallies``); a malformed object is
 ``FoldInvalid(carried_counters_malformed)`` whatever the clock. Whether a carried value is below
 the export's is validate's (B9, seams 7c and 7d), not tested here.
@@ -21,8 +22,8 @@ from breezy.persistence.autonomy.canonical import canonical_json
 from breezy.persistence.autonomy.schemas import FoldInvalidReason, State
 from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, OTHER, VENUE, at, run
 from tests.unit.test_registry_fold_tallies import (
+    DRILL_FIELDS,
     LATE,
-    LINEAGE_FIELDS,
     carried,
     lineage_of,
     nominate,
@@ -37,27 +38,54 @@ def test_carried_counters_are_floors() -> None:
     nominate(chain, CHILD, k=1, alpha="0.025")
     over = {
         "nominations": 3, "infeasible_nominations": 2, "alpha_spent": Decimal("0.04375"),
-        "mints": (5, 6, 7), "promotions": (8,), "rollbacks": 2, "terminal_frozen": True,
-        "drill_admits": 1, "drill_promotes": 1, "drill_demotes": 1, "drill_resumes": 1,
-        "drill_halts": 1, "drill_rollbacks": 1,
+        "nomination_instants": (1, 2), "mints": (5, 6, 7), "promotions": (8,),
+        "rollbacks": (9, 10), "model_resumes": (11,), "terminal_frozen": True,
+        "drill_admits": (12,), "drill_promotes": (13,), "drill_demotes": (14,),
+        "drill_resumes": (15,), "drill_halts": (16,), "drill_rollbacks": (17,),
     }  # fmt: skip
-    reset(chain, carried({INCUMBENT: over}, {"infra_resumes": 2, "drill_close_restores": 1}))
+    venue = {"infra_resumes": (18, 19), "drill_close_restores": (20,), "sender_changes": (21,)}
+    reset(chain, carried({INCUMBENT: over}, venue))
 
     result = run(chain, LATE)
     got = lineage_of(result)
+    nomination = chain.rows[3].ts_ns
 
     assert got["nominations"] == 3
     assert got["infeasible_nominations"] == 2
     assert got["alpha_spent"] == Decimal("0.04375")
-    assert got["mints"] == (5, 6, 7)  # the longer record wins; two mint rows are in the chain
+    assert got["nomination_instants"] == (1, 2, nomination)
+    assert got["mints"] == (5, 6, 7, chain.rows[1].ts_ns, chain.rows[2].ts_ns)
     assert got["promotions"] == (8,)
-    assert got["rollbacks"] == 2
+    assert got["rollbacks"] == (9, 10)
+    assert got["model_resumes"] == (11,)
     assert got["terminal_frozen"] is True
     assert view(result, INCUMBENT).terminal_frozen  # one lineage freeze, seen both ways
-    assert {k: got[k] for k in LINEAGE_FIELDS if k.startswith("drill_")} == {
-        k: 1 for k in LINEAGE_FIELDS if k.startswith("drill_")
+    assert {k: got[k] for k in DRILL_FIELDS} == {
+        k: (n,) for k, n in zip(DRILL_FIELDS, range(12, 18))
     }
-    assert result.venue_tallies == fm.VenueTallies(infra_resumes=2, drill_close_restores=1)
+    assert result.venue_tallies == fm.VenueTallies(
+        infra_resumes=(18, 19), drill_close_restores=(20,), sender_changes=(21,)
+    )
+
+
+def test_a_carry_of_older_instants_never_drops_the_folds_recent_ones() -> None:
+    chain = rooted()
+    mints = (chain.rows[1].ts_ns, chain.rows[2].ts_ns)
+    reset(chain, carried({INCUMBENT: {"mints": (1, 2, 3, 4)}}))  # longer, but all older
+
+    got = lineage_of(run(chain, LATE))
+
+    assert got["mints"] == (1, 2, 3, 4, *mints)  # a longer-list rule would lose both of these
+
+
+def test_the_union_keeps_each_instant_at_its_higher_multiplicity() -> None:
+    chain = rooted()
+    first, second = chain.rows[1].ts_ns, chain.rows[2].ts_ns
+    reset(chain, carried({INCUMBENT: {"mints": (5, first, first, first)}}))
+
+    got = lineage_of(run(chain, LATE))
+
+    assert got["mints"] == (5, first, first, first, second)  # carried x3 beats fold x1; second kept
 
 
 def test_a_carried_value_below_the_fold_refunds_nothing() -> None:
@@ -69,7 +97,8 @@ def test_a_carried_value_below_the_fold_refunds_nothing() -> None:
 
     assert got["nominations"] == 2
     assert got["alpha_spent"] == Decimal("0.0125")
-    assert len(got["mints"]) == 2  # carried () is shorter than the two mint rows
+    assert got["mints"] == (chain.rows[1].ts_ns, chain.rows[2].ts_ns)  # carried () drops nothing
+    assert len(got["nomination_instants"]) == 1
 
 
 def test_rows_after_the_reset_charge_on_top_of_the_floor() -> None:
@@ -127,9 +156,16 @@ BASE: Final = carried({INCUMBENT: {"nominations": 1}})
     [
         _mutate(BASE, lambda o: o.pop("venue")),
         _mutate(BASE, lambda o: o.update(extra=1)),
-        _mutate(BASE, lambda o: o["venue"].update(infra_resumes=-1)),
-        _mutate(BASE, lambda o: o["venue"].update(infra_resumes=True)),
+        _mutate(BASE, lambda o: o["venue"].update(infra_resumes=[-1])),
+        _mutate(BASE, lambda o: o["venue"].update(infra_resumes=[True])),
+        _mutate(BASE, lambda o: o["venue"].update(infra_resumes=1)),
+        _mutate(BASE, lambda o: o["venue"].update(sender_changes=[2, 1])),
+        _mutate(BASE, lambda o: o["venue"].pop("sender_changes")),
         _mutate(BASE, lambda o: o["venue"].pop("drill_close_restores")),
+        _mutate(BASE, lambda o: o["lineages"][INCUMBENT].update(rollbacks=2)),
+        _mutate(BASE, lambda o: o["lineages"][INCUMBENT].update(drill_halts=[5, 4])),
+        _mutate(BASE, lambda o: o["lineages"][INCUMBENT].update(nomination_instants=[-1])),
+        _mutate(BASE, lambda o: o["lineages"][INCUMBENT].update(model_resumes=["1"])),
         _mutate(BASE, lambda o: o["lineages"][INCUMBENT].pop("rollbacks")),
         _mutate(BASE, lambda o: o["lineages"][INCUMBENT].update(surprise=1)),
         _mutate(BASE, lambda o: o["lineages"][INCUMBENT].update(nominations="1")),
@@ -146,7 +182,14 @@ BASE: Final = carried({INCUMBENT: {"nominations": 1}})
         "unknown_top_key",
         "negative_infra",
         "bool_infra",
+        "old_int_shape",
+        "unsorted_sender_changes",
+        "missing_sender_changes",
         "missing_close_restores",
+        "int_rollbacks",
+        "unsorted_drill_halts",
+        "negative_nomination_instant",
+        "string_model_resume",
         "missing_lineage_field",
         "unknown_lineage_field",
         "string_count",

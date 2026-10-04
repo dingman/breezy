@@ -46,24 +46,27 @@ Choices ARCH leaves open, fixed here (each pinned by a test):
   Becoming CHAMPION again clears it.
 * A drill episode ends at the first SUPERSEDE or DISPLACED of its child that takes effect, or at the
   child's RETIRE.
-* A lineage is named by the introducing row's ``lineage_root_family_id``, else the family itself.
-  A BOOTSTRAP or ROOT_ADMIT that names another family as its lineage root is ``FoldInvalid``
-  (``root_lineage_mismatch``, E-14); an absent column on a root kind means its own lineage.
-* Charging (tallies). A row is charged at its effective instant, so a pending, lapsed or voided
-  pair charges nothing. ``nominations`` is the largest ``k_life`` of a feasible SHADOW to CHALLENGER
-  PROMOTE, ``infeasible_nominations`` counts the infeasible ones and ``alpha_spent`` is the exact
-  sum of ``alpha_k``. ``mints`` and ``promotions`` hold effective instants (a PROMOTE head only;
-  ROOT_ADMIT, RESUME and the partners are no promotion). A ROLLBACK head that takes effect while a
-  drill episode is open is a ``drill_rollbacks`` charge, else ``rollbacks``. DRILL_ADMIT,
-  a DRILL_PROMOTE head and a DEMOTE or HALT of class DRILL charge ``drill_admits``,
-  ``drill_promotes``, ``drill_demotes`` and ``drill_halts``. A RESUME is charged to the class of the
-  family's standing DEMOTE or HALT (a ROLLBACK_FAILED one to its ``trigger_cause_class``):
-  RECOVERABLE_INFRA to ``VenueTallies.infra_resumes``, DRILL to ``drill_resumes``, RECOVERABLE_MODEL
-  to nothing (C5 lists no counter for it) and a RESUME with cause ``drill_close_restore`` only to
-  ``drill_close_restores``. ATTEST, SWAP_CANCEL, TARGET_INELIGIBLE and HWM_RESET charge nothing.
-* ``carried_counters`` (shape: ``fold_tallies``, which ARCH leaves open) is applied at the reset row
-  as floors: each counter becomes the larger of its fold so far and the carried value, and
-  ``terminal_frozen`` true freezes the lineage. A malformed object is
+* A lineage is named by the introducing row's ``lineage_root_family_id``, which every introducing
+  row must carry (A7b-R3): a BOOTSTRAP or ROOT_ADMIT must name itself and a MINT names its root.
+  Any other value, or none, is ``FoldInvalid(root_lineage_mismatch)`` (E-14 rule 3).
+* Charging (tallies; E-21: every windowed counter is a sorted tuple of effective instants). A row is
+  charged at its effective instant, so a pending, lapsed or voided pair charges nothing.
+  ``nominations`` is the largest ``k_life`` of a feasible SHADOW to CHALLENGER PROMOTE,
+  ``infeasible_nominations`` counts the infeasible ones, ``nomination_instants`` holds every
+  nomination and ``alpha_spent`` is the exact sum of ``alpha_k``. ``promotions`` are PROMOTE heads
+  and ``rollbacks`` ROLLBACK heads; a ROLLBACK that takes effect while a drill episode is open is a
+  ``drill_rollbacks`` charge instead. DRILL_ADMIT, a DRILL_PROMOTE head and a DEMOTE or HALT of
+  class DRILL charge ``drill_admits``, ``drill_promotes``, ``drill_demotes`` and ``drill_halts``.
+  A RESUME is charged to the class of the family's standing DEMOTE or HALT (a ROLLBACK_FAILED one
+  to its ``trigger_cause_class``): RECOVERABLE_INFRA to ``VenueTallies.infra_resumes``,
+  RECOVERABLE_MODEL to ``model_resumes``, DRILL to ``drill_resumes``; a RESUME with cause
+  ``drill_close_restore`` only to ``drill_close_restores``. ``VenueTallies.sender_changes`` holds
+  every Z3 logical change: a non-drill →CHAMPION head taking effect (PROMOTE, ROLLBACK, ROOT_ADMIT)
+  and every RESUME that is not a drill RESUME or a close restore. ATTEST, SWAP_CANCEL,
+  TARGET_INELIGIBLE and HWM_RESET charge nothing.
+* ``carried_counters`` (shape and merge: ``fold_tallies``) is applied at the reset row so that no
+  budget is refunded (A7b-R2): ints by max, bools by OR, instant lists by sorted multiset union,
+  and ``terminal_frozen`` true freezes the lineage. A malformed object is
   ``FoldInvalid(carried_counters_malformed)``, whatever the clock. A carried lineage with no
   families left keeps its tallies.
 * ``halted_since_ns`` is the effective instant of the row that moved the family into HALTED and is
@@ -476,13 +479,13 @@ class _Accumulator:
             self._close_episode(family, instant)
         elif kind is Kind.DRILL_ADMIT:
             self.drill_children.add(family)
-            self.book.bump(family, "drill_admits")
+            self.book.charge(family, "drill_admits", instant)
         elif kind is Kind.MINT:
-            self.book.mint(family, instant)
+            self.book.charge(family, "mints", instant)
         elif kind in (Kind.DEMOTE, Kind.HALT):
             self._halt(instant, row)
         elif kind is Kind.RESUME:
-            self._charge_resume(row)
+            self._charge_resume(instant, row)
         elif kind is Kind.RETIRE:
             self._close_episode(family, instant)
             if row.cause_code is CauseCode.MODEL_BUDGET_EXHAUSTED:
@@ -497,6 +500,7 @@ class _Accumulator:
         if _is_nomination(row):
             self.book.nomination(
                 family,
+                instant,
                 feasible=row.nomination_feasible,
                 k_life=row.k_life,
                 alpha_k=row.alpha_k,
@@ -505,25 +509,35 @@ class _Accumulator:
     def _take_champion(self, instant: int, row: TransitionRow) -> None:
         family = row.family_id
         self.rollback_eligible.discard(family)
-        if row.kind is Kind.PROMOTE:
-            self.book.promotion(family, instant)
-        elif row.kind is Kind.DRILL_PROMOTE:
+        if row.kind is Kind.DRILL_PROMOTE:
             self.drill_children.add(family)
             self.episodes.append(_OpenEpisode(family, instant, row.transition_id))
-            self.book.bump(family, "drill_promotes")
+            self.book.charge(family, "drill_promotes", instant)
+            return
+        if row.kind is Kind.ROLLBACK and any(e.end_ns is None for e in self.episodes):
+            self.book.charge(family, "drill_rollbacks", instant)  # closes a drill episode
+            return
+        if row.kind is Kind.PROMOTE:
+            self.book.charge(family, "promotions", instant)
         elif row.kind is Kind.ROLLBACK:
-            drill = any(episode.end_ns is None for episode in self.episodes)
-            self.book.bump(family, "drill_rollbacks" if drill else "rollbacks")
+            self.book.charge(family, "rollbacks", instant)
+        self.book.charge_venue("sender_changes", instant)  # PROMOTE, ROLLBACK, ROOT_ADMIT (Z3)
 
-    def _charge_resume(self, row: TransitionRow) -> None:
-        """Charge a RESUME to the budget of its own cause class (Z3, Z10, E-5)."""
-        cls = self.standing_class.pop(row.family_id, None)
+    def _charge_resume(self, instant: int, row: TransitionRow) -> None:
+        """Charge a RESUME to the budget of its own cause class (Z3, Z10, E-5, E-21)."""
+        family = row.family_id
+        cls = self.standing_class.pop(family, None)
         if row.cause_code is CauseCode.DRILL_CLOSE_RESTORE:
-            self.book.bump_venue("drill_close_restores")
-        elif cls is CauseClass.RECOVERABLE_INFRA:
-            self.book.bump_venue("infra_resumes")
-        elif cls is CauseClass.DRILL:
-            self.book.bump(row.family_id, "drill_resumes")
+            self.book.charge_venue("drill_close_restores", instant)
+            return
+        if cls is CauseClass.DRILL:
+            self.book.charge(family, "drill_resumes", instant)
+            return
+        if cls is CauseClass.RECOVERABLE_INFRA:
+            self.book.charge_venue("infra_resumes", instant)
+        elif cls is CauseClass.RECOVERABLE_MODEL:
+            self.book.charge(family, "model_resumes", instant)
+        self.book.charge_venue("sender_changes", instant)
 
     def _apply_floors(self, row: TransitionRow) -> None:
         carried = self.carried.get(row.transition_id)
@@ -544,7 +558,8 @@ class _Accumulator:
             row.trigger_cause_class if cls is CauseClass.ROLLBACK_FAILED else cls
         )
         if cls is CauseClass.DRILL:
-            self.book.bump(family, "drill_halts" if row.kind is Kind.HALT else "drill_demotes")
+            counter = "drill_halts" if row.kind is Kind.HALT else "drill_demotes"
+            self.book.charge(family, counter, instant)
         if cls is CauseClass.TERMINAL:
             self._freeze_lineage(family)
         if cls is CauseClass.INTEGRITY or row.cause_code is CauseCode.INFRA_BUDGET_EXHAUSTED:
@@ -606,13 +621,22 @@ class _Accumulator:
 
 
 def _introduction(row: TransitionRow) -> tuple[Origin, str] | FoldInvalidReason:
-    """The origin and lineage root a family's first row gives it, or why the chain is invalid."""
-    if row.kind is Kind.MINT:
-        return Origin.CHILD, row.lineage_root_family_id or row.family_id
+    """The origin and lineage root a family's first row gives it, or why the chain is invalid.
+
+    Every introducing row names its lineage root (E-14 rule 3, A7b-R3): a root names itself and a
+    MINT child names the root it descends from. An absent column is as invalid as a foreign one.
+    """
+    root = row.lineage_root_family_id
+    if row.kind is Kind.MINT and root is not None:
+        return Origin.CHILD, root
     if row.kind in _ROOT_KINDS:
-        if row.lineage_root_family_id not in (None, row.family_id):
-            return FoldInvalidReason.ROOT_LINEAGE_MISMATCH
-        return Origin.ROOT, row.family_id
+        return (
+            (Origin.ROOT, root)
+            if root == row.family_id
+            else FoldInvalidReason.ROOT_LINEAGE_MISMATCH
+        )
+    if row.kind is Kind.MINT:
+        return FoldInvalidReason.ROOT_LINEAGE_MISMATCH
     return FoldInvalidReason.FAMILY_INTRODUCED_BY_OTHER_KIND
 
 

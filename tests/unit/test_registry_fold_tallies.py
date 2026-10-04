@@ -65,16 +65,19 @@ ARCH_FILE: Final = (
     / "docs/plans/backlog/AUTONOMY_2026-10-03/AUTONOMY_ARCHITECTURE.md"
 )
 LINEAGE_FIELDS: Final = (
-    "nominations", "infeasible_nominations", "alpha_spent", "mints", "promotions", "rollbacks",
-    "terminal_frozen", "drill_admits", "drill_promotes", "drill_demotes", "drill_resumes",
-    "drill_halts", "drill_rollbacks",
+    "nominations", "infeasible_nominations", "nomination_instants", "alpha_spent", "mints",
+    "promotions", "rollbacks", "model_resumes", "terminal_frozen", "drill_admits",
+    "drill_promotes", "drill_demotes", "drill_resumes", "drill_halts", "drill_rollbacks",
 )  # fmt: skip
+VENUE_FIELDS: Final = ("infra_resumes", "drill_close_restores", "sender_changes")
+SCALAR_FIELDS: Final = ("nominations", "infeasible_nominations", "alpha_spent", "terminal_frozen")
+TUPLE_FIELDS: Final = tuple(f for f in LINEAGE_FIELDS if f not in SCALAR_FIELDS)
+DRILL_FIELDS: Final = tuple(f for f in LINEAGE_FIELDS if f.startswith("drill_"))
 ZERO_LINEAGE: Final[dict[str, Any]] = {
-    "nominations": 0, "infeasible_nominations": 0, "alpha_spent": Decimal(0), "mints": (),
-    "promotions": (), "rollbacks": 0, "terminal_frozen": False, "drill_admits": 0,
-    "drill_promotes": 0, "drill_demotes": 0, "drill_resumes": 0, "drill_halts": 0,
-    "drill_rollbacks": 0,
+    **dict.fromkeys(TUPLE_FIELDS, ()), "nominations": 0, "infeasible_nominations": 0,
+    "alpha_spent": Decimal(0), "terminal_frozen": False,
 }  # fmt: skip
+NEXT_LAUNCH = at(NEXT_DAY, "16:50")
 
 
 def lineage_of(result: fm.FoldResult, root: str = INCUMBENT) -> dict[str, Any]:
@@ -106,7 +109,7 @@ def nominate(
 
 
 def carried(
-    lineages: dict[str, dict[str, Any]] | None = None, venue: dict[str, int] | None = None
+    lineages: dict[str, dict[str, Any]] | None = None, venue: dict[str, Any] | None = None
 ) -> str:
     """Canonical text of a ``carried_counters`` object (the shape 7b fixes)."""
     full = {
@@ -116,7 +119,10 @@ def carried(
         }
         for root, over in (lineages or {}).items()
     }
-    venue_part = {"infra_resumes": 0, "drill_close_restores": 0, **(venue or {})}
+    venue_part = {
+        **{k: [] for k in VENUE_FIELDS},
+        **{k: _wire(v) for k, v in (venue or {}).items()},
+    }
     return canonical_json({"lineages": full, "venue": venue_part}).decode("utf-8")
 
 
@@ -183,17 +189,19 @@ def test_root_kind_with_foreign_lineage_root_is_invalid(kind: Kind) -> None:
     )
 
 
-def test_a_root_kind_without_a_lineage_column_is_its_own_lineage_and_a_mint_may_name_a_root() -> (
-    None
-):
+@pytest.mark.parametrize("kind", [Kind.MINT, Kind.BOOTSTRAP, Kind.ROOT_ADMIT])
+def test_an_introducing_row_without_a_lineage_column_is_invalid(kind: Kind) -> None:
     chain = Chain()
-    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT)
-    chain.add(Kind.MINT, State.SHADOW, family=CHILD, lineage_root_family_id=INCUMBENT)
+    chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT, lineage_root_family_id=INCUMBENT)
+    chain.add(
+        kind, State.SHADOW if kind is Kind.MINT else State.CHAMPION, family=CHILD,
+        lineage_root_family_id=None,
+        effective_launch_date=DAY if kind is Kind.ROOT_ADMIT else None,
+    )  # fmt: skip
 
-    result = run(chain, LATE)
-
-    assert view(result, INCUMBENT).origin is fm.Origin.ROOT
-    assert view(result, INCUMBENT).lineage_root_family_id == INCUMBENT
+    assert fm.fold(chain.rows, VENUE, LATE) == fm.FoldInvalid(
+        FoldInvalidReason.ROOT_LINEAGE_MISMATCH
+    )  # E-14 rule 3 (A7b-R3)
 
 
 def test_the_first_invalid_row_in_chain_order_names_the_reason() -> None:
@@ -224,12 +232,18 @@ def test_lineage_tallies_fields_equal_arch_counters_minus_non_derivable() -> Non
     venue = {f.name for f in fields(fm.VenueTallies)}
 
     assert tuple(f.name for f in fields(fm.LineageTallies)) == LINEAGE_FIELDS
-    assert venue == {"infra_resumes", "drill_close_restores"}
-    expected = (arch_counter_names() - non_derivable) | {
-        "drill_close_restores"
-    }  # E-5 adds the last
+    assert venue == set(VENUE_FIELDS)
+    added = {"drill_close_restores", "nomination_instants", "model_resumes", "sender_changes"}
+    expected = (arch_counter_names() - non_derivable) | added  # E-5 and E-21 add these
     assert lineage | venue == expected
     assert not (lineage | venue) & non_derivable
+    scalars = {
+        f.name
+        for f in fields(fm.LineageTallies)
+        if not isinstance(getattr(fm.LineageTallies(), f.name), tuple)
+    }
+    assert scalars == set(SCALAR_FIELDS)  # E-21: every windowed counter is a tuple of instants
+    assert all(isinstance(getattr(fm.VenueTallies(), n), tuple) for n in VENUE_FIELDS)
 
 
 def test_tallies_are_frozen_and_the_result_carries_one_per_lineage() -> None:
@@ -245,33 +259,35 @@ def test_tallies_are_frozen_and_the_result_carries_one_per_lineage() -> None:
         result.lineages[INCUMBENT].tallies.nominations = 9  # type: ignore[misc]
     with pytest.raises(TypeError):
         result.lineages["x"] = result.lineages[INCUMBENT]  # type: ignore[index]
-    assert result.venue_tallies == fm.VenueTallies(infra_resumes=0, drill_close_restores=0)
+    assert result.venue_tallies == fm.VenueTallies()
 
 
 def test_an_empty_chain_has_no_lineages_and_zero_venue_tallies() -> None:
     result = run(Chain(), LATE)
 
     assert dict(result.lineages) == {}
-    assert result.venue_tallies == fm.VenueTallies(infra_resumes=0, drill_close_restores=0)
+    assert result.venue_tallies == fm.VenueTallies()
 
 
 # --- nominations, alpha and mints ------------------------------------------------------------
 
 
-def test_nominations_are_the_max_feasible_k_and_infeasible_ones_charge_no_alpha() -> None:
+def test_nominations_are_the_max_feasible_k_and_every_nomination_uses_a_slot() -> None:
     chain = rooted()
-    nominate(chain, CHILD, k=1, alpha="0.025")
-    nominate(chain, SECOND, k=4, alpha="0.003125")
+    first = nominate(chain, CHILD, k=1, alpha="0.025")
+    second = nominate(chain, SECOND, k=4, alpha="0.003125")
     chain.add(
         Kind.MINT, State.SHADOW, family="pm_us_crh_fq_v1_r0003", lineage_root_family_id=INCUMBENT
     )
-    nominate(chain, "pm_us_crh_fq_v1_r0003", k=4, alpha="0", feasible=False)
+    third = nominate(chain, "pm_us_crh_fq_v1_r0003", k=4, alpha="0", feasible=False)
 
     got = lineage_of(run(chain, LATE))
 
     assert got["nominations"] == 4  # the largest feasible k_life: neither 3 rows nor 2 feasible
     assert got["infeasible_nominations"] == 1
-    assert got["alpha_spent"] == Decimal("0.028125")  # the infeasible row adds nothing
+    assert got["nomination_instants"] == (first.ts_ns, second.ts_ns, third.ts_ns)  # E-21 slot
+    assert got["alpha_spent"] == Decimal("0.028125")  # the sum of alpha_k over the rows
+    assert got["promotions"] == ()  # a nomination is no sender change
 
 
 def test_tallies_alpha_spent_equals_sum_alpha_k() -> None:
@@ -284,6 +300,7 @@ def test_tallies_alpha_spent_equals_sum_alpha_k() -> None:
 
     assert isinstance(spent, Decimal)
     assert spent == sum((Decimal(a) for a in alphas), Decimal(0))
+    assert lineage_of(run(chain, LATE))["promotions"] == ()
 
 
 def test_alpha_spent_is_exact_beyond_the_default_decimal_precision() -> None:
@@ -305,17 +322,21 @@ def test_a_nomination_is_charged_when_the_clock_reaches_it() -> None:
     after = lineage_of(run(chain, nom.ts_ns))
 
     assert before["nominations"] == 0
+    assert before["nomination_instants"] == ()
     assert before["alpha_spent"] == 0
     assert after["nominations"] == 1
+    assert after["nomination_instants"] == (nom.ts_ns,)
+    assert after["promotions"] == ()
 
 
 def test_only_a_shadow_to_challenger_promote_is_a_nomination() -> None:
     chain, head, _tail = seeded_pair()
     chain.activate(head, ts=at(DAY, "16:45"))
 
-    got = lineage_of(run(chain, LATE), CHILD)
+    got = lineage_of(run(chain, LATE))
 
     assert got["nominations"] == 0  # the seed PROMOTE carries no nomination columns
+    assert got["nomination_instants"] == ()
     assert got["alpha_spent"] == 0
 
 
@@ -334,27 +355,19 @@ def test_mints_are_the_timestamps_of_mint_rows_per_lineage() -> None:
     assert lineage_of(run(chain, mint.ts_ns))["mints"] == (mint.ts_ns,)
 
 
-def test_a_mint_without_a_lineage_column_charges_its_own_lineage() -> None:
-    chain = Chain()
-    chain.add(Kind.MINT, State.SHADOW, family=CHILD)
-
-    result = run(chain, LATE)
-
-    assert lineage_of(result, CHILD)["mints"] == (chain.rows[0].ts_ns,)
-
-
 # --- promotions, rollbacks and the pair that never takes effect --------------------------------
 
 
 def test_an_effective_promote_pair_charges_one_promotion_at_launch() -> None:
     chain, _head, _tail = activated_pair()
 
-    assert lineage_of(run(chain, LAUNCH - 1), CHILD)["promotions"] == ()  # still pending
+    assert lineage_of(run(chain, LAUNCH - 1))["promotions"] == ()  # still pending
     effective = run(chain, LAUNCH)
 
-    assert lineage_of(effective, CHILD)["promotions"] == (LAUNCH,)  # the pair counts once
-    assert lineage_of(effective, CHILD)["rollbacks"] == 0
-    assert lineage_of(effective, INCUMBENT)["promotions"] == ()  # not charged to the outgoing
+    assert lineage_of(effective)["promotions"] == (LAUNCH,)  # the pair counts once
+    assert lineage_of(effective)["rollbacks"] == ()
+    assert effective.venue_tallies.sender_changes == (LAUNCH,)
+    assert run(chain, LAUNCH - 1).venue_tallies.sender_changes == ()
 
 
 def test_an_effective_rollback_pair_charges_one_rollback_at_launch() -> None:
@@ -369,11 +382,12 @@ def test_an_effective_rollback_pair_charges_one_rollback_at_launch() -> None:
     )  # fmt: skip
     chain.activate(back, ts=at(NEXT_DAY, "16:45"), family=INCUMBENT)
 
-    got = lineage_of(run(chain, NEXT_LATE), INCUMBENT)
+    got = lineage_of(run(chain, NEXT_LATE))
 
-    assert got["rollbacks"] == 1
-    assert got["promotions"] == ()
-    assert got["drill_rollbacks"] == 0
+    assert got["rollbacks"] == (NEXT_LAUNCH,)
+    assert got["promotions"] == (LAUNCH,)  # only the earlier PROMOTE: a rollback is no promotion
+    assert got["drill_rollbacks"] == ()
+    assert run(chain, NEXT_LATE).venue_tallies.sender_changes == (LAUNCH, NEXT_LAUNCH)
 
 
 def lapsed(chain: Chain, head: TransitionRow) -> None:
@@ -409,14 +423,13 @@ def test_lapsed_pair_never_charged(
     result = run(chain, at(NEXT_DAY, "00:00"))
 
     assert result.pairs[0].status in (fm.PairStatus.LAPSED, fm.PairStatus.VOIDED)
-    for root in (INCUMBENT, CHILD):
-        got = lineage_of(result, root)
-        assert got["promotions"] == ()
-        assert got["rollbacks"] == 0
-        assert got["drill_promotes"] == 0
-        assert got["drill_rollbacks"] == 0
+    got = lineage_of(result)  # every family descends from INCUMBENT
+    assert got["promotions"] == ()
+    assert got["rollbacks"] == ()
+    assert got["drill_promotes"] == ()
+    assert got["drill_rollbacks"] == ()
     assert dict(result.states) == {INCUMBENT: State.CHAMPION, CHILD: State.CHALLENGER}
-    assert result.venue_tallies == fm.VenueTallies(infra_resumes=0, drill_close_restores=0)
+    assert result.venue_tallies == fm.VenueTallies()
 
 
 def test_a_lapsed_pair_then_an_effective_pair_charges_only_the_effective_one() -> None:
@@ -431,12 +444,13 @@ def test_a_lapsed_pair_then_an_effective_pair_charges_only_the_effective_one() -
     )  # fmt: skip
     chain.activate(second, ts=at(NEXT_DAY, "16:45"))
 
-    got = lineage_of(run(chain, NEXT_LATE), CHILD)
+    got = lineage_of(run(chain, NEXT_LATE))
 
-    assert got["promotions"] == (at(NEXT_DAY, "16:50"),)
+    assert got["promotions"] == (NEXT_LAUNCH,)
+    assert run(chain, NEXT_LATE).venue_tallies.sender_changes == (NEXT_LAUNCH,)
 
 
-def test_root_admit_charges_no_promotion() -> None:
+def test_root_admit_is_a_sender_change_and_no_promotion() -> None:
     chain = Chain()
     root = chain.add(
         Kind.ROOT_ADMIT, State.CHAMPION, family=OTHER, lineage_root_family_id=OTHER,
@@ -448,6 +462,7 @@ def test_root_admit_charges_no_promotion() -> None:
 
     assert result.states[OTHER] is State.CHAMPION
     assert lineage_of(result, OTHER) == ZERO_LINEAGE
+    assert result.venue_tallies == fm.VenueTallies(sender_changes=(LAUNCH,))
 
 
 # --- drill budget ----------------------------------------------------------------------------
@@ -457,19 +472,21 @@ def test_drill_admit_charges_only_drill_budget() -> None:
     chain = drill_chain(admit=True)
     result = run(chain, LATE)
 
-    got = lineage_of(result, CHILD)
+    got = lineage_of(result)
 
-    assert got["drill_admits"] == 1
+    assert got["drill_admits"] == (chain.rows[2].ts_ns,)
     assert got["nominations"] == 0
     assert got["infeasible_nominations"] == 0
     assert got["alpha_spent"] == 0  # no alpha, no K_LIFETIME
+    assert got["nomination_instants"] == ()
     assert got["promotions"] == ()
-    assert got["rollbacks"] == 0
+    assert got["rollbacks"] == ()
+    assert got["model_resumes"] == ()
     assert got["mints"] == (chain.rows[1].ts_ns,)  # the MINT is a mint, the admit is not
-    assert {k: v for k, v in got.items() if k.startswith("drill_") and k != "drill_admits"} == {
-        k: 0 for k in LINEAGE_FIELDS if k.startswith("drill_") and k != "drill_admits"
+    assert {k: got[k] for k in DRILL_FIELDS if k != "drill_admits"} == {
+        k: () for k in DRILL_FIELDS if k != "drill_admits"
     }
-    assert result.venue_tallies == fm.VenueTallies(infra_resumes=0, drill_close_restores=0)
+    assert result.venue_tallies == fm.VenueTallies()
 
 
 def test_drill_episode_rows_charge_only_the_drill_counters() -> None:
@@ -480,19 +497,18 @@ def test_drill_episode_rows_charge_only_the_drill_counters() -> None:
     )  # fmt: skip
     result = run(chain, at(NEXT_DAY, "21:00"))
 
-    child = lineage_of(result, CHILD)
-    incumbent = lineage_of(result, INCUMBENT)
+    child = incumbent = lineage_of(result)  # one lineage: the drill child descends from INCUMBENT
 
-    assert child["drill_promotes"] == 1
-    assert child["drill_demotes"] == 1
-    assert child["drill_resumes"] == 1
-    assert child["drill_halts"] == 1
-    assert incumbent["drill_rollbacks"] == 1  # the ROLLBACK that closed the episode
-    for got in (child, incumbent):
-        assert got["promotions"] == ()
-        assert got["rollbacks"] == 0
-        assert got["terminal_frozen"] is False
-    assert result.venue_tallies.infra_resumes == 0  # a DRILL resume never charges production
+    assert child["drill_promotes"] == (LAUNCH,)
+    assert child["drill_demotes"] == (at(DAY, "20:00"),)
+    assert child["drill_resumes"] == (at(NEXT_DAY, "16:45"),)
+    assert child["drill_halts"] == (at(NEXT_DAY, "20:00"),)
+    assert incumbent["drill_rollbacks"] == (NEXT_LAUNCH,)  # the ROLLBACK that closed the episode
+    assert child["promotions"] == ()
+    assert child["rollbacks"] == ()
+    assert child["model_resumes"] == ()
+    assert child["terminal_frozen"] is False
+    assert result.venue_tallies == fm.VenueTallies()  # no production counter, no sender change
 
 
 # --- RESUME is charged to the cause class of its halt -----------------------------------------
@@ -503,7 +519,7 @@ def halt_then_resume(
     *,
     trigger: CauseClass | None = None,
     resume_code: CauseCode | None = None,
-) -> fm.FoldResult:
+) -> tuple[fm.FoldResult, int]:
     chain = Chain()
     chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT, lineage_root_family_id=INCUMBENT)
     chain.add(
@@ -511,56 +527,62 @@ def halt_then_resume(
         cause_code=CauseCode.ROLLBACK_FAILED if trigger else CauseCode.VERDICT_FAIL,
         trigger_cause_class=trigger,
     )  # fmt: skip
-    chain.add(
+    resume = chain.add(
         Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED, cause_code=resume_code
     )
-    return run(chain, LATE)
+    return run(chain, LATE), resume.ts_ns
 
 
 @pytest.mark.parametrize(
-    ("cls", "trigger", "infra", "drill"),
+    ("cls", "trigger", "bucket"),
     [
-        (CauseClass.RECOVERABLE_INFRA, None, 1, 0),
-        (CauseClass.DRILL, None, 0, 1),
-        (CauseClass.RECOVERABLE_MODEL, None, 0, 0),  # ARCH C5 has no per-lineage model counter
-        (CauseClass.ROLLBACK_FAILED, CauseClass.RECOVERABLE_INFRA, 1, 0),
-        (CauseClass.ROLLBACK_FAILED, CauseClass.DRILL, 0, 1),
-        (CauseClass.ROLLBACK_FAILED, CauseClass.RECOVERABLE_MODEL, 0, 0),
-        (None, None, 0, 0),  # a halt with no class (7c/7d refuse it) charges nothing
+        (CauseClass.RECOVERABLE_INFRA, None, "infra"),
+        (CauseClass.DRILL, None, "drill"),
+        (CauseClass.RECOVERABLE_MODEL, None, "model"),
+        (CauseClass.ROLLBACK_FAILED, CauseClass.RECOVERABLE_INFRA, "infra"),
+        (CauseClass.ROLLBACK_FAILED, CauseClass.DRILL, "drill"),
+        (CauseClass.ROLLBACK_FAILED, CauseClass.RECOVERABLE_MODEL, "model"),
+        (None, None, "none"),  # a halt with no class (7c/7d refuse it): a sender change only
     ],
 )
 def test_resume_charges_the_budget_of_its_own_cause_class(
-    cls: CauseClass | None, trigger: CauseClass | None, infra: int, drill: int
+    cls: CauseClass | None, trigger: CauseClass | None, bucket: str
 ) -> None:
-    result = halt_then_resume(cls, trigger=trigger)
+    result, ts = halt_then_resume(cls, trigger=trigger)
+    got = lineage_of(result)
 
-    assert result.venue_tallies.infra_resumes == infra
-    assert lineage_of(result)["drill_resumes"] == drill
-    assert result.venue_tallies.drill_close_restores == 0
-    assert lineage_of(result)["promotions"] == ()
+    assert result.venue_tallies.infra_resumes == ((ts,) if bucket == "infra" else ())
+    assert got["drill_resumes"] == ((ts,) if bucket == "drill" else ())
+    assert got["model_resumes"] == ((ts,) if bucket == "model" else ())  # E-21: 14D budget
+    assert result.venue_tallies.sender_changes == (() if bucket == "drill" else (ts,))  # Z3
+    assert result.venue_tallies.drill_close_restores == ()
+    assert got["promotions"] == ()
 
 
 def test_a_drill_close_restore_charges_only_its_own_counter() -> None:
-    result = halt_then_resume(CauseClass.DRILL, resume_code=CauseCode.DRILL_CLOSE_RESTORE)
+    result, ts = halt_then_resume(CauseClass.DRILL, resume_code=CauseCode.DRILL_CLOSE_RESTORE)
 
-    assert result.venue_tallies == fm.VenueTallies(infra_resumes=0, drill_close_restores=1)
-    assert lineage_of(result)["drill_resumes"] == 0
+    assert result.venue_tallies == fm.VenueTallies(drill_close_restores=(ts,))
+    assert lineage_of(result)["drill_resumes"] == ()
+    assert lineage_of(result)["model_resumes"] == ()
 
 
 def test_a_second_halt_is_charged_to_its_own_class_not_the_first() -> None:
     chain = Chain()
     chain.add(Kind.BOOTSTRAP, State.CHAMPION, family=INCUMBENT, lineage_root_family_id=INCUMBENT)
+    resumes = []
     for cls in (CauseClass.DRILL, CauseClass.RECOVERABLE_INFRA):
         chain.add(
             Kind.HALT, State.HALTED, family=INCUMBENT, frm=State.CHAMPION, halt_cause_class=cls,
             cause_code=CauseCode.VERDICT_FAIL,
         )  # fmt: skip
-        chain.add(Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED)
+        row = chain.add(Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED)
+        resumes.append(row.ts_ns)
 
     result = run(chain, LATE)
 
-    assert lineage_of(result)["drill_resumes"] == 1
-    assert result.venue_tallies.infra_resumes == 1
+    assert lineage_of(result)["drill_resumes"] == (resumes[0],)
+    assert result.venue_tallies.infra_resumes == (resumes[1],)
 
 
 def test_resumes_are_charged_when_the_clock_reaches_them() -> None:
@@ -572,8 +594,8 @@ def test_resumes_are_charged_when_the_clock_reaches_them() -> None:
     )  # fmt: skip
     resume = chain.add(Kind.RESUME, State.CHAMPION, family=INCUMBENT, frm=State.HALTED)
 
-    assert run(chain, resume.ts_ns - 1).venue_tallies.infra_resumes == 0
-    assert run(chain, resume.ts_ns).venue_tallies.infra_resumes == 1
+    assert run(chain, resume.ts_ns - 1).venue_tallies.infra_resumes == ()
+    assert run(chain, resume.ts_ns).venue_tallies.infra_resumes == (resume.ts_ns,)
 
 
 # --- restrictive rows, TARGET_INELIGIBLE and the terminal freeze -------------------------------
@@ -596,8 +618,7 @@ def test_target_ineligible_never_counted_or_operator_cleared() -> None:
 
     assert view(after, INCUMBENT).target_ineligible  # the operator row did not clear it
     assert not view(before, INCUMBENT).target_ineligible
-    for root in (INCUMBENT, CHILD):
-        assert lineage_of(after, root) == lineage_of(before, root)
+    assert lineage_of(after) == lineage_of(before)
     assert after.venue_tallies == before.venue_tallies
 
 
