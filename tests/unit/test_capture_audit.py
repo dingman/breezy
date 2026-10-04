@@ -572,6 +572,24 @@ def test_the_run_sets_the_work_deadline_from_the_monotonic_clock(
     assert inputs.DEADLINE.get() is None  # reset after the run
 
 
+def test_delivery_send_accepts_prefixed_events() -> None:
+    """S3-R2, S3-R40: ``HEALED_``/``ABANDONED_`` events are not dict keys; they must still reach
+    ``offer`` (INFO and CRITICAL) and must not count as a failed delivery."""
+    offers = Offers()
+    delivery = audit._Delivery(offers)
+    delivery.send(f"CAPTURE_HEALED_{'ab' * 32}", "d=1")
+    delivery.send(f"CAPTURE_HEAL_ALERT_ABANDONED_{'cd' * 32}", "d=2")
+    assert delivery.failed == 0
+    assert [(c[0][-4:], c[1]) for c in offers.calls] == [("abab", "INFO"), ("cdcd", "CRITICAL")]
+
+
+def test_delivery_send_unknown_event_is_a_failed_delivery_not_a_crash() -> None:
+    offers = Offers()
+    delivery = audit._Delivery(offers)
+    delivery.send("NOT_AN_EVENT", "x")
+    assert delivery.failed == 1 and offers.calls == []
+
+
 def test_the_budget_is_the_unit_timeout_less_the_lock_wait_and_a_margin() -> None:
     assert AUDIT_WORK_BUDGET_S == 1500 - 600 - 60 == 840
 

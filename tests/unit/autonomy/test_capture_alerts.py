@@ -13,6 +13,7 @@ from breezy.persistence.autonomy.capture_alerts import (
     abandoned_alert_event,
     heal_alert_event,
     is_capture_alert_event,
+    severity_for,
 )
 
 SHA = "0123456789abcdef" * 4
@@ -113,3 +114,21 @@ def test_is_capture_alert_event_accepts_closed_and_prefixed_only() -> None:
     assert not is_capture_alert_event(f"CAPTURE_HEALED_{SHA.upper()}")
     assert not is_capture_alert_event("CAPTURE_HEALED_" + SHA[:10])
     assert not is_capture_alert_event("")
+
+
+def test_severity_for_healed_is_info_abandoned_critical() -> None:
+    assert severity_for(heal_alert_event(SHA)) == "INFO"
+    assert severity_for(abandoned_alert_event(SHA)) == "CRITICAL"
+    # the gap abandon key is also 64 hex (S3-R7)
+    assert severity_for(abandoned_alert_event(OTHER_SHA)) == "CRITICAL"
+
+
+def test_severity_for_closed_events_is_the_dict_value() -> None:
+    for event, severity in CAPTURE_ALERT_SEVERITIES.items():
+        assert severity_for(event) == severity
+
+
+@pytest.mark.parametrize("bad", ["", "CAPTURE_WRITE_FAILED", "CAPTURE_HEALED_abc", "NOPE"])
+def test_severity_for_unknown_event_raises(bad: str) -> None:
+    with pytest.raises(ValueError):
+        severity_for(bad)

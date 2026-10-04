@@ -84,7 +84,7 @@ from breezy.analysis.capture_settlement import (
     SettlementFileCorrupt,
     read_settlement_day,
 )
-from breezy.persistence.autonomy.capture_alerts import CAPTURE_ALERT_SEVERITIES
+from breezy.persistence.autonomy.capture_alerts import severity_for
 from breezy.persistence.autonomy.capture_epoch import read_epoch
 from breezy.persistence.autonomy.paths import AutonomyPaths, family_component
 from breezy.persistence.autonomy.pins import PRODUCER_SOURCE_SHA256
@@ -488,7 +488,7 @@ class _Delivery:
 
     def send(self, event: str, detail: str) -> None:
         try:
-            accepted = bool(self._offer(event, CAPTURE_ALERT_SEVERITIES[event], detail))
+            accepted = bool(self._offer(event, severity_for(event), detail))
         except Exception:  # noqa: BLE001 - an outbox failure is a failed delivery, not a crash
             accepted = False
         if not accepted:

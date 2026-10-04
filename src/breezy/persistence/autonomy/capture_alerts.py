@@ -22,6 +22,7 @@ __all__ = [
     "abandoned_alert_event",
     "heal_alert_event",
     "is_capture_alert_event",
+    "severity_for",
 ]
 
 CAPTURE_EVENT_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z0-9_]{1,96}$")
@@ -30,6 +31,7 @@ ABANDONED_EVENT_PREFIX: Final[str] = "CAPTURE_HEAL_ALERT_ABANDONED_"
 _SHA_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 _CRITICAL: Final[str] = "CRITICAL"
+_INFO: Final[str] = "INFO"
 _WARNING: Final[str] = "WARNING"
 
 #: event -> severity, per section 3.16. The tuple below is derived from it, so they cannot drift.
@@ -81,3 +83,14 @@ def is_capture_alert_event(event: str) -> bool:
         if event.startswith(prefix):
             return _SHA_RE.match(event[len(prefix) :]) is not None
     return False
+
+
+def severity_for(event: str) -> str:
+    """The severity of ``event``: INFO for ``CAPTURE_HEALED_<sha>``, CRITICAL for the abandoned
+    events, else the closed table's value. The prefixed events are not table keys, so a lookup by
+    key alone loses them (S3-R2, S3-R40). An event outside the catalogue raises ``ValueError``."""
+    if event in CAPTURE_ALERT_SEVERITIES:
+        return CAPTURE_ALERT_SEVERITIES[event]
+    if not is_capture_alert_event(event):
+        raise ValueError(f"not a capture alert event: {event!r}")
+    return _INFO if event.startswith(HEALED_EVENT_PREFIX) else _CRITICAL
