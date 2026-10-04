@@ -46,6 +46,11 @@ from breezy.persistence.autonomy.schemas import (
 from breezy.persistence.autonomy.wire import WireRefusalReason, WireRefused
 from breezy.runtime.trade_supervisor_core import CONTINUOUS_FAMILY_HALT_KEY_PREFIX
 from breezy.strategy.current_rung_hold import trial_day_latch
+from tests.support.autonomy_policy_scan import (
+    _dotted,
+    _import_aliases,
+    _with_assignment_aliases,
+)
 from tests.support.entry_points import SRC_DIR
 
 VENUE = "polymarket_us"
@@ -233,29 +238,55 @@ def test_hwm_unreadable_detail_is_a_closed_code() -> None:
     assert got.detail == WireRefusalReason.MALFORMED_JSON.value
 
 
+_HWM_ABSENT: Final = "breezy.persistence.autonomy.hwm.HwmAbsent"
+
+
+def _calls_hwm_absent(source: str, package: str = "breezy.persistence.autonomy") -> bool:
+    """True when a call resolves, through imports and assignment aliases, to ``HwmAbsent``."""
+    tree = ast.parse(source)
+    aliases = _with_assignment_aliases(tree, _import_aliases(tree, package))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        dotted = _dotted(node.func, aliases)
+        if dotted is not None and (dotted == _HWM_ABSENT or dotted.split(".")[-1] == "HwmAbsent"):
+            return True
+    return False
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "x = HwmAbsent()",
+        "x = hwm.HwmAbsent()",
+        "from breezy.persistence.autonomy.hwm import HwmAbsent as X\nx = X()",
+        "from breezy.persistence.autonomy import hwm as h\nx = h.HwmAbsent()",
+        "import breezy.persistence.autonomy.hwm as h\nx = h.HwmAbsent()",
+        "from breezy.persistence.autonomy.hwm import HwmAbsent\nY = HwmAbsent\nx = Y()",
+        "from .hwm import HwmAbsent as X\nx = X()",
+    ],
+)
+def test_hwm_absent_ban_resolves_aliases(planted: str) -> None:
+    assert _calls_hwm_absent(planted)
+
+
+def test_hwm_absent_ban_ignores_non_construction() -> None:
+    assert not _calls_hwm_absent("x = isinstance(r, HwmAbsent)")
+    assert not _calls_hwm_absent("from other import Thing as X\nx = X()")
+
+
 def test_hwm_absent_construction_only_in_hwm_module() -> None:
-    def calls_hwm_absent(source: str) -> bool:
-        return any(
-            isinstance(node, ast.Call)
-            and (
-                (isinstance(node.func, ast.Name) and node.func.id == "HwmAbsent")
-                or (isinstance(node.func, ast.Attribute) and node.func.attr == "HwmAbsent")
-            )
-            for node in ast.walk(ast.parse(source))
-        )
-
-    # Planted controls: a bare call and an attribute call are both seen.
-    assert calls_hwm_absent("x = HwmAbsent()")
-    assert calls_hwm_absent("x = hwm.HwmAbsent()")
-    assert not calls_hwm_absent("x = isinstance(r, HwmAbsent)")
-
     offenders = [
         str(path.relative_to(SRC_DIR))
         for path in sorted(SRC_DIR.rglob("*.py"))
-        if path != HWM_PATH and calls_hwm_absent(path.read_text(encoding="utf-8"))
+        if path != HWM_PATH
+        and _calls_hwm_absent(
+            path.read_text(encoding="utf-8"),
+            ".".join(path.relative_to(SRC_DIR).with_suffix("").parts[:-1]),
+        )
     ]
     assert offenders == []
-    assert calls_hwm_absent(HWM_PATH.read_text(encoding="utf-8"))
+    assert _calls_hwm_absent(HWM_PATH.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------------------------
