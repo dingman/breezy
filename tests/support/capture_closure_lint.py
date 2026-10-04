@@ -132,6 +132,15 @@ AUT1_WRITE_AUTHORITY: Final[tuple[AuthorityRow, ...]] = (
     _core("capture_schedule", min_calls=4),
     _core("capture_reader", min_calls=90),
     AuthorityRow("breezy.analysis.capture_forecast_ref", min_calls=6),
+    AuthorityRow("breezy.strategy.autonomy_capture.guarded_strategy", min_calls=80),
+    AuthorityRow("breezy.strategy.forecast_quantile_ladder.capture_adapter", min_calls=45),
+    AuthorityRow("breezy.strategy.forecast_quantile_ladder.plugin", min_calls=8),
+    AuthorityRow("breezy.adapters.polymarket_us.recorder_watchdog", min_calls=60),
+    AuthorityRow(
+        "breezy.runtime.capture_recorder_hook_cli",
+        writes=("_open_child_dir", "_write_once", "_atomic_replace", "_acquire_lock"),
+        min_calls=80,
+    ),
 )
 
 
