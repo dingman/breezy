@@ -250,3 +250,17 @@ def test_elond_imports_stdlib_decimal_and_pins_only() -> None:
                 ), module
             else:
                 assert module.split(".")[0] in allowed_stdlib, module
+
+
+def test_alpha_k_refuses_level_at_or_above_one() -> None:
+    with pytest.raises(ValueError, match=r"k=1.*R=30"):
+        elond.alpha_k(1, 30, "elond_heavy_tailed_v1", Decimal("0.05"))
+    # A huge R must be refused as a ValueError, never a decimal.InvalidOperation from quantize.
+    with pytest.raises(ValueError, match="level"):
+        elond.alpha_k(1, 10**17, "elond_heavy_tailed_v1", Decimal("0.05"))
+
+
+def test_alpha_k_allows_level_above_alpha_total_below_one() -> None:
+    alpha_total = Decimal("0.05")
+    level = elond.alpha_k(1, 1, "elond_heavy_tailed_v1", alpha_total)
+    assert alpha_total < level < Decimal(1)

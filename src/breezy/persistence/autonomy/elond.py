@@ -83,7 +83,8 @@ def _check_schedule(schedule: object) -> str:
 def alpha_k(k: int, promotions: int, schedule: str, alpha_total: Decimal) -> Decimal:
     """The level for the lineage's k-th nomination, floor-quantised to 1e-18.
 
-    ``promotions`` is R; ``halving_v1`` ignores it (it is the FWER schedule).
+    ``promotions`` is R; ``halving_v1`` ignores it (it is the FWER schedule). A computed level
+    >= 1 is refused (never clamped); e-LOND may legitimately exceed ``alpha_total`` below 1.
     """
     _check_int(k, "k")
     _check_int(promotions, "promotions")
@@ -101,6 +102,10 @@ def alpha_k(k: int, promotions: int, schedule: str, alpha_total: Decimal) -> Dec
     else:
         scaled = _CTX.multiply(alpha_total, gamma(k))
         raw = _CTX.multiply(scaled, Decimal(promotions + 1))
+    if raw >= _ONE:
+        raise ValueError(
+            f"alpha level for k={k}, R={promotions} is {raw} >= 1, not a valid test level"
+        )
     return raw.quantize(_QUANTUM, rounding=ROUND_FLOOR, context=_CTX)
 
 
