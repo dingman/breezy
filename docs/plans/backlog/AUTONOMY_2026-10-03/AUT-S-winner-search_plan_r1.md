@@ -357,3 +357,76 @@ Key files:
 - `/home/jon/breezy/scripts/analysis/nbp_shadow_parity_pure.py`
 - `/home/jon/breezy/src/breezy/analysis/nbp_calibration.py`
 - `/home/jon/breezy/deploy/systemd/breezy-replay-daily.service`
+---
+
+## Peer-review round 1 rulings (coordinator, 2026-10-06; binding for r2)
+
+**Reviews:**
+- Architect: REQUEST_CHANGES (1 blocking).
+- Stats: SOUND-WITH-CAVEATS (1 design bug).
+- Security: CONDITIONAL PASS (3 HIGH).
+
+- **AS-R1 (blocking; architect): Lane S folds are blocked within each NBM version.**
+  - v5 has data only in `v5_fit_slice` 2026-05-04..06-30 (`nbp_calibration.py:276`).
+  - Add a per-version STOP, with a minimum stated in **climate days**, not station-days (stats #1), plus a computed MDE on Δ.
+  - Drop the "n-rich" claim for v5.
+  - Test: `test_lane_s_folds_version_aware_with_training_data`.
+- **AS-R2 (stats bug, architect, security): one-shot screen and a permanent K.**
+  - Lane S runs **once per (grammar version, data window)**, and its result is immutable.
+  - K is permanent per archive. It is inherited across grammar versions and never reset.
+  - The "data window" is immutable and pinned in the grammar hash.
+  - The K ledger stores each spec's per-day Δ vector (for joint SPA), is hash-chained and committed. The run refuses to start if the ledger is missing or the chain is broken.
+  - Nightly cycles may only add specs inside the cap. They never re-select among specs already tested.
+  - Tests: `test_k_ledger_append_only_hash_chained`, `test_spa_joint_over_persisted_day_vectors`, a K-reset refusal test.
+- **AS-R3 (build order, from stats, architect and security):**
+  - **Phase 0 comes first**: the source and archive inventory (per version), the usable-day census, and the benchmark. A benchmark over 4G blocks the unit.
+  - `spa.py` and Lane S are built **only if Phase 0 step 2 finds a non-empty G2 set**. G1 then runs as a by-product.
+  - The nightly unit is deferred until then.
+  - The harness statistics registration moves to Phase 4, behind the GAP-S6 trigger.
+  - Freeze serialisation can be built now. The `c3_writer` call waits for the F5 GAP-13 ruling.
+- **AS-R4 (Lane S statistic, stats and architect):**
+  - Brier is a **necessary-condition filter only**.
+  - Also report the resolution-term gain (`murphy_decomposition`), and Δ on take-eligible rungs. Gate on Δ > 0 on that band.
+  - Report the fold-wise mean Δ, and require the same sign in every fold.
+  - The champion and the variant use the identical refit procedure; only the knob differs.
+  - Positive control: the champion, refit on its own window, reproduces the committed artefact sha.
+  - Negative control: a shuffled-label run gives Δ ≈ 0.
+  - Leak flag: a Δ above the champion's fold-to-fold spread becomes `HELD(leak_audit)`, never a silent UNUSABLE.
+- **AS-R5 (mint rule):**
+  - FQ-R27's dual rule (Bonferroni LB > 0 AND SPA p < 0.05) applies, **plus an effect-size floor** that maps Δ to expected edge.
+  - A candidate below the forward e-process detectable scale is flagged `unlikely_to_confirm`.
+  - At most 1 mint per cycle.
+- **AS-R6 (conflicts):**
+  - **S1** is accepted, with the addition that Lane E output never enters model-variant evidence.
+  - **S4** is amended: `selection_window_end` is the latest climate day read by any input, including ingested M1 scan windows (`test_selection_window_end_covers_ingested_m1_scan`).
+  - **The `correction_form` knob** is pinned to the champion's form unless a ruling allows re-selection (`test_correction_form_knob_ruling_gated`).
+  - **G2 requires `available_at < decision instant`** (`test_g2_source_available_at_lt_decision_instant`).
+  - **State that only G1 is deployable before KILL.** G2 needs F13 and a G11-style loader acceptance.
+- **AS-R7 (X1): paper only, and it needs its own erratum,** because it widens ARCH `:806`, a third route beyond E-26's two.
+  - "Restrict-only" is defined **per decision, with state-dependent limits held fixed**.
+  - The schema is closed: mask and floor fields only, no size fields, and margins at or above the code default.
+  - An unknown key or type is refused.
+  - The policy sits inside the byte-bound artefact hash.
+  - A property test shows the child's takes are a subset of the root's takes on a shared fixture.
+- **AS-R8 (unit security):** the bwrap row is a **blocking dependency of Phase 3**.
+  - The unit sets `PrivateNetwork=yes` or `IPAddressDeny=any`.
+  - **Mounts:** `src/` and `.venv` are read-only. Only `aut_s/` and `docs/evidence` are writable. These are masked: the exec and trade state DBs, `operator.env`, `~/.config/breezy` (except `alerts.env`) and the node logs. A test opens each masked path and expects a failure.
+  - **Time guards:**
+    - an `ExecCondition=` window refusal, so manual starts are refused too;
+    - an in-run deadline watchdog that exits at ≥16:00Z;
+    - a `Persistent=false` test;
+    - a stall timeout derived from the benchmark, plus a total-runtime heartbeat.
+  - **Environment:** no `Environment=` entry names an exec or venue path.
+  - **Alerts:** the stall alert is written to a file that another unit forwards, because the unit has no network.
+- **AS-R9 (handoff):**
+  - HELD is the **fail-closed default**: any exception, a missing E-26 consumption, or a missing F5 ruling yields HELD.
+  - A test shows the candidate and registry directories cannot be written except through `c3_writer`.
+  - Frozen spec JSON carries no manifest, allowlist, cap or permit fields.
+  - State plainly that nomination and promotion are separate reviewed acts, and that AUT-S has no path to them.
+- **AS-R10 (`spa.py` lift accepted):**
+  - Lift verbatim, preserving the RNG call order.
+  - The stationary bootstrap is a separate function.
+  - Parity test: the M1 evidence JSON is byte-identical before and after.
+  - Record the F11-list exception in the plan header.
+  - Add `test_register_statistic_name_collision_refused` when the harness step is built.
+- **AS-R11 (Lane E):** report power with every verdict, and raise the usable-day STOP above 14 or justify keeping it.
