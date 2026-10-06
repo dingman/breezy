@@ -409,3 +409,63 @@ def test_label_id_is_the_pinned_digest_and_scorer_declares_legs_and_roles() -> N
     assert row.scorer_id == FQ_SCORER_ID
     assert ForecastQuantileLadderScorer.legs == frozenset({"yes", "no"})
     assert ForecastQuantileLadderScorer.roles == frozenset({"entry", "exit"})
+
+
+# -- D4 and D3: gated admissibility until AUT-2b ----------------------------------------------
+
+
+def test_post_epoch_no_leg_entry_is_inadmissible_with_a_named_gate_until_aut2b() -> None:
+    result = _label([_inp(side="no")], _rec(95))
+
+    row = _only(result)
+    assert (row.settled_outcome, row.realized_pnl) == (True, Decimal("0.57"))
+    assert row.admissible is False and row.excluded_reason is None
+    assert [(g.client_order_id, g.reason) for g in result.gated] == [
+        ("O-1", fq_scorer.GATE_NO_LEG_UNTIL_AUT2B)
+    ]
+
+
+def test_exit_rows_are_inadmissible_with_a_named_gate_until_aut2b() -> None:
+    sell = replace(
+        _inp(coid="O-2", venue_order_id="vo-2"),
+        fill=durable_fill(
+            venue_order_id="vo-2", client_order_id="O-2", order_side="SELL", ts_event=TS + 1
+        ),
+    )
+    result = _label([sell], _rec(89))
+
+    assert _only(result).admissible is False
+    assert [(g.client_order_id, g.reason) for g in result.gated] == [
+        ("O-2", fq_scorer.GATE_EXIT_UNTIL_AUT2B)
+    ]
+
+
+def test_a_yes_entry_is_not_gated() -> None:
+    result = _label([_inp()], _rec(89))
+
+    assert result.gated == () and _only(result).admissible is True
+
+
+def test_only_admissible_rows_pass_the_aggregate_filter_from_real_scorer_output() -> None:
+    from breezy.persistence.autonomy.label_store import admissible_rows
+
+    sell = replace(
+        _inp(coid="O-2", venue_order_id="vo-2"),
+        fill=durable_fill(
+            venue_order_id="vo-2", client_order_id="O-2", order_side="SELL", ts_event=TS + 1
+        ),
+    )
+    rows = (
+        *_label([_inp(), _inp(coid="O-3", venue_order_id="vo-3", side="no"), sell], _rec(89)).rows,
+        *_label(
+            [_inp(coid="O-4", venue_order_id="vo-4", venue_settlement_tmax_f=89)],
+            None,
+            now_ns=_REL + 8 * _DAYS,
+        ).rows,
+    )
+
+    chosen = admissible_rows(rows)
+
+    assert [r.client_order_id for r in chosen] == ["O-1"]
+    fallback = next(r for r in rows if r.client_order_id == "O-4")
+    assert fallback.excluded_reason is None and fallback.settlement_basis != "nws_final"

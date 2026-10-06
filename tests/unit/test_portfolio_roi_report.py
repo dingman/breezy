@@ -5496,6 +5496,42 @@ class TestRoiStatusGatedUnlabelledFq:
         assert not (tmp_path / "home").exists()  # nothing written under the (temporary) HOME
         assert not (tmp_path / "derived").exists()  # and no report published
 
+    @pytest.mark.parametrize("bad_args", [["--status-onyl"], ["--status"], ["--status-only", "x"]])
+    def test_command_line_typo_is_rejected_and_never_runs_the_full_report(
+        self, tmp_path: Path, bad_args: list[str]
+    ) -> None:
+        """S1: an unknown argument exits 2 with a usage message. A typo must never fall through to
+        the full report (every path below is a tmp path; nothing live is reachable)."""
+        import os
+        import subprocess
+
+        store_path = _seed_unlabelled_store(tmp_path, n_fills=2)
+        (tmp_path / "families").mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "POLYMARKET_US_EXEC_STATE_DB": str(store_path),
+            "BREEZY_SCORED_TRIALS_DIR": str(tmp_path / "scored_trials"),
+            "BREEZY_SCORE_LIVE_TRIALS_FAMILIES_DIR": str(tmp_path / "families"),
+            "BREEZY_LIVE_TALLY_OUTPUT_DIR": str(tmp_path / "derived"),
+        }
+        script = _SCRIPTS_ANALYSIS_DIR / "portfolio_roi_report.py"
+
+        done = subprocess.run(
+            [sys.executable, str(script), *bad_args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert done.returncode == 2, done.stderr
+        assert "usage" in done.stderr.lower()
+        assert done.stdout == ""
+        assert not (tmp_path / "derived").exists()
+        assert not (tmp_path / "home").exists()
+
     def test_gated_unlabelled_fq_publishes_no_roi_figure(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

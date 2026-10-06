@@ -43,9 +43,12 @@ from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial, ScoreRefusa
 
 __all__ = [
     "FQ_SCORER_ID",
+    "GATE_EXIT_UNTIL_AUT2B",
+    "GATE_NO_LEG_UNTIL_AUT2B",
     "ForecastQuantileLadderScorer",
     "FqFillInput",
     "LabelAlert",
+    "LabelGate",
     "LabelResult",
     "LagBreach",
     "Reconciliation",
@@ -55,6 +58,11 @@ __all__ = [
 ]
 
 FQ_SCORER_ID: Final = "forecast_quantile_ladder/v1"
+#: Named gates: until AUT-2b lands its exit and NO-leg reconciliation, a post-epoch NO-leg entry and
+#: every exit row are never admissible, whatever else holds. The closed ``ExcludedReason``
+#: vocabulary is ARCH-pinned, so the reason is reported here, not in ``excluded_reason``.
+GATE_NO_LEG_UNTIL_AUT2B: Final = "no_leg_gated_until_aut2b"
+GATE_EXIT_UNTIL_AUT2B: Final = "exit_gated_until_aut2b"
 _NS_PER_H: Final = 3_600_000_000_000
 _PENDING_REASONS: Final = frozenset(
     {"no_record", "preliminary_only", "superseded", "sentinel_tmax"}
@@ -114,9 +122,16 @@ class LagBreach:
 
 
 @dataclass(frozen=True)
+class LabelGate:
+    client_order_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class LabelResult:
     rows: tuple[LabelRow, ...]
     alerts: tuple[LabelAlert, ...]
+    gated: tuple[LabelGate, ...]
     lag_breaches: tuple[LagBreach, ...]
     p_null_count: int
     non_c1_post_epoch_count: int
@@ -162,6 +177,14 @@ class _Draft:
     done: bool
     group: tuple[str, str]
     alerts: tuple[LabelAlert, ...]
+
+
+def _gate_of(row: LabelRow) -> LabelGate | None:
+    if row.role is LabelRole.EXIT:
+        return LabelGate(row.client_order_id, GATE_EXIT_UNTIL_AUT2B)
+    if row.leg == "no" and row.decision_id is not None:
+        return LabelGate(row.client_order_id, GATE_NO_LEG_UNTIL_AUT2B)
+    return None
 
 
 def _map_outcome(result: ScoredTrial | ScoreRefusal) -> _Scored:
@@ -215,6 +238,7 @@ class ForecastQuantileLadderScorer:
         return LabelResult(
             rows=apply_prior(rows, self._prior),
             alerts=tuple(a for d in drafts for a in d.alerts),
+            gated=tuple(g for r in rows if (g := _gate_of(r)) is not None),
             lag_breaches=self._lag_breaches(rows, drafts),
             p_null_count=sum(1 for r in entries if r.p_source is PSource.NONE),
             non_c1_post_epoch_count=sum(
@@ -235,7 +259,8 @@ class ForecastQuantileLadderScorer:
         ):
             return replace(row, excluded_reason=ExcludedReason.WINDOW_INCOMPLETE)
         admissible = (
-            row.reconciled
+            _gate_of(row) is None
+            and row.reconciled
             and row.excluded_reason is None
             and row.p_source is PSource.C1_DECISION
             and row.settlement_basis == "nws_final"

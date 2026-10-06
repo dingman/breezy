@@ -34,7 +34,7 @@ from breezy.analysis.labeling.probability import (
     artefact_p_raw,
     bought_leg_probabilities,
 )
-from breezy.domain.instrument_leg import base_symbol_of, leg_of_symbol, symbol_of_instrument_id
+from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
 from breezy.persistence.autonomy.label_schema import PSource
 
 __all__ = [
@@ -174,10 +174,6 @@ def _leg_of(instrument_id: str) -> str:
     return leg_of_symbol(symbol_of_instrument_id(instrument_id))
 
 
-def _slug_of(instrument_id: str) -> str:
-    return base_symbol_of(symbol_of_instrument_id(instrument_id))
-
-
 def _filled_event(fill: DurableFillRecord, events: Iterable[BridgeEvent]) -> BridgeEvent | None:
     for event in events:
         if (
@@ -225,14 +221,13 @@ def bridge_decision(
     if init is None:
         return BridgeUnmatched("no_init_line")
     low = init.ts_ns - BRIDGE_TAKE_TO_INIT_MAX_S * _NS_PER_S
-    slug = _slug_of(fill.instrument_id)
     takes = [
         e
         for e in events
         if e.kind == "take"
         and e.now_ns is not None
         and low <= e.now_ns <= init.ts_ns
-        and _slug_of(e.instrument_id) == slug
+        and e.instrument_id == fill.instrument_id
     ]
     if not takes:
         return BridgeUnmatched("no_take_in_window")

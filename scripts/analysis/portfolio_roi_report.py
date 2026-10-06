@@ -73,6 +73,7 @@ constructing that mapping to the (also out-of-scope-this-stage) CLI
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -4304,19 +4305,34 @@ def _run(
     return 0
 
 
+def _parse_main_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="portfolio_roi_report.py",
+        description="Portfolio ROI report. With no arguments (the systemd contract) it runs the "
+        "full report; --status-only prints the label gate and writes nothing.",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--status-only",
+        action="store_true",
+        help="print the scorer-entry gate and exit; publishes no figure and writes no file",
+    )
+    return parser.parse_args(list(argv))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Thin I/O shell over `_run()`. `argv` is accepted (and ignored, beyond
-    its emptiness) so this matches the deployed wrapper's contract of
-    invoking the script with NO ARGUMENTS -- every input/output path is
-    resolved from the same env-var-or-literal-default convention every
-    sibling study wrapper already uses (see the `_default_*` functions
-    above). Never assigns or reads an operator-reserved control.
+    """Thin I/O shell over `_run()`. Invoked with NO ARGUMENTS (the deployed wrapper's contract)
+    every input/output path is resolved from the same env-var-or-literal-default convention every
+    sibling study wrapper uses (see the `_default_*` functions above). Never assigns or reads an
+    operator-reserved control.
 
     AUT-2 r7 WP1: the single flag ``--status-only`` runs :func:`_status_only` instead (the
     portfolio-roi scorer entry: prints the gate, publishes no figure, writes no file). Any other
-    argument is ignored, exactly as before.
+    argument is refused (argparse usage, exit 2): a typo must never fall through to the full
+    report.
     """
-    if argv is not None and "--status-only" in argv:
+    args = _parse_main_args(argv or [])
+    if args.status_only:
         return _status_only(
             exec_state_db_path=_default_exec_state_db_path(),
             scored_trials_dir=_default_scored_trials_dir(),

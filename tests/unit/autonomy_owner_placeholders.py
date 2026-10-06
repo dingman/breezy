@@ -270,6 +270,10 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
     ),
     *_group(
         "AUT-2",
+        # NOT the WP0 function (that is ``read_venue_positions``, delivered). This is the ledger
+        # sentinel for the nine AUT-2 cross-area tests below, whose GREEN lands with WP5-WP8: naming
+        # a symbol that exists makes every row stale at once (test_no_row_is_stale) and demands the
+        # tests now. Re-point each row to its real delivering symbol as its WP lands.
         "breezy.runtime.venue_positions_read:read_positions",
         [],
         "test_p_at_decision_is_bought_leg_probability",

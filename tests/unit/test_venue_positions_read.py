@@ -501,3 +501,41 @@ def test_module_is_in_the_egress_guard_scan_and_trips_no_rule() -> None:
     assert relative in scanned
     assert relative not in {v.path for v in find_execution_egress_modules()}
     assert find_sdk_import_violations(relative, scanned[relative]) == []
+
+
+def test_an_oversized_page_body_is_read_failed_before_it_is_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S2: the per-page byte cap is enforced on the raw body, before ``json.loads``."""
+    parsed: list[int] = []
+    real_loads = json.loads
+
+    def _spy(raw: Any, *args: Any, **kwargs: Any) -> Any:
+        parsed.append(len(raw))
+        return real_loads(raw, *args, **kwargs)
+
+    big = {"a": _pos("1", filler="x" * (vpr.POSITIONS_PAGE_MAX_BYTES + 1))}
+    transport = _ScriptedTransport([_resp(_page(big, eof=True))])
+    capped = vpr.CappedReadTransport(transport, max_bytes=vpr.POSITIONS_PAGE_MAX_BYTES)
+    monkeypatch.setattr(json, "loads", _spy)
+
+    result = _read(_client(capped))
+
+    assert parsed == []
+    assert result.read_status is vpr.ReadStatus.READ_FAILED
+    assert result.rows == () and result.complete is False
+
+
+def test_a_page_at_the_cap_is_accepted() -> None:
+    body = _resp(_page({"a": _pos("1")}, eof=True))
+    capped = vpr.CappedReadTransport(_ScriptedTransport([body]), max_bytes=len(body.body))
+
+    result = _read(_client(capped))
+
+    assert result.read_status is vpr.ReadStatus.OK and len(result.rows) == 1
+
+
+def test_the_production_client_is_built_over_the_capped_transport() -> None:
+    source = _MODULE_PATH.read_text(encoding="utf-8")
+
+    assert "CappedReadTransport(" in source

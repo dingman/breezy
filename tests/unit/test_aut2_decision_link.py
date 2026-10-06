@@ -157,10 +157,22 @@ def test_bridge_never_runs_on_post_epoch_fills() -> None:
         bridge_decision(_fill(), events, epoch_class=EpochClass.POST_EPOCH, recalibration="none")
 
 
+def test_take_matches_by_instrument_id_not_by_base_slug() -> None:
+    # a take on the other leg's instrument (same base slug) is not the fill's take
+    other_leg = _events(_take(9, instrument=NO, side="no"), _init(10), _filled(11))
+    same = _events(_take(9), _init(10), _filled(11))
+
+    unmatched = _bridge(other_leg)
+    assert isinstance(unmatched, BridgeUnmatched) and unmatched.reason == "no_take_in_window"
+    assert isinstance(_bridge(same), BridgeMatch)
+
+
 def test_a_take_whose_side_disagrees_with_the_fill_leg_is_unmatched() -> None:
-    events = _events(_take(9, side="no"), _init(10, instrument=NO), _filled(11, instrument=NO))
+    events = _events(
+        _take(9, instrument=NO, side="no"), _init(10, instrument=NO), _filled(11, instrument=NO)
+    )
     # a NO-side take against a YES fill
-    wrong = _bridge(_events(_take(9, side="no"), _init(10), _filled(11)))
+    wrong = _bridge(_events(_take(9, side="no"), _init(10), _filled(11)))  # YES instrument
 
     assert isinstance(wrong, BridgeUnmatched) and wrong.reason == "side_leg_mismatch"
     right = _bridge(events, fill=_fill(instrument=NO))

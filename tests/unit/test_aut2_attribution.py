@@ -443,3 +443,35 @@ def test_unresolved_writes_write_once_journal_row(tmp_path: Path) -> None:
         )
     assert refused.value.reason is SingleReadReason.EXISTS_DIFFERENT
     assert attribution.UNRESOLVED_JOURNAL_DIR == ("evidence", "aut2", "unresolved")
+
+
+# -- D1: the decision, the link and the fill must agree in time and on the instrument ------------
+
+
+@pytest.mark.parametrize(
+    ("c1", "reason"),
+    [
+        (_c1(decisions=(_decision(ts_ns=TS - 4),)), "decision_after_link"),  # link ts is TS - 5
+        (_c1(_link(ts_ns=TS + 1)), "link_after_fill"),
+        (_c1(decisions=(_decision(instrument_id=NO),)), "instrument_mismatch"),
+        (_c1(_link(instrument_id=NO)), "instrument_mismatch"),
+    ],
+)
+def test_post_epoch_attribution_fails_closed_on_time_order_and_instrument(
+    c1: C1Index, reason: str
+) -> None:
+    result = attribute_post_epoch(_fill(), c1, venue=VENUE)
+
+    assert isinstance(result, Unresolved) and result.reason == reason and result.critical is True
+
+
+def test_a_fill_on_another_instrument_than_its_decision_is_unresolved() -> None:
+    result = attribute_post_epoch(_fill(instrument_id=NO), _c1(), venue=VENUE)
+
+    assert isinstance(result, Unresolved) and result.reason == "instrument_mismatch"
+
+
+def test_equal_timestamps_are_accepted() -> None:
+    c1 = _c1(_link(ts_ns=TS - 10), decisions=(_decision(ts_ns=TS - 10),))
+
+    assert isinstance(attribute_post_epoch(_fill(), c1, venue=VENUE), Attribution)
