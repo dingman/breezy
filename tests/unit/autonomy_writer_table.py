@@ -132,6 +132,14 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "after accepted=True: the per-asof dedupe of the dead-man alerts",
         "write_once",
     ),
+    # AUT-2 r7 WP2 (plan section 3.2.2): the C2 label store. The file is published through
+    # single_read.write_once; the one parquet serialisation site writes to an in-memory buffer.
+    FileWriter(
+        "derived/labels/<family_id>/labels_<now_ns>.parquet",
+        "the label run (analysis.labeling.label_run), under the studies flock, once per run "
+        "through label_store.write_labels",
+        "write_once",
+    ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",
         "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "
@@ -197,6 +205,13 @@ WRITE_SITE_ALLOWLIST: Final[tuple[WriteSiteRule, ...]] = (
         "breezy.analysis.capture_settlement",
         "_acquire_lock",
         "settlement unit: its own flock file in <decisions_dir>",
+    ),
+    # AUT-2 r7 WP2: parquet bytes are serialised to an in-memory io.BytesIO; the file itself is
+    # published through single_read.write_once (an allowlisted site), never by pyarrow.
+    WriteSiteRule(
+        "breezy.persistence.autonomy.label_store",
+        "_serialise",
+        "label/v1 parquet serialised to memory; the file is published by single_read.write_once",
     ),
     WriteSiteRule(
         "breezy.persistence.live_orders_gate",

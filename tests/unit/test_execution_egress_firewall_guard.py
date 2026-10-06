@@ -3626,7 +3626,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # `DurableFillRecord` (to build the L-42 durable-fill fixtures and prove
     # the real decoder reads them) and the exec key-prefix constants; nothing
     # is constructed and no socket is opened.
+    #
+    # Old -> new (AUT-2 r7 WP2): added `tests/support/aut2_fixtures.py`. WIDENED, not relaxed
+    # (L-6/L-12): the comparison is still `==` and the module carries no
+    # `SOCKET_RESTORING_MARKERS`. It imports `exec.client` only for `DurableFillRecord` and
+    # `FILL_KEY_PREFIX`, to write durable-fill fixtures into a tmp exec store with the real record
+    # serialiser; every AUT-2 labelling test reaches the exec package through this one module.
+    # Nothing is constructed from the client and no socket is opened.
     assert exec_importing_test_modules() == {
+        "tests/support/aut2_fixtures.py",
         "tests/support/capture_audit_w3_fixtures.py",
         "tests/unit/autonomy/test_capture_reader.py",
         "tests/unit/test_aut1_wp0_closure_premises.py",

@@ -100,10 +100,11 @@ from typing import Any
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
-from breezy.adapters.polymarket_us.symbology import (
-    REGISTRY_VENUE_KEY,
-    parse_weather_slug,
-    slug_closed_interval,
+from breezy.analysis.labeling.instrument_facts import (
+    bucket_facts_from_instrument_id as _bucket_facts_from_instrument_id,
+)
+from breezy.analysis.labeling.instrument_facts import (
+    read_bucket_facts_by_instrument_id as _read_bucket_facts_by_instrument_id,
 )
 
 # R2.2: definitions live in breezy.analysis.prereg_admission. Bound here so
@@ -120,12 +121,10 @@ from breezy.analysis.prereg_admission import (
     compute_residual,  # noqa: F401
     read_filled_trials_state_db,
 )
-from breezy.domain.instrument_leg import base_symbol_of, symbol_of_instrument_id
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import (
     Measure,
     WeatherBucketFacts,
-    read_weather_bucket_facts,
 )
 from breezy.persistence.catalog import open_station_catalog, read_climate_day_including_corrections
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
@@ -136,7 +135,7 @@ from breezy.persistence.residual_fills import (  # noqa: F401
 )
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
 from breezy.registry.settlement_clock import settlement_deadline_ns
-from breezy.registry.sites import SiteNotFoundError, default_registry
+from breezy.registry.sites import default_registry
 from breezy.runtime.exec_state_db_path import (
     ExecStateDbNotConfiguredError,
     node_store_path_check,
@@ -573,93 +572,6 @@ def _with_scheduled_release_at_ns(trial: FilledTrial, *, venue: str, city: str) 
         entry_ask=trial.entry_ask,
         scheduled_release_at_ns=release_ns,
         venue_settlement_tmax_f=trial.venue_settlement_tmax_f,
-    )
-
-
-def _read_bucket_facts_by_instrument_id(
-    catalog_base: Path, *, venue: str, city: str
-) -> dict[str, WeatherBucketFacts]:
-    """Resolve every persisted instrument definition's rung facts, keyed by id.
-
-    Absence for a given `instrument_id` is the caller's `instrument_unavailable`
-    refusal signal (item 7) -- this function returns only what it found.
-
-    Duplicate `instrument_id` (review item 4, mirroring `252918a`'s ingest
-    idiom): the FIRST-landed definition stands. A later definition under the
-    same id that diverges in content is counted, never silently taken as the
-    winner, and the count is logged once as a single warning.
-    """
-    catalog = open_station_catalog(catalog_base, venue, city)
-    facts: dict[str, WeatherBucketFacts] = {}
-    divergent = 0
-    for instrument in catalog.instruments():
-        try:
-            resolved = read_weather_bucket_facts(instrument.info)
-        except Exception as exc:  # noqa: BLE001 -- a non-weather instrument is skipped, not fatal
-            logging.getLogger(__name__).debug(
-                "skipping non-weather instrument %s: %s", instrument.id, exc
-            )
-            continue
-        instrument_id = str(instrument.id)
-        existing = facts.get(instrument_id)
-        if existing is not None:
-            if existing != resolved:
-                divergent += 1
-            continue
-        facts[instrument_id] = resolved
-    if divergent:
-        logging.getLogger(__name__).warning(
-            "%d instrument definition(s) share an already-landed instrument_id "
-            "but differ in weather-bucket facts; skipped, the first-landed "
-            "definition stands",
-            divergent,
-        )
-    return facts
-
-
-def _bucket_facts_from_instrument_id(instrument_id: str) -> WeatherBucketFacts | None:
-    """Derive `WeatherBucketFacts` straight from `instrument_id`'s own slug
-    grammar, for when no persisted instrument definition exists (measured
-    2026-09-16: the per-station NWS catalog holds ZERO instrument
-    definitions in this environment -- ING-1 ingest strand).
-
-    Reuses the SAME parser `breezy.adapters.polymarket_us.parsing
-    ._weather_info` reads at ingestion time --
-    `symbology.parse_weather_slug` for the city/measure/climate-day/bounds,
-    then `symbology.slug_closed_interval` for the closed-interval reading --
-    never a new regex. `slug_closed_interval`'s three-family mapping is the
-    exact rule `docs/evidence/venue/polymarket_us
-    /THRESHOLD_SEMANTICS_2026-08-25.md` section 4.2 pins as settlement-grade
-    (`gte{A}lt{B}f` -> `[A, B]` inclusive, the same rule
-    `settlement_truth_dataset.bucket_facts` already applies standalone with
-    no venue payload) -- this driver never has the venue's own
-    description/title to cross-check against (`assert_bounds_cross_checked`
-    needs a live market payload this scorer does not hold), so it uses that
-    corroborated cross-check reading directly rather than re-deriving a new
-    one.
-
-    `None` for anything the parser does not recognise (an unobserved bound
-    family, a slug outside the weather grammar, or a city with no
-    registered settlement site) -- the caller's `instrument_unavailable`
-    refusal, unchanged.
-    """
-    slug = base_symbol_of(symbol_of_instrument_id(instrument_id))
-    parsed = parse_weather_slug(slug)
-    if parsed is None:
-        return None
-    interval = slug_closed_interval(parsed.bounds)
-    if interval is None:
-        return None
-    try:
-        site = default_registry().site_for_venue_city_token(REGISTRY_VENUE_KEY, parsed.city)
-    except SiteNotFoundError:
-        return None
-    return WeatherBucketFacts(
-        settlement_station=site.cli_location,
-        climate_day=dt.date.fromisoformat(parsed.climate_date),
-        measure=Measure(parsed.measure),
-        lower_f=interval[0],
-        upper_f=interval[1],
     )
 
 
