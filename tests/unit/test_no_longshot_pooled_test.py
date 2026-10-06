@@ -332,8 +332,16 @@ def _ns_of(day: dt.date, hour: int, minute: int = 0) -> int:
 
 
 class _Rung:
-    def __init__(self, bucket: str, bid: str | None, *, hour: int = 12, size: str = "20") -> None:
-        self.bucket, self.bid, self.hour, self.size = bucket, bid, hour, size
+    def __init__(
+        self,
+        bucket: str,
+        bid: str | None,
+        *,
+        hour: int = 12,
+        size: str = "20",
+        ask: str | None = None,
+    ) -> None:
+        self.bucket, self.bid, self.hour, self.size, self.ask = bucket, bid, hour, size, ask
 
 
 class _Ladder:
@@ -351,7 +359,8 @@ def _stage(
             for rung in ladder.rungs:
                 slug = f"tc-temp-{ladder.station.lower()}high-{day.isoformat()}-{rung.bucket}f"
                 bids = [] if rung.bid is None else [(rung.bid, rung.size)]
-                row = _depth(slug, _ns_of(day, rung.hour, 5), bids)
+                asks = None if rung.ask is None else [(rung.ask, rung.size)]
+                row = _depth(slug, _ns_of(day, rung.hour, 5), bids, asks)
                 rows.setdefault(str(row.instrument_id), []).append(row)
             issued = dt.datetime(day.year, day.month, day.day, 12, tzinfo=dt.UTC) + dt.timedelta(
                 days=issued_offset
@@ -389,7 +398,7 @@ def _lax(
 
 
 def _git(cwd: Path, *args: str, when: str | None = None) -> str:
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
     if when is not None:
         env.update(GIT_COMMITTER_DATE=when, GIT_AUTHOR_DATE=when)
     done = subprocess.run(
@@ -497,7 +506,8 @@ def test_first_forward_day_derived_from_git_not_json(tmp_path: Path) -> None:
     report, _code = _run(world, catalog, truth)
     assert report["first_forward_day"] == "2026-10-12"
     assert report["read_date"] == (dt.date(2026, 10, 12) + dt.timedelta(days=61)).isoformat()
-    assert report["counts"]["n_days"] == 1  # only 10-12 is a forward day
+    # R21: as_of is before this read date, so the report is counts-only (progress)
+    assert report["progress"]["n_days"] == 1  # only 10-12 is a forward day
 
 
 def test_json_first_forward_day_that_disagrees_with_git_is_refused(tmp_path: Path) -> None:
@@ -681,9 +691,10 @@ def test_main_exit_codes(
         "--out", str(tmp_path / "o"),
         "--as-of", "2026-10-20",
     ]  # fmt: skip
-    assert tool.main(base) == 0
+    clock = lambda: dt.date(2026, 10, 20)  # R20: --as-of cannot pass the clock
+    assert tool.main(base, clock=clock) == 0
     # the committed DRAFT is UNFROZEN: the tool refuses and exits 3 with no verdict
     unfrozen = [*base]
     unfrozen[1] = str(_PREREG_SRC)
-    assert tool.main(unfrozen) == 3
+    assert tool.main(unfrozen, clock=clock) == 3
     assert "UNFROZEN" in capsys.readouterr().err

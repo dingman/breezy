@@ -1,7 +1,7 @@
 """M1-v3: a pre-registered FORWARD screen of buying NO at an ask >= 0.90 (Lane E, AS-R6).
 
 Plan: docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/M1v3-no-longshot-forward-screen_plan.md
-(r1 < r2 < r3 < r3.1; rulings M1V3-R1..R18). Model-free: the only inputs are the recorder's
+(r1 < r2 < r3 < r3.1 < r3.2; rulings M1V3-R1..R27). Model-free: the only inputs are the recorder's
 Depth10 tape and the NWS CLI finals. Venue prices are execution cost only. The output never enters
 model-variant evidence; a WINNER verdict nominates an execution-side admissibility filter on top of
 a weather-sourced NO decision, never a standalone signal. Read-only: no network, no Nautilus
@@ -12,6 +12,18 @@ HOW IT REUSES M1 (``market_calibration_scan``, unchanged)
     ``windows=(D_12Z,)`` (R14); the first Depth10 row in [12:00, 13:00) UTC is the reference.
   * The bootstrap is M1's ``_bootstrap_stats`` on a day x 1 matrix built HERE from the R4 primary
     cost (R13): M1's ``excess`` / ``_day_matrices`` (rounded fee, no slippage) are never used.
+
+COST. ``m1.collect`` re-indexes the whole Depth10 directory listing on every call and accepts no
+pre-built index (m1 stays unchanged, R14), so the primary window and each sensitivity window cost
+O(days x directories). The tool builds its own index once for the validity scoping, the truth-gap
+count and the catalog digest, but cannot hand it to ``collect``.
+
+FIXED SAMPLE AND READ-ONCE (r3.2). The sample is exactly the 53 forward days
+``first <= d <= first+52`` (R19). A verdict needs ``as_of >= read_date`` AND every tape station-day
+in the window to have FINAL truth, or ``as_of >= first+75`` (missing ones are then excluded and
+counted); otherwise the status is ``PENDING_TRUTH``. Before the read date, and while pending, the
+report carries counts only (R21). A READ or INVALID report is never overwritten (R23). ``--as-of``
+may not pass the real UTC date (R20).
 
 FREEZE (R8). The tool refuses to produce a verdict unless ``frozen_sha`` is a real commit that is an
 ancestor of HEAD and the PREREG blob equals the one committed there (``check_frozen_blob``). The
@@ -25,12 +37,14 @@ import datetime as dt
 import hashlib
 import json
 import math
+import subprocess
 import sys
 import warnings
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
@@ -85,6 +99,11 @@ MIN_TAKES: Final[int] = 620
 MIN_DAYS: Final[int] = 40
 MIN_LOSS_DAYS: Final[int] = 5
 READ_OFFSET_DAYS: Final[int] = 61
+SAMPLE_DAYS: Final[int] = 53
+TRUTH_DEADLINE_DAYS: Final[int] = 75
+LAST_FORWARD_RULE: Final[str] = f"first_forward_day+{SAMPLE_DAYS - 1}d"
+TRUTH_DEADLINE_RULE: Final[str] = f"first_forward_day+{TRUTH_DEADLINE_DAYS}d"
+PROGRESS_STATUSES: Final[frozenset[str]] = frozenset({"PROGRESS", "PENDING_TRUTH"})
 DEPTH_MIN_CONTRACTS: Final[Decimal] = Decimal(10)
 UNFROZEN: Final[str] = "UNFROZEN"
 FIRST_FORWARD_RULE: Final[str] = "utc_committer_date(frozen_sha)+1d"
@@ -98,7 +117,7 @@ EXIT_REFUSED: Final[int] = 3
 _ASK_BINS: Final[tuple[tuple[str, Decimal, Decimal], ...]] = (
     ("0.90-0.92", Decimal("0.90"), Decimal("0.93")),
     ("0.93-0.95", Decimal("0.93"), Decimal("0.96")),
-    ("0.96-0.99", Decimal("0.96"), Decimal(1)),
+    ("0.96-0.99", Decimal("0.96"), Decimal(1)),  # the last bin is closed: [0.96, 1.00]
 )
 NOTICE: Final[str] = (
     "Lane E execution-structure screen (AS-R6): model-free, never model-variant evidence, never "
@@ -171,6 +190,7 @@ class Pooled:
     lb_primary: float | None
     lb_bca: float | None
     p_cell: float | None
+    bca_failed: bool = False
 
 
 def _matrices(
@@ -243,9 +263,8 @@ def pool(
     if not n_takes:
         return Pooled(*base, None, None, None, None)
     observed, lower, p_cell = _primary_bound(s_mat, n_mat, resamples, seed)
-    return Pooled(
-        *base, _finite(observed), _finite(lower), _bca_lower(s_mat, n_mat, resamples, seed), p_cell
-    )
+    bca = _bca_lower(s_mat, n_mat, resamples, seed)
+    return Pooled(*base, _finite(observed), _finite(lower), bca, p_cell, bca is None)
 
 
 def _positive(value: float | None) -> bool:
@@ -256,6 +275,8 @@ def decide(pooled: Pooled) -> str:
     """UNDERPOWERED when any floor is unmet, else WINNER iff BOTH lower bounds are > 0."""
     if pooled.n_takes < MIN_TAKES or pooled.n_days < MIN_DAYS or pooled.loss_days < MIN_LOSS_DAYS:
         return "UNDERPOWERED"
+    if pooled.bca_failed:
+        return "NO-EDGE"  # an absent BCa bound can never support a WINNER
     if _positive(pooled.lb_primary) and _positive(pooled.lb_bca):
         return "WINNER"
     return "NO-EDGE"
@@ -264,7 +285,8 @@ def decide(pooled: Pooled) -> str:
 def ask_bin_table(takes: Sequence[Take]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for label, lo, hi in _ASK_BINS:
-        members = [t for t in takes if lo <= t.ask < hi]
+        last = (label, lo, hi) == _ASK_BINS[-1]
+        members = [t for t in takes if lo <= t.ask and (t.ask <= hi if last else t.ask < hi)]
         total = sum((net_ev(t.ask, t.hit) for t in members), Decimal(0))
         rows.append(
             {
@@ -334,6 +356,9 @@ def check_pins(design: Mapping[str, Any]) -> list[str]:
         "min_loss_days": MIN_LOSS_DAYS,
         "read_offset_days": READ_OFFSET_DAYS,
         "ask_threshold_inclusive": True,
+        "sample_days": SAMPLE_DAYS,
+        "last_forward_day_rule": LAST_FORWARD_RULE,
+        "truth_deadline_rule": TRUTH_DEADLINE_RULE,
     }
     problems: list[str] = []
     for key, want in decimals.items():
@@ -355,6 +380,18 @@ class Freeze:
     committer_date: dt.date
     epoch_ns: int
     first_forward_day: dt.date
+
+    @property
+    def last_forward_day(self) -> dt.date:
+        return self.first_forward_day + dt.timedelta(days=SAMPLE_DAYS - 1)
+
+    @property
+    def read_date(self) -> dt.date:
+        return self.first_forward_day + dt.timedelta(days=READ_OFFSET_DAYS)
+
+    @property
+    def truth_deadline(self) -> dt.date:
+        return self.first_forward_day + dt.timedelta(days=TRUTH_DEADLINE_DAYS)
 
 
 def derive_freeze(sha: str, cwd: Path) -> Freeze:
@@ -382,7 +419,45 @@ def _check_first_forward(design: Mapping[str, Any], derived: dt.date) -> None:
         )
 
 
+def check_freeze_introduction(prereg: Path, design: Mapping[str, Any]) -> None:
+    """Refuse unless ``frozen_sha`` is the commit that first introduced the current PREREG blob:
+    the blob must be absent from every parent of ``frozen_sha`` (R26), so an older ancestor that
+    already carried an identical blob cannot backdate the window. The committer date is trusted git
+    metadata; a rewrite is bounded by ancestry plus the blob equality checked before this."""
+    sha = str(design.get("frozen_sha"))
+    folder = prereg.resolve().parent
+    top = _git(folder, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        raise Refusal(f"{prereg} is not inside a git repository")
+    root = Path(top.stdout.strip())
+    rel = prereg.resolve().relative_to(root).as_posix()
+    parents = _git(root, "rev-parse", f"{sha}^@").stdout.split()
+    for parent in parents:
+        blob = _git(root, "show", f"{parent}:{rel}")
+        if blob.returncode != 0:
+            continue
+        try:
+            before = json.loads(blob.stdout)
+        except ValueError:
+            continue
+        if isinstance(before, Mapping) and _canonical(before) == _canonical(design):
+            raise Refusal(
+                f"frozen_sha {sha} is not the commit that introduced this PREREG blob: its parent "
+                f"{parent} already carries it, so the window could be backdated"
+            )
+
+
 def _load_verified_design(prereg: Path) -> tuple[Mapping[str, Any], Freeze]:
+    """The verified design and its freeze; any I/O, JSON or git failure is a ``Refusal`` (R22)."""
+    try:
+        return _verify_design(prereg)
+    except Refusal:
+        raise
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        raise Refusal(f"cannot load the prereg: {type(exc).__name__}: {exc}") from exc
+
+
+def _verify_design(prereg: Path) -> tuple[Mapping[str, Any], Freeze]:
     design = json.loads(prereg.read_text(encoding="utf-8"))
     if not isinstance(design, Mapping):
         raise Refusal(f"{prereg}: the prereg must be a JSON object")
@@ -392,6 +467,7 @@ def _load_verified_design(prereg: Path) -> tuple[Mapping[str, Any], Freeze]:
     defects = check_frozen_blob(prereg, design)
     if defects:
         raise Refusal("; ".join(f"[{d.code}] {d.message}" for d in defects))
+    check_freeze_introduction(prereg, design)
     problems = check_pins(design)
     if problems:
         raise Refusal("pin check failed: " + "; ".join(problems))
@@ -446,14 +522,45 @@ def _collect(
         return None
 
 
-def _validity(collected: m1.Collected, day: dt.date, out: Gathered) -> None:
+def _degenerate_no_asks(
+    catalog: Path,
+    day_truth: Mapping[tuple[str, dt.date], m1.TruthRow],
+    day: dt.date,
+    window: m1.Window,
+    index: Mapping[dt.date, Sequence[tuple[str, m1.RungSpec]]],
+) -> int:
+    """NO-side reference asks outside ``(0, 1)`` on ``day`` (R25). ``collect`` pools YES and NO
+    degenerate asks into one counter, so the NO-only count is re-derived here from the same rows."""
+    members = [(n, s) for n, s in index.get(day, ()) if (s.station, day) in day_truth]
+    if not members:
+        return 0
+    tape = RecorderCatalogTape(
+        catalog, day + dt.timedelta(days=window.day_offset), frozenset(n for n, _s in members)
+    )
+    lo, hi = m1.window_bounds_ns(day, window)
+    count = 0
+    for name, _spec in members:
+        row = m1._first_row(tape, name, lo, hi)
+        ask = m1.no_ask(row) if row is not None else None
+        count += int(ask is not None and not 0 < ask < 1)
+    return count
+
+
+def _validity(
+    collected: m1.Collected,
+    day: dt.date,
+    out: Gathered,
+    scope: Callable[[], int],
+) -> None:
+    """Look-ahead failures and NO-side degenerate asks of THIS forward day void the look. M1's
+    ``invalid_counts`` is deliberately not used: it also counts YES-side degenerate asks and
+    unrelated junk directories, neither of which can affect a NO take (R25)."""
     if collected.lookahead_failures:
         out.reasons.append(
             f"{len(collected.lookahead_failures)} look-ahead assert failure(s) on {day}"
         )
-    out.reasons.extend(
-        f"{name}: {n} on {day}" for name, n in sorted(collected.invalid_counts.items())
-    )
+    if collected.invalid_counts.get(m1.R_DEGENERATE) and (n := scope()):
+        out.reasons.append(f"{m1.R_DEGENERATE}: {n} on {day}")
 
 
 def _usable_parts(
@@ -475,7 +582,6 @@ def _usable_parts(
         part = _collect(catalog, sub, day, window, out)
         if part is None:
             return [], 0, 0
-        _validity(part, day, out)
         if part.windows_without_depth:
             excluded += part.joined_station_days
         else:
@@ -491,6 +597,7 @@ def gather(
     freeze: Freeze,
     *,
     strict: bool,
+    index: Mapping[dt.date, Sequence[tuple[str, m1.RungSpec]]],
 ) -> Gathered:
     """One ``collect`` per forward climate day, truth restricted to that day (R14). ``strict``
     (the primary window) turns a reference row at or before the freeze into an INVALID reason; a
@@ -501,7 +608,9 @@ def gather(
         first = _collect(catalog, day_truth, day, window, out)
         if first is None:
             return out
-        _validity(first, day, out)
+        _validity(
+            first, day, out, partial(_degenerate_no_asks, catalog, day_truth, day, window, index)
+        )
         parts, used, excluded = _usable_parts(catalog, day_truth, day, window, first, out)
         out.excluded_station_days += excluded
         if out.reasons and not parts:
@@ -576,11 +685,15 @@ def _pooled_dict(p: Pooled) -> dict[str, Any]:
         "mean": p.mean,
         "lb_primary": p.lb_primary,
         "lb_bca": p.lb_bca,
+        "bca_failed": p.bca_failed,
     }
 
 
-def _population(forward_days: Sequence[dt.date], g: Gathered) -> dict[str, Any]:
+def _population(
+    forward_days: Sequence[dt.date], g: Gathered, no_final_truth: int
+) -> dict[str, Any]:
     return {
+        "no_final_truth": no_final_truth,
         "forward_days_with_truth": len(forward_days),
         "n_days": len(g.days),
         "excluded_days": [d.isoformat() for d in g.excluded_days],
@@ -637,10 +750,11 @@ def _window_sensitivities(
     freeze: Freeze,
     resamples: int,
     reasons: list[str],
+    index: Mapping[dt.date, Sequence[tuple[str, m1.RungSpec]]],
 ) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for window in SENSITIVITY_WINDOWS:
-        g = gather(catalog, truth, forward_days, window, freeze, strict=False)
+        g = gather(catalog, truth, forward_days, window, freeze, strict=False, index=index)
         reasons.extend(g.reasons)
         out[window.label] = {
             **_pooled_dict(pool(g.takes, g.days, resamples=resamples)),
@@ -650,22 +764,56 @@ def _window_sensitivities(
     return out
 
 
-def _catalog_day_digest(catalog: Path) -> str:
-    by_day = m1._index_directories(catalog / "data" / DEPTH_DIR, m1._Tally())
-    return hashlib.sha256("\n".join(d.isoformat() for d in sorted(by_day)).encode()).hexdigest()
+def _catalog_day_digest(index: Mapping[dt.date, Sequence[tuple[str, m1.RungSpec]]]) -> str:
+    return hashlib.sha256("\n".join(d.isoformat() for d in sorted(index)).encode()).hexdigest()
 
 
 def _head_sha(cwd: Path) -> str:
-    done = _git(cwd, "rev-parse", "HEAD")
+    try:
+        done = _git(cwd, "rev-parse", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return "UNKNOWN"
     return done.stdout.strip() if done.returncode == 0 else "UNKNOWN"
 
 
+def _refuse_overwrite(out_dir: Path) -> None:
+    """A READ or INVALID report is the one look and is never replaced (R23); an unreadable
+    existing file is treated as a consumed look."""
+    path = _refuse_live(out_dir) / REPORT_NAME
+    if not path.exists():
+        return
+    try:
+        status = json.loads(path.read_text(encoding="utf-8")).get("status", "UNKNOWN")
+    except (OSError, ValueError, AttributeError):
+        status = "UNREADABLE"
+    if status not in PROGRESS_STATUSES:
+        raise Refusal(f"{path} already holds a {status} report: the look is read once")
+
+
 def write_report(out_dir: Path, report: Mapping[str, Any]) -> Path:
+    _refuse_overwrite(out_dir)
     resolved = _refuse_live(out_dir)
-    resolved.mkdir(parents=True, exist_ok=True)
-    path = resolved / REPORT_NAME
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+        path = resolved / REPORT_NAME
+        path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    except OSError as exc:
+        raise Refusal(f"cannot write the report under {resolved}: {exc}") from exc
     return path
+
+
+def _progress(g: Gathered, no_final_truth: int) -> dict[str, Any]:
+    """The only figures an interim or pending report may carry (R21): counts, never outcomes."""
+    return {
+        "n_takes": len(g.takes),
+        "n_days": len(g.days),
+        "n_station_days": sum(r.station_days_used for r in g.records),
+        "skipped_no_bid_side": sum(r.no_bid_side for r in g.records),
+        "windows_without_depth": sum(r.windows_without_depth for r in g.records),
+        "excluded_station_days": g.excluded_station_days,
+        "excluded_days": len(g.excluded_days),
+        "no_final_truth": no_final_truth,
+    }
 
 
 def _read_branch(
@@ -676,20 +824,32 @@ def _read_branch(
     forward_days: Sequence[dt.date],
     freeze: Freeze,
     resamples: int,
+    index: Mapping[dt.date, Sequence[tuple[str, m1.RungSpec]]],
+    no_final_truth: int,
 ) -> None:
+    primary.takes = attach_depth(catalog, primary.takes, PRIMARY_WINDOW)
     pooled = pool(primary.takes, primary.days, resamples=resamples)
     reasons: list[str] = []
-    windows = _window_sensitivities(catalog, truth, forward_days, freeze, resamples, reasons)
+    windows = _window_sensitivities(catalog, truth, forward_days, freeze, resamples, reasons, index)
     if reasons:
-        report.update(status="INVALID", verdict="INVALID", invalid_reasons=sorted(set(reasons)))
+        report.update(
+            status="INVALID",
+            verdict="INVALID",
+            invalid_reasons=sorted(set(reasons)),
+            progress=_progress(primary, no_final_truth),
+        )
         return
     report.update(
         status="READ",
         verdict=decide(pooled),
+        counts=_counts(primary.takes, primary.days),
+        population=_population(forward_days, primary, no_final_truth),
+        depth=_depth_report(primary.takes),
         stats={
             "mean": pooled.mean,
             "lb_primary": pooled.lb_primary,
             "lb_bca": pooled.lb_bca,
+            "bca_failed": pooled.bca_failed,
             "p_cell": pooled.p_cell,
             "alpha": ALPHA,
             "note": "p_cell is reported by analogy to FQ-R27 at K=1; it is not Hansen SPA",
@@ -711,6 +871,50 @@ def _read_branch(
     )
 
 
+def _evaluate(
+    report: dict[str, Any],
+    freeze: Freeze,
+    *,
+    catalog: Path,
+    truth: Path,
+    as_of: dt.date,
+    resamples: int,
+) -> None:
+    """Fill ``report``. Any data/IO error propagates to ``run_screen`` (INVALID, R22)."""
+    loaded = m1.load_truth_checked(truth)
+    index = m1._index_directories(catalog / "data" / DEPTH_DIR, m1._Tally())
+    first, last = freeze.first_forward_day, freeze.last_forward_day
+    forward_days = sorted({d for _s, d in loaded.rows if first <= d <= last})
+    tape_station_days = {
+        (spec.station, day)
+        for day, items in index.items()
+        if first <= day <= last
+        for _name, spec in items
+    }
+    no_final_truth = len(tape_station_days - set(loaded.rows))
+    report["truth_sha256"] = hashlib.sha256(truth.read_bytes()).hexdigest()
+    report["catalog_day_list_sha256"] = _catalog_day_digest(index)
+    primary = gather(
+        catalog, loaded.rows, forward_days, PRIMARY_WINDOW, freeze, strict=True, index=index
+    )
+    reasons = [f"truth: {name}: {n}" for name, n in sorted(loaded.invalid_counts.items())]
+    reasons += primary.reasons
+    report["invalid_reasons"] = sorted(set(reasons))
+    if reasons:
+        report.update(
+            status="INVALID", verdict="INVALID", progress=_progress(primary, no_final_truth)
+        )
+    elif as_of < freeze.read_date:
+        report.update(status="PROGRESS", progress=_progress(primary, no_final_truth))
+    elif no_final_truth and as_of < freeze.truth_deadline:
+        report.update(status="PENDING_TRUTH", progress=_progress(primary, no_final_truth))
+    else:
+        _read_branch(
+            report, primary, catalog, loaded.rows, forward_days, freeze, resamples, index,
+            no_final_truth,
+        )  # fmt: skip
+
+
 def run_screen(
     *,
     prereg: Path,
@@ -720,49 +924,49 @@ def run_screen(
     as_of: dt.date,
     resamples: int = B_RESAMPLES,
 ) -> tuple[dict[str, Any], int]:
-    """Run the screen. Raises ``Refusal`` (exit 3, no verdict) on any freeze or output defect;
-    returns ``(report, exit code)`` otherwise (INVALID exits 2)."""
+    """Run the screen. Raises ``Refusal`` (exit 3, no verdict) on any freeze, design-loading or
+    output defect; returns ``(report, exit code)`` otherwise. Data/IO errors during the run and
+    every validity failure give an INVALID report (exit 2); no traceback escapes (R22)."""
     if out_dir is not None:
-        _refuse_live(out_dir)
+        _refuse_overwrite(out_dir)
     design, freeze = _load_verified_design(prereg)
-    loaded = m1.load_truth_checked(truth)
-    forward_days = sorted({d for _s, d in loaded.rows if d >= freeze.first_forward_day})
-    primary = gather(catalog, loaded.rows, forward_days, PRIMARY_WINDOW, freeze, strict=True)
-    reasons = [f"truth: {name}: {n}" for name, n in sorted(loaded.invalid_counts.items())]
-    reasons += primary.reasons
-    read_date = freeze.first_forward_day + dt.timedelta(days=READ_OFFSET_DAYS)
-    primary.takes = attach_depth(catalog, primary.takes, PRIMARY_WINDOW) if not reasons else []
     report: dict[str, Any] = {
         "kind": "m1v3_no_longshot_forward_screen/report",
         "notice": NOTICE,
         "frozen_sha": freeze.sha,
         "head_sha": _head_sha(prereg.resolve().parent),
         "prereg_canonical_sha256": hashlib.sha256(_canonical(design).encode()).hexdigest(),
-        "truth_sha256": hashlib.sha256(truth.read_bytes()).hexdigest(),
-        "catalog_day_list_sha256": _catalog_day_digest(catalog),
         "first_forward_day": freeze.first_forward_day.isoformat(),
-        "read_date": read_date.isoformat(),
+        "last_forward_day": freeze.last_forward_day.isoformat(),
+        "read_date": freeze.read_date.isoformat(),
+        "truth_deadline": freeze.truth_deadline.isoformat(),
         "as_of": as_of.isoformat(),
         "window": PRIMARY_WINDOW.label,
-        "population": _population(forward_days, primary),
-        "counts": _counts(primary.takes, primary.days),
-        "invalid_reasons": sorted(set(reasons)),
     }
-    if reasons:
-        report.update(status="INVALID", verdict="INVALID")
-    elif as_of < read_date:
-        report.update(status="PROGRESS")
-    else:
-        _read_branch(report, primary, catalog, loaded.rows, forward_days, freeze, resamples)
-    if report["status"] != "INVALID":
-        report["depth"] = _depth_report(primary.takes)
+    header = dict(report)
+    try:
+        _evaluate(report, freeze, catalog=catalog, truth=truth, as_of=as_of, resamples=resamples)
+    except Refusal:
+        raise
+    except Exception as exc:  # noqa: BLE001 - R22: a data/IO failure is INVALID, never a traceback
+        report = {
+            **header,
+            "status": "INVALID",
+            "verdict": "INVALID",
+            "invalid_reasons": [f"data error: {type(exc).__name__}: {exc}"],
+        }
     code = EXIT_INVALID if report["status"] == "INVALID" else EXIT_OK
     if out_dir is not None:
         write_report(out_dir, report)
     return report, code
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _utc_today() -> dt.date:
+    return dt.datetime.now(dt.UTC).date()
+
+
+def main(argv: Sequence[str] | None = None, *, clock: Callable[[], dt.date] = _utc_today) -> int:
+    """``clock`` is the injected UTC date source (tests only): ``--as-of`` may not pass it (R20)."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n", 1)[0])
     parser.add_argument("--prereg", type=Path, default=DEFAULT_PREREG)
     parser.add_argument("--catalog", type=Path, default=m1.DEFAULT_CATALOG)
@@ -770,14 +974,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--as-of", type=dt.date.fromisoformat, default=None)
     args = parser.parse_args(argv)
-    as_of = args.as_of or dt.datetime.now(dt.UTC).date()
+    today = clock()
+    if args.as_of is not None and args.as_of > today:
+        print(f"REFUSED: --as-of {args.as_of} is after today ({today}, UTC)", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         report, code = run_screen(
             prereg=args.prereg,
             catalog=args.catalog,
             truth=args.truth,
             out_dir=args.out,
-            as_of=as_of,
+            as_of=args.as_of or today,
         )
     except Refusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
