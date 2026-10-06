@@ -68,6 +68,12 @@ UMask=0077
 # line in breezy-live-tally.service (BLOCK-1.3).
 Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
 
+# AUT-2 r7 WP6 (L2): Persistent=true on the timer fires a missed run at any hour. The catch-up guard
+# refuses a start whose worst-case span meets the launch window [16:30Z, 17:10Z) or that begins in
+# the heavy night [01:00Z, 04:30Z); its exit 10 is mapped to 1 (a clean skip, never `failed`) and any
+# internal error to 255 (a failure that fires OnFailure=). The scheduled 13:55Z start is permitted.
+ExecCondition=/home/jon/breezy/deploy/systemd/slot-guard-run.sh --unit breezy-score-live-trials
+
 ExecStart=/home/jon/breezy/deploy/systemd/score-live-trials-run.sh
 
 # The counter walks the quote-tape Parquet catalog (load_depth per

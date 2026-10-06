@@ -1,0 +1,17 @@
+# TEST FIXTURE ONLY (AUT-2 WP6, E-15). 14:15Z is the primary label slot and 05:00Z the catch-up
+# (PM.us settles 08:00 ET; western CLI finals arrive 09:30-10:30Z). Never Persistent: a missed slot is
+# recovered by the next slot and by the label-lag backstop, never by a catch-up fire that could land
+# inside the [16:30Z, 17:10Z) launch window.
+[Unit]
+Description=14:15 and 05:00 UTC trigger for the Breezy AUT-2 label run
+
+[Timer]
+Unit=breezy-label-outcomes.service
+OnCalendar=*-*-* 14:15:00 UTC
+OnCalendar=*-*-* 05:00:00 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target

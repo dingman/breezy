@@ -21,6 +21,7 @@ from breezy.analysis.labeling.completeness import coverage_partition
 from breezy.analysis.labeling.fill_source import read_durable_fills
 from breezy.analysis.labeling.label_run import (
     CanaryRefused,
+    UnitContext,
     main,
     run_canary,
     synthesize_canary_fills,
@@ -53,6 +54,9 @@ _ALLOWED_READERS = frozenset(
         _SRC / "persistence" / "autonomy" / "canary_store.py",
         _SRC / "analysis" / "labeling" / "label_run.py",
         _SRC / "analysis" / "labeling" / "proof_window.py",
+        _SRC / "analysis" / "labeling" / "proof_source.py",
+        # declares the canary writer's own binds; it opens nothing
+        _SRC / "runtime" / "autonomy_sandbox" / "table.py",
     }
 )
 
@@ -234,6 +238,15 @@ def test_portfolio_roi_never_reads_canary() -> None:
 
 # -- the CLI ----------------------------------------------------------------------------------
 
+_IN_UNIT = UnitContext(
+    invocation_id="inv-1", cgroup_path="/user.slice/breezy-label-outcomes.service"
+)
+
+
+def _main(argv: list[str]) -> int:
+    return main(argv, unit_context=_IN_UNIT)
+
+
 _DAY_START_NS = 1_790_899_200_000_000_000  # 2026-10-02T00:00:00Z
 _CLI_NOW = _DAY_START_NS + 36 * 3_600_000_000_000  # 2026-10-03T12:00Z: the day is closed
 
@@ -261,7 +274,7 @@ def test_cli_canary_refuses_when_a_real_fill_exists_that_day(tmp_path: Path) -> 
     db = tmp_path / "exec.sqlite"
     seed_fills(db, [durable_fill(ts_event=_DAY_START_NS + 3_600_000_000_000)])
 
-    rc = main(_argv(tmp_path / "data", db))
+    rc = _main(_argv(tmp_path / "data", db))
 
     assert rc != 0 and not (tmp_path / "data" / "derived").exists()
 
@@ -272,7 +285,7 @@ def test_cli_canary_runs_on_a_zero_fill_day_and_ignores_other_days_fills(tmp_pat
     root = tmp_path / "data"
     root.mkdir(mode=0o700)
 
-    rc = main(_argv(root, db))
+    rc = _main(_argv(root, db))
 
     assert rc == 0 and read_canary_fills(root, _VENUE, _DAY)
 
@@ -281,20 +294,20 @@ def test_cli_canary_with_an_unreadable_exec_store_exits_nonzero(tmp_path: Path) 
     root = tmp_path / "data"
     root.mkdir(mode=0o700)
 
-    rc = main(_argv(root, tmp_path / "missing.sqlite"))
+    rc = _main(_argv(root, tmp_path / "missing.sqlite"))
 
     assert rc != 0 and not (root / "derived").exists()
 
 
 def test_cli_proof_window_has_no_store_source_yet_and_fails_closed(tmp_path: Path) -> None:
-    rc = main(["--proof-window", "--data-root", str(tmp_path), "--start-day", _DAY])
+    rc = _main(["--proof-window", "--data-root", str(tmp_path), "--start-day", _DAY])
 
     assert rc == 2 and not (tmp_path / "evidence").exists()
 
 
 def test_cli_requires_exactly_one_mode(tmp_path: Path) -> None:
-    assert main([]) == 2
-    assert main(["--canary", "--proof-window"]) == 2
+    assert _main([]) == 2
+    assert _main(["--canary", "--proof-window"]) == 2
 
 
 def test_cli_canary_refuses_an_open_or_future_day(tmp_path: Path) -> None:
@@ -307,7 +320,7 @@ def test_cli_canary_refuses_an_open_or_future_day(tmp_path: Path) -> None:
     earlier = _argv(root, db)
     earlier[earlier.index("--now-ns") + 1] = str(_DAY_START_NS - 1)
 
-    assert main(same_day) != 0 and main(earlier) != 0
+    assert _main(same_day) != 0 and _main(earlier) != 0
     assert not (root / "derived").exists()
 
 
@@ -316,4 +329,4 @@ def test_a_drill_fill_counts_as_a_real_fill_when_refusing_a_canary(tmp_path: Pat
     db = tmp_path / "exec.sqlite"
     seed_fills(db, [durable_fill(venue_order_id="drill-1", ts_event=_DAY_START_NS + 1)])
 
-    assert main(_argv(tmp_path / "data", db)) != 0
+    assert _main(_argv(tmp_path / "data", db)) != 0

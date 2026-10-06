@@ -1,0 +1,26 @@
+# TEST FIXTURE ONLY (AUT-2 WP6, E-15; AUT-1 stage-3 F3 precedent): never linked into the user manager.
+# The unit is promoted into deploy/systemd/ only after AUT-6 lands the breezy-autonomy-failed@
+# notifier row and deliver_with_proof (WP6-promote). The studies lock is taken IN PROCESS by label_run
+# (E7_STUDIES_LOCK, LABEL_FLOCK_WAIT_S = 600), so no flock stands in front of the wrapper and the
+# wait cannot age anything. Pre lines 5 + 5 = 10; ExecStart K + T = 5 + 1785 = 1790; 10 + 1790 = 1800.
+#
+# WP6-SIZE: MemoryHigh and MemoryMax are deliberately absent. The coordinator measures the label
+# run's OWN cgroup memory.peak (label_run --measure-peak) and adds both lines with the evidence
+# artefact and test_label_unit_memory_max_from_measured_label_peak in one reviewed commit.
+[Unit]
+Description=Breezy AUT-2 label run (user scope, sandboxed)
+OnFailure=breezy-autonomy-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+Slice=breezy-studies.slice
+UMask=0077
+TimeoutStartSec=1800
+TimeoutStopSec=5
+ExecStartPre=/usr/bin/timeout -k 1 4 /usr/bin/install -d -m 0700 %h/.local/share/breezy/derived/labels %h/.local/share/breezy/derived/labels_canary %h/.local/share/breezy/derived/label_outcomes %h/.local/share/breezy/derived/canary %h/.local/share/breezy/derived/verdicts %h/.local/share/breezy/evidence/aut2 %h/.local/share/breezy/evidence/aut2_live_proof %h/.local/share/breezy/cache/label_run_snapshot
+ExecStartPre=-/usr/bin/timeout -k 1 4 /usr/bin/touch %t/breezy-studies.lock
+ExecStart=/usr/bin/timeout -k 5 1785 /home/jon/breezy/deploy/systemd/breezy-autonomy-bwrap breezy-label-outcomes /home/jon/breezy/.venv/bin/python3 -I -m breezy.analysis.labeling.label_run
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-label-outcomes

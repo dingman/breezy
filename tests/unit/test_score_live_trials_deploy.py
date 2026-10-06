@@ -693,7 +693,8 @@ def test_score_live_trials_unit_pair_exists_and_wires_to_wrapper() -> None:
 
     timer_text = timer_path.read_text()
     assert "Unit=breezy-score-live-trials.service" in timer_text
-    assert "OnCalendar=*-*-* 14:15:00 UTC" in timer_text
+    # AUT-2 WP6: moved from 14:15 so the tally releases before the label run's flock wait expires
+    assert "OnCalendar=*-*-* 13:55:00 UTC" in timer_text
     assert "Persistent=true" in timer_text
 
 

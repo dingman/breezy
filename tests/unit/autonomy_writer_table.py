@@ -169,6 +169,27 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "through delivery.deliver_critical; an O_EXCL loser treats the key as delivered (L3)",
         "write_once",
     ),
+    # AUT-2 r7 WP6 (plan sections 3.2.2 and 3.12): the run marker, the label-hold journal and the
+    # measured-peak artefact. Each goes through single_read.write_once (label_store.write_marker,
+    # skip_journal.write_json_once); the marker is always the last write of a run.
+    FileWriter(
+        "derived/label_outcomes/<day>/marker_<now_ns>.json",
+        "the label run (analysis.labeling.label_core), under the studies flock, last write of a "
+        "run, through label_store.write_marker; never written on exit 1",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/aut2/holds/<day>/<now_ns>_label-outcomes.json",
+        "the label unit's memory-gate hold path (analysis.labeling.label_run.run_unit), under the "
+        "studies flock, through memory_gate.record_hold",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/aut2/memory/label_run_peak_<now_ns>.json",
+        "label_run --measure-peak, once per measurement under --output-root only, through "
+        "skip_journal.write_json_once",
+        "write_once",
+    ),
     # AUT-2 r7 WP8 (plan sections 3.2.2, 3.8, 6): the canary path and the live-proof artefact. All
     # three go through single_read.write_once (write-once); the canary day file is written whole,
     # never appended, so no raw write site exists.

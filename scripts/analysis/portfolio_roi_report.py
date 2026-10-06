@@ -96,9 +96,23 @@ from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFi
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
 from breezy.adapters.polymarket_us.fees import taker_fee_at_fill
 from breezy.adapters.polymarket_us.operator_controls import _round_cost_up_to_cent
+from breezy.analysis.labeling.completeness import is_final_row
+from breezy.analysis.labeling.instrument_facts import bucket_facts_from_instrument_id
+from breezy.analysis.labeling.legacy_crh_scorer import LEGACY_SCORER_ID
 from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import WeatherBucketFacts
+from breezy.persistence.autonomy.label_store import (
+    LabelRow,
+    LabelStoreError,
+    MarkerCorrupt,
+    RunMarker,
+    RunOutcome,
+    labels_consumable,
+    read_labels,
+    read_newest_marker,
+)
+from breezy.persistence.autonomy.single_read import SingleReadRefused
 from breezy.persistence.catalog import (
     CatalogPathError,
     open_station_catalog,
@@ -169,6 +183,7 @@ __all__ = [
     "PERMANENTLY_UNSETTLED_EVENT",
     "PORTFOLIO_ROI_SCHEMA_VERSION",
     "PROCEEDS_DATE_PROXY_LABEL",
+    "ROI_STATUS_GATED_IDENTITY",
     "ROI_STATUS_GATED_UNLABELLED_FQ",
     "ROI_STATUS_GATED_UNSETTLED_CAPITAL",
     "ROI_STATUS_OK",
@@ -2192,6 +2207,13 @@ _KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
 ROI_STATUS_GATED_UNSETTLED_CAPITAL: Final[str] = "GATED_UNSETTLED_CAPITAL"
+#: AUT-2 r7 WP6: the full report is gated on the label-run marker (`labels_consumable`). An absent,
+#: stale, unreadable or FAILED_IDENTITY marker, or any unresolved / missing-label fill, is
+#: `GATED_IDENTITY`; pending labels reuse `GATED_UNSETTLED_CAPITAL`. A gated report publishes no ROI.
+ROI_STATUS_GATED_IDENTITY: Final[str] = "GATED_IDENTITY"
+_LABEL_GATED_STATUSES: Final[frozenset[str]] = frozenset(
+    {"GATED_IDENTITY", "GATED_UNLABELLED_FQ", "GATED_UNSETTLED_CAPITAL"}
+)
 #: AUT-2 r7 WP1: the status of the `--status-only` scorer entry while any durable fill sits in
 #: the legacy UNRECONCILED bucket (every FQ fill, until a C2 label store feeds this report in
 #: WP6). It is the entry's status only: the full report's `roi_status` is unchanged by WP1 (an
@@ -2623,6 +2645,10 @@ class PortfolioRoiReportData:
     settled_cumulative_unexplained_net: Decimal = Decimal(0)
     provisional_cumulative_unexplained_net: Decimal = Decimal(0)
     settled_cumulative_passes_net: bool = True
+    #: AUT-2 WP6: the C2 (label store) P&L term of the union, and the report's one pass flag, which
+    #: is the NET (external-flow-adjusted) cash-identity flag, never the raw one.
+    realised_pnl_c2_total: Decimal = Decimal(0)
+    pass_flag: bool = True
     #: The per-day net verdict, keyed by `day` -- a SIBLING of
     #: `daily_reconciliation` (see `NetReconciliationRow`'s docstring).
     net_reconciliation: tuple[NetReconciliationRow, ...] = ()
@@ -2669,6 +2695,8 @@ def build_portfolio_roi_report_data(
     external_flow_pulled_at_ns: int | None = None,
     external_flow_newest_rejected_status: str | None = None,
     n_external_flow_records: int = 0,
+    realised_pnl_c2_total: Decimal = Decimal(0),
+    roi_status_override: str | None = None,
 ) -> PortfolioRoiReportData:
     """Assemble the one :class:`PortfolioRoiReportData` this run produces.
 
@@ -2732,7 +2760,11 @@ def build_portfolio_roi_report_data(
         settled_through_statistic=settled_through_statistic,
         lag_sample_n=lag_sample_n,
         roi_status=(
-            ROI_STATUS_GATED_UNSETTLED_CAPITAL if unsettled_count > 0 else ROI_STATUS_OK
+            roi_status_override
+            if roi_status_override is not None
+            else ROI_STATUS_GATED_UNSETTLED_CAPITAL
+            if unsettled_count > 0
+            else ROI_STATUS_OK
         ),
         unsettled_capital_positions=unsettled_count,
         max_days_past_horizon=max_days_past_horizon,
@@ -2756,7 +2788,9 @@ def build_portfolio_roi_report_data(
         n_residual_pending=n_residual_pending,
         n_residual_unresolved=n_residual_unresolved,
         realised_pnl_residual_total=realised_pnl_residual_total,
-        realised_pnl_portfolio_total=total_realised_pnl + realised_pnl_residual_total,
+        realised_pnl_portfolio_total=(
+            total_realised_pnl + realised_pnl_residual_total + realised_pnl_c2_total
+        ),
         trial_rows=trial_rows_of(scored_trials, registered_manifests=registered_manifests),
         external_flow_evidence_status=external_flow_evidence_status,
         external_flow_pulled_at_ns=external_flow_pulled_at_ns,
@@ -2769,6 +2803,8 @@ def build_portfolio_roi_report_data(
         settled_cumulative_unexplained_net=cumulative.settled_cumulative_unexplained_net,
         provisional_cumulative_unexplained_net=cumulative.provisional_cumulative_unexplained_net,
         settled_cumulative_passes_net=cumulative.settled_cumulative_passes_net,
+        realised_pnl_c2_total=realised_pnl_c2_total,
+        pass_flag=cumulative.settled_cumulative_passes_net,
     )
 
 
@@ -2790,9 +2826,12 @@ def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
         "realised_pnl_residual_total": str(data.realised_pnl_residual_total),
         "realised_pnl_portfolio_total": str(data.realised_pnl_portfolio_total),
         "capital_deployed_total": str(data.capital_deployed_total),
-        "roi": str(data.roi),
-        "roi_minus_b0": str(data.roi_minus_b0),
-        "roi_minus_b1": str(data.roi_minus_b1),
+        # a label-gated report publishes no ROI figure at all (AUT-2 WP6)
+        "roi": None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi),
+        "roi_minus_b0": None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi_minus_b0),
+        "roi_minus_b1": None if data.roi_status in _LABEL_GATED_STATUSES else str(data.roi_minus_b1),
+        "realised_pnl_c2_total": str(data.realised_pnl_c2_total),
+        "pass_flag": data.pass_flag,
         "unexplained_flow_days": data.unexplained_flow_days,
         "settled_through": data.settled_through,
         "settled_through_statistic": data.settled_through_statistic,
@@ -2951,6 +2990,11 @@ class PortfolioRoiReportView:
     _roi_minus_b1: Decimal
 
     def _raise_if_gated(self) -> None:
+        if self.roi_status in _LABEL_GATED_STATUSES - {ROI_STATUS_GATED_UNSETTLED_CAPITAL}:
+            raise UnsettledCapitalRoiError(
+                f"portfolio ROI is gated on the label run ({self.roi_status}); "
+                "consult capital_deployed_total and n_fills instead of any ROI field"
+            )
         if self.roi_status == ROI_STATUS_GATED_UNSETTLED_CAPITAL:
             raise UnsettledCapitalRoiError(
                 "portfolio ROI is gated: "
@@ -2974,6 +3018,14 @@ class PortfolioRoiReportView:
     def roi_minus_b1(self) -> Decimal:
         self._raise_if_gated()
         return self._roi_minus_b1
+
+
+def _gated_decimal(raw: Mapping[str, object], key: str) -> Decimal:
+    """A report gated on the label marker carries ``null`` ROI fields; the view then raises on
+    access (``_raise_if_gated``), so the placeholder is never readable as a figure."""
+    if raw.get(key) is None and raw.get("roi_status") in _LABEL_GATED_STATUSES:
+        return Decimal(0)
+    return _require_decimal_str(raw, key)
 
 
 def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
@@ -3160,9 +3212,9 @@ def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
             else True
         ),
         net_reconciliation=_require_net_reconciliation_rows(raw),
-        _roi=_require_decimal_str(raw, "roi"),
-        _roi_minus_b0=_require_decimal_str(raw, "roi_minus_b0"),
-        _roi_minus_b1=_require_decimal_str(raw, "roi_minus_b1"),
+        _roi=_gated_decimal(raw, "roi"),
+        _roi_minus_b0=_gated_decimal(raw, "roi_minus_b0"),
+        _roi_minus_b1=_gated_decimal(raw, "roi_minus_b1"),
     )
 
 
@@ -3365,7 +3417,8 @@ def journal_line(data: PortfolioRoiReportData) -> str:
         f"n_explained_external_flow_days={data.n_explained_external_flow_days} "
         f"n_external_flow_mismatch_days={data.n_external_flow_mismatch_days} "
         f"n_external_flow_unverifiable_days={data.n_external_flow_unverifiable_days} "
-        f"settled_reconciliation_passes_net={data.settled_cumulative_passes_net}"
+        f"settled_reconciliation_passes_net={data.settled_cumulative_passes_net} "
+        f"pass_flag={data.pass_flag}"
     )
 
 
@@ -3551,6 +3604,15 @@ def _default_scored_trials_dir() -> Path:
     if override:
         return Path(override)
     return Path.home() / ".local" / "share" / "breezy" / "derived" / "scored_trials"
+
+
+def _default_labels_data_root() -> Path:
+    """The data root holding the label store and run markers: the env override, else the
+    production root (AUT-2 WP6)."""
+    override = os.environ.get("BREEZY_LABELS_DATA_ROOT", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "breezy"
 
 
 def _default_logs_dir() -> Path:
@@ -3986,8 +4048,78 @@ def _read_bucketed_ledger(
     )
 
 
+class PnlSourceOverlapError(Exception):
+    """A trial is in both the legacy scored store and the C2 label store: the P&L union would pay
+    it twice, so the run refuses (AUT-2 WP6)."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _LabelView:
+    """The label store as the report sees it: the gate, the rows and the covered fills."""
+
+    gate_status: str | None
+    rows: tuple[LabelRow, ...]
+    final_client_orders: frozenset[str]
+
+    def c2_rows(self) -> tuple[LabelRow, ...]:
+        """Admissible entry rows the legacy scorer did not write (its rows ARE the legacy trials)."""
+        return tuple(
+            row
+            for row in self.rows
+            if row.admissible and row.role.value == "entry" and row.scorer_id != LEGACY_SCORER_ID
+        )
+
+
+def _gate_status_of(root: Path, now_ns: int) -> str | None:
+    """``None`` when the newest marker lets the labels be consumed, else the gated status."""
+    try:
+        marker = read_newest_marker(root)
+    except (MarkerCorrupt, SingleReadRefused, OSError):
+        return ROI_STATUS_GATED_IDENTITY
+    if marker is None:
+        return ROI_STATUS_GATED_IDENTITY
+    gate = marker.gate()
+    if labels_consumable(gate, now_ns=now_ns):
+        return None
+    if labels_consumable(replace(gate, pending=0), now_ns=now_ns):
+        return ROI_STATUS_GATED_UNSETTLED_CAPITAL  # only pending labels hold it back
+    return ROI_STATUS_GATED_IDENTITY
+
+
+def _read_label_view(root: Path, now_ns: int) -> _LabelView:
+    status = _gate_status_of(root, now_ns)
+    try:
+        rows = read_labels(root)
+    except (LabelStoreError, SingleReadRefused, OSError):
+        return _LabelView(
+            gate_status=ROI_STATUS_GATED_IDENTITY, rows=(), final_client_orders=frozenset()
+        )
+    final = frozenset(
+        row.client_order_id
+        for row in rows
+        if row.role.value == "entry" and is_final_row(row, now_ns=now_ns, deadline_ns=now_ns)
+    )
+    return _LabelView(gate_status=status, rows=rows, final_client_orders=final)
+
+
+def _unlabelled_fq_fills(
+    buckets: Mapping[FillBucket, tuple[AttributedFill, ...]], labels: _LabelView
+) -> int:
+    """UNRECONCILED fills with an FQ instrument that no final C2 row covers."""
+    return sum(
+        1
+        for item in buckets.get(FillBucket.UNRECONCILED, ())
+        if bucket_facts_from_instrument_id(item.fill.instrument_id) is not None
+        and item.fill.client_order_id not in labels.final_client_orders
+    )
+
+
 def _status_only(
-    *, exec_state_db_path: Path, scored_trials_dir: Path, families_dir: Path
+    *,
+    exec_state_db_path: Path,
+    scored_trials_dir: Path,
+    families_dir: Path,
+    labels_data_root: Path | None = None,
 ) -> int:
     """AUT-2 r7 WP1, the portfolio-roi scorer entry: print the gate, publish no figure.
 
@@ -4003,7 +4135,13 @@ def _status_only(
     )
     if bucketed is None:
         return 1
-    unlabelled = len(bucketed.buckets.get(FillBucket.UNRECONCILED, ()))
+    root = labels_data_root if labels_data_root is not None else _default_labels_data_root()
+    covered = _read_label_view(root, time.time_ns()).final_client_orders
+    unlabelled = sum(
+        1
+        for item in bucketed.buckets.get(FillBucket.UNRECONCILED, ())
+        if item.fill.client_order_id not in covered
+    )
     status = scorer_roi_status(unlabelled)
     print(f"PORTFOLIO_ROI {status} unlabelled={unlabelled}")
     return 0
@@ -4020,6 +4158,7 @@ def _run(
     sink: AlertSink,
     catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
     capital_flows_dir: Path | None = None,
+    labels_data_root: Path | None = None,
 ) -> int:
     """The I/O shell's actual work, factored out of `main()` as an explicit
     test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
@@ -4053,6 +4192,31 @@ def _run(
     family_station_results = bucketed.family_station_results
     n_family_station_refusals = bucketed.n_family_station_refusals
     buckets = bucketed.buckets
+
+    # AUT-2 WP6: the label gate, the C2 P&L term and the overlap refusal. An omitted root reads the
+    # default root, so the gate can never be bypassed by leaving the argument out.
+    labels = _read_label_view(
+        labels_data_root if labels_data_root is not None else _default_labels_data_root(), now_ns
+    )
+    c2_rows = labels.c2_rows()
+    overlap = sorted(
+        {row.trial_id for row in c2_rows} & (frozenset(scored_ids) | frozenset(residual_ids))
+    )
+    if overlap:
+        print(
+            f"portfolio_roi_report: PNL_SOURCE_OVERLAP: {len(overlap)} trial(s) are in both the "
+            "legacy scored store and the C2 label store",
+            file=sys.stderr,
+        )
+        return 1
+    c2_pnl = sum((row.realized_pnl or Decimal(0) for row in c2_rows), Decimal(0))
+    unlabelled_fq = _unlabelled_fq_fills(buckets, labels)
+    if labels.gate_status is not None:
+        label_status: str | None = labels.gate_status
+    elif unlabelled_fq > 0:
+        label_status = ROI_STATUS_GATED_UNLABELLED_FQ
+    else:
+        label_status = None
 
     if fills:
         period_start = min(_utc_day_of_fill(f) for f in fills)
@@ -4176,7 +4340,7 @@ def _run(
         # SAME `UnknownOrderSideError` try block (Decision 2 file-by-file).
         residual_pnl = total_realised_pnl_residual(residual_settlements)
         baselines = roi_against_baselines(
-            total_realised_pnl=total_pnl + residual_pnl,
+            total_realised_pnl=total_pnl + residual_pnl + c2_pnl,
             total_capital_deployed=total_capital,
             fills=fills,
         )
@@ -4257,6 +4421,8 @@ def _run(
         external_flow_pulled_at_ns=external_flow_evidence.pulled_at_ns,
         external_flow_newest_rejected_status=external_flow_evidence.newest_rejected_status,
         n_external_flow_records=len(external_flow_evidence.flows),
+        realised_pnl_c2_total=c2_pnl,
+        roi_status_override=label_status,
     )
 
     # F7/F9: atomic writes -- the directory is created by

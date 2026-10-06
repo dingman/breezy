@@ -288,6 +288,33 @@ _CAPTURE_ROWS: Final[tuple[BwrapRow, ...]] = (
 )
 
 
+#: AUT-2 WP6 (E-15; AUT-1 ``_CAPTURE_ROWS`` precedent): the label run. It writes the C2 labels,
+#: their canary twin, the run marker, the verdicts and its own evidence, and reads the exec store
+#: only through a snapshot copy in its cache bind (``exec_snapshot(take_flock=False)``). Egress is
+#: declared (DNS and network) for the injected delivery seam; it binds no ``evidence/alerts``
+#: before AUT-6.
+_LABEL_OUTCOMES_ROW: Final = BwrapRow(
+    name="breezy-label-outcomes",
+    owner_plan="AUT-2",
+    units=frozenset({"breezy-label-outcomes.service"}),
+    binds=(
+        "derived/labels",
+        "derived/labels_canary",
+        "derived/label_outcomes",
+        "derived/canary",
+        "derived/verdicts",
+        "evidence/aut2",
+        "evidence/aut2_live_proof",
+        "cache/label_run_snapshot",
+    ),
+    entry_modules=("breezy.analysis.labeling.label_run",),
+    resolves_dns=True,
+    network="egress",
+    studies_lock=True,
+    exceptions=frozenset({"E7_STUDIES_LOCK"}),
+)
+
+
 #: The seam B rows. They run only as transient ``systemd-run --unit=<name>`` units.
 AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
     {
@@ -342,6 +369,7 @@ AUTONOMY_BWRAP_TABLE: Final[Mapping[str, BwrapRow]] = MappingProxyType(
                 network="none",
             ),
             *_CAPTURE_ROWS,
+            _LABEL_OUTCOMES_ROW,
         )
     }
 )

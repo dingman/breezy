@@ -58,6 +58,24 @@ def _load_module() -> ModuleType:
 
 _prr = _load_module()
 
+
+@pytest.fixture(autouse=True)
+def _consumable_label_marker(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AUT-2 WP6: the full report is gated on the newest label-run marker. Every test that predates
+    the gate runs against a root holding a consumable (fresh, clean) marker; the gate's own tests
+    below point the root elsewhere. The marker is dated far ahead so no test clock makes it stale."""
+    from breezy.persistence.autonomy.label_store import RunMarker, RunOutcome, write_marker
+
+    root = tmp_path_factory.mktemp("labels_root")
+    root.chmod(0o700)
+    write_marker(
+        root,
+        RunMarker(RunOutcome.NO_INPUT, 0, None, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        day="2100-01-01",
+        now_ns=4_102_444_800_000_000_000,
+    )
+    monkeypatch.setenv("BREEZY_LABELS_DATA_ROOT", str(root))
+
 FEE_RECONCILED_LABEL = _prr.FEE_RECONCILED_LABEL
 FEE_UNRECONCILED_LABEL = _prr.FEE_UNRECONCILED_LABEL
 AttributedFill = _prr.AttributedFill
@@ -5086,6 +5104,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
             "settled_cumulative_unexplained_net",
             "provisional_cumulative_unexplained_net",
             "settled_cumulative_passes_net",
+            "pass_flag",  # AUT-2 WP6: the report's one pass flag IS the net flag
             "net_reconciliation",
         }
         for key in json_without:
@@ -5556,3 +5575,321 @@ class TestRoiStatusGatedUnlabelledFq:
         assert _prr.ROI_STATUS_GATED_UNLABELLED_FQ == "GATED_UNLABELLED_FQ"
         assert _prr.scorer_roi_status(2) == _prr.ROI_STATUS_GATED_UNLABELLED_FQ
         assert _prr.scorer_roi_status(0) == ROI_STATUS_OK
+
+
+
+# --------------------------------------------------------------------------
+# AUT-2 r7 WP6: the full report is gated on the label-run marker (labels_consumable), unions its
+# P&L as legacy scored trials + C2 rows with overlap refused, and its pass flag is the NET flag.
+# --------------------------------------------------------------------------
+
+_NS_PER_H = 3_600_000_000_000
+_FQ_YES = "tc-temp-laxhigh-2026-10-02-gte89lt90f.POLYMARKET_US"
+
+
+def _marker_root(
+    tmp_path: Path, name: str = "lroot", marker: dict[str, Any] | None = None, *, now_ns: int
+) -> Path:
+    from breezy.persistence.autonomy.label_store import RunMarker, RunOutcome, write_marker
+
+    root = tmp_path / name
+    root.mkdir(mode=0o700)
+    if marker is not None:
+        fields: dict[str, Any] = {
+            "run_outcome": RunOutcome.LABELLED,
+            "durable_fill_count": 1,
+            "durable_fill_count_prev": None,
+            "labelled_final": 1,
+            "unattributed_pre_epoch": 0,
+            "legacy_labelled": 0,
+            "open": 0,
+            "pending": 0,
+            "unresolved": 0,
+            "missing_label": 0,
+            "p_null_count": 0,
+            "non_c1_post_epoch_count": 0,
+        }
+        fields.update(marker)
+        write_marker(root, RunMarker(**fields), day="2026-10-04", now_ns=now_ns)
+    return root
+
+
+def _fq_store(tmp_path: Path, n: int = 1) -> Path:
+    store_path = tmp_path / "fq_state.db"
+    store = SqliteStateStore(store_path)
+    try:
+        for i in range(n):
+            fill = _fill(
+                venue_order_id=f"vo-fq-{i}",
+                instrument_id=_FQ_YES,
+                ts_event=_ns_of_day("2026-10-02") + i,
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-fq-{i}", fill.to_bytes())
+    finally:
+        store.close()
+    return store_path
+
+
+def _c2_row(client_order_id: str = "client-vo-fq-0", **over: Any) -> Any:
+    from tests.support.aut2_fixtures import make_label_row
+
+    base: dict[str, Any] = {
+        "client_order_id": client_order_id,
+        "label_id": "b" * 32,
+        "trial_id": "forecast_quantile_ladder/trial/LAX/2026-10-02/89_90:yes.POLYMARKET_US",
+    }
+    base.update(over)
+    return make_label_row(**base)
+
+
+def _full_run(tmp_path: Path, store_path: Path, labels_root: Path, now_ns: int) -> int:
+    code: int = _run(
+        exec_state_db_path=store_path,
+        scored_trials_dir=tmp_path / "scored_trials",
+        logs_dir=tmp_path / "logs",
+        output_dir=tmp_path / "derived",
+        families_dir=tmp_path / "families",
+        now_ns=now_ns,
+        sink=_prr.resolve_alert_sink({}),
+        labels_data_root=labels_root,
+    )
+    return code
+
+
+def _report(tmp_path: Path, day: str) -> dict[str, Any]:
+    loaded: dict[str, Any] = json.loads(
+        (tmp_path / "derived" / f"PRIVATE_portfolio_roi_{day}.json").read_text()
+    )
+    return loaded
+
+
+_NOW_NS = _ns_of_day("2026-10-04") + 12 * _NS_PER_H
+
+
+class TestLabelGate:
+    def test_gated_unlabelled_fq_publishes_no_roi_figure(self, tmp_path: Path) -> None:
+        root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
+
+        exit_code = _full_run(tmp_path, _fq_store(tmp_path), root, _NOW_NS)
+
+        assert exit_code == 0
+        report = _report(tmp_path, "2026-10-04")
+        assert report["roi_status"] == _prr.ROI_STATUS_GATED_UNLABELLED_FQ
+        for key in ("roi", "roi_minus_b0", "roi_minus_b1"):
+            assert report[key] is None
+        md = (tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-10-04.md").read_text()
+        assert "GATED -- see roi_status" in md
+        view = _prr.read_portfolio_roi_report(
+            tmp_path / "derived" / "PRIVATE_portfolio_roi_2026-10-04.json"
+        )
+        with pytest.raises(_prr.UnsettledCapitalRoiError):
+            _ = view.roi
+
+    def test_a_labelled_fq_fill_is_not_unlabelled_and_the_report_is_ok(self, tmp_path: Path) -> None:
+        from breezy.persistence.autonomy.label_store import write_labels
+
+        root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
+        write_labels(root, "pm_us_crh_fq_v1", [_c2_row()], now_ns=_NOW_NS - _NS_PER_H)
+
+        exit_code = _full_run(tmp_path, _fq_store(tmp_path), root, _NOW_NS)
+
+        assert exit_code == 0
+        assert _report(tmp_path, "2026-10-04")["roi_status"] == _prr.ROI_STATUS_OK
+
+    def test_pending_gt_zero_gates_roi(self, tmp_path: Path) -> None:
+        root = _marker_root(tmp_path, marker={"pending": 1}, now_ns=_NOW_NS - _NS_PER_H)
+
+        assert _full_run(tmp_path, _seed_unlabelled_store(tmp_path, 0), root, _NOW_NS) == 0
+
+        report = _report(tmp_path, "2026-10-04")
+        assert report["roi_status"] == _prr.ROI_STATUS_GATED_UNSETTLED_CAPITAL
+        assert report["roi"] is None
+
+    def test_failed_identity_marker_gates_roi(self, tmp_path: Path) -> None:
+        from breezy.persistence.autonomy.label_store import RunOutcome
+
+        root = _marker_root(
+            tmp_path, marker={"run_outcome": RunOutcome.FAILED_IDENTITY}, now_ns=_NOW_NS - _NS_PER_H
+        )
+
+        assert _full_run(tmp_path, _seed_unlabelled_store(tmp_path, 0), root, _NOW_NS) == 0
+
+        report = _report(tmp_path, "2026-10-04")
+        assert report["roi_status"] == _prr.ROI_STATUS_GATED_IDENTITY and report["roi"] is None
+
+    @pytest.mark.parametrize("field", ["unresolved", "missing_label"])
+    def test_unresolved_or_missing_label_gates_roi(self, tmp_path: Path, field: str) -> None:
+        root = _marker_root(tmp_path, marker={field: 1}, now_ns=_NOW_NS - _NS_PER_H)
+
+        assert _full_run(tmp_path, _seed_unlabelled_store(tmp_path, 0), root, _NOW_NS) == 0
+
+        assert _report(tmp_path, "2026-10-04")["roi_status"] == _prr.ROI_STATUS_GATED_IDENTITY
+
+    def test_an_absent_or_stale_marker_gates_identity(self, tmp_path: Path) -> None:
+        absent = _marker_root(tmp_path, "absent", marker=None, now_ns=0)
+        stale = _marker_root(tmp_path, "stale", marker={}, now_ns=_NOW_NS - 27 * _NS_PER_H)
+
+        for root in (absent, stale):
+            out = tmp_path / root.name
+            out.mkdir(exist_ok=True)
+            code = _run(
+                exec_state_db_path=_seed_unlabelled_store(out, 0),
+                scored_trials_dir=out / "scored_trials",
+                logs_dir=out / "logs",
+                output_dir=out / "derived",
+                families_dir=out / "families",
+                now_ns=_NOW_NS,
+                sink=_prr.resolve_alert_sink({}),
+                labels_data_root=root,
+            )
+            assert code == 0
+            got = json.loads((out / "derived" / "PRIVATE_portfolio_roi_2026-10-04.json").read_text())
+            assert got["roi_status"] == _prr.ROI_STATUS_GATED_IDENTITY
+
+    def test_an_unreadable_marker_gates_identity_never_ok(self, tmp_path: Path) -> None:
+        root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
+        next(root.rglob("marker_*.json")).write_bytes(b"{")
+
+        assert _full_run(tmp_path, _seed_unlabelled_store(tmp_path, 0), root, _NOW_NS) == 0
+
+        assert _report(tmp_path, "2026-10-04")["roi_status"] == _prr.ROI_STATUS_GATED_IDENTITY
+
+    def test_the_default_labels_root_is_env_then_home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("BREEZY_LABELS_DATA_ROOT", str(tmp_path / "x"))
+        assert _prr._default_labels_data_root() == tmp_path / "x"
+        monkeypatch.delenv("BREEZY_LABELS_DATA_ROOT")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert _prr._default_labels_data_root() == tmp_path / ".local" / "share" / "breezy"
+
+    def test_status_only_subtracts_fills_covered_by_a_final_label(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from breezy.persistence.autonomy.label_store import write_labels
+
+        root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
+        write_labels(root, "pm_us_crh_fq_v1", [_c2_row()], now_ns=_NOW_NS - _NS_PER_H)
+        monkeypatch.setenv("BREEZY_LABELS_DATA_ROOT", str(root))
+
+        exit_code = _status_only(tmp_path, _fq_store(tmp_path, 2))
+
+        assert exit_code == 0
+        assert capsys.readouterr().out == "PORTFOLIO_ROI GATED_UNLABELLED_FQ unlabelled=1\n"
+
+
+class TestPnlUnionAndNetFlag:
+    def _legacy_plus_fq(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, c2_trial_id: str | None = None
+    ) -> tuple[Path, Path]:
+        from breezy.persistence.autonomy.label_store import write_labels
+
+        families_dir = tmp_path / "families"
+        _write_registered_family_manifest(
+            families_dir, family_id="fam_a", trial_id_prefix="fam_a/trial/"
+        )
+        scored_trials_dir = tmp_path / "scored_trials"
+        legacy = _scored_trial(trial_id="fam_a/trial/LAX/2026-09-01", pnl=Decimal("0.10"))
+        write_scored_trials(scored_trials_dir / "fam_a", [legacy], now_ns=1)
+        store_path = tmp_path / "union_state.db"
+        store = SqliteStateStore(store_path)
+        try:
+            for vid, inst, day in (
+                ("vo-a", "LAX-92-94.POLYMARKET_US", "2026-09-01"),
+                ("vo-fq-0", _FQ_YES, "2026-10-02"),
+            ):
+                fill = _fill(venue_order_id=vid, instrument_id=inst, ts_event=_ns_of_day(day))
+                store.set(f"{_FILL_KEY_PREFIX}{vid}", fill.to_bytes())
+        finally:
+            store.close()
+        monkeypatch.setattr(
+            _prr,
+            "read_filled_trials_state_db",
+            _stub_reader(
+                {("fam_a/trial/", "LAX"): ((), {"fam_a/trial/LAX/2026-09-01": (True, "vo-a", False)})}
+            ),
+        )
+        root = _marker_root(tmp_path, marker={}, now_ns=_NOW_NS - _NS_PER_H)
+        row = _c2_row() if c2_trial_id is None else _c2_row(trial_id=c2_trial_id)
+        write_labels(root, "pm_us_crh_fq_v1", [row], now_ns=_NOW_NS - _NS_PER_H)
+        return root, store_path
+
+    def test_pnl_source_union_labels_and_legacy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root, store_path = self._legacy_plus_fq(tmp_path, monkeypatch)
+
+        assert _full_run(tmp_path, store_path, root, _NOW_NS) == 0
+
+        report = _report(tmp_path, "2026-10-04")
+        assert report["realised_pnl_after_fees_total"] == "0.10"  # scored-only, unchanged (AC3)
+        assert report["realised_pnl_c2_total"] == "0.57"
+        assert report["realised_pnl_portfolio_total"] == "0.67"
+
+    def test_an_overlapping_trial_in_both_sources_is_refused_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root, store_path = self._legacy_plus_fq(
+            tmp_path, monkeypatch, c2_trial_id="fam_a/trial/LAX/2026-09-01"
+        )
+
+        assert _full_run(tmp_path, store_path, root, _NOW_NS) == 1
+
+        assert "PNL_SOURCE_OVERLAP" in capsys.readouterr().err
+        assert not (tmp_path / "derived").exists()
+
+    def test_legacy_scorer_rows_are_the_same_trials_and_never_added_twice(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from breezy.analysis.labeling.legacy_crh_scorer import LEGACY_SCORER_ID
+        from breezy.persistence.autonomy.label_store import write_labels
+
+        root, store_path = self._legacy_plus_fq(tmp_path, monkeypatch)
+        legacy_row = _c2_row(
+            client_order_id="client-vo-a",
+            label_id="c" * 32,
+            trial_id="fam_a/trial/LAX/2026-09-01",
+            scorer_id=LEGACY_SCORER_ID,
+            realized_pnl=Decimal("0.10"),
+            family_id="pm_us_crh_v2",
+            p_source=_prr_psource_none(),
+        )
+        write_labels(root, "pm_us_crh_v2", [legacy_row], now_ns=_NOW_NS - 2 * _NS_PER_H)
+
+        assert _full_run(tmp_path, store_path, root, _NOW_NS) == 0
+
+        assert _report(tmp_path, "2026-10-04")["realised_pnl_c2_total"] == "0.57"
+
+    def test_pass_flag_is_net(self) -> None:
+        import dataclasses
+
+        base = _prr.cumulative_reconciliation(daily_rows=(), settled_through="2026-10-01")
+        baselines = _prr.roi_against_baselines(
+            total_realised_pnl=Decimal(0), total_capital_deployed=Decimal(0), fills=[]
+        )
+
+        def data(raw: bool, net: bool) -> Any:
+            cumulative = dataclasses.replace(
+                base, settled_cumulative_passes=raw, settled_cumulative_passes_net=net
+            )
+            return _prr.build_portfolio_roi_report_data(
+                period_start="2026-10-01",
+                period_end="2026-10-03",
+                fill_buckets={},
+                total_realised_pnl=Decimal(0),
+                total_capital_deployed=Decimal(0),
+                baselines=baselines,
+                cumulative=cumulative,
+                settled_through_statistic="max",
+                lag_sample_n=0,
+                permanently_unsettled=(),
+            )
+
+        assert data(raw=False, net=True).pass_flag is True
+        assert data(raw=True, net=False).pass_flag is False
+        assert "pass_flag=False" in _prr.journal_line(data(raw=True, net=False))
+        assert _prr._portfolio_roi_json_dict(data(raw=False, net=True))["pass_flag"] is True
+
+
+def _prr_psource_none() -> Any:
+    from breezy.persistence.autonomy.label_schema import PSource
+
+    return PSource.NONE

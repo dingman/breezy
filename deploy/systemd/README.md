@@ -950,7 +950,7 @@ ruling, not a deploy step.
 
 **Activation record (coordinator, 2026-09-05 04:19 UTC).** Symlinked both units into
 `~/.config/systemd/user/`, `daemon-reload` (also picks up `breezy-live-tally.service`'s new
-`Environment=` path line), `enable --now breezy-score-live-trials.timer` (next fire 14:15 UTC).
+`Environment=` path line), `enable --now breezy-score-live-trials.timer` (next fire 13:55 UTC; moved from 14:15 by AUT-2 WP6).
 Pre-deploy checks: live store 0 fill rows (read-only), node-env pre-flight `MATCH` against the
 running node, full unit suite green through the no-egress gate. Smoke run
 (`systemctl --user start breezy-score-live-trials.service`): `Result=success`, exit 0,
@@ -959,7 +959,7 @@ running node, full unit suite green through the no-egress gate. Smoke run
 Chain evidence: `tests/contract/test_live_fill_scoring_chain_contract.py`; reviews:
 `docs/evidence/codex_fill_chain_review_2026-09-05.md`.
 
-`breezy-score-live-trials.service` + `.timer` run the 14:15 UTC increment of
+`breezy-score-live-trials.service` + `.timer` run the 13:55 UTC increment of
 `docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` (I3) via
 `deploy/systemd/score-live-trials-run.sh`, in the same wrapper-owns-the-work
 style as `live-tally-run.sh`. Each run: (1) a node-env pre-flight (`"$PY" -m
@@ -979,7 +979,8 @@ SOLE writer of that marker anywhere in this repo. Both `breezy-live-tally`
 (14:30 UTC) and `breezy-pm-crh-v2-tally` (17:15 UTC) assert it before
 tallying, so neither can run against a partial or unscored store (BLOCK-2).
 
-Scheduled at **14:15 UTC**, free on the existing schedule and strictly
+Scheduled at **13:55 UTC** (moved from 14:15 UTC by AUT-2 WP6 so its worst case, 14:17:30, releases
+before the AUT-2 label run's 14:15 + 600 s studies-flock wait expires), free on the existing schedule and strictly
 before both tallies it gates — pinned by
 `tests/unit/test_deploy_timer_hours.py`. The unit carries one non-secret
 `Environment=POLYMARKET_US_EXEC_STATE_DB=...` path literal, byte-identical
@@ -1305,7 +1306,7 @@ the manifest's `status` is `REGISTERED` (not `DRAFT_NOT_REGISTERED`), so
 the CLI's own draft gate (`family_tally_v2.py:1042`, SHADOW/DIAGNOSTIC-only
 output for a non-`REGISTERED` manifest) does not apply -- full
 `SURVIVE`/`KILL`/`CONTINUE` verdict vocabulary is issued. The tally's
-source parquet is the SAME store the v2 tally and the 14:15Z scorer read
+source parquet is the SAME store the v2 tally and the scorer read
 (`BREEZY_SCORED_TRIALS_DIR`, default
 `~/.local/share/breezy/derived/scored_trials`) -- no separate store exists
 for v3. As of 2026-09-16 (before that day's 14:15Z scorer run) the live
@@ -1923,3 +1924,22 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
 - **Launch window.** 11:40 and 12:40 are outside 16:30-17:10Z
   (`tests/unit/test_launch_window_table.py`) and free of every other timer tick
   (`tests/unit/test_deploy_timer_hours.py`).
+
+
+## AUT-2 WP6: the tally catch-up guard
+
+`breezy-score-live-trials.timer` is `Persistent=true`, so a host outage across 13:55Z fires the
+tally at the next timer activation, at any hour. `breezy-score-live-trials.service` therefore
+carries `ExecCondition=slot-guard-run.sh --unit breezy-score-live-trials`. The guard
+(`breezy.analysis.labeling.slot_guard`) refuses a start whose worst-case span
+`[start, start + AccuracySec + TimeoutStartSec + TimeoutStopSec]` meets the launch window
+`[16:30Z, 17:10Z)` or that begins in the heavy night `[01:00Z, 04:30Z)`; every bound is read from the
+unit files and an absent `TimeoutStopSec` is systemd's 90 s default. The scheduled 13:55Z start is
+always permitted. The wrapper maps the guard's exit 0 to 0, its deliberate refusal (10) to 1 (a
+clean skip, never `failed`) and every other status to 255 (a failure, so `OnFailure=` fires). The
+missed day is recovered by the next 13:55Z fire.
+
+The AUT-2 label unit (`breezy-label-outcomes.{service,timer}`) is a FIXTURE under
+`tests/fixtures/aut2_units/` and is not installed: it is promoted into this directory only after
+AUT-6 lands the `breezy-autonomy-failed@` notifier row and `deliver_with_proof`, and its
+`MemoryHigh`/`MemoryMax` lines come from the label run's own measured cgroup `memory.peak`.

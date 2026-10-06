@@ -32,7 +32,7 @@ from typing import Any, Final
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from breezy.persistence.autonomy.canonical import decimal_str
+from breezy.persistence.autonomy.canonical import canonical_json, decimal_str
 from breezy.persistence.autonomy.label_schema import (
     LABEL_SCHEMA_ID,
     LABEL_V1_ARROW_SCHEMA,
@@ -40,7 +40,7 @@ from breezy.persistence.autonomy.label_schema import (
     LabelRole,
     PSource,
 )
-from breezy.persistence.autonomy.paths import family_component
+from breezy.persistence.autonomy.paths import date_component, family_component
 from breezy.persistence.autonomy.single_read import (
     ReadPolicy,
     SingleReadReason,
@@ -56,12 +56,15 @@ from breezy.persistence.autonomy.wire import WireRefused
 __all__ = [
     "LABELS_DIR",
     "LABEL_FILE_MODE",
+    "MARKER_DIR",
     "MARKER_STALE_H",
     "ConflictingLabelRows",
     "InvalidLabelRow",
     "LabelMarker",
     "LabelRow",
     "LabelStoreError",
+    "MarkerCorrupt",
+    "RunMarker",
     "RunOutcome",
     "UnknownLabelSchema",
     "UnmappedScorerReason",
@@ -69,7 +72,9 @@ __all__ = [
     "label_relative_path",
     "labels_consumable",
     "read_labels",
+    "read_newest_marker",
     "write_labels",
+    "write_marker",
 ]
 
 LABELS_DIR: Final[tuple[str, ...]] = ("derived", "labels")
@@ -115,6 +120,10 @@ class InvalidLabelRow(LabelStoreError):
 
 class ConflictingLabelRows(LabelStoreError):
     """Two stored rows share ``(label_id, label_seq)`` but differ in content."""
+
+
+class MarkerCorrupt(LabelStoreError):
+    """The newest run marker (or a marker file name) cannot be decoded: never read as absent."""
 
 
 class RunOutcome(StrEnum):
@@ -435,3 +444,166 @@ def read_labels(
     finally:
         os.close(rootfd)
     return tuple(latest.values())
+
+
+# -- the run marker (plan r7 section 3.12) ---------------------------------------------------------
+
+MARKER_DIR: Final[tuple[str, ...]] = ("derived", "label_outcomes")
+_MARKER_SCHEMA: Final[str] = "label_outcomes_marker/v1"
+_MARKER_NAME_PREFIX: Final[str] = "marker_"
+_MARKER_NAME_SUFFIX: Final[str] = ".json"
+_MAX_MARKER_BYTES: Final[int] = 64 * 1024
+_MARKER_COUNTS: Final[tuple[str, ...]] = (
+    "durable_fill_count",
+    "labelled_final",
+    "unattributed_pre_epoch",
+    "legacy_labelled",
+    "open",
+    "pending",
+    "unresolved",
+    "missing_label",
+    "p_null_count",
+    "non_c1_post_epoch_count",
+)
+
+
+@dataclass(frozen=True)
+class RunMarker:
+    """One label run's marker: the outcome and every identity count (section 3.12).
+
+    ``written_at_ns`` is the ``now_ns`` of the file name; it is set on read and ignored on write.
+    """
+
+    run_outcome: RunOutcome
+    durable_fill_count: int
+    durable_fill_count_prev: int | None
+    labelled_final: int
+    unattributed_pre_epoch: int
+    legacy_labelled: int
+    open: int
+    pending: int
+    unresolved: int
+    missing_label: int
+    p_null_count: int
+    non_c1_post_epoch_count: int
+    written_at_ns: int = 0
+
+    def gate(self) -> LabelMarker:
+        """The gate-relevant view every consumer hands :func:`labels_consumable`."""
+        return LabelMarker(
+            run_outcome=self.run_outcome,
+            pending=self.pending,
+            unresolved=self.unresolved,
+            missing_label=self.missing_label,
+            written_at_ns=self.written_at_ns,
+        )
+
+
+def _count(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative int")
+    return value
+
+
+def _marker_body(marker: RunMarker) -> dict[str, object]:
+    body: dict[str, object] = {
+        "schema": _MARKER_SCHEMA,
+        "run_outcome": RunOutcome(marker.run_outcome).value,
+        "durable_fill_count_prev": (
+            None
+            if marker.durable_fill_count_prev is None
+            else _count("durable_fill_count_prev", marker.durable_fill_count_prev)
+        ),
+    }
+    for name in _MARKER_COUNTS:
+        body[name] = _count(name, getattr(marker, name))
+    return body
+
+
+def write_marker(data_root: Path, marker: RunMarker, *, day: str, now_ns: int) -> Path:
+    """Write ``derived/label_outcomes/<day>/marker_<now_ns>.json`` once (a re-write of identical
+    bytes is a no-op, different bytes ``EXISTS_DIFFERENT``). Counts are validated first."""
+    if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+        raise ValueError("now_ns must be a non-negative int")
+    data = canonical_json(_marker_body(marker))
+    parts = (
+        *MARKER_DIR,
+        date_component(day),
+        f"{_MARKER_NAME_PREFIX}{now_ns}{_MARKER_NAME_SUFFIX}",
+    )
+    rootfd = open_root(data_root)
+    try:
+        os.close(ensure_dir(rootfd, parts[:-1]))
+    finally:
+        os.close(rootfd)
+    path = data_root.joinpath(*parts)
+    write_once(path, data, root=data_root, mode=LABEL_FILE_MODE)
+    return path
+
+
+def _marker_ns(name: str) -> int:
+    if not (name.startswith(_MARKER_NAME_PREFIX) and name.endswith(_MARKER_NAME_SUFFIX)):
+        raise MarkerCorrupt("a marker directory holds a file that is not a marker")
+    digits = name[len(_MARKER_NAME_PREFIX) : -len(_MARKER_NAME_SUFFIX)]
+    if not digits.isascii() or not digits.isdigit():
+        raise MarkerCorrupt("a marker file name carries no timestamp")
+    return int(digits)
+
+
+def _decode_marker(raw: bytes, written_at_ns: int) -> RunMarker:
+    import json
+
+    try:
+        wire = json.loads(raw)
+        if wire["schema"] != _MARKER_SCHEMA:
+            raise MarkerCorrupt("the marker schema is not label_outcomes_marker/v1")
+        prev = wire["durable_fill_count_prev"]
+        return RunMarker(
+            run_outcome=RunOutcome(wire["run_outcome"]),
+            durable_fill_count_prev=None
+            if prev is None
+            else _count("durable_fill_count_prev", prev),
+            written_at_ns=written_at_ns,
+            **{name: _count(name, wire[name]) for name in _MARKER_COUNTS},
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        raise MarkerCorrupt("the newest marker does not decode") from exc
+
+
+def _list_or_empty(rootfd: int, parts: Sequence[str]) -> list[str]:
+    try:
+        dirfd = walk_dirs(rootfd, parts)
+    except SingleReadRefused as exc:
+        if exc.reason is SingleReadReason.NOT_FOUND:
+            return []
+        raise
+    try:
+        return _list_dir(dirfd)
+    finally:
+        os.close(dirfd)
+
+
+def read_newest_marker(data_root: Path, *, day: str | None = None) -> RunMarker | None:
+    """The marker with the highest ``now_ns`` across every day (or within ``day``), or ``None``.
+
+    A malformed file name or an undecodable newest marker raises :class:`MarkerCorrupt`: a consumer
+    treats it as GATED, never as an absent marker that merely lets a stale answer through.
+    """
+    rootfd = open_root(data_root)
+    try:
+        found: list[tuple[int, str, str]] = []
+        days = _list_or_empty(rootfd, MARKER_DIR) if day is None else [date_component(day)]
+        for each in days:
+            for name in _list_or_empty(rootfd, (*MARKER_DIR, each)):
+                found.append((_marker_ns(name), each, name))
+        if not found:
+            return None
+        ns, found_day, name = max(found)
+        dirfd = walk_dirs(rootfd, (*MARKER_DIR, found_day))
+        try:
+            raw = read_once_at(dirfd, name, max_bytes=_MAX_MARKER_BYTES, policy=ReadPolicy.STRICT)
+        finally:
+            os.close(dirfd)
+        return _decode_marker(raw, ns)
+    finally:
+        os.close(rootfd)
