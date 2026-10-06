@@ -141,8 +141,19 @@ C6_PROTOCOLS: Final[tuple[type, ...]] = (
 )
 
 
-def _registry_literal_keys(module: ModuleType) -> list[str]:
-    """Keys of the module's registry, read from the source so literal entries are enforced."""
+#: AUT-2 FQ-R41: the offline registry's exact per-kind plug-in type. FQ and both CRH kinds carry a
+#: real Scorer (``label``) and stay ``refusing`` for everything else; ``forecast_ladder`` has no
+#: fills and no scorer, so it stays the plain RefusingPlugin.
+EXPECTED_OFFLINE_TYPES: Final[dict[str, str]] = {
+    "current_rung_hold": "CurrentRungHoldOfflinePlugin",
+    "continuous_rung_hold": "ContinuousRungHoldOfflinePlugin",
+    "forecast_ladder": "RefusingPlugin",
+    "forecast_quantile_ladder": "FqOfflinePlugin",
+}
+
+
+def _registry_literal(module: ModuleType) -> dict[str, str]:
+    """Key -> constructor name of the module's registry literal, read from the source."""
     tree = ast.parse(Path(inspect.getfile(module)).read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.value, ast.Call):
@@ -151,13 +162,30 @@ def _registry_literal_keys(module: ModuleType) -> list[str]:
                 assert isinstance(call.args[0], ast.Dict)
                 assert all(isinstance(k, ast.Constant) for k in call.args[0].keys)
                 assert all(
-                    isinstance(v, ast.Call)
-                    and isinstance(v.func, ast.Name)
-                    and v.func.id == "RefusingPlugin"
+                    isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
                     for v in call.args[0].values
                 )
-                return [str(k.value) for k in call.args[0].keys if isinstance(k, ast.Constant)]
+                return {
+                    str(k.value): v.func.id  # type: ignore[attr-defined]
+                    for k, v in zip(call.args[0].keys, call.args[0].values, strict=True)
+                    if isinstance(k, ast.Constant)
+                }
     raise AssertionError("no literal MappingProxyType registry found")
+
+
+def _registry_literal_keys(module: ModuleType) -> list[str]:
+    return list(_registry_literal(module))
+
+
+#: Every C6 member except ``label``: each must refuse on every offline plug-in, scorer or not.
+NON_LABEL_MEMBERS: Final[tuple[tuple[str, tuple[object, ...]], ...]] = (
+    ("decision_record", (None, None)),
+    ("order_tags", ("d",)),
+    ("offline", (None, None)),
+    ("forward_shadow", (None, None, None)),
+    ("live", (None,)),
+    ("refit", (None,)),
+)
 
 
 def test_family_plugin_exact_set() -> None:
@@ -166,9 +194,46 @@ def test_family_plugin_exact_set() -> None:
     for registry in (NODE_PLUGINS, OFFLINE_PLUGINS):
         assert isinstance(registry, MappingProxyType)
         assert len(registry) == 4
-        assert all(type(v) is RefusingPlugin for v in registry.values())
+    # NODE_PLUGINS is untouched: every kind is still the plain RefusingPlugin
+    assert all(type(v) is RefusingPlugin for v in NODE_PLUGINS.values())
+    # OFFLINE_PLUGINS: each kind is EXACTLY its named class (``type(...) is``, no subclass slips in)
+    assert {k: type(v).__name__ for k, v in OFFLINE_PLUGINS.items()} == EXPECTED_OFFLINE_TYPES
     assert sorted(_registry_literal_keys(node_plugins)) == sorted(_COMPOSITION_KINDS)
     assert sorted(_registry_literal_keys(offline_plugins)) == sorted(_COMPOSITION_KINDS)
+    assert _registry_literal(offline_plugins) == EXPECTED_OFFLINE_TYPES
+    assert set(_registry_literal(node_plugins).values()) == {"RefusingPlugin"}
+
+
+def test_every_offline_plugin_is_incomplete_and_refuses_everything_but_label() -> None:
+    for kind, instance in OFFLINE_PLUGINS.items():
+        assert instance.refusing is True, kind
+        assert is_complete(instance) is False, kind
+        assert isinstance(instance, RefusingPlugin), kind
+        for name, args in NON_LABEL_MEMBERS:
+            with pytest.raises(PluginRefused):
+                getattr(instance, name)(*args)
+        with pytest.raises(PluginRefused):
+            _ = instance.detectors
+
+
+def test_no_offline_plugin_class_overrides_a_member_other_than_label() -> None:
+    members = {name for name, _ in NON_LABEL_MEMBERS} | {"detectors", "refusing"}
+    for kind, instance in OFFLINE_PLUGINS.items():
+        if type(instance) is RefusingPlugin:
+            continue  # the base class itself defines every refusing member
+        for klass in type(instance).__mro__[: type(instance).__mro__.index(RefusingPlugin)]:
+            assert set(vars(klass)) & members == set(), (kind, klass.__name__)
+        own: set[str] = set()
+        assert own == set(), (kind, own)
+
+
+def test_only_the_three_scorer_kinds_have_a_real_label() -> None:
+    for kind, instance in OFFLINE_PLUGINS.items():
+        has = getattr(instance, "has_scorer", False)
+        assert has is (kind != "forecast_ladder"), kind
+        if not has:
+            with pytest.raises(PluginRefused):
+                instance.label(None, None, None)
 
 
 def test_registries_are_read_only() -> None:

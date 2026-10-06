@@ -198,7 +198,10 @@ def _refusal(
         plugin = deps.registry.get(family.kind)
         if plugin is None:
             return family.family_id, "no_plugin"
-        if not getattr(plugin, "refusing", False):
+        # a plug-in with a real scorer (``has_scorer``) never refuses the label run, even though it
+        # stays ``refusing`` for every other member (FQ-R41); a bare RefusingPlugin may refuse only
+        # for a retired kind with nothing left to label
+        if not getattr(plugin, "refusing", False) or getattr(plugin, "has_scorer", False):
             continue
         unlabelled = sum(
             1 for coid, kind in plan.fill_kinds.items() if kind == family.kind and coid not in final
@@ -214,7 +217,7 @@ def _score(
     capture_day = dt.date.fromisoformat(utc_day(deps.now_ns))
     scored: list[tuple[str, ScoredBatch]] = []
     for kind, plugin in deps.registry.items():
-        if getattr(plugin, "refusing", False):
+        if getattr(plugin, "refusing", False) and not getattr(plugin, "has_scorer", False):
             continue
         batch = ScoringBatch(deps.now_ns, prior, tuple(plan.inputs_by_kind.get(kind, ())))
         scored.append((kind, plugin.label(capture_day, batch, deps.settlements)))
