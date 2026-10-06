@@ -62,3 +62,28 @@ def test_reasons_are_the_plan_literals() -> None:
     assert registry.is_registered_reason("calibration_buckets_below_min")
     assert not registry.is_registered_reason("made_up")
     assert registry.DAY_STATUS_NO_INPUT == "NO_INPUT"
+
+
+_EXPECTED_SIDE_KIND_KEYS = (
+    "n_live_yes_NotDPlus1",
+    "n_live_yes_NotExecutable",
+    "n_live_yes_Refuse",
+    "n_live_yes_Take",
+    "n_live_no_NotDPlus1",
+    "n_live_no_NotExecutable",
+    "n_live_no_Refuse",
+    "n_live_no_Take",
+    "n_batch_yes_NotDPlus1",
+    "n_batch_yes_NotExecutable",
+    "n_batch_yes_Refuse",
+    "n_batch_yes_Take",
+    "n_batch_no_NotDPlus1",
+    "n_batch_no_NotExecutable",
+    "n_batch_no_Refuse",
+    "n_batch_no_Take",
+)
+
+
+def test_parity_side_kind_count_keys_are_pinned() -> None:
+    """The explicit tuple pin: a refactor of the generator must keep every key byte-identical."""
+    assert registry.PARITY_SIDE_KIND_COUNT_KEYS == _EXPECTED_SIDE_KIND_KEYS

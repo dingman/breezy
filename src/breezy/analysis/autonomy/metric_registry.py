@@ -109,8 +109,8 @@ PARITY_SCALAR_COUNT_KEYS: Final[tuple[str, ...]] = (
     "n_mismatches",
 )
 PARITY_SIDE_KIND_COUNT_KEYS: Final[tuple[str, ...]] = tuple(
-    f"n_{path}_{side}_{kind}"
-    for path in ("live", "batch")
+    f"n_{route}_{side}_{kind}"
+    for route in ("live", "batch")
     for side in ("yes", "no")
     for kind in ("NotDPlus1", "NotExecutable", "Refuse", "Take")
 )
