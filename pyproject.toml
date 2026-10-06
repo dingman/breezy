@@ -279,6 +279,7 @@ source_modules = [
     "breezy.persistence.autonomy.capture_schedule",
     "breezy.persistence.autonomy.capture_epoch",
     "breezy.persistence.autonomy.resolver",
+    "breezy.persistence.autonomy.sample_size",
 ]
 forbidden_modules = ["nautilus_trader", "breezy.domain"]
 allow_indirect_imports = false
@@ -324,6 +325,7 @@ source_modules = [
     "breezy.persistence.autonomy.capture_alerts",
     "breezy.persistence.autonomy.capture_schedule",
     "breezy.persistence.autonomy.capture_epoch",
+    "breezy.persistence.autonomy.sample_size",
 ]
 forbidden_modules = ["pyarrow"]
 allow_indirect_imports = false
