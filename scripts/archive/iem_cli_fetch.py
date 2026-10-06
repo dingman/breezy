@@ -3,11 +3,12 @@
 
 WHAT THIS IS
 ------------
-The ONE writer of the AFOS CLI cache revisions, and the offline reader that turns
-them into a truth dataset. ``fetch`` pulls the NWS CLI (AFOS ``CLI<loc>``) text
-products for every venue station from IEM through D-1; ``dataset`` reads the
-latest valid revision per station, never touches the network, and writes the
-finals plus an explicit ``coverage_gap`` field.
+The ONE writer of the AFOS CLI cache revisions (through the sibling store module
+``iem_cli_revisions``), and the offline reader that turns them into a truth dataset.
+``fetch`` pulls the NWS CLI (AFOS ``CLI<loc>``) text products for every venue station
+from IEM through D-1; ``dataset`` reads the latest promoted valid revision per
+station, never touches the network, and writes the finals plus an explicit
+``coverage_gap`` field and any ``skipped_revisions``.
 
 EGRESS
 ------
@@ -18,54 +19,81 @@ cap, the budget and the 1 s pacer are inherited. No venue credential and no
 ``operator.env`` is read; this module reads no environment variable at all (the
 unit loads ``alerts.env`` only so the failure notifier can deliver).
 
-CACHE
------
-``<cache>/afos-cli/<LOC>/<fetch_date>.json`` is the revision's commit marker and
-names its body ``<fetch_date>.<sha12>.txt``. Each run asks for a day-bounded
-window ``[window_start, fetch_date - 1]`` (the URL's ``edate`` moves with the fetch
-date, so every day has its own URL). A body is written under an exclusive
-non-blocking ``flock``: temp file, ``fsync``, atomic ``os.replace``, body first and
-marker last. A body that does not parse to CLI products, or whose climate-day
-coverage is smaller than the latest valid revision's, is rejected and logged to
-``rejected.jsonl``; it never becomes a revision. The reader returns the newest
-revision whose marker parses and whose body still matches its recorded sha256.
+CACHE (append-only)
+-------------------
+Each fetch commits a NEW revision ``<LOC>/<fetch_date>.<seq>.json`` (the commit
+marker) naming its body ``<fetch_date>.<seq>.<sha12>.txt``. A committed body or
+marker is NEVER unlinked or overwritten, including on a same-day rerun. A body is
+written under an exclusive non-blocking ``flock``: temp file, ``fsync``, atomic
+``os.replace``, directory ``fsync``; body first and marker last. A body that does
+not parse to CLI products, or whose climate-day coverage is smaller than the latest
+promoted revision's, is rejected and logged to ``rejected.jsonl``; it never becomes
+a revision. The reader returns the newest PROMOTED revision whose marker parses and
+whose body still matches its recorded sha256; every skipped corrupt marker is
+logged with its reason and returned by ``latest_valid_report``.
+
+VALUE CHANGES ARE NOT PROMOTED
+------------------------------
+If a new body changes ``tmax_f`` or the correction flag on a day the previous
+promoted revision already covers, it is committed (evidence) but marked
+``promoted=false`` with ``value_change_unconfirmed`` (day, old, new) in its marker
+and in ``changes.jsonl``; ``latest_valid`` keeps serving the previous value and the
+fetch exits 4 so ``OnFailure`` alerts. TODO(F2-follow-up, deliberately NOT built):
+promotion of an unconfirmed revision is a later explicit, human-reviewed path only.
 
 SINGLE WRITER
 -------------
 ``settlement_alignment_study.fetch_text_cached``/``fetch_bytes_cached`` are
 cache-read-only for AFOS CLI URLs (a miss raises ``AfosCliCacheMissError``).
 
-Exit codes: 0 complete, 1 one or more stations failed, 2 refusal (cache miss in
-``dataset`` or bad cache dir), 3 aborted (budget exhausted or another writer).
+LAUNCH WINDOW
+-------------
+Both subcommands refuse (exit 6) if started 16:30 <= UTC < 17:10; the timers carry
+no ``Persistent=true`` so a missed run is never replayed into that window.
+
+EXIT CODES
+----------
+0 complete
+1 one or more stations failed (HTTP/transport error, bad body, coverage reduced)
+2 refusal (``dataset`` cache miss, bad cache dir, or cache/output OSError)
+3 aborted (request budget exhausted, or another writer holds the lock)
+4 value change on a covered day committed but NOT promoted (takes priority over 1)
+5 catalog disagreement on a committed station (all else complete)
+6 refused: started inside the 16:30-17:10 UTC launch window
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import csv
 import datetime as dt
-import fcntl
-import hashlib
 import io
 import json
-import os
 import sys
 import time
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 _SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
-for _sibling in ("analysis", "venue"):  # pragma: no cover - bootstrap
+for _sibling in ("analysis", "venue", "archive"):  # pragma: no cover - bootstrap
     _sibling_path = str(_SCRIPTS_ROOT / _sibling)
     if _sibling_path not in sys.path:
         sys.path.insert(0, _sibling_path)
 
 # Imported after the sys.path bootstrap above (L-46: IEM retrieval stays under scripts/).
+from iem_cli_revisions import (  # type: ignore[import-not-found]
+    AFOS_CACHE_SUBDIR,
+    CacheLockedError,
+    Revision,
+    RevisionStore,
+    SkippedRevision,
+    atomic_write,
+    sha256_hex,
+)
 from iem_mos_probe_transport import (  # type: ignore[import-not-found]
     IEM_ALLOWED_HOSTS,
     IEM_MIN_INTERVAL_NS,
@@ -106,20 +134,19 @@ __all__ = [
     "FetchedText",
     "IemCliTransport",
     "NonIemUrlError",
+    "Revision",
     "RevisionStore",
+    "SkippedRevision",
     "StationOutcome",
     "TruthCacheMissError",
     "afos_cli_text_url",
     "build_dataset",
+    "catalog_cross_check",
     "fetch_all",
     "main",
     "require_afos_cli_url",
 ]
 
-AFOS_CACHE_SUBDIR: Final[str] = "afos-cli"
-LOCK_NAME: Final[str] = ".lock"
-REJECTED_LOG_NAME: Final[str] = "rejected.jsonl"
-REVISION_SCHEMA: Final[str] = "afos_cli_revision/v1"
 DATASET_SCHEMA: Final[str] = "fq_truth_cli/v1"
 DATASET_CSV_NAME: Final[str] = "truth_cli_finals.csv"
 DATASET_COVERAGE_NAME: Final[str] = "coverage.json"
@@ -134,17 +161,24 @@ ACCEPT: Final[str] = "text/plain"
 MAX_BODY_BYTES: Final[int] = 32 * 1024 * 1024
 MAX_ATTEMPTS: Final[int] = 3
 RETRY_BACKOFF_S: Final[float] = 30.0
-_BODY_SHA_PREFIX_LEN: Final[int] = 12
 _NS_PER_S: Final[int] = 1_000_000_000
 
 EXIT_OK: Final[int] = 0
 EXIT_FAILED: Final[int] = 1
 EXIT_REFUSED: Final[int] = 2
 EXIT_ABORTED: Final[int] = 3
+EXIT_VALUE_CHANGE: Final[int] = 4
+EXIT_DISAGREEMENT: Final[int] = 5
+EXIT_LAUNCH_WINDOW: Final[int] = 6
+
+#: Both subcommands refuse inside [16:30, 17:10) UTC (the launch window).
+LAUNCH_WINDOW_START: Final[dt.time] = dt.time(16, 30)
+LAUNCH_WINDOW_END: Final[dt.time] = dt.time(17, 10)
 
 STATUS_COMMITTED: Final[str] = "committed"
 STATUS_BAD_BODY: Final[str] = "rejected_bad_body"
 STATUS_COVERAGE_REDUCED: Final[str] = "rejected_coverage_reduced"
+STATUS_VALUE_CHANGE: Final[str] = "value_change_unconfirmed"
 STATUS_HTTP_ERROR: Final[str] = "http_error"
 STATUS_FETCH_ERROR: Final[str] = "fetch_error"
 
@@ -157,10 +191,6 @@ _RETRYABLE: Final[tuple[type[TransportError], ...]] = (
 
 class NonIemUrlError(ValueError):
     """The URL is not an https AFOS CLI retrieval on an IEM-allowed host."""
-
-
-class CacheLockedError(RuntimeError):
-    """Another writer holds the cache lock."""
 
 
 class TruthCacheMissError(RuntimeError):
@@ -230,166 +260,39 @@ class IemCliTransport(PacedIemTransport):  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
-# Revision store (the only writer of the AFOS CLI cache)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class Revision:
-    station: str
-    fetch_date: dt.date
-    url: str
-    body_path: Path
-    body_sha256: str
-    label_days: tuple[dt.date, ...]
-    catalog_check: Mapping[str, Any]
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        with tmp.open("wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-class RevisionStore:
-    def __init__(self, cache_dir: Path) -> None:
-        self._root = cache_dir / AFOS_CACHE_SUBDIR
-
-    @property
-    def root(self) -> Path:
-        return self._root
-
-    def station_dir(self, station: str) -> Path:
-        return self._root / station
-
-    @contextlib.contextmanager
-    def locked(self) -> Iterator[None]:
-        self._root.mkdir(parents=True, exist_ok=True)
-        with (self._root / LOCK_NAME).open("a") as handle:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise CacheLockedError("another AFOS CLI cache writer holds the lock") from exc
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    def latest_valid(self, station: str) -> Revision | None:
-        """The newest revision whose marker parses and whose body matches its sha256."""
-        directory = self.station_dir(station)
-        if not directory.is_dir():
-            return None
-        for marker in sorted(directory.glob("*.json"), reverse=True):
-            revision = self._load(station, directory, marker)
-            if revision is not None:
-                return revision
-        return None
-
-    def _load(self, station: str, directory: Path, marker: Path) -> Revision | None:
-        try:
-            meta = json.loads(marker.read_text(encoding="utf-8"))
-            if meta["schema"] != REVISION_SCHEMA or meta["station"] != station:
-                return None
-            body_path = directory / str(meta["body_file"])
-            body = body_path.read_bytes()
-            if _sha256(body) != meta["body_sha256"]:
-                return None
-            return Revision(
-                station=station,
-                fetch_date=dt.date.fromisoformat(meta["fetch_date"]),
-                url=str(meta["url"]),
-                body_path=body_path,
-                body_sha256=str(meta["body_sha256"]),
-                label_days=tuple(dt.date.fromisoformat(day) for day in meta["label_days"]),
-                catalog_check=dict(meta["catalog_check"]),
-            )
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-
-    def commit(
-        self,
-        *,
-        station: str,
-        fetch_date: dt.date,
-        url: str,
-        body: bytes,
-        label_days: Sequence[dt.date],
-        catalog_check: Mapping[str, Any],
-    ) -> str:
-        """Write body then marker. Caller must hold ``locked()``. Returns the body sha256."""
-        directory = self.station_dir(station)
-        directory.mkdir(parents=True, exist_ok=True)
-        digest = _sha256(body)
-        body_name = f"{fetch_date.isoformat()}.{digest[:_BODY_SHA_PREFIX_LEN]}.txt"
-        _atomic_write(directory / body_name, body)
-        meta = {
-            "schema": REVISION_SCHEMA,
-            "station": station,
-            "fetch_date": fetch_date.isoformat(),
-            "url": url,
-            "body_file": body_name,
-            "body_sha256": digest,
-            "body_bytes": len(body),
-            "label_days": [day.isoformat() for day in sorted(label_days)],
-            "catalog_check": dict(catalog_check),
-        }
-        marker = directory / f"{fetch_date.isoformat()}.json"
-        previous_body = self._body_named_by(marker)
-        _atomic_write(marker, (json.dumps(meta, sort_keys=True) + "\n").encode("utf-8"))
-        if previous_body is not None and previous_body != body_name:
-            (directory / previous_body).unlink(missing_ok=True)
-        return digest
-
-    @staticmethod
-    def _body_named_by(marker: Path) -> str | None:
-        try:
-            return str(json.loads(marker.read_text(encoding="utf-8"))["body_file"])
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-
-    def log_rejection(
-        self, *, station: str, fetch_date: dt.date, reason: str, body: bytes, detail: str
-    ) -> None:
-        directory = self.station_dir(station)
-        directory.mkdir(parents=True, exist_ok=True)
-        record = {
-            "fetch_date": fetch_date.isoformat(),
-            "reason": reason,
-            "body_sha256": _sha256(body),
-            "body_bytes": len(body),
-            "detail": detail,
-        }
-        with (directory / REJECTED_LOG_NAME).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-
-
-# ---------------------------------------------------------------------------
 # Fetch
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class StationOutcome:
+    """``detail`` carries ``message``, ``disagreement`` and ``compared_days`` (and changes)."""
+
     station: str
     status: str
-    detail: str
+    detail: Mapping[str, Any]
     body_sha256: str | None = None
     label_day_count: int = 0
 
     @property
     def ok(self) -> bool:
         return self.status == STATUS_COMMITTED
+
+    @property
+    def disagreement(self) -> bool:
+        return bool(self.detail.get("disagreement", False))
+
+
+def _detail(
+    message: str, check: Mapping[str, Any] | None = None, changes: Sequence[Any] = ()
+) -> dict[str, Any]:
+    check = check or {}
+    return {
+        "message": message,
+        "disagreement": bool(check.get("disagreement", False)),
+        "compared_days": int(check.get("compared_days", 0)),
+        "value_changes": list(changes),
+    }
 
 
 def _parse_labels(
@@ -449,6 +352,70 @@ async def _fetch_with_retry(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+async def _get_text(
+    fetcher: CliTextFetcher,
+    url: str,
+    sleep: Callable[[float], Awaitable[None]],
+    station: str,
+) -> FetchedText | StationOutcome:
+    try:
+        fetched = await _fetch_with_retry(fetcher, url, sleep)
+    except RequestBudgetExceededError:
+        raise
+    except TransportError as exc:
+        return StationOutcome(station, STATUS_FETCH_ERROR, _detail(f"{type(exc).__name__}: {exc}"))
+    if not 200 <= fetched.status_code < 300:
+        return StationOutcome(station, STATUS_HTTP_ERROR, _detail(f"HTTP {fetched.status_code}"))
+    return fetched
+
+
+def _check_coverage_not_reduced(
+    previous: Revision | None, labels: Mapping[dt.date, CliLabel], window_start: dt.date
+) -> str | None:
+    """A rejection detail if the new body lost climate days the previous revision covered."""
+    if previous is None:
+        return None
+    lost = sorted(day for day in previous.label_days if day >= window_start and day not in labels)
+    if not lost:
+        return None
+    return f"{len(lost)} previously covered climate days missing, first {lost[0]}"
+
+
+def _value_changes(
+    previous: Revision | None,
+    spec: SiteSpec,
+    labels: Mapping[dt.date, CliLabel],
+    window: tuple[dt.date, dt.date],
+) -> list[dict[str, Any]]:
+    """Covered days whose tmax or correction flag differ from the previous promoted revision."""
+    if previous is None:
+        return []
+    text = previous.body_path.read_text(encoding="utf-8")
+    old_labels, _errors = _parse_labels(spec, text, previous.url, *window)
+    return [
+        {
+            "climate_day": day.isoformat(),
+            "old_tmax_f": old_labels[day].tmax_f,
+            "new_tmax_f": labels[day].tmax_f,
+            "old_correction_flag": old_labels[day].correction_flag,
+            "new_correction_flag": labels[day].correction_flag,
+        }
+        for day in sorted(labels)
+        if day in old_labels
+        and (old_labels[day].tmax_f, old_labels[day].correction_flag)
+        != (labels[day].tmax_f, labels[day].correction_flag)
+    ]
+
+
+def _reject(
+    store: RevisionStore, station: str, fetch_date: dt.date, reason: str, body: bytes, detail: str
+) -> StationOutcome:
+    store.log_rejection(
+        station=station, fetch_date=fetch_date, reason=reason, body=body, detail=detail
+    )
+    return StationOutcome(station, reason, _detail(detail), sha256_hex(body))
+
+
 async def _fetch_station(
     *,
     spec: SiteSpec,
@@ -460,51 +427,34 @@ async def _fetch_station(
     sleep: Callable[[float], Awaitable[None]],
 ) -> StationOutcome:
     station = spec.site.cli_location
-    window_end = fetch_date - dt.timedelta(days=1)
-    url = afos_cli_text_url(station, window_start, window_end)
-    try:
-        fetched = await _fetch_with_retry(fetcher, url, sleep)
-    except RequestBudgetExceededError:
-        raise
-    except TransportError as exc:
-        return StationOutcome(station, STATUS_FETCH_ERROR, f"{type(exc).__name__}: {exc}")
-    if not 200 <= fetched.status_code < 300:
-        return StationOutcome(station, STATUS_HTTP_ERROR, f"HTTP {fetched.status_code}")
-
+    window = (window_start, fetch_date - dt.timedelta(days=1))
+    url = afos_cli_text_url(station, *window)
+    fetched = await _get_text(fetcher, url, sleep, station)
+    if isinstance(fetched, StationOutcome):
+        return fetched
     body = fetched.text.encode("utf-8")
-    labels, error_count = _parse_labels(spec, fetched.text, url, window_start, window_end)
+    labels, error_count = _parse_labels(spec, fetched.text, url, *window)
     if not labels:
-        detail = f"no parseable CLI final in window ({error_count} product parse errors)"
-        store.log_rejection(
-            station=station, fetch_date=fetch_date, reason=STATUS_BAD_BODY, body=body, detail=detail
-        )
-        return StationOutcome(station, STATUS_BAD_BODY, detail, _sha256(body))
-
+        message = f"no parseable CLI final in window ({error_count} product parse errors)"
+        return _reject(store, station, fetch_date, STATUS_BAD_BODY, body, message)
     previous = store.latest_valid(station)
-    if previous is not None:
-        lost = sorted(
-            day for day in previous.label_days if day >= window_start and day not in labels
-        )
-        if lost:
-            detail = f"{len(lost)} previously covered climate days missing, first {lost[0]}"
-            store.log_rejection(
-                station=station,
-                fetch_date=fetch_date,
-                reason=STATUS_COVERAGE_REDUCED,
-                body=body,
-                detail=detail,
-            )
-            return StationOutcome(station, STATUS_COVERAGE_REDUCED, detail, _sha256(body))
-
+    reduced = _check_coverage_not_reduced(previous, labels, window_start)
+    if reduced is not None:
+        return _reject(store, station, fetch_date, STATUS_COVERAGE_REDUCED, body, reduced)
+    changes = _value_changes(previous, spec, labels, window)
+    check = catalog_cross_check(spec.city, labels, catalog_tmax)
     digest = store.commit(
         station=station,
         fetch_date=fetch_date,
         url=url,
         body=body,
         label_days=tuple(labels),
-        catalog_check=catalog_cross_check(spec.city, labels, catalog_tmax),
+        catalog_check=check,
+        value_changes=changes,
     )
-    return StationOutcome(station, STATUS_COMMITTED, "ok", digest, len(labels))
+    status = STATUS_VALUE_CHANGE if changes else STATUS_COMMITTED
+    message = f"{len(changes)} covered day(s) changed, NOT promoted" if changes else "ok"
+    return StationOutcome(station, status, _detail(message, check, changes), digest, len(labels))
 
 
 async def fetch_all(
@@ -560,6 +510,70 @@ class DatasetReport:
     coverage: Mapping[str, Any]
 
 
+def _latest_per_station(
+    store: RevisionStore, sites: Sequence[SiteSpec]
+) -> tuple[dict[str, Revision], list[SkippedRevision]]:
+    found: dict[str, Revision] = {}
+    skipped: list[SkippedRevision] = []
+    for spec in sites:
+        station = spec.site.cli_location
+        revision, station_skipped = store.latest_valid_report(station)
+        skipped.extend(station_skipped)
+        if revision is not None:
+            found[station] = revision
+    missing = sorted(
+        spec.site.cli_location for spec in sites if spec.site.cli_location not in found
+    )
+    if missing:
+        raise TruthCacheMissError(
+            f"no valid AFOS CLI revision cached for {missing}; the dataset never fetches"
+            f" ({len(skipped)} corrupt revision(s) skipped)"
+        )
+    return found, skipped
+
+
+def _station_rows(
+    spec: SiteSpec, revision: Revision, labels: Mapping[dt.date, CliLabel]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "station": spec.site.cli_location,
+            "city": spec.city,
+            "climate_day": day.isoformat(),
+            "tmax_f": labels[day].tmax_f,
+            "tmax_flag": labels[day].tmax_flag or "",
+            "correction_flag": labels[day].correction_flag,
+            "issued_at_utc": labels[day].issued_at_utc.isoformat()
+            if labels[day].issued_at_utc
+            else "",
+            "product_sha256": labels[day].raw_sha256,
+            "revision_fetch_date": revision.fetch_date.isoformat(),
+            "revision_sha256": revision.body_sha256,
+        }
+        for day in sorted(labels)
+    ]
+
+
+def _station_coverage(
+    spec: SiteSpec,
+    revision: Revision,
+    labels: Mapping[dt.date, CliLabel],
+    gap: Sequence[dt.date],
+) -> dict[str, Any]:
+    return {
+        "city": spec.city,
+        "revision_fetch_date": revision.fetch_date.isoformat(),
+        "revision_sha256": revision.body_sha256,
+        "final_days": len(labels),
+        "coverage_gap_days": len(gap),
+        "coverage_gap": [day.isoformat() for day in gap],
+        "last_final_day": max(labels).isoformat() if labels else None,
+        "catalog_disagreement": bool(revision.catalog_check.get("disagreement", False)),
+        "catalog_disagreements": list(revision.catalog_check.get("disagreements", [])),
+        "catalog_check_status": revision.catalog_check.get("status"),
+    }
+
+
 def build_dataset(
     *,
     store: RevisionStore,
@@ -568,15 +582,8 @@ def build_dataset(
     output_dir: Path,
     window_start: dt.date = TRUTH_WINDOW_START,
 ) -> DatasetReport:
-    """Read the latest valid revision per station. A cache miss is a refusal, not a fetch."""
-    revisions = {
-        spec.site.cli_location: store.latest_valid(spec.site.cli_location) for spec in sites
-    }
-    missing = sorted(station for station, revision in revisions.items() if revision is None)
-    if missing:
-        raise TruthCacheMissError(
-            f"no valid AFOS CLI revision cached for {missing}; the dataset never fetches"
-        )
+    """Read the latest promoted revision per station. A cache miss is a refusal, not a fetch."""
+    revisions, skipped = _latest_per_station(store, sites)
     window_end = as_of - dt.timedelta(days=1)
     expected = [
         window_start + dt.timedelta(days=offset)
@@ -584,58 +591,31 @@ def build_dataset(
     ]
     rows: list[dict[str, Any]] = []
     stations: dict[str, Any] = {}
-    gap_total = 0
     for spec in sites:
-        station = spec.site.cli_location
-        revision = revisions[station]
-        assert revision is not None  # narrowed by the refusal above
+        revision = revisions[spec.site.cli_location]
         text = revision.body_path.read_text(encoding="utf-8")
         labels, _errors = _parse_labels(spec, text, revision.url, window_start, window_end)
+        rows.extend(_station_rows(spec, revision, labels))
         gap = [day for day in expected if day not in labels]
-        gap_total += len(gap)
-        for day in sorted(labels):
-            label = labels[day]
-            rows.append(
-                {
-                    "station": station,
-                    "city": spec.city,
-                    "climate_day": day.isoformat(),
-                    "tmax_f": label.tmax_f,
-                    "tmax_flag": label.tmax_flag or "",
-                    "correction_flag": label.correction_flag,
-                    "issued_at_utc": label.issued_at_utc.isoformat() if label.issued_at_utc else "",
-                    "product_sha256": label.raw_sha256,
-                    "revision_fetch_date": revision.fetch_date.isoformat(),
-                    "revision_sha256": revision.body_sha256,
-                }
-            )
-        stations[station] = {
-            "city": spec.city,
-            "revision_fetch_date": revision.fetch_date.isoformat(),
-            "revision_sha256": revision.body_sha256,
-            "final_days": len(labels),
-            "coverage_gap_days": len(gap),
-            "coverage_gap": [day.isoformat() for day in gap],
-            "last_final_day": max(labels).isoformat() if labels else None,
-            "catalog_disagreement": bool(revision.catalog_check.get("disagreement", False)),
-            "catalog_disagreements": list(revision.catalog_check.get("disagreements", [])),
-            "catalog_check_status": revision.catalog_check.get("status"),
-        }
+        stations[spec.site.cli_location] = _station_coverage(spec, revision, labels, gap)
     coverage: dict[str, Any] = {
         "schema": DATASET_SCHEMA,
         "as_of": as_of.isoformat(),
         "window_start": window_start.isoformat(),
         "through_d_minus_1": window_end.isoformat(),
         "expected_days_per_station": len(expected),
-        "coverage_gap_days": gap_total,
+        "coverage_gap_days": sum(s["coverage_gap_days"] for s in stations.values()),
         "catalog_disagreement": any(s["catalog_disagreement"] for s in stations.values()),
+        "skipped_revisions": [
+            {"station": s.station, "marker": s.marker, "reason": s.reason} for s in skipped
+        ],
         "stations": stations,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / DATASET_CSV_NAME
     coverage_path = output_dir / DATASET_COVERAGE_NAME
-    _atomic_write(csv_path, _render_csv(rows))
-    _atomic_write(coverage_path, (json.dumps(coverage, indent=2, sort_keys=True) + "\n").encode())
+    atomic_write(csv_path, _render_csv(rows))
+    atomic_write(coverage_path, (json.dumps(coverage, indent=2, sort_keys=True) + "\n").encode())
     return DatasetReport(csv_path=csv_path, coverage_path=coverage_path, coverage=coverage)
 
 
@@ -669,8 +649,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _now(clock: Callable[[], int]) -> dt.datetime:
+    return dt.datetime.fromtimestamp(clock() / _NS_PER_S, tz=dt.UTC)
+
+
 def _today(clock: Callable[[], int]) -> dt.date:
-    return dt.datetime.fromtimestamp(clock() / _NS_PER_S, tz=dt.UTC).date()
+    return _now(clock).date()
+
+
+def _in_launch_window(clock: Callable[[], int]) -> bool:
+    return LAUNCH_WINDOW_START <= _now(clock).time() < LAUNCH_WINDOW_END
+
+
+def _fetch_exit_code(outcomes: Sequence[StationOutcome]) -> int:
+    if any(outcome.status == STATUS_VALUE_CHANGE for outcome in outcomes):
+        return EXIT_VALUE_CHANGE
+    if not all(outcome.ok for outcome in outcomes):
+        return EXIT_FAILED
+    return EXIT_DISAGREEMENT if any(outcome.disagreement for outcome in outcomes) else EXIT_OK
 
 
 def _run_fetch(
@@ -708,8 +704,12 @@ def _run_fetch(
         print(f"aborted: {exc}", file=sys.stderr)
         return EXIT_ABORTED
     for outcome in outcomes:
-        print(f"{outcome.station} {outcome.status} {outcome.detail}")
-    return EXIT_OK if all(outcome.ok for outcome in outcomes) else EXIT_FAILED
+        print(
+            f"{outcome.station} {outcome.status} {outcome.detail['message']}"
+            f" disagreement={outcome.disagreement}"
+            f" compared_days={outcome.detail['compared_days']}"
+        )
+    return _fetch_exit_code(outcomes)
 
 
 def _run_dataset(args: argparse.Namespace, *, clock: Callable[[], int]) -> int:
@@ -722,7 +722,7 @@ def _run_dataset(args: argparse.Namespace, *, clock: Callable[[], int]) -> int:
             output_dir=Path(args.output_dir),
             window_start=dt.date.fromisoformat(args.window_start),
         )
-    except TruthCacheMissError as exc:
+    except (TruthCacheMissError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     print(f"coverage_gap_days={report.coverage['coverage_gap_days']} csv={report.csv_path}")
@@ -738,6 +738,9 @@ def main(
     """`clock` and `fetcher` are test seams, never CLI flags."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     resolved_clock = clock if clock is not None else time.time_ns
+    if _in_launch_window(resolved_clock):
+        print("refused: inside the 16:30-17:10 UTC launch window", file=sys.stderr)
+        return EXIT_LAUNCH_WINDOW
     if args.command == "fetch":
         return _run_fetch(args, clock=resolved_clock, fetcher=fetcher)
     return _run_dataset(args, clock=resolved_clock)

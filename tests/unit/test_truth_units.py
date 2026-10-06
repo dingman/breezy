@@ -73,6 +73,8 @@ def test_truth_units_bounded_and_outside_launch_window(unit: str) -> None:
     # Parked: only the timer is installable; the service carries no [Install].
     assert "[Install]" not in service
     assert "WantedBy=timers.target" in timer
+    # No catch-up: a Persistent= replay after downtime could land in the launch window.
+    assert not any(line.replace(" ", "").lower() == "persistent=true" for line in timer)
 
     # Scheduled outside [16:30Z, 17:10Z) including each firing's worst-case runtime.
     assert window_overlaps(DEPLOYED_DIR, only_timer=unit) == []
@@ -140,7 +142,10 @@ def test_dataset_never_fetches_cache_miss_refused(
         )
 
     # CLI path (what the unit runs): exit 2, nothing written, no request attempted.
-    code = fetch.main(["dataset", "--cache-dir", str(cache), "--output-dir", str(out)])
+    code = fetch.main(
+        ["dataset", "--cache-dir", str(cache), "--output-dir", str(out)],
+        clock=lambda: 1_790_000_000_000_000_000,  # fixed, outside the launch window
+    )
     assert code == fetch.EXIT_REFUSED
     assert "refused" in capsys.readouterr().err
     assert tripwire.attempts == 0

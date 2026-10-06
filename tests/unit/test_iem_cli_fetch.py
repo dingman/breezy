@@ -16,10 +16,11 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Final
 from urllib.parse import parse_qs, urlsplit
 
@@ -31,12 +32,13 @@ from breezy.ingest.probe_transport import RequestBudget
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCRIPT_PATH: Final[Path] = REPO_ROOT / "scripts/archive/iem_cli_fetch.py"
+STORE_PATH: Final[Path] = REPO_ROOT / "scripts/archive/iem_cli_revisions.py"
 NYC_PRODUCT: Final[Path] = REPO_ROOT / "tests/fixtures/nws/nyc_final_2026-08-21/product.txt"
 SENTINEL: Final[str] = "SENTINEL-VENUE-CREDENTIAL-VALUE"
 WINDOW_START: Final[dt.date] = dt.date(2026, 8, 18)
 TEST_UA: Final[str] = "breezy-truth-fetch-TESTONLY"
 
-for _sibling in ("analysis", "venue"):
+for _sibling in ("analysis", "venue", "archive"):
     _path = str(REPO_ROOT / "scripts" / _sibling)
     if _path not in sys.path:
         sys.path.insert(0, _path)
@@ -54,6 +56,11 @@ def _load_script(path: Path) -> ModuleType:
 @pytest.fixture(scope="module")
 def fetch() -> ModuleType:
     return _load_script(SCRIPT_PATH)
+
+
+@pytest.fixture(scope="module")
+def revisions(fetch: ModuleType) -> ModuleType:
+    return importlib.import_module("iem_cli_revisions")
 
 
 @pytest.fixture(scope="module")
@@ -210,21 +217,22 @@ def test_fetch_targets_every_registered_venue_station(fetch: ModuleType, tmp_pat
 def test_fetch_reads_no_venue_or_operator_env(
     fetch: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
-    docstring = ast.get_docstring(tree, clean=False)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            assert node.attr not in {"environ", "getenv", "environb"}, node.lineno
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if node.value == docstring:
-                continue
-            lowered = node.value.lower()
-            for forbidden in (".env", "polymarket_us_", "api_key", "secret", "credential"):
-                assert forbidden not in lowered, (forbidden, node.lineno)
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            module = node.module if isinstance(node, ast.ImportFrom) else ""
-            names = [module or ""] + [alias.name for alias in node.names]
-            assert not any("polymarket_us" in name for name in names), node.lineno
+    for module_path in (SCRIPT_PATH, STORE_PATH):
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        docstring = ast.get_docstring(tree, clean=False)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                assert node.attr not in {"environ", "getenv", "environb"}, node.lineno
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value == docstring:
+                    continue
+                lowered = node.value.lower()
+                for forbidden in (".env", "polymarket_us_", "api_key", "secret", "credential"):
+                    assert forbidden not in lowered, (forbidden, node.lineno)
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                module = node.module if isinstance(node, ast.ImportFrom) else ""
+                names = [module or ""] + [alias.name for alias in node.names]
+                assert not any("polymarket_us" in name for name in names), node.lineno
 
     for name in ("POLYMARKET_US_API_KEY", "POLYMARKET_US_ACCOUNT_NUMBER", "BREEZY_USER_AGENT"):
         monkeypatch.setenv(name, SENTINEL)
@@ -247,14 +255,70 @@ def test_fetch_reads_no_venue_or_operator_env(
 # ---------------------------------------------------------------------------
 
 
+_WRITE_METHODS: Final[frozenset[str]] = frozenset(
+    {"write_text", "write_bytes", "replace", "rename", "unlink", "touch", "mkdir"}
+)
+
+
+def _python_files() -> list[Path]:
+    return [p for root in ("scripts", "src") for p in sorted((REPO_ROOT / root).rglob("*.py"))]
+
+
+def _call_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for call in ast.walk(node):
+        if isinstance(call, ast.Call):
+            func = call.func
+            names.add(func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", ""))
+    return names
+
+
+def _afos_cache_literals(tree: ast.AST) -> bool:
+    return any(
+        isinstance(n, ast.Constant) and isinstance(n.value, str) and "afos-cli" in n.value
+        for n in ast.walk(tree)
+    )
+
+
+def _afos_cache_name_refs(tree: ast.AST) -> bool:
+    return any(
+        (isinstance(n, ast.Name) and n.id == "AFOS_CACHE_SUBDIR")
+        or (isinstance(n, ast.Attribute) and n.attr == "AFOS_CACHE_SUBDIR")
+        or (isinstance(n, ast.alias) and n.name == "AFOS_CACHE_SUBDIR")
+        for n in ast.walk(tree)
+    )
+
+
 def test_fetch_is_single_cache_writer(fetch: ModuleType, study: ModuleType, tmp_path: Path) -> None:
-    owners = [
-        path.relative_to(REPO_ROOT).as_posix()
-        for root in ("scripts", "src")
-        for path in sorted((REPO_ROOT / root).rglob("*.py"))
-        if fetch.AFOS_CACHE_SUBDIR in path.read_text(encoding="utf-8")
+    store_rel = STORE_PATH.relative_to(REPO_ROOT).as_posix()
+    fetch_rel = SCRIPT_PATH.relative_to(REPO_ROOT).as_posix()
+    parsed = {p: ast.parse(p.read_text(encoding="utf-8")) for p in _python_files()}
+
+    def rel(paths: Any) -> list[str]:
+        return [p.relative_to(REPO_ROOT).as_posix() for p in paths]
+
+    # The text grep stays: only the store module may even mention the cache subdirectory.
+    text_owners = [p for p in parsed if fetch.AFOS_CACHE_SUBDIR in p.read_text(encoding="utf-8")]
+    assert rel(text_owners) == [store_rel]
+    # AST: the literal lives only in the store; the constant is referenced only by the
+    # store and its single caller (the fetch script).
+    assert rel(p for p, t in parsed.items() if _afos_cache_literals(t)) == [store_rel]
+    assert sorted(rel(p for p, t in parsed.items() if _afos_cache_name_refs(t))) == sorted(
+        [fetch_rel, store_rel]
+    )
+    # Call sites: any other function that does a network get AND a filesystem write must
+    # route through the AFOS CLI refusal guard (the legacy cache helpers do).
+    unguarded = [
+        f"{path.relative_to(REPO_ROOT)}:{node.name}"
+        for path, tree in parsed.items()
+        if path not in (SCRIPT_PATH, STORE_PATH)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and "cache_path_for_url" in _call_names(node)
+        and _call_names(node) & _WRITE_METHODS
+        and "_refuse_afos_cli_write" not in _call_names(node)
     ]
-    assert owners == ["scripts/archive/iem_cli_fetch.py"]
+    assert unguarded == []
 
     # The dataset reads the cache and leaves every byte of it untouched.
     cache = tmp_path / "cache"
@@ -271,7 +335,7 @@ def test_fetch_is_single_cache_writer(fetch: ModuleType, study: ModuleType, tmp_
 
 
 def test_cache_write_is_flocked_atomic_rename(
-    fetch: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fetch: ModuleType, revisions: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events: list[tuple[str, str]] = []
     real_flock = fcntl.flock
@@ -287,8 +351,8 @@ def test_cache_write_is_flocked_atomic_rename(
         assert Path(src).name.startswith(".")  # a temp sibling, never the final name
         real_replace(src, dst)
 
-    monkeypatch.setattr(fetch.fcntl, "flock", spy_flock)
-    monkeypatch.setattr(fetch.os, "replace", spy_replace)
+    monkeypatch.setattr(revisions.fcntl, "flock", spy_flock)
+    monkeypatch.setattr(revisions.os, "replace", spy_replace)
 
     run_fetch(fetch, tmp_path, FakeFetcher(fetch, cli_body(days(18, 20))), dt.date(2026, 8, 22))
 
@@ -319,7 +383,7 @@ def test_cache_write_is_flocked_atomic_rename(
 
 def test_refetch_window_picks_latest_revision(fetch: ModuleType, tmp_path: Path) -> None:
     first = FakeFetcher(fetch, cli_body(days(18, 20), tmax=85))
-    second = FakeFetcher(fetch, cli_body(days(18, 21), tmax=88))
+    second = FakeFetcher(fetch, cli_body(days(18, 21), tmax=85))
     run_fetch(fetch, tmp_path, first, dt.date(2026, 8, 22))
     run_fetch(fetch, tmp_path, second, dt.date(2026, 8, 23))
 
@@ -462,3 +526,254 @@ def test_afos_cli_url_predicate_scope(study: ModuleType) -> None:
     assert study.is_afos_cli_url(pil.format("CLINYC"))
     assert not study.is_afos_cli_url(pil.format("AFDOKX"))
     assert not study.is_afos_cli_url("https://example.com/other.py?pil=CLINYC")
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: append-only revisions, unconfirmed value changes, visible skips
+# ---------------------------------------------------------------------------
+
+NOON_0823: Final[int] = int(dt.datetime(2026, 8, 23, 12, 0, tzinfo=dt.UTC).timestamp() * 1e9)
+
+
+def _clock_at(hour: int, minute: int, second: int = 0) -> Any:
+    when = dt.datetime(2026, 8, 23, hour, minute, second, tzinfo=dt.UTC)
+    return lambda: int(when.timestamp() * 1e9)
+
+
+def _nyc_only(fetch: ModuleType, monkeypatch: pytest.MonkeyPatch, catalog: Any = None) -> None:
+    spec = nyc_spec(fetch)
+    monkeypatch.setattr(fetch, "load_sites", lambda: [spec])
+    monkeypatch.setattr(fetch, "read_catalog_finals", lambda **_kw: (catalog or {}, {}))
+
+
+def _main_fetch(fetch: ModuleType, cache: Path, body: str, clock: Any = None) -> int:
+    return int(
+        fetch.main(
+            ["fetch", "--cache-dir", str(cache), "--window-start", WINDOW_START.isoformat()],
+            clock=clock or (lambda: NOON_0823),
+            fetcher=FakeFetcher(fetch, body),
+        )
+    )
+
+
+def test_value_change_on_covered_day_not_promoted(fetch: ModuleType, tmp_path: Path) -> None:
+    run_fetch(
+        fetch, tmp_path, FakeFetcher(fetch, cli_body(days(18, 20), tmax=85)), dt.date(2026, 8, 22)
+    )
+    store = fetch.RevisionStore(tmp_path)
+    original = store.latest_valid("NYC")
+
+    changed = cli_body(days(18, 21), tmax=90)
+    outcomes = run_fetch(fetch, tmp_path, FakeFetcher(fetch, changed), dt.date(2026, 8, 23))
+
+    assert [o.status for o in outcomes] == ["value_change_unconfirmed"]
+    assert outcomes[0].ok is False
+    assert store.latest_valid("NYC") == original  # still serves the previous value
+    directory = tmp_path / "afos-cli" / "NYC"
+    newest = json.loads(max(directory.glob("*.json")).read_text())
+    assert newest["promoted"] is False
+    assert [c["climate_day"] for c in newest["value_change_unconfirmed"]] == [
+        "2026-08-18",
+        "2026-08-19",
+        "2026-08-20",
+    ]
+    assert {(c["old_tmax_f"], c["new_tmax_f"]) for c in newest["value_change_unconfirmed"]} == {
+        (85, 90)
+    }
+    log = [json.loads(line) for line in (directory / "changes.jsonl").read_text().splitlines()]
+    assert [(c["climate_day"], c["old_tmax_f"], c["new_tmax_f"]) for c in log] == [
+        ("2026-08-18", 85, 90),
+        ("2026-08-19", 85, 90),
+        ("2026-08-20", 85, 90),
+    ]
+    # The changed body is retained as evidence, and a dataset keeps the previous value.
+    report = fetch.build_dataset(
+        store=store,
+        sites=[nyc_spec(fetch)],
+        as_of=dt.date(2026, 8, 21),
+        output_dir=tmp_path / "out",
+        window_start=WINDOW_START,
+    )
+    assert {row.split(",")[3] for row in report.csv_path.read_text().splitlines()[1:]} == {"85"}
+
+
+def test_previous_bodies_never_unlinked(fetch: ModuleType, tmp_path: Path) -> None:
+    directory = tmp_path / "afos-cli" / "NYC"
+    seen: set[str] = set()
+    # Two same-day reruns (different bodies) and a later-day run.
+    for date, body in (
+        (dt.date(2026, 8, 22), cli_body(days(18, 20))),
+        (dt.date(2026, 8, 22), cli_body(days(18, 20), tmax=99)),
+        (dt.date(2026, 8, 22), cli_body(days(18, 21))),
+        (dt.date(2026, 8, 23), cli_body(days(18, 21))),
+    ):
+        run_fetch(fetch, tmp_path, FakeFetcher(fetch, body), date)
+        files = {p.name for p in directory.iterdir() if p.suffix in {".txt", ".json"}}
+        assert seen <= files  # nothing committed earlier ever disappears
+        seen = files
+    assert len([n for n in seen if n.endswith(".txt")]) == 4
+    assert len([n for n in seen if n.endswith(".json")]) == 4
+
+
+def test_value_change_exits_nonzero(
+    fetch: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _nyc_only(fetch, monkeypatch)
+    # 2026-08-22 12:00Z establishes the revision; the changed value arrives a day later.
+    first = _main_fetch(fetch, tmp_path, cli_body(days(18, 20)), _clock_at(12, 0))
+    assert first == fetch.EXIT_OK
+    changed = _main_fetch(fetch, tmp_path, cli_body(days(18, 21), tmax=90))
+    assert changed == fetch.EXIT_VALUE_CHANGE == 4
+
+
+def test_catalog_disagreement_nonzero_exit(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = {("NYC", day): SimpleNamespace(tmax_f=80) for day in days(18, 20)}
+    _nyc_only(fetch, monkeypatch, catalog)
+    assert _main_fetch(fetch, tmp_path, cli_body(days(18, 20))) == fetch.EXIT_DISAGREEMENT == 5
+    assert "disagreement=True compared_days=3" in capsys.readouterr().out
+
+    # The structured outcome carries both fields too.
+    outcomes = run_fetch(
+        fetch,
+        tmp_path / "again",
+        FakeFetcher(fetch, cli_body(days(18, 20))),
+        dt.date(2026, 8, 22),
+        catalog_tmax={key: rec.tmax_f for key, rec in catalog.items()},
+    )
+    assert outcomes[0].detail["disagreement"] is True
+    assert outcomes[0].detail["compared_days"] == 3
+    assert outcomes[0].status == "committed"
+
+
+@pytest.mark.parametrize("command", ["fetch", "dataset"])
+def test_refuses_inside_launch_window(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _nyc_only(fetch, monkeypatch)
+    fetcher = FakeFetcher(fetch, cli_body(days(18, 20)))
+    extra = ["--output-dir", str(tmp_path / "o")] if command == "dataset" else []
+    for hour, minute, second in ((16, 30, 0), (16, 45, 0), (17, 9, 59)):
+        code = fetch.main(
+            [command, "--cache-dir", str(tmp_path / "cache"), *extra],
+            clock=_clock_at(hour, minute, second),
+            fetcher=fetcher,
+        )
+        assert code == fetch.EXIT_LAUNCH_WINDOW == 6
+    assert "launch window" in capsys.readouterr().err
+    assert fetcher.urls == []
+    assert not (tmp_path / "cache").exists() and not (tmp_path / "o").exists()
+    # Just outside the window on either side is not refused.
+    assert not fetch._in_launch_window(_clock_at(16, 29, 59))
+    assert not fetch._in_launch_window(_clock_at(17, 10, 0))
+
+
+def test_corrupt_newest_revision_reported_not_silent(
+    fetch: ModuleType, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    run_fetch(fetch, tmp_path, FakeFetcher(fetch, cli_body(days(18, 20))), dt.date(2026, 8, 22))
+    run_fetch(fetch, tmp_path, FakeFetcher(fetch, cli_body(days(18, 21))), dt.date(2026, 8, 23))
+    directory = tmp_path / "afos-cli" / "NYC"
+    newest = max(directory.glob("*.json"))
+    newest.write_text("{not json", encoding="utf-8")
+    store = fetch.RevisionStore(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="breezy.truth_fetch"):
+        revision, skipped = store.latest_valid_report("NYC")
+
+    assert revision.fetch_date == dt.date(2026, 8, 22)
+    assert [(s.marker, s.station) for s in skipped] == [(newest.name, "NYC")]
+    assert skipped[0].reason
+    assert newest.name in caplog.text and skipped[0].reason in caplog.text
+
+    report = fetch.build_dataset(
+        store=store,
+        sites=[nyc_spec(fetch)],
+        as_of=dt.date(2026, 8, 24),
+        output_dir=tmp_path / "out",
+        window_start=WINDOW_START,
+    )
+    coverage = json.loads(report.coverage_path.read_text())
+    assert [(s["station"], s["marker"]) for s in coverage["skipped_revisions"]] == [
+        ("NYC", newest.name)
+    ]
+    assert coverage["skipped_revisions"][0]["reason"] == skipped[0].reason
+
+
+def test_store_rejects_bad_station_and_traversing_body_file(
+    fetch: ModuleType, tmp_path: Path
+) -> None:
+    store = fetch.RevisionStore(tmp_path)
+    for bad in ("../x", "nyc", "NYCX", "NY", ""):
+        with pytest.raises(ValueError, match="station"):
+            store.station_dir(bad)
+
+    run_fetch(fetch, tmp_path, FakeFetcher(fetch, cli_body(days(18, 20))), dt.date(2026, 8, 22))
+    directory = tmp_path / "afos-cli" / "NYC"
+    marker = next(directory.glob("*.json"))
+    meta = json.loads(marker.read_text())
+    (tmp_path / "afos-cli" / "outside.txt").write_bytes(
+        (directory / meta["body_file"]).read_bytes()
+    )
+    meta["body_file"] = "../outside.txt"
+    marker.write_text(json.dumps(meta), encoding="utf-8")
+    revision, skipped = store.latest_valid_report("NYC")
+    assert revision is None
+    assert "bare file name" in skipped[0].reason
+
+
+def test_directory_fsynced_after_replace(
+    fetch: ModuleType, revisions: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    real_replace, real_fsync_dir = os.replace, revisions._fsync_dir
+
+    def spy_replace(src: Any, dst: Any) -> None:
+        events.append("replace")
+        real_replace(src, dst)
+
+    def spy_fsync_dir(path: Path) -> None:
+        events.append("fsync_dir")
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(revisions.os, "replace", spy_replace)
+    monkeypatch.setattr(revisions, "_fsync_dir", spy_fsync_dir)
+    run_fetch(fetch, tmp_path, FakeFetcher(fetch, cli_body(days(18, 20))), dt.date(2026, 8, 22))
+    assert events == ["replace", "fsync_dir", "replace", "fsync_dir"]
+
+
+def test_dataset_oserror_exits_2_and_no_production_assert(
+    fetch: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(**_kwargs: Any) -> Any:
+        raise PermissionError("disk says no")
+
+    monkeypatch.setattr(fetch, "build_dataset", boom)
+    monkeypatch.setattr(fetch, "load_sites", list)
+    code = fetch.main(["dataset", "--cache-dir", str(tmp_path)], clock=_clock_at(12, 0))
+    assert code == fetch.EXIT_REFUSED
+    assert "disk says no" in capsys.readouterr().err
+    for path in (SCRIPT_PATH, STORE_PATH):
+        assert not [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Assert)]
+
+
+def test_public_surface_and_size(fetch: ModuleType) -> None:
+    assert {"Revision", "catalog_cross_check"} <= set(fetch.__all__)
+    assert all(hasattr(fetch, name) for name in fetch.__all__)
+    for path in (SCRIPT_PATH, STORE_PATH):
+        tree = ast.parse(path.read_text())
+        assert len(path.read_text().splitlines()) < 800
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                assert (node.end_lineno or 0) - node.lineno < 50, node.name

@@ -11,9 +11,9 @@ Unit=breezy-truth-dataset.service
 # After=, which does not order units started by separate timers). A fetch that did
 # not land leaves yesterday's revision, and the dataset reports the resulting
 # coverage_gap rather than hiding it. Free tick; outside the 16:30-17:10Z window.
+# No Persistent=true (a catch-up must never replay into that window).
 OnCalendar=*-*-* 12:40:00 UTC
 
-Persistent=true
 
 AccuracySec=1min
 
