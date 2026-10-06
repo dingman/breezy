@@ -1127,6 +1127,17 @@ def _write_parity_files(
         )
     )
     parity_verdict_path(root).chmod(0o600)
+    _stamp(parity_verdict_path(root), _NOW - timedelta(hours=1))
+
+
+def test_f6_tests_do_not_depend_on_wall_clock(tmp_path: Path) -> None:
+    # every artefact the helpers write carries an mtime derived from the injected clock
+    _write_parity_files(tmp_path / "p")
+    art = tmp_path / "a" / "latest.json"
+    _write_artefact(art)
+    written = [parity_fill_count_path(tmp_path / "p"), parity_verdict_path(tmp_path / "p"), art]
+    for path in written:
+        assert path.stat().st_mtime <= _NOW.timestamp(), path
 
 
 def _stamp(path: Path, when: datetime) -> None:
