@@ -18,10 +18,12 @@ SS6.1 pins.
 **Invariant, binding:** this module never imports `breezy.strategy`,
 `breezy.adapters`, `breezy.runtime`, or anything execution-shaped -- enforced
 mechanically by the two-way `import-linter` `forbidden` contract in
-`pyproject.toml` (AUD-18 D6(i)). The one reused import from below `analysis`
-in the layer stack is `breezy.settlement.current_rung_hold_v2`'s
+`pyproject.toml` (AUD-18 D6(i)). The reused imports from below `analysis`
+in the layer stack are `breezy.settlement.current_rung_hold_v2`'s
 `CombinedDraw`/`combine_station_day` family, exactly as SS6.1 mandates reuse
-over re-invention.
+over re-invention, and (AUT-4 RC-1) `breezy.persistence.autonomy.sample_size`,
+the single sigma-parameterised definition of the MDE that `recompute_mde`
+delegates to at sigma = sqrt(`VARIANCE_BOUND`), bit-identically.
 
 **Known residuals (V2-LOOK-GATE, RA-9 Path B):** the registration-time gates
 in `register_hypothesis` are the only sanctioned entry point -- they do not
@@ -42,9 +44,9 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from statistics import NormalDist
 from typing import Final, Literal
 
+from breezy.persistence.autonomy import sample_size
 from breezy.settlement.current_rung_hold_v2 import CombinedDraw
 
 __all__ = [
@@ -867,11 +869,9 @@ def recompute_mde(*, per_variant_alpha: float, n_station_days: int) -> float:
     """
     if n_station_days <= 0:
         raise ValueError("recompute_mde is undefined for n_station_days <= 0")
-    normal = NormalDist()
-    z_alpha = normal.inv_cdf(1.0 - per_variant_alpha)
-    z_power = normal.inv_cdf(POWER)
-    numerator = float(z_alpha + z_power) * float(VARIANCE_BOUND**0.5)
-    return float(numerator / (float(n_station_days) ** 0.5))
+    return sample_size.mde_one_sided(
+        float(VARIANCE_BOUND**0.5), n_station_days, per_variant_alpha, POWER
+    )
 
 
 def register_hypothesis(
