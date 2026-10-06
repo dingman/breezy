@@ -49,7 +49,7 @@ import us_source_alert as alert_mod
 import us_source_guards as guards
 import us_source_ledger as ledger_mod
 import us_source_norm as norm
-from iem_mos_probe_transport import (
+from iem_mos_probe_transport import (  # type: ignore[import-not-found]
     IEM_AFOS_PFM_MAX_BODY_BYTES,
     IemPacer,
     PacedIemTransport,
@@ -78,6 +78,8 @@ from breezy.ingest.us_source_availability import (
     available_at,
 )
 from breezy.persistence.us_source_request import (
+    LAMP_ALL_STATION,
+    LAMP_EXT_STATION,
     PFM_POINTS,
     US_LAMP_LIVE_SOURCE,
     US_PFM_AFOS_SOURCE,
@@ -87,6 +89,7 @@ from breezy.persistence.us_source_request import (
 from breezy.persistence.us_source_revision_store import (
     AppendOutcome,
     RevisionStoreBusyError,
+    RevisionStoreError,
     UsSourceRevisionStore,
 )
 
@@ -127,8 +130,8 @@ NBP_AVAILABILITY_SOURCE: Final[str] = "NBM_NBP"
 NBP_STATIONS: Final[frozenset[str]] = frozenset({*DEFAULT_NBM_QUANTILE_STATIONS, "KNYC"})
 NBP_CYCLE_HOURS: Final[tuple[int, ...]] = (1, 7, 13, 19)
 
-LAMP_ALL: Final[str] = "ALL"
-LAMP_EXT: Final[str] = "ALLEXT"
+LAMP_ALL: Final[str] = LAMP_ALL_STATION
+LAMP_EXT: Final[str] = LAMP_EXT_STATION
 _AVAILABILITY_VERSION: Final[str] = "v1"
 
 #: A poll after this long past the run is ``late`` (right-censored; excluded from lag freeze).
@@ -176,6 +179,7 @@ class CycleStatus(enum.StrEnum):
     COLLECTED = "collected"
     UNCHANGED = "unchanged"
     NOT_PUBLISHED = "not_published"
+    REFUSED = "refused"
     DEADLINE = "deadline"
     SKIPPED_WINDOW = "skipped_window"
     SKIPPED_LOCKED = "skipped_locked"
@@ -194,7 +198,9 @@ class CycleReport:
     def exit_code(self) -> int:
         if self.status is CycleStatus.REFUSED_GUARD:
             return _EXIT_REFUSED
-        return _EXIT_ERROR if self.status is CycleStatus.ERROR else 0
+        if self.status in {CycleStatus.ERROR, CycleStatus.REFUSED}:
+            return _EXIT_ERROR
+        return 0
 
 
 @dataclass(frozen=True)
@@ -207,7 +213,7 @@ class CycleContext:
     fetch_nbp: Callable[[dt.date, int], FetchedPayload]
     measure_ntp_offset: Callable[[], int | None]
     free_bytes: Callable[[Path], int]
-    alert: Callable[[str, str, str], None]
+    alert: Callable[[str, str, str], bool]
     poll_interval_s: float = 60.0
     nbp_poll_interval_s: float = 300.0
     ntp_bound_ns: int = _DEFAULT_NTP_BOUND_MS * 1_000_000
@@ -397,20 +403,27 @@ class _Collector:
         if seen is None:
             seen = self.seen_event(target, payload, sha)
             self.ledger.record(self.source_key, seen)
-        outcome = self.store.append_if_new(
-            source=target.source_key,
-            station=target.station,
-            run_ts_ns=target.run_ts_ns,
-            model=target.model,
-            payload=payload.body,
-        )
+        try:
+            outcome = self.store.append_if_new(
+                source=target.source_key,
+                station=target.station,
+                run_ts_ns=target.run_ts_ns,
+                model=target.model,
+                payload=payload.body,
+            )
+        except RevisionStoreBusyError:
+            raise
+        except (RevisionStoreError, OSError) as exc:
+            return self._store_refused(target, sha, type(exc).__name__)
+        if outcome.outcome is AppendOutcome.QUARANTINED:
+            return self._store_refused(target, sha, "quarantined")
         base = US_SOURCE_PRODUCTS[target.source_key]
         stored = dict(
             self.store.revisions(target.source_key, target.station, target.run_ts_ns, base)
         )
         number = next((n for n, digest in stored.items() if digest == sha), None)
         if number is None:
-            return _Result(CycleStatus.ERROR)
+            return self._store_refused(target, sha, "digest_missing_after_append")
         if build_rows is not None:
             raw = revision_request(
                 target.source_key, target.station, target.run_ts_ns, number, model=target.model
@@ -418,6 +431,12 @@ class _Collector:
             norm.write_normalised(self.writer, raw, build_rows(seen))
         appended = outcome.outcome is AppendOutcome.APPENDED
         return _Result(CycleStatus.COLLECTED if appended else CycleStatus.UNCHANGED)
+
+    def _store_refused(self, target: _Target, sha: str, reason: str) -> _Result:
+        """The store said no AFTER the seen row: record it, alert, and fail the cycle."""
+        self.record_refused(target.station, target.run_ts_ns, sha, reason)
+        self.ctx.alert("payload_refused", self.source_key, f"{target.station}: store {reason}")
+        return _Result(CycleStatus.ERROR, refused=1)
 
     def repair_normalised(
         self,
@@ -456,9 +475,12 @@ class _Collector:
         prior = self.ledger.last_alert_ns(self.source_key)
         if prior is not None and now_ns - prior < _STALE_ALERT_REPEAT_NS:
             return
-        self.ledger.record(self.source_key, {"kind": "stale_alert", "fetched_at_ns": now_ns})
         age_h = (now_ns - last) / _HOUR_NS
-        self.ctx.alert("stale_source", self.source_key, f"newest observed run is {age_h:.1f} h old")
+        delivered = self.ctx.alert(
+            "stale_source", self.source_key, f"newest observed run is {age_h:.1f} h old"
+        )
+        if delivered:  # an undelivered alert is retried next cycle, never deduped away
+            self.ledger.record(self.source_key, {"kind": "stale_alert", "fetched_at_ns": now_ns})
 
 
 # -- the polling loop -----------------------------------------------------------------------
@@ -507,6 +529,13 @@ def _merge(results: Sequence[CycleStatus]) -> CycleStatus:
         if status in results:
             return status
     return CycleStatus.UNCHANGED
+
+
+def _final_status(results: Sequence[CycleStatus], refused: int) -> CycleStatus:
+    """Merged status; a cycle whose every outcome was a refusal is REFUSED, never UNCHANGED."""
+    if refused and not results:
+        return CycleStatus.REFUSED
+    return _merge(results)
 
 
 def _log(message: str) -> None:
@@ -571,7 +600,9 @@ def _lamp_cycle(col: _Collector, now_ns: int) -> CycleReport:
                 refused += 1
                 return True
             builder = _optional_lamp_rows(payload.body)
-        results.append(col.ingest(target, payload, builder).status)
+        outcome = col.ingest(target, payload, builder)
+        results.append(outcome.status)
+        refused += outcome.refused
         return True
 
     deadline = max(run_ts + LATE_AFTER_NS["lamp"], now_ns + _LATE_MAX_POLL_NS)
@@ -585,7 +616,7 @@ def _lamp_cycle(col: _Collector, now_ns: int) -> CycleReport:
     )
     if unfinished and status is not None:
         results.append(status)
-    return CycleReport(col.source_key, _merge(results), refused)
+    return CycleReport(col.source_key, _final_status(results, refused), refused)
 
 
 def _optional_lamp_rows(body: bytes) -> Callable[[dict[str, Any]], bytes] | None:
@@ -628,8 +659,10 @@ def _pfm_cycle(col: _Collector, _now_ns: int) -> CycleReport:
         target = _Target(
             "pfm", col.source_key, station, issued_ns, point.wfo, wmo_header_ns=issued_ns
         )
-        results.append(col.ingest(target, payload, functools.partial(norm.pfm_csv, parsed)).status)
-    return CycleReport(col.source_key, _merge(results), refused)
+        outcome = col.ingest(target, payload, functools.partial(norm.pfm_csv, parsed))
+        results.append(outcome.status)
+        refused += outcome.refused
+    return CycleReport(col.source_key, _final_status(results, refused), refused)
 
 
 # -- NBP (availability only) ----------------------------------------------------------------
@@ -825,11 +858,12 @@ def _unused_fetcher(*_args: object) -> FetchedPayload:
     raise RuntimeError("this fetcher is not used by the selected source")
 
 
-def _make_alert(webhook_url: str | None) -> Callable[[str, str, str], None]:
-    def alert(event: str, source: str, detail: str) -> None:
+def _make_alert(webhook_url: str | None) -> Callable[[str, str, str], bool]:
+    def alert(event: str, source: str, detail: str) -> bool:
         print(f"ALERT {event} {source}: {detail}", file=sys.stderr)  # the journal line
-        if webhook_url:
-            alert_mod.post_alert(webhook_url, event, source, detail)
+        if not webhook_url:
+            return False
+        return bool(alert_mod.post_alert(webhook_url, event, source, detail))
 
     return alert
 

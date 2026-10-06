@@ -27,6 +27,8 @@ from typing import Final
 from breezy.persistence.archive_cache import ArchiveRequest
 
 __all__ = [
+    "LAMP_ALL_STATION",
+    "LAMP_EXT_STATION",
     "LAV_MODEL",
     "PFM_POINTS",
     "US_LAMP_LIVE_SOURCE",
@@ -64,7 +66,13 @@ US_SOURCE_PRODUCTS: Final[Mapping[str, str]] = MappingProxyType(
 
 LAV_MODEL: Final[str] = "LAV"
 #: Station token for a bulletin that carries every station in one payload.
-_ALL_STATIONS_TOKEN: Final[str] = "ALL"
+LAMP_ALL_STATION: Final[str] = "ALL"
+#: The ``lavtxt_ext`` bulletin (forecast hours 26-38) rides the SAME source and base product
+#: under this station token, so it never collides with the main bulletin's ``ALL`` key. It is a
+#: key token only: it is not in ``US_SOURCE_STATIONS`` (so no per-station request builder
+#: accepts it) and station-enumerating readers must skip it. Raw-only until its layout is
+#: verified.
+LAMP_EXT_STATION: Final[str] = "ALLEXT"
 #: The closed station set shared with the IEM MOS backfill, KNYC included (R33).
 US_SOURCE_STATIONS: Final[tuple[str, ...]] = ("KLAX", "KMDW", "KMIA", "KNYC", "KSFO")
 _NORMALISED_INFIX: Final[str] = "-norm"
@@ -145,15 +153,11 @@ def revision_request(
 
 
 def lamp_live_request(run_ts_ns: int, *, revision: int = 0) -> ArchiveRequest:
-    return revision_request(
-        US_LAMP_LIVE_SOURCE, _ALL_STATIONS_TOKEN, run_ts_ns, revision, model=None
-    )
+    return revision_request(US_LAMP_LIVE_SOURCE, LAMP_ALL_STATION, run_ts_ns, revision, model=None)
 
 
 def lamp_mdl_request(run_ts_ns: int, *, revision: int = 0) -> ArchiveRequest:
-    return revision_request(
-        US_LAMP_MDL_SOURCE, _ALL_STATIONS_TOKEN, run_ts_ns, revision, model=None
-    )
+    return revision_request(US_LAMP_MDL_SOURCE, LAMP_ALL_STATION, run_ts_ns, revision, model=None)
 
 
 def lav_iem_request(station: str, run_ts_ns: int, *, revision: int = 0) -> ArchiveRequest:

@@ -26,11 +26,20 @@ import pytest
 from breezy.ingest.us_source_availability import freeze_lag
 from breezy.persistence.archive_cache import ArchiveCache, ArchiveRequest
 from breezy.persistence.us_source_request import (
+    LAMP_ALL_STATION,
+    LAMP_EXT_STATION,
+    lav_iem_request,
     normalised_request,
     pfm_afos_request,
     revision_request,
 )
-from breezy.persistence.us_source_revision_store import UsSourceRevisionStore
+from breezy.persistence.us_source_revision_store import (
+    AppendOutcome,
+    RevisionPayloadRefusedError,
+    RevisionResult,
+    RevisionStoreIntegrityError,
+    UsSourceRevisionStore,
+)
 from tests.support.mock_http import install_mock_http
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -99,8 +108,11 @@ class Recorder:
         self.alerts: list[tuple[str, str, str]] = []
         self.calls: list[tuple[Any, ...]] = []
 
-    def alert(self, event: str, source: str, detail: str) -> None:
+    ok = True
+
+    def alert(self, event: str, source: str, detail: str) -> bool:
         self.alerts.append((event, source, detail))
+        return self.ok
 
 
 def _no_read(_request: ArchiveRequest) -> bytes:
@@ -918,3 +930,146 @@ def test_collector_modules_pass_the_user_agent_explicitly() -> None:
 def test_main_refuses_a_missing_archive_root_with_exit_2(tmp_path: Path) -> None:
     done = _run_script("--source", "lamp", "--archive-root", str(tmp_path / "does-not-exist"))
     assert done.returncode == 2
+
+
+# ------------------------------------------------- store refusals after the seen row
+
+
+def _fake_append(kind: str) -> Any:
+    def refuse(self: Any, **_kw: Any) -> RevisionResult:
+        if kind == "refused":
+            raise RevisionPayloadRefusedError("store said no")
+        if kind == "integrity":
+            raise RevisionStoreIntegrityError("key exists, digest unknown")
+        if kind == "oserror":
+            raise OSError(28, "No space left on device")
+        outcome = AppendOutcome.QUARANTINED if kind == "quarantined" else AppendOutcome.APPENDED
+        return RevisionResult(outcome, "0" * 64, None, None)  # "missing": claims a write
+
+    return refuse
+
+
+@pytest.mark.parametrize("kind", ["refused", "quarantined", "integrity", "oserror", "missing"])
+def test_store_refusal_after_the_seen_row_alerts_records_refused_and_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    monkeypatch.setattr(UsSourceRevisionStore, "append_if_new", _fake_append(kind))
+    report, _clock, rec, _feed = _lamp_cycle(tmp_path, RUN_2330 + 6 * MIN)
+
+    assert "payload_refused" in [a[0] for a in rec.alerts]
+    refused = [e for e in _events(tmp_path, LAMP_SOURCE) if e["kind"] == "refused"]
+    assert any(e["station"] == "ALL" for e in refused)
+    assert report.status is col.CycleStatus.ERROR
+    assert report.exit_code == 1
+    assert report.refused >= 1
+
+
+def test_lamp_cycle_with_only_refused_outcomes_reports_refused_and_exits_1(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(RUN_2330 + 6 * MIN)
+    rec = Recorder()
+    feed = LampFeed(clock, rec, ext_body=b"\xff\xfe not utf-8")
+    feed.body = b"GARBAGE\nGARBAGE\n"
+    report = col.run_cycle("lamp", make_ctx(tmp_path, clock, rec, lamp=feed))
+    assert report.status is col.CycleStatus.REFUSED
+    assert report.refused == 2
+    assert report.exit_code == 1
+
+
+def test_kill_inside_append_after_the_ledger_row_keeps_the_first_seen_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def killed(self: Any, **_kw: Any) -> RevisionResult:
+        raise SimulatedKill
+
+    real = UsSourceRevisionStore.append_if_new
+    monkeypatch.setattr(UsSourceRevisionStore, "append_if_new", killed)
+    clock = FakeClock(RUN_2330 + 6 * MIN)
+    rec = Recorder()
+    feed = LampFeed(clock, rec)
+    with pytest.raises(SimulatedKill):
+        col.run_cycle("lamp", make_ctx(tmp_path, clock, rec, lamp=feed))
+    [first] = [e for e in _events(tmp_path, LAMP_SOURCE) if e["kind"] == "seen"]
+    assert _store(tmp_path, clock).revisions(LAMP_SOURCE, "ALL", RUN_2330, "lamp-lavtxt") == ()
+
+    monkeypatch.setattr(UsSourceRevisionStore, "append_if_new", real)
+    clock.now += 31 * MIN
+    report = col.run_cycle("lamp", make_ctx(tmp_path, clock, rec, lamp=feed))
+    assert report.status is col.CycleStatus.COLLECTED
+    seen = [
+        e for e in _events(tmp_path, LAMP_SOURCE) if e["kind"] == "seen" and e["station"] == "ALL"
+    ]
+    assert len(seen) == 1
+    assert seen[0]["first_seen_ns"] == first["first_seen_ns"]
+    assert [
+        n for n, _ in _store(tmp_path, clock).revisions(LAMP_SOURCE, "ALL", RUN_2330, "lamp-lavtxt")
+    ] == [0]
+
+
+# -------------------------------------------------------- ledger cache, stale dedupe
+
+
+def test_ledger_file_is_read_once_per_source_per_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads: list[str] = []
+    real = ledger_mod.PollLedger._load
+
+    def counting(self: Any, source: str) -> Any:
+        reads.append(source)
+        return real(self, source)
+
+    monkeypatch.setattr(ledger_mod.PollLedger, "_load", counting)
+    _lamp_cycle(tmp_path, RUN_2330 + 6 * MIN)
+    assert reads.count(LAMP_SOURCE) == 1
+    seen = [e for e in _events(tmp_path, LAMP_SOURCE) if e["kind"] == "seen"]
+    assert len(seen) == 2  # the cached view and the file agree
+
+
+def test_stale_dedupe_row_is_written_only_when_the_alert_was_delivered(tmp_path: Path) -> None:
+    last_seen = RUN_2330 + 8 * MIN
+    root = tmp_path / "s"
+    _seed_lamp_seen(root, last_seen)
+    clock = FakeClock(last_seen + guards.STALE_AFTER_NS["lamp"] + 2 * HOUR)
+    rec = Recorder()
+    rec.ok = False  # the sink is down
+    feed = LampFeed(clock, rec, publish_at_ns=clock() + 10 * HOUR)
+    col.run_cycle("lamp", make_ctx(root, clock, rec, lamp=feed))
+    ledger = ledger_mod.PollLedger(root / "archive")
+    assert ledger.last_alert_ns(LAMP_SOURCE) is None
+
+    clock.now += 30 * MIN
+    rec.ok = True
+    col.run_cycle("lamp", make_ctx(root, clock, rec, lamp=feed))
+    assert [a[0] for a in rec.alerts].count("stale_source") == 2  # retried, then delivered
+    assert ledger_mod.PollLedger(root / "archive").last_alert_ns(LAMP_SOURCE) is not None
+
+
+# ------------------------------------------------------------- ALL / ALLEXT tokens
+
+
+def test_all_and_allext_tokens_are_public_and_never_valid_station_keys() -> None:
+    assert (LAMP_ALL_STATION, LAMP_EXT_STATION) == ("ALL", "ALLEXT")
+    assert col.LAMP_ALL == LAMP_ALL_STATION and col.LAMP_EXT == LAMP_EXT_STATION
+    with pytest.raises(ValueError):
+        lav_iem_request(LAMP_EXT_STATION, RUN_2330)
+
+
+def test_station_enumerating_readers_ignore_allext(tmp_path: Path) -> None:
+    # lamp_parse reads station blocks out of bulletin TEXT and never an archive key, so only
+    # the lag reader enumerates archive stations; it must not count the ext bulletin.
+    ledger = ledger_mod.PollLedger(tmp_path / "archive")
+    for station in (LAMP_ALL_STATION, LAMP_EXT_STATION):
+        ledger.record(
+            LAMP_SOURCE,
+            {
+                "kind": "seen",
+                "station": station,
+                "run_ts_ns": HOUR,
+                "available_ts_ns": HOUR + 9 * MIN,
+                "late": False,
+                "fetched_at_ns": HOUR + 9 * MIN,
+            },
+        )
+    assert len(col.lag_samples(ledger, LAMP_SOURCE)) == 1

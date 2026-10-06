@@ -28,12 +28,12 @@ LEDGER_NAME: Final[str] = "poll_ledger.jsonl"
 class PollLedger:
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
+        self._cache: dict[str, list[dict[str, Any]]] = {}
 
     def path(self, source: str) -> Path:
         return self._root / source / LEDGER_NAME
 
-    def events(self, source: str) -> list[dict[str, Any]]:
-        """Every complete event, in append order; a torn final line is ignored."""
+    def _load(self, source: str) -> list[dict[str, Any]]:
         try:
             raw = self.path(source).read_bytes()
         except FileNotFoundError:
@@ -50,6 +50,13 @@ class PollLedger:
                 events.append(event)
         return events
 
+    def events(self, source: str) -> list[dict[str, Any]]:
+        """Every complete event in append order, read from disk ONCE per instance and then
+        kept in step by :meth:`record` (one cycle holds the unit lock, so no one else writes)."""
+        if source not in self._cache:
+            self._cache[source] = self._load(source)
+        return list(self._cache[source])
+
     def record(self, source: str, event: Mapping[str, Any]) -> None:
         path = self.path(source)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,6 +67,8 @@ class PollLedger:
                 line = b"\n" + line  # repair a torn tail so the new event starts cleanly
             os.write(fd, line)
             os.fsync(fd)
+            if source in self._cache:
+                self._cache[source].append(dict(event))
         finally:
             os.close(fd)
 

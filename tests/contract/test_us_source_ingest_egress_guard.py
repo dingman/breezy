@@ -446,6 +446,8 @@ def _non_get_sites(path: Path) -> list[str]:
                 first = node.args[0]
                 if isinstance(first, ast.Constant) and str(first.value).upper() in _WRITE_VERBS:
                     sites.append(f"{path.name}:{node.lineno} verb {first.value!r}")
+        if isinstance(node, ast.keyword) and node.arg in {"data", "content", "files"}:
+            sites.append(f"{path.name}:{node.value.lineno} request body keyword {node.arg}=")
         if isinstance(node, ast.keyword) and node.arg == "method":
             value = node.value
             if isinstance(value, ast.Constant) and str(value.value).upper() != "GET":
@@ -476,13 +478,41 @@ def test_get_only_detector_is_not_vacuous(tmp_path: Path) -> None:
     assert len(_non_get_sites(probe)) >= 2
 
 
-def test_the_only_post_in_scripts_collect_is_the_https_only_alert_webhook() -> None:
+def test_post_detector_flags_a_data_keyword_body(tmp_path: Path) -> None:
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import urllib.request\n"
+        "def f(url: str) -> None:\n"
+        "    urllib.request.urlopen(urllib.request.Request(url, data=b'x'))\n",
+        encoding="utf-8",
+    )
+    assert any("data=" in site for site in _non_get_sites(probe))
+
+
+def test_the_only_request_body_in_scripts_collect_is_the_alert_webhook() -> None:
     posting = {p.name for p in sorted(COLLECT_DIR.glob("*.py")) if _non_get_sites(p)}
     assert posting <= {"us_source_alert.py"}
-    alert = COLLECT_DIR / "us_source_alert.py"
-    text = alert.read_text(encoding="utf-8")
-    assert '"https"' in text, "the webhook sink must refuse a non-https URL"
+    text = (COLLECT_DIR / "us_source_alert.py").read_text(encoding="utf-8")
     assert "http.client" not in text and "requests" not in text
+
+
+def test_alert_poster_refuses_a_non_https_url_without_calling_the_opener() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "us_source_alert_probe", COLLECT_DIR / "us_source_alert.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls: list[object] = []
+
+    def opener(*args: object, **kwargs: object) -> object:
+        calls.append(args)
+        raise AssertionError("the opener must not be reached")
+
+    assert module.post_alert("http://hooks.example/x", "e", "s", "d", opener=opener) is False
+    assert calls == []
 
 
 def test_no_polymarket_kalshi_or_exec_host_in_any_allowlist() -> None:

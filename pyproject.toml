@@ -388,7 +388,7 @@ explicit_package_bases = true
 # `src.breezy.*` relative to the current directory -- the two-name collision
 # `explicit_package_bases` alone reproduced for every `src/breezy` module the
 # moment it was turned on.
-mypy_path = "src"
+mypy_path = "src:scripts/collect"
 files = [
     "src/breezy/adapters",
     "src/breezy/normalize",
@@ -405,6 +405,8 @@ files = [
     # PRODUCTION credentials, so it must be typechecked, and so must the test
     # doubles that claim to model the real classes.
     "scripts/venue",
+    # F13-C1 collector (sibling modules import each other by bare name; see mypy_path).
+    "scripts/collect",
     # The settlement seam's analysis scripts (Q-3). Previously excluded
     # because the directory carried pre-existing strict errors owned by that
     # seam; those errors are now fixed and the gate is widened to cover it.
