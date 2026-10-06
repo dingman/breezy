@@ -223,6 +223,27 @@ source_modules = [
 forbidden_modules = ["breezy.persistence.autonomy.resolver"]
 allow_indirect_imports = false
 
+# F7b-core (F7B-R25): the two pure statistics cores are stdlib-only and never reach Nautilus, the
+# live path or pyarrow, directly or indirectly. Named outside the `ARCH-0 autonomy (` prefix so
+# B8-R2's count of three stays. `confidence_sequence` reaches `analysis.stats.scoring_core`, which
+# is stdlib-only (checked: no pyarrow chain).
+[[tool.importlinter.contracts]]
+name = "F7b-core pure statistics cores never reach Nautilus, the live path or pyarrow"
+type = "forbidden"
+source_modules = [
+    "breezy.analysis.autonomy.eprocess",
+    "breezy.analysis.autonomy.confidence_sequence",
+]
+forbidden_modules = [
+    "nautilus_trader",
+    "breezy.strategy",
+    "breezy.runtime",
+    "breezy.adapters",
+    "breezy.app",
+    "pyarrow",
+]
+allow_indirect_imports = false
+
 # ARCH-0 seam A (V16, V22, V23). Contracts (b) and (c) name MODULES ONLY, never the
 # package: import-linter treats a package source as including every descendant, and
 # `label_schema`, `label_store`, `family_bytes`, `byte_binding`, `registry_store`, `replay` and `resolver` legitimately
