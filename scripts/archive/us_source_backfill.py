@@ -20,9 +20,9 @@ Statuses: ``complete``; ``oversize_product`` (a single product exceeds the body 
 stops, the next runs); ``error`` (an unexpected exception inside a leg is recorded, never raised);
 ``unplaceable_header`` (a header cannot be placed unambiguously from the
 cursor: that station stops, the next station runs); ``degraded`` (a revision-store error other
-than an expected payload refusal); ``throttled`` / ``paused_launch_window`` (stop ALL remaining
-stations and the GFS leg); ``budget_exhausted``, ``store_busy``. Any status but ``complete``
-exits 1.
+than an expected payload refusal); ``throttled`` / ``forbidden`` (an IEM 403 abuse block) /
+``paused_launch_window`` (stop ALL remaining stations and the GFS leg);
+``budget_exhausted``, ``store_busy``. Any status but ``complete`` exits 1.
 
 Safety: ``--dry-run`` plans only (no network, no write); ``--apply`` needs ``BREEZY_LIVE=1`` and
 a request budget. A request never starts inside, or close enough to meet, the 16:30-17:10Z
@@ -59,7 +59,7 @@ from iem_mos_probe_transport import (  # type: ignore[import-not-found]
     PacedIemTransport,
 )
 
-from breezy.ingest.http import OversizeBodyError, RateLimitedError
+from breezy.ingest.http import ForbiddenError, OversizeBodyError, RateLimitedError
 from breezy.ingest.pfm_parse import PfmParseError, parse_pfm_product
 from breezy.ingest.probe_transport import (
     RequestBudget,
@@ -111,7 +111,9 @@ MAX_GAP_DAYS: Final[int] = 45
 #: out-of-order header and is refused rather than placed a month ahead.
 MAX_ROLLOVER_GAP_DAYS: Final[int] = 7
 #: Statuses after which nothing else may run (the venue asked us to stop, or the window opened).
-STOP_ALL_STATUSES: Final[frozenset[str]] = frozenset({"throttled", "paused_launch_window"})
+STOP_ALL_STATUSES: Final[frozenset[str]] = frozenset(
+    {"throttled", "forbidden", "paused_launch_window"}
+)
 #: Mirrors ``scripts/analysis/market_calibration_scan.LIVE_DATA_ROOT``.
 LIVE_DATA_ROOT: Final[Path] = Path.home() / ".local" / "share" / "breezy"
 #: The one directory under the live data root this script may write (the collector's archive).
@@ -313,6 +315,11 @@ def _fetch_page(
                 return None, limit
             limit //= 2
             continue
+        except ForbiddenError:
+            report.requests += 1
+            report.status = "forbidden"
+            _alert(f"IEM 403 (abuse block) for PFM{wfo} at sdate={cursor}; stopping every leg")
+            return None, limit
         except RateLimitedError:
             report.requests += 1
             if attempt == len(THROTTLE_BACKOFF_S):

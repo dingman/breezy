@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from breezy.ingest.http import OversizeBodyError, RateLimitedError
+from breezy.ingest.http import ForbiddenError, OversizeBodyError, RateLimitedError
 from breezy.ingest.probe_transport import RequestBudgetExceededError
 from breezy.persistence.us_source_request import US_PFM_AFOS_SOURCE
 from breezy.persistence.us_source_revision_store import UsSourceRevisionStore
@@ -923,6 +923,57 @@ def test_p6_a_throttle_stops_remaining_stations_and_the_gfs_leg(
     assert [leg["station"] for leg in report["pfm"]["legs"]] == ["KNYC"]
     assert report["pfm"]["stopped"] == {
         "reason": "throttled",
+        "skipped_stations": ["KLAX", "KMIA"],
+    }
+    assert report["gfs"]["status"] == "skipped_after_stop"
+
+
+def test_forbidden_403_stops_all_remaining_stations_and_gfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    fetched: list[str] = []
+    calls: list[list[str]] = []
+
+    def factory(**_kwargs: Any) -> Any:
+        def fetch(wfo: str, _sdate: dt.date, _limit: int) -> str:
+            fetched.append(wfo)
+            raise ForbiddenError("403 abuse block")
+
+        return fetch
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--legs",
+            "pfm",
+            "gfs",
+            "--stations",
+            "KNYC",
+            "KLAX",
+            "KMIA",
+            "--start-date",
+            "2022-01-01",
+        ),
+        clock=lambda: _utc(6, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=factory,
+        gfs_runner=_recording_runner(calls),
+    )
+
+    assert rc == 1
+    assert fetched == ["OKX"]
+    assert calls == []
+    report = json.loads((tmp_path / "report.json").read_text())
+    legs = report["pfm"]["legs"]
+    assert [leg["station"] for leg in legs] == ["KNYC"]
+    assert legs[0]["status"] == "forbidden"
+    assert legs[0]["resume_sdate"] == "2022-01-01"
+    assert report["pfm"]["stopped"] == {
+        "reason": "forbidden",
         "skipped_stations": ["KLAX", "KMIA"],
     }
     assert report["gfs"]["status"] == "skipped_after_stop"
