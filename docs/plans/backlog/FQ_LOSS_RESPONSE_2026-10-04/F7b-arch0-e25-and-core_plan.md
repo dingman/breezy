@@ -466,3 +466,46 @@ These rulings are BINDING over the plan text and the provisional rulings above.
 **STATUS:**
 - **Slice 1 READY.** Round-1 issues were resolved by R1–R6 as the reviewers stated them.
 - **Slice 2** goes to a round-2 review (stats + architect) on R7–R19 before build.
+
+---
+## r3 rulings (coordinator, 2026-10-06, after the round-2 reviews of Slice 2)
+
+Round-2 reviews: stats REQUEST_CHANGES, architect REQUEST_CHANGES. Each fix below is adopted as the reviewer stated it. These rulings are BINDING over the plan body and R7–R20.
+
+- **F7B-R21 (supersedes the R14 haircut clause).**
+  - BE and X use the haircut ask: `ask + haircut + fee`, as in `_break_even` in `fq_mc_livedata.py`.
+  - The **Z comparator** (`(ask−h)² − (p−h)²`, `fq_mc_eprocess.py:139`) and BSS-on-takes use the **raw executable quote**, with no haircut.
+  - Cross-check fixtures carry `raw_ask` and the haircut `be` as distinct fields.
+  - `test_bss_on_takes_uses_ask_comparator` asserts that the raw ask is used.
+  - e_b's validity requires the comparator to be G-measurable at decision time. The docstring says so.
+- **F7B-R22 (supersedes the R10 null wording).**
+  - The m=0 KILL capital `∏(1−λ(Y−m))`, with λ ≥ 0 predictable, is a supermartingale when E[Y|F] ≥ 0, i.e. under the **no-loss null**.
+  - False-KILL ≤ α_kill/2 therefore holds whenever the true edge is non-negative. Under the PASS null (E[Y] ≤ 0) the capital grows, and KILL is intended.
+  - Requiring all 5 grid points only adds conservatism. The per-m λ cap guarantees `1−λ(Y−m) > 0`.
+  - Add an enumeration test at E[Y]=0 asserting E[m=0 capital] ≤ 1.
+- **F7B-R23 (R13 voids and unsettled takes).**
+  - `h=None` means a **venue-declared void** only, carried as an explicit `void=True` field.
+  - A take with unknown h on a day ≤ `last_settled_day` is refused (`unsettled_take_in_settled_day`), never scored as 0.
+  - Test: `test_unsettled_take_refused_not_voided`.
+- **F7B-R24 (R13 gap definition).**
+  - A calendar day is **covered** only with a settled-coverage marker, per the "covered means recorder capture only" rule. The marker is supplied with the evidence: `LoadedEvidence.covered_days`.
+  - A day in range without the marker is a gap, and the evaluator refuses (`coverage_gap`).
+  - A covered day with zero takes is Y=0.
+  - Tests:
+    - `test_uncovered_day_is_gap_refused`
+    - `test_covered_zero_take_day_is_y0`
+- **F7B-R25 (contract classification for Slice 2's new modules).**
+  - Add one import-linter `forbidden` contract with `allow_indirect_imports = false`.
+    - Name it outside the `ARCH-0 autonomy (` prefix, so `test_three_arch0_contracts_are_strict_forbidden` stays at three.
+    - Its source modules are `breezy.analysis.autonomy.eprocess` and `breezy.analysis.autonomy.confidence_sequence`, listed by module.
+    - It forbids `nautilus_trader`, `breezy.strategy`, `breezy.runtime`, `breezy.adapters` and `breezy.app`, plus `pyarrow` unless the verify-first shows `analysis/stats/scoring_core.py` reaches it. If it does, the BSS interval uses an injected callable, or ships point-only as R2-step-2 already allows.
+  - `evidence_row`, `evaluators.forecast_quantile_ladder` and `labeling.scoring_batch` each get an explicit classification row: either "never reaches nautilus/strategy/runtime/adapters", or a reasoned exemption (`scoring_batch` → `label_store` is PYARROW_REACHING).
+  - Add a membership test with a planted-unclassified-module case, modelled on `test_autonomy_contracts.py:134-148`.
+  - `regen_closure_manifest --check` stays in the gate as a positive control and is expected to show no diff.
+- **F7B-R26 (body text struck).** Under R7, the Slice 2 body text describing a `forward_shadow` override and `ALLOWED_OWN_NAMES_BY_CLASS` is VOID: §Slice 2 acceptance bullets 3–4, step 5 (`forward_shadow` member), step 7 (`ALLOWED_OWN_NAMES_BY_CLASS`, planted lookalike), and the "Override-policy loosening" risk.
+  - `test_forward_shadow_refuses_without_registered_forward_shadow_source` and `…_non_loaded_evidence` target the **module-level guard chain** (`check_forward_shadow_inputs(...)`), not a plugin member.
+  - The inherited `forward_shadow` raises a plain `PluginRefused`. This is unchanged and covered by the existing byte-unchanged test.
+- **F7B-R27 (R17).** The rule-8 UNDERPOWERED cap lives in a private `_cap_backtest_outcome()` that is tested directly. `evaluate_e_process` refuses backtest input before reaching it.
+- **F7B-R28 (R8).** The "patched reader is used" test includes a planted case showing that a default-argument or closure binding of `_READERS` would be caught: the loader reads `evidence_row._READERS` by global name at call time.
+
+**STATUS: Slice 2 READY (2026-10-06).** Round 2 surfaced only fixes the reviewers specified exactly; each is adopted verbatim above. The post-build code review (prediction-market-reviewer + python-reviewer + architect) re-checks R21–R28 against the code. Build order: Slice 1 merges first, then Slice 2 rebases onto it.
