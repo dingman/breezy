@@ -26,6 +26,11 @@ mark and the truth SHA [FQ-R17]. Owner, mode and mtime are checked and ``as_of``
 must be monotonic in memory. Until the producer exists the file is absent and
 the probe reads UNKNOWN, which vetoes.
 
+In-memory monotonicity caveat: ``as_of`` monotonicity (and the parity fill
+count's monotonicity) is held in process memory only. A producer that rewinds
+``as_of`` or the live-fill count is refused until the node restarts; the
+restart is the only recovery (note for the future producer owner).
+
 Retirement: the retirement commit (plan §R8-2) deletes this module and its
 wiring by hand. Nothing here auto-retires.
 """
@@ -89,6 +94,8 @@ REASON_HALT_UNREADABLE: Final[str] = "fq_halt_veto_unreadable"
 REASON_STALE: Final[str] = "fq_loss_stop_stale"
 REASON_LOSS_UNREADABLE: Final[str] = "fq_loss_stop_unreadable"
 REASON_PARITY_UNREADABLE: Final[str] = "fq_parity_unreadable"
+REASON_PARITY_COUNT_STALE: Final[str] = "fq_parity_count_stale"
+REASON_PARITY_COUNT_REGRESSED: Final[str] = "fq_parity_count_regressed"
 
 
 class Verdict(StrEnum):
@@ -488,6 +495,10 @@ class LossStopProbeActor(Actor):
 # --------------------------------------------------------------------------
 
 
+class ParityCountStale(Exception):
+    """The live-fill-count file is older than ``STALE_PARITY_H``: refuse, never "no veto"."""
+
+
 @dataclass(frozen=True, slots=True)
 class ParityVerdict:
     subject: str
@@ -523,16 +534,25 @@ class ParityGate:
         self._fill_count_reader = fill_count_reader
         self._verdict_reader = verdict_reader
         self._latched = False
+        self._max_count = 0  # in-memory high-water mark; the count never decreases
 
     def veto_reason(self) -> str | None:
         if self._latched:
             return "fq_parity_fail"
-        n = self._read_count()
+        try:
+            n = self._read_count()
+        except ParityCountStale:
+            return REASON_PARITY_COUNT_STALE
         if n is None:
             return "fq_parity_fill_count_unreadable"
+        if n < self._max_count:
+            return REASON_PARITY_COUNT_REGRESSED
+        self._max_count = n
         # FQ-R spec (F5-pinned single look): below N_PAR live fills the parity
         # look is not yet defined, so there is NO parity veto. Deliberate; do
-        # not "fix" this into a refusal without a ruling.
+        # not "fix" this into a refusal without a ruling. It holds ONLY while
+        # the count is fresh (<= STALE_PARITY_H) and non-regressed, so a stale
+        # or rewound count file can never silently disable the veto.
         if n < self._n_par:
             return None
         return self._judge(self._read_verdict())
@@ -540,6 +560,8 @@ class ParityGate:
     def _read_count(self) -> int | None:
         try:
             n = self._fill_count_reader()
+        except ParityCountStale:
+            raise
         except Exception:
             logger.exception("fq parity fill-count reader failed")
             return None
@@ -579,6 +601,7 @@ class _ParitySnapshot:
     count: int | None = None
     verdict: ParityVerdict | None = None
     settled_at: datetime | None = None
+    count_stale: bool = False
 
 
 class ParityFileCache:
@@ -603,15 +626,21 @@ class ParityFileCache:
         """Re-read both files. Never raises; unreadable inputs cache as ``None``."""
         try:
             now = self._clock()
-            count = self._read_count(now)
+            count, count_stale = self._read_count(now)
             verdict = self._read_verdict(now)
-            self._state = _ParitySnapshot(count=count, verdict=verdict, settled_at=now)
+            self._state = _ParitySnapshot(
+                count=count, verdict=verdict, settled_at=now, count_stale=count_stale
+            )
         except Exception:
             logger.exception("fq parity cache refresh failed")
 
     def count(self) -> int | None:
         state = self._state
-        return state.count if self._live(state) else None
+        if not self._live(state):
+            return None
+        if state.count_stale:
+            raise ParityCountStale
+        return state.count
 
     def verdict(self) -> ParityVerdict | None:
         state = self._state
@@ -643,16 +672,28 @@ class ParityFileCache:
             logger.exception("fq parity verdict file unreadable")
             return None
 
-    def _read_count(self, now: datetime) -> int | None:
+    def _read_count(self, now: datetime) -> tuple[int | None, bool]:
+        """``(count, is_stale)``; stale when the fstat mtime or an ``as_of`` is too old."""
         try:
-            body, _mtime = _read_guarded(self._count_path, expected_uid=self._expected_uid, now=now)
+            body, mtime = _read_guarded(self._count_path, expected_uid=self._expected_uid, now=now)
             if body.get("schema") != FILL_COUNT_SCHEMA or body.get("subject") != PARITY_SUBJECT:
-                return None
+                return None, False
             n = body["n_live_fills"]
-            return n if isinstance(n, int) else None
+            if not isinstance(n, int) or isinstance(n, bool):
+                return None, False
+            stale = timedelta(hours=STALE_PARITY_H)
+            if now - mtime > stale:
+                return n, True
+            if "as_of" in body:  # optional in the schema; obeyed when present
+                as_of = _utc(str(body["as_of"]))
+                if as_of > now + _FUTURE_SKEW:
+                    return None, False
+                if now - as_of > stale:
+                    return n, True
+            return n, False
         except (_ArtefactError, ValueError, KeyError, TypeError, OSError):
             logger.exception("fq parity fill-count file unreadable")
-            return None
+            return None, False
 
 
 def make_file_parity_gate(

@@ -1113,6 +1113,7 @@ def _write_parity_files(
         json.dumps({"schema": lsp.FILL_COUNT_SCHEMA, "subject": PARITY_SUBJECT, "n_live_fills": n})
     )
     count.chmod(0o600)
+    _stamp(count, _NOW - timedelta(hours=1))
     as_of = (_NOW - timedelta(hours=age_h)).isoformat().replace("+00:00", "Z")
     parity_verdict_path(root).write_text(
         json.dumps(
@@ -1128,6 +1129,10 @@ def _write_parity_files(
     parity_verdict_path(root).chmod(0o600)
 
 
+def _stamp(path: Path, when: datetime) -> None:
+    os.utime(path, (when.timestamp(), when.timestamp()))
+
+
 def _file_parity(
     tmp_path: Path,
 ) -> tuple[ParityGate, lsp.ParityFileCache, Path, list[datetime]]:
@@ -1136,6 +1141,59 @@ def _file_parity(
     cache = lsp.ParityFileCache(root, clock=lambda: clock[0], expected_uid=os.getuid())
     gate = lsp.make_file_parity_gate(family_id=_FAMILY, clock=lambda: clock[0], cache=cache)
     return gate, cache, root, clock
+
+
+def test_parity_stale_count_file_refuses(tmp_path: Path) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root, n=PARITY_N_PAR - 1)  # below N_PAR: would be "no veto" if fresh
+    _stamp(parity_fill_count_path(root), _NOW - timedelta(hours=STALE_PARITY_H + 1))
+    cache.refresh()
+
+    assert gate.veto_reason() == "fq_parity_count_stale"
+
+
+def test_parity_stale_count_as_of_refuses(tmp_path: Path) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root, n=PARITY_N_PAR - 1)
+    old = (_NOW - timedelta(hours=STALE_PARITY_H + 1)).isoformat()
+    parity_fill_count_path(root).write_text(
+        json.dumps(
+            {
+                "schema": lsp.FILL_COUNT_SCHEMA,
+                "subject": PARITY_SUBJECT,
+                "n_live_fills": PARITY_N_PAR - 1,
+                "as_of": old,
+            }
+        )
+    )
+    parity_fill_count_path(root).chmod(0o600)
+    _stamp(parity_fill_count_path(root), _NOW - timedelta(hours=1))  # fresh mtime, old as_of
+    cache.refresh()
+
+    assert gate.veto_reason() == "fq_parity_count_stale"
+
+
+def test_parity_count_regression_refuses(tmp_path: Path) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root, n=PARITY_N_PAR + 2)
+    cache.refresh()
+    assert gate.veto_reason() is None
+
+    _write_parity_files(root, n=PARITY_N_PAR - 5)  # regressed below N_PAR: must not unveto
+    cache.refresh()
+
+    assert gate.veto_reason() == "fq_parity_count_regressed"
+
+
+def test_parity_fresh_low_count_still_no_veto(tmp_path: Path) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root, n=3)
+    cache.refresh()
+    assert gate.veto_reason() is None
+
+    _write_parity_files(root, n=4)  # monotonic growth stays fine
+    cache.refresh()
+    assert gate.veto_reason() is None
 
 
 def test_item8_parity_veto_before_first_refresh_refuses(tmp_path: Path) -> None:
