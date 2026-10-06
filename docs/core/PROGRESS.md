@@ -75,8 +75,6 @@ Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits 
 `/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
 | # | ID | Work | Needs | Status |
 |---|---|---|---|---|
-| 1 | AUT-1-R9 | PLAN native-first AUT-1 → r12 READY (E-12) | — | DONE |
-| 2 | AUT-NATIVE | PLAN native pressure test; AUT-6 → r15, AUT-4 → r11 READY (E-11, E-13) | — | DONE |
 | 3 | ING-2-AMEND2 | RUN live proof above, remove TEMPORARY drop-in | — | OPEN |
 | 4 | ARCH-0 | BUILD Wave 0 core + E-7a bwrap wrapper + E-8a snapshot helper (plans: seam A r5, seam B r5; E-7d/E-7e/E-14 filed) | 1,2 | DONE 2026-10-04: seams A+B merged, V0–V21 PASS (V10 node-up 17:12Z); rulings reviews/ARCH-0-r1-merged.md |
 | 5 | AUT-1a | BUILD capture offline (audit, settlement, refs) | 4 | IN PROGRESS: WP0–WP2, WP3 s1, WP5 stages 1–3 merged (d407ff3b); WP4 held for WP8; WP3 s2 waits AUT-6, WP6 AUT-4 |
