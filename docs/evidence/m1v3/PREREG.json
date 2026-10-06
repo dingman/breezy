@@ -24,7 +24,7 @@
     "depth_note": "Descriptive screen only; a fixed constant unrelated to any operator cap."
   },
   "floors_rule": "UNDERPOWERED if n_takes < min_takes OR n_days < min_days OR loss_days < min_loss_days; a verdict about power, not a failure.",
-  "frozen_sha": "UNFROZEN",
+  "frozen_sha": "adb1cd8b4ff2edec4130a5f2f055f2b93152b8bb",
   "hit_definition": "NO hit = the settled high (FINAL CLI tmax_f) lies OUTSIDE the rung's closed interval [lower, upper] (m1.rung_outcome); net EV per take = hit - (ask + fee + slippage).",
   "holdout_statement": "The 2026-07-01 holdout seal applies to model scoring. This screen is market-only and the tape starts 2026-08-30; both facts are disclosed here.",
   "hypothesis": "H1: buying NO at the Depth10 ask where the NO ask >= 0.90 (YES bid <= 0.10) has positive mean net EV per take after fee and slippage.",
