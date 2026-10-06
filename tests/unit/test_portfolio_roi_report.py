@@ -5379,3 +5379,144 @@ class TestFu13bNetOfExternalFlowReconciliation:
         monkeypatch.setattr(_prr, "default_output_dir", lambda: sentinel)
 
         assert _prr._default_output_dir() == sentinel
+
+
+# --------------------------------------------------------------------------
+# AUT-2 r7 WP1: roi_status GATED_UNLABELLED_FQ and the `--status-only` scorer entry.
+# A durable fill in the legacy UNRECONCILED bucket (every FQ fill until WP6) makes the entry print
+# the gate instead of a figure. The full report's roi_status is unchanged here: an in-flight,
+# not-yet-scored fill is also UNRECONCILED and the report stays OK (WP6 gates it on the C2 marker).
+# --------------------------------------------------------------------------
+
+
+def _seed_unlabelled_store(tmp_path: Path, n_fills: int) -> Path:
+    """A real exec store written through the real `SqliteStateStore`, holding `n_fills` durable
+    fills that no manifest attributes and no scorer labels (the FQ state before WP6)."""
+    store_path = tmp_path / "state.db"
+    store = SqliteStateStore(store_path)
+    try:
+        for index in range(n_fills):
+            fill = _fill(
+                venue_order_id=f"vo-fq-{index}",
+                instrument_id="tc-temp-laxhigh-2026-10-02-gte92lt93f^no.POLYMARKET_US",
+                ts_event=_ns_of_day("2026-10-02") + index,
+            )
+            store.set(f"{_FILL_KEY_PREFIX}vo-fq-{index}", fill.to_bytes())
+    finally:
+        store.close()
+    return store_path
+
+
+def _status_only(tmp_path: Path, store_path: Path) -> int:
+    exit_code: int = _prr._status_only(
+        exec_state_db_path=store_path,
+        scored_trials_dir=tmp_path / "scored_trials",
+        families_dir=tmp_path / "families",
+    )
+    return exit_code
+
+
+class TestRoiStatusGatedUnlabelledFq:
+    def test_status_only_reports_gated_unlabelled_fq_when_uncovered_fills(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store_path = _seed_unlabelled_store(tmp_path, n_fills=3)
+
+        exit_code = _status_only(tmp_path, store_path)
+
+        assert exit_code == 0
+        assert capsys.readouterr().out == "PORTFOLIO_ROI GATED_UNLABELLED_FQ unlabelled=3\n"
+
+    def test_status_only_ok_at_zero_uncovered(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        store_path = _seed_unlabelled_store(tmp_path, n_fills=0)
+
+        exit_code = _status_only(tmp_path, store_path)
+
+        assert exit_code == 0
+        assert capsys.readouterr().out == "PORTFOLIO_ROI OK unlabelled=0\n"
+
+    def test_status_only_refuses_a_missing_ledger_instead_of_reporting_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        exit_code = _status_only(tmp_path, tmp_path / "absent.db")
+
+        assert exit_code == 1
+        assert capsys.readouterr().out == ""
+
+    def test_main_status_only_flag_runs_only_the_status_entry(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        store_path = _seed_unlabelled_store(tmp_path, n_fills=2)
+        monkeypatch.setattr(_prr, "_default_exec_state_db_path", lambda: store_path)
+        monkeypatch.setattr(_prr, "_default_scored_trials_dir", lambda: tmp_path / "scored_trials")
+        monkeypatch.setattr(_prr, "_default_families_dir", lambda: tmp_path / "families")
+        monkeypatch.setattr(_prr, "_default_output_dir", lambda: tmp_path / "derived")
+
+        assert _prr.main(["--status-only"]) == 0
+
+        assert capsys.readouterr().out == "PORTFOLIO_ROI GATED_UNLABELLED_FQ unlabelled=2\n"
+        assert not (tmp_path / "derived").exists()  # the entry publishes no report file
+
+    def test_command_line_status_only_reaches_the_entry_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """L-55, the production default: the real `__main__` block, not `main()` called by hand.
+        A `main()` that never receives `sys.argv` would run the FULL report instead."""
+        import os
+        import subprocess
+
+        store_path = _seed_unlabelled_store(tmp_path, n_fills=2)
+        (tmp_path / "families").mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "POLYMARKET_US_EXEC_STATE_DB": str(store_path),
+            "BREEZY_SCORED_TRIALS_DIR": str(tmp_path / "scored_trials"),
+            "BREEZY_SCORE_LIVE_TRIALS_FAMILIES_DIR": str(tmp_path / "families"),
+        }
+        env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(tmp_path / "derived")
+        script = _SCRIPTS_ANALYSIS_DIR / "portfolio_roi_report.py"
+
+        done = subprocess.run(
+            [sys.executable, str(script), "--status-only"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == "PORTFOLIO_ROI GATED_UNLABELLED_FQ unlabelled=2\n"
+        assert not (tmp_path / "home").exists()  # nothing written under the (temporary) HOME
+        assert not (tmp_path / "derived").exists()  # and no report published
+
+    def test_gated_unlabelled_fq_publishes_no_roi_figure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The entry prints the gate where a figure would go: no ROI value, no ROI label, no
+        report file, even though a scored trial with real P&L sits beside the unlabelled fills."""
+        store_path = _seed_unlabelled_store(tmp_path, n_fills=2)
+        write_scored_trials(
+            tmp_path / "scored_trials" / "fam_a",
+            [_scored_trial(trial_id="fam_a/trial/LAX/2026-09-01", pnl=Decimal("0.4321"))],
+            now_ns=1,
+        )
+
+        exit_code = _status_only(tmp_path, store_path)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert captured.out == "PORTFOLIO_ROI GATED_UNLABELLED_FQ unlabelled=2\n"
+        assert captured.err == ""
+        assert "0.4321" not in captured.out
+        assert "roi=" not in captured.out.lower()
+        assert not (tmp_path / "derived").exists()
+        assert _prr.ROI_STATUS_GATED_UNLABELLED_FQ == "GATED_UNLABELLED_FQ"
+        assert _prr.scorer_roi_status(2) == _prr.ROI_STATUS_GATED_UNLABELLED_FQ
+        assert _prr.scorer_roi_status(0) == ROI_STATUS_OK

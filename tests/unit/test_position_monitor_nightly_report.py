@@ -15,12 +15,14 @@ import would itself violate the isolation this test exists to enforce).
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import sys
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -1314,3 +1316,182 @@ class TestIndependentLedgerFillCount:
 
         result = report_mod.count_ledger_fill_records(store_path, since_ts_ns=1_000_000_000)
         assert result == 1
+
+
+# --------------------------------------------------------------------------
+# AUT-2 r7 WP1: a family-bound report counts only its own family's positions.
+# Evidence: docs/evidence/AUT-2_rc_monitor_pnl_2026-10-03.md (the -0.37 / +0.37 root cause).
+# --------------------------------------------------------------------------
+
+_V4_TRIAL = "continuous_rung_hold/trial/SFO/2026-09-21/tc-temp-sfohigh-2026-09-21-gte66lt67f"
+_V2_TRIAL = "current_rung_hold/trial/MIA/2026-09-21/tc-temp-miahigh-2026-09-21-gte88lt89f"
+_CONT_TRIAL = "continuous_rung_hold/trial/MDW/2026-09-15/tc-temp-mdwhigh-2026-09-15-gte80lt81f"
+
+#: Golden at the pre-WP1 revision for the scenario in ``_golden_inputs``: an UNBOUND report
+#: (no ``--family-manifest``) must stay byte-identical.
+_UNBOUND_GOLDEN_JSON_SHA256 = "b79da76c5b80743eb1c23ad4e4bfeb59d36b887d016be136fc7d46da33aec18e"
+_UNBOUND_GOLDEN_MARKDOWN = """# Position monitor nightly report
+
+positions: 2 (settled 1, unsettled 1)
+settled by source: scored_trials=1 summary=0
+position universe: monitor summaries (N=2); ledger fills: UNAVAILABLE (--exec-state-db not supplied)
+premature-exit rate: point=None [0.0000, 0.0000] n=0
+DEAD precision: point=None n=0
+avoided-loss sum: 0 (n=0, excluded-missing-mark=0)
+one-sided-book rate: 0.0
+n-gated metrics: INSUFFICIENT_N (n=1, n_min=90)
+calibration: UNCALIBRATED -- INC-8 corpus not yet available
+
+R_THREAT: ARMED: False family: UNBOUND (no manifest supplied) n=0 realized_pnl_total=0 avoided_loss_total=0 premature_exit_rate point=None n=0
+R_DEAD: ARMED: False family: UNBOUND (no manifest supplied) n=0 realized_pnl_total=0 avoided_loss_total=0 premature_exit_rate point=None n=0
+SETTLED: ARMED: False family: UNBOUND (no manifest supplied) n=1 realized_pnl_total=-0.37 avoided_loss_total=0.00 premature_exit_rate point=None n=0
+"""  # noqa: E501
+
+
+def _families() -> dict[str, FamilyManifest]:
+    """The three CRH families as committed: v4 and cont share a prefix, split by date window."""
+    return {
+        "v2": _manifest(
+            family_id="pm_us_crh_v2",
+            trial_id_prefix="current_rung_hold/trial/",
+            composition_kind="current_rung_hold",
+            d0_climate_day="2026-09-05",
+        ),
+        "v4": _manifest(
+            family_id="pm_us_crh_v4",
+            trial_id_prefix="continuous_rung_hold/trial/",
+            d0_climate_day="2026-09-20",
+        ),
+        "cont": _manifest(
+            family_id="pm_us_crh_cont",
+            trial_id_prefix="continuous_rung_hold/trial/",
+            d0_climate_day="2026-09-12",
+            terminal_climate_day="2026-09-19",
+        ),
+    }
+
+
+def _three_family_inputs() -> tuple[tuple[PositionMonitorSummary, ...], tuple[ScoredTrial, ...]]:
+    summaries = (
+        _summary(trial_id=_V4_TRIAL, climate_day="2026-09-21"),
+        _summary(trial_id=_V2_TRIAL, climate_day="2026-09-21", station="MIA"),
+        _summary(trial_id=_CONT_TRIAL, climate_day="2026-09-15", station="MDW"),
+    )
+    trials = (
+        _trial(trial_id=_V4_TRIAL, climate_day="2026-09-21", held=False, pnl=Decimal("-0.37")),
+        _trial(trial_id=_V2_TRIAL, climate_day="2026-09-21", held=True, pnl=Decimal("0.20")),
+        _trial(trial_id=_CONT_TRIAL, climate_day="2026-09-15", held=True, pnl=Decimal("0.11")),
+    )
+    return summaries, trials
+
+
+def _settled_total(report: Any) -> Decimal:
+    return Decimal(report.exit_rule_series["SETTLED"].realized_pnl_total)
+
+
+class TestFamilyScopedMonitorReport:
+    def test_bound_report_excludes_other_family_summaries(self, report_mod: ModuleType) -> None:
+        summaries, trials = _three_family_inputs()
+        families = _families()
+        registered = tuple(families.values())
+
+        v4 = report_mod.build_monitor_report(
+            summaries,
+            trials,
+            family_manifest=families["v4"],
+            registered_manifests=registered,
+        )
+        v2 = report_mod.build_monitor_report(
+            summaries,
+            trials,
+            family_manifest=families["v2"],
+            registered_manifests=registered,
+        )
+        cont = report_mod.build_monitor_report(
+            summaries,
+            trials,
+            family_manifest=families["cont"],
+            registered_manifests=registered,
+        )
+
+        assert [r.total_positions for r in (v4, v2, cont)] == [1, 1, 1]
+        # the shared -0.37 row belongs to v4 alone, never to v2 or cont
+        assert _settled_total(v4) == Decimal("-0.37")
+        assert _settled_total(v2) == Decimal("0.20")
+        assert _settled_total(cont) == Decimal("0.11")
+
+    def test_bound_report_keeps_own_family_rows(self, report_mod: ModuleType) -> None:
+        families = _families()
+        summaries = (
+            _summary(trial_id=_V4_TRIAL, climate_day="2026-09-21"),
+            _summary(
+                trial_id="continuous_rung_hold/trial/MIA/2026-09-22/tc-miahigh-2026-09-22-x",
+                climate_day="2026-09-22",
+                station="MIA",
+                leg="NO",
+            ),
+        )
+        # the bound manifest need not be among the REGISTERED ones (a DRAFT family still reports)
+        report = report_mod.build_monitor_report(
+            summaries, (), family_manifest=families["v4"], registered_manifests=()
+        )
+        assert report.total_positions == 2
+        assert report.by_leg == {"YES": 1, "NO": 1}
+        assert report.no_monitor_for_kind is None
+
+    def test_fq_kind_reports_no_monitor_for_kind(self, report_mod: ModuleType) -> None:
+        summaries, trials = _three_family_inputs()
+        fq = _manifest(
+            family_id="pm_us_crh_fq_v1",
+            trial_id_prefix="forecast_quantile_ladder/trial/pm_us_crh_fq_v1/",
+            composition_kind="forecast_quantile_ladder",
+            d0_climate_day="2026-10-02",
+        )
+        report = report_mod.build_monitor_report(
+            summaries,
+            trials,
+            family_manifest=fq,
+            registered_manifests=(*_families().values(), fq),
+        )
+        assert report.total_positions == 0
+        assert report.no_monitor_for_kind == "forecast_quantile_ladder"
+        assert report.to_dict()["no_monitor_for_kind"] == "forecast_quantile_ladder"
+        markdown = report_mod._render_markdown(report)
+        assert "positions: 0 (settled 0, unsettled 0)" in markdown
+        assert "NO_MONITOR_FOR_KIND forecast_quantile_ladder" in markdown
+
+    def test_unbound_report_unchanged_golden(self, report_mod: ModuleType) -> None:
+        s1 = _summary(
+            trial_id="continuous_rung_hold/trial/SFO/2026-09-21/a", climate_day="2026-09-21"
+        )
+        s2 = _summary(
+            trial_id="current_rung_hold/trial/MIA/2026-09-21/b",
+            climate_day="2026-09-21",
+            leg="NO",
+            station="MIA",
+        )
+        t1 = _trial(
+            trial_id=s1.trial_id, climate_day="2026-09-21", held=False, pnl=Decimal("-0.37")
+        )
+        report = report_mod.build_monitor_report((s1, s2), (t1,))
+        digest = hashlib.sha256(
+            json.dumps(report.to_dict(), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        assert digest == _UNBOUND_GOLDEN_JSON_SHA256
+        assert report_mod._render_markdown(report) == _UNBOUND_GOLDEN_MARKDOWN
+        assert "no_monitor_for_kind" not in report.to_dict()
+        # registering families without binding one scopes nothing
+        unbound = report_mod.build_monitor_report(
+            (s1, s2), (t1,), registered_manifests=tuple(_families().values())
+        )
+        assert unbound.total_positions == 2
+
+    def test_scored_trial_without_summary_is_not_a_row(self, report_mod: ModuleType) -> None:
+        trial = _trial(trial_id=_V4_TRIAL, climate_day="2026-09-21")
+        families = _families()
+        for bound in (None, families["v4"]):
+            report = report_mod.build_monitor_report(
+                (), (trial,), family_manifest=bound, registered_manifests=tuple(families.values())
+            )
+            assert report.total_positions == 0
+            assert report.settled_count == 0
