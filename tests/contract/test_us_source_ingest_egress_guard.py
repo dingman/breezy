@@ -40,6 +40,10 @@ import re
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.contract
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"
 SCRIPTS = REPO_ROOT / "scripts"
