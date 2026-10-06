@@ -54,11 +54,22 @@ _VENV_PYTHON_HOST_PATHS = frozenset(
 
 
 def _directive_lines(text: str) -> list[str]:
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    """Logical lines: a physical line ending in `\\` is joined to the next with one space, as
+    systemd does, BEFORE blank/comment filtering. A comment line is never extended."""
+    logical: list[str] = []
+    pending = ""
+    for physical in text.splitlines():
+        stripped = physical.strip()
+        if not pending and stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1].rstrip() + " "
+            continue
+        logical.append((pending + stripped).strip())
+        pending = ""
+    if pending.strip():
+        logical.append(pending.strip())
+    return [line for line in logical if line and not line.startswith("#")]
 
 
 def _directive(text: str, name: str) -> str | None:
@@ -306,3 +317,37 @@ def test_specifier_and_trailing_argument_tokens_are_dropped_not_expanded(
     assert "%h" not in joined, argv
     assert "${BREEZY_USER_AGENT}" not in joined, argv
     assert argv[-1] == "--help"
+
+
+def test_directive_reader_joins_backslash_newline_continuations_like_systemd() -> None:
+    """systemd joins a line ending in `\\` with the next (replacing the pair with one space)
+    BEFORE it looks for the directive; a naive reader splits the ExecStart in two."""
+    text = (
+        "[Service]\nExecStart=/usr/bin/flock -n \\\n"
+        "  /usr/bin/bwrap --clearenv \\\n  -- /bin/true\nType=exec\n"
+    )
+    joined = _directive(text, "ExecStart")
+    assert joined is not None
+    assert shlex.split(joined) == [
+        "/usr/bin/flock",
+        "-n",
+        "/usr/bin/bwrap",
+        "--clearenv",
+        "--",
+        "/bin/true",
+    ]
+    assert _directive(text, "Type") == "exec"
+    # a comment line is never a continuation target, and a lone trailing `\` ends the file safely
+    assert _directive("ExecStart=/bin/a \\\n", "ExecStart") == "/bin/a"
+
+
+def test_bwrap_wrapped_collector_unit_is_scanned_and_is_not_a_direct_venv_python_unit() -> None:
+    """The collector's ExecStart parses (continuations joined) and is deliberately NOT in the
+    direct-venv-python set: its first token is flock, and its imports are proven for real by
+    `test_us_source_collector_unit.py::test_bwrap_probe_real_collector_help_runs_under_the_profile`."""
+    unit = _SYSTEMD_DIR / "us-source-collector@.service"
+    exec_start = _directive(unit.read_text(), "ExecStart")
+    assert exec_start is not None
+    tokens = shlex.split(_expand_home_specifier(exec_start, home=Path("/placeholder-home")))
+    assert tokens[0] == "/usr/bin/flock" and "/usr/bin/bwrap" in tokens
+    assert unit not in _venv_python_direct_script_units()

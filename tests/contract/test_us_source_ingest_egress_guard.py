@@ -139,7 +139,9 @@ M6_PREEXISTING_BASELINE: dict[str, str] = {
     "scripts/venue/polymarket_us_capital_flow_pull.py": "56005638006617e6e50bd0196b82ab084c34523428c54f75484adc823f15113d",  # noqa: E501
     "scripts/venue/polymarket_us_positions_value_capture.py": "593f676d53269d3c000a8118879d976aaa6a3c67bb943dd213bd65ed9504b54a",  # noqa: E501
     "scripts/venue/polymarket_us_private_shape_probe.py": "5e295f20f097e521ca3b7d86cd1ed5497637ecb2f225d25acbe05d19e558af7f",  # noqa: E501
-    "scripts/venue/polymarket_us_shape_capture.py": "0117997dbe576465f206cc0e75afc78eaa496de929f11de876ece890cf3fa633",  # noqa: E501
+    # Re-digested once at the F4 rebase: 097e768d (AUT-2 WP0, reviewed upstream) changed this
+    # pre-existing venue script, which is outside the C1 closure. Entry kept, digest updated.
+    "scripts/venue/polymarket_us_shape_capture.py": "4f7b2ddf78ec6ccc91ae0fb196f84aaca5ade575d6600ea8a13a7e33395e6a87",  # noqa: E501
     "scripts/venue/polymarket_us_write_signing_probe.py": "fbc925a7a09be883ccdd53d84307ee047c24aa6ad45c988f53091bc2af99043f",  # noqa: E501
     "src/breezy/ingest/_nbm_text_common.py": "62dbb22751260cb9ee62f795ab7dc5634b2876c85ac2cb2d880ea24ca9126837",  # noqa: E501
     "src/breezy/ingest/gaps.py": "5d62031c75747b804f019d291fe423d557ce060c1dbec6acb8c2b443cfec0c96",

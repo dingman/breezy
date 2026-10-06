@@ -10,6 +10,8 @@ Documentation=file:///home/jon/breezy/scripts/collect/us_source_collector.py
 # writable path. Alert delivery reads alerts.env as a FILE because --clearenv strips
 # EnvironmentFile (F13 R31).
 
+OnFailure=breezy-study-failed@%n.service
+
 [Service]
 # Type=exec, not oneshot: systemd ignores RuntimeMaxSec= under Type=oneshot (measured with
 # `systemd-analyze --user verify`), and the backstop below must actually bind.
