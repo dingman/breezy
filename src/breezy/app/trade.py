@@ -760,6 +760,48 @@ def _compose_forecast_quantile_ladder(
         live_orders.ruling_sha256 or "none",
         manifest.density_artefact_sha256,
     )
+    # F6 FQ-BRIDGE (E-28 carve-out; temporary, retired by hand per plan
+    # §R8-2): wrap the halt veto in ONE add-only OR -- family halt first,
+    # then the loss stop, then parity -- so the SAME callable reaches both
+    # the strategies and the exec client. A veto only: it can refuse, never
+    # enable. The import is local so the carve-out stays inside this def.
+    from breezy.strategy.forecast_quantile_ladder import loss_stop_probe as fq_bridge
+
+    def _fq_bridge_now() -> dt.datetime:
+        return dt.datetime.now(tz=dt.UTC)
+
+    def _fq_bridge_set_halt(reason: str, evidence_sha256: str) -> None:
+        forecast_halt_latch.record_policy_halt(
+            reason=reason, evidence_sha256=evidence_sha256, ts_ns=time.time_ns()
+        )
+
+    fq_loss_stop_probe = fq_bridge.LossStopProbe(
+        path=fq_bridge.loss_stop_artefact_path(catalog_root),
+        clock=_fq_bridge_now,
+        set_family_halted=_fq_bridge_set_halt,
+        alert_sink=resolve_alert_sink(),
+        alert_every_probe=lambda: (
+            live_orders.enabled and not forecast_halt_latch.is_family_halted()
+        ),
+        expected_uid=os.getuid(),
+    )
+    fq_loss_stop_probe.probe_once()
+    fq_parity_gate = (
+        fq_bridge.make_file_parity_gate(
+            catalog_root,
+            family_id=manifest.family_id,
+            clock=_fq_bridge_now,
+            expected_uid=os.getuid(),
+        )
+        if manifest.family_id == fq_bridge.PARITY_SUBJECT
+        else None
+    )
+    submit_veto = fq_bridge.FqComposedVeto(
+        halt_veto=submit_veto,
+        loss_stop_veto=fq_loss_stop_probe.veto_reason,
+        parity_veto=None if fq_parity_gate is None else fq_parity_gate.veto_reason,
+    )
+    extra_actors.append(fq_bridge.LossStopProbeActor(fq_loss_stop_probe))
     # FQ-S11: ONE shared in-process decision-funnel aggregator for
     # this boot, flushed every 15 minutes (plus once at on_stop) to
     # the SAME sibling `decisions/` directory

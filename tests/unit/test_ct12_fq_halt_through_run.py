@@ -39,6 +39,9 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     PersistentQuantileLadderLatch,
 )
 from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
+from tests.unit.test_app_trade_fq_loss_stop_wiring import (
+    _write_artefact as _write_loss_stop_artefact,
+)
 from tests.unit.test_forecast_quantile_ladder_boot import (
     _write_d_plus_1_catalog,
     _write_forecast_quantile_ladder_manifest,
@@ -181,6 +184,9 @@ def _boot(
     catalog_root = tmp_path / "catalog"
     catalog_root.mkdir()
     _write_d_plus_1_catalog(catalog_root)
+    # F6: the composed veto also reads the loss-stop artefact (fail closed
+    # when absent); the unhalted twin gets a fresh PASS so its assertions hold.
+    _write_loss_stop_artefact(tmp_path / "derived/fq-loss-stop/latest.json", verdict="PASS")
     env = _trade_env(
         tmp_path,
         **{
