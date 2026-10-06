@@ -1,0 +1,98 @@
+{
+  "schema": "f13_prereg_blend_v1",
+  "frozen_sha": "UNFROZEN",
+  "status": "DRAFT skeleton. The coordinator pins every null under `pins` and the `veto` pins, then freezes it (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, or if the committed blob differs.",
+  "pin_note": "coordinator pins before any M1-M3 scoring",
+  "plan": {
+    "document": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md",
+    "binding": "r3 + r3.1 + r3.2 + F13-R35 (LAMP remaining-hours feature). F13-R36 (B1 UNDERPOWERED) is out of scope here.",
+    "sections": ["Phase A1 / A", "Procedure R4/R15", "Acceptance 1-9", "Folds", "Veto analysis R8/R15", "OPEN-3", "R25", "R35"]
+  },
+  "fixed_by_plan": {
+    "holdout_start": "2026-07-01",
+    "holdout_rule": "rows on or after holdout_start are REFUSED by the fit, the folds, the scorer and the runner; open_holdout is never called",
+    "champion": "M0 = nbp_calibration.fit_calibration, module byte-unchanged (sha pinned by test_nbp_calibration_module_is_byte_unchanged)",
+    "ladder": ["M0prime", "M1(+LAMP)", "M2(+PFM)", "M3(+GFS MOS)"],
+    "k": 1,
+    "primary_comparison": "M3 vs M0prime",
+    "test_statistic": "delta = CRPS(M0prime) - CRPS(M3), positive = M3 better",
+    "scorer": "nbp_calibration.crps_numerical with center = the blend mu",
+    "distribution": "Student-t, log sigma = c + d*log(NBP sd) floored; the disagreement term e*log(sd of sources' mu) is a separate, later ladder step, never in the primary arms",
+    "weights": "shrinkage toward a sum of 1 (lambda * n * (sum(w) - 1)^2), not a hard box",
+    "nesting": "a row scores with the longest present prefix of [LAMP, PFM, GFS MOS]; LAMP missing means the row scores as M0prime",
+    "bootstrap": "stationary (Politis-Romano), circular, by climate day averaged across stations and horizons",
+    "mean_block_days": 7,
+    "alpha_one_sided": 0.025,
+    "lb_rule": "one-sided 97.5 % lower bound must be > 0 AND >= floor, for both CRPS(M0prime) - CRPS(M3) and CRPS(M0) - CRPS(M3) (R25)",
+    "floor_rule": "floor = floor_multiple * sample SD of the M0 fold-to-fold mean CRPS, committed before M1-M3 are scored",
+    "fold_sign_fraction": 0.75,
+    "fold_sign_rule": "same sign in >= ceil(0.75 * n_folds) folds",
+    "block_days": 28,
+    "min_train_days": 28,
+    "min_blocks": 2,
+    "fold_rule": "blocked within each NBM version and within each source-break segment; a segment enters only with >= 2 blocks of >= 28 held days and >= 28 train days; no fold straddles a source break; v5 never mints (AS-R14)",
+    "lag_shift_minutes": 60,
+    "lag_rule": "rerun with every source lag +60 min; LB must be >= 0 (R25) and the rows lost are reported",
+    "c1_min_measured_days": 14,
+    "negative_control": "labels shuffled within version; the shuffled delta is reported and must be ~0",
+    "positive_control": "M0 reproduces the committed champion (fit_calibration)",
+    "lamp_feature": {
+      "ruling": "F13-R35",
+      "name": "lamp_rem_max_f",
+      "definition": "max over lavtxt + lavtxt_ext forecast hours with valid_ts strictly after the anchor and inside the LST climate day, from the latest run with available_at (frozen upper-bound lag) before the anchor",
+      "persisted": ["hours_covered", "lamp_peak_covered", "m_lamp", "lamp_rem_max_f", "obs_so_far_f"],
+      "peak_rule": "lamp_peak_covered is true only when every LST hour 12..18 after the anchor is present; otherwise the feature is MISSING (m_lamp = 1) and nothing is imputed",
+      "blend_input": "L = max(obs_so_far, lamp_rem_max_f); at a D-1 anchor obs_so_far is undefined and L = lamp_rem_max_f",
+      "obs_so_far": "from the obs path only (obs available_at before the anchor), never from LAMP",
+      "m0prime_inputs": "NBP q50 and NBP sd, plus obs_so_far when defined (LAMP credit is not confused with observation credit)",
+      "strict_24h_max": "diagnostic only, never read by the blend"
+    },
+    "diagnostics": ["CRPS by horizon", "PIT histogram (10 bins)", "80 % and 95 % coverage", "mean log score on the rung ladder", "RMSE (descriptive only)", "LAMP missingness per horizon"],
+    "outcomes": {
+      "ACCEPT": "every criterion holds",
+      "REFUSED_M0PRIME_WORSE": "CRPS(M0prime) - CRPS(M0) > m0_prime_tolerance_crps_f",
+      "HELD_LEAK_AUDIT": "delta mean > leak_audit_spread_multiple * M0 fold SD",
+      "NO_SKILL": "otherwise: record NO_SKILL, stop Phase D, keep B1 and C1 running"
+    }
+  },
+  "pins": {
+    "floor_multiple": null,
+    "m0_prime_tolerance_crps_f": null,
+    "station_tolerance_crps_f": null,
+    "leak_audit_spread_multiple": null,
+    "student_t_nu": null,
+    "sigma_floor_f": null,
+    "weight_sum_lambda": null,
+    "min_cell_rows": null,
+    "bootstrap_n": null,
+    "bootstrap_seed": null,
+    "champion_cdf_method": null,
+    "m0_bootstrap_draws": null,
+    "source_breaks": null,
+    "rung_edges_f": null,
+    "min_uncensored_lag_samples": null
+  },
+  "pin_units": {
+    "m0_prime_tolerance_crps_f": "absolute CRPS in degF; M0prime worse than M0 by more than this refuses ACCEPT",
+    "station_tolerance_crps_f": "absolute CRPS in degF; a station whose mean (M0prime - M3) is below minus this is degraded",
+    "sigma_floor_f": "degF",
+    "source_breaks": "list of ISO dates from A0; a fold never straddles one",
+    "rung_edges_f": "integer degF edges for the rung-ladder log score",
+    "champion_cdf_method": "NORMAL | PCHIP_NORMAL_TAILS | SKEW_NORMAL, the CdfMethod the committed champion uses"
+  },
+  "veto": {
+    "label": "descriptive only, carries no verdict (R8, R15)",
+    "take_rule": {
+      "open_item": "OPEN-3",
+      "citation": "src/breezy/strategy/forecast_quantile_ladder/decision.py:349-355 (net EV against the cost, take iff net > forecast_margin); margin src/breezy/strategy/forecast_quantile_ladder/margin.py:30-37; fee src/breezy/strategy/weather_common/costs.py:155-183; reached through the shipped evaluate() via scripts/analysis/fq_mc_livedata.py:370 (_call_evaluate)",
+      "order": "YES: ev_net(p_lower, cost); NO: ev_net_no(p_upper, cost); cost = fee theta*p*(1-p) + slippage floor; take iff net > margin(h)",
+      "fixed_by_code": "theta, slippage floor, h_hours and bound halfwidth are the scripts/analysis/fq_mc_livedata.py LoopConfig defaults, read from the code and never copied",
+      "proxy_deviation": "no out-of-fold bootstrap draws exist, so p_lower and p_upper are p_hat -/+ the LoopConfig bound halfwidth"
+    },
+    "reference": null,
+    "reference_note": "no tape exists before 2026-08-30, so the pre-07-01 proxy needs a pre-registered reference ask; the coordinator pins its kind and value. Until then blend_veto_descriptive.py refuses to run.",
+    "tape_start": "2026-08-30",
+    "horizon": "D-1 (the FQ family trades D+1)",
+    "champion_output": "out-of-fold only; a fitted-in-sample champion is refused"
+  }
+}
