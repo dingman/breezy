@@ -65,7 +65,11 @@ from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, VENUE, Chain, a
 from tests.unit.test_registry_fold_tallies import carried, reset
 
 KIND: Final = "forecast_quantile_ladder"
-ROOT_SOURCE: Final = REPO_ROOT / "deploy" / "families" / f"{INCUMBENT}.json"
+#: FQ-R45 (CONFLICT-13 option d): the registry World's root is the pre-F3 v1 manifest, frozen as a
+#: fixture, so the live deploy manifest's terminal day does not leak into the derived children.
+ROOT_SOURCE: Final = REPO_ROOT / "tests" / "fixtures" / "registry_world" / f"{INCUMBENT}.json"
+LIVE_ROOT_SOURCE: Final = REPO_ROOT / "deploy" / "families" / f"{INCUMBENT}.json"
+ROOT_FIXTURE_SHA256: Final = "8e1217fd2037ca4ea070c3f15a081168c591ad450ab347ed7319ede2f524b9d0"
 #: The root's real density artefact: the bytes at its manifest's ``density_artefact_path`` (E-24:
 #: a family's density pin is its bound artefact, so the pinned sha ``9c0b...`` is ``ART_SHA``).
 ROOT_ARTEFACT_PATH: Final = (
@@ -703,3 +707,20 @@ def test_artefact_reads_are_memoised_by_model_class_and_sha(
 def test_the_artefact_read_cap_is_a_pin() -> None:
     assert pins.ARTEFACT_MAX_BYTES == 64 * 1024 * 1024
     assert not hasattr(replay_mod, "ARTEFACT_MAX_BYTES")
+
+
+def test_registry_world_root_fixture_equals_deploy_v1_modulo_terminal_day() -> None:
+    """FQ-R45 drift guard: the fixture is the pre-F3 v1 manifest and differs from the live deploy
+    manifest only by the terminal day (and the sha that follows from it)."""
+    from breezy.persistence.family_manifest import FamilyManifest, parse_family_manifest
+
+    fixture_raw = ROOT_SOURCE.read_bytes()
+    assert _sha(fixture_raw) == ROOT_FIXTURE_SHA256
+    fixture = parse_family_manifest(fixture_raw, path=ROOT_SOURCE)
+    live = parse_family_manifest(LIVE_ROOT_SOURCE.read_bytes(), path=LIVE_ROOT_SOURCE)
+    skipped = {"terminal_climate_day", "manifest_sha256"}
+    for field in dataclasses.fields(FamilyManifest):
+        if field.name not in skipped:
+            assert getattr(fixture, field.name) == getattr(live, field.name), field.name
+    assert fixture.terminal_climate_day is None
+    assert live.terminal_climate_day == "2026-10-05"

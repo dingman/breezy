@@ -60,6 +60,10 @@ from tests.unit.registry_resolver_world import (
 from tests.unit.test_registry_fold import CHILD, DAY, INCUMBENT, VENUE, at
 from tests.unit.test_registry_replay import (
     ART_SHA,
+    CHILD_ART_SHA,
+    CHILD_ARTEFACT_PATH,
+    LIVE_ROOT_SOURCE,
+    ROOT_ARTEFACT_PATH,
     World,
     _sha,
     _verdict,
@@ -320,3 +324,20 @@ def test_a_child_declaring_no_policy_ruling_is_ruling_not_policy(
 
     refused = refusal_of(run_child(world, promoted, lineage_gate=gate))
     assert refused.reason is RefusalReason.RULING_NOT_POLICY
+
+
+def test_child_inheriting_root_terminal_before_its_d0_is_refused(world: World) -> None:
+    """FQ-R45: a child cut from the live (terminal 2026-10-05) v1 bytes with d0 2026-10-20 is an
+    impossible world; the parser refuses it before any root comparison."""
+    live = LIVE_ROOT_SOURCE.read_bytes()
+    assert b'"terminal_climate_day": "2026-10-05"' in live
+
+    def from_live(_pristine: bytes) -> bytes:
+        raw = live.replace(INCUMBENT.encode(), CHILD.encode())
+        raw = raw.replace(b'"2026-10-02"', b'"2026-10-20"')
+        raw = raw.replace(ART_SHA.encode(), CHILD_ART_SHA.encode())
+        return raw.replace(ROOT_ARTEFACT_PATH.encode(), CHILD_ARTEFACT_PATH.encode())
+
+    chain = new_child(world, from_live)
+    refused = refusal_of(run_child(world, chain, stub=True))
+    assert refused.reason is RefusalReason.MANIFEST_INVALID
