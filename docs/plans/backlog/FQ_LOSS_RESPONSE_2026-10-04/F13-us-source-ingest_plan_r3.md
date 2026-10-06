@@ -646,3 +646,38 @@ Round 3: security NOT-READY (2 blockers), stats NOT-READY (2), architecture NOT-
   - The KNYC widening updates any pinned 4-tuple test as a WIDENED row, never relaxing it.
 
 Next: a confirmation-only round 4 on r3 + r3.1 (the same three reviewers, checking only R22..R29 and regressions). READY on all three marks F13 READY and opens the F13-C1 queue row.
+
+## r3.2 amendments: round-4 rulings F13-R30..R33 (coordinator, 2026-10-06). BINDING over r3 and r3.1.
+
+Round 4 results: stats READY (with nits), security NOT-READY (2), architecture NOT-READY (2). Each fix text below is adopted verbatim.
+
+- **F13-R30 (M6 baseline digest; security).** A baseline entry exempts a file only while its current sha256 equals the recorded digest. A path-listed file with a differing digest is scanned like a new file.
+  - Files in the C1 transitive closure, including `http.py`, `probe_transport.py` and `iem_mos_probe_transport.py`, are scanned regardless of baseline membership.
+  - `test_m6_baseline_excludes_c1_closure` asserts that no closure file is exempted. `test_m6_modified_baseline_file_is_rescanned` asserts the digest rule.
+- **F13-R31 (H5 probe credentials; security). Replaces R23(a).** (a) Credential files and credential env names are absent: `~/.config/breezy` contains no entry other than the read-only `alerts.env`, and `ls` of it shows exactly that one file.
+  - The collector reads `alerts.env` as a file, because `--clearenv` strips `EnvironmentFile`.
+  - `user_agent=` is passed explicitly for the same reason.
+- **F13-R32 (revision scope; architecture).** The digest set is `{e.sha256}` over `entries(source)`, filtered to `station == S`, `window_start == run_ts`, and base product P with an `-r\d+` suffix. Only raw-payload entries count.
+  - Normalised CSVs are stored under a distinct product and are excluded.
+  - N is computed over the same filter.
+  - The unit flock is never `<source>/coverage.json.lock`, which `_commit_miss` takes with `LOCK_NB`.
+  - Parse and UTF-8 checks run before the `get_or_fetch` write, so a refused payload never leaves an orphan.
+  - When `last_modified` is None, the basis falls back to `first_seen`.
+- **F13-R33 (KNYC; architecture). Supersedes the R29 KNYC clause.** Leave `IEM_MOS_STATION_ORDER` unchanged. Widen only `IEM_MOS_STATIONS`, and have backfill and AFOS/LAV validate against the set.
+  - KNYC runs only when named in an explicit `--stations`, so the nightly `asos-refresh-run.sh` default stays four stations.
+  - Test: `test_knyc_widening_leaves_default_station_order_unchanged`.
+- **Stats round-4 nits (adopted).**
+  - θ = the pinned `EVIDENCED_FEE_THETA` (`hypothesis_ledger.py:202`), read and never copied. The test asserts equality with that symbol. Any per-instrument θ comes from the `costs.py:133` resolver.
+  - The 60 s STOP is evaluated on the primary-lag source's median time-to-50%-of-move. An untestable STOP is not FUTILE and falls through to the interval rule.
+  - Holm test renamed to `test_holm_family_size_equals_b0_fixed_size_1_or_2_at_alpha_0_025`.
+  - OPEN-5 adds the per-source minimum uncensored lag samples, the per-method byte caps and the `RuntimeMaxSec` margin.
+- **F13-R34 (R33 addendum + R32 nits; architecture round 5).**
+  - Retarget `test_mos_url_rejects_knyc` to an unlisted station: rename it `test_mos_url_rejects_unlisted_station`, use station `KJFK`, and keep the `ValueError` refusal. Add `test_mos_url_accepts_knyc`. This keeps the closed-set refusal; it is a widening, not a weakening.
+  - Add an EDIT row for `scripts/archive/iem_mos_backfill.py` `:469/:498/:526` (tuple → `IEM_MOS_STATIONS`). `STATIONS` and the `--stations` default stay `IEM_MOS_STATION_ORDER`, asserted by `test_knyc_widening_leaves_default_station_order_unchanged`.
+  - The unit lock is `<archive_root>/<source>/collector.lock`.
+  - The product match is `fullmatch(rf"{re.escape(P)}-r\d+")`.
+  - The `first_seen` fallback also applies to an unparsable `last_modified`.
+  - The collector parses `alerts.env` with a small local reader and imports nothing from `breezy.runtime`; M6 enforces this.
+  - The probe asserts the one-entry rule by listing `~/.config/breezy` under the profile.
+
+**STATUS: READY (2026-10-06).** Round 5: security READY, architecture READY once the R34 addendum is applied, statistics READY in round 4. The binding plan is r3 + r3.1 + r3.2. The F13-C1 queue row is open.
