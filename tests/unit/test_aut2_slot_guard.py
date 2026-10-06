@@ -19,10 +19,12 @@ from breezy.analysis.labeling.slot_guard import (
 )
 
 _REPO = Path(__file__).resolve().parents[2]
-_UNIT_DIR = _REPO / "deploy" / "systemd"
+_DEPLOY_DIR = _REPO / "deploy" / "systemd"
+#: the guard reads the STAGED WP6 unit pair: the deployed pair is symlink-installed and untouched
+_UNIT_DIR = _REPO / "tests" / "fixtures" / "aut2_units" / "promote"
 _TIMER = (_UNIT_DIR / "breezy-score-live-trials.timer").read_text()
 _SERVICE = (_UNIT_DIR / "breezy-score-live-trials.service").read_text()
-_WRAPPER = _UNIT_DIR / "slot-guard-run.sh"
+_WRAPPER = _DEPLOY_DIR / "slot-guard-run.sh"
 
 
 def _at(hh: int, mm: int, ss: int = 0) -> dt.datetime:
@@ -176,3 +178,47 @@ def test_score_live_trials_timer_moves_to_1355_and_keeps_its_other_settings() ->
 def test_the_wrapper_is_executable_and_names_no_shell_hazard() -> None:
     assert os.access(_WRAPPER, os.X_OK)
     assert "set -u" in _WRAPPER.read_text() or "set -eu" in _WRAPPER.read_text()
+
+
+# -- review fold-in: the module's windows are derived from the shared constants -----------------
+
+
+def test_slot_guard_windows_are_the_shared_constants() -> None:
+    from breezy.analysis.labeling import slot_guard
+
+    (launch_from, launch_until), (night_from, night_until) = CATCHUP_DENY_UTC
+
+    assert slot_guard._LAUNCH_FROM == dt.time(16, 30)  # the ARCH launch window opens at 16:30Z
+    assert slot_guard._LAUNCH_UNTIL == launch_until == dt.time(17, 10)
+    assert (slot_guard._NIGHT_FROM, slot_guard._NIGHT_UNTIL) == (night_from, night_until)
+    # CATCHUP_DENY_UTC's launch start is the 16:30Z window minus the worst-case span of the
+    # current unit pair (AccuracySec 60 + TimeoutStartSec 1200 + default stop 90 = 1350 s)
+    span = dt.timedelta(seconds=60 + 1200 + 90)
+    opened = dt.datetime.combine(dt.date(2026, 10, 7), dt.time(16, 30)) - span
+    assert launch_from == opened.time()
+
+
+def test_a_drift_between_the_constants_and_the_guard_would_be_caught() -> None:
+    from breezy.analysis.labeling import slot_guard
+
+    assert slot_guard.LAUNCH_WINDOW == (dt.time(16, 30), CATCHUP_DENY_UTC[0][1])
+    assert slot_guard.NIGHT_WINDOW == CATCHUP_DENY_UTC[1]
+
+
+def test_the_wrapper_runs_python_in_isolated_mode_unless_a_test_seam_is_set() -> None:
+    text = _WRAPPER.read_text()
+
+    assert '"$PYTHON" -I -m' in text
+    assert "SLOT_GUARD_MODULE" in text  # the seam is the only path that drops -I
+
+
+def test_the_unit_context_cgroup_check_fails_closed_under_a_cgroup_namespace() -> None:
+    from breezy.analysis.labeling.label_run import UnitContext
+
+    # inside a cgroup namespace /proc/self/cgroup shows a path relative to the namespace root
+    # ("0::/"), whose leaf is empty: it can never equal breezy-label-outcomes.service
+    assert UnitContext.from_environment({"INVOCATION_ID": "i"}, "0::/\n").is_label_unit() is False
+    assert (
+        UnitContext.from_environment({"INVOCATION_ID": "i"}, "0::/../..\n").is_label_unit() is False
+    )
+    assert UnitContext.from_environment({"INVOCATION_ID": "i"}, "").is_label_unit() is False

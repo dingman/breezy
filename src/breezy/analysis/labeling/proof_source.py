@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Callable, Sequence
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Final
 
@@ -61,6 +61,7 @@ __all__ = [
     "check_proof_start",
     "collect_day_evidence",
     "hold_days",
+    "metric_or_none",
     "store_proof_window",
 ]
 
@@ -133,14 +134,19 @@ def _verdict_wires(data_root: Path, family_id: str) -> list[dict[str, Any]]:
     return wires
 
 
-def _metric_int(wire: dict[str, Any], name: str) -> int:
+def metric_or_none(wire: dict[str, Any], name: str) -> int | None:
+    """An integer verdict metric, or ``None`` when it is absent or not an integer: a missing metric
+    is a gap that fails the day, never a zero."""
     metrics = wire.get("metrics", {})
     value = metrics.get(name) if isinstance(metrics, dict) else None
-    if isinstance(value, str):
-        return int(Decimal(value))
+    try:
+        if isinstance(value, str):
+            return int(Decimal(value))
+    except InvalidOperation:
+        return None
     if isinstance(value, int) and not isinstance(value, bool):
         return value
-    return 0
+    return None
 
 
 def _day_of(ns: int) -> str:
@@ -228,6 +234,22 @@ def collect_day_evidence(
         and w["outcome"] != VerdictOutcome.PASS.value
     )
     lag_h = _max_lag_hours(day_fills, final, lag_start_ns, now_ns)
+    gaps: list[str] = [] if marker is not None else ["marker_missing"]
+    mismatches = (
+        None if daily_wire is None else metric_or_none(daily_wire, "position_mismatches_transient")
+    )
+    never_compared = (
+        len(day_fills)
+        if daily_wire is None
+        else metric_or_none(daily_wire, "fills_never_position_compared")
+    )
+    if daily_wire is not None:
+        for name, value in (
+            ("position_mismatches_transient", mismatches),
+            ("fills_never_position_compared", never_compared),
+        ):
+            if value is None:
+                gaps.append(f"metric_missing:{name}")
     return DayEvidence(
         utc_day=day,
         real_fills=len(day_fills),
@@ -240,15 +262,9 @@ def collect_day_evidence(
         daily_recon=daily,
         post_stop=post_stop,
         intraday_non_pass_ids=intraday_bad,
-        position_mismatches_transient=(
-            0 if daily_wire is None else _metric_int(daily_wire, "position_mismatches_transient")
-        ),
+        position_mismatches_transient=0 if mismatches is None else mismatches,
         max_label_lag_h=lag_h,
-        fills_never_position_compared=(
-            len(day_fills)
-            if daily_wire is None
-            else _metric_int(daily_wire, "fills_never_position_compared")
-        ),
+        fills_never_position_compared=len(day_fills) if never_compared is None else never_compared,
         canary_fills=len(canary_fills),
         canary_labelled_with_p=bool(canary_fills)
         and len([r for r in canary_labels if r.climate_day == day]) >= len(canary_fills)
@@ -260,6 +276,7 @@ def collect_day_evidence(
         marker_file=None if marker is None else f"marker_{marker.written_at_ns}.json",
         daily_recon_verdict_id=daily_id,
         post_stop_verdict_id=post_stop_id,
+        evidence_gaps=tuple(gaps),
     )
 
 

@@ -26,6 +26,9 @@ from breezy.runtime.autonomy_sandbox.unit_lint import (
 _REPO = Path(__file__).resolve().parents[2]
 FIXTURES = _REPO / "tests" / "fixtures" / "aut2_units"
 DEPLOY = _REPO / "deploy" / "systemd"
+#: The WP6 versions of the score-live-trials unit pair, staged until promotion: the deployed pair is
+#: installed by symlink, so an edit to it goes live on the next daemon-reload.
+PROMOTE = FIXTURES / "promote"
 LABEL = "breezy-label-outcomes"
 SCORE = "breezy-score-live-trials"
 STAND_IN = BwrapRow(
@@ -104,8 +107,17 @@ def _meets_window(start: dt.datetime, end: dt.datetime) -> bool:
 # -- the fixture set and lint ----------------------------------------------------------------------
 
 
-def test_fixture_set_is_exactly_the_label_service_and_timer() -> None:
-    assert sorted(p.name for p in FIXTURES.iterdir()) == [f"{LABEL}.service", f"{LABEL}.timer"]
+def test_fixture_set_is_exactly_the_label_pair_and_the_staged_promote_directory() -> None:
+    assert sorted(p.name for p in FIXTURES.iterdir()) == [
+        f"{LABEL}.service",
+        f"{LABEL}.timer",
+        "promote",
+    ]
+    assert sorted(p.name for p in PROMOTE.iterdir()) == [
+        "README.md",
+        f"{SCORE}.service",
+        f"{SCORE}.timer",
+    ]
 
 
 def test_label_unit_lints_clean_against_a_standin_notifier_row() -> None:
@@ -271,7 +283,7 @@ def test_window_arithmetic_includes_timeout_stop_sec() -> None:
 
 
 def test_score_live_trials_tally_releases_before_label_flock_wait_expires() -> None:
-    timer, service = _text(DEPLOY, SCORE, "timer"), _text(DEPLOY, SCORE, "service")
+    timer, service = _text(PROMOTE, SCORE, "timer"), _text(PROMOTE, SCORE, "service")
     (tally,) = _calendar_times(timer)
 
     end = _worst_end(tally, timer, service)
@@ -285,7 +297,7 @@ def test_score_live_trials_tally_releases_before_label_flock_wait_expires() -> N
 
 
 def test_score_live_trials_slot_clears_launch_window() -> None:
-    timer, service = _text(DEPLOY, SCORE, "timer"), _text(DEPLOY, SCORE, "service")
+    timer, service = _text(PROMOTE, SCORE, "timer"), _text(PROMOTE, SCORE, "service")
     (tally,) = _calendar_times(timer)
 
     assert not _meets_window(
@@ -294,16 +306,75 @@ def test_score_live_trials_slot_clears_launch_window() -> None:
     assert _accuracy_s(timer) == 60.0 and _values(timer, "Timer", "Persistent") == ["true"]
 
 
-def test_the_label_timer_shares_no_tick_with_a_deployed_timer() -> None:
-    label = set(_calendar_times(_text(FIXTURES, LABEL, "timer")))
-    shared: list[str] = []
-    for path in sorted(DEPLOY.glob("*.timer")):
-        text = path.read_text()
-        for line in _values(text, "Timer", "OnCalendar"):
-            found = re.fullmatch(r"\*-\*-\* (\d\d):(\d\d):(\d\d) UTC", line)
-            if found and dt.time(int(found[1]), int(found[2]), int(found[3])) in label:
-                shared.append(path.name)
-    assert shared == []
+def _ticks_of(directory: Path, *, skip: set[str] | None = None) -> dict[str, set[dt.time]]:
+    found: dict[str, set[dt.time]] = {}
+    for path in sorted(directory.glob("*.timer")):
+        if skip and path.name in skip:
+            continue
+        found[path.name] = set()
+        for line in _values(path.read_text(), "Timer", "OnCalendar"):
+            hit = re.fullmatch(r"\*-\*-\* (\d\d):(\d\d):(\d\d) UTC", line)
+            if hit:
+                found[path.name].add(dt.time(int(hit[1]), int(hit[2]), int(hit[3])))
+    return found
+
+
+def test_the_staged_set_shares_no_tick_with_any_deployed_timer_it_does_not_replace() -> None:
+    """The label timer (14:15, 05:00) and the staged tally timer (13:55) must each be free in the
+    deployed schedule once the deployed tally timer, which the staged one replaces, is set aside."""
+    staged = {t for ticks in _ticks_of(FIXTURES).values() for t in ticks} | {dt.time(13, 55)}
+    deployed = _ticks_of(DEPLOY, skip={f"{SCORE}.timer"})
+
+    assert [name for name, ticks in deployed.items() if ticks & staged] == []
+
+
+def test_the_staged_tally_timer_replaces_exactly_the_deployed_1415_tick() -> None:
+    assert _ticks_of(DEPLOY)[f"{SCORE}.timer"] == {dt.time(14, 15)}
+    assert _ticks_of(PROMOTE)[f"{SCORE}.timer"] == {dt.time(13, 55)}
+
+
+# -- the installed units stay untouched until promotion ------------------------------------------
+
+
+def test_deployed_score_live_trials_pair_is_the_pre_aut2_version() -> None:
+    """Installed by symlink: an edit goes live at the next daemon-reload, before the label unit
+    exists. The WP6 versions live only in the promote fixture directory."""
+    service = _text(DEPLOY, SCORE, "service")
+    timer = _text(DEPLOY, SCORE, "timer")
+
+    assert _values(service, "Service", "ExecCondition") == []
+    assert "slot-guard" not in service and "slot-guard" not in timer
+    assert _values(timer, "Timer", "OnCalendar") == ["*-*-* 14:15:00 UTC"]
+
+
+def test_the_promote_fixtures_are_the_wp6_versions() -> None:
+    service = _text(PROMOTE, SCORE, "service")
+    timer = _text(PROMOTE, SCORE, "timer")
+
+    assert _values(service, "Service", "ExecCondition") == [
+        "/home/jon/breezy/deploy/systemd/slot-guard-run.sh --unit breezy-score-live-trials"
+    ]
+    assert _values(service, "Unit", "OnFailure") == ["breezy-study-failed@%n.service"]
+    assert _values(timer, "Timer", "OnCalendar") == ["*-*-* 13:55:00 UTC"]
+    assert _values(timer, "Timer", "Persistent") == ["true"]
+
+
+def test_no_deployed_file_references_slot_guard_run_until_promotion() -> None:
+    offenders = [
+        path.name
+        for path in sorted(DEPLOY.rglob("*"))
+        if path.is_file()
+        and path.name != "slot-guard-run.sh"
+        and "slot-guard-run" in _safe_text(path)
+    ]
+    assert offenders == []
+
+
+def _safe_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return ""
 
 
 # -- WP6-size is deferred ---------------------------------------------------------------------

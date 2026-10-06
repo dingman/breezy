@@ -367,3 +367,21 @@ def test_a_malformed_evidence_day_is_refused() -> None:
         _eval([_ev("2026-10-2")])
 
     assert caught.value.reason == "malformed_date"
+
+
+def test_any_evidence_gap_fails_the_day_and_restarts_the_window() -> None:
+    gap = _ev(_day(3), evidence_gaps=("marker_missing",))
+
+    result = _eval([_ev(_day(2)), gap, _ev(_day(4))])
+
+    assert _status(result, _day(3)) is DayStatus.FAILS
+    assert result.restarted_on == (_day(3),) and result.qualifying_days == 1
+    assert next(d for d in result.days if d.utc_day == _day(3)).reasons == (
+        "evidence_gap:marker_missing",
+    )
+
+
+def test_a_zero_fill_day_with_an_evidence_gap_also_fails() -> None:
+    result = _eval([_canary(_day(2), evidence_gaps=("marker_missing",))])
+
+    assert _status(result, _day(2)) is DayStatus.FAILS

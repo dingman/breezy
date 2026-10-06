@@ -293,6 +293,11 @@ _CAPTURE_ROWS: Final[tuple[BwrapRow, ...]] = (
 #: only through a snapshot copy in its cache bind (``exec_snapshot(take_flock=False)``). Egress is
 #: declared (DNS and network) for the injected delivery seam; it binds no ``evidence/alerts``
 #: before AUT-6.
+#:
+#: Accepted exception (security review, WP6): the row combines a read-only bind of the whole data
+#: root with declared egress, and carries no credentials (``credential_names`` and
+#: ``credential_env`` are empty). Nothing in the sandbox holds a secret that the data root's
+#: contents could leak, and the only network use is the injected alert delivery.
 _LABEL_OUTCOMES_ROW: Final = BwrapRow(
     name="breezy-label-outcomes",
     owner_plan="AUT-2",

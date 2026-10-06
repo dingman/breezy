@@ -2191,8 +2191,11 @@ def roi_against_baselines(
 #: than landing as another additive-within-1 key). FU-3c bumps it again to 3:
 #: `roi`/`roi_minus_b0`/`roi_minus_b1` now fold `realised_pnl_residual_total`
 #: into their numerator (Decision 2/R1) -- a semantic change to an existing
-#: field, not an additive-only one, so D7 requires the bump.
-PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 3
+#: field, not an additive-only one, so D7 requires the bump. AUT-2 WP6 bumps it to 4: `roi`,
+#: `roi_minus_b0` and `roi_minus_b1` are now `null` in a report gated on the label marker (a type
+#: change for an existing field), and `pass_flag` / `realised_pnl_c2_total` are added. The in-module
+#: reader and the exit-window study's reader (`read_portfolio_roi_report`) accept 1..4.
+PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 4
 
 #: The version `trial_rows` was introduced at -- every `schema_version` at
 #: or above this REQUIRES the key (see `_require_trial_rows`); below it,
@@ -2202,7 +2205,7 @@ _MIN_SCHEMA_VERSION_WITH_TRIAL_ROWS: Final[int] = 2
 #: Every `schema_version` this reader accepts -- `PORTFOLIO_ROI_SCHEMA_VERSION`
 #: (the current, writer-stamped version) plus every prior version this
 #: module still reads. Anything else raises `UnknownPortfolioRoiSchemaError`.
-_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3})
+_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3, 4})
 
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
@@ -3334,7 +3337,8 @@ def render_markdown_report(
             f"{row.classification} day={row.day} magnitude_cents="
             f"{row.magnitude_cents}{provisional_suffix}"
         )
-    if data.roi_status == ROI_STATUS_GATED_UNSETTLED_CAPITAL:
+    # AUT-2 WP6: kept whenever positions are unsettled, even when a label gate set the status
+    if data.unsettled_capital_positions > 0:
         lines.append(
             "\n**GATED_UNSETTLED_CAPITAL:** at least one position has aged past its "
             "settlement horizon with no matching ScoredTrial. ROI fields above are "

@@ -280,7 +280,7 @@ class TestJsonSchemaVersion:
 
         raw = json.loads(path.read_text())
         # Stage C3 bumps this to 2 (the per-trial `trial_rows` breakdown).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 4
         # D6: the JSON is PRIVATE, mode 0600.
         assert (path.stat().st_mode & 0o777) == 0o600
 
@@ -420,7 +420,7 @@ class TestPerTrialPnlBreakdown:
         write_portfolio_roi_json(path, data)
         raw = json.loads(path.read_text())
 
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 4
         assert raw["trial_rows"] == [
             {
                 "trial_id": "fam_a/trial/1",
@@ -2231,7 +2231,7 @@ class TestAdditiveSchemaFieldBackwardCompat:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 4
         assert view.n_family_station_refusals == 0
 
     def test_the_journal_line_carries_the_new_dimensionless_count(self) -> None:
@@ -2292,7 +2292,7 @@ class TestF1CumulativeReconciliationReachesTheArtefact:
         ]
         # These fields are additive-within-version (D7); the schema_version
         # bump to 2 is unrelated (Stage C3's `trial_rows` field).
-        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert raw["schema_version"] == PORTFOLIO_ROI_SCHEMA_VERSION == 4
 
         view = read_portfolio_roi_report(path)
         assert view.settled_cumulative_passes is False
@@ -4408,7 +4408,7 @@ class TestResidualPnlAndD9:
     def test_reader_accepts_v3_and_reads_absent_residual_pnl_as_none_on_v2(
         self, tmp_path: Path
     ) -> None:
-        """D7: `_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS` now includes 3. A
+        """D7: `_KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS` now includes 3 and 4. A
         genuinely older v2 report predates the field entirely -- `None`
         (unknown), never `Decimal(0)` (which would misreport a report that
         KNOWS the field and genuinely settled zero residuals)."""
@@ -4421,7 +4421,7 @@ class TestResidualPnlAndD9:
         write_portfolio_roi_json(path, data)
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 4
         assert view.realised_pnl_residual_total == Decimal("0.30")
         assert view.realised_pnl_portfolio_total == Decimal("0.87")
 
@@ -5162,7 +5162,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
     def test_fu13b_schema_version_stays_3_and_reader_accepts_old_v3(
         self, tmp_path: Path
     ) -> None:
-        assert PORTFOLIO_ROI_SCHEMA_VERSION == 3
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 4
         path = tmp_path / "report.json"
         write_portfolio_roi_json(path, _report_data())
         raw = json.loads(path.read_text())
@@ -5184,7 +5184,7 @@ class TestFu13bNetOfExternalFlowReconciliation:
         path.write_text(json.dumps(raw))
 
         view = read_portfolio_roi_report(path)
-        assert view.schema_version == 3
+        assert view.schema_version == PORTFOLIO_ROI_SCHEMA_VERSION == 4
         assert view.external_flow_evidence_status == STATUS_NOT_CONFIGURED
         assert view.n_windows_not_covered == 0
         assert view.settled_cumulative_passes_net is True
@@ -5893,3 +5893,77 @@ def _prr_psource_none() -> Any:
     from breezy.persistence.autonomy.label_schema import PSource
 
     return PSource.NONE
+
+
+class TestSchemaV4AndKeptUnsettledSignal:
+    """Review fold-in: ``roi`` may now be null (a label-gated report), so the schema is v4; a
+    label gate must not hide the unsettled-capital paragraph or the D9 alert."""
+
+    def _gated_data(self, *, unsettled: int) -> Any:
+        return dataclasses.replace(
+            _report_data(unsettled_capital_positions=unsettled, max_days_past_horizon=4 * unsettled),
+            roi_status=_prr.ROI_STATUS_GATED_IDENTITY,
+        )
+
+    def test_schema_version_is_four_and_every_prior_version_stays_readable(self) -> None:
+        assert PORTFOLIO_ROI_SCHEMA_VERSION == 4
+        assert _prr._KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS == frozenset({1, 2, 3, 4})
+
+    def test_a_label_gated_v4_report_round_trips_with_null_roi_and_raises_on_access(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "gated.json"
+        write_portfolio_roi_json(path, self._gated_data(unsettled=0))
+
+        raw = json.loads(path.read_text())
+        view = read_portfolio_roi_report(path)
+
+        assert raw["schema_version"] == 4 and raw["roi"] is None
+        assert view.schema_version == 4
+        for name in ("roi", "roi_minus_b0", "roi_minus_b1"):
+            with pytest.raises(_prr.UnsettledCapitalRoiError):
+                getattr(view, name)
+
+    def test_a_v3_report_with_a_numeric_roi_still_reads(self, tmp_path: Path) -> None:
+        path = tmp_path / "ok.json"
+        write_portfolio_roi_json(path, _report_data())
+        raw = json.loads(path.read_text())
+        raw["schema_version"] = 3
+        path.write_text(json.dumps(raw))
+
+        view = read_portfolio_roi_report(path)
+        assert view.schema_version == 3 and view.roi == Decimal(raw["roi"])
+
+    def test_a_null_roi_on_an_ok_report_is_malformed_never_gated_silently(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "bad.json"
+        write_portfolio_roi_json(path, _report_data())
+        raw = json.loads(path.read_text())
+        raw["roi"] = None
+        path.write_text(json.dumps(raw))
+
+        with pytest.raises(_prr.PortfolioRoiReportMalformedFieldError):
+            read_portfolio_roi_report(path)
+
+    def test_the_unsettled_capital_paragraph_survives_a_label_gate(self) -> None:
+        md = render_markdown_report(self._gated_data(unsettled=2))
+
+        assert "**GATED_UNSETTLED_CAPITAL:**" in md
+        assert "GATED -- see roi_status" in md
+
+    def test_no_unsettled_paragraph_when_nothing_is_unsettled(self) -> None:
+        assert "**GATED_UNSETTLED_CAPITAL:**" not in render_markdown_report(
+            self._gated_data(unsettled=0)
+        )
+
+    def test_the_d9_alert_ladder_input_ignores_the_label_status(
+        self, tmp_path: Path
+    ) -> None:
+        """The ladder is fed ``len(permanently_unsettled)``, never ``roi_status``: pinned by the
+        source so a future refactor cannot route it through the overridden status."""
+        text = (_SCRIPTS_ANALYSIS_DIR / "portfolio_roi_report.py").read_text()
+        call = text[text.rindex("apply_unsettled_positions_ladder(") :][:400]
+
+        assert "unsettled_count=len(permanently_unsettled)" in call
+        assert "roi_status" not in call

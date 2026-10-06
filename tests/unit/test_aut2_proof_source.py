@@ -19,9 +19,10 @@ from breezy.analysis.labeling.proof_source import (
     ProofSourceError,
     collect_day_evidence,
     hold_days,
+    metric_or_none,
     store_proof_window,
 )
-from breezy.analysis.labeling.proof_window import DayEvidence
+from breezy.analysis.labeling.proof_window import DayEvidence, DayStatus, evaluate_window
 from breezy.analysis.labeling.skip_journal import utc_day
 from breezy.persistence.autonomy.label_schema import PSource
 from breezy.persistence.autonomy.label_store import write_labels
@@ -246,3 +247,64 @@ def test_open_days_are_never_evaluated(tmp_path: Path) -> None:
     )
 
     assert path is None
+
+
+# -- review fold-in: a missing input fails the day, it never reads as zero ------------------------
+
+
+def _collect_no_run(tmp_path: Path) -> DayEvidence:
+    deps = make_deps(tmp_path)  # fills exist, but no label run has written a marker or verdict
+    return collect_day_evidence(
+        deps.data_root,
+        exec_db=deps.exec_db,
+        venue=_VENUE,
+        family_id=FAMILY,
+        day=_FILL_DAY,
+        lag_start_ns=deps.lag_start_ns,
+        now_ns=NOW_NS,
+    )
+
+
+def test_a_missing_marker_fails_the_day_not_counts_zero(tmp_path: Path) -> None:
+    ev = _collect_no_run(tmp_path)
+
+    assert "marker_missing" in ev.evidence_gaps
+    result = evaluate_window(
+        start_day=_FILL_DAY,
+        days=[ev],
+        capture_epoch_start_ns=TS - 24 * HOUR_NS,
+        wp7_active=True,
+        hold_days=(),
+    )
+    assert result.days[0].status is DayStatus.FAILS
+    assert "evidence_gap:marker_missing" in result.days[0].reasons
+
+
+def test_a_missing_metric_fails_the_day_not_reads_zero(tmp_path: Path) -> None:
+    _, ev = _collect(tmp_path)  # the daily verdict this run wrote carries no position metrics yet
+
+    assert "metric_missing:fills_never_position_compared" in ev.evidence_gaps
+    result = evaluate_window(
+        start_day=_FILL_DAY,
+        days=[ev],
+        capture_epoch_start_ns=TS - 24 * HOUR_NS,
+        wp7_active=True,
+        hold_days=(),
+    )
+    assert result.days[0].status is DayStatus.FAILS
+
+
+def test_metric_reader_returns_none_for_an_absent_metric_and_a_value_otherwise() -> None:
+    wire = {"metrics": {"present": "7", "also": 3}}
+
+    assert metric_or_none(wire, "present") == 7
+    assert metric_or_none(wire, "also") == 3
+    assert metric_or_none(wire, "absent") is None
+    assert metric_or_none({}, "absent") is None
+    assert metric_or_none({"metrics": {"bad": "x"}}, "bad") is None
+
+
+def test_a_present_marker_and_metrics_leave_no_gap_for_those_inputs(tmp_path: Path) -> None:
+    _, ev = _collect(tmp_path)
+
+    assert "marker_missing" not in ev.evidence_gaps

@@ -129,27 +129,30 @@ def test_every_timer_file_is_parsed_by_this_test() -> None:
     assert "breezy-score-live-trials.timer" in names
 
 
-def test_1355_utc_is_owned_by_exactly_one_timer() -> None:
-    # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md) put the score-live-trials tick at 14:15 UTC; AUT-2
-    # WP6 moved it to 13:55 UTC so it releases before the AUT-2 label run's studies-flock wait
-    # (14:15 + 600 s) expires. This is a targeted restatement of the collision test above, scoped
-    # to the one tick this unit owns, so a future timer added at 13:55 fails loudly here even if
-    # the general collision test above were ever weakened.
-    owners = [
-        timer_path.name
-        for timer_path in _all_timer_files()
-        if ("13", "55") in _clock_ticks(timer_path)
-    ]
-    assert owners == ["breezy-score-live-trials.timer"]
-
-
-def test_1415_utc_is_reserved_for_the_aut2_label_run_and_owned_by_no_deployed_timer() -> None:
+def test_1415_utc_is_owned_by_exactly_one_timer() -> None:
+    # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md): 14:15 UTC is the new
+    # score-live-trials tick, free on the pre-existing schedule (09:00,
+    # 13:30, 14:30, 17:15, 22:30, 22:45, 00/06/12/18:15). This is a targeted
+    # restatement of the collision test above, scoped to the one tick this
+    # increment adds, so a future timer added at 14:15 fails loudly here
+    # even if the general collision test above were ever weakened.
     owners = [
         timer_path.name
         for timer_path in _all_timer_files()
         if ("14", "15") in _clock_ticks(timer_path)
     ]
-    assert owners == []  # the label timer is a fixture until AUT-6 promotes it
+    assert owners == ["breezy-score-live-trials.timer"]
+
+
+def test_1355_utc_is_unowned_in_deploy_until_aut2_promotes_the_tally_move() -> None:
+    # AUT-2 WP6 stages the tally's move to 13:55 in tests/fixtures/aut2_units/promote/. The
+    # installed units are symlinks, so nothing may claim 13:55 under deploy/systemd before then.
+    owners = [
+        timer_path.name
+        for timer_path in _all_timer_files()
+        if ("13", "55") in _clock_ticks(timer_path)
+    ]
+    assert owners == []
 
 
 def test_a_periodic_timer_is_exempt_only_when_it_shares_a_unit_with_a_sibling(

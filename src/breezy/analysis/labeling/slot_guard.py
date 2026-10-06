@@ -22,14 +22,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from breezy.analysis.labeling.constants import SLOT_GUARD_REFUSED_RC, SYSTEMD_DEFAULT_TIMEOUT_STOP_S
+from breezy.analysis.labeling.constants import (
+    CATCHUP_DENY_UTC,
+    SLOT_GUARD_REFUSED_RC,
+    SYSTEMD_DEFAULT_TIMEOUT_STOP_S,
+)
 
-__all__ = ["SlotDecision", "catch_up_permitted", "main", "parse_systemd_span_s"]
+__all__ = [
+    "LAUNCH_WINDOW",
+    "NIGHT_WINDOW",
+    "SlotDecision",
+    "catch_up_permitted",
+    "main",
+    "parse_systemd_span_s",
+]
 
+#: The ARCH launch window opens at 16:30Z (``CATCHUP_DENY_UTC`` holds the derived deny START, 16:30
+#: minus the current units' worst-case span, which the guard recomputes from the unit files). Its
+#: end and the heavy night come straight from ``CATCHUP_DENY_UTC``; a test ties the 16:30 to it.
 _LAUNCH_FROM: Final = dt.time(16, 30)
-_LAUNCH_UNTIL: Final = dt.time(17, 10)
-_NIGHT_FROM: Final = dt.time(1, 0)
-_NIGHT_UNTIL: Final = dt.time(4, 30)
+_LAUNCH_UNTIL: Final = CATCHUP_DENY_UTC[0][1]
+_NIGHT_FROM: Final = CATCHUP_DENY_UTC[1][0]
+_NIGHT_UNTIL: Final = CATCHUP_DENY_UTC[1][1]
+LAUNCH_WINDOW: Final = (_LAUNCH_FROM, _LAUNCH_UNTIL)
+NIGHT_WINDOW: Final = (_NIGHT_FROM, _NIGHT_UNTIL)
 _DEFAULT_ACCURACY_S: Final = 60.0  # systemd's default AccuracySec
 _INTERNAL_ERROR_RC: Final = 255
 _UNIT_RE: Final = re.compile(r"\Abreezy-[a-z0-9-]{1,64}\Z")

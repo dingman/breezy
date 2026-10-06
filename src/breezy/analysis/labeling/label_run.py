@@ -25,6 +25,7 @@ import argparse
 import datetime as dt
 import fcntl
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -116,6 +117,9 @@ LABEL_UNIT: Final = "breezy-label-outcomes"
 #: proof window refuses to start (plan section 6, Q4).
 WP7_ACTIVE: Final = False
 _RC_REFUSED: Final = 2
+_MEASURE_LEAF_RE: Final = re.compile(
+    r"(?:run-(?:r[0-9a-f]+|p[0-9]+-i[0-9]+)|aut2-label-peak-[0-9]+|breezy-label-outcomes)\.service"
+)
 _RC_DELIVERY: Final = 4
 _GIB: Final = 1024**3
 
@@ -416,9 +420,21 @@ class UnitContext:
         return UnitContext.from_environment(os.environ, text)
 
     def is_label_unit(self) -> bool:
+        """Fails closed under a cgroup namespace: there ``/proc/self/cgroup`` shows a path relative
+        to the namespace root, whose leaf is empty and can never be the label unit's name."""
         return bool(self.invocation_id) and (
             PurePosixPath(self.cgroup_path).name == f"{LABEL_UNIT}.service"
         )
+
+    def is_measure_unit(self) -> bool:
+        """``--measure-peak`` reads its OWN cgroup's ``memory.peak``, which is the measurement only
+        inside a dedicated unit: the transient ``systemd-run`` unit (``run-...`` or the plan's
+        ``aut2-label-peak-<ts>``) or the label unit itself. Anywhere else (a login scope, another
+        unit) the file is some other process tree's peak."""
+        if not self.invocation_id:
+            return False
+        leaf = PurePosixPath(self.cgroup_path).name
+        return _MEASURE_LEAF_RE.fullmatch(leaf) is not None
 
 
 @dataclass(frozen=True)
@@ -826,9 +842,9 @@ def main(
     if sum(modes) > 1:
         print("AUT2 USAGE choose at most one mode")
         return _RC_REFUSED
-    if args.measure_peak:
-        return _measure_main(args, measure_seams, unit_factory)
     context = unit_context if unit_context is not None else UnitContext.current()
+    if args.measure_peak:
+        return _measure_main(args, context, measure_seams, unit_factory)
     if not context.is_label_unit():
         print("LABEL_OUTCOMES REFUSED reason=not_under_unit")
         return _RC_REFUSED
@@ -857,10 +873,16 @@ def main(
 
 
 def _measure_main(
-    args: argparse.Namespace, seams: MeasureSeams | None, unit_factory: UnitFactory | None
+    args: argparse.Namespace,
+    context: UnitContext,
+    seams: MeasureSeams | None,
+    unit_factory: UnitFactory | None,
 ) -> int:
     if args.output_root is None:
         print("AUT2 USAGE --measure-peak needs --output-root")
+        return _RC_REFUSED
+    if not context.is_measure_unit():
+        print("LABEL_OUTCOMES REFUSED reason=not_transient_unit")
         return _RC_REFUSED
     chosen = seams if seams is not None else _real_measure_seams()
     floor = MEASURE_MEMAVAILABLE_FLOOR_GIB * _GIB + chosen.rss_bytes()

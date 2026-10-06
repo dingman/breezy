@@ -1,12 +1,15 @@
 [Unit]
-Description=14:15 UTC trigger for the Breezy I3 live-fill scoring run
+Description=13:55 UTC trigger for the Breezy I3 live-fill scoring run
 Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Documentation=file:///home/jon/breezy/scripts/analysis/score_live_trials.py
 
 [Timer]
 Unit=breezy-score-live-trials.service
 
-# 14:15 UTC -- free on the existing schedule (occupied: 09:00, 13:30,
+# AUT-2 r7 WP6: moved 14:15 -> 13:55 UTC so the tally (worst case 13:55 + 60 s accuracy + 1200 s
+# start + the default 90 s stop = 14:17:30) releases before the AUT-2 label run's studies-flock wait
+# (14:15 + 600 s) expires; test_aut2_units_deploy.py asserts the arithmetic from these files.
+# 13:55 UTC -- free on the existing schedule (occupied: 09:00, 13:30,
 # 14:30, 17:15, 22:30, 22:45, 00/06/12/18:15), and BEFORE breezy-live-tally
 # (14:30) and breezy-pm-crh-v2-tally (17:15) so this unit's dated success
 # marker exists before either tally's own OnCalendar tick -- ordering is by
@@ -15,7 +18,7 @@ Unit=breezy-score-live-trials.service
 # clock is UTC) so the schedule cannot move if the host timezone is ever
 # changed. No two Breezy timers ever fire in the same hour:minute tick
 # (tests/unit/test_deploy_timer_hours.py).
-OnCalendar=*-*-* 14:15:00 UTC
+OnCalendar=*-*-* 13:55:00 UTC
 
 # A run missed because the host was down fires as soon as the timer is
 # next active, instead of being silently skipped until the following day --

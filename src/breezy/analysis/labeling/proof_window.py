@@ -86,6 +86,9 @@ class DayEvidence:
     invocation_id: str | None = None
     daily_recon_verdict_id: str | None = None
     post_stop_verdict_id: str | None = None
+    #: Inputs the store reader could not find (a missing marker, a missing metric). Any gap fails
+    #: the day: an absent input is never read as zero.
+    evidence_gaps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -173,6 +176,12 @@ def _is_canary_day(ev: DayEvidence) -> bool:
 
 
 def _classify(ev: DayEvidence) -> tuple[DayStatus, tuple[str, ...], str]:
+    if ev.evidence_gaps:
+        return (
+            DayStatus.FAILS,
+            tuple(f"evidence_gap:{gap}" for gap in ev.evidence_gaps),
+            "not_checked",
+        )
     if ev.label_slot_held:
         return DayStatus.FAILS, ("label_slot_held",), "not_checked"
     if ev.non_c1_entry_rows > 0:

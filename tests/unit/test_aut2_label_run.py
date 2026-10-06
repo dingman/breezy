@@ -743,3 +743,49 @@ def test_canary_without_exec_db_reads_through_exec_snapshot_without_flock(
     assert rc == 0 and seen == [False]  # the exec store is read through a snapshot, never a flock
     assert list(root.joinpath("derived", "canary").rglob("*.jsonl"))
     assert (root / "cache" / "label_run_snapshot").is_dir()
+
+
+# -- review fold-in: --measure-peak only runs under a transient unit ---------------------------
+
+
+def test_measure_peak_refuses_outside_a_transient_unit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from breezy.analysis.labeling.label_run import MeasureSeams
+
+    seams = MeasureSeams(
+        meminfo_path=_meminfo(tmp_path, 40 * 1024**2),
+        rss_bytes=lambda: 0,
+        proc_cgroup_text="0::/user.slice/user-1000.slice/session-3.scope\n",
+        cgroup_root=tmp_path,
+    )
+    for ctx in (
+        UnitContext(None, "/user.slice/run-r123.service"),
+        UnitContext("inv", "/user.slice/session-3.scope"),
+        UnitContext("inv", "/user.slice/breezy-capture-audit.service"),
+    ):
+        rc = main(
+            ["--measure-peak", "--output-root", str(tmp_path / "o")],
+            unit_context=ctx,
+            measure_seams=seams,
+        )
+        assert rc == 2
+    assert capsys.readouterr().out.count("LABEL_OUTCOMES REFUSED reason=not_transient_unit") == 3
+    assert not (tmp_path / "o").exists()
+
+
+@pytest.mark.parametrize(
+    ("leaf", "ok"),
+    [
+        ("run-r0123abcd.service", True),
+        ("aut2-label-peak-1790000000.service", True),
+        ("breezy-label-outcomes.service", True),
+        ("run-.service", False),
+        ("session-3.scope", False),
+        ("evil.service", False),
+    ],
+)
+def test_the_transient_unit_name_pattern(leaf: str, ok: bool) -> None:
+    ctx = UnitContext("inv", f"/user.slice/{leaf}")
+
+    assert ctx.is_measure_unit() is ok

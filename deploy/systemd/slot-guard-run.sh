@@ -13,7 +13,14 @@ set -u
 PYTHON="${BREEZY_PYTHON:-/home/jon/breezy/.venv/bin/python}"
 MODULE="${SLOT_GUARD_MODULE:-breezy.analysis.labeling.slot_guard}"
 
-"$PYTHON" -m "$MODULE" "$@"
+# -I (isolated mode) ignores PYTHON* variables and the working directory, so the unit cannot be
+# steered to another module path. Only the test seam (SLOT_GUARD_MODULE, never set by the unit)
+# drops it, because it needs PYTHONPATH to find a planted stand-in module.
+if [ -n "${SLOT_GUARD_MODULE:-}" ]; then
+  "$PYTHON" -m "$MODULE" "$@"
+else
+  "$PYTHON" -I -m "$MODULE" "$@"
+fi
 status=$?
 case "$status" in
   0) exit 0 ;;
