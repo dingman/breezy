@@ -49,7 +49,9 @@ __all__ = [
     "attribute_post_epoch",
     "backfill_family",
     "fill_key_sha",
+    "fq_rung_id",
     "fq_trial_id",
+    "label_family_of",
     "label_family_set",
     "latch_key_exists",
     "unresolved_row_of",
@@ -153,6 +155,17 @@ def attribute_post_epoch(
     )
 
 
+def label_family_of(attribution: Attribution | PreEpochAttribution) -> str:
+    """The family the label FILE is stored under: the C1 family, or a pre-epoch storage key.
+
+    The only reader of ``PreEpochAttribution.storage_key`` outside tests; the key places a file and
+    never attributes a statistic.
+    """
+    if isinstance(attribution, Attribution):
+        return attribution.family_id
+    return attribution.storage_key
+
+
 def fq_trial_id(station: str, climate_day: str, rung_id: str, side: str) -> str:
     """The stored latch key of an FQ trial: ``<prefix><STATION>/<day>/<rung_id>:<side>.<VENUE>``.
 
@@ -177,7 +190,7 @@ def latch_key_exists(db_path: Path, trial_id: str) -> bool:
         conn.close()
 
 
-def _fq_rung_id(lower: int | None, upper: int | None) -> str | None:
+def fq_rung_id(lower: int | None, upper: int | None) -> str | None:
     if lower is not None and upper is not None:
         return f"{lower}_{upper}"
     if lower is None and upper is not None:
@@ -195,7 +208,7 @@ def _bridge_family(
     facts = bucket_facts_from_instrument_id(fill.instrument_id)
     if facts is None:
         return None
-    rung_id = _fq_rung_id(facts.lower_f, facts.upper_f)
+    rung_id = fq_rung_id(facts.lower_f, facts.upper_f)
     if rung_id is None:
         return None
     leg = "no" if symbol_of_instrument_id(fill.instrument_id).endswith("^no") else "yes"
