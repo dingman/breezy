@@ -1,0 +1,276 @@
+"""Parse the GFS LAMP station text bulletin (`lavtxt`) and derive a daily max (F13-C1).
+
+PURE module: no network, no clock access, no `nautilus_trader` import, no global
+state. It holds the streaming line readers (plain bytes and the concatenated
+monthly MDL `.gz` archive, A0-R4) and the block parser.
+
+Bulletin shape (A0-R3)::
+
+     KNYC   GFS LAMP GUIDANCE   10/06/2026  0130 UTC
+     UTC  02 03 04 ...
+     TMP  59 57 57 ...
+
+There is NO explicit max row: the climate-day max is derived from hourly `TMP`
+over the climate day's local-STANDARD-time window (`lamp_daily_max_f`, using
+`breezy.domain.climate_day`). A window that is not fully covered is MISSING
+(`None`), never imputed (A0-R4: missing days are real).
+
+H3 posture: strict UTF-8, bounded lines/fields/bytes, physical-range checks. A bad
+row in a closed-set station block REFUSES the whole run (`LampParseError`); it is
+never skipped. `LampParseError` is a local refusal class: it is not a
+`TransportError`, `CliParseError` or `CliSanityError` (R18).
+
+Blocks of stations outside :data:`LAMP_STATIONS` (a live bulletin carries
+thousands) are not parsed or validated; they only count against the line bound.
+
+The fixture under `tests/fixtures/us_sources/` is SYNTHETIC; a real first-capture
+sample is still owed (columns are whitespace-split integers here).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import re
+import zlib
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from itertools import pairwise
+from typing import Final
+
+from breezy.domain.climate_day import climate_day_for_instant
+
+LAMP_STATIONS: Final[frozenset[str]] = frozenset({"KLAX", "KMDW", "KMIA", "KSFO", "KNYC"})
+
+MAX_LINE_BYTES: Final = 4096
+MAX_FIELDS_PER_ROW: Final = 64
+MAX_LINES: Final = 8_000_000
+MAX_COMPRESSED_BYTES: Final = 64 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES: Final = 512 * 1024 * 1024
+
+#: Physical range for a surface temperature, degrees Fahrenheit.
+TMP_MIN_F: Final = -80
+TMP_MAX_F: Final = 140
+
+_HOURS_PER_LST_DAY: Final = 24
+_INFLATE_STEP: Final = 64 * 1024
+_HEADER_MARK: Final = "GFS LAMP GUIDANCE"
+_HEADER_RE: Final = re.compile(
+    r"^\s*([A-Z0-9]{3,4})\s+GFS LAMP GUIDANCE\s+(\d{2})/(\d{2})/(\d{4})\s+(\d{4}) UTC\s*$"
+)
+_INT_RE: Final = re.compile(r"^-?\d{1,4}$")
+
+
+class LampParseError(ValueError):
+    """The LAMP input is not a bulletin this parser may trust; the run is refused."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"LAMP parse refused: {reason}" + (f" ({detail})" if detail else ""))
+
+
+@dataclass(frozen=True, slots=True)
+class LampBlock:
+    """One closed-set station's hourly `TMP` series from one bulletin run."""
+
+    station: str
+    issued_at: dt.datetime
+    valid_times: tuple[dt.datetime, ...]
+    tmp_f: tuple[int, ...]
+
+
+class _LineSplitter:
+    """Incremental bytes -> strict-UTF-8 lines with a per-line byte bound."""
+
+    def __init__(self, max_line_bytes: int) -> None:
+        self._max = max_line_bytes
+        self._buf = bytearray()
+
+    def feed(self, data: bytes) -> Iterator[str]:
+        self._buf += data
+        start = 0
+        while (nl := self._buf.find(b"\n", start)) != -1:
+            yield self._decode(bytes(self._buf[start:nl]))
+            start = nl + 1
+        del self._buf[:start]
+        if len(self._buf) > self._max:
+            raise LampParseError("line_too_long", f"over {self._max} bytes")
+
+    def finish(self) -> Iterator[str]:
+        if self._buf:
+            tail = bytes(self._buf)
+            self._buf.clear()
+            yield self._decode(tail)
+
+    def _decode(self, raw: bytes) -> str:
+        if len(raw) > self._max:
+            raise LampParseError("line_too_long", f"over {self._max} bytes")
+        try:
+            return raw.decode("utf-8").rstrip("\r")
+        except UnicodeDecodeError as exc:
+            raise LampParseError("non_utf8", str(exc)) from exc
+
+
+def iter_plain_lines(
+    chunks: Iterable[bytes], *, max_line_bytes: int = MAX_LINE_BYTES
+) -> Iterator[str]:
+    """Stream strict-UTF-8 lines from plain byte chunks."""
+    splitter = _LineSplitter(max_line_bytes)
+    for chunk in chunks:
+        yield from splitter.feed(chunk)
+    yield from splitter.finish()
+
+
+def iter_gzip_lines(
+    chunks: Iterable[bytes],
+    *,
+    max_compressed_bytes: int = MAX_COMPRESSED_BYTES,
+    max_decompressed_bytes: int = MAX_DECOMPRESSED_BYTES,
+    max_line_bytes: int = MAX_LINE_BYTES,
+) -> Iterator[str]:
+    """Stream lines from a (possibly multi-member) gzip byte stream (A0-R4).
+
+    Inflates in bounded steps (`max_length`), so a gzip bomb trips
+    `max_decompressed_bytes` after at most one step of excess output, never after
+    buffering it. Compressed input is counted before it is inflated. Truncated
+    streams and bytes trailing a member that are not another gzip member refuse.
+    """
+    splitter = _LineSplitter(max_line_bytes)
+    inflater = zlib.decompressobj(wbits=31)
+    total_in = total_out = members = 0
+    member_open = False
+    for chunk in chunks:
+        total_in += len(chunk)
+        if total_in > max_compressed_bytes:
+            raise LampParseError("compressed_cap", f"over {max_compressed_bytes} bytes")
+        pending = chunk
+        drain = False
+        while pending or drain:
+            member_open = True
+            try:
+                out = inflater.decompress(pending, _INFLATE_STEP)
+            except zlib.error as exc:
+                raise LampParseError("bad_gzip", str(exc)) from exc
+            total_out += len(out)
+            if total_out > max_decompressed_bytes:
+                raise LampParseError("decompressed_cap", f"over {max_decompressed_bytes} bytes")
+            yield from splitter.feed(out)
+            if inflater.eof:
+                members += 1
+                member_open = False
+                pending = inflater.unused_data
+                drain = False
+                inflater = zlib.decompressobj(wbits=31)
+            else:
+                pending = inflater.unconsumed_tail
+                # A full step may leave output inside zlib with no input left: keep
+                # draining until a step comes up short.
+                drain = not pending and len(out) == _INFLATE_STEP
+    if member_open:
+        raise LampParseError("truncated_gzip")
+    if members == 0:
+        raise LampParseError("empty_gzip")
+    yield from splitter.finish()
+
+
+def _int_fields(line: str, label: str, max_fields: int) -> list[int]:
+    tokens = line.split()[1:]
+    if not tokens:
+        raise LampParseError("empty_row", label)
+    if len(tokens) > max_fields:
+        raise LampParseError("too_many_fields", f"{label}: {len(tokens)} > {max_fields}")
+    values: list[int] = []
+    for token in tokens:
+        if not _INT_RE.match(token):
+            raise LampParseError("bad_token", f"{label}: {token!r}")
+        values.append(int(token))
+    return values
+
+
+def _issued_at(match: re.Match[str]) -> dt.datetime:
+    month, day, year, hhmm = (int(g) for g in match.groups()[1:])
+    try:
+        return dt.datetime(year, month, day, hhmm // 100, hhmm % 100, tzinfo=dt.UTC)
+    except ValueError as exc:
+        raise LampParseError("bad_header_time", match.group(0).strip()) from exc
+
+
+def _build_block(
+    station: str,
+    issued: dt.datetime,
+    utc_row: list[int] | None,
+    tmp_row: list[int] | None,
+) -> LampBlock:
+    if utc_row is None or tmp_row is None:
+        raise LampParseError("missing_row", f"{station}: UTC and TMP rows are both required")
+    if len(utc_row) != len(tmp_row):
+        raise LampParseError("row_length_mismatch", f"{station}: {len(utc_row)} vs {len(tmp_row)}")
+    first = issued.replace(minute=0) + dt.timedelta(hours=1)
+    if any(not 0 <= h <= 23 for h in utc_row) or utc_row[0] != first.hour:
+        raise LampParseError("utc_row_misaligned", f"{station}: starts {utc_row[0]:02d}")
+    if any((b - a) % 24 != 1 for a, b in pairwise(utc_row)):
+        raise LampParseError("utc_row_not_hourly", station)
+    for value in tmp_row:
+        if not TMP_MIN_F <= value <= TMP_MAX_F:
+            raise LampParseError("tmp_out_of_range", f"{station}: {value}")
+    times = tuple(first + dt.timedelta(hours=i) for i in range(len(utc_row)))
+    return LampBlock(station=station, issued_at=issued, valid_times=times, tmp_f=tuple(tmp_row))
+
+
+def iter_lamp_blocks(
+    lines: Iterable[str],
+    *,
+    max_lines: int = MAX_LINES,
+    max_fields: int = MAX_FIELDS_PER_ROW,
+) -> Iterator[LampBlock]:
+    """Yield one `LampBlock` per closed-set station block; refuse the run on a bad row."""
+    station: str | None = None
+    issued: dt.datetime | None = None
+    rows: dict[str, list[int]] = {}
+
+    def flush() -> LampBlock | None:
+        if station is None or issued is None:
+            return None
+        return _build_block(station, issued, rows.get("UTC"), rows.get("TMP"))
+
+    for count, line in enumerate(lines, start=1):
+        if count > max_lines:
+            raise LampParseError("too_many_lines", f"over {max_lines}")
+        header = _HEADER_RE.match(line)
+        if header is None and _HEADER_MARK in line:
+            raise LampParseError("bad_header", line.strip()[:80])
+        if header is not None or not line.strip():
+            if (block := flush()) is not None:
+                yield block
+            station, issued, rows = None, None, {}
+            if header is not None and header.group(1) in LAMP_STATIONS:
+                station, issued = header.group(1), _issued_at(header)
+            continue
+        if station is None:
+            continue
+        label = line.split(None, 1)[0]
+        if label in ("UTC", "TMP"):
+            if label in rows:
+                raise LampParseError("duplicate_row", f"{station}: {label}")
+            rows[label] = _int_fields(line, label, max_fields)
+    if (block := flush()) is not None:
+        yield block
+
+
+def lamp_daily_max_f(
+    block: LampBlock, climate_day: dt.date, std_utc_offset_hours: float
+) -> int | None:
+    """Max hourly `TMP` over `climate_day`'s local-standard-time window, or None (MISSING).
+
+    The window is the 24 hourly instants whose local-standard date is `climate_day`.
+    Any absent hour makes the day MISSING; nothing is imputed.
+    """
+    by_time = dict(zip(block.valid_times, block.tmp_f, strict=True))
+    window = [
+        v
+        for t, v in by_time.items()
+        if climate_day_for_instant(t, std_utc_offset_hours) == climate_day
+    ]
+    if len(window) != _HOURS_PER_LST_DAY:
+        return None
+    return max(window)
