@@ -681,3 +681,7 @@ Round 4 results: stats READY (with nits), security NOT-READY (2), architecture N
   - The probe asserts the one-entry rule by listing `~/.config/breezy` under the profile.
 
 **STATUS: READY (2026-10-06).** Round 5: security READY, architecture READY once the R34 addendum is applied, statistics READY in round 4. The binding plan is r3 + r3.1 + r3.2. The F13-C1 queue row is open.
+
+## Post-READY build finding (coordinator, 2026-10-06)
+
+- **F13-OPEN-7 (LAMP daily-max window).** Real HH30 `lavtxt` bulletins carry 25 hourly columns, and `lavtxt_ext` carries hours 26–38. So no single run covers a full 24-hour LST climate day, and the strict "all 24 hours" daily max (S3 `lamp_parse`) is MISSING for real runs. This affects the Phase A and B feature definition only; C1 still archives the raw bulletins, unchanged. Before Phase A1 is scored, the prereg must freeze the LAMP feature. The proposal is the max over the forecast hours remaining in the climate day after the anchor, using `lavtxt` + `lavtxt_ext`, plus an explicit hours-covered field. The observed max-so-far comes from the existing obs path, never from LAMP. The strict 24-hour max stays as is and is labelled diagnostic. This needs a review before Phase A; it does not block C1.

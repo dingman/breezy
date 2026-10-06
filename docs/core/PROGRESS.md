@@ -61,13 +61,13 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 FQ v1 halt FAILED 10-05 (cwd bug, 5 more fills); backstop orders-off drop-in live 01:01Z 10-06; CLI halt re-timed 16:40Z.
 | Row | Status |
 |---|---|
-| F2 truth fetch | full gate running; units not installed |
-| F4 labels | IN PROGRESS WP0-WP3 |
-| F5 prereg MC | BUILT 960c0956; review fixes in progress |
+| F2 truth fetch | MERGED; units install next |
+| F4 labels | WP0-WP3 reviewed (3x APPROVE), final gate; then WP5/6/8 |
+| F5 prereg MC | DONE: STARVED; design frozen 072ab026 (RULING_FQ-PREREG-v2-AMENDMENT) |
 | F6 bridge | waits F5 numerics (STALE_PARITY_H, n_par) |
-| F7a stats move | BUILT, both reviews APPROVE; nit fixes, then full gate |
+| F7a stats move | DONE (merged) |
 | F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
-| F13 US sources | plan READY (r3 + r3.1/r3.2); NEXT F13-C1 collector + A0/B0 |
+| F13 US sources | READY; A0 done; C1 S1-S3 merged, S4 final gate; OPEN-7 before Phase A |
 Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
