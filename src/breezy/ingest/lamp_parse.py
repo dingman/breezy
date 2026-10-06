@@ -64,6 +64,7 @@ _HEADER_RE: Final = re.compile(
 )
 _INT_RE: Final = re.compile(r"^-?\d{1,3}$")
 _COLUMN_WIDTH: Final = 3
+_RUN_MINUTE: Final = 30  # only the HH30 runs are in scope (A0-R3)
 
 
 class LampParseError(ValueError):
@@ -134,10 +135,11 @@ def iter_gzip_lines(
     max_compressed_bytes: int = MAX_COMPRESSED_BYTES,
     max_decompressed_bytes: int = MAX_DECOMPRESSED_BYTES,
     max_line_bytes: int = MAX_LINE_BYTES,
+    inflate_step: int = _INFLATE_STEP,
 ) -> Iterator[str]:
     """Stream lines from a (possibly multi-member) gzip byte stream (A0-R4).
 
-    Inflates in bounded steps (`max_length`), so a gzip bomb trips
+    Inflates in bounded steps (`inflate_step`, via `max_length`), so a gzip bomb trips
     `max_decompressed_bytes` after at most one step of excess output, never after
     buffering it. Compressed input is counted before it is inflated. Truncated
     streams and bytes trailing a member that are not another gzip member refuse.
@@ -155,7 +157,7 @@ def iter_gzip_lines(
         while pending or drain:
             member_open = True
             try:
-                out = inflater.decompress(pending, _INFLATE_STEP)
+                out = inflater.decompress(pending, inflate_step)
             except zlib.error as exc:
                 raise LampParseError("bad_gzip", str(exc)) from exc
             total_out += len(out)
@@ -172,7 +174,7 @@ def iter_gzip_lines(
                 pending = inflater.unconsumed_tail
                 # A full step may leave output inside zlib with no input left: keep
                 # draining until a step comes up short.
-                drain = not pending and len(out) == _INFLATE_STEP
+                drain = not pending and len(out) == inflate_step
     if member_open:
         raise LampParseError("truncated_gzip")
     if members == 0:
@@ -205,6 +207,8 @@ def _fixed_fields(line: str, label: str, max_fields: int) -> list[int | None]:
 
 def _issued_at(match: re.Match[str]) -> dt.datetime:
     month, day, year, hhmm = (int(g) for g in match.groups()[1:])
+    if hhmm % 100 != _RUN_MINUTE:
+        raise LampParseError("run_minute_not_30", match.group(0).strip())
     try:
         return dt.datetime(year, month, day, hhmm // 100, hhmm % 100, tzinfo=dt.UTC)
     except ValueError as exc:
@@ -240,7 +244,14 @@ def iter_lamp_blocks(
     max_lines: int = MAX_LINES,
     max_fields: int = MAX_FIELDS_PER_ROW,
 ) -> Iterator[LampBlock]:
-    """Yield one `LampBlock` per closed-set station block; refuse the run on a bad row."""
+    """Yield one `LampBlock` per closed-set station block; refuse the run on a bad row.
+
+    LAZY: blocks that precede a bad row have already been yielded when the refusal is
+    raised. A caller that persists must drain the whole stream first (or use
+    :func:`parse_lamp_blocks`, which is all-or-nothing). A repeated (station, issued_at)
+    block in one stream is refused.
+    """
+    seen: set[tuple[str, dt.datetime]] = set()
     station: str | None = None
     issued: dt.datetime | None = None
     rows: dict[str, list[int | None]] = {}
@@ -248,6 +259,9 @@ def iter_lamp_blocks(
     def flush() -> LampBlock | None:
         if station is None or issued is None:
             return None
+        if (station, issued) in seen:
+            raise LampParseError("duplicate_block", f"{station} {issued.isoformat()}")
+        seen.add((station, issued))
         return _build_block(station, issued, rows.get("UTC"), rows.get("TMP"))
 
     for count, line in enumerate(lines, start=1):
@@ -272,6 +286,16 @@ def iter_lamp_blocks(
             rows[label] = _fixed_fields(line, label, max_fields)
     if (block := flush()) is not None:
         yield block
+
+
+def parse_lamp_blocks(
+    lines: Iterable[str],
+    *,
+    max_lines: int = MAX_LINES,
+    max_fields: int = MAX_FIELDS_PER_ROW,
+) -> tuple[LampBlock, ...]:
+    """All-or-nothing: every closed-set block of the run, or a `LampParseError` and nothing."""
+    return tuple(iter_lamp_blocks(lines, max_lines=max_lines, max_fields=max_fields))
 
 
 def lamp_daily_max_f(

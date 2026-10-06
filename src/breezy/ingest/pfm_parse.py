@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 
+MAX_RAW_BYTES: Final = 1024 * 1024
 MAX_LINES: Final = 5000
 MAX_LINE_BYTES: Final = 256
 MAX_FIELDS_PER_ROW: Final = 64
@@ -101,15 +102,22 @@ class PfmPoint:
     max_by_day: tuple[tuple[dt.date, int], ...]
 
 
+_STATION_BY_POINT: Final = MappingProxyType(
+    {(point.wfo, point.point_name): station for station, point in PFM_POINT_MAP.items()}
+)
+
+
 def resolve_pfm_station(wfo: str, point_name: str) -> str:
     """Return the station for `(wfo, point_name)`, or refuse an unmapped point."""
-    for station, point in PFM_POINT_MAP.items():
-        if point.wfo == wfo and point.point_name == point_name:
-            return station
-    raise PfmParseError("unmapped_point", f"{wfo} / {point_name!r}")
+    try:
+        return _STATION_BY_POINT[(wfo, point_name)]
+    except KeyError:
+        raise PfmParseError("unmapped_point", f"{wfo} / {point_name!r}") from None
 
 
 def _decode_lines(raw: bytes, max_lines: int) -> list[str]:
+    if len(raw) > MAX_RAW_BYTES:
+        raise PfmParseError("raw_too_large", f"{len(raw)} > {MAX_RAW_BYTES} bytes")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -156,6 +164,8 @@ def _issuance(
 
 _LABEL_WIDTH: Final = 14
 _MAX_TABLES: Final = 4
+_DATE_BEFORE: Final = dt.timedelta(days=2)
+_DATE_AFTER: Final = dt.timedelta(days=10)
 _MAX_UTC_HOUR: Final = 0
 _MIN_UTC_HOUR: Final = 12
 _DATE_LABEL_RE: Final = re.compile(r"(?:[A-Z][a-z]{2} )?(\d{2})/(\d{2})(?:/(\d{2}))?")
@@ -178,31 +188,39 @@ def _hour_tokens(line: str) -> list[tuple[int, int]]:
         if not re.fullmatch(r"\d{2}", m.group()) or not 0 <= int(m.group()) <= 23:
             raise PfmParseError("bad_hour_token", m.group())
         out.append((_LABEL_WIDTH + m.end(), int(m.group())))
+        if len(out) > MAX_FIELDS_PER_ROW:
+            raise PfmParseError("too_many_fields", f"hour row over {MAX_FIELDS_PER_ROW}")
     return out
 
 
-def _first_date(label: re.Match[str], issued_at: dt.datetime) -> dt.date:
-    """The first column's date; a label without a year takes it from the issuance."""
+def _first_date(label: re.Match[str], anchor: dt.date) -> dt.date:
+    """The first column's date. A yearless label takes the year (of anchor.year -1/0/+1)
+    that lands nearest `anchor`: the previous table's last date, or the issuance date."""
     month, day, short_year = int(label.group(1)), int(label.group(2)), label.group(3)
-    years = [2000 + int(short_year)] if short_year else [issued_at.year, issued_at.year + 1]
+    years = (
+        [2000 + int(short_year)] if short_year else [anchor.year - 1, anchor.year, anchor.year + 1]
+    )
+    dates: list[dt.date] = []
     for year in years:
         try:
-            date = dt.date(year, month, day)
+            dates.append(dt.date(year, month, day))
         except ValueError:
             continue
-        if date >= issued_at.date() - dt.timedelta(days=2):
-            return date
-    raise PfmParseError("bad_date_label", label.group())
+    if not dates:
+        raise PfmParseError("bad_date_label", label.group())
+    return min(dates, key=lambda d: abs((d - anchor).days))
 
 
-def _columns(date_row: str, local_row: str, utc_row: str, issued_at: dt.datetime) -> list[_Column]:
+def _columns(
+    date_row: str, local_row: str, utc_row: str, anchor: dt.date, issued_at: dt.datetime
+) -> list[_Column]:
     local, utc = _hour_tokens(local_row), _hour_tokens(utc_row)
     if not local or [e for e, _ in local] != [e for e, _ in utc]:
         raise PfmParseError("hour_rows_misaligned")
     labels = list(_DATE_LABEL_RE.finditer(date_row, len("Date")))
     if not labels:
         raise PfmParseError("no_date_label")
-    date = _first_date(labels[0], issued_at)
+    date = _first_date(labels[0], anchor)
     columns: list[_Column] = []
     previous = -1
     for (end, hour), (_, utc_hour) in zip(local, utc, strict=True):
@@ -210,6 +228,12 @@ def _columns(date_row: str, local_row: str, utc_row: str, issued_at: dt.datetime
             date += dt.timedelta(days=1)
         previous = hour
         columns.append(_Column(end, hour, utc_hour, date))
+    lo = issued_at.date() - _DATE_BEFORE
+    hi = issued_at.date() + _DATE_AFTER
+    if any(not lo <= c.local_date <= hi for c in columns):
+        raise PfmParseError(
+            "date_out_of_range", f"{columns[0].local_date}..{columns[-1].local_date}"
+        )
     for label in labels:
         column = next((c for c in columns if c.end > label.start()), None)
         month, day = int(label.group(1)), int(label.group(2))
@@ -218,17 +242,22 @@ def _columns(date_row: str, local_row: str, utc_row: str, issued_at: dt.datetime
     return columns
 
 
-def _table_max(table: list[str], issued_at: dt.datetime) -> dict[dt.date, int]:
+def _table_max(
+    table: list[str], anchor: dt.date, issued_at: dt.datetime
+) -> tuple[dict[dt.date, int], dt.date]:
     if len(table) < 3 or not _LOCAL_ROW_RE.match(table[1]) or not _UTC_ROW_RE.match(table[2]):
         raise PfmParseError("table_header", table[0][:40])
     extrema = [ln for ln in table[3:] if _EXTREMA_RE.match(ln)]
     if len(extrema) != 1:
         raise PfmParseError("extrema_row", f"{len(extrema)} Min/Max rows in table")
-    columns = {c.end: c for c in _columns(table[0], table[1], table[2], issued_at)}
+    ordered = _columns(table[0], table[1], table[2], anchor, issued_at)
+    columns = {c.end: c for c in ordered}
     if extrema[0][:_LABEL_WIDTH].strip() not in ("Min/Max", "Max/Min"):
         raise PfmParseError("extrema_label")
     found: dict[dt.date, int] = {}
-    for m in re.finditer(r"\S+", extrema[0][_LABEL_WIDTH:]):
+    for count, m in enumerate(re.finditer(r"\S+", extrema[0][_LABEL_WIDTH:]), start=1):
+        if count > MAX_FIELDS_PER_ROW:
+            raise PfmParseError("too_many_fields", f"extrema row over {MAX_FIELDS_PER_ROW}")
         end = _LABEL_WIDTH + m.end()
         if not _INT_RE.match(m.group()) or end not in columns:
             raise PfmParseError("bad_extrema_cell", m.group())
@@ -240,7 +269,7 @@ def _table_max(table: list[str], issued_at: dt.datetime) -> dict[dt.date, int]:
             found[column.local_date] = value
         elif column.utc_hour != _MIN_UTC_HOUR:
             raise PfmParseError("extrema_under_unexpected_hour", str(column.utc_hour))
-    return found
+    return found, ordered[-1].local_date
 
 
 def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date, int], ...]:
@@ -248,8 +277,10 @@ def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date,
     if not starts or len(starts) > _MAX_TABLES:
         raise PfmParseError("tables", f"{len(starts)} tables in point block")
     merged: dict[dt.date, int] = {}
+    anchor = issued_at.date()
     for begin, end in zip(starts, [*starts[1:], len(body)], strict=True):
-        for date, value in _table_max(body[begin:end], issued_at).items():
+        found, anchor = _table_max(body[begin:end], anchor, issued_at)
+        for date, value in found.items():
             if date in merged:
                 raise PfmParseError("duplicate_day", date.isoformat())
             merged[date] = value
@@ -292,7 +323,7 @@ def parse_pfm_product(
     wfo, issued_at = _issuance(lines, reference_time, max_age)
     if wfo != target.wfo:
         raise PfmParseError("wfo_mismatch", f"{wfo} != {target.wfo} for {station}")
-    matches = [s for s in _sections(lines) if resolve_or_none(wfo, s[1]) == station]
+    matches = [s for s in _sections(lines) if _STATION_BY_POINT.get((wfo, s[1])) == station]
     if len(matches) != 1:
         raise PfmParseError("point_not_unique", f"{target.point_name!r}: {len(matches)} sections")
     zone, name, body = matches[0]
@@ -304,11 +335,3 @@ def parse_pfm_product(
         issued_at=issued_at,
         max_by_day=_max_by_day(body, issued_at),
     )
-
-
-def resolve_or_none(wfo: str, point_name: str) -> str | None:
-    """`resolve_pfm_station`, but None instead of a refusal (for scanning sections)."""
-    try:
-        return resolve_pfm_station(wfo, point_name)
-    except PfmParseError:
-        return None

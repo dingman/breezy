@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import datetime as dt
 import gzip
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from breezy.ingest import lamp_parse
+from breezy.ingest import lamp_parse, pfm_parse
 from breezy.ingest.http import TransportError
 from breezy.ingest.lamp_parse import (
     LAMP_STATIONS,
@@ -74,21 +75,29 @@ def test_lamp_blocks_cover_closed_station_set_and_skip_others() -> None:
     assert len(knyc.tmp_f) == len(knyc.valid_times) == 30
 
 
+def _tmp_block(values: list[int]) -> str:
+    """A KNYC block of 30 hourly columns starting 02Z Oct 6 with the given TMP values."""
+    hours = [(2 + i) % 24 for i in range(len(values))]
+    utc = " UTC " + "".join(f"{h:3d}".replace(" ", " ") for h in hours)
+    tmp = " TMP " + "".join(f"{v:3d}" for v in values)
+    return f" KNYC   GFS LAMP GUIDANCE   10/06/2026  0130 UTC\n{utc}\n{tmp}\n"
+
+
 def test_lamp_daily_max_uses_climate_day_lst_window() -> None:
-    knyc = _lamp_blocks()["KNYC"]
-    # KNYC LST (-5h) climate day 2026-10-06 = 05Z Oct 6 .. 04Z Oct 7 inclusive.
-    assert lamp_daily_max_f(knyc, dt.date(2026, 10, 6), -5.0) == 70
-    # Hours of the next LST day (05Z..07Z) must not leak into 10-06: shifting the
-    # window to the LAX offset (-8h: 08Z Oct 6 .. 07Z Oct 7) changes membership.
-    values = dict(zip(knyc.valid_times, knyc.tmp_f, strict=True))
-    window = [
-        v
-        for t, v in values.items()
-        if v is not None
-        and dt.datetime(2026, 10, 6, 5, tzinfo=UTC) <= t <= dt.datetime(2026, 10, 7, 4, tzinfo=UTC)
-    ]
-    assert len(window) == 24
-    assert lamp_daily_max_f(knyc, dt.date(2026, 10, 6), -5.0) == max(window)
+    # Index i is valid at 02Z Oct 6 + i h. Decoys sit where only a WRONG offset looks:
+    #   02Z Oct 6 (i=0)  99: before both the -5h and -8h windows
+    #   06Z Oct 6 (i=4)  77: inside the -5h window (05Z..04Z), outside the -8h one (08Z..07Z)
+    #   15Z Oct 6 (i=13) 70: inside both
+    #   07Z Oct 7 (i=29) 95: inside the -8h window only (-5h ends 04Z Oct 7)
+    values = [50] * 30
+    values[0], values[4], values[13], values[29] = 99, 77, 70, 95
+    block = _lamp_blocks(_tmp_block(values))["KNYC"]
+    assert lamp_daily_max_f(block, dt.date(2026, 10, 6), -5.0) == 77
+    assert lamp_daily_max_f(block, dt.date(2026, 10, 6), -8.0) == 95
+    # The real-offset result must not equal what a -8h (wrong for KNYC) window gives.
+    assert lamp_daily_max_f(block, dt.date(2026, 10, 6), -5.0) != lamp_daily_max_f(
+        block, dt.date(2026, 10, 6), -8.0
+    )
 
 
 def test_lamp_peak_window_not_covered_is_missing_not_imputed() -> None:
@@ -216,7 +225,7 @@ def test_lamp_glued_negative_values_parse_by_fixed_width() -> None:
 
 
 def test_parser_refuses_row_out_of_physical_range() -> None:
-    for bad in (" TMP  50 51 400", " TMP  50 51 -120"):
+    for bad in (" TMP  50 51400", " TMP  50 51-99"):
         with pytest.raises(LampParseError):
             _lamp_blocks(_knyc_block(bad))
 
@@ -237,10 +246,65 @@ def test_lamp_refuses_bad_token_missing_rows_and_count_mismatch() -> None:
 
 def test_bad_row_refuses_whole_run_never_skips() -> None:
     good = _fixture_text("lamp_lavtxt_synthetic_edge.txt")
-    poisoned = good + _knyc_block(" TMP  50 51 999")
+    # A real bad value (out of the physical range), after five valid closed-set blocks.
+    poisoned = good + _knyc_block(" TMP  50 51400", " UTC  03 04 05").replace("0130", "0230")
     with pytest.raises(LampParseError) as err:
-        list(iter_lamp_blocks(_lamp_lines(poisoned)))
-    assert err.value.reason  # carries a machine-readable reason for the alert path
+        lamp_parse.parse_lamp_blocks(_lamp_lines(poisoned))
+    assert err.value.reason == "tmp_out_of_range"
+    # All-or-nothing: the collecting API returns nothing, so nothing valid is committed.
+    result: list[lamp_parse.LampBlock] = []
+    with pytest.raises(LampParseError):
+        result.extend(lamp_parse.parse_lamp_blocks(_lamp_lines(poisoned)))
+    assert result == []
+
+
+def test_lazy_stream_yields_valid_blocks_before_the_bad_one_so_callers_must_drain() -> None:
+    """Pins the documented contract: `iter_lamp_blocks` is lazy; persist only after a full drain."""
+    good = _fixture_text("lamp_lavtxt_synthetic_edge.txt")
+    poisoned = good + _knyc_block(" TMP  50 51400", " UTC  03 04 05").replace("0130", "0230")
+    seen: list[str] = []
+    with pytest.raises(LampParseError):
+        for block in iter_lamp_blocks(_lamp_lines(poisoned)):
+            seen.append(block.station)
+    assert seen == ["KNYC", "KMIA", "KMDW", "KLAX", "KSFO"]
+
+
+def test_lamp_refuses_header_minute_other_than_30() -> None:
+    for minute in ("0100", "0115", "0145"):
+        with pytest.raises(LampParseError) as err:
+            _lamp_blocks(_knyc_block(" TMP  50 51 52").replace("0130", minute))
+        assert err.value.reason == "run_minute_not_30"
+
+
+def test_lamp_refuses_duplicate_station_run_in_one_stream() -> None:
+    text = _knyc_block(" TMP  50 51 52") * 2
+    with pytest.raises(LampParseError) as err:
+        lamp_parse.parse_lamp_blocks(_lamp_lines(text))
+    assert err.value.reason == "duplicate_block"
+    # A different run of the same station is not a duplicate.
+    other = (
+        _knyc_block(" TMP  50 51 52")
+        .replace("0130", "0230")
+        .replace("UTC  02", "UTC  03")
+        .replace("03 04", "04 05")
+    )
+    assert (
+        len(lamp_parse.parse_lamp_blocks(_lamp_lines(_knyc_block(" TMP  50 51 52") + other))) == 2
+    )
+
+
+def test_lamp_blank_line_inside_a_block_ends_it_and_a_split_block_is_refused() -> None:
+    """Pinned: a blank (or whitespace-only) line terminates the block; rows after it are
+    not attached, so a TMP row cut off from its UTC row is a refusal, never a silent skip."""
+    split = (
+        " KNYC   GFS LAMP GUIDANCE   10/06/2026  0130 UTC\n UTC  02 03 04\n   \n TMP  50 51 52\n"
+    )
+    with pytest.raises(LampParseError) as err:
+        _lamp_blocks(split)
+    assert err.value.reason == "missing_row"
+    # Extra rows after a blank belong to nothing and are ignored once both rows were seen.
+    ok = _knyc_block(" TMP  50 51 52") + "   \n DPT  40 41 42\n"
+    assert _lamp_blocks(ok)["KNYC"].tmp_f == (50, 51, 52)
 
 
 def test_parser_refuses_non_utf8() -> None:
@@ -286,19 +350,43 @@ def test_gzip_line_reader_streams_concatenated_members() -> None:
     assert got == ["one", "two", "three", "four"]
 
 
-def test_gzip_bomb_trips_decompressed_cap_before_buffering() -> None:
+class _CountingInflater:
+    """Wraps a zlib decompressobj and records every byte it hands back."""
+
+    produced = 0
+
+    def __init__(self, real: object) -> None:
+        self._real = real
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        out: bytes = self._real.decompress(data, max_length)  # type: ignore[attr-defined]
+        type(self).produced += len(out)
+        return out
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def test_gzip_bomb_trips_decompressed_cap_before_buffering(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = zlib.decompressobj
+    monkeypatch.setattr(zlib, "decompressobj", lambda *a, **k: _CountingInflater(real(*a, **k)))
+    _CountingInflater.produced = 0
     bomb = gzip.compress(b"0" * (64 * 1024 * 1024), compresslevel=9)
     assert len(bomb) < 200_000
-    produced = 0
-    with pytest.raises(LampParseError):
-        for _ in iter_gzip_lines(
-            iter([bomb]),
-            max_compressed_bytes=len(bomb),
-            max_decompressed_bytes=1_000_000,
-            max_line_bytes=1_000_000_000,
-        ):
-            produced += 1
-    assert produced == 0
+    cap, step = 10_000, 1024
+    with pytest.raises(LampParseError) as err:
+        list(
+            iter_gzip_lines(
+                iter([bomb]),
+                max_compressed_bytes=len(bomb),
+                max_decompressed_bytes=cap,
+                max_line_bytes=1_000_000_000,
+                inflate_step=step,
+            )
+        )
+    assert err.value.reason == "decompressed_cap"
+    # Inflated output never exceeds the cap by more than one step: 64 MiB never materialises.
+    assert cap < _CountingInflater.produced <= cap + step
 
 
 def test_gzip_decompressed_cap_counts_across_many_lines() -> None:
@@ -370,6 +458,28 @@ def test_gzip_lamp_archive_end_to_end_matches_plain() -> None:
         )
     ]
     assert plain == zipped and plain
+
+
+def test_gzip_truncated_second_member_after_complete_first_is_refused() -> None:
+    first, second = gzip.compress(b"one\n" * 50), gzip.compress(b"two\n" * 5000)
+    raw = first + second[:-6]
+    with pytest.raises(LampParseError) as err:
+        list(
+            iter_gzip_lines(
+                iter([raw]), max_compressed_bytes=len(raw), max_decompressed_bytes=1_000_000
+            )
+        )
+    assert err.value.reason == "truncated_gzip"
+
+
+def test_gzip_single_trailing_magic_byte_after_a_member_is_refused() -> None:
+    raw = gzip.compress(b"one\n") + b"\x1f"
+    with pytest.raises(LampParseError):
+        list(
+            iter_gzip_lines(
+                iter([raw]), max_compressed_bytes=len(raw), max_decompressed_bytes=1_000_000
+            )
+        )
 
 
 # ---------------------------------------------------------------------- PFM
@@ -558,6 +668,86 @@ def test_pfm_refuses_date_label_that_disagrees_with_its_column() -> None:
     mutate = (b"Tue 10/06/26            Wed 10/07/26", b"Tue 10/07/26            Wed 10/07/26")
     with pytest.raises(PfmParseError):
         parse_pfm_product(_okx(mutate), station="KNYC", reference_time=PFM_REF)
+
+
+def _pfm_synthetic(
+    wmo: str,
+    first_label: str,
+    local_hours: list[int],
+    labels: dict[int, str],
+    maxes: dict[int, int],
+    offset: int = 5,
+) -> bytes:
+    """A minimal one-table PFM product in the real column layout (EST: UTC = local + 5)."""
+    n = len(local_hours)
+    width = 14 + 3 * n
+    date = list("Date".ljust(width))
+    date[14 : 14 + len(first_label)] = first_label
+    for col, text in labels.items():
+        date[14 + 3 * col : 14 + 3 * col + len(text)] = text
+    extrema = list("Min/Max".ljust(width))
+    for col, value in maxes.items():
+        extrema[14 + 3 * col : 16 + 3 * col] = f"{value:2d}"
+    rows = [
+        "".join(date).rstrip(),
+        "EST 3hrly".ljust(14) + " ".join(f"{h:02d}" for h in local_hours),
+        "UTC 3hrly".ljust(14) + " ".join(f"{(h + offset) % 24:02d}" for h in local_hours),
+        "",
+        "".join(extrema).rstrip(),
+    ]
+    body = "\n".join(rows)
+    return (
+        f"\x01\n854 \n{wmo}\nPFMOKX\n\nPoint Forecast Matrices\n\n"
+        f"NYZ072-060800-\nCentral Park-New York NY\n40.78N  73.97W Elev. 16 ft\n\n{body}\n$$\n"
+    ).encode()
+
+
+def test_pfm_yearless_label_year_is_nearest_the_issuance_across_new_year() -> None:
+    # Issued 2027-01-01 01:01Z (20:01 EST Dec 31). First label has no year: Dec 31 of 2026.
+    hours = [19, 22, 1, 4, 7, 10, 13, 16, 19, 22]  # UTC 00 columns at i=0 and i=8
+    raw = _pfm_synthetic("FOUS51 KOKX 010101", "12/31", hours, {2: "Fri 01/01/27"}, {0: 40, 8: 38})
+    point = parse_pfm_product(
+        raw, station="KNYC", reference_time=dt.datetime(2027, 1, 1, 1, 30, tzinfo=UTC)
+    )
+    assert dict(point.max_by_day) == {D(2026, 12, 31): 40, D(2027, 1, 1): 38}
+
+
+def test_pfm_yearless_label_on_dec_31_issuance_stays_in_the_issuance_year() -> None:
+    hours = [19, 22, 1, 4, 7, 10, 13, 16, 19, 22]
+    raw = _pfm_synthetic("FOUS51 KOKX 311901", "12/31", hours, {2: "Fri 01/01/27"}, {0: 41, 8: 37})
+    point = parse_pfm_product(
+        raw, station="KNYC", reference_time=dt.datetime(2026, 12, 31, 19, 30, tzinfo=UTC)
+    )
+    assert dict(point.max_by_day) == {D(2026, 12, 31): 41, D(2027, 1, 1): 37}
+
+
+def test_pfm_refuses_a_date_label_far_from_the_issuance() -> None:
+    hours = [19, 22, 1, 4, 7, 10, 13, 16, 19, 22]
+    for label in ("11/30/26", "01/20/27"):  # -31 days and +20 days from 2026-12-31
+        raw = _pfm_synthetic("FOUS51 KOKX 311901", label, hours, {}, {0: 41})
+        with pytest.raises(PfmParseError):
+            parse_pfm_product(
+                raw, station="KNYC", reference_time=dt.datetime(2026, 12, 31, 19, 30, tzinfo=UTC)
+            )
+
+
+def test_pfm_refuses_oversize_raw_before_decoding() -> None:
+    limit = pfm_parse.MAX_RAW_BYTES
+    raw = _pfm_real("KNYC") + b" " * (limit + 1 - len(_pfm_real("KNYC")))
+    assert len(raw) == limit + 1
+    with pytest.raises(PfmParseError) as err:
+        parse_pfm_product(raw, station="KNYC", reference_time=PFM_REF)
+    assert err.value.reason == "raw_too_large"
+
+
+def test_pfm_refuses_field_count_over_bound() -> None:
+    hours = [(i * 3) % 24 for i in range(70)]
+    raw = _pfm_synthetic("FOUS51 KOKX 311901", "12/31/26", hours, {}, {0: 41})
+    with pytest.raises(PfmParseError) as err:
+        parse_pfm_product(
+            raw, station="KNYC", reference_time=dt.datetime(2026, 12, 31, 19, 30, tzinfo=UTC)
+        )
+    assert err.value.reason in {"too_many_fields", "hour_rows_too_wide"}
 
 
 # -------------------------------------------------------- refusal taxonomy
