@@ -1,0 +1,37 @@
+{
+  "frozen_sha": null,
+  "alpha_total": 0.025,
+  "gamma_schedule": "elond_heavy_tailed_v1",
+  "T": 4,
+  "delta_h": 0.16,
+  "n_e_power_basis": "joint_min_ea_eb",
+  "n_e_power": {
+    "1": 889,
+    "2": 1208,
+    "3": 1373,
+    "4": 1483
+  },
+  "take_rate_lower": 0.25,
+  "uptime_floor": 0.9,
+  "earliest_look_n": 20,
+  "m_cap": 2,
+  "x_max": 4.0,
+  "lambda_max": 0.5,
+  "mu_max": 0.5,
+  "betting_rule_e_a": "agrapa_v1:prior_pseudo_days=1,prior_second_moment=0.25",
+  "betting_rule_e_b": "agrapa_v1:prior_pseudo_days=1,prior_second_moment=0.25",
+  "alpha_kill": 0.05,
+  "n_par": 15,
+  "delta_par": 0.01,
+  "alpha_par": 0.1,
+  "parity_bootstrap_seed": 20261006,
+  "parity_bootstrap_replicates": 10000,
+  "stale_parity_h": 36,
+  "ask_floor": 0.05,
+  "haircut": {
+    "ticks": 1,
+    "tick_size": 0.01
+  },
+  "theta": 0.0695,
+  "rounding": "ask_exec=round(price,4); BE=haircut_ask+theta*p*(1-p) in probability units, fee unrounded; theta and rounding pinned by climate day, fail closed on drift"
+}
