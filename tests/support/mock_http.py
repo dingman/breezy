@@ -37,14 +37,16 @@ def install_mock_http(monkeypatch: pytest.MonkeyPatch, handler: Handler) -> Mock
         state.requests.append(request)
         return handler(request)
 
-    def async_factory(**kwargs: Any) -> httpx.AsyncClient:
-        state.client_kwargs.append(dict(kwargs))
-        return _REAL_ASYNC_CLIENT(**kwargs, transport=httpx.MockTransport(recording))
+    class MockAsyncClient(_REAL_ASYNC_CLIENT):
+        def __init__(self, **kwargs: Any) -> None:
+            state.client_kwargs.append(dict(kwargs))
+            super().__init__(**kwargs, transport=httpx.MockTransport(recording))
 
-    def sync_factory(**kwargs: Any) -> httpx.Client:
-        state.client_kwargs.append(dict(kwargs))
-        return _REAL_SYNC_CLIENT(**kwargs, transport=httpx.MockTransport(recording))
+    class MockClient(_REAL_SYNC_CLIENT):
+        def __init__(self, **kwargs: Any) -> None:
+            state.client_kwargs.append(dict(kwargs))
+            super().__init__(**kwargs, transport=httpx.MockTransport(recording))
 
-    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
-    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+    monkeypatch.setattr(httpx, "Client", MockClient)
     return state

@@ -15,37 +15,25 @@ buffered under a small cap, sha256 over the raw bytes). The archives are
 large (a year is ~3.8 GB; a month is ~11 MB gzip, ~119 MB text), so they are
 STREAMED and exposed as SYNCHRONOUS context managers: the stdlib ``tarfile``
 stream reader is blocking, and the archive path is an offline backfill, never
-the live collector loop. Streaming handling (H2):
-
-* the tar is read in stream mode ``r|`` only; ``extract``/``extractall`` are
-  never called and no output path exists, so no member name can reach a file
-  system path -- a name is a label returned to the caller and nothing else;
-* only regular members are accepted; symlinks, hardlinks, directories and
-  devices raise, as do ``..``, absolute, NUL and backslash names;
-* member count, member size, per-member and total DECOMPRESSED bytes, and the
-  compressed download are all capped, and decompressed bytes are counted as
-  they stream (``zlib`` ``max_length``) so a gzip bomb trips the cap before
-  its output is produced.
+the live collector loop. The H2 stream handling (tar ``r|`` only, plain
+regular members, every cap, single-use streams, ``sha256`` only after a fully
+validated pass) lives in :mod:`breezy.ingest.lamp_archive_stream`.
 
 This module defines the only new ``TransportError`` subclasses of F13-C1
 (R18); both are registered in ``breezy.ingest.routing`` and the routing
-contract test.
+contract test. The stream module is handed ``LampArchiveIntegrityError`` as
+its refusal factory, so it defines none of its own.
 """
 
 from __future__ import annotations
 
 import asyncio
-import codecs
 import datetime as dt
-import hashlib
 import re
-import tarfile
 import time
-import zlib
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Final
 from urllib.parse import urlsplit
@@ -53,17 +41,23 @@ from urllib.parse import urlsplit
 import httpx
 
 from breezy.ingest.http import (
-    DecodeError,
     DisallowedHostError,
     FetchResult,
     HttpTransport,
-    OversizeBodyError,
     RateLimitedError,
     TransportError,
     TransportTimeoutError,
     UserAgentConfigurationError,
     assert_clean_proxy_env,
     redact_url,
+)
+from breezy.ingest.lamp_archive_stream import (
+    LampArchiveLimits,
+    LampMonthStream,
+    LampTarMember,
+    LampYearStream,
+    open_month_stream,
+    open_year_stream,
 )
 
 __all__ = [
@@ -107,19 +101,13 @@ DEFAULT_LAMP_BULLETIN_MAX_BYTES: Final[int] = 16 * 1024 * 1024
 _MIB: Final[int] = 1024 * 1024
 _GIB: Final[int] = 1024 * _MIB
 _CHUNK_SIZE: Final[int] = 64 * 1024
-_DECOMPRESS_STEP: Final[int] = 64 * 1024
 _MAX_RETRY_AFTER_SECONDS: Final[float] = 120.0
+_MAX_RETRY_AFTER_DIGITS: Final[int] = 4
 _FIRST_ARCHIVE_YEAR: Final[int] = 2006
 _LAST_ARCHIVE_YEAR: Final[int] = 2099
 _YYYYMM_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A(?P<year>\d{4})(?P<month>\d{2})\Z")
 _HHMM_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A(?P<hour>\d{2})(?P<minute>\d{2})\Z")
 _VALID_MINUTES: Final[frozenset[int]] = frozenset({0, 15, 30, 45})
-
-#: ``KNYC   GFS LAMP GUIDANCE  10/06/2026  0130 UTC`` (A0). The station token is
-#: not assumed to be an ICAO call sign.
-_STATION_HEADER_RE: Final[re.Pattern[str]] = re.compile(
-    r"^\s*(?P<station>[A-Z0-9]{3,6})\s+(?:GFS\s+)?LAMP\s+GUIDANCE\b"
-)
 
 
 class LampNotPublishedError(TransportError):
@@ -143,17 +131,6 @@ class LampArchiveIntegrityError(TransportError):
     """
 
 
-@dataclass(frozen=True, slots=True)
-class LampArchiveLimits:
-    """Byte and count caps for one streamed archive method."""
-
-    max_compressed_bytes: int
-    max_members: int
-    max_member_bytes: int
-    max_member_decompressed_bytes: int
-    max_total_decompressed_bytes: int
-
-
 #: A month: ~11 MB gzip / ~119 MB text measured (A0). One file, no members.
 DEFAULT_LAMP_MONTH_LIMITS: Final[LampArchiveLimits] = LampArchiveLimits(
     max_compressed_bytes=64 * _MIB,
@@ -161,6 +138,7 @@ DEFAULT_LAMP_MONTH_LIMITS: Final[LampArchiveLimits] = LampArchiveLimits(
     max_member_bytes=64 * _MIB,
     max_member_decompressed_bytes=_GIB,
     max_total_decompressed_bytes=_GIB,
+    max_wall_seconds=30 * 60,
 )
 
 #: A year: ~3.8 GB tar of <=1,152 monthly gz files of ~11 MB / ~119 MB each.
@@ -170,6 +148,7 @@ DEFAULT_LAMP_YEAR_LIMITS: Final[LampArchiveLimits] = LampArchiveLimits(
     max_member_bytes=64 * _MIB,
     max_member_decompressed_bytes=_GIB,
     max_total_decompressed_bytes=192 * _GIB,
+    max_wall_seconds=2 * 3600,
 )
 
 
@@ -185,298 +164,17 @@ class LampBulletinResult:
     retrieved_at_ns: int
 
 
-# -- streaming helpers ----------------------------------------------------------
-
-
-class _CountingReader:
-    """A file-like over response chunks: caps, digests and counts as it reads."""
-
-    def __init__(self, chunks: Iterator[bytes], *, max_bytes: int, label: str) -> None:
-        self._chunks = chunks
-        self._max_bytes = max_bytes
-        self._label = label
-        self._buffer = b""
-        self._digest = hashlib.sha256()
-        self.total = 0
-        self.exhausted = False
-
-    def _pull(self) -> bool:
-        if self.exhausted:
-            return False
-        try:
-            chunk = next(self._chunks)
-        except StopIteration:
-            self.exhausted = True
-            return False
-        self.total += len(chunk)
-        if self.total > self._max_bytes:
-            raise OversizeBodyError(
-                f"Download from {self._label} exceeded the {self._max_bytes}-byte compressed cap."
-            )
-        self._digest.update(chunk)
-        self._buffer += chunk
-        return True
-
-    def read(self, size: int = -1) -> bytes:
-        if size < 0:
-            raise ValueError("an unbounded read is refused; the stream is size-capped")
-        while len(self._buffer) < size and self._pull():
-            pass
-        taken, self._buffer = self._buffer[:size], self._buffer[size:]
-        return taken
-
-    def drain(self) -> None:
-        while self._pull():
-            self._buffer = b""
-
-    def chunks(self, size: int = _CHUNK_SIZE) -> Iterator[bytes]:
-        while chunk := self.read(size):
-            yield chunk
-
-    @property
-    def sha256(self) -> str:
-        if not self.exhausted:
-            raise RuntimeError("sha256 is unavailable until the stream is fully consumed")
-        return self._digest.hexdigest()
-
-
-class _DecompressedBudget:
-    """Per-member and total decompressed-byte counter, shared across members."""
-
-    def __init__(self, limits: LampArchiveLimits, *, label: str) -> None:
-        self._limits = limits
-        self._label = label
-        self._member = 0
-        self._total = 0
-
-    def begin_member(self) -> None:
-        self._member = 0
-
-    def add(self, count: int) -> None:
-        self._member += count
-        self._total += count
-        if self._member > self._limits.max_member_decompressed_bytes:
-            raise OversizeBodyError(
-                f"A member of {self._label} decompressed past the "
-                f"{self._limits.max_member_decompressed_bytes}-byte per-member cap."
-            )
-        if self._total > self._limits.max_total_decompressed_bytes:
-            raise OversizeBodyError(
-                f"{self._label} decompressed past the "
-                f"{self._limits.max_total_decompressed_bytes}-byte total cap."
-            )
-
-
-def _gunzip(chunks: Iterable[bytes], *, budget: _DecompressedBudget, label: str) -> Iterator[bytes]:
-    """Incrementally gunzip (concatenated members allowed), counting output."""
-    inflater = zlib.decompressobj(zlib.MAX_WBITS | 16)
-    fed = False
-    try:
-        for chunk in chunks:
-            data = chunk
-            fed = fed or bool(chunk)
-            while True:
-                out = inflater.decompress(data, _DECOMPRESS_STEP)
-                budget.add(len(out))
-                if out:
-                    yield out
-                if inflater.eof:
-                    data = inflater.unused_data
-                    inflater = zlib.decompressobj(zlib.MAX_WBITS | 16)
-                    fed = bool(data)
-                    if not data:
-                        break
-                    continue
-                data = inflater.unconsumed_tail
-                if not data and len(out) < _DECOMPRESS_STEP:
-                    break
-    except zlib.error as exc:
-        raise DecodeError(f"Invalid gzip data in {label}: {exc}") from exc
-    if fed:
-        raise DecodeError(f"Truncated gzip data in {label}.")
-
-
-def _consume_lines(pending: str, decoded: str) -> tuple[list[str], str]:
-    parts = (pending + decoded).splitlines(keepends=True)
-    tail = parts.pop() if parts and not parts[-1].endswith(("\n", "\r")) else ""
-    return parts, tail
-
-
-def _decode_lines(chunks: Iterable[bytes], *, label: str) -> Iterator[str]:
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    pending = ""
-    try:
-        for chunk in chunks:
-            lines, pending = _consume_lines(pending, decoder.decode(chunk))
-            yield from lines
-        pending += decoder.decode(b"", final=True)
-    except UnicodeDecodeError as exc:
-        raise DecodeError(f"{label} is not valid UTF-8: {exc}") from exc
-    if pending:
-        yield pending
-
-
-def _filter_stations(lines: Iterable[str], stations: frozenset[str] | None) -> Iterator[str]:
-    """Keep only the wanted stations' blocks; the discard happens per line."""
-    if stations is None:
-        yield from lines
-        return
-    keep = False
-    for line in lines:
-        match = _STATION_HEADER_RE.match(line)
-        if match is not None:
-            keep = match.group("station") in stations
-        if keep:
-            yield line
-
-
-# -- archive stream results -----------------------------------------------------
-
-
-class LampMonthStream:
-    """A monthly ``.gz`` as station-filterable text lines."""
-
-    def __init__(
-        self,
-        *,
-        reader: _CountingReader,
-        budget: _DecompressedBudget,
-        source_host: str,
-        last_modified: str | None,
-        url: str,
-    ) -> None:
-        self._reader = reader
-        self._budget = budget
-        self.source_host = source_host
-        self.last_modified = last_modified
-        self.url = url
-
-    def lines(self, stations: frozenset[str] | None = None) -> Iterator[str]:
-        label = redact_url(self.url)
-        self._budget.begin_member()
-        text = _decode_lines(
-            _gunzip(self._reader.chunks(), budget=self._budget, label=label), label=label
-        )
-        yield from _filter_stations(text, stations)
-        self._reader.drain()
-
-    @property
-    def sha256(self) -> str:
-        """Digest of the COMPRESSED bytes; available once ``lines`` is exhausted."""
-        return self._reader.sha256
-
-
-class LampTarMember:
-    """One regular tar member (a monthly gz). ``name`` is a label, never a path."""
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        size: int,
-        read: Callable[[int], bytes],
-        budget: _DecompressedBudget,
-    ) -> None:
-        self.name = name
-        self.size = size
-        self._read = read
-        self._budget = budget
-
-    def lines(self, stations: frozenset[str] | None = None) -> Iterator[str]:
-        label = f"tar member {self.name!r}"
-        self._budget.begin_member()
-
-        def raw() -> Iterator[bytes]:
-            while chunk := self._read(_CHUNK_SIZE):
-                yield chunk
-
-        text = _decode_lines(_gunzip(raw(), budget=self._budget, label=label), label=label)
-        yield from _filter_stations(text, stations)
-
-
-def _unsafe_member_name(name: str) -> bool:
-    return (
-        not name
-        or "\x00" in name
-        or "\\" in name
-        or name.startswith("/")
-        or ".." in PurePosixPath(name).parts
-    )
-
-
-class LampYearStream:
-    """A yearly tar as a one-pass sequence of members (mode ``r|``)."""
-
-    def __init__(
-        self,
-        *,
-        reader: _CountingReader,
-        limits: LampArchiveLimits,
-        source_host: str,
-        last_modified: str | None,
-        url: str,
-    ) -> None:
-        self._reader = reader
-        self._limits = limits
-        self._budget = _DecompressedBudget(limits, label=redact_url(url))
-        self.source_host = source_host
-        self.last_modified = last_modified
-        self.url = url
-
-    def members(self) -> Iterator[LampTarMember]:
-        """Yield members in stream order; consume each before advancing."""
-        try:
-            with tarfile.open(fileobj=self._reader, mode="r|") as archive:  # type: ignore[call-overload]
-                for count, member in enumerate(archive, start=1):
-                    yield self._checked_member(archive, member, count)
-        except tarfile.TarError as exc:
-            raise LampArchiveIntegrityError(
-                f"Malformed tar from {redact_url(self.url)}: {exc}"
-            ) from exc
-        self._reader.drain()
-
-    def _checked_member(
-        self, archive: tarfile.TarFile, member: tarfile.TarInfo, count: int
-    ) -> LampTarMember:
-        if count > self._limits.max_members:
-            raise OversizeBodyError(
-                f"{redact_url(self.url)} has more than {self._limits.max_members} members."
-            )
-        if _unsafe_member_name(member.name):
-            raise LampArchiveIntegrityError(
-                f"Unsafe tar member name {member.name!r} in {redact_url(self.url)}."
-            )
-        if not member.isreg():
-            raise LampArchiveIntegrityError(
-                f"Non-regular tar member {member.name!r} (type {member.type!r}) in "
-                f"{redact_url(self.url)}; only regular files are accepted."
-            )
-        if member.size > self._limits.max_member_bytes:
-            raise OversizeBodyError(
-                f"Tar member {member.name!r} is {member.size} bytes, over the "
-                f"{self._limits.max_member_bytes}-byte member cap."
-            )
-        handle = archive.extractfile(member)
-        if handle is None:  # pragma: no cover - isreg() members always have a handle
-            raise LampArchiveIntegrityError(f"Unreadable tar member {member.name!r}.")
-        return LampTarMember(
-            name=member.name, size=member.size, read=handle.read, budget=self._budget
-        )
-
-    @property
-    def sha256(self) -> str:
-        """Digest of the whole tar; available once ``members`` is exhausted."""
-        return self._reader.sha256
-
-
 # -- the transport ----------------------------------------------------------------
 
 
 def _retry_delay(retry_after: str | None) -> float | None:
     """Seconds to wait, or None when the header is absent/unusable (never guessed)."""
-    if retry_after is None or not retry_after.strip().isdecimal():
+    if retry_after is None:
         return None
-    delay = float(int(retry_after.strip()))
+    text = retry_after.strip()
+    if not (text.isascii() and text.isdecimal() and len(text) <= _MAX_RETRY_AFTER_DIGITS):
+        return None
+    delay = float(int(text))
     return delay if delay <= _MAX_RETRY_AFTER_SECONDS else None
 
 
@@ -492,6 +190,7 @@ class MdlLampTransport(HttpTransport):
         month_limits: LampArchiveLimits = DEFAULT_LAMP_MONTH_LIMITS,
         year_limits: LampArchiveLimits = DEFAULT_LAMP_YEAR_LIMITS,
         max_429_retries: int = 2,
+        monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         async_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         check_proxy_env: bool = True,
@@ -520,6 +219,7 @@ class MdlLampTransport(HttpTransport):
         self._month_limits = month_limits
         self._year_limits = year_limits
         self._max_429_retries = max_429_retries
+        self._monotonic = monotonic
         self._sleep = sleep
         self._async_sleep = async_sleep
 
@@ -533,7 +233,8 @@ class MdlLampTransport(HttpTransport):
         path = parts.path
         segments = path.split("/")[1:]
         suspicious = (
-            not path.startswith(prefix)
+            bool(parts.query or parts.fragment or "?" in url or "#" in url)
+            or not path.startswith(prefix)
             or "%" in path
             or "" in segments[:-1]
             or ".." in segments
@@ -683,19 +384,15 @@ class MdlLampTransport(HttpTransport):
             f"https://{LAMP_MDL_HOST}{LAMP_HOST_PATH_PREFIXES[LAMP_MDL_HOST]}"
             f"lmp_lavtxt.{yyyymm}.{hhmm}z.gz"
         )
-        limits = self._month_limits
         with self._open_stream(url) as response:
-            reader = _CountingReader(
+            yield open_month_stream(
                 _iter_response(response, url),
-                max_bytes=limits.max_compressed_bytes,
-                label=redact_url(url),
-            )
-            yield LampMonthStream(
-                reader=reader,
-                budget=_DecompressedBudget(limits, label=redact_url(url)),
+                limits=self._month_limits,
+                monotonic=self._monotonic,
                 source_host=LAMP_MDL_HOST,
                 last_modified=response.headers.get("last-modified"),
                 url=url,
+                url_label=redact_url(url),
             )
 
     @contextmanager
@@ -708,19 +405,16 @@ class MdlLampTransport(HttpTransport):
         url = (
             f"https://{LAMP_MDL_HOST}{LAMP_HOST_PATH_PREFIXES[LAMP_MDL_HOST]}lmp_lavtxt.{yyyy}.tar"
         )
-        limits = self._year_limits
         with self._open_stream(url) as response:
-            reader = _CountingReader(
+            yield open_year_stream(
                 _iter_response(response, url),
-                max_bytes=limits.max_compressed_bytes,
-                label=redact_url(url),
-            )
-            yield LampYearStream(
-                reader=reader,
-                limits=limits,
+                limits=self._year_limits,
+                monotonic=self._monotonic,
                 source_host=LAMP_MDL_HOST,
                 last_modified=response.headers.get("last-modified"),
                 url=url,
+                url_label=redact_url(url),
+                refuse=LampArchiveIntegrityError,
             )
 
 

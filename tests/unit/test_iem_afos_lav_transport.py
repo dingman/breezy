@@ -241,9 +241,18 @@ async def test_afos_and_lav_calls_are_spaced_by_the_four_second_interval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _serve(monkeypatch)
-    sleeps = _Sleeps()
-    await _call_each(_transport(sleeper=sleeps))
-    assert sleeps.seconds == [
+    now = [FROZEN_NS]
+    slept: list[float] = []
+
+    async def advancing_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += round(seconds * 1e9)
+
+    transport = _transport(
+        pacer=iem.IemPacer(clock=lambda: now[0], sleeper=advancing_sleep), clock=lambda: now[0]
+    )
+    await _call_each(transport)
+    assert slept == [
         iem.IEM_AFOS_LAV_MIN_INTERVAL_NS / 1e9,
         iem.IEM_AFOS_LAV_MIN_INTERVAL_NS / 1e9,
     ]

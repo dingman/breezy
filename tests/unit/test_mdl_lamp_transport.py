@@ -750,10 +750,11 @@ def test_tar_stream_filters_stations_without_buffering_whole_tar(
     with _transport().fetch_lamp_archive_year(2025) as stream:
         members = stream.members()
         first = next(members)
-        first_line = next(iter(first.lines(stations=frozenset({"KNYC"}))))
+        first_lines = first.lines(stations=frozenset({"KNYC"}))
+        first_line = next(first_lines)
         assert first_line.startswith("KNYC")
         assert pulled < len(archive) / 2, "the whole tar was buffered"
-        kept = "".join(first.lines(stations=frozenset({"KNYC"})))
+        kept = first_line + "".join(first_lines)
     assert "KJFK" not in kept
 
 
@@ -768,19 +769,20 @@ def test_output_path_never_derived_from_member_name(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_module_never_extracts_or_writes_files() -> None:
-    tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
-    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    assert not attributes & {"extract", "extractall", "write_bytes", "write_text", "mkdir"}
-    calls = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert "open" not in calls
-    source = MODULE_PATH.read_text(encoding="utf-8")
-    assert 'mode="r|"' in source
-    assert '"r:' not in source
+def test_modules_never_extract_or_write_files() -> None:
+    for path in (MODULE_PATH, MODULE_PATH.with_name("lamp_archive_stream.py")):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        assert not attributes & {"extract", "extractall", "write_bytes", "write_text", "mkdir"}
+        calls = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "open" not in calls
+        assert '"r:' not in source
+    assert 'mode="r|"' in MODULE_PATH.with_name("lamp_archive_stream.py").read_text("utf-8")
 
 
 def test_corrupt_tar_is_an_integrity_error(monkeypatch: pytest.MonkeyPatch) -> None:

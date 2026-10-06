@@ -218,17 +218,35 @@ class IemPacer:
         self._sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._min_interval_ns = min_interval_ns
         self._last_ns: int | None = None
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _slot_lock(self) -> asyncio.Lock:
+        # Created lazily, and rebuilt if the pacer is reused from another event
+        # loop (the backfill drives it from one runner, tests from several).
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     async def wait(self, min_interval_ns: int | None = None) -> None:
-        """Sleep out the interval since the last request; the larger of the
-        pacer's own and ``min_interval_ns`` (a per-method floor) applies."""
-        now = self._clock()
-        if self._last_ns is not None:
+        """Reserve the next request slot atomically, then sleep until it.
+
+        Under the lock the slot is ``max(now, last + interval)`` and is
+        recorded as ``last`` BEFORE any sleep, so concurrent callers each get a
+        distinct slot at least one interval apart -- including at first use.
+        The interval is the larger of the pacer's own and ``min_interval_ns``
+        (a per-method floor).
+        """
+        async with self._slot_lock():
+            now = self._clock()
             interval_ns = max(self._min_interval_ns, min_interval_ns or 0)
-            residual_ns = interval_ns - (now - self._last_ns)
-            if residual_ns > 0:
-                await self._sleeper(residual_ns / _NANOSECONDS_PER_SECOND)
-        self._last_ns = self._clock()
+            slot = now if self._last_ns is None else max(now, self._last_ns + interval_ns)
+            self._last_ns = slot
+        delay_ns = slot - now
+        if delay_ns > 0:
+            await self._sleeper(delay_ns / _NANOSECONDS_PER_SECOND)
 
 
 class PacedIemTransport(HttpTransport):
