@@ -273,3 +273,139 @@ def test_label_files_are_write_once(tmp_path: Path) -> None:
         write_labels(tmp_path, FAMILY, [_row(realized_pnl=Decimal(9))], now_ns=NOW_NS)
     assert refused.value.reason is SingleReadReason.EXISTS_DIFFERENT
     assert path.read_bytes() == before
+
+
+# -- hardened read and write validation (F4 review batch: P1, P2, P3, D3) ------------------
+
+
+def _plant(
+    root: Path, family: str, now_ns: int, wires: list[dict[str, Any]], *, as_dir: str = ""
+) -> Path:
+    """Place a raw label file the real writer would refuse (corruption fixtures only)."""
+    parts = label_store.label_relative_path(family, now_ns)
+    if as_dir:
+        parts = (*parts[:-2], as_dir, parts[-1])
+    path = root.joinpath(*parts)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_bytes(label_store._serialise(wires))  # the one serialiser, bypassing validation
+    path.chmod(0o600)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "error"),
+    [
+        ("qty", "not-a-decimal", InvalidLabelRow),
+        ("p_source", "made_up", InvalidLabelRow),
+        ("role", "sideways", InvalidLabelRow),
+        ("excluded_reason", "made_up", InvalidLabelRow),
+    ],
+)
+def test_a_corrupt_stored_row_raises_a_label_store_error_chained_from_the_cause(
+    tmp_path: Path, column: str, value: str, error: type[Exception]
+) -> None:
+    wire = label_store._wire(_row())
+    wire[column] = value
+    _plant(tmp_path, FAMILY, NOW_NS, [wire])
+
+    with pytest.raises(error) as caught:
+        read_labels(tmp_path, FAMILY)
+
+    assert isinstance(caught.value, label_store.LabelStoreError)
+    assert caught.value.__cause__ is not None
+
+
+def test_a_label_file_with_a_missing_or_extra_column_is_unknown_schema(tmp_path: Path) -> None:
+    wire = label_store._wire(_row())
+    wire_extra = {**wire, "surprise": "x"}
+    short = {k: v for k, v in wire.items() if k != "scorer_id"}
+    for wires, now in (([wire_extra], NOW_NS), ([short], NOW_NS + 1)):
+        path = label_store.label_relative_path(FAMILY, now)
+        target = tmp_path.joinpath(*path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table = pa.Table.from_pylist(wires, schema=None).replace_schema_metadata(
+            {label_store._SCHEMA_META_KEY: b"label/v1"}
+        )
+        pq.write_table(table, target)
+        target.chmod(0o600)
+
+    with pytest.raises(UnknownLabelSchema):
+        read_labels(tmp_path, FAMILY)
+
+
+def test_a_row_stored_under_another_familys_directory_raises(tmp_path: Path) -> None:
+    other = label_store._wire(_row(family_id="some_other_family"))
+    _plant(tmp_path, FAMILY, NOW_NS, [other])
+
+    with pytest.raises(InvalidLabelRow, match="family"):
+        read_labels(tmp_path, FAMILY)
+    with pytest.raises(InvalidLabelRow, match="family"):
+        read_labels(tmp_path)
+
+
+def test_a_duplicate_label_id_and_seq_with_different_content_raises(tmp_path: Path) -> None:
+    first = label_store._wire(_row(realized_pnl=Decimal("0.57")))
+    second = label_store._wire(_row(realized_pnl=Decimal("-0.43")))
+    _plant(tmp_path, FAMILY, NOW_NS, [first])
+    _plant(tmp_path, FAMILY, NOW_NS + 1, [second])
+
+    with pytest.raises(label_store.ConflictingLabelRows):
+        read_labels(tmp_path, FAMILY)
+
+
+def test_a_duplicate_label_id_and_seq_with_identical_content_is_one_row(tmp_path: Path) -> None:
+    wire = label_store._wire(_row())
+    _plant(tmp_path, FAMILY, NOW_NS, [wire])
+    _plant(tmp_path, FAMILY, NOW_NS + 1, [wire])
+
+    assert len(read_labels(tmp_path, FAMILY)) == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"admissible": "yes"},
+        {"admissible": 1},
+        {"reconciled": None},
+        {"reconciled": 0},
+        {"labelled_at_ns": 1.5},
+        {"labelled_at_ns": True},
+        {"labelled_at_ns": "1790000000000000000"},
+        {"labelled_at_ns": -1},
+    ],
+)
+def test_validated_type_checks_admissible_reconciled_and_labelled_at(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(InvalidLabelRow):
+        write_labels(tmp_path, FAMILY, [_row(**overrides)], now_ns=NOW_NS)
+
+    assert not (tmp_path / "derived").exists()
+
+
+def test_only_admissible_rows_select_for_any_pnl_or_roi_aggregate() -> None:
+    """D3: ``admissible_rows`` is the one selection rule. Exit rows and venue-fallback rows, whose
+    ``excluded_reason`` is null, are still not admissible and never pass it."""
+    entry = _row(label_id="1" * 32)
+    exit_row = _row(label_id="2" * 32, role=LabelRole.EXIT, admissible=False, p_source=PSource.NONE)
+    fallback = _row(
+        label_id="3" * 32,
+        settlement_basis="venue_last_fair_price_fallback",
+        admissible=False,
+        excluded_reason=None,
+    )
+    excluded = _row(label_id="4" * 32, admissible=False, excluded_reason=ExcludedReason.CANARY)
+
+    chosen = label_store.admissible_rows([entry, exit_row, fallback, excluded])
+
+    assert chosen == (entry,)
+    assert fallback.excluded_reason is None and exit_row.excluded_reason is None
+
+
+def test_the_unresolved_journal_has_a_one_writer_row() -> None:
+    """P4: the journal path is a registered writer (widening 19 -> 20 in the writer table)."""
+    from tests.unit.autonomy_writer_table import AUTONOMY_FILE_WRITERS
+
+    assert "evidence/aut2/unresolved/<day>/<now_ns>_label_run.json" in {
+        w.path for w in AUTONOMY_FILE_WRITERS
+    }

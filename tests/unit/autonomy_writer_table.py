@@ -140,6 +140,14 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "through label_store.write_labels",
         "write_once",
     ),
+    # AUT-2 r7 WP2 (plan section 3.12): the unresolved-fill journal, written once per label run
+    # through single_read.write_once (attribution.write_unresolved_journal).
+    FileWriter(
+        "evidence/aut2/unresolved/<day>/<now_ns>_label_run.json",
+        "the label run (analysis.labeling.label_run), once per run with unresolved fills, through "
+        "attribution.write_unresolved_journal",
+        "write_once",
+    ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",
         "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "

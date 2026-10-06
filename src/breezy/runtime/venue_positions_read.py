@@ -40,6 +40,7 @@ from breezy.adapters.polymarket_us.transport import (
     QUOTA_KEY_PORTFOLIO,
     NautilusHttpTransport,
     PolymarketUSReadTransport,
+    VenueResponse,
     build_default_quota,
     build_keyed_quotas,
     build_shared_http_client,
@@ -50,7 +51,9 @@ from breezy.runtime.settings import proxy_env_check_enabled
 __all__ = [
     "MAX_PAGES",
     "POSITIONS_LITERAL",
+    "POSITIONS_PAGE_MAX_BYTES",
     "VENUE_READ_REQUEST_TIMEOUT_S",
+    "CappedReadTransport",
     "PositionRow",
     "ReadStatus",
     "VenuePositionsRead",
@@ -68,6 +71,10 @@ VENUE_READ_REQUEST_TIMEOUT_S: Final[int] = 10
 
 #: The page cap is the Wave 0 pin, never a local number.
 MAX_PAGES: Final[int] = pins.POSTSTOP_POSITIONS_MAX_PAGES
+
+#: Per-page response body cap, checked on the raw bytes before the client parses them (S2). A
+#: positions page of a few hundred rows is tens of KiB; a body past this is refused, not parsed.
+POSITIONS_PAGE_MAX_BYTES: Final[int] = 4 * 1024 * 1024
 
 #: Endpoint labels are constants chosen by the caller, never payload data. Anything outside this
 #: charset is refused rather than sanitised, so a path carrying a market slug or a query string
@@ -113,6 +120,28 @@ class VenuePositionsRead:
     pages: int
     read_status: ReadStatus
     rows: tuple[PositionRow, ...]
+
+
+class _PageTooLarge(Exception):
+    """A page body over the byte cap; mapped to ``READ_FAILED``."""
+
+
+class CappedReadTransport:
+    """A read transport that refuses an oversized body before the client's ``json.loads``.
+
+    The body is already in memory when the transport returns it; the cap bounds the parse and
+    everything after it, and the shipped transport is the only caller.
+    """
+
+    def __init__(self, inner: PolymarketUSReadTransport, *, max_bytes: int) -> None:
+        self._inner = inner
+        self._max_bytes = max_bytes
+
+    async def get(self, url: str, *, headers: Mapping[str, str], quota_key: str) -> VenueResponse:
+        response = await self._inner.get(url, headers=headers, quota_key=quota_key)
+        if len(response.body) > self._max_bytes:
+            raise _PageTooLarge("a positions page body exceeds the byte cap")
+        return response
 
 
 class _GetAuthenticated(Protocol):
@@ -255,7 +284,10 @@ def build_positions_client(
         credentials, clock=LiveClock(), variant=config.signing_variant
     )
     return PolymarketUSHttpClient(
-        transport=transport if transport is not None else _default_transport(config),
+        transport=CappedReadTransport(
+            transport if transport is not None else _default_transport(config),
+            max_bytes=POSITIONS_PAGE_MAX_BYTES,
+        ),
         signer=signer,
         api_base_url=str(config.api_base_url),
         gateway_base_url=str(config.gateway_base_url),

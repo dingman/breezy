@@ -22,9 +22,9 @@ from __future__ import annotations
 import io
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
@@ -51,11 +51,13 @@ from breezy.persistence.autonomy.single_read import (
     walk_dirs,
     write_once,
 )
+from breezy.persistence.autonomy.wire import WireRefused
 
 __all__ = [
     "LABELS_DIR",
     "LABEL_FILE_MODE",
     "MARKER_STALE_H",
+    "ConflictingLabelRows",
     "InvalidLabelRow",
     "LabelMarker",
     "LabelRow",
@@ -63,6 +65,7 @@ __all__ = [
     "RunOutcome",
     "UnknownLabelSchema",
     "UnmappedScorerReason",
+    "admissible_rows",
     "label_relative_path",
     "labels_consumable",
     "read_labels",
@@ -108,6 +111,10 @@ class UnmappedScorerReason(LabelStoreError):
 
 class InvalidLabelRow(LabelStoreError):
     """A row that breaks a C2 invariant (type, probability range, source or family)."""
+
+
+class ConflictingLabelRows(LabelStoreError):
+    """Two stored rows share ``(label_id, label_seq)`` but differ in content."""
 
 
 class RunOutcome(StrEnum):
@@ -239,6 +246,12 @@ def _as_p_source(value: object) -> PSource:
 def _validated(row: LabelRow, family_id: str) -> LabelRow:
     if row.family_id != family_id:
         raise InvalidLabelRow("a row's family_id must equal the file's family")
+    for name in ("admissible", "reconciled"):
+        if not isinstance(getattr(row, name), bool):
+            raise InvalidLabelRow(f"{name} must be a bool")
+    stamp = row.labelled_at_ns
+    if isinstance(stamp, bool) or not isinstance(stamp, int) or stamp < 0:
+        raise InvalidLabelRow("labelled_at_ns must be a non-negative int")
     p_source = _as_p_source(row.p_source)
     p_at = _as_probability("p_at_decision", row.p_at_decision)
     p_raw = _as_probability("p_raw_at_decision", row.p_raw_at_decision)
@@ -307,15 +320,19 @@ def write_labels(data_root: Path, family_id: str, rows: Sequence[LabelRow], *, n
 
 
 def _row_of(wire: Mapping[str, Any]) -> LabelRow:
-    values: dict[str, Any] = dict(wire)
-    for name in _MONEY_FIELDS:
-        raw = values[name]
-        values[name] = None if raw is None else Decimal(raw)
-    values["p_source"] = PSource(values["p_source"])
-    values["role"] = LabelRole(values["role"])
-    reason = values["excluded_reason"]
-    values["excluded_reason"] = None if reason is None else ExcludedReason(reason)
-    return LabelRow(**values)
+    """One stored row; any decode failure is an ``InvalidLabelRow`` chained from its cause."""
+    try:
+        values: dict[str, Any] = dict(wire)
+        for name in _MONEY_FIELDS:
+            raw = values[name]
+            values[name] = None if raw is None else Decimal(raw)
+        values["p_source"] = PSource(values["p_source"])
+        values["role"] = LabelRole(values["role"])
+        reason = values["excluded_reason"]
+        values["excluded_reason"] = None if reason is None else ExcludedReason(reason)
+        return LabelRow(**values)
+    except (InvalidOperation, ValueError, TypeError, KeyError) as exc:
+        raise InvalidLabelRow("a stored label row does not decode") from exc
 
 
 def _read_file(dirfd: int, name: str) -> list[LabelRow]:
@@ -351,6 +368,34 @@ def _family_dirs(rootfd: int, family_id: str | None) -> list[str]:
         os.close(labels_fd)
 
 
+def _check_family(row: LabelRow, directory: str) -> None:
+    try:
+        expected = family_component(row.family_id)
+    except WireRefused as exc:
+        raise InvalidLabelRow("a stored row's family_id is not a valid family") from exc
+    if expected != directory:
+        raise InvalidLabelRow("a stored row's family_id does not match its directory")
+
+
+def _keep_latest(latest: dict[str, LabelRow], row: LabelRow) -> None:
+    kept = latest.get(row.label_id)
+    if kept is None or row.label_seq > kept.label_seq:
+        latest[row.label_id] = row
+    elif row.label_seq == kept.label_seq and row != kept:
+        raise ConflictingLabelRows(
+            "two stored rows share (label_id, label_seq) with differing content"
+        )
+
+
+def admissible_rows(rows: Iterable[LabelRow]) -> tuple[LabelRow, ...]:
+    """The one selection rule for any P&L or ROI aggregate: ``admissible`` rows and nothing else.
+
+    A null ``excluded_reason`` does not make a row eligible (an exit row or a venue-fallback row has
+    none and is still inadmissible).
+    """
+    return tuple(row for row in rows if row.admissible)
+
+
 def read_labels(data_root: Path, family_id: str | None = None) -> tuple[LabelRow, ...]:
     """Every stored row (one family, or all), deduped to the highest ``label_seq`` per
     ``label_id``. An unreadable file or a foreign schema raises; an absent directory is empty."""
@@ -372,9 +417,8 @@ def read_labels(data_root: Path, family_id: str | None = None) -> tuple[LabelRow
                 ]
                 for name in names:
                     for row in _read_file(dirfd, name):
-                        kept = latest.get(row.label_id)
-                        if kept is None or row.label_seq > kept.label_seq:
-                            latest[row.label_id] = row
+                        _check_family(row, family)
+                        _keep_latest(latest, row)
             finally:
                 os.close(dirfd)
     finally:

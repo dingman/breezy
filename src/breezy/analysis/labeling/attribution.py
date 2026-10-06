@@ -139,6 +139,14 @@ def attribute_post_epoch(
         return Unresolved("no_decision")
     if decision.kind == _TAKE and not decision.p_hat:
         return Unresolved("take_without_p_hat")
+    # fail closed: a decision after its order, an order after its fill, or three different
+    # instruments cannot be one causal chain
+    if not decision.ts_ns <= link.ts_ns:
+        return Unresolved("decision_after_link")
+    if not link.ts_ns <= fill.ts_event:
+        return Unresolved("link_after_fill")
+    if not decision.instrument_id == link.instrument_id == fill.instrument_id:
+        return Unresolved("instrument_mismatch")
     alerts: tuple[str, ...] = ()
     if champion_at is not None:
         champion = champion_at(venue, fill.ts_event)

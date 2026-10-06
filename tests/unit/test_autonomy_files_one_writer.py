@@ -307,7 +307,8 @@ def test_the_writer_table_names_only_known_mechanisms_and_unique_paths() -> None
     assert {row.mechanism for row in AUTONOMY_FILE_WRITERS} <= WRITE_MECHANISMS
     paths = [row.path for row in AUTONOMY_FILE_WRITERS]
     # 19: AUT-2 r7 WP2 adds the C2 label store row (derived/labels/<family_id>/...).
-    assert len(paths) == len(set(paths)) == 19
+    # 20: the AUT-2 unresolved-fill journal row (evidence/aut2/unresolved/...).
+    assert len(paths) == len(set(paths)) == 20
 
 
 def test_exemptions_are_narrow_and_unique() -> None:
