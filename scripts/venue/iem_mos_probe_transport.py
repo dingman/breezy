@@ -14,6 +14,7 @@ import asyncio
 import copy
 import datetime as dt
 import re
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Final
 from urllib.parse import urlencode, urlsplit
@@ -218,28 +219,20 @@ class IemPacer:
         self._sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._min_interval_ns = min_interval_ns
         self._last_ns: int | None = None
-        self._lock: asyncio.Lock | None = None
-        self._lock_loop: asyncio.AbstractEventLoop | None = None
-
-    def _slot_lock(self) -> asyncio.Lock:
-        # Created lazily, and rebuilt if the pacer is reused from another event
-        # loop (the backfill drives it from one runner, tests from several).
-        loop = asyncio.get_running_loop()
-        if self._lock is None or self._lock_loop is not loop:
-            self._lock = asyncio.Lock()
-            self._lock_loop = loop
-        return self._lock
+        # Held only across the synchronous slot computation (no await inside),
+        # so it is safe across threads and across event loops alike.
+        self._lock = threading.Lock()
 
     async def wait(self, min_interval_ns: int | None = None) -> None:
         """Reserve the next request slot atomically, then sleep until it.
 
-        Under the lock the slot is ``max(now, last + interval)`` and is
-        recorded as ``last`` BEFORE any sleep, so concurrent callers each get a
+        The slot is ``max(now, last + interval)`` and is recorded as ``last``
+        BEFORE any sleep, so concurrent callers (tasks or threads) each get a
         distinct slot at least one interval apart -- including at first use.
         The interval is the larger of the pacer's own and ``min_interval_ns``
         (a per-method floor).
         """
-        async with self._slot_lock():
+        with self._lock:
             now = self._clock()
             interval_ns = max(self._min_interval_ns, min_interval_ns or 0)
             slot = now if self._last_ns is None else max(now, self._last_ns + interval_ns)

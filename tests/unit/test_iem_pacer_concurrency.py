@@ -115,3 +115,28 @@ async def test_concurrent_afos_and_lav_fetches_are_spaced_from_first_use(
     )
     step = iem.IEM_AFOS_LAV_MIN_INTERVAL_NS / 1e9
     assert sorted(fake.sleeps) == [step, 2 * step]
+
+
+def test_slot_reservation_is_thread_safe_across_event_loops() -> None:
+    import threading
+
+    fake = _FakeTime()  # a clock that never advances: every slot must be distinct
+    pacer = iem.IemPacer(clock=fake.clock, sleeper=fake.sleep)
+    per_thread = 40
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        async def run() -> None:
+            barrier.wait()
+            for _ in range(per_thread):
+                await pacer.wait()
+
+        asyncio.run(run())
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    # 2 * 40 reservations: the first fires at once, the rest are one interval apart.
+    assert sorted(fake.sleeps) == [float(i) for i in range(1, 2 * per_thread)]

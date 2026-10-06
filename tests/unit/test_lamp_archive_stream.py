@@ -315,3 +315,59 @@ def test_mock_http_clients_are_real_client_subclasses(monkeypatch: pytest.Monkey
     install_mock_http(monkeypatch, lambda _r: httpx.Response(200))
     assert isinstance(httpx.AsyncClient(), httpx.AsyncClient)
     assert isinstance(httpx.Client(), httpx.Client)
+
+
+# -- year digest: every member must have been fully consumed and validated -------------
+
+
+def _two_member_tar(first: bytes, second: bytes) -> bytes:
+    return _tar([("lmp_lavtxt.202501.0000z.gz", first), ("lmp_lavtxt.202502.0000z.gz", second)])
+
+
+def test_year_sha256_refuses_after_a_caught_member_error_and_continued_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = _gz(_block("KNYC") * 20)[:-8]  # truncated gzip: lines() raises
+    _serve(monkeypatch, _two_member_tar(bad, _gz(_block("KMIA"))))
+    with _transport().fetch_lamp_archive_year(2025) as stream:
+        for member in stream.members():
+            try:
+                list(member.lines())
+            except TransportError:
+                continue  # the caller swallows the failure and carries on
+        with pytest.raises(RuntimeError):
+            _ = stream.sha256
+
+
+def test_year_sha256_refuses_when_a_member_was_never_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve(monkeypatch, _two_member_tar(_gz(_block("KNYC")), _gz(_block("KMIA"))))
+    with _transport().fetch_lamp_archive_year(2025) as stream:
+        for index, member in enumerate(stream.members()):
+            if index == 1:
+                list(member.lines())  # the first member is skipped unread
+        with pytest.raises(RuntimeError):
+            _ = stream.sha256
+
+
+def test_year_sha256_refuses_when_a_member_is_only_partly_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve(monkeypatch, _two_member_tar(_gz(_block("KNYC") * 5), _gz(_block("KMIA"))))
+    with _transport().fetch_lamp_archive_year(2025) as stream:
+        for index, member in enumerate(stream.members()):
+            lines = member.lines()
+            next(lines) if index == 0 else list(lines)
+        with pytest.raises(RuntimeError):
+            _ = stream.sha256
+
+
+def test_year_sha256_is_released_when_every_member_is_fully_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve(monkeypatch, _two_member_tar(_gz(_block("KNYC")), _gz(_block("KMIA"))))
+    with _transport().fetch_lamp_archive_year(2025) as stream:
+        for member in stream.members():
+            list(member.lines())
+        assert len(stream.sha256) == 64

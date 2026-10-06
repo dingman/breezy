@@ -322,6 +322,7 @@ class LampTarMember:
         self._owner = owner
         self._refuse = refuse
         self._used = False
+        self.consumed = False
 
     def lines(self, stations: frozenset[str] | None = None) -> Iterator[str]:
         if self._used:
@@ -352,7 +353,13 @@ class LampTarMember:
             label=label,
             max_line_chars=self._owner.limits.max_line_chars,
         )
-        yield from _filter_stations(text, stations)
+        try:
+            yield from _filter_stations(text, stations)
+        except BaseException:
+            # A caught failure must never let the year digest be released.
+            self._owner.failed = True
+            raise
+        self.consumed = True
 
 
 def _unsafe_member_name(name: str) -> bool:
@@ -383,6 +390,8 @@ class LampYearStream(_SingleUse):
         self.limits = limits
         self.budget = _DecompressedBudget(limits, label=url_label)
         self.current_member: LampTarMember | None = None
+        self.failed = False
+        self._unvalidated = False
         self._label = url_label
         self._refuse = refuse
         self.source_host = source_host
@@ -398,12 +407,24 @@ class LampYearStream(_SingleUse):
         try:
             with tarfile.open(fileobj=self._reader, mode="r|") as archive:  # type: ignore[call-overload]
                 for count, member in enumerate(archive, start=1):
+                    self._note_member_done()
                     self.current_member = self._checked_member(archive, member, count)
                     yield self.current_member
         except tarfile.TarError as exc:
             raise self._refuse(f"Malformed tar from {self._label}: {exc}") from exc
+        self._note_member_done()
         self.current_member = None
         self._finish()
+
+    def _note_member_done(self) -> None:
+        previous = self.current_member
+        if previous is not None and not previous.consumed:
+            self._unvalidated = True  # skipped or partly read: its gzip was never validated
+
+    def _finish(self) -> None:
+        self._reader.drain()
+        if not (self.failed or self._unvalidated):
+            self._complete = True
 
     def _checked_member(
         self, archive: tarfile.TarFile, member: tarfile.TarInfo, count: int
