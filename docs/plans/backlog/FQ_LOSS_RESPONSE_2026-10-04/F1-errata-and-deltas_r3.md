@@ -303,10 +303,12 @@
    - **(a) The W15 clear precondition.** FQ-R34's precondition for clearing v1's standing halt reads: "the fold shows v1 RETIRED **and no family of v1's lineage is in any other state**".
      - The fold flag `terminal_frozen` is not part of the precondition.
      - The fold is unchanged. A BOOTSTRAP → RETIRED row sets no freeze, so every existing `terminal_frozen` assertion stays byte-unchanged.
-   - **(b) The validate rule, owned by ARCH-0 and restrictive only: "a MINT whose lineage root is RETIRED is refused".**
+   - **(b) The validate rule, owned by ARCH-0 and restrictive only: "a MINT is refused when every family of its lineage is RETIRED".** (FQ-R56; narrowed from r3's "lineage root is RETIRED". The broader rule conflicted with ARCH `:489`, under which a superseded root routinely ends RETIRED in a healthy lineage.)
      - It is added to `_CHECKS[Kind.MINT]` (`validate.py:526`) beside `ii.mint_rate` (`validate_ii.py:248-264`), as a new `validate_ii` check with a new `RuleII` member, refusing with `FAIL`.
-     - The root's state is read batch-aware: first `ctx.states` (`validate.py:604`, `:609`), then the prior fold. So a MINT that follows, in the same batch, a row that retires its root is also refused.
-     - **Why this is needed.** Y10 `terminal_frozen` (`validate_ii.py:208-219`) guards only →CHAMPION rows. MINT's checks today are `ii.mint_rate` alone (`validate.py:526`). So nothing currently stops a MINT under a retired root. With this rule, (a) stays true once it holds.
+     - The lineage's family states are read from `ctx.states`, which starts as the prior fold and is advanced by the earlier immediate rows in the batch (`validate.py:604`, `:623-624`). So a MINT that follows, in the same batch, a row that retires the lineage's last non-RETIRED family is also refused.
+     - The check runs after `ii.mint_rate`, so the RED tests use the day's first MINT.
+     - **SCOPE (FQ-R56):** `RULE_II_NAMES` (`tests/unit/test_registry_validate_ii.py:1254`, used by `test_every_rule_ii_name_is_unique_and_wired`) is widened by exactly the one new name, in the same commit.
+     - **Why this is needed.** Y10 `terminal_frozen` (`validate_ii.py:208-219`) guards only →CHAMPION rows. MINT's checks today are `ii.mint_rate` alone (`validate.py:526`). So nothing currently stops a MINT in an all-RETIRED lineage. With this rule, (a) stays true once it holds.
 
 **Unchanged.**
 - ROOT_ADMIT (ARCH `:479`) stays the recovery path after a KILL or a TERMINAL event, including its U2 standing-halt rule.
@@ -327,9 +329,10 @@
 - **ADD (assertion)** to `test_default_restrictive_class_is_demote_or_halt_with_known_classes` (`test_autonomy_pins.py:148-158`): `assert table["parity.fq_v2_shadow_live"] == ("DEMOTE", "RECOVERABLE_MODEL")`. The existing assertions are byte-unchanged. The test pins no exact key set, so no widening is needed.
 - ADD `test_bootstrap_seed_champion_has_live_orders_triple`
 - ADD `test_policy_halt_mirror_on_seeded_retired_family_writes_no_row_and_no_freeze`
-- ADD `test_mint_under_retired_root_refused` (FQ-R46)
-- ADD `test_mint_after_root_retired_earlier_in_same_batch_refused` (FQ-R46, the batch-aware read)
-- **Verify-first (FQ-R46, blocking).** List every existing test that writes a MINT whose lineage root is, or becomes, RETIRED. If any exists, STOP for a ruling. Its assertion is never edited to pass.
+- ADD `test_mint_in_all_retired_lineage_refused` (FQ-R46, FQ-R56)
+- ADD `test_mint_after_lineage_fully_retired_earlier_in_same_batch_refused` (FQ-R46, FQ-R56, the batch-aware read)
+- ADD `test_mint_allowed_when_root_retired_but_lineage_has_live_family` (FQ-R56: a superseded root that is RETIRED does not block MINT in a healthy lineage)
+- **Verify-first (FQ-R46, blocking).** List every existing test that writes a MINT in a lineage whose families are all, or all become, RETIRED. If any exists, STOP for a ruling. Its assertion is never edited to pass.
 - **Dropped:** r2's `test_seeded_retired_lineage_is_terminal_frozen`. It was an r2 proposal that never merged, and its rule is rejected.
 
 ---
@@ -667,10 +670,10 @@ Retargeted: 19 lines. Kept: 0.
 | # | Act | Commit content | Activation |
 |---|---|---|---|
 | 1 | F9-A, live-orders enablement | The v2 manifest `live_orders_ruling` = the RC-5 ruling, plus one `_LIVE_ORDERS_ALLOWLIST` triple. These are the two inseparable halves of G4 | No send yet |
-| 2 | F9-B, env arm | The env and unit sources switch the sending family (`BREEZY_SENDING_FAMILY_ID`, `runtime/settings.py:106`) from v2-shadow to v2, as v1 was armed on 10-01. Afterwards no env source names v1. **SCOPE (re-pin)** in this commit: `tests/unit/test_trade_supervisor_phase1_unit.py:37` `_EXPECTED_SENDING_FAMILY_ID` becomes `"pm_us_crh_fq_v2"`, and its assertions stay byte-unchanged | Node respawn plus the FQ-R22 checks. Supervisor restart in [01:00Z, 16:40Z) if the env lives in the symlinked unit. **"Verified"** means the read-back below is recorded before row 3 starts |
+| 2 | F9-B, env arm | The env and unit sources switch the sending family (`BREEZY_SENDING_FAMILY_ID`, `runtime/settings.py:106`) from `pm_us_crh_fq_v1` to `pm_us_crh_fq_v2` (the v2 shadow run of F8 is a separate, non-sending composition), as v1 was armed on 10-01. Afterwards no env source names v1. **SCOPE (re-pin)** in this commit: `tests/unit/test_trade_supervisor_phase1_unit.py:37` `_EXPECTED_SENDING_FAMILY_ID` becomes `"pm_us_crh_fq_v2"`, and its assertions stay byte-unchanged | Node respawn plus the FQ-R22 checks. Supervisor restart in [01:00Z, 16:40Z) if the env lives in the symlinked unit. **"Verified"** means the read-back below is recorded before row 3 starts |
 | 3a | P-1, pins before the first bootstrap (after F9-B and F3) | `BOOTSTRAP_SEED` per E-27. `BOOTSTRAPPED_ROOT_MANIFEST_SHA256` rows for v2 (the post-F9-A sha), v1 (the post-F3 sha), v4, cont and `pm_us_crh_v2`. **The mandatory fixture migration (FQ-R49)**, below | Inert until bootstrap |
 | 3b | P-2 | The `_LINEAGE_POLICY_ALLOWLIST` row: `fq_v1` replaced by `pm_us_crh_fq_v2` (still one row) | Registry |
-| 3c | GAP-16 pins | The `DEFAULT_RESTRICTIVE_CLASS` entry (E-27). It may land with P-1 or before it, never after | Inert until bootstrap |
+| 3c | GAP-16 pins | The `DEFAULT_RESTRICTIVE_CLASS` entry (E-27). It lands in the {P-1, P-2, GAP-16} stage, in the P-1 commit or a separate commit within that stage, never before F9-B and never after the bootstrap | Inert until bootstrap |
 | 4 | Bootstrap | The row-7 genesis transaction from the P-1 seed. Stage S activates here | Registry |
 | 5 | P-3 | Policy revision: `lineage_roots=["pm_us_crh_fq_v2"]`, the E-25 lineage keys and a `detector_map` parity row. `root_admit_enabled` stays false | Registry |
 | — | (none) | `ROOT_ADMIT_ENABLED_CEILING` stays `False` (`pins.py:22`). Stage flags follow AUT-5 r7 WP9/WP10 unchanged. L2 stays gated by DEP-9 | — |
@@ -701,7 +704,7 @@ Retargeted: 19 lines. Kept: 0.
   - The v1 fixture and its drift guard from CONFLICT-13 stay. v1 is now a RETIRED seed in the world.
 - **What a change may touch.**
   - It changes fixtures and identifiers only, never the asserted relation.
-  - An assertion that names `pm_us_crh_fq_v1` as a literal is rewritten to the fixture constant. The reviewer checks hunk by hunk that only identifiers change.
+  - An assertion that names `pm_us_crh_fq_v1` as a literal is rewritten to the fixture constant. The reviewer checks hunk by hunk that only identifiers change. **STOP (FQ-R56):** any hunk that changes anything other than an identifier, for example a refusal row index, a fold count or a tally, stops the commit for a ruling. Prefer fixtures that do not bootstrap v1 at all (`ii.bootstrap` only checks membership in the seed set, `validate_ii.py:196`), so no index shifts.
 - **Guards.**
   - ADD `test_registry_world_v2_fixture_equals_deploy_v2`. It pins the fixture sha256 as a literal and compares the parsed fields to the deploy file.
   - The `--collect-only` node-id list after the change equals the list before it. No test is renamed, removed or skipped.
@@ -758,7 +761,7 @@ Retargeted: 19 lines. Kept: 0.
   - `test_no_env_source_names_v1_after_f9b`
   - `test_l1_session_counts_only_when_registry_resolved_family_equals_env_sender`, `test_l1_sessions_before_f9b_never_count`
   - `test_registry_world_v2_fixture_equals_deploy_v2`
-  - `test_mint_under_retired_root_refused`, `test_mint_after_root_retired_earlier_in_same_batch_refused` (E-27)
+  - `test_mint_in_all_retired_lineage_refused`, `test_mint_after_lineage_fully_retired_earlier_in_same_batch_refused`, `test_mint_allowed_when_root_retired_but_lineage_has_live_family` (E-27, FQ-R56)
   - r1's `test_root_admit_v2_requires_parity_detector_mapped` and `test_root_admit_v2_cites_fee_pass` stay **dropped**. They were r1 ADDs, never merged, and ROOT_ADMIT is not on the path.
 
 ### §R8-5 Parity continuation gate (FQ-R29, FQ-R35, FQ-R47)
@@ -905,3 +908,17 @@ Retargeted: 19 lines. Kept: 0.
   - `test_trade_supervisor_phase1_unit.py:37` belongs to F9-B.
   - Without them, P-1 and F9-B would go red.
 - **A reader FQ-R45 missed.** `test_persistence_exit_gate.py` reads every committed manifest, and FQ-R45's list omitted it.
+
+---
+
+## Convergence check (architect, 2026-10-06) and coordinator ruling FQ-R56
+
+- **Verdict:** NOT-READY on four items, all fixed in place above.
+  - **(a) HIGH.** Rule 4(b) is narrowed to "every family of the lineage is RETIRED". The ARCH `:489` superseded-root case is now allowed, with a new test.
+  - **(b)** `RULE_II_NAMES` is widened by exactly one name.
+  - **(c)** The P-1 migration has a STOP on any hunk that changes more than identifiers.
+  - **(d)** F9-B's starting value is corrected to `pm_us_crh_fq_v1`.
+  - **(e)** The GAP-16 pin's stage wording is aligned with E-27 rule 3.
+- **Ruled genuine SCOPE:** the two re-pins r3 added (`test_autonomy_pins.py:104`, `test_trade_supervisor_phase1_unit.py:37`).
+- **H1 text:** the security reviewer's round-2 text is substituted verbatim (§R8-4).
+- **Status: READY TO FILE.** E-25..E-28 are appended to `ARCH-ERRATA-rev9_2.md`. They are consumed by their owning WPs, per each erratum's Consumption list.
