@@ -168,6 +168,7 @@ __all__ = [
     "PERMANENTLY_UNSETTLED_EVENT",
     "PORTFOLIO_ROI_SCHEMA_VERSION",
     "PROCEEDS_DATE_PROXY_LABEL",
+    "ROI_STATUS_GATED_UNLABELLED_FQ",
     "ROI_STATUS_GATED_UNSETTLED_CAPITAL",
     "ROI_STATUS_OK",
     "SETTLEMENT_HORIZON_GRACE_DAYS",
@@ -246,6 +247,7 @@ __all__ = [
     "residual_trial_ids_pooled",
     "roi",
     "roi_against_baselines",
+    "scorer_roi_status",
     "settled_through_statistic_label",
     "settlement_lag_days",
     "settlement_payout",
@@ -2189,6 +2191,16 @@ _KNOWN_PORTFOLIO_ROI_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2, 3
 #: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
 ROI_STATUS_OK: Final[str] = "OK"
 ROI_STATUS_GATED_UNSETTLED_CAPITAL: Final[str] = "GATED_UNSETTLED_CAPITAL"
+#: AUT-2 r7 WP1: the status of the `--status-only` scorer entry while any durable fill sits in
+#: the legacy UNRECONCILED bucket (every FQ fill, until a C2 label store feeds this report in
+#: WP6). It is the entry's status only: the full report's `roi_status` is unchanged by WP1 (an
+#: in-flight, not-yet-scored fill is also UNRECONCILED and keeps the report `OK`).
+ROI_STATUS_GATED_UNLABELLED_FQ: Final[str] = "GATED_UNLABELLED_FQ"
+
+
+def scorer_roi_status(n_unlabelled: int) -> str:
+    """`GATED_UNLABELLED_FQ` while any durable fill is unlabelled, else `OK`."""
+    return ROI_STATUS_GATED_UNLABELLED_FQ if n_unlabelled > 0 else ROI_STATUS_OK
 
 
 class UnknownPortfolioRoiSchemaError(Exception):
@@ -3871,32 +3883,29 @@ def _resolve_residual_settlements(
 # --------------------------------------------------------------------------
 
 
-def _run(
-    *,
-    exec_state_db_path: Path,
-    scored_trials_dir: Path,
-    logs_dir: Path,
-    output_dir: Path,
-    families_dir: Path,
-    now_ns: int,
-    sink: AlertSink,
-    catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
-    capital_flows_dir: Path | None = None,
-) -> int:
-    """The I/O shell's actual work, factored out of `main()` as an explicit
-    test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
-    `proc_root` keyword-only seam): every path `main()` would otherwise
-    resolve from an env-var-or-literal-default is passed in directly, so a
-    test can drive the exact same code `main()` runs against a `tmp_path`
-    layout without touching `~/.local/share` or any environment variable
-    `main()` reads. `main([])`'s own no-argument CLI contract (pinned by
-    `deploy/systemd/portfolio-roi-run.sh` and
-    `tests/unit/test_portfolio_roi_deploy.py`) is unchanged by this split.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _BucketedLedger:
+    """The read-and-bucket half of a run, shared by the full report and `--status-only`."""
 
-    `catalog_base` (FU-3b) is only ever read when at least one residual
-    trial_id needs resolving (`_resolve_residual_settlements`) -- a run with
-    no residual fills touches no catalog path, so the default is safe for
-    every pre-existing caller/test that never writes one.
+    ledger_result: LedgerReadResult
+    scored_trials: tuple[ScoredTrial, ...]
+    n_duplicate_scored_trials: int
+    registered_manifests: tuple[FamilyManifest, ...]
+    residual_ids: frozenset[str]
+    scored_ids: frozenset[str]
+    family_station_results: Sequence[FamilyStationResult]
+    n_family_station_refusals: int
+    buckets: dict[FillBucket, tuple[AttributedFill, ...]]
+
+
+def _read_bucketed_ledger(
+    *, exec_state_db_path: Path, scored_trials_dir: Path, families_dir: Path
+) -> _BucketedLedger | None:
+    """Read the ledger, scored trials and manifests and partition every fill (§8 AC #2).
+
+    Returns ``None`` after printing the one stderr line on any fail-loud condition (absent or
+    unreadable ledger, a duplicate-scored-trial economics mismatch, a partition violation); the
+    caller maps that to a non-zero exit and writes nothing.
     """
     ledger_result = read_ledger_fills_with_counts(exec_state_db_path)
     if ledger_result is None:
@@ -3905,7 +3914,7 @@ def _run(
             f"{exec_state_db_path} -- refusing to report a fabricated zero",
             file=sys.stderr,
         )
-        return 1
+        return None
     fills = ledger_result.fills
 
     # defect 1 fix: `scored_trials_*.parquet` and `excluded_fills.jsonl`
@@ -3934,7 +3943,7 @@ def _run(
             f"portfolio_roi_report: DUPLICATE_SCORED_TRIAL_ECONOMICS_MISMATCH: {exc}",
             file=sys.stderr,
         )
-        return 1
+        return None
     # Stage C3 (review fix): the per-trial P&L breakdown's `family_id`
     # column resolves against every REGISTERED family's declared date
     # window (`_family_id_of_trial`/`resolve_trial_family`) -- never by
@@ -3962,7 +3971,87 @@ def _run(
         assert_ledger_partition(ledger_result=ledger_result, buckets=buckets)
     except LedgerPartitionViolationError as exc:
         print(f"portfolio_roi_report: PARTITION VIOLATION: {exc}", file=sys.stderr)
+        return None
+    return _BucketedLedger(
+        ledger_result=ledger_result,
+        scored_trials=tuple(scored_trials),
+        n_duplicate_scored_trials=n_duplicate_scored_trials,
+        registered_manifests=registered_manifests,
+        residual_ids=residual_ids,
+        scored_ids=scored_ids,
+        family_station_results=family_station_results,
+        n_family_station_refusals=n_family_station_refusals,
+        buckets=buckets,
+    )
+
+
+def _status_only(
+    *, exec_state_db_path: Path, scored_trials_dir: Path, families_dir: Path
+) -> int:
+    """AUT-2 r7 WP1, the portfolio-roi scorer entry: print the gate, publish no figure.
+
+    Prints ``PORTFOLIO_ROI <roi_status> unlabelled=<n>`` where ``n`` is the number of durable fills
+    in the UNRECONCILED bucket, and exits 0. It reads the same inputs as the full report, writes no
+    file and touches no alert ladder. An unreadable ledger exits 1 with the stderr line of a full
+    run, never a fabricated zero.
+    """
+    bucketed = _read_bucketed_ledger(
+        exec_state_db_path=exec_state_db_path,
+        scored_trials_dir=scored_trials_dir,
+        families_dir=families_dir,
+    )
+    if bucketed is None:
         return 1
+    unlabelled = len(bucketed.buckets.get(FillBucket.UNRECONCILED, ()))
+    status = scorer_roi_status(unlabelled)
+    print(f"PORTFOLIO_ROI {status} unlabelled={unlabelled}")
+    return 0
+
+
+def _run(
+    *,
+    exec_state_db_path: Path,
+    scored_trials_dir: Path,
+    logs_dir: Path,
+    output_dir: Path,
+    families_dir: Path,
+    now_ns: int,
+    sink: AlertSink,
+    catalog_base: Path = DEFAULT_NWS_CATALOG_BASE,
+    capital_flows_dir: Path | None = None,
+) -> int:
+    """The I/O shell's actual work, factored out of `main()` as an explicit
+    test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
+    `proc_root` keyword-only seam): every path `main()` would otherwise
+    resolve from an env-var-or-literal-default is passed in directly, so a
+    test can drive the exact same code `main()` runs against a `tmp_path`
+    layout without touching `~/.local/share` or any environment variable
+    `main()` reads. `main([])`'s own no-argument CLI contract (pinned by
+    `deploy/systemd/portfolio-roi-run.sh` and
+    `tests/unit/test_portfolio_roi_deploy.py`) is unchanged by this split.
+
+    `catalog_base` (FU-3b) is only ever read when at least one residual
+    trial_id needs resolving (`_resolve_residual_settlements`) -- a run with
+    no residual fills touches no catalog path, so the default is safe for
+    every pre-existing caller/test that never writes one.
+    """
+    bucketed = _read_bucketed_ledger(
+        exec_state_db_path=exec_state_db_path,
+        scored_trials_dir=scored_trials_dir,
+        families_dir=families_dir,
+    )
+    if bucketed is None:
+        return 1
+    ledger_result = bucketed.ledger_result
+    fills = ledger_result.fills
+    scored_trials = bucketed.scored_trials
+    n_duplicate_scored_trials = bucketed.n_duplicate_scored_trials
+    registered_manifests = bucketed.registered_manifests
+    residual_ids = bucketed.residual_ids
+    scored_ids = bucketed.scored_ids
+    family_station_results = bucketed.family_station_results
+    n_family_station_refusals = bucketed.n_family_station_refusals
+    buckets = bucketed.buckets
 
     if fills:
         period_start = min(_utc_day_of_fill(f) for f in fills)
@@ -4222,8 +4311,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     resolved from the same env-var-or-literal-default convention every
     sibling study wrapper already uses (see the `_default_*` functions
     above). Never assigns or reads an operator-reserved control.
+
+    AUT-2 r7 WP1: the single flag ``--status-only`` runs :func:`_status_only` instead (the
+    portfolio-roi scorer entry: prints the gate, publishes no figure, writes no file). Any other
+    argument is ignored, exactly as before.
     """
-    del argv  # accepted for CLI-shape symmetry with sibling scripts; unused
+    if argv is not None and "--status-only" in argv:
+        return _status_only(
+            exec_state_db_path=_default_exec_state_db_path(),
+            scored_trials_dir=_default_scored_trials_dir(),
+            families_dir=_default_families_dir(),
+        )
 
     log_alert_egress_status(os.environ, component="portfolio_roi_report")
     return _run(
@@ -4243,4 +4341,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

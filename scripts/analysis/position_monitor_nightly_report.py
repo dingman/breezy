@@ -171,6 +171,37 @@ def resolve_trial_family(
     return _AMBIGUOUS_FAMILY_LABEL
 
 
+#: AUT-2 r7 WP1: the composition kinds whose builder composes a `PositionMonitor`
+#: (`strategy/current_rung_hold/composition.py`). A family of any other kind (FQ, forecast_ladder)
+#: has no monitor, so its bound report has no position rows by construction.
+_MONITORED_KINDS: Final[frozenset[str]] = frozenset({"current_rung_hold", "continuous_rung_hold"})
+
+
+def _summaries_of_bound_family(
+    summaries: Sequence[PositionMonitorSummary],
+    family_manifest: FamilyManifest | None,
+    registered_manifests: Sequence[FamilyManifest],
+) -> tuple[PositionMonitorSummary, ...]:
+    """AUT-2 r7 WP1: a family-BOUND report counts only the summaries its own family owns.
+
+    Ownership is `resolve_trial_family` over the REGISTERED manifests plus the bound one (a DRAFT
+    family is not registered but still reports). A trial owned by another family, by none, or
+    ambiguously is not this family's row. An UNBOUND report (no manifest) keeps every summary.
+    """
+    if family_manifest is None:
+        return tuple(summaries)
+    scope = (
+        *(m for m in registered_manifests if m.family_id != family_manifest.family_id),
+        family_manifest,
+    )
+    return tuple(
+        summary
+        for summary in summaries
+        if resolve_trial_family(summary.trial_id, summary.climate_day, scope)
+        == family_manifest.family_id
+    )
+
+
 def _open_readonly_state_db(path: Path) -> sqlite3.Connection | None:
     """Independent `mode=ro` open, mirroring `fill_time_count.py`'s own idiom
     (`:84-98`) -- a separate implementation on purpose (AUD-07 §7 step 1 R2):
@@ -465,8 +496,17 @@ class MonitorReport:
     #: (`total_positions`) and the ledger universe are DIFFERENT stores --
     #: see `_render_markdown`'s "position universe" line.
     ledger_fill_count: int | None
+    #: AUT-2 r7 WP1: the bound family's composition kind when that kind composes no
+    #: `PositionMonitor` (`NO_MONITOR_FOR_KIND`), else `None`. Never set on an unbound report.
+    no_monitor_for_kind: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = self._base_dict()
+        if self.no_monitor_for_kind is not None:
+            payload["no_monitor_for_kind"] = self.no_monitor_for_kind
+        return payload
+
+    def _base_dict(self) -> dict[str, Any]:
         return {
             "total_positions": self.total_positions,
             "settled_count": self.settled_count,
@@ -883,7 +923,13 @@ def build_monitor_report(
     both already-read, pure inputs -- this function performs no I/O of its
     own; `main` reads the manifests and the ledger and passes the results in.
     """
-    joined, unsettled = _join(summaries, scored_trials)
+    bound_summaries = _summaries_of_bound_family(summaries, family_manifest, registered_manifests)
+    no_monitor_for_kind = (
+        family_manifest.composition_kind
+        if family_manifest is not None and family_manifest.composition_kind not in _MONITORED_KINDS
+        else None
+    )
+    joined, unsettled = _join(bound_summaries, scored_trials)
     ambiguous_family_trial_ids = tuple(
         summary.trial_id
         for summary in summaries
@@ -896,13 +942,13 @@ def build_monitor_report(
     settled_from_summary = len(joined) - settled_from_scored_trials
 
     return MonitorReport(
-        total_positions=len(summaries),
+        total_positions=len(bound_summaries),
         settled_count=len(joined),
         unsettled_count=unsettled,
         settled_from_scored_trials=settled_from_scored_trials,
         settled_from_summary=settled_from_summary,
-        by_leg=MappingProxyType(_count_by(summaries, lambda s: s.leg)),
-        by_entry_context=MappingProxyType(_count_by(summaries, lambda s: s.entry_context)),
+        by_leg=MappingProxyType(_count_by(bound_summaries, lambda s: s.leg)),
+        by_entry_context=MappingProxyType(_count_by(bound_summaries, lambda s: s.entry_context)),
         contingency_table=_contingency_table(joined),
         contingency_table_by_entry_context=MappingProxyType(
             _contingency_by_entry_context(joined)
@@ -910,10 +956,10 @@ def build_monitor_report(
         premature_exit_rate=_premature_exit_rate(joined),
         dead_precision=_dead_precision(joined),
         avoided_loss=_avoided_loss(joined),
-        one_sided_book=_one_sided_book(summaries),
-        exit_timing_histogram=MappingProxyType(_exit_timing_histogram(summaries)),
-        mae_summary=_decimal_range_summary(tuple(s.mae for s in summaries)),
-        mfe_summary=_decimal_range_summary(tuple(s.mfe for s in summaries)),
+        one_sided_book=_one_sided_book(bound_summaries),
+        exit_timing_histogram=MappingProxyType(_exit_timing_histogram(bound_summaries)),
+        mae_summary=_decimal_range_summary(tuple(s.mae for s in bound_summaries)),
+        mfe_summary=_decimal_range_summary(tuple(s.mfe for s in bound_summaries)),
         realized_vs_mark_delta=_realized_vs_mark_delta(joined),
         n_gated=_n_gated_metrics(joined, n_min=n_min),
         calibration=_calibration_status(usable_station_days),
@@ -922,6 +968,7 @@ def build_monitor_report(
         ),
         ambiguous_family_trial_ids=ambiguous_family_trial_ids,
         ledger_fill_count=ledger_fill_count,
+        no_monitor_for_kind=no_monitor_for_kind,
     )
 
 
@@ -962,6 +1009,11 @@ def _render_markdown(report: MonitorReport) -> str:
         ),
         _position_universe_line(report),
     ]
+    if report.no_monitor_for_kind is not None:
+        lines.append(
+            f"NO_MONITOR_FOR_KIND {report.no_monitor_for_kind}: this composition kind composes "
+            "no PositionMonitor, so the report has no position rows by construction"
+        )
     if report.ambiguous_family_trial_ids:
         lines.append(
             "AMBIGUOUS_FAMILY: "
