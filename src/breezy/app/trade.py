@@ -786,22 +786,33 @@ def _compose_forecast_quantile_ladder(
         expected_uid=os.getuid(),
     )
     fq_loss_stop_probe.probe_once()
-    fq_parity_gate = (
-        fq_bridge.make_file_parity_gate(
-            catalog_root,
-            family_id=manifest.family_id,
-            clock=_fq_bridge_now,
-            expected_uid=os.getuid(),
+    fq_parity_cache = (
+        fq_bridge.ParityFileCache(
+            catalog_root, clock=_fq_bridge_now, expected_uid=os.getuid()
         )
         if manifest.family_id == fq_bridge.PARITY_SUBJECT
         else None
     )
+    fq_parity_gate = (
+        None
+        if fq_parity_cache is None
+        else fq_bridge.make_file_parity_gate(
+            family_id=manifest.family_id, clock=_fq_bridge_now, cache=fq_parity_cache
+        )
+    )
+    if fq_parity_cache is not None:
+        fq_parity_cache.refresh()
     submit_veto = fq_bridge.FqComposedVeto(
         halt_veto=submit_veto,
         loss_stop_veto=fq_loss_stop_probe.veto_reason,
         parity_veto=None if fq_parity_gate is None else fq_parity_gate.veto_reason,
     )
-    extra_actors.append(fq_bridge.LossStopProbeActor(fq_loss_stop_probe))
+    extra_actors.append(
+        fq_bridge.LossStopProbeActor(
+            fq_loss_stop_probe,
+            refreshers=() if fq_parity_cache is None else (fq_parity_cache.refresh,),
+        )
+    )
     # FQ-S11: ONE shared in-process decision-funnel aggregator for
     # this boot, flushed every 15 minutes (plus once at on_stop) to
     # the SAME sibling `decisions/` directory

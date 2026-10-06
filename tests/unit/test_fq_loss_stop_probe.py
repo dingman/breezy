@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import logging
 import os
 import re
 from collections import Counter
@@ -17,11 +18,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import pytest
 
-from breezy.runtime.health import AlertPayload
+from breezy.runtime.health import AlertPayload, LoggingAlertSink, TeeAlertSink
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.trial_day_latch import open_trial_day_latch
@@ -42,6 +43,7 @@ from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import (
     parity_fill_count_path,
     parity_verdict_path,
 )
+from tests.support.fq_loss_stop_artefact import write_artefact
 
 _REPO: Final[Path] = Path(__file__).resolve().parents[2]
 _DESIGN: Final[Path] = (
@@ -68,30 +70,9 @@ class _Sink:
 
 
 def _write_artefact(
-    path: Path,
-    *,
-    verdict: str = "PASS",
-    as_of: datetime = _NOW - timedelta(hours=1),
-    c2_hwm: str = "c2-100",
-    truth_sha: str = "t" * 64,
-    digest: str | None = None,
-    schema: str = SCHEMA,
-    mode: int = 0o600,
+    path: Path, *, as_of: datetime = _NOW - timedelta(hours=1), **kwargs: Any
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    as_of_text = as_of.isoformat().replace("+00:00", "Z")
-    body = {
-        "schema": schema,
-        "verdict": verdict,
-        "as_of": as_of_text,
-        "c2_hwm": c2_hwm,
-        "truth_sha": truth_sha,
-        "digest": digest
-        or compute_digest(verdict=verdict, as_of=as_of_text, c2_hwm=c2_hwm, truth_sha=truth_sha),
-    }
-    path.write_text(json.dumps(body))
-    path.chmod(mode)
-    os.utime(path, (as_of.timestamp(), as_of.timestamp()))
+    write_artefact(path, as_of=as_of, **kwargs)
 
 
 class _Halts:
@@ -688,3 +669,587 @@ def test_composed_veto_is_never_an_enable_only_strings_or_none() -> None:
     }
 
     assert all(r is None or isinstance(r, str) for r in reasons)
+
+
+# ==========================================================================
+# review fixes (2026-10-06): deadman, latch, atomic cache, delivered alerts,
+# alert hygiene, as_of, TOCTOU, parity cache, halt guard
+# ==========================================================================
+
+_DEADMAN_S: Final[int] = 3 * lsp.PROBE_INTERVAL_SECONDS
+
+
+class _FalseSink:
+    """A sink that reports failure by return value instead of raising."""
+
+    def emit(self, payload: AlertPayload) -> bool:
+        return False
+
+
+class _OkSink:
+    def emit(self, payload: AlertPayload) -> None:
+        return None
+
+
+class _DownSink:
+    def emit(self, payload: AlertPayload) -> None:
+        raise ConnectionError("webhook down")
+
+
+# -- item 1: deadman -------------------------------------------------------
+
+
+def test_item1_deadman_timer_never_fires_after_initial_pass_refuses_after_deadline(
+    tmp_path: Path,
+) -> None:
+    probe, path, _sink, clock = _probe(tmp_path)
+    _write_artefact(path)
+    assert probe.probe_once() is Verdict.PASS
+    clock[0] = _NOW + timedelta(seconds=_DEADMAN_S)
+    assert probe.veto_reason() is None  # at the deadline: still inside
+
+    clock[0] = _NOW + timedelta(seconds=_DEADMAN_S + 1)
+
+    assert probe.veto_reason() == lsp.REASON_PROBE_STALE  # no probe ran: refuse
+
+
+def test_item1_deadman_resets_when_probe_settles_again(tmp_path: Path) -> None:
+    probe, path, _sink, clock = _probe(tmp_path)
+    _write_artefact(path)
+    probe.probe_once()
+    clock[0] = _NOW + timedelta(seconds=_DEADMAN_S + 1)
+    assert probe.veto_reason() == lsp.REASON_PROBE_STALE
+
+    probe.probe_once()
+
+    assert probe.veto_reason() is None
+
+
+def test_item1_cached_pass_ages_into_stale_veto_without_the_timer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lsp, "PROBE_INTERVAL_SECONDS", 10**9)  # isolate from the deadman
+    probe, path, _sink, clock = _probe(tmp_path)
+    _write_artefact(path, as_of=_NOW - timedelta(hours=1))
+    assert probe.probe_once() is Verdict.PASS
+    assert probe.veto_reason() is None
+
+    clock[0] = _NOW + timedelta(hours=STALE_VETO_H)  # artefact is now > STALE_VETO_H old
+
+    assert probe.veto_reason() == lsp.REASON_STALE
+
+
+def test_item1_cached_pass_in_stale_window_vetoes_until_a_probe_delivers_the_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lsp, "PROBE_INTERVAL_SECONDS", 10**9)
+    probe, path, sink, clock = _probe(tmp_path)
+    _write_artefact(path, as_of=_NOW - timedelta(hours=1))
+    probe.probe_once()
+
+    clock[0] = _NOW + timedelta(hours=lsp.MAX_AGE_H)  # 1h + MAX_AGE_H old, < STALE_VETO_H
+    assert probe.veto_reason() == lsp.REASON_STALE  # no CRITICAL alert yet
+
+    assert probe.probe_once() is Verdict.UNKNOWN_STALE
+    assert probe.veto_reason() is None  # alert delivered: the window applies
+    assert [p.event for p in sink.payloads] == ["FQ_LOSS_STOP_STALE"]
+
+
+def test_item1_deadman_never_unrefuses_fail_or_unknown(tmp_path: Path) -> None:
+    probe, path, _sink, clock = _probe(tmp_path)
+    _write_artefact(path, verdict="FAIL")
+    probe.probe_once()
+
+    clock[0] = _NOW + timedelta(days=30)
+
+    assert probe.veto_reason() == lsp.REASON_FAIL
+
+
+def test_item1_veto_with_broken_clock_refuses(tmp_path: Path) -> None:
+    probe, path, _sink, _clock = _probe(tmp_path)
+    _write_artefact(path)
+    probe.probe_once()
+    probe._clock = lambda: (_ for _ in ()).throw(RuntimeError("clock"))
+
+    assert probe.veto_reason() == lsp.REASON_UNKNOWN
+
+
+# -- item 2: the FAIL latch is exception-proof ------------------------------
+
+
+def test_item2_exception_after_fail_settle_keeps_fail_and_later_pass_is_vetoed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe, path, _sink, clock = _probe(tmp_path)
+    _write_artefact(path, verdict="FAIL")
+
+    def _raise(**_kwargs: object) -> AlertPayload:
+        raise RuntimeError("payload construction exploded")
+
+    monkeypatch.setattr(lsp, "AlertPayload", _raise)
+    assert probe.probe_once() is Verdict.FAIL
+    assert probe.veto_reason() == lsp.REASON_FAIL
+    monkeypatch.undo()
+
+    clock[0] = _NOW + timedelta(hours=2)
+    _write_artefact(path, verdict="PASS", as_of=_NOW + timedelta(hours=1))
+    probe.probe_once()
+    probe.probe_once()
+
+    assert probe.veto_reason() == lsp.REASON_FAIL
+
+
+def test_item2_fail_unknown_and_settle_can_never_leave_fail(tmp_path: Path) -> None:
+    probe, path, _sink, _ = _probe(tmp_path)
+    _write_artefact(path, verdict="FAIL")
+    probe.probe_once()
+
+    assert probe._fail_unknown("late exception") is Verdict.FAIL
+    assert probe._settle(Verdict.PASS, detail="", now=_NOW) is Verdict.FAIL
+    assert probe.veto_reason() == lsp.REASON_FAIL
+
+
+def test_item2_exception_inside_settle_side_effects_after_fail_keeps_fail(
+    tmp_path: Path,
+) -> None:
+    class _Boom:
+        def emit(self, payload: AlertPayload) -> None:
+            raise RuntimeError("sink")
+
+    def _halt_boom(reason: str, evidence_sha256: str) -> None:
+        raise RuntimeError("store")
+
+    probe, path, _sink, _ = _probe(tmp_path, sink=_Boom(), halts=_halt_boom)  # type: ignore[arg-type]
+    _write_artefact(path, verdict="FAIL")
+
+    assert probe.probe_once() is Verdict.FAIL
+    assert probe.veto_reason() == lsp.REASON_FAIL
+
+
+# -- item 3: one atomic cache ------------------------------------------------
+
+
+def test_item3_veto_reads_one_atomic_snapshot_attribute(tmp_path: Path) -> None:
+    probe, _path, _sink, _ = _probe(tmp_path)
+    assert not hasattr(probe, "_cache")
+    assert not hasattr(probe, "_stale_veto")
+    assert isinstance(probe._state, lsp._Snapshot)
+    assert lsp._Snapshot.__dataclass_params__.frozen  # type: ignore[attr-defined]
+
+    tree = ast.parse(_PROBE_SRC.read_text())
+    cls = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "LossStopProbe"
+    )
+    veto = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "veto_reason")
+    reads = [
+        n.attr
+        for n in ast.walk(veto)
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "self"
+        and isinstance(n.ctx, ast.Load)
+    ]
+    assert reads.count("_state") == 1
+    assert set(reads) <= {"_state", "_clock"}
+
+
+def test_item3_state_is_published_before_any_side_effect_so_readers_never_see_a_mix(
+    tmp_path: Path,
+) -> None:
+    seen: list[str | None] = []
+    holder: list[LossStopProbe] = []
+
+    class _Peek:
+        def emit(self, payload: AlertPayload) -> None:
+            seen.append(holder[0].veto_reason())
+
+    probe, path, _sink, _ = _probe(tmp_path, sink=_Peek())  # type: ignore[arg-type]
+    holder.append(probe)
+    _write_artefact(path)
+    probe.probe_once()  # PASS: no alert
+    assert probe.veto_reason() is None
+
+    _write_artefact(path, verdict="FAIL", as_of=_NOW - timedelta(minutes=30))
+    probe.probe_once()
+
+    assert seen[0] == lsp.REASON_FAIL  # observed DURING the alert emit
+
+
+# -- item 4: stale window needs a delivered alert ------------------------------
+
+
+def _stale_window_probe(tmp_path: Path, sink: object) -> LossStopProbe:
+    probe, path, _s, _ = _probe(tmp_path, sink=sink)  # type: ignore[arg-type]
+    _write_artefact(path, as_of=_NOW - timedelta(hours=lsp.MAX_AGE_H + 2))
+    assert lsp.MAX_AGE_H + 2 < STALE_VETO_H
+    probe.probe_once()
+    return probe
+
+
+def test_item4_stale_window_allows_entry_only_while_alert_delivered(tmp_path: Path) -> None:
+    sink = _Sink()
+    probe = _stale_window_probe(tmp_path, sink)
+
+    assert probe.veto_reason() is None
+    assert [p.event for p in sink.payloads] == ["FQ_LOSS_STOP_STALE"]
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        _Sink(down=True),
+        _DownSink(),
+        _FalseSink(),
+        LoggingAlertSink(),
+        TeeAlertSink(LoggingAlertSink(), _DownSink()),
+    ],
+    ids=["raises", "down", "returns_false", "local_only", "tee_local_plus_dead_webhook"],
+)
+def test_item4_stale_window_vetoes_immediately_when_alert_not_delivered(
+    tmp_path: Path, sink: object
+) -> None:
+    probe = _stale_window_probe(tmp_path, sink)
+
+    assert probe.veto_reason() == lsp.REASON_STALE
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [_OkSink(), TeeAlertSink(LoggingAlertSink(), _OkSink())],
+    ids=["ok", "tee_local_plus_live_webhook"],
+)
+def test_item4_stale_window_allows_when_alert_really_delivered(
+    tmp_path: Path, sink: object
+) -> None:
+    assert _stale_window_probe(tmp_path, sink).veto_reason() is None
+
+
+def test_item4_delivery_failure_then_recovery_reopens_the_window(tmp_path: Path) -> None:
+    sink = _Sink(down=True)
+    probe = _stale_window_probe(tmp_path, sink)
+    assert probe.veto_reason() == lsp.REASON_STALE
+
+    sink.down = False
+    probe.probe_once()
+
+    assert probe.veto_reason() is None
+
+
+# -- item 5: alert hygiene -----------------------------------------------------
+
+
+def test_item5_fail_alert_flag_set_only_after_delivery_and_retried(tmp_path: Path) -> None:
+    sink = _Sink(down=True)
+    probe, path, _s, _ = _probe(tmp_path, sink=sink)
+    _write_artefact(path, verdict="FAIL")
+    probe.probe_once()
+    assert sink.payloads == []
+
+    sink.down = False
+    probe.probe_once()
+    probe.probe_once()
+
+    assert [p.event for p in sink.payloads] == ["FQ_LOSS_STOP_FAIL"]  # retried once, then quiet
+
+
+def test_item5_unknown_alert_day_set_only_after_delivery_and_retried(tmp_path: Path) -> None:
+    sink = _Sink(down=True)
+    probe, _path, _s, _ = _probe(tmp_path, sink=sink, live_unhalted=False)
+    probe.probe_once()
+    assert sink.payloads == []
+
+    sink.down = False
+    probe.probe_once()
+    probe.probe_once()
+
+    assert [p.event for p in sink.payloads] == ["FQ_LOSS_STOP_UNKNOWN"]
+
+
+def test_item5_second_failure_path_logs_with_traceback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    probe, _path, _s, _ = _probe(tmp_path)
+
+    def _boom(*_a: object, **_k: object) -> Verdict:
+        raise RuntimeError("settle exploded")
+
+    probe._settle = _boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR, logger=lsp.logger.name):
+        assert probe.probe_once() is Verdict.UNKNOWN
+
+    assert probe.veto_reason() == lsp.REASON_UNKNOWN
+    assert [r for r in caplog.records if r.exc_info], "second failure must log a traceback"
+
+
+def test_item5_probe_once_logs_with_exc_info(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    def _bad_clock() -> datetime:
+        raise RuntimeError("clock exploded")
+
+    probe = LossStopProbe(
+        path=tmp_path / "x.json",
+        clock=_bad_clock,
+        set_family_halted=_Halts(),
+        alert_sink=_Sink(),
+        alert_every_probe=lambda: False,
+        expected_uid=os.getuid(),
+    )
+    with caplog.at_level(logging.ERROR, logger=lsp.logger.name):
+        probe.probe_once()
+
+    assert any(r.exc_info and "clock exploded" in str(r.exc_info[1]) for r in caplog.records)
+
+
+def test_item5_guarded_branch_logs_the_exception(caplog: pytest.LogCaptureFixture) -> None:
+    composed = FqComposedVeto(halt_veto=_Spy(), loss_stop_veto=_Spy(raises=True))
+    with caplog.at_level(logging.ERROR, logger=lsp.logger.name):
+        assert composed() == lsp.REASON_LOSS_UNREADABLE
+
+    assert any(r.exc_info for r in caplog.records)
+
+
+# -- item 6: a forged future as_of cannot lock out later legitimate files ------
+
+
+def test_item6_future_as_of_rejected_and_does_not_lock_out_a_later_legit_file(
+    tmp_path: Path,
+) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path, as_of=_NOW + timedelta(days=3))
+    assert probe.probe_once() is Verdict.UNKNOWN
+    assert probe._last_as_of is None
+
+    _write_artefact(path, as_of=_NOW - timedelta(hours=1))
+
+    assert probe.probe_once() is Verdict.PASS
+    assert probe.veto_reason() is None
+
+
+def test_item6_last_as_of_only_advances_on_an_accepted_artefact(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path, as_of=_NOW - timedelta(hours=2), mode=0o666)  # rejected: mode
+    assert probe.probe_once() is Verdict.UNKNOWN
+
+    assert probe._last_as_of is None
+
+
+# -- item 7: TOCTOU-safe reads --------------------------------------------------
+
+
+def test_item7_symlinked_artefact_is_refused(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    real = tmp_path / "elsewhere" / "real.json"
+    _write_artefact(real)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(real)
+
+    assert probe.probe_once() is Verdict.UNKNOWN
+    assert probe.veto_reason() == lsp.REASON_UNKNOWN
+
+
+def test_item7_group_writable_parent_directory_is_refused(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path)
+    path.parent.chmod(0o775)
+
+    assert probe.probe_once() is Verdict.UNKNOWN
+
+
+def test_item7_other_writable_parent_directory_is_refused(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path)
+    path.parent.chmod(0o757)
+
+    assert probe.probe_once() is Verdict.UNKNOWN
+
+
+def test_item7_parent_directory_owned_by_someone_else_is_refused(tmp_path: Path) -> None:
+    _probe_unused, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path)
+    # the file's owner matches, the directory's does not: only possible by faking the uid
+    # the probe was told to expect for the directory check
+    with pytest.raises(lsp._ArtefactError):
+        lsp._read_guarded(path, expected_uid=os.getuid(), now=_NOW, dir_uid=os.getuid() + 1)
+
+
+def test_item7_fifo_artefact_is_refused_without_blocking(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    assert probe.probe_once() is Verdict.UNKNOWN
+
+
+def test_item7_read_uses_the_opened_descriptor_for_fstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "d" / "a.json"
+    _write_artefact(path)
+    calls: list[str] = []
+    real_fstat = os.fstat
+
+    def _spy_fstat(fd: int) -> os.stat_result:
+        calls.append("fstat")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(os, "fstat", _spy_fstat)
+
+    lsp._read_guarded(path, expected_uid=os.getuid(), now=_NOW)
+
+    assert calls == ["fstat"]
+
+
+# -- item 8: parity file reads live on the timer ----------------------------------
+
+
+def _write_parity_files(
+    root: Path, *, n: int = PARITY_N_PAR, verdict: str = "PASS", age_h: float = 1.0
+) -> None:
+    count = parity_fill_count_path(root)
+    count.parent.mkdir(parents=True, exist_ok=True)
+    count.parent.chmod(0o755)
+    count.write_text(
+        json.dumps({"schema": lsp.FILL_COUNT_SCHEMA, "subject": PARITY_SUBJECT, "n_live_fills": n})
+    )
+    count.chmod(0o600)
+    as_of = (_NOW - timedelta(hours=age_h)).isoformat().replace("+00:00", "Z")
+    parity_verdict_path(root).write_text(
+        json.dumps(
+            {
+                "schema": lsp.PARITY_SCHEMA,
+                "subject": PARITY_SUBJECT,
+                "family_id": _FAMILY,
+                "verdict": verdict,
+                "as_of": as_of,
+            }
+        )
+    )
+    parity_verdict_path(root).chmod(0o600)
+
+
+def _file_parity(
+    tmp_path: Path,
+) -> tuple[ParityGate, lsp.ParityFileCache, Path, list[datetime]]:
+    root = tmp_path / "catalog"
+    clock = [_NOW]
+    cache = lsp.ParityFileCache(root, clock=lambda: clock[0], expected_uid=os.getuid())
+    gate = lsp.make_file_parity_gate(family_id=_FAMILY, clock=lambda: clock[0], cache=cache)
+    return gate, cache, root, clock
+
+
+def test_item8_parity_veto_before_first_refresh_refuses(tmp_path: Path) -> None:
+    gate, _cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root)
+
+    assert gate.veto_reason() == "fq_parity_fill_count_unreadable"
+
+
+def test_item8_parity_veto_path_does_no_file_io(tmp_path: Path) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root)
+    cache.refresh()
+    assert gate.veto_reason() is None
+    parity_verdict_path(root).unlink()
+    parity_fill_count_path(root).unlink()
+
+    assert gate.veto_reason() is None  # the cache answers; no read happened
+
+
+def test_item8_parity_refresh_picks_up_a_fail_and_latches(tmp_path: Path) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root)
+    cache.refresh()
+    assert gate.veto_reason() is None
+
+    _write_parity_files(root, verdict="FAIL")
+    cache.refresh()
+
+    assert gate.veto_reason() == "fq_parity_fail"
+    _write_parity_files(root, verdict="PASS")
+    cache.refresh()
+    assert gate.veto_reason() == "fq_parity_fail"
+
+
+def test_item8_parity_deadman_refuses_when_the_timer_stops(tmp_path: Path) -> None:
+    gate, cache, root, clock = _file_parity(tmp_path)
+    _write_parity_files(root, n=PARITY_N_PAR - 1)  # below N_PAR: no veto while live
+    cache.refresh()
+    assert gate.veto_reason() is None
+
+    clock[0] = _NOW + timedelta(seconds=_DEADMAN_S + 1)
+
+    assert gate.veto_reason() == "fq_parity_fill_count_unreadable"
+    cache.refresh()
+    assert gate.veto_reason() is None
+
+
+def test_item8_parity_unreadable_file_refuses_and_logs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate, cache, root, _ = _file_parity(tmp_path)
+    _write_parity_files(root)
+    parity_fill_count_path(root).write_text("{not json")
+    parity_fill_count_path(root).chmod(0o600)
+
+    with caplog.at_level(logging.ERROR, logger=lsp.logger.name):
+        cache.refresh()
+
+    assert gate.veto_reason() == "fq_parity_fill_count_unreadable"
+    assert any(r.exc_info for r in caplog.records)
+
+
+def test_item8_parity_cache_is_one_frozen_snapshot(tmp_path: Path) -> None:
+    _gate, cache, _root, _ = _file_parity(tmp_path)
+
+    assert lsp._ParitySnapshot.__dataclass_params__.frozen  # type: ignore[attr-defined]
+    assert isinstance(cache._state, lsp._ParitySnapshot)
+
+
+def test_item8_actor_timer_refreshes_probe_and_parity_cache(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path)
+    refreshed: list[str] = []
+    actor = lsp.LossStopProbeActor(probe, refreshers=(lambda: refreshed.append("parity"),))
+
+    actor._on_timer(None)
+
+    assert probe.veto_reason() is None
+    assert refreshed == ["parity"]
+
+
+def test_item8_actor_timer_survives_a_raising_refresher(tmp_path: Path) -> None:
+    probe, path, _s, _ = _probe(tmp_path)
+    _write_artefact(path)
+
+    def _boom() -> None:
+        raise RuntimeError("refresh")
+
+    actor = lsp.LossStopProbeActor(probe, refreshers=(_boom,))
+
+    actor._on_timer(None)
+
+    assert probe.veto_reason() is None
+
+
+# -- item 10: halt branch guard --------------------------------------------------
+
+
+def test_item10_halt_veto_raising_refuses() -> None:
+    composed = FqComposedVeto(halt_veto=_Spy(raises=True), loss_stop_veto=_Spy())
+
+    assert composed() == lsp.REASON_HALT_UNREADABLE
+
+
+def test_item10_halt_veto_raising_still_evaluates_the_other_branches() -> None:
+    loss = _Spy("fq_loss_stop_fail")
+    composed = FqComposedVeto(halt_veto=_Spy(raises=True), loss_stop_veto=loss)
+
+    assert composed() == lsp.REASON_HALT_UNREADABLE
+    assert loss.calls == 1
+
+
+def test_item10_halt_reason_still_comes_first_when_it_does_not_raise() -> None:
+    composed = FqComposedVeto(halt_veto=_Spy("family_halt"), loss_stop_veto=_Spy(raises=True))
+
+    assert composed() == "family_halt"

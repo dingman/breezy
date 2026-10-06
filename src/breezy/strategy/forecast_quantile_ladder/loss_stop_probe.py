@@ -36,18 +36,22 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import stat
 from collections import Counter
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from nautilus_trader.common.actor import Actor
 
-from breezy.runtime.health import AlertPayload, AlertSink
+from breezy.runtime.health import AlertPayload, AlertSink, LoggingAlertSink, TeeAlertSink
+
+if TYPE_CHECKING:
+    from nautilus_trader.common.component import TimeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,10 @@ MAX_AGE_H: Final[int] = 26
 STALE_VETO_H: Final[int] = 36
 
 PROBE_INTERVAL_SECONDS: Final[int] = 300
+#: Deadman: a cached verdict whose last successful probe settle is older than
+#: this many probe intervals is no longer trusted (a dead timer must refuse).
+DEADMAN_INTERVALS: Final[int] = 3
+_MAX_ARTEFACT_BYTES: Final[int] = 1 << 20
 _FUTURE_SKEW: Final[timedelta] = timedelta(minutes=5)
 _UNSAFE_MODE_BITS: Final[int] = stat.S_IWGRP | stat.S_IWOTH
 _SITE: Final[str] = "fq_loss_stop_probe"
@@ -76,6 +84,8 @@ _HALT_REASON: Final[str] = "fq_loss_stop"
 
 REASON_FAIL: Final[str] = "fq_loss_stop_fail"
 REASON_UNKNOWN: Final[str] = "fq_loss_stop_unknown"
+REASON_PROBE_STALE: Final[str] = "fq_loss_stop_probe_stale"
+REASON_HALT_UNREADABLE: Final[str] = "fq_halt_veto_unreadable"
 REASON_STALE: Final[str] = "fq_loss_stop_stale"
 REASON_LOSS_UNREADABLE: Final[str] = "fq_loss_stop_unreadable"
 REASON_PARITY_UNREADABLE: Final[str] = "fq_parity_unreadable"
@@ -126,27 +136,95 @@ def _utc(text: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _read_guarded(
-    path: Path, *, expected_uid: int, now: datetime
-) -> tuple[dict[str, Any], datetime]:
-    """Owner, mode and mtime checked; returns the parsed object and its mtime."""
+def _deadman_window() -> timedelta:
+    return timedelta(seconds=DEADMAN_INTERVALS * PROBE_INTERVAL_SECONDS)
+
+
+def _check_parent_dir(path: Path, *, dir_uid: int) -> None:
+    """The directory must be ours and not group/other writable (no rename-over)."""
     try:
-        info = path.stat()
+        info = os.stat(path.parent)
     except FileNotFoundError as exc:
         raise _ArtefactError("missing") from exc
-    if not stat.S_ISREG(info.st_mode):
-        raise _ArtefactError("not a regular file")
-    if info.st_uid != expected_uid:
-        raise _ArtefactError("wrong owner")
+    if not stat.S_ISDIR(info.st_mode):
+        raise _ArtefactError("parent is not a directory")
+    if info.st_uid != dir_uid:
+        raise _ArtefactError("parent directory wrong owner")
     if info.st_mode & _UNSAFE_MODE_BITS:
-        raise _ArtefactError("group/other writable")
-    mtime = datetime.fromtimestamp(info.st_mtime, tz=UTC)
-    if mtime > now + _FUTURE_SKEW:
-        raise _ArtefactError("mtime in the future")
-    body = json.loads(path.read_text())
+        raise _ArtefactError("parent directory group/other writable")
+
+
+def _read_guarded(
+    path: Path, *, expected_uid: int, now: datetime, dir_uid: int | None = None
+) -> tuple[dict[str, Any], datetime]:
+    """Owner, mode and mtime checked ON THE OPENED DESCRIPTOR; returns body and mtime.
+
+    ``O_NOFOLLOW`` refuses a symlink; ``O_NONBLOCK`` keeps a FIFO from hanging
+    the open. Every check uses ``fstat`` of the fd that is then read, so the
+    path cannot be swapped between check and use.
+    """
+    _check_parent_dir(path, dir_uid=expected_uid if dir_uid is None else dir_uid)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError as exc:
+        raise _ArtefactError("missing") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _ArtefactError("not a regular file")
+        if info.st_uid != expected_uid:
+            raise _ArtefactError("wrong owner")
+        if info.st_mode & _UNSAFE_MODE_BITS:
+            raise _ArtefactError("group/other writable")
+        mtime = datetime.fromtimestamp(info.st_mtime, tz=UTC)
+        if mtime > now + _FUTURE_SKEW:
+            raise _ArtefactError("mtime in the future")
+        raw = os.read(fd, _MAX_ARTEFACT_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > _MAX_ARTEFACT_BYTES:
+        raise _ArtefactError("artefact too large")
+    body = json.loads(raw.decode())
     if not isinstance(body, dict):
         raise _ArtefactError("not an object")
     return body, mtime
+
+
+# --------------------------------------------------------------------------
+# alert delivery
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Delivery:
+    """``emitted``: no sink branch raised/refused. ``off_box``: something beyond
+    the local log took it. A detector without delivery is not a control."""
+
+    emitted: bool
+    off_box: bool
+
+
+def _emit_branch(sink: AlertSink, payload: AlertPayload) -> bool:
+    try:
+        # the protocol returns None; a sink that reports failure by returning
+        # False is honoured too (hence the Any hop).
+        emit: Callable[[AlertPayload], Any] = sink.emit
+        result = emit(payload)
+    except Exception:
+        logger.exception("fq loss-stop alert sink branch failed event=%s", payload.event)
+        return False
+    return result is not False
+
+
+def _deliver(sink: AlertSink, payload: AlertPayload) -> _Delivery:
+    """Emit and OBSERVE the outcome (``TeeAlertSink.emit`` itself swallows branch errors)."""
+    if isinstance(sink, TeeAlertSink):
+        outcomes = [(_deliver(branch, payload)) for branch in sink.sinks]
+        return _Delivery(
+            emitted=any(o.emitted for o in outcomes), off_box=any(o.off_box for o in outcomes)
+        )
+    ok = _emit_branch(sink, payload)
+    return _Delivery(emitted=ok, off_box=ok and not isinstance(sink, LoggingAlertSink))
 
 
 # --------------------------------------------------------------------------
@@ -154,8 +232,24 @@ def _read_guarded(
 # --------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    """The WHOLE cached state, published by a single assignment.
+
+    ``anchor`` is ``min(as_of, mtime)`` of the last accepted artefact (staleness
+    is re-derived from it at veto time); ``settled_at`` is the clock reading at
+    the last probe settle (the deadman); ``alert_delivered`` says the CRITICAL
+    alert for this probe left the box.
+    """
+
+    verdict: Verdict
+    anchor: datetime | None = None
+    settled_at: datetime | None = None
+    alert_delivered: bool = False
+
+
 class LossStopProbe:
-    """Reads the artefact, caches one :class:`Verdict`; the veto reads the cache only."""
+    """Reads the artefact, caches one :class:`_Snapshot`; the veto reads it only."""
 
     def __init__(
         self,
@@ -173,24 +267,27 @@ class LossStopProbe:
         self._alert_sink = alert_sink
         self._alert_every_probe = alert_every_probe
         self._expected_uid = expected_uid
-        self._cache: Verdict = Verdict.UNKNOWN
-        self._stale_veto = False
+        self._state: _Snapshot = _Snapshot(Verdict.UNKNOWN)
         self._last_as_of: datetime | None = None
         self._halt_set = False
         self._fail_alerted = False
-        self._unknown_alert_day: object | None = None
+        self._unknown_alert_day: date | None = None
         self.counters: Counter[str] = Counter()
 
-    # -- the veto: cache only, no I/O -------------------------------------
+    # -- the veto: one snapshot read, no I/O ---------------------------------
 
     def veto_reason(self) -> str | None:
-        if self._cache is Verdict.PASS:
-            return None
-        if self._cache is Verdict.FAIL:
+        state = self._state  # the ONLY mutable read; everything below is derived from it
+        if state.verdict is Verdict.FAIL:
             return REASON_FAIL
-        if self._cache is Verdict.UNKNOWN_STALE:
-            return REASON_STALE if self._stale_veto else None
-        return REASON_UNKNOWN
+        if state.verdict is Verdict.UNKNOWN:
+            return REASON_UNKNOWN
+        try:
+            now = self._clock()
+        except Exception:
+            logger.exception("fq loss-stop veto could not read the clock")
+            return REASON_UNKNOWN
+        return _derive_veto(state, now)
 
     # -- the probe ----------------------------------------------------------
 
@@ -198,38 +295,44 @@ class LossStopProbe:
         """Evaluate, cache, alert, halt on FAIL. Never raises."""
         try:
             return self._probe()
-        except Exception as exc:  # noqa: BLE001 - any failure is UNKNOWN, never PASS
-            logger.error("fq loss-stop probe failed: %s", type(exc).__name__)
+        except Exception as exc:
+            logger.exception("fq loss-stop probe failed: %s", type(exc).__name__)
             return self._fail_unknown(f"probe_exception:{type(exc).__name__}")
 
     def _fail_unknown(self, detail: str) -> Verdict:
-        """UNKNOWN even when alerting itself raises (e.g. a broken clock)."""
+        """UNKNOWN even when settling itself raises; NEVER moves out of FAIL."""
+        if self._state.verdict is Verdict.FAIL:
+            return Verdict.FAIL
         try:
-            return self._settle(Verdict.UNKNOWN, detail=detail)
-        except Exception:  # noqa: BLE001 - the cache must still read UNKNOWN
-            self._cache = Verdict.UNKNOWN
-            self._stale_veto = False
+            return self._settle(Verdict.UNKNOWN, detail=detail, now=None)
+        except Exception:
+            logger.exception("fq loss-stop settle failed; forcing UNKNOWN")
+            self._state = _Snapshot(Verdict.UNKNOWN)
             self.counters["unknown"] += 1
             return Verdict.UNKNOWN
 
     def _probe(self) -> Verdict:
-        if self._cache is Verdict.FAIL:
+        if self._state.verdict is Verdict.FAIL:
             self.counters["fail_latched"] += 1
-            self._ensure_halt()
+            self._on_fail()
             return Verdict.FAIL
         now = self._clock()
         try:
             verdict, as_of, mtime = self._evaluate(now)
         except (_ArtefactError, ValueError, KeyError, TypeError, OSError) as exc:
-            return self._settle(Verdict.UNKNOWN, detail=f"input_{type(exc).__name__}:{exc}")
+            return self._settle(
+                Verdict.UNKNOWN, detail=f"input_{type(exc).__name__}:{exc}", now=now
+            )
+        self._last_as_of = as_of  # only an ACCEPTED artefact advances the monotonic bound
+        anchor = min(as_of, mtime)
         if verdict is Verdict.FAIL:
-            return self._settle(Verdict.FAIL, detail="loss stop FAIL")
-        age_h = (now - min(as_of, mtime)).total_seconds() / 3600
+            return self._settle(Verdict.FAIL, detail="loss stop FAIL", now=now, anchor=anchor)
+        age_h = (now - anchor).total_seconds() / 3600
         if age_h > MAX_AGE_H:
             return self._settle(
-                Verdict.UNKNOWN_STALE, detail=f"age_h={age_h:.1f}", stale_veto=age_h > STALE_VETO_H
+                Verdict.UNKNOWN_STALE, detail=f"age_h={age_h:.1f}", now=now, anchor=anchor
             )
-        return self._settle(Verdict.PASS, detail="")
+        return self._settle(Verdict.PASS, detail="", now=now, anchor=anchor)
 
     def _evaluate(self, now: datetime) -> tuple[Verdict, datetime, datetime]:
         body, mtime = _read_guarded(self._path, expected_uid=self._expected_uid, now=now)
@@ -245,78 +348,117 @@ class LossStopProbe:
         if not hmac.compare_digest(str(body["digest"]), expected):
             raise _ArtefactError("digest mismatch")
         as_of = _utc(as_of_text)
-        if as_of > now + _FUTURE_SKEW:
+        if as_of > now + _FUTURE_SKEW:  # rejected BEFORE any bound is recorded
             raise _ArtefactError("as_of in the future")
         if self._last_as_of is not None and as_of < self._last_as_of:
             raise _ArtefactError("as_of went backwards")
-        self._last_as_of = as_of
         return Verdict(verdict_text), as_of, mtime
 
-    def _settle(self, verdict: Verdict, *, detail: str, stale_veto: bool = False) -> Verdict:
-        self._cache = verdict
-        self._stale_veto = stale_veto
+    def _settle(
+        self,
+        verdict: Verdict,
+        *,
+        detail: str,
+        now: datetime | None,
+        anchor: datetime | None = None,
+    ) -> Verdict:
+        """Publish ONE snapshot, then run side effects; nothing after can undo it."""
+        if self._state.verdict is Verdict.FAIL:
+            return Verdict.FAIL  # the latch: no settle ever leaves FAIL
+        self._state = _Snapshot(verdict, anchor=anchor, settled_at=now)
         self.counters[verdict.value.lower()] += 1
+        try:
+            self._side_effects(verdict, detail)
+        except Exception:
+            logger.exception("fq loss-stop settle side effects failed verdict=%s", verdict.value)
+        return verdict
+
+    def _side_effects(self, verdict: Verdict, detail: str) -> None:
         if verdict is Verdict.PASS:
             self._unknown_alert_day = None
         elif verdict is Verdict.FAIL:
             self._on_fail()
         elif verdict is Verdict.UNKNOWN_STALE:
-            self._alert("FQ_LOSS_STOP_STALE", detail)
-        elif self._should_alert_unknown():
-            self._alert("FQ_LOSS_STOP_UNKNOWN", detail)
-        return verdict
+            delivery = self._alert("FQ_LOSS_STOP_STALE", detail)
+            # re-publish ONCE, atomically, with the delivery outcome
+            self._state = replace(self._state, alert_delivered=delivery.off_box)
+        elif self._should_alert_unknown() and self._alert("FQ_LOSS_STOP_UNKNOWN", detail).emitted:
+            self._unknown_alert_day = self._clock().date()
 
     def _should_alert_unknown(self) -> bool:
-        today = self._clock().date()
-        if self._alert_every_probe() or self._unknown_alert_day != today:
-            self._unknown_alert_day = today
-            return True
-        return False
+        return self._alert_every_probe() or self._unknown_alert_day != self._clock().date()
 
     def _on_fail(self) -> None:
         if not self._fail_alerted:
-            self._fail_alerted = True
-            self._alert("FQ_LOSS_STOP_FAIL", "loss stop FAIL: family halt requested")
+            delivery = self._alert("FQ_LOSS_STOP_FAIL", "loss stop FAIL: family halt requested")
+            self._fail_alerted = delivery.emitted
         self._ensure_halt()
 
     def _ensure_halt(self) -> None:
         """Set-only; retried each probe until it takes. The veto holds regardless."""
         if self._halt_set:
             return
-        evidence = hashlib.sha256(f"{_HALT_REASON}:{self._last_as_of}".encode()).hexdigest()
         try:
+            evidence = hashlib.sha256(f"{_HALT_REASON}:{self._last_as_of}".encode()).hexdigest()
             self._set_family_halted(_HALT_REASON, evidence)
-        except Exception as exc:  # noqa: BLE001 - the FAIL veto still applies
+        except Exception as exc:
+            logger.exception("fq loss-stop family halt could not be set")
             self._alert("FQ_LOSS_STOP_HALT_SET_FAILED", type(exc).__name__)
             return
         self._halt_set = True
 
-    def _alert(self, event: str, detail: str) -> None:
-        payload = AlertPayload(severity="CRITICAL", event=event, site=_SITE, detail=detail)
+    def _alert(self, event: str, detail: str) -> _Delivery:
         try:
-            self._alert_sink.emit(payload)
-        except Exception as exc:  # noqa: BLE001 - a dead sink must never lift the veto
+            payload = AlertPayload(severity="CRITICAL", event=event, site=_SITE, detail=detail)
+            delivery = _deliver(self._alert_sink, payload)
+        except Exception:
+            logger.exception("fq loss-stop alert could not be built or sent event=%s", event)
+            delivery = _Delivery(emitted=False, off_box=False)
+        if not delivery.emitted:
             self.counters["alert_delivery_failed"] += 1
-            logger.error("fq loss-stop alert undelivered event=%s: %s", event, type(exc).__name__)
+            logger.error("fq loss-stop alert undelivered event=%s", event)
+        return delivery
+
+
+def _derive_veto(state: _Snapshot, now: datetime) -> str | None:
+    """PASS / UNKNOWN_STALE, re-derived at veto time from the cached anchor and deadman."""
+    if state.settled_at is None or state.anchor is None:
+        return REASON_UNKNOWN
+    if now - state.settled_at > _deadman_window():
+        return REASON_PROBE_STALE  # the probe timer is dead: do not trust the cache
+    age_h = (now - state.anchor).total_seconds() / 3600
+    if age_h > STALE_VETO_H:
+        return REASON_STALE
+    if age_h > MAX_AGE_H:
+        # entries only while THIS probe's CRITICAL alert actually left the box
+        if state.verdict is Verdict.UNKNOWN_STALE and state.alert_delivered:
+            return None
+        return REASON_STALE
+    return None
 
 
 class LossStopProbeActor(Actor):
-    """Runs :meth:`LossStopProbe.probe_once` on a timer. The veto never waits on it."""
+    """Runs the probe (and any parity refreshers) on a timer. The veto never waits on it."""
 
     _TIMER_NAME: Final = "fq-loss-stop-probe-timer"
 
     def __init__(
-        self, probe: LossStopProbe, *, interval_seconds: int = PROBE_INTERVAL_SECONDS
+        self,
+        probe: LossStopProbe,
+        *,
+        interval_seconds: int = PROBE_INTERVAL_SECONDS,
+        refreshers: Sequence[Callable[[], object]] = (),
     ) -> None:
         super().__init__()
         if interval_seconds <= 0:
             raise ValueError("`interval_seconds` must be positive")
         self._probe = probe
+        self._refreshers = tuple(refreshers)
         self._interval_seconds = interval_seconds
         self._timer_armed = False
 
     def on_start(self) -> None:
-        self._probe.probe_once()
+        self._run_once()
         self.clock.set_timer(
             name=self._TIMER_NAME,
             interval=timedelta(seconds=self._interval_seconds),
@@ -329,8 +471,16 @@ class LossStopProbeActor(Actor):
             self.clock.cancel_timer(self._TIMER_NAME)
             self._timer_armed = False
 
-    def _on_timer(self, event: object) -> None:
+    def _on_timer(self, event: TimeEvent) -> None:
+        self._run_once()
+
+    def _run_once(self) -> None:
         self._probe.probe_once()
+        for refresh in self._refreshers:
+            try:
+                refresh()
+            except Exception:
+                logger.exception("fq parity refresh failed")
 
 
 # --------------------------------------------------------------------------
@@ -347,7 +497,12 @@ class ParityVerdict:
 
 
 class ParityGate:
-    """Refuses on an accepted parity FAIL; the refusal latches for the process."""
+    """Refuses on an accepted parity FAIL; the refusal latches for the process.
+
+    The readers are injected; in production they answer from a
+    :class:`ParityFileCache` refreshed on the actor timer, so this veto path
+    does no file I/O.
+    """
 
     def __init__(
         self,
@@ -375,6 +530,9 @@ class ParityGate:
         n = self._read_count()
         if n is None:
             return "fq_parity_fill_count_unreadable"
+        # FQ-R spec (F5-pinned single look): below N_PAR live fills the parity
+        # look is not yet defined, so there is NO parity veto. Deliberate; do
+        # not "fix" this into a refusal without a ruling.
         if n < self._n_par:
             return None
         return self._judge(self._read_verdict())
@@ -382,14 +540,16 @@ class ParityGate:
     def _read_count(self) -> int | None:
         try:
             n = self._fill_count_reader()
-        except Exception:  # noqa: BLE001 - unreadable refuses
+        except Exception:
+            logger.exception("fq parity fill-count reader failed")
             return None
         return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
 
     def _read_verdict(self) -> ParityVerdict | None:
         try:
             return self._verdict_reader()
-        except Exception:  # noqa: BLE001 - unreadable refuses
+        except Exception:
+            logger.exception("fq parity verdict reader failed")
             return None
 
     def _judge(self, v: ParityVerdict | None) -> str | None:
@@ -412,20 +572,65 @@ class ParityGate:
         return "fq_parity_unavailable"
 
 
-def make_file_parity_gate(
-    catalog_root: Path,
-    *,
-    family_id: str,
-    clock: Callable[[], datetime],
-    expected_uid: int,
-) -> ParityGate:
-    """The production :class:`ParityGate` over the guarded ``derived/fq-parity`` files."""
-    verdict_path = parity_verdict_path(catalog_root)
-    count_path = parity_fill_count_path(catalog_root)
+@dataclass(frozen=True, slots=True)
+class _ParitySnapshot:
+    """Both parity inputs plus the refresh time, published by ONE assignment."""
 
-    def _verdict() -> ParityVerdict | None:
+    count: int | None = None
+    verdict: ParityVerdict | None = None
+    settled_at: datetime | None = None
+
+
+class ParityFileCache:
+    """Guarded ``derived/fq-parity`` reads, done on the actor timer only.
+
+    ``count()`` / ``verdict()`` answer from one frozen snapshot with the same
+    deadman as the loss-stop probe: never refreshed, or last refreshed more
+    than ``DEADMAN_INTERVALS`` probe intervals ago, reads as unreadable (the
+    gate then refuses).
+    """
+
+    def __init__(
+        self, catalog_root: Path, *, clock: Callable[[], datetime], expected_uid: int
+    ) -> None:
+        self._verdict_path = parity_verdict_path(catalog_root)
+        self._count_path = parity_fill_count_path(catalog_root)
+        self._clock = clock
+        self._expected_uid = expected_uid
+        self._state: _ParitySnapshot = _ParitySnapshot()
+
+    def refresh(self) -> None:
+        """Re-read both files. Never raises; unreadable inputs cache as ``None``."""
         try:
-            body, _mtime = _read_guarded(verdict_path, expected_uid=expected_uid, now=clock())
+            now = self._clock()
+            count = self._read_count(now)
+            verdict = self._read_verdict(now)
+            self._state = _ParitySnapshot(count=count, verdict=verdict, settled_at=now)
+        except Exception:
+            logger.exception("fq parity cache refresh failed")
+
+    def count(self) -> int | None:
+        state = self._state
+        return state.count if self._live(state) else None
+
+    def verdict(self) -> ParityVerdict | None:
+        state = self._state
+        return state.verdict if self._live(state) else None
+
+    def _live(self, state: _ParitySnapshot) -> bool:
+        if state.settled_at is None:
+            return False
+        try:
+            return self._clock() - state.settled_at <= _deadman_window()
+        except Exception:
+            logger.exception("fq parity cache could not read the clock")
+            return False
+
+    def _read_verdict(self, now: datetime) -> ParityVerdict | None:
+        try:
+            body, _mtime = _read_guarded(
+                self._verdict_path, expected_uid=self._expected_uid, now=now
+            )
             if body.get("schema") != PARITY_SCHEMA:
                 return None
             return ParityVerdict(
@@ -435,26 +640,33 @@ def make_file_parity_gate(
                 as_of=_utc(str(body["as_of"])),
             )
         except (_ArtefactError, ValueError, KeyError, TypeError, OSError):
+            logger.exception("fq parity verdict file unreadable")
             return None
 
-    def _count() -> int | None:
+    def _read_count(self, now: datetime) -> int | None:
         try:
-            body, _mtime = _read_guarded(count_path, expected_uid=expected_uid, now=clock())
+            body, _mtime = _read_guarded(self._count_path, expected_uid=self._expected_uid, now=now)
             if body.get("schema") != FILL_COUNT_SCHEMA or body.get("subject") != PARITY_SUBJECT:
                 return None
             n = body["n_live_fills"]
             return n if isinstance(n, int) else None
         except (_ArtefactError, ValueError, KeyError, TypeError, OSError):
+            logger.exception("fq parity fill-count file unreadable")
             return None
 
+
+def make_file_parity_gate(
+    *, family_id: str, clock: Callable[[], datetime], cache: ParityFileCache
+) -> ParityGate:
+    """The production :class:`ParityGate` over a timer-refreshed :class:`ParityFileCache`."""
     return ParityGate(
         subject=PARITY_SUBJECT,
         family_id=family_id,
         n_par=PARITY_N_PAR,
         stale_parity_h=STALE_PARITY_H,
         clock=clock,
-        fill_count_reader=_count,
-        verdict_reader=_verdict,
+        fill_count_reader=cache.count,
+        verdict_reader=cache.verdict,
     )
 
 
@@ -468,7 +680,8 @@ class FqComposedVeto:
 
     Every branch is evaluated on every call; the first non-``None`` reason in
     that order is returned, so wherever the old halt veto refused this refuses
-    with the SAME reason. A loss-stop or parity branch that raises refuses.
+    with the SAME reason. Any branch that raises refuses (a raising halt branch
+    refuses with its own reason; the other branches are still evaluated).
     """
 
     def __init__(
@@ -483,7 +696,7 @@ class FqComposedVeto:
         self._parity_veto = parity_veto
 
     def __call__(self) -> str | None:
-        halt = self._halt_veto()
+        halt = _guarded(self._halt_veto, REASON_HALT_UNREADABLE)
         loss = _guarded(self._loss_stop_veto, REASON_LOSS_UNREADABLE)
         parity = (
             None
@@ -499,5 +712,6 @@ class FqComposedVeto:
 def _guarded(branch: Callable[[], str | None], on_error: str) -> str | None:
     try:
         return branch()
-    except Exception:  # noqa: BLE001 - an unreadable branch refuses
+    except Exception:
+        logger.exception("fq composed veto branch raised; refusing with %s", on_error)
         return on_error

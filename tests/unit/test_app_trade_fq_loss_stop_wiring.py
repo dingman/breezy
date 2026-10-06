@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import ast
 import io
-import json
+import os
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -26,12 +25,12 @@ from breezy.runtime.settings import (
 )
 from breezy.runtime.trade_cli import EXIT_OK
 from breezy.strategy.forecast_quantile_ladder.loss_stop_probe import (
-    SCHEMA,
+    PARITY_SUBJECT,
     FqComposedVeto,
     LossStopProbeActor,
-    compute_digest,
 )
 from breezy.strategy.forecast_quantile_ladder.strategy import ForecastQuantileLadderStrategy
+from tests.support.fq_loss_stop_artefact import write_artefact
 from tests.unit.test_forecast_quantile_ladder_boot import (
     _write_d_plus_1_catalog,
     _write_forecast_quantile_ladder_manifest,
@@ -81,28 +80,13 @@ class _Node(RecordingNode):
         super().run()
 
 
-def _write_artefact(path: Path, *, verdict: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    as_of = (datetime.now(tz=UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-    path.write_text(
-        json.dumps(
-            {
-                "schema": SCHEMA,
-                "verdict": verdict,
-                "as_of": as_of,
-                "c2_hwm": "c2-1",
-                "truth_sha": "t" * 64,
-                "digest": compute_digest(
-                    verdict=verdict, as_of=as_of, c2_hwm="c2-1", truth_sha="t" * 64
-                ),
-            }
-        )
-    )
-    path.chmod(0o600)
-
-
-def _boot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, verdict: str | None) -> _Observed:
-    family_id = "pm_us_fq_f6_wiring"
+def _boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    verdict: str | None,
+    family_id: str = "pm_us_fq_f6_wiring",
+) -> _Observed:
     families_dir = tmp_path / "deploy" / "families"
     _write_forecast_quantile_ladder_manifest(families_dir, family_id=family_id, stations=_STATIONS)
     monkeypatch.chdir(tmp_path)
@@ -110,7 +94,7 @@ def _boot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, verdict: str | Non
     catalog_root.mkdir()
     _write_d_plus_1_catalog(catalog_root)
     if verdict is not None:
-        _write_artefact(tmp_path / "derived/fq-loss-stop/latest.json", verdict=verdict)
+        write_artefact(tmp_path / "derived/fq-loss-stop/latest.json", verdict=verdict)
     env = _trade_env(
         tmp_path,
         **{
@@ -164,6 +148,21 @@ def test_boot_with_fail_artefact_sets_the_halt_and_halt_reason_comes_first(
     assert obs.exec_reason == "family_halt"
 
 
+def test_boot_of_the_parity_family_wires_the_timer_refreshed_parity_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    # fresh loss-stop PASS, but no derived/fq-parity files: the parity branch
+    # (cache refreshed at boot, then on the actor timer) refuses fail closed.
+    obs = _boot(tmp_path, monkeypatch, verdict="PASS", family_id=PARITY_SUBJECT)
+
+    assert set(obs.strategy_vetoes) == {"fq_parity_fill_count_unreadable"}
+    assert obs.exec_reason == "fq_parity_fill_count_unreadable"
+    assert LossStopProbeActor in obs.actor_types
+
+
 # --------------------------------------------------------------------------
 # diff-scope guard (E-28)
 # --------------------------------------------------------------------------
@@ -193,10 +192,18 @@ def _top_level_digests(source: str) -> dict[str, str]:
     return out
 
 
-def test_f6_trade_py_changes_only_compose_fq() -> None:
+def _base_or_skip_or_fail() -> str:
+    """The merge base; when unavailable FAIL under CI / BREEZY_REQUIRE_MERGE_BASE, else skip."""
     base = _merge_base()
-    if base is None:
-        pytest.skip("no merge base available")
+    if base is not None:
+        return base
+    if os.environ.get("CI") or os.environ.get("BREEZY_REQUIRE_MERGE_BASE"):
+        pytest.fail("merge base unavailable but CI/BREEZY_REQUIRE_MERGE_BASE requires it")
+    pytest.skip("no merge base available")
+
+
+def test_f6_trade_py_changes_only_compose_fq() -> None:
+    base = _base_or_skip_or_fail()
     old = _top_level_digests(_git("show", f"{base}:{_TRADE_PY}"))
     new = _top_level_digests((_REPO / _TRADE_PY).read_text())
 
@@ -212,14 +219,45 @@ _ALLOWED_DIFF: Final[frozenset[str]] = frozenset(
         "tests/unit/test_fq_loss_stop_probe.py",
         "tests/unit/test_app_trade_fq_loss_stop_wiring.py",
         "tests/unit/test_ct12_fq_halt_through_run.py",
+        # additive widening (review fix item 10): the shared artefact helper
+        "tests/support/fq_loss_stop_artefact.py",
     }
 )
 
 
 def test_f6_diff_name_only_is_within_scope() -> None:
-    base = _merge_base()
-    if base is None:
-        pytest.skip("no merge base available")
+    base = _base_or_skip_or_fail()
     names = set(_git("diff", "--name-only", base).split())
 
     assert names <= _ALLOWED_DIFF
+
+
+@pytest.mark.parametrize("env_name", ["CI", "BREEZY_REQUIRE_MERGE_BASE"])
+def test_item9_missing_merge_base_fails_when_ci_or_require_flag_is_set(
+    monkeypatch: pytest.MonkeyPatch, env_name: str
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("BREEZY_REQUIRE_MERGE_BASE", raising=False)
+    monkeypatch.setenv(env_name, "1")
+    monkeypatch.setattr(f"{__name__}._merge_base", lambda: None)
+
+    with pytest.raises(pytest.fail.Exception):
+        _base_or_skip_or_fail()
+
+
+def test_item9_missing_merge_base_skips_when_no_flag_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("BREEZY_REQUIRE_MERGE_BASE", raising=False)
+    monkeypatch.setattr(f"{__name__}._merge_base", lambda: None)
+
+    with pytest.raises(pytest.skip.Exception):
+        _base_or_skip_or_fail()
+
+
+def test_item9_present_merge_base_is_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CI", "1")
+    monkeypatch.setattr(f"{__name__}._merge_base", lambda: "abc123")
+
+    assert _base_or_skip_or_fail() == "abc123"
