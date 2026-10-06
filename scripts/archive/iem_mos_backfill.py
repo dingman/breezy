@@ -119,6 +119,7 @@ from iem_mos_probe_transport import (
     IEM_MIN_INTERVAL_NS,
     IEM_MOS_MODEL_ORDER,
     IEM_MOS_STATION_ORDER,
+    IEM_MOS_STATIONS,
     IemMosProbeTransport,
     IemPacer,
 )
@@ -466,9 +467,11 @@ def build_plan(
     """Station-major, year-ascending work plan. One item is one request."""
     if model not in MODELS:
         raise ValueError(f"unknown model {model!r}; the closed set is {sorted(MODELS)}")
-    unknown = [station for station in stations if station not in STATIONS]
+    unknown = [station for station in stations if station not in IEM_MOS_STATIONS]
     if unknown:
-        raise ValueError(f"station(s) {unknown} are not in the closed set {list(STATIONS)}")
+        raise ValueError(
+            f"station(s) {unknown} are not in the closed set {sorted(IEM_MOS_STATIONS)}"
+        )
     if through_year < first_year:
         raise ValueError(f"through_year {through_year} precedes first_year {first_year}")
     return tuple(
@@ -495,9 +498,11 @@ def build_window_plan(
     """
     if model not in MODELS:
         raise ValueError(f"unknown model {model!r}; the closed set is {sorted(MODELS)}")
-    unknown = [station for station in stations if station not in STATIONS]
+    unknown = [station for station in stations if station not in IEM_MOS_STATIONS]
     if unknown:
-        raise ValueError(f"station(s) {unknown} are not in the closed set {list(STATIONS)}")
+        raise ValueError(
+            f"station(s) {unknown} are not in the closed set {sorted(IEM_MOS_STATIONS)}"
+        )
     plan = tuple(StationWindow(station, start, end, model) for station in stations)
     for item in plan:
         request_for(item)  # refuses a bad window before any work is planned
@@ -523,9 +528,11 @@ def build_closed_day_plan(
     """
     if model not in MODELS:
         raise ValueError(f"unknown model {model!r}; the closed set is {sorted(MODELS)}")
-    unknown = [station for station in stations if station not in STATIONS]
+    unknown = [station for station in stations if station not in IEM_MOS_STATIONS]
     if unknown:
-        raise ValueError(f"station(s) {unknown} are not in the closed set {list(STATIONS)}")
+        raise ValueError(
+            f"station(s) {unknown} are not in the closed set {sorted(IEM_MOS_STATIONS)}"
+        )
     if isinstance(lookback, bool) or not isinstance(lookback, int):
         raise TypeError("lookback must be an int")
     if not (1 <= lookback <= MAX_CLOSED_DAYS_LOOKBACK):

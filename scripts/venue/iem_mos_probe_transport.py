@@ -11,6 +11,7 @@ The budget is charged inside ``_fetch`` before the pacer and before
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 import re
 from collections.abc import Awaitable, Callable
@@ -20,8 +21,10 @@ from urllib.parse import urlencode, urlsplit
 from breezy.ingest.http import (
     FetchResult,
     HttpTransport,
+    RateLimitedError,
     RedirectError,
     _validated_path_identifier,  # internal path-segment validator; not a public HTTP API
+    redact_url,
 )
 from breezy.ingest.probe_transport import (
     SETTLEMENT_HOSTS,
@@ -31,9 +34,16 @@ from breezy.ingest.probe_transport import (
 )
 
 __all__ = [
+    "IEM_AFOS_LAV_MIN_INTERVAL_NS",
+    "IEM_AFOS_LIST_MAX_BODY_BYTES",
+    "IEM_AFOS_LIST_PATH",
+    "IEM_AFOS_PFM_MAX_BODY_BYTES",
+    "IEM_AFOS_RETRIEVE_PATH",
+    "IEM_AFOS_WFOS",
     "IEM_ALLOWED_HOSTS",
     "IEM_BASE_URL",
     "IEM_HOST",
+    "IEM_LAV_MAX_BODY_BYTES",
     "IEM_MIN_INTERVAL_NS",
     "IEM_MOS_ACCEPT",
     "IEM_MOS_MODELS",
@@ -56,14 +66,64 @@ IEM_MIN_INTERVAL_NS: Final[int] = 1_000_000_000
 IEM_MOS_ACCEPT: Final[str] = "text/csv"
 IEM_MOS_PROBE_MAX_BODY_BYTES: Final[int] = 32 * 1024 * 1024
 IEM_MOS_STATION_ORDER: Final[tuple[str, ...]] = ("KLAX", "KMDW", "KMIA", "KSFO")
-IEM_MOS_STATIONS: Final[frozenset[str]] = frozenset(IEM_MOS_STATION_ORDER)
+#: The closed MOS/LAV station SET. KNYC is widened in here only (F13-R33);
+#: `IEM_MOS_STATION_ORDER` stays the four-station default so the nightly
+#: backfill is unchanged, and KNYC runs only when named explicitly.
+IEM_MOS_STATIONS: Final[frozenset[str]] = frozenset({*IEM_MOS_STATION_ORDER, "KNYC"})
 IEM_MOS_MODEL_ORDER: Final[tuple[str, ...]] = ("NBS", "GFS")
 IEM_MOS_MODELS: Final[frozenset[str]] = frozenset(IEM_MOS_MODEL_ORDER)
 IEM_MOS_PATH: Final[str] = "/cgi-bin/request/mos.py"
+IEM_AFOS_RETRIEVE_PATH: Final[str] = "/cgi-bin/afos/retrieve.py"
+IEM_AFOS_LIST_PATH: Final[str] = "/api/1/nws/afos/list.json"
+IEM_LAV_MODEL: Final[str] = "LAV"
+
+#: PFM issuing offices for the five stations (A0-R2): OKX, LOX, LOT, MTR, MFL.
+IEM_AFOS_WFOS: Final[frozenset[str]] = frozenset({"OKX", "LOX", "LOT", "MTR", "MFL"})
+IEM_AFOS_PILS: Final[frozenset[str]] = frozenset(f"PFM{wfo}" for wfo in IEM_AFOS_WFOS)
+IEM_AFOS_MAX_LIMIT: Final[int] = 50
+
+#: A0-R1: IEM throttled at ~1.2 s between requests; 3-4 s was clean. Applies to
+#: the AFOS and LAV methods only -- `IEM_MIN_INTERVAL_NS` is unchanged.
+IEM_AFOS_LAV_MIN_INTERVAL_NS: Final[int] = 4_000_000_000
+
+#: Per-method body caps (F13 R21), each well under the MOS probe cap.
+IEM_AFOS_PFM_MAX_BODY_BYTES: Final[int] = 2 * 1024 * 1024
+IEM_AFOS_LIST_MAX_BODY_BYTES: Final[int] = 1024 * 1024
+IEM_LAV_MAX_BODY_BYTES: Final[int] = 16 * 1024 * 1024
+
+#: IEM's throttle answer (A0 probe). It is NOT data, whatever the status code.
+IEM_THROTTLE_BODY_MARKER: Final[str] = "Too many requests from your IP address"
+_THROTTLE_SCAN_CHARS: Final[int] = 512
 
 _NANOSECONDS_PER_SECOND: Final[int] = 1_000_000_000
 _STATION_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Z]{4}\Z")
 _STS_ETS_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\Z")
+
+
+def _closed_station(station: str) -> str:
+    encoded = _validated_path_identifier(
+        station,
+        name="station",
+        shape="a four-letter upper-case ICAO station id (e.g. `KMDW`), not a URL",
+        pattern=_STATION_PATTERN,
+    )
+    if station not in IEM_MOS_STATIONS:
+        raise ValueError(
+            "`station` is not in the closed MOS station set; refused rather than sanitised."
+        )
+    return encoded
+
+
+def _closed_window(sts: str, ets: str) -> None:
+    for name, value in (("sts", sts), ("ets", ets)):
+        if _STS_ETS_PATTERN.match(value) is None:
+            raise ValueError(f"`{name}` must be YYYY-MM-DDTHH:MMZ; the supplied value is refused.")
+
+
+def _closed_date(name: str, value: dt.date) -> str:
+    if not isinstance(value, dt.date) or isinstance(value, dt.datetime):
+        raise TypeError(f"`{name}` must be a `datetime.date`, was {type(value).__name__}")
+    return value.isoformat()
 
 
 def utc_stamp(clock: Callable[[], int]) -> str:
@@ -159,10 +219,13 @@ class IemPacer:
         self._min_interval_ns = min_interval_ns
         self._last_ns: int | None = None
 
-    async def wait(self) -> None:
+    async def wait(self, min_interval_ns: int | None = None) -> None:
+        """Sleep out the interval since the last request; the larger of the
+        pacer's own and ``min_interval_ns`` (a per-method floor) applies."""
         now = self._clock()
         if self._last_ns is not None:
-            residual_ns = self._min_interval_ns - (now - self._last_ns)
+            interval_ns = max(self._min_interval_ns, min_interval_ns or 0)
+            residual_ns = interval_ns - (now - self._last_ns)
             if residual_ns > 0:
                 await self._sleeper(residual_ns / _NANOSECONDS_PER_SECOND)
         self._last_ns = self._clock()
@@ -250,15 +313,88 @@ class PacedIemTransport(HttpTransport):
         if_none_match: str | None,
         if_modified_since: str | None,
         allow_not_modified: bool,
+        min_interval_ns: int | None = None,
     ) -> FetchResult:
         self._budget.consume()
-        await self._pacer.wait()
+        if min_interval_ns is None:
+            await self._pacer.wait()
+        else:
+            await self._pacer.wait(min_interval_ns)
         return await super()._fetch(
             url,
             if_none_match=if_none_match,
             if_modified_since=if_modified_since,
             allow_not_modified=allow_not_modified,
         )
+
+    # -- AFOS (PFM) and LAV: closed sets, per-method caps, A0-R1 pacing -------
+
+    async def fetch_afos_pfm(
+        self, wfo: str, *, sdate: dt.date | None = None, limit: int = 1
+    ) -> FetchResult:
+        """The latest PFM (``sdate=None``) or ascending history from ``sdate``."""
+        if wfo not in IEM_AFOS_WFOS:
+            raise ValueError("`wfo` is not in the closed PFM office set; refused.")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("`limit` must be an int")
+        if not 1 <= limit <= IEM_AFOS_MAX_LIMIT:
+            raise ValueError(f"`limit` must be in 1..{IEM_AFOS_MAX_LIMIT}")
+        params = {"pil": f"PFM{wfo}", "limit": str(limit)}
+        if sdate is not None:
+            params["sdate"] = _closed_date("sdate", sdate)
+            params["order"] = "asc"
+        params["fmt"] = "text"
+        return await self._fetch_closed(
+            f"{self._base_url}{IEM_AFOS_RETRIEVE_PATH}?{urlencode(params)}",
+            cap=IEM_AFOS_PFM_MAX_BODY_BYTES,
+            accept="text/plain",
+        )
+
+    async def fetch_afos_list(self, pil: str, date: dt.date) -> FetchResult:
+        """The day's issuance list for one closed-set PFM product."""
+        if pil not in IEM_AFOS_PILS:
+            raise ValueError("`pil` is not in the closed PFM product set; refused.")
+        query = urlencode({"pil": pil, "date": _closed_date("date", date)})
+        return await self._fetch_closed(
+            f"{self._base_url}{IEM_AFOS_LIST_PATH}?{query}",
+            cap=IEM_AFOS_LIST_MAX_BODY_BYTES,
+            accept="application/json",
+        )
+
+    async def fetch_lav(self, station: str, sts: str, ets: str) -> FetchResult:
+        """GFS LAMP (LAV) CSV. Never goes through the MOS model set."""
+        encoded = _closed_station(station)
+        _closed_window(sts, ets)
+        query = urlencode(
+            {"station": encoded, "model": IEM_LAV_MODEL, "format": "csv", "sts": sts, "ets": ets}
+        )
+        return await self._fetch_closed(
+            f"{self._base_url}{IEM_MOS_PATH}?{query}",
+            cap=IEM_LAV_MAX_BODY_BYTES,
+            accept="text/csv",
+        )
+
+    async def _fetch_closed(self, url: str, *, cap: int, accept: str) -> FetchResult:
+        # A shallow per-call view: it carries this method's cap and Accept
+        # without mutating the shared transport, while the budget and pacer
+        # (shared by reference) still count and space every request.
+        view = copy.copy(self)
+        view._max_body_bytes = min(cap, self._max_body_bytes)
+        view._accept = accept
+        result = await view._fetch(
+            url,
+            if_none_match=None,
+            if_modified_since=None,
+            allow_not_modified=False,
+            min_interval_ns=IEM_AFOS_LAV_MIN_INTERVAL_NS,
+        )
+        if IEM_THROTTLE_BODY_MARKER in (result.text or "")[:_THROTTLE_SCAN_CHARS]:
+            raise RateLimitedError(
+                f"{IEM_THROTTLE_BODY_MARKER} (IEM throttle body from "
+                f"{redact_url(result.url)}): the response is not data; back off and alert.",
+                retry_after=None,
+            )
+        return result
 
 
 class IemMosProbeTransport(PacedIemTransport):
@@ -302,25 +438,12 @@ class IemMosProbeTransport(PacedIemTransport):
         )
 
     def _mos_url(self, station: str, model: str, sts: str, ets: str) -> str:
-        encoded_station = _validated_path_identifier(
-            station,
-            name="station",
-            shape="a four-letter upper-case ICAO station id (e.g. `KMDW`), not a URL",
-            pattern=_STATION_PATTERN,
-        )
-        if station not in IEM_MOS_STATIONS:
-            raise ValueError(
-                "`station` is not in the closed MOS station set; refused rather than sanitised."
-            )
+        encoded_station = _closed_station(station)
         if model not in IEM_MOS_MODELS:
             raise ValueError(
                 "`model` is not in the closed MOS model set; refused rather than sanitised."
             )
-        for name, value in (("sts", sts), ("ets", ets)):
-            if _STS_ETS_PATTERN.match(value) is None:
-                raise ValueError(
-                    f"`{name}` must be YYYY-MM-DDTHH:MMZ; the supplied value is refused."
-                )
+        _closed_window(sts, ets)
         query = urlencode(
             {
                 "station": encoded_station,

@@ -129,9 +129,14 @@ async def test_fetch_station_observations_is_closed() -> None:
         await _transport().fetch_station_observations("KMDW", limit=1)
 
 
-def test_mos_url_rejects_knyc() -> None:
+def test_mos_url_rejects_unlisted_station() -> None:
     with pytest.raises(ValueError):
-        _transport()._mos_url("KNYC", "NBS", "2021-01-01T00:00Z", "2021-12-31T23:59Z")
+        _transport()._mos_url("KJFK", "NBS", "2021-01-01T00:00Z", "2021-12-31T23:59Z")
+
+
+def test_mos_url_accepts_knyc() -> None:
+    url = _transport()._mos_url("KNYC", "NBS", "2021-01-01T00:00Z", "2021-12-31T23:59Z")
+    assert parse_qs(urlsplit(url).query)["station"] == ["KNYC"]
 
 
 def test_mos_url_rejects_nam() -> None:

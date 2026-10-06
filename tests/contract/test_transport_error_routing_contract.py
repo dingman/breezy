@@ -46,6 +46,10 @@ from breezy.ingest.http import (
     TransportError,
     TransportTimeoutError,
 )
+from breezy.ingest.mdl_lamp_transport import (
+    LampArchiveIntegrityError,
+    LampNotPublishedError,
+)
 from breezy.ingest.nbm_quantile_transport import (
     BothHostsFailedError,
     NbmQuantileFetchError,
@@ -85,6 +89,8 @@ TRANSPORT_ERROR_CONSTRUCTORS: Mapping[type[TransportError], Callable[[], Transpo
         primary_error=TransportTimeoutError("s3 timeout"),
         fallback_error=ServerError("nomads 503", status_code=503),
     ),
+    LampNotPublishedError: lambda: LampNotPublishedError("404 not published", status_code=404),
+    LampArchiveIntegrityError: lambda: LampArchiveIntegrityError("unsafe tar member"),
 }
 
 _UNROUTED_CONSEQUENCE = (

@@ -90,6 +90,10 @@ from breezy.ingest.http import (
     TransportTimeoutError,
     redact_url,
 )
+from breezy.ingest.mdl_lamp_transport import (
+    LampArchiveIntegrityError,
+    LampNotPublishedError,
+)
 from breezy.ingest.nbm_quantile_transport import (
     BothHostsFailedError,
     NbmQuantileFetchError,
@@ -577,6 +581,14 @@ _TRANSPORT_ERROR_ROUTES: dict[type[TransportError], PollOutcome] = {
     # not a settlement-integrity event, so it shares the SERVER_ERROR
     # transient bucket rather than a new one.
     BothHostsFailedError: PollOutcome.SERVER_ERROR,
+    # F13-C1 `mdl_lamp_transport`. A 404 on an hourly LAMP bulletin is the
+    # routine "not yet published" poll miss: transient, never an integrity
+    # alarm (the collector records it as an availability miss).
+    LampNotPublishedError: PollOutcome.NETWORK_FAILURE,
+    # A malformed or unsafe archive container (traversal/absolute/special
+    # member, corrupt tar) is an integrity alarm, routed with the other
+    # content-integrity rows rather than as a hiccup.
+    LampArchiveIntegrityError: PollOutcome.CONTENT_ENCODING,
 }
 
 TRANSPORT_ERROR_ROUTES: MappingProxyType[type[TransportError], PollOutcome] = MappingProxyType(

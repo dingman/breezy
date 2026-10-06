@@ -530,6 +530,30 @@ def test_an_end_at_or_before_the_start_is_refused(cli: ModuleType) -> None:
         )
 
 
+def test_knyc_widening_leaves_default_station_order_unchanged(cli: ModuleType) -> None:
+    four = ("KLAX", "KMDW", "KMIA", "KSFO")
+    assert cli.STATIONS == four
+    assert {item.station for item in cli.build_plan(through_year=2021)} == set(four)
+    # KNYC is plannable only when named explicitly, and an unlisted station is still refused.
+    plan = cli.build_plan(stations=("KNYC",), through_year=2021)
+    assert {item.station for item in plan} == {"KNYC"}
+    window = cli.build_window_plan(
+        stations=("KNYC",), start=dt.date(2026, 9, 1), end=dt.date(2026, 9, 3)
+    )
+    assert {item.station for item in window} == {"KNYC"}
+    closed = cli.build_closed_day_plan(
+        stations=("KNYC",), settled_bound=dt.date(2026, 9, 10), lookback=2
+    )
+    assert {item.station for item in closed} == {"KNYC"}
+    unlisted = ("KJFK",)
+    with pytest.raises(ValueError, match="closed set"):
+        cli.build_plan(stations=unlisted, through_year=2021)
+    with pytest.raises(ValueError, match="closed set"):
+        cli.build_window_plan(stations=unlisted, start=dt.date(2026, 9, 1), end=dt.date(2026, 9, 3))
+    with pytest.raises(ValueError, match="closed set"):
+        cli.build_closed_day_plan(stations=unlisted, settled_bound=dt.date(2026, 9, 10), lookback=2)
+
+
 def test_the_window_plan_is_station_major_and_one_item_per_station(cli: ModuleType) -> None:
     plan = _window_plan(cli, stations=("KMIA", "KSFO"))
 
