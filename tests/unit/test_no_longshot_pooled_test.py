@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -31,6 +32,7 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, REPO_ROOT.as_posix())
 from scripts.analysis import no_longshot_pooled_test as tool
+from scripts.analysis.prereg_precommit_check import check_frozen_blob
 
 _NS = 1_000_000_000
 _PREREG_SRC = REPO_ROOT / "docs" / "evidence" / "m1v3" / "PREREG.json"
@@ -267,9 +269,21 @@ def test_per_ladder_secondary_computed() -> None:
 # --------------------------------------------------------------------------- the prereg draft
 
 
-def test_draft_prereg_is_unfrozen_and_pinned_to_the_tool_constants() -> None:
+def test_committed_prereg_is_frozen_and_pinned_to_the_tool_constants() -> None:
     design = json.loads(_PREREG_SRC.read_text())
-    assert design["frozen_sha"] == "UNFROZEN"
+    sha = design["frozen_sha"]
+    assert design["status"] == "FROZEN"
+    assert re.fullmatch(r"[0-9a-f]{40}", sha)
+    repo = _PREREG_SRC.parent
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    assert ancestor.returncode == 0, "frozen_sha must be an ancestor of HEAD"
+    assert check_frozen_blob(_PREREG_SRC, design) == []
+    tool.check_freeze_introduction(_PREREG_SRC, design)  # frozen_sha introduced this blob
     assert tool.check_pins(design) == []
     assert design["window"] == "D_12Z"
     assert (design["min_takes"], design["min_days"], design["min_loss_days"]) == (620, 40, 5)
@@ -693,8 +707,12 @@ def test_main_exit_codes(
     ]  # fmt: skip
     clock = lambda: dt.date(2026, 10, 20)  # R20: --as-of cannot pass the clock
     assert tool.main(base, clock=clock) == 0
-    # the committed DRAFT is UNFROZEN: the tool refuses and exits 3 with no verdict
+    # a synthetic DRAFT is UNFROZEN: the tool refuses and exits 3 with no verdict
+    draft = tmp_path / "draft_PREREG.json"
+    draft.write_text(
+        json.dumps({**json.loads(world["prereg"].read_text()), "frozen_sha": "UNFROZEN"})
+    )
     unfrozen = [*base]
-    unfrozen[1] = str(_PREREG_SRC)
+    unfrozen[1] = str(draft)
     assert tool.main(unfrozen, clock=clock) == 3
     assert "UNFROZEN" in capsys.readouterr().err
