@@ -42,6 +42,8 @@ __all__ = [
     "ARCHIVE_VERSION",
     "HOLDOUT_START",
     "MANIFEST_NAME",
+    "MAX_BLOCK_BYTES",
+    "MAX_BLOCK_LINES",
     "LampRun",
     "LavPayloadError",
     "Manifest",
@@ -91,6 +93,10 @@ _STAMP_RE: Final[re.Pattern[str]] = re.compile(
 )
 _LAV_TIME_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
 _LAV_MODEL: Final[str] = "LAV"
+#: A real closed-set station block is ~30 lines and ~2 KiB; a block past either cap is not a
+#: LAMP block (a runaway or hostile stream) and is dropped and tallied, never held or stored.
+MAX_BLOCK_LINES: Final[int] = 200
+MAX_BLOCK_BYTES: Final[int] = 64 * 1024
 
 
 def _bump(tally: dict[str, int], key: str, count: int = 1) -> None:
@@ -147,15 +153,31 @@ def iter_lamp_runs(
     blocks: dict[str, str] = {}
     station: str | None = None
     held: list[str] = []
+    held_bytes = 0
+    oversize = False
+    skipping: dt.datetime | None = None
 
     def close_block() -> None:
-        nonlocal station, held
+        nonlocal station, held, held_bytes, oversize
         if station is not None:
-            if station in blocks:
+            if oversize:
+                _bump(tally, "oversize_blocks")
+            elif station in blocks:
                 _bump(tally, "duplicate_block")
             else:
                 blocks[station] = "".join(held) + "\n"
-        station, held = None, []
+        station, held, held_bytes, oversize = None, [], 0, False
+
+    def hold(line: str) -> None:
+        nonlocal held_bytes, oversize
+        if oversize:
+            return
+        held_bytes += len(line.encode("utf-8"))
+        if len(held) >= MAX_BLOCK_LINES or held_bytes > MAX_BLOCK_BYTES:
+            oversize = True
+            held.clear()
+            return
+        held.append(line)
 
     def run_ready() -> LampRun | None:
         close_block()
@@ -183,15 +205,18 @@ def iter_lamp_runs(
                 if finished is not None:
                     yield finished
                 if issued in seen:
-                    _bump(tally, "run_reappeared")
+                    if issued != skipping:  # one reappearance is one drop, not one per block
+                        _bump(tally, "run_reappeared")
+                    skipping = issued
                     current, blocks = None, {}
                     continue
-                current, blocks = issued, {}
+                current, blocks, skipping = issued, {}, None
                 seen.add(issued)
-            station, held = header["station"], [line]
+            station = header["station"]
+            hold(line)
         elif station is not None:
             if line.strip():
-                held.append(line)
+                hold(line)
             else:
                 close_block()
     finished = run_ready()
@@ -291,15 +316,37 @@ class Manifest:
     def __init__(self, root: Path, source: str) -> None:
         self._path = root / source / MANIFEST_NAME
         self._keys: set[tuple[str, int, str]] | None = None
+        self._torn_offset: int | None = None
+        #: Torn trailing lines skipped on load (a crash mid-append); never a non-trailing one.
+        self.torn_lines = 0
 
     def _load(self) -> set[tuple[str, int, str]]:
         if self._keys is None:
             self._keys = set()
             if self._path.exists():
-                for line in self._path.read_text(encoding="utf-8").splitlines():
-                    row = json.loads(line)
-                    self._keys.add((row["station"], row["run_ts_ns"], row["sha256"]))
+                self._read_rows(self._path.read_bytes())
         return self._keys
+
+    def _read_rows(self, data: bytes) -> None:
+        """Index every row. An invalid LAST line is a torn append: skip, count, truncate later."""
+        assert self._keys is not None
+        offset = 0
+        entries: list[tuple[int, bytes]] = []
+        for raw in data.split(b"\n"):
+            if raw.strip():
+                entries.append((offset, raw))
+            offset += len(raw) + 1
+        for index, (start, raw) in enumerate(entries):
+            try:
+                row = json.loads(raw.decode("utf-8"))
+                key = (row["station"], row["run_ts_ns"], row["sha256"])
+            except (ValueError, KeyError, TypeError):
+                if index != len(entries) - 1:
+                    raise
+                self.torn_lines += 1
+                self._torn_offset = start
+                return
+            self._keys.add(key)
 
     def record(self, row: Mapping[str, Any]) -> bool:
         """Append ``row`` unless its key is present; True when a line was written."""
@@ -311,6 +358,9 @@ class Manifest:
         line = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
         try:
+            if self._torn_offset is not None:  # cut the torn tail so the next row starts clean
+                os.ftruncate(fd, self._torn_offset)
+                self._torn_offset = None
             os.write(fd, line)
             os.fsync(fd)
         finally:

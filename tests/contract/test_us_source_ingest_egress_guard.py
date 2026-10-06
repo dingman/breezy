@@ -37,6 +37,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -100,6 +101,15 @@ C1_SRC_MODULES: tuple[str, ...] = (
     "src/breezy/persistence/us_source_revision_store.py",
 )
 
+#: F13 A1 archive-backfill CLIs (coordinator-run, read-only network). They are C1-OWNED: scanned
+#: for every import at any depth, and closure entry points, so a regression can never make them
+#: import exec/order/permit code.
+ARCHIVE_BACKFILL_FILES: tuple[str, ...] = (
+    "scripts/archive/lamp_archive_backfill.py",
+    "scripts/archive/lamp_archive_runs.py",
+    "scripts/archive/us_source_backfill.py",
+)
+
 #: Entry points of the transitive closure (R22).
 CLOSURE_ENTRY_POINTS: tuple[str, ...] = (
     "scripts/collect/us_source_collector.py",
@@ -108,6 +118,7 @@ CLOSURE_ENTRY_POINTS: tuple[str, ...] = (
     "src/breezy/ingest/lamp_parse.py",
     "src/breezy/ingest/pfm_parse.py",
     *C1_SRC_MODULES,
+    *ARCHIVE_BACKFILL_FILES,
 )
 
 #: Data transports: GET-only by AST. (``scripts/collect/us_source_alert.py`` is the single
@@ -266,7 +277,11 @@ def resolve_module(dotted: str) -> Path | None:
 
 def _c1_owned_files() -> list[Path]:
     collect = sorted(COLLECT_DIR.glob("*.py")) if COLLECT_DIR.is_dir() else []
-    return [*collect, *(REPO_ROOT / rel for rel in C1_SRC_MODULES)]
+    return [
+        *collect,
+        *(REPO_ROOT / rel for rel in C1_SRC_MODULES),
+        *(REPO_ROOT / rel for rel in ARCHIVE_BACKFILL_FILES),
+    ]
 
 
 def import_closure(entries: Iterable[Path]) -> dict[Path, set[str]]:
@@ -365,6 +380,53 @@ def test_m6_scans_by_directory_including_iem_mos_probe_transport() -> None:
 def test_every_c1_owned_file_is_scanned_for_all_imports() -> None:
     owned = {_rel(p) for p in _c1_owned_files()}
     assert {"scripts/collect/us_source_collector.py", *C1_SRC_MODULES} <= owned
+
+
+def test_archive_backfill_scripts_are_c1_owned_entry_points_scanned_for_all_imports() -> None:
+    """F13 A1: the LAMP/PFM archive backfill CLIs may never reach exec/order/permit code."""
+    assert set(ARCHIVE_BACKFILL_FILES) == {
+        "scripts/archive/lamp_archive_backfill.py",
+        "scripts/archive/lamp_archive_runs.py",
+        "scripts/archive/us_source_backfill.py",
+    }
+    owned = {_rel(p) for p in _c1_owned_files()}
+    assert set(ARCHIVE_BACKFILL_FILES) <= owned
+    assert set(ARCHIVE_BACKFILL_FILES) <= set(CLOSURE_ENTRY_POINTS)
+    assert {REPO_ROOT / rel for rel in ARCHIVE_BACKFILL_FILES} <= closure_files()
+    for rel in ARCHIVE_BACKFILL_FILES:
+        assert banned_hits(import_closure([REPO_ROOT / rel])) == [], rel
+
+
+def test_archive_backfill_guard_flags_a_planted_banned_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planted = tmp_path / "scripts" / "archive" / "planted_backfill.py"
+    planted.parent.mkdir(parents=True)
+    planted.write_text(
+        "import importlib\n"
+        "from breezy.runtime import settings\n"
+        "from breezy.adapters.polymarket_us.safety import LiveTradingPermit\n"
+        "def late():\n"
+        "    from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport\n"
+        "    importlib.import_module('breezy.adapters.polymarket_us.exec.client')\n",
+        encoding="utf-8",
+    )
+    module = sys.modules[__name__]
+    monkeypatch.setattr(
+        module,
+        "_rel",
+        lambda path: (
+            path.name if tmp_path in path.parents else path.relative_to(REPO_ROOT).as_posix()
+        ),
+    )
+    monkeypatch.setattr(module, "_c1_owned_files", lambda: [planted])
+
+    hits = "\n".join(banned_hits(import_closure([planted])))
+
+    assert "imports breezy.runtime" in hits
+    assert "LiveTradingPermit" in hits
+    assert "write_transport" in hits  # a function-local import is caught: the file is owned
+    assert "breezy.adapters.polymarket_us.exec.client" in hits
 
 
 def test_m6_baseline_excludes_c1_closure() -> None:

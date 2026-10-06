@@ -32,8 +32,18 @@ after 2026-07-01 is STORED (kept for the forward feed) but tagged ``holdout_seal
 score code lives here and none may read a sealed row.
 
 Statuses per unit: ``complete``; ``not_published`` (404: the file is missing); ``oversize`` (a
-byte, member or line cap); ``error``; and the STOP-ALL statuses ``throttled`` / ``forbidden`` /
+byte, member or line cap); ``degraded`` (the unit ran to the end but a run was refused by the
+store's payload checks or hit a store error; that run's day is reported missing); ``error``;
+and the STOP-ALL statuses ``throttled`` / ``forbidden`` /
 ``paused_launch_window`` / ``budget_exhausted`` / ``store_busy``. A non-``complete`` unit exits 1.
+
+Files: the revision store, the manifest and the report are written 0o644 (world-readable): the
+data is public NWS/IEM text and this matches the live collector's files. Deliberately not 0o600.
+
+Tar completeness: a yearly unit reports the expected year x cycle members that were absent
+(``members_missing``) and whether the tar stream was fully validated (``tar_stream_complete``,
+``tar_sha256``). Members that are skipped are never gunzipped, so any skip leaves the stream
+unvalidated; the members that WERE ingested were each validated by their own parse.
 
 Safety: ``--dry-run`` plans only (no network, no write, no archive directory created);
 ``--apply`` needs ``BREEZY_LIVE=1`` and a hard request budget. No request starts that could meet
@@ -129,7 +139,10 @@ __all__ = [
     "ARCHIVE_PREREG",
     "HOLDOUT_START",
     "MANIFEST_NAME",
+    "REQUEST_WORST_CASE_S",
+    "RETRY_AFTER_WORST_CASE_S",
     "THROTTLE_BACKOFF_S",
+    "Manifest",
     "RequestBudget",
     "RequestBudgetExceededError",
     "apply_address_space_cap",
@@ -151,8 +164,16 @@ MDL_MIN_INTERVAL_S: Final[float] = 5.0
 DEFAULT_MEMORY_CAP_GIB: Final[float] = 4.0
 #: Worst-case span of one stream: its wall-clock cap plus the connect/slack allowance.
 _SLACK_S: Final[int] = REQUEST_WORST_CASE_S
-YEAR_WORST_CASE_S: Final[int] = int(DEFAULT_LAMP_YEAR_LIMITS.max_wall_seconds) + _SLACK_S
-MONTH_WORST_CASE_S: Final[int] = int(DEFAULT_LAMP_MONTH_LIMITS.max_wall_seconds) + _SLACK_S
+#: The transport honours up to 2 ``Retry-After`` waits of at most 120 s each before a stream
+#: opens (``mdl_lamp_transport``: ``max_429_retries=2``, ``_MAX_RETRY_AFTER_SECONDS=120``); a test
+#: pins this equal to those. Each retry is also charged to the request budget (``_charge_retries``).
+RETRY_AFTER_WORST_CASE_S: Final[int] = 2 * 120
+YEAR_WORST_CASE_S: Final[int] = (
+    int(DEFAULT_LAMP_YEAR_LIMITS.max_wall_seconds) + _SLACK_S + RETRY_AFTER_WORST_CASE_S
+)
+MONTH_WORST_CASE_S: Final[int] = (
+    int(DEFAULT_LAMP_MONTH_LIMITS.max_wall_seconds) + _SLACK_S + RETRY_AFTER_WORST_CASE_S
+)
 STOP_ALL_STATUSES: Final[frozenset[str]] = frozenset(
     {"throttled", "forbidden", "paused_launch_window", "budget_exhausted", "store_busy"}
 )
@@ -194,6 +215,9 @@ class UnitReport:
     refused: dict[str, int] = field(default_factory=dict)
     store_errors: dict[str, int] = field(default_factory=dict)
     station_blocks_missing: dict[str, int] = field(default_factory=dict)
+    members_missing: list[str] = field(default_factory=list)
+    tar_stream_complete: bool | None = None
+    tar_sha256: str | None = None
     missing_runs: dict[str, list[str]] = field(default_factory=dict)
     missing_run_count: int = 0
     error: str | None = None
@@ -214,6 +238,10 @@ class UnitReport:
             "refused": dict(sorted(self.refused.items())),
             "store_errors": dict(sorted(self.store_errors.items())),
             "station_blocks_missing": dict(sorted(self.station_blocks_missing.items())),
+            "members_missing": sorted(self.members_missing),
+            "members_missing_count": len(self.members_missing),
+            "tar_stream_complete": self.tar_stream_complete,
+            "tar_sha256": self.tar_sha256,
             "missing_runs": dict(sorted(self.missing_runs.items())),
             "missing_run_count": self.missing_run_count,
             "error": self.error,
@@ -339,8 +367,12 @@ def _append(
     model: str | None,
     run_at: dt.datetime,
     payload: bytes,
-) -> None:
-    """Append one raw revision and its manifest row; a busy unit lock is retried then raised."""
+) -> bool:
+    """Append one raw revision and its manifest row; a busy unit lock is retried then raised.
+
+    True when the run is held in the store (appended, unchanged or quarantined); False when it
+    was refused or hit a store error (it is then NOT seen: its day is reported missing).
+    """
     store, manifest = ctx.stores[source], ctx.manifests[source]
     run_ns = int(run_at.timestamp()) * _NS
     for attempt in range(BUSY_RETRIES + 1):
@@ -368,17 +400,18 @@ def _append(
             continue
         except RevisionPayloadRefusedError as exc:  # an expected refusal of this payload
             _bump(rep.refused, str(getattr(exc.__cause__, "reason", type(exc).__name__)))
-            return
+            return False
         except RevisionStoreError as exc:  # integrity or other store trouble: not a refusal
             _bump(rep.store_errors, type(exc).__name__)
-            return
+            return False
         if result.outcome is AppendOutcome.APPENDED:
             rep.appended += 1
         elif result.outcome is AppendOutcome.UNCHANGED:
             rep.unchanged += 1
         else:
             rep.quarantined += 1
-        return
+        return True
+    raise AssertionError("unreachable: the retry loop returns or raises")  # pragma: no cover
 
 
 # ------------------------------------------------------------------ unit runners
@@ -397,9 +430,8 @@ def _ingest_lamp_lines(
         stations=ctx.station_set,
     ):
         rep.runs_seen += 1
-        seen_days.add(run.run_at.day)
         _note_missing_stations(rep, run, ctx.stations)
-        _append(
+        held = _append(
             ctx,
             rep,
             source=US_LAMP_MDL_SOURCE,
@@ -408,6 +440,8 @@ def _ingest_lamp_lines(
             run_at=run.run_at,
             payload=run.payload(),
         )
+        if held:  # a refused or errored run never counts as seen
+            seen_days.add(run.run_at.day)
     absent = [d for d in range(1, calendar.monthrange(year, month)[1] + 1) if d not in seen_days]
     if absent:
         rep.missing_runs[f"{ym}.{hhmm}"] = [f"{year:04d}-{month:02d}-{d:02d}" for d in absent]
@@ -423,6 +457,7 @@ def _run_year(ctx: _Ctx, rep: UnitReport, year: int) -> None:
     assert ctx.mdl is not None
     ctx.gate.before(YEAR_WORST_CASE_S)
     rep.requests += 1
+    seen_members: set[str] = set()
     with ctx.mdl.fetch_lamp_archive_year(year) as stream:
         for member in stream.members():
             match = _MEMBER_RE.fullmatch(member.name)
@@ -433,10 +468,30 @@ def _run_year(ctx: _Ctx, rep: UnitReport, year: int) -> None:
             elif match["hhmm"] not in ctx.cycles:
                 _bump(rep.members_skipped, "not_selected_cycle")
             else:
+                seen_members.add(f"{match['ym']}.{match['hhmm']}")
                 rep.members_ingested += 1
                 _ingest_lamp_lines(
                     ctx, rep, member.lines(ctx.station_set), ym=match["ym"], hhmm=match["hhmm"]
                 )
+        _note_tar_outcome(ctx, rep, year, seen_members, stream)
+
+
+def _note_tar_outcome(
+    ctx: _Ctx, rep: UnitReport, year: int, seen_members: set[str], stream: Any
+) -> None:
+    """Report members absent from the tar and whether its stream was fully validated.
+
+    A skipped (unselected or unrecognised) member is never gunzipped, so the stream is not
+    fully validated whenever any member was skipped: ``tar_stream_complete`` is then False and no
+    sha256 is released. That is reported, never papered over.
+    """
+    expected = {f"{year:04d}{m:02d}.{hhmm}" for m in range(1, 13) for hhmm in ctx.cycles}
+    rep.members_missing = sorted(expected - seen_members)
+    try:
+        rep.tar_sha256 = stream.sha256
+        rep.tar_stream_complete = True
+    except RuntimeError:
+        rep.tar_stream_complete = False
 
 
 def _run_month(ctx: _Ctx, rep: UnitReport, ym: str, hhmm: str) -> None:
@@ -446,6 +501,22 @@ def _run_month(ctx: _Ctx, rep: UnitReport, ym: str, hhmm: str) -> None:
     with ctx.mdl.fetch_lamp_archive_month(ym, hhmm) as stream:
         rep.members_ingested += 1
         _ingest_lamp_lines(ctx, rep, stream.lines(ctx.station_set), ym=ym, hhmm=hhmm)
+
+
+def _charge_retries(transport: MdlLampTransport, budget: RequestBudget) -> None:
+    """Charge each transport 429 retry to the request budget before it is made.
+
+    The transport re-issues a stream request after a ``Retry-After`` wait through its sleep
+    hook and nowhere else; wrapping that hook (the transport module is not edited) spends one
+    budget request per retry, so a retry can never exceed the hard ceiling.
+    """
+    wait = transport._sleep
+
+    def charged(seconds: float) -> None:
+        budget.consume()
+        wait(seconds)
+
+    transport._sleep = charged
 
 
 def _next_month(year: int, month: int) -> tuple[int, int]:
@@ -526,7 +597,7 @@ def _execute(ctx: _Ctx, unit: _Unit) -> UnitReport:
     while True:
         try:
             unit.run(ctx, rep)
-            return rep
+            return _settled(rep)
         except PausedLaunchWindowError:
             rep.status = "paused_launch_window"
             _alert(f"{unit.name}: a request could meet the 16:30-17:10Z launch window; stopping")
@@ -556,6 +627,13 @@ def _execute(ctx: _Ctx, unit: _Unit) -> UnitReport:
             rep.status, rep.error = "error", f"{type(exc).__name__}: {exc}"
             _alert(f"{unit.name}: unexpected {rep.error}")
         return rep
+
+
+def _settled(rep: UnitReport) -> UnitReport:
+    """A unit that ran to the end but refused a run or hit a store error is not complete."""
+    if rep.status == "complete" and (rep.refused or rep.store_errors):
+        rep.status = "degraded"
+    return rep
 
 
 # ---------------------------------------------------------------------- plan
@@ -737,6 +815,7 @@ def _apply(
     )
     if any(leg in args.legs for leg in ("mdl-yearly", "mdl-monthly")):
         ctx.mdl = mdl_factory(clock)
+        _charge_retries(ctx.mdl, budget)
     if "iem-lav" in args.legs:
         ctx.lav_fetch = iem_fetch_factory(
             budget=budget,
@@ -744,6 +823,7 @@ def _apply(
             clock_ns=clock,
         )
     legs_report: dict[str, Any] = report.setdefault("legs", {})
+    report["manifest_torn_lines"] = 0
     pending = [(leg, unit) for leg in LEGS if leg in args.legs for unit in _units(args, leg)]
     incomplete = False
     for index, (leg, unit) in enumerate(pending):
@@ -755,8 +835,9 @@ def _apply(
                 "reason": rep.status,
                 "skipped_units": [u.name for _, u in pending[index + 1 :]],
             }
-            return _EXIT_INCOMPLETE
-    return _EXIT_INCOMPLETE if incomplete else 0
+            break
+    report["manifest_torn_lines"] = sum(m.torn_lines for m in ctx.manifests.values())
+    return _EXIT_INCOMPLETE if incomplete or "stopped" in report else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - script entry

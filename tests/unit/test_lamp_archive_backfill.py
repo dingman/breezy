@@ -38,7 +38,10 @@ from breezy.persistence.us_source_request import (
     lav_iem_request,
     revision_request,
 )
-from breezy.persistence.us_source_revision_store import UsSourceRevisionStore
+from breezy.persistence.us_source_revision_store import (
+    RevisionStoreError,
+    UsSourceRevisionStore,
+)
 from scripts.analysis import release_census as census
 from scripts.archive import lamp_archive_backfill as lb
 from tests.support.mock_http import install_mock_http
@@ -473,7 +476,7 @@ def test_a_run_that_reappears_non_contiguously_is_dropped_not_revised() -> None:
     )
 
     assert [r.run_at.day for r in runs] == [1, 2]
-    assert tally["run_reappeared"] == 5
+    assert tally["run_reappeared"] == 1  # item 6: once per reappearance, not once per block
 
 
 # ===================================== egress / hosts ================================
@@ -887,3 +890,218 @@ def test_iem_lav_months_from_the_split_date_are_tagged_sealed(run: _Run) -> None
     )  # fmt: skip
 
     assert {r["holdout_sealed"] for r in run.manifest(US_LAV_IEM_SOURCE)} == {True}
+
+
+# ===================== review fixes (2026-10-06): items 1-7 ==========================
+
+
+def _yearly_args(cycles: str = "2330") -> tuple[str, ...]:
+    return (
+        "--apply", "--legs", "mdl-yearly", "--first-year", "2025", "--last-year", "2025",
+        "--cycles", cycles, "--request-budget", "5",
+    )  # fmt: skip
+
+
+def test_item1_a_refused_run_makes_the_unit_degraded_and_its_day_missing(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good, bad = (
+        _bulletin(2026, 6, 1),
+        _bulletin(2026, 6, 2).replace(" TMP  63 61", " TMP  63 6x", 1),
+    )
+    install_mock_http(monkeypatch, _serve({_month_url("202606"): _gz(good + bad)}))
+
+    rc = run.go(*_month_args("2026-06"))
+
+    unit = run.units("mdl-monthly")[0]
+    assert unit["refused"] == {"bad_token": 1}
+    assert unit["status"] == "degraded" and rc == 1
+    assert "2026-06-02" in unit["missing_runs"]["202606.2330"]
+    assert "2026-06-01" not in unit["missing_runs"]["202606.2330"]
+
+
+def test_item1_a_store_error_makes_the_unit_degraded_and_its_day_missing(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_mock_http(monkeypatch, _serve({_month_url("202606"): _gz(_month_text(2026, 6, [1]))}))
+
+    def broken(self: object, **_kwargs: object) -> None:
+        raise RevisionStoreError("integrity")
+
+    monkeypatch.setattr(UsSourceRevisionStore, "append_if_new", broken)
+
+    rc = run.go(*_month_args("2026-06"))
+
+    unit = run.units("mdl-monthly")[0]
+    assert unit["store_errors"] == {"RevisionStoreError": 1}
+    assert unit["status"] == "degraded" and rc == 1
+    assert "2026-06-01" in unit["missing_runs"]["202606.2330"]
+
+
+def test_item2_absent_tar_members_are_reported_missing_and_completion_is_reported(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar = _tar([("lmp_lavtxt.202501.2330z.gz", _gz(_month_text(2025, 1, [1])))])
+    install_mock_http(monkeypatch, _serve({_year_url(2025): tar}))
+
+    rc = run.go(*_yearly_args())
+
+    unit = run.units("mdl-yearly")[0]
+    assert rc == 0 and unit["status"] == "complete"
+    assert unit["members_missing_count"] == 11
+    assert unit["members_missing"] == [f"2025{m:02d}.2330" for m in range(2, 13)]
+    assert unit["tar_stream_complete"] is True
+    assert len(unit["tar_sha256"]) == 64
+
+
+def test_item2_a_skipped_member_leaves_the_tar_stream_unvalidated(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar = _tar(
+        [
+            ("lmp_lavtxt.202501.2330z.gz", _gz(_month_text(2025, 1, [1]))),
+            ("lmp_lavtxt.202501.2345z.gz", _gz(b"skipped, never validated")),
+        ]
+    )
+    install_mock_http(monkeypatch, _serve({_year_url(2025): tar}))
+
+    run.go(*_yearly_args())
+
+    unit = run.units("mdl-yearly")[0]
+    assert unit["members_skipped"] == {"not_selected_cycle": 1}
+    assert unit["tar_stream_complete"] is False and unit["tar_sha256"] is None
+
+
+def test_item3_a_torn_trailing_manifest_line_is_skipped_counted_and_repaired(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / US_LAMP_MDL_SOURCE / lb.MANIFEST_NAME
+    path.parent.mkdir(parents=True)
+    good = json.dumps({"station": "ALL", "run_ts_ns": 1, "sha256": "a" * 64})
+    path.write_text(good + "\n" + '{"station": "ALL", "run_ts')
+    manifest = lb.Manifest(tmp_path, US_LAMP_MDL_SOURCE)
+
+    wrote = manifest.record({"station": "ALL", "run_ts_ns": 2, "sha256": "b" * 64})
+
+    assert wrote is True and manifest.torn_lines == 1
+    lines = path.read_text().splitlines()
+    assert [json.loads(ln)["run_ts_ns"] for ln in lines] == [1, 2]
+    assert (
+        lb.Manifest(tmp_path, US_LAMP_MDL_SOURCE).record(
+            {"station": "ALL", "run_ts_ns": 2, "sha256": "b" * 64}
+        )
+        is False
+    )
+
+
+def test_item3_an_invalid_non_trailing_manifest_line_still_errors(tmp_path: Path) -> None:
+    path = tmp_path / US_LAMP_MDL_SOURCE / lb.MANIFEST_NAME
+    path.parent.mkdir(parents=True)
+    good = json.dumps({"station": "ALL", "run_ts_ns": 1, "sha256": "a" * 64})
+    path.write_text(good + "\n{not json\n" + good + "\n")
+
+    with pytest.raises(ValueError, match="Expecting"):
+        lb.Manifest(tmp_path, US_LAMP_MDL_SOURCE).record(
+            {"station": "ALL", "run_ts_ns": 9, "sha256": "c" * 64}
+        )
+
+
+def test_item3_the_torn_line_count_is_in_the_report(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = run.archive / US_LAMP_MDL_SOURCE / lb.MANIFEST_NAME
+    path.parent.mkdir(parents=True)
+    path.write_text('{"station": "ALL", "run')
+    install_mock_http(monkeypatch, _serve({_month_url("202606"): _gz(_month_text(2026, 6, [1]))}))
+
+    run.go(*_month_args("2026-06"))
+
+    assert run.report["manifest_torn_lines"] == 1
+    assert len(run.manifest()) == 1
+
+
+def _one_block_run(extra_lines: int = 0, extra_bytes: int = 0) -> list[str]:
+    head = "KNYC   GFS LAMP GUIDANCE   06/01/2026  2330 UTC\n"
+    body = [" HR   00 01\n"] + [" TMP  63 61\n"] * extra_lines
+    if extra_bytes:
+        body.append(" X " + "9" * extra_bytes + "\n")
+    return [head, *body, "\n"]
+
+
+def test_item4_an_over_cap_block_is_dropped_and_tallied_never_stored() -> None:
+    cases = {"lines": _one_block_run(extra_lines=400), "bytes": _one_block_run(extra_bytes=70_000)}
+    for label, lines in cases.items():
+        tally: dict[str, int] = {}
+        runs = list(
+            lb.iter_lamp_runs(lines, expect_year_month=(2026, 6), expect_hhmm="2330", tally=tally)
+        )
+        assert runs == [], label
+        assert tally == {"oversize_blocks": 1}, label
+
+
+def test_item4_a_block_under_both_caps_is_kept() -> None:
+    tally: dict[str, int] = {}
+    runs = list(
+        lb.iter_lamp_runs(
+            _one_block_run(extra_lines=150),
+            expect_year_month=(2026, 6),
+            expect_hhmm="2330",
+            tally=tally,
+        )
+    )
+    assert len(runs) == 1 and "oversize_blocks" not in tally
+
+
+def test_item4_the_real_bulletin_blocks_fit_the_caps() -> None:
+    tally: dict[str, int] = {}
+    lines = _bulletin(2026, 6, 1).splitlines(keepends=True)
+    runs = list(
+        lb.iter_lamp_runs(lines, expect_year_month=(2026, 6), expect_hhmm="2330", tally=tally)
+    )
+    assert len(runs) == 1 and len(runs[0].blocks) == 5 and "oversize_blocks" not in tally
+
+
+def test_item7_a_429_retry_is_charged_to_the_request_budget(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _gz(_month_text(2026, 6, [1]))
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(1)
+        if len(seen) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"}, content=b"slow")
+        return httpx.Response(200, content=body)
+
+    def factory(clock: Callable[[], int]) -> MdlLampTransport:
+        return MdlLampTransport(clock=clock, check_proxy_env=False, sleep=run.clock.sleep)
+
+    install_mock_http(monkeypatch, handler)
+    args = (*_MONTH[:-1], "1", "--apply", "--start-month", "2026-06", "--end-month", "2026-06")
+
+    rc = run.go(*args, mdl=factory)
+
+    assert run.units("mdl-monthly")[0]["status"] == "budget_exhausted" and rc == 1
+    assert len(seen) == 1  # the retry never reached the host
+
+    seen.clear()
+    run.go(
+        *(*_MONTH[:-1], "2", "--apply", "--start-month", "2026-06", "--end-month", "2026-06"),
+        mdl=factory,
+    )
+    assert run.units("mdl-monthly")[0]["status"] == "complete" and len(seen) == 2
+
+
+def test_item7_window_worst_case_includes_two_max_retry_after_waits() -> None:
+    from breezy.ingest import mdl_lamp_transport as transport
+
+    extra = 2 * int(transport._MAX_RETRY_AFTER_SECONDS)
+    assert lb.RETRY_AFTER_WORST_CASE_S == extra
+    assert (
+        lb.YEAR_WORST_CASE_S
+        == int(DEFAULT_LAMP_YEAR_LIMITS.max_wall_seconds) + lb.REQUEST_WORST_CASE_S + extra
+    )
+    assert (
+        lb.MONTH_WORST_CASE_S
+        == int(DEFAULT_LAMP_MONTH_LIMITS.max_wall_seconds) + lb.REQUEST_WORST_CASE_S + extra
+    )
