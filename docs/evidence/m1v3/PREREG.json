@@ -1,6 +1,10 @@
 {
   "alpha": 0.05,
-  "ask_bins": ["0.90-0.92", "0.93-0.95", "0.96-0.99"],
+  "ask_bins": [
+    "0.90-0.92",
+    "0.93-0.95",
+    "0.96-0.99"
+  ],
   "ask_threshold": "0.90",
   "ask_threshold_inclusive": true,
   "ask_threshold_note": "NO ask = 1 - best YES bid (size >= 1) of the first Depth10 row in the window; a take requires NO ask >= 0.90, inclusive.",
@@ -41,10 +45,22 @@
   "reference_row": "The first Depth10 row with ts_event in [12:00, 13:00) UTC on climate day D (m1._first_row); the tape is scoped by calendar date AND hour; ref_ts must be strictly after the freeze commit time and before settlement.",
   "report_fields": "frozen_sha, head_sha, truth CSV sha256, sha256 of the catalog climate-day list, per-day no_bid_side and windows_without_depth, ask-bin composition, per-ladder secondary, depth share (>= 10 contracts), sensitivities.",
   "sensitivities": {
-    "ask_band": ["0.90", "0.97"],
-    "fee": ["rounded_only", "unrounded_only"],
-    "slippage_cents": [0, 2],
-    "windows": ["D-1_18Z", "D_17Z"]
+    "ask_band": [
+      "0.90",
+      "0.97"
+    ],
+    "fee": [
+      "rounded_only",
+      "unrounded_only"
+    ],
+    "slippage_cents": [
+      0,
+      2
+    ],
+    "windows": [
+      "D-1_18Z",
+      "D_17Z"
+    ]
   },
   "skipped_observations": "Observations without a NO ask (empty YES bid side) and windows without Depth10 are counted per day as denominators; an ask is never synthesised.",
   "sample_days": 53,
@@ -52,7 +68,7 @@
   "truth_deadline_rule": "first_forward_day+75d",
   "sample_note": "Fixed sample: forward days first <= d <= first+52 (53 days). A verdict needs as_of >= read_date AND FINAL truth for every tape station-day in the window, or as_of >= first+75 (missing ones are then excluded and counted as no_final_truth); otherwise status PENDING_TRUTH with no verdict. Before the read date the report carries counts only.",
   "slippage": "0.01",
-  "status": "DRAFT",
+  "status": "FROZEN",
   "statistic": "ratio-of-sums mean net EV per take, pooled across stations and rungs",
   "theta": "0.0695",
   "theta_source": "breezy.analysis.hypothesis_ledger.EVIDENCED_FEE_THETA via the scan's Decimal THETA",
