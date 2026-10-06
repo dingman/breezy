@@ -1,5 +1,5 @@
-# SYNTHETIC FIXTURE (F13-C1-S3): hand-built to mirror the GFS LAMP lavtxt station bulletin
-# layout described in A0-R3; NOT a captured sample. Replace with a real first-capture sample.
+# SYNTHETIC EDGE FIXTURE (F13-C1-S3): 30-column hourly TMP blocks (extended-run shape) so full
+# climate-day LST windows exist; real-layout rows (fixed 3-char columns). Not a captured sample.
 # Lines starting with '#' are stripped by the tests before parsing.
  KNYC   GFS LAMP GUIDANCE   10/06/2026  0130 UTC
  UTC  02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 00 01 02 03 04 05 06 07

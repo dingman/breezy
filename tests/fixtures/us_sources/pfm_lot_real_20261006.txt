@@ -1,0 +1,49 @@
+# REAL CAPTURE (F13-C1-S3, trimmed to header lines + one point block; unmodified otherwise).
+# Source URL: https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py?pil=PFMLOT&limit=1&fmt=text
+# Fetched: 2026-10-06T02:11:12Z
+# HTTP Last-Modified: (none; IEM dynamic response sent no Last-Modified header)
+# Lines starting with '#' are stripped by the tests before parsing.
+
+100 
+FOUS53 KLOT 060156
+PFMLOT
+
+Point Forecast Matrices
+National Weather Service Chicago/Romeoville IL
+856 PM CDT Mon Oct 5 2026
+
+ILZ104-060900-
+Chicago Midway Airport-Cook IL
+41.78N  87.76W Elev. 612 ft
+856 PM CDT Mon Oct 5 2026
+
+Date           10/05/26      Tue 10/06/26            Wed 10/07/26            Thu
+CDT 3hrly     16 19 22 01 04 07 10 13 16 19 22 01 04 07 10 13 16 19 22 01 04 07
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      49          73          57          76          54
+Temp                55 53 51 50 61 70 72 65 62 60 59 57 66 74 75 67 62 59 56 54
+Dewpt               50 47 44 43 45 45 44 46 46 46 47 51 57 58 56 55 53 51 49 46
+RH                  83 80 77 77 56 41 37 50 56 60 64 80 73 57 52 65 72 75 77 74
+Wind dir             E SE  S  S  S SW SW  S SW SW SW SW  W  W NW NW NW NW NW NW
+Wind spd             5  5  5  6 10 13 13  9 11 10  9  6  6  8  9  6  5  5  5  6
+Clouds              FW FW FW FW FW CL FW FW SC SC SC SC FW FW FW FW FW SC SC SC
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Snow 12hr                 00-00       00-00       00-00                        
+
+
+Date           10/08  Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+CDT 6hrly     13 19   01 07 13 19   01 07 13 19   01 07 13 19   01 07 13 19
+UTC 6hrly     18 00   06 12 18 00   06 12 18 00   06 12 18 00   06 12 18 00
+
+Max/Min          68      50    67      50    72      58    75      57    69
+Temp          68 63   54 51 66 61   54 51 69 66   61 58 73 69   61 57 68 63
+Dewpt         42 46   47 44 43 45   45 44 46 49   49 48 54 55   53 53 54 53
+PWind dir        NW      NW    SW      SE     S       S     S       S     E
+Wind char        GN      LT    LT      LT    GN      GN    GN      LT    GN
+Avg clouds    SC SC   SC SC SC SC   SC FW FW FW   FW FW SC SC   SC SC SC SC
+PoP 12hr          5       5     5       5     0       0    10      10    20
+Rain shwrs                                                             S  S
+
+$$

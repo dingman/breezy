@@ -1,0 +1,48 @@
+# REAL CAPTURE (F13-C1-S3, trimmed to header lines + one point block; unmodified otherwise).
+# Source URL: https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py?pil=PFMMTR&limit=1&fmt=text
+# Fetched: 2026-10-06T02:11:17Z
+# HTTP Last-Modified: (none; IEM dynamic response sent no Last-Modified header)
+# Lines starting with '#' are stripped by the tests before parsing.
+
+424 
+FOUS56 KMTR 060100
+PFMMTR
+
+Point Forecast Matrices
+National Weather Service San Francisco Bay Area
+600 PM PDT Mon Oct 5 2026
+
+CAZ508-061100-
+San Francisco Airport-San Mateo CA
+37.62N 122.38W Elev. 10 ft
+600 PM PDT Mon Oct 5 2026
+
+Date          Mon 10/05/26      Tue 10/06/26            Wed 10/07/26         Thu
+PDT 3hrly     14 17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      61          87          61          84          59
+Temp                70 66 63 61 63 77 87 83 70 66 63 61 62 77 83 80 67 63 61 59
+Dewpt               55 55 55 54 54 58 58 56 54 54 54 54 54 58 57 56 55 55 54 53
+RH                  59 68 75 78 72 52 38 40 57 65 72 78 75 52 41 44 65 75 78 80
+Wind dir             W  W  W  N  N NE  W  W  W  W  W  N  W  W  W  W  W  W  N  N
+Wind spd             6  3  2  0  0  1  6 11  6  4  1  0  1  4  9 13  6  2  0  0
+Clouds              CL CL CL CL FW FW CL CL CL FW FW FW FW FW CL CL FW FW SC SC
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Heat                 Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y
+
+
+Date           10/08/26  Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+PDT 6hrly     11 17 23   05 11 17 23   05 11 17 23   05 11 17 23   05 11 17
+UTC 6hrly     18 00 06   12 18 00 06   12 18 00 06   12 18 00 06   12 18 00
+
+Max/Min          82      60    74      61    69      58    67      57    69
+Temp          72 74 64   61 68 72 64   62 65 66 61   59 63 65 59   58 64 67
+Dewpt         55 57 55   55 58 58 56   56 59 56 54   53 54 54 52   51 51 52
+PWind dir         W       W     W       W    SW       W     W       W    SW
+Wind char        LT      LT    LT      LT    GN      BZ    GN      LT    LT
+Avg clouds    SC FW CL   FW SC FW CL   FW SC SC FW   FW FW FW CL   FW FW FW
+PoP 12hr          0       0     0       0     0       0     0       0     0
+
+$$

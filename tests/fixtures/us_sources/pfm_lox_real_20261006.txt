@@ -1,0 +1,53 @@
+# REAL CAPTURE (F13-C1-S3, trimmed to header lines + one point block; unmodified otherwise).
+# Source URL: https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py?pil=PFMLOX&limit=1&fmt=text
+# Fetched: 2026-10-06T02:11:07Z
+# HTTP Last-Modified: (none; IEM dynamic response sent no Last-Modified header)
+# Lines starting with '#' are stripped by the tests before parsing.
+
+466 
+FOUS56 KLOX 052152
+PFMLOX
+
+Point Forecast Matrices
+National Weather Service Los Angeles/Oxnard CA
+252 PM PDT Mon Oct 5 2026
+
+CAZ366-061100-
+Los Angeles Airport CA
+33.94N 118.39W Elev. 99 ft
+252 PM PDT Mon Oct 5 2026
+
+Date          Mon 10/05/26      Tue 10/06/26            Wed 10/07/26         Thu
+PDT 3hrly     14 17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      73          97          70          90          69
+Temp             81 83 79 79 75 78 94 96 93 91 87 80 80 75 89 88 78 72 70 69 69
+Dewpt            55 57 60 60 58 58 63 66 68 70 69 65 66 59 61 62 61 61 62 61 61
+RH               41 41 52 52 55 50 36 38 44 50 55 60 62 58 39 42 56 68 76 76 76
+Wind dir          W  W SW NE  N NE SE SW  W  W SW NW  N NE SW  W SW  W  S  E  N
+Wind spd         12  9  4  3  2  5  8 12 13 10  4  4  1  3  9 13 16  8  6  4  1
+Clouds           FW FW FW FW FW FW FW FW FW FW FW FW FW FW CL CL FW FW SC SC SC
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Snow 12hr                 00-00       00-00       00-00                        
+Heat index                                  97                                 
+Max heat                           95   100    97                              
+Coast Flood                                              Y  Y  Y  Y  Y  Y  Y  Y
+Extreme Heat      W  W  W  W  W  W  W  W  W  W  W  W  W  W  W  W  W  W  W  W  W
+
+
+Date           10/08/26  Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+PDT 6hrly     11 17 23   05 11 17 23   05 11 17 23   05 11 17 23   05 11 17
+UTC 6hrly     18 00 06   12 18 00 06   12 18 00 06   12 18 00 06   12 18 00
+
+Max/Min          88      69    85      69    81      68    77      65    75
+Temp          86 80 71   69 83 79 71   69 80 77 70   68 75 73 67   65 72 72
+Dewpt         64 65 67   66 65 66 66   65 65 64 65   65 64 62 62   62 61 60
+PWind dir        NW       W     W       W     W      SW     S      SW     S
+Wind char        LT      LT    LT      LT    LT      GN    GN      GN    LT
+Avg clouds    SC CL CL   FW SC FW FW   FW SC SC FW   SC B1 SC FW   SC SC SC
+PoP 12hr          0       0     0       0     0      20    10      20    10
+Rain shwrs                                            S             S      
+
+$$

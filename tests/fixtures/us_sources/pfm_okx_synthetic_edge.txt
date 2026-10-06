@@ -1,0 +1,85 @@
+# SYNTHETIC EDGE FIXTURE (F13-C1-S3): the real OKX header and Central Park block (see pfm_okx_real_20261006.txt)
+# plus a DECOY point sharing zone NYZ072 (same zone, different point name) for key-selection tests.
+# Lines starting with '#' are stripped by the tests before parsing.
+
+854 
+FOUS51 KOKX 051901
+PFMOKX
+
+Point Forecast Matrices
+National Weather Service New York NY
+301 PM EDT Mon Oct 5 2026
+
+NYZ072-060800-
+Brooklyn-New York NY
+40.78N  73.97W Elev. 16 ft
+301 PM EDT Mon Oct 5 2026
+
+Date           10/05/26      Tue 10/06/26            Wed 10/07/26            Thu
+EDT 3hrly     17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      99          63          47          68          55
+Temp          66 61 56 54 50 50 55 62 63 58 53 50 48 49 59 67 68 63 60 58 55 57
+Dewpt         41 37 34 32 32 32 30 28 29 30 31 32 34 36 39 40 44 47 50 52 54 55
+RH            40 41 43 43 50 50 38 27 27 34 43 50 58 61 47 37 42 56 69 80 96 93
+Wind dir      NW NW NW NW NW NW NW NW NW NW NW  W  W SW SW  S  S SW SW SW SW SW
+Wind spd      20 13 12 13 11 10  8  5  5  4  2  2  2  2  5  8  6  5  5  5  4  4
+Wind gust                          16                      18 19 16 16         
+Clouds        FW CL CL CL CL CL CL CL FW FW CL CL CL CL CL CL CL CL FW FW FW FW
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Snow 12hr                 00-00       00-00       00-00                        
+
+
+Date           10/08  Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+EDT 6hrly     14 20   02 08 14 20   02 08 14 20   02 08 14 20   02 08 14 20
+UTC 6hrly     18 00   06 12 18 00   06 12 18 00   06 12 18 00   06 12 18 00
+
+Max/Min          76      57    72      55    69      53    68      57    71
+Temp          75 69   61 57 71 66   58 55 67 63   56 55 67 64   60 59 69 66
+Dewpt         54 51   49 49 48 47   47 47 46 45   45 47 52 52   53 55 58 57
+PWind dir         W      NW     W       W    NW      SW     S      SW     W
+Wind char        LT      LT    LT      LT    LT      LT    LT      LT    GN
+Avg clouds    FW FW   FW FW FW FW   FW FW FW FW   SC SC SC B1   B2 B2 B1 B1
+PoP 12hr          0       0     0       5     0       0     5      20    20
+Rain shwrs                                                          S  S  S
+
+$$
+
+NYZ072-060800-
+Central Park-New York NY
+40.78N  73.97W Elev. 16 ft
+301 PM EDT Mon Oct 5 2026
+
+Date           10/05/26      Tue 10/06/26            Wed 10/07/26            Thu
+EDT 3hrly     17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      49          63          47          68          55
+Temp          66 61 56 54 50 50 55 62 63 58 53 50 48 49 59 67 68 63 60 58 55 57
+Dewpt         41 37 34 32 32 32 30 28 29 30 31 32 34 36 39 40 44 47 50 52 54 55
+RH            40 41 43 43 50 50 38 27 27 34 43 50 58 61 47 37 42 56 69 80 96 93
+Wind dir      NW NW NW NW NW NW NW NW NW NW NW  W  W SW SW  S  S SW SW SW SW SW
+Wind spd      20 13 12 13 11 10  8  5  5  4  2  2  2  2  5  8  6  5  5  5  4  4
+Wind gust                          16                      18 19 16 16         
+Clouds        FW CL CL CL CL CL CL CL FW FW CL CL CL CL CL CL CL CL FW FW FW FW
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Snow 12hr                 00-00       00-00       00-00                        
+
+
+Date           10/08  Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+EDT 6hrly     14 20   02 08 14 20   02 08 14 20   02 08 14 20   02 08 14 20
+UTC 6hrly     18 00   06 12 18 00   06 12 18 00   06 12 18 00   06 12 18 00
+
+Max/Min          76      57    72      55    69      53    68      57    71
+Temp          75 69   61 57 71 66   58 55 67 63   56 55 67 64   60 59 69 66
+Dewpt         54 51   49 49 48 47   47 47 46 45   45 47 52 52   53 55 58 57
+PWind dir         W      NW     W       W    NW      SW     S      SW     W
+Wind char        LT      LT    LT      LT    LT      LT    LT      LT    GN
+Avg clouds    FW FW   FW FW FW FW   FW FW FW FW   SC SC SC B1   B2 B2 B1 B1
+PoP 12hr          0       0     0       5     0       0     5      20    20
+Rain shwrs                                                          S  S  S
+
+$$

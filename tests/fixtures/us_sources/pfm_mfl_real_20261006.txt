@@ -1,0 +1,53 @@
+# REAL CAPTURE (F13-C1-S3, trimmed to header lines + one point block; unmodified otherwise).
+# Source URL: https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py?pil=PFMMFL&limit=1&fmt=text
+# Fetched: 2026-10-06T02:11:22Z
+# HTTP Last-Modified: (none; IEM dynamic response sent no Last-Modified header)
+# Lines starting with '#' are stripped by the tests before parsing.
+
+294 
+FOUS52 KMFL 051821
+PFMMFL
+
+Point Forecast Matrices
+National Weather Service Miami FL
+221 PM EDT Mon Oct 5 2026
+
+FLZ074-060800-
+Miami-Miami Dade FL
+25.82N  80.28W Elev. 12 ft
+221 PM EDT Mon Oct 5 2026
+
+Date           10/05/26      Tue 10/06/26            Wed 10/07/26            Thu
+EDT 3hrly     17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      77          89          76          89          76
+Temp          87 82 81 79 79 79 85 87 85 81 79 79 78 78 85 87 83 80 79 78 77 78
+Dewpt         76 75 76 76 75 76 76 76 76 75 76 75 75 75 77 76 77 76 76 75 75 75
+RH            70 79 85 91 88 91 75 70 75 82 91 88 91 91 77 70 82 88 91 91 94 91
+Wind dir      SE SE SE  S  W  N SE SE SE  S SW  W  S SW  S  S  S SW SW SW SW  S
+Wind spd       6  3  1  1  1  1  4  6  5  2  1  1  1  1  3  6  4  2  2  1  1  1
+Clouds        SC SC SC SC B1 SC SC SC SC B1 B1 B1 SC SC SC B1 B1 B1 B1 SC SC SC
+PoP 12hr                     10          40          30          80          30
+QPF 12hr                      0        0.02        0.01        0.35        0.03
+Rain shwrs                             C  C  S              D  D  C  C        S
+Tstms                                  C  S  S              C  C  C  S         
+Heat index    98                   98                   96 98                  
+Max heat         99                98    99                99    98            
+
+
+Date           10/08  Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+EDT 6hrly     14 20   02 08 14 20   02 08 14 20   02 08 14 20   02 08 14 20
+UTC 6hrly     18 00   06 12 18 00   06 12 18 00   06 12 18 00   06 12 18 00
+
+Max/Min          89      76    89      78    89      78    89      78    89
+Temp          86 81   78 77 86 82   80 80 87 83   81 80 87 83   80 80 87 83
+Dewpt         77 76   75 76 77 76   76 77 77 76   77 77 77 77   77 77 77 77
+PWind dir         S       S    SE       E    SE      SE    SE      SE    SE
+Wind char        LT      LT    LT      LT    GN      GN    GN      LT    LT
+Avg clouds    SC B1   B1 SC SC B1   SC SC SC B1   SC SC SC B1   B1 SC SC B1
+PoP 12hr         80      20    40      30    60      30    30      10    30
+Rain shwrs     S  D    S     S  C    C  C  C  L    C  S  S  C             C
+Tstms          S  C    S     S  C    C  C  C  C    C  S  S  C             C
+
+$$

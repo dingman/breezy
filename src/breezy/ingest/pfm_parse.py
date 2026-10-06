@@ -18,9 +18,25 @@ state.
 `PfmParseError` is a local refusal class: not a `TransportError`, `CliParseError`
 or `CliSanityError` (R18).
 
-The fixture under `tests/fixtures/us_sources/` is SYNTHETIC: the MAX-row column
-layout (one value per forecast day, space separated) is an assumption pending a
-real first-capture sample, so `max_f` is returned in column order only.
+Layout VERIFIED against real captures of all five offices
+(`tests/fixtures/us_sources/pfm_*_real_20261006.txt`). Each point block holds two
+tables, a 3-hourly one and a 6-hourly one, each introduced by three header rows::
+
+    Date           10/05/26      Tue 10/06/26            Wed 10/07/26            Thu
+    EDT 3hrly     17 20 23 02 05 08 11 14 17 20 23 02 05 08 ...
+    UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 ...
+
+    Min/Max                      49          63          47          68          55
+
+(`Max/Min` in the 6-hourly table). Columns are 2 characters wide, right-aligned, and
+data rows are aligned to the header rows by character position, so a value is matched
+to its column by END position. The MAX is the value under the UTC 00 column and the MIN
+the value under UTC 12 (any value under another hour is a layout this parser does not
+understand and refuses). The MAX's forecast day is the LOCAL date of its UTC 00 column
+(20:00 EDT / 19:00 CDT / 17:00 PDT, so never past local midnight). Local dates come
+from the first `Date` label (the first column's date; the second table's label has no
+year, which is taken from the issuance) plus a rollover whenever the local hour
+decreases; every printed date label is cross-checked against its column.
 """
 
 from __future__ import annotations
@@ -41,7 +57,7 @@ TEMP_MAX_F: Final = 140
 _HEADER_SCAN_LINES: Final = 10
 _WMO_RE: Final = re.compile(r"^[A-Z]{4}\d{2} ([A-Z]{4}) (\d{2})(\d{2})(\d{2})$")
 _ZONE_RE: Final = re.compile(r"^([A-Z]{2}Z\d{3})(?:[->]\d{3})*-\d{6}-$")
-_LATLON_RE: Final = re.compile(r"^\d{1,2}\.\d{2}[NS] \d{1,3}\.\d{2}[EW]\b")
+_LATLON_RE: Final = re.compile(r"^\d{1,2}\.\d{2}[NS]\s+\d{1,3}\.\d{2}[EW]\b")
 _INT_RE: Final = re.compile(r"^-?\d{1,4}$")
 
 
@@ -74,14 +90,15 @@ class PfmParseError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class PfmPoint:
-    """The MAX-temperature row of one mapped station point."""
+    """The MAX temperatures of one mapped station point."""
 
     station: str
     wfo: str
     point_name: str
     zone_code: str
     issued_at: dt.datetime
-    max_f: tuple[int, ...]
+    #: (forecast local date, MAX degrees F) in date order; see the module docstring.
+    max_by_day: tuple[tuple[dt.date, int], ...]
 
 
 def resolve_pfm_station(wfo: str, point_name: str) -> str:
@@ -137,22 +154,106 @@ def _issuance(
     return cccc[1:], best
 
 
-def _max_row(section: list[str]) -> tuple[int, ...]:
-    rows = [ln.split() for ln in section if ln.split()[:1] == ["MAX"]]
-    if len(rows) != 1:
-        raise PfmParseError("max_row", f"{len(rows)} MAX rows in point section")
-    tokens = rows[0][1:]
-    if not tokens or len(tokens) > MAX_FIELDS_PER_ROW:
-        raise PfmParseError("max_row_fields", f"{len(tokens)} fields")
-    values: list[int] = []
-    for token in tokens:
-        if not _INT_RE.match(token):
-            raise PfmParseError("bad_token", f"MAX: {token!r}")
-        value = int(token)
+_LABEL_WIDTH: Final = 14
+_MAX_TABLES: Final = 4
+_MAX_UTC_HOUR: Final = 0
+_MIN_UTC_HOUR: Final = 12
+_DATE_LABEL_RE: Final = re.compile(r"(?:[A-Z][a-z]{2} )?(\d{2})/(\d{2})(?:/(\d{2}))?")
+_LOCAL_ROW_RE: Final = re.compile(r"^[A-Z]{3} [36]hrly\s")
+_UTC_ROW_RE: Final = re.compile(r"^UTC [36]hrly\s")
+_EXTREMA_RE: Final = re.compile(r"^(?:Min/Max|Max/Min)\s")
+
+
+@dataclass(frozen=True, slots=True)
+class _Column:
+    end: int
+    local_hour: int
+    utc_hour: int
+    local_date: dt.date
+
+
+def _hour_tokens(line: str) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for m in re.finditer(r"\S+", line[_LABEL_WIDTH:]):
+        if not re.fullmatch(r"\d{2}", m.group()) or not 0 <= int(m.group()) <= 23:
+            raise PfmParseError("bad_hour_token", m.group())
+        out.append((_LABEL_WIDTH + m.end(), int(m.group())))
+    return out
+
+
+def _first_date(label: re.Match[str], issued_at: dt.datetime) -> dt.date:
+    """The first column's date; a label without a year takes it from the issuance."""
+    month, day, short_year = int(label.group(1)), int(label.group(2)), label.group(3)
+    years = [2000 + int(short_year)] if short_year else [issued_at.year, issued_at.year + 1]
+    for year in years:
+        try:
+            date = dt.date(year, month, day)
+        except ValueError:
+            continue
+        if date >= issued_at.date() - dt.timedelta(days=2):
+            return date
+    raise PfmParseError("bad_date_label", label.group())
+
+
+def _columns(date_row: str, local_row: str, utc_row: str, issued_at: dt.datetime) -> list[_Column]:
+    local, utc = _hour_tokens(local_row), _hour_tokens(utc_row)
+    if not local or [e for e, _ in local] != [e for e, _ in utc]:
+        raise PfmParseError("hour_rows_misaligned")
+    labels = list(_DATE_LABEL_RE.finditer(date_row, len("Date")))
+    if not labels:
+        raise PfmParseError("no_date_label")
+    date = _first_date(labels[0], issued_at)
+    columns: list[_Column] = []
+    previous = -1
+    for (end, hour), (_, utc_hour) in zip(local, utc, strict=True):
+        if hour <= previous:
+            date += dt.timedelta(days=1)
+        previous = hour
+        columns.append(_Column(end, hour, utc_hour, date))
+    for label in labels:
+        column = next((c for c in columns if c.end > label.start()), None)
+        month, day = int(label.group(1)), int(label.group(2))
+        if column is None or (column.local_date.month, column.local_date.day) != (month, day):
+            raise PfmParseError("date_label_mismatch", label.group())
+    return columns
+
+
+def _table_max(table: list[str], issued_at: dt.datetime) -> dict[dt.date, int]:
+    if len(table) < 3 or not _LOCAL_ROW_RE.match(table[1]) or not _UTC_ROW_RE.match(table[2]):
+        raise PfmParseError("table_header", table[0][:40])
+    extrema = [ln for ln in table[3:] if _EXTREMA_RE.match(ln)]
+    if len(extrema) != 1:
+        raise PfmParseError("extrema_row", f"{len(extrema)} Min/Max rows in table")
+    columns = {c.end: c for c in _columns(table[0], table[1], table[2], issued_at)}
+    if extrema[0][:_LABEL_WIDTH].strip() not in ("Min/Max", "Max/Min"):
+        raise PfmParseError("extrema_label")
+    found: dict[dt.date, int] = {}
+    for m in re.finditer(r"\S+", extrema[0][_LABEL_WIDTH:]):
+        end = _LABEL_WIDTH + m.end()
+        if not _INT_RE.match(m.group()) or end not in columns:
+            raise PfmParseError("bad_extrema_cell", m.group())
+        value = int(m.group())
         if not TEMP_MIN_F <= value <= TEMP_MAX_F:
-            raise PfmParseError("max_out_of_range", str(value))
-        values.append(value)
-    return tuple(values)
+            raise PfmParseError("extrema_out_of_range", m.group())
+        column = columns[end]
+        if column.utc_hour == _MAX_UTC_HOUR:
+            found[column.local_date] = value
+        elif column.utc_hour != _MIN_UTC_HOUR:
+            raise PfmParseError("extrema_under_unexpected_hour", str(column.utc_hour))
+    return found
+
+
+def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date, int], ...]:
+    starts = [i for i, ln in enumerate(body) if ln.startswith("Date ")]
+    if not starts or len(starts) > _MAX_TABLES:
+        raise PfmParseError("tables", f"{len(starts)} tables in point block")
+    merged: dict[dt.date, int] = {}
+    for begin, end in zip(starts, [*starts[1:], len(body)], strict=True):
+        for date, value in _table_max(body[begin:end], issued_at).items():
+            if date in merged:
+                raise PfmParseError("duplicate_day", date.isoformat())
+            merged[date] = value
+    return tuple(sorted(merged.items()))
 
 
 def _sections(lines: list[str]) -> list[tuple[str, str, list[str]]]:
@@ -201,7 +302,7 @@ def parse_pfm_product(
         point_name=name,
         zone_code=zone,
         issued_at=issued_at,
-        max_f=_max_row(body),
+        max_by_day=_max_by_day(body, issued_at),
     )
 
 

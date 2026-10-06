@@ -23,8 +23,11 @@ never skipped. `LampParseError` is a local refusal class: it is not a
 Blocks of stations outside :data:`LAMP_STATIONS` (a live bulletin carries
 thousands) are not parsed or validated; they only count against the line bound.
 
-The fixture under `tests/fixtures/us_sources/` is SYNTHETIC; a real first-capture
-sample is still owed (columns are whitespace-split integers here).
+Layout VERIFIED against a real capture (`lamp_lavtxt_real_20261005_2330z.txt`): rows
+are a 4-character label, a space, then 3-character right-justified columns (so values
+glue), 25 hourly columns for a `HH30` run, the first column being the hour after the run;
+`999` is the missing marker (that hour is MISSING; the run is not refused). A day whose
+24 window hours include a missing hour is MISSING.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ MAX_DECOMPRESSED_BYTES: Final = 512 * 1024 * 1024
 #: Physical range for a surface temperature, degrees Fahrenheit.
 TMP_MIN_F: Final = -80
 TMP_MAX_F: Final = 140
+#: The published missing-data value in a 3-character column (real bulletin, 2026-10-05).
+MISSING_MARKER: Final = 999
 
 _HOURS_PER_LST_DAY: Final = 24
 _INFLATE_STEP: Final = 64 * 1024
@@ -57,7 +62,8 @@ _HEADER_MARK: Final = "GFS LAMP GUIDANCE"
 _HEADER_RE: Final = re.compile(
     r"^\s*([A-Z0-9]{3,4})\s+GFS LAMP GUIDANCE\s+(\d{2})/(\d{2})/(\d{4})\s+(\d{4}) UTC\s*$"
 )
-_INT_RE: Final = re.compile(r"^-?\d{1,4}$")
+_INT_RE: Final = re.compile(r"^-?\d{1,3}$")
+_COLUMN_WIDTH: Final = 3
 
 
 class LampParseError(ValueError):
@@ -76,7 +82,8 @@ class LampBlock:
     station: str
     issued_at: dt.datetime
     valid_times: tuple[dt.datetime, ...]
-    tmp_f: tuple[int, ...]
+    #: Hourly temperatures, `None` where the bulletin printed the missing marker.
+    tmp_f: tuple[int | None, ...]
 
 
 class _LineSplitter:
@@ -173,17 +180,26 @@ def iter_gzip_lines(
     yield from splitter.finish()
 
 
-def _int_fields(line: str, label: str, max_fields: int) -> list[int]:
-    tokens = line.split()[1:]
-    if not tokens:
-        raise LampParseError("empty_row", label)
-    if len(tokens) > max_fields:
-        raise LampParseError("too_many_fields", f"{label}: {len(tokens)} > {max_fields}")
-    values: list[int] = []
-    for token in tokens:
-        if not _INT_RE.match(token):
-            raise LampParseError("bad_token", f"{label}: {token!r}")
-        values.append(int(token))
+def _fixed_fields(line: str, label: str, max_fields: int) -> list[int | None]:
+    """Decode a row's fixed 3-character columns (A0-R3, real layout).
+
+    The label occupies columns 0-4 and every value is right-justified in a 3-character
+    column starting at column 5, so negatives and `999` glue to their neighbours
+    (`" TMP  -5-12 -3"`). `999` is the published missing marker and decodes to None.
+    """
+    body = line[5:].rstrip()
+    if line[4:5] != " " or not body or len(body) % _COLUMN_WIDTH:
+        raise LampParseError("bad_row_shape", label)
+    count = len(body) // _COLUMN_WIDTH
+    if count > max_fields:
+        raise LampParseError("too_many_fields", f"{label}: {count} > {max_fields}")
+    values: list[int | None] = []
+    for i in range(0, len(body), _COLUMN_WIDTH):
+        cell = body[i : i + _COLUMN_WIDTH]
+        token = cell.strip()
+        if " " in token or not _INT_RE.match(token):
+            raise LampParseError("bad_token", f"{label}: {cell!r}")
+        values.append(None if int(token) == MISSING_MARKER else int(token))
     return values
 
 
@@ -198,20 +214,21 @@ def _issued_at(match: re.Match[str]) -> dt.datetime:
 def _build_block(
     station: str,
     issued: dt.datetime,
-    utc_row: list[int] | None,
-    tmp_row: list[int] | None,
+    utc_row: list[int | None] | None,
+    tmp_row: list[int | None] | None,
 ) -> LampBlock:
     if utc_row is None or tmp_row is None:
         raise LampParseError("missing_row", f"{station}: UTC and TMP rows are both required")
     if len(utc_row) != len(tmp_row):
         raise LampParseError("row_length_mismatch", f"{station}: {len(utc_row)} vs {len(tmp_row)}")
+    hours = [h for h in utc_row if h is not None and 0 <= h <= 23]
     first = issued.replace(minute=0) + dt.timedelta(hours=1)
-    if any(not 0 <= h <= 23 for h in utc_row) or utc_row[0] != first.hour:
-        raise LampParseError("utc_row_misaligned", f"{station}: starts {utc_row[0]:02d}")
-    if any((b - a) % 24 != 1 for a, b in pairwise(utc_row)):
+    if len(hours) != len(utc_row) or hours[0] != first.hour:
+        raise LampParseError("utc_row_misaligned", f"{station}: {utc_row[:1]}")
+    if any((b - a) % 24 != 1 for a, b in pairwise(hours)):
         raise LampParseError("utc_row_not_hourly", station)
     for value in tmp_row:
-        if not TMP_MIN_F <= value <= TMP_MAX_F:
+        if value is not None and not TMP_MIN_F <= value <= TMP_MAX_F:
             raise LampParseError("tmp_out_of_range", f"{station}: {value}")
     times = tuple(first + dt.timedelta(hours=i) for i in range(len(utc_row)))
     return LampBlock(station=station, issued_at=issued, valid_times=times, tmp_f=tuple(tmp_row))
@@ -226,7 +243,7 @@ def iter_lamp_blocks(
     """Yield one `LampBlock` per closed-set station block; refuse the run on a bad row."""
     station: str | None = None
     issued: dt.datetime | None = None
-    rows: dict[str, list[int]] = {}
+    rows: dict[str, list[int | None]] = {}
 
     def flush() -> LampBlock | None:
         if station is None or issued is None:
@@ -252,7 +269,7 @@ def iter_lamp_blocks(
         if label in ("UTC", "TMP"):
             if label in rows:
                 raise LampParseError("duplicate_row", f"{station}: {label}")
-            rows[label] = _int_fields(line, label, max_fields)
+            rows[label] = _fixed_fields(line, label, max_fields)
     if (block := flush()) is not None:
         yield block
 
@@ -271,6 +288,6 @@ def lamp_daily_max_f(
         for t, v in by_time.items()
         if climate_day_for_instant(t, std_utc_offset_hours) == climate_day
     ]
-    if len(window) != _HOURS_PER_LST_DAY:
+    if len(window) != _HOURS_PER_LST_DAY or any(v is None for v in window):
         return None
-    return max(window)
+    return max(v for v in window if v is not None)
