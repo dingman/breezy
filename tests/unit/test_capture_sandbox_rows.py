@@ -101,10 +101,13 @@ def test_audit_bus_reads_equal_names() -> None:
         assert row.bus_reads == () and not row.studies_lock and row.exceptions == frozenset()
 
 
-def test_only_the_audit_row_takes_the_studies_lock() -> None:
+def test_only_the_audit_and_label_rows_take_the_studies_lock() -> None:
+    # AUT-2 WP6 / E-15: the label run takes the studies flock in process under the E7_STUDIES_LOCK
+    # exception (plan-owner architect ruling), like the audit row. No other row may.
     assert [row.name for row in AUTONOMY_BWRAP_TABLE.values() if row.studies_lock] == [
         "breezy-autonomy-selftest-proc",
         "breezy-capture-audit",
+        "breezy-label-outcomes",
     ]
 
 
