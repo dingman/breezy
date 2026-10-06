@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import sys
 from collections.abc import Sequence
+from pathlib import Path
 from statistics import NormalDist
 from typing import Any, Final
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
 
 from breezy.strategy.forecast_quantile_ladder.decision import SidedAsk, Take
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
@@ -26,6 +33,7 @@ from scripts.analysis.fq_mc_eprocess import (
     _alphas,
     eprocess_scan,
     items_to_yz,
+    wilson_upper,
 )
 from scripts.analysis.fq_mc_livedata import (
     Design,
@@ -59,19 +67,37 @@ def _type1_rows(
             x_max=x_max,
         )
 
-        def rate(c: np.ndarray) -> dict[str, float]:
-            return {str(k + 1): float((c[k] >= 0).mean()) for k in range(len(alphas))}
-
+        reps = int(y.shape[0])
+        valid = batch.valid[..., :m_cap]
+        be_taken = batch.be[..., :m_cap][valid]
+        bite = float(np.mean(1.0 / be_taken - 1.0 > x_max)) if be_taken.size else 0.0
+        stats: dict[str, Any] = {}
+        for name, crossed in (
+            ("type1_joint", scan.cross_joint),
+            ("type1_a", scan.cross_a),
+            ("type1_b", scan.cross_b),
+        ):
+            hits = [int((crossed[k] >= 0).sum()) for k in range(len(alphas))]
+            rates = [x / reps for x in hits]
+            stats[name] = {str(k + 1): r for k, r in enumerate(rates)}
+            stats[f"{name}_se"] = {
+                str(k + 1): math.sqrt(r * (1.0 - r) / reps) for k, r in enumerate(rates)
+            }
+            stats[f"{name}_wilson_ub"] = {
+                str(k + 1): wilson_upper(x, reps) for k, x in enumerate(hits)
+            }
         rows.append(
             {
                 "m_cap": m_cap,
                 "x_max": x_max,
-                "reps": int(y.shape[0]),
-                "type1_joint": rate(scan.cross_joint),
-                "type1_a": rate(scan.cross_a),
-                "type1_b": rate(scan.cross_b),
+                "reps": reps,
+                **stats,
                 "alpha_k": {str(k + 1): a for k, a in enumerate(alphas)},
-                "p_false_kill": float((scan.kill_n >= 0).mean()),
+                # KILL's null is E[Y] >= 0 AFTER the clip; a clipped null stream has E[Y] < 0, so
+                # this is the rate at which a zero-edge stream is capital-protection killed.
+                "p_kill_under_null_stream": float((scan.kill_n >= 0).mean()),
+                "clipped_mean_y": float(y.mean()),
+                "clip_bite_fraction": bite,
                 "peak_joint_e_p99": float(np.exp(np.quantile(scan.peak_log_min, 0.99)))
                 if scan.peak_log_min is not None
                 else None,
@@ -89,18 +115,30 @@ def type1_mixed_side(
     seed: int,
     pi_fav: float,
     earliest_look_n: int,
+    delta_h: float = 0.0,
 ) -> dict[str, Any]:
-    """(ii) Mixed-side same-station-day takes: comonotone outcomes, exact null."""
+    """(ii) Mixed-side same-station-day takes: comonotone outcomes, exact null.
+
+    ``delta_h`` > 0 injects a true edge: a POSITIVE CONTROL that must trip PASS.
+    """
     templates = build_templates(pool_days, pi_fav=pi_fav, seed=seed)
     batch = simulate_pooled(
-        templates, Design(delta_h=0.0), reps=reps, days=days, seed=seed, null=True, mixed_only=True
+        templates,
+        Design(delta_h=delta_h),
+        reps=reps,
+        days=days,
+        seed=seed,
+        null=delta_h == 0.0,
+        mixed_only=True,
     )
     assert batch.st is not None and batch.mixed is not None
     pair = batch.valid[..., 0] & batch.valid[..., 1] & (batch.st[..., 0] == batch.st[..., 1])
     cov = (batch.h[..., 0] - batch.be[..., 0]) * (batch.h[..., 1] - batch.be[..., 1])
     return {
         "case": "ii_mixed_side_same_station_day",
-        "true_conditional_edge": 0.0,
+        "true_conditional_edge": delta_h,
+        "mean_takes_per_day": float(batch.n_d.mean()),
+        "looks_reached_fraction": float((batch.n_d.sum(axis=1) >= earliest_look_n).mean()),
         "mixed_side_fraction": float(batch.mixed.mean()),
         "pair_covariance": float(cov[pair].mean()) if pair.any() else 0.0,
         "positive_covariance": bool(pair.any() and cov[pair].mean() > 0.0),
@@ -140,6 +178,7 @@ def _intraday_rep_day(
     checkpoints: int,
     momentum: float,
     model_sd: float,
+    leak: float,
 ) -> tuple[list[tuple[float, float, float, float]], float]:
     """One day. M ~ N(0,1); rung events are {M > t_r}; pi_k(r) = P(M > t_r | info_k) is a
     martingale and the quote is set so BE = pi_k exactly, so E[h | G_tau] = BE for every take.
@@ -165,11 +204,14 @@ def _intraday_rep_day(
             for r in range(rungs):
                 jump = float(pi_k[r] - prev[r])
                 signal_abs += abs(jump)
+                y_event = 1.0 if m_latent > thr[r] else 0.0
                 p_hat = float(
                     np.clip(
                         pi_k[r] + momentum * jump + model_sd * rng.standard_normal(), 0.001, 0.999
                     )
                 )
+                # leak > 0 is a LOOK-AHEAD positive control: the model sees part of the outcome.
+                p_hat = float(np.clip((1.0 - leak) * p_hat + leak * y_event, 0.001, 0.999))
                 sides: tuple[tuple[Side, float], ...] = (
                     ("yes", float(pi_k[r])),
                     ("no", 1.0 - float(pi_k[r])),
@@ -193,7 +235,6 @@ def _intraday_rep_day(
                         latch=latch,
                     )
                     if isinstance(decision, Take):
-                        y_event = 1.0 if m_latent > thr[r] else 0.0
                         h = y_event if side == "yes" else 1.0 - y_event
                         p_side = p_hat if side == "yes" else 1.0 - p_hat
                         out.append((ask, be, p_side, h))
@@ -215,6 +256,7 @@ def type1_intraday(
     checkpoints: int = 4,
     momentum: float = 0.25,
     model_sd: float = 0.03,
+    leak: float = 0.0,
 ) -> dict[str, Any]:
     """(i) Intraday-informed take count.
 
@@ -240,6 +282,7 @@ def type1_intraday(
                 checkpoints=checkpoints,
                 momentum=momentum,
                 model_sd=model_sd,
+                leak=leak,
             )
             n_d[r, d] = len(takes)
             for j, (a, b, ps, hh) in enumerate(takes[:K_SLOTS]):
@@ -260,7 +303,9 @@ def type1_intraday(
     )
     return {
         "case": "i_intraday_informed_take_count",
-        "true_conditional_edge": 0.0,
+        "true_conditional_edge": 0.0 if leak == 0.0 else None,
+        "look_ahead_leak": leak,
+        "looks_reached_fraction": float((n_d.sum(axis=1) >= earliest_look_n).mean()),
         "realised_mean_edge_first_slots": float((h - be)[taken].mean()) if taken.any() else 0.0,
         "mean_takes_per_day": float(n_d.mean()),
         "take_count_varies_with_signal": bool(n_d.std() > 0 and corr_sig > 0.0),

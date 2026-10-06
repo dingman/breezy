@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -253,8 +254,19 @@ def test_h1_outcomes_from_delta_h_at_sampled_asks_residuals_only_for_rho_var(
     rho, var = mc.residual_rho_var([[0.1, 0.2, -0.3], [0.4, 0.5]])
     assert var > 0.0
     assert -1.0 <= rho <= 1.0
-    params = mc.simulate_pooled.__code__.co_varnames[: mc.simulate_pooled.__code__.co_argcount]
-    assert "residuals" not in params
+    # behavioural: flipping every settled outcome in the pool changes nothing the MC draws
+    flipped = [
+        mc.PoolRung(r.station, r.climate_day, r.rung_id, r.yes_ask, r.yes_bid, not r.result)
+        for r in _synthetic_pool()
+    ]
+    other_days = mc.group_days(flipped)
+    t1 = mc.build_templates(pool_days, pi_fav=0.6, seed=7)
+    t2 = mc.build_templates(other_days, pi_fav=0.6, seed=7)
+    b1 = mc.simulate_pooled(t1, _design(delta_h=0.1), reps=50, days=30, seed=9, null=False)
+    b2 = mc.simulate_pooled(t2, _design(delta_h=0.1), reps=50, days=30, seed=9, null=False)
+    assert np.array_equal(b1.h, b2.h)
+    assert np.array_equal(b1.be, b2.be)
+    assert mc.residual_rho_var([[0.1, -0.1], [0.2, -0.2]]) != mc.residual_rho_var([[0.1, 0.1]])
 
 
 # --------------------------------------------------------------------------- power and N
@@ -357,41 +369,64 @@ def test_n_starvation_compares_projection_to_n() -> None:
 # --------------------------------------------------------------------------- type I
 
 
+def _assert_rows_le_alpha(result: dict[str, Any]) -> None:
+    for row in result["rows"]:
+        for kind in ("type1_joint", "type1_a", "type1_b"):
+            for k, rate in row[kind].items():
+                assert rate <= mc.alpha_k(int(k)) + 1e-12, (row["m_cap"], kind, k)
+                ub = row[f"{kind}_wilson_ub"][k]
+                se = row[f"{kind}_se"][k]
+                assert ub >= rate and se >= 0.0
+                n = row["reps"]
+                assert ub == pytest.approx(mc.wilson_upper(round(rate * n), n))
+        assert "p_false_kill" not in row
+        assert 0.0 <= row["p_kill_under_null_stream"] <= 1.0
+        assert 0.0 <= row["clip_bite_fraction"] <= 1.0
+        assert isinstance(row["clipped_mean_y"], float)
+
+
 def test_mc_type1_mixed_side_le_alpha(pool_days: list[mc.PoolDay]) -> None:
     result = mc.type1_mixed_side(
-        pool_days,
-        designs=[(2, 4.0), (3, 4.0)],
-        reps=300,
-        days=50,
-        seed=21,
-        pi_fav=0.6,
+        pool_days, designs=[(2, 4.0), (3, 4.0)], reps=300, days=50, seed=21, pi_fav=0.6,
         earliest_look_n=5,
-    )
+    )  # fmt: skip
     assert result["mixed_side_fraction"] > 0.5
     assert result["positive_covariance"] is True
-    for row in result["rows"]:
-        for k, rate in row["type1_joint"].items():
-            assert rate <= mc.alpha_k(int(k)) + 1e-12, (row, k)
-        for k, rate in row["type1_a"].items():
-            assert rate <= mc.alpha_k(int(k)) + 1e-12, (row, k)
+    assert result["mean_takes_per_day"] * 50 >= 5  # the looks actually occurred
+    assert result["looks_reached_fraction"] > 0.9
+    _assert_rows_le_alpha(result)
 
 
 def test_mc_type1_intraday_dependent_take_count_le_alpha() -> None:
     result = mc.type1_intraday(
-        designs=[(2, 4.0), (3, 4.0)],
-        reps=60,
-        days=25,
-        seed=33,
-        earliest_look_n=5,
-    )
+        designs=[(2, 4.0), (3, 4.0)], reps=60, days=25, seed=33, earliest_look_n=5,
+    )  # fmt: skip
     assert result["take_count_varies_with_signal"] is True
     assert result["signal_outcome_correlation"] > 0.0
     assert result["true_conditional_edge"] == 0.0
-    for row in result["rows"]:
-        for k, rate in row["type1_joint"].items():
-            assert rate <= mc.alpha_k(int(k)) + 1e-12, (row, k)
-        for k, rate in row["type1_a"].items():
-            assert rate <= mc.alpha_k(int(k)) + 1e-12, (row, k)
+    assert result["mean_takes_per_day"] * 25 >= 5
+    assert result["looks_reached_fraction"] > 0.9
+    _assert_rows_le_alpha(result)
+
+
+def test_type1_mixed_side_positive_control_injected_edge_trips_pass(
+    pool_days: list[mc.PoolDay],
+) -> None:
+    """The harness must be able to fail: a real edge MUST cross the PASS bar."""
+    result = mc.type1_mixed_side(
+        pool_days, designs=[(2, 4.0)], reps=40, days=120, seed=21, pi_fav=0.6,
+        earliest_look_n=5, delta_h=0.5,
+    )  # fmt: skip
+    assert result["true_conditional_edge"] == 0.5
+    assert result["rows"][0]["type1_a"]["1"] > 0.5
+
+
+def test_type1_intraday_positive_control_look_ahead_trips_pass() -> None:
+    """A model that peeks at the outcome (look-ahead) MUST cross; the null result is not vacuous."""
+    result = mc.type1_intraday(
+        designs=[(2, 4.0)], reps=30, days=40, seed=33, earliest_look_n=5, leak=1.0,
+    )  # fmt: skip
+    assert result["rows"][0]["type1_a"]["1"] > 0.5
 
 
 def test_kill_cs_flags_a_clearly_negative_stream_and_spares_a_positive_one() -> None:
@@ -489,3 +524,83 @@ def test_every_cli_script_has_a_main_guard() -> None:
     for name in ("fq_resume_n_mc", "prereg_precommit_check"):
         text = (REPO_ROOT / "scripts/analysis" / f"{name}.py").read_text(encoding="utf-8")
         assert 'if __name__ == "__main__":' in text, name
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+def test_load_results_never_holds_holdout_outcomes_and_counts_skips(tmp_path: Path) -> None:
+    def market(ticker: str, result: str) -> dict[str, str]:
+        return {"ticker": ticker, "result": result}
+
+    (tmp_path / "markets_KXHIGHAAA.json").write_text(
+        json.dumps({"markets": [market("KXHIGHAAA-25MAR01-B70.5", "yes"),
+                                market("KXHIGHAAA-26JUL02-T99", "yes")]})
+    )  # fmt: skip
+    (tmp_path / "markets_KXHIGHBBB.json").write_text("{not json")
+    stats = livedata.LoadStats()
+    results = livedata._load_results(tmp_path, stats)
+    assert results == {"KXHIGHAAA-25MAR01-B70.5": True}
+    assert "KXHIGHAAA-26JUL02-T99" not in results
+    assert stats.markets_holdout_skipped == 1
+    assert stats.markets_files_undecodable == 1
+
+
+def test_load_pool_counts_undecodable_and_holdout_lines(tmp_path: Path) -> None:
+    candles = tmp_path / "candles.jsonl"
+    _write_candles(candles)
+    with candles.open("a") as handle:
+        handle.write("{broken\n")
+    stats = livedata.LoadStats()
+    pool = mc.load_pool(candles, markets_dir=tmp_path, stats=stats)
+    assert pool
+    assert stats.candle_lines_undecodable == 1
+    assert stats.candle_lines_holdout_skipped == 1
+    assert set(stats.as_dict()) >= {
+        "candle_lines_undecodable", "candle_lines_holdout_skipped", "candle_lines_unparsed",
+        "markets_files_undecodable", "markets_holdout_skipped",
+    }  # fmt: skip
+
+
+def test_calibrate_take_rate_returns_the_iterate_closest_to_target(
+    monkeypatch: pytest.MonkeyPatch, pool_days: list[mc.PoolDay]
+) -> None:
+    def fake_build(days: Any, *, pi_fav: float, seed: int, cfg: Any = None) -> list[Any]:
+        n = 1 if pi_fav < 0.45 else 3  # a step: the target sits in the jump
+        take = livedata.TakeRecord("S", "R", "yes", 0.2, 0.25, 0.5, 0.1)
+        return [livedata.DayTemplate(d.climate_day, (take,) * n) for d in days]
+
+    monkeypatch.setattr(livedata, "build_templates", fake_build)
+    pi, templates = mc.calibrate_take_rate(pool_days[:5], target_rate=1.1, seed=1)
+    assert float(np.mean([t.n for t in templates])) == 1.0  # |1-1.1| < |3-1.1|
+    assert pi < 0.45
+
+
+def test_starvation_is_computed_at_the_pinned_design_worst_case_over_the_sweep() -> None:
+    def cell(m: int, x: float, excess: float, n1: int | None, n4: int | None) -> dict[str, Any]:
+        return {
+            "m_cap": m, "x_max": x, "delta_h": 0.2, "take_rate": 1.0, "edge_excess_mean": excess,
+            "n_e_power_by_k": {"1": n1, "2": None, "3": None, "4": n4},
+            "n_e_power": n1, "n_max": 1000,
+        }  # fmt: skip
+
+    cells = [
+        cell(2, 4.0, 0.01, 500, 800),
+        cell(2, 4.0, 0.08, 700, None),  # worst case: k=4 never reached -> n_max + 1
+        cell(3, 4.0, 0.01, 100, 100),  # not the pinned design: must be ignored
+        cell(2, 2.0, 0.01, 100, 100),  # not the pinned design: must be ignored
+    ]
+    out = mc.starvation_by_delta(
+        cells, [1.0], [0.2], 1000, dt.date(2026, 10, 10), 0.9, m_cap=2, x_max=4.0
+    )
+    row = out["by_delta"]["0.2"]
+    assert row["k1"]["1.0"]["n_required"] == 700
+    assert row["k4"]["1.0"]["n_required"] == 1001
+    assert out["pinned_design"] == {"m_cap": 2, "x_max": 4.0}
+    assert out["headline_basis"] == "worst_case_over_edge_excess_sweep"
+    assert row["k1"]["1.0"]["starved"] is True
+
+
+def test_fq_mc_type1_has_its_own_sys_path_bootstrap() -> None:
+    text = (REPO_ROOT / "scripts/analysis/fq_mc_type1.py").read_text(encoding="utf-8")
+    assert "sys.path" in text

@@ -141,37 +141,76 @@ def _bid_close(response: Mapping[str, Any]) -> float | None:
     return None
 
 
-def _load_results(markets_dir: Path) -> dict[str, bool]:
+@dataclass(slots=True)
+class LoadStats:
+    """What the loaders skipped, so a silent drop shows up in the result JSON."""
+
+    candle_lines_undecodable: int = 0
+    candle_lines_unparsed: int = 0
+    candle_lines_holdout_skipped: int = 0
+    markets_files_undecodable: int = 0
+    markets_holdout_skipped: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "candle_lines_undecodable": self.candle_lines_undecodable,
+            "candle_lines_unparsed": self.candle_lines_unparsed,
+            "candle_lines_holdout_skipped": self.candle_lines_holdout_skipped,
+            "markets_files_undecodable": self.markets_files_undecodable,
+            "markets_holdout_skipped": self.markets_holdout_skipped,
+        }
+
+
+def _load_results(markets_dir: Path, stats: LoadStats | None = None) -> dict[str, bool]:
+    """Settled YES/NO by ticker. A holdout-dated ticker is skipped BEFORE its result is read."""
+    stats = stats if stats is not None else LoadStats()
     results: dict[str, bool] = {}
     for path in sorted(markets_dir.glob("markets_*.json")):
         try:
             markets = json.loads(path.read_text(encoding="utf-8")).get("markets", [])
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
+            stats.markets_files_undecodable += 1
             continue
         for market in markets:
-            if isinstance(market, Mapping) and market.get("result") in ("yes", "no"):
+            if not isinstance(market, Mapping):
+                continue
+            parsed = _ticker_day(str(market.get("ticker", "")))
+            if parsed is not None and parsed[1] >= HOLDOUT_START:
+                stats.markets_holdout_skipped += 1
+                continue
+            if market.get("result") in ("yes", "no"):
                 results[str(market.get("ticker"))] = market["result"] == "yes"
     return results
 
 
 def load_pool(
-    candles_path: Path, *, markets_dir: Path | None = None, start: dt.date = POOL_START
+    candles_path: Path,
+    *,
+    markets_dir: Path | None = None,
+    start: dt.date = POOL_START,
+    stats: LoadStats | None = None,
 ) -> list[PoolRung]:
     """Read-only. Rows dated at or after the holdout start are never kept."""
-    results = _load_results(markets_dir) if markets_dir is not None else {}
+    stats = stats if stats is not None else LoadStats()
+    results = _load_results(markets_dir, stats) if markets_dir is not None else {}
     rows: list[PoolRung] = []
     with candles_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             try:
                 record = json.loads(line)
             except ValueError:
+                stats.candle_lines_undecodable += 1
                 continue
             parsed = _ticker_day(str(record.get("ticker", "")))
             response = record.get("response")
             if parsed is None or not isinstance(response, Mapping):
+                stats.candle_lines_unparsed += 1
                 continue
             station, day, rung = parsed
-            if day < start or day >= HOLDOUT_START:
+            if day >= HOLDOUT_START:
+                stats.candle_lines_holdout_skipped += 1
+                continue
+            if day < start:
                 continue
             ask = ask_at_open(response)
             if ask is None:
@@ -443,14 +482,16 @@ def calibrate_take_rate(
     """Bisect pi_fav so the mean takes per climate day hits ``target_rate`` (fixed draws)."""
     lo, hi = 0.0, 1.0
     best = build_templates(days, pi_fav=hi, seed=seed, cfg=cfg)
-    if float(np.mean([t.n for t in best])) <= target_rate:
+    best_rate = float(np.mean([t.n for t in best]))
+    if best_rate <= target_rate:
         return hi, best
     best_pi = hi
     for _ in range(iterations):
         mid = 0.5 * (lo + hi)
         templates = build_templates(days, pi_fav=mid, seed=seed, cfg=cfg)
         rate = float(np.mean([t.n for t in templates]))
-        best, best_pi = templates, mid
+        if abs(rate - target_rate) < abs(best_rate - target_rate):
+            best, best_pi, best_rate = templates, mid, rate  # keep the iterate closest to target
         lo, hi = (mid, hi) if rate < target_rate else (lo, mid)
         if abs(rate - target_rate) < 0.02 * max(target_rate, 0.1):
             break

@@ -77,10 +77,12 @@ from scripts.analysis.fq_mc_eprocess import (
     outcome_probability,
     residual_rho_var,
     take_x,
+    wilson_upper,
 )
 from scripts.analysis.fq_mc_livedata import (
     HOLDOUT_START,
     Design,
+    LoadStats,
     LoopConfig,
     PoolDay,
     PoolRung,
@@ -130,6 +132,7 @@ __all__ = [
     "type1_intraday",
     "type1_mixed_side",
     "venue_fee_prob",
+    "wilson_upper",
 ]
 
 
@@ -331,7 +334,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type1-intraday-reps", type=int, default=800)
     p.add_argument("--type1-intraday-days", type=int, default=40)
     p.add_argument("--claim-excess", type=_floats, default=(0.01, 0.04, 0.08))
-    p.add_argument("--sens-reps", type=int, default=600)
+    p.add_argument("--sens-reps", type=int, default=1000)
+    p.add_argument("--pinned-m-cap", type=int, default=2)
+    p.add_argument("--pinned-x-max", type=float, default=4.0)
     p.add_argument("--skip-type1", action="store_true")
     return p
 
@@ -344,7 +349,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     def say(msg: str) -> None:
         print(f"PROGRESS +{time.monotonic() - t0:7.1f}s {msg}", flush=True)
 
-    rows = load_pool(args.candles, markets_dir=args.markets_dir)
+    load_stats = LoadStats()
+    rows = load_pool(args.candles, markets_dir=args.markets_dir, stats=load_stats)
     days_all = group_days(rows)
     rng = np.random.default_rng(args.seed)
     keep = sorted(rng.choice(len(days_all), size=min(args.pool_days, len(days_all)), replace=False))
@@ -395,9 +401,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for cell in run_grid(
             days,
             deltas=args.deltas,
-            rates=args.rates[-1:],
-            m_caps=args.m_caps,
-            x_maxes=args.x_maxes,
+            rates=args.rates,
+            m_caps=(args.pinned_m_cap,),
+            x_maxes=(args.pinned_x_max,),
             reps=args.sens_reps,
             n_max=args.n_max,
             seed=args.seed + 7,
@@ -406,8 +412,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             sensitivity.append({**cell, "edge_excess_mean": excess})
         say(f"claim sensitivity edge_excess_mean={excess} done")
+    default_excess = LoopConfig().edge_excess_mean
+    swept = [{**c, "edge_excess_mean": default_excess} for c in cells] + sensitivity
     starvation = starvation_by_delta(
-        cells, args.rates, args.deltas, args.n_max, args.d0, args.uptime_floor
+        swept,
+        args.rates,
+        args.deltas,
+        args.n_max,
+        args.d0,
+        args.uptime_floor,
+        m_cap=args.pinned_m_cap,
+        x_max=args.pinned_x_max,
     )
     result = {
         "pool": {
@@ -416,6 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "sampled_days": len(days),
             "cutoff_exclusive": HOLDOUT_START.isoformat(),
             "max_climate_day": max(r.climate_day for r in rows).isoformat(),
+            "load_stats": load_stats.as_dict(),
         },
         "residual_rho_hat": rho,
         "residual_variance": var,
@@ -437,6 +453,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _worst_case_n(
+    cells: Sequence[Mapping[str, Any]], *, rate: float, delta: float, k: str, n_max: int
+) -> int:
+    """Largest N over the matching cells; a cell that never reached power counts as n_max + 1."""
+    ns = [
+        c["n_e_power_by_k"][k] if c["n_e_power_by_k"][k] is not None else n_max + 1
+        for c in cells
+        if c["take_rate"] == rate and c["delta_h"] == delta
+    ]
+    return max(ns) if ns else n_max + 1
+
+
 def starvation_by_delta(
     cells: Sequence[Mapping[str, Any]],
     rates: Sequence[float],
@@ -444,25 +472,30 @@ def starvation_by_delta(
     n_max: int,
     d0: dt.date,
     uptime_floor: float,
+    *,
+    m_cap: int = 2,
+    x_max: float = 4.0,
 ) -> dict[str, Any]:
-    """Per delta_h: the best N over (m_cap, x_max) per rate against n available before the KILL."""
-    per_delta = {}
+    """Per delta_h at the PINNED design: joint N (k=1 and k=4) against n available before the KILL.
+
+    The headline N is the worst case over every cell supplied for that (rate, delta_h), i.e. over
+    the model-claim (edge_excess) sensitivity sweep. Cells of any other design are ignored.
+    """
+    pinned = [c for c in cells if c["m_cap"] == m_cap and c["x_max"] == x_max]
+    per_delta: dict[str, Any] = {}
     for delta in deltas:
-        need: dict[float, int] = {}
-        for rate in rates:
-            ns = [
-                c["n_e_power"]
-                for c in cells
-                if c["take_rate"] == rate and c["delta_h"] == delta and c["n_e_power"] is not None
-            ]
-            need[rate] = (
-                min(ns) if ns else n_max + 1
-            )  # n_max + 1 == "not reached inside the horizon"
-        per_delta[str(delta)] = n_starvation(n_required=need, d0=d0, uptime_floor=uptime_floor)[
-            "by_rate"
-        ]
+        row: dict[str, Any] = {}
+        for label, k in (("k1", "1"), ("k4", "4")):
+            need = {r: _worst_case_n(pinned, rate=r, delta=delta, k=k, n_max=n_max) for r in rates}
+            row[label] = n_starvation(n_required=need, d0=d0, uptime_floor=uptime_floor)["by_rate"]
+        per_delta[str(delta)] = row
     base = n_starvation(n_required={r: n_max + 1 for r in rates}, d0=d0, uptime_floor=uptime_floor)
-    every = all(v["starved"] for by_rate in per_delta.values() for v in by_rate.values())
+    every = all(
+        v["starved"]
+        for row in per_delta.values()
+        for by_rate in row.values()
+        for v in by_rate.values()
+    )
     verdict = (
         "STARVED at every (delta_h, take rate) grid point"
         if every
@@ -474,12 +507,15 @@ def starvation_by_delta(
         "days_to_kill": base["days_to_kill"],
         "uptime_floor": uptime_floor,
         "n_max_horizon": n_max,
+        "pinned_design": {"m_cap": m_cap, "x_max": x_max},
+        "headline_basis": "worst_case_over_edge_excess_sweep",
         "by_delta": per_delta,
         "starved_at_every_grid_point": every,
         "m1_fallback_preregistered": True,
         "statement": (
-            f"n-starvation outcome: {verdict}; {base['days_to_kill']} forward days from "
-            f"{base['d0']} to {base['kill_date']} at uptime floor {uptime_floor}. "
+            f"n-starvation outcome at m_cap={m_cap}, X_max={x_max}: {verdict}; "
+            f"{base['days_to_kill']} forward days from {base['d0']} to {base['kill_date']} at "
+            f"uptime floor {uptime_floor}. "
             "The M1 fallback is pre-registered: where the e-process on Takes is n-starved, the "
             "n-rich M1 path with forward-frozen confirmation is the primary route (FQ-R14)."
         ),

@@ -9,6 +9,12 @@ the command line and nothing else: no repo, no network, no write.
 
     prereg_precommit_check.py <design.json>
 
+Beyond shape and range it is MANDATORY against the committed blob: the design file must equal
+(canonical JSON, the `frozen_sha` key itself excluded because a commit cannot contain its own
+sha) the blob `git show <frozen_sha>:<path>`, and the sha must be a reachable commit. It also pins
+theta, ask_floor, the haircut and both betting rules to the constants the N Monte-Carlo ran with,
+imported from it (no duplicated literals).
+
 This script does not choose any value. The values are the coordinator's, pinned after the
 joint-power N Monte-Carlo (`fq_resume_n_mc.py`) and the peer loop.
 """
@@ -18,12 +24,46 @@ from __future__ import annotations
 import json
 import math
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-__all__ = ["REQUIRED_KEYS", "load_design", "main", "validate_design"]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
+from scripts.analysis.fq_mc_eprocess import BETTING_RULE
+from scripts.analysis.fq_mc_livedata import LoopConfig
+
+#: The values the N Monte-Carlo ran with. The design must carry exactly these.
+PINNED_THETA: Final[float] = LoopConfig().theta
+PINNED_ASK_FLOOR: Final[float] = LoopConfig().ask_floor
+PINNED_HAIRCUT: Final[float] = LoopConfig().haircut  # one tick = ticks * tick_size
+PINNED_BETTING_RULE: Final[str] = BETTING_RULE
+_GIT_TIMEOUT_S: Final[int] = 20
+
+
+@dataclass(frozen=True, slots=True)
+class Defect:
+    """One validation failure: a stable ``code`` for callers and tests, a ``message`` for people."""
+
+    code: str
+    message: str
+
+
+__all__ = [
+    "REQUIRED_KEYS",
+    "Defect",
+    "check_frozen_blob",
+    "load_design",
+    "main",
+    "validate_defects",
+    "validate_design",
+]
 
 _SHA_RE: Final = re.compile(r"^[0-9a-f]{40}$")
 
@@ -185,11 +225,16 @@ _FIELD_CHECKS: Final[dict[str, Callable[[Any], str | None]]] = {
 }
 
 
-def _check_gamma_pin(design: Mapping[str, Any]) -> tuple[list[str], int | None]:
-    """Exactly one of `T` / `per_epoch_budgets` is pinned (E-25 rule 4); (errors, look_count)."""
+def _check_gamma_pin(design: Mapping[str, Any]) -> tuple[list[Defect], int | None]:
+    """Exactly one of `T` / `per_epoch_budgets` is pinned (E-25 rule 4); (defects, look_count).
+
+    A missing `T` with no budgets is reported once, as MISSING_KEY, by `validate_defects`.
+    """
     has_t, has_budgets = "T" in design, "per_epoch_budgets" in design
     if has_t and has_budgets:
-        return ["pin exactly one of T and per_epoch_budgets, not both"], None
+        return [
+            Defect("GAMMA_PIN_BOTH", "pin exactly one of T and per_epoch_budgets, not both")
+        ], None
     if has_budgets:
         budgets = design["per_epoch_budgets"]
         if (
@@ -199,44 +244,123 @@ def _check_gamma_pin(design: Mapping[str, Any]) -> tuple[list[str], int | None]:
             and all(_num_in(b, 0.0, 1.0) for b in budgets)
         ):
             return [], len(budgets)
-        return ["per_epoch_budgets must be a non-empty list of numbers in (0, 1]"], None
+        message = "per_epoch_budgets must be a non-empty list of numbers in (0, 1]"
+        return [Defect("BAD_per_epoch_budgets", message)], None
     if not has_t:
-        return ["T missing (pin T, or per_epoch_budgets instead)"], None
+        return [], None
     t = design["T"]
     if _is_int(t) and 1 <= t <= MAX_NOMINATIONS_PER_LINEAGE_LIFETIME:
         return [], t
-    return [f"T must be an int in 1..{MAX_NOMINATIONS_PER_LINEAGE_LIFETIME}, got {t!r}"], None
+    message = f"T must be an int in 1..{MAX_NOMINATIONS_PER_LINEAGE_LIFETIME}, got {t!r}"
+    return [Defect("BAD_T", message)], None
 
 
-def _check_n_e_power(design: Mapping[str, Any], looks: int | None) -> list[str]:
-    errors: list[str] = []
+def _check_n_e_power(design: Mapping[str, Any], looks: int | None) -> list[Defect]:
+    defects: list[Defect] = []
     if design.get("n_e_power_basis") != "joint_min_ea_eb":
-        errors.append("n_e_power_basis must be 'joint_min_ea_eb' (joint power of min(e_a, e_b))")
+        message = "n_e_power_basis must be 'joint_min_ea_eb' (joint power of min(e_a, e_b))"
+        defects.append(Defect("BAD_n_e_power_basis", message))
     table = design.get("n_e_power")
     if not isinstance(table, Mapping) or not table:
-        return [*errors, "n_e_power must be a non-empty {k: n} table"]
+        return [*defects, Defect("BAD_n_e_power", "n_e_power must be a non-empty {k: n} table")]
     if looks is not None and set(table) != {str(k) for k in range(1, looks + 1)}:
-        errors.append(f"n_e_power keys must be exactly '1'..'{looks}', got {sorted(table)}")
+        message = f"n_e_power keys must be exactly '1'..'{looks}', got {sorted(table)}"
+        defects.append(Defect("BAD_n_e_power", message))
     if not all(_is_int(n) and n > 0 for n in table.values()):
-        errors.append("n_e_power values must be ints > 0")
-    return errors
+        defects.append(Defect("BAD_n_e_power", "n_e_power values must be ints > 0"))
+    return defects
+
+
+def _check_pins(design: Mapping[str, Any]) -> list[Defect]:
+    """theta, ask floor, haircut and both betting rules must be what the MC ran with."""
+    wanted: dict[str, Any] = {
+        "theta": PINNED_THETA,
+        "ask_floor": PINNED_ASK_FLOOR,
+        "betting_rule_e_a": PINNED_BETTING_RULE,
+        "betting_rule_e_b": PINNED_BETTING_RULE,
+    }
+    defects = [
+        Defect("PIN_MISMATCH", f"{key} must equal the MC constant {value!r}, got {design[key]!r}")
+        for key, value in wanted.items()
+        if key in design and design[key] != value
+    ]
+    haircut = design.get("haircut")
+    if isinstance(haircut, Mapping) and _check_haircut(haircut) is None:
+        ticks = haircut["ticks"] * haircut["tick_size"]
+        if not math.isclose(ticks, PINNED_HAIRCUT, abs_tol=1e-12):
+            message = f"haircut ticks*tick_size must equal {PINNED_HAIRCUT!r}, got {ticks!r}"
+            defects.append(Defect("PIN_MISMATCH", message))
+    return defects
+
+
+def validate_defects(design: Mapping[str, Any]) -> list[Defect]:
+    """Every shape, range and pin defect in ``design``; empty when it is acceptable."""
+    defects: list[Defect] = []
+    for key in REQUIRED_KEYS:
+        if key not in design and not (key == "T" and "per_epoch_budgets" in design):
+            defects.append(Defect("MISSING_KEY", f"missing required key: {key}"))
+    defects.extend(
+        Defect("UNKNOWN_KEY", f"unknown key: {key}") for key in sorted(set(design) - _ALLOWED)
+    )
+    for key, check in _FIELD_CHECKS.items():
+        if key in design and (message := check(design[key])):
+            defects.append(Defect(f"BAD_{key}", message))
+    gamma_defects, looks = _check_gamma_pin(design)
+    defects.extend(gamma_defects)
+    if "n_e_power" in design or "n_e_power_basis" in design:
+        defects.extend(_check_n_e_power(design, looks))
+    defects.extend(_check_pins(design))
+    return defects
 
 
 def validate_design(design: Mapping[str, Any]) -> list[str]:
-    """Every defect in ``design`` as a human-readable line; empty when the design is acceptable."""
-    errors: list[str] = []
-    for key in REQUIRED_KEYS:
-        if key not in design and not (key == "T" and "per_epoch_budgets" in design):
-            errors.append(f"missing required key: {key}")
-    errors.extend(f"unknown key: {key}" for key in sorted(set(design) - _ALLOWED))
-    for key, check in _FIELD_CHECKS.items():
-        if key in design and (message := check(design[key])):
-            errors.append(message)
-    gamma_errors, looks = _check_gamma_pin(design)
-    errors.extend(e for e in gamma_errors if not e.startswith("T missing"))
-    if "n_e_power" in design or "n_e_power_basis" in design:
-        errors.extend(_check_n_e_power(design, looks))
-    return errors
+    """The messages of `validate_defects`, for callers that only print."""
+    return [d.message for d in validate_defects(design)]
+
+
+def _canonical(design: Mapping[str, Any]) -> str:
+    """Canonical JSON of a design, without `frozen_sha` (a commit cannot contain its own sha)."""
+    body = {k: v for k, v in design.items() if k != "frozen_sha"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT_S,
+        check=False,
+    )
+
+
+def check_frozen_blob(path: Path, design: Mapping[str, Any]) -> list[Defect]:
+    """Refuse a design whose content differs from the blob committed at `frozen_sha`."""
+    sha = design.get("frozen_sha")
+    if not isinstance(sha, str) or not _SHA_RE.match(sha):
+        return [Defect("BAD_frozen_sha", "frozen_sha must be a 40-char lowercase hex git SHA")]
+    folder = path.resolve().parent
+    try:
+        top = _git(folder, "rev-parse", "--show-toplevel")
+        if top.returncode != 0:
+            return [Defect("NOT_IN_GIT_REPO", f"{path} is not inside a git repository")]
+        root = Path(top.stdout.strip())
+        if _git(root, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
+            return [Defect("FROZEN_SHA_UNREACHABLE", f"frozen_sha {sha} is not a reachable commit")]
+        rel = path.resolve().relative_to(root).as_posix()
+        blob = _git(root, "show", f"{sha}:{rel}")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return [Defect("GIT_FAILED", f"cannot read the committed blob: {exc}")]
+    if blob.returncode != 0:
+        return [Defect("FROZEN_BLOB_MISSING", f"{rel} does not exist at commit {sha}")]
+    try:
+        committed = json.loads(blob.stdout)
+    except ValueError:
+        return [Defect("FROZEN_BLOB_DIFFERS", f"the blob at {sha}:{rel} is not valid JSON")]
+    if not isinstance(committed, Mapping) or _canonical(committed) != _canonical(design):
+        return [Defect("FROZEN_BLOB_DIFFERS", f"{rel} differs from the blob committed at {sha}")]
+    return []
 
 
 def load_design(path: Path) -> Mapping[str, Any]:
@@ -251,18 +375,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(args) != 1:
         print("usage: prereg_precommit_check.py <design.json>", file=sys.stderr)
         return 2
+    path = Path(args[0])
     try:
-        design = load_design(Path(args[0]))
+        design = load_design(path)
     except (OSError, TypeError, ValueError) as exc:  # JSONDecodeError is a ValueError
         print(f"cannot load design: {exc}", file=sys.stderr)
         return 2
-    errors = validate_design(design)
-    for line in errors:
-        print(line, file=sys.stderr)
-    if errors:
-        print(f"FAIL: {len(errors)} defect(s)", file=sys.stderr)
+    defects = validate_defects(design)
+    defects.extend(check_frozen_blob(path, design))
+    for defect in defects:
+        print(f"[{defect.code}] {defect.message}", file=sys.stderr)
+    if defects:
+        print(f"FAIL: {len(defects)} defect(s)", file=sys.stderr)
         return 1
-    print("OK: design is complete and in range")
+    print("OK: design is complete, in range, pinned, and equals its committed blob")
     return 0
 
 

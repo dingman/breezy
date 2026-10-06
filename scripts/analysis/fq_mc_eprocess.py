@@ -47,6 +47,17 @@ PRIOR_SECOND_MOMENT: Final[float] = 0.25
 BETTING_RULE: Final[str] = "agrapa_v1:prior_pseudo_days=1,prior_second_moment=0.25"
 
 
+def wilson_upper(successes: int, trials: int, *, z: float = 1.959963984540054) -> float:
+    """Upper end of the Wilson score interval for a rate of ``successes`` in ``trials``."""
+    if trials <= 0:
+        return 1.0
+    p = successes / trials
+    denom = 1.0 + z * z / trials
+    centre = p + z * z / (2.0 * trials)
+    half = z * math.sqrt(p * (1.0 - p) / trials + z * z / (4.0 * trials * trials))
+    return min(1.0, (centre + half) / denom)
+
+
 def gamma_schedule(horizon: int = T_NOMINATIONS) -> tuple[float, ...]:
     """gamma_t = g(t)/sum_{s<=T} g(s), g(t) = 1/(t ln^2(t+1))."""
     g = [1.0 / (t * math.log(t + 1.0) ** 2) for t in range(1, horizon + 1)]

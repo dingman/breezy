@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-import copy
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -169,13 +170,18 @@ def test_n_e_power_must_be_joint_and_cover_every_look() -> None:
 def test_gamma_pins_exactly_one_of_t_or_epoch_budgets() -> None:
     design = _valid()
     design["per_epoch_budgets"] = [0.01, 0.01]
-    assert any("T" in e and "per_epoch_budgets" in e for e in chk.validate_design(design))
+    assert "GAMMA_PIN_BOTH" in {d.code for d in chk.validate_defects(design)}
     design = _valid()
     del design["T"]
     design["per_epoch_budgets"] = [0.01, 0.01]
     design["n_e_power"] = {"1": 1, "2": 2}
     # T is a required E-25 consumption key unless the budgets alternative is pinned
-    assert chk.validate_design(design) == []
+    assert chk.validate_defects(design) == []
+    design = _valid()
+    del design["T"]
+    codes = {d.code for d in chk.validate_defects(design)}
+    assert "MISSING_KEY" in codes
+    assert "GAMMA_PIN_MISSING" not in codes  # one defect per cause, not two
 
 
 def test_unknown_keys_are_refused() -> None:
@@ -184,14 +190,40 @@ def test_unknown_keys_are_refused() -> None:
     assert any("surprise" in e for e in chk.validate_design(design))
 
 
+def _git(repo: Path, *args: str) -> str:
+    env = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "PATH": os.environ["PATH"],
+        "HOME": str(repo),
+    }
+    done = subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        cwd=repo, env=env, check=True, capture_output=True, text=True,
+    )  # fmt: skip
+    return done.stdout.strip()
+
+
+def _committed(tmp_path: Path, design: dict[str, object]) -> Path:
+    """Commit ``design`` in a throwaway repo, then stamp the commit sha into the file."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    path = repo / "design.json"
+    design = {**design, "frozen_sha": "0" * 40}
+    path.write_text(json.dumps(design, indent=1, sort_keys=True))
+    _git(repo, "add", "design.json")
+    _git(repo, "commit", "-q", "-m", "freeze")
+    sha = _git(repo, "rev-parse", "HEAD")
+    path.write_text(json.dumps({**design, "frozen_sha": sha}, indent=1, sort_keys=True))
+    return path
+
+
 def test_main_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    good = tmp_path / "good.json"
-    good.write_text(json.dumps(_valid()))
+    good = _committed(tmp_path, _valid())
     assert chk.main([str(good)]) == 0
-    bad_design = copy.deepcopy(_valid())
-    bad_design["m_cap"] = 5
     bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps(bad_design))
+    bad.write_text(json.dumps({**_valid(), "m_cap": 5}))
     assert chk.main([str(bad)]) != 0
     assert "m_cap" in capsys.readouterr().err
     assert chk.main([str(tmp_path / "missing.json")]) != 0
@@ -201,3 +233,65 @@ def test_main_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     arr = tmp_path / "arr.json"
     arr.write_text("[]")
     assert chk.main([str(arr)]) != 0
+
+
+def test_precommit_refuses_a_design_that_differs_from_the_committed_blob(tmp_path: Path) -> None:
+    path = _committed(tmp_path, _valid())
+    assert chk.main([str(path)]) == 0
+    edited = json.loads(path.read_text())
+    edited["m_cap"] = 3  # in range, but not what was frozen
+    path.write_text(json.dumps(edited, indent=1, sort_keys=True))
+    assert chk.validate_design(edited) == []  # shape and range alone would accept it
+    assert chk.main([str(path)]) != 0
+    assert "FROZEN_BLOB_DIFFERS" in {d.code for d in chk.check_frozen_blob(path, edited)}
+
+
+def test_precommit_ignores_key_order_and_whitespace_but_not_values(tmp_path: Path) -> None:
+    path = _committed(tmp_path, _valid())
+    reordered = dict(reversed(list(json.loads(path.read_text()).items())))
+    path.write_text(json.dumps(reordered))  # compact, reversed key order
+    assert chk.main([str(path)]) == 0
+
+
+def test_precommit_refuses_an_unreachable_frozen_sha(tmp_path: Path) -> None:
+    path = _committed(tmp_path, _valid())
+    design = json.loads(path.read_text())
+    design["frozen_sha"] = "ab" * 20
+    path.write_text(json.dumps(design))
+    assert "FROZEN_SHA_UNREACHABLE" in {d.code for d in chk.check_frozen_blob(path, design)}
+    assert chk.main([str(path)]) != 0
+
+
+def test_precommit_refuses_a_file_outside_any_git_repo(tmp_path: Path) -> None:
+    path = tmp_path / "loose.json"
+    path.write_text(json.dumps(_valid()))
+    assert chk.main([str(path)]) != 0
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("theta", 0.06),
+        ("ask_floor", 0.1),
+        ("haircut", {"ticks": 2, "tick_size": 0.01}),
+        ("betting_rule_e_a", "agrapa_v1:prior_pseudo_days=2,prior_second_moment=0.25"),
+        ("betting_rule_e_b", "something_else"),
+    ],
+)
+def test_precommit_pins_mc_constants(key: str, value: object, tmp_path: Path) -> None:
+    design = _valid()
+    design[key] = value
+    assert "PIN_MISMATCH" in {d.code for d in chk.validate_defects(design)}
+    path = _committed(tmp_path, design)  # frozen and committed, still refused
+    assert chk.main([str(path)]) != 0
+
+
+def test_pins_are_imported_from_the_mc_not_duplicated() -> None:
+    from scripts.analysis import fq_mc_eprocess, fq_mc_livedata
+
+    assert chk.PINNED_THETA == fq_mc_livedata.LoopConfig().theta
+    assert chk.PINNED_ASK_FLOOR == fq_mc_livedata.LoopConfig().ask_floor
+    assert chk.PINNED_BETTING_RULE == fq_mc_eprocess.BETTING_RULE
+    source = (REPO_ROOT / "scripts/analysis/prereg_precommit_check.py").read_text()
+    assert "0.0695" not in source
+    assert "agrapa_v1" not in source
