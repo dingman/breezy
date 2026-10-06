@@ -1331,3 +1331,83 @@ def _fixture_bytes_for_status_test() -> bytes:
         / "family_halt"
         / "legacy_v4_halt_2026-09-24.bin"
     ).read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# cwd independence (2026-10-05: a systemd unit ran the CLI with cwd=/home/jon)
+# ---------------------------------------------------------------------------
+
+
+def test_set_family_halt_resolves_manifest_independent_of_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+    foreign = tmp_path / "foreign_cwd"
+    foreign.mkdir()
+    monkeypatch.chdir(foreign)
+    assert not Path("deploy/families").exists()
+
+    code = _run(
+        ["--reason", REASON, "--evidence-path", str(_evidence_path(tmp_path))],
+        store_path,
+    )
+
+    assert code == EXIT_OK
+    assert _is_halted(store_path)
+
+
+def test_status_works_from_foreign_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+    foreign = tmp_path / "foreign_cwd"
+    foreign.mkdir()
+    monkeypatch.chdir(foreign)
+    out = io.StringIO()
+
+    code = _run(["--status"], store_path, stdout=out)
+
+    assert code == EXIT_OK
+    assert "halted=False" in out.getvalue()
+
+
+def test_missing_families_dir_fails_closed_rc2_never_cwd_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from breezy.strategy.current_rung_hold import family_id_arg
+
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+    # A decoy manifest dir in the cwd must never be picked up.
+    decoy = tmp_path / "cwd" / "deploy"
+    decoy.mkdir(parents=True)
+    (decoy / "families").symlink_to(Path(family_id_arg._REPO_ROOT) / "deploy" / "families")
+    monkeypatch.chdir(tmp_path / "cwd")
+    monkeypatch.setattr(family_id_arg, "_REPO_ROOT", tmp_path / "no_such_root")
+    err = io.StringIO()
+
+    code = _run(
+        ["--reason", REASON, "--evidence-path", str(_evidence_path(tmp_path))],
+        store_path,
+        stderr=err,
+    )
+
+    assert code == 2
+    assert "families directory not found" in err.getvalue()
+    assert not _is_halted(store_path)
+
+
+def test_relative_evidence_path_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store_path = tmp_path / "state.db"
+    _seed_open_submit_intent_and_close(store_path)
+    evidence = _evidence_path(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(["--reason", REASON, "--evidence-path", evidence.name], store_path)
+
+    assert excinfo.value.code == 2
+    assert "must be an absolute path" in capsys.readouterr().err
+    assert not _is_halted(store_path)

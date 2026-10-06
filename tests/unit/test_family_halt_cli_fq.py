@@ -17,6 +17,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from breezy.runtime.exec_state_db_path import EXEC_STATE_DB_ENV_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
@@ -237,3 +239,18 @@ def test_a_failed_positions_get_refuses_for_both_kinds(tmp_path: Path) -> None:
 def test_kinds_with_exit_path_is_pinned_exactly_and_within_the_haltable_kinds() -> None:
     assert KINDS_WITH_EXIT_PATH == frozenset({"continuous_rung_hold"})
     assert KINDS_WITH_EXIT_PATH <= HALTABLE_COMPOSITION_KINDS
+
+
+def test_fq_set_and_clear_resolve_manifest_independent_of_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_path = tmp_path / "state.db"
+    SqliteStateStore(store_path).close()
+    foreign = tmp_path / "foreign_cwd"
+    foreign.mkdir()
+    monkeypatch.chdir(foreign)
+
+    set_code, set_err = _set(tmp_path, store_path)
+    clear_code, clear_err = _clear(tmp_path, store_path)
+
+    assert (set_code, clear_code) == (EXIT_OK, EXIT_OK), (set_err, clear_err)

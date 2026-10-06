@@ -122,6 +122,8 @@ from breezy.runtime.submit_intent import (
 from breezy.strategy.current_rung_hold.family_id_arg import (
     KINDS_WITH_EXIT_PATH,
     FamilyIdArgError,
+    default_families_dir,
+    evidence_path_arg,
     resolve_haltable_family_arg,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -174,13 +176,6 @@ def _reason_type(value: str) -> str:
             f"--reason must be at least {MIN_REASON_LENGTH} characters"
         )
     return stripped
-
-
-def _evidence_path_type(value: str) -> Path:
-    path = Path(value)
-    if not path.is_file():
-        raise argparse.ArgumentTypeError(f"--evidence-path does not exist: {value}")
-    return path
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,8 +371,9 @@ def set_family_halt(
     parser.add_argument(
         "--families-dir",
         type=Path,
-        default=Path("deploy/families"),
-        help="directory containing registered family manifests",
+        default=None,
+        help="directory containing registered family manifests "
+        "(default: deploy/families under the repository root, never the cwd)",
     )
     parser.add_argument(
         "--reason",
@@ -386,14 +382,17 @@ def set_family_halt(
     )
     parser.add_argument(
         "--evidence-path",
-        type=_evidence_path_type,
+        type=evidence_path_arg,
         help="path to an existing evidence artefact; only its sha256 is recorded",
     )
     args = parser.parse_args(argv)
     if not args.status and (args.reason is None or args.evidence_path is None):
         parser.error("--reason and --evidence-path are required unless --status is given")
     try:
-        manifest = resolve_haltable_family_arg(args.family_id, args.families_dir)
+        families_dir = (
+            args.families_dir if args.families_dir is not None else default_families_dir()
+        )
+        manifest = resolve_haltable_family_arg(args.family_id, families_dir)
     except FamilyIdArgError as exc:
         print(f"breezy-set-family-halt: {exc}; refused", file=err)
         return EXIT_REFUSED

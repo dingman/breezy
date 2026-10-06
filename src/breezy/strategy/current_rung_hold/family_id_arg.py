@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from typing import Final
 
@@ -31,6 +32,48 @@ KINDS_WITH_EXIT_PATH: Final[frozenset[str]] = frozenset({"continuous_rung_hold"}
 
 class FamilyIdArgError(ValueError):
     """Raised when a CLI family id is syntactically or semantically invalid."""
+
+
+#: The repository root, located from this file (``src/breezy/strategy/
+#: current_rung_hold/family_id_arg.py`` -> ``parents[4]``), the same anchor
+#: ``runtime.build_sha`` uses for ``breezy.__file__``. NEVER the process cwd:
+#: a systemd unit runs the halt CLIs with an arbitrary cwd (2026-10-05).
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[4]
+
+_FAMILIES_SUBDIR: Final[Path] = Path("deploy") / "families"
+
+
+def default_families_dir() -> Path:
+    """The registered-manifest directory under the repo root, independent of cwd.
+
+    Fails closed: raises :class:`FamilyIdArgError` when it does not exist, never
+    falling back to a cwd-relative path.
+    """
+    families_dir = _REPO_ROOT / _FAMILIES_SUBDIR
+    if not families_dir.is_dir():
+        raise FamilyIdArgError(
+            f"families directory not found at {families_dir} (derived from the installed "
+            "package location, not the cwd); pass an absolute --families-dir"
+        )
+    return families_dir
+
+
+def evidence_path_arg(value: str) -> Path:
+    """argparse ``type`` for ``--evidence-path``: absolute, existing file only.
+
+    A relative path is refused rather than resolved: it used to bind to the
+    cwd, and silently hashing a different file than the operator meant would
+    corrupt the audit record.
+    """
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"--evidence-path must be an absolute path (got {value!r}); "
+            "relative paths are refused because they depend on the cwd"
+        )
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"--evidence-path does not exist: {value}")
+    return path
 
 
 def resolve_haltable_family_arg(family_id: str, families_dir: Path) -> FamilyManifest:
