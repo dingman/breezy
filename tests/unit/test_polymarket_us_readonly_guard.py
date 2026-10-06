@@ -2295,6 +2295,12 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         "scripts/analysis/current_rung_hold_paper_replay.py",
         "src/breezy/app/trade.py",
         "src/breezy/runtime/trade_supervisor.py",
+        # WIDENED (AUT-2 r7 WP5, Z19), not relaxed: the comparison is still `==`; old -> new added
+        # exactly this one path. `prelaunch_intents` imports `SubmitIntent`, `SubmitIntentState` and
+        # `SubmitIntentCorrupt` to DECODE the singleton and the retired-intent history the caller
+        # hands it; it opens no latch, takes no flock and opens no store (the reads are injected
+        # callables), so it adds no second latch.
+        "src/breezy/analysis/labeling/prelaunch_intents.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",

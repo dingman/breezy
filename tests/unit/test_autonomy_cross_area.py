@@ -26,8 +26,13 @@ from tests.support.autonomy_owner_stub import await_owner
 from tests.unit.autonomy_blocks_kinds_floor import BLOCKS_KINDS_FLOOR
 from tests.unit.autonomy_owner_placeholders import CROSS_AREA_FILE, OWNER_PLACEHOLDERS, OwnerRow
 
-#: Stubs the plan carries in this file, and the six AUT-5a stubs r5 added.
-EXPECTED_CROSS_AREA_STUBS: Final = 157
+#: Stubs the plan carries in this file, and the six AUT-5a stubs r5 added. 157 at seam 4b; five
+#: AUT-2 stubs became real tests as their symbols landed (WP0, WP2, WP3 x2 and WP5: the
+#: ``test_poststop_venue_read_is_get_only``, ``test_scorer_never_attributes_by_trial_id_prefix``,
+#: ``test_p_at_decision_is_bought_leg_probability``,
+#: ``test_retired_kind_keeps_scorer_until_last_fill_labelled`` and
+#: ``test_voided_pair_fills_excluded_from_all_n`` stubs), so the carried count is 157 - 5.
+EXPECTED_CROSS_AREA_STUBS: Final = 152
 R5_AUT_5A_STUBS: Final = (
     "test_l1_cutover_lock_acquired_at_164454_aborts",
     "test_l1_cutover_late_write_completion_aborts",
@@ -974,29 +979,58 @@ def test_producer_demand_write_is_restrictive_only(case: str) -> None:
     await_owner(f"test_producer_demand_write_is_restrictive_only[{case}]")
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")
 def test_p_at_decision_is_bought_leg_probability() -> None:
-    await_owner("test_p_at_decision_is_bought_leg_probability")
+    """Delivered by AUT-2 WP3: the owner's own test, run under the ARCH 4.7 node id."""
+    from tests.unit.test_aut2_probability import test_p_at_decision_is_bought_leg_probability as t
+
+    t()
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")
 def test_scorer_never_attributes_by_trial_id_prefix() -> None:
-    await_owner("test_scorer_never_attributes_by_trial_id_prefix")
+    """Delivered by AUT-2 WP2: the owner's own test (AST scan plus a behaviour fixture)."""
+    from tests.unit.test_aut2_attribution import (
+        test_scorer_never_attributes_by_trial_id_prefix as t,
+    )
+
+    t()
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")
 def test_voided_pair_fills_excluded_from_all_n() -> None:
-    await_owner("test_voided_pair_fills_excluded_from_all_n")
+    """A voided-pair fill keeps its family but never selects into any P&L or n aggregate."""
+    from dataclasses import replace
+
+    from breezy.analysis.labeling.attribution import Attribution
+    from breezy.persistence.autonomy.label_schema import ExcludedReason
+    from breezy.persistence.autonomy.label_store import admissible_rows
+    from tests.unit.test_aut2_attribution import _decision, _link
+    from tests.unit.test_aut2_label_store import _row
+
+    voided = Attribution(
+        family_id="pm_us_crh_fq_v1", decision=_decision(), link=_link(), drill=False,
+        voided_pair=True, alerts=(),
+    )
+    row = replace(
+        _row(), excluded_reason=voided.excluded_reason, admissible=False, label_id="b" * 32
+    )
+
+    assert voided.excluded_reason is ExcludedReason.VOIDED_PAIR
+    assert admissible_rows([_row(), row]) == (_row(),)
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")
 def test_poststop_venue_read_is_get_only() -> None:
-    await_owner("test_poststop_venue_read_is_get_only")
+    """Delivered by AUT-2 WP0: the owner's test of the one GET call, the literal and the cap."""
+    from tests.unit.test_venue_positions_read import test_poststop_venue_read_is_get_only as t
+
+    t()
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")
 def test_retired_kind_keeps_scorer_until_last_fill_labelled() -> None:
-    await_owner("test_retired_kind_keeps_scorer_until_last_fill_labelled")
+    """Delivered by AUT-2 WP3: a retired CRH kind keeps its scorer until its last fill."""
+    from tests.unit.test_aut2_legacy_crh_scorer import (
+        test_retired_kind_keeps_scorer_until_last_fill_labelled as t,
+    )
+
+    t()
 
 
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")

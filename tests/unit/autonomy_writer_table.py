@@ -148,6 +148,27 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "attribution.write_unresolved_journal",
         "write_once",
     ),
+    # AUT-2 r7 WP5 (plan section 3.2.2): the position-compare, lock-skip and CRITICAL-dedup
+    # journals.
+    # Each file is created once through skip_journal.write_json_once -> single_read.write_once.
+    FileWriter(
+        "evidence/aut2/position_compare/<day>/<snapshot_ns>_<mode>.json",
+        "recon_run (intraday and post_stop) under the reconcile lock, once per snapshot through "
+        "reconcile.write_position_compare",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/aut2/skips/<day>/<now_ns>_<unit>.json",
+        "the --record-skip path of label_run and recon_run (no lock; the name is unique by now_ns) "
+        "through skip_journal.record_skip",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/aut2/critical_dedup/<day>/<key_sha>.json",
+        "the three AUT-2 entrypoints, each under the lock it holds, only after a delivered proof, "
+        "through delivery.deliver_critical; an O_EXCL loser treats the key as delivered (L3)",
+        "write_once",
+    ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",
         "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "

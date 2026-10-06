@@ -303,7 +303,7 @@ def label_family_set(
 
 def fill_key_sha(fill: DurableFillRecord) -> str:
     """The journal's stable handle for a fill: sha256 of its durable store key, never an amount."""
-    return hashlib.sha256(f"{FILL_KEY_PREFIX}{fill.venue_order_id}".encode()).hexdigest()
+    return hashlib.sha256((FILL_KEY_PREFIX + fill.venue_order_id).encode()).hexdigest()
 
 
 @dataclass(frozen=True)

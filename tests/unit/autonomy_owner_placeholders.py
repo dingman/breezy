@@ -268,22 +268,26 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         "test_producer_demand_write_is_restrictive_only[aut6_producer_ast]",
         "test_detectors_and_drawdown_include_drill_fills[detectors]",
     ),
+    # AUT-2: the cross-area tests whose GREEN is delivered (WP0-WP3) are real tests now and carry no
+    # row. The rest wait on the symbol that lands them: the canary store (WP8), the post-STOP
+    # producer (WP6) and the label run (WP6).
     *_group(
         "AUT-2",
-        # NOT the WP0 function (that is ``read_venue_positions``, delivered). This is the ledger
-        # sentinel for the nine AUT-2 cross-area tests below, whose GREEN lands with WP5-WP8: naming
-        # a symbol that exists makes every row stale at once (test_no_row_is_stale) and demands the
-        # tests now. Re-point each row to its real delivering symbol as its WP lands.
-        "breezy.runtime.venue_positions_read:read_positions",
+        "breezy.persistence.autonomy.canary_store:append_canary_fill",
         [],
-        "test_p_at_decision_is_bought_leg_probability",
-        "test_scorer_never_attributes_by_trial_id_prefix",
-        "test_voided_pair_fills_excluded_from_all_n",
         "test_reconciliation_and_entry_guard_never_read_canary_store[reconciliation]",
         "test_reconciliation_and_entry_guard_never_read_canary_store[entry_guard]",
-        "test_poststop_venue_read_is_get_only",
-        "test_retired_kind_keeps_scorer_until_last_fill_labelled",
+    ),
+    *_group(
+        "AUT-2",
+        "breezy.analysis.labeling.recon_run:main",
+        [],
         "test_post_stop_producer_inconclusive_without_stop_signal",
+    ),
+    *_group(
+        "AUT-2",
+        "breezy.analysis.labeling.label_run:main",
+        [],
         "test_drill_fills_excluded_from_n_and_kill_clock",
     ),
     *_group(
