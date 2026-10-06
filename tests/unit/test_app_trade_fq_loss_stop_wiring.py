@@ -174,6 +174,9 @@ def _git(*args: str) -> str:
     ).stdout
 
 
+_F6_MARKER: Final = "src/breezy/strategy/forecast_quantile_ladder/loss_stop_probe.py"
+
+
 def _merge_base() -> str | None:
     try:
         return _git("merge-base", "HEAD", _BASE_BRANCH).strip()
@@ -192,10 +195,28 @@ def _top_level_digests(source: str) -> dict[str, str]:
     return out
 
 
+def _base_contains_f6(base: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{base}:{_F6_MARKER}"],
+            cwd=_REPO,
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
 def _base_or_skip_or_fail() -> str:
-    """The merge base; when unavailable FAIL under CI / BREEZY_REQUIRE_MERGE_BASE, else skip."""
+    """The merge base; when unavailable FAIL under CI / BREEZY_REQUIRE_MERGE_BASE, else skip.
+
+    These are branch-review guards for F6: once F6 is in the base they are vacuous
+    (the skip is deliberate and is not converted to a failure by CI).
+    """
     base = _merge_base()
     if base is not None:
+        if _base_contains_f6(base):
+            pytest.skip("F6 already merged into base; diff scope verified at merge")
         return base
     if os.environ.get("CI") or os.environ.get("BREEZY_REQUIRE_MERGE_BASE"):
         pytest.fail("merge base unavailable but CI/BREEZY_REQUIRE_MERGE_BASE requires it")
@@ -261,3 +282,20 @@ def test_item9_present_merge_base_is_returned(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(f"{__name__}._merge_base", lambda: "abc123")
 
     assert _base_or_skip_or_fail() == "abc123"
+
+
+def test_scope_guards_skip_once_f6_is_in_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HEAD itself contains the probe module, i.e. F6 is already in the base.
+    monkeypatch.setenv("CI", "1")
+    monkeypatch.setenv("BREEZY_REQUIRE_MERGE_BASE", "1")
+    monkeypatch.setattr(f"{__name__}._merge_base", lambda: _git("rev-parse", "HEAD").strip())
+
+    with pytest.raises(pytest.skip.Exception):
+        _base_or_skip_or_fail()
+
+
+def test_scope_guards_stay_active_when_base_lacks_f6(monkeypatch: pytest.MonkeyPatch) -> None:
+    pre_f6 = _git("rev-parse", "HEAD~3").strip()
+    monkeypatch.setattr(f"{__name__}._merge_base", lambda: pre_f6)
+
+    assert _base_or_skip_or_fail() == pre_f6
