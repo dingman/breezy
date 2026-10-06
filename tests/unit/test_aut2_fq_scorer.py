@@ -492,3 +492,17 @@ def test_voided_pair_fills_excluded_from_all_n() -> None:
     assert voided_row.admissible is False and voided_row.family_id == _FAMILY
     assert ok_row.admissible is True
     assert admissible_rows(result.rows) == (ok_row,)
+
+
+def test_drill_fills_excluded_from_n_and_kill_clock() -> None:
+    """A drill fill is labelled and final but inadmissible: no n and no kill clock reads it."""
+    from breezy.persistence.autonomy.label_store import admissible_rows
+
+    result = _label(
+        [_inp(), _inp(coid="O-2", venue_order_id="vo-2", attribution=_attr(drill=True))], _rec(89)
+    )
+
+    ok_row, drill_row = result.rows
+    assert (drill_row.excluded_reason, drill_row.admissible) == (ExcludedReason.DRILL, False)
+    assert is_final_row(drill_row, now_ns=_REL + _H, deadline_ns=_REL + _H)
+    assert admissible_rows(result.rows) == (ok_row,)

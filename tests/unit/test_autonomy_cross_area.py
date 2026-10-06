@@ -32,7 +32,9 @@ from tests.unit.autonomy_owner_placeholders import CROSS_AREA_FILE, OWNER_PLACEH
 #: ``test_p_at_decision_is_bought_leg_probability``,
 #: ``test_retired_kind_keeps_scorer_until_last_fill_labelled`` and
 #: ``test_voided_pair_fills_excluded_from_all_n`` stubs), so the carried count is 157 - 5.
-EXPECTED_CROSS_AREA_STUBS: Final = 152
+#: WP8 delivered three more (the canary-store reconciliation and entry_guard halves and the drill
+#: test), so 152 - 3.
+EXPECTED_CROSS_AREA_STUBS: Final = 149
 R5_AUT_5A_STUBS: Final = (
     "test_l1_cutover_lock_acquired_at_164454_aborts",
     "test_l1_cutover_late_write_completion_aborts",
@@ -480,20 +482,21 @@ def test_adapter_reader_fixtures_written_through_record_fill() -> None:
                 strict=True, raises=OwnerPending, reason="AUT-5:WP2; blocks none"
             ),
         ),
-        pytest.param(
-            "reconciliation",
-            id="reconciliation",
-            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none"),
-        ),
-        pytest.param(
-            "entry_guard",
-            id="entry_guard",
-            marks=pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none"),
-        ),
+        pytest.param("reconciliation", id="reconciliation"),
+        pytest.param("entry_guard", id="entry_guard"),
     ],
 )
-def test_reconciliation_and_entry_guard_never_read_canary_store(case: str) -> None:
-    await_owner(f"test_reconciliation_and_entry_guard_never_read_canary_store[{case}]")
+def test_reconciliation_and_entry_guard_never_read_canary_store(case: str, tmp_path: Path) -> None:
+    """The two AUT-2 halves are delivered by WP8 (the isolation test scans both modules); the
+    adapter-reader half waits on AUT-5:WP2."""
+    if case == "adapter_reader":
+        await_owner(f"test_reconciliation_and_entry_guard_never_read_canary_store[{case}]")
+        return
+    from tests.unit.test_aut2_canary_isolation import (
+        test_reconciliation_and_entry_guard_never_read_canary_store as delivered,
+    )
+
+    delivered(tmp_path)
 
 
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-5:WP5; blocks none")
@@ -1023,9 +1026,11 @@ def test_post_stop_producer_inconclusive_without_stop_signal() -> None:
     await_owner("test_post_stop_producer_inconclusive_without_stop_signal")
 
 
-@pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-2; blocks none")
 def test_drill_fills_excluded_from_n_and_kill_clock() -> None:
-    await_owner("test_drill_fills_excluded_from_n_and_kill_clock")
+    """Delivered by AUT-2 WP8: the FQ scorer's own test (a drill row is inadmissible, so no n)."""
+    from tests.unit.test_aut2_fq_scorer import test_drill_fills_excluded_from_n_and_kill_clock as t
+
+    t()
 
 
 @pytest.mark.xfail(strict=True, raises=OwnerPending, reason="AUT-4; blocks none")
@@ -1161,8 +1166,8 @@ def test_the_plan_stub_count_and_the_six_new_aut_5a_stubs_are_carried() -> None:
 def test_the_canary_store_param_split_follows_ruling_b6_a1() -> None:
     owners = dict(_own_rows())
     base = "test_reconciliation_and_entry_guard_never_read_canary_store"
-    assert owners[f"{base}[entry_guard]"] == "AUT-2"
-    assert owners[f"{base}[reconciliation]"] == "AUT-2"
+    # WP8 delivered the two AUT-2 halves: they are real tests and carry no row
+    assert f"{base}[entry_guard]" not in owners and f"{base}[reconciliation]" not in owners
     assert owners[f"{base}[adapter_reader]"] == "AUT-5:WP2"
 
 

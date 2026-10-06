@@ -169,6 +169,27 @@ AUTONOMY_FILE_WRITERS: Final[tuple[FileWriter, ...]] = (
         "through delivery.deliver_critical; an O_EXCL loser treats the key as delivered (L3)",
         "write_once",
     ),
+    # AUT-2 r7 WP8 (plan sections 3.2.2, 3.8, 6): the canary path and the live-proof artefact. All
+    # three go through single_read.write_once (write-once); the canary day file is written whole,
+    # never appended, so no raw write site exists.
+    FileWriter(
+        "derived/canary/<venue>/canary_fills_<YYYY-MM-DD>.jsonl",
+        "label_run --canary (analysis.labeling.label_run), under the studies flock, only on a UTC "
+        "day with zero real fills, through canary_store.write_canary_fills",
+        "write_once",
+    ),
+    FileWriter(
+        "derived/labels_canary/<family_id>/labels_<now_ns>.parquet",
+        "label_run --canary, through label_store.write_labels with the canary labels directory; "
+        "never read by a consumer of labels/",
+        "write_once",
+    ),
+    FileWriter(
+        "evidence/aut2_live_proof/window_<start>_<end>.json",
+        "label_run --proof-window (analysis.labeling.label_run), inside the label unit, once per "
+        "window range through skip_journal.write_json_once",
+        "write_once",
+    ),
     FileWriter(
         "derived/verdicts/health/<family>/** (capture family verdicts only)",
         "breezy-capture-audit and breezy-capture-live-proof write capture-family verdicts into "

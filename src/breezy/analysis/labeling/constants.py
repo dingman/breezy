@@ -36,6 +36,8 @@ __all__ = [
     "POST_STOP_POST_READ_BUDGET_S",
     "POST_STOP_READ_DEADLINE_S",
     "POST_STOP_TIMEOUT_START_S",
+    "PROOF_MIN_REAL_FILLS",
+    "PROOF_QUALIFYING_DAYS",
     "RECON_DAILY_VALIDITY_H",
     "RECON_INTRADAY_FLOCK_WAIT_S",
     "RECON_INTRADAY_TIMEOUT_START_S",
@@ -55,6 +57,10 @@ WINDOW_INCOMPLETE_MAX_H: Final = 48
 RECON_DAILY_VALIDITY_H: Final = 26
 RECON_INTRADAY_VALIDITY_H: Final = 8
 LABEL_MARKER_STALE_H: Final = 26  # V9; equals label_store.MARKER_STALE_H (test-pinned)
+
+# live-proof window (section 6): qualifying days and real fills it needs
+PROOF_QUALIFYING_DAYS: Final = 7
+PROOF_MIN_REAL_FILLS: Final = 5
 
 # cadence and snapshot freshness
 INTRADAY_PERIOD_MIN: Final = 30

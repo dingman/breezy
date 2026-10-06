@@ -269,26 +269,13 @@ OWNER_PLACEHOLDERS: Final[tuple[OwnerRow, ...]] = (
         "test_detectors_and_drawdown_include_drill_fills[detectors]",
     ),
     # AUT-2: the cross-area tests whose GREEN is delivered (WP0-WP3) are real tests now and carry no
-    # row. The rest wait on the symbol that lands them: the canary store (WP8), the post-STOP
-    # producer (WP6) and the label run (WP6).
-    *_group(
-        "AUT-2",
-        "breezy.persistence.autonomy.canary_store:append_canary_fill",
-        [],
-        "test_reconciliation_and_entry_guard_never_read_canary_store[reconciliation]",
-        "test_reconciliation_and_entry_guard_never_read_canary_store[entry_guard]",
-    ),
+    # row; WP8 delivered the canary store and the label run's canary path. The rest wait on the
+    # post-STOP producer (WP9).
     *_group(
         "AUT-2",
         "breezy.analysis.labeling.recon_run:main",
         [],
         "test_post_stop_producer_inconclusive_without_stop_signal",
-    ),
-    *_group(
-        "AUT-2",
-        "breezy.analysis.labeling.label_run:main",
-        [],
-        "test_drill_fills_excluded_from_n_and_kill_clock",
     ),
     *_group(
         "AUT-4",

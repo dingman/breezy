@@ -200,11 +200,13 @@ def labels_consumable(marker: LabelMarker | None, *, now_ns: int) -> bool:
     return marker.pending + marker.unresolved + marker.missing_label == 0
 
 
-def label_relative_path(family_id: str, now_ns: int) -> tuple[str, ...]:
+def label_relative_path(
+    family_id: str, now_ns: int, labels_dir: tuple[str, ...] = LABELS_DIR
+) -> tuple[str, ...]:
     """Path parts of one run's file below the data root; ``family_id`` is validated."""
     if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
         raise InvalidLabelRow("now_ns must be a non-negative int")
-    return (*LABELS_DIR, family_component(family_id), f"{_FILE_PREFIX}{now_ns}{_FILE_SUFFIX}")
+    return (*labels_dir, family_component(family_id), f"{_FILE_PREFIX}{now_ns}{_FILE_SUFFIX}")
 
 
 def _as_decimal(name: str, value: object) -> Decimal | None:
@@ -299,14 +301,21 @@ def _serialise(rows: Sequence[dict[str, Any]]) -> bytes:
     return sink.getvalue()
 
 
-def write_labels(data_root: Path, family_id: str, rows: Sequence[LabelRow], *, now_ns: int) -> Path:
+def write_labels(
+    data_root: Path,
+    family_id: str,
+    rows: Sequence[LabelRow],
+    *,
+    now_ns: int,
+    labels_dir: tuple[str, ...] = LABELS_DIR,
+) -> Path:
     """Publish one run's rows for ``family_id`` and return the file path.
 
     Every row is validated first (nothing is written for a bad row). The file is write-once: a
     second call for the same ``(family_id, now_ns)`` with different rows raises
     ``SingleReadRefused(EXISTS_DIFFERENT)``; identical bytes are an idempotent no-op.
     """
-    parts = label_relative_path(family_id, now_ns)
+    parts = label_relative_path(family_id, now_ns, labels_dir)
     checked = [_validated(row, family_id) for row in rows]
     data = _serialise([_wire(row) for row in checked])
     rootfd = open_root(data_root)
@@ -353,11 +362,11 @@ def _list_dir(dirfd: int) -> list[str]:
     return sorted(os.listdir(dirfd))
 
 
-def _family_dirs(rootfd: int, family_id: str | None) -> list[str]:
+def _family_dirs(rootfd: int, family_id: str | None, labels_dir: tuple[str, ...]) -> list[str]:
     if family_id is not None:
         return [family_component(family_id)]
     try:
-        labels_fd = walk_dirs(rootfd, LABELS_DIR)
+        labels_fd = walk_dirs(rootfd, labels_dir)
     except SingleReadRefused as exc:
         if exc.reason is SingleReadReason.NOT_FOUND:
             return []
@@ -396,15 +405,17 @@ def admissible_rows(rows: Iterable[LabelRow]) -> tuple[LabelRow, ...]:
     return tuple(row for row in rows if row.admissible)
 
 
-def read_labels(data_root: Path, family_id: str | None = None) -> tuple[LabelRow, ...]:
+def read_labels(
+    data_root: Path, family_id: str | None = None, *, labels_dir: tuple[str, ...] = LABELS_DIR
+) -> tuple[LabelRow, ...]:
     """Every stored row (one family, or all), deduped to the highest ``label_seq`` per
     ``label_id``. An unreadable file or a foreign schema raises; an absent directory is empty."""
     latest: dict[str, LabelRow] = {}
     rootfd = open_root(data_root)
     try:
-        for family in _family_dirs(rootfd, family_id):
+        for family in _family_dirs(rootfd, family_id, labels_dir):
             try:
-                dirfd = walk_dirs(rootfd, (*LABELS_DIR, family))
+                dirfd = walk_dirs(rootfd, (*labels_dir, family))
             except SingleReadRefused as exc:
                 if exc.reason is SingleReadReason.NOT_FOUND:
                     continue
