@@ -62,7 +62,7 @@ FQ v1 halt FAILED 10-05 (cwd bug, 5 more fills); backstop orders-off drop-in liv
 | Row | Status |
 |---|---|
 | F2 truth fetch | MERGED; units install next |
-| F4 labels | WP0-WP3 reviewed (3x APPROVE), final gate; then WP5/6/8 |
+| F4 labels | build-now DONE (WP0-3,5,6,8 + plugins); promote waits AUT-6; see F4-open-items_2026-10-06.md |
 | F5 prereg MC | DONE: STARVED; design frozen 072ab026 (RULING_FQ-PREREG-v2-AMENDMENT) |
 | F6 bridge | waits F5 numerics (STALE_PARITY_H, n_par) |
 | F7a stats move | DONE (merged) |
