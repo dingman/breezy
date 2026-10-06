@@ -38,6 +38,11 @@ def _utc(day: int, hour: int = 0, minute: int = 0, *, month: int = 10) -> int:
 def _okx_product(header_ddhhmm: str = "051901") -> str:
     lines = (_FIXTURES / "pfm_okx_real_20261006.txt").read_text().splitlines(keepends=True)
     text = "".join(ln for ln in lines if not ln.startswith("#"))
+    if header_ddhhmm != "051901":
+        # The real body prints its own issuance ("301 PM EDT Mon Oct 5 2026"); an edited WMO
+        # heading would contradict it (a header_body_mismatch refusal), so the synthetic product
+        # drops that line and is placed from the WMO heading alone (the cursor-relative path).
+        text = "".join(ln for ln in text.splitlines(keepends=True) if "301 PM EDT" not in ln)
     return text.replace("051901", header_ddhhmm)
 
 
@@ -694,15 +699,18 @@ def test_p2_main_continues_with_the_next_station_exits_1_and_still_writes_the_re
 
 
 def test_p7_an_out_of_order_header_is_refused_not_pushed_a_month_ahead(tmp_path: Path) -> None:
+    # Amended 2026-10-06 (PFM history fix): the original 051901 then 051801 is a same-day
+    # inversion, now placed on that day (see test_us_source_pfm_history). The refusal is kept
+    # for a header from an EARLIER day (041901 after 061901), which would only "fit" as next
+    # month; the refusal now covers that product alone and the station continues.
     def fetch(_wfo: str, _sdate: dt.date, _limit: int) -> str:
-        # 18:01 after 19:01 on the same day would only "fit" as the next month's 5th.
-        return _okx_product("051901") + _okx_product("051801")
+        return _okx_product("061901") + _okx_product("041901")
 
     report = _leg(tmp_path, fetch, page_limit=10)
 
-    assert report.status == "unplaceable_header"
-    assert report.appended == 0
-    assert census.pfm_issuance_times(tmp_path) == {}
+    assert report.status == "complete"
+    assert report.appended == 1
+    assert list(census.pfm_issuance_times(tmp_path)) != []
     assert report.refused == {"unplaceable_header": 1}
 
 

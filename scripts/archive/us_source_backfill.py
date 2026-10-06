@@ -19,9 +19,10 @@ the ``us-pfm-afos`` revision store (PFM) and the existing MOS archive writer (GF
 
 Statuses: ``complete``; ``oversize_product`` (a single product exceeds the body cap: that station
 stops, the next runs); ``error`` (an unexpected exception inside a leg is recorded, never raised);
-``unplaceable_header`` (a header cannot be placed unambiguously from the
-cursor: that station stops, the next station runs); ``degraded`` (a revision-store error other
-than an expected payload refusal); ``throttled`` / ``forbidden`` (an IEM 403 abuse block) /
+``unplaceable_header`` (NO product on a page could be placed: that station stops, the next
+runs; a single unplaceable product is only refused and counted, never mis-placed); ``degraded``
+(a revision-store error other than an expected payload refusal); ``throttled`` / ``forbidden``
+(an IEM 403 abuse block) /
 ``paused_launch_window`` (stop ALL remaining stations and the GFS leg);
 ``budget_exhausted``, ``store_busy``. Any status but ``complete`` exits 1.
 
@@ -59,6 +60,12 @@ from iem_mos_probe_transport import (  # type: ignore[import-not-found]
     IemPacer,
     PacedIemTransport,
 )
+from us_source_pfm_support import (  # type: ignore[import-not-found]
+    BODY_WMO_TOLERANCE,
+    RefusalQuarantine,
+    body_issuance_utc,
+    wmo_instant_near,
+)
 
 from breezy.ingest.http import ForbiddenError, OversizeBodyError, RateLimitedError
 from breezy.ingest.pfm_parse import PfmParseError, parse_pfm_product
@@ -82,6 +89,7 @@ from breezy.persistence.us_source_revision_store import (
 
 __all__ = [
     "LegReport",
+    "RefusalQuarantine",
     "UnplaceableHeaderError",
     "main",
     "make_pfm_fetch",
@@ -217,7 +225,11 @@ def resolve_issuance_sequence(
 
 
 class UnplaceableHeaderError(ValueError):
-    """A WMO header cannot be placed unambiguously relative to the paging cursor."""
+    """A product cannot be placed unambiguously; ``reason`` is the refusal it is counted under."""
+
+    def __init__(self, message: str, reason: str = "unplaceable_header") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def make_window_guard(worst_case_s: int = REQUEST_WORST_CASE_S) -> Callable[[int], bool]:
@@ -356,6 +368,7 @@ def _append(
     run_ts_ns: int,
     wfo: str,
     payload: bytes,
+    on_refused: Callable[[str], None] | None = None,
 ) -> bool:
     """Append one raw revision; False when the unit lock stayed busy past the retries."""
     for attempt in range(BUSY_RETRIES + 1):
@@ -374,6 +387,8 @@ def _append(
             continue
         except RevisionPayloadRefusedError as exc:  # an expected refusal of this payload
             _count(report, type(exc).__name__)
+            if on_refused is not None:
+                on_refused(type(exc).__name__)
             return True
         except RevisionStoreError as exc:  # integrity or other store trouble: not a refusal
             name = type(exc).__name__
@@ -393,39 +408,91 @@ def _count(report: LegReport, reason: str) -> None:
     report.refused[reason] = report.refused.get(reason, 0) + 1
 
 
-def _place(
-    products: Sequence[str], cursor: dt.date, report: LegReport
-) -> list[tuple[str, dt.datetime | None]]:
-    """Pair each product with its resolved issuance time; headerless ones are refused.
+def _place_by_body(
+    header: tuple[str, int, int, int],
+    body: dt.datetime,
+    previous: dt.datetime,
+    floor: dt.datetime,
+) -> dt.datetime:
+    """The WMO instant nearest the body's full local date, if the two agree and are plausible."""
+    _cccc, day, hour, minute = header
+    issued: dt.datetime | None = wmo_instant_near(day, hour, minute, body)
+    if issued is None or abs(issued - body) > BODY_WMO_TOLERANCE:
+        raise UnplaceableHeaderError(
+            f"WMO {day:02d}{hour:02d}{minute:02d} disagrees with the body time {body.isoformat()}",
+            "header_body_mismatch",
+        )
+    if issued < floor or issued - previous > dt.timedelta(days=MAX_GAP_DAYS):
+        raise UnplaceableHeaderError(
+            f"body time {issued.isoformat()} is outside the window around {previous.isoformat()}"
+        )
+    return issued
 
-    Raises ``UnplaceableHeaderError`` for a page whose headers cannot be placed unambiguously
-    from ``cursor``: a gap over ``MAX_GAP_DAYS``, or a month "rollover" over
-    ``MAX_ROLLOVER_GAP_DAYS`` (an out-of-order header would otherwise land a month ahead).
-    """
-    headers = [wmo_header_fields(p) for p in products]
-    parseable = [(h[1], h[2], h[3]) for h in headers if h is not None]
+
+def _place_by_cursor(header: tuple[str, int, int, int], previous: dt.datetime) -> dt.datetime:
+    """Cursor-relative placement for a product with no usable body time (day, hour, minute only)."""
     try:
-        placed = resolve_issuance_sequence(parseable, cursor)
+        (issued,) = resolve_issuance_sequence([(header[1], header[2], header[3])], previous.date())
     except ValueError as exc:
         raise UnplaceableHeaderError(str(exc)) from exc
-    previous = dt.datetime(cursor.year, cursor.month, cursor.day, tzinfo=dt.UTC)
-    for issued in placed:
-        rolled = (issued.year, issued.month) != (previous.year, previous.month)
-        if rolled and issued - previous > dt.timedelta(days=MAX_ROLLOVER_GAP_DAYS):
-            raise UnplaceableHeaderError(
-                f"header {issued.isoformat()} is a {(issued - previous).days} day month "
-                f"rollover after {previous.isoformat()}; refusing to place it"
-            )
-        previous = issued
-    resolved = iter(placed)
+    rolled = (issued.year, issued.month) != (previous.year, previous.month)
+    if rolled and issued - previous > dt.timedelta(days=MAX_ROLLOVER_GAP_DAYS):
+        raise UnplaceableHeaderError(
+            f"header {issued.isoformat()} is a {(issued - previous).days} day month "
+            f"rollover after {previous.isoformat()}; refusing to place it"
+        )
+    return issued
+
+
+def _place(
+    products: Sequence[str],
+    cursor: dt.date,
+    report: LegReport,
+    on_refused: Callable[[str, str], None] | None = None,
+) -> list[tuple[str, dt.datetime | None]]:
+    """Pair each product with its resolved issuance time; an unplaceable one is refused alone.
+
+    The body's full local date ("615 PM CST Thu Dec 31 2020"), cross-checked against the WMO
+    ``DDHHMM``, places a product when present. Otherwise the WMO header is placed relative to the
+    latest instant placed so far (the cursor's midnight at first): same month unless the day went
+    backwards, and a month "rollover" over ``MAX_ROLLOVER_GAP_DAYS`` is refused rather than
+    placed a month ahead. A refused product is counted (and passed to ``on_refused(reason,
+    product)``); the others on the page are still placed.
+    """
+    floor = dt.datetime(cursor.year, cursor.month, cursor.day, tzinfo=dt.UTC) - dt.timedelta(days=1)
+    previous = floor + dt.timedelta(days=1)
     paired: list[tuple[str, dt.datetime | None]] = []
-    for product, header in zip(products, headers, strict=True):
+    for product in products:
+        header = wmo_header_fields(product)
         if header is None:
-            _count(report, "no_wmo_header")
+            _refuse_product(report, on_refused, "no_wmo_header", product)
             paired.append((product, None))
-        else:
-            paired.append((product, next(resolved)))
+            continue
+        body = body_issuance_utc(product)
+        try:
+            issued = (
+                _place_by_cursor(header, previous)
+                if body is None
+                else _place_by_body(header, body, previous, floor)
+            )
+        except UnplaceableHeaderError as exc:
+            _refuse_product(report, on_refused, exc.reason, product)
+            paired.append((product, None))
+            continue
+        previous = max(previous, issued)
+        paired.append((product, issued))
     return paired
+
+
+def _refuse_product(
+    report: LegReport,
+    on_refused: Callable[[str, str], None] | None,
+    reason: str,
+    product: str,
+) -> None:
+    _count(report, reason)
+    if on_refused is not None:
+        on_refused(reason, product)
 
 
 def _ingest_page(
@@ -437,9 +504,12 @@ def _ingest_page(
     store: UsSourceRevisionStore,
     report: LegReport,
     sleep: Callable[[float], None],
+    quarantine: RefusalQuarantine | None = None,
+    sdate: dt.datetime | None = None,
 ) -> tuple[dt.datetime | None, bool, bool]:
     """Store a page; returns ``(last issuance seen, past_end, busy)``."""
     last: dt.datetime | None = None
+
     for product, issued in paired:
         if issued is None:
             continue
@@ -448,14 +518,30 @@ def _ingest_page(
         last = issued
         report.products_seen += 1
         raw = product.encode("utf-8")
+
+        def keep(reason: str, *, _raw: bytes = raw, _issued: dt.datetime = issued) -> None:
+            if quarantine is not None and sdate is not None:
+                quarantine.record(
+                    reason=reason, station=station, wfo=wfo, sdate=sdate, issued=_issued, raw=_raw
+                )
+
         try:
             parse_pfm_product(raw, station=station, reference_time=issued + dt.timedelta(seconds=1))
         except PfmParseError as exc:
-            _count(report, exc.reason or _REFUSE_REASON_FALLBACK)
+            reason = exc.reason or _REFUSE_REASON_FALLBACK
+            _count(report, reason)
+            keep(reason)
             continue
         run_ts_ns = int(issued.timestamp()) * _NS
         if not _append(
-            store, report, sleep, station=station, run_ts_ns=run_ts_ns, wfo=wfo, payload=raw
+            store,
+            report,
+            sleep,
+            station=station,
+            run_ts_ns=run_ts_ns,
+            wfo=wfo,
+            payload=raw,
+            on_refused=keep,
         ):
             return last, False, True
     return last, False, False
@@ -472,6 +558,7 @@ def run_pfm_leg(
     window_ok: Callable[[int], bool],
     sleep: Callable[[float], None],
     page_limit: int = DEFAULT_PAGE_LIMIT,
+    quarantine: RefusalQuarantine | None = None,
 ) -> LegReport:
     """Backfill one station's WFO from ``start`` to ``end`` inclusive, ascending by issuance.
 
@@ -484,7 +571,7 @@ def run_pfm_leg(
     try:
         _page_loop(
             report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
-            sleep, page_limit,
+            sleep, page_limit, quarantine,
         )  # fmt: skip
     except Exception as exc:  # noqa: BLE001 - the station boundary: record, never crash the run
         report.status = "error"
@@ -495,6 +582,13 @@ def run_pfm_leg(
     if report.store_errors and report.status == "complete":
         report.status = "degraded"
     return report
+
+
+_PLACEMENT_REASONS: Final[tuple[str, ...]] = ("unplaceable_header", "header_body_mismatch")
+
+
+def _placement_refusals(report: LegReport) -> int:
+    return sum(report.refused.get(reason, 0) for reason in _PLACEMENT_REASONS)
 
 
 def _page_loop(
@@ -510,6 +604,7 @@ def _page_loop(
     window_ok: Callable[[int], bool],
     sleep: Callable[[float], None],
     page_limit: int,
+    quarantine: RefusalQuarantine | None = None,
 ) -> None:
     while cursor_box[0].date() <= end:
         cursor = cursor_box[0]
@@ -522,18 +617,37 @@ def _page_loop(
         products = split_raw_products(text)
         if not products:
             return
-        try:
-            paired = _place(products, cursor.date(), report)
-        except UnplaceableHeaderError as exc:
-            _count(report, "unplaceable_header")
+        refused_before = _placement_refusals(report)
+
+        def on_refused(reason: str, product: str, *, _cursor: dt.datetime = cursor) -> None:
+            if quarantine is not None:
+                quarantine.record(
+                    reason=reason,
+                    station=station,
+                    wfo=wfo,
+                    sdate=_cursor,
+                    issued=None,
+                    raw=product.encode("utf-8"),
+                )
+
+        paired = _place(products, cursor.date(), report, on_refused)
+        if _placement_refusals(report) > refused_before and all(i is None for _p, i in paired):
             _alert(
-                f"{wfo} sdate={_stamp(cursor)}: {exc}; this station stops, "
-                f"resume at {_stamp(cursor)}"
+                f"{wfo} sdate={_stamp(cursor)}: no product on the page could be placed; "
+                f"this station stops, resume at {_stamp(cursor)}"
             )
             report.status, report.resume_sdate = "unplaceable_header", cursor.date()
             return
         last, past_end, busy = _ingest_page(
-            paired, station=station, wfo=wfo, end=end, store=store, report=report, sleep=sleep
+            paired,
+            station=station,
+            wfo=wfo,
+            end=end,
+            store=store,
+            report=report,
+            sleep=sleep,
+            quarantine=quarantine,
+            sdate=cursor,
         )
         if busy:
             report.status, report.resume_sdate = "store_busy", cursor.date()
@@ -665,6 +779,12 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--max-runtime-s", type=int, default=DEFAULT_MAX_RUNTIME_S)
     parser.add_argument("--mos-cache-root", type=Path, default=None)
     parser.add_argument("--report-json", type=Path, default=None)
+    parser.add_argument(
+        "--quarantine-dir",
+        type=Path,
+        default=None,
+        help="write every refused raw PFM product plus a refusals.jsonl line here (default off)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args(list(argv))
@@ -692,6 +812,21 @@ def _archive_root_problem(root: Path) -> str | None:
     )
 
 
+def _quarantine_dir_problem(root: Path, archive_root: Path | None) -> str | None:
+    """Refuse a quarantine dir in a holdout, the live data root, or the archive being written."""
+    resolved = root.resolve()
+    if any("holdout" in part.lower() for part in resolved.parts):
+        return f"--quarantine-dir {resolved} sits in a holdout directory (sealed)"
+    live = LIVE_DATA_ROOT.resolve()
+    if resolved == live or live in resolved.parents:
+        return f"--quarantine-dir {resolved} is under the live data root {live}"
+    if archive_root is not None:
+        archive = archive_root.resolve()
+        if resolved == archive or archive in resolved.parents:
+            return f"--quarantine-dir {resolved} is inside --archive-root {archive}"
+    return None
+
+
 def _validate(args: argparse.Namespace) -> str | None:
     """A refusal message, or None when the invocation is coherent."""
     if args.dry_run == args.apply:
@@ -707,6 +842,8 @@ def _validate(args: argparse.Namespace) -> str | None:
         problem = _archive_root_problem(args.archive_root)
         if problem is not None:
             return problem
+    if args.quarantine_dir is not None:
+        return _quarantine_dir_problem(args.quarantine_dir, args.archive_root)
     if args.apply and os.environ.get(LIVE_ENV_VAR) != "1":
         return f"{LIVE_ENV_VAR}=1 is required before any request may be dispatched"
     if args.apply and "pfm" in args.legs and not args.request_budget:
@@ -848,6 +985,9 @@ def _apply(
             request_budget=args.request_budget, user_agent=user_agent, clock_ns=clock
         )
         store = UsSourceRevisionStore(args.archive_root, _StoreClock(clock))
+        quarantine = (
+            RefusalQuarantine(args.quarantine_dir) if args.quarantine_dir is not None else None
+        )
         legs: list[LegReport] = []
         for index, station in enumerate(stations):
             leg = run_pfm_leg(
@@ -859,6 +999,7 @@ def _apply(
                 clock_ns=clock,
                 window_ok=make_window_guard(),
                 sleep=sleep,
+                quarantine=quarantine,
             )
             legs.append(leg)
             if leg.status in STOP_ALL_STATUSES:

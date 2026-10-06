@@ -1,0 +1,45 @@
+# REAL CAPTURE (public NWS text, trimmed to header lines + one point block; unmodified otherwise).
+# Source: IEM AFOS retrieve.py pil=PFMMTR (historical backfill run 2026-10-06; entered before the 241801 product).
+# Lines starting with '#' are stripped by the tests before parsing.
+
+196 
+FOUS56 KMTR 241802
+PFMMTR
+
+Point Forecast Matrices
+National Weather Service San Francisco Bay Area
+1101 AM PDT Wed Aug 24 2022
+
+CAZ508-250000-
+San Francisco Airport-San Mateo CA
+37.62N 122.38W Elev. 10 ft
+1101 AM PDT Wed Aug 24 2022
+
+Date                Wed 08/24/22            Thu 08/25/22            Fri 08/26/22
+PDT 3hrly     02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17
+UTC 3hrly     09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00
+
+Max/Min                      MM          MM          MM          MM          MM
+Temp                      MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM
+Dewpt                     MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM
+RH                        MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM
+Wind dir                  MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM
+Wind spd                  MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM
+Clouds                    MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM MM
+PoP 12hr                     MM          MM          MM          MM          MM
+QPF 12hr                     MM          MM          MM          MM          MM
+
+
+Date               Sat 08/27/22  Sun 08/28/22  Mon 08/29/22  Tue 08/30/22
+PDT 6hrly     23   05 11 17 23   05 11 17 23   05 11 17 23   05 11 17
+UTC 6hrly     06   12 18 00 06   12 18 00 06   12 18 00 06   12 18 00
+
+Min/Max            MM    MM      MM    MM      MM    MM      MM    MM
+Temp          MM   MM MM MM MM   MM MM MM MM   MM MM MM MM   MM MM MM
+Dewpt         MM   MM MM MM MM   MM MM MM MM   MM MM MM MM   MM MM MM
+PWind dir          MM    MM      MM    MM      MM    MM      MM    MM
+Wind char          MM    MM      MM    MM      MM    MM      MM    MM
+Avg clouds    MM   MM MM MM MM   MM MM MM MM   MM MM MM MM   MM MM MM
+PoP 12hr           MM    MM      MM    MM      MM    MM      MM    MM
+
+$$

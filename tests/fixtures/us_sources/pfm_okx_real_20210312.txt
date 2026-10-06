@@ -1,0 +1,52 @@
+# REAL CAPTURE (public NWS text, trimmed to header lines + one point block; unmodified otherwise).
+# Source: IEM AFOS retrieve.py pil=PFMOKX (historical backfill run 2026-10-06; EST era).
+# Lines starting with '#' are stripped by the tests before parsing.
+
+756 
+FOUS51 KOKX 122305
+PFMOKX
+
+Point Forecast Matrices
+National Weather Service New York NY
+605 PM EST Fri Mar 12 2021
+
+NYZ072-130900-
+Central Park-New York NY
+40.78N  73.97W Elev. 16 ft
+605 PM EST Fri Mar 12 2021
+
+Date           03/12/21      Sat 03/13/21            Sun 03/14/21            Mon
+EST 3hrly     16 19 22 01 04 07 10 13 16 19 22 01 04 07 10 13 16 19 22 01 04 07
+UTC 3hrly     21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12
+
+Min/Max                      31          47          36          55          25
+Temp             58 49 40 31 31 38 44 47 44 41 38 37 37 48 54 53 46 38 31 28 25
+Dewpt            18 21 23 16 14  8  7  9 13 14 16 17 19 19 16 12  9 10  5  4  1
+RH               21 33 50 53 49 28 21 21 28 33 40 44 48 31 22 19 22 31 32 35 34
+Wind dir          W NW NW NW NW NW  W  W  W  W  W  W  W  W NW NW NW NW NW NW  N
+Wind spd         11 21 26 24 17 12 11 12 10  9  8  8  8 13 18 19 19 18 17 14 14
+Wind gust           35 46 41 28                         25 29 33 35 33 27 25   
+Clouds           CL CL CL CL CL CL CL CL CL CL FW FW FW FW FW SC FW FW FW CL CL
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Snow 12hr                 00-00       00-00       00-00                        
+Wind chill             29 18 20 30 38    38 35 32 31 31          38 28 20 16 13
+Min chill              29    18    22    38    32    31    34    38    20    13
+Wind                 Y  Y  Y                                                   
+
+
+Date           03/15  Tue 03/16/21  Wed 03/17/21  Thu 03/18/21  Fri 03/19/21
+EST 6hrly     13 19   01 07 13 19   01 07 13 19   01 07 13 19   01 07 13 19
+UTC 6hrly     18 00   06 12 18 00   06 12 18 00   06 12 18 00   06 12 18 00
+
+Max/Min          38      31    42      37    51      39    52      42    49
+Temp          36 36   32 31 39 39   42 38 50 46   41 40 50 49   44 42 48 44
+Dewpt          0  3    5  9 17 24   28 30 34 34   34 36 41 40   41 34 30 23
+PWind dir        NW      NE    SE       E    SW      SW     S       W    NW
+Wind char        GN      LT    LT      LT    LT      LT    GN      GN    GN
+Avg clouds    CL FW   SC B2 B2 B2   B1 B1 B1 B1   SC B1 B2 B2   B2 B1 B1 B1
+PoP 12hr          0      10    30      30    10      20    40      40    30
+Rain                         C  C    C  S                S  C    C  C  C  S
+Snow                         S                                             
+
+$$

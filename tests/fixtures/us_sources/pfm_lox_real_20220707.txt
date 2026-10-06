@@ -1,0 +1,45 @@
+# REAL CAPTURE (public NWS text, trimmed to header lines + one point block; unmodified otherwise).
+# Source: IEM AFOS retrieve.py pil=PFMLOX (historical backfill run 2026-10-06; body line 858 AM PDT vs WMO 071559).
+# Lines starting with '#' are stripped by the tests before parsing.
+
+106 
+FOUS56 KLOX 071559
+PFMLOX
+National Weather Service Los Angeles/Oxnard CA
+858 AM PDT Thu Jul 7 2022
+
+CAZ041-080000-
+Los Angeles Airport CA
+33.94N 118.39W Elev. 99 ft
+858 AM PDT Thu Jul 7 2022
+
+Date                Thu 07/07/22            Fri 07/08/22            Sat 07/09/22
+PDT 3hrly     02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17
+UTC 3hrly     09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00
+
+Max/Min                      74          63          74          63          73
+Temp                   74 73 71 67 65 63 63 67 74 73 71 67 65 63 63 67 73 72 71
+Dewpt                  60 60 60 61 60 60 60 60 60 60 60 60 59 60 60 60 59 57 59
+RH                     62 64 68 81 84 90 90 78 62 64 68 78 81 90 90 78 62 59 66
+Wind dir               SW  W  W  W SW SW SE  S SW  W  W SW  S SE  E SE SW SW  W
+Wind spd               10 12 12  8  3  3  4  8 10 13 13 11  5  3  3  3  9 13 14
+Clouds                 CL CL CL CL CL CL OV OV CL CL CL CL OV OV OV OV CL CL CL
+PoP 12hr                      0           0           0           0           0
+QPF 12hr                      0           0           0           0           0
+Snow 12hr                 00-00       00-00       00-00                        
+Obvis                                    PF PF             PF PF PF PF         
+
+
+Date               Sun 07/10/22  Mon 07/11/22  Tue 07/12/22  Wed 07/13/22
+PDT 6hrly     23   05 11 17 23   05 11 17 23   05 11 17 23   05 11 17
+UTC 6hrly     06   12 18 00 06   12 18 00 06   12 18 00 06   12 18 00
+
+Min/Max            64    75      64    74      63    73      63    74
+Temp          65   64 75 72 66   64 74 71 65   63 73 70 64   63 74 71
+Dewpt         58   60 58 58 59   61 63 62 61   61 61 62 60   61 61 61
+PWind dir          SW     S      SW     S      SW    SW      SW    SW
+Wind char          GN    LT      GN    LT      GN    GN      GN    GN
+Avg clouds    CL   OV OV CL CL   OV OV CL CL   OV OV FW FW   OV OV FW
+PoP 12hr            0     0       0     0       5     5       5     5
+
+$$

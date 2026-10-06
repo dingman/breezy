@@ -1,0 +1,45 @@
+# REAL CAPTURE (public NWS text, trimmed to header lines + one point block; unmodified otherwise).
+# Source: IEM AFOS retrieve.py pil=PFMMTR (historical backfill run 2026-10-06; WMO minute 1 earlier than the product archived before it).
+# Lines starting with '#' are stripped by the tests before parsing.
+
+841 
+FOUS56 KMTR 241801
+PFMMTR
+
+Point Forecast Matrices
+National Weather Service San Francisco Bay Area
+1101 AM PDT Wed Aug 24 2022
+
+CAZ508-250000-
+San Francisco Airport-San Mateo CA
+37.62N 122.38W Elev. 10 ft
+1101 AM PDT Wed Aug 24 2022
+
+Date                Wed 08/24/22            Thu 08/25/22            Fri 08/26/22
+PDT 3hrly     02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17
+UTC 3hrly     09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00
+
+Max/Min                      73          59          73          59          73
+Temp                      71 69 62 61 61 59 61 67 71 69 63 61 60 60 61 67 71 69
+Dewpt                     57 56 55 56 55 55 55 57 57 56 56 56 55 55 55 57 56 56
+RH                        61 63 78 84 81 87 81 70 61 63 78 84 84 84 81 70 59 63
+Wind dir                   W  W  W  W SW SW SW SW  W  W  W  W SW SW SW SW  W  W
+Wind spd                  16 20 16 11  9  8  6 10 16 19 14 10  8  5  5  9 13 18
+Clouds                    FW FW SC SC SC B1 SC FW FW FW FW SC SC B1 SC SC FW FW
+PoP 12hr                      0          10           5          10           0
+QPF 12hr                      0           0           0           0           0
+
+
+Date               Sat 08/27/22  Sun 08/28/22  Mon 08/29/22  Tue 08/30/22
+PDT 6hrly     23   05 11 17 23   05 11 17 23   05 11 17 23   05 11 17
+UTC 6hrly     06   12 18 00 06   12 18 00 06   12 18 00 06   12 18 00
+
+Min/Max            58    70      58    71      58    74      57    73
+Temp          60   58 66 67 60   58 66 68 61   59 67 70 60   58 67 70
+Dewpt         55   54 56 55 54   53 54 54 54   53 55 54 54   54 55 54
+PWind dir          SW    SW      SW    SW      SW    SW      SW     W
+Wind char          GN    GN      GN    GN      GN    GN      GN    GN
+Avg clouds    FW   SC SC SC SC   SC B1 SC FW   SC SC FW FW   FW SC FW
+PoP 12hr           10    10       5     5       5     0       5     0
+
+$$

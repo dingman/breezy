@@ -18,6 +18,14 @@ state.
 `PfmParseError` is a local refusal class: not a `TransportError`, `CliParseError`
 or `CliSanityError` (R18).
 
+Pre-2022 LOT layout (real capture `pfm_lot_real_20210101.txt`): the `UTC 3hrly` row is printed
+ABOVE the local `CST 3hrly` row and the extrema label is upper case (`MIN/MAX`, `MAX/MIN`); the
+columns, the point names and the zone lines are the same. Both row orders are accepted.
+
+An extrema cell that is the NWS missing marker `MM` (a real SFO block of 2022-08-24 prints it for
+every cell) is skipped: that day has no MAX. A product left with no MAX at all is refused
+(`no_max_values`); any other non-integer cell is still refused (`bad_extrema_cell`).
+
 Layout VERIFIED against real captures of all five offices
 (`tests/fixtures/us_sources/pfm_*_real_20261006.txt`). Each point block holds two
 tables, a 3-hourly one and a 6-hourly one, each introduced by three header rows::
@@ -169,9 +177,11 @@ _DATE_AFTER: Final = dt.timedelta(days=10)
 _MAX_UTC_HOUR: Final = 0
 _MIN_UTC_HOUR: Final = 12
 _DATE_LABEL_RE: Final = re.compile(r"(?:[A-Z][a-z]{2} )?(\d{2})/(\d{2})(?:/(\d{2}))?")
-_LOCAL_ROW_RE: Final = re.compile(r"^[A-Z]{3} [36]hrly\s")
+_LOCAL_ROW_RE: Final = re.compile(r"^(?!UTC )[A-Z]{3} [36]hrly\s")
 _UTC_ROW_RE: Final = re.compile(r"^UTC [36]hrly\s")
-_EXTREMA_RE: Final = re.compile(r"^(?:Min/Max|Max/Min)\s")
+_EXTREMA_RE: Final = re.compile(r"^(?:Min/Max|Max/Min)\s", re.IGNORECASE)
+_EXTREMA_LABELS: Final = ("MIN/MAX", "MAX/MIN")
+_MISSING_MARKER: Final = "MM"
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,23 +267,44 @@ def _columns(
     return columns
 
 
+def _hour_rows(table: list[str]) -> tuple[str, str] | None:
+    """`(local row, UTC row)` of a table, or None when the two rows after `Date` are not that pair.
+
+    Today's products print the local row first; the pre-2022 LOT PFM prints the UTC row first
+    (`UTC 3hrly` over `CST 3hrly`, both aligned to the same columns). Either order is accepted;
+    two rows that are not one local and one UTC are not.
+    """
+    if len(table) < 3:
+        return None
+    first, second = table[1], table[2]
+    if _LOCAL_ROW_RE.match(first) and _UTC_ROW_RE.match(second):
+        return first, second
+    if _UTC_ROW_RE.match(first) and _LOCAL_ROW_RE.match(second):
+        return second, first
+    return None
+
+
 def _table_max(
     table: list[str], anchor: dt.date, issued_at: dt.datetime, previous: _Column | None
 ) -> tuple[dict[dt.date, int], _Column]:
-    if len(table) < 3 or not _LOCAL_ROW_RE.match(table[1]) or not _UTC_ROW_RE.match(table[2]):
+    hour_rows = _hour_rows(table)
+    if hour_rows is None:
         raise PfmParseError("table_header", table[0][:40])
+    local_row, utc_row = hour_rows
     extrema = [ln for ln in table[3:] if _EXTREMA_RE.match(ln)]
     if len(extrema) != 1:
         raise PfmParseError("extrema_row", f"{len(extrema)} Min/Max rows in table")
-    ordered = _columns(table[0], table[1], table[2], anchor, issued_at, previous)
+    ordered = _columns(table[0], local_row, utc_row, anchor, issued_at, previous)
     columns = {c.end: c for c in ordered}
-    if extrema[0][:_LABEL_WIDTH].strip() not in ("Min/Max", "Max/Min"):
+    if extrema[0][:_LABEL_WIDTH].strip().upper() not in _EXTREMA_LABELS:
         raise PfmParseError("extrema_label")
     found: dict[dt.date, int] = {}
     for count, m in enumerate(re.finditer(r"\S+", extrema[0][_LABEL_WIDTH:]), start=1):
         if count > MAX_FIELDS_PER_ROW:
             raise PfmParseError("too_many_fields", f"extrema row over {MAX_FIELDS_PER_ROW}")
         end = _LABEL_WIDTH + m.end()
+        if m.group() == _MISSING_MARKER and end in columns:
+            continue  # the NWS missing-data marker: that extremum is simply not forecast
         if not _INT_RE.match(m.group()) or end not in columns:
             raise PfmParseError("bad_extrema_cell", m.group())
         value = int(m.group())
@@ -299,6 +330,8 @@ def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date,
             if date in merged:
                 raise PfmParseError("duplicate_day", date.isoformat())
             merged[date] = value
+    if not merged:  # e.g. a point block whose every extremum is MM
+        raise PfmParseError("no_max_values", "no MAX under any UTC 00 column")
     return tuple(sorted(merged.items()))
 
 
