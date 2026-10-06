@@ -1,5 +1,5 @@
 {
-  "frozen_sha": null,
+  "frozen_sha": "072ab026cdc790dd6e9a51d62d8164766b85fd82",
   "alpha_total": 0.025,
   "gamma_schedule": "elond_heavy_tailed_v1",
   "T": 4,
