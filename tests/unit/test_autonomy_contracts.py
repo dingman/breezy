@@ -39,6 +39,7 @@ PYARROW_REACHING: Final[frozenset[str]] = frozenset(
     f"{AUTONOMY_PACKAGE}.{m}"
     for m in (
         "label_schema",
+        "label_store",
         "family_bytes",
         "byte_binding",
         "registry_store",
@@ -95,6 +96,7 @@ def test_contracts_b_and_c_list_existing_modules_only_never_the_package() -> Non
         f"{AUTONOMY_PACKAGE}.{m}"
         for m in (
             "label_schema",
+            "label_store",
             "family_bytes",
             "byte_binding",
             "byte_binding",
