@@ -408,3 +408,104 @@ Relevant paths (all under `/home/jon/breezy`):
 - `src/breezy/persistence/autonomy/capture_schedule.py`
 - `src/breezy/persistence/autonomy/lineage.py`
 - `src/breezy/app/trade.py`
+---
+
+## Peer-review round 1 rulings (coordinator, 2026-10-06; binding for r2)
+
+**Reviews:**
+- Architect: REQUEST_CHANGES.
+- Stats: SOUND-WITH-CAVEATS (1 bug).
+- Security: CONDITIONAL APPROVE.
+
+- **F13-R1, order and scope.**
+  - **Week 1** covers four things:
+    - the A0 probes;
+    - B0, which is the MDE from the empirical tape SD plus a placebo-feasibility check;
+    - **C1 limited to** (a) the hourly LAMP live archive, and (b) measured availability times for NBP, PFM and LAMP;
+    - GFS MOS and PFM history, which are backfilled from IEM rather than collected.
+  - **Cut from r2:** A2 HRRR, the NAM ablation, MEX, GFS MOS in C1, and the detailed C2/D file and test lists. C2/D become a gate statement only.
+  - **C1 gets its own queue row, F13-C1.** It is time-critical, needs the egress security review, and does not wait for Phase A or row 7.
+- **F13-R2, B1 redesign** (stats BUG; architect).
+  - **Rules that stay:**
+    - model-free and **CLI-free**;
+    - its days are "scan" days that never count as evidence;
+    - its single read is pre-registered.
+  - **Primary family:** {PFM at the exact WMO time, the NBP cycle at its measured vintage} × the 60-min window, Holm over 2. The 15-min window and LAMP are descriptive, because the windows are nested and LAMP is hourly.
+  - **Release time:** the *measured first public availability*, never the nominal run time.
+  - **Outcome:**
+    - a **matched-rung panel fixed before the release**: rungs with both sides at t and at t+Δ. Dropout is reported per arm, and differential missingness is itself an outcome;
+    - the **signed** change, regressed on the forecast delta.
+  - **Placebos and controls:**
+    - the same clock time on days the source did not update;
+    - matching on minute offset from the METAR release (:51–:56);
+    - a within-day pre-window, [t−60, t] versus [t, t+60].
+  - **Run order:** compute the MDE first, and STOP if it exceeds a plausible effect.
+- **F13-R3, B2 becomes a realised-EV futility screen.**
+  - **Outcome:** realised EV per take at settlement, net of θ fee, 0.01 slippage and margin(h). Drift is a diagnostic only.
+  - **Execution detail:** a lag curve at 0/30/60/120/300 s, a measured latency distribution (not one 44 s case), and depth at the ask.
+  - **Stop rules:**
+    - It is a futility screen, not confirmation (about 1,500 trades would be needed to confirm 3¢).
+    - It STOPs if the market adjusts in under 60 s.
+- **F13-R4, the Phase A blend** (architect REJECT on extending `fit_hierarchical_emos`).
+  - **The champion is untouched.** M0 = `fit_calibration`, unchanged.
+  - **New fits:** M1–M3 are fit in a new `multisource_blend.py` with `crps_numerical`.
+  - **Procedure-equivalence control:** M0′ is the new procedure with k = 0, and must match M0's CRPS within tolerance. The test statistic is Δ = M0′ − M3.
+  - **Byte-unchanged test:** `nbp_calibration.py` is asserted byte-unchanged by a test.
+  - **Predictive distribution:** Student-t, with σ driven by source disagreement:
+    `log σ = c + d·log(NBP spread) + e·log(sd of the sources' μ)`, floored.
+  - **Ladder:** the primary comparison uses an identical σ treatment, and the disagreement-σ gain is a separate ladder step.
+  - **Primary test:** a paired ΔCRPS day-block CI with LB > 0, **plus a minimum-effect floor** derived from the fold SE, pre-registered.
+  - **Descriptive only:** RMSE, so K = 1.
+  - **Co-reported diagnostics:** PIT and 80/95% coverage, and the log score on the rung ladder.
+  - **Fold sign:** the same sign in ≥ ⌈0.75·n_folds⌉ folds.
+  - **Weight sum:** shrinkage toward 1, not a hard box.
+  - v5 never mints (AS-R14).
+- **F13-R5, the data contract.**
+  - Add `first_seen` to the basis enum.
+  - Record availability as the interval (last miss, first_seen].
+  - Reuse the existing floor rule `max(observed, run + floor)` (`nbp_derived_store.py:142-153`).
+  - Tag mirror hosts in `available_at_basis`. IEM/MDL `Last-Modified` is the mirror ingest time, not NWS issuance.
+  - The frozen backtest lags are ≥ the maximum observed by C1 over ≥ 14 days.
+- **F13-R6, reuse.**
+  - Use a separate product table for PFM and LAMP. Do not edit `IEM_MOS_MODEL_PRODUCTS` (it is MOS-only).
+  - Freeze the `ArchiveRequest` keys for PFM (office/point) and LAMP (per-run tar) before building.
+  - AFOS and LAV go through the existing **`PacedIemTransport`**. A second transport to the same host would break IEM pacing.
+  - Only MDL gets a new transport.
+  - Register the new routes in `tests/contract/test_transport_error_routing_contract.py`.
+  - Fix the citations: sha256 is at `nbm_quantile_transport.py:449`, and `crps_normal` is a test oracle only.
+- **F13-R7, security (mandatory requirements, each tested).**
+  - **H1, every new transport:**
+    - exact-match host frozenset, https/443, `follow_redirects=False` (3xx = error), `trust_env=False` plus the proxy-env check;
+    - GET only, explicit timeouts, and a per-source byte cap;
+    - tests: a 3xx to an allowed host and a 3xx to a disallowed host.
+  - **H2, tar handling:** stream mode `r|`, never `extract`, `isreg()` members only, and paths derived from `(source, run_ts)` only. Cap the member count, the per-member size and the total decompressed bytes. Tests: `../`, absolute path, symlink, oversize.
+  - **H3, parsers:** bounded line and field counts, strict decode, and physical range checks. A bad row refuses the run and alerts. Closed station and point maps.
+  - **H4, integrity:** F2-style append-only revisions. A changed payload for the same key becomes a new revision; the first-seen revision is used for anchors; an unconfirmed change is never promoted. An outlier more than N °F from every other source is quarantined. Tests: `test_changed_payload_for_same_key_appends_revision_not_overwrite`, `test_unconfirmed_outlier_not_promoted`.
+  - **H5, the C1 unit:**
+    - no credentials, only `alerts.env` via `EnvironmentFile`;
+    - **bwrap no-credential profile**, with only the archive output writable and `~/.config/breezy` unmounted;
+    - `MemoryMax`, `RuntimeMaxSec` (never past 16:30Z), `LimitNOFILE` and `TasksMax`;
+    - a unit-level `flock`, so overlap is skipped;
+    - boundary clock tests at 16:29:59, 16:30, 17:09:59 and 17:10.
+  - **M6, the NO-SEND ruling (decided now; the firewall is not touched).** Data transports in `breezy.ingest.*` are outside the execution-egress guard. A guard test enforces it with three checks, and the guard runs under the no-egress gate with MockTransport and no live fetch in CI:
+    - (a) no import of the write transport, order sender, permit, `breezy.runtime` or exec client;
+    - (b) AST check that only GET is used;
+    - (c) no polymarket, kalshi or exec-client host in any allowlist.
+  - **M6, live fetches** run only from offline tools or the C1 units, never from the node or from pytest. The exec import pin x1 is extended by WIDENED rows only.
+  - **M7, C2 later:** an AST transitive import-closure check, a bridge with a hard timeout, activation only at the 16:50Z LAUNCH, and the activation commit parked on a branch until the gates pass.
+  - **M8:** exact S3 bucket FQDNs pinned, with host-to-path-prefix binding. Never `*.amazonaws.com`.
+  - **LOW:**
+    - an NTP check, with `fetched_at` recorded;
+    - `redact_url`, and a project-alias User-Agent contact (not the operator's email);
+    - the disk guard is a hard refusal.
+- **F13-R8, loss reduction (stats).**
+  - **Added to Phase A:** the **blend as a veto on FQ-style takes.** Measure how many historical FQ-rule takes the blend would refuse, and their CLI outcomes (pre-07-01 descriptive). Forward use is shadow only.
+  - **Out of F13 scope:**
+    - the pooled NO-side favourite-longshot structural test becomes a separate M1-v3 item;
+    - maker/resting orders go to the existing resting-bid line.
+  - **Rejected:** a Kalshi lead-lag signal. The operator ruled that venue prices are execution cost only, never a predictor (memory `prediction-from-weather-venues-for-cost`).
+- **F13-R9, Phase D/C2 gate statement.** D needs, in addition:
+  - F6 (C2 composes inside `_compose_forecast_quantile_ladder`, E-28);
+  - the ARCH-0 owner for `pins.py:96`;
+  - the AUT-4 OFFLINE_CHALLENGER screen.
+  The "B2 positive" gate is restated as "B2 not futile".
