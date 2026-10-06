@@ -1,6 +1,6 @@
 """F13 Phase A blend, part 3: blocked folds, out-of-fold scoring (blend arms and champion M0).
 
-Split out of ``breezy.analysis.multisource_blend`` (behaviour-neutral).
+Split out of ``breezy.analysis.multisource_blend``; re-exported by that facade.
 """
 
 from __future__ import annotations
@@ -8,18 +8,22 @@ from __future__ import annotations
 import datetime as dt
 import random
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from breezy.analysis.multisource_blend_features import (
     ARM_NAMES,
     HOLDOUT_START,
     FeatureRow,
     HoldoutLeakError,
+    InsufficientRowsError,
     _assert_admissible,
+    _finite,
+    validate_percentiles,
 )
 from breezy.analysis.multisource_blend_fit import (
     BlendSettings,
     fit_blend,
+    intended_level,
     predict_row,
     row_crps,
     student_t_cdf,
@@ -128,6 +132,14 @@ class ArmPrediction:
     sigma: float
     nu: float
 
+    def __post_init__(self) -> None:
+        for name in ("mu", "sigma", "nu"):
+            _finite(f"arm {name}", getattr(self, name))
+        if not self.sigma > 0.0:
+            raise ValueError(f"arm sigma must be positive, was {self.sigma!r}")
+        if not self.nu > 0.0:
+            raise ValueError(f"arm nu must be positive, was {self.nu!r}")
+
 
 @dataclass(frozen=True, slots=True)
 class ChampionSpec:
@@ -138,6 +150,11 @@ class ChampionSpec:
     a: float
     gamma: float
     delta: float
+
+    def __post_init__(self) -> None:
+        validate_percentiles(self.percentiles)
+        for name in ("a", "gamma", "delta"):
+            _finite(f"champion {name}", getattr(self, name))
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +168,10 @@ class ScoredRow:
     crps: Mapping[str, float]
     arm_predictions: Mapping[str, ArmPrediction]
     champion: ChampionSpec | None
+    #: effective ladder level each blend arm scored this row at (S3 diagnostics)
+    levels: Mapping[str, int] = field(default_factory=dict)
+    #: arms whose row scored below its intended level (a missing or non-converged cell; P2)
+    fell_back: tuple[str, ...] = ()
 
 
 def champion_cdf(spec: ChampionSpec) -> Callable[[float], float]:
@@ -179,8 +200,8 @@ def _version_row(row: FeatureRow) -> VersionRow:
 def _champion_rows(
     pool: Sequence[FeatureRow], held: Sequence[FeatureRow], method: CdfMethod, draws: int
 ) -> list[tuple[float, ChampionSpec]]:
-    """M0 scored out of fold: ``fit_calibration`` on ``pool`` (every pre-holdout row outside the
-    held block, all versions, as the committed champion is fitted), then the held rows only."""
+    """M0 scored out of fold: ``fit_calibration`` on ``pool`` (see :func:`_m0_pool`), then the
+    held rows only."""
     fit = fit_calibration([_version_row(r) for r in pool], method=method, bootstrap_draws=draws)
     out: list[tuple[float, ChampionSpec]] = []
     for row in held:
@@ -195,6 +216,69 @@ def _champion_rows(
     return out
 
 
+def _check_embargo(embargo_days: int) -> None:
+    if isinstance(embargo_days, bool) or not isinstance(embargo_days, int) or embargo_days < 0:
+        raise ValueError(f"embargo_days must be a non-negative int, was {embargo_days!r}")
+
+
+def _blocked_days(fold: Fold, embargo_days: int) -> frozenset[dt.date]:
+    """The held days plus every day within ``embargo_days`` of one: never trained on."""
+    return frozenset(
+        held + dt.timedelta(days=k)
+        for held in fold.held_days
+        for k in range(-embargo_days, embargo_days + 1)
+    )
+
+
+def _m0_pool(rows: Sequence[FeatureRow], fold: Fold, embargo_days: int) -> list[FeatureRow]:
+    """S1: the held version's ``fold.train_days`` (same source segment) plus every other version's
+    rows, embargoed around the held block. Never padded with the held version's other segments."""
+    blocked, train = _blocked_days(fold, embargo_days), set(fold.train_days)
+    return [
+        r
+        for r in rows
+        if r.climate_day not in blocked and (r.version != fold.version or r.climate_day in train)
+    ]
+
+
+def _pooled_sensitivity_pool(
+    rows: Sequence[FeatureRow], fold: Fold, embargo_days: int
+) -> list[FeatureRow]:
+    """The pre-S1 pool, kept as a reported sensitivity: every pre-holdout row outside the held
+    block (so it includes the held version's other source segments), embargoed identically."""
+    blocked = _blocked_days(fold, embargo_days)
+    return [r for r in rows if r.climate_day not in blocked]
+
+
+def _m0_pool_defect(pool: Sequence[FeatureRow], fold: Fold) -> str | None:
+    """Why ``fit_calibration`` cannot score ``fold`` from ``pool``; ``None`` when it can."""
+    if not any(r.version == fold.version for r in pool):
+        return "the held version has no train rows left"
+    if len({r.version for r in pool}) < 2:
+        return "fewer than 2 versions"
+    if not any(
+        DEFAULT_SPLITS.split_for_date(r.climate_day) in ("validate", "v5_fit_slice") for r in pool
+    ):
+        return "no validate/v5 row"
+    return None
+
+
+def m0_eligible_plan(rows: Sequence[FeatureRow], plan: FoldPlan, *, embargo_days: int) -> FoldPlan:
+    """Drop (and count in ``excluded``) every fold whose M0 pool ``fit_calibration`` cannot use."""
+    _check_embargo(embargo_days)
+    kept: list[Fold] = []
+    excluded = list(plan.excluded)
+    for fold in plan.folds:
+        defect = _m0_pool_defect(_m0_pool(rows, fold, embargo_days), fold)
+        if defect is None:
+            kept.append(fold)
+        else:
+            excluded.append(
+                (fold.version, fold.segment, f"fold {fold.fold_id}: M0 pool inadmissible: {defect}")
+            )
+    return FoldPlan(folds=tuple(kept), excluded=tuple(excluded))
+
+
 def out_of_fold_scores(
     rows: Sequence[FeatureRow],
     plan: FoldPlan,
@@ -204,41 +288,66 @@ def out_of_fold_scores(
     champion: bool = True,
     m0_bootstrap_draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     champion_method: CdfMethod = CdfMethod.NORMAL,
+    embargo_days: int = 0,
+    pooled_sensitivity: bool = True,
 ) -> list[ScoredRow]:
     """Score every held row of every fold with models fitted without that fold's held days.
 
     The blend arms train on the fold's own train days (same version, same source segment). The
-    champion M0 is the shared multi-version ``fit_calibration`` over every pre-holdout row outside
-    the held block, because the champion's hierarchical shrinkage needs several versions; it is the
-    same procedure the committed champion uses, never fitted on the rows it scores.
+    champion M0 is ``fit_calibration`` over :func:`_m0_pool` (the held version's train days and
+    every other version's rows: its hierarchical shrinkage needs several versions), never fitted on
+    the rows it scores. ``embargo_days`` removes the days around the held block from M0 AND from
+    the blend training. With ``pooled_sensitivity`` the old all-rows pool is also scored as
+    ``M0pooled`` (a sensitivity, never gating). A fold whose M0 pool ``fit_calibration`` cannot use
+    raises :class:`InsufficientRowsError`; :func:`m0_eligible_plan` excludes and counts such folds.
     """
+    _check_embargo(embargo_days)
     _assert_admissible(rows)
     scored: list[ScoredRow] = []
     for fold in plan.folds:
         held_days, train_days = set(fold.held_days), set(fold.train_days)
+        blocked = _blocked_days(fold, embargo_days)
         held = [r for r in rows if r.version == fold.version and r.climate_day in held_days]
-        train = [r for r in rows if r.version == fold.version and r.climate_day in train_days]
+        train = [
+            r
+            for r in rows
+            if r.version == fold.version
+            and r.climate_day in train_days
+            and r.climate_day not in blocked
+        ]
         if not held:
             continue
         crps: list[dict[str, float]] = [{} for _ in held]
         predictions: list[dict[str, ArmPrediction]] = [{} for _ in held]
+        eff_levels: list[dict[str, int]] = [{} for _ in held]
+        fell_back: list[list[str]] = [[] for _ in held]
         for level in levels:
             fit = fit_blend(train, level=level, settings=settings)
             arm = ARM_NAMES[level]
             for i, row in enumerate(held):
-                mu, sigma, _eff = predict_row(fit, row)
+                mu, sigma, eff = predict_row(fit, row)
                 predictions[i][arm] = ArmPrediction(mu, sigma, settings.nu)
                 crps[i][arm] = row_crps(fit, row)
+                eff_levels[i][arm] = eff
+                if eff < intended_level(fit, row):
+                    fell_back[i].append(arm)
         specs: list[ChampionSpec | None] = [None] * len(held)
         if champion:
-            pool = [
-                r for r in rows if not (r.version == fold.version and r.climate_day in held_days)
-            ]
+            pool = _m0_pool(rows, fold, embargo_days)
+            defect = _m0_pool_defect(pool, fold)
+            if defect is not None:
+                raise InsufficientRowsError(f"fold {fold.fold_id}: M0 pool inadmissible: {defect}")
             for i, (value, spec) in enumerate(
                 _champion_rows(pool, held, champion_method, m0_bootstrap_draws)
             ):
                 crps[i]["M0"] = value
                 specs[i] = spec
+            if pooled_sensitivity:
+                wide = _pooled_sensitivity_pool(rows, fold, embargo_days)
+                for i, (value, _spec) in enumerate(
+                    _champion_rows(wide, held, champion_method, m0_bootstrap_draws)
+                ):
+                    crps[i]["M0pooled"] = value
         for i, row in enumerate(held):
             scored.append(
                 ScoredRow(
@@ -251,6 +360,8 @@ def out_of_fold_scores(
                     crps=crps[i],
                     arm_predictions=predictions[i],
                     champion=specs[i],
+                    levels=eff_levels[i],
+                    fell_back=tuple(fell_back[i]),
                 )
             )
     return scored
@@ -275,6 +386,8 @@ def merge_scored(first: Sequence[ScoredRow], second: Sequence[ScoredRow]) -> lis
                 crps={**a.crps, **b.crps},
                 arm_predictions={**a.arm_predictions, **b.arm_predictions},
                 champion=a.champion if a.champion is not None else b.champion,
+                levels={**a.levels, **b.levels},
+                fell_back=(*a.fell_back, *(x for x in b.fell_back if x not in a.fell_back)),
             )
         )
     return merged

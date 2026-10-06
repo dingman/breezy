@@ -293,7 +293,8 @@ def test_blend_identical_sigma_treatment_across_primary_arms() -> None:
             assert cell.e is None
         _mu, sigma, level = msb.predict_row(fit, row)
         cell = fit.cells[(level, False)]
-        expected = max(math.exp(cell.c + cell.d * math.log(row.percentiles.sd)), 0.5)
+        # P2: the floor is the smooth softplus floor, no longer a hard max(., 0.5)
+        expected = float(msb.floored_sigma(cell.c + cell.d * math.log(row.percentiles.sd), 0.5))
         assert sigma == pytest.approx(expected)
 
 
@@ -311,8 +312,11 @@ def test_blend_student_t_log_sigma_includes_source_disagreement_only_in_separate
     # the separate step is exactly the documented formula
     sigma = msb.predict_row(separate, moved)[1]
     dis = msb.source_disagreement_f(moved, level=3)
-    expected = max(
-        math.exp(deep.c + deep.d * math.log(moved.percentiles.sd) + deep.e * math.log(dis)), 0.5
+    # P2: the floor is the smooth softplus floor, no longer a hard max(., 0.5)
+    expected = float(
+        msb.floored_sigma(
+            deep.c + deep.d * math.log(moved.percentiles.sd) + deep.e * math.log(dis), 0.5
+        )
     )
     assert sigma == pytest.approx(expected)
     # level 0 has no sources to disagree: the step is a no-op there
@@ -746,6 +750,7 @@ def _passing_inputs(**overrides: object) -> msb.AcceptanceInputs:
         "station_tolerance": 0.05,
         "lag_rerun": _summary(0.25, 0.10),
         "lag_rows_lost": 12,
+        "negative_control": _summary(0.0, -0.05),
     }
     base.update(overrides)
     return msb.AcceptanceInputs(**base)  # type: ignore[arg-type]

@@ -25,6 +25,7 @@ for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
 from breezy.strategy.forecast_quantile_ladder.decision import SidedAsk, Take
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.ladder_ev.quantile_density import Rung
+from scripts.analysis.fq_evaluate_shim import Side
 from scripts.analysis.fq_mc_eprocess import (
     ALPHA_KILL,
     K_SLOTS,
@@ -39,7 +40,6 @@ from scripts.analysis.fq_mc_livedata import (
     Design,
     LoopConfig,
     PoolDay,
-    Side,
     _break_even,
     _call_evaluate,
     build_templates,

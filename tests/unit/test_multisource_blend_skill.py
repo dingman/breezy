@@ -50,6 +50,7 @@ _PINS: dict[str, Any] = {
     "source_breaks": [],
     "rung_edges_f": [50, 55, 60, 65, 70, 75],
     "min_uncensored_lag_samples": 5,
+    "embargo_days": 2,
 }
 
 
@@ -273,7 +274,8 @@ def test_runner_end_to_end_reports_every_acceptance_input(tmp_path: Path) -> Non
     assert (scenario.out / "result.json").exists()
     assert (scenario.out / "oof_rows.jsonl").exists()
     assert result["rows_scored"] == len(scenario.rows)
-    assert result["negative_control"]["abs_delta"] < abs(result["delta_m0p_m3"]["mean"]) + 0.05
+    assert "abs_delta" not in result["negative_control"]
+    assert set(result["negative_control"]) >= {"mean", "lb", "n_days"}
 
 
 def test_runner_applies_the_memory_cap_before_scoring(
@@ -457,7 +459,9 @@ def test_veto_forward_shadow_never_feeds_a_verdict() -> None:
         veto.forward_shadow_count([stale], first_forward_day=first_forward)
 
 
-def test_veto_main_refuses_unfrozen_prereg_and_unpinned_reference(tmp_path: Path) -> None:
+def test_veto_main_refuses_unfrozen_prereg_and_unpinned_reference(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     rows = tmp_path / "oof_rows.jsonl"
     rows.write_text("", encoding="utf-8")
     scenario_repo = tmp_path / "repo"
@@ -465,10 +469,12 @@ def test_veto_main_refuses_unfrozen_prereg_and_unpinned_reference(tmp_path: Path
     draft = scenario_repo / "draft.json"
     draft.write_text(json.dumps({**_design(), "frozen_sha": "UNFROZEN"}), encoding="utf-8")
     base = ["--oof-rows", str(rows), "--out", str(tmp_path / "veto.json")]
-    with pytest.raises(veto.Refusal, match="UNFROZEN"):
-        veto.main(["--prereg", str(draft), *base])
-    with pytest.raises(veto.Refusal, match="reference"):
-        veto.main(["--prereg", str(frozen), *base])  # the reference ask is an unpinned prereg value
+    assert veto.main(["--prereg", str(draft), *base]) == 2
+    err = capsys.readouterr().err
+    assert "REFUSED:" in err and "UNFROZEN" in err
+    # the reference ask is an unpinned prereg value
+    assert veto.main(["--prereg", str(frozen), *base]) == 2
+    assert "reference" in capsys.readouterr().err
 
 
 def test_oof_row_json_round_trips() -> None:

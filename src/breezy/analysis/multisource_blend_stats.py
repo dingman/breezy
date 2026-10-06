@@ -1,6 +1,6 @@
 """F13 Phase A blend, part 4: paired-delta statistics, acceptance rules, reporting and gates.
 
-Split out of ``breezy.analysis.multisource_blend`` (behaviour-neutral).
+Split out of ``breezy.analysis.multisource_blend``; re-exported by that facade.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from scipy.special import stdtr, stdtrit
 
 from breezy.analysis.multisource_blend_features import (
     HORIZONS,
+    LEVEL_SOURCES,
     C1LagEvidenceError,
     FeatureRow,
     InsufficientFoldsError,
@@ -90,6 +91,12 @@ def stationary_bootstrap_means(
 
     No stationary bootstrap exists elsewhere in the repo (``scoring_core`` and ``release_timing``
     resample i.i.d. clusters), so this is the one implementation of it.
+
+    Two documented approximations (S6): ``values`` are treated as ADJACENT in time, so a
+    non-adjacent climate day (a gap left by a missing or excluded day) is bridged as if it followed
+    its predecessor; and the series is CIRCULAR, so a block that runs past the last value wraps to
+    the first, joining two ends that are not neighbours. Both slightly understate the dependence
+    structure at gaps and at the ends; neither is corrected here.
     """
     n = len(values)
     if n < 2:
@@ -187,6 +194,8 @@ class AcceptanceInputs:
     station_tolerance: float | None
     lag_rerun: DeltaSummary | None
     lag_rows_lost: Any
+    #: S2: M0' vs M3 re-scored on shuffled labels; a positive one-sided lower bound is a leak
+    negative_control: DeltaSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +214,27 @@ def _lb_failures(label: str, summary: DeltaSummary, floor: float) -> list[str]:
     return failures
 
 
+def _leak_reasons(inputs: AcceptanceInputs, spread: float) -> list[str]:
+    """S2 / S4: anything that looks too good, or skill found in shuffled labels, holds the run."""
+    assert inputs.leak_audit_multiple is not None
+    limit = inputs.leak_audit_multiple * spread
+    reasons = [
+        f"delta {label} {summary.mean:.4f} exceeds {inputs.leak_audit_multiple} x the fold "
+        f"spread {spread:.4f}: audit for leakage before believing it"
+        for label, summary in (
+            ("CRPS(M0prime) - CRPS(M3)", inputs.m0p_vs_m3),
+            ("CRPS(M0) - CRPS(M3)", inputs.m0_vs_m3),
+        )
+        if summary.mean > limit
+    ]
+    if inputs.negative_control.lb > 0.0:
+        reasons.append(
+            f"negative control (shuffled labels) one-sided lower bound "
+            f"{inputs.negative_control.lb:.4f} is > 0: the pipeline finds skill in noise"
+        )
+    return reasons
+
+
 def decide_acceptance(inputs: AcceptanceInputs) -> AcceptanceDecision:
     """Acceptance 1-8 (R15, R25). Acceptance 9 is the diagnostics report."""
     for name in ("m0p_tolerance", "station_tolerance", "leak_audit_multiple"):
@@ -219,18 +249,26 @@ def decide_acceptance(inputs: AcceptanceInputs) -> AcceptanceDecision:
         "floor_multiple": inputs.floor_multiple,
         "m0_fold_sd": spread,
         "fold_sign_needed": fold_sign_threshold(len(inputs.fold_means_m0p_vs_m3)),
+        "m0p_vs_m0_two_sided": {
+            "difference": inputs.m0p_minus_m0,
+            "abs_difference": abs(inputs.m0p_minus_m0),
+            "tolerance": inputs.m0p_tolerance,
+            "gating": "one_sided_worse_only",
+        },
+        "negative_control": {
+            "mean": inputs.negative_control.mean,
+            "lb": inputs.negative_control.lb,
+            "n_days": inputs.negative_control.n_days,
+        },
         "lag_rerun": {
             "mean": None if inputs.lag_rerun is None else inputs.lag_rerun.mean,
             "lb": None if inputs.lag_rerun is None else inputs.lag_rerun.lb,
             "rows_lost": inputs.lag_rows_lost,
         },
     }
-    if inputs.m0p_vs_m3.mean > inputs.leak_audit_multiple * spread:
-        reason = (
-            f"delta {inputs.m0p_vs_m3.mean:.4f} exceeds {inputs.leak_audit_multiple} x the fold "
-            f"spread {spread:.4f}: audit for leakage before believing it"
-        )
-        return AcceptanceDecision(Verdict.HELD_LEAK_AUDIT, (reason,), report)
+    leaks = _leak_reasons(inputs, spread)
+    if leaks:
+        return AcceptanceDecision(Verdict.HELD_LEAK_AUDIT, tuple(leaks), report)
     if inputs.m0p_minus_m0 > inputs.m0p_tolerance:
         reason = (
             f"M0' is worse than M0 by {inputs.m0p_minus_m0:.4f}, beyond the tolerance "
@@ -269,6 +307,36 @@ class Missingness:
     @property
     def share(self) -> float:
         return self.missing / self.n if self.n else 0.0
+
+
+def level_counts(scored: Sequence[ScoredRow], arm: str) -> dict[int, int]:
+    """S3: rows by the ladder level ``arm`` effectively scored them at. Reported, never gating."""
+    counts: dict[int, int] = {}
+    for s in scored:
+        if arm in s.levels:
+            counts[s.levels[arm]] = counts.get(s.levels[arm], 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def complete_case_delta(scored: Sequence[ScoredRow], first: str, second: str) -> dict[str, Any]:
+    """S3: ``CRPS(first) - CRPS(second)`` over rows where ``second`` used EVERY source (LAMP, PFM
+    and MOS present). Diagnostic only: it conditions on source availability and never gates."""
+    complete = [
+        s.crps[first] - s.crps[second]
+        for s in scored
+        if s.levels.get(second) == len(LEVEL_SOURCES) and first in s.crps and second in s.crps
+    ]
+    days = {
+        s.climate_day
+        for s in scored
+        if s.levels.get(second) == len(LEVEL_SOURCES) and first in s.crps and second in s.crps
+    }
+    return {
+        "label": "diagnostic_only_never_gating",
+        "n_rows": len(complete),
+        "n_days": len(days),
+        "mean": math.fsum(complete) / len(complete) if complete else None,
+    }
 
 
 def lamp_missingness_by_horizon(rows: Sequence[FeatureRow]) -> dict[str, Missingness]:

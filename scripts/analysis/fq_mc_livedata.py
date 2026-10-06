@@ -16,7 +16,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 import numpy as np
 
@@ -27,21 +27,18 @@ for _entry in (str(_SCRIPTS_ANALYSIS_DIR), str(_REPO_ROOT), str(_REPO_ROOT / "sr
         sys.path.insert(0, _entry)
 
 from breezy.analysis.nbp_calibration import DEFAULT_SPLITS
-from breezy.strategy.forecast_quantile_ladder.bounds import RungBounds
 from breezy.strategy.forecast_quantile_ladder.decision import (
     SidedAsk,
     Take,
-    evaluate,
 )
 from breezy.strategy.forecast_quantile_ladder.latch import QuantileLadderLatch
 from breezy.strategy.forecast_quantile_ladder.margin import (
     forecast_margin,
-    hours_to_settlement,
 )
 from breezy.strategy.ladder_ev.config import LadderEvConfig
-from breezy.strategy.ladder_ev.forecast_state import ForecastQuantileVector
 from breezy.strategy.ladder_ev.quantile_density import Rung
 from breezy.strategy.weather_common.costs import venue_fee_prob
+from scripts.analysis.fq_evaluate_shim import Side, call_evaluate
 from scripts.analysis.fq_mc_eprocess import (
     ALPHA_KILL,
     K_SLOTS,
@@ -51,7 +48,8 @@ from scripts.analysis.fq_mc_eprocess import (
 )
 from scripts.analysis.k1_kalshi_prior import ask_at_open
 
-Side = Literal["yes", "no"]
+#: Kept under its historical name for ``fq_mc_type1`` and the veto; the body lives in the shim.
+_call_evaluate = call_evaluate
 
 
 #: The sealed-holdout start, from the one place the repo declares it.
@@ -332,84 +330,6 @@ def _model_p_hat(rung: PoolRung, draw: _Draw, cfg: LoopConfig, margin: float) ->
         p_upper = 1.0 - no - fee - cfg.slippage_floor_prob - margin - draw.extra
         return max(0.0, p_upper - cfg.bound_halfwidth)
     return min(1.0, max(0.0, rung.yes_ask + 0.01 * draw.noise))
-
-
-class _StubResolved:
-    draws: tuple[()] = ()
-    point = None
-
-
-class _StubCalibration:
-    """`evaluate` forwards only ``draws`` to the bounds provider, which ignores them."""
-
-    def resolve(self, era: str, *, latitude_deg: float, climate_day: dt.date) -> _StubResolved:
-        return _StubResolved()
-
-
-def _vector(day: dt.date) -> ForecastQuantileVector:
-    return ForecastQuantileVector(
-        q10=0.0,
-        q25=0.0,
-        q50=0.0,
-        q75=0.0,
-        q90=0.0,
-        mean=0.0,
-        sd=1.0,
-        available_at_ns=0,
-        cycle_runtime_ns=0,
-        climate_day=day,
-        model_version="v4.0",
-    )
-
-
-def _now_ns(climate_day: dt.date, cfg: LoopConfig, h_hours: float) -> int:
-    settle_ns = (
-        hours_to_settlement(
-            now_ns=0, climate_day=climate_day, std_utc_offset_hours=cfg.std_utc_offset_hours
-        )
-        * 3_600_000_000_000
-    )
-    return int(settle_ns - h_hours * 3_600_000_000_000)
-
-
-def _call_evaluate(
-    *,
-    climate_day: dt.date,
-    station: str,
-    ladder: Sequence[Rung],
-    rung_id: str,
-    side: Side,
-    ask: SidedAsk,
-    p_hat: float,
-    cfg: LoopConfig,
-    h_hours: float,
-    latch: QuantileLadderLatch,
-) -> Any:
-    """ONE call of the shipped take rule. The only injected piece is the bounds provider."""
-
-    def provider(**_kw: Any) -> RungBounds:
-        return RungBounds(p_hat, p_hat - cfg.bound_halfwidth, p_hat + cfg.bound_halfwidth)
-
-    return evaluate(
-        now_ns=_now_ns(climate_day, cfg, h_hours),
-        std_utc_offset_hours=cfg.std_utc_offset_hours,
-        permit_covers=True,
-        vector=_vector(climate_day),
-        station=station,
-        climate_day=climate_day,
-        ladder=ladder,
-        rung_id=rung_id,
-        side=side,
-        ask=ask,
-        fee_coefficient=cfg.theta,
-        slippage_floor_prob=cfg.slippage_floor_prob,
-        h_hours=h_hours,
-        cfg=LadderEvConfig(),
-        calibration=_StubCalibration(),  # type: ignore[arg-type]
-        latitude_deg=cfg.latitude_deg,
-        bounds_provider=provider,
-        latch=latch,
-    )
 
 
 def _record(take: Take, ask: float, cfg: LoopConfig) -> TakeRecord:

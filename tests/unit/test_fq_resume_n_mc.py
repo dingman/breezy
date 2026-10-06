@@ -18,6 +18,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, REPO_ROOT.as_posix())
+from scripts.analysis import fq_evaluate_shim as shim
 from scripts.analysis import fq_mc_livedata as livedata
 from scripts.analysis import fq_resume_n_mc as mc
 
@@ -192,7 +193,8 @@ def test_mc_replays_live_daily_loop_verbatim(
         calls.append((str(kwargs["station"]), str(kwargs["rung_id"]), str(kwargs["side"])))
         return real(**kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(livedata, "evaluate", spy)
+    # P5: the one call of `evaluate` now lives in the shared shim that livedata re-exports
+    monkeypatch.setattr(shim, "evaluate", spy)
     day = pool_days[0]
     view = mc.draw_model_view(day, pi_fav=1.0, seed=3)
     takes = mc.replay_live_day(day, view, mc.LoopConfig())

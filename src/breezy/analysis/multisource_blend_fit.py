@@ -1,6 +1,6 @@
 """F13 Phase A blend, part 2: the Student-t blend, its nested ladder cells and its CRPS scoring.
 
-Split out of ``breezy.analysis.multisource_blend`` (behaviour-neutral).
+Split out of ``breezy.analysis.multisource_blend``; re-exported by that facade.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import math
 import statistics
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 import numpy as np
 from scipy.optimize import minimize
@@ -18,6 +18,7 @@ from scipy.special import gammaln, stdtr
 from breezy.analysis.multisource_blend_features import (
     DISAGREEMENT_SD_FLOOR_F,
     FeatureRow,
+    FitNotConvergedError,
     InsufficientRowsError,
     _assert_admissible,
 )
@@ -25,6 +26,10 @@ from breezy.analysis.nbp_calibration import crps_numerical
 
 _RIDGE: Final[float] = 1e-6
 _MAX_FIT_ITER: Final[int] = 400
+#: Sharpness k of the smooth sigma floor: the floor is exact to within ``ln 2 / k`` degF at the
+#: crossing and to ``exp(-k * floor) / k`` far below it.
+SIGMA_FLOOR_SHARPNESS: Final[float] = 20.0
+_ETA_CLIP: Final[float] = 20.0
 
 # ------------------------------------------------------------------ the blend
 
@@ -65,6 +70,8 @@ class BlendFit:
     level: int
     settings: BlendSettings
     cells: Mapping[tuple[int, bool], CellParams]
+    #: cells whose optimiser did not converge: dropped, so their rows fall back to a lower cell
+    nonconverged: tuple[tuple[int, bool], ...] = ()
 
 
 def source_disagreement_f(row: FeatureRow, *, level: int) -> float:
@@ -102,6 +109,17 @@ def _required(value: float | None) -> float:
     return value
 
 
+def floored_sigma(eta: Any, floor: float) -> Any:
+    """``sigma`` from ``eta = log sigma`` with a SMOOTH floor (a softplus, never a hard maximum).
+
+    ``floor + softplus_k(exp(eta) - floor)``: always >= ``floor``, strictly increasing in ``eta``
+    (so L-BFGS-B always sees a gradient, which a ``max(., floor)`` kink removes) and equal to
+    ``exp(eta)`` far above the floor. The fit and :func:`predict_row` both use it.
+    """
+    raw = np.exp(np.clip(eta, -_ETA_CLIP, _ETA_CLIP))
+    return floor + np.logaddexp(0.0, SIGMA_FLOOR_SHARPNESS * (raw - floor)) / SIGMA_FLOOR_SHARPNESS
+
+
 def _t_constant(nu: float) -> float:
     return float(gammaln((nu + 1.0) / 2.0) - gammaln(nu / 2.0) - 0.5 * math.log(nu * math.pi))
 
@@ -132,7 +150,7 @@ def _fit_cell(
         eta = theta[1 + m] + theta[2 + m] * log_sd
         if log_dis is not None:
             eta = eta + theta[3 + m] * log_dis
-        sigma = np.maximum(np.exp(np.clip(eta, -20.0, 20.0)), floor)
+        sigma = floored_sigma(eta, floor)
         z = (y - mu) / sigma
         nll = float(np.sum(np.log(sigma) - const + 0.5 * (nu + 1.0) * np.log1p(z * z / nu)))
         penalty = lam * n * float(np.sum(theta[1 : 1 + m]) - 1.0) ** 2
@@ -144,6 +162,10 @@ def _fit_cell(
     )
     result = minimize(objective, start, method="L-BFGS-B", options={"maxiter": _MAX_FIT_ITER})
     theta = np.asarray(result.x, dtype=np.float64)
+    if not (bool(result.success) and bool(np.all(np.isfinite(theta)))):
+        raise FitNotConvergedError(
+            f"cell (level={level}, obs={obs}, n={n}) did not converge: {result.message}"
+        )
     w = theta[1 : 1 + m]
     return CellParams(
         level=level,
@@ -171,14 +193,20 @@ def fit_blend(rows: Sequence[FeatureRow], *, level: int, settings: BlendSettings
         if eff > 0:
             # level-0 cell: M0' is fitted on every row, identically inside every ladder step
             groups.setdefault((0, row.obs_so_far_f is not None), []).append(row)
-    cells = {
-        key: _fit_cell(members, key[0], key[1], settings)
-        for key, members in sorted(groups.items())
-        if len(members) >= settings.min_cell_rows
-    }
+    cells: dict[tuple[int, bool], CellParams] = {}
+    nonconverged: list[tuple[int, bool]] = []
+    for key, members in sorted(groups.items()):
+        if len(members) < settings.min_cell_rows:
+            continue
+        try:
+            cells[key] = _fit_cell(members, key[0], key[1], settings)
+        except FitNotConvergedError:
+            if key[0] == 0:
+                raise  # M0' has no cell below it: a silent fallback would score a failed fit
+            nonconverged.append(key)
     if not cells:
         raise InsufficientRowsError("no cell reached min_cell_rows")
-    return BlendFit(level=level, settings=settings, cells=cells)
+    return BlendFit(level=level, settings=settings, cells=cells, nonconverged=tuple(nonconverged))
 
 
 def _cell_for(fit: BlendFit, row: FeatureRow) -> tuple[CellParams, int]:
@@ -202,8 +230,12 @@ def predict_row(fit: BlendFit, row: FeatureRow) -> tuple[float, float, int]:
     eta = cell.c + cell.d * math.log(row.percentiles.sd)
     if cell.e is not None:
         eta += cell.e * math.log(source_disagreement_f(row, level=level))
-    sigma = max(math.exp(max(-20.0, min(20.0, eta))), fit.settings.sigma_floor_f)
-    return mu, sigma, level
+    return mu, float(floored_sigma(eta, fit.settings.sigma_floor_f)), level
+
+
+def intended_level(fit: BlendFit, row: FeatureRow) -> int:
+    """The ladder level the row should score at: its present prefix, capped at the fit's level."""
+    return min(row.prefix_level, fit.level)
 
 
 def student_t_cdf(mu: float, sigma: float, nu: float) -> Callable[[float], float]:

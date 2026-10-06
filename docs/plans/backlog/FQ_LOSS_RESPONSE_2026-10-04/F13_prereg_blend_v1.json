@@ -70,7 +70,8 @@
     "m0_bootstrap_draws": null,
     "source_breaks": null,
     "rung_edges_f": null,
-    "min_uncensored_lag_samples": null
+    "min_uncensored_lag_samples": null,
+    "embargo_days": null
   },
   "pin_units": {
     "m0_prime_tolerance_crps_f": "absolute CRPS in degF; M0prime worse than M0 by more than this refuses ACCEPT",
@@ -78,19 +79,20 @@
     "sigma_floor_f": "degF",
     "source_breaks": "list of ISO dates from A0; a fold never straddles one",
     "rung_edges_f": "integer degF edges for the rung-ladder log score",
-    "champion_cdf_method": "NORMAL | PCHIP_NORMAL_TAILS | SKEW_NORMAL, the CdfMethod the committed champion uses"
+    "champion_cdf_method": "NORMAL | PCHIP_NORMAL_TAILS | SKEW_NORMAL, the CdfMethod the committed champion uses",
+    "embargo_days": "integer days (>= 0): every day within this many days of a held block is dropped from the training of M0, the pooled-M0 sensitivity AND every blend arm"
   },
   "veto": {
     "label": "descriptive only, carries no verdict (R8, R15)",
     "take_rule": {
       "open_item": "OPEN-3",
-      "citation": "src/breezy/strategy/forecast_quantile_ladder/decision.py:349-355 (net EV against the cost, take iff net > forecast_margin); margin src/breezy/strategy/forecast_quantile_ladder/margin.py:30-37; fee src/breezy/strategy/weather_common/costs.py:155-183; reached through the shipped evaluate() via scripts/analysis/fq_mc_livedata.py:370 (_call_evaluate)",
+      "citation": "src/breezy/strategy/forecast_quantile_ladder/decision.py:349-355 (net EV against the cost, take iff net > forecast_margin); margin src/breezy/strategy/forecast_quantile_ladder/margin.py:30-37; fee src/breezy/strategy/weather_common/costs.py:155-183; reached through the shipped evaluate() via scripts/analysis/fq_evaluate_shim.py (call_evaluate; re-exported by fq_mc_livedata as _call_evaluate)",
       "order": "YES: ev_net(p_lower, cost); NO: ev_net_no(p_upper, cost); cost = fee theta*p*(1-p) + slippage floor; take iff net > margin(h)",
       "fixed_by_code": "theta, slippage floor, h_hours and bound halfwidth are the scripts/analysis/fq_mc_livedata.py LoopConfig defaults, read from the code and never copied",
       "proxy_deviation": "no out-of-fold bootstrap draws exist, so p_lower and p_upper are p_hat -/+ the LoopConfig bound halfwidth"
     },
     "reference": null,
-    "reference_note": "no tape exists before 2026-08-30, so the pre-07-01 proxy needs a pre-registered reference ask; the coordinator pins its kind and value. Until then blend_veto_descriptive.py refuses to run.",
+    "reference_note": "no tape exists before 2026-08-30, so the pre-07-01 proxy needs a pre-registered reference ask; the coordinator pins its kind and value. Until then blend_veto_descriptive.py refuses to run. Kinds: raw_nbp_cdf = {kind, spread_prob} (the uncalibrated NBP NORMAL rung probability plus spread_prob, YES p + s, NO 1 - p + s); const = {kind, price} is unsuitable (rung-blind), tests and smoke runs only.",
     "tape_start": "2026-08-30",
     "horizon": "D-1 (the FQ family trades D+1)",
     "champion_output": "out-of-fold only; a fitted-in-sample champion is refused"

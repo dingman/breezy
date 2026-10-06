@@ -1,6 +1,6 @@
 """F13 Phase A blend, part 5: JSON serialisation of feature rows and scored rows.
 
-Split out of ``breezy.analysis.multisource_blend`` (behaviour-neutral).
+Split out of ``breezy.analysis.multisource_blend``; re-exported by that facade.
 """
 
 from __future__ import annotations
@@ -75,6 +75,8 @@ def scored_row_to_json(row: ScoredRow) -> dict[str, Any]:
         "fold_id": row.fold_id,
         "observed_f": row.observed_f,
         "crps": dict(row.crps),
+        "levels": dict(row.levels),
+        "fell_back": list(row.fell_back),
         "arm_predictions": {
             k: {"mu": v.mu, "sigma": v.sigma, "nu": v.nu} for k, v in row.arm_predictions.items()
         },
@@ -100,6 +102,8 @@ def scored_row_from_json(data: Mapping[str, Any]) -> ScoredRow:
         fold_id=data["fold_id"],
         observed_f=data["observed_f"],
         crps=dict(data["crps"]),
+        levels={k: int(v) for k, v in data.get("levels", {}).items()},
+        fell_back=tuple(data.get("fell_back", ())),
         arm_predictions={k: ArmPrediction(**v) for k, v in data["arm_predictions"].items()},
         champion=None
         if champion is None

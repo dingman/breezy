@@ -54,6 +54,10 @@ class PreregIncompleteError(ValueError):
     """A prereg value the computation needs is still null."""
 
 
+class FitNotConvergedError(RuntimeError):
+    """The optimiser did not converge for a cell that has no cell below it to fall back to."""
+
+
 class C1LagEvidenceError(RuntimeError):
     """C1 has not yet measured enough lag days to freeze the source lags."""
 
@@ -93,6 +97,14 @@ class SourceVintage:
 def _finite(name: str, value: float | None) -> None:
     if value is not None and not math.isfinite(value):
         raise NonFiniteInputError(f"{name} is not finite ({value!r}); refused, never imputed")
+
+
+def validate_percentiles(p: Percentiles) -> None:
+    """The one boundary check: every bulletin field finite and the NBP sd strictly positive."""
+    for name in ("q10", "q25", "q50", "q75", "q90", "mean", "sd"):
+        _finite(f"percentiles.{name}", getattr(p, name))
+    if not p.sd > 0.0:
+        raise NonFiniteInputError(f"NBP sd must be positive, was {p.sd!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +153,7 @@ class FeatureRow:
     def __post_init__(self) -> None:
         if self.horizon not in HORIZONS:
             raise ValueError(f"horizon must be one of {HORIZONS}, was {self.horizon!r}")
-        p = self.percentiles
-        for name in ("q10", "q25", "q50", "q75", "q90", "mean", "sd"):
-            _finite(f"percentiles.{name}", getattr(p, name))
-        if not p.sd > 0.0:
-            raise NonFiniteInputError(f"NBP sd must be positive, was {p.sd!r}")
+        validate_percentiles(self.percentiles)
         _finite("cli_tmax_f", self.cli_tmax_f)
         _finite("obs_so_far_f", self.obs_so_far_f)
         _finite("pfm_mu_f", self.pfm_mu_f)
