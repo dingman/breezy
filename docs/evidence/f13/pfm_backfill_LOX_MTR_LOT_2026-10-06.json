@@ -1,0 +1,95 @@
+{
+  "inputs": {
+    "end": "2026-10-06",
+    "legs": [
+      "pfm"
+    ],
+    "start": "2026-08-25",
+    "stations": [
+      "KLAX",
+      "KSFO",
+      "KMDW"
+    ]
+  },
+  "launch_window_utc": "16:30-17:10",
+  "mode": "apply",
+  "pfm": {
+    "estimated_requests": 165,
+    "estimated_seconds": 660.0,
+    "fits_budget": true,
+    "legs": [
+      {
+        "appended": 127,
+        "error": null,
+        "products_seen": 234,
+        "quarantined": 0,
+        "refused": {},
+        "requests": 12,
+        "resume_sdate": null,
+        "station": "KLAX",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 107,
+        "wfo": "LOX"
+      },
+      {
+        "appended": 126,
+        "error": null,
+        "products_seen": 265,
+        "quarantined": 0,
+        "refused": {},
+        "requests": 14,
+        "resume_sdate": null,
+        "station": "KSFO",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 139,
+        "wfo": "MTR"
+      },
+      {
+        "appended": 380,
+        "error": null,
+        "products_seen": 1285,
+        "quarantined": 0,
+        "refused": {},
+        "requests": 65,
+        "resume_sdate": null,
+        "station": "KMDW",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 905,
+        "wfo": "LOT"
+      }
+    ],
+    "pacing_s": 4.0,
+    "page_limit": 20,
+    "planning_issuances_per_day": 24,
+    "request_budget": 600,
+    "wfos": {
+      "LOT": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 55,
+        "start": "2026-08-25",
+        "station": "KMDW"
+      },
+      "LOX": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 55,
+        "start": "2026-08-25",
+        "station": "KLAX"
+      },
+      "MTR": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 55,
+        "start": "2026-08-25",
+        "station": "KSFO"
+      }
+    }
+  }
+}

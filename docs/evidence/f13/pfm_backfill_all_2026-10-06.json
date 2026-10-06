@@ -1,0 +1,188 @@
+{
+  "inputs": {
+    "end": "2026-10-06",
+    "legs": [
+      "pfm"
+    ],
+    "start": "2026-08-25",
+    "stations": [
+      "KLAX",
+      "KMDW",
+      "KMIA",
+      "KNYC",
+      "KSFO"
+    ]
+  },
+  "launch_window_utc": "16:30-17:10",
+  "mode": "apply",
+  "pfm": {
+    "estimated_requests": 260,
+    "estimated_seconds": 1040.0,
+    "fits_budget": true,
+    "legs": [
+      {
+        "appended": 0,
+        "error": null,
+        "products_seen": 288,
+        "quarantined": 0,
+        "refused": {
+          "date_label_mismatch": 161
+        },
+        "requests": 15,
+        "resume_sdate": null,
+        "station": "KLAX",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 127,
+        "wfo": "LOX"
+      },
+      {
+        "appended": 847,
+        "error": null,
+        "products_seen": 853,
+        "quarantined": 0,
+        "refused": {},
+        "requests": 43,
+        "resume_sdate": null,
+        "station": "KMDW",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [
+          "2026-08-25",
+          "2026-08-26",
+          "2026-08-27",
+          "2026-08-28",
+          "2026-08-29",
+          "2026-08-30",
+          "2026-08-31",
+          "2026-09-01",
+          "2026-09-02",
+          "2026-09-03",
+          "2026-09-04",
+          "2026-09-05",
+          "2026-09-06",
+          "2026-09-07",
+          "2026-09-08",
+          "2026-09-09",
+          "2026-09-10",
+          "2026-09-11",
+          "2026-09-12",
+          "2026-09-13",
+          "2026-09-14",
+          "2026-09-15",
+          "2026-09-16",
+          "2026-09-17",
+          "2026-09-18",
+          "2026-09-19",
+          "2026-09-20",
+          "2026-09-21",
+          "2026-09-22",
+          "2026-09-23",
+          "2026-09-24",
+          "2026-09-25",
+          "2026-09-26",
+          "2026-09-27",
+          "2026-09-28",
+          "2026-09-29",
+          "2026-09-30",
+          "2026-10-01",
+          "2026-10-02",
+          "2026-10-03",
+          "2026-10-04",
+          "2026-10-05"
+        ],
+        "unchanged": 6,
+        "wfo": "LOT"
+      },
+      {
+        "appended": 84,
+        "error": null,
+        "products_seen": 93,
+        "quarantined": 0,
+        "refused": {},
+        "requests": 5,
+        "resume_sdate": null,
+        "station": "KMIA",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 9,
+        "wfo": "MFL"
+      },
+      {
+        "appended": 186,
+        "error": null,
+        "products_seen": 217,
+        "quarantined": 0,
+        "refused": {},
+        "requests": 11,
+        "resume_sdate": null,
+        "station": "KNYC",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 31,
+        "wfo": "OKX"
+      },
+      {
+        "appended": 127,
+        "error": null,
+        "products_seen": 283,
+        "quarantined": 0,
+        "refused": {
+          "date_label_mismatch": 127
+        },
+        "requests": 15,
+        "resume_sdate": null,
+        "station": "KSFO",
+        "status": "complete",
+        "store_errors": {},
+        "truncated_days": [],
+        "unchanged": 29,
+        "wfo": "MTR"
+      }
+    ],
+    "pacing_s": 4.0,
+    "page_limit": 20,
+    "planning_issuances_per_day": 24,
+    "request_budget": 600,
+    "wfos": {
+      "LOT": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 52,
+        "start": "2026-08-25",
+        "station": "KMDW"
+      },
+      "LOX": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 52,
+        "start": "2026-08-25",
+        "station": "KLAX"
+      },
+      "MFL": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 52,
+        "start": "2026-08-25",
+        "station": "KMIA"
+      },
+      "MTR": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 52,
+        "start": "2026-08-25",
+        "station": "KSFO"
+      },
+      "OKX": {
+        "days": 43,
+        "end": "2026-10-06",
+        "estimated_requests": 52,
+        "start": "2026-08-25",
+        "station": "KNYC"
+      }
+    }
+  }
+}

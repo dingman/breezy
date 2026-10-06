@@ -715,3 +715,18 @@ Round 4 results: stats READY (with nits), security NOT-READY (2), architecture N
     - `test_lamp_missingness_reported_per_horizon`
     - `test_strict_24h_max_labelled_diagnostic`
   - **Review.** The Phase A prereg freeze review re-checks R35.
+
+### B0 verdict: F13-R36 (coordinator, 2026-10-06, after prediction-market-reviewer decision support)
+
+- **Evidence.** `docs/evidence/f13/b0_report_2026-10-06.json`; census and backfill reports are in the same directory.
+  - PFM family only (size 1; NBP vintages absent, R26).
+  - SD (hour-matched, placebo and pre-window arms): 6.86 °F per 60-min window. n_eff is 35 climate days.
+  - MDE is **3.25 °F**, one-sided at α=0.025 with power 0.8. The excluding-dropout sensitivity gives 2.66 °F.
+  - The 60 s cadence check RESOLVES (182/182 windows).
+- **Pinned plausible effect: 0.5 °F**, an optimistic bound. A typical PFM revision to the day's max is about 1 °F RMS. Assuming 30–50% of it is news not already priced from NBM, LAMP or obs, the 60-min ladder move is about 0.3–0.5 °F.
+- **Verdict: B1 = UNDERPOWERED** under the B0 rule (MDE > plausible slope, 6.5×). B1 and B2 are not run.
+- **No outcome amendment.** These options were considered and rejected:
+  - A mass-normalised mean contradicts R26 and leaves the SD at about 5–6 °F.
+  - Ladder quantiles are quantised by the rung spacing.
+- **Recorded, not scheduled: B0′.** The change in the mid of the rung containing the prior PFM max is a new estimand. It is legitimate only as a separately hash-frozen exploratory prereg with an n_eff target stated up front, and it never rewrites this verdict.
+- **Consequence.** F13 value now rests on Phase A, the US-source blend vs CLI, offline. Phase A still needs ≥14 days of C1 measured lags (≈10-20) and the R35 LAMP feature.
