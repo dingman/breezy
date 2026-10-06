@@ -90,6 +90,7 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     "scripts.analysis.portfolio_roi_report",
     "scripts.analysis.replay_daily_runner",
     "scripts.archive.iem_mos_freshness_check",
+    "scripts.archive.iem_cli_fetch",
     "scripts.analysis.weather_strategy_backtest_lib",
     "scripts.analysis.asos_cache_freshness_check",
     # `breezy-clear-family-halt` / `breezy-set-family-halt` (`breezy.strategy.
