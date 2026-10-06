@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import hashlib
+import inspect
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -17,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from breezy.ingest.http import RateLimitedError
+from breezy.ingest.http import OversizeBodyError, RateLimitedError
 from breezy.ingest.probe_transport import RequestBudgetExceededError
 from breezy.persistence.us_source_request import US_PFM_AFOS_SOURCE
 from breezy.persistence.us_source_revision_store import UsSourceRevisionStore
@@ -984,3 +985,220 @@ def test_p8_archive_root_in_a_holdout_directory_is_refused(tmp_path: Path) -> No
     argv = ["--dry-run", "--legs", "pfm", "--archive-root", str(tmp_path / "Holdout_2026" / "a")]
 
     assert bf.main(argv) == 2
+
+
+# ---- B0 fix: oversize AFOS pages adapt the page size; the report is always written
+
+
+def _oversize() -> OversizeBodyError:
+    return OversizeBodyError("Response body exceeded the 2097152-byte cap during streaming")
+
+
+def _apply_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fetch: Any, *stations: str, **kw: Any
+) -> int:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    return bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--legs",
+            "pfm",
+            "--stations",
+            *stations,
+        ),
+        clock=lambda: _utc(9, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=lambda **_k: fetch,
+        **kw,
+    )
+
+
+def test_oversize_page_halves_limit_and_retries_same_sdate(tmp_path: Path) -> None:
+    catalog = _Catalog(["051901", "061901", "071901"])
+    calls: list[tuple[str, dt.date, int]] = []
+
+    def fetch(wfo: str, sdate: dt.date, limit: int) -> str:
+        calls.append((wfo, sdate, limit))
+        if limit > 5:
+            raise _oversize()
+        return catalog(wfo, sdate, limit)
+
+    report = _leg(tmp_path, fetch, page_limit=20, end=dt.date(2026, 10, 9))
+
+    assert [limit for _w, _s, limit in calls[:3]] == [20, 10, 5]
+    assert {sdate for _w, sdate, _l in calls[:3]} == {dt.date(2026, 10, 5)}
+    assert report.status == "complete"
+    assert report.appended == 3
+    assert report.requests == len(calls)
+
+
+def test_single_product_oversize_marks_station_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog = _Catalog(["051901"])
+    calls: list[tuple[str, int]] = []
+
+    def fetch(wfo: str, sdate: dt.date, limit: int) -> str:
+        calls.append((wfo, limit))
+        if wfo == "OKX":
+            raise _oversize()
+        return catalog(wfo, sdate, limit) if wfo == "LOX" else ""
+
+    rc = _apply_main(tmp_path, monkeypatch, fetch, "KNYC", "KLAX")
+
+    assert rc == 1
+    assert [limit for wfo, limit in calls if wfo == "OKX"] == [20, 10, 5, 2, 1]
+    assert any(wfo == "LOX" for wfo, _l in calls)
+    legs = {
+        leg["station"]: leg
+        for leg in json.loads((tmp_path / "report.json").read_text())["pfm"]["legs"]
+    }
+    assert legs["KNYC"]["status"] == "oversize_product"
+    assert legs["KNYC"]["resume_sdate"] == "2026-10-01"
+    assert legs["KLAX"]["status"] == "complete"
+
+
+def test_unexpected_exception_records_error_and_still_writes_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    def fetch(wfo: str, _sdate: dt.date, _limit: int) -> str:
+        seen.append(wfo)
+        if wfo == "OKX":
+            raise RuntimeError("boom")
+        return ""
+
+    rc = _apply_main(tmp_path, monkeypatch, fetch, "KNYC", "KLAX")
+
+    assert rc == 1
+    assert seen == ["OKX", "LOX"]
+    legs = {
+        leg["station"]: leg
+        for leg in json.loads((tmp_path / "report.json").read_text())["pfm"]["legs"]
+    }
+    assert legs["KNYC"]["status"] == "error"
+    assert legs["KNYC"]["error"] == "RuntimeError: boom"
+    assert legs["KLAX"]["status"] == "complete"
+
+
+def test_an_exception_outside_any_station_still_writes_the_report_and_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+
+    def exploding_gfs(_argv: Sequence[str]) -> int:
+        raise RuntimeError("mos exploded")
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--stations",
+            "KNYC",
+            "--start-date",
+            "2024-01-01",
+        ),
+        clock=lambda: _utc(9, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=lambda **_k: lambda _w, _s, _l: "",
+        gfs_runner=exploding_gfs,
+    )
+
+    assert rc == 1
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["pfm"]["legs"][0]["status"] == "complete"
+    assert report["gfs"]["status"] == "error"
+    assert report["gfs"]["error"] == "RuntimeError: mos exploded"
+
+
+def test_a_crash_in_setup_still_writes_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+
+    def factory(**_kwargs: Any) -> Any:
+        raise RuntimeError("no transport")
+
+    rc = bf.main(
+        _args(tmp_path, "--apply", "--request-budget", "5", "--legs", "pfm"),
+        clock=lambda: _utc(9, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=factory,
+    )
+
+    assert rc == 1
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["error"] == "RuntimeError: no transport"
+
+
+def test_retries_count_against_budget_and_are_paced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    big = b"x" * (2 * 1024 * 1024 + 1)
+    small = _okx_product("051901").encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(parse_qs(urlsplit(str(request.url)).query)["limit"][0])
+        return httpx.Response(200, content=big if limit > 5 else small)
+
+    mock = install_mock_http(monkeypatch, handler)
+    clock = _Clock(_utc(9, 12))
+    slept: list[float] = []
+
+    async def sleeper(seconds: float) -> None:
+        slept.append(seconds)
+        clock.now += int(seconds * _NS)
+
+    fetch = bf.make_pfm_fetch(
+        request_budget=3,
+        user_agent="breezy-test (alias)",
+        clock_ns=clock,
+        sleeper=sleeper,
+        check_proxy_env=False,
+    )
+
+    report = _leg(tmp_path, fetch, page_limit=20, end=dt.date(2026, 10, 5), clock=clock)
+
+    limits = [int(parse_qs(urlsplit(str(r.url)).query)["limit"][0]) for r in mock.requests]
+    assert limits == [20, 10, 5]  # three requests: every oversize retry spent budget
+    assert report.requests == 3 and report.appended == 1
+    assert len(slept) >= 2 and all(s >= 4.0 for s in slept)  # A0-R1 spacing between retries
+    with pytest.raises(RequestBudgetExceededError):
+        fetch("OKX", dt.date(2026, 10, 5), 5)
+
+
+def test_oversize_retry_stops_as_budget_exhausted_when_the_budget_runs_out(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, limit: int) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RequestBudgetExceededError("spent")
+        raise _oversize()
+
+    report = _leg(tmp_path, fetch, page_limit=20)
+
+    assert report.status == "budget_exhausted"
+    assert report.resume_sdate == dt.date(2026, 10, 5)
+
+
+def test_default_page_limit_is_20_and_dry_run_estimate_uses_it(tmp_path: Path) -> None:
+    assert bf.DEFAULT_PAGE_LIMIT == 20
+    assert inspect.signature(bf.run_pfm_leg).parameters["page_limit"].default == 20
+
+    rc = bf.main(_args(tmp_path, "--dry-run", "--request-budget", "100000", "--stations", "KNYC"))
+
+    assert rc == 0
+    pfm = json.loads((tmp_path / "report.json").read_text())["pfm"]
+    days = 6  # 2026-10-01 .. 2026-10-06
+    assert pfm["page_limit"] == 20
+    assert pfm["estimated_requests"] == -(-days * bf.PLANNING_ISSUANCES_PER_DAY // 20)

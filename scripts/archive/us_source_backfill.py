@@ -4,7 +4,8 @@ Read-only network use against ``mesonet.agron.iastate.edu`` only; the one local 
 the ``us-pfm-afos`` revision store (PFM) and the existing MOS archive writer (GFS).
 
 * PFM: ``PacedIemTransport.fetch_afos_pfm`` pages ascending history (``sdate``, ``order=asc``,
-  at most 50 products per request) at the A0-R1 pace (>= 4 s between AFOS requests). Each
+  at most 20 products per request, halved on an oversize body down to one) at the A0-R1 pace
+  (>= 4 s between AFOS requests). Each
   product is split out, its WMO issuance time resolved, parsed (a refused product is counted
   and never written) and appended RAW through ``UsSourceRevisionStore`` under the collector's
   key shape. The stored bytes are the product exactly as the AFOS response framed it (SOH ..
@@ -15,7 +16,9 @@ the ``us-pfm-afos`` revision store (PFM) and the existing MOS archive writer (GF
 * GFS: delegated to the existing ``iem_mos_backfill`` CLI (model ``GFS``, KNYC included via
   the R33 ``IEM_MOS_STATIONS`` widening), so the MOS archive keeps ONE writer.
 
-Statuses: ``complete``; ``unplaceable_header`` (a header cannot be placed unambiguously from the
+Statuses: ``complete``; ``oversize_product`` (a single product exceeds the body cap: that station
+stops, the next runs); ``error`` (an unexpected exception inside a leg is recorded, never raised);
+``unplaceable_header`` (a header cannot be placed unambiguously from the
 cursor: that station stops, the next station runs); ``degraded`` (a revision-store error other
 than an expected payload refusal); ``throttled`` / ``paused_launch_window`` (stop ALL remaining
 stations and the GFS leg); ``budget_exhausted``, ``store_busy``. Any status but ``complete``
@@ -51,13 +54,12 @@ for _directory in (_ARCHIVE_DIR, _ARCHIVE_DIR.parent / "venue"):  # pragma: no c
 
 from iem_mos_probe_transport import (  # type: ignore[import-not-found]
     IEM_AFOS_LAV_MIN_INTERVAL_NS,
-    IEM_AFOS_MAX_LIMIT,
     IEM_AFOS_PFM_MAX_BODY_BYTES,
     IemPacer,
     PacedIemTransport,
 )
 
-from breezy.ingest.http import RateLimitedError
+from breezy.ingest.http import OversizeBodyError, RateLimitedError
 from breezy.ingest.pfm_parse import PfmParseError, parse_pfm_product
 from breezy.ingest.probe_transport import (
     RequestBudget,
@@ -93,6 +95,8 @@ __all__ = [
 _NS: Final[int] = 1_000_000_000
 LIVE_ENV_VAR: Final[str] = "BREEZY_LIVE"
 USER_AGENT_ENV_VAR: Final[str] = "BREEZY_USER_AGENT"
+#: 20 PFM products (~40-60 KB each) stay under the 2 MiB body cap; 50 did not.
+DEFAULT_PAGE_LIMIT: Final[int] = 20
 DEFAULT_USER_AGENT: Final[str] = "breezy-us-source-backfill (contact: jon@gopoint.com; F13 B0)"
 FIRST_YEAR: Final[int] = 2021
 #: A request is paced (>= 4 s), may read for up to 20 s, plus slack.
@@ -238,6 +242,7 @@ class LegReport:
     store_errors: dict[str, int] = field(default_factory=dict)
     truncated_days: tuple[dt.date, ...] = ()
     resume_sdate: dt.date | None = None
+    error: str | None = None
 
     @property
     def refused_total(self) -> int:
@@ -257,6 +262,7 @@ class LegReport:
             "store_errors": dict(sorted(self.store_errors.items())),
             "truncated_days": [d.isoformat() for d in self.truncated_days],
             "resume_sdate": self.resume_sdate.isoformat() if self.resume_sdate else None,
+            "error": self.error,
         }
 
 
@@ -281,28 +287,43 @@ def _fetch_page(
     sleep: Callable[[float], None],
     window_ok: Callable[[int], bool],
     clock_ns: Callable[[], int],
-) -> str | None:
-    """One page, retrying a throttle with backoff; None means the leg must stop (status set)."""
-    for attempt in range(len(THROTTLE_BACKOFF_S) + 1):
+) -> tuple[str | None, int]:
+    """One page as ``(text, limit used)``; ``text`` None means the leg must stop (status set).
+
+    A throttle is retried with backoff. An oversize body retries the same ``cursor`` with the
+    limit halved (each retry is a paced, budgeted request); a single-product page that is still
+    oversize marks the station ``oversize_product``.
+    """
+    attempt = 0
+    while True:
         if not window_ok(clock_ns()):
             report.status = "paused_launch_window"
-            return None
+            return None, limit
         try:
             text = fetch(wfo, cursor, limit)
         except RequestBudgetExceededError:
             report.status = "budget_exhausted"
-            return None
+            return None, limit
+        except OversizeBodyError as exc:
+            report.requests += 1
+            if limit <= 1:
+                report.status = "oversize_product"
+                report.error = f"{type(exc).__name__}: {exc}"
+                _alert(f"PFM{wfo} sdate={cursor}: one product exceeds the body cap; station stops")
+                return None, limit
+            limit //= 2
+            continue
         except RateLimitedError:
             report.requests += 1
             if attempt == len(THROTTLE_BACKOFF_S):
                 report.status = "throttled"
                 _alert(f"IEM throttle persisted for PFM{wfo} at sdate={cursor}; stopping the leg")
-                return None
+                return None, limit
             sleep(THROTTLE_BACKOFF_S[attempt])
+            attempt += 1
             continue
         report.requests += 1
-        return text
-    return None  # pragma: no cover - the loop always returns
+        return text, limit
 
 
 def _append(
@@ -429,45 +450,77 @@ def run_pfm_leg(
     clock_ns: Callable[[], int],
     window_ok: Callable[[int], bool],
     sleep: Callable[[float], None],
-    page_limit: int = IEM_AFOS_MAX_LIMIT,
+    page_limit: int = DEFAULT_PAGE_LIMIT,
 ) -> LegReport:
-    """Backfill one station's WFO from ``start`` to ``end`` inclusive, ascending by issuance."""
+    """Backfill one station's WFO from ``start`` to ``end`` inclusive, ascending by issuance.
+
+    Never raises for a leg-local fault: an unexpected exception becomes status ``error``.
+    """
     wfo = PFM_POINTS[station].wfo
     report = LegReport(station=station, wfo=wfo)
     truncated: list[dt.date] = []
-    cursor = start
-    while cursor <= end:
-        text = _fetch_page(fetch, wfo, cursor, page_limit, report, sleep, window_ok, clock_ns)
+    cursor = [start]  # mutable so the error path can name where the leg stopped
+    try:
+        _page_loop(
+            report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
+            sleep, page_limit,
+        )  # fmt: skip
+    except Exception as exc:  # noqa: BLE001 - the station boundary: record, never crash the run
+        report.status = "error"
+        report.error = f"{type(exc).__name__}: {exc}"
+        report.resume_sdate = cursor[0]
+        _alert(f"{wfo} sdate={cursor[0]}: unexpected {report.error}; this station stops")
+    report.truncated_days = tuple(truncated)
+    if report.store_errors and report.status == "complete":
+        report.status = "degraded"
+    return report
+
+
+def _page_loop(
+    report: LegReport,
+    truncated: list[dt.date],
+    cursor_box: list[dt.date],
+    wfo: str,
+    station: str,
+    end: dt.date,
+    fetch: PfmFetch,
+    store: UsSourceRevisionStore,
+    clock_ns: Callable[[], int],
+    window_ok: Callable[[int], bool],
+    sleep: Callable[[float], None],
+    page_limit: int,
+) -> None:
+    while cursor_box[0] <= end:
+        cursor = cursor_box[0]
+        text, page_limit = _fetch_page(
+            fetch, wfo, cursor, page_limit, report, sleep, window_ok, clock_ns
+        )
         if text is None:
             report.resume_sdate = cursor
-            break
+            return
         products = split_raw_products(text)
         if not products:
-            break
+            return
         try:
             paired = _place(products, cursor, report)
         except UnplaceableHeaderError as exc:
             _count(report, "unplaceable_header")
             _alert(f"{wfo} sdate={cursor}: {exc}; this station stops, resume at {cursor}")
             report.status, report.resume_sdate = "unplaceable_header", cursor
-            break
+            return
         last, past_end, busy = _ingest_page(
             paired, station=station, wfo=wfo, end=end, store=store, report=report, sleep=sleep
         )
         if busy:
             report.status, report.resume_sdate = "store_busy", cursor
-            break
+            return
         if past_end or len(products) < page_limit or last is None:
-            break
+            return
         following = last.date()
         if following <= cursor:  # a full page inside one date: the rest of that date is unseen
             truncated.append(cursor)
             following = cursor + dt.timedelta(days=1)
-        cursor = following
-    report.truncated_days = tuple(truncated)
-    if report.store_errors and report.status == "complete":
-        report.status = "degraded"
-    return report
+        cursor_box[0] = following
 
 
 # -------------------------------------------------------------------- transport
@@ -532,7 +585,7 @@ def _pfm_plan(
     stations: Sequence[str], start: dt.date, end: dt.date, budget: int | None
 ) -> dict[str, Any]:
     days = (end - start).days + 1
-    per_wfo = math.ceil(days * PLANNING_ISSUANCES_PER_DAY / IEM_AFOS_MAX_LIMIT)
+    per_wfo = math.ceil(days * PLANNING_ISSUANCES_PER_DAY / DEFAULT_PAGE_LIMIT)
     wfos = {
         PFM_POINTS[s].wfo: {
             "station": s,
@@ -548,7 +601,7 @@ def _pfm_plan(
     return {
         "wfos": wfos,
         "pacing_s": pacing_s,
-        "page_limit": IEM_AFOS_MAX_LIMIT,
+        "page_limit": DEFAULT_PAGE_LIMIT,
         "planning_issuances_per_day": PLANNING_ISSUANCES_PER_DAY,
         "estimated_requests": total,
         "estimated_seconds": total * pacing_s,
@@ -681,8 +734,16 @@ def main(
     if args.dry_run:
         _write_report(args.report_json, report)
         return 0
-    code = _apply(args, report, stations, years, end, clock, sleep, pfm_fetch_factory, gfs_runner)
-    _write_report(args.report_json, report)
+    code = _EXIT_INCOMPLETE
+    try:
+        code = _apply(
+            args, report, stations, years, end, clock, sleep, pfm_fetch_factory, gfs_runner
+        )
+    except Exception as exc:  # noqa: BLE001 - the report is the run's evidence; never lose it
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        _alert(f"run aborted by unexpected {report['error']}")
+    finally:
+        _write_report(args.report_json, report)
     return code
 
 
@@ -726,7 +787,12 @@ def _run_gfs(
         _alert(f"GFS leg not started: {args.max_runtime_s} s would meet the launch window")
         return True
     budget = args.gfs_request_budget or len(stations) * len(years)
-    code = gfs_runner(_gfs_argv(stations, years, budget, args.mos_cache_root))
+    try:
+        code = gfs_runner(_gfs_argv(stations, years, budget, args.mos_cache_root))
+    except Exception as exc:  # noqa: BLE001 - recorded, so the PFM results still reach the report
+        gfs.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        _alert(f"GFS leg raised {gfs['error']}")
+        return True
     gfs.update(status="complete" if code == 0 else "failed", exit_code=code)
     return code != 0
 
