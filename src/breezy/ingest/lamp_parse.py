@@ -59,8 +59,10 @@ MISSING_MARKER: Final = 999
 _HOURS_PER_LST_DAY: Final = 24
 _INFLATE_STEP: Final = 64 * 1024
 _HEADER_MARK: Final = "GFS LAMP GUIDANCE"
+#: The month and day are NOT zero-padded in the MDL archive ("1/01/2026"); the live feed pads
+#: ("10/05/2026"). Impossible dates are refused when the date is constructed (`_issued_at`).
 _HEADER_RE: Final = re.compile(
-    r"^\s*([A-Z0-9]{3,4})\s+GFS LAMP GUIDANCE\s+(\d{2})/(\d{2})/(\d{4})\s+(\d{4}) UTC\s*$"
+    r"^\s*([A-Z0-9]{3,4})\s+GFS LAMP GUIDANCE\s+(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{4}) UTC\s*$"
 )
 _INT_RE: Final = re.compile(r"^-?\d{1,3}$")
 _COLUMN_WIDTH: Final = 3

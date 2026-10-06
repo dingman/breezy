@@ -33,7 +33,8 @@ score code lives here and none may read a sealed row.
 
 Statuses per unit: ``complete``; ``not_published`` (404: the file is missing); ``oversize`` (a
 byte, member or line cap); ``degraded`` (the unit ran to the end but a run was refused by the
-store's payload checks or hit a store error; that run's day is reported missing); ``error``;
+store's payload checks, hit a store error, or dropped any block outside
+``EXPECTED_SKIP_DROPS``; that run's day is reported missing); ``error``;
 and the STOP-ALL statuses ``throttled`` / ``forbidden`` /
 ``paused_launch_window`` / ``budget_exhausted`` / ``store_busy``. A non-``complete`` unit exits 1.
 
@@ -629,9 +630,17 @@ def _execute(ctx: _Ctx, unit: _Unit) -> UnitReport:
         return rep
 
 
+#: Drop reasons that are the expected, benign skips of a source that carries more than the
+#: closed set: an IEM LAV row for a station outside it. Every other drop (a bad or mismatched
+#: header, an oversize or duplicate block, a reappearing run, a malformed LAV row) means data
+#: the file carried was NOT stored, so it must surface as ``degraded`` and never as ``complete``.
+EXPECTED_SKIP_DROPS: Final = frozenset({"wrong_station"})
+
+
 def _settled(rep: UnitReport) -> UnitReport:
-    """A unit that ran to the end but refused a run or hit a store error is not complete."""
-    if rep.status == "complete" and (rep.refused or rep.store_errors):
+    """A unit that lost data (refused run, store error, unexpected drop) is not complete."""
+    unexpected_drop = any(k not in EXPECTED_SKIP_DROPS for k in rep.dropped)
+    if rep.status == "complete" and (rep.refused or rep.store_errors or unexpected_drop):
         rep.status = "degraded"
     return rep
 

@@ -1105,3 +1105,94 @@ def test_item7_window_worst_case_includes_two_max_retry_after_waits() -> None:
         lb.MONTH_WORST_CASE_S
         == int(DEFAULT_LAMP_MONTH_LIMITS.max_wall_seconds) + lb.REQUEST_WORST_CASE_S + extra
     )
+
+
+# ============ one-digit month header (real MDL archive, 2026-01) =====================
+
+_ARCHIVE_REAL = "lamp_archive_real_202601_1230z.txt"
+
+
+def _archive_real_text() -> str:
+    return (_FIXTURES / _ARCHIVE_REAL).read_text()
+
+
+def test_live_parser_accepts_single_digit_month_header() -> None:
+    from breezy.ingest.lamp_parse import parse_lamp_blocks
+
+    text = _archive_real_text()
+    assert " KNYC   GFS LAMP GUIDANCE   1/01/2026  1230 UTC" in text
+
+    blocks = parse_lamp_blocks(text.splitlines())
+
+    assert sorted(b.station for b in blocks) == sorted(_CLOSED)
+    assert {b.issued_at for b in blocks} == {dt.datetime(2026, 1, 1, 12, 30, tzinfo=dt.UTC)}
+
+
+def test_live_parser_still_parses_the_two_digit_month_fixture_identically() -> None:
+    from breezy.ingest.lamp_parse import parse_lamp_blocks
+
+    live = parse_lamp_blocks(_real_text().splitlines())
+    assert {b.issued_at for b in live} == {dt.datetime(2026, 10, 5, 23, 30, tzinfo=dt.UTC)}
+    assert {"KNYC", "KLAX", "KMDW", "KMIA", "KSFO"} <= {b.station for b in live}
+
+    one_digit = _real_text().replace("10/05/2026", " 1/05/2026")  # same width, month 1 not 10
+    padded = _real_text().replace("10/05/2026", "01/05/2026")
+    assert parse_lamp_blocks(one_digit.replace(" 1/05/2026", "1/05/2026").splitlines()) == (
+        parse_lamp_blocks(padded.splitlines())
+    )
+
+
+def test_one_digit_month_header_still_refuses_an_impossible_date() -> None:
+    from breezy.ingest.lamp_parse import LampParseError, parse_lamp_blocks
+
+    bad = _archive_real_text().replace("1/01/2026", "1/32/2026")
+    with pytest.raises(LampParseError) as err:
+        parse_lamp_blocks(bad.splitlines())
+    assert err.value.reason == "bad_header_time"
+
+
+def test_archive_runs_accept_single_digit_month() -> None:
+    tally: dict[str, int] = {}
+
+    runs = list(
+        lb.iter_lamp_runs(
+            _archive_real_text().splitlines(keepends=True),
+            expect_year_month=(2026, 1),
+            expect_hhmm="1230",
+            tally=tally,
+        )
+    )
+
+    assert tally == {}
+    assert [r.run_at for r in runs] == [dt.datetime(2026, 1, 1, 12, 30, tzinfo=dt.UTC)]
+    assert sorted(runs[0].blocks) == sorted(_CLOSED)
+
+
+def test_all_blocks_dropped_unit_is_degraded_not_complete(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = _month_text(2026, 6, [1, 2]).replace("06/01/2026", "13/45/2026")
+    broken = broken.replace("06/02/2026", "13/45/2026")
+    install_mock_http(monkeypatch, _serve({_month_url("202606"): _gz(broken)}))
+
+    rc = run.go(*_month_args("2026-06"))
+
+    unit = run.units("mdl-monthly")[0]
+    assert unit["appended"] == 0 and unit["unchanged"] == 0
+    assert unit["dropped"]["bad_header"] > 0
+    assert unit["status"] == "degraded"
+    assert rc == 1
+
+
+def test_an_expected_skip_drop_alone_keeps_the_unit_complete(run: _Run) -> None:
+    rep = lb.UnitReport(unit="u", leg="iem-lav")
+    rep.appended = 3
+    rep.dropped = {"wrong_station": 7}
+    assert lb._settled(rep).status == "complete"
+
+
+def test_any_unexpected_drop_degrades_even_when_runs_were_stored() -> None:
+    rep = lb.UnitReport(unit="u", leg="mdl-monthly")
+    rep.appended = 3
+    rep.dropped = {"bad_header": 1}
+    assert lb._settled(rep).status == "degraded"

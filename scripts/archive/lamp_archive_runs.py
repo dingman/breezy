@@ -89,7 +89,7 @@ _HEADER_RE: Final[re.Pattern[str]] = re.compile(
     r"^\s*(?P<station>[A-Z0-9]{3,6})\s+(?:GFS\s+)?LAMP\s+GUIDANCE\b"
 )
 _STAMP_RE: Final[re.Pattern[str]] = re.compile(
-    r"\bGUIDANCE\s+(?P<month>\d{2})/(?P<day>\d{2})/(?P<year>\d{4})\s+(?P<hhmm>\d{4})\s+UTC\b"
+    r"\bGUIDANCE\s+(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})\s+(?P<hhmm>\d{4})\s+UTC\b"
 )
 _LAV_TIME_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
 _LAV_MODEL: Final[str] = "LAV"
