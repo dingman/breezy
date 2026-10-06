@@ -511,3 +511,24 @@ Relevant paths (all under `/home/jon/breezy`):
 - `src/breezy/persistence/autonomy/capture_schedule.py`
 
 I wrote no files.
+
+---
+
+## Round-2 rulings (coordinator, 2026-10-06; reviews: security NOT-READY, stats NOT-READY, architecture NOT-READY; all R1..R9 applied in substance)
+
+Every reviewer's blocking fix text is adopted verbatim unless amended here. r3 must apply all of them; no redesign.
+
+- **F13-R10 (M6, security B1).** M6(a) defines its own banned set (write transport, order sender, permit, `breezy.runtime`, exec client, `breezy.exec`; implementer cites file:line). It is a **transitive** `breezy.*`/`scripts.*` import-closure check, scanned **by directory** over `src/breezy/ingest/`, `scripts/venue/`, `scripts/collect/` (incl. `iem_mos_probe_transport.py`). `BANNED_EXEC_TRANSPORT_MODULES` is not reused; `breezy.ingest.mdl_lamp_transport` is added to it as a WIDENED row (the only firewall-file touch). A reverse test asserts no `breezy.exec`/runtime module imports any C1 module. The x1 pin test asserts superset against a recorded baseline. State that `lint-imports` covers `src/` only (`root_packages`), so M6 is the only import check over `scripts/`.
+- **F13-R11 (H5, security B2).** ExecStart is the bwrap profile as given by the security review (`--clearenv --unshare-all --share-net --die-with-parent`, ro minimal root, `--tmpfs $HOME`, archive dir sole rw bind, `alerts.env` ro). Behavioural probe test under the exact profile (skip only if `bwrap_ok` fails, with reason). The collector enforces the 16:30Z deadline in-process via `launch_window_guard`/`seconds_outside_launch_window`; `RuntimeMaxSec` is a backstop only. `alerts.env` must hold only the alert sink (implementer verifies, never prints values).
+- **F13-R12 (holdout, stats B1).** Adopt the post-freeze forward-ledger carve-out text and test `test_b2_and_veto_read_only_post_freeze_days_via_live_ledger`. B1 reads source forecast values (not champion output) and no outcome.
+- **F13-R13 (B2 definition, stats B2).** B2 signal/entry/freeze text adopted; freeze = the B1/B2 prereg commit sha, independent of Phase A. Primary lag = pre-registered median fetch-to-decision latency; others descriptive. "Adjusts under 60 s" = time to 50 % of the move on Depth10; B0 must show the cadence resolves 60 s or the STOP is recorded untestable. Outcomes FUTILE / INCONCLUSIVE / NOT-FUTILE; **the R9 gate requires NOT-FUTILE** (INCONCLUSIVE does not open C2/D — amends R9). Fee is θ·p(1−p) at fill + 0.01 + margin(h).
+- **F13-R14 (B0 power, stats B3).** Adopt the pre-registration text: plausible slope, α=0.025 Holm-over-2, power 0.8, unit = event-day clustered by climate day; SD from placebo/pre-window; B1 slope CI by day-block bootstrap. Expect the PFM no-update placebo pool to be empty → descriptive.
+- **F13-R15 (Phase A acceptance, stats B4).** Floor = pre-registered multiple of M0 fold-to-fold CRPS SD, committed before M1–M3 are scored. Also require CRPS(M0) − CRPS(M3) LB > 0 and ≥ floor; ACCEPT refused if M0′ is worse than M0 beyond tolerance. LB is one-sided 97.5 %. Add the +60-min lag-sensitivity rerun and CRPS by horizon. Veto proxy uses out-of-fold champion output.
+- **F13-R16 (B1 panel/regressor, stats nits 1–2).** Panel defined at t only; missing t+Δ = dropout. Regressor = source value − pre-release ladder-implied mean.
+- **F13-R17 (revisions, arch B-1).** `ArchiveCache` unmodified; `us_source_revision_store` owns revisions via direct fetch + sha compare, writing `product=<…>-r<N>`, `window_start=run_ts`. `get_or_fetch` is never the change detector.
+- **F13-R18 (error routing, arch B-2).** AFOS/LAV raise only existing `breezy.ingest.http` errors. A new `TransportError` subclass may live only in `mdl_lamp_transport.py`, with route + constructor + explicit import in the contract test. Parser/revision refusals are local non-transport classes on refuse-and-alert.
+- **F13-R19 (NBP observation, arch B-3).** Reuse `NbmQuantileTransport` (GET); no new S3 client. B0 checks whether the node's `ForecastPoint` NBM_NBP vintages exist; if so C1's NBP poll is a cross-check only.
+- **F13-R20 (arch nits).** Adopt all six: floor from `MINIMUM_PUBLICATION_LAG_NS`; citation fixes (`:62`, LAV never via `iem_mos_request`, KNYC widening never relaxing); one `source` per writer (`us-lamp-live`, `us-lav-iem`, `us-pfm-afos`, `us-lamp-mdl`); factories re-exported via `archive_request.py`; the C1-off-node Nautilus justification line. OPEN-1 CLOSED per the architecture review.
+- **F13-R21 (security nits).** Adopt all: `late` rows right-censored and excluded from the lag freeze max; per-method byte caps + closed station/path sets on AFOS/LAV; compressed-download cap + decompressed-byte counting for `r|gz`.
+
+r3 = r2 + R10..R21 applied, with a "Changes from r2" table. Convergence round 3 then runs on r3 by the same three reviewers.
