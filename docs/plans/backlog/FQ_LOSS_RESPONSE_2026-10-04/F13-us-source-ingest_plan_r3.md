@@ -685,3 +685,33 @@ Round 4 results: stats READY (with nits), security NOT-READY (2), architecture N
 ## Post-READY build finding (coordinator, 2026-10-06)
 
 - **F13-OPEN-7 (LAMP daily-max window).** Real HH30 `lavtxt` bulletins carry 25 hourly columns, and `lavtxt_ext` carries hours 26–38. So no single run covers a full 24-hour LST climate day, and the strict "all 24 hours" daily max (S3 `lamp_parse`) is MISSING for real runs. This affects the Phase A and B feature definition only; C1 still archives the raw bulletins, unchanged. Before Phase A1 is scored, the prereg must freeze the LAMP feature. The proposal is the max over the forecast hours remaining in the climate day after the anchor, using `lavtxt` + `lavtxt_ext`, plus an explicit hours-covered field. The observed max-so-far comes from the existing obs path, never from LAMP. The strict 24-hour max stays as is and is labelled diagnostic. This needs a review before Phase A; it does not block C1.
+
+### F13-OPEN-7 ruling: F13-R35 (coordinator, 2026-10-06, after trading-bot-architect review). BINDING over the S3 strict-24 h definition for Phase A/B features.
+
+- **F13-R35. LAMP feature definition.**
+  - **Feature.** Phase A/B use `lamp_rem_max_f`. It is the max over `lavtxt` and `lavtxt_ext` forecast hours where `valid_ts` is after the anchor and the hour falls inside the LST climate day (`climate_day_for_txn`).
+  - **Run selection.** Use the latest run whose `available_at` (frozen upper-bound lag) is before the anchor.
+  - **Leakage.** Assert the run side (r3.1, `max(available_at) < anchor`) and the hour side (`min(valid_ts) > anchor`).
+  - **Persisted fields.**
+    - `hours_covered`.
+    - `lamp_peak_covered`, true only when every hour from 12 to 18 LST that is after the anchor is present.
+    - If `lamp_peak_covered` is false, the feature is MISSING: `m_lamp=1`, the LAMP term drops, and the row scores as M0′. Nothing is imputed.
+  - **Blend input.** The blend uses `L = max(obs_so_far, lamp_rem_max_f)`.
+    - `obs_so_far` comes only from the obs path, with obs `available_at` before the anchor. It never comes from LAMP.
+    - At a D-1 anchor, `L = lamp_rem_max_f`.
+    - Both raw parts are persisted. Obs-only and LAMP-only are descriptive arms.
+  - **M0′ baseline.** M0′ also receives `obs_so_far`, so LAMP credit is not confused with observation credit. The ladder stays K=1.
+  - **Diagnostics and reporting.** The strict 24 h max is diagnostic only. Missingness is reported per horizon (D0, D-1); differential missingness is an outcome.
+  - **A0 probe item before the Phase A freeze.** Confirm which HH30 cycles publish `lavtxt_ext`. D-1 18Z peak coverage depends on it (EST day end is +35 h, PST +38 h, and ext reaches 38 h).
+  - **Tests (Phase A builder, RED first).**
+    - `test_lamp_rem_max_excludes_hours_at_or_before_anchor`
+    - `test_lamp_rem_run_available_at_before_anchor_asserted`
+    - `test_lamp_peak_coverage_d0_complete_dm1_requires_ext`
+    - `test_lamp_peak_uncovered_sets_missing_indicator_no_imputation`
+    - `test_combined_feature_is_max_obs_so_far_and_lamp_rem`
+    - `test_dm1_anchor_obs_so_far_undefined_uses_lamp_only`
+    - `test_obs_so_far_never_sourced_from_lamp`
+    - `test_missing_lamp_row_scores_as_m0prime`
+    - `test_lamp_missingness_reported_per_horizon`
+    - `test_strict_24h_max_labelled_diagnostic`
+  - **Review.** The Phase A prereg freeze review re-checks R35.
