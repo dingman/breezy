@@ -269,3 +269,101 @@ def test_day_evidence_is_immutable() -> None:
     with pytest.raises(AttributeError):
         ev.real_fills = 9  # type: ignore[misc]
     assert replace(ev, real_fills=2).real_fills == 2
+
+
+# -- review fold-ins: the write-once artefact carries every section 6 field -----------------------
+
+_ARTEFACT_DAY_FIELDS = (
+    "utc_day",
+    "status",
+    "reasons",
+    "real_fills",
+    "final_labelled",
+    "unresolved",
+    "missing_label",
+    "non_c1_post_epoch_count",
+    "non_c1_entry_rows",
+    "p_null_count",
+    "daily_recon",
+    "daily_recon_verdict_id",
+    "post_stop",
+    "post_stop_verdict_id",
+    "intraday_non_pass_ids",
+    "position_mismatches_transient",
+    "max_label_lag_h",
+    "fills_never_position_compared",
+    "canary_fills",
+    "canary_labelled_with_p",
+    "canary_recon_passes",
+    "live_fill_check",
+    "no_leg_fills",
+    "exit_fills",
+)
+
+
+def test_artefact_day_rows_carry_every_section_6_field(tmp_path: Path) -> None:
+    day = _ev(
+        daily_recon_verdict_id="v-daily",
+        post_stop_verdict_id="v-post",
+        intraday_non_pass_ids=("v-i1",),
+        position_mismatches_transient=2,
+        max_label_lag_h=7.5,
+        no_leg_fills=1,
+    )
+
+    path = run_proof_window(
+        tmp_path,
+        start_day=_START,
+        days=[day],
+        capture_epoch_start_ns=_EPOCH_NS,
+        wp7_active=True,
+        hold_days=(),
+    )
+
+    row = json.loads(path.read_text())["days"][0]
+    assert set(_ARTEFACT_DAY_FIELDS) <= set(row)
+    assert row["daily_recon_verdict_id"] == "v-daily" and row["post_stop_verdict_id"] == "v-post"
+    assert row["daily_recon"] == "PASS" and row["intraday_non_pass_ids"] == ["v-i1"]
+    assert (row["position_mismatches_transient"], row["max_label_lag_h"]) == (2, "7.500")
+    assert row["final_labelled"] == 1 and row["fills_never_position_compared"] == 0
+
+
+def test_a_missing_verdict_is_recorded_as_null_not_dropped(tmp_path: Path) -> None:
+    path = run_proof_window(
+        tmp_path,
+        start_day=_START,
+        days=[_ev(post_stop=None)],
+        capture_epoch_start_ns=_EPOCH_NS,
+        wp7_active=True,
+        hold_days=(),
+    )
+
+    row = json.loads(path.read_text())["days"][0]
+    assert "post_stop" in row and row["post_stop"] is None
+
+
+# -- review fold-in: malformed dates are refused, never compared as strings -----------------------
+
+
+@pytest.mark.parametrize(
+    ("start", "holds"),
+    [
+        ("2026-1-2", ()),
+        ("20261002", ()),
+        ("not-a-date", ()),
+        (_START, ("2026-10",)),
+        (_START, ("garbage",)),
+    ],
+)
+def test_malformed_start_or_hold_dates_are_refused(start: str, holds: tuple[str, ...]) -> None:
+    with pytest.raises(ProofWindowRefused) as caught:
+        _eval([_ev()], start_day=start, hold_days=holds)
+
+    assert caught.value.reason == "malformed_date"
+
+
+def test_a_malformed_evidence_day_is_refused() -> None:
+    with pytest.raises(ProofWindowRefused) as caught:
+        _eval([_ev("2026-10-2")])
+
+    assert caught.value.reason == "malformed_date"

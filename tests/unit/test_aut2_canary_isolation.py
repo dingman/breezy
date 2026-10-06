@@ -235,6 +235,7 @@ def test_portfolio_roi_never_reads_canary() -> None:
 # -- the CLI ----------------------------------------------------------------------------------
 
 _DAY_START_NS = 1_790_899_200_000_000_000  # 2026-10-02T00:00:00Z
+_CLI_NOW = _DAY_START_NS + 36 * 3_600_000_000_000  # 2026-10-03T12:00Z: the day is closed
 
 
 def _argv(root: Path, db: Path, *extra: str) -> list[str]:
@@ -251,7 +252,7 @@ def _argv(root: Path, db: Path, *extra: str) -> list[str]:
         "--day",
         _DAY,
         "--now-ns",
-        str(_NOW),
+        str(_CLI_NOW),
         *extra,
     ]
 
@@ -294,3 +295,25 @@ def test_cli_proof_window_has_no_store_source_yet_and_fails_closed(tmp_path: Pat
 def test_cli_requires_exactly_one_mode(tmp_path: Path) -> None:
     assert main([]) == 2
     assert main(["--canary", "--proof-window"]) == 2
+
+
+def test_cli_canary_refuses_an_open_or_future_day(tmp_path: Path) -> None:
+    db = tmp_path / "exec.sqlite"
+    seed_fills(db, [durable_fill(ts_event=_DAY_START_NS - 3_600_000_000_000)])
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    same_day = _argv(root, db)
+    same_day[same_day.index("--now-ns") + 1] = str(_DAY_START_NS + 3_600_000_000_000)
+    earlier = _argv(root, db)
+    earlier[earlier.index("--now-ns") + 1] = str(_DAY_START_NS - 1)
+
+    assert main(same_day) != 0 and main(earlier) != 0
+    assert not (root / "derived").exists()
+
+
+def test_a_drill_fill_counts_as_a_real_fill_when_refusing_a_canary(tmp_path: Path) -> None:
+    """Deliberately conservative: the day's fill count is every durable fill, drill included."""
+    db = tmp_path / "exec.sqlite"
+    seed_fills(db, [durable_fill(venue_order_id="drill-1", ts_event=_DAY_START_NS + 1)])
+
+    assert main(_argv(tmp_path / "data", db)) != 0

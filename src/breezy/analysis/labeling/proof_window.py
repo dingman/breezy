@@ -25,7 +25,9 @@ from breezy.analysis.labeling.constants import (
     PROOF_MIN_REAL_FILLS,
     PROOF_QUALIFYING_DAYS,
 )
+from breezy.persistence.autonomy.paths import date_component
 from breezy.persistence.autonomy.verdict import VerdictOutcome
+from breezy.persistence.autonomy.wire import WireRefused
 
 __all__ = [
     "DayEvidence",
@@ -82,6 +84,8 @@ class DayEvidence:
     exit_fills: int = 0
     marker_file: str | None = None
     invocation_id: str | None = None
+    daily_recon_verdict_id: str | None = None
+    post_stop_verdict_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,15 @@ class WindowResult:
     complete: bool
 
 
+def _iso_day(value: str) -> str:
+    """``value`` as a strict ``YYYY-MM-DD`` date; anything else is a refusal, never a string
+    comparison."""
+    try:
+        return date_component(value)
+    except WireRefused as exc:
+        raise ProofWindowRefused("malformed_date") from exc
+
+
 def _day_start_ns(day: str) -> int:
     date = dt.date.fromisoformat(day)
     return int(dt.datetime(date.year, date.month, date.day, tzinfo=dt.UTC).timestamp()) * (
@@ -122,6 +135,9 @@ def _check_start(
     wp7_active: bool,
     hold_days: Collection[str],
 ) -> None:
+    _iso_day(start_day)
+    for held in hold_days:
+        _iso_day(held)
     if capture_epoch_start_ns is None:
         raise ProofWindowRefused("capture_epoch_unwritten")
     if not wp7_active:
@@ -186,6 +202,8 @@ def evaluate_window(
 ) -> WindowResult:
     """Evaluate ``days`` (any order) from ``start_day``; refuses an invalid start first."""
     _check_start(start_day, capture_epoch_start_ns, wp7_active, hold_days)
+    for ev in days:
+        _iso_day(ev.utc_day)
     results: list[DayResult] = []
     current_start = start_day
     restarts: list[str] = []

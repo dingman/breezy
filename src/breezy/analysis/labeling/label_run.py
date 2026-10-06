@@ -48,6 +48,7 @@ from breezy.persistence.autonomy.canary_store import (
 from breezy.persistence.autonomy.capture_reader import DecisionView, OrderLinkView
 from breezy.persistence.autonomy.label_store import LabelRow, write_labels
 from breezy.persistence.autonomy.paths import date_component
+from breezy.persistence.autonomy.wire import WireRefused
 
 __all__ = [
     "PROOF_DIR",
@@ -294,6 +295,7 @@ def run_proof_window(
                 "real_fills": d.real_fills,
                 "canary_fills": d.canary_fills,
                 "live_fill_check": d.live_fill_check,
+                **_evidence_fields(d.evidence),
             }
             for d in result.days
         ],
@@ -301,6 +303,31 @@ def run_proof_window(
         "invocation_ids": [d.evidence.invocation_id for d in result.days],
     }
     return write_json_once(data_root, (*PROOF_DIR, f"window_{start_day}_{end}.json"), body)
+
+
+def _evidence_fields(ev: DayEvidence) -> dict[str, object]:
+    """Every section 6 per-day field the evidence carries. The file is write-once, so none may be
+    dropped; a verdict that is absent is recorded as null."""
+    return {
+        "final_labelled": ev.final_labelled,
+        "unresolved": ev.unresolved,
+        "missing_label": ev.missing_label,
+        "non_c1_post_epoch_count": ev.non_c1_post_epoch_count,
+        "non_c1_entry_rows": ev.non_c1_entry_rows,
+        "p_null_count": ev.p_null_count,
+        "daily_recon": None if ev.daily_recon is None else ev.daily_recon.value,
+        "daily_recon_verdict_id": ev.daily_recon_verdict_id,
+        "post_stop": None if ev.post_stop is None else ev.post_stop.value,
+        "post_stop_verdict_id": ev.post_stop_verdict_id,
+        "intraday_non_pass_ids": list(ev.intraday_non_pass_ids),
+        "position_mismatches_transient": ev.position_mismatches_transient,
+        "max_label_lag_h": format(ev.max_label_lag_h, ".3f"),  # canonical JSON has no floats
+        "fills_never_position_compared": ev.fills_never_position_compared,
+        "canary_labelled_with_p": ev.canary_labelled_with_p,
+        "canary_recon_passes": ev.canary_recon_passes,
+        "no_leg_fills": ev.no_leg_fills,
+        "exit_fills": ev.exit_fills,
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -318,6 +345,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _real_fill_count(exec_db: Path, day: str) -> int:
+    """Every durable fill dated ``day``. Drill fills count as real here, deliberately: a canary
+    is refused on any day with any durable fill, which is the conservative direction."""
     read = read_durable_fills(exec_db).require_clean()
     return sum(1 for f in read.fills if utc_day(f.ts_event) == day)
 
@@ -327,6 +356,14 @@ def _canary_main(args: argparse.Namespace) -> int:
         print("AUT2 USAGE --canary needs --data-root, --exec-db and --day")
         return _RC_USAGE
     now_ns = args.now_ns if args.now_ns is not None else time.time_ns()
+    try:
+        date_component(args.day)
+    except WireRefused:
+        print("AUT2 USAGE --day must be an ISO YYYY-MM-DD date")
+        return _RC_USAGE
+    if not args.day < utc_day(now_ns):  # ISO dates order as strings; only closed days run
+        print(f"AUT2 CANARY_REFUSED day={args.day} reason=day_not_closed")
+        return _RC_FAILED
     try:
         count = _real_fill_count(args.exec_db, args.day)
         run = run_canary(
