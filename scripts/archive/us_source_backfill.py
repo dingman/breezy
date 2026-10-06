@@ -3,8 +3,9 @@
 Read-only network use against ``mesonet.agron.iastate.edu`` only; the one local write path is
 the ``us-pfm-afos`` revision store (PFM) and the existing MOS archive writer (GFS).
 
-* PFM: ``PacedIemTransport.fetch_afos_pfm`` pages ascending history (``sdate``, ``order=asc``,
-  at most 20 products per request, halved on an oversize body down to one) at the A0-R1 pace
+* PFM: ``PacedIemTransport.fetch_afos_pfm`` pages ascending history (``sdate`` = the last issuance
+  INSTANT, ``order=asc``, at most 20 products per request, halved on an oversize body down to
+  one) at the A0-R1 pace
   (>= 4 s between AFOS requests). Each
   product is split out, its WMO issuance time resolved, parsed (a refused product is counted
   and never written) and appended RAW through ``UsSourceRevisionStore`` under the collector's
@@ -128,6 +129,7 @@ _ETX: Final[str] = "\x03"
 _HEADER_SCAN_LINES: Final[int] = 10
 _WMO_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z]{4}\d{2} ([A-Z]{4}) (\d{2})(\d{2})(\d{2})$")
 
+#: ``(wfo, sdate, limit)``; ``sdate`` is a UTC instant (a ``datetime``, which is a ``date``).
 PfmFetch = Callable[[str, dt.date, int], str]
 
 
@@ -276,6 +278,10 @@ class _StoreClock:
         return self._clock_ns()
 
 
+def _stamp(cursor: dt.datetime) -> str:
+    return cursor.strftime("%Y-%m-%dT%H:%MZ")
+
+
 def _alert(message: str) -> None:
     sys.stderr.write(f"ALERT us-source-backfill: {message}\n")
 
@@ -283,7 +289,7 @@ def _alert(message: str) -> None:
 def _fetch_page(
     fetch: PfmFetch,
     wfo: str,
-    cursor: dt.date,
+    cursor: dt.datetime,
     limit: int,
     report: LegReport,
     sleep: Callable[[float], None],
@@ -311,20 +317,28 @@ def _fetch_page(
             if limit <= 1:
                 report.status = "oversize_product"
                 report.error = f"{type(exc).__name__}: {exc}"
-                _alert(f"PFM{wfo} sdate={cursor}: one product exceeds the body cap; station stops")
+                _alert(
+                    f"PFM{wfo} sdate={_stamp(cursor)}: one product exceeds the body cap; "
+                    "station stops"
+                )
                 return None, limit
             limit //= 2
             continue
         except ForbiddenError:
             report.requests += 1
             report.status = "forbidden"
-            _alert(f"IEM 403 (abuse block) for PFM{wfo} at sdate={cursor}; stopping every leg")
+            _alert(
+                f"IEM 403 (abuse block) for PFM{wfo} at sdate={_stamp(cursor)}; stopping every leg"
+            )
             return None, limit
         except RateLimitedError:
             report.requests += 1
             if attempt == len(THROTTLE_BACKOFF_S):
                 report.status = "throttled"
-                _alert(f"IEM throttle persisted for PFM{wfo} at sdate={cursor}; stopping the leg")
+                _alert(
+                    f"IEM throttle persisted for PFM{wfo} at sdate={_stamp(cursor)}; "
+                    "stopping the leg"
+                )
                 return None, limit
             sleep(THROTTLE_BACKOFF_S[attempt])
             attempt += 1
@@ -466,7 +480,7 @@ def run_pfm_leg(
     wfo = PFM_POINTS[station].wfo
     report = LegReport(station=station, wfo=wfo)
     truncated: list[dt.date] = []
-    cursor = [start]  # mutable so the error path can name where the leg stopped
+    cursor = [dt.datetime(start.year, start.month, start.day, tzinfo=dt.UTC)]  # mutable: error path
     try:
         _page_loop(
             report, truncated, cursor, wfo, station, end, fetch, store, clock_ns, window_ok,
@@ -475,8 +489,8 @@ def run_pfm_leg(
     except Exception as exc:  # noqa: BLE001 - the station boundary: record, never crash the run
         report.status = "error"
         report.error = f"{type(exc).__name__}: {exc}"
-        report.resume_sdate = cursor[0]
-        _alert(f"{wfo} sdate={cursor[0]}: unexpected {report.error}; this station stops")
+        report.resume_sdate = cursor[0].date()
+        _alert(f"{wfo} sdate={_stamp(cursor[0])}: unexpected {report.error}; this station stops")
     report.truncated_days = tuple(truncated)
     if report.store_errors and report.status == "complete":
         report.status = "degraded"
@@ -486,7 +500,7 @@ def run_pfm_leg(
 def _page_loop(
     report: LegReport,
     truncated: list[dt.date],
-    cursor_box: list[dt.date],
+    cursor_box: list[dt.datetime],
     wfo: str,
     station: str,
     end: dt.date,
@@ -497,36 +511,42 @@ def _page_loop(
     sleep: Callable[[float], None],
     page_limit: int,
 ) -> None:
-    while cursor_box[0] <= end:
+    while cursor_box[0].date() <= end:
         cursor = cursor_box[0]
         text, page_limit = _fetch_page(
             fetch, wfo, cursor, page_limit, report, sleep, window_ok, clock_ns
         )
         if text is None:
-            report.resume_sdate = cursor
+            report.resume_sdate = cursor.date()
             return
         products = split_raw_products(text)
         if not products:
             return
         try:
-            paired = _place(products, cursor, report)
+            paired = _place(products, cursor.date(), report)
         except UnplaceableHeaderError as exc:
             _count(report, "unplaceable_header")
-            _alert(f"{wfo} sdate={cursor}: {exc}; this station stops, resume at {cursor}")
-            report.status, report.resume_sdate = "unplaceable_header", cursor
+            _alert(
+                f"{wfo} sdate={_stamp(cursor)}: {exc}; this station stops, "
+                f"resume at {_stamp(cursor)}"
+            )
+            report.status, report.resume_sdate = "unplaceable_header", cursor.date()
             return
         last, past_end, busy = _ingest_page(
             paired, station=station, wfo=wfo, end=end, store=store, report=report, sleep=sleep
         )
         if busy:
-            report.status, report.resume_sdate = "store_busy", cursor
+            report.status, report.resume_sdate = "store_busy", cursor.date()
             return
         if past_end or len(products) < page_limit or last is None:
             return
-        following = last.date()
-        if following <= cursor:  # a full page inside one date: the rest of that date is unseen
-            truncated.append(cursor)
-            following = cursor + dt.timedelta(days=1)
+        # Continue from the last issuance INSTANT (inclusive, so the overlap dedupes in the store):
+        # a full page inside one day then loses nothing. Only a page that cannot advance at all (a
+        # whole page in one minute) skips that minute, and says so.
+        following = last
+        if following <= cursor:
+            truncated.append(cursor.date())
+            following = cursor + dt.timedelta(minutes=1)
         cursor_box[0] = following
 
 
@@ -592,7 +612,8 @@ def _pfm_plan(
     stations: Sequence[str], start: dt.date, end: dt.date, budget: int | None
 ) -> dict[str, Any]:
     days = (end - start).days + 1
-    per_wfo = math.ceil(days * PLANNING_ISSUANCES_PER_DAY / DEFAULT_PAGE_LIMIT)
+    # each page re-reads the previous page's last product (the instant cursor is inclusive)
+    per_wfo = math.ceil(days * PLANNING_ISSUANCES_PER_DAY / (DEFAULT_PAGE_LIMIT - 1))
     wfos = {
         PFM_POINTS[s].wfo: {
             "station": s,

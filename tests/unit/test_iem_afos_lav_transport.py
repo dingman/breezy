@@ -388,3 +388,28 @@ def test_module_defines_no_new_transport_error_subclass() -> None:
     local_classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
     assert not (raised & local_classes)
     assert {"RateLimitedError"} <= raised
+
+
+@pytest.mark.asyncio
+async def test_afos_pfm_history_accepts_a_utc_instant_cursor_to_the_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http = _serve(monkeypatch)
+    cursor = dt.datetime(2026, 8, 25, 19, 1, 30, tzinfo=dt.UTC)
+    await _transport().fetch_afos_pfm("LOT", sdate=cursor, limit=20)
+    query = parse_qs(urlsplit(str(http.requests[0].url)).query)
+    assert query["sdate"] == ["2026-08-25T19:01Z"]
+    assert query["order"] == ["asc"]
+
+
+@pytest.mark.asyncio
+async def test_afos_pfm_refuses_a_naive_or_non_utc_instant_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http = _serve(monkeypatch)
+    offset = dt.timezone(dt.timedelta(hours=-7))
+    naive = dt.datetime(2026, 8, 25, 19, 1)  # noqa: DTZ001 - the refused input under test
+    for bad in (naive, dt.datetime(2026, 8, 25, 19, 1, tzinfo=offset)):
+        with pytest.raises(ValueError):
+            await _transport().fetch_afos_pfm("LOT", sdate=bad, limit=20)
+    assert http.requests == []

@@ -127,6 +127,22 @@ def _closed_date(name: str, value: dt.date) -> str:
     return value.isoformat()
 
 
+def _closed_sdate(value: dt.date | dt.datetime) -> str:
+    """``sdate`` as a calendar date, or as a UTC instant floored to the minute.
+
+    AFOS ``retrieve.py`` takes ``YYYY-MM-DDTHH:MMZ`` (the recorded F13 probe manifest uses it), so
+    an ascending history can resume from the last product's issuance without skipping the rest of
+    a busy day. A naive or non-UTC instant is refused rather than guessed.
+    """
+    if not isinstance(value, dt.datetime):
+        return _closed_date("sdate", value)
+    if value.tzinfo is None or value.utcoffset() != dt.timedelta(0):
+        raise ValueError(
+            "`sdate` instant must be timezone-aware UTC; the supplied value is refused."
+        )
+    return value.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%MZ")
+
+
 def utc_stamp(clock: Callable[[], int]) -> str:
     """Reproduce probe_transport._utc_stamp from an injected nanosecond clock."""
     seconds = clock() / _NANOSECONDS_PER_SECOND
@@ -341,9 +357,9 @@ class PacedIemTransport(HttpTransport):
     # -- AFOS (PFM) and LAV: closed sets, per-method caps, A0-R1 pacing -------
 
     async def fetch_afos_pfm(
-        self, wfo: str, *, sdate: dt.date | None = None, limit: int = 1
+        self, wfo: str, *, sdate: dt.date | dt.datetime | None = None, limit: int = 1
     ) -> FetchResult:
-        """The latest PFM (``sdate=None``) or ascending history from ``sdate``."""
+        """The latest PFM (``sdate=None``) or ascending history from ``sdate`` (date or instant)."""
         if wfo not in IEM_AFOS_WFOS:
             raise ValueError("`wfo` is not in the closed PFM office set; refused.")
         if isinstance(limit, bool) or not isinstance(limit, int):
@@ -352,7 +368,7 @@ class PacedIemTransport(HttpTransport):
             raise ValueError(f"`limit` must be in 1..{IEM_AFOS_MAX_LIMIT}")
         params = {"pil": f"PFM{wfo}", "limit": str(limit)}
         if sdate is not None:
-            params["sdate"] = _closed_date("sdate", sdate)
+            params["sdate"] = _closed_sdate(sdate)
             params["order"] = "asc"
         params["fmt"] = "text"
         return await self._fetch_closed(

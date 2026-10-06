@@ -60,16 +60,25 @@ class _Sleeps:
         self.seconds.append(seconds)
 
 
+def _header_time(header: str) -> dt.datetime:
+    return dt.datetime(2026, 10, int(header[:2]), int(header[2:4]), int(header[4:6]), tzinfo=dt.UTC)
+
+
 class _Catalog:
-    """A fake AFOS: ascending products from ``sdate``, at most ``limit`` per call."""
+    """A fake AFOS: ascending products from ``sdate`` (date or UTC instant), at most ``limit``."""
 
     def __init__(self, headers: list[str]) -> None:
-        self.products = [(h, _okx_product(h)) for h in headers]
+        self.products = [(_header_time(h), _okx_product(h)) for h in headers]
         self.calls: list[tuple[str, dt.date, int]] = []
 
     def __call__(self, wfo: str, sdate: dt.date, limit: int) -> str:
         self.calls.append((wfo, sdate, limit))
-        eligible = [p for h, p in self.products if int(h[:2]) >= sdate.day]
+        since = (
+            sdate
+            if isinstance(sdate, dt.datetime)
+            else dt.datetime(sdate.year, sdate.month, sdate.day, tzinfo=dt.UTC)
+        )
+        eligible = [p for t, p in self.products if t >= since]
         return "".join(eligible[:limit])
 
 
@@ -177,7 +186,7 @@ def test_identical_rerun_appends_nothing(tmp_path: Path) -> None:
     assert (again.appended, again.unchanged) == (0, 2)
 
 
-def test_pagination_advances_from_the_last_issuance_date_and_dedupes_the_overlap(
+def test_pagination_continues_from_the_last_issuance_instant_and_dedupes_the_overlap(
     tmp_path: Path,
 ) -> None:
     catalog = _Catalog(["051901", "061901", "071901"])
@@ -185,24 +194,50 @@ def test_pagination_advances_from_the_last_issuance_date_and_dedupes_the_overlap
     report = _leg(tmp_path, catalog, page_limit=2)
 
     assert [c[1] for c in catalog.calls] == [
-        dt.date(2026, 10, 5),
-        dt.date(2026, 10, 6),
-        dt.date(2026, 10, 7),
+        dt.datetime(2026, 10, 5, tzinfo=dt.UTC),
+        dt.datetime(2026, 10, 6, 19, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 10, 7, 19, 1, tzinfo=dt.UTC),
     ]
     assert report.requests == 3
-    assert (report.appended, report.unchanged) == (3, 2)  # Oct 6 and Oct 7 each fetched twice
+    assert (report.appended, report.unchanged) == (3, 2)  # each page re-reads the last product
     assert report.status == "complete"
 
 
-def test_a_full_page_inside_one_date_is_flagged_truncated_not_silently_skipped(
+def test_full_page_continues_same_day_without_loss(tmp_path: Path) -> None:
+    headers = ["05" + f"{h:02d}05" for h in range(24)]
+    catalog = _Catalog(headers)
+
+    report = _leg(tmp_path, catalog, end=dt.date(2026, 10, 5), page_limit=20)
+
+    assert report.appended == 24
+    assert census.pfm_issuance_times(tmp_path) == {"OKX": tuple(_utc(5, h, 5) for h in range(24))}
+    assert report.status == "complete"
+    assert report.truncated_days == ()
+
+
+def test_hourly_office_has_no_truncated_days(tmp_path: Path) -> None:
+    headers = [f"{d:02d}{h:02d}05" for d in range(5, 8) for h in range(24)]
+    catalog = _Catalog(headers)
+
+    report = _leg(tmp_path, catalog, end=dt.date(2026, 10, 7), page_limit=20)
+
+    assert report.truncated_days == ()
+    assert report.appended == 72
+    assert report.refused_total == 0
+    assert len(census.pfm_issuance_times(tmp_path)["OKX"]) == 72
+    assert report.requests <= 5  # ~19 new products per request, not one request per day
+
+
+def test_a_full_page_that_cannot_advance_is_flagged_truncated_not_silently_skipped(
     tmp_path: Path,
 ) -> None:
-    catalog = _Catalog(["051901", "052001"])
+    catalog = _Catalog(["051901", "051901", "051901"])
 
-    report = _leg(tmp_path, catalog, page_limit=2)
+    report = _leg(tmp_path, catalog, end=dt.date(2026, 10, 5), page_limit=2)
 
     assert report.truncated_days == (dt.date(2026, 10, 5),)
     assert report.status == "complete"
+    assert [c[1] for c in catalog.calls][-1] == dt.datetime(2026, 10, 5, 19, 2, tzinfo=dt.UTC)
 
 
 def test_products_outside_the_requested_end_date_are_not_stored(tmp_path: Path) -> None:
@@ -1080,7 +1115,7 @@ def test_oversize_page_halves_limit_and_retries_same_sdate(tmp_path: Path) -> No
     report = _leg(tmp_path, fetch, page_limit=20, end=dt.date(2026, 10, 9))
 
     assert [limit for _w, _s, limit in calls[:3]] == [20, 10, 5]
-    assert {sdate for _w, sdate, _l in calls[:3]} == {dt.date(2026, 10, 5)}
+    assert {sdate for _w, sdate, _l in calls[:3]} == {dt.datetime(2026, 10, 5, tzinfo=dt.UTC)}
     assert report.status == "complete"
     assert report.appended == 3
     assert report.requests == len(calls)
@@ -1252,4 +1287,4 @@ def test_default_page_limit_is_20_and_dry_run_estimate_uses_it(tmp_path: Path) -
     pfm = json.loads((tmp_path / "report.json").read_text())["pfm"]
     days = 6  # 2026-10-01 .. 2026-10-06
     assert pfm["page_limit"] == 20
-    assert pfm["estimated_requests"] == -(-days * bf.PLANNING_ISSUANCES_PER_DAY // 20)
+    assert pfm["estimated_requests"] == -(-days * bf.PLANNING_ISSUANCES_PER_DAY // 19)
