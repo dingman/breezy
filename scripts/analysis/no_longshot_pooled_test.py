@@ -33,6 +33,7 @@ first forward day is DERIVED from git (UTC committer date of ``frozen_sha`` + 1 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
 import json
@@ -871,6 +872,25 @@ def _read_branch(
     )
 
 
+def _preflight_inputs(catalog: Path, truth: Path) -> None:
+    """Operator/input errors found BEFORE any window data is evaluated are a ``Refusal`` (exit 3,
+    no report), so a mistyped path never burns the read-once look (R28)."""
+    try:
+        with truth.open(newline="", encoding="utf-8") as handle:
+            header = next(csv.reader(handle), None)
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        raise Refusal(f"cannot read the truth CSV {truth}: {type(exc).__name__}: {exc}") from exc
+    if not header:
+        raise Refusal(f"the truth CSV {truth} has no readable header")
+    depth = catalog / "data" / DEPTH_DIR
+    try:
+        empty = not depth.is_dir() or next(depth.iterdir(), None) is None
+    except OSError as exc:
+        raise Refusal(f"cannot read the catalog root {catalog}: {exc}") from exc
+    if empty:
+        raise Refusal(f"the catalog root {catalog} has no {DEPTH_DIR} directories")
+
+
 def _evaluate(
     report: dict[str, Any],
     freeze: Freeze,
@@ -925,7 +945,8 @@ def run_screen(
     resamples: int = B_RESAMPLES,
 ) -> tuple[dict[str, Any], int]:
     """Run the screen. Raises ``Refusal`` (exit 3, no verdict) on any freeze, design-loading or
-    output defect; returns ``(report, exit code)`` otherwise. Data/IO errors during the run and
+    output defect, and on an unreadable truth path/header or an empty catalog root (R28, no report
+    written); returns ``(report, exit code)`` otherwise. Data/IO errors during the run and
     every validity failure give an INVALID report (exit 2); no traceback escapes (R22)."""
     if out_dir is not None:
         _refuse_overwrite(out_dir)
@@ -944,6 +965,7 @@ def run_screen(
         "window": PRIMARY_WINDOW.label,
     }
     header = dict(report)
+    _preflight_inputs(catalog, truth)
     try:
         _evaluate(report, freeze, catalog=catalog, truth=truth, as_of=as_of, resamples=resamples)
     except Refusal:

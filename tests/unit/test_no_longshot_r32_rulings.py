@@ -197,17 +197,67 @@ def test_r22_design_loading_failures_are_refusals(
 def test_r22_run_time_data_errors_are_invalid_not_tracebacks(
     world: dict[str, Any], capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
+    # R28 narrows R22: a missing truth path is now a pre-evaluation REFUSAL (see the R28 tests);
+    # only a readable truth CSV with a defective header/rows is a run-time INVALID.
     catalog, _truth = _two_days(world)
-    report, code = _run(world, catalog, tmp_path / "missing_truth.csv")
-    assert code == 2 and report["status"] == "INVALID" and report["verdict"] == "INVALID"
-    assert report["invalid_reasons"]
     bad = tmp_path / "bad_truth.csv"
     bad.write_text("station,climate_day\nLAX,2026-10-11\n")  # no is_final column
-    assert _run(world, catalog, bad)[1] == 2
+    report, code = _run(world, catalog, bad)
+    assert code == 2 and report["status"] == "INVALID" and report["verdict"] == "INVALID"
+    assert report["invalid_reasons"]
     out = tmp_path / "o"
-    argv = _argv(world, catalog, tmp_path / "missing_truth.csv", out, "2026-10-06")
+    argv = _argv(world, catalog, bad, out, "2026-10-06")
     assert tool.main(argv, clock=lambda: _TODAY) == 2
     assert "Traceback" not in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- R28
+
+
+def test_r28_missing_truth_path_is_refused_and_writes_no_report(
+    world: dict[str, Any], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    catalog, _truth = _two_days(world)
+    out = tmp_path / "o"
+    with pytest.raises(tool.Refusal, match="truth"):
+        _run(world, catalog, tmp_path / "missing_truth.csv", out_dir=out)
+    assert not (out / tool.REPORT_NAME).exists()
+    argv = _argv(world, catalog, tmp_path / "missing_truth.csv", out, "2026-10-06")
+    assert tool.main(argv, clock=lambda: _TODAY) == 3
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err and not (out / tool.REPORT_NAME).exists()
+    empty = tmp_path / "empty_truth.csv"
+    empty.write_text("")  # unreadable header
+    with pytest.raises(tool.Refusal, match="truth"):
+        _run(world, catalog, empty, out_dir=out)
+    assert not (out / tool.REPORT_NAME).exists()
+
+
+def test_r28_missing_catalog_root_is_refused_and_writes_no_report(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    _catalog, truth = _two_days(world)
+    out = tmp_path / "o"
+    with pytest.raises(tool.Refusal, match="catalog"):
+        _run(world, tmp_path / "no_such_catalog", truth, out_dir=out)
+    assert not (out / tool.REPORT_NAME).exists()
+    empty_root = tmp_path / "empty_catalog"
+    empty_root.mkdir()
+    with pytest.raises(tool.Refusal, match="catalog"):
+        _run(world, empty_root, truth, out_dir=out)
+    assert not (out / tool.REPORT_NAME).exists()
+
+
+def test_r28_in_window_lookahead_is_still_invalid_and_persisted(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    days = {_FIRST: [base._lax()], _FIRST + dt.timedelta(days=1): [base._lax()]}
+    catalog, truth = base._stage(world["root"], days, issued_offset=-1)
+    out = tmp_path / "o"
+    report, code = _run(world, catalog, truth, out_dir=out)
+    assert code == 2 and report["status"] == "INVALID"
+    assert any("look-ahead" in r for r in report["invalid_reasons"])
+    assert json.loads((out / tool.REPORT_NAME).read_text())["status"] == "INVALID"
 
 
 def test_r22_main_maps_missing_prereg_to_exit_3(
