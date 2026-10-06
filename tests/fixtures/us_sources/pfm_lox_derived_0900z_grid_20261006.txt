@@ -1,0 +1,37 @@
+# DERIVED FIXTURE (F13 B0-fix2, D2), NOT a raw capture.
+# The raw refused products were never retained (a refused payload is not archived), so this is
+# the real LOX Oct 5 capture's layout re-cut to the LOX 09Z-grid cycle that
+# pfm_lox_real_20261006.txt does not cover: grid starts 02 PDT (UTC 09), the 3hrly table runs
+# 22 columns to Thu 17 PDT, so the 6hrly table opens with a ONE-column Thu 23 PDT (UTC 06) block
+# that has no room for a date label. Layout inferred from the real EDT/CDT 09Z-cycle products in
+# the archive (EDT 05.. / CDT 04.. starts) and the width-dependent label rule. Public NWS text shape.
+# Lines starting with '#' are stripped by the tests before parsing.
+
+466 
+FOUS56 KLOX 061112
+PFMLOX
+
+Point Forecast Matrices
+National Weather Service Los Angeles/Oxnard CA
+412 AM PDT Tue Oct 6 2026
+
+CAZ366-061100-
+Los Angeles Airport CA
+33.94N 118.39W Elev. 99 ft
+412 AM PDT Tue Oct 6 2026
+
+Date                Tue 10/06/26            Wed 10/07/26            Thu 10/08/26
+PDT 3hrly     02 05 08 11 14 17 20 23 02 05 08 11 14 17 20 23 02 05 08 11 14 17
+UTC 3hrly     09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00
+
+Min/Max          66          88          67          90          65          84
+
+
+Date               Fri 10/09/26  Sat 10/10/26  Sun 10/11/26  Mon 10/12/26
+PDT 6hrly     23   05 11 17 23   05 11 17 23   05 11 17 23   05 11 17 23   05
+UTC 6hrly     06   12 18 00 06   12 18 00 06   12 18 00 06   12 18 00 06   12
+
+Max/Min            66    82      65    80      64    79      64    77
+
+$$
+

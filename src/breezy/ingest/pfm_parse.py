@@ -212,21 +212,36 @@ def _first_date(label: re.Match[str], anchor: dt.date) -> dt.date:
 
 
 def _columns(
-    date_row: str, local_row: str, utc_row: str, anchor: dt.date, issued_at: dt.datetime
+    date_row: str,
+    local_row: str,
+    utc_row: str,
+    anchor: dt.date,
+    issued_at: dt.datetime,
+    previous: _Column | None = None,
 ) -> list[_Column]:
+    """The table's columns with local dates.
+
+    The first table takes its first date from the first printed label. A later table CONTINUES
+    from `previous`, the last column of the table before it: a block too narrow for any label
+    (the Pacific 09Z-grid cycle opens its 6hrly table with a single Thu 23 PDT column) prints
+    none, so the first printed label belongs to the NEXT day and cannot date column 0. Every
+    printed label is still cross-checked against its column either way."""
     local, utc = _hour_tokens(local_row), _hour_tokens(utc_row)
     if not local or [e for e, _ in local] != [e for e, _ in utc]:
         raise PfmParseError("hour_rows_misaligned")
     labels = list(_DATE_LABEL_RE.finditer(date_row, len("Date")))
     if not labels:
         raise PfmParseError("no_date_label")
-    date = _first_date(labels[0], anchor)
+    if previous is None:
+        date = _first_date(labels[0], anchor)
+        previous_hour = -1
+    else:
+        date, previous_hour = previous.local_date, previous.local_hour
     columns: list[_Column] = []
-    previous = -1
     for (end, hour), (_, utc_hour) in zip(local, utc, strict=True):
-        if hour <= previous:
+        if hour <= previous_hour:
             date += dt.timedelta(days=1)
-        previous = hour
+        previous_hour = hour
         columns.append(_Column(end, hour, utc_hour, date))
     lo = issued_at.date() - _DATE_BEFORE
     hi = issued_at.date() + _DATE_AFTER
@@ -243,14 +258,14 @@ def _columns(
 
 
 def _table_max(
-    table: list[str], anchor: dt.date, issued_at: dt.datetime
-) -> tuple[dict[dt.date, int], dt.date]:
+    table: list[str], anchor: dt.date, issued_at: dt.datetime, previous: _Column | None
+) -> tuple[dict[dt.date, int], _Column]:
     if len(table) < 3 or not _LOCAL_ROW_RE.match(table[1]) or not _UTC_ROW_RE.match(table[2]):
         raise PfmParseError("table_header", table[0][:40])
     extrema = [ln for ln in table[3:] if _EXTREMA_RE.match(ln)]
     if len(extrema) != 1:
         raise PfmParseError("extrema_row", f"{len(extrema)} Min/Max rows in table")
-    ordered = _columns(table[0], table[1], table[2], anchor, issued_at)
+    ordered = _columns(table[0], table[1], table[2], anchor, issued_at, previous)
     columns = {c.end: c for c in ordered}
     if extrema[0][:_LABEL_WIDTH].strip() not in ("Min/Max", "Max/Min"):
         raise PfmParseError("extrema_label")
@@ -269,7 +284,7 @@ def _table_max(
             found[column.local_date] = value
         elif column.utc_hour != _MIN_UTC_HOUR:
             raise PfmParseError("extrema_under_unexpected_hour", str(column.utc_hour))
-    return found, ordered[-1].local_date
+    return found, ordered[-1]
 
 
 def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date, int], ...]:
@@ -277,9 +292,9 @@ def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date,
     if not starts or len(starts) > _MAX_TABLES:
         raise PfmParseError("tables", f"{len(starts)} tables in point block")
     merged: dict[dt.date, int] = {}
-    anchor = issued_at.date()
+    last: _Column | None = None
     for begin, end in zip(starts, [*starts[1:], len(body)], strict=True):
-        found, anchor = _table_max(body[begin:end], anchor, issued_at)
+        found, last = _table_max(body[begin:end], issued_at.date(), issued_at, last)
         for date, value in found.items():
             if date in merged:
                 raise PfmParseError("duplicate_day", date.isoformat())

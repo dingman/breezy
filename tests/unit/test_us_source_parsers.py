@@ -761,3 +761,60 @@ def test_parser_and_revision_refusals_are_not_transport_error_subclasses() -> No
         assert cls.__module__.startswith("breezy.ingest.")
     assert not issubclass(LampParseError, PfmParseError)
     assert not issubclass(PfmParseError, LampParseError)
+
+
+# ------------------------------------------- Pacific 09Z-grid cycle (B0-fix2 D2)
+
+#: station -> (derived fixture, issued_at, {local date: MAX}). The raw refused products were never
+#: retained, so these are DERIVED (see the fixture header): the Pacific 09Z-grid cycle ends its
+#: 3hrly table on a Thursday 17 PDT, so the 6hrly table opens with a one-column block that has no
+#: room for a date label.
+PACIFIC_MORNING_PFM = {
+    "KLAX": (
+        "pfm_lox_derived_0900z_grid_20261006.txt",
+        dt.datetime(2026, 10, 6, 11, 12, tzinfo=UTC),
+        {
+            D(2026, 10, 6): 88,
+            D(2026, 10, 7): 90,
+            D(2026, 10, 8): 84,
+            D(2026, 10, 9): 82,
+            D(2026, 10, 10): 80,
+            D(2026, 10, 11): 79,
+            D(2026, 10, 12): 77,
+        },
+    ),
+    "KSFO": (
+        "pfm_mtr_derived_0900z_grid_20261006.txt",
+        dt.datetime(2026, 10, 6, 11, 10, tzinfo=UTC),
+        {
+            D(2026, 10, 6): 74,
+            D(2026, 10, 7): 76,
+            D(2026, 10, 8): 71,
+            D(2026, 10, 9): 70,
+            D(2026, 10, 10): 69,
+            D(2026, 10, 11): 68,
+            D(2026, 10, 12): 67,
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("station", sorted(PACIFIC_MORNING_PFM))
+def test_pacific_evening_pfm_date_labels_parse(station: str) -> None:
+    name, issued, expected = PACIFIC_MORNING_PFM[station]
+    point = parse_pfm_product(
+        _fixture_text(name).encode(),
+        station=station,
+        reference_time=issued + dt.timedelta(seconds=1),
+    )
+    assert point.issued_at == issued
+    assert dict(point.max_by_day) == expected
+
+
+def test_pacific_one_column_first_block_still_refuses_a_wrong_later_label() -> None:
+    raw = _fixture_text(PACIFIC_MORNING_PFM["KLAX"][0]).encode()
+    wrong = raw.replace(b"Sat 10/10/26", b"Sat 10/11/26")
+    assert wrong != raw
+    with pytest.raises(PfmParseError) as err:
+        parse_pfm_product(wrong, station="KLAX", reference_time=PACIFIC_MORNING_PFM["KLAX"][1])
+    assert err.value.reason == "date_label_mismatch"
