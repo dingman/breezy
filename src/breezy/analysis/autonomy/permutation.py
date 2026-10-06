@@ -146,8 +146,11 @@ def date_cluster_signflip(
         return PermutationResult(hits / total, METHOD_EXACT, statistic, n_dates, total, False)
 
     draws = draw_count(alpha) if b is None else b
-    if draws <= 0:
-        raise ValueError(f"b must be positive, was {b!r}")
+    if b is not None and b < required_draws(alpha):
+        raise ValueError(
+            f"b={b} is below required_draws({alpha}) = {required_draws(alpha)}; "
+            "pass b=None to resolve it automatically"
+        )
     if draws > BOOTSTRAP_B_MAX or (b is None and required_draws(alpha) > BOOTSTRAP_B_MAX):
         bound = math.exp(-(observed_sum**2) / (2.0 * sum_squares)) if observed_sum > 0.0 else 1.0
         return PermutationResult(bound, METHOD_HOEFFDING_TAIL, statistic, n_dates, 0, True)

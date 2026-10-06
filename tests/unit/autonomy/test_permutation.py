@@ -95,9 +95,9 @@ def test_one_sided_a_negative_effect_is_never_significant() -> None:
 
 def test_chunking_does_not_change_the_result(monkeypatch: pytest.MonkeyPatch) -> None:
     effect = _effect(30, 0.5)
-    whole = permutation.date_cluster_signflip(effect, alpha=0.025, seed=4, b=5_000)
+    whole = permutation.date_cluster_signflip(effect, alpha=0.025, seed=4, b=10_000)
     monkeypatch.setattr(permutation, "CHUNK_FLIPS", 777)
-    chunked = permutation.date_cluster_signflip(effect, alpha=0.025, seed=4, b=5_000)
+    chunked = permutation.date_cluster_signflip(effect, alpha=0.025, seed=4, b=10_000)
     # Different chunking consumes the generator differently, so exact equality is not promised;
     # both must be valid Monte-Carlo estimates of the same p.
     assert abs(whole.p_value - chunked.p_value) < 0.03
@@ -130,6 +130,19 @@ def test_rows_within_a_date_are_summed_not_resampled() -> None:
     """Moving a difference between dates changes the result; reordering inside a date does not."""
     effect = _effect(30, 0.4)
     reordered = {d: list(reversed(v)) for d, v in effect.items()}
-    a = permutation.date_cluster_signflip(effect, alpha=0.025, seed=3, b=4_000)
-    b = permutation.date_cluster_signflip(reordered, alpha=0.025, seed=3, b=4_000)
+    a = permutation.date_cluster_signflip(effect, alpha=0.025, seed=3, b=10_000)
+    b = permutation.date_cluster_signflip(reordered, alpha=0.025, seed=3, b=10_000)
     assert a.p_value == pytest.approx(b.p_value, abs=1e-12)
+
+
+def test_explicit_b_below_required_draws_is_refused() -> None:
+    effect = _effect(30, 0.5)
+    below = permutation.required_draws(0.025) - 1
+    with pytest.raises(ValueError, match="required_draws"):
+        permutation.date_cluster_signflip(effect, alpha=0.025, seed=1, b=below)
+    ok = permutation.date_cluster_signflip(
+        effect, alpha=0.025, seed=1, b=permutation.required_draws(0.025)
+    )
+    assert ok.p_method == permutation.METHOD_MONTE_CARLO
+    auto = permutation.date_cluster_signflip(effect, alpha=0.025, seed=1)
+    assert auto.draws == permutation.draw_count(0.025)

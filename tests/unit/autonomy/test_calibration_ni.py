@@ -158,3 +158,34 @@ def test_unpaired_or_mismatched_inputs_are_refused() -> None:
         ni.relative_calibration_ni(flipped, champ, _dates(100), _ALPHA, _MARGIN, 1, 100)
     with pytest.raises(ValueError):
         ni.relative_calibration_ni([], [], [], _ALPHA, _MARGIN, 1, 100)
+
+
+def test_non_integer_bucket_key_raises_type_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, champ = _rows(300, bias=0.0)
+    monkeypatch.setattr(ni, "bin_by_edges", lambda edges: lambda p: "bucket")
+    with pytest.raises(TypeError, match="bucket"):
+        ni.relative_calibration_ni(champ, champ, _dates(300), _ALPHA, _MARGIN, 1, 100)
+
+
+def test_dropped_nan_bootstrap_draws_are_counted_and_exposed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cand, champ = _rows(1500, bias=0.05, seed=2)
+    clean = ni.relative_calibration_ni(cand, champ, _dates(1500), _ALPHA, _MARGIN, 3, 500)
+    assert clean.n_draws_dropped == 0
+    real = ni._ece
+    calls = {"n": 0}
+
+    def flaky(n, p, y, paired):  # type: ignore[no-untyped-def]
+        out = real(n, p, y, paired)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            out = out.copy()
+            out[:7] = np.nan
+        return out
+
+    monkeypatch.setattr(ni, "_ece", flaky)
+    stat = ni.relative_calibration_ni(cand, champ, _dates(1500), _ALPHA, _MARGIN, 3, 500)
+    assert stat.n_draws_dropped == 7
+    verdict = ni.evaluate_calibration_ni(cand, champ, _dates(1500), _ALPHA, _MARGIN, 3, 3, 500)
+    assert hasattr(verdict, "n_draws_dropped")

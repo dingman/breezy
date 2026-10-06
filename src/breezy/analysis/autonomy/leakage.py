@@ -8,11 +8,13 @@ from __future__ import annotations
 import datetime as dt
 from typing import Final
 
+from breezy.analysis.stats.scoring_core import LeakageError
+
 #: Forward screening and shadow evaluation use climate days on or after this date (§3.5).
 FIRST_FORWARD_DAY: Final[dt.date] = dt.date(2026, 10, 2)
 
 
-class LeakageViolation(RuntimeError):
+class LeakageViolation(LeakageError):
     """An input would let an evaluation see information it could not have had."""
 
 

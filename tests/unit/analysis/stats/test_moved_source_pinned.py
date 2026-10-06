@@ -243,20 +243,11 @@ _WRAPPER_CASES = [(m, f, names) for (m, f), names in WRAPPERS.items()]
 def test_script_wrappers_delegate(module: str, script: str, names: tuple[str, ...]) -> None:
     stats = importlib.import_module(f"breezy.analysis.stats.{module}")
     wrapper = _load_script(script)
-    redefined = _top_level_names(_SCRIPTS_DIR / script) & set(names)
-    # A moved name may be imported into the script but never defined there.
     for name in names:
         assert getattr(wrapper, name) is getattr(stats, name), (
             f"{script}:{name} is not the stats object"
         )
-    assert not redefined or all(getattr(wrapper, n) is getattr(stats, n) for n in redefined), (
-        "script redefines a moved name"
-    )
-    defined_here = {
-        n.name
-        for n in ast.parse((_SCRIPTS_DIR / script).read_text()).body
-        if isinstance(n, (ast.FunctionDef, ast.ClassDef))
-    } & set(names)
+    defined_here = _top_level_names(_SCRIPTS_DIR / script) & set(names)
     assert not defined_here, f"{script} still defines moved definitions: {sorted(defined_here)}"
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass
 from typing import Final
 
@@ -14,6 +15,7 @@ from breezy.persistence.autonomy.pins import (
 
 NS_PER_S: Final[int] = 1_000_000_000
 SECONDS_PER_HOUR: Final[int] = 3_600
+_SLOT_RE: Final[re.Pattern[str]] = re.compile(r"(?P<hour>[01]\d|2[0-3]):(?P<minute>[0-5]\d)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,9 +29,16 @@ class ForwardWindow:
 
 def slot_start_ns(slot_date: dt.date, slot_utc: str) -> int:
     """Epoch ns of ``slot_date`` at ``slot_utc`` (``"HH:MM"``), the unit's ``OnCalendar``."""
-    hour, minute = slot_utc.split(":")
+    match = _SLOT_RE.fullmatch(slot_utc)
+    if match is None:
+        raise ValueError(f"slot_utc must be 'HH:MM' (00:00-23:59), was {slot_utc!r}")
     start = dt.datetime(
-        slot_date.year, slot_date.month, slot_date.day, int(hour), int(minute), tzinfo=dt.UTC
+        slot_date.year,
+        slot_date.month,
+        slot_date.day,
+        int(match["hour"]),
+        int(match["minute"]),
+        tzinfo=dt.UTC,
     )
     return int(start.timestamp()) * NS_PER_S
 

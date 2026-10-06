@@ -39,6 +39,8 @@ REASON_BUCKETS_BELOW_MIN: Final[str] = "calibration_buckets_below_min"
 class NIStatistic(NamedTuple):
     ece_diff_ub: float
     n_buckets_paired: int
+    #: Bootstrap draws discarded because no paired-bucket event survived the resample.
+    n_draws_dropped: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,7 @@ class NIVerdict:
     reason: str | None
     ece_diff_ub: float | None
     n_buckets_paired: int
+    n_draws_dropped: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +91,8 @@ def _stats(rows: Sequence[tuple[float, bool]], date_index: Sequence[int], n_date
     y = np.zeros((n_dates, _N_BUCKETS))
     for (prob, outcome), d in zip(rows, date_index, strict=True):
         b = key(prob)
-        assert isinstance(b, int)
+        if not isinstance(b, int):
+            raise TypeError(f"bucket key must be an int index, was {b!r}")
         n[d, b] += 1.0
         p[d, b] += prob
         y[d, b] += float(bool(outcome))
@@ -154,11 +158,12 @@ def relative_calibration_ni(
         diffs.append(ece_c - ece_h)
         remaining -= chunk
     draws = np.concatenate(diffs)
+    n_dropped = int(np.count_nonzero(np.isnan(draws)))
     draws = draws[~np.isnan(draws)]
     if draws.size == 0:
-        return NIStatistic(float("nan"), n_paired)
+        return NIStatistic(float("nan"), n_paired, n_dropped)
     upper = float(np.quantile(draws, 1.0 - alpha, method="higher"))
-    return NIStatistic(upper, n_paired)
+    return NIStatistic(upper, n_paired, n_dropped)
 
 
 def evaluate_calibration_ni(
@@ -180,11 +185,19 @@ def evaluate_calibration_ni(
     stat = relative_calibration_ni(cand, champ, dates, alpha, margin, seed, b)
     if stat.n_buckets_paired < min_buckets or np.isnan(stat.ece_diff_ub):
         return NIVerdict(
-            OUTCOME_INCONCLUSIVE, REASON_BUCKETS_BELOW_MIN, None, stat.n_buckets_paired
+            OUTCOME_INCONCLUSIVE,
+            REASON_BUCKETS_BELOW_MIN,
+            None,
+            stat.n_buckets_paired,
+            stat.n_draws_dropped,
         )
     holds = stat.ece_diff_ub < margin
     return NIVerdict(
-        OUTCOME_HOLDS if holds else OUTCOME_FAILS, None, stat.ece_diff_ub, stat.n_buckets_paired
+        OUTCOME_HOLDS if holds else OUTCOME_FAILS,
+        None,
+        stat.ece_diff_ub,
+        stat.n_buckets_paired,
+        stat.n_draws_dropped,
     )
 
 

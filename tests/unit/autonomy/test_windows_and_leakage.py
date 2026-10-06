@@ -90,3 +90,17 @@ def test_reference_must_be_strictly_before_the_decision() -> None:
     for ref, decision in ((2, 2), (3, 2)):
         with pytest.raises(leakage.LeakageViolation):
             leakage.assert_reference_before_decision(ref, decision)
+
+
+@pytest.mark.parametrize("bad", ["", "11", "11:00:00", "ab:cd", "24:00", "11:60", "-1:00"])
+def test_malformed_slot_string_raises_named_value_error(bad: str) -> None:
+    with pytest.raises(ValueError, match="slot_utc"):
+        windows.slot_start_ns(dt.date(2026, 10, 6), bad)
+
+
+def test_leakage_violation_is_a_scoring_core_leakage_error() -> None:
+    from breezy.analysis.stats.scoring_core import LeakageError
+
+    assert issubclass(leakage.LeakageViolation, LeakageError)
+    with pytest.raises(LeakageError):
+        leakage.assert_reference_before_decision(2, 2)
