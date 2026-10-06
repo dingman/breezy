@@ -607,3 +607,42 @@ I wrote no files. This is a read-only design for the implementer briefs.
 Verified this round with codegraph and grep: `MINIMUM_PUBLICATION_LAG_NS` at `forecast_point.py:165`; `PUBLICATION_LAG_FLOOR_NS` at `nbp_derived_store.py:81`; `launch_window_guard` at `capture_schedule.py:36`; `seconds_outside_launch_window` at `:54`; `iem_mos_request` at `archive_cache.py:211`; the `archive_request.py` re-export module; `_SOURCE_PATTERN` at `archive_cache.py:62`; `BANNED_EXEC_TRANSPORT_MODULES` at `:1862` used at `:2310`; `bwrap_ok` at `run_tests_no_egress.sh:60`; `root_packages` at `pyproject.toml:71`. The IEM station and path line numbers are corrected from r2 (`:58-59` and `:62`).
 
 Not re-verified: the `pins.py:96` ARCH-0 citation, the `MINIMUM_PUBLICATION_LAG_NS` keys for LAMP, GFS MOS and PFM, and `ArchiveCache`'s existing write API for the `-r<N>` product suffix. The last should be checked against `_PRODUCT` validation before the revision store is built.
+
+---
+
+## r3.1 amendments: round-3 rulings F13-R22..R29 (coordinator, 2026-10-06). BINDING over any conflicting r3 text above.
+
+Round 3: security NOT-READY (2 blockers), stats NOT-READY (2), architecture NOT-READY (4). Every blocker had one-paragraph fix text; it is adopted verbatim below. The plan is r3 + these amendments ("r3.1"). Implementer briefs cite both.
+
+- **F13-R22 (M6 scope; security BLOCK-1).** M6(a) scans every `.py` under `scripts/collect/` and `src/breezy/ingest/mdl_lamp_transport.py`. It also scans every `.py` under `scripts/venue/` and `src/breezy/ingest/` that is not in `M6_PREEXISTING_BASELINE`: a recorded, additive-never-shrinking list of file paths with sha256, committed in the test and frozen at this change. Any file absent from the baseline is scanned automatically, with no registration step. The transitive closure from `us_source_collector.py`, `iem_mos_probe_transport.py`, `us_source_availability.py` and the parser modules must be clean. Tests: `test_m6_baseline_excludes_c1_closure`; `test_scripts_collect_exists_and_is_non_empty`. The reverse test scans `src/breezy/exec`, `src/breezy/runtime` and `src/breezy/adapters` by directory. The x1-pin test names the exact pin and baseline location (`test_execution_egress_firewall_guard.py`, implementer cites line).
+- **F13-R23 (H5 probe; security BLOCK-2).** The probe skips only when a dedicated `bwrap_profile_ok` fails. That helper runs the exact C1 argument list with `true` as the command and skips with the recorded stderr as the reason. The probe asserts only: (a) `~/.config/breezy` and the credential env names are absent; (b) a write outside the archive dir fails; (c) `alerts.env` is present and read-only-mounted; (d) the alert sink is a path or config key, with no network call; (e) the real collector `--help` entry executes under the profile. Sink reachability is a separate timer-time check, never run in pytest. Per-method byte caps and the `RuntimeMaxSec` margin are frozen under OPEN-5.
+- **F13-R24 (B2 verdict rule; stats BLOCK-1).** The verdict is computed on mean realised net EV per take, clustered by climate day.
+  - FUTILE: the one-sided 97.5 % upper bound is below the pre-registered minimum useful edge, or the 60 s STOP fires.
+  - NOT-FUTILE: the one-sided 97.5 % lower bound is above 0 AND the point estimate is at least the minimum useful edge.
+  - Otherwise INCONCLUSIVE.
+  - The minimum useful edge, minimum n and take count are frozen in the B1/B2 prereg.
+  - Test: `test_b2_verdict_rule_boundaries`.
+  - The B2 signal direction is sign(source value − the same source's previous vintage). Price enters only at fill and cost.
+  - "The move" is the t+60-min level versus the pre-release level, with a pre-registered minimum move size. It is aggregated by the median across events per source.
+  - θ is read from the live pinned value, never hard-coded.
+- **F13-R25 (Phase A floor; stats BLOCK-2).** ACCEPT requires the one-sided 97.5 % LB of CRPS(M0′) − CRPS(M3) ≥ floor AND the LB of CRPS(M0) − CRPS(M3) ≥ floor. The +60-min lag rerun requires LB ≥ 0 (not just the sign) and reports the rows lost. Rename the acceptance test to assert LB ≥ floor for both comparisons.
+- **F13-R26 (stats nits).**
+  - B0 fixes the B1 family size before the read. If NBP vintages are absent, the family is PFM alone at α = 0.025.
+  - A rung missing at t+Δ is carried forward at its last quote, with the dropout count reported per arm. The ladder is never renormalised.
+  - `late` rows are counted per source beside the frozen lag, and each source needs a minimum number of uncensored samples (OPEN-5) before its 14-day freeze counts.
+- **F13-R27 (archive module; arch BLOCK-1).** `US_SOURCE_PRODUCTS` and the four new request factories live in a NEW module, `src/breezy/persistence/us_source_request.py`, which constructs `ArchiveRequest`. They are re-exported via `archive_request.py`. `archive_cache.py` is byte-unchanged, and its EDIT row is deleted.
+- **F13-R28 (revision compare; arch BLOCK-2).**
+  - Compare the fetched sha256 against the set of digests of ALL stored revisions for `(source, run_ts)`. Append only if the digest is absent from that set.
+  - N = 1 + the highest existing revision, computed under the source's unit-level flock.
+  - The write goes through `ArchiveCache(fetch=<closure returning the already-fetched bytes>).get_or_fetch` on a key verified `missing()` (the only write API). `get_or_fetch` is the write path, never the comparison; rename the test accordingly.
+  - `window_end = run_ts + 1 ns`. The first-seen revision is `-r0` (the `-r<N>` suffix is accepted by `ArchiveRequest`, verified).
+  - Test: `test_identical_repoll_after_revision_appends_nothing`.
+- **F13-R29 (floor vs lag, NBP poll; arch BLOCK-3/4, nits).**
+  - `MINIMUM_PUBLICATION_LAG_NS` is a sanity floor only, never the backtest lag. Rows with no observed time take basis `nominal_plus_conservative_lag`, with the prereg conservative lag (GFS MOS ≥ 5 h, LAMP ≥ 60 min). That lag must be ≥ the floor and ≥ the C1-measured maximum where one exists.
+  - LAMP and PFM get no key in `MINIMUM_PUBLICATION_LAG_NS`; their floor lives in the prereg A0 table. Test: `test_unmeasured_row_uses_conservative_lag_not_minimum_floor`.
+  - The NBP observation calls the unmodified `fetch_nbp_bulletin`. Polling stops for a cycle after its first success. `host_tag` = `result.source_host`, and the basis is `measured_header@s3|nomads` from `last_modified`. The `stations` constructor argument includes KNYC, and the module default is not edited.
+  - B0's vintage check reads the node catalog's `ForecastPoint` rows for `NBM_NBP`.
+  - `TRANSPORT_ERROR_CONSTRUCTORS` lives in the contract test (`:65`). Parser refusal classes never subclass `CliParseError` or `CliSanityError`.
+  - The KNYC widening updates any pinned 4-tuple test as a WIDENED row, never relaxing it.
+
+Next: a confirmation-only round 4 on r3 + r3.1 (the same three reviewers, checking only R22..R29 and regressions). READY on all three marks F13 READY and opens the F13-C1 queue row.
