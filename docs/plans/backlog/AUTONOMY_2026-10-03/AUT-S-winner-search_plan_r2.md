@@ -636,3 +636,38 @@ r2 applies all 11 rulings. No file was written. Things you should know before fi
   - AS-R8's network denial is tested by its effect (a socket connect fails), because systemd `--user` sandbox directives may be no-ops on this host.
 - **The effect-size mapping needs stats-peer confirmation.** The AS-R5 synthetic-ask edge proxy has no existing code to match. This is OPEN-R2-2.
 - **The alert forwarder is unconfirmed.** I did not verify that any forwarding unit accepts a non-capture outbox event. This is OPEN-R2-3, and it blocks Phase 3.
+---
+
+## Convergence review (stats, 2026-10-06) and coordinator rulings AS-R12..R16 (binding; these supersede conflicting r2 text)
+
+- **AS-R12 (B1), negative control: an aggregate criterion.**
+  - The shuffled-label control runs `S_neg` = 20 pre-declared seeds per spec.
+  - The run is UNUSABLE only if more than `ceil(0.05·S_neg·K_tested) + 3·sqrt(0.05·0.95·S_neg·K_tested)` of the take-band Δ 95% intervals exclude 0 across all (seed, spec) pairs.
+  - This replaces r2's "every per-spec interval covers 0". That rule gave a false-UNUSABLE rate of about 58%.
+  - Test: `test_negative_control_aggregate_binomial_tolerance`.
+- **AS-R13 (B2), mint statistic and family α.**
+  - The mint rule's LB, SPA and same-sign tests run on the **take-band Δ of the live NBM version** (v5.0 today).
+  - Other versions are reported but are informational only.
+  - The family α is **0.05 one-sided** for the LB, Bonferroni at the cap: α/48 one-sided.
+  - The MDE formula uses the same one-sided α/48: `(z_{1−0.05/48} + z_{0.80})·SE`.
+  - Test: `test_mint_statistic_is_live_version_take_band_one_sided`.
+- **AS-R14 (B3): Lane S never mints for v5 under the current data window.**
+  - v5 has 58 climate days, split into 2 folds of 29. That is a different estimator regime from the deployed 58-day fit. Same-sign across 2 folds is about a 25% coin-flip under the null, and an MDE of about 4 SE is far beyond any CDF or window tweak.
+  - §Lane S and §Feasibility are read to say: **for the live version, Lane S is G2-informational and reject-only. The mint rule cannot fire until a new data window is separately ruled.** A new window would touch post-07-01 holdout days, so it needs its own ruling.
+  - The r2 "unlikely to clear" wording is withdrawn as too soft.
+- **AS-R15 (B4): restore `test_multisource_consumes_no_execution_data`** (r1 line 120) as a [P2] test for every G2 spec.
+- **AS-R16, the non-blocking items:**
+  - **OPEN-R2-2 is resolved.** The synthetic-ask proxy is a flag only, with these properties:
+    - it is measured in ROI against the `compute_roi_bound` detectable ROI at projected forward takes;
+    - the fee is charged at the ask, with the ask rounded up to the tick;
+    - it covers both sides;
+    - it flags on the day-cluster bootstrap UB;
+    - absence of the flag implies nothing.
+  - **Phase 0 runs 0.3 first.** Steps 0.2 and 0.5 run only if G2 ≠ ∅.
+  - **The 28-day Lane E STOP is a floor, not a sufficiency claim.**
+  - **The leak flag needs a fold-count floor:** at least 3 folds, otherwise it reports `HELD_LEAK_AUDIT` on any Δ beyond 2 SE of the champion.
+  - **Two stale test names are renamed** to match their content: `test_spa_matches_m1_scan_day_block` and `test_timer_outside_1600_1730z`.
+
+**Status: READY.** Build starts at Phase 0, and only the read-only steps run first. Phase 1 may build after Phase 0 evidence is committed. Phase 2 and later remain conditional, per AS-R3.
+
+**Programme consequence (coordinator):** AUT-S cannot produce a live-deployable winner before the 2027-01-25 KILL. The binding winner-search lever is **new US weather data (F13 / G2)**. F13 planning is raised accordingly once Phase 0 step 0.3 reports.
