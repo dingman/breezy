@@ -1,0 +1,39 @@
+[Unit]
+# FQ loss response F2 (FQ-LOSS-RESPONSE_plan_r3.md, section "F2 FQ-TRUTH", FQ-R18):
+# the OFFLINE truth dataset. It reads the latest valid AFOS CLI revision per station
+# from the cache the fetch unit fills, writes truth_cli_finals.csv and coverage.json
+# (with the explicit coverage_gap field) under derived/fq-truth, and NEVER fetches: a
+# station with no valid revision is a refusal (exit 2), not a request. It therefore
+# has no network ordering (no After=network-online) and reads no credential.
+#
+# PARKED: committed but NOT installed. The coordinator installs and enables it only
+# after the full gate reads EXIT=0.
+Description=Breezy offline AFOS CLI truth dataset (FQ loss response F2)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/archive/iem_cli_fetch.py
+
+# AUD-15a: alert on failure (timeout, OOM-kill or non-zero exit, including a refusal).
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+Slice=breezy-studies.slice
+UMask=0077
+
+MemoryHigh=1G
+MemoryMax=1536M
+
+# alerts.env is the ONLY environment file (see breezy-truth-fetch.service).
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/archive/iem_cli_fetch.py dataset
+
+# Five station bodies parsed once each: well under a minute. Bounded both ways.
+TimeoutStartSec=600
+RuntimeMaxSec=900
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-truth-dataset
+
+# NOTE: no [Install] section. Started BY the timer; enable only the timer.

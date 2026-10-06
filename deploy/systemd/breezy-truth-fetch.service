@@ -1,0 +1,48 @@
+[Unit]
+# FQ loss response F2 (docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/
+# FQ-LOSS-RESPONSE_plan_r3.md, section "F2 FQ-TRUTH", FQ-R18): the daily AFOS CLI
+# truth fetch. It is the ONLY writer of the AFOS CLI cache revisions
+# (<settlement-alignment-cache>/afos-cli/<LOC>/). Egress is a public HTTPS GET to
+# mesonet.agron.iastate.edu through the paced IEM transport and nothing else.
+#
+# PARKED: committed but NOT installed. The coordinator symlinks it, runs
+# `systemctl --user daemon-reload` and `enable --now breezy-truth-fetch.timer` only
+# after the full gate reads EXIT=0, and records all three in the slice's evidence.
+Description=Breezy daily IEM AFOS CLI truth fetch (FQ loss response F2)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/archive/iem_cli_fetch.py
+After=network-online.target
+Wants=network-online.target
+
+# AUD-15a: alert on failure (timeout, OOM-kill or non-zero exit).
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+Slice=breezy-studies.slice
+UMask=0077
+
+# Own cgroup ceiling (imports the settlement-alignment study + nautilus catalog
+# reader for the catalog cross-check; it holds one station body at a time).
+MemoryHigh=1G
+MemoryMax=1536M
+
+# alerts.env is the ONLY environment file: a single non-secret webhook key. Never
+# polymarket.env, breezy-trade.env or operator.env -- this unit holds no venue
+# credential and the script reads no environment variable.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/archive/iem_cli_fetch.py fetch
+
+# Five stations, one paced request each (3 attempts, 30 s/60 s backoff): minutes
+# at worst. Both bounds are set so neither a hang nor a slow trickle can run on.
+TimeoutStartSec=900
+RuntimeMaxSec=1200
+
+# No Restart=. A missed day is recovered by the next run, whose window is
+# [window_start, fetch_date - 1] and so re-covers every missed day.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-truth-fetch
+
+# NOTE: no [Install] section. Started BY the timer; enable only the timer.

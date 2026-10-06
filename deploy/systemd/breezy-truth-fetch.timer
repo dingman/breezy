@@ -1,0 +1,21 @@
+[Unit]
+Description=11:40 UTC trigger for the Breezy daily IEM AFOS CLI truth fetch
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/archive/iem_cli_fetch.py
+
+[Timer]
+Unit=breezy-truth-fetch.service
+
+# 11:40 UTC: every venue station's D-1 CLI final is long published (the latest, the
+# west-coast station, closes its climate day at 08:00Z), the tick is free on the
+# existing schedule (tests/unit/test_deploy_timer_hours.py), and it is far outside
+# the 16:30-17:10Z launch window (tests/unit/test_launch_window_table.py).
+OnCalendar=*-*-* 11:40:00 UTC
+
+# A run missed while the host was down fires when the timer is next active.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

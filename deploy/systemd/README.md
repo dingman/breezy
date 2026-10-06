@@ -1886,3 +1886,40 @@ failure to UNKNOWN (health) or CRITICAL (failed@, daily). stderr carries a reaso
 `python -I -m breezy.runtime.autonomy_sandbox.selftest_cli --bus-snapshot` prints each read's `rc`
 and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer `timeout` it prints
 `"bus_snapshot": "bus_snapshot_missing"` (V21).
+
+## `breezy-truth-fetch` / `breezy-truth-dataset` — AFOS CLI truth cache (FQ loss response F2, 2026-10-06, PREPARED, NOT ACTIVATED)
+
+| Unit | Tick (UTC) | Script | Egress | Bounds |
+|---|---|---|---|---|
+| `breezy-truth-fetch.{service,timer}` | 11:40 | `scripts/archive/iem_cli_fetch.py fetch` | HTTPS GET to `mesonet.agron.iastate.edu` only (`IEM_ALLOWED_HOSTS`, paced) | `MemoryHigh=1G`/`MemoryMax=1536M`, `TimeoutStartSec=900`, `RuntimeMaxSec=1200` |
+| `breezy-truth-dataset.{service,timer}` | 12:40 | `scripts/archive/iem_cli_fetch.py dataset` | none (offline; a cache miss is a refusal, exit 2) | `MemoryHigh=1G`/`MemoryMax=1536M`, `TimeoutStartSec=600`, `RuntimeMaxSec=900` |
+
+- **Owner and activation.** The units are committed parked. The coordinator symlinks them into
+  `~/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then
+  `systemctl --user enable --now breezy-truth-fetch.timer breezy-truth-dataset.timer`, only after the
+  full gate reads `EXIT=0`, and records all three steps in the slice's evidence file (FQ-R12, FQ-R18).
+  Nothing in the commit installs or enables them.
+- **Single writer.** The fetch unit is the only writer of `<settlement-alignment-cache>/afos-cli/<LOC>/`
+  (default `~/.local/share/breezy/archive/settlement-alignment-cache`). Each run asks for the window
+  `[2026-01-01, D-1]` under a day-bounded URL (the window end moves with the fetch date). A revision is
+  `<fetch_date>.json` (commit marker: body sha256, label days, catalog cross-check) plus
+  `<fetch_date>.<sha12>.txt`, written under an exclusive non-blocking `flock` by temp file, `fsync` and
+  atomic rename. A body that does not parse to CLI products, or whose climate-day coverage is smaller
+  than the latest valid revision's, is rejected (logged in `rejected.jsonl`) and never becomes a
+  revision. `settlement_alignment_study.fetch_text_cached`/`fetch_bytes_cached` are cache-read-only for
+  AFOS CLI URLs (a miss raises `AfosCliCacheMissError`).
+- **Reading.** The reader takes the newest revision whose marker parses and whose body still hashes to
+  the recorded sha256. The cross-check against the catalog CLI finals is recorded per revision as
+  `catalog_disagreement` (never an exit failure).
+- **Dataset output.** `~/.local/share/breezy/derived/fq-truth/truth_cli_finals.csv` and `coverage.json`.
+  `coverage.json` carries `coverage_gap_days` and, per station, `coverage_gap` (the climate days in
+  `[2026-01-01, D-1]` with no final), always present and never omitted when zero. This output is separate
+  from `derived/settlement-truth` (the 2021-2025 archive dataset) and does not replace it.
+- **Environment.** `EnvironmentFile=-%h/.config/breezy/alerts.env` only; the script reads no
+  environment variable and no venue or operator file. No sandbox claim is made for these user units.
+- **Exit codes.** 0 complete, 1 a station failed (rejected, HTTP or transport error), 2 dataset refusal,
+  3 aborted (budget exhausted or another writer holds the lock). Non-zero fires
+  `breezy-study-failed@%n.service`.
+- **Launch window.** 11:40 and 12:40 are outside 16:30-17:10Z
+  (`tests/unit/test_launch_window_table.py`) and free of every other timer tick
+  (`tests/unit/test_deploy_timer_hours.py`).
