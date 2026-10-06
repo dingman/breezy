@@ -14,7 +14,6 @@ from typing import Any
 
 import pytest
 
-from breezy.analysis.labeling import fill_source
 from breezy.analysis.labeling.fill_source import (
     FillRead,
     FillStoreCorruption,

@@ -1,8 +1,8 @@
 """AUT-2 r7 WP2 / section 3.12: every durable fill lands in exactly one bucket, every run.
 
 ``C2_FINAL + C2_NONFINAL + UNRESOLVED + MISSING_LABEL == durable_fill_count`` and the last two
-buckets are zero, or the run is FAILED_IDENTITY. ``test_legacy_crh_fills_labelled_by_legacy_scorer``
-belongs to the WP3 commit, where ``LegacyCrhScorer`` lands.
+buckets are zero, or the run is FAILED_IDENTITY. ``LegacyCrhScorer`` rows count as final and as
+``legacy_labelled`` (WP3).
 """
 
 from __future__ import annotations
@@ -255,3 +255,32 @@ def test_run_outcome_vocabulary_and_open_versus_pending() -> None:
             unresolved_fill_keys=frozenset({"x"}),
             n_undecodable=-1,
         )
+
+
+def test_legacy_crh_fills_labelled_by_legacy_scorer() -> None:
+    from breezy.analysis.labeling.legacy_crh_scorer import (
+        LEGACY_SCORER_ID,
+        LegacyCrhScorer,
+        LegacyFillInput,
+    )
+
+    buys = [
+        durable_fill(venue_order_id=f"vo-{n}", client_order_id=f"O-{n}", ts_event=NOW - 5 * _H)
+        for n in (1, 2)
+    ]
+    sell = durable_fill(
+        venue_order_id="vo-3", client_order_id="O-3", order_side="SELL", ts_event=NOW - 4 * _H
+    )
+    fills = [*buys, sell]
+    inputs = [
+        LegacyFillInput(fill=f, label_family="pm_us_crh_v4", trial_id=f"t-{i}", scored=None)
+        for i, f in enumerate(fills)
+    ]
+    rows = LegacyCrhScorer(now_ns=NOW, prior=()).label(None, inputs, None)
+
+    coverage = coverage_partition(
+        fills, rows, now_ns=NOW, deadline_ns=_deadline, legacy_scorer_ids={LEGACY_SCORER_ID}
+    )
+
+    assert (coverage.c2_final, coverage.legacy_labelled, coverage.missing_label) == (3, 3, 0)
+    assert identity_breaches(coverage, durable_fill_count_prev=None) == ()
