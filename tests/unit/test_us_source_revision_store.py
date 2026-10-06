@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -263,14 +264,17 @@ def test_validator_runs_before_the_write_and_a_refusal_leaves_no_orphan(tmp_path
         raise _ParseRefused("bad row")
 
     store = _store(tmp_path, validator=validator)
-    with pytest.raises(_ParseRefused):
+    with pytest.raises(RevisionPayloadRefusedError) as info:
         _append(store, V0)
 
+    assert isinstance(info.value.__cause__, _ParseRefused)
     assert seen == [V0]
     assert _no_files_written(tmp_path)
 
 
-def test_validator_is_not_consulted_for_an_unchanged_repoll_after_a_pass(tmp_path: Path) -> None:
+def test_validator_runs_on_every_poll_but_an_unchanged_repoll_writes_nothing(
+    tmp_path: Path,
+) -> None:
     calls: list[int] = []
     store = _store(tmp_path, validator=lambda p: calls.append(len(p)))
     _append(store, V0)
@@ -383,3 +387,78 @@ def test_revision_store_refusals_are_not_transport_cli_parse_or_cli_sanity_error
     for refusal in refusals:
         assert not issubclass(refusal, (TransportError, CliParseError, CliSanityError))
         assert issubclass(refusal, Exception)
+
+
+def test_validator_store_error_passes_through_unwrapped(tmp_path: Path) -> None:
+    def validator(_payload: bytes) -> None:
+        raise RevisionStoreBusyError("own refusal")
+
+    with pytest.raises(RevisionStoreBusyError):
+        _append(_store(tmp_path, validator=validator), V0)
+
+
+def test_only_decode_and_csv_errors_are_wrapped_as_payload_refusals(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(RevisionPayloadRefusedError, match="UTF-8 or CSV"):
+        _append(store, b"\xff\xfe")
+    with pytest.raises(RevisionPayloadRefusedError):
+        store.append_if_new(
+            source=SOURCE,
+            station="KSFO",
+            run_ts_ns=RUN_TS,
+            model="MTR",
+            payload="str",  # type: ignore[arg-type]
+        )
+
+
+def test_a_second_thread_entering_a_locked_instance_is_refused(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    outcome: list[BaseException | None] = []
+
+    def other_thread() -> None:
+        try:
+            _append(store, V1)
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+
+    with store.unit_lock(SOURCE):
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        thread.join()
+        _append(store, V0)  # the owner thread still re-enters
+
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], RevisionStoreBusyError)
+    assert _revisions(store) == ((0, _sha(V0)),)
+
+
+def test_lock_is_released_for_another_thread_after_the_owner_leaves(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _append(store, V0)
+    results: list[Any] = []
+    thread = threading.Thread(target=lambda: results.append(_append(store, V1)))
+    thread.start()
+    thread.join()
+    assert results[0].outcome is AppendOutcome.APPENDED
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "{}",
+        '{"sha256": "a"}',
+        "[1]",
+        '{"sha256": 1, "station": "K", "run_ts_ns": 1, "base_product": "pfm"}',
+    ],
+)
+def test_malformed_quarantine_row_is_an_integrity_error_not_a_keyerror(
+    tmp_path: Path, line: str
+) -> None:
+    store = _store(tmp_path, outlier_probe=_probe(9.0), outlier_threshold_f=5.0)
+    (tmp_path / SOURCE).mkdir()
+    (tmp_path / SOURCE / "quarantine.jsonl").write_text(line + "\n")
+    with pytest.raises(store_module.RevisionStoreIntegrityError):
+        store.quarantined_count(SOURCE, "KSFO", RUN_TS, BASE)
+    with pytest.raises(store_module.RevisionStoreIntegrityError):
+        _append(store, V0)

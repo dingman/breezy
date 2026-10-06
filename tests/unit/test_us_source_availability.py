@@ -34,18 +34,18 @@ def _http(offset_ns: int) -> str:
 
 
 def test_measured_header_beyond_floor_is_the_anchor() -> None:
-    ts, basis, miss = available_at(
+    ts, basis, miss, _clamped = available_at(
         "us-lamp-live",
         "v1",
         RUN,
         Observation(last_modified=_http(25 * MIN), last_miss_ns=RUN + 20 * MIN),
         prereg=PREREG,
     )
-    assert (ts, basis, miss) == (RUN + 25 * MIN, "measured_header", RUN + 20 * MIN)
+    assert (ts, basis, miss, _clamped) == (RUN + 25 * MIN, "measured_header", RUN + 20 * MIN, False)
 
 
 def test_measured_header_below_floor_is_clamped_to_run_plus_floor() -> None:
-    ts, basis, _ = available_at(
+    ts, basis, _, _clamped = available_at(
         "us-lamp-live", "v1", RUN, Observation(last_modified=_http(5 * MIN)), prereg=PREREG
     )
     assert ts == RUN + 20 * MIN
@@ -60,21 +60,23 @@ def test_floor_rule_matches_nbp_available_at_ns_on_shared_fixtures(lm_offset_min
     lm_ns = parse_last_modified_ns(lm)
     expected = available_at_ns(cycle_runtime_ns=RUN, last_modified_ns=lm_ns)
 
-    ts, _, _ = available_at("NBM_NBP", "v5.0", RUN, Observation(last_modified=lm), prereg=PREREG)
+    ts, _, _, _clamped = available_at(
+        "NBM_NBP", "v5.0", RUN, Observation(last_modified=lm), prereg=PREREG
+    )
 
     assert ts == expected
     assert MINIMUM_PUBLICATION_LAG_NS["NBM_NBP"] == 60 * MIN
 
 
 def test_nbp_floor_comes_from_minimum_publication_lag_not_a_literal() -> None:
-    ts, _, _ = available_at(
+    ts, _, _, _clamped = available_at(
         "NBM_NBP", "v5.0", RUN, Observation(last_modified=_http(1)), prereg=PREREG
     )
     assert ts == RUN + MINIMUM_PUBLICATION_LAG_NS["NBM_NBP"]
 
 
 def test_unmeasured_row_uses_conservative_lag_not_minimum_floor() -> None:
-    ts, basis, miss = available_at("GFS_MOS", "v16", RUN, None, prereg=PREREG)
+    ts, basis, miss, _clamped = available_at("GFS_MOS", "v16", RUN, None, prereg=PREREG)
 
     assert ts == RUN + 5 * HOUR
     assert ts != RUN + MINIMUM_PUBLICATION_LAG_NS["GFS_MOS"]
@@ -83,7 +85,7 @@ def test_unmeasured_row_uses_conservative_lag_not_minimum_floor() -> None:
 
 
 def test_unmeasured_lamp_uses_prereg_conservative_lag() -> None:
-    ts, basis, _ = available_at("us-lamp-live", "v1", RUN, Observation(), prereg=PREREG)
+    ts, basis, _, _clamped = available_at("us-lamp-live", "v1", RUN, Observation(), prereg=PREREG)
     assert (ts, basis) == (RUN + 60 * MIN, "nominal_plus_conservative_lag")
 
 
@@ -133,7 +135,7 @@ def test_version_keyed_prereg_overrides_source_keyed() -> None:
 
 def test_pfm_wmo_header_time_is_exact_and_labelled_wmo_header() -> None:
     wmo = RUN + 3 * MIN
-    ts, basis, _ = available_at(
+    ts, basis, _, _clamped = available_at(
         "us-pfm-afos", "v1", RUN, Observation(wmo_header_ns=wmo, host_tag="iem"), prereg=PREREG
     )
     assert ts == wmo
@@ -141,7 +143,7 @@ def test_pfm_wmo_header_time_is_exact_and_labelled_wmo_header() -> None:
 
 
 def test_mirror_host_tagged_in_basis() -> None:
-    _, basis, _ = available_at(
+    _, basis, _, _clamped = available_at(
         "us-lav-iem",
         "v1",
         RUN,
@@ -154,7 +156,7 @@ def test_mirror_host_tagged_in_basis() -> None:
 
 def test_mirror_last_modified_is_never_labelled_wmo_header() -> None:
     for host in ("iem", "mdl", "s3", "nomads"):
-        _, basis, _ = available_at(
+        _, basis, _, _clamped = available_at(
             "us-lamp-mdl" if host == "mdl" else "us-lav-iem",
             "v1",
             RUN,
@@ -169,7 +171,7 @@ def test_mirror_last_modified_is_never_labelled_wmo_header() -> None:
 def test_first_seen_basis_and_miss_interval_recorded() -> None:
     first_seen = RUN + 36 * MIN
     miss = RUN + 30 * MIN
-    ts, basis, got_miss = available_at(
+    ts, basis, got_miss, _clamped = available_at(
         "us-lamp-live",
         "v1",
         RUN,
@@ -183,7 +185,7 @@ def test_first_seen_basis_and_miss_interval_recorded() -> None:
 @pytest.mark.parametrize("header", [None, "", "not a date", "Thu, 99 Foo 2026 25:61:61 GMT"])
 def test_first_seen_fallback_when_last_modified_none_or_unparsable(header: str | None) -> None:
     first_seen = RUN + 40 * MIN
-    ts, basis, _ = available_at(
+    ts, basis, _, _clamped = available_at(
         "us-lamp-live",
         "v1",
         RUN,
@@ -195,14 +197,14 @@ def test_first_seen_fallback_when_last_modified_none_or_unparsable(header: str |
 
 
 def test_first_seen_below_floor_is_clamped() -> None:
-    ts, _, _ = available_at(
+    ts, _, _, _clamped = available_at(
         "us-lamp-live", "v1", RUN, Observation(first_seen_ns=RUN + MIN), prereg=PREREG
     )
     assert ts == RUN + 20 * MIN
 
 
 def test_available_at_never_precedes_run_ts_when_observed_is_earlier() -> None:
-    ts, _, _ = available_at(
+    ts, _, _, _clamped = available_at(
         "us-lamp-live", "v1", RUN, Observation(last_modified=_http(-3 * HOUR)), prereg=PREREG
     )
     assert ts >= RUN
@@ -224,10 +226,10 @@ def test_empty_source_or_version_refused() -> None:
 
 
 def test_available_at_is_observed_header_never_assumed() -> None:
-    measured, basis_m, _ = available_at(
+    measured, basis_m, _, _clamped = available_at(
         "us-lamp-live", "v1", RUN, Observation(last_modified=_http(26 * MIN)), prereg=PREREG
     )
-    assumed, basis_a, _ = available_at("us-lamp-live", "v1", RUN, None, prereg=PREREG)
+    assumed, basis_a, _, _clamped = available_at("us-lamp-live", "v1", RUN, None, prereg=PREREG)
     assert measured == RUN + 26 * MIN
     assert assumed == RUN + 60 * MIN
     assert basis_m != basis_a
@@ -274,3 +276,130 @@ def test_lag_freeze_all_late_has_no_maximum() -> None:
 def test_lag_freeze_min_uncensored_must_be_positive() -> None:
     with pytest.raises(ValueError, match=">= 1"):
         freeze_lag([], "s", min_uncensored=0)
+
+
+# -- leakage: the anchor may never precede a poll that saw the file absent ------
+
+
+def test_last_modified_before_last_miss_is_clamped_above_the_miss() -> None:
+    miss = RUN + 50 * MIN
+    ts, basis, got_miss, clamped = available_at(
+        "us-lamp-live",
+        "v1",
+        RUN,
+        Observation(last_modified=_http(30 * MIN), last_miss_ns=miss),
+        prereg=PREREG,
+    )
+    assert ts == miss + 1
+    assert basis == "measured_header"
+    assert got_miss == miss
+    assert clamped is True
+
+
+def test_wmo_header_before_last_miss_is_clamped_above_the_miss() -> None:
+    miss = RUN + 10 * MIN
+    ts, basis, _, clamped = available_at(
+        "us-pfm-afos",
+        "v1",
+        RUN,
+        Observation(wmo_header_ns=RUN + 2 * MIN, last_miss_ns=miss),
+        prereg=PREREG,
+    )
+    assert (ts, basis, clamped) == (miss + 1, "wmo_header", True)
+
+
+def test_observed_time_equal_to_last_miss_is_clamped_to_miss_plus_one() -> None:
+    miss = RUN + 30 * MIN
+    ts, _, _, clamped = available_at(
+        "us-lamp-live",
+        "v1",
+        RUN,
+        Observation(last_modified=_http(30 * MIN), last_miss_ns=miss),
+        prereg=PREREG,
+    )
+    assert (ts, clamped) == (miss + 1, True)
+
+
+def test_observed_time_one_ns_after_last_miss_is_not_clamped() -> None:
+    miss = RUN + 30 * MIN - 1
+    ts, _, _, clamped = available_at(
+        "us-lamp-live",
+        "v1",
+        RUN,
+        Observation(last_modified=_http(30 * MIN), last_miss_ns=miss),
+        prereg=PREREG,
+    )
+    assert (ts, clamped) == (RUN + 30 * MIN, False)
+
+
+def test_first_seen_branch_is_clamped_too() -> None:
+    miss = RUN + 45 * MIN
+    ts, basis, _, clamped = available_at(
+        "us-lamp-live",
+        "v1",
+        RUN,
+        Observation(first_seen_ns=RUN + 40 * MIN, last_miss_ns=miss),
+        prereg=PREREG,
+    )
+    assert (ts, basis, clamped) == (miss + 1, "first_seen", True)
+
+
+def test_nominal_branch_is_never_flagged_clamped() -> None:
+    *_, clamped = available_at("us-lamp-live", "v1", RUN, None, prereg=PREREG)
+    assert clamped is False
+
+
+def test_ts_exceeds_miss_and_respects_floor_across_a_sweep() -> None:
+    floor = 20 * MIN
+    offsets = [-2 * HOUR, -MIN, 0, 1, MIN, 19 * MIN, 20 * MIN, 21 * MIN, HOUR, 5 * HOUR]
+    for observed_off in offsets:
+        for miss_off in [None, *offsets]:
+            miss = None if miss_off is None else RUN + miss_off
+            candidates = [
+                Observation(last_modified=_http(observed_off), last_miss_ns=miss),
+                Observation(first_seen_ns=RUN + observed_off, last_miss_ns=miss),
+            ]
+            for obs in candidates:
+                ts, _, got_miss, _clamped = available_at(
+                    "us-lamp-live", "v1", RUN, obs, prereg=PREREG
+                )
+                assert ts >= RUN + floor
+                if miss is not None:
+                    assert ts > miss
+                assert got_miss == miss
+    for observed_off in offsets:
+        for miss_off in [None, *offsets]:
+            miss = None if miss_off is None else RUN + miss_off
+            ts, *_ = available_at(
+                "us-pfm-afos",
+                "v1",
+                RUN,
+                Observation(wmo_header_ns=RUN + observed_off, last_miss_ns=miss),
+                prereg=PREREG,
+            )
+            assert ts >= RUN
+            if miss is not None:
+                assert ts > miss
+
+
+def test_measured_max_cross_check_handles_source_only_and_versioned_keys() -> None:
+    # source-only conservative lag vs a measured max stored under (source, version)
+    with pytest.raises(AvailabilityConfigError, match="measured maximum"):
+        LagPrereg(
+            sanity_floors_ns={"x": 0},
+            conservative_lags_ns={"x": 10 * MIN},
+            measured_max_lag_ns={("x", "v2"): 11 * MIN},
+        )
+    # versioned conservative lag vs a source-only measured max
+    with pytest.raises(AvailabilityConfigError, match="measured maximum"):
+        LagPrereg(
+            sanity_floors_ns={"x": 0},
+            conservative_lags_ns={("x", "v2"): 10 * MIN},
+            measured_max_lag_ns={"x": 11 * MIN},
+        )
+    # a measured max for ANOTHER version does not constrain this one
+    LagPrereg(
+        sanity_floors_ns={"x": 0},
+        conservative_lags_ns={("x", "v1"): 10 * MIN},
+        measured_max_lag_ns={("x", "v2"): 11 * MIN},
+    )

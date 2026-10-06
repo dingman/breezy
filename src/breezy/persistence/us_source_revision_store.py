@@ -21,11 +21,13 @@ digests of every stored raw revision for ``(source, station, run_ts, base)``.
 from __future__ import annotations
 
 import contextlib
+import csv
 import errno
 import fcntl
 import hashlib
 import json
 import os
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -52,6 +54,13 @@ __all__ = [
 LOCK_NAME: Final[str] = "collector.lock"
 QUARANTINE_NAME: Final[str] = "quarantine.jsonl"
 _SYMLINKED_LOCK_ERRNOS: Final[frozenset[int]] = frozenset({errno.ELOOP, errno.EMLINK})
+
+_LEDGER_FIELDS: Final[dict[str, type]] = {
+    "base_product": str,
+    "run_ts_ns": int,
+    "sha256": str,
+    "station": str,
+}
 
 Validator = Callable[[bytes], None]
 #: Smallest absolute deviation (deg F) from every OTHER source, or None when
@@ -116,7 +125,7 @@ class UsSourceRevisionStore:
         self._outlier_threshold_f = outlier_threshold_f
         self._payload: bytes = b""
         self._cache = ArchiveCache(self._root, fetch=self._fetch_closure, clock=clock)
-        self._held: dict[str, int] = {}
+        self._held: dict[str, tuple[int, int]] = {}  # source -> (owner thread, depth)
 
     def _fetch_closure(self, _request: ArchiveRequest) -> bytes:
         return self._payload
@@ -131,12 +140,19 @@ class UsSourceRevisionStore:
         """Non-blocking exclusive flock on ``<root>/<source>/collector.lock``; re-entrant here."""
         if source not in US_SOURCE_PRODUCTS:
             raise ValueError(f"unknown US source {source!r}")
-        if source in self._held:
-            self._held[source] += 1
+        me = threading.get_ident()
+        held = self._held.get(source)
+        if held is not None:
+            owner, depth = held
+            if owner != me:
+                raise RevisionStoreBusyError(
+                    f"{source} is locked by another thread of this store; one writer per unit"
+                )
+            self._held[source] = (owner, depth + 1)
             try:
                 yield
             finally:
-                self._held[source] -= 1
+                self._held[source] = (owner, self._held[source][1] - 1)
             return
         path = self.lock_path(source)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +169,7 @@ class UsSourceRevisionStore:
         except OSError as exc:
             os.close(fd)
             raise RevisionStoreBusyError(f"another run holds {path}") from exc
-        self._held[source] = 1
+        self._held[source] = (me, 1)
         try:
             yield
         finally:
@@ -247,10 +263,18 @@ class UsSourceRevisionStore:
         try:
             payload.decode("utf-8")
             count_rows(payload)
-        except Exception as exc:  # any decode or CSV failure is a refusal, pre-write
-            raise RevisionPayloadRefusedError(f"payload is not strict UTF-8 text: {exc}") from exc
-        if self._validator is not None:
+        except (UnicodeDecodeError, csv.Error) as exc:
+            raise RevisionPayloadRefusedError(f"payload is not valid UTF-8 or CSV: {exc}") from exc
+        if self._validator is None:
+            return
+        try:
             self._validator(payload)
+        except RevisionStoreError:
+            raise
+        except Exception as exc:
+            raise RevisionPayloadRefusedError(
+                f"caller validation refused the payload: {exc}"
+            ) from exc
 
     def _deviation(self, payload: bytes) -> float | None:
         if self._outlier_probe is None or self._outlier_threshold_f is None:
@@ -275,8 +299,12 @@ class UsSourceRevisionStore:
                 row = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise RevisionStoreIntegrityError(f"{path}: corrupt quarantine line") from exc
-            if not isinstance(row, dict):
-                raise RevisionStoreIntegrityError(f"{path}: quarantine line is not an object")
+            if not isinstance(row, dict) or any(
+                not isinstance(row.get(name), kind) for name, kind in _LEDGER_FIELDS.items()
+            ):
+                raise RevisionStoreIntegrityError(
+                    f"{path}: quarantine line is not an object with fields {sorted(_LEDGER_FIELDS)}"
+                )
             rows.append(row)
         return rows
 

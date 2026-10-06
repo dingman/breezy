@@ -56,7 +56,11 @@ class AvailabilityBasis(enum.StrEnum):
 
 
 class AvailabilityResult(NamedTuple):
-    """``(ts, basis, miss_ts)``. ``miss_ts`` is None when no miss was observed.
+    """``(ts, basis, miss_ts, clamped_to_miss)``. ``miss_ts`` is None when no miss was seen.
+
+    ``clamped_to_miss`` is True when the observed time was at or before a poll
+    that saw the file absent, so ``ts`` was raised to ``miss_ts + 1`` (the
+    conservative upper bound). The basis is unchanged; the census counts these.
 
     ``basis`` is the enum value, with ``@<host_tag>`` appended when the
     observation came from a named host (``measured_header@iem``).
@@ -65,6 +69,7 @@ class AvailabilityResult(NamedTuple):
     ts: int
     basis: str
     miss_ts: int | None
+    clamped_to_miss: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +114,7 @@ class LagPrereg:
                 raise AvailabilityConfigError(
                     f"conservative lag for {key!r} is below its sanity floor"
                 )
-            measured = _lookup(self.measured_max_lag_ns, key)
+            measured = _measured_max_for(self.measured_max_lag_ns, key)
             if measured is not None and lag < measured:
                 raise AvailabilityConfigError(
                     f"conservative lag for {key!r} is below the measured maximum"
@@ -124,6 +129,25 @@ def _lookup(table: Mapping[LagKey, int] | None, key: LagKey) -> int | None:
     if isinstance(key, tuple):
         return table.get(key[0])
     return None
+
+
+def _measured_max_for(table: Mapping[LagKey, int] | None, key: LagKey) -> int | None:
+    """Largest measured max that constrains ``key``.
+
+    A source-only key is constrained by the source's measurement under any
+    version; a versioned key by its own and by the source-only measurement.
+    """
+    if table is None:
+        return None
+    source = key if isinstance(key, str) else key[0]
+    applicable = [
+        value
+        for k, value in table.items()
+        if k == key
+        or k == source
+        or (isinstance(key, str) and isinstance(k, tuple) and k[0] == key)
+    ]
+    return max(applicable) if applicable else None
 
 
 def _floor_ns(source: str, versioned: LagKey | None, prereg: LagPrereg) -> int:
@@ -179,8 +203,10 @@ def available_at(
        -> ``first_seen[@host]``.
     4. nothing observed -> ``nominal_plus_conservative_lag``.
 
-    Cases 1-3 return ``max(observed, run_ts + floor)``; the floor is a sanity
-    clamp, never a lag estimate. ``ts`` therefore never precedes ``run_ts``.
+    Cases 1-3 return ``max(observed, run_ts + floor)``, then are clamped to
+    ``last_miss + 1`` so the anchor never precedes provable absence (leakage);
+    ``clamped_to_miss`` records the event. The floor is a sanity clamp, never a
+    lag estimate. ``ts`` therefore never precedes ``run_ts``.
     """
     if not source or not version:
         raise ValueError("source and version must be non-empty")
@@ -193,23 +219,26 @@ def available_at(
     miss = _require_ns("last_miss_ns", obs.last_miss_ns)
     host = obs.host_tag
 
+    def _anchored(
+        observed_ts: int, basis: AvailabilityBasis, tag: str | None
+    ) -> AvailabilityResult:
+        ts = max(observed_ts, floor_ts)
+        clamped = miss is not None and ts <= miss
+        if miss is not None and clamped:
+            ts = miss + 1
+        return AvailabilityResult(ts, _label(basis, tag), miss, clamped)
+
     wmo = _require_ns("wmo_header_ns", obs.wmo_header_ns)
     if wmo is not None:
-        return AvailabilityResult(
-            max(wmo, floor_ts), _label(AvailabilityBasis.WMO_HEADER, None), miss
-        )
+        return _anchored(wmo, AvailabilityBasis.WMO_HEADER, None)
 
     modified = parse_last_modified_ns(obs.last_modified)
     if modified is not None:
-        return AvailabilityResult(
-            max(modified, floor_ts), _label(AvailabilityBasis.MEASURED_HEADER, host), miss
-        )
+        return _anchored(modified, AvailabilityBasis.MEASURED_HEADER, host)
 
     first_seen = _require_ns("first_seen_ns", obs.first_seen_ns)
     if first_seen is not None:
-        return AvailabilityResult(
-            max(first_seen, floor_ts), _label(AvailabilityBasis.FIRST_SEEN, host), miss
-        )
+        return _anchored(first_seen, AvailabilityBasis.FIRST_SEEN, host)
 
     conservative = _lookup(prereg.conservative_lags_ns, versioned)
     if conservative is None:
@@ -220,6 +249,7 @@ def available_at(
         run + max(conservative, floor_ns),
         AvailabilityBasis.NOMINAL_PLUS_CONSERVATIVE_LAG.value,
         None,
+        False,
     )
 
 
