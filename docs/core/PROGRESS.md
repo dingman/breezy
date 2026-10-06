@@ -50,7 +50,7 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | ID | Merge | Proof owed (exact) |
 |---|---|---|
 | ING-2-AMEND2 | 9730f1e | 09-29 ~09:45Z post-rotation ingest: `extend_dedupe:` shows `custom_depth_truncation:<n>/0` + `flat_root=none`, deferred_instances=0, ≤600 s, cgroup `memory.peak` ≤2G (measured directly, never from RSS) → remove `zz-memory-containment-TEMPORARY.conf` + daemon-reload. `flat_root=custom_depth_truncation` WARN = native flat write happened → open structural fix |
-| BL-10 | fdf28aa | Boot clean PROVEN 09-28 16:50Z (0 FATAL, permit issued ttl 10 h). Owed: first create-path order shows no permit refusal (none possible while A1 halt SET). Also fixes a real budget leak (raising `build_order_body` spent permit budget) |
+| BL-10 | fdf28aa | Boot clean PROVEN 09-28 16:50Z (0 FATAL, permit issued ttl 10 h). Owed: first create-path order shows no permit refusal (none possible while A1 halt SET). |
 | FAILURE-KIND-DURABLE | bdba573 | Next node spawn; a restart with an OPEN AMBIGUOUS intent names the durable kind (not `none`) in the stale CRITICAL |
 | RECON-MIA-0913 | 97c4325 | 09-29 15:20Z exit study: per-trial reconciliation `matched=True` with `n_fee_unverified_excluded=1` |
 | AUD-07 gate | 97c4325 | `--stage 80k` refused while `20k/DEFERRED` non-empty (repo copy; the pinned a40d433 copy drives the drain) |
@@ -58,15 +58,16 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
 
 ### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
-FQ v1 halt FAILED 10-05 (cwd bug, 5 more fills); backstop orders-off drop-in live 01:01Z 10-06; CLI halt re-timed 16:40Z.
+Resume point: docs/plans/backlog/HALT_POINT_2026-10-06.md.
 | Row | Status |
 |---|---|
 | F2 truth fetch | LIVE (timers 11:40Z/12:40Z) |
 | F4 labels | build-now DONE (WP0-3,5,6,8 + plugins); promote waits AUT-6; see F4-open-items_2026-10-06.md |
 | F5 prereg MC | DONE: STARVED; design frozen 072ab026 (RULING_FQ-PREREG-v2-AMENDMENT) |
-| F6 bridge | BUILDING (F5 numerics frozen) |
+| F6 bridge | veto merged; refuses FQ until F6b producer |
 | F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
-| F13 US sources | C1 collector LIVE 10-06; B0 building; OPEN-7 before Phase A |
+| F13 US sources | C1 LIVE; B1 UNDERPOWERED (R36); Phase A code merged; backfills partial |
+| F7b / M1-v3 | F7b merged (inert); M1-v3 frozen, read >= 12-07 |
 Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
