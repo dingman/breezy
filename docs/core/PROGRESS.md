@@ -57,12 +57,10 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
 
-### FQ LOSS RESPONSE (resumed 2026-10-06; plan r3 + F1 r3, errata E-25..E-28 filed 8bdb5ef1)
+### FQ LOSS RESPONSE (plan r3 + F1-errata-and-deltas_r3.md; E-25..E-28 filed)
 FQ v1 halt FAILED 10-05 (cwd bug, 5 more fills); backstop orders-off drop-in live 01:01Z 10-06; CLI halt re-timed 16:40Z.
 | Row | Status |
 |---|---|
-| F0 M1 | DONE fc442601 (no surviving cell; MDE 19.8c) |
-| F1 | DONE: E-25..E-28 filed; F1-errata-and-deltas_r3.md (FQ-R34..R56) |
 | F2 truth fetch | BUILT, review fixes in progress; units not installed |
 | F3 v1 terminal day | BUILT bc52965e (FQ-R45 fixture decoupling); full gate queued |
 | F4 labels | IN PROGRESS WP0-WP3 |
