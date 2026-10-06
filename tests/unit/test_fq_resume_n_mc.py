@@ -604,3 +604,17 @@ def test_starvation_is_computed_at_the_pinned_design_worst_case_over_the_sweep()
 def test_fq_mc_type1_has_its_own_sys_path_bootstrap() -> None:
     text = (REPO_ROOT / "scripts/analysis/fq_mc_type1.py").read_text(encoding="utf-8")
     assert "sys.path" in text
+
+
+def test_starvation_refuses_when_the_pinned_design_was_not_simulated() -> None:
+    cell = {
+        "m_cap": 3, "x_max": 2.0, "delta_h": 0.2, "take_rate": 1.0,
+        "n_e_power_by_k": {"1": 100, "2": None, "3": None, "4": 200}, "n_e_power": 100,
+        "n_max": 1000,
+    }  # fmt: skip
+    with pytest.raises(mc.PinnedDesignMissingError, match="m_cap=2.*X_max=4.0"):
+        mc.starvation_by_delta([cell], [1.0], [0.2], 1000, dt.date(2026, 10, 10), 0.9)
+    # present for one (rate, delta) but absent for another is refused too
+    pinned = {**cell, "m_cap": 2, "x_max": 4.0}
+    with pytest.raises(mc.PinnedDesignMissingError):
+        mc.starvation_by_delta([pinned], [1.0, 0.5], [0.2], 1000, dt.date(2026, 10, 10), 0.9)

@@ -295,3 +295,25 @@ def test_pins_are_imported_from_the_mc_not_duplicated() -> None:
     source = (REPO_ROOT / "scripts/analysis/prereg_precommit_check.py").read_text()
     assert "0.0695" not in source
     assert "agrapa_v1" not in source
+
+
+def test_precommit_refuses_a_sha_that_exists_but_is_not_an_ancestor_of_head(tmp_path: Path) -> None:
+    path = _committed(tmp_path, _valid())
+    repo = path.parent
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "side commit, identical design blob")
+    side_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", base)  # HEAD is back on the base commit; side is not an ancestor
+    _git(repo, "checkout", "-q", "-B", "main")
+    design = {**_valid(), "frozen_sha": side_sha}
+    path.write_text(json.dumps(design, indent=1, sort_keys=True))
+    assert chk.check_frozen_blob(path, design)  # the commit exists, the blob matches, still refused
+    assert "FROZEN_SHA_NOT_ANCESTOR" in {d.code for d in chk.check_frozen_blob(path, design)}
+    assert chk.main([str(path)]) != 0
+
+
+def test_module_docstring_says_the_script_calls_git() -> None:
+    doc = chk.__doc__ or ""
+    assert "git" in doc.lower()
+    assert "no repo" not in doc

@@ -105,6 +105,7 @@ __all__ = [
     "Design",
     "ItemBatch",
     "LoopConfig",
+    "PinnedDesignMissingError",
     "PoolDay",
     "PoolRung",
     "agrapa_lambda",
@@ -453,6 +454,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+class PinnedDesignMissingError(ValueError):
+    """The pinned design was not simulated for some (rate, delta_h); starvation is not reported."""
+
+
 def _worst_case_n(
     cells: Sequence[Mapping[str, Any]], *, rate: float, delta: float, k: str, n_max: int
 ) -> int:
@@ -482,6 +487,17 @@ def starvation_by_delta(
     the model-claim (edge_excess) sensitivity sweep. Cells of any other design are ignored.
     """
     pinned = [c for c in cells if c["m_cap"] == m_cap and c["x_max"] == x_max]
+    missing = [
+        (r, d)
+        for r in rates
+        for d in deltas
+        if not any(c["take_rate"] == r and c["delta_h"] == d for c in pinned)
+    ]
+    if missing:
+        raise PinnedDesignMissingError(
+            f"the pinned design m_cap={m_cap}, X_max={x_max} was not simulated for "
+            f"(rate, delta_h) {missing}; add it to --m-caps/--x-maxes or --pinned-*"
+        )
     per_delta: dict[str, Any] = {}
     for delta in deltas:
         row: dict[str, Any] = {}

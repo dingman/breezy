@@ -5,15 +5,17 @@ Validates that a design file carries EVERY key E-25 (`ARCH-ERRATA-rev9_2.md`, as
 FQ-R15/R20/R26/R37-R39/R55) consumes, that each value is typed and in range, and that the file
 is frozen at a 40-hex git SHA. It exits 0 only when the design is complete and in range; any
 other outcome exits non-zero with one line per defect on stderr. It reads the one file named on
-the command line and nothing else: no repo, no network, no write.
+the command line, and it runs read-only local `git` commands (rev-parse, cat-file, merge-base,
+show) in that file's repository to read the frozen blob. No network, no write.
 
     prereg_precommit_check.py <design.json>
 
 Beyond shape and range it is MANDATORY against the committed blob: the design file must equal
 (canonical JSON, the `frozen_sha` key itself excluded because a commit cannot contain its own
-sha) the blob `git show <frozen_sha>:<path>`, and the sha must be a reachable commit. It also pins
-theta, ask_floor, the haircut and both betting rules to the constants the N Monte-Carlo ran with,
-imported from it (no duplicated literals).
+sha) the blob `git show <frozen_sha>:<path>`. The sha must be a commit that is an ancestor of HEAD
+(`git merge-base --is-ancestor`), not merely one that exists. It also pins theta, ask_floor, the
+haircut and both betting rules to the constants the N Monte-Carlo ran with, imported from it (no
+duplicated literals).
 
 This script does not choose any value. The values are the coordinator's, pinned after the
 joint-power N Monte-Carlo (`fq_resume_n_mc.py`) and the peer loop.
@@ -347,7 +349,11 @@ def check_frozen_blob(path: Path, design: Mapping[str, Any]) -> list[Defect]:
             return [Defect("NOT_IN_GIT_REPO", f"{path} is not inside a git repository")]
         root = Path(top.stdout.strip())
         if _git(root, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
-            return [Defect("FROZEN_SHA_UNREACHABLE", f"frozen_sha {sha} is not a reachable commit")]
+            return [Defect("FROZEN_SHA_UNREACHABLE", f"frozen_sha {sha} is not a commit here")]
+        # existence is not enough: a commit on a side branch must not freeze a design
+        if _git(root, "merge-base", "--is-ancestor", sha, "HEAD").returncode != 0:
+            message = f"frozen_sha {sha} is not an ancestor of HEAD"
+            return [Defect("FROZEN_SHA_NOT_ANCESTOR", message)]
         rel = path.resolve().relative_to(root).as_posix()
         blob = _git(root, "show", f"{sha}:{rel}")
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
