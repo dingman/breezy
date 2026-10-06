@@ -221,6 +221,11 @@ def test_open_holdout_is_never_called(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     for rel in (
         "src/breezy/analysis/multisource_blend.py",
+        "src/breezy/analysis/multisource_blend_features.py",
+        "src/breezy/analysis/multisource_blend_fit.py",
+        "src/breezy/analysis/multisource_blend_folds.py",
+        "src/breezy/analysis/multisource_blend_stats.py",
+        "src/breezy/analysis/multisource_blend_io.py",
         "scripts/analysis/multisource_blend_skill.py",
         "scripts/analysis/blend_veto_descriptive.py",
     ):
@@ -269,7 +274,7 @@ def test_blend_uses_crps_numerical_with_blend_mu_as_center(
         seen.append(center)
         return real(cdf, observed, center=center, **kwargs)
 
-    monkeypatch.setattr("breezy.analysis.multisource_blend.crps_numerical", _spy)
+    monkeypatch.setattr("breezy.analysis.multisource_blend_fit.crps_numerical", _spy)
     row = rows[0]
     value = msb.row_crps(fit, row)
     mu, _sigma, _level = msb.predict_row(fit, row)
