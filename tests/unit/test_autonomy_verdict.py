@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +21,7 @@ from breezy.persistence.autonomy.single_read import WriteOutcome
 from breezy.persistence.autonomy.verdict import (
     ActionClass,
     Assumption,
+    StatTestKind,
     Verdict,
     VerdictIdCollision,
     VerdictInput,
@@ -50,6 +52,7 @@ EXPECTED_KEYS = frozenset(
         "n_min", "power", "mde", "eta_to_verdict_days", "alpha_spent", "k_life", "alpha_k",
         "n_min_eff", "n_cap", "inputs", "policy_ruling_sha256", "family_prereg_sha256",
         "produced_at_ns", "valid_until_ns", "producer_code_sha", "assumptions",
+        "test_kind", "eta_ns", "window_end",
     }
 )  # fmt: skip
 
@@ -87,6 +90,7 @@ def forward_shadow(**overrides: Any) -> Verdict:
         "alpha_k": Decimal("0.0125"),
         "n_min_eff": 403,
         "n_cap": 480,
+        "test_kind": StatTestKind.FIXED_N,  # E-25 rule 1: never null on FORWARD_SHADOW
     }
     fields.update(overrides)
     return make(**fields)
@@ -268,8 +272,11 @@ def test_verdict_id_excludes_produced_at() -> None:
 
 
 def test_verdict_id_golden() -> None:
-    # Independently derived: sha256 of the literal body (sorted keys, compact separators).
-    assert make().verdict_id == "a99c03789a35384e5321b3333e52b94c5fc47d72cdfe1c107b4f8698d30a222d"
+    # Independently derived: sha256 of the literal body (sorted keys, compact separators), with
+    # the three E-25 keys (test_kind, eta_ns, window_end) as null. Re-derived with hashlib/json only
+    # (never via Verdict): `python3 <scratchpad>/f7b-s1-impl/golden.py`, which first reproduces the
+    # previous pin a99c0378... from the same literal body without the three keys.
+    assert make().verdict_id == "0e7326e5d5171f5086bb244466af4518e5a53c7aaa84e15623349dfae02f33fc"
 
 
 def test_recompute_same_slot_same_inputs_same_verdict_id(tmp_path: Path) -> None:
@@ -423,8 +430,9 @@ def test_metric_values_admit_decimal_text_bool_and_null() -> None:
 
 def test_metric_text_golden_with_day_status_no_input() -> None:
     verdict = make(metrics=(("day_status", "NO_INPUT"),))
-    # Independently derived: sha256 of the literal body (sorted keys, compact separators).
-    assert verdict.verdict_id == "e94075769c3ad70cd1f9f43d961b633df3b7184451522b189afe6dea08d35590"
+    # Independently derived as above (hashlib/json only, golden.py); the previous pin e9407576...
+    # was reproduced from the same literal body without the three E-25 keys.
+    assert verdict.verdict_id == "9fb9054a3b33bf116e98fe2b66826114b7938e465d6dd05604432c3f51aff51d"
 
 
 @pytest.mark.parametrize(
@@ -480,3 +488,123 @@ def test_valid_until_before_produced_at_is_refused() -> None:
 def test_a_policy_ruling_with_the_no_policy_ruling_assumption_is_refused() -> None:
     with pytest.raises(WireRefused):
         make(policy_ruling_sha256=SHA_D, assumptions=(Assumption.NO_POLICY_RULING,))
+
+
+# --- E-25 (ARCH-0-E25): test_kind / eta_ns / window_end -------------------------------------
+
+_NEW_KEYS = ("test_kind", "eta_ns", "window_end")
+
+
+def e_process_shadow(**overrides: Any) -> Verdict:
+    fields: dict[str, Any] = {
+        "test_kind": StatTestKind.E_PROCESS,
+        "n_min_eff": None,  # E-25 rule 2: null on every e_process verdict
+        "eta_ns": PRODUCED + 30 * 24 * HOUR_NS,
+        "window_end": "2026-11-20",
+    }
+    fields.update(overrides)
+    return forward_shadow(**fields)
+
+
+def test_c4_e_process_n_min_eff_null_with_eta_ns_window_end() -> None:
+    verdict = e_process_shadow()
+    wire = verdict.to_wire()
+    assert wire["test_kind"] == "e_process"
+    assert wire["n_min_eff"] is None
+    assert wire["eta_ns"] == PRODUCED + 30 * 24 * HOUR_NS
+    assert wire["window_end"] == "2026-11-20"
+    assert Verdict.from_wire(parse_json_exact(canonical_json(wire))) == verdict
+    with pytest.raises(WireRefused):
+        e_process_shadow(n_min_eff=403)  # E-25 rule 2
+
+
+def test_test_kind_closed_enum_and_kind_rules() -> None:
+    assert {t.value for t in StatTestKind} == {"fixed_n", "e_process"}
+    with pytest.raises(WireRefused):
+        forward_shadow(test_kind=None)  # never null on FORWARD_SHADOW
+    wire = forward_shadow().to_wire()
+    for bad in ("sequential", "FIXED_N", "", 1, True):
+        with pytest.raises(WireRefused):
+            Verdict.from_wire({**wire, "test_kind": bad})
+    with pytest.raises(WireRefused):
+        forward_shadow(test_kind="fixed_n")  # a bare str is not the enum
+    for kind in (
+        VerdictKind.OFFLINE_CHALLENGER,
+        VerdictKind.DRIFT,
+        VerdictKind.HEALTH,
+        VerdictKind.RECONCILIATION,
+    ):
+        assert make(kind=kind).test_kind is None
+        for member in StatTestKind:
+            with pytest.raises(WireRefused):
+                make(kind=kind, test_kind=member)
+
+
+def test_eta_ns_only_when_test_kind_e_process() -> None:
+    assert e_process_shadow(eta_ns=None).eta_ns is None  # infeasible nomination: null eta_ns
+    with pytest.raises(WireRefused):
+        forward_shadow(eta_ns=PRODUCED)  # fixed_n
+    with pytest.raises(WireRefused):
+        make(eta_ns=PRODUCED)  # HEALTH
+    with pytest.raises(WireRefused):
+        make(kind=VerdictKind.LIVE_SEQUENTIAL, test_kind=StatTestKind.E_PROCESS, eta_ns=PRODUCED)
+    for bad in (-1, True, 1.5):
+        with pytest.raises(WireRefused):
+            e_process_shadow(eta_ns=bad)
+    wire = e_process_shadow().to_wire()
+    wire_bad: tuple[object, ...] = ("12", -1, 1.5, True)
+    for bad_wire in wire_bad:
+        with pytest.raises(WireRefused):
+            Verdict.from_wire({**wire, "eta_ns": bad_wire})
+
+
+def test_window_end_forward_shadow_only_and_iso_date() -> None:
+    with pytest.raises(WireRefused):
+        e_process_shadow(window_end=None)  # required on FS e_process
+    assert forward_shadow(window_end=None).window_end is None  # nullable on FS fixed_n
+    assert forward_shadow(window_end="2026-11-20").window_end == "2026-11-20"
+    for kind in (VerdictKind.OFFLINE_CHALLENGER, VerdictKind.LIVE_SEQUENTIAL, VerdictKind.HEALTH):
+        with pytest.raises(WireRefused):
+            make(kind=kind, window_end="2026-11-20")
+    wire = forward_shadow(window_end="2026-11-20").to_wire()
+    for bad in ("2026-13-01", "2026-02-30", "20261120", "2026-1-2", " 2026-11-20", "2026-11-20\n",
+                "٢026-11-20", "2026-11-20T00:00:00Z", "", 20261120):  # fmt: skip
+        with pytest.raises(WireRefused):
+            forward_shadow(window_end=bad)
+        with pytest.raises(WireRefused):
+            Verdict.from_wire({**wire, "window_end": bad})
+
+
+def test_live_sequential_test_kind_null_or_e_process_never_fixed_n() -> None:
+    live = {"kind": VerdictKind.LIVE_SEQUENTIAL}
+    assert make(**live).test_kind is None
+    assert make(**live, test_kind=StatTestKind.E_PROCESS).test_kind is StatTestKind.E_PROCESS
+    with pytest.raises(WireRefused):
+        make(**live, test_kind=StatTestKind.FIXED_N)
+    with pytest.raises(WireRefused):
+        make(**live, test_kind=StatTestKind.E_PROCESS, n_min_eff=3)
+
+
+def test_each_new_key_moves_verdict_id() -> None:
+    base = e_process_shadow()
+    assert base.eta_ns is not None
+    assert replace(base, eta_ns=base.eta_ns + 1).verdict_id != base.verdict_id
+    assert replace(base, window_end="2026-11-21").verdict_id != base.verdict_id
+    fixed = forward_shadow()
+    assert fixed.verdict_id != replace(fixed, window_end="2026-11-20").verdict_id
+    as_e_process = forward_shadow(
+        test_kind=StatTestKind.E_PROCESS, n_min_eff=None, eta_ns=None, window_end="2026-11-20"
+    )
+    assert fixed.verdict_id != as_e_process.verdict_id
+    body = base.body_wire()
+    assert set(_NEW_KEYS) <= set(body)  # in the hashed body
+
+
+def test_exact_set_reader_refuses_wire_without_new_keys() -> None:
+    for key in _NEW_KEYS:
+        wire = forward_shadow().to_wire()
+        del wire[key]
+        with pytest.raises(WireRefused) as info:
+            Verdict.from_wire(wire)
+        assert refusal(info) is WireRefusalReason.MISSING_KEY
+        assert key in EXPECTED_KEYS

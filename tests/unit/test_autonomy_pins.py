@@ -185,6 +185,7 @@ DAMPING: Final[dict[str, tuple[str, int]]] = {
     "MIN_DAYS_BETWEEN_PROMOTES_PER_LINEAGE": (">=", 14),
     "MAX_NOMINATIONS_PER_LINEAGE_LIFETIME": ("<=", 4),
     "MAX_NOMINATIONS_PER_FORWARD_WINDOW": ("<=", 1),
+    "MAX_INFEASIBLE_NOMINATIONS_PER_LINEAGE_LIFETIME": ("<=", 4),  # E-25 rule 6
     "MAX_MINTS_PER_LINEAGE_PER_DAY": ("<=", 1),
     "DRILL_BUDGET_PER_VENUE_30D": ("<=", 1),
 }
@@ -241,6 +242,12 @@ def test_damping_ceilings(facet: str) -> None:
         _check(name, relation, bound)
     assert pins.MAX_RECOVERABLE_RESUMES_PER_LINEAGE_14D >= 0
     assert pins.DRILL_BUDGET_PER_VENUE_30D == 1  # one drill, ever, per 30 d
+
+
+def test_max_infeasible_nominations_is_int_ceiling_4() -> None:
+    value = pins.MAX_INFEASIBLE_NOMINATIONS_PER_LINEAGE_LIFETIME
+    assert type(value) is int  # no bool, no float
+    assert value == 4  # E-25 rule 6: a code ceiling that bounds the policy key
 
 
 def test_pins_ceilings_within_arch_bounds() -> None:

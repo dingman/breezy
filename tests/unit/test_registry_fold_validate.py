@@ -34,6 +34,7 @@ from breezy.persistence.autonomy.stage_policy import STAGE
 from breezy.persistence.autonomy.verdict import (
     ActionClass,
     Assumption,
+    StatTestKind,
     Verdict,
     VerdictKind,
     VerdictOutcome,
@@ -669,6 +670,8 @@ def forward_shadow(
         declared_action_class=ActionClass.NONE, produced_at_ns=produced_at_ns,
         valid_until_ns=produced_at_ns + HOUR_NS, producer_code_sha="d" * 64,
         assumptions=(Assumption.NO_POLICY_RULING,),
+        # E-25 rule 1: test_kind is never null on FORWARD_SHADOW (fixture default only).
+        test_kind=StatTestKind.FIXED_N if kind is VerdictKind.FORWARD_SHADOW else None,
     )  # fmt: skip
 
 

@@ -50,6 +50,7 @@ from breezy.persistence.autonomy.wire import (
     check_match,
     check_sha256,
     decimal_wire,
+    is_null,
     optional_decimal_str,
     optional_int,
     optional_sha256,
@@ -68,6 +69,7 @@ __all__ = [
     "MAX_VERDICT_BYTES",
     "ActionClass",
     "Assumption",
+    "StatTestKind",
     "Verdict",
     "VerdictIdCollision",
     "VerdictInput",
@@ -92,6 +94,8 @@ _NAME_RE: Final = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 _ROLE_RE: Final = re.compile(r"\A[a-z0-9_]{1,64}\Z", re.ASCII)
 #: A5-R2: a text metric value (closed charset, at most 128 characters).
 _METRIC_TEXT_RE: Final = re.compile(r"\A[A-Za-z0-9_:.()=,-]{1,128}\Z", re.ASCII)
+#: E-25 rule 1: ``window_end`` is an ISO calendar date (also round-trip checked).
+_WINDOW_END_RE: Final = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z", re.ASCII)
 
 #: A5-R2: a metric is a decimal, a text string, a bool or null. Text that is itself a canonical
 #: decimal string is refused so that one wire value has one Python type.
@@ -113,6 +117,13 @@ class VerdictOutcome(StrEnum):
     UNDERPOWERED = "UNDERPOWERED"
     INCONCLUSIVE = "INCONCLUSIVE"
     ERROR = "ERROR"
+
+
+class StatTestKind(StrEnum):
+    """E-25 rule 1: the statistical test a FORWARD_SHADOW / LIVE_SEQUENTIAL verdict rests on."""
+
+    FIXED_N = "fixed_n"
+    E_PROCESS = "e_process"
 
 
 class ActionClass(StrEnum):
@@ -181,12 +192,15 @@ _KEYS: Final = (
     "n_min", "power", "mde", "eta_to_verdict_days", "alpha_spent", "k_life", "alpha_k",
     "n_min_eff", "n_cap", "inputs", "policy_ruling_sha256", "family_prereg_sha256",
     "produced_at_ns", "valid_until_ns", "producer_code_sha", "assumptions",
+    "test_kind", "eta_ns", "window_end",
 )  # fmt: skip
 _BODY_EXCLUDED: Final = frozenset({"verdict_id", "produced_at_ns"})
 _DECIMAL_COLUMNS: Final = ("power", "mde", "eta_to_verdict_days", "alpha_spent", "alpha_k")
-_INT_COLUMNS: Final = ("n", "n_min", "k_life", "n_min_eff", "n_cap")
+_INT_COLUMNS: Final = ("n", "n_min", "k_life", "n_min_eff", "n_cap", "eta_ns")
 #: Null on every kind but FORWARD_SHADOW (ARCH C4, ALPHA).
 _FORWARD_SHADOW_ONLY: Final = ("k_life", "alpha_k", "n_min_eff", "n_cap")
+#: E-25 (F7B-R2): non-null only on a FORWARD_SHADOW ``e_process`` verdict.
+_FORWARD_SHADOW_E_PROCESS_ONLY: Final = ("eta_ns", "window_end")
 
 
 def _bad(field: str) -> WireRefused:
@@ -230,6 +244,9 @@ class Verdict:
     n_cap: int | None = None
     policy_ruling_sha256: str | None = None
     family_prereg_sha256: str | None = None
+    test_kind: StatTestKind | None = None
+    eta_ns: int | None = None
+    window_end: str | None = None
 
     def __post_init__(self) -> None:
         for field, enum in (
@@ -239,6 +256,8 @@ class Verdict:
         ):
             if not isinstance(getattr(self, field), enum):
                 raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+        if self.test_kind is not None and not isinstance(self.test_kind, StatTestKind):
+            raise WireRefused(WireRefusalReason.WRONG_TYPE, "test_kind")
         family_component(self.subject_family_id)
         if self.comparator_family_id is not None:
             family_component(self.comparator_family_id)
@@ -268,11 +287,36 @@ class Verdict:
                     raise _bad(field)
         if self.kind is not VerdictKind.LIVE_SEQUENTIAL and self.family_prereg_sha256 is not None:
             raise _bad("family_prereg_sha256")
+        self._check_test_kind_rules()
         no_ruling = Assumption.NO_POLICY_RULING in self.assumptions
         if (self.policy_ruling_sha256 is None) != no_ruling:
             raise _bad("policy_ruling_sha256")  # null exactly with no_policy_ruling
         if self.valid_until_ns < self.produced_at_ns:
             raise _bad("valid_until_ns")
+
+    def _check_test_kind_rules(self) -> None:
+        """E-25 rules 1-2 as amended by F7B-R2 (strict)."""
+        if self.kind is VerdictKind.FORWARD_SHADOW:
+            if self.test_kind is None:
+                raise _bad("test_kind")  # never null on FORWARD_SHADOW
+        elif self.kind is VerdictKind.LIVE_SEQUENTIAL:
+            if self.test_kind is StatTestKind.FIXED_N:
+                raise _bad("test_kind")  # LD-OBF families keep it null
+        elif self.test_kind is not None:
+            raise _bad("test_kind")
+        is_fs_e_process = (
+            self.kind is VerdictKind.FORWARD_SHADOW and self.test_kind is StatTestKind.E_PROCESS
+        )
+        if self.test_kind is StatTestKind.E_PROCESS and self.n_min_eff is not None:
+            raise _bad("n_min_eff")  # E-25 rule 2
+        if not is_fs_e_process and self.eta_ns is not None:
+            raise _bad("eta_ns")
+        if self.window_end is not None:
+            if self.kind is not VerdictKind.FORWARD_SHADOW:
+                raise _bad("window_end")
+            _check_iso_date(self.window_end, "window_end")
+        elif is_fs_e_process:
+            raise _bad("window_end")  # required on FORWARD_SHADOW e_process
 
     def _check_collections(self) -> None:
         for name, value in self.metrics:
@@ -320,6 +364,9 @@ class Verdict:
             "valid_until_ns": self.valid_until_ns,
             "producer_code_sha": self.producer_code_sha,
             "assumptions": [a.value for a in self.assumptions],
+            "test_kind": None if self.test_kind is None else self.test_kind.value,
+            "eta_ns": self.eta_ns,
+            "window_end": self.window_end,
         }
 
     def body_wire(self) -> dict[str, object]:
@@ -375,10 +422,31 @@ class Verdict:
             valid_until_ns=require_ns(obj, "valid_until_ns"),
             producer_code_sha=require_sha256(obj, "producer_code_sha"),
             assumptions=_assumptions_from_wire(obj),
+            test_kind=_test_kind_from_wire(obj),
+            eta_ns=optional_int(obj, "eta_ns"),
+            window_end=optional_str(obj, "window_end"),
         )
         if require_sha256(obj, "verdict_id") != verdict.verdict_id:
             raise _bad("verdict_id")
         return verdict
+
+
+def _test_kind_from_wire(obj: Mapping[str, object]) -> StatTestKind | None:
+    if is_null(obj, "test_kind"):
+        return None
+    return StatTestKind(require_enum(obj, "test_kind", allowed=[t.value for t in StatTestKind]))
+
+
+def _check_iso_date(value: object, field: str) -> None:
+    if not isinstance(value, str):
+        raise WireRefused(WireRefusalReason.WRONG_TYPE, field)
+    if _WINDOW_END_RE.match(value) is None:
+        raise _bad(field)
+    try:
+        if date.fromisoformat(value).isoformat() != value:
+            raise _bad(field)
+    except ValueError:
+        raise _bad(field) from None
 
 
 def _assumptions_from_wire(obj: Mapping[str, object]) -> tuple[Assumption, ...]:

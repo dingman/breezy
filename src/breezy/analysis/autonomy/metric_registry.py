@@ -39,6 +39,13 @@ FAMILY_PREREG_COLUMN: Final[str] = "family_prereg_sha256"
 RULING_SHA_COLUMNS: Final[tuple[str, str]] = (POLICY_RULING_COLUMN, FAMILY_PREREG_COLUMN)
 
 FORWARD_SHADOW_ONLY_COLUMNS: Final[tuple[str, ...]] = ("k_life", "alpha_k", "n_min_eff", "n_cap")
+#: E-25 (F7B-R2): non-null only on a FORWARD_SHADOW ``e_process`` verdict (null elsewhere).
+FORWARD_SHADOW_E_PROCESS_ONLY_COLUMNS: Final[tuple[str, ...]] = ("eta_ns", "window_end")
+#: E-25 rule 1: ``test_kind`` is null on every kind but FORWARD_SHADOW and LIVE_SEQUENTIAL.
+TEST_KIND_COLUMN: Final[str] = "test_kind"
+_NO_TEST_KIND_NULL: Final[frozenset[str]] = frozenset(
+    {TEST_KIND_COLUMN, *FORWARD_SHADOW_E_PROCESS_ONLY_COLUMNS}
+)
 _HEALTH_NULL: Final[frozenset[str]] = frozenset(
     {
         "n",
@@ -50,6 +57,7 @@ _HEALTH_NULL: Final[frozenset[str]] = frozenset(
         "eta_to_verdict_days",
         FAMILY_PREREG_COLUMN,
         *FORWARD_SHADOW_ONLY_COLUMNS,
+        *_NO_TEST_KIND_NULL,
     }
 )
 
@@ -58,10 +66,12 @@ _HEALTH_NULL: Final[frozenset[str]] = frozenset(
 NULL_COLUMNS_BY_KIND: Final = MappingProxyType(
     {
         KIND_OFFLINE_CHALLENGER: frozenset(
-            {"power", FAMILY_PREREG_COLUMN, *FORWARD_SHADOW_ONLY_COLUMNS}
+            {"power", FAMILY_PREREG_COLUMN, *FORWARD_SHADOW_ONLY_COLUMNS, *_NO_TEST_KIND_NULL}
         ),
         KIND_FORWARD_SHADOW: frozenset({FAMILY_PREREG_COLUMN}),
-        KIND_LIVE_SEQUENTIAL: frozenset(FORWARD_SHADOW_ONLY_COLUMNS),
+        KIND_LIVE_SEQUENTIAL: frozenset(
+            {*FORWARD_SHADOW_ONLY_COLUMNS, *FORWARD_SHADOW_E_PROCESS_ONLY_COLUMNS}
+        ),
         KIND_HEALTH: _HEALTH_NULL,
     }
 )

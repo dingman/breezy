@@ -55,6 +55,7 @@ from breezy.persistence.autonomy.schemas import (
 from breezy.persistence.autonomy.verdict import (
     ActionClass,
     Assumption,
+    StatTestKind,
     Verdict,
     VerdictKind,
     VerdictOutcome,
@@ -102,6 +103,8 @@ def _verdict(
         declared_action_class=ActionClass.NONE, produced_at_ns=produced,
         valid_until_ns=produced + 20 * HOUR_NS, producer_code_sha="d" * 64,
         subject_artefact_sha256=artefact, assumptions=(Assumption.NO_POLICY_RULING,),
+        # E-25 rule 1: test_kind is never null on FORWARD_SHADOW (fixture default only).
+        test_kind=StatTestKind.FIXED_N if kind is VerdictKind.FORWARD_SHADOW else None,
     )  # fmt: skip
 
 
