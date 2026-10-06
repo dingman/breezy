@@ -10,11 +10,24 @@ It reads no model or CLI value and no outcome, opens no network connection and w
 one JSON file (``--out``). SD for the MDE comes only from the pre-window and placebo arms of
 the ladder-implied mean's own change (R14); no post-release arm is computed here and no effect
 is estimated (``effect_estimate`` is null by construction).
+
+Conventions (binding text in the F13 plan r3 + review fixes S1-S5):
+
+* Rung values: an interior band ``gteLltU`` of ANY width is represented by ``L + (U - L) / 2``;
+  a rung that still cannot be parsed is counted (``skipped_rungs``), never guessed. Tails sit one
+  band-width beyond the neighbouring interior midpoint on both sides (``TAIL_CONVENTION``).
+* Placebo SD is hour-matched: placebo instants are kept only in the UTC hours in which the
+  source really releases (+-1 h). The pooled SD is reported beside it; the hour-matched one is
+  USED for the MDE. The MDE is one-sided (alpha = 0.025, Holm family m in {1, 2}).
+* Release -> market assignment (``RELEASE_DAY_ASSIGNMENT``): a release is matched to every open
+  market whose climate day it precedes, so a D-1 release is also an event of the D market.
+* ``n_eff`` clusters by climate date across stations and by station-day; the smaller is used.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as dt
 import json
 import math
@@ -25,6 +38,7 @@ import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
@@ -59,8 +73,23 @@ DEFAULT_MAX_PLACEBO_PER_STATION: Final[int] = 400
 SAME_CLOCK_TOLERANCE_S: Final[int] = 300
 #: A placebo window may not overlap an event window: exclude +-60 min around every release.
 PLACEBO_EXCLUSION_S: Final[int] = 3600
-#: Tail rungs have no bounded width; they sit this far beyond their bound (convention only).
+#: Tail rungs have no bounded width. Convention only: a tail sits ``TAIL_OFFSET_F`` (one band
+#: width) beyond the midpoint of its neighbouring interior band, on both sides.
 TAIL_OFFSET_F: Final[float] = 1.0
+TAIL_CONVENTION: Final[str] = (
+    "low tail lt<U>f = U - 0.5 - 1.0 and high tail gte<L>f = L + 0.5 + 1.0: one band-width "
+    "beyond the neighbouring interior midpoint on both sides; interior = lower + width / 2"
+)
+RELEASE_DAY_ASSIGNMENT: Final[str] = (
+    "a release is matched to every open market whose climate day it precedes within the study "
+    "horizon (a D-1 release is also an event of the D market); a release after a market's "
+    "climate day closed is never matched to it"
+)
+#: Release hours widen by this many hours either side to form the placebo hour band.
+HOUR_BAND_MARGIN_H: Final[int] = 1
+#: A pre-window arm is dropped when a previous release is closer than this (strictly less).
+OVERLAP_WINDOW_S: Final[int] = 3600
+_SKIPPED_EXAMPLES: Final[int] = 20
 _EXIT_REFUSED: Final[int] = 2
 _ALPHA: Final[float] = rt.ALPHA
 
@@ -103,29 +132,34 @@ class InstrumentKey:
     value_f: float
 
 
-def parse_instrument(name: str) -> InstrumentKey | None:
-    """The station, climate day and rung value of a tape instrument id; None if foreign."""
+def classify_instrument(name: str) -> tuple[InstrumentKey | None, bool]:
+    """``(key, skipped)``; ``skipped`` marks a known-station rung with an unparseable band."""
     match = _INSTRUMENT_RE.match(name)
     if match is None or match["city"] not in CITY_TO_STATION:
-        return None
+        return None, False
     try:
         day = dt.date.fromisoformat(match["date"])
     except ValueError:
-        return None
+        return None, False
     band = match["band"]
     value: float
     if (low := _LOW_RE.match(band)) is not None:
-        value = int(low["upper"]) - 1 - TAIL_OFFSET_F
+        value = int(low["upper"]) - 0.5 - TAIL_OFFSET_F
     elif (high := _HIGH_RE.match(band)) is not None:
-        value = int(high["lower"]) + TAIL_OFFSET_F
+        value = int(high["lower"]) + 0.5 + TAIL_OFFSET_F
     elif (interior := _INTERIOR_RE.match(band)) is not None:
-        lower = int(interior["lower"])
-        if int(interior["upper"]) != lower + 1:
-            return None
-        value = lower + 0.5
+        lower, upper = int(interior["lower"]), int(interior["upper"])
+        if upper <= lower:
+            return None, True
+        value = lower + (upper - lower) / 2.0
     else:
-        return None
-    return InstrumentKey(CITY_TO_STATION[match["city"]], day, band, value)
+        return None, True
+    return InstrumentKey(CITY_TO_STATION[match["city"]], day, band, value), False
+
+
+def parse_instrument(name: str) -> InstrumentKey | None:
+    """The station, climate day and rung value of a tape instrument id; None if unusable."""
+    return classify_instrument(name)[0]
 
 
 # ----------------------------------------------------------------------- reader
@@ -221,6 +255,8 @@ class WindowChange:
     panel_rungs: int
     dropout_rungs: int
     empty_side_rungs: int
+    panel_mass: float = 0.0
+    dropout_mass: float = 0.0
 
 
 def window_change(rungs: Sequence[RungSeries], start_ns: int, end_ns: int) -> WindowChange | None:
@@ -229,7 +265,12 @@ def window_change(rungs: Sequence[RungSeries], start_ns: int, end_ns: int) -> Wi
     if not panel.rungs:
         return None
     return WindowChange(
-        rt.signed_change(panel), len(panel.rungs), panel.dropout_count, panel.empty_side_count
+        rt.signed_change(panel),
+        len(panel.rungs),
+        panel.dropout_count,
+        panel.empty_side_count,
+        panel_mass=sum(r.p_t for r in panel.rungs),
+        dropout_mass=sum(r.p_t for r in panel.rungs if r.carried_forward),
     )
 
 
@@ -303,6 +344,9 @@ class _ArmTally:
     panel_rungs: int = 0
     dropout_rungs: int = 0
     empty_side_rungs: int = 0
+    overlapping_windows: int = 0
+    panel_mass: float = 0.0
+    dropout_mass: float = 0.0
 
     def record(self, result: WindowChange | None) -> None:
         self.n_events += 1
@@ -313,6 +357,8 @@ class _ArmTally:
         self.panel_rungs += result.panel_rungs
         self.dropout_rungs += result.dropout_rungs
         self.empty_side_rungs += result.empty_side_rungs
+        self.panel_mass += result.panel_mass
+        self.dropout_mass += result.dropout_mass
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -322,7 +368,41 @@ class _ArmTally:
             "panel_rungs": self.panel_rungs,
             "dropout_rungs": self.dropout_rungs,
             "empty_side_rungs": self.empty_side_rungs,
+            "overlapping_windows": self.overlapping_windows,
         }
+
+    def diagnostics(self) -> dict[str, float | None]:
+        """Dropout share (by rung count and by probability mass) and mean panel mass per window."""
+        return {
+            "dropout_share": _ratio(self.dropout_rungs, self.panel_rungs),
+            "dropout_mass_share": _ratio(self.dropout_mass, self.panel_mass),
+            "panel_mass_mean": _ratio(self.panel_mass, self.n_evaluated),
+        }
+
+
+def _ratio(numerator: float, denominator: float) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+#: Value variants kept per arm: every window / hour-matched windows, each also restricted to the
+#: windows with no dropout rung (the sensitivity arm: a dropout rung is carried flat, which
+#: shrinks the SD, so the sensitivity SD is read from windows that have none).
+_VARIANTS: Final[tuple[str, ...]] = ("pooled", "matched", "pooled_excl", "matched_excl")
+_Values = dict[str, dict[str, list[float]]]
+
+
+def _new_values() -> _Values:
+    return {variant: defaultdict(list) for variant in _VARIANTS}
+
+
+def _record_values(values: _Values, arm: str, result: WindowChange, *, hour_matched: bool) -> None:
+    values["pooled"][arm].append(result.change)
+    if hour_matched:
+        values["matched"][arm].append(result.change)
+    if result.dropout_rungs == 0:  # sensitivity: a carried-forward rung contributes a flat 0
+        values["pooled_excl"][arm].append(result.change)
+        if hour_matched:
+            values["matched_excl"][arm].append(result.change)
 
 
 @dataclass(slots=True)
@@ -332,10 +412,12 @@ class _Stratum:
     releases_ns: list[int]
     same_clock_by_day: dict[dt.date, list[int]]
     metar_by_day: dict[dt.date, list[int]]
-    events_by_day: dict[dt.date, list[int]]
+    hour_band: tuple[int, ...]
+    overlapping_ns: frozenset[int]
     tape_days: int = 0
     same_clock_pool: int = 0
     metar_pool: int = 0
+    metar_matched_pool: int = 0
 
 
 def _utc_days(since: dt.date, until: dt.date) -> list[dt.date]:
@@ -353,6 +435,40 @@ def _by_climate_day(instants: Iterable[int], station: str) -> dict[dt.date, list
     for instant in sorted(instants):
         grouped[local_standard_date(instant, offset)].append(instant)
     return grouped
+
+
+def _utc_hour(instant_ns: int) -> int:
+    return (instant_ns // _NS // 3600) % 24
+
+
+def release_hour_band(releases_ns: Iterable[int]) -> tuple[int, ...]:
+    """UTC hours in which the source releases, widened by ``HOUR_BAND_MARGIN_H`` each side."""
+    hours = {_utc_hour(t) for t in releases_ns}
+    return tuple(
+        sorted(
+            {
+                (hour + step) % 24
+                for hour in hours
+                for step in range(-HOUR_BAND_MARGIN_H, HOUR_BAND_MARGIN_H + 1)
+            }
+        )
+    )
+
+
+def overlapping_releases(sorted_releases_ns: Sequence[int]) -> frozenset[int]:
+    """Releases whose pre-window would contain the previous release (gap < ``OVERLAP_WINDOW_S``)."""
+    limit = OVERLAP_WINDOW_S * _NS
+    return frozenset(b for a, b in pairwise(sorted_releases_ns) if b - a < limit)
+
+
+def events_for_market(
+    stratum: _Stratum, climate_day: dt.date, first_ns: int, last_ns: int
+) -> list[int]:
+    """Releases inside the market's tape span whose climate day does not follow the market's."""
+    lo = bisect.bisect_left(stratum.releases_ns, first_ns)
+    hi = bisect.bisect_right(stratum.releases_ns, last_ns)
+    offset = STATION_STD_OFFSET_HOURS[stratum.station]
+    return [t for t in stratum.releases_ns[lo:hi] if local_standard_date(t, offset) <= climate_day]
 
 
 def _build_stratum(
@@ -383,7 +499,8 @@ def _build_stratum(
         ordered,
         _by_climate_day(_stride(sorted(same_clock), cap), station),
         _by_climate_day(_stride(sorted(set(metar)), cap), station),
-        _by_climate_day(ordered, station),
+        release_hour_band(ordered),
+        overlapping_releases(ordered),
     )
 
 
@@ -392,17 +509,28 @@ def _build_stratum(
 
 def _discover(
     tape: Path, stations: Sequence[str], since: dt.date, until: dt.date
-) -> dict[tuple[str, dt.date], list[tuple[InstrumentKey, Path]]]:
+) -> tuple[dict[tuple[str, dt.date], list[tuple[InstrumentKey, Path]]], list[str]]:
+    """Group the tape's rungs by (station, climate day); also name every unparseable rung."""
     groups: dict[tuple[str, dt.date], list[tuple[InstrumentKey, Path]]] = defaultdict(list)
+    skipped: list[str] = []
     base = tape / "data" / DEPTH_DIR
     if not base.is_dir():
-        return groups
+        return groups, skipped
     for directory in sorted(p for p in base.iterdir() if p.is_dir()):
-        key = parse_instrument(directory.name)
+        key, unparseable = classify_instrument(directory.name)
+        if unparseable and _in_scope(directory.name, stations, since, until):
+            skipped.append(directory.name)
         if key is None or key.station not in stations or not since <= key.climate_day <= until:
             continue
         groups[(key.station, key.climate_day)].append((key, directory))
-    return groups
+    return groups, skipped
+
+
+def _in_scope(name: str, stations: Sequence[str], since: dt.date, until: dt.date) -> bool:
+    match = _INSTRUMENT_RE.match(name)
+    if match is None or CITY_TO_STATION.get(match["city"]) not in stations:
+        return False
+    return since <= dt.date.fromisoformat(match["date"]) <= until
 
 
 def _load_rungs(members: Sequence[tuple[InstrumentKey, Path]]) -> list[RungSeries]:
@@ -422,7 +550,7 @@ def _evaluate_window(
     rungs: Sequence[RungSeries],
     window_s: int,
     tallies: dict[str, _ArmTally],
-    values: dict[str, list[float]],
+    values: _Values,
 ) -> int:
     span = window_s * _NS
     firsts = [int(r.top.ts[0]) for r in rungs if r.top.n_rows]
@@ -435,57 +563,97 @@ def _evaluate_window(
     metar = _covered(stratum.metar_by_day.get(day, []), first, last, span)
     stratum.same_clock_pool += len(same)
     stratum.metar_pool += len(metar)
+    stratum.metar_matched_pool += sum(_utc_hour(t) in stratum.hour_band for t in metar)
     plan = (
-        ("pre_window", stratum.events_by_day.get(day, []), -span, 0),
+        ("pre_window", events_for_market(stratum, day, first, last), -span, 0),
         ("placebo_same_clock", same, 0, span),
         ("placebo_metar_offset", metar, 0, span),
     )
     evaluated_events = 0
     for arm, instants, lo, hi in plan:
         for instant in instants:
+            if arm == "pre_window" and instant in stratum.overlapping_ns:
+                tallies[arm].overlapping_windows += 1
+                continue
             result = window_change(rungs, instant + lo, instant + hi)
             tallies[arm].record(result)
-            if result is not None:
-                values[arm].append(result.change)
-                evaluated_events += arm == "pre_window"
+            if result is None:
+                continue
+            matched = arm == "pre_window" or _utc_hour(instant) in stratum.hour_band
+            _record_values(values, arm, result, hour_matched=matched)
+            evaluated_events += arm == "pre_window"
     return evaluated_events
 
 
+def _sd_and_mde(
+    series: Mapping[str, Sequence[float]], n_eff: float, family_size: int
+) -> dict[str, Any]:
+    """SD over the supplied arms and the MDE at each Holm family size; ``error`` on failure."""
+    arms = sorted(name for name, values in series.items() if values)
+    out: dict[str, Any] = {"sd_arms": arms, "sd": None, "mde": None, "by_family_size": None}
+    try:
+        sd = rt.pooled_sd({name: series[name] for name in arms})
+        by_family = {str(m): rt.mde(sd=sd, n_eff=n_eff, family_size=m) for m in (1, 2)}
+    except ValueError as exc:
+        out["error"] = str(exc)
+        return out
+    out.update(sd=sd, by_family_size=by_family, mde=by_family[str(family_size)])
+    return out
+
+
 def _mde_section(
-    values: Mapping[str, Sequence[float]],
-    cluster_sizes: Sequence[int],
+    values: _Values,
+    clusters: Mapping[str, Sequence[int]],
     chosen: int,
     plausible: float | None,
     icc: float,
+    tallies: Mapping[str, _ArmTally],
 ) -> dict[str, Any]:
-    sd_arms = sorted(name for name, series in values.items() if series)
-    n_eff = rt.effective_n(cluster_sizes, icc=icc)
+    n_eff_station_day = rt.effective_n(clusters["station_day"], icc=icc)
+    n_eff_date = rt.effective_n(clusters["climate_date"], icc=icc)
+    n_eff = min(n_eff_station_day, n_eff_date)
+    matched = _sd_and_mde(values["matched"], n_eff, chosen)
+    pooled = _sd_and_mde(values["pooled"], n_eff, chosen)
+    sensitivity = _sd_and_mde(values["matched_excl"], n_eff, chosen)
     section: dict[str, Any] = {
-        "sd_arms": sd_arms,
+        "sd_arms": matched["sd_arms"],
         "chosen_family_size": chosen,
+        "sidedness": "one-sided",
+        "sd_basis": "hour_matched",
         "n_eff": n_eff,
-        "n_clusters": len(cluster_sizes),
+        "n_eff_station_day": n_eff_station_day,
+        "n_eff_climate_date": n_eff_date,
+        "n_clusters": len(clusters["station_day"]),
+        "n_clusters_climate_date": len(clusters["climate_date"]),
         "units": "ladder-implied expected daily max, degrees F per window",
         "plausible_effect": plausible,
-        "sd": None,
-        "by_family_size": None,
-        "mde": None,
+        "sd": matched["sd"],
+        "sd_hour_matched": matched["sd"],
+        "sd_pooled": pooled["sd"],
+        "by_family_size": matched["by_family_size"],
+        "by_family_size_pooled": pooled["by_family_size"],
+        "mde": matched["mde"],
         "underpowered": None,
+        "sensitivity_excluding_dropout": {
+            key: sensitivity[key] for key in ("sd_arms", "sd", "mde", "by_family_size")
+        },
+        "per_arm": {
+            arm: {
+                **tally.diagnostics(),
+                "n_values_pooled": len(values["pooled"].get(arm, [])),
+                "n_values_hour_matched": len(values["matched"].get(arm, [])),
+            }
+            for arm, tally in sorted(tallies.items())
+        },
     }
-    try:
-        sd = rt.pooled_sd({name: values[name] for name in sd_arms})
-        by_family = {str(m): rt.mde(sd=sd, n_eff=n_eff, family_size=m) for m in (1, 2)}
-    except ValueError as exc:
-        section["error"] = str(exc)
-        return section
-    section.update(
-        sd=sd,
-        by_family_size=by_family,
-        mde=by_family[str(chosen)],
-        underpowered=rt.is_underpowered(
-            mde_value=by_family[str(chosen)], plausible_effect=plausible
-        ),
-    )
+    if "error" in matched:
+        section["error"] = matched["error"]
+    if "error" in sensitivity:
+        section["sensitivity_excluding_dropout"]["error"] = sensitivity["error"]
+    if matched["mde"] is not None:
+        section["underpowered"] = rt.is_underpowered(
+            mde_value=matched["mde"], plausible_effect=plausible
+        )
     return section
 
 
@@ -516,6 +684,8 @@ def _stratum_report(
         "events_per_day": per_day,
         "same_clock_pool_days_total": stratum.same_clock_pool,
         "metar_offset_pool_instants_total": stratum.metar_pool,
+        "metar_offset_pool_hour_matched_total": stratum.metar_matched_pool,
+        "release_hour_band_utc": list(stratum.hour_band),
     }
 
 
@@ -550,12 +720,11 @@ def build_report(args: argparse.Namespace, census: Mapping[str, Any]) -> dict[st
     tallies = {
         name: _ArmTally() for name in ("pre_window", "placebo_same_clock", "placebo_metar_offset")
     }
-    values: dict[str, list[float]] = defaultdict(list)
+    values = _new_values()
     evaluated: dict[tuple[str, dt.date], int] = {}
     windows: list[dict[str, Any]] = []
-    for (station, day), members in sorted(
-        _discover(args.tape_catalog, stations, args.since, args.until).items()
-    ):
+    discovered, skipped = _discover(args.tape_catalog, stations, args.since, args.until)
+    for (station, day), members in sorted(discovered.items()):
         rungs = _load_rungs(members)
         windows.append(window_inventory(station, day, rungs))
         if station in strata:
@@ -564,7 +733,13 @@ def build_report(args: argparse.Namespace, census: Mapping[str, Any]) -> dict[st
             )
     nbp = bool(census.get("nbp", {}).get("vintages_present", False))
     family = _b1_family(nbp)
-    cluster_sizes = [n for n in evaluated.values() if n]
+    by_date: dict[dt.date, int] = defaultdict(int)
+    for (_station, day), count in evaluated.items():
+        by_date[day] += count
+    clusters = {
+        "station_day": [n for n in evaluated.values() if n],
+        "climate_date": [n for n in by_date.values() if n],
+    }
     return {
         "inputs": {
             "tape_catalog": str(args.tape_catalog),
@@ -585,12 +760,21 @@ def build_report(args: argparse.Namespace, census: Mapping[str, Any]) -> dict[st
             "cluster": "climate_day",
             "icc": args.icc,
         },
-        "tape_inventory": {"n_station_windows": len(windows), "station_windows": windows},
+        "tape_inventory": {
+            "n_station_windows": len(windows),
+            "station_windows": windows,
+            "skipped_rungs": len(skipped),
+            "skipped_rung_examples": skipped[:_SKIPPED_EXAMPLES],
+        },
+        "tail_convention": TAIL_CONVENTION,
+        "release_day_assignment": RELEASE_DAY_ASSIGNMENT,
         "cadence_60s": cadence_verdict(windows),
         "strata": {s: _stratum_report(st, evaluated) for s, st in sorted(strata.items())},
         "placebo": _placebo_section(strata),
         "arms": {name: tally.as_dict() for name, tally in tallies.items()},
-        "mde": _mde_section(values, cluster_sizes, family["size"], args.plausible_effect, args.icc),
+        "mde": _mde_section(
+            values, clusters, family["size"], args.plausible_effect, args.icc, tallies
+        ),
         "b1_family": family,
         "effect_estimate": None,
     }

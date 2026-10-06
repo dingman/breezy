@@ -579,3 +579,408 @@ def test_script_writes_only_through_the_revision_store_and_never_names_a_settlem
     for banned in ("breezy.runtime", "breezy.exec", "adapters", "settlement", "cli_parse"):
         assert banned not in flat
     assert "us_source_revision_store" in flat
+
+
+# ======================================================================
+# Review fixes P2-P8 (2026-10-06). Appended; no earlier assertion was changed.
+# ======================================================================
+
+_BAD_GAP_START = dt.date(2026, 11, 5)
+
+
+def _unplaceable_catalog(_wfo: str, _sdate: dt.date, _limit: int) -> str:
+    # Nov has no day 31: the header resolves to 12-31, a 56 day gap, which is unplaceable.
+    return _okx_product("311901")
+
+
+# ---- P2: an unplaceable header ends that station, not the run
+
+
+def test_p2_a_gap_over_45_days_marks_the_leg_unplaceable_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    report = _leg(
+        tmp_path,
+        _unplaceable_catalog,
+        start=_BAD_GAP_START,
+        end=dt.date(2027, 1, 31),
+        page_limit=10,
+    )
+
+    assert report.status == "unplaceable_header"
+    assert report.resume_sdate == _BAD_GAP_START
+    assert report.refused == {"unplaceable_header": 1}
+    assert report.appended == 0
+
+
+def test_p2_main_continues_with_the_next_station_exits_1_and_still_writes_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    seen: list[str] = []
+
+    def factory(**_kwargs: Any) -> Any:
+        def fetch(wfo: str, _sdate: dt.date, _limit: int) -> str:
+            seen.append(wfo)
+            return _okx_product("311901") if wfo == "OKX" else ""
+
+        return fetch
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--legs",
+            "pfm",
+            "--stations",
+            "KNYC",
+            "KLAX",
+            "--start-date",
+            "2026-11-05",
+            "--end-date",
+            "2027-01-31",
+        ),
+        clock=lambda: _utc(9, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=factory,
+    )
+
+    assert rc == 1
+    assert seen == ["OKX", "LOX"]
+    report = json.loads((tmp_path / "report.json").read_text())
+    statuses = {leg["station"]: leg["status"] for leg in report["pfm"]["legs"]}
+    assert statuses == {"KNYC": "unplaceable_header", "KLAX": "complete"}
+
+
+# ---- P7: a header that cannot be placed unambiguously is refused, not mis-placed
+
+
+def test_p7_an_out_of_order_header_is_refused_not_pushed_a_month_ahead(tmp_path: Path) -> None:
+    def fetch(_wfo: str, _sdate: dt.date, _limit: int) -> str:
+        # 18:01 after 19:01 on the same day would only "fit" as the next month's 5th.
+        return _okx_product("051901") + _okx_product("051801")
+
+    report = _leg(tmp_path, fetch, page_limit=10)
+
+    assert report.status == "unplaceable_header"
+    assert report.appended == 0
+    assert census.pfm_issuance_times(tmp_path) == {}
+    assert report.refused == {"unplaceable_header": 1}
+
+
+def test_p7_a_genuine_month_rollover_still_places() -> None:
+    report = bf.LegReport(station="KNYC", wfo="OKX")
+    products = (_okx_product("311901"), _okx_product("011901"))
+
+    paired = bf._place(products, dt.date(2026, 10, 31), report)
+
+    assert [issued for _p, issued in paired] == [
+        dt.datetime(2026, 10, 31, 19, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 11, 1, 19, 1, tzinfo=dt.UTC),
+    ]
+
+
+# ---- P3: store errors degrade the leg and the exit code
+
+
+class _FailingStore:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def append_if_new(self, **_kwargs: Any) -> Any:
+        raise self._exc
+
+
+def _leg_with_store(store: Any, fetch: Any) -> bf.LegReport:
+    clk = _Clock(_utc(9, 12))
+    return bf.run_pfm_leg(
+        station="KNYC",
+        start=dt.date(2026, 10, 5),
+        end=dt.date(2026, 10, 9),
+        fetch=fetch,
+        store=store,
+        clock_ns=clk,
+        window_ok=lambda _n: True,
+        sleep=_Sleeps(),
+        page_limit=10,
+    )
+
+
+def test_p3_a_revision_store_integrity_error_degrades_the_leg_not_refuses_it() -> None:
+    from breezy.persistence.us_source_revision_store import RevisionStoreIntegrityError
+
+    report = _leg_with_store(
+        _FailingStore(RevisionStoreIntegrityError("digest not in set")),
+        _Catalog(["051901"]),
+    )
+
+    assert report.status == "degraded"
+    assert report.refused_total == 0  # `refused` is for expected parse refusals only
+    assert report.store_errors == {"RevisionStoreIntegrityError": 1}
+    assert report.to_dict()["store_errors"] == {"RevisionStoreIntegrityError": 1}
+
+
+def test_p3_a_payload_refused_by_the_store_is_an_expected_refusal() -> None:
+    from breezy.persistence.us_source_revision_store import RevisionPayloadRefusedError
+
+    report = _leg_with_store(
+        _FailingStore(RevisionPayloadRefusedError("not csv")), _Catalog(["051901"])
+    )
+
+    assert report.status == "complete"
+    assert report.refused == {"RevisionPayloadRefusedError": 1}
+    assert report.store_errors == {}
+
+
+def test_p3_main_exits_1_when_a_leg_is_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from breezy.persistence.us_source_revision_store import RevisionStoreIntegrityError
+
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+
+    class _Broken:
+        def __init__(self, *_a: Any, **_k: Any) -> None: ...
+
+        def append_if_new(self, **_kwargs: Any) -> Any:
+            raise RevisionStoreIntegrityError("boom")
+
+    monkeypatch.setattr(bf, "UsSourceRevisionStore", _Broken)
+    catalog = _Catalog(["051901"])
+
+    rc = bf.main(
+        _args(tmp_path, "--apply", "--request-budget", "50", "--legs", "pfm", "--stations", "KNYC"),
+        clock=lambda: _utc(9, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=lambda **_k: catalog,
+    )
+
+    assert rc == 1
+    leg = json.loads((tmp_path / "report.json").read_text())["pfm"]["legs"][0]
+    assert leg["status"] == "degraded"
+
+
+# ---- P4: byte-identical framing with the live collector
+
+
+def _collector_payload(response_text: str) -> bytes:
+    """What ``us_source_collector.default_pfm_fetcher`` stores: the whole response, UTF-8."""
+    return response_text.encode("utf-8")
+
+
+@pytest.mark.parametrize("suffix", ["\x03", "\x03\n", "\n\x03"])
+def test_p4_a_live_collected_issuance_is_unchanged_not_a_new_revision_under_backfill(
+    tmp_path: Path, suffix: str
+) -> None:
+    response = _okx_product("051901") + suffix  # a limit=1 AFOS response, SOH ... ETX
+    clk = _Clock(_utc(9, 12))
+    store = _store(tmp_path, clk)
+    store.append_if_new(
+        source=US_PFM_AFOS_SOURCE,
+        station="KNYC",
+        run_ts_ns=_utc(5, 19, 1),
+        model="OKX",
+        payload=_collector_payload(response),
+    )
+
+    report = _leg(tmp_path, lambda _w, _s, _l: response, page_limit=10)
+
+    assert (report.appended, report.unchanged) == (0, 1)
+    assert store.revisions(US_PFM_AFOS_SOURCE, "KNYC", _utc(5, 19, 1), "pfm")[-1][0] == 0
+
+
+def test_p4_split_raw_products_keeps_each_product_exactly_as_the_response_framed_it() -> None:
+    one = _okx_product("051901") + "\x03"
+    two = _okx_product("061901") + "\x03\n"
+
+    assert bf.split_raw_products(one) == (one,)
+    assert bf.split_raw_products(one + two) == (one, two)
+    assert bf.split_raw_products("  \n") == ()
+
+
+# ---- P5: the GFS leg is re-checked against the launch window when it actually starts
+
+
+def test_p5_gfs_is_refused_and_recorded_when_the_pfm_leg_ate_the_time_before_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    clock = _Clock(_utc(9, 12, 0))
+    calls: list[list[str]] = []
+
+    def factory(**_kwargs: Any) -> Any:
+        def fetch(_wfo: str, _sdate: dt.date, _limit: int) -> str:
+            clock.now = _utc(9, 15, 45)  # the PFM leg ran for hours
+            return ""
+
+        return fetch
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--legs",
+            "pfm",
+            "gfs",
+            "--stations",
+            "KNYC",
+            "--max-runtime-s",
+            "3600",
+            "--start-date",
+            "2022-01-01",
+        ),
+        clock=clock,
+        sleep=lambda _s: None,
+        pfm_fetch_factory=factory,
+        gfs_runner=_recording_runner(calls),
+    )
+
+    assert rc == 1
+    assert calls == []
+    gfs = json.loads((tmp_path / "report.json").read_text())["gfs"]
+    assert gfs["status"] == "refused_launch_window"
+    assert gfs["max_runtime_s"] == 3600
+    assert gfs["seconds_to_window"] == 45 * 60
+
+
+def test_p5_gfs_start_records_the_remaining_time_to_the_window_when_it_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    calls: list[list[str]] = []
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "5",
+            "--legs",
+            "gfs",
+            "--max-runtime-s",
+            "600",
+            "--start-date",
+            "2022-01-01",
+        ),
+        clock=lambda: _utc(6, 12, 0),
+        gfs_runner=_recording_runner(calls),
+    )
+
+    assert rc == 0
+    gfs = json.loads((tmp_path / "report.json").read_text())["gfs"]
+    assert gfs["seconds_to_window"] == 4 * 3600 + 30 * 60
+    assert gfs["max_runtime_s"] == 600
+
+
+# ---- P6: a throttle or a launch-window pause stops everything that remains
+
+
+def test_p6_a_throttle_stops_remaining_stations_and_the_gfs_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    fetched: list[str] = []
+    calls: list[list[str]] = []
+
+    def factory(**_kwargs: Any) -> Any:
+        def fetch(wfo: str, _sdate: dt.date, _limit: int) -> str:
+            fetched.append(wfo)
+            raise RateLimitedError("Too many requests", retry_after=None)
+
+        return fetch
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--legs",
+            "pfm",
+            "gfs",
+            "--stations",
+            "KNYC",
+            "KLAX",
+            "KMIA",
+            "--start-date",
+            "2022-01-01",
+        ),
+        clock=lambda: _utc(6, 12, 0),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=factory,
+        gfs_runner=_recording_runner(calls),
+    )
+
+    assert rc == 1
+    assert set(fetched) == {"OKX"}
+    assert calls == []
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert [leg["station"] for leg in report["pfm"]["legs"]] == ["KNYC"]
+    assert report["pfm"]["stopped"] == {
+        "reason": "throttled",
+        "skipped_stations": ["KLAX", "KMIA"],
+    }
+    assert report["gfs"]["status"] == "skipped_after_stop"
+
+
+def test_p6_a_launch_window_pause_stops_remaining_stations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    fetched: list[str] = []
+
+    def factory(**_kwargs: Any) -> Any:
+        def fetch(wfo: str, _sdate: dt.date, _limit: int) -> str:
+            fetched.append(wfo)
+            return ""
+
+        return fetch
+
+    rc = bf.main(
+        _args(
+            tmp_path,
+            "--apply",
+            "--request-budget",
+            "50",
+            "--legs",
+            "pfm",
+            "--stations",
+            "KNYC",
+            "KLAX",
+        ),
+        clock=lambda: _utc(6, 16, 45),
+        sleep=lambda _s: None,
+        pfm_fetch_factory=factory,
+    )
+
+    assert rc == 1
+    assert fetched == []
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert [leg["status"] for leg in report["pfm"]["legs"]] == ["paused_launch_window"]
+    assert report["pfm"]["stopped"]["skipped_stations"] == ["KLAX"]
+
+
+# ---- P8: the archive root may not sit in the holdout or the live data root
+
+
+def test_p8_archive_root_under_the_live_data_root_is_refused_except_the_us_source_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = tmp_path / "live"
+    monkeypatch.setattr(bf, "LIVE_DATA_ROOT", live)
+
+    for bad in (live, live / "catalog" / "quote_tape", live / "exec_store"):
+        argv = ["--dry-run", "--legs", "pfm", "--archive-root", str(bad)]
+        assert bf.main(argv) == 2, bad
+    ok = ["--dry-run", "--legs", "pfm", "--archive-root", str(live / "us_source_archive")]
+    assert bf.main(ok) == 0
+
+
+def test_p8_archive_root_in_a_holdout_directory_is_refused(tmp_path: Path) -> None:
+    argv = ["--dry-run", "--legs", "pfm", "--archive-root", str(tmp_path / "Holdout_2026" / "a")]
+
+    assert bf.main(argv) == 2

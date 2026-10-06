@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from breezy.analysis import release_timing as rt
 from scripts.analysis import release_timing_b0 as b0
 
 _NS = 1_000_000_000
@@ -152,8 +153,10 @@ def test_parse_instrument_maps_city_day_and_rung_value() -> None:
     assert (interior.station, interior.climate_day) == ("KNYC", dt.date(2026, 9, 2))
     assert interior.rung_id == "gte80lt81f"
     assert interior.value_f == pytest.approx(80.5)
-    assert low.value_f == pytest.approx(79 - b0.TAIL_OFFSET_F)
-    assert high.value_f == pytest.approx(94 + b0.TAIL_OFFSET_F)
+    # S4 (2026-10-06) superseded the earlier 79 - 1.0 / 94 + 1.0 tail convention: the tails now
+    # sit one band-width beyond the neighbouring interior midpoint (78.5 / 95.5).
+    assert low.value_f == pytest.approx(80 - 0.5 - b0.TAIL_OFFSET_F)
+    assert high.value_f == pytest.approx(94 + 0.5 + b0.TAIL_OFFSET_F)
 
 
 @pytest.mark.parametrize(
@@ -432,3 +435,302 @@ def test_script_imports_no_network_client_no_outcome_and_no_model_module() -> No
         "nautilus_trader",
     ):
         assert banned not in flat
+
+
+# ======================================================================
+# Review fixes S1-S5 (2026-10-06). Added after the original B0 tests; no earlier assertion above
+# was changed except the tail-value convention in the parse test (see S4 note there).
+# ======================================================================
+
+
+def _ladder_tape(
+    root: Path,
+    city: str,
+    day: int,
+    bands: tuple[str, ...],
+    start: tuple[int, int],
+    end: tuple[int, int],
+    bid_at: Callable[[int, int, int], float],
+    *,
+    step_s: int = 30,
+    empty: Callable[[int, int, int], bool] | None = None,
+) -> None:
+    """Write one ladder; ``bid_at(ts_ns, row, rung_index)`` gives its bid, ask = bid + 0.02."""
+    ts = list(range(_utc_ns(*start), _utc_ns(*end), step_s * _NS))
+    for index, band in enumerate(bands):
+        bid = [bid_at(t, k, index) for k, t in enumerate(ts)]
+        sizes = [
+            0.0 if (empty is not None and empty(t, k, index)) else 1.0 for k, t in enumerate(ts)
+        ]
+        _write_depth(
+            root,
+            _instrument(city, f"2026-09-{day:02d}", band),
+            ts,
+            bid,
+            [b + 0.02 for b in bid],
+            bid_size=sizes,
+        )
+
+
+def _run_census(
+    tmp_path: Path, census_obj: dict[str, Any], argv_extra: list[str] | None = None
+) -> dict[str, Any]:
+    census_path = tmp_path / "census_custom.json"
+    census_path.write_text(json.dumps(census_obj))
+    out = tmp_path / "report.json"
+    rc = b0.main(
+        [
+            "--tape-catalog",
+            str(tmp_path / "tape"),
+            "--census-json",
+            str(census_path),
+            "--since",
+            "2026-09-01",
+            "--until",
+            "2026-09-04",
+            "--out",
+            str(out),
+            *(argv_extra or []),
+        ],
+        cap=lambda _gib: 0,
+    )
+    assert rc == 0
+    report: dict[str, Any] = json.loads(out.read_text())
+    return report
+
+
+def _wavy(ts: int, k: int, index: int) -> float:
+    return 0.30 + 0.04 * math.sin(k / 30.0 + index)
+
+
+# ---- S1: interior bands of any width are parsed, the rest is counted
+
+
+def test_s1_wide_interior_band_uses_its_midpoint_and_is_never_dropped() -> None:
+    two = b0.parse_instrument(_instrument("nyc", "2026-09-02", "gte80lt82f"))
+    five = b0.parse_instrument(_instrument("nyc", "2026-09-02", "gte80lt85f"))
+
+    assert two is not None and five is not None
+    assert two.value_f == pytest.approx(81.0)  # lower + width / 2
+    assert five.value_f == pytest.approx(82.5)
+
+
+@pytest.mark.parametrize("band", ["gte83lt83f", "gte84lt83f", "weirdband"])
+def test_s1_an_unparseable_known_station_rung_is_none_not_a_guess(band: str) -> None:
+    assert b0.parse_instrument(_instrument("nyc", "2026-09-02", band)) is None
+
+
+def test_s1_report_counts_every_rung_still_unparseable(tmp_path: Path) -> None:
+    _ladder_tape(
+        tmp_path / "tape",
+        "nyc",
+        2,
+        ("lt80f", "gte80lt82f", "gte83lt83f", "weirdband"),
+        (2, 4),
+        (3, 6),
+        _wavy,
+    )
+
+    report = _run(tmp_path)
+
+    window = report["tape_inventory"]["station_windows"][0]
+    assert window["n_instruments"] == 2  # lt80f and the 2 F wide band
+    assert report["tape_inventory"]["skipped_rungs"] == 2
+    assert sorted(report["tape_inventory"]["skipped_rung_examples"]) == [
+        _instrument("nyc", "2026-09-02", "gte83lt83f"),
+        _instrument("nyc", "2026-09-02", "weirdband"),
+    ]
+
+
+# ---- S2: hour-matched placebo SD
+
+
+def _hour_of(ts: int) -> int:
+    return (ts // _NS // 3600) % 24
+
+
+def _calm_in_band_wild_outside(ts: int, k: int, index: int) -> float:
+    if 8 <= _hour_of(ts) < 23:
+        return 0.30 + 0.0005 * math.sin(k / 7.0 + index)
+    return 0.30 + 0.25 * (1.0 if (ts // _NS // 600) % 2 else -1.0)
+
+
+def test_s2_placebo_sd_is_hour_matched_to_the_release_band_and_that_sd_drives_the_mde(
+    tmp_path: Path,
+) -> None:
+    for day in (2, 3):
+        _ladder_tape(
+            tmp_path / "tape",
+            "nyc",
+            day,
+            ("lt80f", "gte80lt81f", "gte82lt83f"),
+            (day, 4),
+            (day + 1, 6),
+            _calm_in_band_wild_outside,
+        )
+
+    report = _run(tmp_path)
+
+    mde = report["mde"]
+    assert mde["sd_pooled"] > 5 * mde["sd_hour_matched"] > 0
+    assert mde["sd"] == pytest.approx(mde["sd_hour_matched"])
+    assert mde["by_family_size"]["1"] == pytest.approx(
+        rt.mde(sd=mde["sd_hour_matched"], n_eff=mde["n_eff"], family_size=1)
+    )
+    assert report["strata"]["KNYC"]["release_hour_band_utc"] == list(range(8, 22))
+    assert mde["sd_basis"] == "hour_matched"
+
+
+# ---- S3: climate-date clustering across stations, release -> market assignment
+
+
+def test_s3_n_eff_clusters_by_climate_date_across_stations_and_uses_the_smaller(
+    tmp_path: Path,
+) -> None:
+    for city in ("nyc", "mia"):
+        _ladder_tape(
+            tmp_path / "tape", city, 2, ("lt80f", "gte80lt81f", "gte82lt83f"), (2, 4), (3, 6), _wavy
+        )
+    times = [_utc_ns(2, h, 15) for h in range(9, 21)]
+    census = {
+        "pfm": {"OKX": {"issuance_times_ns": times}, "MFL": {"issuance_times_ns": times}},
+        "nbp": {"vintages_present": False},
+    }
+
+    report = _run_census(tmp_path, census)
+
+    mde = report["mde"]
+    assert mde["n_eff_station_day"] == pytest.approx(2.0)
+    assert mde["n_eff_climate_date"] == pytest.approx(1.0)
+    assert mde["n_eff"] == pytest.approx(1.0)
+    assert mde["n_clusters_climate_date"] == 1
+
+
+def test_s3_a_release_is_matched_to_every_open_market_whose_climate_day_it_precedes(
+    tmp_path: Path,
+) -> None:
+    # The 09-03 market is quoted from 09-02 12:00Z; a 09-02 release (D-1) precedes it.
+    _ladder_tape(
+        tmp_path / "tape", "nyc", 3, ("lt80f", "gte80lt81f", "gte82lt83f"), (2, 12), (4, 6), _wavy
+    )
+    census = {
+        "pfm": {"OKX": {"issuance_times_ns": [_utc_ns(2, 20, 15), _utc_ns(3, 10, 15)]}},
+        "nbp": {"vintages_present": False},
+    }
+
+    report = _run_census(tmp_path, census)
+
+    assert report["arms"]["pre_window"]["n_events"] == 2
+    rule = report["release_day_assignment"]
+    assert "D-1" in rule and "every open market" in rule
+
+
+def test_s3_a_release_after_the_market_climate_day_is_not_matched(tmp_path: Path) -> None:
+    _ladder_tape(
+        tmp_path / "tape", "nyc", 2, ("lt80f", "gte80lt81f", "gte82lt83f"), (2, 4), (4, 6), _wavy
+    )
+    # 09-03 15:15Z is local 09-03 10:15: after the 09-02 climate day closed.
+    census = {
+        "pfm": {"OKX": {"issuance_times_ns": [_utc_ns(2, 12, 15), _utc_ns(3, 15, 15)]}},
+        "nbp": {"vintages_present": False},
+    }
+
+    report = _run_census(tmp_path, census)
+
+    assert report["arms"]["pre_window"]["n_events"] == 1
+
+
+# ---- S4: symmetric tail representative values
+
+
+def test_s4_tails_sit_one_band_width_beyond_the_neighbouring_interior_midpoint() -> None:
+    low = b0.parse_instrument(_instrument("nyc", "2026-09-02", "lt80f"))
+    high = b0.parse_instrument(_instrument("nyc", "2026-09-02", "gte94f"))
+
+    assert low is not None and high is not None
+    assert low.value_f == pytest.approx(80 - 0.5 - 1.0)  # U - 0.5 - 1.0
+    assert high.value_f == pytest.approx(94 + 0.5 + 1.0)  # L + 0.5 + 1.0
+    assert "one band-width" in (b0.__doc__ or "") + b0.TAIL_CONVENTION
+
+
+# ---- S5: dropout/mass diagnostics, sensitivity MDE, one-sided label, overlap
+
+
+def test_s5_window_change_reports_panel_mass_and_dropout_mass() -> None:
+    rungs = _rungs()
+    rungs[1] = b0.RungSeries(
+        "B",
+        72.5,
+        b0.TopOfBook(
+            np.array([50 * _NS, 90 * _NS], dtype=np.uint64),
+            np.array([0.40, np.nan]),
+            np.array([0.42, 0.45]),
+            1,
+        ),
+    )
+
+    result = b0.window_change(rungs, 60 * _NS, 100 * _NS)
+
+    assert result is not None
+    assert result.panel_mass == pytest.approx(0.21 + 0.41)
+    assert result.dropout_mass == pytest.approx(0.41)
+
+
+def _dropout_from_10(ts: int, k: int, index: int) -> bool:
+    # the middle rung's bid vanishes from 10:00Z to 12:00Z on 09-02
+    return index == 1 and _utc_ns(2, 10) <= ts < _utc_ns(2, 12)
+
+
+def test_s5_report_gives_per_arm_dropout_share_panel_mass_sensitivity_and_one_sided_label(
+    tmp_path: Path,
+) -> None:
+    _ladder_tape(
+        tmp_path / "tape",
+        "nyc",
+        2,
+        ("lt80f", "gte80lt81f", "gte82lt83f"),
+        (2, 4),
+        (3, 6),
+        _wavy,
+        empty=_dropout_from_10,
+    )
+
+    report = _run(tmp_path)
+
+    mde = report["mde"]
+    pre = mde["per_arm"]["pre_window"]
+    arm = report["arms"]["pre_window"]
+    assert arm["dropout_rungs"] > 0
+    assert pre["dropout_share"] == pytest.approx(arm["dropout_rungs"] / arm["panel_rungs"])
+    assert pre["panel_mass_mean"] > 0
+    assert 0 < pre["dropout_mass_share"] < 1
+    assert mde["sidedness"] == "one-sided"
+    sens = mde["sensitivity_excluding_dropout"]
+    assert sens["sd"] is not None and sens["mde"] is not None
+    assert sens["sd"] != pytest.approx(mde["sd"])
+
+
+def test_s5_pre_window_arms_overlapping_a_previous_release_are_flagged_and_left_out_of_the_sd(
+    tmp_path: Path,
+) -> None:
+    _ladder_tape(
+        tmp_path / "tape", "nyc", 2, ("lt80f", "gte80lt81f", "gte82lt83f"), (2, 4), (3, 6), _wavy
+    )
+    census = {
+        "pfm": {
+            "OKX": {
+                "issuance_times_ns": [
+                    _utc_ns(2, 9, 15),
+                    _utc_ns(2, 9, 45),  # 30 min after the previous release: overlaps
+                    _utc_ns(2, 11, 15),
+                ]
+            }
+        },
+        "nbp": {"vintages_present": False},
+    }
+
+    report = _run_census(tmp_path, census)
+
+    arm = report["arms"]["pre_window"]
+    assert arm["overlapping_windows"] == 1
+    assert arm["n_evaluated"] == 2  # the overlapping window is not evaluated into the SD

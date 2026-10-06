@@ -341,3 +341,32 @@ def test_script_imports_no_network_client_and_reads_no_outcome_module() -> None:
     flat = " ".join(sorted(imported))
     for banned in ("httpx", "urllib", "socket", "requests", "settlement", "cli_parse", "iem_mos"):
         assert banned not in flat
+
+
+# ------------------------------------------------------------------ P1 (review fix)
+
+
+def test_p1_memory_cap_never_raises_an_already_lower_soft_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(resource, "getrlimit", lambda _r: (2 * 2**30, 8 * 2**30))
+    monkeypatch.setattr(resource, "setrlimit", lambda r, v: calls.append((r, v)))
+
+    capped = memory_cap.apply_address_space_cap(6)
+
+    assert capped == 2 * 2**30  # the inherited soft limit wins over the larger request
+    assert calls == [(resource.RLIMIT_AS, (2 * 2**30, 8 * 2**30))]
+
+
+def test_p1_infinite_soft_limit_does_not_clamp_a_smaller_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(
+        resource, "getrlimit", lambda _r: (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+    )
+    monkeypatch.setattr(resource, "setrlimit", lambda r, v: calls.append((r, v)))
+
+    assert memory_cap.apply_address_space_cap(3) == 3 * 2**30
+    assert calls[0][1][0] == 3 * 2**30

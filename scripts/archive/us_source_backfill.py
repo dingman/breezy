@@ -7,11 +7,19 @@ the ``us-pfm-afos`` revision store (PFM) and the existing MOS archive writer (GF
   at most 50 products per request) at the A0-R1 pace (>= 4 s between AFOS requests). Each
   product is split out, its WMO issuance time resolved, parsed (a refused product is counted
   and never written) and appended RAW through ``UsSourceRevisionStore`` under the collector's
-  key shape, so a re-run appends nothing and a live-collected issuance is not duplicated by
-  key. Normalised CSVs and the poll ledger are not written: a backfilled row's availability is
+  key shape. The stored bytes are the product exactly as the AFOS response framed it (SOH ..
+  ETX, nothing stripped), which is what the live collector stores for a ``limit=1`` response,
+  so a live-collected issuance is UNCHANGED under a re-run, never a second revision.
+  Normalised CSVs and the poll ledger are not written: a backfilled row's availability is
   its exact WMO header time and the live collector owns first-seen stamps.
 * GFS: delegated to the existing ``iem_mos_backfill`` CLI (model ``GFS``, KNYC included via
   the R33 ``IEM_MOS_STATIONS`` widening), so the MOS archive keeps ONE writer.
+
+Statuses: ``complete``; ``unplaceable_header`` (a header cannot be placed unambiguously from the
+cursor: that station stops, the next station runs); ``degraded`` (a revision-store error other
+than an expected payload refusal); ``throttled`` / ``paused_launch_window`` (stop ALL remaining
+stations and the GFS leg); ``budget_exhausted``, ``store_busy``. Any status but ``complete``
+exits 1.
 
 Safety: ``--dry-run`` plans only (no network, no write); ``--apply`` needs ``BREEZY_LIVE=1`` and
 a request budget. A request never starts inside, or close enough to meet, the 16:30-17:10Z
@@ -32,6 +40,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
@@ -54,7 +63,7 @@ from breezy.ingest.probe_transport import (
     RequestBudget,
     RequestBudgetExceededError,
 )
-from breezy.persistence.autonomy.capture_schedule import launch_window_guard
+from breezy.persistence.autonomy.capture_schedule import LAUNCH_WINDOW_UTC, launch_window_guard
 from breezy.persistence.us_source_request import (
     PFM_POINTS,
     US_PFM_AFOS_SOURCE,
@@ -62,6 +71,7 @@ from breezy.persistence.us_source_request import (
 )
 from breezy.persistence.us_source_revision_store import (
     AppendOutcome,
+    RevisionPayloadRefusedError,
     RevisionStoreBusyError,
     RevisionStoreError,
     UsSourceRevisionStore,
@@ -69,12 +79,14 @@ from breezy.persistence.us_source_revision_store import (
 
 __all__ = [
     "LegReport",
+    "UnplaceableHeaderError",
     "main",
     "make_pfm_fetch",
     "make_window_guard",
     "resolve_issuance_sequence",
     "run_pfm_leg",
     "split_products",
+    "split_raw_products",
     "wmo_header_fields",
 ]
 
@@ -91,6 +103,15 @@ BUSY_RETRIES: Final[int] = 3
 #: Planning constant for the dry run only (LOT issues ~28/day, the others fewer).
 PLANNING_ISSUANCES_PER_DAY: Final[int] = 24
 MAX_GAP_DAYS: Final[int] = 45
+#: A month rollover is only credible for a short forward gap; a longer "rollover" is an
+#: out-of-order header and is refused rather than placed a month ahead.
+MAX_ROLLOVER_GAP_DAYS: Final[int] = 7
+#: Statuses after which nothing else may run (the venue asked us to stop, or the window opened).
+STOP_ALL_STATUSES: Final[frozenset[str]] = frozenset({"throttled", "paused_launch_window"})
+#: Mirrors ``scripts/analysis/market_calibration_scan.LIVE_DATA_ROOT``.
+LIVE_DATA_ROOT: Final[Path] = Path.home() / ".local" / "share" / "breezy"
+#: The one directory under the live data root this script may write (the collector's archive).
+US_SOURCE_ARCHIVE_DIR: Final[str] = "us_source_archive"
 _MAX_MONTH_BUMPS: Final[int] = 3
 DEFAULT_MAX_RUNTIME_S: Final[int] = 3 * 3600
 _REFUSE_REASON_FALLBACK: Final[str] = "unparsed"
@@ -121,6 +142,21 @@ def split_products(text: str) -> tuple[str, ...]:
         if body.strip():
             out.append(_SOH + body)
     return tuple(out)
+
+
+def split_raw_products(text: str) -> tuple[str, ...]:
+    """Split an AFOS response into products, each EXACTLY as framed (SOH .. up to the next SOH).
+
+    A single-product response is returned whole, byte for byte, which is what the live collector
+    stores for ``limit=1``; nothing (ETX, trailing newline) is stripped.
+    """
+    if not text.strip():
+        return ()
+    starts = [i for i, ch in enumerate(text) if ch == _SOH]
+    if len(starts) <= 1:
+        return (text,)
+    bounds = [*starts, len(text)]
+    return tuple(text[a:b] for a, b in pairwise(bounds))
 
 
 def wmo_header_fields(product: str) -> tuple[str, int, int, int] | None:
@@ -172,6 +208,10 @@ def resolve_issuance_sequence(
     return resolved
 
 
+class UnplaceableHeaderError(ValueError):
+    """A WMO header cannot be placed unambiguously relative to the paging cursor."""
+
+
 def make_window_guard(worst_case_s: int = REQUEST_WORST_CASE_S) -> Callable[[int], bool]:
     """``window_ok(now_ns)``: True when a request starting now cannot meet 16:30-17:10Z."""
 
@@ -195,6 +235,7 @@ class LegReport:
     unchanged: int = 0
     quarantined: int = 0
     refused: dict[str, int] = field(default_factory=dict)
+    store_errors: dict[str, int] = field(default_factory=dict)
     truncated_days: tuple[dt.date, ...] = ()
     resume_sdate: dt.date | None = None
 
@@ -213,6 +254,7 @@ class LegReport:
             "unchanged": self.unchanged,
             "quarantined": self.quarantined,
             "refused": dict(sorted(self.refused.items())),
+            "store_errors": dict(sorted(self.store_errors.items())),
             "truncated_days": [d.isoformat() for d in self.truncated_days],
             "resume_sdate": self.resume_sdate.isoformat() if self.resume_sdate else None,
         }
@@ -288,8 +330,12 @@ def _append(
                 return False
             sleep(BUSY_WAIT_S)
             continue
-        except RevisionStoreError as exc:
+        except RevisionPayloadRefusedError as exc:  # an expected refusal of this payload
             _count(report, type(exc).__name__)
+            return True
+        except RevisionStoreError as exc:  # integrity or other store trouble: not a refusal
+            name = type(exc).__name__
+            report.store_errors[name] = report.store_errors.get(name, 0) + 1
             return True
         if result.outcome is AppendOutcome.APPENDED:
             report.appended += 1
@@ -308,10 +354,28 @@ def _count(report: LegReport, reason: str) -> None:
 def _place(
     products: Sequence[str], cursor: dt.date, report: LegReport
 ) -> list[tuple[str, dt.datetime | None]]:
-    """Pair each product with its resolved issuance time; headerless ones are refused."""
+    """Pair each product with its resolved issuance time; headerless ones are refused.
+
+    Raises ``UnplaceableHeaderError`` for a page whose headers cannot be placed unambiguously
+    from ``cursor``: a gap over ``MAX_GAP_DAYS``, or a month "rollover" over
+    ``MAX_ROLLOVER_GAP_DAYS`` (an out-of-order header would otherwise land a month ahead).
+    """
     headers = [wmo_header_fields(p) for p in products]
     parseable = [(h[1], h[2], h[3]) for h in headers if h is not None]
-    resolved = iter(resolve_issuance_sequence(parseable, cursor))
+    try:
+        placed = resolve_issuance_sequence(parseable, cursor)
+    except ValueError as exc:
+        raise UnplaceableHeaderError(str(exc)) from exc
+    previous = dt.datetime(cursor.year, cursor.month, cursor.day, tzinfo=dt.UTC)
+    for issued in placed:
+        rolled = (issued.year, issued.month) != (previous.year, previous.month)
+        if rolled and issued - previous > dt.timedelta(days=MAX_ROLLOVER_GAP_DAYS):
+            raise UnplaceableHeaderError(
+                f"header {issued.isoformat()} is a {(issued - previous).days} day month "
+                f"rollover after {previous.isoformat()}; refusing to place it"
+            )
+        previous = issued
+    resolved = iter(placed)
     paired: list[tuple[str, dt.datetime | None]] = []
     for product, header in zip(products, headers, strict=True):
         if header is None:
@@ -377,10 +441,16 @@ def run_pfm_leg(
         if text is None:
             report.resume_sdate = cursor
             break
-        products = split_products(text)
+        products = split_raw_products(text)
         if not products:
             break
-        paired = _place(products, cursor, report)
+        try:
+            paired = _place(products, cursor, report)
+        except UnplaceableHeaderError as exc:
+            _count(report, "unplaceable_header")
+            _alert(f"{wfo} sdate={cursor}: {exc}; this station stops, resume at {cursor}")
+            report.status, report.resume_sdate = "unplaceable_header", cursor
+            break
         last, past_end, busy = _ingest_page(
             paired, station=station, wfo=wfo, end=end, store=store, report=report, sleep=sleep
         )
@@ -395,6 +465,8 @@ def run_pfm_leg(
             following = cursor + dt.timedelta(days=1)
         cursor = following
     report.truncated_days = tuple(truncated)
+    if report.store_errors and report.status == "complete":
+        report.status = "degraded"
     return report
 
 
@@ -522,6 +594,23 @@ def _refuse(message: str) -> int:
     return _EXIT_REFUSED
 
 
+def _archive_root_problem(root: Path) -> str | None:
+    """Refuse a holdout directory, and the live data root except its sanctioned archive dir."""
+    resolved = root.resolve()
+    if any("holdout" in part.lower() for part in resolved.parts):
+        return f"--archive-root {resolved} sits in a holdout directory (sealed)"
+    live = LIVE_DATA_ROOT.resolve()
+    if resolved != live and live not in resolved.parents:
+        return None
+    sanctioned = live / US_SOURCE_ARCHIVE_DIR
+    if resolved == sanctioned or sanctioned in resolved.parents:
+        return None
+    return (
+        f"--archive-root {resolved} is under the live data root {live}; only "
+        f"{sanctioned} (the collector archive) may be written from here"
+    )
+
+
 def _validate(args: argparse.Namespace) -> str | None:
     """A refusal message, or None when the invocation is coherent."""
     if args.dry_run == args.apply:
@@ -533,6 +622,10 @@ def _validate(args: argparse.Namespace) -> str | None:
         return f"station(s) {unknown} are outside the closed set {list(US_SOURCE_STATIONS)}"
     if "pfm" in args.legs and args.archive_root is None:
         return "--archive-root is required for the pfm leg"
+    if args.archive_root is not None:
+        problem = _archive_root_problem(args.archive_root)
+        if problem is not None:
+            return problem
     if args.apply and os.environ.get(LIVE_ENV_VAR) != "1":
         return f"{LIVE_ENV_VAR}=1 is required before any request may be dispatched"
     if args.apply and "pfm" in args.legs and not args.request_budget:
@@ -593,6 +686,51 @@ def main(
     return code
 
 
+def _seconds_to_window(now_ns: int) -> int:
+    """Whole seconds from ``now_ns`` to the next 16:30Z window start (0 inside the window)."""
+    (start_h, start_m), (end_h, end_m) = LAUNCH_WINDOW_UTC
+    second = now_ns // _NS
+    of_day = second % 86_400
+    start_s, end_s = start_h * 3600 + start_m * 60, end_h * 3600 + end_m * 60
+    if start_s <= of_day < end_s:
+        return 0
+    return (start_s - of_day) % 86_400
+
+
+def _run_gfs(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    stations: Sequence[str],
+    years: Sequence[int],
+    clock: Callable[[], int],
+    gfs_runner: Callable[[Sequence[str]], int],
+    stopped: dict[str, Any] | None,
+) -> bool:
+    """Run (or refuse) the delegated GFS leg; True when it leaves the run incomplete.
+
+    ``iem_mos_backfill`` has no deadline hook, so the leg is bounded by its request budget and by
+    a start-time check: it only starts when ``--max-runtime-s`` still fits before the next
+    16:30Z window, evaluated NOW (after any PFM leg) and recorded in the report.
+    """
+    gfs = report["gfs"]
+    if stopped is not None:
+        gfs["status"] = "skipped_after_stop"
+        return True
+    if not years:
+        gfs["status"] = "nothing_to_do"
+        return False
+    now = clock()
+    gfs.update(max_runtime_s=args.max_runtime_s, seconds_to_window=_seconds_to_window(now))
+    if not launch_window_guard(now, 0, args.max_runtime_s):
+        gfs["status"] = "refused_launch_window"
+        _alert(f"GFS leg not started: {args.max_runtime_s} s would meet the launch window")
+        return True
+    budget = args.gfs_request_budget or len(stations) * len(years)
+    code = gfs_runner(_gfs_argv(stations, years, budget, args.mos_cache_root))
+    gfs.update(status="complete" if code == 0 else "failed", exit_code=code)
+    return code != 0
+
+
 def _apply(
     args: argparse.Namespace,
     report: dict[str, Any],
@@ -609,15 +747,17 @@ def _apply(
             f"a {args.max_runtime_s} s run starting now could meet the 16:30-17:10Z launch window"
         )
     incomplete = False
+    stopped: dict[str, Any] | None = None
     if "pfm" in args.legs:
         user_agent = os.environ.get(USER_AGENT_ENV_VAR, DEFAULT_USER_AGENT)
         fetch = pfm_fetch_factory(
             request_budget=args.request_budget, user_agent=user_agent, clock_ns=clock
         )
         store = UsSourceRevisionStore(args.archive_root, _StoreClock(clock))
-        legs = [
-            run_pfm_leg(
-                station=s,
+        legs: list[LegReport] = []
+        for index, station in enumerate(stations):
+            leg = run_pfm_leg(
+                station=station,
                 start=args.start_date,
                 end=end,
                 fetch=fetch,
@@ -626,18 +766,18 @@ def _apply(
                 window_ok=make_window_guard(),
                 sleep=sleep,
             )
-            for s in stations
-        ]
+            legs.append(leg)
+            if leg.status in STOP_ALL_STATUSES:
+                stopped = {"reason": leg.status, "skipped_stations": list(stations[index + 1 :])}
+                break
         report["pfm"]["legs"] = [leg.to_dict() for leg in legs]
-        incomplete = any(leg.status != "complete" for leg in legs)
+        if stopped is not None:
+            report["pfm"]["stopped"] = stopped
+        incomplete = stopped is not None or any(leg.status != "complete" for leg in legs)
     if "gfs" in args.legs:
-        if not years:
-            report["gfs"]["status"] = "nothing_to_do"
-        else:
-            budget = args.gfs_request_budget or len(stations) * len(years)
-            code = gfs_runner(_gfs_argv(stations, years, budget, args.mos_cache_root))
-            report["gfs"].update(status="complete" if code == 0 else "failed", exit_code=code)
-            incomplete = incomplete or code != 0
+        incomplete = (
+            _run_gfs(args, report, stations, years, clock, gfs_runner, stopped) or incomplete
+        )
     return _EXIT_INCOMPLETE if incomplete else 0
 
 
