@@ -62,13 +62,12 @@ FQ v1 halt FAILED 10-05 (cwd bug, 5 more fills); backstop orders-off drop-in liv
 | Row | Status |
 |---|---|
 | F2 truth fetch | BUILT, review fixes in progress; units not installed |
-| F3 v1 terminal day | BUILT bc52965e (FQ-R45 fixture decoupling); full gate queued |
 | F4 labels | IN PROGRESS WP0-WP3 |
 | F5 prereg MC | IN PROGRESS (code + MC run) |
 | F6 bridge | waits F5 numerics (STALE_PARITY_H, n_par) |
 | F7a stats move | IN PROGRESS |
-| F10 AUT-S plan | IN PROGRESS |
-| halt CLI cwd fix | a8a66f41 gate running; merge after 16:55Z 10-06 |
+| F10 AUT-S | plan r2 READY; Phase 0: G2 empty -> Lane S not built; F13 is the binding lever |
+| F13 new US sources | plan r1 + rulings F13-R1..R9; r2 in progress (C1 collector + B1 timing first) |
 Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
