@@ -11,7 +11,12 @@ from typing import Final
 import pytest
 
 from breezy.analysis.autonomy import offline_plugins
-from breezy.analysis.autonomy.offline_plugins import OFFLINE_PLUGINS
+from breezy.analysis.autonomy.offline_plugins import (
+    OFFLINE_PLUGINS,
+    ContinuousRungHoldOfflinePlugin,
+    CurrentRungHoldOfflinePlugin,
+    FqOfflinePlugin,
+)
 from breezy.persistence.autonomy import plugin, veto
 from breezy.persistence.autonomy.plugin import (
     CaptureAdapter,
@@ -144,11 +149,11 @@ C6_PROTOCOLS: Final[tuple[type, ...]] = (
 #: AUT-2 FQ-R41: the offline registry's exact per-kind plug-in type. FQ and both CRH kinds carry a
 #: real Scorer (``label``) and stay ``refusing`` for everything else; ``forecast_ladder`` has no
 #: fills and no scorer, so it stays the plain RefusingPlugin.
-EXPECTED_OFFLINE_TYPES: Final[dict[str, str]] = {
-    "current_rung_hold": "CurrentRungHoldOfflinePlugin",
-    "continuous_rung_hold": "ContinuousRungHoldOfflinePlugin",
-    "forecast_ladder": "RefusingPlugin",
-    "forecast_quantile_ladder": "FqOfflinePlugin",
+EXPECTED_OFFLINE_TYPES: Final[dict[str, type]] = {
+    "current_rung_hold": CurrentRungHoldOfflinePlugin,
+    "continuous_rung_hold": ContinuousRungHoldOfflinePlugin,
+    "forecast_ladder": RefusingPlugin,
+    "forecast_quantile_ladder": FqOfflinePlugin,
 }
 
 
@@ -197,10 +202,14 @@ def test_family_plugin_exact_set() -> None:
     # NODE_PLUGINS is untouched: every kind is still the plain RefusingPlugin
     assert all(type(v) is RefusingPlugin for v in NODE_PLUGINS.values())
     # OFFLINE_PLUGINS: each kind is EXACTLY its named class (``type(...) is``, no subclass slips in)
-    assert {k: type(v).__name__ for k, v in OFFLINE_PLUGINS.items()} == EXPECTED_OFFLINE_TYPES
+    assert set(OFFLINE_PLUGINS) == set(EXPECTED_OFFLINE_TYPES)
+    for kind, cls in EXPECTED_OFFLINE_TYPES.items():
+        assert type(OFFLINE_PLUGINS[kind]) is cls, kind
     assert sorted(_registry_literal_keys(node_plugins)) == sorted(_COMPOSITION_KINDS)
     assert sorted(_registry_literal_keys(offline_plugins)) == sorted(_COMPOSITION_KINDS)
-    assert _registry_literal(offline_plugins) == EXPECTED_OFFLINE_TYPES
+    assert _registry_literal(offline_plugins) == {
+        kind: cls.__name__ for kind, cls in EXPECTED_OFFLINE_TYPES.items()
+    }
     assert set(_registry_literal(node_plugins).values()) == {"RefusingPlugin"}
 
 
@@ -216,15 +225,69 @@ def test_every_offline_plugin_is_incomplete_and_refuses_everything_but_label() -
             _ = instance.detectors
 
 
+#: What a scorer-bearing offline plug-in class may define of its own (besides dunders).
+ALLOWED_SUBCLASS_NAMES: Final[frozenset[str]] = frozenset({"label", "has_scorer"})
+
+
+def _policed_members() -> set[str]:
+    """Every public or private member ``RefusingPlugin`` defines except ``label``: derived from the
+    class itself, so a member added there later is policed with no edit here."""
+    return {n for n in vars(RefusingPlugin) if not n.startswith("__")} - {"label"}
+
+
+def _override_violations(klass: type) -> set[str]:
+    """Names ``klass`` defines that it may not: any policed member, or anything beyond ``label``
+    and ``has_scorer`` (dunders such as ``__module__`` are not definitions of its own)."""
+    own = {n for n in vars(klass) if not n.startswith("__")}
+    return (own & _policed_members()) | (own - ALLOWED_SUBCLASS_NAMES)
+
+
 def test_no_offline_plugin_class_overrides_a_member_other_than_label() -> None:
-    members = {name for name, _ in NON_LABEL_MEMBERS} | {"detectors", "refusing"}
+    assert {"decision_record", "order_tags", "offline", "forward_shadow", "live", "refit"} <= (
+        _policed_members()
+    )
     for kind, instance in OFFLINE_PLUGINS.items():
-        if type(instance) is RefusingPlugin:
-            continue  # the base class itself defines every refusing member
-        for klass in type(instance).__mro__[: type(instance).__mro__.index(RefusingPlugin)]:
-            assert set(vars(klass)) & members == set(), (kind, klass.__name__)
-        own: set[str] = set()
-        assert own == set(), (kind, own)
+        mro = type(instance).__mro__
+        for klass in mro[: mro.index(RefusingPlugin)]:  # the plain RefusingPlugin has none
+            assert _override_violations(klass) == set(), (kind, klass.__name__)
+
+
+def test_the_override_check_catches_a_planted_violation() -> None:
+    class Overrides(RefusingPlugin):
+        has_scorer = True
+
+        def label(self, capture_day: object, exec_fills: object, settlements: object) -> object:
+            return None
+
+        def decision_record(self, decision: object, ctx: object) -> object:
+            return None
+
+    class AddsMember(RefusingPlugin):
+        def sneaky(self) -> None:
+            return None
+
+    class Clean(RefusingPlugin):
+        has_scorer = True
+
+        def label(self, capture_day: object, exec_fills: object, settlements: object) -> object:
+            return None
+
+    assert _override_violations(Overrides) == {"decision_record"}
+    assert _override_violations(AddsMember) == {"sneaky"}
+    assert _override_violations(Clean) == set()
+
+
+def test_a_member_added_to_refusing_plugin_later_is_policed_automatically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(RefusingPlugin, "future_member", lambda self: None, raising=False)
+
+    class Overrides(RefusingPlugin):
+        def future_member(self) -> None:
+            return None
+
+    assert "future_member" in _policed_members()
+    assert _override_violations(Overrides) == {"future_member"}
 
 
 def test_only_the_three_scorer_kinds_have_a_real_label() -> None:
