@@ -1,0 +1,19 @@
+[Unit]
+Description=Trigger for the Breezy F13-C1 US-source collector, source %i
+Documentation=file:///home/jon/breezy/docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md
+
+# Default schedule = the LAMP source (instance `lamp`): HH:31 hourly, a poll burst to HH:50.
+# No static slot lies inside the launch window [16:30Z, 17:10Z) (the repo's launch-window
+# table test enforces that for every unit): the 16:31 slot is omitted, and the 17:10Z firing
+# collects the displaced 16:30 run with its rows flagged late. The collector ALSO refuses,
+# in-process, any firing that would start inside the window (defence in depth, clock-boundary
+# tested). `pfm` and `nbp` replace this list in their own drop-ins
+# (us-source-collector@<source>.timer.d/schedule.conf).
+[Timer]
+OnCalendar=*-*-* 0..15,17..23:31:00 UTC
+OnCalendar=*-*-* 17:10:00 UTC
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

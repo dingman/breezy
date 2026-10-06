@@ -1,0 +1,67 @@
+[Unit]
+Description=Breezy F13-C1 US-source collector, one cycle for source %i
+Documentation=file:///home/jon/breezy/docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md
+Documentation=file:///home/jon/breezy/scripts/collect/us_source_collector.py
+
+# Instances are sources: us-source-collector@lamp, @pfm, @nbp. Not installed, enabled or
+# reloaded by the change that added this file; the coordinator installs it after review.
+# No credential reaches the process: the profile below clears the environment, mounts only
+# alerts.env (read-only) from ~/.config/breezy, and binds the archive directory as the sole
+# writable path. Alert delivery reads alerts.env as a FILE because --clearenv strips
+# EnvironmentFile (F13 R31).
+
+[Service]
+# Type=exec, not oneshot: systemd ignores RuntimeMaxSec= under Type=oneshot (measured with
+# `systemd-analyze --user verify`), and the backstop below must actually bind.
+Type=exec
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# Caps. The collector buffers one bulletin (<= 16 MiB) and streams the NBP bulletin.
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=64
+LimitNOFILE=524288
+
+# A BACKSTOP only. The in-process deadline (launch_window_guard, never an attempt that could
+# meet [16:30Z, 17:10Z)) is primary; this must exceed the in-process work budget and no
+# firing before 16:30Z may run past it (tests/unit/test_us_source_collector_unit.py).
+RuntimeMaxSec=1500
+
+# flock -n: an overlapping run for the same instance exits 75 and is not a failure.
+SuccessExitStatus=75
+
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/breezy/us_source_archive
+ExecStart=/usr/bin/flock -n -E 75 %t/us-source-collector-%i.lock \
+  /usr/bin/bwrap \
+  --clearenv --unshare-all --share-net --die-with-parent --new-session --cap-drop ALL \
+  --ro-bind /usr /usr \
+  --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
+  --ro-bind-try /etc/ssl /etc/ssl \
+  --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
+  --ro-bind-try /etc/resolv.conf /etc/resolv.conf \
+  --ro-bind-try /etc/hosts /etc/hosts \
+  --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
+  --proc /proc --dev /dev --tmpfs /tmp --tmpfs %h \
+  --ro-bind /home/jon/breezy/.venv /home/jon/breezy/.venv \
+  --ro-bind /home/jon/breezy/src /home/jon/breezy/src \
+  --ro-bind /home/jon/breezy/scripts/collect /home/jon/breezy/scripts/collect \
+  --ro-bind /home/jon/breezy/scripts/venue /home/jon/breezy/scripts/venue \
+  --ro-bind %h/.local/share/uv/python %h/.local/share/uv/python \
+  --bind %h/.local/share/breezy/us_source_archive %h/.local/share/breezy/us_source_archive \
+  --ro-bind %h/.config/breezy/alerts.env %h/.config/breezy/alerts.env \
+  --remount-ro %h --remount-ro / \
+  --setenv HOME %h --setenv PATH /usr/bin:/bin --setenv TMPDIR /tmp \
+  --setenv PYTHONPATH /home/jon/breezy/src --setenv PYTHONDONTWRITEBYTECODE 1 \
+  --chdir /tmp \
+  -- /home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/collect/us_source_collector.py \
+  --source %i --archive-root %h/.local/share/breezy/us_source_archive \
+  --alerts-env %h/.config/breezy/alerts.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=us-source-collector-%i
+
+TimeoutStopSec=30
+
+# NOTE: no [Install] section. This unit is started by its timer.

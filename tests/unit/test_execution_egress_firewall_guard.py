@@ -1865,6 +1865,12 @@ BANNED_EXEC_TRANSPORT_MODULES = frozenset(
         "breezy.adapters.polymarket_us.http",
         "breezy.adapters.polymarket_us.websocket",
         "breezy.ingest.http",
+        # F13-C1 S4 (plan r3 R10): the GFS LAMP transport owns an httpx client (NOMADS/MDL).
+        # WIDENED, never relaxed (L-12): one member added. Nothing under exec/ imports it
+        # today; this keeps it that way. `lamp_archive_stream` is NOT added: it owns no
+        # client or socket (it consumes an injected byte iterator), so this set's own rule
+        # ("Breezy modules that CARRY a network client") does not reach it.
+        "breezy.ingest.mdl_lamp_transport",
         # BL-24 Seam B (S1): the NWS observation parser, the transport that
         # owns the socket, and the Actor that drives it. Widened, never
         # relaxed (L-12).
