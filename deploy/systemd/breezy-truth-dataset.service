@@ -29,8 +29,8 @@ EnvironmentFile=-%h/.config/breezy/alerts.env
 ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/archive/iem_cli_fetch.py dataset
 
 # Five station bodies parsed once each: well under a minute. Bounded both ways.
-TimeoutStartSec=600
-RuntimeMaxSec=900
+# Type=oneshot ignores RuntimeMaxSec=; TimeoutStartSec= bounds the whole run.
+TimeoutStartSec=900
 
 StandardOutput=journal
 StandardError=journal

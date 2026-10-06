@@ -9,6 +9,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Final
@@ -28,6 +30,7 @@ from tests.unit.test_launch_window_table import DEPLOYED_DIR, window_overlaps
 
 DEPLOY_DIR: Final[Path] = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
 UNITS: Final[tuple[str, ...]] = ("breezy-truth-fetch", "breezy-truth-dataset")
+EXPECTED_START_S: Final[dict[str, int]] = {"breezy-truth-fetch": 1200, "breezy-truth-dataset": 900}
 FORBIDDEN_ENV: Final[tuple[str, ...]] = (
     "polymarket.env",
     "breezy-trade.env",
@@ -58,8 +61,9 @@ def test_truth_units_bounded_and_outside_launch_window(unit: str) -> None:
     # Bounded: memory ceiling, both time bounds, failure alert, no restart.
     assert re.fullmatch(r"\d+[MG]", _single(service, "MemoryMax"))
     start_s = int(_single(service, "TimeoutStartSec"))
-    runtime_s = int(_single(service, "RuntimeMaxSec"))
-    assert 0 < start_s <= runtime_s <= 3600
+    assert 0 < start_s <= 3600
+    assert start_s == EXPECTED_START_S[unit]
+    assert not any(line.startswith("RuntimeMaxSec=") for line in service)
     assert _single(service, "OnFailure") == "breezy-study-failed@%n.service"
     assert not any(line.startswith("Restart=") for line in service)
 
@@ -79,6 +83,32 @@ def test_truth_units_bounded_and_outside_launch_window(unit: str) -> None:
     # Scheduled outside [16:30Z, 17:10Z) including each firing's worst-case runtime.
     assert window_overlaps(DEPLOYED_DIR, only_timer=unit) == []
     assert any(line.startswith("OnCalendar=*-*-* ") and line.endswith(" UTC") for line in timer)
+
+
+def test_no_oneshot_unit_uses_runtime_max_sec() -> None:
+    """systemd ignores RuntimeMaxSec= for Type=oneshot; TimeoutStartSec= is the cap."""
+    offenders = []
+    for path in sorted(DEPLOY_DIR.glob("*.service")):
+        lines = _directives(path)
+        if "Type=oneshot" in lines and any(x.startswith("RuntimeMaxSec=") for x in lines):
+            offenders.append(path.name)
+    assert offenders == []
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-analyze") is None,
+    reason="systemd-analyze not available in this environment",
+)
+@pytest.mark.parametrize("unit", UNITS)
+def test_truth_units_systemd_verify_is_silent(unit: str) -> None:
+    result = subprocess.run(  # noqa: S603
+        ["systemd-analyze", "--user", "verify", str(DEPLOY_DIR / f"{unit}.service")],  # noqa: S607
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert (result.stdout + result.stderr).strip() == ""
 
 
 def test_truth_units_run_the_script_with_the_right_subcommand() -> None:

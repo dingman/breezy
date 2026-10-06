@@ -1891,8 +1891,8 @@ and `"in_row_systemctl": "failed"` (V17); with the pre line killed by the outer 
 
 | Unit | Tick (UTC) | Script | Egress | Bounds |
 |---|---|---|---|---|
-| `breezy-truth-fetch.{service,timer}` | 11:40 | `scripts/archive/iem_cli_fetch.py fetch` | HTTPS GET to `mesonet.agron.iastate.edu` only (`IEM_ALLOWED_HOSTS`, paced) | `MemoryHigh=1G`/`MemoryMax=1536M`, `TimeoutStartSec=900`, `RuntimeMaxSec=1200` |
-| `breezy-truth-dataset.{service,timer}` | 12:40 | `scripts/archive/iem_cli_fetch.py dataset` | none (offline; a cache miss is a refusal, exit 2) | `MemoryHigh=1G`/`MemoryMax=1536M`, `TimeoutStartSec=600`, `RuntimeMaxSec=900` |
+| `breezy-truth-fetch.{service,timer}` | 11:40 | `scripts/archive/iem_cli_fetch.py fetch` | HTTPS GET to `mesonet.agron.iastate.edu` only (`IEM_ALLOWED_HOSTS`, paced) | `MemoryHigh=1G`/`MemoryMax=1536M`, `TimeoutStartSec=1200` |
+| `breezy-truth-dataset.{service,timer}` | 12:40 | `scripts/archive/iem_cli_fetch.py dataset` | none (offline; a cache miss is a refusal, exit 2) | `MemoryHigh=1G`/`MemoryMax=1536M`, `TimeoutStartSec=900` |
 
 - **Owner and activation.** The units are committed parked. The coordinator symlinks them into
   `~/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then
