@@ -125,6 +125,10 @@ STAGE0_ENTRY_MODULES: Final[tuple[str, ...]] = (
     # `breezy.runtime`, so `structural_dead_stop` now imports `breezy.runtime`
     # and source (c) picks it up; tracked, not excluded.
     "scripts.analysis.structural_dead_stop",
+    # AUT-2 r7 WP0: `polymarket_us_shape_capture` re-imports the moved
+    # `validate_endpoint` from `breezy.runtime.venue_positions_read`, so source
+    # (c) picks it up; tracked, not excluded.
+    "scripts.venue.polymarket_us_shape_capture",
 )
 
 #: Entries that WOULD be required by `test_entry_module_list_covers_every_

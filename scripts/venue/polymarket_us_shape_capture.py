@@ -69,6 +69,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
+from breezy.runtime.venue_positions_read import validate_endpoint as _validate_endpoint
+
 #: Directory the R-1 artefacts land in. Shared with the auth smoke's evidence
 #: directory deliberately: one place an operator looks. Safety comes from the
 #: filename prefix, not from a separate location.
@@ -295,11 +297,6 @@ SHAPE_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
         "volume",
     }
 )
-
-#: Endpoint labels are constants chosen by the caller, never payload data.
-#: Anything outside this charset is refused rather than sanitised, so a path
-#: carrying a market slug or a query string cannot become a filename.
-_ENDPOINT_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A/[A-Za-z0-9/_-]*\Z")
 
 _ARTIFACT_SUFFIX: Final[str] = ".shape.json"
 
@@ -568,15 +565,6 @@ def verify_value_free(shape: Mapping[str, Any], *, path: str = "$") -> None:
 # ---------------------------------------------------------------------------
 # Rendering and writing
 # ---------------------------------------------------------------------------
-
-
-def _validate_endpoint(endpoint: str) -> str:
-    if not _ENDPOINT_PATTERN.fullmatch(endpoint):
-        raise ValueError(
-            "endpoint label must be a plain path of [A-Za-z0-9/_-]; refusing "
-            "a label that could carry payload-derived text"
-        )
-    return endpoint
 
 
 def render_shape_report(*, endpoint: str, shape: Mapping[str, Any]) -> str:
