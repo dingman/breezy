@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from tests.support.entry_points import PYPROJECT_PATH, SRC_DIR
+from tests.unit.test_autonomy_contracts import _modules_loaded_by
 
 ANALYSIS: Final[Path] = SRC_DIR / "breezy" / "analysis"
 CONTRACT_NAME: Final = (
@@ -38,11 +39,33 @@ PURE_CORE_BREEZY_ALLOWED: Final = {"breezy.analysis.stats.scoring_core"}
 
 STRICT: Final = "strict_contract"
 NO_LIVE_REACH: Final = "never_reaches_nautilus_strategy_runtime_adapters"
+EXEMPT: Final = "exempt:"
+LIVE_REACH_PREFIXES: Final = (
+    "nautilus_trader",
+    "breezy.strategy",
+    "breezy.runtime",
+    "breezy.adapters",
+    "breezy.app",
+)
 
 #: module -> classification. Every F7b-core module has a row; a reasoned exemption names its reason.
 CLASSIFICATION: Final[dict[str, str]] = {
     "breezy.analysis.autonomy.eprocess": STRICT,
     "breezy.analysis.autonomy.confidence_sequence": STRICT,
+    "breezy.analysis.autonomy.evidence_row": NO_LIVE_REACH,
+    # The evaluator also hosts the C6 `label` seam (moved verbatim from `FqOfflinePlugin`), which
+    # imports `labeling.fq_scorer`; offline_plugins reached that scorer before F7b-core as well.
+    # `evaluate_e_process` and the guard chain use none of it.
+    "breezy.analysis.autonomy.evaluators.forecast_quantile_ladder": (
+        EXEMPT + "label seam reaches strategy/runtime/adapters/nautilus through labeling.fq_scorer"
+    ),
+    # `scoring_batch` -> `persistence.autonomy.label_store` (PYARROW_REACHING in ARCH-0 contract c).
+    "breezy.analysis.labeling.scoring_batch": NO_LIVE_REACH,
+}
+#: Modules whose classification admits pyarrow (the exempt evaluator and scoring_batch).
+PYARROW_REACHING_ROWS: Final = {
+    "breezy.analysis.autonomy.evaluators.forecast_quantile_ladder",
+    "breezy.analysis.labeling.scoring_batch",
 }
 
 
@@ -116,9 +139,29 @@ def test_scoring_core_is_stdlib_only_so_the_pyarrow_ban_is_kept() -> None:
 
 def test_every_f7b_core_module_is_classified() -> None:
     assert _unclassified(_scoped_modules(), CLASSIFICATION) == set()
-    assert set(CLASSIFICATION.values()) <= {STRICT, NO_LIVE_REACH} or all(
-        v.startswith("exempt:") for v in CLASSIFICATION.values() if v not in {STRICT, NO_LIVE_REACH}
-    )
+    for module, value in CLASSIFICATION.items():
+        assert value in {STRICT, NO_LIVE_REACH} or value.startswith(EXEMPT), module
+        if value.startswith(EXEMPT):
+            assert len(value) > len(EXEMPT) + 20, f"{module}: an exemption needs a reason"
+
+
+def _reaches(module: str) -> tuple[set[str], bool]:
+    loaded = _modules_loaded_by(module)
+    live = {m for m in loaded if m.startswith(LIVE_REACH_PREFIXES)}
+    return live, any(m.split(".")[0] == "pyarrow" for m in loaded)
+
+
+def test_each_classification_row_is_true_at_runtime() -> None:
+    """The rows are measured, not asserted: a probe imports each module in a fresh interpreter."""
+    for module, value in CLASSIFICATION.items():
+        live, arrow = _reaches(module)
+        if value == STRICT:
+            assert live == set() and not arrow, module
+        elif value == NO_LIVE_REACH:
+            assert live == set(), module
+            assert arrow == (module in PYARROW_REACHING_ROWS), module
+        else:  # an exemption must still be a real reach, or it should be reclassified
+            assert live != set(), module
 
 
 def test_classification_scan_catches_a_planted_unclassified_module() -> None:

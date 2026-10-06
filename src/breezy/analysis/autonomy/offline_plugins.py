@@ -2,7 +2,8 @@
 
 Exactly the four composition kinds (``family_manifest._COMPOSITION_KINDS``). Three of them carry a
 real C6 ``Scorer`` (ARCH C6, AUTONOMY_ARCHITECTURE.md:756-760: the CRH kinds keep a real Scorer even
-when retired): ``forecast_quantile_ladder`` the FQ scorer and the two CRH kinds the legacy CRH
+when retired): ``forecast_quantile_ladder`` the FQ scorer (``FqEvaluator``, which lives in
+``evaluators/forecast_quantile_ladder.py``) and the two CRH kinds the legacy CRH
 scorer. Each of those plug-ins is a ``RefusingPlugin`` subclass that overrides ``label`` ONLY: it
 stays ``refusing`` (so ``is_complete`` is false), and the capture, evaluator, detector and refit
 members, which is where a family is minted and composed, still raise ``PluginRefused``.
@@ -16,39 +17,16 @@ attribution, the legacy trial join) is the label run's planner, not the scorer s
 from types import MappingProxyType
 from typing import Any, ClassVar, Final
 
-from breezy.analysis.labeling.fq_scorer import ForecastQuantileLadderScorer
+from breezy.analysis.autonomy.evaluators.forecast_quantile_ladder import FqEvaluator
 from breezy.analysis.labeling.legacy_crh_scorer import LegacyCrhScorer
-from breezy.analysis.labeling.scoring_batch import ScoredBatch, ScoringBatch
+from breezy.analysis.labeling.scoring_batch import ScoredBatch, require_scoring_batch
 from breezy.persistence.autonomy.plugin import RefusingPlugin
 
 __all__ = [
     "OFFLINE_PLUGINS",
     "ContinuousRungHoldOfflinePlugin",
     "CurrentRungHoldOfflinePlugin",
-    "FqOfflinePlugin",
 ]
-
-
-def _batch(exec_fills: Any) -> ScoringBatch:
-    if not isinstance(exec_fills, ScoringBatch):
-        raise TypeError("label() takes a ScoringBatch in the exec_fills position")
-    return exec_fills
-
-
-class FqOfflinePlugin(RefusingPlugin):
-    """FQ: a real ``label``; every other member refuses and the plug-in stays incomplete."""
-
-    has_scorer: ClassVar[bool] = True
-
-    def label(self, capture_day: Any, exec_fills: Any, settlements: Any) -> ScoredBatch:
-        batch = _batch(exec_fills)
-        scorer = ForecastQuantileLadderScorer(now_ns=batch.now_ns, prior=batch.prior)
-        result = scorer.label_with_alerts(capture_day, list(batch.inputs), settlements)
-        return ScoredBatch(
-            rows=result.rows,
-            p_null_count=result.p_null_count,
-            non_c1_post_epoch_count=result.non_c1_post_epoch_count,
-        )
 
 
 class _LegacyCrhOfflinePlugin(RefusingPlugin):
@@ -58,7 +36,7 @@ class _LegacyCrhOfflinePlugin(RefusingPlugin):
     has_scorer: ClassVar[bool] = True
 
     def label(self, capture_day: Any, exec_fills: Any, settlements: Any) -> ScoredBatch:
-        batch = _batch(exec_fills)
+        batch = require_scoring_batch(exec_fills)
         scorer = LegacyCrhScorer(now_ns=batch.now_ns, prior=batch.prior)
         result = scorer.label_with_counts(capture_day, list(batch.inputs), settlements)
         return ScoredBatch(rows=result.rows, legacy_sell_rows=result.legacy_sell_rows)
@@ -77,6 +55,6 @@ OFFLINE_PLUGINS: Final[MappingProxyType[str, RefusingPlugin]] = MappingProxyType
         "current_rung_hold": CurrentRungHoldOfflinePlugin(),
         "continuous_rung_hold": ContinuousRungHoldOfflinePlugin(),
         "forecast_ladder": RefusingPlugin(),
-        "forecast_quantile_ladder": FqOfflinePlugin(),
+        "forecast_quantile_ladder": FqEvaluator(),
     }
 )

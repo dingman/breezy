@@ -11,11 +11,11 @@ from typing import Final
 import pytest
 
 from breezy.analysis.autonomy import offline_plugins
+from breezy.analysis.autonomy.evaluators.forecast_quantile_ladder import FqEvaluator
 from breezy.analysis.autonomy.offline_plugins import (
     OFFLINE_PLUGINS,
     ContinuousRungHoldOfflinePlugin,
     CurrentRungHoldOfflinePlugin,
-    FqOfflinePlugin,
 )
 from breezy.persistence.autonomy import plugin, veto
 from breezy.persistence.autonomy.plugin import (
@@ -153,7 +153,7 @@ EXPECTED_OFFLINE_TYPES: Final[dict[str, type]] = {
     "current_rung_hold": CurrentRungHoldOfflinePlugin,
     "continuous_rung_hold": ContinuousRungHoldOfflinePlugin,
     "forecast_ladder": RefusingPlugin,
-    "forecast_quantile_ladder": FqOfflinePlugin,
+    "forecast_quantile_ladder": FqEvaluator,
 }
 
 

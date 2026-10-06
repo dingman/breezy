@@ -14,7 +14,7 @@ from typing import Any
 
 from breezy.persistence.autonomy.label_store import LabelRow
 
-__all__ = ["ScoredBatch", "ScoringBatch"]
+__all__ = ["ScoredBatch", "ScoringBatch", "require_scoring_batch"]
 
 
 @dataclass(frozen=True)
@@ -38,3 +38,10 @@ class ScoredBatch:
     @staticmethod
     def of(rows: Sequence[LabelRow]) -> ScoredBatch:
         return ScoredBatch(rows=tuple(rows))
+
+
+def require_scoring_batch(exec_fills: Any) -> ScoringBatch:
+    """The ``exec_fills`` argument of a ``label`` call, or ``TypeError`` if it is not a batch."""
+    if not isinstance(exec_fills, ScoringBatch):
+        raise TypeError("label() takes a ScoringBatch in the exec_fills position")
+    return exec_fills

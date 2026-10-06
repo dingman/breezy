@@ -8,11 +8,11 @@ from decimal import Decimal
 
 import pytest
 
+from breezy.analysis.autonomy.evaluators.forecast_quantile_ladder import FqEvaluator
 from breezy.analysis.autonomy.offline_plugins import (
     OFFLINE_PLUGINS,
     ContinuousRungHoldOfflinePlugin,
     CurrentRungHoldOfflinePlugin,
-    FqOfflinePlugin,
 )
 from breezy.analysis.labeling.attribution import Attribution
 from breezy.analysis.labeling.fq_scorer import FqFillInput, Reconciliation
@@ -55,7 +55,7 @@ def _fq_input() -> FqFillInput:
 
 def test_the_fq_plugin_labels_a_batch_through_the_real_scorer() -> None:
     plugin = OFFLINE_PLUGINS["forecast_quantile_ladder"]
-    assert type(plugin) is FqOfflinePlugin
+    assert type(plugin) is FqEvaluator
 
     scored = plugin.label(_DAY, ScoringBatch(_NOW, (), (_fq_input(),)), _Settlements())
 
