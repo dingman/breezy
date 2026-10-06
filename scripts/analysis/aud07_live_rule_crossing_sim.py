@@ -69,7 +69,6 @@ from typing import Any, Final, Literal
 
 import numpy as np
 import scipy
-from numpy.typing import NDArray
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
@@ -88,15 +87,15 @@ from aud06a_qty_envelope_sweep import (
     sample_station_day,
 )
 
+from breezy.analysis.stats.sequential_looks import (
+    StreamingBoundary,
+)
 from breezy.persistence.gs_boundary_artefact import (
     ALPHA_ONE_SIDED,
-    GRID_HALFWIDTH_SD,
     GRID_NPTS,
     I_MAX,
     BoundaryArtefact,
     SpendingSpec,
-    _look_step,
-    _one_sided_spend,
 )
 from breezy.settlement.current_rung_hold_v2 import (
     CombinedDraw,
@@ -205,74 +204,9 @@ N_DEPTHS: Final[int] = N_MAX // LOOK_STEP
 
 
 # ---------------------------------------------------------------------------
-# Streaming boundary (L-40 amendment (iii))
+# Streaming boundary (L-40 amendment (iii)): `StreamingBoundary` moved byte-identically to
+# `breezy.analysis.stats.sequential_looks` (F7a WP1s) and is re-exported by the import above.
 # ---------------------------------------------------------------------------
-class StreamingBoundary:
-    """A per-replicate streaming reimplementation of
-    `BoundaryArtefact.boundary_for`'s own joint-density recursion.
-
-    Carries `(grid, dens, prev_t)` forward across looks within ONE
-    replicate's history -- `boundary_for` itself recomputes from `t=0` on
-    every call, which a 20000-replicate x 16-look Monte-Carlo cannot
-    afford. Imports the artefact's OWN `_look_step`/`_one_sided_spend`
-    primitives (`breezy.persistence.gs_boundary_artefact`); never
-    re-derives the spending function (L-40 amendment (iii), `docs/core/
-    LESSONS.md:1403`).
-
-    Non-terminal target: `spend(t) - spend(prev_t)` -- the identical
-    subtraction `_iter_boundary_looks` performs. Terminal target: `alpha -
-    spend(prev_t)`, via a `_look_step` call from the SAME prior `(grid,
-    dens, prev_t)` state (never from a hypothetical intermediate
-    non-terminal state). A tie (`t == prev_t`) is not special-cased here:
-    it flows into `_look_step`'s own `dt == 0` branch, which returns the
-    degenerate `(+inf, -inf)` pair unchanged.
-
-    Every call must extend the previously committed `t_history` by EXACTLY
-    one element -- checked explicitly, a wiring defect otherwise (a fresh
-    instance is required per Monte-Carlo replicate; state is never shared
-    across replicates).
-    """
-
-    def __init__(
-        self,
-        *,
-        alpha: float = ALPHA_ONE_SIDED,
-        npts: int = GRID_NPTS,
-        halfwidth_sd: float = GRID_HALFWIDTH_SD,
-    ) -> None:
-        self.alpha = alpha
-        self.npts = npts
-        self.halfwidth_sd = halfwidth_sd
-        self._grid: NDArray[np.float64] | None = None
-        self._dens: NDArray[np.float64] | None = None
-        self._prev_t = 0.0
-        self._committed_looks = 0
-
-    def __call__(
-        self, t_history: Sequence[float], *, is_terminal: bool
-    ) -> tuple[float, float]:
-        t_history = tuple(t_history)
-        if len(t_history) != self._committed_looks + 1:
-            raise ValueError(
-                "StreamingBoundary requires t_history to extend the previously "
-                f"committed history by exactly one look: had "
-                f"{self._committed_looks} committed look(s), got a t_history of "
-                f"length {len(t_history)} (a wiring defect -- one fresh "
-                "StreamingBoundary instance per Monte-Carlo replicate)"
-            )
-        t = t_history[-1]
-        prev_t = self._prev_t
-        if is_terminal:
-            target = self.alpha - _one_sided_spend(prev_t, self.alpha)
-        else:
-            target = _one_sided_spend(t, self.alpha) - _one_sided_spend(prev_t, self.alpha)
-        b_eff, b_fut, new_grid, new_dens, new_prev_t = _look_step(
-            t, prev_t, self._grid, self._dens, target, self.npts, self.halfwidth_sd
-        )
-        self._grid, self._dens, self._prev_t = new_grid, new_dens, new_prev_t
-        self._committed_looks += 1
-        z_scale = math.sqrt(t)
-        return b_eff / z_scale, b_fut / z_scale
 
 
 def _synthetic_artefact(

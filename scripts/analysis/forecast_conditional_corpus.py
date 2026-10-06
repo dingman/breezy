@@ -96,6 +96,14 @@ for _entry in (str(_SCRIPTS_ANALYSIS_DIR), str(_REPO_ROOT / "src")):
 
 from forecast_climate_day_map import TXN_MAX_PERIOD_END_UTC_HOUR, climate_day_for_txn
 
+from breezy.analysis.stats.scoring_core import (  # noqa: F401
+    BOOTSTRAP_ALPHA,
+    BOOTSTRAP_ITERATIONS,
+    BOOTSTRAP_SEED,
+    RELIABILITY_BUCKET_EDGES,
+    LeakageError,
+)
+
 NS: Final[int] = 10**9
 _SECONDS_PER_HOUR: Final[int] = 3600
 
@@ -162,11 +170,6 @@ MIN_TRAIN_STATION_DAYS: Final[int] = 400
 MIN_HOLDOUT_STATION_DAYS_POOLED: Final[int] = 200
 MIN_HOLDOUT_STATION_DAYS_PER_STATION: Final[int] = 100
 
-BOOTSTRAP_ITERATIONS: Final[int] = 2000
-BOOTSTRAP_SEED: Final[int] = 20260919
-BOOTSTRAP_ALPHA: Final[float] = 0.05
-
-RELIABILITY_BUCKET_EDGES: Final[tuple[float, ...]] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 VERDICT_INSUFFICIENT_DATA: Final[str] = "INSUFFICIENT_DATA"
 VERDICT_SCORED: Final[str] = "SCORED"
@@ -179,11 +182,6 @@ STATIONS: Final[tuple[tuple[str, str], ...]] = (
 )
 MOS_MODEL: Final[str] = "NBS"
 ARTEFACT_SCHEMA: Final[str] = "breezy.forecast_conditional_model_study/2"
-
-
-class LeakageError(RuntimeError):
-    """Raised when a corpus or a comparison would leak information."""
-
 
 
 # ---------------------------------------------------------------------------
