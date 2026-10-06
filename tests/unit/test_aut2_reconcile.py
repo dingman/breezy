@@ -24,11 +24,14 @@ from breezy.analysis.labeling.legacy_crh_scorer import LEGACY_SCORER_ID
 from breezy.analysis.labeling.reconcile import (
     CashSourceOverlap,
     CompareResult,
+    InvalidExitFill,
+    PositionCompareCorrupt,
     ReconSource,
     SettlementEvidence,
     SlugCompare,
     StoredSnapshot,
     cash_leg_outcome,
+    cash_leg_result,
     cash_records,
     daily_position_leg,
     fills_never_position_compared,
@@ -41,13 +44,13 @@ from breezy.analysis.labeling.reconcile import (
     streak_alert,
     write_position_compare,
 )
+from breezy.analysis.labeling.verdicts import ReconMode
 from breezy.persistence.autonomy.label_schema import LabelRole, PSource
 from breezy.persistence.autonomy.label_store import LabelRow
 from breezy.persistence.autonomy.single_read import SingleReadReason, SingleReadRefused
 from breezy.persistence.autonomy.verdict import VerdictOutcome
 from breezy.runtime.venue_positions_read import PositionRow, ReadStatus, VenuePositionsRead
-from tests.support.aut2_fixtures import durable_fill
-from tests.unit.test_portfolio_roi_report import _prr
+from tests.support.aut2_fixtures import durable_fill, portfolio_roi_module
 
 _S = 1_000_000_000
 _H = 3_600 * _S
@@ -213,7 +216,8 @@ def test_fill_inside_grace_not_compared() -> None:
     on_edge = _recon(_snap({SLUG_A: "2"}), [_fill(1, age_s=POSITION_SETTLE_GRACE_S)])
 
     assert _results(inside) == {SLUG_A: CompareResult.NOT_COMPARED_GRACE}
-    assert inside.not_compared_grace == 1 and inside.outcome is VerdictOutcome.PASS
+    # an all-grace snapshot compared nothing: INCONCLUSIVE (all_grace), never PASS
+    assert inside.not_compared_grace == 1 and inside.outcome is VerdictOutcome.INCONCLUSIVE
     assert _results(on_edge) == {SLUG_A: CompareResult.MATCH}
 
 
@@ -241,7 +245,7 @@ def test_venue_only_slug_fails_every_family_on_venue() -> None:
 
 def _stored(at: int, result: CompareResult, venue: str = "2", ledger: str = "2") -> StoredSnapshot:
     return StoredSnapshot(
-        at, "intraday", (SlugCompare(SLUG_A, Decimal(venue), Decimal(ledger), result),)
+        at, ReconMode.INTRADAY, (SlugCompare(SLUG_A, Decimal(venue), Decimal(ledger), result),)
     )
 
 
@@ -338,12 +342,16 @@ def test_governing_comparison_reproducible_from_journal(tmp_path: Path) -> None:
 
 def test_per_snapshot_compare_results_written_once(tmp_path: Path) -> None:
     rows = list(_stored(SNAP, CompareResult.MATCH).rows)
-    path = write_position_compare(tmp_path, SNAP, "intraday", rows, snapshot_sha256="a" * 64)
+    path = write_position_compare(
+        tmp_path, SNAP, ReconMode.INTRADAY, rows, snapshot_sha256="a" * 64
+    )
 
-    again = write_position_compare(tmp_path, SNAP, "intraday", rows, snapshot_sha256="a" * 64)
+    again = write_position_compare(
+        tmp_path, SNAP, ReconMode.INTRADAY, rows, snapshot_sha256="a" * 64
+    )
     other = [replace(rows[0], result=CompareResult.MISMATCH)]
     with pytest.raises(SingleReadRefused) as caught:
-        write_position_compare(tmp_path, SNAP, "intraday", other, snapshot_sha256="a" * 64)
+        write_position_compare(tmp_path, SNAP, ReconMode.INTRADAY, other, snapshot_sha256="a" * 64)
 
     assert again == path and caught.value.reason is SingleReadReason.EXISTS_DIFFERENT
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -452,6 +460,7 @@ def test_missing_venue_evidence_overdue_is_fail() -> None:
 # -- cash leg -----------------------------------------------------------------------------------
 
 
+_prr = portfolio_roi_module()
 _D0 = "2026-10-02"
 _D1 = "2026-10-03"
 
@@ -790,3 +799,205 @@ def test_legacy_crh_sell_proceeds_reach_cash_leg() -> None:
     assert [(r.kind, r.payout, r.dated_at_ns) for r in produced.records] == [
         ("exit_proceeds", Decimal("0.53"), sell.ts_event)
     ]
+
+
+# -- review batch: daily venue-only, grace/intent, netting on open lots, cash result ------------
+
+
+def test_daily_leg_fails_on_a_journaled_venue_only_mismatch() -> None:
+    """An AMBIGUOUS IOC that really filled shows up as a venue slug with no ledger fill."""
+    venue_only = StoredSnapshot(
+        SNAP,
+        ReconMode.INTRADAY,
+        (
+            SlugCompare(SLUG_A, Decimal(2), Decimal(2), CompareResult.MATCH),
+            SlugCompare(SLUG_B, Decimal(1), Decimal(0), CompareResult.MISMATCH),
+        ),
+    )
+
+    leg = daily_position_leg([_fill(1)], [venue_only], _deadline, now_ns=SNAP + _H)
+
+    assert leg.outcome is VerdictOutcome.FAIL and leg.venue_only_slugs == (SLUG_B,)
+
+
+def test_all_grace_snapshot_is_inconclusive_not_pass() -> None:
+    all_grace = _recon(_snap({SLUG_A: "2"}), [_fill(1, age_s=30)])
+    mixed = _recon(
+        _snap({SLUG_A: "2", SLUG_B: "1"}),
+        [_fill(1, age_s=30), _fill(2, instrument=B_YES, qty="1")],
+    )
+
+    assert all_grace.outcome is VerdictOutcome.INCONCLUSIVE
+    assert "all_grace" in all_grace.inconclusive_causes
+    assert mixed.outcome is VerdictOutcome.PASS and mixed.slugs_compared == 1
+
+
+def test_open_intent_is_checked_before_grace() -> None:
+    leg = _recon(_snap({SLUG_A: "2"}), [_fill(1, age_s=30)], open_intent_slugs={SLUG_A})
+
+    assert _results(leg) == {SLUG_A: CompareResult.NOT_COMPARED_INTENT}
+    assert "open_intent" in leg.inconclusive_causes
+
+
+def test_venue_only_slug_with_an_open_intent_is_inconclusive_not_a_mismatch() -> None:
+    leg = _recon(_snap({SLUG_A: "2", SLUG_B: "1"}), [_fill(1)], open_intent_slugs={SLUG_B})
+
+    assert _results(leg)[SLUG_B] is CompareResult.NOT_COMPARED_INTENT
+    assert leg.venue_only_slugs == () and leg.outcome is VerdictOutcome.INCONCLUSIVE
+
+
+def test_netting_pairs_on_open_lots_not_gross_entry_quantity() -> None:
+    yes_buy = _cash_fill("Y", instrument=A_YES, qty="5", cost="2.00", fee="0.15")
+    yes_sold = _cash_fill(
+        "YS", instrument=A_YES, side="SELL", qty="4", cost="1.80", fee="0.12", hour=14
+    )
+    no_buy = _cash_fill("N", instrument=A_NO, qty="3", cost="1.65", fee="0.09")
+    rows = [
+        _cash_row("Y", yes_buy, net_position_key=SLUG_A, leg="yes", settled_outcome=True),
+        _cash_row(
+            "N",
+            no_buy,
+            net_position_key=SLUG_A,
+            leg="no",
+            settled_outcome=False,
+            instrument_id=A_NO,
+        ),
+    ]
+
+    produced = cash_records(
+        rows,
+        [yes_buy, yes_sold, no_buy],
+        legacy_fill_keys=set(),
+        deadline_ns=_slug_deadline,
+        netting_ns=lambda slug: _ts(_D0, 15),
+    )
+
+    offsets = [r for r in produced.records if r.kind == "netting_offset"]
+    assert [r.payout for r in offsets] == [Decimal(1)]  # open YES 1, open NO 3 -> one pair
+
+
+def test_cash_result_carries_the_failing_flag_when_inconclusive_takes_precedence() -> None:
+    result = cash_leg_result(
+        settled_cumulative_passes_net=False,
+        n_balance_unknown_days=1,
+        external_flow_evidence_status="OK",
+    )
+
+    assert result.outcome is VerdictOutcome.INCONCLUSIVE
+    assert result.cumulative_failed is True
+    assert (
+        cash_leg_result(
+            settled_cumulative_passes_net=True,
+            n_balance_unknown_days=0,
+            external_flow_evidence_status="OK",
+        ).cumulative_failed
+        is False
+    )
+
+
+def test_label_rows_without_a_matching_fill_are_counted_and_surface() -> None:
+    orphan = _cash_row("X", _cash_fill("X"), net_position_key=SLUG_A)
+
+    produced = cash_records(
+        [orphan],
+        [],
+        legacy_fill_keys=set(),
+        deadline_ns=_slug_deadline,
+        netting_ns=lambda slug: None,
+    )
+    result = cash_leg_result(
+        settled_cumulative_passes_net=True,
+        n_balance_unknown_days=0,
+        external_flow_evidence_status="OK",
+        unmatched_rows=produced.unmatched_rows,
+    )
+
+    assert produced.unmatched_rows == ("O-X",)
+    assert result.outcome is VerdictOutcome.INCONCLUSIVE and result.unmatched == 1
+
+
+def test_exit_record_guards_fee_and_leaves_basis_unset() -> None:
+    bad = _cash_fill("S", side="SELL", cost="0.01", fee="0.02")
+    row = _cash_row("S", bad, role=LabelRole.EXIT, realized_pnl=None, settled_outcome=None)
+    with pytest.raises(InvalidExitFill):
+        cash_records(
+            [row],
+            [bad],
+            legacy_fill_keys=set(),
+            deadline_ns=_slug_deadline,
+            netting_ns=lambda slug: None,
+        )
+
+    good = _cash_fill("S2", side="SELL", cost="0.60", fee="0.02")
+    row2 = _cash_row(
+        "S2",
+        good,
+        role=LabelRole.EXIT,
+        realized_pnl=None,
+        settled_outcome=None,
+        settlement_basis=None,
+    )
+    only = cash_records(
+        [row2],
+        [good],
+        legacy_fill_keys=set(),
+        deadline_ns=_slug_deadline,
+        netting_ns=lambda slug: None,
+    ).records[0]
+    assert only.settlement_basis is None
+
+
+def test_daily_cash_identity_ignores_realised_pnl_on_exit_proceeds() -> None:
+    sold = _cash_fill("S", day=_D1, hour=13, side="SELL", cost="0.60", fee="0.02")
+    row = _cash_row("S", sold, role=LabelRole.EXIT, realized_pnl=None, settled_outcome=None)
+    record = cash_records(
+        [row],
+        [sold],
+        legacy_fill_keys=set(),
+        deadline_ns=_slug_deadline,
+        netting_ns=lambda slug: None,
+    ).records[0]
+    bought = _cash_fill("B", day=_D0)
+    balances = {_D0: Decimal(100), _D1: Decimal(100) + record.payout}
+
+    def _rows(pnl: Decimal) -> Any:
+        residual = _prr.ResidualSettlement(
+            trial_id=record.trial_id,
+            climate_day=record.climate_day,
+            payout=record.payout,
+            dated_at_ns=record.dated_at_ns,
+            settlement_basis="nws_final",
+            realised_pnl=pnl,
+        )
+        return _prr.reconcile_daily(
+            fills=[bought, sold],
+            scored_trials=[],
+            daily_balances=balances,
+            residual_settlements=[residual],
+        )
+
+    assert _rows(Decimal(0)) == _rows(Decimal(99))
+
+
+def test_a_corrupt_compare_journal_file_raises_a_typed_error(tmp_path: Path) -> None:
+    day_dir = tmp_path / "evidence" / "aut2" / "position_compare" / "2026-09-21"
+    day_dir.mkdir(parents=True, mode=0o700)
+    bad = day_dir / f"{SNAP}_intraday.json"
+    bad.write_text("not json")
+    bad.chmod(0o600)
+
+    with pytest.raises(PositionCompareCorrupt):
+        read_position_compares(tmp_path)
+
+
+def test_position_compare_modes_are_typed(tmp_path: Path) -> None:
+
+    rows = list(_stored(SNAP, CompareResult.MATCH).rows)
+    path = write_position_compare(
+        tmp_path, SNAP, ReconMode.POST_STOP, rows, snapshot_sha256="a" * 64
+    )
+
+    assert path.name == f"{SNAP}_post_stop.json"
+    assert read_position_compares(tmp_path)[0].mode is ReconMode.POST_STOP
+    with pytest.raises(ValueError):
+        write_position_compare(tmp_path, SNAP + 1, "bogus", rows, snapshot_sha256="a" * 64)  # type: ignore[arg-type]

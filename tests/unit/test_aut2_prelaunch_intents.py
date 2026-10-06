@@ -49,6 +49,7 @@ def _observe(current: SubmitIntent | None, **kw: Any) -> IntentObservation:
         stop_signal_present=kw.pop("stop", True),
         node_pid=kw.pop("pid", lambda: None),
         read_current=lambda: current,
+        is_ambiguous=kw.pop("is_ambiguous", lambda intent: False),
         **kw,
     )
 
@@ -72,7 +73,10 @@ def test_missing_post_stop_run_reports_unknown() -> None:
 
     assert (
         observe_open_intent_post_stop(
-            stop_signal_present=True, node_pid=lambda: None, read_current=_raises
+            stop_signal_present=True,
+            node_pid=lambda: None,
+            read_current=_raises,
+            is_ambiguous=lambda _i: False,
         )
         is IntentObservation.UNKNOWN
     )
@@ -104,3 +108,18 @@ def test_z19_unknown_is_metric_not_alert() -> None:
     assert (counts.days_open, counts.n, counts.ambiguous, counts.unknown) == (2, 5, 1, 2)
     assert z19_line(counts) == "Z19 open_intent_at_poststop days=2/5 ambiguous=1 unknown=2"
     assert z19_alerts(counts) == ()
+
+
+def test_is_ambiguous_is_a_required_keyword() -> None:
+    """Fail closed: a caller must say how ambiguity is decided, never inherit a default of False."""
+    import inspect
+
+    import pytest
+
+    param = inspect.signature(observe_open_intent_post_stop).parameters["is_ambiguous"]
+    assert param.default is inspect.Parameter.empty
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        observe_open_intent_post_stop(  # type: ignore[call-arg]
+            stop_signal_present=True, node_pid=lambda: None, read_current=lambda: _intent()
+        )

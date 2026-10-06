@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from breezy.analysis.labeling.completeness import Coverage
 from breezy.analysis.labeling.constants import (
     LABEL_LAG_MAX_H,
     RECON_DAILY_VALIDITY_H,
@@ -20,7 +19,6 @@ from breezy.analysis.labeling.verdicts import (
     RECONCILIATION_DETECTOR,
     LagFill,
     PolicyBlock,
-    ReconFacts,
     ReconMode,
     build_label_lag_verdict,
     build_reconciliation_verdict,
@@ -34,48 +32,18 @@ from breezy.persistence.autonomy.verdict import (
     VerdictKind,
     VerdictOutcome,
 )
+from tests.support.aut2_fixtures import (
+    ART,
+    HOUR_NS,
+    NOW,
+    PASS,
+    SHA,
+    make_coverage,
+    make_recon_facts,
+)
 
-_H = 3_600_000_000_000
-NOW = 1_790_000_000_000_000_000
-SHA = "c" * 64
-ART = "a" * 64
+_H = HOUR_NS
 RULING = "b" * 64
-PASS = VerdictOutcome.PASS
-
-
-def _cov(**over: Any) -> Coverage:
-    base: dict[str, Any] = {
-        "durable_fill_count": 10,
-        "c2_final": 10,
-        "open": 0,
-        "pending": 0,
-        "unresolved": 0,
-        "missing_label": 0,
-        "unattributed_pre_epoch": 4,
-        "legacy_labelled": 6,
-    }
-    base.update(over)
-    return Coverage(**base)
-
-
-def _facts(**over: Any) -> ReconFacts:
-    base: dict[str, Any] = {
-        "family_id": "pm_us_crh_fq_v1",
-        "mode": ReconMode.DAILY,
-        "produced_at_ns": NOW,
-        "producer_code_sha": SHA,
-        "subject_artefact_sha256": ART,
-        "position": PASS,
-        "settlement": PASS,
-        "cash": PASS,
-        "coverage": _cov(),
-        "breaches": (),
-        "n": 7,
-        "metrics": {"p_null_count": 2, "non_c1_post_epoch_count": 0},
-        "policy": None,
-    }
-    base.update(over)
-    return ReconFacts(**base)
 
 
 def _metrics(verdict: Verdict) -> dict[str, Any]:
@@ -83,8 +51,8 @@ def _metrics(verdict: Verdict) -> dict[str, Any]:
 
 
 def test_daily_reconciliation_valid_26h() -> None:
-    daily = build_reconciliation_verdict(_facts())
-    intraday = build_reconciliation_verdict(_facts(mode=ReconMode.INTRADAY))
+    daily = build_reconciliation_verdict(make_recon_facts())
+    intraday = build_reconciliation_verdict(make_recon_facts(mode=ReconMode.INTRADAY))
 
     assert daily.valid_until_ns - daily.produced_at_ns == RECON_DAILY_VALIDITY_H * _H == 26 * _H
     assert intraday.valid_until_ns - intraday.produced_at_ns == RECON_INTRADAY_VALIDITY_H * _H
@@ -93,7 +61,7 @@ def test_daily_reconciliation_valid_26h() -> None:
 
 
 def test_subject_sha_is_bound_artefact_sha() -> None:
-    verdict = build_reconciliation_verdict(_facts())
+    verdict = build_reconciliation_verdict(make_recon_facts())
 
     assert verdict.subject_artefact_sha256 == ART
 
@@ -101,8 +69,10 @@ def test_subject_sha_is_bound_artefact_sha() -> None:
 def test_action_class_read_from_policy_block_only() -> None:
     policy = PolicyBlock(ActionClass.HALT, RULING)
 
-    with_block = build_reconciliation_verdict(_facts(policy=policy))
-    other = build_reconciliation_verdict(_facts(policy=PolicyBlock(ActionClass.ALERT, RULING)))
+    with_block = build_reconciliation_verdict(make_recon_facts(policy=policy))
+    other = build_reconciliation_verdict(
+        make_recon_facts(policy=PolicyBlock(ActionClass.ALERT, RULING))
+    )
 
     assert with_block.declared_action_class is ActionClass.HALT
     assert other.declared_action_class is ActionClass.ALERT
@@ -110,7 +80,7 @@ def test_action_class_read_from_policy_block_only() -> None:
 
 
 def test_no_policy_ruling_assumption_without_block() -> None:
-    verdict = build_reconciliation_verdict(_facts(policy=None))
+    verdict = build_reconciliation_verdict(make_recon_facts(policy=None))
 
     assert Assumption.NO_POLICY_RULING in verdict.assumptions
     assert verdict.policy_ruling_sha256 is None
@@ -120,12 +90,12 @@ def test_no_policy_ruling_assumption_without_block() -> None:
 @pytest.mark.parametrize(
     "facts",
     [
-        {"coverage": _cov(unresolved=1, c2_final=9), "breaches": ("unresolved",)},
-        {"coverage": _cov(missing_label=1, c2_final=9), "breaches": ("missing_label",)},
+        {"coverage": make_coverage(unresolved=1, c2_final=9), "breaches": ("unresolved",)},
+        {"coverage": make_coverage(missing_label=1, c2_final=9), "breaches": ("missing_label",)},
     ],
 )
 def test_unresolved_and_missing_label_fail_reconciliation(facts: dict[str, Any]) -> None:
-    verdict = build_reconciliation_verdict(_facts(**facts))
+    verdict = build_reconciliation_verdict(make_recon_facts(**facts))
 
     assert verdict.outcome is VerdictOutcome.FAIL
     m = _metrics(verdict)
@@ -133,19 +103,19 @@ def test_unresolved_and_missing_label_fail_reconciliation(facts: dict[str, Any])
 
 
 def test_legs_combine_fail_over_inconclusive_over_pass() -> None:
-    assert build_reconciliation_verdict(_facts(position=VerdictOutcome.INCONCLUSIVE)).outcome is (
-        VerdictOutcome.INCONCLUSIVE
-    )
+    assert build_reconciliation_verdict(
+        make_recon_facts(position=VerdictOutcome.INCONCLUSIVE)
+    ).outcome is (VerdictOutcome.INCONCLUSIVE)
     assert (
         build_reconciliation_verdict(
-            _facts(cash=VerdictOutcome.FAIL, position=VerdictOutcome.INCONCLUSIVE)
+            make_recon_facts(cash=VerdictOutcome.FAIL, position=VerdictOutcome.INCONCLUSIVE)
         ).outcome
         is VerdictOutcome.FAIL
     )
 
 
 def test_metrics_include_p_null_and_non_c1_counts() -> None:
-    m = _metrics(build_reconciliation_verdict(_facts()))
+    m = _metrics(build_reconciliation_verdict(make_recon_facts()))
 
     assert m["p_null_count"] == Decimal(2) and m["non_c1_post_epoch_count"] == Decimal(0)
     assert m["durable_fill_count"] == Decimal(10) and m["legacy_labelled"] == Decimal(6)
@@ -234,3 +204,43 @@ def test_autonomy_payload_hygiene_scan_covers_aut2_writers() -> None:
         relative_path(writers[0]), 'def f(path):\n    raise ValueError(f"bad {path}")\n'
     )
     assert [f.detail for f in planted] == ["interpolates path"]
+
+
+@pytest.mark.parametrize("field", ["unresolved", "missing_label", "n_undecodable"])
+def test_coverage_breach_fails_the_verdict_without_caller_breaches(field: str) -> None:
+    coverage = make_coverage(**{field: 1})
+
+    verdict = build_reconciliation_verdict(make_recon_facts(coverage=coverage, breaches=()))
+
+    assert verdict.outcome is VerdictOutcome.FAIL
+
+
+def test_clean_coverage_with_no_breaches_still_passes() -> None:
+    assert build_reconciliation_verdict(make_recon_facts(breaches=())).outcome is PASS
+
+
+def test_caller_metrics_may_not_shadow_core_metrics() -> None:
+    with pytest.raises(ValueError, match="unresolved"):
+        build_reconciliation_verdict(make_recon_facts(metrics={"unresolved": 0}))
+
+
+def test_recon_facts_metrics_are_immutable() -> None:
+    facts = make_recon_facts(metrics={"p_null_count": 1})
+
+    with pytest.raises(TypeError):
+        facts.metrics["p_null_count"] = 2  # type: ignore[index]
+
+
+def test_label_lag_unreadable_or_empty_fill_store_is_inconclusive_never_pass() -> None:
+    empties: tuple[list[LagFill] | None, ...] = (None, [])
+    for fills in empties:
+        verdict = build_label_lag_verdict(
+            family_id="pm_us_crh_fq_v1",
+            mode=ReconMode.DAILY,
+            produced_at_ns=NOW,
+            now_ns=NOW,
+            fills=fills,
+            producer_code_sha=SHA,
+            subject_artefact_sha256=ART,
+        )
+        assert verdict.outcome is VerdictOutcome.INCONCLUSIVE

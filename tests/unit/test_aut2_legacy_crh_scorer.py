@@ -21,9 +21,7 @@ from breezy.analysis.labeling.legacy_crh_scorer import (
 )
 from breezy.persistence.autonomy.label_schema import ExcludedReason, LabelRole, PSource
 from breezy.settlement.trial_scorer import ScoredTrial
-from tests.support.aut2_fixtures import durable_fill
-from tests.unit.test_aut2_attribution import TS, YES
-from tests.unit.test_aut2_fq_scorer import _H, _REL
+from tests.support.aut2_fixtures import HOUR_NS, RELEASE_NS, TS, YES, durable_fill
 
 _FAMILY = "pm_us_crh_v4"
 _TRIAL = "continuous_rung_hold/trial/LAX/2026-10-02"
@@ -40,7 +38,7 @@ def _scored(**over: Any) -> ScoredTrial:
         "pnl": Decimal("0.57"),
         "revision_seq": 1,
         "raw_sha256": "a" * 64,
-        "scored_at_ns": _REL,
+        "scored_at_ns": RELEASE_NS,
         "score_seq": 0,
         "settlement_basis": "nws_final",
         "excluded_reason": None,
@@ -60,7 +58,7 @@ def _input(*, side: str = "BUY", scored: ScoredTrial | None = None, coid: str = 
     return LegacyFillInput(fill=fill, label_family=_FAMILY, trial_id=_TRIAL, scored=scored)
 
 
-def _label(*inputs: Any, now_ns: int = _REL + _H) -> LegacyLabelResult:
+def _label(*inputs: Any, now_ns: int = RELEASE_NS + HOUR_NS) -> LegacyLabelResult:
     return LegacyCrhScorer(now_ns=now_ns, prior=()).label_with_counts(None, list(inputs), None)
 
 
@@ -133,17 +131,17 @@ def test_a_sell_row_is_final_for_completeness_and_never_missing() -> None:
 
     row = _label(_input(side="SELL", scored=None)).rows[0]
 
-    assert is_final_row(row, now_ns=_REL, deadline_ns=_REL + 10 * _H) is True
+    assert is_final_row(row, now_ns=RELEASE_NS, deadline_ns=RELEASE_NS + 10 * HOUR_NS) is True
 
 
 def test_a_correction_relabels_at_the_next_label_seq() -> None:
     first = _label(_input(scored=None)).rows[0]
-    second = LegacyCrhScorer(now_ns=_REL + 2 * _H, prior=(first,)).label_with_counts(
+    second = LegacyCrhScorer(now_ns=RELEASE_NS + 2 * HOUR_NS, prior=(first,)).label_with_counts(
         None, [_input(scored=_scored())], None
     )
-    same = LegacyCrhScorer(now_ns=_REL + 3 * _H, prior=(second.rows[0],)).label_with_counts(
-        None, [_input(scored=_scored())], None
-    )
+    same = LegacyCrhScorer(
+        now_ns=RELEASE_NS + 3 * HOUR_NS, prior=(second.rows[0],)
+    ).label_with_counts(None, [_input(scored=_scored())], None)
 
     assert second.rows[0].label_seq == 1 and second.rows[0].realized_pnl == Decimal("0.57")
     assert same.rows == ()

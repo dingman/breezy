@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from breezy.analysis.labeling.constants import (
     POST_READ_WRITE_RESERVE_S,
 )
 from breezy.analysis.labeling.skip_journal import utc_day, write_json_once
+from breezy.persistence.autonomy.canonical import canonical_json
 from breezy.persistence.autonomy.single_read import (
     SingleReadReason,
     SingleReadRefused,
@@ -82,6 +84,8 @@ class DeliveryOutcome:
 
 
 Deliver = Callable[[Mapping[str, Any]], DeliveryProof | None]
+
+_MAX_PROOF_BYTES: Final = 4096
 
 
 def deliver_or_fail(
@@ -138,8 +142,29 @@ def _dedup_parts(day: str, key: str) -> tuple[str, ...]:
     return (*DEDUP_DIR, day, f"{key}.json")
 
 
+def _dedup_body(key: str) -> Mapping[str, Any]:
+    """The journal body depends on the key alone, so equal bytes are the proof of delivery."""
+    return {"schema": "aut2_critical_dedup/v1", "key_sha12": key[:_HEX12]}
+
+
+def _holds_proof(dirfd: int, key: str) -> bool:
+    """True only for a regular file (no symlink followed, no FIFO opened) with the exact bytes."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(f"{key}.json", flags, dir_fd=dirfd)
+    except OSError:  # absent, a symlink (ELOOP) or unreadable: not a proof
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read(_MAX_PROOF_BYTES + 1) == canonical_json(dict(_dedup_body(key)))
+    finally:
+        os.close(fd)
+
+
 def is_duplicate(data_root: Path, day: str, key: str) -> bool:
-    """Whether the dedup journal already holds ``key`` for ``day``."""
+    """Whether the dedup journal already holds a delivered proof for ``key`` on ``day``."""
     rootfd = open_root(data_root)
     try:
         try:
@@ -149,24 +174,20 @@ def is_duplicate(data_root: Path, day: str, key: str) -> bool:
                 return False
             raise
         try:
-            return f"{key}.json" in os.listdir(dirfd)
+            return _holds_proof(dirfd, key)
         finally:
             os.close(dirfd)
     finally:
         os.close(rootfd)
 
 
-def _record_delivered(data_root: Path, day: str, key: str, event: str) -> None:
+def _record_delivered(data_root: Path, day: str, key: str, event: str) -> str | None:
+    """Journal the proof; a failure after a successful send is a line, never a lost delivery."""
     try:
-        write_json_once(
-            data_root,
-            _dedup_parts(day, key),
-            {"schema": "aut2_critical_dedup/v1", "event": event, "key_sha12": key[:_HEX12]},
-        )
-    except SingleReadRefused as exc:
-        # EEXIST: another writer, possibly under the other lock, already holds the proof
-        if exc.reason is not SingleReadReason.EXISTS_DIFFERENT:
-            raise
+        write_json_once(data_root, _dedup_parts(day, key), _dedup_body(key))
+    except (SingleReadRefused, OSError):
+        return f"AUT2 DEDUP_JOURNAL_NOT_WRITTEN event={event} key={key[:_HEX12]}"
+    return None
 
 
 def max_deliveries_in_budget(post_read_budget_s: float) -> int:
@@ -213,5 +234,5 @@ def deliver_critical(
         deliver_or_fail(payload, deliver=deliver, deadline_s=deadline_s)
     except AlertDeliveryFailed:
         return DeliveryOutcome(DeliveryStatus.FAILED, key, f"AUT2 DELIVERY_FAILED event={event}")
-    _record_delivered(data_root, day, key, event)
-    return DeliveryOutcome(DeliveryStatus.DELIVERED, key)
+    journal_line = _record_delivered(data_root, day, key, event)
+    return DeliveryOutcome(DeliveryStatus.DELIVERED, key, journal_line)

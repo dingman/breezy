@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Mapping
@@ -118,11 +119,11 @@ def test_suppressed_critical_keeps_verdict_effect(tmp_path: Path) -> None:
         build_reconciliation_verdict,
     )
     from breezy.persistence.autonomy.verdict import VerdictOutcome
-    from tests.unit.test_aut2_verdicts import _facts
+    from tests.support.aut2_fixtures import make_recon_facts
 
     _critical(tmp_path, _Sink())
     suppressed = _critical(tmp_path, _Sink())
-    verdict = build_reconciliation_verdict(_facts(position=VerdictOutcome.FAIL))
+    verdict = build_reconciliation_verdict(make_recon_facts(position=VerdictOutcome.FAIL))
 
     assert suppressed.status is DeliveryStatus.SUPPRESSED
     assert verdict.outcome is VerdictOutcome.FAIL  # suppression never softens the verdict
@@ -230,3 +231,51 @@ def test_measure_peak_delivery_is_dry_run_and_writes_no_real_dedup_journal(tmp_p
     written = [p for p in measure_root.rglob("*.json")]
     assert len(written) == 1 and '"status_class":"measure_dry_run"' in written[0].read_text()
     assert '"delivered":false' in written[0].read_text()
+
+
+def test_a_symlink_fifo_or_directory_at_the_dedup_path_does_not_suppress(tmp_path: Path) -> None:
+    key = critical_dedup_key(_EVENT, _VENUE, _SUBJECT, 1)
+    day_dir = tmp_path / "evidence" / "aut2" / "critical_dedup" / utc_day(NOW)
+    day_dir.mkdir(parents=True, mode=0o700)
+    (day_dir / f"{key}.json").symlink_to(tmp_path / "nowhere")
+    sink = _Sink()
+
+    outcome = _critical(tmp_path, sink)
+
+    assert outcome.status is DeliveryStatus.DELIVERED and sink.calls == 1
+    assert outcome.line is not None and "DEDUP_JOURNAL_NOT_WRITTEN" in outcome.line
+    (day_dir / f"{key}.json").unlink()
+    os.mkfifo(day_dir / f"{key}.json")
+    assert is_duplicate(tmp_path, utc_day(NOW), key) is False
+    (day_dir / f"{key}.json").unlink()
+    (day_dir / f"{key}.json").mkdir()
+    assert is_duplicate(tmp_path, utc_day(NOW), key) is False
+
+
+def test_a_regular_file_with_other_bytes_is_not_a_delivered_proof(tmp_path: Path) -> None:
+    key = critical_dedup_key(_EVENT, _VENUE, _SUBJECT, 1)
+    day_dir = tmp_path / "evidence" / "aut2" / "critical_dedup" / utc_day(NOW)
+    day_dir.mkdir(parents=True, mode=0o700)
+    planted = day_dir / f"{key}.json"
+    planted.write_text("{}")
+    planted.chmod(0o600)
+
+    assert is_duplicate(tmp_path, utc_day(NOW), key) is False
+
+
+def test_a_journal_write_failure_after_a_successful_send_still_reports_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from breezy.analysis.labeling import delivery
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(delivery, "write_json_once", _boom)
+    sink = _Sink()
+
+    outcome = _critical(tmp_path, sink)
+
+    assert sink.calls == 1
+    assert outcome.status is DeliveryStatus.DELIVERED
+    assert outcome.line is not None and "DEDUP_JOURNAL_NOT_WRITTEN" in outcome.line

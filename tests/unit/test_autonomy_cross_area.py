@@ -996,25 +996,10 @@ def test_scorer_never_attributes_by_trial_id_prefix() -> None:
 
 
 def test_voided_pair_fills_excluded_from_all_n() -> None:
-    """A voided-pair fill keeps its family but never selects into any P&L or n aggregate."""
-    from dataclasses import replace
+    """Delivered by AUT-2 WP3: the FQ scorer's own test, run on a voided-pair attribution."""
+    from tests.unit.test_aut2_fq_scorer import test_voided_pair_fills_excluded_from_all_n as t
 
-    from breezy.analysis.labeling.attribution import Attribution
-    from breezy.persistence.autonomy.label_schema import ExcludedReason
-    from breezy.persistence.autonomy.label_store import admissible_rows
-    from tests.unit.test_aut2_attribution import _decision, _link
-    from tests.unit.test_aut2_label_store import _row
-
-    voided = Attribution(
-        family_id="pm_us_crh_fq_v1", decision=_decision(), link=_link(), drill=False,
-        voided_pair=True, alerts=(),
-    )
-    row = replace(
-        _row(), excluded_reason=voided.excluded_reason, admissible=False, label_id="b" * 32
-    )
-
-    assert voided.excluded_reason is ExcludedReason.VOIDED_PAIR
-    assert admissible_rows([_row(), row]) == (_row(),)
+    t()
 
 
 def test_poststop_venue_read_is_get_only() -> None:

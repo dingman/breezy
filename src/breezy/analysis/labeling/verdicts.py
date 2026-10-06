@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Final
 
 from breezy.analysis.labeling.completeness import Coverage
@@ -83,6 +84,9 @@ class ReconFacts:
     policy: PolicyBlock | None = None
     inputs: tuple[VerdictInput, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+
 
 def _metric(value: MetricInput) -> MetricValue:
     if isinstance(value, bool) or value is None or isinstance(value, str | Decimal):
@@ -108,7 +112,14 @@ def _validity_h(mode: ReconMode) -> int:
 
 def _recon_outcome(facts: ReconFacts) -> VerdictOutcome:
     legs = (facts.position, facts.settlement, facts.cash)
-    if facts.breaches or VerdictOutcome.FAIL in legs:
+    cov = facts.coverage
+    if (
+        facts.breaches
+        or cov.unresolved
+        or cov.missing_label
+        or cov.n_undecodable
+        or VerdictOutcome.FAIL in legs
+    ):
         return VerdictOutcome.FAIL
     if VerdictOutcome.INCONCLUSIVE in legs:
         return VerdictOutcome.INCONCLUSIVE
@@ -131,8 +142,11 @@ def build_reconciliation_verdict(facts: ReconFacts) -> Verdict:
         "missing_label": cov.missing_label,
         "n_min_reason": _N_MIN_REASON,
         "mode": facts.mode.value,
-        **facts.metrics,
     }
+    clash = sorted(set(facts.metrics) & set(metrics))
+    if clash:
+        raise ValueError(f"caller metrics shadow core metrics: {', '.join(clash)}")
+    metrics.update(facts.metrics)
     return Verdict(
         kind=VerdictKind.RECONCILIATION,
         subject_family_id=facts.family_id,
@@ -170,6 +184,13 @@ def lag_start_ns(first_settlement_record_ts: int | None, settlement_deadline_ns:
     return min(first_settlement_record_ts, settlement_deadline_ns)
 
 
+def _lag_outcome(fills: Sequence[LagFill] | None, lagging: Sequence[LagFill]) -> VerdictOutcome:
+    """An unreadable (None) or empty fill store proves nothing: INCONCLUSIVE, never PASS."""
+    if not fills:
+        return VerdictOutcome.INCONCLUSIVE
+    return VerdictOutcome.FAIL if lagging else VerdictOutcome.PASS
+
+
 def _lagging(fill: LagFill, now_ns: int) -> bool:
     horizon = LABEL_LAG_MAX_H * _NS_PER_H
     end = fill.final_label_ns if fill.final_label_ns is not None else now_ns
@@ -182,7 +203,7 @@ def build_label_lag_verdict(
     mode: ReconMode,
     produced_at_ns: int,
     now_ns: int,
-    fills: Sequence[LagFill],
+    fills: Sequence[LagFill] | None,
     producer_code_sha: str,
     subject_artefact_sha256: str | None,
     policy: PolicyBlock | None = None,
@@ -190,16 +211,17 @@ def build_label_lag_verdict(
     """HEALTH ``aut2.label_lag``: FAIL when any fill has gone more than 24 h from its lag start
     without a final label (or got one only after 24 h)."""
     action, ruling, assumptions = _policy_fields(policy)
-    lagging = [f for f in fills if _lagging(f, now_ns)]
+    readable = fills if fills else ()
+    lagging = [f for f in readable if _lagging(f, now_ns)]
     metrics: dict[str, MetricInput] = {
-        "fills_checked": len(fills),
+        "fills_checked": len(readable),
         "fills_lagging": len(lagging),
         "awaiting_venue_fallback": sum(1 for f in lagging if f.awaiting_venue_fallback),
     }
     return Verdict(
         kind=VerdictKind.HEALTH,
         subject_family_id=family_id,
-        outcome=VerdictOutcome.FAIL if lagging else VerdictOutcome.PASS,
+        outcome=_lag_outcome(fills, lagging),
         detector=LABEL_LAG_DETECTOR,
         declared_action_class=action,
         produced_at_ns=produced_at_ns,
@@ -208,6 +230,6 @@ def build_label_lag_verdict(
         metrics=_metrics(metrics),
         assumptions=assumptions,
         subject_artefact_sha256=subject_artefact_sha256,
-        n=len(fills),
+        n=len(readable),
         policy_ruling_sha256=ruling,
     )

@@ -45,69 +45,11 @@ from breezy.strategy.forecast_quantile_ladder.persistent_latch import (
     FORECAST_QUANTILE_TRIAL_KEY_PREFIX,
     PersistentQuantileLadderLatch,
 )
-from tests.support.aut2_fixtures import durable_fill
+from tests.support.aut2_fixtures import NO, TS, VENUE, durable_fill, make_decision, make_link
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-VENUE = "polymarket_us"
-YES = "tc-temp-laxhigh-2026-10-02-gte89lt90f.POLYMARKET_US"
-NO = "tc-temp-laxhigh-2026-10-02-gte89lt90f^no.POLYMARKET_US"
-TS = 1_790_000_000_000_000_000
-
-
-def _decision(**over: Any) -> DecisionView:
-    base: dict[str, Any] = {
-        "schema": "capture_decision/v2",
-        "decision_id": "dec-1",
-        "family_id": "pm_us_crh_fq_v1",
-        "node_boot_id": "boot-1",
-        "build_sha": "b" * 40,
-        "registry_seq": 0,
-        "drill": False,
-        "source": "live",
-        "kind": "Take",
-        "reason": "",
-        "eval_ns": TS - 10,
-        "eval_seq": 0,
-        "wall_ns": TS - 10,
-        "ts_ns": TS - 10,
-        "station": "LAX",
-        "climate_day": "2026-10-02",
-        "rung_id": "89_90",
-        "side": "yes",
-        "instrument_id": YES,
-        "ask_px": "0.40",
-        "depth_ref": "",
-        "quote_ref": "",
-        "p_hat": "0.62",
-        "p_hat_raw": "0.62",
-        "p_lower": "0.5",
-        "p_upper": "0.7",
-        "ev_net": "0.1",
-        "margin": "0.1",
-        "forecast_input_ref": "",
-        "artefact_sha256": "a" * 64,
-        "manifest_sha256": "m" * 64,
-    }
-    base.update(over)
-    return DecisionView(**base)
-
-
-def _link(coid: str = "O-1", decision_id: str = "dec-1", **over: Any) -> OrderLinkView:
-    base: dict[str, Any] = {
-        "decision_id": decision_id,
-        "client_order_id": coid,
-        "venue_order_id_sha256": "",
-        "instrument_id": YES,
-        "side": "1",
-        "qty": "1.00",
-        "px": "0.40",
-        "time_in_force": "2",
-        "intent_fingerprint": "f" * 64,
-        "ts_ns": TS - 5,
-        "source": "live",
-    }
-    base.update(over)
-    return OrderLinkView(**base)
+_decision = make_decision
+_link = make_link
 
 
 def _c1(*links: OrderLinkView, decisions: tuple[DecisionView, ...] = ()) -> C1Index:

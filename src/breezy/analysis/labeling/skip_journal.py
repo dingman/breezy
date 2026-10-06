@@ -64,6 +64,8 @@ def utc_day(ns: int) -> str:
 
 def write_json_once(data_root: Path, parts: Sequence[str], body: Mapping[str, Any]) -> Path:
     """Write ``body`` as canonical JSON at ``data_root/<parts>`` once (0600)."""
+    if not parts:
+        raise ValueError("write_json_once needs at least one of the parts")
     rootfd = open_root(data_root)
     try:
         os.close(ensure_dir(rootfd, tuple(parts[:-1])))

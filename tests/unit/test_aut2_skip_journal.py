@@ -84,3 +84,10 @@ def test_a_bad_unit_or_reason_is_refused(tmp_path: Path) -> None:
         record_skip(tmp_path, "../x", "lock", T0, slot_ns=T0, since_ns=0)
     with pytest.raises(ValueError):
         record_skip(tmp_path, UNIT, "other", T0, slot_ns=T0, since_ns=0)
+
+
+def test_write_json_once_refuses_empty_parts(tmp_path: Path) -> None:
+    from breezy.analysis.labeling.skip_journal import write_json_once
+
+    with pytest.raises(ValueError, match="parts"):
+        write_json_once(tmp_path, (), {"a": 1})

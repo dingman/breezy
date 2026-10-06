@@ -55,7 +55,7 @@ def observe_open_intent_post_stop(
     stop_signal_present: bool,
     node_pid: _NodePid,
     read_current: _ReadCurrent,
-    is_ambiguous: Callable[[SubmitIntent], bool] = lambda _intent: False,
+    is_ambiguous: Callable[[SubmitIntent], bool],
 ) -> IntentObservation:
     """The intent state with the node down. The live-node guard runs immediately before the read."""
     if not stop_signal_present:
@@ -119,5 +119,7 @@ def z19_line(counts: Z19Counts) -> str:
 
 
 def z19_alerts(counts: Z19Counts) -> tuple[str, ...]:
-    """``unknown`` is a metric only until AUT-5a's STOP journaling exists: never an alert."""
+    """``unknown`` is a metric only until AUT-5a's STOP journaling exists: never an alert.
+
+    ``counts`` is deliberately unused until then; the signature is the settled seam."""
     return ()

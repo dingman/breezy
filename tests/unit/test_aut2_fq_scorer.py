@@ -34,12 +34,20 @@ from breezy.persistence.autonomy.label_store import LabelRow, UnmappedScorerReas
 from breezy.settlement.trial_scorer import ScoredTrial
 from breezy.settlement.trial_scorer import score_trial as real_score_trial
 from tests.contract.test_catalog_nws_records import make_climate_day
-from tests.support.aut2_fixtures import durable_fill
-from tests.unit.test_aut2_attribution import NO, TS, YES, _decision, _link
+from tests.support.aut2_fixtures import (
+    HOUR_NS,
+    NO,
+    RELEASE_NS,
+    TS,
+    YES,
+    durable_fill,
+    make_decision,
+    make_link,
+)
 
 _DAY = dt.date(2026, 10, 2)
-_H = 3_600_000_000_000
-_REL = TS + 10 * _H
+_H = HOUR_NS
+_REL = RELEASE_NS
 _FAMILY = "pm_us_crh_fq_v1"
 _GOOD = Reconciliation(reconciled=True, delta=Decimal(0), source="venue_get")
 
@@ -60,11 +68,11 @@ def _rec(tmax: int = 89, **over: Any) -> NwsClimateDay:
 
 def _attr(*, side: str = "yes", ask: str = "0.40", drill: bool = False, **over: Any) -> Attribution:
     instrument = YES if side == "yes" else NO
-    decision = _decision(side=side, ask_px=ask, drill=drill, instrument_id=instrument, **over)
+    decision = make_decision(side=side, ask_px=ask, drill=drill, instrument_id=instrument, **over)
     return Attribution(
         family_id=_FAMILY,
         decision=decision,
-        link=_link(instrument_id=instrument),
+        link=make_link(instrument_id=instrument),
         drill=drill,
         voided_pair=False,
         alerts=(),
@@ -469,3 +477,18 @@ def test_only_admissible_rows_pass_the_aggregate_filter_from_real_scorer_output(
     assert [r.client_order_id for r in chosen] == ["O-1"]
     fallback = next(r for r in rows if r.client_order_id == "O-4")
     assert fallback.excluded_reason is None and fallback.settlement_basis != "nws_final"
+
+
+def test_voided_pair_fills_excluded_from_all_n() -> None:
+    """A voided-pair fill keeps its family and is inadmissible; no aggregate selects it."""
+    from breezy.persistence.autonomy.label_store import admissible_rows
+
+    voided = replace(_attr(), voided_pair=True)
+
+    result = _label([_inp(), _inp(coid="O-2", venue_order_id="vo-2", attribution=voided)], _rec(89))
+
+    ok_row, voided_row = result.rows
+    assert voided_row.excluded_reason is ExcludedReason.VOIDED_PAIR
+    assert voided_row.admissible is False and voided_row.family_id == _FAMILY
+    assert ok_row.admissible is True
+    assert admissible_rows(result.rows) == (ok_row,)

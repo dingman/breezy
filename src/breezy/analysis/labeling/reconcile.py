@@ -35,6 +35,7 @@ from breezy.analysis.labeling.constants import (
 from breezy.analysis.labeling.fill_source import net_by_base_slug
 from breezy.analysis.labeling.legacy_crh_scorer import LEGACY_SCORER_ID
 from breezy.analysis.labeling.skip_journal import utc_day, write_json_once
+from breezy.analysis.labeling.verdicts import ReconMode
 from breezy.domain.instrument_leg import base_symbol_of, symbol_of_instrument_id
 from breezy.persistence.autonomy.canonical import sha256_hex
 from breezy.persistence.autonomy.label_schema import LabelRole
@@ -52,11 +53,14 @@ from breezy.runtime.venue_positions_read import PositionRow, ReadStatus, VenuePo
 
 __all__ = [
     "COMPARE_DIR",
+    "CashLegResult",
     "CashRecord",
     "CashRecords",
     "CashSourceOverlap",
     "CompareResult",
     "DailyPositionLeg",
+    "InvalidExitFill",
+    "PositionCompareCorrupt",
     "PositionLeg",
     "ReconAlert",
     "ReconSource",
@@ -65,6 +69,7 @@ __all__ = [
     "SlugCompare",
     "StoredSnapshot",
     "cash_leg_outcome",
+    "cash_leg_result",
     "cash_records",
     "daily_position_leg",
     "fills_never_position_compared",
@@ -88,6 +93,14 @@ _ONE: Final = Decimal(1)
 
 #: ``base_slug -> the venue settlement deadline of its climate day`` (None when unknown).
 DeadlineNs = Callable[[str], int | None]
+
+
+class PositionCompareCorrupt(Exception):
+    """A stored position-compare journal file that does not decode."""
+
+
+class InvalidExitFill(Exception):
+    """A SELL fill whose fee exceeds its proceeds: it cannot yield non-negative cash."""
 
 
 class CompareResult(StrEnum):
@@ -195,6 +208,13 @@ def reconcile_positions(
     for slug in sorted(set(by_slug) | set(venue)):
         in_ledger = by_slug.get(slug, [])
         venue_net = venue.get(slug, Decimal(0))
+        if not in_ledger and slug in open_intent_slugs:
+            # an open or ambiguous intent may still be filling: unknown, not a venue-only FAIL
+            causes.append("open_intent")
+            compares.append(
+                SlugCompare(slug, venue_net, Decimal(0), CompareResult.NOT_COMPARED_INTENT)
+            )
+            continue
         if not in_ledger:
             venue_only.append(slug)
             compares.append(SlugCompare(slug, venue_net, Decimal(0), CompareResult.MISMATCH))
@@ -202,11 +222,11 @@ def reconcile_positions(
             continue
         settled = [f for f in in_ledger if f.ts_event <= snap - grace_ns]
         ledger_net = next(iter(net_by_base_slug(settled).values()), Decimal(0))
-        if any(f.ts_event > snap - grace_ns for f in in_ledger):
-            result = CompareResult.NOT_COMPARED_GRACE
-        elif slug in open_intent_slugs:
+        if slug in open_intent_slugs:  # checked before grace: the intent cause is never lost
             result = CompareResult.NOT_COMPARED_INTENT
             causes.append("open_intent")
+        elif any(f.ts_event > snap - grace_ns for f in in_ledger):
+            result = CompareResult.NOT_COMPARED_GRACE
         elif slug not in venue and _is_settled_away(slug, snap, deadline_ns):
             result = CompareResult.SETTLED_AWAY
         else:
@@ -215,6 +235,9 @@ def reconcile_positions(
                 alerts.append(ReconAlert("CRITICAL", "position_mismatch", slug))
         compares.append(SlugCompare(slug, venue_net, ledger_net, result))
 
+    ledger_results = [c.result for c in compares if c.base_slug in by_slug]
+    if ledger_results and all(r is CompareResult.NOT_COMPARED_GRACE for r in ledger_results):
+        causes.append("all_grace")  # nothing was actually compared: never a PASS
     if any(c.result is CompareResult.MISMATCH for c in compares):
         outcome = VerdictOutcome.FAIL
     elif causes:
@@ -247,24 +270,25 @@ def position_leg_for_family(leg: PositionLeg, family_slugs: Collection[str]) -> 
 @dataclass(frozen=True)
 class StoredSnapshot:
     snapshot_ns: int
-    mode: str
+    mode: ReconMode
     rows: tuple[SlugCompare, ...]
 
 
 def write_position_compare(
     data_root: Path,
     snapshot_ns: int,
-    mode: str,
+    mode: ReconMode,
     compares: Sequence[SlugCompare],
     *,
     snapshot_sha256: str,
 ) -> Path:
     """One write-once file per snapshot: quantities and results only, no amounts or ids."""
+    mode = ReconMode(mode)  # a bad mode is a ValueError, never a file name
     body = {
         "schema": COMPARE_SCHEMA,
         "snapshot_ns": snapshot_ns,
         "snapshot_sha256": snapshot_sha256,
-        "mode": mode,
+        "mode": mode.value,
         "rows": [
             {
                 "base_slug": c.base_slug,
@@ -276,7 +300,7 @@ def write_position_compare(
         ],
     }
     return write_json_once(
-        data_root, (*COMPARE_DIR, utc_day(snapshot_ns), f"{snapshot_ns}_{mode}.json"), body
+        data_root, (*COMPARE_DIR, utc_day(snapshot_ns), f"{snapshot_ns}_{mode.value}.json"), body
     )
 
 
@@ -302,7 +326,7 @@ def read_position_compares(data_root: Path) -> tuple[StoredSnapshot, ...]:
                     raw = read_once_at(
                         dayfd, name, max_bytes=_MAX_COMPARE_BYTES, policy=ReadPolicy.STRICT
                     )
-                    out.append(_stored_of(json.loads(raw)))
+                    out.append(_stored_of(_decode(raw)))
             finally:
                 os.close(dayfd)
     finally:
@@ -310,22 +334,34 @@ def read_position_compares(data_root: Path) -> tuple[StoredSnapshot, ...]:
     return tuple(sorted(out, key=lambda s: (s.snapshot_ns, s.mode)))
 
 
-def _stored_of(body: Mapping[str, object]) -> StoredSnapshot:
-    rows = body["rows"]
-    assert isinstance(rows, list)
-    return StoredSnapshot(
-        snapshot_ns=int(str(body["snapshot_ns"])),
-        mode=str(body["mode"]),
-        rows=tuple(
-            SlugCompare(
-                str(r["base_slug"]),
-                Decimal(str(r["venue_net_qty"])),
-                Decimal(str(r["ledger_net_qty"])),
-                CompareResult(str(r["result"])),
-            )
-            for r in rows
-        ),
-    )
+def _decode(raw: bytes) -> object:
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise PositionCompareCorrupt("a stored position comparison is not JSON") from exc
+
+
+def _stored_of(body: object) -> StoredSnapshot:
+    """One stored comparison; any malformed file is a ``PositionCompareCorrupt``."""
+    try:
+        assert isinstance(body, Mapping)
+        rows = body["rows"]
+        assert isinstance(rows, list)
+        return StoredSnapshot(
+            snapshot_ns=int(str(body["snapshot_ns"])),
+            mode=ReconMode(str(body["mode"])),
+            rows=tuple(
+                SlugCompare(
+                    str(r["base_slug"]),
+                    Decimal(str(r["venue_net_qty"])),
+                    Decimal(str(r["ledger_net_qty"])),
+                    CompareResult(str(r["result"])),
+                )
+                for r in rows
+            ),
+        )
+    except (AssertionError, KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise PositionCompareCorrupt("a stored position comparison does not decode") from exc
 
 
 def snapshot_sha256(rows: Sequence[PositionRow]) -> str:
@@ -432,6 +468,23 @@ class DailyPositionLeg:
     position_mismatches_transient: int
     standing_mismatches: tuple[str, ...]
     fills_never_position_compared: int
+    venue_only_slugs: tuple[str, ...] = ()
+
+
+def _journaled_venue_only(
+    fills: Sequence[DurableFillRecord], snapshots: Sequence[StoredSnapshot]
+) -> tuple[str, ...]:
+    """Slugs a snapshot journalled as a MISMATCH when the ledger held no fill for them yet: a venue
+    position that no fill explains (an AMBIGUOUS order that really filled)."""
+    seen: set[str] = set()
+    for snap in snapshots:
+        known = {_slug_of(f) for f in fills if f.ts_event <= snap.snapshot_ns}
+        seen.update(
+            row.base_slug
+            for row in snap.rows
+            if row.result is CompareResult.MISMATCH and row.base_slug not in known
+        )
+    return tuple(sorted(seen))
 
 
 def daily_position_leg(
@@ -461,13 +514,14 @@ def daily_position_leg(
         ):
             transient += 1
     never = fills_never_position_compared(fills, snapshots, deadline_ns, now_ns=now_ns)
-    if standing or never:
+    venue_only = _journaled_venue_only(fills, snapshots)
+    if standing or never or venue_only:
         outcome = VerdictOutcome.FAIL
     elif pending:
         outcome = VerdictOutcome.INCONCLUSIVE
     else:
         outcome = VerdictOutcome.PASS
-    return DailyPositionLeg(outcome, transient, tuple(standing), never)
+    return DailyPositionLeg(outcome, transient, tuple(standing), never, venue_only)
 
 
 def streak_alert(
@@ -552,7 +606,7 @@ class CashRecord:
     climate_day: str
     payout: Decimal
     dated_at_ns: int
-    settlement_basis: str
+    settlement_basis: str | None
     realised_pnl: Decimal
 
 
@@ -560,6 +614,7 @@ class CashRecord:
 class CashRecords:
     records: tuple[CashRecord, ...]
     unknown_netting_slugs: tuple[str, ...]
+    unmatched_rows: tuple[str, ...] = ()
 
 
 def _lot_fraction(fills: Sequence[DurableFillRecord], instrument_id: str) -> Decimal:
@@ -601,9 +656,11 @@ def cash_records(
     by_coid = {f.client_order_id: f for f in fills}
     records: list[CashRecord] = []
     pairs: dict[str, dict[str, list[tuple[LabelRow, DurableFillRecord]]]] = {}
+    unmatched: list[str] = []
     for row in rows:
         fill = by_coid.get(row.client_order_id)
         if fill is None:
+            unmatched.append(row.client_order_id)  # a label with no durable fill: surfaced
             continue
         if fill.venue_order_id in legacy_fill_keys:
             if row.scorer_id == LEGACY_SCORER_ID:
@@ -618,10 +675,12 @@ def cash_records(
     unknown: list[str] = []
     for slug, sides in sorted(pairs.items()):
         records.extend(_entry_records(slug, sides, fills, deadline_ns, netting_ns, unknown))
-    return CashRecords(tuple(records), tuple(unknown))
+    return CashRecords(tuple(records), tuple(unknown), tuple(unmatched))
 
 
 def _exit_record(row: LabelRow, fill: DurableFillRecord) -> CashRecord:
+    if fill.cumulative_fee > fill.cumulative_cost:
+        raise InvalidExitFill("a SELL's fee exceeds its proceeds")
     proceeds = fill.cumulative_cost - fill.cumulative_fee
     return CashRecord(
         "exit_proceeds",
@@ -630,7 +689,7 @@ def _exit_record(row: LabelRow, fill: DurableFillRecord) -> CashRecord:
         row.climate_day,
         proceeds,
         fill.ts_event,
-        "nws_final",
+        row.settlement_basis,  # an exit carries no settlement basis of its own
         proceeds,
     )
 
@@ -643,8 +702,15 @@ def _entry_records(
     netting_ns: Callable[[str], int | None],
     unknown: list[str],
 ) -> list[CashRecord]:
-    q_yes = sum((f.cumulative_qty for _, f in sides["yes"]), Decimal(0))
-    q_no = sum((f.cumulative_qty for _, f in sides["no"]), Decimal(0))
+    # pair on OPEN lots: a quantity already sold back is not held to settlement
+    q_yes = sum(
+        (f.cumulative_qty * _lot_fraction(fills, r.instrument_id) for r, f in sides["yes"]),
+        Decimal(0),
+    )
+    q_no = sum(
+        (f.cumulative_qty * _lot_fraction(fills, r.instrument_id) for r, f in sides["no"]),
+        Decimal(0),
+    )
     paired = min(q_yes, q_no)
     out: list[CashRecord] = []
     first_row = (sides["yes"] or sides["no"])[0][0]
@@ -661,7 +727,7 @@ def _entry_records(
                     first_row.climate_day,
                     paired * _ONE,
                     when,
-                    first_row.settlement_basis or "nws_final",
+                    first_row.settlement_basis,
                     Decimal(0),
                 )
             )
@@ -681,11 +747,43 @@ def _entry_records(
                     row.climate_day,
                     payout,
                     deadline,
-                    row.settlement_basis or "nws_final",
+                    row.settlement_basis,
                     row.realized_pnl,
                 )
             )
     return out
+
+
+@dataclass(frozen=True)
+class CashLegResult:
+    """The cash leg's outcome and the cumulative flag it may have outranked (kept as a metric)."""
+
+    outcome: VerdictOutcome
+    cumulative_failed: bool
+    unmatched: int
+
+
+def cash_leg_result(
+    *,
+    settled_cumulative_passes_net: bool,
+    n_balance_unknown_days: int,
+    external_flow_evidence_status: str,
+    unknown_netting_slugs: Collection[str] = (),
+    unmatched_rows: Collection[str] = (),
+) -> CashLegResult:
+    """PASS on the net cumulative flag; an unknown balance, unverified external flows, an
+    unobservable netting event or a label with no fill is INCONCLUSIVE, never coerced to zero or
+    FAIL. A failing flag that INCONCLUSIVE outranks is still carried in ``cumulative_failed``."""
+    failed = not settled_cumulative_passes_net
+    if (
+        n_balance_unknown_days > 0
+        or external_flow_evidence_status != "OK"
+        or len(unknown_netting_slugs) > 0
+        or len(unmatched_rows) > 0
+    ):
+        return CashLegResult(VerdictOutcome.INCONCLUSIVE, failed, len(unmatched_rows))
+    outcome = VerdictOutcome.FAIL if failed else VerdictOutcome.PASS
+    return CashLegResult(outcome, failed, 0)
 
 
 def cash_leg_outcome(
@@ -695,12 +793,10 @@ def cash_leg_outcome(
     external_flow_evidence_status: str,
     unknown_netting_slugs: Collection[str] = (),
 ) -> VerdictOutcome:
-    """PASS on the net cumulative flag; an unknown balance, unverified external flows or an
-    unobservable netting event is INCONCLUSIVE, never coerced to zero or FAIL."""
-    if (
-        n_balance_unknown_days > 0
-        or external_flow_evidence_status != "OK"
-        or len(unknown_netting_slugs) > 0
-    ):
-        return VerdictOutcome.INCONCLUSIVE
-    return VerdictOutcome.PASS if settled_cumulative_passes_net else VerdictOutcome.FAIL
+    """The outcome alone; see :func:`cash_leg_result`."""
+    return cash_leg_result(
+        settled_cumulative_passes_net=settled_cumulative_passes_net,
+        n_balance_unknown_days=n_balance_unknown_days,
+        external_flow_evidence_status=external_flow_evidence_status,
+        unknown_netting_slugs=unknown_netting_slugs,
+    ).outcome
