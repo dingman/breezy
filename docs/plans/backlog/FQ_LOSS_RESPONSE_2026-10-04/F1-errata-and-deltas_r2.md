@@ -689,3 +689,68 @@ The decisions round 2 needs to make:
 - Frozen ARCH: `/home/jon/breezy/docs/plans/backlog/AUTONOMY_2026-10-03/reviews/snapshots/ARCH_rev9_2.md`
 - WP1b ownership: `/home/jon/breezy/docs/plans/backlog/AUTONOMY_2026-10-03/ARCH-0-seamA_plan_r5.md`
 - The CONFLICT-13 fixture: `/home/jon/breezy/tests/unit/test_registry_replay.py`
+---
+
+## Peer-review round 2 rulings (coordinator, 2026-10-06 ~01:00Z; binding for r3)
+
+**Reviews:**
+- Architect: REQUEST_CHANGES. The blockers are CONFLICT-14 rule 4 and the P-1 test impact.
+- Security: AMEND, 1 HIGH, no CRITICAL.
+- Stats: SOUND-WITH-CAVEATS, with 4 required fixes.
+
+- **FQ-R45, CONFLICT-13: option (d) ACCEPTED.**
+  - The guard pins the fixture's sha256 as a literal, in addition to the parsed-field comparison.
+  - **Verify-first:** after F3, run EVERY direct reader of `deploy/families/pm_us_crh_fq_v1.json`. That is `test_autonomy_pins.py:365`, `test_family_halt_cli_fq.py:155`, `test_nbp_shadow_parity_live.py:776`, `test_fq_s8_registration_artefacts.py:37`, `test_forecast_quantile_ladder_manifest_and_markers.py:23`, `test_ct08_supervisor_contract_surface.py:388`, `test_operator_caps_through_the_live_composition.py:338` and `test_trade_supervisor_phase1_unit.py:85`, plus the production readers `nbp_shadow_parity.py:115` and `family_tally_v2.py:1537`.
+  - F3 is rebuilt on this basis now. It does not wait for r3.
+- **FQ-R46, CONFLICT-14: E-27 rule 4 REJECTED.** Evidence (architect): it breaks 9 fold assertions (`test_registry_fold_effects.py:401,419,460,489,500,529,543,556`; `test_registry_fold_tallies.py:655`), and its benefits were overclaimed.
+  - **Replacement, part 1:** FQ-R34's precondition reads "the fold shows v1 RETIRED and no family of v1's lineage is in any other state".
+  - **Replacement, part 2:** a restrictive validate rule, owned by ARCH-0: "a MINT whose lineage root is RETIRED is refused". It needs a verify-first that no existing test mints under a RETIRED root. Test: `test_mint_under_retired_root_refused`.
+  - Security preferred the freeze rule. The architect's evidence that it breaks existing assertions, and that MINT never checks `terminal_frozen`, decides it.
+- **FQ-R47, GAP-16: option (i).**
+  - The pins entry `parity.fq_v2_shadow_live: (DEMOTE, RECOVERABLE_MODEL)` is listed in E-27's consumption list (ARCH `:372` names the literal).
+  - Add the exact-value assertion to `test_default_restrictive_class_is_demote_or_halt_with_known_classes`.
+  - It lands at or before P-1.
+- **FQ-R48, sequence and DEP-17.**
+  - **Explicit order:** F9-A → F9-B (verified) → {P-1, P-2, GAP-16 pins} → bootstrap → P-3.
+  - Stage S follows F9-B. Sessions before F9-B never count toward L1.
+  - Add a test that the registry's resolved family matches the env sender before any L1 session counts (security M3).
+  - Row-7 WP1–WP9 may merge, since they are inert while the source is unset. Only WP10 (stage S, L1, L2) waits behind F8, F6, the resume bar and RC-5. Record this delay in PROGRESS.
+- **FQ-R49, P-1 test impact (architect HIGH).**
+  - Verify-first: every validate-path test that bootstraps `pm_us_crh_fq_v1` as CHAMPION (55 occurrences in 16 files).
+  - Option (a), migrating the fixtures to a v2 root, is MANDATORY in the P-1 commit. It is a SCOPE change, never an assertion change.
+- **FQ-R50, E-28 wording:** "F6 merges before any row-7 WP that edits `app/trade.py` (WP5). 'Row 7 merged' means its last WP merged."
+- **FQ-R51, the §R12-1 activation proof.**
+  - Run one hand run of `family_tally_v2` on a frozen input snapshot, before and after the merge. Memory-capped, one heavy job at a time.
+  - Byte-compare the two outputs, then watch the next timer firing's exit code.
+- **FQ-R52, E-27 text.**
+  - It states explicitly that it amends RC-5's "through registry ROOT_ADMIT".
+  - Rule 2 treats ARCH `:35`, `:68-69` as historical (no new reading).
+  - The drill child `pm_us_crh_fq_v1_r0001` (`:1256`) reads `<champion>_r0001`.
+- **FQ-R53, security H1: every ops step needs a pre-flight and a read-back.**
+  - Applies to F9-A, F9-B, P-1/bootstrap, the W15 clear, the F7a activation and the F6 retirement.
+  - Add the security reviewer's acceptance text verbatim: a dry run from a non-repo cwd with absolute paths, which prints the resolved manifest path and sha, the family and the intended write, and exits non-zero on any unresolved input; then a read-back of the effect, recorded.
+  - `a8a66f41` is merged before any of these steps runs.
+- **FQ-R54, security M1, M2 and M4.**
+  - **M1, parity veto tests.** Each case refuses:
+    - an unreadable or raising fill count;
+    - a stale age (`STALE_PARITY_H`, pinned);
+    - a wrong subject or family.
+    - A FAIL also latches: a later UNDERPOWERED or older PASS never un-refuses.
+  - **M2, `evidence_row`.** r3 states that the token is an accident guard, not a security boundary. Add:
+    - the class made final;
+    - a `type(r) is EvidenceRow` check at consumers;
+    - a sealed `LoadedEvidence` container returned by the loader and checked by consumers;
+    - an AST ban on `pickle.load*` and `__setstate__` in `analysis/autonomy`;
+    - an `object.__new__` path test.
+  - **M4, the RC-5 live-orders ruling for v2.** The coordinator authors it under the operator's standing grant, where only the two budget caps are operator decisions. It cites the operator's 10-01 FQ live-real-orders ruling (`RULING_operator_fq_live_real_orders_2026-10-01`) as the authority. It is not escalated.
+- **FQ-R55, statistics (all four required before filing).**
+  1. **m_d.** m_d = `m_cap`, pinned in the F5 design JSON at 2 provisionally. F5's joint power MC chooses between {2, 3}, and m_d no longer tracks L_d.
+  2. **Upside clip.** A pinned clip `X_max` applies to h/BE−1 in both e_a and the KILL CS. The downside is never clipped, and the ask floor is kept.
+  3. **Joint power.** F5's MC reports joint power for min(e_a, e_b), and `n_e_power` comes from the joint test. The power record (FQ-R39) is re-stated after the MC; until then it is marked provisional and optimistic.
+  4. **Ties and voids.**
+     - Ties at one decision instant are ordered by G-measurable keys only (station, rung id).
+     - A voided take enters as X = 0 and is never dropped.
+  - Also state in r3:
+    - H0_b ≠ H0_a, so PASS asserts both.
+    - KILL's null is "E[Y] ≥ 0 after the haircut", not "no edge", and re-nominations compound the false-kill risk (bounded by the lifetime cap).
+    - The parity interval uses a day-clustered bootstrap, with the seed pinned and fills qty-weighted.
