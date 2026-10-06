@@ -36,8 +36,8 @@ ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/archive/iem
 
 # Five stations, one paced request each (3 attempts, 30 s/60 s backoff): minutes
 # at worst. Both bounds are set so neither a hang nor a slow trickle can run on.
-TimeoutStartSec=900
-RuntimeMaxSec=1200
+# Type=oneshot ignores RuntimeMaxSec=; TimeoutStartSec= bounds the whole run.
+TimeoutStartSec=1200
 
 # No Restart=. A missed day is recovered by the next run, whose window is
 # [window_start, fetch_date - 1] and so re-covers every missed day.
