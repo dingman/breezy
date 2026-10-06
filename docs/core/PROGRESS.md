@@ -57,9 +57,21 @@ worktree (shared venv); never `git stash`. Full gate after EVERY merge. AUD plan
 | R3V-a | 8a2f8f2 | 09-29 10:30Z backfill `breezy-replay-backfill-0929` (40 targets, 3 h) then 15:50Z daily (6): `BATCH_SUMMARY` lines, rows appended, ends before 16:35Z |
 | R3V-b | (gating) | 10-01: run `scripts/analysis/r3_viability.py`; if Wilson upper (z=1.96) < f_req 0.625 ⇒ RULING R3 not viable ⇒ programme KILL decision forward + K-2 planning |
 
-### HALT POINT 2026-10-04 ~22:30Z (operator: halt development)
-Resume from `docs/plans/backlog/HALT_POINT_2026-10-04.md`. FQ v1 halt timers fire 16:40Z 10-05; check `ops/fq_halt_*.result`.
-FQ loss-response queue (plan r3 + FQ-R34..R44): M1 evidence DONE; F1 r2 pending; F2 READY; F3 PARKED (registry child-manifest conflict).
+### FQ LOSS RESPONSE (resumed 2026-10-06; plan r3 + F1 r3, errata E-25..E-28 filed 8bdb5ef1)
+FQ v1 halt FAILED 10-05 (cwd bug, 5 more fills); backstop orders-off drop-in live 01:01Z 10-06; CLI halt re-timed 16:40Z.
+| Row | Status |
+|---|---|
+| F0 M1 | DONE fc442601 (no surviving cell; MDE 19.8c) |
+| F1 | DONE: E-25..E-28 filed; F1-errata-and-deltas_r3.md (FQ-R34..R56) |
+| F2 truth fetch | BUILT, review fixes in progress; units not installed |
+| F3 v1 terminal day | BUILT bc52965e (FQ-R45 fixture decoupling); full gate queued |
+| F4 labels | IN PROGRESS WP0-WP3 |
+| F5 prereg MC | IN PROGRESS (code + MC run) |
+| F6 bridge | waits F5 numerics (STALE_PARITY_H, n_par) |
+| F7a stats move | IN PROGRESS |
+| F10 AUT-S plan | IN PROGRESS |
+| halt CLI cwd fix | a8a66f41 gate running; merge after 16:55Z 10-06 |
+Row 7 note (FQ-R48): AUT-5a WP1-WP9 may merge (inert); WP10 stage S/L1/L2 waits F8, F6, resume bar, RC-5 (F9-B).
 
 ### AUTONOMY QUEUE (operator priority 2026-10-03; outranks every other BUILD/RUN row)
 `/execute-backlog` takes the FIRST row not DONE/GATED whose Needs are DONE; never skip ahead; on finish set `DONE <sha>`. PLAN rows go to planner + peer review, not TDD. Every brief carries the area plan, `reviews/<area>-final.md` and ARCH errata. Detail: `docs/plans/backlog/AUTONOMY_2026-10-03/README.md`.
