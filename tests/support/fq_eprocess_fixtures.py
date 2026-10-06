@@ -72,6 +72,37 @@ def fixture_b() -> tuple[Row, ...]:
 FIXTURE_B_DAYS: Final = 40
 
 
+def fixture_c() -> tuple[Row, ...]:
+    """A 24-day winning book: two takes a day, the first wins 3 days in 4, the second every other
+    day. The e-process crosses at alpha 0.05 (bar 20) well inside the window."""
+    rows: list[Row] = []
+    for d in range(24):
+        rows.append(
+            (d, 10, "KNYC", "r1", "yes", 0.35, _BE_035, 0.55, 0 if d % 4 == 3 else 1, False)
+        )
+        rows.append(
+            (d, 20, "KSFO", "r2", "yes", 0.20, _BE_020, 0.35, 1 if d % 2 == 0 else 0, False)
+        )
+    return tuple(rows)
+
+
+FIXTURE_C_DAYS: Final = 24
+
+
+def fixture_d() -> tuple[Row, ...]:
+    """A 60-day losing book WITH clipped days: the first slot is a longshot (be .169, X clipped from
+    4.9 to x_max 4) that wins every 12th day, the second slot always loses. KILL fires."""
+    rows: list[Row] = []
+    for d in range(60):
+        win = 1 if d % 12 == 0 else 0
+        rows.append((d, 10, "KNYC", "r1", "yes", 0.15, _BE_015, 0.30, win, False))
+        rows.append((d, 20, "KSFO", "r2", "yes", 0.35, _BE_035, 0.45, 0, False))
+    return tuple(rows)
+
+
+FIXTURE_D_DAYS: Final = 60
+
+
 def ts_ns(day_index: int, offset_s: int) -> int:
     return BASE_TS_NS + day_index * DAY_NS + offset_s * SECOND_NS
 

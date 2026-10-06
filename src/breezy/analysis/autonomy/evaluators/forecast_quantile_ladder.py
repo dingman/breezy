@@ -262,7 +262,7 @@ def evaluate_e_process(
     bss_iterations: int = BOOTSTRAP_ITERATIONS,
 ) -> FqShadowEvaluation:
     """Walk the settled days of one window and return the first terminal event, else the state."""
-    evidence = _require_shadow(loaded)
+    evidence = check_forward_shadow_inputs(loaded)
     end_day = min(last_settled_day, window_end)
     stats = build_day_stats(
         [_to_take(r) for r in evidence.rows],
@@ -289,11 +289,10 @@ def evaluate_e_process(
         look = state.n_cum >= design.earliest_look_n
         kill_hit = look and kill_crossed(kill_rows[i], kill_b)
         cross = look and crossed(state.log_min, pass_b)
-        pass_hit = False
+        last_guard = _guard(scored, design.guard)  # the guard on THIS settled day, every day
         if cross:
             pass_crossing_n = state.n_cum if pass_crossing_n is None else pass_crossing_n
-            last_guard = _guard(scored, design.guard)
-            pass_hit = last_guard.status == GUARD_OK
+        pass_hit = cross and last_guard.status == GUARD_OK
         if kill_hit:  # F7B-R12: a same-day PASS and KILL is FAIL
             terminal, outcome, kill_n = i, VerdictOutcome.FAIL, state.n_cum
             break
@@ -339,6 +338,8 @@ def _non_terminal(
         reason = "window_end_guard_blocked" if crossed_ever else "window_end_no_crossing"
         return VerdictOutcome.INCONCLUSIVE, reason
     if crossed_ever:
+        if guard_status == GUARD_OK:  # the blocked crossing has since lapsed, the guard is fine
+            return VerdictOutcome.UNDERPOWERED, "no_crossing_yet"
         return VerdictOutcome.UNDERPOWERED, _guard_reason(guard_status)
     if n_cum < earliest_look_n:
         return VerdictOutcome.UNDERPOWERED, "below_earliest_look_n"

@@ -6,6 +6,12 @@ null. By Ville's inequality the chance it ever reaches ``2/alpha_kill`` is at mo
 so a false KILL has probability at most ``alpha_kill / 2`` whenever the true edge is non-negative.
 Under the PASS null (``E[Y] <= 0``) that capital grows and KILL is the intended outcome.
 
+The bound is on the CLIPPED variable: it holds when ``E[Y_clipped] >= 0``. Upside clipping lowers
+``Y`` (``X`` is cut at ``x_max``), so ``E[Y_clipped] <= E[Y_unclipped]``: a book whose unclipped
+edge is exactly zero has a slightly negative clipped edge, and KILL is therefore slightly
+anti-conservative for the unclipped edge (the false-KILL bound is not guaranteed at an unclipped
+edge of exactly zero). The stated bound is exact only for the clipped edge.
+
 The module also requires the capital at EVERY other grid point (``KILL_GRID_POINTS`` values of m
 over ``[0, X_max]``) to be at the bar. Those extra points only add conservatism; they carry no
 validity claim. The per-m cap on ``lam`` keeps ``1 - lam (Y - m) > 0`` for every ``Y`` in
@@ -77,6 +83,17 @@ def _lambda_cap(m: float, x_max: float) -> float:
     return min(KILL_MAX_LAMBDA, 0.5 / max(x_max - m, _MIN_RANGE))
 
 
+def _bet_fraction(sy: float, sy2: float, d: int, m: float, x_max: float) -> float:
+    """The PREDICTABLE minus-side bet at day ``d`` for grid point ``m``: it is a function of the
+    sums ``sy``/``sy2`` of the days strictly before ``d`` only (shrunk toward ``(0, 0.25)``)."""
+    n = d + PRIOR_PSEUDO_DAYS
+    mu = sy / n
+    m2 = (sy2 + PRIOR_PSEUDO_DAYS * PRIOR_SECOND_MOMENT) / n
+    var = max(m2 - mu * mu, _VAR_FLOOR)
+    gap = m - mu
+    return min(max(gap / (var + gap * gap), 0.0), _lambda_cap(m, x_max))
+
+
 def kill_log_capitals(ys: Sequence[float], *, x_max: float) -> tuple[tuple[float, ...], ...]:
     """Per day, the log of the minus-side capital betting ``E[Y] < m`` at every grid m.
 
@@ -87,13 +104,8 @@ def kill_log_capitals(ys: Sequence[float], *, x_max: float) -> tuple[tuple[float
     sy = sy2 = 0.0
     rows: list[tuple[float, ...]] = []
     for d, y in enumerate(ys):
-        n = d + PRIOR_PSEUDO_DAYS
-        mu = sy / n
-        m2 = (sy2 + PRIOR_PSEUDO_DAYS * PRIOR_SECOND_MOMENT) / n
-        var = max(m2 - mu * mu, _VAR_FLOOR)
         for j, m in enumerate(grid):
-            gap = m - mu
-            lam = min(max(gap / (var + gap * gap), 0.0), _lambda_cap(m, x_max))
+            lam = _bet_fraction(sy, sy2, d, m, x_max)
             log_k[j] += math.log1p(-lam * (y - m))
         sy, sy2 = sy + y, sy2 + y * y
         rows.append(tuple(log_k))

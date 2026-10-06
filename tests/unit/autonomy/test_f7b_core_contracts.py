@@ -9,6 +9,7 @@ membership scan catches a new, unclassified module.
 from __future__ import annotations
 
 import ast
+import shutil
 import sys
 import tomllib
 from collections.abc import Collection
@@ -77,18 +78,34 @@ def _contract() -> dict[str, Any]:
     return contract
 
 
-def _scoped_modules() -> set[str]:
-    """Every F7b-core module that exists on disk: the explicit names plus the whole evaluators
-    package (a new evaluator module must be classified too)."""
-    found = {m for m in CLASSIFICATION if _path(m).exists()}
-    evaluators = ANALYSIS / "autonomy" / "evaluators"
-    if evaluators.is_dir():
-        found |= {
-            f"breezy.analysis.autonomy.evaluators.{p.stem}"
-            for p in evaluators.glob("*.py")
-            if p.stem != "__init__"
-        }
-    return found
+AUTONOMY_ROOT: Final[Path] = ANALYSIS / "autonomy"
+AUTONOMY_PREFIX: Final = "breezy.analysis.autonomy"
+
+#: Every module under `analysis/autonomy/**` that existed at 1ecacc87 (before F7b-core). They carry
+#: their own ARCH-0 classification; a module in neither this set nor CLASSIFICATION fails the scan.
+PRE_EXISTING_AUTONOMY_MODULES: Final = frozenset(
+    {
+        "breezy.analysis.autonomy.budget",
+        "breezy.analysis.autonomy.calibration_ni",
+        "breezy.analysis.autonomy.eval_stats",
+        "breezy.analysis.autonomy.leakage",
+        "breezy.analysis.autonomy.metric_registry",
+        "breezy.analysis.autonomy.offline_plugins",
+        "breezy.analysis.autonomy.permutation",
+        "breezy.analysis.autonomy.seeding",
+        "breezy.analysis.autonomy.windows",
+    }
+)
+
+
+def _scoped_modules(root: Path = AUTONOMY_ROOT) -> set[str]:
+    """Every module under `analysis/autonomy/**` (package `__init__` files excluded), so a new
+    module anywhere there must be classified or allowlisted."""
+    return {
+        ".".join((AUTONOMY_PREFIX, *p.relative_to(root).with_suffix("").parts))
+        for p in root.rglob("*.py")
+        if p.stem != "__init__" and "__pycache__" not in p.parts
+    }
 
 
 def _path(module: str) -> Path:
@@ -138,7 +155,9 @@ def test_scoring_core_is_stdlib_only_so_the_pyarrow_ban_is_kept() -> None:
 
 
 def test_every_f7b_core_module_is_classified() -> None:
-    assert _unclassified(_scoped_modules(), CLASSIFICATION) == set()
+    known = set(CLASSIFICATION) | PRE_EXISTING_AUTONOMY_MODULES
+    assert _unclassified(_scoped_modules(), known) == set()
+    assert {m for m in CLASSIFICATION if m.startswith(AUTONOMY_PREFIX)} <= _scoped_modules()
     for module, value in CLASSIFICATION.items():
         assert value in {STRICT, NO_LIVE_REACH} or value.startswith(EXEMPT), module
         if value.startswith(EXEMPT):
@@ -164,7 +183,17 @@ def test_each_classification_row_is_true_at_runtime() -> None:
             assert live != set(), module
 
 
-def test_classification_scan_catches_a_planted_unclassified_module() -> None:
-    planted = "breezy.analysis.autonomy.evaluators.zz_planted"
-    existing = _scoped_modules() | {planted}
-    assert _unclassified(existing, CLASSIFICATION) == {planted}
+def test_classification_scan_catches_a_planted_unclassified_module(tmp_path: Path) -> None:
+    """The REAL scan, pointed at a copy of the tree: a new module anywhere under autonomy/**
+    (top level or a new package) is reported; the allowlist and CLASSIFICATION are not."""
+    root = tmp_path / "autonomy"
+    shutil.copytree(AUTONOMY_ROOT, root, ignore=shutil.ignore_patterns("__pycache__"))
+    known = set(CLASSIFICATION) | PRE_EXISTING_AUTONOMY_MODULES
+    assert _unclassified(_scoped_modules(root), known) == set()
+    (root / "zz_planted_top.py").write_text("", encoding="utf-8")
+    (root / "newpkg").mkdir()
+    (root / "newpkg" / "zz_planted_nested.py").write_text("", encoding="utf-8")
+    assert _unclassified(_scoped_modules(root), known) == {
+        f"{AUTONOMY_PREFIX}.zz_planted_top",
+        f"{AUTONOMY_PREFIX}.newpkg.zz_planted_nested",
+    }

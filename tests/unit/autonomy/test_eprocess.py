@@ -44,9 +44,13 @@ from breezy.analysis.autonomy.eprocess import (
 from tests.support.fq_eprocess_fixtures import (
     FIXTURE_A,
     FIXTURE_A_DAYS,
+    FIXTURE_C_DAYS,
+    FIXTURE_D_DAYS,
     Row,
     climate_day,
     fixture_b,
+    fixture_c,
+    fixture_d,
     ts_ns,
 )
 from tests.support.fq_mc_reference_vectors import REFERENCE
@@ -462,7 +466,19 @@ CASES: Final = (
     ("A_m2", FIXTURE_A, FIXTURE_A_DAYS, 2, 3),
     ("A_m3", FIXTURE_A, FIXTURE_A_DAYS, 3, 3),
     ("B_m2", fixture_b(), 40, 2, 6),
+    ("C_m2", fixture_c(), FIXTURE_C_DAYS, 2, 6),  # e_a crosses at alpha .05
+    ("D_m2", fixture_d(), FIXTURE_D_DAYS, 2, 6),  # a losing book with clipped days
 )
+
+
+def test_c_fixture_e_a_crosses_at_alpha_005_and_d_has_clipped_days() -> None:
+    ref_c, ref_d = REFERENCE["C_m2"], REFERENCE["D_m2"]
+    assert ref_c["cross_a"][2] > 0  # alphas[2] == .05: e_a crosses the 1/alpha bar
+    # the longshot's unclipped X is 1/0.1693408 - 1 = 4.905 > x_max, so the clipped day is
+    # (4.0 - 1.0) / m_cap = 1.5, not (4.905 - 1.0) / 2 = 1.95
+    assert 1 / 0.1693408 - 1 > 4.0
+    assert max(ref_d["y"]) == pytest.approx(1.5, abs=1e-12)
+    assert ref_d["kill_first_n"] > 0
 
 
 @pytest.mark.parametrize(("key", "rows", "days", "m_cap", "elo"), CASES)
@@ -658,8 +674,21 @@ def test_mutation_dropping_voids_from_the_count_is_caught() -> None:
     kept = daily_statistic(climate_day(0), [v, w], d)
     dropped = daily_statistic(climate_day(0), [w], d)
     assert (kept.n_takes, dropped.n_takes) == (2, 1)
-    stat = DayStat(climate_day(0), kept.y, kept.z, kept.n_takes, kept.uncounted)
-    assert run_eprocess([stat], d)[0].n_cum == 2
+    # independent of `kept`: the whole pipeline (takes -> build_day_stats -> run_eprocess)
+    pipeline = {
+        label: run_eprocess(
+            build_day_stats(
+                takes,
+                covered_days=frozenset({climate_day(0)}),
+                first_day=climate_day(0),
+                last_settled_day=climate_day(0),
+                design=d,
+            ),
+            d,
+        )[0].n_cum
+        for label, takes in (("with_void", [v, w]), ("void_dropped", [w]))
+    }
+    assert pipeline == {"with_void": 2, "void_dropped": 1}
 
 
 def test_h0_crossing_rate_le_alpha_exact_null() -> None:

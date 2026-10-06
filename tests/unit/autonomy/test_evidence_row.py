@@ -167,14 +167,53 @@ def _src_files() -> list[Path]:
 # ------------------------------------------------------------------ loader contract
 
 
+_CONSTRUCTED: Final = {"EvidenceRow", "LoadedEvidence"}
+
+
+def constructor_violations(source: str) -> list[str]:
+    """Calls of `EvidenceRow` / `LoadedEvidence`: by name, through an attribute
+    (`evidence_row.EvidenceRow(...)`), or through an import alias (`import ... as X`)."""
+    tree = ast.parse(source)
+    aliases = {
+        a.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for a in node.names
+        if a.name in _CONSTRUCTED and a.asname
+    }
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _CONSTRUCTED | aliases:
+            out.append(func.id)
+        elif isinstance(func, ast.Attribute) and func.attr in _CONSTRUCTED:
+            out.append(func.attr)
+    return out
+
+
+def test_single_constructor_scan_catches_attribute_and_aliased_calls() -> None:
+    planted = {
+        "EvidenceRow(a=1)": ["EvidenceRow"],
+        "evidence_row.EvidenceRow(a=1)": ["EvidenceRow"],
+        "pkg.mod.LoadedEvidence(1)": ["LoadedEvidence"],
+        "from m import EvidenceRow as Row\nRow(a=1)": ["Row"],
+        "from m import LoadedEvidence as L\nx = L(rows=())": ["L"],
+        "from m import EvidenceRow\nisinstance(x, EvidenceRow)": [],
+        "from m import EvidenceRow as Row\nisinstance(x, Row)": [],
+        "other.Build(1)": [],
+    }
+    for source, want in planted.items():
+        assert constructor_violations(source) == want, source
+
+
 def test_evidence_row_single_loader_contract() -> None:
     """`EvidenceRow(...)` is built only inside `evidence_row.py`; the loader is the constructor."""
     for path in _src_files():
         if path == EVIDENCE_SRC:
             continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                assert node.func.id not in {"EvidenceRow", "LoadedEvidence"}, path
+        assert constructor_violations(path.read_text(encoding="utf-8")) == [], path
     assert callable(load_evidence_rows)
     with pytest.raises(TypeError):
         EvidenceRow(  # type: ignore[call-arg]
@@ -453,6 +492,10 @@ def test_row_shape_and_numeric_validation(monkeypatch: pytest.MonkeyPatch) -> No
         (raw_row(p_model="-0.1"), "bad_number"),
         (raw_row(h=2), "bad_outcome"),
         (raw_row(h=True), "bad_outcome"),
+        (raw_row(h=1.0), "bad_outcome"),  # only an exact int 0/1 settles
+        (raw_row(h=0.0), "bad_outcome"),
+        (raw_row(h=Decimal(1)), "bad_outcome"),
+        (raw_row(h="1"), "bad_outcome"),
         (raw_row(void=True, h=1), "void_with_outcome"),
         (raw_row(void="yes"), "wrong_type"),
         (raw_row(climate_day="2026-13-40"), "bad_date"),

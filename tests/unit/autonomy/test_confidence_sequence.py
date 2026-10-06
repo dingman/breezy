@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import itertools
 import math
+from collections.abc import Callable
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -53,7 +54,7 @@ def test_module_docstring_states_the_m0_supermartingale_argument() -> None:
     assert "UB < 0" not in doc.replace("never claims", "")  # the withdrawn wording is not claimed
 
 
-@pytest.mark.parametrize("key", ["A_m2", "A_m3", "B_m2"])
+@pytest.mark.parametrize("key", ["A_m2", "A_m3", "B_m2", "C_m2", "D_m2"])
 def test_kill_matches_f5_mc_reference_on_shared_fixtures(key: str) -> None:
     ref = REFERENCE[key]
     caps = kill_log_capitals(ref["y"], x_max=X_MAX)
@@ -70,6 +71,8 @@ def test_kill_matches_f5_mc_reference_on_shared_fixtures(key: str) -> None:
     )
     assert got == (None if ref["kill_first_n"] < 0 else ref["kill_first_n"])
     assert key != "B_m2" or got == 78
+    assert key != "D_m2" or got is not None  # KILL fires on the book with clipped days
+    assert key != "C_m2" or got is None  # and never on the winning book
 
 
 def test_cs_reject_only_when_ub_lt_0() -> None:
@@ -163,22 +166,50 @@ def test_enumeration_m0_capital_is_a_supermartingale_at_zero_edge() -> None:
     assert total <= 1 + Fraction(1, 10**9)
 
 
-def test_mutation_future_betting_breaks_the_m0_supermartingale() -> None:
-    """MUTATION: a capital whose bet may see today's Y exceeds 1 in expectation at the null."""
+def _m0_capital_expectation(on_path: Callable[[list[float]], None] = lambda ys: None) -> Fraction:
+    """Exact E[m = 0 capital] over a Bernoulli tree at zero edge (be 1/4, X = 3 or -1, two takes a
+    day, three days), through the PRODUCTION `kill_log_capitals`. `on_path` sees each path's
+    daily Y before the capital is computed."""
     q = Fraction(1, 4)
     total = Fraction(0)
     for hs in itertools.product((0, 1), repeat=6):
         w = Fraction(1)
-        log_cap = 0.0
+        ys = []
         for k in range(0, 6, 2):
             pair = hs[k : k + 2]
             for h in pair:
                 w *= q if h else 1 - q
-            y = sum(3.0 if h else -1.0 for h in pair) / 2
-            lam = 0.5 if y < 0 else 0.0  # bets on E[Y] < 0 only when it has seen Y < 0
-            log_cap += math.log1p(-lam * y)
-        total += w * Fraction(math.exp(log_cap))
-    assert total > 1 + Fraction(1, 100)
+            ys.append(sum(3.0 if h else -1.0 for h in pair) / 2)
+        on_path(ys)
+        total += w * Fraction(math.exp(kill_log_capitals(ys, x_max=X_MAX)[-1][0]))
+    return total
+
+
+def test_mutation_future_betting_breaks_the_m0_supermartingale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MUTATION OF THE PRODUCTION PATH: make the predictable bet fraction see today's Y. The exact
+    enumeration that passes for the real code must then fail (E[capital] > 1 at the null)."""
+    assert _m0_capital_expectation() <= 1 + Fraction(1, 10**9)  # the real path holds
+    path: dict[str, list[float]] = {}
+    real = cs._bet_fraction
+
+    def sees_today(sy: float, sy2: float, d: int, m: float, x_max: float) -> float:
+        y = path["ys"][d]
+        return real(sy + y, sy2 + y * y, d, m, x_max)
+
+    monkeypatch.setattr(cs, "_bet_fraction", sees_today)
+    mutated = _m0_capital_expectation(lambda ys: path.update(ys=ys))
+    assert mutated > 1 + Fraction(1, 100)
+
+
+def test_module_docstring_states_the_clipping_bound_and_its_direction() -> None:
+    """The false-KILL bound holds for E[Y_clipped] >= 0; upside clipping makes KILL slightly
+    anti-conservative relative to the unclipped edge."""
+    doc = " ".join((cs.__doc__ or "").split())
+    assert "E[Y_clipped] >= 0" in doc
+    assert "anti-conservative" in doc
+    assert "unclipped" in doc
 
 
 # ---------------------------------------------------------------- BSS on takes (diagnostic)

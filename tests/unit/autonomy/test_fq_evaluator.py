@@ -65,6 +65,14 @@ SHADOW: Final = StoreKind.NODE_C1_SHADOW_TAKES
 P = VerdictOutcome
 
 
+@pytest.fixture(autouse=True)
+def _registered_shadow_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production registry is empty (E-25 rule 6b), so the evaluator refuses every input. The
+    PASS/FAIL logic tests need a registered source: this fixture registers the shadow store for
+    them. The guard-chain tests reset it to the production value explicitly."""
+    monkeypatch.setattr(fq, "REGISTERED_FORWARD_SHADOW_SOURCES", frozenset({SHADOW}))
+
+
 def design(guard: GuardThresholds | None = None, **kw: Any) -> EProcessDesign:
     base: dict[str, Any] = {
         "m_cap": 2,
@@ -203,6 +211,7 @@ def test_forward_shadow_refuses_without_registered_forward_shadow_source(
 ) -> None:
     assert REGISTERED_FORWARD_SHADOW_SOURCES == frozenset()  # E-25 rule 6b: empty until F5 rules
     assert isinstance(REGISTERED_FORWARD_SHADOW_SOURCES, frozenset)
+    monkeypatch.setattr(fq, "REGISTERED_FORWARD_SHADOW_SOURCES", REGISTERED_FORWARD_SHADOW_SOURCES)
     ev = evidence(monkeypatch, FIXTURE_A, FIXTURE_A_DAYS)
     with pytest.raises(ForwardShadowRefused) as err:
         check_forward_shadow_inputs(ev)
@@ -210,6 +219,21 @@ def test_forward_shadow_refuses_without_registered_forward_shadow_source(
     # the chain passes only for a registered source
     monkeypatch.setattr(fq, "REGISTERED_FORWARD_SHADOW_SOURCES", frozenset({SHADOW}))
     assert check_forward_shadow_inputs(ev) is ev
+
+
+def test_evaluate_e_process_itself_runs_the_full_guard_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct call with otherwise valid, sealed shadow evidence still needs a REGISTERED source:
+    the evaluator runs `check_forward_shadow_inputs`, not only the shadow-class check."""
+    monkeypatch.setattr(fq, "REGISTERED_FORWARD_SHADOW_SOURCES", frozenset())
+    ev = evidence(monkeypatch, FIXTURE_A, FIXTURE_A_DAYS)
+    assert ev.evidence_class is EvidenceClass.SHADOW
+    with pytest.raises(ForwardShadowRefused) as err:
+        run(ev, FIXTURE_A_DAYS, design(guard()))
+    assert err.value.reason == "no_registered_forward_shadow_source"
+    monkeypatch.setattr(fq, "REGISTERED_FORWARD_SHADOW_SOURCES", frozenset({SHADOW}))
+    assert run(ev, FIXTURE_A_DAYS, design(guard())).outcome is P.PASS
 
 
 @pytest.mark.parametrize("kind", [StoreKind.C2_LABEL_STORE, StoreKind.HARNESS, StoreKind.FS_REPLAY])
@@ -321,6 +345,45 @@ def test_guard_is_evaluated_per_day_jointly_with_the_crossing(
     assert out.outcome is P.PASS and out.terminal_day == climate_day(5)
     late = run(ev, FIXTURE_A_DAYS, design(guard(n_guard_min=15)))
     assert late.outcome is not P.PASS  # the guard never became sufficient inside the window
+
+
+def test_reported_guard_status_is_the_current_days_not_the_last_crossing_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """alpha_k .8437 (bar .1699): the statistic crosses on day 6 only (.194), not on day 5 (.159)
+    or day 7 (.160). The guard (n_guard_min 14) is insufficient on day 6 (13 settled takes) and OK
+    on day 7 (14), so the reported guard is the day-7 one while the crossing stays blocked."""
+    ev = evidence(monkeypatch, FIXTURE_A, FIXTURE_A_DAYS)
+    out = run(ev, FIXTURE_A_DAYS, design(guard(n_guard_min=14)), alpha_k="0.8437")
+    assert out.pass_crossing_n == 15  # a crossing was seen, and blocked, on day 6
+    assert out.outcome is P.UNDERPOWERED and out.terminal_day is None
+    assert out.guard_status == "OK"  # the guard on the LAST settled day
+    assert out.reason == "no_crossing_yet"  # not a stale guard_insufficient
+
+
+def test_window_end_guard_blocked_reports_the_final_days_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ev = evidence(monkeypatch, FIXTURE_A, FIXTURE_A_DAYS)
+    out = run(
+        ev,
+        FIXTURE_A_DAYS,
+        design(guard(n_guard_min=14)),
+        alpha_k="0.8437",
+        window_end=FIXTURE_A_DAYS - 1,
+    )
+    assert (out.outcome, out.reason) == (P.INCONCLUSIVE, "window_end_guard_blocked")
+    assert out.guard_status == "OK"
+    # a guard that stays insufficient is still reported as such
+    stuck = run(
+        ev,
+        FIXTURE_A_DAYS,
+        design(guard(n_guard_min=10_000)),
+        alpha_k="0.8437",
+        window_end=FIXTURE_A_DAYS - 1,
+    )
+    assert stuck.reason == "window_end_guard_blocked"
+    assert stuck.guard_status == "INSUFFICIENT(n_guard_min)"
 
 
 def test_pass_requires_both_e_a_and_e_b_at_alpha_k(monkeypatch: pytest.MonkeyPatch) -> None:

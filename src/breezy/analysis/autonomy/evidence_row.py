@@ -295,7 +295,7 @@ def _seal_row(raw: object, cls: EvidenceClass) -> EvidenceRow:
     if tag is not cls:
         raise EvidenceRefused("tag_mismatch", f"{tag.value} in a {cls.value} store")
     h = raw["h"]
-    if h is not None and (isinstance(h, bool) or h not in (0, 1)):
+    if h is not None and not (type(h) is int and h in (0, 1)):  # exact int: no bool/float/Decimal
         raise EvidenceRefused("bad_outcome", repr(h))
     void = raw["void"]
     if not isinstance(void, bool):
