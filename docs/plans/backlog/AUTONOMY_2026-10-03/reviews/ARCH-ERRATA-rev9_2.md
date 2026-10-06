@@ -502,3 +502,297 @@ AUT-4's `eval-offline` replay children run `run_live_parity`, which imports `bre
 - **Manifest sha.** A family's `manifest_sha256` is the one on its introducing row. A later row may carry only that same sha. This supersedes the "latest manifest sha" fold behaviour (fold.py:321-322).
 - **Density pin.** The manifest's `density_artefact_sha256` equals the family's bound artefact sha, for every kind. Sentinel roots bind the sentinel file.
 - **New density.** A new density is a new child family, minted. ARCH:367 was silent on manifest immutability; this erratum closes that gap.
+
+
+<!-- E-25..E-28 filed 2026-10-06 from docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F1-errata-and-deltas_r3.md (F1 FQ-PLAN; peer rounds 1-2 + convergence, rulings FQ-R34..R56). Consumed by their owning WPs; nothing here is built. -->
+## E-25 (coordinator, 2026-10-04; FQ r3 RC-1 as amended by FQ-R15, FQ-R20, FQ-R26, FQ-R37, FQ-R38, FQ-R39, FQ-R55; filed by F1 only, FQ-R19): e-process verdicts and the per-lineage e-LOND α schedule
+
+**Numbering.** The FQ plan's "E-15" is already used by the network-namespace erratum, so this one is E-25. Every FQ-plan reference to E-15, including F7b's Needs token, reads E-25.
+
+**Finding.**
+- ARCH C4 (`:288-301`, `:323-346`) and AUT-4 r11 (§3.1 `:469-472`, §3.5 `:560-572`) allow only a fixed-n, single-look FORWARD_SHADOW under a geometric FWER schedule.
+- PREREG v2 confirms on an anytime-valid, calendar-day e-process and controls FDR with per-lineage e-LOND.
+- Neither the `verdict/v1` key set (`src/breezy/persistence/autonomy/verdict.py:178-184`) nor the window-cap rule (ARCH `:340-346`) can express that.
+
+**Rule.**
+
+1. **New verdict fields.** These are three nullable additions to `verdict/v1` `_KEYS`, and all three are in the identity body.
+   - **`test_kind`** ∈ {`fixed_n`, `e_process`}.
+     - Never null on FORWARD_SHADOW.
+     - On LIVE_SEQUENTIAL it is `e_process` only when the family PREREG registers an e-process. LD-OBF families keep it null; `family_prereg_sha256` governs them.
+     - Null on every other kind.
+   - **`eta_ns`** (int, `e_process` only). The projected UTC ns at which n reaches `n_e_power[k]`, at `take_rate_lower`. Null when the nomination is infeasible or the test is `fixed_n`.
+   - **`window_end`** (ISO date, FORWARD_SHADOW only, either test kind). The last forward climate day, inclusive, by AUT-4 `windows.py` arithmetic.
+
+2. **`n_min_eff` is not redefined.**
+   - It is null on every `e_process` verdict.
+   - For `e_process`, `n_min` is F5's pre-registered earliest-look n. No PASS or FAIL is written below it.
+
+3. **The e-process (FORWARD_SHADOW and LIVE_SEQUENTIAL `e_process`).** The unit is the settled calendar day d.
+   - **Null H0_a (per take).** E[h_i | G_τi] ≤ BE_i, where:
+     - h_i ∈ {0, 1} is the qty-1 payout;
+     - BE_i = haircut `ask_exec` + fee, with the existing minimum-ask floor on the ask kept unchanged (FQ-R55.2);
+     - G_τi is the information at the decision instant.
+   - **The per-take term, with the upside clipped (FQ-R55.2).**
+     - X_i = min(h_i/BE_i − 1, `X_max`), where `X_max` is pinned in the F5 design JSON.
+     - The downside is never clipped, so X_i ≥ −1 still holds.
+     - Clipping only lowers X_i, so E[X_i | G_τi] ≤ 0 under H0_a still holds. Validity is kept and the upside tail is bounded.
+   - **Voids and ties (FQ-R55.4).**
+     - A voided take enters as X_i = 0 (and S_i = 0 below). It takes its slot and is never dropped.
+     - Takes at one decision instant are ordered by G-measurable keys only: (station, rung id), lexicographic. No outcome-dependent or arrival-order key is used.
+   - **The daily statistic uses a denominator pinned before the day (FQ-R39, FQ-R55.1).**
+     - Y_d = (1/m_d) · Σ_{i ≤ min(N_d, m_d)} X_i, where N_d is the number of takes on day d.
+     - **m_d = `m_cap`** for every day. `m_cap` is pinned in the F5 design JSON, **provisionally 2**. F5's joint power MC chooses between {2, 3}. m_d no longer depends on the listing count L_d.
+     - Empty slots (N_d < m_d) contribute 0. A day with no takes has Y_d = 0, which gives a factor of 1.
+     - Takes are counted in decision order (ties as above). Takes beyond m_d are excluded from Y_d and disclosed in the metric `eprocess_uncounted_takes`.
+     - −1 ≤ Y_d ≤ `X_max`.
+   - **e_a.** e_a,t = Π_{d ≤ t} (1 + λ_d·Y_d).
+     - λ_d is fixed at the start of day d from settled days only (the betting rule is pinned).
+     - λ_d ∈ [0, λ_max], with λ_max ≤ 0.5 (FQ-R15), so every factor is ≥ 0.5.
+   - **e_b, a betting e-process built directly rather than derived from a CS (FQ-R39).**
+     - S_i = (a_i − y_i)² − (p_i − y_i)², where a_i is the ask-implied probability of the side bought, p_i is the model's probability of that side, and y_i is the outcome.
+     - The null is H0_b: E[S_i | G_τi] ≤ 0.
+     - Z_d = (1/m_d)·Σ_{i ≤ min(N_d, m_d)} S_i ∈ [−1, 1], using the same m_d, the same tie order and the same void rule.
+     - e_b,t = Π (1 + μ_d·Z_d), with μ_d predictable and in [0, μ_max ≤ 0.5].
+     - The BSS-on-takes CS is still reported, as a diagnostic only.
+   - **The two nulls are different (FQ-R55).**
+     - H0_a (no net edge against the haircut ask) and H0_b (no Brier improvement against the ask) are distinct hypotheses. Neither implies the other.
+     - PASS asserts **both** alternatives. It is an intersection–union test: it rejects H0_a ∪ H0_b only when each one is rejected at α_k.
+   - **Outcomes.**
+     - **PASS:** min(e_a, e_b) ≥ 1/α_k on some settled day with n ≥ `earliest_look_n`, **and** the calibration guard is sufficient and not failing.
+       - Ville's inequality bounds P_H0a(sup e_a ≥ 1/α_k) ≤ α_k, and likewise for H0_b. So the IUT has level α_k.
+     - **FAIL (KILL):** the hedged CS on Y_d (clipped X), at level 1 − **α_kill**, has UB < 0.
+       - **KILL's null (FQ-R55).** It is E[Y_d | F_{d−}] ≥ 0 after the haircut and the clip: "the clipped, haircut daily mean is not negative". It is **not** "the model has no edge". A model with a small true edge that the haircut, the fee and the clip remove can be killed. That is accepted as capital protection.
+       - **α_kill = 0.05**, pinned in the F5 design JSON. It is separate from α_k, is never charged to `alpha_spent`, and is not part of e-LOND. Rationale: KILL is a capital-protection decision, not a discovery claim.
+       - **Compounding (FQ-R55).** Each re-nomination runs a new KILL test, so false-kill risk compounds across a lineage's tests. The lifetime cap bounds it. By the union bound, P(any false KILL across a lineage's FORWARD_SHADOW tests) ≤ K_LIFETIME·α_kill = 4·0.05 = 0.20. Infeasible nominations run no test, and `max_infeasible_nominations` caps them (rule 6). Each LIVE_SEQUENTIAL `e_process` tenure adds at most α_kill. F5 reports the realised bound.
+     - **UNDERPOWERED:** otherwise.
+     - **`INCONCLUSIVE(window_end_no_crossing)`:** the window ended without a crossing.
+     - PASS, FAIL and INCONCLUSIVE are final and are never reopened.
+     - On LIVE_SEQUENTIAL `e_process`, WIN is PASS and KILL is FAIL. The detector map is unchanged.
+   - **Why a pinned denominator and not per-take factors (FQ-R39).**
+     - The per-take product Π(1 + λ X_i) with a start-of-day λ is a test supermartingale only if each factor has conditional mean ≤ 1 given the earlier factors.
+     - Takes on the same station-day settle together and are dependent. Mixed-side takes on one station-day are positively correlated (L-40 i).
+     - The linear daily form is valid under any within-day dependence, and with a take count that depends on intraday information. Each term has conditional mean ≤ 0 at its own decision instant, the tower property applies, and the slot weights 1/m_cap are fixed before the day.
+     - The cost is dilution on days with N_d < m_cap. F5's joint MC chooses `m_cap` ∈ {2, 3} to trade that dilution against P(N_d > m_cap).
+   - **Mandatory MC cases (F5, L-40 and L-41).** Type-I error of PASS ≤ α_k is required in both exact-null cases:
+     - (i) **Intraday-informed take count.** Takes fire when an intraday observation signal crosses a threshold, outcomes are correlated with that signal, and the true conditional edge is exactly 0.
+     - (ii) **Mixed-side same-station-day takes** with positive covariance.
+     - Both cases run at each candidate `m_cap` ∈ {2, 3}, with the pinned `X_max`.
+
+4. **α schedule.** Each lineage root pins `alpha_schedule` ∈ {`halving_v1`, `elond_heavy_tailed_v1`} in the policy block.
+   - **`halving_v1`** is ARCH's α_total·2^−k_life, unchanged.
+   - **`elond_heavy_tailed_v1`** gives α_k = α_total·γ_k·(R + 1), where:
+     - γ_t = g(t)/Σ_{s=1..T} g(s), with g(t) = 1/(t·ln²(t+1));
+     - T = `MAX_NOMINATIONS_PER_LINEAGE_LIFETIME` (`pins.py:38`, which is 4), unless F5 pins per-epoch budgets. The design JSON pins exactly one of the two;
+     - R = the lineage's effective CHALLENGER→CHAMPION PROMOTE count before the nomination row's `ts_ns`. That is the fold's `promotions` (`fold.py:397-398`; `fold_tallies.py:62`, `:87`). PROMOTE reaches CHAMPION only from CHALLENGER (`transitions.py:72`; FQ-R43 CONFIRMED).
+   - **Why R is safe.** R ≤ the true discovery count, because each such PROMOTE needs an accepted FORWARD_SHADOW PASS (ARCH `:476`). If `promotions` is window-pruned (E-21), R only shrinks, which is conservative.
+   - **Frozen at test start.** `alpha_k` is computed once, inside the nomination's `BEGIN IMMEDIATE`, and written to the row. FORWARD_SHADOW copies it.
+   - **No pooling** across lineages. `alpha_spent` = Σ row `alpha_k`.
+   - **Pairing rule.** The policy loader refuses `elond_heavy_tailed_v1` on a `fixed_n` lineage and `halving_v1` on an `e_process` lineage.
+
+5. **Error-rate statement (FQ-R39).**
+   - **What is controlled.** e-LOND controls FDR ≤ α_total **within each lineage's nomination sequence**, under arbitrary dependence among that lineage's e-values.
+   - **The null.** A false discovery is a PASS when H0_k holds, where H0_k = H0_a ∪ H0_b for nominee k: no net edge against the **haircut ask** (on the clipped scale), or no Brier improvement against the **ask**.
+   - **What PASS does not test.** PASS does **not** test superiority over the incumbent champion. That comparison is the non-confirmatory OFFLINE_CHALLENGER / NOT_DISTINCT screen.
+   - **Across lineages, nothing is controlled.** With L lineages, this erratum does not bound the programme-wide false-discovery proportion.
+   - **The FWER bound.** At R = 0, Σ_k α_k ≤ α_total. ARCH's "Σα ≤ α_total per lineage" (`:334`) holds for `halving_v1` lineages only. That is the FWER-to-FDR substitution this programme adopts.
+
+6. **`nomination_feasible`.**
+   - **`fixed_n`:** unchanged (`n_min_eff ≤ n_cap`).
+   - **`e_process`:** true iff **both** of these hold:
+     - (a) ⌊`take_rate_lower` · forward days to `window_end` · `uptime_floor`⌋ ≥ `n_e_power[k]`.
+       - `n_e_power` is a pinned policy-block table of the smallest n with **joint** MC power ≥ 0.8 for the PASS rule min(e_a, e_b) ≥ 1/α_k, at R = 0, at the pinned `m_cap` and `X_max` (FQ-R55.3).
+       - It is never derived from e_a power alone.
+       - This is arithmetic on named block keys only (AUT-4 r11 K1);
+     - (b) **(FQ-R38, GAP-13)** an F5 ruling registers a forward-only shadow evidence source for the nominee. While none exists, every `e_process` nomination of a non-champion is infeasible.
+   - **An infeasible nomination burns no K slot:** `alpha_k = 0`, `k_life` unchanged, `infeasible_nominations` +1, and the window slot is used. ARCH `:343-344` is unchanged.
+   - **Cap (FQ-R39).**
+     - A nomination is refused, and no row is written, when the lineage's `infeasible_nominations` (`fold_tallies.py:59`, `:83`) is ≥ the policy key `max_infeasible_nominations`.
+     - A new code ceiling owned by ARCH-0, `pins.MAX_INFEASIBLE_NOMINATIONS_PER_LINEAGE_LIFETIME = 4`, bounds that key.
+     - Rationale: infeasible nominations spend no α. Without a cap, a lineage can consume forward windows indefinitely, and can shop for a feasible window as `window_end` and the table index move. The cap only restricts.
+
+7. **C5 row shape is unchanged.** All five `NOMINATION_FIELDS` stay required on a nomination (`registry_shape.py:41`, `:73-75`).
+   - On an `e_process` row, `n_min_eff` holds the `fixed_n` value computed from the same block. It is disclosure only and never a gate.
+
+8. **Evidence provenance (FQ-R37).**
+   - No verdict PASS may rest on `source=backtest` rows. The evaluator enforces this: a statistic whose only input is backtest yields at most UNDERPOWERED, or a screen rejection.
+   - The policy loader refuses a `forecast_quantile_ladder` lineage with `test_kind=fixed_n`.
+   - Non-FQ fixed-n replay FS is unchanged and moot, because `pins.LIVE_GATE_ROUTED_KINDS` = {`forecast_quantile_ladder`} (`pins.py:23`).
+
+9. **K_LIFETIME ≤ 4** stays a ceiling.
+
+10. **Fixed-n-only rules.**
+    - The single-look discipline (AUT-4 r11 §3.1) and the window-cap rule (ARCH `:340-346`) apply to `fixed_n` only.
+    - `e_process` uses rules 3 and 6.
+
+**Amends (the frozen text itself is not edited).**
+- ARCH C4 `:288-301`, `:323-336` and `:340-346`.
+- AUT-4 r11 §3.1, §3.1a, §3.5, §3.7, §3.8 and §7.
+- The AUT-5 r7 policy key `alpha_spending` (`:599`).
+
+**Consumption.**
+- **ARCH-0 owner:**
+  - three keys in `verdict.py:178-184`;
+  - kind rules beside `_FORWARD_SHADOW_ONLY` (`:189`, `:264-270`);
+  - the new pins ceiling (rule 6);
+  - `persistence/autonomy/elond.py`.
+- AUT-4 r12: F7b (WP2b).
+- AUT-5 r8: policy keys and WP3 tests.
+- **F5 design JSON pins:**
+  - γ or T, δ_h, `n_e_power` (joint), `take_rate_lower`, `uptime_floor`, `earliest_look_n`;
+  - `m_cap` (provisional 2; final ∈ {2, 3}), `X_max`, λ_max, μ_max, the betting rules, α_kill;
+  - the parity n_par, δ_par and α_par, plus the parity bootstrap seed and replicate count (§R12-5), and `STALE_PARITY_H` (§R8-1).
+
+**Tests (all ADD).**
+- `test_c4_e_process_n_min_eff_null_with_eta_ns_window_end`
+- `test_elond_alpha_matches_pinned_gamma_schedule` (FQ-R26)
+- `test_alpha_frozen_at_test_start_per_lineage_no_pooling`
+- `test_infeasible_nomination_burns_no_k_slot`
+- `test_infeasible_nominations_capped_per_lineage`
+- `test_e_process_nomination_infeasible_without_forward_shadow_source`
+- `test_elond_schedule_refused_for_fixed_n_lineage`
+- `test_elond_r_counts_only_effective_champion_promotes`
+- `test_verdict_e_process_fields_null_on_other_kinds`
+- `test_eprocess_daily_denominator_fixed_before_first_decision`
+- `test_eprocess_m_d_is_pinned_m_cap_independent_of_listing_count` (FQ-R55.1)
+- `test_eprocess_uncounted_takes_disclosed_never_entered`
+- `test_eprocess_upside_clipped_at_x_max_downside_never_clipped` (FQ-R55.2)
+- `test_kill_cs_uses_clipped_haircut_y` (FQ-R55.2)
+- `test_eprocess_same_instant_ties_ordered_by_station_then_rung_id` (FQ-R55.4)
+- `test_eprocess_void_take_enters_as_zero_never_dropped` (FQ-R55.4)
+- `test_eprocess_null_mc_intraday_dependent_take_count`
+- `test_eprocess_null_mc_mixed_side_same_station_day`
+- `test_n_e_power_is_joint_power_of_min_ea_eb` (FQ-R55.3; F5 design-JSON test)
+- `test_e_b_is_betting_process_not_cs_derived`
+- `test_alpha_kill_pinned_separately_never_charged`
+- `test_backtest_only_input_never_yields_pass`
+- `test_policy_loader_refuses_fq_lineage_fixed_n`
+
+**Fail-closed reading.** Until a merged ARCH-0 change consumes E-25, the exact-set reader refuses any verdict carrying `test_kind`, and F7b cannot merge.
+
+## E-26 (coordinator, 2026-10-04; FQ r3 RC-6 as amended by FQ-R20, FQ-R40; filed by F1 only): two FQ model classes
+
+**Numbering.** The FQ plan's "E-16" is already used, so this one is E-26. The Needs of F11 and F13 read E-26.
+
+**Finding.** Only `density_table` and `rung_recalibration` are admitted (ARCH C3 `:235-240`; AUT-3 r6 §3.1; `pins.MODEL_CLASS_COMPONENTS`, `pins.py:96`).
+
+**Rule.**
+
+1. **Two new classes.**
+   - Add `forecast_quantile_ladder:density_table_multisource` and `forecast_quantile_ladder:variant_spec`.
+   - `MODEL_CLASS_COMPONENTS` becomes `("density_table", "rung_recalibration", "density_table_multisource", "variant_spec")`. It is append-only.
+   - `ROOT_ARTEFACT_COMPONENT` stays `"density_table"` (`pins.py:91`).
+   - E-22(d) probing still requires exactly one match.
+2. **Single writer.** Only AUT-3 `c3_writer.write_candidate` writes either class:
+   - into a fresh `derived/artefacts/<model_class>/<sha>/`;
+   - with `lineage/v1` and every C3 invariant (`ref_ts_lt_take_ts`, `no_sealed_holdout_rows_in_train`);
+   - with one `refit_run/v1` per run.
+3. **One mint slot.** ≤ 1 MINT per lineage per day across all four classes (ARCH `:323-325`).
+4. **`density_table_multisource`.**
+   - Inputs: US weather sources only. Never international data, venue prices or execution data (ARCH `:238-240`).
+   - `data_windows` has one entry per source, each with its `content_sha256`.
+   - It may be screened and forward-shadow-replayed. Becoming CHAMPION also needs the F13 ingest actor live, and a separately reviewed G11-style live-loader acceptance with parity tests.
+5. **`variant_spec` (FQ-R40).**
+   - **The variation lives in the artefact only.** A `variant_spec` child's manifest equals its committed root on every key outside the ARCH §4.2 allowlist (ARCH `:803-806`; `byte_binding.CHILD_MANIFEST_ALLOWLIST`, `byte_binding.py:82-91`).
+   - `params` is a closed-key artefact object. Its keys come from the set the FQ live loader reads from an artefact, bounded by that loader (ARCH `:806`).
+   - It never changes `taker_fee_coefficient`, `composition_kind` or `stations`.
+6. **Nomination refusal (FQ-R40).**
+   - A nomination of a child whose manifest differs from its root outside the §4.2 allowlist is **refused at nomination**.
+   - Variation that needs a manifest change goes through new-family registration, never through a MINT.
+7. **Forward freeze (FQ-R14).**
+   - `variant_spec` `lineage.json` carries `spec_freeze_sha`.
+   - `leakage_assertions` gains `nomination_days_after_spec_freeze`.
+   - Scan and screen days never count as nomination evidence.
+
+**Consumption.**
+- `pins.py:96`, by the ARCH-0 owner.
+- AUT-3 r7: `c3_writer` and the §3.1 table.
+- F11 and F13.
+- The AUT-4 OFFLINE_CHALLENGER screens all four classes.
+
+**Tests (all ADD unless marked).**
+- `test_model_class_components_append_only_four`. Any existing exact-set pin is widened by exactly these two entries in the same commit (SCOPE: widened by exactly two, never turned into a superset check).
+- `test_c3_writer_only_writer_of_new_classes`. This must be a call-site AST check (FQ-R43).
+- `test_mint_ceiling_shared_across_four_classes`
+- `test_multisource_consumes_no_execution_data`
+- `test_variant_spec_params_are_artefact_only`
+- `test_variant_spec_refuses_theta_kind_or_new_station`
+- `test_variant_spec_nonallowlisted_diff_nomination_refused` (FQ-R40)
+- `test_variant_spec_nomination_days_after_spec_freeze`
+
+**Fail-closed reading.** Until E-26 is consumed, `c3_writer` refuses both classes, and the replay probe finds no component, so it refuses.
+
+**Carried to F10.** M1 cells are (side, ask bin). The FQ manifest has no such key (`pm_us_crh_fq_v1.json:1-20`), and a child cannot vary it. An M1 survivor therefore needs either a reviewed FQ manifest-schema extension (outside E-26) or a new family (FQ-R40).
+
+## E-27 (coordinator, 2026-10-04; FQ-R35 as amended by FQ-R46, FQ-R47, FQ-R48, FQ-R52): BOOTSTRAP_SEED CHAMPION is the venue's sending FQ root
+
+**Amends RC-5 (FQ-R52).** This erratum amends FQ r3 RC-5's "F9 arms v2 through registry ROOT_ADMIT/RESUME" (`FQ-LOSS-RESPONSE_plan_r3.md:74`). It now reads:
+- v2 is armed by the env and the RC-5 live-orders ruling (F9-A, F9-B).
+- v2 enters the registry as the `BOOTSTRAP_SEED` CHAMPION.
+- Neither ROOT_ADMIT nor RESUME is on the F9 path.
+
+**Rule.**
+
+1. **The CHAMPION seed.** In ARCH `:472` and `:737-738`, the `pins.BOOTSTRAP_SEED` CHAMPION reads "the venue's sending FQ root at bootstrap".
+   - For polymarket_us this is `pm_us_crh_fq_v2`.
+   - `pm_us_crh_fq_v1` is seeded **RETIRED**, beside v4, cont and `pm_us_crh_v2`.
+   - The pair BOOTSTRAP (∅, RETIRED) is allowed (`transitions.py:69`).
+   - **Evidence that this is safe now:** no bootstrap has run, and `BOOTSTRAPPED_ROOT_MANIFEST_SHA256` is empty (`pins.py:99-100`; asserted by `test_empty_pins_at_arch0`, `test_autonomy_pins.py:104`).
+
+2. **Other mentions of `fq_v1` (CONFLICT-7; FQ-R52).**
+   - **Readings.** Where ARCH C3, C5, §5.3 or §10 names `fq_v1` as drill root, incumbent or rollback target (`:264`, `:480`, `:607`, `:1255`, `:1258`), it reads "the venue's FQ CHAMPION at drill time".
+   - **The drill child.** `pm_us_crh_fq_v1_r0001` (`:1256`) reads `<champion>_r0001`. With v2 seeded, that is `pm_us_crh_fq_v2_r0001`.
+   - **Historical, with no new reading.** These lines record the state at Rev 9.2 and are not re-read:
+     - `:35` (G1, "currently `pm_us_crh_fq_v1`");
+     - `:68-69` (G34, G35);
+     - AUT-7 r5 `:29`, the ARCH §10 quote.
+
+3. **Ordering (FQ-R48).**
+   - The sequence is binding: **F9-A → F9-B (verified) → {P-1, P-2, GAP-16 pins} → bootstrap → P-3.**
+   - P-1 also lands after F3 (FQ-R33).
+   - The seed CHAMPION must hold its own `_LIVE_ORDERS_ALLOWLIST` triple at the P-1 commit.
+   - E-24 holds: v2 has no registry row before F9-A.
+   - Stage S follows F9-B. No session before F9-B ever counts toward L1.
+
+4. **Seeded-retired lineages (FQ-R46; replaces r2 rule 4, which is deleted).**
+   - **(a) The W15 clear precondition.** FQ-R34's precondition for clearing v1's standing halt reads: "the fold shows v1 RETIRED **and no family of v1's lineage is in any other state**".
+     - The fold flag `terminal_frozen` is not part of the precondition.
+     - The fold is unchanged. A BOOTSTRAP → RETIRED row sets no freeze, so every existing `terminal_frozen` assertion stays byte-unchanged.
+   - **(b) The validate rule, owned by ARCH-0 and restrictive only: "a MINT is refused when every family of its lineage is RETIRED".** (FQ-R56; narrowed from r3's "lineage root is RETIRED". The broader rule conflicted with ARCH `:489`, under which a superseded root routinely ends RETIRED in a healthy lineage.)
+     - It is added to `_CHECKS[Kind.MINT]` (`validate.py:526`) beside `ii.mint_rate` (`validate_ii.py:248-264`), as a new `validate_ii` check with a new `RuleII` member, refusing with `FAIL`.
+     - The lineage's family states are read from `ctx.states`, which starts as the prior fold and is advanced by the earlier immediate rows in the batch (`validate.py:604`, `:623-624`). So a MINT that follows, in the same batch, a row that retires the lineage's last non-RETIRED family is also refused.
+     - The check runs after `ii.mint_rate`, so the RED tests use the day's first MINT.
+     - **SCOPE (FQ-R56):** `RULE_II_NAMES` (`tests/unit/test_registry_validate_ii.py:1254`, used by `test_every_rule_ii_name_is_unique_and_wired`) is widened by exactly the one new name, in the same commit.
+     - **Why this is needed.** Y10 `terminal_frozen` (`validate_ii.py:208-219`) guards only →CHAMPION rows. MINT's checks today are `ii.mint_rate` alone (`validate.py:526`). So nothing currently stops a MINT in an all-RETIRED lineage. With this rule, (a) stays true once it holds.
+
+**Unchanged.**
+- ROOT_ADMIT (ARCH `:479`) stays the recovery path after a KILL or a TERMINAL event, including its U2 standing-halt rule.
+- `ROOT_ADMIT_ENABLED_CEILING` stays `False` (`pins.py:22`).
+
+**Consumption.**
+- **ARCH-0 owner, as pins and validate commits:**
+  - The `BOOTSTRAP_SEED` re-pin (P-1).
+  - The `BOOTSTRAPPED_ROOT_MANIFEST_SHA256` rows (P-1).
+  - **The GAP-16 pins entry (FQ-R47):** `pins.DEFAULT_RESTRICTIVE_CLASS` (`pins.py:148-164`; ARCH `:372` names this literal) gains `"parity.fq_v2_shadow_live": ("DEMOTE", "RECOVERABLE_MODEL")`. It lands at or before P-1.
+  - The rule 4(b) MINT check in `validate.py` and `validate_ii.py`.
+- AUT-5 r8: §R8-3 line 172; §R8-4.
+- AUT-7 r6: the retargets (§R8-3).
+
+**Tests.**
+- **SCOPE (re-pin)** `tests/unit/test_autonomy_pins.py::test_literal_identity_pins` (`:113-122`). The exact-equality assertion on `pins.BOOTSTRAP_SEED` is kept. The expected literal becomes the E-27 seed (`pm_us_crh_fq_v2` CHAMPION; v1, v4, cont and `pm_us_crh_v2` RETIRED) in the P-1 commit.
+- **SCOPE (re-pin)** `test_autonomy_pins.py::test_empty_pins_at_arch0` (`:97-105`). The `BOOTSTRAPPED_ROOT_MANIFEST_SHA256 == {}` assertion (`:104`) keeps exact equality, re-pinned to the exact five-row P-1 literal. The `MappingProxyType` check (`:105`) is byte-unchanged. `test_bootstrapped_root_manifests_unchanged` (`:359-361`) is byte-unchanged and then hashes those five files.
+- **ADD (assertion)** to `test_default_restrictive_class_is_demote_or_halt_with_known_classes` (`test_autonomy_pins.py:148-158`): `assert table["parity.fq_v2_shadow_live"] == ("DEMOTE", "RECOVERABLE_MODEL")`. The existing assertions are byte-unchanged. The test pins no exact key set, so no widening is needed.
+- ADD `test_bootstrap_seed_champion_has_live_orders_triple`
+- ADD `test_policy_halt_mirror_on_seeded_retired_family_writes_no_row_and_no_freeze`
+- ADD `test_mint_in_all_retired_lineage_refused` (FQ-R46, FQ-R56)
+- ADD `test_mint_after_lineage_fully_retired_earlier_in_same_batch_refused` (FQ-R46, FQ-R56, the batch-aware read)
+- ADD `test_mint_allowed_when_root_retired_but_lineage_has_live_family` (FQ-R56: a superseded root that is RETIRED does not block MINT in a healthy lineage)
+- **Verify-first (FQ-R46, blocking).** List every existing test that writes a MINT in a lineage whose families are all, or all become, RETIRED. If any exists, STOP for a ruling. Its assertion is never edited to pass.
+- **Dropped:** r2's `test_seeded_retired_lineage_is_terminal_frozen`. It was an r2 proposal that never merged, and its rule is rejected.
+
+## E-28 (coordinator, 2026-10-04; FQ-R36 as reworded by FQ-R50): RC-7 carve-out from AUT-5a's `app/trade.py` ownership
+
+**Rule.**
+- The ARCH §5.1 sentence "`app/trade.py` … belong[s] to AUT-5a alone" (`:1049-1051`) reads: "except that FQ r3 row F6 may change `_compose_forecast_quantile_ladder` (`app/trade.py:676`) once. **F6 merges before any row-7 WP that edits `app/trade.py` (WP5).**"
+- **"Row 7 merged" means that row 7's last WP has merged.**
+- Row-7 WPs that do not edit `app/trade.py` may merge before F6 (FQ-R48). Work after row 7 merges, such as F13, is outside AUT-5a's in-flight exclusivity and is unaffected.
