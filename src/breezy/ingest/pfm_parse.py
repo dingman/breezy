@@ -23,8 +23,9 @@ ABOVE the local `CST 3hrly` row and the extrema label is upper case (`MIN/MAX`, 
 columns, the point names and the zone lines are the same. Both row orders are accepted.
 
 An extrema cell that is the NWS missing marker `MM` (a real SFO block of 2022-08-24 prints it for
-every cell) is skipped: that day has no MAX. A product left with no MAX at all is refused
-(`no_max_values`); any other non-integer cell is still refused (`bad_extrema_cell`).
+every cell) is skipped: that day has no MAX. A product left with no MAX because MM cells were
+skipped is refused (`no_max_values`); any other non-integer cell is still refused
+(`bad_extrema_cell`).
 
 Layout VERIFIED against real captures of all five offices
 (`tests/fixtures/us_sources/pfm_*_real_20261006.txt`). Each point block holds two
@@ -286,7 +287,7 @@ def _hour_rows(table: list[str]) -> tuple[str, str] | None:
 
 def _table_max(
     table: list[str], anchor: dt.date, issued_at: dt.datetime, previous: _Column | None
-) -> tuple[dict[dt.date, int], _Column]:
+) -> tuple[dict[dt.date, int], _Column, int]:
     hour_rows = _hour_rows(table)
     if hour_rows is None:
         raise PfmParseError("table_header", table[0][:40])
@@ -299,12 +300,14 @@ def _table_max(
     if extrema[0][:_LABEL_WIDTH].strip().upper() not in _EXTREMA_LABELS:
         raise PfmParseError("extrema_label")
     found: dict[dt.date, int] = {}
+    skipped = 0
     for count, m in enumerate(re.finditer(r"\S+", extrema[0][_LABEL_WIDTH:]), start=1):
         if count > MAX_FIELDS_PER_ROW:
             raise PfmParseError("too_many_fields", f"extrema row over {MAX_FIELDS_PER_ROW}")
         end = _LABEL_WIDTH + m.end()
         if m.group() == _MISSING_MARKER and end in columns:
-            continue  # the NWS missing-data marker: that extremum is simply not forecast
+            skipped += 1  # the NWS missing-data marker: that extremum is simply not forecast
+            continue
         if not _INT_RE.match(m.group()) or end not in columns:
             raise PfmParseError("bad_extrema_cell", m.group())
         value = int(m.group())
@@ -315,7 +318,7 @@ def _table_max(
             found[column.local_date] = value
         elif column.utc_hour != _MIN_UTC_HOUR:
             raise PfmParseError("extrema_under_unexpected_hour", str(column.utc_hour))
-    return found, ordered[-1]
+    return found, ordered[-1], skipped
 
 
 def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date, int], ...]:
@@ -324,13 +327,15 @@ def _max_by_day(body: list[str], issued_at: dt.datetime) -> tuple[tuple[dt.date,
         raise PfmParseError("tables", f"{len(starts)} tables in point block")
     merged: dict[dt.date, int] = {}
     last: _Column | None = None
+    skipped_mm = 0
     for begin, end in zip(starts, [*starts[1:], len(body)], strict=True):
-        found, last = _table_max(body[begin:end], issued_at.date(), issued_at, last)
+        found, last, skipped = _table_max(body[begin:end], issued_at.date(), issued_at, last)
+        skipped_mm += skipped
         for date, value in found.items():
             if date in merged:
                 raise PfmParseError("duplicate_day", date.isoformat())
             merged[date] = value
-    if not merged:  # e.g. a point block whose every extremum is MM
+    if not merged and skipped_mm:  # every extremum MM; any other empty block keeps ()
         raise PfmParseError("no_max_values", "no MAX under any UTC 00 column")
     return tuple(sorted(merged.items()))
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -169,9 +170,64 @@ def test_body_and_wmo_that_disagree_are_refused_not_placed() -> None:
     assert report.refused == {"header_body_mismatch": 1}
 
 
-def test_an_unknown_body_zone_falls_back_to_cursor_relative_placement() -> None:
+def test_a_present_but_unparseable_body_zone_is_refused_and_counted() -> None:
     report = bf.LegReport(station="KNYC", wfo="OKX")
-    raw = _fixture("pfm_okx_real_20210312.txt").replace("EST", "XXX")
+    raw = _fixture("pfm_okx_real_20210312.txt").replace("EST", "HST")
+
+    paired = bf._place([raw], dt.date(2021, 3, 12), report)
+
+    assert [i for _p, i in paired] == [None]
+    assert report.refused == {"body_time_unparseable": 1}
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        ("EST", "XXX"),
+        ("Mar 12 2021", "Mar 32 2021"),
+        ("605 PM", "605 QM"),
+        ("Mar 12 2021", "Mar 12 2O21"),
+    ],
+)
+def test_a_typo_in_the_body_issuance_line_is_refused_not_cursor_placed(
+    edit: tuple[str, str],
+) -> None:
+    report = bf.LegReport(station="KNYC", wfo="OKX")
+    raw = _fixture("pfm_okx_real_20210312.txt").replace(*edit)
+
+    paired = bf._place([raw], dt.date(2021, 3, 12), report)
+
+    assert [i for _p, i in paired] == [None]
+    assert report.refused == {"body_time_unparseable": 1}
+
+
+def test_a_product_with_no_body_issuance_line_still_uses_cursor_placement() -> None:
+    report = bf.LegReport(station="KNYC", wfo="OKX")
+    raw = "".join(
+        ln
+        for ln in _fixture("pfm_okx_real_20210312.txt").splitlines(keepends=True)
+        if "605 PM EST" not in ln
+    )
+
+    paired = bf._place([raw], dt.date(2021, 3, 12), report)
+
+    assert [i for _p, i in paired] == [dt.datetime(2021, 3, 12, 23, 5, tzinfo=_UTC)]
+    assert report.refused == {}
+
+
+def test_a_body_weekday_that_contradicts_the_date_is_refused() -> None:
+    report = bf.LegReport(station="KNYC", wfo="OKX")
+    raw = _fixture("pfm_okx_real_20210312.txt").replace("Fri Mar 12 2021", "Sat Mar 12 2021")
+
+    paired = bf._place([raw], dt.date(2021, 3, 12), report)
+
+    assert [i for _p, i in paired] == [None]
+    assert report.refused == {"body_weekday_mismatch": 1}
+
+
+def test_a_matching_body_weekday_places_at_the_wmo_instant() -> None:
+    report = bf.LegReport(station="KNYC", wfo="OKX")
+    raw = _fixture("pfm_okx_real_20210312.txt")
 
     paired = bf._place([raw], dt.date(2021, 3, 12), report)
 
@@ -347,3 +403,127 @@ def test_main_quarantines_through_the_option(
         for ln in (tmp_path / "q" / "refusals.jsonl").read_text().splitlines()
     ]
     assert reasons == ["unplaceable_header"]
+
+
+# ------------------------------ review fixes: guards, MM-only, atomic quarantine
+
+_GOLDEN_MAIN_PARSE: dict[str, tuple[str, str, str, list[tuple[str, int]]]] = {
+    # fixture -> (station, issued_at, ...); recorded by running the parser of main (6d1eb4f3)
+    "pfm_lot_real_20261006.txt": ("KMDW", "2026-10-06T01:56:00+00:00", "", [
+        ("2026-10-06", 73), ("2026-10-07", 76), ("2026-10-08", 68), ("2026-10-09", 67),
+        ("2026-10-10", 72), ("2026-10-11", 75), ("2026-10-12", 69)]),
+    "pfm_lox_real_20261006.txt": ("KLAX", "2026-10-05T21:52:00+00:00", "", [
+        ("2026-10-06", 97), ("2026-10-07", 90), ("2026-10-08", 88), ("2026-10-09", 85),
+        ("2026-10-10", 81), ("2026-10-11", 77), ("2026-10-12", 75)]),
+    "pfm_mfl_real_20261006.txt": ("KMIA", "2026-10-05T18:21:00+00:00", "", [
+        ("2026-10-06", 89), ("2026-10-07", 89), ("2026-10-08", 89), ("2026-10-09", 89),
+        ("2026-10-10", 89), ("2026-10-11", 89), ("2026-10-12", 89)]),
+    "pfm_mtr_real_20261006.txt": ("KSFO", "2026-10-06T01:00:00+00:00", "", [
+        ("2026-10-06", 87), ("2026-10-07", 84), ("2026-10-08", 82), ("2026-10-09", 74),
+        ("2026-10-10", 69), ("2026-10-11", 67), ("2026-10-12", 69)]),
+    "pfm_okx_real_20261006.txt": ("KNYC", "2026-10-05T19:01:00+00:00", "", [
+        ("2026-10-06", 63), ("2026-10-07", 68), ("2026-10-08", 76), ("2026-10-09", 72),
+        ("2026-10-10", 69), ("2026-10-11", 68), ("2026-10-12", 71)]),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("name", sorted(_GOLDEN_MAIN_PARSE))
+def test_current_layout_real_fixtures_parse_exactly_as_on_main(name: str) -> None:
+    station, issued, _unused, expected = _GOLDEN_MAIN_PARSE[name]
+
+    point = parse_pfm_product(
+        _fixture(name).encode(),
+        station=station,
+        reference_time=dt.datetime(2026, 10, 6, 23, 0, tzinfo=_UTC),
+    )
+
+    assert point.issued_at.isoformat() == issued
+    assert [(d.isoformat(), v) for d, v in point.max_by_day] == expected
+
+
+def test_a_block_with_no_max_column_and_no_mm_cell_keeps_the_prior_empty_result() -> None:
+    # Every Min/Max row emptied: no MM was skipped, so this is not the all-MM refusal.
+    lines = _fixture("pfm_okx_real_20261006.txt").splitlines(keepends=True)
+    emptied = "".join(
+        ln[:14] + "\n" if ln.startswith(("Min/Max", "Max/Min")) else ln for ln in lines
+    )
+    ref = dt.datetime(2026, 10, 6, 23, 0, tzinfo=_UTC)
+
+    point = parse_pfm_product(emptied.encode(), station="KNYC", reference_time=ref)
+
+    assert point.max_by_day == ()
+
+
+def _live_apply_args(tmp_path: Path, *extra: str) -> list[str]:
+    return _main_args(tmp_path, "--apply", "--quarantine-dir", str(tmp_path / "q"), *extra)
+
+
+def test_apply_with_a_quarantine_dir_still_requires_the_live_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("BREEZY_LIVE", raising=False)
+
+    code = bf.main(_live_apply_args(tmp_path, "--request-budget", "50"))
+
+    assert code == 2
+    assert "BREEZY_LIVE=1 is required" in capsys.readouterr().err
+
+
+def test_apply_with_a_quarantine_dir_still_requires_a_request_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+
+    code = bf.main(_live_apply_args(tmp_path))
+
+    assert code == 2
+    assert "--request-budget is required" in capsys.readouterr().err
+
+
+def test_apply_with_a_quarantine_dir_refuses_a_zero_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+
+    code = bf.main(_live_apply_args(tmp_path, "--request-budget", "0"))
+
+    assert code == 2
+    assert "--request-budget" in capsys.readouterr().err
+
+
+def test_quarantine_raw_write_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_src: Any, _dst: Any) -> None:
+        raise OSError("rename failed")
+
+    monkeypatch.setattr(os, "replace", boom)
+    quarantine = bf.RefusalQuarantine(tmp_path / "q")
+
+    with pytest.raises(OSError, match="rename failed"):
+        quarantine.record(
+            reason="x", station="KNYC", wfo="OKX", sdate=dt.datetime(2026, 10, 5, tzinfo=_UTC),
+            issued=None, raw=b"raw",
+        )  # fmt: skip
+
+    assert list((tmp_path / "q").glob("*.raw")) == []
+    assert not (tmp_path / "q" / "refusals.jsonl").exists()
+
+
+def test_quarantine_log_append_is_flushed_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+
+    bf.RefusalQuarantine(tmp_path / "q").record(
+        reason="x", station="KNYC", wfo="OKX", sdate=dt.datetime(2026, 10, 5, tzinfo=_UTC),
+        issued=None, raw=b"raw",
+    )  # fmt: skip
+
+    assert synced
+    assert (tmp_path / "q" / "refusals.jsonl").read_text().endswith("\n")

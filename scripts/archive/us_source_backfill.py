@@ -62,6 +62,7 @@ from iem_mos_probe_transport import (  # type: ignore[import-not-found]
 )
 from us_source_pfm_support import (  # type: ignore[import-not-found]
     BODY_WMO_TOLERANCE,
+    BodyTimeError,
     RefusalQuarantine,
     body_issuance_utc,
     wmo_instant_near,
@@ -88,6 +89,7 @@ from breezy.persistence.us_source_revision_store import (
 )
 
 __all__ = [
+    "BodyTimeError",
     "LegReport",
     "RefusalQuarantine",
     "UnplaceableHeaderError",
@@ -468,14 +470,14 @@ def _place(
             _refuse_product(report, on_refused, "no_wmo_header", product)
             paired.append((product, None))
             continue
-        body = body_issuance_utc(product)
         try:
+            body = body_issuance_utc(product)
             issued = (
                 _place_by_cursor(header, previous)
                 if body is None
                 else _place_by_body(header, body, previous, floor)
             )
-        except UnplaceableHeaderError as exc:
+        except (UnplaceableHeaderError, BodyTimeError) as exc:
             _refuse_product(report, on_refused, exc.reason, product)
             paired.append((product, None))
             continue
@@ -843,7 +845,9 @@ def _validate(args: argparse.Namespace) -> str | None:
         if problem is not None:
             return problem
     if args.quarantine_dir is not None:
-        return _quarantine_dir_problem(args.quarantine_dir, args.archive_root)
+        problem = _quarantine_dir_problem(args.quarantine_dir, args.archive_root)
+        if problem is not None:
+            return problem
     if args.apply and os.environ.get(LIVE_ENV_VAR) != "1":
         return f"{LIVE_ENV_VAR}=1 is required before any request may be dispatched"
     if args.apply and "pfm" in args.legs and not args.request_budget:

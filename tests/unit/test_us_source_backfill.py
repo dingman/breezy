@@ -710,7 +710,8 @@ def test_p7_an_out_of_order_header_is_refused_not_pushed_a_month_ahead(tmp_path:
 
     assert report.status == "complete"
     assert report.appended == 1
-    assert list(census.pfm_issuance_times(tmp_path)) != []
+    placed = int(dt.datetime(2026, 10, 6, 19, 1, tzinfo=dt.UTC).timestamp()) * 1_000_000_000
+    assert census.pfm_issuance_times(tmp_path) == {"OKX": (placed,)}
     assert report.refused == {"unplaceable_header": 1}
 
 

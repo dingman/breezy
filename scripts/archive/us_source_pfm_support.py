@@ -13,18 +13,30 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Final
 
-__all__ = ["BODY_WMO_TOLERANCE", "RefusalQuarantine", "body_issuance_utc", "wmo_instant_near"]
+__all__ = [
+    "BODY_WMO_TOLERANCE",
+    "BodyTimeError",
+    "RefusalQuarantine",
+    "body_issuance_utc",
+    "wmo_instant_near",
+]
 
 #: Body time and WMO heading are minutes apart (858 AM PDT vs 071559); more is a conflict.
 BODY_WMO_TOLERANCE: Final[dt.timedelta] = dt.timedelta(hours=2)
 _BODY_SCAN_LINES: Final[int] = 20
 _BODY_ISSUED_RE: Final[re.Pattern[str]] = re.compile(
-    r"^(\d{1,2})(\d{2}) ([AP]M) ([A-Z]{3,4}) [A-Z]{3} ([A-Z]{3}) (\d{1,2}) (\d{4})$", re.IGNORECASE
+    r"^(\d{1,2})(\d{2}) ([AP]M) ([A-Z]{3,4}) ([A-Z]{3}) ([A-Z]{3}) (\d{1,2}) (\d{4})$",
+    re.IGNORECASE,
 )
+#: A line that LOOKS like an issuance line ("615 PM CST ..."); if the strict form does not match
+#: it, the product is refused rather than placed as though it had no body time.
+_BODY_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"^\d{3,4}\s+[A-Z]M\b", re.IGNORECASE)
+_WEEKDAYS: Final[tuple[str, ...]] = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 #: UTC offset in hours of each zone the closed five-office set prints.
 _TZ_OFFSET_H: Final[dict[str, int]] = {
     "UTC": 0,
@@ -48,29 +60,51 @@ _MAX_HOUR_12: Final[int] = 12
 _MAX_MINUTE: Final[int] = 59
 
 
-def body_issuance_utc(product: str) -> dt.datetime | None:
-    """The UTC instant of the first local-time issuance line in the header block, or None.
+class BodyTimeError(ValueError):
+    """A body issuance line is present but unusable; ``reason`` is the refusal counted."""
 
-    None also covers a zone outside the table or an impossible clock/date: the caller then falls
-    back to cursor-relative placement instead of guessing.
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _unparseable(line: str) -> BodyTimeError:
+    return BodyTimeError(f"unparseable body issuance line {line!r}", "body_time_unparseable")
+
+
+def body_issuance_utc(product: str) -> dt.datetime | None:
+    """The UTC instant of the first local-time issuance line in the header block.
+
+    None only when the header block has NO issuance line (the caller then uses cursor-relative
+    placement). A line that is present but unusable (zone outside the table, impossible
+    clock/date, typo) raises ``BodyTimeError("body_time_unparseable")``; a weekday token that
+    contradicts the date raises ``BodyTimeError("body_weekday_mismatch")``. Never a guess.
     """
-    for line in product.splitlines()[:_BODY_SCAN_LINES]:
-        match = _BODY_ISSUED_RE.match(line.strip())
+    for raw_line in product.splitlines()[:_BODY_SCAN_LINES]:
+        line = raw_line.strip()
+        match = _BODY_ISSUED_RE.match(line)
         if match is None:
+            if _BODY_CANDIDATE_RE.match(line):
+                raise _unparseable(line)
             continue
-        hour12, minute, meridiem, zone, month_name, day, year = match.groups()
+        hour12, minute, meridiem, zone, weekday, month_name, day, year = match.groups()
         offset = _TZ_OFFSET_H.get(zone.upper())
         month = _MONTHS.get(month_name.upper())
-        if offset is None or month is None:
-            return None
         hour, mins = int(hour12), int(minute)
-        if not 1 <= hour <= _MAX_HOUR_12 or mins > _MAX_MINUTE:
-            return None
+        if offset is None or month is None or not 1 <= hour <= _MAX_HOUR_12 or mins > _MAX_MINUTE:
+            raise _unparseable(line)
         hour = hour % _MAX_HOUR_12 + (_MAX_HOUR_12 if meridiem.upper() == "PM" else 0)
         try:
             local = dt.datetime(int(year), month, int(day), hour, mins, tzinfo=dt.UTC)
         except ValueError:
-            return None
+            raise _unparseable(line) from None
+        if weekday.upper() not in _WEEKDAYS:
+            raise _unparseable(line)
+        if _WEEKDAYS[local.weekday()] != weekday.upper():
+            raise BodyTimeError(
+                f"body weekday {weekday} contradicts {local.date().isoformat()}",
+                "body_weekday_mismatch",
+            )
         return local - dt.timedelta(hours=offset)
     return None
 
@@ -112,7 +146,9 @@ class RefusalQuarantine:
         self._root.mkdir(parents=True, exist_ok=True)
         target = self._root / raw_file
         if not target.exists():
-            target.write_bytes(raw)
+            partial = self._root / f"{digest}.raw.tmp"
+            partial.write_bytes(raw)
+            os.replace(partial, target)
         line = {
             "reason": reason,
             "station": station,
@@ -125,3 +161,5 @@ class RefusalQuarantine:
         }
         with (self._root / self.LOG_NAME).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
