@@ -19,10 +19,15 @@ import httpx
 import pytest
 
 from breezy.ingest.http import (
+    ContentEncodingError,
+    DecodeError,
+    DisallowedHostError,
     ForbiddenError,
     OversizeBodyError,
     RateLimitedError,
+    RedirectError,
     ServerError,
+    TransportError,
     TransportTimeoutError,
 )
 from breezy.ingest.probe_transport import RequestBudgetExceededError
@@ -1429,3 +1434,132 @@ def test_forbidden_is_never_retried(tmp_path: Path) -> None:
     assert report.status == "forbidden"
     assert calls == 1
     assert sleeps.seconds == []
+
+
+# ---- connection-level transient failures (2026-10-07 LOT/LOX "Server disconnected")
+
+
+def _wrapped(cause: BaseException) -> TransportError:
+    err = TransportError("Transport failure fetching https://mesonet.agron.iastate.edu/x")
+    err.__cause__ = cause
+    return err
+
+
+_CONNECTION_CAUSES: list[Callable[[], BaseException]] = [
+    lambda: httpx.RemoteProtocolError("Server disconnected without sending a response."),
+    lambda: httpx.ConnectError("connection refused"),
+    lambda: httpx.ReadError("read failed"),
+    lambda: ConnectionResetError("reset by peer"),
+]
+
+
+@pytest.mark.parametrize("make_cause", _CONNECTION_CAUSES)
+def test_connection_level_transport_error_is_retried_then_succeeds(
+    tmp_path: Path, make_cause: Callable[[], BaseException]
+) -> None:
+    catalog = _Catalog(["051901"])
+    state = {"n": 0}
+
+    def fetch(wfo: str, sdate: dt.date, limit: int) -> str:
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise _wrapped(make_cause())
+        return catalog(wfo, sdate, limit)
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "complete"
+    assert sleeps.seconds == [30.0, 60.0]
+    assert report.requests == 3  # each retry consumed request budget accounting
+
+
+def test_connection_error_retries_exhausted_stops_station(tmp_path: Path) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise _wrapped(httpx.RemoteProtocolError("Server disconnected without sending a response."))
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "error"
+    assert calls == 4
+    assert sleeps.seconds == [30.0, 60.0, 120.0]
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_gateway_server_errors_are_retried(tmp_path: Path, status: int) -> None:
+    catalog = _Catalog(["051901"])
+    state = {"n": 0}
+
+    def fetch(wfo: str, sdate: dt.date, limit: int) -> str:
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ServerError(f"HTTP {status}", status_code=status)
+        return catalog(wfo, sdate, limit)
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+    assert report.status == "complete" and sleeps.seconds == [30.0]
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        lambda: TransportError("Transport failure: something else"),  # no connection cause
+        lambda: _wrapped(ValueError("not a connection error")),
+        lambda: DecodeError("bad utf-8"),
+        lambda: ContentEncodingError("bad encoding"),
+        lambda: RedirectError("redirect", status_code=301, location=None),
+        lambda: DisallowedHostError("host"),
+    ],
+)
+def test_non_transient_transport_errors_are_not_retried(
+    tmp_path: Path, make_error: Callable[[], BaseException]
+) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise make_error()
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "error"
+    assert calls == 1
+    assert sleeps.seconds == []
+
+
+def test_forbidden_is_never_retried_and_stops_the_leg(tmp_path: Path) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise ForbiddenError("HTTP 403")
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "forbidden"
+    assert calls == 1 and sleeps.seconds == []
+
+
+def test_connection_retry_respects_launch_window_guard(tmp_path: Path) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise _wrapped(httpx.RemoteProtocolError("Server disconnected"))
+
+    allowed = iter([True, False])
+    report = _leg(tmp_path, fetch, sleep=_Sleeps(), window_ok=lambda _n: next(allowed, False))
+
+    assert report.status == "paused_launch_window"
+    assert calls == 1

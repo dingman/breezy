@@ -49,6 +49,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
+import httpx
+
 _ARCHIVE_DIR = Path(__file__).resolve().parent
 for _directory in (_ARCHIVE_DIR, _ARCHIVE_DIR.parent / "venue"):  # pragma: no cover - bootstrap
     if str(_directory) not in sys.path:
@@ -69,10 +71,15 @@ from us_source_pfm_support import (  # type: ignore[import-not-found]
 )
 
 from breezy.ingest.http import (
+    ContentEncodingError,
+    DecodeError,
+    DisallowedHostError,
     ForbiddenError,
     OversizeBodyError,
     RateLimitedError,
+    RedirectError,
     ServerError,
+    TransportError,
     TransportTimeoutError,
 )
 from breezy.ingest.pfm_parse import PfmParseError, parse_pfm_product
@@ -308,6 +315,34 @@ def _alert(message: str) -> None:
     sys.stderr.write(f"ALERT us-source-backfill: {message}\n")
 
 
+_CONNECTION_CAUSES: Final = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ReadError,
+    ConnectionResetError,
+)
+_NEVER_RETRIED: Final = (
+    ForbiddenError,
+    RateLimitedError,
+    OversizeBodyError,
+    DecodeError,
+    DisallowedHostError,
+    RedirectError,
+    ContentEncodingError,
+)
+
+
+def _is_transient(exc: TransportError) -> bool:
+    """A timeout, a gateway 5xx, or a plain TransportError caused by a connection-level failure."""
+    if isinstance(exc, _NEVER_RETRIED):
+        return False
+    if isinstance(exc, TransportTimeoutError):
+        return True
+    if isinstance(exc, ServerError):
+        return exc.status_code >= 500
+    return type(exc) is TransportError and isinstance(exc.__cause__, _CONNECTION_CAUSES)
+
+
 def _fetch_page(
     fetch: PfmFetch,
     wfo: str,
@@ -348,7 +383,9 @@ def _fetch_page(
                 return None, limit
             limit //= 2
             continue
-        except (TransportTimeoutError, ServerError):
+        except (TransportTimeoutError, ServerError) as exc:
+            if not _is_transient(exc):
+                raise
             # Each failed attempt spent budget and pacing; the retry re-enters this loop, so it
             # is paced, budgeted and window-guarded again. Exhausted: the station boundary
             # records ``error`` with the resume date.
@@ -376,6 +413,17 @@ def _fetch_page(
                 return None, limit
             sleep(THROTTLE_BACKOFF_S[attempt])
             attempt += 1
+            continue
+        except TransportError as exc:
+            # Only a connection-level cause (e.g. "Server disconnected") is transient; every other
+            # TransportError subclass reaching here (decode, redirect, host, encoding) is not.
+            if not _is_transient(exc):
+                raise
+            report.requests += 1
+            if transient == len(TRANSIENT_BACKOFF_S):
+                raise
+            sleep(TRANSIENT_BACKOFF_S[transient])
+            transient += 1
             continue
         report.requests += 1
         return text, limit
