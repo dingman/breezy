@@ -730,3 +730,9 @@ Round 4 results: stats READY (with nits), security NOT-READY (2), architecture N
   - Ladder quantiles are quantised by the rung spacing.
 - **Recorded, not scheduled: B0′.** The change in the mid of the rung containing the prior PFM max is a new estimand. It is legitimate only as a separately hash-frozen exploratory prereg with an n_eff target stated up front, and it never rewrites this verdict.
 - **Consequence.** F13 value now rests on Phase A, the US-source blend vs CLI, offline. Phase A still needs ≥14 days of C1 measured lags (≈10-20) and the R35 LAMP feature.
+
+### A0 probe result: F13-R37 (coordinator, 2026-10-07). It resolves the R35 probe item.
+- **Live feed.** A NOMADS listing (`lmp.20261006/`, over HTTP/1.1) shows that **every HH30 cycle publishes `lavtxt_ext`**, from 0030 through 2330. The quarter-hour cycles publish only `lavtxt`. Live D-1 18Z peak coverage via ext is therefore available from C1 going forward.
+- **MDL archive.** The archive carries **no `lavtxt_ext`** (LAMP backfill builder, 2026-10-06). On archive days, D-1 anchors therefore get `lamp_peak_covered=false`, which means MISSING, `m_lamp=1` and M0′ scoring under R35. D0 anchors are fully covered.
+- **Consequence for reporting.** Phase A must report per horizon as R35 requires. The archive-era LAMP credit is effectively D0-only.
+- **No plan change** beyond this note.
