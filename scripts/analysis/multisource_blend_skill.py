@@ -54,7 +54,10 @@ from breezy.analysis import multisource_blend as msb
 from breezy.analysis.memory_cap import apply_address_space_cap
 from breezy.analysis.multisource_blend_features import LAG_SHIFT_NS
 from breezy.strategy.ladder_ev.quantile_density import CdfMethod
-from scripts.analysis.multisource_blend_inputs_anchors import check_row_anchors
+from scripts.analysis.multisource_blend_inputs_anchors import (
+    check_row_anchors,
+    check_sidecar_anchors_match_prereg,
+)
 from scripts.analysis.multisource_blend_lag_arm import (
     LagKeys,
     common_scored,
@@ -432,6 +435,8 @@ def prepare_run(
     meta = _check_sidecar(features, design, role="primary", variant=anchor_variant)
     lag_meta = _check_sidecar(lag_features, design, role="lag", variant=anchor_variant)
     check_sidecar_pair(meta, lag_meta)
+    check_sidecar_anchors_match_prereg(meta, design, features)
+    check_sidecar_anchors_match_prereg(lag_meta, design, lag_features)
     rows = _load_rows(features)
     lag_loaded = _load_rows(lag_features, extra_lag_ns=LAG_SHIFT_NS)
     check_row_anchors(rows, meta, features)

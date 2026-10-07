@@ -49,7 +49,6 @@ import io
 import json
 import math
 import os
-import re
 import sys
 import time
 from collections import Counter
@@ -84,6 +83,7 @@ from breezy.ingest.http import (
     TransportError,
     TransportTimeoutError,
 )
+from breezy.ingest.iem_observations import parse_metar_t_group
 from breezy.ingest.probe_transport import RequestBudget, RequestBudgetExceededError
 from breezy.persistence.archive_cache import (
     ArchiveCache,
@@ -158,7 +158,6 @@ _RETRYABLE: Final[tuple[type[TransportError], ...]] = (
     ServerError,
     TransportTimeoutError,
 )
-_TGROUP: Final[re.Pattern[str]] = re.compile(r"(?<!\S)T([01])(\d{3})(?:[01]\d{3})?(?!\S)")
 _DEFAULT_ASOS_ROOT: Final[Path] = (
     Path.home() / ".local" / "share" / "breezy" / "archive" / "iem-asos-1min"
 )
@@ -181,19 +180,13 @@ class MetarRow:
 
 
 def parse_tgroup_tenths(raw: str) -> int | None:
-    """The temperature of the remarks ``T`` group in integer tenths of a degree C, or ``None``.
+    """The remarks ``T`` group in integer tenths of a degree C, or ``None``: the LIVE parser.
 
-    ``T1xxx...`` is negative. Only the remarks section is searched, so a body token can never
-    be mistaken for the group.
+    Delegates to ``breezy.ingest.iem_observations.parse_metar_t_group`` (full 8-digit
+    ``T[01]ddd[01]ddd`` token, whole string searched) so training drops exactly the reports the
+    live ingest drops (L-13, no train/serve skew).
     """
-    _body, sep, remarks = raw.partition(" RMK ")
-    if not sep:
-        return None
-    match = _TGROUP.search(remarks)
-    if match is None:
-        return None
-    tenths = int(match.group(2))
-    return -tenths if match.group(1) == "1" else tenths
+    return parse_metar_t_group(raw)
 
 
 def tgroup_to_f(tenths: int) -> int:

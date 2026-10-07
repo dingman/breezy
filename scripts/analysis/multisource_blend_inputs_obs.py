@@ -13,8 +13,10 @@ excluded on both sides. The live path, cited here and imported nowhere:
 
 FB-R15: the training values are read from the routine-METAR store
 (``scripts/archive/metar_routine_store.py``, via ``read_routine_metar``), whose ``tmpf`` is the
-T group through ``round_half_up_f``. ``tmpf_source="column"`` rows are used and counted;
-``"missing"`` rows are skipped and counted, never imputed; there is NO 1-minute fallback. The
+T group through ``round_half_up_f``. a row WITHOUT a T group
+(``tmpf_source="column"``) is dropped and counted ``routine_no_tgroup`` because the live ingest
+drops it too (train/serve parity, L-13); ``"missing"`` rows are skipped and counted, never
+imputed; there is NO 1-minute fallback. The
 station's ``obs_routine_minute_by_station`` pin is a validation filter: a row at another minute
 is excluded and counted. ``available_at`` = report time + the obs lag. The store is read below the
 sealed holdout only (a window reaching it is never requested).
@@ -58,6 +60,10 @@ from breezy.persistence.archive_cache import (
     ArchiveCache,
     ArchiveCacheError,
     iem_asos_1min_request,
+)
+from scripts.analysis.multisource_blend_inputs_obs_coverage import (
+    YearCoverage,
+    expected_report_count,
 )
 
 __all__ = [
@@ -111,6 +117,7 @@ class RoutineObsYear:
 
     readings_by_day: dict[dt.date, tuple[ObsReading, ...]] = field(default_factory=dict)
     counts: Counter[str] = field(default_factory=Counter)
+    coverage: YearCoverage = field(default_factory=YearCoverage)
 
 
 @dataclass(slots=True)
@@ -217,6 +224,30 @@ def _routine_window(
     return start, min(dt.datetime(year + 1, 1, 1, tzinfo=dt.UTC), latest, sealed)
 
 
+def _usable_reading(
+    row: RoutineMetar, counts: Counter[str], routine_minute: int, ts_ns: int, lag_ns: int
+) -> ObsReading | None:
+    """The reading a stored row yields, or ``None`` with the reason counted (never imputed)."""
+    if row.tmpf_source == "column":  # no T group: the live ingest drops the report (L-13)
+        counts["routine_no_tgroup"] += 1
+        return None
+    if row.tmpf is None or row.tmpf_source == "missing":
+        counts["routine_missing"] += 1
+        return None
+    if row.valid_utc.minute != routine_minute:
+        counts["routine_pin_minute_excluded"] += 1
+        return None
+    if row.tmpf_source != "tgroup":
+        raise ObsQuantisationError(f"{row.valid_utc}: unknown tmpf_source {row.tmpf_source!r}")
+    _check_tgroup_agrees(row, row.tmpf)
+    return ObsReading(
+        ts_ns=ts_ns,
+        available_at_ns=ts_ns + lag_ns,
+        temp_f=float(row.tmpf),
+        source=OBS_SOURCE_LABEL,
+    )
+
+
 def read_routine_obs_year(
     root: Path,
     icao: str,
@@ -230,11 +261,13 @@ def read_routine_obs_year(
     """One station-year of routine-METAR readings for the requested days, up to each day's cutoff.
 
     ``cutoff_ns_by_day`` names the days to keep and, per day, the latest instant any anchor needs;
-    every other row is dropped (counted). Of the kept rows: ``missing`` ones are counted and
-    skipped (never imputed), rows at another minute than ``routine_minute`` are counted as
-    ``routine_pin_minute_excluded``, ``column``-sourced ones are used and counted, and every used
-    row is counted in ``routine_rows_used``. A missing or corrupt store year raises
-    :class:`ObsStoreError` (nothing is fabricated); the sealed holdout is never requested.
+    every other row is dropped (counted). Of the kept rows: ``column``-sourced ones (no T group)
+    are counted ``routine_no_tgroup`` and dropped, ``missing`` ones are counted and skipped
+    (never imputed), rows at another minute than ``routine_minute`` are counted as
+    ``routine_pin_minute_excluded``, and every used row is counted in ``routine_rows_used``.
+    ``out.coverage`` carries the station-year coverage counters (item: coverage guard). A missing
+    or corrupt store year raises :class:`ObsStoreError` (nothing is fabricated); the sealed
+    holdout is never requested.
     """
     # Lazy: metar_routine_store -> metar_routine_minute_probe -> this module (modal helpers) and
     # the builder, so a top-level import here would be circular.
@@ -247,35 +280,28 @@ def read_routine_obs_year(
     except RoutineMetarError as exc:
         raise ObsStoreError(f"{icao} {year}: {exc}") from exc
     offset = dt.timedelta(hours=std_utc_offset_hours)
+    for day, last_ns in cutoff_ns_by_day.items():
+        out.coverage.add_expected(
+            day.month, expected_report_count(day, std_utc_offset_hours, routine_minute, last_ns)
+        )
     readings: dict[dt.date, list[ObsReading]] = {}
     for row in rows:
         ts_ns = int(row.valid_utc.timestamp()) * _NS
-        cutoff = cutoff_ns_by_day.get((row.valid_utc + offset).date())
+        day = (row.valid_utc + offset).date()
+        cutoff = cutoff_ns_by_day.get(day)
         if cutoff is None:
             out.counts["day_not_requested"] += 1
             continue
         if ts_ns > cutoff:
             out.counts["after_cutoff"] += 1
             continue
-        if row.tmpf is None or row.tmpf_source == "missing":
-            out.counts["routine_missing"] += 1
+        out.coverage.add_row(row.valid_utc.minute, routine_minute)
+        reading = _usable_reading(row, out.counts, routine_minute, ts_ns, lag_ns)
+        if reading is None:
             continue
-        if row.valid_utc.minute != routine_minute:
-            out.counts["routine_pin_minute_excluded"] += 1
-            continue
-        if row.tmpf_source == "tgroup":
-            _check_tgroup_agrees(row, row.tmpf)
-        else:
-            out.counts["routine_column_sourced"] += 1
         out.counts["routine_rows_used"] += 1
-        readings.setdefault((row.valid_utc + offset).date(), []).append(
-            ObsReading(
-                ts_ns=ts_ns,
-                available_at_ns=ts_ns + lag_ns,
-                temp_f=float(row.tmpf),
-                source=OBS_SOURCE_LABEL,
-            )
-        )
+        out.coverage.add_used(day.month)
+        readings.setdefault(day, []).append(reading)
     out.readings_by_day = {day: tuple(items) for day, items in readings.items()}
     return out
 

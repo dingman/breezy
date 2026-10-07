@@ -23,6 +23,14 @@ Columns: ``station, valid_utc, tmpf, tgroup_c, report_type, tmpf_source, metar``
 whole degF of the T-group through ``round_half_up_f`` (``tmpf_source=tgroup``), else the IEM
 ``tmpf`` column rounded half up (``column``), else empty (``missing``).
 
+``rederive``
+    Offline. Recomputes ``tmpf`` / ``tgroup_c`` / ``tmpf_source`` of every stored row from its raw
+    ``metar`` column with the LIVE T-group parser (``breezy.ingest.iem_observations``), so a store
+    written with an older, looser parse matches what the live ingest would have kept. ``--dry-run``
+    reports the rows that would change; ``--apply`` rewrites the changed station-years atomically
+    (body first, manifest sha256 after) under the store lock. A row that loses its T group keeps
+    its stored ``tmpf`` (the IEM column equals the T-group value) as ``column``. No network.
+
 ``read_routine_metar(station, start, end, root)`` is the read helper for the Phase A obs reader.
 
 EXIT CODES: 0 complete; 1 a station-year failed; 2 refusal or error (report still written);
@@ -392,6 +400,112 @@ def _run_fetch(
 
 
 # ---------------------------------------------------------------------------
+# Re-derive leg
+# ---------------------------------------------------------------------------
+
+REDERIVE_TAG: Final[str] = "live_t_group_parser/v1"
+_KIND_TGROUP_LOST: Final[str] = "tgroup_to_column"
+_KIND_TGROUP_GAINED: Final[str] = "column_or_missing_to_tgroup"
+_KIND_TGROUP_CHANGED: Final[str] = "tgroup_value_changed"
+
+
+def _rederive_record(record: Mapping[str, str]) -> tuple[dict[str, str], str | None]:
+    """The row recomputed from its raw METAR, and the kind of change (``None`` if unchanged)."""
+    out = dict(record)
+    tenths = parse_tgroup_tenths(record["metar"])
+    was_tgroup = record["tmpf_source"] == "tgroup"
+    if tenths is not None:
+        out.update(
+            tmpf=str(tgroup_to_f(tenths)), tgroup_c=f"{tenths / 10:.1f}", tmpf_source="tgroup"
+        )
+    elif was_tgroup:
+        out.update(tgroup_c="", tmpf_source="column")
+    if out == dict(record):
+        return out, None
+    if tenths is None:
+        return out, _KIND_TGROUP_LOST
+    return out, _KIND_TGROUP_CHANGED if was_tgroup else _KIND_TGROUP_GAINED
+
+
+def _rederive_year(data: bytes) -> tuple[bytes, Counter[str], int]:
+    """New CSV bytes, the change counts by kind, and the row count of one stored station-year."""
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8")))
+    if tuple(reader.fieldnames or ()) != COLUMNS:
+        raise RoutineMetarError(f"unexpected store columns {reader.fieldnames}")
+    kinds: Counter[str] = Counter()
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(COLUMNS)
+    total = 0
+    for record in reader:
+        total += 1
+        row, kind = _rederive_record(record)
+        if kind is not None:
+            kinds[kind] += 1
+        writer.writerow([row[column] for column in COLUMNS])
+    return out.getvalue().encode("utf-8"), kinds, total
+
+
+def _verified_year(root: Path, manifest: Mapping[str, Any], station: str, year: int) -> bytes:
+    entry = manifest["entries"].get(_entry_key(station, year))
+    path = root / station / f"{year}.csv"
+    if entry is None or not path.is_file():
+        raise RoutineMetarError(f"{station} {year}: not in the routine-METAR archive")
+    data = path.read_bytes()
+    if _sha256(data) != entry["sha256"]:
+        raise RoutineMetarError(f"{station} {year}: sha256 does not match the manifest")
+    return data
+
+
+def _run_rederive(args: argparse.Namespace, report: dict[str, Any]) -> int:
+    root: Path = args.archive_root
+    manifest = _load_manifest(root)
+    plan: list[tuple[str, int, bytes, bytes, Counter[str], int]] = []
+    for station in args.stations:  # verify and compute everything before any write
+        for year in args.years:
+            old = _verified_year(root, manifest, station, year)
+            new, kinds, total = _rederive_year(old)
+            plan.append((station, year, old, new, kinds, total))
+    totals: Counter[str] = Counter()
+    per_year: dict[str, Any] = {}
+    for station, year, _old, _new, kinds, total in plan:
+        changed = sum(kinds.values())
+        per_year[_entry_key(station, year)] = {"rows": total, "rows_changed": changed, **kinds}
+        totals.update(kinds)
+        totals["rows_total"] += total
+        totals["rows_changed"] += changed
+    report.update(
+        archive_root=str(root),
+        rows_total=totals["rows_total"],
+        rows_changed=totals["rows_changed"],
+        **{k: totals[k] for k in (_KIND_TGROUP_LOST, _KIND_TGROUP_GAINED, _KIND_TGROUP_CHANGED)},
+        per_station_year=dict(sorted(per_year.items())),
+    )
+    if not args.apply:
+        report["status"] = "dry_run"
+        return EXIT_OK
+    with open(root / LOCK_NAME, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            report["status"] = "store_busy"
+            return EXIT_ABORTED
+        for station, year, old, new, kinds, _total in plan:
+            if not kinds or new == old:
+                continue
+            atomic_write(root / station / f"{year}.csv", new)  # body first, manifest last
+            manifest["entries"][_entry_key(station, year)].update(
+                sha256=_sha256(new), rederived=REDERIVE_TAG
+            )
+            atomic_write(
+                root / MANIFEST_NAME,
+                (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
+            )
+    report["status"] = "applied"
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic leg
 # ---------------------------------------------------------------------------
 
@@ -522,7 +636,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     fetch.add_argument("--end-exclusive", type=dt.date.fromisoformat, default=HOLDOUT_START)
     diag = sub.add_parser("diag", help="offline 1-min derivation diagnostic")
     diag.add_argument("--asos-root", type=Path, default=DEFAULT_ASOS_ROOT)
-    for command in (fetch, diag):
+    rederive = sub.add_parser("rederive", help="offline re-parse of the stored raw METAR column")
+    redo = rederive.add_mutually_exclusive_group(required=True)
+    redo.add_argument("--dry-run", action="store_true")
+    redo.add_argument("--apply", action="store_true", help="rewrite changed station-years")
+    for command in (fetch, diag, rederive):
         command.add_argument("--archive-root", type=Path, default=DEFAULT_ARCHIVE_ROOT)
         command.add_argument("--report-json", type=Path, required=True)
         command.add_argument("--stations", nargs="+", default=list(DEFAULT_STATIONS))
@@ -554,6 +672,8 @@ def main(
     try:
         if args.command == "diag":
             code = _run_diag(args, report, onemin_reader)
+        elif args.command == "rederive":
+            code = _run_rederive(args, report)
         elif not _may_run(resolved_clock, 1):
             report["status"] = "refused_launch_window"
             code = EXIT_LAUNCH_WINDOW
@@ -573,6 +693,8 @@ def main(
         for station, body in report["stations"].items():
             for name, stats in body["variants"].items():
                 print(f"{station} {name} n={stats['n']} mismatch={stats['mismatch_rate']:.4f}")
+    elif code == EXIT_OK and args.command == "rederive":
+        print(f"rows_total={report['rows_total']} rows_changed={report['rows_changed']}")
     elif code == EXIT_OK and not getattr(args, "apply", False):
         print(
             f"planned_requests={report['planned_requests']} cached={report['cached_station_years']}"

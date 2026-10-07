@@ -115,7 +115,7 @@ async def _no_sleep(_seconds: float) -> None:
         ("KNYC 011951Z 00000KT 10SM CLR 17/M02 A3000 RMK AO2 T01720022", 172),
         ("KMDW 011951Z 00000KT 10SM CLR M05/M10 A3000 RMK AO2 T10501100", -50),
         ("KMDW 011951Z 00000KT CLR M05/M10 A3000 RMK AO2 T11001125", -100),
-        ("KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T0000", 0),
+        ("KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T0000", None),  # live needs all 8 digits
         ("KNYC 011951Z 00000KT 10SM CLR 17/M02 A3000 RMK AO2", None),
         ("KNYC 011951Z 00000KT 10SM CLR 17/M02 A3000", None),
         ("", None),
@@ -125,8 +125,27 @@ def test_parse_tgroup_tenths(probe: ModuleType, raw: str, expected: int | None) 
     assert probe.parse_tgroup_tenths(raw) == expected
 
 
-def test_tgroup_in_body_is_not_a_tgroup(probe: ModuleType) -> None:
-    assert probe.parse_tgroup_tenths("KXXX T01720022 CLR 17/M02") is None
+_PARITY_CORPUS = [
+    "KNYC 011951Z 00000KT 10SM CLR 17/M02 A3000 RMK AO2 T01720022",
+    "KMDW 011951Z 00000KT 10SM CLR M05/M10 A3000 RMK AO2 T10501100",
+    "KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T0000",
+    "KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T00001",
+    "KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T0000000",
+    "KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T000000001",
+    "KMDW 011951Z 00000KT CLR 00/M01 A3000 RMK AO2 T00000000 10050",
+    "KXXX T01720022 CLR 17/M02",  # no RMK: live searches the whole string
+    "KNYC 011951Z AUTO RMK AO2 SLP123 T21720022",  # sign digit 2 is not a T group
+    "KNYC 011951Z AUTO RMK AO2 XT01720022",
+    "T01720022",
+    "",
+]
+
+
+@pytest.mark.parametrize("raw", _PARITY_CORPUS)
+def test_the_store_parse_equals_the_live_parser(probe: ModuleType, raw: str) -> None:
+    from breezy.ingest.iem_observations import parse_metar_t_group
+
+    assert probe.parse_tgroup_tenths(raw) == parse_metar_t_group(raw)
 
 
 def test_tgroup_to_f_uses_the_live_quantiser(probe: ModuleType) -> None:

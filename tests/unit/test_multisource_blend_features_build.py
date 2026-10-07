@@ -77,6 +77,7 @@ def _pins(**overrides: Any) -> dict[str, Any]:
         "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
         "obs_cadence_seconds": 3600,
         "obs_routine_minute_by_station": {"KNYC": 40},
+        "obs_min_coverage_per_station_year": 0.5,  # a TEST value; the prereg skeleton keeps null
     }
     pins.update(overrides)
     return pins
@@ -797,7 +798,7 @@ def test_per_station_obs_counts_are_reported(tmp_path: Path) -> None:
 
     stats = _per_station(world)
     assert stats["routine_missing"] == 1
-    assert stats["routine_column_sourced"] == 1
+    assert stats["routine_no_tgroup"] == 1  # the column row has no T group: dropped like live
     assert stats["routine_pin_minute_excluded"] >= 1
     assert stats["routine_rows_used"] > 0
     d13 = _by_key(world.rows())[(_D13, "D0")]
@@ -858,7 +859,13 @@ def test_a_null_routine_minute_pin_still_refuses(tmp_path: Path) -> None:
 
 
 def test_rows_whose_minute_differs_from_the_pin_are_all_excluded(tmp_path: Path) -> None:
-    world = _build_world(tmp_path, pins=_pins(obs_routine_minute_by_station={"KNYC": 41}))
+    # coverage pin 0.0 isolates the exclusion; the guard itself is tested in the coverage tests
+    world = _build_world(
+        tmp_path,
+        pins=_pins(
+            obs_routine_minute_by_station={"KNYC": 41}, obs_min_coverage_per_station_year=0.0
+        ),
+    )
 
     assert _run(world) == fb.EXIT_OK
 

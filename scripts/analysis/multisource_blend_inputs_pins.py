@@ -19,6 +19,7 @@ from scripts.analysis.multisource_blend_inputs_anchors import (
     anchor_ns_for,
     parse_anchors,
 )
+from scripts.analysis.multisource_blend_inputs_obs_coverage import COVERAGE_PIN, check_coverage_pin
 
 __all__ = [
     "LAG_FLOORS_NS",
@@ -88,6 +89,8 @@ class Pins:
     anchors_raw: Mapping[str, Any]
     lags: Mapping[str, int]
     obs_routine_minute_by_station: Mapping[str, int]
+    #: ``obs_min_coverage_per_station_year``: a station-year below it refuses the build.
+    obs_min_coverage_per_station_year: float
 
 
 def load_pins(design: Mapping[str, Any]) -> Pins:
@@ -107,4 +110,10 @@ def load_pins(design: Mapping[str, Any]) -> Pins:
             f"{obsmod.ROUTINE_OBS_CADENCE_SECONDS}, was {cadence!r} (FB-R13)"
         )
     minutes = _parse_routine_minutes(pins.get("obs_routine_minute_by_station"))
-    return Pins(anchors, pins["anchors"], lags, minutes)
+    try:
+        coverage = check_coverage_pin(pins.get(COVERAGE_PIN))
+    except (
+        ValueError
+    ) as exc:  # a null pin is refused too: the coordinator pins it, never the builder
+        raise BuildRefusal(str(exc)) from exc
+    return Pins(anchors, pins["anchors"], lags, minutes, coverage)

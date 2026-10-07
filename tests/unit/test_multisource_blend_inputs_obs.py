@@ -146,14 +146,14 @@ def test_rows_off_the_pinned_minute_are_excluded_and_counted(tmp_path: Path) -> 
     assert year.counts["routine_rows_used"] == 2
 
 
-def test_column_sourced_rows_are_used_and_flagged(tmp_path: Path) -> None:
+def test_column_sourced_rows_are_dropped_like_the_live_ingest_and_counted(tmp_path: Path) -> None:
     rows = [(utc(2021, 6, 15, 12, 53), 72, "tgroup"), (utc(2021, 6, 15, 13, 53), 73, "column")]
 
     year = _read_routine(tmp_path, rows)
 
-    assert [r.temp_f for r in year.readings_by_day[_DAY]] == [72.0, 73.0]
-    assert year.counts["routine_column_sourced"] == 1
-    assert year.counts["routine_rows_used"] == 2
+    assert [r.temp_f for r in year.readings_by_day[_DAY]] == [72.0]
+    assert year.counts["routine_no_tgroup"] == 1
+    assert year.counts["routine_rows_used"] == 1
 
 
 def test_missing_rows_are_skipped_counted_and_never_imputed(tmp_path: Path) -> None:

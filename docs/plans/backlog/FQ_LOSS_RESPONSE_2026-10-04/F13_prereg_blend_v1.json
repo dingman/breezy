@@ -77,6 +77,7 @@
     "obs_source": null,
     "obs_cadence_seconds": null,
     "obs_routine_minute_by_station": null,
+    "obs_min_coverage_per_station_year": null,
     "lag_arm_max_lost_fraction": null
   },
   "pin_units": {
@@ -92,6 +93,7 @@
     "obs_source": "FB-R3/FB-R15, a string label for the obs_so_far path; the builder accepts only iem_routine_metar_tgroup_round_half_up_f (the routine-METAR store, T group quantised through round_half_up_f). The 1-min archive is no longer a source; its raw running max and 5-min arm are descriptive, non-METAR arms only.",
     "obs_cadence_seconds": "FB-R13, integer seconds between routine METAR readings; the builder refuses any value other than 3600 (obs_so_far is the running max of routine hourly METAR values only; interval rows and specials are excluded).",
     "obs_routine_minute_by_station": "FB-R13, object {icao: minute of the hour 0..59} of each station's routine METAR report; FB-R15: a VALIDATION FILTER over the routine-METAR store (rows at another minute are excluded and counted). Derived by multisource_blend_inputs_obs.modal_routine_minute_by_station from routine report timestamps; the coordinator pins it (reported, never auto-applied).",
+    "obs_min_coverage_per_station_year": "number in [0, 1]: the build refuses when any station-year in scope has routine-METAR coverage (routine rows used / expected hourly reports at the pinned minute, from local-standard midnight to each requested day's last anchor) below it, and names the station-years. Null refuses (the coordinator pins it; the builder never assigns it). The report also carries coverage per station-month, the report-minute histogram and pin-minute-excluded share per station-year (to detect an era change) and the mean (final truth Tmax - D0 obs_so_far) per station-year.",
     "lag_arm_max_lost_fraction": "fraction in [0, 1] (review fix 2): the runner refuses to emit a verdict when the +60 min shift loses more than this share of the primary file's (station, climate day, horizon) keys; the lag arm is compared with the primary on the common keys only (paired difference), so a larger loss would make the sensitivity answer a different question"
   },
   "veto": {

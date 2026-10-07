@@ -35,7 +35,14 @@ _PREREG_SRC = (
     / "FQ_LOSS_RESPONSE_2026-10-04"
     / "F13_prereg_blend_v1.json"
 )
+_SIDECAR_ANCHORS: dict[str, Any] = {
+    "D-1": {"kind": "utc", "hour": 18},
+    "D0": {"kind": "lst", "hour": 10},
+    "D0_sensitivity": {"kind": "lst", "hour": 12},
+    "offset_rule": "fixed_standard_time_never_dst",
+}
 _PINS: dict[str, Any] = {
+    "anchors": _SIDECAR_ANCHORS,
     "floor_multiple": 0.5,
     "m0_prime_tolerance_crps_f": 0.2,
     "station_tolerance_crps_f": 0.2,
@@ -111,12 +118,6 @@ def _write_features(path: Path, rows: list[msb.FeatureRow]) -> Path:
 
 
 _DERIVED_SIDECAR_KEYS = ("schema", "role", "prereg_content_sha256", "features_sha256", "n_rows")
-_SIDECAR_ANCHORS: dict[str, Any] = {
-    "D-1": {"kind": "utc", "hour": 18},
-    "D0": {"kind": "lst", "hour": 10},
-    "D0_sensitivity": {"kind": "lst", "hour": 12},
-    "offset_rule": "fixed_standard_time_never_dst",
-}
 _SIDECAR_LAGS: dict[str, int] = {"lamp-mdl": 1, "lav-iem": 2, "pfm": 3, "mos-gfs": 4, "obs": 5}
 _LAG_SHIFT_NS = 3_600_000_000_000
 

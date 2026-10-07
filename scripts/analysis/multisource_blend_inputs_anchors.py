@@ -17,7 +17,11 @@ from typing import Any, Final
 from breezy.analysis.multisource_blend_features import HORIZONS, FeatureRow
 from scripts.analysis import nbp_skill_study as nss
 from scripts.analysis.multisource_blend_refusal import Refusal
-from scripts.analysis.multisource_blend_sidecar import PRIMARY_VARIANT, SENSITIVITY_VARIANT
+from scripts.analysis.multisource_blend_sidecar import (
+    ANCHOR_VARIANTS,
+    PRIMARY_VARIANT,
+    SENSITIVITY_VARIANT,
+)
 
 __all__ = [
     "DEFAULT_STATIONS",
@@ -26,6 +30,7 @@ __all__ = [
     "BuildRefusal",
     "anchor_ns_for",
     "check_row_anchors",
+    "check_sidecar_anchors_match_prereg",
     "parse_anchors",
 ]
 
@@ -96,6 +101,23 @@ def anchor_ns_for(
     return int(moment.timestamp()) * 1_000_000_000
 
 
+def check_sidecar_anchors_match_prereg(
+    meta: Mapping[str, Any], design: Mapping[str, Any], path: Path
+) -> None:
+    """The sidecar's ``anchors`` equal the anchors pinned in the frozen prereg (else a Refusal)."""
+    pins = design.get("pins")
+    try:
+        pinned = parse_anchors(pins.get("anchors") if isinstance(pins, Mapping) else None)
+        recorded = parse_anchors(meta["anchors"])
+    except BuildRefusal as exc:
+        raise Refusal(f"{path}: the prereg or sidecar anchors are unusable: {exc}") from exc
+    if recorded != pinned:
+        raise Refusal(
+            f"{path}: the sidecar's anchors {recorded} differ from the anchors pinned in the "
+            f"prereg {pinned}"
+        )
+
+
 def check_row_anchors(rows: Sequence[FeatureRow], meta: Mapping[str, Any], path: Path) -> None:
     """Every row's ``anchor_ns`` equals the anchor the sidecar's variant and pins imply.
 
@@ -112,12 +134,17 @@ def check_row_anchors(rows: Sequence[FeatureRow], meta: Mapping[str, Any], path:
         for icao, hours in registry.std_utc_offset_hours_by_icao.items()
     }
     variant = meta["anchor_variant"]
+    if variant not in ANCHOR_VARIANTS:
+        raise Refusal(f"{path}: anchor_variant must be one of {ANCHOR_VARIANTS}, was {variant!r}")
     for row in rows:
         if row.station not in offsets:
             raise Refusal(f"{path}: row station {row.station!r} is not in the station registry")
-        expected = anchor_ns_for(
-            row.horizon, row.climate_day, offsets[row.station], anchors, variant=variant
-        )
+        try:
+            expected = anchor_ns_for(
+                row.horizon, row.climate_day, offsets[row.station], anchors, variant=variant
+            )
+        except ValueError as exc:
+            raise Refusal(f"{path}: row horizon is unusable: {exc}") from exc
         if row.anchor_ns != expected:
             raise Refusal(
                 f"{path}: anchor_ns {row.anchor_ns} of {row.station} {row.climate_day} "

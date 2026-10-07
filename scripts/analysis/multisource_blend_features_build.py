@@ -42,7 +42,7 @@ import os
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
@@ -82,6 +82,7 @@ from scripts.analysis.multisource_blend_inputs_forecast import (
     select_nbp,
 )
 from scripts.analysis.multisource_blend_inputs_lamp import LampArchive
+from scripts.analysis.multisource_blend_inputs_obs_coverage import ObsDiagnostics
 from scripts.analysis.multisource_blend_inputs_pins import (
     LAG_FLOORS_NS,
     Anchors,
@@ -285,6 +286,8 @@ class _Tally:
     #: ``None`` until a 1-min payload was read: the non-METAR arms are optional and descriptive.
     obs_raw_differs: int | None = None
     obs_five_min_differs: int | None = None
+    #: coverage per station-year, D0 truth gap and staleness (coverage guard, drift, report note)
+    obs_diag: ObsDiagnostics = field(default_factory=ObsDiagnostics)
 
 
 @dataclass(slots=True)
@@ -414,6 +417,14 @@ def _emit_rows(ctx: _Context, item: _RowInputs, arms: obsmod.OneMinArms, rows: _
         _tally_row(ctx.tally, row, shift)
         if shift == 0 and item.horizon == "D0":
             _tally_obs_arms(ctx.tally, row, arms, item.day, item.anchor_ns)
+            ctx.tally.obs_diag.record_d0(
+                item.station.icao,
+                item.day.year,
+                truth_tmax_f=float(ctx.truth[(item.station.key, item.day)].tmax_f),
+                obs_so_far_f=row.obs_so_far_f,
+                anchor_ns=item.anchor_ns,
+                readings=item.readings,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +499,7 @@ def _build_year(
     )
     ctx.tally.counts.update(obs_year.counts)
     ctx.tally.obs_by_station.setdefault(station.icao, Counter()).update(obs_year.counts)
+    ctx.tally.obs_diag.coverage[(station.icao, year)] = obs_year.coverage
     arms = _read_arms(ctx, station, year, cutoffs)
     bases = rows.lamp_bases[station.icao]
     for day in year_days:
@@ -679,6 +691,10 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
     _check_rows(rows.primary, rows.lag)
     breaks = {**lamp_breaks(rows.lamp_bases), "nbp_versions": nbp_version_breaks(rows.primary)}
     counts, tally = ctx.tally.counts, ctx.tally
+    pin = pins.obs_min_coverage_per_station_year
+    report["obs_coverage"] = tally.obs_diag.coverage_report(pin)
+    if refusal := tally.obs_diag.below_pin_message(pin):
+        raise BuildRefusal(refusal)
     report.update(
         counts=dict(counts),
         by_horizon={h: dict(c) for h, c in tally.by_horizon.items()},
@@ -688,6 +704,7 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
             raw_differs=tally.obs_raw_differs,
             pins=pins,
             per_station=tally.obs_by_station,
+            d0_staleness=tally.obs_diag.staleness_report(),
         ),
         source_breaks_observed=breaks,
         truth_concordance=truth_concordance(cfg.f2_truth, ctx.truth),

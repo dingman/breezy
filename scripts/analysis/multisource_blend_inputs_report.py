@@ -128,7 +128,7 @@ def source_lags(pins: Pins) -> dict[str, Any]:
 #: FB-R15 per-station routine-METAR counters, always reported (zero when absent).
 OBS_STATION_KEYS: Final[tuple[str, ...]] = (
     "routine_rows_used",
-    "routine_column_sourced",
+    "routine_no_tgroup",
     "routine_missing",
     "routine_pin_minute_excluded",
 )
@@ -140,6 +140,7 @@ def obs_report(
     raw_differs: int | None,
     pins: Pins,
     per_station: Mapping[str, Mapping[str, int]],
+    d0_staleness: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "source": obsmod.OBS_SOURCE_LABEL,
@@ -152,14 +153,21 @@ def obs_report(
             for icao, counts in sorted(per_station.items())
         },
         "per_station_note": (
-            "routine_rows_used: rows that became readings; routine_column_sourced: of those, rows "
-            "whose tmpf came from the IEM column (no T group), used and flagged; routine_missing: "
-            "tmpf_source=missing rows, skipped and never imputed; routine_pin_minute_excluded: "
-            "rows at a minute other than the pinned routine minute. Counted within the requested "
-            "climate days up to each day's last anchor."
+            "routine_rows_used: rows that became readings; routine_no_tgroup: rows with no T group "
+            "(tmpf_source=column), dropped exactly as the live ingest drops them and never used; "
+            "routine_missing: tmpf_source=missing rows, skipped and never imputed; "
+            "routine_pin_minute_excluded: rows at a minute other than the pinned routine minute. "
+            "Counted within the requested climate days up to each day's last anchor."
+        ),
+        "d0_obs_staleness_minutes_by_station": dict(d0_staleness or {}),
+        "d0_obs_staleness_note": (
+            "effective staleness of the primary D0 rows: anchor minus the newest usable routine "
+            "report (available before the anchor), in minutes; no_usable_report counts D0 rows "
+            "with none"
         ),
         "no_1min_fallback": True,
         "quantisation": "T group tenths C -> breezy.domain.temperature.round_half_up_f (store)",
+        "t_group_parser": "breezy.ingest.iem_observations.parse_metar_t_group (the live parser)",
         "interval_rows_not_emulated": True,
         "interval_rows_note": (
             "FB-R13: the NWS integer-C interval rows and METAR specials are excluded on both "

@@ -30,6 +30,7 @@ _NEW_PINS = (
     "obs_source",
     "obs_cadence_seconds",
     "obs_routine_minute_by_station",
+    "obs_min_coverage_per_station_year",
 )
 
 
@@ -262,3 +263,47 @@ def test_the_run_refuses_a_feature_file_whose_anchors_contradict_its_sidecar(
 
     with pytest.raises(skill.Refusal, match="anchor"):
         scenario.run()
+
+
+# ------------------------------------------------------------------ sidecar anchors vs the prereg
+
+
+def test_the_run_refuses_sidecar_anchors_that_differ_from_the_prereg_pin(tmp_path: Path) -> None:
+    from tests.unit.test_multisource_blend_skill import _SIDECAR_ANCHORS
+
+    scenario = _Scenario(tmp_path)
+    other = {**_SIDECAR_ANCHORS, "D0_sensitivity": {"kind": "lst", "hour": 13}}
+    for path, role in ((scenario.features, "primary"), (scenario.lag_features, "lag")):
+        write_sidecar(path, role=role, digest=_digest(scenario), anchors=other)
+
+    with pytest.raises(skill.Refusal, match="pinned"):
+        scenario.run()
+
+
+def test_the_run_refuses_a_prereg_without_usable_anchors(tmp_path: Path) -> None:
+    with pytest.raises(skill.Refusal, match="anchors"):
+        _Scenario(tmp_path, anchors=None).run()
+
+
+def test_an_unknown_anchor_variant_in_a_sidecar_is_a_refusal_not_a_raw_error(
+    tmp_path: Path,
+) -> None:
+    meta = _anchor_meta("d0_09lst")
+
+    with pytest.raises(skill.Refusal, match="anchor_variant"):
+        skill.check_row_anchors(_both_horizons(), meta, tmp_path / "f.jsonl")
+
+
+def test_a_row_with_an_unknown_horizon_is_a_refusal_not_a_raw_error(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    # FeatureRow itself rejects a bad horizon, so a stand-in carries one to the anchor check
+    rows = [
+        SimpleNamespace(
+            station=r.station, climate_day=r.climate_day, horizon="D+5", anchor_ns=r.anchor_ns
+        )
+        for r in _both_horizons()
+    ]
+
+    with pytest.raises(skill.Refusal, match="horizon"):
+        skill.check_row_anchors(rows, _anchor_meta(), tmp_path / "f.jsonl")
