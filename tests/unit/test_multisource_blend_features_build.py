@@ -20,7 +20,7 @@ import ast
 import datetime as dt
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,7 @@ from scripts.analysis import multisource_blend_skill as skill
 from tests.unit.featbuild_fixtures import (
     HOUR_NS,
     NS,
+    RoutineRow,
     asos_1min_payload,
     ns,
     truth_row,
@@ -44,6 +45,7 @@ from tests.unit.featbuild_fixtures import (
     write_mdl_run,
     write_nbp_cycle,
     write_pfm_product,
+    write_routine_store,
     write_truth,
 )
 from tests.unit.test_multisource_blend_skill import _PREREG_SRC
@@ -72,7 +74,7 @@ def _pins(**overrides: Any) -> dict[str, Any]:
     pins: dict[str, Any] = {
         "anchors": _ANCHORS,
         "source_lags_ns": dict(_LAGS_NS),
-        "obs_source": "iem_asos_1min_whole_f_via_metar_tgroup_quantisation",
+        "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
         "obs_cadence_seconds": 3600,
         "obs_routine_minute_by_station": {"KNYC": 40},
     }
@@ -89,6 +91,7 @@ class _World:
     mos: Path
     asos: Path
     truth: Path
+    metar: Path
 
     def argv(
         self,
@@ -104,6 +107,7 @@ class _World:
             "--us-source-root", str(self.us),
             "--mos-root", str(self.mos),
             "--asos-root", str(self.asos),
+            "--metar-routine-root", str(self.metar),
             "--truth", str(self.truth),
             "--start", start,
             "--end", end,
@@ -150,8 +154,23 @@ def _asos_rows() -> list[tuple[dt.datetime, int | str]]:
     return rows
 
 
+def _routine_rows() -> list[RoutineRow]:
+    """Routine METAR at :40 of every hour (30 + hour of day), tgroup-sourced."""
+    rows: list[RoutineRow] = []
+    when = utc(2021, 3, 12, 0, 40)
+    while when < utc(2021, 3, 15, 6):
+        rows.append((when, 30 + when.hour, "tgroup"))
+        when += dt.timedelta(hours=1)
+    return rows
+
+
 def _build_world(
-    tmp_path: Path, *, slow_nbp_cycle: bool = False, pins: dict[str, Any] | None = None
+    tmp_path: Path,
+    *,
+    slow_nbp_cycle: bool = False,
+    pins: dict[str, Any] | None = None,
+    routine_extra: Sequence[RoutineRow] = (),
+    routine_replace: Mapping[dt.datetime, RoutineRow] | None = None,
 ) -> _World:
     root = tmp_path
     nbp, us, mos, asos = root / "nbp", root / "us", root / "mos", root / "asos"
@@ -197,6 +216,10 @@ def _build_world(
         _gfs_for_knyc(),
     )
     write_asos_year(asos, "KNYC", 2021, asos_1min_payload(_asos_rows(), station="NYC"))
+    metar = root / "metar"
+    replaced = routine_replace or {}
+    routine = [replaced.get(r[0], r) for r in _routine_rows()] + list(routine_extra)
+    write_routine_store(metar, "KNYC", 2021, routine)
     truth = write_truth(
         root / "truth" / "settlement_truth.parquet",
         [
@@ -209,7 +232,7 @@ def _build_world(
     design["pins"] = {**design["pins"], **(pins if pins is not None else _pins())}
     prereg = root / "prereg.json"
     prereg.write_text(json.dumps(design, indent=2), encoding="utf-8")
-    return _World(root, prereg, nbp, us, mos, asos, truth)
+    return _World(root, prereg, nbp, us, mos, asos, truth, metar)
 
 
 @pytest.fixture(autouse=True)
@@ -328,7 +351,7 @@ def test_obs_reading_after_anchor_excluded_and_never_lamp(tmp_path: Path) -> Non
     # the 15:00 and later archive rows (45, 46, ...) exist but are not available before 15Z
     assert row.obs_so_far_f == 44.0
     assert row.obs_available_at_ns is not None and row.obs_available_at_ns < row.anchor_ns
-    assert world.report()["obs"]["source"] == "iem_asos_1min_whole_f_via_metar_tgroup_quantisation"
+    assert world.report()["obs"]["source"] == "iem_routine_metar_tgroup_round_half_up_f"
 
 
 # ------------------------------------------------------------------ the +60 min twin (FB-R2)
@@ -640,8 +663,9 @@ def test_the_report_cites_the_live_obs_path_and_flags_what_is_not_emulated(tmp_p
 
     assert "running_extreme" in obs["live_path"] and "iem_observations" in obs["live_path"]
     assert obs["cadence_seconds"] == 3600 and obs["interval_rows_not_emulated"] is True
-    assert obs["raw_1min_running_max_is_descriptive_only"] is True
-    assert obs["d0_rows_where_raw_1min_max_differs"] == 2  # 45 at 15:00 vs the cadence feature 44
+    assert obs["non_metar_1min_arms_descriptive_only"] is True
+    # 45 at 15:00 vs the routine-METAR feature 44
+    assert obs["non_metar_1min_raw_max_d0_rows_differ"] == 2
     assert "qc_revision_risk" in obs
 
 
@@ -747,7 +771,154 @@ def test_descriptive_obs_arms_reported_not_in_features_through_the_build(tmp_pat
     assert obs["routine_metar_only"] is True
     assert obs["obs_routine_minute_by_station"] == {"KNYC": 40}
     # 45 at 15:00 (1-min and 5-min arms) vs the routine-METAR feature 44 (14:40)
-    assert obs["d0_rows_where_raw_1min_max_differs"] == 2
-    assert obs["d0_rows_where_five_min_max_differs"] == 2
+    assert obs["non_metar_1min_raw_max_d0_rows_differ"] == 2
+    assert obs["non_metar_5min_whole_f_max_d0_rows_differ"] == 2
     assert obs["descriptive_arms_feed_no_feature"] is True
     assert {r.obs_so_far_f for (_d, h), r in rows.items() if h == "D0"} == {44.0}
+
+
+# ------------------------------------------------------------------ FB-R15: routine-METAR store
+
+
+def _per_station(world: _World) -> dict[str, int]:
+    stats: dict[str, int] = world.report()["obs"]["per_station"]["KNYC"]
+    return stats
+
+
+def test_per_station_obs_counts_are_reported(tmp_path: Path) -> None:
+    extra: list[RoutineRow] = [(utc(2021, 3, 13, 12, 20), 99, "tgroup")]  # a special off the pin
+    replace = {
+        utc(2021, 3, 13, 11, 40): (utc(2021, 3, 13, 11, 40), None, "missing"),
+        utc(2021, 3, 13, 12, 40): (utc(2021, 3, 13, 12, 40), 42, "column"),
+    }
+    world = _build_world(tmp_path, routine_extra=extra, routine_replace=replace)
+
+    assert _run(world) == fb.EXIT_OK
+
+    stats = _per_station(world)
+    assert stats["routine_missing"] == 1
+    assert stats["routine_column_sourced"] == 1
+    assert stats["routine_pin_minute_excluded"] >= 1
+    assert stats["routine_rows_used"] > 0
+    d13 = _by_key(world.rows())[(_D13, "D0")]
+    assert d13.obs_so_far_f == 44.0  # the 99 special never enters; the missing hour is not imputed
+
+
+def test_a_missing_routine_hour_is_not_imputed_from_the_1min_archive(tmp_path: Path) -> None:
+    gone = {utc(2021, 3, 13, 14, 40): (utc(2021, 3, 13, 14, 40), None, "missing")}
+    world = _build_world(tmp_path, routine_replace=gone)
+
+    assert _run(world) == fb.EXIT_OK
+
+    # 14:40 is gone and the 1-min archive still says 44 there: the feature falls back to 13:40
+    assert _by_key(world.rows())[(_D13, "D0")].obs_so_far_f == 43.0
+
+
+def test_the_build_needs_no_1min_archive_for_the_feature(tmp_path: Path) -> None:
+    world = _build_world(tmp_path)
+    argv = world.argv()
+    at = argv.index("--asos-root")
+    del argv[at : at + 2]
+
+    assert fb.main(argv) == fb.EXIT_OK
+
+    assert _by_key(world.rows())[(_D13, "D0")].obs_so_far_f == 44.0
+    obs = world.report()["obs"]
+    assert obs["non_metar_1min_raw_max_d0_rows_differ"] is None
+
+
+def test_the_store_root_defaults_to_the_routine_metar_archive() -> None:
+    from scripts.archive.metar_routine_store import DEFAULT_ARCHIVE_ROOT
+
+    args = fb._parse_args(
+        [
+            "--prereg", "p", "--nbp-root", "n", "--us-source-root", "u", "--mos-root", "m",
+            "--truth", "t", "--start", "2021-03-13", "--end", "2021-03-14",
+            "--out-features", "a", "--out-lag-features", "b", "--report-json", "r",
+        ]
+    )  # fmt: skip
+
+    assert args.metar_routine_root == DEFAULT_ARCHIVE_ROOT == fb.DEFAULT_METAR_ROUTINE_ROOT
+
+
+def test_an_output_inside_the_routine_store_is_refused(tmp_path: Path) -> None:
+    world = _build_world(tmp_path)
+    argv = world.argv()
+    argv[argv.index("--out-features") + 1] = str(world.metar / "features.jsonl")
+
+    assert fb.main(argv) == fb.EXIT_REFUSED
+    assert not (world.metar / "features.jsonl").exists()
+
+
+def test_a_null_routine_minute_pin_still_refuses(tmp_path: Path) -> None:
+    world = _build_world(tmp_path, pins=_pins(obs_routine_minute_by_station=None))
+
+    assert _run(world) == fb.EXIT_REFUSED
+    assert "obs_routine_minute_by_station" in world.report()["reason"]
+
+
+def test_rows_whose_minute_differs_from_the_pin_are_all_excluded(tmp_path: Path) -> None:
+    world = _build_world(tmp_path, pins=_pins(obs_routine_minute_by_station={"KNYC": 41}))
+
+    assert _run(world) == fb.EXIT_OK
+
+    assert all(r.obs_so_far_f is None for r in world.rows())
+    stats = _per_station(world)
+    assert stats["routine_rows_used"] == 0 and stats["routine_pin_minute_excluded"] > 0
+
+
+def test_a_tampered_store_year_is_refused_by_the_manifest_hash(tmp_path: Path) -> None:
+    world = _build_world(tmp_path)
+    year_file = world.metar / "KNYC" / "2021.csv"
+    year_file.write_text(year_file.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    assert _run(world) == fb.EXIT_REFUSED
+    assert "sha256" in world.report()["reason"]
+
+
+def test_the_store_manifest_hash_is_recorded_in_the_report_and_sidecars(tmp_path: Path) -> None:
+    world = _build_world(tmp_path)
+    _run(world)
+    expected = hashlib.sha256((world.metar / "manifest.json").read_bytes()).hexdigest()
+
+    assert world.report()["inputs_sha256"]["metar_routine_manifest"] == expected
+    for name in ("features.jsonl", "features_lag60.jsonl"):
+        side = json.loads(
+            Path(str(world.out() / name) + skill.SIDECAR_SUFFIX).read_text(encoding="utf-8")
+        )
+        assert side["metar_routine_manifest_sha256"] == expected
+
+
+def test_a_sealed_window_is_never_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _build_world(tmp_path)
+    seen: list[dt.datetime] = []
+    from scripts.archive import metar_routine_store as store
+
+    real = store.read_routine_metar
+
+    def spy(station: str, start: Any, end: Any, root: Path) -> Any:
+        seen.append(end)
+        return real(station, start, end, root)
+
+    monkeypatch.setattr(store, "read_routine_metar", spy)
+
+    assert _run(world) == fb.EXIT_OK
+
+    assert seen and all(end <= dt.datetime(2026, 7, 1, tzinfo=dt.UTC) for end in seen)
+
+
+# ------------------------------------------------------------------ write-once publish (review)
+
+
+def test_publish_never_replaces_a_target_that_appeared_after_the_guard(tmp_path: Path) -> None:
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    second.write_text("precious\n", encoding="utf-8")  # appears between the guard and the publish
+
+    with pytest.raises(fb.BuildRefusal, match="already exists"):
+        fb._write_set([(first, b"one\n"), (second, b"two\n")])
+
+    assert second.read_text(encoding="utf-8") == "precious\n"
+    assert not first.exists()  # the set is all-or-nothing
+    assert not list(tmp_path.glob("*.tmp"))

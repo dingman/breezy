@@ -11,10 +11,12 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from scripts.analysis import multisource_blend_skill as skill
+from tests.unit.test_multisource_blend import make_rows
 from tests.unit.test_multisource_blend_skill import (
     _PREREG_SRC,
     _Scenario,
@@ -88,7 +90,7 @@ def test_identical_key_sets_report_zero_rows_lost(tmp_path: Path) -> None:
 
 def test_a_lag_file_sharing_no_key_with_the_base_is_refused(tmp_path: Path) -> None:
     scenario = _Scenario(tmp_path)
-    _write_features(scenario.lag_features, [dataclasses.replace(scenario.rows[0], station="ZZZ")])
+    _write_features(scenario.lag_features, [dataclasses.replace(scenario.rows[0], station="MIA")])
 
     with pytest.raises(skill.Refusal, match="no station-day in common"):
         scenario.run()
@@ -177,3 +179,86 @@ def test_runner_refuses_when_only_the_lag_sidecar_is_missing(tmp_path: Path) -> 
 
 def test_runner_has_no_production_sidecar_bypass_flag() -> None:
     assert "allow-no-sidecar" not in Path(skill.__file__).read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------ lag file: shifted leak check
+
+
+def test_the_lag_file_is_leak_checked_under_the_plus_60_min_shift(tmp_path: Path) -> None:
+    scenario = _Scenario(tmp_path)
+    # a lag row whose PFM availability is only 30 min before the anchor: leak-free as a primary
+    # row, but the twin shifts it by 60 min, past the anchor
+    leaky = [
+        dataclasses.replace(r, pfm_available_at_ns=r.anchor_ns - 30 * 60 * 10**9)
+        if r.pfm_mu_f is not None
+        else r
+        for r in scenario.rows
+    ]
+    _write_features(scenario.lag_features, leaky)
+
+    with pytest.raises(skill.Refusal, match="pfm available_at"):
+        scenario.run()
+
+
+def test_the_primary_file_is_not_shifted_by_the_lag_check(tmp_path: Path) -> None:
+    scenario = _Scenario(tmp_path)
+    same = [
+        dataclasses.replace(r, pfm_available_at_ns=r.anchor_ns - 30 * 60 * 10**9)
+        if r.pfm_mu_f is not None
+        else r
+        for r in scenario.rows
+    ]
+
+    assert skill._load_rows(_write_features(scenario.features, same))  # no raise
+    with pytest.raises(skill.Refusal, match="pfm available_at"):
+        skill._load_rows(scenario.features, extra_lag_ns=skill.LAG_SHIFT_NS)
+
+
+# ------------------------------------------------------------------ anchors vs the sidecar
+
+
+def _both_horizons() -> list[Any]:
+    return make_rows(days=3, stations=("NYC", "LAX"), horizons=("D-1", "D0"))
+
+
+def _anchor_meta(variant: str = "primary", anchors: dict[str, Any] | None = None) -> dict[str, Any]:
+    from tests.unit.test_multisource_blend_skill import _SIDECAR_ANCHORS
+
+    return {"anchor_variant": variant, "anchors": {**_SIDECAR_ANCHORS, **(anchors or {})}}
+
+
+def test_row_anchors_matching_the_sidecar_are_accepted(tmp_path: Path) -> None:
+    skill.check_row_anchors(_both_horizons(), _anchor_meta(), tmp_path / "f.jsonl")  # no raise
+
+
+def test_row_anchors_that_differ_from_the_declared_variant_are_refused(tmp_path: Path) -> None:
+    with pytest.raises(skill.Refusal, match="anchor"):
+        skill.check_row_anchors(_both_horizons(), _anchor_meta("d0_12lst"), tmp_path / "f.jsonl")
+
+
+def test_row_anchors_that_differ_from_the_declared_pin_hour_are_refused(tmp_path: Path) -> None:
+    with pytest.raises(skill.Refusal, match="anchor"):
+        skill.check_row_anchors(
+            _both_horizons(),
+            _anchor_meta(anchors={"D-1": {"kind": "utc", "hour": 17}}),
+            tmp_path / "f",
+        )
+
+
+def test_a_row_for_a_station_outside_the_registry_is_refused(tmp_path: Path) -> None:
+    rows = make_rows(days=1, stations=("ZZZ",), horizons=("D0",))
+
+    with pytest.raises(skill.Refusal, match="ZZZ"):
+        skill.check_row_anchors(rows, _anchor_meta(), tmp_path / "f.jsonl")
+
+
+def test_the_run_refuses_a_feature_file_whose_anchors_contradict_its_sidecar(
+    tmp_path: Path,
+) -> None:
+    scenario = _Scenario(tmp_path)
+    shifted = [dataclasses.replace(r, anchor_ns=r.anchor_ns + 3600 * 10**9) for r in scenario.rows]
+    _write_features(scenario.features, shifted)
+    _write_features(scenario.lag_features, shifted)
+
+    with pytest.raises(skill.Refusal, match="anchor"):
+        scenario.run()

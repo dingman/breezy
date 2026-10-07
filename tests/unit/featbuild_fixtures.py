@@ -8,10 +8,16 @@ Nothing here touches the live data root or the network. Every store is created u
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import hashlib
+import io
+import json
+import math
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pyarrow.parquet as pq
 
@@ -75,6 +81,55 @@ def asos_1min_payload(rows: Iterable[tuple[dt.datetime, int | str]], station: st
 
 def write_asos_year(root: Path, icao: str, year: int, payload: bytes) -> None:
     write_cache_entry(root, iem_asos_1min_request(icao, year), payload)
+
+
+# ------------------------------------------------------------------ routine-METAR store
+
+#: ``(valid_utc, tmpf or None, tmpf_source)``; ``tgroup`` rows carry a T group that round-trips.
+RoutineRow = tuple[dt.datetime, int | None, str]
+_ROUTINE_COLUMNS = (
+    "station",
+    "valid_utc",
+    "tmpf",
+    "tgroup_c",
+    "report_type",
+    "tmpf_source",
+    "metar",
+)
+
+
+def write_routine_store(root: Path, icao: str, year: int, rows: Iterable[RoutineRow]) -> Path:
+    """One station-year in ``metar_routine_store.py``'s on-disk format, plus its manifest entry."""
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(_ROUTINE_COLUMNS)
+    for when, tmpf, source in sorted(rows, key=lambda r: r[0]):
+        tenths = None if tmpf is None else math.floor((tmpf - 32) * 50 / 9 + 0.5)
+        tgroup = f"{tenths / 10:.1f}" if tenths is not None and source == "tgroup" else ""
+        writer.writerow(
+            [
+                icao,
+                f"{when:%Y-%m-%dT%H:%MZ}",
+                "" if tmpf is None else tmpf,
+                tgroup,
+                "3",
+                source,
+                "X",
+            ]
+        )
+    data = out.getvalue().encode("utf-8")
+    path = root / icao / f"{year}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    manifest_path = root / "manifest.json"
+    manifest: dict[str, Any] = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.exists()
+        else {"schema": "metar_routine_store/v1", "entries": {}}
+    )
+    manifest["entries"][f"{icao}/{year}"] = {"sha256": hashlib.sha256(data).hexdigest()}
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    return path
 
 
 # ------------------------------------------------------------------ NBP derived store

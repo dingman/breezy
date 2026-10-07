@@ -10,11 +10,14 @@ Inputs (read-only, no network, never the live data root as an output):
 
 * ``--nbp-root`` NBP derived store; ``--us-source-root`` the ``us-lamp-mdl`` / ``us-lav-iem`` /
   ``us-pfm-afos`` revision stores; ``--mos-root`` the ``iem-mos`` cache root (GFS);
-  ``--asos-root`` the ``iem-asos-1min`` cache root; ``--truth`` the champion's
-  ``settlement_truth.parquet`` (read below the holdout only);
+  ``--metar-routine-root`` the routine-METAR store of ``scripts/archive/metar_routine_store.py``
+  (default ``~/.local/share/breezy/us_source_archive/metar-routine``; FB-R15: the ONLY source of
+  ``obs_so_far``); ``--asos-root`` the optional ``iem-asos-1min`` cache root (the descriptive,
+  non-METAR 1-min arms only); ``--truth`` the champion's ``settlement_truth.parquet`` (read below
+  the holdout only);
 * ``--prereg`` the draft/frozen prereg: it supplies the ``anchors``, ``source_lags_ns``,
   ``obs_source``, ``obs_cadence_seconds`` (3600) and ``obs_routine_minute_by_station`` pins
-  (a null or unaccepted pin is refused).
+  (a null or unaccepted pin is refused; the minute pin is the routine-METAR validation filter).
 
 Anchors (FB-R1): D-1 is a UTC hour on the day before; D0 is a local-STANDARD hour (never DST).
 ``--anchor-variant d0_12lst`` builds the sensitivity pair (D0 at 12:00 LST), never mixed in.
@@ -69,6 +72,7 @@ from breezy.persistence.us_source_request import (
 )
 from scripts.analysis import multisource_blend_inputs_obs as obsmod
 from scripts.analysis import nbp_skill_study as nss
+from scripts.analysis.multisource_blend_inputs_anchors import DEFAULT_STATIONS
 from scripts.analysis.multisource_blend_inputs_forecast import (
     FeatureInputError,
     NbpCandidate,
@@ -106,6 +110,7 @@ from scripts.analysis.multisource_blend_skill import content_digest
 from scripts.archive.iem_mos_backfill import ModelMixError
 
 __all__ = [
+    "DEFAULT_STATIONS",
     "EXIT_DEGRADED",
     "EXIT_OK",
     "EXIT_REFUSED",
@@ -124,8 +129,10 @@ EXIT_OK: Final[int] = 0
 EXIT_DEGRADED: Final[int] = 1
 EXIT_REFUSED: Final[int] = 2
 DEFAULT_MAX_MEMORY_GIB: Final[float] = 4.0
-DEFAULT_STATIONS: Final[tuple[str, ...]] = ("KLAX", "KMDW", "KMIA", "KNYC", "KSFO")
 LIVE_DATA_ROOT: Final[Path] = Path.home() / ".local" / "share" / "breezy"
+#: The routine-METAR store root (equal to ``metar_routine_store.DEFAULT_ARCHIVE_ROOT``, pinned by a
+#: test: importing that module here is circular, it imports the builder through the probe).
+DEFAULT_METAR_ROUTINE_ROOT: Final[Path] = LIVE_DATA_ROOT / "us_source_archive" / "metar-routine"
 _DAY: Final[dt.timedelta] = dt.timedelta(days=1)
 MOS_MODEL: Final[str] = "GFS"
 #: Counts meaning a payload could not be used: the run is degraded (exit 1), outputs written.
@@ -136,8 +143,6 @@ DEGRADING_COUNTS: Final[tuple[str, ...]] = (
     "pfm_payload_unreadable",
     "pfm_first_revision_missing",
     "pfm_first_revision_not_earliest",
-    "year_payload_unavailable",
-    "out_of_order",
 )
 _REFUSALS: Final[tuple[type[Exception], ...]] = (
     FeatureInputError,
@@ -145,6 +150,7 @@ _REFUSALS: Final[tuple[type[Exception], ...]] = (
     HoldoutLeakError,
     ModelMixError,
     obsmod.ObsQuantisationError,
+    obsmod.ObsStoreError,
 )
 
 
@@ -174,7 +180,8 @@ class Config:
     nbp_root: Path
     us_root: Path
     mos_root: Path
-    asos_root: Path
+    metar_root: Path
+    asos_root: Path | None
     truth: Path
     start: dt.date
     end: dt.date
@@ -193,7 +200,9 @@ def _inside(path: Path, root: Path) -> bool:
 
 def _guard_outputs(cfg: Config) -> None:
     """Writes are refused under the live data root and under any input; existing files are kept."""
-    inputs = [cfg.nbp_root, cfg.us_root, cfg.mos_root, cfg.asos_root, cfg.truth, cfg.prereg]
+    inputs = [cfg.nbp_root, cfg.us_root, cfg.mos_root, cfg.metar_root, cfg.truth, cfg.prereg]
+    if cfg.asos_root is not None:
+        inputs.append(cfg.asos_root)
     if cfg.f2_truth is not None:
         inputs.append(cfg.f2_truth)
     for path in (cfg.out_features, cfg.out_lag, cfg.report):
@@ -224,15 +233,25 @@ def _stage(path: Path, data: bytes) -> Path:
 
 
 def _publish(staged: Sequence[tuple[Path, Path]]) -> None:
+    """Hard-link each temp file to its target: an existing target is never replaced (O_EXCL-like).
+
+    ``os.link`` fails with ``FileExistsError`` when the target appeared after ``_guard_outputs``;
+    that is a refusal, and every target this call already published is removed again.
+    """
     published: list[Path] = []
     try:
         for tmp, path in staged:
-            os.replace(tmp, path)
+            try:
+                os.link(tmp, path)
+            except FileExistsError as exc:
+                raise BuildRefusal(f"{path} already exists; outputs are write-once") from exc
             published.append(path)
     except BaseException:
-        for path in published:  # none of them existed before: _guard_outputs checked
+        for path in published:  # only the links this call created
             path.unlink(missing_ok=True)
         raise
+    for tmp, _path in staged:
+        tmp.unlink(missing_ok=True)
 
 
 def _write_set(items: Sequence[tuple[Path, bytes]]) -> None:
@@ -261,8 +280,11 @@ def _sha256(path: Path) -> str:
 class _Tally:
     counts: Counter[str]
     by_horizon: dict[str, Counter[str]]
-    obs_raw_differs: int = 0
-    obs_five_min_differs: int = 0
+    #: station -> routine-METAR obs counters (rows used / column-sourced / missing / pin-excluded)
+    obs_by_station: dict[str, Counter[str]]
+    #: ``None`` until a 1-min payload was read: the non-METAR arms are optional and descriptive.
+    obs_raw_differs: int | None = None
+    obs_five_min_differs: int | None = None
 
 
 @dataclass(slots=True)
@@ -273,7 +295,8 @@ class _Context:
     lamp: LampArchive
     us_cache: ArchiveCache
     mos_cache: ArchiveCache
-    asos_cache: ArchiveCache
+    metar_root: Path
+    asos_cache: ArchiveCache | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,16 +394,18 @@ def _tally_row(tally: _Tally, row: msb.FeatureRow, shift_ns: int) -> None:
 
 
 def _tally_obs_arms(
-    tally: _Tally, row: msb.FeatureRow, obs_year: obsmod.ObsYear, day: dt.date, anchor: int
+    tally: _Tally, row: msb.FeatureRow, arms: obsmod.OneMinArms, day: dt.date, anchor: int
 ) -> None:
-    """The descriptive raw 1-min and 5-min arms: counted against the feature, never a feature."""
-    raw = obsmod.raw_running_max_at(obs_year.raw_max_by_day.get(day, ()), anchor)
+    """The non-METAR 1-min and 5-min arms: counted against the feature, never a feature."""
+    if tally.obs_raw_differs is None or tally.obs_five_min_differs is None:
+        return  # no 1-min payload was read for this build
+    raw = obsmod.raw_running_max_at(arms.raw_max_by_day.get(day, ()), anchor)
     tally.obs_raw_differs += int(raw != row.obs_so_far_f)
-    five = obsmod.raw_running_max_at(obs_year.five_min_max_by_day.get(day, ()), anchor)
+    five = obsmod.raw_running_max_at(arms.five_min_max_by_day.get(day, ()), anchor)
     tally.obs_five_min_differs += int(five != row.obs_so_far_f)
 
 
-def _emit_rows(ctx: _Context, item: _RowInputs, obs_year: obsmod.ObsYear, rows: _Rows) -> None:
+def _emit_rows(ctx: _Context, item: _RowInputs, arms: obsmod.OneMinArms, rows: _Rows) -> None:
     for shift, target in ((0, rows.primary), (LAG_SHIFT_NS, rows.lag)):
         row = _assemble(ctx, item, shift)
         if row is None:
@@ -388,7 +413,7 @@ def _emit_rows(ctx: _Context, item: _RowInputs, obs_year: obsmod.ObsYear, rows: 
         target.append(row)
         _tally_row(ctx.tally, row, shift)
         if shift == 0 and item.horizon == "D0":
-            _tally_obs_arms(ctx.tally, row, obs_year, item.day, item.anchor_ns)
+            _tally_obs_arms(ctx.tally, row, arms, item.day, item.anchor_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +446,26 @@ def _load_sources(cfg: Config, pins: Pins, station: _Station, ctx: _Context) -> 
     return _StationSources(pfm, mos.vintages_by_day, minute)
 
 
+def _read_arms(
+    ctx: _Context, station: _Station, year: int, cutoffs: Mapping[dt.date, int]
+) -> obsmod.OneMinArms:
+    """The optional non-METAR 1-min arms of one station-year (empty without ``--asos-root``)."""
+    if ctx.asos_cache is None:
+        return obsmod.OneMinArms()
+    arms = obsmod.read_onemin_arms_year(
+        ctx.asos_cache,
+        station.icao,
+        year,
+        std_utc_offset_hours=station.offset,
+        cutoff_ns_by_day=cutoffs,
+    )
+    ctx.tally.counts.update(arms.counts)
+    if not arms.counts["onemin_year_payload_unavailable"]:
+        ctx.tally.obs_raw_differs = ctx.tally.obs_raw_differs or 0
+        ctx.tally.obs_five_min_differs = ctx.tally.obs_five_min_differs or 0
+    return arms
+
+
 def _build_year(
     pins: Pins,
     station: _Station,
@@ -432,8 +477,8 @@ def _build_year(
     rows: _Rows,
 ) -> None:
     cutoffs = {d: max(anchors[(d, h)] for h in HORIZONS) for d in year_days}
-    obs_year = obsmod.read_obs_year(
-        ctx.asos_cache,
+    obs_year = obsmod.read_routine_obs_year(
+        ctx.metar_root,
         station.icao,
         year,
         std_utc_offset_hours=station.offset,
@@ -442,6 +487,8 @@ def _build_year(
         cutoff_ns_by_day=cutoffs,
     )
     ctx.tally.counts.update(obs_year.counts)
+    ctx.tally.obs_by_station.setdefault(station.icao, Counter()).update(obs_year.counts)
+    arms = _read_arms(ctx, station, year, cutoffs)
     bases = rows.lamp_bases[station.icao]
     for day in year_days:
         readings = obs_year.readings_by_day.get(day, ())
@@ -453,7 +500,7 @@ def _build_year(
                 station, day, horizon, anchor, choice.runs, readings,
                 sources.pfm.get(day, ()), sources.mos.get(day, ()),
             )  # fmt: skip
-            _emit_rows(ctx, item, obs_year, rows)
+            _emit_rows(ctx, item, arms, rows)
 
 
 def _build_station(cfg: Config, pins: Pins, station: _Station, ctx: _Context, rows: _Rows) -> None:
@@ -495,6 +542,10 @@ def _check_rows(primary: Sequence[msb.FeatureRow], lag: Sequence[msb.FeatureRow]
             msb.assert_row_leakage_free(row, extra_lag_ns=extra_lag_ns)
 
 
+def _metar_manifest(cfg: Config) -> Path:
+    return cfg.metar_root / "manifest.json"
+
+
 def _inputs_sha(cfg: Config) -> dict[str, str]:
     manifests = {
         "nbp_manifest": cfg.nbp_root / "_manifest.json",
@@ -502,10 +553,12 @@ def _inputs_sha(cfg: Config) -> dict[str, str]:
         "us_lav_iem": cfg.us_root / US_LAV_IEM_SOURCE / "coverage.json",
         "us_pfm_afos": cfg.us_root / US_PFM_AFOS_SOURCE / "coverage.json",
         "iem_mos": cfg.mos_root / "iem-mos" / "coverage.json",
-        "iem_asos_1min": cfg.asos_root / "iem-asos-1min" / "coverage.json",
+        "metar_routine_manifest": _metar_manifest(cfg),
         "truth": cfg.truth,
         "prereg": cfg.prereg,
     }
+    if cfg.asos_root is not None:  # descriptive, non-METAR arms only
+        manifests["iem_asos_1min_non_metar"] = cfg.asos_root / "iem-asos-1min" / "coverage.json"
     return {name: _sha256(path) for name, path in manifests.items()}
 
 
@@ -530,6 +583,7 @@ def _sidecar(
         "obs_source": obsmod.OBS_SOURCE_LABEL,
         "obs_cadence_seconds": obsmod.ROUTINE_OBS_CADENCE_SECONDS,
         "obs_routine_minute_by_station": dict(pins.obs_routine_minute_by_station),
+        "metar_routine_manifest_sha256": _sha256(_metar_manifest(cfg)),
         "source_breaks_observed": breaks,
         "lag_shift_ns": LAG_SHIFT_NS if role == "lag" else 0,
         "obs_available_at_ns_shifted": role == "lag",
@@ -546,7 +600,7 @@ def _lines(rows: Sequence[msb.FeatureRow]) -> bytes:
 def _make_context(cfg: Config, pins: Pins, registry: nss.StationRegistry) -> _Context:
     counts: Counter[str] = Counter()
     return _Context(
-        tally=_Tally(counts, {h: Counter() for h in HORIZONS}),
+        tally=_Tally(counts, {h: Counter() for h in HORIZONS}, {}),
         truth=_truth_lookup(cfg),
         nbp=collect_nbp_candidates(
             cfg.nbp_root, registry, end_exclusive=cfg.end + _DAY, counts=counts
@@ -560,7 +614,8 @@ def _make_context(cfg: Config, pins: Pins, registry: nss.StationRegistry) -> _Co
         ),
         us_cache=read_only_cache(cfg.us_root),
         mos_cache=read_only_cache(cfg.mos_root),
-        asos_cache=read_only_cache(cfg.asos_root),
+        metar_root=cfg.metar_root,
+        asos_cache=None if cfg.asos_root is None else read_only_cache(cfg.asos_root),
     )
 
 
@@ -632,6 +687,7 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
             five_min_differs=tally.obs_five_min_differs,
             raw_differs=tally.obs_raw_differs,
             pins=pins,
+            per_station=tally.obs_by_station,
         ),
         source_breaks_observed=breaks,
         truth_concordance=truth_concordance(cfg.f2_truth, ctx.truth),
@@ -654,7 +710,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--nbp-root", type=Path, required=True)
     parser.add_argument("--us-source-root", type=Path, required=True)
     parser.add_argument("--mos-root", type=Path, required=True)
-    parser.add_argument("--asos-root", type=Path, required=True)
+    parser.add_argument("--metar-routine-root", type=Path, default=DEFAULT_METAR_ROUTINE_ROOT)
+    parser.add_argument("--asos-root", type=Path, default=None)
     parser.add_argument("--truth", type=Path, required=True)
     parser.add_argument("--start", type=dt.date.fromisoformat, required=True)
     parser.add_argument("--end", type=dt.date.fromisoformat, required=True)
@@ -674,6 +731,7 @@ def _config(args: argparse.Namespace) -> Config:
         nbp_root=args.nbp_root,
         us_root=args.us_source_root,
         mos_root=args.mos_root,
+        metar_root=args.metar_routine_root,
         asos_root=args.asos_root,
         truth=args.truth,
         start=args.start,

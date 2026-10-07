@@ -45,6 +45,23 @@ def _lst_ns(day: dt.date, hour: float) -> int:
     return _lst_midnight_ns(day) + int(hour * _HOUR_NS)
 
 
+#: Station standard offsets as the registry holds them (the runner re-derives anchors from them).
+_STD_OFFSET_BY_STATION = {"NYC": -5.0, "LAX": -8.0}
+#: Availability margin: a row survives the +60 min twin's shifted leak check (FB-R2 review fix).
+_AVAILABLE_BEFORE_ANCHOR_NS = 2 * _HOUR_NS
+
+
+def _builder_anchor_ns(station: str, day: dt.date, horizon: str) -> int:
+    """The builder's anchors for the draft pins: D-1 = 18Z the day before, D0 = 10 LST."""
+    midnight = dt.datetime(day.year, day.month, day.day, tzinfo=dt.UTC)
+    if horizon == "D-1":
+        moment = midnight - dt.timedelta(days=1) + dt.timedelta(hours=18)
+    else:
+        offset = _STD_OFFSET_BY_STATION.get(station, _OFFSET)
+        moment = midnight - dt.timedelta(hours=offset) + dt.timedelta(hours=10)
+    return int(moment.timestamp()) * _NS
+
+
 def _pct(q50: float, sd: float) -> Percentiles:
     return Percentiles(
         q10=q50 - 1.2816 * sd,
@@ -74,7 +91,7 @@ def _lamp_feature(rem: float | None, *, anchor_ns: int) -> msb.LampFeature:
         hours_covered=10,
         peak_covered=True,
         missing=False,
-        run_available_at_ns=anchor_ns - _HOUR_NS,
+        run_available_at_ns=anchor_ns - _AVAILABLE_BEFORE_ANCHOR_NS,
         min_valid_ts_ns=anchor_ns + _HOUR_NS,
         strict_24h_max_f_diagnostic=None,
     )
@@ -94,7 +111,7 @@ def _row(
     pfm: float | None,
     mos: float | None,
 ) -> msb.FeatureRow:
-    anchor = _lst_ns(day, 9.0) if horizon == "D0" else _lst_ns(day - dt.timedelta(days=1), 15.0)
+    anchor = _builder_anchor_ns(station, day, horizon)
     return msb.FeatureRow(
         station=station,
         climate_day=day,
@@ -104,12 +121,12 @@ def _row(
         percentiles=_pct(nbp, sd),
         cli_tmax_f=y,
         obs_so_far_f=obs,
-        obs_available_at_ns=None if obs is None else anchor - _HOUR_NS,
+        obs_available_at_ns=None if obs is None else anchor - _AVAILABLE_BEFORE_ANCHOR_NS,
         lamp=_lamp_feature(lamp, anchor_ns=anchor),
         pfm_mu_f=pfm,
-        pfm_available_at_ns=None if pfm is None else anchor - _HOUR_NS,
+        pfm_available_at_ns=None if pfm is None else anchor - _AVAILABLE_BEFORE_ANCHOR_NS,
         mos_mu_f=mos,
-        mos_available_at_ns=None if mos is None else anchor - _HOUR_NS,
+        mos_available_at_ns=None if mos is None else anchor - _AVAILABLE_BEFORE_ANCHOR_NS,
     )
 
 

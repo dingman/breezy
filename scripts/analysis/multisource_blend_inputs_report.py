@@ -125,25 +125,56 @@ def source_lags(pins: Pins) -> dict[str, Any]:
     return lags
 
 
-def obs_report(*, five_min_differs: int, raw_differs: int, pins: Pins) -> dict[str, Any]:
+#: FB-R15 per-station routine-METAR counters, always reported (zero when absent).
+OBS_STATION_KEYS: Final[tuple[str, ...]] = (
+    "routine_rows_used",
+    "routine_column_sourced",
+    "routine_missing",
+    "routine_pin_minute_excluded",
+)
+
+
+def obs_report(
+    *,
+    five_min_differs: int | None,
+    raw_differs: int | None,
+    pins: Pins,
+    per_station: Mapping[str, Mapping[str, int]],
+) -> dict[str, Any]:
     return {
         "source": obsmod.OBS_SOURCE_LABEL,
         "live_path": obsmod.LIVE_PATH_CITATION,
         "cadence_seconds": obsmod.ROUTINE_OBS_CADENCE_SECONDS,
         "routine_metar_only": True,
         "obs_routine_minute_by_station": dict(pins.obs_routine_minute_by_station),
-        "quantisation": "whole degF -> tenths C -> breezy.domain.temperature.round_half_up_f",
+        "per_station": {
+            icao: {key: int(counts.get(key, 0)) for key in OBS_STATION_KEYS}
+            for icao, counts in sorted(per_station.items())
+        },
+        "per_station_note": (
+            "routine_rows_used: rows that became readings; routine_column_sourced: of those, rows "
+            "whose tmpf came from the IEM column (no T group), used and flagged; routine_missing: "
+            "tmpf_source=missing rows, skipped and never imputed; routine_pin_minute_excluded: "
+            "rows at a minute other than the pinned routine minute. Counted within the requested "
+            "climate days up to each day's last anchor."
+        ),
+        "no_1min_fallback": True,
+        "quantisation": "T group tenths C -> breezy.domain.temperature.round_half_up_f (store)",
         "interval_rows_not_emulated": True,
         "interval_rows_note": (
             "FB-R13: the NWS integer-C interval rows and METAR specials are excluded on both "
             "sides; only the routine hourly METAR reading is used"
         ),
+        "non_metar_1min_arms_descriptive_only": True,
         "descriptive_arms_feed_no_feature": True,
-        "d0_rows_where_five_min_max_differs": five_min_differs,
-        "raw_1min_running_max_is_descriptive_only": True,
-        "d0_rows_where_raw_1min_max_differs": raw_differs,
+        "non_metar_5min_whole_f_max_d0_rows_differ": five_min_differs,
+        "non_metar_1min_raw_max_d0_rows_differ": raw_differs,
         "qc_revision_risk": (
-            "the 1-min archive is post-QC and may differ from what the live path saw; not "
-            "measurable offline"
+            "the routine-METAR store is IEM's current archive and may differ from what the live "
+            "path saw (later corrections); not measurable offline"
+        ),
+        "non_metar_arms_note": (
+            "FB-R15: the 1-min archive disagrees with the METAR value on 16.6-22.2% of hours; its "
+            "arms are descriptive, non-METAR, and null when no 1-min payload was read"
         ),
     }

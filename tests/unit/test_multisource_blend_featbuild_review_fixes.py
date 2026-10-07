@@ -127,14 +127,14 @@ def test_a_failure_part_way_through_leaves_none_of_the_four_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world = _build_world(tmp_path)
-    real = os.replace
+    real = os.link  # publish is link-or-fail (an existing target is never replaced)
 
     def flaky(src: Any, dst: Any) -> None:
         if str(dst).endswith("features_lag60.jsonl"):
             raise OSError("rename failed")
         real(src, dst)
 
-    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(os, "link", flaky)
 
     assert _run(world) == fb.EXIT_REFUSED
 

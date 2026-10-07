@@ -52,7 +52,9 @@ for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
 
 from breezy.analysis import multisource_blend as msb
 from breezy.analysis.memory_cap import apply_address_space_cap
+from breezy.analysis.multisource_blend_features import LAG_SHIFT_NS
 from breezy.strategy.ladder_ev.quantile_density import CdfMethod
+from scripts.analysis.multisource_blend_inputs_anchors import check_row_anchors
 from scripts.analysis.multisource_blend_lag_arm import (
     LagKeys,
     common_scored,
@@ -73,6 +75,7 @@ from scripts.analysis.multisource_blend_sidecar import (
 from scripts.analysis.prereg_precommit_check import check_frozen_blob
 
 __all__ = [
+    "LAG_SHIFT_NS",
     "OOF_HEADER_KEY",
     "RECORD_NAME",
     "REQUIRED_PINS",
@@ -84,6 +87,7 @@ __all__ = [
     "StageA",
     "StageB",
     "assemble_result",
+    "check_row_anchors",
     "content_digest",
     "load_verified_prereg",
     "main",
@@ -292,7 +296,8 @@ def write_stage_a(out_dir: Path, payload: Mapping[str, Any]) -> None:
 # ------------------------------------------------------------------ inputs
 
 
-def _load_rows(path: Path) -> list[msb.FeatureRow]:
+def _load_rows(path: Path, *, extra_lag_ns: int = 0) -> list[msb.FeatureRow]:
+    """Load a feature file; ``extra_lag_ns`` is the lag twin's shift for the leak check (FB-R2)."""
     try:
         lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         rows = [msb.feature_row_from_json(json.loads(ln)) for ln in lines]
@@ -301,7 +306,7 @@ def _load_rows(path: Path) -> list[msb.FeatureRow]:
     try:
         msb.assert_pre_holdout(rows)
         for row in rows:
-            msb.assert_row_leakage_free(row)
+            msb.assert_row_leakage_free(row, extra_lag_ns=extra_lag_ns)
     except (msb.HoldoutLeakError, msb.LeakageError) as exc:
         raise Refusal(str(exc)) from exc
     if not rows:
@@ -427,7 +432,10 @@ def prepare_run(
     meta = _check_sidecar(features, design, role="primary", variant=anchor_variant)
     lag_meta = _check_sidecar(lag_features, design, role="lag", variant=anchor_variant)
     check_sidecar_pair(meta, lag_meta)
-    rows, lag_loaded = _load_rows(features), _load_rows(lag_features)
+    rows = _load_rows(features)
+    lag_loaded = _load_rows(lag_features, extra_lag_ns=LAG_SHIFT_NS)
+    check_row_anchors(rows, meta, features)
+    check_row_anchors(lag_loaded, lag_meta, lag_features)
     check_sidecar_row_count(meta, features, len(rows))
     check_sidecar_row_count(lag_meta, lag_features, len(lag_loaded))
     keys = split_lag_keys(rows, lag_loaded)
