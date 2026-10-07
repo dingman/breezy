@@ -729,10 +729,56 @@ def test_apply_builds_the_transport_with_the_stations_and_always_writes_a_report
             "0",
             "--report-json",
             str(report_path),
-        )
+        ),
+        clock=_clock(),
     )
 
     assert exit_code == 1
     assert seen["stations"] == _FIVE
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["failed"] and payload["stations"] == sorted(_FIVE)
+
+
+def test_apply_inside_the_launch_window_pauses_before_any_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.analysis.nbp_backfill as module
+
+    fetched: list[object] = []
+
+    class _Boom:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch_nbp_bulletin(self, **kw: object) -> None:
+            fetched.append(kw)
+            raise NbmQuantileFetchError("boom")
+
+    monkeypatch.setattr(module, "NbmQuantileTransport", _Boom)
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    monkeypatch.setenv("BREEZY_USER_AGENT", "breezy-test (jon@gopoint.com)")
+    in_window = int(dt.datetime(2026, 10, 7, 16, 45, tzinfo=dt.UTC).timestamp() * 1e9)
+    report_path = tmp_path / "report.json"
+
+    main(
+        _argv(
+            tmp_path,
+            "--apply",
+            "--stations",
+            "KLAX,KMDW,KMIA,KSFO,KNYC",
+            "--out-root",
+            str(tmp_path / "nbp5"),
+            "--request-budget",
+            "100",
+            "--pace-s",
+            "0",
+            "--report-json",
+            str(report_path),
+        ),
+        clock=lambda: in_window,
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert fetched == []
+    assert payload["failed"] == []
+    assert payload["stop_reason"] == "paused_launch_window"
