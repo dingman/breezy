@@ -19,7 +19,11 @@ from scripts.analysis.multisource_blend_inputs_anchors import (
     anchor_ns_for,
     parse_anchors,
 )
-from scripts.analysis.multisource_blend_inputs_obs_coverage import COVERAGE_PIN, check_coverage_pin
+from scripts.analysis.multisource_blend_inputs_obs_coverage import (
+    COVERAGE_PIN,
+    check_coverage_pin,
+    check_share_pin,
+)
 
 __all__ = [
     "LAG_FLOORS_NS",
@@ -89,8 +93,10 @@ class Pins:
     anchors_raw: Mapping[str, Any]
     lags: Mapping[str, int]
     obs_routine_minute_by_station: Mapping[str, int]
-    #: ``obs_min_coverage_per_station_year``: a station-year below it refuses the build.
+    #: ``obs_min_coverage_per_station_year``: a station-year below it is excluded (PIN-R4).
     obs_min_coverage_per_station_year: float
+    #: ``obs_max_pin_minute_excluded_share``: a station-year above it is excluded (PIN-R4).
+    obs_max_pin_minute_excluded_share: float
 
 
 def load_pins(design: Mapping[str, Any]) -> Pins:
@@ -116,4 +122,8 @@ def load_pins(design: Mapping[str, Any]) -> Pins:
         ValueError
     ) as exc:  # a null pin is refused too: the coordinator pins it, never the builder
         raise BuildRefusal(str(exc)) from exc
-    return Pins(anchors, pins["anchors"], lags, minutes, coverage)
+    try:
+        share = check_share_pin(pins.get("obs_max_pin_minute_excluded_share"))
+    except ValueError as exc:
+        raise BuildRefusal(str(exc)) from exc
+    return Pins(anchors, pins["anchors"], lags, minutes, coverage, share)

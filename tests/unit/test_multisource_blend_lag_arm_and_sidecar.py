@@ -27,6 +27,10 @@ from tests.unit.test_multisource_blend_skill import (
 )
 
 
+def _caps(value: Any) -> dict[str, Any]:
+    return {"overall": value, "per_horizon": value, "per_station": value}
+
+
 def _digest(scenario: _Scenario) -> str:
     return skill.content_digest(json.loads(scenario.prereg.read_text(encoding="utf-8")))
 
@@ -143,7 +147,7 @@ def _first_row() -> msb.FeatureRow:
 
 
 def test_lost_fraction_above_the_pin_refuses_before_anything_is_scored(tmp_path: Path) -> None:
-    scenario = _Scenario(tmp_path, lag_arm_max_lost_fraction=0.05)
+    scenario = _Scenario(tmp_path, lag_arm_max_lost_fraction=_caps(0.05))
     _drop_lag_keys(scenario, 40)  # 40 / 336 = 11.9 %
 
     with pytest.raises(skill.Refusal, match="lag_arm_max_lost_fraction"):
@@ -153,7 +157,7 @@ def test_lost_fraction_above_the_pin_refuses_before_anything_is_scored(tmp_path:
 
 
 def test_lost_fraction_at_or_below_the_pin_is_accepted(tmp_path: Path) -> None:
-    scenario = _Scenario(tmp_path, lag_arm_max_lost_fraction=0.2)
+    scenario = _Scenario(tmp_path, lag_arm_max_lost_fraction=_caps(0.2))
     _drop_lag_keys(scenario, 40)
 
     assert scenario.run()["lag_rerun"]["lost_fraction"] < 0.2
@@ -168,19 +172,22 @@ def test_a_null_lag_arm_max_lost_fraction_pin_is_refused_like_the_others(tmp_pat
 
 @pytest.mark.parametrize("bad", [-0.1, 1.5, "half", True])
 def test_lag_arm_max_lost_fraction_must_be_a_fraction(tmp_path: Path, bad: Any) -> None:
-    prereg = _freeze(tmp_path / "repo", _design(lag_arm_max_lost_fraction=bad))
+    prereg = _freeze(tmp_path / "repo", _design(lag_arm_max_lost_fraction=_caps(bad)))
 
     with pytest.raises(skill.Refusal, match="lag_arm_max_lost_fraction"):
         skill.load_verified_prereg(prereg)
 
 
-def test_the_prereg_skeleton_carries_the_lag_arm_pin_null() -> None:
+def test_the_prereg_skeleton_carries_the_lag_arm_caps_pinned_by_pin_r5() -> None:
     from tests.unit.test_multisource_blend_skill import _PREREG_SRC
 
     draft = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
 
-    assert "lag_arm_max_lost_fraction" in draft["pins"]
-    assert draft["pins"]["lag_arm_max_lost_fraction"] is None
+    assert draft["pins"]["lag_arm_max_lost_fraction"] == {
+        "overall": 0.05,
+        "per_horizon": 0.05,
+        "per_station": 0.10,
+    }
     assert "lag_arm_max_lost_fraction" in draft["pin_units"]
     assert "lag_arm_max_lost_fraction" in skill.REQUIRED_PINS
 

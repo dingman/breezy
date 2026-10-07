@@ -14,7 +14,15 @@ It REFUSES to score unless every one of these holds, in this order, before any m
 3. the prereg's frozen sha and content digest are RECORDED in ``<out>/prereg_record.json``; a run
    directory recorded under a different prereg is refused ("changed since"); a run directory that
    already holds ``stage_a.json`` is refused (the floor commitment is write-once);
-4. C1 has measured the source lags for >= 14 days (``--c1-evidence``).
+4. C1 has measured the source lags for >= 14 days (``--c1-evidence``), and every pinned
+   ``source_lags_ns`` value is at least that source's C1 observed p99 (PIN-R6).
+
+Freeze guards (PIN-R8): a prereg whose git history holds more than one commit with a non-UNFROZEN
+``frozen_sha`` is refused as re-frozen; a sidecar stamped ``scoring: false`` (a builder
+``--draft-scratch`` build) is refused. Every builder pin is a required pin (PIN-R9). The sidecars'
+observed source breaks must all be pinned in ``source_breaks`` (PIN-R7). Amendments are made only in
+a NEW file (``..._v2.json``) with an amendment record, frozen once on its own; both results are
+reported. A prereg is never edited after its freeze.
 
 It then scores in two stages. Stage A fits only M0 (the champion, ``fit_calibration``) and M0';
 the minimum-effect floor (multiple x the M0 fold-to-fold CRPS SD) is written to ``stage_a.json``
@@ -27,9 +35,10 @@ Inputs are pre-assembled feature rows (JSONL of ``multisource_blend.feature_row_
 ``assemble_feature_row``; a second file carries the same rows assembled with every source lag +60
 min. Both files need the builder's sidecar, and the pair is cross-checked (anchor variant, anchors,
 lags, routine minutes, prereg digest, lag shifts, row counts). The lag arm is compared with the
-primary on the keys both hold (paired difference); a lost fraction above the pinned
-``lag_arm_max_lost_fraction`` refuses the run. Rows on or after 2026-07-01 are refused. The script
-never calls ``open_holdout``, opens no network connection and writes only under ``--out-dir``.
+primary on the keys both hold (paired difference); a lost fraction above any of the pinned
+``lag_arm_max_lost_fraction`` caps (overall, per horizon, per station) refuses the run. Rows on or
+after 2026-07-01 are refused. The script never calls ``open_holdout``, opens no network
+connection and writes only under ``--out-dir``.
 """
 
 from __future__ import annotations
@@ -58,12 +67,20 @@ from scripts.analysis.multisource_blend_inputs_anchors import (
     check_row_anchors,
     check_sidecar_anchors_match_prereg,
 )
+from scripts.analysis.multisource_blend_inputs_pins import BuildRefusal, load_pins
 from scripts.analysis.multisource_blend_lag_arm import (
     LagKeys,
+    check_lag_caps,
     common_scored,
     lag_loss_report,
     paired_day_values,
+    parse_lag_caps,
     split_lag_keys,
+)
+from scripts.analysis.multisource_blend_pin_guards import (
+    check_breaks_pinned,
+    check_not_refrozen,
+    check_pinned_lags_cover_c1,
 )
 from scripts.analysis.multisource_blend_refusal import Refusal
 from scripts.analysis.multisource_blend_sidecar import (
@@ -121,6 +138,14 @@ REQUIRED_PINS: Final[tuple[str, ...]] = (
     "min_uncensored_lag_samples",
     "embargo_days",
     "lag_arm_max_lost_fraction",
+    # PIN-R9: every pin the builder reads is required, so a null refuses by name
+    "anchors",
+    "source_lags_ns",
+    "obs_source",
+    "obs_cadence_seconds",
+    "obs_routine_minute_by_station",
+    "obs_min_coverage_per_station_year",
+    "obs_max_pin_minute_excluded_share",
 )
 RECORD_NAME: Final[str] = "prereg_record.json"
 #: FB-R6: the embargo must reach past the 1-day autocorrelation of a daily-max series.
@@ -213,12 +238,20 @@ def _check_collections(pins: Mapping[str, Any]) -> list[str]:
     edges = pins.get("rung_edges_f")
     if not isinstance(edges, list) or not edges or not all(_is_int(e) for e in edges):
         problems.append(f"pins.rung_edges_f must be a non-empty list of integers, was {edges!r}")
-    fraction = pins.get("lag_arm_max_lost_fraction")
-    if not _is_number(fraction) or not 0.0 <= fraction <= 1.0:
-        problems.append(
-            f"pins.lag_arm_max_lost_fraction must be a number in [0, 1], was {fraction!r}"
-        )
+    try:
+        parse_lag_caps(pins.get("lag_arm_max_lost_fraction"))
+    except ValueError as exc:
+        problems.append(str(exc))
     return problems
+
+
+def _check_builder_pins(design: Mapping[str, Any]) -> list[str]:
+    """The builder's own validation of the anchors, lags, obs and coverage pins (PIN-R9)."""
+    try:
+        load_pins(design)
+    except BuildRefusal as exc:
+        return [str(exc)]
+    return []
 
 
 def _check_values(design: Mapping[str, Any]) -> None:
@@ -231,6 +264,7 @@ def _check_values(design: Mapping[str, Any]) -> None:
     problems = _check_scalars("fixed_by_plan", fixed, _FIXED_INTS, _FIXED_NUMBERS)
     problems += _check_scalars("pins", pins, _PIN_INTS, _PIN_NUMBERS)
     problems += _check_collections(pins)
+    problems += _check_builder_pins(design)
     if problems:
         raise Refusal("; ".join(problems))
 
@@ -250,6 +284,7 @@ def load_verified_prereg(path: Path) -> Mapping[str, Any]:
     defects = check_frozen_blob(path, design)
     if defects:
         raise Refusal("; ".join(f"[{d.code}] {d.message}" for d in defects))
+    check_not_refrozen(path)
     pins = design.get("pins")
     if not isinstance(pins, Mapping):
         raise Refusal("the prereg has no `pins` object")
@@ -343,6 +378,7 @@ def _check_c1(path: Path, design: Mapping[str, Any]) -> None:
         )
     except msb.C1LagEvidenceError as exc:
         raise Refusal(str(exc)) from exc
+    check_pinned_lags_cover_c1(design["pins"]["source_lags_ns"], evidence.get("lag_samples_ns"))
 
 
 def _settings(pins: Mapping[str, Any]) -> msb.BlendSettings:
@@ -403,13 +439,8 @@ def _check_variant(anchor_variant: str) -> None:
 
 
 def _check_lag_loss(keys: LagKeys, pins: Mapping[str, Any]) -> None:
-    limit = float(pins["lag_arm_max_lost_fraction"])
-    if keys.lost_fraction > limit:
-        raise Refusal(
-            f"the +60 min shift lost {len(keys.lost)} of {len(keys.base)} keys "
-            f"({keys.lost_fraction:.4f}), above the pinned lag_arm_max_lost_fraction {limit}; "
-            "no verdict is emitted"
-        )
+    """PIN-R5: refuse on any exceeded cap; the measured loss never loosens one."""
+    check_lag_caps(keys, parse_lag_caps(pins["lag_arm_max_lost_fraction"]))
 
 
 def prepare_run(
@@ -435,6 +466,8 @@ def prepare_run(
     meta = _check_sidecar(features, design, role="primary", variant=anchor_variant)
     lag_meta = _check_sidecar(lag_features, design, role="lag", variant=anchor_variant)
     check_sidecar_pair(meta, lag_meta)
+    check_breaks_pinned(meta, pins["source_breaks"], features)
+    check_breaks_pinned(lag_meta, pins["source_breaks"], lag_features)
     check_sidecar_anchors_match_prereg(meta, design, features)
     check_sidecar_anchors_match_prereg(lag_meta, design, lag_features)
     rows = _load_rows(features)

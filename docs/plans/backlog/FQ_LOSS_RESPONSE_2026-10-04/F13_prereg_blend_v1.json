@@ -1,7 +1,7 @@
 {
   "schema": "f13_prereg_blend_v1",
   "frozen_sha": "UNFROZEN",
-  "status": "DRAFT skeleton. The coordinator pins every null under `pins` and the `veto` pins, then freezes it (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, or if the committed blob differs.",
+  "status": "DRAFT skeleton (F13 Phase A pins r3, PIN-R2). Every fixed pin and the veto reference are written as exact literals; only `source_lags_ns` and `source_breaks` stay null until the one gated freeze derives them by their rules (PIN-R6/R7). Then it is frozen once (commit, then stamp that commit's sha here). The runner refuses to score while frozen_sha is UNFROZEN, while any pin is null, if the committed blob differs, or if the file was re-frozen.",
   "pin_note": "coordinator pins before any M1-M3 scoring",
   "plan": {
     "document": "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md",
@@ -56,29 +56,46 @@
     }
   },
   "pins": {
-    "floor_multiple": null,
-    "m0_prime_tolerance_crps_f": null,
-    "station_tolerance_crps_f": null,
-    "leak_audit_spread_multiple": null,
-    "student_t_nu": null,
-    "sigma_floor_f": null,
-    "weight_sum_lambda": null,
-    "min_cell_rows": null,
-    "bootstrap_n": null,
-    "bootstrap_seed": null,
-    "champion_cdf_method": null,
-    "m0_bootstrap_draws": null,
+    "floor_multiple": 0.25,
+    "m0_prime_tolerance_crps_f": 0.03,
+    "station_tolerance_crps_f": 0.05,
+    "leak_audit_spread_multiple": 3.0,
+    "student_t_nu": 5,
+    "sigma_floor_f": 0.75,
+    "weight_sum_lambda": 1.0,
+    "min_cell_rows": 60,
+    "bootstrap_n": 10000,
+    "bootstrap_seed": 20261006,
+    "champion_cdf_method": "NORMAL",
+    "champion_cdf_method_source": {
+      "path": "deploy/families/artefacts/nbp_calibration_pm_us_crh_fq_v1_2026-09-30.json",
+      "commit": "ad76d2f24415b2c4256289f74e5ad12d02dcba0f"
+    },
+    "m0_bootstrap_draws": 200,
     "source_breaks": null,
-    "rung_edges_f": null,
-    "min_uncensored_lag_samples": null,
-    "embargo_days": null,
-    "anchors": null,
+    "rung_edges_f": [
+      -20, -18, -16, -14, -12, -10, -8, -6, -4, -2, 0, 2,
+      4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26,
+      28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50,
+      52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74,
+      76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98,
+      100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120
+    ],
+    "min_uncensored_lag_samples": 30,
+    "embargo_days": 3,
+    "anchors": {
+      "D-1": {"kind": "utc", "hour": 18},
+      "D0": {"kind": "lst", "hour": 10},
+      "D0_sensitivity": {"kind": "lst", "hour": 12},
+      "offset_rule": "fixed_standard_time_never_dst"
+    },
     "source_lags_ns": null,
-    "obs_source": null,
-    "obs_cadence_seconds": null,
-    "obs_routine_minute_by_station": null,
-    "obs_min_coverage_per_station_year": null,
-    "lag_arm_max_lost_fraction": null
+    "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
+    "obs_cadence_seconds": 3600,
+    "obs_routine_minute_by_station": {"KLAX": 53, "KMDW": 53, "KMIA": 53, "KNYC": 51, "KSFO": 56},
+    "obs_min_coverage_per_station_year": 0.95,
+    "obs_max_pin_minute_excluded_share": 0.02,
+    "lag_arm_max_lost_fraction": {"overall": 0.05, "per_horizon": 0.05, "per_station": 0.10}
   },
   "pin_units": {
     "m0_prime_tolerance_crps_f": "absolute CRPS in degF; M0prime worse than M0 by more than this refuses ACCEPT",
@@ -93,8 +110,10 @@
     "obs_source": "FB-R3/FB-R15, a string label for the obs_so_far path; the builder accepts only iem_routine_metar_tgroup_round_half_up_f (the routine-METAR store, T group quantised through round_half_up_f). The 1-min archive is no longer a source; its raw running max and 5-min arm are descriptive, non-METAR arms only.",
     "obs_cadence_seconds": "FB-R13, integer seconds between routine METAR readings; the builder refuses any value other than 3600 (obs_so_far is the running max of routine hourly METAR values only; interval rows and specials are excluded).",
     "obs_routine_minute_by_station": "FB-R13, object {icao: minute of the hour 0..59} of each station's routine METAR report; FB-R15: a VALIDATION FILTER over the routine-METAR store (rows at another minute are excluded and counted). Derived by multisource_blend_inputs_obs.modal_routine_minute_by_station from routine report timestamps; the coordinator pins it (reported, never auto-applied).",
-    "obs_min_coverage_per_station_year": "number in [0, 1]: the build refuses when any station-year in scope has routine-METAR coverage (routine rows used / expected hourly reports at the pinned minute, from local-standard midnight to each requested day's last anchor) below it, and names the station-years. Null refuses (the coordinator pins it; the builder never assigns it). The report also carries coverage per station-month, the report-minute histogram and pin-minute-excluded share per station-year (to detect an era change) and the mean (final truth Tmax - D0 obs_so_far) per station-year.",
-    "lag_arm_max_lost_fraction": "fraction in [0, 1] (review fix 2): the runner refuses to emit a verdict when the +60 min shift loses more than this share of the primary file's (station, climate day, horizon) keys; the lag arm is compared with the primary on the common keys only (paired difference), so a larger loss would make the sensitivity answer a different question"
+    "obs_min_coverage_per_station_year": "number in [0, 1] (PIN-R4): a station-year in scope whose routine-METAR coverage (routine rows used / expected hourly reports at the pinned minute, from local-standard midnight to each requested day's last anchor) is below it is EXCLUDED from every row (all arms, M0 included) and named in the report and sidecars; the build refuses only if every station-year fails. Null refuses (the builder never assigns it). The report also carries coverage per station-month, the report-minute histogram and pin-minute-excluded share per station-year (to detect an era change) and the mean (final truth Tmax - D0 obs_so_far) per station-year.",
+    "lag_arm_max_lost_fraction": "PIN-R5: object {\"overall\": x, \"per_horizon\": y, \"per_station\": z}, each a fraction in [0, 1]. The runner refuses to emit a verdict when the +60 min shift loses more than overall of the primary file's (station, climate day, horizon) keys, more than per_horizon of any one horizon's keys (D-1 and D0 separately), or more than per_station of any one station's keys. The lag arm is compared with the primary on the common keys only (paired difference), so a larger loss would make the sensitivity answer a different question; the twin's measured loss can only refuse a run, never loosen a cap",
+    "obs_max_pin_minute_excluded_share": "PIN-R4: number in [0, 1]; a station-year whose share of stored routine reports at a minute other than the pinned one is above it is EXCLUDED, like one below obs_min_coverage_per_station_year, from every row of both feature files (all arms, M0 included), listed in the build report and bound into both sidecars by a digest; the build refuses only if every station-year fails. Never chosen while looking at the truth-gap diagnostic",
+    "champion_cdf_method_source": "PIN-R2: where champion_cdf_method was read: the committed champion calibration artefact (path) at that commit; its cdf_method value `normal` is CdfMethod.NORMAL. Provenance only, not a required pin"
   },
   "veto": {
     "label": "descriptive only, carries no verdict (R8, R15)",
@@ -105,7 +124,7 @@
       "fixed_by_code": "theta, slippage floor, h_hours and bound halfwidth are the scripts/analysis/fq_mc_livedata.py LoopConfig defaults, read from the code and never copied",
       "proxy_deviation": "no out-of-fold bootstrap draws exist, so p_lower and p_upper are p_hat -/+ the LoopConfig bound halfwidth"
     },
-    "reference": null,
+    "reference": {"kind": "raw_nbp_cdf", "method": "NORMAL", "spread_prob": 0.02},
     "reference_note": "no tape exists before 2026-08-30, so the pre-07-01 proxy needs a pre-registered reference ask; the coordinator pins its kind and value. Until then blend_veto_descriptive.py refuses to run. Kinds: raw_nbp_cdf = {kind, spread_prob} (the uncalibrated NBP NORMAL rung probability plus spread_prob, YES p + s, NO 1 - p + s); const = {kind, price} is unsuitable (rung-blind), tests and smoke runs only.",
     "tape_start": "2026-08-30",
     "horizon": "D-1 (the FQ family trades D+1)",

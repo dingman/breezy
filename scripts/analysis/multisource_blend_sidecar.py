@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
@@ -27,6 +27,8 @@ __all__ = [
     "check_sidecar",
     "check_sidecar_pair",
     "check_sidecar_row_count",
+    "draft_scratch_digest",
+    "excluded_digest",
     "sha256_file",
 ]
 
@@ -44,6 +46,9 @@ _SHARED_FIELDS: Final[tuple[str, ...]] = (
     "source_lags_ns",
     "obs_routine_minute_by_station",
     "prereg_content_sha256",
+    "source_breaks_observed",
+    "obs_excluded_station_years",
+    "obs_excluded_station_years_sha256",
 )
 _REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "schema",
@@ -51,9 +56,25 @@ _REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "features_sha256",
     "n_rows",
     "lag_shift_ns",
+    "scoring",
     *_SHARED_FIELDS,
 )
 _EXPECTED_SHIFT_NS: Final[Mapping[str, int]] = {"primary": 0, "lag": LAG_SHIFT_NS}
+
+
+def draft_scratch_digest(prereg_digest: str) -> str:
+    """The prereg digest a ``--draft-scratch`` build records (PIN-R8a).
+
+    It can never equal a real prereg digest, so a draft sidecar edited to ``scoring: true`` still
+    fails the digest binding in :func:`check_sidecar`.
+    """
+    return hashlib.sha256(f"{prereg_digest}:scoring=false".encode()).hexdigest()
+
+
+def excluded_digest(station_years: Sequence[str]) -> str:
+    """SHA-256 of the sorted excluded station-year list (PIN-R4), recorded next to the list."""
+    body = json.dumps(sorted(station_years), separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def sha256_file(path: Path, chunk_size: int = HASH_CHUNK_BYTES) -> str:
@@ -109,6 +130,12 @@ def check_sidecar(
             f"{path}: sha256 {actual_sha} does not match the sidecar's {meta['features_sha256']}; "
             "the feature file changed since the builder wrote it"
         )
+    if meta["scoring"] is not True:
+        raise Refusal(
+            f"{sidecar}: scoring is {meta['scoring']!r}: a --draft-scratch build is never scored "
+            "(PIN-R8a); rebuild from the frozen prereg"
+        )
+    _check_excluded_binding(sidecar, meta)
     if meta["prereg_content_sha256"] != prereg_digest:
         raise Refusal(
             f"{sidecar}: built under prereg digest {meta['prereg_content_sha256']}, but this "
@@ -126,6 +153,17 @@ def check_sidecar(
             f"record {expected_shift}"
         )
     return meta
+
+
+def _check_excluded_binding(sidecar: Path, meta: Mapping[str, Any]) -> None:
+    listed = meta["obs_excluded_station_years"]
+    if not isinstance(listed, list) or not all(isinstance(item, str) for item in listed):
+        raise Refusal(f"{sidecar}: obs_excluded_station_years must be a list of station-years")
+    if meta["obs_excluded_station_years_sha256"] != excluded_digest(listed):
+        raise Refusal(
+            f"{sidecar}: obs_excluded_station_years {listed} does not match its recorded "
+            "obs_excluded_station_years_sha256 (PIN-R4)"
+        )
 
 
 def check_sidecar_pair(primary: Mapping[str, Any], lag: Mapping[str, Any]) -> None:

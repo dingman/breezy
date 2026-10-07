@@ -77,7 +77,8 @@ def _pins(**overrides: Any) -> dict[str, Any]:
         "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
         "obs_cadence_seconds": 3600,
         "obs_routine_minute_by_station": {"KNYC": 40},
-        "obs_min_coverage_per_station_year": 0.5,  # a TEST value; the prereg skeleton keeps null
+        "obs_min_coverage_per_station_year": 0.5,  # TEST values, looser than the skeleton's pins
+        "obs_max_pin_minute_excluded_share": 1.0,
     }
     pins.update(overrides)
     return pins
@@ -93,6 +94,8 @@ class _World:
     asos: Path
     truth: Path
     metar: Path
+    #: PIN-R8a: the prereg skeleton is UNFROZEN, so the builder runs only as a scratch draft
+    draft: bool = True
 
     def argv(
         self,
@@ -116,6 +119,7 @@ class _World:
             "--out-features", str(out / "features.jsonl"),
             "--out-lag-features", str(out / "features_lag60.jsonl"),
             "--report-json", str(out / "report.json"),
+            *(["--draft-scratch"] if self.draft else []),
             *extra,
         ]  # fmt: skip
 
@@ -172,6 +176,7 @@ def _build_world(
     pins: dict[str, Any] | None = None,
     routine_extra: Sequence[RoutineRow] = (),
     routine_replace: Mapping[dt.datetime, RoutineRow] | None = None,
+    frozen: bool = False,
 ) -> _World:
     root = tmp_path
     nbp, us, mos, asos = root / "nbp", root / "us", root / "mos", root / "asos"
@@ -231,9 +236,11 @@ def _build_world(
     )
     design = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
     design["pins"] = {**design["pins"], **(pins if pins is not None else _pins())}
+    if frozen:  # the builder only reads the stamp; the runner verifies the blob against git
+        design["frozen_sha"] = "a" * 40
     prereg = root / "prereg.json"
     prereg.write_text(json.dumps(design, indent=2), encoding="utf-8")
-    return _World(root, prereg, nbp, us, mos, asos, truth, metar)
+    return _World(root, prereg, nbp, us, mos, asos, truth, metar, draft=not frozen)
 
 
 @pytest.fixture(autouse=True)
@@ -695,7 +702,7 @@ def test_truth_concordance_counts_the_f2_disagreements(tmp_path: Path) -> None:
 
 
 def test_sidecars_record_the_prereg_digest_the_file_shas_and_the_pins(tmp_path: Path) -> None:
-    world = _build_world(tmp_path)
+    world = _build_world(tmp_path, frozen=True)
     _run(world)
     digest = skill.content_digest(json.loads(world.prereg.read_text(encoding="utf-8")))
 
@@ -714,7 +721,7 @@ def test_sidecars_record_the_prereg_digest_the_file_shas_and_the_pins(tmp_path: 
 def test_the_runners_check_accepts_the_builders_sidecars_and_refuses_a_tampered_file(
     tmp_path: Path,
 ) -> None:
-    world = _build_world(tmp_path)
+    world = _build_world(tmp_path, frozen=True)
     _run(world)
     design = json.loads(world.prereg.read_text(encoding="utf-8"))
     features = world.out() / "features.jsonl"

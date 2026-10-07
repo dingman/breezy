@@ -63,16 +63,15 @@ class _VetoScenario(_Scenario):
 # ------------------------------------------------------------------ embargo pin + reporting
 
 
-def test_embargo_days_is_a_required_null_pin_in_the_draft_prereg() -> None:
+def test_embargo_days_is_a_required_pin_filled_in_the_draft_prereg() -> None:
     assert "embargo_days" in skill.REQUIRED_PINS
     draft = json.loads(
         (
             REPO_ROOT / "docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13_prereg_blend_v1.json"
         ).read_text(encoding="utf-8")
     )
-    assert "embargo_days" in draft["pins"] and draft["pins"]["embargo_days"] is None
+    assert draft["pins"]["embargo_days"] == 3  # PIN-R2: fixed literal in the skeleton
     assert "embargo_days" in draft["pin_units"]
-    assert all(value is None for value in draft["pins"].values())  # the coordinator pins them
 
 
 def test_runner_refuses_a_null_embargo_pin(tmp_path: Path) -> None:

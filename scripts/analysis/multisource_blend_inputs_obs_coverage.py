@@ -1,8 +1,11 @@
 """F13 Phase A feature build: routine-METAR coverage, drift and staleness diagnostics.
 
-Pure helpers (no store reads) for the ``obs_so_far`` source. The build REFUSES a station-year whose
-coverage (routine rows used / expected hourly reports in the requested window) is below the
-prereg pin ``obs_min_coverage_per_station_year``; everything else here is descriptive.
+Pure helpers (no store reads) for the ``obs_so_far`` source. A station-year FAILS (PIN-R4) when its
+coverage (routine rows used / expected hourly reports in the requested window) is below the prereg
+pin ``obs_min_coverage_per_station_year`` OR its pin-minute-excluded share is above
+``obs_max_pin_minute_excluded_share``. A failing station-year is excluded from every row of both
+feature files (every arm, M0 included) and listed in the report and the sidecars; the build refuses
+only when every station-year fails. Everything else here is descriptive.
 
 * ``expected`` counts, per requested climate day, the hourly report instants at the pinned routine
   minute from local-standard-time midnight up to the day's last anchor (the same window the
@@ -26,15 +29,19 @@ from typing import Any, Final
 
 __all__ = [
     "COVERAGE_PIN",
+    "SHARE_PIN",
     "ObsDiagnostics",
     "YearCoverage",
     "check_coverage_pin",
+    "check_share_pin",
     "coverage_report",
     "expected_report_count",
+    "failure_reasons",
     "staleness_report",
 ]
 
 COVERAGE_PIN: Final[str] = "obs_min_coverage_per_station_year"
+SHARE_PIN: Final[str] = "obs_max_pin_minute_excluded_share"
 _NS: Final[int] = 1_000_000_000
 _HOURS_PER_DAY: Final[int] = 24
 _SECONDS_PER_HOUR: Final[int] = 3600
@@ -98,6 +105,24 @@ def check_coverage_pin(pin: object) -> float:
     return float(pin)
 
 
+def check_share_pin(pin: object) -> float:
+    """The max-share pin as a fraction in [0, 1]; anything else (incl. null) is ``ValueError``."""
+    if isinstance(pin, bool) or not isinstance(pin, int | float) or not 0.0 <= pin <= 1.0:
+        raise ValueError(f"pins.{SHARE_PIN} must be a number in [0, 1], was {pin!r}")
+    return float(pin)
+
+
+def failure_reasons(year: YearCoverage, min_coverage: float, max_share: float) -> list[str]:
+    """Why a station-year fails PIN-R4 (empty = it passes); both inequalities are strict."""
+    reasons: list[str] = []
+    if year.coverage is not None and year.coverage < min_coverage:
+        reasons.append(f"coverage {year.coverage:.4f} < pins.{COVERAGE_PIN} {min_coverage}")
+    share = year.pin_minute_excluded_share
+    if share is not None and share > max_share:
+        reasons.append(f"pin-minute-excluded share {share:.4f} > pins.{SHARE_PIN} {max_share}")
+    return reasons
+
+
 def _quantile(sorted_values: Sequence[float], q: float) -> float:
     """Nearest-rank quantile of a non-empty ascending sequence."""
     return sorted_values[max(0, math.ceil(q * len(sorted_values)) - 1)]
@@ -115,6 +140,29 @@ class ObsDiagnostics:
     d0_gap: dict[tuple[str, int], list[float]] = field(default_factory=dict)
     d0_staleness_minutes: dict[str, list[float]] = field(default_factory=dict)
     d0_no_report: Counter[str] = field(default_factory=Counter)
+    #: station-year -> why it fails PIN-R4 (excluded from every row of both feature files)
+    excluded: dict[tuple[str, int], list[str]] = field(default_factory=dict)
+
+    def judge_year(self, icao: str, year: int, min_coverage: float, max_share: float) -> bool:
+        """Record and return whether the station-year (already in ``coverage``) is excluded."""
+        reasons = failure_reasons(self.coverage[(icao, year)], min_coverage, max_share)
+        if reasons:
+            self.excluded[(icao, year)] = reasons
+        return bool(reasons)
+
+    @property
+    def excluded_keys(self) -> list[str]:
+        return [_key(station, year) for station, year in sorted(self.excluded)]
+
+    def all_failed_message(self, min_coverage: float, max_share: float) -> str | None:
+        """The refusal text when EVERY station-year fails (PIN-R4), else ``None``."""
+        if not self.coverage or len(self.excluded) != len(self.coverage):
+            return None
+        return (
+            f"every station-year fails the pins.{COVERAGE_PIN} {min_coverage} / "
+            f"pins.{SHARE_PIN} {max_share} guard, so nothing is left to build: "
+            f"{self.excluded_keys}"
+        )
 
     def record_d0(
         self,
@@ -138,18 +186,17 @@ class ObsDiagnostics:
             (anchor_ns - max(usable)) / _NS_PER_MINUTE
         )
 
-    def coverage_report(self, minimum: float | None) -> dict[str, Any]:
-        return coverage_report(self.coverage, self.d0_gap, minimum)
+    def coverage_report(self, minimum: float | None, max_share: float | None) -> dict[str, Any]:
+        report = coverage_report(self.coverage, self.d0_gap, minimum)
+        report["max_pin_minute_excluded_share_pin"] = max_share
+        report["excluded_station_years"] = [
+            {"station_year": _key(station, year), "reasons": reasons}
+            for (station, year), reasons in sorted(self.excluded.items())
+        ]
+        return report
 
     def staleness_report(self) -> dict[str, Any]:
         return staleness_report(self.d0_staleness_minutes, self.d0_no_report)
-
-    def below_pin_message(self, minimum: float) -> str | None:
-        """The refusal text naming every station-year below the pin, or ``None``."""
-        below = _below_pin(self.coverage, minimum)
-        if not below:
-            return None
-        return f"routine-METAR coverage is below pins.{COVERAGE_PIN} {minimum}: {below}"
 
 
 def _below_pin(coverage: Mapping[tuple[str, int], YearCoverage], minimum: float) -> list[str]:

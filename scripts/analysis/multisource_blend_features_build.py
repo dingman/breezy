@@ -26,6 +26,16 @@ The twin (FB-R2) shifts EVERY source lag by 60 min, NBP included; the CLI label 
 A row whose NBP window or station-day is shifted out is simply absent from the twin and reported as
 lost per horizon. ``obs_available_at_ns`` is shifted in the twin.
 
+Coverage guard (PIN-R4): a station-year whose routine-METAR coverage is below
+``obs_min_coverage_per_station_year`` or whose pin-minute-excluded share is above
+``obs_max_pin_minute_excluded_share`` is EXCLUDED from every row of both files (every arm, M0
+included), listed in the report and in the sidecars (bound by a digest); the build refuses only if
+every station-year fails.
+
+Freeze guard (PIN-R8a): an UNFROZEN prereg builds only with ``--draft-scratch``. That mode stamps
+``scoring: false`` into the sidecars and binds it into the recorded prereg digest
+(``draft_scratch_digest``); the runner refuses such output.
+
 Exit codes: 0 complete; 1 degraded (a payload was unreadable; outputs written); 2 refused, leak or
 an unexpected error (only the report is written; its ``status`` is ``refused`` or ``error``). The
 two feature files and their sidecars are written as one set (temp files, then renames). Holdout
@@ -38,7 +48,6 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import os
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -81,6 +90,7 @@ from scripts.analysis.multisource_blend_inputs_forecast import (
     collect_pfm_vintages,
     select_nbp,
 )
+from scripts.analysis.multisource_blend_inputs_io import write_set
 from scripts.analysis.multisource_blend_inputs_lamp import LampArchive
 from scripts.analysis.multisource_blend_inputs_obs_coverage import ObsDiagnostics
 from scripts.analysis.multisource_blend_inputs_pins import (
@@ -105,9 +115,11 @@ from scripts.analysis.multisource_blend_sidecar import (
     PRIMARY_VARIANT,
     SIDECAR_SCHEMA,
     SIDECAR_SUFFIX,
+    draft_scratch_digest,
+    excluded_digest,
     sha256_file,
 )
-from scripts.analysis.multisource_blend_skill import content_digest
+from scripts.analysis.multisource_blend_skill import UNFROZEN, content_digest
 from scripts.archive.iem_mos_backfill import ModelMixError
 
 __all__ = [
@@ -129,6 +141,7 @@ __all__ = [
 EXIT_OK: Final[int] = 0
 EXIT_DEGRADED: Final[int] = 1
 EXIT_REFUSED: Final[int] = 2
+_write_set = write_set  # the historical private name; the implementation moved to ..._inputs_io
 DEFAULT_MAX_MEMORY_GIB: Final[float] = 4.0
 LIVE_DATA_ROOT: Final[Path] = Path.home() / ".local" / "share" / "breezy"
 #: The routine-METAR store root (equal to ``metar_routine_store.DEFAULT_ARCHIVE_ROOT``, pinned by a
@@ -192,6 +205,7 @@ class Config:
     report: Path
     variant: str
     f2_truth: Path | None
+    draft_scratch: bool = False
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -215,59 +229,6 @@ def _guard_outputs(cfg: Config) -> None:
         for target in (path, Path(str(path) + SIDECAR_SUFFIX)):
             if target.exists():
                 raise BuildRefusal(f"{target} already exists; outputs are write-once")
-
-
-def _tmp_name(path: Path) -> Path:
-    return path.with_name(path.name + ".tmp")
-
-
-def _stage(path: Path, data: bytes) -> Path:
-    """Write ``data`` to ``<path>.tmp`` (a stale one from an interrupted run is replaced)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _tmp_name(path)
-    tmp.unlink(missing_ok=True)
-    with tmp.open("xb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return tmp
-
-
-def _publish(staged: Sequence[tuple[Path, Path]]) -> None:
-    """Hard-link each temp file to its target: an existing target is never replaced (O_EXCL-like).
-
-    ``os.link`` fails with ``FileExistsError`` when the target appeared after ``_guard_outputs``;
-    that is a refusal, and every target this call already published is removed again.
-    """
-    published: list[Path] = []
-    try:
-        for tmp, path in staged:
-            try:
-                os.link(tmp, path)
-            except FileExistsError as exc:
-                raise BuildRefusal(f"{path} already exists; outputs are write-once") from exc
-            published.append(path)
-    except BaseException:
-        for path in published:  # only the links this call created
-            path.unlink(missing_ok=True)
-        raise
-    for tmp, _path in staged:
-        tmp.unlink(missing_ok=True)
-
-
-def _write_set(items: Sequence[tuple[Path, bytes]]) -> None:
-    """Write every file to a temp name, then rename the set; a failure leaves none of them."""
-    staged: list[tuple[Path, Path]] = []
-    try:
-        for path, data in items:
-            tmp = _tmp_name(path)
-            staged.append((tmp, path))  # registered first so a partial write is cleaned too
-            _stage(path, data)
-        _publish(staged)
-    except BaseException:
-        for tmp, _path in staged:
-            tmp.unlink(missing_ok=True)
-        raise
 
 
 def _sha256(path: Path) -> str:
@@ -500,6 +461,13 @@ def _build_year(
     ctx.tally.counts.update(obs_year.counts)
     ctx.tally.obs_by_station.setdefault(station.icao, Counter()).update(obs_year.counts)
     ctx.tally.obs_diag.coverage[(station.icao, year)] = obs_year.coverage
+    if ctx.tally.obs_diag.judge_year(
+        station.icao,
+        year,
+        pins.obs_min_coverage_per_station_year,
+        pins.obs_max_pin_minute_excluded_share,
+    ):
+        return  # PIN-R4: no row of this station-year is emitted in any arm
     arms = _read_arms(ctx, station, year, cutoffs)
     bases = rows.lamp_bases[station.icao]
     for day in year_days:
@@ -582,10 +550,12 @@ def _sidecar(
     cfg: Config,
     rows: int,
     breaks: Mapping[str, Any],
+    excluded: Sequence[str],
 ) -> bytes:
     body = {
         "schema": SIDECAR_SCHEMA,
         "role": role,
+        "scoring": not cfg.draft_scratch,
         "prereg_content_sha256": digest,
         "features_sha256": hashlib.sha256(data).hexdigest(),
         "n_rows": rows,
@@ -597,6 +567,8 @@ def _sidecar(
         "obs_routine_minute_by_station": dict(pins.obs_routine_minute_by_station),
         "metar_routine_manifest_sha256": _sha256(_metar_manifest(cfg)),
         "source_breaks_observed": breaks,
+        "obs_excluded_station_years": list(excluded),
+        "obs_excluded_station_years_sha256": excluded_digest(excluded),
         "lag_shift_ns": LAG_SHIFT_NS if role == "lag" else 0,
         "obs_available_at_ns_shifted": role == "lag",
     }
@@ -646,6 +618,7 @@ def _write_outputs(
     digest: str,
     rows: _Rows,
     breaks: Mapping[str, Any],
+    excluded: Sequence[str],
     report: dict[str, Any],
 ) -> None:
     items: list[tuple[Path, bytes]] = []
@@ -654,11 +627,11 @@ def _write_outputs(
         ("lag", rows.lag, cfg.out_lag),
     ):
         data = _lines(role_rows)
-        side = _sidecar(role, data, digest, pins, cfg, len(role_rows), breaks)
+        side = _sidecar(role, data, digest, pins, cfg, len(role_rows), breaks, excluded)
         items += [(Path(str(path) + SIDECAR_SUFFIX), side), (path, data)]
         report.setdefault("output_sha256", {})[role] = hashlib.sha256(data).hexdigest()
         report.setdefault("n_rows", {})[role] = len(role_rows)
-    _write_set(items)
+    write_set(items)
 
 
 def _validated_registry(cfg: Config) -> nss.StationRegistry:
@@ -667,6 +640,30 @@ def _validated_registry(cfg: Config) -> nss.StationRegistry:
     if unknown:
         raise BuildRefusal(f"stations {unknown} are not in the registry")
     return registry
+
+
+def _read_prereg(cfg: Config, report: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """The prereg and the digest the sidecars record; an UNFROZEN prereg needs ``--draft-scratch``.
+
+    A draft build records ``draft_scratch_digest`` (PIN-R8a), so its sidecars can never match a real
+    run's prereg digest even if their ``scoring`` stamp were edited.
+    """
+    design = json.loads(cfg.prereg.read_text(encoding="utf-8"))
+    if design.get("frozen_sha") == UNFROZEN and not cfg.draft_scratch:
+        raise BuildRefusal(
+            "the prereg is UNFROZEN: a build under it can only be a non-scoring draft; rerun with "
+            "--draft-scratch (PIN-R8a)"
+        )
+    content = content_digest(design)
+    digest = draft_scratch_digest(content) if cfg.draft_scratch else content
+    report.update(
+        prereg_content_sha256=content,
+        sidecar_prereg_digest=digest,
+        scoring=not cfg.draft_scratch,
+        anchor_variant=cfg.variant,
+        inputs_sha256=_inputs_sha(cfg),
+    )
+    return design, digest
 
 
 def run_build(cfg: Config, report: dict[str, Any]) -> int:
@@ -678,11 +675,7 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
     if cfg.start > cfg.end:
         raise BuildRefusal("--start is after --end")
     _guard_outputs(cfg)
-    design = json.loads(cfg.prereg.read_text(encoding="utf-8"))
-    digest = content_digest(design)
-    report.update(
-        prereg_content_sha256=digest, anchor_variant=cfg.variant, inputs_sha256=_inputs_sha(cfg)
-    )
+    design, digest = _read_prereg(cfg, report)
     pins = load_pins(design)
     report["source_lags"] = source_lags(pins)
     registry = _validated_registry(cfg)
@@ -691,9 +684,9 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
     _check_rows(rows.primary, rows.lag)
     breaks = {**lamp_breaks(rows.lamp_bases), "nbp_versions": nbp_version_breaks(rows.primary)}
     counts, tally = ctx.tally.counts, ctx.tally
-    pin = pins.obs_min_coverage_per_station_year
-    report["obs_coverage"] = tally.obs_diag.coverage_report(pin)
-    if refusal := tally.obs_diag.below_pin_message(pin):
+    pin, share_pin = pins.obs_min_coverage_per_station_year, pins.obs_max_pin_minute_excluded_share
+    report["obs_coverage"] = tally.obs_diag.coverage_report(pin, share_pin)
+    if refusal := tally.obs_diag.all_failed_message(pin, share_pin):
         raise BuildRefusal(refusal)
     report.update(
         counts=dict(counts),
@@ -712,7 +705,7 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
         pfm_iem_entered_time="unavailable_in_archive",
         mos_model=MOS_MODEL,
     )
-    _write_outputs(cfg, pins, digest, rows, breaks, report)
+    _write_outputs(cfg, pins, digest, rows, breaks, tally.obs_diag.excluded_keys, report)
     degraded = [k for k in DEGRADING_COUNTS if counts.get(k)]
     report["degraded_reasons"] = degraded
     return EXIT_DEGRADED if degraded else EXIT_OK
@@ -738,6 +731,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--report-json", type=Path, required=True)
     parser.add_argument("--anchor-variant", choices=ANCHOR_VARIANTS, default=PRIMARY_VARIANT)
     parser.add_argument("--f2-truth", type=Path, default=None)
+    parser.add_argument(
+        "--draft-scratch",
+        action="store_true",
+        help="build under an UNFROZEN prereg as a non-scoring engineering smoke test (PIN-R8a)",
+    )
     parser.add_argument("--max-memory-gib", type=float, default=DEFAULT_MAX_MEMORY_GIB)
     return parser.parse_args(sys.argv[1:] if argv is None else list(argv))
 
@@ -759,6 +757,7 @@ def _config(args: argparse.Namespace) -> Config:
         report=args.report_json,
         variant=args.anchor_variant,
         f2_truth=args.f2_truth,
+        draft_scratch=args.draft_scratch,
     )
 
 
@@ -790,7 +789,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, Any] = {"status": "refused", "exit_code": EXIT_REFUSED, "reason": None}
     code = _run_reporting(cfg, report)
     body = json.dumps(report, indent=2, sort_keys=True, default=str) + "\n"
-    _write_set([(cfg.report, body.encode("utf-8"))])
+    write_set([(cfg.report, body.encode("utf-8"))])
     return code
 
 

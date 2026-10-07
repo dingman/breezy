@@ -25,6 +25,7 @@ from breezy.analysis import multisource_blend as msb
 from breezy.strategy.ladder_ev.quantile_density import Percentiles, Rung
 from scripts.analysis import blend_veto_descriptive as veto
 from scripts.analysis import multisource_blend_skill as skill
+from scripts.analysis.multisource_blend_sidecar import excluded_digest
 from tests.unit.test_multisource_blend import make_rows, two_version_rows
 
 _PREREG_SRC = (
@@ -41,8 +42,24 @@ _SIDECAR_ANCHORS: dict[str, Any] = {
     "D0_sensitivity": {"kind": "lst", "hour": 12},
     "offset_rule": "fixed_standard_time_never_dst",
 }
+_MIN_NS = 60 * 1_000_000_000
+#: valid pinned lags (each at or above its R29 floor); C1 samples below stay under them
+_PINNED_LAGS: dict[str, int] = {
+    "lamp-mdl": 60 * _MIN_NS,
+    "lav-iem": 90 * _MIN_NS,
+    "pfm": 60 * _MIN_NS,
+    "mos-gfs": 300 * _MIN_NS,
+    "obs": 15 * _MIN_NS,
+}
+_LAG_CAPS: dict[str, float] = {"overall": 0.5, "per_horizon": 0.5, "per_station": 0.5}
 _PINS: dict[str, Any] = {
     "anchors": _SIDECAR_ANCHORS,
+    "source_lags_ns": _PINNED_LAGS,
+    "obs_source": "iem_routine_metar_tgroup_round_half_up_f",
+    "obs_cadence_seconds": 3600,
+    "obs_routine_minute_by_station": {"NYC": 40},
+    "obs_min_coverage_per_station_year": 0.95,
+    "obs_max_pin_minute_excluded_share": 0.02,
     "floor_multiple": 0.5,
     "m0_prime_tolerance_crps_f": 0.2,
     "station_tolerance_crps_f": 0.2,
@@ -59,7 +76,7 @@ _PINS: dict[str, Any] = {
     "rung_edges_f": [50, 55, 60, 65, 70, 75],
     "min_uncensored_lag_samples": 5,
     "embargo_days": 2,
-    "lag_arm_max_lost_fraction": 0.5,
+    "lag_arm_max_lost_fraction": _LAG_CAPS,
 }
 
 
@@ -118,7 +135,12 @@ def _write_features(path: Path, rows: list[msb.FeatureRow]) -> Path:
 
 
 _DERIVED_SIDECAR_KEYS = ("schema", "role", "prereg_content_sha256", "features_sha256", "n_rows")
-_SIDECAR_LAGS: dict[str, int] = {"lamp-mdl": 1, "lav-iem": 2, "pfm": 3, "mos-gfs": 4, "obs": 5}
+_SIDECAR_LAGS: dict[str, int] = _PINNED_LAGS
+_NO_BREAKS: dict[str, Any] = {
+    "lamp": [],
+    "lamp_by_horizon": {"D0": [], "D-1": []},
+    "nbp_versions": [],
+}
 _LAG_SHIFT_NS = 3_600_000_000_000
 
 
@@ -141,6 +163,10 @@ def write_sidecar(
         "anchors": _SIDECAR_ANCHORS,
         "source_lags_ns": _SIDECAR_LAGS,
         "obs_routine_minute_by_station": {"NYC": 40},
+        "source_breaks_observed": _NO_BREAKS,
+        "obs_excluded_station_years": [],
+        "obs_excluded_station_years_sha256": excluded_digest([]),
+        "scoring": True,
         "lag_shift_ns": _LAG_SHIFT_NS if role == "lag" else 0,
     }
     body.update(overrides)
@@ -149,6 +175,12 @@ def write_sidecar(
 
 
 DROP: Any = object()
+
+
+def c1_lag_samples(**overrides: list[int]) -> dict[str, list[int]]:
+    """C1 uncensored lag samples per pinned source: 100 values, all at half the pinned lag."""
+    samples = {key: [lag // 2] * 100 for key, lag in _PINNED_LAGS.items()}
+    return {**samples, **overrides}
 
 
 class _Scenario:
@@ -166,6 +198,7 @@ class _Scenario:
                 {
                     "measured_days": {"lamp": 20, "pfm": 20, "mos": 20},
                     "uncensored": {"lamp": 30, "pfm": 30, "mos": 30},
+                    "lag_samples_ns": c1_lag_samples(),
                 }
             ),
             encoding="utf-8",
@@ -195,12 +228,12 @@ class _Scenario:
 # ------------------------------------------------------------------ prereg skeleton
 
 
-def test_prereg_skeleton_is_an_unfrozen_draft_with_null_pins() -> None:
+def test_prereg_skeleton_is_an_unfrozen_draft_with_the_fixed_pins_filled() -> None:
     draft = json.loads(_PREREG_SRC.read_text(encoding="utf-8"))
     assert draft["frozen_sha"] == "UNFROZEN"
     pins = draft["pins"]
-    for key in ("floor_multiple", "m0_prime_tolerance_crps_f", "station_tolerance_crps_f"):
-        assert key in pins and pins[key] is None
+    assert (pins["floor_multiple"], pins["m0_prime_tolerance_crps_f"]) == (0.25, 0.03)
+    assert pins["station_tolerance_crps_f"] == 0.05
     assert "coordinator pins before any M1" in draft["pin_note"]
     assert set(skill.REQUIRED_PINS) <= set(pins)
     assert draft["fixed_by_plan"]["holdout_start"] == "2026-07-01"
@@ -255,13 +288,18 @@ def test_prereg_sha_is_recorded_before_scoring_and_run_refuses_if_changed(
         scenario.run()
     assert calls == []
 
-    # 4. a re-frozen prereg with a different sha cannot reuse the recorded run directory
+    # 4. a re-frozen prereg (PIN-R8b) is refused outright, before any scoring
     _git(scenario.repo, "checkout", "-q", "--", "prereg.json")
     edited_design = _design(floor_multiple=0.01)
     scenario.prereg = _freeze(scenario.repo, edited_design)
-    with pytest.raises(skill.Refusal, match="changed since"):
+    with pytest.raises(skill.Refusal, match="re-frozen"):
         scenario.run()
     assert calls == []
+
+    # 5. a recorded run directory refuses a different prereg digest
+    other = {**json.loads(scenario.prereg.read_text(encoding="utf-8")), "frozen_sha": "b" * 40}
+    with pytest.raises(skill.Refusal, match="changed since"):
+        skill.record_prereg(scenario.out, other)
 
 
 def test_runner_refuses_null_pins_even_when_frozen(tmp_path: Path) -> None:
@@ -524,7 +562,9 @@ def test_veto_main_refuses_unfrozen_prereg_and_unpinned_reference(
     rows = tmp_path / "oof_rows.jsonl"
     rows.write_text("", encoding="utf-8")
     scenario_repo = tmp_path / "repo"
-    frozen = _freeze(scenario_repo, _design())
+    unpinned = _design()
+    unpinned["veto"] = {**unpinned["veto"], "reference": None}  # the skeleton now pins it (PIN-R2)
+    frozen = _freeze(scenario_repo, unpinned)
     draft = scenario_repo / "draft.json"
     draft.write_text(json.dumps({**_design(), "frozen_sha": "UNFROZEN"}), encoding="utf-8")
     base = ["--oof-rows", str(rows), "--out", str(tmp_path / "veto.json")]
