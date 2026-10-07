@@ -1,0 +1,733 @@
+{
+  "exit_code": 0,
+  "generated_at": "2026-10-07T03:18:37.090040+00:00",
+  "holdout_start": "2026-07-01",
+  "mode": "apply",
+  "pin_share_threshold": 0.95,
+  "plan": [
+    {
+      "month": 3,
+      "station": "KLAX",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=LAX&data=tmpf&data=metar&year1=2021&month1=3&day1=1&year2=2021&month2=4&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2021
+    },
+    {
+      "month": 6,
+      "station": "KLAX",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=LAX&data=tmpf&data=metar&year1=2022&month1=6&day1=1&year2=2022&month2=7&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2022
+    },
+    {
+      "month": 9,
+      "station": "KLAX",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=LAX&data=tmpf&data=metar&year1=2023&month1=9&day1=1&year2=2023&month2=10&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2023
+    },
+    {
+      "month": 12,
+      "station": "KLAX",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=LAX&data=tmpf&data=metar&year1=2024&month1=12&day1=1&year2=2025&month2=1&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2024
+    },
+    {
+      "month": 4,
+      "station": "KLAX",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=LAX&data=tmpf&data=metar&year1=2025&month1=4&day1=1&year2=2025&month2=5&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2025
+    },
+    {
+      "month": 5,
+      "station": "KLAX",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=LAX&data=tmpf&data=metar&year1=2026&month1=5&day1=1&year2=2026&month2=6&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2026
+    },
+    {
+      "month": 3,
+      "station": "KMDW",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MDW&data=tmpf&data=metar&year1=2021&month1=3&day1=1&year2=2021&month2=4&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2021
+    },
+    {
+      "month": 6,
+      "station": "KMDW",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MDW&data=tmpf&data=metar&year1=2022&month1=6&day1=1&year2=2022&month2=7&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2022
+    },
+    {
+      "month": 9,
+      "station": "KMDW",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MDW&data=tmpf&data=metar&year1=2023&month1=9&day1=1&year2=2023&month2=10&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2023
+    },
+    {
+      "month": 12,
+      "station": "KMDW",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MDW&data=tmpf&data=metar&year1=2024&month1=12&day1=1&year2=2025&month2=1&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2024
+    },
+    {
+      "month": 4,
+      "station": "KMDW",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MDW&data=tmpf&data=metar&year1=2025&month1=4&day1=1&year2=2025&month2=5&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2025
+    },
+    {
+      "month": 5,
+      "station": "KMDW",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MDW&data=tmpf&data=metar&year1=2026&month1=5&day1=1&year2=2026&month2=6&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2026
+    },
+    {
+      "month": 3,
+      "station": "KMIA",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MIA&data=tmpf&data=metar&year1=2021&month1=3&day1=1&year2=2021&month2=4&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2021
+    },
+    {
+      "month": 6,
+      "station": "KMIA",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MIA&data=tmpf&data=metar&year1=2022&month1=6&day1=1&year2=2022&month2=7&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2022
+    },
+    {
+      "month": 9,
+      "station": "KMIA",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MIA&data=tmpf&data=metar&year1=2023&month1=9&day1=1&year2=2023&month2=10&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2023
+    },
+    {
+      "month": 12,
+      "station": "KMIA",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MIA&data=tmpf&data=metar&year1=2024&month1=12&day1=1&year2=2025&month2=1&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2024
+    },
+    {
+      "month": 4,
+      "station": "KMIA",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MIA&data=tmpf&data=metar&year1=2025&month1=4&day1=1&year2=2025&month2=5&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2025
+    },
+    {
+      "month": 5,
+      "station": "KMIA",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=MIA&data=tmpf&data=metar&year1=2026&month1=5&day1=1&year2=2026&month2=6&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2026
+    },
+    {
+      "month": 3,
+      "station": "KNYC",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=NYC&data=tmpf&data=metar&year1=2021&month1=3&day1=1&year2=2021&month2=4&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2021
+    },
+    {
+      "month": 6,
+      "station": "KNYC",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=NYC&data=tmpf&data=metar&year1=2022&month1=6&day1=1&year2=2022&month2=7&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2022
+    },
+    {
+      "month": 9,
+      "station": "KNYC",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=NYC&data=tmpf&data=metar&year1=2023&month1=9&day1=1&year2=2023&month2=10&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2023
+    },
+    {
+      "month": 12,
+      "station": "KNYC",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=NYC&data=tmpf&data=metar&year1=2024&month1=12&day1=1&year2=2025&month2=1&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2024
+    },
+    {
+      "month": 4,
+      "station": "KNYC",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=NYC&data=tmpf&data=metar&year1=2025&month1=4&day1=1&year2=2025&month2=5&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2025
+    },
+    {
+      "month": 5,
+      "station": "KNYC",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=NYC&data=tmpf&data=metar&year1=2026&month1=5&day1=1&year2=2026&month2=6&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2026
+    },
+    {
+      "month": 3,
+      "station": "KSFO",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=SFO&data=tmpf&data=metar&year1=2021&month1=3&day1=1&year2=2021&month2=4&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2021
+    },
+    {
+      "month": 6,
+      "station": "KSFO",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=SFO&data=tmpf&data=metar&year1=2022&month1=6&day1=1&year2=2022&month2=7&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2022
+    },
+    {
+      "month": 9,
+      "station": "KSFO",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=SFO&data=tmpf&data=metar&year1=2023&month1=9&day1=1&year2=2023&month2=10&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2023
+    },
+    {
+      "month": 12,
+      "station": "KSFO",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=SFO&data=tmpf&data=metar&year1=2024&month1=12&day1=1&year2=2025&month2=1&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2024
+    },
+    {
+      "month": 4,
+      "station": "KSFO",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=SFO&data=tmpf&data=metar&year1=2025&month1=4&day1=1&year2=2025&month2=5&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2025
+    },
+    {
+      "month": 5,
+      "station": "KSFO",
+      "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=SFO&data=tmpf&data=metar&year1=2026&month1=5&day1=1&year2=2026&month2=6&day2=1&tz=Etc%2FUTC&format=onlycomma&latlon=no&missing=M&trace=T&direct=no&report_type=3",
+      "year": 2026
+    }
+  ],
+  "planned_requests": 30,
+  "proposals": {
+    "obs_routine_minute_by_station": {
+      "KLAX": 53,
+      "KMDW": 53,
+      "KMIA": 53,
+      "KNYC": 51,
+      "KSFO": 56
+    },
+    "obs_routine_minute_by_station_year": {},
+    "unresolved": {}
+  },
+  "proposals_only": "nothing is written to the prereg; the coordinator pins",
+  "report_type": "3",
+  "request_budget": 60,
+  "schema": "metar_routine_minute_probe/v1",
+  "stations": {
+    "KLAX": {
+      "equivalence": {
+        "months_missing_in_onemin_archive": [
+          "2026-05"
+        ],
+        "n_metar_rows": 4390,
+        "n_no_tgroup": 1,
+        "n_tgroup_without_onemin_row": 1025,
+        "onemin_vs_metar_tgroup": {
+          "diff_histogram": {
+            "-1": 264,
+            "-2": 4,
+            "0": 2063,
+            "1": 280,
+            "2": 9
+          },
+          "max_abs_diff": 2,
+          "mean_signed_bias": 0.009923664122137405,
+          "mismatch_rate": 0.21259541984732824,
+          "n_compared": 2620
+        },
+        "tmpf_column_vs_tgroup": {
+          "diff_histogram": {
+            "0": 4388
+          },
+          "max_abs_diff": 0,
+          "mean_signed_bias": 0.0,
+          "mismatch_rate": 0.0,
+          "n_compared": 4388
+        }
+      },
+      "pin_minute": 53,
+      "verdict": "PIN_STATION",
+      "years": {
+        "2021": {
+          "minute_histogram": {
+            "53": 743
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 3,
+          "n_reports": 743,
+          "status": "ok"
+        },
+        "2022": {
+          "minute_histogram": {
+            "53": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 6,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2023": {
+          "minute_histogram": {
+            "53": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 9,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2024": {
+          "minute_histogram": {
+            "53": 743
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 12,
+          "n_reports": 743,
+          "status": "ok"
+        },
+        "2025": {
+          "minute_histogram": {
+            "53": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 4,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2026": {
+          "minute_histogram": {
+            "20": 2,
+            "53": 742
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 0.9973118279569892,
+          "month": 5,
+          "n_reports": 744,
+          "status": "ok"
+        }
+      }
+    },
+    "KMDW": {
+      "equivalence": {
+        "months_missing_in_onemin_archive": [
+          "2026-05"
+        ],
+        "n_metar_rows": 4390,
+        "n_no_tgroup": 0,
+        "n_tgroup_without_onemin_row": 1076,
+        "onemin_vs_metar_tgroup": {
+          "diff_histogram": {
+            "-1": 211,
+            "-2": 4,
+            "-3": 1,
+            "0": 2117,
+            "1": 233,
+            "2": 5,
+            "4": 1
+          },
+          "max_abs_diff": 4,
+          "mean_signed_bias": 0.009720062208398134,
+          "mismatch_rate": 0.17690513219284604,
+          "n_compared": 2572
+        },
+        "tmpf_column_vs_tgroup": {
+          "diff_histogram": {
+            "0": 4390
+          },
+          "max_abs_diff": 0,
+          "mean_signed_bias": 0.0,
+          "mismatch_rate": 0.0,
+          "n_compared": 4390
+        }
+      },
+      "pin_minute": 53,
+      "verdict": "PIN_STATION",
+      "years": {
+        "2021": {
+          "minute_histogram": {
+            "53": 744
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 3,
+          "n_reports": 744,
+          "status": "ok"
+        },
+        "2022": {
+          "minute_histogram": {
+            "53": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 6,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2023": {
+          "minute_histogram": {
+            "53": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 9,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2024": {
+          "minute_histogram": {
+            "53": 744
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 12,
+          "n_reports": 744,
+          "status": "ok"
+        },
+        "2025": {
+          "minute_histogram": {
+            "53": 719,
+            "59": 1
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 0.9986111111111111,
+          "month": 4,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2026": {
+          "minute_histogram": {
+            "53": 742
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 5,
+          "n_reports": 742,
+          "status": "ok"
+        }
+      }
+    },
+    "KMIA": {
+      "equivalence": {
+        "months_missing_in_onemin_archive": [
+          "2026-05"
+        ],
+        "n_metar_rows": 4387,
+        "n_no_tgroup": 2,
+        "n_tgroup_without_onemin_row": 209,
+        "onemin_vs_metar_tgroup": {
+          "diff_histogram": {
+            "-1": 357,
+            "-2": 10,
+            "-3": 1,
+            "-5": 1,
+            "0": 2699,
+            "1": 351,
+            "2": 13,
+            "3": 3,
+            "6": 1
+          },
+          "max_abs_diff": 6,
+          "mean_signed_bias": 0.002037252619324796,
+          "mismatch_rate": 0.21449359720605354,
+          "n_compared": 3436
+        },
+        "tmpf_column_vs_tgroup": {
+          "diff_histogram": {
+            "0": 4384
+          },
+          "max_abs_diff": 0,
+          "mean_signed_bias": 0.0,
+          "mismatch_rate": 0.0,
+          "n_compared": 4384
+        }
+      },
+      "pin_minute": 53,
+      "verdict": "PIN_STATION",
+      "years": {
+        "2021": {
+          "minute_histogram": {
+            "53": 744
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 3,
+          "n_reports": 744,
+          "status": "ok"
+        },
+        "2022": {
+          "minute_histogram": {
+            "53": 719
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 6,
+          "n_reports": 719,
+          "status": "ok"
+        },
+        "2023": {
+          "minute_histogram": {
+            "49": 1,
+            "53": 717,
+            "57": 1
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 0.9972183588317107,
+          "month": 9,
+          "n_reports": 719,
+          "status": "ok"
+        },
+        "2024": {
+          "minute_histogram": {
+            "53": 744
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 1.0,
+          "month": 12,
+          "n_reports": 744,
+          "status": "ok"
+        },
+        "2025": {
+          "minute_histogram": {
+            "53": 719,
+            "54": 1
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 0.9986111111111111,
+          "month": 4,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2026": {
+          "minute_histogram": {
+            "35": 2,
+            "39": 1,
+            "53": 738
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 53,
+          "modal_share": 0.9959514170040485,
+          "month": 5,
+          "n_reports": 741,
+          "status": "ok"
+        }
+      }
+    },
+    "KNYC": {
+      "equivalence": {
+        "months_missing_in_onemin_archive": [
+          "2021-03",
+          "2022-06",
+          "2023-09",
+          "2024-12",
+          "2025-04",
+          "2026-05"
+        ],
+        "n_metar_rows": 4385,
+        "n_no_tgroup": 33,
+        "n_tgroup_without_onemin_row": 0,
+        "onemin_vs_metar_tgroup": {
+          "max_abs_diff": null,
+          "mean_signed_bias": null,
+          "mismatch_rate": null,
+          "n_compared": 0
+        },
+        "tmpf_column_vs_tgroup": {
+          "diff_histogram": {
+            "0": 4352
+          },
+          "max_abs_diff": 0,
+          "mean_signed_bias": 0.0,
+          "mismatch_rate": 0.0,
+          "n_compared": 4352
+        }
+      },
+      "pin_minute": 51,
+      "verdict": "PIN_STATION",
+      "years": {
+        "2021": {
+          "minute_histogram": {
+            "51": 741
+          },
+          "missing_tmpf_rate": 0.002699055330634278,
+          "modal_minute": 51,
+          "modal_share": 1.0,
+          "month": 3,
+          "n_reports": 741,
+          "status": "ok"
+        },
+        "2022": {
+          "minute_histogram": {
+            "51": 719
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 51,
+          "modal_share": 1.0,
+          "month": 6,
+          "n_reports": 719,
+          "status": "ok"
+        },
+        "2023": {
+          "minute_histogram": {
+            "48": 1,
+            "51": 719
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 51,
+          "modal_share": 0.9986111111111111,
+          "month": 9,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2024": {
+          "minute_histogram": {
+            "51": 740,
+            "55": 1
+          },
+          "missing_tmpf_rate": 0.032432432432432434,
+          "modal_minute": 51,
+          "modal_share": 0.9986504723346828,
+          "month": 12,
+          "n_reports": 741,
+          "status": "ok"
+        },
+        "2025": {
+          "minute_histogram": {
+            "51": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 51,
+          "modal_share": 1.0,
+          "month": 4,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2026": {
+          "minute_histogram": {
+            "51": 744
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 51,
+          "modal_share": 1.0,
+          "month": 5,
+          "n_reports": 744,
+          "status": "ok"
+        }
+      }
+    },
+    "KSFO": {
+      "equivalence": {
+        "months_missing_in_onemin_archive": [
+          "2026-05"
+        ],
+        "n_metar_rows": 4388,
+        "n_no_tgroup": 0,
+        "n_tgroup_without_onemin_row": 996,
+        "onemin_vs_metar_tgroup": {
+          "diff_histogram": {
+            "-1": 229,
+            "-2": 4,
+            "0": 2179,
+            "1": 233,
+            "2": 4,
+            "3": 1
+          },
+          "max_abs_diff": 3,
+          "mean_signed_bias": 0.0026415094339622643,
+          "mismatch_rate": 0.17773584905660378,
+          "n_compared": 2650
+        },
+        "tmpf_column_vs_tgroup": {
+          "diff_histogram": {
+            "0": 4388
+          },
+          "max_abs_diff": 0,
+          "mean_signed_bias": 0.0,
+          "mismatch_rate": 0.0,
+          "n_compared": 4388
+        }
+      },
+      "pin_minute": 56,
+      "verdict": "PIN_STATION",
+      "years": {
+        "2021": {
+          "minute_histogram": {
+            "56": 744
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 56,
+          "modal_share": 1.0,
+          "month": 3,
+          "n_reports": 744,
+          "status": "ok"
+        },
+        "2022": {
+          "minute_histogram": {
+            "56": 719
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 56,
+          "modal_share": 1.0,
+          "month": 6,
+          "n_reports": 719,
+          "status": "ok"
+        },
+        "2023": {
+          "minute_histogram": {
+            "56": 720
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 56,
+          "modal_share": 1.0,
+          "month": 9,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2024": {
+          "minute_histogram": {
+            "56": 743
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 56,
+          "modal_share": 1.0,
+          "month": 12,
+          "n_reports": 743,
+          "status": "ok"
+        },
+        "2025": {
+          "minute_histogram": {
+            "56": 719,
+            "57": 1
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 56,
+          "modal_share": 0.9986111111111111,
+          "month": 4,
+          "n_reports": 720,
+          "status": "ok"
+        },
+        "2026": {
+          "minute_histogram": {
+            "56": 742
+          },
+          "missing_tmpf_rate": 0.0,
+          "modal_minute": 56,
+          "modal_share": 1.0,
+          "month": 5,
+          "n_reports": 742,
+          "status": "ok"
+        }
+      }
+    }
+  },
+  "status": "complete"
+}

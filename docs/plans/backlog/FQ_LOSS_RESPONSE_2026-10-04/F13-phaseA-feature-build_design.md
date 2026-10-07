@@ -161,3 +161,22 @@ Round-1 reviews: prediction-market-reviewer REQUEST_CHANGES and architect REQUES
   - Interval rows and specials are excluded on both sides. **Phase C/D requirement:** any live consumer of this blend computes `obs_so_far` the same way, from routine METARs only, never through `RunningExtremeAccumulator`'s interval rows.
   - The 1-min raw running max and the 5-min whole-°F max remain descriptive arms.
 - **FB-R14 (tightens FB-R10).** For a real scoring run the runner **requires** the sidecar, and refuses without one, so the features are always bound to the prereg. Runner tests provide sidecars through a fixture helper. Only a `--allow-no-sidecar` flag that is test-only, or the absence of any real data, may bypass it. Prefer no bypass.
+
+### Build ruling FB-R15 (coordinator, 2026-10-07, after the routine-METAR probe and the 1-min diagnostic)
+- **Evidence.**
+  - `docs/evidence/f13/metar_routine_minute_probe_2026-10-07.json` covers one sampled month per station-year, 2021–2026.
+    - Routine (`report_type=3`) reports sit at a fixed minute: KLAX, KMDW and KMIA at :53, KNYC at :51, KSFO at :56. At least 99.6% of reports fall on that minute in every year, with no drift.
+    - The IEM `tmpf` column equals the T-group value, converted through `round_half_up_f`, on 100% of rows.
+  - `docs/evidence/f13/metar_onemin_derivation_diag_2026-10-07.json` covers the full 2021-01..2026-06 store, about 36k hours per station.
+    - The whole-°F reading from the 1-min archive at the report minute **disagrees with the METAR value on 16.6–22.2% of hours**. The best single offset, −2 min, still disagrees on 10.7–15.7%.
+    - The mean of the 5 one-minute values ending at the report minute matches on 99.56–99.79%. So the METAR value is a 5-min mean, not a 1-min sample.
+    - KNYC has no 1-min archive at all.
+- **Ruling (supersedes FB-R13's source clause; FB-R13's definition stands).**
+  - `obs_so_far` training values come from the **routine-METAR store**. It is filled by `scripts/archive/metar_routine_store.py fetch` (IEM `asos.py`, `report_type=3`, 2021-01-01..2026-06-30, sealed at the holdout) and read with `read_routine_metar`. Each value is the T-group converted to °F with `round_half_up_f`.
+  - Rows with `tmpf_source="column"` are allowed and flagged.
+  - Rows with `tmpf_source="missing"` are skipped and counted, never imputed.
+  - The 1-min archive is no longer a source for this feature. A 1-min mean-of-5 fallback is not adopted (YAGNI): a missing routine hour stays missing.
+  - `obs_routine_minute_by_station` keeps the proposals above (KLAX/KMDW/KMIA 53, KNYC 51, KSFO 56) as a **validation filter**. A store row whose minute differs from the pin is excluded and counted. The pins are frozen with the prereg in the usual way, after the peer review.
+  - `available_at` stays at report time plus the obs lag (FB-R4).
+  - The descriptive 1-min arms stay as they are and are labelled non-METAR.
+- **Store status 2026-10-07:** fetched with `status=complete`, exit 0, covering 5 stations × 2021–2026H1.
