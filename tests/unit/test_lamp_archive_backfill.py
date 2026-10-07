@@ -167,7 +167,7 @@ class _Run:
     def go(
         self,
         *args: str,
-        mdl: Callable[[Callable[[], int]], MdlLampTransport] = _default_mdl,
+        mdl: Callable[[Callable[[], int]], MdlLampTransport] | None = _default_mdl,
         iem: Callable[..., Callable[[str, str, str], str]] | None = None,
         live: bool = True,
     ) -> int:
@@ -1196,3 +1196,89 @@ def test_any_unexpected_drop_degrades_even_when_runs_were_stored() -> None:
     rep.appended = 3
     rep.dropped = {"bad_header": 1}
     assert lb._settled(rep).status == "degraded"
+
+
+# ============ --download-deadline-s: configurable yearly tar deadline =================
+
+_YEAR_ARGS = (
+    "--legs", "mdl-yearly", "--first-year", "2025", "--last-year", "2025",
+    "--cycles", "2330", "--request-budget", "5",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("bad", ["599", "21601", "0", "-5", "nan"])
+def test_download_deadline_outside_600_to_21600_is_refused(run: _Run, bad: str) -> None:
+    rc = run.go("--dry-run", *_YEAR_ARGS, "--download-deadline-s", bad)
+
+    assert rc == 2 and not run.report_path.exists()
+
+
+@pytest.mark.parametrize("ok", ["600", "7200", "21600"])
+def test_download_deadline_bounds_are_inclusive(run: _Run, ok: str) -> None:
+    assert run.go("--dry-run", *_YEAR_ARGS, "--download-deadline-s", ok) == 0
+
+
+def test_plan_worst_case_tracks_the_configured_deadline(run: _Run) -> None:
+    run.go("--dry-run", *_YEAR_ARGS, "--download-deadline-s", "21600")
+
+    expected = 21600 + lb.REQUEST_WORST_CASE_S + lb.RETRY_AFTER_WORST_CASE_S
+    assert run.report["plan"]["mdl-yearly"]["worst_case_s_per_request"] == expected
+    assert run.report["inputs"]["download_deadline_s"] == 21600
+
+
+def test_default_deadline_is_unchanged(run: _Run) -> None:
+    run.go("--dry-run", *_YEAR_ARGS)
+
+    assert run.report["plan"]["mdl-yearly"]["worst_case_s_per_request"] == lb.YEAR_WORST_CASE_S
+    assert lb.DEFAULT_DOWNLOAD_DEADLINE_S == 7200
+
+
+def test_deadline_reaches_the_yearly_transport_limits(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar = _tar([("lmp_lavtxt.202501.2330z.gz", _gz(_month_text(2025, 1, [1])))])
+    install_mock_http(monkeypatch, _serve({_year_url(2025): tar}))
+    captured: list[float] = []
+
+    class _Spy(MdlLampTransport):
+        def __init__(self, **kw: Any) -> None:
+            captured.append(kw["year_limits"].max_wall_seconds)
+            super().__init__(**{**kw, "check_proxy_env": False})
+
+    monkeypatch.setattr(lb, "MdlLampTransport", _Spy)
+
+    run.go("--apply", *_YEAR_ARGS, "--download-deadline-s", "14400", mdl=None)
+
+    assert captured == [14400.0]
+
+
+def test_launch_window_guard_uses_the_configured_deadline(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_mock_http(monkeypatch, _no_network)
+    # 10:30Z + 6 h 4.5 min worst case meets 16:30Z; the default 2 h 4.5 min does not.
+    run.clock.now_ns = int(dt.datetime(2026, 10, 7, 10, 30, tzinfo=dt.UTC).timestamp()) * _NS
+
+    run.go("--apply", *_YEAR_ARGS, "--download-deadline-s", "21600")
+
+    unit = run.units("mdl-yearly")[0]
+    assert unit["status"] == "paused_launch_window" and unit["requests"] == 0
+
+
+def test_rerunning_a_partly_ingested_year_does_not_duplicate_rows(
+    run: _Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar = _tar([("lmp_lavtxt.202501.2330z.gz", _gz(_month_text(2025, 1, [1, 2, 3])))])
+    install_mock_http(monkeypatch, _serve({_year_url(2025): tar}))
+    run.clock.now_ns = int(dt.datetime(2026, 10, 7, 18, 0, tzinfo=dt.UTC).timestamp()) * _NS
+    args = ("--apply", *_YEAR_ARGS)
+
+    run.go(*args)
+    first_manifest = run.manifest()
+    first_revisions = run.revisions(2025, 1, 2)
+    run.go(*args)
+
+    second = run.units("mdl-yearly")[0]
+    assert second["appended"] == 0 and second["unchanged"] == len(first_manifest) == 3
+    assert run.manifest() == first_manifest
+    assert run.revisions(2025, 1, 2) == first_revisions and len(first_revisions) == 1

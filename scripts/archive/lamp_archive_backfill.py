@@ -57,9 +57,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import calendar
+import dataclasses
 import datetime as dt
 import functools
 import json
+import math
 import os
 import re
 import sys
@@ -118,7 +120,6 @@ from breezy.ingest.mdl_lamp_transport import (
     DEFAULT_LAMP_YEAR_LIMITS,
     LampNotPublishedError,
     MdlLampTransport,
-    build_mdl_lamp_transport,
 )
 from breezy.ingest.probe_transport import RequestBudget, RequestBudgetExceededError
 from breezy.persistence.autonomy.capture_schedule import LAUNCH_WINDOW_UTC, launch_window_guard
@@ -169,9 +170,18 @@ _SLACK_S: Final[int] = REQUEST_WORST_CASE_S
 #: opens (``mdl_lamp_transport``: ``max_429_retries=2``, ``_MAX_RETRY_AFTER_SECONDS=120``); a test
 #: pins this equal to those. Each retry is also charged to the request budget (``_charge_retries``).
 RETRY_AFTER_WORST_CASE_S: Final[int] = 2 * 120
-YEAR_WORST_CASE_S: Final[int] = (
-    int(DEFAULT_LAMP_YEAR_LIMITS.max_wall_seconds) + _SLACK_S + RETRY_AFTER_WORST_CASE_S
-)
+#: Yearly tar hard download deadline: default and the accepted --download-deadline-s range.
+DEFAULT_DOWNLOAD_DEADLINE_S: Final[int] = int(DEFAULT_LAMP_YEAR_LIMITS.max_wall_seconds)
+MIN_DOWNLOAD_DEADLINE_S: Final[int] = 600
+MAX_DOWNLOAD_DEADLINE_S: Final[int] = 21_600
+
+
+def year_worst_case_s(download_deadline_s: float = DEFAULT_DOWNLOAD_DEADLINE_S) -> int:
+    """Worst-case span of one yearly tar request: deadline + connect slack + 429 waits."""
+    return int(download_deadline_s) + _SLACK_S + RETRY_AFTER_WORST_CASE_S
+
+
+YEAR_WORST_CASE_S: Final[int] = year_worst_case_s()
 MONTH_WORST_CASE_S: Final[int] = (
     int(DEFAULT_LAMP_MONTH_LIMITS.max_wall_seconds) + _SLACK_S + RETRY_AFTER_WORST_CASE_S
 )
@@ -352,6 +362,7 @@ class _Ctx:
     stores: dict[str, UsSourceRevisionStore]
     manifests: dict[str, Manifest]
     mdl: MdlLampTransport | None = None
+    year_worst_case_s: int = YEAR_WORST_CASE_S
     lav_fetch: LavFetch | None = None
 
     @property
@@ -456,7 +467,7 @@ def _note_missing_stations(rep: UnitReport, run: LampRun, stations: Sequence[str
 
 def _run_year(ctx: _Ctx, rep: UnitReport, year: int) -> None:
     assert ctx.mdl is not None
-    ctx.gate.before(YEAR_WORST_CASE_S)
+    ctx.gate.before(ctx.year_worst_case_s)
     rep.requests += 1
     seen_members: set[str] = set()
     with ctx.mdl.fetch_lamp_archive_year(year) as stream:
@@ -655,7 +666,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         "mdl-yearly": {
             "years": years,
             "estimated_requests": len(years),
-            "worst_case_s_per_request": YEAR_WORST_CASE_S,
+            "worst_case_s_per_request": year_worst_case_s(args.download_deadline_s),
         },
         "mdl-monthly": {
             "months": [f"{y:04d}-{m:02d}" for y, m in months],
@@ -705,6 +716,16 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--start-month", type=_month_arg, default=_month_arg(DEFAULT_START_MONTH))
     parser.add_argument("--end-month", type=_month_arg, default=_month_arg(DEFAULT_END_MONTH))
     parser.add_argument("--request-budget", type=int, default=None)
+    parser.add_argument(
+        "--download-deadline-s",
+        type=float,
+        default=DEFAULT_DOWNLOAD_DEADLINE_S,
+        help=(
+            "hard wall-clock deadline of one yearly tar download, seconds "
+            f"({MIN_DOWNLOAD_DEADLINE_S}..{MAX_DOWNLOAD_DEADLINE_S}; default "
+            f"{DEFAULT_DOWNLOAD_DEADLINE_S}); the launch-window guard uses it"
+        ),
+    )
     parser.add_argument("--memory-cap-gib", type=float, default=DEFAULT_MEMORY_CAP_GIB)
     parser.add_argument("--report-json", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -729,6 +750,14 @@ def _validate(args: argparse.Namespace) -> str | None:
         )
     if not (FIRST_YEAR, 1) <= args.start_month <= args.end_month:
         return f"--start-month/--end-month must satisfy {FIRST_YEAR}-01 <= start <= end"
+    if not (
+        math.isfinite(args.download_deadline_s)
+        and MIN_DOWNLOAD_DEADLINE_S <= args.download_deadline_s <= MAX_DOWNLOAD_DEADLINE_S
+    ):
+        return (
+            f"--download-deadline-s must be within "
+            f"{MIN_DOWNLOAD_DEADLINE_S}..{MAX_DOWNLOAD_DEADLINE_S} seconds"
+        )
     if not args.memory_cap_gib > 0:
         return "--memory-cap-gib must be positive"
     problem: str | None = archive_root_problem(args.archive_root)
@@ -756,7 +785,7 @@ def main(
     *,
     clock: Callable[[], int] = time.time_ns,
     sleep: Callable[[float], None] = time.sleep,
-    mdl_factory: Callable[[Callable[[], int]], MdlLampTransport] = build_mdl_lamp_transport,
+    mdl_factory: Callable[[Callable[[], int]], MdlLampTransport] | None = None,
     iem_fetch_factory: Callable[..., LavFetch] = make_lav_fetch,
     memory_cap: Callable[[float], Any] = apply_address_space_cap,
 ) -> int:
@@ -773,6 +802,7 @@ def main(
             "cycles": list(args.cycles),
             "first_year": args.first_year,
             "last_year": args.last_year,
+            "download_deadline_s": args.download_deadline_s,
             "start_month": "{:04d}-{:02d}".format(*args.start_month),
             "end_month": "{:04d}-{:02d}".format(*args.end_month),
         },
@@ -795,12 +825,24 @@ def main(
     return code
 
 
+def _build_mdl(
+    factory: Callable[[Callable[[], int]], MdlLampTransport] | None,
+    clock: Callable[[], int],
+    download_deadline_s: float,
+) -> MdlLampTransport:
+    """An injected factory owns its limits; the default carries the configured tar deadline."""
+    if factory is not None:
+        return factory(clock)
+    limits = dataclasses.replace(DEFAULT_LAMP_YEAR_LIMITS, max_wall_seconds=download_deadline_s)
+    return MdlLampTransport(clock=clock, year_limits=limits)
+
+
 def _apply(
     args: argparse.Namespace,
     report: dict[str, Any],
     clock: Callable[[], int],
     sleep: Callable[[float], None],
-    mdl_factory: Callable[[Callable[[], int]], MdlLampTransport],
+    mdl_factory: Callable[[Callable[[], int]], MdlLampTransport] | None,
     iem_fetch_factory: Callable[..., LavFetch],
     memory_cap: Callable[[float], Any],
 ) -> int:
@@ -816,6 +858,7 @@ def _apply(
         gate=RequestGate(
             budget=budget, clock=clock, sleep=sleep, min_interval_s=MDL_MIN_INTERVAL_S
         ),
+        year_worst_case_s=year_worst_case_s(args.download_deadline_s),
         stores={
             US_LAMP_MDL_SOURCE: UsSourceRevisionStore(root, store_clock, validator=_validate_lamp),
             US_LAV_IEM_SOURCE: UsSourceRevisionStore(root, store_clock, validator=_validate_lav),
@@ -823,7 +866,7 @@ def _apply(
         manifests={s: Manifest(root, s) for s in (US_LAMP_MDL_SOURCE, US_LAV_IEM_SOURCE)},
     )
     if any(leg in args.legs for leg in ("mdl-yearly", "mdl-monthly")):
-        ctx.mdl = mdl_factory(clock)
+        ctx.mdl = _build_mdl(mdl_factory, clock, args.download_deadline_s)
         _charge_retries(ctx.mdl, budget)
     if "iem-lav" in args.legs:
         ctx.lav_fetch = iem_fetch_factory(
