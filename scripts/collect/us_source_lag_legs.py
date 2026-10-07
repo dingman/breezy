@@ -32,11 +32,12 @@ from typing import Any, Final
 
 import us_source_guards as guards
 
-from breezy.ingest.http import TransportError
+from breezy.ingest.http import ForbiddenError, RateLimitedError, ServerError, TransportError
 from breezy.ingest.us_source_availability import LagPrereg, Observation, available_at
 
 __all__ = [
     "IEM_LEGS",
+    "OBS_BACKOFF_NS",
     "OBS_FETCH_LIMIT",
     "OBS_LATE_AFTER_NS",
     "OBS_ROUTINE_MINUTE",
@@ -69,7 +70,13 @@ OBS_ROUTINE_MINUTE: Final[dict[str, int]] = {
 OBS_SOURCE_KEY: Final[str] = "us-obs-avail"
 #: Same order of size as the live actor's steady-state fetch; the API returns newest-first.
 OBS_FETCH_LIMIT: Final[int] = 12
-OBS_LATE_AFTER_NS: Final[int] = _HOUR_NS
+#: A routine report is polled for only in [routine minute, +35 min]; one first seen after that is
+#: right-censored (F13-R21) and recorded at the next firing that fetches it.
+OBS_LATE_AFTER_NS: Final[int] = 35 * _MINUTE_NS
+#: Firings land up to AccuracySec past the nominal slot; the window end tolerates that.
+_OBS_WINDOW_SLACK_NS: Final[int] = 30 * _NS
+#: After a 429 / 5xx / 403 from the observation host the leg stays silent this long.
+OBS_BACKOFF_NS: Final[int] = 30 * _MINUTE_NS
 _OBS_SPACING_S: Final[float] = 1.0  # S2: never two requests for one host within a second
 
 
@@ -282,11 +289,52 @@ def _is_routine(station: str, report_ns: int, raw: str) -> bool:
     return minute == OBS_ROUTINE_MINUTE[station] and not raw.lstrip().startswith("SPECI")
 
 
+def obs_window_start(station: str, now_ns: int) -> int | None:
+    """The routine-report time whose polling window is open at ``now_ns``, else None."""
+    hour = now_ns // _HOUR_NS * _HOUR_NS
+    minute_ns = OBS_ROUTINE_MINUTE[station] * _MINUTE_NS
+    start = max(c for c in (hour - _HOUR_NS + minute_ns, hour + minute_ns) if c <= now_ns)
+    return start if now_ns - start <= OBS_LATE_AFTER_NS + _OBS_WINDOW_SLACK_NS else None
+
+
+def _backoff_until(col: Any) -> int:
+    stamps = [
+        int(e["until_ns"]) for e in col.ledger.events(OBS_SOURCE_KEY) if e.get("kind") == "backoff"
+    ]
+    return max(stamps, default=0)
+
+
+def _eligible(col: Any, now_ns: int) -> list[str]:
+    """Stations whose report window is open and whose report is not yet seen."""
+    found: list[str] = []
+    for station in STATIONS:
+        window = obs_window_start(station, now_ns)
+        if window is not None and col.ledger.find_seen(OBS_SOURCE_KEY, station, window) is None:
+            found.append(station)
+    return found
+
+
+def _enter_backoff(col: Any, station: str, exc: Exception, now_ns: int, out: LegOutcome) -> None:
+    until = now_ns + OBS_BACKOFF_NS
+    col.ledger.record(
+        OBS_SOURCE_KEY,
+        {"kind": "backoff", "station": station, "fetched_at_ns": now_ns, "until_ns": until},
+    )
+    _log(f"obs {station} {type(exc).__name__}: backing off until {until}")
+    col.ctx.alert("rate_limited", OBS_SOURCE_KEY, f"{station}: {type(exc).__name__}; backing off")
+    out.errors += 1
+
+
 def obs_cycle(col: Any, fetch: Callable[[str], FetchedPayload]) -> LegOutcome:
-    """One pass over the five stations; a routine report is recorded once, at first sight."""
+    """One pass over the stations whose report window is open (the host is shared with the live
+    node, so no station is polled outside [routine minute, +35 min] or after its report is seen);
+    a 429 / 5xx / 403 stops the pass and silences the leg for ``OBS_BACKOFF_NS``."""
     out = LegOutcome()
     start = col.ctx.clock()
-    for index, station in enumerate(STATIONS):
+    if start < _backoff_until(col):
+        _log("obs is backing off after a rate-limit or server error; skipping this firing")
+        return out
+    for index, station in enumerate(_eligible(col, start)):
         if _over_budget(col, "obs", start):
             out.deadline = True
             return out
@@ -294,6 +342,9 @@ def obs_cycle(col: Any, fetch: Callable[[str], FetchedPayload]) -> LegOutcome:
             col.ctx.sleep(_OBS_SPACING_S)
         try:
             payload = fetch(station)
+        except (RateLimitedError, ServerError, ForbiddenError) as exc:
+            _enter_backoff(col, station, exc, col.ctx.clock(), out)
+            return out
         except (TransportError, OSError) as exc:
             _log(f"obs {station} fetch failed: {type(exc).__name__}")
             out.errors += 1

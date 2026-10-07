@@ -10,6 +10,7 @@ the skip reason carries bwrap's stderr.
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
 import re
 import shlex
@@ -43,7 +44,7 @@ SERVICE = UNIT_DIR / "us-source-collector@.service"
 TIMER = UNIT_DIR / "us-source-collector@.timer"
 INSTANCES = ("lamp", "pfm", "nbp", "lav", "mos", "obs")
 #: C1-R1 poll-cadence bounds (seconds) of the first-seen precision for the new legs.
-CADENCE_BOUND_S = {"lav": 15 * 60, "mos": 15 * 60, "obs": 10 * 60}
+CADENCE_BOUND_S = {"lav": 15 * 60, "mos": 15 * 60}
 HOME = str(Path.home())
 ARCHIVE_DST = f"{HOME}/.local/share/breezy/us_source_archive"
 ALERTS_DST = f"{HOME}/.config/breezy/alerts.env"
@@ -389,3 +390,17 @@ def test_new_leg_instance_is_a_known_collector_source(instance: str) -> None:
     from tests.unit.test_us_source_collector import col
 
     assert instance in col.SOURCE_KEYS
+
+
+def test_obs_timer_fires_are_report_minute_targeted_with_bounded_first_seen_gaps() -> None:
+    """Hours 05-06 (full hours): per station, firings inside [routine minute, +35 min] leave gaps
+    <= 5 min during the first 15 min after the report and <= 10 min afterwards."""
+    routine = {"KLAX": 53, "KMDW": 53, "KMIA": 53, "KNYC": 51, "KSFO": 56}
+    firings = [s - 5 * 3600 for s in _firing_seconds("obs") if 5 * 3600 <= s < 7 * 3600]
+    assert len(firings) == 18  # nine an hour
+    for station, minute in routine.items():
+        start = minute * 60
+        marks = [start, *(f for f in firings if start <= f <= start + 35 * 60)]
+        for a, b in itertools.pairwise(marks):
+            bound = 5 * 60 if a - start < 15 * 60 else 10 * 60
+            assert b - a <= bound, (station, a, b)

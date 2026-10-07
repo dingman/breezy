@@ -319,3 +319,93 @@ def test_obs_request_is_in_parity_with_the_live_observation_ingest() -> None:
             asyncio.run(getattr(mirror, closed)("x"))
     with pytest.raises(ValueError):
         mirror.station_observations_url("KORD", 12)
+
+
+# ------------------------------------------------------- obs: shared-host load and back-off
+
+
+def _quiet_feed(clock: FakeClock, rec: Recorder) -> Any:
+    def feed(station: str) -> Any:
+        rec.calls.append(("obs", station, clock()))
+        return col.FetchedPayload(b'{"features": []}', clock(), None, "nws")
+
+    return feed
+
+
+def test_obs_polls_only_stations_inside_their_report_window(tmp_path: Path) -> None:
+    clock, rec = FakeClock(DAY + 7 * HOUR + 40 * MIN), Recorder()  # past every window
+    ctx = make_ctx(tmp_path, clock, rec, fetch_obs=_quiet_feed(clock, rec))
+    assert col.run_cycle("obs", ctx).status is col.CycleStatus.UNCHANGED
+    assert rec.calls == []
+    clock.now = DAY + 7 * HOUR + 54 * MIN  # KNYC (:51) and KLAX/KMDW/KMIA (:53) open, KSFO not yet
+    col.run_cycle("obs", ctx)
+    assert {c[1] for c in rec.calls} == {"KLAX", "KMDW", "KMIA", "KNYC"}
+    rec.calls.clear()
+    clock.now = DAY + 7 * HOUR + 58 * MIN
+    col.run_cycle("obs", ctx)
+    assert {c[1] for c in rec.calls} == set(STATIONS)
+
+
+def test_obs_stops_polling_a_station_once_its_report_is_seen(tmp_path: Path) -> None:
+    report = DAY + 7 * HOUR + 56 * MIN
+    clock, rec = FakeClock(report + 3 * MIN), Recorder()
+    stamps = {"KSFO": [(report, "KSFO 080756Z ...")]}
+    ctx = make_ctx(tmp_path, clock, rec, fetch_obs=ObsFeed(clock, rec, stamps))
+    col.run_cycle("obs", ctx)
+    rec.calls.clear()
+    clock.now = report + 6 * MIN
+    col.run_cycle("obs", ctx)
+    assert "KSFO" not in {c[1] for c in rec.calls}
+
+
+def test_obs_request_ceiling_per_station_per_hour_and_day_is_far_below_the_live_actor(
+    tmp_path: Path,
+) -> None:
+    """Worst case (no report ever seen): replay every real timer firing of a day."""
+    from tests.unit.test_us_source_collector_unit import _firing_seconds
+
+    clock, rec = FakeClock(DAY), Recorder()
+    ctx = make_ctx(tmp_path, clock, rec, fetch_obs=_quiet_feed(clock, rec))
+    for second in _firing_seconds("obs"):
+        clock.now = DAY + second * 10**9
+        col.run_cycle("obs", ctx)
+    per_day = {s: [c for c in rec.calls if c[1] == s] for s in STATIONS}
+    live_actor_per_day = 288  # 300 s poll interval
+    for station, calls in per_day.items():
+        assert 0 < len(calls) <= 240 < live_actor_per_day, station
+        hours: dict[int, int] = {}
+        for call in calls:
+            hours[(call[2] - DAY) // HOUR] = hours.get((call[2] - DAY) // HOUR, 0) + 1
+        assert max(hours.values()) <= 10, (station, hours)
+
+
+@pytest.mark.parametrize("failure", ["429", "503"])
+def test_obs_backs_off_after_a_rate_limit_or_server_error(tmp_path: Path, failure: str) -> None:
+    from breezy.ingest.http import RateLimitedError, ServerError
+
+    clock, rec = FakeClock(DAY + 7 * HOUR + 58 * MIN), Recorder()
+    state = {"fail": True}
+
+    def feed(station: str) -> Any:
+        rec.calls.append(("obs", station, clock()))
+        if state["fail"] and len(rec.calls) == 2:
+            raise (
+                RateLimitedError("429", retry_after=None)
+                if failure == "429"
+                else ServerError("503", status_code=503)
+            )
+        return col.FetchedPayload(b'{"features": []}', clock(), None, "nws")
+
+    ctx = make_ctx(tmp_path, clock, rec, fetch_obs=feed)
+    report = col.run_cycle("obs", ctx)
+    assert report.status is col.CycleStatus.ERROR
+    assert len(rec.calls) == 2  # the pass stopped at the failing station
+    assert [a[0] for a in rec.alerts] == ["rate_limited"]
+    assert any(e["kind"] == "backoff" for e in _events(tmp_path, OBS_SOURCE))
+    state["fail"] = False
+    clock.now += 10 * MIN  # still silent
+    assert col.run_cycle("obs", ctx).status is col.CycleStatus.UNCHANGED
+    assert len(rec.calls) == 2
+    clock.now = DAY + 8 * HOUR + 54 * MIN  # the back-off (30 min) is over, next window is open
+    col.run_cycle("obs", ctx)
+    assert len(rec.calls) > 2
