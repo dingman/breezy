@@ -155,7 +155,7 @@ def test_corrupt_file_is_refetched(store: ModuleType, tmp_path: Path) -> None:
 
 
 def test_tmpf_falls_back_to_column_with_flag_and_missing(store: ModuleType) -> None:
-    from metar_routine_minute_probe import parse_metar_csv
+    from metar_routine_minute_probe import parse_metar_csv  # type: ignore[import-not-found]
 
     rows = parse_metar_csv(
         HEADER

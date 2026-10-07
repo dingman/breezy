@@ -306,4 +306,4 @@ def test_a_row_with_an_unknown_horizon_is_a_refusal_not_a_raw_error(tmp_path: Pa
     ]
 
     with pytest.raises(skill.Refusal, match="horizon"):
-        skill.check_row_anchors(rows, _anchor_meta(), tmp_path / "f.jsonl")
+        skill.check_row_anchors(rows, _anchor_meta(), tmp_path / "f.jsonl")  # type: ignore[arg-type]

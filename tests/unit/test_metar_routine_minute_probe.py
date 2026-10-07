@@ -233,7 +233,7 @@ def test_default_plan_is_one_request_per_station_year_and_stays_pre_holdout(
 
 
 def test_default_stations_are_the_phase_a_list(probe: ModuleType, tmp_path: Path) -> None:
-    from multisource_blend_features_build import DEFAULT_STATIONS
+    from multisource_blend_features_build import DEFAULT_STATIONS  # type: ignore[import-not-found]
 
     _code, report = _run(probe, tmp_path)
     assert {p["station"] for p in report["plan"]} == set(DEFAULT_STATIONS)
