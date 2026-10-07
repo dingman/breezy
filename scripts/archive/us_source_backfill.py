@@ -855,6 +855,19 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=None,
         help="write every refused raw PFM product plus a refusals.jsonl line here (default off)",
     )
+    parser.add_argument(
+        "--reingest-quarantine",
+        type=Path,
+        default=None,
+        help="OFFLINE: replay a --quarantine-dir through the current parser into --archive-root "
+        "(--dry-run counts only; --apply appends; idempotent by the store's sha dedupe)",
+    )
+    parser.add_argument(
+        "--reingest-reasons",
+        nargs="+",
+        default=None,
+        help="with --reingest-quarantine: only replay lines refused for these reasons",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args(list(argv))
@@ -939,6 +952,37 @@ def _default_gfs_runner(argv: Sequence[str]) -> int:  # pragma: no cover - live 
     return int(mos_main(list(argv)))
 
 
+def _reingest(
+    args: argparse.Namespace, clock: Callable[[], int], sleep: Callable[[float], None]
+) -> int:
+    """The offline ``--reingest-quarantine`` mode: no network, no request budget, no live env."""
+    from us_source_pfm_reingest import reingest_quarantine  # type: ignore[import-not-found]
+
+    if args.dry_run == args.apply:
+        return _refuse("exactly one of --dry-run and --apply is required")
+    if args.archive_root is None:
+        return _refuse("--archive-root is required with --reingest-quarantine")
+    problem = _archive_root_problem(args.archive_root)
+    if problem is not None:
+        return _refuse(problem)
+    if any("holdout" in part.lower() for part in args.reingest_quarantine.resolve().parts):
+        return _refuse("--reingest-quarantine sits in a holdout directory (sealed)")
+    store = UsSourceRevisionStore(args.archive_root, _StoreClock(clock)) if args.apply else None
+    reasons = frozenset(args.reingest_reasons) if args.reingest_reasons else None
+    try:
+        report = reingest_quarantine(
+            args.reingest_quarantine, store, only_reasons=reasons, sleep=sleep
+        )
+    except FileNotFoundError as exc:
+        return _refuse(str(exc))
+    _write_report(args.report_json, report)
+    return (
+        0
+        if report["complete"] and not any(leg["store_errors"] for leg in report["legs"])
+        else _EXIT_INCOMPLETE
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -948,6 +992,8 @@ def main(
     gfs_runner: Callable[[Sequence[str]], int] = _default_gfs_runner,
 ) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.reingest_quarantine is not None:
+        return _reingest(args, clock, sleep)
     problem = _validate(args)
     if problem is not None:
         return _refuse(problem)

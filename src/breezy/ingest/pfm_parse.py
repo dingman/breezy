@@ -18,6 +18,10 @@ state.
 `PfmParseError` is a local refusal class: not a `TransportError`, `CliParseError`
 or `CliSanityError` (R18).
 
+Pre-2022 LOT daylight-time products print the extrema under UTC 23 / 11 (local 18 / 06 CDT; real
+capture `pfm_lot_real_20210314_cdt.txt`); same local date as before, accepted only at those
+local hours.
+
 Pre-2022 LOT layout (real capture `pfm_lot_real_20210101.txt`): the `UTC 3hrly` row is printed
 ABOVE the local `CST 3hrly` row and the extrema label is upper case (`MIN/MAX`, `MAX/MIN`); the
 columns, the point names and the zone lines are the same. Both row orders are accepted.
@@ -175,8 +179,12 @@ _LABEL_WIDTH: Final = 14
 _MAX_TABLES: Final = 4
 _DATE_BEFORE: Final = dt.timedelta(days=2)
 _DATE_AFTER: Final = dt.timedelta(days=10)
-_MAX_UTC_HOUR: Final = 0
-_MIN_UTC_HOUR: Final = 12
+#: (UTC hour, local hour) of the MAX / MIN extrema columns. UTC 00 / 12 is every current
+#: product (19 CDT, 20 EDT, 17 PDT; 18 / 06 CST in winter); the pre-2022 LOT daylight-time
+#: layout prints them one hour earlier, under UTC 23 / 11 = LOCAL 18 / 06 CDT. The local hour
+#: is pinned for that variant so a shifted or mislabelled grid is still refused.
+_MAX_COLUMNS: Final = frozenset({(0, None), (23, 18)})
+_MIN_COLUMNS: Final = frozenset({(12, None), (11, 6)})
 _DATE_LABEL_RE: Final = re.compile(r"(?:[A-Z][a-z]{2} )?(\d{2})/(\d{2})(?:/(\d{2}))?")
 _LOCAL_ROW_RE: Final = re.compile(r"^(?!UTC )[A-Z]{3} [36]hrly\s")
 _UTC_ROW_RE: Final = re.compile(r"^UTC [36]hrly\s")
@@ -285,6 +293,10 @@ def _hour_rows(table: list[str]) -> tuple[str, str] | None:
     return None
 
 
+def _is_extrema_column(column: _Column, accepted: frozenset[tuple[int, int | None]]) -> bool:
+    return (column.utc_hour, None) in accepted or (column.utc_hour, column.local_hour) in accepted
+
+
 def _table_max(
     table: list[str], anchor: dt.date, issued_at: dt.datetime, previous: _Column | None
 ) -> tuple[dict[dt.date, int], _Column, int]:
@@ -314,9 +326,9 @@ def _table_max(
         if not TEMP_MIN_F <= value <= TEMP_MAX_F:
             raise PfmParseError("extrema_out_of_range", m.group())
         column = columns[end]
-        if column.utc_hour == _MAX_UTC_HOUR:
+        if _is_extrema_column(column, _MAX_COLUMNS):
             found[column.local_date] = value
-        elif column.utc_hour != _MIN_UTC_HOUR:
+        elif not _is_extrema_column(column, _MIN_COLUMNS):
             raise PfmParseError("extrema_under_unexpected_hour", str(column.utc_hour))
     return found, ordered[-1], skipped
 

@@ -59,6 +59,67 @@ def test_lot_2021_layout_with_utc_row_above_the_local_row_parses() -> None:
     }
 
 
+def _lot_cdt_2021(extrema_row: str | None = None) -> bytes:
+    raw = _fixture("pfm_lot_real_20210314_cdt.txt")
+    if extrema_row is not None:
+        raw = raw.replace("MAX/MIN                      46", extrema_row, 1)
+    return raw.encode()
+
+
+def test_lot_2021_daylight_layout_with_extrema_under_utc_23_and_11_parses() -> None:
+    point = parse_pfm_product(
+        _lot_cdt_2021(),
+        station="KMDW",
+        reference_time=dt.datetime(2021, 3, 14, 8, 15, 1, tzinfo=_UTC),
+    )
+
+    # Hand-read: 3hrly MAX/MIN 46 31 35 35 46 under UTC 23 / 11 (local 18 / 06 CDT), then 6hrly
+    # MIN/MAX 35 50 38 46 34 45 33 52. Each MAX takes the LOCAL date of its 18 CDT column.
+    assert dict(point.max_by_day) == {
+        dt.date(2021, 3, 14): 46,
+        dt.date(2021, 3, 15): 35,
+        dt.date(2021, 3, 16): 46,
+        dt.date(2021, 3, 17): 50,
+        dt.date(2021, 3, 18): 46,
+        dt.date(2021, 3, 19): 45,
+        dt.date(2021, 3, 20): 52,
+    }
+
+
+@pytest.mark.parametrize(
+    "extrema_row",
+    [
+        "MAX/MIN                   46   ",  # under UTC 20 (15 CDT): not an extrema hour
+        "MAX/MIN                         46",  # under UTC 02 (21 CDT): not an extrema hour
+    ],
+)
+def test_extrema_under_any_other_hour_is_still_refused(extrema_row: str) -> None:
+    with pytest.raises(PfmParseError) as err:
+        parse_pfm_product(
+            _lot_cdt_2021(extrema_row),
+            station="KMDW",
+            reference_time=dt.datetime(2021, 3, 14, 8, 15, 1, tzinfo=_UTC),
+        )
+
+    assert err.value.reason == "extrema_under_unexpected_hour"
+
+
+def test_extrema_under_utc_23_with_a_local_hour_other_than_18_is_still_refused() -> None:
+    raw = _fixture("pfm_lot_real_20210314_cdt.txt")
+    raw = raw.replace(
+        "CDT 3hrly     03 06 09 12 15 18 21 00", "CDT 3hrly     03 06 09 12 15 17 21 00", 1
+    )
+
+    with pytest.raises(PfmParseError) as err:
+        parse_pfm_product(
+            raw.encode(),
+            station="KMDW",
+            reference_time=dt.datetime(2021, 3, 14, 8, 15, 1, tzinfo=_UTC),
+        )
+
+    assert err.value.reason == "extrema_under_unexpected_hour"
+
+
 def test_a_table_whose_hour_rows_are_not_utc_and_local_is_still_refused() -> None:
     raw = _fixture("pfm_lot_real_20210101.txt").replace("UTC 3hrly", "CST 3hrly", 1)
 
@@ -403,6 +464,86 @@ def test_main_quarantines_through_the_option(
         for ln in (tmp_path / "q" / "refusals.jsonl").read_text().splitlines()
     ]
     assert reasons == ["unplaceable_header"]
+
+
+# ------------------------------ offline quarantine re-ingest
+
+
+def _quarantine_with_lot_cdt(tmp_path: Path) -> Path:
+    """A quarantine holding the real LOT 2021 CDT product plus one that still refuses."""
+    q = bf.RefusalQuarantine(tmp_path / "q")
+    issued = dt.datetime(2021, 3, 14, 8, 15, tzinfo=_UTC)
+    sdate = dt.datetime(2021, 3, 13, 21, 15, tzinfo=_UTC)
+    good = _fixture("pfm_lot_real_20210314_cdt.txt")
+    bad = good.replace("Chicago Midway Airport-Cook IL", "Elsewhere IL")
+    for raw, reason in ((good, "extrema_under_unexpected_hour"), (bad, "point_not_unique")):
+        q.record(
+            reason=reason, station="KMDW", wfo="LOT", sdate=sdate, issued=issued, raw=raw.encode()
+        )
+    return tmp_path / "q"
+
+
+def _reingest_args(tmp_path: Path, mode: str) -> list[str]:
+    return [
+        "--reingest-quarantine", str(tmp_path / "q"),
+        "--archive-root", str(tmp_path / "archive"),
+        "--report-json", str(tmp_path / "re.json"),
+        mode,
+    ]  # fmt: skip
+
+
+def test_reingest_dry_run_counts_the_now_parseable_products_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    _quarantine_with_lot_cdt(tmp_path)
+
+    code = bf.main(_reingest_args(tmp_path, "--dry-run"), clock=_Clock(), sleep=lambda _s: None)
+
+    report = json.loads((tmp_path / "re.json").read_text())
+    assert code == 0
+    assert report["mode"] == "dry_run"
+    assert report["would_accept"] == {"KMDW": 1}
+    assert report["still_refused"] == {"KMDW:point_not_unique": 1}
+    assert not (tmp_path / "archive").exists()
+
+
+def test_reingest_apply_appends_once_and_a_rerun_is_unchanged(tmp_path: Path) -> None:
+    _quarantine_with_lot_cdt(tmp_path)
+
+    first_code = bf.main(_reingest_args(tmp_path, "--apply"), clock=_Clock(), sleep=lambda _s: None)
+    first = json.loads((tmp_path / "re.json").read_text())["legs"][0]
+    second_code = bf.main(
+        _reingest_args(tmp_path, "--apply"), clock=_Clock(), sleep=lambda _s: None
+    )
+    second = json.loads((tmp_path / "re.json").read_text())["legs"][0]
+
+    assert (first_code, second_code) == (0, 0)
+    assert (first["appended"], first["unchanged"]) == (1, 0)
+    assert (second["appended"], second["unchanged"]) == (0, 1)
+    assert first["refused"] == {"point_not_unique": 1}
+
+
+def test_reingest_needs_an_archive_root_and_exactly_one_mode(tmp_path: Path) -> None:
+    _quarantine_with_lot_cdt(tmp_path)
+
+    no_mode = bf.main(
+        ["--reingest-quarantine", str(tmp_path / "q"), "--archive-root", str(tmp_path / "a")],
+        clock=_Clock(),
+        sleep=lambda _s: None,
+    )
+    no_root = bf.main(
+        ["--reingest-quarantine", str(tmp_path / "q"), "--dry-run"],
+        clock=_Clock(),
+        sleep=lambda _s: None,
+    )
+    missing = bf.main(
+        ["--reingest-quarantine", str(tmp_path / "none"), "--archive-root", str(tmp_path / "a"),
+         "--dry-run"],
+        clock=_Clock(),
+        sleep=lambda _s: None,
+    )  # fmt: skip
+
+    assert (no_mode, no_root, missing) == (2, 2, 2)
 
 
 # ------------------------------ review fixes: guards, MM-only, atomic quarantine
