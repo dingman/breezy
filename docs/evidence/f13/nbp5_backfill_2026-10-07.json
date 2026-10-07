@@ -1,0 +1,33 @@
+{
+  "dry_run": false,
+  "output_dir": "/home/jon/.local/share/breezy/derived/nbp5",
+  "stations": [
+    "KLAX",
+    "KMDW",
+    "KMIA",
+    "KNYC",
+    "KSFO"
+  ],
+  "written": 6003,
+  "skipped": 3,
+  "would_fetch": 0,
+  "failed": [
+    "2021-01-17 19Z",
+    "2021-01-21 19Z",
+    "2021-01-22 13Z",
+    "2021-01-22 19Z",
+    "2021-01-22 01Z",
+    "2021-04-24 13Z",
+    "2022-01-05 19Z",
+    "2022-02-20 19Z",
+    "2022-09-26 19Z",
+    "2022-10-13 13Z",
+    "2023-02-08 01Z",
+    "2023-06-06 01Z",
+    "2024-10-22 19Z",
+    "2025-07-14 01Z",
+    "2026-06-01 01Z"
+  ],
+  "requests_charged": 12036,
+  "stop_reason": null
+}
