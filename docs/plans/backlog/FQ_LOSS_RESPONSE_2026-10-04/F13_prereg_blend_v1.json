@@ -71,7 +71,11 @@
     "source_breaks": null,
     "rung_edges_f": null,
     "min_uncensored_lag_samples": null,
-    "embargo_days": null
+    "embargo_days": null,
+    "anchors": null,
+    "source_lags_ns": null,
+    "obs_source": null,
+    "obs_cadence_seconds": null
   },
   "pin_units": {
     "m0_prime_tolerance_crps_f": "absolute CRPS in degF; M0prime worse than M0 by more than this refuses ACCEPT",
@@ -80,7 +84,11 @@
     "source_breaks": "list of ISO dates from A0; a fold never straddles one",
     "rung_edges_f": "integer degF edges for the rung-ladder log score",
     "champion_cdf_method": "NORMAL | PCHIP_NORMAL_TAILS | SKEW_NORMAL, the CdfMethod the committed champion uses",
-    "embargo_days": "integer days (>= 0): every day within this many days of a held block is dropped from the training of M0, the pooled-M0 sensitivity AND every blend arm"
+    "embargo_days": "integer days (>= 2, FB-R6): every day within this many days of a held block is dropped from the training of M0, the pooled-M0 sensitivity AND every blend arm",
+    "anchors": "FB-R1, read by multisource_blend_features_build.py: object {\"D-1\": {\"kind\": \"utc\", \"hour\": 18}, \"D0\": {\"kind\": \"lst\", \"hour\": 10}, \"D0_sensitivity\": {\"kind\": \"lst\", \"hour\": 12}, \"offset_rule\": \"fixed_standard_time_never_dst\"}. A utc anchor is that UTC hour on the day before the climate day; an lst anchor is that local-STANDARD hour on the climate day (EST 15Z, CST 16Z, PST 18Z for hour 10). D0_sensitivity builds a separate file pair, never mixed into the primary pair.",
+    "source_lags_ns": "FB-R4, integer nanoseconds per source key lamp-mdl, lav-iem, pfm, mos-gfs, obs: availability = nominal time + lag. Provisional basis: lamp-mdl max(60 min, C1 max); lav-iem the same + 30 min; pfm WMO issuance + 60 min; mos-gfs runtime + 5 h; obs report time + 15 min. The builder refuses any value below the R29 floor (lamp-mdl 60 min, lav-iem 90 min, pfm 60 min, mos-gfs 5 h, obs 15 min). Frozen only after >= 14 days of C1 measurement (R29); every value's basis is flagged in the build report.",
+    "obs_source": "FB-R3, a string label for the obs_so_far path; the builder accepts only iem_asos_1min_whole_f_via_metar_tgroup_quantisation (the 1-min archive, quantised through the live METAR T-group function). The raw 1-min running max is a descriptive arm only.",
+    "obs_cadence_seconds": "FB-R3, L-13, integer seconds of the epoch grid the 1-min archive is downsampled to; the builder refuses a value other than the live cadence OBS_CADENCE_SECONDS (300)."
   },
   "veto": {
     "label": "descriptive only, carries no verdict (R8, R15)",

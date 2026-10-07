@@ -458,6 +458,10 @@ class NbpPercentileWindow:
     valid_start_ns: int
     nbm_version_era: str
     percentiles: Percentiles
+    #: F13 FB-R5: the MAX of the group's `DerivedNbpRow.available_at_ns` (the window is public
+    #: only when its last variable is). Set by :func:`complete_percentile_windows`; ``None`` for
+    #: a window built by hand, which a point-in-time consumer must refuse.
+    available_at_ns: int | None = None
 
 
 def iter_nbp_derived_rows(root: Path) -> Iterable[tuple[Path, tuple[DerivedNbpRow, ...] | None]]:
@@ -535,6 +539,7 @@ def complete_percentile_windows(
                 valid_start_ns=valid_start_ns,
                 nbm_version_era=any_row.nbm_version_era,
                 percentiles=percentiles,
+                available_at_ns=max(entry.available_at_ns for entry in variables.values()),
             )
         )
 
