@@ -409,3 +409,13 @@ def test_obs_backs_off_after_a_rate_limit_or_server_error(tmp_path: Path, failur
     clock.now = DAY + 8 * HOUR + 54 * MIN  # the back-off (30 min) is over, next window is open
     col.run_cycle("obs", ctx)
     assert len(rec.calls) > 2
+
+
+def test_iem_csv_has_run_accepts_date_only_runtime_at_midnight() -> None:
+    """IEM prints a midnight-only runtime column as a bare date (all rows share 00:00:00)."""
+    legs = sys.modules["us_source_lag_legs"]
+    csv_text = "runtime,ftime,model,station\n2026-10-07,2026-10-07 06:00:00,GFS,KLAX\n"
+    assert legs.iem_csv_has_run(csv_text, "KLAX", DAY) is True
+    assert legs.iem_csv_has_run(csv_text, "KMIA", DAY) is False
+    # a bare date is not a 06Z run
+    assert legs.iem_csv_has_run(csv_text, "KLAX", DAY + 6 * HOUR) is False

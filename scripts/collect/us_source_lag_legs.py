@@ -195,7 +195,8 @@ def iem_csv_has_run(text: str, station: str, run_ts_ns: int) -> bool:
     """True when the CSV carries a row for ``station`` at exactly this ``runtime``.
 
     A header without the ``runtime`` / ``station`` columns is a malformed payload (ValueError),
-    an empty body or a header-only body is simply "not there yet".
+    an empty body or a header-only body is simply "not there yet". IEM prints a runtime column
+    whose rows are all 00:00:00 as a bare date, so a 00Z run also matches ``YYYY-MM-DD``.
     """
     if not text.strip():
         return False
@@ -203,8 +204,9 @@ def iem_csv_has_run(text: str, station: str, run_ts_ns: int) -> bool:
     if not reader.fieldnames or not {"runtime", "station"} <= set(reader.fieldnames):
         raise ValueError("IEM CSV has no runtime/station columns")
     label = _run_label(run_ts_ns)
+    labels = {label, label[:10]} if label.endswith(" 00:00:00") else {label}
     return any(
-        (row.get("runtime") or "").strip() == label
+        (row.get("runtime") or "").strip() in labels
         and (row.get("station") or "").strip() == station
         for row in reader
     )
