@@ -220,6 +220,43 @@ def test_lamp_nominal_times_are_hh30_with_the_conservative_sixty_minute_lag() ->
     assert first["basis"] == "nominal_plus_conservative_lag"
 
 
+_MID_DAY_NS = _ts(2, 12, 45)
+
+
+def test_lamp_nominal_times_never_list_runs_after_the_injected_now() -> None:
+    rows = census.lamp_nominal_times(dt.date(2026, 9, 2), dt.date(2026, 9, 2), now_ns=_MID_DAY_NS)
+
+    assert [r["run_utc"] for r in rows][-1] == "2026-09-02T12:30:00Z"
+    assert len(rows) == 13
+    assert all(r["run_utc"] <= "2026-09-02T12:45:00Z" for r in rows)
+
+
+def test_lamp_nominal_times_include_a_run_exactly_at_now() -> None:
+    rows = census.lamp_nominal_times(
+        dt.date(2026, 9, 2), dt.date(2026, 9, 2), now_ns=_ts(2, 12, 30)
+    )
+
+    assert rows[-1]["run_utc"] == "2026-09-02T12:30:00Z"
+
+
+def test_lamp_summary_counts_only_runs_up_to_now(tmp_path: Path) -> None:
+    summary = census.lamp_summary(
+        dt.date(2026, 9, 2), dt.date(2026, 9, 3), tmp_path, now_ns=_MID_DAY_NS
+    )
+
+    assert summary["n_runs"] == 13
+    assert summary["last_run_utc"] == "2026-09-02T12:30:00Z"
+
+
+def test_lamp_summary_all_future_is_empty_not_an_error(tmp_path: Path) -> None:
+    summary = census.lamp_summary(
+        dt.date(2026, 9, 3), dt.date(2026, 9, 3), tmp_path, now_ns=_MID_DAY_NS
+    )
+
+    assert summary["n_runs"] == 0
+    assert summary["first_run_utc"] is None
+
+
 def test_lamp_summary_marks_the_source_descriptive_nominal_only(tmp_path: Path) -> None:
     summary = census.lamp_summary(dt.date(2026, 9, 1), dt.date(2026, 9, 1), tmp_path)
 

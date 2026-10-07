@@ -82,6 +82,10 @@ def _entries(archive_root: Path, source: str) -> tuple[Any, ...]:
     return cache.entries(source)
 
 
+def _system_now_ns() -> int:
+    return int(dt.datetime.now(dt.UTC).timestamp() * _NS)
+
+
 def _utc(ns: int) -> str:
     return dt.datetime.fromtimestamp(ns / _NS, tz=dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -177,15 +181,24 @@ def nbp_vintage_report(base: Path | None, stations: Sequence[str]) -> dict[str, 
 # ----------------------------------------------------------------------- LAMP
 
 
-def lamp_nominal_times(start: dt.date, end: dt.date) -> list[dict[str, str]]:
-    """Every HH30 run in ``[start, end]`` with its nominal availability (run + 60 min)."""
+def lamp_nominal_times(
+    start: dt.date, end: dt.date, *, now_ns: int | None = None
+) -> list[dict[str, str]]:
+    """Every HH30 run in ``[start, end]`` with its nominal availability (run + 60 min).
+
+    Runs whose nominal time is after ``now_ns`` (default: the real UTC clock) have not
+    happened yet and are not listed.
+    """
     if end < start:
         raise ValueError("lamp end precedes start")
+    now = dt.datetime.fromtimestamp((_system_now_ns() if now_ns is None else now_ns) / _NS, dt.UTC)
     rows: list[dict[str, str]] = []
     day = start
     while day <= end:
         for hour in range(24):
             run = dt.datetime(day.year, day.month, day.day, hour, LAMP_RUN_MINUTE, tzinfo=dt.UTC)
+            if run > now:
+                continue
             available = run + dt.timedelta(seconds=LAMP_CONSERVATIVE_LAG_S)
             rows.append(
                 {
@@ -198,8 +211,10 @@ def lamp_nominal_times(start: dt.date, end: dt.date) -> list[dict[str, str]]:
     return rows
 
 
-def lamp_summary(start: dt.date, end: dt.date, archive_root: Path) -> dict[str, Any]:
-    rows = lamp_nominal_times(start, end)
+def lamp_summary(
+    start: dt.date, end: dt.date, archive_root: Path, *, now_ns: int | None = None
+) -> dict[str, Any]:
+    rows = lamp_nominal_times(start, end, now_ns=now_ns)
     pattern = revision_product_pattern(US_SOURCE_PRODUCTS[US_LAMP_LIVE_SOURCE])
     measured = {
         e.window_start
@@ -208,8 +223,8 @@ def lamp_summary(start: dt.date, end: dt.date, archive_root: Path) -> dict[str, 
     }
     return {
         "n_runs": len(rows),
-        "first_run_utc": rows[0]["run_utc"],
-        "last_run_utc": rows[-1]["run_utc"],
+        "first_run_utc": rows[0]["run_utc"] if rows else None,
+        "last_run_utc": rows[-1]["run_utc"] if rows else None,
         "conservative_lag_minutes": LAMP_CONSERVATIVE_LAG_S / _MINUTE_S,
         "basis": LAMP_BASIS,
         "measured_c1_rows": len(measured),
@@ -262,14 +277,18 @@ def _write_atomic(out: Path, payload: dict[str, Any]) -> None:
 
 
 def main(
-    argv: Sequence[str] | None = None, *, cap: Callable[[float], int] = apply_address_space_cap
+    argv: Sequence[str] | None = None,
+    *,
+    cap: Callable[[float], int] = apply_address_space_cap,
+    now_ns: Callable[[], int] = _system_now_ns,
 ) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if _is_inside(args.out, args.archive_root):
         sys.stderr.write("REFUSED: --out must not sit inside the archive root\n")
         return _EXIT_REFUSED
     cap(args.max_memory_gib)
-    lamp_end = args.lamp_end or dt.datetime.now(dt.UTC).date()
+    now = now_ns()
+    lamp_end = args.lamp_end or dt.datetime.fromtimestamp(now / _NS, dt.UTC).date()
     report = {
         "inputs": {
             "archive_root": str(args.archive_root),
@@ -287,7 +306,7 @@ def main(
             for wfo, times in pfm_issuance_times(args.archive_root).items()
         },
         "nbp": nbp_vintage_report(args.forecast_base, args.stations),
-        "lamp": lamp_summary(args.lamp_start, lamp_end, args.archive_root),
+        "lamp": lamp_summary(args.lamp_start, lamp_end, args.archive_root, now_ns=now),
     }
     _write_atomic(args.out, report)
     return 0
