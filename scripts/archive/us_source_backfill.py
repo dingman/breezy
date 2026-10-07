@@ -68,7 +68,13 @@ from us_source_pfm_support import (  # type: ignore[import-not-found]
     wmo_instant_near,
 )
 
-from breezy.ingest.http import ForbiddenError, OversizeBodyError, RateLimitedError
+from breezy.ingest.http import (
+    ForbiddenError,
+    OversizeBodyError,
+    RateLimitedError,
+    ServerError,
+    TransportTimeoutError,
+)
 from breezy.ingest.pfm_parse import PfmParseError, parse_pfm_product
 from breezy.ingest.probe_transport import (
     RequestBudget,
@@ -113,6 +119,8 @@ FIRST_YEAR: Final[int] = 2021
 #: A request is paced (>= 4 s), may read for up to 20 s, plus slack.
 REQUEST_WORST_CASE_S: Final[int] = 30
 THROTTLE_BACKOFF_S: Final[tuple[float, ...]] = (30.0, 120.0, 300.0)
+#: Transient transport faults (timeout, 5xx): up to three retries per page, 30/60/120 s apart.
+TRANSIENT_BACKOFF_S: Final[tuple[float, ...]] = (30.0, 60.0, 120.0)
 BUSY_WAIT_S: Final[float] = 10.0
 BUSY_RETRIES: Final[int] = 3
 #: Planning constant for the dry run only (LOT issues ~28/day, the others fewer).
@@ -312,11 +320,13 @@ def _fetch_page(
 ) -> tuple[str | None, int]:
     """One page as ``(text, limit used)``; ``text`` None means the leg must stop (status set).
 
-    A throttle is retried with backoff. An oversize body retries the same ``cursor`` with the
+    A throttle, timeout or 5xx is retried with backoff (a 403 never is). An oversize body
+    retries the same ``cursor`` with the
     limit halved (each retry is a paced, budgeted request); a single-product page that is still
     oversize marks the station ``oversize_product``.
     """
     attempt = 0
+    transient = 0
     while True:
         if not window_ok(clock_ns()):
             report.status = "paused_launch_window"
@@ -337,6 +347,16 @@ def _fetch_page(
                 )
                 return None, limit
             limit //= 2
+            continue
+        except (TransportTimeoutError, ServerError):
+            # Each failed attempt spent budget and pacing; the retry re-enters this loop, so it
+            # is paced, budgeted and window-guarded again. Exhausted: the station boundary
+            # records ``error`` with the resume date.
+            report.requests += 1
+            if transient == len(TRANSIENT_BACKOFF_S):
+                raise
+            sleep(TRANSIENT_BACKOFF_S[transient])
+            transient += 1
             continue
         except ForbiddenError:
             report.requests += 1

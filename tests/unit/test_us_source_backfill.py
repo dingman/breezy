@@ -18,7 +18,13 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
-from breezy.ingest.http import ForbiddenError, OversizeBodyError, RateLimitedError
+from breezy.ingest.http import (
+    ForbiddenError,
+    OversizeBodyError,
+    RateLimitedError,
+    ServerError,
+    TransportTimeoutError,
+)
 from breezy.ingest.probe_transport import RequestBudgetExceededError
 from breezy.persistence.us_source_request import US_PFM_AFOS_SOURCE
 from breezy.persistence.us_source_revision_store import UsSourceRevisionStore
@@ -1297,3 +1303,129 @@ def test_default_page_limit_is_20_and_dry_run_estimate_uses_it(tmp_path: Path) -
     days = 6  # 2026-10-01 .. 2026-10-06
     assert pfm["page_limit"] == 20
     assert pfm["estimated_requests"] == -(-days * bf.PLANNING_ISSUANCES_PER_DAY // 19)
+
+
+# ---- transient transport errors: bounded retry with backoff (2026-10-06 LOT/MFL timeouts)
+
+
+def _timeout() -> TransportTimeoutError:
+    return TransportTimeoutError("Timed out fetching https://mesonet.agron.iastate.edu/x")
+
+
+def test_transient_timeout_is_retried_with_backoff_then_succeeds(tmp_path: Path) -> None:
+    catalog = _Catalog(["051901"])
+    state = {"n": 0}
+
+    def fetch(wfo: str, sdate: dt.date, limit: int) -> str:
+        state["n"] += 1
+        if state["n"] == 1:
+            raise _timeout()
+        if state["n"] == 2:
+            raise ServerError("HTTP 503", status_code=503)
+        return catalog(wfo, sdate, limit)
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "complete"
+    assert report.appended == 1
+    assert sleeps.seconds == [30.0, 60.0]
+    assert report.requests == 3
+
+
+def test_timeout_retries_exhausted_ends_station_as_error_with_resume(tmp_path: Path) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise _timeout()
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "error"
+    assert "TransportTimeoutError" in (report.error or "")
+    assert report.resume_sdate == dt.date(2026, 10, 5)
+    assert calls == 4  # the first try plus three retries
+    assert sleeps.seconds == [30.0, 60.0, 120.0]
+
+
+def test_timeout_retries_are_charged_to_budget_and_paced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    small = _okx_product("051901").encode()
+    state = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise httpx.ReadTimeout("read timed out")
+        return httpx.Response(200, content=small)
+
+    mock = install_mock_http(monkeypatch, handler)
+    clock = _Clock(_utc(9, 12))
+    paced: list[float] = []
+
+    async def sleeper(seconds: float) -> None:
+        paced.append(seconds)
+        clock.now += int(seconds * _NS)
+
+    fetch = bf.make_pfm_fetch(
+        request_budget=3,
+        user_agent="breezy-test (alias)",
+        clock_ns=clock,
+        sleeper=sleeper,
+        check_proxy_env=False,
+    )
+    backoffs = _Sleeps()
+    windows: list[int] = []
+
+    def window_ok(now_ns: int) -> bool:
+        windows.append(now_ns)
+        return True
+
+    report = _leg(
+        tmp_path,
+        fetch,
+        page_limit=20,
+        end=dt.date(2026, 10, 5),
+        clock=clock,
+        sleep=backoffs,
+        window_ok=window_ok,
+    )
+
+    assert len(mock.requests) == 3  # every retry spent budget
+    assert report.requests == 3 and report.appended == 1
+    assert len(windows) == 3  # the launch-window guard ran before every attempt
+    assert len(paced) >= 2 and all(s >= 4.0 for s in paced)  # A0-R1 spacing between retries
+    with pytest.raises(RequestBudgetExceededError):
+        fetch("OKX", dt.date(2026, 10, 5), 5)
+
+
+def test_timeout_retry_stops_when_the_launch_window_opens(tmp_path: Path) -> None:
+    allowed = iter([True, False])
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        raise _timeout()
+
+    report = _leg(tmp_path, fetch, window_ok=lambda _n: next(allowed, False))
+
+    assert report.status == "paused_launch_window"
+    assert report.resume_sdate == dt.date(2026, 10, 5)
+
+
+def test_forbidden_is_never_retried(tmp_path: Path) -> None:
+    calls = 0
+
+    def fetch(_w: str, _s: dt.date, _l: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise ForbiddenError("403 abuse block")
+
+    sleeps = _Sleeps()
+    report = _leg(tmp_path, fetch, sleep=sleeps)
+
+    assert report.status == "forbidden"
+    assert calls == 1
+    assert sleeps.seconds == []
