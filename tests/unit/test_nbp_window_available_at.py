@@ -79,7 +79,9 @@ def test_the_new_field_does_not_change_which_window_build_version_rows_selects()
     windows = nbp_skill_study.complete_percentile_windows(rows)
     stripped = [dataclasses.replace(w, available_at_ns=None) for w in windows]
     registry = nbp_skill_study.station_registry(stations=("KMIA",))
-    truth = {}  # no settlement rows: both paths must count the same single gap
+    truth: dict[
+        tuple[str, dt.date], object
+    ] = {}  # no settlement rows: both paths must count the same single gap
 
     with_field = nbp_skill_study.build_version_rows(windows, truth, registry=registry)
     without = nbp_skill_study.build_version_rows(stripped, truth, registry=registry)

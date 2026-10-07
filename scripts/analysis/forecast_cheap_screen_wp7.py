@@ -923,19 +923,31 @@ def read_rung_tape(
     return instants, rows
 
 
+#: The daily-extremum column of each IEM MOS model: NBS prints ``txn``, GFS prints ``n_x``
+#: (both at the 00Z max / 12Z min ftimes, so the frozen ``climate_day_for_txn`` map applies).
+MOS_VALUE_COLUMN: dict[str, str] = {"NBS": "txn", "GFS": "n_x"}
+
+
 def forecast_cycles_from_mos_payload(
     body: bytes,
     *,
     icao: str,
     std_utc_offset_hours: float,
     runtime_days: frozenset[dt.date] | None = None,
+    model: str = "NBS",
 ) -> dict[dt.date, list[tuple[int, float]]]:
     """``climate_day -> [(runtime_ns, txn_f), ...]``, ALL cycles, sorted.
 
     Not ``forecasts_from_mos_payload``: see the module docstring. The frozen
     ``climate_day_for_txn`` map is reused verbatim; only the vintage rule
     differs, and it is applied later, at the registered decision instant.
+
+    ``model`` (default ``"NBS"``, the only value before F13) names the MOS model and so the
+    column holding the daily extremum (:data:`MOS_VALUE_COLUMN`); an unknown model is refused.
     """
+    column = MOS_VALUE_COLUMN.get(model)
+    if column is None:
+        raise ValueError(f"unknown MOS model {model!r}; the closed set is {sorted(MOS_VALUE_COLUMN)}")
     import csv
     import io
 
@@ -944,7 +956,7 @@ def forecast_cycles_from_mos_payload(
     out: dict[dt.date, list[tuple[int, float]]] = {}
     stream = io.TextIOWrapper(io.BytesIO(body), encoding="utf-8", newline="")
     for row in csv.DictReader(stream):
-        raw = (row.get("txn") or "").strip()
+        raw = (row.get(column) or "").strip()
         if not raw:
             continue
         runtime = dt.datetime.strptime(row["runtime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC)
@@ -957,7 +969,7 @@ def forecast_cycles_from_mos_payload(
                 runtime_ns=int(runtime.timestamp()) * _NS,
                 ftime_ns=int(ftime.timestamp()) * _NS,
                 std_utc_offset_hours=std_utc_offset_hours,
-                model="NBS",
+                model=model,
                 kind="max",
             )
         except ForecastValidPeriodError:
