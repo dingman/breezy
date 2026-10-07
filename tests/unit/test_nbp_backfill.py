@@ -20,6 +20,7 @@ import pytest
 from breezy.ingest.nbm_quantile_parse import NbpBulletinDriftError
 from breezy.ingest.nbm_quantile_transport import (
     BothHostsFailedError,
+    NbmQuantileFetchError,
     NbmQuantileFetchResult,
 )
 from breezy.persistence.nbp_derived_store import (
@@ -424,9 +425,7 @@ def test_derive_rows_for_bulletin_still_raises_the_drift_error_directly() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_apply_refuses_without_breezy_live(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_apply_refuses_without_breezy_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BREEZY_LIVE", raising=False)
     monkeypatch.setenv("BREEZY_USER_AGENT", "breezy-test (contact: jon@gopoint.com)")
 
@@ -558,3 +557,182 @@ def test_manifest_json_is_valid_and_resumable_after_process_restart(tmp_path: Pa
 
     reloaded = load_manifest(output_dir)
     assert "2026-09-28:13" in reloaded
+
+
+# ---------------------------------------------------------------------------
+# 8. KNYC / non-default station sets: isolation, budget, pacing, window, report.
+# ---------------------------------------------------------------------------
+
+_FIVE = frozenset({"KLAX", "KMDW", "KMIA", "KSFO", "KNYC"})
+_DAY = dt.date(2026, 9, 28)
+
+
+def _run(  # type: ignore[no-untyped-def]
+    tmp: Path, transport, *, cycles=(13, 19), clock=None, **kwargs
+):
+    return run_backfill(
+        plan=build_plan(start=_DAY, end=_DAY, cycles=cycles),
+        output_dir=tmp,
+        transport=transport,
+        runner=_FakeRunner(),  # type: ignore[arg-type]
+        progress=lambda _m: None,
+        clock=clock or _clock(),
+        dry_run=False,
+        **kwargs,
+    )
+
+
+def _programmed() -> _FakeTransport:
+    transport = _FakeTransport()
+    transport.program_result(_DAY, 13, _result(text=_fixture_text("nbptx_t13z_excerpt.txt")))
+    transport.program_result(
+        _DAY, 19, _result(text=_fixture_text("nbptx_t19z_excerpt.txt"), raw_sha256="b" * 64)
+    )
+    return transport
+
+
+def test_a_four_station_manifest_entry_never_skips_a_five_station_item(tmp_path: Path) -> None:
+    _run(tmp_path, _programmed())  # default 4-station run
+    transport = _programmed()
+
+    report = _run(tmp_path, transport, stations=_FIVE)
+
+    assert report.skipped == 0
+    assert report.written == 2
+    assert len(transport.calls) == 2
+
+
+def test_a_five_station_run_is_keyed_apart_from_the_default_keys(tmp_path: Path) -> None:
+    _run(tmp_path, _programmed(), stations=_FIVE)
+
+    keys = set(load_manifest(tmp_path))
+    assert manifest_key(_DAY, 13) not in keys
+    assert all("KNYC" in key for key in keys)
+
+
+def test_the_default_station_set_keeps_the_legacy_manifest_key(tmp_path: Path) -> None:
+    _run(tmp_path, _programmed())
+
+    assert manifest_key(_DAY, 13) in load_manifest(tmp_path)
+
+
+def test_derive_rows_counts_a_missing_knyc_block() -> None:
+    _rows, missing = derive_rows_for_bulletin(
+        text=_fixture_text("nbptx_t13z_excerpt.txt"),
+        source_host="h",
+        last_modified=None,
+        fetched_at_ns=1,
+        raw_sha256="a" * 64,
+        stations=_FIVE,
+    )
+
+    assert missing == 1
+
+
+def test_budget_stops_the_run_before_the_next_worst_case_item(tmp_path: Path) -> None:
+    transport = _programmed()
+
+    report = _run(tmp_path, transport, request_budget=2)
+
+    assert report.stop_reason == "budget_exhausted"
+    assert report.written == 1
+    assert len(transport.calls) == 1
+
+
+def test_pacing_sleeps_between_fetches(tmp_path: Path) -> None:
+    sleeps: list[float] = []
+
+    _run(tmp_path, _programmed(), pace_s=1.5, sleeper=sleeps.append)
+
+    assert sleeps == [1.5]
+
+
+def test_a_fetch_inside_the_launch_window_is_never_started(tmp_path: Path) -> None:
+    in_window = int(dt.datetime(2026, 10, 7, 16, 45, tzinfo=dt.UTC).timestamp() * 1e9)
+    transport = _programmed()
+
+    report = _run(tmp_path, transport, clock=lambda: in_window)
+
+    assert report.stop_reason == "paused_launch_window"
+    assert transport.calls == []
+
+
+def _argv(tmp_path: Path, *extra: str) -> list[str]:
+    return ["--start", "2026-09-28", "--end", "2026-09-28", *extra]
+
+
+def test_non_default_stations_refuse_the_default_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert main(_argv(tmp_path, "--stations", "KLAX,KNYC")) == 2
+    assert not (tmp_path / ".local").exists()
+
+
+def test_non_default_stations_refuse_an_explicit_default_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    default_root = tmp_path / ".local" / "share" / "breezy" / "derived" / "nbp"
+
+    exit_code = main(_argv(tmp_path, "--stations", "KLAX,KNYC", "--out-root", str(default_root)))
+
+    assert exit_code == 2
+
+
+def test_a_root_stamped_with_other_stations_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "nbp5"
+    root.mkdir()
+    (root / "_stations.json").write_text('["KLAX", "KNYC"]\n', encoding="utf-8")
+    assert main(_argv(tmp_path, "--stations", "KLAX,KNYC", "--out-root", str(root))) == 0
+    assert main(_argv(tmp_path, "--stations", "KLAX,KMIA", "--out-root", str(root))) == 2
+
+
+def test_apply_requires_a_request_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    monkeypatch.setenv("BREEZY_USER_AGENT", "breezy-test (jon@gopoint.com)")
+
+    assert main(_argv(tmp_path, "--apply", "--output-dir", str(tmp_path / "n"))) == 2
+
+
+def test_apply_builds_the_transport_with_the_stations_and_always_writes_a_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.analysis.nbp_backfill as module
+
+    seen: dict[str, object] = {}
+
+    class _Boom:
+        def __init__(self, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+        async def fetch_nbp_bulletin(self, **_kw: object) -> None:
+            raise NbmQuantileFetchError("boom")
+
+    monkeypatch.setattr(module, "NbmQuantileTransport", _Boom)
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    monkeypatch.setenv("BREEZY_USER_AGENT", "breezy-test (jon@gopoint.com)")
+    report_path = tmp_path / "report.json"
+
+    exit_code = main(
+        _argv(
+            tmp_path,
+            "--apply",
+            "--stations",
+            "KLAX,KMDW,KMIA,KSFO,KNYC",
+            "--out-root",
+            str(tmp_path / "nbp5"),
+            "--request-budget",
+            "100",
+            "--pace-s",
+            "0",
+            "--report-json",
+            str(report_path),
+        )
+    )
+
+    assert exit_code == 1
+    assert seen["stations"] == _FIVE
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["failed"] and payload["stations"] == sorted(_FIVE)

@@ -68,6 +68,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import json
 import os
 import sys
 import time
@@ -85,6 +86,7 @@ from breezy.ingest.nbm_quantile_transport import (
     NbmQuantileFetchError,
     NbmQuantileTransport,
 )
+from breezy.persistence.autonomy.capture_schedule import launch_window_guard
 from breezy.persistence.nbp_derived_store import (
     DerivedNbpRow,
     FailureEntry,
@@ -114,6 +116,7 @@ __all__ = [
     "build_plan",
     "default_output_dir",
     "derive_rows_for_bulletin",
+    "item_key",
     "main",
     "run_backfill",
 ]
@@ -134,6 +137,17 @@ DEFAULT_OUTPUT_DIR_TAIL: Final[tuple[str, ...]] = (
     "nbp",
 )
 
+#: Each item may issue two requests (S3, then the NOMADS fallback); the
+#: budget is charged the worst case up front so it is a hard ceiling.
+REQUESTS_PER_ITEM_WORST_CASE: Final[int] = 2
+#: Worst-case seconds one item can run (two hosts x the transport's 65 s
+#: connect+read ceiling, rounded up) -- the launch-window guard span.
+ITEM_WORST_CASE_S: Final[int] = 150
+DEFAULT_PACE_S: Final[float] = 1.0
+STATIONS_MARKER_NAME: Final[str] = "_stations.json"
+STOP_BUDGET: Final[str] = "budget_exhausted"
+STOP_WINDOW: Final[str] = "paused_launch_window"
+
 STATUS_WRITTEN: Final[str] = "WRITTEN"
 STATUS_SKIPPED: Final[str] = "SKIPPED"
 STATUS_WOULD_FETCH: Final[str] = "WOULD_FETCH"
@@ -142,6 +156,37 @@ STATUS_FAILED: Final[str] = "FAILED"
 
 def default_output_dir() -> Path:
     return Path.home().joinpath(*DEFAULT_OUTPUT_DIR_TAIL)
+
+
+def item_key(item: BackfillPlanItem, stations: frozenset[str]) -> str:
+    """Manifest key. The default (4-station) set keeps the legacy key so the
+    existing store resumes unchanged; any other set is suffixed with its
+    sorted members, so a 4-station item can never satisfy a 5-station one."""
+    if stations == DEFAULT_NBM_QUANTILE_STATIONS:
+        return item.key
+    return f"{item.key}@{'+'.join(sorted(stations))}"
+
+
+def _parse_stations(raw: str) -> frozenset[str]:
+    stations = frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+    if not stations:
+        raise ValueError("--stations must name at least one station")
+    return stations
+
+
+def _root_stations(output_dir: Path) -> frozenset[str] | None:
+    """The station set a root was stamped with; `None` for an unstamped root."""
+    marker = output_dir / STATIONS_MARKER_NAME
+    if not marker.exists():
+        return None
+    return frozenset(json.loads(marker.read_text(encoding="utf-8")))
+
+
+def _stamp_root(output_dir: Path, stations: frozenset[str]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / STATIONS_MARKER_NAME).write_text(
+        json.dumps(sorted(stations)) + "\n", encoding="utf-8"
+    )
 
 
 class BackfillPlanItem:
@@ -193,9 +238,7 @@ def era_for_cycle(cycle_runtime_ns: int) -> str:
     """The NBM version era `NBM_VERSION_BREAKS` expects for a cycle instant,
     read off the cycle's own UTC calendar date (matches how the SL-3 census
     itself classifies a date -- see `VERSION_BREAKS`)."""
-    cycle_date = dt.datetime.fromtimestamp(
-        cycle_runtime_ns / 1_000_000_000, tz=dt.UTC
-    ).date()
+    cycle_date = dt.datetime.fromtimestamp(cycle_runtime_ns / 1_000_000_000, tz=dt.UTC).date()
     return version_for(cycle_date)
 
 
@@ -258,7 +301,17 @@ def derive_rows_for_bulletin(
 class BackfillRunReport:
     """The whole run, in the shape the operator has to act on."""
 
-    __slots__ = ("dry_run", "failed", "output_dir", "skipped", "would_fetch", "written")
+    __slots__ = (
+        "dry_run",
+        "failed",
+        "output_dir",
+        "requests",
+        "skipped",
+        "stations",
+        "stop_reason",
+        "would_fetch",
+        "written",
+    )
 
     def __init__(
         self,
@@ -269,13 +322,32 @@ class BackfillRunReport:
         failed: tuple[str, ...],
         dry_run: bool,
         output_dir: Path,
+        stations: frozenset[str] = DEFAULT_NBM_QUANTILE_STATIONS,
+        requests: int = 0,
+        stop_reason: str | None = None,
     ) -> None:
+        self.stations = stations
+        self.requests = requests
+        self.stop_reason = stop_reason
         self.written = written
         self.skipped = skipped
         self.would_fetch = would_fetch
         self.failed = failed
         self.dry_run = dry_run
         self.output_dir = output_dir
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "dry_run": self.dry_run,
+            "output_dir": str(self.output_dir),
+            "stations": sorted(self.stations),
+            "written": self.written,
+            "skipped": self.skipped,
+            "would_fetch": self.would_fetch,
+            "failed": list(self.failed),
+            "requests_charged": self.requests,
+            "stop_reason": self.stop_reason,
+        }
 
 
 def run_backfill(
@@ -287,6 +359,10 @@ def run_backfill(
     progress: Callable[[str], None],
     clock: Callable[[], int],
     dry_run: bool,
+    stations: frozenset[str] = DEFAULT_NBM_QUANTILE_STATIONS,
+    request_budget: int | None = None,
+    pace_s: float = 0.0,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> BackfillRunReport:
     """Walk the plan date-major, one (date, cycle) at a time, process-then-
     discard: exactly one fetched bulletin's text is alive at a time.
@@ -294,6 +370,11 @@ def run_backfill(
     A failure (both hosts, or a bulletin the parser refuses) is recorded to
     the failure ledger and NEVER written as a partial or guessed row; the
     run continues to the next item.
+
+    Disciplines: `request_budget` is a hard ceiling charged at the worst case
+    (two requests) per item; `pace_s` sleeps between fetches; an item never
+    starts when its worst-case span would meet the 16:30-17:10Z launch window
+    (the run stops and reports `paused_launch_window`).
     """
     manifest = load_manifest(output_dir)
     written = 0
@@ -301,10 +382,14 @@ def run_backfill(
     would_fetch = 0
     failed: list[str] = []
     total = len(plan)
+    charged = 0
+    stop_reason: str | None = None
+    fetched_any = False
 
     for index, item in enumerate(plan, start=1):
         prefix = f"[{index}/{total}] {item.label}"
-        if item.key in manifest:
+        key = item_key(item, stations)
+        if key in manifest:
             skipped += 1
             progress(f"{prefix} {STATUS_SKIPPED} (already in manifest)")
             continue
@@ -316,6 +401,19 @@ def run_backfill(
 
         assert transport is not None and runner is not None  # dry_run False => both required
 
+        if request_budget is not None and (charged + REQUESTS_PER_ITEM_WORST_CASE > request_budget):
+            stop_reason = STOP_BUDGET
+            progress(f"{prefix} STOPPED request budget {request_budget} exhausted")
+            break
+        if not launch_window_guard(clock(), 0, ITEM_WORST_CASE_S):
+            stop_reason = STOP_WINDOW
+            progress(f"{prefix} STOPPED launch window 16:30-17:10Z; resume from this item")
+            break
+        if fetched_any and pace_s > 0:
+            sleeper(pace_s)
+        fetched_any = True
+        charged += REQUESTS_PER_ITEM_WORST_CASE
+
         def _log_with_prefix(message: str, *, _prefix: str = prefix) -> None:
             progress(f"{_prefix} {message}")
 
@@ -326,7 +424,7 @@ def run_backfill(
         except BothHostsFailedError as exc:
             record_failure(
                 output_dir,
-                item.key,
+                key,
                 FailureEntry(
                     cycle_date=item.cycle_date.isoformat(),
                     cycle_hour=item.cycle_hour,
@@ -341,7 +439,7 @@ def run_backfill(
         except NbmQuantileFetchError as exc:
             record_failure(
                 output_dir,
-                item.key,
+                key,
                 FailureEntry(
                     cycle_date=item.cycle_date.isoformat(),
                     cycle_hour=item.cycle_hour,
@@ -361,12 +459,13 @@ def run_backfill(
                 last_modified=result.last_modified,
                 fetched_at_ns=result.fetched_at_ns,
                 raw_sha256=result.raw_sha256,
+                stations=stations,
                 log=_log_with_prefix,
             )
         except NbpBulletinDriftError as exc:
             record_failure(
                 output_dir,
-                item.key,
+                key,
                 FailureEntry(
                     cycle_date=item.cycle_date.isoformat(),
                     cycle_hour=item.cycle_hour,
@@ -384,7 +483,7 @@ def run_backfill(
         write_partition(rows, path)
         record_success(
             output_dir,
-            item.key,
+            key,
             ManifestEntry(
                 cycle_date=item.cycle_date.isoformat(),
                 cycle_hour=item.cycle_hour,
@@ -408,6 +507,9 @@ def run_backfill(
         failed=tuple(failed),
         dry_run=dry_run,
         output_dir=output_dir,
+        stations=stations,
+        requests=charged,
+        stop_reason=stop_reason,
     )
 
 
@@ -420,6 +522,11 @@ def render_summary(report: BackfillRunReport) -> str:
             f"{report.skipped} already covered, {len(report.failed)} failed"
         ),
     ]
+    lines.append(
+        f"  stations={','.join(sorted(report.stations))} requests_charged={report.requests}"
+    )
+    if report.stop_reason:
+        lines.append(f"  STOPPED EARLY: {report.stop_reason} (re-run resumes from the manifest)")
     if report.failed:
         lines.append("  FAILED (see _failures.json; never fetched a partial row):")
         lines.extend(f"    {label}" for label in report.failed)
@@ -437,11 +544,23 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, add_help=True)
     parser.add_argument("--start", required=True, help="First date, inclusive, YYYY-MM-DD.")
     parser.add_argument("--end", required=True, help="Last date, inclusive, YYYY-MM-DD.")
-    parser.add_argument("--output-dir", default=None, type=Path)
+    parser.add_argument("--output-dir", "--out-root", dest="output_dir", default=None, type=Path)
+    parser.add_argument(
+        "--stations",
+        default=",".join(sorted(DEFAULT_NBM_QUANTILE_STATIONS)),
+        help="Comma-separated station ids. A non-default set REQUIRES a fresh --out-root.",
+    )
+    parser.add_argument("--request-budget", type=int, default=None)
+    parser.add_argument("--pace-s", type=float, default=DEFAULT_PACE_S)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--report-json", default=None, type=Path)
     return parser.parse_args(list(argv))
+
+
+def _write_report(report: BackfillRunReport, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
 
 
 def _stderr(line: str) -> None:
@@ -470,8 +589,26 @@ def main(argv: Sequence[str] | None = None, *, clock: Callable[[], int] | None =
     except ValueError as exc:
         return _refuse(str(exc))
 
-    output_dir = args.output_dir if args.output_dir is not None else default_output_dir()
+    try:
+        stations = _parse_stations(args.stations)
+    except ValueError as exc:
+        return _refuse(str(exc))
+    default_root = default_output_dir()
+    output_dir = args.output_dir if args.output_dir is not None else default_root
     dry_run = args.dry_run or not args.apply
+
+    stamped = _root_stations(output_dir)
+    if stations != DEFAULT_NBM_QUANTILE_STATIONS and output_dir.resolve() == default_root.resolve():
+        return _refuse(
+            "a non-default --stations set may not be written into the default NBP root "
+            f"{default_root} (it is evidence for prior studies); pass a fresh --out-root."
+        )
+    if stamped is not None and stamped != stations:
+        return _refuse(
+            f"{output_dir} is stamped with stations {sorted(stamped)}; refusing {sorted(stations)}."
+        )
+    if stamped is None and stations != DEFAULT_NBM_QUANTILE_STATIONS and load_manifest(output_dir):
+        return _refuse(f"{output_dir} holds an unstamped (default-station) manifest.")
 
     if not dry_run:
         if os.environ.get(LIVE_ENV_VAR) != "1":
@@ -481,10 +618,15 @@ def main(argv: Sequence[str] | None = None, *, clock: Callable[[], int] | None =
             )
         if not os.environ.get(USER_AGENT_ENV_VAR):
             return _refuse(f"{USER_AGENT_ENV_VAR} must name a monitored contact.")
+        if not args.request_budget or args.request_budget < 1:
+            return _refuse(
+                "--request-budget is required for --apply "
+                f"(worst case {REQUESTS_PER_ITEM_WORST_CASE} per item x {len(plan)} items)."
+            )
 
     _stderr(
         f"NBP backfill: {len(plan)} item(s) planned ({start}..{end}, cycles={CYCLES}) "
-        f"into {output_dir}"
+        f"into {output_dir} stations={sorted(stations)}"
     )
     _stderr(
         "dedupe: no-BBB mode (R2-13/R3-08 branch (b) -- BBB correction indicator "
@@ -502,14 +644,22 @@ def main(argv: Sequence[str] | None = None, *, clock: Callable[[], int] | None =
             progress=_stderr,
             clock=resolved_clock,
             dry_run=True,
+            stations=stations,
         )
         sys.stderr.write(render_summary(report))
+        if args.report_json is not None:
+            _write_report(report, args.report_json)
         return 0
 
-    exit_code = 0
+    if stations != DEFAULT_NBM_QUANTILE_STATIONS:
+        _stamp_root(output_dir, stations)
+    report_path = (
+        args.report_json if args.report_json is not None else output_dir / "_run_report.json"
+    )
     with asyncio.Runner() as runner:
         transport = NbmQuantileTransport(
             clock=resolved_clock,
+            stations=stations,
             user_agent=os.environ[USER_AGENT_ENV_VAR],
         )
         report = run_backfill(
@@ -520,11 +670,13 @@ def main(argv: Sequence[str] | None = None, *, clock: Callable[[], int] | None =
             progress=_stderr,
             clock=resolved_clock,
             dry_run=False,
+            stations=stations,
+            request_budget=args.request_budget,
+            pace_s=args.pace_s,
         )
     sys.stderr.write(render_summary(report))
-    if report.failed:
-        exit_code = 1
-    return exit_code
+    _write_report(report, report_path)
+    return 1 if report.failed or report.stop_reason else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - operator entry point
