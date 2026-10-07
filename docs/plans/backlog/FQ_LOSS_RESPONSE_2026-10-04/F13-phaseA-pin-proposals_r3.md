@@ -86,3 +86,20 @@ Status: **frozen intent.** Every value and every derivation rule below is fixed 
    - make **one** gated freeze commit and stamp it;
    - push.
 3. **After the freeze:** build the scored primary pair and its lag twin, then run stages A–C.
+
+## E. C1 lag-evidence rulings (coordinator, 2026-10-07)
+
+`scripts/analysis/c1_lag_evidence.py` (branch `feat/f13-c1-lag-samples`) was run on the live ledgers. Only **lamp-mdl** and **pfm** have a live measurement path, each with 2 days of data so far. There is **no live path** for **lav-iem**, **mos-gfs** or **obs**.
+
+- **C1-R1. Measure all five sources; never pin a lag from its floor alone.**
+  - Add collector legs that record the first-seen time for three sources:
+    - **lav-iem:** the IEM LAV product.
+    - **mos-gfs:** GFS MOS MAV for the five stations.
+    - **obs:** routine METAR, polled from the **same endpoint and client that the live obs ingest uses**, so the measured lag is the lag the bot would see.
+  - The PIN-R6 rule `max(floor, p99)` then applies to all five sources.
+  - **Consequence:** the freeze date becomes the later of 2026-10-20 and the date the last of these legs reaches 14 measured days.
+- **C1-R2. `lamp-mdl` lag is measured on the live NOMADS LAMP feed.** That is the feed a live consumer reads. The pin key names the source family, not the archive host.
+- **C1-R3. A lag bounded by poll cadence is accepted.** First-seen minus issuance overstates the true lag by up to one poll interval (pfm p99 is 160 min so far). For leak safety that error falls on the conservative side, so it is accepted.
+- **C1-R4. Key unification.**
+  - The runner's `_check_c1` counts by `LEVEL_SOURCES` (`lamp`, `pfm`, `mos`), while the pins use the five lag keys. `_check_c1` must count and require by the five pin keys.
+  - The evidence file is produced only by `c1_lag_evidence.py`, using schema `c1_lag_evidence/v1`.
