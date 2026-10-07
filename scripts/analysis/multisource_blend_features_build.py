@@ -23,15 +23,15 @@ The twin (FB-R2) shifts EVERY source lag by 60 min, NBP included; the CLI label 
 A row whose NBP window or station-day is shifted out is simply absent from the twin and reported as
 lost per horizon. ``obs_available_at_ns`` is shifted in the twin.
 
-Exit codes: 0 complete; 1 degraded (a payload was unreadable; outputs written); 2 refused or leak
-(only the report is written). Holdout (>= 2026-07-01) rows are never read or emitted; this module
-never opens the holdout.
+Exit codes: 0 complete; 1 degraded (a payload was unreadable; outputs written); 2 refused, leak or
+an unexpected error (only the report is written; its ``status`` is ``refused`` or ``error``). The
+two feature files and their sidecars are written as one set (temp files, then renames). Holdout
+(>= 2026-07-01) rows are never read or emitted; this module never opens the holdout.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import hashlib
 import json
@@ -77,16 +77,44 @@ from scripts.analysis.multisource_blend_inputs_forecast import (
     collect_pfm_vintages,
     select_nbp,
 )
-from scripts.analysis.multisource_blend_inputs_lamp import LampArchive, basis_breaks
-from scripts.analysis.multisource_blend_skill import SIDECAR_SCHEMA, SIDECAR_SUFFIX, content_digest
+from scripts.analysis.multisource_blend_inputs_lamp import LampArchive
+from scripts.analysis.multisource_blend_inputs_pins import (
+    LAG_FLOORS_NS,
+    Anchors,
+    BuildRefusal,
+    Pins,
+    anchor_ns_for,
+    load_pins,
+    parse_anchors,
+)
+from scripts.analysis.multisource_blend_inputs_report import (
+    lag_report,
+    lamp_breaks,
+    nbp_version_breaks,
+    obs_report,
+    source_lags,
+    truth_concordance,
+)
+from scripts.analysis.multisource_blend_sidecar import (
+    ANCHOR_VARIANTS,
+    PRIMARY_VARIANT,
+    SIDECAR_SCHEMA,
+    SIDECAR_SUFFIX,
+    sha256_file,
+)
+from scripts.analysis.multisource_blend_skill import content_digest
 from scripts.archive.iem_mos_backfill import ModelMixError
 
 __all__ = [
     "EXIT_DEGRADED",
     "EXIT_OK",
     "EXIT_REFUSED",
+    "LAG_FLOORS_NS",
+    "Anchors",
     "BuildRefusal",
+    "Pins",
     "anchor_ns_for",
+    "load_pins",
     "main",
     "parse_anchors",
     "read_only_cache",
@@ -98,26 +126,8 @@ EXIT_REFUSED: Final[int] = 2
 DEFAULT_MAX_MEMORY_GIB: Final[float] = 4.0
 DEFAULT_STATIONS: Final[tuple[str, ...]] = ("KLAX", "KMDW", "KMIA", "KNYC", "KSFO")
 LIVE_DATA_ROOT: Final[Path] = Path.home() / ".local" / "share" / "breezy"
-_MIN_NS: Final[int] = 60 * 1_000_000_000
 _DAY: Final[dt.timedelta] = dt.timedelta(days=1)
 MOS_MODEL: Final[str] = "GFS"
-VARIANTS: Final[tuple[str, ...]] = ("primary", "d0_12lst")
-OFFSET_RULE: Final[str] = "fixed_standard_time_never_dst"
-#: R29 conservative floors: a pinned lag below its floor is refused (FB-R4).
-LAG_FLOORS_NS: Final[Mapping[str, int]] = {
-    "lamp-mdl": 60 * _MIN_NS,
-    "lav-iem": 90 * _MIN_NS,
-    "pfm": 60 * _MIN_NS,
-    "mos-gfs": 300 * _MIN_NS,
-    "obs": 15 * _MIN_NS,
-}
-_LAG_BASIS: Final[Mapping[str, str]] = {
-    "lamp-mdl": "nominal run time + max(60 min, C1 max)",
-    "lav-iem": "nominal run label + max(60 min, C1 max) + 30 min (label HH:00, real run HH:30)",
-    "pfm": "WMO issuance + 60 min (IEM entered time is not in the archive)",
-    "mos-gfs": "runtime + 5 h",
-    "obs": "report time + 15 min",
-}
 #: Counts meaning a payload could not be used: the run is degraded (exit 1), outputs written.
 DEGRADING_COUNTS: Final[tuple[str, ...]] = (
     "nbp_partition_unreadable",
@@ -138,10 +148,6 @@ _REFUSALS: Final[tuple[type[Exception], ...]] = (
 )
 
 
-class BuildRefusal(Exception):
-    """The build is refused; only the report is written."""
-
-
 _CAUGHT: Final[tuple[type[Exception], ...]] = (BuildRefusal, *_REFUSALS)
 
 
@@ -157,127 +163,6 @@ def _refuse_fetch(_request: object) -> bytes:
 def read_only_cache(root: Path) -> ArchiveCache:
     """An ``ArchiveCache`` that can only read: any miss would call a fetcher that always refuses."""
     return ArchiveCache(root, fetch=_refuse_fetch, clock=_NoClock())
-
-
-# ------------------------------------------------------------------ pins
-
-
-@dataclass(frozen=True, slots=True)
-class Anchors:
-    d_minus_1_utc_hour: int
-    d0_lst_hour: int
-    d0_sensitivity_lst_hour: int
-
-
-def _hour(raw: Any, kind: str, name: str) -> int:
-    ok = isinstance(raw, Mapping) and raw.get("kind") == kind
-    hour = raw.get("hour") if isinstance(raw, Mapping) else None
-    if not ok or isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
-        raise BuildRefusal(
-            f"pins.anchors.{name} must be {{kind: {kind}, hour: 0..23}}, was {raw!r}"
-        )
-    return hour
-
-
-def parse_anchors(raw: Any) -> Anchors:
-    """FB-R1: validate the ``anchors`` pin (D-1 UTC hour, D0 and D0-sensitivity LST hours)."""
-    if not isinstance(raw, Mapping):
-        raise BuildRefusal(f"pins.anchors must be an object, was {raw!r}")
-    if raw.get("offset_rule") != OFFSET_RULE:
-        raise BuildRefusal(f"pins.anchors.offset_rule must be {OFFSET_RULE!r}")
-    return Anchors(
-        _hour(raw.get("D-1"), "utc", "D-1"),
-        _hour(raw.get("D0"), "lst", "D0"),
-        _hour(raw.get("D0_sensitivity"), "lst", "D0_sensitivity"),
-    )
-
-
-def anchor_ns_for(
-    horizon: str,
-    day: dt.date,
-    std_utc_offset_hours: float,
-    anchors: Anchors,
-    *,
-    variant: str = "primary",
-) -> int:
-    """The anchor instant (ns): D-1 is a UTC hour the day before; D0 an LST hour (fixed offset)."""
-    midnight = dt.datetime(day.year, day.month, day.day, tzinfo=dt.UTC)
-    if horizon == "D-1":
-        moment = midnight - _DAY + dt.timedelta(hours=anchors.d_minus_1_utc_hour)
-    elif horizon == "D0":
-        hour = anchors.d0_sensitivity_lst_hour if variant == "d0_12lst" else anchors.d0_lst_hour
-        moment = midnight - dt.timedelta(hours=std_utc_offset_hours) + dt.timedelta(hours=hour)
-    else:
-        raise ValueError(f"horizon must be one of {HORIZONS}, was {horizon!r}")
-    return int(moment.timestamp()) * 1_000_000_000
-
-
-def _parse_lags(raw: Any) -> dict[str, int]:
-    if not isinstance(raw, Mapping) or set(raw) != set(LAG_FLOORS_NS):
-        raise BuildRefusal(
-            f"pins.source_lags_ns must be an object with keys {sorted(LAG_FLOORS_NS)}"
-        )
-    lags: dict[str, int] = {}
-    for key, floor in LAG_FLOORS_NS.items():
-        value = raw[key]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise BuildRefusal(f"pins.source_lags_ns.{key} must be integer ns, was {value!r}")
-        if value < floor:
-            raise BuildRefusal(
-                f"pins.source_lags_ns.{key} = {value} ns is below the conservative floor {floor} ns"
-            )
-        lags[key] = value
-    return lags
-
-
-def _parse_routine_minutes(raw: Any) -> dict[str, int]:
-    """FB-R13: ``{icao: minute of the hour}`` for every station's routine METAR report."""
-    if not isinstance(raw, Mapping) or not raw:
-        raise BuildRefusal(
-            "pins.obs_routine_minute_by_station must be a non-empty object {icao: minute 0..59} "
-            f"(FB-R13), was {raw!r}"
-        )
-    minutes: dict[str, int] = {}
-    for icao, minute in raw.items():
-        if (
-            isinstance(minute, bool)
-            or not isinstance(minute, int)
-            or not 0 <= minute < obsmod.MINUTES_PER_HOUR
-        ):
-            raise BuildRefusal(
-                f"pins.obs_routine_minute_by_station.{icao} must be an integer minute 0..59, "
-                f"was {minute!r}"
-            )
-        minutes[str(icao)] = minute
-    return minutes
-
-
-@dataclass(frozen=True, slots=True)
-class Pins:
-    anchors: Anchors
-    anchors_raw: Mapping[str, Any]
-    lags: Mapping[str, int]
-    obs_routine_minute_by_station: Mapping[str, int]
-
-
-def load_pins(design: Mapping[str, Any]) -> Pins:
-    pins = design.get("pins")
-    if not isinstance(pins, Mapping):
-        raise BuildRefusal("the prereg has no `pins` object")
-    anchors = parse_anchors(pins.get("anchors"))
-    lags = _parse_lags(pins.get("source_lags_ns"))
-    if pins.get("obs_source") != obsmod.OBS_SOURCE_LABEL:
-        raise BuildRefusal(
-            f"pins.obs_source must be {obsmod.OBS_SOURCE_LABEL!r}, was {pins.get('obs_source')!r}"
-        )
-    cadence = pins.get("obs_cadence_seconds")
-    if isinstance(cadence, bool) or cadence != obsmod.ROUTINE_OBS_CADENCE_SECONDS:
-        raise BuildRefusal(
-            f"pins.obs_cadence_seconds must be the routine-METAR cadence "
-            f"{obsmod.ROUTINE_OBS_CADENCE_SECONDS}, was {cadence!r} (FB-R13)"
-        )
-    minutes = _parse_routine_minutes(pins.get("obs_routine_minute_by_station"))
-    return Pins(anchors, pins["anchors"], lags, minutes)
 
 
 # ------------------------------------------------------------------ configuration and path guards
@@ -308,7 +193,9 @@ def _inside(path: Path, root: Path) -> bool:
 
 def _guard_outputs(cfg: Config) -> None:
     """Writes are refused under the live data root and under any input; existing files are kept."""
-    inputs = (cfg.nbp_root, cfg.us_root, cfg.mos_root, cfg.asos_root, cfg.truth, cfg.prereg)
+    inputs = [cfg.nbp_root, cfg.us_root, cfg.mos_root, cfg.asos_root, cfg.truth, cfg.prereg]
+    if cfg.f2_truth is not None:
+        inputs.append(cfg.f2_truth)
     for path in (cfg.out_features, cfg.out_lag, cfg.report):
         if _inside(path, LIVE_DATA_ROOT):
             raise BuildRefusal(f"refusing to write into the live data root: {path}")
@@ -320,20 +207,51 @@ def _guard_outputs(cfg: Config) -> None:
                 raise BuildRefusal(f"{target} already exists; outputs are write-once")
 
 
-def _write_new(path: Path, data: bytes) -> None:
+def _tmp_name(path: Path) -> Path:
+    return path.with_name(path.name + ".tmp")
+
+
+def _stage(path: Path, data: bytes) -> Path:
+    """Write ``data`` to ``<path>.tmp`` (a stale one from an interrupted run is replaced)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = _tmp_name(path)
+    tmp.unlink(missing_ok=True)
     with tmp.open("xb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    return tmp
+
+
+def _publish(staged: Sequence[tuple[Path, Path]]) -> None:
+    published: list[Path] = []
+    try:
+        for tmp, path in staged:
+            os.replace(tmp, path)
+            published.append(path)
+    except BaseException:
+        for path in published:  # none of them existed before: _guard_outputs checked
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _write_set(items: Sequence[tuple[Path, bytes]]) -> None:
+    """Write every file to a temp name, then rename the set; a failure leaves none of them."""
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for path, data in items:
+            tmp = _tmp_name(path)
+            staged.append((tmp, path))  # registered first so a partial write is cleaned too
+            _stage(path, data)
+        _publish(staged)
+    except BaseException:
+        for tmp, _path in staged:
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 def _sha256(path: Path) -> str:
-    if not path.is_file():
-        return "absent"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return sha256_file(path) if path.is_file() else "absent"
 
 
 # ------------------------------------------------------------------ the build
@@ -347,12 +265,15 @@ class _Tally:
     obs_five_min_differs: int = 0
 
 
-def _day_range(start: dt.date, end: dt.date) -> list[dt.date]:
-    return [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
-
-
-def _shifted(readings: Sequence[ObsReading], shift_ns: int) -> list[ObsReading]:
-    return [ObsReading(r.ts_ns, r.available_at_ns + shift_ns, r.temp_f, r.source) for r in readings]
+@dataclass(slots=True)
+class _Context:
+    tally: _Tally
+    truth: Mapping[tuple[str, dt.date], Any]
+    nbp: Mapping[tuple[str, dt.date], list[NbpCandidate]]
+    lamp: LampArchive
+    us_cache: ArchiveCache
+    mos_cache: ArchiveCache
+    asos_cache: ArchiveCache
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,91 +281,6 @@ class _Station:
     icao: str
     key: str
     offset: float
-
-
-def _build_station(
-    cfg: Config,
-    pins: Pins,
-    station: _Station,
-    ctx: _Context,
-    primary: list[msb.FeatureRow],
-    lag: list[msb.FeatureRow],
-) -> dict[dt.date, str | None]:
-    tally = ctx.tally
-    end_exclusive = cfg.end + _DAY
-    routine_minute = pins.obs_routine_minute_by_station.get(station.icao)
-    if routine_minute is None:
-        raise BuildRefusal(
-            f"pins.obs_routine_minute_by_station has no entry for {station.icao} (FB-R13)"
-        )
-    pfm = collect_pfm_vintages(
-        ctx.us_cache,
-        icao=station.icao,
-        lag_ns=pins.lags["pfm"],
-        end_exclusive=end_exclusive,
-        counts=tally.counts,
-    )
-    mos = collect_mos_vintages(
-        ctx.mos_cache,
-        icao=station.icao,
-        std_utc_offset_hours=station.offset,
-        first_day=cfg.start,
-        last_day=cfg.end,
-        lag_ns=pins.lags["mos-gfs"],
-        model=MOS_MODEL,
-        counts=tally.counts,
-    )
-    days = []
-    for day in _day_range(cfg.start, cfg.end):
-        if (station.key, day) in ctx.truth:
-            days.append(day)
-        else:
-            for horizon in HORIZONS:
-                tally.by_horizon[horizon]["truth_missing"] += 1
-    anchors = {
-        (day, h): anchor_ns_for(h, day, station.offset, pins.anchors, variant=cfg.variant)
-        for day in days
-        for h in HORIZONS
-    }
-    bases: dict[dt.date, str | None] = {}
-    for year in sorted({d.year for d in days}):
-        year_days = [d for d in days if d.year == year]
-        cutoffs = {d: max(anchors[(d, h)] for h in HORIZONS) for d in year_days}
-        obs_year = obsmod.read_obs_year(
-            ctx.asos_cache,
-            station.icao,
-            year,
-            std_utc_offset_hours=station.offset,
-            routine_minute=routine_minute,
-            lag_ns=pins.lags["obs"],
-            cutoff_ns_by_day=cutoffs,
-        )
-        tally.counts.update(obs_year.counts)
-        for day in year_days:
-            readings = obs_year.readings_by_day.get(day, ())
-            for horizon in HORIZONS:
-                anchor = anchors[(day, horizon)]
-                choice = ctx.lamp.runs_for(station.icao, anchor_ns=anchor)
-                bases[day] = bases.get(day) or choice.basis
-                inputs = _RowInputs(
-                    station, day, horizon, anchor, choice.runs, readings,
-                    pfm.get(day, ()), mos.vintages_by_day.get(day, ()),
-                )  # fmt: skip
-                for shift, target in ((0, primary), (LAG_SHIFT_NS, lag)):
-                    row = _assemble(ctx, inputs, shift)
-                    if row is not None:
-                        target.append(row)
-                        _tally_row(tally, row, shift)
-                        if shift == 0 and horizon == "D0":
-                            raw = obsmod.raw_running_max_at(
-                                obs_year.raw_max_by_day.get(day, ()), anchor
-                            )
-                            tally.obs_raw_differs += int(raw != row.obs_so_far_f)
-                            five = obsmod.raw_running_max_at(
-                                obs_year.five_min_max_by_day.get(day, ()), anchor
-                            )
-                            tally.obs_five_min_differs += int(five != row.obs_so_far_f)
-    return bases
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +293,43 @@ class _RowInputs:
     readings: Sequence[ObsReading]
     pfm: Sequence[Any]
     mos: Sequence[Any]
+
+
+@dataclass(slots=True)
+class _Rows:
+    """The two files' rows, and the LAMP basis seen per station, horizon and day."""
+
+    primary: list[msb.FeatureRow]
+    lag: list[msb.FeatureRow]
+    lamp_bases: dict[str, dict[str, dict[dt.date, str | None]]]
+
+
+def _day_range(start: dt.date, end: dt.date) -> list[dt.date]:
+    return [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
+
+
+def _shifted(readings: Sequence[ObsReading], shift_ns: int) -> list[ObsReading]:
+    return [ObsReading(r.ts_ns, r.available_at_ns + shift_ns, r.temp_f, r.source) for r in readings]
+
+
+def _routine_minute(pins: Pins, station: _Station) -> int:
+    minute = pins.obs_routine_minute_by_station.get(station.icao)
+    if minute is None:
+        raise BuildRefusal(
+            f"pins.obs_routine_minute_by_station has no entry for {station.icao} (FB-R13)"
+        )
+    return minute
+
+
+def _station_days(cfg: Config, ctx: _Context, station: _Station) -> list[dt.date]:
+    days: list[dt.date] = []
+    for day in _day_range(cfg.start, cfg.end):
+        if (station.key, day) in ctx.truth:
+            days.append(day)
+        else:
+            for horizon in HORIZONS:
+                ctx.tally.by_horizon[horizon]["truth_missing"] += 1
+    return days
 
 
 def _assemble(ctx: _Context, item: _RowInputs, shift_ns: int) -> msb.FeatureRow | None:
@@ -481,6 +354,7 @@ def _assemble(ctx: _Context, item: _RowInputs, shift_ns: int) -> msb.FeatureRow 
         pfm_vintages=item.pfm,
         mos_vintages=item.mos,
         extra_lag_ns=shift_ns,
+        nbp_cycle_ns=nbp.cycle_runtime_ns,
     )
 
 
@@ -496,15 +370,104 @@ def _tally_row(tally: _Tally, row: msb.FeatureRow, shift_ns: int) -> None:
     cell["obs_missing"] += int(row.obs_so_far_f is None)
 
 
-@dataclass(slots=True)
-class _Context:
-    tally: _Tally
-    truth: Mapping[tuple[str, dt.date], Any]
-    nbp: Mapping[tuple[str, dt.date], list[NbpCandidate]]
-    lamp: LampArchive
-    us_cache: ArchiveCache
-    mos_cache: ArchiveCache
-    asos_cache: ArchiveCache
+def _tally_obs_arms(
+    tally: _Tally, row: msb.FeatureRow, obs_year: obsmod.ObsYear, day: dt.date, anchor: int
+) -> None:
+    """The descriptive raw 1-min and 5-min arms: counted against the feature, never a feature."""
+    raw = obsmod.raw_running_max_at(obs_year.raw_max_by_day.get(day, ()), anchor)
+    tally.obs_raw_differs += int(raw != row.obs_so_far_f)
+    five = obsmod.raw_running_max_at(obs_year.five_min_max_by_day.get(day, ()), anchor)
+    tally.obs_five_min_differs += int(five != row.obs_so_far_f)
+
+
+def _emit_rows(ctx: _Context, item: _RowInputs, obs_year: obsmod.ObsYear, rows: _Rows) -> None:
+    for shift, target in ((0, rows.primary), (LAG_SHIFT_NS, rows.lag)):
+        row = _assemble(ctx, item, shift)
+        if row is None:
+            continue
+        target.append(row)
+        _tally_row(ctx.tally, row, shift)
+        if shift == 0 and item.horizon == "D0":
+            _tally_obs_arms(ctx.tally, row, obs_year, item.day, item.anchor_ns)
+
+
+@dataclass(frozen=True, slots=True)
+class _StationSources:
+    pfm: Mapping[dt.date, Sequence[Any]]
+    mos: Mapping[dt.date, Sequence[Any]]
+    routine_minute: int
+
+
+def _load_sources(cfg: Config, pins: Pins, station: _Station, ctx: _Context) -> _StationSources:
+    minute = _routine_minute(pins, station)
+    counts = ctx.tally.counts
+    pfm = collect_pfm_vintages(
+        ctx.us_cache,
+        icao=station.icao,
+        lag_ns=pins.lags["pfm"],
+        end_exclusive=cfg.end + _DAY,
+        counts=counts,
+    )
+    mos = collect_mos_vintages(
+        ctx.mos_cache,
+        icao=station.icao,
+        std_utc_offset_hours=station.offset,
+        first_day=cfg.start,
+        last_day=cfg.end,
+        lag_ns=pins.lags["mos-gfs"],
+        model=MOS_MODEL,
+        counts=counts,
+    )
+    return _StationSources(pfm, mos.vintages_by_day, minute)
+
+
+def _build_year(
+    pins: Pins,
+    station: _Station,
+    ctx: _Context,
+    sources: _StationSources,
+    year: int,
+    anchors: Mapping[tuple[dt.date, str], int],
+    year_days: Sequence[dt.date],
+    rows: _Rows,
+) -> None:
+    cutoffs = {d: max(anchors[(d, h)] for h in HORIZONS) for d in year_days}
+    obs_year = obsmod.read_obs_year(
+        ctx.asos_cache,
+        station.icao,
+        year,
+        std_utc_offset_hours=station.offset,
+        routine_minute=sources.routine_minute,
+        lag_ns=pins.lags["obs"],
+        cutoff_ns_by_day=cutoffs,
+    )
+    ctx.tally.counts.update(obs_year.counts)
+    bases = rows.lamp_bases[station.icao]
+    for day in year_days:
+        readings = obs_year.readings_by_day.get(day, ())
+        for horizon in HORIZONS:
+            anchor = anchors[(day, horizon)]
+            choice = ctx.lamp.runs_for(station.icao, anchor_ns=anchor)
+            bases[horizon][day] = choice.basis
+            item = _RowInputs(
+                station, day, horizon, anchor, choice.runs, readings,
+                sources.pfm.get(day, ()), sources.mos.get(day, ()),
+            )  # fmt: skip
+            _emit_rows(ctx, item, obs_year, rows)
+
+
+def _build_station(cfg: Config, pins: Pins, station: _Station, ctx: _Context, rows: _Rows) -> None:
+    sources = _load_sources(cfg, pins, station, ctx)
+    days = _station_days(cfg, ctx, station)
+    anchors = {
+        (day, h): anchor_ns_for(h, day, station.offset, pins.anchors, variant=cfg.variant)
+        for day in days
+        for h in HORIZONS
+    }
+    rows.lamp_bases[station.icao] = {h: {} for h in HORIZONS}
+    for year in sorted({d.year for d in days}):
+        year_days = [d for d in days if d.year == year]
+        _build_year(pins, station, ctx, sources, year, anchors, year_days, rows)
 
 
 def _truth_lookup(cfg: Config) -> dict[tuple[str, dt.date], Any]:
@@ -516,73 +479,20 @@ def _truth_lookup(cfg: Config) -> dict[tuple[str, dt.date], Any]:
     }
 
 
-def _truth_concordance(f2: Path | None, truth: Mapping[tuple[str, dt.date], Any]) -> dict[str, Any]:
-    """FB-R6: the F2 truth is a concordance diagnostic only; the champion's truth is the label."""
-    if f2 is None:
-        return {"status": "not_requested"}
-    overlap, bad = 0, []
-    with f2.open(encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            day = dt.date.fromisoformat(row["climate_day"])
-            ours = truth.get((row["city"], day))
-            if day >= HOLDOUT_START or ours is None or not row["tmax_f"].strip():
-                continue
-            overlap += 1
-            if int(float(row["tmax_f"])) != int(ours.tmax_f):
-                bad.append(
-                    {
-                        "station": row["city"],
-                        "climate_day": day.isoformat(),
-                        "champion": int(ours.tmax_f),
-                        "f2": int(float(row["tmax_f"])),
-                    }
-                )
-    return {"n_overlap": overlap, "n_disagree": len(bad), "disagreements": bad[:50]}
-
-
-def _nbp_version_breaks(rows: Sequence[msb.FeatureRow]) -> list[str]:
-    last: dict[str, str] = {}
-    breaks: set[str] = set()
-    for row in sorted(rows, key=lambda r: (r.station, r.climate_day)):
-        if row.station in last and last[row.station] != row.version:
-            breaks.add(row.climate_day.isoformat())
-        last[row.station] = row.version
-    return sorted(breaks)
-
-
 def _check_unique(rows: Sequence[msb.FeatureRow], name: str) -> None:
     keys = [(r.station, r.climate_day, r.horizon) for r in rows]
     if len(keys) != len(set(keys)):
         raise BuildRefusal(f"{name}: more than one row for a (station, climate_day, horizon) key")
 
 
-def _lag_report(primary: Sequence[msb.FeatureRow], lag: Sequence[msb.FeatureRow]) -> dict[str, Any]:
-    base = {(r.station, r.climate_day, r.horizon) for r in primary}
-    shifted = {(r.station, r.climate_day, r.horizon) for r in lag}
-    lost: dict[str, int] = {}
-    for _station, _day, horizon in sorted(base - shifted):
-        lost[horizon] = lost.get(horizon, 0) + 1
-    return {
-        "rows_lost_by_horizon": lost,
-        "source_rows_lost": msb.lag_rows_lost(primary, lag),
-        "obs_available_at_ns_shifted": True,
-        "shift_ns": LAG_SHIFT_NS,
-        "nbp_shifted": True,
-        "label_shifted": False,
-    }
-
-
-def _source_lags(pins: Pins) -> dict[str, Any]:
-    lags: dict[str, Any] = {
-        key: {"ns": ns, "basis": _LAG_BASIS[key], "provisional": True}
-        for key, ns in pins.lags.items()
-    }
-    lags["nbp"] = {
-        "ns": None,
-        "basis": "nominal: store max(LastModified, cycle + floor), not a measured vintage",
-        "provisional": True,
-    }
-    return lags
+def _check_rows(primary: Sequence[msb.FeatureRow], lag: Sequence[msb.FeatureRow]) -> None:
+    """The post-build re-check: unique keys, pre-holdout, and no leak under each file's own lag."""
+    _check_unique(primary, "primary")
+    _check_unique(lag, "lag")
+    for rows, extra_lag_ns in ((primary, 0), (lag, LAG_SHIFT_NS)):
+        msb.assert_pre_holdout(rows)
+        for row in rows:
+            msb.assert_row_leakage_free(row, extra_lag_ns=extra_lag_ns)
 
 
 def _inputs_sha(cfg: Config) -> dict[str, str]:
@@ -633,28 +543,63 @@ def _lines(rows: Sequence[msb.FeatureRow]) -> bytes:
     return (body + "\n").encode("utf-8") if ordered else b""
 
 
-def _obs_report(tally: _Tally, pins: Pins) -> dict[str, Any]:
-    return {
-        "source": obsmod.OBS_SOURCE_LABEL,
-        "live_path": obsmod.LIVE_PATH_CITATION,
-        "cadence_seconds": obsmod.ROUTINE_OBS_CADENCE_SECONDS,
-        "routine_metar_only": True,
-        "obs_routine_minute_by_station": dict(pins.obs_routine_minute_by_station),
-        "quantisation": "whole degF -> tenths C -> breezy.domain.temperature.round_half_up_f",
-        "interval_rows_not_emulated": True,
-        "interval_rows_note": (
-            "FB-R13: the NWS integer-C interval rows and METAR specials are excluded on both "
-            "sides; only the routine hourly METAR reading is used"
+def _make_context(cfg: Config, pins: Pins, registry: nss.StationRegistry) -> _Context:
+    counts: Counter[str] = Counter()
+    return _Context(
+        tally=_Tally(counts, {h: Counter() for h in HORIZONS}),
+        truth=_truth_lookup(cfg),
+        nbp=collect_nbp_candidates(
+            cfg.nbp_root, registry, end_exclusive=cfg.end + _DAY, counts=counts
         ),
-        "descriptive_arms_feed_no_feature": True,
-        "d0_rows_where_five_min_max_differs": tally.obs_five_min_differs,
-        "raw_1min_running_max_is_descriptive_only": True,
-        "d0_rows_where_raw_1min_max_differs": tally.obs_raw_differs,
-        "qc_revision_risk": (
-            "the 1-min archive is post-QC and may differ from what the live path saw; not "
-            "measurable offline"
+        lamp=LampArchive(
+            read_only_cache(cfg.us_root),
+            cfg.us_root,
+            lag_ns_by_source=pins.lags,
+            holdout_start=HOLDOUT_START,
+            counts=counts,
         ),
-    }
+        us_cache=read_only_cache(cfg.us_root),
+        mos_cache=read_only_cache(cfg.mos_root),
+        asos_cache=read_only_cache(cfg.asos_root),
+    )
+
+
+def _build_all(cfg: Config, pins: Pins, registry: nss.StationRegistry, ctx: _Context) -> _Rows:
+    rows = _Rows([], [], {})
+    for icao in cfg.stations:
+        key = registry.settlement_station_by_icao[icao]
+        station = _Station(icao, key, registry.std_utc_offset_hours_by_icao[icao])
+        _build_station(cfg, pins, station, ctx, rows)
+    return rows
+
+
+def _write_outputs(
+    cfg: Config,
+    pins: Pins,
+    digest: str,
+    rows: _Rows,
+    breaks: Mapping[str, Any],
+    report: dict[str, Any],
+) -> None:
+    items: list[tuple[Path, bytes]] = []
+    for role, role_rows, path in (
+        ("primary", rows.primary, cfg.out_features),
+        ("lag", rows.lag, cfg.out_lag),
+    ):
+        data = _lines(role_rows)
+        side = _sidecar(role, data, digest, pins, cfg, len(role_rows), breaks)
+        items += [(Path(str(path) + SIDECAR_SUFFIX), side), (path, data)]
+        report.setdefault("output_sha256", {})[role] = hashlib.sha256(data).hexdigest()
+        report.setdefault("n_rows", {})[role] = len(role_rows)
+    _write_set(items)
+
+
+def _validated_registry(cfg: Config) -> nss.StationRegistry:
+    registry = nss.station_registry(stations=cfg.stations)
+    unknown = [s for s in cfg.stations if s not in registry.std_utc_offset_hours_by_icao]
+    if unknown:
+        raise BuildRefusal(f"stations {unknown} are not in the registry")
+    return registry
 
 
 def run_build(cfg: Config, report: dict[str, Any]) -> int:
@@ -672,70 +617,29 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
         prereg_content_sha256=digest, anchor_variant=cfg.variant, inputs_sha256=_inputs_sha(cfg)
     )
     pins = load_pins(design)
-    report["source_lags"] = _source_lags(pins)
-    registry = nss.station_registry(stations=cfg.stations)
-    unknown = [s for s in cfg.stations if s not in registry.std_utc_offset_hours_by_icao]
-    if unknown:
-        raise BuildRefusal(f"stations {unknown} are not in the registry")
-    counts: Counter[str] = Counter()
-    tally = _Tally(counts, {h: Counter() for h in HORIZONS})
-    truth = _truth_lookup(cfg)
-    ctx = _Context(
-        tally=tally,
-        truth=truth,
-        nbp=collect_nbp_candidates(
-            cfg.nbp_root, registry, end_exclusive=cfg.end + _DAY, counts=counts
-        ),
-        lamp=LampArchive(
-            read_only_cache(cfg.us_root),
-            cfg.us_root,
-            lag_ns_by_source=pins.lags,
-            holdout_start=HOLDOUT_START,
-            counts=counts,
-        ),
-        us_cache=read_only_cache(cfg.us_root),
-        mos_cache=read_only_cache(cfg.mos_root),
-        asos_cache=read_only_cache(cfg.asos_root),
-    )
-    primary: list[msb.FeatureRow] = []
-    lag: list[msb.FeatureRow] = []
-    lamp_bases: dict[str, dict[dt.date, str | None]] = {}
-    for icao in cfg.stations:
-        key = registry.settlement_station_by_icao[icao]
-        station = _Station(icao, key, registry.std_utc_offset_hours_by_icao[icao])
-        lamp_bases[icao] = _build_station(cfg, pins, station, ctx, primary, lag)
-    _check_unique(primary, "primary")
-    _check_unique(lag, "lag")
-    for rows in (primary, lag):
-        msb.assert_pre_holdout(rows)
-        for row in rows:
-            msb.assert_row_leakage_free(row)
-    breaks = {
-        "lamp": sorted(
-            {d.isoformat() for bases in lamp_bases.values() for d in basis_breaks(bases)}
-        ),
-        "nbp_versions": _nbp_version_breaks(primary),
-    }
+    report["source_lags"] = source_lags(pins)
+    registry = _validated_registry(cfg)
+    ctx = _make_context(cfg, pins, registry)
+    rows = _build_all(cfg, pins, registry, ctx)
+    _check_rows(rows.primary, rows.lag)
+    breaks = {**lamp_breaks(rows.lamp_bases), "nbp_versions": nbp_version_breaks(rows.primary)}
+    counts, tally = ctx.tally.counts, ctx.tally
     report.update(
         counts=dict(counts),
         by_horizon={h: dict(c) for h, c in tally.by_horizon.items()},
-        lag_file=_lag_report(primary, lag),
-        obs=_obs_report(tally, pins),
+        lag_file=lag_report(rows.primary, rows.lag),
+        obs=obs_report(
+            five_min_differs=tally.obs_five_min_differs,
+            raw_differs=tally.obs_raw_differs,
+            pins=pins,
+        ),
         source_breaks_observed=breaks,
-        truth_concordance=_truth_concordance(cfg.f2_truth, truth),
+        truth_concordance=truth_concordance(cfg.f2_truth, ctx.truth),
         nbp_availability_basis="nominal: store max(LastModified, cycle + floor), flagged",
         pfm_iem_entered_time="unavailable_in_archive",
         mos_model=MOS_MODEL,
     )
-    for role, rows, path in (("primary", primary, cfg.out_features), ("lag", lag, cfg.out_lag)):
-        data = _lines(rows)
-        _write_new(path, data)
-        _write_new(
-            Path(str(path) + SIDECAR_SUFFIX),
-            _sidecar(role, data, digest, pins, cfg, len(rows), breaks),
-        )
-        report.setdefault("output_sha256", {})[role] = hashlib.sha256(data).hexdigest()
-        report.setdefault("n_rows", {})[role] = len(rows)
+    _write_outputs(cfg, pins, digest, rows, breaks, report)
     degraded = [k for k in DEGRADING_COUNTS if counts.get(k)]
     report["degraded_reasons"] = degraded
     return EXIT_DEGRADED if degraded else EXIT_OK
@@ -758,15 +662,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--out-features", type=Path, required=True)
     parser.add_argument("--out-lag-features", type=Path, required=True)
     parser.add_argument("--report-json", type=Path, required=True)
-    parser.add_argument("--anchor-variant", choices=VARIANTS, default="primary")
+    parser.add_argument("--anchor-variant", choices=ANCHOR_VARIANTS, default=PRIMARY_VARIANT)
     parser.add_argument("--f2-truth", type=Path, default=None)
     parser.add_argument("--max-memory-gib", type=float, default=DEFAULT_MAX_MEMORY_GIB)
     return parser.parse_args(sys.argv[1:] if argv is None else list(argv))
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parse_args(argv)
-    cfg = Config(
+def _config(args: argparse.Namespace) -> Config:
+    return Config(
         prereg=args.prereg,
         nbp_root=args.nbp_root,
         us_root=args.us_source_root,
@@ -782,23 +685,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         variant=args.anchor_variant,
         f2_truth=args.f2_truth,
     )
+
+
+def _run_reporting(cfg: Config, report: dict[str, Any]) -> int:
+    """Run the build; every failure is recorded in ``report`` and exits 2 (never a bare swallow)."""
+    try:
+        code = run_build(cfg, report)
+    except _CAUGHT as exc:
+        status = "refused"
+        reason = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 - any unexpected failure must still reach the report
+        status = "error"
+        reason = f"{type(exc).__name__}: {exc}"
+    else:
+        report.update(status="complete" if code == EXIT_OK else "degraded", exit_code=code)
+        return code
+    report.update(status=status, exit_code=EXIT_REFUSED, reason=reason)
+    print(f"{status.upper()}: {reason}", file=sys.stderr)
+    return EXIT_REFUSED
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    cfg = _config(args)
     apply_address_space_cap(args.max_memory_gib)
     if _inside(cfg.report, LIVE_DATA_ROOT) or cfg.report.exists():
         print(f"REFUSED: refusing to write the report at {cfg.report}", file=sys.stderr)
         return EXIT_REFUSED
     report: dict[str, Any] = {"status": "refused", "exit_code": EXIT_REFUSED, "reason": None}
-    try:
-        code = run_build(cfg, report)
-    except _CAUGHT as exc:
-        report.update(
-            status="refused", exit_code=EXIT_REFUSED, reason=f"{type(exc).__name__}: {exc}"
-        )
-        print(f"REFUSED: {exc}", file=sys.stderr)
-        code = EXIT_REFUSED
-    else:
-        report.update(status="complete" if code == EXIT_OK else "degraded", exit_code=code)
+    code = _run_reporting(cfg, report)
     body = json.dumps(report, indent=2, sort_keys=True, default=str) + "\n"
-    _write_new(cfg.report, body.encode("utf-8"))
+    _write_set([(cfg.report, body.encode("utf-8"))])
     return code
 
 

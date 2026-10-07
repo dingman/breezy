@@ -76,7 +76,8 @@
     "source_lags_ns": null,
     "obs_source": null,
     "obs_cadence_seconds": null,
-    "obs_routine_minute_by_station": null
+    "obs_routine_minute_by_station": null,
+    "lag_arm_max_lost_fraction": null
   },
   "pin_units": {
     "m0_prime_tolerance_crps_f": "absolute CRPS in degF; M0prime worse than M0 by more than this refuses ACCEPT",
@@ -90,7 +91,8 @@
     "source_lags_ns": "FB-R4, integer nanoseconds per source key lamp-mdl, lav-iem, pfm, mos-gfs, obs: availability = nominal time + lag. Provisional basis: lamp-mdl max(60 min, C1 max); lav-iem the same + 30 min; pfm WMO issuance + 60 min; mos-gfs runtime + 5 h; obs report time + 15 min. The builder refuses any value below the R29 floor (lamp-mdl 60 min, lav-iem 90 min, pfm 60 min, mos-gfs 5 h, obs 15 min). Frozen only after >= 14 days of C1 measurement (R29); every value's basis is flagged in the build report.",
     "obs_source": "FB-R3, a string label for the obs_so_far path; the builder accepts only iem_asos_1min_whole_f_via_metar_tgroup_quantisation (the 1-min archive, quantised through the live METAR T-group function). The raw 1-min running max is a descriptive arm only.",
     "obs_cadence_seconds": "FB-R13, integer seconds between routine METAR readings; the builder refuses any value other than 3600 (obs_so_far is the running max of routine hourly METAR values only; interval rows and specials are excluded).",
-    "obs_routine_minute_by_station": "FB-R13, object {icao: minute of the hour 0..59} of each station's routine METAR report, read from the 1-min archive at that minute. Derived by multisource_blend_inputs_obs.modal_routine_minute_by_station from routine report timestamps; the coordinator pins it (reported, never auto-applied)."
+    "obs_routine_minute_by_station": "FB-R13, object {icao: minute of the hour 0..59} of each station's routine METAR report, read from the 1-min archive at that minute. Derived by multisource_blend_inputs_obs.modal_routine_minute_by_station from routine report timestamps; the coordinator pins it (reported, never auto-applied).",
+    "lag_arm_max_lost_fraction": "fraction in [0, 1] (review fix 2): the runner refuses to emit a verdict when the +60 min shift loses more than this share of the primary file's (station, climate day, horizon) keys; the lag arm is compared with the primary on the common keys only (paired difference), so a larger loss would make the sensitivity answer a different question"
   },
   "veto": {
     "label": "descriptive only, carries no verdict (R8, R15)",

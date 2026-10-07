@@ -52,6 +52,7 @@ _PINS: dict[str, Any] = {
     "rung_edges_f": [50, 55, 60, 65, 70, 75],
     "min_uncensored_lag_samples": 5,
     "embargo_days": 2,
+    "lag_arm_max_lost_fraction": 0.5,
 }
 
 
@@ -104,25 +105,49 @@ def _write_features(path: Path, rows: list[msb.FeatureRow]) -> Path:
     sidecar = Path(str(path) + skill.SIDECAR_SUFFIX)
     if sidecar.exists():  # FB-R14 fixture: a rewritten file keeps a sidecar that matches it
         meta = json.loads(sidecar.read_text(encoding="utf-8"))
-        write_sidecar(path, role=meta["role"], digest=meta["prereg_content_sha256"])
+        kept = {k: v for k, v in meta.items() if k not in _DERIVED_SIDECAR_KEYS}
+        write_sidecar(path, role=meta["role"], digest=meta["prereg_content_sha256"], **kept)
     return path
 
 
-def write_sidecar(features: Path, *, role: str, digest: str, sha: str | None = None) -> Path:
-    """FB-R14 fixture helper: the ``<features>.manifest.json`` the builder would have written."""
+_DERIVED_SIDECAR_KEYS = ("schema", "role", "prereg_content_sha256", "features_sha256", "n_rows")
+_SIDECAR_ANCHORS: dict[str, Any] = {
+    "D-1": {"kind": "utc", "hour": 18},
+    "D0": {"kind": "lst", "hour": 10},
+    "D0_sensitivity": {"kind": "lst", "hour": 12},
+    "offset_rule": "fixed_standard_time_never_dst",
+}
+_SIDECAR_LAGS: dict[str, int] = {"lamp-mdl": 1, "lav-iem": 2, "pfm": 3, "mos-gfs": 4, "obs": 5}
+_LAG_SHIFT_NS = 3_600_000_000_000
+
+
+def write_sidecar(
+    features: Path, *, role: str, digest: str, sha: str | None = None, **overrides: Any
+) -> Path:
+    """FB-R14 fixture helper: the ``<features>.manifest.json`` the builder would have written.
+
+    Every field the runner cross-checks is present with a consistent default; ``overrides``
+    replace (or, set to the ``DROP`` sentinel, remove) a field to build a broken sidecar.
+    """
     path = Path(str(features) + skill.SIDECAR_SUFFIX)
-    path.write_text(
-        json.dumps(
-            {
-                "schema": skill.SIDECAR_SCHEMA,
-                "role": role,
-                "prereg_content_sha256": digest,
-                "features_sha256": sha or hashlib.sha256(features.read_bytes()).hexdigest(),
-            }
-        ),
-        encoding="utf-8",
-    )
+    body: dict[str, Any] = {
+        "schema": skill.SIDECAR_SCHEMA,
+        "role": role,
+        "prereg_content_sha256": digest,
+        "features_sha256": sha or hashlib.sha256(features.read_bytes()).hexdigest(),
+        "n_rows": len([ln for ln in features.read_text(encoding="utf-8").splitlines() if ln]),
+        "anchor_variant": "primary",
+        "anchors": _SIDECAR_ANCHORS,
+        "source_lags_ns": _SIDECAR_LAGS,
+        "obs_routine_minute_by_station": {"NYC": 40},
+        "lag_shift_ns": _LAG_SHIFT_NS if role == "lag" else 0,
+    }
+    body.update(overrides)
+    path.write_text(json.dumps({k: v for k, v in body.items() if v is not DROP}), encoding="utf-8")
     return path
+
+
+DROP: Any = object()
 
 
 class _Scenario:
@@ -155,13 +180,14 @@ class _Scenario:
         write_sidecar(self.features, role="primary", digest=digest)
         write_sidecar(self.lag_features, role="lag", digest=digest)
 
-    def run(self) -> dict[str, Any]:
+    def run(self, **kwargs: Any) -> dict[str, Any]:
         return skill.run(
             prereg=self.prereg,
             features=self.features,
             lag_features=self.lag_features,
             c1_evidence=self.evidence,
             out_dir=self.out,
+            **kwargs,
         )
 
 

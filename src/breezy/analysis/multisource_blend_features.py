@@ -149,6 +149,8 @@ class FeatureRow:
     pfm_available_at_ns: int | None = None
     mos_mu_f: float | None = None
     mos_available_at_ns: int | None = None
+    #: Metadata, never a model input: runtime of the NBP cycle this row's percentiles came from.
+    nbp_cycle_ns: int | None = None
 
     def __post_init__(self) -> None:
         if self.horizon not in HORIZONS:
@@ -310,6 +312,7 @@ def assemble_feature_row(
     pfm_vintages: Sequence[SourceVintage] = (),
     mos_vintages: Sequence[SourceVintage] = (),
     extra_lag_ns: int = 0,
+    nbp_cycle_ns: int | None = None,
 ) -> FeatureRow:
     """Build one row from raw inputs, taking only vintages available before the anchor."""
     chosen_obs = _eligible_obs(obs_readings, anchor_ns, climate_day, std_utc_offset_hours)
@@ -336,30 +339,37 @@ def assemble_feature_row(
         pfm_available_at_ns=None if pfm is None else pfm.available_at_ns,
         mos_mu_f=None if mos is None else mos.mu_f,
         mos_available_at_ns=None if mos is None else mos.available_at_ns,
+        nbp_cycle_ns=nbp_cycle_ns,
     )
-    assert_row_leakage_free(row)
+    assert_row_leakage_free(row, extra_lag_ns=extra_lag_ns)
     return row
 
 
-def assert_row_leakage_free(row: FeatureRow) -> None:
-    """The scored-row assertion: ``max(available_at) < anchor`` and ``min(valid_ts) > anchor``."""
+def assert_row_leakage_free(row: FeatureRow, *, extra_lag_ns: int = 0) -> None:
+    """The scored-row assertion: ``max(available_at) < anchor`` and ``min(valid_ts) > anchor``.
+
+    ``extra_lag_ns`` is the +60 min twin's shift of the PFM, MOS and LAMP availabilities, which a
+    twin row stores UNSHIFTED. Its observation availability is stored already shifted, so the shift
+    is never added to ``obs`` twice.
+    """
     pairs = (
-        ("obs", row.obs_so_far_f, row.obs_available_at_ns),
-        ("pfm", row.pfm_mu_f, row.pfm_available_at_ns),
-        ("mos", row.mos_mu_f, row.mos_available_at_ns),
+        ("obs", row.obs_so_far_f, row.obs_available_at_ns, 0),
+        ("pfm", row.pfm_mu_f, row.pfm_available_at_ns, extra_lag_ns),
+        ("mos", row.mos_mu_f, row.mos_available_at_ns, extra_lag_ns),
     )
-    for name, value, available in pairs:
+    for name, value, available, lag in pairs:
         if value is None:
             continue
-        if available is None or available >= row.anchor_ns:
+        if available is None or available + lag >= row.anchor_ns:
             raise LeakageError(
-                f"{name} available_at {available} is not before the anchor {row.anchor_ns} "
-                f"({row.station} {row.climate_day} {row.horizon})"
+                f"{name} available_at {available} (+{lag}) is not before the anchor "
+                f"{row.anchor_ns} ({row.station} {row.climate_day} {row.horizon})"
             )
     lamp = row.lamp
-    if lamp.run_available_at_ns is not None and lamp.run_available_at_ns >= row.anchor_ns:
+    lamp_available = lamp.run_available_at_ns
+    if lamp_available is not None and lamp_available + extra_lag_ns >= row.anchor_ns:
         raise LeakageError(
-            f"LAMP run available_at {lamp.run_available_at_ns} is not before the anchor"
+            f"LAMP run available_at {lamp_available} (+{extra_lag_ns}) is not before the anchor"
         )
     if lamp.min_valid_ts_ns is not None and lamp.min_valid_ts_ns <= row.anchor_ns:
         raise LeakageError(f"LAMP hour valid_ts {lamp.min_valid_ts_ns} is not after the anchor")

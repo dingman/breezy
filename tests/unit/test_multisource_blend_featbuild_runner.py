@@ -69,25 +69,21 @@ def test_lag_arm_compares_on_the_key_intersection_and_reports_rows_lost_per_hori
 
     lag = result["lag_rerun"]
     assert lag["keys_lost_by_horizon"] == {"D-1": 6}
-    assert lag["keys_extra_in_lag_dropped"] == 0
     assert lag["n_keys_common"] == len(scenario.rows) - 6
 
 
-def test_lag_rows_absent_from_the_base_file_are_dropped_and_counted(tmp_path: Path) -> None:
+def test_lag_rows_absent_from_the_base_file_are_refused_not_dropped(tmp_path: Path) -> None:
     scenario = _Scenario(tmp_path)
     _write_features(scenario.features, scenario.rows[3:])
 
-    result = scenario.run()
-
-    assert result["lag_rerun"]["keys_extra_in_lag_dropped"] == 3
-    assert result["lag_rerun"]["keys_lost_by_horizon"] == {}
+    with pytest.raises(skill.Refusal, match="only in the lag"):
+        scenario.run()
 
 
 def test_identical_key_sets_report_zero_rows_lost(tmp_path: Path) -> None:
     result = _Scenario(tmp_path).run()
 
     assert result["lag_rerun"]["keys_lost_by_horizon"] == {}
-    assert result["lag_rerun"]["keys_extra_in_lag_dropped"] == 0
 
 
 def test_a_lag_file_sharing_no_key_with_the_base_is_refused(tmp_path: Path) -> None:

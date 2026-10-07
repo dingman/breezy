@@ -47,7 +47,7 @@ from forecast_conditional_corpus import (  # type: ignore[import-not-found]
 from breezy.analysis.multisource_blend_features import SourceVintage
 from breezy.ingest.gaps import local_standard_date
 from breezy.ingest.pfm_parse import PfmParseError, parse_pfm_product
-from breezy.persistence.archive_cache import ArchiveCache, ArchiveCacheError
+from breezy.persistence.archive_cache import ArchiveCache, ArchiveCacheError, CoverageEntry
 from breezy.persistence.us_source_request import (
     US_PFM_AFOS_SOURCE,
     US_SOURCE_PRODUCTS,
@@ -202,7 +202,7 @@ def collect_pfm_vintages(
 ) -> dict[dt.date, list[SourceVintage]]:
     """``forecast day -> vintages`` from the first-seen PFM revision of every issuance."""
     pattern = revision_product_pattern(US_SOURCE_PRODUCTS[US_PFM_AFOS_SOURCE])
-    by_issue: dict[int, list[tuple[int, object]]] = defaultdict(list)
+    by_issue: dict[int, list[tuple[int, CoverageEntry]]] = defaultdict(list)
     for entry in cache.entries(US_PFM_AFOS_SOURCE):
         matched = pattern.fullmatch(entry.product) if entry.station == icao else None
         if matched is not None:
@@ -215,7 +215,7 @@ def collect_pfm_vintages(
             continue
         revisions = sorted(by_issue[issue_ns], key=lambda item: item[0])
         number, first = revisions[0]
-        fetched = [e.fetched_at_ns for _n, e in revisions]  # type: ignore[attr-defined]
+        fetched = [e.fetched_at_ns for _n, e in revisions]
         if number != 0:
             counts["pfm_first_revision_missing"] += 1
         elif fetched[0] > min(fetched):
@@ -231,7 +231,7 @@ def _add_pfm(
     icao: str,
     issue_ns: int,
     issued: dt.datetime,
-    first: object,
+    first: CoverageEntry,
     lag_ns: int,
     end_exclusive: dt.date,
     counts: Counter[str],
@@ -241,7 +241,7 @@ def _add_pfm(
         icao,
         issue_ns,
         0,
-        model=first.model,  # type: ignore[attr-defined]
+        model=first.model,
     )
     try:
         point = parse_pfm_product(cache.read(request), station=icao, reference_time=issued)

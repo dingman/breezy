@@ -25,8 +25,11 @@ veto (``blend_veto_descriptive.py``) re-verifies.
 
 Inputs are pre-assembled feature rows (JSONL of ``multisource_blend.feature_row_to_json``), built by
 ``assemble_feature_row``; a second file carries the same rows assembled with every source lag +60
-min. Rows on or after 2026-07-01 are refused. The script never calls ``open_holdout``, opens no
-network connection and writes only under ``--out-dir``.
+min. Both files need the builder's sidecar, and the pair is cross-checked (anchor variant, anchors,
+lags, routine minutes, prereg digest, lag shifts, row counts). The lag arm is compared with the
+primary on the keys both hold (paired difference); a lost fraction above the pinned
+``lag_arm_max_lost_fraction`` refuses the run. Rows on or after 2026-07-01 are refused. The script
+never calls ``open_holdout``, opens no network connection and writes only under ``--out-dir``.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ import json
 import math
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, TypeGuard
 
@@ -50,6 +53,23 @@ for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
 from breezy.analysis import multisource_blend as msb
 from breezy.analysis.memory_cap import apply_address_space_cap
 from breezy.strategy.ladder_ev.quantile_density import CdfMethod
+from scripts.analysis.multisource_blend_lag_arm import (
+    LagKeys,
+    common_scored,
+    lag_loss_report,
+    paired_day_values,
+    split_lag_keys,
+)
+from scripts.analysis.multisource_blend_refusal import Refusal
+from scripts.analysis.multisource_blend_sidecar import (
+    ANCHOR_VARIANTS,
+    PRIMARY_VARIANT,
+    SIDECAR_SCHEMA,
+    SIDECAR_SUFFIX,
+    check_sidecar,
+    check_sidecar_pair,
+    check_sidecar_row_count,
+)
 from scripts.analysis.prereg_precommit_check import check_frozen_blob
 
 __all__ = [
@@ -93,12 +113,9 @@ REQUIRED_PINS: Final[tuple[str, ...]] = (
     "rung_edges_f",
     "min_uncensored_lag_samples",
     "embargo_days",
+    "lag_arm_max_lost_fraction",
 )
 RECORD_NAME: Final[str] = "prereg_record.json"
-#: FB-R10: ``<features>.manifest.json`` written by ``multisource_blend_features_build.py``. The
-#: runner checks it whenever it is present; the feature files themselves stay header-free.
-SIDECAR_SUFFIX: Final[str] = ".manifest.json"
-SIDECAR_SCHEMA: Final[str] = "f13_features_manifest_v1"
 #: FB-R6: the embargo must reach past the 1-day autocorrelation of a daily-max series.
 MIN_EMBARGO_DAYS: Final[int] = 2
 STAGE_A_NAME: Final[str] = "stage_a.json"
@@ -131,10 +148,6 @@ _PIN_NUMBERS: Final[tuple[tuple[str, float], ...]] = (
     ("sigma_floor_f", 1e-12),
     ("weight_sum_lambda", 0.0),
 )
-
-
-class Refusal(Exception):
-    """The run is refused; nothing was scored (or nothing further is scored)."""
 
 
 # ------------------------------------------------------------------ the freeze
@@ -193,6 +206,11 @@ def _check_collections(pins: Mapping[str, Any]) -> list[str]:
     edges = pins.get("rung_edges_f")
     if not isinstance(edges, list) or not edges or not all(_is_int(e) for e in edges):
         problems.append(f"pins.rung_edges_f must be a non-empty list of integers, was {edges!r}")
+    fraction = pins.get("lag_arm_max_lost_fraction")
+    if not _is_number(fraction) or not 0.0 <= fraction <= 1.0:
+        problems.append(
+            f"pins.lag_arm_max_lost_fraction must be a number in [0, 1], was {fraction!r}"
+        )
     return problems
 
 
@@ -291,40 +309,13 @@ def _load_rows(path: Path) -> list[msb.FeatureRow]:
     return rows
 
 
-def _check_sidecar(path: Path, design: Mapping[str, Any], *, role: str) -> None:
-    """FB-R10/FB-R14: every scoring run needs the builder's sidecar, and it must match the file.
-
-    A missing sidecar is a Refusal (no production bypass): the features are always bound to the
-    prereg. A sidecar that cannot be read, names another role or schema, or disagrees with the file
-    or the prereg is a Refusal too.
-    """
-    sidecar = Path(str(path) + SIDECAR_SUFFIX)
-    if not sidecar.exists():
-        raise Refusal(
-            f"{path}: no sidecar {sidecar.name}; a scoring run requires the builder's manifest "
-            "binding the features to the prereg (FB-R14)"
-        )
-    try:
-        meta = json.loads(sidecar.read_text(encoding="utf-8"))
-        schema, kind = meta["schema"], meta["role"]
-        recorded_sha, recorded_digest = meta["features_sha256"], meta["prereg_content_sha256"]
-        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise Refusal(f"cannot read the sidecar {sidecar}: {type(exc).__name__}: {exc}") from exc
-    if schema != SIDECAR_SCHEMA:
-        raise Refusal(f"{sidecar}: schema {schema!r} is not {SIDECAR_SCHEMA!r}")
-    if kind != role:
-        raise Refusal(f"{sidecar}: role {kind!r} but {path} is loaded as the {role!r} file")
-    if recorded_sha != actual_sha:
-        raise Refusal(
-            f"{path}: sha256 {actual_sha} does not match the sidecar's {recorded_sha}; the "
-            "feature file changed since the builder wrote it"
-        )
-    if recorded_digest != content_digest(design):
-        raise Refusal(
-            f"{sidecar}: built under prereg digest {recorded_digest}, but this run's prereg "
-            f"digest is {content_digest(design)}"
-        )
+def _check_sidecar(
+    path: Path, design: Mapping[str, Any], *, role: str, variant: str = PRIMARY_VARIANT
+) -> dict[str, Any]:
+    """FB-R10/FB-R14: the builder's sidecar must exist, match the file and bind it to the prereg."""
+    return check_sidecar(
+        path, role=role, prereg_digest=content_digest(design), expected_variant=variant
+    )
 
 
 def _check_c1(path: Path, design: Mapping[str, Any]) -> None:
@@ -369,7 +360,7 @@ class RunContext:
     settings: msb.BlendSettings
     plan: msb.FoldPlan
     embargo_days: int
-    lag_key_report: Mapping[str, Any] = field(default_factory=dict)
+    lag_keys: LagKeys
 
     @property
     def pins(self) -> Mapping[str, Any]:
@@ -398,37 +389,32 @@ def _key(row: msb.FeatureRow) -> tuple[str, dt.date, str]:
     return (row.station, row.climate_day, row.horizon)
 
 
-def _lag_key_intersection(
-    rows: Sequence[msb.FeatureRow], lag_rows: Sequence[msb.FeatureRow]
-) -> tuple[list[msb.FeatureRow], dict[str, Any]]:
-    """FB-R2: the lag arm is scored on the keys both files hold; what was lost is reported.
+def _check_variant(anchor_variant: str) -> None:
+    if anchor_variant not in ANCHOR_VARIANTS:
+        raise Refusal(f"anchor_variant must be one of {ANCHOR_VARIANTS}, was {anchor_variant!r}")
 
-    The +60 min shift can legitimately remove a row (a source no longer available before the
-    anchor, an NBP cycle that drops out). Such a key is lost from the lag arm, counted per horizon,
-    never a refusal; a lag row whose key the base file lacks is dropped and counted. Only a lag
-    file with NO key in common is refused.
-    """
-    base_keys = {_key(r) for r in rows}
-    lag_keys = {_key(r) for r in lag_rows}
-    common = base_keys & lag_keys
-    if not common:
-        raise Refusal("the +60 min lag feature file has no station-day in common with the base")
-    lost: dict[str, int] = {}
-    for _station, _day, horizon in sorted(base_keys - lag_keys):
-        lost[horizon] = lost.get(horizon, 0) + 1
-    kept = [r for r in lag_rows if _key(r) in common]
-    return kept, {
-        "keys_lost_by_horizon": lost,
-        "keys_extra_in_lag_dropped": len(lag_rows) - len(kept),
-        "n_keys_common": len(common),
-        "n_keys_base": len(base_keys),
-    }
+
+def _check_lag_loss(keys: LagKeys, pins: Mapping[str, Any]) -> None:
+    limit = float(pins["lag_arm_max_lost_fraction"])
+    if keys.lost_fraction > limit:
+        raise Refusal(
+            f"the +60 min shift lost {len(keys.lost)} of {len(keys.base)} keys "
+            f"({keys.lost_fraction:.4f}), above the pinned lag_arm_max_lost_fraction {limit}; "
+            "no verdict is emitted"
+        )
 
 
 def prepare_run(
-    *, prereg: Path, features: Path, lag_features: Path, c1_evidence: Path, out_dir: Path
+    *,
+    prereg: Path,
+    features: Path,
+    lag_features: Path,
+    c1_evidence: Path,
+    out_dir: Path,
+    anchor_variant: str = PRIMARY_VARIANT,
 ) -> RunContext:
     """The freeze checks, the inputs and the fold plan; nothing is fitted here."""
+    _check_variant(anchor_variant)
     design = load_verified_prereg(prereg)
     pins, fixed = design["pins"], design["fixed_by_plan"]
     record_prereg(out_dir, design)
@@ -438,10 +424,14 @@ def prepare_run(
             "use a fresh --out-dir"
         )
     _check_c1(c1_evidence, design)
-    _check_sidecar(features, design, role="primary")
-    _check_sidecar(lag_features, design, role="lag")
+    meta = _check_sidecar(features, design, role="primary", variant=anchor_variant)
+    lag_meta = _check_sidecar(lag_features, design, role="lag", variant=anchor_variant)
+    check_sidecar_pair(meta, lag_meta)
     rows, lag_loaded = _load_rows(features), _load_rows(lag_features)
-    lag_rows, lag_key_report = _lag_key_intersection(rows, lag_loaded)
+    check_sidecar_row_count(meta, features, len(rows))
+    check_sidecar_row_count(lag_meta, lag_features, len(lag_loaded))
+    keys = split_lag_keys(rows, lag_loaded)
+    _check_lag_loss(keys, pins)
     embargo = int(pins["embargo_days"])
     plan = msb.build_folds(
         msb.days_by_version(rows),
@@ -453,9 +443,7 @@ def prepare_run(
     plan = msb.m0_eligible_plan(rows, plan, embargo_days=embargo)
     if not plan.folds:
         raise Refusal(f"no version/segment qualifies for folds (incl. M0 pool): {plan.excluded}")
-    return RunContext(
-        design, out_dir, rows, lag_rows, _settings(pins), plan, embargo, lag_key_report
-    )
+    return RunContext(design, out_dir, rows, lag_loaded, _settings(pins), plan, embargo, keys)
 
 
 def _score(ctx: RunContext, rows: Sequence[msb.FeatureRow], **kwargs: Any) -> list[msb.ScoredRow]:
@@ -568,12 +556,58 @@ def _sensitivity_sections(scored: Sequence[msb.ScoredRow]) -> dict[str, Any]:
     }
 
 
+def _common_scored_or_refuse(
+    b: StageB,
+) -> tuple[list[msb.ScoredRow], list[msb.ScoredRow]]:
+    primary, lag = common_scored(b.scored, b.lag_scored)
+    if not primary:
+        raise Refusal("the primary and lag arms scored no key in common; no paired comparison")
+    return primary, lag
+
+
+def _lag_section(
+    ctx: RunContext,
+    b: StageB,
+    lag_delta: msb.DeltaSummary,
+    primary_common: Sequence[msb.ScoredRow],
+    lag_common: Sequence[msb.ScoredRow],
+    rows_lost: Mapping[str, int],
+) -> dict[str, Any]:
+    """The lag arm: BOTH arms on the common keys, their paired difference, what was lost."""
+    keys = ctx.lag_keys
+    paired = msb.delta_summary(
+        paired_day_values(primary_common, lag_common, "M0prime", "M3"),
+        n_boot=int(ctx.pins["bootstrap_n"]),
+        seed=int(ctx.pins["bootstrap_seed"]),
+        mean_block=float(ctx.fixed["mean_block_days"]),
+    )
+    return {
+        **_summary_json(lag_delta),
+        "rows_lost": rows_lost,
+        "keys_lost_by_horizon": _lost_counts_by_horizon(keys),
+        "n_keys_common": len(keys.common),
+        "n_keys_base": len(keys.base),
+        "primary_on_common": _summary_json(_delta(primary_common, "M0prime", "M3", ctx)),
+        "paired_difference": _summary_json(paired),
+        "paired_difference_definition": "primary minus lag, day-block bootstrap",
+        **lag_loss_report(ctx.rows, ctx.lag_rows, keys, b.scored),
+    }
+
+
+def _lost_counts_by_horizon(keys: LagKeys) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for _station, _day, horizon in sorted(keys.lost):
+        counts[horizon] = counts.get(horizon, 0) + 1
+    return counts
+
+
 def assemble_result(ctx: RunContext, a: StageA, b: StageB) -> dict[str, Any]:
     """The acceptance decision and every reported figure, from the two scored stages."""
+    primary_common, lag_common = _common_scored_or_refuse(b)
     deltas = {
         "m0p_m3": _delta(b.scored, "M0prime", "M3", ctx),
         "m0_m3": _delta(b.scored, "M0", "M3", ctx),
-        "lag": _delta(b.lag_scored, "M0prime", "M3", ctx),
+        "lag": _delta(lag_common, "M0prime", "M3", ctx),
         "negative_control": _delta(b.shuffled, "M0prime", "M3", ctx),
     }
     decision, status, stations = _decide(ctx, a, b, deltas)
@@ -597,7 +631,7 @@ def assemble_result(ctx: RunContext, a: StageA, b: StageB) -> dict[str, Any]:
             str(k): v for k, v in msb.per_fold_delta(b.scored, "M0prime", "M3").items()
         },
         "station_deltas": stations,
-        "lag_rerun": {**_summary_json(deltas["lag"]), "rows_lost": lost, **ctx.lag_key_report},
+        "lag_rerun": _lag_section(ctx, b, deltas["lag"], primary_common, lag_common, lost),
         "m0_prime_status": {
             "within_tolerance": status.within_tolerance,
             "difference": status.difference,
@@ -650,6 +684,7 @@ def run(
     lag_features: Path,
     c1_evidence: Path,
     out_dir: Path,
+    anchor_variant: str = PRIMARY_VARIANT,
 ) -> dict[str, Any]:
     ctx = prepare_run(
         prereg=prereg,
@@ -657,6 +692,7 @@ def run(
         lag_features=lag_features,
         c1_evidence=c1_evidence,
         out_dir=out_dir,
+        anchor_variant=anchor_variant,
     )
     stage_a = run_stage_a(ctx)
     stage_b = run_stage_b(ctx, stage_a)
@@ -672,6 +708,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--lag-features", type=Path, required=True)
     parser.add_argument("--c1-evidence", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--anchor-variant",
+        choices=ANCHOR_VARIANTS,
+        default=PRIMARY_VARIANT,
+        help="the feature-file pair to score; the 12 LST sensitivity is never the default",
+    )
     parser.add_argument("--max-memory-gib", type=float, default=DEFAULT_MAX_MEMORY_GIB)
     args = parser.parse_args(sys.argv[1:] if argv is None else list(argv))
     apply_address_space_cap(args.max_memory_gib)
@@ -682,6 +724,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             lag_features=args.lag_features,
             c1_evidence=args.c1_evidence,
             out_dir=args.out_dir,
+            anchor_variant=args.anchor_variant,
         )
     except Refusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

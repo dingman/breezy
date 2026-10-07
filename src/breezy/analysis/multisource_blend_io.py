@@ -43,6 +43,7 @@ def feature_row_to_json(row: FeatureRow) -> dict[str, Any]:
         "pfm_available_at_ns": row.pfm_available_at_ns,
         "mos_mu_f": row.mos_mu_f,
         "mos_available_at_ns": row.mos_available_at_ns,
+        "nbp_cycle_ns": row.nbp_cycle_ns,
     }
 
 
@@ -62,6 +63,7 @@ def feature_row_from_json(data: Mapping[str, Any]) -> FeatureRow:
         pfm_available_at_ns=data["pfm_available_at_ns"],
         mos_mu_f=data["mos_mu_f"],
         mos_available_at_ns=data["mos_available_at_ns"],
+        nbp_cycle_ns=data.get("nbp_cycle_ns"),
     )
 
 
