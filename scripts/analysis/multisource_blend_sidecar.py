@@ -14,8 +14,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
-from breezy.analysis.multisource_blend_features import LAG_SHIFT_NS
+from breezy.analysis.multisource_blend_features import LAG_SHIFT_NS, FeatureRow
 from scripts.analysis.multisource_blend_refusal import Refusal
+from scripts.analysis.settlement_alignment_study import IEM_ASOS_IDS
 
 __all__ = [
     "ANCHOR_VARIANTS",
@@ -24,7 +25,9 @@ __all__ = [
     "SENSITIVITY_VARIANT",
     "SIDECAR_SCHEMA",
     "SIDECAR_SUFFIX",
+    "check_rows_not_excluded",
     "check_sidecar",
+    "check_sidecar_lags_match_prereg",
     "check_sidecar_pair",
     "check_sidecar_row_count",
     "draft_scratch_digest",
@@ -181,3 +184,51 @@ def check_sidecar_row_count(meta: Mapping[str, Any], path: Path, n_rows: int) ->
     recorded = meta["n_rows"]
     if isinstance(recorded, bool) or recorded != n_rows:
         raise Refusal(f"{path}: sidecar n_rows {recorded!r} but the file holds {n_rows} rows")
+
+
+def _excluded_cells(meta: Mapping[str, Any], path: Path) -> dict[tuple[str, int], str]:
+    """``{(station key, LST year): entry}`` for the sidecar's ``ICAO/year`` exclusion entries."""
+    cells: dict[tuple[str, int], str] = {}
+    for item in meta["obs_excluded_station_years"]:
+        icao, _, year = str(item).partition("/")
+        if not icao or not year.isdigit():
+            raise Refusal(
+                f"{path}: obs_excluded_station_years entry {item!r} is not '<station>/<year>'"
+            )
+        cells[(IEM_ASOS_IDS.get(icao, icao), int(year))] = str(item)
+    return cells
+
+
+def check_rows_not_excluded(
+    rows: Sequence[FeatureRow], meta: Mapping[str, Any], path: Path
+) -> None:
+    """Refuse when a loaded row lies in a station-year the sidecar lists as excluded (PIN-R4).
+
+    ``climate_day`` is the local-standard-time climate day, so its year is the LST climate year.
+    A row's station is the settlement key (``NYC``); the list names ICAOs (``KNYC``).
+    """
+    cells = _excluded_cells(meta, path)
+    hit = sorted(
+        {
+            cells[(row.station, row.climate_day.year)]
+            for row in rows
+            if (row.station, row.climate_day.year) in cells
+        }
+    )
+    if hit:
+        raise Refusal(
+            f"{path}: {len(hit)} excluded station-year(s) {hit} still have rows although "
+            "obs_excluded_station_years lists them (PIN-R4)"
+        )
+
+
+def check_sidecar_lags_match_prereg(
+    meta: Mapping[str, Any], design: Mapping[str, Any], path: Path
+) -> None:
+    """The sidecar's ``source_lags_ns`` equals the prereg-pinned ``source_lags_ns`` (FB-R10)."""
+    pinned = design["pins"]["source_lags_ns"]
+    if meta["source_lags_ns"] != pinned:
+        raise Refusal(
+            f"{path}: sidecar source_lags_ns {meta['source_lags_ns']!r} differs from the "
+            f"prereg-pinned source_lags_ns {pinned!r}"
+        )

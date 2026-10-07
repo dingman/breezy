@@ -11,9 +11,10 @@ Pure checks that raise :class:`Refusal`; the runner calls them before any model 
   (``source_breaks_observed`` in the sidecar: LAMP basis breaks overall and per horizon, NBP version
   breaks) must be in the pinned flat ``source_breaks`` list. Breaks define folds, so an unpinned
   one would silently move the M0 fold SD and the floor.
-* PIN-R8b (:func:`check_not_refrozen`): the prereg file's git history (``git log --follow``) may
-  hold at most one commit whose content carries a non-UNFROZEN ``frozen_sha``; a second one means
-  the prereg was re-frozen. Adapted from ``no_longshot_pooled_test.check_freeze_introduction``.
+* PIN-R8b (:func:`check_not_refrozen`): the prereg file's own git history (``git log --follow``,
+  stopping at the copy source) may hold at most one distinct frozen state (non-UNFROZEN
+  ``frozen_sha`` + bytes); a second one means the prereg was re-frozen.
+  Adapted from ``no_longshot_pooled_test.check_freeze_introduction``.
 
 Amendments (PIN-R8d): a prereg is never edited after its freeze. An amendment is a NEW file
 (``..._v2.json``) with an amendment record, frozen once on its own; both results are reported.
@@ -130,63 +131,99 @@ def check_breaks_pinned(meta: Mapping[str, Any], pinned: Sequence[str], path: Pa
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_GIT_TIMEOUT_S,
-    )
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # incl. TimeoutExpired, missing git
+        raise Refusal(
+            f"git {' '.join(args)} failed ({type(exc).__name__}: {exc}); the freeze history of "
+            "the prereg is unknown"
+        ) from exc
 
 
-def _history(root: Path, rel: str) -> list[tuple[str, str]]:
-    """(commit, path at that commit) for every commit touching the file, following renames.
+def _file_chain(root: Path, rel: str) -> list[tuple[str, str]]:
+    """(commit, path at that commit) for this file's own history, newest first.
 
-    ``git log --follow`` also follows COPIES: a new ``_v2.json`` amendment (PIN-R8d) is a near-copy
-    of the frozen v1, and v1's commits would then count as v2's own freezes. A commit under another
-    name counts only if that name is gone from HEAD, i.e. it was a real rename of this file.
+    ``git log --follow --name-status`` reports each commit's status for the followed path. A
+    rename (``R``) moves the followed name back to the old path; a copy (``C``) or an add ends the
+    chain, because the copy SOURCE (e.g. a frozen ``_v1``) is another file with its own freeze
+    (PIN-R8d), so its stamp is never charged to the copy, whether or not v1 still exists.
     """
-    done = _git(root, "log", "--follow", f"--format={_COMMIT_PREFIX}%H", "--name-only", "--", rel)
+    done = _git(
+        root, "log", "--follow", "-M", "-C", f"--format={_COMMIT_PREFIX}%H", "--name-status",
+        "--", rel,
+    )  # fmt: skip
     if done.returncode != 0:
         raise Refusal(f"cannot read the git history of {rel}: {done.stderr.strip()}")
-    entries: list[tuple[str, str]] = []
-    sha = ""
+    chain: list[tuple[str, str]] = []
+    sha, ended = "", False
     for line in done.stdout.splitlines():
         if line.startswith(_COMMIT_PREFIX):
             sha = line[len(_COMMIT_PREFIX) :].strip()
-        elif line.strip() and sha:
-            entries.append((sha, line.strip()))
-    return [(sha, name) for sha, name in entries if name == rel or not _exists_at_head(root, name)]
+            ended = False
+        elif line.strip() and sha and not ended:
+            status, *paths = line.split("\t")
+            if status[0] in "RC" and len(paths) == 2:
+                chain.append((sha, paths[1]))
+                if status[0] == "C":
+                    return chain
+                ended = True
+            else:
+                chain.append((sha, paths[-1] if paths else rel))
+                ended = True
+                if status[0] == "A":
+                    return chain
+    return chain
 
 
-def _exists_at_head(root: Path, name: str) -> bool:
-    return _git(root, "cat-file", "-e", f"HEAD:{name}").returncode == 0
-
-
-def _carries_a_freeze(root: Path, sha: str, name: str) -> bool:
+def _freeze_content(root: Path, sha: str, name: str) -> tuple[str, str] | None:
+    """(frozen_sha stamp, file body) when the file at that commit carries a freeze, else None."""
     blob = _git(root, "show", f"{sha}:{name}")
     if blob.returncode != 0:
-        return False
+        return None
     try:
         body = json.loads(blob.stdout)
     except ValueError:
-        return False
+        return None
     stamp = body.get("frozen_sha") if isinstance(body, Mapping) else None
-    return isinstance(stamp, str) and stamp != UNFROZEN
+    if isinstance(stamp, str) and stamp != UNFROZEN:
+        return stamp, blob.stdout
+    return None
 
 
 def check_not_refrozen(prereg: Path) -> None:
-    """Refuse when more than one commit of the prereg file carries a non-UNFROZEN ``frozen_sha``."""
+    """Refuse when the file's history holds more than one distinct frozen state.
+
+    A frozen state is the (non-UNFROZEN ``frozen_sha``, file body) pair. A pure rename, or any
+    commit that carries the same stamp over the same bytes, is the SAME freeze; a second stamp, or
+    an edit made after the stamp, is a different one. A shallow clone is refused: its truncated
+    history could hide the first freeze (fail closed).
+    """
     top = _git(prereg.resolve().parent, "rev-parse", "--show-toplevel")
     if top.returncode != 0:
         raise Refusal(f"{prereg} is not inside a git repository; its freeze history is unknown")
     root = Path(top.stdout.strip())
-    rel = prereg.resolve().relative_to(root.resolve()).as_posix()
-    frozen = [sha for sha, name in _history(root, rel) if _carries_a_freeze(root, sha, name)]
-    if len(frozen) > 1:
+    shallow = _git(root, "rev-parse", "--is-shallow-repository")
+    if shallow.returncode != 0 or shallow.stdout.strip() != "false":
         raise Refusal(
-            f"the prereg was re-frozen: {len(frozen)} commits of {rel} carry a non-UNFROZEN "
-            f"frozen_sha ({', '.join(s[:12] for s in frozen)}); a freeze is made once, and an "
-            "amendment goes into a new _v2 file (PIN-R8)"
+            f"{root} is a shallow (or unreadable) repository; its truncated history cannot prove "
+            "the prereg was frozen only once (PIN-R8b)"
+        )
+    rel = prereg.resolve().relative_to(root.resolve()).as_posix()
+    states: dict[tuple[str, str], str] = {}
+    for sha, name in _file_chain(root, rel):
+        state = _freeze_content(root, sha, name)
+        if state is not None:
+            states.setdefault(state, sha)
+    if len(states) > 1:
+        raise Refusal(
+            f"the prereg was re-frozen: {len(states)} distinct frozen states of {rel} "
+            f"(commits {', '.join(s[:12] for s in states.values())}); a freeze is made once, and "
+            "an amendment goes into a new _v2 file (PIN-R8)"
         )

@@ -115,6 +115,8 @@ def check_share_pin(pin: object) -> float:
 def failure_reasons(year: YearCoverage, min_coverage: float, max_share: float) -> list[str]:
     """Why a station-year fails PIN-R4 (empty = it passes); both inequalities are strict."""
     reasons: list[str] = []
+    if year.coverage is None and year.pin_minute_excluded_share is None:
+        return ["no_expected_reports"]  # nothing to judge is not a pass
     if year.coverage is not None and year.coverage < min_coverage:
         reasons.append(f"coverage {year.coverage:.4f} < pins.{COVERAGE_PIN} {min_coverage}")
     share = year.pin_minute_excluded_share

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +393,79 @@ def test_the_excluded_digest_is_order_independent_and_content_bound() -> None:
     assert excluded_digest(["A/2"]) != excluded_digest([])
 
 
+def test_a_row_in_an_excluded_station_year_refuses_in_both_files(tmp_path: Path) -> None:
+    from scripts.analysis.multisource_blend_sidecar import excluded_digest
+
+    scenario = _Scenario(tmp_path)  # rows: NYC and LAX, climate year 2025
+    listed = ["KNYC/2025"]
+    _rewrite_sidecars(
+        scenario,
+        obs_excluded_station_years=listed,
+        obs_excluded_station_years_sha256=excluded_digest(listed),
+    )
+
+    with pytest.raises(skill.Refusal, match=r"KNYC/2025.*PIN-R4"):
+        scenario.run()
+    assert not (scenario.out / "stage_a.json").exists()
+
+
+def test_a_row_in_an_excluded_station_year_refuses_when_only_the_lag_file_holds_it(
+    tmp_path: Path,
+) -> None:
+    from scripts.analysis.multisource_blend_sidecar import excluded_digest
+    from tests.unit.test_multisource_blend_skill import _write_features
+
+    scenario = _Scenario(tmp_path)
+    listed = ["KLAX/2025"]
+    _rewrite_sidecars(
+        scenario,
+        obs_excluded_station_years=listed,
+        obs_excluded_station_years_sha256=excluded_digest(listed),
+    )
+    _write_features(scenario.features, [r for r in scenario.rows if r.station != "LAX"])
+
+    with pytest.raises(skill.Refusal, match=r"KLAX/2025"):
+        scenario.run()
+
+
+def test_an_excluded_station_year_with_no_rows_is_accepted(tmp_path: Path) -> None:
+    from scripts.analysis.multisource_blend_sidecar import excluded_digest
+
+    scenario = _Scenario(tmp_path)
+    listed = ["KNYC/2019", "KMIA/2025"]  # NYC has no 2019 rows; no MIA rows at all
+    _rewrite_sidecars(
+        scenario,
+        obs_excluded_station_years=listed,
+        obs_excluded_station_years_sha256=excluded_digest(listed),
+    )
+
+    assert scenario.run()["verdict"]
+
+
+@pytest.mark.parametrize("bad", ["KNYC", "KNYC/abc", "/2025"])
+def test_a_malformed_excluded_station_year_refuses(tmp_path: Path, bad: str) -> None:
+    from scripts.analysis.multisource_blend_sidecar import excluded_digest
+
+    scenario = _Scenario(tmp_path)
+    _rewrite_sidecars(
+        scenario,
+        obs_excluded_station_years=[bad],
+        obs_excluded_station_years_sha256=excluded_digest([bad]),
+    )
+
+    with pytest.raises(skill.Refusal, match="obs_excluded_station_years"):
+        scenario.run()
+
+
+def test_a_sidecar_whose_lags_differ_from_the_pinned_lags_refuses(tmp_path: Path) -> None:
+    scenario = _Scenario(tmp_path)
+    _rewrite_sidecars(scenario, source_lags_ns={**_PINNED_LAGS, "pfm": _PINNED_LAGS["pfm"] + 1})
+
+    with pytest.raises(skill.Refusal, match=r"source_lags_ns.*pfm"):
+        scenario.run()
+    assert not (scenario.out / "stage_a.json").exists()
+
+
 # ------------------------------------------------------------------ PIN-R8b: re-freeze
 
 
@@ -455,6 +529,75 @@ def test_an_amendment_copy_is_judged_on_its_own_history_not_the_frozen_original(
 
     guards.check_not_refrozen(amended)
     guards.check_not_refrozen(original)  # the original stays a single freeze too
+
+
+def test_a_pure_rename_of_the_frozen_file_is_not_a_refreeze(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _freeze(repo, _design(), name="old.json")
+    _git(repo, "mv", "old.json", "new.json")
+    _git(repo, "commit", "-q", "-m", "rename")
+
+    guards.check_not_refrozen(repo / "new.json")
+
+
+def test_a_v2_copy_is_not_charged_with_the_stamp_of_a_v1_that_is_later_deleted(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _freeze(repo, _design(), name="prereg_v1.json")
+    amended = _freeze(repo, _design(), name="prereg_v2.json")
+    _git(repo, "rm", "-q", "prereg_v1.json")
+    _git(repo, "commit", "-q", "-m", "drop v1")
+
+    guards.check_not_refrozen(amended)
+
+
+def test_a_genuine_second_freeze_with_a_new_frozen_sha_is_refused_after_a_rename(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _freeze(repo, _design(), name="old.json")
+    _git(repo, "mv", "old.json", "new.json")
+    _git(repo, "commit", "-q", "-m", "rename")
+    again = json.loads((repo / "new.json").read_text(encoding="utf-8"))
+    again["frozen_sha"] = _git(repo, "rev-parse", "HEAD")
+    _commit_edit(repo, "new.json", again)
+
+    with pytest.raises(skill.Refusal, match="re-frozen"):
+        guards.check_not_refrozen(repo / "new.json")
+
+
+def test_a_shallow_clone_is_refused_because_its_history_is_truncated(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    prereg = _freeze(repo, _design())
+    _commit_edit(repo, "other.json", {"x": 1})
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", repo.as_uri(), str(clone)],
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(skill.Refusal, match="shallow"):
+        guards.check_not_refrozen(clone / prereg.name)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("no git"), subprocess.TimeoutExpired("git", 20), subprocess.SubprocessError("x")],
+)
+def test_a_git_failure_is_a_refusal_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    prereg = _freeze(tmp_path / "repo", _design())
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+
+    with pytest.raises(skill.Refusal, match="git"):
+        guards.check_not_refrozen(prereg)
 
 
 def test_unfrozen_history_alone_is_not_a_refreeze(tmp_path: Path) -> None:

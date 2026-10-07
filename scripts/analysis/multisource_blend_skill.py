@@ -88,7 +88,9 @@ from scripts.analysis.multisource_blend_sidecar import (
     PRIMARY_VARIANT,
     SIDECAR_SCHEMA,
     SIDECAR_SUFFIX,
+    check_rows_not_excluded,
     check_sidecar,
+    check_sidecar_lags_match_prereg,
     check_sidecar_pair,
     check_sidecar_row_count,
 )
@@ -470,9 +472,13 @@ def prepare_run(
     check_breaks_pinned(lag_meta, pins["source_breaks"], lag_features)
     check_sidecar_anchors_match_prereg(meta, design, features)
     check_sidecar_anchors_match_prereg(lag_meta, design, lag_features)
+    check_sidecar_lags_match_prereg(meta, design, features)
+    check_sidecar_lags_match_prereg(lag_meta, design, lag_features)
     rows = _load_rows(features)
     lag_loaded = _load_rows(lag_features, extra_lag_ns=LAG_SHIFT_NS)
     check_row_anchors(rows, meta, features)
+    check_rows_not_excluded(rows, meta, features)
+    check_rows_not_excluded(lag_loaded, lag_meta, lag_features)
     check_row_anchors(lag_loaded, lag_meta, lag_features)
     check_sidecar_row_count(meta, features, len(rows))
     check_sidecar_row_count(lag_meta, lag_features, len(lag_loaded))

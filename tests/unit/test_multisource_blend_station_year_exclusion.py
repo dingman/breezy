@@ -110,8 +110,10 @@ def test_failing_reasons_cover_coverage_and_share_with_strict_inequalities() -> 
     assert len(both) == 2
 
 
-def test_a_year_with_no_expected_reports_and_no_rows_does_not_fail() -> None:
-    assert cov.failure_reasons(_year(expected=0, used=0, rows=0, off_minute=0), 0.95, 0.02) == []
+def test_a_year_with_no_expected_reports_and_no_rows_fails_closed() -> None:
+    # PIN-R4 hardening: nothing to judge is not a pass (was asserted == [] before r3 review)
+    reasons = cov.failure_reasons(_year(expected=0, used=0, rows=0, off_minute=0), 0.95, 0.02)
+    assert reasons == ["no_expected_reports"]
 
 
 @pytest.mark.parametrize("bad", [None, True, -0.1, 1.5, "0.02"])
