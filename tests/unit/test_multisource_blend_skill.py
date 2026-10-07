@@ -9,6 +9,7 @@ data, the network or a sealed (>= 2026-07-01) day.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import subprocess
 import sys
@@ -100,11 +101,33 @@ def _write_features(path: Path, rows: list[msb.FeatureRow]) -> Path:
     path.write_text(
         "\n".join(json.dumps(msb.feature_row_to_json(r)) for r in rows), encoding="utf-8"
     )
+    sidecar = Path(str(path) + skill.SIDECAR_SUFFIX)
+    if sidecar.exists():  # FB-R14 fixture: a rewritten file keeps a sidecar that matches it
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        write_sidecar(path, role=meta["role"], digest=meta["prereg_content_sha256"])
+    return path
+
+
+def write_sidecar(features: Path, *, role: str, digest: str, sha: str | None = None) -> Path:
+    """FB-R14 fixture helper: the ``<features>.manifest.json`` the builder would have written."""
+    path = Path(str(features) + skill.SIDECAR_SUFFIX)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": skill.SIDECAR_SCHEMA,
+                "role": role,
+                "prereg_content_sha256": digest,
+                "features_sha256": sha or hashlib.sha256(features.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
 class _Scenario:
-    def __init__(self, tmp_path: Path, **pin_overrides: Any) -> None:
+    def __init__(self, tmp_path: Path, *, sidecars: bool = True, **pin_overrides: Any) -> None:
+        self.sidecars = sidecars
         self.repo = tmp_path / "repo"
         self.prereg = _freeze(self.repo, _design(**pin_overrides))
         rows = two_version_rows(seed=5)
@@ -122,6 +145,15 @@ class _Scenario:
             encoding="utf-8",
         )
         self.out = tmp_path / "out"
+        self.write_sidecars()
+
+    def write_sidecars(self) -> None:
+        """Bind both feature files to the CURRENT prereg (no-op if ``sidecars=False``)."""
+        if not self.sidecars:
+            return
+        digest = skill.content_digest(json.loads(self.prereg.read_text(encoding="utf-8")))
+        write_sidecar(self.features, role="primary", digest=digest)
+        write_sidecar(self.lag_features, role="lag", digest=digest)
 
     def run(self) -> dict[str, Any]:
         return skill.run(

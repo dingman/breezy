@@ -37,6 +37,7 @@ def _read(
     *,
     days: dict[dt.date, int] | None = None,
     year: int = 2021,
+    routine_minute: int = 0,
 ) -> obs.ObsYear:
     root = tmp_path / "asos"
     write_asos_year(root, "KMIA", year, asos_1min_payload(rows))
@@ -48,7 +49,7 @@ def _read(
         "KMIA",
         year,
         std_utc_offset_hours=_NYC_OFFSET,
-        cadence_seconds=300,
+        routine_minute=routine_minute,
         lag_ns=_LAG,
         cutoff_ns_by_day=cutoffs,
     )
@@ -57,11 +58,12 @@ def _read(
 # ------------------------------------------------------------------ the quantisation (STOP rule)
 
 
-def test_the_live_path_is_cited_and_the_cadence_is_the_live_cadence() -> None:
+def test_the_live_path_is_cited_and_the_obs_cadence_is_the_routine_hourly_cadence() -> None:
     assert "running_extreme" in obs.LIVE_PATH_CITATION
     assert "round_half_up_f" in obs.LIVE_PATH_CITATION
     assert "iem_observations" in obs.LIVE_PATH_CITATION
-    assert obs.LIVE_OBS_CADENCE_SECONDS == OBS_CADENCE_SECONDS == 300
+    assert obs.ROUTINE_OBS_CADENCE_SECONDS == 3600  # FB-R13: routine METAR, not the 5-min grid
+    assert obs.DESCRIPTIVE_FIVE_MIN_SECONDS == OBS_CADENCE_SECONDS == 300
 
 
 def test_every_whole_degf_reproduces_through_the_live_quantisation() -> None:
@@ -87,22 +89,83 @@ def test_an_archive_that_is_not_whole_degf_stops_the_read(tmp_path: Path) -> Non
 # ------------------------------------------------------------------ L-13 cadence downsample
 
 
-def test_the_one_minute_series_is_downsampled_to_the_live_cadence_grid(tmp_path: Path) -> None:
-    rows: list[tuple[dt.datetime, int | str]] = [
-        (utc(2021, 6, 15, 12, minute), 70 + (99 - 70 if minute == 3 else 0)) for minute in range(15)
+def _hourly_minutes(
+    hours: range, spikes: dict[tuple[int, int], int] | None = None
+) -> list[tuple[dt.datetime, int | str]]:
+    """1-min rows for ``hours``: 60 + hour, with ``{(hour, minute): tmpf}`` overrides."""
+    spikes = spikes or {}
+    return [
+        (utc(2021, 6, 15, hour, minute), spikes.get((hour, minute), 60 + hour))
+        for hour in hours
+        for minute in range(60)
     ]
 
-    year = _read(tmp_path, rows)
+
+def test_obs_so_far_uses_routine_metar_minute_only(tmp_path: Path) -> None:
+    # distinct value at every minute of 12Z..14Z: only the :53 values may become readings
+    rows: list[tuple[dt.datetime, int | str]] = [
+        (utc(2021, 6, 15, hour, minute), 50 + (hour - 12) * 10 + minute % 10)
+        for hour in (12, 13, 14)
+        for minute in range(60)
+    ]
+
+    year = _read(tmp_path, rows, routine_minute=53)
+
+    readings = year.readings_by_day[dt.date(2021, 6, 15)]
+    assert [r.ts_ns for r in readings] == [ns(utc(2021, 6, 15, h, 53)) for h in (12, 13, 14)]
+    assert [r.temp_f for r in readings] == [53.0, 63.0, 73.0]
+    assert all(r.available_at_ns == r.ts_ns + _LAG for r in readings)
+    assert year.counts["non_routine_minute"] == 3 * 59
+
+
+def test_obs_specials_and_interval_rows_excluded(tmp_path: Path) -> None:
+    rows = _hourly_minutes(range(12, 15), spikes={(12, 20): 99, (13, 7): 98, (13, 53): 71})
+
+    year = _read(tmp_path, rows, routine_minute=53)
 
     day = dt.date(2021, 6, 15)
-    stamps = [r.ts_ns for r in year.readings_by_day[day]]
-    assert stamps == [ns(utc(2021, 6, 15, 12, m)) for m in (0, 5, 10)]
-    assert all(r.temp_f == 70.0 for r in year.readings_by_day[day])
-    # the 1-min spike never enters the cadence series (L-13: a sparser grid is its own datum) ...
-    assert max(r.temp_f for r in year.readings_by_day[day]) == 70.0
-    # ... and survives only in the DESCRIPTIVE raw running max
-    assert obs.raw_running_max_at(year.raw_max_by_day[day], ns(utc(2021, 6, 15, 13))) == 99.0
-    assert obs.raw_running_max_at(year.raw_max_by_day[day], ns(utc(2021, 6, 15, 12, 2))) == 70.0
+    # a special at :20 and an off-minute interval-style reading at :07 never enter the feature ...
+    assert [r.temp_f for r in year.readings_by_day[day]] == [72.0, 71.0, 74.0]
+    assert max(r.temp_f for r in year.readings_by_day[day]) == 74.0
+    # ... they live only in the descriptive 1-min arm
+    assert obs.raw_running_max_at(year.raw_max_by_day[day], ns(utc(2021, 6, 15, 14, 59))) == 99.0
+
+
+def test_descriptive_obs_arms_reported_not_in_features(tmp_path: Path) -> None:
+    rows = _hourly_minutes(range(12, 14), spikes={(12, 3): 99, (12, 5): 85, (12, 53): 70})
+
+    year = _read(tmp_path, rows, routine_minute=53)
+
+    day = dt.date(2021, 6, 15)
+    anchor = ns(utc(2021, 6, 15, 13, 59))
+    assert obs.raw_running_max_at(year.raw_max_by_day[day], anchor) == 99.0
+    assert obs.raw_running_max_at(year.five_min_max_by_day[day], anchor) == 85.0
+    assert max(r.temp_f for r in year.readings_by_day[day]) == 73.0  # neither arm feeds a feature
+    assert 85.0 not in {r.temp_f for r in year.readings_by_day[day]}
+
+
+def test_routine_minute_helper_reports_modal_minute_per_station() -> None:
+    def report(minute: int, count: int) -> list[dt.datetime]:
+        return [utc(2021, 6, 1) + dt.timedelta(days=i, minutes=minute) for i in range(count)]
+
+    modal = obs.modal_routine_minute_by_station(
+        {"KMIA": [*report(53, 8), *report(54, 3), *report(20, 1)], "KNYC": report(51, 4)}
+    )
+
+    assert modal["KMIA"].minute == 53 and modal["KMIA"].n == 12
+    assert modal["KMIA"].share == pytest.approx(8 / 12)
+    assert modal["KMIA"].histogram == {20: 1, 53: 8, 54: 3}
+    assert modal["KNYC"].minute == 51 and modal["KNYC"].share == 1.0
+    assert obs.routine_minute_pin_suggestion(modal) == {"KMIA": 53, "KNYC": 51}
+
+
+def test_routine_minute_helper_breaks_ties_to_the_lower_minute_and_skips_empty() -> None:
+    tie = [utc(2021, 6, 1, 0, 52), utc(2021, 6, 2, 0, 53)]
+
+    modal = obs.modal_routine_minute_by_station({"KAAA": tie, "KBBB": []})
+
+    assert modal["KAAA"].minute == 52
+    assert "KBBB" not in modal
 
 
 def test_readings_carry_the_obs_lag_and_never_a_lamp_source(tmp_path: Path) -> None:
@@ -118,7 +181,7 @@ def test_missing_rows_are_skipped_and_counted(tmp_path: Path) -> None:
     rows: list[tuple[dt.datetime, int | str]] = [
         (utc(2021, 6, 15, 12, 0), 70),
         (utc(2021, 6, 15, 12, 5), "M"),
-        (utc(2021, 6, 15, 12, 10), 71),
+        (utc(2021, 6, 15, 13, 0), 71),
     ]
 
     year = _read(tmp_path, rows)
@@ -131,9 +194,9 @@ def test_missing_rows_are_skipped_and_counted(tmp_path: Path) -> None:
 
 
 def test_the_climate_day_boundary_is_local_standard_time_never_dst(tmp_path: Path) -> None:
-    # 04:55Z in July is 23:55 LST of the PREVIOUS day at UTC-5 (EDT would call it 00:55 same day)
+    # 04:00Z in July is 23:00 LST of the PREVIOUS day at UTC-5 (EDT would call it 00:00 same day)
     rows: list[tuple[dt.datetime, int | str]] = [
-        (utc(2021, 7, 2, 4, 55), 80),
+        (utc(2021, 7, 2, 4, 0), 80),
         (utc(2021, 7, 2, 5, 0), 81),
     ]
     cutoffs = {dt.date(2021, 7, 1): ns(utc(2021, 7, 3)), dt.date(2021, 7, 2): ns(utc(2021, 7, 3))}
@@ -186,7 +249,7 @@ def test_a_station_year_is_streamed_with_a_bounded_peak(tmp_path: Path) -> None:
         "KMIA",
         2021,
         std_utc_offset_hours=_NYC_OFFSET,
-        cadence_seconds=300,
+        routine_minute=0,
         lag_ns=_LAG,
         cutoff_ns_by_day={dt.date(2021, 6, 15): ns(utc(2021, 6, 15, 15))},
     )

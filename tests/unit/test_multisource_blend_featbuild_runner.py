@@ -9,32 +9,30 @@ rows only; nothing reads real data.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from scripts.analysis import multisource_blend_skill as skill
-from tests.unit.test_multisource_blend_skill import _PREREG_SRC, _Scenario, _write_features
+from tests.unit.test_multisource_blend_skill import (
+    _PREREG_SRC,
+    _Scenario,
+    _write_features,
+    write_sidecar,
+)
 
-_NEW_PINS = ("anchors", "source_lags_ns", "obs_source", "obs_cadence_seconds")
+_NEW_PINS = (
+    "anchors",
+    "source_lags_ns",
+    "obs_source",
+    "obs_cadence_seconds",
+    "obs_routine_minute_by_station",
+)
 
 
 def _sidecar(features: Path, *, role: str, digest: str, sha: str | None = None) -> Path:
-    path = Path(str(features) + skill.SIDECAR_SUFFIX)
-    path.write_text(
-        json.dumps(
-            {
-                "schema": skill.SIDECAR_SCHEMA,
-                "role": role,
-                "prereg_content_sha256": digest,
-                "features_sha256": sha or hashlib.sha256(features.read_bytes()).hexdigest(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
+    return write_sidecar(features, role=role, digest=digest, sha=sha)
 
 
 def _digest(scenario: _Scenario) -> str:
@@ -163,8 +161,23 @@ def test_an_unreadable_sidecar_is_refused_not_ignored(tmp_path: Path) -> None:
         scenario.run()
 
 
-def test_no_sidecar_means_no_sidecar_check(tmp_path: Path) -> None:
-    scenario = _Scenario(tmp_path)
+def test_runner_refuses_without_sidecar(tmp_path: Path) -> None:
+    """FB-R14: a scoring run without the builder's sidecar is REFUSED (exit 2 through main)."""
+    scenario = _Scenario(tmp_path, sidecars=False)
 
     assert not Path(str(scenario.features) + skill.SIDECAR_SUFFIX).exists()
-    assert scenario.run()["rows_input"] == len(scenario.rows)
+    with pytest.raises(skill.Refusal, match="sidecar"):
+        scenario.run()
+    assert not (scenario.out / "stage_a.json").exists()
+
+
+def test_runner_refuses_when_only_the_lag_sidecar_is_missing(tmp_path: Path) -> None:
+    scenario = _Scenario(tmp_path, sidecars=False)
+    _sidecar(scenario.features, role="primary", digest=_digest(scenario))
+
+    with pytest.raises(skill.Refusal, match="sidecar"):
+        scenario.run()
+
+
+def test_runner_has_no_production_sidecar_bypass_flag() -> None:
+    assert "allow-no-sidecar" not in Path(skill.__file__).read_text(encoding="utf-8")

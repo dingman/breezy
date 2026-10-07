@@ -1,26 +1,26 @@
-"""F13 Phase A feature build: the ``obs_so_far`` reader (FB-R3, L-13, FB-R8).
+"""F13 Phase A feature build: the ``obs_so_far`` reader (FB-R13, supersedes FB-R3's 5-min cadence).
 
-``obs_so_far`` must be what the LIVE observation path would hold at the anchor, not a richer
-1-minute series (the train/serve skew of L-13). The live path, cited here and imported nowhere:
+``obs_so_far`` is defined on ROUTINE hourly METAR readings only, for training and for any future
+serving (L-13: no train/serve skew). The live path mixes METAR-exact rows with NWS integer-C
+interval rows at a 5-minute cadence; the interval rows cannot be reproduced from the whole-degF
+1-minute archive, so they are excluded on both sides. The live path, cited here and imported
+nowhere:
 
 * ``breezy.ingest.iem_observations`` / ``breezy.ingest.nws_observations`` turn a METAR ``T`` group
-  (tenths of a degree C) into a ``StationObservation`` (one raw 5-minute reading, ``is_metar``);
+  (tenths of a degree C) into a ``StationObservation`` (``is_metar``);
 * ``breezy.strategy.weather_common.running_extreme.RunningExtremeAccumulator`` keeps the climate
   day's running max and quantises each row with ``breezy.domain.temperature.round_half_up_f``
   (``floor(c_tenths / 10 * 9 / 5 + 32 + 0.5)``), on the local STANDARD-time day.
 
-The 1-minute IEM archive carries whole-degF ``tmpf``. A METAR ``T`` group is the same sensor value
-expressed in tenths of a degree C, so whole degF -> tenths C -> ``round_half_up_f`` is the identity
-for every whole degF in the physical range (asserted by a test over -80..140). This module
-therefore downsamples the 1-minute series to the live cadence and pushes every kept reading through
-that exact round trip. It emulates the METAR-exact (``is_metar``) rows only; the NWS integer-C
-interval rows (precision 10 tenths) cannot be derived from a whole-degF archive and are NOT
-emulated (reported by the builder). A reading the round trip cannot reproduce stops the read with
-:class:`ObsQuantisationError` (never guessed, never passed on as 1-minute data).
+Each routine value is the 1-minute archive's reading at the station's routine report minute
+(``obs_routine_minute_by_station`` pin), pushed through whole degF -> tenths C ->
+``round_half_up_f`` (the identity on every whole degF, asserted by a test over -80..140);
+``available_at`` = report time + the obs lag. A reading the round trip cannot reproduce stops the
+read with :class:`ObsQuantisationError`. Two DESCRIPTIVE arms are returned and never feed a
+feature: the raw 1-minute running max and the 5-minute whole-degF running max.
 
-The raw 1-minute running max is returned as a DESCRIPTIVE arm only (``raw_max_by_day``): it never
-feeds a feature. Streamed: the payload is decoded through a ``TextIOWrapper`` and reduced at once
-to the requested days, up to each day's cutoff (the latest anchor). No network; read-only.
+:func:`modal_routine_minute_by_station` derives the modal report minute per station from routine
+report timestamps for the coordinator to pin (reported, never applied). Streamed; no network.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import math
 import sys
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -55,28 +55,36 @@ from breezy.persistence.archive_cache import (
 )
 
 __all__ = [
-    "LIVE_OBS_CADENCE_SECONDS",
+    "DESCRIPTIVE_FIVE_MIN_SECONDS",
     "LIVE_PATH_CITATION",
+    "MINUTES_PER_HOUR",
     "OBS_SOURCE_LABEL",
+    "ROUTINE_OBS_CADENCE_SECONDS",
     "ObsQuantisationError",
     "ObsYear",
+    "RoutineMinute",
     "live_quantised_f",
+    "modal_routine_minute_by_station",
     "raw_running_max_at",
     "read_obs_year",
+    "routine_minute_pin_suggestion",
     "whole_f_to_c_tenths",
 ]
 
 _NS: Final[int] = 1_000_000_000
-#: The live cadence: ``StationObservation`` is "one raw 5-minute reading" and the corpus declares
-#: the same grid (L-13). Imported, never re-typed.
-LIVE_OBS_CADENCE_SECONDS: Final[int] = OBS_CADENCE_SECONDS
+#: FB-R13: routine METAR reports arrive hourly; this is the ``obs_cadence_seconds`` pin value.
+ROUTINE_OBS_CADENCE_SECONDS: Final[int] = 3600
+#: The live 5-minute grid, kept only for the DESCRIPTIVE 5-min arm (imported, never re-typed).
+DESCRIPTIVE_FIVE_MIN_SECONDS: Final[int] = OBS_CADENCE_SECONDS
+MINUTES_PER_HOUR: Final[int] = 60
 OBS_SOURCE_LABEL: Final[str] = "iem_asos_1min_whole_f_via_metar_tgroup_quantisation"
 LIVE_PATH_CITATION: Final[str] = (
     "live obs path: src/breezy/ingest/iem_observations.py (METAR T-group, tenths C, "
     "station_observation_data_type) + src/breezy/ingest/nws_observations.py; quantised by "
     "src/breezy/strategy/weather_common/running_extreme.py via "
-    "breezy.domain.temperature.round_half_up_f on the local standard-time climate day; cadence = "
-    "one raw 5-minute StationObservation (OBS_CADENCE_SECONDS)"
+    "breezy.domain.temperature.round_half_up_f on the local standard-time climate day; FB-R13: "
+    "only the routine hourly METAR reading (the station's routine report minute) is emulated, "
+    "never the 5-minute NWS interval rows"
 )
 
 
@@ -91,7 +99,44 @@ class ObsYear:
     readings_by_day: dict[dt.date, tuple[ObsReading, ...]] = field(default_factory=dict)
     #: Descriptive only: ``(ts_ns, running max degF)`` change points of the RAW 1-minute series.
     raw_max_by_day: dict[dt.date, tuple[tuple[int, float], ...]] = field(default_factory=dict)
+    #: Descriptive only: the same change points over the 5-minute whole-degF grid rows.
+    five_min_max_by_day: dict[dt.date, tuple[tuple[int, float], ...]] = field(default_factory=dict)
     counts: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass(frozen=True, slots=True)
+class RoutineMinute:
+    """The modal report minute of one station's routine reports, with its support."""
+
+    minute: int
+    n: int
+    share: float
+    histogram: dict[int, int]
+
+
+def modal_routine_minute_by_station(
+    report_times: Mapping[str, Iterable[dt.datetime]],
+) -> dict[str, RoutineMinute]:
+    """The modal minute-of-hour of each station's routine report times (ties: lower minute).
+
+    Stations without a report are omitted. The result is REPORTED for the coordinator to pin; it
+    is never applied automatically.
+    """
+    out: dict[str, RoutineMinute] = {}
+    for icao, times in report_times.items():
+        histogram = Counter(when.minute for when in times)
+        if not histogram:
+            continue
+        top = max(histogram.values())
+        minute = min(m for m, count in histogram.items() if count == top)
+        total = sum(histogram.values())
+        out[icao] = RoutineMinute(minute, total, top / total, dict(sorted(histogram.items())))
+    return out
+
+
+def routine_minute_pin_suggestion(modal: Mapping[str, RoutineMinute]) -> dict[str, int]:
+    """The ``obs_routine_minute_by_station`` pin value the modal minutes would give."""
+    return {icao: entry.minute for icao, entry in sorted(modal.items())}
 
 
 def whole_f_to_c_tenths(tmpf: int) -> int:
@@ -135,11 +180,14 @@ def read_obs_year(
     year: int,
     *,
     std_utc_offset_hours: float,
-    cadence_seconds: int,
+    routine_minute: int,
     lag_ns: int,
     cutoff_ns_by_day: Mapping[dt.date, int],
 ) -> ObsYear:
-    """One station-year of cadence readings for the requested days, up to each day's cutoff.
+    """One station-year of routine-METAR readings for the requested days, up to each day's cutoff.
+
+    Only rows at ``routine_minute`` (minute of the hour) become readings; every other minute is
+    counted as ``non_routine_minute`` and feeds the descriptive arms only.
 
     ``cutoff_ns_by_day`` names the days to keep and, per day, the latest instant any anchor needs;
     every other row is dropped (counted) as it streams past. A missing or unreadable year payload
@@ -152,10 +200,12 @@ def read_obs_year(
         out.counts["year_payload_unavailable"] += 1
         return out
     offset = dt.timedelta(hours=std_utc_offset_hours)
-    grid_ns = cadence_seconds * _NS
+    grid_ns = DESCRIPTIVE_FIVE_MIN_SECONDS * _NS
     readings: dict[dt.date, list[ObsReading]] = {}
     raw_changes: dict[dt.date, list[tuple[int, float]]] = {}
+    five_changes: dict[dt.date, list[tuple[int, float]]] = {}
     running: dict[dt.date, float] = {}
+    running_five: dict[dt.date, float] = {}
     previous_ns = -1
     stream = io.TextIOWrapper(io.BytesIO(body), encoding="utf-8", newline="")
     reader = csv.reader(stream)
@@ -186,7 +236,12 @@ def read_obs_year(
         if quantised > running.get(day, -math.inf):
             running[day] = quantised
             raw_changes.setdefault(day, []).append((ts_ns, quantised))
-        if ts_ns % grid_ns == 0:
+        if ts_ns % grid_ns == 0 and quantised > running_five.get(day, -math.inf):
+            running_five[day] = quantised
+            five_changes.setdefault(day, []).append((ts_ns, quantised))
+        if when.minute != routine_minute:
+            out.counts["non_routine_minute"] += 1
+        else:
             readings.setdefault(day, []).append(
                 ObsReading(
                     ts_ns=ts_ns,
@@ -197,4 +252,5 @@ def read_obs_year(
             )
     out.readings_by_day = {day: tuple(items) for day, items in readings.items()}
     out.raw_max_by_day = {day: tuple(items) for day, items in raw_changes.items()}
+    out.five_min_max_by_day = {day: tuple(items) for day, items in five_changes.items()}
     return out

@@ -47,6 +47,7 @@ class _VetoScenario(_Scenario):
         design = _design(**pins)
         design["veto"] = {**design["veto"], "reference": reference}
         self.prereg = _freeze(self.repo, design, name="prereg_veto.json")
+        self.write_sidecars()
 
     def veto_args(self, *, oof: Path | None = None, out: Path | None = None) -> list[str]:
         return [

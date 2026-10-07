@@ -13,7 +13,8 @@ Inputs (read-only, no network, never the live data root as an output):
   ``--asos-root`` the ``iem-asos-1min`` cache root; ``--truth`` the champion's
   ``settlement_truth.parquet`` (read below the holdout only);
 * ``--prereg`` the draft/frozen prereg: it supplies the ``anchors``, ``source_lags_ns``,
-  ``obs_source`` and ``obs_cadence_seconds`` pins (a null or unaccepted pin is refused).
+  ``obs_source``, ``obs_cadence_seconds`` (3600) and ``obs_routine_minute_by_station`` pins
+  (a null or unaccepted pin is refused).
 
 Anchors (FB-R1): D-1 is a UTC hour on the day before; D0 is a local-STANDARD hour (never DST).
 ``--anchor-variant d0_12lst`` builds the sensitivity pair (D0 at 12:00 LST), never mixed in.
@@ -229,11 +230,34 @@ def _parse_lags(raw: Any) -> dict[str, int]:
     return lags
 
 
+def _parse_routine_minutes(raw: Any) -> dict[str, int]:
+    """FB-R13: ``{icao: minute of the hour}`` for every station's routine METAR report."""
+    if not isinstance(raw, Mapping) or not raw:
+        raise BuildRefusal(
+            "pins.obs_routine_minute_by_station must be a non-empty object {icao: minute 0..59} "
+            f"(FB-R13), was {raw!r}"
+        )
+    minutes: dict[str, int] = {}
+    for icao, minute in raw.items():
+        if (
+            isinstance(minute, bool)
+            or not isinstance(minute, int)
+            or not 0 <= minute < obsmod.MINUTES_PER_HOUR
+        ):
+            raise BuildRefusal(
+                f"pins.obs_routine_minute_by_station.{icao} must be an integer minute 0..59, "
+                f"was {minute!r}"
+            )
+        minutes[str(icao)] = minute
+    return minutes
+
+
 @dataclass(frozen=True, slots=True)
 class Pins:
     anchors: Anchors
     anchors_raw: Mapping[str, Any]
     lags: Mapping[str, int]
+    obs_routine_minute_by_station: Mapping[str, int]
 
 
 def load_pins(design: Mapping[str, Any]) -> Pins:
@@ -247,12 +271,13 @@ def load_pins(design: Mapping[str, Any]) -> Pins:
             f"pins.obs_source must be {obsmod.OBS_SOURCE_LABEL!r}, was {pins.get('obs_source')!r}"
         )
     cadence = pins.get("obs_cadence_seconds")
-    if isinstance(cadence, bool) or cadence != obsmod.LIVE_OBS_CADENCE_SECONDS:
+    if isinstance(cadence, bool) or cadence != obsmod.ROUTINE_OBS_CADENCE_SECONDS:
         raise BuildRefusal(
-            f"pins.obs_cadence_seconds must be the live cadence {obsmod.LIVE_OBS_CADENCE_SECONDS}, "
-            f"was {cadence!r} (L-13)"
+            f"pins.obs_cadence_seconds must be the routine-METAR cadence "
+            f"{obsmod.ROUTINE_OBS_CADENCE_SECONDS}, was {cadence!r} (FB-R13)"
         )
-    return Pins(anchors, pins["anchors"], lags)
+    minutes = _parse_routine_minutes(pins.get("obs_routine_minute_by_station"))
+    return Pins(anchors, pins["anchors"], lags, minutes)
 
 
 # ------------------------------------------------------------------ configuration and path guards
@@ -319,6 +344,7 @@ class _Tally:
     counts: Counter[str]
     by_horizon: dict[str, Counter[str]]
     obs_raw_differs: int = 0
+    obs_five_min_differs: int = 0
 
 
 def _day_range(start: dt.date, end: dt.date) -> list[dt.date]:
@@ -346,6 +372,11 @@ def _build_station(
 ) -> dict[dt.date, str | None]:
     tally = ctx.tally
     end_exclusive = cfg.end + _DAY
+    routine_minute = pins.obs_routine_minute_by_station.get(station.icao)
+    if routine_minute is None:
+        raise BuildRefusal(
+            f"pins.obs_routine_minute_by_station has no entry for {station.icao} (FB-R13)"
+        )
     pfm = collect_pfm_vintages(
         ctx.us_cache,
         icao=station.icao,
@@ -384,7 +415,7 @@ def _build_station(
             station.icao,
             year,
             std_utc_offset_hours=station.offset,
-            cadence_seconds=obsmod.LIVE_OBS_CADENCE_SECONDS,
+            routine_minute=routine_minute,
             lag_ns=pins.lags["obs"],
             cutoff_ns_by_day=cutoffs,
         )
@@ -409,6 +440,10 @@ def _build_station(
                                 obs_year.raw_max_by_day.get(day, ()), anchor
                             )
                             tally.obs_raw_differs += int(raw != row.obs_so_far_f)
+                            five = obsmod.raw_running_max_at(
+                                obs_year.five_min_max_by_day.get(day, ()), anchor
+                            )
+                            tally.obs_five_min_differs += int(five != row.obs_so_far_f)
     return bases
 
 
@@ -583,7 +618,8 @@ def _sidecar(
         "anchors": pins.anchors_raw,
         "source_lags_ns": dict(pins.lags),
         "obs_source": obsmod.OBS_SOURCE_LABEL,
-        "obs_cadence_seconds": obsmod.LIVE_OBS_CADENCE_SECONDS,
+        "obs_cadence_seconds": obsmod.ROUTINE_OBS_CADENCE_SECONDS,
+        "obs_routine_minute_by_station": dict(pins.obs_routine_minute_by_station),
         "source_breaks_observed": breaks,
         "lag_shift_ns": LAG_SHIFT_NS if role == "lag" else 0,
         "obs_available_at_ns_shifted": role == "lag",
@@ -597,17 +633,21 @@ def _lines(rows: Sequence[msb.FeatureRow]) -> bytes:
     return (body + "\n").encode("utf-8") if ordered else b""
 
 
-def _obs_report(tally: _Tally) -> dict[str, Any]:
+def _obs_report(tally: _Tally, pins: Pins) -> dict[str, Any]:
     return {
         "source": obsmod.OBS_SOURCE_LABEL,
         "live_path": obsmod.LIVE_PATH_CITATION,
-        "cadence_seconds": obsmod.LIVE_OBS_CADENCE_SECONDS,
+        "cadence_seconds": obsmod.ROUTINE_OBS_CADENCE_SECONDS,
+        "routine_metar_only": True,
+        "obs_routine_minute_by_station": dict(pins.obs_routine_minute_by_station),
         "quantisation": "whole degF -> tenths C -> breezy.domain.temperature.round_half_up_f",
         "interval_rows_not_emulated": True,
         "interval_rows_note": (
-            "the NWS integer-C interval rows (precision 10 tenths) cannot be derived from a "
-            "whole-degF archive; only the METAR-exact rows are emulated"
+            "FB-R13: the NWS integer-C interval rows and METAR specials are excluded on both "
+            "sides; only the routine hourly METAR reading is used"
         ),
+        "descriptive_arms_feed_no_feature": True,
+        "d0_rows_where_five_min_max_differs": tally.obs_five_min_differs,
         "raw_1min_running_max_is_descriptive_only": True,
         "d0_rows_where_raw_1min_max_differs": tally.obs_raw_differs,
         "qc_revision_risk": (
@@ -680,7 +720,7 @@ def run_build(cfg: Config, report: dict[str, Any]) -> int:
         counts=dict(counts),
         by_horizon={h: dict(c) for h, c in tally.by_horizon.items()},
         lag_file=_lag_report(primary, lag),
-        obs=_obs_report(tally),
+        obs=_obs_report(tally, pins),
         source_breaks_observed=breaks,
         truth_concordance=_truth_concordance(cfg.f2_truth, truth),
         nbp_availability_basis="nominal: store max(LastModified, cycle + floor), flagged",

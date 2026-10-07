@@ -292,14 +292,18 @@ def _load_rows(path: Path) -> list[msb.FeatureRow]:
 
 
 def _check_sidecar(path: Path, design: Mapping[str, Any], *, role: str) -> None:
-    """FB-R10: a feature file with a sidecar must match it (sha256 and prereg digest) or be refused.
+    """FB-R10/FB-R14: every scoring run needs the builder's sidecar, and it must match the file.
 
-    No sidecar means no check (hand-assembled inputs). A sidecar that exists but cannot be read,
-    names another role or schema, or disagrees with the file or the prereg is a Refusal.
+    A missing sidecar is a Refusal (no production bypass): the features are always bound to the
+    prereg. A sidecar that cannot be read, names another role or schema, or disagrees with the file
+    or the prereg is a Refusal too.
     """
     sidecar = Path(str(path) + SIDECAR_SUFFIX)
     if not sidecar.exists():
-        return
+        raise Refusal(
+            f"{path}: no sidecar {sidecar.name}; a scoring run requires the builder's manifest "
+            "binding the features to the prereg (FB-R14)"
+        )
     try:
         meta = json.loads(sidecar.read_text(encoding="utf-8"))
         schema, kind = meta["schema"], meta["role"]

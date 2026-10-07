@@ -73,7 +73,8 @@ def _pins(**overrides: Any) -> dict[str, Any]:
         "anchors": _ANCHORS,
         "source_lags_ns": dict(_LAGS_NS),
         "obs_source": "iem_asos_1min_whole_f_via_metar_tgroup_quantisation",
-        "obs_cadence_seconds": 300,
+        "obs_cadence_seconds": 3600,
+        "obs_routine_minute_by_station": {"KNYC": 40},
     }
     pins.update(overrides)
     return pins
@@ -436,6 +437,11 @@ def test_lag_below_conservative_refused(tmp_path: Path) -> None:
     "pins",
     [
         {"obs_cadence_seconds": 60},
+        {"obs_cadence_seconds": 300},
+        {"obs_routine_minute_by_station": None},
+        {"obs_routine_minute_by_station": {"KMIA": 40}},
+        {"obs_routine_minute_by_station": {"KNYC": 60}},
+        {"obs_routine_minute_by_station": {"KNYC": True}},
         {"obs_source": "iem_asos_1min_raw"},
         {"anchors": None},
         {"source_lags_ns": None},
@@ -633,7 +639,7 @@ def test_the_report_cites_the_live_obs_path_and_flags_what_is_not_emulated(tmp_p
     obs = world.report()["obs"]
 
     assert "running_extreme" in obs["live_path"] and "iem_observations" in obs["live_path"]
-    assert obs["cadence_seconds"] == 300 and obs["interval_rows_not_emulated"] is True
+    assert obs["cadence_seconds"] == 3600 and obs["interval_rows_not_emulated"] is True
     assert obs["raw_1min_running_max_is_descriptive_only"] is True
     assert obs["d0_rows_where_raw_1min_max_differs"] == 2  # 45 at 15:00 vs the cadence feature 44
     assert "qc_revision_risk" in obs
@@ -675,7 +681,8 @@ def test_sidecars_record_the_prereg_digest_the_file_shas_and_the_pins(tmp_path: 
         assert side["prereg_content_sha256"] == digest
         assert side["features_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         assert side["anchors"] == _ANCHORS and side["source_lags_ns"] == _LAGS_NS
-        assert side["obs_cadence_seconds"] == 300
+        assert side["obs_cadence_seconds"] == 3600
+        assert side["obs_routine_minute_by_station"] == {"KNYC": 40}
         assert "lamp" in side["source_breaks_observed"]
 
 
@@ -714,3 +721,33 @@ def test_the_report_carries_the_input_and_prereg_hashes(tmp_path: Path) -> None:
     assert report["inputs_sha256"]["truth"] == hashlib.sha256(world.truth.read_bytes()).hexdigest()
     assert report["nbp_availability_basis"].startswith("nominal")
     assert report["pfm_iem_entered_time"] == "unavailable_in_archive"
+
+
+# ------------------------------------------------------------------ FB-R13 pins, arms
+
+
+def test_obs_cadence_pin_must_be_3600() -> None:
+    with pytest.raises(fb.BuildRefusal, match="3600"):
+        fb.load_pins({"pins": _pins(obs_cadence_seconds=300)})
+    with pytest.raises(fb.BuildRefusal, match="obs_cadence_seconds"):
+        fb.load_pins({"pins": _pins(obs_cadence_seconds=None)})
+
+    pins = fb.load_pins({"pins": _pins(obs_cadence_seconds=3600)})
+
+    assert pins.obs_routine_minute_by_station == {"KNYC": 40}
+
+
+def test_descriptive_obs_arms_reported_not_in_features_through_the_build(tmp_path: Path) -> None:
+    world = _build_world(tmp_path)
+    _run(world)
+
+    obs = world.report()["obs"]
+    rows = {(r.climate_day, r.horizon): r for r in world.rows()}
+
+    assert obs["routine_metar_only"] is True
+    assert obs["obs_routine_minute_by_station"] == {"KNYC": 40}
+    # 45 at 15:00 (1-min and 5-min arms) vs the routine-METAR feature 44 (14:40)
+    assert obs["d0_rows_where_raw_1min_max_differs"] == 2
+    assert obs["d0_rows_where_five_min_max_differs"] == 2
+    assert obs["descriptive_arms_feed_no_feature"] is True
+    assert {r.obs_so_far_f for (_d, h), r in rows.items() if h == "D0"} == {44.0}
