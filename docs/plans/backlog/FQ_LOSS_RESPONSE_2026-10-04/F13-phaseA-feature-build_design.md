@@ -151,3 +151,13 @@ Round-1 reviews: prediction-market-reviewer REQUEST_CHANGES and architect REQUES
   - ≥14 days of C1 lags.
 
 **STATUS: READY to build (2026-10-07).**
+
+### Build rulings FB-R13..R14 (coordinator, 2026-10-07, after the builder's FB-R3 finding)
+- **FB-R13 (supersedes the FB-R3 cadence).** The live path mixes METAR-exact rows with NWS integer-°C interval rows, at a 5-min cadence. The interval rows cannot be reproduced from the whole-°F 1-min archive. The feature is therefore **defined on routine METAR readings only, for training and for any future serving**:
+  - `obs_so_far` is the running max of the station's **routine hourly METAR** values. Each value is taken from the 1-min archive at the station's routine report minute, which is derived per station from the archive and pinned.
+  - Values are quantised with `round_half_up_f` through the METAR T-group path (identity on whole °F).
+  - `available_at` is the report time plus the obs lag.
+  - Pins: `obs_cadence_seconds = 3600` and `obs_routine_minute_by_station`.
+  - Interval rows and specials are excluded on both sides. **Phase C/D requirement:** any live consumer of this blend computes `obs_so_far` the same way, from routine METARs only, never through `RunningExtremeAccumulator`'s interval rows.
+  - The 1-min raw running max and the 5-min whole-°F max remain descriptive arms.
+- **FB-R14 (tightens FB-R10).** For a real scoring run the runner **requires** the sidecar, and refuses without one, so the features are always bound to the prereg. Runner tests provide sidecars through a fixture helper. Only a `--allow-no-sidecar` flag that is test-only, or the absence of any real data, may bypass it. Prefer no bypass.
