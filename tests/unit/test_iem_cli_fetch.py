@@ -528,6 +528,24 @@ def test_afos_cli_url_predicate_scope(study: ModuleType) -> None:
     assert not study.is_afos_cli_url("https://example.com/other.py?pil=CLINYC")
 
 
+IEM_AFOS_MAX_LIMIT: Final[int] = 9999  # IEM rejects limit > 9999 with HTTP 422
+
+
+def test_cli_afos_limit_within_iem_bound(fetch: ModuleType) -> None:
+    url = fetch.afos_cli_text_url("NYC", dt.date(2026, 1, 1), dt.date(2026, 10, 5))
+    limit = int(parse_qs(urlsplit(url).query)["limit"][0])
+    assert 0 < limit <= IEM_AFOS_MAX_LIMIT
+
+
+def test_afos_url_refuses_limit_above_iem_bound(study: ModuleType) -> None:
+    start, end = dt.date(2026, 1, 1), dt.date(2026, 2, 1)
+    with pytest.raises(ValueError, match="9999"):
+        study.afos_url("NYC", start, end, limit=10_000)
+    default_limit = parse_qs(urlsplit(study.afos_url("NYC", start, end)).query)["limit"][0]
+    assert int(default_limit) <= IEM_AFOS_MAX_LIMIT
+    assert "limit=9999" in study.afos_url("NYC", start, end, limit=9999)
+
+
 # ---------------------------------------------------------------------------
 # Review fixes: append-only revisions, unconfirmed value changes, visible skips
 # ---------------------------------------------------------------------------

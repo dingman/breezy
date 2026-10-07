@@ -155,7 +155,8 @@ DEFAULT_CATALOG_DIR: Final[Path] = Path.home() / ".local/share/breezy/catalog"
 
 #: First climate day the truth window covers (matches the SL-5 extension window).
 TRUTH_WINDOW_START: Final[dt.date] = dt.date(2026, 1, 1)
-AFOS_LIMIT: Final[int] = 10_000
+#: IEM rejects limit > 9999 with HTTP 422 (the 10_000 value failed every live fetch).
+AFOS_LIMIT: Final[int] = 9_999
 USER_AGENT: Final[str] = "breezy-truth-fetch/1.0 (read-only AFOS CLI cache; contact: operator)"
 ACCEPT: Final[str] = "text/plain"
 MAX_BODY_BYTES: Final[int] = 32 * 1024 * 1024

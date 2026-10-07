@@ -44,14 +44,12 @@ from breezy.normalize.climate_day import climate_day_for_instant
 from breezy.persistence.catalog import read_climate_days, read_raw_products, station_catalog_path
 from breezy.registry.sites import SettlementSite, default_registry
 
-PREREGISTRATION_PATH: Final[Path] = Path(
-    "scripts/analysis/pre_registration_2026-08-24T192643Z.md"
-)
+PREREGISTRATION_PATH: Final[Path] = Path("scripts/analysis/pre_registration_2026-08-24T192643Z.md")
 DEFAULT_CACHE_DIR: Final[Path] = DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR
-DEFAULT_EVIDENCE_PATH: Final[Path] = Path(
-    "docs/evidence/settlement_alignment_2026-08-24.md"
-)
+DEFAULT_EVIDENCE_PATH: Final[Path] = Path("docs/evidence/settlement_alignment_2026-08-24.md")
 IEM_BASE: Final[str] = "https://mesonet.agron.iastate.edu"
+#: IEM's AFOS endpoint validates ``limit <= 9999`` and answers HTTP 422 above it.
+IEM_AFOS_MAX_LIMIT: Final[int] = 9_999
 USER_AGENT: Final[str] = (
     "Breezy settlement-alignment offline study/0.1 "
     "(contact: local operator; polite cached research)"
@@ -255,9 +253,7 @@ def metar_temperatures(
             continue
         raw_valid = row.get("valid", "")
         try:
-            valid_utc = dt.datetime.strptime(raw_valid, "%Y-%m-%d %H:%M").replace(
-                tzinfo=dt.UTC
-            )
+            valid_utc = dt.datetime.strptime(raw_valid, "%Y-%m-%d %H:%M").replace(tzinfo=dt.UTC)
         except ValueError:
             drops["archive_parse_error"] += 1
             continue
@@ -419,7 +415,13 @@ def fetch_bytes_cached(
     return data
 
 
-def afos_url(cli_location: str, start: dt.date, end: dt.date, *, limit: int = 10_000) -> str:
+def afos_url(
+    cli_location: str, start: dt.date, end: dt.date, *, limit: int = IEM_AFOS_MAX_LIMIT
+) -> str:
+    if limit > IEM_AFOS_MAX_LIMIT:
+        raise ValueError(
+            f"IEM AFOS limit {limit} exceeds the {IEM_AFOS_MAX_LIMIT} bound (HTTP 422)"
+        )
     params = urlencode(
         {
             "pil": f"CLI{cli_location}",
@@ -1068,8 +1070,7 @@ def markdown_report(
         for city in sorted(by_city):
             stats = summarize_cases(by_city[city])
             lines.append(
-                f"| {city} | {format_stats(stats)} | "
-                f"{verdict(stats, generated_at=generated_at)} |"
+                f"| {city} | {format_stats(stats)} | {verdict(stats, generated_at=generated_at)} |"
             )
         lines.extend(
             [
