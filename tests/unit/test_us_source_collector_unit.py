@@ -41,7 +41,9 @@ guards = sys.modules.get("us_source_guards") or _load_guards()
 REPO_LITERAL = "/home/jon/breezy"
 SERVICE = UNIT_DIR / "us-source-collector@.service"
 TIMER = UNIT_DIR / "us-source-collector@.timer"
-INSTANCES = ("lamp", "pfm", "nbp")
+INSTANCES = ("lamp", "pfm", "nbp", "lav", "mos", "obs")
+#: C1-R1 poll-cadence bounds (seconds) of the first-seen precision for the new legs.
+CADENCE_BOUND_S = {"lav": 15 * 60, "mos": 15 * 60, "obs": 10 * 60}
 HOME = str(Path.home())
 ARCHIVE_DST = f"{HOME}/.local/share/breezy/us_source_archive"
 ALERTS_DST = f"{HOME}/.config/breezy/alerts.env"
@@ -366,3 +368,24 @@ def test_bwrap_probe_real_collector_help_runs_under_the_profile(profile: Path) -
     done = _run(profile, [*command[: script + 1], "--help"])
     assert done.returncode == 0, done.stderr
     assert "--source" in done.stdout
+
+
+@pytest.mark.parametrize("instance", sorted(CADENCE_BOUND_S))
+def test_new_leg_cadence_bounds_the_first_seen_precision_outside_the_launch_window(
+    instance: str,
+) -> None:
+    firings = _firing_seconds(instance)
+    window_end = 17 * 3600 + 10 * 60
+    gaps = [
+        b - a
+        for a, b in zip(firings, [*firings[1:], firings[0] + 86_400], strict=True)
+        if not (a < WINDOW_START_S and b >= window_end - 1)
+    ]
+    assert max(gaps) <= CADENCE_BOUND_S[instance], (instance, max(gaps))
+
+
+@pytest.mark.parametrize("instance", sorted(CADENCE_BOUND_S))
+def test_new_leg_instance_is_a_known_collector_source(instance: str) -> None:
+    from tests.unit.test_us_source_collector import col
+
+    assert instance in col.SOURCE_KEYS

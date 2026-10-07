@@ -47,10 +47,14 @@ for _directory in (_COLLECT_DIR, _COLLECT_DIR.parent / "venue"):  # pragma: no c
 
 import us_source_alert as alert_mod
 import us_source_guards as guards
+import us_source_lag_legs as legs
 import us_source_ledger as ledger_mod
 import us_source_norm as norm
+import us_source_obs_transport as obs_transport
 from iem_mos_probe_transport import (  # type: ignore[import-not-found]
+    IEM_AFOS_LAV_MIN_INTERVAL_NS,
     IEM_AFOS_PFM_MAX_BODY_BYTES,
+    IemMosProbeTransport,
     IemPacer,
     PacedIemTransport,
 )
@@ -103,7 +107,10 @@ __all__ = [
     "FetchedPayload",
     "NotPublishedError",
     "default_lamp_fetcher",
+    "default_lav_fetcher",
+    "default_mos_fetcher",
     "default_nbp_fetcher",
+    "default_obs_fetcher",
     "default_pfm_fetcher",
     "lag_samples",
     "main",
@@ -124,6 +131,9 @@ SOURCE_KEYS: Final[dict[str, str]] = {
     "lamp": US_LAMP_LIVE_SOURCE,
     "pfm": US_PFM_AFOS_SOURCE,
     "nbp": NBP_SOURCE_KEY,
+    "lav": legs.IEM_LEGS["lav"].source_key,
+    "mos": legs.IEM_LEGS["mos"].source_key,
+    "obs": legs.OBS_SOURCE_KEY,
 }
 NBP_AVAILABILITY_SOURCE: Final[str] = "NBM_NBP"
 #: R29: the stations argument is KNYC-inclusive; the transport's module default is untouched.
@@ -139,6 +149,9 @@ LATE_AFTER_NS: Final[dict[str, int]] = {
     "lamp": 20 * _MINUTE_NS,
     "pfm": 3 * _HOUR_NS,
     "nbp": 3 * _HOUR_NS,
+    "lav": legs.IEM_LEGS["lav"].late_after_ns,
+    "mos": legs.IEM_LEGS["mos"].late_after_ns,
+    "obs": legs.OBS_LATE_AFTER_NS,
 }
 #: A displaced rerun still polls for this long (it starts past the nominal window).
 _LATE_MAX_POLL_NS: Final[int] = 10 * _MINUTE_NS
@@ -163,16 +176,8 @@ COLLECTOR_PREREG: Final[LagPrereg] = LagPrereg(
 )
 
 
-class NotPublishedError(Exception):
-    """The product is not there yet (404): a routine miss, never data."""
-
-
-@dataclass(frozen=True, slots=True)
-class FetchedPayload:
-    body: bytes
-    fetched_at_ns: int
-    last_modified: str | None
-    host_tag: str
+NotPublishedError = legs.NotPublishedError
+FetchedPayload = legs.FetchedPayload
 
 
 class CycleStatus(enum.StrEnum):
@@ -203,6 +208,10 @@ class CycleReport:
         return 0
 
 
+def _unused_fetcher(*_args: object) -> FetchedPayload:
+    raise RuntimeError("this fetcher is not used by the selected source")
+
+
 @dataclass(frozen=True)
 class CycleContext:
     root: Path
@@ -218,6 +227,9 @@ class CycleContext:
     nbp_poll_interval_s: float = 300.0
     ntp_bound_ns: int = _DEFAULT_NTP_BOUND_MS * 1_000_000
     min_free_bytes: int = _DEFAULT_MIN_FREE_GIB * _GIB
+    fetch_lav: Callable[[str, int], FetchedPayload] = _unused_fetcher
+    fetch_mos: Callable[[str, int], FetchedPayload] = _unused_fetcher
+    fetch_obs: Callable[[str], FetchedPayload] = _unused_fetcher
 
 
 class _StoreClock:
@@ -720,6 +732,37 @@ def _nbp_cycle(col: _Collector, now_ns: int) -> CycleReport:
     return CycleReport(col.source_key, CycleStatus.COLLECTED)
 
 
+# -- lav / mos / obs (availability only, C1-R1) ------------------------------------------------
+
+
+def _leg_report(col: _Collector, out: legs.LegOutcome) -> CycleReport:
+    if out.errors:
+        status = CycleStatus.ERROR
+    elif out.collected:
+        status = CycleStatus.COLLECTED
+    elif out.deadline:
+        status = CycleStatus.DEADLINE
+    elif out.misses:
+        status = CycleStatus.NOT_PUBLISHED
+    elif out.refused:
+        status = CycleStatus.REFUSED
+    else:
+        status = CycleStatus.UNCHANGED
+    return CycleReport(col.source_key, status, out.refused)
+
+
+def _lav_cycle(col: _Collector, _now_ns: int) -> CycleReport:
+    return _leg_report(col, legs.iem_cycle(col, legs.IEM_LEGS["lav"], col.ctx.fetch_lav))
+
+
+def _mos_cycle(col: _Collector, _now_ns: int) -> CycleReport:
+    return _leg_report(col, legs.iem_cycle(col, legs.IEM_LEGS["mos"], col.ctx.fetch_mos))
+
+
+def _obs_cycle(col: _Collector, _now_ns: int) -> CycleReport:
+    return _leg_report(col, legs.obs_cycle(col, col.ctx.fetch_obs))
+
+
 # -- the driver -----------------------------------------------------------------------------
 
 
@@ -727,6 +770,9 @@ _CYCLES: Final[dict[str, Callable[[_Collector, int], CycleReport]]] = {
     "lamp": _lamp_cycle,
     "pfm": _pfm_cycle,
     "nbp": _nbp_cycle,
+    "lav": _lav_cycle,
+    "mos": _mos_cycle,
+    "obs": _obs_cycle,
 }
 
 
@@ -854,8 +900,77 @@ def default_nbp_fetcher(
     return fetch
 
 
-def _unused_fetcher(*_args: object) -> FetchedPayload:
-    raise RuntimeError("this fetcher is not used by the selected source")
+_LAV_REQUEST_BUDGET: Final[int] = 60
+_MOS_REQUEST_BUDGET: Final[int] = 30
+_IEM_CSV_MAX_BODY_BYTES: Final[int] = 2 * 1024 * 1024
+
+
+def _iem_window(run_ts_ns: int) -> tuple[str, str]:
+    """``sts``/``ets`` (YYYY-MM-DDTHH:MMZ) bracketing one runtime; rows are filtered after."""
+    start = dt.datetime.fromtimestamp(run_ts_ns / _NS, tz=dt.UTC)
+    end = start + dt.timedelta(minutes=1)
+    return start.strftime("%Y-%m-%dT%H:%MZ"), end.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def _iem_csv_fetcher(
+    clock: Callable[[], int], *, model: str, budget: int, check_proxy_env: bool
+) -> Callable[[str, int], FetchedPayload]:
+    transport = IemMosProbeTransport(
+        budget=RequestBudget(limit=budget),
+        pacer=IemPacer(clock=clock, min_interval_ns=IEM_AFOS_LAV_MIN_INTERVAL_NS),
+        user_agent=COLLECTOR_USER_AGENT,
+        clock=clock,
+        max_body_bytes=_IEM_CSV_MAX_BODY_BYTES,
+        check_proxy_env=check_proxy_env,
+    )
+
+    def fetch(station: str, run_ts_ns: int) -> FetchedPayload:
+        sts, ets = _iem_window(run_ts_ns)
+        if model == "LAV":
+            result = asyncio.run(transport.fetch_lav(station, sts, ets))
+        else:
+            result = asyncio.run(transport.fetch_mos_csv(station, model, sts, ets))
+        text = result.text or ""
+        if not legs.iem_csv_has_run(text, station, run_ts_ns):
+            raise NotPublishedError(f"no {model} row for {station} at {sts}")
+        return FetchedPayload(text.encode("utf-8"), result.retrieved_at_ns, None, "iem")
+
+    return fetch
+
+
+def default_lav_fetcher(
+    clock: Callable[[], int], *, check_proxy_env: bool = True
+) -> Callable[[str, int], FetchedPayload]:
+    return _iem_csv_fetcher(
+        clock, model="LAV", budget=_LAV_REQUEST_BUDGET, check_proxy_env=check_proxy_env
+    )
+
+
+def default_mos_fetcher(
+    clock: Callable[[], int], *, check_proxy_env: bool = True
+) -> Callable[[str, int], FetchedPayload]:
+    return _iem_csv_fetcher(
+        clock, model="GFS", budget=_MOS_REQUEST_BUDGET, check_proxy_env=check_proxy_env
+    )
+
+
+def default_obs_fetcher(
+    clock: Callable[[], int], *, check_proxy_env: bool = True
+) -> Callable[[str], FetchedPayload]:
+    """The live observation request (parity with ``NwsObservationTransport`` is pinned by test)."""
+    transport = obs_transport.ObsTransport(
+        clock=clock, user_agent=COLLECTOR_USER_AGENT, check_proxy_env=check_proxy_env
+    )
+
+    def fetch(station: str) -> FetchedPayload:
+        result = asyncio.run(
+            transport.fetch_station_observations(station, limit=legs.OBS_FETCH_LIMIT)
+        )
+        return FetchedPayload(
+            (result.text or "").encode("utf-8"), result.retrieved_at_ns, None, "nws"
+        )
+
+    return fetch
 
 
 def _make_alert(webhook_url: str | None) -> Callable[[str, str, str], bool]:
@@ -874,11 +989,17 @@ def build_default_context(args: argparse.Namespace) -> CycleContext:
         "lamp": _unused_fetcher,
         "pfm": _unused_fetcher,
         "nbp": _unused_fetcher,
+        "lav": _unused_fetcher,
+        "mos": _unused_fetcher,
+        "obs": _unused_fetcher,
     }
     factories: dict[str, Callable[[Callable[[], int]], Callable[..., FetchedPayload]]] = {
         "lamp": default_lamp_fetcher,
         "pfm": default_pfm_fetcher,
         "nbp": default_nbp_fetcher,
+        "lav": default_lav_fetcher,
+        "mos": default_mos_fetcher,
+        "obs": default_obs_fetcher,
     }
     fetchers[args.source] = factories[args.source](clock)
     return CycleContext(
@@ -888,6 +1009,9 @@ def build_default_context(args: argparse.Namespace) -> CycleContext:
         fetch_lamp=fetchers["lamp"],
         fetch_pfm=fetchers["pfm"],
         fetch_nbp=fetchers["nbp"],
+        fetch_lav=fetchers["lav"],
+        fetch_mos=fetchers["mos"],
+        fetch_obs=fetchers["obs"],
         measure_ntp_offset=guards.measure_ntp_offset_ns,
         free_bytes=guards.disk_free_bytes,
         alert=_make_alert(guards.resolve_webhook_url(args.alerts_env)),

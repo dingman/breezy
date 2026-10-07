@@ -14,9 +14,13 @@ Lag definitions: ``lamp-mdl`` = measured header availability - nominal cycle (th
 LAMP feed stands in for the MDL archive); ``pfm`` = first-seen - WMO issuance (the ledger's
 ``available_ts`` IS the WMO header, so it carries no lag); the first ``seen`` event per
 (station, run) only (later revisions are not publication lags). ``late`` rows are
-right-censored and dropped. ``lav-iem``, ``mos-gfs`` and ``obs`` have no live C1 path and are
-listed under ``no_live_path``; they are never invented. Read-only on the archive; the output
-is written atomically and always, even when the evidence is insufficient.
+right-censored and dropped. ``lav-iem`` / ``mos-gfs`` / ``obs`` come from the
+availability-only collector legs (``us-lav-iem-avail``, ``us-mos-gfs-avail``,
+``us-obs-avail``): availability = first-seen, so the lag is first-seen minus the nominal run
+(lav: IEM hourly label; mos: model runtime; obs: routine report time), an upper bound by one poll
+interval (C1-R3). A source whose ledger does not exist yet is listed under ``no_live_path``; it is
+never invented. Read-only on the archive; the output is written atomically and always, even when
+the evidence is insufficient.
 """
 
 from __future__ import annotations
@@ -43,7 +47,10 @@ _SOURCES: Final[tuple[str, ...]] = ("lamp-mdl", "lav-iem", "pfm", "mos-gfs", "ob
 #: pin source -> (ledger source key, lag basis); absent = no live C1 path.
 _LIVE: Final[Mapping[str, tuple[str, str]]] = {
     "lamp-mdl": ("us-lamp-live", "available_ts_ns"),
+    "lav-iem": ("us-lav-iem-avail", "available_ts_ns"),
     "pfm": ("us-pfm-afos", "first_seen_ns"),
+    "mos-gfs": ("us-mos-gfs-avail", "available_ts_ns"),
+    "obs": ("us-obs-avail", "available_ts_ns"),
 }
 #: the runner's level-source keys (multisource_blend_features.LEVEL_SOURCES) -> pin key.
 _LEVEL_KEY: Final[Mapping[str, str]] = {"lamp": "lamp-mdl", "pfm": "pfm", "mos": "mos-gfs"}
@@ -71,6 +78,8 @@ def _first_seen_per_run(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]
     firsts: dict[tuple[str, int], dict[str, Any]] = {}
     for e in events:
         if e.get("kind") != "seen" or e.get("station") == _LAMP_EXT:
+            continue
+        if e.get("routine") is False:  # obs ledger rows are routine-only; defence in depth
             continue
         try:
             key = (str(e.get("station")), int(e["run_ts_ns"]))

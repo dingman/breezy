@@ -53,7 +53,14 @@ ATTEMPT_BUDGET_S: Final[int] = 90
 
 #: In-process work budget per source, in seconds. ``RuntimeMaxSec`` is a backstop and must
 #: exceed these (checked by test) while never reaching 16:30Z.
-MAX_WORK_SECONDS: Final[Mapping[str, int]] = {"lamp": 20 * 60, "pfm": 10 * 60, "nbp": 115 * 60}
+MAX_WORK_SECONDS: Final[Mapping[str, int]] = {
+    "lamp": 20 * 60,
+    "pfm": 10 * 60,
+    "nbp": 115 * 60,
+    "lav": 8 * 60,
+    "mos": 8 * 60,
+    "obs": 4 * 60,
+}
 
 #: A source is stale when its newest observed run is older than this. Provisional until the
 #: OPEN-5 numerics are frozen after B0/A0.
@@ -61,6 +68,9 @@ STALE_AFTER_NS: Final[Mapping[str, int]] = {
     "lamp": 3 * _HOUR_NS,
     "pfm": 36 * _HOUR_NS,
     "nbp": 8 * _HOUR_NS,
+    "lav": 4 * _HOUR_NS,
+    "mos": 14 * _HOUR_NS,
+    "obs": 6 * _HOUR_NS,
 }
 
 CHRONYC_PATH: Final[str] = "/usr/bin/chronyc"

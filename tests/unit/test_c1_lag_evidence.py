@@ -128,3 +128,33 @@ def test_main_refuses_missing_archive_root(tmp_path: Path) -> None:
     out = tmp_path / "c1.json"
     assert c1.main(["--archive-root", str(tmp_path / "nope"), "--out", str(out)]) == 2
     assert not out.exists()
+
+
+@pytest.mark.parametrize(
+    ("source", "key"),
+    [("lav-iem", "us-lav-iem-avail"), ("mos-gfs", "us-mos-gfs-avail"), ("obs", "us-obs-avail")],
+)
+def test_availability_only_legs_are_read_with_late_rows_censored(
+    tmp_path: Path, source: str, key: str
+) -> None:
+    rows = [
+        _seen(_T0, lag=40 * _MIN, station="KSFO"),
+        _seen(_T0, lag=45 * _MIN, station="KMIA"),
+        _seen(_T0 + _DAY, lag=50 * _MIN, station="KSFO"),
+        _seen(_T0 + 2 * _DAY, lag=500 * _MIN, station="KSFO", late=True),
+    ]
+    _write(tmp_path, key, rows)
+    ev = c1.build_evidence(tmp_path)
+    assert sorted(ev["lag_samples_ns"][source]) == [40 * _MIN, 45 * _MIN, 50 * _MIN]
+    assert ev["measured_days"][source] == 2
+    assert ev["censored"][source] == 1
+    assert source not in ev["no_live_path"]
+
+
+def test_obs_non_routine_rows_are_excluded(tmp_path: Path) -> None:
+    rows = [
+        _seen(_T0, lag=7 * _MIN, station="KSFO", routine=True),
+        _seen(_T0 + _DAY, lag=1 * _MIN, station="KSFO", routine=False),
+    ]
+    _write(tmp_path, "us-obs-avail", rows)
+    assert c1.build_evidence(tmp_path)["lag_samples_ns"]["obs"] == [7 * _MIN]

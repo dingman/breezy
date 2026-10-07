@@ -3,7 +3,7 @@ Description=Breezy F13-C1 US-source collector, one cycle for source %i
 Documentation=file:///home/jon/breezy/docs/plans/backlog/FQ_LOSS_RESPONSE_2026-10-04/F13-us-source-ingest_plan_r3.md
 Documentation=file:///home/jon/breezy/scripts/collect/us_source_collector.py
 
-# Instances are sources: us-source-collector@lamp, @pfm, @nbp. Not installed, enabled or
+# Instances are sources: us-source-collector@lamp, @pfm, @nbp, @lav, @mos, @obs. Not installed, enabled or
 # reloaded by the change that added this file; the coordinator installs it after review.
 # No credential reaches the process: the profile below clears the environment, mounts only
 # alerts.env (read-only) from ~/.config/breezy, and binds the archive directory as the sole
